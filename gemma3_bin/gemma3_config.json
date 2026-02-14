@@ -1,0 +1,230 @@
+{
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "TMP_REG": 2,
+    "ROPE_SIZE_REG": 3
+  },
+  "file_info": {
+    "layer_size": 14267392,
+    "num_layers": 26,
+    "head_dim": 256,
+    "hidden_size": 1152,
+    "embedding_vocab": 262144,
+    "group_size": 4,
+    "mlp_elements": 6912,
+    "bytes_per_element": 2
+  },
+  "model": {
+    "max_context_size": 512,
+    "end_of_turn_token_id": 106,
+    "decoder_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
+    "rope_global_layers": [5, 11, 17, 23]
+  },
+  "paths": {
+    "weights_bin": "gemma3_bin/weights_gemma3_hf.bin",
+    "hf_model_dir": "gemma3_bin/gemma-3-1b-it",
+    "hf_model_repo": "google/gemma-3-1b-it"
+  },
+  "default_prefill_tokens": [2, 2, 105, 2364, 107, 236781, 236862, 236800, 236784, 236810, 236764, 1144, 563, 1123, 236881, 106, 107, 105, 4368, 107],
+  "layers": {
+    "structure": [
+      {"key": "BLK0_ATTN_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_PRE_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_Q_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_Q_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_Q_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_Q_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_K_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_K_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_K_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_K_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_V_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_V_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_V_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_V_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_Q_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_Q_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_K_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_K_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_OUTPUT_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_OUTPUT_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT"},
+      {"key": "BLK0_POST_ATTENTION_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_POST_NORM_GAMMA"},
+      {"key": "BLK0_FFN_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_FFN_NORM_GAMMA"},
+      {"key": "BLK0_FFN_UP_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_UP_SCALE"},
+      {"key": "BLK0_FFN_UP_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_MLP_UP_QUANT"},
+      {"key": "BLK0_FFN_GATE_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_GATE_SCALE"},
+      {"key": "BLK0_FFN_GATE_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_MLP_GATE_QUANT"},
+      {"key": "BLK0_FFN_DOWN_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_SCALE"},
+      {"key": "BLK0_FFN_DOWN_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_QUANT"},
+      {"key": "BLK0_POST_FFW_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA"}
+    ],
+    "non_layer": [
+      {"key": "ROPE_LOCAL", "attr": "DRAM_ADDR_ROPE_LOCAL"},
+      {"key": "ROPE_GLOBAL", "attr": "DRAM_ADDR_ROPE_GLOBAL"},
+      {"key": "OUTPUT_NORM_WEIGHT", "attr": "DRAM_ADDR_OUTPUT_NORM_GAMMA"},
+      {"key": "LM_HEAD_WEIGHT_SCALE", "attr": "DRAM_ADDR_LM_HEAD_SCALE"},
+      {"key": "LM_HEAD_WEIGHT_DATA", "attr": "DRAM_ADDR_LM_HEAD_QUANT"}
+    ]
+  },
+  "regions": {
+    "BLK0_ATTN_NORM_WEIGHT": {
+      "offset": "0x24000000",
+      "size": 2304,
+      "type": "bf16",
+      "description": "pre_norm_gamma"
+    },
+    "BLK0_ATTN_Q_WEIGHT_SCALE": {
+      "offset": "0x24000900",
+      "size": 36864,
+      "type": "bf16_scale",
+      "description": "Q scale"
+    },
+    "BLK0_ATTN_Q_WEIGHT_DATA": {
+      "offset": "0x24009900",
+      "size": 589824,
+      "type": "int4",
+      "description": "Q quantized"
+    },
+    "BLK0_ATTN_K_WEIGHT_SCALE": {
+      "offset": "0x24099900",
+      "size": 9216,
+      "type": "bf16_scale",
+      "description": "K scale"
+    },
+    "BLK0_ATTN_K_WEIGHT_DATA": {
+      "offset": "0x2409BD00",
+      "size": 147456,
+      "type": "int4",
+      "description": "K quantized"
+    },
+    "BLK0_ATTN_V_WEIGHT_SCALE": {
+      "offset": "0x240BFD00",
+      "size": 9216,
+      "type": "bf16_scale",
+      "description": "V scale"
+    },
+    "BLK0_ATTN_V_WEIGHT_DATA": {
+      "offset": "0x240C2100",
+      "size": 147456,
+      "type": "int4",
+      "description": "V quantized"
+    },
+    "BLK0_ATTN_Q_NORM_WEIGHT": {
+      "offset": "0x240E6100",
+      "size": 512,
+      "type": "bf16",
+      "description": "q_norm_gamma"
+    },
+    "BLK0_ATTN_K_NORM_WEIGHT": {
+      "offset": "0x240E6300",
+      "size": 512,
+      "type": "bf16",
+      "description": "k_norm_gamma"
+    },
+    "BLK0_ATTN_OUTPUT_WEIGHT_SCALE": {
+      "offset": "0x240E6500",
+      "size": 36864,
+      "type": "bf16_scale",
+      "description": "attn_output_scale"
+    },
+    "BLK0_ATTN_OUTPUT_WEIGHT_DATA": {
+      "offset": "0x240EF500",
+      "size": 589824,
+      "type": "int4",
+      "description": "attn_output_quant"
+    },
+    "BLK0_POST_ATTENTION_NORM_WEIGHT": {
+      "offset": "0x2417F500",
+      "size": 2304,
+      "type": "bf16",
+      "description": "post_attn_norm_gamma"
+    },
+    "BLK0_FFN_NORM_WEIGHT": {
+      "offset": "0x2417FE00",
+      "size": 2304,
+      "type": "bf16",
+      "description": "ffn_norm_gamma"
+    },
+    "BLK0_FFN_UP_WEIGHT_SCALE": {
+      "offset": "0x24180700",
+      "size": 248832,
+      "type": "bf16_scale",
+      "description": "mlp_up_scale"
+    },
+    "BLK0_FFN_UP_WEIGHT_DATA": {
+      "offset": "0x241BD300",
+      "size": 3981312,
+      "type": "int4",
+      "description": "mlp_up_quant"
+    },
+    "BLK0_FFN_GATE_WEIGHT_SCALE": {
+      "offset": "0x24589300",
+      "size": 248832,
+      "type": "bf16_scale",
+      "description": "mlp_gate_scale"
+    },
+    "BLK0_FFN_GATE_WEIGHT_DATA": {
+      "offset": "0x245C5F00",
+      "size": 3981312,
+      "type": "int4",
+      "description": "mlp_gate_quant"
+    },
+    "BLK0_FFN_DOWN_WEIGHT_SCALE": {
+      "offset": "0x24991F00",
+      "size": 248832,
+      "type": "bf16_scale",
+      "description": "mlp_down_scale"
+    },
+    "BLK0_FFN_DOWN_WEIGHT_DATA": {
+      "offset": "0x249CEB00",
+      "size": 3981312,
+      "type": "int4",
+      "description": "mlp_down_quant"
+    },
+    "BLK0_POST_FFW_NORM_WEIGHT": {
+      "offset": "0x24D9AB00",
+      "size": 2304,
+      "type": "bf16",
+      "description": "post_ffn_norm_gamma"
+    }
+  },
+  "non_layer_regions": {
+    "OUTPUT_NORM_WEIGHT": {
+      "offset": "0x3A1C4800",
+      "size": 2304
+    },
+    "LM_HEAD_WEIGHT_SCALE": {
+      "offset": "0x3A1C5100",
+      "size": 9437184
+    },
+    "LM_HEAD_WEIGHT_DATA": {
+      "offset": "0x3AAC5100",
+      "size": 150994944
+    },
+    "ROPE_LOCAL": {
+      "offset": "0x43B45100",
+      "size": 524288
+    },
+    "ROPE_GLOBAL": {
+      "offset": "0x43AC5100",
+      "size": 524288
+    }
+  },
+  "special": {
+    "embedding": {
+      "token_embd_offset": "0x0",
+      "token_embd_size": "0x24000000",
+      "vocab_size": 262144,
+      "embedding_dim": 1152,
+      "scale": 0.5
+    },
+    "rope": {
+      "head_dim": 256,
+      "num_positions": 512,
+      "theta": 1000000.0,
+      "local_base": 10000.0
+    },
+    "quantization": {
+      "block_size": 64,
+      "bits": 4,
+      "range": [
+        -8,
+        7
+      ]
+    },
+    "rms_norm": {
+      "gamma_offset": 1.0
+    }
+  }
+}
