@@ -1664,6 +1664,140 @@ class UnifiedEngine:
         total_flops = 3 * M * N + M * N # exp(x), sum(x), broadcast_mul, eltwise_mul(gamma)
         return total_flops
 
+    def rms_norm_core_dram_post_add(self, M: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int = None) -> None:
+        """
+        Residual addition followed by RMS norm: rms_norm(A + B).
+        Args:
+            M: number of rows in the input matrix
+            N: number of columns in the input matrix
+            A_DRAM_ADDR: DRAM address of first input matrix
+            B_DRAM_ADDR: DRAM address of second input matrix
+            ADDOUTPUT_DRAM_ADDR: DRAM address for residual addition output
+            NORMOUTPUT_DRAM_ADDR: DRAM address for normalized output
+            GAMMA_DRAM_ADDR: DRAM address for gamma
+        """
+        gamma_sram_addr = 0x80000
+        params_sram_addr = gamma_sram_addr
+
+        if GAMMA_DRAM_ADDR is not None:
+            self.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
+                                        sram_address=gamma_sram_addr,
+                                        element_size=N)
+            params_sram_addr += N * 2
+        else:
+            gamma_sram_addr = None
+
+        # A in URAM_A, B in URAM_B (after params) so eltwise_add_core sees different URAMs
+        vector_A_sram_addr = 0x00000
+        vector_B_sram_addr = params_sram_addr
+        uram_b_remaining_elements = URAM_NEAR_FULL_ELEMENTS - (params_sram_addr - 0x80000) // 2
+        chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, uram_b_remaining_elements // N, M)
+        assert chunk_size >= 1 and chunk_size <= M, f"chunk_size={chunk_size} must be greater than 0 and less than M={M}"
+
+        for i, m_take in self.chunk_ranges(M, chunk_size):
+            chunk_elements = m_take * N
+
+            # Load A into URAM_A, B into URAM_B (after params)
+            self.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * N * 2,
+                                        sram_address=vector_A_sram_addr,
+                                        element_size=chunk_elements)
+            self.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + i * N * 2,
+                                        sram_address=vector_B_sram_addr,
+                                        element_size=chunk_elements)
+
+            # Residual add: A + B -> A (in-place into A's SRAM location)
+            for j in range(m_take):
+                self.eltwise_add_core(vector_A_sram_addr + j * N * 2, vector_B_sram_addr + j * N * 2, vector_A_sram_addr + j * N * 2, N)
+
+            # Write residual addition result to DRAM
+            self.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
+                                            accelerator_dram_address=ADDOUTPUT_DRAM_ADDR + i * N * 2,
+                                            element_size=chunk_elements)
+
+            # RMS norm the add result (in-place)
+            for j in range(m_take):
+                self.rms_norm_core(vector_A_sram_addr + j * N * 2, vector_A_sram_addr + j * N * 2, N, gamma_sram_addr)
+
+            # Write normalized result to DRAM
+            self.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
+                                            accelerator_dram_address=NORMOUTPUT_DRAM_ADDR + i * N * 2,
+                                            element_size=chunk_elements)
+
+        # Total Theoretical FLOPS:
+        total_flops = M * N # add(A, B)
+        total_flops += 3 * M * N # exp(x), sum(x), broadcast_mul
+        if gamma_sram_addr is not None:
+            total_flops += M * N # eltwise_mul(gamma)
+        return total_flops
+
+    def rms_norm_core_dram_pre_add(self, M: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int, ADDOUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int = None) -> None:
+        """
+        RMS norm followed by residual addition: rms_norm(A) + B.
+        Args:
+            M: number of rows in the input matrix
+            N: number of columns in the input matrix
+            A_DRAM_ADDR: DRAM address of input matrix to normalize
+            B_DRAM_ADDR: DRAM address of residual matrix to add after norm
+            NORMOUTPUT_DRAM_ADDR: DRAM address for normalized output
+            ADDOUTPUT_DRAM_ADDR: DRAM address for residual addition output
+            GAMMA_DRAM_ADDR: DRAM address for gamma
+        """
+        gamma_sram_addr = 0x80000
+        params_sram_addr = gamma_sram_addr
+
+        if GAMMA_DRAM_ADDR is not None:
+            self.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
+                                        sram_address=gamma_sram_addr,
+                                        element_size=N)
+            params_sram_addr += N * 2
+        else:
+            gamma_sram_addr = None
+
+        # A in URAM_A, B in URAM_B (after params) so eltwise_add_core sees different URAMs
+        vector_A_sram_addr = 0x00000
+        vector_B_sram_addr = params_sram_addr
+        uram_b_remaining_elements = URAM_NEAR_FULL_ELEMENTS - (params_sram_addr - 0x80000) // 2
+        chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, uram_b_remaining_elements // N, M)
+        assert chunk_size >= 1 and chunk_size <= M, f"chunk_size={chunk_size} must be greater than 0 and less than M={M}"
+
+        for i, m_take in self.chunk_ranges(M, chunk_size):
+            chunk_elements = m_take * N
+
+            # Load A chunk into URAM_A
+            self.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * N * 2,
+                                        sram_address=vector_A_sram_addr,
+                                        element_size=chunk_elements)
+
+            # RMS norm A (in-place)
+            for j in range(m_take):
+                self.rms_norm_core(vector_A_sram_addr + j * N * 2, vector_A_sram_addr + j * N * 2, N, gamma_sram_addr)
+
+            # Write normalized result to DRAM
+            self.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
+                                            accelerator_dram_address=NORMOUTPUT_DRAM_ADDR + i * N * 2,
+                                            element_size=chunk_elements)
+
+            # Load B chunk into URAM_B (after params)
+            self.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + i * N * 2,
+                                        sram_address=vector_B_sram_addr,
+                                        element_size=chunk_elements)
+
+            # Residual add: rms_norm(A) + B -> A (in-place)
+            for j in range(m_take):
+                self.eltwise_add_core(vector_A_sram_addr + j * N * 2, vector_B_sram_addr + j * N * 2, vector_A_sram_addr + j * N * 2, N)
+
+            # Write addition result to DRAM
+            self.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
+                                            accelerator_dram_address=ADDOUTPUT_DRAM_ADDR + i * N * 2,
+                                            element_size=chunk_elements)
+
+        # Total Theoretical FLOPS:
+        total_flops = 3 * M * N # exp(x), sum(x), broadcast_mul
+        if gamma_sram_addr is not None:
+            total_flops += M * N # eltwise_mul(gamma)
+        total_flops += M * N # add(rms_norm(A), B)
+        return total_flops
+
     # we need a layer norm core that takes in a vector and outputs a vector
     def layer_norm_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, zeros_sram_start_addr: int = None, input_gamma_sram_start_addr: int = None, input_beta_sram_start_addr: int = None) -> None:
         """
