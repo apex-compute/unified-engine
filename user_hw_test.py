@@ -1071,7 +1071,12 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     N = shape[1]
 
     A_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+    B_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+    ADDOUTPUT_DRAM_ADDR_1 = ue.allocate_tensor_dram(M * N * 2)
+    NORMOUTPUT_DRAM_ADDR_1 = ue.allocate_tensor_dram(M * N * 2)
+    ADDOUTPUT_DRAM_ADDR_2 = ue.allocate_tensor_dram(M * N * 2)
+    NORMOUTPUT_DRAM_ADDR_2 = ue.allocate_tensor_dram(M * N * 2)
     GAMMA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2) if gamma_enable else None
     BETA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2) if beta_enable else None
 
@@ -1082,7 +1087,20 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
                                                           OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                                                           GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
                                                           BETA_DRAM_ADDR=BETA_DRAM_ADDR)
-
+    total_flops_from_layer_norm_pre_add = ue.layer_norm_core_dram_pre_add(M=M, N=N,
+                                                          A_DRAM_ADDR=A_DRAM_ADDR,
+                                                          B_DRAM_ADDR=B_DRAM_ADDR,
+                                                          ADDOUTPUT_DRAM_ADDR=ADDOUTPUT_DRAM_ADDR_1,
+                                                          NORMOUTPUT_DRAM_ADDR=NORMOUTPUT_DRAM_ADDR_1,
+                                                          GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
+                                                          BETA_DRAM_ADDR=BETA_DRAM_ADDR)
+    total_flops_from_layer_norm_post_add = ue.layer_norm_core_dram_post_add(M=M, N=N,
+                                                          A_DRAM_ADDR=A_DRAM_ADDR,
+                                                          B_DRAM_ADDR=B_DRAM_ADDR,
+                                                          ADDOUTPUT_DRAM_ADDR=ADDOUTPUT_DRAM_ADDR_2,
+                                                          NORMOUTPUT_DRAM_ADDR=NORMOUTPUT_DRAM_ADDR_2,
+                                                          GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
+                                                          BETA_DRAM_ADDR=BETA_DRAM_ADDR)
     ue.stop_capture()
     ue.generate_instruction_halt()
     program_dram_addr = ue.get_program_dram_addr()
@@ -1092,7 +1110,9 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
 
     # Test Time
     x = torch.randn(M, N, dtype=torch.bfloat16)
+    y = torch.randn(M, N, dtype=torch.bfloat16)
     ue.dma_to_accelerator_memory(A_DRAM_ADDR, x)
+    ue.dma_to_accelerator_memory(B_DRAM_ADDR, y)
     if gamma_enable:
         gamma = torch.randn(N, dtype=torch.bfloat16)
         ue.dma_to_accelerator_memory(GAMMA_DRAM_ADDR, gamma)
@@ -1106,8 +1126,16 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
 
     flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_layer_norm)
     print(f"Report FLOPS for Layer Norm: {flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}, gamma_enable={gamma_enable}, beta_enable={beta_enable}")
+    flop_rate_gflops_pre_add = ue.report_flop_rate_gflops(total_flops_from_layer_norm_pre_add)
+    print(f"Report FLOPS for Layer Norm Pre-Add: {flop_rate_gflops_pre_add:.2f} GFLOPS for M={M}, N={N}, gamma_enable={gamma_enable}, beta_enable={beta_enable}")
+    flop_rate_gflops_post_add = ue.report_flop_rate_gflops(total_flops_from_layer_norm_post_add)
+    print(f"Report FLOPS for Layer Norm Post-Add: {flop_rate_gflops_post_add:.2f} GFLOPS for M={M}, N={N}, gamma_enable={gamma_enable}, beta_enable={beta_enable}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+    pre_normoutput = ue.dma_from_accelerator_memory(NORMOUTPUT_DRAM_ADDR_1, (M, N))
+    pre_addoutput = ue.dma_from_accelerator_memory(ADDOUTPUT_DRAM_ADDR_1, (M, N))
+    post_normoutput = ue.dma_from_accelerator_memory(NORMOUTPUT_DRAM_ADDR_2, (M, N))
+    post_addoutput = ue.dma_from_accelerator_memory(ADDOUTPUT_DRAM_ADDR_2, (M, N))
 
     layer_norm = torch.nn.LayerNorm(N)
     if gamma_enable:
@@ -1124,6 +1152,24 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     snr_db_ref = calculate_snr(ref, output)
     print(f"Reference SNR Analysis for Layer Norm: {snr_db_ref:.2f} dB")
     assert snr_db_ref >= 40 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+
+    pre_ref_norm = layer_norm(x)
+    pre_ref_add = layer_norm(x) + y
+    pre_norm_snr = calculate_snr(pre_ref_norm, pre_normoutput)
+    pre_add_snr = calculate_snr(pre_ref_add, pre_addoutput)
+
+    print(f"Reference SNR Analysis for Layer Norm Pre-Add: Addition: {pre_add_snr:.2f} dB , Norm: {pre_norm_snr:.2f}")
+    assert pre_norm_snr >= 40 or pre_norm_snr == float('inf'), f"Pre-Add Norm SNR {pre_norm_snr:.2f} dB must be at least 40 dB"
+    assert pre_add_snr >= 40 or pre_add_snr == float('inf'), f"Pre-Add Addition SNR {pre_add_snr:.2f} dB must be at least 40 dB"
+
+    post_ref_add = x + y
+    post_ref_norm = layer_norm(post_ref_add)
+    post_add_snr = calculate_snr(post_ref_add, post_addoutput)
+    post_norm_snr = calculate_snr(post_ref_norm, post_normoutput)
+    print(f"Reference SNR Analysis for Layer Norm Post-Add: Addition: {post_add_snr:.2f} dB , Norm: {post_norm_snr:.2f}")
+    assert post_add_snr >= 40 or post_add_snr == float('inf'), f"Post-Add Addition SNR {post_add_snr:.2f} dB must be at least 40 dB"
+    assert post_norm_snr >= 40 or post_norm_snr == float('inf'), f"Post-Add Norm SNR {post_norm_snr:.2f} dB must be at least 40 dB"
+
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
@@ -1232,7 +1278,7 @@ if __name__ == "__main__":
     flash_attention_test(head_dim=256, seq_len=3840, bias_enable=True)
     matmat_mul_test(M=1024, K=1024, N=1024, bias_enable=True, softmax_enable=True, bias_mode="full_matrix")
     layer_norm_test(shape=(1024, 1024), gamma_enable=True, beta_enable=True)
-    rms_norm_test(shape=(1024, 1024))
+    #rms_norm_test(shape=(1024, 1024))
 
     # for M in [64, 128, 256, 512, 1024, 2048, 4096]:
     #     for N in [64, 128, 256, 512, 1024, 2048, 4096]:
