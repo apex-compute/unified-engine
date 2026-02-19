@@ -18,6 +18,7 @@ Usage:
     result = handler(vec1, vec2)
 """
 
+from re import U
 import struct
 import os
 import time
@@ -937,7 +938,9 @@ class UnifiedEngine:
             ue.wait_queue()
             ue.clear_stride_mode()
         """
-        round_length_bytes = (memcpy_length_bytes + 127) & ~127
+
+        # if memcpy_length_bytes % (UE_VECTOR_SIZE * 2) != 0:
+        #     print(f"warning: round_length_bytes is not aligned to UE_VECTOR_SIZE")
 
         # Use start_queue with URAM_DRAM_WRITEBACK mode
         self.start_queue(
@@ -956,9 +959,9 @@ class UnifiedEngine:
             0,  # data_type
             uram_src_addr,  # uram_a_start_addr
             uram_src_addr,  # uram_b_start_addr
-            round_length_bytes // UE_VECTOR_SIZE // 2,  # uram_length (bram_length)
+            0,  # uram_length (uram_row_count)
             dram_dst_addr,  # dma_start_addr
-            0,  # dma_length
+            memcpy_length_bytes,  # dma_length
             0,  # output_size
             inst_id,  # inst_id
             0,  # bias_adder_en
@@ -1149,7 +1152,7 @@ class UnifiedEngine:
                 self.write_reg32(UE_DMA_LENGTH_ADDR, dma_length)
             if uram_bram_wb_start:
                 self.write_reg32(UE_DRAM_ADDR, dma_start_addr)
-                # writeback length is defined by uram_length
+                self.write_reg32(UE_DMA_LENGTH_ADDR, dma_length)
 
             self.write_reg32(UE_URAM_LENGTH_ADDR,
                             (uram_b_start_addr << 12) | uram_a_start_addr)
@@ -1190,7 +1193,7 @@ class UnifiedEngine:
                 w[1] = (dma_start_addr if (dma_start or uram_bram_wb_start) else 0)
 
                 # Word 2 (bits 64-95): dma_length
-                w[2] = dma_length if dma_start else 0
+                w[2] = dma_length if (dma_start or uram_bram_wb_start) else 0
 
                 # Word 3 (bits 96-127): dma_start_reg(96), uram_start_reg(97), data_type(98-99),
                 #                      mode_sel(100-103), output_size(104-119), uram_row_size[7:0](120-127)
@@ -1277,6 +1280,12 @@ class UnifiedEngine:
     # Wrappers for UE eltwise and broadcast ops (wrap start_queue with fixed mode)
     # Used by user_dma_ops.py eltwise_op, eltwise_add, eltwise_mul, broadcast_op.
     # -------------------------------------------------------------------------
+
+    def accelerator_memory_to_scale_sram(self, accelerator_dram_address: int, element_size: int) -> None:
+        """DMA data from accelerator memory to scale SRAM"""
+        element_size_bytes = element_size * 2
+        self.ue_memcpy_from_dram(accelerator_dram_address, element_size_bytes, MEMCPY_TYPE.BRAM.value, 0, 0, self._inst_id)
+        self._inst_id += 1
 
     def accelerator_memory_to_sram(self, accelerator_dram_address: int, sram_address: int, element_size: int, stride_bytes_per_chunk: int = 0, stride_jump_bytes: int = 0) -> None:
         """DMA data from accelerator memory to SRAM"""
@@ -1441,7 +1450,8 @@ class UnifiedEngine:
         )
 
     # Compute engine operations --------------------------------------------------
-    def start_queue_for_bf16_matvec_operation(self, max_clear_en: int, fmax_context_addr: int, vector_sram_start_addr: int, matrix_sram_start_addr: int, output_sram_wb_addr: int, K: int, N: int, bias_enable: bool = False) -> None:
+    def start_queue_for_bf16_matvec_operation(self, max_clear_en: int, fmax_context_addr: int, vector_sram_start_addr: int, matrix_sram_start_addr: int, output_sram_wb_addr: int,
+                                            K: int, N: int, bias_enable: bool = False) -> None:
         """Start queue for compute engine. Wraps start_queue with UE_MODE.
         Args:
             max_clear_en: max_clear_en
@@ -1459,7 +1469,9 @@ class UnifiedEngine:
         output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
 
         assert K % UE_VECTOR_SIZE == 0, f"K={K} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
-        assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
+
+        # TODO: support non-aligned writes
+        #assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
 
         self.start_queue(
             0,  # broadcast_mode (not used for bf16 matvec operation)
@@ -1753,7 +1765,57 @@ class UnifiedEngine:
             total_flops += M * N # add(beta) N times
         return total_flops
 
-    def matmat_mul_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N") -> None:
+    def start_queue_for_bf16_dequantize_operation(self, VECTOR_INPUT_DRAM_ADDR: int, SCALE_INPUT_DRAM_ADDR: int, data_type: TYPE,
+                                                  output_sram_wb_addr: int, element_size: int) -> None:
+        """
+        Start queue for bf16 dequantize operation.
+        Args:
+            VECTOR_INPUT_DRAM_ADDR: DRAM address of input matrix
+            data_type: data_type
+            output_sram_wb_addr: SRAM address for output matrix
+            element_size: number of elements in the matrix
+        """
+
+        output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
+        row_size = (element_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE # round up to the nearest multiple of UE_VECTOR_SIZE - K is inner dimension of the matrix
+
+        assert data_type in (TYPE.INT4, TYPE.INT8, TYPE.FP4), f"data_type={data_type} must be one of TYPE.INT4, TYPE.INT8, TYPE.FP4"
+
+        if data_type == TYPE.INT4 or data_type == TYPE.FP4:
+            dma_length = element_size >> 1
+        elif data_type == TYPE.INT8:
+            dma_length = element_size
+
+        self.accelerator_memory_to_scale_sram(accelerator_dram_address=SCALE_INPUT_DRAM_ADDR, element_size=row_size)
+
+        self.start_queue(
+            0,  # broadcast_mode
+            0,  # clear_max_en
+            1,  # stride_z
+            LALU_MODE.BYPASS.value,  # lalu_mode
+            0,  # lalu_scalar
+            0,  # uram_bram (URAM)
+            output_uram_type.value,  # uram_section
+            0,  # uram_dst_addr
+            0,  # dram_to_uram_cpy_start
+            output_uram_start_addr,  # uram_wb_addr
+            URAM_WRITE_SRC.URAM_WRITE_BACK.value,  # uram_write_src
+            UE_MODE.DEQUANTIZE,  # mode
+            data_type.value,  # data_type (TYPE.BF16, TYPE.INT4, TYPE.INT8, TYPE.FP4)
+            0,  # uram_a_start_addr
+            0,  # uram_b_start_addr
+            row_size,  # bram_length
+            VECTOR_INPUT_DRAM_ADDR,  # dma_start_addr
+            dma_length,  # dma_length
+            row_size,  # output_size
+            self._inst_id
+        )
+        self._inst_id += 1
+
+        return element_size # total flops is element_size
+
+    def matmat_mul_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
+                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None) -> None:
         # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
         # 1. M_chunk can be any value between 1 and M
         # 2. N_chunk needs to be a multiple of UE_VECTOR_SIZE
@@ -1765,21 +1827,47 @@ class UnifiedEngine:
         if bias_enable:
             assert bias_mode in ("broadcast_N", "full_matrix"), f"bias_mode={bias_mode} must be either 'broadcast_N' or 'full_matrix'"
 
+        if is_B_quantized:
+            assert data_type in (TYPE.INT4, TYPE.INT8, TYPE.FP4), f"data_type={data_type} must be one of TYPE.INT4, TYPE.INT8, TYPE.FP4"
+
         # Calculate N_chunk
         N_chunk = min(N, (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-        assert N_chunk >= 1 and N_chunk <= N, f"N_chunk={N_chunk} must be greater than 0 and less than N={N}"
+        N_chunk_aligned = None
+        if N_chunk < UE_VECTOR_SIZE:
+            # Try 32(2 bursts) and 16(1 burst)
+            if (K * 32) <= URAM_NEAR_FULL_ELEMENTS:
+                N_chunk = 32
+            elif (K * 16) <= URAM_NEAR_FULL_ELEMENTS:
+                N_chunk = 16
+            else:
+                assert False, f"N={N} is too large to fit in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
+            N_chunk_aligned = UE_VECTOR_SIZE
 
-        # Calculate M_chunk
-        if softmax_enable:
-            M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, URAM_FULL_ELEMENTS // (K + N_chunk)) # fmax_context is UE_FMAX_CONTEXT_SIZE elements
+        assert N_chunk <= N, f"N_chunk={N_chunk} must be less than or equal to N={N}"
+
+        if N_chunk_aligned is None:
+            # Calculate M_chunk
+            if softmax_enable:
+                M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, URAM_FULL_ELEMENTS // (K + N_chunk)) # fmax_context is UE_FMAX_CONTEXT_SIZE elements
+            else:
+                M_chunk = min(M, URAM_FULL_ELEMENTS // (K + N_chunk))
         else:
-            M_chunk = min(M, URAM_FULL_ELEMENTS // (K + N_chunk))
+            # Calculate M_chunk
+            if softmax_enable:
+                M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, URAM_FULL_ELEMENTS // (K + N_chunk_aligned)) # fmax_context is UE_FMAX_CONTEXT_SIZE elements
+            else:
+                M_chunk = min(M, URAM_FULL_ELEMENTS // (K + N_chunk_aligned))
 
         assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
 
-        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}")
-        print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-        print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
+
+        if N_chunk_aligned is None:
+            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+        else:
+            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk_aligned) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
 
         for i, m_take in self.chunk_ranges(M, M_chunk):
             self.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * K * bytes_per_element,
@@ -1787,14 +1875,24 @@ class UnifiedEngine:
                                             element_size=m_take * K)
 
             output_sram_wb_addr = 0x00000 + m_take * K * bytes_per_element
-            if output_sram_wb_addr >= 0x80000:
-                assert False, f"output_sram_wb_addr={output_sram_wb_addr} is greater than 0x80000, which is the size of URAM_B"
+            assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} is greater than or equal to 0x80000, which is the size of URAM_B"
 
             clear_en = 1
             for j, n_take in self.chunk_ranges(N, N_chunk):
-                self.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + j * K * bytes_per_element,
-                                            sram_address=0x80000,
-                                            element_size=n_take * K)
+                if is_B_quantized:
+                    if data_type == TYPE.INT4 or data_type == TYPE.FP4:
+                        offset = j * K >> 1
+                    elif data_type == TYPE.INT8:
+                        offset = j * K
+                    self.start_queue_for_bf16_dequantize_operation(VECTOR_INPUT_DRAM_ADDR=B_DRAM_ADDR + offset,
+                                                                  SCALE_INPUT_DRAM_ADDR=SCALE_DRAM_ADDR + ((i * K) // UE_VECTOR_SIZE) * bytes_per_element,
+                                                                  data_type=data_type,
+                                                                  output_sram_wb_addr=0x80000,
+                                                                  element_size=n_take * K)
+                else:
+                    self.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + j * K * bytes_per_element,
+                                                sram_address=0x80000,
+                                                element_size=n_take * K)
 
                 if bias_enable and bias_mode == "broadcast_N":
                     self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + j * bytes_per_element, element_size=n_take)
@@ -1805,11 +1903,17 @@ class UnifiedEngine:
                         self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + ((i + output_row) * N + j) * bytes_per_element,
                                                              element_size=n_take)
 
+                    in_sram_offset = output_row * K * bytes_per_element
+                    if N_chunk_aligned is None:
+                        out_sram_offset = output_row * n_take * bytes_per_element
+                    else:
+                        out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
+
                     self.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
                                                             fmax_context_addr=output_row,
-                                                            vector_sram_start_addr=0x00000 + output_row * K * bytes_per_element,
+                                                            vector_sram_start_addr=0x00000 + in_sram_offset,
                                                             matrix_sram_start_addr=0x80000,
-                                                            output_sram_wb_addr=output_sram_wb_addr + output_row * n_take * bytes_per_element,
+                                                            output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
                                                             K=K,
                                                             N=n_take,
                                                             bias_enable=bias_enable)
@@ -1825,11 +1929,17 @@ class UnifiedEngine:
                 #                                 element_size=n_take)
 
                 # New way of copying with stride 
-                self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                            accelerator_dram_address=start_dram_address_of_partial_matrix,
-                                            element_size=m_take * n_take,
-                                            stride_bytes_per_chunk=n_take * bytes_per_element,
-                                            stride_jump_bytes=N * bytes_per_element)
+                if N_chunk_aligned is None:
+                    self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                accelerator_dram_address=start_dram_address_of_partial_matrix,
+                                                element_size=m_take * n_take,
+                                                stride_bytes_per_chunk=n_take * bytes_per_element,
+                                                stride_jump_bytes=N * bytes_per_element)
+                else: # this means output from matrix-vector operation is non-aligned - less than UE_VECTOR_SIZE elements
+                    for o_row_idx in range(m_take):
+                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
+                                                        accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
+                                                        element_size=n_take)
 
             if softmax_enable:
                 m_take_chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, m_take)
@@ -2594,6 +2704,95 @@ class UnifiedEngine:
         Report flop rate
         """
         return num_flops / (self.read_reg32(UE_LATENCY_COUNT_ADDR) * CLOCK_CYCLE_TIME_NS)
+
+    def quantize_weight(self,
+                        weight: torch.Tensor,
+                        N: int,
+                        K: int,
+                        data_type: TYPE) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Quantize a bf16 weight matrix (N, K) with absmax quantization, pack as INT4/FP4/INT8
+        """
+        if N % UE_VECTOR_SIZE != 0:
+            raise ValueError(f"N={N} must be a multiple of {UE_VECTOR_SIZE}")
+        if K % UE_VECTOR_SIZE != 0:
+            raise ValueError(f"K={K} must be a multiple of {UE_VECTOR_SIZE}")
+        assert weight.dim() == 2, "Weight must be 2D"
+        assert weight.dtype == torch.bfloat16, "Weight must be bfloat16"
+        assert weight.shape[0] == N and weight.shape[1] == K, f"Weight shape {weight.shape} must match ({N}, {K})"
+
+        matrix = weight.contiguous()  # (N, K)
+        matrix_flat = matrix.flatten()
+        num_elements = matrix_flat.numel()
+        num_blocks = (num_elements + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+
+        fp4_values = torch.tensor([-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                                    dtype=torch.bfloat16, device=matrix.device)
+        if data_type == TYPE.INT4:
+            max_val_bf16 = torch.tensor(7.0, dtype=torch.bfloat16, device=matrix.device)
+            clamp_min, clamp_max = -8, 7
+        elif data_type == TYPE.FP4:
+            max_val_bf16 = torch.tensor(6.0, dtype=torch.bfloat16, device=matrix.device)
+        else:  # TYPE.INT8
+            max_val_bf16 = torch.tensor(127.0, dtype=torch.bfloat16, device=matrix.device)
+            clamp_min, clamp_max = -128, 127
+
+        quantized_int8 = torch.zeros(num_elements, dtype=torch.int8, device=matrix.device)
+        scales_bf16 = torch.zeros(num_blocks, dtype=torch.bfloat16, device=matrix.device)
+        for i in range(num_blocks):
+            start = i * UE_VECTOR_SIZE
+            end = min(start + UE_VECTOR_SIZE, num_elements)
+            block = matrix_flat[start:end]
+            block_bf16 = block.to(torch.bfloat16)
+            abs_block = block_bf16.abs()
+            max_abs = abs_block.max()
+            if float(max_abs.item()) == 0.0:
+                scale_bf16 = torch.tensor(1.0, dtype=torch.bfloat16, device=matrix.device)
+            else:
+                scale_bf16 = max_abs / max_val_bf16
+            scales_bf16[i] = scale_bf16
+            if float(max_abs.item()) == 0.0:
+                q_block = torch.zeros(end - start, dtype=torch.int8, device=matrix.device)
+            else:
+                scaled = block_bf16 / scale_bf16
+                if data_type == TYPE.FP4:
+                    scaled_expanded = scaled.unsqueeze(-1)
+                    fp4_values_expanded = fp4_values.unsqueeze(0)
+                    distances = torch.abs(scaled_expanded - fp4_values_expanded)
+                    closest_indices = torch.argmin(distances, dim=1)
+                    fp4_codes = torch.tensor([
+                        0b1111, 0b1110, 0b1101, 0b1100, 0b1011, 0b1010, 0b1001, 0b1000,
+                        0b0000, 0b0001, 0b0010, 0b0011, 0b0100, 0b0101, 0b0110, 0b0111,
+                    ], dtype=torch.int8, device=matrix.device)
+                    q_block = fp4_codes[closest_indices]
+                else:
+                    rounded = torch.round(scaled)
+                    clamped = rounded.clamp(clamp_min, clamp_max)
+                    q_block = clamped.to(torch.int8)
+            quantized_int8[start:end] = q_block
+
+        num_packed_bytes = (num_elements + 1) // 2
+        packed_int4 = torch.zeros(num_packed_bytes, dtype=torch.uint8, device=matrix.device)
+        for i in range(0, num_elements, 2):
+            byte_idx = i // 2
+            if i + 1 < num_elements:
+                val1 = quantized_int8[i].item()
+                val2 = quantized_int8[i + 1].item()
+                packed_int4[byte_idx] = ((val2 & 0xF) << 4) | (val1 & 0xF)
+            else:
+                val1 = quantized_int8[i].item()
+                packed_int4[byte_idx] = val1 & 0xF
+
+        print(f"Quantized matrix: {num_elements} elements -> {num_packed_bytes} packed bytes")
+        print(f"Scales: {num_blocks} blocks, {num_blocks * 2} bytes")
+        quantized_matrix_dram_addr = self.get_params_dram_addr()
+        scale_dram_addr = quantized_matrix_dram_addr + num_packed_bytes
+        self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr, packed_int4, num_packed_bytes)
+        self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16, num_blocks * 2)
+        print(f"Quantized matrix and scales written to DRAM at 0x{quantized_matrix_dram_addr:x} and 0x{scale_dram_addr:x}")
+        self.allocate_params_dram(num_packed_bytes + num_blocks * 2)
+
+        return quantized_matrix_dram_addr, scale_dram_addr
 
     @staticmethod
     def float_to_bf19(f: float) -> int:

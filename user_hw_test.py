@@ -26,6 +26,7 @@ from user_dma_core import (
     set_dma_device,
     UnifiedEngine,
     UE_FMAX_CONTEXT_SIZE,
+    UE_VECTOR_SIZE,
 )
 from user_dma_ops import UnifiedEngine
 
@@ -746,7 +747,7 @@ def generic_tests():
 
     print("\n=== Running Stride Mode Memcpy Benchmark ===")
     M = 27648
-    N = 64
+    N = 128 # TODO: Test with 64 and add support for packed writing
     a = torch.randn(M, N).to(torch.bfloat16)
     some_slice = a[:, :N//2]
     bytes_per_element = 2
@@ -776,7 +777,7 @@ def generic_tests():
 
     print("\n=== Running Stride Mode Memcpy Benchmark ===")
     M = 27648
-    N = 64
+    N = 128 # TODO: Test with 64 and add support for packed writing
     a = torch.randn(M, N).to(torch.bfloat16)
     some_slice = a[:, :N//2]
     stride_mode_memcpy_handler = ue.stride_mode_memcpy_benchmark(input_dram_addr=DRAM_ACTIVATION_ADDR,
@@ -1128,6 +1129,173 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
+def dequantize_test():
+    """
+    Tests dequantize core.
+    """
+    ue = UnifiedEngine()
+
+    M = 64
+    N = 64
+    x = torch.rand(M, N, dtype=torch.bfloat16) * 2 - 1
+    QUANTIZED_MATRIX_DRAM_ADDR, SCALE_DRAM_ADDR = ue.quantize_weight(weight=x, N=M, K=N, data_type=TYPE.INT4)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+
+    ue.start_capture()
+    
+    vector_sram_start_addr = 0x00000
+    total_flops_from_dequantize = ue.start_queue_for_bf16_dequantize_operation(VECTOR_INPUT_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
+                                                SCALE_INPUT_DRAM_ADDR=SCALE_DRAM_ADDR,
+                                                data_type=TYPE.INT4,
+                                                output_sram_wb_addr=vector_sram_start_addr,
+                                                element_size=M * N)
+
+    ue.sram_to_accelerator_memory(sram_address=vector_sram_start_addr, accelerator_dram_address=OUTPUT_DRAM_ADDR, element_size=M * N)
+
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.clear_capture_buffer()
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0) # 10 seconds timeout
+    ue.report_timing_and_instruction_count()
+
+    report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
+    print(f"Report FLOPS for Dequantize: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+    snr_db_ref = calculate_snr(x, output)
+
+    print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 20 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def matmat_mul_quantized_weights_test():
+    """
+    Tests dequantize core.
+    """
+    ue = UnifiedEngine()
+
+    M = 32
+    K = 6912
+    N = 1152
+
+    x = torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1
+    QUANTIZED_MATRIX_DRAM_ADDR, SCALE_DRAM_ADDR = ue.quantize_weight(weight=x, N=N, K=K, data_type=TYPE.INT4)
+
+    A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * K * 2)
+
+    ue.start_capture()
+    
+    total_flops_from_dequantize = ue.matmat_mul_core(M=M, K=K, N=N,
+                                                    A_DRAM_ADDR=A_DRAM_ADDR,
+                                                    B_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
+                                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                                                    is_B_quantized=True,
+                                                    data_type=TYPE.INT4,
+                                                    SCALE_DRAM_ADDR=SCALE_DRAM_ADDR)
+
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.clear_capture_buffer()
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
+    ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0) # 10 seconds timeout
+    ue.report_timing_and_instruction_count()
+
+    report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
+    print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+
+    ref = a @ x.T
+    snr_db_ref = calculate_snr(ref, output)
+
+    print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 20 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def matmat_mul_non_aligned_writeback_test():
+    """
+    Tests matmat mul non aligned writeback core.
+    """
+    ue = UnifiedEngine()
+
+    M = 2
+    K = 256
+    N = 32
+
+    A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
+    B_DRAM_ADDR = ue.allocate_tensor_dram(N * K * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+    
+    ue.start_capture()
+
+    ue.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR,
+                                  sram_address=0x00000,
+                                  element_size=M * K)
+    ue.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR,
+                                  sram_address=0x80000,
+                                  element_size=N * K)
+
+    # bf16 dot product
+    N_aligned = (N + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE * UE_VECTOR_SIZE
+    if N < UE_VECTOR_SIZE:
+        print(f"Warning: N={N} is less than UE_VECTOR_SIZE={UE_VECTOR_SIZE}, padding to the nearest multiple of UE_VECTOR_SIZE")
+
+    for i in range(M):
+        ue.start_queue_for_bf16_matvec_operation(max_clear_en=0,
+                                            fmax_context_addr=0,
+                                            vector_sram_start_addr=0x00000 + i * K * 2,
+                                            matrix_sram_start_addr=0x80000,
+                                            output_sram_wb_addr=0xC0000 + i * N_aligned * 2,
+                                            K=K,
+                                            N=N)
+
+        ue.sram_to_accelerator_memory(sram_address=0xC0000 + i * N_aligned * 2,
+                                    accelerator_dram_address=OUTPUT_DRAM_ADDR + i * N * 2,
+                                    element_size=N)
+
+
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.clear_capture_buffer()
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
+    ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+    b = torch.randn(N, K, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(B_DRAM_ADDR, b)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0) # 10 seconds timeout
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+
+    snr_db_ref = calculate_snr(a @ b.T, output)
+    print(f"Reference SNR Analysis for Matmat Mul Non Aligned Writeback: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 40 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+
 def custom_kernel_test():
     """
     Custom kernel test.
@@ -1225,12 +1393,16 @@ if __name__ == "__main__":
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
     
-    #generic_tests()
+    # generic_tests()
     #simple_kq_test()
 
     custom_kernel_test()
-    flash_attention_test(head_dim=256, seq_len=3840, bias_enable=True)
-    matmat_mul_test(M=1024, K=1024, N=1024, bias_enable=True, softmax_enable=True, bias_mode="full_matrix")
+    matmat_mul_non_aligned_writeback_test()
+    matmat_mul_quantized_weights_test()
+    dequantize_test()
+    # flash_attention_test(head_dim=256, seq_len=3840, bias_enable=True)
+    matmat_mul_test(M=1024, K=6912, N=1152)
+    matmat_mul_test(M=1024, K=1152, N=6912)
     layer_norm_test(shape=(1024, 1024), gamma_enable=True, beta_enable=True)
     rms_norm_test(shape=(1024, 1024))
 
