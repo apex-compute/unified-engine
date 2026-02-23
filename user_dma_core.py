@@ -1449,10 +1449,65 @@ class UnifiedEngine:
             sram_start_addr, sram_wb_addr, element_size, scalar
         )
 
+    def start_queue_for_dot_product_operation(self, max_clear_en: int, fmax_context_addr: int, vector_sram_start_addr: int, output_sram_wb_addr: int,
+                                            K: int, N: int, dma_start_addr: int,
+                                            data_type: int = 0, bias_enable: bool = False, lalu_mode: LALU_MODE = LALU_MODE.BYPASS) -> None:
+        """Start queue for dot product operation. Matrix data streams from DRAM via DMA.
+        Args:
+            max_clear_en: clear max accumulator (1 on first chunk, 0 on subsequent)
+            vector_sram_start_addr: SRAM address of the vector in URAM_A
+            output_sram_wb_addr: SRAM address for output writeback
+            K: inner dimension (vector length), must be a multiple of UE_VECTOR_SIZE
+            N: outer dimension (matrix height), must be a multiple of UE_VECTOR_SIZE
+            dma_start_addr: DRAM address where matrix data starts
+            data_type: quantization data type (e.g. TYPE.INT4.value)
+            lalu_mode: LALU mode value (e.g. LALU_MODE.GELU.value)
+            lalu_scalar: scalar for LALU operation
+        """
+        vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
+        assert vector_uram_type == URAM_SECTION.URAM_A, f"vector_sram_start_addr must be in URAM_A hex(vector_uram_start_addr)={hex(vector_uram_start_addr)}"
+        output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
+
+        assert K % UE_VECTOR_SIZE == 0, f"K={K} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
+
+        if data_type == TYPE.FP4 or data_type == TYPE.INT4:
+            dma_length = (N * K) // 2
+        elif data_type == TYPE.INT8:
+            dma_length = N * K
+        else:
+            assert False, f"data_type={data_type} is not supported"
+
+        self.start_queue(
+            0,  # broadcast_mode
+            max_clear_en,  # clear_max_en
+            1,  # stride_z
+            lalu_mode.value,  # lalu_mode
+            0,  # lalu_scalar
+            0,  # uram_bram (URAM)
+            output_uram_type.value,  # uram_section
+            0,  # uram_dst_addr
+            0,  # dram_to_uram_cpy_start
+            output_uram_start_addr,  # uram_wb_addr
+            URAM_WRITE_SRC.URAM_WRITE_BACK.value,  # uram_write_src
+            UE_MODE.DOT_PRODUCT,  # mode
+            data_type,  # data_type
+            vector_uram_start_addr,  # uram_a_start_addr
+            0,  # uram_b_start_addr (not used, matrix streams from DMA)
+            K // UE_VECTOR_SIZE,  # bram_length
+            dma_start_addr,  # dma_start_addr
+            dma_length,  # dma_length
+            N,  # output_size
+            self._inst_id,
+            bias_adder_en=bias_enable,
+            fmax_context_addr=fmax_context_addr
+        )
+        self._inst_id += 1
+
+
     # Compute engine operations --------------------------------------------------
     def start_queue_for_bf16_matvec_operation(self, max_clear_en: int, fmax_context_addr: int, vector_sram_start_addr: int, matrix_sram_start_addr: int, output_sram_wb_addr: int,
-                                            K: int, N: int, bias_enable: bool = False) -> None:
-        """Start queue for compute engine. Wraps start_queue with UE_MODE.
+                                            K: int, N: int, bias_enable: bool = False, lalu_mode: LALU_MODE = LALU_MODE.BYPASS, stride_z: int = UE_VECTOR_SIZE) -> None:
+        """Start queue for bf16 matvec operation. Wraps start_queue with UE_MODE.BF16_DOT_PRODUCT.
         Args:
             max_clear_en: max_clear_en
             fmax_context_addr: fmax_context_addr
@@ -1473,11 +1528,12 @@ class UnifiedEngine:
         # TODO: support non-aligned writes
         #assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
 
+        stride_in_rows = stride_z // UE_VECTOR_SIZE
         self.start_queue(
             0,  # broadcast_mode (not used for bf16 matvec operation)
             max_clear_en,  # max_clear_en
-            1,  # stride_z
-            LALU_MODE.BYPASS.value,  # lalu_mode
+            stride_in_rows,  # stride_z
+            lalu_mode.value,  # lalu_mode
             0,  # scalar
             0,  # uram_bram (URAM)
             output_uram_type.value,
@@ -1491,7 +1547,7 @@ class UnifiedEngine:
             matrix_uram_start_addr,  # uram_b_start_addr (not used for compute)
             K // UE_VECTOR_SIZE,
             0,  # dma_start_addr
-            K * N,  # dma_length
+            K * N if stride_in_rows == 1 else N * stride_z,  # dma_length
             N,  # output_size
             self._inst_id,
             bias_adder_en=bias_enable,
@@ -1815,7 +1871,7 @@ class UnifiedEngine:
         return element_size # total flops is element_size
 
     def matmat_mul_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
-                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None) -> None:
+                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False) -> None:
         # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
         # 1. M_chunk can be any value between 1 and M
         # 2. N_chunk needs to be a multiple of UE_VECTOR_SIZE
@@ -1829,6 +1885,14 @@ class UnifiedEngine:
 
         if is_B_quantized:
             assert data_type in (TYPE.INT4, TYPE.INT8, TYPE.FP4), f"data_type={data_type} must be one of TYPE.INT4, TYPE.INT8, TYPE.FP4"
+
+        assert not (gelu_enable and silu_enable), "gelu_enable and silu_enable cannot be True at the same time"
+
+        lalu_mode = LALU_MODE.BYPASS
+        if gelu_enable:
+            lalu_mode = LALU_MODE.GELU
+        elif silu_enable:
+            lalu_mode = LALU_MODE.SILU
 
         # Calculate N_chunk
         N_chunk = min(N, (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
@@ -1916,7 +1980,8 @@ class UnifiedEngine:
                                                             output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
                                                             K=K,
                                                             N=n_take,
-                                                            bias_enable=bias_enable)
+                                                            bias_enable=bias_enable,
+                                                            lalu_mode=lalu_mode)
                     clear_en = 0
 
                 # generated matrix is m_take x n_take
@@ -1970,237 +2035,273 @@ class UnifiedEngine:
             total_flops += M * N * 5
         if bias_enable:
             total_flops += M * N
+        if gelu_enable or silu_enable:
+            total_flops += 4 * M * N
         print(f"Total Theoretical FLOPS: {total_flops}")
         return total_flops
 
     def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
-                            debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, V_TRANS_DRAM_ADDR: int = None) -> None:
+                            debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
 
         bytes_per_element = 2
         bias_enable = BIAS_DRAM_ADDR is not None
 
         if debug_mode: # DEBUG only, needs to be allocated in DRAM
             assert SM_OUTPUT_DRAM_ADDR is not None, "SM_OUTPUT_DRAM_ADDR is not set for debug mode"
-            assert V_TRANS_DRAM_ADDR is not None, "V_TRANS_DRAM_ADDR is not set for debug mode"
 
-        # Q @ K^T: (seq_len, head_dim) @ (head_dim, seq_len) -> (seq_len, seq_len)
-        # Convention: first matrix Q is (M, K), second K^T is (K, N), output scores (M, N)
-        M = seq_len   # query length (rows of Q)
-        K = head_dim  # head dimension (inner product dim)
-        N = seq_len   # key length (columns of K^T)
+        # SCRATCH_DRAM_ADDR is used for V^T
+        SCRATCH_DRAM_PARTIAL_SM = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element # used for partial softmax output
+
+        # ----------------------------------------------------------------------------------------------------------------
+        # I @ V^T: (head_dim, head_dim) @ (seq_len, head_dim)^T -> (head_dim, seq_len)
+        # Convention: first matrix I is (M, K), second V^T is (K, N), output  (M, N)
+        M = head_dim   # identity length (rows of I)
+        K = head_dim  # identity dimension (inner product dim)
+        N = seq_len   # V length (columns of V^T)
 
         # Allocate identity matrix of size UE_VECTOR_SIZE x UE_VECTOR_SIZE in URAM_A start
         identity_matrix_sram_start_addr = 0x00000
-        usable_sram_start_addr = identity_matrix_sram_start_addr + UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element
-
-        # Calculate N_chunk
-        N_chunk = min(N, ((URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE) // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-        assert N_chunk >= 1 and N_chunk <= N, f"N_chunk={N_chunk} must be greater than 0 and less than N={N}"
-
-        M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, (URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE) // (K + N_chunk)) # fmax_context is UE_FMAX_CONTEXT_SIZE elements
-        assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
-
-        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}")
-        print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-        print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-
         identity_matrix_dram_addr = self.get_params_dram_addr()
         self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
         self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+
+        identity_tensor = torch.eye(head_dim, dtype=torch.bfloat16)
 
         # transfer identity matrix to URAM_A start
         self.accelerator_memory_to_sram(accelerator_dram_address=identity_matrix_dram_addr,
                                         sram_address=identity_matrix_sram_start_addr,
                                         element_size=UE_VECTOR_SIZE * UE_VECTOR_SIZE)
 
+        usable_uram_a_start_addr = identity_matrix_sram_start_addr + UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element
+
+        # URAM_B is used for V matrix, we need to chunk the V matrix into smaller chunks that can fit in URAM_B
+        usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
+        N_chunk = min(N, (usable_uram_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+        N_chunk_aligned = None
+        if N_chunk < UE_VECTOR_SIZE:
+            if (K * 32) <= usable_uram_b_elements:
+                N_chunk = 32
+            elif (K * 16) <= usable_uram_b_elements:
+                N_chunk = 16
+            else:
+                assert False, f"K={K} is too large to fit in usable URAM elements={usable_uram_b_elements}"
+            N_chunk_aligned = UE_VECTOR_SIZE
+
+        usable_uram_a_elements = URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE
+        output_N_size = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
+        M_chunk = min(M, usable_uram_a_elements // output_N_size)
+        assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
+
+        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
+        print(f"URAM_A usage: {100 * (UE_VECTOR_SIZE * UE_VECTOR_SIZE + M_chunk * output_N_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS")
+        print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+
+        output_sram_wb_addr = usable_uram_a_start_addr
+        uram_b_start_addr = 0x80000
+        for i, m_take in self.chunk_ranges(M, M_chunk):
+            for j, n_take in self.chunk_ranges(N, N_chunk):
+
+                self.accelerator_memory_to_sram(accelerator_dram_address=V_DRAM_ADDR + j * K * bytes_per_element,
+                                            sram_address=uram_b_start_addr,
+                                            element_size=n_take * K)
+
+                for output_row in range(m_take):
+                    if N_chunk_aligned is None:
+                        out_sram_offset = output_row * n_take * bytes_per_element
+                    else:
+                        out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
+
+                    ones_idx = identity_tensor[output_row+i, :].reshape(-1, UE_VECTOR_SIZE).sum(axis=1).argmax(axis=0)
+                    vector_idx = identity_tensor[output_row+i, :].reshape(-1, UE_VECTOR_SIZE)[ones_idx, :].argmax(axis=0)
+
+                    self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
+                                                            fmax_context_addr=0,
+                                                            vector_sram_start_addr=0x00000 + vector_idx * UE_VECTOR_SIZE * bytes_per_element,
+                                                            matrix_sram_start_addr=uram_b_start_addr + ones_idx * UE_VECTOR_SIZE * bytes_per_element,
+                                                            output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
+                                                            K=UE_VECTOR_SIZE,
+                                                            N=n_take,
+                                                            stride_z=m_take)
+
+                start_dram_address_of_partial_matrix = SCRATCH_DRAM_ADDR + i * N * bytes_per_element + j * bytes_per_element # the space needed is head_dim x seq_len
+
+                if N_chunk_aligned is None:
+                    self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                    accelerator_dram_address=start_dram_address_of_partial_matrix,
+                                                    element_size=m_take * n_take,
+                                                    stride_bytes_per_chunk=n_take * bytes_per_element,
+                                                    stride_jump_bytes=N * bytes_per_element)
+                else:
+                    for o_row_idx in range(m_take):
+                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
+                                                        accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
+                                                        element_size=n_take)
+
+        # ----------------------------------------------------------------------------------------------------------------
+        # Q @ K^T: (seq_len, head_dim) @ (head_dim, seq_len) -> (seq_len, seq_len)
+        # Convention: first matrix Q is (M, K), second K^T is (K, N), output scores (M, N)
+        M = seq_len   # query length (rows of Q)
+        K = head_dim  # head dimension (inner product dim)
+        N = seq_len   # key length (columns of K^T)
+        # Calculate N_chunk
+        usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
+        N_chunk = min(N, (usable_uram_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+        N_chunk_aligned = None
+        if N_chunk < UE_VECTOR_SIZE:
+            if (K * 32) <= usable_uram_b_elements:
+                N_chunk = 32
+            elif (K * 16) <= usable_uram_b_elements:
+                N_chunk = 16
+            else:
+                assert False, f"K={K} is too large to fit in usable URAM elements={usable_uram_b_elements}"
+            N_chunk_aligned = UE_VECTOR_SIZE
+
+        usable_uram_a_elements = URAM_FULL_ELEMENTS
+        output_N_size = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
+        M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, usable_uram_a_elements // (K + output_N_size))
+        assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
+
+        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
+        print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * output_N_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS")
+        print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+
+        uram_a_start_addr = 0x00000
+        uram_b_start_addr = 0x80000
         for i, m_take in self.chunk_ranges(M, M_chunk):
             self.accelerator_memory_to_sram(accelerator_dram_address=Q_DRAM_ADDR + i * K * bytes_per_element,
-                                            sram_address=usable_sram_start_addr,
+                                            sram_address=uram_a_start_addr,
                                             element_size=m_take * K)
 
             self.broadcast_mul(scalar=1 / math.sqrt(head_dim),
-                                    sram_start_addr=usable_sram_start_addr,
-                                    sram_wb_addr=usable_sram_start_addr,
+                                    sram_start_addr=uram_a_start_addr,
+                                    sram_wb_addr=uram_a_start_addr,
                                     element_size=m_take * K)
 
-            output_sram_wb_addr = usable_sram_start_addr + m_take * K * bytes_per_element
+            output_sram_wb_addr = uram_a_start_addr + m_take * K * bytes_per_element
 
             assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} is greater than 0x80000, which is the size of URAM_B"
 
             clear_en = 1
             for j, n_take in self.chunk_ranges(N, N_chunk):
                 self.accelerator_memory_to_sram(accelerator_dram_address=K_DRAM_ADDR + j * K * bytes_per_element,
-                                            sram_address=0x80000,
+                                            sram_address=uram_b_start_addr,
                                             element_size=n_take * K)
+
+                assert m_take * K + n_take * m_take<= URAM_FULL_ELEMENTS
 
                 for output_row in range(m_take):
                     if bias_enable:
                         self.accelerator_memory_to_bias_sram(accelerator_dram_address=BIAS_DRAM_ADDR + ((i + output_row) * N + j) * bytes_per_element,
                                                              element_size=n_take)
 
+                    if N_chunk_aligned is None:
+                        out_sram_offset = output_row * n_take * bytes_per_element
+                    else:
+                        out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
+
                     self.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
                                                             fmax_context_addr=output_row,
-                                                            vector_sram_start_addr=usable_sram_start_addr + output_row * K * bytes_per_element,
-                                                            matrix_sram_start_addr=0x80000,
-                                                            output_sram_wb_addr=output_sram_wb_addr + output_row * n_take * bytes_per_element,
+                                                            vector_sram_start_addr=uram_a_start_addr + output_row * K * bytes_per_element,
+                                                            matrix_sram_start_addr=uram_b_start_addr,
+                                                            output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
                                                             K=K,
                                                             N=n_take,
                                                             bias_enable=bias_enable)
                     clear_en = 0
 
                 # TODO: if FMAX_CONTEXT_SIZE x seq_len can fit in URAM_A, then we can avoid copying to DRAM, create a special case for this
-                start_dram_address_of_partial_matrix = SCRATCH_DRAM_ADDR + j * bytes_per_element # the space needed is FMAX_CONTEXT_SIZE x seq_len
+                start_dram_address_of_partial_matrix = SCRATCH_DRAM_PARTIAL_SM + j * bytes_per_element # the space needed is FMAX_CONTEXT_SIZE x seq_len
 
-                # LEGACY NOTE: This is the legacy way of copying m_take x n_take matrix to DRAM, check below for new way of copying with stride
-                # for output_row in range(m_take):
-                #     self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + output_row * n_take * bytes_per_element, # every row is n_take elements
-                #                                 accelerator_dram_address=start_dram_address_of_partial_matrix + output_row * N * bytes_per_element,
-                #                                 element_size=n_take)
-
-                # New way of copying with stride
-                self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                accelerator_dram_address=start_dram_address_of_partial_matrix,
-                                                element_size=m_take * n_take,
-                                                stride_bytes_per_chunk=n_take * bytes_per_element,
-                                                stride_jump_bytes=N * bytes_per_element)
+                if N_chunk_aligned is None:
+                    self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                    accelerator_dram_address=start_dram_address_of_partial_matrix,
+                                                    element_size=m_take * n_take,
+                                                    stride_bytes_per_chunk=n_take * bytes_per_element,
+                                                    stride_jump_bytes=N * bytes_per_element)
+                else:
+                    for o_row_idx in range(m_take):
+                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
+                                                        accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
+                                                        element_size=n_take)
 
 
             # SOFTMAX CALCULATION
             #print(f"softmax rows: {m_take * N} elements vs {URAM_FULL_ELEMENTS} elements")
             # DEBUG to get seq_len x seq_len sm(QK^T) results are copied to DRAM
             # start_dram_address_of_partial_row_complete_matrix = SM_OUTPUT_DRAM_ADDR + i * N * bytes_per_element #  make only FMAX_CONTEXT_SIZE x seq_len sm(QK^T) results are copied to DRAM
-            start_dram_address_of_partial_row_complete_matrix = SCRATCH_DRAM_ADDR # the space needed is FMAX_CONTEXT_SIZE x seq_len
             
             # if m_take * N is greater than the space available in URAM_A, copy the matrix to DRAM
-            max_m_take = min((URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE) // N, UE_FMAX_CONTEXT_SIZE)
+            max_m_take = min((URAM_FULL_ELEMENTS - UE_VECTOR_SIZE) // N, UE_FMAX_CONTEXT_SIZE) # worst case scenario, leave one row for output
 
             for m_take_chunk_idx, m_take_chunk_size in self.chunk_ranges(m_take, max_m_take):
-                self.accelerator_memory_to_sram(accelerator_dram_address=start_dram_address_of_partial_row_complete_matrix + m_take_chunk_idx * N * bytes_per_element,
-                                            sram_address=usable_sram_start_addr,
+                self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_PARTIAL_SM + m_take_chunk_idx * N * bytes_per_element,
+                                            sram_address=uram_a_start_addr,
                                             element_size=m_take_chunk_size * N)
 
                 # Reuse input sram_wb_addr for softmax output
                 for row_idx in range(m_take_chunk_size):
                     self.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
-                                                                vector_sram_start_addr=usable_sram_start_addr + row_idx * N * bytes_per_element,
-                                                                output_sram_wb_addr=usable_sram_start_addr + row_idx * N * bytes_per_element,
+                                                                vector_sram_start_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
+                                                                output_sram_wb_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
                                                                 N=N)
 
 
                 # softmax output tap point - DEBUG only
                 if debug_mode:
-                    self.sram_to_accelerator_memory(sram_address=usable_sram_start_addr,
+                    self.sram_to_accelerator_memory(sram_address=uram_a_start_addr,
                                     accelerator_dram_address=SM_OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * N * bytes_per_element,
                                     element_size=m_take_chunk_size * N)
 
-                # V transpose calculation starts herewith symmetric partitioning
-                v_row_chunk_size = min(URAM_HALF_ELEMENTS // UE_VECTOR_SIZE, seq_len)
-                v_column_chunk_size = min(URAM_HALF_ELEMENTS // seq_len, head_dim, UE_VECTOR_SIZE)
+                v_tr_row_chunk_size = min((URAM_NEAR_FULL_ELEMENTS // seq_len // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
+                                        ((URAM_FULL_ELEMENTS - m_take_chunk_size * seq_len) // m_take_chunk_size // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
+                                        head_dim)
 
-                partial_v_transpose_can_stay_in_uram_b = True
-                # if v_column_chunk_size is less than UE_VECTOR_SIZE, it means data cannot stay in URAM_B
-                if v_column_chunk_size < UE_VECTOR_SIZE:
-                    partial_v_transpose_can_stay_in_uram_b = False
-                    v_column_chunk_size = UE_VECTOR_SIZE
-                    first_partition_size = URAM_FULL_ELEMENTS - seq_len * UE_VECTOR_SIZE
-                    v_row_chunk_size = min(first_partition_size // UE_VECTOR_SIZE, seq_len)
-                    assert v_row_chunk_size >= 1 and v_row_chunk_size <= seq_len, f"v_row_chunk_size={v_row_chunk_size} must be greater than 0 and less than seq_len={seq_len}"
-
-                v_sram_start_addr = 0x80000 # URAM_B start
-                v_transpose_sram_start_addr = v_sram_start_addr + v_row_chunk_size * UE_VECTOR_SIZE * bytes_per_element
-
-                assert v_column_chunk_size >= 1 and v_column_chunk_size <= head_dim, f"v_column_chunk_size={v_column_chunk_size} must be greater than 0 and less than head_dim={head_dim}"
-
-                for v_column_inx, v_column_take in self.chunk_ranges(head_dim, v_column_chunk_size):
-                    for v_row_inx, v_row_take in self.chunk_ranges(seq_len, v_row_chunk_size):
-                        # LEGACY NOTE: This is the legacy way of copying v_row_take x v_column_take matrix to SRAM, check below for new way of copying with stride
-                        # for op_row in range(v_row_take):
-                        #     self.accelerator_memory_to_sram(accelerator_dram_address=V_DRAM_ADDR + v_row_inx * head_dim * bytes_per_element + v_column_inx * bytes_per_element + op_row * head_dim * bytes_per_element,
-                        #                                     sram_address=0x80000 + op_row * v_column_take * bytes_per_element,
-                        #                                     element_size=v_column_take)
-
-                        # New way of copying with stride
-                        self.accelerator_memory_to_sram(accelerator_dram_address=V_DRAM_ADDR + v_row_inx * head_dim * bytes_per_element + v_column_inx * bytes_per_element,
-                                                        sram_address=v_sram_start_addr,
-                                                        element_size=v_row_take * v_column_take,
-                                                        stride_bytes_per_chunk=v_column_take * bytes_per_element,
-                                                        stride_jump_bytes=head_dim * bytes_per_element)
-
-                        for op_row in range(v_column_take):
-                            self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
-                                                                    fmax_context_addr=0,
-                                                                    vector_sram_start_addr=identity_matrix_sram_start_addr + op_row * UE_VECTOR_SIZE * bytes_per_element,
-                                                                    matrix_sram_start_addr=v_sram_start_addr,
-                                                                    output_sram_wb_addr=v_transpose_sram_start_addr + op_row * v_row_take * bytes_per_element,
-                                                                    K=UE_VECTOR_SIZE,
-                                                                    N=v_row_take)
-     
-
-                        if partial_v_transpose_can_stay_in_uram_b == False:
-                            self.sram_to_accelerator_memory(sram_address=v_transpose_sram_start_addr,
-                                                            accelerator_dram_address=SCRATCH_DRAM_ADDR + v_row_inx * bytes_per_element,
-                                                            element_size=v_row_take * v_column_take,
-                                                            stride_bytes_per_chunk=v_row_take * bytes_per_element,
-                                                            stride_jump_bytes=seq_len * bytes_per_element)       
-
-                        # V^T tap point - DEBUG: Copy V^T to DRAM
-                        if debug_mode:
-                            self.sram_to_accelerator_memory(sram_address=v_transpose_sram_start_addr,
-                                                            accelerator_dram_address=V_TRANS_DRAM_ADDR + (v_column_inx * seq_len + v_row_inx) * bytes_per_element,
-                                                            element_size=v_row_take * v_column_take,
-                                                            stride_bytes_per_chunk=v_row_take * bytes_per_element,
-                                                            stride_jump_bytes=seq_len * bytes_per_element)                            
-
-                    # # V^T tap point - DEBUG: Copy V^T to DRAM if full seq_len partial matrix is available
-                    # if debug_mode:
-                    #     self.sram_to_accelerator_memory(sram_address=v_transpose_sram_start_addr,
-                    #                                     accelerator_dram_address=V_TRANS_DRAM_ADDR + v_column_inx * seq_len * bytes_per_element,
-                    #                                     element_size=seq_len * v_column_take)
-
-                    # Bring it back to URAM_B at start of URAM_B
-                    # mini partition of V^T and Softmax which is in URAM_A
-                    # matrix multiplicaion here m_take_chunk_size x seq_len @ seq_len x v_column_take = m_take_chunk_size x v_column_take
-                    # m_take_chunk_size x seq_len is in URAM_A already and known size. Let's calculate the URAM_B size needed for this operation
-                    # Known output size is m_take_chunk_size x v_column_take
-
-                    final_output_sram_wb_addr = 0x80000 # URAM_B start
-
-                    if partial_v_transpose_can_stay_in_uram_b == False:
-                        v_t_transfered_from_dram = final_output_sram_wb_addr + m_take_chunk_size * v_column_take * bytes_per_element
+                v_tr_row_chunk_size_aligned = None
+                if v_tr_row_chunk_size < UE_VECTOR_SIZE:
+                    v_tr_row_chunk_size_aligned = UE_VECTOR_SIZE
+                    if seq_len * 32 <= URAM_NEAR_FULL_ELEMENTS:
+                        v_tr_row_chunk_size = 32
+                    elif seq_len * 16 <= URAM_NEAR_FULL_ELEMENTS:
+                        v_tr_row_chunk_size = 16
                     else:
-                        v_t_transfered_from_dram = v_transpose_sram_start_addr
+                        assert False, f"v_tr_row_chunk_size={v_tr_row_chunk_size} is too large to fit in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
 
-                    # TODO: This is a temporary fix to avoid the error, need to fix this properly
-                    assert (seq_len * v_column_take + m_take_chunk_size * v_column_take) <= URAM_FULL_ELEMENTS, f"Not able to transfer partial V^T and Final Output to URAM_B"
+                v_t_sram_start_addr = 0x80000 # URAM_B start
+                output_sram_wb_addr = uram_a_start_addr + m_take_chunk_size * seq_len * bytes_per_element
 
-                    if partial_v_transpose_can_stay_in_uram_b == False:
-                        # Now we have seq_len x v_column_take matrix in URAM_B
-                        self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_ADDR,
-                                                        sram_address=v_t_transfered_from_dram,
-                                                        element_size=seq_len * v_column_take)
+                for v_tr_column_idx, v_tr_column_take in self.chunk_ranges(head_dim, v_tr_row_chunk_size):
+                    self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_ADDR + v_tr_column_idx * seq_len * bytes_per_element,
+                                                sram_address=v_t_sram_start_addr,
+                                                element_size=v_tr_column_take * seq_len)
 
-                    # After this m_take x v_column_take matrix is in 0xC0000
                     for p_row_idx in range(m_take_chunk_size):
+                        if v_tr_row_chunk_size_aligned is None:
+                            output_sram_wb_offset = p_row_idx * v_tr_column_take * bytes_per_element
+                        else:
+                            output_sram_wb_offset = 0
+
                         self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
                                                                 fmax_context_addr=0,
-                                                                vector_sram_start_addr=usable_sram_start_addr + p_row_idx * seq_len * bytes_per_element,
-                                                                matrix_sram_start_addr=v_t_transfered_from_dram,
-                                                                output_sram_wb_addr=final_output_sram_wb_addr + p_row_idx * v_column_take * bytes_per_element,
+                                                                vector_sram_start_addr=uram_a_start_addr + p_row_idx * seq_len * bytes_per_element,
+                                                                matrix_sram_start_addr=v_t_sram_start_addr,
+                                                                output_sram_wb_addr=output_sram_wb_addr + output_sram_wb_offset,
                                                                 K=seq_len,
-                                                                N=v_column_take)
+                                                                N=v_tr_column_take)
 
-                    # LEGACY NOTE: This is the legacy way of copying m_take x n_take matrix to DRAM, check below for new way of copying with stride
-                    # for ii in range(m_take):
-                    #     self.sram_to_accelerator_memory(sram_address=0x80000 + ii * v_column_take * bytes_per_element, # every row is n_take elements
-                    #                                     accelerator_dram_address=OUTPUT_DRAM_ADDR + i * head_dim * bytes_per_element + v_column_inx * bytes_per_element + ii * head_dim * bytes_per_element,
-                    #                                     element_size=v_column_take)
+                        if v_tr_row_chunk_size_aligned is not None:
+                            self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + output_sram_wb_offset,
+                                                            accelerator_dram_address=OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * head_dim * bytes_per_element
+                                                                                                        + v_tr_column_idx * bytes_per_element
+                                                                                                        + p_row_idx * head_dim * bytes_per_element,
+                                                            element_size=v_tr_column_take)
 
-                    # New way of copying with stride - Abandoned for now since we don't have enough space in URAM_B to copy the matrix
-                    self.sram_to_accelerator_memory(sram_address=final_output_sram_wb_addr,
-                                                    accelerator_dram_address=OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * head_dim * bytes_per_element + v_column_inx * bytes_per_element,
-                                                    element_size=m_take_chunk_size * v_column_take,
-                                                    stride_bytes_per_chunk=v_column_take * bytes_per_element,
-                                                    stride_jump_bytes=head_dim * bytes_per_element)
+
+                    if v_tr_row_chunk_size_aligned is None:
+                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                        accelerator_dram_address=OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * head_dim * bytes_per_element + v_tr_column_idx * bytes_per_element,
+                                                        element_size=m_take_chunk_size * v_tr_column_take,
+                                                        stride_bytes_per_chunk=v_tr_column_take * bytes_per_element,
+                                                        stride_jump_bytes=head_dim * bytes_per_element)
 
         # Total Theoretical FLOPS: seq_len * head_dim + 2 * seq_len * head_dim * seq_len + seq_len * seq_len + seq_len * seq_len * 5 + 2 * seq_len * seq_len * head_dim
         total_flops = seq_len * head_dim # q_scale 
@@ -2210,6 +2311,106 @@ class UnifiedEngine:
         total_flops += seq_len * seq_len * 5 # softmax
         total_flops += 2 * seq_len * seq_len * head_dim # sm @ v
         print(f"Total Theoretical FLOPS: {total_flops}")
+        return total_flops
+
+    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False) -> None:
+        """Quantized matrix-matrix multiplication core.
+        Args:
+            M: batch dimension (number of input vectors)
+            K: inner dimension (vector length), must be a multiple of UE_VECTOR_SIZE
+            N: outer dimension (matrix height), must be a multiple of UE_VECTOR_SIZE
+            A_DRAM_ADDR: DRAM address of input matrix
+            B_DRAM_ADDR: DRAM address of weight matrix
+            OUTPUT_DRAM_ADDR: DRAM address of output matrix
+            C_DRAM_ADDR: DRAM address of bias matrix
+            bias_enable: enable bias
+            bias_mode: bias mode
+            data_type: data type
+            SCALE_DRAM_ADDR: DRAM address of scale matrix
+            gelu_enable: enable gelu
+            silu_enable: enable silu
+        """
+        bytes_per_element = 2
+
+        bias_enable = False
+        if C_DRAM_ADDR is not None:
+            bias_enable = True
+
+        if bias_enable:
+            assert bias_mode in ("broadcast_N", "full_matrix"), f"bias_mode={bias_mode} must be either 'broadcast_N' or 'full_matrix'"
+
+        if data_type in (TYPE.INT4, TYPE.INT8, TYPE.FP4):
+            assert SCALE_DRAM_ADDR is not None, "SCALE_DRAM_ADDR must be provided when data_type is INT4, INT8, or FP4"
+
+        assert not (gelu_enable and silu_enable), "gelu_enable and silu_enable cannot be True at the same time"
+
+        lalu_mode = LALU_MODE.BYPASS
+        if gelu_enable:
+            lalu_mode = LALU_MODE.GELU
+        elif silu_enable:
+            lalu_mode = LALU_MODE.SILU
+
+        # We put entire input matrix into URAM_A, and entire output matrix into URAM_B
+
+        M_chunk = min(M, (URAM_FULL_ELEMENTS // K))
+        N_chunk = min((SCALE_BRAM_ELEMENTS // K) * UE_VECTOR_SIZE,
+                       N,
+                     ((URAM_FULL_ELEMENTS // M_chunk) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
+                     BIAS_BRAM_ELEMENTS)
+
+        assert (N * K) % UE_VECTOR_SIZE == 0, f"(N * K={N * K}) must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
+
+        print(f"M_chunk={M_chunk}, N_chunk={N_chunk}")
+
+        for M_chunk_idx, M_chunk_size in self.chunk_ranges(M, M_chunk):
+            # transfer M_chunk_size x K elements to URAM_A
+            self.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + M_chunk_idx * K * bytes_per_element,
+                                            sram_address=0x00000,
+                                            element_size=M_chunk_size * K)
+
+            for N_chunk_idx, N_take_size in self.chunk_ranges(N, N_chunk):
+
+                if bias_enable and bias_mode == "broadcast_N":
+                    self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + N_chunk_idx * bytes_per_element,
+                                                        element_size=N_take_size)
+
+                for vector_idx in range(M_chunk_size): # for each input vector
+
+                    if bias_enable and bias_mode == "full_matrix":
+                        self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + ((M_chunk_idx + vector_idx) * N + N_chunk_idx) * bytes_per_element,
+                                                            element_size=N_take_size)
+
+                    self.accelerator_memory_to_scale_sram(accelerator_dram_address=SCALE_DRAM_ADDR + ((N_chunk_idx * K) // UE_VECTOR_SIZE) * bytes_per_element,
+                                                        element_size=(N_take_size * K) // UE_VECTOR_SIZE)
+
+                    if data_type == TYPE.FP4 or data_type == TYPE.INT4:
+                        dma_offset = N_chunk_idx * K // 2
+                    elif data_type == TYPE.INT8:
+                        dma_offset = N_chunk_idx * K
+                    else:
+                        assert False, f"data_type={data_type} is not supported"
+
+                    self.start_queue_for_dot_product_operation(max_clear_en=0,
+                                                                fmax_context_addr=0,
+                                                                vector_sram_start_addr=0x00000 + vector_idx * K * bytes_per_element,
+                                                                output_sram_wb_addr=0x80000 + vector_idx * N_take_size * bytes_per_element,
+                                                                K=K,
+                                                                N=N_take_size,
+                                                                dma_start_addr=B_DRAM_ADDR + dma_offset,
+                                                                bias_enable=bias_enable,
+                                                                lalu_mode=lalu_mode)
+
+                self.sram_to_accelerator_memory(sram_address=0x80000,
+                                                accelerator_dram_address=OUTPUT_DRAM_ADDR + (M_chunk_idx * N + N_chunk_idx) * bytes_per_element,
+                                                element_size=M_chunk_size * N_take_size,
+                                                stride_bytes_per_chunk=N_take_size * bytes_per_element,
+                                                stride_jump_bytes=N * bytes_per_element)
+
+        total_flops = 2 * M * N * K
+        if bias_enable:
+            total_flops += M * N
+        if gelu_enable or silu_enable:
+            total_flops += 4 * M * N
         return total_flops
 
     def start_capture(self):

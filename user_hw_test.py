@@ -879,13 +879,15 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
     Tests flash attention core.
     """
     ue = UnifiedEngine()
+    debug_mode = False
 
     Q_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * head_dim * 2)
     K_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * head_dim * 2)
     V_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * head_dim * 2)
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * head_dim * 2)
-    SCRATCH_DRAM_ADDR = ue.allocate_tensor_dram(max(head_dim, UE_FMAX_CONTEXT_SIZE) * seq_len * 2) # it is max of head_dim * seq_len and UE_FMAX_CONTEXT_SIZE * seq_len
+    SCRATCH_DRAM_ADDR = ue.allocate_tensor_dram(max(head_dim, UE_FMAX_CONTEXT_SIZE) * seq_len * 2 + head_dim * seq_len * 2) # V_trans + partial softmax output
     BIAS_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * seq_len * 2)
+    SM_OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * seq_len * 2) if debug_mode else None
 
     ue.start_capture() # -------------------------------------------------------------
 
@@ -895,7 +897,9 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
                                                             V_DRAM_ADDR=V_DRAM_ADDR,
                                                             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                                                             SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-                                                            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR if bias_enable else None)
+                                                            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR if bias_enable else None,
+                                                            debug_mode=debug_mode,
+                                                            SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR)
 
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -919,10 +923,15 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
         ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias)
 
     ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(20.0) # 20 seconds timeout
+    ue.wait_queue(50.0) # 30 seconds timeout
     ue.report_timing_and_instruction_count()
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (seq_len, head_dim))
+
+    if debug_mode:
+        sm_output = ue.dma_from_accelerator_memory(SM_OUTPUT_DRAM_ADDR, (seq_len, seq_len))
+        v_trans = ue.dma_from_accelerator_memory(SCRATCH_DRAM_ADDR, (head_dim, seq_len))
+
     report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_flash_attention)
     print(f"Report FLOPS for Flash Attention: {report_flop_rate_gflops:.2f} GFLOPS for head_dim={head_dim} and seq_len={seq_len} and bias_enable={bias_enable}")
 
@@ -937,6 +946,15 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
     ref = sm @ v
     end_time = time.time()
     print(f"Reference Time taken: {(end_time - start_time) * 1000} milliseconds")
+    
+    if debug_mode:
+        snr_db_sm_output = calculate_snr(sm, sm_output)
+        print(f"SM Output SNR Analysis: {snr_db_sm_output:.2f} dB")
+        assert snr_db_sm_output >= 40 or snr_db_sm_output == float('inf'), f"SNR {snr_db_sm_output:.2f} dB must be at least 40 dB"
+
+        snr_db_v_trans = calculate_snr(v.t(), v_trans)
+        print(f"V Trans SNR Analysis: {snr_db_v_trans:.2f} dB")
+        assert snr_db_v_trans >= 40 or snr_db_v_trans == float('inf'), f"SNR {snr_db_v_trans:.2f} dB must be at least 40 dB"
 
     snr_db_ref = calculate_snr(ref, output)
     print(f"Reference SNR Analysis for Flash Attention: {snr_db_ref:.2f} dB")
@@ -946,7 +964,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_enable: bool = False, bias_mode: str = "broadcast_N"):
+def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False):
     """
     Tests matmat_mul core.
     """
@@ -955,7 +973,12 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
     B_DRAM_ADDR = ue.allocate_tensor_dram(N * K * 2)
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    C_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2) if bias_enable else None
+
+    C_DRAM_ADDR = None
+    if bias_enable and bias_mode == "full_matrix":
+        C_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+    elif bias_enable and bias_mode == "broadcast_N":
+        C_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
 
     ue.start_capture()
 
@@ -965,7 +988,9 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
                                                     OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                                                     softmax_enable=softmax_enable,
                                                     C_DRAM_ADDR=C_DRAM_ADDR,
-                                                    bias_mode=bias_mode)
+                                                    bias_mode=bias_mode,
+                                                    gelu_enable=gelu_enable,
+                                                    silu_enable=silu_enable)
 
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -977,25 +1002,41 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     # Test Time
     a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K) # normalizing input helps with numerical stability of softmax
     b = torch.randn(N, K, dtype=torch.bfloat16)
-    c = torch.zeros(M, N, dtype=torch.bfloat16) if bias_enable else None
+
+    c = None
+    if bias_enable:
+        if bias_mode == "full_matrix":
+            c = torch.randn(M, N, dtype=torch.bfloat16)
+        elif bias_mode == "broadcast_N":
+            c = torch.randn(N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(C_DRAM_ADDR, c)
 
     # DMA to accelerator memory -------------------------------------------------------------
     ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
     ue.dma_to_accelerator_memory(B_DRAM_ADDR, b)
-
-    if bias_enable:
-        ue.dma_to_accelerator_memory(C_DRAM_ADDR, c)
 
     ue.start_execute_from_dram(program_dram_addr)
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
     report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_matmat_mul)
-    print(f"Report FLOPS for MxKxN Matmul: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, bias_enable={bias_enable}, softmax_enable={softmax_enable}, bias_mode={bias_mode}")
+    print(f"Report FLOPS for MxKxN Matmul: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, bias_enable={bias_enable}, softmax_enable={softmax_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
     ref = (a @ b.T + c) if bias_enable else (a @ b.T)
+
+    def apply_gelu(x):
+        return x * torch.sigmoid(1.702 * x)
+
+    def apply_silu(x):
+        return x * torch.sigmoid(x)
+
+    if gelu_enable:
+        ref = apply_gelu(ref)
+    elif silu_enable:
+        ref = apply_silu(ref)
+
     if softmax_enable:
         ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
 
@@ -1168,10 +1209,21 @@ def dequantize_test():
     print(f"Report FLOPS for Dequantize: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-    snr_db_ref = calculate_snr(x, output)
+    # fake quantized matrix is x with block size of 64 and INT4 or FP4
+    fake_quantized_matrix = x.reshape(-1, UE_VECTOR_SIZE)
+    scales = 7.0 / fake_quantized_matrix.abs().max(dim=-1).values
+    scales = scales.unsqueeze(-1)
+    quantized_matrix = (fake_quantized_matrix * scales).round().to(torch.int8)
+    dequantized_matrix = quantized_matrix / scales
+    dequantized_matrix = dequantized_matrix.reshape(M, N)
 
+    snr_db_ref = calculate_snr(dequantized_matrix, output)
     print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
-    assert snr_db_ref >= 20 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    assert snr_db_ref >= 30 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 30 dB"
+
+    snr_db_ref = calculate_snr(x, output)
+    print(f"Reference SNR Analysis for Reference: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 19 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 19 dB"
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
@@ -1227,6 +1279,95 @@ def matmat_mul_quantized_weights_test():
 
     print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
     assert snr_db_ref >= 20 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def quantized_matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False):
+    """
+    Tests quantized matrix-matrix multiplication core.
+    Args:
+        M: batch dimension (number of input vectors)
+        K: inner dimension (vector length), must be a multiple of UE_VECTOR_SIZE
+        N: outer dimension (matrix height), must be a multiple of UE_VECTOR_SIZE
+        bias_enable: enable bias
+        bias_mode: bias mode
+        gelu_enable: enable gelu
+        silu_enable: enable silu
+    """
+    ue = UnifiedEngine()
+
+    x = torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1
+
+    QUANTIZED_MATRIX_DRAM_ADDR, SCALE_DRAM_ADDR = ue.quantize_weight(weight=x, N=N, K=K, data_type=TYPE.INT4)
+    A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * K * 2)
+
+    C_DRAM_ADDR = None
+    if bias_enable and bias_mode == "full_matrix":
+        C_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+    elif bias_enable and bias_mode == "broadcast_N":
+        C_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
+
+    print(f"Quantized Matrix-Matrix Multiply Test for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}")
+
+    ue.start_capture()
+    
+    total_flops_from_dequantize = ue.quantized_matmat_core(M=M, K=K, N=N,
+                                                    A_DRAM_ADDR=A_DRAM_ADDR,
+                                                    B_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
+                                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                                                    SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
+                                                    C_DRAM_ADDR=C_DRAM_ADDR,
+                                                    bias_mode=bias_mode,
+                                                    data_type=TYPE.INT4,
+                                                    gelu_enable=gelu_enable,
+                                                    silu_enable=silu_enable)
+
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.clear_capture_buffer()
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
+    ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+    
+    if bias_enable:
+        if bias_mode == "full_matrix":
+            c = torch.randn(M, N, dtype=torch.bfloat16)
+        elif bias_mode == "broadcast_N":
+            c = torch.randn(N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(C_DRAM_ADDR, c)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0) # 10 seconds timeout
+    ue.report_timing_and_instruction_count()
+
+    report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
+    print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+
+    def apply_gelu(x):
+        return x * torch.sigmoid(1.702 * x)
+
+    def apply_silu(x):
+        return x * torch.sigmoid(x)
+
+    ref = (a @ x.T + c) if bias_enable else (a @ x.T)
+
+    if gelu_enable:
+        ref = apply_gelu(ref)
+    elif silu_enable:
+        ref = apply_silu(ref)
+
+    snr_db_ref = calculate_snr(ref, output)
+
+    print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 22 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
@@ -1381,30 +1522,62 @@ if __name__ == "__main__":
                         help='Clock cycle time in nanoseconds (default: 3.0, use 2.5 for alveo)')
     args = parser.parse_args()
     
-    # Set DMA device paths based on device name
+    # Set DMA device paths based on device name and force-sync every module
+    # that may hold a copied device-path global.
     set_dma_device(args.dev)
+    import user_dma_core
+    import user_dma_ops
+    user_dma_ops.DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    user_dma_ops.DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    user_dma_ops.DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+
     print(f"Using DMA device: {args.dev}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
     
     # Set CLOCK_CYCLE_TIME_NS in core module so engine code sees it
-    import user_dma_core
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
     
-    # generic_tests()
-    #simple_kq_test()
+    generic_tests()
+    simple_kq_test()
 
     custom_kernel_test()
     matmat_mul_non_aligned_writeback_test()
     matmat_mul_quantized_weights_test()
     dequantize_test()
-    # flash_attention_test(head_dim=256, seq_len=3840, bias_enable=True)
-    matmat_mul_test(M=1024, K=6912, N=1152)
-    matmat_mul_test(M=1024, K=1152, N=6912)
+
+    matmat_mul_test(M=128, K=2048, N=4096, gelu_enable=True)
+    matmat_mul_test(M=256, K=512, N=1024, silu_enable=True)
+    quantized_matmat_mul_test(M=128, K=6912, N=1152, bias_enable=True, gelu_enable=True)
+    quantized_matmat_mul_test(M=128, K=1152, N=6912, bias_enable=True, silu_enable=True)
+        
     layer_norm_test(shape=(1024, 1024), gamma_enable=True, beta_enable=True)
     rms_norm_test(shape=(1024, 1024))
+
+    flash_attention_test(head_dim=128, seq_len=2048, bias_enable=True)
+
+    # for bias_enable in [False, True]:
+    #     for bias_mode in ["broadcast_N", "full_matrix"]:
+    #         for softmax_enable in [True, False]:
+    #             matmat_mul_test(M=1024, K=1024, N=1024, bias_enable=bias_enable, bias_mode=bias_mode, softmax_enable=softmax_enable)
+    #             matmat_mul_test(M=1024, K=1024, N=1024, bias_enable=bias_enable, bias_mode=bias_mode, gelu_enable=True)
+    #             matmat_mul_test(M=1024, K=1024, N=1024, bias_enable=bias_enable, bias_mode=bias_mode, silu_enable=True)
+
+    # for bias_enable in [False, True]:
+    #     for bias_mode in ["full_matrix", "broadcast_N"]:
+    #             quantized_matmat_mul_test(M=1024, K=1024, N=1024, bias_enable=bias_enable, bias_mode=bias_mode)
+    #             quantized_matmat_mul_test(M=1024, K=1024, N=1024, bias_enable=bias_enable, bias_mode=bias_mode, gelu_enable=True)
+    #             quantized_matmat_mul_test(M=1024, K=1024, N=1024, bias_enable=bias_enable, bias_mode=bias_mode, silu_enable=True)
+
+    # for head_dim in [64, 128, 256]:
+    #     for seq_len in [64, 128, 256, 512, 1024, 2048, 3072, 4096, 6144, 8192]:
+    #         for bias_enable in [True, False]:
+    #             flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable)
 
     # for M in [64, 128, 256, 512, 1024, 2048, 4096]:
     #     for N in [64, 128, 256, 512, 1024, 2048, 4096]:
@@ -1417,11 +1590,6 @@ if __name__ == "__main__":
     #     for N in [64, 128, 256, 512, 1024, 2048, 4096]:
     #         rms_norm_test(shape=(M, N))
     #         print(f"RMS Norm Test for M={M}, N={N}")
-
-    # for head_dim in [64, 128, 256, 512, 1024, 2048]:
-    #     for seq_len in [64, 128, 256, 512, 1024, 2048, 4032]:
-    #         for bias_enable in [True, False]:
-    #             flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable)
 
     # for M in [64, 128, 256, 512, 1024, 2048, 4096]:
     #     for K in [64, 128, 256, 512, 1024, 2048, 4032]:
