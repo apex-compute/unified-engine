@@ -24,78 +24,49 @@ Load the XDMA driver with interrupt mode 0 (auto-detect):
 sudo insmod /lib/modules/$(uname -r)/xdma/xdma.ko interrupt_mode=0
 ```
 
-### 4. Verify Installation
+### 3. Load the Driver Every Boot Automatically
 
-Check that the driver loaded successfully:
+Apply the following script
 ```bash
-# Check module is loaded
-lsmod | grep xdma
+# 1. Remove any conflicting configs
+sudo rm -f /etc/modprobe.d/blacklist-xdma.conf \
+           /etc/modprobe.d/xdma.conf \
+           /etc/modules-load.d/xdma.conf
 
-# Check for XDMA devices
-ls -la /dev/xdma*
+# 2. Create systemd service
+sudo tee /etc/systemd/system/xdma.service << 'EOF'
+[Unit]
+Description=Xilinx XDMA Driver
+After=local-fs.target
 
-# Verify PCIe binding
-lspci -k | grep -A 3 xdma
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/sbin/insmod /lib/modules/$(uname -r)/xdma/xdma.ko || true'
+ExecStartPost=/bin/sh -c 'chmod 666 /dev/xdma*'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 3. Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable xdma
+sudo systemctl restart xdma
+
+# 4. Verify
+sudo systemctl status xdma
+ls -la /dev/xdma* | head -5
 ```
 
-Expected devices:
-- `/dev/xdma0_h2c_0` - Host to Card (write)
-- `/dev/xdma0_c2h_0` - Card to Host (read)
+### 4. Run Tests
 
-## Usage
-
-### Read from FPGA (Card to Host)
 ```bash
-sudo ./dma_from_device --verbose \
-    --device /dev/xdma0_c2h_0 \
-    --address 0x30900004 \
-    --size 4 \
-    --file RECV
+python -m venv my_env
+source my_venv/bin/activate
+pip install torch
+python3 user_hw_test.py
 ```
-
-**Parameters:**
-- `--device`: XDMA device node (c2h = card to host)
-- `--address`: Memory address on the AXI bus
-- `--size`: Number of bytes to read
-- `--file`: Output file to save data
-
-### Write to FPGA (Host to Card)
-```bash
-sudo ./dma_to_device --verbose \
-    --device /dev/xdma0_h2c_0 \
-    --address 0x80000000 \
-    --size 4 \
-    --file TEST
-```
-
-**Parameters:**
-- `--device`: XDMA device node (h2c = host to card)
-- `--address`: Memory address on the AXI bus
-- `--size`: Number of bytes to write
-- `--file`: Input file containing data to write
-
-## Interrupt Modes
-
-The `interrupt_mode` parameter controls how the driver handles interrupts:
-
-- `0` - Auto-detect (MSI-X → MSI → Legacy)
-- `1` - MSI (Message Signaled Interrupts)
-- `2` - Legacy interrupts
-- `3` - MSI-X (Extended MSI)
-- `poll_mode=1` - Polling only (no interrupts)
-
-## Simple C API
-
-For programmatic access, see `simple_dma.c` which provides:
-```c
-// Read from FPGA
-int dma_read(const char *device, uint64_t address, void *buffer, size_t size);
-
-// Write to FPGA  
-int dma_write(const char *device, uint64_t address, const void *buffer, size_t size);
-```
-
-Compile: `gcc -o simple_dma simple_dma.c`
 
 ## References
 
