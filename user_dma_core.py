@@ -1871,7 +1871,7 @@ class UnifiedEngine:
         return element_size # total flops is element_size
 
     def matmat_mul_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
-                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, scale: float = None, gelu_enable: bool = False, silu_enable: bool = False) -> None:
+                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False) -> None:
         # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
         # 1. M_chunk can be any value between 1 and M
         # 2. N_chunk needs to be a multiple of UE_VECTOR_SIZE
@@ -1937,12 +1937,6 @@ class UnifiedEngine:
             self.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * K * bytes_per_element,
                                             sram_address=0x00000,
                                             element_size=m_take * K)
-
-            if scale is not None:
-                self.broadcast_mul(scalar=scale,
-                                   sram_start_addr=0x00000,
-                                   sram_wb_addr=0x00000,
-                                   element_size=m_take * K)
 
             output_sram_wb_addr = 0x00000 + m_take * K * bytes_per_element
             assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} is greater than or equal to 0x80000, which is the size of URAM_B"
