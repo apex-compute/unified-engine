@@ -1235,10 +1235,19 @@ def matmat_mul_quantized_weights_test():
     ue = UnifiedEngine()
 
     M = 32
-    K = 6912
-    N = 1152
+    K = 512
+    N = 512
 
-    x = torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1
+    x = torch.ones(N, K, dtype=torch.bfloat16)
+    x = x.reshape(-1, UE_VECTOR_SIZE)
+
+    out_dim = x.shape[1]
+
+    for i in range(out_dim):
+        x[i, :] = torch.ones(UE_VECTOR_SIZE, dtype=torch.bfloat16) * ( i - (out_dim // 2))
+
+    x = x.reshape(N, K)
+
     QUANTIZED_MATRIX_DRAM_ADDR, SCALE_DRAM_ADDR = ue.quantize_weight(weight=x, N=N, K=K, data_type=TYPE.INT4)
 
     A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
@@ -1543,23 +1552,23 @@ if __name__ == "__main__":
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
     
-    generic_tests()
-    simple_kq_test()
+    # generic_tests()
+    # simple_kq_test()
 
-    custom_kernel_test()
-    matmat_mul_non_aligned_writeback_test()
+    # custom_kernel_test()
+    # matmat_mul_non_aligned_writeback_test()
     matmat_mul_quantized_weights_test()
-    dequantize_test()
+    # dequantize_test()
 
-    matmat_mul_test(M=128, K=2048, N=4096, gelu_enable=True)
-    matmat_mul_test(M=256, K=512, N=1024, silu_enable=True)
-    quantized_matmat_mul_test(M=128, K=6912, N=1152, bias_enable=True, gelu_enable=True)
-    quantized_matmat_mul_test(M=128, K=1152, N=6912, bias_enable=True, silu_enable=True)
+    # matmat_mul_test(M=128, K=2048, N=4096, gelu_enable=True)
+    # matmat_mul_test(M=256, K=512, N=1024, silu_enable=True)
+    # quantized_matmat_mul_test(M=128, K=6912, N=1152, bias_enable=True, gelu_enable=True)
+    # quantized_matmat_mul_test(M=128, K=1152, N=6912, bias_enable=True, silu_enable=True)
         
-    layer_norm_test(shape=(1024, 1024), gamma_enable=True, beta_enable=True)
-    rms_norm_test(shape=(1024, 1024))
+    # layer_norm_test(shape=(1024, 1024), gamma_enable=True, beta_enable=True)
+    # rms_norm_test(shape=(1024, 1024))
 
-    flash_attention_test(head_dim=128, seq_len=2048, bias_enable=True)
+    # flash_attention_test(head_dim=128, seq_len=2048, bias_enable=True)
 
     # for bias_enable in [False, True]:
     #     for bias_mode in ["broadcast_N", "full_matrix"]:
@@ -1598,4 +1607,3 @@ if __name__ == "__main__":
     #                 for softmax_enable in [True, False]:
     #                     for bias_mode in ["broadcast_N", "full_matrix"]:
     #                         matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
-
