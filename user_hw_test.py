@@ -1552,18 +1552,18 @@ if __name__ == "__main__":
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
     
-    # generic_tests()
-    # simple_kq_test()
+    generic_tests()
+    simple_kq_test()
 
-    # custom_kernel_test()
-    # matmat_mul_non_aligned_writeback_test()
+    custom_kernel_test()
+    matmat_mul_non_aligned_writeback_test()
     matmat_mul_quantized_weights_test()
-    # dequantize_test()
+    dequantize_test()
 
-    # matmat_mul_test(M=128, K=2048, N=4096, gelu_enable=True)
-    # matmat_mul_test(M=256, K=512, N=1024, silu_enable=True)
-    # quantized_matmat_mul_test(M=128, K=6912, N=1152, bias_enable=True, gelu_enable=True)
-    # quantized_matmat_mul_test(M=128, K=1152, N=6912, bias_enable=True, silu_enable=True)
+    matmat_mul_test(M=128, K=2048, N=4096, gelu_enable=True)
+    matmat_mul_test(M=256, K=512, N=1024, silu_enable=True)
+    quantized_matmat_mul_test(M=128, K=6912, N=1152, bias_enable=True, gelu_enable=True)
+    quantized_matmat_mul_test(M=128, K=1152, N=6912, bias_enable=True, silu_enable=True)
         
     # layer_norm_test(shape=(1024, 1024), gamma_enable=True, beta_enable=True)
     # rms_norm_test(shape=(1024, 1024))
