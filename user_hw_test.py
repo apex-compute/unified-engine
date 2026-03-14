@@ -17,6 +17,7 @@ import threading
 from read_trace import generate_trace
 import torch
 
+import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_C2H,
     DMA_DEVICE_H2C,
@@ -116,8 +117,8 @@ def matmat_mul_two_engine_flag_check_test(
     ue1.start_execute_from_dram(e1_prog_addr)
 
     ue1.wait_queue(10.0)
-    generate_trace(ue0, f"matmat_mul_core_trace_0_{M_three_fourth}_{K}_{N}.csv", clock_period_ns=3.0)
-    generate_trace(ue1, f"matmat_mul_core_trace_1_{M_one_fourth}_{K}_{N}.csv", clock_period_ns=3.0)
+    generate_trace(ue0, f"matmat_mul_core_trace_0_{M_three_fourth}_{K}_{N}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
+    generate_trace(ue1, f"matmat_mul_core_trace_1_{M_one_fourth}_{K}_{N}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     out_top = ue0.dma_from_accelerator_memory(e0_out_addr, (M_three_fourth, N))
     out_bot = ue1.dma_from_accelerator_memory(e1_out_addr, (M_one_fourth, N))
@@ -178,8 +179,8 @@ def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = Fal
     flop_rate_gflops = total_flops_from_matmat_mul / (latency_us * 1e3)
     print(f"Report FLOPS for two-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, silu_enable={silu_enable}")
 
-    generate_trace(ue0, f"matmat_mul_two_cores_trace_engine0_{M // 2}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv", clock_period_ns=3.0)
-    generate_trace(ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv", clock_period_ns=3.0)
+    generate_trace(ue0, f"matmat_mul_two_cores_trace_engine0_{M // 2}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
+    generate_trace(ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     output = ue0.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
     ref = a @ b.T
@@ -258,7 +259,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
     ue.wait_queue(50.0) # 30 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"flash_attention_core_trace_{head_dim}_{seq_len}_{'bias_enabled' if bias_enable else 'bias_disabled'}.csv", clock_period_ns=3.0)
+    generate_trace(ue, f"flash_attention_core_trace_{head_dim}_{seq_len}_{'bias_enabled' if bias_enable else 'bias_disabled'}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (seq_len, head_dim))
 
@@ -377,7 +378,7 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     print(f"Reference SNR Analysis for MxKxN Matmul: {snr_db_ref:.2f} dB")
     assert snr_db_ref >= 40 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
 
-    generate_trace(ue, f"matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv", clock_period_ns=3.0)
+    generate_trace(ue, f"matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
@@ -480,7 +481,7 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"layer_norm_core_trace_{M}_{N}_{'gamma_enabled' if gamma_enable else 'gamma_disabled'}_{'beta_enabled' if beta_enable else 'beta_disabled'}.csv", clock_period_ns=3.0)
+    generate_trace(ue, f"layer_norm_core_trace_{M}_{N}_{'gamma_enabled' if gamma_enable else 'gamma_disabled'}_{'beta_enabled' if beta_enable else 'beta_disabled'}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_layer_norm)
     print(f"Report FLOPS for Layer Norm: {flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}, gamma_enable={gamma_enable}, beta_enable={beta_enable}")
@@ -707,7 +708,7 @@ def dequantize_test():
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"dequantize_core_trace_{M}_{N}.csv", clock_period_ns=3.0)
+    generate_trace(ue, f"dequantize_core_trace_{M}_{N}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
     print(f"Report FLOPS for Dequantize: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
@@ -801,7 +802,7 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"matmat_mul_quantized_weights_core_trace_{M}_{K}_{N}_{data_type}.csv", clock_period_ns=3.0)
+    generate_trace(ue, f"matmat_mul_quantized_weights_core_trace_{M}_{K}_{N}_{data_type}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
     print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
@@ -894,7 +895,7 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv", clock_period_ns=3.0)
+    generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
     print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
@@ -979,7 +980,7 @@ def matmat_mul_non_aligned_writeback_test():
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"matmat_mul_non_aligned_writeback_core_trace_{M}_{K}_{N}.csv", clock_period_ns=3.0)
+    generate_trace(ue, f"matmat_mul_non_aligned_writeback_core_trace_{M}_{K}_{N}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
@@ -1331,7 +1332,7 @@ def quantized_fp4_test():
     flop_rate_gflops = ue.report_flop_rate_gflops(N * K * 2)
     print(f"Report FLOPS for Quantized FP4: {flop_rate_gflops:.2f} GFLOPS for N={N}, K={K}")
 
-    generate_trace(ue, f"quantized_fp4_core_trace_{N}_{K}.csv", clock_period_ns=3.0)
+    generate_trace(ue, f"quantized_fp4_core_trace_{N}_{K}.csv", clock_period_ns=user_dma_core.CLOCK_CYCLE_TIME_NS)
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (1, N * K // 4))
     ref = ue.dma_from_accelerator_memory(QUANTIZED_MATRIX_DRAM_ADDR, (1, N * K// 4))

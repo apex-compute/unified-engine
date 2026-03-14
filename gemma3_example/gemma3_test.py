@@ -15,13 +15,22 @@ Weights:
 Usage:
   python gemma3_test.py
   python gemma3_test.py --prompt "your prompt"
-  python gemma3_test.py --dev xdma0 [--cycle 5.88]
+  python gemma3_test.py --dev xdma0 [--cycle 5.62]
   python gemma3_test.py --local-weights
+  python gemma3_test.py --dual-engine
+
+Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in the same folder.
+  user_dma_core.py is one folder up; that parent is added to sys.path.
 """
 
 import json
 import math
 import os
+import sys
+
+# This file's folder: gemma3_bin/, *.json, decoder_program.json live here. user_dma_core is one level up.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 
 import numpy as np
 import torch
@@ -30,7 +39,7 @@ from huggingface_hub import snapshot_download
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -71,17 +80,16 @@ def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 6
     scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
     return (data_bytes, scale_bytes)
 
-def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
+def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
     """Generate full_model_weights.bin from Hugging Face model per gemma3_config.json layout.
-    Returns the path to the written file. Use this bin to replace full_model_weights.bin."""
-    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-    cfg = _load_config(script_dir)
+    Returns the path to the written file."""
+    cfg = Gemma3_UnifiedEngine.load_config(config_path=config_path, script_dir=SCRIPT_DIR)
     weight_defs = cfg["_weight_defs"]
     paths = cfg["paths"]
-    paths_full = os.path.join(script_dir, paths["weights_bin"])
+    paths_full = os.path.join(SCRIPT_DIR, paths["weights_bin"])
     out_path = output_path or paths_full
 
-    model, model_dir = _ensure_hf_model(script_dir, cfg)
+    model, model_dir = _ensure_hf_model(SCRIPT_DIR, cfg)
     gamma_offset = cfg["special"]["rms_norm"]["gamma_offset"]
     emb_cfg = cfg["special"]["embedding"]
     token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
@@ -227,32 +235,19 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     )
     return model, model_dir
 
-def _load_config(script_dir: str) -> dict:
-    """Load gemma3_config.json and build weight_defs (offset/size dict) from regions."""
-    config_path = os.path.join(script_dir, "gemma3_bin", "gemma3_config.json")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-    weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
-    for key, r in cfg.get("regions", {}).items():
-        weight_defs[key] = _parse_offset(r["offset"])
-        weight_defs[f"{key}_SIZE"] = r["size"]
-    for key, r in cfg.get("non_layer_regions", {}).items():
-        weight_defs[key] = _parse_offset(r["offset"])
-        weight_defs[f"{key}_SIZE"] = r["size"]
-    cfg["_weight_defs"] = weight_defs
-    return cfg
-
-# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # Gemma3 unified engine
 # -----------------------------------------------------------------------------
 class Gemma3_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine with Gemma3 dims: loads config + weight bin, compile_prefill/compile_decoder, run_prefill/run_decoder. Numeric checks in gemma3_numeric.py."""
 
-    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        super().__init__()
-        self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        self._cfg = _load_config(self.script_dir)
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False):
+        program_dram_base = DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else DRAM_INSTRUCTION_ADDR
+        engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
+        super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
+        self.dual_engine = dual_engine
+        self.script_dir = script_dir or SCRIPT_DIR
+        self._cfg = self.load_config(script_dir=self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
         fi = self._cfg["file_info"]
@@ -264,7 +259,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.bytes_per_element = fi["bytes_per_element"]
         self.group_size = fi["group_size"]
         self.mlp_elements = fi["mlp_elements"]
-        self.hf_model_dir = hf_model_dir or os.path.join(self.script_dir, paths["hf_model_dir"])
         self.q_size = self.head_dim * self.group_size * self.bytes_per_element
         self.k_size = self.head_dim * self.bytes_per_element
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
@@ -279,15 +273,45 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._rope_global_layers = set(model["rope_global_layers"])
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
         self._gamma_bin_offset = self._cfg["special"]["rms_norm"]["gamma_offset"]
+        self.prefill_seq = None 
+        self.engine_slave = engine_slave
 
-        bin_path = weights_bin or paths["weights_bin"]
-        full_path = os.path.join(self.script_dir, bin_path)
-        if not os.path.exists(full_path):
-            raise FileNotFoundError(f"Bin file not found: {full_path}")
-        with open(full_path, "rb") as f:
-            self.weight_bin = f.read()
+        self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
+
+    @staticmethod
+    def load_config(config_path: str | None = None, script_dir: str | None = None) -> dict:
+        """Load gemma3_config.json and build weight_defs (offset/size dict) from regions."""
+        if config_path is None:
+            script_dir = script_dir or SCRIPT_DIR
+            config_path = os.path.join(script_dir, "gemma3_config.json")
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+        weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
+        for key, r in cfg.get("regions", {}).items():
+            weight_defs[key] = _parse_offset(r["offset"])
+            weight_defs[f"{key}_SIZE"] = r["size"]
+        for key, r in cfg.get("non_layer_regions", {}).items():
+            weight_defs[key] = _parse_offset(r["offset"])
+            weight_defs[f"{key}_SIZE"] = r["size"]
+        cfg["_weight_defs"] = weight_defs
+        return cfg
+
+    def set_prefill_seq(self, prompt: str | None = None) -> None:
+        """Set self.prefill_seq from a text prompt (tokenize with chat template) or from config default."""
+        if prompt is not None:
+            conversation = [{"role": "user", "content": prompt}]
+            prompt_with_template = self.tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True
+            )
+            self.prefill_seq = tuple(self.tokenizer.encode(prompt_with_template, add_special_tokens=True))
+            print(f"Prefill from prompt ({len(self.prefill_seq)} tokens): {prompt!r}")
+            print(f"Sequence ids: {self.prefill_seq}")
+        else:
+            self.prefill_seq = tuple(self._cfg["default_prefill_tokens"])
+            # Dummy 510 prefill tokens, all value 107
+            # self.prefill_seq = (2,) * 60
 
     def reset_isa_reg_counter(self) -> None:
         """Reset the ISA register allocation counter to 1 (register 0 is hard-wired zero)."""
@@ -757,7 +781,15 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             setattr(self, attr, addr)
 
     def weight_init(self) -> None:
-        """Initialize DRAM from weight bin: load HF embedding+tokenizer, layers from bin, host-computed RoPE, then OUTPUT_NORM/LM_HEAD from bin."""
+        """Ensure weight bin exists (generate from HF if missing), load it, then initialize DRAM: embedding, layers from bin, RoPE, OUTPUT_NORM/LM_HEAD."""
+        full_path = os.path.join(self.script_dir, self._weights_bin_rel)
+        if os.path.exists(full_path):
+            print(f"Weight bin exists, skip generation: {full_path}")
+        else:
+            print(f"Weight bin not found, generating: {full_path}")
+            weight_bin_generate(output_path=full_path)
+        with open(full_path, "rb") as f:
+            self.weight_bin = f.read()
         model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
         embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
         embedding_scale = model.config.hidden_size ** 0.5
@@ -782,7 +814,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             f"Layer 0 size mismatch: computed {layer0_end} != LAYER_WEIGHT_SIZE {LAYER_WEIGHT_SIZE}"
         )
 
-        print(f"\n--- Weights DRAM allocation, start at DRAM address: {self.get_params_dram_addr()} ---")
+        print(f"\n--- Weights DRAM allocation, start at DRAM address: 0x{self.get_params_dram_addr():X} ---")
         layers_total = self.LAYER_SIZE * LAYER_WEIGHT_SIZE
         layers_base_dram = self.allocate_params_dram(layers_total)
         for layer_idx in range(self.LAYER_SIZE):
@@ -866,17 +898,22 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
-    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 10.0, gflops: float = None) -> None:
+    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 50.0, flops: float = None) -> None:
         """Execute compiled program from DRAM instruction memory.
         """
         print(f"Execute program start at 0x{program_start_addr:X}")
         self.start_execute_from_dram(program_start_addr)
-        self.wait_queue(timeout)
-        latency = self.report_latency_in_us()
-        print(f"    Total program execution latency = {latency} us")
-        if gflops is not None:
-            gflops_program = self.report_flop_rate_gflops(gflops)
-            print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
+        latency, flop_rate_program = 0, 0
+        if timeout == 0:
+            print("Program started")
+        else:
+            self.wait_queue(timeout)
+            latency = self.report_latency_in_us()
+            print(f"    Total program execution latency = {latency} us")
+            if flops is not None:
+                flop_rate_program = self.report_flop_rate_gflops(flops)
+                print(f"Report FLOPS for program execution: {flop_rate_program:.2f} GFLOPS")
+        return latency, flop_rate_program
 
     def compile_prefill(self, seq_len: int, layer_size: int = 26) -> dict:
         """
@@ -893,123 +930,270 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.seq_len = seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        if self.dual_engine:
+            seq_len_engine0 = seq_len // 2
+            seq_len_engine1 = seq_len - seq_len_engine0
+        else:
+            seq_len_engine0 = seq_len
 
         # --- Gemma3 26 layers: compile---
         global _SILENT_MODE
         _SILENT_MODE = True
+        self.clear_capture_buffer()
         self.start_capture()
+        self.generate_instruction_flag_clear()
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
-            if layer_idx != 0:
+            if layer_idx != 0 and not self.engine_slave:
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=seq_len * self.vector_length)
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
+            if not self.engine_slave:
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+                                    OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
+            if not self.engine_slave:
+                # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+                total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.vector_length, N=self.head_dim * self.group_size,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
+                    )
+                total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.vector_length, N=self.head_dim,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
+                    )
+                total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.vector_length, N=self.head_dim,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
+                    )
+                if self.dual_engine:
+                    self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                # Slave(run first): check -> clear -> workload -> set | check -> clear -> workload -> set | 
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
+                total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.vector_length, N=self.head_dim * self.group_size,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM + seq_len_engine0 * self.head_dim * self.group_size * self.bytes_per_element,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
+                    )
+                total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.vector_length, N=self.head_dim,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM + seq_len_engine0 * self.head_dim* self.bytes_per_element,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
+                    )
+                total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.vector_length, N=self.head_dim,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size + seq_len_engine0 * self.head_dim* self.bytes_per_element,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
+                    )
+                self.generate_instruction_flag_set()  
+            if not self.engine_slave:
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.head_dim, A_DRAM_ADDR=self.LAYER0_K_DRAM,
+                                OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off)
+                total_flops += self.rms_norm_core_dram(M=seq_len * self.group_size, N=self.head_dim, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                                OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off)
 
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.head_dim * self.group_size,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.head_dim,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.head_dim,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
-
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.head_dim, A_DRAM_ADDR=self.LAYER0_K_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off)
-            total_flops += self.rms_norm_core_dram(M=seq_len * self.group_size, N=self.head_dim, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off)
-
-            # ROPE weights are shared between layers
-            ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
-            for t in range(seq_len):
-                total_flops += self.rope_hf_core(N=self.head_dim, input_dram_addr=self.LAYER0_K_NORM_DRAM + t * self.head_dim * self.bytes_per_element, output_dram_addr=(self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size) + t * self.head_dim * self.bytes_per_element,
-                            cos_dram_addr=ROPE_WEIGHT_ADDR + t * self.head_dim * 2 * self.bytes_per_element, sin_dram_addr=ROPE_WEIGHT_ADDR + t * self.head_dim * 2 * self.bytes_per_element + self.head_dim * self.bytes_per_element)
-                for g in range(self.group_size):
-                    total_flops += self.rope_hf_core(N=self.head_dim, input_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * self.group_size + g) * self.head_dim * self.bytes_per_element, output_dram_addr=self.LAYER0_FLASH_Q_DRAM + (t * self.group_size + g) * self.head_dim * self.bytes_per_element,
+                # ROPE weights are shared between layers
+                ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
+                for t in range(seq_len):
+                    total_flops += self.rope_hf_core(N=self.head_dim, input_dram_addr=self.LAYER0_K_NORM_DRAM + t * self.head_dim * self.bytes_per_element, output_dram_addr=(self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size) + t * self.head_dim * self.bytes_per_element,
                                 cos_dram_addr=ROPE_WEIGHT_ADDR + t * self.head_dim * 2 * self.bytes_per_element, sin_dram_addr=ROPE_WEIGHT_ADDR + t * self.head_dim * 2 * self.bytes_per_element + self.head_dim * self.bytes_per_element)
-            
-            # Duplicate k rope and v projection to GQA flash attention:
-            self.accelerator_memory_to_sram(self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size, 0x10000, seq_len * self.head_dim)
-            for i in range(seq_len):
-                for g in range(self.group_size):
-                    self.sram_to_accelerator_memory(0x10000 + i * self.head_dim * self.bytes_per_element, self.LAYER0_FLASH_K_DRAM + (g + i * self.group_size) * self.head_dim * self.bytes_per_element, self.head_dim)
+                    for g in range(self.group_size):
+                        total_flops += self.rope_hf_core(N=self.head_dim, input_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * self.group_size + g) * self.head_dim * self.bytes_per_element, output_dram_addr=self.LAYER0_FLASH_Q_DRAM + (t * self.group_size + g) * self.head_dim * self.bytes_per_element,
+                                    cos_dram_addr=ROPE_WEIGHT_ADDR + t * self.head_dim * 2 * self.bytes_per_element, sin_dram_addr=ROPE_WEIGHT_ADDR + t * self.head_dim * 2 * self.bytes_per_element + self.head_dim * self.bytes_per_element)
+                
+                # Duplicate k rope and v projection to GQA flash attention:
+                self.accelerator_memory_to_sram(self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size, 0x10000, seq_len * self.head_dim)
+                for i in range(seq_len):
+                    for g in range(self.group_size):
+                        self.sram_to_accelerator_memory(0x10000 + i * self.head_dim * self.bytes_per_element, self.LAYER0_FLASH_K_DRAM + (g + i * self.group_size) * self.head_dim * self.bytes_per_element, self.head_dim)
 
-            self.accelerator_memory_to_sram(self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size, 0x20000, seq_len * self.head_dim)
-            for i in range(seq_len):
-                for g in range(self.group_size):
-                    self.sram_to_accelerator_memory(0x20000 + i * self.head_dim * self.bytes_per_element, self.LAYER0_FLASH_V_DRAM + (g + i * self.group_size) * self.head_dim * self.bytes_per_element, self.head_dim)
+                self.accelerator_memory_to_sram(self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size, 0x20000, seq_len * self.head_dim)
+                for i in range(seq_len):
+                    for g in range(self.group_size):
+                        self.sram_to_accelerator_memory(0x20000 + i * self.head_dim * self.bytes_per_element, self.LAYER0_FLASH_V_DRAM + (g + i * self.group_size) * self.head_dim * self.bytes_per_element, self.head_dim)
 
-            total_flops += self.flash_attention_core(
-                head_dim=self.head_dim,
-                seq_len=aligned_seq_len,
-                Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            )
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.head_dim * self.group_size, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
-            # ToDo: no FLOPS return for eltwise_add_core and eltwise_mul_core
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=seq_len * self.vector_length)
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.INT4, gelu_enable=True)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.INT4)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=seq_len * self.mlp_elements)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=seq_len * self.mlp_elements)
-            self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.mlp_elements)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=seq_len * self.mlp_elements)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.INT4)
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=seq_len * self.vector_length)
+                total_flops += self.flash_attention_core(
+                    head_dim=self.head_dim,
+                    seq_len=aligned_seq_len,
+                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                )
+            if not self.engine_slave:
+                # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+                total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.head_dim * self.group_size, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
+                    )
+                if self.dual_engine:
+                    self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                # Slave(run first): check -> clear -> workload -> set | check -> clear -> workload -> set | 
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
+                total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.head_dim * self.group_size, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + seq_len_engine0 * self.head_dim * self.group_size * self.bytes_per_element,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
+                    )
+                self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                                OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
+                # ToDo: no FLOPS return for eltwise_add_core and eltwise_mul_core
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=seq_len * self.vector_length)
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                                OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
+            if not self.engine_slave:
+                # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+                total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
+                    gelu_enable=True,
+                    )
+                total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
+                    )
+                if self.dual_engine:
+                    self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                # Slave: check -> clear -> workload -> set | check -> clear -> workload -> set |
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
+                total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM + seq_len_engine0 * self.mlp_elements * self.bytes_per_element,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
+                    gelu_enable=True,
+                    )
+                total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM + seq_len_engine0 * self.mlp_elements * self.bytes_per_element,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
+                    )
+                self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=seq_len * self.mlp_elements)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=seq_len * self.mlp_elements)
+                self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.mlp_elements)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=seq_len * self.mlp_elements)
+            if not self.engine_slave:    
+                # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+                total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.mlp_elements, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
+                    )
+                if self.dual_engine:
+                    self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                # Slave: check -> clear -> workload -> set | check -> clear -> workload -> set |
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
+                total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.mlp_elements, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM + seq_len_engine0 * self.mlp_elements * self.bytes_per_element,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
+                    )
+                self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                                OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=seq_len * self.vector_length)
         self.stop_capture()
         self.generate_instruction_halt()
         prefill_program_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prefill_program_addr)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        self.clear_capture_buffer()
         _SILENT_MODE = False
         print(f"    Prefill program start at 0x{prefill_program_addr:X} end at 0x{self.get_program_dram_addr():X}, usage: {self.get_program_dram_usage()} bytes")
 
         return prefill_program_addr, total_flops
         
-    def run_prefill(self, prefill_program_addr: int, prefill_seq, gflops: int = None) -> dict:
+    def run_prefill(self, prefill_program_addr: int, prefill_seq=None, flops: int = None) -> dict:
         """
-        Run prefill for the given prefill sequence.
+        Run prefill. Uses prefill_seq if provided, otherwise self.prefill_seq (set by set_prefill_seq()).
         
         Args:
             prefill_program_addr: The address of the prefill program in DRAM.
-            prefill_seq: The prefill sequence.
+            prefill_seq: Optional sequence; if None, uses self.prefill_seq.
             gflops: The number of GFLOPS to use for the prefill.
         
         Returns:
             A dictionary containing the results of the prefill.
         """
         if prefill_seq is None:
+            prefill_seq = self.prefill_seq
+        if prefill_seq is None:
             prefill_seq = tuple(self._cfg["default_prefill_tokens"])
-        
         # Prefill processes all but the last token
         if len(prefill_seq) > 1:
             prefill_seq = prefill_seq[:-1]
@@ -1028,13 +1212,26 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         bias_one_group.masked_fill_(valid_mask, 0.0)
         bias_one_group[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
-        self.program_execute(prefill_program_addr, gflops=gflops)
+        latency, flop_rate_program = self.program_execute(prefill_program_addr, flops=flops)
+        return latency, flop_rate_program
 
-    def compile_decoder(self, layer_size: int = 26) -> tuple[list[int], list[int]]:
-        """Compile decoder programs for seq_len buckets; write decoder_program.bin and decoder_program.json.
-        Returns (program_sizes[8], total_flops_list[8])."""
+    def compile_decoder(self, layer_size: int = 26) -> tuple[str, list[int], list[int]]:
+        """Compile decoder programs for seq_len buckets, or load from existing bin/meta.
+        Returns (decoder_bin_path, program_sizes[8], total_flops_list[8])."""
         decoder_bin_path = os.path.join(self.script_dir, "gemma3_bin", "decoder_program.bin")
-        decoder_meta_path = os.path.join(self.script_dir, "gemma3_bin", "decoder_program.json")
+        decoder_meta_path = os.path.join(self.script_dir, "decoder_program.json")
+        if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
+            with open(decoder_meta_path, "r") as f:
+                meta = json.load(f)
+            if "instruction_counts" in meta:
+                program_sizes = [c * 32 for c in meta["instruction_counts"]]
+            else:
+                program_sizes = meta["program_sizes"]
+            gflops_per_token = meta["total_flops"]
+            print(f"Decoder bin found, skipped compile.")
+            return decoder_bin_path, program_sizes, gflops_per_token
+
+        print(f"Decoder bin not found, compiling...")
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         segment_instruction_counts = []
         total_flops_list = []
@@ -1042,6 +1239,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         global _SILENT_MODE
         _SILENT_MODE = True
         self.clear_inst_id()
+        self.clear_capture_buffer()
         self.start_capture()
         for seq_len in self._cfg["model"]["decoder_seq_len_buckets"]:
             count_at_start = self.capture_count
@@ -1053,15 +1251,33 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
-                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim,
-                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim,
-                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                # total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
+                #     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                #     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
+                                                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                                                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
+                                                    OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                                                    is_B_quantized=True,
+                                                    data_type=TYPE.INT4,
+                                                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
+                                                    )
+                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.head_dim,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
+                    )
+                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.head_dim,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
+                    )
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_FLASH_V_DRAM, sram_address=0x10000, element_size=self.head_dim)
                 self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size, self.TMP_REG)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=0, element_size=self.head_dim)
@@ -1091,9 +1307,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                         SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                         BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     )
-                total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
-                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                total_flops += self.matmat_mul_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
+                    )
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off)
 
@@ -1105,21 +1326,37 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.INT4, gelu_enable=True)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.INT4)
+                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
+                    gelu_enable=True,
+                    )
+                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
+                    )
 
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
                 self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.mlp_elements, N=self.vector_length,
-                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.INT4)
+                total_flops += self.matmat_mul_core(M=1, K=self.mlp_elements, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
+                    )
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off)
 
@@ -1131,9 +1368,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             if layer_size == self.LAYER_SIZE:
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                     OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.INT4)
+                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.INT4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
+                    )
 
             self.generate_instruction_halt()
             segment_instruction_counts.append(self.capture_count - count_at_start)
@@ -1150,9 +1392,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             json.dump({"instruction_counts": segment_instruction_counts, "program_sizes": program_sizes, "total_flops": total_flops_list}, f, indent=0)
         self.clear_capture_buffer()
         print(f"Decoder programs: {len(segment_instruction_counts)} segments written to {decoder_bin_path} ({len(all_programs_bytes)} bytes)")
-        return program_sizes, total_flops_list
+        return decoder_bin_path, program_sizes, total_flops_list
 
-    def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, gflops_per_token: list[int] | None = None) -> dict:
+    def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> dict:
         """Run decode loop. seq_len capped at 512. Breaks on END_OF_TURN_TOKEN_ID."""
         if token_id is None:
             print("No last token available for decode.")
@@ -1160,6 +1402,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
+        total_latency, total_flop_rate = 0, 0
         while self.seq_len < max_seq_len:
             _SILENT_MODE = True
             timer_start = time.perf_counter()
@@ -1167,28 +1410,28 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
             prog_idx = min((self.seq_len - 1) // 64, 7)
             prog_addr = decoder_base_addr + sum(decoder_program_sizes[:prog_idx])
-            gflops = gflops_per_token[prog_idx] if gflops_per_token else None
+            flops_per_token_idx = flops_per_token[prog_idx] if flops_per_token else None
 
             self.isa_add_set_core(self.V_CACHE_SIZE_REG, (self.seq_len - 1) * self.k_size)
             self.isa_add_set_core(self.ROPE_SIZE_REG, (self.seq_len - 1) * self.k_size * 2)
-
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
-
             bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
             bias_host[0, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
 
-            self.start_execute_from_dram(prog_addr)
-            self.wait_queue(10.0)
+            latency, flop_rate_program = self.program_execute(prog_addr, flops=flops_per_token_idx)
+            total_latency += latency
+            total_flop_rate += flop_rate_program
             token_id = self.get_arg_max_index()
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
+            
             if token_id in [1, self._end_of_turn_token_id]:
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
-        return self.seq_len
+        return self.seq_len, total_latency, total_flop_rate
         
 # -----------------------------------------------------------------------------
 # Main
@@ -1198,20 +1441,12 @@ def main():
     parser = argparse.ArgumentParser(description="Gemma3 layer-0 prefill: run on accelerator, verify with torch ref.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
     parser.add_argument("--local-weights", action="store_true", help="Use gemma3_bin/full_model_weights.bin instead of generated weights_gemma3_hf.bin")
+    parser.add_argument("--dual-engine", action="store_true", help="Use dual engine")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=1/0.17,
+    parser.add_argument('--cycle', type=float, default=5.62,
                         help='Clock cycle time in nanoseconds (default: 3.0, use 2.5 for alveo)')
     args = parser.parse_args()
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if args.local_weights:
-        weights_bin_rel = "gemma3_bin/full_model_weights.bin"
-    else:
-        weights_bin_rel = "gemma3_bin/weights_gemma3_hf.bin"
-        weights_bin_full = os.path.join(script_dir, weights_bin_rel)
-        if not os.path.exists(weights_bin_full):
-            weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
@@ -1225,54 +1460,42 @@ def main():
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
-    ue = Gemma3_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
-    cfg = _load_config(script_dir)
-    if args.prompt is not None:
-        tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
-        tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
-        conversation = [{"role": "user", "content": args.prompt}]
-        prompt_with_template = tokenizer.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        )
-        prefill_seq = tuple(tokenizer.encode(prompt_with_template, add_special_tokens=True))
-        print(f"Prefill from prompt ({len(prefill_seq)} tokens): {args.prompt!r}")
-        print(f"Sequence ids: {prefill_seq}")
-    else:
-        prefill_seq = tuple(cfg["default_prefill_tokens"])
+    dual_engine = args.dual_engine
+    ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine)
+    ue.set_prefill_seq(args.prompt)
+
+    if dual_engine:
+        ue2 = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True)
+        ue2.set_prefill_seq(args.prompt)
 
     print(f"\n--- Compiling ---")
     timer = time.perf_counter()
-    prefill_program_addr, gflops_prefill = ue.compile_prefill(seq_len=len(prefill_seq))
-    print(f"Prefill compile done in {time.perf_counter() - timer:.2f} seconds, start decoder compile...")
-    decoder_bin_path = os.path.join(script_dir, "gemma3_bin", "decoder_program.bin")
-    decoder_meta_path = os.path.join(script_dir, "gemma3_bin", "decoder_program.json")
-    if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
-        with open(decoder_meta_path, "r") as f:
-            meta = json.load(f)
-        if "instruction_counts" in meta:
-            decoder_program_sizes = [c * 32 for c in meta["instruction_counts"]]
-        else:
-            decoder_program_sizes = meta["program_sizes"]
-        gflops_per_token = meta["total_flops"]
-        print(f"Decoder bin found, skipped compile ({time.perf_counter() - timer:.2f}s).")
-    else:
-        timer_dec = time.perf_counter()
-        decoder_program_sizes, gflops_per_token = ue.compile_decoder()
-        print(f"Decoder compile done in {time.perf_counter() - timer_dec:.2f} seconds.")
+    prefill_program_addr, flops_prefill = ue.compile_prefill(seq_len=len(ue.prefill_seq))
+    if dual_engine:
+        prefill_program_addr2, flops_prefill2 = ue2.compile_prefill(seq_len=len(ue2.prefill_seq))
+    print(f"Prefill compile done in {time.perf_counter() - timer:.2f} seconds")
+    timer_dec = time.perf_counter()
+    decoder_bin_path, decoder_program_sizes, flops_per_token = ue.compile_decoder()
+    print(f"Decoder compile done in {time.perf_counter() - timer_dec:.2f} seconds.")
     decoder_base_addr, _ = ue.load_instructions(decoder_bin_path)
 
     print(f"\n--- Starting prefill ---")
-    print(f"Prompt tokens ({len(prefill_seq)}): {prefill_seq}")
+    print(f"Prompt ({len(ue.prefill_seq)}) tokens: {ue.prefill_seq}")
     timer=time.perf_counter()
-    ue.run_prefill(prefill_program_addr, prefill_seq=prefill_seq, gflops=gflops_prefill)
+    if dual_engine:
+        ue2.program_execute(prefill_program_addr2, timeout=0)
+    latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill(prefill_program_addr, flops=flops_prefill)
     latency_prefill = time.perf_counter() - timer
+    if dual_engine:
+        print(f"Dual engine prefill gflops: {((flops_prefill + flops_prefill2) / (latency_hw_prefill * 1e3)):.2f} GFLOPS")
     print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n")
 
     print(f"\n--- Starting decoder ---")
     timer=time.perf_counter()
-    token_cnt_decoded = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=prefill_seq[-1], gflops_per_token=gflops_per_token)
+    token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
     latency_decoder = time.perf_counter() - timer
-    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, total {token_cnt_decoded} tokens.")
+    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(ue.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
+    print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} Gflops")
     print("Gemma3 test ends.")
 
 if __name__ == "__main__":
