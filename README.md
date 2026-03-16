@@ -27,6 +27,10 @@
   Includes ongoing hardware design updates so you always have the latest architecture.
 </p>
 
+<p align="center">
+  <a href="http://discord.gg/hr9BwTUx"><img src="https://img.shields.io/badge/Discord-Join%20Us-7289da?logo=discord&logoColor=white" alt="Discord"></a>
+</p>
+
 # XDMA Driver Setup and Usage Guide
 
 This guide covers installation and usage of the Xilinx XDMA driver for PCIe-based FPGA communication.
@@ -45,6 +49,7 @@ git clone https://github.com/Xilinx/dma_ip_drivers.git
 cd dma_ip_drivers/XDMA/linux-kernel/xdma
 sudo make install
 ```
+> **Tip:** If `sudo make install` fails, you may need to disable Secure Boot in your BIOS settings.
 
 ### 2. Load the Driver
 
