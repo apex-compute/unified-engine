@@ -76,9 +76,9 @@
   "paths": {
     "hf_model_repo": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
     "hf_model_dir": "smolvlm2_bin/SmolVLM2-500M-Video-Instruct",
-    "gguf_dir": "smolvlm2_bin",
-    "lm_gguf": "smolvlm2_bin/SmolVLM2-500M-Q4_64.gguf",
-    "vision_gguf": "smolvlm2_bin/SmolVLM2-500M-Vision-FP4_64.gguf"
+    "weights_dir": "smolvlm2_bin",
+    "lm_weights": "smolvlm2_bin/smolvlm2_lm_q4.bin",
+    "vision_weights": "smolvlm2_bin/smolvlm2_vision_fp4.bin"
   },
   "defaults": {
     "prompt": "Describe this image.",
