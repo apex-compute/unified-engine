@@ -19,6 +19,9 @@ Example:
 """
 import sys
 import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
 import torch
 
 from user_dma_core import UnifiedEngine, UE_TRACE_BRAM_ADDR, UE_TRACE_BRAM_DATA, UE_TRACE_SIZE

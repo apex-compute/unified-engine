@@ -28,9 +28,11 @@ import math
 import os
 import sys
 
-# This file's folder: gemma3_bin/, *.json, decoder_program.json live here. user_dma_core is one level up.
+# This file's folder: gemma3_bin/, *.json, decoder_program.json live here.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
+REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+sys.path.insert(0, REPO_ROOT)
 
 import numpy as np
 import torch

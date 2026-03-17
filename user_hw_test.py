@@ -10,10 +10,15 @@ Usage:
 
 import argparse
 import math
+import os
 import random
 from re import S
+import sys
 import time
 import threading
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
 from read_trace import generate_trace
 import torch
 

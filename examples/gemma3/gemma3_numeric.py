@@ -21,10 +21,10 @@ import sys
 import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# Ensure parent (pcie_utils) is on path so "import user_dma_core" works when run as python gemma3_example/gemma3_numeric.py
-_parent = os.path.dirname(_THIS_DIR)
-if _parent not in sys.path:
-    sys.path.insert(0, _parent)
+_REPO_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
+for _p in [os.path.join(_REPO_ROOT, "src"), _REPO_ROOT]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import numpy as np
 import torch

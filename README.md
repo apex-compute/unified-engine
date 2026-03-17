@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="black-logo-with-text.png" alt="Apex Compute" width="300">
+  <img src="media/black-logo-with-text.png" alt="Apex Compute" width="300">
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <a href="#"><img src="board_pic.jpg" alt="FPGA Board" width="500"></a><br>
+  <a href="#"><img src="media/board_pic.jpg" alt="FPGA Board" width="500"></a><br>
   <a href="https://buy.stripe.com/6oUaEQf6365bgAt0QHds401">&#128722; Purchase FPGA Board with Unified Engine IP Block for $49.99</a><br>
   Includes ongoing hardware design updates so you always have the latest architecture.
 </p>
@@ -142,7 +142,7 @@ All benchmarks were collected on RTL running on a Kintex UltraScale+ FPGA in rea
 
 ### Benchmark Datasheet
 
-<a href="benchmark_datasheet.pdf">📄 Download Benchmark Datasheet (PDF)</a>
+<a href="media/benchmark_datasheet.pdf">📄 Download Benchmark Datasheet (PDF)</a>
 
 | Specification | Value |
 |---|---|
@@ -241,12 +241,12 @@ def memory_efficient_attention(q, k, v, attn_bias=None):
 ```
 
 <p align="center">
-  <img src="graph_bias_False.png" alt="Flash attention benchmark (bias off)" width="80%"><br>
+  <img src="media/graph_bias_False.png" alt="Flash attention benchmark (bias off)" width="80%"><br>
   <em>Flash attention benchmark — bias off</em>
 </p>
 
 <p align="center">
-  <img src="graph_bias_True.png" alt="Flash attention benchmark (bias on)" width="80%"><br>
+  <img src="media/graph_bias_True.png" alt="Flash attention benchmark (bias on)" width="80%"><br>
   <em>Flash attention benchmark — bias on</em>
 </p>
 
@@ -286,6 +286,6 @@ The example below demonstrates splitting a 256×2048 @ 2048×1024 matrix multipl
 Because the two partitions have unequal workloads, the smaller partition finishes before the larger one. A hardware **synchronization flag** is used to hold the faster engine until both are complete before proceeding to the next stage. The trace visualization below shows this synchronization in action — the idle gap on Engine 1 is where it waits for Engine 0 to finish.
 
 <p align="center">
-  <img src="trace_vis.png" alt="Trace buffer visualization of tensor-parallel matrix multiplication with synchronization" width="90%"><br>
+  <img src="media/trace_vis.png" alt="Trace buffer visualization of tensor-parallel matrix multiplication with synchronization" width="90%"><br>
   <em>Trace buffer visualization — 256×2048 @ 2048×1024 split across two engines with hardware synchronization</em>
 </p>
