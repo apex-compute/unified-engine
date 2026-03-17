@@ -82,7 +82,7 @@
   },
   "defaults": {
     "prompt": "Describe this image.",
-    "image": "test_images/yosemite.jpg",
+    "image": "test_samples/vette.jpg",
     "dev": "xdma0",
     "cycle_ns": 5.63,
     "max_seq": 512
