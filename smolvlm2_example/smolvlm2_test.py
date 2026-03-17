@@ -1756,6 +1756,25 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, self.ROPE_SIN_DRAM, sin_full.flatten(), table_size)
         self.allocate_params_dram(table_size)
         self._hw_cos, self._hw_sin = cos_full, sin_full  # CPU copies for decode position updates
+        # Padded-split cos/sin for prefill RoPE (D<128 path):
+        # Each 32-element half is zero-padded to 64 elements = 128 bytes = 1 URAM row
+        half = D // 2
+        if D < 128:
+            cos_lo = cos_full[:, :half]  # [S, 32]
+            cos_hi = cos_full[:, half:]  # [S, 32]
+            sin_lo = sin_full[:, :half]  # [S, 32] (already pre-negated)
+            sin_hi = sin_full[:, half:]  # [S, 32]
+            pad_D = UE_VECTOR_SIZE  # 64 — pad each half to full URAM row
+            for name, data in [('COS_LO', cos_lo), ('COS_HI', cos_hi),
+                               ('SIN_LO', sin_lo), ('SIN_HI', sin_hi)]:
+                padded = torch.zeros(S, pad_D, dtype=torch.bfloat16)
+                padded[:, :half] = data
+                padded = padded.contiguous()
+                addr = self.get_params_dram_addr()
+                self.dma_write(DMA_DEVICE_H2C, addr, padded.flatten(), S * pad_D * bpe)
+                self.allocate_params_dram(S * pad_D * bpe)
+                setattr(self, f'ROPE_{name}_PAD_DRAM', addr)
+            print(f"    RoPE padded-split [{S}, {pad_D}] × 4 arrays DMA'd")
         print(f"    RoPE cos/sin [{S}, {D}] DMA'd, theta={self.ROPE_THETA}")
 
     # --- Compile ---
@@ -1906,8 +1925,14 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             la = self.lm_layer_addrs[layer_idx]
             h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
             h_out = self.LAYER0_OUTPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_INPUT_DRAM
-            # RMS norm (input_layernorm)
-            self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'])
+            # Input layernorm (fused with previous layer's MLP residual for layers 1+)
+            if layer_idx == 0:
+                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'])
+            else:
+                rms_norm_core_dram_post_add(self, M=S, N=H,
+                    A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    ADDOUTPUT_DRAM_ADDR=h_in, NORMOUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    GAMMA_DRAM_ADDR=la['ln1_gamma'])
             # Q/K/V projections
             lm_matmul(S, H, H, self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM)
             lm_matmul(S, H, KV, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM)
@@ -1917,13 +1942,19 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 q_head = self.LAYER0_Q_PERM_DRAM + h * head_stride
                 self.accelerator_memory_to_sram(self.LAYER0_Q_DRAM + h * D * bpe, 0x00000, S * D,stride_bytes_per_chunk=D * bpe, stride_jump_bytes=H * bpe)
                 self.sram_to_accelerator_memory(0x00000, q_head, S * D)
-                rope_hf_core_dram(self, M=S, D=D, X_DRAM_ADDR=q_head, OUTPUT_DRAM_ADDR=q_head,COS_DRAM_ADDR=self.ROPE_COS_DRAM, SIN_DRAM_ADDR=self.ROPE_SIN_DRAM)
+                rope_hf_core_dram(self, M=S, D=D, X_DRAM_ADDR=q_head, OUTPUT_DRAM_ADDR=q_head,
+                    COS_DRAM_ADDR=self.ROPE_COS_DRAM, SIN_DRAM_ADDR=self.ROPE_SIN_DRAM,
+                    COS_LO_PAD_ADDR=self.ROPE_COS_LO_PAD_DRAM, COS_HI_PAD_ADDR=self.ROPE_COS_HI_PAD_DRAM,
+                    SIN_LO_PAD_ADDR=self.ROPE_SIN_LO_PAD_DRAM, SIN_HI_PAD_ADDR=self.ROPE_SIN_HI_PAD_DRAM)
             # Permute K [S,320]→KV cache [5,S,64] + RoPE per head
             for h in range(self.NUM_KV_HEADS):
                 k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
                 self.accelerator_memory_to_sram(self.LAYER0_K_PROJ_DRAM + h * D * bpe, 0x00000, S * D,stride_bytes_per_chunk=D * bpe, stride_jump_bytes=KV * bpe)
                 self.sram_to_accelerator_memory(0x00000, k_cache, S * D)
-                rope_hf_core_dram(self, M=S, D=D, X_DRAM_ADDR=k_cache, OUTPUT_DRAM_ADDR=k_cache,COS_DRAM_ADDR=self.ROPE_COS_DRAM, SIN_DRAM_ADDR=self.ROPE_SIN_DRAM)
+                rope_hf_core_dram(self, M=S, D=D, X_DRAM_ADDR=k_cache, OUTPUT_DRAM_ADDR=k_cache,
+                    COS_DRAM_ADDR=self.ROPE_COS_DRAM, SIN_DRAM_ADDR=self.ROPE_SIN_DRAM,
+                    COS_LO_PAD_ADDR=self.ROPE_COS_LO_PAD_DRAM, COS_HI_PAD_ADDR=self.ROPE_COS_HI_PAD_DRAM,
+                    SIN_LO_PAD_ADDR=self.ROPE_SIN_LO_PAD_DRAM, SIN_HI_PAD_ADDR=self.ROPE_SIN_HI_PAD_DRAM)
             # Permute V [S,320]→KV cache [5,S,64] (no RoPE)
             for h in range(self.NUM_KV_HEADS):
                 v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
@@ -1949,10 +1980,11 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM)
             lm_matmul(S, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
-            # MLP residual
-            eltwise_add_core_dram(self, size=S * H,
-                A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                OUTPUT_DRAM_ADDR=h_out)
+            # MLP residual (only last layer — others fused into next layer's input norm)
+            if layer_idx == self.NUM_LAYERS - 1:
+                eltwise_add_core_dram(self, size=S * H,
+                    A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    OUTPUT_DRAM_ADDR=h_out)
         # Final norm + LM head (last token only)
         final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
         self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_buf,
