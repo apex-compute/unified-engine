@@ -1,0 +1,15 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include requirements.txt
+
+recursive-include src *.py
+recursive-include examples *.py *.json
+
+exclude *.bin
+exclude *.c
+exclude *.tcl
+exclude *.sh
+exclude Makefile
+recursive-exclude examples *_bin *__pycache__*
+recursive-exclude * *.pyc

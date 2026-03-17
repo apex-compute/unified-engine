@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unified-engine"
+version = "0.1.0"
+description = "Python SDK for the Unified Engine FPGA accelerator"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Apex Compute" },
+]
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "transformers>=4.40.0",
+    "huggingface-hub>=0.20.0",
+    "pillow>=12.1.1",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/apex-compute/unified-engine"
+Repository = "https://github.com/apex-compute/unified-engine"
+
+[project.scripts]
+ue-example = "unified_engine_cli:main"
+
+[tool.setuptools]
+py-modules = ["user_dma_core", "unified_engine_cli"]
+packages = [
+    "unified_engine_examples",
+    "unified_engine_examples.gemma3",
+    "unified_engine_examples.smolvlm2",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+"unified_engine_examples" = "examples"
+
+[tool.setuptools.package-data]
+"unified_engine_examples.gemma3" = ["*.json", "*.md"]
+"unified_engine_examples.smolvlm2" = ["*.json"]

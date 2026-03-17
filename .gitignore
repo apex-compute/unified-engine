@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.bin
+*.safetensors
+examples/gemma3/gemma3_bin/
+examples/smolvlm2/smolvlm2_bin/
