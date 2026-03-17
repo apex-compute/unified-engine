@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-SmolVLM2-500M on accelerator: fp4_e2m1 (vision) & q4_64 (language)
-
-Usage:
-  python smolvlm2_test.py --prompt "your prompt"
-
-  --bin: Loads compile instructions and weights.
-  --vision-bf16: Runs vision encoder in half precision
-  --lm-bf16: Runs text decoder in half precision
-"""
-
+"""SmolVLM2-500M on accelerator: fp4_e2m1 (vision) & q4_64 (language)."""
 import builtins
 import json
 import math
@@ -50,10 +40,7 @@ HF_MODEL_REPO = _SMOLVLM2_CFG["paths"]["hf_model_repo"]
 # Helper Methods for SmolVLM2
 # =============================================================================
 def store_weight(ue, tensor, padded_shape=None):
-    """Pad tensor to padded_shape (if given), convert to bf16, DMA to device DRAM.
-
-    Returns the DRAM address where the weight was stored.
-    """
+    """Pad, convert to bf16, DMA to device DRAM. Returns DRAM address."""
     bf16 = tensor.to(torch.bfloat16)
     if padded_shape is not None:
         padded = torch.zeros(padded_shape, dtype=torch.bfloat16)
@@ -67,13 +54,7 @@ def store_weight(ue, tensor, padded_shape=None):
     ue.allocate_params_dram(nbytes)
     return addr
 def store_quantized_weight(ue, raw_data):
-    """Store Q4_64 raw GGUF data as separate scale + packed data in DRAM.
-
-    Raw GGUF format: [scales: n_blocks x 2 bytes BF16] [packed_data: n_blocks x 32 bytes]
-    Each block covers 64 elements. Total = 34 bytes per block.
-
-    Returns (scale_addr, data_addr).
-    """
+    """Store Q4_64 raw GGUF data as scale + packed in DRAM. Returns (scale_addr, data_addr)."""
     raw_bytes = raw_data.tobytes() if hasattr(raw_data, 'tobytes') else bytes(raw_data)
     n_blocks = len(raw_bytes) // 34
     scales_size = n_blocks * 2
@@ -92,18 +73,19 @@ def store_quantized_weight(ue, raw_data):
     ue.allocate_params_dram(data_size)
 
     return scale_addr, data_addr
-def load_gguf_raw_cache(gguf_path):
-    """Load a GGUF file and return {tensor_name: raw_numpy_data} cache."""
-    import gguf
-    reader = gguf.GGUFReader(str(gguf_path))
+def load_weight_cache(bin_path):
+    """Load bin+json weight file. Returns {tensor_name: raw_numpy_data}."""
+    json_path = bin_path.rsplit('.', 1)[0] + '.json'
+    with open(json_path) as f:
+        manifest = json.load(f)
+    with open(bin_path, 'rb') as f:
+        raw = f.read()
     cache = {}
-    for t in reader.tensors:
-        name = str(t.name)
-        data = t.data
-        cache[name] = np.array(data) if not isinstance(data, np.ndarray) else data.copy()
+    for name, meta in manifest.items():
+        cache[name] = np.frombuffer(raw[meta['offset']:meta['offset'] + meta['size']], dtype=np.uint8).copy()
     return cache
 def init_hang_prevention(ue) -> None:
-    """Stop any stale execution and write a HALT to instruction DRAM base."""
+    """Stop stale execution and write HALT to instruction DRAM base."""
     print("[Init] Hang prevention: disabling instruction execution...")
     ue.dram_inst_running(False)
     ue.start_capture()
@@ -116,7 +98,7 @@ def init_hang_prevention(ue) -> None:
     ue.clear_capture_buffer()
     print("[Init] HALT written to instruction DRAM base")
 def isa_set_register(ue, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
-    """Run a minimal program to set one ISA register to an immediate value."""
+    """Set one ISA register to an immediate value via minimal program."""
     ue._inst_id = 0
     ue.start_capture()
     ue.generate_instruction_add_set(dst_reg_idx, immediate_value)
@@ -129,8 +111,7 @@ def isa_set_register(ue, dst_reg_idx: int, immediate_value: int, timeout_s: floa
     ue.start_execute_from_dram(program_addr)
     ue.wait_queue(timeout_s)
 def _make_add_set_bytes(dst_reg: int, immediate_value: int) -> bytes:
-    """Build raw 32-byte ADD_SET instruction: sets register dst_reg = immediate_value.
-    Can be fused into a program bytestream without separate execution."""
+    """Build raw 32-byte ADD_SET instruction: dst_reg = immediate_value."""
     import struct
     INSTRUCTION_ADD = 2
     INST_ADD_SET = 4
@@ -148,7 +129,7 @@ def _make_add_set_bytes(dst_reg: int, immediate_value: int) -> bytes:
 def accelerator_memory_to_sram_reg(ue, accelerator_dram_address: int, sram_address: int,
                                     element_size: int, general_reg_src: int,
                                     stride_bytes_per_chunk: int = 0, stride_jump_bytes: int = 0) -> None:
-    """accelerator_memory_to_sram with register-based DRAM address rewriting."""
+    """accelerator_memory_to_sram with register-based DRAM address."""
     element_size_bytes = element_size * 2
     uram_type, uram_start_addr = ue.sram_address_to_uram_address(sram_address)
     ue.ue_memcpy_from_dram(accelerator_dram_address, element_size_bytes, MEMCPY_TYPE.URAM.value,
@@ -158,8 +139,7 @@ def accelerator_memory_to_sram_reg(ue, accelerator_dram_address: int, sram_addre
                            general_reg_src=general_reg_src)
     ue._inst_id += 1
 def overwrite_last_instruction_with_general_register(ue, general_register: int) -> None:
-    """Overwrite the most recently captured instruction to use a general register
-    for rewriting the DRAM address at execution time."""
+    """Overwrite last captured instruction to use a general register for DRAM address."""
     if not ue.capture_buffer or ue.capture_count == 0:
         print("ERROR: overwrite_last_instruction_with_general_register() called but capture_buffer is empty!")
         return
@@ -174,7 +154,7 @@ def overwrite_last_instruction_with_general_register(ue, general_register: int) 
            ((0 & 0xF) << 12)
     w[7] = (w[7] & 0x1FFFFFFF) | ((INSTRUCTION_REG_REWRITE & 0x7) << 29)
 def eltwise_add_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
-    """Element-wise addition with DRAM addresses: OUTPUT = A + B."""
+    """OUTPUT = A + B (DRAM)."""
     bytes_per_element = 2
     uram_a_addr = 0x00000
     uram_b_addr = 0x80000
@@ -198,7 +178,7 @@ def eltwise_add_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUT
             element_size=take)
     return size
 def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
-    """Element-wise multiplication with DRAM addresses: OUTPUT = A * B."""
+    """OUTPUT = A * B (DRAM)."""
     bytes_per_element = 2
     uram_a_addr = 0x00000
     uram_b_addr = 0x80000
@@ -222,7 +202,7 @@ def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUT
             element_size=take)
     return size
 def capture_to_raw(ue):
-    """Stop capture and extract raw instruction bytes (no halt). Clears capture buffer."""
+    """Stop capture, extract raw instruction bytes (no halt), clear buffer."""
     ue.stop_capture()
     raw = bytearray()
     for inst in ue.capture_buffer:
@@ -243,7 +223,7 @@ def rms_norm_core_dram_post_add(ue, M: int, N: int,
                                  A_DRAM_ADDR: int, B_DRAM_ADDR: int,
                                  ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int,
                                  GAMMA_DRAM_ADDR: int = None) -> int:
-    """Residual addition followed by RMS norm: rms_norm(A + B)."""
+    """rms_norm(A + B) with residual output."""
     gamma_sram_addr = 0x80000
     params_sram_addr = gamma_sram_addr
 
@@ -286,7 +266,7 @@ def rms_norm_core_dram_post_add(ue, M: int, N: int,
 def layer_norm_core_dram(ue, M: int, N: int,
                          A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                          GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None) -> int:
-    """Plain layer norm: OUTPUT = LN(A)."""
+    """OUTPUT = LayerNorm(A)."""
     zeros_sram = 0x80000
     zeros_dram = ue.get_params_dram_addr()
     ue.allocate_params_dram(N * 2)
@@ -320,7 +300,7 @@ def layer_norm_core_dram_post_add(ue, M: int, N: int,
                                    A_DRAM_ADDR: int, B_DRAM_ADDR: int,
                                    ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int,
                                    GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None) -> int:
-    """Residual addition followed by layer norm: layer_norm(A + B)."""
+    """layer_norm(A + B) with residual output."""
     zeros_sram_addr = 0x80000
 
     zeros_dram_addr = ue.get_params_dram_addr()
@@ -380,251 +360,75 @@ def layer_norm_core_dram_post_add(ue, M: int, N: int,
 def rope_hf_core_dram(ue, M: int, D: int,
                       X_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                       COS_DRAM_ADDR: int, SIN_DRAM_ADDR: int,
-                      pos_offset_reg: int = 0, tmp_reg: int = 0,
                       COS_LO_PAD_ADDR: int = 0, COS_HI_PAD_ADDR: int = 0,
                       SIN_LO_PAD_ADDR: int = 0, SIN_HI_PAD_ADDR: int = 0) -> int:
-    """Apply HF-style RoPE to a matrix row by row.
-
-    RoPE formula: result = x * cos + rotate_half(x) * sin
-    Where rotate_half(x) = cat(-x[D/2:], x[:D/2])
-
-    IMPORTANT: sin tensor must have first half pre-negated before calling.
-    """
-    use_reg = pos_offset_reg != 0 and tmp_reg != 0
+    """Prefill RoPE via padded-split bulk load (D<128). Sin first half must be pre-negated."""
     bytes_per_element = 2
     row_bytes = D * bytes_per_element
     half_D = D // 2
     half_bytes = half_D * bytes_per_element
-    use_split_load = (D < 128)
-    has_padded_split = (COS_LO_PAD_ADDR != 0 and COS_HI_PAD_ADDR != 0
-                        and SIN_LO_PAD_ADDR != 0 and SIN_HI_PAD_ADDR != 0)
 
     URAM_B_BASE = 0x80000
-    SRAM_ROW = 128
+    SRAM_SLOT = 128
+    uram_x_lo      = 0x00000
+    uram_x_hi      = uram_x_lo      + SRAM_SLOT
+    uram_a_lo      = uram_x_hi      + SRAM_SLOT
+    uram_a_hi      = uram_a_lo      + SRAM_SLOT
+    uram_result_lo = uram_a_hi      + SRAM_SLOT
+    uram_result_hi = uram_result_lo + SRAM_SLOT
 
-    if use_split_load and use_reg:
-        SRAM_SLOT = 128
-        uram_x_lo      = 0x00000
-        uram_x_hi      = uram_x_lo      + SRAM_SLOT
-        uram_a_lo      = uram_x_hi      + SRAM_SLOT
-        uram_a_hi      = uram_a_lo      + SRAM_SLOT
-        uram_result_lo = uram_a_hi      + SRAM_SLOT
-        uram_result_hi = uram_result_lo + SRAM_SLOT
+    uram_b_lo       = URAM_B_BASE
+    uram_b_hi       = uram_b_lo       + SRAM_SLOT
+    uram_cos_lo_bulk = uram_b_hi      + SRAM_SLOT
+    uram_cos_hi_bulk = uram_cos_lo_bulk + M * SRAM_SLOT
+    uram_sin_lo_bulk = uram_cos_hi_bulk + M * SRAM_SLOT
+    uram_sin_hi_bulk = uram_sin_lo_bulk + M * SRAM_SLOT
 
-        uram_cos_lo = URAM_B_BASE
-        uram_cos_hi = uram_cos_lo + SRAM_SLOT
-        uram_sin_lo = uram_cos_hi + SRAM_SLOT
-        uram_sin_hi = uram_sin_lo + SRAM_SLOT
-        uram_b_lo   = uram_sin_hi + SRAM_SLOT
-        uram_b_hi   = uram_b_lo   + SRAM_SLOT
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=COS_LO_PAD_ADDR,
+        sram_address=uram_cos_lo_bulk, element_size=M * D)
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=COS_HI_PAD_ADDR,
+        sram_address=uram_cos_hi_bulk, element_size=M * D)
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=SIN_LO_PAD_ADDR,
+        sram_address=uram_sin_lo_bulk, element_size=M * D)
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=SIN_HI_PAD_ADDR,
+        sram_address=uram_sin_hi_bulk, element_size=M * D)
 
-        for row in range(M):
-            row_offset = row * row_bytes
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=X_DRAM_ADDR + row_offset,
-                sram_address=uram_x_lo, element_size=half_D)
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=X_DRAM_ADDR + row_offset + half_bytes,
-                sram_address=uram_x_hi, element_size=half_D)
-
-            ue.generate_instruction_add_imm(pos_offset_reg, COS_DRAM_ADDR + row_offset, tmp_reg)
-            accelerator_memory_to_sram_reg(ue,
-                accelerator_dram_address=COS_DRAM_ADDR + row_offset,
-                sram_address=uram_cos_lo, element_size=half_D, general_reg_src=tmp_reg)
-            ue.generate_instruction_add_imm(pos_offset_reg, COS_DRAM_ADDR + row_offset + half_bytes, tmp_reg)
-            accelerator_memory_to_sram_reg(ue,
-                accelerator_dram_address=COS_DRAM_ADDR + row_offset + half_bytes,
-                sram_address=uram_cos_hi, element_size=half_D, general_reg_src=tmp_reg)
-
-            ue.generate_instruction_add_imm(pos_offset_reg, SIN_DRAM_ADDR + row_offset, tmp_reg)
-            accelerator_memory_to_sram_reg(ue,
-                accelerator_dram_address=SIN_DRAM_ADDR + row_offset,
-                sram_address=uram_sin_lo, element_size=half_D, general_reg_src=tmp_reg)
-            ue.generate_instruction_add_imm(pos_offset_reg, SIN_DRAM_ADDR + row_offset + half_bytes, tmp_reg)
-            accelerator_memory_to_sram_reg(ue,
-                accelerator_dram_address=SIN_DRAM_ADDR + row_offset + half_bytes,
-                sram_address=uram_sin_hi, element_size=half_D, general_reg_src=tmp_reg)
-
-            ue.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half_D)
-            ue.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half_D)
-            ue.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half_D)
-            ue.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half_D)
-            ue.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half_D)
-            ue.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half_D)
-
-            ue.sram_to_accelerator_memory(
-                sram_address=uram_result_lo,
-                accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset, element_size=half_D)
-            ue.sram_to_accelerator_memory(
-                sram_address=uram_result_hi,
-                accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset + half_bytes, element_size=half_D)
-
-    elif use_split_load and has_padded_split:
-        SRAM_SLOT = 128
-        uram_x_lo      = 0x00000
-        uram_x_hi      = uram_x_lo      + SRAM_SLOT
-        uram_a_lo      = uram_x_hi      + SRAM_SLOT
-        uram_a_hi      = uram_a_lo      + SRAM_SLOT
-        uram_result_lo = uram_a_hi      + SRAM_SLOT
-        uram_result_hi = uram_result_lo + SRAM_SLOT
-
-        uram_b_lo       = URAM_B_BASE
-        uram_b_hi       = uram_b_lo       + SRAM_SLOT
-        uram_cos_lo_bulk = uram_b_hi      + SRAM_SLOT
-        uram_cos_hi_bulk = uram_cos_lo_bulk + M * SRAM_SLOT
-        uram_sin_lo_bulk = uram_cos_hi_bulk + M * SRAM_SLOT
-        uram_sin_hi_bulk = uram_sin_lo_bulk + M * SRAM_SLOT
-
+    for row in range(M):
+        row_offset = row * row_bytes
         ue.accelerator_memory_to_sram(
-            accelerator_dram_address=COS_LO_PAD_ADDR,
-            sram_address=uram_cos_lo_bulk, element_size=M * D)
+            accelerator_dram_address=X_DRAM_ADDR + row_offset,
+            sram_address=uram_x_lo, element_size=half_D)
         ue.accelerator_memory_to_sram(
-            accelerator_dram_address=COS_HI_PAD_ADDR,
-            sram_address=uram_cos_hi_bulk, element_size=M * D)
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=SIN_LO_PAD_ADDR,
-            sram_address=uram_sin_lo_bulk, element_size=M * D)
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=SIN_HI_PAD_ADDR,
-            sram_address=uram_sin_hi_bulk, element_size=M * D)
+            accelerator_dram_address=X_DRAM_ADDR + row_offset + half_bytes,
+            sram_address=uram_x_hi, element_size=half_D)
 
-        for row in range(M):
-            row_offset = row * row_bytes
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=X_DRAM_ADDR + row_offset,
-                sram_address=uram_x_lo, element_size=half_D)
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=X_DRAM_ADDR + row_offset + half_bytes,
-                sram_address=uram_x_hi, element_size=half_D)
+        uram_cos_lo_i = uram_cos_lo_bulk + row * SRAM_SLOT
+        uram_cos_hi_i = uram_cos_hi_bulk + row * SRAM_SLOT
+        uram_sin_lo_i = uram_sin_lo_bulk + row * SRAM_SLOT
+        uram_sin_hi_i = uram_sin_hi_bulk + row * SRAM_SLOT
 
-            uram_cos_lo_i = uram_cos_lo_bulk + row * SRAM_SLOT
-            uram_cos_hi_i = uram_cos_hi_bulk + row * SRAM_SLOT
-            uram_sin_lo_i = uram_sin_lo_bulk + row * SRAM_SLOT
-            uram_sin_hi_i = uram_sin_hi_bulk + row * SRAM_SLOT
+        ue.eltwise_mul_core(uram_x_lo, uram_cos_lo_i, uram_a_lo, half_D)
+        ue.eltwise_mul_core(uram_x_hi, uram_cos_hi_i, uram_a_hi, half_D)
+        ue.eltwise_mul_core(uram_x_hi, uram_sin_lo_i, uram_b_lo, half_D)
+        ue.eltwise_mul_core(uram_x_lo, uram_sin_hi_i, uram_b_hi, half_D)
+        ue.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half_D)
+        ue.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half_D)
 
-            ue.eltwise_mul_core(uram_x_lo, uram_cos_lo_i, uram_a_lo, half_D)
-            ue.eltwise_mul_core(uram_x_hi, uram_cos_hi_i, uram_a_hi, half_D)
-            ue.eltwise_mul_core(uram_x_hi, uram_sin_lo_i, uram_b_lo, half_D)
-            ue.eltwise_mul_core(uram_x_lo, uram_sin_hi_i, uram_b_hi, half_D)
-            ue.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half_D)
-            ue.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half_D)
-
-            ue.sram_to_accelerator_memory(
-                sram_address=uram_result_lo,
-                accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset, element_size=half_D)
-            ue.sram_to_accelerator_memory(
-                sram_address=uram_result_hi,
-                accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset + half_bytes, element_size=half_D)
-
-    elif use_split_load:
-        SRAM_SLOT = 128
-        uram_x_lo      = 0x00000
-        uram_x_hi      = uram_x_lo      + SRAM_SLOT
-        uram_a_lo      = uram_x_hi      + SRAM_SLOT
-        uram_a_hi      = uram_a_lo      + SRAM_SLOT
-        uram_result_lo = uram_a_hi      + SRAM_SLOT
-        uram_result_hi = uram_result_lo + SRAM_SLOT
-
-        uram_cos_lo = URAM_B_BASE
-        uram_cos_hi = uram_cos_lo + SRAM_SLOT
-        uram_sin_lo = uram_cos_hi + SRAM_SLOT
-        uram_sin_hi = uram_sin_lo + SRAM_SLOT
-        uram_b_lo   = uram_sin_hi + SRAM_SLOT
-        uram_b_hi   = uram_b_lo   + SRAM_SLOT
-
-        for row in range(M):
-            row_offset = row * row_bytes
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=X_DRAM_ADDR + row_offset,
-                sram_address=uram_x_lo, element_size=half_D)
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=X_DRAM_ADDR + row_offset + half_bytes,
-                sram_address=uram_x_hi, element_size=half_D)
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=COS_DRAM_ADDR + row_offset,
-                sram_address=uram_cos_lo, element_size=half_D)
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=COS_DRAM_ADDR + row_offset + half_bytes,
-                sram_address=uram_cos_hi, element_size=half_D)
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=SIN_DRAM_ADDR + row_offset,
-                sram_address=uram_sin_lo, element_size=half_D)
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=SIN_DRAM_ADDR + row_offset + half_bytes,
-                sram_address=uram_sin_hi, element_size=half_D)
-
-            ue.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half_D)
-            ue.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half_D)
-            ue.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half_D)
-            ue.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half_D)
-            ue.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half_D)
-            ue.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half_D)
-
-            ue.sram_to_accelerator_memory(
-                sram_address=uram_result_lo,
-                accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset, element_size=half_D)
-            ue.sram_to_accelerator_memory(
-                sram_address=uram_result_hi,
-                accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset + half_bytes, element_size=half_D)
-    else:
-        row_storage = ((row_bytes + 127) // 128) * 128
-        uram_x_sram = 0x00000
-        uram_a_sram = uram_x_sram + row_storage
-        uram_result_sram = uram_a_sram + row_storage
-        uram_cos_sram = URAM_B_BASE
-        uram_sin_sram = uram_cos_sram + row_storage
-        uram_b_sram = uram_sin_sram + row_storage
-        uram_c_sram = uram_b_sram + row_storage
-
-        for row in range(M):
-            row_offset = row * row_bytes
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=X_DRAM_ADDR + row_offset,
-                sram_address=uram_x_sram, element_size=D)
-            if use_reg:
-                ue.generate_instruction_add_imm(pos_offset_reg, COS_DRAM_ADDR + row_offset, tmp_reg)
-                accelerator_memory_to_sram_reg(ue,
-                    accelerator_dram_address=COS_DRAM_ADDR + row_offset,
-                    sram_address=uram_cos_sram, element_size=D, general_reg_src=tmp_reg)
-            else:
-                ue.accelerator_memory_to_sram(
-                    accelerator_dram_address=COS_DRAM_ADDR + row_offset,
-                    sram_address=uram_cos_sram, element_size=D)
-            if use_reg:
-                ue.generate_instruction_add_imm(pos_offset_reg, SIN_DRAM_ADDR + row_offset, tmp_reg)
-                accelerator_memory_to_sram_reg(ue,
-                    accelerator_dram_address=SIN_DRAM_ADDR + row_offset,
-                    sram_address=uram_sin_sram, element_size=D, general_reg_src=tmp_reg)
-            else:
-                ue.accelerator_memory_to_sram(
-                    accelerator_dram_address=SIN_DRAM_ADDR + row_offset,
-                    sram_address=uram_sin_sram, element_size=D)
-
-            ue.eltwise_mul_core(
-                vector_A_sram_start_addr=uram_x_sram,
-                vector_B_sram_start_addr=uram_cos_sram,
-                vector_C_sram_wb_addr=uram_a_sram, element_size=D)
-            ue.eltwise_mul_core(
-                vector_A_sram_start_addr=uram_x_sram + half_bytes,
-                vector_B_sram_start_addr=uram_sin_sram,
-                vector_C_sram_wb_addr=uram_b_sram, element_size=half_D)
-            ue.eltwise_mul_core(
-                vector_A_sram_start_addr=uram_x_sram,
-                vector_B_sram_start_addr=uram_sin_sram + half_bytes,
-                vector_C_sram_wb_addr=uram_c_sram, element_size=half_D)
-            ue.eltwise_add_core(
-                vector_A_sram_start_addr=uram_a_sram,
-                vector_B_sram_start_addr=uram_b_sram,
-                vector_C_sram_wb_addr=uram_result_sram, element_size=D)
-
-            ue.sram_to_accelerator_memory(
-                sram_address=uram_result_sram,
-                accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset, element_size=D)
+        ue.sram_to_accelerator_memory(
+            sram_address=uram_result_lo,
+            accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset, element_size=half_D)
+        ue.sram_to_accelerator_memory(
+            sram_address=uram_result_hi,
+            accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset + half_bytes, element_size=half_D)
 
     return M * D * 4
 def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                              params_dram_addr, temp_dram_start):
-    """Universal permute: decomposes into last-dim-fixed DMA relocation + batched transpose."""
+    """Permute via DMA gather + batched transpose decomposition."""
     from user_dma_core import (UE_VECTOR_SIZE, UE_MODE, URAM_FULL_ELEMENTS,
                                URAM_NEAR_FULL_ELEMENTS, URAM_HALF_ELEMENTS,
                                URAM_SECTION, URAM_WRITE_SRC, URAM_START_ADDR, LALU_MODE)
@@ -789,11 +593,7 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
 
     return (2, output_shape)
 def store_identity_matrix(ue):
-    """Store a UE_VECTOR_SIZE x UE_VECTOR_SIZE identity matrix in DRAM once.
-
-    Returns the DRAM address. Pass to decode_flash_attention_core as
-    IDENTITY_DRAM_ADDR to avoid re-allocating every call.
-    """
+    """Store identity matrix in DRAM once. Returns DRAM address."""
     bpe = 2
     size = UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe
     addr = ue.get_params_dram_addr()
@@ -807,12 +607,7 @@ def decode_flash_attention_core(ue, head_dim: int, kv_len: int,
                                  BIAS_DRAM_ADDR: int = None,
                                  debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None,
                                  num_q_heads: int = 1, bias_row_stride: int = None) -> int:
-    """Decode-phase attention (matches Gemma3 decoder_attention_core).
-
-    V^T transpose via identity matmul, Q @ K^T with scaling, softmax, softmax @ V^T.
-    IDENTITY_DRAM_ADDR must point to a pre-stored identity matrix (store once, reuse).
-    num_q_heads >1 enables GQA batching. bias_row_stride defaults to kv_len.
-    """
+    """Decode attention: V^T transpose, scaled Q@K^T, softmax, sm@V^T. GQA via num_q_heads."""
     from user_dma_core import UE_FMAX_CONTEXT_SIZE
     bytes_per_element = 2
     bias_enable = BIAS_DRAM_ADDR is not None
@@ -1046,15 +841,7 @@ def prefill_flash_attention_core(ue, head_dim: int, seq_len: int,
                                   OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int,
                                   IDENTITY_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
                                   num_q_heads: int = 1) -> int:
-    """GQA-batched prefill attention. V^T transpose done once, Q@K^T + softmax + sm@V^T per Q head.
-
-    Q: [num_q_heads * seq_len, head_dim] contiguous heads at Q_DRAM_ADDR.
-    K, V: [seq_len, head_dim] shared KV head.
-    BIAS: [seq_len, seq_len] causal mask (shared by all Q heads).
-    OUTPUT: [num_q_heads * seq_len, head_dim].
-    IDENTITY_DRAM_ADDR: pre-stored UE_VECTOR_SIZE x UE_VECTOR_SIZE identity matrix.
-    SCRATCH: needs head_dim * seq_len + UE_FMAX_CONTEXT_SIZE * seq_len elements.
-    """
+    """GQA-batched prefill attention. V^T once, then Q@K^T + softmax + sm@V^T per Q head."""
     from user_dma_core import UE_FMAX_CONTEXT_SIZE
 
     bpe = 2
@@ -1233,7 +1020,7 @@ def prefill_flash_attention_core(ue, head_dim: int, seq_len: int,
 # FP4 E2M1 lookup table: 16 values (codes 0-7 positive, 8-15 negative)
 _FP4_E2M1_TABLE = torch.tensor(_SMOLVLM2_CFG["quantization"]["fp4_e2m1"]["table"], dtype=torch.bfloat16)
 def quantize_q4_64(tensor):
-    """INT4 quantization with 64-element blocks. Returns combined [scales|packed] bytes."""
+    """INT4 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
     data = tensor.flatten().cpu().float().numpy()
     n_blocks = int(np.ceil(len(data) / 64))
     padded = np.pad(data, (0, n_blocks * 64 - len(data)))
@@ -1247,7 +1034,7 @@ def quantize_q4_64(tensor):
     scale_bytes = torch.tensor(scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
     return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
 def quantize_fp4_64(tensor):
-    """FP4 E2M1 quantization with 64-element blocks. Returns combined [scales|packed] bytes."""
+    """FP4 E2M1 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
     x = tensor.to(torch.bfloat16).cpu().flatten()
     n_blocks = int(np.ceil(x.numel() / 64))
     if x.numel() % 64 != 0:
@@ -1265,10 +1052,9 @@ def quantize_fp4_64(tensor):
     scales_np = scales.view(torch.uint16).numpy()
     return np.frombuffer(scales_np.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
 # =============================================================================
-# GGUF generation — name mapping, quantization dispatch, file writers
+# Weight generation — name mapping, quantization dispatch, bin+json writers
 # =============================================================================
-# HF component → GGUF component, keyed by mode
-_GGUF_LAYER_MAP = {
+_LAYER_MAP = {
     'lm': {
         'self_attn.q_proj.weight': 'attn_q.weight', 'self_attn.k_proj.weight': 'attn_k.weight',
         'self_attn.v_proj.weight': 'attn_v.weight', 'self_attn.o_proj.weight': 'attn_output.weight',
@@ -1287,7 +1073,7 @@ _GGUF_LAYER_MAP = {
         'mlp.fc2.weight': 'ffn_up.weight', 'mlp.fc2.bias': 'ffn_up.bias',
     },
 }
-_GGUF_TOP_MAP = {
+_TOP_MAP = {
     'lm': {'embed_tokens.weight': 'token_embd.weight', 'norm.weight': 'output_norm.weight',
             'lm_head.weight': 'output.weight'},
     'vision': {
@@ -1305,81 +1091,61 @@ _QUANT_SUFFIXES = {
     'fp4_64': {'q_proj.weight', 'k_proj.weight', 'v_proj.weight', 'out_proj.weight',
                'fc1.weight', 'fc2.weight', 'modality_projection.proj.weight'},
 }
-def _to_gguf_name(hf_name, mode):
-    """Map HF param name → GGUF tensor name. mode='lm' or 'vision'."""
+def _weight_key(hf_name, mode):
+    """Map HF param name → short weight key. mode='lm' or 'vision'."""
     name = hf_name
     for pfx in ('model.text_model.', 'model.', 'text_model.'):
         if name.startswith(pfx):
             name = name[len(pfx):]
             break
-    if name in _GGUF_TOP_MAP[mode]:
-        return _GGUF_TOP_MAP[mode][name]
-    # Layer components: layers.{i}.comp (lm) or ...encoder.layers.{i}.comp (vision)
+    if name in _TOP_MAP[mode]:
+        return _TOP_MAP[mode][name]
     if mode == 'lm' and name.startswith('layers.'):
         p = name.split('.'); comp = '.'.join(p[2:])
-        if comp in _GGUF_LAYER_MAP['lm']:
-            return f'blk.{p[1]}.{_GGUF_LAYER_MAP["lm"][comp]}'
+        if comp in _LAYER_MAP['lm']:
+            return f'blk.{p[1]}.{_LAYER_MAP["lm"][comp]}'
     elif mode == 'vision' and 'encoder.layers.' in name:
         p = name.split('.'); idx = p.index('layers') + 1; comp = '.'.join(p[idx+1:])
-        if comp in _GGUF_LAYER_MAP['vision']:
-            return f'v.blk.{p[idx]}.{_GGUF_LAYER_MAP["vision"][comp]}'
+        if comp in _LAYER_MAP['vision']:
+            return f'v.blk.{p[idx]}.{_LAYER_MAP["vision"][comp]}'
     return name
-def _write_gguf(output_path, metadata, model, param_filter, mode, qtype, qfn):
-    """Core GGUF writer shared by LM and vision generators."""
-    import gguf as gguf_lib
-    writer = gguf_lib.GGUFWriter(str(output_path), "llama")
-    for key, (method, val) in metadata.items():
-        getattr(writer, method)(key, val)
+def _write_weight_bin(bin_path, model, param_filter, mode, qtype, qfn):
+    """Write quantized weights to bin + json manifest (no GGUF dependency)."""
+    json_path = bin_path.rsplit('.', 1)[0] + '.json'
+    manifest = {}
     count = 0
-    for pname, param in model.named_parameters():
-        if not param_filter(pname):
-            continue
-        gname = _to_gguf_name(pname, mode)
-        t = param.data
-        if any(pname.endswith(s) for s in _QUANT_SUFFIXES[qtype]):
-            data, _ = qfn(t)
-            writer.add_tensor(f'{gname}.{qtype}', data, (len(data),), gguf_lib.GGMLQuantizationType.I8)
-        else:
-            if 'position_embedding.weight' in pname and t.dim() == 2:
-                t = t.t().contiguous()
-            bf = t.to(torch.bfloat16).contiguous()
-            writer.add_tensor(gname, bf.view(torch.uint16).cpu().numpy(), bf.shape, gguf_lib.GGMLQuantizationType.BF16)
-        count += 1
-    writer.write_header_to_file(); writer.write_kv_data_to_file(); writer.write_tensors_to_file(); writer.close()
-    print(f"GGUF: {count} tensors, {os.path.getsize(str(output_path))/1048576:.1f} MB → {output_path}")
-def generate_lm_gguf(model, text_config, output_path):
-    """Generate language model Q4_64 GGUF. Weights→Q4_64, norms/embeddings→BF16."""
-    tc = text_config
-    _write_gguf(output_path, {
-        "general.name": ("add_string", "SmolVLM2 500M Q4_64"),
-        "general.file_type": ("add_uint32", 99), "general.quantization_version": ("add_uint32", 2),
-        "llama.context_length": ("add_uint32", tc.max_position_embeddings),
-        "llama.embedding_length": ("add_uint32", tc.hidden_size),
-        "llama.block_count": ("add_uint32", tc.num_hidden_layers),
-        "llama.feed_forward_length": ("add_uint32", tc.intermediate_size),
-        "llama.attention.head_count": ("add_uint32", tc.num_attention_heads),
-        "llama.attention.head_count_kv": ("add_uint32", tc.num_key_value_heads),
-        "llama.attention.layer_norm_rms_epsilon": ("add_float32", float(tc.rms_norm_eps)),
-        "llama.rope.freq_base": ("add_float32", float(tc.rope_theta)),
-    }, model, lambda n: 'text_model' in n or 'lm_head' in n, 'lm', 'q4_64', quantize_q4_64)
-def generate_vision_gguf(model, vision_config, output_path):
-    """Generate vision+connector FP4_64 GGUF. Weights→FP4_64, biases/norms→BF16."""
-    vc, enc = vision_config, model.model.vision_model.encoder
-    _write_gguf(output_path, {
-        "general.name": ("add_string", "SmolVLM2 500M Vision FP4_64"),
-        "general.file_type": ("add_uint32", 99), "general.quantization_version": ("add_uint32", 2),
-        "vision.hidden_size": ("add_uint32", vc.hidden_size),
-        "vision.num_hidden_layers": ("add_uint32", len(enc.layers)),
-        "vision.num_attention_heads": ("add_uint32", vc.num_attention_heads),
-        "vision.intermediate_size": ("add_uint32", enc.layers[0].mlp.fc1.weight.shape[0]),
-        "vision.image_size": ("add_uint32", vc.image_size),
-        "vision.patch_size": ("add_uint32", vc.patch_size),
-        "vision.layer_norm_eps": ("add_float32", float(getattr(vc, 'layer_norm_eps', 1e-6))),
-    }, model, lambda n: 'vision_model' in n or 'connector' in n, 'vision', 'fp4_64', quantize_fp4_64)
+    with open(bin_path, 'wb') as f:
+        for pname, param in model.named_parameters():
+            if not param_filter(pname):
+                continue
+            key = _weight_key(pname, mode)
+            t = param.data
+            if any(pname.endswith(s) for s in _QUANT_SUFFIXES[qtype]):
+                data, _ = qfn(t)
+                raw = data.tobytes()
+                key = f'{key}.{qtype}'
+            else:
+                if 'position_embedding.weight' in pname and t.dim() == 2:
+                    t = t.t().contiguous()
+                raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            offset = f.tell()
+            f.write(raw)
+            manifest[key] = {'offset': offset, 'size': len(raw)}
+            count += 1
+    with open(json_path, 'w') as f:
+        json.dump(manifest, f)
+    print(f"Weights: {count} tensors, {os.path.getsize(bin_path)/1048576:.1f} MB → {bin_path}")
+def generate_lm_weights(model, output_path):
+    """Generate LM Q4_64 weight bin."""
+    _write_weight_bin(output_path, model,
+        lambda n: 'text_model' in n or 'lm_head' in n, 'lm', 'q4_64', quantize_q4_64)
+def generate_vision_weights(model, output_path):
+    """Generate vision+connector FP4_64 weight bin."""
+    _write_weight_bin(output_path, model,
+        lambda n: 'vision_model' in n or 'connector' in n, 'vision', 'fp4_64', quantize_fp4_64)
 
 class SmolVLM2_UnifiedEngine(UnifiedEngine):
-    """UnifiedEngine for SmolVLM2-500M: GGUF weight loading, compile prefill/decode, run inference."""
-
+    """SmolVLM2-500M accelerator engine: weight loading, compile, inference."""
     # --- Model dimensions (SmolVLM2-500M) — loaded from smolvlm2_config.json ---
     _cfg = _SMOLVLM2_CFG
     HIDDEN_SIZE       = _cfg["lm"]["hidden_size"]
@@ -1398,14 +1164,10 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
     ROPE_SIZE_REG    = _cfg["fixed_isa_regs"]["ROPE_SIZE_REG"]
     TMP_REG          = _cfg["fixed_isa_regs"]["TMP_REG"]
 
-    @staticmethod
-    def load_config(config_path: str | None = None) -> dict:
-        return _load_smolvlm2_config(config_path)
-
-    def __init__(self, script_dir: str = None, lm_gguf: str = None, vision_gguf: str = None,
+    def __init__(self, script_dir: str = None, lm_weights: str = None, vision_weights: str = None,
                  vision_bf16: bool = False, lm_bf16: bool = False):
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        self._cfg = SmolVLM2_UnifiedEngine.load_config()
+        self._cfg = _SMOLVLM2_CFG
         # DRAM layout: adjust for BF16 weights (~968MB params) vs Q4 (~300MB)
         if lm_bf16 or vision_bf16:
             dl = self._cfg["dram_layout"]["bf16"]
@@ -1420,10 +1182,9 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.vision_bf16 = vision_bf16
         self.lm_bf16 = lm_bf16
 
-        # GGUF paths (generated by --gen-gguf)
-        gguf_dir = os.path.join(self.script_dir, self._cfg["paths"]["gguf_dir"])
-        self.lm_gguf_path = lm_gguf or os.path.join(self.script_dir, self._cfg["paths"]["lm_gguf"])
-        self.vision_gguf_path = vision_gguf or os.path.join(self.script_dir, self._cfg["paths"]["vision_gguf"])
+        # Weight bin paths (generated by --gen-weights)
+        self.lm_weights_path = lm_weights or os.path.join(self.script_dir, self._cfg["paths"]["lm_weights"])
+        self.vision_weights_path = vision_weights or os.path.join(self.script_dir, self._cfg["paths"]["vision_weights"])
     # --- ISA register helpers (same as Gemma3) ---
     def reset_isa_reg_counter(self) -> None:
         self._isa_reg_counter = 1
@@ -1440,19 +1201,16 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
     def get_arg_max_index(self) -> int:
         return self.read_reg32(UE_ARGMAX_INDEX)
     def overwrite_instruction_with_general_register(self, general_register: int) -> None:
-        """Delegate to standalone function (Gemma3-compatible class method name)."""
+        """Overwrite last instruction to use general register for DRAM address."""
         overwrite_last_instruction_with_general_register(self, general_register)
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
-        """Delegate to standalone function (Gemma3-compatible class method name)."""
+        """Set ISA register to immediate value."""
         isa_set_register(self, dst_reg_idx, immediate_value, timeout_s)
     def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int,
                      cos_dram_addr: int, sin_dram_addr: int,
                      rope_size_reg: int = None, output_addr_inc_reg: int = None,
                      tmp_reg: int = None) -> int:
-        """Per-token RoPE for decode (D=64, uses split-load path via rope_hf_core_dram).
-
-        For decode: M=1, with register-addressed cos/sin and output for dynamic position.
-        """
+        """Per-token decode RoPE (D=64) with register-addressed cos/sin."""
         use_reg = rope_size_reg is not None and tmp_reg is not None
         bpe = 2
         half = N // 2
@@ -1511,7 +1269,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
     # --- Weight loading ---
     def weight_init(self) -> None:
-        """Load GGUF weights to device DRAM. Populates per-layer addresses and globals."""
+        """Load GGUF weights to device DRAM."""
         from transformers import AutoTokenizer
         model_dir = os.path.join(self.script_dir, "smolvlm2_bin", "SmolVLM2-500M-Video-Instruct")
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -1543,8 +1301,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             del hf_model
             print(f"LM weights loaded (BF16): {self.NUM_LAYERS} layers, params DRAM usage: {self.get_params_dram_usage()} bytes")
         else:
-            # Q4_64 precision: load from GGUF
-            lm_cache = load_gguf_raw_cache(self.lm_gguf_path)
+            # Q4_64 precision: load from weight bin
+            lm_cache = load_weight_cache(self.lm_weights_path)
             # Embedding (BF16) — also keep CPU copy for token lookup
             embed_raw = lm_cache['token_embd.weight']
             embed_bf16 = torch.from_numpy(embed_raw.copy()).view(torch.bfloat16).reshape(self.VOCAB_SIZE, self.HIDDEN_SIZE)
@@ -1554,13 +1312,13 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self.lm_layer_addrs = []
             for i in range(self.NUM_LAYERS):
                 la = {}
-                for proj, gguf_key in [('q', 'attn_q'), ('k', 'attn_k'), ('v', 'attn_v'),
+                for proj, wkey in [('q', 'attn_q'), ('k', 'attn_k'), ('v', 'attn_v'),
                                         ('o', 'attn_output'), ('gate', 'ffn_gate'),
                                         ('up', 'ffn_up'), ('down', 'ffn_down')]:
-                    raw = lm_cache[f'blk.{i}.{gguf_key}.weight.q4_64']
+                    raw = lm_cache[f'blk.{i}.{wkey}.weight.q4_64']
                     la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, raw)
-                for norm, gguf_key in [('ln1', 'attn_norm'), ('ln2', 'ffn_norm')]:
-                    raw = lm_cache[f'blk.{i}.{gguf_key}.weight']
+                for norm, wkey in [('ln1', 'attn_norm'), ('ln2', 'ffn_norm')]:
+                    raw = lm_cache[f'blk.{i}.{wkey}.weight']
                     la[f'{norm}_gamma'] = store_weight(self, torch.from_numpy(raw.copy()).view(torch.bfloat16))
                 self.lm_layer_addrs.append(la)
             raw = lm_cache['output_norm.weight']
@@ -1623,25 +1381,25 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             params_used = self.get_params_dram_usage()
             _original_print(f"  Vision BF16 loaded: {vis_layers} layers, total params: {params_used/1024/1024:.1f} MB")
         else:
-            # FP4_64 precision: load from GGUF
-            vis_cache = load_gguf_raw_cache(self.vision_gguf_path)
+            # FP4_64 precision: load from weight bin
+            vis_cache = load_weight_cache(self.vision_weights_path)
             self.vis_layer_addrs = []
             vis_layers = sum(1 for k in vis_cache if k.startswith('v.blk.') and k.endswith('.ln1.weight'))
             for i in range(vis_layers):
                 la = {}
-                for proj, gguf_key in [('q', 'attn_q'), ('k', 'attn_k'), ('v', 'attn_v'), ('o', 'attn_out')]:
-                    raw = vis_cache[f'v.blk.{i}.{gguf_key}.weight.fp4_64']
+                for proj, wkey in [('q', 'attn_q'), ('k', 'attn_k'), ('v', 'attn_v'), ('o', 'attn_out')]:
+                    raw = vis_cache[f'v.blk.{i}.{wkey}.weight.fp4_64']
                     la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, raw)
-                    bias_raw = vis_cache[f'v.blk.{i}.{gguf_key}.bias']
+                    bias_raw = vis_cache[f'v.blk.{i}.{wkey}.bias']
                     la[f'{proj}_bias'] = store_weight(self, torch.from_numpy(bias_raw.copy()).view(torch.bfloat16))
-                for proj, gguf_key in [('fc1', 'ffn_down'), ('fc2', 'ffn_up')]:
-                    raw = vis_cache[f'v.blk.{i}.{gguf_key}.weight.fp4_64']
+                for proj, wkey in [('fc1', 'ffn_down'), ('fc2', 'ffn_up')]:
+                    raw = vis_cache[f'v.blk.{i}.{wkey}.weight.fp4_64']
                     la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, raw)
-                    bias_raw = vis_cache[f'v.blk.{i}.{gguf_key}.bias']
+                    bias_raw = vis_cache[f'v.blk.{i}.{wkey}.bias']
                     la[f'{proj}_bias'] = store_weight(self, torch.from_numpy(bias_raw.copy()).view(torch.bfloat16))
-                for ln, gguf_key in [('ln1', 'ln1'), ('ln2', 'ln2')]:
+                for ln, wkey in [('ln1', 'ln1'), ('ln2', 'ln2')]:
                     for suffix in ('weight', 'bias'):
-                        raw = vis_cache[f'v.blk.{i}.{gguf_key}.{suffix}']
+                        raw = vis_cache[f'v.blk.{i}.{wkey}.{suffix}']
                         la[f'{ln}_{suffix}'] = store_weight(self, torch.from_numpy(raw.copy()).view(torch.bfloat16))
                 self.vis_layer_addrs.append(la)
             self.patch_weight_addr = store_weight(self, torch.from_numpy(
@@ -1659,7 +1417,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self.connector_scale, self.connector_data = store_quantized_weight(self, raw)
             print(f"Vision weights loaded (FP4): {vis_layers} layers + connector, params DRAM usage: {self.get_params_dram_usage()} bytes")
     def tensor_init(self, max_seq_len: int = 512) -> None:
-        """Allocate DRAM for decoder + vision activations, KV cache, masks, RoPE."""
+        """Allocate DRAM for activations, KV cache, masks, RoPE."""
         self.max_seq_len = max_seq_len
         seq_len = max_seq_len
         bpe = 2
@@ -1695,14 +1453,9 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.LAYER0_MLP_DOWN_DRAM = self.allocate_tensor_dram(seq_len * self.HIDDEN_SIZE * bpe)
         self.FINAL_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.HIDDEN_SIZE * bpe)
         self.LOGITS_DRAM = self.allocate_tensor_dram(1 * self.VOCAB_SIZE * bpe)
-        # Causal mask for prefill: [S, S] upper triangular -inf
-        causal = torch.full((seq_len, seq_len), -1e38, dtype=torch.bfloat16)
-        causal = torch.triu(causal, diagonal=1)
+        # Causal mask for prefill (written by compile_prefill/load_prefill before use)
         self.CAUSAL_MASK_DRAM = self.allocate_tensor_dram(seq_len * seq_len * bpe)
-        self.dma_write(DMA_DEVICE_H2C, self.CAUSAL_MASK_DRAM, causal.flatten(), seq_len * seq_len * bpe)
-        # Decode attention bias: [1, max_seq_len] per query head, DMA'd each decode step
-        # 0.0 for valid positions, -inf for positions beyond current kv_len
-        # Decode bias: [GROUP_SIZE, max_seq_len] — one row per Q head in GQA batch
+        # Decode bias: [GROUP_SIZE, max_seq_len] — written each decode step
         self.DECODE_BIAS_DRAM = self.allocate_tensor_dram(self.GROUP_SIZE * seq_len * bpe)
         # RoPE cos/sin tables
         self._load_rope_tables()
@@ -1741,7 +1494,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.allocate_tensor_dram(VS * VH * bpe * 2)  # temp space for permute decomposition
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
     def _load_rope_tables(self) -> None:
-        """Precompute cos/sin [max_seq_len, head_dim], pre-negate sin[:,:D/2], DMA to device."""
+        """Precompute cos/sin tables, pre-negate sin, DMA to device."""
         D, S, bpe = self.HEAD_DIM, self.max_seq_len, 2
         inv_freq = 1.0 / (self.ROPE_THETA ** (torch.arange(0, D, 2, dtype=torch.float32) / D))
         freqs = torch.outer(torch.arange(S, dtype=torch.float32), inv_freq)  # [S, D/2]
@@ -1779,7 +1532,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
     # --- Compile ---
     def compile_encoder(self) -> int:
-        """Compile vision encoder. Returns program DRAM address."""
+        """Compile vision encoder program. Returns DRAM address."""
         from user_dma_core import TYPE
         S, H, D, N_HEADS, I = 1024, 768, 64, 12, 3072
         bpe = 2
@@ -1886,10 +1639,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         return program_addr
 
     def compile_prefill(self, seq_len: int) -> None:
-        """Compile decoder prefill layer program (no embed/merge — those are fused at runtime).
-        seq_len is padded up to next multiple of 64 for HW alignment.
-        Stores raw instruction bytes in self._prefill_raw and allocates scratch DRAM.
-        """
+        """Compile prefill program (padded to 64). Embed/merge fused at runtime."""
         from user_dma_core import TYPE
         self.prefill_seq_len = seq_len  # actual token count (for causal mask / LM head)
         S = ((seq_len + 63) // 64) * 64  # padded for HW
@@ -2015,14 +1765,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         print(f"    Prefill compiled (S={S}): {len(self._prefill_raw)} bytes raw + scratch {worst_case} bytes → {bin_path}")
 
     def compile_decoder(self, kv_len_buckets=None) -> None:
-        """Compile decode programs for kv_len buckets + pre-compile per-token embed programs.
-        Embedding lookup is done on-device via DMA gather (no CPU embedding lookup).
-        One program per bucket. At runtime, fuse embed + bucket → single dispatch.
-        ISA registers set by run_decoder before each token:
-          reg 1 (V_CACHE_SIZE_REG): pos * k_size (byte offset for KV cache write)
-          reg 2 (ROPE_SIZE_REG):    pos * HEAD_DIM * bpe (byte offset into cos/sin)
-          reg 3 (TMP_REG):          scratch
-        """
+        """Compile per-bucket decode programs + per-token embed programs."""
         from user_dma_core import TYPE
         if kv_len_buckets is None:
             kv_len_buckets = [64 * (i + 1) for i in range(self.max_seq_len // 64)]
@@ -2132,7 +1875,6 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.allocate_program_dram(worst_case)
 
         # Save to bin files for fast reload
-        import json
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         # Save bucket programs
         bucket_meta = []
@@ -2172,20 +1914,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         return addr
 
     def load_encoder(self) -> int:
-        """Load pre-compiled encoder from bin. Returns program DRAM address.
-
-        compile_encoder() has side effects that allocate+write to params DRAM during
-        instruction capture. The compiled instructions reference those absolute DRAM
-        addresses. We must reproduce the exact same allocations here so that:
-          (a) the data exists in DRAM at the expected addresses, and
-          (b) the params allocator pointer advances to the same position.
-
-        Side effects to reproduce (per vision layer, in order):
-          1. layer_norm_core_dram (LN1)     → 768*2 bytes of zeros
-          2. flash_attention_core × 12 heads → 64*64*2 bytes identity matrix each
-          3. layer_norm_core_dram_post_add   → 768*2 bytes of zeros
-        Plus one final layer_norm_core_dram for post-layernorm.
-        """
+        """Load pre-compiled encoder from bin. Reproduces compile-time DRAM allocations."""
         N = 768  # vision hidden size
         N_HEADS = 12
         bpe = 2
@@ -2217,7 +1946,6 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
     def load_prefill(self, seq_len: int) -> None:
         """Load pre-compiled prefill raw bytes from bin. Sets up causal mask and scratch."""
-        import json
         S = ((seq_len + 63) // 64) * 64
         self.prefill_seq_len = seq_len
         self._prefill_padded = S
@@ -2244,7 +1972,6 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
     def load_decoder(self) -> None:
         """Load pre-compiled decoder from bin (embed programs + bucket programs)."""
-        import json
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         meta_path = os.path.join(bin_dir, "decoder_program.json")
         with open(meta_path, "r") as f:
@@ -2275,10 +2002,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
     # --- Run ---
     def run_encoder(self, encoder_addr: int, pixel_values) -> None:
-        """Run vision encoder. pixel_values is [3, 512, 512] bf16 tensor.
-        DMA pixel data to VIS_PIXEL_IN_DRAM (which feeds patch embed in the compiled program),
-        then execute. Output lands in VIS_CONNECTOR_DRAM [64, 960].
-        """
+        """Run vision encoder. Output lands in VIS_CONNECTOR_DRAM."""
         pixels_bf16 = pixel_values.to(torch.bfloat16).contiguous().flatten()
         self.dma_to_accelerator_memory(self.VIS_PIXEL_IN_DRAM, pixels_bf16)
         # Encoder FLOPs: patch proj + pos add + N layers + post LN + connector
@@ -2294,11 +2018,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             + 2 * 64 * 12288 * self.HIDDEN_SIZE)
         self.program_execute(encoder_addr, timeout=30.0, total_flops=enc_flops)
     def run_prefill(self, token_ids, has_image: bool = False, total_flops: int = None) -> int:
-        """On-device prefill: embed gather + vision merge + decoder layers, single dispatch.
-        Generates DMA gather instructions for embedding lookup and vision token merge,
-        fuses with pre-compiled prefill program, and dispatches as one program.
-        Returns last token's argmax.
-        """
+        """On-device prefill: embed gather + vision merge + decoder layers. Returns argmax."""
         seq_len = len(token_ids)
         self.seq_len = seq_len
         S = self._prefill_padded
@@ -2366,12 +2086,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self._last_total_flops = None
         return self.get_arg_max_index()
     def run_decoder(self, token_id: int, max_new_tokens: int = 512) -> list:
-        """Auto-regressive decode loop with on-device embedding (no CPU lookup).
-        Uses pre-compiled embed programs fused with bucket programs. Returns generated token IDs.
-        Register-set instructions are fused into the program bytestream for single-dispatch
-        execution (no separate isa_set_register calls). Scratch layout:
-          [reg_set (64 bytes)] [embed (64 bytes)] [bucket (cached, re-DMA on change)]
-        """
+        """Auto-regressive decode loop. Returns generated token IDs."""
         bpe = 2
         global _SILENT_MODE
         generated = []
@@ -2435,7 +2150,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         return generated
     def program_execute(self, program_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR,
                         timeout: float = 10.0, total_flops: int = None) -> None:
-        """Execute compiled program from DRAM instruction memory."""
+        """Execute compiled program from DRAM."""
         self.start_execute_from_dram(program_addr)
         self.wait_queue(timeout)
         if total_flops is not None:
@@ -2459,11 +2174,7 @@ def process_image(image_path: str, size: int = 512) -> torch.Tensor:
     arr = (arr - 0.5) / 0.5  # normalize to [-1, 1]
     return torch.from_numpy(arr).permute(2, 0, 1).to(torch.bfloat16)
 def build_input_ids(tokenizer, prompt: str, has_image: bool = True) -> list:
-    """Build token ID list for SmolVLM2 chat template with optional image.
-
-    Format: <|im_start|>User:<fake><global-img><image>×64<fake>{text}<end>\\nAssistant:
-    Returns flat list of token IDs.
-    """
+    """Build token ID list with chat template and optional image token expansion."""
     if has_image:
         messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
     else:
@@ -2488,7 +2199,7 @@ def main():
     from user_dma_core import set_dma_device
 
     parser = argparse.ArgumentParser(description="SmolVLM2-500M on accelerator")
-    parser.add_argument("--gen-gguf", action="store_true", help="Generate GGUF files from HF weights")
+    parser.add_argument("--gen-weights", action="store_true", help="Generate quantized weight bins from HF weights")
     _d = _SMOLVLM2_CFG["defaults"]
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     parser.add_argument("--prompt", type=str, default=_d["prompt"], help="Text prompt")
@@ -2503,38 +2214,36 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     model_dir = os.path.join(script_dir, _SMOLVLM2_CFG["paths"]["hf_model_dir"])
-    gguf_dir = os.path.join(script_dir, _SMOLVLM2_CFG["paths"]["gguf_dir"])
+    weights_dir = os.path.join(script_dir, _SMOLVLM2_CFG["paths"]["weights_dir"])
     # Download HF model if needed
     if not os.path.exists(os.path.join(model_dir, "config.json")):
         print(f"Downloading {HF_MODEL_REPO} ...")
         snapshot_download(repo_id=HF_MODEL_REPO, local_dir=model_dir, local_dir_use_symlinks=False, ignore_patterns=["onnx/*"])
-    # Generate GGUF files if requested
-    if args.gen_gguf:
-        from transformers import AutoModelForImageTextToText, AutoConfig
-        print(f"Loading HF model for GGUF generation...")
-        config = AutoConfig.from_pretrained(model_dir)
+    # Generate quantized weight bins if requested
+    if args.gen_weights:
+        from transformers import AutoModelForImageTextToText
+        print("Loading HF model for weight generation...")
         model = AutoModelForImageTextToText.from_pretrained(
             model_dir, local_files_only=True, torch_dtype='auto', device_map=None, attn_implementation="eager")
         model.cpu().eval()
-        generate_lm_gguf(model, config.text_config, os.path.join(gguf_dir, "SmolVLM2-500M-Q4_64.gguf"))
-        generate_vision_gguf(model, config.vision_config, os.path.join(gguf_dir, "SmolVLM2-500M-Vision-FP4_64.gguf"))
+        generate_lm_weights(model, os.path.join(weights_dir, "smolvlm2_lm_q4.bin"))
+        generate_vision_weights(model, os.path.join(weights_dir, "smolvlm2_vision_fp4.bin"))
         del model
-        print("GGUF generation complete.")
+        print("Weight generation complete.")
         return
-    # Auto-generate GGUF files if missing
-    lm_gguf = os.path.join(gguf_dir, "SmolVLM2-500M-Q4_64.gguf")
-    vis_gguf = os.path.join(gguf_dir, "SmolVLM2-500M-Vision-FP4_64.gguf")
-    if not os.path.exists(lm_gguf) or not os.path.exists(vis_gguf):
-        from transformers import AutoModelForImageTextToText, AutoConfig
-        print("GGUF files not found, generating...")
-        config = AutoConfig.from_pretrained(model_dir)
+    # Auto-generate weight bins if missing
+    lm_bin = os.path.join(weights_dir, "smolvlm2_lm_q4.bin")
+    vis_bin = os.path.join(weights_dir, "smolvlm2_vision_fp4.bin")
+    if not os.path.exists(lm_bin) or not os.path.exists(vis_bin):
+        from transformers import AutoModelForImageTextToText
+        print("Weight files not found, generating...")
         model = AutoModelForImageTextToText.from_pretrained(
             model_dir, local_files_only=True, torch_dtype='auto', device_map=None, attn_implementation="eager")
         model.cpu().eval()
-        generate_lm_gguf(model, config.text_config, lm_gguf)
-        generate_vision_gguf(model, config.vision_config, vis_gguf)
+        generate_lm_weights(model, lm_bin)
+        generate_vision_weights(model, vis_bin)
         del model
-        print("GGUF generation complete.")
+        print("Weight generation complete.")
 
     # --- Hardware inference ---
     set_dma_device(args.dev)
@@ -2624,6 +2333,8 @@ def main():
     _original_print(f"  Prefill:  {seq_len} tokens in {prefill_time:.2f}s ({prefill_flops/1e9:.1f} GF)")
     _original_print(f"  Decode:   {n_generated} tokens in {decode_time:.2f}s ({n_generated / decode_time:.2f} t/s, {ue._decode_hw_gflops:.2f} GFLOPS, {ue._decode_total_flops/1e9:.1f} GF)")
     _original_print(f"  Total:    {n_generated} tokens in {total_time:.2f}s ({n_generated / total_time:.2f} t/s incl. prefill)")
+    if not args.bin:
+        _original_print(f"\nTip: Use --bin flag to skip compilation on next run.")
 
 if __name__ == "__main__":
     main()
