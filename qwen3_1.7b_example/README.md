@@ -12,7 +12,6 @@ This folder contains the Qwen3 1.7B accelerator inference example.
 
 - Run from the **parent directory** so that `user_dma_core` is on the path:
   ```bash
-  cd src/template
   python qwen3_1.7b_example/qwen3_1.7b_test.py
   ```
 - Python with `torch`, `transformers`, and DMA device access.
