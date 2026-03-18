@@ -1,0 +1,359 @@
+{
+  "_template_note": "Qwen3-1.7B config for qwen3_1.7b_test.py. 28 layers, 16Q/8KV heads, head_dim=128, SwiGLU, QK RMSNorm, no post-attn/post-FFN norm, single RoPE base.",
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "TMP_REG": 2,
+    "ROPE_SIZE_REG": 3
+  },
+  "file_info": {
+    "layer_size": 26759168,
+    "num_layers": 28,
+    "head_dim": 1024,
+    "actual_head_dim": 128,
+    "num_kv_heads": 8,
+    "hidden_size": 2048,
+    "embedding_vocab": 151936,
+    "group_size": 2,
+    "mlp_elements": 6144,
+    "bytes_per_element": 2
+  },
+  "model": {
+    "max_context_size": 2048,
+    "end_of_turn_token_id": 151645,
+    "decoder_seq_len_buckets": [
+      256,
+      512,
+      768,
+      1024,
+      1280,
+      1536,
+      1792,
+      2048
+    ],
+    "rope_global_layers": []
+  },
+  "paths": {
+    "weights_bin": "qwen3_1.7b_bin/weights_qwen3_1.7b_hf.bin",
+    "local_weights_bin": "qwen3_1.7b_bin/full_model_weights.bin",
+    "hf_model_dir": "qwen3_1.7b_bin/Qwen3-1.7B",
+    "hf_model_repo": "Qwen/Qwen3-1.7B",
+    "decoder_program_bin": "qwen3_1.7b_bin/decoder_program.bin",
+    "decoder_program_meta": "qwen3_1.7b_bin/decoder_program.json"
+  },
+  "default_prefill_tokens": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    1195,
+    58,
+    16,
+    13,
+    358,
+    1079,
+    498,
+    279,
+    4226,
+    311,
+    856,
+    3405,
+    1191,
+    20173,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    3838,
+    374,
+    220,
+    18,
+    488,
+    220,
+    20,
+    30,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+  ],
+  "layers": {
+    "structure": [
+      {
+        "key": "BLK0_ATTN_NORM_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_PRE_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_ATTN_Q_WEIGHT_SCALE",
+        "type": "bf16_scale",
+        "attr": "DRAM_ADDR_LAYER0_Q_PROJ_SCALE"
+      },
+      {
+        "key": "BLK0_ATTN_Q_WEIGHT_DATA",
+        "type": "int4",
+        "attr": "DRAM_ADDR_LAYER0_Q_PROJ_QUANT"
+      },
+      {
+        "key": "BLK0_ATTN_K_WEIGHT_SCALE",
+        "type": "bf16_scale",
+        "attr": "DRAM_ADDR_LAYER0_K_PROJ_SCALE"
+      },
+      {
+        "key": "BLK0_ATTN_K_WEIGHT_DATA",
+        "type": "int4",
+        "attr": "DRAM_ADDR_LAYER0_K_PROJ_QUANT"
+      },
+      {
+        "key": "BLK0_ATTN_V_WEIGHT_SCALE",
+        "type": "bf16_scale",
+        "attr": "DRAM_ADDR_LAYER0_V_PROJ_SCALE"
+      },
+      {
+        "key": "BLK0_ATTN_V_WEIGHT_DATA",
+        "type": "int4",
+        "attr": "DRAM_ADDR_LAYER0_V_PROJ_QUANT"
+      },
+      {
+        "key": "BLK0_ATTN_Q_NORM_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_Q_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_ATTN_K_NORM_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_K_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_ATTN_OUTPUT_WEIGHT_SCALE",
+        "type": "bf16_scale",
+        "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE"
+      },
+      {
+        "key": "BLK0_ATTN_OUTPUT_WEIGHT_DATA",
+        "type": "int4",
+        "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT"
+      },
+      {
+        "key": "BLK0_POST_ATTENTION_NORM_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_POST_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_FFN_NORM_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_FFN_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_FFN_UP_WEIGHT_SCALE",
+        "type": "bf16_scale",
+        "attr": "DRAM_ADDR_LAYER0_MLP_UP_SCALE"
+      },
+      {
+        "key": "BLK0_FFN_UP_WEIGHT_DATA",
+        "type": "int4",
+        "attr": "DRAM_ADDR_LAYER0_MLP_UP_QUANT"
+      },
+      {
+        "key": "BLK0_FFN_GATE_WEIGHT_SCALE",
+        "type": "bf16_scale",
+        "attr": "DRAM_ADDR_LAYER0_MLP_GATE_SCALE"
+      },
+      {
+        "key": "BLK0_FFN_GATE_WEIGHT_DATA",
+        "type": "int4",
+        "attr": "DRAM_ADDR_LAYER0_MLP_GATE_QUANT"
+      },
+      {
+        "key": "BLK0_FFN_DOWN_WEIGHT_SCALE",
+        "type": "bf16_scale",
+        "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_SCALE"
+      },
+      {
+        "key": "BLK0_FFN_DOWN_WEIGHT_DATA",
+        "type": "int4",
+        "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_QUANT"
+      },
+      {
+        "key": "BLK0_POST_FFW_NORM_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA"
+      }
+    ],
+    "non_layer": [
+      {
+        "key": "ROPE_LOCAL",
+        "attr": "DRAM_ADDR_ROPE_LOCAL"
+      },
+      {
+        "key": "ROPE_GLOBAL",
+        "attr": "DRAM_ADDR_ROPE_GLOBAL"
+      },
+      {
+        "key": "OUTPUT_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_OUTPUT_NORM_GAMMA"
+      },
+      {
+        "key": "LM_HEAD_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LM_HEAD_SCALE"
+      },
+      {
+        "key": "LM_HEAD_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LM_HEAD_QUANT"
+      }
+    ]
+  },
+  "regions": {
+    "BLK0_ATTN_NORM_WEIGHT": {
+      "offset": "0x25180000",
+      "size": 4096,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_Q_WEIGHT_SCALE": {
+      "offset": "0x25181000",
+      "size": 131072,
+      "type": "bf16_scale"
+    },
+    "BLK0_ATTN_Q_WEIGHT_DATA": {
+      "offset": "0x251A1000",
+      "size": 2097152,
+      "type": "int4"
+    },
+    "BLK0_ATTN_K_WEIGHT_SCALE": {
+      "offset": "0x253A1000",
+      "size": 65536,
+      "type": "bf16_scale"
+    },
+    "BLK0_ATTN_K_WEIGHT_DATA": {
+      "offset": "0x253B1000",
+      "size": 1048576,
+      "type": "int4"
+    },
+    "BLK0_ATTN_V_WEIGHT_SCALE": {
+      "offset": "0x254B1000",
+      "size": 65536,
+      "type": "bf16_scale"
+    },
+    "BLK0_ATTN_V_WEIGHT_DATA": {
+      "offset": "0x254C1000",
+      "size": 1048576,
+      "type": "int4"
+    },
+    "BLK0_ATTN_Q_NORM_WEIGHT": {
+      "offset": "0x255C1000",
+      "size": 2048,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_K_NORM_WEIGHT": {
+      "offset": "0x255C1800",
+      "size": 2048,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_OUTPUT_WEIGHT_SCALE": {
+      "offset": "0x255C2000",
+      "size": 131072,
+      "type": "bf16_scale"
+    },
+    "BLK0_ATTN_OUTPUT_WEIGHT_DATA": {
+      "offset": "0x255E2000",
+      "size": 2097152,
+      "type": "int4"
+    },
+    "BLK0_POST_ATTENTION_NORM_WEIGHT": {
+      "offset": "0x257E2000",
+      "size": 4096,
+      "type": "bf16"
+    },
+    "BLK0_FFN_NORM_WEIGHT": {
+      "offset": "0x257E3000",
+      "size": 4096,
+      "type": "bf16"
+    },
+    "BLK0_FFN_UP_WEIGHT_SCALE": {
+      "offset": "0x257e4000",
+      "size": 393216,
+      "type": "bf16_scale"
+    },
+    "BLK0_FFN_UP_WEIGHT_DATA": {
+      "offset": "0x25844000",
+      "size": 6291456,
+      "type": "int4"
+    },
+    "BLK0_FFN_GATE_WEIGHT_SCALE": {
+      "offset": "0x25e44000",
+      "size": 393216,
+      "type": "bf16_scale"
+    },
+    "BLK0_FFN_GATE_WEIGHT_DATA": {
+      "offset": "0x25ea4000",
+      "size": 6291456,
+      "type": "int4"
+    },
+    "BLK0_FFN_DOWN_WEIGHT_SCALE": {
+      "offset": "0x264a4000",
+      "size": 393216,
+      "type": "bf16_scale"
+    },
+    "BLK0_FFN_DOWN_WEIGHT_DATA": {
+      "offset": "0x26504000",
+      "size": 6291456,
+      "type": "int4"
+    },
+    "BLK0_POST_FFW_NORM_WEIGHT": {
+      "offset": "0x26b04000",
+      "size": 4096,
+      "type": "bf16"
+    }
+  },
+  "non_layer_regions": {
+    "OUTPUT_NORM_WEIGHT": {
+      "offset": "0x6117C000",
+      "size": 4096
+    },
+    "LM_HEAD_WEIGHT_SCALE": {
+      "offset": "0x6117D000",
+      "size": 9723904
+    },
+    "LM_HEAD_WEIGHT_DATA": {
+      "offset": "0x61AC3000",
+      "size": 155582464
+    },
+    "ROPE_LOCAL": {
+      "offset": "0x6AF23000",
+      "size": 8388608
+    },
+    "ROPE_GLOBAL": {
+      "offset": "0x6B723000",
+      "size": 8388608
+    }
+  },
+  "special": {
+    "embedding": {
+      "token_embd_offset": "0x0",
+      "token_embd_size": "0x25180000",
+      "vocab_size": 151936,
+      "embedding_dim": 2048,
+      "scale": 0.5
+    },
+    "rope": {
+      "head_dim": 1024,
+      "num_positions": 2048,
+      "theta": 1000000.0,
+      "local_base": 1000000.0
+    },
+    "quantization": {
+      "block_size": 64,
+      "bits": 4,
+      "range": [
+        -8,
+        7
+      ]
+    },
+    "rms_norm": {
+      "gamma_offset": 0.0
+    }
+  }
+}
