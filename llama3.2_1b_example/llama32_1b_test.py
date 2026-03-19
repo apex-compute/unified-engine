@@ -31,13 +31,18 @@ Usage:
 import json
 import math
 import os
+import sys
 
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 import time
-# pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
+
+# This file's folder; user_dma_core.py is one folder up; that parent is added to sys.path.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
+
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine
@@ -287,7 +292,7 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
 
 def _load_config(script_dir: str) -> dict:
     """Load llama32_1b_config.json and build weight_defs (offset/size dict) from regions."""
-    config_path = os.path.join(script_dir, "llama32_1b_bin", "llama32_1b_config.json")
+    config_path = os.path.join(script_dir, "llama32_1b_config.json")
     with open(config_path, "r") as f:
         cfg = json.load(f)
     weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
