@@ -4,9 +4,9 @@ This folder contains the LLaMA 3.2 1B accelerator inference example.
 
 ## Layout
 
-- **llama32_1b_test.py** – Prefill + decode loop on accelerator.
-- **llama32_1b_config.json** – Model and layout config.
-- **llama32_1b_bin/** – Weights, HF model, and decoder binaries (generated at runtime).
+- **llama3.2_1b_test.py** – Prefill + decode loop on accelerator.
+- **llama3.2_1b_config.json** – Model and layout config.
+- **llama3.2_1b_bin/** – Weights, HF model, and decoder binaries (generated at runtime).
 
 ## Prerequisites
 
@@ -19,8 +19,8 @@ From the parent directory:
 
 ```bash
 # Prefill + decode (default prompt)
-python llama3.2_1b_example/llama32_1b_test.py
+python llama3.2_1b_example/llama3.2_1b_test.py
 
 # Custom prompt
-python llama3.2_1b_example/llama32_1b_test.py --prompt "What is 2+2?"
+python llama3.2_1b_example/llama3.2_1b_test.py --prompt "What is 2+2?"
 ```

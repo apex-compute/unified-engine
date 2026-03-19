@@ -2,9 +2,9 @@
 """
 Llama-3.2-1B inference on accelerator: prefill + decode.
 
-  - Config from llama32_1b_config.json; weights from a single bin (see below).
-  - Prefill: compiled each run. Decoder: if llama32_1b_bin/decoder_program.bin and
-    llama32_1b_bin/decoder_program.json exist, skip decoder compile and load
+  - Config from llama3.2_1b_config.json; weights from a single bin (see below).
+  - Prefill: compiled each run. Decoder: if llama3.2_1b_bin/decoder_program.bin and
+    llama3.2_1b_bin/decoder_program.json exist, skip decoder compile and load
     program sizes from meta; otherwise compile and write the bin + meta.
   - Run prefill then decode loop.
 
@@ -18,14 +18,14 @@ Architecture differences vs Gemma3:
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
 Weights:
-  - Default: llama32_1b_bin/weights_llama32_1b_hf.bin (generated from HF model if missing).
-  - --local-weights: use llama32_1b_bin/full_model_weights.bin instead.
+  - Default: llama3.2_1b_bin/weights_llama3.2_1b_hf.bin (generated from HF model if missing).
+  - --local-weights: use llama3.2_1b_bin/full_model_weights.bin instead.
 
 Usage:
-  python llama32_1b_test.py
-  python llama32_1b_test.py --prompt "your prompt"
-  python llama32_1b_test.py --dev xdma0 [--cycle 5.88]
-  python llama32_1b_test.py --local-weights
+  python llama3.2_1b_test.py
+  python llama3.2_1b_test.py --prompt "your prompt"
+  python llama3.2_1b_test.py --dev xdma0 [--cycle 5.88]
+  python llama3.2_1b_test.py --local-weights
 """
 
 import json
@@ -108,7 +108,7 @@ def _rope_kv_perm(num_kv_heads: int, actual_head_dim: int) -> torch.Tensor:
 
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_llama32_1b_hf.bin from HuggingFace model per llama32_1b_config.json layout.
+    """Generate weights_llama3.2_1b_hf.bin from HuggingFace model per llama3.2_1b_config.json layout.
     Returns the path to the written file."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -291,8 +291,8 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     return model, model_dir
 
 def _load_config(script_dir: str) -> dict:
-    """Load llama32_1b_config.json and build weight_defs (offset/size dict) from regions."""
-    config_path = os.path.join(script_dir, "llama32_1b_config.json")
+    """Load llama3.2_1b_config.json and build weight_defs (offset/size dict) from regions."""
+    config_path = os.path.join(script_dir, "llama3.2_1b_config.json")
     with open(config_path, "r") as f:
         cfg = json.load(f)
     weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
@@ -1219,8 +1219,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
         paths_cfg = self._cfg.get("paths", {})
-        decoder_bin_rel = paths_cfg.get("decoder_program_bin", "llama32_1b_bin/decoder_program.bin")
-        decoder_meta_rel = paths_cfg.get("decoder_program_meta", "llama32_1b_bin/decoder_program.json")
+        decoder_bin_rel = paths_cfg.get("decoder_program_bin", "llama3.2_1b_bin/decoder_program.bin")
+        decoder_meta_rel = paths_cfg.get("decoder_program_meta", "llama3.2_1b_bin/decoder_program.json")
         decoder_bin_path = os.path.join(self.script_dir, decoder_bin_rel)
         decoder_meta_path = os.path.join(self.script_dir, decoder_meta_rel)
         os.makedirs(os.path.dirname(decoder_bin_path), exist_ok=True)
@@ -1457,7 +1457,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
-    parser.add_argument("--local-weights", action="store_true", help="Use llama32_1b_bin/full_model_weights.bin instead of generated weights_llama32_1b_hf.bin")
+    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin instead of generated weights_llama3.2_1b_hf.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=1/0.17,
@@ -1466,9 +1466,9 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:
-        weights_bin_rel = "llama32_1b_bin/full_model_weights.bin"
+        weights_bin_rel = "llama3.2_1b_bin/full_model_weights.bin"
     else:
-        weights_bin_rel = "llama32_1b_bin/weights_llama32_1b_hf.bin"
+        weights_bin_rel = "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin"
         weights_bin_full = os.path.join(script_dir, weights_bin_rel)
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
@@ -1504,8 +1504,8 @@ def main():
     timer = time.perf_counter()
     prefill_program_addr, gflops_prefill = ue.compile_prefill(seq_len=len(prefill_seq))
     print(f"Prefill compile done in {time.perf_counter() - timer:.2f} seconds, start decoder compile...")
-    decoder_bin_path = os.path.join(script_dir, "llama32_1b_bin", "decoder_program.bin")
-    decoder_meta_path = os.path.join(script_dir, "llama32_1b_bin", "decoder_program.json")
+    decoder_bin_path = os.path.join(script_dir, "llama3.2_1b_bin", "decoder_program.bin")
+    decoder_meta_path = os.path.join(script_dir, "llama3.2_1b_bin", "decoder_program.json")
     if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
         with open(decoder_meta_path, "r") as f:
             meta = json.load(f)

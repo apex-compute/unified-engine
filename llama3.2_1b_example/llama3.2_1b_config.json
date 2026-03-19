@@ -1,5 +1,5 @@
 {
-  "_template_note": "Concrete starter values for llama32_1b_test.py using template-compatible layout (sizes are bytes; offsets are weight-file offsets).",
+  "_template_note": "Concrete starter values for llama3.2_1b_test.py using template-compatible layout (sizes are bytes; offsets are weight-file offsets).",
   "fixed_isa_regs": {
     "V_CACHE_SIZE_REG": 1,
     "TMP_REG": 2,
@@ -22,12 +22,12 @@
     "rope_global_layers": []
   },
   "paths": {
-    "weights_bin": "llama32_1b_bin/weights_llama32_1b_hf.bin",
-    "local_weights_bin": "llama32_1b_bin/full_model_weights.bin",
-    "hf_model_dir": "llama32_1b_bin/Llama-3.2-1B-Instruct",
+    "weights_bin": "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin",
+    "local_weights_bin": "llama3.2_1b_bin/full_model_weights.bin",
+    "hf_model_dir": "llama3.2_1b_bin/Llama-3.2-1B-Instruct",
     "hf_model_repo": "meta-llama/Llama-3.2-1B-Instruct",
-    "decoder_program_bin": "llama32_1b_bin/decoder_program.bin",
-    "decoder_program_meta": "llama32_1b_bin/decoder_program.json"
+    "decoder_program_bin": "llama3.2_1b_bin/decoder_program.bin",
+    "decoder_program_meta": "llama3.2_1b_bin/decoder_program.json"
   },
   "default_prefill_tokens": [128000, 128006, 9125, 128007, 271, 38766, 1303, 33025, 2696, 25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 975, 2947, 220, 2366, 21, 271, 128009, 128006, 882, 128007, 271, 87, 10, 18, 28, 20, 11, 1148, 374, 865, 30, 128009, 128006, 78191, 128007, 271],
   "layers": {
