@@ -19,8 +19,8 @@ From the parent directory:
 
 ```bash
 # Prefill + decode (default prompt)
-python llama32_1b_example/llama32_1b_test.py
+python llama3.2_1b_example/llama32_1b_test.py
 
 # Custom prompt
-python llama32_1b_example/llama32_1b_test.py --prompt "What is 2+2?"
+python llama3.2_1b_example/llama32_1b_test.py --prompt "What is 2+2?"
 ```
