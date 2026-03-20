@@ -2322,12 +2322,15 @@ def main():
     # --- Decode (on-device embed fused with decoder, single dispatch per token) ---
     max_new = args.max_seq - seq_len
     _original_print(f"\n--- Starting decoder ---")
+    _original_print(ue.tokenizer.decode([hw_token]), end="", flush=True)
     decode_timer = time.perf_counter()
     hw_tokens = ue.run_decoder(hw_token, max_new_tokens=max_new)
     decode_time = time.perf_counter() - decode_timer
     total_time = prefill_time + decode_time
     n_generated = len(hw_tokens)
     _original_print(f"\nDecoder done in {total_time:.2f} seconds, total {n_generated} tokens.")
+    if not args.bin:
+        _original_print(f"\nTip: Use --bin flag to reload compiled model on next run.")
     _original_print("SmolVLM2 test ends.")
 
 if __name__ == "__main__":

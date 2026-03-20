@@ -23,4 +23,7 @@ python models/smolvlm2_example/smolvlm2_test.py
 
 # Custom prompt and image
 python models/smolvlm2_example/smolvlm2_test.py --prompt "Describe this image." --image test_samples/vette.jpg
+
+# Reload compiled model (skip compilation)
+python models/smolvlm2_example/smolvlm2_test.py --bin
 ```
