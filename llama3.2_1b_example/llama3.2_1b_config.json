@@ -1,0 +1,116 @@
+{
+  "_template_note": "Concrete starter values for llama3.2_1b_test.py using template-compatible layout (sizes are bytes; offsets are weight-file offsets).",
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "TMP_REG": 2,
+    "ROPE_SIZE_REG": 3
+  },
+  "file_info": {
+    "layer_size": 32327680,
+    "num_layers": 16,
+    "head_dim": 512,
+    "hidden_size": 2048,
+    "embedding_vocab": 128256,
+    "group_size": 4,
+    "mlp_elements": 8192,
+    "bytes_per_element": 2
+  },
+  "model": {
+    "max_context_size": 512,
+    "end_of_turn_token_id": 128009,
+    "decoder_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
+    "rope_global_layers": []
+  },
+  "paths": {
+    "weights_bin": "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin",
+    "local_weights_bin": "llama3.2_1b_bin/full_model_weights.bin",
+    "hf_model_dir": "llama3.2_1b_bin/Llama-3.2-1B-Instruct",
+    "hf_model_repo": "meta-llama/Llama-3.2-1B-Instruct",
+    "decoder_program_bin": "llama3.2_1b_bin/decoder_program.bin",
+    "decoder_program_meta": "llama3.2_1b_bin/decoder_program.json"
+  },
+  "default_prefill_tokens": [128000, 128006, 9125, 128007, 271, 38766, 1303, 33025, 2696, 25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 975, 2947, 220, 2366, 21, 271, 128009, 128006, 882, 128007, 271, 87, 10, 18, 28, 20, 11, 1148, 374, 865, 30, 128009, 128006, 78191, 128007, 271],
+  "layers": {
+    "structure": [
+      {"key": "BLK0_ATTN_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_PRE_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_Q_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_Q_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_Q_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_Q_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_K_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_K_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_K_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_K_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_V_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_V_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_V_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_V_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_Q_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_Q_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_K_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_K_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_OUTPUT_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_OUTPUT_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT"},
+      {"key": "BLK0_POST_ATTENTION_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_POST_NORM_GAMMA"},
+      {"key": "BLK0_FFN_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_FFN_NORM_GAMMA"},
+      {"key": "BLK0_FFN_UP_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_UP_SCALE"},
+      {"key": "BLK0_FFN_UP_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_MLP_UP_QUANT"},
+      {"key": "BLK0_FFN_GATE_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_GATE_SCALE"},
+      {"key": "BLK0_FFN_GATE_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_MLP_GATE_QUANT"},
+      {"key": "BLK0_FFN_DOWN_WEIGHT_SCALE", "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_SCALE"},
+      {"key": "BLK0_FFN_DOWN_WEIGHT_DATA", "type": "int4", "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_QUANT"},
+      {"key": "BLK0_POST_FFW_NORM_WEIGHT", "type": "bf16", "attr": "DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA"}
+    ],
+    "non_layer": [
+      {"key": "ROPE_LOCAL", "attr": "DRAM_ADDR_ROPE_LOCAL"},
+      {"key": "ROPE_GLOBAL", "attr": "DRAM_ADDR_ROPE_GLOBAL"},
+      {"key": "OUTPUT_NORM_WEIGHT", "attr": "DRAM_ADDR_OUTPUT_NORM_GAMMA"},
+      {"key": "LM_HEAD_WEIGHT_SCALE", "attr": "DRAM_ADDR_LM_HEAD_SCALE"},
+      {"key": "LM_HEAD_WEIGHT_DATA", "attr": "DRAM_ADDR_LM_HEAD_QUANT"}
+    ]
+  },
+  "regions": {
+    "BLK0_ATTN_NORM_WEIGHT": {"offset": "0x1f500000", "size": 4096, "type": "bf16"},
+    "BLK0_ATTN_Q_WEIGHT_SCALE": {"offset": "0x1f501000", "size": 131072, "type": "bf16_scale"},
+    "BLK0_ATTN_Q_WEIGHT_DATA": {"offset": "0x1f521000", "size": 2097152, "type": "int4"},
+    "BLK0_ATTN_K_WEIGHT_SCALE": {"offset": "0x1f721000", "size": 32768, "type": "bf16_scale"},
+    "BLK0_ATTN_K_WEIGHT_DATA": {"offset": "0x1f729000", "size": 524288, "type": "int4"},
+    "BLK0_ATTN_V_WEIGHT_SCALE": {"offset": "0x1f7a9000", "size": 32768, "type": "bf16_scale"},
+    "BLK0_ATTN_V_WEIGHT_DATA": {"offset": "0x1f7b1000", "size": 524288, "type": "int4"},
+    "BLK0_ATTN_Q_NORM_WEIGHT": {"offset": "0x1f831000", "size": 1024, "type": "bf16"},
+    "BLK0_ATTN_K_NORM_WEIGHT": {"offset": "0x1f831400", "size": 1024, "type": "bf16"},
+    "BLK0_ATTN_OUTPUT_WEIGHT_SCALE": {"offset": "0x1f831800", "size": 131072, "type": "bf16_scale"},
+    "BLK0_ATTN_OUTPUT_WEIGHT_DATA": {"offset": "0x1f851800", "size": 2097152, "type": "int4"},
+    "BLK0_POST_ATTENTION_NORM_WEIGHT": {"offset": "0x1fa51800", "size": 4096, "type": "bf16"},
+    "BLK0_FFN_NORM_WEIGHT": {"offset": "0x1fa52800", "size": 4096, "type": "bf16"},
+    "BLK0_FFN_UP_WEIGHT_SCALE": {"offset": "0x1fa53800", "size": 524288, "type": "bf16_scale"},
+    "BLK0_FFN_UP_WEIGHT_DATA": {"offset": "0x1fad3800", "size": 8388608, "type": "int4"},
+    "BLK0_FFN_GATE_WEIGHT_SCALE": {"offset": "0x202d3800", "size": 524288, "type": "bf16_scale"},
+    "BLK0_FFN_GATE_WEIGHT_DATA": {"offset": "0x20353800", "size": 8388608, "type": "int4"},
+    "BLK0_FFN_DOWN_WEIGHT_SCALE": {"offset": "0x20b53800", "size": 524288, "type": "bf16_scale"},
+    "BLK0_FFN_DOWN_WEIGHT_DATA": {"offset": "0x20bd3800", "size": 8388608, "type": "int4"},
+    "BLK0_POST_FFW_NORM_WEIGHT": {"offset": "0x213d3800", "size": 4096, "type": "bf16"}
+  },
+  "non_layer_regions": {
+    "OUTPUT_NORM_WEIGHT": {"offset": "0x3e248000", "size": 4096},
+    "LM_HEAD_WEIGHT_SCALE": {"offset": "0x3e249000", "size": 8208384},
+    "LM_HEAD_WEIGHT_DATA": {"offset": "0x3ea1d000", "size": 131334144},
+    "ROPE_LOCAL": {"offset": "0x4675d000", "size": 1048576},
+    "ROPE_GLOBAL": {"offset": "0x4685d000", "size": 1048576}
+  },
+  "special": {
+    "embedding": {
+      "token_embd_offset": "0x0",
+      "token_embd_size": "0x1f500000",
+      "vocab_size": 128256,
+      "embedding_dim": 2048,
+      "scale": 0.5
+    },
+    "rope": {
+      "head_dim": 512,
+      "num_positions": 512,
+      "theta": 500000.0,
+      "local_base": 500000.0
+    },
+    "quantization": {
+      "block_size": 64,
+      "bits": 4,
+      "range": [-8, 7]
+    },
+    "rms_norm": {
+      "gamma_offset": 0.0
+    }
+  }
+}
