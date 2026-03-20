@@ -1,0 +1,90 @@
+{
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "ROPE_SIZE_REG": 2,
+    "TMP_REG": 3
+  },
+  "lm": {
+    "hidden_size": 960,
+    "num_layers": 32,
+    "num_heads": 15,
+    "num_kv_heads": 5,
+    "group_size": 3,
+    "head_dim": 64,
+    "intermediate_size": 2560,
+    "vocab_size": 49280,
+    "rope_theta": 100000.0,
+    "rms_norm_eps": 1e-5,
+    "max_position_embeddings": 8192
+  },
+  "vision": {
+    "hidden_size": 768,
+    "num_heads": 12,
+    "head_dim": 64,
+    "intermediate_size": 3072,
+    "num_patches": 1024,
+    "num_patches_per_side": 32,
+    "patch_size": 16,
+    "image_size": 512
+  },
+  "connector": {
+    "pixel_shuffle_scale_factor": 4,
+    "input_size": 12288,
+    "output_size": 960,
+    "num_tokens": 64
+  },
+  "model": {
+    "image_seq_len": 64,
+    "max_context_size": 512,
+    "stop_token_ids": [0, 1, 2, 49279]
+  },
+  "special_tokens": {
+    "image_token_id": 49190,
+    "fake_token_id": 49189,
+    "global_img_token_id": 49152,
+    "end_of_utterance_id": 49279
+  },
+  "image_processing": {
+    "resize": 512,
+    "normalize_mean": 0.5,
+    "normalize_std": 0.5
+  },
+  "quantization": {
+    "q4_64": {
+      "block_size": 64,
+      "bits": 4,
+      "scale_divisor": 7.0,
+      "range": [-8, 7]
+    },
+    "fp4_e2m1": {
+      "block_size": 64,
+      "max_value": 6.0,
+      "table": [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+    }
+  },
+  "dram_layout": {
+    "q4_default": {
+      "comment": "params ~300MB | tensors 512MB | instructions open"
+    },
+    "bf16": {
+      "params_dram_base": "0x80000000",
+      "tensor_dram_base": "0xC0000000",
+      "program_dram_base": "0xE0000000",
+      "comment": "params 1GB | tensors 512MB | instructions 512MB"
+    }
+  },
+  "paths": {
+    "hf_model_repo": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+    "hf_model_dir": "smolvlm2_bin/SmolVLM2-500M-Video-Instruct",
+    "weights_dir": "smolvlm2_bin",
+    "lm_weights": "smolvlm2_bin/smolvlm2_lm_q4.bin",
+    "vision_weights": "smolvlm2_bin/smolvlm2_vision_fp4.bin"
+  },
+  "defaults": {
+    "prompt": "Describe this image.",
+    "image": "test_samples/vette.jpg",
+    "dev": "xdma0",
+    "cycle_ns": 5.63,
+    "max_seq": 512
+  }
+}
