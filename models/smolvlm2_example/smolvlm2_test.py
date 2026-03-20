@@ -7,7 +7,7 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
 
@@ -2141,10 +2141,10 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             generated.append(token_id)
             _SILENT_MODE = False
             if token_id in _SMOLVLM2_CFG["model"]["stop_token_ids"]:  # <|endoftext|>, BOS, PAD, <end_of_utterance>
+                _original_print(f"\nStop token {token_id} reached.")
                 break
             _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
         _SILENT_MODE = False
-        _original_print("")
         self._decode_hw_gflops = (self._decode_total_flops / self._decode_total_hw_ns
                                   if self._decode_total_hw_ns > 0 else 0)
         return generated
@@ -2201,7 +2201,7 @@ def main():
     parser = argparse.ArgumentParser(description="SmolVLM2-500M on accelerator")
     parser.add_argument("--gen-weights", action="store_true", help="Generate quantized weight bins from HF weights")
     _d = _SMOLVLM2_CFG["defaults"]
-    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     parser.add_argument("--prompt", type=str, default=_d["prompt"], help="Text prompt")
     parser.add_argument("--image", type=str, default=os.path.join(_root, _d["image"]), help="Path to image file (None for text-only)")
     parser.add_argument("--dev", type=str, default=_d["dev"], help="DMA device name")
@@ -2291,7 +2291,7 @@ def main():
         enc_total_flops = ue._last_total_flops
         _original_print(f"done in {enc_time:.2f}s ({enc_gflops:.2f} GFLOPS, {enc_total_flops/1e9:.1f} GF)")
     # --- Prefill (on-device embed + vision merge + decoder layers, single dispatch) ---
-    _original_print("Running prefill...", end=" ", flush=True)
+    _original_print(f"\n--- Starting prefill ---")
     timer = time.perf_counter()
     padded_seq = ((seq_len + 63) // 64) * 64
     # Prefill FLOPs (S=padded, 32 layers of: RMS+QKV+RoPE+GQA_attn+O+RMS+MLP + final norm + LM head)
@@ -2308,7 +2308,7 @@ def main():
     hw_token = ue.run_prefill(token_ids, has_image=has_image, total_flops=prefill_flops)
     _SILENT_MODE = False
     prefill_time = time.perf_counter() - timer
-    _original_print(f"done in {prefill_time:.2f}s → {ue.tokenizer.decode([hw_token])!r} ({ue._last_hw_gflops:.2f} GFLOPS, {ue._last_total_flops/1e9:.1f} GF)")
+    _original_print(f"Prefill execute done in {prefill_time:.2f} seconds, start decoding...\n")
     # Zero out stale KV cache positions (seq_len..padded-1) left by padded prefill
     if padded_seq > seq_len:
         stale_size = (padded_seq - seq_len) * ue.HEAD_DIM
@@ -2321,20 +2321,14 @@ def main():
                 ue.dma_to_accelerator_memory(v_stale, stale_zeros)
     # --- Decode (on-device embed fused with decoder, single dispatch per token) ---
     max_new = args.max_seq - seq_len
-    _original_print("Decoding...\n")
+    _original_print(f"\n--- Starting decoder ---")
     decode_timer = time.perf_counter()
     hw_tokens = ue.run_decoder(hw_token, max_new_tokens=max_new)
     decode_time = time.perf_counter() - decode_timer
     total_time = prefill_time + decode_time
     n_generated = len(hw_tokens)
-    _original_print(f"\n--- Performance ---")
-    if has_image:
-        _original_print(f"  Encoder:  {enc_time:.2f}s ({enc_gflops:.2f} GFLOPS, {enc_total_flops/1e9:.1f} GF)")
-    _original_print(f"  Prefill:  {seq_len} tokens in {prefill_time:.2f}s ({prefill_flops/1e9:.1f} GF)")
-    _original_print(f"  Decode:   {n_generated} tokens in {decode_time:.2f}s ({n_generated / decode_time:.2f} t/s, {ue._decode_hw_gflops:.2f} GFLOPS, {ue._decode_total_flops/1e9:.1f} GF)")
-    _original_print(f"  Total:    {n_generated} tokens in {total_time:.2f}s ({n_generated / total_time:.2f} t/s incl. prefill)")
-    if not args.bin:
-        _original_print(f"\nTip: Use --bin flag to skip compilation on next run.")
+    _original_print(f"\nDecoder done in {total_time:.2f} seconds, total {n_generated} tokens.")
+    _original_print("SmolVLM2 test ends.")
 
 if __name__ == "__main__":
     main()

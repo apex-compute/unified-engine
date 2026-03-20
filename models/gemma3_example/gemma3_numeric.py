@@ -11,7 +11,7 @@ Usage:
   source venv/bin/activate  # if using venv
   python gemma3_numeric.py --dev xdma0 [--cycle 5.62] [--layer-size 1]
 
-Same layout as gemma3_test: this file lives next to gemma3_bin/, *.json; user_dma_core one level up.
+Same layout as gemma3_test: this file lives next to gemma3_bin/, *.json; user_dma_core two levels up (repo root).
 """
 
 import json
@@ -21,8 +21,8 @@ import sys
 import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# Ensure parent (pcie_utils) is on path so "import user_dma_core" works when run as python gemma3_example/gemma3_numeric.py
-_parent = os.path.dirname(_THIS_DIR)
+# Ensure repo root is on path so "import user_dma_core" works when run as python models/gemma3_example/gemma3_numeric.py
+_parent = os.path.dirname(os.path.dirname(_THIS_DIR))
 if _parent not in sys.path:
     sys.path.insert(0, _parent)
 
