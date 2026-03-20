@@ -39,6 +39,7 @@
   "hardware": {
     "block_size": 64,
     "stride_align": 32,
+    "encoder_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
     "comment": "K dims must be multiples of block_size=64. L (seq len) padded at runtime."
   },
   "weight_staging": {
