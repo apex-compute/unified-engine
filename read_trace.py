@@ -90,16 +90,12 @@ def _pf_packet(timestamp_ns=None, track_event=None, track_descriptor=None, seq_i
     return msg
 
 
-def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str, clock_period_ns: float = None):
+def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
     import io
     import contextlib
     events = []
 
-    # Determine clock period (ns) or frequency (Hz)
-    if clock_period_ns is None:
-        import user_dma_core
-        clock_period_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
-        print(f"Using default clock period = {clock_period_ns:.6f} ns")
+    clock_period_ns = ue._clock_period_ns
 
     # Get captured instructions (must be present in memory)
     insts = ue.get_captured_instructions()
@@ -309,7 +305,7 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str, cl
         return False
 
 
-def generate_trace(ue: UnifiedEngine, file_path: str, clock_period_ns: float = None):
+def generate_trace(ue: UnifiedEngine, file_path: str):
 
     if len(ue.get_captured_instructions()) > UE_TRACE_SIZE:
         print("Capture instruction size is too large to generate trace, skipping...")
@@ -332,7 +328,7 @@ def generate_trace(ue: UnifiedEngine, file_path: str, clock_period_ns: float = N
 
     perf_out = os.path.splitext(file_path)[0] + "_perfetto.json"
     try:
-        success = build_perfetto(trace_data, ue, perf_out, clock_period_ns=clock_period_ns)
+        success = build_perfetto(trace_data, ue, perf_out)
         if not success:
             print("Perfetto generation failed")
     except Exception as e:

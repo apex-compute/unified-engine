@@ -390,13 +390,13 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="MT28GU512 BPI Flash Programmer")
     parser.add_argument("bitfile", nargs="?", help=".bit or .bin file to program")
-    parser.add_argument("--device", "-d", type=int, default=0,
-                        help="FPGA device index (default: 0, maps to /dev/xdma<N>_user)")
+    parser.add_argument("--dev", "-d", type=str, default="xdma0",
+                        help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
     parser.add_argument("--check", action="store_true",
                         help="check device ID, flash status, and read FPGA git hash from flash")
     args = parser.parse_args()
 
-    DMA_DEVICE_USER = f"/dev/xdma{args.device}_user"
+    DMA_DEVICE_USER = f"/dev/{args.dev}_user"
     print(f"Using FPGA device: {DMA_DEVICE_USER}\n")
 
     if args.check:

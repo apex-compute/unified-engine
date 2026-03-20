@@ -387,7 +387,8 @@ class UnifiedEngine:
                  device: str = 'cpu',
                  params_dram_base: int = DRAM_START_ADDR,
                  program_dram_base: int = DRAM_INSTRUCTION_ADDR,
-                 tensor_dram_base: int = DRAM_ACTIVATION_ADDR):
+                 tensor_dram_base: int = DRAM_ACTIVATION_ADDR,
+                 clock_period_ns: float = None):
         self.device = device
         if BASE_ADDR is None:
             BASE_ADDR = UE_0_BASE_ADDR
@@ -415,6 +416,7 @@ class UnifiedEngine:
         self._dram_addresses: dict[str, int] = {}
 
         self._inst_id = 0
+        self._clock_period_ns = clock_period_ns if clock_period_ns is not None else CLOCK_CYCLE_TIME_NS
 
         self._base_addr = BASE_ADDR
 
@@ -3549,20 +3551,20 @@ class UnifiedEngine:
         """
         latency = self.read_reg32(UE_LATENCY_COUNT_ADDR)
         instruction_count = self.read_reg32(UE_INSTRUCTION_CTL_ADDR)
-        print(f"Latency: {latency * CLOCK_CYCLE_TIME_NS / 1e3:.3f} us, Instruction count: {instruction_count}")
+        print(f"Latency: {latency * self._clock_period_ns / 1e3:.3f} us, Instruction count: {instruction_count}")
         print(f"Latency in cycles: {latency}")
 
     def report_latency_in_us(self):
         """
         Report latency
         """
-        return self.read_reg32(UE_LATENCY_COUNT_ADDR) * CLOCK_CYCLE_TIME_NS / 1e3
+        return self.read_reg32(UE_LATENCY_COUNT_ADDR) * self._clock_period_ns / 1e3
 
     def report_flop_rate_gflops(self, num_flops: int):
         """
         Report flop rate
         """
-        return num_flops / (self.read_reg32(UE_LATENCY_COUNT_ADDR) * CLOCK_CYCLE_TIME_NS)
+        return num_flops / (self.read_reg32(UE_LATENCY_COUNT_ADDR) * self._clock_period_ns)
 
     def quantize_weight(self,
                         weight: torch.Tensor,
@@ -3629,28 +3631,37 @@ class UnifiedEngine:
                     clamped = rounded.clamp(clamp_min, clamp_max)
                     q_block = clamped.to(torch.int8)
             quantized_int8[start:end] = q_block
-
-        num_packed_bytes = (num_elements + 1) // 2
-        packed_int4 = torch.zeros(num_packed_bytes, dtype=torch.uint8, device=matrix.device)
-        for i in range(0, num_elements, 2):
-            byte_idx = i // 2
-            if i + 1 < num_elements:
-                val1 = quantized_int8[i].item()
-                val2 = quantized_int8[i + 1].item()
-                packed_int4[byte_idx] = ((val2 & 0xF) << 4) | (val1 & 0xF)
-            else:
-                val1 = quantized_int8[i].item()
-                packed_int4[byte_idx] = val1 & 0xF
-
-        print(f"Quantized matrix: {num_elements} elements -> {num_packed_bytes} packed bytes")
-        print(f"Scales: {num_blocks} blocks, {num_blocks * 2} bytes")
-        quantized_matrix_dram_addr = self.get_params_dram_addr()
-        scale_dram_addr = quantized_matrix_dram_addr + num_packed_bytes
-        self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr, packed_int4, num_packed_bytes)
-        self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16, num_blocks * 2)
+        if data_type == TYPE.INT8:
+            # INT8: send raw bytes (no packing)
+            quantized_bytes = quantized_int8.view(torch.uint8)  # reinterpret as uint8
+            num_bytes = num_elements
+            quantized_matrix_dram_addr = self.get_params_dram_addr()
+            scale_dram_addr = quantized_matrix_dram_addr + num_bytes
+            self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr, quantized_bytes, num_bytes)
+            self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
+            print(f"INT8: wrote {num_bytes} raw bytes + {num_blocks*2} scale bytes")
+            self.allocate_params_dram(num_bytes + num_blocks * 2)
+        else:
+            # INT4 / FP4: keep your existing packing
+            num_packed_bytes = (num_elements + 1) // 2
+            packed_int4 = torch.zeros(num_packed_bytes, dtype=torch.uint8, device=matrix.device)
+            for i in range(0, num_elements, 2):
+                byte_idx = i // 2
+                if i + 1 < num_elements:
+                    val1 = quantized_int8[i].item()
+                    val2 = quantized_int8[i + 1].item()
+                    packed_int4[byte_idx] = ((val2 & 0xF) << 4) | (val1 & 0xF)
+                else:
+                    val1 = quantized_int8[i].item()
+                    packed_int4[byte_idx] = val1 & 0xF
+            quantized_matrix_dram_addr = self.get_params_dram_addr()
+            scale_dram_addr = quantized_matrix_dram_addr + num_packed_bytes
+            self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr, packed_int4, num_packed_bytes)
+            self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
+            print(f"INT4/FP4: wrote {num_packed_bytes} packed bytes + {num_blocks*2} scale bytes")
+            self.allocate_params_dram(num_packed_bytes + num_blocks * 2)
+        
         print(f"Quantized matrix and scales written to DRAM at 0x{quantized_matrix_dram_addr:x} and 0x{scale_dram_addr:x}")
-        self.allocate_params_dram(num_packed_bytes + num_blocks * 2)
-
         return quantized_matrix_dram_addr, scale_dram_addr
 
     @staticmethod
