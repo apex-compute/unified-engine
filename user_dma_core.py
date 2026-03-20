@@ -140,6 +140,8 @@ class LALU_MODE(IntEnum):
     MODE_RECIP = 2
     MODE_RSQRT = 3
     SILU = 4
+    RELU = 5
+    SIGMOID = 6
 
 class MEMCPY_TYPE(IntEnum):
     URAM = 0
@@ -210,6 +212,7 @@ UE_LALU_LATENCY_SOFTMAX = 1 + UE_LALU_PIPELINE_FPDIV  # RECIP: 1 + 3 = 4
 UE_LALU_LATENCY_RMS = 1 + UE_LALU_PIPELINE_FPSQRT + 1 + UE_LALU_PIPELINE_FPDIV  # RSQRT: 1 + 2 + 1 + 3 = 7
 UE_LALU_LATENCY_GELU = 1 + UE_LALU_PIPELINE_GELU_DENOM + 1 + UE_LALU_PIPELINE_FPDIV  # GELU: 1 + 6 + 1 + 3 = 11
 UE_LALU_LATENCY_SILU = 1 + UE_LALU_PIPELINE_SILU_DENOM + 1 + UE_LALU_PIPELINE_FPDIV  # SILU: 1 + 5 + 1 + 3 = 10
+UE_LALU_LATENCY_SIGMOID = UE_LALU_LATENCY_SILU  # SIGMOID: same pipeline as SILU (TODO: confirm with Siqin)
 UE_LALU_LATENCY_MULT = 2  # Additional LALU mode latency
 
 # Quantization latency values (matching andromeda.c)
@@ -2093,7 +2096,7 @@ class UnifiedEngine:
         return 2 * element_size # 2 FLOPS per element
 
     def matmat_mul_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
-                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False) -> None:
+                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False) -> None:
         # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
         # 1. M_chunk can be any value between 1 and M
         # 2. N_chunk needs to be a multiple of UE_VECTOR_SIZE
@@ -2108,13 +2111,17 @@ class UnifiedEngine:
         if is_B_quantized:
             assert data_type in (TYPE.INT4, TYPE.INT8, TYPE.FP4), f"data_type={data_type} must be one of TYPE.INT4, TYPE.INT8, TYPE.FP4"
 
-        assert not (gelu_enable and silu_enable), "gelu_enable and silu_enable cannot be True at the same time"
+        assert sum([gelu_enable, silu_enable, sigmoid_enable, relu_enable]) <= 1, "only one of gelu_enable, silu_enable, sigmoid_enable, relu_enable can be True"
 
         lalu_mode = LALU_MODE.BYPASS
         if gelu_enable:
             lalu_mode = LALU_MODE.GELU
         elif silu_enable:
             lalu_mode = LALU_MODE.SILU
+        elif sigmoid_enable:
+            lalu_mode = LALU_MODE.SIGMOID
+        elif relu_enable:
+            lalu_mode = LALU_MODE.RELU
 
         # Calculate N_chunk
         N_chunk = min(N, (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
@@ -2279,6 +2286,8 @@ class UnifiedEngine:
                              SCALE_DRAM_ADDR: int = None,
                              gelu_enable: bool = False,
                              silu_enable: bool = False,
+                             sigmoid_enable: bool = False,
+                             relu_enable: bool = False,
                              m_engine0: int = None,
                              wait_timeout_seconds: float = 10.0) -> int:
         """
@@ -2326,6 +2335,8 @@ class UnifiedEngine:
             SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
             gelu_enable=gelu_enable,
             silu_enable=silu_enable,
+            sigmoid_enable=sigmoid_enable,
+            relu_enable=relu_enable,
         )
         ue0.generate_instruction_flag_set()
         ue0.generate_instruction_halt()
@@ -2352,6 +2363,8 @@ class UnifiedEngine:
             SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
             gelu_enable=gelu_enable,
             silu_enable=silu_enable,
+            sigmoid_enable=sigmoid_enable,
+            relu_enable=relu_enable,
         )
         ue1.generate_instruction_flag_check(target_engine_idx=0)
         ue1.generate_instruction_halt()
@@ -2915,7 +2928,7 @@ class UnifiedEngine:
         print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
         return total_flops
 
-    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False) -> None:
+    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False) -> None:
         """Quantized matrix-matrix multiplication core.
         Args:
             M: batch dimension (number of input vectors)
@@ -2944,13 +2957,17 @@ class UnifiedEngine:
         if data_type in (TYPE.INT4, TYPE.INT8, TYPE.FP4):
             assert SCALE_DRAM_ADDR is not None, "SCALE_DRAM_ADDR must be provided when data_type is INT4, INT8, or FP4"
 
-        assert not (gelu_enable and silu_enable), "gelu_enable and silu_enable cannot be True at the same time"
+        assert sum([gelu_enable, silu_enable, sigmoid_enable, relu_enable]) <= 1, "only one of gelu_enable, silu_enable, sigmoid_enable, relu_enable can be True"
 
         lalu_mode = LALU_MODE.BYPASS
         if gelu_enable:
             lalu_mode = LALU_MODE.GELU
         elif silu_enable:
             lalu_mode = LALU_MODE.SILU
+        elif sigmoid_enable:
+            lalu_mode = LALU_MODE.SIGMOID
+        elif relu_enable:
+            lalu_mode = LALU_MODE.RELU
 
         # We put entire input matrix into URAM_A, and entire output matrix into URAM_B
 
