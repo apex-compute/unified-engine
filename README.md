@@ -124,7 +124,7 @@ huggingface-cli login
 Then run:
 
 ```bash
-python3 models/gemma3_example/gemma3_test.py --prompt "your prompt"
+python3 models/gemma3/gemma3_test.py --prompt "your prompt"
 ```
 
 ### 7. Updating HW bin file
