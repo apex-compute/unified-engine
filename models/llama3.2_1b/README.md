@@ -1,6 +1,6 @@
-# LLaMA 3.2 1B example
+# LLaMA 3.2 1B
 
-This folder contains the LLaMA 3.2 1B accelerator inference example.
+This folder contains the LLaMA 3.2 1B accelerator inference.
 
 ## Layout
 
@@ -19,8 +19,8 @@ From the repo root directory:
 
 ```bash
 # Prefill + decode (default prompt)
-python models/llama3.2_1b_example/llama3.2_1b_test.py
+python models/llama3.2_1b/llama3.2_1b_test.py
 
 # Custom prompt
-python models/llama3.2_1b_example/llama3.2_1b_test.py --prompt "What is 2+2?"
+python models/llama3.2_1b/llama3.2_1b_test.py --prompt "What is 2+2?"
 ```

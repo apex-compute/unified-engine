@@ -1,6 +1,6 @@
-# SmolVLM2 example
+# SmolVLM2
 
-This folder contains the SmolVLM2-500M vision-language accelerator inference example.
+This folder contains the SmolVLM2-500M vision-language accelerator inference.
 
 ## Layout
 
@@ -19,11 +19,11 @@ From the repo root directory:
 
 ```bash
 # Prefill + decode (default prompt)
-python models/smolvlm2_example/smolvlm2_test.py
+python models/smolvlm2/smolvlm2_test.py
 
 # Custom prompt and image
-python models/smolvlm2_example/smolvlm2_test.py --prompt "Describe this image." --image test_samples/vette.jpg
+python models/smolvlm2/smolvlm2_test.py --prompt "Describe this image." --image test_samples/vette.jpg
 
 # Reload compiled model (skip compilation)
-python models/smolvlm2_example/smolvlm2_test.py --bin
+python models/smolvlm2/smolvlm2_test.py --bin
 ```

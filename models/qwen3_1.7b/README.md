@@ -1,6 +1,6 @@
-# Qwen3 1.7B example
+# Qwen3 1.7B
 
-This folder contains the Qwen3 1.7B accelerator inference example.
+This folder contains the Qwen3 1.7B accelerator inference.
 
 ## Layout
 
@@ -19,8 +19,8 @@ From the repo root directory:
 
 ```bash
 # Prefill + decode (default prompt)
-python models/qwen3_1.7b_example/qwen3_1.7b_test.py
+python models/qwen3_1.7b/qwen3_1.7b_test.py
 
 # Custom prompt
-python models/qwen3_1.7b_example/qwen3_1.7b_test.py --prompt "What is 2+2?"
+python models/qwen3_1.7b/qwen3_1.7b_test.py --prompt "What is 2+2?"
 ```
