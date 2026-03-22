@@ -1,6 +1,6 @@
-# Qwen3 1.7B example
+# Qwen3 1.7B
 
-This folder contains the Qwen3 1.7B accelerator inference example.
+This folder contains the Qwen3 1.7B accelerator inference.
 
 ## Layout
 
@@ -10,17 +10,17 @@ This folder contains the Qwen3 1.7B accelerator inference example.
 
 ## Prerequisites
 
-- Run from the **parent directory** so that `user_dma_core` is on the path:
+- Run from the **repo root directory** so that `user_dma_core` is on the path:
 - Python with `torch`, `transformers`, and DMA device access.
 
 ## Usage
 
-From the parent directory:
+From the repo root directory:
 
 ```bash
 # Prefill + decode (default prompt)
-python qwen3_1.7b_example/qwen3_1.7b_test.py
+python models/qwen3_1.7b/qwen3_1.7b_test.py
 
 # Custom prompt
-python qwen3_1.7b_example/qwen3_1.7b_test.py --prompt "What is 2+2?"
+python models/qwen3_1.7b/qwen3_1.7b_test.py --prompt "What is 2+2?"
 ```

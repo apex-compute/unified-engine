@@ -20,7 +20,7 @@ Usage:
   python gemma3_test.py --dual-engine
 
 Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in the same folder.
-  user_dma_core.py is one folder up; that parent is added to sys.path.
+  user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
 """
 
 import json
@@ -28,9 +28,9 @@ import math
 import os
 import sys
 
-# This file's folder: gemma3_bin/, *.json, decoder_program.json live here. user_dma_core is one level up.
+# This file's folder: gemma3_bin/, *.json, decoder_program.json live here. user_dma_core is two levels up (repo root).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
+sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import numpy as np
 import torch

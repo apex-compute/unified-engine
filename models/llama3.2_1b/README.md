@@ -1,6 +1,6 @@
-# LLaMA 3.2 1B example
+# LLaMA 3.2 1B
 
-This folder contains the LLaMA 3.2 1B accelerator inference example.
+This folder contains the LLaMA 3.2 1B accelerator inference.
 
 ## Layout
 
@@ -10,17 +10,17 @@ This folder contains the LLaMA 3.2 1B accelerator inference example.
 
 ## Prerequisites
 
-- Run from the **parent directory** so that `user_dma_core` is on the path:
+- Run from the **repo root directory** so that `user_dma_core` is on the path:
 - Python with `torch`, `transformers`, and DMA device access.
 
 ## Usage
 
-From the parent directory:
+From the repo root directory:
 
 ```bash
 # Prefill + decode (default prompt)
-python llama3.2_1b_example/llama3.2_1b_test.py
+python models/llama3.2_1b/llama3.2_1b_test.py
 
 # Custom prompt
-python llama3.2_1b_example/llama3.2_1b_test.py --prompt "What is 2+2?"
+python models/llama3.2_1b/llama3.2_1b_test.py --prompt "What is 2+2?"
 ```

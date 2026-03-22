@@ -1,6 +1,6 @@
-# Gemma3 example
+# Gemma3
 
-This folder contains the Gemma3 accelerator inference example and numeric verification.
+This folder contains the Gemma3 accelerator inference and numeric verification.
 
 ## Layout
 
@@ -15,30 +15,29 @@ This folder contains the Gemma3 accelerator inference example and numeric verifi
 
 ## Prerequisites
 
-- Run from the **parent directory** (`pcie_utils`) so that `user_dma_core` is on the path:
+- Run from the **repo root directory** so that `user_dma_core` is on the path:
   ```bash
-  cd pcie_utils
-  python gemma3_example/gemma3_test.py
+  python models/gemma3/gemma3_test.py
   ```
 - Python with `torch`, `transformers`, and DMA device access.
 
 ## Usage
 
-From the **pcie_utils** (parent) directory:
+From the **repo root** directory:
 
 ```bash
 # Prefill + decode (default prompt)
-python gemma3_example/gemma3_test.py
+python models/gemma3/gemma3_test.py
 
 # Custom prompt
-python gemma3_example/gemma3_test.py --prompt "Your prompt here"
+python models/gemma3/gemma3_test.py --prompt "Your prompt here"
 
 # DMA device and clock cycle time (default: xdma0, 5.62 ns)
-python gemma3_example/gemma3_test.py --dev xdma0 --cycle 5.62
+python models/gemma3/gemma3_test.py --dev xdma0 --cycle 5.62
 
 # Use local full-model weights bin
-python gemma3_example/gemma3_test.py --local-weights
+python models/gemma3/gemma3_test.py --local-weights
 
 # Dual engine (master + slave)
-python gemma3_example/gemma3_test.py --dual-engine
+python models/gemma3/gemma3_test.py --dual-engine
 ```
