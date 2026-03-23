@@ -39,6 +39,34 @@ from user_dma_core import (
 URAM_A_BASE = 0x00000
 URAM_B_BASE = 0x80000
 EPS = 1e-5
+
+# ---------------------------------------------------------------------------
+# Debug: compare hardware vs CPU reference
+# ---------------------------------------------------------------------------
+def compare_tensors(name, hw_tensor, ref_tensor, cos_threshold=0.99):
+    """Compare hw vs ref tensors. Asserts on failure (cos < cos_threshold)."""
+    h = hw_tensor.float().flatten()
+    r = ref_tensor.float().flatten()
+    min_len = min(len(h), len(r))
+    h, r = h[:min_len], r[:min_len]
+    cos = F.cosine_similarity(h.unsqueeze(0), r.unsqueeze(0)).item()
+    mae = (h - r).abs().mean().item()
+    max_err = (h - r).abs().max().item()
+    r_norm = r.norm().item()
+    h_norm = h.norm().item()
+    info = (f"{name}: cos={cos:.6f}  mae={mae:.4f}  max_err={max_err:.4f}  "
+            f"hw_norm={h_norm:.2f}  ref_norm={r_norm:.2f}")
+    if cos >= cos_threshold:
+        print(f"  [PASS] {info}")
+    else:
+        # Build detailed error message
+        diff = (h - r).abs()
+        worst_idx = diff.topk(min(5, len(diff))).indices
+        details = "\n".join(
+            f"    [{idx.item()}] hw={h[idx.item()]:.6f} ref={r[idx.item()]:.6f} diff={diff[idx.item()]:.6f}"
+            for idx in worst_idx)
+        assert False, f"MISMATCH {info}\n  Worst elements:\n{details}"
+    return cos
 WEIGHTS_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "model_weights.ckpt")
 TOKENIZER_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "tokenizer.model")
 
@@ -75,13 +103,11 @@ def batch_norm_core_dram(ue: UnifiedEngine, C: int, L: int,
     shift_host = torch.zeros(C, dtype=torch.bfloat16)
     ue.dma_read(DMA_DEVICE_C2H, SCALE_DRAM_ADDR, scale_host, C * 2)
     ue.dma_read(DMA_DEVICE_C2H, SHIFT_DRAM_ADDR, shift_host, C * 2)
-    # Convert bf16 tensors to raw uint16 array for broadcast scalars
-    scale_raw = scale_host.view(torch.int16).numpy()
-    shift_raw = shift_host.view(torch.int16).numpy()
+    # broadcast_mul/add expect raw float scalars (start_queue_broadcast does bf16 encoding)
     for c in range(C):
         ue.accelerator_memory_to_sram(A_DRAM_ADDR + c * row_bytes, URAM_A_BASE, L)
-        ue.broadcast_mul(scalar=int(scale_raw[c]) & 0xFFFF, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=L)
-        ue.broadcast_add(scalar=int(shift_raw[c]) & 0xFFFF, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=L)
+        ue.broadcast_mul(scalar=scale_host[c].float().item(), sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=L)
+        ue.broadcast_add(scalar=shift_host[c].float().item(), sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=L)
         ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + c * row_bytes, L)
 def allocate_identity(ue: UnifiedEngine, N: int):
     """Allocate and write an (N, N) bf16 identity matrix to DRAM. Call once at init.
@@ -105,12 +131,10 @@ def tanh_core_dram(ue: UnifiedEngine, M: int, N: int,
     """
     assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
     row_bytes = N * 2
-    scalar_2 = ue.float_to_bf16(2.0)
-    scalar_neg1 = ue.float_to_bf16(-1.0)
     # Step 1: 2x → OUTPUT as temp
     for m in range(M):
         ue.accelerator_memory_to_sram(A_DRAM_ADDR + m * row_bytes, URAM_A_BASE, N)
-        ue.broadcast_mul(scalar=scalar_2, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
+        ue.broadcast_mul(scalar=2.0, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
         ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, N)
     # Step 2: sigmoid(2x) via identity matmul with LALU sigmoid
     ue.matmat_mul_core(M=M, K=N, N=N,
@@ -121,8 +145,8 @@ def tanh_core_dram(ue: UnifiedEngine, M: int, N: int,
     # Steps 3+4: 2*sigmoid(2x) - 1
     for m in range(M):
         ue.accelerator_memory_to_sram(OUTPUT_DRAM_ADDR + m * row_bytes, URAM_A_BASE, N)
-        ue.broadcast_mul(scalar=scalar_2, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
-        ue.broadcast_add(scalar=scalar_neg1, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
+        ue.broadcast_mul(scalar=2.0, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
+        ue.broadcast_add(scalar=-1.0, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
         ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, N)
 def silu_core_dram(ue: UnifiedEngine, M: int, N: int,
                    A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
@@ -199,11 +223,10 @@ def half_step_residual_core_dram(ue: UnifiedEngine, M: int, N: int,
     """
     assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
     row_bytes = N * 2
-    scalar_half = ue.float_to_bf16(0.5)
     for m in range(M):
         # Load ff_output into URAM_A, multiply by 0.5
         ue.accelerator_memory_to_sram(FF_DRAM_ADDR + m * row_bytes, URAM_A_BASE, N)
-        ue.broadcast_mul(scalar=scalar_half, sram_start_addr=URAM_A_BASE,
+        ue.broadcast_mul(scalar=0.5, sram_start_addr=URAM_A_BASE,
                          sram_wb_addr=URAM_A_BASE, element_size=N)
         # Load residual into URAM_B, add
         ue.accelerator_memory_to_sram(RESIDUAL_DRAM_ADDR + m * row_bytes, URAM_B_BASE, N)
@@ -393,15 +416,23 @@ def pad_to_multiple(n, multiple):
 # ---------------------------------------------------------------------------
 # Host-side mel spectrogram (runs on CPU, not accelerator)
 # ---------------------------------------------------------------------------
-def compute_mel_spectrogram(waveform, cfg):
-    """waveform: (B, samples) float32 → (B, T_mel, 128) bf16."""
+def compute_mel_spectrogram(waveform, cfg, ckpt_sd=None):
+    """waveform: (B, samples) float32 → (B, T_mel, 128) bf16.
+
+    Args:
+        ckpt_sd: checkpoint state_dict — used to load the mel filterbank
+                 and STFT window from 'preprocessor.featurizer.fb' and
+                 'preprocessor.featurizer.window'.
+    """
     pre = cfg["preprocessing"]
     n_fft = pre["n_fft"]
     hop_length = pre["hop_length"]
     win_length = pre["win_length"]
-    # TODO: load actual filterbank and window from weights
-    fb = torch.zeros(1, pre["n_mels"], n_fft // 2 + 1)
-    window = torch.hann_window(win_length)
+    if ckpt_sd is not None:
+        fb = ckpt_sd["preprocessor.featurizer.fb"].float()       # (1, 128, 257)
+        window = ckpt_sd["preprocessor.featurizer.window"].float()  # (400,)
+    else:
+        raise RuntimeError("Checkpoint state_dict required for mel filterbank and window")
     stft = torch.stft(waveform.float(), n_fft, hop_length, win_length,
                        window=window, center=True, pad_mode="reflect",
                        return_complex=True)
@@ -417,13 +448,33 @@ def compute_mel_spectrogram(waveform, cfg):
 # ---------------------------------------------------------------------------
 # Parakeet Unified Engine
 # ---------------------------------------------------------------------------
+# Parakeet DRAM partition over 4GB address space:
+#   2.5 GB params / 750 MB tensors / 750 MB programs
+PARAKEET_PARAMS_BASE  = 0x00000000   # 2.5 GB for weights + identities + staged
+PARAKEET_TENSOR_BASE  = 0xA0000000   # 750 MB for intermediate activations
+PARAKEET_PROGRAM_BASE = 0xCEE00000   # 750 MB for compiled instruction programs
+
+
 class Parakeet_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine subclass for Parakeet-TDT-0.6B."""
 
-    def __init__(self, script_dir=None):
+    def __init__(self, script_dir=None, debug=False):
         super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
-                         program_dram_base=DRAM_INSTRUCTION_ADDR)
+                         params_dram_base=PARAKEET_PARAMS_BASE,
+                         tensor_dram_base=PARAKEET_TENSOR_BASE,
+                         program_dram_base=PARAKEET_PROGRAM_BASE)
         self.script_dir = script_dir or SCRIPT_DIR
+        self.debug = debug
+        # Hang prevention: stop stale execution, write HALT to program base
+        self.dram_inst_running(False)
+        self.start_capture()
+        self.generate_instruction_halt()
+        self.stop_capture()
+        halt_bytes = bytearray()
+        for inst in self.capture_buffer:
+            halt_bytes.extend(inst.get_bytes())
+        self.dma_write(DMA_DEVICE_H2C, PARAKEET_PROGRAM_BASE, halt_bytes, len(halt_bytes))
+        self.clear_capture_buffer()
         self._cfg = load_config()
         enc = self._cfg["encoder"]
         pred = self._cfg["predictor"]
@@ -447,14 +498,68 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.max_symbols_per_step = jnt["max_symbols_per_step"]
         self.block_size = hw["block_size"]      # 64
         self.bytes_per_element = enc["bytes_per_element"]
+
+    # XDMA driver has a transfer size limit (~16-64MB per os.write call).
+    # Chunk large DMA uploads to avoid silent failures.
+    DMA_CHUNK_BYTES = 1 * 1024 * 1024  # 1 MB per chunk — XDMA driver may silently drop larger writes
+
+    def dma_to_accelerator_memory(self, dma_address, data):
+        """Chunked DMA write that handles large transfers."""
+        assert data.dtype == torch.bfloat16, "Data must be in bf16 format"
+        total_bytes = data.numel() * 2
+        if total_bytes <= self.DMA_CHUNK_BYTES:
+            ret = self.dma_write(DMA_DEVICE_H2C, dma_address, data, total_bytes)
+            if ret != total_bytes:
+                print(f"  WARNING: dma_write returned {ret}, expected {total_bytes}")
+            return
+        n_chunks = (total_bytes + self.DMA_CHUNK_BYTES - 1) // self.DMA_CHUNK_BYTES
+        print(f"  [DMA chunked] {total_bytes/1024**2:.1f} MB → {n_chunks} chunks "
+              f"of {self.DMA_CHUNK_BYTES/1024**2:.0f} MB to 0x{dma_address:08X}")
+        flat = data.contiguous().flatten()
+        offset = 0
+        elems_per_chunk = self.DMA_CHUNK_BYTES // 2  # bf16 = 2 bytes
+        chunk_idx = 0
+        while offset < flat.numel():
+            chunk_elems = min(elems_per_chunk, flat.numel() - offset)
+            chunk = flat[offset:offset + chunk_elems].contiguous()
+            addr = dma_address + offset * 2
+            ret = self.dma_write(DMA_DEVICE_H2C, addr, chunk, chunk_elems * 2)
+            if ret != chunk_elems * 2:
+                print(f"    chunk {chunk_idx}: FAILED wrote {ret}/{chunk_elems*2} bytes "
+                      f"at 0x{addr:08X}")
+            chunk_idx += 1
+            offset += chunk_elems
+        print(f"    {chunk_idx} chunks written")
+
     def _alloc_write(self, tensor):
-        """Allocate params DRAM, write bf16 tensor. Returns DRAM address."""
+        """Allocate params DRAM, write bf16 tensor via chunked DMA. Returns DRAM address."""
         t = tensor.to(torch.bfloat16).contiguous()
         addr = self.get_params_dram_addr()
         nbytes = t.numel() * 2
         self.allocate_params_dram(nbytes)
-        self.dma_write(DMA_DEVICE_H2C, addr, t, nbytes)
+        # Use chunked write to avoid XDMA driver silent failures on large tensors
+        self._chunked_dma_write(addr, t)
         return addr
+
+    def _chunked_dma_write(self, dma_address, data):
+        """Write bf16 tensor to DRAM in 1MB chunks."""
+        flat = data.contiguous().flatten()
+        total_bytes = flat.numel() * 2
+        chunk_bytes = self.DMA_CHUNK_BYTES
+        if total_bytes <= chunk_bytes:
+            ret = self.dma_write(DMA_DEVICE_H2C, dma_address, flat, total_bytes)
+            if ret != total_bytes:
+                print(f"  WARNING: dma_write returned {ret}, expected {total_bytes} "
+                      f"at 0x{dma_address:08X}")
+            return
+        elems_per_chunk = chunk_bytes // 2
+        offset = 0
+        while offset < flat.numel():
+            chunk_elems = min(elems_per_chunk, flat.numel() - offset)
+            chunk = flat[offset:offset + chunk_elems].contiguous()
+            addr = dma_address + offset * 2
+            self.dma_write(DMA_DEVICE_H2C, addr, chunk, chunk_elems * 2)
+            offset += chunk_elems
     def _stage_dw_conv1d(self, weight):
         """(C,1,K) -> (C,64) im2col padded."""
         C, _, K = weight.shape
@@ -607,7 +712,36 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         b_dur[:N_dur] = out_b[N_tok:N_tok + N_dur]
         self.w["JOINT_OUT_DUR_W"] = self._alloc_write(w_dur)
         self.w["JOINT_OUT_DUR_B"] = self._alloc_write(b_dur)
-        print(f"  Weight staging complete: {self.get_params_dram_usage() / 1024**2:.1f} MB in DRAM")
+        # Store checkpoint for mel spectrogram (filterbank + window)
+        self._ckpt_sd = sd
+        params_used = self.get_params_dram_usage()
+        params_limit = self._tensor_dram_base - self._params_dram_base
+        print(f"  Weight staging complete: {params_used / 1024**2:.1f} MB in DRAM "
+              f"(budget: {params_limit / 1024**2:.0f} MB)")
+        assert params_used <= params_limit, (
+            f"PARAMS DRAM OVERFLOW: {params_used/1024**2:.1f} MB used > "
+            f"{params_limit/1024**2:.0f} MB budget. "
+            f"Params bleed into tensor region — corrupts activations!"
+        )
+
+        # Verify conformer weights survived DMA upload
+        bpe = self.bytes_per_element
+        print("  Verifying conformer weights in DRAM...")
+        for li in [0, 12, 23]:  # spot-check first, middle, last layers
+            la = self.layer_addrs[li]
+            for key, ckpt_key in [("FF1_W1", f"encoder.layers.{li}.feed_forward1.linear1.weight"),
+                                   ("ATTN_Q_W", f"encoder.layers.{li}.self_attn.linear_q.weight")]:
+                ref_w = sd[ckpt_key].to(torch.bfloat16).flatten()
+                hw_w = torch.zeros(ref_w.numel(), dtype=torch.bfloat16)
+                self.dma_read(DMA_DEVICE_C2H, la[key], hw_w, ref_w.numel() * bpe)
+                match = (hw_w == ref_w).sum().item()
+                total = ref_w.numel()
+                if match != total:
+                    print(f"    FAIL layer {li} {key}: {match}/{total} match")
+                    print(f"      hw[:5]={hw_w[:5].float().tolist()} ref[:5]={ref_w[:5].float().tolist()}")
+                else:
+                    print(f"    OK   layer {li} {key}: {total} elements match")
+
     def tensor_init(self, L_pad):
         """Allocate intermediate DRAM buffers."""
         bpe = self.bytes_per_element
@@ -648,13 +782,25 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         H1, W1 = H0 // 2, W0 // 2                  # after stage 1
         N0 = H0 * W0
         N1 = H1 * W1
-        # Shared patch buffer: max(stage0 patches, stage1/2 DW patches)
-        max_patch_size = max(N0 * 64, SC * N1 * 64)  # stage 0 or DW stage 1 (larger)
+        # Pad spatial dims to block_size for aligned DW matmuls
+        N1_pad = pad_to_multiple(N1, self.block_size)
+        H2, W2_tmp = H1 // 2, W1 // 2
+        N2 = H2 * W2_tmp
+        N2_pad = pad_to_multiple(N2, self.block_size)
+        N_dw_max_pad = max(N1_pad, N2_pad)
+        # Shared patch buffer: max(stage0 patches, stage1/2 DW patches with padding)
+        max_patch_size = max(N0 * 64, SC * N_dw_max_pad * 64)
         self.SUB_PATCH_DRAM = self.allocate_tensor_dram(max_patch_size * bpe)
         self.SUB_OUT0_DRAM = self.allocate_tensor_dram(N0 * SC * bpe)  # stage 0 output
-        self.SUB_DW_OUT_DRAM = self.allocate_tensor_dram(SC * N1 * bpe)  # DW output (reused)
-        self.SUB_PW_IN_DRAM = self.allocate_tensor_dram(N1 * SC * bpe)  # after permute for PW
+        self.SUB_DW_OUT_DRAM = self.allocate_tensor_dram(SC * N_dw_max_pad * bpe)  # DW output (padded)
+        self.SUB_PW_IN_DRAM = self.allocate_tensor_dram(N_dw_max_pad * SC * bpe)  # after permute for PW (padded)
         self.SUB_FLAT_DRAM = self.allocate_tensor_dram(L_pad * 4096 * bpe)
+        # Debug: per-layer snapshots (allocated only when debug=True)
+        self.DEBUG_LAYER_DRAM = []
+        if self.debug:
+            for _ in range(self.num_layers):
+                self.DEBUG_LAYER_DRAM.append(
+                    self.allocate_tensor_dram(L_pad * D * bpe))
         # Decoder intermediates
         self.PRED_EMB_DRAM = self.allocate_tensor_dram(H * bpe)
         self.PRED_GATES_DRAM = self.allocate_tensor_dram(4 * H * bpe)
@@ -664,11 +810,21 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.PRED_H1_DRAM = self.allocate_tensor_dram(H * bpe)
         self.PRED_C1_DRAM = self.allocate_tensor_dram(H * bpe)
         self.PRED_OUT_DRAM = self.allocate_tensor_dram(H * bpe)
-        self.JOINT_ENC_DRAM = self.allocate_tensor_dram(self.joint_hidden * bpe)
+        self.JOINT_ENC_DRAM = self.allocate_tensor_dram(D * bpe)  # holds raw enc_out[t] (1024) before projection
         self.JOINT_PRED_DRAM = self.allocate_tensor_dram(self.joint_hidden * bpe)
         self.JOINT_SUM_DRAM = self.allocate_tensor_dram(self.joint_hidden * bpe)
         self.JOINT_TOK_DRAM = self.allocate_tensor_dram(N_tok_pad * bpe)
         self.JOINT_DUR_DRAM = self.allocate_tensor_dram(N_dur_pad * bpe)
+        tensor_used = self.get_tensor_dram_usage()
+        tensor_limit = self._program_dram_base - self._tensor_dram_base
+        print(f"  Tensor alloc: {tensor_used / 1024**2:.1f} MB "
+              f"(budget: {tensor_limit / 1024**2:.0f} MB)")
+        assert tensor_used <= tensor_limit, (
+            f"TENSOR DRAM OVERFLOW: {tensor_used/1024**2:.1f} MB used > "
+            f"{tensor_limit/1024**2:.0f} MB budget. "
+            f"Tensors bleed into program region!"
+        )
+
     def compile_sub_stage0(self, N0, padded_k, SC):
         """HW program: im2col patches(N0,64) @ W(64,256) + bias, ReLU. Patches pre-built on host."""
         self.clear_capture_buffer()
@@ -687,42 +843,43 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
     def compile_sub_stage_dw_pw(self, N_in, N_out, SC, dw_patch_addr, dw_w_key, dw_b_key, pw_w_key, pw_b_key):
         """HW program: DW patches(N_out,64) @ kernels via per-channel matmul, then PW(N_out,256)@(256,256)+bias+ReLU.
-        DW im2col patches pre-built on host at dw_patch_addr as (SC, N_out, 64)."""
+        DW im2col patches pre-built on host at dw_patch_addr as (SC, N_out_pad, 64).
+        N_out is padded to N_out_pad (next multiple of block_size) for aligned matmuls."""
         bpe = self.bytes_per_element
+        N_out_pad = pad_to_multiple(N_out, self.block_size)
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
         flops = 0
-        # DW: per channel, kernel(1,64) @ patches(N_out,64)^T = (1, N_out)
+        # DW: per channel, kernel(1,64) @ patches(N_out_pad,64)^T = (1, N_out_pad)
         for ch in range(SC):
             kernel_addr = self.w[dw_w_key] + ch * 64 * bpe
-            patch_addr = dw_patch_addr + ch * N_out * 64 * bpe
-            out_addr = self.SUB_DW_OUT_DRAM + ch * N_out * bpe
-            self.matmat_mul_core(M=1, K=64, N=N_out,
+            patch_addr = dw_patch_addr + ch * N_out_pad * 64 * bpe
+            out_addr = self.SUB_DW_OUT_DRAM + ch * N_out_pad * bpe
+            self.matmat_mul_core(M=1, K=64, N=N_out_pad,
                 A_DRAM_ADDR=kernel_addr, B_DRAM_ADDR=patch_addr, OUTPUT_DRAM_ADDR=out_addr)
-            flops += 2 * 64 * N_out
-        # DW bias: broadcast_add per channel
+            flops += 2 * 64 * N_out_pad
+        # DW bias: broadcast_add per channel (pass raw float, not pre-encoded bf16)
         dw_bias = torch.zeros(SC, dtype=torch.bfloat16)
         self.dma_read(DMA_DEVICE_C2H, self.w[dw_b_key], dw_bias, SC * bpe)
-        dw_bias_raw = dw_bias.view(torch.int16).numpy()
         for ch in range(SC):
-            out_addr = self.SUB_DW_OUT_DRAM + ch * N_out * bpe
-            self.accelerator_memory_to_sram(out_addr, URAM_A_BASE, N_out)
-            self.broadcast_add(scalar=int(dw_bias_raw[ch]) & 0xFFFF,
-                sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N_out)
-            self.sram_to_accelerator_memory(URAM_A_BASE, out_addr, N_out)
-        # Chunked on-device transpose: (SC, N_out) -> (N_out, SC)
-        # Process N_out in chunks of SC (256) so each sub-transpose is (SC, SC) which fits URAM.
+            out_addr = self.SUB_DW_OUT_DRAM + ch * N_out_pad * bpe
+            self.accelerator_memory_to_sram(out_addr, URAM_A_BASE, N_out_pad)
+            self.broadcast_add(scalar=dw_bias[ch].float().item(),
+                sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N_out_pad)
+            self.sram_to_accelerator_memory(URAM_A_BASE, out_addr, N_out_pad)
+        # Chunked on-device transpose: (SC, N_out_pad) -> (N_out_pad, SC)
+        # Process N_out_pad in chunks of SC (256) so each sub-transpose is (SC, SC) which fits URAM.
         chunk = SC  # 256
-        for c_start in range(0, N_out, chunk):
-            c_end = min(c_start + chunk, N_out)
+        for c_start in range(0, N_out_pad, chunk):
+            c_end = min(c_start + chunk, N_out_pad)
             c_len = c_end - c_start
             c_len_pad = pad_to_multiple(c_len, self.block_size)
             # Extract (SC, c_len) slice from SUB_DW_OUT and transpose to (c_len_pad, SC)
-            # Input: SC rows, each N_out wide, we want columns [c_start:c_end]
+            # Input: SC rows, each N_out_pad wide, we want columns [c_start:c_end]
             # Use strided read per channel row: read c_len elements at offset c_start
             for ch in range(SC):
-                src = self.SUB_DW_OUT_DRAM + (ch * N_out + c_start) * bpe
+                src = self.SUB_DW_OUT_DRAM + (ch * N_out_pad + c_start) * bpe
                 # Write contiguously into temp as (SC, c_len_pad) for transpose
                 dst = self.PERMUTE_TEMP_DRAM + ch * c_len_pad * bpe
                 self.accelerator_memory_to_sram(src, URAM_A_BASE, c_len)
@@ -734,8 +891,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 output_dram_addr=self.SUB_PW_IN_DRAM + c_start * SC * bpe,
                 params_dram_addr=self.w["IDENTITY_1024"],
                 temp_dram_start=self.PERMUTE_TEMP_DRAM + SC * c_len_pad * bpe)
-        # PW: (N_out, 256) @ (256, 256) + bias, ReLU
-        self.matmat_mul_core(M=N_out, K=SC, N=SC,
+        # PW: (N_out_pad, 256) @ (256, 256) + bias, ReLU
+        self.matmat_mul_core(M=N_out_pad, K=SC, N=SC,
             A_DRAM_ADDR=self.SUB_PW_IN_DRAM, B_DRAM_ADDR=self.w[pw_w_key],
             OUTPUT_DRAM_ADDR=self.SUB_PW_IN_DRAM,
             C_DRAM_ADDR=self.w[pw_b_key], relu_enable=True)
@@ -766,7 +923,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
     def _im2col_conv2d(self, input_tensor, H_in, W_in, stride=2, padding=1):
         """Host-side: build im2col patch matrix for 3x3 conv2d using F.unfold (vectorized).
         input_tensor: (H_in, W_in) or (C, H_in, W_in) bf16.
-        Single-channel: returns (N_out, 64) bf16.  Depthwise: returns (C, N_out, 64).
+        Single-channel: returns (N_out, 64) bf16.  Depthwise: returns (C, N_out_pad, 64)
+        where N_out_pad is padded to the next multiple of block_size for aligned matmuls.
         """
         k = 3
         if input_tensor.dim() == 2:
@@ -788,12 +946,17 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             H_out = (H_in + 2*padding - k) // stride + 1
             W_out = (W_in + 2*padding - k) // stride + 1
             N = cols.shape[2]
-            patches = torch.zeros(C, N, 64, dtype=torch.bfloat16)
-            patches[:, :, :9] = cols.permute(0, 2, 1).to(torch.bfloat16)  # (C, N, 9)
+            N_pad = pad_to_multiple(N, self.block_size)
+            patches = torch.zeros(C, N_pad, 64, dtype=torch.bfloat16)
+            patches[:, :N, :9] = cols.permute(0, 2, 1).to(torch.bfloat16)  # (C, N, 9)
             return patches, H_out, W_out
 
-    def compile_encoder(self, L_pad):
-        """Monolithic encoder compile: subsampling + 24 conformer layers inline. Returns (prog, flops)."""
+    def compile_encoder(self, L_pad, max_layers=None, max_sublayer=None):
+        """Monolithic encoder compile: conformer layers inline. Returns (prog, flops).
+        max_layers: if set, only compile this many layers (for debugging).
+        max_sublayer: if set with max_layers=1, stop after this sub-module in layer 0:
+            1=FF1, 2=+Attention, 3=+ConvModule, 4=+FF2, 5=+FinalLN (complete layer)
+        """
         D, FF, H_heads, dk = self.d_model, self.ff_dim, self.num_heads, self.head_dim
         bpe = self.bytes_per_element
         P = 2 * L_pad - 1
@@ -804,14 +967,24 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_flag_clear()
         total_flops = 0
 
-        # --- 24 conformer layers, all ops inline ---
-        for layer_idx in range(self.num_layers):
+        # --- conformer layers, all ops inline ---
+        n_layers = max_layers if max_layers is not None else self.num_layers
+        print(f"  Compiling {n_layers}/{self.num_layers} conformer layers"
+              f"{f' (sublayer stop at {max_sublayer})' if max_sublayer else ''}")
+        for layer_idx in range(n_layers):
             la = self.layer_addrs[layer_idx]
 
             # ===== FF1 (half-step residual) =====
             self.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
+
+            if max_sublayer is not None and max_sublayer <= 0 and layer_idx == 0:
+                # Copy LN output to ENC_OUT so we can read it back
+                self.accelerator_memory_to_sram(self.LN_OUT_DRAM, URAM_A_BASE, L_pad * D)
+                self.sram_to_accelerator_memory(URAM_A_BASE, self.INPUT_DRAM, L_pad * D)
+                print(f"  [sublayer stop] after LayerNorm only"); break
+
             self.matmat_mul_core(M=L_pad, K=D, N=FF,
                 A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1"],
                 OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
@@ -824,6 +997,9 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 RESIDUAL_DRAM_ADDR=self.INPUT_DRAM, FF_DRAM_ADDR=self.FF_OUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.INPUT_DRAM)
             total_flops += 2 * L_pad * D
+
+            if max_sublayer is not None and max_sublayer <= 1 and layer_idx == 0:
+                print(f"  [sublayer stop] after FF1"); break
 
             # ===== Self-attention =====
             self.layer_norm_core_dram(M=L_pad, N=D,
@@ -886,7 +1062,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.sram_to_accelerator_memory(URAM_A_BASE, self.SCORE_DRAM, score_elems)
                 # Scale
                 self.accelerator_memory_to_sram(self.SCORE_DRAM, URAM_A_BASE, score_elems)
-                inv_sqrt_dk = self.float_to_bf16(1.0 / math.sqrt(dk))
+                inv_sqrt_dk = 1.0 / math.sqrt(dk)
                 for row in range(L_pad):
                     self.broadcast_mul(scalar=inv_sqrt_dk,
                         sram_start_addr=URAM_A_BASE + row * L_pad * bpe,
@@ -922,6 +1098,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
             self.sram_to_accelerator_memory(URAM_A_BASE, self.INPUT_DRAM, L_pad * D)
             total_flops += L_pad * D
+
+            if max_sublayer is not None and max_sublayer <= 2 and layer_idx == 0:
+                print(f"  [sublayer stop] after Attention"); break
+
             # ===== Conv module =====
             self.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
@@ -942,14 +1122,19 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             # DW Conv1d via shift-multiply-accumulate (9 taps, padding=4)
             # For each channel: output[t] = sum_{k=0}^{8} kernel[k] * input[t + k - 4]
             # Read kernel scalars to host for broadcast_mul
-            dw_kernel_host = torch.zeros(D, 64, dtype=torch.bfloat16)
+            dw_kernel_host = torch.zeros(D * 64, dtype=torch.bfloat16)
             self.dma_read(DMA_DEVICE_C2H, la["CONV_DW_W"], dw_kernel_host, D * 64 * bpe)
-            dw_kernel_raw = dw_kernel_host.view(torch.int16).numpy().reshape(D, 64)
+            dw_kernel_2d = dw_kernel_host.reshape(D, 64)
             conv_pad = self.conv_pad  # 4
             K = 2 * conv_pad + 1     # 9
             for ch in range(D):
                 ch_in = self.CONV_T_DRAM + ch * L_pad * bpe
                 ch_out = self.CONV_DW_DRAM + ch * L_pad * bpe
+                # Zero-initialize output row (L_pad is already 64-aligned)
+                self.accelerator_memory_to_sram(ch_in, URAM_A_BASE, L_pad)
+                self.broadcast_mul(scalar=0.0, sram_start_addr=URAM_A_BASE,
+                    sram_wb_addr=URAM_A_BASE, element_size=L_pad)
+                self.sram_to_accelerator_memory(URAM_A_BASE, ch_out, L_pad)
                 for k in range(K):
                     offset = k - conv_pad  # -4 to +4
                     # Source: input[max(0, offset) : min(L_pad, L_pad+offset)]
@@ -960,20 +1145,19 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     if length <= 0:
                         continue
                     length_aligned = pad_to_multiple(length, self.block_size)
-                    # Read shifted input to SRAM_A
-                    self.accelerator_memory_to_sram(ch_in + src_start * bpe, URAM_A_BASE, length)
-                    # Multiply by kernel[k] scalar
-                    scalar = int(dw_kernel_raw[ch, k]) & 0xFFFF
+                    # Read shifted input to SRAM_A (length elements from DRAM).
+                    # SRAM region is length_aligned; extra tail elements are stale
+                    # but will be multiplied and written — safe because output row
+                    # was zero-initialized and dst_start+length_aligned <= L_pad.
+                    self.accelerator_memory_to_sram(ch_in + src_start * bpe, URAM_A_BASE, length_aligned)
+                    # Multiply by kernel[k] scalar (convert bf16 raw to float)
+                    scalar = dw_kernel_2d[ch, k].float().item()
                     self.broadcast_mul(scalar=scalar, sram_start_addr=URAM_A_BASE,
-                        sram_wb_addr=URAM_A_BASE, element_size=length)
-                    if k == 0:
-                        # First tap: write directly to output
-                        self.sram_to_accelerator_memory(URAM_A_BASE, ch_out + dst_start * bpe, length)
-                    else:
-                        # Accumulate: read existing output, add, write back
-                        self.accelerator_memory_to_sram(ch_out + dst_start * bpe, URAM_B_BASE, length)
-                        self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, length)
-                        self.sram_to_accelerator_memory(URAM_A_BASE, ch_out + dst_start * bpe, length)
+                        sram_wb_addr=URAM_A_BASE, element_size=length_aligned)
+                    # Accumulate: read existing output, add, write back
+                    self.accelerator_memory_to_sram(ch_out + dst_start * bpe, URAM_B_BASE, length_aligned)
+                    self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, length_aligned)
+                    self.sram_to_accelerator_memory(URAM_A_BASE, ch_out + dst_start * bpe, length_aligned)
                 total_flops += 2 * K * L_pad
             batch_norm_core_dram(self, C=D, L=L_pad,
                 A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM,
@@ -994,6 +1178,9 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.sram_to_accelerator_memory(URAM_A_BASE, self.INPUT_DRAM, L_pad * D)
             total_flops += L_pad * D
 
+            if max_sublayer is not None and max_sublayer <= 3 and layer_idx == 0:
+                print(f"  [sublayer stop] after ConvModule"); break
+
             # ===== FF2 (half-step residual) =====
             self.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
@@ -1011,10 +1198,19 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.INPUT_DRAM)
             total_flops += 2 * L_pad * D
 
+            if max_sublayer is not None and max_sublayer <= 4 and layer_idx == 0:
+                print(f"  [sublayer stop] after FF2"); break
+
             # ===== Final LayerNorm =====
             self.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.INPUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_OUT_WEIGHT"], BETA_DRAM_ADDR=la["LN_OUT_BIAS"])
+
+            # Debug: snapshot this layer's output
+            if self.debug and self.DEBUG_LAYER_DRAM:
+                self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
+                self.sram_to_accelerator_memory(URAM_A_BASE,
+                    self.DEBUG_LAYER_DRAM[layer_idx], L_pad * D)
 
         # Copy final encoder output
         self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
@@ -1179,7 +1375,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
     # Compile all programs at once
     # -----------------------------------------------------------------------
 
-    def compile_all(self, T_mel, L_pad):
+    def compile_all(self, T_mel, L_pad, max_layers=None, max_sublayer=None):
         """Compile all programs up front: subsampling stages, encoder, decoder.
         Stores program addresses in self.progs dict.
         """
@@ -1219,8 +1415,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         total_compile_flops += f
         print(f"  Compiled sub_linear: {f/1e6:.1f}M flops")
 
-        # Encoder (24 conformer layers)
-        prog, f = self.compile_encoder(L_pad)
+        # Encoder (conformer layers)
+        prog, f = self.compile_encoder(L_pad, max_layers=max_layers, max_sublayer=max_sublayer)
         self.progs["encoder"] = (prog, f)
         total_compile_flops += f
         print(f"  Compiled encoder: {f/1e9:.1f}G flops, "
@@ -1251,47 +1447,95 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         T_mel = mel_bf16.shape[1]
         mel_2d = mel_bf16.squeeze(0)  # (T_mel, 128)
 
+        def _stat(name, tensor):
+            """Print tensor stats for debugging."""
+            f = tensor.float()
+            nan_c = torch.isnan(f).sum().item()
+            inf_c = torch.isinf(f).sum().item()
+            if nan_c or inf_c:
+                print(f"    {name}: numel={f.numel()} NaN={nan_c} Inf={inf_c}")
+            else:
+                print(f"    {name}: numel={f.numel()} "
+                      f"norm={f.norm():.4f} min={f.min():.4f} max={f.max():.4f} "
+                      f"mean={f.mean():.6f}")
+
+        def _read_dram(addr, numel):
+            buf = torch.zeros(numel, dtype=torch.bfloat16)
+            self.dma_read(DMA_DEVICE_C2H, addr, buf, numel * bpe)
+            return buf
+
+        # --- CPU reference subsampling for comparison ---
+        # Run host-side PyTorch to get expected values at each stage
+        print("  --- CPU reference subsampling ---")
+        ref_x = mel_bf16.unsqueeze(1).float()  # (B, 1, T_mel, 128) — add channel dim
+        # Stage 0 reference: Conv2d(1->256, k=3, s=2) + bias + ReLU
+        sd = self._ckpt_sd
+        ref_s0 = F.conv2d(ref_x, sd["encoder.pre_encode.conv.0.weight"].float(),
+                          sd["encoder.pre_encode.conv.0.bias"].float(),
+                          stride=2, padding=1)
+        ref_s0 = F.relu(ref_s0)  # (1, 256, H0_ref, W0_ref)
+        _stat("REF stage0", ref_s0)
+
         # --- Subsampling stage 0 ---
         patches0, H0, W0 = self._im2col_conv2d(mel_2d, T_mel, self.n_mels)
         self.dma_to_accelerator_memory(self.SUB_PATCH_DRAM, patches0.contiguous())
         self.program_execute(self.progs["sub0"][0])
 
-        # Read stage 0 output, build im2col for stage 1
         N0 = H0 * W0
         out0 = torch.zeros(N0 * SC, dtype=torch.bfloat16)
         self.dma_read(DMA_DEVICE_C2H, self.SUB_OUT0_DRAM, out0, N0 * SC * bpe)
+        _stat("HW  stage0", out0)
         out0_3d = out0.reshape(H0, W0, SC).permute(2, 0, 1).contiguous()
 
-        # --- Subsampling stage 1 ---
-        dw_patches1, H1, W1 = self._im2col_conv2d(out0_3d, H0, W0)
-        self.dma_to_accelerator_memory(self.SUB_PATCH_DRAM, dw_patches1.contiguous())
-        self.program_execute(self.progs["sub1"][0])
+        # --- Stages 1 & 2: run on CPU ---
+        # DW im2col patches are too large for DMA (~262MB for stage 1).
+        # Run DW+PW conv on CPU using F.conv2d — cheap one-time ops.
+        cpu_s0 = out0.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).float()
+        cpu_s1 = F.conv2d(cpu_s0, sd["encoder.pre_encode.conv.2.weight"].float(),
+                          sd["encoder.pre_encode.conv.2.bias"].float(),
+                          stride=2, padding=1, groups=SC)
+        cpu_s1 = F.conv2d(cpu_s1, sd["encoder.pre_encode.conv.3.weight"].float(),
+                          sd["encoder.pre_encode.conv.3.bias"].float())
+        cpu_s1 = F.relu(cpu_s1)
 
-        # Read stage 1 output, build im2col for stage 2
-        N1 = H1 * W1
-        out1 = torch.zeros(N1 * SC, dtype=torch.bfloat16)
-        self.dma_read(DMA_DEVICE_C2H, self.SUB_PW_IN_DRAM, out1, N1 * SC * bpe)
-        out1_3d = out1.reshape(H1, W1, SC).permute(2, 0, 1).contiguous()
+        cpu_s2 = F.conv2d(cpu_s1, sd["encoder.pre_encode.conv.5.weight"].float(),
+                          sd["encoder.pre_encode.conv.5.bias"].float(),
+                          stride=2, padding=1, groups=SC)
+        cpu_s2 = F.conv2d(cpu_s2, sd["encoder.pre_encode.conv.6.weight"].float(),
+                          sd["encoder.pre_encode.conv.6.bias"].float())
+        cpu_s2 = F.relu(cpu_s2)
 
-        # --- Subsampling stage 2 ---
-        dw_patches2, H2, W2 = self._im2col_conv2d(out1_3d, H1, W1)
-        self.dma_to_accelerator_memory(self.SUB_PATCH_DRAM, dw_patches2.contiguous())
-        self.program_execute(self.progs["sub2"][0])
-
-        # Read stage 2 output, flatten to (L_pad, 4096)
-        N2 = H2 * W2
-        out2 = torch.zeros(N2 * SC, dtype=torch.bfloat16)
-        self.dma_read(DMA_DEVICE_C2H, self.SUB_PW_IN_DRAM, out2, N2 * SC * bpe)
-        # Reference: x.permute(0,2,1,3).reshape(B,T,C*Freq) -> (H2, SC, W2) -> (H2, SC*W2)
-        flat = out2.reshape(H2, W2, SC).permute(0, 2, 1).reshape(H2, SC * W2).contiguous()
+        _, _, H2, W2 = cpu_s2.shape
+        flat = cpu_s2.squeeze(0).permute(1, 2, 0).reshape(H2, SC * W2).to(torch.bfloat16).contiguous()
         if H2 < L_pad:
             flat_padded = torch.zeros(L_pad, 4096, dtype=torch.bfloat16)
             flat_padded[:H2, :] = flat
             flat = flat_padded
+
         self.dma_to_accelerator_memory(self.SUB_FLAT_DRAM, flat.contiguous())
+
+        # Verify flat upload
+        flat_verify = _read_dram(self.SUB_FLAT_DRAM, min(1024, flat.numel()))
+        flat_match = (flat_verify == flat.flatten()[:flat_verify.numel()]).sum().item()
+        print(f"    Flat upload verify: {flat_match}/{flat_verify.numel()} match")
 
         # --- Subsampling linear ---
         self.program_execute(self.progs["sub_lin"][0])
+
+        # Epsilon-fill padding rows to prevent LayerNorm NaN on zero rows
+        if L_pad > L:
+            pad_rows = L_pad - L
+            epsilon_fill = torch.full((pad_rows * D,), 1e-6, dtype=torch.bfloat16)
+            pad_offset = L * D * bpe
+            self.dma_to_accelerator_memory(self.INPUT_DRAM + pad_offset, epsilon_fill)
+
+        lin_hw = _read_dram(self.INPUT_DRAM, L_pad * D)
+        _stat("HW  linear_out", lin_hw[:L * D])
+
+        # CPU reference linear for comparison
+        ref_linear = F.linear(flat[:H2].float(), sd["encoder.pre_encode.out.weight"].float(),
+                              sd["encoder.pre_encode.out.bias"].float())
+        _stat("REF linear_out", ref_linear)
         print("  Subsampling done")
 
         # --- Write positional embedding ---
@@ -1304,15 +1548,93 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.POS_EMB_DRAM, rel_pe.contiguous())
 
         # --- Write attention mask ---
-        mask = torch.full((L_pad, L_pad), float("-inf"), dtype=torch.bfloat16)
-        mask[:L, :L] = 0.0
+        # Valid rows attend to valid columns; padding columns are blocked.
+        # Padding rows (L..L_pad-1) must attend to at least one position to
+        # avoid softmax(all -inf) = NaN. Let them attend to position 0
+        # (harmless dummy attention — output is masked by downstream ops).
+        mask = torch.full((L_pad, L_pad), -1e38, dtype=torch.bfloat16)
+        mask[:L, :L] = 0.0                # valid positions attend normally
+        mask[L:, 0] = 0.0                 # padding rows attend to pos 0 (prevents NaN)
         self.dma_to_accelerator_memory(self.ATTN_MASK_DRAM, mask.contiguous())
+
+        # Verify layer 0 FF1 weights in DRAM
+        sd = self._ckpt_sd
+        la0 = self.layer_addrs[0]
+        for wname, ckpt_key in [("FF1_W1", "encoder.layers.0.feed_forward1.linear1.weight"),
+                                 ("FF1_W2", "encoder.layers.0.feed_forward1.linear2.weight"),
+                                 ("LN_FF1_WEIGHT", "encoder.layers.0.norm_feed_forward1.weight"),
+                                 ("LN_FF1_BIAS", "encoder.layers.0.norm_feed_forward1.bias")]:
+            ref_w = sd[ckpt_key].to(torch.bfloat16).flatten()
+            hw_w = torch.zeros(ref_w.numel(), dtype=torch.bfloat16)
+            self.dma_read(DMA_DEVICE_C2H, la0[wname], hw_w, ref_w.numel() * bpe)
+            match = (hw_w == ref_w).sum().item()
+            hw_f = hw_w.float()
+            ref_f = ref_w.float()
+            print(f"    Weight {wname}: {match}/{ref_w.numel()} match  "
+                  f"hw=[{hw_f[:3].tolist()}] ref=[{ref_f[:3].tolist()}]  "
+                  f"hw_norm={hw_f.norm():.4f} ref_norm={ref_f.norm():.4f}")
+
+        # Verify mask upload
+        mask_read = _read_dram(self.ATTN_MASK_DRAM, L_pad * L_pad)
+        mask_2d = mask_read.float().reshape(L_pad, L_pad)
+        nan_mask = torch.isnan(mask_2d).sum().item()
+        inf_mask = torch.isinf(mask_2d).sum().item()
+        # Check padding row L has at least one non-negative-huge entry
+        if L < L_pad:
+            pad_row_max = mask_2d[L, :].max().item()
+            pad_row_min = mask_2d[L, :].min().item()
+            print(f"    Mask: nan={nan_mask} inf={inf_mask} "
+                  f"valid_block[0,0]={mask_2d[0,0]:.1f} valid_block[0,L-1]={mask_2d[0,L-1]:.1f} "
+                  f"pad_col[0,L]={mask_2d[0,L]:.1f} "
+                  f"pad_row[L,0]={mask_2d[L,0]:.1f} pad_row[L,1]={mask_2d[L,1]:.1f}")
+        else:
+            print(f"    Mask: nan={nan_mask} inf={inf_mask} L==L_pad, no padding rows")
+
+        # Verify INPUT_DRAM before conformer
+        inp_pre = _read_dram(self.INPUT_DRAM, L_pad * D)
+        _stat("INPUT pre-conformer", inp_pre[:L * D])
+        if L < L_pad:
+            _stat("INPUT padding rows", inp_pre[L * D:])
 
         # --- Execute 24 conformer layers ---
         print("  Executing conformer layers...")
         enc_prog, enc_flops = self.progs["encoder"]
         latency_us, gflops = self.program_execute(enc_prog, flops=enc_flops)
         print(f"  Encoder: {latency_us:.0f} us, {gflops:.1f} GFLOPS")
+
+        # Check encoder output
+        enc_out = _read_dram(self.ENC_OUT_DRAM, L_pad * D)
+        _stat("ENC_OUT", enc_out[:L * D])
+        if torch.isnan(enc_out.float()).any():
+            enc_2d = enc_out.float().reshape(L_pad, D)
+            nan_rows = torch.isnan(enc_2d).any(dim=1)
+            first_nan = nan_rows.nonzero(as_tuple=True)[0][0].item() if nan_rows.any() else -1
+            print(f"    First NaN row: {first_nan}/{L_pad} (L={L})")
+
+        # Read back FF1 intermediates (still in DRAM after execution)
+        FF = self.ff_dim  # 4096
+        ff_mid = _read_dram(self.FF_MID_DRAM, L_pad * FF)
+        _stat("FF_MID (linear1+SiLU)", ff_mid[:L * FF])
+        ff_out = _read_dram(self.FF_OUT_DRAM, L_pad * D)
+        _stat("FF_OUT (linear2)", ff_out[:L * D])
+        ln_out = _read_dram(self.LN_OUT_DRAM, L_pad * D)
+        _stat("LN_OUT (last LN used)", ln_out[:L * D])
+
+        # Verify half-step residual computation
+        # ENC_OUT should equal INPUT_pre + 0.5 * FF_OUT
+        # But INPUT was overwritten by the program. Let's check ENC_OUT[0,:5] vs 0.5*FF_OUT[0,:5]
+        enc_2d = enc_out.float().reshape(L_pad, D)
+        ff_2d = ff_out.float().reshape(L_pad, D)
+        print(f"    ENC_OUT row0[:5]:  {enc_2d[0, :5].tolist()}")
+        print(f"    FF_OUT  row0[:5]:  {ff_2d[0, :5].tolist()}")
+        print(f"    ENC/FF ratio[:5]:  {(enc_2d[0, :5] / (ff_2d[0, :5] + 1e-10)).tolist()}")
+        print(f"    scalar_half bf16:  0x{self.float_to_bf16(0.5):04X} = {self.float_to_bf16(0.5)}")
+        # What if the broadcast_mul multiplied by 16128 (integer) instead of 0.5 (bf16)?
+        wrong_result_row0 = 16128.0 * ff_2d[0, :5]
+        print(f"    If mul by 16128:   {wrong_result_row0.tolist()}")
+        # What if no multiplication at all (scalar ignored)?
+        print(f"    If mul by 1.0:     {ff_2d[0, :5].tolist()}")
+
         return self.ENC_OUT_DRAM
 
     # -----------------------------------------------------------------------
@@ -1337,6 +1659,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         t = 0
         last_token = self.blank_id
         total_steps = 0
+        N_tok_pad = pad_to_multiple(self.vocab_size, self.block_size)
+        N_dur_pad = pad_to_multiple(len(self.tdt_durations), self.block_size)
         while t < L:
             symbols = 0
             while symbols < self.max_symbols_per_step:
@@ -1359,6 +1683,42 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 dur_idx = self.get_arg_max_index()
                 dur = self.tdt_durations[dur_idx] if dur_idx < len(self.tdt_durations) else 0
                 total_steps += 1
+                # Diagnostic: dump first 3 steps
+                if total_steps <= 3:
+                    # Read back key tensors for diagnosis
+                    hw_pred = torch.zeros(H, dtype=torch.bfloat16)
+                    self.dma_read(DMA_DEVICE_C2H, self.PRED_OUT_DRAM, hw_pred, H * bpe)
+                    hw_enc_t = torch.zeros(D, dtype=torch.bfloat16)
+                    self.dma_read(DMA_DEVICE_C2H, enc_out_addr + t * D * bpe, hw_enc_t, D * bpe)
+                    hw_tok = torch.zeros(N_tok_pad, dtype=torch.bfloat16)
+                    self.dma_read(DMA_DEVICE_C2H, self.JOINT_TOK_DRAM, hw_tok, N_tok_pad * bpe)
+                    hw_dur_logits = torch.zeros(N_dur_pad, dtype=torch.bfloat16)
+                    self.dma_read(DMA_DEVICE_C2H, self.JOINT_DUR_DRAM, hw_dur_logits, N_dur_pad * bpe)
+                    print(f"  [step {total_steps}] t={t} tok={token_id} dur={dur} "
+                          f"blank={self.blank_id}")
+                    print(f"    pred_out: norm={hw_pred.float().norm():.4f} "
+                          f"mean={hw_pred.float().mean():.6f} "
+                          f"min={hw_pred.float().min():.4f} max={hw_pred.float().max():.4f}")
+                    print(f"    enc[t]:   norm={hw_enc_t.float().norm():.4f} "
+                          f"mean={hw_enc_t.float().mean():.6f}")
+                    tok_f = hw_tok[:self.vocab_size].float()
+                    print(f"    tok_logits: argmax={tok_f.argmax().item()} "
+                          f"max={tok_f.max():.4f} min={tok_f.min():.4f} "
+                          f"blank_score={tok_f[self.blank_id]:.4f} "
+                          f"top5={tok_f.topk(5).indices.tolist()}")
+                    dur_f = hw_dur_logits[:len(self.tdt_durations)].float()
+                    print(f"    dur_logits: {dur_f.tolist()} argmax={dur_f.argmax().item()}")
+                    # Check if enc output varies across time
+                    if total_steps == 1:
+                        enc0 = hw_enc_t.clone()
+                        hw_enc_t1 = torch.zeros(D, dtype=torch.bfloat16)
+                        if L > 1:
+                            self.dma_read(DMA_DEVICE_C2H, enc_out_addr + 1 * D * bpe,
+                                          hw_enc_t1, D * bpe)
+                            cos01 = F.cosine_similarity(
+                                enc0.float().unsqueeze(0),
+                                hw_enc_t1.float().unsqueeze(0)).item()
+                            print(f"    enc cos(t=0,t=1): {cos01:.6f}")
                 if token_id == self.blank_id:
                     t += max(dur, 1)
                     break
@@ -1373,12 +1733,223 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 t += 1
         print(f"  Decode: {total_steps} joint steps, {len(tokens)} tokens emitted")
         return tokens
+def _load_reference_model():
+    """Load the CPU reference ParakeetTDT model for debug comparison."""
+    REF_DIR = "/home/rohit/apex-compute-ML/simple-llm/src/parakeet"
+    sys.path.insert(0, REF_DIR)
+    from parakeet_modules import ParakeetTDT
+    from parakeet_main import load_checkpoint as ref_load_checkpoint, convert_to_bf16
+    ref = ParakeetTDT()
+    ref = ref_load_checkpoint(ref, WEIGHTS_PATH)
+    ref = convert_to_bf16(ref)
+    ref.eval()
+    ref.stage_for_hardware()
+    return ref
+
+
+def debug_encoder(engine, ref_model, mel, L, L_pad):
+    """Run encoder with per-stage CPU comparison."""
+    bpe = engine.bytes_per_element
+    D = engine.d_model
+    print("\n=== DEBUG: Encoder Comparison ===")
+
+    # --- Run reference encoder step by step ---
+    with torch.no_grad():
+        ref_mel = ref_model.preprocessor(mel.unsqueeze(0).float())
+    compare_tensors("mel_spectrogram", mel.squeeze(0), ref_mel.squeeze(0))
+
+    # --- Run reference subsampling step by step ---
+    sub = ref_model.encoder.subsampling
+    with torch.no_grad():
+        ref_x = ref_mel.unsqueeze(1)  # (1, 1, T, 128)
+        # Stage 0
+        from parakeet_modules import conv2d_standard_staged, depthwise_conv2d_staged, pointwise_conv2d
+        ref_s0 = conv2d_standard_staged(ref_x, sub._conv0_staged, sub.conv0_b,
+                                         sub._conv0_patch_size, stride=2, padding=1)
+        ref_s0 = F.relu(ref_s0)
+
+    # --- Execute HW subsampling stage 0 ---
+    enc_out_addr = engine.run_encoder(mel, L, L_pad)
+
+    # --- Read back HW encoder output and compare ---
+    enc_hw = torch.zeros(L_pad * D, dtype=torch.bfloat16)
+    engine.dma_read(DMA_DEVICE_C2H, engine.ENC_OUT_DRAM, enc_hw, L_pad * D * bpe)
+    enc_hw = enc_hw.reshape(L_pad, D)
+
+    # Run full reference encoder
+    with torch.no_grad():
+        ref_enc = ref_model.encoder(ref_mel)  # (1, L_ref, 1024)
+    ref_enc_2d = ref_enc.squeeze(0)  # (L_ref, 1024)
+    L_ref = ref_enc_2d.shape[0]
+    L_cmp = min(L, L_ref)
+
+    print(f"\n--- Encoder Output (L={L}, L_ref={L_ref}) ---")
+    compare_tensors("encoder_output", enc_hw[:L_cmp], ref_enc_2d[:L_cmp])
+
+    # Check if HW encoder output is constant across timesteps
+    enc_hw_f = enc_hw[:L].float()
+    ts_var = enc_hw_f.var(dim=0).mean().item()
+    ts_cos_01 = F.cosine_similarity(enc_hw_f[0:1], enc_hw_f[1:2]).item() if L > 1 else 0
+    ts_cos_0m = F.cosine_similarity(enc_hw_f[0:1], enc_hw_f[L//2:L//2+1]).item() if L > 2 else 0
+    print(f"  HW enc temporal variance: {ts_var:.6f}")
+    print(f"  HW enc cos(t=0, t=1): {ts_cos_01:.6f}")
+    print(f"  HW enc cos(t=0, t=L/2): {ts_cos_0m:.6f}")
+    assert ts_var > 1e-4, (
+        f"Encoder output collapsed: temporal variance={ts_var:.8f} (all timesteps identical)"
+    )
+    assert ts_cos_01 < 0.999, (
+        f"Encoder timesteps 0 and 1 are identical: cos={ts_cos_01:.6f}"
+    )
+
+    # --- Per-layer debug if buffers were allocated ---
+    if engine.debug and engine.DEBUG_LAYER_DRAM:
+        print(f"\n--- Per-Layer Comparison (24 conformer layers) ---")
+        # Run reference per-layer
+        with torch.no_grad():
+            ref_sub_out = ref_model.encoder.subsampling(ref_mel)  # (1, L_ref, 1024)
+            from parakeet_modules import make_rel_pos_emb
+            ref_pos = make_rel_pos_emb(ref_sub_out.size(1)).to(
+                dtype=ref_sub_out.dtype, device=ref_sub_out.device)
+            ref_layer_x = ref_sub_out
+            for li in range(engine.num_layers):
+                ref_layer_x = ref_model.encoder.layers[li](ref_layer_x, ref_pos)
+                # Read HW layer output
+                hw_layer = torch.zeros(L_pad * D, dtype=torch.bfloat16)
+                engine.dma_read(DMA_DEVICE_C2H, engine.DEBUG_LAYER_DRAM[li],
+                                hw_layer, L_pad * D * bpe)
+                hw_layer = hw_layer.reshape(L_pad, D)
+                ref_layer_2d = ref_layer_x.squeeze(0)
+                L_cmp = min(L, ref_layer_2d.shape[0])
+                compare_tensors(f"layer_{li:02d}", hw_layer[:L_cmp], ref_layer_2d[:L_cmp])
+
+    # --- Also compare subsampling linear output ---
+    sub_lin_hw = torch.zeros(L_pad * D, dtype=torch.bfloat16)
+    engine.dma_read(DMA_DEVICE_C2H, engine.INPUT_DRAM, sub_lin_hw, L_pad * D * bpe)
+    # NOTE: INPUT_DRAM now holds the final encoder output (overwritten by conformer layers).
+    # The subsampling linear output was INPUT_DRAM before conformer started.
+    # We can't read it after the fact. But per-layer comparison covers this.
+
+    return enc_out_addr
+
+
+def debug_decoder(engine, ref_model, enc_out_addr, L):
+    """Run decoder with per-step CPU comparison (first N steps)."""
+    bpe = engine.bytes_per_element
+    H = engine.pred_hidden
+    D = engine.d_model
+    MAX_DEBUG_STEPS = 5
+    print(f"\n=== DEBUG: Decoder Comparison (first {MAX_DEBUG_STEPS} steps) ===")
+
+    # Read HW encoder output for reference joint
+    enc_hw = torch.zeros(L * D, dtype=torch.bfloat16)
+    engine.dma_read(DMA_DEVICE_C2H, enc_out_addr, enc_hw, L * D * bpe)
+    enc_hw = enc_hw.reshape(L, D)
+
+    # Also run reference encoder for ref decoder
+    # (reuse ref_model's encoder output for clean comparison)
+
+    # HW decode state
+    zeros_h = torch.zeros(H, dtype=torch.bfloat16)
+    engine.dma_to_accelerator_memory(engine.PRED_H0_DRAM, zeros_h)
+    engine.dma_to_accelerator_memory(engine.PRED_C0_DRAM, zeros_h)
+    engine.dma_to_accelerator_memory(engine.PRED_H1_DRAM, zeros_h)
+    engine.dma_to_accelerator_memory(engine.PRED_C1_DRAM, zeros_h)
+
+    pred_prog = engine.progs["pred"][0]
+    tok_prog = engine.progs["joint_tok"][0]
+    dur_prog = engine.progs["joint_dur"][0]
+
+    # Reference decode state
+    ref_state = None
+    ref_last_token = engine.blank_id
+    hw_last_token = engine.blank_id
+    t = 0
+
+    from parakeet_modules import VOCAB_SIZE, NUM_TDT_DURATIONS, BLANK_ID
+
+    for step in range(MAX_DEBUG_STEPS):
+        if t >= L:
+            break
+        print(f"\n  --- Decode step {step}, t={t}, last_token={hw_last_token} ---")
+
+        # HW: embedding + predictor
+        emb_src = engine.w["EMBED"] + hw_last_token * H * bpe
+        engine.accelerator_memory_to_sram(emb_src, URAM_A_BASE, H)
+        engine.sram_to_accelerator_memory(URAM_A_BASE, engine.PRED_EMB_DRAM, H)
+        engine.program_execute(pred_prog)
+
+        # Read HW predictor output
+        hw_pred = torch.zeros(H, dtype=torch.bfloat16)
+        engine.dma_read(DMA_DEVICE_C2H, engine.PRED_OUT_DRAM, hw_pred, H * bpe)
+
+        # Reference predictor
+        with torch.no_grad():
+            ref_pred, ref_new_state = ref_model.predictor.step(ref_last_token, ref_state)
+        compare_tensors(f"  pred_out[{step}]", hw_pred, ref_pred.squeeze(0))
+
+        # HW: copy enc_out[t] + pred_out to joint inputs
+        engine.accelerator_memory_to_sram(enc_out_addr + t * D * bpe, URAM_A_BASE, D)
+        engine.sram_to_accelerator_memory(URAM_A_BASE, engine.JOINT_ENC_DRAM, D)
+        engine.accelerator_memory_to_sram(engine.PRED_OUT_DRAM, URAM_A_BASE, H)
+        engine.sram_to_accelerator_memory(URAM_A_BASE, engine.JOINT_PRED_DRAM, H)
+
+        # HW: joint token
+        engine.program_execute(tok_prog)
+        hw_token_id = engine.get_arg_max_index()
+
+        # HW: joint duration
+        engine.program_execute(dur_prog)
+        hw_dur_idx = engine.get_arg_max_index()
+        hw_dur = engine.tdt_durations[hw_dur_idx] if hw_dur_idx < len(engine.tdt_durations) else 0
+
+        # Read HW joint logits for comparison
+        N_tok_pad = pad_to_multiple(engine.vocab_size, engine.block_size)
+        hw_tok_logits = torch.zeros(N_tok_pad, dtype=torch.bfloat16)
+        engine.dma_read(DMA_DEVICE_C2H, engine.JOINT_TOK_DRAM, hw_tok_logits, N_tok_pad * bpe)
+
+        # Reference joint
+        with torch.no_grad():
+            ref_enc_t = enc_hw[t:t+1].unsqueeze(0) if False else ref_pred.new_zeros(1, D)
+            # Use HW encoder output for fair comparison
+            ref_enc_t = enc_hw[t:t+1].float().to(ref_pred.dtype)
+            ref_logits = ref_model.joint(ref_enc_t, ref_pred)
+        ref_tok_logits = ref_logits[:, :VOCAB_SIZE]
+        ref_token_id = ref_tok_logits.argmax(dim=-1).item()
+        ref_dur_logits = ref_logits[:, VOCAB_SIZE:VOCAB_SIZE + NUM_TDT_DURATIONS]
+        ref_dur = engine.tdt_durations[ref_dur_logits.argmax(dim=-1).item()]
+
+        compare_tensors(f"  tok_logits[{step}]", hw_tok_logits[:VOCAB_SIZE], ref_tok_logits.squeeze(0))
+        print(f"  HW: token={hw_token_id} dur={hw_dur}  |  REF: token={ref_token_id} dur={ref_dur}")
+        assert hw_token_id == ref_token_id, (
+            f"Token mismatch at step {step}: HW={hw_token_id} REF={ref_token_id}"
+        )
+        assert hw_dur == ref_dur, (
+            f"Duration mismatch at step {step}: HW={hw_dur} REF={ref_dur}"
+        )
+
+        # Advance state
+        if hw_token_id == engine.blank_id:
+            t += max(hw_dur, 1)
+        else:
+            hw_last_token = hw_token_id
+            ref_last_token = hw_token_id  # track HW path
+            ref_state = ref_new_state
+            if hw_dur > 0:
+                t += hw_dur
+            else:
+                t += 1  # prevent infinite loop in debug
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Parakeet-TDT-0.6B accelerator inference")
     parser.add_argument("--audio", type=str, default=None, help="Path to audio file (.wav, .flac, etc.)")
     parser.add_argument("--dev", type=str, default="xdma0", help="XDMA device")
     parser.add_argument("--cycle", type=float, default=5.63, help="Clock cycle in ns")
+    parser.add_argument("--debug", action="store_true", help="Run CPU reference comparison at every checkpoint")
+    parser.add_argument("--layers", type=int, default=None, help="Only compile N conformer layers (debug)")
+    parser.add_argument("--sublayer", type=int, default=None,
+                        help="With --layers 1: stop after sub-module N (1=FF1 2=Attn 3=Conv 4=FF2 5=full)")
     args = parser.parse_args()
     cfg = load_config()
     set_dma_device(args.dev)
@@ -1388,6 +1959,8 @@ def main():
     print(f"  Predictor: {cfg['predictor']['num_layers']}-layer LSTM, hidden={cfg['predictor']['hidden_size']}")
     print(f"  Joint: tok={cfg['joint']['output_size']} dur={len(cfg['joint']['tdt_durations'])}")
     print(f"  Block size: {cfg['hardware']['block_size']}")
+    if args.debug:
+        print(f"  DEBUG MODE: CPU reference comparison enabled")
     if audio_path and os.path.exists(audio_path):
         import torchaudio
         print(f"  Loading: {audio_path}")
@@ -1401,24 +1974,36 @@ def main():
         waveform = torch.randn(1, cfg["preprocessing"]["sample_rate"] * duration_s)
         print(f"  Using dummy {duration_s}s audio")
     print(f"  Audio: {waveform.shape[1]} samples ({waveform.shape[1]/cfg['preprocessing']['sample_rate']:.1f}s)")
-    mel = compute_mel_spectrogram(waveform, cfg)
+    engine = Parakeet_UnifiedEngine(debug=args.debug)
+    engine.weight_init()
+    mel = compute_mel_spectrogram(waveform, cfg, ckpt_sd=engine._ckpt_sd)
     T_mel = mel.shape[1]
     L = T_mel // 8
     L_pad = pad_to_multiple(L, cfg["hardware"]["block_size"])
     print(f"  Mel: {T_mel} frames, L={L}, L_pad={L_pad}")
-    engine = Parakeet_UnifiedEngine()
-    engine.weight_init()
 
     # --- Compile all programs ---
     print(f"\n--- Compile ---")
     engine.tensor_init(L_pad)
-    engine.compile_all(T_mel, L_pad)
+    engine.compile_all(T_mel, L_pad, max_layers=args.layers, max_sublayer=args.sublayer)
 
-    # --- Execute ---
-    print(f"\n--- Encoder ---")
-    enc_out_addr = engine.run_encoder(mel, L, L_pad)
-    print(f"\n--- Decoder ---")
-    tokens = engine.run_decode(enc_out_addr, L)
+    if args.debug:
+        # --- Debug mode: run with CPU reference comparison ---
+        ref_model = _load_reference_model()
+
+        enc_out_addr = debug_encoder(engine, ref_model, mel, L, L_pad)
+        debug_decoder(engine, ref_model, enc_out_addr, L)
+
+        # Also run full HW decode for final output
+        print(f"\n--- Full HW Decoder ---")
+        tokens = engine.run_decode(enc_out_addr, L)
+    else:
+        # --- Normal mode ---
+        print(f"\n--- Encoder ---")
+        enc_out_addr = engine.run_encoder(mel, L, L_pad)
+        print(f"\n--- Decoder ---")
+        tokens = engine.run_decode(enc_out_addr, L)
+
     tokenizer_path = TOKENIZER_PATH
     if os.path.exists(tokenizer_path):
         import sentencepiece as spm
