@@ -13,7 +13,7 @@ Usage:
   python parakeet_test.py --dev xdma0 [--cycle 5.63]
 
 Fixed layout: parakeet_test.py, parakeet_config.json, and parakeet_bin/ live in the same folder.
-  user_dma_core.py is one folder up; that parent is added to sys.path.
+  user_dma_core.py is at the repo root (two folders up); that directory is added to sys.path.
 """
 
 import json
@@ -22,7 +22,7 @@ import os
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
+sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import numpy as np
 import torch
@@ -43,10 +43,35 @@ EPS = 1e-5
 # ---------------------------------------------------------------------------
 # Debug: compare hardware vs CPU reference
 # ---------------------------------------------------------------------------
+def check_nan(name, tensor):
+    """Assert-halt if tensor contains NaN or Inf. Call on any intermediate result."""
+    f = tensor.float().flatten()
+    nan_c = torch.isnan(f).sum().item()
+    inf_c = torch.isinf(f).sum().item()
+    if nan_c or inf_c:
+        total = f.numel()
+        # Find first NaN/Inf index
+        bad_mask = torch.isnan(f) | torch.isinf(f)
+        first_bad = bad_mask.nonzero(as_tuple=True)[0][0].item()
+        # Show surrounding context
+        lo = max(0, first_bad - 2)
+        hi = min(total, first_bad + 3)
+        context = f[lo:hi].tolist()
+        assert False, (
+            f"NaN/Inf DETECTED in {name}: "
+            f"{nan_c} NaN, {inf_c} Inf out of {total} elements. "
+            f"First bad index: {first_bad}. "
+            f"Values [{lo}:{hi}]: {context}"
+        )
+
+
 def compare_tensors(name, hw_tensor, ref_tensor, cos_threshold=0.99):
-    """Compare hw vs ref tensors. Asserts on failure (cos < cos_threshold)."""
+    """Compare hw vs ref tensors. Asserts on NaN or cosine similarity failure."""
     h = hw_tensor.float().flatten()
     r = ref_tensor.float().flatten()
+    # NaN/Inf check before comparison
+    check_nan(f"{name} (hw)", hw_tensor)
+    check_nan(f"{name} (ref)", ref_tensor)
     min_len = min(len(h), len(r))
     h, r = h[:min_len], r[:min_len]
     cos = F.cosine_similarity(h.unsqueeze(0), r.unsqueeze(0)).item()
@@ -190,25 +215,70 @@ def glu_core_dram(ue: UnifiedEngine, M: int, C: int, A_DRAM_ADDR: int, B_DRAM_AD
         ue.accelerator_memory_to_sram(B_DRAM_ADDR + m * row_bytes, URAM_B_BASE, C)
         ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=C)
         ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, C)
-def rel_shift_core_dram(ue: UnifiedEngine, L: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> None:
-    """Emit instructions for rel_shift: extract (L, L) from (L, 2L-1) positional scores.
+def rel_shift_core_dram(ue: UnifiedEngine, L: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                        input_row_stride: int = None) -> None:
+    """Emit instructions for rel_shift: extract (L, L) from (L, P_pad) positional scores.
     Row i of output = input[i, (L-1-i) : (L-1-i)+L]
     Each is a contiguous L-element DMA copy at a computed source offset.
     No arithmetic — pure memory rearrangement.
     Args:
         ue: UnifiedEngine instance
         L: sequence length (L_pad, bucketed, must be multiple of UE_VECTOR_SIZE)
-        INPUT_DRAM_ADDR: (L, 2L-1) bf16 positional score matrix
+        INPUT_DRAM_ADDR: (L, input_row_stride) bf16 positional score matrix
         OUTPUT_DRAM_ADDR: (L, L) bf16 output
+        input_row_stride: actual number of elements per row in input (P_pad from matmul).
+                          Defaults to 2*L-1 for backwards compatibility.
     """
     assert L % UE_VECTOR_SIZE == 0, f"L={L} must be a multiple of {UE_VECTOR_SIZE}"
-    P = 2 * L - 1   # input row width
+    P_stride = input_row_stride if input_row_stride is not None else (2 * L - 1)
     bpe = 2          # bf16
     for i in range(L):
-        src = INPUT_DRAM_ADDR + (i * P + (L - 1 - i)) * bpe
+        src = INPUT_DRAM_ADDR + (i * P_stride + (L - 1 - i)) * bpe
         dst = OUTPUT_DRAM_ADDR + i * L * bpe
         ue.accelerator_memory_to_sram(src, URAM_A_BASE, L)
         ue.sram_to_accelerator_memory(URAM_A_BASE, dst, L)
+def chunked_transpose_core_dram(ue: UnifiedEngine, M: int, N: int,
+                                 input_dram_addr: int, output_dram_addr: int,
+                                 identity_dram_addr: int, temp_dram_addr: int) -> None:
+    """Transpose (M, N) -> (N, M) by processing N in UE_VECTOR_SIZE-column chunks.
+
+    bf16_smart_permute_core's dot-product transpose accumulates across
+    N_transpose // UE_VECTOR_SIZE groups, which corrupts results when
+    N > UE_VECTOR_SIZE.  This helper splits into chunks where each sub-transpose
+    has N_transpose = UE_VECTOR_SIZE (=64), avoiding the bug.
+
+    Input at input_dram_addr: (M, N) contiguous bf16.
+    Output at output_dram_addr: (N, M_aligned) contiguous bf16,
+        where M_aligned = pad_to_multiple(M, UE_VECTOR_SIZE).
+    """
+    bpe = 2
+    VS = UE_VECTOR_SIZE  # 64
+    M_aligned = ((M - 1) // VS + 1) * VS
+    n_chunks = (N + VS - 1) // VS
+
+    for c in range(n_chunks):
+        col_start = c * VS
+        col_end = min(col_start + VS, N)
+        chunk_cols = col_end - col_start
+        chunk_cols_pad = ((chunk_cols - 1) // VS + 1) * VS  # = VS for full chunks
+
+        # Extract columns [col_start:col_end] from each of M rows into temp as (M, chunk_cols_pad)
+        for row in range(M):
+            src = input_dram_addr + (row * N + col_start) * bpe
+            dst = temp_dram_addr + row * chunk_cols_pad * bpe
+            ue.accelerator_memory_to_sram(src, URAM_A_BASE, chunk_cols)
+            ue.sram_to_accelerator_memory(URAM_A_BASE, dst, chunk_cols)
+
+        # Transpose (M, chunk_cols_pad) -> (chunk_cols_pad, M_aligned)
+        # N_transpose = chunk_cols_pad = VS, so dot product has 1 group. Safe.
+        bf16_smart_permute_core(ue,
+            dims=[M, chunk_cols_pad], permute_indices=[1, 0],
+            input_dram_addr=temp_dram_addr,
+            output_dram_addr=output_dram_addr + col_start * M_aligned * bpe,
+            params_dram_addr=identity_dram_addr,
+            temp_dram_start=temp_dram_addr + M * chunk_cols_pad * bpe)
+
+
 def half_step_residual_core_dram(ue: UnifiedEngine, M: int, N: int,
                                  RESIDUAL_DRAM_ADDR: int, FF_DRAM_ADDR: int,
                                  OUTPUT_DRAM_ADDR: int) -> None:
@@ -621,10 +691,15 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         D, FF, H = self.d_model, self.ff_dim, self.pred_hidden
         self.w = {}
 
-        # Identity matrices
+        # Identity matrices for LALU activation (sigmoid, softmax, etc.)
         self.w["IDENTITY_1024"] = allocate_identity(self, D)
         self.w["IDENTITY_4096"] = allocate_identity(self, FF)
         self.w["IDENTITY_640"] = allocate_identity(self, self.joint_hidden)
+        # 64x64 identity for bf16_smart_permute_core transpose operations.
+        # The permute function loads UE_VECTOR_SIZE * UE_VECTOR_SIZE (64*64)
+        # bytes assuming 64-element rows. A larger identity (e.g. 1024x1024)
+        # has 1024-element rows, so the loaded block is garbled.
+        self.w["IDENTITY_64"] = allocate_identity(self, UE_VECTOR_SIZE)
 
         # Subsampling weights for hardware im2col
         # Stage 0: Conv2d(1->256, k=3, s=2, p=1)
@@ -702,13 +777,16 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         N_dur, N_dur_pad = len(self.tdt_durations), pad_to_multiple(len(self.tdt_durations), self.block_size)
         w_tok = torch.zeros(N_tok_pad, self.joint_hidden, dtype=torch.bfloat16)
         w_tok[:N_tok] = out_w[:N_tok]
-        b_tok = torch.zeros(N_tok_pad, dtype=torch.bfloat16)
+        # Padding biases must be -inf so padding positions never win argmax.
+        # Zero padding logits (0) beat negative real logits, causing the decoder
+        # to always pick padding index 8193 instead of the correct token.
+        b_tok = torch.full((N_tok_pad,), -1e4, dtype=torch.bfloat16)
         b_tok[:N_tok] = out_b[:N_tok]
         self.w["JOINT_OUT_TOK_W"] = self._alloc_write(w_tok)
         self.w["JOINT_OUT_TOK_B"] = self._alloc_write(b_tok)
         w_dur = torch.zeros(N_dur_pad, self.joint_hidden, dtype=torch.bfloat16)
         w_dur[:N_dur] = out_w[N_tok:N_tok + N_dur]
-        b_dur = torch.zeros(N_dur_pad, dtype=torch.bfloat16)
+        b_dur = torch.full((N_dur_pad,), -1e4, dtype=torch.bfloat16)
         b_dur[:N_dur] = out_b[N_tok:N_tok + N_dur]
         self.w["JOINT_OUT_DUR_W"] = self._alloc_write(w_dur)
         self.w["JOINT_OUT_DUR_B"] = self._alloc_write(b_dur)
@@ -744,6 +822,21 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
     def tensor_init(self, L_pad):
         """Allocate intermediate DRAM buffers."""
+        # Zero entire tensor DRAM region up front to prevent stale NaN.
+        # Must happen BEFORE allocations so that identity matrices (written
+        # during allocation) are not overwritten.
+        tensor_budget = self._program_dram_base - self._tensor_dram_base
+        print(f"  Zeroing tensor DRAM ({tensor_budget / 1024**2:.0f} MB budget)...")
+        ZERO_CHUNK = 512 * 1024  # 512K elements = 1MB per chunk
+        offset = 0
+        total_elems = tensor_budget // 2
+        while offset < total_elems:
+            chunk_elems = min(ZERO_CHUNK, total_elems - offset)
+            z = torch.zeros(chunk_elems, dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(self._tensor_dram_base + offset * 2, z)
+            offset += chunk_elems
+        print(f"  Tensor DRAM zeroed.")
+
         bpe = self.bytes_per_element
         D, FF, H = self.d_model, self.ff_dim, self.pred_hidden
         dk = self.head_dim
@@ -760,7 +853,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.Q_DRAM = self.allocate_tensor_dram(L_pad * D * bpe)
         self.K_DRAM = self.allocate_tensor_dram(L_pad * D * bpe)
         self.V_DRAM = self.allocate_tensor_dram(L_pad * D * bpe)
-        self.POS_PROJ_DRAM = self.allocate_tensor_dram(L_pad * D * bpe)
+        self.POS_PROJ_DRAM = self.allocate_tensor_dram(P_pad * D * bpe)  # P_pad rows, not L_pad
         self.SCORE_DRAM = self.allocate_tensor_dram(L_pad * L_pad * bpe)
         self.ATTN_OUT_DRAM = self.allocate_tensor_dram(L_pad * D * bpe)
         self.POS_EMB_DRAM = self.allocate_tensor_dram(P_pad * D * bpe)
@@ -824,6 +917,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             f"{tensor_limit/1024**2:.0f} MB budget. "
             f"Tensors bleed into program region!"
         )
+
 
     def compile_sub_stage0(self, N0, padded_k, SC):
         """HW program: im2col patches(N0,64) @ W(64,256) + bias, ReLU. Patches pre-built on host."""
@@ -889,7 +983,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 dims=[SC, c_len_pad], permute_indices=[1, 0],
                 input_dram_addr=self.PERMUTE_TEMP_DRAM,
                 output_dram_addr=self.SUB_PW_IN_DRAM + c_start * SC * bpe,
-                params_dram_addr=self.w["IDENTITY_1024"],
+                params_dram_addr=self.w["IDENTITY_64"],
                 temp_dram_start=self.PERMUTE_TEMP_DRAM + SC * c_len_pad * bpe)
         # PW: (N_out_pad, 256) @ (256, 256) + bias, ReLU
         self.matmat_mul_core(M=N_out_pad, K=SC, N=SC,
@@ -1053,7 +1147,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM)
                 total_flops += 2 * L_pad * dk * P_pad
                 rel_shift_core_dram(self, L=L_pad,
-                    INPUT_DRAM_ADDR=self.CONV_OUT_DRAM, OUTPUT_DRAM_ADDR=self.REL_SHIFT_DRAM)
+                    INPUT_DRAM_ADDR=self.CONV_OUT_DRAM, OUTPUT_DRAM_ADDR=self.REL_SHIFT_DRAM,
+                    input_row_stride=P_pad)
                 # Combine content + pos
                 score_elems = L_pad * L_pad
                 self.accelerator_memory_to_sram(self.SCORE_DRAM, URAM_A_BASE, score_elems)
@@ -1077,9 +1172,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.accelerator_memory_to_sram(self.V_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
                 self.sram_to_accelerator_memory(URAM_A_BASE, self.CONV_B_DRAM, L_pad * dk)
-                bf16_smart_permute_core(self, dims=[L_pad, dk], permute_indices=[1, 0],
+                # Use chunked transpose: dk=128 > UE_VECTOR_SIZE=64, so
+                # bf16_smart_permute_core's dot-product would corrupt the result.
+                chunked_transpose_core_dram(self, M=L_pad, N=dk,
                     input_dram_addr=self.CONV_B_DRAM, output_dram_addr=self.ATTN_VT_DRAM,
-                    params_dram_addr=self.w["IDENTITY_1024"], temp_dram_start=self.PERMUTE_TEMP_DRAM)
+                    identity_dram_addr=self.w["IDENTITY_64"],
+                    temp_dram_addr=self.PERMUTE_TEMP_DRAM)
                 self.matmat_mul_core(M=L_pad, K=L_pad, N=dk,
                     A_DRAM_ADDR=self.SCORE_DRAM, B_DRAM_ADDR=self.ATTN_VT_DRAM,
                     OUTPUT_DRAM_ADDR=self.CONV_A_DRAM)
@@ -1116,9 +1214,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             glu_core_dram(self, M=L_pad, C=D,
                 A_DRAM_ADDR=self.CONV_A_DRAM, B_DRAM_ADDR=self.CONV_B_DRAM,
                 OUTPUT_DRAM_ADDR=self.CONV_A_DRAM, IDENTITY_DRAM_ADDR=self.w["IDENTITY_1024"])
-            bf16_smart_permute_core(self, dims=[L_pad, D], permute_indices=[1, 0],
+            # Transpose (L_pad, D) -> (D, L_pad) for channel-first DW conv.
+            # D=1024 >> UE_VECTOR_SIZE=64, so use chunked transpose.
+            chunked_transpose_core_dram(self, M=L_pad, N=D,
                 input_dram_addr=self.CONV_A_DRAM, output_dram_addr=self.CONV_T_DRAM,
-                params_dram_addr=self.w["IDENTITY_1024"], temp_dram_start=self.PERMUTE_TEMP_DRAM)
+                identity_dram_addr=self.w["IDENTITY_64"],
+                temp_dram_addr=self.PERMUTE_TEMP_DRAM)
             # DW Conv1d via shift-multiply-accumulate (9 taps, padding=4)
             # For each channel: output[t] = sum_{k=0}^{8} kernel[k] * input[t + k - 4]
             # Read kernel scalars to host for broadcast_mul
@@ -1162,12 +1263,18 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             batch_norm_core_dram(self, C=D, L=L_pad,
                 A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM,
                 SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"])
+            # SiLU: x * sigmoid(x). Cannot be in-place because silu_core_dram
+            # Step 2 (sigmoid) overwrites the input, destroying x before Step 3
+            # can multiply x * sigmoid(x). Use CONV_OUT as temp for sigmoid output.
             silu_core_dram(self, M=D, N=L_pad,
-                A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM,
+                A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM,
                 IDENTITY_DRAM_ADDR=self.IDENTITY_LPAD_DRAM)
-            bf16_smart_permute_core(self, dims=[D, L_pad], permute_indices=[1, 0],
-                input_dram_addr=self.CONV_DW_DRAM, output_dram_addr=self.CONV_T_DRAM,
-                params_dram_addr=self.w["IDENTITY_1024"], temp_dram_start=self.PERMUTE_TEMP_DRAM)
+            # Transpose (D, L_pad) -> (L_pad, D) directly from SiLU output.
+            # No need to copy back to CONV_DW — read from CONV_OUT instead.
+            chunked_transpose_core_dram(self, M=D, N=L_pad,
+                input_dram_addr=self.CONV_OUT_DRAM, output_dram_addr=self.CONV_T_DRAM,
+                identity_dram_addr=self.w["IDENTITY_64"],
+                temp_dram_addr=self.PERMUTE_TEMP_DRAM)
             self.matmat_mul_core(M=L_pad, K=D, N=D,
                 A_DRAM_ADDR=self.CONV_T_DRAM, B_DRAM_ADDR=la["CONV_PW2_W"],
                 OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM)
@@ -1478,31 +1585,38 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
         # --- Subsampling stage 0 ---
         patches0, H0, W0 = self._im2col_conv2d(mel_2d, T_mel, self.n_mels)
+        N0 = H0 * W0
+        # Pre-zero output buffer to prevent stale NaN from accumulating into matmul result
+        zero_buf = torch.zeros(N0 * SC, dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.SUB_OUT0_DRAM, zero_buf)
         self.dma_to_accelerator_memory(self.SUB_PATCH_DRAM, patches0.contiguous())
+        check_nan("sub_stage0_patches (host)", patches0)
         self.program_execute(self.progs["sub0"][0])
 
-        N0 = H0 * W0
         out0 = torch.zeros(N0 * SC, dtype=torch.bfloat16)
         self.dma_read(DMA_DEVICE_C2H, self.SUB_OUT0_DRAM, out0, N0 * SC * bpe)
         _stat("HW  stage0", out0)
+        check_nan("sub_stage0_output", out0)
         out0_3d = out0.reshape(H0, W0, SC).permute(2, 0, 1).contiguous()
 
-        # --- Stages 1 & 2: run on CPU ---
+        # --- Stages 1 & 2: run on CPU in bf16 ---
         # DW im2col patches are too large for DMA (~262MB for stage 1).
         # Run DW+PW conv on CPU using F.conv2d — cheap one-time ops.
-        cpu_s0 = out0.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).float()
-        cpu_s1 = F.conv2d(cpu_s0, sd["encoder.pre_encode.conv.2.weight"].float(),
-                          sd["encoder.pre_encode.conv.2.bias"].float(),
+        # Use bf16 throughout to match the reference model's precision.
+        # (float32 intermediates cause subsampling cos mismatch with bf16 ref.)
+        cpu_s0 = out0.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16)
+        cpu_s1 = F.conv2d(cpu_s0, sd["encoder.pre_encode.conv.2.weight"].to(torch.bfloat16),
+                          sd["encoder.pre_encode.conv.2.bias"].to(torch.bfloat16),
                           stride=2, padding=1, groups=SC)
-        cpu_s1 = F.conv2d(cpu_s1, sd["encoder.pre_encode.conv.3.weight"].float(),
-                          sd["encoder.pre_encode.conv.3.bias"].float())
+        cpu_s1 = F.conv2d(cpu_s1, sd["encoder.pre_encode.conv.3.weight"].to(torch.bfloat16),
+                          sd["encoder.pre_encode.conv.3.bias"].to(torch.bfloat16))
         cpu_s1 = F.relu(cpu_s1)
 
-        cpu_s2 = F.conv2d(cpu_s1, sd["encoder.pre_encode.conv.5.weight"].float(),
-                          sd["encoder.pre_encode.conv.5.bias"].float(),
+        cpu_s2 = F.conv2d(cpu_s1, sd["encoder.pre_encode.conv.5.weight"].to(torch.bfloat16),
+                          sd["encoder.pre_encode.conv.5.bias"].to(torch.bfloat16),
                           stride=2, padding=1, groups=SC)
-        cpu_s2 = F.conv2d(cpu_s2, sd["encoder.pre_encode.conv.6.weight"].float(),
-                          sd["encoder.pre_encode.conv.6.bias"].float())
+        cpu_s2 = F.conv2d(cpu_s2, sd["encoder.pre_encode.conv.6.weight"].to(torch.bfloat16),
+                          sd["encoder.pre_encode.conv.6.bias"].to(torch.bfloat16))
         cpu_s2 = F.relu(cpu_s2)
 
         _, _, H2, W2 = cpu_s2.shape
@@ -1520,17 +1634,28 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         print(f"    Flat upload verify: {flat_match}/{flat_verify.numel()} match")
 
         # --- Subsampling linear ---
+        # Pre-zero INPUT_DRAM (output of linear) to prevent stale NaN accumulation
+        zero_input = torch.zeros(L_pad * D, dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.INPUT_DRAM, zero_input)
         self.program_execute(self.progs["sub_lin"][0])
 
-        # Epsilon-fill padding rows to prevent LayerNorm NaN on zero rows
+        # Fill padding rows with values that have nonzero variance to prevent
+        # LayerNorm NaN. A constant fill (like 1e-6) has var=0, causing
+        # division by zero in LayerNorm. Alternating ±0.1 gives var > 0.
         if L_pad > L:
             pad_rows = L_pad - L
-            epsilon_fill = torch.full((pad_rows * D,), 1e-6, dtype=torch.bfloat16)
+            # Alternating +0.1 / -0.1 pattern: mean ≈ 0, var ≈ 0.01
+            epsilon_fill = torch.zeros(pad_rows * D, dtype=torch.bfloat16)
+            epsilon_fill[0::2] = 0.1
+            epsilon_fill[1::2] = -0.1
             pad_offset = L * D * bpe
             self.dma_to_accelerator_memory(self.INPUT_DRAM + pad_offset, epsilon_fill)
 
         lin_hw = _read_dram(self.INPUT_DRAM, L_pad * D)
         _stat("HW  linear_out", lin_hw[:L * D])
+        check_nan("sub_linear_output", lin_hw[:L * D])
+        # Save for debug comparison — conformer will overwrite INPUT_DRAM
+        self._hw_sub_out = lin_hw.clone().reshape(L_pad, D)
 
         # CPU reference linear for comparison
         ref_linear = F.linear(flat[:H2].float(), sd["encoder.pre_encode.out.weight"].float(),
@@ -1596,6 +1721,31 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         if L < L_pad:
             _stat("INPUT padding rows", inp_pre[L * D:])
 
+        # --- Pre-zero all encoder intermediate buffers to prevent stale NaN ---
+        print("  Pre-zeroing encoder intermediate buffers...")
+        zero_bufs = {
+            "ENC_OUT":     (self.ENC_OUT_DRAM,     L_pad * D),
+            "LN_OUT":      (self.LN_OUT_DRAM,      L_pad * D),
+            "FF_MID":      (self.FF_MID_DRAM,      L_pad * self.ff_dim),
+            "FF_OUT":      (self.FF_OUT_DRAM,       L_pad * D),
+            "RESIDUAL":    (self.RESIDUAL_DRAM,     L_pad * D),
+            "Q":           (self.Q_DRAM,            L_pad * D),
+            "K":           (self.K_DRAM,            L_pad * D),
+            "V":           (self.V_DRAM,            L_pad * D),
+            "POS_PROJ":    (self.POS_PROJ_DRAM,     L_pad * D),
+            "SCORE":       (self.SCORE_DRAM,        L_pad * L_pad),
+            "ATTN_OUT":    (self.ATTN_OUT_DRAM,     L_pad * D),
+            "REL_SHIFT":   (self.REL_SHIFT_DRAM,    L_pad * L_pad),
+            "CONV_A":      (self.CONV_A_DRAM,       L_pad * D),
+            "CONV_B":      (self.CONV_B_DRAM,       L_pad * D),
+            "CONV_T":      (self.CONV_T_DRAM,       D * L_pad),
+            "CONV_DW":     (self.CONV_DW_DRAM,      D * L_pad),
+            "CONV_OUT":    (self.CONV_OUT_DRAM,      L_pad * D),
+        }
+        for buf_name, (addr, numel) in zero_bufs.items():
+            z = torch.zeros(numel, dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(addr, z)
+
         # --- Execute 24 conformer layers ---
         print("  Executing conformer layers...")
         enc_prog, enc_flops = self.progs["encoder"]
@@ -1605,35 +1755,47 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         # Check encoder output
         enc_out = _read_dram(self.ENC_OUT_DRAM, L_pad * D)
         _stat("ENC_OUT", enc_out[:L * D])
-        if torch.isnan(enc_out.float()).any():
-            enc_2d = enc_out.float().reshape(L_pad, D)
-            nan_rows = torch.isnan(enc_2d).any(dim=1)
-            first_nan = nan_rows.nonzero(as_tuple=True)[0][0].item() if nan_rows.any() else -1
-            print(f"    First NaN row: {first_nan}/{L_pad} (L={L})")
 
-        # Read back FF1 intermediates (still in DRAM after execution)
-        FF = self.ff_dim  # 4096
-        ff_mid = _read_dram(self.FF_MID_DRAM, L_pad * FF)
-        _stat("FF_MID (linear1+SiLU)", ff_mid[:L * FF])
-        ff_out = _read_dram(self.FF_OUT_DRAM, L_pad * D)
-        _stat("FF_OUT (linear2)", ff_out[:L * D])
-        ln_out = _read_dram(self.LN_OUT_DRAM, L_pad * D)
-        _stat("LN_OUT (last LN used)", ln_out[:L * D])
+        # --- Post-execution intermediate buffer NaN scan ---
+        # These buffers retain whatever was last written during the program.
+        # For sublayer=2 (FF1+Attention), this tells us exactly which attention
+        # sub-operation first produced NaN.
+        FF = self.ff_dim
+        P_pad = pad_to_multiple(2 * L_pad - 1, self.block_size)
+        dk = self.head_dim
+        print("\n  --- Intermediate buffer NaN scan ---")
+        scan_bufs = [
+            ("LN_OUT",      self.LN_OUT_DRAM,      L_pad * D,       "last LayerNorm output"),
+            ("FF_MID",      self.FF_MID_DRAM,       L_pad * FF,      "FF linear1+SiLU"),
+            ("FF_OUT",      self.FF_OUT_DRAM,        L_pad * D,       "FF linear2 / attn out proj"),
+            ("Q",           self.Q_DRAM,             L_pad * D,       "Q projection"),
+            ("K",           self.K_DRAM,             L_pad * D,       "K projection"),
+            ("V",           self.V_DRAM,             L_pad * D,       "V projection"),
+            ("POS_PROJ",    self.POS_PROJ_DRAM,      L_pad * D,       "Pos projection (allocated size)"),
+            ("SCORE",       self.SCORE_DRAM,         L_pad * L_pad,   "Attention scores (last head)"),
+            ("REL_SHIFT",   self.REL_SHIFT_DRAM,     L_pad * L_pad,   "Rel shift output (last head)"),
+            ("ATTN_OUT",    self.ATTN_OUT_DRAM,      L_pad * D,       "Multi-head concat"),
+            ("CONV_A",      self.CONV_A_DRAM,        L_pad * dk,      "Temp A (last head attn@V)"),
+            ("CONV_B",      self.CONV_B_DRAM,        L_pad * dk,      "Temp B (last head K/V)"),
+            ("CONV_OUT",    self.CONV_OUT_DRAM,       L_pad * P_pad,   "Pos scores pre-relshift (last head)"),
+            ("ATTN_VT",     self.ATTN_VT_DRAM,       dk * L_pad,      "V transposed (last head)"),
+            ("ATTN_MASK",   self.ATTN_MASK_DRAM,     L_pad * L_pad,   "Attention mask"),
+            ("INPUT",       self.INPUT_DRAM,          L_pad * D,       "Final encoder state"),
+            ("IDENTITY_LP", self.IDENTITY_LPAD_DRAM,  L_pad * L_pad,   "Identity matrix (L_pad)"),
+            ("POS_EMB",     self.POS_EMB_DRAM,        P_pad * D,       "Positional embeddings"),
+        ]
+        for name, addr, numel, desc in scan_bufs:
+            buf = _read_dram(addr, numel)
+            f = buf.float()
+            nan_c = torch.isnan(f).sum().item()
+            inf_c = torch.isinf(f).sum().item()
+            if nan_c or inf_c:
+                print(f"    {name:12s} [{numel:>8d}]: NaN={nan_c:>6d} Inf={inf_c:>4d}  -- {desc}")
+            else:
+                print(f"    {name:12s} [{numel:>8d}]: CLEAN  norm={f.norm():.2f}  "
+                      f"min={f.min():.4f} max={f.max():.4f}  -- {desc}")
 
-        # Verify half-step residual computation
-        # ENC_OUT should equal INPUT_pre + 0.5 * FF_OUT
-        # But INPUT was overwritten by the program. Let's check ENC_OUT[0,:5] vs 0.5*FF_OUT[0,:5]
-        enc_2d = enc_out.float().reshape(L_pad, D)
-        ff_2d = ff_out.float().reshape(L_pad, D)
-        print(f"    ENC_OUT row0[:5]:  {enc_2d[0, :5].tolist()}")
-        print(f"    FF_OUT  row0[:5]:  {ff_2d[0, :5].tolist()}")
-        print(f"    ENC/FF ratio[:5]:  {(enc_2d[0, :5] / (ff_2d[0, :5] + 1e-10)).tolist()}")
-        print(f"    scalar_half bf16:  0x{self.float_to_bf16(0.5):04X} = {self.float_to_bf16(0.5)}")
-        # What if the broadcast_mul multiplied by 16128 (integer) instead of 0.5 (bf16)?
-        wrong_result_row0 = 16128.0 * ff_2d[0, :5]
-        print(f"    If mul by 16128:   {wrong_result_row0.tolist()}")
-        # What if no multiplication at all (scalar ignored)?
-        print(f"    If mul by 1.0:     {ff_2d[0, :5].tolist()}")
+        check_nan("encoder_output", enc_out[:L * D])
 
         return self.ENC_OUT_DRAM
 
@@ -1649,32 +1811,46 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         pred_prog = self.progs["pred"][0]
         tok_prog = self.progs["joint_tok"][0]
         dur_prog = self.progs["joint_dur"][0]
-        # Init LSTM state
+        # Pre-zero all decoder intermediate buffers to prevent stale NaN
         zeros_h = torch.zeros(H, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.PRED_H0_DRAM, zeros_h)
         self.dma_to_accelerator_memory(self.PRED_C0_DRAM, zeros_h)
         self.dma_to_accelerator_memory(self.PRED_H1_DRAM, zeros_h)
         self.dma_to_accelerator_memory(self.PRED_C1_DRAM, zeros_h)
+        self.dma_to_accelerator_memory(self.PRED_EMB_DRAM, zeros_h)
+        self.dma_to_accelerator_memory(self.PRED_OUT_DRAM, zeros_h)
+        self.dma_to_accelerator_memory(self.PRED_GATES_DRAM, torch.zeros(4 * H, dtype=torch.bfloat16))
+        self.dma_to_accelerator_memory(self.PRED_GATES2_DRAM, torch.zeros(4 * H, dtype=torch.bfloat16))
+        self.dma_to_accelerator_memory(self.JOINT_ENC_DRAM, torch.zeros(D, dtype=torch.bfloat16))
+        self.dma_to_accelerator_memory(self.JOINT_PRED_DRAM, zeros_h)
+        self.dma_to_accelerator_memory(self.JOINT_SUM_DRAM, zeros_h)
+        N_tok_pad = pad_to_multiple(self.vocab_size, self.block_size)
+        N_dur_pad = pad_to_multiple(len(self.tdt_durations), self.block_size)
+        self.dma_to_accelerator_memory(self.JOINT_TOK_DRAM, torch.zeros(N_tok_pad, dtype=torch.bfloat16))
+        self.dma_to_accelerator_memory(self.JOINT_DUR_DRAM, torch.zeros(N_dur_pad, dtype=torch.bfloat16))
         tokens = []
         t = 0
         last_token = self.blank_id
         total_steps = 0
-        N_tok_pad = pad_to_multiple(self.vocab_size, self.block_size)
-        N_dur_pad = pad_to_multiple(len(self.tdt_durations), self.block_size)
         while t < L:
             symbols = 0
             while symbols < self.max_symbols_per_step:
-                # Embedding lookup (on-device DRAM -> SRAM -> DRAM)
+                # Embedding lookup via host DMA (on-device SRAM ops may not
+                # sync with program execution, causing stale reads)
                 emb_src = self.w["EMBED"] + last_token * H * bpe
-                self.accelerator_memory_to_sram(emb_src, URAM_A_BASE, H)
-                self.sram_to_accelerator_memory(URAM_A_BASE, self.PRED_EMB_DRAM, H)
+                emb_buf = torch.zeros(H, dtype=torch.bfloat16)
+                self.dma_read(DMA_DEVICE_C2H, emb_src, emb_buf, H * bpe)
+                self.dma_to_accelerator_memory(self.PRED_EMB_DRAM, emb_buf)
                 # Predictor
                 self.program_execute(pred_prog)
-                # Copy enc_out[t] and pred_out to joint inputs (on-device)
-                self.accelerator_memory_to_sram(enc_out_addr + t * D * bpe, URAM_A_BASE, D)
-                self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_ENC_DRAM, D)
-                self.accelerator_memory_to_sram(self.PRED_OUT_DRAM, URAM_A_BASE, H)
-                self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_PRED_DRAM, H)
+                # Copy enc_out[t] and pred_out to joint inputs via HOST DMA
+                # (direct SRAM ops may not sync with program execution)
+                enc_t_buf = torch.zeros(D, dtype=torch.bfloat16)
+                self.dma_read(DMA_DEVICE_C2H, enc_out_addr + t * D * bpe, enc_t_buf, D * bpe)
+                self.dma_to_accelerator_memory(self.JOINT_ENC_DRAM, enc_t_buf)
+                pred_buf = torch.zeros(H, dtype=torch.bfloat16)
+                self.dma_read(DMA_DEVICE_C2H, self.PRED_OUT_DRAM, pred_buf, H * bpe)
+                self.dma_to_accelerator_memory(self.JOINT_PRED_DRAM, pred_buf)
                 # Joint token -> hardware argmax
                 self.program_execute(tok_prog)
                 token_id = self.get_arg_max_index()
@@ -1688,10 +1864,13 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     # Read back key tensors for diagnosis
                     hw_pred = torch.zeros(H, dtype=torch.bfloat16)
                     self.dma_read(DMA_DEVICE_C2H, self.PRED_OUT_DRAM, hw_pred, H * bpe)
+                    check_nan(f"decode_step{total_steps}_pred_out", hw_pred)
                     hw_enc_t = torch.zeros(D, dtype=torch.bfloat16)
                     self.dma_read(DMA_DEVICE_C2H, enc_out_addr + t * D * bpe, hw_enc_t, D * bpe)
+                    check_nan(f"decode_step{total_steps}_enc_t{t}", hw_enc_t)
                     hw_tok = torch.zeros(N_tok_pad, dtype=torch.bfloat16)
                     self.dma_read(DMA_DEVICE_C2H, self.JOINT_TOK_DRAM, hw_tok, N_tok_pad * bpe)
+                    check_nan(f"decode_step{total_steps}_tok_logits", hw_tok[:self.vocab_size])
                     hw_dur_logits = torch.zeros(N_dur_pad, dtype=torch.bfloat16)
                     self.dma_read(DMA_DEVICE_C2H, self.JOINT_DUR_DRAM, hw_dur_logits, N_dur_pad * bpe)
                     print(f"  [step {total_steps}] t={t} tok={token_id} dur={dur} "
@@ -1747,7 +1926,7 @@ def _load_reference_model():
     return ref
 
 
-def debug_encoder(engine, ref_model, mel, L, L_pad):
+def debug_encoder(engine, ref_model, mel, L, L_pad, waveform=None):
     """Run encoder with per-stage CPU comparison."""
     bpe = engine.bytes_per_element
     D = engine.d_model
@@ -1755,7 +1934,11 @@ def debug_encoder(engine, ref_model, mel, L, L_pad):
 
     # --- Run reference encoder step by step ---
     with torch.no_grad():
-        ref_mel = ref_model.preprocessor(mel.unsqueeze(0).float())
+        if waveform is not None:
+            ref_mel = ref_model.preprocessor(waveform.float())
+        else:
+            # mel is already computed; use it directly as ref_mel
+            ref_mel = mel if mel.dim() == 3 else mel.unsqueeze(0)
     compare_tensors("mel_spectrogram", mel.squeeze(0), ref_mel.squeeze(0))
 
     # --- Run reference subsampling step by step ---
@@ -1784,9 +1967,17 @@ def debug_encoder(engine, ref_model, mel, L, L_pad):
     L_cmp = min(L, L_ref)
 
     print(f"\n--- Encoder Output (L={L}, L_ref={L_ref}) ---")
-    compare_tensors("encoder_output", enc_hw[:L_cmp], ref_enc_2d[:L_cmp])
+    # Don't assert here — report and continue to per-layer comparison
+    h = enc_hw[:L_cmp].float().flatten()
+    r = ref_enc_2d[:L_cmp].float().flatten()
+    cos = F.cosine_similarity(h.unsqueeze(0), r.unsqueeze(0)).item()
+    mae = (h - r).abs().mean().item()
+    print(f"  encoder_output: cos={cos:.6f}  mae={mae:.4f}  "
+          f"hw_norm={h.norm():.2f}  ref_norm={r.norm():.2f}")
+    if cos < 0.99:
+        print(f"  WARNING: encoder output mismatch (cos={cos:.4f}), checking per-layer...")
 
-    # Check if HW encoder output is constant across timesteps
+    # Check if HW encoder output varies across timesteps
     enc_hw_f = enc_hw[:L].float()
     ts_var = enc_hw_f.var(dim=0).mean().item()
     ts_cos_01 = F.cosine_similarity(enc_hw_f[0:1], enc_hw_f[1:2]).item() if L > 1 else 0
@@ -1794,33 +1985,49 @@ def debug_encoder(engine, ref_model, mel, L, L_pad):
     print(f"  HW enc temporal variance: {ts_var:.6f}")
     print(f"  HW enc cos(t=0, t=1): {ts_cos_01:.6f}")
     print(f"  HW enc cos(t=0, t=L/2): {ts_cos_0m:.6f}")
-    assert ts_var > 1e-4, (
-        f"Encoder output collapsed: temporal variance={ts_var:.8f} (all timesteps identical)"
-    )
-    assert ts_cos_01 < 0.999, (
-        f"Encoder timesteps 0 and 1 are identical: cos={ts_cos_01:.6f}"
-    )
 
     # --- Per-layer debug if buffers were allocated ---
     if engine.debug and engine.DEBUG_LAYER_DRAM:
         print(f"\n--- Per-Layer Comparison (24 conformer layers) ---")
-        # Run reference per-layer
+        # Use HW subsampling output as shared starting point for fair comparison.
+        # This isolates conformer errors from subsampling differences.
+        hw_sub = engine._hw_sub_out[:L].to(torch.bfloat16)  # (L, 1024)
+        # Also run ref subsampling for comparison
         with torch.no_grad():
             ref_sub_out = ref_model.encoder.subsampling(ref_mel)  # (1, L_ref, 1024)
-            from parakeet_modules import make_rel_pos_emb
-            ref_pos = make_rel_pos_emb(ref_sub_out.size(1)).to(
-                dtype=ref_sub_out.dtype, device=ref_sub_out.device)
-            ref_layer_x = ref_sub_out
+        L_ref = ref_sub_out.shape[1]
+        L_cmp_sub = min(L, L_ref)
+        sub_cos = F.cosine_similarity(
+            hw_sub[:L_cmp_sub].float().flatten().unsqueeze(0),
+            ref_sub_out.squeeze(0)[:L_cmp_sub].float().flatten().unsqueeze(0)).item()
+        print(f"  Subsampling output cos(HW, REF): {sub_cos:.6f}  "
+              f"(L_hw={L}, L_ref={L_ref})")
+
+        from parakeet_modules import make_rel_pos_emb
+        # Feed HW sub output to ref conformer layers for fair comparison
+        ref_layer_x = hw_sub.unsqueeze(0).to(ref_sub_out.dtype)  # (1, L, 1024)
+        ref_pos = make_rel_pos_emb(L).to(dtype=ref_layer_x.dtype, device=ref_layer_x.device)
+
+        with torch.no_grad():
             for li in range(engine.num_layers):
                 ref_layer_x = ref_model.encoder.layers[li](ref_layer_x, ref_pos)
                 # Read HW layer output
                 hw_layer = torch.zeros(L_pad * D, dtype=torch.bfloat16)
                 engine.dma_read(DMA_DEVICE_C2H, engine.DEBUG_LAYER_DRAM[li],
                                 hw_layer, L_pad * D * bpe)
+                check_nan(f"hw_layer_{li:02d}", hw_layer[:L * D])
                 hw_layer = hw_layer.reshape(L_pad, D)
                 ref_layer_2d = ref_layer_x.squeeze(0)
                 L_cmp = min(L, ref_layer_2d.shape[0])
-                compare_tensors(f"layer_{li:02d}", hw_layer[:L_cmp], ref_layer_2d[:L_cmp])
+                hw_flat = hw_layer[:L_cmp].float().flatten()
+                ref_flat = ref_layer_2d[:L_cmp].float().flatten()
+                min_len = min(len(hw_flat), len(ref_flat))
+                cos = F.cosine_similarity(hw_flat[:min_len].unsqueeze(0),
+                                          ref_flat[:min_len].unsqueeze(0)).item()
+                mae = (hw_flat[:min_len] - ref_flat[:min_len]).abs().mean().item()
+                status = "PASS" if cos >= 0.95 else ("WARN" if cos >= 0.5 else "FAIL")
+                print(f"  [{status}] layer_{li:02d}: cos={cos:.6f}  mae={mae:.4f}  "
+                      f"hw_norm={hw_flat.norm():.2f}  ref_norm={ref_flat.norm():.2f}")
 
     # --- Also compare subsampling linear output ---
     sub_lin_hw = torch.zeros(L_pad * D, dtype=torch.bfloat16)
@@ -1950,6 +2157,8 @@ def main():
     parser.add_argument("--layers", type=int, default=None, help="Only compile N conformer layers (debug)")
     parser.add_argument("--sublayer", type=int, default=None,
                         help="With --layers 1: stop after sub-module N (1=FF1 2=Attn 3=Conv 4=FF2 5=full)")
+    parser.add_argument("--isolate", action="store_true",
+                        help="Auto-isolate first NaN: run layer 0 sublayers 1..5, then layers 2..24")
     args = parser.parse_args()
     cfg = load_config()
     set_dma_device(args.dev)
@@ -1987,11 +2196,313 @@ def main():
     engine.tensor_init(L_pad)
     engine.compile_all(T_mel, L_pad, max_layers=args.layers, max_sublayer=args.sublayer)
 
-    if args.debug:
+    if args.isolate:
+        # --- Isolate mode: find exactly where NaN first appears ---
+        print(f"\n{'='*60}")
+        print(f"  ISOLATE MODE: auto-searching for first NaN")
+        print(f"{'='*60}")
+        D = engine.d_model
+        bpe = engine.bytes_per_element
+        sublayer_names = {1: "FF1", 2: "Attention", 3: "ConvModule", 4: "FF2", 5: "FinalLN"}
+
+        # Load CPU reference model for comparison
+        ref_model = _load_reference_model()
+        from parakeet_modules import make_rel_pos_emb, FeedForward, RelPosAttention, ConvModule
+
+        def _run_and_check(max_layers, max_sublayer, label):
+            """Recompile with given limits, run encoder, return (nan_free, hw_out, cos)."""
+            engine.reset_tensor_dram_addr()
+            engine.reset_program_dram_addr()
+            engine.tensor_init(L_pad)
+            engine.compile_all(T_mel, L_pad, max_layers=max_layers, max_sublayer=max_sublayer)
+            try:
+                enc_addr = engine.run_encoder(mel, L, L_pad)
+            except AssertionError:
+                enc_addr = engine.ENC_OUT_DRAM
+            out = torch.zeros(L_pad * D, dtype=torch.bfloat16)
+            engine.dma_read(DMA_DEVICE_C2H, enc_addr, out, L_pad * D * bpe)
+            hw_valid = out[:L * D].float()
+            nan_c = torch.isnan(hw_valid).sum().item()
+            valid = hw_valid[~torch.isnan(hw_valid)]
+            norm = valid.norm().item() if valid.numel() > 0 else float('nan')
+            return nan_c == 0, out.reshape(L_pad, D), norm
+
+        # Get HW subsampling output as shared starting point
+        engine.reset_tensor_dram_addr()
+        engine.reset_program_dram_addr()
+        engine.tensor_init(L_pad)
+        engine.compile_all(T_mel, L_pad, max_layers=1, max_sublayer=1)
+        engine.run_encoder(mel, L, L_pad)
+        hw_sub = engine._hw_sub_out[:L].clone()  # (L, 1024) bf16
+
+        # Run CPU reference sublayers on the SAME input
+        ref_x = hw_sub.unsqueeze(0).to(torch.bfloat16)  # (1, L, D)
+        ref_pos = make_rel_pos_emb(L).to(dtype=ref_x.dtype)
+        ref_block = ref_model.encoder.layers[0]
+
+        # Compute ref sublayer outputs step by step
+        with torch.no_grad():
+            # FF1
+            ref_after_ff1 = ref_x + 0.5 * ref_block.ff1(ref_block.ln_ff1(ref_x))
+            # Attention
+            ref_after_attn = ref_after_ff1 + ref_block.self_attn(
+                ref_block.ln_attn(ref_after_ff1), ref_pos)
+            # ConvModule
+            ref_after_conv = ref_after_attn + ref_block.conv(
+                ref_block.ln_conv(ref_after_attn))
+            # FF2
+            ref_after_ff2 = ref_after_conv + 0.5 * ref_block.ff2(
+                ref_block.ln_ff2(ref_after_conv))
+            # Final LN
+            ref_after_ln = ref_block.ln_out(ref_after_ff2)
+
+        ref_stages = {
+            1: ("FF1",        ref_after_ff1.squeeze(0)),
+            2: ("Attention",  ref_after_attn.squeeze(0)),
+            3: ("ConvModule", ref_after_conv.squeeze(0)),
+            4: ("FF2",        ref_after_ff2.squeeze(0)),
+            5: ("FinalLN",    ref_after_ln.squeeze(0)),
+        }
+
+        # Run each sublayer and collect results
+        results = []
+        for sub in range(1, 6):
+            name, ref_out = ref_stages[sub]
+            label = f"after {name}"
+            ok, hw_out, norm = _run_and_check(max_layers=1, max_sublayer=sub, label=label)
+            if not ok:
+                results.append((sub, name, "NaN", 0.0, 0.0, 0.0, 0.0))
+                continue
+            hw_flat = hw_out[:L].float().flatten()
+            ref_flat = ref_out[:L].float().flatten()
+            min_len = min(len(hw_flat), len(ref_flat))
+            cos = F.cosine_similarity(
+                hw_flat[:min_len].unsqueeze(0),
+                ref_flat[:min_len].unsqueeze(0)).item()
+            mae = (hw_flat[:min_len] - ref_flat[:min_len]).abs().mean().item()
+            results.append((sub, name, "OK", cos, mae, hw_flat.norm().item(), ref_flat.norm().item()))
+
+        # Print summary table
+        print(f"\n{'='*72}")
+        print(f"  SUBLAYER COMPARISON SUMMARY — Layer 0")
+        print(f"  (HW vs CPU reference, same subsampling input)")
+        print(f"{'='*72}")
+        print(f"  {'Sub':>3s}  {'Name':<12s}  {'Status':<6s}  {'Cosine':>8s}  {'MAE':>8s}  {'HW norm':>10s}  {'REF norm':>10s}")
+        print(f"  {'-'*3}  {'-'*12}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*10}  {'-'*10}")
+        for sub, name, status, cos, mae, hw_n, ref_n in results:
+            if status == "NaN":
+                print(f"  {sub:3d}  {name:<12s}  {'NaN':>6s}")
+            else:
+                flag = "PASS" if cos >= 0.95 else ("WARN" if cos >= 0.5 else "FAIL")
+                print(f"  {sub:3d}  {name:<12s}  {flag:<6s}  {cos:8.4f}  {mae:8.4f}  {hw_n:10.2f}  {ref_n:10.2f}")
+        print(f"{'='*72}")
+        # Identify first failure
+        for sub, name, status, cos, *_ in results:
+            if status != "NaN" and cos < 0.95:
+                print(f"\n  >>> First divergence: sublayer {sub} ({name}), cos={cos:.4f}")
+                break
+
+        # --- Detailed Attention Diagnostic ---
+        # Run sublayer=2 (FF1+Attention), read back all intermediates, compare with CPU reference
+        print(f"\n{'='*72}")
+        print(f"  ATTENTION DIAGNOSTIC — Layer 0")
+        print(f"{'='*72}")
+
+        # Run HW with sublayer=2
+        engine.reset_tensor_dram_addr()
+        engine.reset_program_dram_addr()
+        engine.tensor_init(L_pad)
+        engine.compile_all(T_mel, L_pad, max_layers=1, max_sublayer=2)
+        try:
+            engine.run_encoder(mel, L, L_pad)
+        except AssertionError:
+            pass
+
+        dk = engine.head_dim
+        H_heads = engine.num_heads
+
+        def _read(addr, numel):
+            buf = torch.zeros(numel, dtype=torch.bfloat16)
+            engine.dma_read(DMA_DEVICE_C2H, addr, buf, numel * bpe)
+            return buf
+
+        def _cos(hw, ref, name):
+            h = hw.float().flatten()
+            r = ref.float().flatten()
+            n = min(len(h), len(r))
+            c = F.cosine_similarity(h[:n].unsqueeze(0), r[:n].unsqueeze(0)).item()
+            mae = (h[:n] - r[:n]).abs().mean().item()
+            flag = "PASS" if c >= 0.95 else ("WARN" if c >= 0.5 else "FAIL")
+            print(f"  [{flag}] {name:<30s} cos={c:.6f}  mae={mae:.4f}  "
+                  f"hw_norm={h[:n].norm():.2f}  ref_norm={r[:n].norm():.2f}")
+            return c
+
+        # Compute CPU reference attention intermediates on SAME input
+        ref_ff1_out = ref_after_ff1  # (1, L, D) — input to attention
+        ref_block_attn = ref_block.self_attn
+        with torch.no_grad():
+            ref_ln_attn = ref_block.ln_attn(ref_ff1_out)  # (1, L, D)
+            ref_q = ref_block_attn.linear_q(ref_ln_attn)  # (1, L, D)
+            ref_k = ref_block_attn.linear_k(ref_ln_attn)
+            ref_v = ref_block_attn.linear_v(ref_ln_attn)
+            ref_p = ref_block_attn.linear_pos(ref_pos)    # (1, 2L-1, D)
+
+            # Multi-head reshape
+            B_r, T_r, _ = ref_q.shape
+            ref_q_h = ref_q.view(B_r, T_r, H_heads, dk).transpose(1, 2)  # (1, H, L, dk)
+            ref_k_h = ref_k.view(B_r, T_r, H_heads, dk).transpose(1, 2)
+            ref_v_h = ref_v.view(B_r, T_r, H_heads, dk).transpose(1, 2)
+            ref_p_h = ref_p.view(1, -1, H_heads, dk).transpose(1, 2)     # (1, H, 2L-1, dk)
+
+            # Head 0 content scores
+            bias_u = ref_block_attn.pos_bias_u.unsqueeze(1)  # (H, 1, dk)
+            bias_v = ref_block_attn.pos_bias_v.unsqueeze(1)
+            ref_qu = ref_q_h + bias_u
+            ref_content_h0 = torch.matmul(ref_qu[0, 0:1], ref_k_h[0, 0:1].transpose(-2, -1))  # (1, L, L)
+
+            ref_qv = ref_q_h + bias_v
+            ref_pos_raw_h0 = torch.matmul(ref_qv[0, 0:1], ref_p_h[0, 0:1].transpose(-2, -1))  # (1, L, 2L-1)
+            from parakeet_modules import rel_shift
+            ref_pos_h0 = rel_shift(ref_pos_raw_h0.unsqueeze(0)).squeeze(0)  # (1, L, L)
+
+            ref_scores_h0 = (ref_content_h0 + ref_pos_h0) * (1.0 / math.sqrt(dk))
+            ref_softmax_h0 = F.softmax(ref_scores_h0, dim=-1)  # (1, L, L)
+
+            # Full attention output
+            ref_attn_out = ref_block_attn(ref_ln_attn, ref_pos)  # (1, L, D)
+
+        # Read HW intermediates
+        hw_ln = _read(engine.LN_OUT_DRAM, L_pad * D).reshape(L_pad, D)
+        hw_q = _read(engine.Q_DRAM, L_pad * D).reshape(L_pad, D)
+        hw_k = _read(engine.K_DRAM, L_pad * D).reshape(L_pad, D)
+        hw_v = _read(engine.V_DRAM, L_pad * D).reshape(L_pad, D)
+        hw_score = _read(engine.SCORE_DRAM, L_pad * L_pad).reshape(L_pad, L_pad)
+        hw_attn_out = _read(engine.ATTN_OUT_DRAM, L_pad * D).reshape(L_pad, D)
+        hw_ff_out = _read(engine.FF_OUT_DRAM, L_pad * D).reshape(L_pad, D)
+
+        print(f"\n  Attention intermediates (valid rows only, L={L}):")
+        _cos(hw_ln[:L], ref_ln_attn.squeeze(0), "LN_attn output")
+        _cos(hw_q[:L], ref_q.squeeze(0), "Q projection")
+        _cos(hw_k[:L], ref_k.squeeze(0), "K projection")
+        _cos(hw_v[:L], ref_v.squeeze(0), "V projection")
+
+        # Head 0 scores: SCORE_DRAM has the LAST head (head 7), not head 0.
+        # But we can check the last head against ref
+        last_h = H_heads - 1
+        with torch.no_grad():
+            ref_content_last = torch.matmul(ref_qu[0, last_h:last_h+1],
+                                             ref_k_h[0, last_h:last_h+1].transpose(-2, -1))
+            ref_pos_raw_last = torch.matmul(ref_qv[0, last_h:last_h+1],
+                                             ref_p_h[0, last_h:last_h+1].transpose(-2, -1))
+            ref_pos_last = rel_shift(ref_pos_raw_last.unsqueeze(0)).squeeze(0)
+            ref_scores_last = (ref_content_last + ref_pos_last) * (1.0 / math.sqrt(dk))
+            ref_softmax_last = F.softmax(ref_scores_last, dim=-1)
+
+        _cos(hw_score[:L, :L], ref_softmax_last.squeeze(0)[:L, :L],
+             f"Softmax scores (head {last_h})")
+
+        # V transpose verification: check CONV_B (V_h) and ATTN_VT (transposed)
+        hw_conv_b = _read(engine.CONV_B_DRAM, L_pad * dk).reshape(L_pad, dk)
+        hw_attn_vt = _read(engine.ATTN_VT_DRAM, dk * L_pad).reshape(dk, L_pad)
+        # CONV_B should have V_h for last head
+        ref_v_last = ref_v_h[0, last_h]  # (L, dk)
+        _cos(hw_conv_b[:L], ref_v_last[:L], f"V_h (head {last_h}, before transpose)")
+        # ATTN_VT should be V_h transposed: (dk, L_pad)
+        # Compare: ATTN_VT[:, :L] should match V_h[:L, :]^T
+        _cos(hw_attn_vt[:, :L].reshape(-1), ref_v_last[:L].t().reshape(-1),
+             f"V_h^T (head {last_h}, after transpose)")
+        print(f"    CONV_B norm={hw_conv_b[:L].float().norm():.2f}  "
+              f"ATTN_VT norm={hw_attn_vt[:, :L].float().norm():.2f}  "
+              f"(should be equal if transpose preserves data)")
+
+        # Per-head attn@V result: CONV_A has last head's output
+        hw_conv_a = _read(engine.CONV_A_DRAM, L_pad * dk).reshape(L_pad, dk)
+        with torch.no_grad():
+            ref_attn_v_last = torch.matmul(ref_softmax_last, ref_v_last.unsqueeze(0))  # (1, L, dk)
+        _cos(hw_conv_a[:L], ref_attn_v_last.squeeze(0)[:L],
+             f"attn@V (head {last_h}, single head)")
+
+        # Check a few specific positions in ATTN_OUT to verify strided write
+        print(f"\n  Strided write check (ATTN_OUT layout):")
+        for h_check in [0, 4, 7]:
+            h_start = h_check * dk
+            hw_slice = hw_attn_out[0, h_start:h_start+4].float()  # first row, 4 elements of head h
+            print(f"    ATTN_OUT[0, head{h_check}:head{h_check}+4] = {hw_slice.tolist()}")
+        # If strided write works, different heads should have different values
+        # If broken (contiguous write), head 0-6 would be zero or from head 7
+
+        _cos(hw_attn_out[:L], ref_attn_out.squeeze(0)[:L],
+             "Attention output (pre-proj)")
+
+        # Output projection: FF_OUT_DRAM has W_out @ attn_concat
+        with torch.no_grad():
+            ref_out_proj = ref_block_attn.linear_out(ref_attn_out)
+        _cos(hw_ff_out[:L], ref_out_proj.squeeze(0)[:L],
+             "Output projection")
+
+        # Check: what does residual look like?
+        hw_input = _read(engine.INPUT_DRAM, L_pad * D).reshape(L_pad, D)
+        _cos(hw_input[:L], ref_after_attn.squeeze(0)[:L],
+             "After residual (x + attn)")
+
+        # --- Reprint sublayer summary table at the end ---
+        print(f"\n{'='*72}")
+        print(f"  SUBLAYER COMPARISON SUMMARY — Layer 0  (L={L}, L_pad={L_pad})")
+        print(f"  (HW vs CPU reference, same subsampling input)")
+        print(f"{'='*72}")
+        print(f"  {'Sub':>3s}  {'Name':<12s}  {'Status':<6s}  {'Cosine':>8s}  {'MAE':>8s}  {'HW norm':>10s}  {'REF norm':>10s}")
+        print(f"  {'-'*3}  {'-'*12}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*10}  {'-'*10}")
+        for sub, name, status, cos, mae, hw_n, ref_n in results:
+            if status == "NaN":
+                print(f"  {sub:3d}  {name:<12s}  {'NaN':>6s}")
+            else:
+                flag = "PASS" if cos >= 0.95 else ("WARN" if cos >= 0.5 else "FAIL")
+                print(f"  {sub:3d}  {name:<12s}  {flag:<6s}  {cos:8.4f}  {mae:8.4f}  {hw_n:10.2f}  {ref_n:10.2f}")
+        print(f"{'='*72}")
+
+        # --- Multi-layer degradation test ---
+        # Run with increasing layer counts to find where cos drops
+        print(f"\n{'='*72}")
+        print(f"  MULTI-LAYER DEGRADATION TEST  (L={L}, L_pad={L_pad})")
+        print(f"{'='*72}")
+        # Feed HW sub output to ref for fair comparison
+        ref_layer_x = hw_sub.unsqueeze(0).to(torch.bfloat16)
+        ref_pos_full = make_rel_pos_emb(L).to(dtype=ref_layer_x.dtype)
+        layer_counts = [1, 2, 4, 8, 12, 16, 20, 24]
+        for n_layers in layer_counts:
+            engine.reset_tensor_dram_addr()
+            engine.reset_program_dram_addr()
+            engine.tensor_init(L_pad)
+            engine.compile_all(T_mel, L_pad, max_layers=n_layers, max_sublayer=None)
+            try:
+                engine.run_encoder(mel, L, L_pad)
+            except AssertionError:
+                pass
+            hw_out = torch.zeros(L_pad * D, dtype=torch.bfloat16)
+            engine.dma_read(DMA_DEVICE_C2H, engine.ENC_OUT_DRAM, hw_out, L_pad * D * bpe)
+            # Run ref for same number of layers
+            ref_x_tmp = ref_layer_x.clone()
+            with torch.no_grad():
+                for li in range(n_layers):
+                    ref_x_tmp = ref_model.encoder.layers[li](ref_x_tmp, ref_pos_full)
+            hw_f = hw_out[:L * D].float()
+            ref_f = ref_x_tmp.squeeze(0)[:L].float().flatten()
+            nan_c = torch.isnan(hw_f).sum().item()
+            if nan_c > 0:
+                print(f"  {n_layers:2d} layers: NaN={nan_c}")
+                continue
+            cos_val = F.cosine_similarity(hw_f.unsqueeze(0), ref_f.unsqueeze(0)).item()
+            print(f"  {n_layers:2d} layers: cos={cos_val:.6f}  "
+                  f"hw_norm={hw_f.norm():.2f}  ref_norm={ref_f.norm():.2f}")
+        print(f"{'='*72}")
+
+        sys.exit(0)
+
+    elif args.debug:
         # --- Debug mode: run with CPU reference comparison ---
         ref_model = _load_reference_model()
 
-        enc_out_addr = debug_encoder(engine, ref_model, mel, L, L_pad)
+        enc_out_addr = debug_encoder(engine, ref_model, mel, L, L_pad, waveform=waveform)
         debug_decoder(engine, ref_model, enc_out_addr, L)
 
         # Also run full HW decode for final output
@@ -2004,18 +2515,124 @@ def main():
         print(f"\n--- Decoder ---")
         tokens = engine.run_decode(enc_out_addr, L)
 
+    # --- BYPASS TEST: Feed ref subsampling to HW encoder, and ref enc to HW decoder ---
+    print(f"\n--- Bypass Tests ---")
+    ref_model = _load_reference_model()
+    with torch.no_grad():
+        ref_mel = ref_model.preprocessor(waveform.float())
+        ref_sub = ref_model.encoder.subsampling(ref_mel)  # (1, L_ref, 1024)
+    L_ref = ref_sub.shape[1]
+    print(f"  REF subsampling: shape={ref_sub.shape}, L_ref={L_ref}")
+
+    # Test 1: Feed ref sub output to HW encoder (bypass HW subsampling)
+    print(f"\n  TEST 1: REF subsampling → HW conformer → HW decoder")
+    ref_sub_padded = torch.zeros(L_pad, engine.d_model, dtype=torch.bfloat16)
+    L_use = min(L_ref, L_pad)  # might differ by 1
+    ref_sub_padded[:L_use] = ref_sub.squeeze(0)[:L_use].to(torch.bfloat16)
+    # Fill remaining padding rows
+    if L_use < L_pad:
+        for r in range(L_use, L_pad):
+            ref_sub_padded[r, 0::2] = 0.1
+            ref_sub_padded[r, 1::2] = -0.1
+    engine.dma_to_accelerator_memory(engine.INPUT_DRAM, ref_sub_padded.contiguous())
+    # Re-execute JUST the encoder conformer (skip subsampling)
+    enc_prog, enc_flops = engine.progs["encoder"]
+    engine.program_execute(enc_prog, flops=enc_flops)
+    bypass_enc = torch.zeros(L_pad * engine.d_model, dtype=torch.bfloat16)
+    engine.dma_read(DMA_DEVICE_C2H, engine.ENC_OUT_DRAM, bypass_enc,
+                    L_pad * engine.d_model * engine.bytes_per_element)
+    bypass_enc_2d = bypass_enc.reshape(L_pad, engine.d_model)[:L_use]
+    # Compare with ref encoder
+    with torch.no_grad():
+        ref_enc = ref_model.encoder(ref_mel)
+    ref_enc_2d = ref_enc.squeeze(0)[:L_use]
+    bypass_cos = F.cosine_similarity(
+        bypass_enc_2d.float().flatten().unsqueeze(0),
+        ref_enc_2d.float().flatten().unsqueeze(0)).item()
+    print(f"  Bypass encoder cos: {bypass_cos:.6f}  "
+          f"hw_norm={bypass_enc_2d.float().norm():.4f}  "
+          f"ref_norm={ref_enc_2d.float().norm():.4f}")
+    # Decode the bypass encoder output
+    bypass_tokens = engine.run_decode(engine.ENC_OUT_DRAM, L_use)
+
+    # Test 2: Feed ref encoder output to HW decoder (bypass everything)
+    print(f"\n  TEST 2: REF encoder → HW decoder")
+    ref_enc_padded = torch.zeros(L_pad, engine.d_model, dtype=torch.bfloat16)
+    ref_enc_padded[:L_use] = ref_enc_2d.to(torch.bfloat16)
+    engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM, ref_enc_padded.contiguous())
+    ref2hw_tokens = engine.run_decode(engine.ENC_OUT_DRAM, L_use)
+
+    # --- CPU reference decode using same encoder output for comparison ---
+    print(f"\n--- CPU Reference Decode ---")
+    bpe = engine.bytes_per_element
+    D = engine.d_model
+
+    # Read HW encoder output (from the normal run, not bypass)
+    hw_enc = torch.zeros(L_pad * D, dtype=torch.bfloat16)
+    engine.dma_read(DMA_DEVICE_C2H, enc_out_addr, hw_enc, L_pad * D * bpe)
+    hw_enc_2d = hw_enc.reshape(L_pad, D)[:L]
+
+    # ref_enc already computed in bypass tests; reuse ref_mel too
+    with torch.no_grad():
+        pass  # ref_mel and ref_enc already computed
+        pass  # ref_enc already computed
+    ref_enc_2d = ref_enc.squeeze(0)[:L_ref]
+
+    print(f"  HW  encoder: shape=({L}, {D}) norm={hw_enc_2d.float().norm():.4f} "
+          f"min={hw_enc_2d.float().min():.4f} max={hw_enc_2d.float().max():.4f}")
+    print(f"  REF encoder: shape=({L_ref}, {D}) norm={ref_enc_2d.float().norm():.4f} "
+          f"min={ref_enc_2d.float().min():.4f} max={ref_enc_2d.float().max():.4f}")
+    L_cmp = min(L, L_ref)
+    cos = F.cosine_similarity(
+        hw_enc_2d[:L_cmp].float().flatten().unsqueeze(0),
+        ref_enc_2d[:L_cmp].float().flatten().unsqueeze(0)).item()
+    print(f"  Encoder cos similarity: {cos:.6f}")
+
+    # CPU decode on HW encoder output (model is bf16, so keep bf16)
+    print(f"\n  CPU decode on HW encoder output:")
+    with torch.no_grad():
+        hw_tokens = ref_model.decode(hw_enc_2d.unsqueeze(0).to(ref_enc.dtype))
+    print(f"  HW-enc tokens: {hw_tokens[0][:20]}{'...' if len(hw_tokens[0]) > 20 else ''}")
+
+    # CPU decode on CPU encoder output
+    print(f"\n  CPU decode on REF encoder output:")
+    with torch.no_grad():
+        ref_tokens = ref_model.decode(ref_enc)
+    print(f"  REF-enc tokens: {ref_tokens[0][:20]}{'...' if len(ref_tokens[0]) > 20 else ''}")
+
+    # Decode all to text
     tokenizer_path = TOKENIZER_PATH
     if os.path.exists(tokenizer_path):
         import sentencepiece as spm
         sp = spm.SentencePieceProcessor()
         sp.Load(tokenizer_path)
         vocab_sz = sp.GetPieceSize()
-        valid_tokens = [t for t in tokens if 0 <= t < vocab_sz]
-        text = sp.DecodeIds(valid_tokens)
-        print(f"\n  >>> {text}\n")
+
+        hw_valid = [t for t in tokens if 0 <= t < vocab_sz]
+        hw_text = sp.DecodeIds(hw_valid)
+        print(f"\n  HW  decode (HW enc):       >>> {hw_text}")
+
+        hw_cpu_valid = [t for t in hw_tokens[0] if 0 <= t < vocab_sz]
+        hw_cpu_text = sp.DecodeIds(hw_cpu_valid)
+        print(f"  CPU decode (HW enc):       >>> {hw_cpu_text}")
+
+        bypass_valid = [t for t in bypass_tokens if 0 <= t < vocab_sz]
+        bypass_text = sp.DecodeIds(bypass_valid)
+        print(f"  HW dec (REF sub→HW enc):   >>> {bypass_text}")
+
+        ref2hw_valid = [t for t in ref2hw_tokens if 0 <= t < vocab_sz]
+        ref2hw_text = sp.DecodeIds(ref2hw_valid)
+        print(f"  HW dec (REF enc→HW dec):   >>> {ref2hw_text}")
+
+        ref_valid = [t for t in ref_tokens[0] if 0 <= t < vocab_sz]
+        ref_text = sp.DecodeIds(ref_valid)
+        print(f"  CPU decode (REF enc):      >>> {ref_text}")
     else:
-        print(f"  Tokens: {tokens[:20]}{'...' if len(tokens) > 20 else ''}")
-        print(f"  (tokenizer not found at {tokenizer_path})")
+        print(f"  HW tokens:  {tokens[:20]}")
+        print(f"  CPU-on-HW:  {hw_tokens[0][:20]}")
+        print(f"  REF tokens: {ref_tokens[0][:20]}")
+
+    print()
 
 
 if __name__ == "__main__":

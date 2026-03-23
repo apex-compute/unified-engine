@@ -157,6 +157,6 @@
     "dev": "xdma0",
     "cycle_ns": 5.63,
     "max_audio_seconds": 60,
-    "default_audio": "../test_samples/1089-134686-0000.flac"
+    "default_audio": "../../test_samples/1089-134686-0000.wav"
   }
 }
