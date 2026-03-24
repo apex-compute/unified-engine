@@ -1931,128 +1931,31 @@ def main():
     compile_and_run(engine, emit_all_24_layers)
     print(f"  All 24 layers executed in one program")
 
-    # --- Timed forward pass (subsampling + encoder + decoder) ---
-    # Re-run just the execution parts (no compilation) to measure wall clock time
-    print(f"\n--- Timed forward pass ---")
-    # Compile decoder programs for timed run
-    pred_prog_t, tok_prog_t, dur_prog_t, _ = engine.compile_decoder()
-    engine.progs = {"pred": (pred_prog_t, 0), "joint_tok": (tok_prog_t, 0), "joint_dur": (dur_prog_t, 0)}
-    # Re-upload subsampling input
-    engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
-    engine.dma_to_accelerator_memory(engine.SUB_FLAT_DRAM, flat.contiguous())
-
-    t_start = _time.perf_counter()
-
-    # Subsampling stage 0 (HW)
-    engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
-    engine.dma_to_accelerator_memory(engine.SUB_PATCH_DRAM, patches0.contiguous())
-    engine.program_execute(prog_s0)
-    # Stages 1 & 2 (CPU) — must re-read and re-compute
-    hw_s0_t = read_dram(engine, engine.SUB_OUT0_DRAM, N0 * SC)
-    cpu_s0_t = hw_s0_t.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16)
-    cpu_s1_t = F.relu(F.conv2d(F.conv2d(cpu_s0_t,
-        sd["encoder.pre_encode.conv.2.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.2.bias"].to(torch.bfloat16), stride=2, padding=1, groups=SC),
-        sd["encoder.pre_encode.conv.3.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.3.bias"].to(torch.bfloat16)))
-    cpu_s2_t = F.relu(F.conv2d(F.conv2d(cpu_s1_t,
-        sd["encoder.pre_encode.conv.5.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.5.bias"].to(torch.bfloat16), stride=2, padding=1, groups=SC),
-        sd["encoder.pre_encode.conv.6.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.6.bias"].to(torch.bfloat16)))
-    flat_t = cpu_s2_t.squeeze(0).permute(1, 0, 2).reshape(H2, SC * W2).to(torch.bfloat16).contiguous()
-    if H2 < L_pad:
-        flat_p = torch.zeros(L_pad, 4096, dtype=torch.bfloat16)
-        flat_p[:H2, :] = flat_t
-        flat_t = flat_p
-    engine.dma_to_accelerator_memory(engine.SUB_FLAT_DRAM, flat_t.contiguous())
-    engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
-    engine.program_execute(prog_lin)
-    if L_pad > H2:
-        ef = torch.zeros((L_pad - H2) * D, dtype=torch.bfloat16)
-        ef[0::2] = 0.1; ef[1::2] = -0.1
-        engine.dma_to_accelerator_memory(engine.INPUT_DRAM + H2 * D * bpe, ef)
-    # Encoder (single instruction stream — already compiled, just re-execute)
-    engine.start_execute_from_dram(enc_prog_addr)
-    engine.wait_queue(120.0)
-    t_encoder_done = _time.perf_counter()
-
-    # Decoder
-    engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM,
-        read_dram(engine, engine.INPUT_DRAM, L_pad * D).contiguous())
-    _ = engine.run_decode(engine.ENC_OUT_DRAM, L)
-    t_end = _time.perf_counter()
-
-    audio_duration = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
-    print(f"\n  Wall clock times:")
-    print(f"    Subsampling + Encoder: {t_encoder_done - t_start:.3f}s")
-    print(f"    Decoder:               {t_end - t_encoder_done:.3f}s")
-    print(f"    Total forward pass:    {t_end - t_start:.3f}s")
-    print(f"    Audio duration:        {audio_duration:.1f}s")
-    print(f"    Real-time factor:      {(t_end - t_start) / audio_duration:.2f}x")
-
-    # --- Read final encoder output ---
+    # --- Read encoder output ---
     hw_enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D).reshape(L_pad, D)
 
-    # --- CPU reference: run reference model conformer on same input ---
-    print(f"\n  Computing CPU reference (24-layer conformer)...")
-    REF_DIR = "/home/rohit/apex-compute-ML/simple-llm/src/parakeet"
-    sys.path.insert(0, REF_DIR)
-    from parakeet_modules import ParakeetTDT, make_rel_pos_emb
-    from parakeet_main import load_checkpoint as ref_load_checkpoint, convert_to_bf16
-
-    ref_model = ParakeetTDT()
-    ref_model = ref_load_checkpoint(ref_model, WEIGHTS_PATH)
-    ref_model = convert_to_bf16(ref_model)
-    ref_model.eval()
-    ref_model.stage_for_hardware()
-
-    # Feed HW subsampling output to ref conformer for fair comparison
-    ref_x = hw_lin[:H2].unsqueeze(0).to(torch.bfloat16)  # (1, H2, D)
-    ref_pos = make_rel_pos_emb(H2).to(dtype=ref_x.dtype)
-    with torch.no_grad():
-        for layer in ref_model.encoder.layers:
-            ref_x = layer(ref_x, ref_pos)
-    ref_enc_out = ref_x.squeeze(0)  # (H2, D)
-
-    hw_vs_cpu("encoder_24layers", hw_enc_out[:H2], ref_enc_out, cos_threshold=0.7)
-
-    print(f"\n{'='*60}")
-    print(f"  24-LAYER ENCODER COMPLETE (Toeplitz DW conv, single instruction stream)")
-    print(f"{'='*60}")
-
-    # ==================================================================
-    # Decoder + Timed forward pass
-    # ==================================================================
-    import time as _time
-    import sentencepiece as spm
-
-    # Compile decoder programs
+    # --- Compile decoder ---
     pred_prog, tok_prog, dur_prog, _ = engine.compile_decoder()
     engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0)}
 
-    # --- Full HW decode ---
+    # --- Run full HW decode ---
     engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM, hw_enc_out.contiguous())
     hw_tokens_raw = engine.run_decode(engine.ENC_OUT_DRAM, L)
 
-    # --- CPU decode for comparison ---
-    with torch.no_grad():
-        ref_tokens = ref_model.decode(ref_enc_out.unsqueeze(0))
-
     # --- Decode to text ---
+    import sentencepiece as spm
     sp = spm.SentencePieceProcessor()
     sp.Load(TOKENIZER_PATH)
     vocab_sz = sp.GetPieceSize()
-    hw_text = sp.DecodeIds([t for t in hw_tokens_raw if 0 <= t < vocab_sz])
-    ref_text = sp.DecodeIds([t for t in ref_tokens[0] if 0 <= t < vocab_sz])
-
-    print(f"\n  HW  pipeline: >>> {hw_text}")
-    print(f"  CPU pipeline: >>> {ref_text}")
+    hw_valid = [t for t in hw_tokens_raw if 0 <= t < vocab_sz]
+    hw_text = sp.DecodeIds(hw_valid)
+    print(f"\n  >>> {hw_text}")
 
     # ==================================================================
-    # Timed forward pass
+    # Timed forward pass (subsampling + encoder + decoder)
     # ==================================================================
-    print(f"\n--- Timed forward pass (subsampling + encoder + decoder) ---")
+    import time as _time
+    print(f"\n--- Timed forward pass ---")
 
     t_start = _time.perf_counter()
 
@@ -2060,6 +1963,7 @@ def main():
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
     engine.dma_to_accelerator_memory(engine.SUB_PATCH_DRAM, patches0.contiguous())
     engine.program_execute(prog_s0)
+
     # Stages 1 & 2 (CPU)
     s0 = read_dram(engine, engine.SUB_OUT0_DRAM, N0 * SC)
     s0_4d = s0.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16)
@@ -2075,11 +1979,12 @@ def main():
         sd["encoder.pre_encode.conv.6.bias"].to(torch.bfloat16)))
     fl = s2.squeeze(0).permute(1, 0, 2).reshape(H2, SC * W2).to(torch.bfloat16).contiguous()
     if H2 < L_pad:
-        fp = torch.zeros(L_pad, 4096, dtype=torch.bfloat16); fp[:H2, :] = fl; fl = fp
+        fp = torch.zeros(L_pad, 4096, dtype=torch.bfloat16)
+        fp[:H2, :] = fl
+        fl = fp
     engine.dma_to_accelerator_memory(engine.SUB_FLAT_DRAM, fl.contiguous())
     engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
     engine.program_execute(prog_lin)
-    # Padding rows
     if L_pad > H2:
         ef = torch.zeros((L_pad - H2) * D, dtype=torch.bfloat16)
         ef[0::2] = 0.1; ef[1::2] = -0.1
@@ -2094,25 +1999,19 @@ def main():
     t_enc_done = _time.perf_counter()
 
     # Decoder
-    engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM,
-        read_dram(engine, engine.INPUT_DRAM, L_pad * D).contiguous())
+    enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D)
+    engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM, enc_out.contiguous())
     _ = engine.run_decode(engine.ENC_OUT_DRAM, L)
 
-    t_dec_done = _time.perf_counter()
+    t_end = _time.perf_counter()
 
-    audio_duration = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
-    total = t_dec_done - t_start
-    print(f"    Subsampling:       {t_sub_done - t_start:.3f}s")
-    print(f"    Encoder (24 layers): {t_enc_done - t_sub_done:.3f}s")
-    print(f"    Decoder:           {t_dec_done - t_enc_done:.3f}s")
-    print(f"    Total:             {total:.3f}s")
-    print(f"    Audio duration:    {audio_duration:.1f}s")
-    print(f"    Real-time factor:  {total / audio_duration:.2f}x")
-
-    print(f"\n{'='*60}")
-    print(f"  FULL PIPELINE COMPLETE")
-    print(f"{'='*60}")
-
+    audio_dur = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
+    print(f"\n  Subsampling:    {t_sub_done - t_start:.3f}s")
+    print(f"  Encoder:        {t_enc_done - t_sub_done:.3f}s")
+    print(f"  Decoder:        {t_end - t_enc_done:.3f}s")
+    print(f"  Total:          {t_end - t_start:.3f}s")
+    print(f"  Audio duration: {audio_dur:.1f}s")
+    print(f"  RTF:            {(t_end - t_start) / audio_dur:.2f}x")
 
 
 if __name__ == "__main__":
