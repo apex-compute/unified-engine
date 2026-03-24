@@ -1,0 +1,272 @@
+{
+  "_template_note": "GPT-2 Base (124M) config for gpt2_test.py. 12 layers, 12 heads (MHA), head_dim=64, GELU MLP, LayerNorm with bias, learned positional embeddings (no RoPE), weight-tied lm_head. Vocab padded to 50304 (multiple of 64). BF16 weights (no quantization) for best quality on small model.",
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "TMP_REG": 2
+  },
+  "file_info": {
+    "layer_size": 14200832,
+    "num_layers": 12,
+    "head_dim": 768,
+    "actual_head_dim": 64,
+    "num_kv_heads": 12,
+    "hidden_size": 768,
+    "embedding_vocab": 50304,
+    "group_size": 1,
+    "mlp_elements": 3072,
+    "bytes_per_element": 2
+  },
+  "model": {
+    "max_context_size": 1024,
+    "end_of_turn_token_id": 50256,
+    "decoder_seq_len_buckets": [
+      128,
+      256,
+      384,
+      512,
+      640,
+      768,
+      896,
+      1024
+    ]
+  },
+  "paths": {
+    "weights_bin": "gpt2_bin/weights_gpt2_hf.bin",
+    "local_weights_bin": "gpt2_bin/full_model_weights.bin",
+    "hf_model_dir": "gpt2_bin/gpt2",
+    "hf_model_repo": "openai-community/gpt2",
+    "decoder_program_bin": "gpt2_bin/decoder_program.bin",
+    "decoder_program_meta": "gpt2_bin/decoder_program.json"
+  },
+  "default_prefill_tokens": [
+    464,
+    2068,
+    7586,
+    21831,
+    18045,
+    625,
+    262
+  ],
+  "layers": {
+    "structure": [
+      {
+        "key": "BLK0_LN1_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_LN1_GAMMA"
+      },
+      {
+        "key": "BLK0_LN1_BIAS",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_LN1_BETA"
+      },
+      {
+        "key": "BLK0_ATTN_Q_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_Q_PROJ"
+      },
+      {
+        "key": "BLK0_ATTN_Q_BIAS",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_Q_BIAS"
+      },
+      {
+        "key": "BLK0_ATTN_K_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_K_PROJ"
+      },
+      {
+        "key": "BLK0_ATTN_K_BIAS",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_K_BIAS"
+      },
+      {
+        "key": "BLK0_ATTN_V_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_V_PROJ"
+      },
+      {
+        "key": "BLK0_ATTN_V_BIAS",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_V_BIAS"
+      },
+      {
+        "key": "BLK0_ATTN_OUTPUT_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ"
+      },
+      {
+        "key": "BLK0_ATTN_OUTPUT_BIAS",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_BIAS"
+      },
+      {
+        "key": "BLK0_LN2_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_LN2_GAMMA"
+      },
+      {
+        "key": "BLK0_LN2_BIAS",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_LN2_BETA"
+      },
+      {
+        "key": "BLK0_MLP_FC_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_MLP_FC"
+      },
+      {
+        "key": "BLK0_MLP_FC_BIAS",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_MLP_FC_BIAS"
+      },
+      {
+        "key": "BLK0_MLP_PROJ_WEIGHT",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_MLP_PROJ"
+      },
+      {
+        "key": "BLK0_MLP_PROJ_BIAS",
+        "type": "bf16",
+        "attr": "DRAM_ADDR_LAYER0_MLP_PROJ_BIAS"
+      }
+    ],
+    "non_layer": [
+      {
+        "key": "POS_EMBED",
+        "attr": "DRAM_ADDR_POS_EMBED"
+      },
+      {
+        "key": "OUTPUT_LN_WEIGHT",
+        "attr": "DRAM_ADDR_OUTPUT_LN_GAMMA"
+      },
+      {
+        "key": "OUTPUT_LN_BIAS",
+        "attr": "DRAM_ADDR_OUTPUT_LN_BETA"
+      },
+      {
+        "key": "LM_HEAD_WEIGHT",
+        "attr": "DRAM_ADDR_LM_HEAD"
+      }
+    ]
+  },
+  "regions": {
+    "BLK0_LN1_WEIGHT": {
+      "offset": "0x49B0000",
+      "size": 1536,
+      "type": "bf16"
+    },
+    "BLK0_LN1_BIAS": {
+      "offset": "0x49B1000",
+      "size": 1536,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_Q_WEIGHT": {
+      "offset": "0x49B2000",
+      "size": 1179648,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_Q_BIAS": {
+      "offset": "0x4AD2000",
+      "size": 1536,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_K_WEIGHT": {
+      "offset": "0x4AD3000",
+      "size": 1179648,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_K_BIAS": {
+      "offset": "0x4BF3000",
+      "size": 1536,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_V_WEIGHT": {
+      "offset": "0x4BF4000",
+      "size": 1179648,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_V_BIAS": {
+      "offset": "0x4D14000",
+      "size": 1536,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_OUTPUT_WEIGHT": {
+      "offset": "0x4D15000",
+      "size": 1179648,
+      "type": "bf16"
+    },
+    "BLK0_ATTN_OUTPUT_BIAS": {
+      "offset": "0x4E35000",
+      "size": 1536,
+      "type": "bf16"
+    },
+    "BLK0_LN2_WEIGHT": {
+      "offset": "0x4E36000",
+      "size": 1536,
+      "type": "bf16"
+    },
+    "BLK0_LN2_BIAS": {
+      "offset": "0x4E37000",
+      "size": 1536,
+      "type": "bf16"
+    },
+    "BLK0_MLP_FC_WEIGHT": {
+      "offset": "0x4E38000",
+      "size": 4718592,
+      "type": "bf16"
+    },
+    "BLK0_MLP_FC_BIAS": {
+      "offset": "0x52B8000",
+      "size": 6144,
+      "type": "bf16"
+    },
+    "BLK0_MLP_PROJ_WEIGHT": {
+      "offset": "0x52BA000",
+      "size": 4718592,
+      "type": "bf16"
+    },
+    "BLK0_MLP_PROJ_BIAS": {
+      "offset": "0x573A000",
+      "size": 1536,
+      "type": "bf16"
+    }
+  },
+  "non_layer_regions": {
+    "POS_EMBED": {
+      "offset": "0xEC34000",
+      "size": 1572864
+    },
+    "OUTPUT_LN_WEIGHT": {
+      "offset": "0xEDB4000",
+      "size": 1536
+    },
+    "OUTPUT_LN_BIAS": {
+      "offset": "0xEDB5000",
+      "size": 1536
+    },
+    "LM_HEAD_WEIGHT": {
+      "offset": "0xEDB6000",
+      "size": 77266944
+    }
+  },
+  "special": {
+    "embedding": {
+      "token_embd_offset": "0x0",
+      "token_embd_size": "0x49B0000",
+      "vocab_size": 50304,
+      "embedding_dim": 768,
+      "scale": 1.0
+    },
+    "positional_embedding": {
+      "block_size": 1024,
+      "embedding_dim": 768
+    },
+    "quantization": {
+      "bits": 16,
+      "format": "bf16"
+    },
+    "layer_norm": {
+      "eps": 1e-5
+    }
+  }
+}
