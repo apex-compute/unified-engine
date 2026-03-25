@@ -9,7 +9,7 @@ Usage:
   python parakeet_stream.py --dev xdma0 --port 8000
 """
 
-import json, math, os, sys, threading, time, queue, textwrap, signal
+import json, math, os, sys, io, threading, time, queue, textwrap, signal
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
@@ -25,7 +25,8 @@ import sentencepiece as spm
 from parakeet_test import (
     Parakeet_UnifiedEngine, load_config, compute_mel_spectrogram,
     pad_to_multiple, conv2d_outsize, compile_and_run, read_dram,
-    batch_norm_core_dram, half_step_residual_core_dram, silu_core_dram,
+    batch_norm_core_dram, batch_norm_prepare_tiled,
+    half_step_residual_core_dram, silu_core_dram,
     glu_core_dram, rel_shift_core_dram, chunked_transpose_core_dram,
     URAM_A_BASE, URAM_B_BASE, WEIGHTS_PATH, TOKENIZER_PATH,
 )
@@ -242,45 +243,63 @@ async def _broadcast(text, idx):
 
 import asyncio
 
-def _transcribe_sync(samples):
-    """Run FPGA transcription (blocking). Called from thread pool."""
+# Dedicated output that never gets redirected
+_real_stdout = sys.stdout
+_print_lock = threading.Lock()
+_segment_counter = 0
+
+def _log(msg):
+    """Thread-safe write to the real stdout. Always on its own line."""
+    with _print_lock:
+        _real_stdout.write(msg + "\n")
+        _real_stdout.flush()
+
+def _transcribe_sync(samples, chunk_num):
+    """Run FPGA transcription (blocking). Called from transcription thread."""
+    global _segment_counter
+    dur = len(samples) / SAMPLE_RATE
+    _log(f">> Chunk {chunk_num} received ({dur:.1f}s audio) — transcribing...")
     waveform = torch.from_numpy(samples).unsqueeze(0)
-    return transcribe_chunk(waveform)
-
-async def _process_buffer():
-    global audio_total_samples
-    with audio_lock:
-        if audio_total_samples < CHUNK_SAMPLES:
-            return
-        chunks = list(audio_buffer)
-        audio_buffer.clear()
-        audio_total_samples = 0
-    samples = np.concatenate(chunks).astype(np.float32)
-    # Run in thread pool so we don't block the async event loop
-    text = await asyncio.to_thread(_transcribe_sync, samples)
+    t0 = time.time()
+    # Suppress engine debug prints (redirect Python-level stdout)
+    sys.stdout = io.StringIO()
+    try:
+        text = transcribe_chunk(waveform)
+    finally:
+        sys.stdout = _real_stdout
+    elapsed = time.time() - t0
     if text:
-        with transcript_lock:
-            transcript_segments.append(text)
-            idx = len(transcript_segments) - 1
-        await _broadcast(text, idx)
+        _segment_counter += 1
+        _log(f"<< [{_segment_counter}] {text}  ({elapsed:.1f}s)")
+    else:
+        _log(f"<< [--] (no speech)  ({elapsed:.1f}s)")
+    return text
 
-async def _flush_buffer():
+def _transcription_thread():
+    """Dedicated thread: grab buffered audio in exact 3s chunks, transcribe each."""
     global audio_total_samples
-    with audio_lock:
-        if not audio_buffer: return
-        chunks = list(audio_buffer)
-        audio_buffer.clear()
-        audio_total_samples = 0
-    samples = np.concatenate(chunks).astype(np.float32)
-    text = await asyncio.to_thread(_transcribe_sync, samples)
-    if text:
-        with transcript_lock:
-            transcript_segments.append(text)
-            idx = len(transcript_segments) - 1
-        await _broadcast(text, idx)
+    chunk_num = 0
+    pending = np.array([], dtype=np.float32)
+    while True:
+        time.sleep(0.1)  # poll frequently, process only when we have 3s
+        with audio_lock:
+            if audio_buffer:
+                pending = np.concatenate([pending] + audio_buffer)
+                audio_buffer.clear()
+                audio_total_samples = 0
+        # Process all complete 3s chunks
+        while len(pending) >= CHUNK_SAMPLES:
+            samples = pending[:CHUNK_SAMPLES]
+            pending = pending[CHUNK_SAMPLES:]
+            chunk_num += 1
+            text = _transcribe_sync(samples, chunk_num)
+            if text:
+                with transcript_lock:
+                    transcript_segments.append(text)
 
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket):
+    """Just buffer audio — never blocks on transcription."""
     global audio_total_samples
     await ws.accept()
     try:
@@ -292,10 +311,8 @@ async def ws_audio(ws: WebSocket):
             with audio_lock:
                 audio_buffer.append(arr)
                 audio_total_samples += len(arr)
-            await _process_buffer()
     except WebSocketDisconnect: pass
     except: pass
-    finally: await _flush_buffer()
 
 @app.websocket("/ws/transcript")
 async def ws_transcript(ws: WebSocket):
@@ -422,8 +439,8 @@ def main():
     cfg = load_config()
     set_dma_device(args.dev)
 
-    # Fixed L_pad for streaming
-    L_pad = 192
+    # Fixed L_pad for streaming (64 fits 3s chunks: L≈38 frames)
+    L_pad = 64
     n_mels = cfg["encoder"]["n_mels"]
 
     # Init engine
@@ -489,22 +506,45 @@ def main():
         toeplitz_addrs.append(addr)
     print(f"  Toeplitz staged: {engine.get_params_dram_usage()/1024**2:.0f} MB")
 
+    # Pre-tile attention biases for bulk ops
+    engine.prepare_attention_tiled_biases(L_pad)
+
+    # Pre-tile BN params for bulk ops
+    bn_tiled = []
+    for layer_idx in range(engine.num_layers):
+        la_i = engine.layer_addrs[layer_idx]
+        s_addr, sh_addr = batch_norm_prepare_tiled(engine, D, L_pad,
+            la_i["CONV_BN_SCALE"], la_i["CONV_BN_SHIFT"])
+        bn_tiled.append((s_addr, sh_addr))
+    print(f"  Bulk params staged: {engine.get_params_dram_usage()/1024**2:.0f} MB")
+
     # Compile encoder (single instruction stream)
     print("  Compiling 24-layer encoder...")
     def emit_all_24_layers():
         for layer_idx in range(engine.num_layers):
             la = engine.layer_addrs[layer_idx]
             t_addr = toeplitz_addrs[layer_idx]
-            # FF1
+            # FF1 (K-split)
+            FF_HALF = FF // 2
             engine.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
-            engine.matmat_mul_core(M=L_pad, K=D, N=FF,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1"],
+            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_LO"],
                 OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM, silu_enable=True)
-            engine.matmat_mul_core(M=L_pad, K=FF, N=D,
-                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2"],
+            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_HI"],
+                OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2_LO"],
                 OUTPUT_DRAM_ADDR=engine.FF_OUT_DRAM)
+            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF1_W2_HI"],
+                OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM)
+            engine.accelerator_memory_to_sram(engine.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
+            engine.accelerator_memory_to_sram(engine.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
+            engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
+            engine.sram_to_accelerator_memory(URAM_A_BASE, engine.FF_OUT_DRAM, L_pad * D)
             half_step_residual_core_dram(engine, M=L_pad, N=D,
                 RESIDUAL_DRAM_ADDR=engine.INPUT_DRAM, FF_DRAM_ADDR=engine.FF_OUT_DRAM,
                 OUTPUT_DRAM_ADDR=engine.INPUT_DRAM)
@@ -526,10 +566,8 @@ def main():
                 h_off = h * dk * bpe
                 engine.accelerator_memory_to_sram(engine.Q_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.accelerator_memory_to_sram(la["ATTN_BIAS_U"] + h_off, URAM_B_BASE, dk)
-                for row in range(L_pad):
-                    engine.eltwise_add_core(URAM_A_BASE + row * dk * bpe, URAM_B_BASE,
-                        URAM_A_BASE + row * dk * bpe, dk)
+                engine.accelerator_memory_to_sram(la["ATTN_BIAS_U_TILED"][h], URAM_B_BASE, L_pad * dk)
+                engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * dk)
                 engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_A_DRAM, L_pad * dk)
                 engine.accelerator_memory_to_sram(engine.K_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
@@ -539,10 +577,8 @@ def main():
                     OUTPUT_DRAM_ADDR=engine.SCORE_DRAM)
                 engine.accelerator_memory_to_sram(engine.Q_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.accelerator_memory_to_sram(la["ATTN_BIAS_V"] + h_off, URAM_B_BASE, dk)
-                for row in range(L_pad):
-                    engine.eltwise_add_core(URAM_A_BASE + row * dk * bpe, URAM_B_BASE,
-                        URAM_A_BASE + row * dk * bpe, dk)
+                engine.accelerator_memory_to_sram(la["ATTN_BIAS_V_TILED"][h], URAM_B_BASE, L_pad * dk)
+                engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * dk)
                 engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_A_DRAM, L_pad * dk)
                 engine.accelerator_memory_to_sram(engine.POS_PROJ_DRAM + h_off, URAM_A_BASE, P_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
@@ -557,12 +593,9 @@ def main():
                 engine.accelerator_memory_to_sram(engine.SCORE_DRAM, URAM_A_BASE, score_elems)
                 engine.accelerator_memory_to_sram(engine.REL_SHIFT_DRAM, URAM_B_BASE, score_elems)
                 engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, score_elems)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.SCORE_DRAM, score_elems)
-                engine.accelerator_memory_to_sram(engine.SCORE_DRAM, URAM_A_BASE, score_elems)
-                for row in range(L_pad):
-                    engine.broadcast_mul(scalar=inv_sqrt_dk,
-                        sram_start_addr=URAM_A_BASE + row * L_pad * bpe,
-                        sram_wb_addr=URAM_A_BASE + row * L_pad * bpe, element_size=L_pad)
+                engine.broadcast_mul(scalar=inv_sqrt_dk,
+                    sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE,
+                    element_size=score_elems)
                 engine.sram_to_accelerator_memory(URAM_A_BASE, engine.SCORE_DRAM, score_elems)
                 engine.matmat_mul_core(M=L_pad, K=L_pad, N=L_pad,
                     A_DRAM_ADDR=engine.SCORE_DRAM, B_DRAM_ADDR=engine.IDENTITY_LPAD_DRAM,
@@ -612,7 +645,9 @@ def main():
                     OUTPUT_DRAM_ADDR=engine.CONV_DW_DRAM + ch * L_pad * bpe)
             batch_norm_core_dram(engine, C=D, L=L_pad,
                 A_DRAM_ADDR=engine.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=engine.CONV_DW_DRAM,
-                SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"])
+                SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"],
+                tiled_scale_addr=bn_tiled[layer_idx][0],
+                tiled_shift_addr=bn_tiled[layer_idx][1])
             silu_core_dram(engine, M=D, N=L_pad,
                 A_DRAM_ADDR=engine.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=engine.CONV_OUT_DRAM,
                 IDENTITY_DRAM_ADDR=engine.IDENTITY_LPAD_DRAM)
@@ -627,16 +662,26 @@ def main():
             engine.accelerator_memory_to_sram(engine.CONV_OUT_DRAM, URAM_B_BASE, L_pad * D)
             engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
             engine.sram_to_accelerator_memory(URAM_A_BASE, engine.INPUT_DRAM, L_pad * D)
-            # FF2
+            # FF2 (K-split)
             engine.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
-            engine.matmat_mul_core(M=L_pad, K=D, N=FF,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1"],
+            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_LO"],
                 OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM, silu_enable=True)
-            engine.matmat_mul_core(M=L_pad, K=FF, N=D,
-                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2"],
+            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_HI"],
+                OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2_LO"],
                 OUTPUT_DRAM_ADDR=engine.FF_OUT_DRAM)
+            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF2_W2_HI"],
+                OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM)
+            engine.accelerator_memory_to_sram(engine.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
+            engine.accelerator_memory_to_sram(engine.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
+            engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
+            engine.sram_to_accelerator_memory(URAM_A_BASE, engine.FF_OUT_DRAM, L_pad * D)
             half_step_residual_core_dram(engine, M=L_pad, N=D,
                 RESIDUAL_DRAM_ADDR=engine.INPUT_DRAM, FF_DRAM_ADDR=engine.FF_OUT_DRAM,
                 OUTPUT_DRAM_ADDR=engine.INPUT_DRAM)
@@ -667,6 +712,9 @@ def main():
     except KeyboardInterrupt:
         print("\nAborted.")
         return
+
+    # Start transcription thread (fires every CHUNK_SECONDS, grabs audio, transcribes)
+    threading.Thread(target=_transcription_thread, daemon=True).start()
 
     # Start server
     threading.Thread(target=lambda: uvicorn.run(app, host="0.0.0.0", port=server_port,
