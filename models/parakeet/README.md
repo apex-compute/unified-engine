@@ -410,7 +410,7 @@ the pointwise conv2 matmul.
 
 **Toeplitz convolution matrix**: A 9-tap 1D convolution
 `y[t] = sum_{k=0}^{8} w[k] * x[t+k-4]` is equivalent to
-`y = T @ x` where T is an `(L, L)` banded matrix:
+`y = x @ T` where T is an `(L, L)` banded matrix:
 
 ```
 T = | w4  w5  w6  w7  w8   0   0  ...  0  |
@@ -423,6 +423,12 @@ T = | w4  w5  w6  w7  w8   0   0  ...  0  |
     |  0   0  ...  w0  w1  w2  w3  w4  w5  |
     |  0   0  ...   0  w0  w1  w2  w3  w4  |
 ```
+
+Formally: `T[i,j] = kernel[j-i+4]` when `|j-i| <= 4`, and `0` otherwise.
+This converts the 1D convolution into a standard matrix multiply, which maps
+directly onto the FPGA's matmul hardware — no dedicated convolution logic is
+needed. The trade-off is memory: each Toeplitz matrix is `(L_pad, L_pad)`, mostly
+zeros outside the 9 non-zero diagonals, but the matmul unit processes it uniformly.
 
 Each channel has different weights, so there are 1024 different Toeplitz
 matrices, each `(L_pad, L_pad)`. Pre-built once at initialization.
@@ -442,6 +448,24 @@ There are **3 compiled FPGA programs**:
 | `pred_prog` | 2-layer LSTM predictor step | ~50 | Host must save/restore LSTM state on blank |
 | `tok_prog` | Joint network + token logits + argmax | ~20 | Host must read argmax before deciding next action |
 | `dur_prog` | Duration logits + argmax | ~5 | Only needed after tok_prog determines the token |
+
+**The core issue is data-dependent control flow.** The host must inspect FPGA
+output at two decision points before proceeding:
+
+1. **After the predictor** (`pred_prog`): The host saves LSTM hidden/cell state
+   *before* running the predictor. If the predicted token turns out to be blank,
+   the LSTM state must be rolled back to undo the update — impossible if the
+   predictor were fused with subsequent stages, since the states would already
+   be overwritten before the host knew the result.
+2. **After the joint/token network** (`tok_prog`): The token identity determines
+   whether LSTM state is restored *before* computing the duration. On blank
+   tokens the sequence is: read token argmax -> restore LSTM -> run `dur_prog`.
+   On real tokens: keep updated LSTM -> run `dur_prog`. Fusing `tok_prog` and
+   `dur_prog` would compute the duration before the host could intervene with
+   the restore, producing results based on the wrong joint state.
+
+In short: each program boundary is a point where the host must read a result
+and make a decision that affects the next step.
 
 #### Execution Flow
 
@@ -534,23 +558,19 @@ Host (CPU)                              FPGA
     |    |
 ```
 
-#### Why 3 separate programs?
+#### Why 3 separate programs? (recap)
 
-**pred_prog must be separate** because on blank tokens, the host needs to
-**undo** the LSTM state update. If the predictor were merged with the joint
-network, the LSTM hidden/cell states would already be corrupted before the
-host knew the result was blank. By running the predictor first, the host
-can save state beforehand and restore it if needed.
+See the summary above the execution flow diagram for the full rationale.
+In brief, each boundary is a host decision point:
 
-**tok_prog and dur_prog are separate** because the token result determines
-whether LSTM state gets restored *before* the duration is read. On a blank
-token, the sequence is: read token argmax -> restore LSTM -> run dur_prog.
-If they were one program, the duration would be computed with the wrong
-(un-restored) joint state.
+- **pred_prog -> tok_prog**: Host must save LSTM state before and potentially
+  restore it after (on blank tokens).
+- **tok_prog -> dur_prog**: Host must read the token argmax and conditionally
+  restore LSTM state before the duration is computed.
 
-**tok_prog could theoretically include dur_prog** for the non-blank path
-(where no restore is needed), but keeping them separate simplifies the
-single code path.
+Note: `tok_prog` could theoretically include `dur_prog` for the non-blank path
+(where no restore is needed), but keeping them separate simplifies the code
+to a single path regardless of token type.
 
 #### LSTM Gate Math (inside pred_prog)
 

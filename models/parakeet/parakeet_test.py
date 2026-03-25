@@ -1039,9 +1039,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
             # ===== FF1 (half-step residual, K-split) =====
             FF_HALF = FF // 2
-            self.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
+            self.layer_norm_core_dram(M=L_pad, N=D,A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
             # Up-proj split: two (L_pad, D) @ (D, FF/2) = (L_pad, FF/2) with SiLU
             self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
                 A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_LO"],
@@ -1068,9 +1066,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             total_flops += 2 * L_pad * D
 
             # ===== Self-attention =====
-            self.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_ATTN_WEIGHT"], BETA_DRAM_ADDR=la["LN_ATTN_BIAS"])
+            self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_ATTN_WEIGHT"], BETA_DRAM_ADDR=la["LN_ATTN_BIAS"])
             self.matmat_mul_core(M=L_pad, K=D, N=D,
                 A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_Q_W"], OUTPUT_DRAM_ADDR=self.Q_DRAM)
             self.matmat_mul_core(M=L_pad, K=D, N=D,
@@ -1150,9 +1146,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.sram_to_accelerator_memory(URAM_A_BASE, self.ATTN_OUT_DRAM + h_off, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
             # Output projection + residual
-            self.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=self.ATTN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_OUT_W"],
-                OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
+            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.ATTN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_OUT_W"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
             total_flops += 2 * L_pad * D * D
             self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
             self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_B_BASE, L_pad * D)
@@ -1161,48 +1155,24 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             total_flops += L_pad * D
 
             # ===== Conv module =====
-            self.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_CONV_WEIGHT"], BETA_DRAM_ADDR=la["LN_CONV_BIAS"])
-            self.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1A_W"],
-                OUTPUT_DRAM_ADDR=self.CONV_A_DRAM)
-            self.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1B_W"],
-                OUTPUT_DRAM_ADDR=self.CONV_B_DRAM)
+            self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_CONV_WEIGHT"], BETA_DRAM_ADDR=la["LN_CONV_BIAS"])
+            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1A_W"], OUTPUT_DRAM_ADDR=self.CONV_A_DRAM)
+            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1B_W"], OUTPUT_DRAM_ADDR=self.CONV_B_DRAM)
             total_flops += 2 * 2 * L_pad * D * D
-            glu_core_dram(self, M=L_pad, C=D,
-                A_DRAM_ADDR=self.CONV_A_DRAM, B_DRAM_ADDR=self.CONV_B_DRAM,
-                OUTPUT_DRAM_ADDR=self.CONV_A_DRAM, IDENTITY_DRAM_ADDR=self.w["IDENTITY_1024"])
+            glu_core_dram(self, M=L_pad, C=D, A_DRAM_ADDR=self.CONV_A_DRAM, B_DRAM_ADDR=self.CONV_B_DRAM, OUTPUT_DRAM_ADDR=self.CONV_A_DRAM, IDENTITY_DRAM_ADDR=self.w["IDENTITY_1024"])
             # Transpose (L_pad, D) -> (D, L_pad) for channel-first DW conv.
-            chunked_transpose_core_dram(self, M=L_pad, N=D,
-                input_dram_addr=self.CONV_A_DRAM, output_dram_addr=self.CONV_T_DRAM,
-                identity_dram_addr=self.w["IDENTITY_64"],
-                temp_dram_addr=self.PERMUTE_TEMP_DRAM)
+            chunked_transpose_core_dram(self, M=L_pad, N=D, input_dram_addr=self.CONV_A_DRAM, output_dram_addr=self.CONV_T_DRAM, identity_dram_addr=self.w["IDENTITY_64"], temp_dram_addr=self.PERMUTE_TEMP_DRAM)
             # DW Conv1d via Toeplitz: per-channel matmul(1, L_pad) @ T(L_pad, L_pad)
             t_addr = toeplitz_addrs[layer_idx]
             for ch in range(D):
-                self.matmat_mul_core(M=1, K=L_pad, N=L_pad,
-                    A_DRAM_ADDR=self.CONV_T_DRAM + ch * L_pad * bpe,
-                    B_DRAM_ADDR=t_addr + ch * L_pad * L_pad * bpe,
-                    OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM + ch * L_pad * bpe)
+                self.matmat_mul_core(M=1, K=L_pad, N=L_pad, A_DRAM_ADDR=self.CONV_T_DRAM + ch * L_pad * bpe, B_DRAM_ADDR=t_addr + ch * L_pad * L_pad * bpe, OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM + ch * L_pad * bpe)
             total_flops += 2 * 9 * D * L_pad
-            batch_norm_core_dram(self, C=D, L=L_pad,
-                A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM,
-                SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"],
-                tiled_scale_addr=bn_tiled[layer_idx][0],
-                tiled_shift_addr=bn_tiled[layer_idx][1])
-            silu_core_dram(self, M=D, N=L_pad,
-                A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM,
-                IDENTITY_DRAM_ADDR=self.IDENTITY_LPAD_DRAM)
+            batch_norm_core_dram(self, C=D, L=L_pad, A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM, SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"], tiled_scale_addr=bn_tiled[layer_idx][0], tiled_shift_addr=bn_tiled[layer_idx][1])
+            silu_core_dram(self, M=D, N=L_pad, A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM, IDENTITY_DRAM_ADDR=self.IDENTITY_LPAD_DRAM)
             # Transpose (D, L_pad) -> (L_pad, D) from SiLU output.
-            chunked_transpose_core_dram(self, M=D, N=L_pad,
-                input_dram_addr=self.CONV_OUT_DRAM, output_dram_addr=self.CONV_T_DRAM,
-                identity_dram_addr=self.w["IDENTITY_64"],
+            chunked_transpose_core_dram(self, M=D, N=L_pad, input_dram_addr=self.CONV_OUT_DRAM, output_dram_addr=self.CONV_T_DRAM, identity_dram_addr=self.w["IDENTITY_64"],
                 temp_dram_addr=self.PERMUTE_TEMP_DRAM)
-            self.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=self.CONV_T_DRAM, B_DRAM_ADDR=la["CONV_PW2_W"],
-                OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM)
+            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.CONV_T_DRAM, B_DRAM_ADDR=la["CONV_PW2_W"], OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM)
             total_flops += 2 * L_pad * D * D
             self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
             self.accelerator_memory_to_sram(self.CONV_OUT_DRAM, URAM_B_BASE, L_pad * D)
@@ -1211,24 +1181,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             total_flops += L_pad * D
 
             # ===== FF2 (half-step residual, K-split) =====
-            self.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
+            self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
             # Up-proj split
-            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_LO"],
-                OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
-            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_HI"],
-                OUTPUT_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_LO"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
+            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_HI"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
             total_flops += 2 * L_pad * D * FF
             # Down-proj split + accumulate
-            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
-                A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2_LO"],
-                OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
-            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
-                A_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF2_W2_HI"],
-                OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM)
+            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2_LO"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
+            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF2_W2_HI"], OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM)
             self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
             self.accelerator_memory_to_sram(self.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
             self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
@@ -1713,6 +1673,21 @@ def main():
     print(f"  FULL PIPELINE COMPLETE")
     print(f"{'='*60}")
 
+    # --- Original NeMo model inference (CPU/GPU) for comparison ---
+    import logging, warnings, io, contextlib
+    for name in ["nemo_logger", "nemo", "pytorch_lightning", "lightning_fabric",
+                 "transformers", "filelock", "huggingface_hub"]:
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+    warnings.filterwarnings("ignore")
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        import nemo.collections.asr as nemo_asr
+        nemo_path = os.path.join(SCRIPT_DIR, "parakeet_bin", "models--nvidia--parakeet-tdt-0.6b-v3",
+                                 "snapshots", "6d590f77001d318fb17a0b5bf7ee329a91b52598",
+                                 "parakeet-tdt-0.6b-v3.nemo")
+        model = nemo_asr.models.ASRModel.restore_from(nemo_path)
+        transcript = model.transcribe([audio_path])
+    print(f"\n  >>> NeMo (original model): {transcript[0].text}")
 
 
 if __name__ == "__main__":
