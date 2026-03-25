@@ -60,7 +60,6 @@ def batch_norm_fuse_params(ue: UnifiedEngine, bn_weight, bn_bias, bn_mean, bn_va
     ue.allocate_params_dram(C * 2)
     ue.dma_write(DMA_DEVICE_H2C, shift_addr, shift, C * 2)
     return scale_addr, shift_addr, C
-
 def batch_norm_prepare_tiled(ue, C, L, SCALE_DRAM_ADDR, SHIFT_DRAM_ADDR):
     """Pre-tile BN scale/shift vectors into (C, L) matrices for bulk ops.
     Returns (tiled_scale_addr, tiled_shift_addr).
@@ -83,7 +82,6 @@ def batch_norm_prepare_tiled(ue, C, L, SCALE_DRAM_ADDR, SHIFT_DRAM_ADDR):
     ue.allocate_params_dram(C * L * bpe)
     ue.dma_to_accelerator_memory(shift_tiled_addr, shift_tiled)
     return scale_tiled_addr, shift_tiled_addr
-
 def batch_norm_core_dram(ue: UnifiedEngine, C: int, L: int,
                          A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                          SCALE_DRAM_ADDR: int, SHIFT_DRAM_ADDR: int,
@@ -121,7 +119,6 @@ def batch_norm_core_dram(ue: UnifiedEngine, C: int, L: int,
         ue.broadcast_mul(scalar=scale_host[c].float().item(), sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=L)
         ue.broadcast_add(scalar=shift_host[c].float().item(), sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=L)
         ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + c * row_bytes, L)
-
 def allocate_identity(ue: UnifiedEngine, N: int):
     """Allocate and write an (N, N) bf16 identity matrix to DRAM. Call once at init.
     Returns DRAM address. Reused by tanh_core_dram and glu_core_dram.
@@ -132,7 +129,6 @@ def allocate_identity(ue: UnifiedEngine, N: int):
     ue.allocate_params_dram(N * N * 2)
     ue.dma_write(DMA_DEVICE_H2C, addr, identity, N * N * 2)
     return addr
-
 def tanh_core_dram(ue: UnifiedEngine, M: int, N: int,
                    A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                    IDENTITY_DRAM_ADDR: int) -> None:
@@ -162,7 +158,6 @@ def tanh_core_dram(ue: UnifiedEngine, M: int, N: int,
         ue.broadcast_mul(scalar=2.0, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
         ue.broadcast_add(scalar=-1.0, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
         ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, N)
-
 def silu_core_dram(ue: UnifiedEngine, M: int, N: int,
                    A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                    IDENTITY_DRAM_ADDR: int) -> None:
@@ -184,7 +179,6 @@ def silu_core_dram(ue: UnifiedEngine, M: int, N: int,
     ue.accelerator_memory_to_sram(OUTPUT_DRAM_ADDR, URAM_B_BASE, total_elems)
     ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
     ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
-
 def glu_core_dram(ue: UnifiedEngine, M: int, C: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int) -> None:
     """Emit instructions for GLU: output = a * sigmoid(b).
     Assumes PW Conv1 was split into two matmuls writing a and b separately:
@@ -203,7 +197,6 @@ def glu_core_dram(ue: UnifiedEngine, M: int, C: int, A_DRAM_ADDR: int, B_DRAM_AD
     ue.accelerator_memory_to_sram(B_DRAM_ADDR, URAM_B_BASE, total_elems)
     ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
     ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
-
 def rel_shift_core_dram(ue: UnifiedEngine, L: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                         input_row_stride: int = None) -> None:
     """Emit instructions for rel_shift: extract (L, L) from (L, P_pad) positional scores.
@@ -226,7 +219,6 @@ def rel_shift_core_dram(ue: UnifiedEngine, L: int, INPUT_DRAM_ADDR: int, OUTPUT_
         dst = OUTPUT_DRAM_ADDR + i * L * bpe
         ue.accelerator_memory_to_sram(src, URAM_A_BASE, L)
         ue.sram_to_accelerator_memory(URAM_A_BASE, dst, L)
-
 def chunked_transpose_core_dram(ue: UnifiedEngine, M: int, N: int,
                                  input_dram_addr: int, output_dram_addr: int,
                                  identity_dram_addr: int, temp_dram_addr: int) -> None:
@@ -272,8 +264,6 @@ def chunked_transpose_core_dram(ue: UnifiedEngine, M: int, N: int,
             output_dram_addr=output_dram_addr + col_start * M_aligned * bpe,
             params_dram_addr=identity_dram_addr,
             temp_dram_start=temp_dram_addr + M * chunk_cols_pad * bpe)
-
-
 def half_step_residual_core_dram(ue: UnifiedEngine, M: int, N: int,
                                  RESIDUAL_DRAM_ADDR: int, FF_DRAM_ADDR: int,
                                  OUTPUT_DRAM_ADDR: int) -> None:
@@ -300,7 +290,6 @@ def half_step_residual_core_dram(ue: UnifiedEngine, M: int, N: int,
                         element_size=total_elems)
     # Write result
     ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
-
 def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                              params_dram_addr, temp_dram_start):
     """Permute via DMA gather + batched transpose decomposition."""
@@ -467,7 +456,6 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
 
     return (2, output_shape)
-
 # ---------------------------------------------------------------------------
 # Config loader
 # ---------------------------------------------------------------------------
@@ -477,14 +465,11 @@ def load_config(config_path=None):
         config_path = os.path.join(SCRIPT_DIR, "parakeet_config.json")
     with open(config_path, "r") as f:
         return json.load(f)
-
 def pad_to_multiple(n, multiple):
     return ((n + multiple - 1) // multiple) * multiple
-
 def conv2d_outsize(H, k=3, s=2, p=1):
     """Output spatial dim for conv2d/pool with given kernel, stride, padding."""
     return (H + 2 * p - k) // s + 1
-
 def hw_vs_cpu(name, hw_tensor, ref_tensor, cos_threshold=0.99):
     """Compare HW result to CPU reference. Asserts on NaN or cosine failure."""
     h = hw_tensor.float().flatten()
@@ -500,7 +485,6 @@ def hw_vs_cpu(name, hw_tensor, ref_tensor, cos_threshold=0.99):
     assert cos >= cos_threshold, (
         f"MISMATCH {name}: cos={cos:.6f} < {cos_threshold}  "
         f"mae={mae:.6f}  max_err={max_err:.6f}")
-
 def rel_shift(x):
     """Relative position shift (skew trick): (B, H, T, 2T-1) -> (B, H, T, T)."""
     B, H, T, P = x.shape
@@ -510,7 +494,6 @@ def rel_shift(x):
     x = x_padded[:, :, 1:].reshape(B, H, T, P)
     x = x[:, :, :, :P // 2 + 1]
     return x
-
 def compile_and_run(engine, emit_fn):
     """Compile a block of HW instructions and execute it."""
     engine.clear_capture_buffer()
@@ -523,13 +506,11 @@ def compile_and_run(engine, emit_fn):
     engine.write_captured_instructions_to_dram(prog)
     engine.allocate_program_dram(engine.get_capture_instruction_size_bytes())
     engine.program_execute(prog)
-
 def read_dram(engine, addr, numel):
     """Read bf16 tensor from accelerator DRAM."""
     buf = torch.zeros(numel, dtype=torch.bfloat16)
     engine.dma_read(DMA_DEVICE_C2H, addr, buf, numel * engine.bytes_per_element)
     return buf
-
 # ---------------------------------------------------------------------------
 # Host-side mel spectrogram (runs on CPU, not accelerator)
 # ---------------------------------------------------------------------------
@@ -562,7 +543,6 @@ def compute_mel_spectrogram(waveform, cfg, ckpt_sd=None):
     std = torch.clamp(torch.sqrt(var), min=1e-5)
     mel = (mel - mean) / std
     return mel.transpose(1, 2).to(torch.bfloat16)      # (B, T_mel, 128)
-
 # ---------------------------------------------------------------------------
 # Parakeet Unified Engine
 # ---------------------------------------------------------------------------
@@ -571,8 +551,6 @@ def compute_mel_spectrogram(waveform, cfg, ckpt_sd=None):
 PARAKEET_PARAMS_BASE  = 0x00000000   # ~3 GB for weights + identities + Toeplitz DW conv matrices
 PARAKEET_TENSOR_BASE  = 0xBB000000   # ~592 MB for intermediate activations
 PARAKEET_PROGRAM_BASE = 0xE0000000   # 512 MB for compiled instruction programs
-
-
 class Parakeet_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine subclass for Parakeet-TDT-0.6B."""
 
@@ -615,11 +593,9 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.max_symbols_per_step = jnt["max_symbols_per_step"]
         self.block_size = hw["block_size"]      # 64
         self.bytes_per_element = enc["bytes_per_element"]
-
     # XDMA driver has a transfer size limit (~16-64MB per os.write call).
     # Chunk large DMA uploads to avoid silent failures.
     DMA_CHUNK_BYTES = 1 * 1024 * 1024  # 1 MB per chunk
-
     def dma_to_accelerator_memory(self, dma_address, data):
         """Chunked DMA write that handles large transfers."""
         assert data.dtype == torch.bfloat16, "Data must be in bf16 format"
@@ -636,7 +612,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             addr = dma_address + offset * 2
             self.dma_write(DMA_DEVICE_H2C, addr, chunk, chunk_elems * 2)
             offset += chunk_elems
-
     def _alloc_write(self, tensor):
         """Allocate params DRAM, write bf16 tensor via chunked DMA. Returns DRAM address."""
         t = tensor.to(torch.bfloat16).contiguous()
@@ -645,7 +620,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.allocate_params_dram(nbytes)
         self.dma_to_accelerator_memory(addr, t)
         return addr
-
     def _stage_dw_conv1d(self, weight):
         """(C,1,K) -> (C,64) im2col padded."""
         C, _, K = weight.shape
@@ -654,13 +628,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         w_padded = torch.zeros(C, padded_K, dtype=torch.bfloat16)
         w_padded[:, :K] = w_flat
         return self._alloc_write(w_padded)
-
     def _split_pw_conv1(self, weight):
         """(2D,D,1) -> (addr_a, addr_b) each (D,D)."""
         w = weight.squeeze(-1).to(torch.bfloat16)
         D = w.shape[0] // 2
         return self._alloc_write(w[:D].contiguous()), self._alloc_write(w[D:].contiguous())
-
     def _stage_sub_conv2d(self, weight, out_ch, in_ch, k=3):
         """Stage 2D conv weight for im2col: (out_ch, in_ch, k, k) -> (out_ch, k*k*in_ch padded to 64)."""
         w = weight.to(torch.bfloat16).reshape(out_ch, -1)
@@ -669,7 +641,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         w_pad = torch.zeros(out_ch, padded, dtype=torch.bfloat16)
         w_pad[:, :flat_k] = w
         return self._alloc_write(w_pad), flat_k, padded
-
     @staticmethod
     def ensure_model_files():
         """Download Parakeet-TDT-0.6B from HuggingFace if not present."""
@@ -698,7 +669,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         if not os.path.exists(TOKENIZER_PATH):
             sys.exit(f"Failed to extract tokenizer.model")
         print("  Download complete.")
-
     def weight_init(self):
         """Load checkpoint, stage all weights to DRAM."""
         self.ensure_model_files()
@@ -823,7 +793,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             f"{params_limit/1024**2:.0f} MB budget. "
             f"Params bleed into tensor region — corrupts activations!"
         )
-
     def tensor_init(self, L_pad):
         """Allocate intermediate DRAM buffers."""
         # Zero entire tensor DRAM region up front to prevent stale NaN.
@@ -911,8 +880,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             f"{tensor_limit/1024**2:.0f} MB budget. "
             f"Tensors bleed into program region!"
         )
-
-
     def compile_sub_stage0(self, N0, padded_k, SC):
         """HW program: im2col patches(N0,64) @ W(64,256) + bias, ReLU. Patches pre-built on host."""
         self.clear_capture_buffer()
@@ -928,7 +895,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
         return prog, 2 * N0 * padded_k * SC
-
     def compile_sub_stage_dw_pw(self, N_in, N_out, SC, dw_patch_addr, dw_w_key, dw_b_key, pw_w_key, pw_b_key):
         """HW program: DW patches(N_out,64) @ kernels via per-channel matmul, then PW(N_out,256)@(256,256)+bias+ReLU.
         DW im2col patches pre-built on host at dw_patch_addr as (SC, N_out_pad, 64).
@@ -985,7 +951,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
         return prog, flops
-
     def compile_sub_linear(self, L_pad):
         """HW program: flatten linear (L_pad, 4096) @ (4096, 1024) + bias -> INPUT_DRAM."""
         D = self.d_model
@@ -1001,7 +966,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
         return prog, 2 * L_pad * 4096 * D
-
     def _im2col_conv2d(self, input_tensor, H_in, W_in, stride=2, padding=1):
         """Host-side: build im2col patch matrix for 3x3 conv2d using F.unfold (vectorized).
         input_tensor: (H_in, W_in) or (C, H_in, W_in) bf16.
@@ -1029,7 +993,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             patches = torch.zeros(C, N_pad, 64, dtype=torch.bfloat16)
             patches[:, :N, :9] = cols.permute(0, 2, 1).to(torch.bfloat16)
             return patches, H_out, W_out
-
     def prepare_attention_tiled_biases(self, L_pad):
         """Pre-tile attention bias_u and bias_v for bulk eltwise_add.
         For each layer and head, creates (L_pad, dk) tiled bias in DRAM.
@@ -1052,23 +1015,18 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     addr = self._alloc_write(tiled)
                     head_addrs.append(addr)
                 la[tiled_key] = head_addrs
-
-    def compile_encoder(self, L_pad):
-        """Monolithic encoder compile: all conformer layers inline. Returns (prog, flops)."""
+    def compile_encoder(self, L_pad, toeplitz_addrs, bn_tiled):
+        """Compile full 24-layer conformer encoder. Returns (program_addr, program_bytes).
+        Must call prepare_attention_tiled_biases(L_pad) before this.
+        Args:
+            L_pad: padded sequence length
+            toeplitz_addrs: list of 24 DRAM addresses for Toeplitz DW conv matrices
+            bn_tiled: list of 24 (tiled_scale_addr, tiled_shift_addr) tuples
+        """
         D, FF, H_heads, dk = self.d_model, self.ff_dim, self.num_heads, self.head_dim
         bpe = self.bytes_per_element
         P = 2 * L_pad - 1
         P_pad = pad_to_multiple(P, self.block_size)
-
-        self.prepare_attention_tiled_biases(L_pad)
-
-        # Pre-tile BN params for bulk ops
-        bn_tiled = []
-        for layer_idx in range(self.num_layers):
-            la = self.layer_addrs[layer_idx]
-            s_addr, sh_addr = batch_norm_prepare_tiled(self, D, L_pad,
-                la["CONV_BN_SCALE"], la["CONV_BN_SHIFT"])
-            bn_tiled.append((s_addr, sh_addr))
 
         self.clear_capture_buffer()
         self.start_capture()
@@ -1221,17 +1179,13 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 input_dram_addr=self.CONV_A_DRAM, output_dram_addr=self.CONV_T_DRAM,
                 identity_dram_addr=self.w["IDENTITY_64"],
                 temp_dram_addr=self.PERMUTE_TEMP_DRAM)
-            # DW Conv1d via im2col + matmul.
-            # For each channel: host builds (L_pad, 64) im2col patches from
-            # CONV_T_DRAM, uploads to SUB_FLAT_DRAM, then HW runs
-            # kernel(1,64) @ patches(L_pad,64)^T → (1,L_pad).
-            # Processed in batches of 64 channels.
-            # NOTE: This section cannot be fully compiled ahead of time since
-            # patches are built on host per execution. The compile_encoder
-            # monolithic program cannot include this — use step-by-step
-            # execution in run_encoder instead.
-            # PLACEHOLDER: emit a no-op for DW conv; actual execution handled
-            # by run_encoder's im2col+matmul path.
+            # DW Conv1d via Toeplitz: per-channel matmul(1, L_pad) @ T(L_pad, L_pad)
+            t_addr = toeplitz_addrs[layer_idx]
+            for ch in range(D):
+                self.matmat_mul_core(M=1, K=L_pad, N=L_pad,
+                    A_DRAM_ADDR=self.CONV_T_DRAM + ch * L_pad * bpe,
+                    B_DRAM_ADDR=t_addr + ch * L_pad * L_pad * bpe,
+                    OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM + ch * L_pad * bpe)
             total_flops += 2 * 9 * D * L_pad
             batch_norm_core_dram(self, C=D, L=L_pad,
                 A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM,
@@ -1284,11 +1238,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 RESIDUAL_DRAM_ADDR=self.INPUT_DRAM, FF_DRAM_ADDR=self.FF_OUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.INPUT_DRAM)
             total_flops += 2 * L_pad * D
-
             # ===== Final LayerNorm =====
             self.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.INPUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_OUT_WEIGHT"], BETA_DRAM_ADDR=la["LN_OUT_BIAS"])
+            print(f"    Layer {layer_idx:2d} compiled")
 
         # Copy final encoder output
         self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
@@ -1298,8 +1252,9 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_halt()
         program_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(program_addr)
-        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        return program_addr, total_flops
+        program_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(program_bytes)
+        return program_addr, program_bytes
 
     def compile_decoder(self):
         """Compile predictor LSTM + split joint. Returns (pred_prog, tok_prog, dur_prog, flops)."""
@@ -1309,12 +1264,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         N_tok_pad = pad_to_multiple(self.vocab_size, self.block_size)
         N_dur_pad = pad_to_multiple(len(self.tdt_durations), self.block_size)
         total_flops = 0
-
         # --- Predictor program ---
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
-
         for i in range(2):
             h_addr = self.PRED_H0_DRAM if i == 0 else self.PRED_H1_DRAM
             c_addr = self.PRED_C0_DRAM if i == 0 else self.PRED_C1_DRAM
@@ -1367,7 +1320,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(self.PRED_OUT_DRAM, URAM_B_BASE, H)
             self.eltwise_mul_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, H)
             self.sram_to_accelerator_memory(URAM_A_BASE, h_addr, H)
-
         self.accelerator_memory_to_sram(self.PRED_H1_DRAM, URAM_A_BASE, H)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.PRED_OUT_DRAM, H)
         self.stop_capture()
@@ -1375,7 +1327,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         pred_prog = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(pred_prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-
         # --- Joint token program ---
         self.clear_capture_buffer()
         self.start_capture()
@@ -1448,190 +1399,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         pe_pos = pe[:seq_len]
         pe_neg = torch.flip(pe[1:seq_len], [0])
         return torch.cat([pe_neg, pe_pos], dim=0).to(torch.bfloat16)
-
-    # -----------------------------------------------------------------------
-    # Compile all programs at once
-    # -----------------------------------------------------------------------
-
-    def compile_all(self, T_mel, L_pad):
-        """Compile all programs up front: subsampling stages, encoder, decoder.
-        Stores program addresses in self.progs dict.
-        """
-        SC = self.sub_channels
-        D = self.d_model
-        n_mels = self.n_mels
-        H0, W0 = conv2d_outsize(T_mel), conv2d_outsize(n_mels)
-        H1, W1 = conv2d_outsize(H0), conv2d_outsize(W0)
-        H2, W2 = conv2d_outsize(H1), conv2d_outsize(W1)
-        N0, N1, N2 = H0 * W0, H1 * W1, H2 * W2
-        self.progs = {}
-        total_compile_flops = 0
-
-        # Subsampling stage 0: im2col matmul + bias + ReLU
-        prog, f = self.compile_sub_stage0(N0, 64, SC)
-        self.progs["sub0"] = (prog, f)
-        total_compile_flops += f
-        print(f"  Compiled sub_stage0: {f/1e6:.1f}M flops")
-
-        # Subsampling stage 1: DW + PW
-        prog, f = self.compile_sub_stage_dw_pw(H0*W0, N1, SC,
-            self.SUB_PATCH_DRAM, "SUB_DW1_W", "SUB_DW1_B", "SUB_PW1_W", "SUB_PW1_B")
-        self.progs["sub1"] = (prog, f)
-        total_compile_flops += f
-        print(f"  Compiled sub_stage1: {f/1e6:.1f}M flops")
-
-        # Subsampling stage 2: DW + PW
-        prog, f = self.compile_sub_stage_dw_pw(H1*W1, N2, SC,
-            self.SUB_PATCH_DRAM, "SUB_DW2_W", "SUB_DW2_B", "SUB_PW2_W", "SUB_PW2_B")
-        self.progs["sub2"] = (prog, f)
-        total_compile_flops += f
-        print(f"  Compiled sub_stage2: {f/1e6:.1f}M flops")
-
-        # Subsampling linear
-        prog, f = self.compile_sub_linear(L_pad)
-        self.progs["sub_lin"] = (prog, f)
-        total_compile_flops += f
-        print(f"  Compiled sub_linear: {f/1e6:.1f}M flops")
-
-        # Encoder (conformer layers)
-        prog, f = self.compile_encoder(L_pad)
-        self.progs["encoder"] = (prog, f)
-        total_compile_flops += f
-        print(f"  Compiled encoder: {f/1e9:.1f}G flops, "
-              f"{self.get_capture_instruction_size_bytes()/1024:.0f}KB")
-
-        # Decoder (predictor + split joint)
-        pred_prog, tok_prog, dur_prog, f = self.compile_decoder()
-        self.progs["pred"] = (pred_prog, f)
-        self.progs["joint_tok"] = (tok_prog, 0)
-        self.progs["joint_dur"] = (dur_prog, 0)
-        total_compile_flops += f
-        print(f"  Compiled decoder: {f/1e6:.1f}M flops")
-
-        print(f"  All programs compiled. Total flops: {total_compile_flops/1e9:.1f}G")
-
-    # -----------------------------------------------------------------------
-    # Execute: encoder
-    # -----------------------------------------------------------------------
-
-    def run_encoder(self, mel_bf16, L, L_pad):
-        """Execute encoder: subsampling (host im2col + HW matmuls) + conformer layers.
-        All programs already compiled via compile_all().
-        Returns enc_out_addr.
-        """
-        bpe = self.bytes_per_element
-        SC = self.sub_channels
-        D = self.d_model
-        T_mel = mel_bf16.shape[1]
-        mel_2d = mel_bf16.squeeze(0)  # (T_mel, 128)
-        sd = self._ckpt_sd
-
-        # --- Subsampling stage 0 ---
-        patches0, H0, W0 = self._im2col_conv2d(mel_2d, T_mel, self.n_mels)
-        N0 = H0 * W0
-        # Pre-zero output buffer to prevent stale NaN from accumulating into matmul result
-        zero_buf = torch.zeros(N0 * SC, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.SUB_OUT0_DRAM, zero_buf)
-        self.dma_to_accelerator_memory(self.SUB_PATCH_DRAM, patches0.contiguous())
-        self.program_execute(self.progs["sub0"][0])
-
-        out0 = torch.zeros(N0 * SC, dtype=torch.bfloat16)
-        self.dma_read(DMA_DEVICE_C2H, self.SUB_OUT0_DRAM, out0, N0 * SC * bpe)
-
-        # --- Stages 1 & 2: run on CPU in bf16 ---
-        # DW im2col patches are too large for DMA (~262MB for stage 1).
-        # Run DW+PW conv on CPU using F.conv2d — cheap one-time ops.
-        cpu_s0 = out0.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16)
-        cpu_s1 = F.conv2d(cpu_s0, sd["encoder.pre_encode.conv.2.weight"].to(torch.bfloat16),
-                          sd["encoder.pre_encode.conv.2.bias"].to(torch.bfloat16),
-                          stride=2, padding=1, groups=SC)
-        cpu_s1 = F.conv2d(cpu_s1, sd["encoder.pre_encode.conv.3.weight"].to(torch.bfloat16),
-                          sd["encoder.pre_encode.conv.3.bias"].to(torch.bfloat16))
-        cpu_s1 = F.relu(cpu_s1)
-
-        cpu_s2 = F.conv2d(cpu_s1, sd["encoder.pre_encode.conv.5.weight"].to(torch.bfloat16),
-                          sd["encoder.pre_encode.conv.5.bias"].to(torch.bfloat16),
-                          stride=2, padding=1, groups=SC)
-        cpu_s2 = F.conv2d(cpu_s2, sd["encoder.pre_encode.conv.6.weight"].to(torch.bfloat16),
-                          sd["encoder.pre_encode.conv.6.bias"].to(torch.bfloat16))
-        cpu_s2 = F.relu(cpu_s2)
-
-        _, _, H2, W2 = cpu_s2.shape
-        flat = cpu_s2.squeeze(0).permute(1, 0, 2).reshape(H2, SC * W2).to(torch.bfloat16).contiguous()
-        if H2 < L_pad:
-            flat_padded = torch.zeros(L_pad, 4096, dtype=torch.bfloat16)
-            flat_padded[:H2, :] = flat
-            flat = flat_padded
-
-        self.dma_to_accelerator_memory(self.SUB_FLAT_DRAM, flat.contiguous())
-
-        # --- Subsampling linear ---
-        # Pre-zero INPUT_DRAM (output of linear) to prevent stale NaN accumulation
-        zero_input = torch.zeros(L_pad * D, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.INPUT_DRAM, zero_input)
-        self.program_execute(self.progs["sub_lin"][0])
-
-        # Fill padding rows with values that have nonzero variance to prevent
-        # LayerNorm NaN. Alternating ±0.1 gives var > 0.
-        if L_pad > L:
-            pad_rows = L_pad - L
-            epsilon_fill = torch.zeros(pad_rows * D, dtype=torch.bfloat16)
-            epsilon_fill[0::2] = 0.1
-            epsilon_fill[1::2] = -0.1
-            pad_offset = L * D * bpe
-            self.dma_to_accelerator_memory(self.INPUT_DRAM + pad_offset, epsilon_fill)
-
-        print("  Subsampling done")
-
-        # --- Write positional embedding ---
-        P_pad = pad_to_multiple(2 * L_pad - 1, self.block_size)
-        rel_pe = self.make_rel_pos_emb(L_pad)
-        if rel_pe.shape[0] < P_pad:
-            pe_padded = torch.zeros(P_pad, D, dtype=torch.bfloat16)
-            pe_padded[:rel_pe.shape[0], :] = rel_pe
-            rel_pe = pe_padded
-        self.dma_to_accelerator_memory(self.POS_EMB_DRAM, rel_pe.contiguous())
-
-        # --- Write attention mask ---
-        # Valid rows attend to valid columns; padding columns are blocked.
-        # Padding rows attend to position 0 to avoid softmax(all -inf) = NaN.
-        mask = torch.full((L_pad, L_pad), -1e38, dtype=torch.bfloat16)
-        mask[:L, :L] = 0.0
-        mask[L:, 0] = 0.0
-        self.dma_to_accelerator_memory(self.ATTN_MASK_DRAM, mask.contiguous())
-
-        # --- Pre-zero encoder intermediate buffers ---
-        print("  Pre-zeroing encoder intermediate buffers...")
-        zero_bufs = {
-            "ENC_OUT":     (self.ENC_OUT_DRAM,     L_pad * D),
-            "LN_OUT":      (self.LN_OUT_DRAM,      L_pad * D),
-            "FF_MID":      (self.FF_MID_DRAM,      L_pad * self.ff_dim),
-            "FF_OUT":      (self.FF_OUT_DRAM,       L_pad * D),
-            "RESIDUAL":    (self.RESIDUAL_DRAM,     L_pad * D),
-            "Q":           (self.Q_DRAM,            L_pad * D),
-            "K":           (self.K_DRAM,            L_pad * D),
-            "V":           (self.V_DRAM,            L_pad * D),
-            "POS_PROJ":    (self.POS_PROJ_DRAM,     L_pad * D),
-            "SCORE":       (self.SCORE_DRAM,        L_pad * L_pad),
-            "ATTN_OUT":    (self.ATTN_OUT_DRAM,     L_pad * D),
-            "REL_SHIFT":   (self.REL_SHIFT_DRAM,    L_pad * L_pad),
-            "CONV_A":      (self.CONV_A_DRAM,       L_pad * D),
-            "CONV_B":      (self.CONV_B_DRAM,       L_pad * D),
-            "CONV_T":      (self.CONV_T_DRAM,       D * L_pad),
-            "CONV_DW":     (self.CONV_DW_DRAM,      D * L_pad),
-            "CONV_OUT":    (self.CONV_OUT_DRAM,      L_pad * D),
-        }
-        for buf_name, (addr, numel) in zero_bufs.items():
-            z = torch.zeros(numel, dtype=torch.bfloat16)
-            self.dma_to_accelerator_memory(addr, z)
-
-        # --- Execute conformer layers ---
-        print("  Executing conformer layers...")
-        enc_prog, enc_flops = self.progs["encoder"]
-        latency_us, gflops = self.program_execute(enc_prog, flops=enc_flops)
-        print(f"  Encoder: {latency_us:.0f} us, {gflops:.1f} GFLOPS")
-
-        return self.ENC_OUT_DRAM
 
     # -----------------------------------------------------------------------
     # Execute: decoder
@@ -1778,74 +1545,29 @@ def main():
     la = engine.layer_addrs[0] # layer 0 weights
 
     # ==================================================================
-    # VERIFIED: Subsampling (Steps 1-3)
+    # Pre-stage: position embedding, attention mask, Toeplitz, BN tiling
     # ==================================================================
-    print(f"\n--- Verified: Subsampling ---")
-
-    # Step 1: Sub stage 0 (HW)
-    prog_s0, _ = engine.compile_sub_stage0(N0, 64, SC)
-    mel_2d = mel.squeeze(0)
-    patches0, H0_actual, W0_actual = engine._im2col_conv2d(mel_2d, T_mel, n_mels)
-    assert H0_actual == H0 and W0_actual == W0
-    engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
-    engine.dma_to_accelerator_memory(engine.SUB_PATCH_DRAM, patches0.contiguous())
-    engine.program_execute(prog_s0)
-    hw_s0 = read_dram(engine, engine.SUB_OUT0_DRAM, N0 * SC)
-    ref_s0 = F.relu(F.conv2d(mel.unsqueeze(1).float(),
-        sd["encoder.pre_encode.conv.0.weight"].float(),
-        sd["encoder.pre_encode.conv.0.bias"].float(), stride=2, padding=1))
-    hw_vs_cpu("sub_stage0", hw_s0, ref_s0.squeeze(0).permute(1, 2, 0).reshape(-1))
-
-    # Step 2: CPU stages 1 & 2
-    cpu_s0 = hw_s0.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16)
-    cpu_s1 = F.relu(F.conv2d(F.conv2d(cpu_s0,
-        sd["encoder.pre_encode.conv.2.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.2.bias"].to(torch.bfloat16), stride=2, padding=1, groups=SC),
-        sd["encoder.pre_encode.conv.3.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.3.bias"].to(torch.bfloat16)))
-    cpu_s2 = F.relu(F.conv2d(F.conv2d(cpu_s1,
-        sd["encoder.pre_encode.conv.5.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.5.bias"].to(torch.bfloat16), stride=2, padding=1, groups=SC),
-        sd["encoder.pre_encode.conv.6.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.6.bias"].to(torch.bfloat16)))
-    assert cpu_s2.shape[2] == H2 and cpu_s2.shape[3] == W2
-    flat = cpu_s2.squeeze(0).permute(1, 0, 2).reshape(H2, SC * W2).to(torch.bfloat16).contiguous()
-    if H2 < L_pad:
-        flat_padded = torch.zeros(L_pad, 4096, dtype=torch.bfloat16)
-        flat_padded[:H2, :] = flat
-        flat = flat_padded
-
-    # Step 3: Sub linear (HW)
-    prog_lin, _ = engine.compile_sub_linear(L_pad)
-    engine.dma_to_accelerator_memory(engine.SUB_FLAT_DRAM, flat.contiguous())
-    engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
-    engine.program_execute(prog_lin)
-    hw_lin = read_dram(engine, engine.INPUT_DRAM, L_pad * D).reshape(L_pad, D)
-    ref_lin = F.linear(flat[:H2].float(), sd["encoder.pre_encode.out.weight"].float(),
-                       sd["encoder.pre_encode.out.bias"].float())
-    hw_vs_cpu("sub_linear", hw_lin[:H2], ref_lin)
-
-    # Padding rows for LayerNorm stability
-    if L_pad > H2:
-        epsilon_fill = torch.zeros((L_pad - H2) * D, dtype=torch.bfloat16)
-        epsilon_fill[0::2] = 0.1; epsilon_fill[1::2] = -0.1
-        engine.dma_to_accelerator_memory(engine.INPUT_DRAM + H2 * D * bpe, epsilon_fill)
-
-
-    # Setup: pos embedding + attention mask (shared across all layers)
+    N1 = H1 * W1
+    N1_pad = pad_to_multiple(N1, engine.block_size)
+    N2 = H2 * W2
+    N2_pad = pad_to_multiple(N2, engine.block_size)
     P_pad = pad_to_multiple(2 * L_pad - 1, engine.block_size)
+
+    # Position embedding
     rel_pe = engine.make_rel_pos_emb(L_pad)
     if rel_pe.shape[0] < P_pad:
         pe_padded = torch.zeros(P_pad, D, dtype=torch.bfloat16)
         pe_padded[:rel_pe.shape[0], :] = rel_pe
         rel_pe = pe_padded
     engine.dma_to_accelerator_memory(engine.POS_EMB_DRAM, rel_pe.contiguous())
+
+    # Attention mask
     mask = torch.full((L_pad, L_pad), -1e38, dtype=torch.bfloat16)
     mask[:L, :L] = 0.0
     mask[L:, 0] = 0.0
     engine.dma_to_accelerator_memory(engine.ATTN_MASK_DRAM, mask.contiguous())
 
-    # Stage Toeplitz matrices for DW conv (all 24 layers)
+    # Toeplitz matrices for DW conv (all 24 layers)
     print(f"  Staging Toeplitz DW conv matrices...")
     toeplitz_addrs = []
     for li in range(engine.num_layers):
@@ -1864,199 +1586,17 @@ def main():
         toeplitz_addrs.append(addr)
     print(f"  Toeplitz staged: {engine.get_params_dram_usage()/1024**2:.0f} MB params used")
 
-    # Pre-tile BN params for bulk ops
+    # Pre-tile BN params and attention biases for bulk ops
     bn_tiled = []
     for li in range(engine.num_layers):
         la_i = engine.layer_addrs[li]
         s_addr, sh_addr = batch_norm_prepare_tiled(engine, D, L_pad,
             la_i["CONV_BN_SCALE"], la_i["CONV_BN_SHIFT"])
         bn_tiled.append((s_addr, sh_addr))
-
-    # Pre-tile attention biases for bulk ops
     engine.prepare_attention_tiled_biases(L_pad)
 
-    print(f"  Encoder setup done")
-
-
-    def emit_all_24_layers():
-      for layer_idx in range(engine.num_layers):
-        la = engine.layer_addrs[layer_idx]
-        t_addr = toeplitz_addrs[layer_idx]
-        if True:  # indent block (was emit_full_layer)
-            # FF1 (K-split)
-            FF_HALF = FF // 2
-            engine.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
-            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_LO"],
-                OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM, silu_enable=True)
-            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_HI"],
-                OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
-            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
-                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2_LO"],
-                OUTPUT_DRAM_ADDR=engine.FF_OUT_DRAM)
-            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
-                A_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF1_W2_HI"],
-                OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM)
-            engine.accelerator_memory_to_sram(engine.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
-            engine.accelerator_memory_to_sram(engine.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
-            engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
-            engine.sram_to_accelerator_memory(URAM_A_BASE, engine.FF_OUT_DRAM, L_pad * D)
-            half_step_residual_core_dram(engine, M=L_pad, N=D,
-                RESIDUAL_DRAM_ADDR=engine.INPUT_DRAM, FF_DRAM_ADDR=engine.FF_OUT_DRAM,
-                OUTPUT_DRAM_ADDR=engine.INPUT_DRAM)
-            # Attention
-            engine.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_ATTN_WEIGHT"], BETA_DRAM_ADDR=la["LN_ATTN_BIAS"])
-            engine.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_Q_W"],
-                OUTPUT_DRAM_ADDR=engine.Q_DRAM)
-            engine.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_K_W"],
-                OUTPUT_DRAM_ADDR=engine.K_DRAM)
-            engine.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_V_W"],
-                OUTPUT_DRAM_ADDR=engine.V_DRAM)
-            engine.matmat_mul_core(M=P_pad, K=D, N=D,
-                A_DRAM_ADDR=engine.POS_EMB_DRAM, B_DRAM_ADDR=la["ATTN_POS_W"],
-                OUTPUT_DRAM_ADDR=engine.POS_PROJ_DRAM)
-            inv_sqrt_dk = 1.0 / math.sqrt(dk)
-            for h in range(H_heads):
-                h_off = h * dk * bpe
-                engine.accelerator_memory_to_sram(engine.Q_DRAM + h_off, URAM_A_BASE, L_pad * dk,
-                    stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.accelerator_memory_to_sram(la["ATTN_BIAS_U_TILED"][h], URAM_B_BASE, L_pad * dk)
-                engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * dk)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_A_DRAM, L_pad * dk)
-                engine.accelerator_memory_to_sram(engine.K_DRAM + h_off, URAM_A_BASE, L_pad * dk,
-                    stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_B_DRAM, L_pad * dk)
-                engine.matmat_mul_core(M=L_pad, K=dk, N=L_pad,
-                    A_DRAM_ADDR=engine.CONV_A_DRAM, B_DRAM_ADDR=engine.CONV_B_DRAM,
-                    OUTPUT_DRAM_ADDR=engine.SCORE_DRAM)
-                engine.accelerator_memory_to_sram(engine.Q_DRAM + h_off, URAM_A_BASE, L_pad * dk,
-                    stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.accelerator_memory_to_sram(la["ATTN_BIAS_V_TILED"][h], URAM_B_BASE, L_pad * dk)
-                engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * dk)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_A_DRAM, L_pad * dk)
-                engine.accelerator_memory_to_sram(engine.POS_PROJ_DRAM + h_off, URAM_A_BASE, P_pad * dk,
-                    stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_B_DRAM, P_pad * dk)
-                engine.matmat_mul_core(M=L_pad, K=dk, N=P_pad,
-                    A_DRAM_ADDR=engine.CONV_A_DRAM, B_DRAM_ADDR=engine.CONV_B_DRAM,
-                    OUTPUT_DRAM_ADDR=engine.CONV_OUT_DRAM)
-                rel_shift_core_dram(engine, L=L_pad,
-                    INPUT_DRAM_ADDR=engine.CONV_OUT_DRAM, OUTPUT_DRAM_ADDR=engine.REL_SHIFT_DRAM,
-                    input_row_stride=P_pad)
-                score_elems = L_pad * L_pad
-                engine.accelerator_memory_to_sram(engine.SCORE_DRAM, URAM_A_BASE, score_elems)
-                engine.accelerator_memory_to_sram(engine.REL_SHIFT_DRAM, URAM_B_BASE, score_elems)
-                engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, score_elems)
-                engine.broadcast_mul(scalar=inv_sqrt_dk,
-                    sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE,
-                    element_size=score_elems)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.SCORE_DRAM, score_elems)
-                engine.matmat_mul_core(M=L_pad, K=L_pad, N=L_pad,
-                    A_DRAM_ADDR=engine.SCORE_DRAM, B_DRAM_ADDR=engine.IDENTITY_LPAD_DRAM,
-                    OUTPUT_DRAM_ADDR=engine.SCORE_DRAM, softmax_enable=True,
-                    C_DRAM_ADDR=engine.ATTN_MASK_DRAM, bias_mode="full_matrix")
-                engine.accelerator_memory_to_sram(engine.V_DRAM + h_off, URAM_A_BASE, L_pad * dk,
-                    stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_B_DRAM, L_pad * dk)
-                chunked_transpose_core_dram(engine, M=L_pad, N=dk,
-                    input_dram_addr=engine.CONV_B_DRAM, output_dram_addr=engine.ATTN_VT_DRAM,
-                    identity_dram_addr=engine.w["IDENTITY_64"],
-                    temp_dram_addr=engine.PERMUTE_TEMP_DRAM)
-                engine.matmat_mul_core(M=L_pad, K=L_pad, N=dk,
-                    A_DRAM_ADDR=engine.SCORE_DRAM, B_DRAM_ADDR=engine.ATTN_VT_DRAM,
-                    OUTPUT_DRAM_ADDR=engine.CONV_A_DRAM)
-                engine.accelerator_memory_to_sram(engine.CONV_A_DRAM, URAM_A_BASE, L_pad * dk)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.ATTN_OUT_DRAM + h_off, L_pad * dk,
-                    stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-            engine.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=engine.ATTN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_OUT_W"],
-                OUTPUT_DRAM_ADDR=engine.FF_OUT_DRAM)
-            engine.accelerator_memory_to_sram(engine.INPUT_DRAM, URAM_A_BASE, L_pad * D)
-            engine.accelerator_memory_to_sram(engine.FF_OUT_DRAM, URAM_B_BASE, L_pad * D)
-            engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
-            engine.sram_to_accelerator_memory(URAM_A_BASE, engine.INPUT_DRAM, L_pad * D)
-            # ConvModule part 1: LN + PW Conv1 split + GLU + Transpose
-            engine.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_CONV_WEIGHT"], BETA_DRAM_ADDR=la["LN_CONV_BIAS"])
-            engine.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1A_W"],
-                OUTPUT_DRAM_ADDR=engine.CONV_A_DRAM)
-            engine.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1B_W"],
-                OUTPUT_DRAM_ADDR=engine.CONV_B_DRAM)
-            glu_core_dram(engine, M=L_pad, C=D,
-                A_DRAM_ADDR=engine.CONV_A_DRAM, B_DRAM_ADDR=engine.CONV_B_DRAM,
-                OUTPUT_DRAM_ADDR=engine.CONV_A_DRAM, IDENTITY_DRAM_ADDR=engine.w["IDENTITY_1024"])
-            chunked_transpose_core_dram(engine, M=L_pad, N=D,
-                input_dram_addr=engine.CONV_A_DRAM, output_dram_addr=engine.CONV_T_DRAM,
-                identity_dram_addr=engine.w["IDENTITY_64"],
-                temp_dram_addr=engine.PERMUTE_TEMP_DRAM)
-            # DW Conv via Toeplitz: input(1, L_pad) @ T(L_pad, L_pad)^T per channel
-            for ch in range(D):
-                engine.matmat_mul_core(M=1, K=L_pad, N=L_pad,
-                    A_DRAM_ADDR=engine.CONV_T_DRAM + ch * L_pad * bpe,
-                    B_DRAM_ADDR=t_addr + ch * L_pad * L_pad * bpe,
-                    OUTPUT_DRAM_ADDR=engine.CONV_DW_DRAM + ch * L_pad * bpe)
-            # BN + SiLU + Transpose + PW Conv2 + Residual
-            batch_norm_core_dram(engine, C=D, L=L_pad,
-                A_DRAM_ADDR=engine.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=engine.CONV_DW_DRAM,
-                SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"],
-                tiled_scale_addr=bn_tiled[layer_idx][0],
-                tiled_shift_addr=bn_tiled[layer_idx][1])
-            silu_core_dram(engine, M=D, N=L_pad,
-                A_DRAM_ADDR=engine.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=engine.CONV_OUT_DRAM,
-                IDENTITY_DRAM_ADDR=engine.IDENTITY_LPAD_DRAM)
-            chunked_transpose_core_dram(engine, M=D, N=L_pad,
-                input_dram_addr=engine.CONV_OUT_DRAM, output_dram_addr=engine.CONV_T_DRAM,
-                identity_dram_addr=engine.w["IDENTITY_64"],
-                temp_dram_addr=engine.PERMUTE_TEMP_DRAM)
-            engine.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=engine.CONV_T_DRAM, B_DRAM_ADDR=la["CONV_PW2_W"],
-                OUTPUT_DRAM_ADDR=engine.CONV_OUT_DRAM)
-            engine.accelerator_memory_to_sram(engine.INPUT_DRAM, URAM_A_BASE, L_pad * D)
-            engine.accelerator_memory_to_sram(engine.CONV_OUT_DRAM, URAM_B_BASE, L_pad * D)
-            engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
-            engine.sram_to_accelerator_memory(URAM_A_BASE, engine.INPUT_DRAM, L_pad * D)
-            # FF2 (K-split)
-            engine.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
-            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_LO"],
-                OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM, silu_enable=True)
-            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_HI"],
-                OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
-            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
-                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2_LO"],
-                OUTPUT_DRAM_ADDR=engine.FF_OUT_DRAM)
-            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
-                A_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF2_W2_HI"],
-                OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM)
-            engine.accelerator_memory_to_sram(engine.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
-            engine.accelerator_memory_to_sram(engine.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
-            engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
-            engine.sram_to_accelerator_memory(URAM_A_BASE, engine.FF_OUT_DRAM, L_pad * D)
-            half_step_residual_core_dram(engine, M=L_pad, N=D,
-                RESIDUAL_DRAM_ADDR=engine.INPUT_DRAM, FF_DRAM_ADDR=engine.FF_OUT_DRAM,
-                OUTPUT_DRAM_ADDR=engine.INPUT_DRAM)
-            # Final LN
-            engine.layer_norm_core_dram(M=L_pad, N=D,
-                A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.INPUT_DRAM,
-                GAMMA_DRAM_ADDR=la["LN_OUT_WEIGHT"], BETA_DRAM_ADDR=la["LN_OUT_BIAS"])
-        print(f"    Layer {layer_idx:2d} emitted")
-
     # ==================================================================
-    # Compilation
+    # Compile
     # ==================================================================
     import time as _time
     import sentencepiece as spm
@@ -2065,27 +1605,28 @@ def main():
     print(f"  COMPILING...")
     print(f"{'='*60}")
 
-    # Compile encoder (capture instructions, write to DRAM — don't execute yet)
-    engine.clear_capture_buffer()
-    engine.start_capture()
-    engine.generate_instruction_flag_clear()
-    emit_all_24_layers()
-    engine.stop_capture()
-    engine.generate_instruction_halt()
-    enc_prog_addr = engine.get_program_dram_addr()
-    engine.write_captured_instructions_to_dram(enc_prog_addr)
-    enc_prog_bytes = engine.get_capture_instruction_size_bytes()
-    engine.allocate_program_dram(enc_prog_bytes)
+    # Subsampling programs
+    prog_s0, _ = engine.compile_sub_stage0(N0, 64, SC)
+    prog_s1, _ = engine.compile_sub_stage_dw_pw(N0, N1, SC,
+        engine.SUB_PATCH_DRAM, "SUB_DW1_W", "SUB_DW1_B", "SUB_PW1_W", "SUB_PW1_B")
+    prog_s2, _ = engine.compile_sub_stage_dw_pw(N1, N2, SC,
+        engine.SUB_PATCH_DRAM, "SUB_DW2_W", "SUB_DW2_B", "SUB_PW2_W", "SUB_PW2_B")
+    prog_lin, _ = engine.compile_sub_linear(L_pad)
+    print(f"  Subsampling compiled (4 programs)")
 
-    # Compile decoder
+    # Encoder program (single instruction stream for 24 conformer layers)
+    enc_prog_addr, enc_prog_bytes = engine.compile_encoder(L_pad, toeplitz_addrs, bn_tiled)
+    print(f"  Encoder compiled: {enc_prog_bytes:,} bytes")
+
+    # Decoder programs (3 small programs for host-driven decode loop)
     pred_prog, tok_prog, dur_prog, _ = engine.compile_decoder()
     engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0)}
+    print(f"  Decoder compiled (3 programs)")
 
     print(f"\n  Compilation Finished")
-    print(f"  Encoder program: {enc_prog_bytes:,} bytes")
 
     # ==================================================================
-    # Executing Forward Pass
+    # Execute
     # ==================================================================
     print(f"\n{'='*60}")
     print(f"  EXECUTING FORWARD PASS...")
@@ -2093,28 +1634,40 @@ def main():
 
     t_start = _time.perf_counter()
 
-    # --- Subsampling ---
+    # --- Subsampling (im2col on host, matmuls on FPGA) ---
+    mel_2d = mel.squeeze(0)
+    patches0, H0_actual, W0_actual = engine._im2col_conv2d(mel_2d, T_mel, n_mels)
+    assert H0_actual == H0 and W0_actual == W0
+
+    # Stage 0: Conv2d(1->256, k=3, s=2) + ReLU
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
     engine.dma_to_accelerator_memory(engine.SUB_PATCH_DRAM, patches0.contiguous())
     engine.program_execute(prog_s0)
-    s0 = read_dram(engine, engine.SUB_OUT0_DRAM, N0 * SC)
-    s0_4d = s0.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16)
-    s1 = F.relu(F.conv2d(F.conv2d(s0_4d,
-        sd["encoder.pre_encode.conv.2.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.2.bias"].to(torch.bfloat16), stride=2, padding=1, groups=SC),
-        sd["encoder.pre_encode.conv.3.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.3.bias"].to(torch.bfloat16)))
-    s2 = F.relu(F.conv2d(F.conv2d(s1,
-        sd["encoder.pre_encode.conv.5.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.5.bias"].to(torch.bfloat16), stride=2, padding=1, groups=SC),
-        sd["encoder.pre_encode.conv.6.weight"].to(torch.bfloat16),
-        sd["encoder.pre_encode.conv.6.bias"].to(torch.bfloat16)))
-    fl = s2.squeeze(0).permute(1, 0, 2).reshape(H2, SC * W2).to(torch.bfloat16).contiguous()
+
+    # Stage 1: DWConv2d(256, k=3, s=2) + PWConv2d(256) + ReLU
+    s0_out = read_dram(engine, engine.SUB_OUT0_DRAM, N0 * SC)
+    s0_ch = s0_out.reshape(H0, W0, SC).permute(2, 0, 1).contiguous()
+    dw1_p, _, _ = engine._im2col_conv2d(s0_ch, H0, W0)
+    engine.dma_to_accelerator_memory(engine.SUB_PATCH_DRAM, dw1_p.contiguous())
+    engine.program_execute(prog_s1)
+
+    # Stage 2: DWConv2d(256, k=3, s=2) + PWConv2d(256) + ReLU
+    s1_out = read_dram(engine, engine.SUB_PW_IN_DRAM, N1_pad * SC)
+    s1_ch = s1_out.reshape(N1_pad, SC)[:N1].reshape(H1, W1, SC).permute(2, 0, 1).contiguous()
+    dw2_p, _, _ = engine._im2col_conv2d(s1_ch, H1, W1)
+    engine.dma_to_accelerator_memory(engine.SUB_PATCH_DRAM, dw2_p.contiguous())
+    engine.program_execute(prog_s2)
+
+    # Flatten + Linear(4096, 1024)
+    s2_out = read_dram(engine, engine.SUB_PW_IN_DRAM, N2_pad * SC)
+    fl = s2_out.reshape(N2_pad, SC)[:N2].reshape(H2, W2, SC).permute(0, 2, 1).reshape(H2, SC * W2).contiguous()
     if H2 < L_pad:
         fp = torch.zeros(L_pad, 4096, dtype=torch.bfloat16); fp[:H2, :] = fl; fl = fp
     engine.dma_to_accelerator_memory(engine.SUB_FLAT_DRAM, fl.contiguous())
     engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
     engine.program_execute(prog_lin)
+
+    # Padding rows for LayerNorm stability
     if L_pad > H2:
         ef = torch.zeros((L_pad - H2) * D, dtype=torch.bfloat16)
         ef[0::2] = 0.1; ef[1::2] = -0.1
@@ -2122,21 +1675,23 @@ def main():
 
     t_sub_done = _time.perf_counter()
 
-    # --- Encoder (single instruction stream) ---
+    # --- Encoder (single instruction stream, no host intervention) ---
     engine.start_execute_from_dram(enc_prog_addr)
     engine.wait_queue(120.0)
     engine.report_timing_and_instruction_count()
 
     t_enc_done = _time.perf_counter()
 
-    # --- Decoder ---
+    # --- Decoder (host-driven greedy loop) ---
     hw_enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D)
     engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM, hw_enc_out.contiguous())
     hw_tokens = engine.run_decode(engine.ENC_OUT_DRAM, L)
 
     t_dec_done = _time.perf_counter()
 
-    # --- Results ---
+    # ==================================================================
+    # Results
+    # ==================================================================
     sp = spm.SentencePieceProcessor()
     sp.Load(TOKENIZER_PATH)
     vocab_sz = sp.GetPieceSize()
@@ -2153,33 +1708,6 @@ def main():
     print(f"    Total:               {total:.3f}s")
     print(f"    Audio duration:      {audio_duration:.1f}s")
     print(f"    Real-time factor:    {total / audio_duration:.2f}x")
-
-    # --- CPU reference comparison ---
-    print(f"\n  Computing CPU reference (24-layer conformer)...")
-    REF_DIR = "/home/rohit/apex-compute-ML/simple-llm/src/parakeet"
-    sys.path.insert(0, REF_DIR)
-    from parakeet_modules import ParakeetTDT, make_rel_pos_emb
-    from parakeet_main import load_checkpoint as ref_load_checkpoint, convert_to_bf16
-
-    ref_model = ParakeetTDT()
-    ref_model = ref_load_checkpoint(ref_model, WEIGHTS_PATH)
-    ref_model = convert_to_bf16(ref_model)
-    ref_model.eval()
-    ref_model.stage_for_hardware()
-
-    ref_x = hw_lin[:H2].unsqueeze(0).to(torch.bfloat16)
-    ref_pos = make_rel_pos_emb(H2).to(dtype=ref_x.dtype)
-    with torch.no_grad():
-        for layer in ref_model.encoder.layers:
-            ref_x = layer(ref_x, ref_pos)
-    ref_enc_out = ref_x.squeeze(0)
-    hw_vs_cpu("encoder_24layers", hw_enc_out.reshape(L_pad, D)[:H2], ref_enc_out, cos_threshold=0.65)
-
-    with torch.no_grad():
-        ref_tokens = ref_model.decode(ref_enc_out.unsqueeze(0))
-    ref_text = sp.DecodeIds([t for t in ref_tokens[0] if 0 <= t < vocab_sz])
-    print(f"\n  HW  transcript: >>> {hw_text}")
-    print(f"  CPU transcript: >>> {ref_text}")
 
     print(f"\n{'='*60}")
     print(f"  FULL PIPELINE COMPLETE")
