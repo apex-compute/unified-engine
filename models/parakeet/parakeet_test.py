@@ -61,15 +61,56 @@ def batch_norm_fuse_params(ue: UnifiedEngine, bn_weight, bn_bias, bn_mean, bn_va
     ue.dma_write(DMA_DEVICE_H2C, shift_addr, shift, C * 2)
     return scale_addr, shift_addr, C
 
+def batch_norm_prepare_tiled(ue, C, L, SCALE_DRAM_ADDR, SHIFT_DRAM_ADDR):
+    """Pre-tile BN scale/shift vectors into (C, L) matrices for bulk ops.
+    Returns (tiled_scale_addr, tiled_shift_addr).
+    Call once before compile, not inside instruction capture.
+    """
+    bpe = 2
+    # Read scale and shift from DRAM
+    scale_host = torch.zeros(C, dtype=torch.bfloat16)
+    shift_host = torch.zeros(C, dtype=torch.bfloat16)
+    ue.dma_read(DMA_DEVICE_C2H, SCALE_DRAM_ADDR, scale_host, C * bpe)
+    ue.dma_read(DMA_DEVICE_C2H, SHIFT_DRAM_ADDR, shift_host, C * bpe)
+    # Tile: each scalar repeated L times per row
+    scale_tiled = scale_host.unsqueeze(1).expand(C, L).contiguous()
+    shift_tiled = shift_host.unsqueeze(1).expand(C, L).contiguous()
+    # Write to DRAM
+    scale_tiled_addr = ue.get_params_dram_addr()
+    ue.allocate_params_dram(C * L * bpe)
+    ue.dma_to_accelerator_memory(scale_tiled_addr, scale_tiled)
+    shift_tiled_addr = ue.get_params_dram_addr()
+    ue.allocate_params_dram(C * L * bpe)
+    ue.dma_to_accelerator_memory(shift_tiled_addr, shift_tiled)
+    return scale_tiled_addr, shift_tiled_addr
+
 def batch_norm_core_dram(ue: UnifiedEngine, C: int, L: int,
                          A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                         SCALE_DRAM_ADDR: int, SHIFT_DRAM_ADDR: int) -> None:
+                         SCALE_DRAM_ADDR: int, SHIFT_DRAM_ADDR: int,
+                         tiled_scale_addr: int = None,
+                         tiled_shift_addr: int = None) -> None:
     """Emit instructions for fused eval-mode batch norm on (C, L) tensor.
-    For each channel c:
-        output[c, :] = input[c, :] * scale[c] + shift[c]
-    Uses broadcast_mul + broadcast_add per channel row.
+    If tiled_scale_addr and tiled_shift_addr are provided, uses bulk ops (6 instructions).
+    Otherwise falls back to per-channel loop.
     """
     assert L % UE_VECTOR_SIZE == 0, f"L={L} must be a multiple of {UE_VECTOR_SIZE}"
+    if tiled_scale_addr is not None and tiled_shift_addr is not None:
+        total_elems = C * L
+        # Load input, load tiled scale, multiply
+        ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
+        ue.accelerator_memory_to_sram(tiled_scale_addr, URAM_B_BASE, total_elems)
+        ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE,
+                           vector_B_sram_start_addr=URAM_B_BASE,
+                           vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
+        # Load tiled shift, add
+        ue.accelerator_memory_to_sram(tiled_shift_addr, URAM_B_BASE, total_elems)
+        ue.eltwise_add_core(vector_A_sram_start_addr=URAM_A_BASE,
+                           vector_B_sram_start_addr=URAM_B_BASE,
+                           vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
+        # Write result
+        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
+        return
+    # Fallback: per-channel (original behavior)
     row_bytes = L * 2
     scale_host = torch.zeros(C, dtype=torch.bfloat16)
     shift_host = torch.zeros(C, dtype=torch.bfloat16)
@@ -132,19 +173,17 @@ def silu_core_dram(ue: UnifiedEngine, M: int, N: int,
         3. eltwise_mul row-by-row: x * sigmoid(x) → OUTPUT
     """
     assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
-    row_bytes = N * 2
-    # Step 1: copy input to OUTPUT (so we can sigmoid in-place there)
-    for m in range(M):
-        ue.accelerator_memory_to_sram(A_DRAM_ADDR + m * row_bytes, URAM_A_BASE, N)
-        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, N)
+    total_elems = M * N
+    # Step 1: bulk copy input to OUTPUT (so we can sigmoid in-place there)
+    ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
+    ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
     # Step 2: sigmoid(x) via identity matmul with LALU sigmoid → OUTPUT in-place
     ue.matmat_mul_core(M=M, K=N, N=N, A_DRAM_ADDR=OUTPUT_DRAM_ADDR, B_DRAM_ADDR=IDENTITY_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, sigmoid_enable=True)
-    # Step 3: x * sigmoid(x) row-by-row
-    for m in range(M):
-        ue.accelerator_memory_to_sram(A_DRAM_ADDR + m * row_bytes, URAM_A_BASE, N)
-        ue.accelerator_memory_to_sram(OUTPUT_DRAM_ADDR + m * row_bytes, URAM_B_BASE, N)
-        ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=N)
-        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, N)
+    # Step 3: bulk x * sigmoid(x)
+    ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
+    ue.accelerator_memory_to_sram(OUTPUT_DRAM_ADDR, URAM_B_BASE, total_elems)
+    ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
+    ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
 
 def glu_core_dram(ue: UnifiedEngine, M: int, C: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int) -> None:
     """Emit instructions for GLU: output = a * sigmoid(b).
@@ -156,15 +195,14 @@ def glu_core_dram(ue: UnifiedEngine, M: int, C: int, A_DRAM_ADDR: int, B_DRAM_AD
         2. eltwise_mul row-by-row: a * sigmoid(b) → OUTPUT
     """
     assert C % UE_VECTOR_SIZE == 0, f"C={C} must be a multiple of {UE_VECTOR_SIZE}"
-    row_bytes = C * 2
+    total_elems = M * C
     # Step 1: sigmoid(b) via identity matmul
     ue.matmat_mul_core(M=M, K=C, N=C, A_DRAM_ADDR=B_DRAM_ADDR, B_DRAM_ADDR=IDENTITY_DRAM_ADDR, OUTPUT_DRAM_ADDR=B_DRAM_ADDR, sigmoid_enable=True)
-    # Step 2: a * sigmoid(b)
-    for m in range(M):
-        ue.accelerator_memory_to_sram(A_DRAM_ADDR + m * row_bytes, URAM_A_BASE, C)
-        ue.accelerator_memory_to_sram(B_DRAM_ADDR + m * row_bytes, URAM_B_BASE, C)
-        ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=C)
-        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, C)
+    # Step 2: bulk a * sigmoid(b)
+    ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
+    ue.accelerator_memory_to_sram(B_DRAM_ADDR, URAM_B_BASE, total_elems)
+    ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
+    ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
 
 def rel_shift_core_dram(ue: UnifiedEngine, L: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                         input_row_stride: int = None) -> None:
@@ -214,12 +252,17 @@ def chunked_transpose_core_dram(ue: UnifiedEngine, M: int, N: int,
         chunk_cols = col_end - col_start
         chunk_cols_pad = ((chunk_cols - 1) // VS + 1) * VS  # = VS for full chunks
 
-        # Extract columns [col_start:col_end] from each of M rows into temp as (M, chunk_cols_pad)
-        for row in range(M):
-            src = input_dram_addr + (row * N + col_start) * bpe
-            dst = temp_dram_addr + row * chunk_cols_pad * bpe
-            ue.accelerator_memory_to_sram(src, URAM_A_BASE, chunk_cols)
-            ue.sram_to_accelerator_memory(URAM_A_BASE, dst, chunk_cols)
+        # Extract columns [col_start:col_end] from each of M rows via strided DMA
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=input_dram_addr + col_start * bpe,
+            sram_address=URAM_A_BASE,
+            element_size=M * chunk_cols,
+            stride_bytes_per_chunk=chunk_cols * bpe,
+            stride_jump_bytes=N * bpe)
+        ue.sram_to_accelerator_memory(
+            sram_address=URAM_A_BASE,
+            accelerator_dram_address=temp_dram_addr,
+            element_size=M * chunk_cols_pad)
 
         # Transpose (M, chunk_cols_pad) -> (chunk_cols_pad, M_aligned)
         # N_transpose = chunk_cols_pad = VS, so dot product has 1 group. Safe.
@@ -244,20 +287,19 @@ def half_step_residual_core_dram(ue: UnifiedEngine, M: int, N: int,
         OUTPUT_DRAM_ADDR: (M, N) bf16 — result
     """
     assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
-    row_bytes = N * 2
-    for m in range(M):
-        # Load ff_output into URAM_A, multiply by 0.5
-        ue.accelerator_memory_to_sram(FF_DRAM_ADDR + m * row_bytes, URAM_A_BASE, N)
-        ue.broadcast_mul(scalar=0.5, sram_start_addr=URAM_A_BASE,
-                         sram_wb_addr=URAM_A_BASE, element_size=N)
-        # Load residual into URAM_B, add
-        ue.accelerator_memory_to_sram(RESIDUAL_DRAM_ADDR + m * row_bytes, URAM_B_BASE, N)
-        ue.eltwise_add_core(vector_A_sram_start_addr=URAM_A_BASE,
-                            vector_B_sram_start_addr=URAM_B_BASE,
-                            vector_C_sram_wb_addr=URAM_A_BASE,
-                            element_size=N)
-        # Write result
-        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, N)
+    total_elems = M * N
+    # Load FF output, scale by 0.5
+    ue.accelerator_memory_to_sram(FF_DRAM_ADDR, URAM_A_BASE, total_elems)
+    ue.broadcast_mul(scalar=0.5, sram_start_addr=URAM_A_BASE,
+                     sram_wb_addr=URAM_A_BASE, element_size=total_elems)
+    # Load residual, add
+    ue.accelerator_memory_to_sram(RESIDUAL_DRAM_ADDR, URAM_B_BASE, total_elems)
+    ue.eltwise_add_core(vector_A_sram_start_addr=URAM_A_BASE,
+                        vector_B_sram_start_addr=URAM_B_BASE,
+                        vector_C_sram_wb_addr=URAM_A_BASE,
+                        element_size=total_elems)
+    # Write result
+    ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
 
 def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                              params_dram_addr, temp_dram_start):
@@ -705,10 +747,19 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             for our_key, nemo_key in ln_map.items():
                 la[f"{our_key}_WEIGHT"] = self._alloc_write(sd[f"{pfx}.{nemo_key}.weight"])
                 la[f"{our_key}_BIAS"] = self._alloc_write(sd[f"{pfx}.{nemo_key}.bias"])
-            la["FF1_W1"] = self._alloc_write(sd[f"{pfx}.feed_forward1.linear1.weight"])
-            la["FF1_W2"] = self._alloc_write(sd[f"{pfx}.feed_forward1.linear2.weight"])
-            la["FF2_W1"] = self._alloc_write(sd[f"{pfx}.feed_forward2.linear1.weight"])
-            la["FF2_W2"] = self._alloc_write(sd[f"{pfx}.feed_forward2.linear2.weight"])
+            # K-split: halve FF weights along inner dimension for better HW tiling
+            w1 = sd[f"{pfx}.feed_forward1.linear1.weight"]  # (4096, 1024)
+            la["FF1_W1_LO"] = self._alloc_write(w1[:FF//2, :].contiguous())
+            la["FF1_W1_HI"] = self._alloc_write(w1[FF//2:, :].contiguous())
+            w2 = sd[f"{pfx}.feed_forward1.linear2.weight"]  # (1024, 4096)
+            la["FF1_W2_LO"] = self._alloc_write(w2[:, :FF//2].contiguous())
+            la["FF1_W2_HI"] = self._alloc_write(w2[:, FF//2:].contiguous())
+            w1 = sd[f"{pfx}.feed_forward2.linear1.weight"]
+            la["FF2_W1_LO"] = self._alloc_write(w1[:FF//2, :].contiguous())
+            la["FF2_W1_HI"] = self._alloc_write(w1[FF//2:, :].contiguous())
+            w2 = sd[f"{pfx}.feed_forward2.linear2.weight"]
+            la["FF2_W2_LO"] = self._alloc_write(w2[:, :FF//2].contiguous())
+            la["FF2_W2_HI"] = self._alloc_write(w2[:, FF//2:].contiguous())
             la["ATTN_Q_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_q.weight"])
             la["ATTN_K_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_k.weight"])
             la["ATTN_V_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_v.weight"])
@@ -979,12 +1030,45 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             patches[:, :N, :9] = cols.permute(0, 2, 1).to(torch.bfloat16)
             return patches, H_out, W_out
 
+    def prepare_attention_tiled_biases(self, L_pad):
+        """Pre-tile attention bias_u and bias_v for bulk eltwise_add.
+        For each layer and head, creates (L_pad, dk) tiled bias in DRAM.
+        Must be called after weight_init() and before compile_encoder().
+        """
+        dk = self.head_dim  # 128
+        bpe = self.bytes_per_element
+        for layer_idx in range(self.num_layers):
+            la = self.layer_addrs[layer_idx]
+            for bias_key in ("ATTN_BIAS_U", "ATTN_BIAS_V"):
+                # Read the full (H_heads * dk) bias from DRAM
+                full_bias = torch.zeros(self.num_heads * dk, dtype=torch.bfloat16)
+                self.dma_read(DMA_DEVICE_C2H, la[bias_key], full_bias, self.num_heads * dk * bpe)
+                tiled_key = f"{bias_key}_TILED"
+                head_addrs = []
+                for h in range(self.num_heads):
+                    head_bias = full_bias[h * dk:(h + 1) * dk]
+                    # Tile: repeat dk-element bias L_pad times
+                    tiled = head_bias.unsqueeze(0).expand(L_pad, dk).contiguous()
+                    addr = self._alloc_write(tiled)
+                    head_addrs.append(addr)
+                la[tiled_key] = head_addrs
+
     def compile_encoder(self, L_pad):
         """Monolithic encoder compile: all conformer layers inline. Returns (prog, flops)."""
         D, FF, H_heads, dk = self.d_model, self.ff_dim, self.num_heads, self.head_dim
         bpe = self.bytes_per_element
         P = 2 * L_pad - 1
         P_pad = pad_to_multiple(P, self.block_size)
+
+        self.prepare_attention_tiled_biases(L_pad)
+
+        # Pre-tile BN params for bulk ops
+        bn_tiled = []
+        for layer_idx in range(self.num_layers):
+            la = self.layer_addrs[layer_idx]
+            s_addr, sh_addr = batch_norm_prepare_tiled(self, D, L_pad,
+                la["CONV_BN_SCALE"], la["CONV_BN_SHIFT"])
+            bn_tiled.append((s_addr, sh_addr))
 
         self.clear_capture_buffer()
         self.start_capture()
@@ -995,18 +1079,30 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         for layer_idx in range(self.num_layers):
             la = self.layer_addrs[layer_idx]
 
-            # ===== FF1 (half-step residual) =====
+            # ===== FF1 (half-step residual, K-split) =====
+            FF_HALF = FF // 2
             self.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
-
-            self.matmat_mul_core(M=L_pad, K=D, N=FF,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1"],
+            # Up-proj split: two (L_pad, D) @ (D, FF/2) = (L_pad, FF/2) with SiLU
+            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_LO"],
                 OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
+            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_HI"],
+                OUTPUT_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
             total_flops += 2 * L_pad * D * FF
-            self.matmat_mul_core(M=L_pad, K=FF, N=D,
-                A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2"],
+            # Down-proj split: two (L_pad, FF/2) @ (FF/2, D) + accumulate
+            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2_LO"],
                 OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
+            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF1_W2_HI"],
+                OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM)
+            self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
+            self.accelerator_memory_to_sram(self.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
+            self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
+            self.sram_to_accelerator_memory(URAM_A_BASE, self.FF_OUT_DRAM, L_pad * D)
             total_flops += 2 * L_pad * FF * D
             half_step_residual_core_dram(self, M=L_pad, N=D,
                 RESIDUAL_DRAM_ADDR=self.INPUT_DRAM, FF_DRAM_ADDR=self.FF_OUT_DRAM,
@@ -1031,13 +1127,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
             for h in range(H_heads):
                 h_off = h * dk * bpe
-                # Q_h + bias_u
+                # Q_h + bias_u (TILED)
                 self.accelerator_memory_to_sram(self.Q_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                self.accelerator_memory_to_sram(la["ATTN_BIAS_U"] + h_off, URAM_B_BASE, dk)
-                for row in range(L_pad):
-                    self.eltwise_add_core(URAM_A_BASE + row * dk * bpe, URAM_B_BASE,
-                        URAM_A_BASE + row * dk * bpe, dk)
+                self.accelerator_memory_to_sram(la["ATTN_BIAS_U_TILED"][h], URAM_B_BASE, L_pad * dk)
+                self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * dk)
                 self.sram_to_accelerator_memory(URAM_A_BASE, self.CONV_A_DRAM, L_pad * dk)
                 # K_h
                 self.accelerator_memory_to_sram(self.K_DRAM + h_off, URAM_A_BASE, L_pad * dk,
@@ -1048,13 +1142,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     A_DRAM_ADDR=self.CONV_A_DRAM, B_DRAM_ADDR=self.CONV_B_DRAM,
                     OUTPUT_DRAM_ADDR=self.SCORE_DRAM)
                 total_flops += 2 * L_pad * dk * L_pad
-                # Positional: Q_h + bias_v
+                # Positional: Q_h + bias_v (TILED)
                 self.accelerator_memory_to_sram(self.Q_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                self.accelerator_memory_to_sram(la["ATTN_BIAS_V"] + h_off, URAM_B_BASE, dk)
-                for row in range(L_pad):
-                    self.eltwise_add_core(URAM_A_BASE + row * dk * bpe, URAM_B_BASE,
-                        URAM_A_BASE + row * dk * bpe, dk)
+                self.accelerator_memory_to_sram(la["ATTN_BIAS_V_TILED"][h], URAM_B_BASE, L_pad * dk)
+                self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * dk)
                 self.sram_to_accelerator_memory(URAM_A_BASE, self.CONV_A_DRAM, L_pad * dk)
                 # P_h
                 self.accelerator_memory_to_sram(self.POS_PROJ_DRAM + h_off, URAM_A_BASE, P_pad * dk,
@@ -1072,14 +1164,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.accelerator_memory_to_sram(self.SCORE_DRAM, URAM_A_BASE, score_elems)
                 self.accelerator_memory_to_sram(self.REL_SHIFT_DRAM, URAM_B_BASE, score_elems)
                 self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, score_elems)
-                self.sram_to_accelerator_memory(URAM_A_BASE, self.SCORE_DRAM, score_elems)
-                # Scale
-                self.accelerator_memory_to_sram(self.SCORE_DRAM, URAM_A_BASE, score_elems)
+                # Scale (data already in URAM_A from eltwise_add above)
                 inv_sqrt_dk = 1.0 / math.sqrt(dk)
-                for row in range(L_pad):
-                    self.broadcast_mul(scalar=inv_sqrt_dk,
-                        sram_start_addr=URAM_A_BASE + row * L_pad * bpe,
-                        sram_wb_addr=URAM_A_BASE + row * L_pad * bpe, element_size=L_pad)
+                self.broadcast_mul(scalar=inv_sqrt_dk,
+                    sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE,
+                    element_size=score_elems)
                 self.sram_to_accelerator_memory(URAM_A_BASE, self.SCORE_DRAM, score_elems)
                 # Softmax + mask
                 self.matmat_mul_core(M=L_pad, K=L_pad, N=L_pad,
@@ -1146,7 +1235,9 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             total_flops += 2 * 9 * D * L_pad
             batch_norm_core_dram(self, C=D, L=L_pad,
                 A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_DW_DRAM,
-                SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"])
+                SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"],
+                tiled_scale_addr=bn_tiled[layer_idx][0],
+                tiled_shift_addr=bn_tiled[layer_idx][1])
             silu_core_dram(self, M=D, N=L_pad,
                 A_DRAM_ADDR=self.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM,
                 IDENTITY_DRAM_ADDR=self.IDENTITY_LPAD_DRAM)
@@ -1165,17 +1256,29 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.sram_to_accelerator_memory(URAM_A_BASE, self.INPUT_DRAM, L_pad * D)
             total_flops += L_pad * D
 
-            # ===== FF2 (half-step residual) =====
+            # ===== FF2 (half-step residual, K-split) =====
             self.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
-            self.matmat_mul_core(M=L_pad, K=D, N=FF,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1"],
+            # Up-proj split
+            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_LO"],
                 OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
+            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_HI"],
+                OUTPUT_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
             total_flops += 2 * L_pad * D * FF
-            self.matmat_mul_core(M=L_pad, K=FF, N=D,
-                A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2"],
+            # Down-proj split + accumulate
+            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2_LO"],
                 OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
+            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF2_W2_HI"],
+                OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM)
+            self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
+            self.accelerator_memory_to_sram(self.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
+            self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
+            self.sram_to_accelerator_memory(URAM_A_BASE, self.FF_OUT_DRAM, L_pad * D)
             total_flops += 2 * L_pad * FF * D
             half_step_residual_core_dram(self, M=L_pad, N=D,
                 RESIDUAL_DRAM_ADDR=self.INPUT_DRAM, FF_DRAM_ADDR=self.FF_OUT_DRAM,
@@ -1760,6 +1863,18 @@ def main():
         engine.dma_to_accelerator_memory(addr, toeplitz.reshape(-1).contiguous())
         toeplitz_addrs.append(addr)
     print(f"  Toeplitz staged: {engine.get_params_dram_usage()/1024**2:.0f} MB params used")
+
+    # Pre-tile BN params for bulk ops
+    bn_tiled = []
+    for li in range(engine.num_layers):
+        la_i = engine.layer_addrs[li]
+        s_addr, sh_addr = batch_norm_prepare_tiled(engine, D, L_pad,
+            la_i["CONV_BN_SCALE"], la_i["CONV_BN_SHIFT"])
+        bn_tiled.append((s_addr, sh_addr))
+
+    # Pre-tile attention biases for bulk ops
+    engine.prepare_attention_tiled_biases(L_pad)
+
     print(f"  Encoder setup done")
 
 
@@ -1768,16 +1883,27 @@ def main():
         la = engine.layer_addrs[layer_idx]
         t_addr = toeplitz_addrs[layer_idx]
         if True:  # indent block (was emit_full_layer)
-            # FF1
+            # FF1 (K-split)
+            FF_HALF = FF // 2
             engine.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
-            engine.matmat_mul_core(M=L_pad, K=D, N=FF,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1"],
+            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_LO"],
                 OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM, silu_enable=True)
-            engine.matmat_mul_core(M=L_pad, K=FF, N=D,
-                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2"],
+            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_HI"],
+                OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2_LO"],
                 OUTPUT_DRAM_ADDR=engine.FF_OUT_DRAM)
+            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF1_W2_HI"],
+                OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM)
+            engine.accelerator_memory_to_sram(engine.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
+            engine.accelerator_memory_to_sram(engine.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
+            engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
+            engine.sram_to_accelerator_memory(URAM_A_BASE, engine.FF_OUT_DRAM, L_pad * D)
             half_step_residual_core_dram(engine, M=L_pad, N=D,
                 RESIDUAL_DRAM_ADDR=engine.INPUT_DRAM, FF_DRAM_ADDR=engine.FF_OUT_DRAM,
                 OUTPUT_DRAM_ADDR=engine.INPUT_DRAM)
@@ -1802,10 +1928,8 @@ def main():
                 h_off = h * dk * bpe
                 engine.accelerator_memory_to_sram(engine.Q_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.accelerator_memory_to_sram(la["ATTN_BIAS_U"] + h_off, URAM_B_BASE, dk)
-                for row in range(L_pad):
-                    engine.eltwise_add_core(URAM_A_BASE + row * dk * bpe, URAM_B_BASE,
-                        URAM_A_BASE + row * dk * bpe, dk)
+                engine.accelerator_memory_to_sram(la["ATTN_BIAS_U_TILED"][h], URAM_B_BASE, L_pad * dk)
+                engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * dk)
                 engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_A_DRAM, L_pad * dk)
                 engine.accelerator_memory_to_sram(engine.K_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
@@ -1815,10 +1939,8 @@ def main():
                     OUTPUT_DRAM_ADDR=engine.SCORE_DRAM)
                 engine.accelerator_memory_to_sram(engine.Q_DRAM + h_off, URAM_A_BASE, L_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                engine.accelerator_memory_to_sram(la["ATTN_BIAS_V"] + h_off, URAM_B_BASE, dk)
-                for row in range(L_pad):
-                    engine.eltwise_add_core(URAM_A_BASE + row * dk * bpe, URAM_B_BASE,
-                        URAM_A_BASE + row * dk * bpe, dk)
+                engine.accelerator_memory_to_sram(la["ATTN_BIAS_V_TILED"][h], URAM_B_BASE, L_pad * dk)
+                engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * dk)
                 engine.sram_to_accelerator_memory(URAM_A_BASE, engine.CONV_A_DRAM, L_pad * dk)
                 engine.accelerator_memory_to_sram(engine.POS_PROJ_DRAM + h_off, URAM_A_BASE, P_pad * dk,
                     stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
@@ -1833,12 +1955,9 @@ def main():
                 engine.accelerator_memory_to_sram(engine.SCORE_DRAM, URAM_A_BASE, score_elems)
                 engine.accelerator_memory_to_sram(engine.REL_SHIFT_DRAM, URAM_B_BASE, score_elems)
                 engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, score_elems)
-                engine.sram_to_accelerator_memory(URAM_A_BASE, engine.SCORE_DRAM, score_elems)
-                engine.accelerator_memory_to_sram(engine.SCORE_DRAM, URAM_A_BASE, score_elems)
-                for row in range(L_pad):
-                    engine.broadcast_mul(scalar=inv_sqrt_dk,
-                        sram_start_addr=URAM_A_BASE + row * L_pad * bpe,
-                        sram_wb_addr=URAM_A_BASE + row * L_pad * bpe, element_size=L_pad)
+                engine.broadcast_mul(scalar=inv_sqrt_dk,
+                    sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE,
+                    element_size=score_elems)
                 engine.sram_to_accelerator_memory(URAM_A_BASE, engine.SCORE_DRAM, score_elems)
                 engine.matmat_mul_core(M=L_pad, K=L_pad, N=L_pad,
                     A_DRAM_ADDR=engine.SCORE_DRAM, B_DRAM_ADDR=engine.IDENTITY_LPAD_DRAM,
@@ -1890,7 +2009,9 @@ def main():
             # BN + SiLU + Transpose + PW Conv2 + Residual
             batch_norm_core_dram(engine, C=D, L=L_pad,
                 A_DRAM_ADDR=engine.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=engine.CONV_DW_DRAM,
-                SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"])
+                SCALE_DRAM_ADDR=la["CONV_BN_SCALE"], SHIFT_DRAM_ADDR=la["CONV_BN_SHIFT"],
+                tiled_scale_addr=bn_tiled[layer_idx][0],
+                tiled_shift_addr=bn_tiled[layer_idx][1])
             silu_core_dram(engine, M=D, N=L_pad,
                 A_DRAM_ADDR=engine.CONV_DW_DRAM, OUTPUT_DRAM_ADDR=engine.CONV_OUT_DRAM,
                 IDENTITY_DRAM_ADDR=engine.IDENTITY_LPAD_DRAM)
@@ -1905,16 +2026,26 @@ def main():
             engine.accelerator_memory_to_sram(engine.CONV_OUT_DRAM, URAM_B_BASE, L_pad * D)
             engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
             engine.sram_to_accelerator_memory(URAM_A_BASE, engine.INPUT_DRAM, L_pad * D)
-            # FF2
+            # FF2 (K-split)
             engine.layer_norm_core_dram(M=L_pad, N=D,
                 A_DRAM_ADDR=engine.INPUT_DRAM, OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM,
                 GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
-            engine.matmat_mul_core(M=L_pad, K=D, N=FF,
-                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1"],
+            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_LO"],
                 OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM, silu_enable=True)
-            engine.matmat_mul_core(M=L_pad, K=FF, N=D,
-                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2"],
+            engine.matmat_mul_core(M=L_pad, K=D, N=FF_HALF,
+                A_DRAM_ADDR=engine.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_HI"],
+                OUTPUT_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=engine.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2_LO"],
                 OUTPUT_DRAM_ADDR=engine.FF_OUT_DRAM)
+            engine.matmat_mul_core(M=L_pad, K=FF_HALF, N=D,
+                A_DRAM_ADDR=engine.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF2_W2_HI"],
+                OUTPUT_DRAM_ADDR=engine.LN_OUT_DRAM)
+            engine.accelerator_memory_to_sram(engine.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
+            engine.accelerator_memory_to_sram(engine.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
+            engine.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
+            engine.sram_to_accelerator_memory(URAM_A_BASE, engine.FF_OUT_DRAM, L_pad * D)
             half_step_residual_core_dram(engine, M=L_pad, N=D,
                 RESIDUAL_DRAM_ADDR=engine.INPUT_DRAM, FF_DRAM_ADDR=engine.FF_OUT_DRAM,
                 OUTPUT_DRAM_ADDR=engine.INPUT_DRAM)
@@ -1924,47 +2055,48 @@ def main():
                 GAMMA_DRAM_ADDR=la["LN_OUT_WEIGHT"], BETA_DRAM_ADDR=la["LN_OUT_BIAS"])
         print(f"    Layer {layer_idx:2d} emitted")
 
+    # ==================================================================
+    # Compilation
+    # ==================================================================
     import time as _time
-    print(f"\n--- Compiling & running single 24-layer instruction stream ---")
-    # Save encoder program address before compile_and_run
+    import sentencepiece as spm
+
+    print(f"\n{'='*60}")
+    print(f"  COMPILING...")
+    print(f"{'='*60}")
+
+    # Compile encoder (capture instructions, write to DRAM — don't execute yet)
+    engine.clear_capture_buffer()
+    engine.start_capture()
+    engine.generate_instruction_flag_clear()
+    emit_all_24_layers()
+    engine.stop_capture()
+    engine.generate_instruction_halt()
     enc_prog_addr = engine.get_program_dram_addr()
-    compile_and_run(engine, emit_all_24_layers)
-    print(f"  All 24 layers executed in one program")
+    engine.write_captured_instructions_to_dram(enc_prog_addr)
+    enc_prog_bytes = engine.get_capture_instruction_size_bytes()
+    engine.allocate_program_dram(enc_prog_bytes)
 
-    # --- Read encoder output ---
-    hw_enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D).reshape(L_pad, D)
-
-    # --- Compile decoder ---
+    # Compile decoder
     pred_prog, tok_prog, dur_prog, _ = engine.compile_decoder()
     engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0)}
 
-    # --- Run full HW decode ---
-    engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM, hw_enc_out.contiguous())
-    hw_tokens_raw = engine.run_decode(engine.ENC_OUT_DRAM, L)
-
-    # --- Decode to text ---
-    import sentencepiece as spm
-    sp = spm.SentencePieceProcessor()
-    sp.Load(TOKENIZER_PATH)
-    vocab_sz = sp.GetPieceSize()
-    hw_valid = [t for t in hw_tokens_raw if 0 <= t < vocab_sz]
-    hw_text = sp.DecodeIds(hw_valid)
-    print(f"\n  >>> {hw_text}")
+    print(f"\n  Compilation Finished")
+    print(f"  Encoder program: {enc_prog_bytes:,} bytes")
 
     # ==================================================================
-    # Timed forward pass (subsampling + encoder + decoder)
+    # Executing Forward Pass
     # ==================================================================
-    import time as _time
-    print(f"\n--- Timed forward pass ---")
+    print(f"\n{'='*60}")
+    print(f"  EXECUTING FORWARD PASS...")
+    print(f"{'='*60}")
 
     t_start = _time.perf_counter()
 
-    # Subsampling stage 0 (HW)
+    # --- Subsampling ---
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
     engine.dma_to_accelerator_memory(engine.SUB_PATCH_DRAM, patches0.contiguous())
     engine.program_execute(prog_s0)
-
-    # Stages 1 & 2 (CPU)
     s0 = read_dram(engine, engine.SUB_OUT0_DRAM, N0 * SC)
     s0_4d = s0.reshape(H0, W0, SC).permute(2, 0, 1).unsqueeze(0).to(torch.bfloat16)
     s1 = F.relu(F.conv2d(F.conv2d(s0_4d,
@@ -1979,9 +2111,7 @@ def main():
         sd["encoder.pre_encode.conv.6.bias"].to(torch.bfloat16)))
     fl = s2.squeeze(0).permute(1, 0, 2).reshape(H2, SC * W2).to(torch.bfloat16).contiguous()
     if H2 < L_pad:
-        fp = torch.zeros(L_pad, 4096, dtype=torch.bfloat16)
-        fp[:H2, :] = fl
-        fl = fp
+        fp = torch.zeros(L_pad, 4096, dtype=torch.bfloat16); fp[:H2, :] = fl; fl = fp
     engine.dma_to_accelerator_memory(engine.SUB_FLAT_DRAM, fl.contiguous())
     engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
     engine.program_execute(prog_lin)
@@ -1992,26 +2122,69 @@ def main():
 
     t_sub_done = _time.perf_counter()
 
-    # Encoder (single instruction stream)
+    # --- Encoder (single instruction stream) ---
     engine.start_execute_from_dram(enc_prog_addr)
     engine.wait_queue(120.0)
+    engine.report_timing_and_instruction_count()
 
     t_enc_done = _time.perf_counter()
 
-    # Decoder
-    enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D)
-    engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM, enc_out.contiguous())
-    _ = engine.run_decode(engine.ENC_OUT_DRAM, L)
+    # --- Decoder ---
+    hw_enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D)
+    engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM, hw_enc_out.contiguous())
+    hw_tokens = engine.run_decode(engine.ENC_OUT_DRAM, L)
 
-    t_end = _time.perf_counter()
+    t_dec_done = _time.perf_counter()
 
-    audio_dur = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
-    print(f"\n  Subsampling:    {t_sub_done - t_start:.3f}s")
-    print(f"  Encoder:        {t_enc_done - t_sub_done:.3f}s")
-    print(f"  Decoder:        {t_end - t_enc_done:.3f}s")
-    print(f"  Total:          {t_end - t_start:.3f}s")
-    print(f"  Audio duration: {audio_dur:.1f}s")
-    print(f"  RTF:            {(t_end - t_start) / audio_dur:.2f}x")
+    # --- Results ---
+    sp = spm.SentencePieceProcessor()
+    sp.Load(TOKENIZER_PATH)
+    vocab_sz = sp.GetPieceSize()
+    hw_text = sp.DecodeIds([t for t in hw_tokens if 0 <= t < vocab_sz])
+
+    audio_duration = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
+    total = t_dec_done - t_start
+
+    print(f"\n  >>> {hw_text}")
+    print(f"\n  Timing:")
+    print(f"    Subsampling:         {t_sub_done - t_start:.3f}s")
+    print(f"    Encoder (24 layers): {t_enc_done - t_sub_done:.3f}s")
+    print(f"    Decoder:             {t_dec_done - t_enc_done:.3f}s")
+    print(f"    Total:               {total:.3f}s")
+    print(f"    Audio duration:      {audio_duration:.1f}s")
+    print(f"    Real-time factor:    {total / audio_duration:.2f}x")
+
+    # --- CPU reference comparison ---
+    print(f"\n  Computing CPU reference (24-layer conformer)...")
+    REF_DIR = "/home/rohit/apex-compute-ML/simple-llm/src/parakeet"
+    sys.path.insert(0, REF_DIR)
+    from parakeet_modules import ParakeetTDT, make_rel_pos_emb
+    from parakeet_main import load_checkpoint as ref_load_checkpoint, convert_to_bf16
+
+    ref_model = ParakeetTDT()
+    ref_model = ref_load_checkpoint(ref_model, WEIGHTS_PATH)
+    ref_model = convert_to_bf16(ref_model)
+    ref_model.eval()
+    ref_model.stage_for_hardware()
+
+    ref_x = hw_lin[:H2].unsqueeze(0).to(torch.bfloat16)
+    ref_pos = make_rel_pos_emb(H2).to(dtype=ref_x.dtype)
+    with torch.no_grad():
+        for layer in ref_model.encoder.layers:
+            ref_x = layer(ref_x, ref_pos)
+    ref_enc_out = ref_x.squeeze(0)
+    hw_vs_cpu("encoder_24layers", hw_enc_out.reshape(L_pad, D)[:H2], ref_enc_out, cos_threshold=0.65)
+
+    with torch.no_grad():
+        ref_tokens = ref_model.decode(ref_enc_out.unsqueeze(0))
+    ref_text = sp.DecodeIds([t for t in ref_tokens[0] if 0 <= t < vocab_sz])
+    print(f"\n  HW  transcript: >>> {hw_text}")
+    print(f"  CPU transcript: >>> {ref_text}")
+
+    print(f"\n{'='*60}")
+    print(f"  FULL PIPELINE COMPLETE")
+    print(f"{'='*60}")
+
 
 
 if __name__ == "__main__":
