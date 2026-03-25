@@ -54,7 +54,7 @@
 #define UE_BIAS_ADDER_EN_ADDR        0x00000060
 #define UE_URAM_WB_PADDING_ADDR      0x00000064
 #define UE_BROADCAST_MODE_ADDR       0x00000068
-#define UE_ARGMAX_INDEX              0x0000006C
+// #define UE_ARGMAX_INDEX              0x0000006C
 #define UE_INSTRUCTION_CTL_ADDR      0x00000070
 #define UE_TOTAL_BYTES_PER_STRIDE    0x00000074
 #define UE_INSTRUCTION_ADDR          0x00000078
@@ -62,7 +62,11 @@
 #define UE_FMAX_CONTEXT_ADDR         0x00000080
 #define UE_TRACE_BRAM_ADDR           0x00000084
 #define UE_TRACE_BRAM_DATA           0x00000088
-#define UE_LAST_REG_ADDR             0x00000088
+#define UE_ARGMAX1_INDEX             0x0000008C
+#define UE_ARGMAX2_INDEX             0x00000090
+#define UE_ARGMAX3_INDEX             0x00000094
+#define UE_ARGMAX4_INDEX             0x00000098
+#define UE_LAST_REG_ADDR             0x00000098
 
 /* ── Latency constants (from user_dma_core.py pipeline calculations) ── */
 #define UE_PIPELINE_BF19_MULT       2
