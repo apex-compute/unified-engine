@@ -32,7 +32,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, set_dma_device,
-    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX1_INDEX
+    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX1_INDEX, UE_ARGMAX2_INDEX
 )
 
 URAM_A_BASE = 0x00000
@@ -1570,7 +1570,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
         return results
     def compile_decoder(self):
-        """Compile predictor LSTM + split joint. Returns (pred_prog, tok_prog, dur_prog, flops)."""
+        """Compile predictor LSTM + joint. Returns (pred_prog, joint_prog, flops)."""
         H = self.pred_hidden
         D = self.d_model
         bpe = self.bytes_per_element
@@ -1625,7 +1625,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         pred_prog = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(pred_prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        # --- Joint token program ---
+        # --- Joint program (token + duration matmuls, argmax1 and argmax2) ---
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
@@ -1638,26 +1638,19 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, H)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_SUM_DRAM, H)
         self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.JOINT_SUM_DRAM, relu_enable=True)
+        # Token logits → argmax1
         self.matmat_mul_core(M=1, K=H, N=N_tok_pad, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["JOINT_OUT_TOK_W"], OUTPUT_DRAM_ADDR=self.JOINT_TOK_DRAM, C_DRAM_ADDR=self.w["JOINT_OUT_TOK_B"])
         total_flops += 2 * H * N_tok_pad
-        self.stop_capture()
-        self.generate_instruction_halt()
-        tok_prog = self.get_program_dram_addr()
-        self.write_captured_instructions_to_dram(tok_prog)
-        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        # --- Joint duration program ---
-        self.clear_capture_buffer()
-        self.start_capture()
-        self.generate_instruction_flag_clear()
+        # Duration logits → argmax2
         self.matmat_mul_core(M=1, K=H, N=N_dur_pad, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["JOINT_OUT_DUR_W"], OUTPUT_DRAM_ADDR=self.JOINT_DUR_DRAM, C_DRAM_ADDR=self.w["JOINT_OUT_DUR_B"])
         total_flops += 2 * H * N_dur_pad
         self.stop_capture()
         self.generate_instruction_halt()
-        dur_prog = self.get_program_dram_addr()
-        self.write_captured_instructions_to_dram(dur_prog)
+        joint_prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(joint_prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
 
-        return pred_prog, tok_prog, dur_prog, total_flops
+        return pred_prog, joint_prog, total_flops
     def program_execute(self, program_addr, timeout=50.0, flops=None):
         """Execute compiled program. Returns (latency_us, gflops)."""
         self.start_execute_from_dram(program_addr)
@@ -1668,9 +1661,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             if flops:
                 gflops = self.report_flop_rate_gflops(flops)
         return latency_us, gflops
-    def get_arg_max_index(self):
-        """Read hardware argmax register."""
+    def get_arg_max_index1(self):
+        """Read hardware argmax1 register."""
         return self.read_reg32(user_dma_core.UE_ARGMAX1_INDEX)
+    def get_arg_max_index2(self):
+        """Read hardware argmax2 register."""
+        return self.read_reg32(user_dma_core.UE_ARGMAX2_INDEX)
     def make_rel_pos_emb(self, seq_len):
         """Generate relative positional encoding: (2*seq_len-1, D) bf16."""
         D = self.d_model
@@ -1692,8 +1688,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         H = self.pred_hidden
         D = self.d_model
         pred_prog = self.progs["pred"][0]
-        tok_prog = self.progs["joint_tok"][0]
-        dur_prog = self.progs["joint_dur"][0]
+        joint_prog = self.progs["joint"][0]
         # Pre-zero all decoder intermediate buffers
         zeros_h = torch.zeros(H, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.PRED_H0_DRAM, zeros_h)
@@ -1741,12 +1736,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 pred_buf = torch.zeros(H, dtype=torch.bfloat16)
                 self.dma_read(DMA_DEVICE_C2H, self.PRED_OUT_DRAM, pred_buf, H * bpe)
                 self.dma_to_accelerator_memory(self.JOINT_PRED_DRAM, pred_buf)
-                # Joint token -> hardware argmax
-                self.program_execute(tok_prog)
-                token_id = self.get_arg_max_index()
-                # Joint duration -> hardware argmax
-                self.program_execute(dur_prog)
-                dur_idx = self.get_arg_max_index()
+                # Joint token + duration -> hardware argmax1, argmax2
+                self.program_execute(joint_prog)
+                token_id = self.get_arg_max_index1()
+                dur_idx = self.get_arg_max_index2()
                 dur = self.tdt_durations[dur_idx] if dur_idx < len(self.tdt_durations) else 0
                 total_steps += 1
                 if token_id == self.blank_id:
@@ -1776,6 +1769,7 @@ def main():
     parser.add_argument("--cycle", type=float, default=5.63, help="Clock cycle in ns")
     parser.add_argument("--profile", action="store_true", help="Profile encoder sub-blocks instead of running full inference")
     parser.add_argument("--compare", action="store_true", help="Layer-by-layer encoder comparison against NeMo reference")
+    parser.add_argument("--frames", type=int, default=None, help="Truncate mel spectrogram to this many frames (e.g. 300 for ~3s)")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -1800,6 +1794,9 @@ def main():
 
     # --- Mel spectrogram (CPU) ---
     mel = compute_mel_spectrogram(waveform, cfg, ckpt_sd=sd)
+    if args.frames is not None:
+        mel = mel[:, :args.frames, :]
+        print(f"  --frames {args.frames}: truncated mel to {mel.shape[1]} frames")
     T_mel = mel.shape[1]
     n_mels = cfg["encoder"]["n_mels"]  # 128
 
@@ -1916,9 +1913,9 @@ def main():
         enc_prog_addr, enc_prog_bytes = engine.compile_encoder(L_pad, toeplitz_addrs, bn_tiled)
         print(f"  Encoder compiled: {enc_prog_bytes:,} bytes")
         # Decoder programs (3 small programs for host-driven decode loop)
-        pred_prog, tok_prog, dur_prog, _ = engine.compile_decoder()
-        engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0)}
-        print(f"  Decoder compiled (3 programs)")
+        pred_prog, joint_prog, _ = engine.compile_decoder()
+        engine.progs = {"pred": (pred_prog, 0), "joint": (joint_prog, 0)}
+        print(f"  Decoder compiled (2 programs)")
         print(f"\n  Compilation Finished")
 
     # ==================================================================
@@ -2300,7 +2297,10 @@ def main():
     hw_text = sp.DecodeIds([t for t in hw_tokens if 0 <= t < vocab_sz])
     cpu_text = sp.DecodeIds([t for t in cpu_tokens if 0 <= t < vocab_sz])
 
-    audio_duration = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
+    if args.frames is not None:
+        audio_duration = T_mel * cfg["preprocessing"]["hop_length"] / cfg["preprocessing"]["sample_rate"]
+    else:
+        audio_duration = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
     total = t_dec_done - t_start
 
     print(f"\n  >>> HW decode:  {hw_text}")
