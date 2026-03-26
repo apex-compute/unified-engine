@@ -1570,7 +1570,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
         return results
     def compile_decoder(self):
-        """Compile predictor LSTM + joint. Returns (pred_prog, joint_prog, flops)."""
+        """Compile predictor LSTM + split joint. Returns (pred_prog, tok_prog, dur_prog, flops)."""
         H = self.pred_hidden
         D = self.d_model
         bpe = self.bytes_per_element
@@ -1625,7 +1625,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         pred_prog = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(pred_prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        # --- Joint program (token + duration matmuls, argmax1 and argmax2) ---
+        # --- Joint token program (shared projections + token matmul → argmax) ---
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
@@ -1638,19 +1638,26 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, H)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_SUM_DRAM, H)
         self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.JOINT_SUM_DRAM, relu_enable=True)
-        # Token logits → argmax1
         self.matmat_mul_core(M=1, K=H, N=N_tok_pad, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["JOINT_OUT_TOK_W"], OUTPUT_DRAM_ADDR=self.JOINT_TOK_DRAM, C_DRAM_ADDR=self.w["JOINT_OUT_TOK_B"])
         total_flops += 2 * H * N_tok_pad
-        # Duration logits → argmax2
+        self.stop_capture()
+        self.generate_instruction_halt()
+        tok_prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(tok_prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        # --- Joint duration program (duration matmul → argmax, reuses JOINT_SUM_DRAM) ---
+        self.clear_capture_buffer()
+        self.start_capture()
+        self.generate_instruction_flag_clear()
         self.matmat_mul_core(M=1, K=H, N=N_dur_pad, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["JOINT_OUT_DUR_W"], OUTPUT_DRAM_ADDR=self.JOINT_DUR_DRAM, C_DRAM_ADDR=self.w["JOINT_OUT_DUR_B"])
         total_flops += 2 * H * N_dur_pad
         self.stop_capture()
         self.generate_instruction_halt()
-        joint_prog = self.get_program_dram_addr()
-        self.write_captured_instructions_to_dram(joint_prog)
+        dur_prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(dur_prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
 
-        return pred_prog, joint_prog, total_flops
+        return pred_prog, tok_prog, dur_prog, total_flops
     def program_execute(self, program_addr, timeout=50.0, flops=None):
         """Execute compiled program. Returns (latency_us, gflops)."""
         self.start_execute_from_dram(program_addr)
@@ -1688,7 +1695,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         H = self.pred_hidden
         D = self.d_model
         pred_prog = self.progs["pred"][0]
-        joint_prog = self.progs["joint"][0]
+        tok_prog = self.progs["joint_tok"][0]
+        dur_prog = self.progs["joint_dur"][0]
         # Pre-zero all decoder intermediate buffers
         zeros_h = torch.zeros(H, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.PRED_H0_DRAM, zeros_h)
@@ -1736,10 +1744,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 pred_buf = torch.zeros(H, dtype=torch.bfloat16)
                 self.dma_read(DMA_DEVICE_C2H, self.PRED_OUT_DRAM, pred_buf, H * bpe)
                 self.dma_to_accelerator_memory(self.JOINT_PRED_DRAM, pred_buf)
-                # Joint token + duration -> hardware argmax1, argmax2
-                self.program_execute(joint_prog)
+                # Joint token -> hardware argmax
+                self.program_execute(tok_prog)
                 token_id = self.get_arg_max_index1()
-                dur_idx = self.get_arg_max_index2()
+                # Joint duration -> hardware argmax
+                self.program_execute(dur_prog)
+                dur_idx = self.get_arg_max_index1()
                 dur = self.tdt_durations[dur_idx] if dur_idx < len(self.tdt_durations) else 0
                 total_steps += 1
                 if token_id == self.blank_id:
@@ -1913,9 +1923,9 @@ def main():
         enc_prog_addr, enc_prog_bytes = engine.compile_encoder(L_pad, toeplitz_addrs, bn_tiled)
         print(f"  Encoder compiled: {enc_prog_bytes:,} bytes")
         # Decoder programs (3 small programs for host-driven decode loop)
-        pred_prog, joint_prog, _ = engine.compile_decoder()
-        engine.progs = {"pred": (pred_prog, 0), "joint": (joint_prog, 0)}
-        print(f"  Decoder compiled (2 programs)")
+        pred_prog, tok_prog, dur_prog, _ = engine.compile_decoder()
+        engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0)}
+        print(f"  Decoder compiled (3 programs)")
         print(f"\n  Compilation Finished")
 
     # ==================================================================
@@ -2326,12 +2336,10 @@ def main():
 
     # --- Original NeMo model inference (CPU/GPU) for comparison ---
     import logging, warnings, io, contextlib
-    for name in ["nemo_logger", "nemo", "pytorch_lightning", "lightning_fabric",
-                 "transformers", "filelock", "huggingface_hub"]:
-        logging.getLogger(name).setLevel(logging.CRITICAL)
+    logging.getLogger().setLevel(logging.CRITICAL)
     warnings.filterwarnings("ignore")
 
-    with contextlib.redirect_stderr(io.StringIO()):
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
         import nemo.collections.asr as nemo_asr
         nemo_path = os.path.join(SCRIPT_DIR, "parakeet_bin", "models--nvidia--parakeet-tdt-0.6b-v3",
                                  "snapshots", "6d590f77001d318fb17a0b5bf7ee329a91b52598",
