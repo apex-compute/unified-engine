@@ -39,6 +39,129 @@ URAM_A_BASE = 0x00000
 URAM_B_BASE = 0x80000
 EPS = 1e-5
 
+# Quantization support (FP4 / INT4)
+FP4_WEIGHTS_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "encoder_fp4.bin")
+FP4_MANIFEST_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "encoder_fp4.json")
+INT4_WEIGHTS_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "encoder_int4.bin")
+INT4_MANIFEST_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "encoder_int4.json")
+
+_FP4_E2M1_TABLE = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.bfloat16)
+
+def quantize_fp4_64(tensor):
+    """FP4 E2M1 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
+    x = tensor.to(torch.bfloat16).cpu().flatten()
+    n_blocks = int(np.ceil(x.numel() / 64))
+    if x.numel() % 64 != 0:
+        x = torch.nn.functional.pad(x, (0, n_blocks * 64 - x.numel()))
+    blocks = x.view(n_blocks, 64)
+    fp4_max = torch.tensor(6.0, dtype=torch.bfloat16)
+    scales = (blocks.abs().max(dim=1).values / fp4_max).clamp(min=1e-8).to(torch.bfloat16)
+    scaled = (blocks / scales[:, None]).to(torch.bfloat16)
+    codes = torch.argmin(torch.abs(scaled.unsqueeze(-1) - _FP4_E2M1_TABLE), dim=-1).to(torch.uint8)
+    codes_np = codes.numpy().flatten()
+    if len(codes_np) % 2 != 0:
+        codes_np = np.pad(codes_np, (0, 1))
+    packed = (codes_np[0::2] & 0x0F) | ((codes_np[1::2] & 0x0F) << 4)
+    scales_np = scales.view(torch.uint16).numpy()
+    return np.frombuffer(scales_np.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
+
+def quantize_q4_64(tensor):
+    """INT4 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
+    data = tensor.flatten().cpu().float().numpy()
+    n_blocks = int(np.ceil(len(data) / 64))
+    padded = np.pad(data, (0, n_blocks * 64 - len(data)))
+    blocks = padded.reshape(n_blocks, 64)
+    scales = np.max(np.abs(blocks), axis=1)
+    scales[scales == 0] = 1.0
+    scales /= 7.0
+    quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
+    pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
+    packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
+    scale_bytes = torch.tensor(scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
+    return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
+
+def _encoder_weight_entries(sd, layer_idx, FF, D):
+    """Return dict of {key: tensor} for the 16 large encoder weights of a layer."""
+    pfx = f"encoder.layers.{layer_idx}"
+    return {
+        "FF1_W1_LO": sd[f"{pfx}.feed_forward1.linear1.weight"][:FF//2, :].contiguous(),
+        "FF1_W1_HI": sd[f"{pfx}.feed_forward1.linear1.weight"][FF//2:, :].contiguous(),
+        "FF1_W2_LO": sd[f"{pfx}.feed_forward1.linear2.weight"][:, :FF//2].contiguous(),
+        "FF1_W2_HI": sd[f"{pfx}.feed_forward1.linear2.weight"][:, FF//2:].contiguous(),
+        "FF2_W1_LO": sd[f"{pfx}.feed_forward2.linear1.weight"][:FF//2, :].contiguous(),
+        "FF2_W1_HI": sd[f"{pfx}.feed_forward2.linear1.weight"][FF//2:, :].contiguous(),
+        "FF2_W2_LO": sd[f"{pfx}.feed_forward2.linear2.weight"][:, :FF//2].contiguous(),
+        "FF2_W2_HI": sd[f"{pfx}.feed_forward2.linear2.weight"][:, FF//2:].contiguous(),
+        "ATTN_Q_W": sd[f"{pfx}.self_attn.linear_q.weight"],
+        "ATTN_K_W": sd[f"{pfx}.self_attn.linear_k.weight"],
+        "ATTN_V_W": sd[f"{pfx}.self_attn.linear_v.weight"],
+        "ATTN_POS_W": sd[f"{pfx}.self_attn.linear_pos.weight"],
+        "ATTN_OUT_W": sd[f"{pfx}.self_attn.linear_out.weight"],
+        "CONV_PW1A_W": sd[f"{pfx}.conv.pointwise_conv1.weight"].squeeze(-1)[:D].contiguous(),
+        "CONV_PW1B_W": sd[f"{pfx}.conv.pointwise_conv1.weight"].squeeze(-1)[D:].contiguous(),
+        "CONV_PW2_W": sd[f"{pfx}.conv.pointwise_conv2.weight"].squeeze(-1),
+    }
+
+def generate_quantized_weights(quant_mode):
+    """Quantize large encoder weights and write bin + json manifest.
+    quant_mode: 'fp4' or 'int4'."""
+    qfn = quantize_fp4_64 if quant_mode == 'fp4' else quantize_q4_64
+    bin_path = FP4_WEIGHTS_PATH if quant_mode == 'fp4' else INT4_WEIGHTS_PATH
+    json_path = FP4_MANIFEST_PATH if quant_mode == 'fp4' else INT4_MANIFEST_PATH
+    print(f"Generating {quant_mode.upper()} encoder weights...")
+    sd = torch.load(WEIGHTS_PATH, map_location="cpu", weights_only=True)
+    FF, D = 4096, 1024
+    manifest = {}
+    with open(bin_path, 'wb') as f:
+        for i in range(24):
+            entries = _encoder_weight_entries(sd, i, FF, D)
+            for key, tensor in entries.items():
+                name = f"layer.{i}.{key}"
+                data, _ = qfn(tensor)
+                offset = f.tell()
+                raw = data.tobytes()
+                f.write(raw)
+                manifest[name] = {"offset": offset, "size": len(raw)}
+            print(f"\r  Layer {i:2d}/23 quantized", end="", flush=True)
+    print()
+    with open(json_path, 'w') as f:
+        json.dump(manifest, f)
+    print(f"  Written: {bin_path} ({os.path.getsize(bin_path)/1048576:.1f} MB)")
+    print(f"  Manifest: {json_path} ({len(manifest)} tensors)")
+
+def load_quantized_weight_cache(quant_mode):
+    """Load quantized bin + json manifest. Returns {tensor_name: raw_numpy_data}."""
+    json_path = FP4_MANIFEST_PATH if quant_mode == 'fp4' else INT4_MANIFEST_PATH
+    bin_path = FP4_WEIGHTS_PATH if quant_mode == 'fp4' else INT4_WEIGHTS_PATH
+    with open(json_path) as f:
+        manifest = json.load(f)
+    with open(bin_path, 'rb') as f:
+        raw = f.read()
+    cache = {}
+    for name, meta in manifest.items():
+        cache[name] = np.frombuffer(raw[meta['offset']:meta['offset'] + meta['size']], dtype=np.uint8).copy()
+    return cache
+
+def store_quantized_weight(ue, raw_data):
+    """Store FP4_64 quantized data as separate scale + packed in DRAM. Returns (scale_addr, data_addr)."""
+    raw_bytes = raw_data.tobytes() if hasattr(raw_data, 'tobytes') else bytes(raw_data)
+    n_blocks = len(raw_bytes) // 34  # 34 = 2 (scale) + 32 (packed codes for 64 elements)
+    scales_size = n_blocks * 2
+    data_size = n_blocks * 32
+    scales_np = np.frombuffer(raw_bytes[:scales_size], dtype=np.uint16).copy()
+    scale_tensor = torch.from_numpy(scales_np).view(torch.bfloat16)
+    scale_addr = ue.get_params_dram_addr()
+    ue.dma_write(DMA_DEVICE_H2C, scale_addr, scale_tensor, scales_size)
+    ue.allocate_params_dram(scales_size)
+    data_np = np.frombuffer(raw_bytes[scales_size:scales_size + data_size], dtype=np.uint8).copy()
+    data_tensor = torch.from_numpy(data_np)
+    data_addr = ue.get_params_dram_addr()
+    ue.dma_write(DMA_DEVICE_H2C, data_addr, data_tensor, data_size)
+    ue.allocate_params_dram(data_size)
+    return scale_addr, data_addr
+
 WEIGHTS_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "model_weights.ckpt")
 TOKENIZER_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "tokenizer.model")
 
@@ -554,9 +677,13 @@ PARAKEET_PROGRAM_BASE = 0xE0000000   # 512 MB for compiled instruction programs
 class Parakeet_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine subclass for Parakeet-TDT-0.6B."""
 
-    def __init__(self, script_dir=None, clock_period_ns=None):
+    def __init__(self, script_dir=None, clock_period_ns=None, fp4=False, int4=False):
         super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR, params_dram_base=PARAKEET_PARAMS_BASE, tensor_dram_base=PARAKEET_TENSOR_BASE, program_dram_base=PARAKEET_PROGRAM_BASE, clock_period_ns=clock_period_ns)
         self.script_dir = script_dir or SCRIPT_DIR
+        self.fp4 = fp4
+        self.int4 = int4
+        # Unified quant mode: None, 'fp4', or 'int4'
+        self.quant = 'fp4' if fp4 else ('int4' if int4 else None)
         # Hang prevention: stop stale execution, write HALT to program base
         self.dram_inst_running(False)
         self.start_capture()
@@ -705,6 +832,26 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.w["SUB_OUT_B"] = self._alloc_write(sd["encoder.pre_encode.out.bias"])
 
         # Per-layer conformer weights
+        # Expected (N, K) element counts for each quantized weight key
+        _QUANT_EXPECTED = {
+            "FF1_W1_LO": FF//2 * D, "FF1_W1_HI": FF//2 * D,
+            "FF1_W2_LO": D * FF//2, "FF1_W2_HI": D * FF//2,
+            "FF2_W1_LO": FF//2 * D, "FF2_W1_HI": FF//2 * D,
+            "FF2_W2_LO": D * FF//2, "FF2_W2_HI": D * FF//2,
+            "ATTN_Q_W": D*D, "ATTN_K_W": D*D, "ATTN_V_W": D*D,
+            "ATTN_POS_W": D*D, "ATTN_OUT_W": D*D,
+            "CONV_PW1A_W": D*D, "CONV_PW1B_W": D*D, "CONV_PW2_W": D*D,
+        }
+        _QUANT_KEYS = set(_QUANT_EXPECTED.keys())
+        quant_cache = None
+        if self.quant:
+            bin_path = FP4_WEIGHTS_PATH if self.quant == 'fp4' else INT4_WEIGHTS_PATH
+            if not os.path.exists(bin_path):
+                print(f"  {self.quant.upper()} weights not found, generating...")
+                generate_quantized_weights(self.quant)
+            print(f"  Loading {self.quant.upper()} encoder weights from {bin_path}...")
+            quant_cache = load_quantized_weight_cache(self.quant)
+            print(f"  {self.quant.upper()} cache: {len(quant_cache)} tensors loaded")
         self.layer_addrs = []
         for i in range(self.num_layers):
             la = {}
@@ -714,28 +861,42 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             for our_key, nemo_key in ln_map.items():
                 la[f"{our_key}_WEIGHT"] = self._alloc_write(sd[f"{pfx}.{nemo_key}.weight"])
                 la[f"{our_key}_BIAS"] = self._alloc_write(sd[f"{pfx}.{nemo_key}.bias"])
-            # K-split: halve FF weights along inner dimension for better HW tiling
-            w1 = sd[f"{pfx}.feed_forward1.linear1.weight"]  # (4096, 1024)
-            la["FF1_W1_LO"] = self._alloc_write(w1[:FF//2, :].contiguous())
-            la["FF1_W1_HI"] = self._alloc_write(w1[FF//2:, :].contiguous())
-            w2 = sd[f"{pfx}.feed_forward1.linear2.weight"]  # (1024, 4096)
-            la["FF1_W2_LO"] = self._alloc_write(w2[:, :FF//2].contiguous())
-            la["FF1_W2_HI"] = self._alloc_write(w2[:, FF//2:].contiguous())
-            w1 = sd[f"{pfx}.feed_forward2.linear1.weight"]
-            la["FF2_W1_LO"] = self._alloc_write(w1[:FF//2, :].contiguous())
-            la["FF2_W1_HI"] = self._alloc_write(w1[FF//2:, :].contiguous())
-            w2 = sd[f"{pfx}.feed_forward2.linear2.weight"]
-            la["FF2_W2_LO"] = self._alloc_write(w2[:, :FF//2].contiguous())
-            la["FF2_W2_HI"] = self._alloc_write(w2[:, FF//2:].contiguous())
-            la["ATTN_Q_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_q.weight"])
-            la["ATTN_K_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_k.weight"])
-            la["ATTN_V_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_v.weight"])
-            la["ATTN_POS_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_pos.weight"])
-            la["ATTN_OUT_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_out.weight"])
+            if self.quant:
+                # Load pre-quantized weights from bin file
+                for key in _QUANT_KEYS:
+                    cache_key = f"layer.{i}.{key}"
+                    raw = quant_cache[cache_key]
+                    n_blocks = len(raw) // 34
+                    n_elements = n_blocks * 64
+                    expected = _QUANT_EXPECTED[key]
+                    assert n_elements == expected, (
+                        f"{self.quant.upper()} shape mismatch: layer {i} {key}: got {n_elements} elements, "
+                        f"expected {expected}. Delete encoder_{self.quant}.bin and regenerate.")
+                    la[key] = store_quantized_weight(self, raw)
+            else:
+                # BF16 weights from checkpoint
+                w1 = sd[f"{pfx}.feed_forward1.linear1.weight"]  # (4096, 1024)
+                la["FF1_W1_LO"] = self._alloc_write(w1[:FF//2, :].contiguous())
+                la["FF1_W1_HI"] = self._alloc_write(w1[FF//2:, :].contiguous())
+                w2 = sd[f"{pfx}.feed_forward1.linear2.weight"]  # (1024, 4096)
+                la["FF1_W2_LO"] = self._alloc_write(w2[:, :FF//2].contiguous())
+                la["FF1_W2_HI"] = self._alloc_write(w2[:, FF//2:].contiguous())
+                w1 = sd[f"{pfx}.feed_forward2.linear1.weight"]
+                la["FF2_W1_LO"] = self._alloc_write(w1[:FF//2, :].contiguous())
+                la["FF2_W1_HI"] = self._alloc_write(w1[FF//2:, :].contiguous())
+                w2 = sd[f"{pfx}.feed_forward2.linear2.weight"]
+                la["FF2_W2_LO"] = self._alloc_write(w2[:, :FF//2].contiguous())
+                la["FF2_W2_HI"] = self._alloc_write(w2[:, FF//2:].contiguous())
+                la["ATTN_Q_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_q.weight"])
+                la["ATTN_K_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_k.weight"])
+                la["ATTN_V_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_v.weight"])
+                la["ATTN_POS_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_pos.weight"])
+                la["ATTN_OUT_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_out.weight"])
+                pw1_a, pw1_b = self._split_pw_conv1(sd[f"{pfx}.conv.pointwise_conv1.weight"])
+                la["CONV_PW1A_W"], la["CONV_PW1B_W"] = pw1_a, pw1_b
+                la["CONV_PW2_W"] = self._alloc_write(sd[f"{pfx}.conv.pointwise_conv2.weight"].squeeze(-1))
             la["ATTN_BIAS_U"] = self._alloc_write(sd[f"{pfx}.self_attn.pos_bias_u"].reshape(-1))
             la["ATTN_BIAS_V"] = self._alloc_write(sd[f"{pfx}.self_attn.pos_bias_v"].reshape(-1))
-            pw1_a, pw1_b = self._split_pw_conv1(sd[f"{pfx}.conv.pointwise_conv1.weight"])
-            la["CONV_PW1A_W"], la["CONV_PW1B_W"] = pw1_a, pw1_b
             la["CONV_DW_W"] = self._stage_dw_conv1d(sd[f"{pfx}.conv.depthwise_conv.weight"])
             bn_w = sd[f"{pfx}.conv.batch_norm.weight"]
             bn_b = sd[f"{pfx}.conv.batch_norm.bias"]
@@ -743,11 +904,13 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             bn_v = sd[f"{pfx}.conv.batch_norm.running_var"]
             s_addr, sh_addr, _ = batch_norm_fuse_params(self, bn_w, bn_b, bn_m, bn_v)
             la["CONV_BN_SCALE"], la["CONV_BN_SHIFT"] = s_addr, sh_addr
-            la["CONV_PW2_W"] = self._alloc_write(sd[f"{pfx}.conv.pointwise_conv2.weight"].squeeze(-1))
             self.layer_addrs.append(la)
             print(f"\r  Layer {i:2d}/{self.num_layers - 1} staged", end="", flush=True)
 
         print()
+        if self.quant:
+            q_count = sum(1 for la in self.layer_addrs for v in la.values() if isinstance(v, tuple))
+            print(f"  Encoder: {q_count} {self.quant.upper()} weight tensors loaded to DRAM")
         # Predictor weights
         self.w["EMBED"] = self._alloc_write(sd["decoder.prediction.embed.weight"])
         for i in range(2):
@@ -1013,6 +1176,22 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     addr = self._alloc_write(tiled)
                     head_addrs.append(addr)
                 la[tiled_key] = head_addrs
+    _enc_matmul_quant_count = 0
+    _enc_matmul_bf16_count = 0
+    def _enc_matmul(self, M, K, N, A_DRAM_ADDR, w_addr, OUTPUT_DRAM_ADDR, **kw):
+        """Encoder matmul: dispatches bf16 or quantized based on self.quant.
+        w_addr is a single DRAM addr (bf16) or (scale_addr, data_addr) tuple (quantized)."""
+        if self.quant and isinstance(w_addr, tuple):
+            scale_addr, data_addr = w_addr
+            Parakeet_UnifiedEngine._enc_matmul_quant_count += 1
+            dtype = TYPE.FP4 if self.quant == 'fp4' else TYPE.INT4
+            self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
+                B_DRAM_ADDR=data_addr, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                is_B_quantized=True, data_type=dtype, SCALE_DRAM_ADDR=scale_addr, **kw)
+        else:
+            Parakeet_UnifiedEngine._enc_matmul_bf16_count += 1
+            self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
+                B_DRAM_ADDR=w_addr, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, **kw)
     def compile_encoder(self, L_pad, toeplitz_addrs, bn_tiled):
         """Compile full 24-layer conformer encoder. Returns (program_addr, program_bytes).
         Must call prepare_attention_tiled_biases(L_pad) before this.
@@ -1039,12 +1218,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             FF_HALF = FF // 2
             self.layer_norm_core_dram(M=L_pad, N=D,A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM,GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
             # Up-proj split: two (L_pad, D) @ (D, FF/2) = (L_pad, FF/2) with SiLU
-            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_LO"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
-            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_HI"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+            self._enc_matmul(L_pad, D, FF_HALF, self.LN_OUT_DRAM, la["FF1_W1_LO"], self.FF_MID_DRAM, silu_enable=True)
+            self._enc_matmul(L_pad, D, FF_HALF, self.LN_OUT_DRAM, la["FF1_W1_HI"], self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
             total_flops += 2 * L_pad * D * FF
             # Down-proj split: two (L_pad, FF/2) @ (FF/2, D) + accumulate
-            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2_LO"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
-            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF1_W2_HI"], OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM)
+            self._enc_matmul(L_pad, FF_HALF, D, self.FF_MID_DRAM, la["FF1_W2_LO"], self.FF_OUT_DRAM)
+            self._enc_matmul(L_pad, FF_HALF, D, self.FF_MID_DRAM + L_pad * FF_HALF * bpe, la["FF1_W2_HI"], self.LN_OUT_DRAM)
             self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
             self.accelerator_memory_to_sram(self.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
             self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
@@ -1057,16 +1236,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
             # ===== Self-attention =====
             self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_ATTN_WEIGHT"], BETA_DRAM_ADDR=la["LN_ATTN_BIAS"])
-            self.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_Q_W"], OUTPUT_DRAM_ADDR=self.Q_DRAM)
-            self.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_K_W"], OUTPUT_DRAM_ADDR=self.K_DRAM)
-            self.matmat_mul_core(M=L_pad, K=D, N=D,
-                A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_V_W"], OUTPUT_DRAM_ADDR=self.V_DRAM)
+            self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_Q_W"], self.Q_DRAM)
+            self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_K_W"], self.K_DRAM)
+            self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_V_W"], self.V_DRAM)
             total_flops += 3 * 2 * L_pad * D * D
-            self.matmat_mul_core(M=P_pad, K=D, N=D,
-                A_DRAM_ADDR=self.POS_EMB_DRAM, B_DRAM_ADDR=la["ATTN_POS_W"],
-                OUTPUT_DRAM_ADDR=self.POS_PROJ_DRAM)
+            self._enc_matmul(P_pad, D, D, self.POS_EMB_DRAM, la["ATTN_POS_W"], self.POS_PROJ_DRAM)
             total_flops += 2 * P_pad * D * D
 
             for h in range(H_heads):
@@ -1120,7 +1294,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.accelerator_memory_to_sram(self.CONV_A_DRAM, URAM_A_BASE, L_pad * dk)
                 self.sram_to_accelerator_memory(URAM_A_BASE, self.ATTN_OUT_DRAM + h_off, L_pad * dk, stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
             # Output projection + residual
-            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.ATTN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_OUT_W"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
+            self._enc_matmul(L_pad, D, D, self.ATTN_OUT_DRAM, la["ATTN_OUT_W"], self.FF_OUT_DRAM)
             total_flops += 2 * L_pad * D * D
             self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
             self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_B_BASE, L_pad * D)
@@ -1130,8 +1304,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
             # ===== Conv module =====
             self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_CONV_WEIGHT"], BETA_DRAM_ADDR=la["LN_CONV_BIAS"])
-            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1A_W"], OUTPUT_DRAM_ADDR=self.CONV_A_DRAM)
-            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1B_W"], OUTPUT_DRAM_ADDR=self.CONV_B_DRAM, sigmoid_enable=True)
+            self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["CONV_PW1A_W"], self.CONV_A_DRAM)
+            self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["CONV_PW1B_W"], self.CONV_B_DRAM, sigmoid_enable=True)
             total_flops += 2 * 2 * L_pad * D * D
             # GLU: a * sigmoid(b) — sigmoid fused into PW1b above
             self.accelerator_memory_to_sram(self.CONV_A_DRAM, URAM_A_BASE, L_pad * D)
@@ -1152,7 +1326,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             # Transpose (D, L_pad) -> (L_pad, D) from SiLU output.
             chunked_transpose_core_dram(self, M=D, N=L_pad, input_dram_addr=self.CONV_OUT_DRAM, output_dram_addr=self.CONV_T_DRAM, identity_dram_addr=self.w["IDENTITY_64"], temp_dram_addr=self.PERMUTE_TEMP_DRAM)
             total_flops += (L_pad // UE_VECTOR_SIZE) * L_pad * 2 * UE_VECTOR_SIZE * pad_to_multiple(D, UE_VECTOR_SIZE)  # transpose dot-products
-            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.CONV_T_DRAM, B_DRAM_ADDR=la["CONV_PW2_W"], OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM)
+            self._enc_matmul(L_pad, D, D, self.CONV_T_DRAM, la["CONV_PW2_W"], self.CONV_OUT_DRAM)
             total_flops += 2 * L_pad * D * D
             self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
             self.accelerator_memory_to_sram(self.CONV_OUT_DRAM, URAM_B_BASE, L_pad * D)
@@ -1163,12 +1337,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             # ===== FF2 (half-step residual, K-split) =====
             self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
             # Up-proj split
-            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_LO"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
-            self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_HI"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+            self._enc_matmul(L_pad, D, FF_HALF, self.LN_OUT_DRAM, la["FF2_W1_LO"], self.FF_MID_DRAM, silu_enable=True)
+            self._enc_matmul(L_pad, D, FF_HALF, self.LN_OUT_DRAM, la["FF2_W1_HI"], self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
             total_flops += 2 * L_pad * D * FF
             # Down-proj split + accumulate
-            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2_LO"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
-            self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF2_W2_HI"], OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM)
+            self._enc_matmul(L_pad, FF_HALF, D, self.FF_MID_DRAM, la["FF2_W2_LO"], self.FF_OUT_DRAM)
+            self._enc_matmul(L_pad, FF_HALF, D, self.FF_MID_DRAM + L_pad * FF_HALF * bpe, la["FF2_W2_HI"], self.LN_OUT_DRAM)
             self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
             self.accelerator_memory_to_sram(self.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
             self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
@@ -1183,6 +1357,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             print(f"\r    Layer {layer_idx:2d}/{self.num_layers - 1} compiled", end="", flush=True)
 
         print()
+        q_n = Parakeet_UnifiedEngine._enc_matmul_quant_count
+        bf16_n = Parakeet_UnifiedEngine._enc_matmul_bf16_count
+        q_label = self.quant.upper() if self.quant else "QUANT"
+        print(f"  Encoder matmul dispatch: {q_n} {q_label}, {bf16_n} BF16  (expected: {384 if self.quant else 0} quantized)")
         # Copy final encoder output
         self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.ENC_OUT_DRAM, L_pad * D)
@@ -1783,7 +1961,10 @@ def main():
     parser.add_argument("--profile", action="store_true", help="Profile encoder sub-blocks instead of running full inference")
     parser.add_argument("--compare", action="store_true", help="Layer-by-layer encoder comparison against NeMo reference")
     parser.add_argument("--frames", type=int, default=None, help="Truncate mel spectrogram to this many frames (e.g. 300 for ~3s)")
+    parser.add_argument("--fp4", action="store_true", help="Use FP4 quantized encoder weights (auto-generates if missing)")
+    parser.add_argument("--int4", action="store_true", help="Use INT4 quantized encoder weights (auto-generates if missing)")
     args = parser.parse_args()
+    assert not (args.fp4 and args.int4), "--fp4 and --int4 are mutually exclusive"
 
     cfg = load_config()
     set_dma_device(args.dev)
@@ -1801,7 +1982,9 @@ def main():
     print(f"  Audio: {waveform.shape[1]} samples ({waveform.shape[1]/cfg['preprocessing']['sample_rate']:.1f}s)")
 
     # --- Init engine, load weights ---
-    engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
+    engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, fp4=args.fp4, int4=args.int4)
+    if engine.quant:
+        print(f"  {engine.quant.upper()} encoder weights enabled")
     engine.weight_init()
     sd = engine._ckpt_sd
 
@@ -2212,6 +2395,17 @@ def main():
 
     t_enc_done = _time.perf_counter()
 
+    # --- Encoder diagnostic: print key info and stop ---
+    enc_sample = read_dram(engine, engine.INPUT_DRAM, min(64, L_pad * D))
+    vals = enc_sample[:8].tolist()
+    mode_str = engine.quant.upper() if engine.quant else 'BF16'
+    print(f"\n  === ENCODER DIAGNOSTIC ===")
+    print(f"  Mode: {mode_str}")
+    print(f"  Program bytes: {enc_prog_bytes:,}")
+    print(f"  Encoder output first 8 values: {[f'{v:.6f}' for v in vals]}")
+    print(f"  Matmul dispatch: {Parakeet_UnifiedEngine._enc_matmul_quant_count} {mode_str}, {Parakeet_UnifiedEngine._enc_matmul_bf16_count} BF16")
+    assert False, f"DIAGNOSTIC STOP — compare BF16 vs --fp4 vs --int4 output above"
+
     # --- Decoder (host-driven greedy loop) ---
     hw_enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D)
     engine.dma_to_accelerator_memory(engine.ENC_OUT_DRAM, hw_enc_out.contiguous())
@@ -2316,8 +2510,8 @@ def main():
         audio_duration = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
     total = t_dec_done - t_start
 
-    print(f"\n  >>> HW decode:  {hw_text}")
-    print(f"  >>> CPU decode: {cpu_text}")
+    print(f"\n  >>> HW decode:                {hw_text}")
+    print(f"  >>> CPU decode (HW encoder):  {cpu_text}")
     if hw_text == cpu_text:
         print(f"  >>> MATCH")
     else:
@@ -2328,7 +2522,6 @@ def main():
     print(f"    Subsampling:         {t_sub_done - t_start:.3f}s")
     print(f"    Encoder (24 layers): {t_enc_done - t_sub_done:.3f}s")
     print(f"    HW Decoder:          {t_dec_done - t_enc_done:.3f}s")
-    print(f"    CPU Decoder:         {t_cpu_dec_done - t_dec_done:.3f}s")
     print(f"    Total (HW path):     {total:.3f}s")
     print(f"    Audio duration:      {audio_duration:.1f}s")
     print(f"    Real-time factor:    {total / audio_duration:.2f}x")
@@ -2337,95 +2530,7 @@ def main():
     print(f"  FULL PIPELINE COMPLETE")
     print(f"{'='*60}")
 
-    # --- CPU BF16 forward pass (encoder + decoder) for timing comparison ---
-    sys.path.insert(0, "/home/rohit/apex-compute-ML/simple-llm/src/parakeet")
-    from parakeet_modules import ParakeetTDT as CPU_ParakeetTDT, make_rel_pos_emb as cpu_make_rel_pos_emb
-    sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", ".."))
-
-    t_cpu_load_start = _time.perf_counter()
-    print(f"\n  Loading CPU BF16 model...", end="", flush=True)
-    cpu_model = CPU_ParakeetTDT()
-    cpu_sd = engine._ckpt_sd
-    for i in range(engine.num_layers):
-        layer = cpu_model.encoder.layers[i]
-        pfx = f"encoder.layers.{i}"
-        layer.ln_ff1.weight.data.copy_(cpu_sd[f"{pfx}.norm_feed_forward1.weight"])
-        layer.ln_ff1.bias.data.copy_(cpu_sd[f"{pfx}.norm_feed_forward1.bias"])
-        layer.ln_attn.weight.data.copy_(cpu_sd[f"{pfx}.norm_self_att.weight"])
-        layer.ln_attn.bias.data.copy_(cpu_sd[f"{pfx}.norm_self_att.bias"])
-        layer.ln_conv.weight.data.copy_(cpu_sd[f"{pfx}.norm_conv.weight"])
-        layer.ln_conv.bias.data.copy_(cpu_sd[f"{pfx}.norm_conv.bias"])
-        layer.ln_ff2.weight.data.copy_(cpu_sd[f"{pfx}.norm_feed_forward2.weight"])
-        layer.ln_ff2.bias.data.copy_(cpu_sd[f"{pfx}.norm_feed_forward2.bias"])
-        layer.ln_out.weight.data.copy_(cpu_sd[f"{pfx}.norm_out.weight"])
-        layer.ln_out.bias.data.copy_(cpu_sd[f"{pfx}.norm_out.bias"])
-        layer.ff1.linear1.weight.data.copy_(cpu_sd[f"{pfx}.feed_forward1.linear1.weight"])
-        layer.ff1.linear2.weight.data.copy_(cpu_sd[f"{pfx}.feed_forward1.linear2.weight"])
-        layer.ff2.linear1.weight.data.copy_(cpu_sd[f"{pfx}.feed_forward2.linear1.weight"])
-        layer.ff2.linear2.weight.data.copy_(cpu_sd[f"{pfx}.feed_forward2.linear2.weight"])
-        layer.self_attn.linear_q.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_q.weight"])
-        layer.self_attn.linear_k.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_k.weight"])
-        layer.self_attn.linear_v.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_v.weight"])
-        layer.self_attn.linear_out.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_out.weight"])
-        layer.self_attn.linear_pos.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_pos.weight"])
-        layer.self_attn.pos_bias_u.data.copy_(cpu_sd[f"{pfx}.self_attn.pos_bias_u"])
-        layer.self_attn.pos_bias_v.data.copy_(cpu_sd[f"{pfx}.self_attn.pos_bias_v"])
-        layer.conv.pw_conv1_w.data.copy_(cpu_sd[f"{pfx}.conv.pointwise_conv1.weight"])
-        layer.conv.dw_conv_w.data.copy_(cpu_sd[f"{pfx}.conv.depthwise_conv.weight"])
-        layer.conv.pw_conv2_w.data.copy_(cpu_sd[f"{pfx}.conv.pointwise_conv2.weight"])
-        layer.conv.bn_weight.data.copy_(cpu_sd[f"{pfx}.conv.batch_norm.weight"])
-        layer.conv.bn_bias.data.copy_(cpu_sd[f"{pfx}.conv.batch_norm.bias"])
-        layer.conv.bn_mean.copy_(cpu_sd[f"{pfx}.conv.batch_norm.running_mean"])
-        layer.conv.bn_var.copy_(cpu_sd[f"{pfx}.conv.batch_norm.running_var"])
-    cpu_model.bfloat16()
-    cpu_model.eval()
-    cpu_model.stage_for_hardware()
-    print(f" done ({_time.perf_counter() - t_cpu_load_start:.1f}s)")
-
-    # CPU BF16 encoder forward
-    cpu_enc_input = sub_output.reshape(1, L_pad, D).to(torch.bfloat16)
-    pos_emb = cpu_make_rel_pos_emb(L_pad).to(torch.bfloat16)
-
-    print(f"  Running CPU BF16 encoder...", end="", flush=True)
-    with torch.no_grad():
-        t_cpu_enc_start = _time.perf_counter()
-        cpu_enc_x = cpu_enc_input
-        for layer in cpu_model.encoder.layers:
-            cpu_enc_x = layer(cpu_enc_x, pos_emb)
-        t_cpu_enc_done = _time.perf_counter()
-        print(f" done ({t_cpu_enc_done - t_cpu_enc_start:.3f}s)")
-
-        # CPU BF16 decoder forward
-        print(f"  Running CPU BF16 decoder...", end="", flush=True)
-        cpu_enc_out = cpu_enc_x
-        t_cpu_bf16_dec_start = _time.perf_counter()
-        cpu_bf16_tokens = cpu_model.decode(cpu_enc_out)[0]
-        t_cpu_bf16_dec_done = _time.perf_counter()
-        print(f" done ({t_cpu_bf16_dec_done - t_cpu_bf16_dec_start:.3f}s)")
-
-    cpu_bf16_text = sp.DecodeIds([t for t in cpu_bf16_tokens if 0 <= t < vocab_sz])
-
-    print(f"\n  >>> CPU BF16:  {cpu_bf16_text}")
-
-    cpu_enc_time = t_cpu_enc_done - t_cpu_enc_start
-    cpu_dec_time = t_cpu_bf16_dec_done - t_cpu_bf16_dec_start
-    cpu_total = cpu_enc_time + cpu_dec_time
-
-    print(f"\n{'='*60}")
-    print(f"  TIMING SUMMARY")
-    print(f"{'='*60}")
-    print(f"  {'':30}  {'HW':>12}  {'CPU BF16':>12}")
-    print(f"  {'-'*56}")
-    print(f"  {'Encoder':30}  {t_enc_done - t_sub_done:>11.3f}s  {cpu_enc_time:>11.3f}s")
-    print(f"  {'Decoder':30}  {t_dec_done - t_enc_done:>11.3f}s  {cpu_dec_time:>11.3f}s")
-    print(f"  {'Total (enc+dec)':30}  {t_dec_done - t_sub_done:>11.3f}s  {cpu_total:>11.3f}s")
-    print(f"  {'-'*56}")
-    print(f"  {'Audio duration':30}  {audio_duration:>11.1f}s")
-    print(f"  {'RTF (HW)':30}  {(t_dec_done - t_sub_done) / audio_duration:>11.2f}x")
-    print(f"  {'RTF (CPU BF16)':30}  {cpu_total / audio_duration:>11.2f}x")
-    print(f"  {'Speedup (CPU/HW)':30}  {cpu_total / (t_dec_done - t_sub_done):>11.2f}x")
-
-    # --- Original NeMo model inference (BF16 only) for transcript comparison ---
+    # --- NeMo model inference (BF16) for transcript comparison ---
     import logging, warnings, io, contextlib
     logging.getLogger().setLevel(logging.CRITICAL)
     warnings.filterwarnings("ignore")
@@ -2437,8 +2542,12 @@ def main():
                                  "parakeet-tdt-0.6b-v3.nemo")
         model = nemo_asr.models.ASRModel.restore_from(nemo_path)
         model.bfloat16()
+    t_nemo_start = _time.perf_counter()
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
         transcript_bf16 = model.transcribe([audio_path])
+    t_nemo_done = _time.perf_counter()
     print(f"\n  >>> NeMo BF16: {transcript_bf16[0].text}")
+    print(f"  >>> NeMo BF16 wall clock: {t_nemo_done - t_nemo_start:.3f}s (RTF: {(t_nemo_done - t_nemo_start) / audio_duration:.2f}x)")
 
 if __name__ == "__main__":
     main()
