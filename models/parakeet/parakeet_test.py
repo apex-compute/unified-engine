@@ -1453,7 +1453,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         print(f"\n{'='*120}")
         print(f"  ENCODER PROFILING: {self.num_layers} layers x 5 sub-blocks")
         print(f"{'='*120}")
-        print(f"{'Layer':>5}  {'Block':<12}  {'Instrs':>8}  {'HW(us)':>12}  {'Wall(ms)':>10}  {'GFLOP':>8}  {'GFLOP/s(w)':>10}  Dimensions")
+        print(f"{'Layer':>5}  {'Block':<12}  {'Instrs':>8}  {'HW(us)':>12}  {'Wall(ms)':>10}  {'GFLOP':>8}  {'GFLOP/s(hw)':>11}  {'GFLOP/s(w)':>10}  Dimensions")
         print("-" * 120)
 
         results = []
@@ -1491,16 +1491,18 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             gflops = flops / 1e9
             wall_rate = gflops / wall_s if wall_s > 0 else 0
 
+            hw_rate = gflops / (hw_us * 1e-6) if hw_us > 0 else 0
+
             results.append({
                 "layer": layer_idx, "block": block_name,
                 "instr_count": instr_count, "hw_us": hw_us,
                 "wall_s": wall_s, "flops": flops,
-                "gflops": gflops, "wall_rate": wall_rate,
+                "gflops": gflops, "hw_rate": hw_rate, "wall_rate": wall_rate,
                 "dispatch_ms": dispatch_ms, "poll_ms": poll_ms,
                 "poll_count": poll_count, "read_ms": read_ms,
                 "gap_ms": gap_ms,
             })
-            print(f"{layer_idx:>5}  {block_name:<12}  {instr_count:>8}  {hw_us:>12.2f}  {wall_s*1000:>10.2f}  {gflops:>8.3f}  {wall_rate:>8.2f}  {dims}")
+            print(f"{layer_idx:>5}  {block_name:<12}  {instr_count:>8}  {hw_us:>12.2f}  {wall_s*1000:>10.2f}  {gflops:>8.3f}  {hw_rate:>9.2f}  {wall_rate:>8.2f}  {dims}")
 
         total_wall = _time.perf_counter() - total_t0
         total_hw_us = sum(r["hw_us"] for r in results)
@@ -1539,8 +1541,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
         print(f"\n  By sub-block type:")
         print(f"  {'Block':<12}  {'Total HW(us)':>14}  {'Total Wall(s)':>13}  {'% HW':>7}  {'% Wall':>7}  "
-              f"{'Disp(ms)':>9}  {'Poll(ms)':>9}  {'Read(ms)':>9}  {'Total GFLOP':>12}  {'GFLOP/s(wall)':>13}")
-        print(f"  {'-'*120}")
+              f"{'Disp(ms)':>9}  {'Poll(ms)':>9}  {'Read(ms)':>9}  {'Total GFLOP':>12}  {'GFLOP/s(hw)':>11}  {'GFLOP/s(wall)':>13}")
+        print(f"  {'-'*130}")
         for bname in block_names:
             br = [r for r in results if r["block"] == bname]
             bk_hw = sum(r["hw_us"] for r in br)
@@ -1548,12 +1550,13 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             bk_gflops = sum(r["gflops"] for r in br)
             bk_hw_pct = 100 * bk_hw / total_hw_us if total_hw_us > 0 else 0
             bk_wall_pct = 100 * bk_wall / total_wall if total_wall > 0 else 0
+            bk_hw_rate = bk_gflops / (bk_hw * 1e-6) if bk_hw > 0 else 0
             bk_wall_rate = bk_gflops / bk_wall if bk_wall > 0 else 0
             bk_disp = sum(r["dispatch_ms"] for r in br)
             bk_poll = sum(r["poll_ms"] for r in br)
             bk_read = sum(r["read_ms"] for r in br)
             print(f"  {bname:<12}  {bk_hw:>14.2f}  {bk_wall:>13.3f}  {bk_hw_pct:>6.1f}%  {bk_wall_pct:>6.1f}%  "
-                  f"{bk_disp:>9.1f}  {bk_poll:>9.1f}  {bk_read:>9.1f}  {bk_gflops:>12.3f}  {bk_wall_rate:>13.2f}")
+                  f"{bk_disp:>9.1f}  {bk_poll:>9.1f}  {bk_read:>9.1f}  {bk_gflops:>12.3f}  {bk_hw_rate:>11.2f}  {bk_wall_rate:>13.2f}")
 
         print(f"\n  Per-layer total:")
         print(f"  {'Layer':>7}  {'HW(us)':>14}  {'Wall(ms)':>12}  {'Disp(ms)':>9}  {'Poll(ms)':>9}  {'Read(ms)':>9}")
