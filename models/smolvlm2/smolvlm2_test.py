@@ -23,7 +23,7 @@ from huggingface_hub import snapshot_download
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX,
+    DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
     UnifiedEngine,
@@ -1199,7 +1199,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
     def clear_inst_id(self) -> None:
         self._inst_id = 0
     def get_arg_max_index(self) -> int:
-        return self.read_reg32(UE_ARGMAX_INDEX)
+        return self.read_reg32(UE_ARGMAX1_INDEX)
     def overwrite_instruction_with_general_register(self, general_register: int) -> None:
         """Overwrite last instruction to use general register for DRAM address."""
         overwrite_last_instruction_with_general_register(self, general_register)
