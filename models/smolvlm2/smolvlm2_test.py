@@ -23,7 +23,7 @@ from huggingface_hub import snapshot_download
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX,
+    DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
     UnifiedEngine,
