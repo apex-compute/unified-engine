@@ -32,7 +32,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, set_dma_device,
-    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION,
+    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX1_INDEX
 )
 
 URAM_A_BASE = 0x00000
@@ -1670,7 +1670,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         return latency_us, gflops
     def get_arg_max_index(self):
         """Read hardware argmax register."""
-        return self.read_reg32(user_dma_core.UE_ARGMAX_INDEX)
+        return self.read_reg32(user_dma_core.UE_ARGMAX1_INDEX)
     def make_rel_pos_emb(self, seq_len):
         """Generate relative positional encoding: (2*seq_len-1, D) bf16."""
         D = self.d_model
