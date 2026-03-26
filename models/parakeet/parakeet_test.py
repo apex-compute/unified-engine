@@ -2337,7 +2337,95 @@ def main():
     print(f"  FULL PIPELINE COMPLETE")
     print(f"{'='*60}")
 
-    # --- Original NeMo model inference (CPU/GPU) for comparison ---
+    # --- CPU BF16 forward pass (encoder + decoder) for timing comparison ---
+    sys.path.insert(0, "/home/rohit/apex-compute-ML/simple-llm/src/parakeet")
+    from parakeet_modules import ParakeetTDT as CPU_ParakeetTDT, make_rel_pos_emb as cpu_make_rel_pos_emb
+    sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", ".."))
+
+    t_cpu_load_start = _time.perf_counter()
+    print(f"\n  Loading CPU BF16 model...", end="", flush=True)
+    cpu_model = CPU_ParakeetTDT()
+    cpu_sd = engine._ckpt_sd
+    for i in range(engine.num_layers):
+        layer = cpu_model.encoder.layers[i]
+        pfx = f"encoder.layers.{i}"
+        layer.ln_ff1.weight.data.copy_(cpu_sd[f"{pfx}.norm_feed_forward1.weight"])
+        layer.ln_ff1.bias.data.copy_(cpu_sd[f"{pfx}.norm_feed_forward1.bias"])
+        layer.ln_attn.weight.data.copy_(cpu_sd[f"{pfx}.norm_self_att.weight"])
+        layer.ln_attn.bias.data.copy_(cpu_sd[f"{pfx}.norm_self_att.bias"])
+        layer.ln_conv.weight.data.copy_(cpu_sd[f"{pfx}.norm_conv.weight"])
+        layer.ln_conv.bias.data.copy_(cpu_sd[f"{pfx}.norm_conv.bias"])
+        layer.ln_ff2.weight.data.copy_(cpu_sd[f"{pfx}.norm_feed_forward2.weight"])
+        layer.ln_ff2.bias.data.copy_(cpu_sd[f"{pfx}.norm_feed_forward2.bias"])
+        layer.ln_out.weight.data.copy_(cpu_sd[f"{pfx}.norm_out.weight"])
+        layer.ln_out.bias.data.copy_(cpu_sd[f"{pfx}.norm_out.bias"])
+        layer.ff1.linear1.weight.data.copy_(cpu_sd[f"{pfx}.feed_forward1.linear1.weight"])
+        layer.ff1.linear2.weight.data.copy_(cpu_sd[f"{pfx}.feed_forward1.linear2.weight"])
+        layer.ff2.linear1.weight.data.copy_(cpu_sd[f"{pfx}.feed_forward2.linear1.weight"])
+        layer.ff2.linear2.weight.data.copy_(cpu_sd[f"{pfx}.feed_forward2.linear2.weight"])
+        layer.self_attn.linear_q.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_q.weight"])
+        layer.self_attn.linear_k.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_k.weight"])
+        layer.self_attn.linear_v.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_v.weight"])
+        layer.self_attn.linear_out.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_out.weight"])
+        layer.self_attn.linear_pos.weight.data.copy_(cpu_sd[f"{pfx}.self_attn.linear_pos.weight"])
+        layer.self_attn.pos_bias_u.data.copy_(cpu_sd[f"{pfx}.self_attn.pos_bias_u"])
+        layer.self_attn.pos_bias_v.data.copy_(cpu_sd[f"{pfx}.self_attn.pos_bias_v"])
+        layer.conv.pw_conv1_w.data.copy_(cpu_sd[f"{pfx}.conv.pointwise_conv1.weight"])
+        layer.conv.dw_conv_w.data.copy_(cpu_sd[f"{pfx}.conv.depthwise_conv.weight"])
+        layer.conv.pw_conv2_w.data.copy_(cpu_sd[f"{pfx}.conv.pointwise_conv2.weight"])
+        layer.conv.bn_weight.data.copy_(cpu_sd[f"{pfx}.conv.batch_norm.weight"])
+        layer.conv.bn_bias.data.copy_(cpu_sd[f"{pfx}.conv.batch_norm.bias"])
+        layer.conv.bn_mean.copy_(cpu_sd[f"{pfx}.conv.batch_norm.running_mean"])
+        layer.conv.bn_var.copy_(cpu_sd[f"{pfx}.conv.batch_norm.running_var"])
+    cpu_model.bfloat16()
+    cpu_model.eval()
+    cpu_model.stage_for_hardware()
+    print(f" done ({_time.perf_counter() - t_cpu_load_start:.1f}s)")
+
+    # CPU BF16 encoder forward
+    cpu_enc_input = sub_output.reshape(1, L_pad, D).to(torch.bfloat16)
+    pos_emb = cpu_make_rel_pos_emb(L_pad).to(torch.bfloat16)
+
+    print(f"  Running CPU BF16 encoder...", end="", flush=True)
+    with torch.no_grad():
+        t_cpu_enc_start = _time.perf_counter()
+        cpu_enc_x = cpu_enc_input
+        for layer in cpu_model.encoder.layers:
+            cpu_enc_x = layer(cpu_enc_x, pos_emb)
+        t_cpu_enc_done = _time.perf_counter()
+        print(f" done ({t_cpu_enc_done - t_cpu_enc_start:.3f}s)")
+
+        # CPU BF16 decoder forward
+        print(f"  Running CPU BF16 decoder...", end="", flush=True)
+        cpu_enc_out = cpu_enc_x
+        t_cpu_bf16_dec_start = _time.perf_counter()
+        cpu_bf16_tokens = cpu_model.decode(cpu_enc_out)[0]
+        t_cpu_bf16_dec_done = _time.perf_counter()
+        print(f" done ({t_cpu_bf16_dec_done - t_cpu_bf16_dec_start:.3f}s)")
+
+    cpu_bf16_text = sp.DecodeIds([t for t in cpu_bf16_tokens if 0 <= t < vocab_sz])
+
+    print(f"\n  >>> CPU BF16:  {cpu_bf16_text}")
+
+    cpu_enc_time = t_cpu_enc_done - t_cpu_enc_start
+    cpu_dec_time = t_cpu_bf16_dec_done - t_cpu_bf16_dec_start
+    cpu_total = cpu_enc_time + cpu_dec_time
+
+    print(f"\n{'='*60}")
+    print(f"  TIMING SUMMARY")
+    print(f"{'='*60}")
+    print(f"  {'':30}  {'HW':>12}  {'CPU BF16':>12}")
+    print(f"  {'-'*56}")
+    print(f"  {'Encoder':30}  {t_enc_done - t_sub_done:>11.3f}s  {cpu_enc_time:>11.3f}s")
+    print(f"  {'Decoder':30}  {t_dec_done - t_enc_done:>11.3f}s  {cpu_dec_time:>11.3f}s")
+    print(f"  {'Total (enc+dec)':30}  {t_dec_done - t_sub_done:>11.3f}s  {cpu_total:>11.3f}s")
+    print(f"  {'-'*56}")
+    print(f"  {'Audio duration':30}  {audio_duration:>11.1f}s")
+    print(f"  {'RTF (HW)':30}  {(t_dec_done - t_sub_done) / audio_duration:>11.2f}x")
+    print(f"  {'RTF (CPU BF16)':30}  {cpu_total / audio_duration:>11.2f}x")
+    print(f"  {'Speedup (CPU/HW)':30}  {cpu_total / (t_dec_done - t_sub_done):>11.2f}x")
+
+    # --- Original NeMo model inference (BF16 only) for transcript comparison ---
     import logging, warnings, io, contextlib
     logging.getLogger().setLevel(logging.CRITICAL)
     warnings.filterwarnings("ignore")
@@ -2348,11 +2436,9 @@ def main():
                                  "snapshots", "6d590f77001d318fb17a0b5bf7ee329a91b52598",
                                  "parakeet-tdt-0.6b-v3.nemo")
         model = nemo_asr.models.ASRModel.restore_from(nemo_path)
-        transcript_fp32 = model.transcribe([audio_path])
         model.bfloat16()
         transcript_bf16 = model.transcribe([audio_path])
-    print(f"\n  >>> NeMo FP32: {transcript_fp32[0].text}")
-    print(f"  >>> NeMo BF16: {transcript_bf16[0].text}")
+    print(f"\n  >>> NeMo BF16: {transcript_bf16[0].text}")
 
 if __name__ == "__main__":
     main()
