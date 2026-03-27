@@ -1400,11 +1400,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             def emit_ff1(la=la):
                 flops = 0
                 self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
-                self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_LO"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
-                self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF1_W1_HI"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+                self._enc_matmul(L_pad, D, FF_HALF, self.LN_OUT_DRAM, la["FF1_W1_LO"], self.FF_MID_DRAM, silu_enable=True)
+                self._enc_matmul(L_pad, D, FF_HALF, self.LN_OUT_DRAM, la["FF1_W1_HI"], self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
                 flops += 2 * L_pad * D * FF
-                self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF1_W2_LO"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
-                self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF1_W2_HI"], OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM)
+                self._enc_matmul(L_pad, FF_HALF, D, self.FF_MID_DRAM, la["FF1_W2_LO"], self.FF_OUT_DRAM)
+                self._enc_matmul(L_pad, FF_HALF, D, self.FF_MID_DRAM + L_pad * FF_HALF * bpe, la["FF1_W2_HI"], self.LN_OUT_DRAM)
                 flops += 2 * L_pad * FF * D
                 self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
                 self.accelerator_memory_to_sram(self.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
@@ -1421,11 +1421,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             def emit_self_attn(la=la):
                 flops = 0
                 self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_ATTN_WEIGHT"], BETA_DRAM_ADDR=la["LN_ATTN_BIAS"])
-                self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_Q_W"], OUTPUT_DRAM_ADDR=self.Q_DRAM)
-                self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_K_W"], OUTPUT_DRAM_ADDR=self.K_DRAM)
-                self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_V_W"], OUTPUT_DRAM_ADDR=self.V_DRAM)
+                self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_Q_W"], self.Q_DRAM)
+                self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_K_W"], self.K_DRAM)
+                self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_V_W"], self.V_DRAM)
                 flops += 3 * 2 * L_pad * D * D
-                self.matmat_mul_core(M=P_pad, K=D, N=D, A_DRAM_ADDR=self.POS_EMB_DRAM, B_DRAM_ADDR=la["ATTN_POS_W"], OUTPUT_DRAM_ADDR=self.POS_PROJ_DRAM)
+                self._enc_matmul(P_pad, D, D, self.POS_EMB_DRAM, la["ATTN_POS_W"], self.POS_PROJ_DRAM)
                 flops += 2 * P_pad * D * D
                 for h in range(H_heads):
                     h_off = h * dk * bpe
@@ -1462,7 +1462,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     flops += 2 * L_pad * L_pad * dk
                     self.accelerator_memory_to_sram(self.CONV_A_DRAM, URAM_A_BASE, L_pad * dk)
                     self.sram_to_accelerator_memory(URAM_A_BASE, self.ATTN_OUT_DRAM + h_off, L_pad * dk, stride_bytes_per_chunk=dk * bpe, stride_jump_bytes=D * bpe)
-                self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.ATTN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_OUT_W"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
+                self._enc_matmul(L_pad, D, D, self.ATTN_OUT_DRAM, la["ATTN_OUT_W"], self.FF_OUT_DRAM)
                 flops += 2 * L_pad * D * D
                 self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
                 self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_B_BASE, L_pad * D)
@@ -1478,8 +1478,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             def emit_conv_module(la=la, layer_idx=layer_idx):
                 flops = 0
                 self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_CONV_WEIGHT"], BETA_DRAM_ADDR=la["LN_CONV_BIAS"])
-                self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1A_W"], OUTPUT_DRAM_ADDR=self.CONV_A_DRAM)
-                self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["CONV_PW1B_W"], OUTPUT_DRAM_ADDR=self.CONV_B_DRAM, sigmoid_enable=True)
+                self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["CONV_PW1A_W"], self.CONV_A_DRAM)
+                self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["CONV_PW1B_W"], self.CONV_B_DRAM, sigmoid_enable=True)
                 flops += 2 * 2 * L_pad * D * D
                 # GLU: a * sigmoid(b) — sigmoid fused into PW1b above
                 self.accelerator_memory_to_sram(self.CONV_A_DRAM, URAM_A_BASE, L_pad * D)
@@ -1497,7 +1497,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 flops += 2 * D * L_pad * L_pad  # SiLU identity matmul
                 chunked_transpose_core_dram(self, M=D, N=L_pad, input_dram_addr=self.CONV_OUT_DRAM, output_dram_addr=self.CONV_T_DRAM, identity_dram_addr=self.w["IDENTITY_64"], temp_dram_addr=self.PERMUTE_TEMP_DRAM)
                 flops += (L_pad // UE_VECTOR_SIZE) * L_pad * 2 * UE_VECTOR_SIZE * pad_to_multiple(D, UE_VECTOR_SIZE)  # transpose dot-products
-                self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.CONV_T_DRAM, B_DRAM_ADDR=la["CONV_PW2_W"], OUTPUT_DRAM_ADDR=self.CONV_OUT_DRAM)
+                self._enc_matmul(L_pad, D, D, self.CONV_T_DRAM, la["CONV_PW2_W"], self.CONV_OUT_DRAM)
                 flops += 2 * L_pad * D * D
                 self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
                 self.accelerator_memory_to_sram(self.CONV_OUT_DRAM, URAM_B_BASE, L_pad * D)
@@ -1513,11 +1513,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             def emit_ff2(la=la):
                 flops = 0
                 self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
-                self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_LO"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM, silu_enable=True)
-                self.matmat_mul_core(M=L_pad, K=D, N=FF_HALF, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["FF2_W1_HI"], OUTPUT_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
+                self._enc_matmul(L_pad, D, FF_HALF, self.LN_OUT_DRAM, la["FF2_W1_LO"], self.FF_MID_DRAM, silu_enable=True)
+                self._enc_matmul(L_pad, D, FF_HALF, self.LN_OUT_DRAM, la["FF2_W1_HI"], self.FF_MID_DRAM + L_pad * FF_HALF * bpe, silu_enable=True)
                 flops += 2 * L_pad * D * FF
-                self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM, B_DRAM_ADDR=la["FF2_W2_LO"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
-                self.matmat_mul_core(M=L_pad, K=FF_HALF, N=D, A_DRAM_ADDR=self.FF_MID_DRAM + L_pad * FF_HALF * bpe, B_DRAM_ADDR=la["FF2_W2_HI"], OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM)
+                self._enc_matmul(L_pad, FF_HALF, D, self.FF_MID_DRAM, la["FF2_W2_LO"], self.FF_OUT_DRAM)
+                self._enc_matmul(L_pad, FF_HALF, D, self.FF_MID_DRAM + L_pad * FF_HALF * bpe, la["FF2_W2_HI"], self.LN_OUT_DRAM)
                 flops += 2 * L_pad * FF * D
                 self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_A_BASE, L_pad * D)
                 self.accelerator_memory_to_sram(self.LN_OUT_DRAM, URAM_B_BASE, L_pad * D)
@@ -1570,10 +1570,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         # --- Part 1: LN + QKV + Pos projections ---
         def emit_proj():
             self.layer_norm_core_dram(M=L_pad, N=D, A_DRAM_ADDR=self.INPUT_DRAM, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM, GAMMA_DRAM_ADDR=la["LN_ATTN_WEIGHT"], BETA_DRAM_ADDR=la["LN_ATTN_BIAS"])
-            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_Q_W"], OUTPUT_DRAM_ADDR=self.Q_DRAM)
-            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_K_W"], OUTPUT_DRAM_ADDR=self.K_DRAM)
-            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.LN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_V_W"], OUTPUT_DRAM_ADDR=self.V_DRAM)
-            self.matmat_mul_core(M=P_pad, K=D, N=D, A_DRAM_ADDR=self.POS_EMB_DRAM, B_DRAM_ADDR=la["ATTN_POS_W"], OUTPUT_DRAM_ADDR=self.POS_PROJ_DRAM)
+            self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_Q_W"], self.Q_DRAM)
+            self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_K_W"], self.K_DRAM)
+            self._enc_matmul(L_pad, D, D, self.LN_OUT_DRAM, la["ATTN_V_W"], self.V_DRAM)
+            self._enc_matmul(P_pad, D, D, self.POS_EMB_DRAM, la["ATTN_POS_W"], self.POS_PROJ_DRAM)
         programs.append(("Attn:LN+Proj", _compile(emit_proj)))
 
         # --- Part 2: Per-head attention loop ---
@@ -1612,7 +1612,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
         # --- Part 3: Output projection + residual ---
         def emit_out():
-            self.matmat_mul_core(M=L_pad, K=D, N=D, A_DRAM_ADDR=self.ATTN_OUT_DRAM, B_DRAM_ADDR=la["ATTN_OUT_W"], OUTPUT_DRAM_ADDR=self.FF_OUT_DRAM)
+            self._enc_matmul(L_pad, D, D, self.ATTN_OUT_DRAM, la["ATTN_OUT_W"], self.FF_OUT_DRAM)
             self.accelerator_memory_to_sram(self.INPUT_DRAM, URAM_A_BASE, L_pad * D)
             self.accelerator_memory_to_sram(self.FF_OUT_DRAM, URAM_B_BASE, L_pad * D)
             self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, L_pad * D)
@@ -2395,16 +2395,13 @@ def main():
 
     t_enc_done = _time.perf_counter()
 
-    # --- Encoder diagnostic: print key info and stop ---
-    enc_sample = read_dram(engine, engine.INPUT_DRAM, min(64, L_pad * D))
-    vals = enc_sample[:8].tolist()
+    # --- Encoder summary ---
+    q_n = Parakeet_UnifiedEngine._enc_matmul_quant_count
+    bf16_n = Parakeet_UnifiedEngine._enc_matmul_bf16_count
     mode_str = engine.quant.upper() if engine.quant else 'BF16'
-    print(f"\n  === ENCODER DIAGNOSTIC ===")
-    print(f"  Mode: {mode_str}")
-    print(f"  Program bytes: {enc_prog_bytes:,}")
-    print(f"  Encoder output first 8 values: {[f'{v:.6f}' for v in vals]}")
-    print(f"  Matmul dispatch: {Parakeet_UnifiedEngine._enc_matmul_quant_count} {mode_str}, {Parakeet_UnifiedEngine._enc_matmul_bf16_count} BF16")
-    assert False, f"DIAGNOSTIC STOP — compare BF16 vs --fp4 vs --int4 output above"
+    if engine.quant:
+        print(f"  Encoder mode: {mode_str} ({q_n} quantized matmuls, {bf16_n} bf16)")
+
 
     # --- Decoder (host-driven greedy loop) ---
     hw_enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D)
