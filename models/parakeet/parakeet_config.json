@@ -1,6 +1,8 @@
 {
   "fixed_isa_regs": {
-    "TMP_REG": 1
+    "TOKEN_REG": 1,
+    "ENC_T_REG": 2,
+    "TMP_REG": 3
   },
   "encoder": {
     "d_model": 1024,

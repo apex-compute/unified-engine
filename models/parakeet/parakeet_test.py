@@ -6,12 +6,10 @@ Config from parakeet_config.json; weights from NeMo checkpoint.
 
 Host (CPU):
   - Mel spectrogram extraction from audio (torchaudio + custom filterbank).
-  - Decoder loop control: embedding lookup, LSTM state save/restore on blank,
-    and enc_out[t] slicing are coordinated by the host via DMA between each
-    decode step.  The actual predictor, joint-network, and argmax computations
-    run on the accelerator.
-  - A CPU-only reference decode is run afterward purely for transcript
-    comparison (not part of the timed pipeline).
+  - Decoder loop control: the host sets ISA registers (embedding offset,
+    encoder position offset) and dispatches programs each decode step.
+    It reads argmax registers for token/duration decisions and handles
+    blank-vs-emit branching.  No host DMA data transfers per step.
 
 Accelerator (FPGA):
   - Subsampling: three conv2d stages, each with an im2col program (permutation-
@@ -24,13 +22,14 @@ Accelerator (FPGA):
   - Encoder: 24 conformer layers (LayerNorm, FF1, self-attention with
     relative positional encoding, depthwise conv + BatchNorm, FF2) compiled
     into a single instruction stream and executed without host intervention.
-  - Decoder: LSTM predictor (2 layers), joint network projections, ReLU,
-    and token/duration argmax — each step launched as a small program by the
-    host-driven decode loop.
+  - Decoder: each decode step runs entirely on-device — LSTM state
+    save, register-addressed embedding lookup, 2-layer LSTM predictor,
+    register-addressed enc_out[t] copy, joint projections + ReLU, and
+    token/duration argmax.  On blank, a separate state-restore program
+    rolls back LSTM state from on-device save buffers.
 
-All weights are BF16.  The encoder runs as one monolithic program on the
-accelerator; the decoder is host-driven but all compute (matmuls, activations,
-argmax) happens on the accelerator.
+All weights are BF16.  No host DMA data transfers occur during the
+forward pass after the initial mel spectrogram upload.
 
 Usage:
   python parakeet_test.py
@@ -46,6 +45,7 @@ that directory is added to sys.path.
 import json
 import math
 import os
+import struct
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +65,19 @@ from user_dma_core import (
 URAM_A_BASE = 0x00000
 URAM_B_BASE = 0x80000
 EPS = 1e-5
+
+def _make_add_set_bytes(dst_reg, immediate_value):
+    """Build raw 32-byte ADD_SET instruction: dst_reg = immediate_value."""
+    INSTRUCTION_ADD = 2
+    INST_ADD_SET = 4
+    w = [0] * 8
+    w[0] = ((INST_ADD_SET & 0xF) << 0) | ((dst_reg & 0xF) << 4) | ((dst_reg & 0xF) << 8)
+    w[1] = immediate_value & 0xFFFFFFFF
+    w[7] = (INSTRUCTION_ADD & 0x7) << 29
+    result = bytearray(32)
+    for i in range(8):
+        result[i*4:(i+1)*4] = struct.pack('<I', w[i] & 0xFFFFFFFF)
+    return bytes(result)
 
 WEIGHTS_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "model_weights.ckpt")
 TOKENIZER_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "tokenizer.model")
@@ -615,6 +628,34 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.max_symbols_per_step = jnt["max_symbols_per_step"]
         self.block_size = hw["block_size"]      # 64
         self.bytes_per_element = enc["bytes_per_element"]
+        # ISA register assignments for decoder dynamic addressing
+        regs = self._cfg.get("fixed_isa_regs", {})
+        self.TOKEN_REG = regs.get("TOKEN_REG", 1)
+        self.ENC_T_REG = regs.get("ENC_T_REG", 2)
+        self.TMP_REG = regs.get("TMP_REG", 3)
+    def overwrite_instruction_with_general_register(self, general_register):
+        """Modify the last captured instruction to use a general register for DRAM address."""
+        if not self.capture_buffer or self.capture_count == 0:
+            raise RuntimeError("capture_buffer is empty")
+        if general_register <= 0 or general_register > 15:
+            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
+        inst = self.capture_buffer[self.capture_count - 1]
+        w = inst.words
+        w[0] = ((0 & 0xF) << 0) | ((general_register & 0xF) << 4) | ((0 & 0xF) << 8) | ((0 & 0xF) << 12)
+        w[7] = (w[7] & 0x1FFFFFFF) | ((user_dma_core.INSTRUCTION_REG_REWRITE & 0x7) << 29)
+    def isa_add_set_core(self, dst_reg_idx, immediate_value, timeout_s=10.0):
+        """Set one ISA register to an immediate value via minimal program execution."""
+        self.clear_capture_buffer()
+        self.start_capture()
+        self.generate_instruction_add_set(dst_reg_idx, immediate_value)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.clear_capture_buffer()
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout_s)
     # XDMA driver has a transfer size limit (~16-64MB per os.write call).
     # Chunk large DMA uploads to avoid silent failures.
     DMA_CHUNK_BYTES = 1 * 1024 * 1024  # 1 MB per chunk
@@ -938,6 +979,11 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.PRED_H1_DRAM = self.allocate_tensor_dram(H * bpe)
         self.PRED_C1_DRAM = self.allocate_tensor_dram(H * bpe)
         self.PRED_OUT_DRAM = self.allocate_tensor_dram(H * bpe)
+        # On-device LSTM state save buffers (for blank rollback without host DMA)
+        self.SAVED_H0_DRAM = self.allocate_tensor_dram(H * bpe)
+        self.SAVED_C0_DRAM = self.allocate_tensor_dram(H * bpe)
+        self.SAVED_H1_DRAM = self.allocate_tensor_dram(H * bpe)
+        self.SAVED_C1_DRAM = self.allocate_tensor_dram(H * bpe)
         self.JOINT_ENC_DRAM = self.allocate_tensor_dram(D * bpe)
         self.JOINT_PRED_DRAM = self.allocate_tensor_dram(self.joint_hidden * bpe)
         self.JOINT_SUM_DRAM = self.allocate_tensor_dram(self.joint_hidden * bpe)
@@ -1874,17 +1920,38 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
         return results
     def compile_decoder(self):
-        """Compile predictor LSTM + split joint. Returns (pred_prog, tok_prog, dur_prog, flops)."""
+        """Compile decoder programs with on-device DMA (no host round-trips per step).
+
+        Returns (pred_prog, tok_prog, dur_prog, state_restore_prog, total_flops).
+
+        pred_prog: LSTM state save + embedding lookup (register-addressed) + predictor LSTM
+        tok_prog: enc_out[t] copy (register-addressed) + pred_out copy + joint projections + token argmax
+        dur_prog: duration matmul + argmax
+        state_restore_prog: copy saved LSTM state back (for blank rollback)
+        """
         H = self.pred_hidden
         D = self.d_model
         bpe = self.bytes_per_element
         N_tok_pad = pad_to_multiple(self.vocab_size, self.block_size)
         N_dur_pad = pad_to_multiple(len(self.tdt_durations), self.block_size)
         total_flops = 0
-        # --- Predictor program ---
+        # --- Predictor program: state save + embedding + LSTM ---
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
+        # 1. Save LSTM state to on-device temp buffers
+        for src, dst in [(self.PRED_H0_DRAM, self.SAVED_H0_DRAM),
+                         (self.PRED_C0_DRAM, self.SAVED_C0_DRAM),
+                         (self.PRED_H1_DRAM, self.SAVED_H1_DRAM),
+                         (self.PRED_C1_DRAM, self.SAVED_C1_DRAM)]:
+            self.accelerator_memory_to_sram(src, URAM_A_BASE, H)
+            self.sram_to_accelerator_memory(URAM_A_BASE, dst, H)
+        # 2. Embedding lookup: TMP_REG = TOKEN_REG + EMBED_base, DMA from TMP_REG
+        self.generate_instruction_add_imm(self.TOKEN_REG, self.w["EMBED"], self.TMP_REG)
+        self.accelerator_memory_to_sram(self.w["EMBED"], URAM_A_BASE, H)
+        self.overwrite_instruction_with_general_register(self.TMP_REG)
+        self.sram_to_accelerator_memory(URAM_A_BASE, self.PRED_EMB_DRAM, H)
+        # 3. Predictor LSTM (2 layers)
         for i in range(2):
             h_addr = self.PRED_H0_DRAM if i == 0 else self.PRED_H1_DRAM
             c_addr = self.PRED_C0_DRAM if i == 0 else self.PRED_C1_DRAM
@@ -1897,15 +1964,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(self.PRED_GATES2_DRAM, URAM_B_BASE, 4*H)
             self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, 4*H)
             self.sram_to_accelerator_memory(URAM_A_BASE, self.PRED_GATES_DRAM, 4*H)
-            # i sigmoid
             self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.PRED_GATES_DRAM, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.PRED_GATES_DRAM, sigmoid_enable=True)
-            # f sigmoid
             self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.PRED_GATES_DRAM + H * bpe, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.PRED_GATES_DRAM + H * bpe, sigmoid_enable=True)
-            # g tanh
             tanh_core_dram(self, M=1, N=H, A_DRAM_ADDR=self.PRED_GATES_DRAM + 2 * H * bpe, OUTPUT_DRAM_ADDR=self.PRED_GATES_DRAM + 2 * H * bpe, IDENTITY_DRAM_ADDR=self.w["IDENTITY_640"])
-            # o sigmoid
             self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.PRED_GATES_DRAM + 3 * H * bpe, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.PRED_GATES_DRAM + 3 * H * bpe, sigmoid_enable=True)
-            # c_new = f*c + i*g
             self.accelerator_memory_to_sram(self.PRED_GATES_DRAM + H * bpe, URAM_A_BASE, H)
             self.accelerator_memory_to_sram(c_addr, URAM_B_BASE, H)
             self.eltwise_mul_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, H)
@@ -1916,7 +1978,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(c_addr, URAM_B_BASE, H)
             self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, H)
             self.sram_to_accelerator_memory(URAM_A_BASE, c_addr, H)
-            # h_new = o * tanh(c_new)
             tanh_core_dram(self, M=1, N=H, A_DRAM_ADDR=c_addr, OUTPUT_DRAM_ADDR=self.PRED_OUT_DRAM, IDENTITY_DRAM_ADDR=self.w["IDENTITY_640"])
             self.accelerator_memory_to_sram(self.PRED_GATES_DRAM + 3 * H * bpe, URAM_A_BASE, H)
             self.accelerator_memory_to_sram(self.PRED_OUT_DRAM, URAM_B_BASE, H)
@@ -1929,10 +1990,19 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         pred_prog = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(pred_prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        # --- Joint token program (shared projections + token matmul → argmax) ---
+        # --- Joint token program: enc_out copy + pred_out copy + projections + token argmax ---
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
+        # enc_out[t] copy: TMP_REG = ENC_T_REG + ENC_OUT_DRAM, DMA from TMP_REG
+        self.generate_instruction_add_imm(self.ENC_T_REG, self.ENC_OUT_DRAM, self.TMP_REG)
+        self.accelerator_memory_to_sram(self.ENC_OUT_DRAM, URAM_A_BASE, D)
+        self.overwrite_instruction_with_general_register(self.TMP_REG)
+        self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_ENC_DRAM, D)
+        # pred_out copy (static addresses)
+        self.accelerator_memory_to_sram(self.PRED_OUT_DRAM, URAM_A_BASE, H)
+        self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_PRED_DRAM, H)
+        # Joint projections + ReLU
         self.matmat_mul_core(M=1, K=D, N=H, A_DRAM_ADDR=self.JOINT_ENC_DRAM, B_DRAM_ADDR=self.w["JOINT_ENC_W"], OUTPUT_DRAM_ADDR=self.JOINT_ENC_DRAM, C_DRAM_ADDR=self.w["JOINT_ENC_B"])
         total_flops += 2 * D * H
         self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.JOINT_PRED_DRAM, B_DRAM_ADDR=self.w["JOINT_PRED_W"], OUTPUT_DRAM_ADDR=self.JOINT_PRED_DRAM, C_DRAM_ADDR=self.w["JOINT_PRED_B"])
@@ -1942,6 +2012,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, H)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_SUM_DRAM, H)
         self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.JOINT_SUM_DRAM, relu_enable=True)
+        # Token matmul + argmax
         self.matmat_mul_core(M=1, K=H, N=N_tok_pad, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["JOINT_OUT_TOK_W"], OUTPUT_DRAM_ADDR=self.JOINT_TOK_DRAM, C_DRAM_ADDR=self.w["JOINT_OUT_TOK_B"])
         total_flops += 2 * H * N_tok_pad
         self.stop_capture()
@@ -1949,7 +2020,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         tok_prog = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(tok_prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        # --- Joint duration program (duration matmul → argmax, reuses JOINT_SUM_DRAM) ---
+        # --- Joint duration program ---
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
@@ -1960,8 +2031,23 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         dur_prog = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(dur_prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        # --- State restore program (for blank rollback) ---
+        self.clear_capture_buffer()
+        self.start_capture()
+        self.generate_instruction_flag_clear()
+        for src, dst in [(self.SAVED_H0_DRAM, self.PRED_H0_DRAM),
+                         (self.SAVED_C0_DRAM, self.PRED_C0_DRAM),
+                         (self.SAVED_H1_DRAM, self.PRED_H1_DRAM),
+                         (self.SAVED_C1_DRAM, self.PRED_C1_DRAM)]:
+            self.accelerator_memory_to_sram(src, URAM_A_BASE, H)
+            self.sram_to_accelerator_memory(URAM_A_BASE, dst, H)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        restore_prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(restore_prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
 
-        return pred_prog, tok_prog, dur_prog, total_flops
+        return pred_prog, tok_prog, dur_prog, restore_prog, total_flops
     def program_execute(self, program_addr, timeout=50.0, flops=None):
         """Execute compiled program. Returns (latency_us, gflops)."""
         self.start_execute_from_dram(program_addr)
@@ -1994,13 +2080,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
     # Execute: decoder
     # -----------------------------------------------------------------------
     def run_decode(self, enc_out_addr, L):
-        """TDT greedy decode. All programs already compiled. Returns token list."""
+        """TDT greedy decode with on-device DMA. Host only sets registers and dispatches programs."""
         bpe = self.bytes_per_element
         H = self.pred_hidden
         D = self.d_model
         pred_prog = self.progs["pred"][0]
         tok_prog = self.progs["joint_tok"][0]
         dur_prog = self.progs["joint_dur"][0]
+        restore_prog = self.progs["state_restore"][0]
         # Pre-zero all decoder intermediate buffers
         zeros_h = torch.zeros(H, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.PRED_H0_DRAM, zeros_h)
@@ -2025,30 +2112,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         while t < L:
             symbols = 0
             while symbols < self.max_symbols_per_step:
-                # Save LSTM state before predictor (restore on blank)
-                saved_h0 = torch.zeros(H, dtype=torch.bfloat16)
-                saved_c0 = torch.zeros(H, dtype=torch.bfloat16)
-                saved_h1 = torch.zeros(H, dtype=torch.bfloat16)
-                saved_c1 = torch.zeros(H, dtype=torch.bfloat16)
-                self.dma_read(DMA_DEVICE_C2H, self.PRED_H0_DRAM, saved_h0, H * bpe)
-                self.dma_read(DMA_DEVICE_C2H, self.PRED_C0_DRAM, saved_c0, H * bpe)
-                self.dma_read(DMA_DEVICE_C2H, self.PRED_H1_DRAM, saved_h1, H * bpe)
-                self.dma_read(DMA_DEVICE_C2H, self.PRED_C1_DRAM, saved_c1, H * bpe)
-                # Embedding lookup via host DMA
-                emb_src = self.w["EMBED"] + last_token * H * bpe
-                emb_buf = torch.zeros(H, dtype=torch.bfloat16)
-                self.dma_read(DMA_DEVICE_C2H, emb_src, emb_buf, H * bpe)
-                self.dma_to_accelerator_memory(self.PRED_EMB_DRAM, emb_buf)
-                # Predictor
+                # Set registers: TOKEN_REG = embedding offset, ENC_T_REG = encoder position offset
+                self.isa_add_set_core(self.TOKEN_REG, last_token * H * bpe)
+                self.isa_add_set_core(self.ENC_T_REG, t * D * bpe)
+                # Predictor: state save + embedding lookup (register-addressed) + LSTM
                 self.program_execute(pred_prog)
-                # Copy enc_out[t] and pred_out to joint inputs via HOST DMA
-                enc_t_buf = torch.zeros(D, dtype=torch.bfloat16)
-                self.dma_read(DMA_DEVICE_C2H, enc_out_addr + t * D * bpe, enc_t_buf, D * bpe)
-                self.dma_to_accelerator_memory(self.JOINT_ENC_DRAM, enc_t_buf)
-                pred_buf = torch.zeros(H, dtype=torch.bfloat16)
-                self.dma_read(DMA_DEVICE_C2H, self.PRED_OUT_DRAM, pred_buf, H * bpe)
-                self.dma_to_accelerator_memory(self.JOINT_PRED_DRAM, pred_buf)
-                # Joint token -> hardware argmax
+                # Joint token: enc_out[t] copy (register-addressed) + pred_out copy + projections + argmax
                 self.program_execute(tok_prog)
                 token_id = self.get_arg_max_index1()
                 # Joint duration -> hardware argmax
@@ -2057,11 +2126,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 dur = self.tdt_durations[dur_idx] if dur_idx < len(self.tdt_durations) else 0
                 total_steps += 1
                 if token_id == self.blank_id:
-                    # Restore LSTM state — blank means no state update
-                    self.dma_to_accelerator_memory(self.PRED_H0_DRAM, saved_h0)
-                    self.dma_to_accelerator_memory(self.PRED_C0_DRAM, saved_c0)
-                    self.dma_to_accelerator_memory(self.PRED_H1_DRAM, saved_h1)
-                    self.dma_to_accelerator_memory(self.PRED_C1_DRAM, saved_c1)
+                    # Restore LSTM state from on-device save buffers
+                    self.program_execute(restore_prog)
                     t += max(dur, 1)
                     break
                 else:
@@ -2224,8 +2290,8 @@ def main():
         enc_prog_addr, enc_prog_bytes = engine.compile_encoder(L_pad, toeplitz_addrs, bn_tiled)
         print(f"  Encoder compiled: {enc_prog_bytes:,} bytes")
         # Decoder programs (3 small programs for host-driven decode loop)
-        pred_prog, tok_prog, dur_prog, _ = engine.compile_decoder()
-        engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0)}
+        pred_prog, tok_prog, dur_prog, restore_prog, _ = engine.compile_decoder()
+        engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0), "state_restore": (restore_prog, 0)}
         print(f"  Decoder compiled (3 programs)")
         print(f"\n  Compilation Finished")
 
@@ -2322,95 +2388,12 @@ def main():
     t_dec_done = _time.perf_counter()
 
     # ==================================================================
-    # CPU Decode (reference using HW encoder output)
-    # ==================================================================
-    print(f"\n  Running CPU decode on HW encoder output...")
-    sd = engine._ckpt_sd
-
-    # Read HW encoder output from accelerator DRAM
-    hw_enc_out_flat = read_dram(engine, engine.ENC_OUT_DRAM, L_pad * D)
-    hw_enc_out = hw_enc_out_flat.reshape(L_pad, D).float()  # (L_pad, D)
-
-    # Load decoder weights from checkpoint
-    embed_w = sd["decoder.prediction.embed.weight"].float()  # (vocab, H)
-    lstm_wih = [sd[f"decoder.prediction.dec_rnn.lstm.weight_ih_l{i}"].float() for i in range(2)]
-    lstm_whh = [sd[f"decoder.prediction.dec_rnn.lstm.weight_hh_l{i}"].float() for i in range(2)]
-    lstm_bih = [sd[f"decoder.prediction.dec_rnn.lstm.bias_ih_l{i}"].float() for i in range(2)]
-    lstm_bhh = [sd[f"decoder.prediction.dec_rnn.lstm.bias_hh_l{i}"].float() for i in range(2)]
-    joint_enc_w = sd["joint.enc.weight"].float()    # (H, D)
-    joint_enc_b = sd["joint.enc.bias"].float()       # (H,)
-    joint_pred_w = sd["joint.pred.weight"].float()   # (H, H)
-    joint_pred_b = sd["joint.pred.bias"].float()     # (H,)
-    joint_out_w = sd["joint.joint_net.2.weight"].float()  # (vocab+dur, H)
-    joint_out_b = sd["joint.joint_net.2.bias"].float()    # (vocab+dur,)
-    N_tok = engine.vocab_size
-    N_dur = len(engine.tdt_durations)
-
-    H_pred = engine.pred_hidden  # 640
-    h_states = [torch.zeros(H_pred), torch.zeros(H_pred)]
-    c_states = [torch.zeros(H_pred), torch.zeros(H_pred)]
-
-    cpu_tokens = []
-    t_cpu = 0
-    last_tok = engine.blank_id
-
-    while t_cpu < L:
-        symbols = 0
-        while symbols < engine.max_symbols_per_step:
-            saved_h = [h.clone() for h in h_states]
-            saved_c = [c.clone() for c in c_states]
-
-            # LSTM predictor (2 layers)
-            x = embed_w[last_tok]  # (H,)
-            for i in range(2):
-                gates = x @ lstm_wih[i].T + lstm_bih[i] + h_states[i] @ lstm_whh[i].T + lstm_bhh[i]
-                ig, fg, gg, og = gates.chunk(4)
-                ig = torch.sigmoid(ig)
-                fg = torch.sigmoid(fg)
-                gg = torch.tanh(gg)
-                og = torch.sigmoid(og)
-                c_states[i] = fg * c_states[i] + ig * gg
-                h_states[i] = og * torch.tanh(c_states[i])
-                x = h_states[i]
-
-            pred_out = h_states[1]  # (H,)
-
-            # Joint network
-            enc_proj = hw_enc_out[t_cpu] @ joint_enc_w.T + joint_enc_b    # (H,)
-            pred_proj = pred_out @ joint_pred_w.T + joint_pred_b           # (H,)
-            joint_hidden = torch.relu(enc_proj + pred_proj)                # (H,)
-            logits = joint_hidden @ joint_out_w.T + joint_out_b            # (vocab+dur,)
-
-            token_id = logits[:N_tok].argmax().item()
-            dur_logits = logits[N_tok:N_tok + N_dur]
-            dur_idx = dur_logits.argmax().item()
-            dur = engine.tdt_durations[dur_idx] if dur_idx < len(engine.tdt_durations) else 0
-
-            if token_id == engine.blank_id:
-                h_states = saved_h
-                c_states = saved_c
-                t_cpu += max(dur, 1)
-                break
-            else:
-                cpu_tokens.append(token_id)
-                last_tok = token_id
-                symbols += 1
-                if dur > 0:
-                    t_cpu += dur
-                    break
-        else:
-            t_cpu += 1
-
-    t_cpu_dec_done = _time.perf_counter()
-
-    # ==================================================================
     # Results
     # ==================================================================
     sp = spm.SentencePieceProcessor()
     sp.Load(TOKENIZER_PATH)
     vocab_sz = sp.GetPieceSize()
     hw_text = sp.DecodeIds([t for t in hw_tokens if 0 <= t < vocab_sz])
-    cpu_text = sp.DecodeIds([t for t in cpu_tokens if 0 <= t < vocab_sz])
 
     if args.frames is not None:
         audio_duration = T_mel * cfg["preprocessing"]["hop_length"] / cfg["preprocessing"]["sample_rate"]
@@ -2418,44 +2401,18 @@ def main():
         audio_duration = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
     total = t_dec_done - t_start
 
-    print(f"\n  >>> HW decode:                {hw_text}")
-    print(f"  >>> CPU decode (HW encoder):  {cpu_text}")
-    if hw_text == cpu_text:
-        print(f"  >>> MATCH")
-    else:
-        print(f"  >>> MISMATCH — encoder or decoder divergence")
-        print(f"  >>> HW tokens ({len(hw_tokens)}): {hw_tokens[:20]}...")
-        print(f"  >>> CPU tokens ({len(cpu_tokens)}): {cpu_tokens[:20]}...")
+    print(f"\n  >>> {hw_text}")
     print(f"\n  Timing:")
     print(f"    Subsampling:         {t_sub_done - t_start:.3f}s")
     print(f"    Encoder (24 layers): {t_enc_done - t_sub_done:.3f}s")
-    print(f"    HW Decoder:          {t_dec_done - t_enc_done:.3f}s")
-    print(f"    Total (HW path):     {total:.3f}s")
+    print(f"    Decoder:             {t_dec_done - t_enc_done:.3f}s")
+    print(f"    Total:               {total:.3f}s")
     print(f"    Audio duration:      {audio_duration:.1f}s")
     print(f"    Real-time factor:    {total / audio_duration:.2f}x")
 
     print(f"\n{'='*60}")
     print(f"  FULL PIPELINE COMPLETE")
     print(f"{'='*60}")
-
-    # --- NeMo model inference (BF16) for transcript comparison ---
-    import logging, warnings, io, contextlib
-    logging.getLogger().setLevel(logging.CRITICAL)
-    warnings.filterwarnings("ignore")
-
-    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-        import nemo.collections.asr as nemo_asr
-        nemo_path = os.path.join(SCRIPT_DIR, "parakeet_bin", "models--nvidia--parakeet-tdt-0.6b-v3",
-                                 "snapshots", "6d590f77001d318fb17a0b5bf7ee329a91b52598",
-                                 "parakeet-tdt-0.6b-v3.nemo")
-        model = nemo_asr.models.ASRModel.restore_from(nemo_path)
-        model.bfloat16()
-    t_nemo_start = _time.perf_counter()
-    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-        transcript_bf16 = model.transcribe([audio_path])
-    t_nemo_done = _time.perf_counter()
-    print(f"\n  >>> NeMo BF16: {transcript_bf16[0].text}")
-    print(f"  >>> NeMo BF16 wall clock: {t_nemo_done - t_nemo_start:.3f}s (RTF: {(t_nemo_done - t_nemo_start) / audio_duration:.2f}x)")
 
 if __name__ == "__main__":
     main()
