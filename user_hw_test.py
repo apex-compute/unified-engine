@@ -255,7 +255,7 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
         ue.clear_capture_buffer()
 
 
-def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = False, gelu_enable: bool = False, silu_enable: bool = False):
+def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = False, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False):
     """
     Run two-engine matmul via UnifiedEngine.matmat_mul_two_cores().
     Uses balanced 1/2 + 1/2 row sharding.
@@ -285,17 +285,17 @@ def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = Fal
     ue0.dma_to_accelerator_memory(A_DRAM_ADDR, a)
     ue0.dma_to_accelerator_memory(B_DRAM_ADDR, b)
 
-    total_flops_from_matmat_mul = UnifiedEngine.matmat_mul_two_cores(ue0=ue0, ue1=ue1, M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, softmax_enable=softmax_enable, gelu_enable=gelu_enable, silu_enable=silu_enable)
+    total_flops_from_matmat_mul = UnifiedEngine.matmat_mul_two_cores(ue0=ue0, ue1=ue1, M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, softmax_enable=softmax_enable, gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable, relu_enable=relu_enable)
     ue0.report_timing_and_instruction_count()
     ue1.report_timing_and_instruction_count()
 
     # Parallel completion time is bounded by the slower engine.
     latency_us = max(ue0.report_latency_in_us(), ue1.report_latency_in_us())
     flop_rate_gflops = total_flops_from_matmat_mul / (latency_us * 1e3)
-    print(f"Report FLOPS for two-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, silu_enable={silu_enable}")
+    print(f"Report FLOPS for two-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, relu_enable={relu_enable}")
 
-    generate_trace(ue0, f"matmat_mul_two_cores_trace_engine0_{M // 2}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv")
-    generate_trace(ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv")
+    generate_trace(ue0, f"matmat_mul_two_cores_trace_engine0_{M // 2}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
+    generate_trace(ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
 
     output = ue0.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
     ref = a @ b.T
@@ -306,10 +306,20 @@ def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = Fal
     def apply_silu(x):
         return x * torch.sigmoid(x)
 
+    def apply_sigmoid(x):
+        return torch.sigmoid(x)
+
+    def apply_relu(x):
+        return torch.relu(x)
+
     if gelu_enable:
         ref = apply_gelu(ref)
     elif silu_enable:
         ref = apply_silu(ref)
+    elif sigmoid_enable:
+        ref = apply_sigmoid(ref)
+    elif relu_enable:
+        ref = apply_relu(ref)
 
     if softmax_enable:
         ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
@@ -414,7 +424,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False):
+def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False):
     """
     Tests matmat_mul core.
     """
@@ -440,7 +450,9 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
                                                     C_DRAM_ADDR=C_DRAM_ADDR,
                                                     bias_mode=bias_mode,
                                                     gelu_enable=gelu_enable,
-                                                    silu_enable=silu_enable)
+                                                    silu_enable=silu_enable,
+                                                    sigmoid_enable=sigmoid_enable,
+                                                    relu_enable=relu_enable)
 
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -469,7 +481,7 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     ue.report_timing_and_instruction_count()
 
     report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_matmat_mul)
-    print(f"Report FLOPS for MxKxN Matmul: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, bias_enable={bias_enable}, softmax_enable={softmax_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}")
+    print(f"Report FLOPS for MxKxN Matmul: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, bias_enable={bias_enable}, softmax_enable={softmax_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, relu_enable={relu_enable}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
@@ -481,10 +493,20 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     def apply_silu(x):
         return x * torch.sigmoid(x)
 
+    def apply_sigmoid(x):
+        return torch.sigmoid(x)
+
+    def apply_relu(x):
+        return torch.relu(x)
+
     if gelu_enable:
         ref = apply_gelu(ref)
     elif silu_enable:
         ref = apply_silu(ref)
+    elif sigmoid_enable:
+        ref = apply_sigmoid(ref)
+    elif relu_enable:
+        ref = apply_relu(ref)
 
     if softmax_enable:
         ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
@@ -493,7 +515,7 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     print(f"Reference SNR Analysis for MxKxN Matmul: {snr_db_ref:.2f} dB")
     assert snr_db_ref >= 40 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
 
-    generate_trace(ue, f"matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv")
+    generate_trace(ue, f"matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
@@ -878,7 +900,7 @@ def dequantize_test(data_type=TYPE.INT4):
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool = False, bias_mode: str = "broadcast_N", data_type: TYPE = TYPE.INT4, gelu_enable: bool = False, silu_enable: bool = False):
+def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool = False, bias_mode: str = "broadcast_N", data_type: TYPE = TYPE.INT4, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False):
     """
     Tests matrix-matrix multiplication with quantized weights.
     Args:
@@ -932,7 +954,9 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
                                                     data_type=data_type,
                                                     SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
                                                     gelu_enable=gelu_enable,
-                                                    silu_enable=silu_enable)
+                                                    silu_enable=silu_enable,
+                                                    sigmoid_enable=sigmoid_enable,
+                                                    relu_enable=relu_enable)
 
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -960,6 +984,12 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
     def apply_silu(x):
         return x * torch.sigmoid(x)
 
+    def apply_sigmoid(x):
+        return torch.sigmoid(x)
+
+    def apply_relu(x):
+        return torch.relu(x)
+
     ref = a @ x.T
 
     if bias_enable:
@@ -969,6 +999,10 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
         ref = apply_gelu(ref)
     elif silu_enable:
         ref = apply_silu(ref)
+    elif sigmoid_enable:
+        ref = apply_sigmoid(ref)
+    elif relu_enable:
+        ref = apply_relu(ref)
 
     snr_db_ref = calculate_snr(ref, output)
 
@@ -979,7 +1013,7 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
     ue.reset_tensor_dram_addr()
 
 # TODO: Not very efficient for larger M 
-def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT4, bias_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False):
+def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT4, bias_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False):
     """
     Tests quantized matrix-matrix multiplication core.
     Args:
@@ -1005,10 +1039,10 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
     elif bias_enable and bias_mode == "broadcast_N":
         C_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
 
-    print(f"Quantized Matrix-Matrix Multiply Test for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}")
+    print(f"Quantized Matrix-Matrix Multiply Test for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, relu_enable={relu_enable}")
 
     ue.start_capture()
-    
+
     total_flops_from_dequantize = ue.quantized_matmat_core(M=M, K=K, N=N,
                                                     A_DRAM_ADDR=A_DRAM_ADDR,
                                                     B_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
@@ -1018,7 +1052,9 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
                                                     bias_mode=bias_mode,
                                                     data_type=data_type,
                                                     gelu_enable=gelu_enable,
-                                                    silu_enable=silu_enable)
+                                                    silu_enable=silu_enable,
+                                                    sigmoid_enable=sigmoid_enable,
+                                                    relu_enable=relu_enable)
 
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -1040,7 +1076,7 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}.csv")
+    generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}_{'relu_enabled' if relu_enable else 'relu_disabled'}.csv")
 
     report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
     print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
@@ -1053,12 +1089,22 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
     def apply_silu(x):
         return x * torch.sigmoid(x)
 
+    def apply_sigmoid(x):
+        return torch.sigmoid(x)
+
+    def apply_relu(x):
+        return torch.relu(x)
+
     ref = (a @ x.T + c) if bias_enable else (a @ x.T)
 
     if gelu_enable:
         ref = apply_gelu(ref)
     elif silu_enable:
         ref = apply_silu(ref)
+    elif sigmoid_enable:
+        ref = apply_sigmoid(ref)
+    elif relu_enable:
+        ref = apply_relu(ref)
 
     snr_db_ref = calculate_snr(ref, output)
 
@@ -1580,6 +1626,10 @@ if __name__ == "__main__":
     matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True)
     matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True)
     matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True)
+    matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True)
+    matmat_mul_test(M=1920, K=768, N=2048, sigmoid_enable=True)
+    matmat_mul_two_cores_test(M=1920, K=768, N=2048, relu_enable=True)
+    matmat_mul_test(M=1920, K=768, N=2048, relu_enable=True)
     # matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
 
     # for M in [64, 192, 4096]:

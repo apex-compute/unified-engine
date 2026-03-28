@@ -1,0 +1,164 @@
+{
+  "fixed_isa_regs": {
+    "TOKEN_REG": 1,
+    "ENC_T_REG": 2,
+    "TMP_REG": 3
+  },
+  "encoder": {
+    "d_model": 1024,
+    "num_layers": 24,
+    "num_heads": 8,
+    "head_dim": 128,
+    "ff_dim": 4096,
+    "conv_kernel": 9,
+    "conv_pad": 4,
+    "sub_channels": 256,
+    "n_mels": 128,
+    "bytes_per_element": 2
+  },
+  "predictor": {
+    "hidden_size": 640,
+    "num_layers": 2,
+    "vocab_size": 8193,
+    "embedding_dim": 640
+  },
+  "joint": {
+    "hidden_size": 640,
+    "output_size": 8198,
+    "output_size_padded": 8256,
+    "num_tdt_durations": 5,
+    "tdt_durations": [0, 1, 2, 3, 4],
+    "blank_id": 8192,
+    "max_symbols_per_step": 10
+  },
+  "preprocessing": {
+    "sample_rate": 16000,
+    "n_fft": 512,
+    "hop_length": 160,
+    "win_length": 400,
+    "n_mels": 128
+  },
+  "hardware": {
+    "block_size": 64,
+    "stride_align": 32,
+    "encoder_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
+    "comment": "K dims must be multiples of block_size=64. L (seq len) padded at runtime."
+  },
+  "weight_staging": {
+    "dw_conv1d": {
+      "method": "im2col",
+      "original_shape": [1024, 1, 9],
+      "staged_shape": [1024, 64],
+      "utilization": 0.14,
+      "comment": "9-tap kernel padded to 64. Input rearranged via strided DRAM read (free)."
+    },
+    "conv2d_sub_stage1": {
+      "method": "im2col",
+      "original_shape": [256, 1, 3, 3],
+      "staged_shape": [256, 64],
+      "utilization": 0.14,
+      "comment": "C_in*kH*kW=9 padded to 64."
+    },
+    "dwconv2d_sub_stage2": {
+      "method": "im2col",
+      "original_shape": [256, 1, 3, 3],
+      "staged_shape": [256, 64],
+      "utilization": 0.14,
+      "comment": "kH*kW=9 padded to 64."
+    },
+    "dwconv2d_sub_stage3": {
+      "method": "im2col",
+      "original_shape": [256, 1, 3, 3],
+      "staged_shape": [256, 64],
+      "utilization": 0.14,
+      "comment": "kH*kW=9 padded to 64."
+    },
+    "joint_output": {
+      "method": "row_pad",
+      "original_shape": [8198, 640],
+      "staged_shape": [8256, 640],
+      "utilization": 0.993,
+      "comment": "8198 rows padded to 8256 (next multiple of 64)."
+    }
+  },
+  "layers": {
+    "conformer_block": [
+      {"key": "LN_FF1_WEIGHT", "type": "bf16", "shape": [1024]},
+      {"key": "LN_FF1_BIAS", "type": "bf16", "shape": [1024]},
+      {"key": "FF1_LINEAR1_WEIGHT", "type": "bf16", "shape": [4096, 1024]},
+      {"key": "FF1_LINEAR2_WEIGHT", "type": "bf16", "shape": [1024, 4096]},
+      {"key": "LN_ATTN_WEIGHT", "type": "bf16", "shape": [1024]},
+      {"key": "LN_ATTN_BIAS", "type": "bf16", "shape": [1024]},
+      {"key": "ATTN_Q_WEIGHT", "type": "bf16", "shape": [1024, 1024]},
+      {"key": "ATTN_K_WEIGHT", "type": "bf16", "shape": [1024, 1024]},
+      {"key": "ATTN_V_WEIGHT", "type": "bf16", "shape": [1024, 1024]},
+      {"key": "ATTN_POS_WEIGHT", "type": "bf16", "shape": [1024, 1024]},
+      {"key": "ATTN_OUT_WEIGHT", "type": "bf16", "shape": [1024, 1024]},
+      {"key": "ATTN_POS_BIAS_U", "type": "bf16", "shape": [8, 128]},
+      {"key": "ATTN_POS_BIAS_V", "type": "bf16", "shape": [8, 128]},
+      {"key": "LN_CONV_WEIGHT", "type": "bf16", "shape": [1024]},
+      {"key": "LN_CONV_BIAS", "type": "bf16", "shape": [1024]},
+      {"key": "CONV_PW1_WEIGHT", "type": "bf16", "shape": [2048, 1024]},
+      {"key": "CONV_DW_WEIGHT_STAGED", "type": "bf16", "shape": [1024, 64], "comment": "im2col padded from (1024,1,9)"},
+      {"key": "CONV_BN_WEIGHT", "type": "bf16", "shape": [1024]},
+      {"key": "CONV_BN_BIAS", "type": "bf16", "shape": [1024]},
+      {"key": "CONV_BN_MEAN", "type": "bf16", "shape": [1024]},
+      {"key": "CONV_BN_VAR", "type": "bf16", "shape": [1024]},
+      {"key": "CONV_PW2_WEIGHT", "type": "bf16", "shape": [1024, 1024]},
+      {"key": "LN_FF2_WEIGHT", "type": "bf16", "shape": [1024]},
+      {"key": "LN_FF2_BIAS", "type": "bf16", "shape": [1024]},
+      {"key": "FF2_LINEAR1_WEIGHT", "type": "bf16", "shape": [4096, 1024]},
+      {"key": "FF2_LINEAR2_WEIGHT", "type": "bf16", "shape": [1024, 4096]},
+      {"key": "LN_OUT_WEIGHT", "type": "bf16", "shape": [1024]},
+      {"key": "LN_OUT_BIAS", "type": "bf16", "shape": [1024]}
+    ],
+    "subsampling": [
+      {"key": "CONV0_WEIGHT_STAGED", "type": "bf16", "shape": [256, 64], "comment": "im2col padded from (256,1,3,3)"},
+      {"key": "CONV0_BIAS", "type": "bf16", "shape": [256]},
+      {"key": "CONV2_WEIGHT_STAGED", "type": "bf16", "shape": [256, 64], "comment": "dw im2col padded from (256,1,3,3)"},
+      {"key": "CONV2_BIAS", "type": "bf16", "shape": [256]},
+      {"key": "CONV3_WEIGHT", "type": "bf16", "shape": [256, 256, 1, 1]},
+      {"key": "CONV3_BIAS", "type": "bf16", "shape": [256]},
+      {"key": "CONV5_WEIGHT_STAGED", "type": "bf16", "shape": [256, 64], "comment": "dw im2col padded from (256,1,3,3)"},
+      {"key": "CONV5_BIAS", "type": "bf16", "shape": [256]},
+      {"key": "CONV6_WEIGHT", "type": "bf16", "shape": [256, 256, 1, 1]},
+      {"key": "CONV6_BIAS", "type": "bf16", "shape": [256]},
+      {"key": "OUT_LINEAR_WEIGHT", "type": "bf16", "shape": [1024, 4096]},
+      {"key": "OUT_LINEAR_BIAS", "type": "bf16", "shape": [1024]}
+    ],
+    "predictor": [
+      {"key": "EMBEDDING", "type": "bf16", "shape": [8193, 640]},
+      {"key": "LSTM_WIH0", "type": "bf16", "shape": [2560, 640]},
+      {"key": "LSTM_WHH0", "type": "bf16", "shape": [2560, 640]},
+      {"key": "LSTM_BIH0", "type": "bf16", "shape": [2560]},
+      {"key": "LSTM_BHH0", "type": "bf16", "shape": [2560]},
+      {"key": "LSTM_WIH1", "type": "bf16", "shape": [2560, 640]},
+      {"key": "LSTM_WHH1", "type": "bf16", "shape": [2560, 640]},
+      {"key": "LSTM_BIH1", "type": "bf16", "shape": [2560]},
+      {"key": "LSTM_BHH1", "type": "bf16", "shape": [2560]}
+    ],
+    "joint": [
+      {"key": "ENC_PROJ_WEIGHT", "type": "bf16", "shape": [640, 1024]},
+      {"key": "ENC_PROJ_BIAS", "type": "bf16", "shape": [640]},
+      {"key": "PRED_PROJ_WEIGHT", "type": "bf16", "shape": [640, 640]},
+      {"key": "PRED_PROJ_BIAS", "type": "bf16", "shape": [640]},
+      {"key": "OUT_WEIGHT_STAGED", "type": "bf16", "shape": [8256, 640], "comment": "padded from (8198, 640)"},
+      {"key": "OUT_BIAS_STAGED", "type": "bf16", "shape": [8256], "comment": "padded from (8198,)"}
+    ],
+    "preprocessor": [
+      {"key": "MEL_FILTERBANK", "type": "bf16", "shape": [1, 128, 257]},
+      {"key": "STFT_WINDOW", "type": "bf16", "shape": [400]}
+    ]
+  },
+  "paths": {
+    "hf_model_repo": "nvidia/parakeet-tdt-0.6b",
+    "weights_dir": "parakeet_bin",
+    "weights_ckpt": "parakeet_bin/model_weights.ckpt"
+  },
+  "defaults": {
+    "dev": "xdma0",
+    "cycle_ns": 5.63,
+    "max_audio_seconds": 60,
+    "default_audio": "../../test_samples/1089-134686-0000.wav"
+  }
+}
