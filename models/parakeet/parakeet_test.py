@@ -1799,8 +1799,10 @@ def main():
     audio_path = args.audio or os.path.join(SCRIPT_DIR, cfg["defaults"]["default_audio"])
 
     import torchaudio
+    import soundfile as sf
     assert os.path.exists(audio_path), f"Audio file not found: {audio_path}"
-    waveform, sr = torchaudio.load(audio_path)
+    data, sr = sf.read(audio_path, dtype="float32")
+    waveform = torch.from_numpy(data).T if data.ndim > 1 else torch.from_numpy(data).unsqueeze(0)
     if sr != cfg["preprocessing"]["sample_rate"]:
         waveform = torchaudio.functional.resample(waveform, sr, cfg["preprocessing"]["sample_rate"])
     if waveform.dim() == 1:
