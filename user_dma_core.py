@@ -28,32 +28,6 @@ from enum import IntEnum
 import torch
 import math
 
-LOCK_FILE = "/srv/model_files/user_hw_test.lock"
-
-def acquire_hw_lock():
-    """Atomically create a lock file to prevent concurrent hardware test runs."""
-    try:
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        os.write(fd, f"pid={os.getpid()} user={os.getenv('USER', 'unknown')}\n".encode())
-        os.close(fd)
-        atexit.register(release_hw_lock)
-    except FileExistsError:
-        try:
-            with open(LOCK_FILE, "r") as f:
-                info = f.read().strip()
-        except OSError:
-            info = "unknown"
-        print(f"ERROR: Hardware test is already running ({info})")
-        print(f"If this is stale, remove: sudo rm {LOCK_FILE}")
-        raise SystemExit(1)
-
-def release_hw_lock():
-    """Remove the lock file."""
-    try:
-        os.remove(LOCK_FILE)
-    except OSError:
-        pass
-
 # Register address definitions (matches andromeda.c)
 # User device base address (AXI-Lite BAR mapping)
 AXI_LITE_TRANSLATION_OFFSET = 0x00000000
@@ -106,7 +80,6 @@ DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register acce
 
 def set_dma_device(device_name: str):
     """Set DMA device paths based on device name (e.g., 'xdma0' -> '/dev/xdma0_*')"""
-    acquire_hw_lock()
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
     DMA_DEVICE_C2H = f"/dev/{device_name}_c2h_0"
