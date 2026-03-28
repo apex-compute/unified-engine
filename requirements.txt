@@ -1,7 +1,10 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 torch>=2.4
+torchaudio>=2.4
+soundfile
 numpy<2
 transformers>=4.40.0
 huggingface-hub>=0.20.0
 pillow>=12.1.1
+sentencepiece
