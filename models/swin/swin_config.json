@@ -1,0 +1,138 @@
+{
+  "file_info": {
+    "image_size": 384,
+    "patch_size": 4,
+    "num_channels": 3,
+    "embed_dim": 192,
+    "depths": [2, 2, 18, 2],
+    "num_heads": [6, 12, 24, 48],
+    "window_size": 12,
+    "mlp_ratio": 4.0,
+    "head_dim": 32,
+    "num_stages": 4,
+    "num_labels": 21841,
+    "bytes_per_element": 2
+  },
+  "model": {
+    "hidden_act": "gelu",
+    "qkv_bias": true,
+    "use_absolute_embeddings": false,
+    "layer_norm_eps": 1e-5,
+    "drop_path_rate": 0.0
+  },
+  "paths": {
+    "weights_bin": "swin_bin/weights_swin_hf.bin",
+    "hf_model_dir": "swin_bin/swin-large-patch4-window12-384-in22k",
+    "hf_model_repo": "microsoft/swin-large-patch4-window12-384-in22k"
+  },
+  "defaults": {
+    "default_image": "../../test_samples/vette.jpg"
+  },
+  "stages": {
+    "stage_0": {
+      "dim": 192,
+      "num_heads": 6,
+      "depth": 2,
+      "spatial": [96, 96],
+      "num_windows": 64,
+      "seq_len": 9216,
+      "window_area": 144,
+      "mlp_hidden": 768,
+      "has_patch_merging": true
+    },
+    "stage_1": {
+      "dim": 384,
+      "num_heads": 12,
+      "depth": 2,
+      "spatial": [48, 48],
+      "num_windows": 16,
+      "seq_len": 2304,
+      "window_area": 144,
+      "mlp_hidden": 1536,
+      "has_patch_merging": true
+    },
+    "stage_2": {
+      "dim": 768,
+      "num_heads": 24,
+      "depth": 18,
+      "spatial": [24, 24],
+      "num_windows": 4,
+      "seq_len": 576,
+      "window_area": 144,
+      "mlp_hidden": 3072,
+      "has_patch_merging": true
+    },
+    "stage_3": {
+      "dim": 1536,
+      "num_heads": 48,
+      "depth": 2,
+      "spatial": [12, 12],
+      "num_windows": 1,
+      "seq_len": 144,
+      "window_area": 144,
+      "mlp_hidden": 6144,
+      "has_patch_merging": false
+    }
+  },
+  "padding": {
+    "align": 64,
+    "head_dim": 32,
+    "head_dim_pad": 64,
+    "window_area": 144,
+    "window_area_pad": 192,
+    "comment": "head_dim 32->64 is the source of the unpad problem; window_area 144->192 for seq alignment"
+  },
+  "unpad_weights": {
+    "comment": "Constructed identity-select matrices per stage: matmul(padded, W) strips interleaved head padding",
+    "stage_0": { "K": 384, "N": 192, "description": "6 heads * 64 -> 6 heads * 32" },
+    "stage_1": { "K": 768, "N": 384, "description": "12 heads * 64 -> 12 heads * 32" },
+    "stage_2": { "K": 1536, "N": 768, "description": "24 heads * 64 -> 24 heads * 32" },
+    "stage_3": { "K": 3072, "N": 1536, "description": "48 heads * 64 -> 48 heads * 32" }
+  },
+  "layers": {
+    "structure": [
+      {"key": "LAYER_PRE_ATTN_NORM_GAMMA", "type": "bf16"},
+      {"key": "LAYER_PRE_ATTN_NORM_BETA", "type": "bf16"},
+      {"key": "LAYER_ATTN_Q_WEIGHT", "type": "bf16"},
+      {"key": "LAYER_ATTN_Q_BIAS", "type": "bf16"},
+      {"key": "LAYER_ATTN_K_WEIGHT", "type": "bf16"},
+      {"key": "LAYER_ATTN_K_BIAS", "type": "bf16"},
+      {"key": "LAYER_ATTN_V_WEIGHT", "type": "bf16"},
+      {"key": "LAYER_ATTN_V_BIAS", "type": "bf16"},
+      {"key": "LAYER_REL_POS_BIAS", "type": "bf16"},
+      {"key": "LAYER_ATTN_OUTPUT_WEIGHT", "type": "bf16"},
+      {"key": "LAYER_ATTN_OUTPUT_BIAS", "type": "bf16"},
+      {"key": "LAYER_PRE_MLP_NORM_GAMMA", "type": "bf16"},
+      {"key": "LAYER_PRE_MLP_NORM_BETA", "type": "bf16"},
+      {"key": "LAYER_MLP_EXPAND_WEIGHT", "type": "bf16"},
+      {"key": "LAYER_MLP_EXPAND_BIAS", "type": "bf16"},
+      {"key": "LAYER_MLP_CONTRACT_WEIGHT", "type": "bf16"},
+      {"key": "LAYER_MLP_CONTRACT_BIAS", "type": "bf16"}
+    ],
+    "non_layer": [
+      {"key": "PATCH_EMBED_PROJ_WEIGHT", "attr": "DRAM_ADDR_PATCH_EMBED_WEIGHT"},
+      {"key": "PATCH_EMBED_PROJ_BIAS", "attr": "DRAM_ADDR_PATCH_EMBED_BIAS"},
+      {"key": "PATCH_EMBED_NORM_GAMMA", "attr": "DRAM_ADDR_PATCH_EMBED_NORM_GAMMA"},
+      {"key": "PATCH_EMBED_NORM_BETA", "attr": "DRAM_ADDR_PATCH_EMBED_NORM_BETA"},
+      {"key": "PATCH_MERGE_0_NORM_GAMMA", "attr": "DRAM_ADDR_MERGE0_NORM_GAMMA"},
+      {"key": "PATCH_MERGE_0_NORM_BETA", "attr": "DRAM_ADDR_MERGE0_NORM_BETA"},
+      {"key": "PATCH_MERGE_0_REDUCTION_WEIGHT", "attr": "DRAM_ADDR_MERGE0_REDUCTION"},
+      {"key": "PATCH_MERGE_1_NORM_GAMMA", "attr": "DRAM_ADDR_MERGE1_NORM_GAMMA"},
+      {"key": "PATCH_MERGE_1_NORM_BETA", "attr": "DRAM_ADDR_MERGE1_NORM_BETA"},
+      {"key": "PATCH_MERGE_1_REDUCTION_WEIGHT", "attr": "DRAM_ADDR_MERGE1_REDUCTION"},
+      {"key": "PATCH_MERGE_2_NORM_GAMMA", "attr": "DRAM_ADDR_MERGE2_NORM_GAMMA"},
+      {"key": "PATCH_MERGE_2_NORM_BETA", "attr": "DRAM_ADDR_MERGE2_NORM_BETA"},
+      {"key": "PATCH_MERGE_2_REDUCTION_WEIGHT", "attr": "DRAM_ADDR_MERGE2_REDUCTION"},
+      {"key": "FINAL_NORM_GAMMA", "attr": "DRAM_ADDR_FINAL_NORM_GAMMA"},
+      {"key": "FINAL_NORM_BETA", "attr": "DRAM_ADDR_FINAL_NORM_BETA"},
+      {"key": "CLASSIFIER_WEIGHT", "attr": "DRAM_ADDR_CLASSIFIER_WEIGHT"},
+      {"key": "CLASSIFIER_BIAS", "attr": "DRAM_ADDR_CLASSIFIER_BIAS"},
+      {"key": "UNPAD_WEIGHT_STAGE_0", "attr": "DRAM_ADDR_UNPAD_STAGE0"},
+      {"key": "UNPAD_WEIGHT_STAGE_1", "attr": "DRAM_ADDR_UNPAD_STAGE1"},
+      {"key": "UNPAD_WEIGHT_STAGE_2", "attr": "DRAM_ADDR_UNPAD_STAGE2"},
+      {"key": "UNPAD_WEIGHT_STAGE_3", "attr": "DRAM_ADDR_UNPAD_STAGE3"}
+    ]
+  },
+  "regions": {},
+  "non_layer_regions": {}
+}
