@@ -195,21 +195,22 @@ def window_partition_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_A
     input_row_stride = W * C * bytes_per_element            # full spatial row in input
     window_elements = window_size * window_size * C         # total elements per window
 
+    row_elements = window_size * C          # elements in one window row
     output_offset = 0
     for wh in range(num_windows_h):
         for ww in range(num_windows_w):
             # Top-left corner of this window in input DRAM
             window_src = INPUT_DRAM_ADDR + (wh * window_size * W + ww * window_size) * C * bytes_per_element
 
-            # Strided read: gather window_size rows, each window_row_bytes long,
-            # spaced input_row_stride apart in DRAM -> contiguous in SRAM
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=window_src,
-                sram_address=0x00000,
-                element_size=window_elements,
-                stride_bytes_per_chunk=window_row_bytes,
-                stride_jump_bytes=input_row_stride,
-            )
+            # Read each window row individually into contiguous SRAM slots
+            for row in range(window_size):
+                row_src = window_src + row * input_row_stride
+                row_sram = row * row_elements * bytes_per_element
+                ue.accelerator_memory_to_sram(
+                    accelerator_dram_address=row_src,
+                    sram_address=row_sram,
+                    element_size=row_elements,
+                )
             # Contiguous write to output
             ue.sram_to_accelerator_memory(
                 sram_address=0x00000,
@@ -231,6 +232,7 @@ def window_reverse_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADD
     output_row_stride = W * C * bytes_per_element
     window_elements = window_size * window_size * C
 
+    row_elements = window_size * C
     input_offset = 0
     for wh in range(num_windows_h):
         for ww in range(num_windows_w):
@@ -243,15 +245,15 @@ def window_reverse_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADD
                 sram_address=0x00000,
                 element_size=window_elements,
             )
-            # Strided write: scatter window_size rows, each window_row_bytes long,
-            # spaced output_row_stride apart in DRAM
-            ue.sram_to_accelerator_memory(
-                sram_address=0x00000,
-                accelerator_dram_address=window_dst,
-                element_size=window_elements,
-                stride_bytes_per_chunk=window_row_bytes,
-                stride_jump_bytes=output_row_stride,
-            )
+            # Write each window row individually to its spatial position
+            for row in range(window_size):
+                row_sram = row * row_elements * bytes_per_element
+                row_dst = window_dst + row * output_row_stride
+                ue.sram_to_accelerator_memory(
+                    sram_address=row_sram,
+                    accelerator_dram_address=row_dst,
+                    element_size=row_elements,
+                )
             input_offset += window_elements * bytes_per_element
 def cyclic_shift_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                       H: int, W: int, C: int, shift_h: int, shift_w: int) -> None:
@@ -751,13 +753,27 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.unpad_weight_addrs = []
         for s in range(self.NUM_STAGES):
             w = self.build_unpad_weight(self.NUM_HEADS[s], self.HEAD_DIM, pad(self.HEAD_DIM))
-            self.unpad_weight_addrs.append(self._alloc_param(w))
+            # matmat_mul_core expects B as (N, K) since it computes A @ B^T
+            self.unpad_weight_addrs.append(self._alloc_param(w.T.contiguous()))
 
-        # ---- Encoder: patch merging weights ----
-        # TODO: load norm gamma+beta, reduction weight for 3 merges
+        # ---- Encoder: patch merging weights (stages 0, 1, 2 only — no merge after stage 3) ----
+        self.patch_merge_weights = []
+        for s in range(self.NUM_STAGES - 1):
+            dim = self.STAGE_DIMS[s]
+            ds = swin.encoder.layers[s].downsample
+            pmw = {}
+            pmw['norm_gamma'] = self._alloc_param(ds.norm.weight.data)   # (4*dim,)
+            pmw['norm_beta']  = self._alloc_param(ds.norm.bias.data)     # (4*dim,)
+            pmw['reduction']  = self._alloc_param(ds.reduction.weight.data)  # (2*dim, 4*dim)
+            self.patch_merge_weights.append(pmw)
 
         # ---- Post-encoder ----
-        # TODO: final layernorm, avg pool weight, classifier weight+bias
+        # Final LayerNorm weights → params DRAM
+        self.POST_ENCODER_LN_GAMMA = self._alloc_param(swin.layernorm.weight.data)  # (1536,)
+        self.POST_ENCODER_LN_BETA  = self._alloc_param(swin.layernorm.bias.data)    # (1536,)
+        # Classifier weights kept on CPU (runs after DMA back)
+        self.CLASSIFIER_WEIGHT = model.classifier.weight.data.to(torch.bfloat16)  # (num_labels, 1536)
+        self.CLASSIFIER_BIAS   = model.classifier.bias.data.to(torch.bfloat16)    # (num_labels,)
 
         del model  # free CPU memory
 
@@ -797,7 +813,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
             # Windowed layout
             st['windowed'] = self._alloc_tensor(num_windows * wa * dim)
-            st['shifted'] = self._alloc_tensor(M * dim)  # for cyclic shift
+            st['shifted'] = self._alloc_tensor(M * dim)      # forward cyclic shift output (step 2)
+            st['win_reverse'] = self._alloc_tensor(M * dim)  # window reverse output (step 10)
 
             # Q/K/V after projection (windowed flat)
             st['q_proj'] = self._alloc_tensor(num_windows * wa * dim)
@@ -833,10 +850,17 @@ class Swin_UnifiedEngine(UnifiedEngine):
             st['mlp_mid'] = self._alloc_tensor(M * mlp_dim)
             st['mlp_out'] = self._alloc_tensor(M * dim)
 
+            # Patch merging scratch: (spatial/2 * spatial/2, 4*dim) — only for stages 0-2
+            if s < self.NUM_STAGES - 1:
+                next_M = (spatial // 2) * (spatial // 2)
+                st['merge_buf'] = self._alloc_tensor(next_M * 4 * dim)
+
             self.stage_tensors.append(st)
 
         # ---- Post-encoder tensors ----
-        # TODO: final norm output, transpose buffer, pool output, logits
+        final_M = self.STAGE_SPATIAL[3] ** 2  # 12*12 = 144
+        final_C = self.STAGE_DIMS[3]           # 1536
+        self.FINAL_LN_OUTPUT_DRAM = self._alloc_tensor(final_M * final_C)
 
     # ------------------------------------------------------------------
     # Unpad weight construction
@@ -1009,7 +1033,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             total_batches = num_windows * num_heads
             st = self.stage_tensors[s]
 
-            for l in range(min(1, self.DEPTHS[s])):  # TODO: all layers. For now, layer 0 only.
+            for l in range(self.DEPTHS[s]):
                 lw = self.encoder_weights[s][l]
                 shift_size = 0 if l % 2 == 0 else self.WINDOW_SIZE // 2
 
@@ -1072,6 +1096,31 @@ class Swin_UnifiedEngine(UnifiedEngine):
                         num_windows=num_windows, wa=wa, num_heads=num_heads,
                         head_dim=head_dim, head_dim_pad=hd_pad, wa_pad=wa_pad)
 
+                # --- 5b. Pre-scale Q to correct for padded head_dim ---
+                # flash_attention_core scales by 1/sqrt(hd_pad=64), but we need 1/sqrt(head_dim=32).
+                # Pre-multiply Q by sqrt(hd_pad)/sqrt(head_dim) so net scale = 1/sqrt(head_dim).
+                scale_correction = math.sqrt(hd_pad) / math.sqrt(head_dim)
+                total_q_elements = total_batches * wa_pad * hd_pad
+                chunk_size = URAM_NEAR_FULL_ELEMENTS
+                for offset in range(0, total_q_elements, chunk_size):
+                    take = min(chunk_size, total_q_elements - offset)
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=st['q_heads'] + offset * 2,
+                        sram_address=0x00000,
+                        element_size=take,
+                    )
+                    self.broadcast_mul(
+                        scalar=scale_correction,
+                        sram_start_addr=0x00000,
+                        sram_wb_addr=0x00000,
+                        element_size=take,
+                    )
+                    self.sram_to_accelerator_memory(
+                        sram_address=0x00000,
+                        accelerator_dram_address=st['q_heads'] + offset * 2,
+                        element_size=take,
+                    )
+
                 # --- 6. Flash attention batched ---
                 dram_zero_fill(self, st['attn_output'], total_batches * wa_pad * hd_pad)
                 flash_attention_batched(self,
@@ -1086,7 +1135,210 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     BIAS_DRAM_ADDR=lw['rel_pos_bias'],
                 )
 
-                # TODO: steps 7-17 (inverse permute, unpad, output proj, residuals, MLP)
+                # --- 7. Inverse permute: (total_batches, wa_pad, hd_pad) -> (num_windows * wa, num_heads * hd_pad) ---
+                # For each window, extract (num_heads, wa, hd_pad) from attn_output (skipping wa_pad rows),
+                # permute to (wa, num_heads, hd_pad), then write to attn_permuted.
+                for w in range(num_windows):
+                    # Gather each head's real rows into permute_temp as (num_heads, wa, hd_pad)
+                    for h in range(num_heads):
+                        src = st['attn_output'] + (w * num_heads + h) * wa_pad * hd_pad * 2
+                        dst = st['permute_temp'] + h * wa * hd_pad * 2
+                        self.accelerator_memory_to_sram(
+                            accelerator_dram_address=src,
+                            sram_address=0x00000,
+                            element_size=wa * hd_pad,
+                        )
+                        self.sram_to_accelerator_memory(
+                            sram_address=0x00000,
+                            accelerator_dram_address=dst,
+                            element_size=wa * hd_pad,
+                        )
+
+                    # Permute (num_heads, wa, hd_pad) -> (wa, num_heads, hd_pad)
+                    permute_out = st['permute_temp'] + num_heads * wa * hd_pad * 2
+                    self.bf16_permute_core(
+                        dim_0=num_heads, dim_1=wa, dim_2=hd_pad,
+                        INPUT_DRAM_ADDR=st['permute_temp'],
+                        OUTPUT_DRAM_ADDR=permute_out,
+                    )
+
+                    # Copy (wa, num_heads * hd_pad) to attn_permuted, chunked to fit in URAM_A
+                    out_dst = st['attn_permuted'] + w * wa * num_heads * hd_pad * 2
+                    row_elems = num_heads * hd_pad
+                    rows_per_chunk = max(1, URAM_NEAR_FULL_ELEMENTS // row_elems)
+                    for row_start in range(0, wa, rows_per_chunk):
+                        row_take = min(rows_per_chunk, wa - row_start)
+                        chunk_elems = row_take * row_elems
+                        self.accelerator_memory_to_sram(
+                            accelerator_dram_address=permute_out + row_start * row_elems * 2,
+                            sram_address=0x00000,
+                            element_size=chunk_elems,
+                        )
+                        self.sram_to_accelerator_memory(
+                            sram_address=0x00000,
+                            accelerator_dram_address=out_dst + row_start * row_elems * 2,
+                            element_size=chunk_elems,
+                        )
+
+                # --- 8. Unpad matmul: (M_win, num_heads*hd_pad) @ (num_heads*hd_pad, dim) -> (M_win, dim) ---
+                self.matmat_mul_core(
+                    M=M_win, K=num_heads * hd_pad, N=dim,
+                    A_DRAM_ADDR=st['attn_permuted'],
+                    B_DRAM_ADDR=self.unpad_weight_addrs[s],
+                    OUTPUT_DRAM_ADDR=st['attn_unpadded'],
+                )
+
+                # --- 9. Output projection: (M_win, dim) @ (dim, dim) + bias -> (M_win, dim) ---
+                self.matmat_mul_core(
+                    M=M_win, K=dim, N=dim,
+                    A_DRAM_ADDR=st['attn_unpadded'],
+                    B_DRAM_ADDR=lw['out_proj_weight'],
+                    OUTPUT_DRAM_ADDR=st['out_proj'],
+                    C_DRAM_ADDR=lw['out_proj_bias'],
+                    bias_mode="broadcast_N",
+                )
+
+                # --- 10. Window reverse: (num_windows, wa, dim) -> (spatial, spatial, dim) ---
+                window_reverse_dram(self,
+                    INPUT_DRAM_ADDR=st['out_proj'],
+                    OUTPUT_DRAM_ADDR=st['win_reverse'],
+                    H=spatial, W=spatial, C=dim,
+                    window_size=self.WINDOW_SIZE)
+
+                # --- 11. Reverse cyclic shift (odd layers only) ---
+                if shift_size > 0:
+                    cyclic_shift_dram(self,
+                        INPUT_DRAM_ADDR=st['win_reverse'],
+                        OUTPUT_DRAM_ADDR=st['ln_output'],
+                        H=spatial, W=spatial, C=dim,
+                        shift_h=spatial - shift_size, shift_w=spatial - shift_size)
+
+                # --- 12. Residual add 1: shortcut + attention spatial output ---
+                attn_spatial_addr = st['ln_output'] if shift_size > 0 else st['win_reverse']
+                chunk_elems = min(URAM_NEAR_FULL_ELEMENTS, M * dim)
+                for offset in range(0, M * dim, chunk_elems):
+                    take = min(chunk_elems, M * dim - offset)
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=layer_input_addr + offset * 2,
+                        sram_address=0x00000,
+                        element_size=take,
+                    )
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=attn_spatial_addr + offset * 2,
+                        sram_address=0x80000,
+                        element_size=take,
+                    )
+                    self.eltwise_add_core(
+                        vector_A_sram_start_addr=0x00000,
+                        vector_B_sram_start_addr=0x80000,
+                        vector_C_sram_wb_addr=0x00000,
+                        element_size=take,
+                    )
+                    self.sram_to_accelerator_memory(
+                        sram_address=0x00000,
+                        accelerator_dram_address=st['residual1'] + offset * 2,
+                        element_size=take,
+                    )
+
+                # --- 13. Pre-MLP LayerNorm ---
+                self.layer_norm_core_dram(
+                    M=M, N=dim,
+                    A_DRAM_ADDR=st['residual1'],
+                    OUTPUT_DRAM_ADDR=st['mlp_ln'],
+                    GAMMA_DRAM_ADDR=lw['ln_after_gamma'],
+                    BETA_DRAM_ADDR=lw['ln_after_beta'],
+                )
+
+                # --- 14. MLP expand: (M, dim) -> (M, mlp_dim) + bias + GELU ---
+                self.matmat_mul_core(
+                    M=M, K=dim, N=mlp_dim,
+                    A_DRAM_ADDR=st['mlp_ln'],
+                    B_DRAM_ADDR=lw['mlp_expand_weight'],
+                    OUTPUT_DRAM_ADDR=st['mlp_mid'],
+                    C_DRAM_ADDR=lw['mlp_expand_bias'],
+                    bias_mode="broadcast_N",
+                    gelu_enable=True,
+                )
+
+                # --- 15. MLP contract: (M, mlp_dim) -> (M, dim) + bias ---
+                self.matmat_mul_core(
+                    M=M, K=mlp_dim, N=dim,
+                    A_DRAM_ADDR=st['mlp_mid'],
+                    B_DRAM_ADDR=lw['mlp_contract_weight'],
+                    OUTPUT_DRAM_ADDR=st['mlp_out'],
+                    C_DRAM_ADDR=lw['mlp_contract_bias'],
+                    bias_mode="broadcast_N",
+                )
+
+                # --- 16. Residual add 2: residual1 + mlp_out -> layer output ---
+                # Write to layer_input so the next layer reads from there
+                layer_output_addr = st['layer_input']
+                chunk_elems = min(URAM_NEAR_FULL_ELEMENTS, M * dim)
+                for offset in range(0, M * dim, chunk_elems):
+                    take = min(chunk_elems, M * dim - offset)
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=st['residual1'] + offset * 2,
+                        sram_address=0x00000,
+                        element_size=take,
+                    )
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=st['mlp_out'] + offset * 2,
+                        sram_address=0x80000,
+                        element_size=take,
+                    )
+                    self.eltwise_add_core(
+                        vector_A_sram_start_addr=0x00000,
+                        vector_B_sram_start_addr=0x80000,
+                        vector_C_sram_wb_addr=0x00000,
+                        element_size=take,
+                    )
+                    self.sram_to_accelerator_memory(
+                        sram_address=0x00000,
+                        accelerator_dram_address=layer_output_addr + offset * 2,
+                        element_size=take,
+                    )
+
+                self.stop_capture()
+                self.generate_instruction_halt()
+
+                prog_addr = self.get_program_dram_addr()
+                self.write_captured_instructions_to_dram(prog_addr)
+                self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+                self.clear_capture_buffer()
+
+                program_addrs.append(prog_addr)
+
+            # ---- Patch merging (after all layers in stages 0-2) ----
+            if s < self.NUM_STAGES - 1:
+                pmw = self.patch_merge_weights[s]
+                next_spatial = spatial // 2
+                next_M = next_spatial * next_spatial
+                next_dim = dim * 2   # STAGE_DIMS[s+1]
+
+                self.start_capture()
+
+                # Gather 2x2 neighbors: (spatial, spatial, dim) -> (next_M, 4*dim)
+                patch_merging_gather_dram(self,
+                    INPUT_DRAM_ADDR=st['layer_input'],
+                    OUTPUT_DRAM_ADDR=st['merge_buf'],
+                    H=spatial, W=spatial, C=dim)
+
+                # LayerNorm on 4*dim
+                self.layer_norm_core_dram(
+                    M=next_M, N=4 * dim,
+                    A_DRAM_ADDR=st['merge_buf'],
+                    OUTPUT_DRAM_ADDR=st['merge_buf'],
+                    GAMMA_DRAM_ADDR=pmw['norm_gamma'],
+                    BETA_DRAM_ADDR=pmw['norm_beta'],
+                )
+
+                # Linear reduction: (next_M, 4*dim) -> (next_M, 2*dim), no bias
+                self.matmat_mul_core(
+                    M=next_M, K=4 * dim, N=next_dim,
+                    A_DRAM_ADDR=st['merge_buf'],
+                    B_DRAM_ADDR=pmw['reduction'],
+                    OUTPUT_DRAM_ADDR=self.stage_tensors[s + 1]['layer_input'],
+                )
 
                 self.stop_capture()
                 self.generate_instruction_halt()
@@ -1101,26 +1353,34 @@ class Swin_UnifiedEngine(UnifiedEngine):
         return program_addrs
 
     def compile_post_encoder(self) -> int:
-        """Compile everything after the encoder layers.
+        """Compile final LayerNorm on HW.
 
-        Ops:
-          1. Final LayerNorm(1536)
-          2. bf16_transpose_core(M=144, N=1536) -> (1536, 192 padded)
-          3. matmat_mul_core(M=1536, K=192, N=64) with avg_pool_weight -> (1536, 64)
-          4. matmat_mul_core(M=1, K=1536, N=21841) with classifier weight + bias
+        Input:  stage_tensors[3]['layer_input'] (144, 1536) — final encoder output
+        Output: FINAL_LN_OUTPUT_DRAM (144, 1536)
 
-        Input:  (144, 1536) encoder output in DRAM
-        Output: (1, 21841) logits in DRAM
+        Avg pool and classifier run on CPU in run_post_encoder after DMA back.
 
         Returns program DRAM address.
         """
-        # TODO: start_capture
-        #   layer_norm_core_dram(M=144, N=1536, gamma, beta)
-        #   bf16_transpose_core(M=144, N=1536)
-        #   matmat_mul_core(M=1536, K=192, N=64, B=avg_pool_weight)
-        #   matmat_mul_core(M=1, K=1536, N=21841, B=classifier_weight, C=classifier_bias)
-        # stop_capture, write to program DRAM
-        raise NotImplementedError("compile_post_encoder")
+        final_M = self.STAGE_SPATIAL[3] ** 2  # 144
+        final_C = self.STAGE_DIMS[3]           # 1536
+
+        self.start_capture()
+        self.layer_norm_core_dram(
+            M=final_M, N=final_C,
+            A_DRAM_ADDR=self.stage_tensors[3]['layer_input'],
+            OUTPUT_DRAM_ADDR=self.FINAL_LN_OUTPUT_DRAM,
+            GAMMA_DRAM_ADDR=self.POST_ENCODER_LN_GAMMA,
+            BETA_DRAM_ADDR=self.POST_ENCODER_LN_BETA,
+        )
+        self.stop_capture()
+        self.generate_instruction_halt()
+
+        prog_addr = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog_addr)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.clear_capture_buffer()
+        return prog_addr
 
     def compile_forward(self) -> dict:
         """Compile full forward pass. Returns dict of program addresses."""
@@ -1150,27 +1410,29 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.wait_queue()
 
     def run_encoder(self, program_addrs: list[int]) -> None:
-        """Run encoder layer programs.
-
-        For now: first layer reads directly from EMBED_OUTPUT_DRAM (compiled that way).
-        """
-        if program_addrs:
-            self.start_execute_from_dram(program_addrs[0])
+        """Run all encoder layer + patch merging programs sequentially."""
+        for addr in program_addrs:
+            self.start_execute_from_dram(addr)
             self.wait_queue()
 
     def run_post_encoder(self, program_addr: int) -> torch.Tensor:
-        """Run final norm + pool + classifier. Returns logits.
+        """Run final norm (HW) + avg pool + classifier (CPU). Returns (1, num_labels) logits."""
+        final_M = self.STAGE_SPATIAL[3] ** 2  # 144
+        final_C = self.STAGE_DIMS[3]           # 1536
 
-        1. Execute post_encoder program
-        2. DMA logits back from device
-        3. Return (1, num_labels) tensor
-        """
-        # TODO:
-        #   start_execute_from_dram(program_addr)
-        #   wait_queue()
-        #   logits = dma_from_accelerator_memory(LOGITS_DRAM, (1, num_labels))
-        #   return logits
-        raise NotImplementedError("run_post_encoder")
+        self.start_execute_from_dram(program_addr)
+        self.wait_queue()
+
+        # DMA back (144, 1536)
+        ln_out = self.dma_from_accelerator_memory(
+            self.FINAL_LN_OUTPUT_DRAM, (final_M, final_C)).to(torch.bfloat16)
+
+        # Avg pool: mean over sequence dim → (1, 1536)
+        pooled = ln_out.mean(dim=0, keepdim=True)  # (1, 1536)
+
+        # Classifier: (1, 1536) @ (num_labels, 1536)^T + bias → (1, num_labels)
+        logits = torch.nn.functional.linear(pooled, self.CLASSIFIER_WEIGHT, self.CLASSIFIER_BIAS)
+        return logits
 
     def run_forward(self, pixel_values: torch.Tensor, program_addrs: dict) -> torch.Tensor:
         """Run full forward pass on accelerator.
@@ -1311,9 +1573,10 @@ def main():
         # (9216, 192) each
     del model2
 
-    # Run encoder (first layer)
+    # Compile all encoder programs, then run one at a time for per-layer inspection
     encoder_addrs = ue.compile_encoder()
-    ue.run_encoder(encoder_addrs)
+    ue.start_execute_from_dram(encoder_addrs[0])
+    ue.wait_queue()
 
     # Read back Q projection
     st = ue.stage_tensors[0]
@@ -1408,7 +1671,522 @@ def main():
     attn_snr = 10 * math.log10(attn_signal / attn_noise) if attn_noise > 0 else float('inf')
     print(f"  Attention: MAE={attn_mae:.6f}, SNR={attn_snr:.2f} dB — {'PASS' if attn_snr > 30 else 'FAIL'}")
 
-    assert False, "Encoder layer 0 test complete (LN + window partition + QKV + permute + attention)."
+    # Inverse permute check
+    # ref_ctx is (64, 6, 144, 32) = (nw, num_heads, wa, head_dim)
+    # After inverse permute: (nw, wa, num_heads, hd_pad) with zeros in [head_dim:hd_pad]
+    # Flattened: (nw * wa, num_heads * hd_pad) = (9216, 384)
+    ref_inv_permute = ref_ctx.permute(0, 2, 1, 3).contiguous()  # (64, 144, 6, 32)
+    # Pad head_dim 32->64 with zeros to match HW layout
+    ref_inv_padded = torch.zeros(nw, wa, num_heads, hd_pad, dtype=torch.bfloat16)
+    ref_inv_padded[:, :, :, :head_dim] = ref_inv_permute.to(torch.bfloat16)
+    ref_inv_flat = ref_inv_padded.reshape(nw * wa, num_heads * hd_pad)
+
+    hw_inv = ue.dma_from_accelerator_memory(
+        st['attn_permuted'], (nw * wa, num_heads * hd_pad)).to(torch.bfloat16)
+
+    inv_diff = (ref_inv_flat.float() - hw_inv.float()).abs()
+    inv_mae = inv_diff.mean().item()
+    inv_signal = (ref_inv_flat.float() ** 2).mean().item()
+    inv_noise = ((ref_inv_flat.float() - hw_inv.float()) ** 2).mean().item()
+    inv_snr = 10 * math.log10(inv_signal / inv_noise) if inv_noise > 0 else float('inf')
+    print(f"  InvPermute: MAE={inv_mae:.6f}, SNR={inv_snr:.2f} dB — {'PASS' if inv_snr > 30 else 'FAIL'}")
+
+    # Unpad check: after matmul with unpad weight, should be (nw * wa, dim) = (9216, 192)
+    dim = ue.STAGE_DIMS[0]  # 192
+    ref_unpadded = ref_ctx.permute(0, 2, 1, 3).contiguous().reshape(nw * wa, num_heads * head_dim).to(torch.bfloat16)
+
+    hw_unpadded = ue.dma_from_accelerator_memory(
+        st['attn_unpadded'], (nw * wa, dim)).to(torch.bfloat16)
+
+    unpad_diff = (ref_unpadded.float() - hw_unpadded.float()).abs()
+    unpad_mae = unpad_diff.mean().item()
+    unpad_signal = (ref_unpadded.float() ** 2).mean().item()
+    unpad_noise = ((ref_unpadded.float() - hw_unpadded.float()) ** 2).mean().item()
+    unpad_snr = 10 * math.log10(unpad_signal / unpad_noise) if unpad_noise > 0 else float('inf')
+    print(f"  Unpad: MAE={unpad_mae:.6f}, SNR={unpad_snr:.2f} dB — {'PASS' if unpad_snr > 30 else 'FAIL'}")
+
+    # Output projection check: (nw * wa, dim) = (9216, 192)
+    with torch.no_grad():
+        model4, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+        out_proj4 = model4.swin.encoder.layers[0].blocks[0].attention.output.dense
+        ref_out_proj = out_proj4(ref_unpadded.unsqueeze(0)).squeeze(0)
+        del model4
+
+    hw_out_proj = ue.dma_from_accelerator_memory(
+        st['out_proj'], (nw * wa, dim)).to(torch.bfloat16)
+
+    op_diff = (ref_out_proj.float() - hw_out_proj.float()).abs()
+    op_mae = op_diff.mean().item()
+    op_signal = (ref_out_proj.float() ** 2).mean().item()
+    op_noise = ((ref_out_proj.float() - hw_out_proj.float()) ** 2).mean().item()
+    op_snr = 10 * math.log10(op_signal / op_noise) if op_noise > 0 else float('inf')
+    print(f"  OutProj: MAE={op_mae:.6f}, SNR={op_snr:.2f} dB — {'PASS' if op_snr > 30 else 'FAIL'}")
+
+    # Window reverse check: (nw * wa, dim) windowed -> (spatial * spatial, dim) spatial
+    num_wh = spatial // ws  # 8
+    num_ww = spatial // ws  # 8
+    ref_win_reversed = ref_out_proj.reshape(nw, ws, ws, dim)
+    ref_win_reversed = ref_win_reversed.reshape(num_wh, num_ww, ws, ws, dim)
+    ref_win_reversed = ref_win_reversed.permute(0, 2, 1, 3, 4).contiguous().reshape(spatial * spatial, dim)
+
+    hw_win_reversed = ue.dma_from_accelerator_memory(
+        st['win_reverse'], (spatial * spatial, dim)).to(torch.bfloat16)
+
+    wr_diff = (ref_win_reversed.float() - hw_win_reversed.float()).abs()
+    wr_mae = wr_diff.mean().item()
+    wr_signal = (ref_win_reversed.float() ** 2).mean().item()
+    wr_noise = ((ref_win_reversed.float() - hw_win_reversed.float()) ** 2).mean().item()
+    wr_snr = 10 * math.log10(wr_signal / wr_noise) if wr_noise > 0 else float('inf')
+    print(f"  WinReverse: MAE={wr_mae:.6f}, SNR={wr_snr:.2f} dB — {'PASS' if wr_snr > 30 else 'FAIL'}")
+
+    # Reverse cyclic shift: skipped for layer 0 (shift_size=0)
+    print(f"  RevShift: skipped (layer 0, shift_size=0)")
+
+    # Residual add 1 check: shortcut (embed output) + attention spatial output
+    # For layer 0: shortcut is embed_2d (9216, 192), attn spatial is ref_win_reversed
+    ref_residual1 = (embed_2d.float() + ref_win_reversed.float()).to(torch.bfloat16)
+
+    hw_residual1 = ue.dma_from_accelerator_memory(
+        st['residual1'], (M_win, dim)).to(torch.bfloat16)
+
+    r1_diff = (ref_residual1.float() - hw_residual1.float()).abs()
+    r1_mae = r1_diff.mean().item()
+    r1_signal = (ref_residual1.float() ** 2).mean().item()
+    r1_noise = ((ref_residual1.float() - hw_residual1.float()) ** 2).mean().item()
+    r1_snr = 10 * math.log10(r1_signal / r1_noise) if r1_noise > 0 else float('inf')
+    print(f"  Residual1: MAE={r1_mae:.6f}, SNR={r1_snr:.2f} dB — {'PASS' if r1_snr > 30 else 'FAIL'}")
+
+    # Pre-MLP LayerNorm check
+    with torch.no_grad():
+        model5, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+        block5 = model5.swin.encoder.layers[0].blocks[0]
+        ref_mlp_ln = block5.layernorm_after(ref_residual1.unsqueeze(0)).squeeze(0)
+        del model5
+
+    hw_mlp_ln = ue.dma_from_accelerator_memory(
+        st['mlp_ln'], (M_win, dim)).to(torch.bfloat16)
+
+    mln_diff = (ref_mlp_ln.float() - hw_mlp_ln.float()).abs()
+    mln_mae = mln_diff.mean().item()
+    mln_signal = (ref_mlp_ln.float() ** 2).mean().item()
+    mln_noise = ((ref_mlp_ln.float() - hw_mlp_ln.float()) ** 2).mean().item()
+    mln_snr = 10 * math.log10(mln_signal / mln_noise) if mln_noise > 0 else float('inf')
+    print(f"  MLP_LN: MAE={mln_mae:.6f}, SNR={mln_snr:.2f} dB — {'PASS' if mln_snr > 30 else 'FAIL'}")
+
+    # MLP expand + GELU check
+    # HW GELU is x * sigmoid(1.702 * x), not torch's exact erf-based F.gelu
+    def hw_gelu(x):
+        return x * torch.sigmoid(1.702 * x)
+
+    with torch.no_grad():
+        model6, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+        block6 = model6.swin.encoder.layers[0].blocks[0]
+        ref_mlp_pre_act = block6.intermediate.dense(ref_mlp_ln.unsqueeze(0)).squeeze(0)  # Linear only
+        ref_mlp_mid = hw_gelu(ref_mlp_pre_act)
+        del model6
+
+    mlp_dim = int(dim * ue.MLP_RATIO)  # 768
+    hw_mlp_mid = ue.dma_from_accelerator_memory(
+        st['mlp_mid'], (M_win, mlp_dim)).to(torch.bfloat16)
+
+    mm_diff = (ref_mlp_mid.float() - hw_mlp_mid.float()).abs()
+    mm_mae = mm_diff.mean().item()
+    mm_signal = (ref_mlp_mid.float() ** 2).mean().item()
+    mm_noise = ((ref_mlp_mid.float() - hw_mlp_mid.float()) ** 2).mean().item()
+    mm_snr = 10 * math.log10(mm_signal / mm_noise) if mm_noise > 0 else float('inf')
+    print(f"  MLP_Expand+GELU: MAE={mm_mae:.6f}, SNR={mm_snr:.2f} dB — {'PASS' if mm_snr > 30 else 'FAIL'}")
+
+    # MLP contract check
+    with torch.no_grad():
+        model7, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+        block7 = model7.swin.encoder.layers[0].blocks[0]
+        ref_mlp_out = block7.output.dense(ref_mlp_mid.unsqueeze(0)).squeeze(0)  # Linear only
+        del model7
+
+    hw_mlp_out = ue.dma_from_accelerator_memory(
+        st['mlp_out'], (M_win, dim)).to(torch.bfloat16)
+
+    mc_diff = (ref_mlp_out.float() - hw_mlp_out.float()).abs()
+    mc_mae = mc_diff.mean().item()
+    mc_signal = (ref_mlp_out.float() ** 2).mean().item()
+    mc_noise = ((ref_mlp_out.float() - hw_mlp_out.float()) ** 2).mean().item()
+    mc_snr = 10 * math.log10(mc_signal / mc_noise) if mc_noise > 0 else float('inf')
+    print(f"  MLP_Contract: MAE={mc_mae:.6f}, SNR={mc_snr:.2f} dB — {'PASS' if mc_snr > 30 else 'FAIL'}")
+
+    # Residual add 2 check: residual1 + mlp_out = full layer output
+    ref_layer_out = (ref_residual1.float() + ref_mlp_out.float()).to(torch.bfloat16)
+
+    hw_layer_out = ue.dma_from_accelerator_memory(
+        st['layer_input'], (M_win, dim)).to(torch.bfloat16)
+
+    r2_diff = (ref_layer_out.float() - hw_layer_out.float()).abs()
+    r2_mae = r2_diff.mean().item()
+    r2_signal = (ref_layer_out.float() ** 2).mean().item()
+    r2_noise = ((ref_layer_out.float() - hw_layer_out.float()) ** 2).mean().item()
+    r2_snr = 10 * math.log10(r2_signal / r2_noise) if r2_noise > 0 else float('inf')
+    print(f"  Residual2: MAE={r2_mae:.6f}, SNR={r2_snr:.2f} dB — {'PASS' if r2_snr > 30 else 'FAIL'}")
+
+    print()
+    print("=" * 60)
+    print("Testing encoder stage 0, layer 1 (shift_size=6)")
+    print("=" * 60)
+
+    ue.start_execute_from_dram(encoder_addrs[1])
+    ue.wait_queue()
+
+    def snr_check(name, ref, hw_addr, shape):
+        hw = ue.dma_from_accelerator_memory(hw_addr, shape).to(torch.bfloat16)
+        r = ref.float()
+        h = hw.float()
+        diff = (r - h).abs()
+        mae = diff.mean().item()
+        sig = (r ** 2).mean().item()
+        noise = ((r - h) ** 2).mean().item()
+        snr = 10 * math.log10(sig / noise) if noise > 0 else float('inf')
+        print(f"  {name}: MAE={mae:.6f}, SNR={snr:.2f} dB — {'PASS' if snr > 30 else 'FAIL'}")
+        return hw
+
+    shift_size1 = ws // 2  # 6
+
+    with torch.no_grad():
+        model_l1, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+        block1_l1 = model_l1.swin.encoder.layers[0].blocks[1]
+
+        # Use actual HW layer 0 output as layer 1 input to isolate layer 1 errors
+        ref_l0_out = hw_layer_out  # DMA'd from st['layer_input'] after encoder_addrs[0]
+
+        # LN
+        ref_l1_ln = block1_l1.layernorm_before(ref_l0_out.unsqueeze(0)).squeeze(0)
+
+        # Cyclic shift (-6, -6) -> st['shifted']
+        ref_l1_shifted = torch.roll(
+            ref_l1_ln.reshape(spatial, spatial, dim),
+            shifts=(-shift_size1, -shift_size1), dims=(0, 1)
+        ).reshape(M_win, dim)
+
+        # Window partition -> st['windowed']
+        ref_l1_wpart = ref_l1_shifted.reshape(num_wh, ws, num_ww, ws, dim)
+        ref_l1_wpart = ref_l1_wpart.permute(0, 2, 1, 3, 4).contiguous().reshape(-1, ws * ws, dim)
+
+        # QKV
+        attn1 = block1_l1.attention.self
+        ref_l1_q = ref_l1_wpart.reshape(-1, dim) @ attn1.query.weight.data.to(torch.bfloat16).T + attn1.query.bias.data.to(torch.bfloat16)
+        ref_l1_k = ref_l1_wpart.reshape(-1, dim) @ attn1.key.weight.data.to(torch.bfloat16).T + attn1.key.bias.data.to(torch.bfloat16)
+        ref_l1_v = ref_l1_wpart.reshape(-1, dim) @ attn1.value.weight.data.to(torch.bfloat16).T + attn1.value.bias.data.to(torch.bfloat16)
+
+        # Attention (no shifted window mask — HW uses RPB only)
+        ref_l1_q_mh = ref_l1_q.reshape(nw, wa, num_heads, head_dim).permute(0, 2, 1, 3)
+        ref_l1_k_mh = ref_l1_k.reshape(nw, wa, num_heads, head_dim).permute(0, 2, 1, 3)
+        ref_l1_v_mh = ref_l1_v.reshape(nw, wa, num_heads, head_dim).permute(0, 2, 1, 3)
+        ref_l1_scores = torch.matmul(ref_l1_q_mh.float(), ref_l1_k_mh.float().transpose(-1, -2)) / math.sqrt(head_dim)
+        rpb1 = attn1.relative_position_bias_table[attn1.relative_position_index.view(-1)].view(wa, wa, num_heads).permute(2, 0, 1).contiguous()
+        ref_l1_scores = ref_l1_scores + rpb1.float().unsqueeze(0)
+        ref_l1_probs = torch.nn.functional.softmax(ref_l1_scores, dim=-1)
+        ref_l1_ctx = torch.matmul(ref_l1_probs, ref_l1_v_mh.float())
+        ref_l1_ctx_flat = ref_l1_ctx.reshape(nw * num_heads, wa, head_dim).to(torch.bfloat16)
+
+        # Inv permute (padded)
+        ref_l1_inv_padded = torch.zeros(nw, wa, num_heads, hd_pad, dtype=torch.bfloat16)
+        ref_l1_inv_padded[:, :, :, :head_dim] = ref_l1_ctx.permute(0, 2, 1, 3).to(torch.bfloat16)
+        ref_l1_inv_flat = ref_l1_inv_padded.reshape(nw * wa, num_heads * hd_pad)
+
+        # Unpad
+        ref_l1_unpadded = ref_l1_ctx.permute(0, 2, 1, 3).contiguous().reshape(nw * wa, num_heads * head_dim).to(torch.bfloat16)
+
+        # Out proj
+        ref_l1_out_proj = block1_l1.attention.output.dense(ref_l1_unpadded.unsqueeze(0)).squeeze(0)
+
+        # Window reverse -> st['shifted']
+        ref_l1_winrev = ref_l1_out_proj.reshape(nw, ws, ws, dim)
+        ref_l1_winrev = ref_l1_winrev.reshape(num_wh, num_ww, ws, ws, dim)
+        ref_l1_winrev = ref_l1_winrev.permute(0, 2, 1, 3, 4).contiguous().reshape(spatial * spatial, dim)
+
+        # Reverse cyclic shift (+6, +6) -> st['ln_output']
+        ref_l1_revshift = torch.roll(
+            ref_l1_winrev.reshape(spatial, spatial, dim),
+            shifts=(shift_size1, shift_size1), dims=(0, 1)
+        ).reshape(M_win, dim)
+
+        # Residual 1
+        ref_l1_res1 = (ref_l0_out.float() + ref_l1_revshift.float()).to(torch.bfloat16)
+
+        # Pre-MLP LN
+        ref_l1_mlp_ln = block1_l1.layernorm_after(ref_l1_res1.unsqueeze(0)).squeeze(0)
+
+        # MLP expand + HW GELU
+        ref_l1_mlp_mid = hw_gelu(block1_l1.intermediate.dense(ref_l1_mlp_ln.unsqueeze(0)).squeeze(0))
+
+        # MLP contract
+        ref_l1_mlp_out = block1_l1.output.dense(ref_l1_mlp_mid.unsqueeze(0)).squeeze(0)
+
+        # Residual 2 = layer output
+        ref_l1_out = (ref_l1_res1.float() + ref_l1_mlp_out.float()).to(torch.bfloat16)
+
+        del model_l1
+
+    # Note: for odd layers, st['shifted'] is overwritten by window reverse (step 10)
+    # and st['ln_output'] is overwritten by reverse shift (step 11). Checks reflect final state.
+    snr_check("WindowPartition", ref_l1_wpart.reshape(-1, dim), st['windowed'], (M_win, dim))
+    for name, ref in [('Q', ref_l1_q), ('K', ref_l1_k), ('V', ref_l1_v)]:
+        snr_check(name, ref, st[f'{name.lower()}_proj'], (M_win, dim))
+    hw_l1_attn = ue.dma_from_accelerator_memory(st['attn_output'], (total_batches * wa_pad, hd_pad)).to(torch.bfloat16)
+    hw_l1_attn_real = hw_l1_attn.reshape(total_batches, wa_pad, hd_pad)[:, :wa, :head_dim]
+    attn_diff = (ref_l1_ctx_flat.float() - hw_l1_attn_real.float()).abs()
+    attn_sig = (ref_l1_ctx_flat.float() ** 2).mean().item()
+    attn_noise = ((ref_l1_ctx_flat.float() - hw_l1_attn_real.float()) ** 2).mean().item()
+    attn_snr = 10 * math.log10(attn_sig / attn_noise) if attn_noise > 0 else float('inf')
+    print(f"  Attention: MAE={attn_diff.mean():.6f}, SNR={attn_snr:.2f} dB — {'PASS' if attn_snr > 30 else 'FAIL'}")
+    snr_check("InvPermute", ref_l1_inv_flat, st['attn_permuted'], (nw * wa, num_heads * hd_pad))
+    snr_check("Unpad",      ref_l1_unpadded, st['attn_unpadded'], (M_win, dim))
+    snr_check("OutProj",    ref_l1_out_proj, st['out_proj'],      (M_win, dim))
+    snr_check("WinReverse", ref_l1_winrev,   st['win_reverse'],   (spatial * spatial, dim))
+    snr_check("RevShift",   ref_l1_revshift, st['ln_output'],     (M_win, dim))
+    snr_check("Residual1",  ref_l1_res1,     st['residual1'],     (M_win, dim))
+    snr_check("MLP_LN",     ref_l1_mlp_ln,   st['mlp_ln'],        (M_win, dim))
+    snr_check("MLP_Expand+GELU", ref_l1_mlp_mid, st['mlp_mid'],   (M_win, mlp_dim))
+    snr_check("MLP_Contract",    ref_l1_mlp_out, st['mlp_out'],   (M_win, dim))
+    hw_l1_out = snr_check("Residual2",  ref_l1_out,      st['layer_input'],   (M_win, dim))
+
+    print()
+    print("=" * 60)
+    print("Testing stage 0 patch merging output")
+    print("=" * 60)
+
+    next_spatial = spatial // 2   # 48
+    next_dim = dim * 2            # 384
+    next_M = next_spatial * next_spatial  # 2304
+
+    # CPU reference for patch merge: apply gather+LN+reduction manually on HW layer 1 output
+    # (hw_l1_out is the actual HW input to patch merge, isolating errors to patch merge ops only)
+    hw_l1_2d = hw_l1_out.reshape(spatial, spatial, dim)
+    x0 = hw_l1_2d[0::2, 0::2, :]
+    x1 = hw_l1_2d[1::2, 0::2, :]
+    x2 = hw_l1_2d[0::2, 1::2, :]
+    x3 = hw_l1_2d[1::2, 1::2, :]
+    ref_gathered = torch.cat([x0, x1, x2, x3], dim=-1).reshape(next_M, 4 * dim)
+    with torch.no_grad():
+        model_pm, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+        ds = model_pm.swin.encoder.layers[0].downsample
+        ref_pm = ds.reduction(ds.norm(ref_gathered))
+        del model_pm
+
+    ue.start_execute_from_dram(encoder_addrs[2])
+    ue.wait_queue()
+
+    hw_pm = ue.dma_from_accelerator_memory(
+        ue.stage_tensors[1]['layer_input'], (next_M, next_dim)).to(torch.bfloat16)
+
+    pm_diff = (ref_pm.float() - hw_pm.float()).abs()
+    pm_mae = pm_diff.mean().item()
+    pm_signal = (ref_pm.float() ** 2).mean().item()
+    pm_noise = ((ref_pm.float() - hw_pm.float()) ** 2).mean().item()
+    pm_snr = 10 * math.log10(pm_signal / pm_noise) if pm_noise > 0 else float('inf')
+    print(f"  PatchMerge: MAE={pm_mae:.6f}, SNR={pm_snr:.2f} dB — {'PASS' if pm_snr > 30 else 'FAIL'}")
+
+    # Per-stage per-layer checks for stages 1-3 (same pattern as stage 0)
+    prog_idx = 3  # encoder_addrs[0..2] already consumed by stage 0 above
+    for s in range(1, ue.NUM_STAGES):
+        sdim      = ue.STAGE_DIMS[s]
+        sspatial  = ue.STAGE_SPATIAL[s]
+        snheads   = ue.NUM_HEADS[s]
+        smlp_dim  = int(sdim * ue.MLP_RATIO)
+        sM        = sspatial * sspatial
+        sws       = ue.WINDOW_SIZE          # 12
+        snum_wh   = sspatial // sws
+        snum_ww   = sspatial // sws
+        snw       = snum_wh * snum_ww
+        swa       = ue.WINDOW_AREA          # 144
+        swa_pad   = ue.pad_dim(swa)         # 192
+        shd_pad   = ue.pad_dim(ue.HEAD_DIM) # 64
+        stot_bat  = snw * snheads
+        sst       = ue.stage_tensors[s]
+
+        for l in range(ue.DEPTHS[s]):
+            sl_shift = 0 if l % 2 == 0 else sws // 2
+
+            print()
+            print("=" * 60)
+            print(f"Testing encoder stage {s}, layer {l} (shift_size={sl_shift})")
+            print("=" * 60)
+
+            # Read HW layer input BEFORE running (previous layer/patch-merge wrote it)
+            prev_hw = ue.dma_from_accelerator_memory(sst['layer_input'], (sM, sdim)).to(torch.bfloat16)
+
+            ue.start_execute_from_dram(encoder_addrs[prog_idx])
+            ue.wait_queue()
+            prog_idx += 1
+
+            with torch.no_grad():
+                model_s, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+                blk = model_s.swin.encoder.layers[s].blocks[l]
+
+                ref_ln = blk.layernorm_before(prev_hw.unsqueeze(0)).squeeze(0)
+
+                if sl_shift > 0:
+                    ref_shifted = torch.roll(
+                        ref_ln.reshape(sspatial, sspatial, sdim),
+                        shifts=(-sl_shift, -sl_shift), dims=(0, 1)
+                    ).reshape(sM, sdim)
+                else:
+                    ref_shifted = ref_ln
+
+                ref_wpart = ref_shifted.reshape(snum_wh, sws, snum_ww, sws, sdim)
+                ref_wpart = ref_wpart.permute(0, 2, 1, 3, 4).contiguous().reshape(-1, sws * sws, sdim)
+
+                sa = blk.attention.self
+                ref_q = ref_wpart.reshape(-1, sdim) @ sa.query.weight.data.to(torch.bfloat16).T + sa.query.bias.data.to(torch.bfloat16)
+                ref_k = ref_wpart.reshape(-1, sdim) @ sa.key.weight.data.to(torch.bfloat16).T   + sa.key.bias.data.to(torch.bfloat16)
+                ref_v = ref_wpart.reshape(-1, sdim) @ sa.value.weight.data.to(torch.bfloat16).T + sa.value.bias.data.to(torch.bfloat16)
+
+                ref_q_mh = ref_q.reshape(snw, swa, snheads, ue.HEAD_DIM).permute(0, 2, 1, 3)
+                ref_k_mh = ref_k.reshape(snw, swa, snheads, ue.HEAD_DIM).permute(0, 2, 1, 3)
+                ref_v_mh = ref_v.reshape(snw, swa, snheads, ue.HEAD_DIM).permute(0, 2, 1, 3)
+                scores = torch.matmul(ref_q_mh.float(), ref_k_mh.float().transpose(-1, -2)) / math.sqrt(ue.HEAD_DIM)
+                rpb = sa.relative_position_bias_table[sa.relative_position_index.view(-1)].view(swa, swa, snheads).permute(2, 0, 1).contiguous()
+                scores = scores + rpb.float().unsqueeze(0)
+                probs  = torch.nn.functional.softmax(scores, dim=-1)
+                ctx    = torch.matmul(probs, ref_v_mh.float())
+                ctx_flat = ctx.reshape(snw * snheads, swa, ue.HEAD_DIM).to(torch.bfloat16)
+
+                ref_inv_pad = torch.zeros(snw, swa, snheads, shd_pad, dtype=torch.bfloat16)
+                ref_inv_pad[:, :, :, :ue.HEAD_DIM] = ctx.permute(0, 2, 1, 3).to(torch.bfloat16)
+                ref_inv_flat = ref_inv_pad.reshape(snw * swa, snheads * shd_pad)
+
+                ref_unpad  = ctx.permute(0, 2, 1, 3).contiguous().reshape(snw * swa, snheads * ue.HEAD_DIM).to(torch.bfloat16)
+                ref_oproj  = blk.attention.output.dense(ref_unpad.unsqueeze(0)).squeeze(0)
+
+                ref_winrev = ref_oproj.reshape(snum_wh, snum_ww, sws, sws, sdim).permute(0, 2, 1, 3, 4).contiguous().reshape(sspatial * sspatial, sdim)
+
+                if sl_shift > 0:
+                    ref_revshift = torch.roll(
+                        ref_winrev.reshape(sspatial, sspatial, sdim),
+                        shifts=(sl_shift, sl_shift), dims=(0, 1)
+                    ).reshape(sM, sdim)
+                else:
+                    ref_revshift = ref_winrev
+
+                ref_res1    = (prev_hw.float() + ref_revshift.float()).to(torch.bfloat16)
+                ref_mlp_ln  = blk.layernorm_after(ref_res1.unsqueeze(0)).squeeze(0)
+                ref_mlp_mid = hw_gelu(blk.intermediate.dense(ref_mlp_ln.unsqueeze(0)).squeeze(0))
+                ref_mlp_out = blk.output.dense(ref_mlp_mid.unsqueeze(0)).squeeze(0)
+                ref_out     = (ref_res1.float() + ref_mlp_out.float()).to(torch.bfloat16)
+
+                del model_s
+
+            if sl_shift > 0:
+                snr_check("LN+CyclicShift", ref_shifted, sst['shifted'], (sM, sdim))
+            else:
+                snr_check("LN", ref_ln, sst['ln_output'], (sM, sdim))
+            snr_check("WindowPartition", ref_wpart.reshape(-1, sdim), sst['windowed'], (sM, sdim))
+            for nm, rx in [('Q', ref_q), ('K', ref_k), ('V', ref_v)]:
+                snr_check(nm, rx, sst[f'{nm.lower()}_proj'], (sM, sdim))
+            hw_attn_s = ue.dma_from_accelerator_memory(sst['attn_output'], (stot_bat * swa_pad, shd_pad)).to(torch.bfloat16)
+            hw_attn_real_s = hw_attn_s.reshape(stot_bat, swa_pad, shd_pad)[:, :swa, :ue.HEAD_DIM]
+            attn_diff_s = (ctx_flat.float() - hw_attn_real_s.float()).abs()
+            attn_sig_s  = (ctx_flat.float() ** 2).mean().item()
+            attn_nse_s  = ((ctx_flat.float() - hw_attn_real_s.float()) ** 2).mean().item()
+            attn_snr_s  = 10 * math.log10(attn_sig_s / attn_nse_s) if attn_nse_s > 0 else float('inf')
+            print(f"  Attention: MAE={attn_diff_s.mean():.6f}, SNR={attn_snr_s:.2f} dB — {'PASS' if attn_snr_s > 30 else 'FAIL'}")
+            snr_check("InvPermute",      ref_inv_flat, sst['attn_permuted'], (sM, snheads * shd_pad))
+            snr_check("Unpad",           ref_unpad,    sst['attn_unpadded'], (sM, sdim))
+            snr_check("OutProj",         ref_oproj,    sst['out_proj'],      (sM, sdim))
+            snr_check("WinReverse",      ref_winrev,   sst['win_reverse'],   (sspatial * sspatial, sdim))
+            if sl_shift > 0:
+                snr_check("RevShift", ref_revshift, sst['ln_output'], (sM, sdim))
+            else:
+                print(f"  RevShift: skipped (layer {l}, shift_size=0)")
+            snr_check("Residual1",       ref_res1,     sst['residual1'], (sM, sdim))
+            snr_check("MLP_LN",          ref_mlp_ln,   sst['mlp_ln'],    (sM, sdim))
+            snr_check("MLP_Expand+GELU", ref_mlp_mid,  sst['mlp_mid'],   (sM, smlp_dim))
+            snr_check("MLP_Contract",    ref_mlp_out,  sst['mlp_out'],   (sM, sdim))
+            prev_hw = snr_check("Residual2", ref_out,  sst['layer_input'], (sM, sdim))
+
+        # Patch merging after stages 0-2 (not stage 3)
+        if s < ue.NUM_STAGES - 1:
+            snext_sp  = sspatial // 2
+            snext_dim = sdim * 2
+            snext_M   = snext_sp * snext_sp
+
+            print()
+            print("=" * 60)
+            print(f"Testing stage {s} patch merging output")
+            print("=" * 60)
+
+            hw_l_2d = prev_hw.reshape(sspatial, sspatial, sdim)
+            ref_s_gathered = torch.cat([
+                hw_l_2d[0::2, 0::2, :], hw_l_2d[1::2, 0::2, :],
+                hw_l_2d[0::2, 1::2, :], hw_l_2d[1::2, 1::2, :],
+            ], dim=-1).reshape(snext_M, 4 * sdim)
+            with torch.no_grad():
+                model_spm, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+                sds = model_spm.swin.encoder.layers[s].downsample
+                ref_s_pm = sds.reduction(sds.norm(ref_s_gathered))
+                del model_spm
+
+            ue.start_execute_from_dram(encoder_addrs[prog_idx])
+            ue.wait_queue()
+            prog_idx += 1
+
+            hw_spm = ue.dma_from_accelerator_memory(ue.stage_tensors[s + 1]['layer_input'], (snext_M, snext_dim)).to(torch.bfloat16)
+            spm_diff   = (ref_s_pm.float() - hw_spm.float()).abs()
+            spm_signal = (ref_s_pm.float() ** 2).mean().item()
+            spm_noise  = ((ref_s_pm.float() - hw_spm.float()) ** 2).mean().item()
+            spm_snr    = 10 * math.log10(spm_signal / spm_noise) if spm_noise > 0 else float('inf')
+            print(f"  PatchMerge: MAE={spm_diff.mean().item():.6f}, SNR={spm_snr:.2f} dB — {'PASS' if spm_snr > 30 else 'FAIL'}")
+
+    # ---- Post-encoder: final LN (HW) + avg pool + classifier (CPU) ----
+    print()
+    print("=" * 60)
+    print("Testing post-encoder (final LN + avg pool + classifier)")
+    print("=" * 60)
+
+    post_addr = ue.compile_post_encoder()
+    hw_logits = ue.run_post_encoder(post_addr)  # (1, num_labels)
+
+    # CPU reference: run full model forward on same pixel_values
+    model_ref, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+    with torch.no_grad():
+        ref_logits = model_ref(pixel_values.to(torch.bfloat16)).logits  # (1, num_labels)
+    del model_ref
+
+    ref_logits = ref_logits.squeeze(0).float()   # (num_labels,)
+    hw_logits  = hw_logits.squeeze(0).float()    # (num_labels,)
+
+    # Final LN check: compare HW LN output against CPU reference (using HW encoder output as input)
+    final_M = ue.STAGE_SPATIAL[3] ** 2
+    final_C = ue.STAGE_DIMS[3]
+    model_ln, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+    with torch.no_grad():
+        hw_enc_out = ue.dma_from_accelerator_memory(
+            ue.stage_tensors[3]['layer_input'], (final_M, final_C)).to(torch.bfloat16)
+        ref_ln_out = model_ln.swin.layernorm(hw_enc_out.unsqueeze(0)).squeeze(0).to(torch.bfloat16)
+    del model_ln
+    hw_ln_out = ue.dma_from_accelerator_memory(
+        ue.FINAL_LN_OUTPUT_DRAM, (final_M, final_C)).to(torch.bfloat16)
+    snr_check("FinalLN", ref_ln_out, hw_ln_out, (final_M, final_C))
+
+    # Logits check
+    logits_diff = (ref_logits - hw_logits).abs()
+    logits_signal = (ref_logits ** 2).mean().item()
+    logits_noise  = ((ref_logits - hw_logits) ** 2).mean().item()
+    logits_snr    = 10 * math.log10(logits_signal / logits_noise) if logits_noise > 0 else float('inf')
+    print(f"  Logits: MAE={logits_diff.mean().item():.6f}, SNR={logits_snr:.2f} dB — {'PASS' if logits_snr > 30 else 'FAIL'}")
+
+    # Top-5 predictions
+    model_labels, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
+    id2label = model_labels.config.id2label
+    del model_labels
+
+    top5_vals, top5_idx = hw_logits.topk(5)
+    print("\nHW Top-5 predictions:")
+    for i, (v, idx) in enumerate(zip(top5_vals.tolist(), top5_idx.tolist())):
+        print(f"  {i+1}. {id2label.get(idx, str(idx))!r}: {v:.4f}")
+
+    ref_top1 = ref_logits.argmax().item()
+    hw_top1  = hw_logits.argmax().item()
+    print(f"\nRef top-1: {id2label.get(ref_top1, str(ref_top1))!r}")
+    print(f"HW  top-1: {id2label.get(hw_top1,  str(hw_top1))!r}")
+    print(f"Top-1 match: {'YES' if ref_top1 == hw_top1 else 'NO'}")
 
 
 if __name__ == "__main__":
