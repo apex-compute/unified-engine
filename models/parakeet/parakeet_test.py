@@ -444,8 +444,8 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
                     abs_row = start_vec + i
                     vec_idx = abs_row % UE_VECTOR_SIZE
                     col_block = abs_row // UE_VECTOR_SIZE
-                    ue.start_queue(0, 0, N_transpose // UE_VECTOR_SIZE, LALU_MODE.BYPASS.value, 0, 0,
-                        URAM_SECTION.URAM_A.value, 0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+                    ue.start_queue(0, 0, N_transpose // UE_VECTOR_SIZE, 0, 0, LALU_MODE.BYPASS.value, 0,
+                        0, 0, 0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
                         UE_MODE.BF16_DOT_PRODUCT, 0, input_uram_addr + vec_idx, URAM_START_ADDR + col_block,
                         1, 0, cur_N * N_transpose, cur_N, inst_id)
                     inst_id += 1; ue.wait_queue()
