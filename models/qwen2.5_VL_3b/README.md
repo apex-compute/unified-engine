@@ -13,13 +13,13 @@ Vision-Language Model (VLM) inference on FPGA accelerator. Supports image+text a
 
 ```bash
 # VLM with default image (demo.jpeg + default prompt)
-python qwen2.5_vl_3b/qwen2.5_vl_3b_test.py
+python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py
 
 # VLM with custom image + custom prompt
-python qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --image /path/to/photo.jpg --prompt "What do you see?"
+python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --image /path/to/photo.jpg --prompt "What do you see?"
 
 # Text-only (no vision encoder)
-python qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --image none --prompt "What is 2+2?"
+python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --image none --prompt "What is 2+2?"
 ```
 
 ## Cached Files
