@@ -303,23 +303,6 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         self._isa_reg_counter += 1
         return reg_idx
 
-    def overwrite_instruction_with_general_register(self, general_register: int) -> None:
-        if self.capture_buffer is None or len(self.capture_buffer) == 0:
-            print("ERROR: overwrite_instruction_with_general_register() called but capture_buffer is empty!")
-            return
-        if self.capture_count == 0:
-            print("ERROR: overwrite_instruction_with_general_register() called but capture_count is 0!")
-            return
-        if general_register <= 0 or general_register > 15:
-            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
-        inst = self.capture_buffer[self.capture_count - 1]
-        w = inst.words
-        w[0] = ((0 & 0xF) << 0) | \
-               ((general_register & 0xF) << 4) | \
-               ((0 & 0xF) << 8) | \
-               ((0 & 0xF) << 12)
-        w[7] = (w[7] & 0x1FFFFFFF) | ((user_dma_core.INSTRUCTION_REG_REWRITE & 0x7) << 29)
-
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         self.clear_inst_id()
         self.start_capture()
@@ -741,7 +724,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         latency = self.report_latency_in_us()
         print(f"    Total program execution latency = {latency} us")
         if gflops is not None:
-            gflops_program = self.report_flop_rate_gflops(gflops)
+            gflops_program, _ = self.report_flop_rate_gflops(gflops)
             print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
 
     def compile_prefill(self, seq_len: int, layer_size: int | None = None) -> dict:
