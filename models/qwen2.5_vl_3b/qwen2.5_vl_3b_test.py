@@ -1501,16 +1501,28 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Pre-allocate the identity matrix used by flash_attention_core
         self._preallocate_identity_matrix()
 
+    def _corrected_hw_latency_us(self, wall_time_s: float) -> float:
+        """Read HW cycle counter and correct for 32-bit overflow.
+        Counter wraps at 2^32 * cycle_ns = ~24.18s at 5.63ns."""
+        raw_us = self.report_latency_in_us()
+        overflow_us = (2**32) * self._clock_period_ns / 1e3
+        # Add overflows until within reasonable range of wall time
+        corrected = raw_us
+        while corrected + overflow_us / 2 < wall_time_s * 1e6:
+            corrected += overflow_us
+        return corrected
+
     def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 120.0, gflops: float = None) -> None:
-        """Execute compiled program from DRAM instruction memory.
-        """
+        """Execute compiled program from DRAM instruction memory."""
         print(f"Execute program start at 0x{program_start_addr:X}")
+        t0 = time.perf_counter()
         self.start_execute_from_dram(program_start_addr)
         self.wait_queue(timeout)
-        latency = self.report_latency_in_us()
-        print(f"    Total program execution latency = {latency} us")
+        wall_s = time.perf_counter() - t0
+        latency_us = self._corrected_hw_latency_us(wall_s)
+        print(f"    Total program execution latency = {latency_us:.0f} us")
         if gflops is not None:
-            gflops_program = self.report_flop_rate_gflops(gflops)
+            gflops_program = gflops / (latency_us * 1e-6) / 1e9
             self._last_hw_gflops = gflops_program
             self._last_total_flops = gflops
             print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
@@ -2043,10 +2055,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         vis_flops += 2 * self.NUM_MERGED_TOKENS * merge_dim * VH_OUT     # merger MLP2
 
         print(f"    Running vision encoder ({vis_flops/1e9:.1f} GF)...")
+        t0 = time.perf_counter()
         self.start_execute_from_dram(program_addr)
         self.wait_queue(600.0)
-        latency_us = self.report_latency_in_us()
-        vis_gflops = self.report_flop_rate_gflops(vis_flops)
+        wall_s = time.perf_counter() - t0
+        latency_us = self._corrected_hw_latency_us(wall_s)
+        vis_gflops = vis_flops / (latency_us * 1e-6) / 1e9
         self._vis_total_flops = vis_flops
         self._vis_gflops = vis_gflops
         print(f"    Vision encoder complete: {latency_us/1e6:.2f}s, {vis_gflops:.2f} GFLOPS")
