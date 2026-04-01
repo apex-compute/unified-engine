@@ -39,7 +39,7 @@ from huggingface_hub import snapshot_download
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -343,36 +343,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._isa_reg_counter += 1
         return reg_idx
 
-    def overwrite_instruction_with_general_register(self, general_register: int) -> None:
-        """
-        Overwrite the most recently captured instruction to use a general register
-        for rewriting the DRAM source/destination address.
-
-        This modifies the instruction at capture_buffer[capture_count - 1] to:
-        - Set inst_src_reg_idx in word 0 (bits 4-7)
-        - Set inst_type to INSTRUCTION_REG_REWRITE in word 7 (bits 29-31)
-        """
-        if self.capture_buffer is None or len(self.capture_buffer) == 0:
-            print("ERROR: overwrite_instruction_with_general_register() called but capture_buffer is empty!")
-            return
-        if self.capture_count == 0:
-            print("ERROR: overwrite_instruction_with_general_register() called but capture_count is 0!")
-            return
-        if general_register <= 0 or general_register > 15:
-            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
-
-        inst = self.capture_buffer[self.capture_count - 1]
-        w = inst.words
-
-        # Overwrite word 0: set inst_src_reg_idx in bits 4-7
-        w[0] = ((0 & 0xF) << 0) | \
-               ((general_register & 0xF) << 4) | \
-               ((0 & 0xF) << 8) | \
-               ((0 & 0xF) << 12)
-
-        # Overwrite word 7: preserve bits 0-28, set inst_type to INSTRUCTION_REG_REWRITE in bits 29-31
-        w[7] = (w[7] & 0x1FFFFFFF) | ((user_dma_core.INSTRUCTION_REG_REWRITE & 0x7) << 29)
-
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         """
         Run a minimal program that sets one ISA register to an immediate value (ADD SET then HALT):
@@ -443,7 +413,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
     def get_arg_max_index(self) -> int:
         """Get the arg max index from the Unified Engine"""
-        return self.read_reg32(UE_ARGMAX1_INDEX)
+        return self.read_reg32(UE_ARGMAX_INDEX)
 
     def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
         """RoPE (HuggingFace style). Caller must have start_capture() before and stop_capture() after."""
@@ -911,7 +881,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             latency = self.report_latency_in_us()
             print(f"    Total program execution latency = {latency} us")
             if flops is not None:
-                flop_rate_program = self.report_flop_rate_gflops(flops)
+                flop_rate_program, _ = self.report_flop_rate_gflops(flops)
                 print(f"Report FLOPS for program execution: {flop_rate_program:.2f} GFLOPS")
         return latency, flop_rate_program
 
