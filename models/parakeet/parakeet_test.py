@@ -41,7 +41,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, set_dma_device,
-    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX1_INDEX, UE_ARGMAX2_INDEX
+    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX
 )
 
 URAM_A_BASE = 0x00000
@@ -615,16 +615,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.TOKEN_REG = regs.get("TOKEN_REG", 1)
         self.ENC_T_REG = regs.get("ENC_T_REG", 2)
         self.TMP_REG = regs.get("TMP_REG", 3)
-    def overwrite_instruction_with_general_register(self, general_register):
-        """Modify the last captured instruction to use a general register for DRAM address."""
-        if not self.capture_buffer or self.capture_count == 0:
-            raise RuntimeError("capture_buffer is empty")
-        if general_register <= 0 or general_register > 15:
-            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
-        inst = self.capture_buffer[self.capture_count - 1]
-        w = inst.words
-        w[0] = ((0 & 0xF) << 0) | ((general_register & 0xF) << 4) | ((0 & 0xF) << 8) | ((0 & 0xF) << 12)
-        w[7] = (w[7] & 0x1FFFFFFF) | ((user_dma_core.INSTRUCTION_REG_REWRITE & 0x7) << 29)
     def isa_add_set_core(self, dst_reg_idx, immediate_value, timeout_s=10.0):
         """Set one ISA register to an immediate value via minimal program execution."""
         self.clear_capture_buffer()
@@ -1614,12 +1604,9 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             if flops:
                 gflops = self.report_flop_rate_gflops(flops)
         return latency_us, gflops
-    def get_arg_max_index1(self):
-        """Read hardware argmax1 register."""
-        return self.read_reg32(user_dma_core.UE_ARGMAX1_INDEX)
-    def get_arg_max_index2(self):
-        """Read hardware argmax2 register."""
-        return self.read_reg32(user_dma_core.UE_ARGMAX2_INDEX)
+    def get_arg_max_index(self):
+        """Read hardware argmax register."""
+        return self.read_reg32(UE_ARGMAX_INDEX)
     def make_rel_pos_emb(self, seq_len):
         """Generate relative positional encoding: (2*seq_len-1, D) bf16."""
         D = self.d_model
@@ -1761,10 +1748,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.program_execute(pred_prog)
                 # Joint token: enc_out[t] copy (register-addressed) + pred_out copy + projections + argmax
                 self.program_execute(tok_prog)
-                token_id = self.get_arg_max_index1()
+                token_id = self.get_arg_max_index()
                 # Joint duration -> hardware argmax
                 self.program_execute(dur_prog)
-                dur_idx = self.get_arg_max_index1()
+                dur_idx = self.get_arg_max_index()
                 dur = self.tdt_durations[dur_idx] if dur_idx < len(self.tdt_durations) else 0
                 total_steps += 1
                 if token_id == self.blank_id:

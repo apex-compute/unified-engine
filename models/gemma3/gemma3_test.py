@@ -39,7 +39,7 @@ from huggingface_hub import snapshot_download
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -413,18 +413,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
     def get_arg_max_index(self) -> int:
         """Get the arg max index from the Unified Engine"""
-        return self.read_reg32(UE_ARGMAX1_INDEX)
-
-    def overwrite_instruction_with_general_register(self, general_register: int) -> None:
-        """Modify the last captured instruction to use a general register for DRAM address."""
-        if not self.capture_buffer or self.capture_count == 0:
-            raise RuntimeError("capture_buffer is empty")
-        if general_register <= 0 or general_register > 15:
-            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
-        inst = self.capture_buffer[self.capture_count - 1]
-        w = inst.words
-        w[0] = ((0 & 0xF) << 0) | ((general_register & 0xF) << 4) | ((0 & 0xF) << 8) | ((0 & 0xF) << 12)
-        w[7] = (w[7] & 0x1FFFFFFF) | ((user_dma_core.INSTRUCTION_REG_REWRITE & 0x7) << 29)
+        return self.read_reg32(UE_ARGMAX_INDEX)
 
     def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
         """RoPE (HuggingFace style). Caller must have start_capture() before and stop_capture() after."""

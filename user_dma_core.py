@@ -21,7 +21,6 @@ Usage:
 from re import U
 import struct
 import os
-import atexit
 import time
 from typing import Optional, Tuple, Callable
 from enum import IntEnum
@@ -152,15 +151,15 @@ class LALU_MODE(IntEnum):
 # LALU activation hyperparameters (bf16 values for UE_LALU_HYPERPARAMETERS register)
 # Activation function (a+x)*sigmoid(-bx)
 # gelu: x*sigmoid(1.702x)
-# ACT
+# Set ACT
 LALU_ACT_GELU_A = 0x0000
 LALU_ACT_GELU_B = 0xbfd9   # -1.702
 # silu: x*sigmoid(x)
-# ACT
+# Set ACT
 LALU_ACT_SILU_A = 0x0000
 LALU_ACT_SILU_B = 0xbf80   # -1.0 in bf16
 # sigmoid: sigmoid(x)
-# ACT_NO_X
+# Set ACT_NO_X
 LALU_ACT_SIGMOID_A = 0x3f80  # 1.0 in bf16
 LALU_ACT_SIGMOID_B = 0xbf80  # -1.0 in bf16
 
@@ -228,9 +227,9 @@ UE_LALU_PIPELINE_FACT = 8  # sample_1_plus_exp_bx pipeline depth (from sample_1_
 
 # LALU mode latencies calculated from timing.md formulas (shift register delay parameter)
 # Pipeline stages are all 1 cycle (Input Reg + intermediate Reg + Output Reg - 1 for overlap)
-UE_LALU_LATENCY_SOFTMAX = 1 + UE_LALU_PIPELINE_FPDIV  # RECIP: 1 + 3 = 4
-UE_LALU_LATENCY_RMS = 1 + UE_LALU_PIPELINE_FPSQRT + 1 + UE_LALU_PIPELINE_FPDIV  # RSQRT: 1 + 2 + 1 + 3 = 7
-UE_LALU_LATENCY_ACT = 1 + UE_LALU_PIPELINE_FACT + 1 + UE_LALU_PIPELINE_FPDIV  # GELU/SILU/SIGM: 1 + 8 + 1 + 3 = 13
+UE_LALU_LATENCY_SOFTMAX = 1 + UE_LALU_PIPELINE_FPDIV
+UE_LALU_LATENCY_RMS = 1 + UE_LALU_PIPELINE_FPSQRT + 1 + UE_LALU_PIPELINE_FPDIV
+UE_LALU_LATENCY_ACT = 1 + UE_LALU_PIPELINE_FACT + 1 + UE_LALU_PIPELINE_FPDIV
 
 # Quantization latency values (matching andromeda.c)
 UE_QUANTIZE_FMAX_PIPELINE = 7
@@ -3369,11 +3368,22 @@ class UnifiedEngine:
         if inst_type == INSTRUCTION_JUMP:
             jump_mode = isa_mode
             reg_id = src_reg_idx
-            jump_mode_name = ["ABSOLUTE", "RELATIVE", "JNZ"][jump_mode] if jump_mode < 3 else f"UNKNOWN({jump_mode})"
+            jump_mode_names = {
+                JUMP_MODE_ABSOLUTE: "ABSOLUTE",
+                JUMP_MODE_JNZ: "JNZ",
+                JUMP_MODE_JZ: "JZ",
+                JUMP_MODE_RELATIVE: "RELATIVE",
+                JUMP_MODE_RELA_JNZ: "RELA_JNZ",
+                JUMP_MODE_RELA_JZ: "RELA_JZ",
+            }
+            jump_mode_name = jump_mode_names.get(jump_mode, f"UNKNOWN({jump_mode})")
             result = f"ISA_JUMP ({jump_mode_name})"
-            result += f"\n    target_addr: {hex(immediate_value)}"
+            if jump_mode in (JUMP_MODE_RELATIVE, JUMP_MODE_RELA_JNZ, JUMP_MODE_RELA_JZ):
+                result += f"\n    relative_back: {immediate_value} inst words"
+            else:
+                result += f"\n    target_addr: {hex(immediate_value)}"
             result += f"\n    transaction_id: {transaction_id}"
-            if jump_mode == 2:
+            if jump_mode in (JUMP_MODE_JNZ, JUMP_MODE_JZ, JUMP_MODE_RELA_JNZ, JUMP_MODE_RELA_JZ):
                 result += f"\n    reg_id: {reg_id}"
             for line in result.split('\n'):
                 print(f"        {line}")
@@ -3592,6 +3602,33 @@ class UnifiedEngine:
             print(f"ERROR: target_engine_idx must be 0-7, got {target_engine_idx}")
             return
         self.generate_instruction(INSTRUCTION_FLAG, 0, FLAG_MODE_CHECK, target_engine_idx, 0, 0, transaction_id)
+
+    def overwrite_instruction_with_general_register(self, general_register: int) -> None:
+        """
+        Overwrite the most recently captured instruction to use a general register
+        for rewriting the DRAM source/destination address.
+
+        REG_REWRITE: [11:8] inst_type; [39:36] inst_src_reg_idx.
+        Address comes from regfile (RTL INST_REWRITE), not [63:32] dram.
+        """
+        if self.capture_buffer is None or len(self.capture_buffer) == 0:
+            print("ERROR: overwrite_instruction_with_general_register() called but capture_buffer is empty!")
+            return
+        if self.capture_count == 0:
+            print("ERROR: overwrite_instruction_with_general_register() called but capture_count is 0!")
+            return
+        if general_register <= 0 or general_register > 15:
+            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
+
+        inst = self.capture_buffer[self.capture_count - 1]
+        w = inst.words
+        inst_id = w[0] & 0xFF
+
+        # Overwrite word 0: preserve inst_id [7:0], set inst_type to INSTRUCTION_REG_REWRITE [11:8]
+        w[0] = (inst_id & 0xFF) | ((INSTRUCTION_REG_REWRITE & 0xF) << 8)
+
+        # Overwrite word 1: set inst_src_reg_idx [39:36] (bits 7:4 of w[1])
+        w[1] = ((general_register & 0xF) << 4)
 
     def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
         """
