@@ -154,37 +154,25 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
     """
     import user_dma_core
 
-    # assert num_engines >= 1, f"num_engines must be >= 1, got {num_engines}"
-    # assert M % num_engines == 0, f"M must be divisible by {num_engines} for sharding, got {M}"
-    m_per_engine = M // num_engines  # split only along M: each engine gets (m_per_engine, K) -> (m_per_engine, N)
-
     engine_base_stride = 0x00010000
-    tensor_region_stride = 0x04000000
-    program_dram_stride = 0x01000000
+    dram_base_stride = 0x10000000
 
     ues = []
     for i in range(num_engines):
-        ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride)
-        ue._tensor_dram_addr = DRAM_ACTIVATION_ADDR + i * tensor_region_stride
-        ue._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + i * program_dram_stride
+        ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
+                            params_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride,
+                            tensor_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride + 0x08000000,
+                            program_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride + 0x0F000000,
+                            )
         ues.append(ue)
 
-    # Per-engine buffers: A_i (m_per_engine, K), B (N, K), output_i (m_per_engine, N)
     a_addrs = []
-    b_addrs = []
-    out_addrs = []
     for i, ue in enumerate(ues):
-        a_addrs.append(ue.allocate_tensor_dram(0))
-        b_addrs.append(ue.allocate_tensor_dram(N * K * 2))
-        out_addrs.append(ue.allocate_tensor_dram(m_per_engine * N * 2))
+        a_addrs.append(ue.allocate_tensor_dram(1 * 1024 * 1024))
 
-    total_flops = 0
     prog_addrs = []
     ues[0].start_capture()
-    # total_flops += ues[0].matmat_mul_core(
-    #     M=m_per_engine, K=K, N=N,
-    #     A_DRAM_ADDR=a_addrs[0], B_DRAM_ADDR=b_addrs[0], OUTPUT_DRAM_ADDR=out_addrs[0],
-    # )
+
     element_size = URAM_HALF_ELEMENTS
     ues[0].generate_instruction_flag_set()
     ues[0].accelerator_memory_to_sram(accelerator_dram_address=a_addrs[0],
@@ -205,10 +193,6 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
             ues[i].start_capture()
             ues[i].generate_instruction_flag_clear()
             ues[i].generate_instruction_flag_check(target_engine_idx=0)
-            # total_flops += ues[i].matmat_mul_core(
-            #     M=m_per_engine, K=K, N=N,
-            #     A_DRAM_ADDR=a_addrs[i], B_DRAM_ADDR=b_addrs[i], OUTPUT_DRAM_ADDR=out_addrs[i],
-            # )
             ues[i].accelerator_memory_to_sram(accelerator_dram_address=a_addrs[i],
                                   sram_address=0x00000,
                                   element_size=element_size)
@@ -219,20 +203,11 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
             ues[i].write_captured_instructions_to_dram(prog_addrs[i])
             ues[i].allocate_program_dram(ues[i].get_capture_instruction_size_bytes())
 
-    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
-    b = torch.randn(N, K, dtype=torch.bfloat16)
-    for i in range(num_engines):
-        start_row = i * m_per_engine
-        end_row = start_row + m_per_engine
-        ues[i].dma_to_accelerator_memory(a_addrs[i], a[start_row:end_row, :])
-        ues[i].dma_to_accelerator_memory(b_addrs[i], b)
-
     for i in range(1, num_engines):
         ues[i].start_execute_from_dram(prog_addrs[i])
     ues[0].start_execute_from_dram(prog_addrs[0])
     # ue0 waits for 1..7 inside its program; host only needs to wait for ue0
     ues[0].wait_queue(10.0)
-    flop_rate_gflops = total_flops / (ues[0].report_latency_in_us() * 1e3)
     print(f"Total latency: {ues[0].report_latency_in_us()} us")
     total_bytes_transferred = num_engines * element_size * 2
     print(f"speed {total_bytes_transferred / ues[0].report_latency_in_us():.2f} MB/s")
@@ -241,21 +216,12 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
 
     # print(f"Report FLOPS for {num_engines}-engine parallel sharded matmul: {flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}")
 
-    # out_parts = []
-    # for i in range(num_engines):
-    #     out_parts.append(ues[i].dma_from_accelerator_memory(out_addrs[i], (m_per_engine, N)))
-    # out_combined = torch.cat(out_parts, dim=0)
-
-    # ref = a @ b.T
-    # snr_combined = calculate_snr(ref, out_combined)
-    # print(f"{num_engines}-engine parallel sharded matmul SNR combined: {snr_combined:.2f} dB")
-
     for ue in ues:
         ue.reset_tensor_dram_addr()
         ue.clear_capture_buffer()
 
 
-def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = False, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False):
+def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = False, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False):
     """
     Run two-engine matmul via UnifiedEngine.matmat_mul_two_cores().
     Uses balanced 1/2 + 1/2 row sharding.
@@ -285,14 +251,15 @@ def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = Fal
     ue0.dma_to_accelerator_memory(A_DRAM_ADDR, a)
     ue0.dma_to_accelerator_memory(B_DRAM_ADDR, b)
 
-    total_flops_from_matmat_mul = UnifiedEngine.matmat_mul_two_cores(ue0=ue0, ue1=ue1, M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, softmax_enable=softmax_enable, gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable, relu_enable=relu_enable)
+    total_flops_from_matmat_mul = UnifiedEngine.matmat_mul_two_cores(ue0=ue0, ue1=ue1, M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, softmax_enable=softmax_enable, gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable)
     ue0.report_timing_and_instruction_count()
     ue1.report_timing_and_instruction_count()
 
     # Parallel completion time is bounded by the slower engine.
     latency_us = max(ue0.report_latency_in_us(), ue1.report_latency_in_us())
     flop_rate_gflops = total_flops_from_matmat_mul / (latency_us * 1e3)
-    print(f"Report FLOPS for two-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, relu_enable={relu_enable}")
+    flops_ratio = flop_rate_gflops / user_dma_core.UE_PEAK_GFLOPS * 50
+    print(f"Report FLOPS for two-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}")
 
     generate_trace(ue0, f"matmat_mul_two_cores_trace_engine0_{M // 2}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
     generate_trace(ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
@@ -309,17 +276,12 @@ def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = Fal
     def apply_sigmoid(x):
         return torch.sigmoid(x)
 
-    def apply_relu(x):
-        return torch.relu(x)
-
     if gelu_enable:
         ref = apply_gelu(ref)
     elif silu_enable:
         ref = apply_silu(ref)
     elif sigmoid_enable:
         ref = apply_sigmoid(ref)
-    elif relu_enable:
-        ref = apply_relu(ref)
 
     if softmax_enable:
         ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
@@ -392,8 +354,8 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
         sm_output = ue.dma_from_accelerator_memory(SM_OUTPUT_DRAM_ADDR, (seq_len, seq_len))
         v_trans = ue.dma_from_accelerator_memory(SCRATCH_DRAM_ADDR, (head_dim, seq_len))
 
-    report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_flash_attention)
-    print(f"Report FLOPS for Flash Attention: {report_flop_rate_gflops:.2f} GFLOPS for head_dim={head_dim} and seq_len={seq_len} and bias_enable={bias_enable}")
+    report_flop_rate_gflops, report_gflops_ratio = ue.report_flop_rate_gflops(total_flops_from_flash_attention)
+    print(f"Report FLOPS for Flash Attention: {report_flop_rate_gflops:.2f} GFLOPS, {report_gflops_ratio:.2f}% peak throughput for head_dim={head_dim} and seq_len={seq_len} and bias_enable={bias_enable}")
 
     # Reference calculation (CPU)
     start_time = time.time()
@@ -424,7 +386,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False)
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False):
+def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, debug_fmax: bool = False):
     """
     Tests matmat_mul core.
     """
@@ -440,6 +402,13 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     elif bias_enable and bias_mode == "broadcast_N":
         C_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
 
+    ZERO_DRAM_ADDR = None
+    FMAX_DRAM_ADDR = None
+    if softmax_enable:
+        if debug_fmax:
+            ZERO_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * 2)
+            FMAX_DRAM_ADDR = ue.allocate_tensor_dram(M * UE_VECTOR_SIZE * 2)
+
     ue.start_capture()
 
     total_flops_from_matmat_mul = ue.matmat_mul_core(M=M, K=K, N=N,
@@ -452,7 +421,9 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
                                                     gelu_enable=gelu_enable,
                                                     silu_enable=silu_enable,
                                                     sigmoid_enable=sigmoid_enable,
-                                                    relu_enable=relu_enable)
+                                                    debug_fmax=debug_fmax,
+                                                    ZERO_DRAM_ADDR=ZERO_DRAM_ADDR,
+                                                    FMAX_DRAM_ADDR=FMAX_DRAM_ADDR)
 
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -475,15 +446,23 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     # DMA to accelerator memory -------------------------------------------------------------
     ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
     ue.dma_to_accelerator_memory(B_DRAM_ADDR, b)
+    if debug_fmax:
+        zero = torch.zeros(UE_VECTOR_SIZE, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(ZERO_DRAM_ADDR, zero)
 
     ue.start_execute_from_dram(program_dram_addr)
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_matmat_mul)
-    print(f"Report FLOPS for MxKxN Matmul: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, K={K}, N={N}, bias_enable={bias_enable}, softmax_enable={softmax_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, relu_enable={relu_enable}")
+    report_flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_matmat_mul)
+    print(f"Report FLOPS for MxKxN Matmul: {report_flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, bias_enable={bias_enable}, softmax_enable={softmax_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+    fmax = None
+    if softmax_enable:
+        if debug_fmax:
+            fmax = ue.dma_from_accelerator_memory(FMAX_DRAM_ADDR, (M, UE_VECTOR_SIZE))
+            fmax = -fmax[:, 0] # hardware negates the fmax, so we need to negate it again
 
     ref = (a @ b.T + c) if bias_enable else (a @ b.T)
 
@@ -496,19 +475,19 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
     def apply_sigmoid(x):
         return torch.sigmoid(x)
 
-    def apply_relu(x):
-        return torch.relu(x)
-
     if gelu_enable:
         ref = apply_gelu(ref)
     elif silu_enable:
         ref = apply_silu(ref)
     elif sigmoid_enable:
         ref = apply_sigmoid(ref)
-    elif relu_enable:
-        ref = apply_relu(ref)
 
     if softmax_enable:
+        if debug_fmax:
+            fmax_ref = torch.max(ref, dim=-1).values
+            snr_db_fmax = calculate_snr(fmax_ref, fmax)
+            print(f"FMAX SNR Analysis: {snr_db_fmax:.2f} dB")
+            assert snr_db_fmax >= 40 or snr_db_fmax == float('inf'), f"SNR {snr_db_fmax:.2f} dB must be at least 40 dB"
         ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
 
     snr_db_ref = calculate_snr(ref, output)
@@ -559,8 +538,8 @@ def rms_norm_test(shape: tuple):
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_rms_norm)
-    print(f"Report FLOPS for RMS Norm: {flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_rms_norm)
+    print(f"Report FLOPS for RMS Norm: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
@@ -620,8 +599,8 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
 
     generate_trace(ue, f"layer_norm_core_trace_{M}_{N}_{'gamma_enabled' if gamma_enable else 'gamma_disabled'}_{'beta_enabled' if beta_enable else 'beta_disabled'}.csv")
 
-    flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_layer_norm)
-    print(f"Report FLOPS for Layer Norm: {flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}, gamma_enable={gamma_enable}, beta_enable={beta_enable}")
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_layer_norm)
+    print(f"Report FLOPS for Layer Norm: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}, gamma_enable={gamma_enable}, beta_enable={beta_enable}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
@@ -692,8 +671,8 @@ def rope_core_dram_test(M: int, N: int):
     ue.wait_queue(10.0)
     ue.report_timing_and_instruction_count()
 
-    flop_rate_gflops = ue.report_flop_rate_gflops(total_flops)
-    print(f"Report FLOPS for RoPE core DRAM: {flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+    print(f"Report FLOPS for RoPE core DRAM: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
@@ -861,8 +840,8 @@ def dequantize_test(data_type=TYPE.INT4):
     data_type_str = type_names.get(data_type, f"UNKNOWN({data_type})")
     generate_trace(ue, f"dequantize_core_trace_{M}_{N}_{data_type_str}.csv")
 
-    report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
-    print(f"Report FLOPS for Dequantize ({data_type_str}): {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
+    report_flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_dequantize)
+    print(f"Report FLOPS for Dequantize ({data_type_str}): {report_flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
     if (data_type == TYPE.INT4) :
@@ -900,7 +879,7 @@ def dequantize_test(data_type=TYPE.INT4):
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool = False, bias_mode: str = "broadcast_N", data_type: TYPE = TYPE.INT4, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False):
+def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool = False, bias_mode: str = "broadcast_N", data_type: TYPE = TYPE.INT4, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False):
     """
     Tests matrix-matrix multiplication with quantized weights.
     Args:
@@ -955,8 +934,7 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
                                                     SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
                                                     gelu_enable=gelu_enable,
                                                     silu_enable=silu_enable,
-                                                    sigmoid_enable=sigmoid_enable,
-                                                    relu_enable=relu_enable)
+                                                    sigmoid_enable=sigmoid_enable)
 
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -973,8 +951,8 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
 
     generate_trace(ue, f"matmat_mul_quantized_weights_core_trace_{M}_{K}_{N}_{data_type}.csv")
 
-    report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
-    print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
+    report_flop_rate_gflops, report_gflops_ratio = ue.report_flop_rate_gflops(total_flops_from_dequantize)
+    print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS, {report_gflops_ratio:.2f}% peak throughput for M={M}, N={N}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
@@ -987,9 +965,6 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
     def apply_sigmoid(x):
         return torch.sigmoid(x)
 
-    def apply_relu(x):
-        return torch.relu(x)
-
     ref = a @ x.T
 
     if bias_enable:
@@ -1001,8 +976,6 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
         ref = apply_silu(ref)
     elif sigmoid_enable:
         ref = apply_sigmoid(ref)
-    elif relu_enable:
-        ref = apply_relu(ref)
 
     snr_db_ref = calculate_snr(ref, output)
 
@@ -1013,7 +986,7 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
     ue.reset_tensor_dram_addr()
 
 # TODO: Not very efficient for larger M 
-def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT4, bias_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False):
+def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT4, bias_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False):
     """
     Tests quantized matrix-matrix multiplication core.
     Args:
@@ -1039,10 +1012,10 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
     elif bias_enable and bias_mode == "broadcast_N":
         C_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
 
-    print(f"Quantized Matrix-Matrix Multiply Test for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, relu_enable={relu_enable}")
+    print(f"Quantized Matrix-Matrix Multiply Test for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}")
 
     ue.start_capture()
-
+    
     total_flops_from_dequantize = ue.quantized_matmat_core(M=M, K=K, N=N,
                                                     A_DRAM_ADDR=A_DRAM_ADDR,
                                                     B_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
@@ -1053,8 +1026,7 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
                                                     data_type=data_type,
                                                     gelu_enable=gelu_enable,
                                                     silu_enable=silu_enable,
-                                                    sigmoid_enable=sigmoid_enable,
-                                                    relu_enable=relu_enable)
+                                                    sigmoid_enable=sigmoid_enable)
 
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -1064,7 +1036,7 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
 
     a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
     ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
-    
+
     if bias_enable:
         if bias_mode == "full_matrix":
             c = torch.randn(M, N, dtype=torch.bfloat16)
@@ -1076,10 +1048,10 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}_{'relu_enabled' if relu_enable else 'relu_disabled'}.csv")
+    generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
 
-    report_flop_rate_gflops = ue.report_flop_rate_gflops(total_flops_from_dequantize)
-    print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS for M={M}, N={N}")
+    report_flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_dequantize)
+    print(f"Report FLOPS for Quantize Matrix-Matrix Multiply: {report_flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}")
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
@@ -1092,9 +1064,6 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
     def apply_sigmoid(x):
         return torch.sigmoid(x)
 
-    def apply_relu(x):
-        return torch.relu(x)
-
     ref = (a @ x.T + c) if bias_enable else (a @ x.T)
 
     if gelu_enable:
@@ -1103,8 +1072,6 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.INT
         ref = apply_silu(ref)
     elif sigmoid_enable:
         ref = apply_sigmoid(ref)
-    elif relu_enable:
-        ref = apply_relu(ref)
 
     snr_db_ref = calculate_snr(ref, output)
 
@@ -1520,8 +1487,8 @@ def quantized_fp4_test():
     ue.start_execute_from_dram(program_dram_addr)
     ue.wait_queue(10.0) # 10 seconds timeout
     ue.report_timing_and_instruction_count()
-    flop_rate_gflops = ue.report_flop_rate_gflops(N * K * 2)
-    print(f"Report FLOPS for Quantized FP4: {flop_rate_gflops:.2f} GFLOPS for N={N}, K={K}")
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(N * K * 2)
+    print(f"Report FLOPS for Quantized FP4: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for N={N}, K={K}")
 
     generate_trace(ue, f"quantized_fp4_core_trace_{N}_{K}.csv")
 
@@ -1569,13 +1536,142 @@ def quantized_fp4_test():
 
     ue.clear_capture_buffer()
 
+def fmax_test(length: int = 256):
+    """
+    FMAX test: loads a vector, applies x - fmax via broadcast add with FMAX_NEGATE.
+    """
+    ue = UnifiedEngine()
+    INPUT_DRAM_ADDR = ue.allocate_tensor_dram(length * 2)
+    IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(length * length * 2)
+    ZERO_DRAM_ADDR = ue.allocate_tensor_dram(length * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(length * 2)
+    FMAX_DRAM_ADDR = ue.allocate_tensor_dram(length * 2)
+
+    vector_sram_addr = 0x00000  # URAM_A
+    identity_sram_addr = 0x80000  # URAM_B
+    output_sram_addr = vector_sram_addr + length * 2  # URAM_A
+    zero_sram_addr = output_sram_addr + length * 2  # URAM_A
+    fmax_sram_addr = zero_sram_addr + UE_VECTOR_SIZE * 2  # URAM_A
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(accelerator_dram_address=ZERO_DRAM_ADDR,
+                                  sram_address=zero_sram_addr,
+                                  element_size=UE_VECTOR_SIZE)
+    ue.accelerator_memory_to_sram(accelerator_dram_address=INPUT_DRAM_ADDR,
+                                  sram_address=vector_sram_addr,
+                                  element_size=length)
+    ue.accelerator_memory_to_sram(accelerator_dram_address=IDENTITY_DRAM_ADDR,
+                                  sram_address=identity_sram_addr,
+                                  element_size=length * length)
+    clear_en = 1
+    for i in range(UE_FMAX_CONTEXT_SIZE):
+        ue.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
+                                                 fmax_context_addr=i,
+                                                 vector_sram_start_addr=vector_sram_addr,
+                                                 matrix_sram_start_addr=identity_sram_addr,
+                                                 output_sram_wb_addr=vector_sram_addr,
+                                                 K=length, N=length)
+        clear_en = 0
+    ue.fmax_core(vector_sram_start_addr=zero_sram_addr,
+                 output_sram_wb_addr=fmax_sram_addr,
+                 N=UE_VECTOR_SIZE,
+                 fmax_context_addr=0)
+    ue.sram_to_accelerator_memory(sram_address=vector_sram_addr,
+                                  accelerator_dram_address=OUTPUT_DRAM_ADDR,
+                                  element_size=length)
+    ue.sram_to_accelerator_memory(sram_address=fmax_sram_addr,
+                                  accelerator_dram_address=FMAX_DRAM_ADDR,
+                                  element_size=UE_VECTOR_SIZE)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    x = torch.randn(length, dtype=torch.bfloat16)
+    identity = torch.eye(length, dtype=torch.bfloat16)
+    zero = torch.zeros(UE_VECTOR_SIZE, dtype=torch.bfloat16)
+
+    ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+    ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, identity)
+    ue.dma_to_accelerator_memory(ZERO_DRAM_ADDR, zero)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0) # 10 seconds timeout
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (length,))
+    fmax_ref = torch.max(x).item()
+    fmax = -1.0 * ue.dma_from_accelerator_memory(FMAX_DRAM_ADDR, (UE_VECTOR_SIZE,))[0].item()
+    print("fmax_ref:", fmax_ref)
+    print("fmax:", fmax)
+    assert abs(fmax - fmax_ref) < 1e-6, f"FMAX {fmax} does not match reference {fmax_ref}"
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+def software_reset_test():
+    """
+    Verifies that software reset breaks a deterministic deadlock caused
+    by flag registers, and that the engine recovers cleanly afterwards.
+
+    Phase 1 — flag deadlock (expect engine stuck):
+      Program engine 0 to FLAG_CHECK on engine 1 whose flag is never set.
+      This causes an infinite spin-wait (deadlock).  Confirm the engine
+      is stuck, then issue software_reset() to break it.
+
+    Phase 2 — simple halt instruction (expect PASS):
+    """
+    # ---- Phase 1: cause a flag deadlock, then reset ----
+    ue = UnifiedEngine()
+
+    ue.start_capture()
+    ue.generate_instruction_flag_check(target_engine_idx=1)
+    ue.generate_instruction_halt()
+    ue.stop_capture()
+    program_dram_addr = ue.get_program_dram_addr()
+    print(f"program_dram_addr: {program_dram_addr:08x}")
+    print(f"capture_instruction_size_bytes: {ue.get_capture_instruction_size_bytes()}")
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.start_execute_from_dram(program_dram_addr)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+    ue.wait_queue(3.0) # 3 seconds timeout
+
+    assert ue.is_queue_busy(), \
+        "Engine should be stuck in FLAG_CHECK spin-wait but reports idle"
+    print("Engine is deadlocked on FLAG_CHECK(engine 1) — issuing software reset...")
+    ue.software_reset()
+
+    # ---- Phase 2: run flag set/clear after reset, expect completion ----
+    ue.start_capture()
+    ue.generate_instruction_halt()
+    ue.stop_capture()
+    program_dram_addr = ue.get_program_dram_addr()
+    print(f"program_dram_addr: {program_dram_addr:08x}")
+    print(f"capture_instruction_size_bytes: {ue.get_capture_instruction_size_bytes()}")
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(3.0) # 3 seconds timeout
+
+    assert not ue.is_queue_busy(), \
+        "Engine should have completed HALT but still reports busy"
+
+    print("Software reset test PASSED")
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=5.1594,
-                        help='Clock cycle time in nanoseconds')
+    parser.add_argument('--freq', type=float, default=194,
+                        help='Clock frequency in MHz')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=0x02000000,
                         help='AXI-Lite register base address (default: 0x02000000). '
                              'Try 0x0 if register read hangs after bitstream update.')
@@ -1595,12 +1691,14 @@ if __name__ == "__main__":
     # alveo operates at 300 Mhz = 3.3333 ns
     # kintex ultrascale+ operates at 333 Mhz = 3.0030 ns
     # bittware board operates at 400 Mhz = 2.5000 ns
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Clock period={args.cycle:.6f} ns")
+    user_dma_core.CLOCK_CYCLE_TIME_NS = 1e3/args.freq
+    user_dma_core.UE_PEAK_GFLOPS = args.freq * 0.128
+    print(f"Clock period={user_dma_core.CLOCK_CYCLE_TIME_NS:.6f} ns")
 
+    software_reset_test()
+    fmax_test()
     for packing_mode in [16, 32, 48, 64]:
         packing_test(packing_mode=packing_mode)
-
     padding_zero_test()
     slicing_test()
     quantized_fp4_test()
@@ -1615,7 +1713,9 @@ if __name__ == "__main__":
     mix_of_broadcast_eltwise_add_eltwise_mul_core_test()
     bf16_transpose_test(M=1024, N=512)
     matmat_mul_test(M=1920, K=768, N=2048)
-    matmat_mul_test(M=1920, K=768, N=2048, softmax_enable=True)
+    matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True)
+    matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True)
+    matmat_mul_test(M=1984, K=1024, N=384, softmax_enable=True, debug_fmax=True)
     quantized_matmat_mul_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
     matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix")
     flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True)
@@ -1627,9 +1727,8 @@ if __name__ == "__main__":
     matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True)
     matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True)
     matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True)
-    matmat_mul_test(M=1920, K=768, N=2048, sigmoid_enable=True)
-    matmat_mul_two_cores_test(M=1920, K=768, N=2048, relu_enable=True)
-    matmat_mul_test(M=1920, K=768, N=2048, relu_enable=True)
+
+    # Alveo U50 only setup
     # matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
 
     # for M in [64, 192, 4096]:

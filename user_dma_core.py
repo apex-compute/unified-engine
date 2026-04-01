@@ -21,7 +21,6 @@ Usage:
 from re import U
 import struct
 import os
-import atexit
 import time
 from typing import Optional, Tuple, Callable
 from enum import IntEnum
@@ -45,18 +44,17 @@ UE_URAM_LENGTH_ADDR = 0x00000020
 UE_URAM_WRITEBACK_ADDR = 0x00000024
 UE_LATENCY_COUNT_ADDR = 0x00000030
 UE_DRAM_URAM_CTRL_ADDR = 0x00000034
+UE_LALU_HYPERPARAMETERS_ADDR = 0x00000038  # bf16_lalu_a [15:0], bf16_lalu_b [31:16] (axi_reg_map_pkg.sv)
 UE_URAM_ROW_SIZE_ADDR = 0x00000040
 UE_VALID_DELAY_EXTRA_ADDR = 0x00000044
 UE_LALU_INST_ADDR = 0x00000048
 UE_LALU_DELAY_ADDR = 0x0000004C
 UE_SCALAR_ADDR = 0x00000050
 UE_QUEUE_CTRL_ADDR = 0x00000054
-UE_QUEUE_SIZE_ADDR = 0x00000058
 UE_URAM_LENGTH_ADDR_Z = 0x0000005C
 UE_BIAS_ADDER_EN_ADDR = 0x00000060
 UE_URAM_WB_PADDING_ADDR = 0x00000064
 UE_BROADCAST_MODE_ADDR = 0x00000068
-# UE_ARGMAX_INDEX = 0x0000006C (old)
 UE_INSTRUCTION_CTL_ADDR = 0x00000070
 UE_TOTAL_BYTES_PER_STRIDE = 0x00000074
 UE_INSTRUCTION_ADDR = 0x00000078
@@ -68,19 +66,18 @@ UE_ARGMAX1_INDEX = 0x0000008C
 UE_ARGMAX2_INDEX = 0x00000090
 UE_ARGMAX3_INDEX = 0x00000094
 UE_ARGMAX4_INDEX = 0x00000098
-UE_LAST_REG_ADDR = 0x00000098  # last reg address (same as FMAX for init loop)
+# Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)
+UE_ARGMAX_INDEX = UE_ARGMAX1_INDEX
+UE_LAST_REG_ADDR = UE_ARGMAX4_INDEX  # last AXI-Lite offset for init scan
 
-# CLOCK_CYCLE_TIME_NS will be set based on target argument (default: 3, alveo: 2.5)
+# CLOCK_CYCLE_TIME_NS will be set based on target argument (default: 3 ns)
 CLOCK_CYCLE_TIME_NS = 3
+UE_PEAK_GFLOPS = 333.3 * 0.128
 UE_TRACE_SIZE = 8192
 # DMA device paths (can be overridden by command-line argument)
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
-
-LOCK_FILE = "/srv/model_files/user_hw_test.lock"
-import atexit
-import os
 
 def set_dma_device(device_name: str):
     """Set DMA device paths based on device name (e.g., 'xdma0' -> '/dev/xdma0_*')"""
@@ -145,12 +142,26 @@ class URAM_WRITE_SRC(IntEnum):
 
 class LALU_MODE(IntEnum):
     BYPASS = 0
-    GELU = 1
-    MODE_RECIP = 2
-    MODE_RSQRT = 3
-    SILU = 4
+    ACT = 1
+    ACT_NO_X = 2
+    MODE_RECIP = 3
+    MODE_RSQRT = 4
     RELU = 5
-    SIGMOID = 6
+
+# LALU activation hyperparameters (bf16 values for UE_LALU_HYPERPARAMETERS register)
+# Activation function (a+x)*sigmoid(-bx)
+# gelu: x*sigmoid(1.702x)
+# Set ACT
+LALU_ACT_GELU_A = 0x0000
+LALU_ACT_GELU_B = 0xbfd9   # -1.702
+# silu: x*sigmoid(x)
+# Set ACT
+LALU_ACT_SILU_A = 0x0000
+LALU_ACT_SILU_B = 0xbf80   # -1.0 in bf16
+# sigmoid: sigmoid(x)
+# Set ACT_NO_X
+LALU_ACT_SIGMOID_A = 0x3f80  # 1.0 in bf16
+LALU_ACT_SIGMOID_B = 0xbf80  # -1.0 in bf16
 
 class MEMCPY_TYPE(IntEnum):
     URAM = 0
@@ -175,15 +186,15 @@ WB_PADDING_NEG_INF = 1  # 0xFF80
 # UE_PIPELINE_ADDER_TREE = 16  # adder_tree pipeline depth
 # UE_PIPELINE_BF20_ADD = 2  # bf20_adder pipeline depth
 ## bf20_adder_unit latencies
-# UE_LATENCY_BF20_ITR2 = UE_PIPELINE_BF20_ADD + 1 - 1  # 2 + 1 - 1 = 2
-# UE_LATENCY_BF20_ITR3 = 2*UE_PIPELINE_BF20_ADD + 2 - 1  # 2 * 2 + 2 - 1 = 5
-# UE_LATENCY_BF20_ITRGT3 = 3*UE_PIPELINE_BF20_ADD + 2 - 1  # 3 * 2 + 2 - 1 = 7
+# UE_LATENCY_BF20_ITR2 = UE_PIPELINE_BF20_ADD + 1 - 1
+# UE_LATENCY_BF20_ITR3 = 2*UE_PIPELINE_BF20_ADD + 2 - 1
+# UE_LATENCY_BF20_ITRGT3 = 3*UE_PIPELINE_BF20_ADD + 2 - 1
 
 # Pipeline component latencies from bf19_mult.vhdl, bf19_add.vhdl, custom_exp.vhdl, adder_tree.vhdl
 UE_PIPELINE_BF19_MULT = 2
 UE_PIPELINE_BF19_ADD = 3
 UE_PIPELINE_CUSTOM_EXP = 4
-UE_PIPELINE_ADDER_TREE = 21
+UE_PIPELINE_ADDER_TREE = 12
 BF20_ADDER_3_CYCLE = True
 UE_LATENCY_BF20_ITR2, UE_LATENCY_BF20_ITR3, UE_LATENCY_BF20_ITRGT3 = ((3, 11, 11) if BF20_ADDER_3_CYCLE else (2, 5, 7))
 
@@ -196,13 +207,13 @@ UE_PIPELINE_STAGES_MULT = 4  # Mult Pipeline Stages
 UE_PIPELINE_STAGES_ADD = 3  # ADD Pipeline Stages
 
 # Mode latencies calculated from timing.md formulas
-UE_LATENCY_DOT_PRODUCT = UE_PIPELINE_STAGES_INPUT_REG + UE_PIPELINE_STAGES_DOT_P + UE_PIPELINE_BF19_MULT + UE_PIPELINE_ADDER_TREE - 1  # 1 + 4 + 1 + 16 - 1 = 21
-UE_LATENCY_RMS = UE_PIPELINE_STAGES_RMS + UE_PIPELINE_BF19_MULT + UE_PIPELINE_ADDER_TREE - 1  # 4 + 1 + 16 - 1 = 20
-UE_LATENCY_EXP = UE_PIPELINE_STAGES_EXP + UE_PIPELINE_BF19_ADD + UE_PIPELINE_CUSTOM_EXP + UE_PIPELINE_ADDER_TREE - 1  # 4 + 2 + 3 + 16 - 1 = 24
-UE_LATENCY_ADD_REDUCE = UE_PIPELINE_STAGES_ADD + UE_PIPELINE_BF19_ADD + UE_PIPELINE_ADDER_TREE - 1  # 3 + 2 + 16 - 1 = 20
-UE_LATENCY_ELTWISE_MUL = UE_PIPELINE_STAGES_MULT + UE_PIPELINE_BF19_MULT - 1  # 4 + 1 - 1 = 4
-UE_LATENCY_ELTWISE_ADD = UE_PIPELINE_STAGES_ADD + UE_PIPELINE_BF19_ADD - 1  # 3 + 2 - 1 = 4
-UE_LATENCY_ADD_EXP = UE_PIPELINE_STAGES_EXP + UE_PIPELINE_BF19_ADD + UE_PIPELINE_CUSTOM_EXP - 1  # 4 + 2 + 3 - 1 = 8
+UE_LATENCY_DOT_PRODUCT = UE_PIPELINE_STAGES_INPUT_REG + UE_PIPELINE_STAGES_DOT_P + UE_PIPELINE_BF19_MULT + UE_PIPELINE_ADDER_TREE - 1
+UE_LATENCY_RMS = UE_PIPELINE_STAGES_RMS + UE_PIPELINE_BF19_MULT + UE_PIPELINE_ADDER_TREE - 1
+UE_LATENCY_EXP = UE_PIPELINE_STAGES_EXP + UE_PIPELINE_BF19_ADD + UE_PIPELINE_CUSTOM_EXP + UE_PIPELINE_ADDER_TREE - 1
+UE_LATENCY_ADD_REDUCE = UE_PIPELINE_STAGES_ADD + UE_PIPELINE_BF19_ADD + UE_PIPELINE_ADDER_TREE - 1
+UE_LATENCY_ELTWISE_MUL = UE_PIPELINE_STAGES_MULT + UE_PIPELINE_BF19_MULT - 1
+UE_LATENCY_ELTWISE_ADD = UE_PIPELINE_STAGES_ADD + UE_PIPELINE_BF19_ADD - 1
+UE_LATENCY_ADD_EXP = UE_PIPELINE_STAGES_EXP + UE_PIPELINE_BF19_ADD + UE_PIPELINE_CUSTOM_EXP - 1
 UE_LATENCY_ROPE = 8  # Additional mode latency
 # Legacy latency values as a reference
 # UE_LATENCY_QUANTIZATION = 18  # Additional mode latency
@@ -212,23 +223,19 @@ UE_LATENCY_MEAN = 20  # Additional mode latency
 # LALU pipeline component latencies from timing.md (micro values)
 UE_LALU_PIPELINE_FPDIV = 3  # fpdiv pipeline depth (from fpdiv.vhdl line 561)
 UE_LALU_PIPELINE_FPSQRT = 2  # fpsqrt pipeline depth (from fpsqrt.vhdl line 9)
-UE_LALU_PIPELINE_GELU_DENOM = 6  # gelu_denom pipeline depth (from gelu_denom.vhdl line 3981)
-UE_LALU_PIPELINE_SILU_DENOM = 5  # silu_denom pipeline depth (from silu_denom.vhdl line 3810)
+UE_LALU_PIPELINE_FACT = 8  # sample_1_plus_exp_bx pipeline depth (from sample_1_plus_exp_bx.vhdl line 9039)
 
 # LALU mode latencies calculated from timing.md formulas (shift register delay parameter)
 # Pipeline stages are all 1 cycle (Input Reg + intermediate Reg + Output Reg - 1 for overlap)
-UE_LALU_LATENCY_SOFTMAX = 1 + UE_LALU_PIPELINE_FPDIV  # RECIP: 1 + 3 = 4
-UE_LALU_LATENCY_RMS = 1 + UE_LALU_PIPELINE_FPSQRT + 1 + UE_LALU_PIPELINE_FPDIV  # RSQRT: 1 + 2 + 1 + 3 = 7
-UE_LALU_LATENCY_GELU = 1 + UE_LALU_PIPELINE_GELU_DENOM + 1 + UE_LALU_PIPELINE_FPDIV  # GELU: 1 + 6 + 1 + 3 = 11
-UE_LALU_LATENCY_SILU = 1 + UE_LALU_PIPELINE_SILU_DENOM + 1 + UE_LALU_PIPELINE_FPDIV  # SILU: 1 + 5 + 1 + 3 = 10
-UE_LALU_LATENCY_SIGMOID = UE_LALU_LATENCY_SILU  # SIGMOID: same pipeline as SILU (TODO: confirm with Siqin)
-UE_LALU_LATENCY_MULT = 2  # Additional LALU mode latency
+UE_LALU_LATENCY_SOFTMAX = 1 + UE_LALU_PIPELINE_FPDIV
+UE_LALU_LATENCY_RMS = 1 + UE_LALU_PIPELINE_FPSQRT + 1 + UE_LALU_PIPELINE_FPDIV
+UE_LALU_LATENCY_ACT = 1 + UE_LALU_PIPELINE_FACT + 1 + UE_LALU_PIPELINE_FPDIV
 
 # Quantization latency values (matching andromeda.c)
 UE_QUANTIZE_FMAX_PIPELINE = 7
-UE_LATENCY_QSCALE = UE_LALU_PIPELINE_FPDIV + UE_QUANTIZE_FMAX_PIPELINE + 2  # 12
-UE_QINPUT_DELAY = UE_LATENCY_QSCALE + 1  # 13
-UE_LATENCY_QUANTIZATION = UE_LATENCY_QSCALE + UE_PIPELINE_BF19_MULT + 5  # 19
+UE_LATENCY_QSCALE = UE_LALU_PIPELINE_FPDIV + UE_QUANTIZE_FMAX_PIPELINE + 2
+UE_QINPUT_DELAY = UE_LATENCY_QSCALE + 1
+UE_LATENCY_QUANTIZATION = UE_LATENCY_QSCALE + UE_PIPELINE_BF19_MULT + 5
 
 # ISA instruction type constants (matching axi_top.sv)
 INSTRUCTION_JUMP = 1
@@ -242,11 +249,13 @@ FLAG_MODE_SET   = 0  # Assert this engine's flag (signal busy)
 FLAG_MODE_CLEAR = 1  # De-assert this engine's flag (signal done)
 FLAG_MODE_CHECK = 2  # Spin-wait until target engine's flag is 1
 
-# JUMP mode constants
+# JUMP mode constants (match queue_state_module.sv / andromeda.c)
 JUMP_MODE_ABSOLUTE = 0
-JUMP_MODE_RELATIVE = 1
-JUMP_MODE_JNZ = 2  # Jump if Not Zero
-JUMP_MODE_JZ = 3   # Jump if Zero
+JUMP_MODE_JNZ = 2  # absolute if reg != 0
+JUMP_MODE_JZ = 3   # absolute if reg == 0
+JUMP_MODE_RELATIVE = 4  # inst cache read ptr -= immediate[9:0]
+JUMP_MODE_RELA_JNZ = 5
+JUMP_MODE_RELA_JZ = 6
 
 # ADD mode constants
 INST_ADD_INC = 0  # Increment destination register
@@ -264,10 +273,18 @@ REGFILE_R3_RES = 3        # Result register
 # Decoder instruction capture constants
 MAX_DECODER_INSTRUCTIONS = 768 * 1024 * 1024 // 32
 
+def _inst_desc_bits(w: list, lo: int, hi: int) -> int:
+    """inst_descriptor[hi:lo] inclusive (Verilog indices), from eight LE words (queue_state_module.sv)."""
+    val = 0
+    for b in range(lo, hi + 1):
+        val |= ((w[b // 32] >> (b % 32)) & 1) << (b - lo)
+    return val
+
+
 class Instructions:
     """
-    256-bit instruction descriptor (32 bytes exactly, matches RTL FIFO width)
-    Bit layout matches axi_top.sv QUEUE_LOAD state
+    256-bit instruction descriptor (32 bytes); layout matches Vivado/hdl/queue_state_module.sv
+    inst_descriptor[255:0] (w[k] = [32k+31 : 32k], LE words).
     """
     def __init__(self):
         # 8 words of 32 bits each = 256 bits = 32 bytes
@@ -530,7 +547,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        #assert hw_version == 0x2ae8dae9, "HW version is not 0x2ae8dae9 please check the FPGA version"
+        # assert hw_version == 0x3fa17350, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x3fa17350. Please update FPGA with commit update_3fa1735.bin using update_flash.py (public release v1.1)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -574,13 +591,12 @@ class UnifiedEngine:
         )
         self.write_reg32(UE_VALID_DELAY_EXTRA_ADDR, ue_valid_delay_extra)
 
-        # Configure delay for the last ALU
+        # Configure delay for the last ALU (matching andromeda.c init_unified_engine)
         ue_lalu_delay = (
-            (UE_QINPUT_DELAY << 25) +
-            (UE_LATENCY_QUANTIZATION << 20) +
-            (UE_LATENCY_QSCALE << 16) +
-            (UE_LALU_LATENCY_SILU << 12) +
-            (UE_LALU_LATENCY_GELU << 8) +
+            ((UE_QINPUT_DELAY & 0x1F) << 21) +
+            (UE_LATENCY_QUANTIZATION << 16) +
+            (UE_LATENCY_QSCALE << 12) +
+            (UE_LALU_LATENCY_ACT << 8) +
             (UE_LALU_LATENCY_RMS << 4) +
             (UE_LALU_LATENCY_SOFTMAX << 0)
         )
@@ -879,7 +895,7 @@ class UnifiedEngine:
             stride_jump_bytes: Distance in bytes between start of consecutive copies in DRAM
                               (0 = contiguous, use stride_bytes_per_chunk for the jump)
             general_reg_src: General purpose register source (default: 0)
-            fmax_context_addr: Fmax context address packed in inst_reserved_2 (bits 15-20, 6 bits, default: 0)
+            fmax_context_addr: 6-bit fmx_context into inst_descriptor[228:223] when capturing (must match CSR path for replay from DRAM)
         """
         # Capture mode: pack instruction instead of executing
         if not self.is_capture_on:
@@ -915,61 +931,57 @@ class UnifiedEngine:
             # Trigger queue
             self.write_reg32(UE_QUEUE_CTRL_ADDR, inst_id)
         else:
-            # === CAPTURE: Pack into 256-bit instruction descriptor ===
+            # === CAPTURE: Pack into 256-bit instruction descriptor (queue_state_module.sv) ===
             if self.capture_buffer is not None and self.capture_count < MAX_DECODER_INSTRUCTIONS:
                 inst = Instructions()
                 w = inst.words
 
-                # Clear instruction first (all zeros - matches explicit zeroing in function)
                 for i in range(8):
                     w[i] = 0
 
-                # Memory copy stride mode is enabled if stride_bytes_per_chunk > 0
                 stride_en = 1 if stride_jump_bytes > 0 else 0
-
-                # Pack only the registers that are set for MEMCPY operation
-                # Word 0 (bits 0-31): ISA control fields in [15:0], reserved in [31:16]
-                inst_type = 0
-                if general_reg_src != 0:
-                    w[0] = ((0 & 0xF) << 0) | \
-                           ((general_reg_src & 0xF) << 4) | \
-                           ((0 & 0xF) << 8) | \
-                           ((0 & 0xF) << 12)
-                    inst_type = INSTRUCTION_REG_REWRITE
+                # Virtual mode 0xF = memcpy from DRAM (RTL UE_MODE_MEMCPY_FROM_DRAM)
+                if not stride_en:
+                    # Same as andromeda.c ue_memcpy_from_dram capture (non-stride)
+                    w[0] = (inst_id & 0xFF) | (0 << 8)
+                    w[1] = dram_src_addr
+                    w[2] = memcpy_length_bytes
+                    w[3] = 0
+                    w[4] = 0
+                    w[5] = ((0xF << 12) |
+                            ((uram_type & 1) << 16) |
+                            ((URAM_WRITE_SRC.URAM_DRAM.value & 3) << 17) |
+                            ((LALU_MODE.BYPASS.value & 7) << 23))
+                    w[6] = 0
+                    # [246:231] memcpy alias: start_memcpy, bram_uram_select, uram_memcpy_dst_addr
+                    w[7] = ((1 << 7) |
+                            ((memcpy_type & 3) << 8) |
+                            (((uram_dst_addr & 0xFFF) << 10)))
+                    if general_reg_src != 0:
+                        w[0] = (inst_id & 0xFF) | ((INSTRUCTION_REG_REWRITE & 0xF) << 8)
+                        w[1] = ((general_reg_src & 0xF) << 4)
                 else:
-                    w[0] = 0  # ISA fields not used for regular memcpy
-                    inst_type = 0
-                
-                # Word 1 (bits 32-63): unified DMA address (replaces separate source/target)
-                w[1] = dram_src_addr
-                
-                w[2] = memcpy_length_bytes  # Word 2: dma_length
-                # Word 3: mode_sel(4-7)=0xF (virtual mode), output_size(8-23)=stride_bytes_per_chunk
-                w[3] = ((0xF << 4) |
-                        ((stride_bytes_per_chunk & 0xFFFF) << 8))  # inst_output_size for bytes per stride
-                w[4] = 0  # Word 4: All zeros
-                # Word 5: start_memcpy_reg(168), uram_select(169), dr_mb_wb_mode(170-171),
-                #         uram_memcpy_dst_addr(172-183), bram_uram_select(184-185),
-                #         lalu_mode(186-188), lalu_scalar[2:0](189-191)
-                w[5] = ((1 << 8) |  # start_memcpy_reg = 1
-                        ((uram_type & 1) << 9) |  # uram_select
-                        ((URAM_WRITE_SRC.URAM_DRAM.value & 3) << 10) |  # dr_mb_wb_mode = URAM_DRAM
-                        ((uram_dst_addr & 0xFFF) << 12) |  # uram_memcpy_dst_addr
-                        ((memcpy_type & 3) << 24) |  # bram_uram_select = memcpy_type
-                        ((stride_jump_bytes & 0x7) << 29))  # lalu_scalar[2:0] = stride_jump_bytes lower 3 bits
-                # Word 6: lalu_scalar[20:3](192-209), uram_row_size_z(210-221),
-                #         uram_dram_wb_start_reg(222), wb_padding_sel(223)
-                w[6] = ((stride_jump_bytes >> 3) & 0x3FFFF)  # lalu_scalar[20:3] = stride_jump_bytes upper 18 bits
-                # Word 7 (bits 224-255): fmax_clear(224), inst_trans_row_cnt(225-234), inst_trans_col_cnt(235-244),
-                #                      broadcast_mode(245-246), transaction_id(247-252), inst_type(253-255)
-                w[7] = ((0 & 1) |                           # bit 0: fmax_clear = 0
-                        (0 << 1) |                          # bits 1: use bias adder = 0
-                        (0 << 2) |                          # bits 2-13: uram_row_stride_z = 0
-                        (stride_en << 14) |                 # bit 14: dma_stride_en = stride_en
-                        (fmax_context_addr << 15) |  # bits 15-20: inst_reserved_2 = fmax_context address
-                        (0 << 21) |                         # bits 21-22: broadcast_mode = 0
-                        ((inst_id & 0x3F) << 23) |          # bits 23-28: transaction_id (6 bits)
-                        ((inst_type & 0x7) << 29))          # bits 29-31: inst_type (3 bits)
+                    # Stride: same field math as start_queue with mode 0xF, stride output_size / scalar
+                    osz = stride_bytes_per_chunk
+                    sj = stride_jump_bytes
+                    w[0] = (inst_id & 0xFF) | (0 << 8)
+                    w[1] = dram_src_addr
+                    w[2] = memcpy_length_bytes
+                    w[3] = 0
+                    w[4] = ((osz & 0xF) << 28)
+                    w[5] = ((((osz >> 4) & 0xFFF)) |
+                            ((0xF << 12)) |
+                            (((uram_type & 1) << 16)) |
+                            (((URAM_WRITE_SRC.URAM_DRAM.value & 3) << 17)) |
+                            (((LALU_MODE.BYPASS.value & 7) << 23)) |
+                            (((sj & 0x3F) << 26)))
+                    w[6] = ((((sj >> 6) & 0x7FFF)) | ((stride_en & 1) << 30))
+                    w[7] = ((1 << 7) |
+                            ((memcpy_type & 3) << 8) |
+                            (((uram_dst_addr & 0xFFF) << 10)))
+                    if general_reg_src != 0:
+                        w[0] = (inst_id & 0xFF) | ((INSTRUCTION_REG_REWRITE & 0xF) << 8)
+                        w[1] = ((general_reg_src & 0xF) << 4)
 
                 self.capture_buffer.append(inst)
                 self.capture_count += 1
@@ -1016,6 +1028,8 @@ class UnifiedEngine:
             0,  # broadcast_mode
             0,  # clear_max_en
             1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
             LALU_MODE.BYPASS.value,  # lalu_mode
             0,  # scalar
             memcpy_type,  # uram_bram (URAM/BRAM type)
@@ -1137,7 +1151,8 @@ class UnifiedEngine:
             self.wait_queue()
             self.report_timing_and_instruction_count()
             # tranpose is elemental access for each element 1 ops per element
-            print( f"flops: {self.report_flop_rate_gflops(memcpy_length_bytes / bytes_per_element):.3f} GFLOPS")
+            _gflops, _ = self.report_flop_rate_gflops(memcpy_length_bytes / bytes_per_element)
+            print(f"flops: {_gflops:.3f} GFLOPS")
 
             if isinstance(matrix, DeviceTensor):
                 return DeviceTensor((memcpy_length_bytes // stride_bytes_per_chunk, stride_bytes_per_chunk // bytes_per_element), ue=self, dram_addr=output_dram_addr)
@@ -1146,7 +1161,8 @@ class UnifiedEngine:
 
         return handler
 
-    def start_queue(self, broadcast_mode: int, max_clear_en: int, stride_z: int, lalu_mode: int, scalar: int,
+    def start_queue(self, broadcast_mode: int, max_clear_en: int, stride_z: int,
+                   lalu_a: int, lalu_b: int, lalu_mode: int, scalar: int,
                    uram_bram: int, uram_section: int, uram_dst_addr: int,
                    dram_to_uram_cpy_start: int, uram_wb_addr: int,
                    uram_write_src: int, mode: UE_MODE, data_type: int,
@@ -1195,6 +1211,7 @@ class UnifiedEngine:
             # Configure last ALU
             self.write_reg32(UE_LALU_INST_ADDR, lalu_mode)
             self.write_reg32(UE_SCALAR_ADDR, scalar)
+            self.write_reg32(UE_LALU_HYPERPARAMETERS_ADDR, ((lalu_b & 0xFFFF) << 16) | (lalu_a & 0xFFFF))
 
             if stride_jump_bytes > 0:
                 # axi_top.sv:
@@ -1239,7 +1256,7 @@ class UnifiedEngine:
             # Hardware will execute the operation based on the configured registers
             self.write_reg32(UE_QUEUE_CTRL_ADDR, inst_id)
         else:
-            # === CAPTURE: Pack into 256-bit instruction descriptor ===
+            # === CAPTURE: Pack into 256-bit instruction descriptor (queue_state_module.sv) ===
             if self.capture_buffer is not None and self.capture_count < MAX_DECODER_INSTRUCTIONS:
                 inst = Instructions()
                 w = inst.words
@@ -1248,71 +1265,64 @@ class UnifiedEngine:
                 output_size = stride_bytes_per_chunk if stride_en else output_size
                 scalar = stride_jump_bytes if stride_en else scalar
 
-                # Pack according to RTL bit layout (axi_top.sv lines 928-951 + inst_type)
-                # Word 0 (bits 0-31): ISA control fields in [15:0], reserved in [31:16]
-                inst_type = 0
-                if general_reg_src != 0:
-                    w[0] = ((0 & 0xF) << 0) | \
-                           ((general_reg_src & 0xF) << 4) | \
-                           ((0 & 0xF) << 8) | \
-                           ((0 & 0xF) << 12)
-                    inst_type = INSTRUCTION_REG_REWRITE
-                else:
-                    w[0] = 0  # ISA fields not used for regular memcpy
-                    inst_type = 0
+                # [15:0] header: [7:0] transaction_id; [11:8] inst_type=UE(0); [31:16] inst_bf16_lalu_a
+                w[0] = (inst_id & 0xFF) | (0 << 8) | ((lalu_a & 0xFFFF) << 16)
 
-                # Word 1 (bits 32-63): unified DMA address (replaces separate source/target)
+                # [63:32] inst_dram_addr; [95:64] inst_dma_length
                 w[1] = (dma_start_addr if (dma_start or uram_bram_wb_start) else 0)
+                w[2] = (dma_length if (dma_start or uram_bram_wb_start) else 0)
 
-                # Word 2 (bits 64-95): dma_length
-                w[2] = dma_length if (dma_start or uram_bram_wb_start) else 0
+                # [127:96]: [107:96] inst_uram_row_size; [119:108] inst_uram_row_size_z; [127:120] uram_start_addr_y[7:0]
+                w[3] = ((uram_length & 0xFFF) |
+                        ((uram_length_z & 0xFFF) << 12) |
+                        (((uram_a_start_addr & 0xFFF) << 24)))
 
-                # Word 3 (bits 96-127): dma_start_reg(96), uram_start_reg(97), data_type(98-99),
-                #                      mode_sel(100-103), output_size(104-119), uram_row_size[7:0](120-127)
-                w[3] = ((dma_start & 1) |
-                        ((uram_start & 1) << 1) |
-                        ((data_type & 3) << 2) |
-                        ((mode.value & 0xF) << 4) |
-                        ((output_size & 0xFFFF) << 8) |
-                        ((uram_length & 0xFF) << 24))
+                # [159:128]: uram_start_addr_y[11:8], uram_start_addr_z, uram_writeb_addr, output_size[3:0]
+                w[4] = ((((uram_a_start_addr >> 8) & 0xF)) |
+                        (((uram_b_start_addr & 0xFFF) << 4)) |
+                        (((uram_wb_addr & 0xFFF) << 16)) |
+                        (((output_size & 0xF) << 28)))
 
-                # Word 4 (bits 128-159): uram_row_size[11:8](128-131), uram_start_addr_y(132-143),
-                #                      uram_start_addr_z(144-155), uram_writeb_addr[3:0](156-159)
-                w[4] = (((uram_length >> 8) & 0xF) |
-                        ((uram_a_start_addr & 0xFFF) << 4) |
-                        ((uram_b_start_addr & 0xFFF) << 16) |
-                        ((uram_wb_addr & 0xF) << 28))
+                # [191:160]: output_size[15:4], mode_sel, uram_select, dr_mb_wb_mode, dma/uram start, data_type, lalu_mode, lalu_scalar[5:0]
+                w[5] = ((((output_size >> 4) & 0xFFF)) |
+                        (((mode.value & 0xF) << 12)) |
+                        (((uram_section & 1) << 16)) |
+                        (((uram_write_src & 3) << 17)) |
+                        (((dma_start & 1) << 19)) |
+                        (((uram_start & 1) << 20)) |
+                        (((data_type & 3) << 21)) |
+                        (((lalu_mode & 7) << 23)) |
+                        (((scalar & 0x3F) << 26)))
 
-                # Word 5 (bits 160-191): uram_writeb_addr[11:4](160-167), start_memcpy_reg(168),
-                #                      uram_select(169), dr_mb_wb_mode(170-171), uram_memcpy_dst_addr(172-183),
-                #                      bram_uram_select(184-185), lalu_mode(186-188), lalu_scalar[2:0](189-191)
-                w[5] = (((uram_wb_addr >> 4) & 0xFF) |
-                        ((dram_to_uram_cpy_start & 1) << 8) |
-                        ((uram_section & 1) << 9) |
-                        ((uram_write_src & 3) << 10) |
-                        ((uram_dst_addr & 0xFFF) << 12) |
-                        ((uram_bram & 3) << 24) |
-                        ((lalu_mode & 0x7) << 26) |
-                        ((scalar & 0x7) << 29))
+                # [223:192]: lalu_scalar[20:6], wb_padding[207], fmax_clear[208], bias_adder[209],
+                #            uram_row_stride_z[221:210], dma_stride_en[222], fmx_context[223] (LSB)
+                fmx = fmax_context_addr & 0x3F
+                w[6] = ((((scalar >> 6) & 0x7FFF)) |
+                        (((wb_padding_control & 1) << 15)) |
+                        (((max_clear_en & 1) << 16)) |
+                        (((bias_adder_en & 1) << 17)) |
+                        (((stride_z & 0xFFF) << 18)) |
+                        (((stride_en & 1) << 30)) |
+                        (((fmx & 1) << 31)))
 
-                # Word 6 (bits 192-223): lalu_scalar[20:3](192-209), uram_row_size_z(210-221),
-                #                      uram_dram_wb_start_reg(222), wb_padding_sel(223)
-                w[6] = (((scalar >> 3) & 0x3FFFF) |
-                        ((uram_length_z & 0xFFF) << 18) |
-                        ((uram_bram_wb_start & 1) << 30) |
-                        ((wb_padding_control & 1) << 31))
+                # [255:224]: fmx_context[228:224] in w[7][4:0]; broadcast[230:229]; [246:231] mux
+                if mode == UE_MODE.URAM_DRAM_WRITEBACK:
+                    desc_246_231 = (
+                        (((dram_to_uram_cpy_start & 1) << 7)) |
+                        (((uram_bram & 3) << 8)) |
+                        (((uram_dst_addr & 0xFFF) << 10)) |
+                        (((uram_bram_wb_start & 1) << 22))
+                    )
+                else:
+                    desc_246_231 = ((lalu_b & 0xFFFF) << 7)
+                w[7] = ((((fmx >> 1) & 0x1F)) |
+                        (((broadcast_mode & 3) << 5)) |
+                        desc_246_231)
 
-                
-                # Word 7 (bits 224-255): fmax_clear(224), use_bf19_bias_adder(225), uram_row_stride_z(226-237),
-                #                      dma_stride_en(238), reserved_2(239-244)=fmax_context_addr, broadcast_mode(245-246), transaction_id(247-252), inst_type(253-255)
-                w[7] = ((max_clear_en & 1) |
-                        ((bias_adder_en & 1) << 1) |
-                        ((stride_z & 0xFFF) << 2) |
-                        ((stride_en & 0x1) << 14) |         # bit 14: dma_stride_en
-                        (fmax_context_addr << 15) |  # bits 15-20: reserved_2 = fmax_context address
-                        ((broadcast_mode & 0x3) << 21) |
-                        ((inst_id & 0x3F) << 23) |
-                        ((inst_type & 0x7) << 29))
+                # REG_REWRITE: [11:8] inst_type; [39:36] inst_src_reg_idx (RTL uses regfile for DRAM addr)
+                if general_reg_src != 0:
+                    w[0] = (inst_id & 0xFF) | ((INSTRUCTION_REG_REWRITE & 0xF) << 8)
+                    w[1] = (((general_reg_src & 0xF) << 4))
 
                 self.capture_buffer.append(inst)
                 self.capture_count += 1
@@ -1321,7 +1331,7 @@ class UnifiedEngine:
         # Queue busy state is checked via is_queue_busy() which reads the hardware register
         # Results are read back via DMA when needed
         return None
-    
+
     def dma_to_accelerator_memory(self, dma_address: int, data: torch.Tensor) -> None:
         """DMA data from host memory to accelerator memory"""
         assert data.dtype == torch.bfloat16, "Data must be in bf16 format"
@@ -1398,6 +1408,8 @@ class UnifiedEngine:
             0,  # broadcast_mode
             0,  # max_clear_en
             1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
             LALU_MODE.BYPASS.value,  # lalu_mode
             0,  # scalar (not used)
             0,  # uram_bram (URAM)
@@ -1460,7 +1472,7 @@ class UnifiedEngine:
 
     # Broadcast operations ------------------------------------------------------
     def start_queue_broadcast(self, mode: UE_MODE, broadcast_mode: BROADCAST_MODE,
-                              uram_src_start_addr: int, uram_wb_start_addr: int, 
+                              uram_src_start_addr: int, uram_wb_start_addr: int,
                               element_size: int, scalar: float = None) -> Optional[torch.Tensor]:
         """
         Start queue for broadcast op: MUL_BROADCAST or ADD_BROADCAST.
@@ -1484,6 +1496,8 @@ class UnifiedEngine:
             broadcast_mode.value,  # broadcast_mode
             0,  # max_clear_en
             1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
             LALU_MODE.BYPASS.value,  # lalu_mode
             self.float_to_bf16(scalar) if scalar is not None else self.float_to_bf19(1.0),
             0,  # uram_bram (URAM)
@@ -1506,7 +1520,7 @@ class UnifiedEngine:
 
     def broadcast_mul(self, scalar: float,
                             sram_start_addr: int, sram_wb_addr: int,
-                            element_size: int) -> Optional[torch.Tensor]:                           
+                            element_size: int) -> Optional[torch.Tensor]:
         """Start queue for broadcast multiply. Wraps start_queue with UE_MODE.MUL_BROADCAST."""
         self.start_queue_broadcast(
             UE_MODE.MUL_BROADCAST, BROADCAST_MODE.SCALAR_IN_REG,
@@ -1524,7 +1538,8 @@ class UnifiedEngine:
 
     def start_queue_for_dot_product_operation(self, max_clear_en: int, fmax_context_addr: int, vector_sram_start_addr: int, output_sram_wb_addr: int,
                                             K: int, N: int, dma_start_addr: int,
-                                            data_type: int = 0, bias_enable: bool = False, lalu_mode: LALU_MODE = LALU_MODE.BYPASS) -> None:
+                                            data_type: int = 0, bias_enable: bool = False, lalu_mode: LALU_MODE = LALU_MODE.BYPASS,
+                                            lalu_a: int = 0, lalu_b: int = 0) -> None:
         """Start queue for dot product operation. Matrix data streams from DRAM via DMA.
         Args:
             max_clear_en: clear max accumulator (1 on first chunk, 0 on subsequent)
@@ -1534,7 +1549,7 @@ class UnifiedEngine:
             N: outer dimension (matrix height), must be a multiple of UE_VECTOR_SIZE
             dma_start_addr: DRAM address where matrix data starts
             data_type: quantization data type (e.g. TYPE.INT4.value)
-            lalu_mode: LALU mode value (e.g. LALU_MODE.GELU.value)
+            lalu_mode: LALU mode value (e.g. LALU_MODE.ACT)
             lalu_scalar: scalar for LALU operation
         """
         vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
@@ -1554,6 +1569,8 @@ class UnifiedEngine:
             0,  # broadcast_mode
             max_clear_en,  # clear_max_en
             1,  # stride_z
+            lalu_a,  # lalu_a
+            lalu_b,  # lalu_b
             lalu_mode.value,  # lalu_mode
             0,  # lalu_scalar
             0,  # uram_bram (URAM)
@@ -1579,7 +1596,8 @@ class UnifiedEngine:
 
     # Compute engine operations --------------------------------------------------
     def start_queue_for_bf16_matvec_operation(self, max_clear_en: int, fmax_context_addr: int, vector_sram_start_addr: int, matrix_sram_start_addr: int, output_sram_wb_addr: int,
-                                            K: int, N: int, bias_enable: bool = False, lalu_mode: LALU_MODE = LALU_MODE.BYPASS, stride_z: int = UE_VECTOR_SIZE) -> None:
+                                            K: int, N: int, bias_enable: bool = False, lalu_mode: LALU_MODE = LALU_MODE.BYPASS, stride_z: int = UE_VECTOR_SIZE,
+                                            lalu_a: int = 0, lalu_b: int = 0) -> None:
         """Start queue for bf16 matvec operation. Wraps start_queue with UE_MODE.BF16_DOT_PRODUCT.
         Args:
             max_clear_en: max_clear_en
@@ -1606,6 +1624,8 @@ class UnifiedEngine:
             0,  # broadcast_mode (not used for bf16 matvec operation)
             max_clear_en,  # max_clear_en
             stride_in_rows,  # stride_z
+            lalu_a,  # lalu_a
+            lalu_b,  # lalu_b
             lalu_mode.value,  # lalu_mode
             0,  # scalar
             0,  # uram_bram (URAM)
@@ -1650,6 +1670,8 @@ class UnifiedEngine:
             BROADCAST_MODE.FMAX_NEGATE.value,  # broadcast_mode
             0,  # max_clear_en
             1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
             LALU_MODE.MODE_RECIP.value,  # lalu_mode: 1/sum
             self.float_to_bf19(1.0),  # scalar: 1.0 in bf19 format
             0,  # uram_bram (URAM)
@@ -1690,6 +1712,8 @@ class UnifiedEngine:
             0,  # broadcast_mode
             0,  # max_clear_en
             1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
             LALU_MODE.MODE_RSQRT.value,  # lalu_mode gets sqrt(N) / sqrt(sum(x_i^2))
             self.float_to_bf19(float(math.sqrt(N))),  # BF19 scalar (sqrt(N))
             0,  # uram_bram (URAM)
@@ -1729,6 +1753,8 @@ class UnifiedEngine:
             0,  # broadcast_mode
             0,  # clear_max_en
             1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
             LALU_MODE.MODE_RECIP.value,  # lalu_mode (computes 1/sum)
             self.float_to_bf19(float(N)),  # BF19 scalar (n)
             0,  # uram_bram (URAM = 0)
@@ -1747,11 +1773,11 @@ class UnifiedEngine:
             0,  # output_size
             self._inst_id
         )
-        self._inst_id += 1        
+        self._inst_id += 1
 
     # SRAM only version of rms norm core
     def rms_norm_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, gamma_sram_start_addr: int = None) -> None:
-        """ Core RMS norm: normalizes vector x -> x / rms(x). 
+        """ Core RMS norm: normalizes vector x -> x / rms(x).
         Args:
             vector_sram_start_addr: SRAM address of input vector (must be URAM_A: 0x00000-0x7FFFF)
             output_sram_wb_addr: SRAM address for normalized output
@@ -1818,7 +1844,7 @@ class UnifiedEngine:
             input_gamma_sram_start_addr: input_gamma_sram_start_addr
             input_beta_sram_start_addr: input_beta_sram_start_addr
         """
- 
+
         self.start_queue_for_bf16_layer_norm_mean(vector_sram_start_addr, zeros_sram_start_addr, N)
         self.start_queue_broadcast(UE_MODE.ADD_BROADCAST, BROADCAST_MODE.LALU_RESULT_NEGATE, vector_sram_start_addr, output_sram_wb_addr, N) # use 1/rms(x) result from LALU
         self.start_queue_for_bf16_rms_mean(output_sram_wb_addr, N)
@@ -1874,7 +1900,7 @@ class UnifiedEngine:
 
         vector_sram_addr = 0x00000
 
-        for i, m_take in self.chunk_ranges(M, chunk_size):  
+        for i, m_take in self.chunk_ranges(M, chunk_size):
             self.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * N * 2,
                                         sram_address=vector_sram_addr,
                                         element_size=m_take * N)
@@ -1886,7 +1912,7 @@ class UnifiedEngine:
                                             accelerator_dram_address=OUTPUT_DRAM_ADDR + i * N * 2,
                                             element_size=m_take * N)
 
-        # Total Theoretical FLOPS: 
+        # Total Theoretical FLOPS:
         total_flops = 5 * M * N # mean(N), subtract(N), variance(N), sum(N), rsqrt(1), scale(N)
         if gamma_sram_addr is not None:
             total_flops += M * N # mul(gamma) N times
@@ -2037,6 +2063,8 @@ class UnifiedEngine:
             0,  # broadcast_mode
             0,  # clear_max_en
             1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
             LALU_MODE.BYPASS.value,  # lalu_mode
             0,  # lalu_scalar
             0,  # uram_bram (URAM)
@@ -2082,6 +2110,8 @@ class UnifiedEngine:
             0,  # broadcast_mode
             0,  # clear_max_en
             1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
             LALU_MODE.MODE_RECIP.value,  # lalu_mode
             0,  # lalu_scalar not used for quantize
             0,  # uram_bram (URAM)
@@ -2105,7 +2135,8 @@ class UnifiedEngine:
         return 2 * element_size # 2 FLOPS per element
 
     def matmat_mul_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
-                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False) -> None:
+                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False,
+                             debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None) -> None:
         # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
         # 1. M_chunk can be any value between 1 and M
         # 2. N_chunk needs to be a multiple of UE_VECTOR_SIZE
@@ -2122,13 +2153,26 @@ class UnifiedEngine:
 
         assert sum([gelu_enable, silu_enable, sigmoid_enable, relu_enable]) <= 1, "only one of gelu_enable, silu_enable, sigmoid_enable, relu_enable can be True"
 
+        if softmax_enable:
+            if debug_fmax:
+                assert ZERO_DRAM_ADDR is not None, "ZERO_DRAM_ADDR must be provided when debug_fmax=True"
+                assert FMAX_DRAM_ADDR is not None, "FMAX_DRAM_ADDR must be provided when debug_fmax=True"
+
         lalu_mode = LALU_MODE.BYPASS
+        lalu_a = 0
+        lalu_b = 0
         if gelu_enable:
-            lalu_mode = LALU_MODE.GELU
+            lalu_mode = LALU_MODE.ACT
+            lalu_a = LALU_ACT_GELU_A
+            lalu_b = LALU_ACT_GELU_B
         elif silu_enable:
-            lalu_mode = LALU_MODE.SILU
+            lalu_mode = LALU_MODE.ACT
+            lalu_a = LALU_ACT_SILU_A
+            lalu_b = LALU_ACT_SILU_B
         elif sigmoid_enable:
-            lalu_mode = LALU_MODE.SIGMOID
+            lalu_mode = LALU_MODE.ACT_NO_X
+            lalu_a = LALU_ACT_SIGMOID_A
+            lalu_b = LALU_ACT_SIGMOID_B
         elif relu_enable:
             lalu_mode = LALU_MODE.RELU
 
@@ -2219,7 +2263,9 @@ class UnifiedEngine:
                                                             K=K,
                                                             N=n_take,
                                                             bias_enable=bias_enable,
-                                                            lalu_mode=lalu_mode)
+                                                            lalu_mode=lalu_mode,
+                                                            lalu_a=lalu_a,
+                                                            lalu_b=lalu_b)
                     clear_en = 0
 
                 # generated matrix is m_take x n_take
@@ -2231,7 +2277,7 @@ class UnifiedEngine:
                 #                                 accelerator_dram_address=start_dram_address_of_partial_matrix + output_row * N * bytes_per_element,
                 #                                 element_size=n_take)
 
-                # New way of copying with stride 
+                # New way of copying with stride
                 if N_chunk_aligned is None:
                     self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
                                                 accelerator_dram_address=start_dram_address_of_partial_matrix,
@@ -2258,6 +2304,20 @@ class UnifiedEngine:
 
                     output_sram_wb_addr = 0x80000 # URAM_B start
                     for row_idx in range(m_take_chunk):
+                        if debug_fmax:
+                            zero_sram_addr = input_sram_start_addr + m_take_chunk * N * bytes_per_element
+                            self.accelerator_memory_to_sram(accelerator_dram_address=ZERO_DRAM_ADDR,
+                                                            sram_address=zero_sram_addr,
+                                                            element_size=UE_VECTOR_SIZE)
+
+                            self.fmax_core(vector_sram_start_addr=zero_sram_addr,
+                                        output_sram_wb_addr=zero_sram_addr,
+                                        N=UE_VECTOR_SIZE,
+                                        fmax_context_addr=row_idx + m_take_chunk_idx)
+                            self.sram_to_accelerator_memory(sram_address=zero_sram_addr,
+                                                            accelerator_dram_address=FMAX_DRAM_ADDR + (i + row_idx + m_take_chunk_idx) * UE_VECTOR_SIZE * bytes_per_element,
+                                                            element_size=UE_VECTOR_SIZE)
+
                         self.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
                                                                 vector_sram_start_addr=input_sram_start_addr + row_idx * N * bytes_per_element,
                                                                 output_sram_wb_addr=output_sram_wb_addr + row_idx * N * bytes_per_element,
@@ -2266,7 +2326,7 @@ class UnifiedEngine:
                     self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
                                                 accelerator_dram_address=start_dram_address_of_partial_row_complete_matrix,
                                                 element_size=m_take_chunk * N)
-        
+
         # Total Theoretical FLOPS: 2 * M * K * N + M * N * 5 (softmax)
         total_flops = 2 * M * K * N
         if softmax_enable:
@@ -2391,6 +2451,53 @@ class UnifiedEngine:
         total_flops = flops_engine0 + flops_engine1
         print(f"Total Theoretical FLOPS (two cores): {total_flops / 1e9:.6f} G")
         return total_flops
+
+    def fmax_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, fmax_context_addr: int = 0) -> None:
+        """get's the fmax from the fmax_context_addr and stores it in the output_sram_wb_addr.
+
+        Uses ADD_BROADCAST with FMAX_NEGATE broadcast mode to subtract the tracked
+        maximum (populated by a prior dot product / matvec with max_clear_en=1)
+        from every element in the input vector.
+
+        Args:
+            vector_sram_start_addr: SRAM address of input vector (must be in URAM_A: 0x00000-0x7FFFF)
+            output_sram_wb_addr: SRAM address for output writeback
+            N: number of elements
+            fmax_context_addr: fmax context slot (0-63) populated by a prior dot product (default: 0)
+        """
+        vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
+        assert vector_uram_type == URAM_SECTION.URAM_A, f"vector_sram_start_addr must be in URAM_A, got {hex(vector_sram_start_addr)}"
+
+        output_uram_type, output_uram_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
+
+        row_size = (N + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+
+        self.start_queue(
+            BROADCAST_MODE.FMAX_NEGATE.value,  # broadcast_mode: use -fmax from context
+            0,  # max_clear_en
+            1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
+            LALU_MODE.BYPASS.value,  # lalu_mode
+            0,  # scalar (not used with FMAX_NEGATE)
+            0,  # uram_bram (URAM)
+            output_uram_type.value,
+            0,  # uram_dst_addr
+            0,  # dram_to_uram_cpy_start
+            output_uram_addr,
+            URAM_WRITE_SRC.URAM_WRITE_BACK.value,  # uram_write_src
+            UE_MODE.ADD_BROADCAST,
+            0,  # data_type
+            vector_uram_start_addr,
+            0,  # uram_b_start_addr (not used for broadcast)
+            row_size,
+            0,  # dma_start_addr
+            0,  # dma_length
+            0,  # output_size
+            self._inst_id,
+            fmax_context_addr=fmax_context_addr
+        )
+        self._inst_id += 1
 
     def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> None:
         """
@@ -2528,7 +2635,7 @@ class UnifiedEngine:
 
             output_dram_offset += chunk_rows * row_bytes
             row_idx += chunk_rows
-    
+
         # No FLOPS for this operation
 
     def patching_core(self, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
@@ -2630,6 +2737,8 @@ class UnifiedEngine:
                             0,  # broadcast_mode
                             0,  # clear_max_en
                             1,  # stride_z
+                            0,  # lalu_a
+                            0,  # lalu_b
                             LALU_MODE.BYPASS.value,
                             0,  # scalar
                             0,  # uram_bram
@@ -2853,7 +2962,7 @@ class UnifiedEngine:
             #print(f"softmax rows: {m_take * N} elements vs {URAM_FULL_ELEMENTS} elements")
             # DEBUG to get seq_len x seq_len sm(QK^T) results are copied to DRAM
             # start_dram_address_of_partial_row_complete_matrix = SM_OUTPUT_DRAM_ADDR + i * N * bytes_per_element #  make only FMAX_CONTEXT_SIZE x seq_len sm(QK^T) results are copied to DRAM
-            
+
             # if m_take * N is greater than the space available in URAM_A, copy the matrix to DRAM
             max_m_take = min((URAM_FULL_ELEMENTS - UE_VECTOR_SIZE) // N, UE_FMAX_CONTEXT_SIZE) # worst case scenario, leave one row for output
 
@@ -2928,7 +3037,7 @@ class UnifiedEngine:
                                                         stride_jump_bytes=head_dim * bytes_per_element)
 
         # Total Theoretical FLOPS: seq_len * head_dim + 2 * seq_len * head_dim * seq_len + seq_len * seq_len + seq_len * seq_len * 5 + 2 * seq_len * seq_len * head_dim
-        total_flops = seq_len * head_dim # q_scale 
+        total_flops = seq_len * head_dim # q_scale
         total_flops += 2 * seq_len * head_dim * seq_len # Q @ K^T
         if bias_enable:
             total_flops += seq_len * seq_len # bias
@@ -2969,12 +3078,20 @@ class UnifiedEngine:
         assert sum([gelu_enable, silu_enable, sigmoid_enable, relu_enable]) <= 1, "only one of gelu_enable, silu_enable, sigmoid_enable, relu_enable can be True"
 
         lalu_mode = LALU_MODE.BYPASS
+        lalu_a = 0
+        lalu_b = 0
         if gelu_enable:
-            lalu_mode = LALU_MODE.GELU
+            lalu_mode = LALU_MODE.ACT
+            lalu_a = LALU_ACT_GELU_A
+            lalu_b = LALU_ACT_GELU_B
         elif silu_enable:
-            lalu_mode = LALU_MODE.SILU
+            lalu_mode = LALU_MODE.ACT
+            lalu_a = LALU_ACT_SILU_A
+            lalu_b = LALU_ACT_SILU_B
         elif sigmoid_enable:
-            lalu_mode = LALU_MODE.SIGMOID
+            lalu_mode = LALU_MODE.ACT_NO_X
+            lalu_a = LALU_ACT_SIGMOID_A
+            lalu_b = LALU_ACT_SIGMOID_B
         elif relu_enable:
             lalu_mode = LALU_MODE.RELU
 
@@ -2990,7 +3107,7 @@ class UnifiedEngine:
 
         print(f"M_chunk={M_chunk}, N_chunk={N_chunk}")
 
-        
+
         max_clear_en = 1
         for M_chunk_idx, M_chunk_size in self.chunk_ranges(M, M_chunk):
             # transfer M_chunk_size x K elements to URAM_A
@@ -3019,7 +3136,7 @@ class UnifiedEngine:
                         dma_offset = N_chunk_idx * K
                     else:
                         assert False, f"data_type={data_type} is not supported"
- 
+
                     self.start_queue_for_dot_product_operation(max_clear_en=max_clear_en,
                                                                 fmax_context_addr=0,
                                                                 vector_sram_start_addr=0x00000 + vector_idx * K * bytes_per_element,
@@ -3028,7 +3145,9 @@ class UnifiedEngine:
                                                                 N=N_take_size,
                                                                 dma_start_addr=B_DRAM_ADDR + dma_offset,
                                                                 bias_enable=bias_enable,
-                                                                lalu_mode=lalu_mode)
+                                                                lalu_mode=lalu_mode,
+                                                                lalu_a=lalu_a,
+                                                                lalu_b=lalu_b)
                     max_clear_en = 0
 
                 self.sram_to_accelerator_memory(sram_address=0x80000,
@@ -3080,270 +3199,250 @@ class UnifiedEngine:
     def parse_instruction(self, inst: Instructions, inst_index: int, inst_addr: int) -> None:
         """
         Parse and print an instruction for human-readable display
-        
+
         Args:
             inst: Instructions object
             inst_index: Instruction index in capture buffer
             inst_addr: Physical DRAM address of instruction
         """
         w = inst.words
-        inst_type = (w[7] >> 29) & 0x7
-        
+
         # Print instruction header with hex dump
         hex_str = ' '.join([f"{w[j]:08X}" for j in range(8)])
         print(f"  [{inst_index:4d}] @ {hex(inst_addr):10s} = {hex_str}")
-        
-        # Parse and format instruction details
-        if inst_type == 0 or inst_type == INSTRUCTION_REG_REWRITE:
-            # UE op (Unified Engine operation)
-            mode_sel = (w[3] >> 4) & 0xF
-            
+
+        inst_type = _inst_desc_bits(w, 8, 11)
+        transaction_id = _inst_desc_bits(w, 0, 7)
+
+        # C ue_memcpy REG_REWRITE path: memset then only w[0], w[1] (no UE payload in w[2:])
+        if (inst_type == INSTRUCTION_REG_REWRITE and w[2] == 0 and w[3] == 0
+                and w[4] == 0 and w[5] == 0 and w[6] == 0 and w[7] == 0):
+            general_reg_src = _inst_desc_bits(w, 36, 39)
+            result = (f"UE_MEMCPY_FROM_DRAM (REG_REWRITE, src_reg={general_reg_src})\n"
+                      f"    inst_id: {transaction_id}")
+            for line in result.split('\n'):
+                print(f"        {line}")
+            return
+
+        # UE engine ops: inst_type 0, or REG_REWRITE with full tail (start_queue / memcpy overwrites w[0..1] only)
+        if inst_type in (0, INSTRUCTION_REG_REWRITE):
+            mode_sel = _inst_desc_bits(w, 172, 175)
+            reg_rewrite = inst_type == INSTRUCTION_REG_REWRITE
+            general_reg_src = _inst_desc_bits(w, 36, 39) if reg_rewrite else 0
+
             if mode_sel == 0xF:
-                # memcpy from dram
-                # Word 0: ISA control fields (if REG_REWRITE) or 0
-                inst_type = (w[7] >> 29) & 0x7
-                if inst_type == INSTRUCTION_REG_REWRITE:
-                    general_reg_src = (w[0] >> 4) & 0xF
-                else:
-                    general_reg_src = 0
-                # Word 1: unified DMA address (dram_src_addr)
-                dram_src_addr = w[1]
-                memcpy_length = w[2]
-                stride_bytes_per_chunk = (w[3] >> 8) & 0xFFFF
-                uram_select = (w[5] >> 9) & 0x1
-                dr_mb_wb_mode = (w[5] >> 10) & 0x3
-                uram_memcpy_dst_addr = (w[5] >> 12) & 0xFFF
-                bram_uram_select = (w[5] >> 24) & 0x3
-                stride_jump_bytes_low = (w[5] >> 29) & 0x7
-                stride_jump_bytes_high = w[6] & 0x3FFFF
-                stride_jump_bytes = stride_jump_bytes_low | (stride_jump_bytes_high << 3)
-                stride_en = (w[7] >> 14) & 0x1
-                inst_id = (w[7] >> 23) & 0x3F
-                
-                # Parse memcpy_type
+                dram_src_addr = _inst_desc_bits(w, 32, 63)
+                memcpy_length = _inst_desc_bits(w, 64, 95)
+                uram_select = _inst_desc_bits(w, 176, 176)
+                bram_uram_select = _inst_desc_bits(w, 232, 233)
+                uram_memcpy_dst_addr = _inst_desc_bits(w, 234, 245)
+                stride_en = _inst_desc_bits(w, 222, 222)
+                lalu_scalar = _inst_desc_bits(w, 186, 206)
+                output_size = _inst_desc_bits(w, 156, 171)
+
                 memcpy_type_name = MEMCPY_TYPE(bram_uram_select).name if bram_uram_select in [e.value for e in MEMCPY_TYPE] else f"UNKNOWN({bram_uram_select})"
                 memcpy_type_str = f"{memcpy_type_name}"
                 if bram_uram_select == MEMCPY_TYPE.URAM.value:
-                    # For URAM, also show URAM_A or URAM_B
                     uram_section_name = URAM_SECTION(uram_select).name if uram_select in [e.value for e in URAM_SECTION] else f"UNKNOWN({uram_select})"
                     memcpy_type_str += f" ({uram_section_name})"
-                
+
                 result = f"UE_MEMCPY_FROM_DRAM"
-                if inst_type == INSTRUCTION_REG_REWRITE:
-                        result += f" (addr reset from general register {general_reg_src})"
+                if reg_rewrite:
+                    result += f" (addr reset from general register {general_reg_src})"
                 result += f"\n    dram_src_addr: {hex(dram_src_addr)}"
                 result += f"\n    memcpy_length: {memcpy_length} bytes"
                 result += f"\n    uram_dst_addr: {uram_memcpy_dst_addr}"
                 result += f"\n    memcpy_type: {memcpy_type_str}"
                 if stride_en:
-                    result += f"\n    stride_bytes_per_chunk: {stride_bytes_per_chunk}"
-                    result += f"\n    stride_jump_bytes: {stride_jump_bytes}"
-                result += f"\n    inst_id: {inst_id}"
-                # Print formatted instruction details
+                    sj = lalu_scalar
+                    result += f"\n    stride_bytes_per_chunk: {output_size}"
+                    result += f"\n    stride_jump_bytes: {sj}"
+                result += f"\n    inst_id: {transaction_id}"
                 for line in result.split('\n'):
                     print(f"        {line}")
                 return
+
+            mode = mode_sel
+            dma_start = _inst_desc_bits(w, 179, 179)
+            uram_start = _inst_desc_bits(w, 180, 180)
+            data_type = _inst_desc_bits(w, 181, 182)
+            output_size = _inst_desc_bits(w, 156, 171)
+            uram_length = _inst_desc_bits(w, 96, 107)
+            uram_length_z = _inst_desc_bits(w, 108, 119)
+            uram_a_start_addr = _inst_desc_bits(w, 120, 131)
+            uram_b_start_addr = _inst_desc_bits(w, 132, 143)
+            uram_wb_addr = _inst_desc_bits(w, 144, 155)
+            uram_section = _inst_desc_bits(w, 176, 176)
+            uram_write_src = _inst_desc_bits(w, 177, 178)
+            uram_dst_addr = _inst_desc_bits(w, 234, 245)
+            uram_bram = _inst_desc_bits(w, 232, 233)
+            lalu_mode = _inst_desc_bits(w, 183, 185)
+            scalar = _inst_desc_bits(w, 186, 206)
+            wb_padding_control = _inst_desc_bits(w, 207, 207)
+            max_clear_en = _inst_desc_bits(w, 208, 208)
+            bias_adder_en = _inst_desc_bits(w, 209, 209)
+            stride_z = _inst_desc_bits(w, 210, 221)
+            stride_en = _inst_desc_bits(w, 222, 222)
+            broadcast_mode = _inst_desc_bits(w, 229, 230)
+            dram_addr = _inst_desc_bits(w, 32, 63)
+            dma_length = _inst_desc_bits(w, 64, 95)
+            uram_bram_wb_start = _inst_desc_bits(w, 246, 246)
+
+            if mode == UE_MODE.URAM_DRAM_WRITEBACK.value:
+                memcpy_type_name = MEMCPY_TYPE(uram_bram).name if uram_bram in [e.value for e in MEMCPY_TYPE] else f"UNKNOWN({uram_bram})"
+                memcpy_type_str = f"{memcpy_type_name}"
+                if uram_bram == MEMCPY_TYPE.URAM.value:
+                    uram_section_name = URAM_SECTION(uram_section).name if uram_section in [e.value for e in URAM_SECTION] else f"UNKNOWN({uram_section})"
+                    memcpy_type_str += f" ({uram_section_name})"
+
+                result = f"UE_MEMCPY_TO_DRAM"
+                if reg_rewrite:
+                    result += f" (addr from general register {general_reg_src})"
+                result += f"\n    uram_src_addr: {uram_a_start_addr}"
+                result += f"\n    dram_dst_addr: {hex(dram_addr)}"
+                result += f"\n    memcpy_length: {uram_length} uram rows ({uram_length * 64 * 2} bytes)"
+                result += f"\n    memcpy_type: {memcpy_type_str}"
+                result += f"\n    uram_bram_wb_start: {uram_bram_wb_start}"
+                if stride_en:
+                    result += f"\n    stride_en: enabled"
+                result += f"\n    inst_id: {transaction_id}"
+                for line in result.split('\n'):
+                    print(f"        {line}")
+                return
+
+            mode_name = UE_MODE(mode).name if mode in [e.value for e in UE_MODE] else f"UNKNOWN({mode})"
+            result = f"UE_COMPUTE ({mode_name})"
+            result += f"\n    uram_a_start: {uram_a_start_addr}, uram_b_start: {uram_b_start_addr}"
+            result += f"\n    uram_length: {uram_length}, uram_wb_addr: {uram_wb_addr}"
+            result += f"\n    output_size: {output_size}"
+            data_type_name = TYPE(data_type).name if data_type in [e.value for e in TYPE] else f"UNKNOWN({data_type})"
+            result += f"\n    data_type: {data_type_name}"
+            if uram_start:
+                result += f"\n    uram_start: enabled, uram_length: {uram_length}, uram_length_z: {uram_length_z}"
+            if dma_start:
+                result += f"\n    dma_start: enabled, dma_start_addr: {hex(dram_addr)}"
+                if reg_rewrite:
+                    result += f" (from general register {general_reg_src})"
+                result += f", dma_length: {dma_length}"
+            if uram_bram == MEMCPY_TYPE.URAM.value:
+                uram_section_name = URAM_SECTION(uram_section).name if uram_section in [e.value for e in URAM_SECTION] else f"UNKNOWN({uram_section})"
+                result += f"\n    uram_type: URAM ({uram_section_name})"
             else:
-                # Check if it's memcpy to dram or compute engine
-                mode = (w[3] >> 4) & 0xF
-                dma_start = w[3] & 0x1
-                uram_start = (w[3] >> 1) & 0x1
-                data_type = (w[3] >> 2) & 0x3
-                output_size = (w[3] >> 8) & 0xFFFF
-                uram_length = ((w[3] >> 24) & 0xFF) | (((w[4] >> 0) & 0xF) << 8)
-                uram_a_start_addr = (w[4] >> 4) & 0xFFF
-                uram_b_start_addr = (w[4] >> 16) & 0xFFF
-                uram_wb_addr = ((w[4] >> 28) & 0xF) | (((w[5] >> 0) & 0xFF) << 4)
-                dram_to_uram_cpy_start = (w[5] >> 8) & 0x1
-                uram_section = (w[5] >> 9) & 0x1
-                uram_write_src = (w[5] >> 10) & 0x3
-                uram_dst_addr = (w[5] >> 12) & 0xFFF
-                uram_bram = (w[5] >> 24) & 0x3
-                lalu_mode = (w[5] >> 26) & 0x7
-                scalar_low = (w[5] >> 29) & 0x7
-                scalar_high = (w[6] >> 0) & 0x3FFFF
-                scalar = scalar_low | (scalar_high << 3)
-                uram_length_z = (w[6] >> 18) & 0xFFF
-                uram_bram_wb_start = (w[6] >> 30) & 0x1
-                wb_padding_control = (w[6] >> 31) & 0x1
-                max_clear_en = w[7] & 0x1
-                bias_adder_en = (w[7] >> 1) & 0x1
-                stride_z = (w[7] >> 2) & 0xFFF
-                stride_en = (w[7] >> 14) & 0x1
-                broadcast_mode = (w[7] >> 21) & 0x3
-                inst_id = (w[7] >> 23) & 0x3F
-                # Word 0: ISA control fields (if REG_REWRITE) or 0
-                inst_type = (w[7] >> 29) & 0x7
-                if inst_type == INSTRUCTION_REG_REWRITE:
-                    general_reg_src = (w[0] >> 4) & 0xF
-                else:
-                    general_reg_src = 0
-                # Word 1: unified DMA address
-                dram_addr = w[1]
-                dma_length = w[2]
-                
-                if mode == UE_MODE.URAM_DRAM_WRITEBACK.value:
-                    # memcpy to dram
-                    # Parse memcpy_type
-                    memcpy_type_name = MEMCPY_TYPE(uram_bram).name if uram_bram in [e.value for e in MEMCPY_TYPE] else f"UNKNOWN({uram_bram})"
-                    memcpy_type_str = f"{memcpy_type_name}"
-                    if uram_bram == MEMCPY_TYPE.URAM.value:
-                        # For URAM, also show URAM_A or URAM_B
-                        uram_section_name = URAM_SECTION(uram_section).name if uram_section in [e.value for e in URAM_SECTION] else f"UNKNOWN({uram_section})"
-                        memcpy_type_str += f" ({uram_section_name})"
-                    
-                    result = f"UE_MEMCPY_TO_DRAM"
-                    if inst_type == INSTRUCTION_REG_REWRITE:
-                        result += f" (addr from general register {general_reg_src})"
-                    result += f"\n    uram_src_addr: {uram_a_start_addr}"
-                    result += f"\n    dram_dst_addr: {hex(dram_addr)}"
-                    result += f"\n    memcpy_length: {uram_length} uram rows ({uram_length * 64 * 2} bytes)"
-                    result += f"\n    memcpy_type: {memcpy_type_str}"
-                    result += f"\n    uram_bram_wb_start: {uram_bram_wb_start}"
-                    if stride_en:
-                        result += f"\n    stride_en: enabled"
-                    result += f"\n    inst_id: {inst_id}"
-                    # Print formatted instruction details
-                    for line in result.split('\n'):
-                        print(f"        {line}")
-                    return
-                else:
-                    # compute engine
-                    mode_name = UE_MODE(mode).name if mode in [e.value for e in UE_MODE] else f"UNKNOWN({mode})"
-                    result = f"UE_COMPUTE ({mode_name})"
-                    result += f"\n    uram_a_start: {uram_a_start_addr}, uram_b_start: {uram_b_start_addr}"
-                    result += f"\n    uram_length: {uram_length}, uram_wb_addr: {uram_wb_addr}"
-                    result += f"\n    output_size: {output_size}"
-                    
-                    # data_type
-                    data_type_name = TYPE(data_type).name if data_type in [e.value for e in TYPE] else f"UNKNOWN({data_type})"
-                    result += f"\n    data_type: {data_type_name}"
-                    
-                    # uram_start or dram_start
-                    if uram_start:
-                        result += f"\n    uram_start: enabled, uram_length: {uram_length}, uram_length_z: {uram_length_z}"
-                    if dma_start:
-                        result += f"\n    dma_start: enabled, dma_start_addr: {hex(dram_addr)}"
-                        if inst_type == INSTRUCTION_REG_REWRITE:
-                            result += f" (from general register {general_reg_src})"
-                        result += f", dma_length: {dma_length}"
-                    
-                    # uram_type based on uram_bram and uram_section
-                    if uram_bram == MEMCPY_TYPE.URAM.value:
-                        uram_section_name = URAM_SECTION(uram_section).name if uram_section in [e.value for e in URAM_SECTION] else f"UNKNOWN({uram_section})"
-                        result += f"\n    uram_type: URAM ({uram_section_name})"
-                    else:
-                        uram_type_name = MEMCPY_TYPE(uram_bram).name if uram_bram in [e.value for e in MEMCPY_TYPE] else f"UNKNOWN({uram_bram})"
-                        result += f"\n    uram_type: {uram_type_name}"
-                    
-                    # writeback enabled (uram_write_src = 0) otherwise writeback disabled
-                    if uram_write_src == URAM_WRITE_SRC.URAM_WRITE_BACK.value:
-                        result += f"\n    writeback: enabled, uram_dst_addr: {uram_dst_addr}"
-                    else:
-                        writeback_name = URAM_WRITE_SRC(uram_write_src).name if uram_write_src in [e.value for e in URAM_WRITE_SRC] else f"UNKNOWN({uram_write_src})"
-                        result += f"\n    writeback: disabled ({writeback_name})"
-                    
-                    # wb_padding_select
-                    result += f"\n    wb_padding_select: {wb_padding_control}"
-                    
-                    if bias_adder_en:
-                        result += f"\n    bias_adder: enabled"
-                    if max_clear_en:
-                        result += f"\n    max_clear: enabled"
-                    if lalu_mode != 0:
-                        lalu_mode_name = LALU_MODE(lalu_mode).name if lalu_mode in [e.value for e in LALU_MODE] else f"UNKNOWN({lalu_mode})"
-                        result += f"\n    lalu_mode: {lalu_mode_name}, scalar: {hex(scalar)}"
-                    if broadcast_mode != 0:
-                        broadcast_mode_name = BROADCAST_MODE(broadcast_mode).name if broadcast_mode in [e.value for e in BROADCAST_MODE] else f"UNKNOWN({broadcast_mode})"
-                        result += f"\n    broadcast_mode: {broadcast_mode_name}"
-                    result += f"\n    inst_id: {inst_id}"
-                    # Print formatted instruction details
-                    for line in result.split('\n'):
-                        print(f"        {line}")
-                    return
-        else:
-            # ISA instruction
-            # Word 0 (bits 0-31): ISA control fields in [15:0]
-            isa_mode = w[0] & 0xF
-            src_reg_idx = (w[0] >> 4) & 0xF
-            dst_reg_idx = (w[0] >> 8) & 0xF
-            rst_reg_idx = (w[0] >> 12) & 0xF
-            # Word 1 (bits 32-63): immediate_value (moved from [31:0] to [63:32])
-            immediate_value = w[1]
-            
-            if inst_type == INSTRUCTION_HALT:
-                result = f"ISA_HALT"
-                for line in result.split('\n'):
-                    print(f"        {line}")
-                return
-            elif inst_type == INSTRUCTION_JUMP:
-                jump_mode = isa_mode
-                reg_id = src_reg_idx
-                jump_mode_name = ["ABSOLUTE", "RELATIVE", "JNZ"][jump_mode] if jump_mode < 3 else f"UNKNOWN({jump_mode})"
-                result = f"ISA_JUMP ({jump_mode_name})"
+                uram_type_name = MEMCPY_TYPE(uram_bram).name if uram_bram in [e.value for e in MEMCPY_TYPE] else f"UNKNOWN({uram_bram})"
+                result += f"\n    uram_type: {uram_type_name}"
+            if uram_write_src == URAM_WRITE_SRC.URAM_WRITE_BACK.value:
+                result += f"\n    writeback: enabled, uram_dst_addr: {uram_dst_addr}"
+            else:
+                writeback_name = URAM_WRITE_SRC(uram_write_src).name if uram_write_src in [e.value for e in URAM_WRITE_SRC] else f"UNKNOWN({uram_write_src})"
+                result += f"\n    writeback: disabled ({writeback_name})"
+            result += f"\n    wb_padding_select: {wb_padding_control}"
+            if bias_adder_en:
+                result += f"\n    bias_adder: enabled"
+            if max_clear_en:
+                result += f"\n    max_clear: enabled"
+            if lalu_mode != 0:
+                lalu_mode_name = LALU_MODE(lalu_mode).name if lalu_mode in [e.value for e in LALU_MODE] else f"UNKNOWN({lalu_mode})"
+                result += f"\n    lalu_mode: {lalu_mode_name}, scalar: {hex(scalar)}"
+            if broadcast_mode != 0:
+                broadcast_mode_name = BROADCAST_MODE(broadcast_mode).name if broadcast_mode in [e.value for e in BROADCAST_MODE] else f"UNKNOWN({broadcast_mode})"
+                result += f"\n    broadcast_mode: {broadcast_mode_name}"
+            result += f"\n    uram_row_stride_z: {stride_z}, stride_en: {stride_en}"
+            result += f"\n    inst_id: {transaction_id}"
+            for line in result.split('\n'):
+                print(f"        {line}")
+            return
+
+        # ISA (non-UE): [79:32] micro-op fields
+        isa_mode = _inst_desc_bits(w, 32, 35)
+        src_reg_idx = _inst_desc_bits(w, 36, 39)
+        dst_reg_idx = _inst_desc_bits(w, 40, 43)
+        rst_reg_idx = _inst_desc_bits(w, 44, 47)
+        immediate_value = _inst_desc_bits(w, 48, 79)
+
+        if inst_type == INSTRUCTION_HALT:
+            result = f"ISA_HALT"
+            result += f"\n    transaction_id: {transaction_id}"
+            for line in result.split('\n'):
+                print(f"        {line}")
+            return
+        if inst_type == INSTRUCTION_JUMP:
+            jump_mode = isa_mode
+            reg_id = src_reg_idx
+            jump_mode_names = {
+                JUMP_MODE_ABSOLUTE: "ABSOLUTE",
+                JUMP_MODE_JNZ: "JNZ",
+                JUMP_MODE_JZ: "JZ",
+                JUMP_MODE_RELATIVE: "RELATIVE",
+                JUMP_MODE_RELA_JNZ: "RELA_JNZ",
+                JUMP_MODE_RELA_JZ: "RELA_JZ",
+            }
+            jump_mode_name = jump_mode_names.get(jump_mode, f"UNKNOWN({jump_mode})")
+            result = f"ISA_JUMP ({jump_mode_name})"
+            if jump_mode in (JUMP_MODE_RELATIVE, JUMP_MODE_RELA_JNZ, JUMP_MODE_RELA_JZ):
+                result += f"\n    relative_back: {immediate_value} inst words"
+            else:
                 result += f"\n    target_addr: {hex(immediate_value)}"
-                if jump_mode == 2:  # JNZ
-                    result += f"\n    reg_id: {reg_id}"
-                for line in result.split('\n'):
-                    print(f"        {line}")
-                return
-            elif inst_type == INSTRUCTION_ADD:
-                isa_mode_names = {
-                    INST_ADD_INC: "INC",
-                    INST_ADD_DEC: "DEC",
-                    INST_ADD_REG: "REG",
-                    INST_ADD_IMM: "IMM",
-                    INST_ADD_SET: "SET"
-                }
-                mode_name = isa_mode_names.get(isa_mode, f"UNKNOWN({isa_mode})")
-                result = f"ISA_ADD ({mode_name})"
-                if isa_mode == INST_ADD_SET:  # SET
-                    result += f"\n    dst_reg: {dst_reg_idx}, value: {hex(immediate_value)}"
-                elif isa_mode == INST_ADD_INC:  # INC
-                    result += f"\n    reg: {dst_reg_idx}"
-                elif isa_mode == INST_ADD_DEC:  # DEC
-                    result += f"\n    reg: {dst_reg_idx}"
-                elif isa_mode == INST_ADD_IMM:  # IMM
-                    result += f"\n    reg: {dst_reg_idx}, immediate: {hex(immediate_value)}"
-                elif isa_mode == INST_ADD_REG:  # REG
-                    result += f"\n    dst_reg: {dst_reg_idx}, src_reg: {src_reg_idx}, rst_reg: {rst_reg_idx}"
-                for line in result.split('\n'):
-                    print(f"        {line}")
-                return
-            elif inst_type == INSTRUCTION_FLAG:
-                flag_mode = isa_mode
-                target_engine = src_reg_idx & 0x7
-                flag_mode_names = {
-                    FLAG_MODE_SET: "SET",
-                    FLAG_MODE_CLEAR: "CLEAR",
-                    FLAG_MODE_CHECK: "CHECK",
-                }
-                mode_name = flag_mode_names.get(flag_mode, f"UNKNOWN({flag_mode})")
-                result = f"ISA_FLAG ({mode_name})"
-                if flag_mode == FLAG_MODE_CHECK:
-                    result += f"\n    target_engine: {target_engine}"
-                for line in result.split('\n'):
-                    print(f"        {line}")
-                return
-            else:
-                result = f"ISA_UNKNOWN (type=0x{inst_type:X})"
-                for line in result.split('\n'):
-                    print(f"        {line}")
-                return
+            result += f"\n    transaction_id: {transaction_id}"
+            if jump_mode in (JUMP_MODE_JNZ, JUMP_MODE_JZ, JUMP_MODE_RELA_JNZ, JUMP_MODE_RELA_JZ):
+                result += f"\n    reg_id: {reg_id}"
+            for line in result.split('\n'):
+                print(f"        {line}")
+            return
+        if inst_type == INSTRUCTION_ADD:
+            isa_mode_names = {
+                INST_ADD_INC: "INC",
+                INST_ADD_DEC: "DEC",
+                INST_ADD_REG: "REG",
+                INST_ADD_IMM: "IMM",
+                INST_ADD_SET: "SET"
+            }
+            mode_name = isa_mode_names.get(isa_mode, f"UNKNOWN({isa_mode})")
+            result = f"ISA_ADD ({mode_name})"
+            result += f"\n    transaction_id: {transaction_id}"
+            if isa_mode == INST_ADD_SET:
+                result += f"\n    dst_reg: {dst_reg_idx}, value: {hex(immediate_value)}"
+            elif isa_mode == INST_ADD_INC:
+                result += f"\n    reg: {dst_reg_idx}"
+            elif isa_mode == INST_ADD_DEC:
+                result += f"\n    reg: {dst_reg_idx}"
+            elif isa_mode == INST_ADD_IMM:
+                result += f"\n    reg: {dst_reg_idx}, immediate: {hex(immediate_value)}"
+            elif isa_mode == INST_ADD_REG:
+                result += f"\n    dst_reg: {dst_reg_idx}, src_reg: {src_reg_idx}, rst_reg: {rst_reg_idx}"
+            for line in result.split('\n'):
+                print(f"        {line}")
+            return
+        if inst_type == INSTRUCTION_FLAG:
+            flag_mode = isa_mode
+            target_engine = src_reg_idx & 0x7
+            flag_mode_names = {
+                FLAG_MODE_SET: "SET",
+                FLAG_MODE_CLEAR: "CLEAR",
+                FLAG_MODE_CHECK: "CHECK",
+            }
+            mode_name = flag_mode_names.get(flag_mode, f"UNKNOWN({flag_mode})")
+            result = f"ISA_FLAG ({mode_name})"
+            result += f"\n    transaction_id: {transaction_id}"
+            if flag_mode == FLAG_MODE_CHECK:
+                result += f"\n    target_engine: {target_engine}"
+            for line in result.split('\n'):
+                print(f"        {line}")
+            return
+
+        result = f"ISA_UNKNOWN (type=0x{inst_type:X})"
+        result += f"\n    transaction_id: {transaction_id}"
+        for line in result.split('\n'):
+            print(f"        {line}")
 
     def generate_instruction(self, inst_type: int, immediate_value: int = 0,
                              isa_mode: int = 0, src_reg_idx: int = 0,
-                             dst_reg_idx: int = 0, rst_reg_idx: int = 0):
+                             dst_reg_idx: int = 0, rst_reg_idx: int = 0,
+                             transaction_id: int = 0):
         """
-        Generate an instruction and add to capture buffer (base function matching C code)
+        Generate an instruction and add to capture buffer (matches andromeda.c generate_instruction).
 
-        Args:
-            inst_type: Instruction type (INSTRUCTION_HALT, INSTRUCTION_JUMP, INSTRUCTION_ADD, etc.)
-            immediate_value: 32-bit immediate value (for JUMP: target_addr, for ADD: immediate value)
-            isa_mode: ISA mode (4 bits) - for ADD: INST_ADD_INC, INST_ADD_DEC, etc.
-            src_reg_idx: Source register index (4 bits)
-            dst_reg_idx: Destination register index (4 bits)
-            rst_reg_idx: Reset register index (4 bits)
+        Header [15:0]: [7:0] transaction_id; [11:8] inst_type; [15:12] reserved.
+        ISA [79:32]: [35:32] isa_mode; [39:36] src; [43:40] dst; [47:44] rst; [79:48] immediate.
         """
         # capture_buffer is initialized to [] in start_capture(); treat None as uninitialized
         if self.capture_buffer is None:
@@ -3364,9 +3463,6 @@ class UnifiedEngine:
             w[i] = 0
 
         if inst_type == INSTRUCTION_FLAG:
-            # axi_top.sv FLAG format:
-            #   bits [3:0]  : flag_mode
-            #   bits [6:4]  : target_engine_idx (3 bits)
             if isa_mode not in (FLAG_MODE_SET, FLAG_MODE_CLEAR, FLAG_MODE_CHECK):
                 print(f"ERROR: invalid flag_mode={isa_mode}, expected one of "
                       f"{FLAG_MODE_SET}/{FLAG_MODE_CLEAR}/{FLAG_MODE_CHECK}")
@@ -3381,74 +3477,65 @@ class UnifiedEngine:
                       "immediate_value/dst_reg_idx/rst_reg_idx must be 0")
                 assert False
                 return
-            w[0] = ((isa_mode & 0xF) << 0) | ((src_reg_idx & 0x7) << 4)
-            w[1] = 0
-        else:
-            # Word 0 (bits 0-31): ISA control fields in [15:0], reserved in [31:16]
-            # bits [3:0]: isa_mode
-            # bits [7:4]: src_reg_idx
-            # bits [11:8]: dst_reg_idx
-            # bits [15:12]: rst_reg_idx
-            # bits [31:16]: reserved
-            w[0] = ((isa_mode & 0xF) << 0) | \
-                   ((src_reg_idx & 0xF) << 4) | \
-                   ((dst_reg_idx & 0xF) << 8) | \
-                   ((rst_reg_idx & 0xF) << 12)
 
-            # Word 1 (bits 32-63): immediate_value (moved from [31:0] to [63:32])
-            # For JUMP: target_addr
-            # For ADD: immediate value
-            # For HALT: set to 0
-            w[1] = immediate_value
-
-        # Word 7 (bits 224-255): inst_type at bits 253-255 (bits 29-31 of word 7)
-        w[7] = (inst_type & 0x7) << 29
+        w[0] = ((transaction_id & 0xFF) << 0) | (((inst_type & 0xF) << 8))
+        w[1] = (((isa_mode & 0xF) << 0) |
+                ((src_reg_idx & 0xF) << 4) |
+                ((dst_reg_idx & 0xF) << 8) |
+                ((rst_reg_idx & 0xF) << 12) |
+                (((immediate_value & 0xFFFF) << 16)))
+        w[2] = ((immediate_value >> 16) & 0xFFFF)
 
         self.capture_buffer.append(inst)
         self.capture_count += 1
 
         # print(f"generate_instruction(inst_type=0x{inst_type:X}, imm=0x{immediate_value:X}, isa={isa_mode}, src={src_reg_idx}, dst={dst_reg_idx}, rst={rst_reg_idx}): wrote to buffer[{self.capture_count-1}]")
 
-    def generate_instruction_halt(self):
+    def generate_instruction_halt(self, transaction_id: int = 0):
         """Generate a HALT instruction"""
-        self.generate_instruction(INSTRUCTION_HALT, 0, 0, 0, 0, 0)
+        self.generate_instruction(INSTRUCTION_HALT, 0, 0, 0, 0, 0, transaction_id)
 
-    def generate_instruction_jump(self, target_instruction_addr: int, jump_mode: int, reg_id: int = 0):
+    def generate_instruction_jump(self, target_instruction_addr: int, jump_mode: int, reg_id: int = 0,
+                                   transaction_id: int = 0):
         """
         Generate a JUMP instruction
 
         Args:
             target_instruction_addr: 32-bit target address for jump
-            jump_mode: JUMP_MODE_ABSOLUTE, JUMP_MODE_RELATIVE, or JUMP_MODE_JNZ
-            reg_id: Register ID for JNZ mode (4 bits) - only used when jump_mode == JUMP_MODE_JNZ
+            jump_mode: JUMP_MODE_* (absolute/JNZ/JZ use DRAM address in immediate; RELATIVE/RELA_* use backward word offset in immediate[9:0])
+            reg_id: Register index for conditional jump modes (4 bits)
+            transaction_id: 8-bit ID in inst_descriptor[7:0]
         """
-        self.generate_instruction(INSTRUCTION_JUMP, target_instruction_addr, jump_mode, reg_id, 0, 0)
+        self.generate_instruction(INSTRUCTION_JUMP, target_instruction_addr, jump_mode, reg_id, 0, 0, transaction_id)
 
-    def generate_instruction_add_inc(self, reg_idx: int):
+    def generate_instruction_add_inc(self, reg_idx: int, transaction_id: int = 0):
         """
         Generate an ADD instruction to increment a register
 
         Args:
             reg_idx: Register index to increment (must not be 0)
+            transaction_id: 8-bit ID in inst_descriptor[7:0]
         """
         if reg_idx == 0:
             print("ERROR: INSTRUCTION_ADD overwriting reg_idx 0 (zero reg) not allowed")
             return
-        self.generate_instruction(INSTRUCTION_ADD, 0, INST_ADD_INC, reg_idx, reg_idx, 0)
+        self.generate_instruction(INSTRUCTION_ADD, 0, INST_ADD_INC, reg_idx, reg_idx, 0, transaction_id)
 
-    def generate_instruction_add_dec(self, reg_idx: int):
+    def generate_instruction_add_dec(self, reg_idx: int, transaction_id: int = 0):
         """
         Generate an ADD instruction to decrement a register
 
         Args:
             reg_idx: Register index to decrement (must not be 0)
+            transaction_id: 8-bit ID in inst_descriptor[7:0]
         """
         if reg_idx == 0:
             print("ERROR: INSTRUCTION_ADD overwriting reg_idx 0 (zero reg) not allowed")
             return
-        self.generate_instruction(INSTRUCTION_ADD, 0, INST_ADD_DEC, reg_idx, reg_idx, 0)
+        self.generate_instruction(INSTRUCTION_ADD, 0, INST_ADD_DEC, reg_idx, reg_idx, 0, transaction_id)
 
-    def generate_instruction_add_reg(self, dst_reg_idx: int, src_reg_idx: int, rst_reg_idx: int):
+    def generate_instruction_add_reg(self, dst_reg_idx: int, src_reg_idx: int, rst_reg_idx: int,
+                                      transaction_id: int = 0):
         """
         Generate an ADD instruction to add two registers
 
@@ -3456,13 +3543,15 @@ class UnifiedEngine:
             dst_reg_idx: Destination register index (must not be 0)
             src_reg_idx: Source register index
             rst_reg_idx: Reset register index
+            transaction_id: 8-bit ID in inst_descriptor[7:0]
         """
         if dst_reg_idx == 0:
             print("ERROR: INSTRUCTION_ADD overwriting reg_idx 0 (zero reg) not allowed")
             return
-        self.generate_instruction(INSTRUCTION_ADD, 0, INST_ADD_REG, src_reg_idx, dst_reg_idx, rst_reg_idx)
+        self.generate_instruction(INSTRUCTION_ADD, 0, INST_ADD_REG, src_reg_idx, dst_reg_idx, rst_reg_idx, transaction_id)
 
-    def generate_instruction_add_imm(self, src_reg_idx: int, immediate_value: int, dst_reg_idx: Optional[int] = None):
+    def generate_instruction_add_imm(self, src_reg_idx: int, immediate_value: int, dst_reg_idx: Optional[int] = None,
+                                      transaction_id: int = 0):
         """
         Generate an ADD instruction to add immediate value to register
 
@@ -3470,46 +3559,76 @@ class UnifiedEngine:
             src_reg_idx: Source register index (must not be 0)
             immediate_value: 32-bit immediate value to add
             dst_reg_idx: Destination register index (defaults to src_reg_idx if None)
+            transaction_id: 8-bit ID in inst_descriptor[7:0]
         """
         if src_reg_idx == 0:
             print("ERROR: INSTRUCTION_ADD overwriting reg_idx 0 (zero reg) not allowed")
             return
         if dst_reg_idx is None:
             dst_reg_idx = src_reg_idx
-        self.generate_instruction(INSTRUCTION_ADD, immediate_value, INST_ADD_IMM, src_reg_idx, dst_reg_idx, 0)
+        self.generate_instruction(INSTRUCTION_ADD, immediate_value, INST_ADD_IMM, src_reg_idx, dst_reg_idx, 0, transaction_id)
 
-    def generate_instruction_add_set(self, dst_reg_idx: int, immediate_value: int):
+    def generate_instruction_add_set(self, dst_reg_idx: int, immediate_value: int, transaction_id: int = 0):
         """
         Generate an ADD instruction to set register to immediate value
 
         Args:
             dst_reg_idx: Destination register index (must not be 0)
             immediate_value: 32-bit immediate value to set
+            transaction_id: 8-bit ID in inst_descriptor[7:0]
         """
         if dst_reg_idx == 0:
             print("ERROR: INSTRUCTION_ADD overwriting reg_idx 0 (zero reg) not allowed")
             return
-        self.generate_instruction(INSTRUCTION_ADD, immediate_value, INST_ADD_SET, dst_reg_idx, dst_reg_idx, 0)
+        self.generate_instruction(INSTRUCTION_ADD, immediate_value, INST_ADD_SET, dst_reg_idx, dst_reg_idx, 0, transaction_id)
 
-    def generate_instruction_flag_set(self):
+    def generate_instruction_flag_set(self, transaction_id: int = 0):
         """Set this engine's flag to 1, signaling busy to other engines."""
-        self.generate_instruction(INSTRUCTION_FLAG, 0, FLAG_MODE_SET, 0, 0, 0)
+        self.generate_instruction(INSTRUCTION_FLAG, 0, FLAG_MODE_SET, 0, 0, 0, transaction_id)
 
-    def generate_instruction_flag_clear(self):
+    def generate_instruction_flag_clear(self, transaction_id: int = 0):
         """Clear this engine's flag to 0, signaling done to other engines."""
-        self.generate_instruction(INSTRUCTION_FLAG, 0, FLAG_MODE_CLEAR, 0, 0, 0)
+        self.generate_instruction(INSTRUCTION_FLAG, 0, FLAG_MODE_CLEAR, 0, 0, 0, transaction_id)
 
-    def generate_instruction_flag_check(self, target_engine_idx: int):
+    def generate_instruction_flag_check(self, target_engine_idx: int, transaction_id: int = 0):
         """
         Spin-wait until target engine's flag is 1 before proceeding.
 
         Args:
             target_engine_idx: Engine index (0-7) whose flag to wait on
+            transaction_id: 8-bit ID in inst_descriptor[7:0]
         """
         if target_engine_idx < 0 or target_engine_idx > 7:
             print(f"ERROR: target_engine_idx must be 0-7, got {target_engine_idx}")
             return
-        self.generate_instruction(INSTRUCTION_FLAG, 0, FLAG_MODE_CHECK, target_engine_idx, 0, 0)
+        self.generate_instruction(INSTRUCTION_FLAG, 0, FLAG_MODE_CHECK, target_engine_idx, 0, 0, transaction_id)
+
+    def overwrite_instruction_with_general_register(self, general_register: int) -> None:
+        """
+        Overwrite the most recently captured instruction to use a general register
+        for rewriting the DRAM source/destination address.
+
+        REG_REWRITE: [11:8] inst_type; [39:36] inst_src_reg_idx.
+        Address comes from regfile (RTL INST_REWRITE), not [63:32] dram.
+        """
+        if self.capture_buffer is None or len(self.capture_buffer) == 0:
+            print("ERROR: overwrite_instruction_with_general_register() called but capture_buffer is empty!")
+            return
+        if self.capture_count == 0:
+            print("ERROR: overwrite_instruction_with_general_register() called but capture_count is 0!")
+            return
+        if general_register <= 0 or general_register > 15:
+            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
+
+        inst = self.capture_buffer[self.capture_count - 1]
+        w = inst.words
+        inst_id = w[0] & 0xFF
+
+        # Overwrite word 0: preserve inst_id [7:0], set inst_type to INSTRUCTION_REG_REWRITE [11:8]
+        w[0] = (inst_id & 0xFF) | ((INSTRUCTION_REG_REWRITE & 0xF) << 8)
+
+        # Overwrite word 1: set inst_src_reg_idx [39:36] (bits 7:4 of w[1])
+        w[1] = ((general_register & 0xF) << 4)
 
     def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
         """
@@ -3571,6 +3690,23 @@ class UnifiedEngine:
         """
         self.write_reg32(UE_INSTRUCTION_ADDR, instruction_addr)
 
+    def software_reset(self):
+        """
+        Trigger a software reset of the engine via the UE_QUEUE_CTRL register
+        and reinitialize all hardware and software state.
+
+        Writes bit[31]=1 (reset command flag) and bit[15]=1 (sw_reset_pending)
+        to UE_QUEUE_CTRL_ADDR. The hardware defers the actual reset pulse until
+        the AXI write response completes and the AXI master is idle, avoiding
+        protocol violations from aborting in-flight DMA bursts.
+        """
+        SW_RESET_CMD = 0x80008000
+        self.write_reg32(UE_QUEUE_CTRL_ADDR, SW_RESET_CMD)
+        self.wait_queue(1.0) # 1 seconds timeout
+        self.init_unified_engine()
+        self._inst_id = 0
+        print("Software reset complete.")
+
     def report_timing_and_instruction_count(self):
         """
         Report timing and instruction count
@@ -3588,9 +3724,10 @@ class UnifiedEngine:
 
     def report_flop_rate_gflops(self, num_flops: int):
         """
-        Report flop rate
+        Report flop rate and gflops ratio of peak throughput
         """
-        return num_flops / (self.read_reg32(UE_LATENCY_COUNT_ADDR) * self._clock_period_ns)
+        gflops_ratio = num_flops / 1.28 / self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        return num_flops / (self.read_reg32(UE_LATENCY_COUNT_ADDR) * self._clock_period_ns), gflops_ratio
 
     def quantize_weight(self,
                         weight: torch.Tensor,
@@ -3686,7 +3823,7 @@ class UnifiedEngine:
             self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
             print(f"INT4/FP4: wrote {num_packed_bytes} packed bytes + {num_blocks*2} scale bytes")
             self.allocate_params_dram(num_packed_bytes + num_blocks * 2)
-        
+
         print(f"Quantized matrix and scales written to DRAM at 0x{quantized_matrix_dram_addr:x} and 0x{scale_dram_addr:x}")
         return quantized_matrix_dram_addr, scale_dram_addr
 
