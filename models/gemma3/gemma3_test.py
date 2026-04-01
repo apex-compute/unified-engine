@@ -415,6 +415,17 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """Get the arg max index from the Unified Engine"""
         return self.read_reg32(UE_ARGMAX1_INDEX)
 
+    def overwrite_instruction_with_general_register(self, general_register: int) -> None:
+        """Modify the last captured instruction to use a general register for DRAM address."""
+        if not self.capture_buffer or self.capture_count == 0:
+            raise RuntimeError("capture_buffer is empty")
+        if general_register <= 0 or general_register > 15:
+            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
+        inst = self.capture_buffer[self.capture_count - 1]
+        w = inst.words
+        w[0] = ((0 & 0xF) << 0) | ((general_register & 0xF) << 4) | ((0 & 0xF) << 8) | ((0 & 0xF) << 12)
+        w[7] = (w[7] & 0x1FFFFFFF) | ((user_dma_core.INSTRUCTION_REG_REWRITE & 0x7) << 29)
+
     def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
         """RoPE (HuggingFace style). Caller must have start_capture() before and stop_capture() after."""
         assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
