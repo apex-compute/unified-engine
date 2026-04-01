@@ -381,10 +381,51 @@ def read_flash_array_dump():
 DEVICE_HASH_ADDR = 0x02000000
 
 def read_device_hash():
-    """Read hardware hash from flash at 0x02000000."""
+    """Read hardware hash from flash at 0x02000000 and return it."""
     print(f"=== Reading Device Hash @ 0x{DEVICE_HASH_ADDR:08X} ===")
     data = user_read32(DEVICE_HASH_ADDR)
-    print(f"Hardware hash: {data:08x}")
+    print(f"Hardware hash: {data >> 4 & 0xFFFFFFF:07x}")
+    return data
+
+
+def find_repo_bin_hash():
+    """Find update_<hash>.bin in the repo and return (short_hash, bin_path)."""
+    import glob
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    pattern = os.path.join(script_dir, "update_*.bin")
+    matches = [m for m in glob.glob(pattern) if os.path.basename(m).startswith("update_") and m.endswith(".bin")]
+    if not matches:
+        return None, None
+    # Use the most recently modified .bin if multiple exist
+    bin_path = max(matches, key=os.path.getmtime)
+    filename = os.path.basename(bin_path)
+    # Extract hash from "update_<hash>.bin"
+    hash_part = filename[len("update_"):-len(".bin")]
+    short_hash = hash_part[:7]
+    return short_hash, bin_path
+
+
+def check_update_required(device_hash):
+    """Compare device hash against the update_*.bin file in the repo. Print update recommendation."""
+    repo_hash, bin_path = find_repo_bin_hash()
+    if repo_hash is None:
+        print("No update_*.bin file found in repo. Cannot check for updates.")
+        return
+
+    repo_hash_int = int(repo_hash, 16)
+    device_hash_short = device_hash & 0x0FFFFFFF  # mask to 28 bits (7 hex digits)
+
+    print(f"\n=== Update Check ===")
+    print(f"  Device hash : 0x{device_hash_short:07x}")
+    print(f"  Repo .bin   : 0x{repo_hash_int:07x} ({os.path.basename(bin_path)})")
+
+    if device_hash_short == repo_hash_int:
+        update_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(bin_path)))
+        print(f"  Status: UP TO DATE (updated {update_date})")
+    else:
+        print(f"  Status: UPDATE REQUIRED")
+        print(f"  Run: python3 update_flash.py {bin_path}")
+
 
 if __name__ == "__main__":
     import argparse
@@ -393,7 +434,7 @@ if __name__ == "__main__":
     parser.add_argument("--dev", "-d", type=str, default="xdma0",
                         help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
     parser.add_argument("--check", action="store_true",
-                        help="check device ID, flash status, and read FPGA git hash from flash")
+                        help="check device ID, flash status, read FPGA git hash, and compare against repo .bin")
     args = parser.parse_args()
 
     DMA_DEVICE_USER = f"/dev/{args.dev}_user"
@@ -406,8 +447,9 @@ if __name__ == "__main__":
         check_device_id()
         check_rcr_status(FLASH_BASE_ADDR)
         check_lock_status(FLASH_BASE_ADDR)
-        read_device_hash()
-        print("Check complete.")
+        device_hash = read_device_hash()
+        check_update_required(device_hash)
+        print("\nCheck complete.")
         sys.exit(0)
 
     if not args.bitfile:

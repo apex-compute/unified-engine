@@ -138,21 +138,6 @@ def accelerator_memory_to_sram_reg(ue, accelerator_dram_address: int, sram_addre
                            stride_jump_bytes=stride_jump_bytes,
                            general_reg_src=general_reg_src)
     ue._inst_id += 1
-def overwrite_last_instruction_with_general_register(ue, general_register: int) -> None:
-    """Overwrite last captured instruction to use a general register for DRAM address."""
-    if not ue.capture_buffer or ue.capture_count == 0:
-        print("ERROR: overwrite_last_instruction_with_general_register() called but capture_buffer is empty!")
-        return
-    if general_register <= 0 or general_register > 15:
-        raise ValueError(f"general_register must be in [1, 15], got {general_register}")
-
-    inst = ue.capture_buffer[ue.capture_count - 1]
-    w = inst.words
-    w[0] = ((0 & 0xF) << 0) | \
-           ((general_register & 0xF) << 4) | \
-           ((0 & 0xF) << 8) | \
-           ((0 & 0xF) << 12)
-    w[7] = (w[7] & 0x1FFFFFFF) | ((INSTRUCTION_REG_REWRITE & 0x7) << 29)
 def eltwise_add_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
     """OUTPUT = A + B (DRAM)."""
     bytes_per_element = 2
@@ -1200,9 +1185,6 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self._inst_id = 0
     def get_arg_max_index(self) -> int:
         return self.read_reg32(UE_ARGMAX_INDEX)
-    def overwrite_instruction_with_general_register(self, general_register: int) -> None:
-        """Overwrite last instruction to use general register for DRAM address."""
-        overwrite_last_instruction_with_general_register(self, general_register)
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         """Set ISA register to immediate value."""
         isa_set_register(self, dst_reg_idx, immediate_value, timeout_s)
@@ -2079,7 +2061,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.start_execute_from_dram(self._prefill_scratch_addr)
         self.wait_queue(30.0)
         if total_flops is not None:
-            self._last_hw_gflops = self.report_flop_rate_gflops(total_flops)
+            self._last_hw_gflops, _ = self.report_flop_rate_gflops(total_flops)
             self._last_total_flops = total_flops
         else:
             self._last_hw_gflops = None
