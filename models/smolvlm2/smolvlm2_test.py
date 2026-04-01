@@ -23,7 +23,7 @@ from huggingface_hub import snapshot_download
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX,
+    DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, UE_ARGMAX1_INDEX,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
     UnifiedEngine,
@@ -111,17 +111,19 @@ def isa_set_register(ue, dst_reg_idx: int, immediate_value: int, timeout_s: floa
     ue.start_execute_from_dram(program_addr)
     ue.wait_queue(timeout_s)
 def _make_add_set_bytes(dst_reg: int, immediate_value: int) -> bytes:
-    """Build raw 32-byte ADD_SET instruction: dst_reg = immediate_value."""
+    """Build raw 32-byte ADD_SET instruction: dst_reg = immediate_value.
+    Encoding must match user_dma_core.generate_instruction / andromeda.c layout."""
     import struct
     INSTRUCTION_ADD = 2
     INST_ADD_SET = 4
     w = [0] * 8
-    w[0] = ((INST_ADD_SET & 0xF) << 0) | \
+    w[0] = (INSTRUCTION_ADD & 0xF) << 8
+    w[1] = ((INST_ADD_SET & 0xF) << 0) | \
            ((dst_reg & 0xF) << 4) | \
            ((dst_reg & 0xF) << 8) | \
-           ((0 & 0xF) << 12)
-    w[1] = immediate_value & 0xFFFFFFFF
-    w[7] = (INSTRUCTION_ADD & 0x7) << 29
+           ((0 & 0xF) << 12) | \
+           ((immediate_value & 0xFFFF) << 16)
+    w[2] = (immediate_value >> 16) & 0xFFFF
     result = bytearray(32)
     for i in range(8):
         result[i*4:(i+1)*4] = struct.pack('<I', w[i] & 0xFFFFFFFF)
