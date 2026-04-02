@@ -608,6 +608,10 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_dir, torch_dtype=torch.bfloat16, device_map=None, trust_remote_code=True
     )
+    # Newer transformers nests vision encoder under model.model.visual;
+    # expose it as model.visual so the rest of the code can access it directly.
+    if not hasattr(model, 'visual') and hasattr(model, 'model') and hasattr(model.model, 'visual'):
+        model.visual = model.model.visual
     return model, model_dir
 
 def weight_bin_generate(script_dir: str | None = None, output_lm: str | None = None, output_vis: str | None = None) -> tuple[str, str]:
@@ -1912,6 +1916,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self._hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_dir, torch_dtype=torch.bfloat16, device_map="cpu"
             )
+            if not hasattr(self._hf_model, 'visual') and hasattr(self._hf_model, 'model') and hasattr(self._hf_model.model, 'visual'):
+                self._hf_model.visual = self._hf_model.model.visual
             self._hf_model.eval()
             print("    HF model loaded.")
 
@@ -2621,10 +2627,26 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = 5.63
 
     ue = Qwen25VL3B_UnifiedEngine(script_dir=script_dir)
+
+    # Stop any stale FPGA execution from a previous crashed/timed-out run
+    ue.dram_inst_running(False)
+    ue.start_capture()
+    ue.generate_instruction_halt()
+    ue.stop_capture()
+    halt_bytes = bytearray()
+    for inst in ue.capture_buffer:
+        halt_bytes.extend(inst.get_bytes())
+    ue.dma_write(DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, halt_bytes, len(halt_bytes))
+    ue.clear_capture_buffer()
+
     cfg = _load_config(script_dir)
     if args.image and args.image.lower() == "none":
         args.image = None
     has_image = args.image is not None
+
+    print(f"\n--- Configuration ---")
+    print(f"  Image : {args.image if has_image else '(none)'}")
+    print(f"  Prompt: {args.prompt!r}")
 
     if has_image and args.vision_cpu:
         # CPU vision encoder (fp32 precision, for quality comparison)
@@ -2635,6 +2657,8 @@ def main():
         model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
         hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_dir, torch_dtype=torch.bfloat16, device_map="cpu")
+        if not hasattr(hf_model, 'visual') and hasattr(hf_model, 'model') and hasattr(hf_model.model, 'visual'):
+            hf_model.visual = hf_model.model.visual
         hf_model.eval()
         processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
         img_size = cfg["vision"].get("image_size", 336)
