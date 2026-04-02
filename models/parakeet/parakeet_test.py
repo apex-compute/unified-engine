@@ -940,6 +940,49 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
         return prog
+
+    def compile_mel_norm(self, T_mel):
+        """Compile HW mel normalization: transpose → layer_norm → transpose back.
+
+        Input: log-mel energies at MEL_ENERGY_DRAM (T_mel, n_mels) bf16.
+        Output: normalized mel at MEL_DRAM (T_mel_padded, n_mels) bf16.
+        Uses DFT_REAL_DRAM as transposed workspace, DFT_IMAG_DRAM as temp.
+        Returns program_addr.
+        """
+        bpe = self.bytes_per_element
+        n_mels = self.n_mels  # 128
+        T_mel_padded = pad_to_multiple(T_mel, UE_VECTOR_SIZE)
+
+        self.clear_capture_buffer()
+        self.start_capture()
+        self.generate_instruction_flag_clear()
+
+        # Transpose (T_mel, 128) → (128, T_mel_padded)
+        chunked_transpose_core_dram(self, M=T_mel, N=n_mels,
+            input_dram_addr=self.MEL_ENERGY_DRAM,
+            output_dram_addr=self.DFT_REAL_DRAM,
+            identity_dram_addr=self.w["IDENTITY_64"],
+            temp_dram_addr=self.DFT_IMAG_DRAM)
+
+        # Layer norm: normalize each of 128 bands across T_mel_padded time steps
+        self.layer_norm_core_dram(M=n_mels, N=T_mel_padded,
+            A_DRAM_ADDR=self.DFT_REAL_DRAM,
+            OUTPUT_DRAM_ADDR=self.DFT_REAL_DRAM)
+
+        # Transpose back (128, T_mel_padded) → (T_mel_padded, 128)
+        chunked_transpose_core_dram(self, M=n_mels, N=T_mel_padded,
+            input_dram_addr=self.DFT_REAL_DRAM,
+            output_dram_addr=self.MEL_DRAM,
+            identity_dram_addr=self.w["IDENTITY_64"],
+            temp_dram_addr=self.DFT_IMAG_DRAM)
+
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        return prog
+
     def compile_im2col_s0(self, T_mel):
         """Compile accelerator program for stage-0 im2col via permutation-matrix matmul.
 
@@ -2097,6 +2140,7 @@ def main():
     loaded = engine.load_programs(L_pad)
     if loaded:
         mel_prog = loaded["mel"]
+        norm_prog = loaded["norm"]
         im2col_s0 = loaded["im2col_s0"]
         prog_s0 = loaded["prog_s0"]
         im2col_s1 = loaded["im2col_s1"]
@@ -2129,8 +2173,10 @@ def main():
         if dual_engine:
             engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, dual_engine=True, engine_slave=True)
             engine2.copy_dram_layout(engine)
-        # HW mel spectrogram program (master only — log/norm done on CPU after readback)
+        # HW mel spectrogram program (master only — log done on CPU after readback)
         mel_prog = engine.compile_mel_spectrogram(T_mel)
+        # HW mel normalization: transpose → layer_norm → transpose back
+        norm_prog = engine.compile_mel_norm(T_mel)
         # Subsampling programs (master + slave)
         im2col_s0, _, _ = engine.compile_im2col_s0(T_mel)
         prog_s0, _ = engine.compile_sub_stage0(N0, 64, SC)
@@ -2160,7 +2206,7 @@ def main():
         pred_prog, tok_prog, dur_prog, restore_prog, _ = engine.compile_decoder()
         # Compute program sizes from consecutive DRAM addresses
         all_progs = [
-            ("mel", mel_prog),
+            ("mel", mel_prog), ("norm", norm_prog),
             ("im2col_s0", im2col_s0), ("prog_s0", prog_s0),
             ("im2col_s1", im2col_s1), ("prog_s1", prog_s1),
             ("im2col_s2", im2col_s2), ("prog_s2", prog_s2),
@@ -2203,18 +2249,20 @@ def main():
     timer = threading.Thread(target=_progress_timer, args=("Executing", t_start, stop), daemon=True)
     timer.start()
 
-    # --- HW mel spectrogram → CPU log/norm → subsampling ---
+    # --- HW mel spectrogram → CPU log → HW norm → subsampling ---
     engine.dma_to_accelerator_memory(engine.FRAMED_DRAM, mel_frames)
     engine.program_execute(mel_prog)
-    # CPU interrupt: readback mel energies, apply log + per-band normalize
+    # CPU interrupt: readback mel energies, apply log only (no HW log unit)
     mel_energy = read_dram(engine, engine.MEL_ENERGY_DRAM, T_mel * n_mels)
     mel_energy = mel_energy.reshape(T_mel, n_mels).float()
-    mel_energy = torch.log(torch.clamp(mel_energy, min=1e-5))
-    mel_mean = mel_energy.mean(dim=0, keepdim=True)
-    mel_var = mel_energy.var(dim=0, keepdim=True, unbiased=True)
-    mel_std = torch.clamp(torch.sqrt(mel_var), min=1e-5)
-    mel_norm = ((mel_energy - mel_mean) / mel_std).to(torch.bfloat16).contiguous()
-    engine.dma_to_accelerator_memory(engine.MEL_DRAM, mel_norm)
+    mel_energy = torch.log(torch.clamp(mel_energy, min=1e-5)).to(torch.bfloat16).contiguous()
+    engine.dma_to_accelerator_memory(engine.MEL_ENERGY_DRAM, mel_energy)
+    # Pre-zero transpose temp tail so padding columns are deterministic zeros
+    T_mel_padded = pad_to_multiple(T_mel, UE_VECTOR_SIZE)
+    engine.dma_to_accelerator_memory(engine.DFT_IMAG_DRAM,
+        torch.zeros(T_mel_padded * UE_VECTOR_SIZE, dtype=torch.bfloat16))
+    # HW: transpose → layer_norm → transpose back → result in MEL_DRAM
+    engine.program_execute(norm_prog)
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
     if dual_engine:
         engine2.start_execute_from_dram(im2col_s0_2)
