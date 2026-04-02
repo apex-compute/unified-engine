@@ -398,6 +398,21 @@ def compute_mel_spectrogram(waveform, cfg, ckpt_sd=None):
     std = torch.clamp(torch.sqrt(var), min=1e-5)
     mel = (mel - mean) / std
     return mel.transpose(1, 2).to(torch.bfloat16)      # (B, T_mel, 128)
+
+def frame_waveform(waveform, cfg):
+    """Frame waveform for HW mel: center-pad + overlapping windows → (T_mel, n_fft) bf16.
+
+    Replicates torch.stft framing (center=True, pad_mode='reflect') without the FFT.
+    Window is already absorbed into HW DFT coefficients (DFT_COS / DFT_SIN).
+    """
+    pre = cfg["preprocessing"]
+    n_fft = pre["n_fft"]           # 512
+    hop_length = pre["hop_length"] # 160
+    pad = n_fft // 2
+    sig = waveform.float()[0]                                        # (samples,)
+    padded = torch.nn.functional.pad(sig.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+    frames = padded.unfold(0, n_fft, hop_length)                     # (T_mel, n_fft)
+    return frames.to(torch.bfloat16).contiguous()
 # ---------------------------------------------------------------------------
 # Parakeet Unified Engine
 # ---------------------------------------------------------------------------
@@ -449,6 +464,9 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.max_symbols_per_step = jnt["max_symbols_per_step"]
         self.block_size = hw["block_size"]      # 64
         self.bytes_per_element = enc["bytes_per_element"]
+        pre = self._cfg["preprocessing"]
+        self.n_fft = pre["n_fft"]                                     # 512
+        self.n_bins_pad = pad_to_multiple(pre["n_fft"] // 2 + 1, hw["block_size"])  # 320
         # ISA register assignments for decoder dynamic addressing
         regs = self._cfg.get("fixed_isa_regs", {})
         self.TOKEN_REG = regs.get("TOKEN_REG", 1)
@@ -1988,11 +2006,11 @@ def main():
     # --- Init engine ---
     engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, dual_engine=dual_engine)
 
-    # --- Mel spectrogram (CPU) — needs checkpoint for filterbank ---
+    # --- Mel spectrogram (HW DFT/power/filterbank + CPU log/norm) ---
     Parakeet_UnifiedEngine.ensure_model_files()
     sd = torch.load(WEIGHTS_PATH, map_location="cpu", weights_only=True)
-    mel = compute_mel_spectrogram(waveform, cfg, ckpt_sd=sd)
-    T_mel = mel.shape[1]
+    mel_frames = frame_waveform(waveform, cfg)           # (T_mel, n_fft) bf16
+    T_mel = mel_frames.shape[0]
     n_mels = cfg["encoder"]["n_mels"]  # 128
 
     # --- Compute correct output dimensions through 3 subsampling stages ---
@@ -2078,6 +2096,7 @@ def main():
     enc_prog_addr2 = None
     loaded = engine.load_programs(L_pad)
     if loaded:
+        mel_prog = loaded["mel"]
         im2col_s0 = loaded["im2col_s0"]
         prog_s0 = loaded["prog_s0"]
         im2col_s1 = loaded["im2col_s1"]
@@ -2110,6 +2129,8 @@ def main():
         if dual_engine:
             engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, dual_engine=True, engine_slave=True)
             engine2.copy_dram_layout(engine)
+        # HW mel spectrogram program (master only — log/norm done on CPU after readback)
+        mel_prog = engine.compile_mel_spectrogram(T_mel)
         # Subsampling programs (master + slave)
         im2col_s0, _, _ = engine.compile_im2col_s0(T_mel)
         prog_s0, _ = engine.compile_sub_stage0(N0, 64, SC)
@@ -2139,6 +2160,7 @@ def main():
         pred_prog, tok_prog, dur_prog, restore_prog, _ = engine.compile_decoder()
         # Compute program sizes from consecutive DRAM addresses
         all_progs = [
+            ("mel", mel_prog),
             ("im2col_s0", im2col_s0), ("prog_s0", prog_s0),
             ("im2col_s1", im2col_s1), ("prog_s1", prog_s1),
             ("im2col_s2", im2col_s2), ("prog_s2", prog_s2),
@@ -2181,40 +2203,18 @@ def main():
     timer = threading.Thread(target=_progress_timer, args=("Executing", t_start, stop), daemon=True)
     timer.start()
 
-    # --- HW Mel Spectrogram Test ---
-    _original_print("  HW mel spectrogram test...")
-    n_fft = cfg["preprocessing"]["n_fft"]
-    hop_length = cfg["preprocessing"]["hop_length"]
-    win_length = cfg["preprocessing"]["win_length"]
-    # Frame audio on CPU (reflect pad + unfold — fast, no compute)
-    waveform_padded = torch.nn.functional.pad(waveform.float(), (n_fft // 2, n_fft // 2), mode="reflect")
-    frames = waveform_padded.unfold(-1, n_fft, hop_length).squeeze(0)  # (T_mel, 512)
-    frames_bf16 = frames.to(torch.bfloat16).contiguous()
-    engine.dma_to_accelerator_memory(engine.FRAMED_DRAM, frames_bf16)
-    # Compile and execute HW mel program
-    mel_prog = engine.compile_mel_spectrogram(T_mel)
+    # --- HW mel spectrogram → CPU log/norm → subsampling ---
+    engine.dma_to_accelerator_memory(engine.FRAMED_DRAM, mel_frames)
     engine.program_execute(mel_prog)
-    # Read back mel energies (T_mel, 128) — before log+normalize
-    hw_mel_energy = read_dram(engine, engine.MEL_ENERGY_DRAM, T_mel * n_mels)
-    hw_mel_energy = hw_mel_energy.reshape(T_mel, n_mels).float()
-    # Log + normalize on CPU (FP32)
-    hw_log_mel = torch.log(torch.clamp(hw_mel_energy, min=1e-5))
-    # Transpose to (128, T) for per-channel normalize
-    hw_log_mel_t = hw_log_mel.T.unsqueeze(0)  # (1, 128, T)
-    hw_mean = hw_log_mel_t.mean(dim=-1, keepdim=True)
-    hw_std = torch.clamp(hw_log_mel_t.var(dim=-1, keepdim=True, unbiased=True).sqrt(), min=1e-5)
-    hw_mel_norm = ((hw_log_mel_t - hw_mean) / hw_std).transpose(1, 2)  # (1, T, 128)
-    # Compare with CPU mel (first channel only in case of stereo)
-    cpu_mel = mel[:1].float()  # (1, T_mel, 128)
-    cos_sim = F.cosine_similarity(cpu_mel.flatten().unsqueeze(0), hw_mel_norm.flatten().unsqueeze(0)).item()
-    mae = (cpu_mel - hw_mel_norm).abs().mean().item()
-    max_err = (cpu_mel - hw_mel_norm).abs().max().item()
-    _original_print(f"  HW vs CPU mel: cos={cos_sim:.6f}  mae={mae:.6f}  max_err={max_err:.6f}")
-    assert False, f"HW mel test complete — cos={cos_sim:.6f}. Remove this assert to continue."
-
-    # --- Subsampling ---
-    mel_flat = mel.squeeze(0).to(torch.bfloat16).contiguous()
-    engine.dma_to_accelerator_memory(engine.MEL_DRAM, mel_flat)
+    # CPU interrupt: readback mel energies, apply log + per-band normalize
+    mel_energy = read_dram(engine, engine.MEL_ENERGY_DRAM, T_mel * n_mels)
+    mel_energy = mel_energy.reshape(T_mel, n_mels).float()
+    mel_energy = torch.log(torch.clamp(mel_energy, min=1e-5))
+    mel_mean = mel_energy.mean(dim=0, keepdim=True)
+    mel_var = mel_energy.var(dim=0, keepdim=True, unbiased=True)
+    mel_std = torch.clamp(torch.sqrt(mel_var), min=1e-5)
+    mel_norm = ((mel_energy - mel_mean) / mel_std).to(torch.bfloat16).contiguous()
+    engine.dma_to_accelerator_memory(engine.MEL_DRAM, mel_norm)
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
     if dual_engine:
         engine2.start_execute_from_dram(im2col_s0_2)
