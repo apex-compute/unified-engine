@@ -343,6 +343,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._isa_reg_counter += 1
         return reg_idx
 
+    # overwrite_instruction_with_general_register: use base class (user_dma_core.py)
+
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         """
         Run a minimal program that sets one ISA register to an immediate value (ADD SET then HALT):
@@ -1189,7 +1191,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """Compile decoder programs for seq_len buckets, or load from existing bin/meta.
         Returns (decoder_bin_path, program_sizes[8], total_flops_list[8])."""
         decoder_bin_path = os.path.join(self.script_dir, "gemma3_bin", "decoder_program.bin")
-        decoder_meta_path = os.path.join(self.script_dir, "decoder_program.json")
+        decoder_meta_path = os.path.join(self.script_dir, "gemma3_bin", "decoder_program.json")
         if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
             with open(decoder_meta_path, "r") as f:
                 meta = json.load(f)
