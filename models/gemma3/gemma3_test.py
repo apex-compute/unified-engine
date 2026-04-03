@@ -1189,7 +1189,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """Compile decoder programs for seq_len buckets, or load from existing bin/meta.
         Returns (decoder_bin_path, program_sizes[8], total_flops_list[8])."""
         decoder_bin_path = os.path.join(self.script_dir, "gemma3_bin", "decoder_program.bin")
-        decoder_meta_path = os.path.join(self.script_dir, "decoder_program.json")
+        decoder_meta_path = os.path.join(self.script_dir, "gemma3_bin", "decoder_program.json")
         if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
             with open(decoder_meta_path, "r") as f:
                 meta = json.load(f)
