@@ -343,8 +343,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._isa_reg_counter += 1
         return reg_idx
 
-    # overwrite_instruction_with_general_register: use base class (user_dma_core.py)
-
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         """
         Run a minimal program that sets one ISA register to an immediate value (ADD SET then HALT):
