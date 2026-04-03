@@ -737,28 +737,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._isa_reg_counter += 1
         return reg_idx
 
-    def overwrite_instruction_with_general_register(self, general_register: int) -> None:
-        """Overwrite last captured instruction to use a general register for DRAM address rewriting."""
-        if self.capture_buffer is None or len(self.capture_buffer) == 0:
-            print("ERROR: overwrite_instruction_with_general_register() called but capture_buffer is empty!")
-            return
-        if self.capture_count == 0:
-            print("ERROR: overwrite_instruction_with_general_register() called but capture_count is 0!")
-            return
-        if general_register <= 0 or general_register > 15:
-            raise ValueError(f"general_register must be in [1, 15], got {general_register}")
-
-        inst = self.capture_buffer[self.capture_count - 1]
-        w = inst.words
-
-        # Overwrite word 0: set inst_src_reg_idx in bits 4-7
-        w[0] = ((0 & 0xF) << 0) | \
-               ((general_register & 0xF) << 4) | \
-               ((0 & 0xF) << 8) | \
-               ((0 & 0xF) << 12)
-
-        # Overwrite word 7: preserve bits 0-28, set inst_type to INSTRUCTION_REG_REWRITE in bits 29-31
-        w[7] = (w[7] & 0x1FFFFFFF) | ((user_dma_core.INSTRUCTION_REG_REWRITE & 0x7) << 29)
+    # overwrite_instruction_with_general_register: use base class (user_dma_core.py)
 
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         """Set one ISA register to an immediate value via ADD SET + HALT program."""
