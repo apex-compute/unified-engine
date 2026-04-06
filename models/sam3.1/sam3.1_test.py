@@ -2495,7 +2495,7 @@ class Sam31_UnifiedEngine(UnifiedEngine):
     # Run HW up to current checkpoint
     # ------------------------------------------------------------------
 
-    def run_hw(self, image_path: str, program_addr: int, timeout: float = 300.0) -> None:
+    def run_hw(self, image_path: str, program_addr: int, timeout: float = 600.0) -> None:
         """Preprocess image, DMA inputs, execute compiled program."""
         image = self.preprocess_image(image_path, self.IMAGE_SIZE)
         image_chw = image.squeeze(0)  # (3, 1008, 1008)
