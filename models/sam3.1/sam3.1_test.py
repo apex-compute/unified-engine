@@ -66,6 +66,34 @@ class _CheckpointStop(Exception):
 # Helper ops (built on UnifiedEngine primitives)
 # =============================================================================
 
+def flash_attention_global_tiled(ue: UnifiedEngine, num_heads: int, head_dim: int,
+                                  seq_len: int,
+                                  Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
+                                  V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                                  SCRATCH_DRAM_ADDR: int) -> int:
+    """Global self-attention processing one head at a time to bound scratch usage.
+
+    flash_attention_core needs (head_dim * seq_len + seq_len²) scratch per head.
+    For seq=5184, head_dim=128: ~52 MB per head — fits in local scratch (111 MB)
+    when scratch is reused across heads instead of allocated per-head simultaneously.
+    """
+    bpe = 2
+    head_stride = seq_len * head_dim * bpe
+
+    total_flops = 0
+    for h in range(num_heads):
+        total_flops += ue.flash_attention_core(
+            head_dim=head_dim,
+            seq_len=seq_len,
+            Q_DRAM_ADDR=Q_DRAM_ADDR      + h * head_stride,
+            K_DRAM_ADDR=K_DRAM_ADDR      + h * head_stride,
+            V_DRAM_ADDR=V_DRAM_ADDR      + h * head_stride,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + h * head_stride,
+            SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,  # reused each head
+        )
+    return total_flops
+
+
 def flash_attention_batched(ue: UnifiedEngine, num_batches: int, head_dim: int,
                             seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
                             V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
@@ -1299,9 +1327,10 @@ class Sam31_UnifiedEngine(UnifiedEngine):
             _qw, _qb = build_padded_qk_weight(
                 _raw_w[0:_VD][_perm], _raw_b[0:_VD][_perm],
                 self.VIT_HEADS, self.VIT_HEAD_DIM)                   # (2048, 1024)
-            # Scale Q by sqrt(2): flash_attention uses 1/sqrt(head_dim_pad=128) but
-            # effective head_dim is 64 (zeros don't contribute to dot product).
+            # Scale Q by sqrt(2) for local blocks only: flash_attention uses 1/sqrt(head_dim_pad=128)
+            # but for local blocks the effective head_dim is 64 (the hi half is zeros after RoPE split).
             # Pre-scaling Q by sqrt(128/64)=sqrt(2) corrects: sqrt(2)*Q·K/sqrt(128) = Q·K/sqrt(64).
+            # Global blocks skip RoPE so all 128 dims are meaningful — no correction needed.
             _qw = (_qw.float() * (2.0 ** 0.5)).to(torch.bfloat16)
             _qb = (_qb.float() * (2.0 ** 0.5)).to(torch.bfloat16)
             _kw, _kb = build_padded_qk_weight(
@@ -1708,7 +1737,8 @@ class Sam31_UnifiedEngine(UnifiedEngine):
         self.VIT_K_HEADS     = self._alloc_tensor(heads_elems)
         self.VIT_V_HEADS     = self._alloc_tensor(heads_elems)
         self.VIT_ATTN_OUT    = self._alloc_tensor(heads_elems)
-        # Scratch: local blocks dominate. hd_pad=128 used for V^T buffer inside flash_attention.
+        # Scratch: local blocks dominate. Global blocks use tiled cross-attention
+        # (tile_size=VIT_WINDOW_AREA) so their scratch is only tile*seq_len, not seq_len².
         local_scratch = total_heads_local * (hd_pad * self.VIT_WINDOW_AREA + self.VIT_WINDOW_AREA ** 2)
         self.VIT_ATTN_SCRATCH = self._alloc_tensor(local_scratch)
         self.VIT_ATTN_MERGED = self._alloc_tensor(GA * VD_QK)           # (5184, 2048) padded
@@ -1876,16 +1906,29 @@ class Sam31_UnifiedEngine(UnifiedEngine):
                                         SIN_LO_DRAM_ADDR=rope_sl, SIN_HI_DRAM_ADDR=rope_sh)
 
             # --- Flash attention ---
-            flash_attention_batched(self,
-                num_batches=total_batches,
-                head_dim=hd_pad,   # 128
-                seq_len=seq_len,
-                Q_DRAM_ADDR=self.VIT_Q_HEADS,
-                K_DRAM_ADDR=self.VIT_K_HEADS,
-                V_DRAM_ADDR=self.VIT_V_HEADS,
-                OUTPUT_DRAM_ADDR=self.VIT_ATTN_OUT,
-                SCRATCH_DRAM_ADDR=self.VIT_ATTN_SCRATCH,
-            )
+            if is_global:
+                # Global seq=5184: tiled to avoid seq²-sized scratch (use window tile=576).
+                flash_attention_global_tiled(self,
+                    num_heads=self.VIT_HEADS,
+                    head_dim=hd_pad,
+                    seq_len=seq_len,
+                    Q_DRAM_ADDR=self.VIT_Q_HEADS,
+                    K_DRAM_ADDR=self.VIT_K_HEADS,
+                    V_DRAM_ADDR=self.VIT_V_HEADS,
+                    OUTPUT_DRAM_ADDR=self.VIT_ATTN_OUT,
+                    SCRATCH_DRAM_ADDR=self.VIT_ATTN_SCRATCH,
+                )
+            else:
+                flash_attention_batched(self,
+                    num_batches=total_batches,
+                    head_dim=hd_pad,
+                    seq_len=seq_len,
+                    Q_DRAM_ADDR=self.VIT_Q_HEADS,
+                    K_DRAM_ADDR=self.VIT_K_HEADS,
+                    V_DRAM_ADDR=self.VIT_V_HEADS,
+                    OUTPUT_DRAM_ADDR=self.VIT_ATTN_OUT,
+                    SCRATCH_DRAM_ADDR=self.VIT_ATTN_SCRATCH,
+                )
 
             # --- Merge heads: (window*heads, seq, hd_pad) → (window, seq, heads*hd_pad) ---
             # Per window: bf16_permute_core (16, seq_len, 128) → (seq_len, 16, 128)
@@ -2636,6 +2679,7 @@ class Sam31_UnifiedEngine(UnifiedEngine):
             compute_axial_cis = None
 
         x = self.cpu_reference_patch_embed(image_path).to(torch.bfloat16)
+        torch.set_grad_enabled(False)
 
         ckpt_path = _ensure_checkpoint(self.script_dir, self.cfg)
         sd = _load_detector_state_dict(ckpt_path)
@@ -2724,10 +2768,10 @@ class Sam31_UnifiedEngine(UnifiedEngine):
             # --- Manual attention matching HW flash_attention_core ---
             # HW: broadcast_mul scales Q first, then Q_scaled @ K^T, softmax (fp32 internal), @ V
             scale = 1.0 / math.sqrt(hd)
-            Q_scaled = Q * scale                                     # scale Q first (matches HW broadcast_mul)
-            scores = torch.bmm(Q_scaled, K.transpose(-2, -1))       # bf16 matmul → bf16 scores
-            probs = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)  # softmax in float32, round to bf16
-            attn_out = torch.bmm(probs, V)                          # bf16 matmul → bf16 output
+            Q_scaled = Q * scale
+            scores = torch.bmm(Q_scaled, K.transpose(-2, -1))
+            probs = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+            attn_out = torch.bmm(probs, V)
 
             # merge heads
             attn_out = (attn_out.reshape(num_win, nh, seq, hd)
@@ -2770,6 +2814,7 @@ class Sam31_UnifiedEngine(UnifiedEngine):
             x = x + mlp_out
 
         del sd
+        torch.set_grad_enabled(True)
         return x.to(torch.bfloat16)
 
     # ------------------------------------------------------------------
@@ -2899,6 +2944,8 @@ def main():
                         help="Per-block HW vs CPU validation (slow: one compile+run per block)")
     parser.add_argument("--validate-blocks", type=int, default=8,
                         help="Number of blocks to validate with --validate-vit (default: 8)")
+    parser.add_argument("--no-step", action="store_true",
+                        help="With --validate-vit: single compile+run to block N, one CPU ref (faster)")
     parser.add_argument("--test-pad-weight", action="store_true",
                         help="Run unit test for build_padded_qk_weight (no hardware needed)")
     args = parser.parse_args()
@@ -2921,7 +2968,24 @@ def main():
     ue = Sam31_UnifiedEngine(script_dir=SCRIPT_DIR)
     _original_print(f"  Weights: {_time.perf_counter() - t0:.3f}s")
 
-    if args.validate_vit:
+    if args.validate_vit and args.no_step:
+        # Single compile to block N, one CPU reference
+        n = args.validate_blocks
+        _original_print(f"  Validating ViT blocks 0-{n - 1} (single compile)...")
+        ue._vit_checkpoint = n - 1
+        try:
+            prog_addr = ue.compile_full_fused()
+        except _CheckpointStop:
+            pass
+        ue.run_hw(image_path, prog_addr)
+        cpu_ref = ue.cpu_reference_vit_blocks(image_path, num_blocks=n)
+        ue.validate(
+            dram_addr=ue.VIT_LAYER_IN,
+            num_elements=ue.GRID_AREA * ue.VIT_DIM,
+            cpu_ref=cpu_ref,
+            label=f"ViT blocks 0-{n - 1}",
+        )
+    elif args.validate_vit:
         # Per-block HW vs CPU validation
         _original_print(f"  Validating ViT blocks 0-{args.validate_blocks - 1} (per-block)...")
         _vit_block_validate(ue, image_path, num_blocks=args.validate_blocks)
