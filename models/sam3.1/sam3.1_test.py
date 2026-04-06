@@ -49,6 +49,7 @@ def quiet_print(*args, **kwargs):
 builtins.print = quiet_print
 
 import user_dma_core
+user_dma_core.MAX_DECODER_INSTRUCTIONS = (0x100000000 - 0x9C000000) // 32  # Section 1: 1.6 GB instruction budget
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
@@ -224,41 +225,47 @@ def cross_attention_batched(ue: UnifiedEngine, num_heads: int, head_dim: int,
 
 
 def rope_2d_heads_dram(ue: UnifiedEngine, num_batches: int, seq_len: int, head_dim: int,
-                      QK_DRAM_ADDR: int,
-                      COS_LO_DRAM_ADDR: int, COS_HI_DRAM_ADDR: int,
-                      SIN_LO_DRAM_ADDR: int, SIN_HI_DRAM_ADDR: int) -> int:
+                       QK_DRAM_ADDR: int,
+                       COS_LO_DRAM_ADDR: int, COS_HI_DRAM_ADDR: int,
+                       SIN_LO_DRAM_ADDR: int, SIN_HI_DRAM_ADDR: int) -> int:
     """Apply 2D RoPE (rotate-half) in-place to Q or K heads.
 
-    head_dim=64 means half=32 elements=64 bytes which is NOT a URAM row (128B).
-    So we use pre-padded split tables (each half zero-padded to 64 elements=128B)
-    and manually implement rotate-half steps — same approach as smolvlm2.
+    head_dim=64 → half=32 elements=64 bytes, which is not URAM-row-aligned (128B).
+    Following the SmolVLM2 pattern: bulk-load cos/sin tables into URAM_B once,
+    then per-position stage x_lo/x_hi through fixed 128B-aligned URAM_A slots.
 
-    URAM_B layout (bulk-loaded once):
-      0x80000: cos_lo [seq_len, 64 elem padded]
-      after:   cos_hi [seq_len, 64 elem padded]
-      after:   sin_lo [seq_len, 64 elem padded]
-      after:   sin_hi [seq_len, 64 elem padded]
-      URAM_B needed: 4 * seq_len * 128 bytes (for seq=576: 294KB < 512KB)
+    URAM_A layout (6 fixed slots × 128 bytes):
+      x_lo   0x000   x_hi   0x080
+      a_lo   0x100   a_hi   0x180
+      out_lo 0x200   out_hi 0x280
 
-    URAM_A layout (per row, 6 slots of 128 bytes):
-      x_lo  0x000  x_hi  0x080
-      a_lo  0x100  a_hi  0x180
-      b_lo  0x200  b_hi  0x280
+    URAM_B layout (bulk-loaded once, 4 × seq_len × 128 bytes ≈ 288KB for seq=576):
+      cos_lo  0x80000
+      cos_hi  cos_lo + seq_len × SLOT
+      sin_lo  cos_hi + seq_len × SLOT
+      sin_hi  sin_lo + seq_len × SLOT
+      b_lo    sin_hi + seq_len × SLOT   (scratch)
+      b_hi    b_lo + SLOT               (scratch)
+
+    eltwise_add/mul require A and B in different URAMs:
+      muls: x/a in URAM_A, cos/sin/b in URAM_B
+      adds: a in URAM_A, b in URAM_B → out in URAM_A
     """
-    bpe = 2
-    SLOT = 128          # bytes per URAM row = 64 elements × 2 bytes
-    half = head_dim // 2  # 32 elements = 64 bytes (one padded row = SLOT)
+    bpe  = 2
+    SLOT = 128           # bytes per 128B-aligned URAM row (64 elements × 2 bytes)
+    half = head_dim // 2 # 32 elements = 64 bytes
 
-    # URAM_A
-    x_lo = 0x000;  x_hi = 0x080
-    a_lo = 0x100;  a_hi = 0x180
+    # URAM_A — fixed 128B-aligned staging and result slots
+    x_lo   = 0x000;  x_hi   = 0x080
+    a_lo   = 0x100;  a_hi   = 0x180
+    out_lo = 0x200;  out_hi = 0x280
 
-    # URAM_B — bulk load all per-position tables once; b scratch after tables
+    # URAM_B — cos/sin tables bulk-loaded once, b scratch slots after tables
     cos_lo_uram = 0x80000
     cos_hi_uram = cos_lo_uram + seq_len * SLOT
     sin_lo_uram = cos_hi_uram + seq_len * SLOT
     sin_hi_uram = sin_lo_uram + seq_len * SLOT
-    b_lo = sin_hi_uram + seq_len * SLOT   # scratch in URAM_B
+    b_lo = sin_hi_uram + seq_len * SLOT
     b_hi = b_lo + SLOT
 
     ue.accelerator_memory_to_sram(COS_LO_DRAM_ADDR, cos_lo_uram, seq_len * UE_VECTOR_SIZE)
@@ -273,27 +280,123 @@ def rope_2d_heads_dram(ue: UnifiedEngine, num_batches: int, seq_len: int, head_d
             cl = cos_lo_uram + t * SLOT;  ch = cos_hi_uram + t * SLOT
             sl = sin_lo_uram + t * SLOT;  sh = sin_hi_uram + t * SLOT
 
-            # Load x[lo] and x[hi] into separate aligned URAM_A slots
+            # Stage x_lo and x_hi into aligned URAM_A slots
             ue.accelerator_memory_to_sram(row_dram,              x_lo, half)
             ue.accelerator_memory_to_sram(row_dram + half * bpe, x_hi, half)
 
-            # a = x * cos  (per half)
+            # a = x * cos (per half)
             ue.eltwise_mul_core(x_lo, cl, a_lo, half)
             ue.eltwise_mul_core(x_hi, ch, a_hi, half)
 
-            # b = x[hi]*sin[lo] and x[lo]*sin[hi]  (rotate-half cross terms)
-            ue.eltwise_mul_core(x_hi, sl, b_lo, half)   # b_lo = x_hi * sin_lo (negated → subtract)
-            ue.eltwise_mul_core(x_lo, sh, b_hi, half)   # b_hi = x_lo * sin_hi
+            # b = cross terms; sin_lo is pre-negated so b_lo = -x_hi * |sin_lo|
+            ue.eltwise_mul_core(x_hi, sl, b_lo, half)
+            ue.eltwise_mul_core(x_lo, sh, b_hi, half)
 
-            # output = a + b  (sin_lo is pre-negated, so a_lo + b_lo = x_lo*cos - x_hi*|sin|)
-            ue.eltwise_add_core(a_lo, b_lo, x_lo, half)
-            ue.eltwise_add_core(a_hi, b_hi, x_hi, half)
+            # out = a + b, written to separate result slots (avoids clobbering x staging)
+            ue.eltwise_add_core(a_lo, b_lo, out_lo, half)
+            ue.eltwise_add_core(a_hi, b_hi, out_hi, half)
 
-            # Write back
-            ue.sram_to_accelerator_memory(x_lo, row_dram,              half)
-            ue.sram_to_accelerator_memory(x_hi, row_dram + half * bpe, half)
+            # Write back in-place
+            ue.sram_to_accelerator_memory(out_lo, row_dram,              half)
+            ue.sram_to_accelerator_memory(out_hi, row_dram + half * bpe, half)
 
     return 4 * num_batches * seq_len * head_dim
+
+
+def rope_2d_vectorized_dram(ue: UnifiedEngine, num_batches: int, seq_len: int,
+                            head_dim: int,
+                            QK_DRAM_ADDR: int,
+                            COS_LO_DRAM_ADDR: int, COS_HI_DRAM_ADDR: int,
+                            SIN_LO_DRAM_ADDR: int, SIN_HI_DRAM_ADDR: int) -> int:
+    """Apply 2D RoPE (rotate-half) in-place — vectorized across ALL positions.
+
+    Requires PADDED Q/K heads: each position stored as
+      [lo(32), zeros(32), hi(32), zeros(32)] = head_dim_pad=128 elements.
+
+    Lo and hi each occupy a full URAM row (64 elements = 128 bytes), so
+    strided gather uses chunk=128 (full URAM row) — no alignment issue.
+
+    Instructions per call: 4 (table loads) + num_batches × 10
+    For local blocks: 4 + 144 × 10 = 1,444  vs  829,440 per-position → 575× fewer.
+
+    URAM_A layout (4 blocks × seq_len × 64 × 2 bytes = 4 × 73,728 bytes ≈ 288 KB):
+      x_lo  0x00000   [seq_len × 64 elements — valid in [0:32], zeros in [32:64] per row]
+      x_hi  x_lo + BLOCK
+      a_lo  x_hi + BLOCK
+      a_hi  a_lo + BLOCK
+
+    URAM_B layout (4 table blocks + 2 scratch blocks ≈ 432 KB):
+      cos_lo  0x80000
+      cos_hi  cos_lo + BLOCK
+      sin_lo  cos_hi + BLOCK
+      sin_hi  sin_lo + BLOCK
+      b_lo    sin_hi + BLOCK
+      b_hi    b_lo + BLOCK
+
+    Strided DMA (gather lo from padded [lo_pad | hi_pad] layout):
+      stride_bytes_per_chunk = UE_VECTOR_SIZE * bpe = 128  ← full URAM row ✓
+      stride_jump_bytes      = head_dim * bpe = 256        ← full padded position
+    For hi: same params but src offset +128 bytes (second row of each position).
+    """
+    from user_dma_core import UE_VECTOR_SIZE
+    bpe    = 2
+    VS     = UE_VECTOR_SIZE          # 64 elements = 128 bytes = one URAM row
+    chunk  = VS * bpe                # 128 bytes — full URAM row ✓
+    jump   = head_dim * bpe          # 256 bytes — stride to next position (head_dim=128)
+    total  = seq_len * VS            # 576 × 64 = 36,864 elements (for eltwise + table load)
+    BLOCK  = total * bpe             # 73,728 bytes per buffer block
+
+    # URAM_A — 4 contiguous blocks
+    x_lo = 0x00000
+    x_hi = x_lo + BLOCK
+    a_lo = x_hi + BLOCK
+    a_hi = a_lo + BLOCK
+
+    # URAM_B — 4 table blocks + 2 scratch blocks
+    cos_lo_uram = 0x80000
+    cos_hi_uram = cos_lo_uram + BLOCK
+    sin_lo_uram = cos_hi_uram + BLOCK
+    sin_hi_uram = sin_lo_uram + BLOCK
+    b_lo        = sin_hi_uram + BLOCK
+    b_hi        = b_lo + BLOCK
+
+    # Bulk-load all 4 cos/sin padded tables into URAM_B once (reused across all batches).
+    # Tables shape: (seq_len, 64) padded — valid in [0:32], zeros in [32:64].
+    ue.accelerator_memory_to_sram(COS_LO_DRAM_ADDR, cos_lo_uram, total)
+    ue.accelerator_memory_to_sram(COS_HI_DRAM_ADDR, cos_hi_uram, total)
+    ue.accelerator_memory_to_sram(SIN_LO_DRAM_ADDR, sin_lo_uram, total)
+    ue.accelerator_memory_to_sram(SIN_HI_DRAM_ADDR, sin_hi_uram, total)
+
+    for batch in range(num_batches):
+        batch_base = QK_DRAM_ADDR + batch * seq_len * head_dim * bpe
+
+        # Strided gather: load all positions' lo rows into x_lo, hi rows into x_hi.
+        # Each position: row 0 = [lo(32), zeros(32)], row 1 = [hi(32), zeros(32)].
+        ue.accelerator_memory_to_sram(batch_base,         x_lo, total,
+                                      stride_bytes_per_chunk=chunk,
+                                      stride_jump_bytes=jump)
+        ue.accelerator_memory_to_sram(batch_base + chunk, x_hi, total,
+                                      stride_bytes_per_chunk=chunk,
+                                      stride_jump_bytes=jump)
+
+        # Vectorized rotate-half over all seq_len positions at once.
+        # Padding zeros * table zeros = 0 — harmless, does not affect valid elements.
+        ue.eltwise_mul_core(x_lo, cos_lo_uram, a_lo,  total)  # a_lo = x_lo * cos_lo
+        ue.eltwise_mul_core(x_hi, cos_hi_uram, a_hi,  total)  # a_hi = x_hi * cos_hi
+        ue.eltwise_mul_core(x_hi, sin_lo_uram, b_lo,  total)  # b_lo = x_hi * sin_lo (negated)
+        ue.eltwise_mul_core(x_lo, sin_hi_uram, b_hi,  total)  # b_hi = x_lo * sin_hi
+        ue.eltwise_add_core(a_lo, b_lo,         x_lo, total)  # out_lo = a_lo + b_lo
+        ue.eltwise_add_core(a_hi, b_hi,         x_hi, total)  # out_hi = a_hi + b_hi
+
+        # Strided scatter: write results back to padded DRAM positions.
+        ue.sram_to_accelerator_memory(x_lo, batch_base,         total,
+                                      stride_bytes_per_chunk=chunk,
+                                      stride_jump_bytes=jump)
+        ue.sram_to_accelerator_memory(x_hi, batch_base + chunk, total,
+                                      stride_bytes_per_chunk=chunk,
+                                      stride_jump_bytes=jump)
+
+    return 4 + num_batches * 10
 
 
 def window_partition_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
@@ -803,6 +906,114 @@ def _make_rope_perm(num_heads: int, head_dim: int) -> torch.Tensor:
     return torch.tensor(perm, dtype=torch.long)
 
 
+def build_padded_qk_weight(W_rows: torch.Tensor, bias: torch.Tensor,
+                           n_heads: int, head_dim: int):
+    """Pad Q/K weight rows so each head outputs [lo, zeros, hi, zeros] per position.
+
+    After projection with this padded weight, each head's output per position is:
+      [lo(half), zeros(half), hi(half), zeros(half)]  = head_dim*2 elements
+
+    This makes lo and hi each occupy a full URAM row (UE_VECTOR_SIZE=64 elements =
+    128 bytes), enabling vectorized RoPE with stride_bytes_per_chunk=128 (full row).
+
+    Args:
+        W_rows: Q or K weight rows  (n_heads*head_dim, D_model), after _make_rope_perm
+        bias:   Q or K bias         (n_heads*head_dim,)
+        n_heads:   number of attention heads
+        head_dim:  original head dimension (64)
+
+    Returns:
+        W_padded: (n_heads * head_dim*2, D_model)
+        b_padded: (n_heads * head_dim*2,)
+    """
+    half   = head_dim // 2    # 32
+    hd_pad = head_dim * 2     # 128
+    D      = W_rows.shape[1]
+
+    W_padded = torch.zeros(n_heads * hd_pad, D, dtype=W_rows.dtype)
+    b_padded = torch.zeros(n_heads * hd_pad,    dtype=bias.dtype)
+
+    for h in range(n_heads):
+        src_lo = slice(h * head_dim,        h * head_dim + half)   # original lo rows
+        src_hi = slice(h * head_dim + half, (h + 1) * head_dim)    # original hi rows
+        dst_lo = slice(h * hd_pad,          h * hd_pad + half)     # [h*128 : h*128+32]
+        dst_hi = slice(h * hd_pad + half*2, h * hd_pad + half*3)   # [h*128+64 : h*128+96]
+
+        W_padded[dst_lo] = W_rows[src_lo]
+        W_padded[dst_hi] = W_rows[src_hi]
+        b_padded[dst_lo] = bias[src_lo]
+        b_padded[dst_hi] = bias[src_hi]
+
+    return W_padded, b_padded
+
+
+def build_padded_proj_weight(W: torch.Tensor, n_heads: int, head_dim: int) -> torch.Tensor:
+    """Build padded output-projection weight to accept padded V-head layout as input.
+
+    The attention output after merging heads has shape (seq, n_heads * head_dim_pad)
+    where each head's contribution is [lo(half), zeros(half), hi(half), zeros(half)].
+    This function pads the proj weight columns to match, inserting zero columns at
+    the padding positions so the matrix multiply ignores them.
+
+    Args:
+        W:         proj.weight  (out_dim, n_heads*head_dim)  e.g. (1024, 1024)
+        n_heads:   number of attention heads
+        head_dim:  original head dimension (64)
+
+    Returns:
+        W_padded:  (out_dim, n_heads * head_dim*2)  e.g. (1024, 2048)
+    """
+    half   = head_dim // 2
+    hd_pad = head_dim * 2
+    out_dim = W.shape[0]
+
+    W_padded = torch.zeros(out_dim, n_heads * hd_pad, dtype=W.dtype)
+    for h in range(n_heads):
+        src_lo = slice(h * head_dim,        h * head_dim + half)
+        src_hi = slice(h * head_dim + half, (h + 1) * head_dim)
+        dst_lo = slice(h * hd_pad,          h * hd_pad + half)
+        dst_hi = slice(h * hd_pad + half*2, h * hd_pad + half*3)
+        W_padded[:, dst_lo] = W[:, src_lo]
+        W_padded[:, dst_hi] = W[:, src_hi]
+    return W_padded
+
+
+def _test_build_padded_qk_weight():
+    """Verify build_padded_qk_weight math — run with python sam3.1_test.py --test-pad-weight"""
+    import torch
+    n_heads, head_dim, D_model = 4, 64, 128
+    half = head_dim // 2
+
+    W = torch.randn(n_heads * head_dim, D_model, dtype=torch.bfloat16)
+    b = torch.randn(n_heads * head_dim, dtype=torch.bfloat16)
+    x = torch.randn(16, D_model, dtype=torch.bfloat16)  # seq_len=16
+
+    W_pad, b_pad = build_padded_qk_weight(W, b, n_heads, head_dim)
+    assert W_pad.shape == (n_heads * head_dim * 2, D_model), f"bad shape {W_pad.shape}"
+
+    # Original projection output
+    out_orig = x @ W.T + b   # (16, n_heads*64)
+
+    # Padded projection output
+    out_padded = x @ W_pad.T + b_pad  # (16, n_heads*128)
+
+    for h in range(n_heads):
+        lo_orig   = out_orig[:, h*head_dim          : h*head_dim + half]   # (16, 32)
+        hi_orig   = out_orig[:, h*head_dim + half   : (h+1)*head_dim]      # (16, 32)
+
+        lo_padded = out_padded[:, h*128             : h*128 + half]        # (16, 32)
+        zeros_lo  = out_padded[:, h*128 + half      : h*128 + half*2]      # (16, 32)
+        hi_padded = out_padded[:, h*128 + half*2    : h*128 + half*3]      # (16, 32)
+        zeros_hi  = out_padded[:, h*128 + half*3    : (h+1)*128]           # (16, 32)
+
+        assert torch.allclose(lo_orig, lo_padded, atol=1e-2), f"head {h} lo mismatch"
+        assert torch.allclose(hi_orig, hi_padded, atol=1e-2), f"head {h} hi mismatch"
+        assert zeros_lo.abs().max() == 0, f"head {h} lo padding not zero"
+        assert zeros_hi.abs().max() == 0, f"head {h} hi padding not zero"
+
+    print("PASS: build_padded_qk_weight — lo/hi correct, padding is zero for all heads")
+
+
 # =============================================================================
 # Config / checkpoint helpers
 # =============================================================================
@@ -852,13 +1063,29 @@ def _ensure_bpe_vocab(script_dir: str, cfg: dict) -> str:
 
 
 # =============================================================================
-# DRAM partition: 2 GB params / 1 GB tensors / 1 GB programs
+# DRAM partition: 2 GB params / 600 MB tensors / ~1.4 GB programs
 # SAM3 detector weights ≈ 1.64 GB in BF16, needs ≥ 2 GB params space.
+# Tensors reduced to 600 MB (ViT heads properly sized + local scratch only).
+# Programs expanded to ~1.4 GB to fit all 32 ViT blocks (~1,353 MB).
 # =============================================================================
 
-SAM31_PARAMS_BASE  = 0x00000000   # 0.0 GB — 2 GB for weights + RoPE tables
-SAM31_TENSOR_BASE  = 0x80000000   # 2.0 GB — 1 GB for activations / scratch
-SAM31_PROGRAM_BASE = 0xC0000000   # 3.0 GB — 1 GB for compiled instructions
+# =============================================================================
+# Section 1 DRAM layout — ViT image encoder (32 blocks)
+#   Params:      0x00000000 – 0x7FFFFFFF  (2 GB)   weights + RoPE tables
+#   Tensors:     0x80000000 – 0x9BFFFFFF  (448 MB) activations / scratch
+#   Instructions:0x9C000000 – 0xFFFFFFFF  (1.6 GB) compiled instruction stream
+#
+# At end of Section 1: ViT output (GA × VIT_DIM) is DMA'd to host.
+# DRAM is then reconfigured for Section 2 (FPN + text + decoder).
+# =============================================================================
+SAM31_S1_PARAMS_BASE  = 0x00000000   # 0.00 GB — ViT weights + RoPE tables
+SAM31_S1_TENSOR_BASE  = 0x80000000   # 2.00 GB — ViT activations / scratch
+SAM31_S1_PROGRAM_BASE = 0x9C000000   # 2.44 GB — ViT instruction stream
+
+# Aliases for current use (remove when Section 2 is added)
+SAM31_PARAMS_BASE  = SAM31_S1_PARAMS_BASE
+SAM31_TENSOR_BASE  = SAM31_S1_TENSOR_BASE
+SAM31_PROGRAM_BASE = SAM31_S1_PROGRAM_BASE
 
 
 # =============================================================================
@@ -891,6 +1118,8 @@ class Sam31_UnifiedEngine(UnifiedEngine):
     VIT_DEPTH       = 32
     VIT_HEADS       = 16
     VIT_HEAD_DIM    = 64           # 1024 // 16
+    VIT_HEAD_DIM_PAD = 128         # padded to 2×head_dim for vectorized RoPE (lo/hi in separate URAM rows)
+    VIT_QK_DIM_PAD  = 2048         # VIT_HEADS * VIT_HEAD_DIM_PAD
     VIT_MLP_HIDDEN  = 4736         # int(1024 * 4.625)
     VIT_WINDOW_SIZE = 24
     VIT_WINDOW_AREA = 576          # 24 * 24
@@ -1058,21 +1287,40 @@ class Sam31_UnifiedEngine(UnifiedEngine):
             bw = {}
             bw['norm1_gamma'] = self._alloc_param(sd[bp + "norm1.weight"])
             bw['norm1_beta'] = self._alloc_param(sd[bp + "norm1.bias"])
-            # Permute Q and K rows to rotate-half layout so rope_core_dram works correctly.
+            # Permute Q and K rows to rotate-half layout, then pad lo/hi into separate
+            # URAM rows so vectorized RoPE can use chunk=128 (full URAM row).
+            # Padded Q/K: (2048, 1024) — [lo(32), zeros(32), hi(32), zeros(32)] per head.
+            # Padded V:   (2048, 1024) — same pattern; flash_attention needs uniform head_dim.
+            # Padded proj: (1024, 2048) — zero columns at padding positions.
             _perm = _make_rope_perm(self.VIT_HEADS, self.VIT_HEAD_DIM)  # (1024,)
             _VD = self.VIT_DIM
             _raw_w = sd[bp + "attn.qkv.weight"].to(torch.bfloat16)  # (3072, 1024)
             _raw_b = sd[bp + "attn.qkv.bias"].to(torch.bfloat16)    # (3072,)
-            _qw = _raw_w[0:_VD][_perm]
-            _kw = _raw_w[_VD:2*_VD][_perm]
-            _vw = _raw_w[2*_VD:3*_VD]
-            _qb = _raw_b[0:_VD][_perm]
-            _kb = _raw_b[_VD:2*_VD][_perm]
-            _vb = _raw_b[2*_VD:3*_VD]
-            bw['qkv_weight'] = self._alloc_param(torch.cat([_qw, _kw, _vw], dim=0))
-            bw['qkv_bias']   = self._alloc_param(torch.cat([_qb, _kb, _vb], dim=0))
-            bw['proj_weight'] = self._alloc_param(sd[bp + "attn.proj.weight"])  # (1024, 1024)
-            bw['proj_bias'] = self._alloc_param(sd[bp + "attn.proj.bias"])
+            _qw, _qb = build_padded_qk_weight(
+                _raw_w[0:_VD][_perm], _raw_b[0:_VD][_perm],
+                self.VIT_HEADS, self.VIT_HEAD_DIM)                   # (2048, 1024)
+            # Scale Q by sqrt(2): flash_attention uses 1/sqrt(head_dim_pad=128) but
+            # effective head_dim is 64 (zeros don't contribute to dot product).
+            # Pre-scaling Q by sqrt(128/64)=sqrt(2) corrects: sqrt(2)*Q·K/sqrt(128) = Q·K/sqrt(64).
+            _qw = (_qw.float() * (2.0 ** 0.5)).to(torch.bfloat16)
+            _qb = (_qb.float() * (2.0 ** 0.5)).to(torch.bfloat16)
+            _kw, _kb = build_padded_qk_weight(
+                _raw_w[_VD:2*_VD][_perm], _raw_b[_VD:2*_VD][_perm],
+                self.VIT_HEADS, self.VIT_HEAD_DIM)                   # (2048, 1024)
+            _vw, _vb = build_padded_qk_weight(
+                _raw_w[2*_VD:3*_VD], _raw_b[2*_VD:3*_VD],
+                self.VIT_HEADS, self.VIT_HEAD_DIM)                   # (2048, 1024)
+            bw['q_weight']  = self._alloc_param(_qw)
+            bw['q_bias']    = self._alloc_param(_qb)
+            bw['k_weight']  = self._alloc_param(_kw)
+            bw['k_bias']    = self._alloc_param(_kb)
+            bw['v_weight']  = self._alloc_param(_vw)
+            bw['v_bias']    = self._alloc_param(_vb)
+            _proj_w = build_padded_proj_weight(
+                sd[bp + "attn.proj.weight"].to(torch.bfloat16),
+                self.VIT_HEADS, self.VIT_HEAD_DIM)                   # (1024, 2048)
+            bw['proj_weight'] = self._alloc_param(_proj_w)
+            bw['proj_bias']   = self._alloc_param(sd[bp + "attn.proj.bias"])
             bw['norm2_gamma'] = self._alloc_param(sd[bp + "norm2.weight"])
             bw['norm2_beta'] = self._alloc_param(sd[bp + "norm2.bias"])
             bw['fc1_weight'] = self._alloc_param(sd[bp + "mlp.fc1.weight"])    # (4736, 1024)
@@ -1104,6 +1352,7 @@ class Sam31_UnifiedEngine(UnifiedEngine):
         self.ROPE_COS_HI_WIN = self._alloc_param(ch_w)
         self.ROPE_SIN_LO_WIN = self._alloc_param(sl_w)
         self.ROPE_SIN_HI_WIN = self._alloc_param(sh_w)
+
 
         # Global blocks: 72x72 positions (RoPE skipped at runtime — stored for future use)
         rope_scale_global = self.VIT_WINDOW_SIZE / self.GRID_SIZE  # 24/72 = 0.333
@@ -1441,25 +1690,28 @@ class Sam31_UnifiedEngine(UnifiedEngine):
         self.VIT_WINDOWED    = self._alloc_tensor(GA * VD)               # (5184, 1024) after window partition
 
         # --- ViT block: Q/K/V separate, multi-head attention, MLP ---
-        self.VIT_Q           = self._alloc_tensor(GA * VD)               # (5184, 1024) Q projection
-        self.VIT_K           = self._alloc_tensor(GA * VD)               # (5184, 1024) K projection
-        self.VIT_V           = self._alloc_tensor(GA * VD)               # (5184, 1024) V projection
+        # Q, K, V use padded head_dim=128 so vectorized RoPE can use chunk=128 (full URAM row).
+        VD_QK = self.VIT_QK_DIM_PAD  # 2048
+        self.VIT_Q           = self._alloc_tensor(GA * VD_QK)            # (5184, 2048) Q projection
+        self.VIT_K           = self._alloc_tensor(GA * VD_QK)            # (5184, 2048) K projection
+        self.VIT_V           = self._alloc_tensor(GA * VD_QK)            # (5184, 2048) V projection
 
-        # Multi-head layout: (total_batches, seq_len, head_dim)
-        # Local: (144, 576, 64), Global: (16, 5184, 64) — same total elements
-        hd = self.VIT_HEAD_DIM  # 64
+        # Multi-head layout: (total_batches, seq_len, head_dim_pad=128)
+        # Local: (144, 576, 128), Global: (16, 5184, 128)
+        hd     = self.VIT_HEAD_DIM      # 64 — original
+        hd_pad = self.VIT_HEAD_DIM_PAD  # 128 — padded
         total_heads_local = self.VIT_NUM_WINDOWS * self.VIT_HEADS  # 144
-        max_seq = max(self.VIT_WINDOW_AREA, GA)  # 5184
-        max_heads = max(total_heads_local, self.VIT_HEADS)  # 144
-        self.VIT_Q_HEADS     = self._alloc_tensor(max_heads * max_seq * hd)
-        self.VIT_K_HEADS     = self._alloc_tensor(max_heads * max_seq * hd)
-        self.VIT_V_HEADS     = self._alloc_tensor(max_heads * max_seq * hd)
-        self.VIT_ATTN_OUT    = self._alloc_tensor(max_heads * max_seq * hd)
-        # Scratch: max of (local: 144 heads * small scratch) vs (global: 16 heads * big scratch)
-        local_scratch = total_heads_local * (hd * self.VIT_WINDOW_AREA + self.VIT_WINDOW_AREA ** 2)
-        global_scratch = self.VIT_HEADS * (hd * GA + GA * GA)
-        self.VIT_ATTN_SCRATCH = self._alloc_tensor(max(local_scratch, global_scratch))
-        self.VIT_ATTN_MERGED = self._alloc_tensor(GA * VD)              # after merge heads
+        local_total  = total_heads_local * self.VIT_WINDOW_AREA    # 144 × 576  = 82,944
+        global_total = self.VIT_HEADS * GA                         # 16  × 5184 = 82,944
+        heads_elems  = max(local_total, global_total) * hd_pad     # 82,944 × 128 = 10,616,832 (~20 MB each)
+        self.VIT_Q_HEADS     = self._alloc_tensor(heads_elems)
+        self.VIT_K_HEADS     = self._alloc_tensor(heads_elems)
+        self.VIT_V_HEADS     = self._alloc_tensor(heads_elems)
+        self.VIT_ATTN_OUT    = self._alloc_tensor(heads_elems)
+        # Scratch: local blocks dominate. hd_pad=128 used for V^T buffer inside flash_attention.
+        local_scratch = total_heads_local * (hd_pad * self.VIT_WINDOW_AREA + self.VIT_WINDOW_AREA ** 2)
+        self.VIT_ATTN_SCRATCH = self._alloc_tensor(local_scratch)
+        self.VIT_ATTN_MERGED = self._alloc_tensor(GA * VD_QK)           # (5184, 2048) padded
         self.VIT_OUT_PROJ    = self._alloc_tensor(GA * VD)
         self.VIT_RESIDUAL    = self._alloc_tensor(GA * VD)
         self.VIT_MLP_MID     = self._alloc_tensor(GA * self.VIT_MLP_HIDDEN)  # (5184, 4736)
@@ -1530,7 +1782,9 @@ class Sam31_UnifiedEngine(UnifiedEngine):
         # PASSED: patch_embed + pos_embed + LN_pre
 
         # 1.4 Transformer blocks 0-31
+        _pre_vit_inst = self.capture_count
         for blk_idx in range(self.VIT_DEPTH):
+            _blk_start = self.capture_count
             bw = self.vit_block_weights[blk_idx]
             is_global = blk_idx in self.VIT_GLOBAL_BLOCKS
 
@@ -1570,57 +1824,61 @@ class Sam31_UnifiedEngine(UnifiedEngine):
                 attn_input = self.VIT_LN_OUT
 
             # --- Q, K, V projections (3 separate matmuls) ---
-            # qkv_weight is (3072, 1024): rows 0:1024=Q, 1024:2048=K, 2048:3072=V
-            # qkv_bias is (3072,): same split
-            VD = self.VIT_DIM
-            bpe_off = bpe  # 2
-            for qkv_idx, out_addr in enumerate([self.VIT_Q, self.VIT_K, self.VIT_V]):
+            # Q, K: (M_flat, 1024) @ (2048, 1024)^T + bias → (M_flat, 2048)  [padded]
+            # V:    (M_flat, 1024) @ (2048, 1024)^T + bias → (M_flat, 2048)  [padded]
+            VD    = self.VIT_DIM        # 1024
+            VD_QK = self.VIT_QK_DIM_PAD  # 2048
+            for w_key, b_key, out_addr, N_out in [
+                ('q_weight', 'q_bias', self.VIT_Q, VD_QK),
+                ('k_weight', 'k_bias', self.VIT_K, VD_QK),
+                ('v_weight', 'v_bias', self.VIT_V, VD_QK),
+            ]:
                 self.matmat_mul_core(
-                    M=M_flat, K=VD, N=VD,
+                    M=M_flat, K=VD, N=N_out,
                     A_DRAM_ADDR=attn_input,
-                    B_DRAM_ADDR=bw['qkv_weight'] + qkv_idx * VD * VD * bpe_off,
+                    B_DRAM_ADDR=bw[w_key],
                     OUTPUT_DRAM_ADDR=out_addr,
-                    C_DRAM_ADDR=bw['qkv_bias'] + qkv_idx * VD * bpe_off,
+                    C_DRAM_ADDR=bw[b_key],
                     bias_mode="broadcast_N",
                 )
 
             # PASSED: block0 norm1 + window_partition + QKV matmul
 
-            # --- Multi-head reshape: (window, seq, heads*hd) → (window*heads, seq, hd) ---
-            # Per window: bf16_permute_core (seq_len, 16, 64) → (16, seq_len, 64)
-            # head_dim=64 is already aligned — no padding needed.
-            hd = self.VIT_HEAD_DIM
+            # --- Multi-head reshape: (window, seq, heads*hd_pad) → (window*heads, seq, hd_pad) ---
+            # Per window: bf16_permute_core (seq_len, 16, 128) → (16, seq_len, 128)
+            # head_dim_pad=128 is aligned (2×UE_VECTOR_SIZE) — no extra padding needed.
+            hd_pad  = self.VIT_HEAD_DIM_PAD  # 128
+            VD_QK   = self.VIT_QK_DIM_PAD    # 2048
+            bpe_off = 2                       # bytes per bf16 element
             for qkv_src, qkv_dst in [(self.VIT_Q, self.VIT_Q_HEADS),
                                       (self.VIT_K, self.VIT_K_HEADS),
                                       (self.VIT_V, self.VIT_V_HEADS)]:
                 for w in range(num_windows):
-                    src = qkv_src + w * seq_len * VD * bpe_off
-                    dst = qkv_dst + w * self.VIT_HEADS * seq_len * hd * bpe_off
+                    src = qkv_src + w * seq_len * VD_QK * bpe_off
+                    dst = qkv_dst + w * self.VIT_HEADS * seq_len * hd_pad * bpe_off
                     self.bf16_permute_core(
-                        dim_0=seq_len, dim_1=self.VIT_HEADS, dim_2=hd,
+                        dim_0=seq_len, dim_1=self.VIT_HEADS, dim_2=hd_pad,
                         INPUT_DRAM_ADDR=src,
                         OUTPUT_DRAM_ADDR=dst,
                     )
 
             # --- 2D RoPE (rotate-half, weights pre-permuted) ---
             # Q and K weights were permuted at load time to [x_lo,y_lo,x_hi,y_hi] layout.
-            # rope_core_dram applies rotate-half which is mathematically equivalent to
-            # the original complex-pair 2D RoPE after that permutation.
             # Global blocks: seq=5184 cos/sin won't fit in URAM_B — skip for now.
             if not is_global:
-                rope_2d_heads_dram(self, num_batches=total_batches, seq_len=seq_len,
-                                   head_dim=hd, QK_DRAM_ADDR=self.VIT_Q_HEADS,
-                                   COS_LO_DRAM_ADDR=rope_cl, COS_HI_DRAM_ADDR=rope_ch,
-                                   SIN_LO_DRAM_ADDR=rope_sl, SIN_HI_DRAM_ADDR=rope_sh)
-                rope_2d_heads_dram(self, num_batches=total_batches, seq_len=seq_len,
-                                   head_dim=hd, QK_DRAM_ADDR=self.VIT_K_HEADS,
-                                   COS_LO_DRAM_ADDR=rope_cl, COS_HI_DRAM_ADDR=rope_ch,
-                                   SIN_LO_DRAM_ADDR=rope_sl, SIN_HI_DRAM_ADDR=rope_sh)
+                rope_2d_vectorized_dram(self, num_batches=total_batches, seq_len=seq_len,
+                                        head_dim=hd_pad, QK_DRAM_ADDR=self.VIT_Q_HEADS,
+                                        COS_LO_DRAM_ADDR=rope_cl, COS_HI_DRAM_ADDR=rope_ch,
+                                        SIN_LO_DRAM_ADDR=rope_sl, SIN_HI_DRAM_ADDR=rope_sh)
+                rope_2d_vectorized_dram(self, num_batches=total_batches, seq_len=seq_len,
+                                        head_dim=hd_pad, QK_DRAM_ADDR=self.VIT_K_HEADS,
+                                        COS_LO_DRAM_ADDR=rope_cl, COS_HI_DRAM_ADDR=rope_ch,
+                                        SIN_LO_DRAM_ADDR=rope_sl, SIN_HI_DRAM_ADDR=rope_sh)
 
             # --- Flash attention ---
             flash_attention_batched(self,
                 num_batches=total_batches,
-                head_dim=hd,
+                head_dim=hd_pad,   # 128
                 seq_len=seq_len,
                 Q_DRAM_ADDR=self.VIT_Q_HEADS,
                 K_DRAM_ADDR=self.VIT_K_HEADS,
@@ -1629,20 +1887,20 @@ class Sam31_UnifiedEngine(UnifiedEngine):
                 SCRATCH_DRAM_ADDR=self.VIT_ATTN_SCRATCH,
             )
 
-            # --- Merge heads: (window*heads, seq, hd) → (window, seq, heads*hd) ---
-            # Per window: bf16_permute_core (16, seq_len, 64) → (seq_len, 16, 64)
+            # --- Merge heads: (window*heads, seq, hd_pad) → (window, seq, heads*hd_pad) ---
+            # Per window: bf16_permute_core (16, seq_len, 128) → (seq_len, 16, 128)
             for w in range(num_windows):
-                src = self.VIT_ATTN_OUT + w * self.VIT_HEADS * seq_len * hd * bpe_off
-                dst = self.VIT_ATTN_MERGED + w * seq_len * VD * bpe_off
+                src = self.VIT_ATTN_OUT + w * self.VIT_HEADS * seq_len * hd_pad * bpe_off
+                dst = self.VIT_ATTN_MERGED + w * seq_len * VD_QK * bpe_off
                 self.bf16_permute_core(
-                    dim_0=self.VIT_HEADS, dim_1=seq_len, dim_2=hd,
+                    dim_0=self.VIT_HEADS, dim_1=seq_len, dim_2=hd_pad,
                     INPUT_DRAM_ADDR=src,
                     OUTPUT_DRAM_ADDR=dst,
                 )
 
             # --- Output projection ---
             self.matmat_mul_core(
-                M=M_flat, K=self.VIT_DIM, N=self.VIT_DIM,
+                M=M_flat, K=self.VIT_QK_DIM_PAD, N=self.VIT_DIM,   # K=2048, N=1024
                 A_DRAM_ADDR=self.VIT_ATTN_MERGED,
                 B_DRAM_ADDR=bw['proj_weight'],
                 OUTPUT_DRAM_ADDR=self.VIT_OUT_PROJ,
@@ -1697,11 +1955,15 @@ class Sam31_UnifiedEngine(UnifiedEngine):
             eltwise_add_dram(self, self.VIT_RESIDUAL, self.VIT_MLP_OUT,
                              self.VIT_LAYER_IN, self.GRID_AREA * self.VIT_DIM)
 
-            # PASSED: full ViT block 0 (no RoPE)
+            # Per-block instruction count
+            _blk_inst = self.capture_count - _blk_start
+            _total_inst = self.capture_count - _pre_vit_inst
+            _type = "GLOBAL" if is_global else "local"
+            _original_print(f"    Block {blk_idx:2d} ({_type}): {_blk_inst:>10,} inst  |  cumulative: {_total_inst:>12,} inst  ({_total_inst * 32 / 1024**2:.0f} MB)")
 
-            # ---- CHECKPOINT: narrow down the failure ----
-            if blk_idx == 5:
-                raise _CheckpointStop("after ViT blocks 0-5")
+            # ---- CHECKPOINT ----
+            if blk_idx == getattr(self, '_vit_checkpoint', 31):
+                raise _CheckpointStop(f"after ViT blocks 0-{blk_idx}")
 
         # ViT output is now in VIT_LAYER_IN: (5184, 1024) = (72, 72, 1024)
 
@@ -2357,7 +2619,7 @@ class Sam31_UnifiedEngine(UnifiedEngine):
         All computation uses bf16 tensors to mirror HW flash_attention_core:
           - Q scaled BEFORE matmul (broadcast_mul), not after
           - bf16 matmul for Q@K^T and softmax@V
-          - bf16 softmax
+          - softmax in float32 internally (matches HW flash_attention_core)
         LayerNorm upcasts to float32 internally (same as HW layer_norm_core).
         RoPE uses compute_axial_cis + apply_rotary_enc (complex-pair, mathematically
         equivalent to the rotate-half + weight-permutation path on HW).
@@ -2404,11 +2666,18 @@ class Sam31_UnifiedEngine(UnifiedEngine):
                 num_win = 1
                 seq = GA
 
-            # Q, K, V projections (bf16 matmul — matches HW matmat_mul_core)
+            # Q, K, V projections — use HW-matching pre-permuted Q/K weights
+            # so rotate-half RoPE produces identical bf16 rounding to HW.
+            _perm = _make_rope_perm(self.VIT_HEADS, self.VIT_HEAD_DIM)
             qkv_w = sd[prefix + "attn.qkv.weight"].to(torch.bfloat16)
             qkv_b = sd[prefix + "attn.qkv.bias"].to(torch.bfloat16)
-            q_w, k_w, v_w = qkv_w.chunk(3, dim=0)
-            q_b, k_b, v_b = qkv_b.chunk(3, dim=0)
+            _VD = self.VIT_DIM
+            q_w = qkv_w[0:_VD][_perm]        # pre-permute Q rows (same as HW weight_init)
+            k_w = qkv_w[_VD:2*_VD][_perm]    # pre-permute K rows
+            v_w = qkv_w[2*_VD:3*_VD]         # V untouched
+            q_b = qkv_b[0:_VD][_perm]
+            k_b = qkv_b[_VD:2*_VD][_perm]
+            v_b = qkv_b[2*_VD:3*_VD]
             Q = F.linear(windowed, q_w, q_b)
             K = F.linear(windowed, k_w, k_b)
             V = F.linear(windowed, v_w, v_b)
@@ -2420,25 +2689,40 @@ class Sam31_UnifiedEngine(UnifiedEngine):
             K = K.reshape(num_win, seq, nh, hd).permute(0, 2, 1, 3)
             V = V.reshape(num_win, seq, nh, hd).permute(0, 2, 1, 3)
 
-            # --- 2D RoPE (complex-pair, matches HW rotate-half + weight permutation) ---
-            if compute_axial_cis is not None and not is_global:
+            # --- 2D RoPE (rotate-half, SAME as HW) ---
+            # Uses the same formula and tables as rope_2d_heads_dram to get
+            # identical bf16 rounding. Complex-pair was "mathematically equivalent"
+            # but produced different rounding errors that compounded through blocks.
+            if not is_global:
                 rope_theta = self.cfg["model"]["rope_theta"]
-                rope_scale = 1.0  # windowed: scale=1.0
-                freqs = compute_axial_cis(
-                    dim=hd, end_x=ws, end_y=ws,
-                    theta=rope_theta, scale_pos=rope_scale
-                ).to(Q.device)  # (seq, hd//2) complex
-                # apply_rotary_enc expects (batch, heads, seq, hd)
-                Q_rot, K_rot = apply_rotary_enc(Q, K, freqs_cis=freqs)
-                Q = Q_rot.to(torch.bfloat16)
-                K = K_rot.to(torch.bfloat16)
+                cos_table, neg_sin = precompute_rope_2d(
+                    ws, ws, hd, theta=rope_theta, scale_pos=1.0)
+                half = hd // 2
+                # Apply rotate-half per head (matching HW rope_2d_heads_dram)
+                Q_flat = Q.reshape(-1, seq, hd)  # (num_win*nh, seq, hd)
+                K_flat = K.reshape(-1, seq, hd)
+                cos_t = cos_table.to(torch.bfloat16)  # (seq, hd)
+                sin_t = neg_sin.to(torch.bfloat16)     # (seq, hd)
+                for qk in [Q_flat, K_flat]:
+                    x_lo = qk[..., :half]
+                    x_hi = qk[..., half:]
+                    cos_lo = cos_t[:, :half]
+                    cos_hi = cos_t[:, half:]
+                    sin_lo = sin_t[:, :half]
+                    sin_hi = sin_t[:, half:]
+                    out_lo = x_lo * cos_lo + x_hi * sin_lo
+                    out_hi = x_hi * cos_hi + x_lo * sin_hi
+                    qk[..., :half] = out_lo.to(torch.bfloat16)
+                    qk[..., half:] = out_hi.to(torch.bfloat16)
+                Q = Q_flat.reshape(num_win, nh, seq, hd)
+                K = K_flat.reshape(num_win, nh, seq, hd)
 
             Q = Q.reshape(-1, seq, hd)
             K = K.reshape(-1, seq, hd)
             V = V.reshape(-1, seq, hd)
 
             # --- Manual attention matching HW flash_attention_core ---
-            # HW: broadcast_mul scales Q first, then Q_scaled @ K^T, bf16 softmax, @ V
+            # HW: broadcast_mul scales Q first, then Q_scaled @ K^T, softmax (fp32 internal), @ V
             scale = 1.0 / math.sqrt(hd)
             Q_scaled = Q * scale                                     # scale Q first (matches HW broadcast_mul)
             scores = torch.bmm(Q_scaled, K.transpose(-2, -1))       # bf16 matmul → bf16 scores
@@ -2473,11 +2757,13 @@ class Sam31_UnifiedEngine(UnifiedEngine):
             normed2 = ln2(x.float()).to(torch.bfloat16)
 
             # MLP: fc1 + GELU, fc2 (all bf16 — matches HW matmat_mul_core with gelu_enable)
+            # HW GELU uses sigmoid approximation: x * sigmoid(1.702x), NOT exact GELU.
             fc1_w = sd[prefix + "mlp.fc1.weight"].to(torch.bfloat16)
             fc1_b = sd[prefix + "mlp.fc1.bias"].to(torch.bfloat16)
             fc2_w = sd[prefix + "mlp.fc2.weight"].to(torch.bfloat16)
             fc2_b = sd[prefix + "mlp.fc2.bias"].to(torch.bfloat16)
-            mlp_mid = F.gelu(F.linear(normed2, fc1_w, fc1_b))
+            fc1_out = F.linear(normed2, fc1_w, fc1_b)
+            mlp_mid = fc1_out * torch.sigmoid(1.702 * fc1_out)       # HW-matching GELU
             mlp_out = F.linear(mlp_mid, fc2_w, fc2_b)
 
             # residual 2
@@ -2491,27 +2777,116 @@ class Sam31_UnifiedEngine(UnifiedEngine):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
-        """Cosine similarity between two flat tensors."""
-        a, b = a.float().flatten(), b.float().flatten()
-        return torch.nn.functional.cosine_similarity(
-            a.unsqueeze(0), b.unsqueeze(0)).item()
+    def tensor_metrics(hw: torch.Tensor, ref: torch.Tensor) -> dict:
+        """Compute numerical quality metrics between HW and CPU reference tensors.
+
+        SNR is the primary metric — it captures both signal magnitude and error
+        magnitude in a single dB value, and is robust to the near-zero values
+        common in ViT residual streams where cosine similarity breaks down.
+
+        BF16 theoretical floor per operation: ~43 dB (7 mantissa bits).
+        After N accumulated ops, expect gradual decay — a sudden drop indicates a bug.
+
+        Returns:
+            snr_db:    Signal-to-noise ratio in dB. >40=excellent, 20-40=ok, <20=bad.
+            cos:       Cosine similarity [0,1]. Detects directional divergence.
+            max_err:   Max absolute element-wise error.
+            mean_err:  Mean absolute element-wise error.
+            pct_1ulp:  % elements within 1 bf16 ULP (~0.0078) of reference.
+        """
+        hw  = hw.float().flatten()
+        ref = ref.float().flatten()
+        err = hw - ref
+
+        signal_power = (ref ** 2).mean().clamp(min=1e-30)
+        noise_power  = (err ** 2).mean().clamp(min=1e-30)
+        snr_db = 10.0 * math.log10(signal_power / noise_power)
+
+        cos = torch.nn.functional.cosine_similarity(
+            hw.unsqueeze(0), ref.unsqueeze(0)).item()
+
+        abs_err = err.abs()
+        bf16_ulp = 0.0078125  # bf16 machine epsilon (1/128)
+
+        return {
+            "snr_db":   snr_db,
+            "cos":      cos,
+            "max_err":  abs_err.max().item(),
+            "mean_err": abs_err.mean().item(),
+            "pct_1ulp": (abs_err <= bf16_ulp).float().mean().item() * 100.0,
+        }
 
     def validate(self, dram_addr: int, num_elements: int,
-                 cpu_ref: torch.Tensor, label: str) -> float:
-        """Read HW result from DRAM, compare with CPU reference."""
-        hw = self.read_tensor_from_dram(dram_addr, num_elements)
-        ref = cpu_ref.to(torch.bfloat16).flatten()[:num_elements]
-        sim = self.cosine_sim(hw, ref)
-        status = "PASS" if sim > 0.99 else ("CLOSE" if sim > 0.95 else "FAIL")
-        _original_print(f"  [{status}] {label}: cosine_sim = {sim:.6f}")
-        return sim
+                 cpu_ref: torch.Tensor, label: str) -> dict:
+        """Read HW result from DRAM, compare with CPU reference, print metrics."""
+        hw  = self.read_tensor_from_dram(dram_addr, num_elements).float()
+        ref = cpu_ref.to(torch.bfloat16).float().flatten()[:num_elements]
+        m   = self.tensor_metrics(hw, ref)
+
+        status = "PASS" if m["snr_db"] > 40 else ("CLOSE" if m["snr_db"] > 20 else "FAIL")
+        _original_print(
+            f"  [{status}] {label}: "
+            f"SNR={m['snr_db']:.1f}dB  cos={m['cos']:.6f}  "
+            f"maxErr={m['max_err']:.4f}  meanErr={m['mean_err']:.6f}  "
+            f"within1ULP={m['pct_1ulp']:.1f}%"
+        )
+        return m
 
 
 
 # =============================================================================
 # Main
 # =============================================================================
+
+def _vit_block_validate(ue: "Sam31_UnifiedEngine", image_path: str, num_blocks: int) -> None:
+    """Compile + run HW for num_blocks ViT blocks, compare per-block with CPU reference.
+
+    For each block N we:
+      1. Set checkpoint to N, compile and run HW — reads VIT_LAYER_IN after block N.
+      2. Run CPU reference for N+1 blocks (same output point).
+      3. Report cosine_sim, max_abs_error, mean_abs_error.
+
+    This pinpoints the first block where HW diverges from CPU.
+    """
+    GA   = ue.GRID_AREA
+    VD   = ue.VIT_DIM
+    n    = GA * VD
+
+    _original_print(f"\n  {'Blk':<4} {'Type':<7} {'SNR(dB)':>9} {'Cos':>9} {'MaxErr':>8} {'MeanErr':>9} {'1ULP%':>7}  Status")
+    _original_print(f"  {'-'*4} {'-'*7} {'-'*9} {'-'*9} {'-'*8} {'-'*9} {'-'*7}  ------")
+
+    for blk in range(num_blocks):
+        # --- HW: compile up to block blk ---
+        ue._vit_checkpoint = blk
+        try:
+            prog_addr = ue.compile_full_fused()
+        except _CheckpointStop:
+            pass
+        except Exception as e:
+            _original_print(f"  [{blk:2d}] compile error: {e}")
+            break
+        ue.run_hw(image_path, prog_addr)
+        hw  = ue.read_tensor_from_dram(ue.VIT_LAYER_IN, n).float()
+
+        # --- CPU reference for blk+1 blocks ---
+        cpu = ue.cpu_reference_vit_blocks(image_path, num_blocks=blk + 1).float().flatten()[:n]
+
+        # --- Metrics ---
+        m = Sam31_UnifiedEngine.tensor_metrics(hw, cpu)
+
+        btype  = "GLOBAL" if blk in ue.VIT_GLOBAL_BLOCKS else "local"
+        status = "PASS" if m["snr_db"] > 40 else ("CLOSE" if m["snr_db"] > 20 else "FAIL")
+        _original_print(
+            f"  {blk:2d}   {btype:<7} {m['snr_db']:9.1f} {m['cos']:9.6f} "
+            f"{m['max_err']:8.4f} {m['mean_err']:9.6f} {m['pct_1ulp']:7.1f}%  {status}"
+        )
+
+        if m["snr_db"] < 20:
+            _original_print(f"\n  *** Divergence at block {blk} (SNR < 20 dB) — stopping. ***")
+            break
+
+    del ue._vit_checkpoint
+
 
 def main():
     import argparse
@@ -2520,7 +2895,17 @@ def main():
     parser.add_argument("--prompt", type=str, default="car", help="Text prompt")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device")
     parser.add_argument("--cycle", type=float, default=5.62, help="Clock cycle time in ns")
+    parser.add_argument("--validate-vit", action="store_true",
+                        help="Per-block HW vs CPU validation (slow: one compile+run per block)")
+    parser.add_argument("--validate-blocks", type=int, default=8,
+                        help="Number of blocks to validate with --validate-vit (default: 8)")
+    parser.add_argument("--test-pad-weight", action="store_true",
+                        help="Run unit test for build_padded_qk_weight (no hardware needed)")
     args = parser.parse_args()
+
+    if args.test_pad_weight:
+        _test_build_padded_qk_weight()
+        return
 
     global _SILENT_MODE
     _SILENT_MODE = True
@@ -2532,31 +2917,32 @@ def main():
 
     _original_print(f"SAM 3.1 on {args.dev}")
 
-    # Create engine (loads weights fresh every time)
     t0 = _time.perf_counter()
     ue = Sam31_UnifiedEngine(script_dir=SCRIPT_DIR)
     _original_print(f"  Weights: {_time.perf_counter() - t0:.3f}s")
 
-    # Compile
-    t1 = _time.perf_counter()
-    prog_addr = ue.compile_full_fused()
-    _original_print(f"  Compile: {_time.perf_counter() - t1:.3f}s")
+    if args.validate_vit:
+        # Per-block HW vs CPU validation
+        _original_print(f"  Validating ViT blocks 0-{args.validate_blocks - 1} (per-block)...")
+        _vit_block_validate(ue, image_path, num_blocks=args.validate_blocks)
+    else:
+        # Normal compile + run + single validate
+        t1 = _time.perf_counter()
+        prog_addr = ue.compile_full_fused()
+        _original_print(f"  Compile: {_time.perf_counter() - t1:.3f}s")
 
-    # Run HW
-    t2 = _time.perf_counter()
-    ue.run_hw(image_path, prog_addr)
-    _original_print(f"  Execute: {_time.perf_counter() - t2:.3f}s")
+        t2 = _time.perf_counter()
+        ue.run_hw(image_path, prog_addr)
+        _original_print(f"  Execute: {_time.perf_counter() - t2:.3f}s")
 
-    # CPU reference + validate
-    _original_print("  Running CPU reference...")
-    cpu_ref = ue.cpu_reference_vit_blocks(image_path, num_blocks=6)
-
-    ue.validate(
-        dram_addr=ue.VIT_LAYER_IN,
-        num_elements=ue.GRID_AREA * ue.VIT_DIM,
-        cpu_ref=cpu_ref,
-        label="ViT blocks 0-5",
-    )
+        _original_print("  Running CPU reference...")
+        cpu_ref = ue.cpu_reference_vit_blocks(image_path, num_blocks=32)
+        ue.validate(
+            dram_addr=ue.VIT_LAYER_IN,
+            num_elements=ue.GRID_AREA * ue.VIT_DIM,
+            cpu_ref=cpu_ref,
+            label="ViT blocks 0-31",
+        )
 
 
 if __name__ == "__main__":
