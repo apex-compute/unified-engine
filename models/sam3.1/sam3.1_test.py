@@ -50,6 +50,7 @@ builtins.print = quiet_print
 
 import user_dma_core
 user_dma_core.MAX_DECODER_INSTRUCTIONS = (0x100000000 - 0x9C000000) // 32  # Section 1: 1.6 GB instruction budget
+# Section 2 uses 1 GB instructions (0xC0000000–0xFFFFFFFF); override before instantiating S2 engine.
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
@@ -1103,24 +1104,42 @@ def _ensure_bpe_vocab(script_dir: str, cfg: dict) -> str:
 #   Tensors:     0x80000000 – 0x9BFFFFFF  (448 MB) activations / scratch
 #   Instructions:0x9C000000 – 0xFFFFFFFF  (1.6 GB) compiled instruction stream
 #
-# At end of Section 1: ViT output (GA × VIT_DIM) is DMA'd to host.
+# At end of Section 1: ViT output (5184, 1024) is DMA'd to host.
 # DRAM is then reconfigured for Section 2 (FPN + text + decoder).
 # =============================================================================
 SAM31_S1_PARAMS_BASE  = 0x00000000   # 0.00 GB — ViT weights + RoPE tables
 SAM31_S1_TENSOR_BASE  = 0x80000000   # 2.00 GB — ViT activations / scratch
 SAM31_S1_PROGRAM_BASE = 0x9C000000   # 2.44 GB — ViT instruction stream
 
-# Aliases for current use (remove when Section 2 is added)
+# =============================================================================
+# Section 2 DRAM layout — FPN neck + text encoder + geometry encoder +
+#                          encoder fusion + decoder + scoring + seg head
+#   Params:      0x00000000 – 0x7FFFFFFF  (2 GB)   all S2 weights
+#   Tensors:     0x80000000 – 0xBFFFFFFF  (1 GB)   activations / scratch
+#   Instructions:0xC0000000 – 0xFFFFFFFF  (1 GB)   compiled instruction stream
+#
+# S2 params budget: ~820 M detector params in BF16 ≈ 1.64 GB (fits in 2 GB).
+# S2 tensor budget: 1 GB for FPN outputs (FPN_4x=42 MB, FPN_2x=11 MB, FPN_1x=3 MB),
+#                   im2col scratch, text/geo/enc/dec activations.
+# S2 program budget: 1 GB instruction stream for all post-ViT stages.
+# =============================================================================
+SAM31_S2_PARAMS_BASE  = 0x00000000   # 0.00 GB — S2 weights
+SAM31_S2_TENSOR_BASE  = 0x80000000   # 2.00 GB — S2 activations / scratch
+SAM31_S2_PROGRAM_BASE = 0xC0000000   # 3.00 GB — S2 instruction stream
+SAM31_S2_INSTRUCTIONS_MAX = (0x100000000 - 0xC0000000) // 32  # 1 GB → 33,554,432 instructions
+
+# Aliases pointing at Section 1 (the active section).
+# Switch to SAM31_S2_* when instantiating the Section 2 engine.
 SAM31_PARAMS_BASE  = SAM31_S1_PARAMS_BASE
 SAM31_TENSOR_BASE  = SAM31_S1_TENSOR_BASE
 SAM31_PROGRAM_BASE = SAM31_S1_PROGRAM_BASE
 
 
 # =============================================================================
-# Sam31_UnifiedEngine
+# Sam31_S1_UnifiedEngine
 # =============================================================================
 
-class Sam31_UnifiedEngine(UnifiedEngine):
+class Sam31_S1_UnifiedEngine(UnifiedEngine):
     """SAM 3.1 text-prompted image segmentation on Unified Engine FPGA accelerator.
 
     Architecture (image-only, single frame):
@@ -1691,6 +1710,10 @@ class Sam31_UnifiedEngine(UnifiedEngine):
         self.MASK_EMBED_L2_W = self._alloc_param(sd[seg_prefix + "mask_predictor.mask_embed.layers.2.weight"])
         self.MASK_EMBED_L2_B = self._alloc_param(sd[seg_prefix + "mask_predictor.mask_embed.layers.2.bias"])
 
+        # Identity matrix (512×512) for GELU-only matmul on FPN 4x intermediate
+        self.FPN_GELU_IDENTITY = self._alloc_param(
+            torch.eye(512, dtype=torch.bfloat16))
+
         params_used = self.get_params_dram_usage()
         _original_print(f"  Params loaded: {params_used / 1024**2:.1f} MB ({params_used / 1024**3:.2f} GB)")
         del sd  # free host memory
@@ -2009,428 +2032,7 @@ class Sam31_UnifiedEngine(UnifiedEngine):
                 raise _CheckpointStop(f"after ViT blocks 0-{blk_idx}")
 
         # ViT output is now in VIT_LAYER_IN: (5184, 1024) = (72, 72, 1024)
-
-        # ==============================================================
-        # PHASE 2: FPN NECK
-        # ==============================================================
-        # All scales derive from VIT_LAYER_IN (72, 72, 1024)
-
-        # Scale 1x: Conv1x1(1024→256) + Conv3x3(256→256) → FPN_1X_OUT (72, 72, 256)
-        conv2d_1x1_dram(self, self.VIT_LAYER_IN, self.FPN_CONV_TEMP,
-                        self.fpn_1x['conv1x1_w'], self.fpn_1x['conv1x1_b'],
-                        H=72, W=72, C_in=1024, C_out=256)
-        conv2d_3x3_dram(self, self.FPN_CONV_TEMP, self.FPN_1X_OUT, self.FPN_IM2COL,
-                        self.fpn_1x['conv3x3_w'], self.fpn_1x['conv3x3_b'],
-                        H=72, W=72, C_in=256, C_out=256)
-
-        # Scale 2x: ConvT(1024→512, 2x) + Conv1x1(512→256) + Conv3x3(256→256) → FPN_2X_OUT
-        conv_transpose2d_2x2_dram(self, self.VIT_LAYER_IN, self.FPN_2X_DECONV, self.FPN_CONV_TEMP,
-                                   self.fpn_2x['dconv_slices'], self.fpn_2x['dconv_bias'],
-                                   H=72, W=72, C_in=1024, C_out=512)
-        conv2d_1x1_dram(self, self.FPN_2X_DECONV, self.FPN_CONV_TEMP,
-                        self.fpn_2x['conv1x1_w'], self.fpn_2x['conv1x1_b'],
-                        H=144, W=144, C_in=512, C_out=256)
-        conv2d_3x3_dram(self, self.FPN_CONV_TEMP, self.FPN_2X_OUT, self.FPN_IM2COL,
-                        self.fpn_2x['conv3x3_w'], self.fpn_2x['conv3x3_b'],
-                        H=144, W=144, C_in=256, C_out=256)
-
-        # Scale 4x: ConvT(1024→512) + GELU + ConvT(512→256) + Conv1x1 + Conv3x3 → FPN_4X_OUT
-        conv_transpose2d_2x2_dram(self, self.VIT_LAYER_IN, self.FPN_4X_DECONV0, self.FPN_CONV_TEMP,
-                                   self.fpn_4x['dconv0_slices'], self.fpn_4x['dconv0_bias'],
-                                   H=72, W=72, C_in=1024, C_out=512)
-        # GELU on FPN_4X_DECONV0: apply via matmul identity trick or dedicated GELU
-        # NOTE: Hardware GELU only available fused with matmul. For standalone GELU,
-        # use matmul with identity weight matrix and gelu_enable=True.
-        conv_transpose2d_2x2_dram(self, self.FPN_4X_DECONV0, self.FPN_4X_DECONV1, self.FPN_CONV_TEMP,
-                                   self.fpn_4x['dconv1_slices'], self.fpn_4x['dconv1_bias'],
-                                   H=144, W=144, C_in=512, C_out=256)
-        conv2d_1x1_dram(self, self.FPN_4X_DECONV1, self.FPN_CONV_TEMP,
-                        self.fpn_4x['conv1x1_w'], self.fpn_4x['conv1x1_b'],
-                        H=288, W=288, C_in=256, C_out=256)
-        conv2d_3x3_dram(self, self.FPN_CONV_TEMP, self.FPN_4X_OUT, self.FPN_IM2COL,
-                        self.fpn_4x['conv3x3_w'], self.fpn_4x['conv3x3_b'],
-                        H=288, W=288, C_in=256, C_out=256)
-
-        # FPN outputs: FPN_4X_OUT (288²,256), FPN_2X_OUT (144²,256), FPN_1X_OUT (72²,256)
-
-        # ==============================================================
-        # PHASE 3: TEXT ENCODER (24 layers, causal attention)
-        # ==============================================================
-        # NOTE: Token IDs are embedded on host; TEXT_TOKENS loaded via DMA before execution.
-        # TEXT_TOKENS starts as (32, 1024) = token_embed + pos_embed
-
-        for t_idx in range(self.TEXT_LAYERS):
-            tw = self.text_block_weights[t_idx]
-            layer_in = self.TEXT_TOKENS if t_idx == 0 else self.TEXT_TOKENS
-
-            # LN → self-attn (causal) → residual → LN → MLP → residual
-            self.layer_norm_core_dram(
-                M=self.TEXT_CTX_LEN, N=self.TEXT_WIDTH,
-                A_DRAM_ADDR=layer_in,
-                OUTPUT_DRAM_ADDR=self.TEXT_LN_OUT,
-                GAMMA_DRAM_ADDR=tw['ln1_w'], BETA_DRAM_ADDR=tw['ln1_b'])
-
-            # QKV projection
-            self.matmat_mul_core(
-                M=self.TEXT_CTX_LEN, K=self.TEXT_WIDTH, N=3 * self.TEXT_WIDTH,
-                A_DRAM_ADDR=self.TEXT_LN_OUT,
-                B_DRAM_ADDR=tw['attn_in_proj_w'],
-                OUTPUT_DRAM_ADDR=self.TEXT_QKV,
-                C_DRAM_ADDR=tw['attn_in_proj_b'],
-                bias_mode="broadcast_N")
-
-            # Split QKV + reshape to multi-head
-            # Text head_dim=64 = aligned, so direct permute
-            for qkv_i, h_addr in enumerate([self.TEXT_Q_HEADS, self.TEXT_K_HEADS, self.TEXT_V_HEADS]):
-                multihead_reshape_dram(self,
-                    INPUT_DRAM_ADDR=self.TEXT_QKV + qkv_i * self.TEXT_WIDTH * bpe,
-                    OUTPUT_DRAM_ADDR=h_addr,
-                    TEMP_DRAM_ADDR=self.TEXT_PERMUTE_TEMP,
-                    seq_len=self.TEXT_CTX_LEN,
-                    num_heads=self.TEXT_HEADS,
-                    head_dim=self.TEXT_HEAD_DIM,
-                    head_dim_pad=self.TEXT_HEAD_DIM)  # no pad needed
-
-            # Causal self-attention with causal mask as bias
-            flash_attention_batched(self,
-                num_batches=self.TEXT_HEADS,
-                head_dim=self.TEXT_HEAD_DIM,
-                seq_len=self.TEXT_CTX_LEN,
-                Q_DRAM_ADDR=self.TEXT_Q_HEADS,
-                K_DRAM_ADDR=self.TEXT_K_HEADS,
-                V_DRAM_ADDR=self.TEXT_V_HEADS,
-                OUTPUT_DRAM_ADDR=self.TEXT_ATTN_OUT,
-                SCRATCH_DRAM_ADDR=self.TEXT_ATTN_SCRATCH,
-                BIAS_DRAM_ADDR=self.CAUSAL_MASK)
-
-            # Merge heads + output projection
-            multihead_merge_dram(self,
-                INPUT_DRAM_ADDR=self.TEXT_ATTN_OUT,
-                OUTPUT_DRAM_ADDR=self.TEXT_MERGED,
-                TEMP_DRAM_ADDR=self.TEXT_PERMUTE_TEMP,
-                seq_len=self.TEXT_CTX_LEN,
-                num_heads=self.TEXT_HEADS,
-                head_dim=self.TEXT_HEAD_DIM,
-                head_dim_pad=self.TEXT_HEAD_DIM)
-
-            self.matmat_mul_core(
-                M=self.TEXT_CTX_LEN, K=self.TEXT_WIDTH, N=self.TEXT_WIDTH,
-                A_DRAM_ADDR=self.TEXT_MERGED,
-                B_DRAM_ADDR=tw['attn_out_proj_w'],
-                OUTPUT_DRAM_ADDR=self.TEXT_LN_OUT,
-                C_DRAM_ADDR=tw['attn_out_proj_b'],
-                bias_mode="broadcast_N")
-
-            # Residual add
-            eltwise_add_dram(self, layer_in, self.TEXT_LN_OUT,
-                             self.TEXT_RESIDUAL, self.TEXT_CTX_LEN * self.TEXT_WIDTH)
-
-            # MLP
-            self.layer_norm_core_dram(
-                M=self.TEXT_CTX_LEN, N=self.TEXT_WIDTH,
-                A_DRAM_ADDR=self.TEXT_RESIDUAL,
-                OUTPUT_DRAM_ADDR=self.TEXT_LN_OUT,
-                GAMMA_DRAM_ADDR=tw['ln2_w'], BETA_DRAM_ADDR=tw['ln2_b'])
-
-            self.matmat_mul_core(
-                M=self.TEXT_CTX_LEN, K=self.TEXT_WIDTH, N=self.TEXT_MLP_HIDDEN,
-                A_DRAM_ADDR=self.TEXT_LN_OUT,
-                B_DRAM_ADDR=tw['mlp_fc_w'],
-                OUTPUT_DRAM_ADDR=self.TEXT_MLP_MID,
-                C_DRAM_ADDR=tw['mlp_fc_b'],
-                bias_mode="broadcast_N", gelu_enable=True)
-
-            self.matmat_mul_core(
-                M=self.TEXT_CTX_LEN, K=self.TEXT_MLP_HIDDEN, N=self.TEXT_WIDTH,
-                A_DRAM_ADDR=self.TEXT_MLP_MID,
-                B_DRAM_ADDR=tw['mlp_proj_w'],
-                OUTPUT_DRAM_ADDR=self.TEXT_MLP_OUT,
-                C_DRAM_ADDR=tw['mlp_proj_b'],
-                bias_mode="broadcast_N")
-
-            eltwise_add_dram(self, self.TEXT_RESIDUAL, self.TEXT_MLP_OUT,
-                             self.TEXT_TOKENS, self.TEXT_CTX_LEN * self.TEXT_WIDTH)
-
-        # LN_final
-        self.layer_norm_core_dram(
-            M=self.TEXT_CTX_LEN, N=self.TEXT_WIDTH,
-            A_DRAM_ADDR=self.TEXT_TOKENS,
-            OUTPUT_DRAM_ADDR=self.TEXT_TOKENS,
-            GAMMA_DRAM_ADDR=self.TEXT_LN_FINAL_W,
-            BETA_DRAM_ADDR=self.TEXT_LN_FINAL_B)
-
-        # Resizer: (32, 1024) @ (256, 1024)^T + bias → (32, 256)
-        self.matmat_mul_core(
-            M=self.TEXT_CTX_LEN, K=self.TEXT_WIDTH, N=self.D_MODEL,
-            A_DRAM_ADDR=self.TEXT_TOKENS,
-            B_DRAM_ADDR=self.TEXT_RESIZER_W,
-            OUTPUT_DRAM_ADDR=self.TEXT_RESIZED,
-            C_DRAM_ADDR=self.TEXT_RESIZER_B,
-            bias_mode="broadcast_N")
-
-        # ==============================================================
-        # PHASE 4: GEOMETRY ENCODER (CLS token for text-only)
-        # ==============================================================
-        # CLS embed → final_proj + norm → 3 cross-attention layers → encode_norm
-        dram_copy(self, self.GEO_CLS_EMBED, self.GEO_EMBED, self.D_MODEL)
-
-        # final_proj: (1, 256) @ (256, 256)^T + bias → (1, 256)
-        self.matmat_mul_core(
-            M=1, K=self.D_MODEL, N=self.D_MODEL,
-            A_DRAM_ADDR=self.GEO_EMBED,
-            B_DRAM_ADDR=self.GEO_FINAL_PROJ_W,
-            OUTPUT_DRAM_ADDR=self.GEO_EMBED,
-            C_DRAM_ADDR=self.GEO_FINAL_PROJ_B,
-            bias_mode="broadcast_N")
-
-        self.layer_norm_core_dram(
-            M=1, N=self.D_MODEL,
-            A_DRAM_ADDR=self.GEO_EMBED,
-            OUTPUT_DRAM_ADDR=self.GEO_EMBED,
-            GAMMA_DRAM_ADDR=self.GEO_NORM_W,
-            BETA_DRAM_ADDR=self.GEO_NORM_B)
-
-        # 3 cross-attention layers (CLS attends to image features)
-        # Image features for geo encoder: FPN_1X_OUT reshaped to (5184, 256)
-        for gi in range(self.GEO_LAYERS):
-            gw = self.geo_layer_weights[gi]
-            # Self-attention on CLS (seq_len=1 → trivial, just passes through)
-            # Cross-attention: CLS → image (q_len=1, kv_len=5184)
-            # FFN
-
-            # Norm1 + self-attn (identity for seq_len=1)
-            self.layer_norm_core_dram(
-                M=1, N=self.D_MODEL,
-                A_DRAM_ADDR=self.GEO_EMBED,
-                OUTPUT_DRAM_ADDR=self.GEO_EMBED,
-                GAMMA_DRAM_ADDR=gw['norm1_w'], BETA_DRAM_ADDR=gw['norm1_b'])
-
-            # Norm2 + cross-attention (CLS queries image)
-            self.layer_norm_core_dram(
-                M=1, N=self.D_MODEL,
-                A_DRAM_ADDR=self.GEO_EMBED,
-                OUTPUT_DRAM_ADDR=self.GEO_SCRATCH,  # reuse as temp
-                GAMMA_DRAM_ADDR=gw['norm2_w'], BETA_DRAM_ADDR=gw['norm2_b'])
-
-            # Cross-attn QKV: Q from CLS (1, 256), K/V from image (5184, 256)
-            # Q proj: (1, 256) → (1, 768) split to Q(1,256)
-            # K proj: (5184, 256) → (5184, 768) split to K(5184,256)
-            # V proj: same → V(5184,256)
-            # For simplicity, project Q separately and K/V from image
-            # TODO: Implement full cross-attention QKV projection here
-            # Placeholder: skip cross-attention detail for geo encoder
-            # (minimal impact since CLS is just 1 token)
-
-            # Norm3 + FFN
-            self.layer_norm_core_dram(
-                M=1, N=self.D_MODEL,
-                A_DRAM_ADDR=self.GEO_EMBED,
-                OUTPUT_DRAM_ADDR=self.GEO_SCRATCH,
-                GAMMA_DRAM_ADDR=gw['norm3_w'], BETA_DRAM_ADDR=gw['norm3_b'])
-
-            self.matmat_mul_core(
-                M=1, K=self.D_MODEL, N=self.ENC_FFN_DIM,
-                A_DRAM_ADDR=self.GEO_SCRATCH,
-                B_DRAM_ADDR=gw['ffn_l1_w'],
-                OUTPUT_DRAM_ADDR=self.GEO_SCRATCH,
-                C_DRAM_ADDR=gw['ffn_l1_b'],
-                bias_mode="broadcast_N")
-            # ReLU: NOTE: need relu activation here (encoder uses relu, not gelu)
-            self.matmat_mul_core(
-                M=1, K=self.ENC_FFN_DIM, N=self.D_MODEL,
-                A_DRAM_ADDR=self.GEO_SCRATCH,
-                B_DRAM_ADDR=gw['ffn_l2_w'],
-                OUTPUT_DRAM_ADDR=self.GEO_SCRATCH,
-                C_DRAM_ADDR=gw['ffn_l2_b'],
-                bias_mode="broadcast_N")
-            eltwise_add_dram(self, self.GEO_EMBED, self.GEO_SCRATCH, self.GEO_EMBED, self.D_MODEL)
-
-        # Encode norm
-        self.layer_norm_core_dram(
-            M=1, N=self.D_MODEL,
-            A_DRAM_ADDR=self.GEO_EMBED,
-            OUTPUT_DRAM_ADDR=self.GEO_EMBED,
-            GAMMA_DRAM_ADDR=self.GEO_ENCODE_NORM_W,
-            BETA_DRAM_ADDR=self.GEO_ENCODE_NORM_B)
-
-        # ==============================================================
-        # PHASE 5: CONCATENATE PROMPT [text(32,256) ; geo_cls(1,256)] → (33,256)
-        # ==============================================================
-        dram_copy(self, self.TEXT_RESIZED, self.PROMPT_FEATS,
-                  self.TEXT_CTX_LEN * self.D_MODEL)
-        dram_copy(self, self.GEO_EMBED,
-                  self.PROMPT_FEATS + self.TEXT_CTX_LEN * self.D_MODEL * bpe,
-                  self.D_MODEL)
-
-        # ==============================================================
-        # PHASE 6: ENCODER FUSION (6 layers, image self-attn + cross-attn to text)
-        # ==============================================================
-        # Input: image features from FPN_1X_OUT (72², 256), prompt (33, 256)
-        dram_copy(self, self.FPN_1X_OUT, self.ENC_INPUT, self.GRID_AREA * self.D_MODEL)
-
-        for ei in range(self.ENC_LAYERS):
-            ew = self.enc_layer_weights[ei]
-
-            # --- Self-attention on image tokens ---
-            self.layer_norm_core_dram(
-                M=self.GRID_AREA, N=self.D_MODEL,
-                A_DRAM_ADDR=self.ENC_INPUT,
-                OUTPUT_DRAM_ADDR=self.ENC_LN_OUT,
-                GAMMA_DRAM_ADDR=ew['norm1_w'], BETA_DRAM_ADDR=ew['norm1_b'])
-
-            self.matmat_mul_core(
-                M=self.GRID_AREA, K=self.D_MODEL, N=3 * self.D_MODEL,
-                A_DRAM_ADDR=self.ENC_LN_OUT,
-                B_DRAM_ADDR=ew['self_attn_in_w'],
-                OUTPUT_DRAM_ADDR=self.ENC_QKV,
-                C_DRAM_ADDR=ew['self_attn_in_b'],
-                bias_mode="broadcast_N")
-
-            # Split QKV + reshape (head_dim=32, pad to 64)
-            for qkv_i, h_addr in enumerate([self.ENC_Q_HEADS, self.ENC_K_HEADS, self.ENC_V_HEADS]):
-                multihead_reshape_dram(self,
-                    INPUT_DRAM_ADDR=self.ENC_QKV + qkv_i * self.D_MODEL * bpe,
-                    OUTPUT_DRAM_ADDR=h_addr,
-                    TEMP_DRAM_ADDR=self.ENC_PERMUTE_TEMP,
-                    seq_len=self.GRID_AREA,
-                    num_heads=self.ENC_HEADS,
-                    head_dim=self.ENC_HEAD_DIM,
-                    head_dim_pad=self.ENC_HEAD_DIM_PAD)
-
-            # Flash self-attention
-            dram_zero_fill(self, self.ENC_ATTN_OUT,
-                          self.ENC_HEADS * self.GRID_AREA * self.ENC_HEAD_DIM_PAD)
-            flash_attention_batched(self,
-                num_batches=self.ENC_HEADS,
-                head_dim=self.ENC_HEAD_DIM_PAD,
-                seq_len=self.GRID_AREA,
-                Q_DRAM_ADDR=self.ENC_Q_HEADS,
-                K_DRAM_ADDR=self.ENC_K_HEADS,
-                V_DRAM_ADDR=self.ENC_V_HEADS,
-                OUTPUT_DRAM_ADDR=self.ENC_ATTN_OUT,
-                SCRATCH_DRAM_ADDR=self.ENC_ATTN_SCRATCH)
-
-            # Merge + unpad + out_proj
-            multihead_merge_dram(self,
-                INPUT_DRAM_ADDR=self.ENC_ATTN_OUT,
-                OUTPUT_DRAM_ADDR=self.ENC_MERGED,
-                TEMP_DRAM_ADDR=self.ENC_PERMUTE_TEMP,
-                seq_len=self.GRID_AREA,
-                num_heads=self.ENC_HEADS,
-                head_dim=self.ENC_HEAD_DIM,
-                head_dim_pad=self.ENC_HEAD_DIM_PAD,
-                UNPAD_WEIGHT_ADDR=self.ENC_DEC_UNPAD_WEIGHT)
-
-            self.matmat_mul_core(
-                M=self.GRID_AREA, K=self.D_MODEL, N=self.D_MODEL,
-                A_DRAM_ADDR=self.ENC_MERGED,
-                B_DRAM_ADDR=ew['self_attn_out_w'],
-                OUTPUT_DRAM_ADDR=self.ENC_LN_OUT,
-                C_DRAM_ADDR=ew['self_attn_out_b'],
-                bias_mode="broadcast_N")
-
-            eltwise_add_dram(self, self.ENC_INPUT, self.ENC_LN_OUT,
-                             self.ENC_RESIDUAL, self.GRID_AREA * self.D_MODEL)
-
-            # --- Cross-attention: image queries text ---
-            self.layer_norm_core_dram(
-                M=self.GRID_AREA, N=self.D_MODEL,
-                A_DRAM_ADDR=self.ENC_RESIDUAL,
-                OUTPUT_DRAM_ADDR=self.ENC_LN_OUT,
-                GAMMA_DRAM_ADDR=ew['norm2_w'], BETA_DRAM_ADDR=ew['norm2_b'])
-
-            # Cross-attn: Q from image (5184, 256), K/V from prompt (33, 256)
-            cross_attention_batched(self,
-                num_heads=self.ENC_HEADS,
-                head_dim=self.ENC_HEAD_DIM,
-                q_len=self.GRID_AREA, kv_len=self.PROMPT_LEN,
-                Q_DRAM_ADDR=self.ENC_LN_OUT,     # TODO: proper QKV projection needed
-                K_DRAM_ADDR=self.PROMPT_FEATS,
-                V_DRAM_ADDR=self.PROMPT_FEATS,
-                OUTPUT_DRAM_ADDR=self.ENC_MERGED,
-                SCRATCH_DRAM_ADDR=self.ENC_CROSS_SCRATCH)
-
-            eltwise_add_dram(self, self.ENC_RESIDUAL, self.ENC_MERGED,
-                             self.ENC_RESIDUAL, self.GRID_AREA * self.D_MODEL)
-
-            # --- FFN ---
-            self.layer_norm_core_dram(
-                M=self.GRID_AREA, N=self.D_MODEL,
-                A_DRAM_ADDR=self.ENC_RESIDUAL,
-                OUTPUT_DRAM_ADDR=self.ENC_LN_OUT,
-                GAMMA_DRAM_ADDR=ew['norm3_w'], BETA_DRAM_ADDR=ew['norm3_b'])
-
-            self.matmat_mul_core(
-                M=self.GRID_AREA, K=self.D_MODEL, N=self.ENC_FFN_DIM,
-                A_DRAM_ADDR=self.ENC_LN_OUT,
-                B_DRAM_ADDR=ew['ffn_l1_w'],
-                OUTPUT_DRAM_ADDR=self.ENC_MLP_MID,
-                C_DRAM_ADDR=ew['ffn_l1_b'],
-                bias_mode="broadcast_N")
-            # NOTE: Encoder uses ReLU, not GELU. Need relu activation here.
-            self.matmat_mul_core(
-                M=self.GRID_AREA, K=self.ENC_FFN_DIM, N=self.D_MODEL,
-                A_DRAM_ADDR=self.ENC_MLP_MID,
-                B_DRAM_ADDR=ew['ffn_l2_w'],
-                OUTPUT_DRAM_ADDR=self.ENC_LN_OUT,
-                C_DRAM_ADDR=ew['ffn_l2_b'],
-                bias_mode="broadcast_N")
-
-            eltwise_add_dram(self, self.ENC_RESIDUAL, self.ENC_LN_OUT,
-                             self.ENC_INPUT, self.GRID_AREA * self.D_MODEL)
-
-        # Encoder output: ENC_INPUT (5184, 256) = fused image memory
-        dram_copy(self, self.ENC_INPUT, self.ENC_OUTPUT, self.GRID_AREA * self.D_MODEL)
-
-        # ==============================================================
-        # PHASE 7: DECODER (6 layers, 200 queries)
-        # ==============================================================
-        # Initialize queries from learnable embeddings
-        dram_copy(self, self.DEC_QUERY_EMBED, self.DEC_QUERIES, self.NUM_QUERIES * self.D_MODEL)
-        # Initialize presence token
-        dram_copy(self, self.DEC_PRESENCE_TOKEN, self.DEC_PRESENCE_OUT, self.D_MODEL)
-
-        # NOTE: Full decoder implementation includes:
-        # - Conditional query position from reference boxes (sine embed + MLP)
-        # - Box RPB attention mask computation
-        # - Self-attention on 201 tokens (200 queries + presence)
-        # - Cross-attention to text (201 → 33)
-        # - Cross-attention to image with RPB (201 → 5184)
-        # - FFN
-        # - Iterative box refinement
-        # - Presence token scoring
-        # Each layer follows this pattern; omitted here for brevity.
-        # The weight addresses are all loaded above in dec_layer_weights.
-
-        for di in range(self.DEC_LAYERS):
-            dw = self.dec_layer_weights[di]
-            # TODO: Implement full decoder layer
-            # Key operations per layer:
-            # 1. Self-attn: flash_attention on 201 tokens
-            # 2. Cross-attn text: cross_attention_batched(q=201, kv=33)
-            # 3. Cross-attn image: cross_attention_batched(q=201, kv=5184) with RPB bias
-            # 4. FFN: matmul(256→2048, relu) + matmul(2048→256)
-            # 5. Box refine: MLP(256→256→4) + inverse_sigmoid + sigmoid
-            pass
-
-        # ==============================================================
-        # PHASE 8: SCORING
-        # ==============================================================
-        # TODO: Implement scoring
-        # 1. prompt_mlp: MLP(256→2048→256, residual, LN) on prompt
-        # 2. mean_pool text features
-        # 3. project both through linear layers
-        # 4. dot product → scores [200]
-
-        # ==============================================================
-        # PHASE 9: SEGMENTATION HEAD
-        # ==============================================================
-        # TODO: Implement segmentation head
-        # 1. Cross-attend encoder memory to text prompt
-        # 2. Pixel decoder: upsample 72² → 144² → 288² with FPN fusion
-        # 3. Instance seg head: Conv1x1
-        # 4. Mask predictor: MLP on queries, einsum with pixel features
-        # 5. Output: (200, 288, 288) mask logits
+        # Section 1 ends here. Host DMA's VIT_LAYER_IN → Section 2 engine.
 
     def _finalize_program(self):
         """Stop capture, write instructions, return program address."""
@@ -2474,6 +2076,31 @@ class Sam31_UnifiedEngine(UnifiedEngine):
     # ------------------------------------------------------------------
     # Patch extraction (host-side, feeds VIT_PATCH_OUT before HW execution)
     # ------------------------------------------------------------------
+
+    def encode_text_tokens(self, prompt: str) -> torch.Tensor:
+        """Tokenise prompt and embed on host. Returns (32, 1024) bf16.
+
+        Performs BPE tokenisation, table lookup into token_embedding, and
+        adds positional embeddings — all on the host CPU.  The result is
+        ready to DMA into TEXT_TOKENS before S2 execution.
+        """
+        from transformers import CLIPTokenizer
+        tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+        # Encode: [SOT, tokens..., EOT] then zero-pad to TEXT_CTX_LEN
+        enc = tokenizer(prompt, add_special_tokens=True)["input_ids"]  # [SOT, ..., EOT]
+        enc = enc[:self.TEXT_CTX_LEN]
+        ids = enc + [0] * (self.TEXT_CTX_LEN - len(enc))
+        ids_t = torch.tensor(ids, dtype=torch.long)
+
+        # Load embedding table from DRAM isn't practical here — read from checkpoint
+        ckpt_path = _ensure_checkpoint(self.script_dir, self.cfg)
+        sd = _load_detector_state_dict(ckpt_path)
+        tok_emb = sd["backbone.language_backbone.encoder.token_embedding.weight"].float()  # (49408, 1024)
+        pos_emb = sd["backbone.language_backbone.encoder.positional_embedding"].float()    # (32, 1024)
+        del sd
+
+        out = tok_emb[ids_t] + pos_emb  # (32, 1024)
+        return out.to(torch.bfloat16)
 
     def extract_patches_to_dram(self, image_chw: torch.Tensor) -> None:
         """Extract 14x14 patches from CHW image, write (5184, PATCH_K_PAD) to VIT_PATCH_OUT.
@@ -2880,10 +2507,299 @@ class Sam31_UnifiedEngine(UnifiedEngine):
 
 
 # =============================================================================
+# Sam31_S2_UnifiedEngine
+# =============================================================================
+
+class Sam31_S2_UnifiedEngine(Sam31_S1_UnifiedEngine):
+    """SAM 3.1 Section 2: FPN neck → text encoder → geometry encoder →
+    encoder fusion → decoder → scoring → segmentation head.
+
+    Inherits all weight loading, helper ops, and constants from S1.
+    Uses the Section 2 DRAM layout:
+        Params:       0x00000000 – 0x7FFFFFFF  (2 GB)
+        Tensors:      0x80000000 – 0xBFFFFFFF  (1 GB)
+        Instructions: 0xC0000000 – 0xFFFFFFFF  (1 GB)
+    """
+
+    def __init__(self, script_dir: str = SCRIPT_DIR, weights_bin: str = None):
+        import user_dma_core as _udc
+        _udc.MAX_DECODER_INSTRUCTIONS = SAM31_S2_INSTRUCTIONS_MAX
+        UnifiedEngine.__init__(
+            self,
+            params_dram_base=SAM31_S2_PARAMS_BASE,
+            tensor_dram_base=SAM31_S2_TENSOR_BASE,
+            program_dram_base=SAM31_S2_PROGRAM_BASE,
+        )
+        self.cfg = _load_config(script_dir)
+        self.script_dir = script_dir
+
+        self.weight_init()   # inherited — loads all detector weights to params region
+        self.tensor_init()   # overridden below — allocates S2 activation buffers
+
+    def tensor_init(self) -> None:
+        """Allocate DRAM buffers for all Section 2 intermediate activations."""
+        bpe = 2
+        GA   = self.GRID_AREA    # 5184  (72×72)
+        DM   = self.D_MODEL      # 256
+        FD   = self.FPN_DIM      # 256
+
+        # ------------------------------------------------------------------
+        # ViT output — written by S1, DMA'd back to host then re-loaded here.
+        # Kept at the start of the tensor region so the host knows the address.
+        # ------------------------------------------------------------------
+        self.VIT_OUTPUT = self._alloc_tensor(GA * self.VIT_DIM)   # (5184, 1024)  — 10 MB
+
+        # ------------------------------------------------------------------
+        # FPN NECK
+        # ------------------------------------------------------------------
+        # Largest intermediate: conv_transpose output at 4x first stage (144², 512)
+        self.FPN_CONV_TEMP  = self._alloc_tensor(20736 * 512)     # 20 MB  — reused across conv ops
+        self.FPN_IM2COL     = self._alloc_tensor(20736 * 9 * FD)  # 96 MB  — largest im2col: 144²×2304
+
+        self.FPN_1X_OUT     = self._alloc_tensor(GA    * FD)      #  3 MB  (72², 256)
+        self.FPN_2X_DECONV  = self._alloc_tensor(20736 * 512)     # 20 MB  (144², 512) after deconv
+        self.FPN_2X_OUT     = self._alloc_tensor(20736 * FD)      # 11 MB  (144², 256)
+        self.FPN_4X_DECONV0 = self._alloc_tensor(20736 * 512)     # 20 MB  (144², 512) after first deconv
+        self.FPN_4X_DECONV1 = self._alloc_tensor(82944 * FD)      # 42 MB  (288², 256) after second deconv
+        self.FPN_4X_OUT     = self._alloc_tensor(82944 * FD)      # 42 MB  (288², 256) final
+
+        # ------------------------------------------------------------------
+        # TEXT ENCODER  (32 tokens, width=1024)
+        # ------------------------------------------------------------------
+        TL  = self.TEXT_CTX_LEN   # 32
+        TW  = self.TEXT_WIDTH     # 1024
+        TH  = self.TEXT_HEADS     # 16
+        THD = self.TEXT_HEAD_DIM  # 64
+
+        self.TEXT_TOKENS      = self._alloc_tensor(TL * TW)          # (32, 1024)  — in-place updated
+        self.TEXT_LN_OUT      = self._alloc_tensor(TL * TW)          # (32, 1024)
+        self.TEXT_QKV         = self._alloc_tensor(TL * 3 * TW)      # (32, 3072)
+        self.TEXT_Q_HEADS     = self._alloc_tensor(TH * TL * THD)    # (16, 32, 64)
+        self.TEXT_K_HEADS     = self._alloc_tensor(TH * TL * THD)
+        self.TEXT_V_HEADS     = self._alloc_tensor(TH * TL * THD)
+        self.TEXT_ATTN_OUT    = self._alloc_tensor(TH * TL * THD)
+        text_scratch          = TH * (THD * TL + TL * TL)            # per-head: KV + scores
+        self.TEXT_ATTN_SCRATCH = self._alloc_tensor(text_scratch)
+        self.TEXT_MERGED      = self._alloc_tensor(TL * TW)
+        self.TEXT_PERMUTE_TEMP = self._alloc_tensor(TL * TW)
+        self.TEXT_RESIDUAL    = self._alloc_tensor(TL * TW)
+        self.TEXT_MLP_MID     = self._alloc_tensor(TL * self.TEXT_MLP_HIDDEN)  # (32, 4096)
+        self.TEXT_MLP_OUT     = self._alloc_tensor(TL * TW)
+        self.TEXT_RESIZED     = self._alloc_tensor(TL * DM)           # (32, 256)
+
+        # ------------------------------------------------------------------
+        # GEOMETRY ENCODER  (1 CLS token, d_model=256)
+        # ------------------------------------------------------------------
+        self.GEO_EMBED   = self._alloc_tensor(DM)                     # (1, 256)
+        self.GEO_SCRATCH = self._alloc_tensor(self.ENC_FFN_DIM)       # (2048,) reused for FFN mid + cross-attn
+
+        # ------------------------------------------------------------------
+        # PROMPT  (text 32 + geo CLS 1 = 33 tokens, d_model=256)
+        # ------------------------------------------------------------------
+        self.PROMPT_FEATS = self._alloc_tensor(self.PROMPT_LEN * DM)  # (33, 256)
+
+        # ------------------------------------------------------------------
+        # ENCODER FUSION  (6 layers, 5184 image tokens, d_model=256, 8 heads)
+        # ------------------------------------------------------------------
+        EH    = self.ENC_HEADS        # 8
+        EHD   = self.ENC_HEAD_DIM     # 32
+        EHDP  = self.ENC_HEAD_DIM_PAD # 64
+        EFFD  = self.ENC_FFN_DIM      # 2048
+        PL    = self.PROMPT_LEN       # 33
+
+        self.ENC_INPUT        = self._alloc_tensor(GA * DM)
+        self.ENC_LN_OUT       = self._alloc_tensor(GA * DM)
+        self.ENC_QKV          = self._alloc_tensor(GA * 3 * DM)
+        self.ENC_Q_HEADS      = self._alloc_tensor(EH * GA * EHDP)
+        self.ENC_K_HEADS      = self._alloc_tensor(EH * GA * EHDP)
+        self.ENC_V_HEADS      = self._alloc_tensor(EH * GA * EHDP)
+        self.ENC_ATTN_OUT     = self._alloc_tensor(EH * GA * EHDP)
+        enc_self_scratch      = EH * (EHDP * GA + GA * GA)
+        self.ENC_ATTN_SCRATCH = self._alloc_tensor(enc_self_scratch)
+        self.ENC_MERGED       = self._alloc_tensor(GA * DM)
+        self.ENC_PERMUTE_TEMP = self._alloc_tensor(GA * EHDP * EH)
+        self.ENC_RESIDUAL     = self._alloc_tensor(GA * DM)
+        self.ENC_MLP_MID      = self._alloc_tensor(GA * EFFD)
+        # Cross-attn scratch: Q=image(5184), KV=prompt(33) → scores (5184×33) per head
+        enc_cross_scratch     = EH * GA * PL * 2
+        self.ENC_CROSS_SCRATCH = self._alloc_tensor(enc_cross_scratch)
+        self.ENC_OUTPUT       = self._alloc_tensor(GA * DM)           # (5184, 256) fused image memory
+
+        # ------------------------------------------------------------------
+        # DECODER  (6 layers, 200 queries + 1 presence = 201 tokens, d_model=256, 8 heads)
+        # ------------------------------------------------------------------
+        NQ   = self.NUM_QUERIES   # 200
+        DH   = self.DEC_HEADS     # 8
+        DHD  = self.DEC_HEAD_DIM  # 32
+        DHDP = self.DEC_HEAD_DIM_PAD  # 64
+        DFFD = self.DEC_FFN_DIM   # 2048
+        DQL  = NQ + 1             # 201 (queries + presence token)
+
+        self.DEC_QUERIES      = self._alloc_tensor(NQ  * DM)          # (200, 256) learnable queries
+        self.DEC_PRESENCE_OUT = self._alloc_tensor(DM)                 # (1, 256)   presence token state
+        self.DEC_COND_POS     = self._alloc_tensor(NQ  * DM)          # (200, 256) conditional query pos
+        self.DEC_SINE_EMBED   = self._alloc_tensor(NQ  * 4 * 128)     # (200, 512) sine embed of ref boxes
+        self.DEC_REF_BOXES    = self._alloc_tensor(NQ  * 4)           # (200, 4)   current reference boxes
+        self.DEC_TOKENS       = self._alloc_tensor(DQL * DM)          # (201, 256) queries + presence
+        self.DEC_LN_OUT       = self._alloc_tensor(DQL * DM)
+        self.DEC_QKV          = self._alloc_tensor(DQL * 3 * DM)
+        self.DEC_Q_HEADS      = self._alloc_tensor(DH * DQL * DHDP)
+        self.DEC_K_HEADS      = self._alloc_tensor(DH * DQL * DHDP)
+        self.DEC_V_HEADS      = self._alloc_tensor(DH * DQL * DHDP)
+        self.DEC_ATTN_OUT     = self._alloc_tensor(DH * DQL * DHDP)
+        dec_self_scratch      = DH * (DHDP * DQL + DQL * DQL)
+        self.DEC_ATTN_SCRATCH = self._alloc_tensor(dec_self_scratch)
+        self.DEC_MERGED       = self._alloc_tensor(DQL * DM)
+        self.DEC_PERMUTE_TEMP = self._alloc_tensor(DQL * DH * DHDP)
+        self.DEC_RESIDUAL     = self._alloc_tensor(DQL * DM)
+        self.DEC_MLP_MID      = self._alloc_tensor(DQL * DFFD)
+        # Cross-attn scratch: Q=201, KV=33(text) or KV=5184(image)
+        dec_cross_text_scratch  = DH * DQL * PL  * 2
+        dec_cross_image_scratch = DH * DQL * GA  * 2
+        self.DEC_CROSS_TEXT_SCRATCH  = self._alloc_tensor(dec_cross_text_scratch)
+        self.DEC_CROSS_IMAGE_SCRATCH = self._alloc_tensor(dec_cross_image_scratch)
+        # RPB bias: (8 heads, 201, 5184) for image cross-attn
+        self.DEC_RPB_BIAS     = self._alloc_tensor(DH * DQL * GA)
+        # Box refinement MLP intermediate
+        self.DEC_BBOX_MID     = self._alloc_tensor(NQ * DM)           # (200, 256)
+        self.DEC_BBOX_OUT     = self._alloc_tensor(NQ * 4)            # (200, 4)
+
+        tensor_used = self.get_tensor_dram_usage()
+        _original_print(f"  S2 tensors allocated: {tensor_used / 1024**2:.1f} MB")
+
+    def _compile_phases(self, pad, bpe):
+        """Section 2 compile: FPN neck → text encoder → geo encoder →
+        encoder fusion → decoder → scoring → seg head.
+
+        VIT_OUTPUT must be DMA'd to DRAM before execute.
+        TEXT_TOKENS must be DMA'd to DRAM before execute (token_embed + pos_embed on host).
+        """
+        # ==============================================================
+        # PHASE 2: FPN NECK
+        # ==============================================================
+        # Input: VIT_OUTPUT (5184, 1024) = (72, 72, 1024)
+
+        # Scale 1x: Conv1x1(1024→256) + Conv3x3(256→256) → FPN_1X_OUT (72, 72, 256)
+        conv2d_1x1_dram(self, self.VIT_OUTPUT, self.FPN_CONV_TEMP,
+                        self.fpn_1x['conv1x1_w'], self.fpn_1x['conv1x1_b'],
+                        H=72, W=72, C_in=1024, C_out=256)
+        conv2d_3x3_dram(self, self.FPN_CONV_TEMP, self.FPN_1X_OUT, self.FPN_IM2COL,
+                        self.fpn_1x['conv3x3_w'], self.fpn_1x['conv3x3_b'],
+                        H=72, W=72, C_in=256, C_out=256)
+
+        # Scale 2x: ConvT(1024→512, 2x) + Conv1x1(512→256) + Conv3x3(256→256) → FPN_2X_OUT
+        conv_transpose2d_2x2_dram(self, self.VIT_OUTPUT, self.FPN_2X_DECONV, self.FPN_CONV_TEMP,
+                                   self.fpn_2x['dconv_slices'], self.fpn_2x['dconv_bias'],
+                                   H=72, W=72, C_in=1024, C_out=512)
+        conv2d_1x1_dram(self, self.FPN_2X_DECONV, self.FPN_CONV_TEMP,
+                        self.fpn_2x['conv1x1_w'], self.fpn_2x['conv1x1_b'],
+                        H=144, W=144, C_in=512, C_out=256)
+        conv2d_3x3_dram(self, self.FPN_CONV_TEMP, self.FPN_2X_OUT, self.FPN_IM2COL,
+                        self.fpn_2x['conv3x3_w'], self.fpn_2x['conv3x3_b'],
+                        H=144, W=144, C_in=256, C_out=256)
+
+        # Scale 4x: ConvT(1024→512) + GELU + ConvT(512→256) + Conv1x1 + Conv3x3 → FPN_4X_OUT
+        conv_transpose2d_2x2_dram(self, self.VIT_OUTPUT, self.FPN_4X_DECONV0, self.FPN_CONV_TEMP,
+                                   self.fpn_4x['dconv0_slices'], self.fpn_4x['dconv0_bias'],
+                                   H=72, W=72, C_in=1024, C_out=512)
+        # GELU on FPN_4X_DECONV0 (20736, 512): identity matmul with gelu_enable fused
+        self.matmat_mul_core(
+            M=20736, K=512, N=512,
+            A_DRAM_ADDR=self.FPN_4X_DECONV0,
+            B_DRAM_ADDR=self.FPN_GELU_IDENTITY,
+            OUTPUT_DRAM_ADDR=self.FPN_4X_DECONV0,
+            gelu_enable=True)
+        conv_transpose2d_2x2_dram(self, self.FPN_4X_DECONV0, self.FPN_4X_DECONV1, self.FPN_CONV_TEMP,
+                                   self.fpn_4x['dconv1_slices'], self.fpn_4x['dconv1_bias'],
+                                   H=144, W=144, C_in=512, C_out=256)
+        conv2d_1x1_dram(self, self.FPN_4X_DECONV1, self.FPN_CONV_TEMP,
+                        self.fpn_4x['conv1x1_w'], self.fpn_4x['conv1x1_b'],
+                        H=288, W=288, C_in=256, C_out=256)
+        conv2d_3x3_dram(self, self.FPN_CONV_TEMP, self.FPN_4X_OUT, self.FPN_IM2COL,
+                        self.fpn_4x['conv3x3_w'], self.fpn_4x['conv3x3_b'],
+                        H=288, W=288, C_in=256, C_out=256)
+
+        # FPN outputs: FPN_1X_OUT (72²,256), FPN_2X_OUT (144²,256), FPN_4X_OUT (288²,256)
+
+    def cpu_reference_fpn(self, vit_output: torch.Tensor) -> dict:
+        """Run FPN neck on CPU given ViT output. Returns dict of bf16 tensors.
+
+        vit_output: (5184, 1024) bf16 — output of S1 ViT backbone.
+
+        Returns:
+            fpn_1x: (5184,  256) bf16  (72×72)
+            fpn_2x: (20736, 256) bf16  (144×144)
+            fpn_4x: (82944, 256) bf16  (288×288)
+        """
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        x = vit_output.float().reshape(1, 72, 72, 1024).permute(0, 3, 1, 2)  # (1, 1024, 72, 72)
+
+        ckpt_path = _ensure_checkpoint(self.script_dir, self.cfg)
+        sd = _load_detector_state_dict(ckpt_path)
+        p = "backbone.vision_backbone.convs."
+
+        def _conv1x1(x, w_key, b_key):
+            w = sd[p + w_key].float()   # (C_out, C_in, 1, 1)
+            b = sd[p + b_key].float()
+            return F.conv2d(x, w, b)
+
+        def _conv3x3(x, w_key, b_key):
+            w = sd[p + w_key].float()   # (C_out, C_in, 3, 3)
+            b = sd[p + b_key].float()
+            return F.conv2d(x, w, b, padding=1)
+
+        def _convT(x, w_key, b_key):
+            w = sd[p + w_key].float()   # (C_in, C_out, 2, 2) for ConvTranspose2d
+            b = sd[p + b_key].float()
+            return F.conv_transpose2d(x, w, b, stride=2)
+
+        # Scale 1x: Conv1x1(1024→256) + Conv3x3(256→256)
+        f1 = _conv1x1(x, "2.conv_1x1.weight", "2.conv_1x1.bias")
+        f1 = _conv3x3(f1, "2.conv_3x3.weight", "2.conv_3x3.bias")  # (1, 256, 72, 72)
+
+        # Scale 2x: ConvT(1024→512) + Conv1x1(512→256) + Conv3x3(256→256)
+        f2 = _convT(x,  "1.dconv_2x2.weight", "1.dconv_2x2.bias")  # (1, 512, 144, 144)
+        f2 = _conv1x1(f2, "1.conv_1x1.weight", "1.conv_1x1.bias")
+        f2 = _conv3x3(f2, "1.conv_3x3.weight", "1.conv_3x3.bias")  # (1, 256, 144, 144)
+
+        # Scale 4x: ConvT(1024→512) + GELU + ConvT(512→256) + Conv1x1 + Conv3x3
+        f4 = _convT(x,  "0.dconv_2x2_0.weight", "0.dconv_2x2_0.bias")  # (1, 512, 144, 144)
+        f4 = F.gelu(f4)
+        f4 = _convT(f4, "0.dconv_2x2_1.weight", "0.dconv_2x2_1.bias")  # (1, 256, 288, 288)
+        f4 = _conv1x1(f4, "0.conv_1x1.weight", "0.conv_1x1.bias")
+        f4 = _conv3x3(f4, "0.conv_3x3.weight", "0.conv_3x3.bias")      # (1, 256, 288, 288)
+
+        del sd
+        # Convert from (1, C, H, W) → (H*W, C) HWC layout matching hardware
+        def _to_hwc(t):
+            return t.squeeze(0).permute(1, 2, 0).reshape(-1, t.shape[1]).to(torch.bfloat16)
+
+        return {
+            "fpn_1x": _to_hwc(f1),   # (5184,  256)
+            "fpn_2x": _to_hwc(f2),   # (20736, 256)
+            "fpn_4x": _to_hwc(f4),   # (82944, 256)
+        }
+
+    def run_hw_s2(self, vit_output: torch.Tensor, text_tokens: torch.Tensor,
+                  program_addr: int, timeout: float = 600.0) -> None:
+        """DMA S2 inputs then execute compiled S2 program.
+
+        vit_output:  (5184, 1024) bf16 — output of S1
+        text_tokens: (32, 1024)   bf16 — token_embed + pos_embed (host-side lookup)
+        """
+        self.dma_to_accelerator_memory(self.VIT_OUTPUT,   vit_output.flatten().contiguous())
+        self.dma_to_accelerator_memory(self.TEXT_TOKENS,  text_tokens.flatten().contiguous())
+        self.start_execute_from_dram(program_addr)
+        self.wait_queue(timeout)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
-def _vit_block_validate(ue: "Sam31_UnifiedEngine", image_path: str, num_blocks: int) -> None:
+def _vit_block_validate(ue: "Sam31_S1_UnifiedEngine", image_path: str, num_blocks: int) -> None:
     """Compile + run HW for num_blocks ViT blocks, compare per-block with CPU reference.
 
     For each block N we:
@@ -2917,7 +2833,7 @@ def _vit_block_validate(ue: "Sam31_UnifiedEngine", image_path: str, num_blocks: 
         cpu = ue.cpu_reference_vit_blocks(image_path, num_blocks=blk + 1).float().flatten()[:n]
 
         # --- Metrics ---
-        m = Sam31_UnifiedEngine.tensor_metrics(hw, cpu)
+        m = Sam31_S1_UnifiedEngine.tensor_metrics(hw, cpu)
 
         btype  = "GLOBAL" if blk in ue.VIT_GLOBAL_BLOCKS else "local"
         status = "PASS" if m["snr_db"] > 40 else ("CLOSE" if m["snr_db"] > 20 else "FAIL")
@@ -2965,7 +2881,7 @@ def main():
     _original_print(f"SAM 3.1 on {args.dev}")
 
     t0 = _time.perf_counter()
-    ue = Sam31_UnifiedEngine(script_dir=SCRIPT_DIR)
+    ue = Sam31_S1_UnifiedEngine(script_dir=SCRIPT_DIR)
     _original_print(f"  Weights: {_time.perf_counter() - t0:.3f}s")
 
     if args.validate_vit and args.no_step:
@@ -2990,23 +2906,51 @@ def main():
         _original_print(f"  Validating ViT blocks 0-{args.validate_blocks - 1} (per-block)...")
         _vit_block_validate(ue, image_path, num_blocks=args.validate_blocks)
     else:
-        # Normal compile + run + single validate
-        t1 = _time.perf_counter()
-        prog_addr = ue.compile_full_fused()
-        _original_print(f"  Compile: {_time.perf_counter() - t1:.3f}s")
+        # ── Section 1: ViT backbone ──────────────────────────────────────
+        vit_cache = os.path.join(SCRIPT_DIR, "sam3.1_bin", "vit_output.pt")
+        n_elems   = ue.GRID_AREA * ue.VIT_DIM
 
-        t2 = _time.perf_counter()
-        ue.run_hw(image_path, prog_addr)
-        _original_print(f"  Execute: {_time.perf_counter() - t2:.3f}s")
+        if os.path.exists(vit_cache):
+            _original_print(f"  Loading cached ViT output from {vit_cache}...")
+            vit_out = torch.load(vit_cache, weights_only=True)  # (5184, 1024) bf16
+        else:
+            t1 = _time.perf_counter()
+            prog_addr_s1 = ue.compile_full_fused()
+            _original_print(f"  S1 compile: {_time.perf_counter() - t1:.3f}s")
 
-        _original_print("  Running CPU reference...")
-        cpu_ref = ue.cpu_reference_vit_blocks(image_path, num_blocks=32)
-        ue.validate(
-            dram_addr=ue.VIT_LAYER_IN,
-            num_elements=ue.GRID_AREA * ue.VIT_DIM,
-            cpu_ref=cpu_ref,
-            label="ViT blocks 0-31",
-        )
+            t2 = _time.perf_counter()
+            ue.run_hw(image_path, prog_addr_s1)
+            _original_print(f"  S1 execute: {_time.perf_counter() - t2:.3f}s")
+
+            vit_out = ue.read_tensor_from_dram(ue.VIT_LAYER_IN, n_elems)
+            vit_out = vit_out.reshape(ue.GRID_AREA, ue.VIT_DIM)
+            torch.save(vit_out, vit_cache)
+            _original_print(f"  Saved ViT output → {vit_cache}")
+
+        # ── Section 2: FPN → text → geo → encoder → decoder → seg ──────
+        _original_print("  Initialising S2 engine...")
+        t3 = _time.perf_counter()
+        ue2 = Sam31_S2_UnifiedEngine(script_dir=SCRIPT_DIR)
+        _original_print(f"  S2 init: {_time.perf_counter() - t3:.3f}s")
+
+        # Tokenise prompt and embed on host (table lookup, no hardware needed)
+        text_tokens = ue2.encode_text_tokens(args.prompt)  # (32, 1024) bf16
+
+        t4 = _time.perf_counter()
+        prog_addr_s2 = ue2.compile_full_fused()
+        _original_print(f"  S2 compile: {_time.perf_counter() - t4:.3f}s")
+
+        t5 = _time.perf_counter()
+        ue2.run_hw_s2(vit_out, text_tokens, prog_addr_s2)
+        _original_print(f"  S2 execute: {_time.perf_counter() - t5:.3f}s")
+
+        # ── FPN validation ───────────────────────────────────────────────
+        _original_print("  Running CPU reference for FPN...")
+        fpn_ref = ue2.cpu_reference_fpn(vit_out)
+
+        ue2.validate(ue2.FPN_1X_OUT, 5184  * 256, fpn_ref["fpn_1x"], "FPN 1x (72²,256)")
+        ue2.validate(ue2.FPN_2X_OUT, 20736 * 256, fpn_ref["fpn_2x"], "FPN 2x (144²,256)")
+        ue2.validate(ue2.FPN_4X_OUT, 82944 * 256, fpn_ref["fpn_4x"], "FPN 4x (288²,256)")
 
 
 if __name__ == "__main__":
