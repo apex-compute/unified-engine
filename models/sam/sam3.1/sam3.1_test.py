@@ -152,7 +152,7 @@ def cross_attention_batched(ue: UnifiedEngine, num_heads: int, head_dim: int,
     kv_stride = kv_len * head_dim * bpe
     out_stride = q_len * head_dim * bpe
     score_size = q_len * kv_len
-    scratch_per_head = 2 * score_size * bpe  # scores + softmax output
+    scratch_per_head = score_size * bpe  # one slot: fused scores+softmax output
 
     total_flops = 0
     scale = 1.0 / math.sqrt(head_dim)
@@ -163,24 +163,15 @@ def cross_attention_batched(ue: UnifiedEngine, num_heads: int, head_dim: int,
         v_addr = V_DRAM_ADDR + h * kv_stride
         o_addr = OUTPUT_DRAM_ADDR + h * out_stride
         scores_addr = SCRATCH_DRAM_ADDR + h * scratch_per_head
-        softmax_addr = scores_addr + score_size * bpe
 
-        # Step 1: scores = Q @ K^T  → [q_len, kv_len]
-        # matmat_mul_core computes A @ B^T; K is already (kv_len, head_dim)
-        ue.matmat_mul_core(
-            M=q_len, K=head_dim, N=kv_len,
-            A_DRAM_ADDR=q_addr,
-            B_DRAM_ADDR=k_addr,
-            OUTPUT_DRAM_ADDR=scores_addr,
-        )
-        total_flops += 2 * q_len * head_dim * kv_len
-
-        # Step 2: scale scores by 1/sqrt(head_dim)
-        total_elems = q_len * kv_len
-        for offset in range(0, total_elems, URAM_NEAR_FULL_ELEMENTS):
-            take = min(URAM_NEAR_FULL_ELEMENTS, total_elems - offset)
+        # Step 1: pre-scale Q_h in place by 1/sqrt(head_dim)
+        # matmat_mul_core(softmax_enable=True) fuses scores+softmax; pre-scaling Q
+        # avoids a separate score-scaling pass.
+        q_elems = q_len * head_dim
+        for offset in range(0, q_elems, URAM_NEAR_FULL_ELEMENTS):
+            take = min(URAM_NEAR_FULL_ELEMENTS, q_elems - offset)
             ue.accelerator_memory_to_sram(
-                accelerator_dram_address=scores_addr + offset * bpe,
+                accelerator_dram_address=q_addr + offset * bpe,
                 sram_address=0x00000, element_size=take,
             )
             ue.broadcast_mul(
@@ -190,14 +181,23 @@ def cross_attention_batched(ue: UnifiedEngine, num_heads: int, head_dim: int,
             )
             ue.sram_to_accelerator_memory(
                 sram_address=0x00000,
-                accelerator_dram_address=scores_addr + offset * bpe,
+                accelerator_dram_address=q_addr + offset * bpe,
                 element_size=take,
             )
 
-        # Step 3: add bias if provided
+        # Step 2: add bias to scores_addr before fused matmul+softmax (if provided)
         if BIAS_DRAM_ADDR is not None:
+            # Compute raw scores first, then add bias, then softmax below
+            ue.matmat_mul_core(
+                M=q_len, K=head_dim, N=kv_len,
+                A_DRAM_ADDR=q_addr,
+                B_DRAM_ADDR=k_addr,
+                OUTPUT_DRAM_ADDR=scores_addr,
+            )
+            total_flops += 2 * q_len * head_dim * kv_len
             bias_per_head = q_len * kv_len * bpe
             bias_addr = BIAS_DRAM_ADDR + h * bias_per_head
+            total_elems = q_len * kv_len
             for offset in range(0, total_elems, URAM_NEAR_FULL_ELEMENTS):
                 take = min(URAM_NEAR_FULL_ELEMENTS, total_elems - offset)
                 ue.accelerator_memory_to_sram(
@@ -219,24 +219,29 @@ def cross_attention_batched(ue: UnifiedEngine, num_heads: int, head_dim: int,
                     accelerator_dram_address=scores_addr + offset * bpe,
                     element_size=take,
                 )
-
-        # Step 4: row-wise softmax
-        # NOTE: Requires hardware softmax primitive or manual exp/sum/div.
-        # Using softmax_row_core if available; otherwise this is a placeholder
-        # that must be replaced with the actual hardware implementation.
-        # For each row of length kv_len: max → sub → exp → sum → div
-        ue.softmax_rows_core_dram(
-            M=q_len, N=kv_len,
-            INPUT_DRAM_ADDR=scores_addr,
-            OUTPUT_DRAM_ADDR=softmax_addr,
-        )
+            # softmax on the bias-added scores (read scores_addr, write scores_addr)
+            ue.matmat_mul_core(
+                M=q_len, K=1, N=q_len * kv_len,
+                A_DRAM_ADDR=scores_addr,
+                B_DRAM_ADDR=scores_addr,
+                OUTPUT_DRAM_ADDR=scores_addr,
+                softmax_enable=True,
+            )
+        else:
+            # Step 3: fused scores + softmax: softmax(Q_scaled @ K^T) → scores_addr
+            ue.matmat_mul_core(
+                M=q_len, K=head_dim, N=kv_len,
+                A_DRAM_ADDR=q_addr,
+                B_DRAM_ADDR=k_addr,
+                OUTPUT_DRAM_ADDR=scores_addr,
+                softmax_enable=True,
+            )
+            total_flops += 2 * q_len * head_dim * kv_len
         total_flops += 5 * q_len * kv_len  # approx for softmax
 
-        # Step 5: out = softmax @ V  → [q_len, head_dim]
-        # A = softmax [q_len, kv_len], we want A @ V [kv_len, head_dim]
-        # matmat_mul_core computes A @ B^T, so B must be V^T = [head_dim, kv_len]
-        # We need V transposed. Store V^T in scratch after softmax.
-        v_t_addr = softmax_addr + score_size * bpe  # temp for V^T
+        # Step 4: out = softmax @ V  → [q_len, head_dim]
+        # matmat_mul_core computes A @ B^T; transpose V → V^T stored after softmax.
+        v_t_addr = scores_addr + score_size * bpe  # temp for V^T
         ue.bf16_permute_core(
             dim_0=kv_len, dim_1=head_dim, dim_2=1,
             INPUT_DRAM_ADDR=v_addr,
@@ -244,7 +249,7 @@ def cross_attention_batched(ue: UnifiedEngine, num_heads: int, head_dim: int,
         )
         ue.matmat_mul_core(
             M=q_len, K=kv_len, N=head_dim,
-            A_DRAM_ADDR=softmax_addr,
+            A_DRAM_ADDR=scores_addr,
             B_DRAM_ADDR=v_t_addr,
             OUTPUT_DRAM_ADDR=o_addr,
         )
@@ -1562,6 +1567,16 @@ class Sam31_S1_UnifiedEngine(UnifiedEngine):
             gw['ffn_l2_b'] = self._alloc_param(sd[gp + "linear2.bias"])
             self.geo_layer_weights.append(gw)
 
+        # FPN_1x sinusoidal 2D pos encoding (72×72 grid, 256-dim) — used by geo cross-attn
+        import sys as _sys
+        _sys.path.insert(0, '/home/rohit/apex-compute-ML/simple-llm/src/sam3')
+        from sam3_main import PositionEmbeddingSine as _PES
+        _pe = _PES(num_pos_feats=256, normalize=True, temperature=10000)
+        _dummy = torch.zeros(1, 1, self.GRID_SIZE, self.GRID_SIZE)
+        _fpn_pos = _pe(_dummy)                                          # [1, 256, 72, 72]
+        _fpn_pos = _fpn_pos.squeeze(0).permute(1, 2, 0).reshape(self.GRID_AREA, 256).to(torch.bfloat16)
+        self.FPN_1X_POS = self._alloc_param(_fpn_pos)                  # (5184, 256) bf16
+
         # ==================================================================
         # ENCODER FUSION (6 layers)
         # ==================================================================
@@ -2618,6 +2633,19 @@ class Sam31_S2_UnifiedEngine(Sam31_S1_UnifiedEngine):
         self.GEO_EMBED   = self._alloc_tensor(DM)                     # (1, 256)
         self.GEO_SCRATCH = self._alloc_tensor(self.ENC_FFN_DIM)       # (2048,) reused for FFN mid + cross-attn
 
+        # Additional geo encoder cross-attn buffers
+        GH   = self.ENC_HEADS         # 8
+        GHD  = self.ENC_HEAD_DIM      # 32
+        GHDP = self.ENC_HEAD_DIM_PAD  # 64 — must use padded dim (K=32 not 64-aligned for matmul)
+        self.GEO_FPN_POS_SUM   = self._alloc_tensor(GA * DM)           # (5184, 256) K input = FPN_1x + pos
+        self.GEO_KV_BUF        = self._alloc_tensor(GA * 2 * DM)       # (5184, 512) K+V proj outputs
+        self.GEO_K_HEADS       = self._alloc_tensor(GH * GA * GHDP)    # (8, 5184, 64) padded
+        self.GEO_V_HEADS       = self._alloc_tensor(GH * GA * GHDP)    # (8, 5184, 64) padded
+        # cross_attention_batched places V^T after all heads' regions; v_t = kv_len * head_dim_pad
+        geo_cross_scratch      = GH * 1 * GA + GA * GHDP               # 41472 + 331776 = 373248
+        self.GEO_CROSS_SCRATCH = self._alloc_tensor(geo_cross_scratch)
+        self.GEO_CROSS_TEMP    = self._alloc_tensor(GA * GH * GHDP)    # (5184, 512) TEMP for K/V reshape
+
         # ------------------------------------------------------------------
         # PROMPT  (text 32 + geo CLS 1 = 33 tokens, d_model=256)
         # ------------------------------------------------------------------
@@ -2913,6 +2941,170 @@ class Sam31_S2_UnifiedEngine(Sam31_S1_UnifiedEngine):
 
         # Text encoder output: TEXT_RESIZED (32, 256)
 
+        # ==============================================================
+        # PHASE 4: GEOMETRY ENCODER
+        # ==============================================================
+        DM = self.D_MODEL  # 256
+
+        # 4.1 CLS init: copy cls_embed → GEO_EMBED, final_proj, norm
+        dram_copy(self, self.GEO_CLS_EMBED, self.GEO_EMBED, DM)
+
+        self.matmat_mul_core(
+            M=1, K=DM, N=DM,
+            A_DRAM_ADDR=self.GEO_EMBED,
+            B_DRAM_ADDR=self.GEO_FINAL_PROJ_W,
+            OUTPUT_DRAM_ADDR=self.GEO_EMBED,
+            C_DRAM_ADDR=self.GEO_FINAL_PROJ_B,
+            bias_mode="broadcast_N",
+        )
+
+        self.layer_norm_core_dram(
+            M=1, N=DM,
+            A_DRAM_ADDR=self.GEO_EMBED,
+            OUTPUT_DRAM_ADDR=self.GEO_EMBED,
+            GAMMA_DRAM_ADDR=self.GEO_NORM_W,
+            BETA_DRAM_ADDR=self.GEO_NORM_B,
+        )
+
+        # 4.2 Per-layer: self-attn (trivial) × 3
+        # GEO_SCRATCH layout (2048 elements):
+        #   [0:256]     LN output
+        #   [256:1024]  QKV output (Q=256, K=256, V=256)
+        #   [1024:1280] out_proj output
+        GEO_LN_OUT   = self.GEO_SCRATCH
+        GEO_QKV      = self.GEO_SCRATCH + 256 * bpe
+        GEO_V        = self.GEO_SCRATCH + 768 * bpe   # V = QKV[512:768] offset from GEO_QKV start
+        GEO_OUT_PROJ = self.GEO_SCRATCH + 1024 * bpe
+
+        for gw in self.geo_layer_weights:
+            # 4.2.1 Trivial self-attention (1 token: output = V, no score/softmax needed)
+            self.layer_norm_core_dram(
+                M=1, N=DM,
+                A_DRAM_ADDR=self.GEO_EMBED,
+                OUTPUT_DRAM_ADDR=GEO_LN_OUT,
+                GAMMA_DRAM_ADDR=gw['norm1_w'],
+                BETA_DRAM_ADDR=gw['norm1_b'],
+            )
+            # QKV: [1,256] @ [768,256]^T + [768] → [Q|K|V] each 256 elements
+            self.matmat_mul_core(
+                M=1, K=DM, N=3 * DM,
+                A_DRAM_ADDR=GEO_LN_OUT,
+                B_DRAM_ADDR=gw['self_attn_in_w'],
+                OUTPUT_DRAM_ADDR=GEO_QKV,
+                C_DRAM_ADDR=gw['self_attn_in_b'],
+                bias_mode="broadcast_N",
+            )
+            # out_proj on V (attn output = V since single-token softmax = 1.0)
+            self.matmat_mul_core(
+                M=1, K=DM, N=DM,
+                A_DRAM_ADDR=GEO_V,
+                B_DRAM_ADDR=gw['self_attn_out_w'],
+                OUTPUT_DRAM_ADDR=GEO_OUT_PROJ,
+                C_DRAM_ADDR=gw['self_attn_out_b'],
+                bias_mode="broadcast_N",
+            )
+            # residual add: GEO_EMBED += out_proj result
+            eltwise_add_dram(self, self.GEO_EMBED, GEO_OUT_PROJ, self.GEO_EMBED, DM)
+
+            # 4.2.2 Cross-attention: CLS queries FPN_1x image features
+            # head_dim must be padded to 64 — K=32 violates matmul 64-alignment requirement
+            GH   = self.ENC_HEADS         # 8
+            GHD  = self.ENC_HEAD_DIM      # 32
+            GHDP = self.ENC_HEAD_DIM_PAD  # 64
+            GA   = self.GRID_AREA          # 5184
+
+            # Cross-attn scratch slots (all within GEO_SCRATCH = 2048 elements)
+            CA_LN_OUT    = self.GEO_SCRATCH                  # [0:256]    norm2 output
+            CA_Q_PROJ    = self.GEO_SCRATCH + 256  * bpe     # [256:512]  Q proj [1, 256]
+            CA_Q_PADS    = self.GEO_SCRATCH + 512  * bpe     # [512:1024] padded Q [8, 1, 64]
+            CA_Q_TEMP    = self.GEO_SCRATCH + 1024 * bpe     # [1024:1536] TEMP for Q reshape
+            CA_CROSS_OUT = self.GEO_SCRATCH + 1536 * bpe     # [1536:2048] cross-attn out [8, 1, 64]
+
+            # norm2 on GEO_EMBED → CA_LN_OUT
+            self.layer_norm_core_dram(
+                M=1, N=DM,
+                A_DRAM_ADDR=self.GEO_EMBED,
+                OUTPUT_DRAM_ADDR=CA_LN_OUT,
+                GAMMA_DRAM_ADDR=gw['norm2_w'],
+                BETA_DRAM_ADDR=gw['norm2_b'],
+            )
+
+            # K input = FPN_1x + pos_enc (pos_enc_at_cross_attn_keys=True), V = raw FPN_1x
+            eltwise_add_dram(self, self.FPN_1X_OUT, self.FPN_1X_POS,
+                             self.GEO_FPN_POS_SUM, GA * DM)
+
+            # Q proj: [1, 256] → [1, 256]  (in_proj rows 0:256)
+            self.matmat_mul_core(
+                M=1, K=DM, N=DM,
+                A_DRAM_ADDR=CA_LN_OUT,
+                B_DRAM_ADDR=gw['cross_attn_in_w'],
+                OUTPUT_DRAM_ADDR=CA_Q_PROJ,
+                C_DRAM_ADDR=gw['cross_attn_in_b'],
+                bias_mode="broadcast_N",
+            )
+            # K proj: [5184, 256] → GEO_KV_BUF[0]  (in_proj rows 256:512)
+            self.matmat_mul_core(
+                M=GA, K=DM, N=DM,
+                A_DRAM_ADDR=self.GEO_FPN_POS_SUM,
+                B_DRAM_ADDR=gw['cross_attn_in_w'] + DM * DM * bpe,
+                OUTPUT_DRAM_ADDR=self.GEO_KV_BUF,
+                C_DRAM_ADDR=gw['cross_attn_in_b'] + DM * bpe,
+                bias_mode="broadcast_N",
+            )
+            # V proj: [5184, 256] → GEO_KV_BUF[1]  (in_proj rows 512:768)
+            self.matmat_mul_core(
+                M=GA, K=DM, N=DM,
+                A_DRAM_ADDR=self.FPN_1X_OUT,
+                B_DRAM_ADDR=gw['cross_attn_in_w'] + 2 * DM * DM * bpe,
+                OUTPUT_DRAM_ADDR=self.GEO_KV_BUF + GA * DM * bpe,
+                C_DRAM_ADDR=gw['cross_attn_in_b'] + 2 * DM * bpe,
+                bias_mode="broadcast_N",
+            )
+
+            GEO_K_BUF = self.GEO_KV_BUF
+            GEO_V_BUF = self.GEO_KV_BUF + GA * DM * bpe
+
+            # Pad head_dim 32→64: [seq, 8, 32] → [8, seq, 64]
+            # Q: [1, 256]=[1, 8, 32] → [8, 1, 64]
+            multihead_reshape_dram(self, CA_Q_PROJ, CA_Q_PADS, CA_Q_TEMP,
+                                   seq_len=1, num_heads=GH, head_dim=GHD, head_dim_pad=GHDP)
+            # K: [5184, 256]=[5184, 8, 32] → [8, 5184, 64]
+            multihead_reshape_dram(self, GEO_K_BUF, self.GEO_K_HEADS, self.GEO_CROSS_TEMP,
+                                   seq_len=GA, num_heads=GH, head_dim=GHD, head_dim_pad=GHDP)
+            # V: [5184, 256] → [8, 5184, 64]
+            multihead_reshape_dram(self, GEO_V_BUF, self.GEO_V_HEADS, self.GEO_CROSS_TEMP,
+                                   seq_len=GA, num_heads=GH, head_dim=GHD, head_dim_pad=GHDP)
+
+            # cross_attention_batched with head_dim=64 (K=64 satisfies 64-alignment)
+            cross_attention_batched(
+                self,
+                num_heads=GH, head_dim=GHDP,
+                q_len=1, kv_len=GA,
+                Q_DRAM_ADDR=CA_Q_PADS,
+                K_DRAM_ADDR=self.GEO_K_HEADS,
+                V_DRAM_ADDR=self.GEO_V_HEADS,
+                OUTPUT_DRAM_ADDR=CA_CROSS_OUT,
+                SCRATCH_DRAM_ADDR=self.GEO_CROSS_SCRATCH,
+            )
+
+            # Merge + unpad: [8, 1, 64] → [1, 256]
+            # CA_Q_TEMP reused as merge TEMP, CA_Q_PROJ reused as merge output
+            multihead_merge_dram(self, CA_CROSS_OUT, CA_Q_PROJ, CA_Q_TEMP,
+                                 seq_len=1, num_heads=GH, head_dim=GHD, head_dim_pad=GHDP,
+                                 UNPAD_WEIGHT_ADDR=self.ENC_DEC_UNPAD_WEIGHT)
+
+            # out_proj: [1, 256] → [1, 256]; CA_LN_OUT reused as output (LN already consumed)
+            self.matmat_mul_core(
+                M=1, K=DM, N=DM,
+                A_DRAM_ADDR=CA_Q_PROJ,
+                B_DRAM_ADDR=gw['cross_attn_out_w'],
+                OUTPUT_DRAM_ADDR=CA_LN_OUT,
+                C_DRAM_ADDR=gw['cross_attn_out_b'],
+                bias_mode="broadcast_N",
+            )
+            # residual add: GEO_EMBED += cross_attn result
+            eltwise_add_dram(self, self.GEO_EMBED, CA_LN_OUT, self.GEO_EMBED, DM)
+
     def compile_fpn_1x_full(self) -> int:
         """Compile-only: FPN scale-1x Conv1x1 + Conv3x3 (→ FPN_1X_OUT).
         Used to isolate conv3x3 im2col staging correctness.
@@ -3115,6 +3307,158 @@ class Sam31_S2_UnifiedEngine(Sam31_S1_UnifiedEngine):
 
         del sd
         return x
+
+    def cpu_reference_geo_self_attn(self) -> torch.Tensor:
+        """CPU reference for geo encoder CLS init + all 3 trivial self-attention layers.
+
+        Trivial because seq_len=1: softmax([scalar])=1.0, so attn output = V.
+        Returns GEO_EMBED (1, 256) bf16 after 3 layers of self-attn.
+        """
+        import torch.nn as nn
+
+        ckpt_path = _ensure_checkpoint(self.script_dir, self.cfg)
+        sd = _load_detector_state_dict(ckpt_path)
+        gp = "geometry_encoder."
+
+        # 4.1 CLS init
+        x = sd[gp + "cls_embed.weight"].to(torch.bfloat16)         # (1, 256)
+        fp_w = sd[gp + "final_proj.weight"].to(torch.bfloat16)
+        fp_b = sd[gp + "final_proj.bias"].to(torch.bfloat16)
+        x = (x @ fp_w.T + fp_b).to(torch.bfloat16)
+        norm = nn.LayerNorm(self.D_MODEL)
+        norm.weight.data = sd[gp + "norm.weight"].float()
+        norm.bias.data   = sd[gp + "norm.bias"].float()
+        x = norm(x.float()).to(torch.bfloat16)
+
+        # 4.2.1 × 3 trivial self-attention layers
+        DM = self.D_MODEL
+        for i in range(self.GEO_LAYERS):
+            lp = f"{gp}encode.{i}."
+            ln1 = nn.LayerNorm(DM)
+            ln1.weight.data = sd[lp + "norm1.weight"].float()
+            ln1.bias.data   = sd[lp + "norm1.bias"].float()
+            x_ln = ln1(x.float()).to(torch.bfloat16)
+
+            in_w = sd[lp + "self_attn.in_proj_weight"].to(torch.bfloat16)  # (768, 256)
+            in_b = sd[lp + "self_attn.in_proj_bias"].to(torch.bfloat16)    # (768,)
+            qkv  = (x_ln @ in_w.T + in_b).to(torch.bfloat16)              # (1, 768)
+            v    = qkv[:, 2 * DM:]                                          # (1, 256)
+
+            out_w = sd[lp + "self_attn.out_proj.weight"].to(torch.bfloat16)
+            out_b = sd[lp + "self_attn.out_proj.bias"].to(torch.bfloat16)
+            out   = (v @ out_w.T + out_b).to(torch.bfloat16)               # (1, 256)
+
+            x = (x + out).to(torch.bfloat16)
+
+        del sd
+        return x  # (1, 256)
+
+    def cpu_reference_geo_cross_attn(self, fpn_1x: torch.Tensor) -> torch.Tensor:
+        """CPU reference for geo encoder CLS init + 3 layers of trivial self-attn + cross-attn.
+
+        fpn_1x: (5184, 256) bf16 — from cpu_reference_fpn(vit_out)["fpn_1x"]
+        Returns GEO_EMBED (1, 256) bf16 after 3 layers.
+        """
+        import torch.nn as nn
+        import sys
+        sys.path.insert(0, '/home/rohit/apex-compute-ML/simple-llm/src/sam3')
+        from sam3_main import PositionEmbeddingSine
+
+        ckpt_path = _ensure_checkpoint(self.script_dir, self.cfg)
+        sd = _load_detector_state_dict(ckpt_path)
+        gp = "geometry_encoder."
+        DM  = self.D_MODEL       # 256
+        GH  = self.ENC_HEADS     # 8
+        GHD = self.ENC_HEAD_DIM  # 32
+        GA  = self.GRID_AREA     # 5184
+
+        # CLS init
+        x = sd[gp + "cls_embed.weight"].to(torch.bfloat16)
+        fp_w = sd[gp + "final_proj.weight"].to(torch.bfloat16)
+        fp_b = sd[gp + "final_proj.bias"].to(torch.bfloat16)
+        x = (x @ fp_w.T + fp_b).to(torch.bfloat16)
+        norm = nn.LayerNorm(DM)
+        norm.weight.data = sd[gp + "norm.weight"].float()
+        norm.bias.data   = sd[gp + "norm.bias"].float()
+        x = norm(x.float()).to(torch.bfloat16)
+
+        # Pos encoding for K (pos_enc_at_cross_attn_keys=True, V has no pos)
+        pe = PositionEmbeddingSine(num_pos_feats=256, normalize=True, temperature=10000)
+        dummy = torch.zeros(1, 1, self.GRID_SIZE, self.GRID_SIZE)
+        pos = pe(dummy).squeeze(0).permute(1, 2, 0).reshape(GA, DM).to(torch.bfloat16)
+        fpn_k = (fpn_1x + pos).to(torch.bfloat16)   # K input: FPN_1x + pos
+        fpn_v = fpn_1x                                # V input: raw FPN_1x
+
+        for i in range(self.GEO_LAYERS):
+            lp = f"{gp}encode.{i}."
+
+            # Trivial self-attention (seq_len=1: output = V)
+            ln1 = nn.LayerNorm(DM)
+            ln1.weight.data = sd[lp + "norm1.weight"].float()
+            ln1.bias.data   = sd[lp + "norm1.bias"].float()
+            x_ln = ln1(x.float()).to(torch.bfloat16)
+            in_w = sd[lp + "self_attn.in_proj_weight"].to(torch.bfloat16)
+            in_b = sd[lp + "self_attn.in_proj_bias"].to(torch.bfloat16)
+            qkv  = (x_ln @ in_w.T + in_b).to(torch.bfloat16)
+            v    = qkv[:, 2 * DM:]
+            out_w = sd[lp + "self_attn.out_proj.weight"].to(torch.bfloat16)
+            out_b = sd[lp + "self_attn.out_proj.bias"].to(torch.bfloat16)
+            x = (x + (v @ out_w.T + out_b)).to(torch.bfloat16)
+
+            # Cross-attention: CLS attends to FPN_1x
+            ln2 = nn.LayerNorm(DM)
+            ln2.weight.data = sd[lp + "norm2.weight"].float()
+            ln2.bias.data   = sd[lp + "norm2.bias"].float()
+            x_ln2 = ln2(x.float()).to(torch.bfloat16)
+
+            ca_in_w = sd[lp + "cross_attn_image.in_proj_weight"].to(torch.bfloat16)  # [768,256]
+            ca_in_b = sd[lp + "cross_attn_image.in_proj_bias"].to(torch.bfloat16)    # [768]
+            Q = (x_ln2 @ ca_in_w[:DM].T       + ca_in_b[:DM]).to(torch.bfloat16)        # [1,256]
+            K = (fpn_k  @ ca_in_w[DM:2*DM].T  + ca_in_b[DM:2*DM]).to(torch.bfloat16)   # [5184,256]
+            V = (fpn_v  @ ca_in_w[2*DM:].T    + ca_in_b[2*DM:]).to(torch.bfloat16)      # [5184,256]
+
+            Q = Q.reshape(1, GH, GHD).permute(1, 0, 2)      # [8, 1, 32]
+            K = K.reshape(GA, GH, GHD).permute(1, 0, 2)     # [8, 5184, 32]
+            V = V.reshape(GA, GH, GHD).permute(1, 0, 2)     # [8, 5184, 32]
+
+            scale  = GHD ** -0.5
+            scores = (Q @ K.transpose(-2, -1) * scale).to(torch.bfloat16)  # [8, 1, 5184]
+            attn   = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+            out    = (attn @ V).to(torch.bfloat16)            # [8, 1, 32]
+            out    = out.permute(1, 0, 2).reshape(1, DM)      # [1, 256]
+
+            ca_out_w = sd[lp + "cross_attn_image.out_proj.weight"].to(torch.bfloat16)
+            ca_out_b = sd[lp + "cross_attn_image.out_proj.bias"].to(torch.bfloat16)
+            x = (x + (out @ ca_out_w.T + ca_out_b)).to(torch.bfloat16)
+
+        del sd
+        return x  # (1, 256)
+
+    def cpu_reference_geo_cls_init(self) -> torch.Tensor:
+        """CPU reference for geo encoder CLS init: cls_embed → final_proj → norm.
+
+        Mirrors HW precision: bf16 matmul, float32 internal LN.
+        Returns GEO_EMBED (1, 256) bf16.
+        """
+        import torch.nn as nn
+
+        ckpt_path = _ensure_checkpoint(self.script_dir, self.cfg)
+        sd = _load_detector_state_dict(ckpt_path)
+        gp = "geometry_encoder."
+
+        cls = sd[gp + "cls_embed.weight"].to(torch.bfloat16)       # (1, 256)
+
+        fp_w = sd[gp + "final_proj.weight"].to(torch.bfloat16)     # (256, 256)
+        fp_b = sd[gp + "final_proj.bias"].to(torch.bfloat16)       # (256,)
+        x = (cls @ fp_w.T + fp_b).to(torch.bfloat16)              # (1, 256)
+
+        norm = nn.LayerNorm(self.D_MODEL)
+        norm.weight.data = sd[gp + "norm.weight"].float()
+        norm.bias.data   = sd[gp + "norm.bias"].float()
+        x = norm(x.float()).to(torch.bfloat16)
+
+        del sd
+        return x  # (1, 256)
 
     def run_hw_s2(self, vit_output: torch.Tensor, text_tokens: torch.Tensor,
                   program_addr: int, timeout: float = 600.0) -> None:
@@ -3385,6 +3729,12 @@ def main():
         _original_print("  Running CPU reference for full text encoder...")
         text_ref = ue2.cpu_reference_text_encoder(text_tokens)
         ue2.validate(ue2.TEXT_RESIZED, 32 * 256, text_ref, "Text encoder output (32,256)")
+
+        # ── Geo encoder cross-attn validation (4.2.2×3) ─────────────────
+        _original_print("  Running CPU reference for geo encoder cross-attention...")
+        geo_cross_ref = ue2.cpu_reference_geo_cross_attn(fpn_ref["fpn_1x"])
+        ue2.validate(ue2.GEO_EMBED, 256, geo_cross_ref,
+                     "Geo encoder cross-attn output (1,256)")
 
 
 if __name__ == "__main__":
