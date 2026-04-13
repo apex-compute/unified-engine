@@ -46,66 +46,41 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
+import builtins
+
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine
-
-# --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
-import builtins
+from model_lib_core import (
+    quantize_bf16_to_int4_packed,
+    parse_offset,
+    set_silent,
+    install_quiet_print,
+    ensure_hf_model,
+    load_config_with_weight_defs,
+)
 
 _original_print = builtins.print
-_SILENT_MODE = False
-
-def quiet_print(*args, **kwargs):
-    """Suppress prints when _SILENT_MODE is True; otherwise print normally."""
-    if _SILENT_MODE:
-        return
-    _original_print(*args, **kwargs)
-
-builtins.print = quiet_print
-# ---------------------------------------------
+install_quiet_print()
 
 # down_proj K=6144 ≤ SCALE_BRAM_ELEMENTS=8192 — no K-split needed.
 # (Previously was 8960 which required splitting; mlp_elements corrected to 6144.)
-
-def _parse_offset(val) -> int:
-    """Parse offset/size from JSON: int or hex string like '0x24000000'."""
-    if isinstance(val, str):
-        return int(val, 0)
-    return int(val)
-
-def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 64) -> tuple[bytes, bytes]:
-    """Quantize bf16 weight (N_w, K_w) to INT4 packed + scale per block of 64 along K. Returns (data_bytes, scale_bytes)."""
-    w = weight_bf16.detach().cpu().float().reshape(-1)
-    N_w, K_w = weight_bf16.shape
-    assert K_w % block_size == 0
-    w_blocks = w.reshape(N_w, K_w // block_size, block_size)
-    scale = w_blocks.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
-    scale_bf16 = scale.to(torch.bfloat16)
-    w_int8 = (w_blocks / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
-    w_nibbles = w_int8.numpy().astype(np.int16) & 0x0F
-    low = w_nibbles[:, :, 0::2].reshape(N_w, -1)
-    high = w_nibbles[:, :, 1::2].reshape(N_w, -1)
-    packed = (high << 4) | low
-    data_bytes = packed.astype(np.uint8).tobytes()
-    scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
-    return (data_bytes, scale_bytes)
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
     """Generate weights_qwen3_1.7b_hf.bin from Hugging Face model per qwen3_1.7b_config.json layout.
     Returns the path to the written file. Use this bin to replace full_model_weights.bin."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-    cfg = _load_config(script_dir)
+    cfg = load_config_with_weight_defs(os.path.join(script_dir, "qwen3_1.7b_config.json"))
     weight_defs = cfg["_weight_defs"]
     paths = cfg["paths"]
     paths_full = os.path.join(script_dir, paths["weights_bin"])
     out_path = output_path or paths_full
 
-    model, model_dir = _ensure_hf_model(script_dir, cfg)
+    model, model_dir = ensure_hf_model(script_dir, cfg, AutoModelForCausalLM)
     gamma_offset = cfg["special"]["rms_norm"]["gamma_offset"]  # 0.0 for Qwen3
     emb_cfg = cfg["special"]["embedding"]
-    token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
-    token_embd_size = _parse_offset(emb_cfg["token_embd_size"])
+    token_embd_offset = parse_offset(emb_cfg["token_embd_offset"])
+    token_embd_size = parse_offset(emb_cfg["token_embd_size"])
     LAYER_WEIGHT_SIZE = weight_defs["LAYER_WEIGHT_SIZE"]
     base_layer0 = weight_defs["BLK0_ATTN_NORM_WEIGHT"]
     num_layers = cfg["file_info"]["num_layers"]
@@ -183,7 +158,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
             if kind == "int4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
-                data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(tensor)
+                data_bytes, scale_bytes = quantize_bf16_to_int4_packed(tensor)
                 scale_padded = (scale_bytes + b"\x00" * sz)[:sz]
                 data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
                 write_at(file_off, scale_padded)
@@ -225,7 +200,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     lm_head_w = model.lm_head.weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
-    data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(lm_head_w)
+    data_bytes, scale_bytes = quantize_bf16_to_int4_packed(lm_head_w)
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
@@ -235,35 +210,6 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
         f.write(buf)
     print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
     return out_path
-
-def _ensure_hf_model(script_dir: str, cfg: dict):
-    """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
-    model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
-    hf_repo = cfg["paths"]["hf_model_repo"]
-    config_path = os.path.join(model_dir, "config.json")
-    if not os.path.exists(config_path):
-        _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
-        snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
-        _original_print("Download complete.")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16, device_map=None, trust_remote_code=True
-    )
-    return model, model_dir
-
-def _load_config(script_dir: str) -> dict:
-    """Load qwen3_1.7b_config.json and build weight_defs (offset/size dict) from regions."""
-    config_path = os.path.join(script_dir, "qwen3_1.7b_config.json")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-    weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
-    for key, r in cfg.get("regions", {}).items():
-        weight_defs[key] = _parse_offset(r["offset"])
-        weight_defs[f"{key}_SIZE"] = r["size"]
-    for key, r in cfg.get("non_layer_regions", {}).items():
-        weight_defs[key] = _parse_offset(r["offset"])
-        weight_defs[f"{key}_SIZE"] = r["size"]
-    cfg["_weight_defs"] = weight_defs
-    return cfg
 
 # -----------------------------------------------------------------------------
 # Qwen3-1.7B unified engine
@@ -298,7 +244,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             program_dram_base=0x98000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        self._cfg = _load_config(self.script_dir)
+        self._cfg = load_config_with_weight_defs(os.path.join(self.script_dir, "qwen3_1.7b_config.json"))
         self.weight_defs = self._cfg["_weight_defs"]
 
         fi = self._cfg["file_info"]
@@ -834,7 +780,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
     def weight_init(self) -> None:
         """Initialize DRAM from weight bin: load HF embedding+tokenizer, layers from bin, host-computed RoPE, then OUTPUT_NORM/LM_HEAD from bin."""
-        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
+        model, model_dir = ensure_hf_model(self.script_dir, self._cfg, AutoModelForCausalLM)
         # Qwen3 does NOT scale the embedding by sqrt(hidden_size)
         embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
         self.embedding_weight = embed
@@ -1027,8 +973,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         rope_row_bytes = ahd * 2 * bpe   # 128*2*2 = 512 bytes per position per call
 
         # --- Qwen3 28 layers: compile ---
-        global _SILENT_MODE
-        _SILENT_MODE = True
+        set_silent(True)
         self.start_capture()
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
@@ -1200,7 +1145,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(prefill_program_addr)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
         self.clear_capture_buffer()
-        _SILENT_MODE = False
+        set_silent(False)
         _original_print()  # newline after \r layer progress
         print(f"    Prefill program start at 0x{prefill_program_addr:X} end at 0x{self.get_program_dram_addr():X}, usage: {self.get_program_dram_usage()} bytes")
 
@@ -1262,9 +1207,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         bpe  = self.bytes_per_element
         hd   = self.head_dim          # 1024
         rope_row_bytes = ahd * 2 * bpe   # 512 bytes per position
-
-        global _SILENT_MODE
-        _SILENT_MODE = True
+        set_silent(True)
         self.clear_inst_id()
         self.start_capture()
 
@@ -1415,7 +1358,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             total_flops_list.append(total_flops)
 
         self.stop_capture()
-        _SILENT_MODE = False
+        set_silent(False)
         all_programs_bytes = bytearray()
         for inst in self.capture_buffer:
             all_programs_bytes.extend(inst.get_bytes())
@@ -1443,11 +1386,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         _kv_stride  = ahd * bpe                  # 128 * 2 = 256 bytes per position per head
         # ROPE_SIZE_REG: decode_pos × rope_row_bytes (rope table stride per position)
         _rope_stride = ahd * 2 * bpe             # 128 * 2 * 2 = 512 bytes per position
-
-        global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
         while self.seq_len < max_seq_len:
-            _SILENT_MODE = True
+            set_silent(True)
             self.seq_len += 1
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
             prog_idx = min((self.seq_len - 1) // 256, 7)
@@ -1468,7 +1409,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             self.wait_queue(10.0)
             token_id = self.get_arg_max_index()
             token_char = self.tokenizer.decode([token_id])
-            _SILENT_MODE = False
+            set_silent(False)
             if token_id in _qwen3_stop_tokens:
                 print(f"\nStop token {token_id} reached.")
                 break
@@ -1511,7 +1452,7 @@ def main():
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
-    cfg = _load_config(script_dir)
+    cfg = load_config_with_weight_defs(os.path.join(script_dir, "qwen3_1.7b_config.json"))
     if args.prompt is not None:
         tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
         tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)

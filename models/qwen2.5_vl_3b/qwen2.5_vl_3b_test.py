@@ -18,6 +18,13 @@ sys.path.insert(0, PROJECT_ROOT)
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
+from model_lib_core import (
+    store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
+    eltwise_add_core_dram, eltwise_mul_core_dram,
+    rms_norm_core_dram_post_add,
+    quantize_q4_64 as _mlc_quantize_q4_64,
+    quantize_fp4_64 as _mlc_quantize_fp4_64,
+)
 
 import builtins
 
@@ -36,113 +43,6 @@ def _parse_offset(val) -> int:
     if isinstance(val, str):
         return int(val, 0)
     return int(val)
-
-def store_weight(ue, tensor, padded_shape=None):
-    """Pad, convert to bf16, DMA to device DRAM. Returns DRAM address."""
-    bf16 = tensor.to(torch.bfloat16)
-    if padded_shape is not None:
-        padded = torch.zeros(padded_shape, dtype=torch.bfloat16)
-        slices = tuple(slice(0, s) for s in bf16.shape)
-        padded[slices] = bf16
-        bf16 = padded
-    bf16 = bf16.contiguous()
-    nbytes = bf16.numel() * 2
-    addr = ue.get_params_dram_addr()
-    ue.dma_write(DMA_DEVICE_H2C, addr, bf16.flatten(), nbytes)
-    ue.allocate_params_dram(nbytes)
-    return addr
-
-def store_quantized_weight(ue, raw_data):
-    """Store Q4_64 raw GGUF data as scale + packed in DRAM. Returns (scale_addr, data_addr)."""
-    raw_bytes = raw_data.tobytes() if hasattr(raw_data, 'tobytes') else bytes(raw_data)
-    n_blocks = len(raw_bytes) // 34
-    scales_size = n_blocks * 2
-    data_size = n_blocks * 32
-
-    scales_np = np.frombuffer(raw_bytes[:scales_size], dtype=np.uint16).copy()
-    scale_tensor = torch.from_numpy(scales_np).view(torch.bfloat16)
-    scale_addr = ue.get_params_dram_addr()
-    ue.dma_write(DMA_DEVICE_H2C, scale_addr, scale_tensor, scales_size)
-    ue.allocate_params_dram(scales_size)
-
-    data_np = np.frombuffer(raw_bytes[scales_size:scales_size + data_size], dtype=np.uint8).copy()
-    data_tensor = torch.from_numpy(data_np)
-    data_addr = ue.get_params_dram_addr()
-    ue.dma_write(DMA_DEVICE_H2C, data_addr, data_tensor, data_size)
-    ue.allocate_params_dram(data_size)
-
-    return scale_addr, data_addr
-
-def load_weight_cache(bin_path):
-    """Load bin+json weight file. Returns {tensor_name: raw_numpy_data}."""
-    json_path = bin_path.rsplit('.', 1)[0] + '.json'
-    with open(json_path) as f:
-        manifest = json.load(f)
-    with open(bin_path, 'rb') as f:
-        raw = f.read()
-    cache = {}
-    for name, meta in manifest.items():
-        cache[name] = np.frombuffer(raw[meta['offset']:meta['offset'] + meta['size']], dtype=np.uint8).copy()
-    return cache
-
-def store_identity_matrix(ue):
-    """Store identity matrix in DRAM once. Returns DRAM address."""
-    bpe = 2
-    size = UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe
-    addr = ue.get_params_dram_addr()
-    ue.dma_write(DMA_DEVICE_H2C, addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), size)
-    ue.allocate_params_dram(size)
-    return addr
-
-def eltwise_add_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
-    """OUTPUT = A + B (DRAM)."""
-    bytes_per_element = 2
-    uram_a_addr = 0x00000
-    uram_b_addr = 0x80000
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS, size)
-
-    for start, take in ue.chunk_ranges(size, chunk_size):
-        offset_bytes = start * bytes_per_element
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=A_DRAM_ADDR + offset_bytes,
-            sram_address=uram_a_addr, element_size=take)
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=B_DRAM_ADDR + offset_bytes,
-            sram_address=uram_b_addr, element_size=take)
-        ue.eltwise_add_core(
-            vector_A_sram_start_addr=uram_a_addr,
-            vector_B_sram_start_addr=uram_b_addr,
-            vector_C_sram_wb_addr=uram_a_addr, element_size=take)
-        ue.sram_to_accelerator_memory(
-            sram_address=uram_a_addr,
-            accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
-            element_size=take)
-    return size
-
-def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
-    """OUTPUT = A * B (DRAM)."""
-    bytes_per_element = 2
-    uram_a_addr = 0x00000
-    uram_b_addr = 0x80000
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS, size)
-
-    for start, take in ue.chunk_ranges(size, chunk_size):
-        offset_bytes = start * bytes_per_element
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=A_DRAM_ADDR + offset_bytes,
-            sram_address=uram_a_addr, element_size=take)
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=B_DRAM_ADDR + offset_bytes,
-            sram_address=uram_b_addr, element_size=take)
-        ue.eltwise_mul_core(
-            vector_A_sram_start_addr=uram_a_addr,
-            vector_B_sram_start_addr=uram_b_addr,
-            vector_C_sram_wb_addr=uram_a_addr, element_size=take)
-        ue.sram_to_accelerator_memory(
-            sram_address=uram_a_addr,
-            accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
-            element_size=take)
-    return size
 
 def bf16_permute_core_v2(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                           params_dram_addr, temp_dram_start):
@@ -312,86 +212,11 @@ def bf16_permute_core_v2(ue, dims, permute_indices, input_dram_addr, output_dram
 
     return (2, output_shape)
 
-def rms_norm_core_dram_post_add(ue, M: int, N: int,
-                                 A_DRAM_ADDR: int, B_DRAM_ADDR: int,
-                                 ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int,
-                                 GAMMA_DRAM_ADDR: int = None) -> int:
-    """rms_norm(A + B) with residual output."""
-    gamma_sram_addr = 0x80000
-    params_sram_addr = gamma_sram_addr
-
-    if GAMMA_DRAM_ADDR is not None:
-        ue.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
-                                    sram_address=gamma_sram_addr, element_size=N)
-        params_sram_addr += N * 2
-    else:
-        gamma_sram_addr = None
-
-    vector_A_sram_addr = 0x00000
-    vector_B_sram_addr = params_sram_addr
-    uram_b_remaining_elements = URAM_NEAR_FULL_ELEMENTS - (params_sram_addr - 0x80000) // 2
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, uram_b_remaining_elements // N, M)
-    assert chunk_size >= 1 and chunk_size <= M
-
-    for i, m_take in ue.chunk_ranges(M, chunk_size):
-        chunk_elements = m_take * N
-        ue.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * N * 2,
-                                    sram_address=vector_A_sram_addr, element_size=chunk_elements)
-        ue.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + i * N * 2,
-                                    sram_address=vector_B_sram_addr, element_size=chunk_elements)
-        for j in range(m_take):
-            ue.eltwise_add_core(vector_A_sram_addr + j * N * 2, vector_B_sram_addr + j * N * 2,
-                                vector_A_sram_addr + j * N * 2, N)
-        ue.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
-                                        accelerator_dram_address=ADDOUTPUT_DRAM_ADDR + i * N * 2,
-                                        element_size=chunk_elements)
-        for j in range(m_take):
-            ue.rms_norm_core(vector_A_sram_addr + j * N * 2, vector_A_sram_addr + j * N * 2,
-                             N, gamma_sram_addr)
-        ue.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
-                                        accelerator_dram_address=NORMOUTPUT_DRAM_ADDR + i * N * 2,
-                                        element_size=chunk_elements)
-
-    total_flops = M * N + 3 * M * N
-    if gamma_sram_addr is not None:
-        total_flops += M * N
-    return total_flops
-
-_FP4_E2M1_TABLE = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                                  -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.bfloat16)
-
 def quantize_q4_64(tensor):
-    """INT4 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
-    data = tensor.flatten().cpu().float().numpy()
-    n_blocks = int(np.ceil(len(data) / 64))
-    padded = np.pad(data, (0, n_blocks * 64 - len(data)))
-    blocks = padded.reshape(n_blocks, 64)
-    scales = np.max(np.abs(blocks), axis=1)
-    scales[scales == 0] = 1.0
-    scales /= 7.0
-    quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
-    pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
-    packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
-    scale_bytes = torch.tensor(scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
-    return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
+    return _mlc_quantize_q4_64(tensor)
 
 def quantize_fp4_64(tensor):
-    """FP4 E2M1 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
-    x = tensor.to(torch.bfloat16).cpu().flatten()
-    n_blocks = int(np.ceil(x.numel() / 64))
-    if x.numel() % 64 != 0:
-        x = torch.nn.functional.pad(x, (0, n_blocks * 64 - x.numel()))
-    blocks = x.view(n_blocks, 64)
-    fp4_max = torch.tensor(6.0, dtype=torch.bfloat16)
-    scales = (blocks.abs().max(dim=1).values / fp4_max).clamp(min=1e-8).to(torch.bfloat16)
-    scaled = (blocks / scales[:, None]).to(torch.bfloat16)
-    codes = torch.argmin(torch.abs(scaled.unsqueeze(-1) - _FP4_E2M1_TABLE), dim=-1).to(torch.uint8)
-    codes_np = codes.numpy().flatten()
-    if len(codes_np) % 2 != 0:
-        codes_np = np.pad(codes_np, (0, 1))
-    packed = (codes_np[0::2] & 0x0F) | ((codes_np[1::2] & 0x0F) << 4)
-    scales_np = scales.view(torch.uint16).numpy()
-    return np.frombuffer(scales_np.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
+    return _mlc_quantize_fp4_64(tensor)
 
 _LAYER_MAP = {
     'lm': {
@@ -2588,8 +2413,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen2.5-VL-3B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default="please describe the image in details.", help="Text prompt")
-    parser.add_argument("--image", type=str, default=os.path.join(SCRIPT_DIR, "test_image.jpg"),
-                        help="Path to image file (default: test_image.jpg, use 'none' for text-only)")
+    parser.add_argument("--image", type=str, default=os.path.join(PROJECT_ROOT, "test_samples/test_image.jpg"),
+                        help="Path to image file (default: test_samples/test_image.jpg, use 'none' for text-only)")
     parser.add_argument('--vision-cpu', action='store_true',
                         help='Run vision encoder on CPU (fp32) instead of FPGA — for quality comparison')
     parser.add_argument('--rep-penalty', type=float, default=1.05,
