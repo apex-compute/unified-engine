@@ -424,11 +424,10 @@ PARAKEET_PROGRAM_BASE = 0xF0000000   # 256 MB for compiled instruction programs
 class Parakeet_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine subclass for Parakeet-TDT-0.6B."""
 
-    def __init__(self, script_dir=None, clock_period_ns=None, dual_engine=False, engine_slave=False):
+    def __init__(self, script_dir=None, clock_period_ns=None, engine_slave=False):
         program_base = PARAKEET_PROGRAM_BASE + 0x08000000 if engine_slave else PARAKEET_PROGRAM_BASE
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
         super().__init__(BASE_ADDR=engine_base, params_dram_base=PARAKEET_PARAMS_BASE, tensor_dram_base=PARAKEET_TENSOR_BASE, program_dram_base=program_base, clock_period_ns=clock_period_ns)
-        self.dual_engine = dual_engine
         self.engine_slave = engine_slave
         self.script_dir = script_dir or SCRIPT_DIR
         # Hang prevention: stop stale execution, write HALT to program base
@@ -1005,14 +1004,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         row_bytes = W_in * bpe  # 256 bytes per mel row — well above 32-byte AXI min
 
         # Dual-engine M-split for the matmul
-        if self.dual_engine:
-            M_e0 = H_out // 2
-            M_e1 = H_out - M_e0
-            M_local = M_e0 if not self.engine_slave else M_e1
-            m_off = 0 if not self.engine_slave else M_e0
-        else:
-            M_local = H_out
-            m_off = 0
+        M_e0 = H_out // 2
+        M_e1 = H_out - M_e0
+        M_local = M_e0 if not self.engine_slave else M_e1
+        m_off = 0 if not self.engine_slave else M_e0
 
         # Pre-zero R_combined (padding rows stay zero) — master only
         if not self.engine_slave:
@@ -1065,9 +1060,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     offset += chunk
 
             # Signal slave: DMA done → begin dual matmul
-            if self.dual_engine:
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
+            self.generate_instruction_flag_set()
+            self.generate_instruction_flag_clear()
         else:
             # Slave: wait for master DMA
             self.generate_instruction_flag_check(target_engine_idx=0)
@@ -1080,11 +1074,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.SUB_PATCH_DRAM + m_off * N_g * bpe)
 
         # Sync: end
-        if self.dual_engine:
-            if not self.engine_slave:
-                self.generate_instruction_flag_check(target_engine_idx=1)
-            else:
-                self.generate_instruction_flag_set()
+        if not self.engine_slave:
+            self.generate_instruction_flag_check(target_engine_idx=1)
+        else:
+            self.generate_instruction_flag_set()
 
         self.stop_capture()
         self.generate_instruction_halt()
@@ -1122,14 +1115,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
         # Dual-engine M-split for the matmul (M = SC * H_out_pad)
         M_full = SC * H_out_pad
-        if self.dual_engine:
-            M_e0 = M_full // 2
-            M_e1 = M_full - M_e0
-            M_local = M_e0 if not self.engine_slave else M_e1
-            m_off = 0 if not self.engine_slave else M_e0
-        else:
-            M_local = M_full
-            m_off = 0
+        M_e0 = M_full // 2
+        M_e1 = M_full - M_e0
+        M_local = M_e0 if not self.engine_slave else M_e1
+        m_off = 0 if not self.engine_slave else M_e0
 
         # Pre-zero R_all — master only
         if not self.engine_slave:
@@ -1204,9 +1193,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                             self.wait_queue(); inst_id += 1
 
             # Signal slave: data prep done
-            if self.dual_engine:
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
+            self.generate_instruction_flag_set()
+            self.generate_instruction_flag_clear()
         else:
             # Slave: wait for master data prep
             self.generate_instruction_flag_check(target_engine_idx=0)
@@ -1219,11 +1207,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.SUB_PATCH_DRAM + m_off * N_g * bpe)
 
         # Sync: end
-        if self.dual_engine:
-            if not self.engine_slave:
-                self.generate_instruction_flag_check(target_engine_idx=1)
-            else:
-                self.generate_instruction_flag_set()
+        if not self.engine_slave:
+            self.generate_instruction_flag_check(target_engine_idx=1)
+        else:
+            self.generate_instruction_flag_set()
 
         self.stop_capture()
         self.generate_instruction_halt()
@@ -1234,36 +1221,30 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         return prog, H_out, W_out
     def compile_sub_stage0(self, N0, padded_k, SC):
         """HW program: im2col patches(N0,64) @ W(64,256) + bias, ReLU. M-split for dual-engine."""
-        if self.dual_engine:
-            M_e0 = N0 // 2
-            M_e1 = N0 - M_e0
-            M_local = M_e0 if not self.engine_slave else M_e1
-            m_off = 0 if not self.engine_slave else M_e0
-        else:
-            M_local = N0
-            m_off = 0
+        M_e0 = N0 // 2
+        M_e1 = N0 - M_e0
+        M_local = M_e0 if not self.engine_slave else M_e1
+        m_off = 0 if not self.engine_slave else M_e0
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
         # Sync: begin
-        if self.dual_engine:
-            if not self.engine_slave:
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
-            else:
-                self.generate_instruction_flag_check(target_engine_idx=0)
-                self.generate_instruction_flag_clear()
+        if not self.engine_slave:
+            self.generate_instruction_flag_set()
+            self.generate_instruction_flag_clear()
+        else:
+            self.generate_instruction_flag_check(target_engine_idx=0)
+            self.generate_instruction_flag_clear()
         self.matmat_mul_core(M=M_local, K=padded_k, N=SC,
             A_DRAM_ADDR=self.SUB_PATCH_DRAM + m_off * padded_k * self.bytes_per_element,
             B_DRAM_ADDR=self.w["SUB_CONV0_W"],
             OUTPUT_DRAM_ADDR=self.SUB_OUT0_DRAM + m_off * SC * self.bytes_per_element,
             C_DRAM_ADDR=self.w["SUB_CONV0_B"], relu_enable=True)
         # Sync: end
-        if self.dual_engine:
-            if not self.engine_slave:
-                self.generate_instruction_flag_check(target_engine_idx=1)
-            else:
-                self.generate_instruction_flag_set()
+        if not self.engine_slave:
+            self.generate_instruction_flag_check(target_engine_idx=1)
+        else:
+            self.generate_instruction_flag_set()
         self.stop_capture()
         self.generate_instruction_halt()
         prog = self.get_program_dram_addr()
@@ -1277,14 +1258,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         bpe = self.bytes_per_element
         N_out_pad = pad_to_multiple(N_out, self.block_size)
         # Dual-engine M-split for PW matmul
-        if self.dual_engine:
-            M_e0 = N_out_pad // 2
-            M_e1 = N_out_pad - M_e0
-            M_local = M_e0 if not self.engine_slave else M_e1
-            m_off = 0 if not self.engine_slave else M_e0
-        else:
-            M_local = N_out_pad
-            m_off = 0
+        M_e0 = N_out_pad // 2
+        M_e1 = N_out_pad - M_e0
+        M_local = M_e0 if not self.engine_slave else M_e1
+        m_off = 0 if not self.engine_slave else M_e0
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
@@ -1325,9 +1302,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     params_dram_addr=self.w["IDENTITY_64"],
                     temp_dram_start=self.PERMUTE_TEMP_DRAM + SC * c_len_pad * bpe)
             # Signal slave: DW + transpose done
-            if self.dual_engine:
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
+            self.generate_instruction_flag_set()
+            self.generate_instruction_flag_clear()
         else:
             # Slave: wait for master DW + transpose
             self.generate_instruction_flag_check(target_engine_idx=0)
@@ -1340,11 +1316,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             C_DRAM_ADDR=self.w[pw_b_key], relu_enable=True)
         flops += 2 * N_out * SC * SC
         # Sync: end
-        if self.dual_engine:
-            if not self.engine_slave:
-                self.generate_instruction_flag_check(target_engine_idx=1)
-            else:
-                self.generate_instruction_flag_set()
+        if not self.engine_slave:
+            self.generate_instruction_flag_check(target_engine_idx=1)
+        else:
+            self.generate_instruction_flag_set()
         self.stop_capture()
         self.generate_instruction_halt()
         prog = self.get_program_dram_addr()
@@ -1357,36 +1332,30 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         M-split for dual-engine."""
         D = self.d_model
         K = W2 * self.sub_channels  # W2*SC = 4096
-        if self.dual_engine:
-            M_e0 = H2 // 2
-            M_e1 = H2 - M_e0
-            M_local = M_e0 if not self.engine_slave else M_e1
-            m_off = 0 if not self.engine_slave else M_e0
-        else:
-            M_local = H2
-            m_off = 0
+        M_e0 = H2 // 2
+        M_e1 = H2 - M_e0
+        M_local = M_e0 if not self.engine_slave else M_e1
+        m_off = 0 if not self.engine_slave else M_e0
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_flag_clear()
         # Sync: begin
-        if self.dual_engine:
-            if not self.engine_slave:
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
-            else:
-                self.generate_instruction_flag_check(target_engine_idx=0)
-                self.generate_instruction_flag_clear()
+        if not self.engine_slave:
+            self.generate_instruction_flag_set()
+            self.generate_instruction_flag_clear()
+        else:
+            self.generate_instruction_flag_check(target_engine_idx=0)
+            self.generate_instruction_flag_clear()
         self.matmat_mul_core(M=M_local, K=K, N=D,
             A_DRAM_ADDR=self.SUB_PW_IN_DRAM + m_off * K * self.bytes_per_element,
             B_DRAM_ADDR=self.w["SUB_OUT_W_PERM"],
             OUTPUT_DRAM_ADDR=self.INPUT_DRAM + m_off * D * self.bytes_per_element,
             C_DRAM_ADDR=self.w["SUB_OUT_B"])
         # Sync: end
-        if self.dual_engine:
-            if not self.engine_slave:
-                self.generate_instruction_flag_check(target_engine_idx=1)
-            else:
-                self.generate_instruction_flag_set()
+        if not self.engine_slave:
+            self.generate_instruction_flag_check(target_engine_idx=1)
+        else:
+            self.generate_instruction_flag_set()
         self.stop_capture()
         self.generate_instruction_halt()
         prog = self.get_program_dram_addr()
@@ -1422,8 +1391,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
     def compile_encoder(self, L_pad, toeplitz_addrs, bn_tiled):
         """Compile full 24-layer conformer encoder. Returns (program_addr, program_bytes).
         Must call prepare_attention_tiled_biases(L_pad) before this.
-        Supports dual-engine mode: FF1/FF2 blocks run M-split across two engines,
-        attention and conv module run single-engine (master only).
+        Requires dual-engine mode: FF1/FF2 blocks run M-split across two engines,
+        attention and conv module run on master only.
         Args:
             L_pad: padded sequence length
             toeplitz_addrs: list of 24 DRAM addresses for Toeplitz DW conv matrices
@@ -1435,12 +1404,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         P_pad = pad_to_multiple(P, self.block_size)
 
         # Dual-engine M-split setup
-        if self.dual_engine:
-            M_local = L_pad // 2
-            m_off = 0 if not self.engine_slave else M_local
-        else:
-            M_local = L_pad
-            m_off = 0
+        M_local = L_pad // 2
+        m_off = 0 if not self.engine_slave else M_local
         # Precompute DRAM row offsets for (rows, D) and (rows, FF_HALF) shaped buffers
         off_D = m_off * D * bpe
         FF_HALF = FF // 2
@@ -1456,13 +1421,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
             # ===== FF1 (half-step residual, K-split) — DUAL ENGINE =====
             # Sync: begin dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_set()
-                    self.generate_instruction_flag_clear()
-                else:
-                    self.generate_instruction_flag_check(target_engine_idx=0)
-                    self.generate_instruction_flag_clear()
+            if not self.engine_slave:
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+            else:
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             self.layer_norm_core_dram(M=M_local, N=D, A_DRAM_ADDR=self.INPUT_DRAM + off_D, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM + off_D, GAMMA_DRAM_ADDR=la["LN_FF1_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF1_BIAS"])
             # Up-proj K-split: FF_MID layout is [(L_pad, FF_HALF) | (L_pad, FF_HALF)]
             # With M-split, each engine writes its rows within each K-half
@@ -1482,32 +1446,29 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.INPUT_DRAM + off_D)
             total_flops += 2 * M_local * D
             # Sync: end FF1 dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
-                else:
-                    self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                self.generate_instruction_flag_set()
 
             # ===== Attention projections: LN + Q/K/V/pos — DUAL ENGINE =====
             # Sync: begin attention projection dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_set()
-                    self.generate_instruction_flag_clear()
-                else:
-                    self.generate_instruction_flag_check(target_engine_idx=0)
-                    self.generate_instruction_flag_clear()
+            if not self.engine_slave:
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+            else:
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             self.layer_norm_core_dram(M=M_local, N=D, A_DRAM_ADDR=self.INPUT_DRAM + off_D, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM + off_D, GAMMA_DRAM_ADDR=la["LN_ATTN_WEIGHT"], BETA_DRAM_ADDR=la["LN_ATTN_BIAS"])
             self._enc_matmul(M_local, D, D, self.LN_OUT_DRAM + off_D, la["ATTN_Q_W"], self.Q_DRAM + off_D)
             self._enc_matmul(M_local, D, D, self.LN_OUT_DRAM + off_D, la["ATTN_K_W"], self.K_DRAM + off_D)
             self._enc_matmul(M_local, D, D, self.LN_OUT_DRAM + off_D, la["ATTN_V_W"], self.V_DRAM + off_D)
             total_flops += 3 * 2 * M_local * D * D
             # Sync: end Q/K/V dual, master needs full Q/K/V for per-head attention
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
-                else:
-                    self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                self.generate_instruction_flag_set()
 
             # ===== Per-head attention loop — MASTER ONLY =====
             if not self.engine_slave:
@@ -1567,13 +1528,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
             # ===== Output projection + residual — DUAL ENGINE =====
             # Sync: begin output proj dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_set()
-                    self.generate_instruction_flag_clear()
-                else:
-                    self.generate_instruction_flag_check(target_engine_idx=0)
-                    self.generate_instruction_flag_clear()
+            if not self.engine_slave:
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+            else:
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             self._enc_matmul(M_local, D, D, self.ATTN_OUT_DRAM + off_D, la["ATTN_OUT_W"], self.FF_OUT_DRAM + off_D)
             total_flops += 2 * M_local * D * D
             self.accelerator_memory_to_sram(self.INPUT_DRAM + off_D, URAM_A_BASE, M_local * D)
@@ -1582,21 +1542,19 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.sram_to_accelerator_memory(URAM_A_BASE, self.INPUT_DRAM + off_D, M_local * D)
             total_flops += M_local * D
             # Sync: end output proj dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
-                else:
-                    self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                self.generate_instruction_flag_set()
 
             # ===== Conv module: PW1a/PW1b/GLU — DUAL ENGINE =====
             # Sync: begin conv dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_set()
-                    self.generate_instruction_flag_clear()
-                else:
-                    self.generate_instruction_flag_check(target_engine_idx=0)
-                    self.generate_instruction_flag_clear()
+            if not self.engine_slave:
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+            else:
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             self.layer_norm_core_dram(M=M_local, N=D, A_DRAM_ADDR=self.INPUT_DRAM + off_D, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM + off_D, GAMMA_DRAM_ADDR=la["LN_CONV_WEIGHT"], BETA_DRAM_ADDR=la["LN_CONV_BIAS"])
             self._enc_matmul(M_local, D, D, self.LN_OUT_DRAM + off_D, la["CONV_PW1A_W"], self.CONV_A_DRAM + off_D)
             self._enc_matmul(M_local, D, D, self.LN_OUT_DRAM + off_D, la["CONV_PW1B_W"], self.CONV_B_DRAM + off_D, sigmoid_enable=True)
@@ -1607,11 +1565,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.eltwise_mul_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, M_local * D)
             self.sram_to_accelerator_memory(URAM_A_BASE, self.CONV_A_DRAM + off_D, M_local * D)
             # Sync: end conv PW1/GLU dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
-                else:
-                    self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                self.generate_instruction_flag_set()
 
             # ===== Conv module: DW conv section — MASTER ONLY =====
             if not self.engine_slave:
@@ -1632,13 +1589,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
             # ===== Conv module: PW2 + residual — DUAL ENGINE =====
             # Sync: begin PW2 dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_set()
-                    self.generate_instruction_flag_clear()
-                else:
-                    self.generate_instruction_flag_check(target_engine_idx=0)
-                    self.generate_instruction_flag_clear()
+            if not self.engine_slave:
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+            else:
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             self._enc_matmul(M_local, D, D, self.CONV_T_DRAM + off_D, la["CONV_PW2_W"], self.CONV_OUT_DRAM + off_D)
             total_flops += 2 * M_local * D * D
             self.accelerator_memory_to_sram(self.INPUT_DRAM + off_D, URAM_A_BASE, M_local * D)
@@ -1647,21 +1603,19 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.sram_to_accelerator_memory(URAM_A_BASE, self.INPUT_DRAM + off_D, M_local * D)
             total_flops += M_local * D
             # Sync: end PW2 dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
-                else:
-                    self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                self.generate_instruction_flag_set()
 
             # ===== FF2 (half-step residual, K-split) — DUAL ENGINE =====
             # Sync: begin FF2 dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_set()
-                    self.generate_instruction_flag_clear()
-                else:
-                    self.generate_instruction_flag_check(target_engine_idx=0)
-                    self.generate_instruction_flag_clear()
+            if not self.engine_slave:
+                self.generate_instruction_flag_set()
+                self.generate_instruction_flag_clear()
+            else:
+                self.generate_instruction_flag_check(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             self.layer_norm_core_dram(M=M_local, N=D, A_DRAM_ADDR=self.INPUT_DRAM + off_D, OUTPUT_DRAM_ADDR=self.LN_OUT_DRAM + off_D, GAMMA_DRAM_ADDR=la["LN_FF2_WEIGHT"], BETA_DRAM_ADDR=la["LN_FF2_BIAS"])
             # Up-proj split
             self._enc_matmul(M_local, D, FF_HALF, self.LN_OUT_DRAM + off_D, la["FF2_W1_LO"], self.FF_MID_DRAM + off_FFH, silu_enable=True)
@@ -1680,11 +1634,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.INPUT_DRAM + off_D)
             total_flops += 2 * M_local * D
             # Sync: end FF2 dual section
-            if self.dual_engine:
-                if not self.engine_slave:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
-                else:
-                    self.generate_instruction_flag_set()
+            if not self.engine_slave:
+                self.generate_instruction_flag_check(target_engine_idx=1)
+            else:
+                self.generate_instruction_flag_set()
 
             # ===== Final LayerNorm — MASTER ONLY =====
             if not self.engine_slave:
@@ -2017,10 +1970,8 @@ def main():
     parser.add_argument("--audio", type=str, default=None, help="Path to audio file (.wav, .flac, etc.)")
     parser.add_argument("--dev", type=str, default="xdma0", help="XDMA device")
     parser.add_argument("--cycle", type=float, default=5.63, help="Clock cycle in ns")
-    parser.add_argument("--dual-engine", action="store_true", help="Enable dual-engine for encoder FF1/FF2")
     parser.add_argument("--max-seconds", type=float, default=None, help="Truncate audio to N seconds")
     args = parser.parse_args()
-    dual_engine = args.dual_engine
 
     global _SILENT_MODE
     _SILENT_MODE = True
@@ -2043,11 +1994,10 @@ def main():
         max_samples = int(args.max_seconds * cfg["preprocessing"]["sample_rate"])
         waveform = waveform[:, :max_samples]
     audio_dur = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
-    _original_print(f"Parakeet-TDT-0.6B on {args.dev} ({audio_dur:.1f}s audio)" +
-                    (" [dual-engine]" if dual_engine else ""))
+    _original_print(f"Parakeet-TDT-0.6B on {args.dev} ({audio_dur:.1f}s audio) [dual-engine]")
 
     # --- Init engine ---
-    engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, dual_engine=dual_engine)
+    engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
 
     # --- Mel spectrogram (HW DFT/power/filterbank + CPU log/norm) ---
     Parakeet_UnifiedEngine.ensure_model_files()
@@ -2135,8 +2085,6 @@ def main():
     import time as _time
     import sentencepiece as spm
 
-    engine2 = None
-    enc_prog_addr2 = None
     loaded = engine.load_programs(L_pad)
     if loaded:
         mel_prog = loaded["mel"]
@@ -2153,26 +2101,22 @@ def main():
         tok_prog = loaded["tok"]
         dur_prog = loaded["dur"]
         restore_prog = loaded["restore"]
-        if dual_engine:
-            engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, dual_engine=True, engine_slave=True)
-            engine2.copy_dram_layout(engine)
-            loaded2 = engine2.load_programs(L_pad)
-            if loaded2:
-                im2col_s0_2 = loaded2["im2col_s0"]
-                prog_s0_2 = loaded2["prog_s0"]
-                im2col_s1_2 = loaded2["im2col_s1"]
-                prog_s1_2 = loaded2["prog_s1"]
-                im2col_s2_2 = loaded2["im2col_s2"]
-                prog_s2_2 = loaded2["prog_s2"]
-                prog_flatten_lin_2 = loaded2["prog_flatten_lin"]
-                enc_prog_addr2 = loaded2["encoder"]
-            else:
-                loaded = None  # force recompile if slave bins missing
+        engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, engine_slave=True)
+        engine2.copy_dram_layout(engine)
+        loaded2 = engine2.load_programs(L_pad)
+        assert loaded2, "Master program bins found but slave bins missing — delete parakeet_bin/ and recompile"
+        im2col_s0_2 = loaded2["im2col_s0"]
+        prog_s0_2 = loaded2["prog_s0"]
+        im2col_s1_2 = loaded2["im2col_s1"]
+        prog_s1_2 = loaded2["prog_s1"]
+        im2col_s2_2 = loaded2["im2col_s2"]
+        prog_s2_2 = loaded2["prog_s2"]
+        prog_flatten_lin_2 = loaded2["prog_flatten_lin"]
+        enc_prog_addr2 = loaded2["encoder"]
     else:
         # Create slave engine for dual-engine compilation
-        if dual_engine:
-            engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, dual_engine=True, engine_slave=True)
-            engine2.copy_dram_layout(engine)
+        engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, engine_slave=True)
+        engine2.copy_dram_layout(engine)
         # HW mel spectrogram program (master only — log done on CPU after readback)
         mel_prog = engine.compile_mel_spectrogram(T_mel)
         # HW mel normalization: transpose → layer_norm → transpose back
@@ -2187,21 +2131,18 @@ def main():
         prog_s2, _ = engine.compile_sub_stage_dw_pw(N1, N2, SC,
             engine.SUB_PATCH_DRAM, "SUB_DW2_W", "SUB_DW2_B", "SUB_PW2_W", "SUB_PW2_B")
         prog_flatten_lin, _ = engine.compile_sub_flatten_linear(H2, W2)
-        if dual_engine:
-            im2col_s0_2, _, _ = engine2.compile_im2col_s0(T_mel)
-            prog_s0_2, _ = engine2.compile_sub_stage0(N0, 64, SC)
-            im2col_s1_2, _, _ = engine2.compile_im2col_dw(H0, W0, N1_pad, engine2.SUB_OUT0_DRAM, "IM2COL_G_S1")
-            prog_s1_2, _ = engine2.compile_sub_stage_dw_pw(N0, N1, SC,
-                engine2.SUB_PATCH_DRAM, "SUB_DW1_W", "SUB_DW1_B", "SUB_PW1_W", "SUB_PW1_B")
-            im2col_s2_2, _, _ = engine2.compile_im2col_dw(H1, W1, N2_pad, engine2.SUB_PW_IN_DRAM, "IM2COL_G_S2")
-            prog_s2_2, _ = engine2.compile_sub_stage_dw_pw(N1, N2, SC,
-                engine2.SUB_PATCH_DRAM, "SUB_DW2_W", "SUB_DW2_B", "SUB_PW2_W", "SUB_PW2_B")
-            prog_flatten_lin_2, _ = engine2.compile_sub_flatten_linear(H2, W2)
+        im2col_s0_2, _, _ = engine2.compile_im2col_s0(T_mel)
+        prog_s0_2, _ = engine2.compile_sub_stage0(N0, 64, SC)
+        im2col_s1_2, _, _ = engine2.compile_im2col_dw(H0, W0, N1_pad, engine2.SUB_OUT0_DRAM, "IM2COL_G_S1")
+        prog_s1_2, _ = engine2.compile_sub_stage_dw_pw(N0, N1, SC,
+            engine2.SUB_PATCH_DRAM, "SUB_DW1_W", "SUB_DW1_B", "SUB_PW1_W", "SUB_PW1_B")
+        im2col_s2_2, _, _ = engine2.compile_im2col_dw(H1, W1, N2_pad, engine2.SUB_PW_IN_DRAM, "IM2COL_G_S2")
+        prog_s2_2, _ = engine2.compile_sub_stage_dw_pw(N1, N2, SC,
+            engine2.SUB_PATCH_DRAM, "SUB_DW2_W", "SUB_DW2_B", "SUB_PW2_W", "SUB_PW2_B")
+        prog_flatten_lin_2, _ = engine2.compile_sub_flatten_linear(H2, W2)
         # Encoder program
         enc_prog_addr, enc_prog_bytes = engine.compile_encoder(L_pad, toeplitz_addrs, bn_tiled)
-        enc_prog_addr2 = None
-        if dual_engine:
-            enc_prog_addr2, _ = engine2.compile_encoder(L_pad, toeplitz_addrs, bn_tiled)
+        enc_prog_addr2, _ = engine2.compile_encoder(L_pad, toeplitz_addrs, bn_tiled)
         # Decoder programs
         pred_prog, tok_prog, dur_prog, restore_prog, _ = engine.compile_decoder()
         # Compute program sizes from consecutive DRAM addresses
@@ -2220,19 +2161,18 @@ def main():
             next_addr = all_progs[i + 1][1] if i + 1 < len(all_progs) else prog_end
             sized[name] = (addr, next_addr - addr)
         engine.dump_programs(sized, L_pad)
-        if dual_engine:
-            all_progs2 = [
-                ("im2col_s0", im2col_s0_2), ("prog_s0", prog_s0_2),
-                ("im2col_s1", im2col_s1_2), ("prog_s1", prog_s1_2),
-                ("im2col_s2", im2col_s2_2), ("prog_s2", prog_s2_2),
-                ("prog_flatten_lin", prog_flatten_lin_2), ("encoder", enc_prog_addr2),
-            ]
-            prog_end2 = engine2.get_program_dram_addr()
-            sized2 = {}
-            for i, (name, addr) in enumerate(all_progs2):
-                next_addr = all_progs2[i + 1][1] if i + 1 < len(all_progs2) else prog_end2
-                sized2[name] = (addr, next_addr - addr)
-            engine2.dump_programs(sized2, L_pad)
+        all_progs2 = [
+            ("im2col_s0", im2col_s0_2), ("prog_s0", prog_s0_2),
+            ("im2col_s1", im2col_s1_2), ("prog_s1", prog_s1_2),
+            ("im2col_s2", im2col_s2_2), ("prog_s2", prog_s2_2),
+            ("prog_flatten_lin", prog_flatten_lin_2), ("encoder", enc_prog_addr2),
+        ]
+        prog_end2 = engine2.get_program_dram_addr()
+        sized2 = {}
+        for i, (name, addr) in enumerate(all_progs2):
+            next_addr = all_progs2[i + 1][1] if i + 1 < len(all_progs2) else prog_end2
+            sized2[name] = (addr, next_addr - addr)
+        engine2.dump_programs(sized2, L_pad)
     engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0), "state_restore": (restore_prog, 0)}
 
     import threading
@@ -2264,27 +2204,20 @@ def main():
     # HW: transpose → layer_norm → transpose back → result in MEL_DRAM
     engine.program_execute(norm_prog)
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
-    if dual_engine:
-        engine2.start_execute_from_dram(im2col_s0_2)
+    engine2.start_execute_from_dram(im2col_s0_2)
     engine.program_execute(im2col_s0)
-    if dual_engine:
-        engine2.start_execute_from_dram(prog_s0_2)
+    engine2.start_execute_from_dram(prog_s0_2)
     engine.program_execute(prog_s0)
-    if dual_engine:
-        engine2.start_execute_from_dram(im2col_s1_2)
+    engine2.start_execute_from_dram(im2col_s1_2)
     engine.program_execute(im2col_s1)
-    if dual_engine:
-        engine2.start_execute_from_dram(prog_s1_2)
+    engine2.start_execute_from_dram(prog_s1_2)
     engine.program_execute(prog_s1)
-    if dual_engine:
-        engine2.start_execute_from_dram(im2col_s2_2)
+    engine2.start_execute_from_dram(im2col_s2_2)
     engine.program_execute(im2col_s2)
-    if dual_engine:
-        engine2.start_execute_from_dram(prog_s2_2)
+    engine2.start_execute_from_dram(prog_s2_2)
     engine.program_execute(prog_s2)
     engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
-    if dual_engine:
-        engine2.start_execute_from_dram(prog_flatten_lin_2)
+    engine2.start_execute_from_dram(prog_flatten_lin_2)
     engine.program_execute(prog_flatten_lin)
     if L_pad > H2:
         ef = torch.zeros((L_pad - H2) * D, dtype=torch.bfloat16)
@@ -2293,8 +2226,7 @@ def main():
     t_sub_done = _time.perf_counter()
 
     # --- Encoder ---
-    if dual_engine:
-        engine2.start_execute_from_dram(enc_prog_addr2)
+    engine2.start_execute_from_dram(enc_prog_addr2)
     engine.start_execute_from_dram(enc_prog_addr)
     engine.wait_queue(120.0)
     t_enc_done = _time.perf_counter()
