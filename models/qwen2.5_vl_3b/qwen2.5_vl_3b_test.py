@@ -19,7 +19,7 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
 from model_lib_core import (
-    bf16_permute_core,
+    smart_bf16_permute_core,
     store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
     eltwise_add_core_dram, eltwise_mul_core_dram,
     rms_norm_core_dram_post_add,
@@ -449,42 +449,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     def get_arg_max_index(self) -> int:
         """Get the arg max index from the Unified Engine"""
         return self.read_reg32(UE_ARGMAX1_INDEX)
-
-    def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
-        """RoPE (HuggingFace style). Caller must have start_capture() before and stop_capture() after."""
-        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
-        assert N % 2 == 0, "N must be even for RoPE half layout"
-        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
-        half = N // 2
-        bytes_per_elem = 2
-        sram_x = 0x00000
-        sram_a = 0x20000
-        sram_d = 0x40000
-        sram_cos = 0x80000
-        sram_sin = 0x80000 + N * bytes_per_elem
-        sram_bc = 0x80000 + N * bytes_per_elem * 2
-        self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr, sram_address=sram_x, element_size=N)
-        if rope_size_reg is not None:
-            self.generate_instruction_add_imm(rope_size_reg, cos_dram_addr, tmp_reg)
-            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-            self.generate_instruction_add_imm(rope_size_reg, sin_dram_addr, tmp_reg)
-            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-        else:
-            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
-            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
-        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
-        if output_addr_inc_reg is not None:
-            self.generate_instruction_add_imm(output_addr_inc_reg, output_dram_addr, tmp_reg)
-            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-        else:
-            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
-        return 4 * N
 
     def decoder_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
@@ -1314,14 +1278,14 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         stride_jump_bytes=qk_row_pad * bpe)
                     self.sram_to_accelerator_memory(0x00000, dst, t_take * VN_VD_PAD)
 
-                bf16_permute_core(self,
+                smart_bf16_permute_core(self,
                     dims=[VS, VN, VD_PAD], permute_indices=[1, 0, 2],
                     input_dram_addr=extract_buf,
                     output_dram_addr=pad_dst,
                     params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
                     temp_dram_start=perm_temp)
 
-            bf16_permute_core(self,
+            smart_bf16_permute_core(self,
                 dims=[VS, VN, VD_PAD], permute_indices=[1, 0, 2],
                 input_dram_addr=self.VIS_V_DRAM,
                 output_dram_addr=self.VIS_V_PAD_DRAM,
@@ -1408,7 +1372,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(
                         0x00000, dst_head + t_start * VD * bpe, t_take * VD)
 
-            bf16_permute_core(self,
+            smart_bf16_permute_core(self,
                 dims=permute_dims_merge, permute_indices=permute_idx,
                 input_dram_addr=self.VIS_ATTN_TRIM_DRAM,
                 output_dram_addr=self.VIS_ATTN_RESULT_DRAM,
@@ -1801,14 +1765,14 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 cos_addr = ROPE_WEIGHT_ADDR + t * rope_row_bytes
                 sin_addr = cos_addr + ahd * bpe
                 for kv_h in range(nkvh):
-                    total_flops += self.rope_hf_core(
+                    total_flops += self.rope_core_dram_step(
                         N=ahd,
                         input_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
                         output_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
                         cos_dram_addr=cos_addr,
                         sin_dram_addr=sin_addr)
                 for q_h in range(nkvh * qpkv):
-                    total_flops += self.rope_hf_core(
+                    total_flops += self.rope_core_dram_step(
                         N=ahd,
                         input_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
                         output_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
@@ -2047,7 +2011,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # RoPE per head (decode position set by ROPE_SIZE_REG at runtime)
                 ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE
                 for kv_h in range(nkvh):
-                    total_flops += self.rope_hf_core(
+                    total_flops += self.rope_core_dram_step(
                         N=ahd,
                         input_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
                         output_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
@@ -2056,7 +2020,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         rope_size_reg=self.ROPE_SIZE_REG,
                         tmp_reg=self.TMP_REG)
                 for q_h in range(nkvh * qpkv):
-                    total_flops += self.rope_hf_core(
+                    total_flops += self.rope_core_dram_step(
                         N=ahd,
                         input_dram_addr=self.LAYER0_Q_DRAM + q_h * ahd * bpe,
                         output_dram_addr=self.LAYER0_Q_DRAM + q_h * ahd * bpe,

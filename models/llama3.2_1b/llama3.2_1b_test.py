@@ -407,42 +407,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """Get the arg max index from the Unified Engine."""
         return self.read_reg32(UE_ARGMAX_INDEX)
 
-    def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
-        """RoPE (HuggingFace style). Caller must have start_capture() before and stop_capture() after."""
-        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
-        assert N % 2 == 0, "N must be even for RoPE half layout"
-        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
-        half = N // 2
-        bytes_per_elem = 2
-        sram_x = 0x00000
-        sram_a = 0x20000
-        sram_d = 0x40000
-        sram_cos = 0x80000
-        sram_sin = 0x80000 + N * bytes_per_elem
-        sram_bc = 0x80000 + N * bytes_per_elem * 2
-        self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr, sram_address=sram_x, element_size=N)
-        if rope_size_reg is not None:
-            self.generate_instruction_add_imm(rope_size_reg, cos_dram_addr, tmp_reg)
-            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-            self.generate_instruction_add_imm(rope_size_reg, sin_dram_addr, tmp_reg)
-            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-        else:
-            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
-            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
-        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
-        if output_addr_inc_reg is not None:
-            self.generate_instruction_add_imm(output_addr_inc_reg, output_dram_addr, tmp_reg)
-            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-        else:
-            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
-        return 4 * N
-
     def decoder_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
 
@@ -939,7 +903,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             # Phase 1: K rope in-place on LAYER0_K_DRAM (N=512, [lo|hi] layout)
             # After this, K_DRAM[t] = [K0_lo_r..K7_lo_r(256), K0_hi_r..K7_hi_r(256)]
             for t in range(seq_len):
-                total_flops += self.rope_hf_core(
+                total_flops += self.rope_core_dram_step(
                     N=hd,
                     input_dram_addr=self.LAYER0_K_DRAM + t * hd * bpe,
                     output_dram_addr=self.LAYER0_K_DRAM + t * hd * bpe,
@@ -951,7 +915,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             for g in range(qpkv):
                 for t in range(seq_len):
                     q_t_g = self.LAYER0_Q_DRAM + t * total_q_dim * bpe + g * hd * bpe
-                    total_flops += self.rope_hf_core(
+                    total_flops += self.rope_core_dram_step(
                         N=hd,
                         input_dram_addr=q_t_g,
                         output_dram_addr=q_t_g,
@@ -1179,7 +1143,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 half_ahd = ahd // 2               # 32
 
                 # Step 1: K rope in-place (N=512, uses ROPE_SIZE_REG for decode position)
-                total_flops += self.rope_hf_core(
+                total_flops += self.rope_core_dram_step(
                     N=hd,
                     input_dram_addr=self.LAYER0_K_DRAM,
                     output_dram_addr=self.LAYER0_K_DRAM,
@@ -1190,7 +1154,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
                 # Step 2: Q rope in-place per 512-dim group (N=512, uses ROPE_SIZE_REG)
                 for g in range(qpkv):
-                    total_flops += self.rope_hf_core(
+                    total_flops += self.rope_core_dram_step(
                         N=hd,
                         input_dram_addr=self.LAYER0_Q_DRAM + g * hd * bpe,
                         output_dram_addr=self.LAYER0_Q_DRAM + g * hd * bpe,
