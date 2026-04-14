@@ -278,7 +278,7 @@ def chunked_transpose_core_dram(ue: UnifiedEngine, M: int, N: int,
 
         # Transpose (M, chunk_cols_pad) -> (chunk_cols_pad, M_aligned)
         # N_transpose = chunk_cols_pad = VS, so dot product has 1 group. Safe.
-        bf16_smart_permute_core(ue,
+        bf16_permute_core(ue,
             dims=[M, chunk_cols_pad], permute_indices=[1, 0],
             input_dram_addr=temp_dram_addr,
             output_dram_addr=output_dram_addr + col_start * M_aligned * bpe,
@@ -310,7 +310,7 @@ def half_step_residual_core_dram(ue: UnifiedEngine, M: int, N: int,
                         element_size=total_elems)
     # Write result
     ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
-def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
+def bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                              params_dram_addr, temp_dram_start):
     """Permute via DMA gather + batched transpose decomposition."""
     from user_dma_core import (UE_VECTOR_SIZE, UE_MODE, URAM_FULL_ELEMENTS,
@@ -1095,7 +1095,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_flag_clear()
 
         # Step 1: Transpose (N_in, SC) → (SC, N_in)
-        bf16_smart_permute_core(self,
+        bf16_permute_core(self,
             dims=[N_in, SC],
             permute_indices=[1, 0],
             input_dram_addr=input_dram_addr,
@@ -1226,7 +1226,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 dst = self.PERMUTE_TEMP_DRAM + ch * c_len_pad * bpe
                 self.accelerator_memory_to_sram(src, URAM_A_BASE, c_len)
                 self.sram_to_accelerator_memory(URAM_A_BASE, dst, c_len)
-            bf16_smart_permute_core(self,
+            bf16_permute_core(self,
                 dims=[SC, c_len_pad], permute_indices=[1, 0],
                 input_dram_addr=self.PERMUTE_TEMP_DRAM,
                 output_dram_addr=self.SUB_PW_IN_DRAM + c_start * SC * bpe,

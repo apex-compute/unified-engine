@@ -52,7 +52,6 @@ def store_weight(ue, tensor: torch.Tensor, padded_shape=None) -> int:
     ue.allocate_params_dram(nbytes)
     return addr
 
-
 def store_quantized_weight(ue, raw_data) -> tuple[int, int]:
     """Store Q4_64 raw GGUF data as (scales, packed) in DRAM. Returns (scale_addr, data_addr)."""
     raw_bytes = raw_data.tobytes() if hasattr(raw_data, "tobytes") else bytes(raw_data)
@@ -74,7 +73,6 @@ def store_quantized_weight(ue, raw_data) -> tuple[int, int]:
 
     return scale_addr, data_addr
 
-
 def load_weight_cache(bin_path: str) -> dict:
     """Load bin + sibling json manifest. Returns ``{tensor_name: raw_uint8_numpy}``."""
     json_path = bin_path.rsplit(".", 1)[0] + ".json"
@@ -88,7 +86,6 @@ def load_weight_cache(bin_path: str) -> dict:
             raw[meta["offset"]:meta["offset"] + meta["size"]], dtype=np.uint8
         ).copy()
     return cache
-
 
 def store_identity_matrix(ue) -> int:
     """Write a UE_VECTOR_SIZE × UE_VECTOR_SIZE bf16 identity into params DRAM. Returns its address."""
@@ -129,7 +126,6 @@ def eltwise_add_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int,
             element_size=take)
     return size
 
-
 def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int,
                           OUTPUT_DRAM_ADDR: int) -> int:
     """OUTPUT = A * B over ``size`` bf16 elements, streamed through URAM A/B."""
@@ -155,6 +151,211 @@ def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int,
             accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
             element_size=take)
     return size
+
+
+# =============================================================================
+# §2b Unified ND permute (DMA gather + batched transpose)
+# =============================================================================
+def bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
+                      params_dram_addr=0, temp_dram_start=0):
+    """ND permute via DMA gather + batched identity-dot-product transpose.
+
+    Auto-detects an identity prefix in ``permute_indices``: leading dims that
+    map to themselves are treated as outer-loop batch and strided over, so the
+    inner decomposition only sees the dims that actually move.
+
+    Subsumes the 3-D ``bf16_permute_core`` on ``UnifiedEngine`` (lands in Case 1
+    fast gather) and handles non-``UE_VECTOR_SIZE``-aligned last dims.
+    """
+    from user_dma_core import (UE_VECTOR_SIZE, UE_MODE, URAM_NEAR_FULL_ELEMENTS,
+                               URAM_HALF_ELEMENTS, URAM_SECTION, URAM_WRITE_SRC,
+                               URAM_START_ADDR, LALU_MODE)
+    bpe = 2
+
+    # Peel identity prefix → outer batch loop.
+    batch_prefix = 0
+    while batch_prefix < len(permute_indices) and permute_indices[batch_prefix] == batch_prefix:
+        batch_prefix += 1
+    # Last dim must be part of the permuted suffix for the decomposition to make sense.
+    if batch_prefix >= len(permute_indices) - 1:
+        batch_prefix = 0
+
+    if batch_prefix > 0:
+        inner_dims = list(dims[batch_prefix:])
+        inner_perm = [p - batch_prefix for p in permute_indices[batch_prefix:]]
+        outer = 1
+        for d in dims[:batch_prefix]:
+            outer *= d
+        inner_elems = 1
+        for d in inner_dims:
+            inner_elems *= d
+        stride = inner_elems * bpe
+        last_shape = None
+        for b in range(outer):
+            _, last_shape = bf16_permute_core(
+                ue, inner_dims, inner_perm,
+                input_dram_addr + b * stride,
+                output_dram_addr + b * stride,
+                params_dram_addr, temp_dram_start,
+            )
+        return (1, tuple(dims[:batch_prefix]) + last_shape)
+
+    n = len(dims) - 1
+    total_elements = 1
+    for d in dims:
+        total_elements *= d
+    k = permute_indices[n]
+    inst_id = 0
+
+    # Case 1: last dim stays fixed — pure DMA gather.
+    if k == n:
+        last_dim = dims[n]
+        output_shape = tuple(dims[permute_indices[i]] for i in range(len(dims)))
+        permute_a = torch.arange(total_elements, dtype=torch.int32).reshape(*dims)
+        permute_a = permute_a.permute(*permute_indices).contiguous().flatten()
+
+        if last_dim < UE_VECTOR_SIZE or last_dim % UE_VECTOR_SIZE != 0:
+            for j in range(total_elements // last_dim):
+                src_idx = permute_a[j * last_dim].item()
+                ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
+                    URAM_START_ADDR, URAM_SECTION.URAM_A.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+                ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                    output_dram_addr + j * last_dim * bpe, last_dim * bpe, inst_id)
+                ue.wait_queue(); inst_id += 1
+            return (1, output_shape)
+
+        out_addr = output_dram_addr
+        remaining = total_elements
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining)
+            n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                src_idx = permute_a[i + j * last_dim].item()
+                ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
+                    URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe, inst_id)
+            ue.wait_queue(); inst_id += 1
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+        return (1, output_shape)
+
+    # Case 2: last dim changes — Q1 (last-dim-fixed) → transpose → Q3 (last-dim-fixed).
+    remaining_for_q1 = [i for i in range(n + 1) if i != k and i != n]
+    q1 = remaining_for_q1 + [k, n]
+    q1_is_identity = all(q1[i] == i for i in range(n + 1))
+    dims_after_q1 = [dims[q1[i]] for i in range(n + 1)]
+
+    M_transpose = dims_after_q1[n - 1]
+    N_transpose = dims_after_q1[n]
+    M_aligned = ((M_transpose - 1) // UE_VECTOR_SIZE + 1) * UE_VECTOR_SIZE
+    batch_size = 1
+    for i in range(n - 1):
+        batch_size *= dims_after_q1[i]
+    dims_after_transpose = list(dims_after_q1[:n - 1]) + [N_transpose, M_aligned]
+
+    current_dim_at_pos = list(q1[:n - 1]) + [n, k]
+    pos_of_orig_dim = [0] * (n + 1)
+    for pos, orig_dim in enumerate(current_dim_at_pos):
+        pos_of_orig_dim[orig_dim] = pos
+    q3 = [pos_of_orig_dim[permute_indices[i]] for i in range(n + 1)]
+    q3_is_identity = all(q3[i] == i for i in range(n + 1))
+    output_shape = tuple(dims_after_transpose[q3[i]] for i in range(n + 1))
+
+    transposed_total = batch_size * N_transpose * M_aligned
+    safe_temp = temp_dram_start
+    if q1_is_identity:
+        p2_in = input_dram_addr
+    else:
+        p2_in = safe_temp; safe_temp += total_elements * bpe
+    if q3_is_identity:
+        p2_out = output_dram_addr
+    else:
+        p2_out = safe_temp
+
+    if not q1_is_identity:
+        q1_pa = torch.arange(total_elements, dtype=torch.int32).reshape(*dims).permute(*q1).contiguous().flatten()
+        last_dim = dims[n]
+        out_addr = p2_in; remaining = total_elements
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining); n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                ue.ue_memcpy_from_dram(input_dram_addr + q1_pa[i + j * last_dim].item() * bpe,
+                    last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe, inst_id)
+            ue.wait_queue(); inst_id += 1
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+
+    input_uram_addr = URAM_START_ADDR
+    ue.ue_memcpy_from_dram(params_dram_addr, UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe,
+        0, input_uram_addr, URAM_SECTION.URAM_A.value, inst_id)
+    ue.wait_queue(); inst_id += 1
+
+    max_N_chunk = min(((URAM_NEAR_FULL_ELEMENTS // N_transpose) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE, M_aligned)
+    max_M_chunk = min(N_transpose, URAM_HALF_ELEMENTS // N_transpose, URAM_HALF_ELEMENTS // max_N_chunk)
+    in_stride = M_transpose * N_transpose * bpe
+    out_stride = M_aligned * N_transpose * bpe
+
+    for batch in range(batch_size):
+        cur_in = p2_in + batch * in_stride
+        cur_out = p2_out + batch * out_stride
+        remaining_M = N_transpose; start_vec = 0; out_chunk = cur_out
+
+        while remaining_M > 0:
+            cur_M = min(max_M_chunk, remaining_M)
+            output_uram = UE_VECTOR_SIZE; remaining_N = M_aligned
+            weight_addr = cur_in; out_offset = out_chunk
+
+            while remaining_N > 0:
+                cur_N = min(max_N_chunk, remaining_N)
+                ue.ue_memcpy_from_dram(weight_addr, cur_N * N_transpose * bpe,
+                    0, URAM_START_ADDR, URAM_SECTION.URAM_B.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+
+                for i in range(cur_M):
+                    abs_row = start_vec + i
+                    vec_idx = abs_row % UE_VECTOR_SIZE
+                    col_block = abs_row // UE_VECTOR_SIZE
+                    ue.start_queue(0, 0, N_transpose // UE_VECTOR_SIZE, LALU_MODE.BYPASS.value, 0, 0,
+                        URAM_SECTION.URAM_A.value, 0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+                        UE_MODE.BF16_DOT_PRODUCT, 0, input_uram_addr + vec_idx, URAM_START_ADDR + col_block,
+                        1, 0, cur_N * N_transpose, cur_N, inst_id)
+                    inst_id += 1; ue.wait_queue()
+                    ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, output_uram,
+                        out_offset + i * M_aligned * bpe, cur_N * bpe, inst_id)
+                    ue.wait_queue(); inst_id += 1
+
+                remaining_N -= cur_N; out_offset += cur_N * bpe; weight_addr += cur_N * N_transpose * bpe
+            out_chunk += cur_M * M_aligned * bpe; remaining_M -= cur_M; start_vec += cur_M
+
+    if not q3_is_identity:
+        q3_pa = torch.arange(transposed_total, dtype=torch.int32).reshape(*dims_after_transpose).permute(*q3).contiguous().flatten()
+        last_dim = M_aligned
+        out_addr = output_dram_addr; remaining = transposed_total
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining); n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                ue.ue_memcpy_from_dram(p2_out + q3_pa[i + j * last_dim].item() * bpe,
+                    last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe, inst_id)
+            ue.wait_queue(); inst_id += 1
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+
+    return (2, output_shape)
 
 
 # =============================================================================
