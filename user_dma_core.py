@@ -2036,6 +2036,95 @@ class UnifiedEngine:
         total_flops = 3 * M * N
         return total_flops
 
+    def rope_core_dram_step(self, N: int,
+                            input_dram_addr: int, output_dram_addr: int,
+                            cos_dram_addr: int, sin_dram_addr: int,
+                            rope_size_reg: int = None,
+                            output_addr_inc_reg: int = None,
+                            tmp_reg: int = None) -> int:
+        """Single-token RoPE with register-addressed position stepping for capture-mode decode.
+
+        Extends rope_core_dram to the ISA capture loop: cos/sin DRAM addresses can be
+        patched at runtime via general registers so the same captured instruction sequence
+        steps through token positions without recompilation.
+
+        Caller must bracket this call with start_capture() / stop_capture().
+        sin must have its first half pre-negated (same convention as rope_core / rope_core_dram).
+
+        URAM layout (fixed slots):
+          URAM_A: x @ 0x00000, scratch_a @ 0x20000, output @ 0x40000
+          URAM_B: cos @ 0x80000, sin @ 0x80000 + N*2, bc_scratch @ 0x80000 + N*4
+
+        Args:
+            N: vector length — must be a multiple of UE_VECTOR_SIZE, even, and >= 128
+            input_dram_addr: DRAM address of input token vector (N bf16 elements)
+            output_dram_addr: DRAM address for output vector (N bf16 elements)
+            cos_dram_addr: base DRAM address of cosine table row for this token
+            sin_dram_addr: base DRAM address of sine table row for this token
+            rope_size_reg: general register holding the per-step byte stride for cos/sin;
+                           if None, cos_dram_addr/sin_dram_addr are used as fixed addresses
+            output_addr_inc_reg: general register holding the per-step byte stride for output;
+                                 if None, output_dram_addr is used as a fixed address
+            tmp_reg: scratch general register used for address patching (required when
+                     rope_size_reg or output_addr_inc_reg is not None)
+
+        Returns:
+            4 * N (theoretical FLOP count)
+        """
+        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
+        assert N % 2 == 0, "N must be even for RoPE half layout"
+        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
+        half = N // 2
+        bpe = 2
+        sram_x   = 0x00000
+        sram_a   = 0x20000
+        sram_d   = 0x40000
+        sram_cos = 0x80000
+        sram_sin = 0x80000 + N * bpe
+        sram_bc  = 0x80000 + N * bpe * 2
+
+        self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr,
+                                        sram_address=sram_x, element_size=N)
+        if rope_size_reg is not None:
+            self.generate_instruction_add_imm(rope_size_reg, cos_dram_addr, tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr,
+                                            sram_address=sram_cos, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, sin_dram_addr, tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr,
+                                            sram_address=sram_sin, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+        else:
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr,
+                                            sram_address=sram_cos, element_size=N)
+            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr,
+                                            sram_address=sram_sin, element_size=N)
+
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x,
+                              vector_B_sram_start_addr=sram_cos,
+                              vector_C_sram_wb_addr=sram_a, element_size=N)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bpe,
+                              vector_B_sram_start_addr=sram_sin,
+                              vector_C_sram_wb_addr=sram_bc, element_size=half)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x,
+                              vector_B_sram_start_addr=sram_sin + half * bpe,
+                              vector_C_sram_wb_addr=sram_bc + half * bpe, element_size=half)
+        self.eltwise_add_core(vector_A_sram_start_addr=sram_a,
+                              vector_B_sram_start_addr=sram_bc,
+                              vector_C_sram_wb_addr=sram_d, element_size=N)
+
+        if output_addr_inc_reg is not None:
+            self.generate_instruction_add_imm(output_addr_inc_reg, output_dram_addr, tmp_reg)
+            self.sram_to_accelerator_memory(sram_address=sram_d,
+                                            accelerator_dram_address=output_dram_addr,
+                                            element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+        else:
+            self.sram_to_accelerator_memory(sram_address=sram_d,
+                                            accelerator_dram_address=output_dram_addr,
+                                            element_size=N)
+        return 4 * N
+
     def start_queue_for_bf16_dequantize_operation(self, VECTOR_INPUT_DRAM_ADDR: int, SCALE_INPUT_DRAM_ADDR: int, data_type: TYPE,
                                                   output_sram_wb_addr: int, element_size: int) -> None:
         """

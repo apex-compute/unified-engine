@@ -156,8 +156,8 @@ def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int,
 # =============================================================================
 # §2b Unified ND permute (DMA gather + batched transpose)
 # =============================================================================
-def bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
-                      params_dram_addr=0, temp_dram_start=0):
+def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
+                            params_dram_addr=0, temp_dram_start=0):
     """ND permute via DMA gather + batched identity-dot-product transpose.
 
     Auto-detects an identity prefix in ``permute_indices``: leading dims that
@@ -192,7 +192,7 @@ def bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_ad
         stride = inner_elems * bpe
         last_shape = None
         for b in range(outer):
-            _, last_shape = bf16_permute_core(
+            _, last_shape = smart_bf16_permute_core(
                 ue, inner_dims, inner_perm,
                 input_dram_addr + b * stride,
                 output_dram_addr + b * stride,
@@ -325,8 +325,8 @@ def bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_ad
                     abs_row = start_vec + i
                     vec_idx = abs_row % UE_VECTOR_SIZE
                     col_block = abs_row // UE_VECTOR_SIZE
-                    ue.start_queue(0, 0, N_transpose // UE_VECTOR_SIZE, LALU_MODE.BYPASS.value, 0, 0,
-                        URAM_SECTION.URAM_A.value, 0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+                    ue.start_queue(0, 0, N_transpose // UE_VECTOR_SIZE, 0, 0, LALU_MODE.BYPASS.value, 0,
+                        0, 0, 0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
                         UE_MODE.BF16_DOT_PRODUCT, 0, input_uram_addr + vec_idx, URAM_START_ADDR + col_block,
                         1, 0, cur_N * N_transpose, cur_N, inst_id)
                     inst_id += 1; ue.wait_queue()
