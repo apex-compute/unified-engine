@@ -29,6 +29,7 @@ from user_dma_core import (
     UnifiedEngine,
 )
 from model_lib_core import (
+    bf16_permute_core,
     store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
     eltwise_add_core_dram, eltwise_mul_core_dram,
     rms_norm_core_dram_post_add, layer_norm_core_dram_post_add,
@@ -189,7 +190,7 @@ def rope_hf_core_dram(ue, M: int, D: int,
             accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset + half_bytes, element_size=half_D)
 
     return M * D * 4
-def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
+def bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                              params_dram_addr, temp_dram_start):
     """Permute via DMA gather + batched transpose decomposition."""
     from user_dma_core import (UE_VECTOR_SIZE, UE_MODE, URAM_FULL_ELEMENTS,
@@ -1274,7 +1275,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         # Permute: [C=3, H_patches=32, P=16, W_patches=32, P=16] → [32, 32, 3, 16, 16]
         P = 16
         H_patches = 32  # 512 / 16
-        bf16_smart_permute_core(self,dims=[3, H_patches, P, H_patches, P], permute_indices=[1, 3, 0, 2, 4],input_dram_addr=self.VIS_PIXEL_IN_DRAM, output_dram_addr=self.VIS_PATCH_PERM_DRAM,params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
+        bf16_permute_core(self,dims=[3, H_patches, P, H_patches, P], permute_indices=[1, 3, 0, 2, 4],input_dram_addr=self.VIS_PIXEL_IN_DRAM, output_dram_addr=self.VIS_PATCH_PERM_DRAM,params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
 
         # Patch projection: [1024, 768] @ weight + bias → [1024, 768]
         self.matmat_mul_core(M=S, K=H, N=H,A_DRAM_ADDR=self.VIS_PATCH_PERM_DRAM, B_DRAM_ADDR=self.patch_weight_addr,OUTPUT_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM,C_DRAM_ADDR=self.patch_bias_addr, bias_mode="broadcast_N")
@@ -1305,7 +1306,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             for src, dst in [(self.VIS_Q_DRAM, self.VIS_Q_PERM_DRAM),
                              (self.VIS_K_DRAM, self.VIS_K_PERM_DRAM),
                              (self.VIS_V_DRAM, self.VIS_V_PERM_DRAM)]:
-                bf16_smart_permute_core(self, dims=permute_dims, permute_indices=permute_indices,
+                bf16_permute_core(self, dims=permute_dims, permute_indices=permute_indices,
                     input_dram_addr=src, output_dram_addr=dst,
                     params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
             # 12x flash attention (no causal mask, no GQA)
@@ -1317,7 +1318,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT_DRAM + h * head_stride,
                     SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM)
             # Inverse permute: [12, S, 64] → [S, 768]
-            bf16_smart_permute_core(self, dims=inv_permute_dims, permute_indices=permute_indices,
+            bf16_permute_core(self, dims=inv_permute_dims, permute_indices=permute_indices,
                 input_dram_addr=self.VIS_ATTN_OUT_DRAM, output_dram_addr=self.VIS_ATTN_RESULT_DRAM,
                 params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
             # O projection + residual + LN2
@@ -1335,7 +1336,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
             GAMMA_DRAM_ADDR=self.vis_post_ln_weight, BETA_DRAM_ADDR=self.vis_post_ln_bias)
         # Pixel shuffle: [1024,768] → [64,12288]
-        bf16_smart_permute_core(self, dims=[8, 4, 8, 4, H], permute_indices=[0, 2, 1, 3, 4],
+        bf16_permute_core(self, dims=[8, 4, 8, 4, H], permute_indices=[0, 2, 1, 3, 4],
             input_dram_addr=self.VIS_POST_LN_DRAM, output_dram_addr=self.VIS_SHUFFLED_DRAM,
             params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
         # Connector: [64, 12288] → [64, 960]
