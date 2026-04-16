@@ -7,7 +7,7 @@ SAM 1 ViT-B segmentation inference on accelerator.
                   → neck (1×1 conv + LN + 3×3 conv + LN → 256-dim features).
   - All BF16 weights (no quantization). ~86M image encoder params ≈ 172 MB.
   - No RoPE: SAM1 uses decomposed 2D relative positional embeddings (rel_pos).
-    NOTE: rel_pos is not yet implemented on-chip; initial pass skips it.
+    Implemented via precomputed (sz, sz, 64) Rh/Rw tables + matmul-based scatter.
   - Window padding: 64×64 grid padded to 70×70 (next multiple of window_size=14).
     Boundary windows (9 of 25) include padding tokens with non-zero bias — minor
     accuracy impact; unpad step discards padding outputs before residual add.
@@ -55,13 +55,14 @@ def quiet_print(*args, **kwargs):
 builtins.print = quiet_print
 
 import user_dma_core
-user_dma_core.MAX_DECODER_INSTRUCTIONS = (0x100000000 - 0x9C000000) // 32  # Section 1: 1.6 GB instruction budget
+user_dma_core.MAX_DECODER_INSTRUCTIONS = (0x100000000 - 0x3C000000) // 32  # 3.1 GB instruction budget
 # Section 2 uses 1 GB instructions (0xC0000000–0xFFFFFFFF); override before instantiating S2 engine.
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     set_dma_device, UnifiedEngine,
 )
+from model_lib_core import eltwise_mul_core_dram
 
 
 class _CheckpointStop(Exception):
@@ -77,26 +78,59 @@ def flash_attention_global_tiled(ue: UnifiedEngine, num_heads: int, head_dim: in
                                   seq_len: int,
                                   Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
                                   V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                                  SCRATCH_DRAM_ADDR: int) -> int:
+                                  SCRATCH_DRAM_ADDR: int,
+                                  RH_DRAM_ADDR: int = None,
+                                  RW_DRAM_ADDR: int = None,
+                                  ONES_SCATTER_ADDR: int = None,
+                                  BIAS_DRAM_ADDR: int = None) -> int:
     """Global self-attention processing one head at a time to bound scratch usage.
 
     flash_attention_core needs (head_dim * seq_len + seq_len²) scratch per head.
     For seq=4096, head_dim=64: ~4 MB per head — fits in local scratch (111 MB)
     when scratch is reused across heads instead of allocated per-head simultaneously.
+
+    If RH_DRAM_ADDR / RW_DRAM_ADDR / ONES_SCATTER_ADDR / BIAS_DRAM_ADDR are provided,
+    decomposed 2D relative positional bias is computed per head before flash_attention_core.
+    BIAS_DRAM_ADDR must hold (seq_len, seq_len) bf16 scratch (zeroed per head here).
+    SCRATCH_DRAM_ADDR is reused as scratch for add_rel_pos_bias_dram (VIT_COMPACT_HEADS).
     """
     bpe = 2
+    sz = int(seq_len ** 0.5)  # 64 for seq_len=4096
     head_stride = seq_len * head_dim * bpe
+    use_rel_pos = (RH_DRAM_ADDR is not None and RW_DRAM_ADDR is not None
+                   and ONES_SCATTER_ADDR is not None and BIAS_DRAM_ADDR is not None)
 
     total_flops = 0
     for h in range(num_heads):
+        q_h = Q_DRAM_ADDR + h * head_stride
+        bias_addr = None
+        if use_rel_pos:
+            # Zero-fill the per-head bias buffer (seq_len × seq_len)
+            dram_zero_fill(ue, BIAS_DRAM_ADDR, seq_len * seq_len)
+            # Compute decomposed rel_pos bias for this one head
+            # Q layout for this head: (seq_len, head_dim) at q_h; seq_pad = seq_len (no padding)
+            add_rel_pos_bias_dram(ue,
+                Q_DRAM_ADDR=q_h,
+                RH_DRAM_ADDR=RH_DRAM_ADDR,
+                RW_DRAM_ADDR=RW_DRAM_ADDR,
+                BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+                ONES_SCATTER_ADDR=ONES_SCATTER_ADDR,
+                sz=sz,
+                sz_pad=64,
+                num_batches=1,
+                seq_pad=seq_len,
+                SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            )
+            bias_addr = BIAS_DRAM_ADDR
         total_flops += ue.flash_attention_core(
             head_dim=head_dim,
             seq_len=seq_len,
-            Q_DRAM_ADDR=Q_DRAM_ADDR      + h * head_stride,
+            Q_DRAM_ADDR=q_h,
             K_DRAM_ADDR=K_DRAM_ADDR      + h * head_stride,
             V_DRAM_ADDR=V_DRAM_ADDR      + h * head_stride,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + h * head_stride,
             SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,  # reused each head
+            BIAS_DRAM_ADDR=bias_addr,
         )
     return total_flops
 
@@ -710,6 +744,121 @@ def dram_copy(ue: UnifiedEngine, SRC: int, DST: int, num_elements: int) -> None:
 
 
 # =============================================================================
+# Decomposed 2D relative positional bias (SAM1 ViT-B)
+# =============================================================================
+
+def add_rel_pos_bias_dram(ue: UnifiedEngine,
+                           Q_DRAM_ADDR: int,
+                           RH_DRAM_ADDR: int,
+                           RW_DRAM_ADDR: int,
+                           BIAS_DRAM_ADDR: int,
+                           ONES_SCATTER_ADDR: int,
+                           sz: int,
+                           sz_pad: int,
+                           num_batches: int,
+                           seq_pad: int,
+                           SCRATCH_DRAM_ADDR: int) -> None:
+    """Add decomposed 2D relative positional bias into BIAS_DRAM_ADDR in-place.
+
+    sz      = actual grid size (14 for local windows, 64 for global)
+    sz_pad  = padded key-position dim for matmuls (64; N≥32 requirement of matmat_mul_core)
+    seq_pad = bias row width in DRAM (256 for local, 4096 for global)
+    seq_sq  = sz * sz = real token count per window (196 or 4096)
+
+    Rh/Rw stored as (sz, sz_pad, 64): key-position dim zero-padded to sz_pad.
+    ONES_SCATTER stored as (seq_pad, sz_pad): [kh*sz+kw, kh]=1 for kh,kw<sz; rest 0.
+
+    Algorithm per (batch b, grid row qh):
+      rel_h     = q_row @ Rh[qh].T          (sz, sz_pad); first sz cols valid
+      scatter_h = rel_h @ ONES_SCATTER.T    (sz, seq_pad)
+                  scatter_h[qw, kh*sz+kw] = rel_h[qw, kh]
+      per qw:
+        rel_w = q_row[qw] @ Rw[qw].T        (1, sz_pad); first sz entries valid
+        tile first sz entries → RW_TILE[qw, kh*sz:...+sz] for each kh
+      per qw: scatter_h[qw, 0:seq_sq] += RW_TILE[qw, 0:seq_sq]
+      per qw: bias[b, qh*sz+qw, 0:seq_sq] += scatter_h[qw, 0:seq_sq]
+
+    Scratch layout in SCRATCH_DRAM_ADDR (VIT_COMPACT_HEADS or VIT_ATTN_SCRATCH):
+      [0                        : sz*sz_pad)       → SCR_REL_H   (sz, sz_pad)
+      [sz*sz_pad                : +sz*seq_pad)     → SCR_SCATTER (sz, seq_pad)
+      [sz*sz_pad+sz*seq_pad     : +sz_pad)         → SCR_REL_W   (sz_pad,) per-qw
+      [sz*sz_pad+sz*seq_pad+sz_pad : +sz*seq_sq)   → SCR_RW_TILE (sz, seq_sq)
+    Total local : 14*64 + 14*256 + 64 + 14*196 = 896+3584+64+2744 = 7288 elements
+    Total global: 64*64 + 64*4096 + 64 + 64*4096 = 4096+262144+64+262144 = 528448 elements
+    """
+    bpe = 2
+    hd = 64  # head_dim, always 64 for SAM1 ViT-B
+    seq_sq = sz * sz
+
+    SCR_REL_H   = SCRATCH_DRAM_ADDR
+    SCR_SCATTER = SCRATCH_DRAM_ADDR + sz * sz_pad * bpe
+    SCR_REL_W   = SCRATCH_DRAM_ADDR + sz * sz_pad * bpe + sz * seq_pad * bpe
+    SCR_RW_TILE = SCRATCH_DRAM_ADDR + sz * sz_pad * bpe + sz * seq_pad * bpe + sz_pad * bpe
+
+    bias_batch_stride = seq_pad * seq_pad
+
+    for b in range(num_batches):
+        q_batch_addr = Q_DRAM_ADDR    + b * seq_pad * hd * bpe
+        bias_base    = BIAS_DRAM_ADDR + b * bias_batch_stride * bpe
+
+        for qh in range(sz):
+            q_row_addr = q_batch_addr + qh * sz * hd * bpe
+            rh_qh_addr = RH_DRAM_ADDR + qh * sz_pad * hd * bpe  # Rh[qh]: (sz_pad, 64)
+
+            # Step 1: rel_h = q_row @ Rh[qh].T → (sz, sz_pad)
+            # A=(sz,64), B=(sz_pad,64) stored → C = A@B^T = (sz, sz_pad)
+            ue.matmat_mul_core(
+                M=sz, K=hd, N=sz_pad,
+                A_DRAM_ADDR=q_row_addr,
+                B_DRAM_ADDR=rh_qh_addr,
+                OUTPUT_DRAM_ADDR=SCR_REL_H,
+            )
+
+            # Step 2: scatter_h = rel_h @ ONES_SCATTER^T → (sz, seq_pad)
+            # A=(sz, sz_pad), B=(seq_pad, sz_pad) stored → C = A@B^T = (sz, seq_pad)
+            # scatter_h[qw, kh*sz+kw] = rel_h[qw, kh]  for kh<sz, kw<sz
+            ue.matmat_mul_core(
+                M=sz, K=sz_pad, N=seq_pad,
+                A_DRAM_ADDR=SCR_REL_H,
+                B_DRAM_ADDR=ONES_SCATTER_ADDR,
+                OUTPUT_DRAM_ADDR=SCR_SCATTER,
+            )
+
+            # Step 3: per-qw: compute rel_w and tile first sz entries into RW_TILE
+            for qw in range(sz):
+                q_single_addr = q_row_addr + qw * hd * bpe
+                rw_qw_addr    = RW_DRAM_ADDR + qw * sz_pad * hd * bpe  # Rw[qw]: (sz_pad, 64)
+                # rel_w = q_single @ Rw[qw].T → (1, sz_pad); first sz entries valid
+                ue.matmat_mul_core(
+                    M=1, K=hd, N=sz_pad,
+                    A_DRAM_ADDR=q_single_addr,
+                    B_DRAM_ADDR=rw_qw_addr,
+                    OUTPUT_DRAM_ADDR=SCR_REL_W,
+                )
+                # Tile first sz entries of SCR_REL_W into RW_TILE[qw, kh*sz:kh*sz+sz]
+                rw_tile_row = SCR_RW_TILE + qw * seq_sq * bpe
+                for kh in range(sz):
+                    dram_copy(ue, SCR_REL_W, rw_tile_row + kh * sz * bpe, sz)
+
+            # Step 4: per-qw: merge rel_w tile into scatter_h (first seq_sq cols only)
+            for qw in range(sz):
+                eltwise_add_dram(ue,
+                    SCR_SCATTER + qw * seq_pad * bpe,
+                    SCR_RW_TILE + qw * seq_sq  * bpe,
+                    SCR_SCATTER + qw * seq_pad * bpe,
+                    seq_sq)
+
+            # Step 5: per-qw: add combined bias into BIAS_DRAM_ADDR rows
+            for qw in range(sz):
+                bias_row_addr = bias_base + (qh * sz + qw) * seq_pad * bpe
+                eltwise_add_dram(ue,
+                    bias_row_addr,
+                    SCR_SCATTER + qw * seq_pad * bpe,
+                    bias_row_addr,
+                    seq_sq)
+
+
+# =============================================================================
 # Feature map pad / unpad helpers (SAM1 ViT-B: 64×64 grid → 70×70 for window=14)
 # =============================================================================
 
@@ -778,13 +927,13 @@ def _load_sam1_state_dict(ckpt_path: str) -> dict:
 
 # =============================================================================
 # DRAM layout — SAM1 ViT-B
-#   Params:      0x00000000 – 0x7FFFFFFF  (2 GB)   weights
-#   Tensors:     0x80000000 – 0x9BFFFFFF  (448 MB) activations / scratch
-#   Instructions:0x9C000000 – 0xFFFFFFFF  (1.6 GB) compiled instruction stream
+#   Params:      0x00000000 – 0x1FFFFFFF  (512 MB)  weights
+#   Tensors:     0x20000000 – 0x3BFFFFFF  (448 MB)  activations / scratch
+#   Instructions:0x3C000000 – 0xFFFFFFFF  (3.1 GB)  compiled instruction stream
 # =============================================================================
 SAM1_PARAMS_BASE  = 0x00000000
-SAM1_TENSOR_BASE  = 0x80000000
-SAM1_PROGRAM_BASE = 0x9C000000
+SAM1_TENSOR_BASE  = 0x20000000
+SAM1_PROGRAM_BASE = 0x3C000000
 
 
 # =============================================================================
@@ -798,9 +947,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         ViT-B backbone (12 blocks, dim=768, 12 heads, window=14, 4 global blocks)
         → Neck (Conv 1×1 → LN → Conv 3×3 → LN → 256-dim feature map at 64×64)
 
-    NOTE: rel_pos (decomposed 2D relative positional embeddings) is not yet
-    implemented on-chip. Attention runs without positional bias — accuracy is
-    reduced but architecture and weight loading are otherwise correct.
+    Decomposed 2D relative positional embeddings (rel_pos) are implemented via
+    precomputed (sz, sz, 64) Rh/Rw tables in params and matmul-based scatter on-chip.
     """
 
     # --- Architecture constants ---
@@ -951,6 +1099,57 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         # SAM1 uses combined attn.qkv weight (2304, 768) — split into Q/K/V (768, 768) each.
         # No RoPE, no head_dim padding: head_dim=64 == UE_VECTOR_SIZE, directly aligned.
         # Q scale: flash_attention uses 1/sqrt(head_dim=64) correctly — no correction needed.
+
+        # matmat_mul_core requires N ≥ N_chunk (typically 32 or 64).
+        # sz=14 (local window) is too small. We pad the k-position dimension to sz_pad=64
+        # so all rel_pos matmuls use N=64 or N=seq_sq_pad≥64.
+        _SZ_PAD = 64  # common pad target — equals head_dim and global sz
+
+        # ONES_SCATTER matrices for rel_pos scatter via matmul.
+        # Shape: (seq_sq_pad, sz_pad) so matmat_mul_core (A @ B^T) computes
+        #   rel_h (sz, sz_pad) @ ONES_SCATTER^T (sz_pad, seq_sq_pad) → (sz, seq_sq_pad).
+        # ONES_SCATTER[kh*sz+kw, kh] = 1.0 for kh<sz, kw<sz; rest 0.
+        # Result: scatter[qw, kh*sz+kw] = rel_h[qw, kh]  (broadcast over kw). ✓
+        def _make_ones_scatter(sz: int, seq_sq_pad: int, sz_pad: int) -> torch.Tensor:
+            mat = torch.zeros(seq_sq_pad, sz_pad, dtype=torch.bfloat16)
+            for kh in range(sz):
+                mat[kh * sz : kh * sz + sz, kh] = 1.0
+            return mat
+
+        _ws_local     = self.VIT_WINDOW_SIZE   # 14
+        _ws_global    = 64                     # global block: 64×64 grid
+        _seq_pad_local = self.VIT_WINDOW_AREA_PAD  # 256 (bias row width for local)
+        _seq_pad_glob  = self.GRID_AREA             # 4096 (no padding for global)
+        self.ONES_SCATTER_LOCAL  = self._alloc_param(
+            _make_ones_scatter(_ws_local,  _seq_pad_local, _SZ_PAD))  # (256, 64)
+        self.ONES_SCATTER_GLOBAL = self._alloc_param(
+            _make_ones_scatter(_ws_global, _seq_pad_glob,  _SZ_PAD))  # (4096, 64)
+
+        def _get_rel_pos(q_size: int, raw: torch.Tensor, sz_pad: int) -> torch.Tensor:
+            """Build (q_size, sz_pad, head_dim) relative positional lookup table.
+
+            raw: checkpoint tensor of shape (max_rel_dist, head_dim).
+            The second dimension (key positions) is zero-padded from q_size to sz_pad
+            so matmat_mul_core (which requires N ≥ 32) can handle it as N=sz_pad.
+            """
+            import torch.nn.functional as F
+            max_dist = 2 * q_size - 1
+            raw = raw.float()
+            if raw.shape[0] != max_dist:
+                raw = F.interpolate(
+                    raw.T.unsqueeze(0),  # (1, head_dim, src_len)
+                    size=max_dist, mode="linear", align_corners=False,
+                ).squeeze(0).T  # (max_dist, head_dim)
+            q_coords = torch.arange(q_size, dtype=torch.long)[:, None]
+            k_coords = torch.arange(q_size, dtype=torch.long)[None, :]
+            rel = (q_coords - k_coords + (q_size - 1))
+            result = raw[rel].to(torch.bfloat16)  # (q_size, q_size, head_dim)
+            if sz_pad > q_size:
+                padded = torch.zeros(q_size, sz_pad, result.shape[2], dtype=torch.bfloat16)
+                padded[:, :q_size, :] = result
+                return padded  # (q_size, sz_pad, head_dim)
+            return result
+
         self.vit_block_weights = []
         for i in range(self.VIT_DEPTH):
             bp = f"{vit}layers.{i}."
@@ -974,6 +1173,16 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             bw['fc1_bias']    = self._alloc_param(sd[bp + "mlp.lin1.bias"])
             bw['fc2_weight']  = self._alloc_param(sd[bp + "mlp.lin2.weight"])  # (768, 3072)
             bw['fc2_bias']    = self._alloc_param(sd[bp + "mlp.lin2.bias"])
+            # Relative positional bias tables: (sz, sz_pad=64, head_dim=64) lookup tables.
+            # Key-position dim padded to sz_pad=64 so matmat_mul_core N≥32 requirement is met.
+            # Local blocks: sz=14 → (14, 64, 64) = 115 KB each.
+            # Global blocks: sz=64 → (64, 64, 64) = 524 KB each.
+            _is_global_blk = i in self.VIT_GLOBAL_BLOCKS
+            _sz = 64 if _is_global_blk else self.VIT_WINDOW_SIZE  # 64 or 14
+            _rph = sd[bp + "attn.rel_pos_h"]  # checkpoint shape, e.g. (27, 64) for local
+            _rpw = sd[bp + "attn.rel_pos_w"]
+            bw['rel_pos_h'] = self._alloc_param(_get_rel_pos(_sz, _rph, _SZ_PAD))
+            bw['rel_pos_w'] = self._alloc_param(_get_rel_pos(_sz, _rpw, _SZ_PAD))
             self.vit_block_weights.append(bw)
 
         # ==================================================================
@@ -1014,13 +1223,25 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         self.PE_GAUSSIAN_MATRIX = self._alloc_param(
             sd["shared_image_embedding.positional_embedding"].to(torch.bfloat16))  # (2, 128)
         self.PE_POINT_EMBED_FG  = self._alloc_param(
-            sd[pe + "point_embed.0.weight"].to(torch.bfloat16))        # (1, 256)
+            sd[pe + "point_embed.1.weight"].to(torch.bfloat16))        # (1, 256)  foreground label=1
         self.PE_POINT_EMBED_BG  = self._alloc_param(
-            sd[pe + "point_embed.1.weight"].to(torch.bfloat16))        # (1, 256)
+            sd[pe + "point_embed.0.weight"].to(torch.bfloat16))        # (1, 256)  background label=0
         self.PE_NOT_A_POINT     = self._alloc_param(
             sd[pe + "not_a_point_embed.weight"].to(torch.bfloat16))    # (1, 256)
         self.PE_NO_MASK         = self._alloc_param(
             sd[pe + "no_mask_embed.weight"].to(torch.bfloat16))        # (1, 256)
+
+        # Prompt encoder sin/cos lookup tables for hardware PE computation.
+        # Host selects 4 rows (128 bf16 each) for (x_px, y_px) before execution.
+        _pe_mat_f = sd["shared_image_embedding.positional_embedding"].float()  # (2, 128)
+        _coords_x = torch.arange(1024, dtype=torch.float32) / 1024.0           # (1024,)
+        _coords_y = torch.arange(1024, dtype=torch.float32) / 1024.0           # (1024,)
+        _proj_x = 2 * math.pi * _coords_x.unsqueeze(1) * _pe_mat_f[0:1, :]     # (1024, 128)
+        _proj_y = 2 * math.pi * _coords_y.unsqueeze(1) * _pe_mat_f[1:2, :]     # (1024, 128)
+        self.PE_SIN_X = self._alloc_param(torch.sin(_proj_x).to(torch.bfloat16))  # (1024, 128)
+        self.PE_COS_X = self._alloc_param(torch.cos(_proj_x).to(torch.bfloat16))  # (1024, 128)
+        self.PE_SIN_Y = self._alloc_param(torch.sin(_proj_y).to(torch.bfloat16))  # (1024, 128)
+        self.PE_COS_Y = self._alloc_param(torch.cos(_proj_y).to(torch.bfloat16))  # (1024, 128)
 
         # Image positional encoding: constant 64×64 grid PE stored as param.
         # Used as key_pe in every cross-attention call.
@@ -1029,6 +1250,7 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             torch.arange(64, dtype=torch.float32),
             torch.arange(64, dtype=torch.float32), indexing='ij')
         _grid = torch.stack([(_gx + 0.5) / 64, (_gy + 0.5) / 64], dim=-1).reshape(-1, 2)  # (4096, 2)
+        _grid = 2.0 * _grid - 1.0  # normalize [0,1] → [-1,1] to match CPU reference
         _proj = 2 * math.pi * (_grid @ _pe_mat)  # (4096, 128)
         _pos_src = torch.cat([torch.sin(_proj), torch.cos(_proj)], dim=-1).to(torch.bfloat16)
         self.DEC_POS_SRC = self._alloc_param(_pos_src)  # (4096, 256) constant image PE
@@ -1105,9 +1327,48 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         # Self-attn: head_dim=32 padded to 64 (bf16_permute_core requires dim_2 multiple of 64)
         self.DEC_SA_UNPAD_W  = self._alloc_param(
             self.build_unpad_weight(self.DEC_HEADS, self.DEC_HEAD_DIM, 64).T.contiguous())
-        # Cross-attn: head_dim=16 padded to 32 (min viable multiple of 32 per matmul alignment)
+        # Cross-attn: head_dim=16 padded to 64 (same dim_2 constraint)
         self.DEC_CA_UNPAD_W  = self._alloc_param(
-            self.build_unpad_weight(self.DEC_HEADS, self.DEC_INTERNAL_HD, 32))
+            self.build_unpad_weight(self.DEC_HEADS, self.DEC_INTERNAL_HD, 64).T.contiguous())
+
+        # Cross-attn Q/K/V projection weights padded: (DH*HD=128, DD=256) → (DH*HD_PAD=512, DD=256)
+        # Same padding trick as self-attn: each head's HD=16 real rows in [h*64:h*64+16], rest zero.
+        _CA_DH, _CA_HD, _CA_HDP = self.DEC_HEADS, self.DEC_INTERNAL_HD, 64
+        _CA_ID = self.DEC_INTERNAL_DIM  # 128
+        _CA_DD = self.DEC_DIM           # 256
+        for i in range(self.DEC_LAYERS):
+            lp = "mask_decoder." + f"transformer.layers.{i}."
+            lw = self.dec_layer_weights[i]
+            for attn_name in ("cross_attn_token_to_image", "cross_attn_image_to_token"):
+                for proj in ("q", "k", "v"):
+                    w_raw = sd[lp + f"{attn_name}.{proj}_proj.weight"].to(torch.bfloat16)  # (128, 256)
+                    b_raw = sd[lp + f"{attn_name}.{proj}_proj.bias"].to(torch.bfloat16)    # (128,)
+                    w_pad = torch.zeros(_CA_DH * _CA_HDP, _CA_DD, dtype=torch.bfloat16)
+                    b_pad = torch.zeros(_CA_DH * _CA_HDP, dtype=torch.bfloat16)
+                    for _h in range(_CA_DH):
+                        w_pad[_h*_CA_HDP : _h*_CA_HDP+_CA_HD] = w_raw[_h*_CA_HD : (_h+1)*_CA_HD]
+                        b_pad[_h*_CA_HDP : _h*_CA_HDP+_CA_HD] = b_raw[_h*_CA_HD : (_h+1)*_CA_HD]
+                    prefix = "t2i" if attn_name == "cross_attn_token_to_image" else "i2t"
+                    lw[f'ca_{prefix}_{proj}_w'] = self._alloc_param(w_pad)
+                    lw[f'ca_{prefix}_{proj}_b'] = self._alloc_param(b_pad)
+
+        # Bias for token→image cross-attn: mask query rows [7:64] (zero-padded queries)
+        NT_PAD = 64
+        NT_tok = self.DEC_NUM_TOKENS  # 7
+        _t2i_bias = torch.zeros(self.DEC_HEADS, NT_PAD, NT_PAD, dtype=torch.bfloat16)
+        _t2i_bias[:, NT_tok:, :] = float('-inf')  # mask padded query rows
+        self.DEC_CA_T2I_BIAS = self._alloc_param(_t2i_bias.reshape(-1))
+
+        # Bias for image→token cross-attn: mask kv columns [7:64] (zero-padded keys)
+        _i2t_bias = torch.zeros(self.DEC_HEADS, NT_PAD, NT_PAD, dtype=torch.bfloat16)
+        _i2t_bias[:, :, NT_tok:] = float('-inf')
+        self.DEC_CA_I2T_BIAS = self._alloc_param(_i2t_bias.reshape(-1))
+
+        # Per-row kv-column mask for i2t: shape (NT_PAD=64,), 0.0 at [0:7], -inf at [7:64].
+        # Broadcast-added to every query row of the (GA, NT_PAD) score matrix before softmax.
+        _i2t_bias_row = torch.zeros(NT_PAD, dtype=torch.bfloat16)
+        _i2t_bias_row[NT_tok:] = float('-inf')
+        self.DEC_CA_I2T_BIAS_ROW = self._alloc_param(_i2t_bias_row)
 
         # Self-attn attention bias: (DEC_HEADS, NT, NT_PAD) with -inf at kv positions NT:NT_PAD.
         # Hardware requires seq_len to be a multiple of UE_VECTOR_SIZE=64.
@@ -1118,6 +1379,93 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         _sa_bias = torch.zeros(self.DEC_HEADS, NT_PAD, NT_PAD, dtype=torch.bfloat16)
         _sa_bias[:, :, NT_tok:] = float('-inf')
         self.DEC_SA_ATTN_BIAS = self._alloc_param(_sa_bias.reshape(-1))
+
+        # Pad final_attn Q/K/V weights: same (DH*HD=128, DD=256) → (DH*HDP=512, DD=256) pattern
+        for proj in ("q", "k", "v"):
+            w_raw = sd[fp + f"{proj}_proj.weight"].to(torch.bfloat16)  # (128, 256)
+            b_raw = sd[fp + f"{proj}_proj.bias"].to(torch.bfloat16)    # (128,)
+            w_pad = torch.zeros(_CA_DH * _CA_HDP, _CA_DD, dtype=torch.bfloat16)
+            b_pad = torch.zeros(_CA_DH * _CA_HDP, dtype=torch.bfloat16)
+            for _h in range(_CA_DH):
+                w_pad[_h*_CA_HDP : _h*_CA_HDP+_CA_HD] = w_raw[_h*_CA_HD : (_h+1)*_CA_HD]
+                b_pad[_h*_CA_HDP : _h*_CA_HDP+_CA_HD] = b_raw[_h*_CA_HD : (_h+1)*_CA_HD]
+            self.dec_final_attn[f'{proj}_w'] = self._alloc_param(w_pad)
+            self.dec_final_attn[f'{proj}_b'] = self._alloc_param(b_pad)
+
+        # Output upscaling: upscale_conv1 (256→64), upscale_layer_norm, upscale_conv2 (64→32)
+        md = "mask_decoder."
+        # ConvTranspose2d 0: weight (256, 64, 2, 2) → 4 sub-matrices (N=64, K=256) for (dr,dc) positions
+        w_up0 = sd[md + "upscale_conv1.weight"].to(torch.bfloat16)  # (256, 64, 2, 2)
+        self.DEC_UP0_W = []
+        for dr in range(2):
+            row = []
+            for dc in range(2):
+                sub = w_up0[:, :, dr, dc].T.contiguous()  # (C_out=64, C_in=256)
+                row.append(self._alloc_param(sub))
+            self.DEC_UP0_W.append(row)
+        if md + "upscale_conv1.bias" in sd:
+            self.DEC_UP0_B = self._alloc_param(sd[md + "upscale_conv1.bias"].to(torch.bfloat16))
+        else:
+            self.DEC_UP0_B = None
+        # LayerNorm after first ConvTranspose2d
+        self.DEC_UP_LN_W = self._alloc_param(sd[md + "upscale_layer_norm.weight"].to(torch.bfloat16))  # (64,)
+        self.DEC_UP_LN_B = self._alloc_param(sd[md + "upscale_layer_norm.bias"].to(torch.bfloat16))    # (64,)
+        # ConvTranspose2d 1: weight (64, 32, 2, 2) → 4 sub-matrices (N=32, K=64) for (dr,dc) positions
+        w_up1 = sd[md + "upscale_conv2.weight"].to(torch.bfloat16)  # (64, 32, 2, 2)
+        self.DEC_UP1_W = []
+        for dr in range(2):
+            row = []
+            for dc in range(2):
+                sub_raw = w_up1[:, :, dr, dc].T.contiguous()  # (C_out=32, C_in=64)
+                sub = torch.zeros(64, 64, dtype=torch.bfloat16)
+                sub[:32, :] = sub_raw
+                row.append(self._alloc_param(sub))
+            self.DEC_UP1_W.append(row)
+        if md + "upscale_conv2.bias" in sd:
+            b_raw = sd[md + "upscale_conv2.bias"].to(torch.bfloat16)
+            b_pad = torch.zeros(64, dtype=torch.bfloat16)
+            b_pad[:32] = b_raw
+            self.DEC_UP1_B = self._alloc_param(b_pad)
+        else:
+            self.DEC_UP1_B = None
+
+        # Output hypernetwork MLPs: 4 MLPs, each proj_in + layers.0 + proj_out (256→256→256→32)
+        NUM_MASKS = 4
+        self.dec_hyper_weights = []
+        for m in range(NUM_MASKS):
+            hp = md + f"output_hypernetworks_mlps.{m}."
+            hw_dict = {
+                'l0_w': self._alloc_param(sd[hp + "proj_in.weight"].to(torch.bfloat16)),
+                'l0_b': self._alloc_param(sd[hp + "proj_in.bias"].to(torch.bfloat16)),
+                'l1_w': self._alloc_param(sd[hp + "layers.0.weight"].to(torch.bfloat16)),
+                'l1_b': self._alloc_param(sd[hp + "layers.0.bias"].to(torch.bfloat16)),
+            }
+            w_raw = sd[hp + "proj_out.weight"].to(torch.bfloat16)  # (32, 256)
+            w_pad = torch.zeros(64, 256, dtype=torch.bfloat16)
+            w_pad[:32, :] = w_raw
+            hw_dict['l2_w'] = self._alloc_param(w_pad)
+            b_raw = sd[hp + "proj_out.bias"].to(torch.bfloat16)
+            b_pad = torch.zeros(64, dtype=torch.bfloat16)
+            b_pad[:32] = b_raw
+            hw_dict['l2_b'] = self._alloc_param(b_pad)
+            self.dec_hyper_weights.append(hw_dict)
+
+        # IoU prediction head: proj_in + layers.0 + proj_out (256→256→256→4)
+        ip = md + "iou_prediction_head."
+        self.dec_iou_weights = {
+            'l0_w': self._alloc_param(sd[ip + "proj_in.weight"].to(torch.bfloat16)),
+            'l0_b': self._alloc_param(sd[ip + "proj_in.bias"].to(torch.bfloat16)),
+            'l1_w': self._alloc_param(sd[ip + "layers.0.weight"].to(torch.bfloat16)),
+            'l1_b': self._alloc_param(sd[ip + "layers.0.bias"].to(torch.bfloat16)),
+        }
+        w_raw = sd[ip + "proj_out.weight"].to(torch.bfloat16)  # (4, 256)
+        w_pad = torch.zeros(64, 256, dtype=torch.bfloat16)
+        w_pad[:4, :] = w_raw
+        self.dec_iou_weights['l2_w'] = self._alloc_param(w_pad)
+        b_raw = sd[ip + "proj_out.bias"].to(torch.bfloat16)
+        b_pad = torch.zeros(64, dtype=torch.bfloat16)
+        b_pad[:4] = b_raw
+        self.dec_iou_weights['l2_b'] = self._alloc_param(b_pad)
 
         params_used = self.get_params_dram_usage()
         _original_print(f"  Params loaded: {params_used / 1024**2:.1f} MB ({params_used / 1024**3:.2f} GB)")
@@ -1169,6 +1517,12 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         # Scratch: local — 300 × (64×256 + 256²) = 300 × 81,920 = 24,576,000 elements
         local_scratch = total_heads_local * (hd_pad * wa_pad + wa_pad ** 2)
         self.VIT_ATTN_SCRATCH = self._alloc_tensor(local_scratch)
+        # Rel-pos bias buffer for local blocks: (300, 256, 256) = 19,660,800 elements ≈ 39.3 MB
+        # Per-batch bias (bias_shared=False) after window mask is broadcast in.
+        self.VIT_REL_POS_BIAS = self._alloc_tensor(total_heads_local * wa_pad * wa_pad)
+        # Rel-pos bias buffer for global blocks: (4096, 4096) = 16,777,216 elements ≈ 33.6 MB
+        # One head at a time; zeroed and filled before each flash_attention_core call.
+        self.VIT_GLOBAL_BIAS = self._alloc_tensor(GA * GA)
         self.VIT_ATTN_MERGED = self._alloc_tensor(GA_PAD * VD_QK)  # (4900, 768) merged heads
         self.VIT_OUT_PROJ    = self._alloc_tensor(GA_PAD * VD)      # (4900, 768) output proj
         self.VIT_RESIDUAL    = self._alloc_tensor(GA * VD)          # (4096, 768)
@@ -1209,6 +1563,74 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         self.DEC_SA_TEMP      = self._alloc_tensor(DH * NT * HD_PAD)  # compact (8,7,64) for scatter
         self.DEC_SA_MERGED    = self._alloc_tensor(NT * DD)            # merged (7, 256)
 
+        # Cross-attn positional encodings (assembled in hardware by the prompt encoder phase)
+        self.DEC_QUERY_PE    = self._alloc_tensor(NT * DD)             # (7, 256) token PE
+        self.DEC_KEY_PE      = self._alloc_tensor(GA * DD)             # (4096, 256) dense image PE
+
+        # Prompt encoder PE scratch: 4 × 128 bf16 slots for host-selected rows
+        # Host writes SIN_X[x], COS_X[x], SIN_Y[y], COS_Y[y] before execution.
+        self.PE_SX_SLOT = self._alloc_tensor(128)   # SIN_X[x_px, :]
+        self.PE_CX_SLOT = self._alloc_tensor(128)   # COS_X[x_px, :]
+        self.PE_SY_SLOT = self._alloc_tensor(128)   # SIN_Y[y_px, :]
+        self.PE_CY_SLOT = self._alloc_tensor(128)   # COS_Y[y_px, :]
+        # Intermediate PE computation buffers (128 elements each)
+        self.PE_TMP1    = self._alloc_tensor(128)   # sin(A)*cos(B)
+        self.PE_TMP2    = self._alloc_tensor(128)   # cos(A)*sin(B)
+        self.PE_TMP3    = self._alloc_tensor(128)   # cos(A)*cos(B)
+        self.PE_TMP4    = self._alloc_tensor(128)   # sin(A)*sin(B)
+        self.PE_SIN_OUT = self._alloc_tensor(128)   # pe_sin = sin(A+B)
+        self.PE_COS_OUT = self._alloc_tensor(128)   # pe_cos = cos(A+B)
+        self.PE_FG_TOK  = self._alloc_tensor(256)   # final fg_token (pe_sin||pe_cos + point_embed_1)
+
+        # t2i cross-attn buffers
+        # K and V projections for image side: (4096, 512) each
+        CA_HDP = 64   # head_dim padded
+        CA_ID  = self.DEC_INTERNAL_DIM   # 128
+        self.DEC_CA_T2I_K      = self._alloc_tensor(GA * DH * CA_HDP)  # (4096, 512)
+        self.DEC_CA_T2I_V      = self._alloc_tensor(GA * DH * CA_HDP)  # (4096, 512)
+        self.DEC_CA_T2I_K_HEADS = self._alloc_tensor(DH * GA * CA_HDP)  # (8, 4096, 64)
+        self.DEC_CA_T2I_V_HEADS = self._alloc_tensor(DH * GA * CA_HDP)  # (8, 4096, 64)
+        # Per-head scratch (reused across heads sequentially)
+        self.DEC_CA_SCORES     = self._alloc_tensor(NT * GA)            # (7, 4096) per-head scores
+        self.DEC_CA_VT         = self._alloc_tensor(CA_HDP * GA)        # (64, 4096) per-head V^T
+        # Per-head output accumulator: (8, 7, 64)
+        self.DEC_CA_OUT_HEADS  = self._alloc_tensor(DH * NT * CA_HDP)   # (8, 7, 64)
+        # Merged output after unpad: (7, 128) — fits inside DEC_SA_MERGED
+        self.DEC_CA_T2I_MERGED = self._alloc_tensor(NT * CA_ID)         # (7, 128)
+
+        # i2t cross-attn buffers (image attends to tokens; token side padded to NT_PAD_I=64)
+        NT_PAD_I = 64
+        self.DEC_CA_I2T_K_PAD    = self._alloc_tensor(NT_PAD_I * DH * CA_HDP)   # (64, 512) padded K proj
+        self.DEC_CA_I2T_V_PAD    = self._alloc_tensor(NT_PAD_I * DH * CA_HDP)   # (64, 512) padded V proj
+        self.DEC_CA_I2T_SCORES   = self._alloc_tensor(GA * NT_PAD_I)             # (4096, 64) per-head scores
+        self.DEC_CA_I2T_VT       = self._alloc_tensor(CA_HDP * NT_PAD_I)         # (64, 64) per-head V^T
+        self.DEC_CA_I2T_OUT_HEADS = self._alloc_tensor(DH * GA * CA_HDP)         # (8, 4096, 64) = 2M
+        self.DEC_CA_I2T_MERGED   = self._alloc_tensor(GA * CA_ID)                # (4096, 128)
+
+        # MLP intermediate: (7, 2048)
+        MLP_DIM = self.DEC_MLP_DIM  # 2048
+        self.DEC_MLP_INTER = self._alloc_tensor(NT * MLP_DIM)                    # (7, 2048)
+
+        # Mask upscaling scratch and output buffers
+        # ConvTranspose2d 0: (4096, 256) → (16384, 64); scratch holds 4 sub-position results
+        self.DEC_UP0_SCRATCH = self._alloc_tensor(4 * GA * 64)                   # (16384, 64)
+        self.DEC_UP0_OUT     = self._alloc_tensor(4 * GA * 64)                   # (16384, 64) pixel-shuffled
+
+        # ConvTranspose2d 1: (16384, 64) → (65536, 32); scratch holds 4 sub-position results
+        # Padded to N=64 lanes for hardware alignment (only first 32 channels real).
+        self.DEC_UP1_SCRATCH = self._alloc_tensor(4 * 16384 * 64)                # (65536, 64)
+        self.DEC_UP1_OUT     = self._alloc_tensor(65536 * 64)                    # (65536, 64) pixel-shuffled
+
+        # Hypernetwork MLP outputs: padded to (64, 64); only first 4 rows × 32 cols real
+        NUM_MASKS = 4
+        self.DEC_HYPER_OUT   = self._alloc_tensor(64 * 64)                       # (64, 64)
+
+        # IoU head output: padded to 64 lanes; only first 4 real
+        self.DEC_IOU_OUT     = self._alloc_tensor(64)                            # (64,) iou scores
+
+        # Final mask logits: padded to (65536, 64); only first 4 cols per row real
+        self.DEC_MASK_LOGITS = self._alloc_tensor(65536 * 64)                    # (65536, 64)
+
         tensor_used = self.get_tensor_dram_usage()
         _original_print(f"  Tensors allocated: {tensor_used / 1024**2:.1f} MB")
 
@@ -1229,10 +1651,12 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
 
         self.start_capture()
 
+        _t_compile_start = _time.perf_counter()
         try:
             self._compile_phases(pad, bpe)
         except (_CheckpointStop, AssertionError) as e:
             _original_print(f"  Compile stopped at checkpoint: {e}")
+        _original_print(f"  [compile] total: {_time.perf_counter() - _t_compile_start:.3f}s")
         self._finalize_program()
         _SILENT_MODE = False
         return self._last_prog_addr
@@ -1244,6 +1668,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         VD_QK = self.VIT_QK_DIM_PAD  # 768 (no head_dim padding)
         hd    = self.VIT_HEAD_DIM_PAD # 64
         bpe   = 2
+
+        _tp = _time.perf_counter()
 
         # ==============================================================
         # PHASE 1: PATCH EMBEDDING
@@ -1266,11 +1692,13 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
 
         # SAM1 has no LN_pre.
 
+        _original_print(f"  [compile] patch-embed: {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
+
         # ==============================================================
         # PHASE 2: ViT BLOCKS (12 blocks)
         # Local blocks (0-1, 3-4, 6-7, 9-10): window=14, 25 windows
         # Global blocks (2, 5, 8, 11):         full seq=4096
-        # No RoPE — SAM1 uses rel_pos (not yet implemented on-chip).
+        # No RoPE — SAM1 uses decomposed 2D rel_pos (implemented via Rh/Rw tables + matmul).
         # ==============================================================
         _pre_vit_inst = self.capture_count
         for blk_idx in range(self.VIT_DEPTH):
@@ -1378,11 +1806,29 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                             OUTPUT_DRAM_ADDR=dst,
                         )
 
-            # --- No RoPE (SAM1 uses rel_pos — TODO: implement decomposed rel_pos on-chip) ---
-
-            # --- Flash attention ---
+            # --- Flash attention (with decomposed rel_pos bias for local blocks) ---
             if is_global:
-                # Global seq=4096: 4096 % 64 = 0, no padding needed
+                # Global seq=4096: compute decomposed rel_pos bias into VIT_GLOBAL_BIAS,
+                # then run flash attention with the bias. Now fits within the expanded
+                # ~97M-instruction program budget (was skipped under the old 52.4M cap).
+                # Zero-fill the global bias buffer (4096 × 4096).
+                dram_zero_fill(self, self.VIT_GLOBAL_BIAS, self.GRID_AREA * self.GRID_AREA)
+                # Compute decomposed rel_pos bias for all 12 heads into VIT_GLOBAL_BIAS.
+                # num_batches=VIT_HEADS=12 (one per head; no windows for global).
+                # sz=64 (64×64 global grid), sz_pad=64, seq_pad=4096.
+                # VIT_COMPACT_HEADS is free at this point (used as scratch after QKV permute).
+                add_rel_pos_bias_dram(self,
+                    Q_DRAM_ADDR=self.VIT_Q_HEADS,
+                    RH_DRAM_ADDR=bw['rel_pos_h'],
+                    RW_DRAM_ADDR=bw['rel_pos_w'],
+                    BIAS_DRAM_ADDR=self.VIT_GLOBAL_BIAS,
+                    ONES_SCATTER_ADDR=self.ONES_SCATTER_GLOBAL,
+                    sz=64,
+                    sz_pad=64,
+                    num_batches=self.VIT_HEADS,   # 12
+                    seq_pad=self.GRID_AREA,       # 4096
+                    SCRATCH_DRAM_ADDR=self.VIT_COMPACT_HEADS,
+                )
                 flash_attention_global_tiled(self,
                     num_heads=self.VIT_HEADS,
                     head_dim=hd,
@@ -1392,6 +1838,10 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                     V_DRAM_ADDR=self.VIT_V_HEADS,
                     OUTPUT_DRAM_ADDR=self.VIT_ATTN_OUT,
                     SCRATCH_DRAM_ADDR=self.VIT_ATTN_SCRATCH,
+                    RH_DRAM_ADDR=bw['rel_pos_h'],
+                    RW_DRAM_ADDR=bw['rel_pos_w'],
+                    ONES_SCATTER_ADDR=self.ONES_SCATTER_GLOBAL,
+                    BIAS_DRAM_ADDR=self.VIT_GLOBAL_BIAS,
                 )
             else:
                 # Local: run attention on seq_pad=256 (real 196 tokens + 60 zero-padded).
@@ -1419,6 +1869,28 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                 #
                 # This is the fundamental accuracy limit of SAM1 ViT-B on this hardware.
                 # SAM3.1 avoids this entirely: window_size=24 → area=576=9×64, already aligned.
+                # Initialize per-batch bias: zero-fill then broadcast window mask into each batch.
+                # Window mask sets key positions wa:wa_pad to -inf to suppress padding tokens.
+                dram_zero_fill(self, self.VIT_REL_POS_BIAS, total_batches * wa_pad * wa_pad)
+                for _b in range(total_batches):
+                    dram_copy(self,
+                        self.VIT_WINDOW_ATTN_BIAS,
+                        self.VIT_REL_POS_BIAS + _b * wa_pad * wa_pad * bpe,
+                        wa_pad * wa_pad)
+                # Add decomposed rel_pos bias into each batch's bias slice.
+                # After QKV permute, VIT_COMPACT_HEADS is free to use as scratch.
+                add_rel_pos_bias_dram(self,
+                    Q_DRAM_ADDR=self.VIT_Q_HEADS,
+                    RH_DRAM_ADDR=bw['rel_pos_h'],
+                    RW_DRAM_ADDR=bw['rel_pos_w'],
+                    BIAS_DRAM_ADDR=self.VIT_REL_POS_BIAS,
+                    ONES_SCATTER_ADDR=self.ONES_SCATTER_LOCAL,
+                    sz=self.VIT_WINDOW_SIZE,       # 14
+                    sz_pad=64,
+                    num_batches=total_batches,     # 300
+                    seq_pad=wa_pad,                # 256
+                    SCRATCH_DRAM_ADDR=self.VIT_COMPACT_HEADS,
+                )
                 flash_attention_batched(self,
                     num_batches=total_batches,  # 300
                     head_dim=hd,
@@ -1428,8 +1900,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                     V_DRAM_ADDR=self.VIT_V_HEADS,
                     OUTPUT_DRAM_ADDR=self.VIT_ATTN_OUT,
                     SCRATCH_DRAM_ADDR=self.VIT_ATTN_SCRATCH,
-                    BIAS_DRAM_ADDR=self.VIT_WINDOW_ATTN_BIAS,
-                    bias_shared=True,
+                    BIAS_DRAM_ADDR=self.VIT_REL_POS_BIAS,
+                    bias_shared=False,
                 )
 
             # --- Merge heads: (window*heads, seq, 64) → (window, seq, heads*64) ---
@@ -1545,6 +2017,7 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                 raise _CheckpointStop(f"after ViT blocks 0-{blk_idx}")
 
         # ViT output: VIT_LAYER_IN contains (4096, 768) = (64, 64, 768)
+        _original_print(f"  [compile] ViT blocks (12): {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
 
         # ==============================================================
         # PHASE 3: NECK
@@ -1591,6 +2064,57 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         )
 
         # NECK_OUT now contains the image embedding: (4096, 256) = (64, 64, 256)
+        _original_print(f"  [compile] neck: {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
+
+        # ==============================================================
+        # PHASE 3b: PROMPT ENCODER — assemble DEC_TOKENS in hardware
+        #
+        # Inputs (written by host before execution):
+        #   PE_SX_SLOT: SIN_X[x_px, :]  (128 bf16)
+        #   PE_CX_SLOT: COS_X[x_px, :]  (128 bf16)
+        #   PE_SY_SLOT: SIN_Y[y_px, :]  (128 bf16)
+        #   PE_CY_SLOT: COS_Y[y_px, :]  (128 bf16)
+        #
+        # Computes fg_token = [sin(A+B), cos(A+B)] + PE_POINT_EMBED_FG
+        # Assembles DEC_TOKENS rows:
+        #   [0]   = iou_token
+        #   [1:5] = mask_tokens  (4 rows × 256)
+        #   [5]   = fg_token
+        #   [6]   = not_a_point_embed (no PE for padding token)
+        # Then: DEC_QUERY_PE = DEC_TOKENS
+        #       DEC_KEY_PE   = DEC_POS_SRC
+        # ==============================================================
+        _DD = self.DEC_DIM   # 256
+
+        # Step 1: sin(A+B) = SIN_X[x]*COS_Y[y] + COS_X[x]*SIN_Y[y]
+        eltwise_mul_core_dram(self, 128, self.PE_SX_SLOT, self.PE_CY_SLOT, self.PE_TMP1)
+        eltwise_mul_core_dram(self, 128, self.PE_CX_SLOT, self.PE_SY_SLOT, self.PE_TMP2)
+        eltwise_add_dram(self, self.PE_TMP1, self.PE_TMP2, self.PE_SIN_OUT, 128)
+
+        # Step 2: cos(A+B) = COS_X[x]*COS_Y[y] - SIN_X[x]*SIN_Y[y]
+        eltwise_mul_core_dram(self, 128, self.PE_CX_SLOT, self.PE_CY_SLOT, self.PE_TMP3)
+        eltwise_mul_core_dram(self, 128, self.PE_SX_SLOT, self.PE_SY_SLOT, self.PE_TMP4)
+        broadcast_mul_dram(self, self.PE_TMP4, -1.0, 128)
+        eltwise_add_dram(self, self.PE_TMP3, self.PE_TMP4, self.PE_COS_OUT, 128)
+
+        # Step 3: assemble pe = [pe_sin, pe_cos] into PE_FG_TOK, then add point_embed.1.weight (FG)
+        dram_copy(self, self.PE_SIN_OUT, self.PE_FG_TOK,           128)
+        dram_copy(self, self.PE_COS_OUT, self.PE_FG_TOK + 128*bpe, 128)
+        eltwise_add_dram(self, self.PE_FG_TOK, self.PE_POINT_EMBED_FG, self.PE_FG_TOK, _DD)
+
+        # Step 4: assemble DEC_TOKENS[7, 256] from params + fg_token
+        dram_copy(self, self.DEC_IOU_TOKEN,   self.DEC_TOKENS + 0*_DD*bpe, _DD)       # row 0
+        dram_copy(self, self.DEC_MASK_TOKENS, self.DEC_TOKENS + 1*_DD*bpe, 4*_DD)     # rows 1-4
+        dram_copy(self, self.PE_FG_TOK,       self.DEC_TOKENS + 5*_DD*bpe, _DD)       # row 5
+        dram_copy(self, self.PE_NOT_A_POINT,  self.DEC_TOKENS + 6*_DD*bpe, _DD)       # row 6 (NO PE)
+
+        # Step 5: DEC_QUERY_PE = DEC_TOKENS (tokens serve as their own PE in cross-attn)
+        dram_copy(self, self.DEC_TOKENS, self.DEC_QUERY_PE, self.DEC_NUM_TOKENS * _DD)
+
+        # Step 6: DEC_KEY_PE = DEC_POS_SRC (precomputed at weight_init)
+        dram_copy(self, self.DEC_POS_SRC, self.DEC_KEY_PE, self.GRID_AREA * _DD)
+
+        _original_print(f"  [compile] prompt encoder: {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
 
         # ==============================================================
         # PHASE 4: MASK DECODER — layer 0, self-attention
@@ -1607,6 +2131,7 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         NT_PAD = 64                  # next multiple of UE_VECTOR_SIZE — required for HW attn
         DH     = self.DEC_HEADS      # 8
         HD     = self.DEC_HEAD_DIM   # 32
+        GA     = self.GRID_AREA      # 4096
         lw0    = self.dec_layer_weights[0]
 
         # Init DEC_SRC: copy NECK_OUT then add no_mask_embed (broadcast add)
@@ -1726,6 +2251,784 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             GAMMA_DRAM_ADDR=lw0['norm1_w'],
             BETA_DRAM_ADDR=lw0['norm1_b'],
         )
+
+        # ── Layer 0: t2i cross-attention ───────────────────────────────────
+        # q = tokens + query_pe, k = src + key_pe, v = src (no PE)
+        # internal_dim=128, num_heads=8, head_dim=16 padded to 64
+        CA_HDP = 64
+        CA_ID  = self.DEC_INTERNAL_DIM   # 128
+        CA_HD  = self.DEC_INTERNAL_HD    # 16
+        N_CA   = DH * CA_HDP             # 512
+
+        # Q: (tokens + query_pe) → project → (7, 512)
+        eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_QUERY_PE,
+                         self.DEC_TOKENS_NORM, NT * DD)
+        self.matmat_mul_core(
+            M=NT, K=DD, N=N_CA,
+            A_DRAM_ADDR=self.DEC_TOKENS_NORM,
+            B_DRAM_ADDR=lw0['ca_t2i_q_w'],
+            OUTPUT_DRAM_ADDR=self.DEC_Q,
+            C_DRAM_ADDR=lw0['ca_t2i_q_b'],
+            bias_mode="broadcast_N",
+        )
+
+        # K: (src + key_pe) @ W_k^T = src @ W_k^T + key_pe @ W_k^T
+        # Use DEC_CA_T2I_V as temp for the key_pe partial result
+        self.matmat_mul_core(
+            M=GA, K=DD, N=N_CA,
+            A_DRAM_ADDR=self.DEC_SRC,
+            B_DRAM_ADDR=lw0['ca_t2i_k_w'],
+            OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_K,
+            C_DRAM_ADDR=lw0['ca_t2i_k_b'],
+            bias_mode="broadcast_N",
+        )
+        self.matmat_mul_core(
+            M=GA, K=DD, N=N_CA,
+            A_DRAM_ADDR=self.DEC_POS_SRC,
+            B_DRAM_ADDR=lw0['ca_t2i_k_w'],
+            OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_V,  # temp
+        )
+        eltwise_add_dram(self, self.DEC_CA_T2I_K, self.DEC_CA_T2I_V,
+                         self.DEC_CA_T2I_K, GA * N_CA)
+
+        # V: src (no PE) → project → (4096, 512)
+        self.matmat_mul_core(
+            M=GA, K=DD, N=N_CA,
+            A_DRAM_ADDR=self.DEC_SRC,
+            B_DRAM_ADDR=lw0['ca_t2i_v_w'],
+            OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_V,
+            C_DRAM_ADDR=lw0['ca_t2i_v_b'],
+            bias_mode="broadcast_N",
+        )
+
+        # Reshape to heads: (seq, 8, 64) → (8, seq, 64) via permute
+        # Q: (7, 8, 64) → (8, 7, 64) in DEC_SA_TEMP
+        self.bf16_permute_core(
+            dim_0=NT, dim_1=DH, dim_2=CA_HDP,
+            INPUT_DRAM_ADDR=self.DEC_Q,
+            OUTPUT_DRAM_ADDR=self.DEC_SA_TEMP,
+        )
+        # K: (4096, 8, 64) → (8, 4096, 64) in DEC_CA_T2I_K_HEADS
+        self.bf16_permute_core(
+            dim_0=GA, dim_1=DH, dim_2=CA_HDP,
+            INPUT_DRAM_ADDR=self.DEC_CA_T2I_K,
+            OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_K_HEADS,
+        )
+        # V: (4096, 8, 64) → (8, 4096, 64) in DEC_CA_T2I_V_HEADS
+        self.bf16_permute_core(
+            dim_0=GA, dim_1=DH, dim_2=CA_HDP,
+            INPUT_DRAM_ADDR=self.DEC_CA_T2I_V,
+            OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_V_HEADS,
+        )
+
+        # Pre-scale Q by 1/sqrt(CA_HD=16): padded zeros don't contribute to dot products
+        broadcast_mul_dram(self, self.DEC_SA_TEMP,
+                           1.0 / math.sqrt(CA_HD), DH * NT * CA_HDP)
+
+        # Per-head: scores = softmax(Q_h @ K_h^T), out_h = scores @ V_h
+        for h in range(DH):
+            q_addr = self.DEC_SA_TEMP + h * NT * CA_HDP * bpe
+            k_addr = self.DEC_CA_T2I_K_HEADS + h * GA * CA_HDP * bpe
+            v_addr = self.DEC_CA_T2I_V_HEADS + h * GA * CA_HDP * bpe
+            o_addr = self.DEC_CA_OUT_HEADS + h * NT * CA_HDP * bpe
+
+            # scores: (7, 64) @ (64, 4096)^T → (7, 4096), softmax row-wise
+            self.matmat_mul_core(
+                M=NT, K=CA_HDP, N=GA,
+                A_DRAM_ADDR=q_addr,
+                B_DRAM_ADDR=k_addr,
+                OUTPUT_DRAM_ADDR=self.DEC_CA_SCORES,
+                softmax_enable=True,
+            )
+            # V^T: (4096, 64) → (64, 4096)
+            self.bf16_transpose_core(
+                M=GA, N=CA_HDP,
+                INPUT_DRAM_ADDR=v_addr,
+                OUTPUT_DRAM_ADDR=self.DEC_CA_VT,
+            )
+            # out: (7, 4096) @ (4096, 64)^T → (7, 4096) @ (4096, 64) using V^T as B
+            # matmat_mul_core computes A @ B^T where B is (N, K)
+            # B = V^T stored as (N=64, K=4096) → B^T = V → out = scores @ V ✓
+            self.matmat_mul_core(
+                M=NT, K=GA, N=CA_HDP,
+                A_DRAM_ADDR=self.DEC_CA_SCORES,
+                B_DRAM_ADDR=self.DEC_CA_VT,
+                OUTPUT_DRAM_ADDR=o_addr,
+            )
+
+        # Merge: (8, 7, 64) → (7, 128) with head_dim unpad 64→16
+        multihead_merge_dram(self,
+            INPUT_DRAM_ADDR=self.DEC_CA_OUT_HEADS,
+            OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_MERGED,
+            TEMP_DRAM_ADDR=self.DEC_SA_Q_HEADS,
+            seq_len=NT, num_heads=DH,
+            head_dim=CA_HD, head_dim_pad=CA_HDP,
+            UNPAD_WEIGHT_ADDR=self.DEC_CA_UNPAD_W,
+        )
+
+        # out_proj: (7, 128) → (7, 256) + residual + norm2
+        self.matmat_mul_core(
+            M=NT, K=CA_ID, N=DD,
+            A_DRAM_ADDR=self.DEC_CA_T2I_MERGED,
+            B_DRAM_ADDR=lw0['ca_t2i_out_w'],
+            OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+            C_DRAM_ADDR=lw0['ca_t2i_out_b'],
+            bias_mode="broadcast_N",
+        )
+        eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_TOKENS_NORM,
+                         self.DEC_TOKENS, NT * DD)
+        self.layer_norm_core_dram(
+            M=NT, N=DD,
+            A_DRAM_ADDR=self.DEC_TOKENS,
+            OUTPUT_DRAM_ADDR=self.DEC_TOKENS,
+            GAMMA_DRAM_ADDR=lw0['norm2_w'],
+            BETA_DRAM_ADDR=lw0['norm2_b'],
+        )
+
+        # ── Helper: i2t cross-attention (image attends to tokens) ──────────────
+        # Shared constants already defined above: CA_HDP=64, CA_ID=128, CA_HD=16, N_CA=512
+        NT_PAD_I = 64   # token sequence padded to 64 for matmat_mul_core N-alignment
+        MLP_DIM  = self.DEC_MLP_DIM  # 2048
+
+        def _compile_i2t(lw):
+            """Compile one image→token cross-attn block + residual + norm4.
+            Updates DEC_SRC in-place. Uses lw for the current layer weights."""
+            # Q: (src + key_pe) @ W_q_i2t → (4096, 512)  [stored temporarily in DEC_CA_T2I_K]
+            eltwise_add_dram(self, self.DEC_SRC, self.DEC_POS_SRC,
+                             self.DEC_CA_T2I_K, GA * DD)
+            self.matmat_mul_core(
+                M=GA, K=DD, N=N_CA,
+                A_DRAM_ADDR=self.DEC_CA_T2I_K,
+                B_DRAM_ADDR=lw['ca_i2t_q_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_V,   # temp for Q proj
+                C_DRAM_ADDR=lw['ca_i2t_q_b'],
+                bias_mode="broadcast_N",
+            )
+
+            # K: (tokens + query_pe) @ W_k_i2t → (7, 512), zero-padded to (64, 512)
+            eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_QUERY_PE,
+                             self.DEC_TOKENS_NORM, NT * DD)
+            self.matmat_mul_core(
+                M=NT, K=DD, N=N_CA,
+                A_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                B_DRAM_ADDR=lw['ca_i2t_k_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_CA_I2T_K_PAD,
+                C_DRAM_ADDR=lw['ca_i2t_k_b'],
+                bias_mode="broadcast_N",
+            )
+            # Zero-fill padding rows [7:64] in K_PAD: (NT_PAD_I - NT) * N_CA elements
+            dram_zero_fill(self,
+                self.DEC_CA_I2T_K_PAD + NT * N_CA * bpe,
+                (NT_PAD_I - NT) * N_CA)
+
+            # V: tokens @ W_v_i2t → (7, 512), zero-padded to (64, 512)
+            self.matmat_mul_core(
+                M=NT, K=DD, N=N_CA,
+                A_DRAM_ADDR=self.DEC_TOKENS,
+                B_DRAM_ADDR=lw['ca_i2t_v_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_CA_I2T_V_PAD,
+                C_DRAM_ADDR=lw['ca_i2t_v_b'],
+                bias_mode="broadcast_N",
+            )
+            dram_zero_fill(self,
+                self.DEC_CA_I2T_V_PAD + NT * N_CA * bpe,
+                (NT_PAD_I - NT) * N_CA)
+
+            # Permute Q: (4096, 8, 64) → (8, 4096, 64) into DEC_CA_T2I_K_HEADS
+            self.bf16_permute_core(
+                dim_0=GA, dim_1=DH, dim_2=CA_HDP,
+                INPUT_DRAM_ADDR=self.DEC_CA_T2I_V,      # Q proj lives here
+                OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_K_HEADS,
+            )
+            # Permute K: (64, 8, 64) → (8, 64, 64) into DEC_SA_K_HEADS (reused)
+            self.bf16_permute_core(
+                dim_0=NT_PAD_I, dim_1=DH, dim_2=CA_HDP,
+                INPUT_DRAM_ADDR=self.DEC_CA_I2T_K_PAD,
+                OUTPUT_DRAM_ADDR=self.DEC_SA_K_HEADS,
+            )
+            # Permute V: (64, 8, 64) → (8, 64, 64) into DEC_SA_V_HEADS (reused)
+            self.bf16_permute_core(
+                dim_0=NT_PAD_I, dim_1=DH, dim_2=CA_HDP,
+                INPUT_DRAM_ADDR=self.DEC_CA_I2T_V_PAD,
+                OUTPUT_DRAM_ADDR=self.DEC_SA_V_HEADS,
+            )
+
+            # Scale Q heads by 1/sqrt(CA_HD=16)
+            broadcast_mul_dram(self, self.DEC_CA_T2I_K_HEADS,
+                               1.0 / math.sqrt(CA_HD), DH * GA * CA_HDP)
+
+            # Per-head attention: Q_h (4096,64) × K_h^T (64,64) → scores (4096,64) → softmax → × V_h
+            # Zero-padded K/V rows [7:64] produce near-zero (not -inf) scores;
+            # since V_h[7:64,:]=0 their contribution to the output is exactly zero.
+            # Identity matrix for standalone row-wise softmax: softmax(S @ I^T) = softmax(S)
+            _i2t_sm_id = torch.eye(NT_PAD_I, dtype=torch.bfloat16)
+            _i2t_sm_id_w = self._alloc_param(_i2t_sm_id)
+            for h in range(DH):
+                q_addr = self.DEC_CA_T2I_K_HEADS + h * GA * CA_HDP * bpe
+                k_addr = self.DEC_SA_K_HEADS      + h * NT_PAD_I * CA_HDP * bpe
+                v_addr = self.DEC_SA_V_HEADS      + h * NT_PAD_I * CA_HDP * bpe
+                o_addr = self.DEC_CA_I2T_OUT_HEADS + h * GA * CA_HDP * bpe
+
+                # Step A: raw scores Q_h @ K_h^T → (GA, NT_PAD_I), no softmax
+                self.matmat_mul_core(
+                    M=GA, K=CA_HDP, N=NT_PAD_I,
+                    A_DRAM_ADDR=q_addr,
+                    B_DRAM_ADDR=k_addr,
+                    OUTPUT_DRAM_ADDR=self.DEC_CA_I2T_SCORES,
+                )
+                # Step B: add kv-column bias row (0 at [0:7], -inf at [7:64]) to every
+                # query row of the score matrix so softmax suppresses padded keys.
+                # Load the 64-element bias row once into B-side SRAM, then for each of
+                # the GA=4096 rows: load row → A, add → write back.
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=self.DEC_CA_I2T_BIAS_ROW,
+                    sram_address=0x80000,
+                    element_size=NT_PAD_I,
+                )
+                for _row in range(GA):
+                    _row_addr = self.DEC_CA_I2T_SCORES + _row * NT_PAD_I * bpe
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=_row_addr,
+                        sram_address=0x00000,
+                        element_size=NT_PAD_I,
+                    )
+                    self.eltwise_add_core(
+                        vector_A_sram_start_addr=0x00000,
+                        vector_B_sram_start_addr=0x80000,
+                        vector_C_sram_wb_addr=0x00000,
+                        element_size=NT_PAD_I,
+                    )
+                    self.sram_to_accelerator_memory(
+                        sram_address=0x00000,
+                        accelerator_dram_address=_row_addr,
+                        element_size=NT_PAD_I,
+                    )
+                # Step C: standalone softmax on the bias-added scores.
+                # Identity-matrix trick: softmax(scores @ I^T) = softmax(scores).
+                # K=NT_PAD_I=64 satisfies the 64-ALU minimum (K=1 is invalid).
+                self.matmat_mul_core(
+                    M=GA, K=NT_PAD_I, N=NT_PAD_I,
+                    A_DRAM_ADDR=self.DEC_CA_I2T_SCORES,
+                    B_DRAM_ADDR=_i2t_sm_id_w,
+                    OUTPUT_DRAM_ADDR=self.DEC_CA_I2T_SCORES,
+                    softmax_enable=True,
+                )
+                self.bf16_transpose_core(
+                    M=NT_PAD_I, N=CA_HDP,
+                    INPUT_DRAM_ADDR=v_addr,
+                    OUTPUT_DRAM_ADDR=self.DEC_CA_I2T_VT,
+                )
+                self.matmat_mul_core(
+                    M=GA, K=NT_PAD_I, N=CA_HDP,
+                    A_DRAM_ADDR=self.DEC_CA_I2T_SCORES,
+                    B_DRAM_ADDR=self.DEC_CA_I2T_VT,
+                    OUTPUT_DRAM_ADDR=o_addr,
+                )
+
+            # Merge: (8, 4096, 64) → permute → (4096, 512) → unpad → (4096, 128)
+            # Use DEC_CA_T2I_K as the permute temp (GA*N_CA = 4096*512 elements, fits)
+            multihead_merge_dram(self,
+                INPUT_DRAM_ADDR=self.DEC_CA_I2T_OUT_HEADS,
+                OUTPUT_DRAM_ADDR=self.DEC_CA_I2T_MERGED,
+                TEMP_DRAM_ADDR=self.DEC_CA_T2I_K,
+                seq_len=GA, num_heads=DH,
+                head_dim=CA_HD, head_dim_pad=CA_HDP,
+                UNPAD_WEIGHT_ADDR=self.DEC_CA_UNPAD_W,
+            )
+
+            # out_proj: (4096, 128) → (4096, 256), residual, norm4
+            self.matmat_mul_core(
+                M=GA, K=CA_ID, N=DD,
+                A_DRAM_ADDR=self.DEC_CA_I2T_MERGED,
+                B_DRAM_ADDR=lw['ca_i2t_out_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                C_DRAM_ADDR=lw['ca_i2t_out_b'],
+                bias_mode="broadcast_N",
+            )
+            eltwise_add_dram(self, self.DEC_SRC, self.DEC_TOKENS_NORM,
+                             self.DEC_SRC, GA * DD)
+            self.layer_norm_core_dram(
+                M=GA, N=DD,
+                A_DRAM_ADDR=self.DEC_SRC,
+                OUTPUT_DRAM_ADDR=self.DEC_SRC,
+                GAMMA_DRAM_ADDR=lw['norm4_w'],
+                BETA_DRAM_ADDR=lw['norm4_b'],
+            )
+
+        def _compile_mlp(lw):
+            """Compile one MLP block (lin1 + GELU + lin2) + residual + norm3 on DEC_TOKENS."""
+            self.matmat_mul_core(
+                M=NT, K=DD, N=MLP_DIM,
+                A_DRAM_ADDR=self.DEC_TOKENS,
+                B_DRAM_ADDR=lw['mlp_lin1_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_MLP_INTER,
+                C_DRAM_ADDR=lw['mlp_lin1_b'],
+                bias_mode="broadcast_N",
+                gelu_enable=True,
+            )
+            self.matmat_mul_core(
+                M=NT, K=MLP_DIM, N=DD,
+                A_DRAM_ADDR=self.DEC_MLP_INTER,
+                B_DRAM_ADDR=lw['mlp_lin2_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                C_DRAM_ADDR=lw['mlp_lin2_b'],
+                bias_mode="broadcast_N",
+            )
+            eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_TOKENS_NORM,
+                             self.DEC_TOKENS, NT * DD)
+            self.layer_norm_core_dram(
+                M=NT, N=DD,
+                A_DRAM_ADDR=self.DEC_TOKENS,
+                OUTPUT_DRAM_ADDR=self.DEC_TOKENS,
+                GAMMA_DRAM_ADDR=lw['norm3_w'],
+                BETA_DRAM_ADDR=lw['norm3_b'],
+            )
+
+        def _compile_t2i(lw, is_final=False, out_norm_w=None, out_norm_b=None):
+            """Compile one token→image cross-attn block.
+            If is_final=True: no residual add, apply out_norm instead of norm2."""
+            # Q: (tokens + query_pe) → project → (7, 512)
+            eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_QUERY_PE,
+                             self.DEC_TOKENS_NORM, NT * DD)
+            self.matmat_mul_core(
+                M=NT, K=DD, N=N_CA,
+                A_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                B_DRAM_ADDR=lw['ca_t2i_q_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_Q,
+                C_DRAM_ADDR=lw['ca_t2i_q_b'],
+                bias_mode="broadcast_N",
+            )
+
+            # K: (src + key_pe) @ W_k
+            self.matmat_mul_core(
+                M=GA, K=DD, N=N_CA,
+                A_DRAM_ADDR=self.DEC_SRC,
+                B_DRAM_ADDR=lw['ca_t2i_k_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_K,
+                C_DRAM_ADDR=lw['ca_t2i_k_b'],
+                bias_mode="broadcast_N",
+            )
+            self.matmat_mul_core(
+                M=GA, K=DD, N=N_CA,
+                A_DRAM_ADDR=self.DEC_POS_SRC,
+                B_DRAM_ADDR=lw['ca_t2i_k_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_V,   # temp
+            )
+            eltwise_add_dram(self, self.DEC_CA_T2I_K, self.DEC_CA_T2I_V,
+                             self.DEC_CA_T2I_K, GA * N_CA)
+
+            # V: src (no PE) → project
+            self.matmat_mul_core(
+                M=GA, K=DD, N=N_CA,
+                A_DRAM_ADDR=self.DEC_SRC,
+                B_DRAM_ADDR=lw['ca_t2i_v_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_V,
+                C_DRAM_ADDR=lw['ca_t2i_v_b'],
+                bias_mode="broadcast_N",
+            )
+
+            # Permute Q: (7, 8, 64) → (8, 7, 64) into DEC_SA_TEMP
+            self.bf16_permute_core(
+                dim_0=NT, dim_1=DH, dim_2=CA_HDP,
+                INPUT_DRAM_ADDR=self.DEC_Q,
+                OUTPUT_DRAM_ADDR=self.DEC_SA_TEMP,
+            )
+            # Permute K: (4096, 8, 64) → (8, 4096, 64)
+            self.bf16_permute_core(
+                dim_0=GA, dim_1=DH, dim_2=CA_HDP,
+                INPUT_DRAM_ADDR=self.DEC_CA_T2I_K,
+                OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_K_HEADS,
+            )
+            # Permute V: (4096, 8, 64) → (8, 4096, 64)
+            self.bf16_permute_core(
+                dim_0=GA, dim_1=DH, dim_2=CA_HDP,
+                INPUT_DRAM_ADDR=self.DEC_CA_T2I_V,
+                OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_V_HEADS,
+            )
+
+            broadcast_mul_dram(self, self.DEC_SA_TEMP,
+                               1.0 / math.sqrt(CA_HD), DH * NT * CA_HDP)
+
+            for h in range(DH):
+                q_addr = self.DEC_SA_TEMP        + h * NT * CA_HDP * bpe
+                k_addr = self.DEC_CA_T2I_K_HEADS + h * GA * CA_HDP * bpe
+                v_addr = self.DEC_CA_T2I_V_HEADS + h * GA * CA_HDP * bpe
+                o_addr = self.DEC_CA_OUT_HEADS   + h * NT * CA_HDP * bpe
+
+                self.matmat_mul_core(
+                    M=NT, K=CA_HDP, N=GA,
+                    A_DRAM_ADDR=q_addr,
+                    B_DRAM_ADDR=k_addr,
+                    OUTPUT_DRAM_ADDR=self.DEC_CA_SCORES,
+                    softmax_enable=True,
+                )
+                self.bf16_transpose_core(
+                    M=GA, N=CA_HDP,
+                    INPUT_DRAM_ADDR=v_addr,
+                    OUTPUT_DRAM_ADDR=self.DEC_CA_VT,
+                )
+                self.matmat_mul_core(
+                    M=NT, K=GA, N=CA_HDP,
+                    A_DRAM_ADDR=self.DEC_CA_SCORES,
+                    B_DRAM_ADDR=self.DEC_CA_VT,
+                    OUTPUT_DRAM_ADDR=o_addr,
+                )
+
+            multihead_merge_dram(self,
+                INPUT_DRAM_ADDR=self.DEC_CA_OUT_HEADS,
+                OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_MERGED,
+                TEMP_DRAM_ADDR=self.DEC_SA_Q_HEADS,
+                seq_len=NT, num_heads=DH,
+                head_dim=CA_HD, head_dim_pad=CA_HDP,
+                UNPAD_WEIGHT_ADDR=self.DEC_CA_UNPAD_W,
+            )
+
+            self.matmat_mul_core(
+                M=NT, K=CA_ID, N=DD,
+                A_DRAM_ADDR=self.DEC_CA_T2I_MERGED,
+                B_DRAM_ADDR=lw['ca_t2i_out_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                C_DRAM_ADDR=lw['ca_t2i_out_b'],
+                bias_mode="broadcast_N",
+            )
+
+            if not is_final:
+                eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_TOKENS_NORM,
+                                 self.DEC_TOKENS, NT * DD)
+                self.layer_norm_core_dram(
+                    M=NT, N=DD,
+                    A_DRAM_ADDR=self.DEC_TOKENS,
+                    OUTPUT_DRAM_ADDR=self.DEC_TOKENS,
+                    GAMMA_DRAM_ADDR=lw['norm2_w'],
+                    BETA_DRAM_ADDR=lw['norm2_b'],
+                )
+            else:
+                # Final attn: add residual then apply final layer norm
+                eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_TOKENS_NORM,
+                                 self.DEC_TOKENS, NT * DD)
+                self.layer_norm_core_dram(
+                    M=NT, N=DD,
+                    A_DRAM_ADDR=self.DEC_TOKENS,
+                    OUTPUT_DRAM_ADDR=self.DEC_TOKENS,
+                    GAMMA_DRAM_ADDR=out_norm_w,
+                    BETA_DRAM_ADDR=out_norm_b,
+                )
+
+        def _compile_sa(lw):
+            """Compile one self-attention block + out_proj + residual + norm1 on DEC_TOKENS."""
+            HD     = self.DEC_HEAD_DIM   # 32
+            HD_PAD = 64
+            NT_PAD = 64
+            N_PAD  = DH * HD_PAD         # 512
+
+            # Q/K/V projections (padded weights)
+            self.matmat_mul_core(
+                M=NT, K=DD, N=N_PAD,
+                A_DRAM_ADDR=self.DEC_TOKENS,
+                B_DRAM_ADDR=lw['sa_q_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_Q,
+                C_DRAM_ADDR=lw['sa_q_b'],
+                bias_mode="broadcast_N",
+            )
+            self.matmat_mul_core(
+                M=NT, K=DD, N=N_PAD,
+                A_DRAM_ADDR=self.DEC_TOKENS,
+                B_DRAM_ADDR=lw['sa_k_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_K,
+                C_DRAM_ADDR=lw['sa_k_b'],
+                bias_mode="broadcast_N",
+            )
+            self.matmat_mul_core(
+                M=NT, K=DD, N=N_PAD,
+                A_DRAM_ADDR=self.DEC_TOKENS,
+                B_DRAM_ADDR=lw['sa_v_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_V,
+                C_DRAM_ADDR=lw['sa_v_b'],
+                bias_mode="broadcast_N",
+            )
+
+            # Permute Q/K/V: (7,8,64) → compact (8,7,64) in TEMP, zero-fill (8,64,64), scatter
+            for proj, heads in [(self.DEC_Q, self.DEC_SA_Q_HEADS),
+                                (self.DEC_K, self.DEC_SA_K_HEADS),
+                                (self.DEC_V, self.DEC_SA_V_HEADS)]:
+                self.bf16_permute_core(
+                    dim_0=NT, dim_1=DH, dim_2=HD_PAD,
+                    INPUT_DRAM_ADDR=proj,
+                    OUTPUT_DRAM_ADDR=self.DEC_SA_TEMP,
+                )
+                dram_zero_fill(self, heads, DH * NT_PAD * HD_PAD)
+                for h in range(DH):
+                    dram_copy(self,
+                        self.DEC_SA_TEMP + h * NT * HD_PAD * bpe,
+                        heads             + h * NT_PAD * HD_PAD * bpe,
+                        NT * HD_PAD)
+
+            # Scale Q by sqrt(2): effective scale = sqrt(2)/sqrt(64) = 1/sqrt(32) = 1/sqrt(HD)
+            broadcast_mul_dram(self, self.DEC_SA_Q_HEADS, math.sqrt(2.0), DH * NT_PAD * HD_PAD)
+
+            flash_attention_batched(self,
+                num_batches=DH, head_dim=HD_PAD, seq_len=NT_PAD,
+                Q_DRAM_ADDR=self.DEC_SA_Q_HEADS,
+                K_DRAM_ADDR=self.DEC_SA_K_HEADS,
+                V_DRAM_ADDR=self.DEC_SA_V_HEADS,
+                OUTPUT_DRAM_ADDR=self.DEC_SA_OUT_HEADS,
+                SCRATCH_DRAM_ADDR=self.DEC_SA_SCRATCH,
+                BIAS_DRAM_ADDR=self.DEC_SA_ATTN_BIAS,
+            )
+
+            # Extract first NT=7 rows per head from (8,64,64) into compact (8,7,64)
+            for h in range(DH):
+                dram_copy(self,
+                    self.DEC_SA_OUT_HEADS + h * NT_PAD * HD_PAD * bpe,
+                    self.DEC_SA_TEMP      + h * NT * HD_PAD * bpe,
+                    NT * HD_PAD)
+
+            multihead_merge_dram(self,
+                INPUT_DRAM_ADDR=self.DEC_SA_TEMP,
+                OUTPUT_DRAM_ADDR=self.DEC_SA_MERGED,
+                TEMP_DRAM_ADDR=self.DEC_SA_Q_HEADS,
+                seq_len=NT, num_heads=DH,
+                head_dim=HD, head_dim_pad=HD_PAD,
+                UNPAD_WEIGHT_ADDR=self.DEC_SA_UNPAD_W,
+            )
+
+            self.matmat_mul_core(
+                M=NT, K=DD, N=DD,
+                A_DRAM_ADDR=self.DEC_SA_MERGED,
+                B_DRAM_ADDR=lw['sa_out_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                C_DRAM_ADDR=lw['sa_out_b'],
+                bias_mode="broadcast_N",
+            )
+            eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_TOKENS_NORM,
+                             self.DEC_TOKENS, NT * DD)
+            self.layer_norm_core_dram(
+                M=NT, N=DD,
+                A_DRAM_ADDR=self.DEC_TOKENS,
+                OUTPUT_DRAM_ADDR=self.DEC_TOKENS,
+                GAMMA_DRAM_ADDR=lw['norm1_w'],
+                BETA_DRAM_ADDR=lw['norm1_b'],
+            )
+
+        # ── Layer 0: remaining blocks (MLP + i2t) ─────────────────────────────
+        _compile_mlp(lw0)
+        _compile_i2t(lw0)
+
+        # ── Layer 1: sa1 + t2i1 + MLP1 + i2t1 ────────────────────────────────
+        lw1 = self.dec_layer_weights[1]
+        _compile_sa(lw1)
+        _compile_t2i(lw1)
+        _compile_mlp(lw1)
+        _compile_i2t(lw1)
+
+        # ── Final token→image cross-attention + layer_norm_final_attn ─────────
+        # Uses dec_final_attn (padded Q/K/V weights) — no i2t, no MLP after this.
+        # Output updates DEC_TOKENS; DEC_SRC (last i2t1 output) feeds mask upscaling.
+        # Adapt dec_final_attn keys to the ca_t2i_* scheme _compile_t2i expects.
+        fa = self.dec_final_attn
+        _final_lw = {
+            'ca_t2i_q_w': fa['q_w'], 'ca_t2i_q_b': fa['q_b'],
+            'ca_t2i_k_w': fa['k_w'], 'ca_t2i_k_b': fa['k_b'],
+            'ca_t2i_v_w': fa['v_w'], 'ca_t2i_v_b': fa['v_b'],
+            'ca_t2i_out_w': fa['out_w'], 'ca_t2i_out_b': fa['out_b'],
+        }
+        _compile_t2i(
+            lw=_final_lw,
+            is_final=True,
+            out_norm_w=self.dec_final_norm['w'],
+            out_norm_b=self.dec_final_norm['b'],
+        )
+
+        # ── Hypernetwork MLPs + IoU head ───────────────────────────────────────
+        # Tokens layout after transformer:
+        #   row 0 : iou_token  → IoU head (256→256→256→4)
+        #   rows 1-4: mask_tokens → 4 hypernetwork MLPs (256→256→256→32)
+        NUM_MASKS = 4
+
+        # IoU head: 3-layer MLP with ReLU on first two layers
+        # Input: DEC_TOKENS row 0 (1, 256); output: DEC_IOU_OUT (1, 4)
+        iou_w = self.dec_iou_weights
+        # Layer 0: (1,256) → (1,256) + ReLU
+        self.matmat_mul_core(
+            M=1, K=DD, N=DD,
+            A_DRAM_ADDR=self.DEC_TOKENS,
+            B_DRAM_ADDR=iou_w['l0_w'],
+            OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+            C_DRAM_ADDR=iou_w['l0_b'],
+            bias_mode="broadcast_N",
+            relu_enable=True,
+        )
+        # Layer 1: (1,256) → (1,256) + ReLU
+        self.matmat_mul_core(
+            M=1, K=DD, N=DD,
+            A_DRAM_ADDR=self.DEC_TOKENS_NORM,
+            B_DRAM_ADDR=iou_w['l1_w'],
+            OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+            C_DRAM_ADDR=iou_w['l1_b'],
+            bias_mode="broadcast_N",
+            relu_enable=True,
+        )
+        # Layer 2: (1,256) → (1,4) — padded to N=64 for hardware lane alignment
+        self.matmat_mul_core(
+            M=1, K=DD, N=64,
+            A_DRAM_ADDR=self.DEC_TOKENS_NORM,
+            B_DRAM_ADDR=iou_w['l2_w'],
+            OUTPUT_DRAM_ADDR=self.DEC_IOU_OUT,
+            C_DRAM_ADDR=iou_w['l2_b'],
+            bias_mode="broadcast_N",
+        )
+
+        # Hypernetwork MLPs: 4 mask tokens (rows 1-4) → 4 × (1,32) mask weight vectors
+        # Each MLP: ReLU on first two layers; no activation on final layer
+        for m in range(NUM_MASKS):
+            hw = self.dec_hyper_weights[m]
+            src_addr = self.DEC_TOKENS + (m + 1) * DD * bpe  # row (m+1) of DEC_TOKENS
+            out_addr = self.DEC_HYPER_OUT + m * 64 * bpe     # row m of DEC_HYPER_OUT (padded to 64 cols)
+
+            # Layer 0: (1,256) → (1,256) + ReLU
+            self.matmat_mul_core(
+                M=1, K=DD, N=DD,
+                A_DRAM_ADDR=src_addr,
+                B_DRAM_ADDR=hw['l0_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                C_DRAM_ADDR=hw['l0_b'],
+                bias_mode="broadcast_N",
+                relu_enable=True,
+            )
+            # Layer 1: (1,256) → (1,256) + ReLU
+            self.matmat_mul_core(
+                M=1, K=DD, N=DD,
+                A_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                B_DRAM_ADDR=hw['l1_w'],
+                OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                C_DRAM_ADDR=hw['l1_b'],
+                bias_mode="broadcast_N",
+                relu_enable=True,
+            )
+            # Layer 2: (1,256) → (1,32) — padded to N=64 for hardware lane alignment
+            self.matmat_mul_core(
+                M=1, K=DD, N=64,
+                A_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                B_DRAM_ADDR=hw['l2_w'],
+                OUTPUT_DRAM_ADDR=out_addr,
+                C_DRAM_ADDR=hw['l2_b'],
+                bias_mode="broadcast_N",
+            )
+
+        # Zero-fill padded rows 4..63 of DEC_HYPER_OUT so they don't contribute
+        # garbage to the final (65536,64) @ (64,64)^T mask-logit matmul.
+        dram_zero_fill(self, self.DEC_HYPER_OUT + 4 * 64 * bpe, 60 * 64)
+
+        # ── Mask upscaling: ConvTranspose2d × 2 ───────────────────────────────
+        # Input: DEC_SRC (4096, 256) — final image features after i2t1 + norm4
+        # Stage 0: ConvTranspose2d(256→64, k=2,s=2) → (16384, 64); LayerNorm2d(64); GELU
+        C_IN0, C_OUT0 = DD, 64           # 256 → 64
+        H_IN0, W_IN0  = 64, 64
+        H_OUT0, W_OUT0 = 128, 128
+
+        # Compute 4 sub-position matmuls: for each (dr, dc), output is (GA, C_OUT0)
+        # Bias added here — each output pixel gets contribution from exactly one sub-position
+        for dr in range(2):
+            for dc in range(2):
+                sub_idx = dr * 2 + dc
+                self.matmat_mul_core(
+                    M=GA, K=C_IN0, N=C_OUT0,
+                    A_DRAM_ADDR=self.DEC_SRC,
+                    B_DRAM_ADDR=self.DEC_UP0_W[dr][dc],
+                    OUTPUT_DRAM_ADDR=self.DEC_UP0_SCRATCH + sub_idx * GA * C_OUT0 * bpe,
+                    C_DRAM_ADDR=self.DEC_UP0_B,
+                    bias_mode="broadcast_N" if self.DEC_UP0_B is not None else None,
+                )
+
+        # Pixel-shuffle scatter: (4, 4096, 64) → (16384, 64)
+        # src_row = sub_idx*GA + r*W_IN0 + c; dst_row = (2*r+dr)*W_OUT0 + (2*c+dc)
+        for r in range(H_IN0):
+            for c in range(W_IN0):
+                for dr in range(2):
+                    for dc in range(2):
+                        sub_idx  = dr * 2 + dc
+                        src_row  = sub_idx * GA + r * W_IN0 + c
+                        dst_row  = (2 * r + dr) * W_OUT0 + (2 * c + dc)
+                        src_byte = self.DEC_UP0_SCRATCH + src_row * C_OUT0 * bpe
+                        dst_byte = self.DEC_UP0_OUT     + dst_row * C_OUT0 * bpe
+                        self.accelerator_memory_to_sram(src_byte, 0x0000, C_OUT0)
+                        self.sram_to_accelerator_memory(0x0000, dst_byte, C_OUT0)
+
+        # LayerNorm2d(64): normalize each spatial position (row) along the channel dim
+        self.layer_norm_core_dram(
+            M=H_OUT0 * W_OUT0, N=C_OUT0,
+            A_DRAM_ADDR=self.DEC_UP0_OUT,
+            OUTPUT_DRAM_ADDR=self.DEC_UP0_OUT,
+            GAMMA_DRAM_ADDR=self.DEC_UP_LN_W,
+            BETA_DRAM_ADDR=self.DEC_UP_LN_B,
+        )
+
+        # GELU activation: reuse matmat_mul_core with gelu_enable.
+        # Identity weight (N=C_OUT0, K=C_OUT0) so output = GELU(input).
+        # Build identity matrix for GELU passthrough (stored in params)
+        _identity_64 = torch.eye(C_OUT0, dtype=torch.bfloat16)
+        _gelu_id_w = self._alloc_param(_identity_64)
+        self.matmat_mul_core(
+            M=H_OUT0 * W_OUT0, K=C_OUT0, N=C_OUT0,
+            A_DRAM_ADDR=self.DEC_UP0_OUT,
+            B_DRAM_ADDR=_gelu_id_w,
+            OUTPUT_DRAM_ADDR=self.DEC_UP0_OUT,
+            gelu_enable=True,
+        )
+
+        # Stage 1: ConvTranspose2d(64→32, k=2,s=2) → (65536, 32)
+        C_IN1, C_OUT1  = C_OUT0, 32        # 64 → 32
+        C_OUT1_PAD     = 64                # hardware lane alignment (N must be multiple of 64)
+        H_IN1, W_IN1   = H_OUT0, W_OUT0    # 128 × 128
+        H_OUT1, W_OUT1 = 256, 256
+        GA1 = H_IN1 * W_IN1                # 16384
+
+        for dr in range(2):
+            for dc in range(2):
+                sub_idx = dr * 2 + dc
+                self.matmat_mul_core(
+                    M=GA1, K=C_IN1, N=C_OUT1_PAD,
+                    A_DRAM_ADDR=self.DEC_UP0_OUT,
+                    B_DRAM_ADDR=self.DEC_UP1_W[dr][dc],
+                    OUTPUT_DRAM_ADDR=self.DEC_UP1_SCRATCH + sub_idx * GA1 * C_OUT1_PAD * bpe,
+                    C_DRAM_ADDR=self.DEC_UP1_B,
+                    bias_mode="broadcast_N" if self.DEC_UP1_B is not None else None,
+                )
+
+        # Pixel-shuffle scatter: (4, 16384, 64) → (65536, 64)
+        for r in range(H_IN1):
+            for c in range(W_IN1):
+                for dr in range(2):
+                    for dc in range(2):
+                        sub_idx  = dr * 2 + dc
+                        src_row  = sub_idx * GA1 + r * W_IN1 + c
+                        dst_row  = (2 * r + dr) * W_OUT1 + (2 * c + dc)
+                        src_byte = self.DEC_UP1_SCRATCH + src_row * C_OUT1_PAD * bpe
+                        dst_byte = self.DEC_UP1_OUT     + dst_row * C_OUT1_PAD * bpe
+                        self.accelerator_memory_to_sram(src_byte, 0x0000, C_OUT1_PAD)
+                        self.sram_to_accelerator_memory(0x0000, dst_byte, C_OUT1_PAD)
+
+        # GELU after second ConvTranspose2d (SAM output_upscaling index 4)
+        _identity_64_1 = torch.eye(64, dtype=torch.bfloat16)
+        _gelu_id_w1 = self._alloc_param(_identity_64_1)
+        self.matmat_mul_core(
+            M=H_OUT1 * W_OUT1, K=C_OUT1_PAD, N=C_OUT1_PAD,
+            A_DRAM_ADDR=self.DEC_UP1_OUT,
+            B_DRAM_ADDR=_gelu_id_w1,
+            OUTPUT_DRAM_ADDR=self.DEC_UP1_OUT,
+            gelu_enable=True,
+        )
+
+        # ── Final mask logits: (65536, 64) @ (64, 64)^T → (65536, 64) ──────────
+        # DEC_HYPER_OUT is padded (64, 64) — first 4 rows real, rest zero.
+        # Only first 4 output columns per row are real mask logits.
+        self.matmat_mul_core(
+            M=H_OUT1 * W_OUT1, K=C_OUT1_PAD, N=64,
+            A_DRAM_ADDR=self.DEC_UP1_OUT,
+            B_DRAM_ADDR=self.DEC_HYPER_OUT,
+            OUTPUT_DRAM_ADDR=self.DEC_MASK_LOGITS,
+        )
+        _original_print(f"  [compile] mask decoder: {_time.perf_counter() - _tp:.3f}s")
 
     def _finalize_program(self):
         """Stop capture, write instructions, return program address."""
@@ -2188,6 +3491,81 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         del sd
         return tokens.to(torch.bfloat16), src.to(torch.bfloat16)
 
+    def cpu_reference_dec_t2i0(self, tokens_after_norm1: torch.Tensor,
+                                src: torch.Tensor,
+                                query_pe: torch.Tensor,
+                                key_pe: torch.Tensor) -> torch.Tensor:
+        """CPU reference for decoder layer-0 token→image cross-attention.
+
+        Args:
+            tokens_after_norm1: (7, 256) bf16 — output of self-attn + norm1
+            src:                (4096, 256) bf16 — image features + no_mask_embed
+            query_pe:           (7, 256) bf16 — prompt token positional encoding
+            key_pe:             (4096, 256) bf16 — dense image positional encoding
+        Returns:
+            tokens after t2i attn + residual + norm2, shape (7, 256) bf16
+        """
+        import torch.nn.functional as F
+
+        ckpt_path = _ensure_checkpoint(self.script_dir, self.cfg)
+        sd = _load_sam1_state_dict(ckpt_path)
+        lp = "mask_decoder.transformer.layers.0."
+
+        tokens = tokens_after_norm1.to(torch.bfloat16)  # (7, 256)
+        src    = src.to(torch.bfloat16)                  # (4096, 256)
+        qpe    = query_pe.to(torch.bfloat16)             # (7, 256)
+        kpe    = key_pe.to(torch.bfloat16)               # (4096, 256)
+
+        NT, DD = self.DEC_NUM_TOKENS, self.DEC_DIM
+        DH, HD = self.DEC_HEADS, self.DEC_INTERNAL_HD    # 8, 16
+        ID     = self.DEC_INTERNAL_DIM                   # 128
+
+        q_w  = sd[lp + "cross_attn_token_to_image.q_proj.weight"].to(torch.bfloat16)
+        q_b  = sd[lp + "cross_attn_token_to_image.q_proj.bias"].to(torch.bfloat16)
+        k_w  = sd[lp + "cross_attn_token_to_image.k_proj.weight"].to(torch.bfloat16)
+        k_b  = sd[lp + "cross_attn_token_to_image.k_proj.bias"].to(torch.bfloat16)
+        v_w  = sd[lp + "cross_attn_token_to_image.v_proj.weight"].to(torch.bfloat16)
+        v_b  = sd[lp + "cross_attn_token_to_image.v_proj.bias"].to(torch.bfloat16)
+        out_w = sd[lp + "cross_attn_token_to_image.out_proj.weight"].to(torch.bfloat16)
+        out_b = sd[lp + "cross_attn_token_to_image.out_proj.bias"].to(torch.bfloat16)
+        ln2_w = sd[lp + "layer_norm2.weight"].to(torch.bfloat16)
+        ln2_b = sd[lp + "layer_norm2.bias"].to(torch.bfloat16)
+
+        GA = self.GRID_AREA  # 4096
+
+        # q = tokens + query_pe, k = src + key_pe, v = src
+        q = (tokens.float() + qpe.float()).to(torch.bfloat16)
+        k = (src.float()    + kpe.float()).to(torch.bfloat16)
+        v = src
+
+        Q = F.linear(q.float(), q_w.float(), q_b.float()).to(torch.bfloat16)  # (7, 128)
+        K = F.linear(k.float(), k_w.float(), k_b.float()).to(torch.bfloat16)  # (4096, 128)
+        V = F.linear(v.float(), v_w.float(), v_b.float()).to(torch.bfloat16)  # (4096, 128)
+
+        # Multi-head reshape: Q (7, 8, 16), K/V (4096, 8, 16)
+        Q = Q.reshape(NT, DH, HD).permute(1, 0, 2)   # (8, 7, 16)
+        K = K.reshape(GA, DH, HD).permute(1, 0, 2)   # (8, 4096, 16)
+        V = V.reshape(GA, DH, HD).permute(1, 0, 2)   # (8, 4096, 16)
+
+        scale = 1.0 / math.sqrt(HD)
+        scores = torch.bmm(Q.float() * scale, K.float().transpose(-2, -1)).to(torch.bfloat16)  # (8, 7, 4096)
+        probs  = torch.softmax(scores.to(torch.bfloat16), dim=-1)   # bf16 softmax to match HW
+        attn   = torch.bmm(probs.float(), V.float()).to(torch.bfloat16)  # (8, 7, 16)
+
+        attn_merged = attn.permute(1, 0, 2).reshape(NT, ID)   # (7, 128)
+        attn_out = F.linear(attn_merged.float(), out_w.float(), out_b.float()).to(torch.bfloat16)
+
+        tokens = tokens + attn_out  # residual
+
+        # norm2
+        _mean = tokens.float().mean(dim=-1, keepdim=True)
+        _cent = tokens.float() - _mean
+        _rms  = _cent.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        tokens = (_cent / _rms).to(torch.bfloat16) * ln2_w + ln2_b
+
+        del sd
+        return tokens.to(torch.bfloat16)
+
     @staticmethod
     def tensor_metrics(hw: torch.Tensor, ref: torch.Tensor) -> dict:
         """Compute numerical quality metrics between HW and CPU reference tensors.
@@ -2337,6 +3715,7 @@ def main():
 
     _original_print(f"SAM 1 ViT-B on {args.dev}")
 
+    _t_total = _time.perf_counter()
     t0 = _time.perf_counter()
     ue = Sam1VitB_UnifiedEngine(script_dir=SCRIPT_DIR)
     _original_print(f"  Weights: {_time.perf_counter() - t0:.3f}s")
@@ -2516,8 +3895,8 @@ def main():
             proj  = 2 * math.pi * (coord @ _pe_mat)
             return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1).to(torch.bfloat16)  # (1, 256)
 
-        fg_emb  = (_point_pe(*TEST_POINT).float() + sd["prompt_encoder.point_embed.0.weight"].float()).to(torch.bfloat16)
-        pad_emb = (_point_pe(0.0, 0.0).float()    + sd["prompt_encoder.not_a_point_embed.weight"].float()).to(torch.bfloat16)
+        fg_emb  = (_point_pe(*TEST_POINT).float() + sd["prompt_encoder.point_embed.1.weight"].float()).to(torch.bfloat16)
+        pad_emb = sd["prompt_encoder.not_a_point_embed.weight"].to(torch.bfloat16)  # no PE add for padding token
         iou_tok   = sd["mask_decoder.iou_token.weight"].to(torch.bfloat16)    # (1, 256)
         mask_toks = sd["mask_decoder.mask_tokens.weight"].to(torch.bfloat16)  # (4, 256)
         cpu_tokens = torch.cat([iou_tok, mask_toks, fg_emb, pad_emb], dim=0)  # (7, 256)
@@ -2658,24 +4037,20 @@ def main():
             prog_addr = ue.compile_full_fused()
             _original_print(f"  Compile: {_time.perf_counter() - t1:.3f}s")
 
-            # Build prompt tokens and DMA to DEC_TOKENS before HW execution
-            ckpt_path = _ensure_checkpoint(SCRIPT_DIR, ue.cfg)
-            _sd = _load_sam1_state_dict(ckpt_path)
-            _pe_mat = _sd["shared_image_embedding.positional_embedding"].float()  # (2, 128)
+            # Prompt encoder: write 4 sin/cos table rows for (x_px, y_px) to fixed DRAM slots.
+            # The compiled program assembles DEC_TOKENS, DEC_QUERY_PE, DEC_KEY_PE from these.
             TEST_POINT = (512.0, 512.0)
-            def _point_pe(x, y):
-                coord = torch.tensor([[x / ue.IMAGE_SIZE, y / ue.IMAGE_SIZE]], dtype=torch.float32)
-                proj  = 2 * math.pi * (coord @ _pe_mat)
-                return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1).to(torch.bfloat16)
-            fg_emb  = (_point_pe(*TEST_POINT).float() + _sd["prompt_encoder.point_embed.0.weight"].float()).to(torch.bfloat16)
-            pad_emb = (_point_pe(0.0, 0.0).float()    + _sd["prompt_encoder.not_a_point_embed.weight"].float()).to(torch.bfloat16)
-            cpu_tokens = torch.cat([
-                _sd["mask_decoder.iou_token.weight"].to(torch.bfloat16),   # (1, 256)
-                _sd["mask_decoder.mask_tokens.weight"].to(torch.bfloat16), # (4, 256)
-                fg_emb, pad_emb,
-            ], dim=0)  # (7, 256)
-            del _sd
-            ue.dma_to_accelerator_memory(ue.DEC_TOKENS, cpu_tokens.contiguous())
+            x_px = int(TEST_POINT[0])
+            y_px = int(TEST_POINT[1])
+            bpe = 2
+            sin_x_row = ue.read_tensor_from_dram(ue.PE_SIN_X + x_px * 128 * bpe, 128)
+            cos_x_row = ue.read_tensor_from_dram(ue.PE_COS_X + x_px * 128 * bpe, 128)
+            sin_y_row = ue.read_tensor_from_dram(ue.PE_SIN_Y + y_px * 128 * bpe, 128)
+            cos_y_row = ue.read_tensor_from_dram(ue.PE_COS_Y + y_px * 128 * bpe, 128)
+            ue.dma_to_accelerator_memory(ue.PE_SX_SLOT, sin_x_row.contiguous())
+            ue.dma_to_accelerator_memory(ue.PE_CX_SLOT, cos_x_row.contiguous())
+            ue.dma_to_accelerator_memory(ue.PE_SY_SLOT, sin_y_row.contiguous())
+            ue.dma_to_accelerator_memory(ue.PE_CY_SLOT, cos_y_row.contiguous())
 
             t2 = _time.perf_counter()
             ue.run_hw(image_path, prog_addr)
@@ -2698,11 +4073,55 @@ def main():
         neck_ref = ue.cpu_reference_neck(vit_out_raw)
         ue.validate(ue.NECK_OUT, ue.GRID_AREA * ue.NECK_DIM, neck_ref, "Neck output (4096,256)")
 
-        # Validate decoder layer-0 self-attention + src init
-        _original_print("  Running CPU reference for decoder layer-0 self-attn...")
-        tokens_sa0_ref, src_ref = ue.cpu_reference_dec_sa0(cpu_tokens, neck_out)
-        ue.validate(ue.DEC_TOKENS, ue.DEC_NUM_TOKENS * ue.DEC_DIM,
-                    tokens_sa0_ref, "Dec layer-0 self-attn + norm1 (7,256)")
+        # ── Read and postprocess final outputs ────────────────────────────────
+        _t_post = _time.perf_counter()
+        # Mask logits: stored (65536, 64) padded — only first 4 cols per row are real
+        mask_logits = ue.read_tensor_from_dram(
+            ue.DEC_MASK_LOGITS, 256 * 256 * 64).reshape(256 * 256, 64).float()
+        mask_logits = mask_logits[:, :4].T.contiguous().reshape(4, 256, 256)
+        _original_print(f"  Mask logit stats: min={mask_logits.min():.4f}  max={mask_logits.max():.4f}  "
+                        f"mean={mask_logits.mean():.4f}  positive_pct={100*(mask_logits>0).float().mean():.1f}%")
+
+        # IoU scores: stored padded (64,) — only first 4 real
+        iou_scores = ue.read_tensor_from_dram(ue.DEC_IOU_OUT, 64).float()[:4]
+        _original_print(f"  IoU scores: {iou_scores.tolist()}")
+
+        # Sigmoid → probabilities, select best mask by IoU
+        mask_probs = torch.sigmoid(mask_logits)          # (4, 256, 256)
+        best_idx   = int(iou_scores.argmax())
+        best_mask  = mask_probs[best_idx]                # (256, 256)
+        _original_print(f"  Best mask idx: {best_idx}  IoU: {iou_scores[best_idx]:.4f}")
+
+        # Upsample 256×256 → 1024×1024 (4× bilinear, matches SAM's original resolution)
+        mask_1024 = torch.nn.functional.interpolate(
+            best_mask.unsqueeze(0).unsqueeze(0),
+            size=(1024, 1024), mode="bilinear", align_corners=False,
+        ).squeeze()                                      # (1024, 1024)
+
+        # Threshold at 0.5 → binary mask
+        binary_mask = (mask_1024 > 0.5).numpy().astype("uint8") * 255
+
+        # Save output
+        import numpy as np
+        out_dir  = os.path.join(SCRIPT_DIR, "sam1_vit_b_bin")
+        out_path = os.path.join(out_dir, "mask_output.png")
+        os.makedirs(out_dir, exist_ok=True)
+        Image.fromarray(binary_mask).save(out_path)
+        _original_print(f"  Mask saved → {out_path}")
+        _original_print(f"  Postprocess (readback+sigmoid+upsample+save): {_time.perf_counter() - _t_post:.3f}s")
+
+        # Overlay on original image for visualization
+        try:
+            orig_img = Image.open(image_path).convert("RGB").resize((1024, 1024))
+            overlay  = np.array(orig_img).copy()
+            overlay[binary_mask > 0] = (overlay[binary_mask > 0] * 0.5 + np.array([0, 255, 0]) * 0.5).astype("uint8")
+            overlay_path = os.path.join(out_dir, "mask_overlay.png")
+            Image.fromarray(overlay).save(overlay_path)
+            _original_print(f"  Overlay saved → {overlay_path}")
+        except Exception as e:
+            _original_print(f"  Overlay failed: {e}")
+
+        _original_print(f"  Total end-to-end: {_time.perf_counter() - _t_total:.3f}s")
 
 
 if __name__ == "__main__":
