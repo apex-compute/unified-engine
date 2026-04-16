@@ -1234,14 +1234,21 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         # Prompt encoder sin/cos lookup tables for hardware PE computation.
         # Host selects 4 rows (128 bf16 each) for (x_px, y_px) before execution.
         _pe_mat_f = sd["shared_image_embedding.positional_embedding"].float()  # (2, 128)
-        _coords_x = torch.arange(1024, dtype=torch.float32) / 1024.0           # (1024,)
-        _coords_y = torch.arange(1024, dtype=torch.float32) / 1024.0           # (1024,)
+        _coords_x = 2 * torch.arange(1024, dtype=torch.float32) / 1024.0 - 1.0   # [-1, 1) range
+        _coords_y = 2 * torch.arange(1024, dtype=torch.float32) / 1024.0 - 1.0   # [-1, 1) range
         _proj_x = 2 * math.pi * _coords_x.unsqueeze(1) * _pe_mat_f[0:1, :]     # (1024, 128)
         _proj_y = 2 * math.pi * _coords_y.unsqueeze(1) * _pe_mat_f[1:2, :]     # (1024, 128)
         self.PE_SIN_X = self._alloc_param(torch.sin(_proj_x).to(torch.bfloat16))  # (1024, 128)
         self.PE_COS_X = self._alloc_param(torch.cos(_proj_x).to(torch.bfloat16))  # (1024, 128)
         self.PE_SIN_Y = self._alloc_param(torch.sin(_proj_y).to(torch.bfloat16))  # (1024, 128)
         self.PE_COS_Y = self._alloc_param(torch.cos(_proj_y).to(torch.bfloat16))  # (1024, 128)
+
+        # PE input slots — in params region so firmware tensor-region overruns can never reach them.
+        # Host writes the 4 sin/cos rows for the input point here before execution.
+        self.PE_SX_SLOT = self._alloc_param(torch.zeros(128, dtype=torch.bfloat16))
+        self.PE_CX_SLOT = self._alloc_param(torch.zeros(128, dtype=torch.bfloat16))
+        self.PE_SY_SLOT = self._alloc_param(torch.zeros(128, dtype=torch.bfloat16))
+        self.PE_CY_SLOT = self._alloc_param(torch.zeros(128, dtype=torch.bfloat16))
 
         # Image positional encoding: constant 64×64 grid PE stored as param.
         # Used as key_pe in every cross-attention call.
@@ -1567,21 +1574,6 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         self.DEC_QUERY_PE    = self._alloc_tensor(NT * DD)             # (7, 256) token PE
         self.DEC_KEY_PE      = self._alloc_tensor(GA * DD)             # (4096, 256) dense image PE
 
-        # Prompt encoder PE scratch: 4 × 128 bf16 slots for host-selected rows
-        # Host writes SIN_X[x], COS_X[x], SIN_Y[y], COS_Y[y] before execution.
-        self.PE_SX_SLOT = self._alloc_tensor(128)   # SIN_X[x_px, :]
-        self.PE_CX_SLOT = self._alloc_tensor(128)   # COS_X[x_px, :]
-        self.PE_SY_SLOT = self._alloc_tensor(128)   # SIN_Y[y_px, :]
-        self.PE_CY_SLOT = self._alloc_tensor(128)   # COS_Y[y_px, :]
-        # Intermediate PE computation buffers (128 elements each)
-        self.PE_TMP1    = self._alloc_tensor(128)   # sin(A)*cos(B)
-        self.PE_TMP2    = self._alloc_tensor(128)   # cos(A)*sin(B)
-        self.PE_TMP3    = self._alloc_tensor(128)   # cos(A)*cos(B)
-        self.PE_TMP4    = self._alloc_tensor(128)   # sin(A)*sin(B)
-        self.PE_SIN_OUT = self._alloc_tensor(128)   # pe_sin = sin(A+B)
-        self.PE_COS_OUT = self._alloc_tensor(128)   # pe_cos = cos(A+B)
-        self.PE_FG_TOK  = self._alloc_tensor(256)   # final fg_token (pe_sin||pe_cos + point_embed_1)
-
         # t2i cross-attn buffers
         # K and V projections for image side: (4096, 512) each
         CA_HDP = 64   # head_dim padded
@@ -1631,8 +1623,23 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         # Final mask logits: padded to (65536, 64); only first 4 cols per row real
         self.DEC_MASK_LOGITS = self._alloc_tensor(65536 * 64)                    # (65536, 64)
 
+        # Prompt encoder PE scratch — in PARAMS region (see weight_init), safe from tensor overruns.
+        self.PE_TMP1    = self._alloc_tensor(128)   # sin(A)*cos(B)
+        self.PE_TMP2    = self._alloc_tensor(128)   # cos(A)*sin(B)
+        self.PE_TMP3    = self._alloc_tensor(128)   # cos(A)*cos(B)
+        self.PE_TMP4    = self._alloc_tensor(128)   # sin(A)*sin(B)
+        self.PE_SIN_OUT = self._alloc_tensor(128)   # pe_sin = sin(A+B)
+        self.PE_COS_OUT = self._alloc_tensor(128)   # pe_cos = cos(A+B)
+        self.PE_FG_TOK  = self._alloc_tensor(256)   # final fg_token (pe_sin||pe_cos + point_embed_1)
+
         tensor_used = self.get_tensor_dram_usage()
-        _original_print(f"  Tensors allocated: {tensor_used / 1024**2:.1f} MB")
+        tensor_end  = SAM1_TENSOR_BASE + tensor_used
+        _original_print(f"  Tensors allocated: {tensor_used / 1024**2:.1f} MB  "
+                        f"(0x{SAM1_TENSOR_BASE:08X} – 0x{tensor_end:08X})")
+        _original_print(f"  Instruction region starts: 0x{SAM1_PROGRAM_BASE:08X}  "
+                        f"{'*** OVERLAP ***' if tensor_end > SAM1_PROGRAM_BASE else 'OK, no overlap'}")
+        _original_print(f"  PE_SX_SLOT addr: 0x{self.PE_SX_SLOT:08X}  "
+                        f"DEC_KEY_PE ends:  0x{self.DEC_KEY_PE + self.GRID_AREA * self.DEC_DIM * 2:08X}")
 
     # ------------------------------------------------------------------
     # Program compilation
@@ -2115,6 +2122,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         dram_copy(self, self.DEC_POS_SRC, self.DEC_KEY_PE, self.GRID_AREA * _DD)
 
         _original_print(f"  [compile] prompt encoder: {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
+        if getattr(self, '_checkpoint_after_pe', False):
+            raise _CheckpointStop("after prompt encoder")
 
         # ==============================================================
         # PHASE 4: MASK DECODER — layer 0, self-attention
@@ -4042,15 +4051,25 @@ def main():
             TEST_POINT = (512.0, 512.0)
             x_px = int(TEST_POINT[0])
             y_px = int(TEST_POINT[1])
-            bpe = 2
-            sin_x_row = ue.read_tensor_from_dram(ue.PE_SIN_X + x_px * 128 * bpe, 128)
-            cos_x_row = ue.read_tensor_from_dram(ue.PE_COS_X + x_px * 128 * bpe, 128)
-            sin_y_row = ue.read_tensor_from_dram(ue.PE_SIN_Y + y_px * 128 * bpe, 128)
-            cos_y_row = ue.read_tensor_from_dram(ue.PE_COS_Y + y_px * 128 * bpe, 128)
+            # Recompute sin/cos rows on CPU — PE_SIN_X/Y are params (not tensor region),
+            # so read_tensor_from_dram cannot address them. Same formula as weight_init.
+            _ckpt    = _ensure_checkpoint(ue.script_dir, ue.cfg)
+            _sd_pe   = _load_sam1_state_dict(_ckpt)
+            _pe_mat  = _sd_pe["shared_image_embedding.positional_embedding"].float()  # (2, 128)
+            _proj_x  = 2 * math.pi * (2 * (x_px / 1024.0) - 1) * _pe_mat[0]   # (128,)
+            _proj_y  = 2 * math.pi * (2 * (y_px / 1024.0) - 1) * _pe_mat[1]   # (128,)
+            sin_x_row = torch.sin(_proj_x).to(torch.bfloat16)
+            cos_x_row = torch.cos(_proj_x).to(torch.bfloat16)
+            sin_y_row = torch.sin(_proj_y).to(torch.bfloat16)
+            cos_y_row = torch.cos(_proj_y).to(torch.bfloat16)
             ue.dma_to_accelerator_memory(ue.PE_SX_SLOT, sin_x_row.contiguous())
             ue.dma_to_accelerator_memory(ue.PE_CX_SLOT, cos_x_row.contiguous())
             ue.dma_to_accelerator_memory(ue.PE_SY_SLOT, sin_y_row.contiguous())
             ue.dma_to_accelerator_memory(ue.PE_CY_SLOT, cos_y_row.contiguous())
+            # ── Pre-execution DMA verify ───────────────────────────────────────
+            _original_print(f"  [verify 1] CPU sin_x_row (what we computed): min={sin_x_row.float().min():.4f}  max={sin_x_row.float().max():.4f}  (expect in [-1, 1])")
+            _verify = ue.read_tensor_from_dram(ue.PE_SX_SLOT, 128).float()
+            _original_print(f"  [verify 2] PE_SX_SLOT readback (after DMA, before run): min={_verify.min():.4f}  max={_verify.max():.4f}  (expect same as verify 1)")
 
             t2 = _time.perf_counter()
             ue.run_hw(image_path, prog_addr)
@@ -4072,6 +4091,64 @@ def main():
         vit_out_raw = vit_out_raw.reshape(ue.GRID_AREA, ue.VIT_DIM)
         neck_ref = ue.cpu_reference_neck(vit_out_raw)
         ue.validate(ue.NECK_OUT, ue.GRID_AREA * ue.NECK_DIM, neck_ref, "Neck output (4096,256)")
+
+        # ── Decoder NaN probe sweep ────────────────────────────────────────────
+        def _probe(label, addr, numel):
+            t = ue.read_tensor_from_dram(addr, numel).float()
+            nan_n = torch.isnan(t).sum().item()
+            inf_n = torch.isinf(t).sum().item()
+            fin   = t[torch.isfinite(t)]
+            if fin.numel() > 0:
+                rng = f"[{fin.min():.4f}, {fin.max():.4f}]"
+            else:
+                rng = "[no finite]"
+            _original_print(f"  probe {label:<28s}  nan={nan_n:>7d}  inf={inf_n:>7d}  fin_range={rng}")
+            assert nan_n == 0 and inf_n == 0, f"NaN/Inf detected in {label}: nan={nan_n}, inf={inf_n}, fin_range={rng}"
+
+        GA = ue.GRID_AREA        # 4096
+        DD = ue.DEC_DIM          # 256
+        _original_print("  ── decoder probe sweep ──")
+        # Prompt encoder intermediates — must all be finite before DEC_TOKENS is assembled
+        _probe("PE_SX_SLOT (128)",           ue.PE_SX_SLOT,           128)
+        _probe("PE_CX_SLOT (128)",           ue.PE_CX_SLOT,           128)
+        _probe("PE_SY_SLOT (128)",           ue.PE_SY_SLOT,           128)
+        _probe("PE_CY_SLOT (128)",           ue.PE_CY_SLOT,           128)
+        _probe("PE_TMP1 sinX*cosY",          ue.PE_TMP1,              128)
+        _probe("PE_TMP2 cosX*sinY",          ue.PE_TMP2,              128)
+        _probe("PE_TMP3 cosX*cosY",          ue.PE_TMP3,              128)
+        _probe("PE_TMP4 sinX*sinY",          ue.PE_TMP4,              128)
+        _probe("PE_SIN_OUT",                 ue.PE_SIN_OUT,           128)
+        _probe("PE_COS_OUT",                 ue.PE_COS_OUT,           128)
+        _probe("PE_FG_TOK (256)",            ue.PE_FG_TOK,            256)
+        _probe("PE_POINT_EMBED_FG (256)",    ue.PE_POINT_EMBED_FG,    256)
+        _probe("PE_NOT_A_POINT (256)",       ue.PE_NOT_A_POINT,       256)
+        _probe("DEC_IOU_TOKEN (256)",        ue.DEC_IOU_TOKEN,        256)
+        _probe("DEC_MASK_TOKENS (4,256)",    ue.DEC_MASK_TOKENS,      4 * DD)
+        _probe("DEC_TOKENS (7,256)",         ue.DEC_TOKENS,           7  * DD)
+        _probe("DEC_SRC (4096,256)",         ue.DEC_SRC,              GA * DD)
+        _probe("DEC_TOKENS_NORM (7,256)",    ue.DEC_TOKENS_NORM,      7  * DD)
+        _probe("DEC_SA_Q_HEADS (8,64,64)",   ue.DEC_SA_Q_HEADS,       8  * 64 * 64)
+        _probe("DEC_SA_OUT_HEADS",           ue.DEC_SA_OUT_HEADS,     8  * 64 * 64)
+        _probe("DEC_SA_MERGED (7,256)",      ue.DEC_SA_MERGED,        7  * DD)
+        _probe("DEC_CA_T2I_K (4096,512)",    ue.DEC_CA_T2I_K,         GA * 8 * 64)
+        _probe("DEC_CA_SCORES (7,4096)",     ue.DEC_CA_SCORES,        7  * GA)
+        _probe("DEC_CA_OUT_HEADS (8,7,64)",  ue.DEC_CA_OUT_HEADS,     8  * 7 * 64)
+        _probe("DEC_CA_T2I_MERGED (7,128)",  ue.DEC_CA_T2I_MERGED,    7  * 128)
+        _probe("DEC_MLP_INTER (7,2048)",     ue.DEC_MLP_INTER,        7  * 2048)
+        _probe("DEC_CA_I2T_K_PAD (64,512)", ue.DEC_CA_I2T_K_PAD,     64 * 8 * 64)
+        _probe("DEC_CA_I2T_SCORES (4096,64)",ue.DEC_CA_I2T_SCORES,    GA * 64)
+        _probe("DEC_CA_I2T_OUT (8,4096,64)", ue.DEC_CA_I2T_OUT_HEADS, 8  * GA * 64)
+        _probe("DEC_CA_I2T_MERGED (4096,128)",ue.DEC_CA_I2T_MERGED,   GA * 128)
+        _probe("DEC_UP0_OUT (16384,64)",     ue.DEC_UP0_OUT,          4  * GA * 64)
+        _probe("DEC_UP1_OUT (65536,64)",     ue.DEC_UP1_OUT,          65536 * 64)
+        _probe("DEC_HYPER_OUT (64,64)",      ue.DEC_HYPER_OUT,        64 * 64)
+        _probe("DEC_IOU_OUT (64,)",          ue.DEC_IOU_OUT,          64)
+        _probe("DEC_MASK_LOGITS (65536,64)", ue.DEC_MASK_LOGITS,      65536 * 64)
+        # Guard diagnostic — read BEFORE DEC_TOKENS assert so it's always visible
+        _g = ue.read_tensor_from_dram(ue._DEC_MASK_LOGITS_GUARD, 131072).float()
+        _g_nonzero = (_g != 0).sum().item()
+        _original_print(f"  guard after DEC_MASK_LOGITS: {_g_nonzero}/131072 non-zero (firmware overrun size diagnostic)")
+        _original_print("  ── end probe sweep ──")
 
         # ── Read and postprocess final outputs ────────────────────────────────
         _t_post = _time.perf_counter()
