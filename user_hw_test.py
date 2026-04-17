@@ -1609,6 +1609,97 @@ def fmax_test(length: int = 256):
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
+
+def recurrent_gated_delta_rule_core_test(T: int, num_heads: int, Dk: int, Dv: int):
+    """
+    Tests recurrent_gated_delta_rule_core against a pure-torch reference.
+    """
+    ue = UnifiedEngine()
+
+    bytes_per_element = 2
+
+    Q_DRAM_ADDR      = ue.allocate_tensor_dram(T * num_heads * Dk * bytes_per_element)
+    K_DRAM_ADDR      = ue.allocate_tensor_dram(T * num_heads * Dk * bytes_per_element)
+    V_DRAM_ADDR      = ue.allocate_tensor_dram(T * num_heads * Dv * bytes_per_element)
+    S_DRAM_ADDR      = ue.allocate_tensor_dram(num_heads * Dk * Dv * bytes_per_element)
+    OUT_DRAM_ADDR    = ue.allocate_tensor_dram(T * num_heads * Dv * bytes_per_element)
+    SCRATCH_DRAM_ADDR = ue.allocate_tensor_dram(num_heads * (2 * Dk * Dv + Dv) * bytes_per_element)
+
+    ue.start_capture()
+
+    # Random inputs (bf16 for hw, float32 for reference)
+    q = torch.randn(T, num_heads, Dk, dtype=torch.bfloat16)
+    k = torch.randn(T, num_heads, Dk, dtype=torch.bfloat16)
+    v = torch.randn(T, num_heads, Dv, dtype=torch.bfloat16)
+    alpha = (torch.rand(T, num_heads) * 0.5 + 0.5).to(torch.bfloat16)  # (0.5, 1.0)
+    beta  = torch.rand(T, num_heads).to(torch.bfloat16)
+
+    ue.recurrent_gated_delta_rule_core(
+        T=T, num_heads=num_heads, Dk=Dk, Dv=Dv,
+        Q_DRAM_ADDR=Q_DRAM_ADDR,
+        K_DRAM_ADDR=K_DRAM_ADDR,
+        V_DRAM_ADDR=V_DRAM_ADDR,
+        S_DRAM_ADDR=S_DRAM_ADDR,
+        OUT_DRAM_ADDR=OUT_DRAM_ADDR,
+        SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+        alpha_host=alpha,
+        beta_host=beta,
+        k_host=k,
+    )
+
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    # DMA inputs to FPGA
+    ue.dma_to_accelerator_memory(Q_DRAM_ADDR, q.reshape(T * num_heads, Dk))
+    ue.dma_to_accelerator_memory(K_DRAM_ADDR, k.reshape(T * num_heads, Dk))
+    ue.dma_to_accelerator_memory(V_DRAM_ADDR, v.reshape(T * num_heads, Dv))
+    ue.dma_to_accelerator_memory(S_DRAM_ADDR, torch.zeros(num_heads * Dk, Dv, dtype=torch.bfloat16))
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(120.0)
+    ue.report_timing_and_instruction_count()
+
+    # Read back output and final state
+    output = ue.dma_from_accelerator_memory(OUT_DRAM_ADDR, (T * num_heads, Dv))
+    final_S = ue.dma_from_accelerator_memory(S_DRAM_ADDR, (num_heads * Dk, Dv))
+
+    # Pure-torch reference (bf16 arithmetic to match hw precision)
+    q_f = q.float()
+    k_f = k.float()
+    v_f = v.float()
+    alpha_f = alpha.float()
+    beta_f  = beta.float()
+
+    S_ref = torch.zeros(num_heads, Dk, Dv)
+    out_ref = torch.zeros(T, num_heads, Dv)
+    for t in range(T):
+        for h in range(num_heads):
+            S_ref[h] = alpha_f[t, h] * S_ref[h]
+            m = k_f[t, h] @ S_ref[h]
+            delta = beta_f[t, h] * (v_f[t, h] - m)
+            S_ref[h] = S_ref[h] + torch.outer(k_f[t, h], delta)
+            out_ref[t, h] = q_f[t, h] @ S_ref[h]
+
+    ref_out_flat = out_ref.reshape(T * num_heads, Dv)
+    ref_S_flat   = S_ref.reshape(num_heads * Dk, Dv)
+
+    snr_out = calculate_snr(ref_out_flat, output)
+    snr_S   = calculate_snr(ref_S_flat, final_S)
+    print(f"Gated DeltaNet core SNR (output): {snr_out:.2f} dB  "
+          f"(T={T}, num_heads={num_heads}, Dk={Dk}, Dv={Dv})")
+    print(f"Gated DeltaNet core SNR (state):  {snr_S:.2f} dB")
+    assert snr_out >= 25 or snr_out == float('inf'), \
+        f"Output SNR {snr_out:.2f} dB must be at least 25 dB"
+    assert snr_S >= 25 or snr_S == float('inf'), \
+        f"State SNR {snr_S:.2f} dB must be at least 25 dB"
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
 def software_reset_test():
     """
     Verifies that software reset breaks a deterministic deadlock caused
@@ -1719,6 +1810,7 @@ if __name__ == "__main__":
     quantized_matmat_mul_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
     matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix")
     flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True)
+    recurrent_gated_delta_rule_core_test(T=8, num_heads=4, Dk=128, Dv=128)
     rms_norm_test(shape=(768, 1024))
     layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True)
     matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)

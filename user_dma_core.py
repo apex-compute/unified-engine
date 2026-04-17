@@ -3046,6 +3046,137 @@ class UnifiedEngine:
         print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
         return total_flops
 
+    def recurrent_gated_delta_rule_core(self, T: int, num_heads: int, Dk: int, Dv: int,
+                            Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int,
+                            S_DRAM_ADDR: int, OUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int,
+                            alpha_host: torch.Tensor, beta_host: torch.Tensor,
+                            k_host: torch.Tensor) -> None:
+        """Emit-only recurrence kernel for Gated DeltaNet -- implements HF's
+        `torch_recurrent_gated_delta_rule` as a single FPGA capture covering T
+        tokens, all heads.  Same usage pattern as flash_attention_core: caller
+        wraps with start_capture / stop_capture / execute.
+
+        SCOPE: This core covers ONLY the recurrence step (steps "kv_mem/delta/
+        state_update/output" in HF's rule).  The full Gated DeltaNet layer also
+        needs (upstream) input RMSNorm + in_proj_qkv + causal conv1d + SiLU +
+        split/head-reshape + L2-norm(q,k) + alpha/beta computation, and
+        (downstream) RMSNormGated(core_out, z) + out_proj + residual add.
+        Those are composed in the model template around this core.
+
+        Implements per-token recurrence:
+            S = alpha * S
+            m = k @ S                         (matvec)
+            delta = beta * (v - m)
+            S = S + outer(k, delta)           (Dk broadcast_muls)
+            o = q @ S                         (matvec)
+
+        Args:
+            T:              sequence length (number of tokens)
+            num_heads:      number of attention heads
+            Dk:             head key dimension (e.g. 128)
+            Dv:             head value dimension (e.g. 128)
+            Q_DRAM_ADDR:    [T * num_heads, Dk]  query, interleaved (t0h0, t0h1, ..., t1h0, ...)
+            K_DRAM_ADDR:    [T * num_heads, Dk]  key, same layout
+            V_DRAM_ADDR:    [T * num_heads, Dv]  value, same layout
+            S_DRAM_ADDR:    [num_heads, Dk, Dv]  persistent state (read & written)
+            OUT_DRAM_ADDR:  [T * num_heads, Dv]  output, same layout as Q/K/V
+            SCRATCH_DRAM_ADDR:  >= num_heads * (2 * Dk * Dv + Dv) * 2 bytes
+            alpha_host:     [T, num_heads]  host tensor, data-dependent decay
+            beta_host:      [T, num_heads]  host tensor, data-dependent update gate
+            k_host:         [T, num_heads, Dk]  host tensor, same data as K_DRAM
+        """
+        bytes_per_element = 2
+
+        # SRAM addresses — reused per (token, head).  matmat_mul_core clobbers URAM
+        # internally, so SRAM state does not persist across matvec calls.
+        SA_MAT   = 0x00000  # S / alpha*S / m
+        SA_V     = 0x00400  # v
+        SA_DELTA = 0x00800  # beta*v -> delta
+        SA_OUTER = 0x10000  # outer matrix (Dk rows of Dv)
+        SB_AS    = 0x80000  # alpha*S reload for eltwise_add
+        SB_NBM   = 0x90000  # -beta*m scratch
+
+        # Per-head scratch in DRAM:
+        #   ALPHA_S   [Dk, Dv]  -- alpha*S (original layout, for step 5 eltwise_add)
+        #   S_T       [Dv, Dk]  -- transposed S (reused for alpha*S^T and S_new^T)
+        #   M_VEC     [Dv]      -- matvec output m
+        head_scratch_size = (2 * Dk * Dv + Dv) * bytes_per_element
+        def _alpha_s_addr(h):
+            return SCRATCH_DRAM_ADDR + h * head_scratch_size
+        def _s_t_addr(h):
+            return SCRATCH_DRAM_ADDR + h * head_scratch_size + Dk * Dv * bytes_per_element
+        def _m_addr(h):
+            return SCRATCH_DRAM_ADDR + h * head_scratch_size + 2 * Dk * Dv * bytes_per_element
+
+        for t in range(T):
+            for h in range(num_heads):
+                q_addr = Q_DRAM_ADDR + (t * num_heads + h) * Dk * bytes_per_element
+                k_addr = K_DRAM_ADDR + (t * num_heads + h) * Dk * bytes_per_element
+                v_addr = V_DRAM_ADDR + (t * num_heads + h) * Dv * bytes_per_element
+                S_h    = S_DRAM_ADDR + h * Dk * Dv * bytes_per_element
+                o_addr = OUT_DRAM_ADDR + (t * num_heads + h) * Dv * bytes_per_element
+
+                a = float(alpha_host[t, h].item())
+                b = float(beta_host[t, h].item())
+
+                # step 1: alpha * S  (SRAM broadcast_mul, write to scratch DRAM)
+                self.accelerator_memory_to_sram(accelerator_dram_address=S_h,
+                                                sram_address=SA_MAT,
+                                                element_size=Dk * Dv)
+                self.broadcast_mul(scalar=a, sram_start_addr=SA_MAT,
+                                   sram_wb_addr=SA_MAT, element_size=Dk * Dv)
+                self.sram_to_accelerator_memory(sram_address=SA_MAT,
+                                                accelerator_dram_address=_alpha_s_addr(h),
+                                                element_size=Dk * Dv)
+
+                # step 1b: transpose alpha*S [Dk,Dv] -> [Dv,Dk] for correct matvec
+                # matmat_mul_core computes A @ B^T, so B must store S^T to get A @ S.
+                self.bf16_transpose_core(M=Dk, N=Dv,
+                                         INPUT_DRAM_ADDR=_alpha_s_addr(h),
+                                         OUTPUT_DRAM_ADDR=_s_t_addr(h))
+
+                # step 2: m = k @ alpha*S  (matvec: k[1,Dk] @ S^T^T[Dk,Dv] = k @ S)
+                self.matmat_mul_core(M=1, K=Dk, N=Dv,
+                                    A_DRAM_ADDR=k_addr, B_DRAM_ADDR=_s_t_addr(h),
+                                    OUTPUT_DRAM_ADDR=_m_addr(h), is_B_quantized=False)
+
+                # step 3: delta = beta*v + (-beta)*m  (SRAM ops, A/B banks for eltwise_add)
+                self.accelerator_memory_to_sram(accelerator_dram_address=_m_addr(h),
+                                                sram_address=SA_MAT, element_size=Dv)
+                self.accelerator_memory_to_sram(accelerator_dram_address=v_addr,
+                                                sram_address=SA_V, element_size=Dv)
+                self.broadcast_mul(scalar=-b, sram_start_addr=SA_MAT,
+                                   sram_wb_addr=SB_NBM, element_size=Dv)
+                self.broadcast_mul(scalar=b, sram_start_addr=SA_V,
+                                   sram_wb_addr=SA_DELTA, element_size=Dv)
+                self.eltwise_add_core(SA_DELTA, SB_NBM, SA_DELTA, Dv)
+
+                # step 4: outer(k, delta) via Dk broadcast_muls
+                kh = k_host[t, h]
+                for i in range(Dk):
+                    ki = float(kh[i].item())
+                    self.broadcast_mul(scalar=ki, sram_start_addr=SA_DELTA,
+                                       sram_wb_addr=SA_OUTER + i * Dv * bytes_per_element,
+                                       element_size=Dv)
+
+                # step 5: S_new = alpha*S + outer  (reload alpha*S to URAM_B, eltwise_add)
+                self.accelerator_memory_to_sram(accelerator_dram_address=_alpha_s_addr(h),
+                                                sram_address=SB_AS, element_size=Dk * Dv)
+                self.eltwise_add_core(SA_OUTER, SB_AS, SB_AS, Dk * Dv)
+                self.sram_to_accelerator_memory(sram_address=SB_AS,
+                                                accelerator_dram_address=S_h,
+                                                element_size=Dk * Dv)
+
+                # step 5b: transpose S_new [Dk,Dv] -> [Dv,Dk] for step 6 matvec
+                self.bf16_transpose_core(M=Dk, N=Dv,
+                                         INPUT_DRAM_ADDR=S_h,
+                                         OUTPUT_DRAM_ADDR=_s_t_addr(h))
+
+                # step 6: o = q @ S_new  (matvec: q[1,Dk] @ S^T^T[Dk,Dv] = q @ S)
+                self.matmat_mul_core(M=1, K=Dk, N=Dv,
+                                    A_DRAM_ADDR=q_addr, B_DRAM_ADDR=_s_t_addr(h),
+                                    OUTPUT_DRAM_ADDR=o_addr, is_B_quantized=False)
+
     def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, relu_enable: bool = False) -> None:
         """Quantized matrix-matrix multiplication core.
         Args:
