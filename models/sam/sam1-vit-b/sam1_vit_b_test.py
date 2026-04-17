@@ -1549,7 +1549,36 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         HD   = self.DEC_HEAD_DIM     # 32
         HDP  = 64                    # padded head_dim for self-attn
         self.DEC_TOKENS      = self._alloc_tensor(NT * DD)   # (7, 256) prompt + output tokens
+        # ── DEBUG: per-stage DEC_TOKENS snapshots (single-run NaN bisection) ──
+        # 10 slots × (7,256) bf16 = 35 KB total. Populated by dram_copy after each
+        # Phase 4 stage that writes DEC_TOKENS; probed from the host post-run to
+        # find which stage first introduces NaN.
+        self.DEC_SNAP_TOK    = self._alloc_tensor(NT * DD)   # after prompt-encoder assembly
+        self.DEC_SNAP_SA0    = self._alloc_tensor(NT * DD)   # after layer 0 self-attn + norm1
+        self.DEC_SNAP_T2I0   = self._alloc_tensor(NT * DD)   # after layer 0 t2i  + norm2
+        self.DEC_SNAP_MLP0   = self._alloc_tensor(NT * DD)   # after layer 0 MLP  + norm3
+        self.DEC_SNAP_LAYER0 = self._alloc_tensor(NT * DD)   # after layer 0 i2t  (tokens unchanged)
+        self.DEC_SNAP_SA1    = self._alloc_tensor(NT * DD)   # after layer 1 self-attn + norm1
+        self.DEC_SNAP_T2I1   = self._alloc_tensor(NT * DD)   # after layer 1 t2i  + norm2
+        self.DEC_SNAP_MLP1   = self._alloc_tensor(NT * DD)   # after layer 1 MLP  + norm3
+        self.DEC_SNAP_LAYER1 = self._alloc_tensor(NT * DD)   # after layer 1 i2t  (tokens unchanged)
+        self.DEC_SNAP_FINAL  = self._alloc_tensor(NT * DD)   # after final t2i + final_norm
+        # ── DEBUG: per-stage DEC_QUERY_PE snapshots to bisect who corrupts it ──
+        # DEC_QUERY_PE is a read-only buffer assembled in Phase 3b. t2i0 succeeds
+        # (so it was clean then), t2i1 produces all-NaN (so it was corrupted by
+        # then). 10 slots × 7*256 bf16 = 35 KB total.
+        self.DEC_QPE_SNAP_TOK    = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_SA0    = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_T2I0   = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_MLP0   = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_LAYER0 = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_SA1    = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_T2I1   = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_MLP1   = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_LAYER1 = self._alloc_tensor(NT * DD)
+        self.DEC_QPE_SNAP_FINAL  = self._alloc_tensor(NT * DD)
         self.DEC_SRC         = self._alloc_tensor(GA * DD)   # (4096, 256) image src
+        self.DEC_I2T_RES     = self._alloc_tensor(GA * DD)   # (4096, 256) i2t out-proj result
         self.DEC_TOKENS_NORM = self._alloc_tensor(NT * DD)   # (7, 256) LN scratch
         self.DEC_Q           = self._alloc_tensor(NT * DH * 64)  # (7, 512) padded proj Q
         self.DEC_K           = self._alloc_tensor(NT * DH * 64)  # (7, 512) padded proj K
@@ -2114,12 +2143,16 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         dram_copy(self, self.DEC_MASK_TOKENS, self.DEC_TOKENS + 1*_DD*bpe, 4*_DD)     # rows 1-4
         dram_copy(self, self.PE_FG_TOK,       self.DEC_TOKENS + 5*_DD*bpe, _DD)       # row 5
         dram_copy(self, self.PE_NOT_A_POINT,  self.DEC_TOKENS + 6*_DD*bpe, _DD)       # row 6 (NO PE)
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_TOK, self.DEC_NUM_TOKENS * _DD)  # snapshot: assembly
 
         # Step 5: DEC_QUERY_PE = DEC_TOKENS (tokens serve as their own PE in cross-attn)
         dram_copy(self, self.DEC_TOKENS, self.DEC_QUERY_PE, self.DEC_NUM_TOKENS * _DD)
 
         # Step 6: DEC_KEY_PE = DEC_POS_SRC (precomputed at weight_init)
         dram_copy(self, self.DEC_POS_SRC, self.DEC_KEY_PE, self.GRID_AREA * _DD)
+
+        # QPE snapshot: baseline after PE assembly (before any decoder layer runs)
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_TOK, self.DEC_NUM_TOKENS * _DD)
 
         _original_print(f"  [compile] prompt encoder: {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
         if getattr(self, '_checkpoint_after_pe', False):
@@ -2260,6 +2293,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             GAMMA_DRAM_ADDR=lw0['norm1_w'],
             BETA_DRAM_ADDR=lw0['norm1_b'],
         )
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_SA0, NT * DD)  # snapshot: after SA0
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_SA0, NT * DD)
 
         # ── Layer 0: t2i cross-attention ───────────────────────────────────
         # q = tokens + query_pe, k = src + key_pe, v = src (no PE)
@@ -2393,6 +2428,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             GAMMA_DRAM_ADDR=lw0['norm2_w'],
             BETA_DRAM_ADDR=lw0['norm2_b'],
         )
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_T2I0, NT * DD)  # snapshot: after t2i0
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_T2I0, NT * DD)
 
         # ── Helper: i2t cross-attention (image attends to tokens) ──────────────
         # Shared constants already defined above: CA_HDP=64, CA_ID=128, CA_HD=16, N_CA=512
@@ -2546,15 +2583,19 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             )
 
             # out_proj: (4096, 128) → (4096, 256), residual, norm4
+            # NOTE: output must go to DEC_I2T_RES (2 MB), NOT DEC_TOKENS_NORM
+            # (3.5 KB) — the latter is sized for (NT, DD) and a (GA, DD) write
+            # overruns by ~2 MB, stomping DEC_SA_MERGED / DEC_QUERY_PE / start
+            # of DEC_KEY_PE (silent NaN corruption surfaces at t2i1).
             self.matmat_mul_core(
                 M=GA, K=CA_ID, N=DD,
                 A_DRAM_ADDR=self.DEC_CA_I2T_MERGED,
                 B_DRAM_ADDR=lw['ca_i2t_out_w'],
-                OUTPUT_DRAM_ADDR=self.DEC_TOKENS_NORM,
+                OUTPUT_DRAM_ADDR=self.DEC_I2T_RES,
                 C_DRAM_ADDR=lw['ca_i2t_out_b'],
                 bias_mode="broadcast_N",
             )
-            eltwise_add_dram(self, self.DEC_SRC, self.DEC_TOKENS_NORM,
+            eltwise_add_dram(self, self.DEC_SRC, self.DEC_I2T_RES,
                              self.DEC_SRC, GA * DD)
             self.layer_norm_core_dram(
                 M=GA, N=DD,
@@ -2821,14 +2862,26 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
 
         # ── Layer 0: remaining blocks (MLP + i2t) ─────────────────────────────
         _compile_mlp(lw0)
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_MLP0, NT * DD)    # snapshot: after MLP0
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_MLP0, NT * DD)
         _compile_i2t(lw0)
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_LAYER0, NT * DD)  # snapshot: end of layer 0
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_LAYER0, NT * DD)
 
         # ── Layer 1: sa1 + t2i1 + MLP1 + i2t1 ────────────────────────────────
         lw1 = self.dec_layer_weights[1]
         _compile_sa(lw1)
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_SA1, NT * DD)     # snapshot: after SA1
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_SA1, NT * DD)
         _compile_t2i(lw1)
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_T2I1, NT * DD)    # snapshot: after t2i1
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_T2I1, NT * DD)
         _compile_mlp(lw1)
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_MLP1, NT * DD)    # snapshot: after MLP1
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_MLP1, NT * DD)
         _compile_i2t(lw1)
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_LAYER1, NT * DD)  # snapshot: end of layer 1
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_LAYER1, NT * DD)
 
         # ── Final token→image cross-attention + layer_norm_final_attn ─────────
         # Uses dec_final_attn (padded Q/K/V weights) — no i2t, no MLP after this.
@@ -2847,6 +2900,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             out_norm_w=self.dec_final_norm['w'],
             out_norm_b=self.dec_final_norm['b'],
         )
+        dram_copy(self, self.DEC_TOKENS, self.DEC_SNAP_FINAL, NT * DD)   # snapshot: after final t2i
+        dram_copy(self, self.DEC_QUERY_PE, self.DEC_QPE_SNAP_FINAL, NT * DD)
 
         # ── Hypernetwork MLPs + IoU head ───────────────────────────────────────
         # Tokens layout after transformer:
@@ -3575,6 +3630,140 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         del sd
         return tokens.to(torch.bfloat16)
 
+    def cpu_reference_dec_full(self, cpu_tokens: torch.Tensor,
+                                neck_out:  torch.Tensor,
+                                query_pe:  torch.Tensor,
+                                key_pe:    torch.Tensor) -> dict:
+        """Full decoder transformer CPU reference, returning per-stage DEC_TOKENS.
+
+        Output keys mirror the HW snapshot names:
+            'tok', 'sa0', 't2i0', 'mlp0', 'layer0',
+            'sa1', 't2i1', 'mlp1', 'layer1', 'final'.
+        All tensors (7, 256) bf16. Each sub-op round-trips through bf16 to match HW.
+        """
+        import torch.nn.functional as F
+        sd = _load_sam1_state_dict(_ensure_checkpoint(self.script_dir, self.cfg))
+        md_tx = "mask_decoder.transformer."
+
+        NT, DD, GA = self.DEC_NUM_TOKENS, self.DEC_DIM, self.GRID_AREA
+        DH = self.DEC_HEADS
+        SA_HD = self.DEC_HEAD_DIM       # 32
+        CA_HD = self.DEC_INTERNAL_HD    # 16
+        CA_ID = self.DEC_INTERNAL_DIM   # 128
+
+        bf = lambda x: x.to(torch.bfloat16)
+        lin = lambda x, w, b: bf(F.linear(x.float(), w.float(), b.float()))
+
+        def ln(x, w, b):
+            mu  = x.float().mean(-1, keepdim=True)
+            ce  = x.float() - mu
+            rms = ce.pow(2).mean(-1, keepdim=True).sqrt()
+            return bf((ce / rms).to(torch.bfloat16).float() * w.float() + b.float())
+
+        def attn(q, k, v, hd):
+            # q: (Nq, DH*hd), k,v: (Nk, DH*hd). Returns (Nq, DH*hd) bf16.
+            Nq = q.shape[0]; Nk = k.shape[0]
+            Q = q.reshape(Nq, DH, hd).permute(1, 0, 2)     # (DH, Nq, hd)
+            K = k.reshape(Nk, DH, hd).permute(1, 0, 2)     # (DH, Nk, hd)
+            V = v.reshape(Nk, DH, hd).permute(1, 0, 2)
+            scale = 1.0 / math.sqrt(hd)
+            scores = torch.bmm(Q.float() * scale, K.float().transpose(-2, -1))
+            probs  = torch.softmax(bf(scores), dim=-1)
+            out    = torch.bmm(probs.float(), V.float())
+            return bf(out.permute(1, 0, 2).reshape(Nq, DH * hd))
+
+        def do_sa(tokens, lp, skip_pe):
+            q_in = tokens if skip_pe else bf(tokens.float() + query_pe.float())
+            k_in = q_in
+            v_in = tokens
+            Q = lin(q_in, sd[lp+"self_attn.q_proj.weight"], sd[lp+"self_attn.q_proj.bias"])
+            K = lin(k_in, sd[lp+"self_attn.k_proj.weight"], sd[lp+"self_attn.k_proj.bias"])
+            V = lin(v_in, sd[lp+"self_attn.v_proj.weight"], sd[lp+"self_attn.v_proj.bias"])
+            a = attn(Q, K, V, SA_HD)
+            o = lin(a, sd[lp+"self_attn.out_proj.weight"], sd[lp+"self_attn.out_proj.bias"])
+            t = bf(tokens.float() + o.float())
+            return ln(t, sd[lp+"layer_norm1.weight"], sd[lp+"layer_norm1.bias"])
+
+        def _dbg(tag, x):
+            if False:  # enable by flipping to True
+                xf = x.float()
+                nn = torch.isnan(xf).sum().item()
+                ii = torch.isinf(xf).sum().item()
+                fin = xf[torch.isfinite(xf)]
+                rng = f"[{fin.min():.3f},{fin.max():.3f}]" if fin.numel() > 0 else "[no finite]"
+                _original_print(f"    cpu_ref dbg {tag:<28s} shape={tuple(xf.shape)} nan={nn} inf={ii} range={rng}")
+
+        def do_t2i(tokens, src, lp, final=False, out_norm_w=None, out_norm_b=None):
+            q = bf(tokens.float() + query_pe.float())
+            k = bf(src.float()    + key_pe.float())
+            v = src
+            if final:
+                lp2 = md_tx + "final_attn_token_to_image."
+            else:
+                lp2 = lp + "cross_attn_token_to_image."
+            _dbg(f"t2i[{lp2[-10:]}] q",  q)
+            _dbg(f"t2i[{lp2[-10:]}] k",  k)
+            Q = lin(q, sd[lp2+"q_proj.weight"], sd[lp2+"q_proj.bias"]); _dbg(f"t2i Q",  Q)
+            K = lin(k, sd[lp2+"k_proj.weight"], sd[lp2+"k_proj.bias"]); _dbg(f"t2i K",  K)
+            V = lin(v, sd[lp2+"v_proj.weight"], sd[lp2+"v_proj.bias"]); _dbg(f"t2i V",  V)
+            a = attn(Q, K, V, CA_HD);                                   _dbg(f"t2i attn", a)
+            o = lin(a, sd[lp2+"out_proj.weight"], sd[lp2+"out_proj.bias"]); _dbg(f"t2i out_proj", o)
+            t = bf(tokens.float() + o.float());                         _dbg(f"t2i residual", t)
+            if final:
+                r = ln(t, out_norm_w, out_norm_b)
+            else:
+                r = ln(t, sd[lp+"layer_norm2.weight"], sd[lp+"layer_norm2.bias"])
+            _dbg(f"t2i after_norm", r)
+            return r
+
+        def do_i2t(tokens, src, lp):
+            # updates src in-place; returns new src
+            q = bf(src.float()    + key_pe.float())
+            k = bf(tokens.float() + query_pe.float())
+            v = tokens
+            lp2 = lp + "cross_attn_image_to_token."
+            Q = lin(q, sd[lp2+"q_proj.weight"], sd[lp2+"q_proj.bias"])
+            K = lin(k, sd[lp2+"k_proj.weight"], sd[lp2+"k_proj.bias"])
+            V = lin(v, sd[lp2+"v_proj.weight"], sd[lp2+"v_proj.bias"])
+            a = attn(Q, K, V, CA_HD)
+            o = lin(a, sd[lp2+"out_proj.weight"], sd[lp2+"out_proj.bias"])
+            s = bf(src.float() + o.float())
+            return ln(s, sd[lp+"layer_norm4.weight"], sd[lp+"layer_norm4.bias"])
+
+        def do_mlp(tokens, lp):
+            w1, b1 = sd[lp+"mlp.lin1.weight"], sd[lp+"mlp.lin1.bias"]
+            w2, b2 = sd[lp+"mlp.lin2.weight"], sd[lp+"mlp.lin2.bias"]
+            h = bf(F.gelu(lin(tokens, w1, b1).float()))
+            o = lin(h, w2, b2)
+            t = bf(tokens.float() + o.float())
+            return ln(t, sd[lp+"layer_norm3.weight"], sd[lp+"layer_norm3.bias"])
+
+        tokens = bf(cpu_tokens)
+        src    = bf(neck_out.float() + sd["prompt_encoder.no_mask_embed.weight"].float())
+        out = {"tok": tokens.clone()}
+
+        lp0 = md_tx + "layers.0."
+        tokens = do_sa(tokens, lp0, skip_pe=True);      out["sa0"]    = tokens.clone()
+        tokens = do_t2i(tokens, src, lp0);              out["t2i0"]   = tokens.clone()
+        tokens = do_mlp(tokens, lp0);                   out["mlp0"]   = tokens.clone()
+        src    = do_i2t(tokens, src, lp0);              out["layer0"] = tokens.clone()
+
+        lp1 = md_tx + "layers.1."
+        tokens = do_sa(tokens, lp1, skip_pe=False);     out["sa1"]    = tokens.clone()
+        tokens = do_t2i(tokens, src, lp1);              out["t2i1"]   = tokens.clone()
+        tokens = do_mlp(tokens, lp1);                   out["mlp1"]   = tokens.clone()
+        src    = do_i2t(tokens, src, lp1);              out["layer1"] = tokens.clone()
+
+        # Final: token→image attn using final_attn_token_to_image, then layer_norm_final_attn
+        fn_w = sd[md_tx + "layer_norm_final_attn.weight"]
+        fn_b = sd[md_tx + "layer_norm_final_attn.bias"]
+        tokens = do_t2i(tokens, src, lp="", final=True,
+                        out_norm_w=fn_w, out_norm_b=fn_b)
+        out["final"] = tokens.clone()
+
+        del sd
+        return out
+
     @staticmethod
     def tensor_metrics(hw: torch.Tensor, ref: torch.Tensor) -> dict:
         """Compute numerical quality metrics between HW and CPU reference tensors.
@@ -4124,6 +4313,146 @@ def main():
         _probe("PE_NOT_A_POINT (256)",       ue.PE_NOT_A_POINT,       256)
         _probe("DEC_IOU_TOKEN (256)",        ue.DEC_IOU_TOKEN,        256)
         _probe("DEC_MASK_TOKENS (4,256)",    ue.DEC_MASK_TOKENS,      4 * DD)
+        # ── DEC_TOKENS per-stage snapshot sweep + CPU SNR comparison ────────
+        # Each snapshot was written by dram_copy(DEC_TOKENS → SNAP_*, NT*DD)
+        # right after its stage. CPU ref runs the same pipeline and we compute
+        # SNR per stage — gradual SNR decay = accumulating bf16 noise;
+        # sudden plunge = structural bug in that stage.
+        _snap_stages = [
+            ("tok",    ue.DEC_SNAP_TOK),
+            ("sa0",    ue.DEC_SNAP_SA0),
+            ("t2i0",   ue.DEC_SNAP_T2I0),
+            ("mlp0",   ue.DEC_SNAP_MLP0),
+            ("layer0", ue.DEC_SNAP_LAYER0),
+            ("sa1",    ue.DEC_SNAP_SA1),
+            ("t2i1",   ue.DEC_SNAP_T2I1),
+            ("mlp1",   ue.DEC_SNAP_MLP1),
+            ("layer1", ue.DEC_SNAP_LAYER1),
+            ("final",  ue.DEC_SNAP_FINAL),
+        ]
+
+        # Feed the CPU ref with CLEAN sources, not the post-run (potentially
+        # corrupted) DEC_QUERY_PE / DEC_KEY_PE buffers. DEC_QUERY_PE at PE
+        # assembly == DEC_TOKENS == DEC_SNAP_TOK. DEC_KEY_PE == DEC_POS_SRC
+        # (params region, read-only, verified clean by the corruption map).
+        _cpu_tok  = ue.read_tensor_from_dram(ue.DEC_SNAP_TOK,  7 * DD).reshape(7, DD)
+        _cpu_qpe  = ue.read_tensor_from_dram(ue.DEC_SNAP_TOK,  7 * DD).reshape(7, DD)
+        _cpu_kpe  = ue.read_tensor_from_dram(ue.DEC_POS_SRC,  GA * DD).reshape(GA, DD)
+
+        # ── NaN-pattern diagnostic: distinguish head/tail/scatter corruption ──
+        # Hypotheses to separate:
+        #   (1) tail is stale DRAM  — dram_copy truncated → NaN band at END
+        #   (2) head overwritten    — something splashed in from DEC_SA_MERGED side → NaN band at START
+        #   (3) interior scatter    — rogue writes in middle → irregular pattern
+        def _nan_pattern(label, addr, numel, n_buckets=32):
+            t = ue.read_tensor_from_dram(addr, numel).float().flatten()
+            mask = torch.isnan(t) | torch.isinf(t)
+            bad = int(mask.sum().item())
+            _original_print(f"  pattern {label:<22s} addr=0x{addr:08X} "
+                            f"numel={numel} bad={bad} ({100.0*bad/numel:.1f}%)")
+            if bad == 0:
+                return
+            idx = torch.nonzero(mask, as_tuple=False).flatten()
+            first, last = int(idx[0]), int(idx[-1])
+            _original_print(f"    first_bad_idx={first} last_bad_idx={last} "
+                            f"(span={last-first+1}, contiguous_if_span==bad)")
+            # Bucket histogram: which thirty-seconds of the buffer are dirty?
+            bucket_sz = (numel + n_buckets - 1) // n_buckets
+            hist = []
+            for b in range(n_buckets):
+                lo = b * bucket_sz
+                hi = min(lo + bucket_sz, numel)
+                if hi <= lo:
+                    break
+                seg = mask[lo:hi]
+                pct = 100.0 * int(seg.sum().item()) / (hi - lo)
+                if pct >= 99.5:    ch = "#"
+                elif pct >= 50.0:  ch = "+"
+                elif pct > 0.0:    ch = "."
+                else:              ch = " "
+                hist.append(ch)
+            _original_print(f"    bucket_histogram (each={bucket_sz} elems, #=all-nan, +=half, .=some):")
+            _original_print(f"    [{''.join(hist)}]")
+
+        _original_print("  ── PE input corruption map ──")
+        _nan_pattern("DEC_POS_SRC",    ue.DEC_POS_SRC,    GA * DD)
+        _nan_pattern("DEC_SA_MERGED",  ue.DEC_SA_MERGED,  7  * DD)
+        _nan_pattern("DEC_QUERY_PE",   ue.DEC_QUERY_PE,   7  * DD)
+        _nan_pattern("DEC_KEY_PE",     ue.DEC_KEY_PE,     GA * DD)
+        _nan_pattern("DEC_CA_T2I_K",   ue.DEC_CA_T2I_K,   GA * 8 * 64)
+        _nan_pattern("DEC_CA_T2I_V",   ue.DEC_CA_T2I_V,   GA * 8 * 64)
+        _original_print("  ── end PE corruption map ──")
+
+        # ── DEC_QUERY_PE per-stage bisection ────────────────────────────────
+        # DEC_QUERY_PE is assembled in Phase 3b and then read-only. If it goes
+        # NaN mid-run, SOMETHING between these snapshots wrote into its 3.5 KB
+        # region at 0x31606600. First stage where this flips from 0 NaN → 1792
+        # NaN tells us the exact op boundary to look at.
+        _qpe_stages = [
+            ("tok",    ue.DEC_QPE_SNAP_TOK),
+            ("sa0",    ue.DEC_QPE_SNAP_SA0),
+            ("t2i0",   ue.DEC_QPE_SNAP_T2I0),
+            ("mlp0",   ue.DEC_QPE_SNAP_MLP0),
+            ("layer0", ue.DEC_QPE_SNAP_LAYER0),
+            ("sa1",    ue.DEC_QPE_SNAP_SA1),
+            ("t2i1",   ue.DEC_QPE_SNAP_T2I1),
+            ("mlp1",   ue.DEC_QPE_SNAP_MLP1),
+            ("layer1", ue.DEC_QPE_SNAP_LAYER1),
+            ("final",  ue.DEC_QPE_SNAP_FINAL),
+        ]
+        _original_print("  ── DEC_QUERY_PE per-stage NaN sweep ──")
+        _first_qpe_bad = None
+        for _label, _addr in _qpe_stages:
+            _qpe = ue.read_tensor_from_dram(_addr, 7 * DD).float()
+            _nn = int(torch.isnan(_qpe).sum().item())
+            _ii = int(torch.isinf(_qpe).sum().item())
+            _fin = _qpe[torch.isfinite(_qpe)]
+            _rng = f"[{_fin.min():7.3f},{_fin.max():7.3f}]" if _fin.numel() > 0 else " [no finite]"
+            _original_print(f"  qpe[{_label:<8s}] nan={_nn:>4d} inf={_ii:>4d} range={_rng}")
+            if _first_qpe_bad is None and (_nn > 0 or _ii > 0):
+                _first_qpe_bad = _label
+        if _first_qpe_bad is not None:
+            _original_print(f"  ── DEC_QUERY_PE FIRST CORRUPTED AT stage: {_first_qpe_bad} ──")
+        else:
+            _original_print("  ── DEC_QUERY_PE clean across all stages (corruption must be post-final) ──")
+
+        for _name, _t in [("cpu_tok", _cpu_tok), ("cpu_qpe", _cpu_qpe),
+                          ("cpu_kpe", _cpu_kpe), ("neck_out", neck_out)]:
+            _tf = _t.float()
+            _nn = torch.isnan(_tf).sum().item()
+            _ii = torch.isinf(_tf).sum().item()
+            _fin = _tf[torch.isfinite(_tf)]
+            _rng = f"[{_fin.min():.4f},{_fin.max():.4f}]" if _fin.numel() > 0 else "[no finite]"
+            _original_print(f"  cpu-ref input {_name:<10s} shape={tuple(_tf.shape)} "
+                            f"nan={_nn} inf={_ii} range={_rng}")
+        _cpu_refs = ue.cpu_reference_dec_full(_cpu_tok, neck_out, _cpu_qpe, _cpu_kpe)
+
+        _first_bad = None
+        _original_print("  ── DEC_TOKENS per-stage sweep (HW stats + SNR vs CPU) ──")
+        _original_print(f"  {'stage':<8s}  {'nan':>5s} {'inf':>5s}  {'hw_range':>22s}  "
+                        f"{'ref_range':>22s}  {'SNR(dB)':>8s}  {'cos':>8s}")
+        for _label, _addr in _snap_stages:
+            _hw    = ue.read_tensor_from_dram(_addr, 7 * DD).float().reshape(7, DD)
+            _n_nan = torch.isnan(_hw).sum().item()
+            _n_inf = torch.isinf(_hw).sum().item()
+            _fin   = _hw[torch.isfinite(_hw)]
+            _hwr   = f"[{_fin.min():7.3f},{_fin.max():7.3f}]" if _fin.numel() > 0 else "       [no finite]   "
+            _ref   = _cpu_refs[_label].float()
+            _refr  = f"[{_ref.min():7.3f},{_ref.max():7.3f}]"
+            if _n_nan > 0 or _n_inf > 0:
+                _snr_s, _cos_s = "   NaN", "   NaN"
+            else:
+                _m = ue.tensor_metrics(_hw, _ref)
+                _snr_s, _cos_s = f"{_m['snr_db']:8.2f}", f"{_m['cos']:8.5f}"
+            _original_print(f"  {_label:<8s}  {_n_nan:>5d} {_n_inf:>5d}  {_hwr:>22s}  "
+                            f"{_refr:>22s}  {_snr_s}  {_cos_s}")
+            if _first_bad is None and (_n_nan > 0 or _n_inf > 0):
+                _first_bad = (_label, _addr, _n_nan, _n_inf)
+        if _first_bad is not None:
+            _label, _addr, _n_nan, _n_inf = _first_bad
+            _original_print(f"  ── FIRST BAD STAGE: {_label}  (nan={_n_nan}, inf={_n_inf}) ──")
+            assert False, f"DEC_TOKENS NaN/Inf first appears at stage '{_label}'"
+        _original_print("  ── all stage snapshots clean ──")
         _probe("DEC_TOKENS (7,256)",         ue.DEC_TOKENS,           7  * DD)
         _probe("DEC_SRC (4096,256)",         ue.DEC_SRC,              GA * DD)
         _probe("DEC_TOKENS_NORM (7,256)",    ue.DEC_TOKENS_NORM,      7  * DD)
