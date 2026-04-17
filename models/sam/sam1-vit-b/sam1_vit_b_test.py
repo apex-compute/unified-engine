@@ -59,7 +59,7 @@ user_dma_core.MAX_DECODER_INSTRUCTIONS = (0x100000000 - 0x3C000000) // 32  # 3.1
 # Section 2 uses 1 GB instructions (0xC0000000–0xFFFFFFFF); override before instantiating S2 engine.
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE,
-    UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
+    UE_VECTOR_SIZE, UE_FMAX_CONTEXT_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     set_dma_device, UnifiedEngine,
 )
 from model_lib_core import eltwise_mul_core_dram
@@ -168,6 +168,187 @@ def flash_attention_batched(ue: UnifiedEngine, num_batches: int, head_dim: int,
             SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR + b * scratch_stride,
             BIAS_DRAM_ADDR=bias_addr,
         )
+    return total_flops
+
+
+def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
+                                  q_len: int, kv_len: int,
+                                  Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
+                                  V_T_DRAM_ADDR: int,
+                                  OUTPUT_DRAM_ADDR: int,
+                                  SCORES_SCRATCH_ADDR: int,
+                                  SM_OUTPUT_DRAM_ADDR: int = None) -> int:
+    """Asymmetric flash attention for a single head.
+
+    Mirrors ``UnifiedEngine.flash_attention_core``'s Phase-2 (Q @ K^T with
+    per-row running max accumulated in the FMAX context) and Phase-3
+    (row-wise softmax + SM @ V^T) schedule, but with ``q_len`` decoupled from
+    ``kv_len``. Caller supplies V already-transposed so the identity-matvec
+    V^T trick is unnecessary.
+
+    The running-max across ``kv_len`` column chunks is what makes this correct
+    for ``kv_len > 64``: ``matmat_mul_core(softmax_enable=True)`` uses the same
+    pattern, but when Q has length > 1 each row's FMAX slot is only cleared on
+    row 0 which leaves rows 1..q_len-1 with stale state in the per-slot
+    running max — producing a chunked local-softmax rather than a global one.
+    Here we explicitly set ``max_clear_en=1`` for every row on the first
+    column chunk so every row starts with a freshly cleared max.
+
+    Layouts:
+        Q:       (q_len, head_dim)      bf16 row-major — caller pre-scales
+        K:       (kv_len, head_dim)     bf16 row-major — same orientation as Q
+        V_T:     (head_dim, kv_len)     bf16 row-major — V transposed
+        OUTPUT:  (q_len, head_dim)      bf16 row-major
+        SCORES_SCRATCH: ``q_len * kv_len`` bf16 elements (Phase-2 / Phase-3 handoff)
+
+    Preconditions: ``q_len <= 64`` (FMAX context depth), ``head_dim % 64 == 0``,
+    ``kv_len % 64 == 0``.
+    """
+    bytes_per_element = 2
+    UE_VEC = UE_VECTOR_SIZE  # 64
+
+    assert q_len <= UE_FMAX_CONTEXT_SIZE, f"q_len={q_len} > FMAX context depth {UE_FMAX_CONTEXT_SIZE}"
+    assert head_dim % UE_VEC == 0, f"head_dim={head_dim} must be multiple of {UE_VEC}"
+    assert kv_len % UE_VEC == 0, f"kv_len={kv_len} must be multiple of {UE_VEC}"
+
+    # -----------------------------------------------------------------
+    # Direct port of gemma3_test.py flash decode (Phase 2 + Phase 3 + Phase 3b).
+    # Gemma3 hardcodes M = 1 (decode, one query token). We generalise to
+    # M = q_len for cross-attention. Everything else is a line-by-line
+    # copy, including the per-row fmax_context_addr, the clear_en flip
+    # inside the output_row loop, and the output_sram_wb_addr = uram_a +
+    # m_take*K*bpe layout. We skip Gemma3's Phase 1 (V^T via identity)
+    # because V^T is precomputed by the caller and sits at V_T_DRAM_ADDR.
+    # Q arrives pre-scaled at Q_DRAM_ADDR (caller owns the scale factor —
+    # SAM uses 1/sqrt(CA_HD) with CA_HD=16, not 1/sqrt(head_dim)=1/sqrt(64)).
+    # -----------------------------------------------------------------
+    M = q_len
+    K = head_dim
+    N = kv_len
+
+    # Phase 2: Q @ K^T → scores @ SCORES_SCRATCH_ADDR
+    usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
+    N_chunk = min(N, (usable_uram_b_elements // K) // UE_VEC * UE_VEC)
+    assert N_chunk >= UE_VEC, f"N_chunk={N_chunk} < UE_VEC={UE_VEC}"
+
+    usable_uram_a_elements = URAM_FULL_ELEMENTS
+    output_N_size = N_chunk
+    M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, usable_uram_a_elements // (K + output_N_size))
+    assert 1 <= M_chunk <= M, f"M_chunk={M_chunk} out of range (M={M})"
+
+    uram_a_start_addr = 0x00000
+    uram_b_start_addr = 0x80000
+
+    for i, m_take in ue.chunk_ranges(M, M_chunk):
+        ue.accelerator_memory_to_sram(accelerator_dram_address=Q_DRAM_ADDR + i * K * bytes_per_element,
+                                      sram_address=uram_a_start_addr,
+                                      element_size=m_take * K)
+
+        output_sram_wb_addr = uram_a_start_addr + m_take * K * bytes_per_element
+        assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} >= URAM_B base"
+
+        for j, n_take in ue.chunk_ranges(N, N_chunk):
+            ue.accelerator_memory_to_sram(accelerator_dram_address=K_DRAM_ADDR + j * K * bytes_per_element,
+                                          sram_address=uram_b_start_addr,
+                                          element_size=n_take * K)
+
+            assert m_take * K + n_take * m_take <= URAM_FULL_ELEMENTS
+
+            clear_en = 1 if j == 0 else 0
+            for output_row in range(m_take):
+                out_sram_offset = output_row * n_take * bytes_per_element
+
+                ue.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
+                                                        fmax_context_addr=output_row,
+                                                        vector_sram_start_addr=uram_a_start_addr + output_row * K * bytes_per_element,
+                                                        matrix_sram_start_addr=uram_b_start_addr,
+                                                        output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
+                                                        K=K,
+                                                        N=n_take)
+
+            start_dram_address_of_partial_matrix = SCORES_SCRATCH_ADDR + j * bytes_per_element
+            ue.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                          accelerator_dram_address=start_dram_address_of_partial_matrix,
+                                          element_size=m_take * n_take,
+                                          stride_bytes_per_chunk=n_take * bytes_per_element,
+                                          stride_jump_bytes=N * bytes_per_element)
+
+        # Phase 3: softmax(scores) + SM @ V^T, inside the outer i-loop.
+        max_m_take = min((URAM_FULL_ELEMENTS - UE_VEC) // N, UE_FMAX_CONTEXT_SIZE)
+
+        for m_take_chunk_idx, m_take_chunk_size in ue.chunk_ranges(m_take, max_m_take):
+            ue.accelerator_memory_to_sram(accelerator_dram_address=SCORES_SCRATCH_ADDR + m_take_chunk_idx * N * bytes_per_element,
+                                          sram_address=uram_a_start_addr,
+                                          element_size=m_take_chunk_size * N)
+
+            for row_idx in range(m_take_chunk_size):
+                ue.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
+                                                          vector_sram_start_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
+                                                          output_sram_wb_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
+                                                          N=N)
+
+            if SM_OUTPUT_DRAM_ADDR is not None:
+                ue.sram_to_accelerator_memory(sram_address=uram_a_start_addr,
+                                              accelerator_dram_address=SM_OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * N * bytes_per_element,
+                                              element_size=m_take_chunk_size * N)
+
+            # Chunk V^T along head_dim. With N=kv_len large (e.g. 4096) and 1-row
+            # URAM_B headroom, the "round down to UE_VEC multiple" collapses to 0.
+            # Mirror gemma3_test.py's aligned-fallback: drop to 32 or 16 rows per
+            # chunk and pad the matvec output up to UE_VEC per row.
+            v_tr_row_chunk_size = min((URAM_NEAR_FULL_ELEMENTS // N // UE_VEC) * UE_VEC,
+                                      ((URAM_FULL_ELEMENTS - m_take_chunk_size * N) // m_take_chunk_size // UE_VEC) * UE_VEC,
+                                      head_dim)
+            v_tr_row_chunk_size_aligned = None
+            if v_tr_row_chunk_size < UE_VEC:
+                v_tr_row_chunk_size_aligned = UE_VEC
+                if N * 32 <= URAM_NEAR_FULL_ELEMENTS:
+                    v_tr_row_chunk_size = 32
+                elif N * 16 <= URAM_NEAR_FULL_ELEMENTS:
+                    v_tr_row_chunk_size = 16
+                else:
+                    assert False, f"kv_len N={N} too large for v_tr fallback in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
+
+            v_t_sram_start_addr = 0x80000
+            output_sram_wb_addr = uram_a_start_addr + m_take_chunk_size * N * bytes_per_element
+
+            for v_tr_column_idx, v_tr_column_take in ue.chunk_ranges(head_dim, v_tr_row_chunk_size):
+                ue.accelerator_memory_to_sram(accelerator_dram_address=V_T_DRAM_ADDR + v_tr_column_idx * N * bytes_per_element,
+                                              sram_address=v_t_sram_start_addr,
+                                              element_size=v_tr_column_take * N)
+
+                for p_row_idx in range(m_take_chunk_size):
+                    if v_tr_row_chunk_size_aligned is None:
+                        output_sram_wb_offset = p_row_idx * v_tr_column_take * bytes_per_element
+                    else:
+                        output_sram_wb_offset = 0
+
+                    ue.start_queue_for_bf16_matvec_operation(max_clear_en=0,
+                                                            fmax_context_addr=0,
+                                                            vector_sram_start_addr=uram_a_start_addr + p_row_idx * N * bytes_per_element,
+                                                            matrix_sram_start_addr=v_t_sram_start_addr,
+                                                            output_sram_wb_addr=output_sram_wb_addr + output_sram_wb_offset,
+                                                            K=N,
+                                                            N=v_tr_column_take)
+
+                    if v_tr_row_chunk_size_aligned is not None:
+                        ue.sram_to_accelerator_memory(
+                            sram_address=output_sram_wb_addr + output_sram_wb_offset,
+                            accelerator_dram_address=OUTPUT_DRAM_ADDR
+                                + (i + m_take_chunk_idx + p_row_idx) * head_dim * bytes_per_element
+                                + v_tr_column_idx * bytes_per_element,
+                            element_size=v_tr_column_take)
+
+                if v_tr_row_chunk_size_aligned is None:
+                    ue.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                  accelerator_dram_address=OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * head_dim * bytes_per_element + v_tr_column_idx * bytes_per_element,
+                                                  element_size=m_take_chunk_size * v_tr_column_take,
+                                                  stride_bytes_per_chunk=v_tr_column_take * bytes_per_element,
+                                                  stride_jump_bytes=head_dim * bytes_per_element)
+
+    total_flops = (2 * q_len * head_dim * kv_len  # Q @ K^T
+                   + q_len * kv_len * 5            # softmax
+                   + 2 * q_len * kv_len * head_dim)  # SM @ V^T
     return total_flops
 
 
@@ -1577,6 +1758,30 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         self.DEC_QPE_SNAP_MLP1   = self._alloc_tensor(NT * DD)
         self.DEC_QPE_SNAP_LAYER1 = self._alloc_tensor(NT * DD)
         self.DEC_QPE_SNAP_FINAL  = self._alloc_tensor(NT * DD)
+        # ── DEBUG: per-op snapshots for layer-0 t2i (bisect the 44→16 dB plunge) ──
+        # Captures every intermediate so the first stage where HW diverges from CPU
+        # pins the bug down to one op (proj, permute, scale, scores, softmax, V^T,
+        # merge, out_proj). Total ~16 MB (well under the 117 MB slack).
+        _N_CA = 8 * 64
+        self.DEC_T2I0_Q_RAW      = self._alloc_tensor(NT * _N_CA)     # (7, 512)
+        self.DEC_T2I0_K_RAW      = self._alloc_tensor(GA * _N_CA)     # (4096, 512)
+        self.DEC_T2I0_V_RAW      = self._alloc_tensor(GA * _N_CA)     # (4096, 512)
+        self.DEC_T2I0_Q_HEADS    = self._alloc_tensor(8 * NT * 64)    # (8, 7, 64)
+        self.DEC_T2I0_K_HEADS    = self._alloc_tensor(8 * GA * 64)    # (8, 4096, 64)
+        self.DEC_T2I0_V_HEADS    = self._alloc_tensor(8 * GA * 64)    # (8, 4096, 64)
+        self.DEC_T2I0_Q_SCALED   = self._alloc_tensor(8 * NT * 64)    # (8, 7, 64)
+        # Split the fused matmul+softmax: raw scores before softmax, probs after.
+        # Two separate snapshots isolate "matmul wrong" vs "softmax wrong".
+        self.DEC_T2I0_H0_RAW_SCORES = self._alloc_tensor(NT * GA)     # head 0 pre-softmax
+        # Snapshot of the flash helper's own Phase-2 output — distinct from the
+        # independent matmat_mul_core diagnostic above. Isolates helper's
+        # Q@K^T from its Phase-3 softmax.
+        self.DEC_T2I0_H0_HELPER_P2 = self._alloc_tensor(NT * GA)      # helper Phase 2 (7, 4096)
+        self.DEC_T2I0_H0_SCORES  = self._alloc_tensor(NT * GA)        # head 0 (7, 4096)
+        self.DEC_T2I0_H0_OUT     = self._alloc_tensor(NT * 64)        # head 0 (7, 64)
+        self.DEC_T2I0_OUT_HEADS  = self._alloc_tensor(8 * NT * 64)    # (8, 7, 64)
+        self.DEC_T2I0_MERGED     = self._alloc_tensor(NT * 128)       # (7, 128)
+        self.DEC_T2I0_OUT_PROJ   = self._alloc_tensor(NT * DD)        # (7, 256) pre-residual
         self.DEC_SRC         = self._alloc_tensor(GA * DD)   # (4096, 256) image src
         self.DEC_I2T_RES     = self._alloc_tensor(GA * DD)   # (4096, 256) i2t out-proj result
         self.DEC_TOKENS_NORM = self._alloc_tensor(NT * DD)   # (7, 256) LN scratch
@@ -2315,6 +2520,7 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             C_DRAM_ADDR=lw0['ca_t2i_q_b'],
             bias_mode="broadcast_N",
         )
+        dram_copy(self, self.DEC_Q, self.DEC_T2I0_Q_RAW, NT * N_CA)
 
         # K: (src + key_pe) @ W_k^T = src @ W_k^T + key_pe @ W_k^T
         # Use DEC_CA_T2I_V as temp for the key_pe partial result
@@ -2334,6 +2540,7 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         )
         eltwise_add_dram(self, self.DEC_CA_T2I_K, self.DEC_CA_T2I_V,
                          self.DEC_CA_T2I_K, GA * N_CA)
+        dram_copy(self, self.DEC_CA_T2I_K, self.DEC_T2I0_K_RAW, GA * N_CA)
 
         # V: src (no PE) → project → (4096, 512)
         self.matmat_mul_core(
@@ -2344,6 +2551,7 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             C_DRAM_ADDR=lw0['ca_t2i_v_b'],
             bias_mode="broadcast_N",
         )
+        dram_copy(self, self.DEC_CA_T2I_V, self.DEC_T2I0_V_RAW, GA * N_CA)
 
         # Reshape to heads: (seq, 8, 64) → (8, seq, 64) via permute
         # Q: (7, 8, 64) → (8, 7, 64) in DEC_SA_TEMP
@@ -2352,53 +2560,77 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             INPUT_DRAM_ADDR=self.DEC_Q,
             OUTPUT_DRAM_ADDR=self.DEC_SA_TEMP,
         )
+        dram_copy(self, self.DEC_SA_TEMP, self.DEC_T2I0_Q_HEADS, DH * NT * CA_HDP)
         # K: (4096, 8, 64) → (8, 4096, 64) in DEC_CA_T2I_K_HEADS
         self.bf16_permute_core(
             dim_0=GA, dim_1=DH, dim_2=CA_HDP,
             INPUT_DRAM_ADDR=self.DEC_CA_T2I_K,
             OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_K_HEADS,
         )
+        dram_copy(self, self.DEC_CA_T2I_K_HEADS, self.DEC_T2I0_K_HEADS, DH * GA * CA_HDP)
         # V: (4096, 8, 64) → (8, 4096, 64) in DEC_CA_T2I_V_HEADS
         self.bf16_permute_core(
             dim_0=GA, dim_1=DH, dim_2=CA_HDP,
             INPUT_DRAM_ADDR=self.DEC_CA_T2I_V,
             OUTPUT_DRAM_ADDR=self.DEC_CA_T2I_V_HEADS,
         )
+        dram_copy(self, self.DEC_CA_T2I_V_HEADS, self.DEC_T2I0_V_HEADS, DH * GA * CA_HDP)
 
         # Pre-scale Q by 1/sqrt(CA_HD=16): padded zeros don't contribute to dot products
         broadcast_mul_dram(self, self.DEC_SA_TEMP,
                            1.0 / math.sqrt(CA_HD), DH * NT * CA_HDP)
+        dram_copy(self, self.DEC_SA_TEMP, self.DEC_T2I0_Q_SCALED, DH * NT * CA_HDP)
 
         # Per-head: scores = softmax(Q_h @ K_h^T), out_h = scores @ V_h
+        # Uses asymmetric flash-attention helper (running FMAX across kv chunks)
+        # instead of matmat_mul_core(softmax_enable=True), which only clears the
+        # FMAX slot for row 0 and so produces chunked-local softmax — correct
+        # for q_len==1, wrong for q_len>1 with kv_len>64.
         for h in range(DH):
             q_addr = self.DEC_SA_TEMP + h * NT * CA_HDP * bpe
             k_addr = self.DEC_CA_T2I_K_HEADS + h * GA * CA_HDP * bpe
             v_addr = self.DEC_CA_T2I_V_HEADS + h * GA * CA_HDP * bpe
             o_addr = self.DEC_CA_OUT_HEADS + h * NT * CA_HDP * bpe
 
-            # scores: (7, 64) @ (64, 4096)^T → (7, 4096), softmax row-wise
-            self.matmat_mul_core(
-                M=NT, K=CA_HDP, N=GA,
-                A_DRAM_ADDR=q_addr,
-                B_DRAM_ADDR=k_addr,
-                OUTPUT_DRAM_ADDR=self.DEC_CA_SCORES,
-                softmax_enable=True,
-            )
-            # V^T: (4096, 64) → (64, 4096)
+            # V^T: (4096, 64) → (64, 4096) — produced once per head, consumed
+            # inside the helper as the "matrix" operand for SM @ V^T.
             self.bf16_transpose_core(
                 M=GA, N=CA_HDP,
                 INPUT_DRAM_ADDR=v_addr,
                 OUTPUT_DRAM_ADDR=self.DEC_CA_VT,
             )
-            # out: (7, 4096) @ (4096, 64)^T → (7, 4096) @ (4096, 64) using V^T as B
-            # matmat_mul_core computes A @ B^T where B is (N, K)
-            # B = V^T stored as (N=64, K=4096) → B^T = V → out = scores @ V ✓
-            self.matmat_mul_core(
-                M=NT, K=GA, N=CA_HDP,
-                A_DRAM_ADDR=self.DEC_CA_SCORES,
-                B_DRAM_ADDR=self.DEC_CA_VT,
+
+            # DIAGNOSTIC SPLIT (h=0 only): raw scores pre-softmax into a
+            # separate buffer. Validates that Q @ K^T is clean even though the
+            # old fused softmax path was broken.
+            if h == 0:
+                self.matmat_mul_core(
+                    M=NT, K=CA_HDP, N=GA,
+                    A_DRAM_ADDR=q_addr,
+                    B_DRAM_ADDR=k_addr,
+                    OUTPUT_DRAM_ADDR=self.DEC_T2I0_H0_RAW_SCORES,
+                )
+
+            # Fused Q@K^T + running-max softmax + SM @ V^T.
+            # For h=0, also spill softmax output to DEC_T2I0_H0_SCORES so the
+            # post-softmax step is separately validatable.
+            sm_tap = self.DEC_T2I0_H0_SCORES if h == 0 else None
+            cross_attn_flash_single_head(self,
+                head_dim=CA_HDP, q_len=NT, kv_len=GA,
+                Q_DRAM_ADDR=q_addr, K_DRAM_ADDR=k_addr,
+                V_T_DRAM_ADDR=self.DEC_CA_VT,
                 OUTPUT_DRAM_ADDR=o_addr,
+                SCORES_SCRATCH_ADDR=self.DEC_CA_SCORES,
+                SM_OUTPUT_DRAM_ADDR=sm_tap,
             )
+            if h == 0:
+                # Phase-3 softmax does NOT write back to DEC_CA_SCORES, so
+                # after the helper finishes DEC_CA_SCORES still holds the
+                # helper's own Phase-2 pre-softmax scores. Snapshot it to
+                # compare against the CPU raw scores → isolates P2 vs P3.
+                dram_copy(self, self.DEC_CA_SCORES, self.DEC_T2I0_H0_HELPER_P2, NT * GA)
+                dram_copy(self, o_addr, self.DEC_T2I0_H0_OUT, NT * CA_HDP)
+        dram_copy(self, self.DEC_CA_OUT_HEADS, self.DEC_T2I0_OUT_HEADS, DH * NT * CA_HDP)
 
         # Merge: (8, 7, 64) → (7, 128) with head_dim unpad 64→16
         multihead_merge_dram(self,
@@ -2409,6 +2641,7 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             head_dim=CA_HD, head_dim_pad=CA_HDP,
             UNPAD_WEIGHT_ADDR=self.DEC_CA_UNPAD_W,
         )
+        dram_copy(self, self.DEC_CA_T2I_MERGED, self.DEC_T2I0_MERGED, NT * CA_ID)
 
         # out_proj: (7, 128) → (7, 256) + residual + norm2
         self.matmat_mul_core(
@@ -2419,6 +2652,7 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
             C_DRAM_ADDR=lw0['ca_t2i_out_b'],
             bias_mode="broadcast_N",
         )
+        dram_copy(self, self.DEC_TOKENS_NORM, self.DEC_T2I0_OUT_PROJ, NT * DD)
         eltwise_add_dram(self, self.DEC_TOKENS, self.DEC_TOKENS_NORM,
                          self.DEC_TOKENS, NT * DD)
         self.layer_norm_core_dram(
@@ -2705,23 +2939,17 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                 v_addr = self.DEC_CA_T2I_V_HEADS + h * GA * CA_HDP * bpe
                 o_addr = self.DEC_CA_OUT_HEADS   + h * NT * CA_HDP * bpe
 
-                self.matmat_mul_core(
-                    M=NT, K=CA_HDP, N=GA,
-                    A_DRAM_ADDR=q_addr,
-                    B_DRAM_ADDR=k_addr,
-                    OUTPUT_DRAM_ADDR=self.DEC_CA_SCORES,
-                    softmax_enable=True,
-                )
                 self.bf16_transpose_core(
                     M=GA, N=CA_HDP,
                     INPUT_DRAM_ADDR=v_addr,
                     OUTPUT_DRAM_ADDR=self.DEC_CA_VT,
                 )
-                self.matmat_mul_core(
-                    M=NT, K=GA, N=CA_HDP,
-                    A_DRAM_ADDR=self.DEC_CA_SCORES,
-                    B_DRAM_ADDR=self.DEC_CA_VT,
+                cross_attn_flash_single_head(self,
+                    head_dim=CA_HDP, q_len=NT, kv_len=GA,
+                    Q_DRAM_ADDR=q_addr, K_DRAM_ADDR=k_addr,
+                    V_T_DRAM_ADDR=self.DEC_CA_VT,
                     OUTPUT_DRAM_ADDR=o_addr,
+                    SCORES_SCRATCH_ADDR=self.DEC_CA_SCORES,
                 )
 
             multihead_merge_dram(self,
@@ -3764,6 +3992,105 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         del sd
         return out
 
+    def cpu_reference_t2i0_staged(self, tokens_sa0: torch.Tensor,
+                                   src:      torch.Tensor,
+                                   query_pe: torch.Tensor,
+                                   key_pe:   torch.Tensor) -> dict:
+        """Compute layer-0 t2i intermediates, padded to the HW layout exactly.
+
+        Every tensor returned matches the HW DRAM contents bit-for-bit under
+        infinite precision. Where HW pads head_dim 16→64, CPU mirrors with zero
+        padding. Where HW places head dim stripes as (seq, DH, HDP), CPU does
+        the same permute so byte-compare with DEC_T2I0_* is apples-to-apples.
+        """
+        import torch.nn.functional as F
+        sd = _load_sam1_state_dict(_ensure_checkpoint(self.script_dir, self.cfg))
+        lp = "mask_decoder.transformer.layers.0.cross_attn_token_to_image."
+
+        NT   = self.DEC_NUM_TOKENS   # 7
+        DD   = self.DEC_DIM          # 256
+        GA   = self.GRID_AREA        # 4096
+        DH   = self.DEC_HEADS        # 8
+        CA_HD  = self.DEC_INTERNAL_HD   # 16
+        CA_HDP = 64
+        CA_ID  = self.DEC_INTERNAL_DIM  # 128
+        N_CA   = DH * CA_HDP            # 512
+
+        bf = lambda x: x.to(torch.bfloat16)
+        lin = lambda x, w, b: bf(F.linear(x.float(), w.float(),
+                                          b.float() if b is not None else None))
+
+        def pad_head(x):  # (*, DH*CA_HD) → (*, DH*CA_HDP) with zero-pad per head
+            lead = x.shape[:-1]
+            y = torch.zeros(*lead, DH, CA_HDP, dtype=torch.bfloat16)
+            y[..., :CA_HD] = x.reshape(*lead, DH, CA_HD)
+            return y.reshape(*lead, DH * CA_HDP)
+
+        q = bf(tokens_sa0.float() + query_pe.float())          # (7, 256)
+        k = bf(src.float()        + key_pe.float())            # (4096, 256)
+        v = src                                                  # (4096, 256)
+
+        W_q, b_q = sd[lp + "q_proj.weight"], sd[lp + "q_proj.bias"]
+        W_k, b_k = sd[lp + "k_proj.weight"], sd[lp + "k_proj.bias"]
+        W_v, b_v = sd[lp + "v_proj.weight"], sd[lp + "v_proj.bias"]
+        W_o, b_o = sd[lp + "out_proj.weight"], sd[lp + "out_proj.bias"]
+
+        Q_unpad = lin(q, W_q, b_q)                              # (7, 128)
+        K_unpad = lin(k, W_k, b_k)                              # (4096, 128)
+        V_unpad = lin(v, W_v, b_v)                              # (4096, 128)
+
+        Q_raw = pad_head(Q_unpad)                                # (7, 512)
+        K_raw = pad_head(K_unpad)                                # (4096, 512)
+        V_raw = pad_head(V_unpad)                                # (4096, 512)
+
+        # Permute (seq, DH, HDP) → (DH, seq, HDP)
+        Q_heads = Q_raw.reshape(NT, DH, CA_HDP).permute(1, 0, 2).contiguous()  # (8,7,64)
+        K_heads = K_raw.reshape(GA, DH, CA_HDP).permute(1, 0, 2).contiguous()  # (8,4096,64)
+        V_heads = V_raw.reshape(GA, DH, CA_HDP).permute(1, 0, 2).contiguous()  # (8,4096,64)
+
+        # Pre-scale on Q (HW does bf16 multiply in place)
+        scale = 1.0 / math.sqrt(CA_HD)
+        Q_scaled = bf(Q_heads.float() * scale)                   # (8,7,64)
+
+        # Per-head scores (softmax) and output. HW does softmax inside matmat.
+        # Matches CPU ref's attn(): bf16 scores → softmax → bf16 → bmm V.
+        # Also retain head 0's PRE-softmax raw scores — pairs with the new HW
+        # diagnostic matmul that runs without softmax_enable on h=0.
+        scores_h = torch.zeros(DH, NT, GA, dtype=torch.bfloat16)
+        out_h    = torch.zeros(DH, NT, CA_HDP, dtype=torch.bfloat16)
+        h0_raw_scores = None
+        for h in range(DH):
+            s = torch.matmul(Q_scaled[h].float(), K_heads[h].float().T)  # (7, 4096)
+            if h == 0:
+                h0_raw_scores = bf(s)   # match HW bf16 storage
+            p = torch.softmax(bf(s), dim=-1)
+            scores_h[h] = p
+            o = torch.matmul(p.float(), V_heads[h].float())              # (7, 64)
+            out_h[h] = bf(o)
+
+        # Merge via permute + unpad (drop the 48 padded lanes per head)
+        merged_padded = out_h.permute(1, 0, 2).contiguous()              # (7, 8, 64)
+        merged = merged_padded[..., :CA_HD].reshape(NT, DH * CA_HD)      # (7, 128)
+
+        out_proj = lin(merged, W_o, b_o)                                  # (7, 256)
+
+        del sd
+        return {
+            "q_raw":      Q_raw,          # (7, 512)
+            "k_raw":      K_raw,          # (4096, 512)
+            "v_raw":      V_raw,          # (4096, 512)
+            "q_heads":    Q_heads,        # (8, 7, 64)
+            "k_heads":    K_heads,        # (8, 4096, 64)
+            "v_heads":    V_heads,        # (8, 4096, 64)
+            "q_scaled":   Q_scaled,       # (8, 7, 64)
+            "h0_raw_scores": h0_raw_scores,  # (7, 4096) pre-softmax
+            "h0_scores":  scores_h[0],    # (7, 4096)
+            "h0_out":     out_h[0],       # (7, 64)
+            "out_heads":  out_h,          # (8, 7, 64)
+            "merged":     merged,         # (7, 128)
+            "out_proj":   out_proj,       # (7, 256)
+        }
+
     @staticmethod
     def tensor_metrics(hw: torch.Tensor, ref: torch.Tensor) -> dict:
         """Compute numerical quality metrics between HW and CPU reference tensors.
@@ -4448,6 +4775,81 @@ def main():
                             f"{_refr:>22s}  {_snr_s}  {_cos_s}")
             if _first_bad is None and (_n_nan > 0 or _n_inf > 0):
                 _first_bad = (_label, _addr, _n_nan, _n_inf)
+
+        # ── t2i0 per-op bisection (runs regardless of NaN outcome) ──────────
+        # Every intermediate in layer-0 t2i was snapshotted by dram_copy in
+        # _compile_t2i's inline block. Compare each to a staged CPU ref built
+        # with the exact same padded layout. First stage whose SNR collapses
+        # pins the bug to one op. Feeds asserts so the run stops AT the guilty
+        # op rather than drifting downstream.
+        _src_cpu = (neck_out.float() + _load_sam1_state_dict(
+            _ensure_checkpoint(ue.script_dir, ue.cfg)
+        )["prompt_encoder.no_mask_embed.weight"].float()).to(torch.bfloat16)
+        _t2i0_ref = ue.cpu_reference_t2i0_staged(
+            tokens_sa0=_cpu_refs["sa0"], src=_src_cpu,
+            query_pe=_cpu_qpe, key_pe=_cpu_kpe,
+        )
+        _t2i0_probes = [
+            ("q_raw",      ue.DEC_T2I0_Q_RAW,     _t2i0_ref["q_raw"]),
+            ("k_raw",      ue.DEC_T2I0_K_RAW,     _t2i0_ref["k_raw"]),
+            ("v_raw",      ue.DEC_T2I0_V_RAW,     _t2i0_ref["v_raw"]),
+            ("q_heads",    ue.DEC_T2I0_Q_HEADS,   _t2i0_ref["q_heads"]),
+            ("k_heads",    ue.DEC_T2I0_K_HEADS,   _t2i0_ref["k_heads"]),
+            ("v_heads",    ue.DEC_T2I0_V_HEADS,   _t2i0_ref["v_heads"]),
+            ("q_scaled",   ue.DEC_T2I0_Q_SCALED,  _t2i0_ref["q_scaled"]),
+            # Split of the fused matmul+softmax: raw scores (pre-softmax) then
+            # post-softmax probs. If raw scores are clean and post-softmax is
+            # bad, the softmax_enable path is the bug.
+            ("h0_raw_scores", ue.DEC_T2I0_H0_RAW_SCORES, _t2i0_ref["h0_raw_scores"]),
+            # Helper's own Phase-2 output (same reference as h0_raw_scores).
+            # Tells us whether cross_attn_flash_single_head's internal Q@K^T
+            # matches the independent matmat_mul_core diagnostic.
+            ("h0_helper_p2", ue.DEC_T2I0_H0_HELPER_P2, _t2i0_ref["h0_raw_scores"]),
+            ("h0_scores",  ue.DEC_T2I0_H0_SCORES, _t2i0_ref["h0_scores"]),
+            ("h0_out",     ue.DEC_T2I0_H0_OUT,    _t2i0_ref["h0_out"]),
+            ("out_heads",  ue.DEC_T2I0_OUT_HEADS, _t2i0_ref["out_heads"]),
+            ("merged",     ue.DEC_T2I0_MERGED,    _t2i0_ref["merged"]),
+            ("out_proj",   ue.DEC_T2I0_OUT_PROJ,  _t2i0_ref["out_proj"]),
+        ]
+        _original_print("  ── t2i0 per-op HW↔CPU breakdown ──")
+        _original_print(f"  {'op':<10s}  {'numel':>9s}  {'nan':>5s} {'inf':>5s}  "
+                        f"{'hw_range':>22s}  {'ref_range':>22s}  "
+                        f"{'SNR(dB)':>8s}  {'cos':>8s}")
+        _t2i0_first_bad = None
+        for _op, _addr, _ref_t in _t2i0_probes:
+            _numel = _ref_t.numel()
+            _hw = ue.read_tensor_from_dram(_addr, _numel).float().reshape(_ref_t.shape)
+            _nn = int(torch.isnan(_hw).sum().item())
+            _ii = int(torch.isinf(_hw).sum().item())
+            _fin = _hw[torch.isfinite(_hw)]
+            _hwr = f"[{_fin.min():7.3f},{_fin.max():7.3f}]" if _fin.numel() > 0 else " [no finite]"
+            _ref_f = _ref_t.float()
+            _refr = f"[{_ref_f.min():7.3f},{_ref_f.max():7.3f}]"
+            if _nn > 0 or _ii > 0:
+                _snr_s, _cos_s = "   NaN", "   NaN"
+                _snr = -999.0
+            else:
+                _m = ue.tensor_metrics(_hw, _ref_f)
+                _snr_s, _cos_s = f"{_m['snr_db']:8.2f}", f"{_m['cos']:8.5f}"
+                _snr = _m["snr_db"]
+            _original_print(f"  {_op:<10s}  {_numel:>9d}  {_nn:>5d} {_ii:>5d}  "
+                            f"{_hwr:>22s}  {_refr:>22s}  {_snr_s}  {_cos_s}")
+            # Threshold: anything below 25 dB on a single op is a structural bug,
+            # not rounding. BF16 per-op floor is ~43 dB. 25 dB gives ~18 dB margin.
+            if _t2i0_first_bad is None and (_nn > 0 or _ii > 0 or _snr < 25.0):
+                _t2i0_first_bad = (_op, _snr, _nn, _ii)
+        if _t2i0_first_bad is not None:
+            _op, _snr, _nn, _ii = _t2i0_first_bad
+            _op_addr = {o: a for o, a, _ in _t2i0_probes}[_op]
+            _original_print(f"  ── t2i0 FIRST BAD OP: {_op}  "
+                            f"(SNR={_snr:.2f} dB, nan={_nn}, inf={_ii}) ──")
+            assert False, (
+                f"t2i0 bug localized to op '{_op}': SNR={_snr:.2f} dB "
+                f"(threshold 25 dB, bf16 floor ~43 dB). "
+                f"HW at 0x{_op_addr:08X} vs cpu_reference_t2i0_staged['{_op}']."
+            )
+        _original_print("  ── t2i0 all ops pass ≥25 dB ──")
+
         if _first_bad is not None:
             _label, _addr, _n_nan, _n_inf = _first_bad
             _original_print(f"  ── FIRST BAD STAGE: {_label}  (nan={_n_nan}, inf={_n_inf}) ──")
