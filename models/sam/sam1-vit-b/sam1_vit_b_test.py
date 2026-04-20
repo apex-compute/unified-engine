@@ -177,7 +177,9 @@ def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
                                   V_T_DRAM_ADDR: int,
                                   OUTPUT_DRAM_ADDR: int,
                                   SCORES_SCRATCH_ADDR: int,
-                                  SM_OUTPUT_DRAM_ADDR: int = None) -> int:
+                                  SM_OUTPUT_DRAM_ADDR: int = None,
+                                  FMAX_DUMP_DRAM_ADDR: int = None,
+                                  ZEROS_DRAM_ADDR: int = None) -> int:
     """Asymmetric flash attention for a single head.
 
     Mirrors ``UnifiedEngine.flash_attention_core``'s Phase-2 (Q @ K^T with
@@ -254,6 +256,20 @@ def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
             ue.sram_to_accelerator_memory(sram_address=scores_sram_addr,
                                           accelerator_dram_address=SCORES_SCRATCH_ADDR + r * N * bytes_per_element,
                                           element_size=N)
+
+        # Fmax dump: load zeros into Q slot, run fmax_core → output is -fmax[0], write to DRAM.
+        # This captures the actual running max after Phase 2, before softmax consumes it.
+        if FMAX_DUMP_DRAM_ADDR is not None and ZEROS_DRAM_ADDR is not None:
+            ue.accelerator_memory_to_sram(accelerator_dram_address=ZEROS_DRAM_ADDR,
+                                          sram_address=uram_a_start_addr,
+                                          element_size=UE_VEC)
+            ue.fmax_core(vector_sram_start_addr=uram_a_start_addr,
+                         output_sram_wb_addr=uram_a_start_addr,
+                         N=UE_VEC,
+                         fmax_context_addr=0)
+            ue.sram_to_accelerator_memory(sram_address=uram_a_start_addr,
+                                          accelerator_dram_address=FMAX_DUMP_DRAM_ADDR + r * UE_VEC * bytes_per_element,
+                                          element_size=UE_VEC)
 
         # Phase 3: softmax(scores row) in place at scores_sram_addr, slot 0
         ue.start_queue_for_bf16_softmax_operation(fmax_context_addr=0,
@@ -1733,6 +1749,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         # Q@K^T from its Phase-3 softmax.
         self.DEC_T2I0_H0_HELPER_P2 = self._alloc_tensor(NT * GA)      # helper Phase 2 (7, 4096)
         self.DEC_T2I0_H0_SCORES  = self._alloc_tensor(NT * GA)        # head 0 (7, 4096)
+        self.DEC_T2I0_H0_FMAX_DUMP = self._alloc_tensor(NT * 64)     # fmax[0] per row (7, 64) — element 0 is -fmax[0]
+        self.DEC_ZEROS_64        = self._alloc_param(torch.zeros(64, dtype=torch.bfloat16))  # constant zero vector for fmax probe
         self.DEC_T2I0_H0_OUT     = self._alloc_tensor(NT * 64)        # head 0 (7, 64)
         self.DEC_T2I0_OUT_HEADS  = self._alloc_tensor(8 * NT * 64)    # (8, 7, 64)
         self.DEC_T2I0_MERGED     = self._alloc_tensor(NT * 128)       # (7, 128)
@@ -1829,6 +1847,43 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                         f"{'*** OVERLAP ***' if tensor_end > SAM1_PROGRAM_BASE else 'OK, no overlap'}")
         _original_print(f"  PE_SX_SLOT addr: 0x{self.PE_SX_SLOT:08X}  "
                         f"DEC_KEY_PE ends:  0x{self.DEC_KEY_PE + self.GRID_AREA * self.DEC_DIM * 2:08X}")
+
+    # ------------------------------------------------------------------
+    # Bin save / load (params + instructions)
+    # ------------------------------------------------------------------
+
+    def save_bins(self, params_path: str, instr_path: str) -> None:
+        """Save params region and last compiled instructions to bin files."""
+        params_size = self.get_params_dram_usage()
+        params_data = self.dma_from_accelerator_memory(self._params_dram_base, torch.Size([params_size // 2]))
+        with open(params_path, "wb") as f:
+            f.write(params_data.view(torch.uint8).numpy().tobytes())
+        _original_print(f"  Saved params  → {params_path} ({params_size} bytes)")
+
+        if not hasattr(self, '_last_prog_addr') or not hasattr(self, '_last_prog_size'):
+            _original_print("  Warning: no compiled program to save (run compile first)")
+            return
+        instr_buf = bytearray(self._last_prog_size)
+        self.dma_read(DMA_DEVICE_C2H, self._last_prog_addr, instr_buf, self._last_prog_size)
+        with open(instr_path, "wb") as f:
+            f.write(instr_buf)
+        _original_print(f"  Saved instrs  → {instr_path} ({self._last_prog_size} bytes)")
+
+    def load_bins(self, params_path: str, instr_path: str) -> int:
+        """Load params and instructions from bin files. Returns program DRAM address."""
+        with open(params_path, "rb") as f:
+            raw = f.read()
+        data = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self._params_dram_base, data)
+        _original_print(f"  Loaded params ← {params_path} ({len(raw)} bytes)")
+
+        with open(instr_path, "rb") as f:
+            instr_raw = f.read()
+        prog_addr = self.allocate_program_dram(len(instr_raw))
+        self.dma_write(DMA_DEVICE_H2C, prog_addr, instr_raw, len(instr_raw))
+        _original_print(f"  Loaded instrs ← {instr_path} ({len(instr_raw)} bytes)")
+        self._last_prog_addr = prog_addr
+        return prog_addr
 
     # ------------------------------------------------------------------
     # Program compilation
@@ -2209,6 +2264,9 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                          self.VIT_LAYER_IN, self.GRID_AREA * VD)
 
         # SAM1 has no LN_pre.
+
+        if getattr(self, '_checkpoint_after_patch_embed', False):
+            raise _CheckpointStop("after patch embed")
 
         _original_print(f"  [compile] patch-embed: {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
 
@@ -2899,6 +2957,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=o_addr,
                 SCORES_SCRATCH_ADDR=self.DEC_CA_SCORES,
                 SM_OUTPUT_DRAM_ADDR=sm_tap,
+                FMAX_DUMP_DRAM_ADDR=self.DEC_T2I0_H0_FMAX_DUMP if h == 0 else None,
+                ZEROS_DRAM_ADDR=self.DEC_ZEROS_64 if h == 0 else None,
             )
             if h == 0:
                 # Phase-3 softmax does NOT write back to DEC_CA_SCORES, so
@@ -3606,7 +3666,8 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         self.stop_capture()
         prog_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prog_addr)
-        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self._last_prog_size = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(self._last_prog_size)
         self.clear_capture_buffer()
         self._last_prog_addr = prog_addr
 
@@ -4828,16 +4889,24 @@ def main():
         _vit_block_validate(ue, image_path, num_blocks=args.validate_blocks)
     else:
         # ── ViT + neck forward pass ──────────────────────────────────────
-        neck_cache = os.path.join(SCRIPT_DIR, "sam1_vit_b_bin", "neck_output.pt")
-        n_elems    = ue.GRID_AREA * ue.NECK_DIM  # 4096 * 256
+        neck_cache   = os.path.join(SCRIPT_DIR, "sam1_vit_b_bin", "neck_output.pt")
+        params_bin   = os.path.join(SCRIPT_DIR, "sam1_vit_b_bin", "sam1_params.bin")
+        instr_bin    = os.path.join(SCRIPT_DIR, "sam1_vit_b_bin", "sam1_instructions.bin")
+        n_elems      = ue.GRID_AREA * ue.NECK_DIM  # 4096 * 256
+        bins_exist   = os.path.exists(params_bin) and os.path.exists(instr_bin)
 
         if False and os.path.exists(neck_cache):
             _original_print(f"  Loading cached neck output from {neck_cache}...")
             neck_out = torch.load(neck_cache, weights_only=True)  # (4096, 256) bf16
         else:
             t1 = _time.perf_counter()
-            prog_addr = ue.compile_full_fused()
-            _original_print(f"  Compile: {_time.perf_counter() - t1:.3f}s")
+            if bins_exist:
+                _original_print("  Loading params + instructions from bin cache...")
+                prog_addr = ue.load_bins(params_bin, instr_bin)
+                _original_print(f"  Load: {_time.perf_counter() - t1:.3f}s")
+            else:
+                prog_addr = ue.compile_full_fused()
+                _original_print(f"  Compile: {_time.perf_counter() - t1:.3f}s")
 
             # Prompt encoder: write 4 sin/cos table rows for (x_px, y_px) to fixed DRAM slots.
             # The compiled program assembles DEC_TOKENS, DEC_QUERY_PE, DEC_KEY_PE from these.
@@ -4874,14 +4943,41 @@ def main():
             torch.save(neck_out, neck_cache)
             _original_print(f"  Saved neck output → {neck_cache}")
 
+            if not bins_exist:
+                ue.save_bins(params_bin, instr_bin)
+                _original_print("  Bin cache saved for future runs.")
+
         _original_print(f"  Neck output shape: {neck_out.shape}, dtype: {neck_out.dtype}")
         _original_print(f"  |neck_out| mean={neck_out.float().abs().mean():.4f}  "
                         f"max={neck_out.float().abs().max():.4f}")
 
-        # Validate neck against CPU reference
-        _original_print("  Running CPU reference for neck...")
+        # ══════════════════════════════════════════════════════════════════════
+        # VIT OUTPUT CHECK — reads VIT_LAYER_IN from the full run above (before
+        # patch embed check overwrites it with a shorter program)
+        # ══════════════════════════════════════════════════════════════════════
+        _original_print("\033[1m  >>> VIT OUTPUT CHECK (pre-neck) <<<\033[0m")
         vit_out_raw = ue.read_tensor_from_dram(ue.VIT_LAYER_IN, ue.GRID_AREA * ue.VIT_DIM)
         vit_out_raw = vit_out_raw.reshape(ue.GRID_AREA, ue.VIT_DIM)
+        vit_ref = ue.cpu_reference_vit_blocks(image_path, num_blocks=ue.VIT_DEPTH)
+        ue.validate(ue.VIT_LAYER_IN, ue.GRID_AREA * ue.VIT_DIM, vit_ref, "ViT output (4096,768)")
+        _original_print("\033[1m  >>> END VIT OUTPUT CHECK <<<\033[0m")
+        # ══════════════════════════════════════════════════════════════════════
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PATCH EMBED CHECK — separate truncated run, stops before ViT blocks
+        # ══════════════════════════════════════════════════════════════════════
+        _original_print("\033[1m  >>> PATCH EMBED CHECK <<<\033[0m")
+        ue._checkpoint_after_patch_embed = True
+        _pe_prog = ue.compile_full_fused()
+        del ue._checkpoint_after_patch_embed
+        ue.run_hw(image_path, _pe_prog)
+        patch_ref = ue.cpu_reference_patch_embed(image_path)
+        ue.validate(ue.VIT_LAYER_IN, ue.GRID_AREA * ue.VIT_DIM, patch_ref, "Patch embed (4096,768)")
+        _original_print("\033[1m  >>> END PATCH EMBED CHECK <<<\033[0m")
+        # ══════════════════════════════════════════════════════════════════════
+
+        # Validate neck against CPU reference (uses HW vit_out_raw as input)
+        _original_print("  Running CPU reference for neck...")
         neck_ref = ue.cpu_reference_neck(vit_out_raw)
         ue.validate(ue.NECK_OUT, ue.GRID_AREA * ue.NECK_DIM, neck_ref, "Neck output (4096,256)")
 
@@ -4895,8 +4991,8 @@ def main():
                 rng = f"[{fin.min():.4f}, {fin.max():.4f}]"
             else:
                 rng = "[no finite]"
-            _original_print(f"  probe {label:<28s}  nan={nan_n:>7d}  inf={inf_n:>7d}  fin_range={rng}")
-            assert nan_n == 0 and inf_n == 0, f"NaN/Inf detected in {label}: nan={nan_n}, inf={inf_n}, fin_range={rng}"
+            flag = "  *** NaN/Inf ***" if (nan_n > 0 or inf_n > 0) else ""
+            _original_print(f"  probe {label:<28s}  nan={nan_n:>7d}  inf={inf_n:>7d}  fin_range={rng}{flag}")
 
         GA = ue.GRID_AREA        # 4096
         DD = ue.DEC_DIM          # 256
@@ -4983,6 +5079,10 @@ def main():
         _nan_pattern("DEC_SA_MERGED",  ue.DEC_SA_MERGED,  7  * DD)
         _nan_pattern("DEC_QUERY_PE",   ue.DEC_QUERY_PE,   7  * DD)
         _nan_pattern("DEC_KEY_PE",     ue.DEC_KEY_PE,     GA * DD)
+        # ── DEC_SRC / no_mask_embed: isolate NaN source for CA K/V ──
+        _nan_pattern("PE_NO_MASK(1,256)",  ue.PE_NO_MASK,     DD)
+        _nan_pattern("NECK_OUT(4096,256)", ue.NECK_OUT,       GA * DD)
+        _nan_pattern("DEC_SRC(4096,256)",  ue.DEC_SRC,        GA * DD)
         _nan_pattern("DEC_CA_T2I_K",   ue.DEC_CA_T2I_K,   GA * 8 * 64)
         _nan_pattern("DEC_CA_T2I_V",   ue.DEC_CA_T2I_V,   GA * 8 * 64)
         _original_print("  ── end PE corruption map ──")
@@ -5120,6 +5220,51 @@ def main():
             _op_addr = {o: a for o, a, _ in _t2i0_probes}[_op]
             _original_print(f"  ── t2i0 FIRST BAD OP: {_op}  "
                             f"(SNR={_snr:.2f} dB, nan={_nn}, inf={_ii}) ──")
+            # Per-row SNR breakdown for h0_scores to isolate which query rows fail
+            if _op == "h0_scores":
+                _original_print("  ── h0_scores per-row SNR (isolates multi-row fmax issue) ──")
+                _ref_scores = _t2i0_ref["h0_scores"].float()  # (NT, GA)
+                _NT, _GA = _ref_scores.shape[0], _ref_scores.shape[1]
+                for _r in range(_NT):
+                    _row_hw = ue.read_tensor_from_dram(
+                        ue.DEC_T2I0_H0_SCORES + _r * _GA * 2, _GA).float()
+                    _row_ref = _ref_scores[_r]
+                    _row_nn = int(torch.isnan(_row_hw).sum().item())
+                    if _row_nn > 0:
+                        _original_print(f"    row {_r}: NaN={_row_nn}/{_GA}")
+                    else:
+                        _rm = ue.tensor_metrics(_row_hw, _row_ref)
+                        _original_print(
+                            f"    row {_r}: SNR={_rm['snr_db']:7.2f} dB  "
+                            f"cos={_rm['cos']:8.5f}  "
+                            f"hw_range=[{_row_hw.min():7.4f},{_row_hw.max():7.4f}]  "
+                            f"hw_sum={_row_hw.sum().item():.5f}")
+                # Also show pre-softmax scores per-row for cross-check
+                _original_print("  ── h0_helper_p2 per-row SNR (pre-softmax, should all be ~50dB) ──")
+                _ref_raw = _t2i0_ref["h0_raw_scores"].float()
+                for _r in range(_NT):
+                    _row_hw = ue.read_tensor_from_dram(
+                        ue.DEC_T2I0_H0_HELPER_P2 + _r * _GA * 2, _GA).float()
+                    _row_ref = _ref_raw[_r]
+                    _row_nn = int(torch.isnan(_row_hw).sum().item())
+                    if _row_nn > 0:
+                        _original_print(f"    row {_r}: NaN={_row_nn}/{_GA}")
+                    else:
+                        _rm = ue.tensor_metrics(_row_hw, _row_ref)
+                        _original_print(
+                            f"    row {_r}: SNR={_rm['snr_db']:7.2f} dB  "
+                            f"hw_range=[{_row_hw.min():7.1f},{_row_hw.max():7.1f}]")
+                # fmax[0] dump: element 0 of each row is -fmax[0] after Phase 2
+                _original_print("  ── fmax[0] dump per row (hw fmax vs ref row max) ──")
+                _ref_raw2 = _t2i0_ref["h0_raw_scores"].float()
+                for _r in range(_NT):
+                    _fmax_row = ue.read_tensor_from_dram(
+                        ue.DEC_T2I0_H0_FMAX_DUMP + _r * 64 * 2, 64).float()
+                    _hw_fmax = -_fmax_row[0].item()  # fmax_core gives 0 + (-fmax) = -fmax
+                    _ref_max = _ref_raw2[_r].max().item()
+                    _original_print(
+                        f"    row {_r}: hw_fmax={_hw_fmax:8.2f}  ref_row_max={_ref_max:8.2f}  "
+                        f"diff={_hw_fmax - _ref_max:+8.2f}")
             assert False, (
                 f"t2i0 bug localized to op '{_op}': SNR={_snr:.2f} dB "
                 f"(threshold 25 dB, bf16 floor ~43 dB). "
