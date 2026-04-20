@@ -23,7 +23,7 @@ from huggingface_hub import snapshot_download
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, UE_ARGMAX1_INDEX,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, UE_ARGMAX1_INDEX,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
     UnifiedEngine,
@@ -1531,6 +1531,85 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.allocate_program_dram(worst_case)
         print(f"    Loaded prefill raw ({len(self._prefill_raw)} bytes) + scratch ({worst_case} bytes)")
 
+    def dump_snapshot(self) -> None:
+        """Dump params DRAM + all runtime address metadata to smolvlm2_bin/params.bin + params.json."""
+        bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
+        bin_path = os.path.join(bin_dir, "params.bin")
+        meta_path = os.path.join(bin_dir, "params.json")
+        total = self.get_params_dram_usage()
+        CHUNK = 1 * 1024 * 1024
+        with open(bin_path, "wb") as f:
+            offset = 0
+            while offset < total:
+                sz = min(CHUNK, total - offset)
+                buf = bytearray(sz)
+                self.dma_read(DMA_DEVICE_C2H, self._params_dram_base + offset, buf, sz)
+                f.write(buf)
+                offset += sz
+        addr_attrs = [
+            "embed_addr", "ROPE_COS_DRAM", "ROPE_SIN_DRAM", "PERMUTE_PARAMS_DRAM",
+            "LAYER0_K_DRAM", "LAYER0_V_DRAM", "LAYER0_INPUT_DRAM", "LAYER0_OUTPUT_DRAM",
+            "LAYER0_PRE_NORM_DRAM", "LAYER0_Q_DRAM", "LAYER0_K_PROJ_DRAM", "LAYER0_V_PROJ_DRAM",
+            "LAYER0_Q_PERM_DRAM", "LAYER0_ATTN_OUT_DRAM", "LAYER0_ATTN_SCRATCH_DRAM",
+            "LAYER0_ATTN_RESULT_DRAM", "LAYER0_O_PROJ_DRAM", "LAYER0_RESIDUAL_DRAM",
+            "LAYER0_MLP_GATE_DRAM", "LAYER0_MLP_UP_DRAM", "LAYER0_MLP_MULT_DRAM",
+            "LAYER0_MLP_DOWN_DRAM", "FINAL_NORM_DRAM", "LOGITS_DRAM",
+            "CAUSAL_MASK_DRAM", "DECODE_BIAS_DRAM",
+            "VIS_PIXEL_IN_DRAM", "VIS_PATCH_PERM_DRAM", "VIS_PATCH_PROJ_DRAM",
+            "VIS_IO_A_DRAM", "VIS_IO_B_DRAM", "VIS_LN_OUT_DRAM",
+            "VIS_Q_DRAM", "VIS_K_DRAM", "VIS_V_DRAM",
+            "VIS_Q_PERM_DRAM", "VIS_K_PERM_DRAM", "VIS_V_PERM_DRAM",
+            "VIS_ATTN_OUT_DRAM", "VIS_ATTN_SCRATCH_DRAM", "VIS_ATTN_RESULT_DRAM",
+            "VIS_O_PROJ_DRAM", "VIS_RESIDUAL_DRAM", "VIS_MLP_INTER_DRAM", "VIS_MLP_OUT_DRAM",
+            "VIS_POST_LN_DRAM", "VIS_SHUFFLED_DRAM", "VIS_CONNECTOR_DRAM", "PERMUTE_TEMP_DRAM",
+        ]
+        meta = {
+            "params_size": total,
+            "tensor_size": self.get_tensor_dram_usage(),
+            "max_seq_len": self.max_seq_len,
+            "k_size": self.k_size,
+            "KV_HEAD_STRIDE": self.KV_HEAD_STRIDE,
+            "KV_LAYER_STRIDE": self.KV_LAYER_STRIDE,
+            "vision_bf16": self.vision_bf16,
+            "_num_vis_layers": len(self.vis_layer_addrs),
+        }
+        for attr in addr_attrs:
+            meta[attr] = getattr(self, attr)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        _original_print(f"  Snapshot dumped: {total / 1024**2:.1f} MB → {bin_path}")
+
+    def load_snapshot(self) -> bool:
+        """Load params DRAM from snapshot bin + restore all address metadata. Returns True if loaded."""
+        bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
+        bin_path = os.path.join(bin_dir, "params.bin")
+        meta_path = os.path.join(bin_dir, "params.json")
+        if not os.path.exists(bin_path) or not os.path.exists(meta_path):
+            return False
+        with open(meta_path) as f:
+            meta = json.load(f)
+        total = meta["params_size"]
+        CHUNK = 1 * 1024 * 1024
+        with open(bin_path, "rb") as f:
+            offset = 0
+            while offset < total:
+                data = f.read(min(CHUNK, total - offset))
+                self.dma_write(DMA_DEVICE_H2C, self._params_dram_base + offset, data, len(data))
+                offset += len(data)
+        self.allocate_params_dram(total)
+        self.allocate_tensor_dram(meta["tensor_size"])
+        for key, val in meta.items():
+            if key not in ("params_size", "tensor_size"):
+                setattr(self, key, val)
+        from transformers import AutoTokenizer
+        model_dir = os.path.join(self.script_dir, "smolvlm2_bin", "SmolVLM2-500M-Video-Instruct")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        kv_zeros = torch.zeros(self.NUM_LAYERS * self.NUM_KV_HEADS * self.max_seq_len * self.HEAD_DIM, dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.LAYER0_K_DRAM, kv_zeros)
+        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zeros)
+        _original_print(f"  Snapshot loaded: {total / 1024**2:.1f} MB")
+        return True
+
     def load_decoder(self) -> None:
         """Load pre-compiled decoder from bin (embed programs + bucket programs)."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
@@ -1811,8 +1890,10 @@ def main():
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir, vision_bf16=not args.vision_fp4)
     init_hang_prevention(ue)
-    ue.weight_init()
-    ue.tensor_init(max_seq_len=args.max_seq)
+    if not ue.load_snapshot():
+        ue.weight_init()
+        ue.tensor_init(max_seq_len=args.max_seq)
+        ue.dump_snapshot()
     has_image = args.image is not None
     token_ids = build_input_ids(ue.tokenizer, args.prompt, has_image=has_image)
     seq_len = len(token_ids)

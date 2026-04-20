@@ -902,7 +902,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             gflops_program, _ = self.report_flop_rate_gflops(gflops)
             print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
 
-    def compile_prefill(self, seq_len: int, layer_size: int | None = None) -> dict:
+    def compile_prefill(self, seq_len: int, layer_size: int | None = None, save_bin: bool = True) -> dict:
         """
         Compile prefill for the given prefill sequence.
 
@@ -1108,6 +1108,19 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         prefill_program_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prefill_program_addr)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        if save_bin:
+            prefill_bytes = bytearray()
+            for inst in self.capture_buffer:
+                prefill_bytes.extend(inst.get_bytes())
+            bin_dir = os.path.join(self.script_dir, "qwen3_1.7b_bin")
+            os.makedirs(bin_dir, exist_ok=True)
+            bin_path  = os.path.join(bin_dir, f"prefill_program_S{seq_len + 1}.bin")
+            meta_path = os.path.join(bin_dir, f"prefill_program_S{seq_len + 1}.json")
+            with open(bin_path, "wb") as f:
+                f.write(prefill_bytes)
+            with open(meta_path, "w") as f:
+                json.dump({"seq_len": seq_len + 1, "total_flops": total_flops}, f)
+            print(f"    Prefill bin saved: {bin_path} ({len(prefill_bytes)} bytes)")
         self.clear_capture_buffer()
         set_silent(False)
         _original_print()  # newline after \r layer progress
