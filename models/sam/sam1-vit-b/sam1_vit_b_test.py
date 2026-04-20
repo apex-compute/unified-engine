@@ -211,140 +211,95 @@ def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
     assert head_dim % UE_VEC == 0, f"head_dim={head_dim} must be multiple of {UE_VEC}"
     assert kv_len % UE_VEC == 0, f"kv_len={kv_len} must be multiple of {UE_VEC}"
 
-    # -----------------------------------------------------------------
-    # Direct port of gemma3_test.py flash decode (Phase 2 + Phase 3 + Phase 3b).
-    # Gemma3 hardcodes M = 1 (decode, one query token). We generalise to
-    # M = q_len for cross-attention. Everything else is a line-by-line
-    # copy, including the per-row fmax_context_addr, the clear_en flip
-    # inside the output_row loop, and the output_sram_wb_addr = uram_a +
-    # m_take*K*bpe layout. We skip Gemma3's Phase 1 (V^T via identity)
-    # because V^T is precomputed by the caller and sits at V_T_DRAM_ADDR.
-    # Q arrives pre-scaled at Q_DRAM_ADDR (caller owns the scale factor —
-    # SAM uses 1/sqrt(CA_HD) with CA_HD=16, not 1/sqrt(head_dim)=1/sqrt(64)).
-    # -----------------------------------------------------------------
-    M = q_len
+    # Process one query row at a time, always using fmax slot 0.
+    # This matches the proven gemma3 decode path (M=1, slot 0 only).
+    # Multi-row batching (slots 0..q_len-1) causes stale fmax state in
+    # slots 1+ producing exp() overflow → NaN in softmax.
     K = head_dim
     N = kv_len
 
-    # Phase 2: Q @ K^T → scores @ SCORES_SCRATCH_ADDR
     usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
     N_chunk = min(N, (usable_uram_b_elements // K) // UE_VEC * UE_VEC)
     assert N_chunk >= UE_VEC, f"N_chunk={N_chunk} < UE_VEC={UE_VEC}"
 
-    usable_uram_a_elements = URAM_FULL_ELEMENTS
-    output_N_size = N_chunk
-    M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, usable_uram_a_elements // (K + output_N_size))
-    assert 1 <= M_chunk <= M, f"M_chunk={M_chunk} out of range (M={M})"
-
     uram_a_start_addr = 0x00000
     uram_b_start_addr = 0x80000
+    # URAM_A layout per row: [Q row (K elems)] [scores row (N elems)]
+    scores_sram_addr = uram_a_start_addr + K * bytes_per_element
+    assert scores_sram_addr + N * bytes_per_element <= 0x80000, "Q+scores overflow URAM_A"
 
-    for i, m_take in ue.chunk_ranges(M, M_chunk):
-        ue.accelerator_memory_to_sram(accelerator_dram_address=Q_DRAM_ADDR + i * K * bytes_per_element,
+    for r in range(q_len):
+        # Load single query row into URAM_A
+        ue.accelerator_memory_to_sram(accelerator_dram_address=Q_DRAM_ADDR + r * K * bytes_per_element,
                                       sram_address=uram_a_start_addr,
-                                      element_size=m_take * K)
+                                      element_size=K)
 
-        output_sram_wb_addr = uram_a_start_addr + m_take * K * bytes_per_element
-        assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} >= URAM_B base"
-
+        # Phase 2: row r of Q @ K^T → scores row, accumulated into slot 0
         for j, n_take in ue.chunk_ranges(N, N_chunk):
             ue.accelerator_memory_to_sram(accelerator_dram_address=K_DRAM_ADDR + j * K * bytes_per_element,
                                           sram_address=uram_b_start_addr,
                                           element_size=n_take * K)
 
-            assert m_take * K + n_take * m_take <= URAM_FULL_ELEMENTS
+            assert K + n_take <= URAM_FULL_ELEMENTS
 
-            clear_en = 1 if j == 0 else 0
-            for output_row in range(m_take):
-                out_sram_offset = output_row * n_take * bytes_per_element
+            ue.start_queue_for_bf16_matvec_operation(max_clear_en=1 if j == 0 else 0,
+                                                     fmax_context_addr=0,
+                                                     vector_sram_start_addr=uram_a_start_addr,
+                                                     matrix_sram_start_addr=uram_b_start_addr,
+                                                     output_sram_wb_addr=scores_sram_addr + j * bytes_per_element,
+                                                     K=K,
+                                                     N=n_take)
 
-                ue.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
-                                                        fmax_context_addr=output_row,
-                                                        vector_sram_start_addr=uram_a_start_addr + output_row * K * bytes_per_element,
-                                                        matrix_sram_start_addr=uram_b_start_addr,
-                                                        output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
-                                                        K=K,
-                                                        N=n_take)
+        if SCORES_SCRATCH_ADDR is not None:
+            ue.sram_to_accelerator_memory(sram_address=scores_sram_addr,
+                                          accelerator_dram_address=SCORES_SCRATCH_ADDR + r * N * bytes_per_element,
+                                          element_size=N)
 
-            start_dram_address_of_partial_matrix = SCORES_SCRATCH_ADDR + j * bytes_per_element
-            ue.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                          accelerator_dram_address=start_dram_address_of_partial_matrix,
-                                          element_size=m_take * n_take,
-                                          stride_bytes_per_chunk=n_take * bytes_per_element,
-                                          stride_jump_bytes=N * bytes_per_element)
+        # Phase 3: softmax(scores row) in place at scores_sram_addr, slot 0
+        ue.start_queue_for_bf16_softmax_operation(fmax_context_addr=0,
+                                                   vector_sram_start_addr=scores_sram_addr,
+                                                   output_sram_wb_addr=scores_sram_addr,
+                                                   N=N)
 
-        # Phase 3: softmax(scores) + SM @ V^T, inside the outer i-loop.
-        max_m_take = min((URAM_FULL_ELEMENTS - UE_VEC) // N, UE_FMAX_CONTEXT_SIZE)
+        if SM_OUTPUT_DRAM_ADDR is not None:
+            ue.sram_to_accelerator_memory(sram_address=scores_sram_addr,
+                                          accelerator_dram_address=SM_OUTPUT_DRAM_ADDR + r * N * bytes_per_element,
+                                          element_size=N)
 
-        for m_take_chunk_idx, m_take_chunk_size in ue.chunk_ranges(m_take, max_m_take):
-            ue.accelerator_memory_to_sram(accelerator_dram_address=SCORES_SCRATCH_ADDR + m_take_chunk_idx * N * bytes_per_element,
-                                          sram_address=uram_a_start_addr,
-                                          element_size=m_take_chunk_size * N)
+        # Phase 3b: SM row @ V^T → output row r
+        # V^T is (head_dim, kv_len); chunk along head_dim rows.
+        # With N=kv_len large, v_tr_row_chunk_size may fall below UE_VEC; use fallback.
+        v_tr_row_chunk_size = (URAM_NEAR_FULL_ELEMENTS // N // UE_VEC) * UE_VEC
+        v_tr_row_chunk_size_aligned = None
+        if v_tr_row_chunk_size < UE_VEC:
+            v_tr_row_chunk_size_aligned = UE_VEC
+            if N * 32 <= URAM_NEAR_FULL_ELEMENTS:
+                v_tr_row_chunk_size = 32
+            elif N * 16 <= URAM_NEAR_FULL_ELEMENTS:
+                v_tr_row_chunk_size = 16
+            else:
+                assert False, f"kv_len N={N} too large for v_tr fallback"
 
-            for row_idx in range(m_take_chunk_size):
-                ue.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
-                                                          vector_sram_start_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
-                                                          output_sram_wb_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
-                                                          N=N)
+        v_t_sram_start_addr = 0x80000
+        output_sram_wb_addr = scores_sram_addr + N * bytes_per_element  # after scores, no overlap
 
-            if SM_OUTPUT_DRAM_ADDR is not None:
-                ue.sram_to_accelerator_memory(sram_address=uram_a_start_addr,
-                                              accelerator_dram_address=SM_OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * N * bytes_per_element,
-                                              element_size=m_take_chunk_size * N)
+        for v_tr_column_idx, v_tr_column_take in ue.chunk_ranges(head_dim, v_tr_row_chunk_size):
+            ue.accelerator_memory_to_sram(accelerator_dram_address=V_T_DRAM_ADDR + v_tr_column_idx * N * bytes_per_element,
+                                          sram_address=v_t_sram_start_addr,
+                                          element_size=v_tr_column_take * N)
 
-            # Chunk V^T along head_dim. With N=kv_len large (e.g. 4096) and 1-row
-            # URAM_B headroom, the "round down to UE_VEC multiple" collapses to 0.
-            # Mirror gemma3_test.py's aligned-fallback: drop to 32 or 16 rows per
-            # chunk and pad the matvec output up to UE_VEC per row.
-            v_tr_row_chunk_size = min((URAM_NEAR_FULL_ELEMENTS // N // UE_VEC) * UE_VEC,
-                                      ((URAM_FULL_ELEMENTS - m_take_chunk_size * N) // m_take_chunk_size // UE_VEC) * UE_VEC,
-                                      head_dim)
-            v_tr_row_chunk_size_aligned = None
-            if v_tr_row_chunk_size < UE_VEC:
-                v_tr_row_chunk_size_aligned = UE_VEC
-                if N * 32 <= URAM_NEAR_FULL_ELEMENTS:
-                    v_tr_row_chunk_size = 32
-                elif N * 16 <= URAM_NEAR_FULL_ELEMENTS:
-                    v_tr_row_chunk_size = 16
-                else:
-                    assert False, f"kv_len N={N} too large for v_tr fallback in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
+            ue.start_queue_for_bf16_matvec_operation(max_clear_en=1 if v_tr_column_idx == 0 else 0,
+                                                     fmax_context_addr=1,
+                                                     vector_sram_start_addr=scores_sram_addr,
+                                                     matrix_sram_start_addr=v_t_sram_start_addr,
+                                                     output_sram_wb_addr=output_sram_wb_addr,
+                                                     K=N,
+                                                     N=v_tr_column_take)
 
-            v_t_sram_start_addr = 0x80000
-            output_sram_wb_addr = uram_a_start_addr + m_take_chunk_size * N * bytes_per_element
-
-            for v_tr_column_idx, v_tr_column_take in ue.chunk_ranges(head_dim, v_tr_row_chunk_size):
-                ue.accelerator_memory_to_sram(accelerator_dram_address=V_T_DRAM_ADDR + v_tr_column_idx * N * bytes_per_element,
-                                              sram_address=v_t_sram_start_addr,
-                                              element_size=v_tr_column_take * N)
-
-                for p_row_idx in range(m_take_chunk_size):
-                    if v_tr_row_chunk_size_aligned is None:
-                        output_sram_wb_offset = p_row_idx * v_tr_column_take * bytes_per_element
-                    else:
-                        output_sram_wb_offset = 0
-
-                    ue.start_queue_for_bf16_matvec_operation(max_clear_en=0,
-                                                            fmax_context_addr=0,
-                                                            vector_sram_start_addr=uram_a_start_addr + p_row_idx * N * bytes_per_element,
-                                                            matrix_sram_start_addr=v_t_sram_start_addr,
-                                                            output_sram_wb_addr=output_sram_wb_addr + output_sram_wb_offset,
-                                                            K=N,
-                                                            N=v_tr_column_take)
-
-                    if v_tr_row_chunk_size_aligned is not None:
-                        ue.sram_to_accelerator_memory(
-                            sram_address=output_sram_wb_addr + output_sram_wb_offset,
-                            accelerator_dram_address=OUTPUT_DRAM_ADDR
-                                + (i + m_take_chunk_idx + p_row_idx) * head_dim * bytes_per_element
-                                + v_tr_column_idx * bytes_per_element,
-                            element_size=v_tr_column_take)
-
-                if v_tr_row_chunk_size_aligned is None:
-                    ue.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                  accelerator_dram_address=OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * head_dim * bytes_per_element + v_tr_column_idx * bytes_per_element,
-                                                  element_size=m_take_chunk_size * v_tr_column_take,
-                                                  stride_bytes_per_chunk=v_tr_column_take * bytes_per_element,
-                                                  stride_jump_bytes=head_dim * bytes_per_element)
+            ue.sram_to_accelerator_memory(
+                sram_address=output_sram_wb_addr,
+                accelerator_dram_address=OUTPUT_DRAM_ADDR + r * head_dim * bytes_per_element + v_tr_column_idx * bytes_per_element,
+                element_size=v_tr_column_take)
 
     total_flops = (2 * q_len * head_dim * kv_len  # Q @ K^T
                    + q_len * kv_len * 5            # softmax
@@ -1901,6 +1856,328 @@ class Sam1VitB_UnifiedEngine(UnifiedEngine):
         self._finalize_program()
         _SILENT_MODE = False
         return self._last_prog_addr
+
+    def compile_patch_embed_vit(self) -> int:
+        """Compile patch embedding + 12 ViT blocks + neck as a standalone instruction stream.
+
+        Input:  VIT_PATCH_OUT  (written by extract_patches_to_dram before execution)
+        Output: NECK_OUT       (4096, 256) bf16 image embedding — ready for mask decoder
+
+        Returns program DRAM address.
+        """
+        global _SILENT_MODE
+        _SILENT_MODE = True
+
+        VD    = self.VIT_DIM
+        VD_QK = self.VIT_QK_DIM_PAD
+        hd    = self.VIT_HEAD_DIM_PAD
+        bpe   = 2
+
+        self.start_capture()
+        _tp = _time.perf_counter()
+
+        # ------------------------------------------------------------------
+        # Phase 1: Patch embedding
+        # ------------------------------------------------------------------
+        self.matmat_mul_core(
+            M=self.GRID_AREA, K=self.PATCH_K_PAD, N=VD,
+            A_DRAM_ADDR=self.VIT_PATCH_OUT,
+            B_DRAM_ADDR=self.PATCH_EMBED_WEIGHT,
+            OUTPUT_DRAM_ADDR=self.VIT_LAYER_IN,
+            C_DRAM_ADDR=self.PATCH_EMBED_BIAS,
+            bias_mode="broadcast_N",
+        )
+        eltwise_add_dram(self, self.VIT_LAYER_IN, self.POS_EMBED,
+                         self.VIT_LAYER_IN, self.GRID_AREA * VD)
+        _original_print(f"  [compile] patch-embed: {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
+
+        # ------------------------------------------------------------------
+        # Phase 2: ViT blocks (12)
+        # ------------------------------------------------------------------
+        _pre_vit_inst = self.capture_count
+        for blk_idx in range(self.VIT_DEPTH):
+            _blk_start = self.capture_count
+            bw = self.vit_block_weights[blk_idx]
+            is_global = blk_idx in self.VIT_GLOBAL_BLOCKS
+
+            if is_global:
+                seq_len       = self.GRID_AREA
+                num_windows   = 1
+                total_batches = self.VIT_HEADS
+                M_flat        = self.GRID_AREA
+            else:
+                seq_len       = self.VIT_WINDOW_AREA
+                num_windows   = self.VIT_NUM_WINDOWS
+                total_batches = num_windows * self.VIT_HEADS
+                M_flat        = self.GRID_AREA_PAD
+
+            self.layer_norm_core_dram(
+                M=self.GRID_AREA, N=VD,
+                A_DRAM_ADDR=self.VIT_LAYER_IN,
+                OUTPUT_DRAM_ADDR=self.VIT_LN_OUT,
+                GAMMA_DRAM_ADDR=bw['norm1_gamma'],
+                BETA_DRAM_ADDR=bw['norm1_beta'],
+            )
+
+            if not is_global:
+                pad_feature_map_dram(self,
+                    INPUT_DRAM_ADDR=self.VIT_LN_OUT,
+                    OUTPUT_DRAM_ADDR=self.VIT_PADDED,
+                    H=self.GRID_SIZE, W=self.GRID_SIZE,
+                    H_PAD=self.GRID_SIZE_PAD, W_PAD=self.GRID_SIZE_PAD,
+                    C=VD)
+                window_partition_dram(self,
+                    INPUT_DRAM_ADDR=self.VIT_PADDED,
+                    OUTPUT_DRAM_ADDR=self.VIT_WINDOWED,
+                    H=self.GRID_SIZE_PAD, W=self.GRID_SIZE_PAD, C=VD,
+                    window_size=self.VIT_WINDOW_SIZE)
+                attn_input = self.VIT_WINDOWED
+            else:
+                attn_input = self.VIT_LN_OUT
+
+            if not is_global:
+                wa = seq_len          # 196
+                wa_pad = self.VIT_WINDOW_AREA_PAD  # 256
+                win_stride     = wa     * VD  # 150,528 elements (compact window)
+                win_stride_pad = wa_pad * VD  # 196,608 elements (padded window)
+
+                # Pad each of the 25 windows from 196→256 rows into VIT_ATTN_SCRATCH[0].
+                # The gap rows (196..255) stay zero. This gives (6400, 768) contiguous input
+                # for the matmul, eliminating the 300-entry per-head scatter after projection.
+                # VIT_ATTN_SCRATCH is 49 MB; flash_attention uses only the first ~160 KB per
+                # call, so the padded region and raw-QKV temp (at offset 6400*768*bpe) are
+                # never clobbered during attention.
+                dram_zero_fill(self, self.VIT_ATTN_SCRATCH, num_windows * win_stride_pad)
+                for w in range(num_windows):
+                    dram_copy(self,
+                        attn_input + w * win_stride * bpe,
+                        self.VIT_ATTN_SCRATCH + w * win_stride_pad * bpe,
+                        win_stride)
+
+                # Temp buffer for raw (6400, 768) matmul output, just past the padded input.
+                raw_off = self.VIT_ATTN_SCRATCH + num_windows * win_stride_pad * bpe
+
+                for w_key, b_key, qkv_dst in [
+                    ('q_weight', 'q_bias', self.VIT_Q_HEADS),
+                    ('k_weight', 'k_bias', self.VIT_K_HEADS),
+                    ('v_weight', 'v_bias', self.VIT_V_HEADS),
+                ]:
+                    # Matmul on padded (6400, 768) — 25×256 rows, all 64-aligned.
+                    self.matmat_mul_core(
+                        M=num_windows * wa_pad, K=VD, N=VD_QK,
+                        A_DRAM_ADDR=self.VIT_ATTN_SCRATCH,
+                        B_DRAM_ADDR=bw[w_key],
+                        OUTPUT_DRAM_ADDR=raw_off,
+                        C_DRAM_ADDR=bw[b_key],
+                        bias_mode="broadcast_N",
+                    )
+                    # Per-window permute (256, 12, 64) → (12, 256, 64) → qkv_dst.
+                    # 25 permutes instead of 300 per-head scatter copies.
+                    for w in range(num_windows):
+                        self.bf16_permute_core(
+                            dim_0=wa_pad, dim_1=self.VIT_HEADS, dim_2=hd,
+                            INPUT_DRAM_ADDR=raw_off + w * win_stride_pad * bpe,
+                            OUTPUT_DRAM_ADDR=qkv_dst + w * self.VIT_HEADS * wa_pad * hd * bpe,
+                        )
+
+                seq_pad = wa_pad
+
+            else:
+                # Global: matmul (4096,768) → VIT_Q/K/V, then permute (4096,12,64)→(12,4096,64).
+                for w_key, b_key, out_addr, qkv_dst in [
+                    ('q_weight', 'q_bias', self.VIT_Q, self.VIT_Q_HEADS),
+                    ('k_weight', 'k_bias', self.VIT_K, self.VIT_K_HEADS),
+                    ('v_weight', 'v_bias', self.VIT_V, self.VIT_V_HEADS),
+                ]:
+                    self.matmat_mul_core(
+                        M=M_flat, K=VD, N=VD_QK,
+                        A_DRAM_ADDR=attn_input,
+                        B_DRAM_ADDR=bw[w_key],
+                        OUTPUT_DRAM_ADDR=out_addr,
+                        C_DRAM_ADDR=bw[b_key],
+                        bias_mode="broadcast_N",
+                    )
+                    self.bf16_permute_core(
+                        dim_0=seq_len, dim_1=self.VIT_HEADS, dim_2=hd,
+                        INPUT_DRAM_ADDR=out_addr,
+                        OUTPUT_DRAM_ADDR=qkv_dst,
+                    )
+
+                seq_pad = seq_len
+
+            broadcast_mul_dram(self,
+                self.VIT_Q_HEADS,
+                1.0 / math.sqrt(hd),
+                total_batches * seq_pad * hd,
+            )
+
+            for b in range(total_batches):
+                off = b * seq_pad * hd * bpe
+                self.flash_attention_core(
+                    head_dim=hd, seq_len=seq_pad,
+                    Q_DRAM_ADDR=self.VIT_Q_HEADS + off,
+                    K_DRAM_ADDR=self.VIT_K_HEADS + off,
+                    V_DRAM_ADDR=self.VIT_V_HEADS + off,
+                    OUTPUT_DRAM_ADDR=self.VIT_ATTN_OUT + off,
+                    SCRATCH_DRAM_ADDR=self.VIT_ATTN_SCRATCH,
+                )
+
+            if not is_global:
+                # Merge: (25,12,256,64) → per-window permute → (25,256,768) in scratch,
+                # then strip padding 256→196 per window → VIT_ATTN_MERGED (25,196,768).
+                # VIT_ATTN_SCRATCH is free now (flash attention has finished writing ATTN_OUT).
+                for w in range(num_windows):
+                    self.bf16_permute_core(
+                        dim_0=self.VIT_HEADS, dim_1=wa_pad, dim_2=hd,
+                        INPUT_DRAM_ADDR=self.VIT_ATTN_OUT + w * self.VIT_HEADS * wa_pad * hd * bpe,
+                        OUTPUT_DRAM_ADDR=self.VIT_ATTN_SCRATCH + w * win_stride_pad * bpe,
+                    )
+                for w in range(num_windows):
+                    dram_copy(self,
+                        self.VIT_ATTN_SCRATCH + w * win_stride_pad * bpe,
+                        self.VIT_ATTN_MERGED + w * win_stride * bpe,
+                        win_stride)
+                out_proj_M = num_windows * wa  # 4900
+            else:
+                self.bf16_permute_core(
+                    dim_0=self.VIT_HEADS, dim_1=seq_len, dim_2=hd,
+                    INPUT_DRAM_ADDR=self.VIT_ATTN_OUT,
+                    OUTPUT_DRAM_ADDR=self.VIT_ATTN_MERGED,
+                )
+                out_proj_M = seq_len  # 4096
+
+            self.matmat_mul_core(
+                M=out_proj_M, K=VD_QK, N=VD,
+                A_DRAM_ADDR=self.VIT_ATTN_MERGED,
+                B_DRAM_ADDR=bw['proj_weight'],
+                OUTPUT_DRAM_ADDR=self.VIT_OUT_PROJ,
+                C_DRAM_ADDR=bw['proj_bias'],
+                bias_mode="broadcast_N",
+            )
+
+            if not is_global:
+                window_reverse_dram(self,
+                    INPUT_DRAM_ADDR=self.VIT_OUT_PROJ,
+                    OUTPUT_DRAM_ADDR=self.VIT_ATTN_MERGED,
+                    H=self.GRID_SIZE_PAD, W=self.GRID_SIZE_PAD, C=VD,
+                    window_size=self.VIT_WINDOW_SIZE)
+                unpad_feature_map_dram(self,
+                    INPUT_DRAM_ADDR=self.VIT_ATTN_MERGED,
+                    OUTPUT_DRAM_ADDR=self.VIT_LN_OUT,
+                    H=self.GRID_SIZE, W=self.GRID_SIZE,
+                    W_PAD=self.GRID_SIZE_PAD, C=VD)
+                attn_result = self.VIT_LN_OUT
+            else:
+                attn_result = self.VIT_OUT_PROJ
+
+            eltwise_add_dram(self, self.VIT_LAYER_IN, attn_result,
+                             self.VIT_RESIDUAL, self.GRID_AREA * VD)
+
+            self.layer_norm_core_dram(
+                M=self.GRID_AREA, N=VD,
+                A_DRAM_ADDR=self.VIT_RESIDUAL,
+                OUTPUT_DRAM_ADDR=self.VIT_LN_OUT,
+                GAMMA_DRAM_ADDR=bw['norm2_gamma'],
+                BETA_DRAM_ADDR=bw['norm2_beta'],
+            )
+
+            self.matmat_mul_core(
+                M=self.GRID_AREA, K=VD, N=self.VIT_MLP_HIDDEN,
+                A_DRAM_ADDR=self.VIT_LN_OUT,
+                B_DRAM_ADDR=bw['fc1_weight'],
+                OUTPUT_DRAM_ADDR=self.VIT_MLP_MID,
+                C_DRAM_ADDR=bw['fc1_bias'],
+                bias_mode="broadcast_N",
+                gelu_enable=True,
+            )
+            self.matmat_mul_core(
+                M=self.GRID_AREA, K=self.VIT_MLP_HIDDEN, N=VD,
+                A_DRAM_ADDR=self.VIT_MLP_MID,
+                B_DRAM_ADDR=bw['fc2_weight'],
+                OUTPUT_DRAM_ADDR=self.VIT_MLP_OUT,
+                C_DRAM_ADDR=bw['fc2_bias'],
+                bias_mode="broadcast_N",
+            )
+
+            eltwise_add_dram(self, self.VIT_RESIDUAL, self.VIT_MLP_OUT,
+                             self.VIT_LAYER_IN, self.GRID_AREA * VD)
+
+            _blk_inst  = self.capture_count - _blk_start
+            _total_inst = self.capture_count - _pre_vit_inst
+            _type = "GLOBAL" if is_global else "local"
+            _original_print(
+                f"    Block {blk_idx:2d} ({_type}): {_blk_inst:>10,} inst  |  "
+                f"cumulative: {_total_inst:>12,} inst  ({_total_inst * 32 / 1024**2:.0f} MB)")
+
+        _original_print(f"  [compile] ViT blocks (12): {_time.perf_counter() - _tp:.3f}s"); _tp = _time.perf_counter()
+
+        # ------------------------------------------------------------------
+        # Phase 3: Neck — Conv1×1 → LN → Conv3×3 → LN
+        # Input:  VIT_LAYER_IN (4096, 768)
+        # Output: NECK_OUT     (4096, 256)
+        # ------------------------------------------------------------------
+        ND = self.NECK_DIM  # 256
+        GS = self.GRID_SIZE  # 64
+
+        self.matmat_mul_core(
+            M=self.GRID_AREA, K=VD, N=ND,
+            A_DRAM_ADDR=self.VIT_LAYER_IN,
+            B_DRAM_ADDR=self.NECK_CONV1_W,
+            OUTPUT_DRAM_ADDR=self.VIT_NECK_OUT,
+        )
+        self.layer_norm_core_dram(
+            M=self.GRID_AREA, N=ND,
+            A_DRAM_ADDR=self.VIT_NECK_OUT,
+            OUTPUT_DRAM_ADDR=self.VIT_NECK_OUT,
+            GAMMA_DRAM_ADDR=self.NECK_LN1_W,
+            BETA_DRAM_ADDR=self.NECK_LN1_B,
+        )
+        conv2d_3x3_dram(self,
+            INPUT_DRAM_ADDR=self.VIT_NECK_OUT,
+            OUTPUT_DRAM_ADDR=self.NECK_OUT,
+            IM2COL_DRAM_ADDR=self.NECK_IM2COL,
+            WEIGHT_DRAM_ADDR=self.NECK_CONV3_W,
+            BIAS_DRAM_ADDR=None,
+            H=GS, W=GS, C_in=ND, C_out=ND,
+            ZERO_PAD_DRAM_ADDR=self.ZERO_PAD,
+        )
+        self.layer_norm_core_dram(
+            M=self.GRID_AREA, N=ND,
+            A_DRAM_ADDR=self.NECK_OUT,
+            OUTPUT_DRAM_ADDR=self.NECK_OUT,
+            GAMMA_DRAM_ADDR=self.NECK_LN2_W,
+            BETA_DRAM_ADDR=self.NECK_LN2_B,
+        )
+        _original_print(f"  [compile] neck: {_time.perf_counter() - _tp:.3f}s")
+
+        self._finalize_program()
+        _SILENT_MODE = False
+        return self._last_prog_addr
+
+    def validate_patch_embed_vit(self, image_path: str, prog_addr: int) -> None:
+        """Run HW patch-embed+ViT+neck stream, compare against CPU references.
+
+        Checks both VIT_LAYER_IN (ViT output) and NECK_OUT (final image embedding).
+        """
+        self.run_hw(image_path, prog_addr)
+
+        # ViT output check
+        hw_vit = self.read_tensor_from_dram(self.VIT_LAYER_IN, self.GRID_AREA * self.VIT_DIM)
+        cpu_vit = self.cpu_reference_vit_blocks(image_path, num_blocks=self.VIT_DEPTH)
+        diff = hw_vit.float() - cpu_vit.float()
+        snr_db = 20 * math.log10((cpu_vit.float().pow(2).mean().sqrt() / (diff.pow(2).mean().sqrt() + 1e-9)).item())
+        _original_print(f"  [validate] ViT output  SNR: {snr_db:.1f} dB  max_err: {diff.abs().max():.5f}")
+        assert snr_db > 30.0, f"ViT SNR too low: {snr_db:.1f} dB"
+
+        # Neck output check
+        hw_neck = self.read_tensor_from_dram(self.NECK_OUT, self.GRID_AREA * self.NECK_DIM)
+        cpu_neck = self.cpu_reference_neck(cpu_vit)
+        diff = hw_neck.float() - cpu_neck.float()
+        snr_db = 20 * math.log10((cpu_neck.float().pow(2).mean().sqrt() / (diff.pow(2).mean().sqrt() + 1e-9)).item())
+        _original_print(f"  [validate] Neck output SNR: {snr_db:.1f} dB  max_err: {diff.abs().max():.5f}")
+        assert snr_db > 30.0, f"Neck SNR too low: {snr_db:.1f} dB"
+
+        _original_print("  [validate] PASS")
 
     def _compile_phases(self, pad, bpe):
         """All compile phases live here."""
