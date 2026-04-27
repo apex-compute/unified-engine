@@ -17,13 +17,16 @@
   "model": {
     "max_context_size": 512,
     "end_of_turn_token_id": 106,
+    "prefill_max_seq_len": 33,
     "decoder_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
     "rope_global_layers": [5, 11, 17, 23]
   },
   "paths": {
     "weights_bin": "gemma3_bin/weights_gemma3_hf.bin",
     "hf_model_dir": "gemma3_bin/gemma-3-1b-it",
-    "hf_model_repo": "google/gemma-3-1b-it"
+    "hf_model_repo": "google/gemma-3-1b-it",
+    "instruction_bin": "gemma3_bin/gemma3_instruction.bin",
+    "instruction_meta": "gemma3_bin/gemma3_instruction.json"
   },
   "default_prefill_tokens": [2, 2, 105, 2364, 107, 236781, 236862, 236800, 236784, 236810, 236764, 1144, 563, 1123, 236881, 106, 107, 105, 4368, 107],
   "layers": {
