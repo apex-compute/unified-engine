@@ -36,7 +36,7 @@ import sys
 
 # This file's folder: gemma3_bin/, *.json, decoder_program.json live here. user_dma_core is one level up.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
+sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import numpy as np
 import torch
@@ -48,16 +48,8 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
+# --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
-
-from model_lib_core import (
-    quantize_bf16_to_int4_packed,
-    parse_offset,
-    set_silent,
-    install_quiet_print,
-    ensure_hf_model,
-    load_config_with_weight_defs,
-)
 
 _original_print = builtins.print
 _SILENT_MODE = False
@@ -104,11 +96,11 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     paths_full = os.path.join(SCRIPT_DIR, paths["weights_bin"])
     out_path = output_path or paths_full
 
-    model, model_dir = ensure_hf_model(SCRIPT_DIR, cfg, AutoModelForCausalLM)
+    model, model_dir = _ensure_hf_model(SCRIPT_DIR, cfg)
     gamma_offset = cfg["special"]["rms_norm"]["gamma_offset"]
     emb_cfg = cfg["special"]["embedding"]
-    token_embd_offset = parse_offset(emb_cfg["token_embd_offset"])
-    token_embd_size = parse_offset(emb_cfg["token_embd_size"])
+    token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
+    token_embd_size = _parse_offset(emb_cfg["token_embd_size"])
     LAYER_WEIGHT_SIZE = weight_defs["LAYER_WEIGHT_SIZE"]
     base_layer0 = weight_defs["BLK0_ATTN_NORM_WEIGHT"]
     num_layers = cfg["file_info"]["num_layers"]
@@ -181,7 +173,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             if kind == "int4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
-                data_bytes, scale_bytes = quantize_bf16_to_int4_packed(tensor)
+                data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(tensor)
                 scale_padded = (scale_bytes + b"\x00" * sz)[:sz]
                 data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
                 write_at(file_off, scale_padded)
@@ -225,7 +217,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     lm_head_w = model.lm_head.weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
-    data_bytes, scale_bytes = quantize_bf16_to_int4_packed(lm_head_w)
+    data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(lm_head_w)
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
@@ -235,6 +227,20 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
         f.write(buf)
     print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
     return out_path
+
+def _ensure_hf_model(script_dir: str, cfg: dict):
+    """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
+    model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
+    hf_repo = cfg["paths"]["hf_model_repo"]
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
+        snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
+        _original_print("Download complete.")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, torch_dtype=torch.bfloat16, device_map=None, trust_remote_code=True
+    )
+    return model, model_dir
 
 # -----------------------------------------------------------------------------
 # Gemma3 unified engine
@@ -291,10 +297,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             cfg = json.load(f)
         weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
         for key, r in cfg.get("regions", {}).items():
-            weight_defs[key] = parse_offset(r["offset"])
+            weight_defs[key] = _parse_offset(r["offset"])
             weight_defs[f"{key}_SIZE"] = r["size"]
         for key, r in cfg.get("non_layer_regions", {}).items():
-            weight_defs[key] = parse_offset(r["offset"])
+            weight_defs[key] = _parse_offset(r["offset"])
             weight_defs[f"{key}_SIZE"] = r["size"]
         cfg["_weight_defs"] = weight_defs
         return cfg
@@ -884,7 +890,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             weight_bin_generate(output_path=full_path)
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
-        model, model_dir = ensure_hf_model(self.script_dir, self._cfg, AutoModelForCausalLM)
+        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
         embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
         embedding_scale = model.config.hidden_size ** 0.5
         self.embedding_weight = (embed.float() * embedding_scale).to(torch.bfloat16)
@@ -1382,11 +1388,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                               use_pbi=use_pbi)
 
                 ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
-                total_flops += self.rope_core_dram_step(N=self.head_dim, input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
+                total_flops += self.rope_hf_core(N=self.head_dim, input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
                         cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=ROPE_WEIGHT_ADDR + self.head_dim * self.bytes_per_element,
                         rope_size_reg=self.ROPE_SIZE_REG, output_addr_inc_reg=self.V_CACHE_SIZE_REG, tmp_reg=self.TMP_REG)
                 for g in range(self.group_size):
-                    total_flops += self.rope_core_dram_step(N=self.head_dim, input_dram_addr=self.LAYER0_Q_NORM_DRAM + g * self.head_dim * self.bytes_per_element, output_dram_addr=self.LAYER0_FLASH_Q_DRAM + g * self.head_dim * self.bytes_per_element,
+                    total_flops += self.rope_hf_core(N=self.head_dim, input_dram_addr=self.LAYER0_Q_NORM_DRAM + g * self.head_dim * self.bytes_per_element, output_dram_addr=self.LAYER0_FLASH_Q_DRAM + g * self.head_dim * self.bytes_per_element,
                             cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=ROPE_WEIGHT_ADDR + self.head_dim * self.bytes_per_element,
                             rope_size_reg=self.ROPE_SIZE_REG, tmp_reg=self.TMP_REG)
                 total_flops += self.decoder_group_attention_core(

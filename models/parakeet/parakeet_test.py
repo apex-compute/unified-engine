@@ -40,10 +40,197 @@ builtins.print = quiet_print
 import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE, UE_VECTOR_SIZE,
-    URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, set_dma_device,
+    URAM_NEAR_FULL_ELEMENTS, URAM_HALF_ELEMENTS, URAM_FULL_ELEMENTS, URAM_START_ADDR,
+    UnifiedEngine, set_dma_device,
     UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX
 )
-from model_lib_core import smart_bf16_permute_core
+
+
+def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
+                            params_dram_addr=0, temp_dram_start=0):
+    """ND permute via DMA gather + batched identity-dot-product transpose."""
+    bpe = 2
+
+    batch_prefix = 0
+    while batch_prefix < len(permute_indices) and permute_indices[batch_prefix] == batch_prefix:
+        batch_prefix += 1
+    if batch_prefix >= len(permute_indices) - 1:
+        batch_prefix = 0
+
+    if batch_prefix > 0:
+        inner_dims = list(dims[batch_prefix:])
+        inner_perm = [p - batch_prefix for p in permute_indices[batch_prefix:]]
+        outer = 1
+        for d in dims[:batch_prefix]:
+            outer *= d
+        inner_elems = 1
+        for d in inner_dims:
+            inner_elems *= d
+        stride = inner_elems * bpe
+        last_shape = None
+        for b in range(outer):
+            _, last_shape = smart_bf16_permute_core(
+                ue, inner_dims, inner_perm,
+                input_dram_addr + b * stride,
+                output_dram_addr + b * stride,
+                params_dram_addr, temp_dram_start,
+            )
+        return (1, tuple(dims[:batch_prefix]) + last_shape)
+
+    n = len(dims) - 1
+    total_elements = 1
+    for d in dims:
+        total_elements *= d
+    k = permute_indices[n]
+    if k == n:
+        last_dim = dims[n]
+        output_shape = tuple(dims[permute_indices[i]] for i in range(len(dims)))
+        permute_a = torch.arange(total_elements, dtype=torch.int32).reshape(*dims)
+        permute_a = permute_a.permute(*permute_indices).contiguous().flatten()
+
+        if last_dim < UE_VECTOR_SIZE or last_dim % UE_VECTOR_SIZE != 0:
+            for j in range(total_elements // last_dim):
+                src_idx = permute_a[j * last_dim].item()
+                ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
+                    URAM_START_ADDR, URAM_SECTION.URAM_A.value)
+                ue.wait_queue()
+                ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                    output_dram_addr + j * last_dim * bpe, last_dim * bpe)
+                ue.wait_queue()
+            return (1, output_shape)
+
+        out_addr = output_dram_addr
+        remaining = total_elements
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining)
+            n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                src_idx = permute_a[i + j * last_dim].item()
+                ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
+                    URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value)
+                ue.wait_queue()
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe)
+            ue.wait_queue()
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+        return (1, output_shape)
+
+    remaining_for_q1 = [i for i in range(n + 1) if i != k and i != n]
+    q1 = remaining_for_q1 + [k, n]
+    q1_is_identity = all(q1[i] == i for i in range(n + 1))
+    dims_after_q1 = [dims[q1[i]] for i in range(n + 1)]
+
+    M_transpose = dims_after_q1[n - 1]
+    N_transpose = dims_after_q1[n]
+    M_aligned = ((M_transpose - 1) // UE_VECTOR_SIZE + 1) * UE_VECTOR_SIZE
+    batch_size = 1
+    for i in range(n - 1):
+        batch_size *= dims_after_q1[i]
+    dims_after_transpose = list(dims_after_q1[:n - 1]) + [N_transpose, M_aligned]
+
+    current_dim_at_pos = list(q1[:n - 1]) + [n, k]
+    pos_of_orig_dim = [0] * (n + 1)
+    for pos, orig_dim in enumerate(current_dim_at_pos):
+        pos_of_orig_dim[orig_dim] = pos
+    q3 = [pos_of_orig_dim[permute_indices[i]] for i in range(n + 1)]
+    q3_is_identity = all(q3[i] == i for i in range(n + 1))
+    output_shape = tuple(dims_after_transpose[q3[i]] for i in range(n + 1))
+
+    transposed_total = batch_size * N_transpose * M_aligned
+    safe_temp = temp_dram_start
+    if q1_is_identity:
+        p2_in = input_dram_addr
+    else:
+        p2_in = safe_temp; safe_temp += total_elements * bpe
+    if q3_is_identity:
+        p2_out = output_dram_addr
+    else:
+        p2_out = safe_temp
+
+    if not q1_is_identity:
+        q1_pa = torch.arange(total_elements, dtype=torch.int32).reshape(*dims).permute(*q1).contiguous().flatten()
+        last_dim = dims[n]
+        out_addr = p2_in; remaining = total_elements
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining); n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                ue.ue_memcpy_from_dram(input_dram_addr + q1_pa[i + j * last_dim].item() * bpe,
+                    last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value)
+                ue.wait_queue()
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe)
+            ue.wait_queue()
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+
+    input_uram_addr = URAM_START_ADDR
+    ue.ue_memcpy_from_dram(params_dram_addr, UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe,
+        0, input_uram_addr, URAM_SECTION.URAM_A.value)
+    ue.wait_queue()
+
+    max_N_chunk = min(((URAM_NEAR_FULL_ELEMENTS // N_transpose) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE, M_aligned)
+    max_M_chunk = min(N_transpose, URAM_HALF_ELEMENTS // N_transpose, URAM_HALF_ELEMENTS // max_N_chunk)
+    in_stride = M_transpose * N_transpose * bpe
+    out_stride = M_aligned * N_transpose * bpe
+
+    for batch in range(batch_size):
+        cur_in = p2_in + batch * in_stride
+        cur_out = p2_out + batch * out_stride
+        remaining_M = N_transpose; start_vec = 0; out_chunk = cur_out
+
+        while remaining_M > 0:
+            cur_M = min(max_M_chunk, remaining_M)
+            output_uram = UE_VECTOR_SIZE; remaining_N = M_aligned
+            weight_addr = cur_in; out_offset = out_chunk
+
+            while remaining_N > 0:
+                cur_N = min(max_N_chunk, remaining_N)
+                ue.ue_memcpy_from_dram(weight_addr, cur_N * N_transpose * bpe,
+                    0, URAM_START_ADDR, URAM_SECTION.URAM_B.value)
+                ue.wait_queue()
+
+                for i in range(cur_M):
+                    abs_row = start_vec + i
+                    vec_idx = abs_row % UE_VECTOR_SIZE
+                    col_block = abs_row // UE_VECTOR_SIZE
+                    ue.start_queue_for_bf16_matvec_operation(
+                        0, 0,
+                        (input_uram_addr + vec_idx) * UE_VECTOR_SIZE * 2,
+                        0x80000 + col_block * UE_VECTOR_SIZE * 2,
+                        output_uram * UE_VECTOR_SIZE * 2,
+                        N_transpose, cur_N)
+                    ue.wait_queue()
+                    ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, output_uram,
+                        out_offset + i * M_aligned * bpe, cur_N * bpe)
+                    ue.wait_queue()
+
+                remaining_N -= cur_N; out_offset += cur_N * bpe; weight_addr += cur_N * N_transpose * bpe
+            out_chunk += cur_M * M_aligned * bpe; remaining_M -= cur_M; start_vec += cur_M
+
+    if not q3_is_identity:
+        q3_pa = torch.arange(transposed_total, dtype=torch.int32).reshape(*dims_after_transpose).permute(*q3).contiguous().flatten()
+        last_dim = M_aligned
+        out_addr = output_dram_addr; remaining = transposed_total
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining); n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                ue.ue_memcpy_from_dram(p2_out + q3_pa[i + j * last_dim].item() * bpe,
+                    last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value)
+                ue.wait_queue()
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe)
+            ue.wait_queue()
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+
+    return (2, output_shape)
 
 URAM_A_BASE = 0x00000
 URAM_B_BASE = 0x80000
@@ -485,6 +672,21 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_add_set(dst_reg_idx, immediate_value)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.clear_capture_buffer()
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout_s)
+
+    def isa_add_set_multi(self, reg_val_pairs, timeout_s=10.0):
+        """Set multiple ISA registers in a single program execution."""
+        self.clear_capture_buffer()
+        self.start_capture()
+        for dst_reg_idx, immediate_value in reg_val_pairs:
+            self.generate_instruction_add_set(dst_reg_idx, immediate_value)
         self.stop_capture()
         self.generate_instruction_halt()
         prog = self.get_program_dram_addr()
@@ -1042,9 +1244,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     src = self.MEL_DRAM + src_row * W_in * bpe
                     self.ue_memcpy_from_dram(
                         src, chunk, 0, URAM_START_ADDR,
-                        URAM_SECTION.URAM_A.value, inst_id,
+                        URAM_SECTION.URAM_A.value,
                         stride_bytes_per_chunk=row_bytes,
-                        stride_jump_bytes=stride * row_bytes)
+                        stride_jump_bytes=stride * row_bytes,
+                        inst_pointer_idx=0)
                     self.wait_queue(); inst_id += 1
 
                     dst = (self.IM2COL_R_DRAM
@@ -1052,9 +1255,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                            + kh * W_in * bpe)
                     self.ue_memcpy_to_dram(
                         0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                        dst, chunk, inst_id,
+                        dst, chunk,
                         stride_bytes_per_chunk=row_bytes,
-                        stride_jump_bytes=K_g * bpe)
+                        stride_jump_bytes=K_g * bpe,
+                        inst_pointer_idx=0)
                     self.wait_queue(); inst_id += 1
 
                     offset += chunk
@@ -1166,16 +1370,18 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                             src = ch_base + src_row * W_in * bpe
                             self.ue_memcpy_from_dram(
                                 src, chunk, 0, URAM_START_ADDR,
-                                URAM_SECTION.URAM_A.value, inst_id,
+                                URAM_SECTION.URAM_A.value,
                                 stride_bytes_per_chunk=row_bytes,
-                                stride_jump_bytes=stride * row_bytes)
+                                stride_jump_bytes=stride * row_bytes,
+                                inst_pointer_idx=0)
                             self.wait_queue(); inst_id += 1
                             dst = r_base + oh_base * K_g * bpe + kh * W_in * bpe
                             self.ue_memcpy_to_dram(
                                 0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                                dst, chunk, inst_id,
+                                dst, chunk,
                                 stride_bytes_per_chunk=row_bytes,
-                                stride_jump_bytes=K_g * bpe)
+                                stride_jump_bytes=K_g * bpe,
+                                inst_pointer_idx=0)
                             self.wait_queue(); inst_id += 1
                             offset += chunk
                     else:
@@ -1184,12 +1390,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                             src = ch_base + src_row * W_in * bpe
                             self.ue_memcpy_from_dram(
                                 src, row_bytes, 0, URAM_START_ADDR,
-                                URAM_SECTION.URAM_A.value, inst_id)
+                                URAM_SECTION.URAM_A.value,
+                                inst_pointer_idx=0)
                             self.wait_queue(); inst_id += 1
                             dst = r_base + (oh_start + j) * K_g * bpe + kh * W_in * bpe
                             self.ue_memcpy_to_dram(
                                 0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                                dst, row_bytes, inst_id)
+                                dst, row_bytes,
+                                inst_pointer_idx=0)
                             self.wait_queue(); inst_id += 1
 
             # Signal slave: data prep done
@@ -1239,7 +1447,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             A_DRAM_ADDR=self.SUB_PATCH_DRAM + m_off * padded_k * self.bytes_per_element,
             B_DRAM_ADDR=self.w["SUB_CONV0_W"],
             OUTPUT_DRAM_ADDR=self.SUB_OUT0_DRAM + m_off * SC * self.bytes_per_element,
-            C_DRAM_ADDR=self.w["SUB_CONV0_B"], relu_enable=True)
+            C_DRAM_ADDR=self.w["SUB_CONV0_B"], clamp_enable=True)
         # Sync: end
         if not self.engine_slave:
             self.generate_instruction_flag_check(target_engine_idx=1)
@@ -1313,7 +1521,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             A_DRAM_ADDR=self.SUB_PW_IN_DRAM + m_off * SC * bpe,
             B_DRAM_ADDR=self.w[pw_w_key],
             OUTPUT_DRAM_ADDR=self.SUB_PW_IN_DRAM + m_off * SC * bpe,
-            C_DRAM_ADDR=self.w[pw_b_key], relu_enable=True)
+            C_DRAM_ADDR=self.w[pw_b_key], clamp_enable=True)
         flops += 2 * N_out * SC * SC
         # Sync: end
         if not self.engine_slave:
@@ -1749,7 +1957,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.accelerator_memory_to_sram(self.JOINT_PRED_DRAM, URAM_B_BASE, H)
         self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, H)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_SUM_DRAM, H)
-        self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.JOINT_SUM_DRAM, relu_enable=True)
+        self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.JOINT_SUM_DRAM, clamp_enable=True)
         # Token matmul + argmax
         self.matmat_mul_core(M=1, K=H, N=N_tok_pad, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["JOINT_OUT_TOK_W"], OUTPUT_DRAM_ADDR=self.JOINT_TOK_DRAM, C_DRAM_ADDR=self.w["JOINT_OUT_TOK_B"])
         total_flops += 2 * H * N_tok_pad
@@ -1936,8 +2144,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             symbols = 0
             while symbols < self.max_symbols_per_step:
                 # Set registers: TOKEN_REG = embedding offset, ENC_T_REG = encoder position offset
-                self.isa_add_set_core(self.TOKEN_REG, last_token * H * bpe)
-                self.isa_add_set_core(self.ENC_T_REG, t * D * bpe)
+                self.isa_add_set_multi([(self.TOKEN_REG, last_token * H * bpe), (self.ENC_T_REG, t * D * bpe)])
                 # Predictor: state save + embedding lookup (register-addressed) + LSTM
                 self.program_execute(pred_prog)
                 # Joint token: enc_out[t] copy (register-addressed) + pred_out copy + projections + argmax
@@ -2228,8 +2435,9 @@ def main():
     # --- Encoder ---
     engine2.start_execute_from_dram(enc_prog_addr2)
     engine.start_execute_from_dram(enc_prog_addr)
-    engine.wait_queue(120.0)
+    engine.wait_queue(600.0)
     t_enc_done = _time.perf_counter()
+    _original_print(f"\r  Encoder done ({t_enc_done - t_start:.1f}s)", flush=True)
 
     # --- Decoder ---
     hw_enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D)

@@ -205,8 +205,6 @@ def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
     for d in dims:
         total_elements *= d
     k = permute_indices[n]
-    inst_id = 0
-
     # Case 1: last dim stays fixed — pure DMA gather.
     if k == n:
         last_dim = dims[n]
@@ -218,11 +216,11 @@ def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             for j in range(total_elements // last_dim):
                 src_idx = permute_a[j * last_dim].item()
                 ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
-                    URAM_START_ADDR, URAM_SECTION.URAM_A.value, inst_id)
-                ue.wait_queue(); inst_id += 1
+                    URAM_START_ADDR, URAM_SECTION.URAM_A.value)
+                ue.wait_queue()
                 ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                    output_dram_addr + j * last_dim * bpe, last_dim * bpe, inst_id)
-                ue.wait_queue(); inst_id += 1
+                    output_dram_addr + j * last_dim * bpe, last_dim * bpe)
+                ue.wait_queue()
             return (1, output_shape)
 
         out_addr = output_dram_addr
@@ -236,11 +234,11 @@ def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
                 src_idx = permute_a[i + j * last_dim].item()
                 ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
                     URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
-                    URAM_SECTION.URAM_A.value, inst_id)
-                ue.wait_queue(); inst_id += 1
+                    URAM_SECTION.URAM_A.value)
+                ue.wait_queue()
             ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                out_addr, n_blocks * last_dim * bpe, inst_id)
-            ue.wait_queue(); inst_id += 1
+                out_addr, n_blocks * last_dim * bpe)
+            ue.wait_queue()
             remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
         return (1, output_shape)
 
@@ -288,17 +286,17 @@ def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             for j in range(n_blocks):
                 ue.ue_memcpy_from_dram(input_dram_addr + q1_pa[i + j * last_dim].item() * bpe,
                     last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
-                    URAM_SECTION.URAM_A.value, inst_id)
-                ue.wait_queue(); inst_id += 1
+                    URAM_SECTION.URAM_A.value)
+                ue.wait_queue()
             ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                out_addr, n_blocks * last_dim * bpe, inst_id)
-            ue.wait_queue(); inst_id += 1
+                out_addr, n_blocks * last_dim * bpe)
+            ue.wait_queue()
             remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
 
     input_uram_addr = URAM_START_ADDR
     ue.ue_memcpy_from_dram(params_dram_addr, UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe,
-        0, input_uram_addr, URAM_SECTION.URAM_A.value, inst_id)
-    ue.wait_queue(); inst_id += 1
+        0, input_uram_addr, URAM_SECTION.URAM_A.value)
+    ue.wait_queue()
 
     max_N_chunk = min(((URAM_NEAR_FULL_ELEMENTS // N_transpose) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE, M_aligned)
     max_M_chunk = min(N_transpose, URAM_HALF_ELEMENTS // N_transpose, URAM_HALF_ELEMENTS // max_N_chunk)
@@ -318,21 +316,23 @@ def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             while remaining_N > 0:
                 cur_N = min(max_N_chunk, remaining_N)
                 ue.ue_memcpy_from_dram(weight_addr, cur_N * N_transpose * bpe,
-                    0, URAM_START_ADDR, URAM_SECTION.URAM_B.value, inst_id)
-                ue.wait_queue(); inst_id += 1
+                    0, URAM_START_ADDR, URAM_SECTION.URAM_B.value)
+                ue.wait_queue()
 
                 for i in range(cur_M):
                     abs_row = start_vec + i
                     vec_idx = abs_row % UE_VECTOR_SIZE
                     col_block = abs_row // UE_VECTOR_SIZE
-                    ue.start_queue(0, 0, N_transpose // UE_VECTOR_SIZE, 0, 0, LALU_MODE.BYPASS.value, 0,
-                        0, 0, 0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
-                        UE_MODE.BF16_DOT_PRODUCT, 0, input_uram_addr + vec_idx, URAM_START_ADDR + col_block,
-                        1, 0, cur_N * N_transpose, cur_N, inst_id)
-                    inst_id += 1; ue.wait_queue()
+                    ue.start_queue_for_bf16_matvec_operation(
+                        0, 0,
+                        (input_uram_addr + vec_idx) * UE_VECTOR_SIZE * 2,
+                        0x80000 + col_block * UE_VECTOR_SIZE * 2,
+                        output_uram * UE_VECTOR_SIZE * 2,
+                        N_transpose, cur_N)
+                    ue.wait_queue()
                     ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, output_uram,
-                        out_offset + i * M_aligned * bpe, cur_N * bpe, inst_id)
-                    ue.wait_queue(); inst_id += 1
+                        out_offset + i * M_aligned * bpe, cur_N * bpe)
+                    ue.wait_queue()
 
                 remaining_N -= cur_N; out_offset += cur_N * bpe; weight_addr += cur_N * N_transpose * bpe
             out_chunk += cur_M * M_aligned * bpe; remaining_M -= cur_M; start_vec += cur_M
@@ -348,11 +348,11 @@ def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             for j in range(n_blocks):
                 ue.ue_memcpy_from_dram(p2_out + q3_pa[i + j * last_dim].item() * bpe,
                     last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
-                    URAM_SECTION.URAM_A.value, inst_id)
-                ue.wait_queue(); inst_id += 1
+                    URAM_SECTION.URAM_A.value)
+                ue.wait_queue()
             ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                out_addr, n_blocks * last_dim * bpe, inst_id)
-            ue.wait_queue(); inst_id += 1
+                out_addr, n_blocks * last_dim * bpe)
+            ue.wait_queue()
             remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
 
     return (2, output_shape)
