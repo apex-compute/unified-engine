@@ -13,6 +13,7 @@ Usage:
 import argparse
 import builtins
 import itertools
+import json
 import math
 import os
 import sys
@@ -2924,13 +2925,88 @@ class MobileSAM_UE(UnifiedEngine):
         self.wait_queue(120.0)
 
     def encode(self, image_t: torch.Tensor):
-        """Compile + execute in one call (used for --debug path)."""
-        img_hwc = image_t[0].permute(1, 2, 0).contiguous()
-        img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, ENC_CIN_PAD, dtype=torch.bfloat16)
-        img_pad[:, :3] = img_hwc.reshape(-1, 3)
-        self.dma_to_accelerator_memory(self.PE_IN_DRAM, img_pad.reshape(-1))
-        self.start_capture()
-        self._encoder_ops(self._exec_partial)
+        """Compile + execute in one call — single instruction stream."""
+        prog = self.compile_encoder()
+        self.execute_encoder(prog, image_t)
+
+    # ------------------------------------------------------------------
+    # Binary dump (for run_from_bin)
+    # ------------------------------------------------------------------
+
+    def dump_params_to_file(self, bin_dir: str):
+        """Dump params + tensor layout to bin_dir/params.bin + params.json."""
+        os.makedirs(bin_dir, exist_ok=True)
+        bin_path = os.path.join(bin_dir, "params.bin")
+        meta_path = os.path.join(bin_dir, "params.json")
+        total = self.get_params_dram_usage()
+        CHUNK = 1 * 1024 * 1024
+        with open(bin_path, "wb") as f:
+            offset = 0
+            while offset < total:
+                sz = min(CHUNK, total - offset)
+                buf = bytearray(sz)
+                self.dma_read(DMA_DEVICE_C2H, self._params_dram_base + offset, buf, sz)
+                f.write(buf)
+                offset += sz
+        # Tensor offsets relative to tensor DRAM base (re-allocated by run_from_bin)
+        tensor_ofs = {
+            "pe_in": self.PE_IN_DRAM - self._tensor_dram_base,
+            "tokens": self.TOKENS_DRAM - self._tensor_dram_base,
+            "tokens_pe": self.TOKENS_PE_DRAM - self._tensor_dram_base,
+            "src": self.SRC_DRAM - self._tensor_dram_base,
+            "key_pe": self.KEY_PE_DRAM - self._tensor_dram_base,
+            "neck_out": self.NECK_OUT_DRAM - self._tensor_dram_base,
+            "mask_out": self.MASK_OUT - self._tensor_dram_base,
+            "iou_out": self.IOU_OUT - self._tensor_dram_base,
+        }
+        tensor_sizes = {
+            "pe_in": ENC_IN_H * ENC_IN_W * ENC_CIN_PAD * BPE,
+            "tokens": NT_PAD * DEC_DIM * BPE,
+            "tokens_pe": NT_PAD * DEC_DIM * BPE,
+            "src": GA * DEC_DIM * BPE,
+            "key_pe": GA * DEC_DIM * BPE,
+            "neck_out": 4096 * 256 * BPE,
+            "mask_out": 4 * 65536 * BPE,
+            "iou_out": 64 * BPE,
+        }
+        with open(meta_path, "w") as f:
+            json.dump({"size": total, "tensors": tensor_ofs, "tensor_sizes": tensor_sizes}, f)
+        _original_print(f"  Params: {total / 1024**2:.1f} MB → {bin_path}")
+
+    def dump_programs_to_file(self, enc_prog_addr: int, dec_prog_addr: int, bin_dir: str):
+        """Read encoder+decoder programs from DRAM and save to bin_dir/programs.bin + programs.json.
+
+        Program sizes are inferred from sequential DRAM layout
+        (encoder compiled first, decoder second).
+        """
+        os.makedirs(bin_dir, exist_ok=True)
+        bin_path = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
+        total_usage = self.get_program_dram_usage()
+        enc_size = dec_prog_addr - enc_prog_addr
+        dec_size = total_usage - enc_size
+        programs = [
+            ("encoder", enc_prog_addr, enc_size),
+            ("decoder", dec_prog_addr, dec_size),
+        ]
+        manifest = {"programs": {}}
+        all_bytes = bytearray()
+        CHUNK = 1 * 1024 * 1024
+        for name, addr, size in programs:
+            offset_in_file = len(all_bytes)
+            remaining = size
+            while remaining > 0:
+                sz = min(CHUNK, remaining)
+                buf = bytearray(sz)
+                self.dma_read(DMA_DEVICE_C2H, addr + (size - remaining), buf, sz)
+                all_bytes.extend(buf)
+                remaining -= sz
+            manifest["programs"][name] = {"offset": offset_in_file, "size": size}
+        with open(bin_path, "wb") as f:
+            f.write(all_bytes)
+        with open(meta_path, "w") as f:
+            json.dump(manifest, f)
+        _original_print(f"  Programs: {len(all_bytes)} bytes → {bin_path}")
 
     def _encoder_ops(self, flush):
         """All encoder instruction ops. flush() called in place of each _exec_partial."""
@@ -3859,17 +3935,63 @@ def main():
         image_pe_t = _raw.pe_layer.forward_grid((IMG_H, IMG_W))[0].permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
         dense_t    = _raw.prompt_encoder.no_mask_embed.weight.reshape(1, DEC_DIM).expand(GA, -1).bfloat16().contiguous()
 
-    # ---- Compile ----
-    # IMPORTANT: create both UE objects first (params+tensors alloc), THEN compile.
-    # Both share the same physical DRAM. If we compiled enc before creating ue,
-    # ue's __init__ param allocs would overwrite enc's compiled programs.
-    _original_print("\nCompiling …")
-    t0 = time.perf_counter()
-    ue = MobileSAM_UE(WEIGHTS)
-    enc_prog = ue.compile_encoder()
-    _original_print(f"  Encoder: 1 program  ({time.perf_counter() - t0:.1f}s)")
-    dec_prog = ue.compile_decoder()
-    _original_print(f"  Decoder: done  ({time.perf_counter() - t0:.1f}s total)")
+    # ---- Compile or load from bins ----
+    bins_exist = (os.path.exists(os.path.join(BIN_DIR, "params.bin"))
+                  and os.path.exists(os.path.join(BIN_DIR, "programs.bin")))
+    if bins_exist:
+        _original_print("\nLoading from pre-compiled bins …")
+        from mobilesam_run_from_bin import MobileSAM_UE_Run
+        ue = MobileSAM_UE_Run()
+        ue.load_params()
+        with open(os.path.join(BIN_DIR, "params.json")) as f:
+            _pm = json.load(f)
+        _tb = ue._tensor_dram_base
+        # Set all tensor attrs the rest of the flow expects
+        # (some names omit the _DRAM suffix, handle those explicitly)
+        for name, ofs in _pm["tensors"].items():
+            attr = "MASK_OUT" if name == "mask_out" else \
+                   "IOU_OUT" if name == "iou_out" else \
+                   name.upper() + "_DRAM"
+            setattr(ue, attr, _tb + ofs)
+        ue.pe_in_dram = ue.PE_IN_DRAM
+        progs = ue.load_programs()
+        enc_prog = progs["encoder"]
+        dec_prog = progs["decoder"]
+        # Stitch on the decoder interface methods the rest of the flow expects
+        import types
+        def _preload(self, image_emb_t, image_pe_t, dense_t):
+            src_t = (image_emb_t + dense_t).to(torch.bfloat16).contiguous()
+            self.dma_to_accelerator_memory(self.SRC_DRAM, src_t.flatten())
+            self.dma_to_accelerator_memory(self.KEY_PE_DRAM, image_pe_t.flatten())
+        def _run_dec(self, prog_addr, tokens_t, timeout=120.0):
+            toks = tokens_t.to(torch.bfloat16).contiguous()
+            self.dma_to_accelerator_memory(self.TOKENS_DRAM, toks.flatten())
+            self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, toks.flatten())
+            self.start_execute_from_dram(prog_addr)
+            self.wait_queue(timeout)
+            masks = self.dma_from_accelerator_memory(self.MASK_OUT, (4, 256*256)).float().reshape(4,256,256)
+            iou = self.dma_from_accelerator_memory(self.IOU_OUT, (64,)).float()[:4]
+            return masks, iou
+        ue.preload_decoder_image = types.MethodType(_preload, ue)
+        ue.run_decoder_tokens = types.MethodType(_run_dec, ue)
+        _original_print("  Loaded from bins.")
+    else:
+        # IMPORTANT: create both UE objects first (params+tensors alloc), THEN compile.
+        # Both share the same physical DRAM. If we compiled enc before creating ue,
+        # ue's __init__ param allocs would overwrite enc's compiled programs.
+        _original_print("\nCompiling …")
+        t0 = time.perf_counter()
+        ue = MobileSAM_UE(WEIGHTS)
+        enc_prog = ue.compile_encoder()
+        _original_print(f"  Encoder: 1 program  ({time.perf_counter() - t0:.1f}s)")
+        dec_prog = ue.compile_decoder()
+        _original_print(f"  Decoder: done  ({time.perf_counter() - t0:.1f}s total)")
+
+        # ---- Save bins ----
+        _original_print("\nSaving bins …")
+        ue.dump_params_to_file(BIN_DIR)
+        ue.dump_programs_to_file(enc_prog, dec_prog, BIN_DIR)
+        _original_print("  Done saving bins.")
 
     if args.point:
         px, py = args.point
@@ -3946,10 +4068,11 @@ def main():
     t0 = time.perf_counter()
     ue.execute_encoder(enc_prog, image_t)
     _original_print(f"  HW encoder done in {time.perf_counter() - t0:.2f}s")
-    s3b1_t = ue.dma_from_accelerator_memory(ue.S3B1_OUT_DRAM,
-                 (ENC_S3_H * ENC_S3_W, ENC_S3_C)).bfloat16().float()
-    _original_print(f"  S3B1_OUT:    mean={s3b1_t.mean():.4f} std={s3b1_t.std():.4f} "
-                    f"min={s3b1_t.min():.4f} max={s3b1_t.max():.4f}")
+    if hasattr(ue, 'S3B1_OUT_DRAM'):
+        s3b1_t = ue.dma_from_accelerator_memory(ue.S3B1_OUT_DRAM,
+                     (ENC_S3_H * ENC_S3_W, ENC_S3_C)).bfloat16().float()
+        _original_print(f"  S3B1_OUT:    mean={s3b1_t.mean():.4f} std={s3b1_t.std():.4f} "
+                        f"min={s3b1_t.min():.4f} max={s3b1_t.max():.4f}")
     image_emb_t = ue.dma_from_accelerator_memory(ue.NECK_OUT_DRAM, (GA, DEC_DIM)).bfloat16()
     _original_print(f"  NECK_OUT:    mean={image_emb_t.float().mean():.4f} std={image_emb_t.float().std():.4f} "
                     f"min={image_emb_t.float().min():.4f} max={image_emb_t.float().max():.4f}")
