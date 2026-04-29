@@ -18,14 +18,7 @@ sys.path.insert(0, PROJECT_ROOT)
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
-from model_lib_core import (
-    smart_bf16_permute_core,
-    store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
-    eltwise_add_core_dram, eltwise_mul_core_dram,
-    rms_norm_core_dram_post_add,
-    quantize_q4_64 as _mlc_quantize_q4_64,
-    quantize_fp4_64 as _mlc_quantize_fp4_64,
-)
+from user_dma_core import ue_35bit_addr_shifter
 
 import builtins
 
@@ -45,11 +38,361 @@ def _parse_offset(val) -> int:
         return int(val, 0)
     return int(val)
 
+def store_weight(ue, tensor, padded_shape=None):
+    """Pad, convert to bf16, DMA to device DRAM. Returns DRAM address."""
+    bf16 = tensor.to(torch.bfloat16)
+    if padded_shape is not None:
+        padded = torch.zeros(padded_shape, dtype=torch.bfloat16)
+        slices = tuple(slice(0, s) for s in bf16.shape)
+        padded[slices] = bf16
+        bf16 = padded
+    bf16 = bf16.contiguous()
+    nbytes = bf16.numel() * 2
+    addr = ue.get_params_dram_addr()
+    ue.dma_write(DMA_DEVICE_H2C, addr, bf16.flatten(), nbytes)
+    ue.allocate_params_dram(nbytes)
+    return addr
+
+def store_quantized_weight(ue, raw_data):
+    """Store Q4_64 raw GGUF data as scale + packed in DRAM. Returns (scale_addr, data_addr)."""
+    raw_bytes = raw_data.tobytes() if hasattr(raw_data, 'tobytes') else bytes(raw_data)
+    n_blocks = len(raw_bytes) // 34
+    scales_size = n_blocks * 2
+    data_size = n_blocks * 32
+
+    scales_np = np.frombuffer(raw_bytes[:scales_size], dtype=np.uint16).copy()
+    scale_tensor = torch.from_numpy(scales_np).view(torch.bfloat16)
+    scale_addr = ue.get_params_dram_addr()
+    ue.dma_write(DMA_DEVICE_H2C, scale_addr, scale_tensor, scales_size)
+    ue.allocate_params_dram(scales_size)
+
+    data_np = np.frombuffer(raw_bytes[scales_size:scales_size + data_size], dtype=np.uint8).copy()
+    data_tensor = torch.from_numpy(data_np)
+    data_addr = ue.get_params_dram_addr()
+    ue.dma_write(DMA_DEVICE_H2C, data_addr, data_tensor, data_size)
+    ue.allocate_params_dram(data_size)
+
+    return scale_addr, data_addr
+
+def load_weight_cache(bin_path):
+    """Load bin+json weight file. Returns {tensor_name: raw_numpy_data}."""
+    json_path = bin_path.rsplit('.', 1)[0] + '.json'
+    with open(json_path) as f:
+        manifest = json.load(f)
+    with open(bin_path, 'rb') as f:
+        raw = f.read()
+    cache = {}
+    for name, meta in manifest.items():
+        cache[name] = np.frombuffer(raw[meta['offset']:meta['offset'] + meta['size']], dtype=np.uint8).copy()
+    return cache
+
+def store_identity_matrix(ue):
+    """Store identity matrix in DRAM once. Returns DRAM address."""
+    bpe = 2
+    size = UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe
+    addr = ue.get_params_dram_addr()
+    ue.dma_write(DMA_DEVICE_H2C, addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), size)
+    ue.allocate_params_dram(size)
+    return addr
+
+def eltwise_add_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
+    """OUTPUT = A + B (DRAM)."""
+    bytes_per_element = 2
+    uram_a_addr = 0x00000
+    uram_b_addr = 0x80000
+    chunk_size = min(URAM_NEAR_FULL_ELEMENTS, size)
+
+    for start, take in ue.chunk_ranges(size, chunk_size):
+        offset_bytes = start * bytes_per_element
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=A_DRAM_ADDR + offset_bytes,
+            sram_address=uram_a_addr, element_size=take)
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=B_DRAM_ADDR + offset_bytes,
+            sram_address=uram_b_addr, element_size=take)
+        ue.eltwise_add_core(
+            vector_A_sram_start_addr=uram_a_addr,
+            vector_B_sram_start_addr=uram_b_addr,
+            vector_C_sram_wb_addr=uram_a_addr, element_size=take)
+        ue.sram_to_accelerator_memory(
+            sram_address=uram_a_addr,
+            accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
+            element_size=take)
+    return size
+
+def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
+    """OUTPUT = A * B (DRAM)."""
+    bytes_per_element = 2
+    uram_a_addr = 0x00000
+    uram_b_addr = 0x80000
+    chunk_size = min(URAM_NEAR_FULL_ELEMENTS, size)
+
+    for start, take in ue.chunk_ranges(size, chunk_size):
+        offset_bytes = start * bytes_per_element
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=A_DRAM_ADDR + offset_bytes,
+            sram_address=uram_a_addr, element_size=take)
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=B_DRAM_ADDR + offset_bytes,
+            sram_address=uram_b_addr, element_size=take)
+        ue.eltwise_mul_core(
+            vector_A_sram_start_addr=uram_a_addr,
+            vector_B_sram_start_addr=uram_b_addr,
+            vector_C_sram_wb_addr=uram_a_addr, element_size=take)
+        ue.sram_to_accelerator_memory(
+            sram_address=uram_a_addr,
+            accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
+            element_size=take)
+    return size
+
+def bf16_permute_core_v2(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
+                          params_dram_addr, temp_dram_start):
+    """Permute via DMA gather + batched transpose decomposition.
+    Adapted from bf16_permute_core_v2 — handles non-64-aligned last_dim (e.g. 80)."""
+    from user_dma_core import (UE_VECTOR_SIZE, UE_MODE, URAM_FULL_ELEMENTS,
+                               URAM_NEAR_FULL_ELEMENTS, URAM_HALF_ELEMENTS,
+                               URAM_SECTION, URAM_WRITE_SRC, URAM_START_ADDR, LALU_MODE)
+    n = len(dims) - 1
+    bpe = 2
+    total_elements = 1
+    for d in dims:
+        total_elements *= d
+    k = permute_indices[n]
+    inst_id = 0
+
+    # Case 1: last dim stays fixed (P[n] == n) — pure DMA gather
+    if k == n:
+        last_dim = dims[n]
+        output_shape = tuple(dims[permute_indices[i]] for i in range(len(dims)))
+        permute_a = torch.arange(total_elements, dtype=torch.int32).reshape(*dims)
+        permute_a = permute_a.permute(*permute_indices).contiguous().flatten()
+
+        if last_dim < UE_VECTOR_SIZE or last_dim % UE_VECTOR_SIZE != 0:
+            for j in range(total_elements // last_dim):
+                src_idx = permute_a[j * last_dim].item()
+                ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
+                    URAM_START_ADDR, URAM_SECTION.URAM_A.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+                ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                    output_dram_addr + j * last_dim * bpe, last_dim * bpe, inst_id)
+                ue.wait_queue(); inst_id += 1
+            return (1, output_shape)
+
+        out_addr = output_dram_addr
+        remaining = total_elements
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining)
+            n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                src_idx = permute_a[i + j * last_dim].item()
+                ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
+                    URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe, inst_id)
+            ue.wait_queue(); inst_id += 1
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+        return (1, output_shape)
+
+    # Case 2: last dim changes — decompose into Q1 (last-dim-fixed) + transpose + Q3 (last-dim-fixed)
+    remaining_for_q1 = [i for i in range(n + 1) if i != k and i != n]
+    q1 = remaining_for_q1 + [k, n]
+    q1_is_identity = all(q1[i] == i for i in range(n + 1))
+    dims_after_q1 = [dims[q1[i]] for i in range(n + 1)]
+
+    M_transpose = dims_after_q1[n - 1]
+    N_transpose = dims_after_q1[n]
+    M_aligned = ((M_transpose - 1) // UE_VECTOR_SIZE + 1) * UE_VECTOR_SIZE
+    batch_size = 1
+    for i in range(n - 1):
+        batch_size *= dims_after_q1[i]
+    dims_after_transpose = list(dims_after_q1[:n - 1]) + [N_transpose, M_aligned]
+
+    current_dim_at_pos = list(q1[:n - 1]) + [n, k]
+    pos_of_orig_dim = [0] * (n + 1)
+    for pos, orig_dim in enumerate(current_dim_at_pos):
+        pos_of_orig_dim[orig_dim] = pos
+    q3 = [pos_of_orig_dim[permute_indices[i]] for i in range(n + 1)]
+    q3_is_identity = all(q3[i] == i for i in range(n + 1))
+    output_shape = tuple(dims_after_transpose[q3[i]] for i in range(n + 1))
+
+    transposed_total = batch_size * N_transpose * M_aligned
+    safe_temp = temp_dram_start
+    if q1_is_identity:
+        p2_in = input_dram_addr
+    else:
+        p2_in = safe_temp; safe_temp += total_elements * bpe
+    if q3_is_identity:
+        p2_out = output_dram_addr
+    else:
+        p2_out = safe_temp
+
+    # Phase 1: Q1 permute (last-dim-fixed DMA gather)
+    if not q1_is_identity:
+        q1_pa = torch.arange(total_elements, dtype=torch.int32).reshape(*dims).permute(*q1).contiguous().flatten()
+        last_dim = dims[n]
+        out_addr = p2_in; remaining = total_elements
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining); n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                ue.ue_memcpy_from_dram(input_dram_addr + q1_pa[i + j * last_dim].item() * bpe,
+                    last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe, inst_id)
+            ue.wait_queue(); inst_id += 1
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+
+    # Phase 2: Batched transpose (last two dims swapped via identity dot-product)
+    input_uram_addr = URAM_START_ADDR
+    ue.ue_memcpy_from_dram(params_dram_addr, UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe,
+        0, input_uram_addr, URAM_SECTION.URAM_A.value, inst_id)
+    ue.wait_queue(); inst_id += 1
+
+    max_N_chunk = min(((URAM_NEAR_FULL_ELEMENTS // N_transpose) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE, M_aligned)
+    max_M_chunk = min(N_transpose, URAM_HALF_ELEMENTS // N_transpose, URAM_HALF_ELEMENTS // max_N_chunk)
+    in_stride = M_transpose * N_transpose * bpe
+    out_stride = M_aligned * N_transpose * bpe
+
+    for batch in range(batch_size):
+        cur_in = p2_in + batch * in_stride
+        cur_out = p2_out + batch * out_stride
+        remaining_M = N_transpose; start_vec = 0; out_chunk = cur_out
+
+        while remaining_M > 0:
+            cur_M = min(max_M_chunk, remaining_M)
+            output_uram = UE_VECTOR_SIZE; remaining_N = M_aligned
+            weight_addr = cur_in; out_offset = out_chunk
+
+            while remaining_N > 0:
+                cur_N = min(max_N_chunk, remaining_N)
+                ue.ue_memcpy_from_dram(weight_addr, cur_N * N_transpose * bpe,
+                    0, URAM_START_ADDR, URAM_SECTION.URAM_B.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+
+                for i in range(cur_M):
+                    abs_row = start_vec + i
+                    vec_idx = abs_row % UE_VECTOR_SIZE
+                    col_block = abs_row // UE_VECTOR_SIZE
+                    ue.start_queue(0, 0, N_transpose // UE_VECTOR_SIZE, LALU_MODE.BYPASS.value, 0, 0,
+                        URAM_SECTION.URAM_A.value, 0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+                        UE_MODE.BF16_DOT_PRODUCT, 0, input_uram_addr + vec_idx, URAM_START_ADDR + col_block,
+                        1, 0, cur_N * N_transpose, cur_N, inst_id)
+                    inst_id += 1; ue.wait_queue()
+                    ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, output_uram,
+                        out_offset + i * M_aligned * bpe, cur_N * bpe, inst_id)
+                    ue.wait_queue(); inst_id += 1
+
+                remaining_N -= cur_N; out_offset += cur_N * bpe; weight_addr += cur_N * N_transpose * bpe
+            out_chunk += cur_M * M_aligned * bpe; remaining_M -= cur_M; start_vec += cur_M
+
+    # Phase 3: Q3 permute (last-dim-fixed DMA gather)
+    if not q3_is_identity:
+        q3_pa = torch.arange(transposed_total, dtype=torch.int32).reshape(*dims_after_transpose).permute(*q3).contiguous().flatten()
+        last_dim = M_aligned
+        out_addr = output_dram_addr; remaining = transposed_total
+        aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        i = 0
+        while remaining > 0:
+            cur = min(aligned, remaining); n_blocks = cur // last_dim
+            for j in range(n_blocks):
+                ue.ue_memcpy_from_dram(p2_out + q3_pa[i + j * last_dim].item() * bpe,
+                    last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
+                    URAM_SECTION.URAM_A.value, inst_id)
+                ue.wait_queue(); inst_id += 1
+            ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                out_addr, n_blocks * last_dim * bpe, inst_id)
+            ue.wait_queue(); inst_id += 1
+            remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
+
+    return (2, output_shape)
+
+def rms_norm_core_dram_post_add(ue, M: int, N: int,
+                                 A_DRAM_ADDR: int, B_DRAM_ADDR: int,
+                                 ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int,
+                                 GAMMA_DRAM_ADDR: int = None) -> int:
+    """rms_norm(A + B) with residual output."""
+    gamma_sram_addr = 0x80000
+    params_sram_addr = gamma_sram_addr
+
+    if GAMMA_DRAM_ADDR is not None:
+        ue.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
+                                    sram_address=gamma_sram_addr, element_size=N)
+        params_sram_addr += N * 2
+    else:
+        gamma_sram_addr = None
+
+    vector_A_sram_addr = 0x00000
+    vector_B_sram_addr = params_sram_addr
+    uram_b_remaining_elements = URAM_NEAR_FULL_ELEMENTS - (params_sram_addr - 0x80000) // 2
+    chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, uram_b_remaining_elements // N, M)
+    assert chunk_size >= 1 and chunk_size <= M
+
+    for i, m_take in ue.chunk_ranges(M, chunk_size):
+        chunk_elements = m_take * N
+        ue.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * N * 2,
+                                    sram_address=vector_A_sram_addr, element_size=chunk_elements)
+        ue.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + i * N * 2,
+                                    sram_address=vector_B_sram_addr, element_size=chunk_elements)
+        for j in range(m_take):
+            ue.eltwise_add_core(vector_A_sram_addr + j * N * 2, vector_B_sram_addr + j * N * 2,
+                                vector_A_sram_addr + j * N * 2, N)
+        ue.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
+                                        accelerator_dram_address=ADDOUTPUT_DRAM_ADDR + i * N * 2,
+                                        element_size=chunk_elements)
+        for j in range(m_take):
+            ue.rms_norm_core(vector_A_sram_addr + j * N * 2, vector_A_sram_addr + j * N * 2,
+                             N, gamma_sram_addr)
+        ue.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
+                                        accelerator_dram_address=NORMOUTPUT_DRAM_ADDR + i * N * 2,
+                                        element_size=chunk_elements)
+
+    total_flops = M * N + 3 * M * N
+    if gamma_sram_addr is not None:
+        total_flops += M * N
+    return total_flops
+
+_FP4_E2M1_TABLE = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                  -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.bfloat16)
+
 def quantize_q4_64(tensor):
-    return _mlc_quantize_q4_64(tensor)
+    """INT4 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
+    data = tensor.flatten().cpu().float().numpy()
+    n_blocks = int(np.ceil(len(data) / 64))
+    padded = np.pad(data, (0, n_blocks * 64 - len(data)))
+    blocks = padded.reshape(n_blocks, 64)
+    scales = np.max(np.abs(blocks), axis=1)
+    scales[scales == 0] = 1.0
+    scales /= 7.0
+    quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
+    pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
+    packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
+    scale_bytes = torch.tensor(-scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
+    return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
 
 def quantize_fp4_64(tensor):
-    return _mlc_quantize_fp4_64(tensor)
+    """FP4 E2M1 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
+    x = tensor.to(torch.bfloat16).cpu().flatten()
+    n_blocks = int(np.ceil(x.numel() / 64))
+    if x.numel() % 64 != 0:
+        x = torch.nn.functional.pad(x, (0, n_blocks * 64 - x.numel()))
+    blocks = x.view(n_blocks, 64)
+    fp4_max = torch.tensor(6.0, dtype=torch.bfloat16)
+    scales = (blocks.abs().max(dim=1).values / fp4_max).clamp(min=1e-8).to(torch.bfloat16)
+    scaled = (blocks / scales[:, None]).to(torch.bfloat16)
+    codes = torch.argmin(torch.abs(scaled.unsqueeze(-1) - _FP4_E2M1_TABLE), dim=-1).to(torch.uint8)
+    codes_np = codes.numpy().flatten()
+    if len(codes_np) % 2 != 0:
+        codes_np = np.pad(codes_np, (0, 1))
+    packed = (codes_np[0::2] & 0x0F) | ((codes_np[1::2] & 0x0F) << 4)
+    scales_np = scales.view(torch.uint16).numpy()
+    return np.frombuffer(scales_np.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
 
 _LAYER_MAP = {
     'lm': {
@@ -449,6 +792,42 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     def get_arg_max_index(self) -> int:
         """Get the arg max index from the Unified Engine"""
         return self.read_reg32(UE_ARGMAX1_INDEX)
+
+    def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
+        """RoPE (HuggingFace style). Caller must have start_capture() before and stop_capture() after."""
+        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
+        assert N % 2 == 0, "N must be even for RoPE half layout"
+        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
+        half = N // 2
+        bytes_per_elem = 2
+        sram_x = 0x00000
+        sram_a = 0x20000
+        sram_d = 0x40000
+        sram_cos = 0x80000
+        sram_sin = 0x80000 + N * bytes_per_elem
+        sram_bc = 0x80000 + N * bytes_per_elem * 2
+        self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr, sram_address=sram_x, element_size=N)
+        if rope_size_reg is not None:
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(cos_dram_addr), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(sin_dram_addr), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+        else:
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
+            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
+        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
+        if output_addr_inc_reg is not None:
+            self.generate_instruction_add_imm(output_addr_inc_reg, ue_35bit_addr_shifter(output_dram_addr), tmp_reg)
+            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+        else:
+            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
+        return 4 * N
 
     def decoder_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
@@ -1192,7 +1571,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=la[f'{la_key_prefix}_data'],
                     OUTPUT_DRAM_ADDR=OUT,
                     C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.INT4,
+                    is_B_quantized=True, data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=la[f'{la_key_prefix}_scale'],
                     silu_enable=silu_en, gelu_enable=gelu_en)
 
@@ -1238,7 +1617,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=la['qk_data'],
                     OUTPUT_DRAM_ADDR=self.VIS_QK_DRAM,
                     C_DRAM_ADDR=la['qk_bias'], bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.INT4,
+                    is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=la['qk_scale'])
 
             if _bf16_mode and 'v_weight_bf16' in la:
@@ -1255,7 +1634,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=la['v_data'],
                     OUTPUT_DRAM_ADDR=self.VIS_V_DRAM,
                     C_DRAM_ADDR=la['v_bias'], bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.INT4,
+                    is_B_quantized=True, data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=la['v_scale'])
 
             qk_row_pad = VN_VD_PAD * 2
@@ -1278,14 +1657,14 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         stride_jump_bytes=qk_row_pad * bpe)
                     self.sram_to_accelerator_memory(0x00000, dst, t_take * VN_VD_PAD)
 
-                smart_bf16_permute_core(self,
+                bf16_permute_core_v2(self,
                     dims=[VS, VN, VD_PAD], permute_indices=[1, 0, 2],
                     input_dram_addr=extract_buf,
                     output_dram_addr=pad_dst,
                     params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
                     temp_dram_start=perm_temp)
 
-            smart_bf16_permute_core(self,
+            bf16_permute_core_v2(self,
                 dims=[VS, VN, VD_PAD], permute_indices=[1, 0, 2],
                 input_dram_addr=self.VIS_V_DRAM,
                 output_dram_addr=self.VIS_V_PAD_DRAM,
@@ -1372,7 +1751,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(
                         0x00000, dst_head + t_start * VD * bpe, t_take * VD)
 
-            smart_bf16_permute_core(self,
+            bf16_permute_core_v2(self,
                 dims=permute_dims_merge, permute_indices=permute_idx,
                 input_dram_addr=self.VIS_ATTN_TRIM_DRAM,
                 output_dram_addr=self.VIS_ATTN_RESULT_DRAM,
@@ -1393,7 +1772,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
                 B_DRAM_ADDR=la['gate_data'],
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.INT4,
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['gate_bias'], bias_mode="broadcast_N",
                 silu_enable=True)
             self.matmat_mul_core(is_B_quantized=True,
@@ -1401,7 +1780,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
                 B_DRAM_ADDR=la['up_data'],
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.INT4,
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['up_bias'], bias_mode="broadcast_N")
 
             # gate * up chunked
@@ -1422,7 +1801,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.VIS_MLP_MULT_DRAM,
                 B_DRAM_ADDR=la['down_data'],
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.INT4,
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['down_bias'], bias_mode="broadcast_N")
 
             eltwise_add_core_dram(self, size=VS * VH,
@@ -1467,7 +1846,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.merger_mlp0_data,
                 OUTPUT_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM,
                 C_DRAM_ADDR=self.merger_mlp0_bias, bias_mode="broadcast_N",
-                is_B_quantized=True, data_type=TYPE.INT4,
+                is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.merger_mlp0_scale,
                 gelu_enable=True)
             self.matmat_mul_core(
@@ -1476,7 +1855,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.merger_mlp2_data,
                 OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM,
                 C_DRAM_ADDR=self.merger_mlp2_bias, bias_mode="broadcast_N",
-                is_B_quantized=True, data_type=TYPE.INT4,
+                is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.merger_mlp2_scale)
 
         # Finalize single program
@@ -1740,11 +2119,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # Q, K, V projections with bias
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.FP4,
+                SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['q_bias'])
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.FP4,
+                SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['k_bias'])
             # v_proj writes to temp buffer (seq_len, hd) in standard per-head interleaved layout (BF16)
             total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd,
@@ -1765,14 +2144,14 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 cos_addr = ROPE_WEIGHT_ADDR + t * rope_row_bytes
                 sin_addr = cos_addr + ahd * bpe
                 for kv_h in range(nkvh):
-                    total_flops += self.rope_core_dram_step(
+                    total_flops += self.rope_hf_core(
                         N=ahd,
                         input_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
                         output_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
                         cos_dram_addr=cos_addr,
                         sin_dram_addr=sin_addr)
                 for q_h in range(nkvh * qpkv):
-                    total_flops += self.rope_core_dram_step(
+                    total_flops += self.rope_hf_core(
                         N=ahd,
                         input_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
                         output_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
@@ -1847,10 +2226,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # MLP: gate_proj with SiLU, up_proj, gate x up element-wise, down_proj
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.FP4, silu_enable=True)
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True)
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.FP4)
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4)
 
             # gate x up chunked: process M_CHUNK rows at a time
             _bpe = self.bytes_per_element
@@ -1868,7 +2247,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # down_proj
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.FP4)
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4)
 
             # Qwen2.5-VL: no post-FFN norm; add residual directly to down_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
@@ -1996,11 +2375,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # Q, K, V projections with bias
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.vector_length, N=hd * qpkv,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                    SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.FP4,
+                    SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
                     C_DRAM_ADDR=la['q_bias'])
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.vector_length, N=hd,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                    SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.FP4,
+                    SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
                     C_DRAM_ADDR=la['k_bias'])
                 total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=hd,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
@@ -2011,7 +2390,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # RoPE per head (decode position set by ROPE_SIZE_REG at runtime)
                 ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE
                 for kv_h in range(nkvh):
-                    total_flops += self.rope_core_dram_step(
+                    total_flops += self.rope_hf_core(
                         N=ahd,
                         input_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
                         output_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
@@ -2020,7 +2399,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         rope_size_reg=self.ROPE_SIZE_REG,
                         tmp_reg=self.TMP_REG)
                 for q_h in range(nkvh * qpkv):
-                    total_flops += self.rope_core_dram_step(
+                    total_flops += self.rope_hf_core(
                         N=ahd,
                         input_dram_addr=self.LAYER0_Q_DRAM + q_h * ahd * bpe,
                         output_dram_addr=self.LAYER0_Q_DRAM + q_h * ahd * bpe,
@@ -2040,13 +2419,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
                     # Store roped K_h to KV cache at decode position (via V_CACHE_SIZE_REG)
                     self.accelerator_memory_to_sram(self.LAYER0_K_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
-                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, k_cache_base, self.TMP_REG)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x10000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
                     # Store V_h to KV cache at decode position (via V_CACHE_SIZE_REG)
                     self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
-                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, v_cache_base, self.TMP_REG)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x20000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
@@ -2086,10 +2465,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # MLP: SwiGLU
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.FP4, silu_enable=True)
+                    SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True)
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                    SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.FP4)
+                    SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4)
 
                 # gate x up (M=1: mlp_elements fits in SRAM in one shot)
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
@@ -2100,7 +2479,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # down_proj
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.mlp_elements, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.FP4)
+                    SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4)
 
                 # Qwen2.5-VL: no post-FFN norm; residual direct on down_proj output
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
@@ -2113,7 +2492,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
                 total_flops += self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                     A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.FP4)
+                    SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
 
             self.generate_instruction_halt()
             segment_instruction_counts.append(self.capture_count - count_at_start)
@@ -2158,9 +2537,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             prog_idx = min((self.seq_len - 1) // 64, len(decoder_program_sizes) - 1)
             prog_addr = decoder_base_addr + sum(decoder_program_sizes[:prog_idx])
 
-            self.isa_add_set_core(self.V_CACHE_SIZE_REG, (self.seq_len - 1) * _kv_stride)
+            self.isa_add_set_core(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter((self.seq_len - 1) * _kv_stride))
             _rope_pos = self.seq_len - 1 + getattr(self, '_rope_offset', 0)
-            self.isa_add_set_core(self.ROPE_SIZE_REG,    _rope_pos * _rope_stride)
+            self.isa_add_set_core(self.ROPE_SIZE_REG,    ue_35bit_addr_shifter(_rope_pos * _rope_stride))
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
@@ -2210,8 +2589,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen2.5-VL-3B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default="please describe the image in details.", help="Text prompt")
-    parser.add_argument("--image", type=str, default=os.path.join(PROJECT_ROOT, "test_samples/test_image.jpg"),
-                        help="Path to image file (default: test_samples/test_image.jpg, use 'none' for text-only)")
+    parser.add_argument("--image", type=str, default=os.path.join(SCRIPT_DIR, "test_image.jpg"),
+                        help="Path to image file (default: test_image.jpg, use 'none' for text-only)")
     parser.add_argument('--vision-cpu', action='store_true',
                         help='Run vision encoder on CPU (fp32) instead of FPGA — for quality comparison')
     parser.add_argument('--rep-penalty', type=float, default=1.05,

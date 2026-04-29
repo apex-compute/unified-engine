@@ -45,19 +45,27 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine
 
+# --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
 
-from model_lib_core import (
-    parse_offset,
-    set_silent,
-    install_quiet_print,
-    ensure_hf_model,
-    load_config_with_weight_defs,
-)
-
 _original_print = builtins.print
-install_quiet_print()
+_SILENT_MODE = False
 
+def quiet_print(*args, **kwargs):
+    """Suppress prints when _SILENT_MODE is True; otherwise print normally."""
+    if _SILENT_MODE:
+        return
+    _original_print(*args, **kwargs)
+
+builtins.print = quiet_print
+# ---------------------------------------------
+
+
+def _parse_offset(val) -> int:
+    """Parse offset/size from JSON: int or hex string like '0x499F000'."""
+    if isinstance(val, str):
+        return int(val, 0)
+    return int(val)
 
 
 def _bf16_bytes(tensor: torch.Tensor) -> bytes:
@@ -79,16 +87,16 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
       - All weights stored as bf16 (no quantization) for best quality on 124M model.
     """
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-    cfg = load_config_with_weight_defs(os.path.join(script_dir, "gpt2_config.json"))
+    cfg = _load_config(script_dir)
     weight_defs = cfg["_weight_defs"]
     paths = cfg["paths"]
     paths_full = os.path.join(script_dir, paths["weights_bin"])
     out_path = output_path or paths_full
 
-    model, model_dir = ensure_hf_model(script_dir, cfg, AutoModelForCausalLM)
+    model, model_dir = _ensure_hf_model(script_dir, cfg)
     emb_cfg = cfg["special"]["embedding"]
-    token_embd_offset = parse_offset(emb_cfg["token_embd_offset"])
-    token_embd_size = parse_offset(emb_cfg["token_embd_size"])
+    token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
+    token_embd_size = _parse_offset(emb_cfg["token_embd_size"])
     LAYER_WEIGHT_SIZE = weight_defs["LAYER_WEIGHT_SIZE"]
     num_layers = cfg["file_info"]["num_layers"]
     hidden_size = cfg["file_info"]["hidden_size"]
@@ -195,6 +203,36 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     return out_path
 
 
+def _ensure_hf_model(script_dir: str, cfg: dict):
+    """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
+    model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
+    hf_repo = cfg["paths"]["hf_model_repo"]
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
+        snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False,
+                         allow_patterns=["*.json", "*.txt", "*.safetensors", "*.model"])
+        _original_print("Download complete.")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, torch_dtype=torch.bfloat16, device_map=None, trust_remote_code=True
+    )
+    return model, model_dir
+
+
+def _load_config(script_dir: str) -> dict:
+    """Load gpt2_config.json and build weight_defs (offset/size dict) from regions."""
+    config_path = os.path.join(script_dir, "gpt2_config.json")
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+    weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
+    for key, r in cfg.get("regions", {}).items():
+        weight_defs[key] = _parse_offset(r["offset"])
+        weight_defs[f"{key}_SIZE"] = r["size"]
+    for key, r in cfg.get("non_layer_regions", {}).items():
+        weight_defs[key] = _parse_offset(r["offset"])
+        weight_defs[f"{key}_SIZE"] = r["size"]
+    cfg["_weight_defs"] = weight_defs
+    return cfg
 
 
 # -----------------------------------------------------------------------------
@@ -216,7 +254,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
         super().__init__()
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        self._cfg = load_config_with_weight_defs(os.path.join(self.script_dir, "gpt2_config.json"))
+        self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
         fi = self._cfg["file_info"]
@@ -559,7 +597,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
 
     def weight_init(self) -> None:
         """Initialize DRAM: load HF embedding+tokenizer+pos_embed, layer weights from bin, OUTPUT_LN/LM_HEAD from bin."""
-        model, model_dir = ensure_hf_model(self.script_dir, self._cfg, AutoModelForCausalLM)
+        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
         # GPT-2 does NOT scale the embedding; pad to 50304 for alignment
         embed_raw = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
         padded_vocab = self.EMBEDDING_ELEMENTS  # 50304
@@ -705,7 +743,9 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         self.seq_len = seq_len
         q_seq_len = seq_len * self.group_size  # = seq_len for MHA
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
-        set_silent(True)
+
+        global _SILENT_MODE
+        _SILENT_MODE = True
         self.start_capture()
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
@@ -828,7 +868,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(prefill_program_addr)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
         self.clear_capture_buffer()
-        set_silent(False)
+        _SILENT_MODE = False
         print(f"    Prefill program start at 0x{prefill_program_addr:X} end at 0x{self.get_program_dram_addr():X}, usage: {self.get_program_dram_usage()} bytes")
 
         return prefill_program_addr, total_flops
@@ -873,7 +913,9 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         segment_instruction_counts = []
         total_flops_list = []
-        set_silent(True)
+
+        global _SILENT_MODE
+        _SILENT_MODE = True
         self.clear_inst_id()
         self.start_capture()
 
@@ -1001,7 +1043,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
             segment_instruction_counts.append(self.capture_count - count_at_start)
             total_flops_list.append(total_flops)
         self.stop_capture()
-        set_silent(False)
+        _SILENT_MODE = False
         all_programs_bytes = bytearray()
         for inst in self.capture_buffer:
             all_programs_bytes.extend(inst.get_bytes())
@@ -1082,10 +1124,12 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         _stop_tokens = {self._end_of_turn_token_id}  # 50256
         use_sampling = temperature > 0
         generated_ids = []
+
+        global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
         buckets = self._cfg["model"]["decoder_seq_len_buckets"]
         while self.seq_len < max_seq_len:
-            set_silent(True)
+            _SILENT_MODE = True
             self.seq_len += 1
             # Find the correct bucket index
             prog_idx = 0
@@ -1128,7 +1172,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                     token_id = logits.argmax().item()
 
             token_char = self.tokenizer.decode([token_id])
-            set_silent(False)
+            _SILENT_MODE = False
             if token_id in _stop_tokens:
                 print(f"\nStop token {token_id} reached.")
                 break
@@ -1159,7 +1203,7 @@ def main():
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    cfg = load_config_with_weight_defs(os.path.join(script_dir, "gpt2_config.json"))
+    cfg = _load_config(script_dir)
     if args.local_weights:
         weights_bin_rel = cfg["paths"]["local_weights_bin"]
     else:

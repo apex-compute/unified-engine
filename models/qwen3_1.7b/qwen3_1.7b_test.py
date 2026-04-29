@@ -46,41 +46,67 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
+import user_dma_core
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import UnifiedEngine
+
+# --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
 
-import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
-from user_dma_core import UnifiedEngine
-from model_lib_core import (
-    quantize_bf16_to_int4_packed,
-    parse_offset,
-    set_silent,
-    install_quiet_print,
-    ensure_hf_model,
-    load_config_with_weight_defs,
-)
-
 _original_print = builtins.print
-install_quiet_print()
+_SILENT_MODE = False
+
+def quiet_print(*args, **kwargs):
+    """Suppress prints when _SILENT_MODE is True; otherwise print normally."""
+    if _SILENT_MODE:
+        return
+    _original_print(*args, **kwargs)
+
+builtins.print = quiet_print
+# ---------------------------------------------
 
 # down_proj K=6144 ≤ SCALE_BRAM_ELEMENTS=8192 — no K-split needed.
 # (Previously was 8960 which required splitting; mlp_elements corrected to 6144.)
+
+def _parse_offset(val) -> int:
+    """Parse offset/size from JSON: int or hex string like '0x24000000'."""
+    if isinstance(val, str):
+        return int(val, 0)
+    return int(val)
+
+def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 64) -> tuple[bytes, bytes]:
+    """Quantize bf16 weight (N_w, K_w) to INT4 packed + scale per block of 64 along K. Returns (data_bytes, scale_bytes).
+    Scale is stored with negative sign so HW IF4 path dispatches as INT4 (sign(bf16 scale)=neg → INT4 codebook)."""
+    w = weight_bf16.detach().cpu().float().reshape(-1)
+    N_w, K_w = weight_bf16.shape
+    assert K_w % block_size == 0
+    w_blocks = w.reshape(N_w, K_w // block_size, block_size)
+    scale = w_blocks.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
+    scale_bf16 = (-scale).to(torch.bfloat16)
+    w_int8 = (w_blocks / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
+    w_nibbles = w_int8.numpy().astype(np.int16) & 0x0F
+    low = w_nibbles[:, :, 0::2].reshape(N_w, -1)
+    high = w_nibbles[:, :, 1::2].reshape(N_w, -1)
+    packed = (high << 4) | low
+    data_bytes = packed.astype(np.uint8).tobytes()
+    scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
+    return (data_bytes, scale_bytes)
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
     """Generate weights_qwen3_1.7b_hf.bin from Hugging Face model per qwen3_1.7b_config.json layout.
     Returns the path to the written file. Use this bin to replace full_model_weights.bin."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-    cfg = load_config_with_weight_defs(os.path.join(script_dir, "qwen3_1.7b_config.json"))
+    cfg = _load_config(script_dir)
     weight_defs = cfg["_weight_defs"]
     paths = cfg["paths"]
     paths_full = os.path.join(script_dir, paths["weights_bin"])
     out_path = output_path or paths_full
 
-    model, model_dir = ensure_hf_model(script_dir, cfg, AutoModelForCausalLM)
+    model, model_dir = _ensure_hf_model(script_dir, cfg)
     gamma_offset = cfg["special"]["rms_norm"]["gamma_offset"]  # 0.0 for Qwen3
     emb_cfg = cfg["special"]["embedding"]
-    token_embd_offset = parse_offset(emb_cfg["token_embd_offset"])
-    token_embd_size = parse_offset(emb_cfg["token_embd_size"])
+    token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
+    token_embd_size = _parse_offset(emb_cfg["token_embd_size"])
     LAYER_WEIGHT_SIZE = weight_defs["LAYER_WEIGHT_SIZE"]
     base_layer0 = weight_defs["BLK0_ATTN_NORM_WEIGHT"]
     num_layers = cfg["file_info"]["num_layers"]
@@ -158,7 +184,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
             if kind == "int4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
-                data_bytes, scale_bytes = quantize_bf16_to_int4_packed(tensor)
+                data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(tensor)
                 scale_padded = (scale_bytes + b"\x00" * sz)[:sz]
                 data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
                 write_at(file_off, scale_padded)
@@ -200,7 +226,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     lm_head_w = model.lm_head.weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
-    data_bytes, scale_bytes = quantize_bf16_to_int4_packed(lm_head_w)
+    data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(lm_head_w)
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
@@ -210,6 +236,35 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
         f.write(buf)
     print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
     return out_path
+
+def _ensure_hf_model(script_dir: str, cfg: dict):
+    """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
+    model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
+    hf_repo = cfg["paths"]["hf_model_repo"]
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
+        snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
+        _original_print("Download complete.")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, torch_dtype=torch.bfloat16, device_map=None, trust_remote_code=True
+    )
+    return model, model_dir
+
+def _load_config(script_dir: str) -> dict:
+    """Load qwen3_1.7b_config.json and build weight_defs (offset/size dict) from regions."""
+    config_path = os.path.join(script_dir, "qwen3_1.7b_config.json")
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+    weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
+    for key, r in cfg.get("regions", {}).items():
+        weight_defs[key] = _parse_offset(r["offset"])
+        weight_defs[f"{key}_SIZE"] = r["size"]
+    for key, r in cfg.get("non_layer_regions", {}).items():
+        weight_defs[key] = _parse_offset(r["offset"])
+        weight_defs[f"{key}_SIZE"] = r["size"]
+    cfg["_weight_defs"] = weight_defs
+    return cfg
 
 # -----------------------------------------------------------------------------
 # Qwen3-1.7B unified engine
@@ -244,7 +299,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             program_dram_base=0x98000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        self._cfg = load_config_with_weight_defs(os.path.join(self.script_dir, "qwen3_1.7b_config.json"))
+        self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
         fi = self._cfg["file_info"]
@@ -442,6 +497,42 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
     def get_arg_max_index(self) -> int:
         """Get the arg max index from the Unified Engine"""
         return self.read_reg32(UE_ARGMAX_INDEX)
+
+    def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
+        """RoPE (HuggingFace style). Caller must have start_capture() before and stop_capture() after."""
+        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
+        assert N % 2 == 0, "N must be even for RoPE half layout"
+        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
+        half = N // 2
+        bytes_per_elem = 2
+        sram_x = 0x00000
+        sram_a = 0x20000
+        sram_d = 0x40000
+        sram_cos = 0x80000
+        sram_sin = 0x80000 + N * bytes_per_elem
+        sram_bc = 0x80000 + N * bytes_per_elem * 2
+        self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr, sram_address=sram_x, element_size=N)
+        if rope_size_reg is not None:
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(cos_dram_addr), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(sin_dram_addr), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+        else:
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
+            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
+        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
+        if output_addr_inc_reg is not None:
+            self.generate_instruction_add_imm(output_addr_inc_reg, ue_35bit_addr_shifter(output_dram_addr), tmp_reg)
+            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+        else:
+            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
+        return 4 * N
 
     def decoder_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
@@ -744,7 +835,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
     def weight_init(self) -> None:
         """Initialize DRAM from weight bin: load HF embedding+tokenizer, layers from bin, host-computed RoPE, then OUTPUT_NORM/LM_HEAD from bin."""
-        model, model_dir = ensure_hf_model(self.script_dir, self._cfg, AutoModelForCausalLM)
+        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
         # Qwen3 does NOT scale the embedding by sqrt(hidden_size)
         embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
         self.embedding_weight = embed
@@ -902,7 +993,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             gflops_program, _ = self.report_flop_rate_gflops(gflops)
             print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
 
-    def compile_prefill(self, seq_len: int, layer_size: int | None = None, save_bin: bool = True) -> dict:
+    def compile_prefill(self, seq_len: int, layer_size: int | None = None) -> dict:
         """
         Compile prefill for the given prefill sequence.
 
@@ -937,7 +1028,8 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         rope_row_bytes = ahd * 2 * bpe   # 128*2*2 = 512 bytes per position per call
 
         # --- Qwen3 28 layers: compile ---
-        set_silent(True)
+        global _SILENT_MODE
+        _SILENT_MODE = True
         self.start_capture()
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
@@ -956,14 +1048,14 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # Q, K, V projections
             total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
             total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
             # v_proj writes to temp buffer (seq_len, hd) in standard per-head interleaved layout
             total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
             # QK RMSNorm per head: treat (seq_len, hd) as (seq_len * nkvh, ahd) for K
             # and (seq_len, hd * qpkv) as (seq_len * nkvh * qpkv, ahd) for Q
@@ -980,14 +1072,14 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 cos_addr = ROPE_WEIGHT_ADDR + t * rope_row_bytes
                 sin_addr = cos_addr + ahd * bpe              # sin row starts after cos row (each 64 × 2 B)
                 for kv_h in range(nkvh):
-                    total_flops += self.rope_core_dram_step(
+                    total_flops += self.rope_hf_core(
                         N=ahd,
                         input_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
                         output_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
                         cos_dram_addr=cos_addr,
                         sin_dram_addr=sin_addr)
                 for q_h in range(nkvh * qpkv):
-                    total_flops += self.rope_core_dram_step(
+                    total_flops += self.rope_hf_core(
                         N=ahd,
                         input_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
                         output_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
@@ -1056,7 +1148,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # o_proj: (seq_len, hd * qpkv) → (seq_len, vector_length)
             total_flops += self.quantized_matmat_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
             # Qwen3: no post-attention norm; add residual directly to o_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
@@ -1071,10 +1163,10 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # MLP: gate_proj with SiLU, up_proj, gate x up element-wise, down_proj
             total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.INT4, silu_enable=True)
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True)
             total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.INT4)
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4)
 
             # gate x up chunked: process M_CHUNK rows at a time
             # Each row = mlp_elements = 8960 elems × 2 bytes = 17.9 KB
@@ -1095,7 +1187,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # down_proj: K=6144 ≤ SCALE_BRAM_ELEMENTS=8192, single call (no split)
             total_flops += self.quantized_matmat_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.INT4)
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4)
 
             # Qwen3: no post-FFN norm; add residual directly to down_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
@@ -1108,21 +1200,8 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         prefill_program_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prefill_program_addr)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        if save_bin:
-            prefill_bytes = bytearray()
-            for inst in self.capture_buffer:
-                prefill_bytes.extend(inst.get_bytes())
-            bin_dir = os.path.join(self.script_dir, "qwen3_1.7b_bin")
-            os.makedirs(bin_dir, exist_ok=True)
-            bin_path  = os.path.join(bin_dir, f"prefill_program_S{seq_len + 1}.bin")
-            meta_path = os.path.join(bin_dir, f"prefill_program_S{seq_len + 1}.json")
-            with open(bin_path, "wb") as f:
-                f.write(prefill_bytes)
-            with open(meta_path, "w") as f:
-                json.dump({"seq_len": seq_len + 1, "total_flops": total_flops}, f)
-            print(f"    Prefill bin saved: {bin_path} ({len(prefill_bytes)} bytes)")
         self.clear_capture_buffer()
-        set_silent(False)
+        _SILENT_MODE = False
         _original_print()  # newline after \r layer progress
         print(f"    Prefill program start at 0x{prefill_program_addr:X} end at 0x{self.get_program_dram_addr():X}, usage: {self.get_program_dram_usage()} bytes")
 
@@ -1184,7 +1263,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         bpe  = self.bytes_per_element
         hd   = self.head_dim          # 1024
         rope_row_bytes = ahd * 2 * bpe   # 512 bytes per position
-        set_silent(True)
+
+        global _SILENT_MODE
+        _SILENT_MODE = True
         self.clear_inst_id()
         self.start_capture()
 
@@ -1208,13 +1289,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 # Q, K projections; V to FLASH_V_DRAM temp (single token)
                 total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=hd * qpkv,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
                 total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=hd,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
                 total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=hd,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
                 # QK RMSNorm per head (M=1 token * nkvh heads / nkvh*qpkv heads)
                 total_flops += self.rms_norm_core_dram(M=nkvh, N=ahd, A_DRAM_ADDR=self.LAYER0_K_DRAM,
@@ -1225,7 +1306,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 # RoPE per head (decode position set by ROPE_SIZE_REG at runtime)
                 ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_LOCAL
                 for kv_h in range(nkvh):
-                    total_flops += self.rope_core_dram_step(
+                    total_flops += self.rope_hf_core(
                         N=ahd,
                         input_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
                         output_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
@@ -1234,7 +1315,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                         rope_size_reg=self.ROPE_SIZE_REG,
                         tmp_reg=self.TMP_REG)
                 for q_h in range(nkvh * qpkv):
-                    total_flops += self.rope_core_dram_step(
+                    total_flops += self.rope_hf_core(
                         N=ahd,
                         input_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
                         output_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
@@ -1254,13 +1335,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
                     # Store roped K_h to KV cache at decode position (via V_CACHE_SIZE_REG)
                     self.accelerator_memory_to_sram(self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
-                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, k_cache_base, self.TMP_REG)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x10000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
                     # Store V_h to KV cache at decode position (via V_CACHE_SIZE_REG)
                     self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
-                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, v_cache_base, self.TMP_REG)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x20000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
@@ -1286,7 +1367,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 # o_proj
                 total_flops += self.quantized_matmat_core(M=1, K=hd * qpkv, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.INT4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
                 # Qwen3: no post-attention norm; residual direct on o_proj output
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
@@ -1301,10 +1382,10 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 # MLP: SwiGLU
                 total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.INT4, silu_enable=True)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True)
                 total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.INT4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4)
 
                 # gate x up (M=1: mlp_elements fits in SRAM in one shot)
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
@@ -1315,7 +1396,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 # down_proj: K=6144 ≤ SCALE_BRAM_ELEMENTS=8192, single call
                 total_flops += self.quantized_matmat_core(M=1, K=self.mlp_elements, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.INT4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4)
 
                 # Qwen3: no post-FFN norm; residual direct on down_proj output
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
@@ -1328,14 +1409,14 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
                 total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                     A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.INT4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4)
 
             self.generate_instruction_halt()
             segment_instruction_counts.append(self.capture_count - count_at_start)
             total_flops_list.append(total_flops)
 
         self.stop_capture()
-        set_silent(False)
+        _SILENT_MODE = False
         all_programs_bytes = bytearray()
         for inst in self.capture_buffer:
             all_programs_bytes.extend(inst.get_bytes())
@@ -1363,17 +1444,19 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         _kv_stride  = ahd * bpe                  # 128 * 2 = 256 bytes per position per head
         # ROPE_SIZE_REG: decode_pos × rope_row_bytes (rope table stride per position)
         _rope_stride = ahd * 2 * bpe             # 128 * 2 * 2 = 512 bytes per position
+
+        global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
         while self.seq_len < max_seq_len:
-            set_silent(True)
+            _SILENT_MODE = True
             self.seq_len += 1
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
             prog_idx = min((self.seq_len - 1) // 256, 7)
             prog_addr = decoder_base_addr + sum(decoder_program_sizes[:prog_idx])
             gflops = gflops_per_token[prog_idx] if gflops_per_token else None
 
-            self.isa_add_set_core(self.V_CACHE_SIZE_REG, (self.seq_len - 1) * _kv_stride)
-            self.isa_add_set_core(self.ROPE_SIZE_REG,    (self.seq_len - 1) * _rope_stride)
+            self.isa_add_set_core(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter((self.seq_len - 1) * _kv_stride))
+            self.isa_add_set_core(self.ROPE_SIZE_REG,    ue_35bit_addr_shifter((self.seq_len - 1) * _rope_stride))
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
@@ -1386,7 +1469,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             self.wait_queue(10.0)
             token_id = self.get_arg_max_index()
             token_char = self.tokenizer.decode([token_id])
-            set_silent(False)
+            _SILENT_MODE = False
             if token_id in _qwen3_stop_tokens:
                 print(f"\nStop token {token_id} reached.")
                 break
@@ -1429,7 +1512,7 @@ def main():
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
-    cfg = load_config_with_weight_defs(os.path.join(script_dir, "qwen3_1.7b_config.json"))
+    cfg = _load_config(script_dir)
     if args.prompt is not None:
         tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
         tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)

@@ -34,7 +34,7 @@ import math
 import os
 import sys
 
-# This file's folder: gemma3_bin/, *.json, decoder_program.json live here. user_dma_core is one level up.
+# This file's folder; user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
@@ -69,27 +69,134 @@ def _parse_offset(val) -> int:
         return int(val, 0)
     return int(val)
 
-def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 64) -> tuple[bytes, bytes]:
-    """Quantize bf16 weight (N_w, K_w) to INT4 packed + scale per block of 64 along K. Returns (data_bytes, scale_bytes)."""
-    w = weight_bf16.detach().cpu().float().reshape(-1)
-    N_w, K_w = weight_bf16.shape
+# NVFP4 E2M1 codebooks. _NVFP4_VALUES is the value table in argmin order
+# (used during quantization). _NVFP4_NIBBLES[i] is the HW storage code that
+# decodes back to value i. _NVFP4_DECODE indexes by storage code.
+_NVFP4_VALUES_F32 = np.array(
+    [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0,
+      0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0],
+    dtype=np.float32,
+)
+_NVFP4_NIBBLES = np.array(
+    [0xF, 0xE, 0xD, 0xC, 0xB, 0xA, 0x9, 0x8,
+     0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7],
+    dtype=np.uint8,
+)
+_NVFP4_DECODE_F32 = np.array(
+    [+0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=np.float32,
+)
+
+
+def _quantize_bf16_to_if4_packed(weight_bf16: torch.Tensor, block_size: int = 64,
+                                  force_int4: bool = False) -> tuple[bytes, bytes]:
+    """Pack bf16 weight (N, K) as IF4 for HW. Per K-block of 64, picks INT4
+    (codes -8..7) vs FP4 NVFP4 E2M1 by min reconstruction MSE; ``force_int4=True``
+    skips the FP4 branch and produces a pure-Q4 bin (all-negative scale signs)
+    that the HW dispatches as INT4. Sign of bf16 scale dispatches the HW
+    codebook (negative=INT4, positive=FP4). Returns (data_bytes, scale_bytes)."""
+    w = weight_bf16.detach().cpu().float()
+    N_w, K_w = w.shape
     assert K_w % block_size == 0
-    w_blocks = w.reshape(N_w, K_w // block_size, block_size)
-    scale = w_blocks.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
-    # IF4 INT4 path is selected by negative BF16 scale sign bit in RTL.
-    scale_bf16 = (-scale).to(torch.bfloat16)
-    w_int8 = (w_blocks / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
-    w_nibbles = w_int8.numpy().astype(np.int16) & 0x0F
-    low = w_nibbles[:, :, 0::2].reshape(N_w, -1)
-    high = w_nibbles[:, :, 1::2].reshape(N_w, -1)
-    packed = (high << 4) | low
-    data_bytes = packed.astype(np.uint8).tobytes()
+    num_blocks_k = K_w // block_size
+    blocks = w.view(N_w, num_blocks_k, block_size)
+    abs_max = blocks.abs().amax(dim=-1).clamp(min=1e-8)
+
+    q4_scale_f = abs_max / 7.0
+    q4_scale_bf = q4_scale_f.to(torch.bfloat16).float()
+    q4_q = (blocks / q4_scale_bf.unsqueeze(-1)).round().clamp(-8, 7)
+    q4_recon = q4_q * q4_scale_bf.unsqueeze(-1)
+    q4_err = ((blocks - q4_recon) ** 2).sum(dim=-1)
+
+    if force_int4:
+        use_q4 = torch.ones_like(q4_err, dtype=torch.bool)
+        signed_scale_f = -q4_scale_f
+        scale_bf16 = signed_scale_f.to(torch.bfloat16)
+        q4_nib = (q4_q.to(torch.int8).numpy().astype(np.int16) & 0x0F).astype(np.uint8)
+        nibbles = q4_nib.reshape(N_w, K_w)
+    else:
+        nvfp4_t = torch.from_numpy(_NVFP4_VALUES_F32)
+        fp4_scale_f = abs_max / 6.0
+        fp4_scale_bf = fp4_scale_f.to(torch.bfloat16).float()
+        scaled = blocks / fp4_scale_bf.unsqueeze(-1)
+        dist = (scaled.unsqueeze(-1) - nvfp4_t).abs()
+        fp4_idx = dist.argmin(dim=-1)
+        fp4_recon = nvfp4_t[fp4_idx] * fp4_scale_bf.unsqueeze(-1)
+        fp4_err = ((blocks - fp4_recon) ** 2).sum(dim=-1)
+
+        use_q4 = q4_err <= fp4_err
+        chosen_scale_f = torch.where(use_q4, q4_scale_f, fp4_scale_f)
+        signed_scale_f = torch.where(use_q4, -chosen_scale_f, chosen_scale_f)
+        scale_bf16 = signed_scale_f.to(torch.bfloat16)
+
+        q4_nib = (q4_q.to(torch.int8).numpy().astype(np.int16) & 0x0F).astype(np.uint8)
+        fp4_nib = _NVFP4_NIBBLES[fp4_idx.numpy()]
+        use_q4_b = use_q4.numpy()[..., None]
+        nibbles = np.where(use_q4_b, q4_nib, fp4_nib).reshape(N_w, K_w)
+
+    low = nibbles[:, 0::2].astype(np.uint16)
+    high = nibbles[:, 1::2].astype(np.uint16)
+    packed = ((high << 4) | low).astype(np.uint8)
+    data_bytes = packed.tobytes()
     scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
     return (data_bytes, scale_bytes)
 
-def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
+
+def _dequantize_if4_from_bin(
+    weight_bin: bytes,
+    scale_off: int,
+    scale_sz: int,
+    data_off: int,
+    data_sz: int,
+    N: int,
+    K: int,
+    block_size: int = 64,
+) -> torch.Tensor:
+    """Dequantize mixed IF4 packed weight from bin. Per K-block of 64,
+    sign(bf16 scale) selects the codebook (negative=INT4, positive=FP4 NVFP4
+    E2M1). HW dequant = code_table[nibble] * |scale|. Returns (N, K) bf16."""
+    assert K % block_size == 0
+    num_blocks_k = K // block_size
+
+    scale_bytes = weight_bin[scale_off : scale_off + scale_sz]
+    scale = torch.frombuffer(
+        bytearray(scale_bytes), dtype=torch.bfloat16
+    ).clone().reshape(N, num_blocks_k)
+
+    data_bytes_arr = weight_bin[data_off : data_off + data_sz]
+    packed = np.frombuffer(data_bytes_arr, dtype=np.uint8)
+    packed = packed[: N * (K // 2)].reshape(N, K // 2)
+
+    low_nib = (packed & 0x0F).astype(np.int16)
+    high_nib = ((packed >> 4) & 0x0F).astype(np.int16)
+    nibbles = np.stack([low_nib, high_nib], axis=-1).reshape(N, K)
+
+    int4_vals = np.where(nibbles >= 8, nibbles - 16, nibbles).astype(np.float32)
+    fp4_vals = _NVFP4_DECODE_F32[nibbles]
+
+    int4_blocked = int4_vals.reshape(N, num_blocks_k, block_size)
+    fp4_blocked = fp4_vals.reshape(N, num_blocks_k, block_size)
+    use_int4 = (scale.float().numpy() < 0)[..., None]
+    decoded = np.where(use_int4, int4_blocked, fp4_blocked).reshape(N, K)
+
+    abs_scale_expanded = scale.abs().float().repeat_interleave(block_size, dim=1).to(torch.bfloat16)
+    return torch.from_numpy(decoded).to(torch.bfloat16) * abs_scale_expanded
+
+def weight_bin_generate(output_path: str | None = None, config_path: str | None = None,
+                        quantization: str = "if4") -> str:
     """Generate full_model_weights.bin from Hugging Face model per gemma3_config.json layout.
+
+    ``quantization``:
+      - ``"if4"`` (default): mixed Q4/FP4 per K-block (per-block min-MSE selection,
+        sign-bit dispatch on the bf16 scale).
+      - ``"pure_q4"``: force INT4 (Q4_64) for every block; same wire format,
+        all-negative scale signs so HW dispatches as INT4 only.
+
     Returns the path to the written file."""
+    if quantization not in ("if4", "pure_q4"):
+        raise ValueError(f"quantization must be 'if4' or 'pure_q4', got {quantization!r}")
+    force_int4 = (quantization == "pure_q4")
     cfg = Gemma3_UnifiedEngine.load_config(config_path=config_path, script_dir=SCRIPT_DIR)
     weight_defs = cfg["_weight_defs"]
     paths = cfg["paths"]
@@ -148,17 +255,17 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         region_writes = [
             (gamma_in, "bf16"),
-            (q_w, "int4"),
-            (k_w, "int4"),
-            (v_w, "int4"),
+            (q_w, "if4"),
+            (k_w, "if4"),
+            (v_w, "if4"),
             (gamma_q, "bf16"),
             (gamma_k, "bf16"),
-            (o_w, "int4"),
+            (o_w, "if4"),
             (gamma_post, "bf16"),
             (gamma_ffn, "bf16"),
-            (up_w, "int4"),
-            (gate_w, "int4"),
-            (down_w, "int4"),
+            (up_w, "if4"),
+            (gate_w, "if4"),
+            (down_w, "if4"),
             (gamma_post_ffn, "bf16"),
         ]
         j = 0
@@ -170,10 +277,10 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             sz = weight_defs[sz_key]
             file_off = off + layer_idx * LAYER_WEIGHT_SIZE
             tensor, kind = region_writes[j]
-            if kind == "int4":
+            if kind == "if4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
-                data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(tensor)
+                data_bytes, scale_bytes = _quantize_bf16_to_if4_packed(tensor, force_int4=force_int4)
                 scale_padded = (scale_bytes + b"\x00" * sz)[:sz]
                 data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
                 write_at(file_off, scale_padded)
@@ -217,7 +324,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     lm_head_w = model.lm_head.weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
-    data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(lm_head_w)
+    data_bytes, scale_bytes = _quantize_bf16_to_if4_packed(lm_head_w, force_int4=force_int4)
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
