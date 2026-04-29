@@ -41,7 +41,8 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, set_dma_device,
-    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX
+    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX,
+    ue_35bit_addr_shifter
 )
 
 URAM_A_BASE = 0x00000
@@ -335,10 +336,10 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             for j in range(total_elements // last_dim):
                 src_idx = permute_a[j * last_dim].item()
                 ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
-                    URAM_START_ADDR, URAM_SECTION.URAM_A.value, inst_id)
+                    URAM_START_ADDR, URAM_SECTION.URAM_A.value)
                 ue.wait_queue(); inst_id += 1
                 ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                    output_dram_addr + j * last_dim * bpe, last_dim * bpe, inst_id)
+                    output_dram_addr + j * last_dim * bpe, last_dim * bpe)
                 ue.wait_queue(); inst_id += 1
             return (1, output_shape)
 
@@ -353,10 +354,10 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
                 src_idx = permute_a[i + j * last_dim].item()
                 ue.ue_memcpy_from_dram(input_dram_addr + src_idx * bpe, last_dim * bpe, 0,
                     URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
-                    URAM_SECTION.URAM_A.value, inst_id)
+                    URAM_SECTION.URAM_A.value)
                 ue.wait_queue(); inst_id += 1
             ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                out_addr, n_blocks * last_dim * bpe, inst_id)
+                out_addr, n_blocks * last_dim * bpe)
             ue.wait_queue(); inst_id += 1
             remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
         return (1, output_shape)
@@ -406,17 +407,17 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             for j in range(n_blocks):
                 ue.ue_memcpy_from_dram(input_dram_addr + q1_pa[i + j * last_dim].item() * bpe,
                     last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
-                    URAM_SECTION.URAM_A.value, inst_id)
+                    URAM_SECTION.URAM_A.value)
                 ue.wait_queue(); inst_id += 1
             ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                out_addr, n_blocks * last_dim * bpe, inst_id)
+                out_addr, n_blocks * last_dim * bpe)
             ue.wait_queue(); inst_id += 1
             remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
 
     # Phase 2: Batched transpose (identity dot-product)
     input_uram_addr = URAM_START_ADDR
     ue.ue_memcpy_from_dram(params_dram_addr, UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe,
-        0, input_uram_addr, URAM_SECTION.URAM_A.value, inst_id)
+        0, input_uram_addr, URAM_SECTION.URAM_A.value)
     ue.wait_queue(); inst_id += 1
 
     max_N_chunk = min(((URAM_NEAR_FULL_ELEMENTS // N_transpose) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE, M_aligned)
@@ -437,20 +438,20 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             while remaining_N > 0:
                 cur_N = min(max_N_chunk, remaining_N)
                 ue.ue_memcpy_from_dram(weight_addr, cur_N * N_transpose * bpe,
-                    0, URAM_START_ADDR, URAM_SECTION.URAM_B.value, inst_id)
+                    0, URAM_START_ADDR, URAM_SECTION.URAM_B.value)
                 ue.wait_queue(); inst_id += 1
 
                 for i in range(cur_M):
                     abs_row = start_vec + i
                     vec_idx = abs_row % UE_VECTOR_SIZE
                     col_block = abs_row // UE_VECTOR_SIZE
-                    ue.start_queue(0, 0, N_transpose // UE_VECTOR_SIZE, 0, 0, LALU_MODE.BYPASS.value, 0,
-                        0, 0, 0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+                    ue.ue_arithmetic_op(0, 0, N_transpose // UE_VECTOR_SIZE, 0, 0, LALU_MODE.BYPASS.value, 0,
+                        0, 0, output_uram, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
                         UE_MODE.BF16_DOT_PRODUCT, 0, input_uram_addr + vec_idx, URAM_START_ADDR + col_block,
-                        1, 0, cur_N * N_transpose, cur_N, inst_id)
+                        1, 0, cur_N * N_transpose, cur_N)
                     inst_id += 1; ue.wait_queue()
                     ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, output_uram,
-                        out_offset + i * M_aligned * bpe, cur_N * bpe, inst_id)
+                        out_offset + i * M_aligned * bpe, cur_N * bpe)
                     ue.wait_queue(); inst_id += 1
 
                 remaining_N -= cur_N; out_offset += cur_N * bpe; weight_addr += cur_N * N_transpose * bpe
@@ -468,10 +469,10 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
             for j in range(n_blocks):
                 ue.ue_memcpy_from_dram(p2_out + q3_pa[i + j * last_dim].item() * bpe,
                     last_dim * bpe, 0, URAM_START_ADDR + (j * last_dim) // UE_VECTOR_SIZE,
-                    URAM_SECTION.URAM_A.value, inst_id)
+                    URAM_SECTION.URAM_A.value)
                 ue.wait_queue(); inst_id += 1
             ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                out_addr, n_blocks * last_dim * bpe, inst_id)
+                out_addr, n_blocks * last_dim * bpe)
             ue.wait_queue(); inst_id += 1
             remaining -= cur; out_addr += n_blocks * last_dim * bpe; i += cur
 
@@ -1027,7 +1028,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 src = self.MEL_DRAM + src_row * W_in * bpe
                 self.ue_memcpy_from_dram(
                     src, chunk, 0, URAM_START_ADDR,
-                    URAM_SECTION.URAM_A.value, inst_id,
+                    URAM_SECTION.URAM_A.value,
                     stride_bytes_per_chunk=row_bytes,
                     stride_jump_bytes=stride * row_bytes)
                 self.wait_queue(); inst_id += 1
@@ -1038,7 +1039,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                        + kh * W_in * bpe)
                 self.ue_memcpy_to_dram(
                     0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                    dst, chunk, inst_id,
+                    dst, chunk,
                     stride_bytes_per_chunk=row_bytes,
                     stride_jump_bytes=K_g * bpe)
                 self.wait_queue(); inst_id += 1
@@ -1133,14 +1134,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                         src = ch_base + src_row * W_in * bpe
                         self.ue_memcpy_from_dram(
                             src, chunk, 0, URAM_START_ADDR,
-                            URAM_SECTION.URAM_A.value, inst_id,
+                            URAM_SECTION.URAM_A.value,
                             stride_bytes_per_chunk=row_bytes,
                             stride_jump_bytes=stride * row_bytes)
                         self.wait_queue(); inst_id += 1
                         dst = r_base + oh_base * K_g * bpe + kh * W_in * bpe
                         self.ue_memcpy_to_dram(
                             0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                            dst, chunk, inst_id,
+                            dst, chunk,
                             stride_bytes_per_chunk=row_bytes,
                             stride_jump_bytes=K_g * bpe)
                         self.wait_queue(); inst_id += 1
@@ -1152,12 +1153,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                         src = ch_base + src_row * W_in * bpe
                         self.ue_memcpy_from_dram(
                             src, row_bytes, 0, URAM_START_ADDR,
-                            URAM_SECTION.URAM_A.value, inst_id)
+                            URAM_SECTION.URAM_A.value)
                         self.wait_queue(); inst_id += 1
                         dst = r_base + (oh_start + j) * K_g * bpe + kh * W_in * bpe
                         self.ue_memcpy_to_dram(
                             0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
-                            dst, row_bytes, inst_id)
+                            dst, row_bytes)
                         self.wait_queue(); inst_id += 1
 
         # Step 3: Matmul R_all @ G → (SC * H_out_pad, W_out * 64) = (SC, N_out_pad, 64)
@@ -1181,7 +1182,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.matmat_mul_core(M=N0, K=padded_k, N=SC,
             A_DRAM_ADDR=self.SUB_PATCH_DRAM, B_DRAM_ADDR=self.w["SUB_CONV0_W"],
             OUTPUT_DRAM_ADDR=self.SUB_OUT0_DRAM,
-            C_DRAM_ADDR=self.w["SUB_CONV0_B"], relu_enable=True)
+            C_DRAM_ADDR=self.w["SUB_CONV0_B"], clamp_enable=True)
         self.stop_capture()
         self.generate_instruction_halt()
         prog = self.get_program_dram_addr()
@@ -1236,7 +1237,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.matmat_mul_core(M=N_out_pad, K=SC, N=SC,
             A_DRAM_ADDR=self.SUB_PW_IN_DRAM, B_DRAM_ADDR=self.w[pw_w_key],
             OUTPUT_DRAM_ADDR=self.SUB_PW_IN_DRAM,
-            C_DRAM_ADDR=self.w[pw_b_key], relu_enable=True)
+            C_DRAM_ADDR=self.w[pw_b_key], clamp_enable=True)
         flops += 2 * N_out * SC * SC
         self.stop_capture()
         self.generate_instruction_halt()
@@ -1493,7 +1494,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(src, URAM_A_BASE, H)
             self.sram_to_accelerator_memory(URAM_A_BASE, dst, H)
         # 2. Embedding lookup: TMP_REG = TOKEN_REG + EMBED_base, DMA from TMP_REG
-        self.generate_instruction_add_imm(self.TOKEN_REG, self.w["EMBED"], self.TMP_REG)
+        self.generate_instruction_add_imm(self.TOKEN_REG, ue_35bit_addr_shifter(self.w["EMBED"]), self.TMP_REG)
         self.accelerator_memory_to_sram(self.w["EMBED"], URAM_A_BASE, H)
         self.overwrite_instruction_with_general_register(self.TMP_REG)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.PRED_EMB_DRAM, H)
@@ -1541,7 +1542,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.start_capture()
         self.generate_instruction_flag_clear()
         # enc_out[t] copy: TMP_REG = ENC_T_REG + ENC_OUT_DRAM, DMA from TMP_REG
-        self.generate_instruction_add_imm(self.ENC_T_REG, self.ENC_OUT_DRAM, self.TMP_REG)
+        self.generate_instruction_add_imm(self.ENC_T_REG, ue_35bit_addr_shifter(self.ENC_OUT_DRAM), self.TMP_REG)
         self.accelerator_memory_to_sram(self.ENC_OUT_DRAM, URAM_A_BASE, D)
         self.overwrite_instruction_with_general_register(self.TMP_REG)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_ENC_DRAM, D)
@@ -1557,7 +1558,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.accelerator_memory_to_sram(self.JOINT_PRED_DRAM, URAM_B_BASE, H)
         self.eltwise_add_core(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, H)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_SUM_DRAM, H)
-        self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.JOINT_SUM_DRAM, relu_enable=True)
+        self.matmat_mul_core(M=1, K=H, N=H, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["IDENTITY_640"], OUTPUT_DRAM_ADDR=self.JOINT_SUM_DRAM, clamp_enable=True)
         # Token matmul + argmax
         self.matmat_mul_core(M=1, K=H, N=N_tok_pad, A_DRAM_ADDR=self.JOINT_SUM_DRAM, B_DRAM_ADDR=self.w["JOINT_OUT_TOK_W"], OUTPUT_DRAM_ADDR=self.JOINT_TOK_DRAM, C_DRAM_ADDR=self.w["JOINT_OUT_TOK_B"])
         total_flops += 2 * H * N_tok_pad
@@ -1681,6 +1682,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             f.write(all_bytes)
         with open(meta_path, "w") as f:
             json.dump(manifest, f)
+        slave_bin_path = os.path.join(bin_dir, "programs_slave.bin")
+        slave_meta_path = os.path.join(bin_dir, "programs_slave.json")
+        with open(slave_bin_path, "wb") as f:
+            f.write(all_bytes)
+        with open(slave_meta_path, "w") as f:
+            json.dump(manifest, f)
         _original_print(f"  Programs dumped: {len(all_bytes)} bytes → {bin_path}")
     def load_programs(self, L_pad):
         """Load compiled programs from bin. Returns dict of {name: dram_addr} or None if not found."""
@@ -1742,8 +1749,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             symbols = 0
             while symbols < self.max_symbols_per_step:
                 # Set registers: TOKEN_REG = embedding offset, ENC_T_REG = encoder position offset
-                self.isa_add_set_core(self.TOKEN_REG, last_token * H * bpe)
-                self.isa_add_set_core(self.ENC_T_REG, t * D * bpe)
+                self.isa_add_set_core(self.TOKEN_REG, ue_35bit_addr_shifter(last_token * H * bpe))
+                self.isa_add_set_core(self.ENC_T_REG, ue_35bit_addr_shifter(t * D * bpe))
                 # Predictor: state save + embedding lookup (register-addressed) + LSTM
                 self.program_execute(pred_prog)
                 # Joint token: enc_out[t] copy (register-addressed) + pred_out copy + projections + argmax
@@ -1879,6 +1886,9 @@ def main():
     # Dump params to bin (weights + Toeplitz + BN + attention biases)
     if not params_loaded:
         engine.dump_params(L_pad)
+        bin_dir = os.path.join(engine.script_dir, "parakeet_bin")
+        np.save(os.path.join(bin_dir, "mel_fb.npy"), sd["preprocessor.featurizer.fb"].float().numpy())
+        np.save(os.path.join(bin_dir, "mel_window.npy"), sd["preprocessor.featurizer.window"].float().numpy())
 
     # ==================================================================
     # Compile (or load from bin)

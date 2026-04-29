@@ -495,7 +495,7 @@ def quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor,
     assert K_w % block_size == 0
     w_blocks = w.reshape(N_w, K_w // block_size, block_size)
     scale = w_blocks.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
-    scale_bf16 = scale.to(torch.bfloat16)
+    scale_bf16 = -scale.to(torch.bfloat16)
     w_int8 = (w_blocks / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
     w_nibbles = w_int8.numpy().astype(np.int16) & 0x0F
     low = w_nibbles[:, :, 0::2].reshape(N_w, -1)
@@ -521,7 +521,7 @@ def quantize_q4_64(tensor: torch.Tensor) -> tuple[np.ndarray, int]:
     quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
     pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
     packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
-    scale_bytes = torch.tensor(scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
+    scale_bytes = torch.tensor(-scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
     return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
 
 

@@ -28,7 +28,7 @@ from user_dma_core import (
     DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, UE_ARGMAX1_INDEX,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
-    UnifiedEngine, set_dma_device,
+    UnifiedEngine, set_dma_device, ue_35bit_addr_shifter,
 )
 
 # =============================================================================
@@ -99,11 +99,10 @@ def accelerator_memory_to_sram_reg(ue, accelerator_dram_address: int, sram_addre
     element_size_bytes = element_size * 2
     uram_type, uram_start_addr = ue.sram_address_to_uram_address(sram_address)
     ue.ue_memcpy_from_dram(accelerator_dram_address, element_size_bytes, MEMCPY_TYPE.URAM.value,
-                           uram_start_addr, uram_type.value, ue._inst_id,
+                           uram_start_addr, uram_type.value,
                            stride_bytes_per_chunk=stride_bytes_per_chunk,
                            stride_jump_bytes=stride_jump_bytes,
                            general_reg_src=general_reg_src)
-    ue._inst_id += 1
 
 def capture_to_raw(ue):
     """Stop capture, extract raw instruction bytes (no halt), clear buffer."""
@@ -442,8 +441,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 last_bucket_idx = prog_idx
             # Build fused reg_set + embed bytes (64 + 64 = 128 bytes)
             reg_set_bytes = bytearray()
-            reg_set_bytes.extend(_make_add_set_bytes(self.V_CACHE_SIZE_REG, pos * self.k_size))
-            reg_set_bytes.extend(_make_add_set_bytes(self.ROPE_SIZE_REG, pos * self.HEAD_DIM * bpe))
+            reg_set_bytes.extend(_make_add_set_bytes(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(pos * self.k_size)))
+            reg_set_bytes.extend(_make_add_set_bytes(self.ROPE_SIZE_REG, ue_35bit_addr_shifter(pos * self.HEAD_DIM * bpe)))
             embed_raw = self._decode_embed_raw[token_id]
             fused_head = bytes(reg_set_bytes) + embed_raw
             # DMA fused reg_set + embed to start of scratch (bucket already cached after)

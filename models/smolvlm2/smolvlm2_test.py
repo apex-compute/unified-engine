@@ -26,7 +26,7 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, UE_ARGMAX1_INDEX,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
-    UnifiedEngine,
+    UnifiedEngine, ue_35bit_addr_shifter,
 )
 from model_lib_core import (
     smart_bf16_permute_core,
@@ -98,10 +98,11 @@ def accelerator_memory_to_sram_reg(ue, accelerator_dram_address: int, sram_addre
     element_size_bytes = element_size * 2
     uram_type, uram_start_addr = ue.sram_address_to_uram_address(sram_address)
     ue.ue_memcpy_from_dram(accelerator_dram_address, element_size_bytes, MEMCPY_TYPE.URAM.value,
-                           uram_start_addr, uram_type.value, ue._inst_id,
+                           uram_start_addr, uram_type.value,
                            stride_bytes_per_chunk=stride_bytes_per_chunk,
                            stride_jump_bytes=stride_jump_bytes,
-                           general_reg_src=general_reg_src)
+                           general_reg_src=general_reg_src,
+                           inst_pointer_idx=ue._inst_id)
     ue._inst_id += 1
 def capture_to_raw(ue):
     """Stop capture, extract raw instruction bytes (no halt), clear buffer."""
@@ -796,13 +797,13 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.accelerator_memory_to_sram(input_dram_addr + half_bytes, uram_x_hi, half)
         # Load cos/sin (register-addressed for decode position)
         if use_reg:
-            self.generate_instruction_add_imm(rope_size_reg, cos_dram_addr, tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(cos_dram_addr), tmp_reg)
             accelerator_memory_to_sram_reg(self, cos_dram_addr, uram_cos_lo, half, tmp_reg)
-            self.generate_instruction_add_imm(rope_size_reg, cos_dram_addr + half_bytes, tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(cos_dram_addr + half_bytes), tmp_reg)
             accelerator_memory_to_sram_reg(self, cos_dram_addr + half_bytes, uram_cos_hi, half, tmp_reg)
-            self.generate_instruction_add_imm(rope_size_reg, sin_dram_addr, tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(sin_dram_addr), tmp_reg)
             accelerator_memory_to_sram_reg(self, sin_dram_addr, uram_sin_lo, half, tmp_reg)
-            self.generate_instruction_add_imm(rope_size_reg, sin_dram_addr + half_bytes, tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(sin_dram_addr + half_bytes), tmp_reg)
             accelerator_memory_to_sram_reg(self, sin_dram_addr + half_bytes, uram_sin_hi, half, tmp_reg)
         else:
             self.accelerator_memory_to_sram(cos_dram_addr, uram_cos_lo, half)
@@ -818,10 +819,10 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half)
         # Write output (register-addressed for KV cache position)
         if output_addr_inc_reg is not None:
-            self.generate_instruction_add_imm(output_addr_inc_reg, output_dram_addr, tmp_reg)
+            self.generate_instruction_add_imm(output_addr_inc_reg, ue_35bit_addr_shifter(output_dram_addr), tmp_reg)
             self.sram_to_accelerator_memory(uram_result_lo, output_dram_addr, half)
             self.overwrite_instruction_with_general_register(tmp_reg)
-            self.generate_instruction_add_imm(output_addr_inc_reg, output_dram_addr + half_bytes, tmp_reg)
+            self.generate_instruction_add_imm(output_addr_inc_reg, ue_35bit_addr_shifter(output_dram_addr + half_bytes), tmp_reg)
             self.sram_to_accelerator_memory(uram_result_hi, output_dram_addr + half_bytes, half)
             self.overwrite_instruction_with_general_register(tmp_reg)
         else:
@@ -1125,7 +1126,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             else:
                 self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
                     OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.FP4, SCALE_DRAM_ADDR=la[f'{proj}_scale'], **kw)
+                    is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=la[f'{proj}_scale'], **kw)
 
         for layer_idx, la in enumerate(self.vis_layer_addrs):
             h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
@@ -1182,7 +1183,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self.matmat_mul_core(M=64, K=12288, N=self.HIDDEN_SIZE,
                 A_DRAM_ADDR=self.VIS_SHUFFLED_DRAM, B_DRAM_ADDR=self.connector_data,
                 OUTPUT_DRAM_ADDR=self.VIS_CONNECTOR_DRAM,
-                is_B_quantized=True, data_type=TYPE.FP4, SCALE_DRAM_ADDR=self.connector_scale)
+                is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.connector_scale)
 
         self.stop_capture()
         self.generate_instruction_halt()
@@ -1229,7 +1230,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=OUT, **kw)
             else:
                 self.quantized_matmat_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
-                    OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.INT4, **kw)
+                    OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.IF4, **kw)
 
         self.start_capture()
         for layer_idx in range(self.NUM_LAYERS):
@@ -1307,7 +1308,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         else:
             self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=last_token,
                 B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.INT4)
+                SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
         # Extract raw instruction bytes (no halt) for runtime fusion
         self._prefill_raw = capture_to_raw(self)
         self._halt_raw = generate_halt_raw(self)
@@ -1341,7 +1342,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=OUT, **kw)
             else:
                 self.quantized_matmat_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
-                    OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.INT4, **kw)
+                    OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.IF4, **kw)
 
         # --- Pre-compile per-token embed programs (on-device DMA gather) ---
         embed_row_bytes = H * bpe
@@ -1380,7 +1381,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 for h in range(self.NUM_KV_HEADS):
                     v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
                     self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_DRAM + h * D * bpe, 0x10000, D)
-                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, v_cache, self.TMP_REG)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x10000, v_cache, D)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
                 # RoPE on K (5 heads), store to KV cache at current pos
@@ -1423,7 +1424,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             else:
                 self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
                     B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.INT4)
+                    SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
             self.generate_instruction_halt()
             bucket_raw = capture_to_raw(self)
             self._decode_bucket_raw.append(bucket_raw)
@@ -1760,8 +1761,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 last_bucket_idx = prog_idx
             # Build fused reg_set + embed bytes (64 + 64 = 128 bytes)
             reg_set_bytes = bytearray()
-            reg_set_bytes.extend(_make_add_set_bytes(self.V_CACHE_SIZE_REG, pos * self.k_size))
-            reg_set_bytes.extend(_make_add_set_bytes(self.ROPE_SIZE_REG, pos * self.HEAD_DIM * bpe))
+            reg_set_bytes.extend(_make_add_set_bytes(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(pos * self.k_size)))
+            reg_set_bytes.extend(_make_add_set_bytes(self.ROPE_SIZE_REG, ue_35bit_addr_shifter(pos * self.HEAD_DIM * bpe)))
             embed_raw = self._decode_embed_raw[token_id]
             fused_head = bytes(reg_set_bytes) + embed_raw
             # DMA fused reg_set + embed to start of scratch (bucket already cached after)

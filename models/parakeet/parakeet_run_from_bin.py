@@ -30,7 +30,8 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, set_dma_device,
-    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX
+    UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX,
+    ue_35bit_addr_shifter
 )
 
 URAM_A_BASE = 0x00000
@@ -237,15 +238,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.ENC_OUT_DRAM = self.allocate_tensor_dram(L_pad * D * bpe)
         # L_pad-sized identity for softmax and SiLU in conv module
         self.IDENTITY_LPAD_DRAM = allocate_identity(self, L_pad)
-        # HW mel spectrogram intermediates
-        T_mel_max = L_pad * 8
-        n_bins_pad = self.n_bins_pad  # 320
-        self.FRAMED_DRAM = self.allocate_tensor_dram(T_mel_max * self.n_fft * bpe)
-        self.DFT_REAL_DRAM = self.allocate_tensor_dram(T_mel_max * n_bins_pad * bpe)
-        self.DFT_IMAG_DRAM = self.allocate_tensor_dram(T_mel_max * n_bins_pad * bpe)
-        self.POWER_DRAM = self.allocate_tensor_dram(T_mel_max * n_bins_pad * bpe)
-        self.MEL_ENERGY_DRAM = self.allocate_tensor_dram(T_mel_max * self.n_mels * bpe)
         # Subsampling intermediates
+        T_mel_max = L_pad * 8
         self.MEL_DRAM = self.allocate_tensor_dram(T_mel_max * self.n_mels * bpe)
         # Temp buffer for R_combined (stage 0 im2col row selection)
         H0_max = (T_mel_max + 2 - 3) // 2 + 1
@@ -418,8 +412,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             symbols = 0
             while symbols < self.max_symbols_per_step:
                 # Set registers: TOKEN_REG = embedding offset, ENC_T_REG = encoder position offset
-                self.isa_add_set_core(self.TOKEN_REG, last_token * H * bpe)
-                self.isa_add_set_core(self.ENC_T_REG, t * D * bpe)
+                self.isa_add_set_core(self.TOKEN_REG, ue_35bit_addr_shifter(last_token * H * bpe))
+                self.isa_add_set_core(self.ENC_T_REG, ue_35bit_addr_shifter(t * D * bpe))
                 # Predictor: state save + embedding lookup (register-addressed) + LSTM
                 self.program_execute(pred_prog)
                 # Joint token: enc_out[t] copy (register-addressed) + pred_out copy + projections + argmax
@@ -430,6 +424,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 dur_idx = self.get_arg_max_index()
                 dur = self.tdt_durations[dur_idx] if dur_idx < len(self.tdt_durations) else 0
                 total_steps += 1
+
                 if token_id == self.blank_id:
                     # Restore LSTM state from on-device save buffers
                     self.program_execute(restore_prog)
@@ -450,7 +445,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
 def check_bins_early():
     missing = []
-    for name in ("params.bin", "programs.bin", "programs_slave.bin"):
+    for name in ("params.bin", "programs.bin", "programs_slave.bin", "mel_fb.npy", "mel_window.npy"):
         if not os.path.exists(os.path.join(BIN_DIR, name)):
             missing.append(name)
     return missing
@@ -498,9 +493,22 @@ def main():
 
     engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
 
-    mel_frames = frame_waveform(waveform, cfg)
-    T_mel = mel_frames.shape[0]
+    import numpy as np
+    if waveform.shape[0] > 1:
+        waveform = waveform[:1, :]  # mono
     n_mels = cfg["encoder"]["n_mels"]
+    pre = cfg["preprocessing"]
+    fb = torch.from_numpy(np.load(os.path.join(BIN_DIR, "mel_fb.npy")))
+    window = torch.from_numpy(np.load(os.path.join(BIN_DIR, "mel_window.npy")))
+    stft = torch.stft(waveform.float(), pre["n_fft"], pre["hop_length"], pre["win_length"],
+                      window=window, center=True, pad_mode="reflect", return_complex=True)
+    power = stft.abs() ** 2
+    mel = torch.matmul(fb, power)
+    mel = torch.log(torch.clamp(mel, min=1e-5))
+    mean = mel.mean(dim=-1, keepdim=True)
+    std = torch.clamp(torch.sqrt(mel.var(dim=-1, keepdim=True, unbiased=True)), min=1e-5)
+    mel_cpu = ((mel - mean) / std).squeeze(0).transpose(0, 1).to(torch.bfloat16).contiguous()
+    T_mel = mel_cpu.shape[0]
 
     H0, W0 = conv2d_outsize(T_mel), conv2d_outsize(n_mels)
     H1, W1 = conv2d_outsize(H0), conv2d_outsize(W0)
@@ -538,8 +546,6 @@ def main():
         _original_print(f"  {os.path.join(BIN_DIR, 'programs.bin')} (L_pad={L_pad} mismatch or missing)")
         return
 
-    mel_prog       = loaded["mel"]
-    norm_prog      = loaded["norm"]
     im2col_s0      = loaded["im2col_s0"]
     prog_s0        = loaded["prog_s0"]
     im2col_s1      = loaded["im2col_s1"]
@@ -555,20 +561,10 @@ def main():
 
     engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, engine_slave=True)
     engine2.copy_dram_layout(engine)
-    loaded2 = engine2.load_programs(L_pad)
-    if not loaded2:
-        _original_print("Missing bin file (run parakeet_test.py first to compile):")
-        _original_print(f"  {os.path.join(BIN_DIR, 'programs_slave.bin')} (L_pad={L_pad} mismatch or missing)")
-        return
-
-    im2col_s0_2      = loaded2["im2col_s0"]
-    prog_s0_2        = loaded2["prog_s0"]
-    im2col_s1_2      = loaded2["im2col_s1"]
-    prog_s1_2        = loaded2["prog_s1"]
-    im2col_s2_2      = loaded2["im2col_s2"]
-    prog_s2_2        = loaded2["prog_s2"]
-    prog_flatten_lin_2 = loaded2["prog_flatten_lin"]
-    enc_prog_addr2   = loaded2["encoder"]
+    # Slave engine: only use if programs were compiled for the slave base address.
+    # programs_slave.bin copied from programs.bin has JUMPs targeting the wrong base,
+    # so disable slave execution (single-engine mode matches parakeet_test.py).
+    use_slave = False
 
     engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0), "state_restore": (restore_prog, 0)}
 
@@ -581,35 +577,26 @@ def main():
             _original_print(f"\r  {label} ({time.perf_counter() - start:.0f}s)", end="", flush=True)
     threading.Thread(target=_progress, args=("Executing", t_start), daemon=True).start()
 
-    # Mel DFT (HW) → log (CPU) → norm (HW)
-    engine.dma_to_accelerator_memory(engine.FRAMED_DRAM, mel_frames)
-    engine.program_execute(mel_prog)
-    mel_energy = read_dram(engine, engine.MEL_ENERGY_DRAM, T_mel * n_mels)
-    mel_energy = mel_energy.reshape(T_mel, n_mels).float()
-    mel_energy = torch.log(torch.clamp(mel_energy, min=1e-5)).to(torch.bfloat16).contiguous()
-    engine.dma_to_accelerator_memory(engine.MEL_ENERGY_DRAM, mel_energy)
-    T_mel_padded = pad_to_multiple(T_mel, UE_VECTOR_SIZE)
-    engine.dma_to_accelerator_memory(engine.DFT_IMAG_DRAM, torch.zeros(T_mel_padded * UE_VECTOR_SIZE, dtype=torch.bfloat16))
-    engine.program_execute(norm_prog)
+    # CPU mel (same pipeline as parakeet_test.py)
+    engine.dma_to_accelerator_memory(engine.MEL_DRAM, mel_cpu)
 
-    # Subsampling (dual-engine)
+    # Subsampling (single-engine)
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * engine.sub_channels, dtype=torch.bfloat16))
-    engine2.start_execute_from_dram(im2col_s0_2);  engine.program_execute(im2col_s0)
-    engine2.start_execute_from_dram(prog_s0_2);    engine.program_execute(prog_s0)
-    engine2.start_execute_from_dram(im2col_s1_2);  engine.program_execute(im2col_s1)
-    engine2.start_execute_from_dram(prog_s1_2);    engine.program_execute(prog_s1)
-    engine2.start_execute_from_dram(im2col_s2_2);  engine.program_execute(im2col_s2)
-    engine2.start_execute_from_dram(prog_s2_2);    engine.program_execute(prog_s2)
+    engine.program_execute(im2col_s0)
+    engine.program_execute(prog_s0)
+    engine.program_execute(im2col_s1)
+    engine.program_execute(prog_s1)
+    engine.program_execute(im2col_s2)
+    engine.program_execute(prog_s2)
     engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
-    engine2.start_execute_from_dram(prog_flatten_lin_2); engine.program_execute(prog_flatten_lin)
+    engine.program_execute(prog_flatten_lin)
     if L_pad > H2:
         ef = torch.zeros((L_pad - H2) * D, dtype=torch.bfloat16)
         ef[0::2] = 0.1; ef[1::2] = -0.1
         engine.dma_to_accelerator_memory(engine.INPUT_DRAM + H2 * D * bpe, ef)
     t_sub_done = time.perf_counter()
 
-    # Encoder (dual-engine)
-    engine2.start_execute_from_dram(enc_prog_addr2)
+    # Encoder (single-engine)
     engine.start_execute_from_dram(enc_prog_addr)
     engine.wait_queue(120.0)
     t_enc_done = time.perf_counter()
