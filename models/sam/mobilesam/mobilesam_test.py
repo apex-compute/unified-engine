@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """MobileSAM mask decoder — hardware accelerator implementation.
 
-Follows the Swin-style compile/execute separation pattern.
-Compiles the full mask decoder (TwoWayTransformer + output upscaling +
-hypernetwork MLPs + IoU head) into a single instruction stream, then
-executes it on the accelerator and compares to a CPU reference.
+Encoder + mask decoder compiled into instruction streams and
+executed on the Unified Engine accelerator.
 
 Usage:
     python mobilesam_test.py [--dev xdma0] [--freq 194]
@@ -614,96 +612,11 @@ def _build_unpad_weight(num_heads: int, head_dim: int, head_dim_pad: int) -> tor
     return W   # caller does .T.contiguous() before _alloc_param
 
 
-# ---------------------------------------------------------------------------
-# Debug helpers
-# ---------------------------------------------------------------------------
-
-def _snr_cos(name: str, hw: torch.Tensor, ref: torch.Tensor) -> None:
-    h, r = hw.float().reshape(-1), ref.float().reshape(-1)
-    _original_print(f"  {name}: SNR={calculate_snr(r, h):.2f}dB  "
-                    f"cos={F.cosine_similarity(r[None], h[None]).item():.6f}")
 
 
-def _exec_partial(ue, timeout: float = 30.0) -> None:
-    """Stop current capture, execute as a standalone program, restart capture."""
-    ue.stop_capture()
-    ue.generate_instruction_halt()
-    p = ue.get_program_dram_addr()
-    ue.write_captured_instructions_to_dram(p)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-    ue.clear_capture_buffer()
-    ue.start_execute_from_dram(p)
-    ue.wait_queue(timeout)
-    ue.start_capture()
 
 
-def _cpu_intermediates(checkpoint_path: str,
-                       tokens_t: torch.Tensor,
-                       image_emb_t: torch.Tensor,
-                       image_pe_t: torch.Tensor,
-                       dense_t: torch.Tensor) -> dict:
-    model = MobileSAM().to(torch.bfloat16).eval()
-    load_weights(model, checkpoint_path)
-    dec = model.mask_decoder
-    ints = {}
-    with torch.no_grad():
-        queries  = tokens_t[:NT].to(torch.bfloat16).unsqueeze(0)
-        query_pe = queries.clone()
-        keys   = (image_emb_t + dense_t).to(torch.bfloat16).unsqueeze(0)
-        key_pe = image_pe_t.to(torch.bfloat16).unsqueeze(0)
-        for li, layer in enumerate(dec.transformer.layers):
-            sa = layer.self_attn
-            q_in = queries if li == 0 else queries + query_pe
-            # per-projection outputs (NT, internal_dim=256)
-            ints[f'l{li}_sa_q_proj'] = sa.q_proj(q_in)[0]
-            ints[f'l{li}_sa_k_proj'] = sa.k_proj(q_in)[0]
-            ints[f'l{li}_sa_v_proj'] = sa.v_proj(queries)[0]
-            # (NT, 256) → (heads, NT, head_dim)
-            # per-head scaled dot-product attention output (heads, NT, head_dim)
-            _sq = ints[f'l{li}_sa_q_proj'].reshape(NT, DEC_HEADS, DEC_SA_HD).permute(1, 0, 2).float()
-            _sk = ints[f'l{li}_sa_k_proj'].reshape(NT, DEC_HEADS, DEC_SA_HD).permute(1, 0, 2).float()
-            _sv = ints[f'l{li}_sa_v_proj'].reshape(NT, DEC_HEADS, DEC_SA_HD).permute(1, 0, 2).float()
-            _scores = torch.matmul(_sq, _sk.transpose(-2, -1)) / (DEC_SA_HD ** 0.5)
-            _attn = torch.softmax(_scores, dim=-1)
-            ints[f'l{li}_sa_attn_out'] = torch.matmul(_attn, _sv).to(torch.bfloat16)
-            ints[f'l{li}_sa_out']    = sa(q_in, q_in, queries)[0]
-            queries = layer.norm1(queries + ints[f'l{li}_sa_out'].unsqueeze(0))
 
-            ca = layer.cross_attn_token_to_image
-            q_t2i = queries + query_pe
-            k_t2i = keys + key_pe
-            ints[f'l{li}_t2i_q_proj'] = ca.q_proj(q_t2i)[0]
-            ints[f'l{li}_t2i_k_proj'] = ca.k_proj(k_t2i)[0]
-            ints[f'l{li}_t2i_v_proj'] = ca.v_proj(keys)[0]
-            ints[f'l{li}_t2i_q_heads'] = ints[f'l{li}_t2i_q_proj'].reshape(NT, DEC_HEADS, DEC_CA_HD).permute(1, 0, 2)
-            ints[f'l{li}_t2i_k_heads'] = ints[f'l{li}_t2i_k_proj'].reshape(GA, DEC_HEADS, DEC_CA_HD).permute(1, 0, 2)
-            _sq = ints[f'l{li}_t2i_q_heads'].float()
-            _sk = ints[f'l{li}_t2i_k_heads'].float()
-            _sv = ints[f'l{li}_t2i_v_proj'].reshape(GA, DEC_HEADS, DEC_CA_HD).permute(1, 0, 2).float()
-            _scores = torch.matmul(_sq, _sk.transpose(-2, -1)) / (DEC_CA_HD ** 0.5)
-            _attn = torch.softmax(_scores, dim=-1)
-            ints[f'l{li}_t2i_attn_out'] = torch.matmul(_attn, _sv).to(torch.bfloat16)
-            ints[f'l{li}_t2i_out']    = ca(q_t2i, k_t2i, keys)[0]
-            queries = layer.norm2(queries + ints[f'l{li}_t2i_out'].unsqueeze(0))
-
-            mlp = layer.mlp["lin2"](F.relu(layer.mlp["lin1"](queries)))
-            ints[f'l{li}_mlp_out'] = mlp[0]
-            queries = layer.norm3(queries + mlp)
-
-            ia = layer.cross_attn_image_to_token
-            q_i2t = keys + key_pe
-            k_i2t = queries + query_pe
-            ints[f'l{li}_i2t_q_proj'] = ia.q_proj(q_i2t)[0]
-            ints[f'l{li}_i2t_k_proj'] = ia.k_proj(k_i2t)[0]
-            ints[f'l{li}_i2t_v_proj'] = ia.v_proj(queries)[0]
-            ints[f'l{li}_i2t_out']    = ia(q_i2t, k_i2t, queries)[0]
-            keys = layer.norm4(keys + ints[f'l{li}_i2t_out'].unsqueeze(0))
-
-        fa = dec.transformer.final_attn_token_to_image
-        q_f = queries + query_pe
-        k_f = keys + key_pe
-        ints['final_t2i_out'] = fa(q_f, k_f, keys)[0]
-    return ints
 
 
 # ---------------------------------------------------------------------------
@@ -1687,159 +1600,6 @@ class MobileSAM_UE(UnifiedEngine):
 
         return masks_hw, iou_hw
 
-    def debug_decode(self, tokens_t: torch.Tensor, image_emb_t: torch.Tensor,
-                     image_pe_t: torch.Tensor, dense_t: torch.Tensor,
-                     cpu_ints: dict) -> None:
-        """Step-through decoder: per-projection checkpoints.
-
-        Comment out successive `assert False` lines to advance.
-        """
-        def _chk_proj(name, hw_addr, hw_rows, hd_real, ref, real_rows=None):
-            hw = self.dma_from_accelerator_memory(
-                hw_addr, (hw_rows, DEC_HEADS * DEC_HD_PAD)).float()
-            hw_up = hw.reshape(hw_rows, DEC_HEADS, DEC_HD_PAD)[:, :, :hd_real] \
-                       .reshape(hw_rows, DEC_HEADS * hd_real)
-            if real_rows is not None:
-                hw_up = hw_up[:real_rows]
-            _snr_cos(name, hw_up, ref.float())
-
-        src_t = (image_emb_t + dense_t).to(torch.bfloat16).contiguous()
-        self.dma_to_accelerator_memory(self.TOKENS_DRAM,    tokens_t.to(torch.bfloat16).contiguous().flatten())
-        self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, tokens_t.to(torch.bfloat16).contiguous().flatten())
-        self.dma_to_accelerator_memory(self.SRC_DRAM,       src_t.flatten())
-        self.dma_to_accelerator_memory(self.KEY_PE_DRAM,    image_pe_t.to(torch.bfloat16).contiguous().flatten())
-        self.start_capture()
-
-        for li in range(DEC_LAYERS):
-            lw = self.dec_layer_weights[li]
-            skip_pe = (li == 0)
-            q_src = self.TOKENS_DRAM if skip_pe else self.Q_IN_DRAM
-            if not skip_pe:
-                eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM,
-                                 self.Q_IN_DRAM, NT_PAD * DEC_DIM)
-
-            # ---- SA Q/K/V projections (verified clean) ----
-            self.matmat_mul_core(M=NT_PAD, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-                A_DRAM_ADDR=q_src, B_DRAM_ADDR=lw['sa_q_w'],
-                OUTPUT_DRAM_ADDR=self.SA_Q_PROJ,
-                C_DRAM_ADDR=lw['sa_q_b'], bias_mode="broadcast_N")
-            self.matmat_mul_core(M=NT_PAD, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-                A_DRAM_ADDR=q_src, B_DRAM_ADDR=lw['sa_k_w'],
-                OUTPUT_DRAM_ADDR=self.SA_K_PROJ,
-                C_DRAM_ADDR=lw['sa_k_b'], bias_mode="broadcast_N")
-            self.matmat_mul_core(M=NT_PAD, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-                A_DRAM_ADDR=self.TOKENS_DRAM, B_DRAM_ADDR=lw['sa_v_w'],
-                OUTPUT_DRAM_ADDR=self.SA_V_PROJ,
-                C_DRAM_ADDR=lw['sa_v_b'], bias_mode="broadcast_N")
-
-            # ---- SA reshape: (NT_PAD, heads*64) → (heads, NT_PAD, 64) ----
-            self.bf16_permute_core(
-                dim_0=NT_PAD, dim_1=DEC_HEADS, dim_2=DEC_HD_PAD,
-                INPUT_DRAM_ADDR=self.SA_Q_PROJ, OUTPUT_DRAM_ADDR=self.SA_Q_HEADS,
-            )
-            self.bf16_permute_core(
-                dim_0=NT_PAD, dim_1=DEC_HEADS, dim_2=DEC_HD_PAD,
-                INPUT_DRAM_ADDR=self.SA_K_PROJ, OUTPUT_DRAM_ADDR=self.SA_K_HEADS,
-            )
-            self.bf16_permute_core(
-                dim_0=NT_PAD, dim_1=DEC_HEADS, dim_2=DEC_HD_PAD,
-                INPUT_DRAM_ADDR=self.SA_V_PROJ, OUTPUT_DRAM_ADDR=self.SA_V_HEADS,
-            )
-            broadcast_mul_dram(self, self.SA_Q_HEADS, SA_SCALE_CORRECTION,
-                               DEC_HEADS * NT_PAD * DEC_HD_PAD)
-            dram_zero_fill(self, self.SA_ATTN_OUT, DEC_HEADS * NT_PAD * DEC_HD_PAD)
-            flash_attention_batched(self, num_batches=DEC_HEADS, head_dim=DEC_HD_PAD,
-                seq_len=NT_PAD,
-                Q_DRAM_ADDR=self.SA_Q_HEADS, K_DRAM_ADDR=self.SA_K_HEADS,
-                V_DRAM_ADDR=self.SA_V_HEADS, OUTPUT_DRAM_ADDR=self.SA_ATTN_OUT,
-                SCRATCH_DRAM_ADDR=self.SA_SCRATCH, BIAS_DRAM_ADDR=self.DEC_SA_BIAS)
-            _exec_partial(self)
-            hw_attn = self.dma_from_accelerator_memory(
-                self.SA_ATTN_OUT, (DEC_HEADS, NT_PAD, DEC_HD_PAD)).float()[:, :NT, :DEC_SA_HD]
-            _snr_cos(f"L{li} SA_ATTN_OUT", hw_attn, cpu_ints[f'l{li}_sa_attn_out'].float())
-            multihead_merge_dram(self, self.SA_ATTN_OUT, self.SA_MERGED, self.SA_MERGE_TMP,
-                seq_len=NT_PAD, num_heads=DEC_HEADS, head_dim=DEC_SA_HD, head_dim_pad=DEC_HD_PAD,
-                UNPAD_WEIGHT_ADDR=self.DEC_SA_UNPAD_W)
-            self.matmat_mul_core(M=NT_PAD, K=DEC_DIM, N=DEC_DIM,
-                A_DRAM_ADDR=self.SA_MERGED, B_DRAM_ADDR=lw['sa_out_w'],
-                OUTPUT_DRAM_ADDR=self.SA_OUT,
-                C_DRAM_ADDR=lw['sa_out_b'], bias_mode="broadcast_N")
-            _exec_partial(self)
-            _snr_cos(f"L{li} SA_OUT",
-                     self.dma_from_accelerator_memory(self.SA_OUT, (NT_PAD, DEC_DIM)).float()[:NT],
-                     cpu_ints[f'l{li}_sa_out'])
-
-            # ---- residual + norm1 ----
-            eltwise_add_dram(self, self.TOKENS_DRAM, self.SA_OUT, self.TOKENS_DRAM, NT_PAD * DEC_DIM)
-            self.layer_norm_core_dram(M=NT_PAD, N=DEC_DIM,
-                A_DRAM_ADDR=self.TOKENS_DRAM, OUTPUT_DRAM_ADDR=self.TOKENS_DRAM,
-                GAMMA_DRAM_ADDR=lw['norm1_w'], BETA_DRAM_ADDR=lw['norm1_b'])
-
-            # ---- T2I (proj → reshape → cross_attn → merge → out_proj) ----
-            eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM,
-                             self.Q_IN_DRAM, NT_PAD * DEC_DIM)
-            eltwise_add_dram(self, self.SRC_DRAM, self.KEY_PE_DRAM,
-                             self.SRC_PE_DRAM, GA * DEC_DIM)
-            self._cross_attn_t2i(
-                lw['t2i_q_w'], lw['t2i_q_b'], lw['t2i_k_w'], lw['t2i_k_b'],
-                lw['t2i_v_w'], lw['t2i_v_b'], lw['t2i_out_w'], lw['t2i_out_b'],
-                self.Q_IN_DRAM, self.SRC_PE_DRAM, self.SRC_DRAM, NT_PAD)
-            _exec_partial(self)
-            _snr_cos(f"L{li} T2I_OUT",
-                     self.dma_from_accelerator_memory(self.T2I_OUT, (NT_PAD, DEC_DIM)).float()[:NT],
-                     cpu_ints[f'l{li}_t2i_out'])
-
-            # ---- residual + norm2 + MLP ----
-            eltwise_add_dram(self, self.TOKENS_DRAM, self.T2I_OUT, self.TOKENS_DRAM, NT_PAD * DEC_DIM)
-            self.layer_norm_core_dram(M=NT_PAD, N=DEC_DIM,
-                A_DRAM_ADDR=self.TOKENS_DRAM, OUTPUT_DRAM_ADDR=self.TOKENS_DRAM,
-                GAMMA_DRAM_ADDR=lw['norm2_w'], BETA_DRAM_ADDR=lw['norm2_b'])
-            self.matmat_mul_core(M=NT_PAD, K=DEC_DIM, N=DEC_MLP_DIM,
-                A_DRAM_ADDR=self.TOKENS_DRAM, B_DRAM_ADDR=lw['mlp_lin1_w'],
-                OUTPUT_DRAM_ADDR=self.MLP_MID, C_DRAM_ADDR=lw['mlp_lin1_b'],
-                bias_mode="broadcast_N", clamp_enable=True)
-            self.matmat_mul_core(M=NT_PAD, K=DEC_MLP_DIM, N=DEC_DIM,
-                A_DRAM_ADDR=self.MLP_MID, B_DRAM_ADDR=lw['mlp_lin2_w'],
-                OUTPUT_DRAM_ADDR=self.MLP_OUT, C_DRAM_ADDR=lw['mlp_lin2_b'],
-                bias_mode="broadcast_N")
-            _exec_partial(self)
-            _snr_cos(f"L{li} MLP_OUT",
-                     self.dma_from_accelerator_memory(self.MLP_OUT, (NT_PAD, DEC_DIM)).float()[:NT],
-                     cpu_ints[f'l{li}_mlp_out'])
-
-            # ---- residual + norm3 + I2T ----
-            eltwise_add_dram(self, self.TOKENS_DRAM, self.MLP_OUT, self.TOKENS_DRAM, NT_PAD * DEC_DIM)
-            self.layer_norm_core_dram(M=NT_PAD, N=DEC_DIM,
-                A_DRAM_ADDR=self.TOKENS_DRAM, OUTPUT_DRAM_ADDR=self.TOKENS_DRAM,
-                GAMMA_DRAM_ADDR=lw['norm3_w'], BETA_DRAM_ADDR=lw['norm3_b'])
-            eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM,
-                             self.TOK_PE_DRAM, NT_PAD * DEC_DIM)
-            self._cross_attn_i2t(
-                lw['i2t_q_w'], lw['i2t_q_b'], lw['i2t_k_w'], lw['i2t_k_b'],
-                lw['i2t_v_w'], lw['i2t_v_b'], lw['i2t_out_w'], lw['i2t_out_b'],
-                self.SRC_PE_DRAM, self.TOK_PE_DRAM, self.TOKENS_DRAM)
-            _exec_partial(self)
-            _snr_cos(f"L{li} I2T_OUT",
-                     self.dma_from_accelerator_memory(self.I2T_OUT, (GA, DEC_DIM)).float(),
-                     cpu_ints[f'l{li}_i2t_out'])
-
-            # ---- residual + norm4 ----
-            eltwise_add_dram(self, self.SRC_DRAM, self.I2T_OUT, self.SRC_DRAM, GA * DEC_DIM)
-            self.layer_norm_core_dram(M=GA, N=DEC_DIM,
-                A_DRAM_ADDR=self.SRC_DRAM, OUTPUT_DRAM_ADDR=self.SRC_DRAM,
-                GAMMA_DRAM_ADDR=lw['norm4_w'], BETA_DRAM_ADDR=lw['norm4_b'])
-
-        fa = self.dec_final_attn
-        eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.Q_IN_DRAM, NT_PAD * DEC_DIM)
-        eltwise_add_dram(self, self.SRC_DRAM, self.KEY_PE_DRAM, self.SRC_PE_DRAM, GA * DEC_DIM)
-        self._cross_attn_t2i(
-            fa['q_w'], fa['q_b'], fa['k_w'], fa['k_b'],
-            fa['v_w'], fa['v_b'], fa['out_w'], fa['out_b'],
-            self.Q_IN_DRAM, self.SRC_PE_DRAM, self.SRC_DRAM, NT_PAD)
-        _exec_partial(self)
-        _snr_cos("final T2I_OUT",
-                 self.dma_from_accelerator_memory(self.T2I_OUT, (NT_PAD, DEC_DIM)).float()[:NT],
-                 cpu_ints['final_t2i_out'])
     def _enc_init(self, sd):
         # ---- patch_embed conv 0: Conv2d_BN(3→32, ks=3, stride=2, pad=1) + GELU ----
         # BN-fold, then zero-pad C_in 3→64 and C_out 32→64 for HW alignment.
@@ -2586,26 +2346,7 @@ class MobileSAM_UE(UnifiedEngine):
         self.dma_to_accelerator_memory(addr, t.reshape(-1))
         return addr
 
-    def _exec_partial(self):
-        self.stop_capture()
-        self.generate_instruction_halt()
-        prog = self.get_program_dram_addr()
-        self.write_captured_instructions_to_dram(prog)
-        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        self.start_execute_from_dram(prog)
-        self.wait_queue(120.0)
-        self.clear_capture_buffer()
-        self.start_capture()
 
-    def _compile_partial(self, progs: list):
-        self.stop_capture()
-        self.generate_instruction_halt()
-        prog = self.get_program_dram_addr()
-        self.write_captured_instructions_to_dram(prog)
-        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        progs.append(prog)
-        self.clear_capture_buffer()
-        self.start_capture()
 
     def _run_s1_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int) -> None:
         """Run one TinyViTBlock: attn → residual → local_conv → mlp+residual."""
@@ -3009,7 +2750,7 @@ class MobileSAM_UE(UnifiedEngine):
         _original_print(f"  Programs: {len(all_bytes)} bytes → {bin_path}")
 
     def _encoder_ops(self, flush):
-        """All encoder instruction ops. flush() called in place of each _exec_partial."""
+        """All encoder instruction ops."""
         # conv0: (1024×1024, 64) → (512×512, 64)  [Conv-BN-GELU]
         conv2d_3x3_stride2_dram(
             self, self.PE_IN_DRAM, self.PE_MID_DRAM, self.PE_IM2COL,
@@ -3191,64 +2932,6 @@ class MobileSAM_UE(UnifiedEngine):
 
 
 
-# ---------------------------------------------------------------------------
-# CPU reference
-# ---------------------------------------------------------------------------
-
-def cpu_reference(checkpoint_path: str,
-                  tokens_t: torch.Tensor,
-                  image_emb_t: torch.Tensor,
-                  image_pe_t: torch.Tensor,
-                  dense_t: torch.Tensor):
-    """Run the MobileSAM mask decoder on CPU using mobilesam_raw classes.
-
-    All inputs are bf16. Returns (masks, iou) in float32.
-    tokens_t : (NT_PAD, 256) — padded tokens (only first NT rows are real)
-    image_emb_t : (4096, 256) HWC → reshaped to (1, 256, 64, 64)
-    image_pe_t  : (4096, 256) HWC → reshaped to (1, 256, 64, 64)
-    dense_t     : (4096, 256) HWC → reshaped to (1, 256, 64, 64)
-    """
-    model = MobileSAM().to(torch.bfloat16).eval()
-    load_weights(model, checkpoint_path)
-    dec = model.mask_decoder
-
-    def hwc_to_bchw(t):
-        return t.to(torch.bfloat16).reshape(1, IMG_H, IMG_W, DEC_DIM).permute(0, 3, 1, 2)
-
-    img_emb  = hwc_to_bchw(image_emb_t)   # (1, 256, 64, 64)
-    img_pe   = hwc_to_bchw(image_pe_t)
-    dense_b  = hwc_to_bchw(dense_t)
-
-    with torch.no_grad():
-        tokens_all = tokens_t[:NT].to(torch.bfloat16).unsqueeze(0)   # (1, 6, 256)
-        B, C, H, W = img_emb.shape
-        keys    = (img_emb + dense_b).flatten(2).permute(0, 2, 1)  # (1, 4096, 256) bf16
-        key_pe  = img_pe.flatten(2).permute(0, 2, 1)               # (1, 4096, 256) bf16
-
-        queries   = tokens_all.clone()
-        query_pe  = tokens_all.clone()
-
-        for layer in dec.transformer.layers:
-            queries, keys = layer(queries, keys, query_pe, key_pe)
-
-        q = queries + query_pe
-        k = keys    + key_pe
-        queries = dec.transformer.norm_final_attn(
-            queries + dec.transformer.final_attn_token_to_image(q, k, keys))
-
-        src_back = keys.reshape(B, H, W, C).permute(0, 3, 1, 2)
-        up = dec.output_upscaling(src_back)                          # (1, 32, 256, 256)
-
-        iou_tok   = queries[:, 0]
-        mask_toks = queries[:, 1:5]
-
-        hyper = torch.stack([dec.output_hypernetworks_mlps[i](mask_toks[:, i])
-                              for i in range(4)], dim=1)             # (1, 4, 32)
-        B_, C_, H_, W_ = up.shape
-        masks = (hyper @ up.flatten(2)).reshape(B_, 4, H_, W_)
-        iou   = dec.iou_prediction_head(iou_tok)
-
-    return masks[0].float(), iou[0].float()
 
 
 # ---------------------------------------------------------------------------
@@ -3464,336 +3147,10 @@ def _bn_fold(w_conv, bn_w, bn_b, bn_mean, bn_var, eps=1e-5):
     w_fused = w_conv * scale[:, None, None, None]               # broadcast over kH,kW,C_in
     b_fused = bn_b - bn_mean * scale
     return w_fused.to(torch.bfloat16), b_fused.to(torch.bfloat16)
-
-
-
-
-def _cpu_neck_intermediates(model, s3b1_out) -> dict:
-    """CPU references for each neck op. s3b1_out: (1, HW, 320) bfloat16."""
-    neck = model.image_encoder.neck
-    _HW = ENC_S3_H * ENC_S3_W
-    x = s3b1_out[0].reshape(ENC_S3_H, ENC_S3_W, ENC_S3_C).permute(2, 0, 1).unsqueeze(0)  # (1,320,64,64)
-    c1  = neck[0](x)           # Conv1x1 → (1, 256, 64, 64)
-    ln1 = neck[1](c1)          # LN1
-    c3  = neck[2](ln1)         # Conv3x3
-    ln2 = neck[3](c3)          # LN2
-    def _hwc(t): return t[0].permute(1, 2, 0).reshape(_HW, 256).bfloat16()
-    return {
-        "neck_c1_out":  _hwc(c1),
-        "neck_ln1_out": _hwc(ln1),
-        "neck_c3_out":  _hwc(c3),
-        "neck_out":     _hwc(ln2),
-    }
-
-
-def _cpu_encoder_intermediates(weights_path: str, image_t: torch.Tensor) -> dict:
-    """Run CPU forward through patch_embed and return intermediates."""
-    model = MobileSAM()
-    raw_load_weights(model, weights_path)
-    model.float().eval()
-    with torch.no_grad():
-        pe_out = model.image_encoder.patch_embed["seq"](image_t.float())  # (1, 64, 256, 256)
-        # Stage 0 Block 0 conv1 + conv2
-        s0   = model.image_encoder._stages[0]
-        blk0 = s0["blocks"][0]
-        c1_out  = F.gelu(blk0.conv1(pe_out))         # (1, 256, 256, 256)
-        c2_out  = F.gelu(blk0.conv2(c1_out))         # (1, 256, 256, 256)
-        c3_out  = blk0.conv3(c2_out)                  # (1, 64, 256, 256)
-        b0_out  = F.gelu(pe_out + c3_out)             # (1, 64, 256, 256)
-        blk1    = s0["blocks"][1]
-        b1_c1   = F.gelu(blk1.conv1(b0_out))
-        b1_c2   = F.gelu(blk1.conv2(b1_c1))
-        b1_c3   = blk1.conv3(b1_c2)
-        b1_out  = F.gelu(b0_out + b1_c3)             # (1, 64, 256, 256)
-        # PatchMerging 0→1
-        ds = model.image_encoder._stages[0]["downsample"]
-        pm_c1 = F.gelu(ds.conv1(b1_out))             # (1, 128, 256, 256)
-        pm_c2 = F.gelu(ds.conv2(pm_c1))              # (1, 128, 128, 128)
-        pm_c3 = ds.conv3(pm_c2)                       # (1, 128, 128, 128)
-        pm01_c1_hwc = pm_c1[0].permute(1,2,0).contiguous().reshape(ENC_S0_H * ENC_S0_W, ENC_S1_C)
-        pm01_c2_hwc = pm_c2[0].permute(1,2,0).contiguous().reshape(ENC_S1_H * ENC_S1_W, ENC_S1_C)
-        # Stage 1 — TinyViTAttn uses COMPUTE_DTYPE (bfloat16) internally, run in bf16
-        model.bfloat16().eval()
-        s1 = model.image_encoder._stages[1]
-        s1_input = pm_c3.flatten(2).transpose(1, 2).bfloat16()   # (1, 16384, 128)
-        blk0 = s1["blocks"][0]
-        _ws = ENC_S1_WS; _N = _ws * _ws; _pad = ENC_S1_PAD; _nH = _nW = ENC_S1_NH
-        # attn norm on spatial tokens (H*W, C) — same order as HW impl (LN before window partition)
-        s1_attn_ln = blk0.attn.norm(s1_input[0])   # (H*W, C)
-        # window partition LN output — mirrors what HW does after LN
-        s1_ln_2d = s1_attn_ln.view(ENC_S1_H, ENC_S1_W, ENC_S1_C)
-        s1_ln_pad = F.pad(s1_ln_2d, (0,0,0,_pad,0,_pad))
-        s1_ln_flat = s1_ln_pad.view(_nH, _ws, _nW, _ws, ENC_S1_C).permute(0,2,1,3,4).reshape(_nH*_nW*_N, ENC_S1_C)
-        s1_wins_pad = torch.zeros(ENC_S1_NWIN * ENC_S1_WIN_PAD, ENC_S1_C, dtype=torch.bfloat16)
-        for wi in range(ENC_S1_NWIN):
-            s1_wins_pad[wi*ENC_S1_WIN_PAD : wi*ENC_S1_WIN_PAD+_N] = s1_ln_flat[wi*_N : (wi+1)*_N]
-        # Q in our weight layout: W_q = qkv_w.reshape(heads,3,hd,C)[:,0].reshape(C,C) → output [h0q,h1q,h2q,h3q]
-        qkv_full = F.linear(s1_wins_pad, blk0.attn.qkv.weight, blk0.attn.qkv.bias)  # (NTOK, 384)
-        qkv_view = qkv_full.view(-1, ENC_S1_HEADS, 3, ENC_S1_HEAD_DIM)
-        s1_q_ref = qkv_view[:, :, 0, :].reshape(-1, ENC_S1_C)   # (NTOK, 128)
-        s1_k_ref = qkv_view[:, :, 1, :].reshape(-1, ENC_S1_C)
-        s1_v_ref = qkv_view[:, :, 2, :].reshape(-1, ENC_S1_C)
-        # per-head refs after multihead_reshape: (NTOK, HEAD_PAD) with HEAD_DIM real zeros padded
-        _sd = torch.load(weights_path, map_location="cpu", weights_only=True)
-        _pfx = "image_encoder.layers.1.blocks.0"
-        _ab  = _sd[f"{_pfx}.attn.attention_biases"].float()        # (4, 49)
-        _pts = list(itertools.product(range(ENC_S1_WS), range(ENC_S1_WS)))
-        _offsets = {}; _idxs = []
-        for _p1 in _pts:
-            for _p2 in _pts:
-                _off = (abs(_p1[0]-_p2[0]), abs(_p1[1]-_p2[1]))
-                if _off not in _offsets: _offsets[_off] = len(_offsets)
-                _idxs.append(_offsets[_off])
-        _abi = torch.tensor(_idxs).view(_N, _N)
-        _ab_full = _ab[:, _abi]                                     # (4, 49, 49)
-        _bias_pad = torch.full((ENC_S1_HEADS, ENC_S1_WIN_PAD, ENC_S1_WIN_PAD), float('-inf'))
-        _N = ENC_S1_WS * ENC_S1_WS
-        _bias_pad[:, :_N, :_N] = _ab_full
-        _bias_pad[:, :_N, _N:] = float('-inf')
-        _bias_pad[:, _N:, :]   = 0.0
-        _HP = ENC_S1_HEAD_PAD
-        s1_q_head_refs = {}
-        s1_attn_h_refs = {}
-        _scale = ENC_S1_HEAD_DIM ** -0.5
-        for _h in range(ENC_S1_HEADS):
-            q_h = qkv_view[:, _h, 0, :]   # (NTOK, HEAD_DIM)
-            k_h = qkv_view[:, _h, 1, :]
-            v_h = qkv_view[:, _h, 2, :]
-            s1_q_head_refs[_h] = F.pad(q_h, (0, _HP - ENC_S1_HEAD_DIM)).bfloat16()  # (NTOK, HEAD_PAD)
-            q3 = q_h.reshape(ENC_S1_NWIN, ENC_S1_WIN_PAD, ENC_S1_HEAD_DIM)
-            k3 = k_h.reshape(ENC_S1_NWIN, ENC_S1_WIN_PAD, ENC_S1_HEAD_DIM)
-            v3 = v_h.reshape(ENC_S1_NWIN, ENC_S1_WIN_PAD, ENC_S1_HEAD_DIM)
-            scores = (q3.float() @ k3.float().transpose(-1,-2)) * _scale + _bias_pad[_h]
-            attn_out = torch.softmax(scores, dim=-1).bfloat16() @ v3
-            s1_attn_h_refs[_h] = F.pad(attn_out, (0, _HP - ENC_S1_HEAD_DIM)).reshape(-1, _HP).bfloat16()
-        # attn output: run TinyViTAttn on the real windows (nH*nW, ws*ws, C)
-        _x2d_raw = s1_input[0].view(ENC_S1_H, ENC_S1_W, ENC_S1_C)
-        _x2d_pad = F.pad(_x2d_raw, (0,0,0,_pad,0,_pad))
-        _wins_real = _x2d_pad.view(_nH, _ws, _nW, _ws, ENC_S1_C).permute(0,2,1,3,4).reshape(_nH*_nW, _ws*_ws, ENC_S1_C)
-        _attn_out = blk0.attn(_wins_real)   # (nH*nW, N, C) — applies norm+qkv+attn+proj
-        # merged ref: concat head outputs (strip HEAD_PAD→HEAD_DIM) per token — matches S1_MERGED_DRAM
-        # s1_attn_h_refs[h] is (NTOK, HEAD_PAD); unpad and interleave heads → (NTOK, C)
-        s1_merged_ref = torch.cat(
-            [s1_attn_h_refs[h][:, :ENC_S1_HEAD_DIM] for h in range(ENC_S1_HEADS)], dim=-1
-        ).bfloat16()  # (NTOK, C)
-        # proj output: apply proj linear directly to s1_merged_ref (same path as HW)
-        _proj_w = _sd[f"{_pfx}.attn.proj.weight"].to(torch.bfloat16)
-        _proj_b = _sd[f"{_pfx}.attn.proj.bias"].to(torch.bfloat16)
-        s1_proj_ref = F.linear(s1_merged_ref.float(), _proj_w.float(), _proj_b.float()).bfloat16()
-        # unpartition: scatter proj output back to (H*W, C) — strip WIN_PAD gaps
-        _proj_real = torch.zeros(ENC_S1_NWIN * _N, ENC_S1_C, dtype=torch.bfloat16)
-        for wi in range(ENC_S1_NWIN):
-            _proj_real[wi*_N : (wi+1)*_N] = s1_proj_ref[wi*ENC_S1_WIN_PAD : wi*ENC_S1_WIN_PAD+_N]
-        # unpartition: scatter back to (H*W, C)
-        _proj_2d = _proj_real.reshape(_nH*_nW, _N, ENC_S1_C).view(_nH, _nW, _ws, _ws, ENC_S1_C).permute(0,2,1,3,4).reshape(_nH*_ws, _nW*_ws, ENC_S1_C)
-        s1_rev_ref = _proj_2d[:ENC_S1_H, :ENC_S1_W].reshape(ENC_S1_H * ENC_S1_W, ENC_S1_C)  # (H*W, C)
-        s1_post_attn_ref = (s1_input[0] + s1_rev_ref).bfloat16()   # attn residual (H*W, C)
-        # local conv
-        _lc_in = s1_post_attn_ref.reshape(1, ENC_S1_H, ENC_S1_W, ENC_S1_C).permute(0,3,1,2)  # (1,C,H,W)
-        s1_lc_ref = blk0.local_conv(_lc_in)[0].permute(1,2,0).reshape(ENC_S1_H*ENC_S1_W, ENC_S1_C).bfloat16()
-        s1_b0_out = blk0(s1_input)                     # (1, 16384, 128) bf16
-        s1_b1_out = s1["blocks"][1](s1_b0_out)         # (1, 16384, 128) bf16
-        # Block 1 intermediates (attn LN + Q only — enough to catch weight/path issues)
-        blk1 = s1["blocks"][1]
-        _pfx1 = "image_encoder.layers.1.blocks.1"
-        s1b1_attn_ln = blk1.attn.norm(s1_b0_out[0])   # (H*W, C)
-        _b1_ln_pad = torch.zeros(ENC_S1_NWIN * ENC_S1_WIN_PAD, ENC_S1_C, dtype=torch.bfloat16)
-        _b1_ln_2d = s1b1_attn_ln.view(ENC_S1_H, ENC_S1_W, ENC_S1_C)
-        _b1_ln_padded = F.pad(_b1_ln_2d, (0,0,0,_pad,0,_pad))
-        _b1_ln_flat = _b1_ln_padded.view(_nH, _ws, _nW, _ws, ENC_S1_C).permute(0,2,1,3,4).reshape(_nH*_nW*_N, ENC_S1_C)
-        for wi in range(ENC_S1_NWIN):
-            _b1_ln_pad[wi*ENC_S1_WIN_PAD : wi*ENC_S1_WIN_PAD+_N] = _b1_ln_flat[wi*_N : (wi+1)*_N]
-        _b1_qkv = F.linear(_b1_ln_pad, blk1.attn.qkv.weight, blk1.attn.qkv.bias)
-        _b1_qkv_view = _b1_qkv.view(-1, ENC_S1_HEADS, 3, ENC_S1_HEAD_DIM)
-        s1b1_q_ref = _b1_qkv_view[:, :, 0, :].reshape(-1, ENC_S1_C)
-        # Block 1 attn intermediates: per-head flash attn, merged, proj, rev
-        _b1_ab = _sd[f"{_pfx1}.attn.attention_biases"].float()
-        _b1_ab_full = _b1_ab[:, _abi]
-        _b1_bias_pad = torch.full((ENC_S1_HEADS, ENC_S1_WIN_PAD, ENC_S1_WIN_PAD), float('-inf'))
-        _b1_bias_pad[:, :_N, :_N] = _b1_ab_full
-        _b1_bias_pad[:, :_N, _N:] = float('-inf')
-        _b1_bias_pad[:, _N:, :]   = 0.0
-        _b1_attn_h_refs = {}
-        for _h in range(ENC_S1_HEADS):
-            q_h = _b1_qkv_view[:, _h, 0, :]
-            k_h = _b1_qkv_view[:, _h, 1, :]
-            v_h = _b1_qkv_view[:, _h, 2, :]
-            q3 = q_h.reshape(ENC_S1_NWIN, ENC_S1_WIN_PAD, ENC_S1_HEAD_DIM)
-            k3 = k_h.reshape(ENC_S1_NWIN, ENC_S1_WIN_PAD, ENC_S1_HEAD_DIM)
-            v3 = v_h.reshape(ENC_S1_NWIN, ENC_S1_WIN_PAD, ENC_S1_HEAD_DIM)
-            scores = (q3.float() @ k3.float().transpose(-1,-2)) * _scale + _b1_bias_pad[_h]
-            attn_out = torch.softmax(scores, dim=-1).bfloat16() @ v3
-            _b1_attn_h_refs[_h] = F.pad(attn_out, (0, _HP - ENC_S1_HEAD_DIM)).reshape(-1, _HP).bfloat16()
-        s1b1_merged_ref = torch.cat(
-            [_b1_attn_h_refs[h][:, :ENC_S1_HEAD_DIM] for h in range(ENC_S1_HEADS)], dim=-1
-        ).bfloat16()
-        _b1_proj_w = _sd[f"{_pfx1}.attn.proj.weight"].to(torch.bfloat16)
-        _b1_proj_b = _sd[f"{_pfx1}.attn.proj.bias"].to(torch.bfloat16)
-        s1b1_proj_ref = F.linear(s1b1_merged_ref.float(), _b1_proj_w.float(), _b1_proj_b.float()).bfloat16()
-        _b1_proj_real = torch.zeros(ENC_S1_NWIN * _N, ENC_S1_C, dtype=torch.bfloat16)
-        for wi in range(ENC_S1_NWIN):
-            _b1_proj_real[wi*_N : (wi+1)*_N] = s1b1_proj_ref[wi*ENC_S1_WIN_PAD : wi*ENC_S1_WIN_PAD+_N]
-        _b1_proj_2d = _b1_proj_real.reshape(_nH*_nW, _N, ENC_S1_C).view(_nH, _nW, _ws, _ws, ENC_S1_C).permute(0,2,1,3,4).reshape(_nH*_ws, _nW*_ws, ENC_S1_C)
-        s1b1_rev_ref = _b1_proj_2d[:ENC_S1_H, :ENC_S1_W].reshape(ENC_S1_H * ENC_S1_W, ENC_S1_C)
-        s1b1_post_attn_ref = (s1_b0_out[0] + s1b1_rev_ref).bfloat16()
-        _b1_lc_in = s1b1_post_attn_ref.reshape(1, ENC_S1_H, ENC_S1_W, ENC_S1_C).permute(0,3,1,2)
-        s1b1_lc_ref = blk1.local_conv(_b1_lc_in)[0].permute(1,2,0).reshape(ENC_S1_H*ENC_S1_W, ENC_S1_C).bfloat16()
-        # PatchMerging 1→2
-        ds12 = model.image_encoder._stages[1]["downsample"]
-        _pm12_in = s1_b1_out  # (1, 128, 128, 128) — stages expect NCHW
-        # ds12 takes NCHW input from the stage output
-        # s1_b1_out from blk1() is (1, HW, C), need (1, C, H, W)
-        _pm12_in_nchw = s1_b1_out[0].reshape(ENC_S1_H, ENC_S1_W, ENC_S1_C).permute(2,0,1).unsqueeze(0).bfloat16()
-        pm12_c1_out = F.gelu(ds12.conv1(_pm12_in_nchw))   # (1,160,128,128)
-        pm12_c2_out = F.gelu(ds12.conv2(pm12_c1_out))     # (1,160,64,64)
-        pm12_c3_out = ds12.conv3(pm12_c2_out)              # (1,160,64,64)
-        pm12_c1_hwc = pm12_c1_out[0].permute(1,2,0).reshape(ENC_S1_H*ENC_S1_W, ENC_S2_C).bfloat16()
-        pm12_c2_hwc = pm12_c2_out[0].permute(1,2,0).reshape(ENC_S2_H*ENC_S2_W, ENC_S2_C).bfloat16()
-        pm12_out_hwc = pm12_c3_out[0].permute(1,2,0).reshape(ENC_S2_H*ENC_S2_W, ENC_S2_C).bfloat16()
-
-        # Stage 2 Block 0 intermediates
-        s2 = model.image_encoder._stages[2]
-        s2_input = pm12_c3_out.flatten(2).transpose(1,2).bfloat16()  # (1, 4096, 160)
-        blk0_s2 = s2["blocks"][0]
-        _ws2 = ENC_S2_WS; _N2 = _ws2*_ws2; _pad2 = ENC_S2_PAD; _nH2 = _nW2 = ENC_S2_NH
-        s2b0_attn_ln = blk0_s2.attn.norm(s2_input[0])   # (HW, 160)
-        _s2_ln_2d  = s2b0_attn_ln.view(ENC_S2_H, ENC_S2_W, ENC_S2_C)
-        _s2_ln_pad = F.pad(_s2_ln_2d, (0,0,0,_pad2,0,_pad2))
-        _s2_ln_flat = _s2_ln_pad.view(_nH2, _ws2, _nW2, _ws2, ENC_S2_C).permute(0,2,1,3,4).reshape(_nH2*_nW2*_N2, ENC_S2_C)
-        s2b0_wins_pad = torch.zeros(ENC_S2_NWIN*ENC_S2_WIN_PAD, ENC_S2_C, dtype=torch.bfloat16)
-        for _wi in range(ENC_S2_NWIN):
-            s2b0_wins_pad[_wi*ENC_S2_WIN_PAD : _wi*ENC_S2_WIN_PAD+_N2] = _s2_ln_flat[_wi*_N2 : (_wi+1)*_N2]
-        _pfx_s2b0 = "image_encoder.layers.2.blocks.0"
-        _s2_qkv_full = F.linear(s2b0_wins_pad, blk0_s2.attn.qkv.weight, blk0_s2.attn.qkv.bias)  # (NTOK2, 480)
-        _s2_qkv_view = _s2_qkv_full.view(-1, ENC_S2_HEADS, 3, ENC_S2_HEAD_DIM)
-        s2b0_q_ref = _s2_qkv_view[:, :, 0, :].reshape(-1, ENC_S2_C)
-        # attention bias for ws=14
-        _ab_s2 = _sd[f"{_pfx_s2b0}.attn.attention_biases"].float()
-        _pts2 = list(itertools.product(range(ENC_S2_WS), range(ENC_S2_WS)))
-        _off2 = {}; _idx2 = []
-        for _p1 in _pts2:
-            for _p2 in _pts2:
-                _o = (abs(_p1[0]-_p2[0]), abs(_p1[1]-_p2[1]))
-                if _o not in _off2: _off2[_o] = len(_off2)
-                _idx2.append(_off2[_o])
-        _abi2 = torch.tensor(_idx2).view(_N2, _N2)
-        _ab_s2_full = _ab_s2[:, _abi2]  # (5, 196, 196)
-        _bias2_pad = torch.full((ENC_S2_HEADS, ENC_S2_WIN_PAD, ENC_S2_WIN_PAD), float('-inf'))
-        _bias2_pad[:, :_N2, :_N2] = _ab_s2_full
-        _bias2_pad[:, :_N2, _N2:] = float('-inf')
-        _bias2_pad[:, _N2:, :]    = 0.0
-        _HP2 = ENC_S2_HEAD_PAD
-        _scale2 = ENC_S2_HEAD_DIM ** -0.5
-        s2b0_q_head_refs = {}
-        s2b0_attn_h_refs = {}
-        for _h in range(ENC_S2_HEADS):
-            _q_h = _s2_qkv_view[:, _h, 0, :]
-            _k_h = _s2_qkv_view[:, _h, 1, :]
-            _v_h = _s2_qkv_view[:, _h, 2, :]
-            s2b0_q_head_refs[_h] = F.pad(_q_h, (0, _HP2-ENC_S2_HEAD_DIM)).bfloat16()
-            _q3 = _q_h.reshape(ENC_S2_NWIN, ENC_S2_WIN_PAD, ENC_S2_HEAD_DIM)
-            _k3 = _k_h.reshape(ENC_S2_NWIN, ENC_S2_WIN_PAD, ENC_S2_HEAD_DIM)
-            _v3 = _v_h.reshape(ENC_S2_NWIN, ENC_S2_WIN_PAD, ENC_S2_HEAD_DIM)
-            _scores = (_q3.float() @ _k3.float().transpose(-1,-2)) * _scale2 + _bias2_pad[_h]
-            _attn_out = torch.softmax(_scores, dim=-1).bfloat16() @ _v3
-            s2b0_attn_h_refs[_h] = F.pad(_attn_out, (0, _HP2-ENC_S2_HEAD_DIM)).reshape(-1, _HP2).bfloat16()
-        s2b0_merged_ref = torch.cat(
-            [s2b0_attn_h_refs[_h][:, :ENC_S2_HEAD_DIM] for _h in range(ENC_S2_HEADS)], dim=-1).bfloat16()
-        _s2b0_proj_w = _sd[f"{_pfx_s2b0}.attn.proj.weight"].to(torch.bfloat16)
-        _s2b0_proj_b = _sd[f"{_pfx_s2b0}.attn.proj.bias"].to(torch.bfloat16)
-        s2b0_proj_ref = F.linear(s2b0_merged_ref.float(), _s2b0_proj_w.float(), _s2b0_proj_b.float()).bfloat16()
-        _s2b0_pr = torch.zeros(ENC_S2_NWIN*_N2, ENC_S2_C, dtype=torch.bfloat16)
-        for _wi in range(ENC_S2_NWIN):
-            _s2b0_pr[_wi*_N2:(_wi+1)*_N2] = s2b0_proj_ref[_wi*ENC_S2_WIN_PAD : _wi*ENC_S2_WIN_PAD+_N2]
-        _s2b0_pd = _s2b0_pr.reshape(_nH2*_nW2, _N2, ENC_S2_C).view(_nH2, _nW2, _ws2, _ws2, ENC_S2_C).permute(0,2,1,3,4).reshape(_nH2*_ws2, _nW2*_ws2, ENC_S2_C)
-        s2b0_rev_ref = _s2b0_pd[:ENC_S2_H, :ENC_S2_W].reshape(ENC_S2_H*ENC_S2_W, ENC_S2_C)
-        s2b0_post_attn_ref = (s2_input[0] + s2b0_rev_ref).bfloat16()
-        _s2b0_lc_in = s2b0_post_attn_ref.reshape(1, ENC_S2_H, ENC_S2_W, ENC_S2_C).permute(0,3,1,2)
-        s2b0_lc_ref = blk0_s2.local_conv(_s2b0_lc_in)[0].permute(1,2,0).reshape(ENC_S2_H*ENC_S2_W, ENC_S2_C).bfloat16()
-        s2_b0_out = blk0_s2(s2_input)   # (1, 4096, 160)
-        s2_blk_outs = [s2_b0_out]
-        for _bi in range(1, 6):
-            s2_blk_outs.append(s2["blocks"][_bi](s2_blk_outs[-1]))
-        # PatchMerging 2→3
-        ds23 = model.image_encoder._stages[2]["downsample"]
-        _pm23_in_nchw = s2_blk_outs[-1][0].reshape(ENC_S2_H, ENC_S2_W, ENC_S2_C).permute(2,0,1).unsqueeze(0).bfloat16()
-        pm23_c1_out = F.gelu(ds23.conv1(_pm23_in_nchw))   # (1, 320, 64, 64)
-        pm23_c2_out = F.gelu(ds23.conv2(pm23_c1_out))     # (1, 320, 64, 64) stride=1
-        pm23_c3_out = ds23.conv3(pm23_c2_out)              # (1, 320, 64, 64)
-        pm23_c1_hwc = pm23_c1_out[0].permute(1,2,0).reshape(ENC_S2_H*ENC_S2_W, ENC_S3_C).bfloat16()
-        pm23_c2_hwc = pm23_c2_out[0].permute(1,2,0).reshape(ENC_S3_H*ENC_S3_W, ENC_S3_C).bfloat16()
-        pm23_out_hwc = pm23_c3_out[0].permute(1,2,0).reshape(ENC_S3_H*ENC_S3_W, ENC_S3_C).bfloat16()
-        # Stage 3
-        s3 = model.image_encoder._stages[3]
-        s3_input = pm23_c3_out.flatten(2).transpose(1,2).bfloat16()  # (1, 4096, 320)
-        s3_b0_out = s3["blocks"][0](s3_input)
-        s3_b1_out = s3["blocks"][1](s3_b0_out)
-
-    pe_hwc = pe_out[0].permute(1,2,0).contiguous().reshape(ENC_S0_H * ENC_S0_W, ENC_C0P)
-    c1_hwc = c1_out[0].permute(1,2,0).contiguous().reshape(ENC_S0_H * ENC_S0_W, ENC_S0_C_EXP)
-    c2_hwc = c2_out[0].permute(1,2,0).contiguous().reshape(ENC_S0_H * ENC_S0_W, ENC_S0_C_EXP)
-    b0_hwc = b0_out[0].permute(1,2,0).contiguous().reshape(ENC_S0_H * ENC_S0_W, ENC_C0P)
-    pm01_hwc = pm_c3[0].permute(1,2,0).contiguous().reshape(ENC_S1_H * ENC_S1_W, ENC_S1_C)
-    return {
-        "patch_embed_out": pe_hwc.to(torch.bfloat16),
-        "s0_b0_c1_out":    c1_hwc.to(torch.bfloat16),
-        "s0_b0_c2_out":    c2_hwc.to(torch.bfloat16),
-        "s0_b0_out":       b0_hwc.to(torch.bfloat16),
-        "s0_b1_out":       b1_out[0].permute(1,2,0).contiguous().reshape(ENC_S0_H * ENC_S0_W, ENC_C0P).to(torch.bfloat16),
-        "pm01_c1_out":     pm01_c1_hwc.to(torch.bfloat16),
-        "pm01_c2_out":     pm01_c2_hwc.to(torch.bfloat16),
-        "pm01_out":        pm01_hwc.to(torch.bfloat16),
-        "s1_attn_ln":      s1_attn_ln,         # (H*W, C) spatial LN output
-        "s1_win":          s1_wins_pad,        # (NTOK, C) windowed LN output
-        "s1_q":            s1_q_ref,
-        "s1_k":            s1_k_ref,
-        "s1_v":            s1_v_ref,
-        **{f"s1_q_head_h{h}": s1_q_head_refs[h] for h in range(ENC_S1_HEADS)},
-        **{f"s1_attn_h{h}":   s1_attn_h_refs[h] for h in range(ENC_S1_HEADS)},
-        "s1_merged":       s1_merged_ref,                  # (NTOK, C) pre-proj attn output
-        "s1_proj":         s1_proj_ref,                    # (NTOK, C) proj output before window_reverse
-        "s1_rev":          s1_rev_ref.bfloat16(),       # (H*W, C) unpartitioned attn proj output
-        "s1_post_attn":    s1_post_attn_ref,            # (H*W, C) after attn residual
-        "s1_lc_out":       s1_lc_ref,                   # (H*W, C) after local_conv
-        "s1_b0_out":       s1_b0_out[0].reshape(ENC_S1_H * ENC_S1_W, ENC_S1_C).bfloat16(),
-        "s1b1_attn_ln":    s1b1_attn_ln.bfloat16(),
-        "s1b1_q":          s1b1_q_ref.bfloat16(),
-        "s1b1_merged":     s1b1_merged_ref,
-        "s1b1_proj":       s1b1_proj_ref,
-        "s1b1_rev":        s1b1_rev_ref.bfloat16(),
-        "s1b1_post_attn":  s1b1_post_attn_ref,
-        "s1b1_lc_out":     s1b1_lc_ref,
-        "s1_b1_out":       s1_b1_out[0].reshape(ENC_S1_H * ENC_S1_W, ENC_S1_C).bfloat16(),
-        "pm12_c1":         pm12_c1_hwc,
-        "pm12_c2":         pm12_c2_hwc,
-        "pm12_out":        pm12_out_hwc,
-        "s2b0_attn_ln":    s2b0_attn_ln.bfloat16(),
-        "s2b0_win":        s2b0_wins_pad,
-        "s2b0_q":          s2b0_q_ref.bfloat16(),
-        **{f"s2b0_q_head_h{h}": s2b0_q_head_refs[h] for h in range(ENC_S2_HEADS)},
-        **{f"s2b0_attn_h{h}":   s2b0_attn_h_refs[h] for h in range(ENC_S2_HEADS)},
-        "s2b0_merged":     s2b0_merged_ref,
-        "s2b0_proj":       s2b0_proj_ref,
-        "s2b0_rev":        s2b0_rev_ref.bfloat16(),
-        "s2b0_post_attn":  s2b0_post_attn_ref,
-        "s2b0_lc_out":     s2b0_lc_ref,
-        "s2b0_out":        s2_b0_out[0].reshape(ENC_S2_H*ENC_S2_W, ENC_S2_C).bfloat16(),
-        **{f"s2b{_bi}_out": s2_blk_outs[_bi][0].reshape(ENC_S2_H*ENC_S2_W, ENC_S2_C).bfloat16()
-           for _bi in range(1, 6)},
-        "pm23_c1":  pm23_c1_hwc,
-        "pm23_c2":  pm23_c2_hwc,
-        "pm23_out": pm23_out_hwc,
-        "s3b0_out": s3_b0_out[0].reshape(ENC_S3_H*ENC_S3_W, ENC_S3_C).bfloat16(),
-        "s3b1_out": s3_b1_out[0].reshape(ENC_S3_H*ENC_S3_W, ENC_S3_C).bfloat16(),
-        **_cpu_neck_intermediates(model, s3_b1_out),
-    }
-
-
 def main():
     parser = argparse.ArgumentParser(description="MobileSAM mask decoder accelerator test")
     parser.add_argument("--dev",   default="xdma0")
     parser.add_argument("--freq",  type=float, default=194.0, help="Clock frequency MHz")
-    parser.add_argument("--debug", action="store_true", help="Step-through encoder debug mode")
     parser.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"),
                         default=[512, 512],
                         help="Single-point inference: encode image, run decoder for this point, save best mask")
@@ -3814,112 +3171,6 @@ def main():
 
     _original_print("MobileSAM — HW test")
     _original_print(f"  Device: {args.dev}  Freq: {args.freq} MHz")
-
-    if args.debug:
-        from PIL import Image as _PIL_Image
-        import numpy as _np
-        _img = _PIL_Image.open(os.path.join(SCRIPT_DIR, "../../../test_samples/vette.jpg")).convert("RGB")
-        _img = _img.resize((ENC_IN_W, ENC_IN_H), _PIL_Image.BILINEAR)
-        _img_arr = torch.from_numpy(_np.array(_img)).float().permute(2, 0, 1) / 255.0
-        image_t = _img_arr.unsqueeze(0).bfloat16()
-        _original_print("\nRunning CPU neck references …")
-        cpu_enc = _cpu_encoder_intermediates(WEIGHTS, image_t)
-        enc = MobileSAM_UE(WEIGHTS)
-        _original_print("Running encoder (VIT) …")
-        enc.encode(image_t)   # runs full VIT+Neck; S3B1_OUT_DRAM is now valid
-
-        _NHW = ENC_S3_H * ENC_S3_W  # 4096
-        _NC  = 256
-
-        # Re-run neck step by step from S3B1_OUT_DRAM for per-op SNR checks
-        enc.start_capture()
-
-        # neck.0: Conv1x1(320→256)
-        enc.matmat_mul_core(
-            M=_NHW, K=ENC_S3_C, N=_NC,
-            A_DRAM_ADDR=enc.S3B1_OUT_DRAM,
-            B_DRAM_ADDR=enc.NECK_C1_W,
-            OUTPUT_DRAM_ADDR=enc.NECK_BUF1_DRAM,
-        )
-        enc._exec_partial()
-        hw = enc.dma_from_accelerator_memory(enc.NECK_BUF1_DRAM, (_NHW, _NC)).float()
-        _snr_cos("NECK_C1_OUT", hw, cpu_enc["neck_c1_out"].float())
-
-        # neck.1: LayerNorm2d(256)
-        enc.start_capture()
-        enc.layer_norm_core_dram(
-            M=_NHW, N=_NC,
-            A_DRAM_ADDR=enc.NECK_BUF1_DRAM,
-            OUTPUT_DRAM_ADDR=enc.NECK_BUF1_DRAM,
-            GAMMA_DRAM_ADDR=enc.NECK_LN1_G,
-            BETA_DRAM_ADDR=enc.NECK_LN1_B,
-        )
-        enc._exec_partial()
-        hw = enc.dma_from_accelerator_memory(enc.NECK_BUF1_DRAM, (_NHW, _NC)).float()
-        _snr_cos("NECK_LN1_OUT", hw, cpu_enc["neck_ln1_out"].float())
-
-        # neck.2: Conv3x3(256→256, pad=1)
-        enc.start_capture()
-        conv2d_3x3_stride1_dram(
-            enc,
-            INPUT_DRAM_ADDR=enc.NECK_BUF1_DRAM,
-            OUTPUT_DRAM_ADDR=enc.NECK_OUT_DRAM,
-            IM2COL_DRAM_ADDR=enc.NECK_IM2COL_DRAM,
-            WEIGHT_DRAM_ADDR=enc.NECK_C3_W,
-            BIAS_DRAM_ADDR=enc.NECK_ZERO,
-            ZERO_PAD_DRAM_ADDR=enc.NECK_ZERO,
-            H=ENC_S3_H, W=ENC_S3_W, C_in=_NC, C_out=_NC,
-        )
-        enc._exec_partial()
-        hw = enc.dma_from_accelerator_memory(enc.NECK_OUT_DRAM, (_NHW, _NC)).float()
-        _snr_cos("NECK_C3_OUT", hw, cpu_enc["neck_c3_out"].float())
-
-        # neck.3: LayerNorm2d(256)
-        enc.start_capture()
-        enc.layer_norm_core_dram(
-            M=_NHW, N=_NC,
-            A_DRAM_ADDR=enc.NECK_OUT_DRAM,
-            OUTPUT_DRAM_ADDR=enc.NECK_OUT_DRAM,
-            GAMMA_DRAM_ADDR=enc.NECK_LN2_G,
-            BETA_DRAM_ADDR=enc.NECK_LN2_B,
-        )
-        enc._exec_partial()
-        hw = enc.dma_from_accelerator_memory(enc.NECK_OUT_DRAM, (_NHW, _NC)).float()
-        _snr_cos("NECK_OUT", hw, cpu_enc["neck_out"].float())
-
-        _original_print("\nVerifying decoder …")
-
-        _raw_dec = MobileSAM().bfloat16().eval()
-        load_weights(_raw_dec, WEIGHTS)
-        with torch.no_grad():
-            image_pe_t = _raw_dec.pe_layer.forward_grid((IMG_H, IMG_W))[0] \
-                             .permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
-            dense_t = _raw_dec.prompt_encoder.no_mask_embed.weight \
-                          .reshape(1, DEC_DIM).expand(GA, -1).bfloat16().contiguous()
-            centre = torch.tensor([[512.0, 512.0]])
-            pts = centre.reshape(1, 1, 2).bfloat16()
-            lbs = torch.ones(1, 1, dtype=torch.long)
-            sparse, _ = _raw_dec.prompt_encoder(pts, lbs)
-            sparse_tok = sparse[0].bfloat16()  # (2, 256)
-
-        tokens_t = _assemble_tokens(WEIGHTS, sparse_tok)
-
-        # CPU reference masks+IOU using the HW neck output already in DRAM
-        image_emb_hw = enc.dma_from_accelerator_memory(enc.NECK_OUT_DRAM, (GA, DEC_DIM)).bfloat16()
-        cpu_masks_ref, cpu_iou_ref = cpu_reference(WEIGHTS, tokens_t, image_emb_hw, image_pe_t, dense_t)
-        _original_print(f"  CPU IOU:  {cpu_iou_ref.tolist()}")
-
-        # Compile + run HW decoder
-        dec_prog = enc.compile_decoder()
-        enc.preload_decoder_image(image_emb_hw, image_pe_t, dense_t)
-        hw_masks, hw_iou = enc.run_decoder_tokens(dec_prog, tokens_t)
-        _original_print(f"  HW  IOU:  {hw_iou.tolist()}")
-
-        _snr_cos("decoder IOU",   hw_iou,            cpu_iou_ref)
-        _snr_cos("decoder masks", hw_masks.flatten(), cpu_masks_ref.flatten())
-
-        assert False, "Decoder debug done"
-        return
 
     # ---- Inputs ----
     from PIL import Image as _PIL_Image
@@ -3979,13 +3230,23 @@ def main():
         # IMPORTANT: create both UE objects first (params+tensors alloc), THEN compile.
         # Both share the same physical DRAM. If we compiled enc before creating ue,
         # ue's __init__ param allocs would overwrite enc's compiled programs.
-        _original_print("\nCompiling …")
-        t0 = time.perf_counter()
+        _original_print("\nCompiling … (this will take a moment...)")
+        import threading as _th
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                _original_print(f"\r  Elapsed: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                time.sleep(0.2)
+        _timer = _th.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         ue = MobileSAM_UE(WEIGHTS)
         enc_prog = ue.compile_encoder()
-        _original_print(f"  Encoder: 1 program  ({time.perf_counter() - t0:.1f}s)")
+        _original_print(f"\r  Encoder: 1 program  ({time.perf_counter() - _t0:.1f}s)")
         dec_prog = ue.compile_decoder()
-        _original_print(f"  Decoder: done  ({time.perf_counter() - t0:.1f}s total)")
+        _stop_timer = True
+        _timer.join()
+        _original_print(f"  Decoder: done  ({time.perf_counter() - _t0:.1f}s total)")
 
         # ---- Save bins ----
         _original_print("\nSaving bins …")
@@ -4005,19 +3266,6 @@ def main():
             sparse_tok = _amg_encode_point(_raw_pt, coord)  # (2, 256)
         tokens_t = _assemble_tokens(WEIGHTS, sparse_tok)
 
-        # CPU reference
-        _original_print("  Running CPU encoder+decoder reference …")
-        with torch.no_grad():
-            cpu_enc_out = _raw_pt.image_encoder(image_t.bfloat16())
-            cpu_img_emb = cpu_enc_out[0].permute(1, 2, 0).reshape(1, IMG_H, IMG_W, DEC_DIM).permute(0,3,1,2).bfloat16()
-            cpu_img_pe  = image_pe_t.reshape(1, IMG_H, IMG_W, DEC_DIM).permute(0,3,1,2).bfloat16()
-            sparse_cpu, dense_cpu = _raw_pt.prompt_encoder(
-                coord.reshape(1,1,2).bfloat16(), torch.ones(1,1,dtype=torch.long))
-            masks_cpu, iou_cpu = _raw_pt.mask_decoder(cpu_img_emb, cpu_img_pe, sparse_cpu, dense_cpu)
-            masks_cpu = masks_cpu[0]; iou_cpu = iou_cpu[0]
-        best_cpu = iou_cpu.argmax().item()
-        _original_print(f"  CPU IOU: {[round(x,4) for x in iou_cpu.tolist()]}  best={best_cpu}")
-
         t_enc = time.perf_counter()
         ue.execute_encoder(enc_prog, image_t)
         _original_print(f"  HW encoder done in {time.perf_counter() - t_enc:.2f}s")
@@ -4028,7 +3276,6 @@ def main():
         _original_print(f"  HW decoder done in {time.perf_counter() - t_dec:.3f}s")
         best = iou_hw.argmax().item()
         _original_print(f"  HW  IOU: {[round(x,4) for x in iou_hw.tolist()]}  best={best}")
-        _original_print(f"  encoder SNR: {calculate_snr(image_emb_t.float(), cpu_enc_out[0].permute(1,2,0).reshape(GA,DEC_DIM).float()):.2f}dB")
 
         def _save_point_overlay(mask_256, path, color):
             mask_1024 = _np.array(_PIL.fromarray(mask_256).resize((1024, 1024), _PIL.NEAREST))
@@ -4045,23 +3292,8 @@ def main():
             _PIL.fromarray(overlay).save(path)
             _original_print(f"  Saved {path}")
 
-        _save_point_overlay((masks_cpu[best_cpu] > _MASK_THRESHOLD).cpu().numpy(), "mask_point_cpu.png", [0, 200, 255])
-        _save_point_overlay((masks_hw[best]      > _MASK_THRESHOLD).cpu().numpy(), "mask_point.png",     [0, 255, 100])
+        _save_point_overlay((masks_hw[best] > _MASK_THRESHOLD).cpu().numpy(), "mask_point.png", [0, 255, 100])
         return
-
-    # ---- CPU reference (AMG) ----
-    _original_print("\nRunning CPU encoder …")
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        _enc_out = _raw.image_encoder(image_t.bfloat16())
-        image_emb_cpu = _enc_out[0].permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
-    _original_print(f"  CPU encoder done in {time.perf_counter() - t0:.2f}s")
-    _original_print(f"  CPU NECK_OUT: mean={image_emb_cpu.float().mean():.4f} std={image_emb_cpu.float().std():.4f} "
-                    f"min={image_emb_cpu.float().min():.4f} max={image_emb_cpu.float().max():.4f}")
-    _original_print("Running CPU AMG …")
-    t0 = time.perf_counter()
-    cpu_masks = _amg_run_cpu(_raw, image_emb_cpu, image_pe_t, dense_t, points_per_side=4)
-    _original_print(f"  {len(cpu_masks)} masks in {time.perf_counter() - t0:.2f}s")
 
     # ---- Execute (HW encoder + AMG decoder) ----
     _original_print("\nExecuting …")
@@ -4076,7 +3308,6 @@ def main():
     image_emb_t = ue.dma_from_accelerator_memory(ue.NECK_OUT_DRAM, (GA, DEC_DIM)).bfloat16()
     _original_print(f"  NECK_OUT:    mean={image_emb_t.float().mean():.4f} std={image_emb_t.float().std():.4f} "
                     f"min={image_emb_t.float().min():.4f} max={image_emb_t.float().max():.4f}")
-    _snr_cos("image_emb HW vs CPU", image_emb_t.float(), image_emb_cpu.float())
     _original_print("Running HW AMG …")
     t0 = time.perf_counter()
     hw_masks = _amg_run_hw(ue, dec_prog, image_emb_t, image_pe_t, dense_t, _raw, points_per_side=4)
@@ -4084,7 +3315,6 @@ def main():
 
     # ---- Overlays ----
     _original_print("\nSaving overlays …")
-    _save_amg_overlay(image_t, cpu_masks, "mask_cpu.png")
     _save_amg_overlay(image_t, hw_masks,  "mask_hw.png")
 
 
@@ -4166,26 +3396,6 @@ def _amg_filter_and_nms(all_logits: list, all_iou: list, orig_hw, scaled_hw,
             boxes[i] = torch.tensor([xs.min(), ys.min(), xs.max(), ys.max()], dtype=torch.float32)
     kept_idx = nms(boxes, iou_scores.cpu(), _BOX_NMS_THRESH)
     return [masks_orig[i].numpy() for i in kept_idx]
-
-
-def _amg_run_cpu(raw_model, image_emb_cpu: torch.Tensor,
-                 image_pe_t: torch.Tensor, dense_t: torch.Tensor,
-                 points_per_side: int = _AMG_POINTS_PER_SIDE):
-    """CPU AMG: run decoder for each grid point, return filtered mask list."""
-    grid = _amg_grid_points(points_per_side)
-    all_logits, all_iou = [], []
-    with torch.no_grad():
-        img_emb = image_emb_cpu.reshape(1, IMG_H, IMG_W, DEC_DIM).permute(0,3,1,2).bfloat16()
-        img_pe  = image_pe_t.reshape(1, IMG_H, IMG_W, DEC_DIM).permute(0,3,1,2).bfloat16()
-        for coord in grid:
-            pts = coord.reshape(1, 1, 2).bfloat16()
-            lbs = torch.ones(1, 1, dtype=torch.long)
-            sparse, dense = raw_model.prompt_encoder(pts, lbs)
-            masks, iou = raw_model.mask_decoder(img_emb, img_pe, sparse, dense)
-            all_logits.append(masks[0])   # (4, 256, 256)
-            all_iou.append(iou[0])        # (4,)
-    return _amg_filter_and_nms(all_logits, all_iou,
-                                orig_hw=(1024, 1024), scaled_hw=(256, 256), tag="CPU")
 
 
 def _amg_run_hw(ue: 'MobileSAM_UE', dec_prog: int,
