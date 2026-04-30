@@ -1,7 +1,0 @@
-{
-    "paths": {
-        "hf_repo_id": "facebook/sam-vit-base",
-        "hf_checkpoint_filename": "model.safetensors",
-        "bin_dir": "sam1_vit_b_bin"
-    }
-}

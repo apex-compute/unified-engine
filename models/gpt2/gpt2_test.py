@@ -42,7 +42,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -966,7 +966,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                     self.accelerator_memory_to_sram(
                         self.LAYER0_K_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
                     self.generate_instruction_add_imm(
-                        self.V_CACHE_SIZE_REG, k_cache_base, self.TMP_REG)
+                        self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x10000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
@@ -974,7 +974,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                     self.accelerator_memory_to_sram(
                         self.LAYER0_V_PROJ_DRAM + kv_h * ahd * bpe, 0x20000, ahd)
                     self.generate_instruction_add_imm(
-                        self.V_CACHE_SIZE_REG, v_cache_base, self.TMP_REG)
+                        self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x20000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
@@ -1143,7 +1143,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
 
             # V_CACHE_SIZE_REG: decode_pos × actual_hd × bpe
             _kv_stride = self.actual_head_dim * self.bytes_per_element  # 128 bytes/position
-            self.isa_add_set_core(self.V_CACHE_SIZE_REG, (self.seq_len - 1) * _kv_stride)
+            self.isa_add_set_core(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter((self.seq_len - 1) * _kv_stride))
 
             # Host-side: token + positional embedding for current decode position
             embedding_tensor = self.get_embedding_for_tokens([token_id], start_pos=self.seq_len - 1)
