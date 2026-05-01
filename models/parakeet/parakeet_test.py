@@ -42,7 +42,7 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, set_dma_device,
     UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX,
-    ue_35bit_addr_shifter
+    ue_35bit_addr_shifter, calculate_snr
 )
 
 URAM_A_BASE = 0x00000
@@ -611,6 +611,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.max_symbols_per_step = jnt["max_symbols_per_step"]
         self.block_size = hw["block_size"]      # 64
         self.bytes_per_element = enc["bytes_per_element"]
+        # HW mel pipeline buffers (allocated in tensor_init)
+        self.POWER_DRAM = None
+        self.MEL_TEMP_DRAM = None
+        self.MASK_DRAM = None
+        self.ZEROS_DRAM = None
+        self.mel_matmul_prog = 0
+        self.mel_norm_prog = 0
+        self.mel_transpose_prog = 0
         # ISA register assignments for decoder dynamic addressing
         regs = self._cfg.get("fixed_isa_regs", {})
         self.TOKEN_REG = regs.get("TOKEN_REG", 1)
@@ -714,6 +722,13 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         print(f"  {sum(v.numel() for v in sd.values() if hasattr(v, 'numel')):,} parameters")
         D, FF, H = self.d_model, self.ff_dim, self.pred_hidden
         self.w = {}
+
+        # Mel filterbank (padded 257→320 for HW 64-ALU alignment)
+        fb = sd["preprocessor.featurizer.fb"].float().squeeze(0)  # (128, 257)
+        K_padded = pad_to_multiple(257, self.block_size)  # 320
+        fb_padded = torch.zeros(128, K_padded, dtype=torch.bfloat16)
+        fb_padded[:, :257] = fb.to(torch.bfloat16)
+        self.w["MEL_FB"] = self._alloc_write(fb_padded)
 
         # Identity matrices for LALU activation (sigmoid, softmax, etc.)
         self.w["IDENTITY_1024"] = allocate_identity(self, D)
@@ -912,6 +927,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         # Subsampling intermediates
         T_mel_max = L_pad * 8
         self.MEL_DRAM = self.allocate_tensor_dram(T_mel_max * self.n_mels * bpe)
+        # HW mel pipeline: power spectrogram (T_mel_max × K_padded) and matmul temp (n_mels × T_mel_max)
+        K_padded = pad_to_multiple(257, self.block_size)  # 320
+        self.POWER_DRAM = self.allocate_tensor_dram(T_mel_max * K_padded * bpe)
+        self.MEL_TEMP_DRAM = self.allocate_tensor_dram(self.n_mels * T_mel_max * bpe)
+        # Mask and zeros for custom layer norm (size = max padded T_mel)
+        T_mel_max_padded = pad_to_multiple(T_mel_max, self.block_size)
+        self.ZEROS_DRAM = self.allocate_tensor_dram(T_mel_max_padded * bpe)
+        self.MASK_DRAM = self.allocate_tensor_dram(T_mel_max_padded * bpe)
         # Temp buffer for R_combined (stage 0 im2col row selection)
         H0_max = (T_mel_max + 2 - 3) // 2 + 1
         self.IM2COL_R_DRAM = self.allocate_tensor_dram(H0_max * 3 * self.n_mels * bpe)
@@ -1059,6 +1082,87 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         prog_bytes = self.get_capture_instruction_size_bytes()
         self.allocate_program_dram(prog_bytes)
         return prog, H_out, W_out
+    def compile_mel_matmul(self, T_mel_padded: int):
+        """Compile matmul + log for mel spectrogram: fb(128×320) @ power^T(T_padded×320)."""
+        K_padded = pad_to_multiple(257, self.block_size)  # 320
+        self.clear_capture_buffer()
+        self.start_capture()
+        self.matmat_mul_core(M=self.n_mels, K=K_padded, N=T_mel_padded,
+                             A_DRAM_ADDR=self.w["MEL_FB"],
+                             B_DRAM_ADDR=self.POWER_DRAM,
+                             OUTPUT_DRAM_ADDR=self.MEL_TEMP_DRAM,
+                             log_enable=True)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        return prog
+    def compile_mel_norm(self, T_mel: int, T_mel_padded: int):
+        """Compile custom masked layer norm with 0 CPU round-trips.
+
+        Per-row sequence (7 HW ops, all compiled inline):
+          0. eltwise_mul_core(x, mask)          → zero pads in x
+          1. start_queue_for_bf16_layer_norm_mean → LALU = sum(x_real)/N  (pads=0)
+          2. ADD_BROADCAST(LALU_RESULT_NEGATE)    → x - mean
+          3. eltwise_mul_core(x, mask)           → zero pads in centered x
+          4. start_queue_for_bf16_rms_mean        → LALU = 1/rms
+          5. MUL_BROADCAST(LALU_RESULT)           → (x-μ)/rms
+          6. broadcast_mul(sqrt(T_mel/N))         → correct rms divisor
+        """
+        N = T_mel_padded
+        zeros_sram = 0x80000
+        mask_sram = zeros_sram + N * 2
+        vector_sram = 0x00000
+        chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, self.n_mels)
+        correction = math.sqrt(T_mel / N)
+
+        self.clear_capture_buffer()
+        self.start_capture()
+
+        # Load zeros + mask from DRAM → SRAM (URAM_B)
+        self.accelerator_memory_to_sram(self.ZEROS_DRAM, zeros_sram, N)
+        self.accelerator_memory_to_sram(self.MASK_DRAM, mask_sram, N)
+
+        for i, m_take in self.chunk_ranges(self.n_mels, chunk_size):
+            self.accelerator_memory_to_sram(
+                self.MEL_TEMP_DRAM + i * N * 2, vector_sram, m_take * N)
+
+            for j in range(m_take):
+                row = vector_sram + j * N * 2
+
+                self.eltwise_mul_core(row, mask_sram, row, N)
+                self.start_queue_for_bf16_layer_norm_mean(row, zeros_sram, N)
+                self.start_queue_broadcast(UE_MODE.ADD_BROADCAST,
+                    BROADCAST_MODE.LALU_RESULT_NEGATE, row, row, N)
+                self.eltwise_mul_core(row, mask_sram, row, N)
+                self.start_queue_for_bf16_rms_mean(row, N)
+                self.start_queue_broadcast(UE_MODE.MUL_BROADCAST,
+                    BROADCAST_MODE.LALU_RESULT, row, row, N)
+                self.broadcast_mul(correction, row, row, N)
+
+            self.sram_to_accelerator_memory(
+                vector_sram, self.MEL_TEMP_DRAM + i * N * 2, m_take * N)
+
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        return prog
+    def compile_mel_transpose(self, T_mel_padded: int):
+        """Compile 2D transpose (128, T_padded) -> (T_padded, 128) via bf16_transpose_core."""
+        self.clear_capture_buffer()
+        self.start_capture()
+        self.bf16_transpose_core(M=self.n_mels, N=T_mel_padded,
+                                  INPUT_DRAM_ADDR=self.MEL_TEMP_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.MEL_DRAM)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        return prog
     def compile_im2col_dw(self, H_in, W_in, N_out_pad, input_dram_addr, g_key):
         """Compile accelerator program for depthwise im2col via transpose + permutation-matrix matmul.
 
@@ -1807,11 +1911,15 @@ def main():
     # --- Init engine ---
     engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
 
-    # --- Mel spectrogram (CPU) — needs checkpoint for filterbank ---
+    # --- Mel spectrogram: power spec on CPU, matmul+log on accelerator, norm on CPU ---
     Parakeet_UnifiedEngine.ensure_model_files()
     sd = torch.load(WEIGHTS_PATH, map_location="cpu", weights_only=True)
-    mel = compute_mel_spectrogram(waveform, cfg, ckpt_sd=sd)
-    T_mel = mel.shape[1]
+    pre = cfg["preprocessing"]
+    window = sd["preprocessor.featurizer.window"].float()
+    stft = torch.stft(waveform.float(), pre["n_fft"], pre["hop_length"], pre["win_length"],
+                       window=window, center=True, pad_mode="reflect", return_complex=True)
+    power = (stft.abs() * stft.abs())  # (1, 257, T_mel)
+    T_mel = power.shape[-1]
     n_mels = cfg["encoder"]["n_mels"]  # 128
 
     # --- Compute correct output dimensions through 3 subsampling stages ---
@@ -1829,8 +1937,20 @@ def main():
         engine.weight_init()
         _original_print("done")
 
+    # Mel filterbank: always populate self.w (weight_init handles it fresh; on bin reload it's missing)
+    if "MEL_FB" not in engine.w:
+        K_padded = pad_to_multiple(257, engine.block_size)
+        fb = sd["preprocessor.featurizer.fb"].float().squeeze(0)
+        fb_padded = torch.zeros(128, K_padded, dtype=torch.bfloat16)
+        fb_padded[:, :257] = fb.to(torch.bfloat16)
+        engine.w["MEL_FB"] = engine._alloc_write(fb_padded)
+
     # --- Allocate DRAM buffers ---
     engine.tensor_init(L_pad)
+
+    # Initialize ZEROS_DRAM (constant zeros, done once)
+    T_mel_max_padded = pad_to_multiple(L_pad * 8, engine.block_size)
+    engine.dma_to_accelerator_memory(engine.ZEROS_DRAM, torch.zeros(T_mel_max_padded, dtype=torch.bfloat16))
 
     SC = engine.sub_channels  # 256
     D = engine.d_model         # 1024
@@ -1942,6 +2062,13 @@ def main():
         engine.dump_programs(sized, L_pad)
     engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0), "state_restore": (restore_prog, 0)}
 
+    # --- HW mel pipeline program (always compiled — T_mel varies per utterance) ---
+    K_padded = pad_to_multiple(257, engine.block_size)                     # 320
+    T_mel_padded = pad_to_multiple(T_mel, engine.block_size)
+    engine.mel_matmul_prog = engine.compile_mel_matmul(T_mel_padded)
+    engine.mel_norm_prog = engine.compile_mel_norm(T_mel, T_mel_padded)
+    engine.mel_transpose_prog = engine.compile_mel_transpose(T_mel_padded)
+
     import threading
 
     def _progress_timer(label, start_time, stop_event):
@@ -1956,9 +2083,23 @@ def main():
     timer = threading.Thread(target=_progress_timer, args=("Executing", t_start, stop), daemon=True)
     timer.start()
 
-    # --- Subsampling ---
-    mel_flat = mel.squeeze(0).to(torch.bfloat16).contiguous()
-    engine.dma_to_accelerator_memory(engine.MEL_DRAM, mel_flat)
+    # --- HW mel: power spec -> matmul+log -> norm -> transpose (all HW) ---
+    power_bt = power[0].t().contiguous()  # (T_mel, 257) float32
+    power_padded = torch.zeros(T_mel_padded, K_padded, dtype=torch.bfloat16)
+    power_padded[:T_mel, :257] = power_bt.to(torch.bfloat16)
+    engine.dma_to_accelerator_memory(engine.POWER_DRAM, power_padded)
+
+    # Matmul + log on HW
+    engine.program_execute(engine.mel_matmul_prog)   # (128, T_mel_padded) at MEL_TEMP_DRAM
+
+    # Mask + norm on HW (in-place at MEL_TEMP_DRAM)
+    mask = torch.zeros(T_mel_padded, dtype=torch.bfloat16)
+    mask[:T_mel] = 1.0
+    engine.dma_to_accelerator_memory(engine.MASK_DRAM, mask)
+    engine.program_execute(engine.mel_norm_prog)     # (128, T_mel_padded) normed at MEL_TEMP_DRAM
+
+    # Transpose to (T_mel_padded, 128) at MEL_DRAM
+    engine.program_execute(engine.mel_transpose_prog)
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
     engine.program_execute(im2col_s0)
     engine.program_execute(prog_s0)
