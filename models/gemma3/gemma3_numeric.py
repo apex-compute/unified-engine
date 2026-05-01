@@ -36,9 +36,9 @@ from read_trace import generate_trace
 import gemma3_test
 from gemma3_test import (
     Gemma3_UnifiedEngine,
-    _parse_offset,
     SCRIPT_DIR,
 )
+from model_lib_core import parse_offset as _parse_offset
 
 def _dequantize_int4_from_bin(
     weight_bin: bytes,

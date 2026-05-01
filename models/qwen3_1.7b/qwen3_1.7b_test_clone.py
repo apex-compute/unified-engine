@@ -993,7 +993,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             gflops_program, _ = self.report_flop_rate_gflops(gflops)
             print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
 
-    def compile_prefill(self, seq_len: int, layer_size: int | None = None) -> dict:
+    def compile_prefill(self, seq_len: int, layer_size: int | None = None, save_path: str | None = None) -> dict:
         """
         Compile prefill for the given prefill sequence.
 
@@ -1008,6 +1008,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         Args:
             seq_len: Length of the prefill sequence (including last token).
             layer_size: Number of layers to compile (default: all).
+            save_path: If set, save the compiled instructions to this bin file.
 
         Returns:
             (prefill_program_addr, total_flops)
@@ -1200,6 +1201,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         prefill_program_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prefill_program_addr)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        if save_path:
+            prefill_bytes = bytearray()
+            for inst in self.capture_buffer:
+                prefill_bytes.extend(inst.get_bytes())
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            with open(save_path, "wb") as f:
+                f.write(prefill_bytes)
         self.clear_capture_buffer()
         _SILENT_MODE = False
         _original_print()  # newline after \r layer progress
@@ -1488,6 +1496,8 @@ def main():
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=1/0.17,
                         help='Clock cycle time in nanoseconds (default: ~5.88ns)')
+    parser.add_argument('--kv-variants', type=int, default=0, nargs='?', const=512,
+                        help='Pre-compile prefill bins for all KV sizes up to this value (default: 512). Saves bins, does not run inference.')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1513,6 +1523,22 @@ def main():
 
     ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)
+
+    if args.kv_variants:
+        bin_dir = os.path.join(script_dir, "qwen3_1.7b_bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        max_kv = args.kv_variants
+        print(f"\n--- Compiling prefill bins for KV sizes 64..{max_kv} ---")
+        for kv_size in range(64, max_kv + 1, 64):
+            print(f"  Compiling prefill seq_len={kv_size}...")
+            timer = time.perf_counter()
+            ue.compile_prefill(seq_len=kv_size, layer_size=ue.LAYER_SIZE,
+                               save_path=os.path.join(bin_dir, f"prefill_S{kv_size}.bin"))
+            ue.reset_program_dram_addr()
+            print(f"    done in {time.perf_counter() - timer:.2f}s")
+        print("All prefill bins compiled. Exiting.")
+        return
+
     if args.prompt is not None:
         tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
         tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)

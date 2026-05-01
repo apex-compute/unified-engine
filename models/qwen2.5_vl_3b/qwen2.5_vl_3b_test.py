@@ -18,6 +18,7 @@ sys.path.insert(0, PROJECT_ROOT)
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
+from user_dma_core import ue_35bit_addr_shifter
 
 import builtins
 
@@ -372,7 +373,7 @@ def quantize_q4_64(tensor):
     quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
     pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
     packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
-    scale_bytes = torch.tensor(scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
+    scale_bytes = torch.tensor(-scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
     return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
 
 def quantize_fp4_64(tensor):
@@ -807,10 +808,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         sram_bc = 0x80000 + N * bytes_per_elem * 2
         self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr, sram_address=sram_x, element_size=N)
         if rope_size_reg is not None:
-            self.generate_instruction_add_imm(rope_size_reg, cos_dram_addr, tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(cos_dram_addr), tmp_reg)
             self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
             self.overwrite_instruction_with_general_register(tmp_reg)
-            self.generate_instruction_add_imm(rope_size_reg, sin_dram_addr, tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(sin_dram_addr), tmp_reg)
             self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
             self.overwrite_instruction_with_general_register(tmp_reg)
         else:
@@ -821,7 +822,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
         self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
         if output_addr_inc_reg is not None:
-            self.generate_instruction_add_imm(output_addr_inc_reg, output_dram_addr, tmp_reg)
+            self.generate_instruction_add_imm(output_addr_inc_reg, ue_35bit_addr_shifter(output_dram_addr), tmp_reg)
             self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
             self.overwrite_instruction_with_general_register(tmp_reg)
         else:
@@ -1570,7 +1571,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=la[f'{la_key_prefix}_data'],
                     OUTPUT_DRAM_ADDR=OUT,
                     C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.INT4,
+                    is_B_quantized=True, data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=la[f'{la_key_prefix}_scale'],
                     silu_enable=silu_en, gelu_enable=gelu_en)
 
@@ -1616,7 +1617,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=la['qk_data'],
                     OUTPUT_DRAM_ADDR=self.VIS_QK_DRAM,
                     C_DRAM_ADDR=la['qk_bias'], bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.INT4,
+                    is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=la['qk_scale'])
 
             if _bf16_mode and 'v_weight_bf16' in la:
@@ -1633,7 +1634,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=la['v_data'],
                     OUTPUT_DRAM_ADDR=self.VIS_V_DRAM,
                     C_DRAM_ADDR=la['v_bias'], bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.INT4,
+                    is_B_quantized=True, data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=la['v_scale'])
 
             qk_row_pad = VN_VD_PAD * 2
@@ -1771,7 +1772,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
                 B_DRAM_ADDR=la['gate_data'],
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.INT4,
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['gate_bias'], bias_mode="broadcast_N",
                 silu_enable=True)
             self.matmat_mul_core(is_B_quantized=True,
@@ -1779,7 +1780,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
                 B_DRAM_ADDR=la['up_data'],
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.INT4,
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['up_bias'], bias_mode="broadcast_N")
 
             # gate * up chunked
@@ -1800,7 +1801,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.VIS_MLP_MULT_DRAM,
                 B_DRAM_ADDR=la['down_data'],
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.INT4,
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['down_bias'], bias_mode="broadcast_N")
 
             eltwise_add_core_dram(self, size=VS * VH,
@@ -1845,7 +1846,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.merger_mlp0_data,
                 OUTPUT_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM,
                 C_DRAM_ADDR=self.merger_mlp0_bias, bias_mode="broadcast_N",
-                is_B_quantized=True, data_type=TYPE.INT4,
+                is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.merger_mlp0_scale,
                 gelu_enable=True)
             self.matmat_mul_core(
@@ -1854,7 +1855,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.merger_mlp2_data,
                 OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM,
                 C_DRAM_ADDR=self.merger_mlp2_bias, bias_mode="broadcast_N",
-                is_B_quantized=True, data_type=TYPE.INT4,
+                is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.merger_mlp2_scale)
 
         # Finalize single program
@@ -2118,11 +2119,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # Q, K, V projections with bias
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.FP4,
+                SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['q_bias'])
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.FP4,
+                SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['k_bias'])
             # v_proj writes to temp buffer (seq_len, hd) in standard per-head interleaved layout (BF16)
             total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd,
@@ -2225,10 +2226,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # MLP: gate_proj with SiLU, up_proj, gate x up element-wise, down_proj
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.FP4, silu_enable=True)
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True)
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.FP4)
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4)
 
             # gate x up chunked: process M_CHUNK rows at a time
             _bpe = self.bytes_per_element
@@ -2246,7 +2247,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # down_proj
             total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.FP4)
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4)
 
             # Qwen2.5-VL: no post-FFN norm; add residual directly to down_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
@@ -2374,11 +2375,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # Q, K, V projections with bias
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.vector_length, N=hd * qpkv,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                    SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.FP4,
+                    SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
                     C_DRAM_ADDR=la['q_bias'])
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.vector_length, N=hd,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                    SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.FP4,
+                    SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
                     C_DRAM_ADDR=la['k_bias'])
                 total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=hd,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
@@ -2418,13 +2419,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
                     # Store roped K_h to KV cache at decode position (via V_CACHE_SIZE_REG)
                     self.accelerator_memory_to_sram(self.LAYER0_K_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
-                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, k_cache_base, self.TMP_REG)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x10000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
                     # Store V_h to KV cache at decode position (via V_CACHE_SIZE_REG)
                     self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
-                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, v_cache_base, self.TMP_REG)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x20000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
@@ -2464,10 +2465,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # MLP: SwiGLU
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.FP4, silu_enable=True)
+                    SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True)
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                    SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.FP4)
+                    SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4)
 
                 # gate x up (M=1: mlp_elements fits in SRAM in one shot)
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
@@ -2478,7 +2479,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # down_proj
                 total_flops += self.matmat_mul_core(is_B_quantized=True,M=1, K=self.mlp_elements, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.FP4)
+                    SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4)
 
                 # Qwen2.5-VL: no post-FFN norm; residual direct on down_proj output
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
@@ -2491,7 +2492,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
                 total_flops += self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                     A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.FP4)
+                    SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
 
             self.generate_instruction_halt()
             segment_instruction_counts.append(self.capture_count - count_at_start)
@@ -2536,9 +2537,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             prog_idx = min((self.seq_len - 1) // 64, len(decoder_program_sizes) - 1)
             prog_addr = decoder_base_addr + sum(decoder_program_sizes[:prog_idx])
 
-            self.isa_add_set_core(self.V_CACHE_SIZE_REG, (self.seq_len - 1) * _kv_stride)
+            self.isa_add_set_core(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter((self.seq_len - 1) * _kv_stride))
             _rope_pos = self.seq_len - 1 + getattr(self, '_rope_offset', 0)
-            self.isa_add_set_core(self.ROPE_SIZE_REG,    _rope_pos * _rope_stride)
+            self.isa_add_set_core(self.ROPE_SIZE_REG,    ue_35bit_addr_shifter(_rope_pos * _rope_stride))
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
