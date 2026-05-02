@@ -385,7 +385,7 @@ def read_device_hash():
     print(f"=== Reading Device Hash @ 0x{DEVICE_HASH_ADDR:08X} ===")
     data = user_read32(DEVICE_HASH_ADDR)
     print(f"Hardware hash: {data >> 4 & 0xFFFFFFF:07x}")
-    return data
+    return (data >> 4) & 0xFFFFFFF
 
 
 def find_repo_bin_hash():
