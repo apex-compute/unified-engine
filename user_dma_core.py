@@ -267,7 +267,7 @@ UE_LATENCY_MEAN = 20  # Additional mode latency
 
 # LALU pipeline component latencies from timing.md (micro values)
 UE_LALU_PIPELINE_FPDIV = 3  # fpdiv pipeline depth (from fpdiv.vhdl line 561)
-UE_LALU_PIPELINE_FPSQRT = 2  # fpsqrt pipeline depth (from fpsqrt.vhdl line 9)
+UE_LALU_PIPELINE_FPSQRT = 3  # fpsqrt pipeline depth (from fpsqrt.vhdl line 9)
 UE_LALU_PIPELINE_FACT = 8  # sample_1_plus_exp_bx pipeline depth (from sample_1_plus_exp_bx.vhdl line 9039)
 
 # LALU mode latencies calculated from timing.md formulas (shift register delay parameter)
