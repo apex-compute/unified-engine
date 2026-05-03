@@ -25,7 +25,7 @@ _original_print = builtins.print
 builtins.print = lambda *a, **k: None  # silence all compile/init noise; use _original_print for real output
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 sys.path.insert(0, SCRIPT_DIR)
 
 import user_dma_core
@@ -63,137 +63,23 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, threshold: float):
     return keep
 
 
-class _DictModuleWrapper:
-    """Makes an nn.Module subscriptable: wrapper["subname"] → module.subname."""
-    def __init__(self, module):
-        self._m = module
-    def __getitem__(self, key):
-        return getattr(self._m, key)
-    def __call__(self, *a, **k):
-        return self._m(*a, **k)
+_prompt_weights = None
 
 
-class _MLPDictWrapper(_nn.Module):
-    def __init__(self, mlp):
-        super().__init__()
-        self._mlp = mlp
-    def __getitem__(self, key):
-        return getattr(self._mlp, key)
-    def forward(self, x):
-        return self._mlp(x)
-
-
-class _TwoWayLayerWrapper(_nn.Module):
-    def __init__(self, layer):
-        super().__init__()
-        self._layer = layer
-        self.self_attn = layer.self_attn
-        self.cross_attn_token_to_image = layer.cross_attn_token_to_image
-        self.cross_attn_image_to_token = layer.cross_attn_image_to_token
-        self.norm1 = layer.norm1; self.norm2 = layer.norm2
-        self.norm3 = layer.norm3; self.norm4 = layer.norm4
-        self.mlp = _MLPDictWrapper(layer.mlp)
-    def forward(self, queries, keys, query_pe, key_pe):
-        return self._layer(queries, keys, query_pe, key_pe)
-
-
-class _TransformerWrapper(_nn.Module):
-    def __init__(self, t):
-        super().__init__()
-        self._t = t
-        self.norm_final_attn = t.norm_final_attn
-        self.final_attn_token_to_image = t.final_attn_token_to_image
-        self.layers = _nn.ModuleList([_TwoWayLayerWrapper(l) for l in t.layers])
-
-
-class MaskDecoder(_nn.Module):
-    def __init__(self, raw_md):
-        super().__init__()
-        self._md = raw_md
-        self.output_upscaling = raw_md.output_upscaling
-        self.output_hypernetworks_mlps = raw_md.output_hypernetworks_mlps
-        self.iou_prediction_head = raw_md.iou_prediction_head
-        self.transformer = _TransformerWrapper(raw_md.transformer)
-    def forward(self, image_embeddings, image_pe, sparse_prompt_embeddings,
-                dense_prompt_embeddings, multimask_output=True):
-        return self._md(image_embeddings=image_embeddings, image_pe=image_pe,
-                        sparse_prompt_embeddings=sparse_prompt_embeddings,
-                        dense_prompt_embeddings=dense_prompt_embeddings,
-                        multimask_output=multimask_output)
-
-
-class _PeLayerWrapper:
-    def __init__(self, pe_layer):
-        self._pe = pe_layer
-    def forward_grid(self, size):
-        return self._pe.forward(size).unsqueeze(0)  # (1, C, H, W)
-
-
-class _PromptEncoderWrapper(_nn.Module):
-    def __init__(self, pe):
-        super().__init__()
-        self._pe = pe
-        self.no_mask_embed = pe.no_mask_embed
-    def forward(self, points=None, labels=None):
-        if points is not None and labels is not None:
-            sparse, dense = self._pe(points=(points, labels), boxes=None, masks=None)
-        else:
-            sparse, dense = self._pe(points=points, boxes=None, masks=None)
-        return sparse.bfloat16(), dense.bfloat16()
-
-
-class _StageWrapper:
-    def __init__(self, layer):
-        self._layer = layer
-    def __getitem__(self, key):
-        if key == "blocks":    return self._layer.blocks
-        if key == "downsample": return self._layer.downsample
-        raise KeyError(key)
-
-
-class _ImageEncoderWrapper(_nn.Module):
-    def __init__(self, enc):
-        super().__init__()
-        self._enc = enc
-        self._stages = [_StageWrapper(l) for l in enc.layers]
-        self.neck = enc.neck
-        self.patch_embed = _DictModuleWrapper(enc.patch_embed)
-    def forward(self, x):
-        return self._enc(x)
-
-
-class MobileSAM(_nn.Module):
-    def __init__(self):
-        super().__init__()
-        self._sam = None
-    @property
-    def image_encoder(self): return self._image_encoder_wrapper
-    @property
-    def prompt_encoder(self): return self._prompt_encoder_wrapper
-    @property
-    def mask_decoder(self): return self._mask_decoder_wrapper
-    @property
-    def pe_layer(self): return self._pe_layer_wrapper
-    def forward(self, *a, **k): return self._sam(*a, **k)
-
-
-def raw_load_weights(model: MobileSAM, checkpoint_path: str) -> None:
-    from mobile_sam import sam_model_registry
-    sam = sam_model_registry["vit_t"](checkpoint=checkpoint_path)
-    sam.bfloat16().eval()
-    # gaussian matrix must stay float32 — forward_with_coords casts coords to float
-    pe_layer = sam.prompt_encoder.pe_layer
-    pe_layer.positional_encoding_gaussian_matrix = \
-        pe_layer.positional_encoding_gaussian_matrix.float()
-    model._sam = sam
-    model._image_encoder_wrapper = _ImageEncoderWrapper(sam.image_encoder)
-    model._prompt_encoder_wrapper = _PromptEncoderWrapper(sam.prompt_encoder)
-    model._mask_decoder_wrapper = MaskDecoder(sam.mask_decoder)
-    model._pe_layer_wrapper = _PeLayerWrapper(sam.prompt_encoder.pe_layer)
-
-
-# Alias used at some call sites
-load_weights = raw_load_weights
+def _get_prompt_weights():
+    """Lazy-load prompt encoder weights from checkpoint (no mobile_sam package needed)."""
+    global _prompt_weights
+    if _prompt_weights is not None:
+        return _prompt_weights
+    _sd = torch.load(WEIGHTS, map_location="cpu", weights_only=True)
+    _prompt_weights = {
+        "gauss_matrix": _sd["prompt_encoder.pe_layer.positional_encoding_gaussian_matrix"],
+        "no_mask_embed": _sd["prompt_encoder.no_mask_embed.weight"],
+        "not_a_point": _sd["prompt_encoder.not_a_point_embed.weight"],
+        "point_0": _sd["prompt_encoder.point_embeddings.0.weight"],
+        "point_1": _sd["prompt_encoder.point_embeddings.1.weight"],
+    }
+    return _prompt_weights
 
 # ---------------------------------------------------------------------------
 # Local HW helpers (built on user_dma_core primitives only)
@@ -3175,16 +3061,23 @@ def main():
     # ---- Inputs ----
     from PIL import Image as _PIL_Image
     import numpy as _np
-    _img = _PIL_Image.open(os.path.join(SCRIPT_DIR, "../../../test_samples/vette.jpg")).convert("RGB")
+    _img = _PIL_Image.open(os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")).convert("RGB")
     _img = _img.resize((ENC_IN_W, ENC_IN_H), _PIL_Image.BILINEAR)
     _img_arr = torch.from_numpy(_np.array(_img)).float().permute(2, 0, 1) / 255.0
     image_t  = _img_arr.unsqueeze(0).bfloat16()
 
-    _raw = MobileSAM().bfloat16().eval()
-    load_weights(_raw, WEIGHTS)
-    with torch.no_grad():
-        image_pe_t = _raw.pe_layer.forward_grid((IMG_H, IMG_W))[0].permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
-        dense_t    = _raw.prompt_encoder.no_mask_embed.weight.reshape(1, DEC_DIM).expand(GA, -1).bfloat16().contiguous()
+    # Load checkpoint weights directly (no mobile_sam package needed)
+    _ckpt = torch.load(WEIGHTS, map_location="cpu", weights_only=True)
+    _gauss = _ckpt["prompt_encoder.pe_layer.positional_encoding_gaussian_matrix"]
+    dense_t = _ckpt["prompt_encoder.no_mask_embed.weight"].reshape(1, DEC_DIM).expand(GA, -1).bfloat16().contiguous()
+    # Positional encoding (PositionEmbeddingRandom.forward equivalent)
+    _tmp = torch.ones(IMG_H, IMG_W)
+    _gy = (_tmp.cumsum(dim=0) - 0.5) / IMG_H
+    _gx = (_tmp.cumsum(dim=1) - 0.5) / IMG_W
+    _coords = 2 * torch.stack([_gx, _gy], dim=-1) - 1
+    _pe_raw = 2 * math.pi * (_coords @ _gauss)
+    _pe = torch.cat([torch.sin(_pe_raw), torch.cos(_pe_raw)], dim=-1)
+    image_pe_t = _pe.permute(2, 0, 1)[None][0].permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
 
     # ---- Compile or load from bins ----
     bins_exist = (os.path.exists(os.path.join(BIN_DIR, "params.bin"))
@@ -3259,11 +3152,9 @@ def main():
         _original_print(f"\nSingle-point inference at ({px}, {py}) …")
         from PIL import Image as _PIL
         import numpy as _np
-        _raw_pt = MobileSAM().bfloat16().eval()
-        load_weights(_raw_pt, WEIGHTS)
-        with torch.no_grad():
-            coord = torch.tensor([[float(px), float(py)]])
-            sparse_tok = _amg_encode_point(_raw_pt, coord)  # (2, 256)
+        _pw = _get_prompt_weights()
+        coord = torch.tensor([[float(px), float(py)]])
+        sparse_tok = _amg_encode_point(coord, _pw)  # (2, 256)
         tokens_t = _assemble_tokens(WEIGHTS, sparse_tok)
 
         t_enc = time.perf_counter()
@@ -3310,7 +3201,7 @@ def main():
                     f"min={image_emb_t.float().min():.4f} max={image_emb_t.float().max():.4f}")
     _original_print("Running HW AMG …")
     t0 = time.perf_counter()
-    hw_masks = _amg_run_hw(ue, dec_prog, image_emb_t, image_pe_t, dense_t, _raw, points_per_side=4)
+    hw_masks = _amg_run_hw(ue, dec_prog, image_emb_t, image_pe_t, dense_t, _get_prompt_weights(), points_per_side=4)
     _original_print(f"  {len(hw_masks)} masks in {time.perf_counter() - t0:.2f}s")
 
     # ---- Overlays ----
@@ -3338,14 +3229,30 @@ def _amg_grid_points(points_per_side: int, img_size: int = 1024):
     ], dtype=torch.float32)   # (N, 2)
 
 
-def _amg_encode_point(raw_model, coord_xy: torch.Tensor) -> torch.Tensor:
-    """Build (2, 256) bf16 tokens for one foreground point. coord_xy: (2,) pixel coords.
-    Returns both the point token and the 'not-a-point' padding token SAM always appends."""
-    with torch.no_grad():
-        pts = coord_xy.reshape(1, 1, 2).to(torch.bfloat16)
-        lbs = torch.ones(1, 1, dtype=torch.long)
-        sparse, _ = raw_model.prompt_encoder(pts, lbs)   # (1, 2, 256)
-    return sparse[0].bfloat16()   # (2, 256)
+def _amg_encode_point(coord_xy: torch.Tensor, pw: dict) -> torch.Tensor:
+    """Build (2, 256) bf16 tokens for one foreground point. Uses prompt weights dict."""
+    pts = coord_xy.reshape(1, 1, 2).float() + 0.5
+    lbs = torch.ones(1, 1, dtype=torch.long)
+    # Pad with a not-a-point (SAM always appends this when no boxes)
+    pad_pt = torch.zeros(1, 1, 2)
+    pad_lb = -torch.ones(1, 1, dtype=torch.long)
+    pts = torch.cat([pts, pad_pt], dim=1)
+    lbs = torch.cat([lbs, pad_lb], dim=1)
+    # Positional encoding via forward_with_coords
+    coords = pts.clone()
+    coords[:, :, 0] /= 1024.0
+    coords[:, :, 1] /= 1024.0
+    coords = 2 * coords - 1
+    pe = coords @ pw["gauss_matrix"]  # (1, 2, 128)
+    pe = 2 * math.pi * pe
+    point_embedding = torch.cat([torch.sin(pe), torch.cos(pe)], dim=-1)  # (1, 2, 256)
+    # Apply point embeddings (labels: 1=foreground, -1=not-a-point)
+    nap = (lbs == -1)[0]  # (2,) — squeeze batch dim for boolean indexing
+    fg = (lbs == 1)[0]    # (2,)
+    point_embedding[:, nap, :] = 0.0
+    point_embedding[:, nap, :] += pw["not_a_point"]
+    point_embedding[:, fg, :] += pw["point_1"]
+    return point_embedding[0].bfloat16()  # (2, 256)
 
 
 def _amg_filter_and_nms(all_logits: list, all_iou: list, orig_hw, scaled_hw,
@@ -3400,7 +3307,7 @@ def _amg_filter_and_nms(all_logits: list, all_iou: list, orig_hw, scaled_hw,
 
 def _amg_run_hw(ue: 'MobileSAM_UE', dec_prog: int,
                 image_emb_t: torch.Tensor, image_pe_t: torch.Tensor, dense_t: torch.Tensor,
-                raw_model, points_per_side: int = _AMG_POINTS_PER_SIDE):
+                pw: dict, points_per_side: int = _AMG_POINTS_PER_SIDE):
     """HW AMG: encoder output already in NECK_OUT_DRAM. Runs decoder per grid point."""
     sd = torch.load(WEIGHTS, map_location="cpu", weights_only=True)
     iou_tok   = sd["mask_decoder.iou_token.weight"].to(torch.bfloat16)
@@ -3410,7 +3317,7 @@ def _amg_run_hw(ue: 'MobileSAM_UE', dec_prog: int,
     grid = _amg_grid_points(points_per_side)
     all_logits, all_iou = [], []
     for coord in grid:
-        point_tok = _amg_encode_point(raw_model, coord)  # (2, 256)
+        point_tok = _amg_encode_point(coord, pw)  # (2, 256)
         tokens_t  = torch.zeros(NT_PAD, DEC_DIM, dtype=torch.bfloat16)
         tokens_t[0]   = iou_tok[0]
         tokens_t[1:5] = mask_toks
