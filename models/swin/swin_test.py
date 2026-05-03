@@ -33,7 +33,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 import numpy as np
 import torch
 from PIL import Image
-from torchvision import transforms
 from transformers import AutoModelForImageClassification
 from huggingface_hub import snapshot_download
 import time
@@ -1453,13 +1452,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
 def preprocess_image(image_path: str) -> torch.Tensor:
     """Load and preprocess image for Swin-Large-384. Returns (1, 3, 384, 384)."""
-    image = Image.open(image_path).convert("RGB")
-    transform = transforms.Compose([
-        transforms.Resize((384, 384)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    return transform(image).unsqueeze(0)
+    image = Image.open(image_path).convert("RGB").resize((384, 384), Image.Resampling.BILINEAR)
+    img_t = torch.from_numpy(np.array(image)).float().permute(2, 0, 1) / 255.0
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    return (img_t - mean) / std
 
 
 # ---------------------------------------------------------------------------
