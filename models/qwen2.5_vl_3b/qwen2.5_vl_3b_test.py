@@ -1894,7 +1894,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             print("    Loading HF model for patch embedding...")
             from transformers import Qwen2_5_VLForConditionalGeneration
             self._hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_dir, torch_dtype=torch.bfloat16, device_map="cpu"
+                model_dir, torch_dtype=torch.bfloat16
             )
             if not hasattr(self._hf_model, 'visual') and hasattr(self._hf_model, 'model') and hasattr(self._hf_model.model, 'visual'):
                 self._hf_model.visual = self._hf_model.model.visual
@@ -1907,9 +1907,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             if image_grid_thw is not None:
                 pixel_values_hf = pixel_values.to(torch.bfloat16)
             else:
-                from transformers import AutoProcessor
+                from transformers import AutoTokenizer, Qwen2VLImageProcessor
                 from PIL import Image
-                processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
                 img_np = pixel_values.float().permute(1, 2, 0).numpy()
                 img_cfg = self._cfg.get("image_processing", {})
                 mean = img_cfg.get("normalize_mean", [0.48145466, 0.4578275, 0.40821073])
@@ -1924,10 +1923,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     {"type": "image", "image": pil_img},
                     {"type": "text", "text": "Describe this image."},
                 ]}]
-                text_input = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = processor(text=[text_input], images=[pil_img], return_tensors="pt")
-                pixel_values_hf = inputs["pixel_values"].to(torch.bfloat16)
-                image_grid_thw = inputs["image_grid_thw"]
+                tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+                text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                image_processor = Qwen2VLImageProcessor.from_pretrained(model_dir, trust_remote_code=True)
+                img_inputs = image_processor(images=[pil_img], return_tensors="pt")
+                text_enc = tokenizer(text_input, return_tensors="pt")
+                pixel_values_hf = img_inputs["pixel_values"].to(torch.bfloat16)
+                image_grid_thw = img_inputs["image_grid_thw"]
 
             visual = model.visual
             patch_embeds = visual.patch_embed(pixel_values_hf)
@@ -2589,8 +2591,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen2.5-VL-3B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default="please describe the image in details.", help="Text prompt")
-    parser.add_argument("--image", type=str, default=os.path.join(SCRIPT_DIR, "test_image.jpg"),
-                        help="Path to image file (default: test_image.jpg, use 'none' for text-only)")
+    parser.add_argument("--image", type=str, default=os.path.join(SCRIPT_DIR, "../../test_samples/test_image.jpg"),
+                        help="Path to image file (default: test_samples/test_image.jpg, use 'none' for text-only)")
     parser.add_argument('--vision-cpu', action='store_true',
                         help='Run vision encoder on CPU (fp32) instead of FPGA — for quality comparison')
     parser.add_argument('--rep-penalty', type=float, default=1.05,

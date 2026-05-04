@@ -1229,6 +1229,9 @@ def main():
         print(f"Sequence ids: {prefill_seq}")
     else:
         prefill_seq = tuple(ue._cfg["default_prefill_tokens"])
+        default_prompt_text = ue.tokenizer.decode(list(prefill_seq))
+        print(f"Default prompt ({len(prefill_seq)} tokens): {default_prompt_text!r}")
+        print(f"Sequence ids: {prefill_seq}")
 
     print(f"\n--- Compiling ---")
     timer = time.perf_counter()
