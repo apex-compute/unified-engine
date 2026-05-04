@@ -1767,6 +1767,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.dma_write(DMA_DEVICE_H2C, self._params_dram_base + offset, data, len(data))
                 offset += len(data)
         self.allocate_params_dram(total)
+        # weight_init is skipped on bin reload, so create w with MEL_FB ref
+        self.w = {"MEL_FB": self._params_dram_base}
         _original_print(f"  Loading Toeplitz Staged BF16 Weights... {total / 1024**2:.1f} MB from bin")
         return True
     def dump_programs(self, program_addrs, L_pad):
