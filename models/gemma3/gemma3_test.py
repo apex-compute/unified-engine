@@ -35,9 +35,7 @@ import os
 import sys
 
 # This file's folder; user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
-# This file's folder; user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import numpy as np
@@ -104,49 +102,7 @@ def _dequantize_if4_from_bin(
     data_bytes = weight_bin[data_off : data_off + data_sz]
     return dequantize_if4(data_bytes, scale_bytes, N, K, block_size=block_size)
 
-
-def _dequantize_if4_from_bin(
-    weight_bin: bytes,
-    scale_off: int,
-    scale_sz: int,
-    data_off: int,
-    data_sz: int,
-    N: int,
-    K: int,
-    block_size: int = 64,
-) -> torch.Tensor:
-    """Dequantize mixed IF4 packed weight from bin. Per K-block of 64,
-    sign(bf16 scale) selects the codebook (negative=INT4, positive=FP4 NVFP4
-    E2M1). HW dequant = code_table[nibble] * |scale|. Returns (N, K) bf16."""
-    assert K % block_size == 0
-    num_blocks_k = K // block_size
-
-    scale_bytes = weight_bin[scale_off : scale_off + scale_sz]
-    scale = torch.frombuffer(
-        bytearray(scale_bytes), dtype=torch.bfloat16
-    ).clone().reshape(N, num_blocks_k)
-
-    data_bytes_arr = weight_bin[data_off : data_off + data_sz]
-    packed = np.frombuffer(data_bytes_arr, dtype=np.uint8)
-    packed = packed[: N * (K // 2)].reshape(N, K // 2)
-
-    low_nib = (packed & 0x0F).astype(np.int16)
-    high_nib = ((packed >> 4) & 0x0F).astype(np.int16)
-    nibbles = np.stack([low_nib, high_nib], axis=-1).reshape(N, K)
-
-    int4_vals = np.where(nibbles >= 8, nibbles - 16, nibbles).astype(np.float32)
-    fp4_vals = _NVFP4_DECODE_F32[nibbles]
-
-    int4_blocked = int4_vals.reshape(N, num_blocks_k, block_size)
-    fp4_blocked = fp4_vals.reshape(N, num_blocks_k, block_size)
-    use_int4 = (scale.float().numpy() < 0)[..., None]
-    decoded = np.where(use_int4, int4_blocked, fp4_blocked).reshape(N, K)
-
-    abs_scale_expanded = scale.abs().float().repeat_interleave(block_size, dim=1).to(torch.bfloat16)
-    return torch.from_numpy(decoded).to(torch.bfloat16) * abs_scale_expanded
-
-def weight_bin_generate(output_path: str | None = None, config_path: str | None = None,
-                        quantization: str = "if4") -> str:
+def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
     """Generate full_model_weights.bin from Hugging Face model per gemma3_config.json layout.
 
     Quantizable weights (Q/K/V/O projections, MLP up/gate/down, LM head) use
@@ -154,9 +110,6 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     the FPGA via the bf16 scale's sign bit. Norms / embeddings stay BF16.
 
     Returns the path to the written file."""
-    if quantization not in ("if4", "pure_q4"):
-        raise ValueError(f"quantization must be 'if4' or 'pure_q4', got {quantization!r}")
-    force_int4 = (quantization == "pure_q4")
     cfg = Gemma3_UnifiedEngine.load_config(config_path=config_path, script_dir=SCRIPT_DIR)
     weight_defs = cfg["_weight_defs"]
     paths = cfg["paths"]
@@ -218,18 +171,11 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             (q_w, "if4"),
             (k_w, "if4"),
             (v_w, "if4"),
-            (q_w, "if4"),
-            (k_w, "if4"),
-            (v_w, "if4"),
             (gamma_q, "bf16"),
             (gamma_k, "bf16"),
             (o_w, "if4"),
-            (o_w, "if4"),
             (gamma_post, "bf16"),
             (gamma_ffn, "bf16"),
-            (up_w, "if4"),
-            (gate_w, "if4"),
-            (down_w, "if4"),
             (up_w, "if4"),
             (gate_w, "if4"),
             (down_w, "if4"),
@@ -244,7 +190,6 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             sz = weight_defs[sz_key]
             file_off = off + layer_idx * LAYER_WEIGHT_SIZE
             tensor, kind = region_writes[j]
-            if kind == "if4":
             if kind == "if4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
