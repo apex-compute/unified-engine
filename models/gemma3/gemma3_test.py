@@ -333,10 +333,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 conversation, tokenize=False, add_generation_prompt=True
             )
             tokens = tuple(self.tokenizer.encode(prompt_with_template, add_special_tokens=True))
-            if len(tokens) < 2 or len(tokens) > max_prefill + 1:
+            if len(tokens) < 2 or len(tokens) > max_bucket + 1:
                 print(
                     f"WARNING: Tokenized prompt has {len(tokens)} tokens; supported prompt length is "
-                    f"[2, {max_prefill + 1}] (prefill seq_len in [1, {max_prefill}]). "
+                    f"[2, {max_bucket + 1}] (prefill seq_len in [1, {max_bucket}]). "
                     "Falling back to default prompt."
                 )
                 self.prefill_seq = default_tokens
@@ -648,6 +648,32 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             )
             self.loop_end()
             self.release_inst_ptr(ptr)
+
+        # Chunk size: max elements that fit in one URAM bank (A or B) starting at 0x10000.
+        _uram_max_elems = (URAM_FULL_ELEMENTS * 2 - 0x10000) // 2
+
+        def uram_eltwise_chunked(a_dram, b_dram, out_dram, total_elems, mul=True):
+            """Emit chunked DRAM→URAM→eltwise→DRAM instructions fitting within URAM."""
+            off = 0
+            while off < total_elems:
+                n = min(_uram_max_elems, total_elems - off)
+                self.accelerator_memory_to_sram(a_dram + off * 2, 0x10000, n)
+                self.accelerator_memory_to_sram(b_dram + off * 2, 0x90000, n)
+                if mul:
+                    self.eltwise_mul_core(0x10000, 0x90000, 0x10000, n)
+                else:
+                    self.eltwise_add_core(0x10000, 0x90000, 0x10000, n)
+                self.sram_to_accelerator_memory(0x10000, out_dram + off * 2, n)
+                off += n
+
+        def uram_copy_chunked(src_dram, dst_dram, total_elems):
+            """Emit chunked DRAM→URAM→DRAM copy instructions fitting within URAM."""
+            off = 0
+            while off < total_elems:
+                n = min(_uram_max_elems, total_elems - off)
+                self.accelerator_memory_to_sram(src_dram + off * 2, 0x10000, n)
+                self.sram_to_accelerator_memory(0x10000, dst_dram + off * 2, n)
+                off += n
 
         # --- Gemma3 26 layers: compile---
         global _SILENT_MODE
@@ -1262,8 +1288,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if slave_prefill_addr is not None:
             slave_engine.program_execute(slave_prefill_addr, timeout=0)
 
-        seq_len = prefill_seq_len
-        q_seq_len = seq_len * self.group_size
+        q_seq_len = bucket_seq_len * self.group_size
         aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
         bucket_idx = aligned_seq_len_q // UE_VECTOR_SIZE  # 1-based, matches flash_attention dispatcher
 
@@ -1281,6 +1306,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
 
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
+        if bucket_seq_len > prefill_seq_len:
+            pad = embedding_tensor[-1:].repeat(bucket_seq_len - prefill_seq_len, 1)
+            embedding_tensor = torch.cat([embedding_tensor, pad], dim=0)
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
         bias_one_group = torch.full((aligned_seq_len_q, aligned_seq_len_q), float("-inf"), dtype=torch.bfloat16)
         valid_mask = torch.tril(torch.ones(aligned_seq_len_q, aligned_seq_len_q, dtype=torch.bool), diagonal=0) if not self.causal_mask_upper else torch.triu(torch.ones(aligned_seq_len_q, aligned_seq_len_q, dtype=torch.bool), diagonal=0)
