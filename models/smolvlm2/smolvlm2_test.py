@@ -1122,11 +1122,11 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         def vis_matmul(M, K, N, A, proj, la, OUT, bias=None, **kw):
             if self.vision_bf16:
                 self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_weight'],
-                    OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N", **kw)
+                    OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N", use_pbi=True, **kw)
             else:
                 self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
                     OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=la[f'{proj}_scale'], **kw)
+                    is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=la[f'{proj}_scale'], use_pbi=True, **kw)
 
         for layer_idx, la in enumerate(self.vis_layer_addrs):
             h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
@@ -1335,11 +1335,16 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         H, KV, D, I = self.HIDDEN_SIZE, self.NUM_KV_HEADS * self.HEAD_DIM, self.HEAD_DIM, self.INTERMEDIATE_SIZE
         bpe = 2
 
-        # Helper: dispatch matmul as BF16 or Q4_64
-        def lm_matmul(M, K, N, A, proj, la, OUT, **kw):
+        # Helper: dispatch matmul as BF16 or Q4_64. pbi=True routes quantized
+        # path through matmat_mul_core_pbi for instruction-stream compression.
+        def lm_matmul(M, K, N, A, proj, la, OUT, pbi=False, **kw):
             if self.lm_bf16:
                 self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_weight'],
                     OUTPUT_DRAM_ADDR=OUT, **kw)
+            elif pbi:
+                self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
+                    OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=la[f'{proj}_scale'], use_pbi=True, **kw)
             else:
                 self.quantized_matmat_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
                     OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.IF4, **kw)
@@ -1364,7 +1369,21 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         # --- Compile bucket programs (one per kv_len, with halt) ---
         self._decode_bucket_raw = []
         self.clear_inst_id()
+        # Registers 1-3 are reserved as fixed ISA regs (V_CACHE_SIZE, ROPE_SIZE, TMP).
+        # matmat_mul_core_pbi uses loop_start/loop_end which call alloc_isa_reg.
+        # Reset counter to 4 so PBI loop registers don't collide with the fixed ones.
+        _pbi_reg_base = max(self.V_CACHE_SIZE_REG, self.ROPE_SIZE_REG, self.TMP_REG) + 1
+        # matmat_mul_core_pbi emits generate_instruction_jump_abs using get_program_dram_addr()
+        # to anchor the M-tile loop. At runtime the bucket is loaded at:
+        #   _decode_scratch_addr + REG_SET_SIZE(64) + embed_size
+        # Advance the program DRAM pointer by that offset NOW so absolute jump addresses
+        # computed during compilation match the runtime load address.
+        _max_embed = max(len(r) for r in self._decode_embed_raw)
+        _bucket_offset = 64 + _max_embed  # reg_set (64B) + embed
+        _scratch_base = self.get_program_dram_addr()
+        self.allocate_program_dram(_bucket_offset)
         for kv_len in kv_len_buckets:
+            self._isa_reg_counter = _pbi_reg_base
             self.start_capture()
             for layer_idx in range(self.NUM_LAYERS):
                 la = self.lm_layer_addrs[layer_idx]
@@ -1374,9 +1393,9 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=h_in,
                     OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'])
                 # Q/K/V projections M=1
-                lm_matmul(1, H, H, self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM)
-                lm_matmul(1, H, KV, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM)
-                lm_matmul(1, H, KV, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM)
+                lm_matmul(1, H, H, self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM, pbi=True)
+                lm_matmul(1, H, KV, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM, pbi=True)
+                lm_matmul(1, H, KV, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM, pbi=True)
                 # Store V [1,320]=[1,5*64] to KV cache at current pos (register-addressed)
                 for h in range(self.NUM_KV_HEADS):
                     v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
@@ -1396,19 +1415,19 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                     q_start = kv_b * self.GROUP_SIZE * D * bpe
                     decode_flash_attention_core(self, head_dim=D, kv_len=kv_len,Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + q_start,K_DRAM_ADDR=self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE,V_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE,OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + q_start,SCRATCH_DRAM_ADDR=self.LAYER0_ATTN_SCRATCH_DRAM,IDENTITY_DRAM_ADDR=self.identity_addr,BIAS_DRAM_ADDR=self.DECODE_BIAS_DRAM,num_q_heads=self.GROUP_SIZE,bias_row_stride=self.max_seq_len)
                 # O projection M=1
-                lm_matmul(1, H, H, self.LAYER0_ATTN_OUT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM)
+                lm_matmul(1, H, H, self.LAYER0_ATTN_OUT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM, pbi=True)
                 # Fused residual + RMS norm
                 rms_norm_core_dram_post_add(self, M=1, N=H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.LAYER0_O_PROJ_DRAM,
                     ADDOUTPUT_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, NORMOUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                     GAMMA_DRAM_ADDR=la['ln2_gamma'])
                 # MLP M=1
-                lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
-                lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'up', la, self.LAYER0_MLP_UP_DRAM)
+                lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, pbi=True, silu_enable=True)
+                lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'up', la, self.LAYER0_MLP_UP_DRAM, pbi=True)
                 self.accelerator_memory_to_sram(self.LAYER0_MLP_GATE_DRAM, 0x10000, I)
                 self.accelerator_memory_to_sram(self.LAYER0_MLP_UP_DRAM, 0x90000, I)
                 self.eltwise_mul_core(0x10000, 0x90000, 0x10000, I)
                 self.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM, I)
-                lm_matmul(1, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
+                lm_matmul(1, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM, pbi=True)
                 # MLP residual M=1
                 self.accelerator_memory_to_sram(self.LAYER0_RESIDUAL_DRAM, 0x10000, H)
                 self.accelerator_memory_to_sram(self.LAYER0_MLP_DOWN_DRAM, 0x90000, H)
@@ -1429,12 +1448,13 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             bucket_raw = capture_to_raw(self)
             self._decode_bucket_raw.append(bucket_raw)
 
-        # Allocate scratch for fused decode program: reg_set (64B) + embed + largest bucket
-        max_embed = max(len(r) for r in self._decode_embed_raw)
+        # Allocate scratch for fused decode program: reg_set (64B) + embed + largest bucket.
+        # _bucket_offset bytes (_max_embed + 64) were pre-allocated before the bucket loop
+        # so that PBI absolute jumps computed during compilation match runtime load addresses.
+        # Only allocate the remaining max_bucket bytes here.
         max_bucket = max(len(r) for r in self._decode_bucket_raw)
-        worst_case = 64 + max_embed + max_bucket  # 64 bytes for 2 x 32-byte ADD_SET
-        self._decode_scratch_addr = self.get_program_dram_addr()
-        self.allocate_program_dram(worst_case)
+        self._decode_scratch_addr = _scratch_base
+        self.allocate_program_dram(max_bucket)
 
         # Save to bin files for fast reload
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
