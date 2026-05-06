@@ -1476,6 +1476,405 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             print(token_char, end="", flush=True)
         return self.seq_len
 
+    def compile_qwen3(self) -> None:
+        """Compile all prefill buckets + all decoder buckets into one combined instruction bin.
+        Saves qwen3_instruction.bin and qwen3_instruction.json. Skips if both already exist."""
+        paths_cfg = self._cfg.get("paths", {})
+        inst_bin_path  = os.path.join(self.script_dir, paths_cfg.get("instruction_bin",  "qwen3_1.7b_bin/qwen3_instruction.bin"))
+        inst_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "qwen3_1.7b_bin/qwen3_instruction.json"))
+        if os.path.exists(inst_bin_path) and os.path.exists(inst_meta_path):
+            _original_print(f"Reusing existing instruction image at {inst_bin_path}")
+            _original_print(f"  Delete {inst_bin_path} to force recompile.")
+            return
+
+        os.makedirs(os.path.dirname(inst_bin_path), exist_ok=True)
+        model_cfg = self._cfg["model"]
+        prefill_buckets = model_cfg["prefill_seq_len_buckets"]
+        decoder_buckets = model_cfg["decoder_seq_len_buckets"]
+        LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
+
+        ahd  = self.actual_head_dim
+        nkvh = self.num_kv_heads
+        qpkv = self.group_size
+        bpe  = self.bytes_per_element
+        hd   = self.head_dim
+        rope_row_bytes = ahd * 2 * bpe
+
+        global _SILENT_MODE
+        _SILENT_MODE = True
+
+        prefill_seg_counts  = []
+        prefill_flops_list  = []
+
+        # ---- Prefill buckets (first capture session) ----
+        _original_print(f"  Compiling {len(prefill_buckets)} prefill buckets × {self.LAYER_SIZE} layers...")
+        self.clear_inst_id()
+        self.start_capture()
+        for bucket_seq_len in prefill_buckets:
+            seq_len = bucket_seq_len - 1
+            q_seq_len     = seq_len * qpkv
+            aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+            count_at_start = self.capture_count
+            total_flops = 0
+            _original_print(f"    prefill bucket seq_len={bucket_seq_len}...", flush=True)
+            for layer_idx in range(self.LAYER_SIZE):
+                layer_off = layer_idx * LAYER_WEIGHT_SIZE
+                if layer_idx != 0:
+                    self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
+                    self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=seq_len * self.vector_length)
+
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
+                total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=hd * qpkv,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=hd,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=hd,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                total_flops += self.rms_norm_core_dram(M=seq_len * nkvh, N=ahd, A_DRAM_ADDR=self.LAYER0_K_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off)
+                total_flops += self.rms_norm_core_dram(M=seq_len * nkvh * qpkv, N=ahd, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off)
+                ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_LOCAL
+                for t in range(seq_len):
+                    cos_addr = ROPE_WEIGHT_ADDR + t * rope_row_bytes
+                    sin_addr = cos_addr + ahd * bpe
+                    for kv_h in range(nkvh):
+                        total_flops += self.rope_hf_core(N=ahd,
+                            input_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
+                            output_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
+                            cos_dram_addr=cos_addr, sin_dram_addr=sin_addr)
+                    for q_h in range(nkvh * qpkv):
+                        total_flops += self.rope_hf_core(N=ahd,
+                            input_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
+                            output_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
+                            cos_dram_addr=cos_addr, sin_dram_addr=sin_addr)
+                for kv_h in range(nkvh):
+                    k_cache_base = (self.LAYER0_K_ROPE_DRAM
+                                    + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
+                                    + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                    v_cache_base = (self.LAYER0_V_DRAM
+                                    + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
+                                    + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                    for t in range(seq_len):
+                        k_src = self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe
+                        self.accelerator_memory_to_sram(k_src, 0x10000, ahd)
+                        self.sram_to_accelerator_memory(0x10000, k_cache_base + t * ahd * bpe, ahd)
+                        for g in range(qpkv):
+                            self.sram_to_accelerator_memory(0x10000, self.LAYER0_FLASH_K_DRAM + (t * qpkv + g) * ahd * bpe, ahd)
+                    for t in range(seq_len):
+                        v_src = self.LAYER0_V_PROJ_TEMP + (t * nkvh + kv_h) * ahd * bpe
+                        self.accelerator_memory_to_sram(v_src, 0x20000, ahd)
+                        self.sram_to_accelerator_memory(0x20000, v_cache_base + t * ahd * bpe, ahd)
+                        for g in range(qpkv):
+                            self.sram_to_accelerator_memory(0x20000, self.LAYER0_FLASH_V_DRAM + (t * qpkv + g) * ahd * bpe, ahd)
+                    for t in range(seq_len):
+                        for q in range(qpkv):
+                            q_src = self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + kv_h * qpkv + q) * ahd * bpe
+                            self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
+                            self.sram_to_accelerator_memory(0x30000, self.LAYER0_FLASH_Q_DRAM + (t * qpkv + q) * ahd * bpe, ahd)
+                    total_flops += self._flash_attention_core_cached(
+                        head_dim=ahd, seq_len=aligned_seq_len,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                        V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    )
+                    out_h_base = kv_h * qpkv * ahd * bpe
+                    for t in range(seq_len):
+                        for g in range(qpkv):
+                            src = self.LAYER0_FLASH_OUT_HEAD_DRAM + (t * qpkv + g) * ahd * bpe
+                            dst = self.LAYER0_FLASH_OUTPUT_DRAM + t * hd * qpkv * bpe + out_h_base + g * ahd * bpe
+                            self.accelerator_memory_to_sram(src, 0x40000, ahd)
+                            self.sram_to_accelerator_memory(0x40000, dst, ahd)
+                total_flops += self.quantized_matmat_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=seq_len * self.vector_length)
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
+                total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True)
+                total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4)
+                _M_CHUNK = min(25, seq_len)
+                for _t in range(0, seq_len, _M_CHUNK):
+                    _m_take = min(_M_CHUNK, seq_len - _t)
+                    _g_row = self.LAYER0_MLP_GATE_DRAM + _t * self.mlp_elements * bpe
+                    _u_row = self.LAYER0_MLP_UP_DRAM   + _t * self.mlp_elements * bpe
+                    _m_row = self.LAYER0_MLP_MULT_DRAM  + _t * self.mlp_elements * bpe
+                    self.accelerator_memory_to_sram(_g_row, 0x10000, _m_take * self.mlp_elements)
+                    self.accelerator_memory_to_sram(_u_row, 0x90000, _m_take * self.mlp_elements)
+                    self.eltwise_mul_core(0x10000, 0x90000, 0x10000, _m_take * self.mlp_elements)
+                    self.sram_to_accelerator_memory(0x10000, _m_row, _m_take * self.mlp_elements)
+                total_flops += self.quantized_matmat_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=seq_len * self.vector_length)
+            self.generate_instruction_halt()
+            prefill_seg_counts.append(self.capture_count - count_at_start)
+            prefill_flops_list.append(total_flops)
+
+        self.stop_capture()
+        prefill_bytes = bytearray()
+        for inst in self.capture_buffer:
+            prefill_bytes.extend(inst.get_bytes())
+        self.clear_capture_buffer()
+
+        # ---- Decoder buckets (fresh capture session — resets _inst_id to avoid wrapping) ----
+        decoder_seg_counts  = []
+        decoder_flops_list  = []
+        _original_print(f"  Compiling {len(decoder_buckets)} decoder buckets × {self.LAYER_SIZE} layers...")
+        self.clear_inst_id()
+        self.start_capture()
+        for _bi, seq_len in enumerate(decoder_buckets):
+            _original_print(f"    decoder bucket {_bi + 1}/{len(decoder_buckets)} seq_len={seq_len}...", flush=True)
+            count_at_start = self.capture_count
+            total_flops = 0
+            for layer_idx in range(self.LAYER_SIZE):
+                layer_off = layer_idx * LAYER_WEIGHT_SIZE
+                if layer_idx != 0:
+                    self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
+                    self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
+                total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
+                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=hd * qpkv,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=hd,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=hd,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                total_flops += self.rms_norm_core_dram(M=nkvh, N=ahd, A_DRAM_ADDR=self.LAYER0_K_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off)
+                total_flops += self.rms_norm_core_dram(M=nkvh * qpkv, N=ahd, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off)
+                ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_LOCAL
+                for kv_h in range(nkvh):
+                    total_flops += self.rope_hf_core(N=ahd,
+                        input_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
+                        output_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
+                        rope_size_reg=self.ROPE_SIZE_REG, tmp_reg=self.TMP_REG)
+                for q_h in range(nkvh * qpkv):
+                    total_flops += self.rope_hf_core(N=ahd,
+                        input_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
+                        output_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
+                        rope_size_reg=self.ROPE_SIZE_REG, tmp_reg=self.TMP_REG)
+                for kv_h in range(nkvh):
+                    k_cache_base = (self.LAYER0_K_ROPE_DRAM
+                                    + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
+                                    + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                    v_cache_base = (self.LAYER0_V_DRAM
+                                    + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
+                                    + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                    self.accelerator_memory_to_sram(self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
+                    self.sram_to_accelerator_memory(0x10000, 0, ahd)
+                    self.overwrite_instruction_with_general_register(self.TMP_REG)
+                    self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
+                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
+                    self.sram_to_accelerator_memory(0x20000, 0, ahd)
+                    self.overwrite_instruction_with_general_register(self.TMP_REG)
+                    for q in range(qpkv):
+                        q_src = self.LAYER0_Q_NORM_DRAM + (kv_h * qpkv + q) * ahd * bpe
+                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
+                        self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
+                        self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
+                        total_flops += self.decoder_attention_core(
+                            head_dim=ahd, seq_len=seq_len,
+                            Q_DRAM_ADDR=flash_q_addr,
+                            K_DRAM_ADDR=k_cache_base,
+                            V_DRAM_ADDR=v_cache_base,
+                            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + (kv_h * qpkv + q) * ahd * bpe,
+                            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                        )
+                total_flops += self.quantized_matmat_core(M=1, K=hd * qpkv, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.vector_length)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
+                total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
+                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True)
+                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
+                self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
+                total_flops += self.quantized_matmat_core(M=1, K=self.mlp_elements, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.vector_length)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
+            total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
+                OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
+            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4)
+            self.generate_instruction_halt()
+            decoder_seg_counts.append(self.capture_count - count_at_start)
+            decoder_flops_list.append(total_flops)
+
+        self.stop_capture()
+        _SILENT_MODE = False
+        decoder_bytes = bytearray()
+        for inst in self.capture_buffer:
+            decoder_bytes.extend(inst.get_bytes())
+        self.clear_capture_buffer()
+        all_bytes = prefill_bytes + decoder_bytes
+        # Compute absolute DRAM start addresses: base + byte offset (each instruction = 32 bytes)
+        base = self._program_dram_base
+        pos = 0
+        prefill_start_addrs = []
+        for c in prefill_seg_counts:
+            prefill_start_addrs.append(hex(base + pos))
+            pos += c * 32
+        decoder_start_addrs = []
+        for c in decoder_seg_counts:
+            decoder_start_addrs.append(hex(base + pos))
+            pos += c * 32
+        with open(inst_bin_path, "wb") as f:
+            f.write(all_bytes)
+        with open(inst_meta_path, "w") as f:
+            json.dump({
+                "prefill_seq_len_buckets": prefill_buckets,
+                "prefill_start_addrs": prefill_start_addrs,
+                "prefill_flops": prefill_flops_list,
+                "decoder_seq_len_buckets": decoder_buckets,
+                "decoder_start_addrs": decoder_start_addrs,
+                "decoder_flops": decoder_flops_list,
+            }, f, indent=2)
+        _original_print(f"  Written {len(all_bytes)} bytes to {inst_bin_path}")
+
+    def run_qwen3(self, prefill_seq: tuple,
+                  temperature: float = 0.0) -> None:
+        """Load pre-compiled instruction bin and run prefill + decoder."""
+        cfg = self._cfg
+        paths_cfg = cfg.get("paths", {})
+        inst_bin_path  = os.path.join(self.script_dir, paths_cfg.get("instruction_bin",  "qwen3_1.7b_bin/qwen3_instruction.bin"))
+        inst_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "qwen3_1.7b_bin/qwen3_instruction.json"))
+
+        _original_print(f"Loading instruction bin ({os.path.getsize(inst_bin_path)} bytes)...")
+        self.load_instructions(inst_bin_path)
+        with open(inst_meta_path) as f:
+            meta = json.load(f)
+
+        prefill_buckets      = meta["prefill_seq_len_buckets"]
+        decoder_buckets      = meta["decoder_seq_len_buckets"]
+        prefill_start_addrs  = [_parse_offset(a) for a in meta["prefill_start_addrs"]]
+        prefill_flops_list   = meta["prefill_flops"]
+        decoder_start_addrs  = [_parse_offset(a) for a in meta["decoder_start_addrs"]]
+
+        if len(prefill_seq) > 1:
+            prefill_tokens = prefill_seq[:-1]
+        else:
+            raise ValueError("Prefill sequence must have at least 2 tokens.")
+
+        prefill_seq_len = len(prefill_tokens)
+        max_bucket = max(prefill_buckets)
+        if prefill_seq_len > max_bucket:
+            raise ValueError(
+                f"prefill_seq_len={prefill_seq_len} exceeds max compiled bucket {max_bucket}. "
+                "Recompile with python qwen3_1.7b_test.py"
+            )
+
+        bucket_idx = next(i for i, b in enumerate(prefill_buckets) if b >= prefill_seq_len)
+        bucket_seq_len = prefill_buckets[bucket_idx]
+        self.seq_len = prefill_seq_len
+
+        q_seq_len     = bucket_seq_len * self.group_size
+        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+
+        _original_print(f"\n--- Starting prefill (seq_len={prefill_seq_len}, bucket={bucket_seq_len}) ---")
+        timer = time.perf_counter()
+
+        embedding_tensor = self.get_embedding_for_tokens(list(prefill_tokens))
+        if bucket_seq_len > prefill_seq_len:
+            pad = embedding_tensor[-1:].repeat(bucket_seq_len - prefill_seq_len, 1)
+            embedding_tensor = torch.cat([embedding_tensor, pad], dim=0)
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+
+        bias = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
+        rows = torch.arange(aligned_seq_len).unsqueeze(1)
+        cols = torch.arange(aligned_seq_len).unsqueeze(0)
+        bias.masked_fill_(cols <= rows, 0.0)
+        bias[:, bucket_seq_len * self.group_size:] = float("-inf")
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias)
+
+        self.start_execute_from_dram(prefill_start_addrs[bucket_idx])
+        self.wait_queue(120.0)
+        latency_us = self.report_latency_in_us()
+        _original_print(f"  Done in {time.perf_counter() - timer:.2f}s "
+                        f"({latency_us/1e6:.2f}s hw), "
+                        f"{prefill_flops_list[bucket_idx]/latency_us/1e3:.2f} GFLOPS")
+
+        _original_print(f"\n--- Starting decoder ---")
+        timer = time.perf_counter()
+        token_id = prefill_seq[-1]
+        _qwen3_stop_tokens = {151643, 151645, self._end_of_turn_token_id}
+        ahd = self.actual_head_dim
+        bpe = self.bytes_per_element
+        _kv_stride   = ahd * bpe
+        _rope_stride = ahd * 2 * bpe
+
+        global _SILENT_MODE
+        while self.seq_len < self.MAX_CONTEXT_SIZE:
+            _SILENT_MODE = True
+            self.seq_len += 1
+            prog_idx = next((i for i, b in enumerate(decoder_buckets) if self.seq_len <= b),
+                            len(decoder_buckets) - 1)
+
+            self.isa_add_set_core(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter((self.seq_len - 1) * _kv_stride))
+            self.isa_add_set_core(self.ROPE_SIZE_REG,    ue_35bit_addr_shifter((self.seq_len - 1) * _rope_stride))
+
+            emb = self.get_embedding_for_tokens([token_id])
+            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, emb)
+
+            aligned_seq_len = ((self.seq_len + 63) // 64) * 64
+            bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+            bias_host[0, :self.seq_len] = 0.0
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
+
+            self.start_execute_from_dram(decoder_start_addrs[prog_idx])
+            self.wait_queue(10.0)
+            token_id = self.get_arg_max_index()
+            _SILENT_MODE = False
+            if token_id in _qwen3_stop_tokens:
+                _original_print(f"\nStop token {token_id} reached.")
+                break
+            _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
+
+        _original_print(f"\nDecoder done in {time.perf_counter() - timer:.2f}s, "
+                        f"{self.seq_len} total tokens.")
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -1520,52 +1919,21 @@ def main():
     ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)
     if args.prompt is not None:
-        tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
-        tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
         conversation = [{"role": "user", "content": args.prompt}]
-        prompt_with_template = tokenizer.apply_chat_template(
+        prompt_with_template = ue.tokenizer.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=True
         )
-        prefill_seq = tuple(tokenizer.encode(prompt_with_template, add_special_tokens=False))
-        print(f"Prefill from prompt ({len(prefill_seq)} tokens): {args.prompt!r}")
-        print(f"Sequence ids: {prefill_seq}")
+        prefill_seq = tuple(ue.tokenizer.encode(prompt_with_template, add_special_tokens=False))
+        _original_print(f"Prompt ({len(prefill_seq)} tokens): {args.prompt!r}")
     else:
         prefill_seq = tuple(cfg["default_prefill_tokens"])
 
-    print(f"\n--- Compiling ---")
+    _original_print(f"\n--- Compiling ---")
     timer = time.perf_counter()
-    prefill_program_addr, gflops_prefill = ue.compile_prefill(seq_len=len(prefill_seq))
-    print(f"Prefill compile done in {time.perf_counter() - timer:.2f} seconds, start decoder compile...")
-    decoder_bin_path = os.path.join(script_dir, "qwen3_1.7b_bin", "decoder_program.bin")
-    decoder_meta_path = os.path.join(script_dir, "qwen3_1.7b_bin", "decoder_program.json")
-    if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
-        with open(decoder_meta_path, "r") as f:
-            meta = json.load(f)
-        if "instruction_counts" in meta:
-            decoder_program_sizes = [c * 32 for c in meta["instruction_counts"]]
-        else:
-            decoder_program_sizes = meta["program_sizes"]
-        gflops_per_token = meta["total_flops"]
-        print(f"Decoder bin found, skipped compile ({time.perf_counter() - timer:.2f}s).")
-    else:
-        timer_dec = time.perf_counter()
-        decoder_program_sizes, gflops_per_token = ue.compile_decoder()
-        print(f"Decoder compile done in {time.perf_counter() - timer_dec:.2f} seconds.")
-    decoder_base_addr, _ = ue.load_instructions(decoder_bin_path)
+    ue.compile_qwen3()
+    _original_print(f"Compile done in {time.perf_counter() - timer:.2f} seconds")
 
-    print(f"\n--- Starting prefill ---")
-    print(f"Prompt tokens ({len(prefill_seq)}): {prefill_seq}")
-    timer = time.perf_counter()
-    ue.run_prefill(prefill_program_addr, prefill_seq=prefill_seq, gflops=gflops_prefill)
-    latency_prefill = time.perf_counter() - timer
-    print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n")
-
-    print(f"\n--- Starting decoder ---")
-    timer = time.perf_counter()
-    token_cnt_decoded = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=prefill_seq[-1], gflops_per_token=gflops_per_token)
-    latency_decoder = time.perf_counter() - timer
-    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, total {token_cnt_decoded} tokens.")
-    print("Qwen3-1.7B test ends.")
+    ue.run_qwen3(prefill_seq=prefill_seq)
 
 if __name__ == "__main__":
     main()

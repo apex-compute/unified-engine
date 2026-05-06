@@ -20,6 +20,7 @@
   "model": {
     "max_context_size": 2048,
     "end_of_turn_token_id": 151645,
+    "prefill_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
     "decoder_seq_len_buckets": [
       256,
       512,
@@ -38,7 +39,9 @@
     "hf_model_dir": "qwen3_1.7b_bin/Qwen3-1.7B",
     "hf_model_repo": "Qwen/Qwen3-1.7B",
     "decoder_program_bin": "qwen3_1.7b_bin/decoder_program.bin",
-    "decoder_program_meta": "qwen3_1.7b_bin/decoder_program.json"
+    "decoder_program_meta": "qwen3_1.7b_bin/decoder_program.json",
+    "instruction_bin": "qwen3_1.7b_bin/qwen3_instruction.bin",
+    "instruction_meta": "qwen3_1.7b_bin/qwen3_instruction.json"
   },
   "default_prefill_tokens": [
     151644,
