@@ -523,14 +523,15 @@ class MobileSAM_UE(UnifiedEngine):
         dense_t     : (4096, 256)   — dense prompt (no_mask_embed broadcast)
     """
 
-    def __init__(self, checkpoint_path: str):
+    def __init__(self, checkpoint_path: str | None = None):
         super().__init__()
         self.init_unified_engine()
-        sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        self.weight_init(sd)
-        self._enc_init(sd)
-        del sd
-        self.tensor_init()
+        if checkpoint_path is not None:
+            sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            self.weight_init(sd)
+            self._enc_init(sd)
+            del sd
+            self.tensor_init()
 
     # ------------------------------------------------------------------
     # DRAM helpers
@@ -2560,6 +2561,67 @@ class MobileSAM_UE(UnifiedEngine):
     # Binary dump (for run_from_bin)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Load from bin (mirror of MobileSAM_UE_Run)
+    # ------------------------------------------------------------------
+
+    def load_params(self, bin_dir: str = BIN_DIR) -> bool:
+        """Load params DRAM from bin. Returns True if loaded."""
+        bin_path = os.path.join(bin_dir, "params.bin")
+        meta_path = os.path.join(bin_dir, "params.json")
+        if not os.path.exists(bin_path) or not os.path.exists(meta_path):
+            return False
+        with open(meta_path) as f:
+            meta = json.load(f)
+        total = meta["size"]
+        CHUNK = 1 * 1024 * 1024
+        with open(bin_path, "rb") as f:
+            offset = 0
+            while offset < total:
+                data = f.read(min(CHUNK, total - offset))
+                self.dma_write(DMA_DEVICE_H2C, self._params_dram_base + offset, data, len(data))
+                offset += len(data)
+        self.allocate_params_dram(total)
+        _original_print(f"  Params: {total / 1024**2:.1f} MB from bin")
+        return True
+
+    def load_programs(self, bin_dir: str = BIN_DIR) -> dict | None:
+        """Load compiled programs from bin. Returns dict of {name: dram_addr} or None."""
+        bin_path = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
+        if not os.path.exists(bin_path) or not os.path.exists(meta_path):
+            return None
+        with open(meta_path) as f:
+            manifest = json.load(f)
+        with open(bin_path, "rb") as f:
+            all_bytes = f.read()
+        addrs = {}
+        for name, meta in manifest["programs"].items():
+            data = all_bytes[meta["offset"]:meta["offset"] + meta["size"]]
+            addr = self.get_program_dram_addr()
+            self.dma_write(DMA_DEVICE_H2C, addr, data, len(data))
+            self.allocate_program_dram(len(data))
+            addrs[name] = addr
+        _original_print(f"  Programs: {len(all_bytes)} bytes from bin")
+        return addrs
+
+    def _restore_tensor_addrs(self, meta: dict) -> None:
+        """Restore tensor DRAM addresses from saved params.json metadata."""
+        tb = self._tensor_dram_base
+        tensors = meta["tensors"]
+        sizes = meta["tensor_sizes"]
+        self.PE_IN_DRAM     = tb + tensors["pe_in"]
+        self.TOKENS_DRAM    = tb + tensors["tokens"]
+        self.TOKENS_PE_DRAM = tb + tensors["tokens_pe"]
+        self.SRC_DRAM       = tb + tensors["src"]
+        self.KEY_PE_DRAM    = tb + tensors["key_pe"]
+        self.NECK_OUT_DRAM  = tb + tensors["neck_out"]
+        self.MASK_OUT       = tb + tensors["mask_out"]
+        self.IOU_OUT        = tb + tensors["iou_out"]
+        max_end = max(tb + tensors[k] + sizes[k] for k in tensors)
+        if max_end > self._tensor_dram_addr:
+            self._tensor_dram_addr = max_end
+
     def dump_params_to_file(self, bin_dir: str):
         """Dump params + tensor layout to bin_dir/params.bin + params.json."""
         os.makedirs(bin_dir, exist_ok=True)
@@ -3084,40 +3146,14 @@ def main():
                   and os.path.exists(os.path.join(BIN_DIR, "programs.bin")))
     if bins_exist:
         _original_print("\nLoading from pre-compiled bins …")
-        from mobilesam_run_from_bin import MobileSAM_UE_Run
-        ue = MobileSAM_UE_Run()
-        ue.load_params()
+        ue = MobileSAM_UE()
+        ue.load_params(BIN_DIR)
         with open(os.path.join(BIN_DIR, "params.json")) as f:
             _pm = json.load(f)
-        _tb = ue._tensor_dram_base
-        # Set all tensor attrs the rest of the flow expects
-        # (some names omit the _DRAM suffix, handle those explicitly)
-        for name, ofs in _pm["tensors"].items():
-            attr = "MASK_OUT" if name == "mask_out" else \
-                   "IOU_OUT" if name == "iou_out" else \
-                   name.upper() + "_DRAM"
-            setattr(ue, attr, _tb + ofs)
-        ue.pe_in_dram = ue.PE_IN_DRAM
-        progs = ue.load_programs()
+        ue._restore_tensor_addrs(_pm)
+        progs = ue.load_programs(BIN_DIR)
         enc_prog = progs["encoder"]
         dec_prog = progs["decoder"]
-        # Stitch on the decoder interface methods the rest of the flow expects
-        import types
-        def _preload(self, image_emb_t, image_pe_t, dense_t):
-            src_t = (image_emb_t + dense_t).to(torch.bfloat16).contiguous()
-            self.dma_to_accelerator_memory(self.SRC_DRAM, src_t.flatten())
-            self.dma_to_accelerator_memory(self.KEY_PE_DRAM, image_pe_t.flatten())
-        def _run_dec(self, prog_addr, tokens_t, timeout=120.0):
-            toks = tokens_t.to(torch.bfloat16).contiguous()
-            self.dma_to_accelerator_memory(self.TOKENS_DRAM, toks.flatten())
-            self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, toks.flatten())
-            self.start_execute_from_dram(prog_addr)
-            self.wait_queue(timeout)
-            masks = self.dma_from_accelerator_memory(self.MASK_OUT, (4, 256*256)).float().reshape(4,256,256)
-            iou = self.dma_from_accelerator_memory(self.IOU_OUT, (64,)).float()[:4]
-            return masks, iou
-        ue.preload_decoder_image = types.MethodType(_preload, ue)
-        ue.run_decoder_tokens = types.MethodType(_run_dec, ue)
         _original_print("  Loaded from bins.")
     else:
         # IMPORTANT: create both UE objects first (params+tensors alloc), THEN compile.
