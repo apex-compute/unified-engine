@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""MobileSAM inference from pre-compiled bin files. Run mobilesam_test.py --point to generate bins first.
+"""MobileSAM inference from pre-compiled bin files.
 
-Usage:
-  python mobilesam_run_from_bin.py --point 512 512
-  python mobilesam_run_from_bin.py --point 512 512 --dev xdma0
+Compile first (auto-skipped if already compiled):
+    python mobilesam_test.py
 
-Save phase (run from mobilesam_test.py): see dump_bins() in that file.
+Then run:
+    python mobilesam_run_from_bin.py --point 512 512
 """
 import argparse
 import json
 import math
 import os
 import sys
+import threading
 import time
 
 import numpy as np
 import torch
 from PIL import Image as _PIL_Image
-from huggingface_hub import hf_hub_download
 
 _original_print = print
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
+sys.path.insert(0, SCRIPT_DIR)
 
 import user_dma_core
 from user_dma_core import (
@@ -186,26 +187,26 @@ def main():
     parser = argparse.ArgumentParser(description="MobileSAM inference from pre-compiled bins")
     parser.add_argument("--point", type=int, nargs=2, metavar=("X", "Y"), default=[512, 512],
                         help="Single-point inference at (x, y) (default: 512 512)")
+    parser.add_argument("--image", type=str, default=None, help="Path to input image")
     parser.add_argument("--dev", type=str, default="xdma0")
     parser.add_argument("--cycle", type=float, default=None)
     args = parser.parse_args()
 
-    # Check bins exist
-    missing = []
-    for f in ("params.bin", "programs.bin"):
-        if not os.path.exists(os.path.join(BIN_DIR, f)):
-            missing.append(f)
+    missing = [f for f in ("params.bin", "params.json", "programs.bin", "programs.json")
+               if not os.path.exists(os.path.join(BIN_DIR, f))]
     if missing:
-        _original_print("Missing bin files. Run mobilesam_test.py first to generate them.")
+        _original_print("Missing bin files (run python mobilesam_test.py first):")
         for f in missing:
             _original_print(f"  {os.path.join(BIN_DIR, f)}")
         return
 
-    # Load manifests
-    with open(os.path.join(BIN_DIR, "programs.json")) as f:
-        prog_meta = json.load(f)
-    with open(os.path.join(BIN_DIR, "params.json")) as f:
-        param_meta = json.load(f)
+    # Download checkpoint if needed (for prompt encoding — CPU-side only)
+    ckpt_path = os.path.join(BIN_DIR, "mobile_sam.pt")
+    if not os.path.exists(ckpt_path):
+        from huggingface_hub import hf_hub_download
+        _original_print("  Downloading mobile_sam.pt …")
+        ckpt_path = hf_hub_download(repo_id="apexcompute/mobile-sam",
+                                    filename="mobile_sam.pt", local_dir=BIN_DIR)
 
     set_dma_device(args.dev)
     # Refresh local bindings shadowed at import time so DMA goes to the right device
@@ -227,13 +228,18 @@ def main():
     img_arr = torch.from_numpy(np.array(img)).float().permute(2, 0, 1) / 255.0
     image_t = img_arr.unsqueeze(0).bfloat16()
 
-    _original_print(f"MobileSAM on {args.dev} (from pre-compiled bins)\n")
+    set_dma_device(args.dev)
+    if args.cycle is not None:
+        user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
 
-    # Build engine
+    _original_print(f"MobileSAM on {args.dev} (from pre-compiled bins)")
+
     engine = MobileSAM_UE_Run(clock_period_ns=args.cycle)
     engine.load_params()
 
-    # Allocate tensor DRAM from saved manifest — use absolute offsets from compilation
+    with open(os.path.join(BIN_DIR, "params.json")) as f:
+        param_meta = json.load(f)
+
     tensor_addrs = {}
     max_end = 0
     for name, ofs in param_meta["tensors"].items():
@@ -242,83 +248,67 @@ def main():
         end = addr + param_meta["tensor_sizes"][name]
         if end > max_end:
             max_end = end
-    # Advance the tensor allocator to protect the region
     if max_end > engine._tensor_dram_addr:
         engine._tensor_dram_addr = max_end
-    engine.pe_in_dram = tensor_addrs.get("pe_in")
+    engine.pe_in_dram = tensor_addrs["pe_in"]
 
-    # Load programs
     progs = engine.load_programs()
     if progs is None:
-        _original_print("Failed to load programs")
+        _original_print("Failed to load programs.")
         return
-    enc_prog = progs.get("encoder")
-    dec_prog = progs.get("decoder")
-    if enc_prog is None or dec_prog is None:
-        _original_print("Missing encoder or decoder program in manifest")
-        return
+    enc_prog = progs["encoder"]
+    dec_prog = progs["decoder"]
+
+    # Build prompt inputs from raw checkpoint weights (no full model needed)
+    _sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    _gauss = _sd["prompt_encoder.pe_layer.positional_encoding_gaussian_matrix"]
+    dense_t = _sd["prompt_encoder.no_mask_embed.weight"].reshape(1, DEC_DIM).expand(GA, -1).bfloat16().contiguous()
+    _tmp = torch.ones(IMG_H, IMG_W)
+    _gy = (_tmp.cumsum(dim=0) - 0.5) / IMG_H
+    _gx = (_tmp.cumsum(dim=1) - 0.5) / IMG_W
+    _coords = 2 * torch.stack([_gx, _gy], dim=-1) - 1
+    _pe_raw = 2 * math.pi * (_coords @ _gauss)
+    _pe = torch.cat([torch.sin(_pe_raw), torch.cos(_pe_raw)], dim=-1)
+    image_pe_t = _pe.permute(2, 0, 1)[None][0].permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
 
     px, py = args.point
-    _original_print(f"Single-point inference at ({px}, {py})")
+    _original_print(f"  Point: ({px}, {py})")
 
-    # Build sparse prompt tokens
-    # We need a MobileSAM prompt encoder — load from HF checkpoint
-    from mobilesam_test import MobileSAM, load_weights, _assemble_tokens
-    hf_repo = "apexcompute/mobile-sam"
-    hf_filename = "mobile_sam.pt"
-    ckpt_path = os.path.join(BIN_DIR, hf_filename)
-    if not os.path.exists(ckpt_path):
-        _original_print(f"  Downloading HF weights {hf_repo}/{hf_filename} …")
-        ckpt_path = hf_hub_download(repo_id=hf_repo, filename=hf_filename, local_dir=BIN_DIR)
-
-    # CPU reference for sparse prompt encoding
-    raw = MobileSAM().bfloat16().eval()
-    load_weights(raw, ckpt_path)
-
-    with torch.no_grad():
-        coord = torch.tensor([[float(px), float(py)]])
-        pts = coord.reshape(1, 1, 2).bfloat16()
-        lbs = torch.ones(1, 1, dtype=torch.long)
-        sparse, _ = raw.prompt_encoder(pts, lbs)
-        sparse_tok = sparse[0].bfloat16()
-        image_pe_t = raw.pe_layer.forward_grid((IMG_H, IMG_W))[0] \
-                        .permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
-        dense_t = raw.prompt_encoder.no_mask_embed.weight \
-                      .reshape(1, DEC_DIM).expand(GA, -1).bfloat16().contiguous()
-
+    from mobilesam_test import _amg_encode_point, _assemble_tokens
+    pw = {
+        "gauss_matrix": _gauss,
+        "not_a_point": _sd["prompt_encoder.not_a_point_embed.weight"],
+        "point_1": _sd["prompt_encoder.point_embeddings.1.weight"],
+    }
+    coord = torch.tensor([[float(px), float(py)]])
+    sparse_tok = _amg_encode_point(coord, pw)
     tokens_t = _assemble_tokens(ckpt_path, sparse_tok)
+    del _sd
 
-    # CPU reference
-    _original_print("  Running CPU reference …")
-    with torch.no_grad():
-        cpu_enc_out = raw.image_encoder(image_t.bfloat16())
-        cpu_img_emb = cpu_enc_out[0].permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
-        masks_cpu, iou_cpu = raw.mask_decoder(
-            cpu_img_emb.reshape(1, IMG_H, IMG_W, DEC_DIM).permute(0, 3, 1, 2),
-            image_pe_t.reshape(1, IMG_H, IMG_W, DEC_DIM).permute(0, 3, 1, 2),
-            sparse, dense_t.reshape(1, IMG_H, IMG_W, DEC_DIM).permute(0, 3, 1, 2))
-        masks_cpu = masks_cpu[0]; iou_cpu = iou_cpu[0]
-    best_cpu = iou_cpu.argmax().item()
-    _original_print(f"  CPU IOU: {[round(x,4) for x in iou_cpu.tolist()]}  best={best_cpu}")
+    def _progress_timer(label, start_time, stop_event):
+        while not stop_event.wait(1.0):
+            _original_print(f"\r  {label} ({time.perf_counter() - start_time:.0f}s)", end="", flush=True)
 
-    # HW encoder
     t_enc = time.perf_counter()
+    stop = threading.Event()
+    timer = threading.Thread(target=_progress_timer, args=("Encoder running…", t_enc, stop), daemon=True)
+    timer.start()
     engine.execute_encoder(enc_prog, image_t)
-    _original_print(f"  HW encoder: {time.perf_counter() - t_enc:.2f}s")
-    image_emb_t = engine.dma_from_accelerator_memory(
-        tensor_addrs["neck_out"], (GA, DEC_DIM)).bfloat16()
+    stop.set(); timer.join()
+    _original_print(f"\r  HW encoder: {time.perf_counter() - t_enc:.2f}s")
+    image_emb_t = engine.dma_from_accelerator_memory(tensor_addrs["neck_out"], (GA, DEC_DIM)).bfloat16()
 
-    # HW decoder
     t_dec = time.perf_counter()
-    masks_hw, iou_hw = engine.run_decoder(
-        dec_prog, tokens_t, image_emb_t, image_pe_t, dense_t, tensor_addrs)
-    _original_print(f"  HW decoder: {time.perf_counter() - t_dec:.3f}s")
+    stop = threading.Event()
+    timer = threading.Thread(target=_progress_timer, args=("Decoder running…", t_dec, stop), daemon=True)
+    timer.start()
+    masks_hw, iou_hw = engine.run_decoder(dec_prog, tokens_t, image_emb_t, image_pe_t, dense_t, tensor_addrs)
+    stop.set(); timer.join()
+    _original_print(f"\r  HW decoder: {time.perf_counter() - t_dec:.3f}s")
     best = iou_hw.argmax().item()
     _original_print(f"  HW  IOU: {[round(x,4) for x in iou_hw.tolist()]}  best={best}")
 
-    # Save overlay images
     def _save_overlay(mask_256, path, color):
-        from PIL import ImageDraw
         mask_1024 = np.array(_PIL_Image.fromarray(mask_256).resize((1024, 1024), _PIL_Image.NEAREST))
         img_np = image_t[0].float().permute(1, 2, 0).numpy()
         img_np = ((img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-6) * 255).astype(np.uint8)
@@ -333,10 +323,7 @@ def main():
         _PIL_Image.fromarray(overlay).save(path)
         _original_print(f"  Saved {path}")
 
-    _save_overlay((masks_cpu[best_cpu] > _MASK_THRESHOLD).cpu().numpy(),
-                   "mask_point_cpu.png", [0, 200, 255])
-    _save_overlay((masks_hw[best] > _MASK_THRESHOLD).cpu().numpy(),
-                   "mask_point.png", [0, 255, 100])
+    _save_overlay((masks_hw[best] > _MASK_THRESHOLD).cpu().numpy(), "mask_point.png", [0, 255, 100])
 
 
 if __name__ == "__main__":
