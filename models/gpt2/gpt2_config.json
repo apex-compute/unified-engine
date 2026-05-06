@@ -19,6 +19,7 @@
   "model": {
     "max_context_size": 1024,
     "end_of_turn_token_id": 50256,
+    "prefill_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
     "decoder_seq_len_buckets": [
       128,
       256,
@@ -36,7 +37,9 @@
     "hf_model_dir": "gpt2_bin/gpt2",
     "hf_model_repo": "openai-community/gpt2",
     "decoder_program_bin": "gpt2_bin/decoder_program.bin",
-    "decoder_program_meta": "gpt2_bin/decoder_program.json"
+    "decoder_program_meta": "gpt2_bin/decoder_program.json",
+    "instruction_bin": "gpt2_bin/gpt2_instruction.bin",
+    "instruction_meta": "gpt2_bin/gpt2_instruction.json"
   },
   "default_prefill_tokens": [
     464,
