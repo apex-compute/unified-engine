@@ -183,6 +183,41 @@ class MobileSAM_UE_Run(UnifiedEngine):
         return masks_hw, iou_hw
 
 
+def _amg_encode_point(coord_xy: torch.Tensor, pw: dict) -> torch.Tensor:
+    """Build (2, 256) bf16 tokens for one foreground point."""
+    pts = coord_xy.reshape(1, 1, 2).float() + 0.5
+    lbs = torch.ones(1, 1, dtype=torch.long)
+    pad_pt = torch.zeros(1, 1, 2)
+    pad_lb = -torch.ones(1, 1, dtype=torch.long)
+    pts = torch.cat([pts, pad_pt], dim=1)
+    lbs = torch.cat([lbs, pad_lb], dim=1)
+    coords = pts.clone()
+    coords[:, :, 0] /= 1024.0
+    coords[:, :, 1] /= 1024.0
+    coords = 2 * coords - 1
+    pe = coords @ pw["gauss_matrix"]
+    pe = 2 * math.pi * pe
+    point_embedding = torch.cat([torch.sin(pe), torch.cos(pe)], dim=-1)
+    nap = (lbs == -1)[0]
+    fg  = (lbs == 1)[0]
+    point_embedding[:, nap, :] = 0.0
+    point_embedding[:, nap, :] += pw["not_a_point"]
+    point_embedding[:, fg, :]  += pw["point_1"]
+    return point_embedding[0].bfloat16()
+
+
+def _assemble_tokens(checkpoint_path: str, sparse_t: torch.Tensor) -> torch.Tensor:
+    """Build (NT_PAD, 256) padded token tensor from iou+mask weights + sparse prompt."""
+    sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    iou_tok   = sd["mask_decoder.iou_token.weight"].to(torch.bfloat16)
+    mask_toks = sd["mask_decoder.mask_tokens.weight"].to(torch.bfloat16)
+    tokens = torch.zeros(NT_PAD, DEC_DIM, dtype=torch.bfloat16)
+    tokens[0]   = iou_tok[0]
+    tokens[1:5] = mask_toks
+    tokens[5:7] = sparse_t.to(torch.bfloat16).reshape(2, DEC_DIM)
+    return tokens
+
+
 def main():
     parser = argparse.ArgumentParser(description="MobileSAM inference from pre-compiled bins")
     parser.add_argument("--point", type=int, nargs=2, metavar=("X", "Y"), default=[512, 512],
@@ -260,7 +295,6 @@ def main():
     px, py = args.point
     _original_print(f"  Point: ({px}, {py})")
 
-    from mobilesam_test import _amg_encode_point, _assemble_tokens
     pw = {
         "gauss_matrix": _gauss,
         "not_a_point": _sd["prompt_encoder.not_a_point_embed.weight"],
@@ -309,7 +343,8 @@ def main():
         _PIL_Image.fromarray(overlay).save(path)
         _original_print(f"  Saved {path}")
 
-    _save_overlay((masks_hw[best] > _MASK_THRESHOLD).cpu().numpy(), "mask_point.png", [0, 255, 100])
+    out_path = os.path.join(SCRIPT_DIR, "mask_point.png")
+    _save_overlay((masks_hw[best] > _MASK_THRESHOLD).cpu().numpy(), out_path, [0, 255, 100])
 
 
 if __name__ == "__main__":
