@@ -3837,14 +3837,14 @@ if __name__ == "__main__":
     atexit.register(write_test_summary, "user_hw_test_summary.md")
 
     software_reset_test()
-    # isa_rela_loop_test()
-    # isa_abs_loop_test()
-    # test_ue_int_reg_read()
-    # fmax_test()
-    # for packing_mode in [16, 32, 48, 64]:
-    #     packing_test(packing_mode=packing_mode)
-    # padding_zero_test()
-    # slicing_test()
+    isa_rela_loop_test()
+    isa_abs_loop_test()
+    test_ue_int_reg_read()
+    fmax_test()
+    for packing_mode in [16, 32, 48, 64]:
+        packing_test(packing_mode=packing_mode)
+    padding_zero_test()
+    slicing_test()
     quantized_fp4_test()
     if4_if8_tests()
     if4_if8_mixed_sign_test()
@@ -3856,69 +3856,69 @@ if __name__ == "__main__":
     dequantize_test(TYPE.IF8, int_variant=False)
     tq4_dequantize_test()
     tq4_dot_product_test(K=64, N=64)
-    # tq4_dot_product_test(K=128, N=128)
-    # # Additional NEW TQ4 tests (variants) without changing the baseline tests above.
-    # tq4_dequantize_variant_tests()
-    # tq4_dot_product_variant_tests()
-    # tq4_dot_product_onehot_oracle_tests()
-    # tq4_codebook_reload_tests()
+    tq4_dot_product_test(K=128, N=128)
+    # Additional NEW TQ4 tests (variants) without changing the baseline tests above.
+    tq4_dequantize_variant_tests()
+    tq4_dot_product_variant_tests()
+    tq4_dot_product_onehot_oracle_tests()
+    tq4_codebook_reload_tests()
 
-    # matmat_mul_non_aligned_writeback_test()
-    # rope_core_dram_test(M=4, N=256)
-    # bf16_permute_test(dim_0=144, dim_1=48, dim_2=64)
-    # patching_test()
-    # dram_read_write_speed_test()
-    # mix_of_broadcast_eltwise_add_eltwise_mul_core_test()
-    # eltwise_sub_core_test()
-    # bf16_transpose_test(M=1024, N=512)
-    # # Per-call snr_threshold_db tightens the floor where we have headroom
-    # # (observed ~50-55 dB on plain matmul, ~46-47 dB on softmax) so silent
-    # # SNR regressions trip the assert instead of slipping under the legacy
-    # # 40 dB floor.
-    # matmat_mul_test(M=64, K=6912, N=64, snr_threshold_db=48.0)
-    # matmat_mul_test(M=64, K=6912, N=64, use_pbi=True, snr_threshold_db=48.0)
-    # matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True, snr_threshold_db=44.0)
-    # matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True, use_pbi=True, snr_threshold_db=44.0)
-    # matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True, snr_threshold_db=52.0)
-    # matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True, use_pbi=True, snr_threshold_db=52.0)
-    # matmat_mul_test(M=1024, K=768, N=512, clamp_enable=True, snr_threshold_db=52.0)
-    # matmat_mul_test(M=1024, K=768, N=512, log_enable=True, snr_threshold_db=52.0)
-    # matmat_mul_test(M=1984, K=1024, N=384, softmax_enable=True, debug_fmax=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
-    # matmat_mul_test(M=1984, K=1024, N=384, softmax_enable=True, debug_fmax=True, use_pbi=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
+    matmat_mul_non_aligned_writeback_test()
+    rope_core_dram_test(M=4, N=256)
+    bf16_permute_test(dim_0=144, dim_1=48, dim_2=64)
+    patching_test()
+    dram_read_write_speed_test()
+    mix_of_broadcast_eltwise_add_eltwise_mul_core_test()
+    eltwise_sub_core_test()
+    bf16_transpose_test(M=1024, N=512)
+    # Per-call snr_threshold_db tightens the floor where we have headroom
+    # (observed ~50-55 dB on plain matmul, ~46-47 dB on softmax) so silent
+    # SNR regressions trip the assert instead of slipping under the legacy
+    # 40 dB floor.
+    matmat_mul_test(M=64, K=6912, N=64, snr_threshold_db=48.0)
+    matmat_mul_test(M=64, K=6912, N=64, use_pbi=True, snr_threshold_db=48.0)
+    matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True, snr_threshold_db=44.0)
+    matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True, use_pbi=True, snr_threshold_db=44.0)
+    matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True, snr_threshold_db=52.0)
+    matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True, use_pbi=True, snr_threshold_db=52.0)
+    matmat_mul_test(M=1024, K=768, N=512, clamp_enable=True, snr_threshold_db=52.0)
+    matmat_mul_test(M=1024, K=768, N=512, log_enable=True, snr_threshold_db=52.0)
+    matmat_mul_test(M=1984, K=1024, N=384, softmax_enable=True, debug_fmax=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
+    matmat_mul_test(M=1984, K=1024, N=384, softmax_enable=True, debug_fmax=True, use_pbi=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
 
-    # # --- Wide-variance softmax stress: exercises exp + bf20 adder tree ------
-    # # The post-matmul pre-softmax values span ~N(0, input_scale^2). Larger
-    # # scales push exp() outputs across many orders of magnitude, which stresses
-    # # the denominator reduction (adder tree) dynamic range and the fmax-based
-    # # numerical-stability path. Reference stays numerically stable because
-    # # torch.softmax internally subtracts the row max.
-    # #
-    # # SNR thresholds are scale-specific: as input_scale grows, the
-    # # max-min span of (a @ b.T) grows linearly in scale, so the bf20
-    # # adder tree retains progressively fewer effective bits. We set
-    # # thresholds ~3 dB below empirically observed values so the tests
-    # # still catch regressions but tolerate the inherent dynamic-range loss.
-    # wide_variance_snr_floors = {
-    #     2.0: 42.0,   # observed ~44.5 dB
-    #     4.0: 38.0,   # observed ~41.0 dB
-    #     8.0: 28.0,   # estimated; scale doubling ~ -6 dB SNR
-    #     16.0: 18.0,  # adder tree near saturation
-    # }
-    # for scale, snr_floor in wide_variance_snr_floors.items():
-    #     matmat_mul_test(M=512, K=512, N=384, softmax_enable=True,
-    #                     input_scale=scale, snr_threshold_db=snr_floor)
-    # # Pair wide variance with debug_fmax so fmax SNR is also validated.
-    # # fmax itself is exact (a row max) so fmax SNR stays high even at
-    # # large scales — keep that floor tight at 44 dB.
-    # matmat_mul_test(M=1024, K=1024, N=512, softmax_enable=True, debug_fmax=True,
-    #                 input_scale=8.0, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
-    # matmat_mul_test(M=1024, K=1024, N=512, softmax_enable=True, debug_fmax=True,
-    #                 input_scale=8.0, use_pbi=True, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
-    # # Tall/narrow and short/wide variants to sweep different M/N tile shapes
-    # # through the wide-variance exp path.
-    # matmat_mul_test(M=2048, K=256, N=128, softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
-    # matmat_mul_test(M=128, K=256, N=2048, softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
-    # matmat_mul_test(M=512, K=1024, N=1024, softmax_enable=True, input_scale=12.0, use_pbi=True, snr_threshold_db=22.0)
+    # --- Wide-variance softmax stress: exercises exp + bf20 adder tree ------
+    # The post-matmul pre-softmax values span ~N(0, input_scale^2). Larger
+    # scales push exp() outputs across many orders of magnitude, which stresses
+    # the denominator reduction (adder tree) dynamic range and the fmax-based
+    # numerical-stability path. Reference stays numerically stable because
+    # torch.softmax internally subtracts the row max.
+    #
+    # SNR thresholds are scale-specific: as input_scale grows, the
+    # max-min span of (a @ b.T) grows linearly in scale, so the bf20
+    # adder tree retains progressively fewer effective bits. We set
+    # thresholds ~3 dB below empirically observed values so the tests
+    # still catch regressions but tolerate the inherent dynamic-range loss.
+    wide_variance_snr_floors = {
+        2.0: 42.0,   # observed ~44.5 dB
+        4.0: 38.0,   # observed ~41.0 dB
+        8.0: 28.0,   # estimated; scale doubling ~ -6 dB SNR
+        16.0: 18.0,  # adder tree near saturation
+    }
+    for scale, snr_floor in wide_variance_snr_floors.items():
+        matmat_mul_test(M=512, K=512, N=384, softmax_enable=True,
+                        input_scale=scale, snr_threshold_db=snr_floor)
+    # Pair wide variance with debug_fmax so fmax SNR is also validated.
+    # fmax itself is exact (a row max) so fmax SNR stays high even at
+    # large scales — keep that floor tight at 44 dB.
+    matmat_mul_test(M=1024, K=1024, N=512, softmax_enable=True, debug_fmax=True,
+                    input_scale=8.0, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
+    matmat_mul_test(M=1024, K=1024, N=512, softmax_enable=True, debug_fmax=True,
+                    input_scale=8.0, use_pbi=True, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
+    # Tall/narrow and short/wide variants to sweep different M/N tile shapes
+    # through the wide-variance exp path.
+    matmat_mul_test(M=2048, K=256, N=128, softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
+    matmat_mul_test(M=128, K=256, N=2048, softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
+    matmat_mul_test(M=512, K=1024, N=1024, softmax_enable=True, input_scale=12.0, use_pbi=True, snr_threshold_db=22.0)
 
     # Quant matmul regression — covers all four (data_type, int_variant)
     # combinations end-to-end through ue.quantize_weight + on-chip matmul.
@@ -3928,60 +3928,60 @@ if __name__ == "__main__":
     matmat_mul_quantized_weights_test(M=64, K=64, N=64, data_type=TYPE.IF8, int_variant=False)
     quantized_matmat_mul_test(M=64, K=64, N=64, data_type=TYPE.IF4, int_variant=True)
     quantized_matmat_mul_test(M=64, K=64, N=64, data_type=TYPE.IF8, int_variant=True)
-    # quantized_matmat_mul_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
-    # matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix")
-    # matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix", use_pbi=True)
-    # flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True)
-    # rms_norm_test(shape=(768, 1024))
-    # layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True)
+    quantized_matmat_mul_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
+    matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix")
+    matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix", use_pbi=True)
+    flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True)
+    rms_norm_test(shape=(768, 1024))
+    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True)
 
-    # # --- Additional coverage: extra dimension/feature combinations ---
-    # bf16_transpose_test(M=2048, N=2048)
-    # bf16_transpose_test(M=64, N=4096)
-    # rope_core_dram_test(M=8, N=512)
-    # rms_norm_test(shape=(2048, 2048))
-    # layer_norm_test(shape=(1024, 1024), gamma_enable=True)
-    # layer_norm_test(shape=(1024, 1024), beta_enable=True)
-    # bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
-    # matmat_mul_test(M=512, K=2048, N=2048)
-    # matmat_mul_test(M=128, K=4096, N=512, gelu_enable=True)
-    # matmat_mul_test(M=256, K=2048, N=1024, silu_enable=True)
-    # matmat_mul_test(M=512, K=1024, N=512, bias_enable=True, bias_mode="broadcast_N")
-    # matmat_mul_test(M=512, K=1024, N=512, bias_enable=True, bias_mode="full_matrix")
-    # matmat_mul_quantized_weights_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=True)
-    # matmat_mul_quantized_weights_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=False)
-    # quantized_matmat_mul_test(M=128, K=512, N=512, data_type=TYPE.IF4, int_variant=True, gelu_enable=True)
-    # flash_attention_test(head_dim=128, seq_len=1024)
-    # flash_attention_test(head_dim=64, seq_len=512, bias_enable=True)
+    # --- Additional coverage: extra dimension/feature combinations ---
+    bf16_transpose_test(M=2048, N=2048)
+    bf16_transpose_test(M=64, N=4096)
+    rope_core_dram_test(M=8, N=512)
+    rms_norm_test(shape=(2048, 2048))
+    layer_norm_test(shape=(1024, 1024), gamma_enable=True)
+    layer_norm_test(shape=(1024, 1024), beta_enable=True)
+    bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
+    matmat_mul_test(M=512, K=2048, N=2048)
+    matmat_mul_test(M=128, K=4096, N=512, gelu_enable=True)
+    matmat_mul_test(M=256, K=2048, N=1024, silu_enable=True)
+    matmat_mul_test(M=512, K=1024, N=512, bias_enable=True, bias_mode="broadcast_N")
+    matmat_mul_test(M=512, K=1024, N=512, bias_enable=True, bias_mode="full_matrix")
+    matmat_mul_quantized_weights_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=True)
+    matmat_mul_quantized_weights_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=False)
+    quantized_matmat_mul_test(M=128, K=512, N=512, data_type=TYPE.IF4, int_variant=True, gelu_enable=True)
+    flash_attention_test(head_dim=128, seq_len=1024)
+    flash_attention_test(head_dim=64, seq_len=512, bias_enable=True)
 
-    # # --- Multi-core / multi-engine tests disabled on rk board (PCIe CI) ---
-    # if args.device == 'kintex7':
-    #     matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, use_pbi=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True, use_pbi=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True, use_pbi=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True, use_pbi=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True, use_pbi=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, clamp_enable=True)
-    #     matmat_mul_two_cores_test(M=1920, K=768, N=2048, log_enable=True)
-    #     # Wide-variance softmax across two engines exercises per-row exp +
-    #     # bf20 adder tree reduction on both engines concurrently. Use scale-
-    #     # specific SNR floors mirroring the single-engine wide-variance set.
-    #     for scale, snr_floor in ((4.0, 38.0), (8.0, 28.0)):
-    #         matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True,
-    #                                   input_scale=scale, snr_threshold_db=snr_floor)
-    #         matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True,
-    #                                   input_scale=scale, use_pbi=True, snr_threshold_db=snr_floor)
+    # --- Multi-core / multi-engine tests disabled on rk board (PCIe CI) ---
+    if args.device == 'kintex7':
+        matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, use_pbi=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True, use_pbi=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True, use_pbi=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True, use_pbi=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True, use_pbi=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, clamp_enable=True)
+        matmat_mul_two_cores_test(M=1920, K=768, N=2048, log_enable=True)
+        # Wide-variance softmax across two engines exercises per-row exp +
+        # bf20 adder tree reduction on both engines concurrently. Use scale-
+        # specific SNR floors mirroring the single-engine wide-variance set.
+        for scale, snr_floor in ((4.0, 38.0), (8.0, 28.0)):
+            matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True,
+                                      input_scale=scale, snr_threshold_db=snr_floor)
+            matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True,
+                                      input_scale=scale, use_pbi=True, snr_threshold_db=snr_floor)
 
-    # # Alveo U50 only setup
-    # # matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
+    # Alveo U50 only setup
+    # matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
 
-    # print(f"[seed-check-end] bf16 samples after seed=0: {_seed_probe.tolist()}")
+    print(f"[seed-check-end] bf16 samples after seed=0: {_seed_probe.tolist()}")
 
     # for M in [64, 192, 4096]:
     #     for N in [64, 576, 1024]:
