@@ -1684,7 +1684,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             slave_prefill_flops = slave_prefill["flops"][bucket_idx]
 
         print(f"\n--- Starting prefill (seq_len={prefill_seq_len}, bucket {bucket_idx + 1}/{prefill_max_seq_len}) ---")
-        print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
+        prompt_text = self.tokenizer.decode(list(self.prefill_seq), skip_special_tokens=False)
+        print(f"Prompt ({len(self.prefill_seq)} tokens): {prompt_text!r}")
         timer = time.perf_counter()
         if slave_prefill_addr is not None:
             slave_engine.program_execute(slave_prefill_addr, timeout=0)
