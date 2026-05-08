@@ -29,6 +29,11 @@ from enum import IntEnum
 import torch
 import math
 
+# Codec module: single source of truth for INT4/FP4/IF4/INT8/FP8/IF8 quant
+# math. Same package directory as this driver -- assumes src/template/ is
+# on sys.path (the standard import path for the template).
+import quant_schemas
+
 # Register address definitions (matches andromeda.c)
 # User device base address (AXI-Lite BAR mapping)
 AXI_LITE_TRANSLATION_OFFSET = 0x00000000
@@ -6286,113 +6291,22 @@ class UnifiedEngine:
         gflops_ratio = num_flops / 1.28 / self.read_reg32(UE_LATENCY_COUNT_ADDR)
         return num_flops / (self.read_reg32(UE_LATENCY_COUNT_ADDR) * self._clock_period_ns), gflops_ratio
 
-    # Fixed FP8 E4M3FN lookup, indexed by byte code 0x00..0xFF. All 254
-    # finite values listed exactly (powers-of-two and 1/8-step fractions
-    # thereof; every entry is representable in bf16 without rounding).
-    # Codes 0x7F / 0xFF are NaN under E4M3FN and must never be emitted by
-    # quantization, so they're sentinels here (math.nan) and the snap-to-
-    # grid table built below filters them out. Negative half (0x80..0xFF)
-    # mirrors the positive half with 0x80 = -0.
-    _FP8_E4M3FN_VALUE_BY_CODE: Tuple[float, ...] = (
-        # 0x00..0x07  (positive subnormals, E=0)
-        0.0, 1/512, 2/512, 3/512, 4/512, 5/512, 6/512, 7/512,
-        # 0x08..0x0F  (E=1)
-        1.0/64, 1.125/64, 1.25/64, 1.375/64, 1.5/64, 1.625/64, 1.75/64, 1.875/64,
-        # 0x10..0x17  (E=2)
-        1.0/32, 1.125/32, 1.25/32, 1.375/32, 1.5/32, 1.625/32, 1.75/32, 1.875/32,
-        # 0x18..0x1F  (E=3)
-        1.0/16, 1.125/16, 1.25/16, 1.375/16, 1.5/16, 1.625/16, 1.75/16, 1.875/16,
-        # 0x20..0x27  (E=4)
-        1.0/8, 1.125/8, 1.25/8, 1.375/8, 1.5/8, 1.625/8, 1.75/8, 1.875/8,
-        # 0x28..0x2F  (E=5)
-        1.0/4, 1.125/4, 1.25/4, 1.375/4, 1.5/4, 1.625/4, 1.75/4, 1.875/4,
-        # 0x30..0x37  (E=6)
-        1.0/2, 1.125/2, 1.25/2, 1.375/2, 1.5/2, 1.625/2, 1.75/2, 1.875/2,
-        # 0x38..0x3F  (E=7, bias point: 1.0 .. 1.875)
-        1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875,
-        # 0x40..0x47  (E=8)
-        2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75,
-        # 0x48..0x4F  (E=9)
-        4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5,
-        # 0x50..0x57  (E=10)
-        8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
-        # 0x58..0x5F  (E=11)
-        16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 30.0,
-        # 0x60..0x67  (E=12)
-        32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0, 60.0,
-        # 0x68..0x6F  (E=13)
-        64.0, 72.0, 80.0, 88.0, 96.0, 104.0, 112.0, 120.0,
-        # 0x70..0x77  (E=14)
-        128.0, 144.0, 160.0, 176.0, 192.0, 208.0, 224.0, 240.0,
-        # 0x78..0x7F  (E=15; 0x7F = +NaN)
-        256.0, 288.0, 320.0, 352.0, 384.0, 416.0, 448.0, math.nan,
-        # 0x80..0x87  (negative subnormals, E=0)
-        -0.0, -1/512, -2/512, -3/512, -4/512, -5/512, -6/512, -7/512,
-        # 0x88..0x8F
-        -1.0/64, -1.125/64, -1.25/64, -1.375/64, -1.5/64, -1.625/64, -1.75/64, -1.875/64,
-        # 0x90..0x97
-        -1.0/32, -1.125/32, -1.25/32, -1.375/32, -1.5/32, -1.625/32, -1.75/32, -1.875/32,
-        # 0x98..0x9F
-        -1.0/16, -1.125/16, -1.25/16, -1.375/16, -1.5/16, -1.625/16, -1.75/16, -1.875/16,
-        # 0xA0..0xA7
-        -1.0/8, -1.125/8, -1.25/8, -1.375/8, -1.5/8, -1.625/8, -1.75/8, -1.875/8,
-        # 0xA8..0xAF
-        -1.0/4, -1.125/4, -1.25/4, -1.375/4, -1.5/4, -1.625/4, -1.75/4, -1.875/4,
-        # 0xB0..0xB7
-        -1.0/2, -1.125/2, -1.25/2, -1.375/2, -1.5/2, -1.625/2, -1.75/2, -1.875/2,
-        # 0xB8..0xBF
-        -1.0, -1.125, -1.25, -1.375, -1.5, -1.625, -1.75, -1.875,
-        # 0xC0..0xC7
-        -2.0, -2.25, -2.5, -2.75, -3.0, -3.25, -3.5, -3.75,
-        # 0xC8..0xCF
-        -4.0, -4.5, -5.0, -5.5, -6.0, -6.5, -7.0, -7.5,
-        # 0xD0..0xD7
-        -8.0, -9.0, -10.0, -11.0, -12.0, -13.0, -14.0, -15.0,
-        # 0xD8..0xDF
-        -16.0, -18.0, -20.0, -22.0, -24.0, -26.0, -28.0, -30.0,
-        # 0xE0..0xE7
-        -32.0, -36.0, -40.0, -44.0, -48.0, -52.0, -56.0, -60.0,
-        # 0xE8..0xEF
-        -64.0, -72.0, -80.0, -88.0, -96.0, -104.0, -112.0, -120.0,
-        # 0xF0..0xF7
-        -128.0, -144.0, -160.0, -176.0, -192.0, -208.0, -224.0, -240.0,
-        # 0xF8..0xFF  (0xFF = -NaN)
-        -256.0, -288.0, -320.0, -352.0, -384.0, -416.0, -448.0, math.nan,
-    )
+    # FP8 E4M3FN value table lives in template/quant_schemas.py
+    # (``_FP8_E4M3FN_VALUE_BY_CODE`` + ``_fp8_e4m3fn_value_code_table``).
+    # The codec module is the single source of truth; this driver no
+    # longer needs its own copy.
 
-    @classmethod
-    def _fp8_e4m3fn_value_code_table(cls, device=None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Materialize the FP8 E4M3FN snap-to-grid lookup as torch tensors.
-
-        Returns ``(values_t, codes_t)`` where ``values_t`` is a float32
-        tensor of the 254 finite FP8 E4M3FN values from
-        :attr:`_FP8_E4M3FN_VALUE_BY_CODE` and ``codes_t`` is the matching
-        uint8 tensor of byte codes. The +/-NaN entries at 0x7F / 0xFF are
-        filtered out so the table can be used directly for absmax
-        snap-to-grid quantization without ever emitting a NaN code.
-        """
-        values = [v for v in cls._FP8_E4M3FN_VALUE_BY_CODE if not math.isnan(v)]
-        codes = [c for c, v in enumerate(cls._FP8_E4M3FN_VALUE_BY_CODE) if not math.isnan(v)]
-        return (torch.tensor(values, dtype=torch.float32, device=device),
-                torch.tensor(codes, dtype=torch.uint8, device=device))
+    _HW_TYPE_TO_PRECISION = {"IF4": "if4", "IF8": "if8"}
 
     def quantize_weight(self,
                         weight: torch.Tensor,
                         N: int,
                         K: int,
                         data_type: TYPE,
-                        int_variant: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Quantize a bf16 weight matrix (N, K) with absmax quantization.
-
-        Width is selected by ``data_type`` (TYPE.IF4 -> 4-bit packed nibbles,
-        TYPE.IF8 -> 8-bit raw bytes). Within each width, the INT vs FP variant
-        is selected by ``int_variant`` and is communicated to the hardware via
-        the sign bit of the per-block bf16 scale: negative -> INT (two's
-        complement codes), positive -> FP (E2M1 / E4M3 codes). The hardware
-        always uses ``|scale|`` as the effective multiplier.
-        """
+                        int_variant: "bool | None" = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize bf16 (N, K) and DMA-write to params DRAM. Returns
+        (matrix_addr, scale_addr). ``int_variant`` is forwarded to
+        ``quant_schemas.quantize``: None=MixMSE, True=force INT, False=force FP."""
         assert data_type in (TYPE.IF4, TYPE.IF8), \
             f"data_type={data_type} must be one of TYPE.IF4, TYPE.IF8"
         if N % UE_VECTOR_SIZE != 0:
@@ -6401,122 +6315,41 @@ class UnifiedEngine:
             raise ValueError(f"K={K} must be a multiple of {UE_VECTOR_SIZE}")
         assert weight.dim() == 2, "Weight must be 2D"
         assert weight.dtype == torch.bfloat16, "Weight must be bfloat16"
-        assert weight.shape[0] == N and weight.shape[1] == K, f"Weight shape {weight.shape} must match ({N}, {K})"
+        assert weight.shape[0] == N and weight.shape[1] == K, \
+            f"Weight shape {weight.shape} must match ({N}, {K})"
 
-        matrix = weight.contiguous()  # (N, K)
-        matrix_flat = matrix.flatten()
-        num_elements = matrix_flat.numel()
-        num_blocks = (num_elements + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        precision = self._HW_TYPE_TO_PRECISION[data_type.name]
+        # Codec runs on CPU bf16 (quant_schemas pulls the tensor to CPU
+        # internally). Keeps the DMA-write side device-independent.
+        data_bytes, scale_bytes = quant_schemas.quantize(
+            precision, weight, block_size=UE_VECTOR_SIZE,
+            int_variant=int_variant)
+        num_data_bytes = len(data_bytes)
+        num_scale_bytes = len(scale_bytes)
 
-        fp4_values = torch.tensor([-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-                                    dtype=torch.bfloat16, device=matrix.device)
-        # FP8 E4M3FN code-to-value table (excludes NaN). Built once outside the
-        # per-block loop and only consulted on the IF8-FP path below.
-        fp8_values_t, fp8_codes_t = self._fp8_e4m3fn_value_code_table(matrix.device)
-        if data_type == TYPE.IF4:
-            if int_variant:
-                max_val_bf16 = torch.tensor(7.0, dtype=torch.bfloat16, device=matrix.device)
-                clamp_min, clamp_max = -8, 7
-            else:
-                max_val_bf16 = torch.tensor(6.0, dtype=torch.bfloat16, device=matrix.device)
-        else:  # TYPE.IF8
-            if int_variant:
-                max_val_bf16 = torch.tensor(127.0, dtype=torch.bfloat16, device=matrix.device)
-                clamp_min, clamp_max = -128, 127
-            else:
-                # FP8 E4M3 finite max (excluding NaN at 0x7F/0xFF).
-                max_val_bf16 = torch.tensor(448.0, dtype=torch.bfloat16, device=matrix.device)
+        # DMA layout: data first, then scale, contiguous in params DRAM.
+        quantized_matrix_dram_addr = self.get_params_dram_addr()
+        data_t = torch.frombuffer(bytearray(data_bytes), dtype=torch.uint8)
+        self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr,
+                       data_t, num_data_bytes)
+        scale_dram_addr = quantized_matrix_dram_addr + num_data_bytes
+        # bf16 scales are written as uint16 (the same bytes, just retyped).
+        scale_t = torch.frombuffer(bytearray(scale_bytes), dtype=torch.uint16)
+        self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scale_t, num_scale_bytes)
+        self.allocate_params_dram(num_data_bytes + num_scale_bytes)
 
-        quantized_int8 = torch.zeros(num_elements, dtype=torch.int8, device=matrix.device)
-        scales_bf16 = torch.zeros(num_blocks, dtype=torch.bfloat16, device=matrix.device)
-        for i in range(num_blocks):
-            start = i * UE_VECTOR_SIZE
-            end = min(start + UE_VECTOR_SIZE, num_elements)
-            block = matrix_flat[start:end]
-            block_bf16 = block.to(torch.bfloat16)
-            abs_block = block_bf16.abs()
-            max_abs = abs_block.max()
-            if float(max_abs.item()) == 0.0:
-                scale_bf16 = torch.tensor(1.0, dtype=torch.bfloat16, device=matrix.device)
-            else:
-                scale_bf16 = max_abs / max_val_bf16
-            scales_bf16[i] = scale_bf16
-            if float(max_abs.item()) == 0.0:
-                q_block = torch.zeros(end - start, dtype=torch.int8, device=matrix.device)
-            else:
-                scaled = block_bf16 / scale_bf16
-                if data_type == TYPE.IF4 and not int_variant:
-                    # FP4 E2M1: snap to the 16-entry value table.
-                    scaled_expanded = scaled.unsqueeze(-1)
-                    fp4_values_expanded = fp4_values.unsqueeze(0)
-                    distances = torch.abs(scaled_expanded - fp4_values_expanded)
-                    closest_indices = torch.argmin(distances, dim=1)
-                    fp4_codes = torch.tensor([
-                        0b1111, 0b1110, 0b1101, 0b1100, 0b1011, 0b1010, 0b1001, 0b1000,
-                        0b0000, 0b0001, 0b0010, 0b0011, 0b0100, 0b0101, 0b0110, 0b0111,
-                    ], dtype=torch.int8, device=matrix.device)
-                    q_block = fp4_codes[closest_indices]
-                elif data_type == TYPE.IF4 and int_variant:
-                    rounded = torch.round(scaled)
-                    clamped = rounded.clamp(clamp_min, clamp_max)
-                    q_block = clamped.to(torch.int8)
-                elif data_type == TYPE.IF8 and int_variant:
-                    rounded = torch.round(scaled)
-                    clamped = rounded.clamp(clamp_min, clamp_max)
-                    q_block = clamped.to(torch.int8)
-                else:
-                    # IF8 + FP path: snap to the FP8 E4M3FN finite-value
-                    # table and emit the matching byte code. The on-chip
-                    # fp8_to_bf19 module (Vivado/hdl/fp8_to_bf19.sv) decodes
-                    # the same byte to bf19 1:1, so the SW reference and HW
-                    # output match exactly for non-NaN codes.
-                    distances = torch.abs(scaled.to(torch.float32).unsqueeze(-1)
-                                          - fp8_values_t.unsqueeze(0))
-                    closest_indices = torch.argmin(distances, dim=-1)
-                    # uint8 byte code reinterpreted into the int8 storage
-                    # buffer (bit pattern is preserved; quantized_int8 is
-                    # later viewed as uint8 for the DMA write).
-                    q_block = fp8_codes_t[closest_indices].contiguous().view(torch.int8)
-            quantized_int8[start:end] = q_block
-
-        # Sign-bit encodes the INT vs FP variant for the hardware: negative
-        # scale -> INT path. Magnitude is the effective multiplier.
-        if int_variant:
-            scales_bf16 = -scales_bf16
-
-        if data_type == TYPE.IF8:
-            # IF8: send raw bytes (no packing)
-            quantized_bytes = quantized_int8.view(torch.uint8)  # reinterpret as uint8
-            num_bytes = num_elements
-            quantized_matrix_dram_addr = self.get_params_dram_addr()
-            scale_dram_addr = quantized_matrix_dram_addr + num_bytes
-            self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr, quantized_bytes, num_bytes)
-            self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
-            variant_str = "INT8" if int_variant else "FP8"
-            print(f"IF8 ({variant_str}): wrote {num_bytes} raw bytes + {num_blocks*2} scale bytes")
-            self.allocate_params_dram(num_bytes + num_blocks * 2)
+        width_str = "IF8" if data_type == TYPE.IF8 else "IF4"
+        if int_variant is True:
+            variant_str = "INT8" if data_type == TYPE.IF8 else "INT4"
+        elif int_variant is False:
+            variant_str = "FP8" if data_type == TYPE.IF8 else "FP4"
         else:
-            # IF4: pack two 4-bit codes per byte (low nibble first).
-            num_packed_bytes = (num_elements + 1) // 2
-            packed_int4 = torch.zeros(num_packed_bytes, dtype=torch.uint8, device=matrix.device)
-            for i in range(0, num_elements, 2):
-                byte_idx = i // 2
-                if i + 1 < num_elements:
-                    val1 = quantized_int8[i].item()
-                    val2 = quantized_int8[i + 1].item()
-                    packed_int4[byte_idx] = ((val2 & 0xF) << 4) | (val1 & 0xF)
-                else:
-                    val1 = quantized_int8[i].item()
-                    packed_int4[byte_idx] = val1 & 0xF
-            quantized_matrix_dram_addr = self.get_params_dram_addr()
-            scale_dram_addr = quantized_matrix_dram_addr + num_packed_bytes
-            self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr, packed_int4, num_packed_bytes)
-            self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
-            variant_str = "INT4" if int_variant else "FP4"
-            print(f"IF4 ({variant_str}): wrote {num_packed_bytes} packed bytes + {num_blocks*2} scale bytes")
-            self.allocate_params_dram(num_packed_bytes + num_blocks * 2)
-
-        print(f"Quantized matrix and scales written to DRAM at 0x{quantized_matrix_dram_addr:x} and 0x{scale_dram_addr:x}")
+            variant_str = "MixMSE"
+        storage_kind = "raw" if data_type == TYPE.IF8 else "packed"
+        print(f"{width_str} ({variant_str}): wrote {num_data_bytes} "
+              f"{storage_kind} bytes + {num_scale_bytes} scale bytes")
+        print(f"Quantized matrix and scales written to DRAM at "
+              f"0x{quantized_matrix_dram_addr:x} and 0x{scale_dram_addr:x}")
         return quantized_matrix_dram_addr, scale_dram_addr
 
     def quantize_weight_simulate(self,
@@ -6534,57 +6367,22 @@ class UnifiedEngine:
         the HW dequantize output for non-NaN codes (FP4 / FP8 lookup
         values fit losslessly in bf16; INT codes are integers).
 
-        ``data_type``: TYPE.IF4 or TYPE.IF8.
-        ``int_variant``: True selects the INT path (round-and-clamp);
-        False selects the FP path (snap to NVFP4 / FP8 E4M3FN grid).
+        ``int_variant``: same as ``quantize_weight`` (None=MixMSE, True/False=force INT/FP).
         """
         assert data_type in (TYPE.IF4, TYPE.IF8), \
             f"data_type={data_type} must be one of TYPE.IF4, TYPE.IF8"
         assert weight.dim() == 2, "Weight must be 2D"
         assert weight.dtype == torch.bfloat16, "Weight must be bfloat16"
 
-        matrix = weight.contiguous()
-        matrix_flat = matrix.flatten()
-        num_elements = matrix_flat.numel()
-        num_blocks = (num_elements + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-
-        if data_type == TYPE.IF4:
-            max_val = torch.tensor(7.0 if int_variant else 6.0,
-                                   dtype=torch.bfloat16, device=matrix.device)
-            fp_values = torch.tensor(
-                [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0,
-                  0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0],
-                dtype=torch.bfloat16, device=matrix.device)
-        else:  # TYPE.IF8
-            max_val = torch.tensor(127.0 if int_variant else 448.0,
-                                   dtype=torch.bfloat16, device=matrix.device)
-            if not int_variant:
-                fp8_values_t, _ = self._fp8_e4m3fn_value_code_table(matrix.device)
-
-        out_flat = torch.zeros(num_elements, dtype=torch.bfloat16, device=matrix.device)
-        for i in range(num_blocks):
-            start = i * UE_VECTOR_SIZE
-            end = min(start + UE_VECTOR_SIZE, num_elements)
-            block = matrix_flat[start:end]
-            max_abs = block.abs().max()
-            if float(max_abs.item()) == 0.0:
-                continue
-            scale_bf16 = (max_abs / max_val).to(torch.bfloat16)
-            scaled = block / scale_bf16
-            if data_type == TYPE.IF4 and not int_variant:
-                distances = torch.abs(scaled.unsqueeze(-1) - fp_values.unsqueeze(0))
-                dequant = fp_values[torch.argmin(distances, dim=-1)]
-            elif data_type == TYPE.IF4 and int_variant:
-                dequant = scaled.round().clamp(-8, 7).to(torch.bfloat16)
-            elif data_type == TYPE.IF8 and int_variant:
-                dequant = scaled.round().clamp(-128, 127).to(torch.bfloat16)
-            else:  # IF8 + FP
-                distances = torch.abs(scaled.to(torch.float32).unsqueeze(-1)
-                                      - fp8_values_t.unsqueeze(0))
-                dequant = fp8_values_t[torch.argmin(distances, dim=-1)].to(torch.bfloat16)
-            out_flat[start:end] = (dequant.to(torch.float32)
-                                   * float(scale_bf16.item())).to(torch.bfloat16)
-        return out_flat.reshape(matrix.shape)
+        precision = self._HW_TYPE_TO_PRECISION[data_type.name]
+        N, K = weight.shape
+        if K % UE_VECTOR_SIZE != 0:
+            raise ValueError(f"K={K} must be a multiple of {UE_VECTOR_SIZE}")
+        d, s = quant_schemas.quantize(precision, weight,
+                                      block_size=UE_VECTOR_SIZE,
+                                      int_variant=int_variant)
+        out_cpu = quant_schemas.dequant(precision, d, s, N, K, block_size=UE_VECTOR_SIZE)
+        return out_cpu.to(weight.device).reshape(weight.shape)
 
     @staticmethod
     def float_to_bf19(f: float) -> int:
