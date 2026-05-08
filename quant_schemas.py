@@ -216,17 +216,49 @@ def _expand_abs_scale(scale: torch.Tensor, block_size: int) -> torch.Tensor:
 def _snap_to_grid_argmin(scaled: torch.Tensor, values_t: torch.Tensor) -> torch.Tensor:
     """``scaled``: (num_blocks, block_size) bf16 or fp32.
     ``values_t``: (num_grid_values,) fp32. Returns LongTensor (num_blocks, block_size).
-    Memory cap: ``_SNAP_CHUNK_BLOCKS * block_size * num_grid_values * 4 bytes``."""
-    num_blocks, block_size = scaled.shape
-    num_vals = values_t.shape[0]
-    out = torch.empty((num_blocks, block_size), dtype=torch.long)
-    # ~512 MB cap per chunk: chunk = 512MB / (block_size * num_vals * 4 bytes)
-    chunk = max(1, (512 * 1024 * 1024) // (block_size * num_vals * 4))
-    for s in range(0, num_blocks, chunk):
-        e = min(s + chunk, num_blocks)
-        d = (scaled[s:e].float().unsqueeze(-1) - values_t).abs()
-        out[s:e] = d.argmin(dim=-1)
-    return out
+
+    Implementation: deduplicate then sort the codebook once, binary-search
+    each query's insertion point, and pick the nearest of the two adjacent
+    sorted entries. O(log V) per element vs O(V) brute-force argmin. The
+    monotonic codebook makes this lossless: the nearest neighbour is
+    provably one of the two adjacent sorted entries.
+
+    Deduplication handles the FP8 E4M3FN ±0 duplicate (code 0x00 = +0.0,
+    code 0x80 = -0.0): we keep the lowest-original-index copy of each
+    unique value, so the lookup matches ``torch.argmin``'s "lowest index"
+    tie-breaking convention. Result is byte-equal to the brute-force
+    version on real weights.
+    """
+    flat = scaled.float().reshape(-1)
+    # Deduplicate: for each unique value, keep the lowest original index.
+    # Iterating once at codec load time on a 254-entry codebook is trivial.
+    seen: dict = {}
+    keep: list = []
+    for i, v in enumerate(values_t.tolist()):
+        if v not in seen:
+            seen[v] = i
+            keep.append(i)
+    keep_idx = torch.tensor(keep, dtype=torch.long)
+    values_unique = values_t[keep_idx]
+
+    # Sort deduped codebook ascending; sort_idx maps sorted position -> dedup position.
+    values_sorted, sort_idx = torch.sort(values_unique)
+    n_vals = values_sorted.numel()
+
+    # Binary-search each query's insertion point (right=False: ties go to the left).
+    hi = torch.searchsorted(values_sorted, flat).clamp(max=n_vals - 1)
+    lo = (hi - 1).clamp(min=0)
+    d_hi = (values_sorted[hi] - flat).abs()
+    d_lo = (flat - values_sorted[lo]).abs()
+    dedup_lo = sort_idx[lo]
+    dedup_hi = sort_idx[hi]
+    # On exact distance ties, pick the lower deduped index (which corresponds
+    # to the lower original-codebook index since dedup keeps lowest first).
+    pick_lo = (d_lo < d_hi) | ((d_lo == d_hi) & (dedup_lo <= dedup_hi))
+    chosen_dedup = torch.where(pick_lo, dedup_lo, dedup_hi)
+    # Map dedup index back to the original codebook index.
+    out = keep_idx[chosen_dedup]
+    return out.view(scaled.shape).long()
 
 
 # ---------------------------------------------------------------------------
