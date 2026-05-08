@@ -1,23 +1,20 @@
 Run from bin files:
-
 SmolVLM2:
 python models/smolvlm2/smolvlm2_run_from_bin.py
 args:
 --image
 --prompt
-
 SWIN:
 python models/swin/swin_run_from_bin.py
 args:
 --image
-
 Mobilesam:
 python models/mobilesam/mobilesam_run_from_bin.py
 args:
-
-
+--image
+--point X Y
 Parakeet Test:
-
+python models/parakeet/parakeet_test.py
 DO NOT RUN ABOVE TEST BACK-TO-BACK, IT WILL HANG DEVICE!!!!
 * Run the below two commands and rerun above command.
 cd ~/Desktop/unified-engine/models/parakeet/parakeet_bin
