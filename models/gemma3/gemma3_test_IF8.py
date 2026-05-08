@@ -111,8 +111,8 @@ def _if4_to_if8_layout(cfg: dict) -> dict:
     filename gets an ``_if8`` suffix so an existing IF4 bin in the same
     directory is not picked up by mistake.
     """
-    def _is_data(key: str, r: dict) -> bool:
-        return key.endswith("_DATA") or r.get("type") == "int4"
+    def _is_data(key: str) -> bool:
+        return key.endswith("_DATA")
 
     regions = cfg.get("regions", {})
     nlr = cfg.get("non_layer_regions", {})
@@ -126,9 +126,8 @@ def _if4_to_if8_layout(cfg: dict) -> dict:
         cur = base
         for k in sorted_keys:
             r = regions[k]
-            if _is_data(k, r):
+            if _is_data(k):
                 r["size"] *= 2
-                r["type"] = "int8"
             r["offset"] = f"0x{cur:08X}"
             cur += r["size"]
         cfg["file_info"]["layer_size"] = cur - base
@@ -142,9 +141,8 @@ def _if4_to_if8_layout(cfg: dict) -> dict:
         cur = layer_block_end
         for k in sorted_nlr:
             r = nlr[k]
-            if _is_data(k, r):
+            if _is_data(k):
                 r["size"] *= 2
-                r["type"] = "int8"
             r["offset"] = f"0x{cur:08X}"
             cur += r["size"]
 
