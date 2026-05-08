@@ -1545,11 +1545,14 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self._prefill_padded = bucket
         self._prefill_raw = self._prefill_bucket_raws[bucket]
         bpe = 2
+        # Gemma3-style mask: standard causal + block padded cols. Pad rows attend
+        # to real cols only (lower-tri AND col<seq_len) — safe because pad rows have
+        # real (last-token-replicated) embeddings, so softmax/RMS-norm don't NaN.
+        # CRITICAL: LM head reads at position bucket-1 (compiled in), so pad row
+        # bucket-1 must attend to the real prompt to produce correct logits.
         causal = torch.full((bucket, bucket), -1e38, dtype=torch.bfloat16)
         causal = torch.triu(causal, diagonal=1)
         causal[:, seq_len:] = -1e38
-        causal[seq_len:, :] = -1e38
-        causal[seq_len:, 0] = 0.0
         self.dma_write(DMA_DEVICE_H2C, self.CAUSAL_MASK_DRAM, causal.flatten(), bucket * bucket * bpe)
 
     def dump_snapshot(self) -> None:
