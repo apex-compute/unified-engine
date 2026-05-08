@@ -1201,10 +1201,13 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         return program_addr
 
     def compile_prefill(self, seq_len: int) -> None:
-        """Compile prefill program (padded to 64). Embed/merge fused at runtime."""
+        """Compile prefill program for one bucket (seq_len IS the bucket size, multiple of 64).
+        Treats the entire bucket as one contiguous sequence of length S=seq_len; the actual
+        prompt-vs-padding distinction is handled at runtime by select_prefill_bucket (causal
+        mask) and run_prefill (embed gather + post-prefill KV zero-fill). Mirrors gemma3."""
         from user_dma_core import TYPE
-        self.prefill_seq_len = seq_len  # actual token count (for causal mask / LM head)
-        S = ((seq_len + 63) // 64) * 64  # padded for HW
+        S = ((seq_len + 63) // 64) * 64  # bucket size; seq_len already aligned for buckets
+        self.prefill_seq_len = S          # compile treats whole bucket as sequence
         self._prefill_padded = S
         H = self.HIDDEN_SIZE           # 960
         KV = self.NUM_KV_HEADS * self.HEAD_DIM  # 320
@@ -1213,14 +1216,9 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         bpe = 2
         head_stride = S * D * bpe
 
-        # Causal mask for padded size: upper triangular -inf
-        # Padding rows (seq_len..S-1) must attend to at least one position to avoid
-        # softmax(all -inf) = NaN. Let them attend to position 0 (harmless dummy attention).
+        # Initial causal mask DMA (overwritten at runtime by select_prefill_bucket).
         causal = torch.full((S, S), -1e38, dtype=torch.bfloat16)
-        causal = torch.triu(causal, diagonal=1)        # standard causal: lower tri = 0
-        causal[:, seq_len:] = -1e38                     # can't attend to padded cols
-        causal[seq_len:, :] = -1e38                     # padded rows: block everything...
-        causal[seq_len:, 0] = 0.0                       # ...except position 0 (prevents NaN)
+        causal = torch.triu(causal, diagonal=1)
         self.dma_write(DMA_DEVICE_H2C, self.CAUSAL_MASK_DRAM, causal.flatten(), S * S * bpe)
 
         # Helper: dispatch matmul as BF16 or Q4_64
@@ -1310,21 +1308,11 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
         # Extract raw instruction bytes (no halt) for runtime fusion
-        self._prefill_raw = capture_to_raw(self)
-        self._halt_raw = generate_halt_raw(self)
-
-        # Estimate worst-case fused program size:
-        # embed gather (2 insts × 32 bytes × max_seq_len) + vision merge (2 × 32 × 64) + prefill + halt
-        max_embed_insts = seq_len * 2 * 32  # 2 DMA instructions per token
-        max_merge_insts = IMAGE_SEQ_LEN * 2 * 32  # 64 image tokens
-        worst_case = max_embed_insts + max_merge_insts + len(self._prefill_raw) + len(self._halt_raw)
-        self._prefill_scratch_addr = self.get_program_dram_addr()
-        self.allocate_program_dram(worst_case)
-
+        prefill_raw = capture_to_raw(self)
         bin_path = os.path.join(self.script_dir, "smolvlm2_bin", f"prefill_program_S{S}.bin")
         with open(bin_path, "wb") as f:
-            f.write(self._prefill_raw)
-        print(f"    Prefill compiled (S={S}): {len(self._prefill_raw)} bytes raw + scratch {worst_case} bytes → {bin_path}")
+            f.write(prefill_raw)
+        print(f"    Prefill compiled (S={S}): {len(prefill_raw)} bytes raw → {bin_path}")
 
     def compile_decoder(self, kv_len_buckets=None) -> None:
         """Compile per-bucket decode programs + per-token embed programs."""
@@ -1526,31 +1514,43 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
         return self._load_bin(os.path.join(self.script_dir, "smolvlm2_bin", "encoder_program.bin"))
 
-    def load_prefill(self, seq_len: int) -> None:
-        """Load pre-compiled prefill raw bytes from bin. Sets up causal mask and scratch."""
-        S = ((seq_len + 63) // 64) * 64
+    def load_prefill_buckets(self) -> None:
+        """Load all per-bucket prefill bins; allocate one shared scratch for largest bucket.
+        Mirrors gemma3's prefill bucket family. Call select_prefill_bucket(seq_len) to pick."""
+        buckets = self._cfg["model"]["prefill_seq_len_buckets"]
+        self._prefill_buckets = list(buckets)
+        self._prefill_bucket_raws = {}
+        bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
+        for S in buckets:
+            bin_path = os.path.join(bin_dir, f"prefill_program_S{S}.bin")
+            with open(bin_path, "rb") as f:
+                self._prefill_bucket_raws[S] = f.read()
+        self._halt_raw = generate_halt_raw(self)
+        max_bucket = buckets[-1]
+        max_embed_insts = max_bucket * 2 * 32
+        max_merge_insts = IMAGE_SEQ_LEN * 2 * 32
+        max_prefill_raw = max(len(r) for r in self._prefill_bucket_raws.values())
+        worst_case = max_embed_insts + max_merge_insts + max_prefill_raw + len(self._halt_raw)
+        self._prefill_scratch_addr = self.get_program_dram_addr()
+        self.allocate_program_dram(worst_case)
+        print(f"    Loaded {len(buckets)} prefill buckets {buckets}, scratch {worst_case} bytes")
+
+    def select_prefill_bucket(self, seq_len: int) -> None:
+        """Select smallest bucket >= seq_len, set state and write causal mask. Mirrors gemma3."""
+        buckets = self._prefill_buckets
+        if seq_len > buckets[-1]:
+            raise ValueError(f"seq_len={seq_len} exceeds largest bucket {buckets[-1]}")
+        bucket = next(b for b in buckets if b >= seq_len)
         self.prefill_seq_len = seq_len
-        self._prefill_padded = S
+        self._prefill_padded = bucket
+        self._prefill_raw = self._prefill_bucket_raws[bucket]
         bpe = 2
-        # Causal mask for the padded size
-        causal = torch.full((S, S), -1e38, dtype=torch.bfloat16)
+        causal = torch.full((bucket, bucket), -1e38, dtype=torch.bfloat16)
         causal = torch.triu(causal, diagonal=1)
         causal[:, seq_len:] = -1e38
         causal[seq_len:, :] = -1e38
         causal[seq_len:, 0] = 0.0
-        self.dma_write(DMA_DEVICE_H2C, self.CAUSAL_MASK_DRAM, causal.flatten(), S * S * bpe)
-        # Load prefill raw bytes (no halt)
-        bin_path = os.path.join(self.script_dir, "smolvlm2_bin", f"prefill_program_S{S}.bin")
-        with open(bin_path, "rb") as f:
-            self._prefill_raw = f.read()
-        self._halt_raw = generate_halt_raw(self)
-        # Allocate scratch for fused program
-        max_embed_insts = seq_len * 2 * 32
-        max_merge_insts = IMAGE_SEQ_LEN * 2 * 32
-        worst_case = max_embed_insts + max_merge_insts + len(self._prefill_raw) + len(self._halt_raw)
-        self._prefill_scratch_addr = self.get_program_dram_addr()
-        self.allocate_program_dram(worst_case)
-        print(f"    Loaded prefill raw ({len(self._prefill_raw)} bytes) + scratch ({worst_case} bytes)")
+        self.dma_write(DMA_DEVICE_H2C, self.CAUSAL_MASK_DRAM, causal.flatten(), bucket * bucket * bpe)
 
     def dump_snapshot(self) -> None:
         """Dump params DRAM + all runtime address metadata to smolvlm2_bin/params.bin + params.json."""
@@ -1687,17 +1687,12 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         bpe = 2
         embed_row_bytes = H * bpe
 
-        # Epsilon-fill padding rows to prevent RMS norm NaN on zero rows
-        if S > seq_len:
-            pad_rows = S - seq_len
-            epsilon_fill = torch.full((pad_rows * H,), 1e-6, dtype=torch.bfloat16)
-            pad_offset = seq_len * embed_row_bytes
-            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM + pad_offset, epsilon_fill)
-
-        # Generate on-device embedding gather instructions
+        # Generate on-device embedding gather: real tokens for [0..seq_len),
+        # last-token replication for [seq_len..S) so LM head at S-1 = logits for actual last token.
         self.start_capture()
-        for t in range(seq_len):
-            token_id = token_ids[t]
+        last_tid = token_ids[-1]
+        for t in range(S):
+            token_id = token_ids[t] if t < seq_len else last_tid
             src_addr = self.embed_addr + token_id * embed_row_bytes
             dst_addr = self.LAYER0_INPUT_DRAM + t * embed_row_bytes
             self.accelerator_memory_to_sram(
@@ -1933,9 +1928,10 @@ def main():
     _SILENT_MODE = True
     timer = time.perf_counter()
     bin_dir = os.path.join(script_dir, "smolvlm2_bin")
-    S = ((seq_len + 63) // 64) * 64
+    prefill_buckets = ue._cfg["model"]["prefill_seq_len_buckets"]
     use_bin = (os.path.exists(os.path.join(bin_dir, "decoder_program.bin"))
-               and os.path.exists(os.path.join(bin_dir, f"prefill_program_S{S}.bin")))
+               and all(os.path.exists(os.path.join(bin_dir, f"prefill_program_S{S}.bin"))
+                       for S in prefill_buckets))
     import threading
     stop_compile = threading.Event()
     def _compile_progress():
@@ -1948,13 +1944,16 @@ def main():
     if use_bin:
         if has_image:
             enc_addr = ue.load_encoder()
-        ue.load_prefill(seq_len=seq_len)
+        ue.load_prefill_buckets()
         ue.load_decoder()
     else:
         if has_image:
             enc_addr = ue.compile_encoder()
-        ue.compile_prefill(seq_len=seq_len)
+        for S in prefill_buckets:
+            ue.compile_prefill(seq_len=S)
+        ue.load_prefill_buckets()
         ue.compile_decoder()
+    ue.select_prefill_bucket(seq_len)
     stop_compile.set()
     _SILENT_MODE = False
     elapsed = time.perf_counter() - timer
@@ -1981,7 +1980,7 @@ def main():
         _original_print(f"\r  Vision encoder ({enc_time:.0f}s) done")
     # --- Prefill ---
     timer = time.perf_counter()
-    padded_seq = ((seq_len + 63) // 64) * 64
+    padded_seq = ue._prefill_padded  # bucket size selected by select_prefill_bucket
     S = padded_seq
     H, D, I = ue.HIDDEN_SIZE, ue.HEAD_DIM, ue.INTERMEDIATE_SIZE
     KVH, QH, G = ue.NUM_KV_HEADS, ue.NUM_HEADS, ue.GROUP_SIZE
