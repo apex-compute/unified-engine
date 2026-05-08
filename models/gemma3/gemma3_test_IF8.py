@@ -1,32 +1,54 @@
 #!/usr/bin/env python3
 """
-Gemma3 inference on accelerator: prefill + decode.
+Gemma3 IF8 inference on accelerator: prefill + decode.
 
-  - Config from gemma3_config.json; weights from a single bin (see below).
-  - One prefill program per integer seq_len in [1, model.prefill_max_seq_len]
-    is compiled, together with every decoder seq_len bucket, into ONE combined
-    instruction image plus a metadata sidecar (per-stage start addresses, sizes,
-    FLOPs). Both are runtime-generated tmp artifacts inside gemma3_bin/, with
-    relative paths declared in gemma3_config.json (paths.instruction_bin /
-    instruction_meta).
-  - Run phase loads the single combined bin once into program DRAM and then
-    dispatches prefill and per-token decoder programs by start address. The
-    prefill program is selected at runtime from the prompt length:
-    prefill_seq_len = len(prompt) - 1, then look up the matching bucket.
+This is the IF8 (8-bit adaptive block-scaled) variant of the gemma3 template.
+It mirrors gemma3_test.py one-for-one except for two IF8-specific design
+points that customers porting other models to IF8 will need to follow:
 
-Weights:
-  - Default: gemma3_bin/weights_gemma3_hf.bin (generated from HF model if missing).
-  - --local-weights: use gemma3_bin/full_model_weights.bin instead.
+  1. Layout rewrite (`_if4_to_if8_layout`): every ``*_DATA`` region in
+     gemma3_config.json doubles in size (1 byte/elem vs 4 bits/elem) and
+     all offsets are repacked contiguously at load time. The on-disk JSON
+     stays IF4-shaped so a single config serves both codecs.
+
+  2. Dynamic Params/Tensor/Program DRAM bases (`Gemma3_UnifiedEngine.__init__`).
+     IF8 doubles every quantized weight; layers (~687 MB) plus LM_HEAD
+     (~297 MB) totals ~990 MB, which overflows the 768 MB Params default
+     baked into user_dma_core.py. Total physical DRAM is 4 GB, so the
+     fix is just to recompute the boundary integers from the config:
+     ``_tensor_base = 0x80000000 + params_estimate``, ``_program_base =
+     _tensor_base + tensor_estimate``, both 1 MB aligned. This mirrors
+     Gemma4 E2B's pattern. With this in place LM_HEAD lives in Params
+     DRAM with all other weights and the on-chip LM_HEAD path runs
+     end-to-end -- prefill + decode are fully on chip; per-token host
+     work is just the embedding-table row select for the new token id.
+
+Quantization: ``QUANT_PRECISION = "if8"`` selects per-block MixMSE between
+INT8 and FP8 E4M3 (scale-sign dispatches the codebook). Forcing pure INT8
+(``int_variant=True``) is *not* recommended -- INT8 preserves activation
+outliers that compound across all 26 layers and inflate the final-layer
+magnitude past the on-chip rms_norm_core's safe range, producing NaN
+logits. MixMSE keeps growth bounded.
+
+Compile/run flow is identical to the IF4 reference: one prefill program per
+``prefill_seq_len`` bucket plus all decoder buckets are captured into a
+single combined instruction image (gemma3_bin/gemma3_instruction.bin) with
+metadata sidecar.
+
+Weights bin: gemma3_bin/weights_gemma3_hf_if8.bin (auto-generated from HF
+on first run; the ``_if8`` suffix avoids collision with an IF4 bin in the
+same directory). ``--local-weights`` uses gemma3_bin/full_model_weights.bin.
 
 Usage:
-  python gemma3_test.py
-  python gemma3_test.py --prompt "your prompt"
-  python gemma3_test.py --dev xdma0 [--cycle 5.62]
-  python gemma3_test.py --local-weights
-  python gemma3_test.py --dual-engine
+  python gemma3_test_IF8.py
+  python gemma3_test_IF8.py --prompt "your prompt"
+  python gemma3_test_IF8.py --dev xdma0 [--cycle 5.62]
+  python gemma3_test_IF8.py --local-weights
+  python gemma3_test_IF8.py --dual-engine
 
-Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in the same folder.
-  user_dma_core.py is one folder up; that parent is added to sys.path.
+Layout: this file, gemma3_numeric.py, gemma3_config.json, and gemma3_bin/
+live in the same folder. user_dma_core.py is two folders up; that parent
+directory is prepended to sys.path at import.
 """
 
 import json
@@ -69,18 +91,77 @@ def _parse_offset(val) -> int:
         return int(val, 0)
     return int(val)
 
-# Codec lives in template/quant_schemas.py -- the single canonical
-# wrapper used by every model template, the SW eval, and (via
-# user_dma_core.UnifiedEngine.quantize_weight) the on-chip
-# quantize-and-DMA path. Gemma3 calls the string-dispatched
-# ``quantize`` directly so the codebook is config-driven; today's
-# release uses "if4". To switch codebooks, change QUANT_PRECISION
-# (``int4`` / ``fp4`` / ``if4``); to force a per-block variant within
-# IF4, pass ``int_variant=True`` (uniform INT4) or ``False`` (uniform
-# FP4) -- defaults to ``None`` (per-block MixMSE selection).
+# Codec lives in template/quant_schemas.py. Change QUANT_PRECISION to swap
+# codebooks (e.g. "if4"); for IF8 the default per-block MixMSE selection
+# between INT8 and FP8 is what we want -- do NOT force pure INT8 here, see
+# module docstring point 3.
 from quant_schemas import quantize
 
-QUANT_PRECISION = "if4"
+QUANT_PRECISION = "if8"
+
+
+def _if4_to_if8_layout(cfg: dict) -> dict:
+    """Rewrite an IF4 ``gemma3_config.json`` layout in place for IF8.
+
+    IF8 stores 1 byte/element vs IF4's 4 bits/element, so every quantized
+    ``*_DATA`` region doubles in size. Offsets are recomputed contiguously
+    (preserving the original blk0 base, e.g. 0x24000000 for gemma3); the
+    per-layer ``file_info.layer_size`` is updated; non-layer regions are
+    repositioned after the (now-larger) layer block; and the weights bin
+    filename gets an ``_if8`` suffix so an existing IF4 bin in the same
+    directory is not picked up by mistake.
+    """
+    def _is_data(key: str, r: dict) -> bool:
+        return key.endswith("_DATA") or r.get("type") == "int4"
+
+    regions = cfg.get("regions", {})
+    nlr = cfg.get("non_layer_regions", {})
+
+    # Walk blk0 regions in original-offset order, double *_DATA sizes,
+    # repack contiguously starting from the original base.
+    if regions:
+        sorted_keys = sorted(regions.keys(),
+                             key=lambda k: _parse_offset(regions[k]["offset"]))
+        base = _parse_offset(regions[sorted_keys[0]]["offset"])
+        cur = base
+        for k in sorted_keys:
+            r = regions[k]
+            if _is_data(k, r):
+                r["size"] *= 2
+                r["type"] = "int8"
+            r["offset"] = f"0x{cur:08X}"
+            cur += r["size"]
+        cfg["file_info"]["layer_size"] = cur - base
+
+    # Non-layer regions sit immediately after the last layer.
+    if nlr:
+        num_layers = cfg["file_info"]["num_layers"]
+        layer_block_end = base + num_layers * cfg["file_info"]["layer_size"]
+        sorted_nlr = sorted(nlr.keys(),
+                            key=lambda k: _parse_offset(nlr[k]["offset"]))
+        cur = layer_block_end
+        for k in sorted_nlr:
+            r = nlr[k]
+            if _is_data(k, r):
+                r["size"] *= 2
+                r["type"] = "int8"
+            r["offset"] = f"0x{cur:08X}"
+            cur += r["size"]
+
+    # Distinct filenames so stale IF4 artifacts don't get reused. Both the
+    # weights bin AND the captured instruction image (which embeds literal
+    # IF8 DRAM addresses) must be separate from the IF4 reference's caches.
+    paths = cfg.setdefault("paths", {})
+    for key, default in (
+        ("weights_bin",     "gemma3_bin/weights_gemma3_hf.bin"),
+        ("instruction_bin", "gemma3_bin/gemma3_instruction.bin"),
+        ("instruction_meta","gemma3_bin/gemma3_instruction.json"),
+    ):
+        rel = paths.get(key, default)
+        if "_if8" not in rel:
+            stem, sep, ext = rel.rpartition(".")
+            paths[key] = f"{stem}_if8{sep}{ext}" if sep else f"{rel}_if8"
+    return cfg
 
 def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
     """Generate full_model_weights.bin from Hugging Face model per gemma3_config.json layout.
@@ -128,7 +209,9 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     raw_emb = emb_scaled.contiguous().view(torch.uint8).numpy().tobytes()
     write_at(token_embd_offset, raw_emb)
 
-    # Layers
+    # Layers (IF8 MixMSE quantization runs on CPU; ~few seconds per layer)
+    print(f"Quantizing {num_layers} transformer layers to {QUANT_PRECISION.upper()} ...")
+    layer_t0 = time.perf_counter()
     for layer_idx in range(num_layers):
         layer = model.model.layers[layer_idx]
         attn = layer.self_attn
@@ -146,19 +229,21 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
         down_w = layer.mlp.down_proj.weight.detach().cpu().to(torch.bfloat16)
         gamma_post_ffn = (layer.post_feedforward_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
 
+        # ``kind`` is "bf16" for raw bf16 bytes, "quant" for codec-driven
+        # (scale, data) pairs produced by ``quantize(QUANT_PRECISION, ...)``.
         region_writes = [
             (gamma_in, "bf16"),
-            (q_w, "if4"),
-            (k_w, "if4"),
-            (v_w, "if4"),
+            (q_w, "quant"),
+            (k_w, "quant"),
+            (v_w, "quant"),
             (gamma_q, "bf16"),
             (gamma_k, "bf16"),
-            (o_w, "if4"),
+            (o_w, "quant"),
             (gamma_post, "bf16"),
             (gamma_ffn, "bf16"),
-            (up_w, "if4"),
-            (gate_w, "if4"),
-            (down_w, "if4"),
+            (up_w, "quant"),
+            (gate_w, "quant"),
+            (down_w, "quant"),
             (gamma_post_ffn, "bf16"),
         ]
         j = 0
@@ -170,7 +255,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             sz = weight_defs[sz_key]
             file_off = off + layer_idx * LAYER_WEIGHT_SIZE
             tensor, kind = region_writes[j]
-            if kind == "if4":
+            if kind == "quant":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
                 data_bytes, scale_bytes = quantize(QUANT_PRECISION, tensor)
@@ -186,6 +271,8 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
                 write_at(file_off, raw)
                 i += 1
             j += 1
+        if (layer_idx + 1) % 4 == 0 or layer_idx == num_layers - 1:
+            print(f"  layer {layer_idx + 1}/{num_layers} done ({time.perf_counter() - layer_t0:.1f}s elapsed)")
 
     # ROPE
     rope_cfg = cfg["special"]["rope"]
@@ -213,11 +300,14 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     raw = (out_norm.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
     write_at(weight_defs["OUTPUT_NORM_WEIGHT"], raw)
 
-    # LM_HEAD
+    # LM_HEAD (262144 x 1152 -> ~302 M elements; the slowest single step)
+    print(f"Quantizing LM_HEAD ({tuple(model.lm_head.weight.shape)}) to {QUANT_PRECISION.upper()} ...")
+    lm_t0 = time.perf_counter()
     lm_head_w = model.lm_head.weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
     data_bytes, scale_bytes = quantize(QUANT_PRECISION, lm_head_w)
+    print(f"  LM_HEAD quantized in {time.perf_counter() - lm_t0:.1f}s")
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
@@ -249,12 +339,30 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine with Gemma3 dims: loads config + weight bin, compile_prefill/compile_decoder, run_prefill/run_decoder. Numeric checks in gemma3_numeric.py."""
 
     def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False):
-        program_dram_base = DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else DRAM_INSTRUCTION_ADDR
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
-        super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
+        # Compute Params/Tensor/Program DRAM bases dynamically so the IF8
+        # weight set (~990 MB total: 26 layers + LM_HEAD + ROPE + OUTPUT_NORM)
+        # fits in a single contiguous Params region. The 768 MB / 512 MB /
+        # 256 MB defaults in user_dma_core.py are sized for small IF4 models;
+        # IF8 doubles every quantized tensor and pushes Params past those
+        # defaults. Total physical DRAM is 4 GB, so the only thing standing
+        # in the way is the boundary integers -- mirror Gemma4 E2B's pattern
+        # and recompute them from the config sizes.
+        _script_dir = script_dir or SCRIPT_DIR
+        _cfg_tmp = self.load_config(script_dir=_script_dir)
+        _fi = _cfg_tmp["file_info"]
+        _layers_sz = _fi["num_layers"] * _fi["layer_size"]
+        _non_layer_sz = sum(r["size"] for r in _cfg_tmp["non_layer_regions"].values())
+        _params_estimate = _layers_sz + _non_layer_sz + 0x100000  # +1 MB margin (alignment, identity, etc.)
+        _tensor_base = ((0x80000000 + _params_estimate + 0xFFFFF) // 0x100000) * 0x100000  # 1 MB aligned
+        _tensor_estimate = 0x12000000  # 288 MB; KV cache + activations + flash buffers fit in ~64 MB on Gemma3-1B with margin
+        _program_base = ((_tensor_base + _tensor_estimate + 0xFFFFF) // 0x100000) * 0x100000  # 1 MB aligned
+        if engine_slave:
+            _program_base += 0x10000000
+        super().__init__(BASE_ADDR=engine_base, program_dram_base=_program_base, tensor_dram_base=_tensor_base)
         self.dual_engine = dual_engine
-        self.script_dir = script_dir or SCRIPT_DIR
-        self._cfg = self.load_config(script_dir=self.script_dir)
+        self.script_dir = _script_dir
+        self._cfg = _cfg_tmp
         self.weight_defs = self._cfg["_weight_defs"]
 
         fi = self._cfg["file_info"]
@@ -289,12 +397,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
     @staticmethod
     def load_config(config_path: str | None = None, script_dir: str | None = None) -> dict:
-        """Load gemma3_config.json and build weight_defs (offset/size dict) from regions."""
+        """Load gemma3_config.json, apply the IF4->IF8 layout rewrite, and
+        build a flat ``weight_defs`` dict of {key: offset, key_SIZE: size}."""
         if config_path is None:
             script_dir = script_dir or SCRIPT_DIR
             config_path = os.path.join(script_dir, "gemma3_config.json")
         with open(config_path, "r") as f:
             cfg = json.load(f)
+        cfg = _if4_to_if8_layout(cfg)
         weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
         for key, r in cfg.get("regions", {}).items():
             weight_defs[key] = _parse_offset(r["offset"])
@@ -933,6 +1043,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     setattr(self, attr, layers_base_dram + offset_in_layer)
         print(f"Layers 0..{self.LAYER_SIZE - 1} loaded: 0x{layers_base_dram:X} size {layers_total} (LAYER_WEIGHT_SIZE={LAYER_WEIGHT_SIZE})")
 
+        # All non-layer weights (OUTPUT_NORM + LM_HEAD scale/data) live in
+        # Params DRAM. The IF8 LM_HEAD (~297 MB) plus the 26 IF8 layers
+        # (~687 MB) fit because __init__ pushed _tensor_base above them.
         for off_key, sz_key, attr in non_layer:
             off = self.weight_defs[off_key]
             sz = self.weight_defs[sz_key]
@@ -1080,7 +1193,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=weight_dram_addr,
                 OUTPUT_DRAM_ADDR=shard_dram_addr(output_dram_addr, row_offset, n_dim),
                 is_B_quantized=True,
-                data_type=TYPE.IF4,
+                data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=scale_dram_addr,
                 use_pbi=use_pbi,
                 **kwargs,
@@ -1156,7 +1269,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 is_B_quantized=True,
-                data_type=TYPE.IF4,
+                data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
                 use_pbi=use_pbi,
             )
@@ -1168,7 +1281,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                 is_B_quantized=True,
-                data_type=TYPE.IF4,
+                data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
                 use_pbi=use_pbi,
             )
@@ -1180,7 +1293,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
                 is_B_quantized=True,
-                data_type=TYPE.IF4,
+                data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
                 use_pbi=use_pbi,
             )
@@ -1246,7 +1359,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 is_B_quantized=True,
-                data_type=TYPE.IF4,
+                data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
                 use_pbi=use_pbi,
             )
@@ -1270,7 +1383,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                 is_B_quantized=True,
-                data_type=TYPE.IF4,
+                data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
                 gelu_enable=True,
                 use_pbi=use_pbi,
@@ -1283,7 +1396,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 is_B_quantized=True,
-                data_type=TYPE.IF4,
+                data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
                 use_pbi=use_pbi,
             )
@@ -1303,7 +1416,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 is_B_quantized=True,
-                data_type=TYPE.IF4,
+                data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
                 use_pbi=use_pbi,
             )
@@ -1354,7 +1467,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                                                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
                                                     OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                                                     is_B_quantized=True,
-                                                    data_type=TYPE.IF4,
+                                                    data_type=TYPE.IF8,
                                                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
                                                     use_pbi=use_pbi
                                                     )
@@ -1363,7 +1476,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                     is_B_quantized=True,
-                    data_type=TYPE.IF4,
+                    data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
                     use_pbi=use_pbi
                     )
@@ -1372,7 +1485,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
                     is_B_quantized=True,
-                    data_type=TYPE.IF4,
+                    data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
                     use_pbi=use_pbi
                     )
@@ -1413,7 +1526,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                     is_B_quantized=True,
-                    data_type=TYPE.IF4,
+                    data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
                     use_pbi=use_pbi
                     )
@@ -1435,7 +1548,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                     is_B_quantized=True,
-                    data_type=TYPE.IF4,
+                    data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
                     gelu_enable=True,
                     use_pbi=use_pbi
@@ -1445,7 +1558,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                     is_B_quantized=True,
-                    data_type=TYPE.IF4,
+                    data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
                     use_pbi=use_pbi
                     )
@@ -1460,7 +1573,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                     is_B_quantized=True,
-                    data_type=TYPE.IF4,
+                    data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
                     use_pbi=use_pbi
                     )
@@ -1482,7 +1595,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
                     OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                     is_B_quantized=True,
-                    data_type=TYPE.IF4,
+                    data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
                     use_pbi=use_pbi,
                     write_back_disable=True
