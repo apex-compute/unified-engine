@@ -238,10 +238,13 @@ def main():
     # Download checkpoint if needed (for prompt encoding — CPU-side only)
     ckpt_path = os.path.join(BIN_DIR, "mobile_sam.pt")
     if not os.path.exists(ckpt_path):
-        from huggingface_hub import hf_hub_download
+        import urllib.request
         _original_print("  Downloading mobile_sam.pt …")
-        ckpt_path = hf_hub_download(repo_id="apexcompute/mobile-sam",
-                                    filename="mobile_sam.pt", local_dir=BIN_DIR)
+        os.makedirs(BIN_DIR, exist_ok=True)
+        urllib.request.urlretrieve(
+            "https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt",
+            ckpt_path,
+        )
 
     img_path = args.image or os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     img = _PIL_Image.open(img_path).convert("RGB")
