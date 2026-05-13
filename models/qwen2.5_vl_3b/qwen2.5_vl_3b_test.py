@@ -370,7 +370,17 @@ def _qs_pack(precision: str, tensor: torch.Tensor):
     store_quantized_weight() as 34 bytes per block: 2 B bf16 scale + 32 B
     nibbles). Accepts arbitrary input shape; flattens and zero-pads to a
     multiple of 64 to match the released helpers."""
-    bf = tensor.detach().to(torch.bfloat16).cpu().flatten()
+    bf = tensor.detach().to(torch.bfloat16).cpu()
+    # Fast path: 2D and K-aligned. Preserve (N, K) shape so the codec can
+    # chunk along rows (large N inputs like the LM head would otherwise hit
+    # the unbounded distance-tensor allocation when flattened to (1, N*K)).
+    if bf.dim() == 2 and bf.shape[1] % 64 == 0:
+        n_blocks = bf.numel() // 64
+        data_bytes, scale_bytes = quant_schemas.quantize(precision, bf, block_size=64)
+        return np.frombuffer(scale_bytes + data_bytes, dtype=np.uint8), n_blocks
+    # Generic path: flatten + zero-pad to a multiple of 64. Used for
+    # arbitrary-rank tensors (e.g. the 5D Conv3D patch_embed weight).
+    bf = bf.flatten()
     n_blocks = (bf.numel() + 63) // 64
     if bf.numel() != n_blocks * 64:
         bf = torch.nn.functional.pad(bf, (0, n_blocks * 64 - bf.numel()))
@@ -484,12 +494,32 @@ def _write_weight_bin(bin_path, model, param_filter, mode, suffix, quant_layers,
 def generate_lm_weights(model, output_path, precision: str = "if4"):
     """Generate LM weight bin using the given quant_schemas precision
     ('int4' / 'fp4' / 'if4'). The precision string is also the manifest
-    suffix the runtime loader looks for."""
+    suffix the runtime loader looks for.
+
+    Also pre-quantizes the LM head (tied to the input embedding) and
+    appends it to the bin as ``lm_head.weight.{precision}``. The runtime
+    loads those bytes directly instead of re-quantizing 300M+ weights at
+    weight_init, which OOMs memory-constrained devices like Pi 5."""
     if precision not in _VALID_PRECISIONS:
         raise ValueError(f"precision={precision!r} not in {_VALID_PRECISIONS}")
     _write_weight_bin(output_path, model,
         lambda n: 'model.layers' in n or 'model.embed_tokens' in n or 'model.norm' in n,
         'lm', precision, _LM_QUANT_LAYERS, lambda t: _qs_pack(precision, t))
+
+    # Pre-quantize the LM head (tied to embedding) and append to the bin.
+    embed_w = model.get_input_embeddings().weight.detach().to(torch.bfloat16)
+    combined, _ = _qs_pack(precision, embed_w)
+    combined_bytes = combined.tobytes()
+    json_path = output_path.rsplit('.', 1)[0] + '.json'
+    with open(json_path) as f:
+        manifest = json.load(f)
+    with open(output_path, 'ab') as f:
+        offset = f.tell()
+        f.write(combined_bytes)
+    manifest[f'lm_head.weight.{precision}'] = {'offset': offset, 'size': len(combined_bytes)}
+    with open(json_path, 'w') as f:
+        json.dump(manifest, f)
+    print(f"LM head ({precision}) appended: {len(combined_bytes)/1048576:.1f} MB at offset 0x{offset:X}")
 
 def generate_vision_weights(model, output_path, precision: str = "int4"):
     """Generate vision weight bin with pre-padded QKV (80→128) and MLP
@@ -1252,6 +1282,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             weight_bin_generate(script_dir=self.script_dir, output_lm=lm_bin_path, output_vis=vis_bin_path)
 
         # Load LM weights
+        print(f"  Reading LM weight bin (memmap)...", flush=True)
         lm_cache = load_weight_cache(lm_bin_path)
 
         # Embedding (host-side only — NOT uploaded to FPGA DRAM)
@@ -1269,8 +1300,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # and +17% for pure INT4 — see src/models/qwen2.5_VL_3b/compare/summary.md).
         # V/O stored as BF16 in binary for better attention accuracy.
         lm_prec = _lm_precision(self._cfg)
+        print(f"  Loading {self.LAYER_SIZE} LM layers to FPGA DRAM ({lm_prec})...", flush=True)
         self.lm_layer_addrs = []
         for i in range(self.LAYER_SIZE):
+            if i and (i % 8 == 0 or i == self.LAYER_SIZE - 1):
+                print(f"    layer {i + 1}/{self.LAYER_SIZE} loaded", flush=True)
             la = {}
             prefix = f'language_model.layers.{i}'
             # Q, K, gate, up, down: precision.lm-quantized from binary
@@ -1300,11 +1334,19 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Final norm
         self.final_norm_addr = store_weight(self, torch.from_numpy(lm_cache['language_model.norm.weight'].copy()).view(torch.bfloat16))
 
-        # LM head: tied to embedding, quantized with the same precision.lm.
-        # matmat_mul_core expects B as (N, K) = (vocab_size, hidden_size);
-        # embed_bf16 is already (vocab_size, hidden_size) — no transpose needed.
-        lm_head_packed, _ = _qs_pack(lm_prec, embed_bf16)
-        self.lm_head_scale, self.lm_head_data = store_quantized_weight(self, lm_head_packed)
+        # LM head: pre-quantized at bin-gen time (tied to embedding) and
+        # loaded directly from the bin. No runtime quantization -- if the
+        # entry is missing, the bin is stale and must be regenerated.
+        lm_head_key = f'lm_head.weight.{lm_prec}'
+        if lm_head_key not in lm_cache:
+            raise RuntimeError(
+                f"LM head entry {lm_head_key!r} not found in bin "
+                f"{lm_bin_path!r}. The bin was generated by an older "
+                f"version of the script. Delete the bin and rerun to "
+                f"regenerate with the LM head pre-quantized."
+            )
+        self.lm_head_scale, self.lm_head_data = store_quantized_weight(
+            self, lm_cache[lm_head_key])
 
         # Identity matrix for decode attention
         self.identity_addr = store_identity_matrix(self)
@@ -1334,8 +1376,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         VD_PAD = 128                                # padded head_dim (must be % 64 == 0)
 
         vis_prec = _vision_precision(self._cfg)
+        print(f"  Loading {vis_depth} vision encoder layers to FPGA DRAM ({vis_prec})...", flush=True)
         self.vis_layer_addrs = []
         for i in range(vis_depth):
+            if i and (i % 8 == 0 or i == vis_depth - 1):
+                print(f"    layer {i + 1}/{vis_depth} loaded", flush=True)
             la = {}
             prefix = f'visual.blocks.{i}'
             # Q/K (rearranged padded) + V (sequential padded) — pre-padded in binary
@@ -1519,20 +1564,40 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             corrected += overflow_us
         return corrected
 
+    @staticmethod
+    def _wait_with_heartbeat(wait_fn, label: str, interval_s: float = 5.0):
+        """Call ``wait_fn`` (blocking) on a background thread and print
+        ``[label] still running ({n}s)`` every ``interval_s`` so the demo
+        doesn't look frozen during long HW executes. Returns wall time."""
+        import threading
+        stop = threading.Event()
+        def _beat():
+            n = 0
+            while not stop.wait(interval_s):
+                n += interval_s
+                print(f"      [{label}] still running ({n:.0f}s)...", flush=True)
+        t = threading.Thread(target=_beat, daemon=True)
+        t0 = time.perf_counter()
+        t.start()
+        try:
+            wait_fn()
+        finally:
+            stop.set()
+            t.join(timeout=interval_s)
+        return time.perf_counter() - t0
+
     def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 120.0, gflops: float = None) -> None:
         """Execute compiled program from DRAM instruction memory."""
-        print(f"Execute program start at 0x{program_start_addr:X}")
-        t0 = time.perf_counter()
+        print(f"  Running program on FPGA (DRAM addr 0x{program_start_addr:X})...", flush=True)
         self.start_execute_from_dram(program_start_addr)
-        self.wait_queue(timeout)
-        wall_s = time.perf_counter() - t0
+        wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(timeout), label="FPGA")
         latency_us = self._corrected_hw_latency_us(wall_s)
         print(f"    Total program execution latency = {latency_us:.0f} us")
         if gflops is not None:
             gflops_program = gflops / (latency_us * 1e-6) / 1e9
             self._last_hw_gflops = gflops_program
             self._last_total_flops = gflops
-            print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
+            print(f"    Throughput: {gflops_program:.2f} GFLOPS")
 
     def compile_encoder(self, num_layers: int = None) -> int:
         """Compile vision encoder FPGA program. Returns program DRAM address."""
@@ -2065,11 +2130,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         vis_flops += 2 * self.NUM_MERGED_TOKENS * merge_dim * merge_dim  # merger MLP0
         vis_flops += 2 * self.NUM_MERGED_TOKENS * merge_dim * VH_OUT     # merger MLP2
 
-        print(f"    Running vision encoder ({vis_flops/1e9:.1f} GF)...")
-        t0 = time.perf_counter()
+        print(f"    Running vision encoder on FPGA (longest single step, ~40-60s)...", flush=True)
         self.start_execute_from_dram(program_addr)
-        self.wait_queue(600.0)
-        wall_s = time.perf_counter() - t0
+        wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(600.0), label="vision")
         latency_us = self._corrected_hw_latency_us(wall_s)
         vis_gflops = vis_flops / (latency_us * 1e-6) / 1e9
         self._vis_total_flops = vis_flops
@@ -2813,10 +2876,10 @@ def main():
         vis_gflops = getattr(ue, '_vis_gflops', 0)
         vis_run = t_total - t_compile
         print(f"  Vision compile:   {t_compile:.2f}s")
-        print(f"  Vision run:       {vis_run:.2f}s  ({vis_flops/1e9:.1f} GF, {vis_gflops:.2f} GFLOPS)")
+        print(f"  Vision run:       {vis_run:.2f}s  ({vis_gflops:.2f} GFLOPS)")
     print(f"  Prefill compile:  {t_prefill_compile:.2f}s")
     prefill_flops = gflops_prefill if isinstance(gflops_prefill, (int, float)) else 0
-    print(f"  Prefill run:      {latency_prefill:.2f}s  ({prefill_flops/1e9:.1f} GF, {prefill_hw_gflops:.2f} GFLOPS)  ({len(prefill_seq)} tokens)")
+    print(f"  Prefill run:      {latency_prefill:.2f}s  ({prefill_hw_gflops:.2f} GFLOPS)  ({len(prefill_seq)} tokens)")
     print(f"  Decode compile:   {t_decode_compile:.2f}s")
     print(f"  Decode run:       {latency_decoder:.2f}s  ({n_new} tokens, {latency_decoder/max(n_new,1):.2f}s/tok)")
     total = (t_total if has_image else 0) + t_prefill_compile + latency_prefill + t_decode_compile + latency_decoder
