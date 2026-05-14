@@ -1779,9 +1779,16 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         meta_path = os.path.join(bin_dir, "programs.json")
         manifest = {"L_pad": L_pad, "programs": {}}
         all_bytes = bytearray()
+        CHUNK = self.DMA_CHUNK_BYTES
         for name, (addr, size) in program_addrs.items():
             buf = bytearray(size)
-            self.dma_read(DMA_DEVICE_C2H, addr, buf, size)
+            offset = 0
+            while offset < size:
+                chunk_size = min(CHUNK, size - offset)
+                chunk = bytearray(chunk_size)
+                self.dma_read(DMA_DEVICE_C2H, addr + offset, chunk, chunk_size)
+                buf[offset:offset + chunk_size] = chunk
+                offset += chunk_size
             manifest["programs"][name] = {"offset": len(all_bytes), "size": size}
             all_bytes.extend(buf)
         with open(bin_path, "wb") as f:
@@ -1813,8 +1820,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         for name, meta in manifest["programs"].items():
             data = all_bytes[meta["offset"]:meta["offset"] + meta["size"]]
             addr = self.get_program_dram_addr()
+            # manifest size = actual_capture_size + alignment_gap (already baked in from compile).
+            # allocate_program_dram also aligns before advancing, so subtract the gap to avoid
+            # double-counting it and causing all subsequent program addresses to drift.
+            alignment_gap = (-addr) % 64
             self.dma_write(DMA_DEVICE_H2C, addr, data, len(data))
-            self.allocate_program_dram(len(data))
+            self.allocate_program_dram(len(data) - alignment_gap)
             addrs[name] = addr
         _original_print(f"  Programs loaded: {len(all_bytes)} bytes from bin")
         return addrs
@@ -2096,17 +2107,11 @@ def main():
     power_padded = torch.zeros(T_mel_padded, K_padded, dtype=torch.bfloat16)
     power_padded[:T_mel, :257] = power_bt.to(torch.bfloat16)
     engine.dma_to_accelerator_memory(engine.POWER_DRAM, power_padded)
-
-    # Matmul + log on HW
-    engine.program_execute(engine.mel_matmul_prog)   # (128, T_mel_padded) at MEL_TEMP_DRAM
-
-    # Mask + norm on HW (in-place at MEL_TEMP_DRAM)
+    engine.program_execute(engine.mel_matmul_prog)
     mask = torch.zeros(T_mel_padded, dtype=torch.bfloat16)
     mask[:T_mel] = 1.0
     engine.dma_to_accelerator_memory(engine.MASK_DRAM, mask)
-    engine.program_execute(engine.mel_norm_prog)     # (128, T_mel_padded) normed at MEL_TEMP_DRAM
-
-    # Transpose to (T_mel_padded, 128) at MEL_DRAM
+    engine.program_execute(engine.mel_norm_prog)
     engine.program_execute(engine.mel_transpose_prog)
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
     engine.program_execute(im2col_s0)
