@@ -571,7 +571,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.params_from_bin = self.load_params()
         if not self.params_from_bin:
             self.weight_init()
-            self.dump_params()
         self.tensor_init()
 
     @staticmethod
@@ -1521,6 +1520,7 @@ def main():
         prog_addr = ue.compile_full_fused()
         stop_c.set()
         timer_c.join()
+        ue.dump_params()
         ue.dump_programs(prog_addr)
     t_compile = _time.perf_counter()
     _original_print(f"\r  Compile: {t_compile - t_weights:.3f}s")
