@@ -23,7 +23,7 @@ sys.path.insert(0, PROJECT_ROOT)
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
-from user_dma_core import ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
+from user_dma_core import ue_35bit_addr_shifter
 import quant_schemas
 
 import builtins
@@ -626,26 +626,6 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
     with open(json_path, 'w') as f:
         json.dump(manifest, f)
     print(f"Vision weights (padded {precision}): {count} layers + merger, {os.path.getsize(output_path)/1048576:.1f} MB -> {output_path}")
-
-def _snr_cosim(hw: torch.Tensor, ref: torch.Tensor, label: str = "") -> tuple[float, float]:
-    """Compute SNR (dB) and cosine similarity between hw and ref tensors. Returns (snr_db, cos_sim)."""
-    hw_f  = hw.float().flatten()
-    ref_f = ref.float().flatten()
-    has_hw_nan  = torch.isnan(hw_f).any().item()
-    has_ref_nan = torch.isnan(ref_f).any().item()
-    if has_hw_nan:
-        _original_print(f"  [{label}] FPGA has NaN — skipping SNR")
-        return float('-inf'), 0.0
-    if has_ref_nan:
-        _original_print(f"  [{label}] CPU ref has NaN — skipping SNR")
-        return float('nan'), float('nan')
-    signal = ref_f.norm()
-    noise  = (hw_f - ref_f).norm()
-    snr_db  = float(20 * math.log10((signal / (noise + 1e-12)).item()))
-    cos_sim = float(torch.nn.functional.cosine_similarity(hw_f.unsqueeze(0), ref_f.unsqueeze(0)).item())
-    _original_print(f"  [{label}] SNR={snr_db:.1f} dB  cos_sim={cos_sim:.5f}")
-    return snr_db, cos_sim
-
 
 def _load_config(script_dir: str) -> dict:
     """Load qwen2.5_vl_3b_config.json and build weight_defs (offset/size dict) from regions."""
@@ -2170,142 +2150,19 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._image_grid_thw = image_grid_thw  # store for mRoPE computation
         print(f"    Vision encoder output: {self._vis_num_tokens} tokens at 0x{self.VIS_ENCODER_OUT_DRAM:X}")
 
-    def check_prefill_health(self, actual_seq_len: int, bucket_seq_len: int) -> bool:
-        """Read key DRAM buffers after prefill and report NaN locations.
-        Returns True if everything looks clean, False if NaN found anywhere."""
-        ahd  = self.actual_head_dim
-        bpe  = self.bytes_per_element
-        nkvh = self.num_kv_heads
-        ok   = True
-
-        # 1. Final layer output
-        out = self.dma_from_accelerator_memory(
-            self.LAYER0_OUTPUT_DRAM, (bucket_seq_len, self.vector_length))
-        n_nan = int(torch.isnan(out).sum().item())
-        if n_nan:
-            _original_print(f"  [health] LAYER0_OUTPUT_DRAM: {n_nan} NaN elements")
-            ok = False
-        else:
-            _original_print(f"  [health] LAYER0_OUTPUT_DRAM: clean")
-
-        # 2. KV cache — scan all layers, report NaN per layer
-        kv_nan_layers = []
-        for layer_idx in range(self.LAYER_SIZE):
-            layer_kv_nan = 0
-            for kv_h in range(nkvh):
-                base_k = (self.LAYER0_K_ROPE_DRAM
-                          + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
-                          + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
-                base_v = (self.LAYER0_V_DRAM
-                          + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
-                          + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
-                k_rows = self.dma_from_accelerator_memory(base_k, (bucket_seq_len, ahd))
-                v_rows = self.dma_from_accelerator_memory(base_v, (bucket_seq_len, ahd))
-                layer_kv_nan += int(torch.isnan(k_rows).sum().item())
-                layer_kv_nan += int(torch.isnan(v_rows).sum().item())
-                if torch.isnan(k_rows).any():
-                    nan_rows = torch.isnan(k_rows).any(dim=1).nonzero(as_tuple=True)[0].tolist()
-                    _original_print(f"  [health] K L{layer_idx} h{kv_h}: NaN rows {nan_rows[:8]}"
-                                    f"{'...' if len(nan_rows) > 8 else ''}")
-            if layer_kv_nan:
-                kv_nan_layers.append(layer_idx)
-                ok = False
-        if kv_nan_layers:
-            _original_print(f"  [health] KV cache NaN in {len(kv_nan_layers)} layers: {kv_nan_layers[:10]}"
-                            f"{'...' if len(kv_nan_layers) > 10 else ''}")
-        else:
-            _original_print(f"  [health] KV cache: clean (all {self.LAYER_SIZE} layers)")
-
-        # 3. Actual vs padded KV slots: if valid > 0 and pad > 0, show stats
-        if bucket_seq_len > actual_seq_len:
-            _original_print(f"  [health] KV slots: {actual_seq_len} real + {bucket_seq_len - actual_seq_len} padded")
-
-        return ok
-
-    def debug_prefill_cpu(self, prefill_embed: torch.Tensor, actual_seq_len: int,
-                          hf_model_dir: str, num_check_layers: int = 2) -> None:
-        """Run first num_check_layers of LM prefill on CPU and compare against FPGA DRAM.
-        Reads LAYER0_OUTPUT_DRAM for the last compiled layer."""
-        try:
-            from transformers import Qwen2_5_VLForConditionalGeneration
-        except ImportError:
-            _original_print("  [cpu_ref] transformers not available — skipping")
-            return
-
-        _original_print(f"  [cpu_ref] Loading HF model for CPU reference ({num_check_layers} layers)...")
-        hf = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            hf_model_dir, torch_dtype=torch.bfloat16, device_map="cpu")
-        if not hasattr(hf, 'model'):
-            _original_print("  [cpu_ref] Unexpected model structure — skipping")
-            return
-        hf.eval()
-        # Qwen2_5_VLForConditionalGeneration nests the LM under model.language_model
-        lm = hf.model.language_model
-
-        x = prefill_embed[:actual_seq_len].to(torch.bfloat16)  # [actual_seq_len, hidden_size]
-
-        # Check the embedding itself for NaN before touching layers
-        n_nan_embed = int(torch.isnan(x).sum().item())
-        if n_nan_embed:
-            nan_rows = torch.isnan(x).any(dim=1).nonzero(as_tuple=True)[0].tolist()
-            _original_print(f"  [cpu_ref] WARNING: {n_nan_embed} NaN in input embedding "
-                            f"(rows {nan_rows[:8]}{'...' if len(nan_rows) > 8 else ''})")
-        else:
-            _original_print(f"  [cpu_ref] Input embedding: clean ({actual_seq_len} rows)")
-
-        # Build position_ids [1, actual_seq_len] for rotary embedding computation
-        position_ids = torch.arange(actual_seq_len, dtype=torch.long).unsqueeze(0)  # [1, S]
-
-        with torch.no_grad():
-            # Compute cos/sin once for all layers
-            cos, sin = lm.rotary_emb(x.unsqueeze(0), position_ids)  # [1, S, head_dim]
-
-            for layer_idx in range(min(num_check_layers, len(lm.layers))):
-                lyr = lm.layers[layer_idx]
-                residual = x
-                normed = lyr.input_layernorm(x)  # [S, H]
-                q = lyr.self_attn.q_proj(normed)
-                k = lyr.self_attn.k_proj(normed)
-                v = lyr.self_attn.v_proj(normed)
-
-                if layer_idx == 0:
-                    hw_prenorm = self.dma_from_accelerator_memory(
-                        self.LAYER0_PRE_NORM_DRAM, (actual_seq_len, self.vector_length)).cpu()
-                    _snr_cosim(hw_prenorm, normed, f"L{layer_idx} pre-norm")
-                    hw_q = self.dma_from_accelerator_memory(
-                        self.LAYER0_Q_DRAM, (actual_seq_len, self.head_dim * self.group_size)).cpu()
-                    _snr_cosim(hw_q, q, f"L{layer_idx} Q-proj")
-                    hw_k = self.dma_from_accelerator_memory(
-                        self.LAYER0_K_DRAM, (actual_seq_len, self.head_dim)).cpu()
-                    _snr_cosim(hw_k, k, f"L{layer_idx} K-proj")
-
-                # Full layer forward with position_embeddings to propagate residual
-                x = lyr(residual.unsqueeze(0), attention_mask=None,
-                        position_embeddings=(cos, sin))[0].squeeze(0)
-
-        # Compare final layer output against LAYER0_OUTPUT_DRAM (last compiled layer)
-        hw_out = self.dma_from_accelerator_memory(
-            self.LAYER0_OUTPUT_DRAM, (actual_seq_len, self.vector_length)).cpu()
-        _snr_cosim(hw_out, x, f"L{num_check_layers-1} output")
-
-        del hf
-
-    def compile_prefill(self, bucket_seq_len: int, layer_size: int | None = None) -> tuple:
-        """Compile prefill program for a fixed bucket size. Returns (program_addr, total_flops).
-
-        bucket_seq_len must be one of prefill_seq_len_buckets from the config. The caller
-        is responsible for picking the smallest bucket >= the actual prompt length.
-        """
+    def compile_prefill(self, seq_len: int, layer_size: int | None = None) -> dict:
+        """Compile prefill program for given seq_len. Returns (addr, flops)."""
         if layer_size is None:
             layer_size = self.LAYER_SIZE
 
+        # Check for cached prefill program
         bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
         os.makedirs(bin_dir, exist_ok=True)
-        cache_path = os.path.join(bin_dir, f"prefill_program_s{bucket_seq_len}.bin")
-        meta_path = os.path.join(bin_dir, f"prefill_program_s{bucket_seq_len}.json")
+        cache_path = os.path.join(bin_dir, f"prefill_program_s{seq_len}.bin")
+        meta_path = os.path.join(bin_dir, f"prefill_program_s{seq_len}.json")
 
         if os.path.exists(cache_path) and os.path.exists(meta_path):
-            _original_print(f"  Loading cached prefill program (bucket={bucket_seq_len}) from {cache_path} ...")
+            _original_print(f"  Loading cached prefill program (seq_len={seq_len-1}) from {cache_path} ...")
             with open(cache_path, "rb") as f:
                 prog_bytes = f.read()
             with open(meta_path, "r") as f:
@@ -2313,10 +2170,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             program_addr = self.get_program_dram_addr()
             self.dma_write(DMA_DEVICE_H2C, program_addr, prog_bytes, len(prog_bytes))
             self.allocate_program_dram(len(prog_bytes))
+            self.seq_len = seq_len - 1
             return program_addr, meta["total_flops"]
 
-        seq_len = bucket_seq_len
+        seq_len -= 1
         self.seq_len = seq_len
+        q_seq_len = seq_len * self.group_size
+        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
         aligned_tok = ((seq_len + 63) // 64) * 64
 
         ahd  = self.actual_head_dim
@@ -2328,86 +2188,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         _SILENT_MODE = True
-        # Regs 1-3 are fixed (V_CACHE_SIZE_REG, TMP_REG, ROPE_SIZE_REG); start PBI loops above them.
-        _pbi_reg_base = max(self.V_CACHE_SIZE_REG, self.TMP_REG, self.ROPE_SIZE_REG) + 1
-        self._isa_reg_counter = _pbi_reg_base
         self.start_capture()
         total_flops = 0
-
-        row_bytes = ahd * bpe
-
-        def scatter_two_dests_pbi(src_base, src_stride, dst1_base, dst2_base, load_sram):
-            """PBI scatter: load seq_len rows from src (strided) → store to two DRAM dests (row_bytes stride)."""
-            _, load_uram = self.sram_address_to_uram_address(load_sram)
-            load_ptr   = self.alloc_inst_ptr()
-            store1_ptr = self.alloc_inst_ptr()
-            store2_ptr = self.alloc_inst_ptr()
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=src_base, dma_length=src_stride,
-                output_size=0, uram_length=0,
-                uram_a_start_addr=0, uram_b_start_addr=0, uram_wb_addr=0,
-                uram_dst_addr=load_uram, fmax_context_addr=0,
-                inst_pointer_idx=load_ptr)
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=dst1_base, dma_length=row_bytes,
-                output_size=0, uram_length=0,
-                uram_a_start_addr=load_uram, uram_b_start_addr=load_uram, uram_wb_addr=0,
-                uram_dst_addr=0, fmax_context_addr=0,
-                inst_pointer_idx=store1_ptr)
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=dst2_base, dma_length=row_bytes,
-                output_size=0, uram_length=0,
-                uram_a_start_addr=load_uram, uram_b_start_addr=load_uram, uram_wb_addr=0,
-                uram_dst_addr=0, fmax_context_addr=0,
-                inst_pointer_idx=store2_ptr)
-            prog_base = self.get_program_dram_addr()
-            self.generate_instruction_jump_abs(
-                ue_35bit_addr_shifter(prog_base + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
-            self.loop_start(seq_len)
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=src_stride, sram_address=load_sram,
-                element_size=0, inst_pointer_idx=load_ptr, memcpy_length_bytes=row_bytes)
-            self.sram_to_accelerator_memory(
-                sram_address=load_sram, accelerator_dram_address=row_bytes,
-                element_size=0, inst_pointer_idx=store1_ptr, memcpy_length_bytes=row_bytes)
-            self.sram_to_accelerator_memory(
-                sram_address=load_sram, accelerator_dram_address=row_bytes,
-                element_size=0, inst_pointer_idx=store2_ptr, memcpy_length_bytes=row_bytes)
-            self.loop_end()
-            self.release_inst_ptr(store2_ptr)
-            self.release_inst_ptr(store1_ptr)
-            self.release_inst_ptr(load_ptr)
-
-        def scatter_one_dest_pbi(src_base, src_stride, dst_base, dst_stride, load_sram):
-            """PBI scatter: load seq_len rows from src (strided) → store to dst (strided)."""
-            _, load_uram = self.sram_address_to_uram_address(load_sram)
-            load_ptr  = self.alloc_inst_ptr()
-            store_ptr = self.alloc_inst_ptr()
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=src_base, dma_length=src_stride,
-                output_size=0, uram_length=0,
-                uram_a_start_addr=0, uram_b_start_addr=0, uram_wb_addr=0,
-                uram_dst_addr=load_uram, fmax_context_addr=0,
-                inst_pointer_idx=load_ptr)
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=dst_base, dma_length=dst_stride,
-                output_size=0, uram_length=0,
-                uram_a_start_addr=load_uram, uram_b_start_addr=load_uram, uram_wb_addr=0,
-                uram_dst_addr=0, fmax_context_addr=0,
-                inst_pointer_idx=store_ptr)
-            prog_base = self.get_program_dram_addr()
-            self.generate_instruction_jump_abs(
-                ue_35bit_addr_shifter(prog_base + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
-            self.loop_start(seq_len)
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=src_stride, sram_address=load_sram,
-                element_size=0, inst_pointer_idx=load_ptr, memcpy_length_bytes=row_bytes)
-            self.sram_to_accelerator_memory(
-                sram_address=load_sram, accelerator_dram_address=dst_stride,
-                element_size=0, inst_pointer_idx=store_ptr, memcpy_length_bytes=row_bytes)
-            self.loop_end()
-            self.release_inst_ptr(store_ptr)
-            self.release_inst_ptr(load_ptr)
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         _original_print(f"  Compiling prefill seq_len={seq_len}, {layer_size} layers...")
         for layer_idx in range(layer_size):
@@ -2423,16 +2205,18 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'])
 
             # Q, K, V projections with bias
-            total_flops += self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=hd * qpkv,
+            total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4, C_DRAM_ADDR=la['q_bias'], use_pbi=True)
-            total_flops += self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=hd,
+                SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
+                C_DRAM_ADDR=la['q_bias'])
+            total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4, C_DRAM_ADDR=la['k_bias'], use_pbi=True)
-            # v_proj: BF16 weights, pbi safe for standard matmul
+                SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
+                C_DRAM_ADDR=la['k_bias'])
+            # v_proj writes to temp buffer (seq_len, hd) in standard per-head interleaved layout (BF16)
             total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
-                C_DRAM_ADDR=la['v_bias'], use_pbi=True)
+                C_DRAM_ADDR=la['v_bias'])
 
             # Qwen2.5-VL: NO QK RMSNorm
             # Copy K_DRAM → K_NORM_DRAM (no scaling)
@@ -2442,7 +2226,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_Q_DRAM, sram_address=0x10000, element_size=seq_len * hd * qpkv)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_Q_NORM_DRAM, element_size=seq_len * hd * qpkv)
 
-            # RoPE — K: legacy per-token loop (nkvh=2, kept non-pbi)
+            # RoPE per head per token: K uses single RoPE base
             ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE
             for t in range(seq_len):
                 cos_addr = ROPE_WEIGHT_ADDR + t * rope_row_bytes
@@ -2454,17 +2238,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         output_dram_addr=self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe,
                         cos_dram_addr=cos_addr,
                         sin_dram_addr=sin_addr)
-
-            # RoPE — Q: pbi over [seq_len, nkvh*qpkv, ahd], one rope entry per token broadcast to all heads
-            total_flops += self.rope_hf_core_dram_gqa_pbi(
-                M=seq_len,
-                group_size=nkvh * qpkv,
-                N=ahd,
-                input_dram_addr=self.LAYER0_Q_NORM_DRAM,
-                output_dram_addr=self.LAYER0_Q_NORM_DRAM,
-                cos_dram_addr=ROPE_WEIGHT_ADDR,
-                sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
-            )
+                for q_h in range(nkvh * qpkv):
+                    total_flops += self.rope_hf_core(
+                        N=ahd,
+                        input_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
+                        output_dram_addr=self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + q_h) * ahd * bpe,
+                        cos_dram_addr=cos_addr,
+                        sin_dram_addr=sin_addr)
 
             # Per-Q-head flash attention: one Q head at a time, K/V shared within KV group
             for kv_h in range(nkvh):
@@ -2475,33 +2255,29 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                                 + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
                                 + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
 
-                # Scatter roped K_h → KV cache + FLASH_K
-                scatter_two_dests_pbi(
-                    src_base=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
-                    src_stride=nkvh * ahd * bpe,
-                    dst1_base=k_cache_base,
-                    dst2_base=self.LAYER0_FLASH_K_DRAM,
-                    load_sram=0x10000)
+                # Scatter roped K_h → KV cache + FLASH_K (ONE copy, no GQA dup)
+                for t in range(seq_len):
+                    k_src = self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe
+                    self.accelerator_memory_to_sram(k_src, 0x10000, ahd)
+                    self.sram_to_accelerator_memory(0x10000, k_cache_base + t * ahd * bpe, ahd)
+                    self.sram_to_accelerator_memory(0x10000, self.LAYER0_FLASH_K_DRAM + t * ahd * bpe, ahd)
 
-                # Scatter V_h → KV cache + FLASH_V
-                scatter_two_dests_pbi(
-                    src_base=self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe,
-                    src_stride=nkvh * ahd * bpe,
-                    dst1_base=v_cache_base,
-                    dst2_base=self.LAYER0_FLASH_V_DRAM,
-                    load_sram=0x20000)
+                # Scatter V_h from V_PROJ_TEMP → KV cache + FLASH_V (ONE copy, no GQA dup)
+                for t in range(seq_len):
+                    v_src = self.LAYER0_V_PROJ_TEMP + (t * nkvh + kv_h) * ahd * bpe
+                    self.accelerator_memory_to_sram(v_src, 0x20000, ahd)
+                    self.sram_to_accelerator_memory(0x20000, v_cache_base + t * ahd * bpe, ahd)
+                    self.sram_to_accelerator_memory(0x20000, self.LAYER0_FLASH_V_DRAM + t * ahd * bpe, ahd)
 
-                # Per-Q-head: scatter Q head, flash attention, assemble output
+                # Per-Q-head: scatter one Q head, flash attention, assemble output
                 for q_idx in range(qpkv):
-                    # Scatter Q head for all tokens → FLASH_Q
-                    scatter_one_dest_pbi(
-                        src_base=self.LAYER0_Q_NORM_DRAM + (kv_h * qpkv + q_idx) * ahd * bpe,
-                        src_stride=nkvh * qpkv * ahd * bpe,
-                        dst_base=self.LAYER0_FLASH_Q_DRAM,
-                        dst_stride=ahd * bpe,
-                        load_sram=0x30000)
+                    # Scatter Q head (kv_h * qpkv + q_idx) for all tokens → FLASH_Q
+                    for t in range(seq_len):
+                        q_src = self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + kv_h * qpkv + q_idx) * ahd * bpe
+                        self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
+                        self.sram_to_accelerator_memory(0x30000, self.LAYER0_FLASH_Q_DRAM + t * ahd * bpe, ahd)
 
-                    # Flash attention for this single Q head
+                    # Flash attention for this single Q head (seq_len = aligned_tok, standard causal)
                     total_flops += self._flash_attention_core_cached(
                         head_dim=ahd,
                         seq_len=aligned_tok,
@@ -2513,19 +2289,17 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     )
 
-                    # Assemble output head into FLASH_OUTPUT_DRAM at correct head position
+                    # Assemble: copy output to FLASH_OUTPUT_DRAM at correct head position
                     global_q_h = kv_h * qpkv + q_idx
-                    scatter_one_dest_pbi(
-                        src_base=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                        src_stride=ahd * bpe,
-                        dst_base=self.LAYER0_FLASH_OUTPUT_DRAM + global_q_h * ahd * bpe,
-                        dst_stride=hd * qpkv * bpe,
-                        load_sram=0x40000)
+                    for t in range(seq_len):
+                        src = self.LAYER0_FLASH_OUT_HEAD_DRAM + t * ahd * bpe
+                        dst = self.LAYER0_FLASH_OUTPUT_DRAM + t * hd * qpkv * bpe + global_q_h * ahd * bpe
+                        self.accelerator_memory_to_sram(src, 0x40000, ahd)
+                        self.sram_to_accelerator_memory(0x40000, dst, ahd)
 
             # o_proj: (seq_len, hd * qpkv) → (seq_len, vector_length) (BF16)
             total_flops += self.matmat_mul_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'],
-                OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, use_pbi=True)
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM)
 
             # Qwen2.5-VL: no post-attention norm; add residual directly to o_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
@@ -2538,72 +2312,30 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln2_gamma'])
 
             # MLP: gate_proj with SiLU, up_proj, gate x up element-wise, down_proj
-            total_flops += self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
+            total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True, use_pbi=True)
-            total_flops += self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True)
+            total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4, use_pbi=True)
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4)
 
-            # gate x up: pbi hardware loop over M_CHUNK-row tiles, explicit tail for remainder
-            _M_CHUNK = (0x80000 - 0x10000) // 2 // self.mlp_elements  # max rows fitting both gate+up in URAM
-            _chunk_elems = _M_CHUNK * self.mlp_elements
-            _chunk_bytes = _chunk_elems * bpe
-            _num_chunks  = seq_len // _M_CHUNK
-            _tail_rows   = seq_len  %  _M_CHUNK
-
-            if _num_chunks > 0:
-                _, _gate_uram = self.sram_address_to_uram_address(0x10000)
-                _, _up_uram   = self.sram_address_to_uram_address(0x90000)
-                _gp = self.alloc_inst_ptr()
-                _up = self.alloc_inst_ptr()
-                _mp = self.alloc_inst_ptr()
-                self.generate_instruction_pbi_init(
-                    dram_shared_addr=self.LAYER0_MLP_GATE_DRAM, dma_length=_chunk_bytes,
-                    output_size=0, uram_length=0,
-                    uram_a_start_addr=0, uram_b_start_addr=0, uram_wb_addr=0,
-                    uram_dst_addr=_gate_uram, fmax_context_addr=0, inst_pointer_idx=_gp)
-                self.generate_instruction_pbi_init(
-                    dram_shared_addr=self.LAYER0_MLP_UP_DRAM, dma_length=_chunk_bytes,
-                    output_size=0, uram_length=0,
-                    uram_a_start_addr=0, uram_b_start_addr=0, uram_wb_addr=0,
-                    uram_dst_addr=_up_uram, fmax_context_addr=0, inst_pointer_idx=_up)
-                self.generate_instruction_pbi_init(
-                    dram_shared_addr=self.LAYER0_MLP_MULT_DRAM, dma_length=_chunk_bytes,
-                    output_size=0, uram_length=0,
-                    uram_a_start_addr=_gate_uram, uram_b_start_addr=_gate_uram, uram_wb_addr=0,
-                    uram_dst_addr=0, fmax_context_addr=0, inst_pointer_idx=_mp)
-                _prog_base = self.get_program_dram_addr()
-                self.generate_instruction_jump_abs(
-                    ue_35bit_addr_shifter(_prog_base + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
-                self.loop_start(_num_chunks)
-                self.accelerator_memory_to_sram(
-                    accelerator_dram_address=_chunk_bytes, sram_address=0x10000,
-                    element_size=0, inst_pointer_idx=_gp, memcpy_length_bytes=_chunk_bytes)
-                self.accelerator_memory_to_sram(
-                    accelerator_dram_address=_chunk_bytes, sram_address=0x90000,
-                    element_size=0, inst_pointer_idx=_up, memcpy_length_bytes=_chunk_bytes)
-                self.eltwise_mul_core(0x10000, 0x90000, 0x10000, _chunk_elems)
-                self.sram_to_accelerator_memory(
-                    sram_address=0x10000, accelerator_dram_address=_chunk_bytes,
-                    element_size=0, inst_pointer_idx=_mp, memcpy_length_bytes=_chunk_bytes)
-                self.loop_end()
-                self.release_inst_ptr(_mp)
-                self.release_inst_ptr(_up)
-                self.release_inst_ptr(_gp)
-
-            if _tail_rows > 0:
-                _tail_off   = _num_chunks * _chunk_bytes
-                _tail_elems = _tail_rows * self.mlp_elements
-                self.accelerator_memory_to_sram(self.LAYER0_MLP_GATE_DRAM + _tail_off, 0x10000, _tail_elems)
-                self.accelerator_memory_to_sram(self.LAYER0_MLP_UP_DRAM   + _tail_off, 0x90000, _tail_elems)
-                self.eltwise_mul_core(0x10000, 0x90000, 0x10000, _tail_elems)
-                self.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM + _tail_off, _tail_elems)
+            # gate x up chunked: process M_CHUNK rows at a time
+            _bpe = self.bytes_per_element
+            _M_CHUNK = min((0x80000 - 0x10000) // 2 // self.mlp_elements, seq_len)
+            for _t in range(0, seq_len, _M_CHUNK):
+                _m_take = min(_M_CHUNK, seq_len - _t)
+                _g_row = self.LAYER0_MLP_GATE_DRAM + _t * self.mlp_elements * _bpe
+                _u_row = self.LAYER0_MLP_UP_DRAM   + _t * self.mlp_elements * _bpe
+                _m_row = self.LAYER0_MLP_MULT_DRAM  + _t * self.mlp_elements * _bpe
+                self.accelerator_memory_to_sram(_g_row, 0x10000, _m_take * self.mlp_elements)
+                self.accelerator_memory_to_sram(_u_row, 0x90000, _m_take * self.mlp_elements)
+                self.eltwise_mul_core(0x10000, 0x90000, 0x10000, _m_take * self.mlp_elements)
+                self.sram_to_accelerator_memory(0x10000, _m_row, _m_take * self.mlp_elements)
 
             # down_proj
-            total_flops += self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.mlp_elements, N=self.vector_length,
+            total_flops += self.matmat_mul_core(is_B_quantized=True,M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4, use_pbi=True)
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4)
 
             # Qwen2.5-VL: no post-FFN norm; add residual directly to down_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
@@ -2627,34 +2359,30 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         with open(cache_path, "wb") as f:
             f.write(prog_bytes)
         with open(meta_path, "w") as f:
-            json.dump({"total_flops": total_flops, "bucket_seq_len": bucket_seq_len}, f)
+            json.dump({"total_flops": total_flops, "seq_len": seq_len}, f)
         print(f"    Prefill program cached to {cache_path} ({len(prog_bytes)} bytes)")
         print(f"    Prefill program start at 0x{prefill_program_addr:X} end at 0x{self.get_program_dram_addr():X}, usage: {self.get_program_dram_usage()} bytes")
 
         return prefill_program_addr, total_flops
 
-    def run_prefill(self, prefill_program_addr: int, prefill_seq, gflops: int = None, has_image: bool = False, bucket_seq_len: int = None) -> dict:
-        """Run prefill: gather embeddings, optionally merge vision tokens, then execute.
-
-        bucket_seq_len: the compiled bucket size. If larger than the actual prompt, the
-        embedding is padded with zeros and the attention bias masks out the padding columns.
-        """
+    def run_prefill(self, prefill_program_addr: int, prefill_seq, gflops: int = None, has_image: bool = False) -> dict:
+        """Run prefill: gather embeddings, optionally merge vision tokens, then execute."""
         if prefill_seq is None:
             prefill_seq = tuple(self._cfg["default_prefill_tokens"])
 
         # Prefill processes all but the last token
         if len(prefill_seq) > 1:
             prefill_seq = prefill_seq[:-1]
+            assert len(prefill_seq) == self.seq_len, f"Expected seq_len {self.seq_len}, but got {len(prefill_seq)}"
         else:
             raise ValueError("Prefill sequence must have at least 2 tokens.")
 
-        actual_seq_len = len(prefill_seq)
-        if bucket_seq_len is None:
-            bucket_seq_len = actual_seq_len
-        assert actual_seq_len <= bucket_seq_len, f"actual_seq_len {actual_seq_len} exceeds bucket_seq_len {bucket_seq_len}"
-
-        aligned_tok = ((bucket_seq_len + 63) // 64) * 64
+        seq_len = len(prefill_seq)
+        q_seq_len = seq_len * self.group_size
+        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        aligned_tok = ((seq_len + 63) // 64) * 64
         bpe = self.bytes_per_element
+        embed_row_bytes = self.vector_length * bpe
 
         # Gather text embeddings
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
@@ -2665,43 +2393,27 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             img_positions = [i for i, t in enumerate(prefill_seq) if t == vision_token_id]
             num_vis = getattr(self, '_vis_num_tokens', 0)
             if len(img_positions) > 0 and num_vis > 0:
+                # Read vision output from device DRAM back to host for merge
                 vis_embeddings = self.dma_from_accelerator_memory(
                     self.VIS_ENCODER_OUT_DRAM, (num_vis, self.vector_length)).cpu()
-                embed_reshaped = embedding_tensor.reshape(actual_seq_len, self.vector_length)
+
+                # Overwrite image token positions with vision embeddings
+                embed_reshaped = embedding_tensor.reshape(seq_len, self.vector_length)
                 n_replace = min(len(img_positions), num_vis)
                 for i in range(n_replace):
                     embed_reshaped[img_positions[i]] = vis_embeddings[i]
                 embedding_tensor = embed_reshaped.flatten()
                 print(f"    Merged {n_replace} vision tokens into prefill at positions {img_positions[:5]}{'...' if len(img_positions) > 5 else ''}")
 
-        # Sanity-check the embedding for NaN before it reaches the hardware.
-        n_nan_emb = int(torch.isnan(embedding_tensor).sum().item())
-        if n_nan_emb:
-            nan_rows = torch.isnan(embedding_tensor.reshape(actual_seq_len, self.vector_length)).any(dim=1).nonzero(as_tuple=True)[0].tolist()
-            _original_print(f"  [run_prefill] WARNING: {n_nan_emb} NaN values in input embedding "
-                            f"(rows {nan_rows[:8]}{'...' if len(nan_rows) > 8 else ''})")
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
 
-        # Pad embedding to bucket size by repeating the last valid row.
-        # Zero-padding would produce NaN: RMSNorm(0-vec) = 0/sqrt(0) = NaN,
-        # which propagates through Q/K/V into the KV cache and corrupts decode.
-        embed_2d = embedding_tensor.reshape(actual_seq_len, self.vector_length)
-        if bucket_seq_len > actual_seq_len:
-            pad_rows = bucket_seq_len - actual_seq_len
-            last_row = embed_2d[-1:].expand(pad_rows, -1)
-            embed_2d = torch.cat([embed_2d, last_row], dim=0)
-        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embed_2d.reshape(-1))
-
-        # Causal bias: (aligned_tok x aligned_tok), -inf above diagonal and on padding columns
-        bias = torch.full((aligned_tok, aligned_tok), float("-inf"), dtype=torch.bfloat16)
-        valid_mask = torch.tril(torch.ones(aligned_tok, aligned_tok, dtype=torch.bool))
-        bias.masked_fill_(valid_mask, 0.0)
-        # Mask out padding columns so pad tokens never attend to anything real
-        bias[:, actual_seq_len:] = float("-inf")
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias)
+        # Build causal bias mask (standard lower-triangular on aligned_tok x aligned_tok)
+        bias_one_group = torch.full((aligned_tok, aligned_tok), float("-inf"), dtype=torch.bfloat16)
+        valid_mask = torch.tril(torch.ones(aligned_tok, aligned_tok, dtype=torch.bool), diagonal=0) if not self.causal_mask_upper else torch.triu(torch.ones(aligned_tok, aligned_tok, dtype=torch.bool), diagonal=0)
+        bias_one_group.masked_fill_(valid_mask, 0.0)
+        bias_one_group[:, seq_len:] = float("-inf")
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
         self.program_execute(prefill_program_addr, gflops=gflops)
-        # Decoder uses self.seq_len as the starting KV context size.
-        # Set it to the actual (not bucket) length so decode skips the padded KV slots.
-        self.seq_len = actual_seq_len
 
     def compile_decoder(self, layer_size: int | None = None) -> tuple[list[int], list[int]]:
         """Compile decoder programs for seq_len buckets; write decoder_program.bin and decoder_program.json.
@@ -2971,10 +2683,6 @@ def main():
                         help='Run vision encoder on CPU (fp32) instead of FPGA — for quality comparison')
     parser.add_argument('--rep-penalty', type=float, default=1.05,
                         help='Repetition penalty (1.0=off, default: 1.05)')
-    parser.add_argument('--debug-prefill', action='store_true',
-                        help='After prefill, read DRAM and report NaN locations in output + KV cache')
-    parser.add_argument('--debug-prefill-cpu', action='store_true',
-                        help='After prefill, reload HF model and compare layer 0 outputs (slow)')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3115,34 +2823,16 @@ def main():
 
     print(f"\n--- Prefill compile ---")
     timer = time.perf_counter()
-    prefill_buckets = list(cfg["model"]["prefill_seq_len_buckets"])
-    actual_prefill_len = len(prefill_seq) - 1  # last token feeds decoder
-    max_bucket = prefill_buckets[-1]
-    if actual_prefill_len > max_bucket:
-        raise ValueError(f"Prompt prefill length {actual_prefill_len} exceeds largest bucket ({max_bucket}). Add a larger bucket or shorten the prompt.")
-    bucket_seq_len = next(b for b in prefill_buckets if b >= actual_prefill_len)
-    print(f"  actual={actual_prefill_len} tokens → bucket={bucket_seq_len}")
-    prefill_program_addr, gflops_prefill = ue.compile_prefill(bucket_seq_len=bucket_seq_len)
+    prefill_program_addr, gflops_prefill = ue.compile_prefill(seq_len=len(prefill_seq))
     t_prefill_compile = time.perf_counter() - timer
     print(f"  {t_prefill_compile:.2f}s")
 
-    print(f"\n--- Prefill run ({actual_prefill_len} tokens, bucket={bucket_seq_len}) ---")
+    print(f"\n--- Prefill run ({len(prefill_seq)} tokens) ---")
     timer = time.perf_counter()
-    ue.run_prefill(prefill_program_addr, prefill_seq=prefill_seq, gflops=gflops_prefill, has_image=has_image, bucket_seq_len=bucket_seq_len)
+    ue.run_prefill(prefill_program_addr, prefill_seq=prefill_seq, gflops=gflops_prefill, has_image=has_image)
     latency_prefill = time.perf_counter() - timer
     prefill_hw_gflops = getattr(ue, '_last_hw_gflops', 0)
     print(f"  {latency_prefill:.2f}s")
-
-    if args.debug_prefill:
-        print(f"\n--- Prefill health check ---")
-        healthy = ue.check_prefill_health(actual_prefill_len, bucket_seq_len)
-        print(f"  {'OK' if healthy else 'FAIL — NaN detected (see above)'}")
-
-    if args.debug_prefill_cpu:
-        print(f"\n--- Prefill CPU reference (layer 0–1) ---")
-        hf_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
-        _embed_2d = ue.get_embedding_for_tokens(list(prefill_seq[:-1][:actual_prefill_len]))
-        ue.debug_prefill_cpu(_embed_2d, actual_prefill_len, hf_dir, num_check_layers=2)
 
     print(f"\n--- Decode compile ---")
     timer = time.perf_counter()
