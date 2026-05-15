@@ -225,7 +225,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     with open(out_path, "wb") as f:
         f.write(buf)
     print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
-    return out_path
+    return out_path, model, model_dir
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
     """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
@@ -382,14 +382,19 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     def weight_init(self) -> None:
         """Ensure weight bin exists (generate from HF if missing), load it, then initialize DRAM: embedding, layers from bin, RoPE, OUTPUT_NORM/LM_HEAD."""
         full_path = os.path.join(self.script_dir, self._weights_bin_rel)
+        hf_model = None
         if os.path.exists(full_path):
             print(f"Weight bin exists, skip generation: {full_path}")
         else:
             print(f"Weight bin not found, generating: {full_path}")
-            weight_bin_generate(output_path=full_path)
+            _, hf_model, _ = weight_bin_generate(output_path=full_path)
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
-        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
+        if hf_model is None:
+            hf_model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
+        else:
+            model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
+        model = hf_model
         embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
         embedding_scale = model.config.hidden_size ** 0.5
         self.embedding_weight = (embed.float() * embedding_scale).to(torch.bfloat16)

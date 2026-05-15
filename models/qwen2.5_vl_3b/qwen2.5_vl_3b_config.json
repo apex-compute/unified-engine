@@ -20,8 +20,16 @@
   "model": {
     "max_context_size": 512,
     "end_of_turn_token_id": 151645,
-    "prefill_seq_len_buckets": [192, 256, 320, 384, 448, 512],
-    "decoder_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
+    "decoder_seq_len_buckets": [
+      64,
+      128,
+      192,
+      256,
+      320,
+      384,
+      448,
+      512
+    ],
     "rope_global_layers": []
   },
   "vision": {

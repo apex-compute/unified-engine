@@ -368,7 +368,14 @@ def quantize_if4(weight: torch.Tensor, block_size: int = 64,
     fp4_scale_bf = (abs_max / 6.0).to(torch.bfloat16)
     # fp4_scaled = (blocks_bf / fp4_scale_bf.unsqueeze(-1)).to(torch.bfloat16)
     fp4_scaled = blocks_f / fp4_scale_bf.float().unsqueeze(-1)
-    fp4_idx = (fp4_scaled.float().unsqueeze(-1) - fp4_v).abs().argmin(dim=-1)
+    # Compute argmin without materializing the full (N, blocks, block_size, 16) tensor.
+    best_dist = torch.full(fp4_scaled.shape, float("inf"))
+    fp4_idx = torch.zeros(fp4_scaled.shape, dtype=torch.long)
+    for i, v in enumerate(fp4_v):
+        dist = (fp4_scaled - v).abs()
+        better = dist < best_dist
+        best_dist = torch.where(better, dist, best_dist)
+        fp4_idx = torch.where(better, torch.tensor(i, dtype=torch.long), fp4_idx)
     fp4_recon = fp4_v[fp4_idx] * fp4_scale_bf.float().unsqueeze(-1)
     fp4_err = ((blocks_f - fp4_recon) ** 2).sum(dim=-1)
 
