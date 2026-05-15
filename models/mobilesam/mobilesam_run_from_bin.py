@@ -273,6 +273,7 @@ def main():
     _original_print(f"MobileSAM on {args.dev} (from pre-compiled bins)")
 
     engine = MobileSAM_UE_Run(clock_period_ns=args.cycle)
+    engine.software_reset()
     engine.load_params()
 
     with open(os.path.join(BIN_DIR, "params.json")) as f:

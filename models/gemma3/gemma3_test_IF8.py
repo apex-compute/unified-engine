@@ -1455,10 +1455,12 @@ def main():
     dual_engine = args.dual_engine
     assert dual_engine == False, "Dual engine is not supported yet for pbi mode"
     ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine)
+    ue.software_reset()
     ue.set_prefill_seq(args.prompt)
 
     if dual_engine:
         ue2 = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True)
+        ue2.software_reset()
         ue2.set_prefill_seq(args.prompt)
 
     print(f"\n--- Compiling ---")

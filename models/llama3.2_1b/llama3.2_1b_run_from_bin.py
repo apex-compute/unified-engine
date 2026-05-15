@@ -531,6 +531,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 _original_print(f"\nStop token {token_id} reached.")
                 break
             _original_print(token_char, end="", flush=True)
+
         return self.seq_len
 
 
@@ -577,6 +578,7 @@ def main():
     t0 = time.perf_counter()
     _original_print("Loading weights...")
     ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin)
+    ue.software_reset()
     _original_print(f"  Weights + tensors: {time.perf_counter() - t0:.2f}s")
 
     cfg = _load_config(script_dir)

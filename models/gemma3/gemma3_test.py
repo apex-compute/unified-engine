@@ -294,8 +294,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._rope_global_layers = set(model["rope_global_layers"])
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
         self._gamma_bin_offset = self._cfg["special"]["rms_norm"]["gamma_offset"]
-        self.prefill_seq = None 
+        self.prefill_seq = None
         self.engine_slave = engine_slave
+        self._instruction_program_addr = None
 
         self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
@@ -1397,7 +1398,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         latency_decoder = time.perf_counter() - timer
         print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(self.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
         print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(self.prefill_seq) + 1):.2f} Gflops")
-        
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -1478,10 +1480,12 @@ def main():
         "future work. Re-run without --dual-engine until validation lands."
     )
     ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine)
+    ue.software_reset()
     ue.set_prefill_seq(args.prompt)
 
     if dual_engine:
         ue2 = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True)
+        ue2.software_reset()
         ue2.set_prefill_seq(args.prompt)
 
     print(f"\n--- Compiling ---")

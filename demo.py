@@ -14,13 +14,13 @@ AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg"}
 SAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_samples")
 
 MODELS = [
-    {"name": "gemma3",        "test": "models/gemma3/gemma3_test.py",                "run": "models/gemma3/gemma3_run_from_bin.py",           "bin_dir": "models/gemma3/gemma3_bin"},
-    {"name": "gpt2",          "test": "models/gpt2/gpt2_test.py",                    "run": "models/gpt2/gpt2_run_from_bin.py",               "bin_dir": "models/gpt2/gpt2_bin"},
-    {"name": "llama3.2_1b",   "test": "models/llama3.2_1b/llama3.2_1b_test.py",     "run": "models/llama3.2_1b/llama3.2_1b_run_from_bin.py", "bin_dir": "models/llama3.2_1b/llama3.2_1b_bin"},
+    {"name": "gemma3",        "test": "models/gemma3/gemma3_test.py",                "run": "models/gemma3/gemma3_run_from_bin.py",           "bin_dir": "models/gemma3/gemma3_bin",        "input_type": "text",  "input_arg": "--prompt"},
+    {"name": "gpt2",          "test": "models/gpt2/gpt2_test.py",                    "run": "models/gpt2/gpt2_run_from_bin.py",               "bin_dir": "models/gpt2/gpt2_bin",            "input_type": "text",  "input_arg": "--prompt"},
+    {"name": "llama3.2_1b",   "test": "models/llama3.2_1b/llama3.2_1b_test.py",     "run": "models/llama3.2_1b/llama3.2_1b_run_from_bin.py", "bin_dir": "models/llama3.2_1b/llama3.2_1b_bin", "input_type": "text", "input_arg": "--prompt"},
     {"name": "mobilesam",     "test": "models/mobilesam/mobilesam_test.py",          "run": "models/mobilesam/mobilesam_run_from_bin.py",     "bin_dir": "models/mobilesam/mobilesam_bin",  "input_type": "image", "input_arg": "--image", "output_image": "models/mobilesam/mask_point.png"},
     {"name": "parakeet",      "test": "models/parakeet/parakeet_test.py",            "run": "models/parakeet/parakeet_run_from_bin.py",       "bin_dir": "models/parakeet/parakeet_bin",    "input_type": "audio", "input_arg": "--audio"},
     {"name": "qwen2.5_vl_3b", "test": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py","run": None,                                              "bin_dir": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin"},
-    {"name": "qwen3_1.7b",    "test": "models/qwen3_1.7b/qwen3_1.7b_test.py",       "run": "models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py",   "bin_dir": "models/qwen3_1.7b/qwen3_1.7b_bin"},
+    {"name": "qwen3_1.7b",    "test": "models/qwen3_1.7b/qwen3_1.7b_test.py",       "run": "models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py",   "bin_dir": "models/qwen3_1.7b/qwen3_1.7b_bin", "input_type": "text", "input_arg": "--prompt"},
     {"name": "smolvlm2",      "test": "models/smolvlm2/smolvlm2_test.py",           "run": "models/smolvlm2/smolvlm2_run_from_bin.py",       "bin_dir": "models/smolvlm2/smolvlm2_bin",    "input_type": "image", "input_arg": "--image"},
     {"name": "swin",          "test": "models/swin/swin_test.py",                    "run": "models/swin/swin_run_from_bin.py",               "bin_dir": "models/swin/swin_bin",            "input_type": "image", "input_arg": "--image"},
 ]
@@ -348,6 +348,50 @@ def file_picker_popup(stdscr, title, files):
             return None
 
 
+# ── text input popup ─────────────────────────────────────────────────────────
+
+def text_input_popup(stdscr, title):
+    """Single-line text entry. Returns the entered string, or None on cancel.
+    Empty string means use the model default."""
+    h, w = stdscr.getmaxyx()
+    box_w = min(max(len(title) + 4, 60), w - 4)
+    box_h = 6
+    by = (h - box_h) // 2
+    bx = (w - box_w) // 2
+
+    win = curses.newwin(box_h, box_w, by, bx)
+    win.keypad(True)
+    curses.curs_set(1)
+
+    text = ""
+    inner_w = box_w - 4
+
+    while True:
+        win.erase()
+        win.border()
+        win.addstr(1, (box_w - len(title)) // 2, title[:box_w - 2], curses.A_BOLD)
+        hint = "Enter confirm  Esc cancel  (empty = default)"
+        win.addstr(box_h - 1, max(1, (box_w - len(hint)) // 2),
+                   hint[:box_w - 2], curses.color_pair(CP_KEY))
+        display = text[-inner_w:] if len(text) > inner_w else text
+        win.addstr(3, 2, display + " " * (inner_w - len(display)),
+                   curses.color_pair(CP_OUTPUT))
+        win.move(3, 2 + min(len(text), inner_w))
+        win.refresh()
+
+        key = win.getch()
+        if key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+            curses.curs_set(0)
+            return text
+        elif key == 27:   # ESC
+            curses.curs_set(0)
+            return None
+        elif key in (curses.KEY_BACKSPACE, 127, ord('\b')):
+            text = text[:-1]
+        elif 32 <= key <= 126:
+            text += chr(key)
+
+
 # ── confirm popup ────────────────────────────────────────────────────────────
 
 def confirm_popup(stdscr, message):
@@ -465,7 +509,17 @@ def main(stdscr):
                 else:
                     extra_args = []
                     input_type = model.get("input_type")
-                    if input_type:
+                    if input_type == "text":
+                        prompt = text_input_popup(
+                            stdscr,
+                            f"Prompt — {model['name']}",
+                        )
+                        if prompt is None:
+                            continue   # user cancelled
+                        if prompt:
+                            extra_args = [model["input_arg"], prompt]
+                        # empty string → no args → model uses its default
+                    elif input_type in ("image", "audio"):
                         files = sample_files(input_type)
                         chosen = file_picker_popup(
                             stdscr,

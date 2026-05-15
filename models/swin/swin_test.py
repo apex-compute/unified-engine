@@ -1498,6 +1498,7 @@ def main():
     import time as _time
     t0 = _time.perf_counter()
     ue = Swin_UnifiedEngine(script_dir=SCRIPT_DIR)
+    ue.software_reset()
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
 
