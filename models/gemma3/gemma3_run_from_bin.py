@@ -2,6 +2,7 @@
 """Gemma3 inference from pre-compiled bin files. Run gemma3_test.py first to generate bins."""
 import builtins
 import json
+import mmap
 import os
 import sys
 import time
@@ -25,7 +26,6 @@ from user_dma_core import (
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     UnifiedEngine, set_dma_device, ue_35bit_addr_shifter,
 )
-from model_lib_core import load_config_with_weight_defs
 
 def _set_silent(val: bool) -> None:
     global _SILENT_MODE
@@ -88,8 +88,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         full_path = os.path.join(self.script_dir, bin_path)
         if not os.path.exists(full_path):
             raise FileNotFoundError(f"Weights bin not found: {full_path}")
-        with open(full_path, "rb") as f:
-            self.weight_bin = f.read()
+        self._weight_bin_file = open(full_path, "rb")
+        self.weight_bin = mmap.mmap(self._weight_bin_file.fileno(), 0, access=mmap.ACCESS_READ)
         self.weight_init()
         self.tensor_init()
 
@@ -179,10 +179,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     def weight_init(self) -> None:
         emb_cfg = self._cfg["special"]["embedding"]
         token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
+        token_embd_size = _parse_offset(emb_cfg["token_embd_size"])
         vocab_size = emb_cfg["vocab_size"]
         emb_dim = emb_cfg["embedding_dim"]
-        emb_bytes = vocab_size * emb_dim * self.bytes_per_element
-        raw_emb = bytearray(self.weight_bin[token_embd_offset : token_embd_offset + emb_bytes])
+        raw_emb = bytes(self.weight_bin[token_embd_offset : token_embd_offset + token_embd_size])
         self.embedding_weight = torch.frombuffer(raw_emb, dtype=torch.bfloat16).reshape(vocab_size, emb_dim).clone()
 
         hf_model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
@@ -218,6 +218,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             setattr(self, attr, addr)
 
         self._load_rope_host()
+
+        # Release mmap and file handle — weights are in DRAM now
+        self.weight_bin.close()
+        self._weight_bin_file.close()
+        del self.weight_bin, self._weight_bin_file
 
     # ------------------------------------------------------------------
     # Tensor init

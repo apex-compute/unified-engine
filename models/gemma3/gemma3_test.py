@@ -31,6 +31,7 @@ Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in
 
 import json
 import math
+import mmap
 import os
 import sys
 
@@ -883,23 +884,36 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     def weight_init(self) -> None:
         """Ensure weight bin exists (generate from HF if missing), load it, then initialize DRAM: embedding, layers from bin, RoPE, OUTPUT_NORM/LM_HEAD."""
         full_path = os.path.join(self.script_dir, self._weights_bin_rel)
-        hf_model = None
         if os.path.exists(full_path):
             print(f"Weight bin exists, skip generation: {full_path}")
         else:
             print(f"Weight bin not found, generating: {full_path}")
-            _, hf_model, _ = weight_bin_generate(output_path=full_path)
-        with open(full_path, "rb") as f:
-            self.weight_bin = f.read()
-        if hf_model is None:
-            hf_model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
-        else:
-            model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
-        model = hf_model
-        embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
-        embedding_scale = model.config.hidden_size ** 0.5
-        self.embedding_weight = (embed.float() * embedding_scale).to(torch.bfloat16)
+            weight_bin_generate(output_path=full_path)
+        model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
+        # Download tokenizer/config files if not present (no model weights loaded)
+        hf_repo = self._cfg["paths"]["hf_model_repo"]
+        config_path = os.path.join(model_dir, "config.json")
+        if not os.path.exists(config_path):
+            _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
+            snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
+            _original_print("Download complete.")
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+
+        # Read embedding directly from bin — already scaled and stored at token_embd_offset
+        emb_cfg = self._cfg["special"]["embedding"]
+        token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
+        token_embd_size = _parse_offset(emb_cfg["token_embd_size"])
+        vocab = self._cfg["file_info"]["embedding_vocab"]
+        hidden = self._cfg["file_info"]["hidden_size"]
+        with open(full_path, "rb") as f:
+            _mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            emb_bytes = bytes(_mm[token_embd_offset : token_embd_offset + token_embd_size])
+            _mm.close()
+        self.embedding_weight = torch.frombuffer(emb_bytes, dtype=torch.bfloat16).reshape(vocab, hidden)
+
+        # mmap the full bin for DMA writes — OS pages in only what's needed
+        self._weight_bin_file = open(full_path, "rb")
+        self.weight_bin = mmap.mmap(self._weight_bin_file.fileno(), 0, access=mmap.ACCESS_READ)
 
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         base_layer0 = self.weight_defs["BLK0_ATTN_NORM_WEIGHT"]
@@ -948,6 +962,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         self._load_rope_host()
         print(f"    Allocate weights end at DRAM address: 0x{self.get_params_dram_addr():X}, usage: {self.get_params_dram_usage()} bytes")
+
+        # Release mmap and file handle — weights are in DRAM now
+        self.weight_bin.close()
+        self._weight_bin_file.close()
+        del self.weight_bin, self._weight_bin_file
         print("Tokenizer loaded successfully.")
 
     def tensor_init(self) -> None:
