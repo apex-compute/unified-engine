@@ -287,7 +287,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # software_reset BEFORE any DMA-to-DRAM. Running it after weight_init corrupts
         # the most recently written DRAM pages (the start of the params region).
+        # On slow buses (Pi PCIe Gen2 x1), the reset-ack returns before the FPGA-side
+        # reset is fully settled, so the first weight DMA still gets clobbered. The
+        # extra sleep gives the controller time to quiesce.
         self.software_reset()
+        time.sleep(0.5)
         self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()

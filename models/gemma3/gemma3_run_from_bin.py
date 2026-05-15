@@ -91,7 +91,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             raise FileNotFoundError(f"Weights bin not found: {full_path}")
         # software_reset BEFORE any DMA-to-DRAM. Running it after weight_init corrupts
         # the most recently written DRAM pages (the start of the params region).
+        # On slow buses (Pi PCIe Gen2 x1), the reset-ack returns before the FPGA-side
+        # reset is fully settled, so the first weight DMA still gets clobbered. The
+        # extra sleep gives the controller time to quiesce.
         self.software_reset()
+        time.sleep(0.5)
         self._weight_bin_file = open(full_path, "rb")
         self.weight_bin = mmap.mmap(self._weight_bin_file.fileno(), 0, access=mmap.ACCESS_READ)
         self.weight_init()

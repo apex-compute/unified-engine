@@ -671,14 +671,31 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         VD_PAD = 128
         model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
         if not hasattr(self, '_hf_model'):
-            print("    Loading HF model for patch embedding...")
-            from transformers import Qwen2_5_VLForConditionalGeneration
-            self._hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_dir, torch_dtype=torch.bfloat16)
+            print("    Building visual encoder shell from config (no safetensors)...")
+            # Build the model from config only (random weights). rot_pos_emb and
+            # get_window_index are deterministic — they don't use learned weights —
+            # so random weights are fine for them. patch_embed is the only layer
+            # we actually invoke, and we overwrite its weights below from the bin
+            # we dumped during compile (patch_embed_proj_weight.bin).
+            from transformers import AutoConfig, Qwen2_5_VLForConditionalGeneration
+            config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+            self._hf_model = Qwen2_5_VLForConditionalGeneration._from_config(config)
+            self._hf_model = self._hf_model.to(torch.bfloat16)
             if not hasattr(self._hf_model, 'visual') and hasattr(self._hf_model, 'model') and hasattr(self._hf_model.model, 'visual'):
                 self._hf_model.visual = self._hf_model.model.visual
+            vis_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["vision_weights"])
+            pe_raw_path = os.path.join(os.path.dirname(vis_bin_path), "patch_embed_proj_weight.bin")
+            pe_meta_path = pe_raw_path + ".json"
+            if not (os.path.exists(pe_raw_path) and os.path.exists(pe_meta_path)):
+                raise FileNotFoundError(
+                    f"Missing {pe_raw_path} (+ .json). Recompile qwen2.5_vl_3b "
+                    "with the updated test.py to regenerate.")
+            with open(pe_meta_path) as _jf:
+                _pe_meta = json.load(_jf)
+            _pe_w = torch.from_numpy(np.fromfile(pe_raw_path, dtype=np.uint16)).view(torch.bfloat16).reshape(_pe_meta["shape"])
+            self._hf_model.visual.patch_embed.proj.weight.data = _pe_w
             self._hf_model.eval()
-            print("    HF model loaded.")
+            print("    Visual shell ready (patch_embed weights loaded from bin).")
         model = self._hf_model
         with torch.no_grad():
             if image_grid_thw is not None:

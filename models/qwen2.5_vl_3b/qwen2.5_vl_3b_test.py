@@ -614,6 +614,13 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
         data, _ = qpack(model.visual.patch_embed.proj.weight.detach().to(torch.bfloat16))
         raw = data.tobytes(); offset = f.tell(); f.write(raw)
         manifest[f'visual.patch_embed.proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
+        # Also dump raw bf16 patch_embed weights for run_from_bin's CPU patch_embed,
+        # so the runtime path doesn't need to load HF safetensors.
+        _pe_w = model.visual.patch_embed.proj.weight.detach().to(torch.bfloat16).contiguous()
+        _pe_raw_path = os.path.join(os.path.dirname(output_path), "patch_embed_proj_weight.bin")
+        _pe_w.view(torch.uint16).cpu().numpy().tofile(_pe_raw_path)
+        with open(_pe_raw_path + ".json", "w") as _jf:
+            json.dump({"shape": list(_pe_w.shape), "dtype": "bfloat16"}, _jf)
         # Merger
         raw = model.visual.merger.ln_q.weight.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
         offset = f.tell(); f.write(raw)
