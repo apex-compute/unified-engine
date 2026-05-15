@@ -439,6 +439,7 @@ def main():
 
     _set_silent(True)
     ue = Qwen3_1_7b_UnifiedEngine(script_dir=SCRIPT_DIR, weights_bin=weights_bin_rel)
+    ue.software_reset()
     _set_silent(False)
 
     if args.prompt is not None:

@@ -1911,6 +1911,7 @@ def main():
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue.software_reset()
     cfg = _load_config(script_dir)
     if args.prompt is not None:
         conversation = [{"role": "user", "content": args.prompt}]

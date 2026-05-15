@@ -501,6 +501,7 @@ def main():
     _SILENT_MODE = True
 
     engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
+    engine.software_reset()
 
     import numpy as np
     if waveform.shape[0] > 1:

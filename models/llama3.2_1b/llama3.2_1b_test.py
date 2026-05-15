@@ -1579,8 +1579,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+
         return self.seq_len
-        
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -1617,6 +1618,7 @@ def main():
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue.software_reset()
     cfg = _load_config(script_dir)
     if args.prompt is not None:
         tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])

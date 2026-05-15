@@ -1482,6 +1482,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+
         return self.seq_len
 
 # -----------------------------------------------------------------------------
@@ -1522,6 +1523,7 @@ def main():
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue.software_reset()
     cfg = _load_config(script_dir)
 
     if args.kv_variants:

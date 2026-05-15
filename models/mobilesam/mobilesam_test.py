@@ -3147,6 +3147,7 @@ def main():
     if bins_exist:
         _original_print("\nLoading from pre-compiled bins …")
         ue = MobileSAM_UE()
+        ue.software_reset()
         ue.load_params(BIN_DIR)
         with open(os.path.join(BIN_DIR, "params.json")) as f:
             _pm = json.load(f)
@@ -3170,6 +3171,7 @@ def main():
         _timer = _th.Thread(target=_roll_timer, daemon=True)
         _timer.start()
         ue = MobileSAM_UE(WEIGHTS)
+        ue.software_reset()
         enc_prog = ue.compile_encoder()
         _original_print(f"\r  Encoder: 1 program  ({time.perf_counter() - _t0:.1f}s)")
         dec_prog = ue.compile_decoder()

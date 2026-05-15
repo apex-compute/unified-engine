@@ -571,6 +571,7 @@ def main():
     _SILENT_MODE = True
 
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir, vision_bf16=not args.vision_fp4)
+    ue.software_reset()
     init_hang_prevention(ue)
     ue.load_snapshot()
 

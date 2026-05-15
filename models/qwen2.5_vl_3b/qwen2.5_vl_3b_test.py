@@ -2660,6 +2660,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+
         return self.seq_len
 
 def process_image(image_path: str, size: int = 448) -> torch.Tensor:
@@ -2697,6 +2698,7 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = 5.63
 
     ue = Qwen25VL3B_UnifiedEngine(script_dir=script_dir)
+    ue.software_reset()
 
     # Stop any stale FPGA execution from a previous crashed/timed-out run
     ue.dram_inst_running(False)

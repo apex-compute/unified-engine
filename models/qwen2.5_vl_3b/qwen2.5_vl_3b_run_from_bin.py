@@ -842,6 +842,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+
         return self.seq_len
 
 
@@ -910,6 +911,7 @@ def main():
 
     _set_silent(True)
     ue = Qwen25VL3B_UnifiedEngine(script_dir=script_dir)
+    ue.software_reset()
     _set_silent(False)
 
     # Drain any stale FPGA execution

@@ -1893,6 +1893,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             else:
                 t += 1
         _original_print(f"  Decode: {total_steps} joint steps, {len(tokens)} tokens emitted")
+
         return tokens
 def main():
     import argparse
@@ -1923,6 +1924,7 @@ def main():
 
     # --- Init engine ---
     engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
+    engine.software_reset()
 
     # --- Mel spectrogram: power spec on CPU, matmul+log on accelerator, norm on CPU ---
     Parakeet_UnifiedEngine.ensure_model_files()

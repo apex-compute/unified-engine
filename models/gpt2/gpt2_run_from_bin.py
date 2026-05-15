@@ -458,6 +458,7 @@ def main():
     _set_silent(True)
     ue = GPT2_UnifiedEngine(script_dir=SCRIPT_DIR,
                             weights_bin=cfg_raw["paths"]["weights_bin"])
+    ue.software_reset()
     _set_silent(False)
 
     if args.prompt is not None:

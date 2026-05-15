@@ -280,6 +280,7 @@ def main():
 
     t0 = time.perf_counter()
     ue = Swin_UnifiedEngine(script_dir=SCRIPT_DIR)
+    ue.software_reset()
     _original_print(f"  Weights: {time.perf_counter() - t0:.3f}s")
 
     prog_addr = ue.load_programs()

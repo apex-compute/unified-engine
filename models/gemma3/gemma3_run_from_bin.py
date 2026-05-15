@@ -83,6 +83,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._rope_global_layers = set(model["rope_global_layers"])
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
         self.seq_len = 0
+        self._instruction_program_addr = None
 
         bin_path = weights_bin or paths["weights_bin"]
         full_path = os.path.join(self.script_dir, bin_path)
@@ -296,7 +297,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             meta = json.load(f)
 
         instruction_bin = os.path.join(self.script_dir, meta["instruction_bin"])
-        self.load_instructions(instruction_bin)
+        if self._instruction_program_addr is None:
+            self._instruction_program_addr, _ = self.load_instructions(instruction_bin)
+
+        kv_size = self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size
+        zero_kv = torch.zeros(kv_size, dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_kv)
+        self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_kv)
 
         prefill_buckets = list(self._cfg["model"]["prefill_seq_len_buckets"])
         prefill_program_addrs = [_parse_offset(a) for a in meta["prefill_program_start_addrs"]]
@@ -420,6 +427,7 @@ def main():
 
     _set_silent(True)
     ue = Gemma3_UnifiedEngine(script_dir=SCRIPT_DIR, weights_bin=weights_bin_rel)
+    ue.software_reset()
     _set_silent(False)
 
     if args.prompt is not None:
