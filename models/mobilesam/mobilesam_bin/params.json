@@ -1,0 +1,1 @@
+{"size": 108732800, "tensors": {"pe_in": 0, "tokens": 592600320, "tokens_pe": 592633088, "src": 592665856, "key_pe": 594763008, "neck_out": 589982464, "mask_out": 659957632, "iou_out": 659957504}, "tensor_sizes": {"pe_in": 134217728, "tokens": 32768, "tokens_pe": 32768, "src": 2097152, "key_pe": 2097152, "neck_out": 2097152, "mask_out": 524288, "iou_out": 128}}

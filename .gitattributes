@@ -1,0 +1,2 @@
+models/*/*_bin/*.bin filter=lfs diff=lfs merge=lfs -text
+models/parakeet/parakeet_bin/*.npy filter=lfs diff=lfs merge=lfs -text

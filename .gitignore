@@ -1,5 +1,16 @@
-*.bin
 *.pt
+*.pth
 *.lock
+__pycache__/
 
-models/*_bin/
+# Block HF weight files if a test script re-downloads them.
+**/model.safetensors
+**/model-*-of-*.safetensors
+**/pytorch_model.bin
+**/consolidated.*.pth
+**/model_weights.ckpt
+**/*.gguf
+**/*.nemo
+
+# HuggingFace download cache for parakeet (sha-named blobs duplicate the extracted weights).
+models/parakeet/parakeet_bin/models--*/
