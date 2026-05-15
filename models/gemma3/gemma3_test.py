@@ -298,6 +298,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.engine_slave = engine_slave
         self._instruction_program_addr = None
 
+        # software_reset BEFORE any DMA-to-DRAM. Running it after weight_init corrupts
+        # the most recently written DRAM pages (the start of the params region).
+        self.software_reset()
         self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
@@ -1480,12 +1483,10 @@ def main():
         "future work. Re-run without --dual-engine until validation lands."
     )
     ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine)
-    ue.software_reset()
     ue.set_prefill_seq(args.prompt)
 
     if dual_engine:
         ue2 = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True)
-        ue2.software_reset()
         ue2.set_prefill_seq(args.prompt)
 
     print(f"\n--- Compiling ---")
