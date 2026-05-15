@@ -285,6 +285,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.engine_slave = engine_slave
         self._instruction_program_addr = None
 
+        # software_reset BEFORE any DMA-to-DRAM. Running it after weight_init corrupts
+        # the most recently written DRAM pages (the start of the params region).
+        self.software_reset()
         self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
@@ -1676,10 +1679,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if self._instruction_program_addr is None:
             self._instruction_program_addr, _ = self.load_instructions(os.path.join(self.script_dir, meta["instruction_bin"]))
 
-        kv_size = self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size
-        zero_kv = torch.zeros(kv_size, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_kv)
-        self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_kv)
 
         # Bucket set comes from config (design-time); per-bucket runtime info
         # (addresses, sizes, flops) comes from the compile-time meta.
@@ -1823,12 +1822,10 @@ def main():
     dual_engine = args.dual_engine
     assert dual_engine == False, "Dual engine is not supported yet for pbi mode"
     ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine)
-    ue.software_reset()
     ue.set_prefill_seq(args.prompt)
 
     if dual_engine:
         ue2 = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True)
-        ue2.software_reset()
         ue2.set_prefill_seq(args.prompt)
 
     print(f"\n--- Compiling ---")
