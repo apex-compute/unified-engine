@@ -20,7 +20,16 @@
   "model": {
     "max_context_size": 512,
     "end_of_turn_token_id": 151645,
-    "decoder_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
+    "decoder_seq_len_buckets": [
+      64,
+      128,
+      192,
+      256,
+      320,
+      384,
+      448,
+      512
+    ],
     "rope_global_layers": []
   },
   "vision": {
@@ -34,20 +43,22 @@
     "spatial_merge_size": 2,
     "out_hidden_size": 2048,
     "window_size": 112,
-    "fullatt_block_indexes": [7, 15, 23, 31],
+    "fullatt_block_indexes": [
+      7,
+      15,
+      23,
+      31
+    ],
     "image_size": 336,
     "num_patches": 576,
     "num_merged_tokens": 144
   },
-  "special_tokens": {
-    "image_token_id": 151655,
-    "video_token_id": 151656,
-    "vision_start_token_id": 151652,
-    "vision_end_token_id": 151653,
-    "vision_token_id": 151654
+  "precision": {
+    "lm": "if4",
+    "vision": "if4"
   },
   "paths": {
-    "lm_weights": "qwen2.5_vl_3b_bin/qwen2.5_vl_3b_lm_fp4.bin",
+    "lm_weights": "qwen2.5_vl_3b_bin/qwen2.5_vl_3b_lm_if4.bin",
     "vision_weights": "qwen2.5_vl_3b_bin/qwen2.5_vl_3b_vision_q4.bin",
     "hf_model_dir": "qwen2.5_vl_3b_bin/Qwen2.5-VL-3B-Instruct",
     "hf_model_repo": "Qwen/Qwen2.5-VL-3B-Instruct",
@@ -55,221 +66,62 @@
     "decoder_program_meta": "qwen2.5_vl_3b_bin/decoder_program.json"
   },
   "default_prefill_tokens": [
-    151644, 8948, 198, 2610, 525, 1195, 58, 16, 13,
-    358, 1079, 498, 279, 4226, 311, 856, 3405, 1191, 20173, 13,
-    151645, 198, 151644, 872, 198, 3838, 374, 220, 18, 488, 220,
-    20, 30, 151645, 198, 151644, 77091, 198
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    1195,
+    58,
+    16,
+    13,
+    358,
+    1079,
+    498,
+    279,
+    4226,
+    311,
+    856,
+    3405,
+    1191,
+    20173,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    3838,
+    374,
+    220,
+    18,
+    488,
+    220,
+    20,
+    30,
+    151645,
+    198,
+    151644,
+    77091,
+    198
   ],
-  "layers": {
-    "structure": [
-      {"key": "BLK0_ATTN_NORM_WEIGHT",          "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_PRE_NORM_GAMMA"},
-      {"key": "BLK0_ATTN_Q_WEIGHT_SCALE",       "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_Q_PROJ_SCALE"},
-      {"key": "BLK0_ATTN_Q_WEIGHT_DATA",        "type": "int4",       "attr": "DRAM_ADDR_LAYER0_Q_PROJ_QUANT"},
-      {"key": "BLK0_ATTN_Q_BIAS",               "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_Q_BIAS"},
-      {"key": "BLK0_ATTN_K_WEIGHT_SCALE",       "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_K_PROJ_SCALE"},
-      {"key": "BLK0_ATTN_K_WEIGHT_DATA",        "type": "int4",       "attr": "DRAM_ADDR_LAYER0_K_PROJ_QUANT"},
-      {"key": "BLK0_ATTN_K_BIAS",               "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_K_BIAS"},
-      {"key": "BLK0_ATTN_V_WEIGHT_SCALE",       "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_V_PROJ_SCALE"},
-      {"key": "BLK0_ATTN_V_WEIGHT_DATA",        "type": "int4",       "attr": "DRAM_ADDR_LAYER0_V_PROJ_QUANT"},
-      {"key": "BLK0_ATTN_V_BIAS",               "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_V_BIAS"},
-      {"key": "BLK0_ATTN_Q_NORM_WEIGHT",        "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_Q_NORM_GAMMA"},
-      {"key": "BLK0_ATTN_K_NORM_WEIGHT",        "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_K_NORM_GAMMA"},
-      {"key": "BLK0_ATTN_OUTPUT_WEIGHT_SCALE",  "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE"},
-      {"key": "BLK0_ATTN_OUTPUT_WEIGHT_DATA",   "type": "int4",       "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT"},
-      {"key": "BLK0_POST_ATTENTION_NORM_WEIGHT", "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_POST_NORM_GAMMA"},
-      {"key": "BLK0_FFN_NORM_WEIGHT",           "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_FFN_NORM_GAMMA"},
-      {"key": "BLK0_FFN_UP_WEIGHT_SCALE",       "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_UP_SCALE"},
-      {"key": "BLK0_FFN_UP_WEIGHT_DATA",        "type": "int4",       "attr": "DRAM_ADDR_LAYER0_MLP_UP_QUANT"},
-      {"key": "BLK0_FFN_GATE_WEIGHT_SCALE",     "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_GATE_SCALE"},
-      {"key": "BLK0_FFN_GATE_WEIGHT_DATA",      "type": "int4",       "attr": "DRAM_ADDR_LAYER0_MLP_GATE_QUANT"},
-      {"key": "BLK0_FFN_DOWN_WEIGHT_SCALE",     "type": "bf16_scale", "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_SCALE"},
-      {"key": "BLK0_FFN_DOWN_WEIGHT_DATA",      "type": "int4",       "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_QUANT"},
-      {"key": "BLK0_POST_FFW_NORM_WEIGHT",      "type": "bf16",       "attr": "DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA"}
-    ],
-    "non_layer": [
-      {"key": "ROPE",             "attr": "DRAM_ADDR_ROPE"},
-      {"key": "OUTPUT_NORM_WEIGHT", "attr": "DRAM_ADDR_OUTPUT_NORM_GAMMA"},
-      {"key": "LM_HEAD_WEIGHT_SCALE", "attr": "DRAM_ADDR_LM_HEAD_SCALE"},
-      {"key": "LM_HEAD_WEIGHT_DATA",  "attr": "DRAM_ADDR_LM_HEAD_QUANT"}
-    ]
-  },
-  "regions": {
-    "BLK0_ATTN_NORM_WEIGHT": {
-      "offset": "0x25180000",
-      "size": 4096,
-      "type": "bf16",
-      "description": "input_layernorm gamma"
-    },
-    "BLK0_ATTN_Q_WEIGHT_SCALE": {
-      "offset": "0x25181000",
-      "size": 131072,
-      "type": "bf16_scale",
-      "description": "Q scale (2048x2048 / 64 blocks)"
-    },
-    "BLK0_ATTN_Q_WEIGHT_DATA": {
-      "offset": "0x251A1000",
-      "size": 2097152,
-      "type": "int4",
-      "description": "Q quantized (2048x2048)"
-    },
-    "BLK0_ATTN_Q_BIAS": {
-      "offset": "0x253A1000",
-      "size": 4096,
-      "type": "bf16",
-      "description": "Q bias (2048 bf16)"
-    },
-    "BLK0_ATTN_K_WEIGHT_SCALE": {
-      "offset": "0x253A2000",
-      "size": 16384,
-      "type": "bf16_scale",
-      "description": "K scale (2048x256 / 64 blocks)"
-    },
-    "BLK0_ATTN_K_WEIGHT_DATA": {
-      "offset": "0x253A6000",
-      "size": 262144,
-      "type": "int4",
-      "description": "K quantized (2048x256)"
-    },
-    "BLK0_ATTN_K_BIAS": {
-      "offset": "0x253E6000",
-      "size": 512,
-      "type": "bf16",
-      "description": "K bias (256 bf16)"
-    },
-    "BLK0_ATTN_V_WEIGHT_SCALE": {
-      "offset": "0x253E6200",
-      "size": 16384,
-      "type": "bf16_scale",
-      "description": "V scale (2048x256 / 64 blocks)"
-    },
-    "BLK0_ATTN_V_WEIGHT_DATA": {
-      "offset": "0x253EA200",
-      "size": 262144,
-      "type": "int4",
-      "description": "V quantized (2048x256)"
-    },
-    "BLK0_ATTN_V_BIAS": {
-      "offset": "0x2542A200",
-      "size": 512,
-      "type": "bf16",
-      "description": "V bias (256 bf16)"
-    },
-    "BLK0_ATTN_Q_NORM_WEIGHT": {
-      "offset": "0x2542A400",
-      "size": 256,
-      "type": "bf16",
-      "description": "q_norm_gamma (zeros — not used in Qwen2.5)"
-    },
-    "BLK0_ATTN_K_NORM_WEIGHT": {
-      "offset": "0x2542A500",
-      "size": 256,
-      "type": "bf16",
-      "description": "k_norm_gamma (zeros — not used in Qwen2.5)"
-    },
-    "BLK0_ATTN_OUTPUT_WEIGHT_SCALE": {
-      "offset": "0x2542A600",
-      "size": 131072,
-      "type": "bf16_scale",
-      "description": "O scale (2048x2048 / 64 blocks)"
-    },
-    "BLK0_ATTN_OUTPUT_WEIGHT_DATA": {
-      "offset": "0x2544A600",
-      "size": 2097152,
-      "type": "int4",
-      "description": "O quantized (2048x2048)"
-    },
-    "BLK0_POST_ATTENTION_NORM_WEIGHT": {
-      "offset": "0x2564A600",
-      "size": 4096,
-      "type": "bf16",
-      "description": "post_attention_layernorm gamma (pre-MLP norm)"
-    },
-    "BLK0_FFN_NORM_WEIGHT": {
-      "offset": "0x2564B600",
-      "size": 4096,
-      "type": "bf16",
-      "description": "ffn_norm (zeros — not used in Qwen2.5)"
-    },
-    "BLK0_FFN_UP_WEIGHT_SCALE": {
-      "offset": "0x2564C600",
-      "size": 704512,
-      "type": "bf16_scale",
-      "description": "MLP up scale (2048x11008 / 64 blocks)"
-    },
-    "BLK0_FFN_UP_WEIGHT_DATA": {
-      "offset": "0x256F8600",
-      "size": 11272192,
-      "type": "int4",
-      "description": "MLP up quantized (2048x11008)"
-    },
-    "BLK0_FFN_GATE_WEIGHT_SCALE": {
-      "offset": "0x261B8600",
-      "size": 704512,
-      "type": "bf16_scale",
-      "description": "MLP gate scale (2048x11008 / 64 blocks)"
-    },
-    "BLK0_FFN_GATE_WEIGHT_DATA": {
-      "offset": "0x26264600",
-      "size": 11272192,
-      "type": "int4",
-      "description": "MLP gate quantized (2048x11008)"
-    },
-    "BLK0_FFN_DOWN_WEIGHT_SCALE": {
-      "offset": "0x26D24600",
-      "size": 704512,
-      "type": "bf16_scale",
-      "description": "MLP down scale (11008x2048 / 64 blocks)"
-    },
-    "BLK0_FFN_DOWN_WEIGHT_DATA": {
-      "offset": "0x26DD0600",
-      "size": 11272192,
-      "type": "int4",
-      "description": "MLP down quantized (11008x2048)"
-    },
-    "BLK0_POST_FFW_NORM_WEIGHT": {
-      "offset": "0x27890600",
-      "size": 4096,
-      "type": "bf16",
-      "description": "post_ffn_norm (zeros — not used in Qwen2.5)"
-    }
-  },
   "non_layer_regions": {
-    "OUTPUT_NORM_WEIGHT": {
-      "offset": "0x7CFF1800",
-      "size": 4096
-    },
-    "LM_HEAD_WEIGHT_SCALE": {
-      "offset": "0x7CFF2800",
-      "size": 9723904
-    },
-    "LM_HEAD_WEIGHT_DATA": {
-      "offset": "0x7D938800",
-      "size": 155582464
-    },
     "ROPE": {
       "offset": "0x86D98800",
       "size": 262144
     }
   },
   "special": {
-    "embedding": {
-      "token_embd_offset": "0x0",
-      "token_embd_size": "0x25180000",
-      "vocab_size": 151936,
-      "embedding_dim": 2048,
-      "scale": 1.0
-    },
     "rope": {
       "head_dim": 256,
       "actual_head_dim": 128,
       "num_positions": 512,
       "theta": 1000000.0,
-      "mrope_section": [16, 24, 24]
-    },
-    "quantization": {
-      "block_size": 64,
-      "bits": 4,
-      "range": [-8, 7]
+      "mrope_section": [
+        16,
+        24,
+        24
+      ]
     },
     "rms_norm": {
       "gamma_offset": 0.0
@@ -277,14 +129,15 @@
   },
   "image_processing": {
     "resize": 336,
-    "normalize_mean": [0.48145466, 0.4578275, 0.40821073],
-    "normalize_std": [0.26862954, 0.26130258, 0.27577711]
-  },
-  "defaults": {
-    "prompt": "Describe this image.",
-    "image": "test_samples/test_image.jpg",
-    "dev": "xdma0",
-    "cycle_ns": 5.63,
-    "max_seq": 512
+    "normalize_mean": [
+      0.48145466,
+      0.4578275,
+      0.40821073
+    ],
+    "normalize_std": [
+      0.26862954,
+      0.26130258,
+      0.27577711
+    ]
   }
 }

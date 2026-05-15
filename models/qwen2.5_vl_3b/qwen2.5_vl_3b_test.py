@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Qwen2.5-VL-3B on accelerator: q4_64 (vision) & fp4_64 (language)."""
+"""Qwen2.5-VL-3B on accelerator. LM and vision precisions are
+config-driven via qwen2.5_vl_3b_config.json::precision.{lm,vision}
+(values: int4 / fp4 / if4). Defaults: lm=if4 (eval-winning text codec
+per src/models/qwen2.5_VL_3b/compare/summary.md), vision=int4 (legacy
+released codec, byte-identical to the prior Q4_64 path). All
+quantization goes through src/template/quant_schemas.py."""
 
 import json
 import math
@@ -19,6 +24,7 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
 from user_dma_core import ue_35bit_addr_shifter
+import quant_schemas
 
 import builtins
 
@@ -358,41 +364,29 @@ def rms_norm_core_dram_post_add(ue, M: int, N: int,
         total_flops += M * N
     return total_flops
 
-_FP4_E2M1_TABLE = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                                  -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.bfloat16)
-
-def quantize_q4_64(tensor):
-    """INT4 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
-    data = tensor.flatten().cpu().float().numpy()
-    n_blocks = int(np.ceil(len(data) / 64))
-    padded = np.pad(data, (0, n_blocks * 64 - len(data)))
-    blocks = padded.reshape(n_blocks, 64)
-    scales = np.max(np.abs(blocks), axis=1)
-    scales[scales == 0] = 1.0
-    scales /= 7.0
-    quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
-    pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
-    packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
-    scale_bytes = torch.tensor(-scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
-    return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
-
-def quantize_fp4_64(tensor):
-    """FP4 E2M1 quantization with 64-element blocks. Returns (packed_bytes, n_blocks)."""
-    x = tensor.to(torch.bfloat16).cpu().flatten()
-    n_blocks = int(np.ceil(x.numel() / 64))
-    if x.numel() % 64 != 0:
-        x = torch.nn.functional.pad(x, (0, n_blocks * 64 - x.numel()))
-    blocks = x.view(n_blocks, 64)
-    fp4_max = torch.tensor(6.0, dtype=torch.bfloat16)
-    scales = (blocks.abs().max(dim=1).values / fp4_max).clamp(min=1e-8).to(torch.bfloat16)
-    scaled = (blocks / scales[:, None]).to(torch.bfloat16)
-    codes = torch.argmin(torch.abs(scaled.unsqueeze(-1) - _FP4_E2M1_TABLE), dim=-1).to(torch.uint8)
-    codes_np = codes.numpy().flatten()
-    if len(codes_np) % 2 != 0:
-        codes_np = np.pad(codes_np, (0, 1))
-    packed = (codes_np[0::2] & 0x0F) | ((codes_np[1::2] & 0x0F) << 4)
-    scales_np = scales.view(torch.uint16).numpy()
-    return np.frombuffer(scales_np.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
+def _qs_pack(precision: str, tensor: torch.Tensor):
+    """Run a 64-block codec via quant_schemas and emit the scale-then-data
+    byte layout the released wire format uses (consumed by
+    store_quantized_weight() as 34 bytes per block: 2 B bf16 scale + 32 B
+    nibbles). Accepts arbitrary input shape; flattens and zero-pads to a
+    multiple of 64 to match the released helpers."""
+    bf = tensor.detach().to(torch.bfloat16).cpu()
+    # Fast path: 2D and K-aligned. Preserve (N, K) shape so the codec can
+    # chunk along rows (large N inputs like the LM head would otherwise hit
+    # the unbounded distance-tensor allocation when flattened to (1, N*K)).
+    if bf.dim() == 2 and bf.shape[1] % 64 == 0:
+        n_blocks = bf.numel() // 64
+        data_bytes, scale_bytes = quant_schemas.quantize(precision, bf, block_size=64)
+        return np.frombuffer(scale_bytes + data_bytes, dtype=np.uint8), n_blocks
+    # Generic path: flatten + zero-pad to a multiple of 64. Used for
+    # arbitrary-rank tensors (e.g. the 5D Conv3D patch_embed weight).
+    bf = bf.flatten()
+    n_blocks = (bf.numel() + 63) // 64
+    if bf.numel() != n_blocks * 64:
+        bf = torch.nn.functional.pad(bf, (0, n_blocks * 64 - bf.numel()))
+    bf = bf.view(1, -1)
+    data_bytes, scale_bytes = quant_schemas.quantize(precision, bf, block_size=64)
+    return np.frombuffer(scale_bytes + data_bytes, dtype=np.uint8), n_blocks
 
 _LAYER_MAP = {
     'lm': {
@@ -425,13 +419,30 @@ _TOP_MAP = {
         'merger.mlp.2.bias': 'v.merger_mlp2.bias',
     },
 }
-_QUANT_SUFFIXES = {
-    'q4_64': {'q_proj.weight', 'k_proj.weight', 'v_proj.weight', 'o_proj.weight',
-              'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'},
-    'fp4_64': {'q_proj.weight', 'k_proj.weight',
-               'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'},
-    # Note: v_proj.weight and o_proj.weight are excluded from fp4_64 → stored as BF16
-}
+# LM-side quant scope: q/k/gate/up/down (v_proj and o_proj stay BF16 for
+# attention accuracy). Same set for every supported precision.
+_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight',
+                    'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'}
+
+_VALID_PRECISIONS = ('int4', 'fp4', 'if4')
+
+def _lm_precision(cfg: dict) -> str:
+    """Read LM precision from the config, defaulting to the eval-winner 'if4'.
+    Validates against the codecs the quant_schemas wrapper actually supports."""
+    p = cfg.get("precision", {}).get("lm", "if4")
+    if p not in _VALID_PRECISIONS:
+        raise ValueError(f"config precision.lm={p!r} not in {_VALID_PRECISIONS}")
+    return p
+
+def _vision_precision(cfg: dict) -> str:
+    """Read vision precision from the config. Default 'int4' matches the
+    legacy released vision codec (Q4_64 = pure INT4 codes, all-negative
+    bf16 scales — HW INT4 dispatch). Same precision string drives both the
+    generator's codec call and the manifest suffix the loader looks for."""
+    p = cfg.get("precision", {}).get("vision", "int4")
+    if p not in _VALID_PRECISIONS:
+        raise ValueError(f"config precision.vision={p!r} not in {_VALID_PRECISIONS}")
+    return p
 
 def _weight_key(hf_name, mode):
     """Map HF param name to short weight key. mode='lm' or 'vision'."""
@@ -452,8 +463,11 @@ def _weight_key(hf_name, mode):
             return f'v.blk.{p[1]}.{_LAYER_MAP["vision"][comp]}'
     return name
 
-def _write_weight_bin(bin_path, model, param_filter, mode, qtype, qfn):
-    """Write quantized weights to bin + json manifest."""
+def _write_weight_bin(bin_path, model, param_filter, mode, suffix, quant_layers, qfn):
+    """Write a weight bin + json manifest. Params whose name ends with one
+    of ``quant_layers`` go through ``qfn`` (returning packed scale+nibble
+    bytes) and get a ``.{suffix}`` manifest key; everything else is stored
+    BF16 with no suffix."""
     json_path = bin_path.rsplit('.', 1)[0] + '.json'
     manifest = {}
     count = 0
@@ -463,10 +477,10 @@ def _write_weight_bin(bin_path, model, param_filter, mode, qtype, qfn):
                 continue
             key = _weight_key(pname, mode)
             t = param.data
-            if any(pname.endswith(s) for s in _QUANT_SUFFIXES[qtype]):
+            if any(pname.endswith(s) for s in quant_layers):
                 data, _ = qfn(t)
                 raw = data.tobytes()
-                key = f'{key}.{qtype}'
+                key = f'{key}.{suffix}'
             else:
                 raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
             offset = f.tell()
@@ -477,17 +491,49 @@ def _write_weight_bin(bin_path, model, param_filter, mode, qtype, qfn):
         json.dump(manifest, f)
     print(f"Weights: {count} tensors, {os.path.getsize(bin_path)/1048576:.1f} MB -> {bin_path}")
 
-def generate_lm_weights(model, output_path):
-    """Generate LM FP4_64 weight bin."""
-    _write_weight_bin(output_path, model,
-        lambda n: 'model.layers' in n or 'model.embed_tokens' in n or 'model.norm' in n, 'lm', 'fp4_64', quantize_fp4_64)
+def generate_lm_weights(model, output_path, precision: str = "if4"):
+    """Generate LM weight bin using the given quant_schemas precision
+    ('int4' / 'fp4' / 'if4'). The precision string is also the manifest
+    suffix the runtime loader looks for.
 
-def generate_vision_weights(model, output_path):
-    """Generate vision Q4_64 weight bin with pre-padded QKV (80→128) and MLP (3420→3456).
+    Also pre-quantizes the LM head (tied to the input embedding) and
+    appends it to the bin as ``lm_head.weight.{precision}``. The runtime
+    loads those bytes directly instead of re-quantizing 300M+ weights at
+    weight_init, which OOMs memory-constrained devices like Pi 5."""
+    if precision not in _VALID_PRECISIONS:
+        raise ValueError(f"precision={precision!r} not in {_VALID_PRECISIONS}")
+    _write_weight_bin(output_path, model,
+        lambda n: 'model.layers' in n or 'model.embed_tokens' in n or 'model.norm' in n,
+        'lm', precision, _LM_QUANT_LAYERS, lambda t: _qs_pack(precision, t))
+
+    # Pre-quantize the LM head (tied to embedding) and append to the bin.
+    embed_w = model.get_input_embeddings().weight.detach().to(torch.bfloat16)
+    combined, _ = _qs_pack(precision, embed_w)
+    combined_bytes = combined.tobytes()
+    json_path = output_path.rsplit('.', 1)[0] + '.json'
+    with open(json_path) as f:
+        manifest = json.load(f)
+    with open(output_path, 'ab') as f:
+        offset = f.tell()
+        f.write(combined_bytes)
+    manifest[f'lm_head.weight.{precision}'] = {'offset': offset, 'size': len(combined_bytes)}
+    with open(json_path, 'w') as f:
+        json.dump(manifest, f)
+    print(f"LM head ({precision}) appended: {len(combined_bytes)/1048576:.1f} MB at offset 0x{offset:X}")
+
+def generate_vision_weights(model, output_path, precision: str = "int4"):
+    """Generate vision weight bin with pre-padded QKV (80→128) and MLP
+    (3420→3456). The given quant_schemas precision ('int4' / 'fp4' / 'if4')
+    drives both the codec and the manifest suffix.
 
     The binary stores padded weights so the runtime doesn't need the HF model.
-    QKV is stored as separate qk_padded (rearranged 128-dim) and v_padded (sequential 128-dim).
+    QKV is stored as separate qk_padded (rearranged 128-dim) and v_padded
+    (sequential 128-dim).
     """
+    if precision not in _VALID_PRECISIONS:
+        raise ValueError(f"precision={precision!r} not in {_VALID_PRECISIONS}")
+    sfx = precision  # manifest suffix tag = precision string
+    qpack = lambda t: _qs_pack(precision, t)
     VN, VD, VD_PAD, VH = 16, 80, 128, 1280
     VI = 3420
     VIS_MLP_PAD = ((VI + 63) // 64) * 64
@@ -513,9 +559,9 @@ def generate_vision_weights(model, output_path):
                     qk_padded_w[hs+64:hs+64+half_d, :] = qkv_w_3d[proj, h, half_d:, :]
                     qk_padded_b[hs:hs+half_d] = qkv_b_3d[proj, h, :half_d]
                     qk_padded_b[hs+64:hs+64+half_d] = qkv_b_3d[proj, h, half_d:]
-            data, _ = quantize_q4_64(qk_padded_w)
+            data, _ = qpack(qk_padded_w)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
-            manifest[f'{prefix}.attn.qk_padded.weight.q4_64'] = {'offset': offset, 'size': len(raw)}
+            manifest[f'{prefix}.attn.qk_padded.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
             raw = qk_padded_b.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.qk_padded.bias'] = {'offset': offset, 'size': len(raw)}
             # V sequential padded
@@ -525,15 +571,15 @@ def generate_vision_weights(model, output_path):
                 hs = h * VD_PAD
                 v_padded_w[hs:hs+VD, :] = qkv_w_3d[2, h, :, :]
                 v_padded_b[hs:hs+VD] = qkv_b_3d[2, h, :]
-            data, _ = quantize_q4_64(v_padded_w)
+            data, _ = qpack(v_padded_w)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
-            manifest[f'{prefix}.attn.v_padded.weight.q4_64'] = {'offset': offset, 'size': len(raw)}
+            manifest[f'{prefix}.attn.v_padded.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
             raw = v_padded_b.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.v_padded.bias'] = {'offset': offset, 'size': len(raw)}
             # O proj (no padding needed)
-            data, _ = quantize_q4_64(block.attn.proj.weight.detach().to(torch.bfloat16))
+            data, _ = qpack(block.attn.proj.weight.detach().to(torch.bfloat16))
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
-            manifest[f'{prefix}.attn.proj.weight.q4_64'] = {'offset': offset, 'size': len(raw)}
+            manifest[f'{prefix}.attn.proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
             raw = block.attn.proj.bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
             offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.proj.bias'] = {'offset': offset, 'size': len(raw)}
@@ -541,18 +587,18 @@ def generate_vision_weights(model, output_path):
             for proj_name in ['gate_proj', 'up_proj']:
                 w = getattr(block.mlp, proj_name).weight.detach().to(torch.bfloat16)
                 w_padded = torch.zeros(VIS_MLP_PAD, VH, dtype=torch.bfloat16); w_padded[:w.shape[0]] = w
-                data, _ = quantize_q4_64(w_padded)
+                data, _ = qpack(w_padded)
                 raw = data.tobytes(); offset = f.tell(); f.write(raw)
-                manifest[f'{prefix}.mlp.{proj_name}.weight.q4_64'] = {'offset': offset, 'size': len(raw)}
+                manifest[f'{prefix}.mlp.{proj_name}.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
                 b = getattr(block.mlp, proj_name).bias.detach().to(torch.bfloat16)
                 b_padded = torch.zeros(VIS_MLP_PAD, dtype=torch.bfloat16); b_padded[:b.shape[0]] = b
                 raw = b_padded.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
                 manifest[f'{prefix}.mlp.{proj_name}.bias'] = {'offset': offset, 'size': len(raw)}
             down_w = block.mlp.down_proj.weight.detach().to(torch.bfloat16)
             down_padded = torch.zeros(VH, VIS_MLP_PAD, dtype=torch.bfloat16); down_padded[:, :down_w.shape[1]] = down_w
-            data, _ = quantize_q4_64(down_padded)
+            data, _ = qpack(down_padded)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
-            manifest[f'{prefix}.mlp.down_proj.weight.q4_64'] = {'offset': offset, 'size': len(raw)}
+            manifest[f'{prefix}.mlp.down_proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
             raw = block.mlp.down_proj.bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
             offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.mlp.down_proj.bias'] = {'offset': offset, 'size': len(raw)}
@@ -563,23 +609,23 @@ def generate_vision_weights(model, output_path):
                 manifest[f'{prefix}.{norm_name}.weight'] = {'offset': offset, 'size': len(raw)}
             count += 1
         # Patch embed (no padding needed)
-        data, _ = quantize_q4_64(model.visual.patch_embed.proj.weight.detach().to(torch.bfloat16))
+        data, _ = qpack(model.visual.patch_embed.proj.weight.detach().to(torch.bfloat16))
         raw = data.tobytes(); offset = f.tell(); f.write(raw)
-        manifest['visual.patch_embed.proj.weight.q4_64'] = {'offset': offset, 'size': len(raw)}
+        manifest[f'visual.patch_embed.proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
         # Merger
         raw = model.visual.merger.ln_q.weight.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
         offset = f.tell(); f.write(raw)
         manifest['visual.merger.ln_q.weight'] = {'offset': offset, 'size': len(raw)}
         for mlp_idx in [0, 2]:
-            data, _ = quantize_q4_64(model.visual.merger.mlp[mlp_idx].weight.detach().to(torch.bfloat16))
+            data, _ = qpack(model.visual.merger.mlp[mlp_idx].weight.detach().to(torch.bfloat16))
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
-            manifest[f'visual.merger.mlp.{mlp_idx}.weight.q4_64'] = {'offset': offset, 'size': len(raw)}
+            manifest[f'visual.merger.mlp.{mlp_idx}.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
             raw = model.visual.merger.mlp[mlp_idx].bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
             offset = f.tell(); f.write(raw)
             manifest[f'visual.merger.mlp.{mlp_idx}.bias'] = {'offset': offset, 'size': len(raw)}
     with open(json_path, 'w') as f:
         json.dump(manifest, f)
-    print(f"Vision weights (padded Q4): {count} layers + merger, {os.path.getsize(output_path)/1048576:.1f} MB -> {output_path}")
+    print(f"Vision weights (padded {precision}): {count} layers + merger, {os.path.getsize(output_path)/1048576:.1f} MB -> {output_path}")
 
 def _load_config(script_dir: str) -> dict:
     """Load qwen2.5_vl_3b_config.json and build weight_defs (offset/size dict) from regions."""
@@ -626,8 +672,8 @@ def weight_bin_generate(script_dir: str | None = None, output_lm: str | None = N
     os.makedirs(os.path.dirname(lm_path), exist_ok=True)
 
     model, model_dir = _ensure_hf_model(script_dir, cfg)
-    generate_lm_weights(model, lm_path)
-    generate_vision_weights(model, vis_path)
+    generate_lm_weights(model, lm_path, precision=_lm_precision(cfg))
+    generate_vision_weights(model, vis_path, precision=_vision_precision(cfg))
     del model
     return lm_path, vis_path
 
@@ -1236,6 +1282,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             weight_bin_generate(script_dir=self.script_dir, output_lm=lm_bin_path, output_vis=vis_bin_path)
 
         # Load LM weights
+        print(f"  Reading LM weight bin (memmap)...", flush=True)
         lm_cache = load_weight_cache(lm_bin_path)
 
         # Embedding (host-side only — NOT uploaded to FPGA DRAM)
@@ -1246,18 +1293,25 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
-        # Per-layer weights — FP4 for Q/K/gate/up/down, BF16 for V/O (all from binary)
-        # FP4 gives ~7% better CLIPScore than INT4 on COCO benchmark.
-        # V/O stored as BF16 in binary (not quantized) for better attention accuracy.
+        # Per-layer weights — config-driven precision (precision.lm) for
+        # Q/K/gate/up/down, BF16 for V/O (all from binary). Default 'if4'
+        # picks INT4 vs FP4 per 64-block by min weight-MSE; near-lossless
+        # vs BF16 on this LM (PPL +0.9% on WikiText-2 vs +7.9% for pure FP4
+        # and +17% for pure INT4 — see src/models/qwen2.5_VL_3b/compare/summary.md).
+        # V/O stored as BF16 in binary for better attention accuracy.
+        lm_prec = _lm_precision(self._cfg)
+        print(f"  Loading {self.LAYER_SIZE} LM layers to FPGA DRAM ({lm_prec})...", flush=True)
         self.lm_layer_addrs = []
         for i in range(self.LAYER_SIZE):
+            if i and (i % 8 == 0 or i == self.LAYER_SIZE - 1):
+                print(f"    layer {i + 1}/{self.LAYER_SIZE} loaded", flush=True)
             la = {}
             prefix = f'language_model.layers.{i}'
-            # Q, K, gate, up, down: FP4 from binary
+            # Q, K, gate, up, down: precision.lm-quantized from binary
             for proj, hf_sub in [('q', 'self_attn.q_proj'), ('k', 'self_attn.k_proj'),
                                   ('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj'),
                                   ('down', 'mlp.down_proj')]:
-                la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.fp4_64'])
+                la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
             # V and O as BF16 from binary
             la['v_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.v_proj.weight'].copy()).view(torch.bfloat16))
             la['o_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.o_proj.weight'].copy()).view(torch.bfloat16))
@@ -1280,11 +1334,19 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Final norm
         self.final_norm_addr = store_weight(self, torch.from_numpy(lm_cache['language_model.norm.weight'].copy()).view(torch.bfloat16))
 
-        # LM head: tied to embedding, INT4 quantized
-        # matmat_mul_core expects B as (N, K) = (vocab_size, hidden_size)
-        # embed_bf16 is already (vocab_size, hidden_size) — no transpose needed
-        lm_head_fp4, _ = quantize_fp4_64(embed_bf16)
-        self.lm_head_scale, self.lm_head_data = store_quantized_weight(self, lm_head_fp4)
+        # LM head: pre-quantized at bin-gen time (tied to embedding) and
+        # loaded directly from the bin. No runtime quantization -- if the
+        # entry is missing, the bin is stale and must be regenerated.
+        lm_head_key = f'lm_head.weight.{lm_prec}'
+        if lm_head_key not in lm_cache:
+            raise RuntimeError(
+                f"LM head entry {lm_head_key!r} not found in bin "
+                f"{lm_bin_path!r}. The bin was generated by an older "
+                f"version of the script. Delete the bin and rerun to "
+                f"regenerate with the LM head pre-quantized."
+            )
+        self.lm_head_scale, self.lm_head_data = store_quantized_weight(
+            self, lm_cache[lm_head_key])
 
         # Identity matrix for decode attention
         self.identity_addr = store_identity_matrix(self)
@@ -1299,7 +1361,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         print("Tokenizer loaded successfully.")
 
     def _load_vision_weights(self, vis_bin_path: str, hf_model=None) -> None:
-        """Load vision encoder weights from bin file."""
+        """Load vision encoder weights from bin file. Manifest-key suffix
+        comes from cfg['precision']['vision'] — same string the generator
+        wrote, so changing precision in the config switches both ends."""
         vis_cache = load_weight_cache(vis_bin_path)
         vis_cfg = self._vis_cfg
         vis_depth = vis_cfg["depth"]
@@ -1311,39 +1375,43 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         VD = vis_cfg["head_dim"]
         VD_PAD = 128                                # padded head_dim (must be % 64 == 0)
 
+        vis_prec = _vision_precision(self._cfg)
+        print(f"  Loading {vis_depth} vision encoder layers to FPGA DRAM ({vis_prec})...", flush=True)
         self.vis_layer_addrs = []
         for i in range(vis_depth):
+            if i and (i % 8 == 0 or i == vis_depth - 1):
+                print(f"    layer {i + 1}/{vis_depth} loaded", flush=True)
             la = {}
             prefix = f'visual.blocks.{i}'
             # Q/K (rearranged padded) + V (sequential padded) — pre-padded in binary
-            la['qk_scale'], la['qk_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.qk_padded.weight.q4_64'])
+            la['qk_scale'], la['qk_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.qk_padded.weight.{vis_prec}'])
             la['qk_bias'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.attn.qk_padded.bias'].copy()).view(torch.bfloat16))
-            la['v_scale'], la['v_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.v_padded.weight.q4_64'])
+            la['v_scale'], la['v_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.v_padded.weight.{vis_prec}'])
             la['v_bias'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.attn.v_padded.bias'].copy()).view(torch.bfloat16))
             # O proj
-            la['o_scale'], la['o_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.proj.weight.q4_64'])
+            la['o_scale'], la['o_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.proj.weight.{vis_prec}'])
             la['o_bias'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.attn.proj.bias'].copy()).view(torch.bfloat16))
             # MLP (pre-padded 3420→3456 in binary)
             for proj, hf_sub in [('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj'), ('down', 'mlp.down_proj')]:
-                la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.{hf_sub}.weight.q4_64'])
+                la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.{hf_sub}.weight.{vis_prec}'])
                 la[f'{proj}_bias'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.{hf_sub}.bias'].copy()).view(torch.bfloat16))
             # RMSNorm (no bias)
             la['norm1_weight'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.norm1.weight'].copy()).view(torch.bfloat16))
             la['norm2_weight'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.norm2.weight'].copy()).view(torch.bfloat16))
             self.vis_layer_addrs.append(la)
 
-        # Patch embedding (FP4 quantized Conv3D weight: [1280, 3, 2, 14, 14])
-        self.patch_weight_scale, self.patch_weight_data = store_quantized_weight(self, vis_cache['visual.patch_embed.proj.weight.q4_64'])
+        # Patch embedding (Conv3D weight [1280, 3, 2, 14, 14]); precision per cfg.
+        self.patch_weight_scale, self.patch_weight_data = store_quantized_weight(self, vis_cache[f'visual.patch_embed.proj.weight.{vis_prec}'])
 
         # Merger
         self.merger_ln_q_weight = store_weight(self, torch.from_numpy(vis_cache['visual.merger.ln_q.weight'].copy()).view(torch.bfloat16))
-        # Merger MLP — Q4 from binary
-        self.merger_mlp0_scale, self.merger_mlp0_data = store_quantized_weight(self, vis_cache['visual.merger.mlp.0.weight.q4_64'])
+        # Merger MLP — quantized per cfg.precision.vision.
+        self.merger_mlp0_scale, self.merger_mlp0_data = store_quantized_weight(self, vis_cache[f'visual.merger.mlp.0.weight.{vis_prec}'])
         self.merger_mlp0_bias = store_weight(self, torch.from_numpy(vis_cache['visual.merger.mlp.0.bias'].copy()).view(torch.bfloat16))
-        self.merger_mlp2_scale, self.merger_mlp2_data = store_quantized_weight(self, vis_cache['visual.merger.mlp.2.weight.q4_64'])
+        self.merger_mlp2_scale, self.merger_mlp2_data = store_quantized_weight(self, vis_cache[f'visual.merger.mlp.2.weight.{vis_prec}'])
         self.merger_mlp2_bias = store_weight(self, torch.from_numpy(vis_cache['visual.merger.mlp.2.bias'].copy()).view(torch.bfloat16))
 
-        print(f"Vision weights loaded (Q4 + padded MLP to {VIS_MLP_PAD}): {vis_depth} layers + merger, params DRAM usage: {self.get_params_dram_usage()} bytes")
+        print(f"Vision weights loaded ({vis_prec} + padded MLP to {VIS_MLP_PAD}): {vis_depth} layers + merger, params DRAM usage: {self.get_params_dram_usage()} bytes")
 
     def tensor_init(self) -> None:
         """Allocate DRAM tensors for LM + vision intermediates."""
@@ -1496,20 +1564,40 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             corrected += overflow_us
         return corrected
 
+    @staticmethod
+    def _wait_with_heartbeat(wait_fn, label: str, interval_s: float = 5.0):
+        """Call ``wait_fn`` (blocking) on a background thread and print
+        ``[label] still running ({n}s)`` every ``interval_s`` so the demo
+        doesn't look frozen during long HW executes. Returns wall time."""
+        import threading
+        stop = threading.Event()
+        def _beat():
+            n = 0
+            while not stop.wait(interval_s):
+                n += interval_s
+                print(f"      [{label}] still running ({n:.0f}s)...", flush=True)
+        t = threading.Thread(target=_beat, daemon=True)
+        t0 = time.perf_counter()
+        t.start()
+        try:
+            wait_fn()
+        finally:
+            stop.set()
+            t.join(timeout=interval_s)
+        return time.perf_counter() - t0
+
     def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 120.0, gflops: float = None) -> None:
         """Execute compiled program from DRAM instruction memory."""
-        print(f"Execute program start at 0x{program_start_addr:X}")
-        t0 = time.perf_counter()
+        print(f"  Running program on FPGA (DRAM addr 0x{program_start_addr:X})...", flush=True)
         self.start_execute_from_dram(program_start_addr)
-        self.wait_queue(timeout)
-        wall_s = time.perf_counter() - t0
+        wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(timeout), label="FPGA")
         latency_us = self._corrected_hw_latency_us(wall_s)
         print(f"    Total program execution latency = {latency_us:.0f} us")
         if gflops is not None:
             gflops_program = gflops / (latency_us * 1e-6) / 1e9
             self._last_hw_gflops = gflops_program
             self._last_total_flops = gflops
-            print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
+            print(f"    Throughput: {gflops_program:.2f} GFLOPS")
 
     def compile_encoder(self, num_layers: int = None) -> int:
         """Compile vision encoder FPGA program. Returns program DRAM address."""
@@ -2042,11 +2130,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         vis_flops += 2 * self.NUM_MERGED_TOKENS * merge_dim * merge_dim  # merger MLP0
         vis_flops += 2 * self.NUM_MERGED_TOKENS * merge_dim * VH_OUT     # merger MLP2
 
-        print(f"    Running vision encoder ({vis_flops/1e9:.1f} GF)...")
-        t0 = time.perf_counter()
+        print(f"    Running vision encoder on FPGA (longest single step, ~40-60s)...", flush=True)
         self.start_execute_from_dram(program_addr)
-        self.wait_queue(600.0)
-        wall_s = time.perf_counter() - t0
+        wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(600.0), label="vision")
         latency_us = self._corrected_hw_latency_us(wall_s)
         vis_gflops = vis_flops / (latency_us * 1e-6) / 1e9
         self._vis_total_flops = vis_flops
@@ -2591,8 +2677,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen2.5-VL-3B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default="please describe the image in details.", help="Text prompt")
-    parser.add_argument("--image", type=str, default=os.path.join(SCRIPT_DIR, "../../test_samples/test_image.jpg"),
-                        help="Path to image file (default: test_samples/test_image.jpg, use 'none' for text-only)")
+    parser.add_argument("--image", type=str, default=os.path.join(SCRIPT_DIR, "../../test_samples/yosemite.jpg"),
+                        help="Path to image file (default: test_samples/yosemite.jpg, use 'none' for text-only)")
     parser.add_argument('--vision-cpu', action='store_true',
                         help='Run vision encoder on CPU (fp32) instead of FPGA — for quality comparison')
     parser.add_argument('--rep-penalty', type=float, default=1.05,
@@ -2790,10 +2876,10 @@ def main():
         vis_gflops = getattr(ue, '_vis_gflops', 0)
         vis_run = t_total - t_compile
         print(f"  Vision compile:   {t_compile:.2f}s")
-        print(f"  Vision run:       {vis_run:.2f}s  ({vis_flops/1e9:.1f} GF, {vis_gflops:.2f} GFLOPS)")
+        print(f"  Vision run:       {vis_run:.2f}s  ({vis_gflops:.2f} GFLOPS)")
     print(f"  Prefill compile:  {t_prefill_compile:.2f}s")
     prefill_flops = gflops_prefill if isinstance(gflops_prefill, (int, float)) else 0
-    print(f"  Prefill run:      {latency_prefill:.2f}s  ({prefill_flops/1e9:.1f} GF, {prefill_hw_gflops:.2f} GFLOPS)  ({len(prefill_seq)} tokens)")
+    print(f"  Prefill run:      {latency_prefill:.2f}s  ({prefill_hw_gflops:.2f} GFLOPS)  ({len(prefill_seq)} tokens)")
     print(f"  Decode compile:   {t_decode_compile:.2f}s")
     print(f"  Decode run:       {latency_decoder:.2f}s  ({n_new} tokens, {latency_decoder/max(n_new,1):.2f}s/tok)")
     total = (t_total if has_image else 0) + t_prefill_compile + latency_prefill + t_decode_compile + latency_decoder
