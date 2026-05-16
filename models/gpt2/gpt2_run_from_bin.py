@@ -113,6 +113,13 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         full_path = os.path.join(self.script_dir, bin_path)
         if not os.path.exists(full_path):
             raise FileNotFoundError(f"Weights bin not found: {full_path}")
+        # software_reset BEFORE any DMA-to-DRAM. Running it after weight_init corrupts
+        # the most recently written DRAM pages (the start of the params region).
+        # On slow buses (Pi PCIe Gen2 x1), the reset-ack returns before the FPGA-side
+        # reset is fully settled, so the first weight DMA still gets clobbered. The
+        # extra sleep gives the controller time to quiesce.
+        self.software_reset()
+        time.sleep(0.5)
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
         self.weight_init()
@@ -458,7 +465,6 @@ def main():
     _set_silent(True)
     ue = GPT2_UnifiedEngine(script_dir=SCRIPT_DIR,
                             weights_bin=cfg_raw["paths"]["weights_bin"])
-    ue.software_reset()
     _set_silent(False)
 
     if args.prompt is not None:

@@ -285,6 +285,13 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         full_path = os.path.join(self.script_dir, bin_path)
         if not os.path.exists(full_path):
             raise FileNotFoundError(f"Bin file not found: {full_path}")
+        # software_reset BEFORE any DMA-to-DRAM. Running it after weight_init corrupts
+        # the most recently written DRAM pages (the start of the params region).
+        # On slow buses (Pi PCIe Gen2 x1), the reset-ack returns before the FPGA-side
+        # reset is fully settled, so the first weight DMA still gets clobbered. The
+        # extra sleep gives the controller time to quiesce.
+        self.software_reset()
+        time.sleep(0.5)
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
         self.weight_init()
@@ -1621,7 +1628,6 @@ def main():
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = GPT2_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
-    ue.software_reset()
 
     if args.prompt is not None:
         prefill_seq = tuple(ue.tokenizer.encode(args.prompt))
