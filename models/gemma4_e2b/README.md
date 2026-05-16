@@ -30,7 +30,7 @@ patch embedder, 16-layer vision encoder, pooler, embed_vision projection,
 | Vision hidden size | 768 |
 | Image features | 256 soft tokens × 1536 |
 | Max context | 512 |
-| Weight format | FP4 E2M1 (q4_64) for matmul weights, BF16 for norms / scales |
+| Codec | IF4 (MixMSE_64) for matmul weights; BF16 for norms / scales / embeddings |
 
 ## Prerequisites
 

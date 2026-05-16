@@ -1,18 +1,18 @@
 """
 FPGA primitives for Gemma4 E2B audio (Conformer) encoder.
 
-Ported from /home/davew/apex-compute-ML/unified-engine/models/parakeet/parakeet_test.py.
-These are pure instruction-emit helpers; they assume the caller has
-``start_capture()`` open and will ``stop_capture()`` later. Each helper takes
-a UnifiedEngine and DRAM addresses, no hidden state.
+Pure instruction-emit helpers; the caller manages ``start_capture()`` /
+``stop_capture()``. Each helper takes a UnifiedEngine plus DRAM addresses
+and emits one operation's worth of ISA, with no hidden state.
 
 Helpers:
-    glu_core_dram        — output = a * sigmoid(b), GLU
-    silu_core_dram       — output = x * sigmoid(x), SiLU
+    glu_core_dram                — output = a * sigmoid(b), GLU
+    silu_core_dram               — output = x * sigmoid(x), SiLU
     half_step_residual_core_dram — output = residual + 0.5 * ff_out
-    softcap_core_dram    — output = soft_cap * tanh(input / soft_cap)
     build_toeplitz_for_depthwise — host-side Toeplitz matrix builder for depthwise 1D conv
-    depthwise_conv1d_core_dram — per-channel matmul executing the conv
+    depthwise_conv1d_core_dram   — per-channel matmul executing the conv
+    eltwise_add_core_dram        — output = a + b, chunked
+    copy_dram_to_dram_chunked    — copy between DRAM regions, chunked
 """
 
 from __future__ import annotations
@@ -219,8 +219,8 @@ def build_toeplitz_for_depthwise(kernel: torch.Tensor, L_pad: int,
         causal: if True, the kernel is left-padded so output position t reads
                 input positions [t-(k-1) .. t]. This matches Gemma4's
                 ``Gemma4AudioCausalConv1d`` (``F.pad(x, (left_pad, 0))``).
-                If False, the kernel is centered (Parakeet style), giving
-                output position t reads input positions [t-(k//2) .. t+(k//2)].
+                If False, the kernel is centered: output position t reads
+                input positions [t-(k//2) .. t+(k//2)].
 
     Returns:
         (D, L_pad, L_pad) bf16 Toeplitz tensor ready to DMA to FPGA.
