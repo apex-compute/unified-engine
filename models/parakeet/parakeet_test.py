@@ -1394,7 +1394,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
     def _enc_matmul(self, M, K, N, A_DRAM_ADDR, w_addr, OUTPUT_DRAM_ADDR, **kw):
         """Encoder matmul (bf16)."""
         self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
-            B_DRAM_ADDR=w_addr, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, **kw)
+            B_DRAM_ADDR=w_addr, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, use_pbi=True, **kw)
     def compile_encoder(self, L_pad, toeplitz_addrs, bn_tiled):
         """Compile full 24-layer conformer encoder. Returns (program_addr, program_bytes).
         Must call prepare_attention_tiled_biases(L_pad) before this.
@@ -1767,6 +1767,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.dma_write(DMA_DEVICE_H2C, self._params_dram_base + offset, data, len(data))
                 offset += len(data)
         self.allocate_params_dram(total)
+        # weight_init is skipped on bin reload, so create w with MEL_FB ref
+        self.w = {"MEL_FB": self._params_dram_base}
         _original_print(f"  Loading Toeplitz Staged BF16 Weights... {total / 1024**2:.1f} MB from bin")
         return True
     def dump_programs(self, program_addrs, L_pad):
@@ -1777,9 +1779,16 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         meta_path = os.path.join(bin_dir, "programs.json")
         manifest = {"L_pad": L_pad, "programs": {}}
         all_bytes = bytearray()
+        CHUNK = self.DMA_CHUNK_BYTES
         for name, (addr, size) in program_addrs.items():
             buf = bytearray(size)
-            self.dma_read(DMA_DEVICE_C2H, addr, buf, size)
+            offset = 0
+            while offset < size:
+                chunk_size = min(CHUNK, size - offset)
+                chunk = bytearray(chunk_size)
+                self.dma_read(DMA_DEVICE_C2H, addr + offset, chunk, chunk_size)
+                buf[offset:offset + chunk_size] = chunk
+                offset += chunk_size
             manifest["programs"][name] = {"offset": len(all_bytes), "size": size}
             all_bytes.extend(buf)
         with open(bin_path, "wb") as f:
@@ -1811,8 +1820,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         for name, meta in manifest["programs"].items():
             data = all_bytes[meta["offset"]:meta["offset"] + meta["size"]]
             addr = self.get_program_dram_addr()
+            # manifest size = actual_capture_size + alignment_gap (already baked in from compile).
+            # allocate_program_dram also aligns before advancing, so subtract the gap to avoid
+            # double-counting it and causing all subsequent program addresses to drift.
+            alignment_gap = (-addr) % 64
             self.dma_write(DMA_DEVICE_H2C, addr, data, len(data))
-            self.allocate_program_dram(len(data))
+            self.allocate_program_dram(len(data) - alignment_gap)
             addrs[name] = addr
         _original_print(f"  Programs loaded: {len(all_bytes)} bytes from bin")
         return addrs
@@ -1880,6 +1893,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             else:
                 t += 1
         _original_print(f"  Decode: {total_steps} joint steps, {len(tokens)} tokens emitted")
+
         return tokens
 def main():
     import argparse
@@ -1910,6 +1924,7 @@ def main():
 
     # --- Init engine ---
     engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
+    engine.software_reset()
 
     # --- Mel spectrogram: power spec on CPU, matmul+log on accelerator, norm on CPU ---
     Parakeet_UnifiedEngine.ensure_model_files()
@@ -2088,17 +2103,11 @@ def main():
     power_padded = torch.zeros(T_mel_padded, K_padded, dtype=torch.bfloat16)
     power_padded[:T_mel, :257] = power_bt.to(torch.bfloat16)
     engine.dma_to_accelerator_memory(engine.POWER_DRAM, power_padded)
-
-    # Matmul + log on HW
-    engine.program_execute(engine.mel_matmul_prog)   # (128, T_mel_padded) at MEL_TEMP_DRAM
-
-    # Mask + norm on HW (in-place at MEL_TEMP_DRAM)
+    engine.program_execute(engine.mel_matmul_prog)
     mask = torch.zeros(T_mel_padded, dtype=torch.bfloat16)
     mask[:T_mel] = 1.0
     engine.dma_to_accelerator_memory(engine.MASK_DRAM, mask)
-    engine.program_execute(engine.mel_norm_prog)     # (128, T_mel_padded) normed at MEL_TEMP_DRAM
-
-    # Transpose to (T_mel_padded, 128) at MEL_DRAM
+    engine.program_execute(engine.mel_norm_prog)
     engine.program_execute(engine.mel_transpose_prog)
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
     engine.program_execute(im2col_s0)

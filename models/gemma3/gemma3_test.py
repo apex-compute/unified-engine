@@ -31,6 +31,7 @@ Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in
 
 import json
 import math
+import mmap
 import os
 import sys
 
@@ -226,7 +227,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     with open(out_path, "wb") as f:
         f.write(buf)
     print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
-    return out_path
+    return out_path, model, model_dir
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
     """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
@@ -280,9 +281,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._rope_global_layers = set(model["rope_global_layers"])
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
         self._gamma_bin_offset = self._cfg["special"]["rms_norm"]["gamma_offset"]
-        self.prefill_seq = None 
+        self.prefill_seq = None
         self.engine_slave = engine_slave
+        self._instruction_program_addr = None
 
+        # software_reset BEFORE any DMA-to-DRAM. Running it after weight_init corrupts
+        # the most recently written DRAM pages (the start of the params region).
+        self.software_reset()
         self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
@@ -314,7 +319,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         length must lie in [2, prefill_max_seq_len + 1]. Out-of-range prompts
         fall back to the default prompt with a warning.
         """
-        max_prefill = int(self._cfg["model"]["prefill_max_seq_len"])
+        max_bucket = max(self._cfg["model"]["prefill_seq_len_buckets"])
         default_tokens = tuple(self._cfg["default_prefill_tokens"])
         if prompt is not None:
             conversation = [{"role": "user", "content": prompt}]
@@ -322,10 +327,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 conversation, tokenize=False, add_generation_prompt=True
             )
             tokens = tuple(self.tokenizer.encode(prompt_with_template, add_special_tokens=True))
-            if len(tokens) < 2 or len(tokens) > max_prefill + 1:
+            if len(tokens) < 2 or len(tokens) > max_bucket + 1:
                 print(
                     f"WARNING: Tokenized prompt has {len(tokens)} tokens; supported prompt length is "
-                    f"[2, {max_prefill + 1}] (prefill seq_len in [1, {max_prefill}]). "
+                    f"[2, {max_bucket + 1}] (prefill seq_len in [1, {max_bucket}]). "
                     "Falling back to default prompt."
                 )
                 self.prefill_seq = default_tokens
@@ -888,13 +893,31 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         else:
             print(f"Weight bin not found, generating: {full_path}")
             weight_bin_generate(output_path=full_path)
-        with open(full_path, "rb") as f:
-            self.weight_bin = f.read()
-        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
-        embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
-        embedding_scale = model.config.hidden_size ** 0.5
-        self.embedding_weight = (embed.float() * embedding_scale).to(torch.bfloat16)
+        model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
+        # Download tokenizer/config files if not present (no model weights loaded)
+        hf_repo = self._cfg["paths"]["hf_model_repo"]
+        config_path = os.path.join(model_dir, "config.json")
+        if not os.path.exists(config_path):
+            _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
+            snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
+            _original_print("Download complete.")
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+
+        # Read embedding directly from bin — already scaled and stored at token_embd_offset
+        emb_cfg = self._cfg["special"]["embedding"]
+        token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
+        token_embd_size = _parse_offset(emb_cfg["token_embd_size"])
+        vocab = self._cfg["file_info"]["embedding_vocab"]
+        hidden = self._cfg["file_info"]["hidden_size"]
+        with open(full_path, "rb") as f:
+            _mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            emb_bytes = bytes(_mm[token_embd_offset : token_embd_offset + token_embd_size])
+            _mm.close()
+        self.embedding_weight = torch.frombuffer(emb_bytes, dtype=torch.bfloat16).reshape(vocab, hidden)
+
+        # mmap the full bin for DMA writes — OS pages in only what's needed
+        self._weight_bin_file = open(full_path, "rb")
+        self.weight_bin = mmap.mmap(self._weight_bin_file.fileno(), 0, access=mmap.ACCESS_READ)
 
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         base_layer0 = self.weight_defs["BLK0_ATTN_NORM_WEIGHT"]
@@ -943,6 +966,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         self._load_rope_host()
         print(f"    Allocate weights end at DRAM address: 0x{self.get_params_dram_addr():X}, usage: {self.get_params_dram_usage()} bytes")
+
+        # Release mmap and file handle — weights are in DRAM now
+        self.weight_bin.close()
+        self._weight_bin_file.close()
+        del self.weight_bin, self._weight_bin_file
         print("Tokenizer loaded successfully.")
 
     def tensor_init(self) -> None:
@@ -1130,6 +1158,32 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.loop_end()
             self.release_inst_ptr(ptr)
 
+        # Chunk size: max elements that fit in one URAM bank (A or B) starting at 0x10000.
+        _uram_max_elems = (URAM_FULL_ELEMENTS * 2 - 0x10000) // 2
+
+        def uram_eltwise_chunked(a_dram, b_dram, out_dram, total_elems, mul=True):
+            """Emit chunked DRAM→URAM→eltwise→DRAM instructions fitting within URAM."""
+            off = 0
+            while off < total_elems:
+                n = min(_uram_max_elems, total_elems - off)
+                self.accelerator_memory_to_sram(a_dram + off * 2, 0x10000, n)
+                self.accelerator_memory_to_sram(b_dram + off * 2, 0x90000, n)
+                if mul:
+                    self.eltwise_mul_core(0x10000, 0x90000, 0x10000, n)
+                else:
+                    self.eltwise_add_core(0x10000, 0x90000, 0x10000, n)
+                self.sram_to_accelerator_memory(0x10000, out_dram + off * 2, n)
+                off += n
+
+        def uram_copy_chunked(src_dram, dst_dram, total_elems):
+            """Emit chunked DRAM→URAM→DRAM copy instructions fitting within URAM."""
+            off = 0
+            while off < total_elems:
+                n = min(_uram_max_elems, total_elems - off)
+                self.accelerator_memory_to_sram(src_dram + off * 2, 0x10000, n)
+                self.sram_to_accelerator_memory(0x10000, dst_dram + off * 2, n)
+                off += n
+
         # --- Gemma3 26 layers: compile---
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -1140,9 +1194,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0 and engine_master:
-                # change the first layer input to addr=LAYER0_OUTPUT_DRAM
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=seq_len * self.vector_length)
+                uram_copy_chunked(self.LAYER0_OUTPUT_DRAM, self.LAYER0_INPUT_DRAM, seq_len * self.vector_length)
             if engine_master:
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                                     OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
@@ -1254,11 +1306,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                                 OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off,
                                 use_pbi=use_pbi)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
                 # ToDo: no FLOPS return for eltwise_add_core and eltwise_mul_core
-                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=seq_len * self.vector_length)
+                uram_eltwise_chunked(self.LAYER0_INPUT_DRAM, self.LAYER0_POST_ATTN_NORM_DRAM, self.LAYER0_POST_ATTN_RESIDUAL_DRAM, seq_len * self.vector_length, mul=False)
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                                 OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                                 use_pbi=use_pbi)
@@ -1288,13 +1337,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 use_pbi=use_pbi,
             )
             if engine_master:
-                # TODO: chunk this MLP eltwise to lift the seq_len cap below.
-                assert seq_len * self.mlp_elements * 2 + 0x10000 <= URAM_FULL_ELEMENTS * 2, \
-                    f"prefill seq_len={seq_len} overflows URAM-staged MLP eltwise"
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=seq_len * self.mlp_elements)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=seq_len * self.mlp_elements)
-                self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.mlp_elements)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=seq_len * self.mlp_elements)
+                uram_eltwise_chunked(self.LAYER0_MLP_GATE_DRAM, self.LAYER0_MLP_UP_DRAM, self.LAYER0_MLP_MULT_DRAM, seq_len * self.mlp_elements, mul=True)
             total_flops += self.matmat_mul_core(
                 M=seq_len,
                 K=self.mlp_elements,
@@ -1311,10 +1354,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                                 OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off,
                                 use_pbi=use_pbi)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
-                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=seq_len * self.vector_length)
+                uram_eltwise_chunked(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, self.LAYER0_POST_MLP_NORM_DRAM, self.LAYER0_OUTPUT_DRAM, seq_len * self.vector_length, mul=False)
         self.generate_instruction_halt()
         prefill_program_addr = self.get_program_dram_addr() + count_at_start * 32
         prefill_program_size = (self.capture_count - count_at_start) * 32
@@ -1529,23 +1569,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             print(f"  delete {instruction_bin_path} to force recompile.")
             return
 
-        prefill_max_seq_len = int(self._cfg["model"]["prefill_max_seq_len"])
-        prefill_seq_len_buckets = list(range(1, prefill_max_seq_len + 1))
+        prefill_seq_len_buckets = list(self._cfg["model"]["prefill_seq_len_buckets"])
 
         self.clear_inst_id()
         self.start_capture()
         prefill_programs = []
-        print(f"Compiling {len(prefill_seq_len_buckets)} prefill buckets (seq_len 1..{prefill_max_seq_len})...")
+        print(f"Compiling {len(prefill_seq_len_buckets)} prefill buckets {prefill_seq_len_buckets}...")
         compile_t0 = time.perf_counter()
         for prefill_seq_len in prefill_seq_len_buckets:
             prog = self._compile_prefill_program(
                 prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=True
             )
             prefill_programs.append(prog)
-            if prefill_seq_len % 8 == 0 or prefill_seq_len == prefill_max_seq_len:
-                elapsed = time.perf_counter() - compile_t0
-                print(f"  bucket {prefill_seq_len}/{prefill_max_seq_len} compiled, "
-                      f"size={prog['size_bytes']} bytes, elapsed={elapsed:.1f}s")
+            elapsed = time.perf_counter() - compile_t0
+            print(f"  bucket seq_len={prefill_seq_len} compiled, "
+                  f"size={prog['size_bytes']} bytes, elapsed={elapsed:.1f}s")
         decoder_program = self._compile_decoder_programs(layer_size=layer_size, use_pbi=True)
         self.stop_capture()
 
@@ -1621,7 +1659,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             json.dump(metadata, f, indent=2)
 
         print(f"Combined gemma3 instruction image written to {instruction_bin_path} ({len(instruction_bytes)} bytes)")
-        print(f"  prefill: {len(prefill_seq_len_buckets)} buckets (seq_len 1..{prefill_max_seq_len}), "
+        print(f"  prefill: {len(prefill_seq_len_buckets)} buckets {prefill_seq_len_buckets}, "
               f"total {sum(p['size_bytes'] for p in prefill_programs)} bytes")
         print(f"  decoder: {len(decoder_program_addrs)} buckets, "
               f"total {sum(decoder_program['program_sizes'])} bytes")
@@ -1638,18 +1676,15 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         meta_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_meta"])
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        self.load_instructions(os.path.join(self.script_dir, meta["instruction_bin"]))
+        if self._instruction_program_addr is None:
+            self._instruction_program_addr, _ = self.load_instructions(os.path.join(self.script_dir, meta["instruction_bin"]))
+
 
         # Bucket set comes from config (design-time); per-bucket runtime info
         # (addresses, sizes, flops) comes from the compile-time meta.
-        prefill_max_seq_len = int(self._cfg["model"]["prefill_max_seq_len"])
+        prefill_buckets = list(self._cfg["model"]["prefill_seq_len_buckets"])
         prefill_program_addrs = [_parse_offset(a) for a in meta["prefill_program_start_addrs"]]
         prefill_flops_list = meta["prefill_total_flops"]
-        assert len(prefill_program_addrs) == prefill_max_seq_len, (
-            f"meta has {len(prefill_program_addrs)} prefill programs but "
-            f"model.prefill_max_seq_len={prefill_max_seq_len}. "
-            f"Delete {self._cfg['paths']['instruction_bin']} to force a recompile."
-        )
         decoder_program_addrs = [_parse_offset(addr) for addr in meta["decoder_program_start_addrs"]]
         flops_per_token = meta["decoder_total_flops"]
 
@@ -1658,17 +1693,15 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             prefill_seq = tuple(self._cfg["default_prefill_tokens"])
         if len(prefill_seq) <= 1:
             raise ValueError("Prefill sequence must have at least 2 tokens.")
-        # Prefill program processes all but the last token (the last one is the
-        # first input to the decoder). Buckets are 1..prefill_max_seq_len, so the
-        # compiled bucket index for seq_len S is just S - 1.
         prefill_seq = prefill_seq[:-1]
         prefill_seq_len = len(prefill_seq)
-        if not 1 <= prefill_seq_len <= prefill_max_seq_len:
+        max_bucket = prefill_buckets[-1]
+        if prefill_seq_len > max_bucket:
             raise ValueError(
-                f"prefill_seq_len={prefill_seq_len} is outside compiled buckets "
-                f"[1, {prefill_max_seq_len}]. Bump model.prefill_max_seq_len and recompile."
+                f"prefill_seq_len={prefill_seq_len} exceeds largest compiled bucket ({max_bucket}). Recompile."
             )
-        bucket_idx = prefill_seq_len - 1
+        bucket_idx = next(i for i, b in enumerate(prefill_buckets) if b >= prefill_seq_len)
+        bucket_seq_len = prefill_buckets[bucket_idx]
         prefill_program_addr = prefill_program_addrs[bucket_idx]
         flops_prefill = prefill_flops_list[bucket_idx]
         self.seq_len = prefill_seq_len
@@ -1683,18 +1716,20 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             slave_prefill_addr = _parse_offset(slave_prefill["start_addrs"][bucket_idx])
             slave_prefill_flops = slave_prefill["flops"][bucket_idx]
 
-        print(f"\n--- Starting prefill (seq_len={prefill_seq_len}, bucket {bucket_idx + 1}/{prefill_max_seq_len}) ---")
+        print(f"\n--- Starting prefill (seq_len={prefill_seq_len}, bucket {bucket_idx + 1}/{len(prefill_buckets)}) ---")
         prompt_text = self.tokenizer.decode(list(self.prefill_seq), skip_special_tokens=False)
         print(f"Prompt ({len(self.prefill_seq)} tokens): {prompt_text!r}")
         timer = time.perf_counter()
         if slave_prefill_addr is not None:
             slave_engine.program_execute(slave_prefill_addr, timeout=0)
 
-        seq_len = prefill_seq_len
-        q_seq_len = seq_len * self.group_size
+        q_seq_len = bucket_seq_len * self.group_size
         aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
 
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
+        if bucket_seq_len > prefill_seq_len:
+            pad = embedding_tensor[-1:].repeat(bucket_seq_len - prefill_seq_len, 1)
+            embedding_tensor = torch.cat([embedding_tensor, pad], dim=0)
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
         bias_one_group = torch.full((aligned_seq_len_q, aligned_seq_len_q), float("-inf"), dtype=torch.bfloat16)
         valid_mask = torch.tril(torch.ones(aligned_seq_len_q, aligned_seq_len_q, dtype=torch.bool), diagonal=0) if not self.causal_mask_upper else torch.triu(torch.ones(aligned_seq_len_q, aligned_seq_len_q, dtype=torch.bool), diagonal=0)
@@ -1702,6 +1737,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         bias_one_group[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
         latency_hw_prefill, flop_rate_hw_prefill = self.program_execute(prefill_program_addr, flops=flops_prefill)
+        if bucket_seq_len > prefill_seq_len:
+            zero_kv = torch.zeros((bucket_seq_len - prefill_seq_len) * self.head_dim, dtype=torch.bfloat16)
+            pad_byte_offset = prefill_seq_len * self.k_size
+            for layer_idx in range(self.LAYER_SIZE):
+                layer_byte_offset = layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
+                self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM + layer_byte_offset + pad_byte_offset, zero_kv)
+                self.dma_to_accelerator_memory(self.LAYER0_V_DRAM + layer_byte_offset + pad_byte_offset, zero_kv)
         latency_prefill = time.perf_counter() - timer
         if slave_prefill_flops is not None:
             print(f"Dual engine prefill gflops: {((flops_prefill + slave_prefill_flops) / (latency_hw_prefill * 1e3)):.2f} GFLOPS")
@@ -1748,7 +1790,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         latency_decoder = time.perf_counter() - timer
         print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(self.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
         print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(self.prefill_seq) + 1):.2f} Gflops")
-        
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------

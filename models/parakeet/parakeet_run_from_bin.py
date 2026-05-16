@@ -161,8 +161,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
         self.start_capture()
         self.generate_instruction_add_set(dst_reg_idx, immediate_value)
-        self.stop_capture()
         self.generate_instruction_halt()
+        self.stop_capture()
         prog = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prog)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
@@ -241,6 +241,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         # Subsampling intermediates
         T_mel_max = L_pad * 8
         self.MEL_DRAM = self.allocate_tensor_dram(T_mel_max * self.n_mels * bpe)
+        # HW mel pipeline buffers: must be allocated even in CPU-mel mode to keep
+        # subsequent tensor addresses aligned with the compiled programs.
+        K_padded = pad_to_multiple(257, self.block_size)  # 320
+        self.POWER_DRAM = self.allocate_tensor_dram(T_mel_max * K_padded * bpe)
+        self.MEL_TEMP_DRAM = self.allocate_tensor_dram(self.n_mels * T_mel_max * bpe)
+        T_mel_max_padded = pad_to_multiple(T_mel_max, self.block_size)
+        self.ZEROS_DRAM = self.allocate_tensor_dram(T_mel_max_padded * bpe)
+        self.MASK_DRAM = self.allocate_tensor_dram(T_mel_max_padded * bpe)
         # Temp buffer for R_combined (stage 0 im2col row selection)
         H0_max = (T_mel_max + 2 - 3) // 2 + 1
         self.IM2COL_R_DRAM = self.allocate_tensor_dram(H0_max * 3 * self.n_mels * bpe)
@@ -344,8 +352,9 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         for name, meta in manifest["programs"].items():
             data = all_bytes[meta["offset"]:meta["offset"] + meta["size"]]
             addr = self.get_program_dram_addr()
+            alignment_gap = (-addr) % 64
             self.dma_write(DMA_DEVICE_H2C, addr, data, len(data))
-            self.allocate_program_dram(len(data))
+            self.allocate_program_dram(len(data) - alignment_gap)
             addrs[name] = addr
         _original_print(f"  Programs loaded: {len(all_bytes)} bytes from bin")
         return addrs
@@ -445,7 +454,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
 def check_bins_early():
     missing = []
-    for name in ("params.bin", "programs.bin", "programs_slave.bin", "mel_fb.npy", "mel_window.npy"):
+    for name in ("params.bin", "programs.bin", "mel_fb.npy", "mel_window.npy"):
         if not os.path.exists(os.path.join(BIN_DIR, name)):
             missing.append(name)
     return missing
@@ -486,12 +495,13 @@ def main():
         waveform = waveform[:, :int(args.max_seconds * cfg["preprocessing"]["sample_rate"])]
 
     audio_dur = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
-    _original_print(f"Parakeet-TDT-0.6B on {args.dev} ({audio_dur:.1f}s audio) [dual-engine]")
+    _original_print(f"Parakeet-TDT-0.6B on {args.dev} ({audio_dur:.1f}s audio)")
 
     global _SILENT_MODE
     _SILENT_MODE = True
 
     engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
+    engine.software_reset()
 
     import numpy as np
     if waveform.shape[0] > 1:
@@ -558,13 +568,6 @@ def main():
     tok_prog       = loaded["tok"]
     dur_prog       = loaded["dur"]
     restore_prog   = loaded["restore"]
-
-    engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, engine_slave=True)
-    engine2.copy_dram_layout(engine)
-    # Slave engine: only use if programs were compiled for the slave base address.
-    # programs_slave.bin copied from programs.bin has JUMPs targeting the wrong base,
-    # so disable slave execution (single-engine mode matches parakeet_test.py).
-    use_slave = False
 
     engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0), "state_restore": (restore_prog, 0)}
 

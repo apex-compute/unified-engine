@@ -571,7 +571,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.params_from_bin = self.load_params()
         if not self.params_from_bin:
             self.weight_init()
-            self.dump_params()
         self.tensor_init()
 
     @staticmethod
@@ -930,6 +929,12 @@ class Swin_UnifiedEngine(UnifiedEngine):
         with open(meta_path, "w") as f:
             json.dump({"size": total, "num_labels": self.NUM_LABELS}, f)
         _original_print(f"  Params dumped: {total / 1024**2:.1f} MB → {bin_path}")
+        model, _ = _ensure_hf_model(self.script_dir, self.cfg)
+        labels_path = os.path.join(bin_dir, "labels.json")
+        with open(labels_path, "w") as f:
+            json.dump({str(k): v for k, v in model.config.id2label.items()}, f)
+        del model
+        _original_print(f"  Labels saved: {labels_path}")
 
     def load_params(self) -> bool:
         """Load params DRAM from bin. Returns True if loaded, False if not found."""
@@ -1487,6 +1492,7 @@ def main():
     import time as _time
     t0 = _time.perf_counter()
     ue = Swin_UnifiedEngine(script_dir=SCRIPT_DIR)
+    ue.software_reset()
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
 
@@ -1509,6 +1515,7 @@ def main():
         prog_addr = ue.compile_full_fused()
         stop_c.set()
         timer_c.join()
+        ue.dump_params()
         ue.dump_programs(prog_addr)
     t_compile = _time.perf_counter()
     _original_print(f"\r  Compile: {t_compile - t_weights:.3f}s")
@@ -1526,11 +1533,10 @@ def main():
     _original_print(f"\r  Executing: {t_exec - t_exec_start:.3f}s")
 
     # Look up label
-    model, _ = _ensure_hf_model(SCRIPT_DIR, ue.cfg)
-    id2label = model.config.id2label
-    del model
-
-    label = id2label.get(predicted_idx, str(predicted_idx))
+    labels_path = os.path.join(SCRIPT_DIR, "swin_bin", "labels.json")
+    with open(labels_path) as f:
+        id2label = json.load(f)
+    label = id2label.get(str(predicted_idx), str(predicted_idx))
     _original_print(f"\n  Image: {image_path}")
     _original_print(f"  Prediction: {label!r} (class {predicted_idx})")
 

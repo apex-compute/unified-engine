@@ -36,6 +36,7 @@
   "model": {
     "image_seq_len": 64,
     "max_context_size": 512,
+    "prefill_seq_len_buckets": [128, 192, 256, 320, 384, 448, 512],
     "stop_token_ids": [0, 1, 2, 49279]
   },
   "special_tokens": {
