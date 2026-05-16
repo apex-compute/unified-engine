@@ -30,6 +30,7 @@ import torch
 from transformers import AutoTokenizer
 
 import user_dma_core
+from reset_state_regs import reset_state_regs
 from user_dma_core import (
     DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE,
     UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
@@ -120,6 +121,11 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         # extra sleep gives the controller time to quiesce.
         self.software_reset()
         time.sleep(0.5)
+        # AXI-Lite registers that survive software_reset() — most importantly
+        # UE_BIAS_ADDER_EN (0x60), UE_LALU_HYPERPARAMETERS (0x38), UE_SCALAR
+        # (0x50), UE_BROADCAST_MODE (0x68) — get zeroed here so the bin
+        # inherits a consistent default regardless of what ran previously.
+        reset_state_regs(self)
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
         self.weight_init()
@@ -244,11 +250,16 @@ class GPT2_UnifiedEngine(UnifiedEngine):
 
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size)
         self.LAYER0_K_DRAM_CACHE = self.allocate_tensor_dram(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size)
-        zero_pad = torch.zeros(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size, dtype=torch.bfloat16)
+        # k_size is bytes per token-row; bf16 element is 2 bytes. Without // 2 the
+        # DMA overruns the allocated KV region by 2x and clobbers ZERO/IDENTITY/
+        # FLASH_Q/K/V_DRAM that follow, which becomes a NaN source the moment we
+        # run after another model has populated those addresses.
+        zero_pad = torch.zeros((self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size) // 2, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_DRAM_CACHE, zero_pad)
 
-        zero_add = torch.zeros(seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
+        # bytes_per_element == 2 for bf16; same overrun pattern -> drop the factor.
+        zero_add = torch.zeros(seq_len * self.head_dim, dtype=torch.bfloat16)
         self.ZERO_DRAM_ADDR = self.allocate_tensor_dram(seq_len * self.head_dim * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
         self.IDENTITY_DRAM_ADDR = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
@@ -257,7 +268,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(aligned_seq_len * self.actual_head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(aligned_seq_len * self.actual_head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(aligned_seq_len * self.actual_head_dim * self.bytes_per_element)
-        zero_flash = torch.zeros(aligned_seq_len * self.actual_head_dim * self.bytes_per_element, dtype=torch.bfloat16)
+        zero_flash = torch.zeros(aligned_seq_len * self.actual_head_dim, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_flash)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_flash)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_flash)
@@ -482,6 +493,10 @@ def main():
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
     )
+
+    # Trailing software_reset so the next process starts with a quiesced queue.
+    _set_silent(True)
+    ue.software_reset()
 
 
 if __name__ == "__main__":

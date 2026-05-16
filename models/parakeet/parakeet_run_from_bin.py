@@ -502,6 +502,7 @@ def main():
 
     engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
     engine.software_reset()
+    time.sleep(0.5)
 
     import numpy as np
     if waveform.shape[0] > 1:
@@ -624,6 +625,9 @@ def main():
     _original_print(f"    Encoder (24 layers): {t_enc_done - t_sub_done:.3f}s")
     _original_print(f"    Decoder:             {t_dec_done - t_enc_done:.3f}s")
     _original_print(f"    Total:               {t_dec_done - t_start:.3f}s")
+
+    # Trailing software_reset so the next process starts with a quiesced queue.
+    engine.software_reset()
 
 
 if __name__ == "__main__":

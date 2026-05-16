@@ -671,6 +671,11 @@ def main():
     latency_decode = time.perf_counter() - t_decode
     _original_print(f"\n  Decode: {latency_decode:.2f}s, {token_cnt} tokens total.")
 
+    # Trailing software_reset so the next process starts with a quiesced queue.
+    global _SILENT_MODE
+    _SILENT_MODE = True
+    ue.software_reset()
+
 
 if __name__ == "__main__":
     main()
