@@ -110,6 +110,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 full_path = alt
             else:
                 raise FileNotFoundError(f"Weight bin not found: {full_path}")
+        # software_reset BEFORE any DMA-to-DRAM. Running it after weight_init corrupts
+        # the most recently written DRAM pages (the start of the params region).
+        # On slow buses (Pi PCIe Gen2 x1), the reset-ack returns before the FPGA-side
+        # reset is fully settled, so the first weight DMA still gets clobbered. The
+        # extra sleep gives the controller time to quiesce.
+        self.software_reset()
+        time.sleep(0.5)
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
         self.weight_init()
@@ -578,7 +585,6 @@ def main():
     t0 = time.perf_counter()
     _original_print("Loading weights...")
     ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin)
-    ue.software_reset()
     _original_print(f"  Weights + tensors: {time.perf_counter() - t0:.2f}s")
 
     cfg = _load_config(script_dir)
