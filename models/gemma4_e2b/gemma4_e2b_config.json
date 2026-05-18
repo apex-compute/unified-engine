@@ -23,6 +23,16 @@
     "max_prefill_seq_len": 512,
     "sliding_window": 512,
     "end_of_turn_token_id": 106,
+    "prefill_seq_len_buckets": [
+      64,
+      128,
+      192,
+      256,
+      320,
+      384,
+      448,
+      512
+    ],
     "decoder_seq_len_buckets": [
       64,
       128,
@@ -68,7 +78,30 @@
     "hf_model_dir": "gemma4_e2b_bin/gemma-4-E2B-it",
     "hf_model_repo": "google/gemma-4-E2B-it"
   },
-  "default_prefill_tokens": [2, 105, 2364, 107, 54593, 786, 1003, 506, 94648, 25822, 236761, 2900, 1051, 691, 625, 5284, 236881, 106, 107, 105, 4368, 107],
+  "default_prefill_tokens": [
+    2,
+    105,
+    2364,
+    107,
+    54593,
+    786,
+    1003,
+    506,
+    94648,
+    25822,
+    236761,
+    2900,
+    1051,
+    691,
+    625,
+    5284,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107
+  ],
   "layers": {
     "structure": [
       {
