@@ -4820,6 +4820,118 @@ class UnifiedEngine:
         self.release_inst_ptr(pointer_compute)
         self.release_inst_ptr(pointer_output)
 
+    def bf16_transpose_core_pbi(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> None:
+        """
+        Same tiling as :meth:`bf16_transpose_core_legacy`: ``M_chunk`` / ``N_chunk`` caps from URAM,
+        then :meth:`chunk_ranges` over **N** and **M** so the last row/column strips can be partial.
+
+        Emission uses absolute DRAM DMA and the same matvec/writeback pattern as legacy; capture is
+        required for parity with other PBI-tested paths.
+
+        Requires ``start_capture()``.
+        """
+        if not self.is_capture_on or self.capture_buffer is None:
+            raise RuntimeError("bf16_transpose_core_pbi() requires an active capture (call start_capture() first).")
+
+        bytes_per_element = 2
+        identity_matrix_sram_start_addr = 0x00000
+        identity_matrix_dram_addr = self.get_params_dram_addr()
+        self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+        self.dma_write(
+            DMA_DEVICE_H2C,
+            identity_matrix_dram_addr,
+            torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16),
+            UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element,
+        )
+
+        identity_tensor = torch.eye(N, dtype=torch.bfloat16)
+
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=identity_matrix_dram_addr,
+            sram_address=identity_matrix_sram_start_addr,
+            element_size=UE_VECTOR_SIZE * UE_VECTOR_SIZE,
+        )
+
+        usable_uram_a_start_addr = identity_matrix_sram_start_addr + UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element
+        usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
+        M_chunk = min(M, (usable_uram_b_elements // N) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+        M_chunk_aligned = None
+        if M_chunk < UE_VECTOR_SIZE:
+            if (N * 32) <= usable_uram_b_elements:
+                M_chunk = 32
+            elif (N * 16) <= usable_uram_b_elements:
+                M_chunk = 16
+            else:
+                assert False, f"N={N} is too large to fit in usable URAM elements={usable_uram_b_elements}"
+            M_chunk_aligned = UE_VECTOR_SIZE
+
+        usable_uram_a_elements = URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE
+        output_M_size = M_chunk_aligned if M_chunk_aligned is not None else M_chunk
+        N_chunk = min(N, usable_uram_a_elements // output_M_size)
+        assert N_chunk % UE_VECTOR_SIZE == 0, f"N_chunk={N_chunk} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
+        assert N_chunk >= 1 and N_chunk <= N, f"N_chunk={N_chunk} must be greater than 0 and less than N={N}"
+
+        print(
+            f"M_chunk: {M_chunk}, N_chunk: {N_chunk}, M_chunk_aligned: {M_chunk_aligned} "
+            f"(legacy tiling: N {N // N_chunk}×{N_chunk} + {N % N_chunk}, "
+            f"M {M // M_chunk}×{M_chunk} + {M % M_chunk})"
+        )
+        print(
+            f"URAM_A usage: {100 * (UE_VECTOR_SIZE * UE_VECTOR_SIZE + N_chunk * output_M_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS"
+        )
+        print(f"URAM_B usage: {100 * M_chunk * N / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+
+        output_sram_wb_addr = usable_uram_a_start_addr
+        uram_b_start_addr = 0x80000
+
+        for i, n_take in self.chunk_ranges(N, N_chunk):
+            for j, m_take in self.chunk_ranges(M, M_chunk):
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=INPUT_DRAM_ADDR + j * N * bytes_per_element,
+                    sram_address=uram_b_start_addr,
+                    element_size=m_take * N,
+                )
+
+                for output_row in range(n_take):
+                    if M_chunk_aligned is None:
+                        out_sram_offset = output_row * m_take * bytes_per_element
+                    else:
+                        out_sram_offset = output_row * M_chunk_aligned * bytes_per_element
+
+                    ones_idx = identity_tensor[output_row + i, :].reshape(-1, UE_VECTOR_SIZE).sum(axis=1).argmax(axis=0)
+                    vector_idx = identity_tensor[output_row + i, :].reshape(-1, UE_VECTOR_SIZE)[ones_idx, :].argmax(axis=0)
+
+                    self.start_queue_for_bf16_matvec_operation(
+                        max_clear_en=0,
+                        fmax_context_addr=0,
+                        vector_sram_start_addr=0x00000 + vector_idx * UE_VECTOR_SIZE * bytes_per_element,
+                        matrix_sram_start_addr=uram_b_start_addr + ones_idx * UE_VECTOR_SIZE * bytes_per_element,
+                        output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
+                        K=UE_VECTOR_SIZE,
+                        N=m_take,
+                        stride_z=N,
+                    )
+
+                start_dram_address_of_partial_matrix = OUTPUT_DRAM_ADDR + i * M * bytes_per_element + j * bytes_per_element
+
+                if M_chunk_aligned is None:
+                    self.sram_to_accelerator_memory(
+                        sram_address=output_sram_wb_addr,
+                        accelerator_dram_address=start_dram_address_of_partial_matrix,
+                        element_size=n_take * m_take,
+                        stride_bytes_per_chunk=m_take * bytes_per_element,
+                        stride_jump_bytes=M * bytes_per_element,
+                    )
+                else:
+                    for o_row_idx in range(n_take):
+                        self.sram_to_accelerator_memory(
+                            sram_address=output_sram_wb_addr + o_row_idx * M_chunk_aligned * bytes_per_element,
+                            accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * M * bytes_per_element,
+                            element_size=m_take,
+                        )
+
+        # No FLOPS for this operation
+
     def bf16_permute_core(self, dim_0: int, dim_1: int, dim_2: int,
                           INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
         """
@@ -6029,6 +6141,542 @@ class UnifiedEngine:
             INPUT_DRAM_ADDR=V_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
             IDENTITY_DRAM_ADDR=IDENTITY_TRANSPOSE_DRAM_ADDR,
+        )
+
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=Q_DRAM_ADDR,
+            sram_address=0x00000,
+            element_size=group_size * head_dim,
+        )
+        self.broadcast_mul(
+            scalar=1 / math.sqrt(head_dim),
+            sram_start_addr=0x00000,
+            sram_wb_addr=0x00000,
+            element_size=group_size * head_dim,
+        )
+        self.sram_to_accelerator_memory(
+            sram_address=0x00000,
+            accelerator_dram_address=scaled_q_dram_addr,
+            element_size=group_size * head_dim,
+        )
+
+        # PBI matmul path is driven by gf_M_reg; allocate a GPR primed with group_size.
+        m_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(m_reg, group_size)
+
+        self.matmat_mul_core(
+            M=group_size,
+            K=head_dim,
+            N=seq_len,
+            A_DRAM_ADDR=scaled_q_dram_addr,
+            B_DRAM_ADDR=K_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=score_dram_addr,
+            softmax_enable=True,
+            C_DRAM_ADDR=BIAS_DRAM_ADDR,
+            gf_M_reg=m_reg,
+        )
+        self.matmat_mul_core(
+            M=group_size,
+            K=seq_len,
+            N=head_dim,
+            A_DRAM_ADDR=score_dram_addr,
+            B_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            gf_M_reg=m_reg,
+        )
+        self.release_isa_reg()  # m_reg
+
+        # Match legacy decoder_group_attention_core GFLOP accounting exactly.
+        group_flops = 1 * head_dim
+        group_flops += 2 * 1 * head_dim * seq_len
+        group_flops += 1 * seq_len * 5
+        group_flops += 2 * 1 * seq_len * head_dim
+        return group_size * group_flops
+
+    def decoder_group_attention_core(
+        self,
+        group_size: int,
+        head_dim: int,
+        seq_len: int,
+        Q_DRAM_ADDR: int,
+        K_DRAM_ADDR: int,
+        V_DRAM_ADDR: int,
+        OUTPUT_DRAM_ADDR: int,
+        SCRATCH_DRAM_ADDR: int,
+        IDENTITY_DRAM_ADDR: int = None,
+        BIAS_DRAM_ADDR: int = None,
+        debug_mode: bool = False,
+        SM_OUTPUT_DRAM_ADDR: int = None,
+        gf_bucket_idx: int = None,
+        num_buckets: int = 8,
+    ):
+        """Decoder group attention entrypoint; dispatches based on ``gf_bucket_idx``:
+
+        - ``gf_bucket_idx`` is a GPR index (1..15): :meth:`decoder_group_attention_core_pbi` — emits
+          a ``num_buckets``-way bucket dispatcher (each body sized for ``seq_len = K*UE_VECTOR_SIZE``).
+          ``seq_len`` arg is ignored (bucket bodies cover the range). Returns a per-bucket FLOPS list.
+        - ``gf_bucket_idx is None`` (default): :meth:`decoder_group_attention_core_legacy` — single
+          static-seq_len body. Returns int total FLOPS.
+        """
+        if gf_bucket_idx is not None:
+            return self.decoder_group_attention_core_pbi(
+                group_size=group_size,
+                head_dim=head_dim,
+                Q_DRAM_ADDR=Q_DRAM_ADDR,
+                K_DRAM_ADDR=K_DRAM_ADDR,
+                V_DRAM_ADDR=V_DRAM_ADDR,
+                OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+                gf_bucket_idx=gf_bucket_idx,
+                num_buckets=num_buckets,
+                IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+                BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+                debug_mode=debug_mode,
+                SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
+            )
+        return self.decoder_group_attention_core_legacy(
+            group_size=group_size,
+            head_dim=head_dim,
+            seq_len=seq_len,
+            Q_DRAM_ADDR=Q_DRAM_ADDR,
+            K_DRAM_ADDR=K_DRAM_ADDR,
+            V_DRAM_ADDR=V_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+            debug_mode=debug_mode,
+            SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
+        )
+
+    # =========================================================================
+    # Decoder group attention (single-query GQA used by autoregressive decode)
+    # =========================================================================
+
+    def decoder_group_attention_core_legacy(
+        self,
+        group_size: int,
+        head_dim: int,
+        seq_len: int,
+        Q_DRAM_ADDR: int,
+        K_DRAM_ADDR: int,
+        V_DRAM_ADDR: int,
+        OUTPUT_DRAM_ADDR: int,
+        SCRATCH_DRAM_ADDR: int,
+        IDENTITY_DRAM_ADDR: int = None,
+        BIAS_DRAM_ADDR: int = None,
+        debug_mode: bool = False,
+        SM_OUTPUT_DRAM_ADDR: int = None,
+    ) -> int:
+        """Legacy GQA decode attention: Q is ``group_size × head_dim`` (one new token replicated
+        across the GQA query heads), K/V are ``seq_len × head_dim`` from the KV cache.
+
+        Conceptually a per-group ``softmax(q·Kᵀ/√d) · V`` with ``M=1`` per group. Compiled as
+        a Python ``for g in range(group_size)`` loop, each iteration emitting its own
+        chunked V^T materialization + Q@Kᵀ + softmax + P@V sequence.
+        """
+        total_flops = 0
+        group_stride_bytes = head_dim * self.bytes_per_element
+        bytes_per_element = 2
+        bias_enable = True if BIAS_DRAM_ADDR is not None else False
+
+        if debug_mode: # DEBUG only, needs to be allocated in DRAM
+            assert SM_OUTPUT_DRAM_ADDR is not None, "SM_OUTPUT_DRAM_ADDR is not set for debug mode"
+
+        identity_tensor = torch.eye(head_dim, dtype=torch.bfloat16)
+        for g in range(group_size):
+            group_q_dram_addr = Q_DRAM_ADDR + g * group_stride_bytes
+            group_output_dram_addr = OUTPUT_DRAM_ADDR + g * group_stride_bytes
+
+            # SCRATCH_DRAM_ADDR is used for V^T
+            SCRATCH_DRAM_PARTIAL_SM = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element # used for partial softmax output
+
+            # ----------------------------------------------------------------------------------------------------------------
+            # I @ V^T: (head_dim, head_dim) @ (seq_len, head_dim)^T -> (head_dim, seq_len)
+            # Convention: first matrix I is (M, K), second V^T is (K, N), output  (M, N)
+            M = head_dim   # identity length (rows of I)
+            K = head_dim  # identity dimension (inner product dim)
+            N = seq_len   # V length (columns of V^T)
+
+            # transfer identity matrix to URAM_A start
+            self.accelerator_memory_to_sram(accelerator_dram_address=IDENTITY_DRAM_ADDR,
+                                            sram_address=0,
+                                            element_size=UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+
+            usable_uram_a_start_addr = UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element
+
+            # URAM_B is used for V matrix, we need to chunk the V matrix into smaller chunks that can fit in URAM_B
+            usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
+            N_chunk = min(N, (usable_uram_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+            N_chunk_aligned = None
+            if N_chunk < UE_VECTOR_SIZE:
+                if (K * 32) <= usable_uram_b_elements:
+                    N_chunk = 32
+                elif (K * 16) <= usable_uram_b_elements:
+                    N_chunk = 16
+                else:
+                    assert False, f"K={K} is too large to fit in usable URAM elements={usable_uram_b_elements}"
+                N_chunk_aligned = UE_VECTOR_SIZE
+
+            usable_uram_a_elements = URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE
+            output_N_size = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
+            M_chunk = min(M, usable_uram_a_elements // output_N_size)
+            assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
+
+            print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
+            print(f"URAM_A usage: {100 * (UE_VECTOR_SIZE * UE_VECTOR_SIZE + M_chunk * output_N_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS")
+            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+
+            output_sram_wb_addr = usable_uram_a_start_addr
+            uram_b_start_addr = 0x80000
+            for i, m_take in self.chunk_ranges(M, M_chunk):
+                for j, n_take in self.chunk_ranges(N, N_chunk):
+
+                    self.accelerator_memory_to_sram(accelerator_dram_address=V_DRAM_ADDR + j * K * bytes_per_element,
+                                                sram_address=uram_b_start_addr,
+                                                element_size=n_take * K)
+
+                    for output_row in range(m_take):
+                        if N_chunk_aligned is None:
+                            out_sram_offset = output_row * n_take * bytes_per_element
+                        else:
+                            out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
+
+                        ones_idx = identity_tensor[output_row+i, :].reshape(-1, UE_VECTOR_SIZE).sum(axis=1).argmax(axis=0)
+                        vector_idx = identity_tensor[output_row+i, :].reshape(-1, UE_VECTOR_SIZE)[ones_idx, :].argmax(axis=0)
+
+                        self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
+                                                                fmax_context_addr=0,
+                                                                vector_sram_start_addr=0x00000 + vector_idx * UE_VECTOR_SIZE * bytes_per_element,
+                                                                matrix_sram_start_addr=uram_b_start_addr + ones_idx * UE_VECTOR_SIZE * bytes_per_element,
+                                                                output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
+                                                                K=UE_VECTOR_SIZE,
+                                                                N=n_take,
+                                                                stride_z=m_take)
+
+                    start_dram_address_of_partial_matrix = SCRATCH_DRAM_ADDR + i * N * bytes_per_element + j * bytes_per_element # the space needed is head_dim x seq_len
+
+                    if N_chunk_aligned is None:
+                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                        accelerator_dram_address=start_dram_address_of_partial_matrix,
+                                                        element_size=m_take * n_take,
+                                                        stride_bytes_per_chunk=n_take * bytes_per_element,
+                                                        stride_jump_bytes=N * bytes_per_element)
+                    else:
+                        for o_row_idx in range(m_take):
+                            self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
+                                                            accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
+                                                            element_size=n_take)
+
+            # ----------------------------------------------------------------------------------------------------------------
+            # Q @ K^T: (1, head_dim) @ (head_dim, seq_len) -> (1, seq_len)
+            # Convention: first matrix Q is (M, K), second K^T is (K, N), output scores (M, N)
+            M = 1         # query length (rows of Q)
+            K = head_dim  # head dimension (inner product dim)
+            N = seq_len   # key length (columns of K^T)
+            # Calculate N_chunk
+            usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
+            N_chunk = min(N, (usable_uram_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+            N_chunk_aligned = None
+            if N_chunk < UE_VECTOR_SIZE:
+                if (K * 32) <= usable_uram_b_elements:
+                    N_chunk = 32
+                elif (K * 16) <= usable_uram_b_elements:
+                    N_chunk = 16
+                else:
+                    assert False, f"K={K} is too large to fit in usable URAM elements={usable_uram_b_elements}"
+                N_chunk_aligned = UE_VECTOR_SIZE
+
+            usable_uram_a_elements = URAM_FULL_ELEMENTS
+            output_N_size = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
+            M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, usable_uram_a_elements // (K + output_N_size))
+            assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
+
+            print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
+            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * output_N_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS")
+            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+
+            uram_a_start_addr = 0x00000
+            uram_b_start_addr = 0x80000
+            for i, m_take in self.chunk_ranges(M, M_chunk):
+                self.accelerator_memory_to_sram(accelerator_dram_address=group_q_dram_addr + i * K * bytes_per_element,
+                                                sram_address=uram_a_start_addr,
+                                                element_size=m_take * K)
+
+                self.broadcast_mul(scalar=1 / math.sqrt(head_dim),
+                                        sram_start_addr=uram_a_start_addr,
+                                        sram_wb_addr=uram_a_start_addr,
+                                        element_size=m_take * K)
+
+                output_sram_wb_addr = uram_a_start_addr + m_take * K * bytes_per_element
+
+                assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} is greater than 0x80000, which is the size of URAM_B"
+
+                clear_en = 1
+                for j, n_take in self.chunk_ranges(N, N_chunk):
+                    self.accelerator_memory_to_sram(accelerator_dram_address=K_DRAM_ADDR + j * K * bytes_per_element,
+                                                sram_address=uram_b_start_addr,
+                                                element_size=n_take * K)
+
+                    if bias_enable:
+                        self.accelerator_memory_to_bias_sram(accelerator_dram_address=BIAS_DRAM_ADDR + j * bytes_per_element,
+                                                           element_size=n_take)
+
+                    assert m_take * K + n_take * m_take<= URAM_FULL_ELEMENTS
+
+                    for output_row in range(m_take):
+                        # removed bias_enable as per causal mask drop
+
+                        if N_chunk_aligned is None:
+                            out_sram_offset = output_row * n_take * bytes_per_element
+                        else:
+                            out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
+
+                        self.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
+                                                                fmax_context_addr=output_row,
+                                                                vector_sram_start_addr=uram_a_start_addr + output_row * K * bytes_per_element,
+                                                                matrix_sram_start_addr=uram_b_start_addr,
+                                                                output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
+                                                                K=K,
+                                                                N=n_take,
+                                                                bias_enable=bias_enable)
+                        clear_en = 0
+
+                    # TODO: if FMAX_CONTEXT_SIZE x seq_len can fit in URAM_A, then we can avoid copying to DRAM, create a special case for this
+                    start_dram_address_of_partial_matrix = SCRATCH_DRAM_PARTIAL_SM + j * bytes_per_element # the space needed is FMAX_CONTEXT_SIZE x seq_len
+
+                    if N_chunk_aligned is None:
+                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                        accelerator_dram_address=start_dram_address_of_partial_matrix,
+                                                        element_size=m_take * n_take,
+                                                        stride_bytes_per_chunk=n_take * bytes_per_element,
+                                                        stride_jump_bytes=N * bytes_per_element)
+                    else:
+                        for o_row_idx in range(m_take):
+                            self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
+                                                            accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
+                                                            element_size=n_take)
+
+
+                # SOFTMAX CALCULATION
+                # if m_take * N is greater than the space available in URAM_A, copy the matrix to DRAM
+                max_m_take = min((URAM_FULL_ELEMENTS - UE_VECTOR_SIZE) // N, UE_FMAX_CONTEXT_SIZE) # worst case scenario, leave one row for output
+
+                for m_take_chunk_idx, m_take_chunk_size in self.chunk_ranges(m_take, max_m_take):
+                    self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_PARTIAL_SM + m_take_chunk_idx * N * bytes_per_element,
+                                                sram_address=uram_a_start_addr,
+                                                element_size=m_take_chunk_size * N)
+
+                    # Reuse input sram_wb_addr for softmax output
+                    for row_idx in range(m_take_chunk_size):
+                        self.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
+                                                                    vector_sram_start_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
+                                                                    output_sram_wb_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
+                                                                    N=N)
+
+
+                    # softmax output tap point - DEBUG only
+                    if debug_mode:
+                        self.sram_to_accelerator_memory(sram_address=uram_a_start_addr,
+                                        accelerator_dram_address=SM_OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * N * bytes_per_element,
+                                        element_size=m_take_chunk_size * N)
+
+                    v_tr_row_chunk_size = min((URAM_NEAR_FULL_ELEMENTS // seq_len // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
+                                            ((URAM_FULL_ELEMENTS - m_take_chunk_size * seq_len) // m_take_chunk_size // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
+                                            head_dim)
+
+                    v_tr_row_chunk_size_aligned = None
+                    if v_tr_row_chunk_size < UE_VECTOR_SIZE:
+                        v_tr_row_chunk_size_aligned = UE_VECTOR_SIZE
+                        if seq_len * 32 <= URAM_NEAR_FULL_ELEMENTS:
+                            v_tr_row_chunk_size = 32
+                        elif seq_len * 16 <= URAM_NEAR_FULL_ELEMENTS:
+                            v_tr_row_chunk_size = 16
+                        else:
+                            assert False, f"v_tr_row_chunk_size={v_tr_row_chunk_size} is too large to fit in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
+
+                    v_t_sram_start_addr = 0x80000 # URAM_B start
+                    output_sram_wb_addr = uram_a_start_addr + m_take_chunk_size * seq_len * bytes_per_element
+
+                    for v_tr_column_idx, v_tr_column_take in self.chunk_ranges(head_dim, v_tr_row_chunk_size):
+                        self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_ADDR + v_tr_column_idx * seq_len * bytes_per_element,
+                                                    sram_address=v_t_sram_start_addr,
+                                                    element_size=v_tr_column_take * seq_len)
+
+                        for p_row_idx in range(m_take_chunk_size):
+                            if v_tr_row_chunk_size_aligned is None:
+                                output_sram_wb_offset = p_row_idx * v_tr_column_take * bytes_per_element
+                            else:
+                                output_sram_wb_offset = 0
+
+                            self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
+                                                                    fmax_context_addr=0,
+                                                                    vector_sram_start_addr=uram_a_start_addr + p_row_idx * seq_len * bytes_per_element,
+                                                                    matrix_sram_start_addr=v_t_sram_start_addr,
+                                                                    output_sram_wb_addr=output_sram_wb_addr + output_sram_wb_offset,
+                                                                    K=seq_len,
+                                                                    N=v_tr_column_take)
+
+                            if v_tr_row_chunk_size_aligned is not None:
+                                self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + output_sram_wb_offset,
+                                                                accelerator_dram_address=group_output_dram_addr + (i + m_take_chunk_idx) * head_dim * bytes_per_element
+                                                                                                            + v_tr_column_idx * bytes_per_element
+                                                                                                            + p_row_idx * head_dim * bytes_per_element,
+                                                                element_size=v_tr_column_take)
+
+
+                        if v_tr_row_chunk_size_aligned is None:
+                            self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                            accelerator_dram_address=group_output_dram_addr + (i + m_take_chunk_idx) * head_dim * bytes_per_element + v_tr_column_idx * bytes_per_element,
+                                                            element_size=m_take_chunk_size * v_tr_column_take,
+                                                            stride_bytes_per_chunk=v_tr_column_take * bytes_per_element,
+                                                            stride_jump_bytes=head_dim * bytes_per_element)
+
+            # Total Theoretical FLOPS
+            group_flops = 1 * head_dim # q_scale
+            group_flops += 2 * 1 * head_dim * seq_len # Q @ K^T
+            group_flops += 1 * seq_len * 5 # softmax
+            group_flops += 2 * 1 * seq_len * head_dim # sm @ v
+            print(f"Total Theoretical FLOPS: {group_flops}")
+            total_flops += group_flops
+        return total_flops
+
+    def decoder_group_attention_core_pbi(
+        self,
+        group_size: int,
+        head_dim: int,
+        Q_DRAM_ADDR: int,
+        K_DRAM_ADDR: int,
+        V_DRAM_ADDR: int,
+        OUTPUT_DRAM_ADDR: int,
+        SCRATCH_DRAM_ADDR: int,
+        gf_bucket_idx: int,
+        num_buckets: int = 8,
+        IDENTITY_DRAM_ADDR: int = None,
+        BIAS_DRAM_ADDR: int = None,
+        debug_mode: bool = False,
+        SM_OUTPUT_DRAM_ADDR: int = None,
+    ) -> list:
+        """Bucketized decoder group attention. Mirrors the dispatcher shape of
+        :meth:`flash_attention_core_pbi`: emits ``num_buckets`` complete bucket bodies (one per
+        ``seq_len = UE_VECTOR_SIZE * i`` for ``i = 1..num_buckets``), with a JZ-cascade header
+        that routes via the runtime ``gf_bucket_idx`` GPR (1-based selector preserved across calls).
+
+        ``group_size`` is the matmul ``M`` dimension and is always static (fixed by the model).
+
+        Caller must size ``SCRATCH_DRAM_ADDR`` for the **maximum** bucket so the per-bucket offset
+        arithmetic for ``score_dram_addr`` / ``scaled_q_dram_addr`` lands inside the allocation.
+
+        Returns ``list[int]`` — per-bucket FLOPS; caller picks ``bucket_flops[gf_bucket_idx - 1]``.
+        """
+        del debug_mode, SM_OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR
+
+        if not (1 <= gf_bucket_idx <= 15):
+            raise ValueError(
+                f"decoder_group_attention_core_pbi: gf_bucket_idx={gf_bucket_idx} must be a GPR index in [1, 15]"
+            )
+        if num_buckets < 1:
+            raise ValueError(
+                f"decoder_group_attention_core_pbi: num_buckets={num_buckets} must be >= 1"
+            )
+
+        program_dram_start_addr = self.get_program_dram_addr()
+        bucket_step = UE_VECTOR_SIZE
+
+        # Bucket jump header: copy gf_bucket_idx into a scratch reg so the JZ cascade leaves the
+        # caller's bucket register untouched.
+        bucket_scratch_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_imm(
+            src_reg_idx=gf_bucket_idx, immediate_value=0, dst_reg_idx=bucket_scratch_reg
+        )
+        jz_capture_indices: list = []
+        for _ in range(num_buckets):
+            self.generate_instruction_add_dec(reg_idx=bucket_scratch_reg)
+            jz_capture_indices.append(self.capture_count)
+            self.generate_instruction_jump_abs_jz(
+                target_instruction_word_addr=0, reg_id=bucket_scratch_reg
+            )
+
+        # Bucket bodies, each followed by a JMP-to-end placeholder.
+        bucket_start_capture_indices: list = []
+        end_jmp_capture_indices: list = []
+        bucket_flops: list = []
+        for i in range(num_buckets):
+            self.pad_capture_to_64b_boundary()
+            bucket_start_capture_indices.append(self.capture_count)
+            bucket_seq_len = bucket_step * (i + 1)
+            bucket_flops.append(
+                self._decoder_group_attention_pbi_body(
+                    group_size=group_size,
+                    head_dim=head_dim,
+                    seq_len=bucket_seq_len,
+                    Q_DRAM_ADDR=Q_DRAM_ADDR,
+                    K_DRAM_ADDR=K_DRAM_ADDR,
+                    V_DRAM_ADDR=V_DRAM_ADDR,
+                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                    SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+                    BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+                )
+            )
+            end_jmp_capture_indices.append(self.capture_count)
+            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+
+        self.pad_capture_to_64b_boundary()
+        end_capture_count = self.capture_count
+        end_word_addr = ue_35bit_addr_shifter(
+            program_dram_start_addr + end_capture_count * INSTRUCTION_SIZE_BYTES
+        )
+
+        # Patch header JZs -> corresponding bucket entry.
+        for jz_idx, bucket_start_idx in zip(jz_capture_indices, bucket_start_capture_indices):
+            bucket_word_addr = ue_35bit_addr_shifter(
+                program_dram_start_addr + bucket_start_idx * INSTRUCTION_SIZE_BYTES
+            )
+            self._patch_jump_immediate(jz_idx, bucket_word_addr)
+
+        # Patch bucket-tail JMPs -> shared end label.
+        for jmp_idx in end_jmp_capture_indices:
+            self._patch_jump_immediate(jmp_idx, end_word_addr)
+
+        self.release_isa_reg()  # bucket_scratch_reg
+
+        print(
+            f"decoder_group_attention_core_pbi (bucketized): {num_buckets} buckets, "
+            f"seq_len={bucket_step}..{num_buckets * bucket_step}, "
+            f"FLOPS min-bucket={bucket_flops[0] / 1e9:.6f} G, "
+            f"max-bucket={bucket_flops[-1] / 1e9:.6f} G"
+        )
+        return bucket_flops
+
+    def _decoder_group_attention_pbi_body(
+        self,
+        group_size: int,
+        head_dim: int,
+        seq_len: int,
+        Q_DRAM_ADDR: int,
+        K_DRAM_ADDR: int,
+        V_DRAM_ADDR: int,
+        OUTPUT_DRAM_ADDR: int,
+        SCRATCH_DRAM_ADDR: int,
+        BIAS_DRAM_ADDR: int = None,
+    ) -> int:
+        """Single concrete-``seq_len`` body of :meth:`decoder_group_attention_core_pbi`.
+
+        All five DRAM addresses are absolute (caller-supplied); each bucket body writes its
+        ``score`` / ``scaled_q`` scratch using its own static ``seq_len``-derived offsets within
+        SCRATCH_DRAM_ADDR. As long as the caller has allocated SCRATCH_DRAM_ADDR for the maximum
+        bucket's seq_len, the per-bucket offsets stay inside the allocation.
+        """
+        bytes_per_element = self.bytes_per_element
+        score_dram_addr = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element
+        scaled_q_dram_addr = score_dram_addr + group_size * seq_len * bytes_per_element
+
+        # Materialize V^T once since K/V cache is shared across all query groups.
+        self.bf16_transpose_core(
+            M=seq_len,
+            N=head_dim,
+            INPUT_DRAM_ADDR=V_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
         )
 
         self.accelerator_memory_to_sram(
