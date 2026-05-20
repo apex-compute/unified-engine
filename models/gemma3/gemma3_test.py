@@ -83,11 +83,6 @@ QUANT_PRECISION = "if4"
 
 def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
     """Generate full_model_weights.bin from Hugging Face model per gemma3_config.json layout.
-
-    Quantizable weights (Q/K/V/O projections, MLP up/gate/down, LM head) use
-    IF4: per-K-block min-MSE selection between INT4 and FP4, dispatched on
-    the FPGA via the bf16 scale's sign bit. Norms / embeddings stay BF16.
-
     Returns the path to the written file."""
     cfg = Gemma3_UnifiedEngine.load_config(config_path=config_path, script_dir=SCRIPT_DIR)
     weight_defs = cfg["_weight_defs"]
@@ -147,17 +142,17 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         region_writes = [
             (gamma_in, "bf16"),
-            (q_w, "if4"),
-            (k_w, "if4"),
-            (v_w, "if4"),
+            (q_w, "int4"),
+            (k_w, "int4"),
+            (v_w, "int4"),
             (gamma_q, "bf16"),
             (gamma_k, "bf16"),
-            (o_w, "if4"),
+            (o_w, "int4"),
             (gamma_post, "bf16"),
             (gamma_ffn, "bf16"),
-            (up_w, "if4"),
-            (gate_w, "if4"),
-            (down_w, "if4"),
+            (up_w, "int4"),
+            (gate_w, "int4"),
+            (down_w, "int4"),
             (gamma_post_ffn, "bf16"),
         ]
         j = 0
@@ -169,10 +164,10 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             sz = weight_defs[sz_key]
             file_off = off + layer_idx * LAYER_WEIGHT_SIZE
             tensor, kind = region_writes[j]
-            if kind == "if4":
+            if kind == "int4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
-                data_bytes, scale_bytes = quantize(QUANT_PRECISION, tensor)
+                data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(tensor)
                 scale_padded = (scale_bytes + b"\x00" * sz)[:sz]
                 data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
                 write_at(file_off, scale_padded)
@@ -216,7 +211,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     lm_head_w = model.lm_head.weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
-    data_bytes, scale_bytes = quantize(QUANT_PRECISION, lm_head_w)
+    data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(lm_head_w)
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
