@@ -1621,16 +1621,27 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 self.dma_write(DMA_DEVICE_H2C, self._params_dram_base + offset, data, len(data))
                 offset += len(data)
         self.allocate_params_dram(total)
-        self.allocate_tensor_dram(meta["tensor_size"])
+        tensor_total = meta["tensor_size"]
+        self.allocate_tensor_dram(tensor_total)
         for key, val in meta.items():
             if key not in ("params_size", "tensor_size"):
                 setattr(self, key, val)
         from transformers import AutoTokenizer
         model_dir = os.path.join(self.script_dir, "smolvlm2_bin", "SmolVLM2-500M-Video-Instruct")
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-        kv_zeros = torch.zeros(self.NUM_LAYERS * self.NUM_KV_HEADS * self.max_seq_len * self.HEAD_DIM, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_K_DRAM, kv_zeros)
-        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zeros)
+        # Zero the entire tensor DRAM region. Kernels read several scratch buffers
+        # (flash-attn scratch, permute temp, padded rows of layer ping-pong, vision
+        # scratch) before fully writing them. On the compile machine those bytes are
+        # zero from prior runs; on a fresh machine they're garbage → NaN logits and
+        # denormal-induced slowdowns. Subsumes the previous KV-only zero.
+        ZERO_CHUNK = 4 * 1024 * 1024
+        zero_buf = bytes(ZERO_CHUNK)
+        offset = 0
+        while offset < tensor_total:
+            n = min(ZERO_CHUNK, tensor_total - offset)
+            buf = zero_buf if n == ZERO_CHUNK else zero_buf[:n]
+            self.dma_write(DMA_DEVICE_H2C, self._tensor_dram_base + offset, buf, n)
+            offset += n
         _original_print(f"  Snapshot loaded: {total / 1024**2:.1f} MB")
         return True
 
