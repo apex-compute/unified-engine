@@ -1,128 +1,104 @@
 # Gemma4 E2B example
 
-This folder contains the Gemma4 E2B accelerator inference example. Both
-text-only prompts and image + text (VLM) prompts are supported. The full
-pipeline — patch embedder, 16-layer vision encoder, pooler, embed_vision
-projection, 35-layer language-model prefill, and decoder loop — runs on
-the accelerator.
+Gemma4 E2B accelerator inference. Three modes — text only (LM), image
++ text (VLM), audio + text — all run from a single instruction bin.
 
-## Layout
+## Two scripts, two stages
 
-- **gemma4_e2b_test.py** – Compile + run. Builds `gemma4_instruction.bin` on first invocation (or extends it for VLM), then runs.
-- **gemma4_e2b_run_from_bin.py** – Execute-only. Loads the pre-compiled bin and runs; refuses to compile.
-- **gemma4_e2b_config.json** – Model and layout config.
-- **gemma4_e2b_bin/** – Weights, tokenizer, side-cache, and the single unified instruction bin. Contains:
-  - `weights_gemma4_e2b_hf.bin`
-  - `host_weights.bin` + `host_weights.json`
-  - `gemma4_instruction.bin` + `gemma4_instruction.json`
-  - `gemma-4-E2B-it/` (Hugging Face tokenizer files)
+| Stage | Script | Notes |
+|---|---|---|
+| Build (once) | `gemma4_e2b_test.py` | Builds `gemma4_instruction.bin` + `weights_gemma4_e2b_hf.bin`, then sanity-runs. Needs the HF model locally. One build covers all three modes. |
+| Deploy (every run after) | `gemma4_e2b_run_from_bin.py` | Loads the bin files and runs. Never touches the HF model. |
+
+After the first `gemma4_e2b_test.py` run, every subsequent invocation
+(either script, any mode) skips compilation.
+
+## Files
+
+- **gemma4_e2b_test.py** – Build + run. Builds the unified bin and the
+  combined weight bin on first invocation; otherwise just runs.
+- **gemma4_e2b_run_from_bin.py** – Execute-only. Loads bin files,
+  refuses to compile, no HF model on disk required.
+- **gemma4_e2b_config.json** – Model + layout config.
+- **gemma4_e2b_bin/** – On-disk artifacts:
+  - `gemma4_instruction.bin` + `.json` – unified ISA (~1.1 GB):
+    LM prefill + decode + vision encoder + audio encoder.
+  - `weights_gemma4_e2b_hf.bin` + `.json` – combined weights (~7 GB)
+    with sections: `[LM | vision | audio | host]`.
+  - `tokenizer/` – minimal tokenizer + processor configs (~32 MB).
 
 ## Prerequisites
 
-- Run from the **repo root directory** so that `user_dma_core` is on the path:
-  ```bash
-  python models/gemma4_e2b/gemma4_e2b_test.py
-  ```
-- Python with `torch`, `transformers >= 5.5.0`, and DMA device access.
-- The HF model (`google/gemma-4-E2B-it`) is downloaded automatically into `gemma4_e2b_bin/gemma-4-E2B-it/` on first run (requires network access and a Hugging Face account with access to the Gemma license).
+- Run from the **repo root** so `user_dma_core` is on the path.
+- Python with `torch`, `transformers >= 5.5.0`, `Pillow`, `soundfile`
+  (audio mode only), and FPGA device access via xdma.
+- Build stage only: HF model `google/gemma-4-E2B-it` is downloaded
+  automatically into `gemma4_e2b_bin/gemma-4-E2B-it/` on first run.
+- Deploy stage: no HF model directory required.
 
-## Usage
-
-From the **repo root** directory. Gemma4 E2B supports three modes — image
-+ text (VLM), text only, and audio + text. Exactly one encoder modality
-can be active per run.
-
-### Recommended first run — VLM mode
-
-The first run builds the unified `gemma4_instruction.bin` containing
-both the LM and the vision encoder. Every subsequent run in any mode
-loads this same bin and skips compilation, so doing VLM first sets you
-up for everything afterward.
+## Build / sanity-check — `gemma4_e2b_test.py`
 
 ```bash
-# Default image (../../test_samples/yosemite.jpg) + default prompt
+# VLM (recommended first run)
 python models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
+python models/gemma4_e2b/gemma4_e2b_test.py --image my.jpg --prompt "?"
 
-# Custom image and prompt
-python models/gemma4_e2b/gemma4_e2b_test.py --image path/to/image.jpg --prompt "What is in this image?"
-```
-
-### Language model (text only)
-
-```bash
-# Default prompt
+# LM only
 python models/gemma4_e2b/gemma4_e2b_test.py
+python models/gemma4_e2b/gemma4_e2b_test.py --prompt "What is 2+2?"
 
-# Custom prompt
-python models/gemma4_e2b/gemma4_e2b_test.py --prompt "Your prompt here"
-```
-
-### Audio + text
-
-```bash
-# Default audio (../../test_samples/apex.wav) + default prompt
+# Audio
 python models/gemma4_e2b/gemma4_e2b_test.py --audio-enable
-
-# Custom audio and prompt
-python models/gemma4_e2b/gemma4_e2b_test.py --audio path/to/file.wav --prompt "Transcribe this exactly."
+python models/gemma4_e2b/gemma4_e2b_test.py --audio clip.wav --prompt "Transcribe this."
 ```
 
-### Fast execute-only path
+The first run builds all three sections (~4 min: LM ~3.5 min +
+vision ~80 s + audio ~17 s). Subsequent runs just load and execute.
 
-After the first compile, use `gemma4_e2b_run_from_bin.py` for fast
-runs — it loads the pre-built bin and never compiles.
+Force a clean rebuild:
 
 ```bash
-python models/gemma4_e2b/gemma4_e2b_run_from_bin.py                                     # LM only
-python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --vision-enable                     # VLM, default image
-python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --image my_photo.jpg --prompt "?"   # VLM, custom image
+rm gemma4_e2b_bin/gemma4_instruction.bin gemma4_e2b_bin/gemma4_instruction.json
+rm gemma4_e2b_bin/weights_gemma4_e2b_hf.bin gemma4_e2b_bin/weights_gemma4_e2b_hf.json
+python models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
 ```
 
-`gemma4_e2b_run_from_bin.py` is fully self-contained — it does not
-import from `gemma4_e2b_test.py` and does not need the full
-`gemma-4-E2B-it/` HF model directory at run time (a bundled
-tokenizer subset in `gemma4_e2b_bin/tokenizer/` is used instead).
-LM-only deploys need only:
+## Deploy / demo — `gemma4_e2b_run_from_bin.py`
+
+Execute-only. Refuses to compile, never imports the HF model class.
+
+```bash
+# LM
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --prompt "What is 2+2?"
+
+# VLM
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --vision-enable
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --image my.jpg --prompt "?"
+
+# Audio
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --audio-enable
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --audio clip.wav --prompt "Transcribe."
+```
+
+### Deploy footprint
 
 ```
 gemma4_e2b_run_from_bin.py
 gemma4_e2b_config.json
-user_dma_core.py + quant_schemas.py    (FPGA driver + codec lib)
+user_dma_core.py + quant_schemas.py
 gemma4_e2b_bin/
-  weights_gemma4_e2b_hf.bin
-  host_weights.bin + .json
-  gemma4_instruction.bin + .json
-  tokenizer/                            (~32 MB)
+  gemma4_instruction.bin + .json       (~1.1 GB)
+  weights_gemma4_e2b_hf.bin  + .json   (~7 GB; LM + vision + audio + host sections)
+  tokenizer/                           (~32 MB)
 ```
 
-VLM mode currently still loads the HF model directory for vision encoder
-weights — fold-in to the bin is a future enhancement.
+## Flags
 
-### Common flags
-
-```bash
-# DMA device and clock cycle time (default: xdma0, 5.62 ns)
-python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --cycle 5.62
-
-# Use local full-model weights bin
-python models/gemma4_e2b/gemma4_e2b_test.py --local-weights
-```
-
-### Mode notes
-
-- Passing `--image PATH` implies `--vision-enable`. Passing `--vision-enable` alone uses the shipped default image.
-- Passing `--audio PATH` implies `--audio-enable`. Passing `--audio-enable` alone uses the shipped default audio.
-- `--vision-enable/--image` and `--audio-enable/--audio` are mutually exclusive (one modality per run).
-- Audio input requires `soundfile` (`pip install soundfile`).
-
-To force a clean rebuild after changing buckets in the config or pulling
-new ISA semantics:
-
-```bash
-rm gemma4_e2b_bin/gemma4_instruction.bin gemma4_e2b_bin/gemma4_instruction.json
-python models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
-```
-
-For design details (unified-bin layout, host-RAM optimisation, vision
-fixed-shape contract, low-memory deploy workflow), see
-`src/template/notes/notes_gemma4_e2b.md`.
+- `--dev xdma0 --cycle 5.62` — DMA device and clock cycle (defaults).
+- `--local-weights` — use the local full-model weights bin.
+- `--image PATH` implies `--vision-enable`; `--vision-enable` alone
+  uses the default image at `../../test_samples/yosemite.jpg`.
+- `--audio PATH` implies `--audio-enable`; `--audio-enable` alone
+  uses the default clip at `../../test_samples/apex.wav`.
+- Vision and audio are mutually exclusive (exactly one modality per run).

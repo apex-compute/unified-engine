@@ -899,10 +899,10 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     config_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(config_path):
         _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
-        snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
+        snapshot_download(repo_id=hf_repo, local_dir=model_dir)
         _original_print("Download complete.")
     model = AutoModelForImageTextToText.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16, device_map=None, trust_remote_code=True
+        model_dir, dtype=torch.bfloat16, device_map=None, trust_remote_code=True
     )
     return model, model_dir
 
