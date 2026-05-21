@@ -50,6 +50,29 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 VISION_CANONICAL_SIZE = (896, 896)   # (width, height) for PIL.Image.resize
 VISION_FIXED_NUM_PATCHES = 2520
 
+# -----------------------------------------------------------------------------
+# Audio fixed-shape contract.
+#
+# HF Gemma3n's audio processor pads/truncates every input audio file to the
+# same input_features shape (so the chat template can hard-code the exact
+# count of <|audio|> placeholder tokens). For Gemma4 E2B this resolves to:
+#   T_raw  = 188 mel frames -> H0 = 94  -> H1 = 47           (real)
+# But the prompt template uses AUDIO_FIXED_SOFT_TOKENS = 128 placeholders, so
+# the actual T_sub = 128 (HF pads H1 from 47 to 128 with mask).
+# Empirically T_raw is fixed by HF for any input duration; we re-assert at
+# runtime if the processor ever shifts.
+# -----------------------------------------------------------------------------
+AUDIO_FIXED_SOFT_TOKENS = 128
+
+# Default sample assets used at first-run compile time to bake the vision
+# and audio sections into gemma4_instruction.bin. The actual sample values
+# don't matter for vision (pixel_position_ids depend only on the canonical
+# image SHAPE, not its pixels) or audio (the mel input gets re-uploaded at
+# runtime); only their shapes pin the ISA.
+_TEST_SAMPLES = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samples"))
+DEFAULT_IMAGE = os.path.join(_TEST_SAMPLES, "yosemite.jpg")
+DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
+
 # Bumped any time the on-disk gemma4_instruction.bin layout / ISA semantics
 # change in an incompatible way. On version mismatch the bin is rebuilt from
 # scratch rather than incrementally extended.
@@ -62,7 +85,7 @@ from huggingface_hub import snapshot_download
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, URAM_NEAR_FULL_SIZE, URAM_START_ADDR, URAM_SECTION, set_dma_device
 from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 
@@ -434,11 +457,440 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
     write_at(weight_defs["LM_HEAD_WEIGHT_DATA"], data_padded)
 
+    # Build vision + host side-cache bytes in memory (no separate files).
+    # We concatenate everything below into ONE weights bin:
+    #   [LM | vision | host]
+    # plus a single master manifest JSON that holds section offsets and the
+    # sub-manifests (per-tensor offsets relative to each section's start).
+    # Two binary files total — gemma4_instruction.bin and weights_gemma4_e2b_hf.bin —
+    # matching the "one instruction bin, one weight bin" design.
+    vision_bytes, vision_manifest = _build_vision_section_bytes(model)
+    audio_bytes,  audio_manifest  = _build_audio_section_bytes(model)
+    host_bytes,   host_manifest   = _build_host_section_bytes(text_model, cfg)
+
+    lm_size     = len(buf)
+    vision_size = len(vision_bytes)
+    audio_size  = len(audio_bytes)
+    host_size   = len(host_bytes)
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(buf)
-    print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
+        f.write(vision_bytes)
+        f.write(audio_bytes)
+        f.write(host_bytes)
+    total = lm_size + vision_size + audio_size + host_size
+    print(f"Generated weights bin: {out_path} ({total/1024**3:.2f} GiB total; "
+          f"LM {lm_size/1024**3:.2f} GiB + vision {vision_size/1024**2:.1f} MiB + "
+          f"audio {audio_size/1024**2:.1f} MiB + host {host_size/1024**3:.2f} GiB)")
+
+    master_meta_path = out_path.rsplit(".", 1)[0] + ".json"
+    master = {
+        "compile_version": "v1",
+        "total_size": total,
+        "lm_section":     {"offset": 0,                                          "size": lm_size},
+        "vision_section": {"offset": lm_size,                                    "size": vision_size, "manifest": vision_manifest},
+        "audio_section":  {"offset": lm_size + vision_size,                      "size": audio_size,  "manifest": audio_manifest},
+        "host_section":   {"offset": lm_size + vision_size + audio_size,         "size": host_size,   "manifest": host_manifest},
+    }
+    with open(master_meta_path, "w") as f:
+        json.dump(master, f, indent=2)
+    print(f"Generated weights manifest: {master_meta_path}")
+
+    # Remove any stale standalone side-cache files from the previous layout
+    # so users don't confuse them with the new combined bin.
+    for stale in ("host_weights.bin", "host_weights.json",
+                   "vision_weights.bin", "vision_weights.json"):
+        sp = os.path.join(os.path.dirname(out_path), stale)
+        if os.path.exists(sp):
+            os.remove(sp)
+            print(f"  removed legacy side-cache: {sp}")
+
+    # Bundle just the tokenizer / processor files into gemma4_e2b_bin/tokenizer/
+    # so a deploy host can run inference without the full HF model directory
+    # (model.safetensors is ~10 GB and not needed at run time). This lets
+    # gemma4_e2b_run_from_bin.py work on a stripped deploy.
+    tokenizer_subset_extract(os.path.dirname(out_path), cfg)
     return out_path
+
+
+def _build_vision_section_bytes(hf_model) -> tuple[bytes, dict]:
+    """Pre-quantize the vision encoder weights once and return
+    (section_bytes, section_manifest). Caller decides where to write.
+
+    Manifest holds tensor offsets RELATIVE to the vision section start
+    (loader adds the section's base offset to convert to absolute file
+    offsets) plus the few scalars `vision_weight_init` needs
+    (`VIS_POOL_K`, `VIS_TEXT_H`, `VIS_ROPE_PERM`, clip ranges).
+    """
+    vt = hf_model.model.vision_tower
+    ev = hf_model.model.embed_vision
+    H, MLP, HD, NH = 768, 3072, 64, 12
+    L_count = 16
+
+    # Same 2D-RoPE permutation vision_weight_init applies before uploading
+    # Q/K/V output rows and O input columns. Stored as a list of ints in
+    # the manifest so run_from_bin can rebuild the tensor.
+    VIS_ROPE_PERM = torch.cat([
+        torch.arange(0, 16), torch.arange(32, 48),
+        torch.arange(16, 32), torch.arange(48, 64),
+    ])
+
+    def _perm_qkv(w: torch.Tensor) -> torch.Tensor:
+        return w.reshape(NH, HD, -1)[:, VIS_ROPE_PERM, :].reshape(NH * HD, -1).contiguous()
+    def _perm_o(w: torch.Tensor) -> torch.Tensor:
+        return w.reshape(-1, NH, HD)[:, :, VIS_ROPE_PERM].reshape(-1, NH * HD).contiguous()
+
+    # (section_key, bytes, shape, dtype) — order doesn't matter at run time,
+    # but we keep layer-major for readability.
+    sections: list[tuple[str, bytes, list[int], str]] = []
+
+    def _add_bf16(key: str, w: torch.Tensor) -> None:
+        wc = w.contiguous()
+        sections.append((key, wc.view(torch.uint8).numpy().tobytes(), list(wc.shape), "bf16"))
+
+    # Per-layer
+    for li in range(L_count):
+        L = vt.encoder.layers[li]
+        pre = f"layer{li}"
+        # Norms (BF16)
+        for n in ["input_layernorm", "post_attention_layernorm",
+                  "pre_feedforward_layernorm", "post_feedforward_layernorm"]:
+            _add_bf16(f"{pre}.{n}", getattr(L, n).weight.detach().cpu().to(torch.bfloat16))
+        # Q/K norm with the rope perm
+        for n in ["q_norm", "k_norm"]:
+            w = getattr(L.self_attn, n).weight.detach().cpu().to(torch.bfloat16)
+            _add_bf16(f"{pre}.{n}", w[VIS_ROPE_PERM])
+        # IF4 projections — quantize in parallel then save (data, scale) pair per tensor
+        q4_names = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        q4_tensors: list[torch.Tensor] = []
+        for proj in ["q_proj", "k_proj", "v_proj"]:
+            w = getattr(L.self_attn, proj).linear.weight.detach().cpu().to(torch.bfloat16)
+            q4_tensors.append(_perm_qkv(w))
+        q4_tensors.append(_perm_o(L.self_attn.o_proj.linear.weight.detach().cpu().to(torch.bfloat16)))
+        for mlp in ["gate_proj", "up_proj", "down_proj"]:
+            q4_tensors.append(getattr(L.mlp, mlp).linear.weight.detach().cpu().to(torch.bfloat16))
+        qs = _parallel_quantize(VISION_QUANT_PRECISION, [t.contiguous() for t in q4_tensors])
+        for name, w, (data_b, scale_b) in zip(q4_names, q4_tensors, qs):
+            sections.append((f"{pre}.{name}.scale", scale_b, list(w.shape), f"{VISION_QUANT_PRECISION}_scale"))
+            sections.append((f"{pre}.{name}.data",  data_b,  list(w.shape), f"{VISION_QUANT_PRECISION}_data"))
+
+    # Non-layer
+    pe = vt.patch_embedder
+    _add_bf16("pos_embedding_table",
+              pe.position_embedding_table.detach().cpu().to(torch.bfloat16))
+    _add_bf16("embed_norm_gamma", torch.ones(H, dtype=torch.bfloat16))
+    _add_bf16("v_norm_ones_gamma", torch.ones(HD, dtype=torch.bfloat16))
+
+    w_patch = pe.input_proj.weight.detach().cpu().to(torch.bfloat16).contiguous()
+    w_embed = ev.embedding_projection.weight.detach().cpu().to(torch.bfloat16).contiguous()
+    pq = _parallel_quantize(VISION_QUANT_PRECISION, [w_patch, w_embed])
+    for name, w, (d, s) in zip(["patch_proj", "embed_proj"], [w_patch, w_embed], pq):
+        sections.append((f"{name}.scale", s, list(w.shape), f"{VISION_QUANT_PRECISION}_scale"))
+        sections.append((f"{name}.data",  d, list(w.shape), f"{VISION_QUANT_PRECISION}_data"))
+
+    # Clip ranges from the Gemma4ClippableLinear wrappers — small JSON.
+    def _finite(x):
+        # JSON can't natively serialize inf; mark with strings.
+        if x == float("inf"):  return "inf"
+        if x == -float("inf"): return "-inf"
+        return float(x)
+    clip_ranges = []
+    for li in range(L_count):
+        L = vt.encoder.layers[li]
+        cr: dict = {}
+        for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            proj = getattr(L.self_attn, proj_name)
+            if proj.use_clipped_linears:
+                cr[proj_name] = {
+                    "input":  [_finite(proj.input_min.item()),  _finite(proj.input_max.item())],
+                    "output": [_finite(proj.output_min.item()), _finite(proj.output_max.item())],
+                }
+            else:
+                cr[proj_name] = {"input": ["-inf", "inf"], "output": ["-inf", "inf"]}
+        for mlp_name in ["gate_proj", "up_proj", "down_proj"]:
+            proj = getattr(L.mlp, mlp_name)
+            if proj.use_clipped_linears:
+                cr[mlp_name] = {
+                    "input":  [_finite(proj.input_min.item()),  _finite(proj.input_max.item())],
+                    "output": [_finite(proj.output_min.item()), _finite(proj.output_max.item())],
+                }
+            else:
+                cr[mlp_name] = {"input": ["-inf", "inf"], "output": ["-inf", "inf"]}
+        clip_ranges.append(cr)
+
+    # Concatenate section bytes in memory. Caller (`weight_bin_generate`)
+    # writes them into the combined weights bin.
+    out = bytearray()
+    section_meta: dict = {}
+    cur = 0
+    for key, b, shape, dtype in sections:
+        section_meta[key] = {"offset": cur, "size": len(b), "shape": shape, "dtype": dtype}
+        out.extend(b)
+        cur += len(b)
+    manifest = {
+        "vision_quant_precision": VISION_QUANT_PRECISION,
+        "num_layers": L_count,
+        "VIS_H": H, "VIS_MLP": MLP, "VIS_HEAD_DIM": HD, "VIS_HEADS": NH,
+        "VIS_POOL_K": int(vt.config.pooling_kernel_size),
+        "VIS_TEXT_H": int(ev.embedding_projection.weight.shape[0]),
+        "VIS_ROPE_PERM": VIS_ROPE_PERM.tolist(),
+        "sections": section_meta,
+        "clip_ranges": clip_ranges,
+    }
+    print(f"  Vision section: {cur/1024**2:.1f} MiB, {len(section_meta)} tensors")
+    return bytes(out), manifest
+
+
+def _build_audio_section_bytes(hf_model) -> tuple[bytes, dict]:
+    """Pre-quantize the audio encoder weights once and return
+    (section_bytes, section_manifest). Mirrors _build_vision_section_bytes.
+
+    Bin layout includes: subsample stem (conv0/conv1/proj with the
+    Phase A2.3 row-duplication + K=2048 padding baked in), 12 Conformer
+    layers, output_proj + multimodal embedder. Generated tensors
+    (G_s0 / gamma_64 / ID_64) are recomputed at runtime by
+    audio_weight_init from canonical-shape constants and don't need to
+    be stored.
+
+    Caller writes section_bytes into the combined weights bin and the
+    manifest goes into the master JSON under "audio_section".
+    """
+    am = hf_model.model.audio_tower
+    ea = hf_model.model.embed_audio
+
+    sections: list[tuple[str, bytes, list[int], str]] = []
+
+    def _add_bf16(key: str, w: torch.Tensor) -> None:
+        wc = w.contiguous()
+        sections.append((key, wc.view(torch.uint8).numpy().tobytes(), list(wc.shape), "bf16"))
+
+    def _add_if4_batch(tensors: list[tuple[str, torch.Tensor]]) -> None:
+        for name, w in tensors:
+            assert w.dim() == 2, f"{name}: expected 2D weight, got {tuple(w.shape)}"
+            assert w.shape[1] % 64 == 0, f"{name}: K={w.shape[1]} not divisible by 64"
+        tensors_c = [w.contiguous() for _, w in tensors]
+        results = _parallel_quantize(AUDIO_QUANT_PRECISION, tensors_c)
+        for (name, _), w, (data_b, scale_b) in zip(tensors, tensors_c, results):
+            sections.append((f"{name}.scale", scale_b, list(w.shape), f"{AUDIO_QUANT_PRECISION}_scale"))
+            sections.append((f"{name}.data",  data_b,  list(w.shape), f"{AUDIO_QUANT_PRECISION}_data"))
+
+    # ---- Subsample weights with Phase A2.3 transformations baked in ----
+    sub = am.subsample_conv_projection
+    w0 = sub.layer0.conv.weight.detach().cpu().to(torch.bfloat16).reshape(128, 9)
+    w0_padded = torch.zeros(128, 64, dtype=torch.bfloat16)
+    w0_padded[:, :9] = w0
+    w1 = sub.layer1.conv.weight.detach().cpu().to(torch.bfloat16).permute(0, 2, 3, 1).reshape(32, 9 * 128)
+    w1_padded = torch.zeros(64, 9 * 128, dtype=torch.bfloat16)
+    w1_padded[:32] = w1
+    w1_padded[32:] = w1  # Phase A2.3: duplicate rows for N=32 LN trick
+    W1_sub = 32
+    proj_orig = sub.input_proj_linear.weight.detach().cpu().to(torch.bfloat16)
+    proj_padded = torch.zeros(1024, 2 * 1024, dtype=torch.bfloat16)
+    for w1_idx in range(W1_sub):
+        proj_padded[:, w1_idx * 64:w1_idx * 64 + 32] = proj_orig[:, w1_idx * 32:(w1_idx + 1) * 32]
+    _add_if4_batch([
+        ("subsample.conv0", w0_padded),
+        ("subsample.conv1", w1_padded),
+        ("subsample.proj",  proj_padded),
+    ])
+    # LN gammas (BF16). gamma_64 = concat(gamma_32, gamma_32) baked here.
+    ln0_gamma = sub.layer0.norm.weight.detach().cpu().to(torch.bfloat16)
+    ln1_gamma_32 = sub.layer1.norm.weight.detach().cpu().to(torch.bfloat16)
+    _add_bf16("subsample.ln0_gamma", ln0_gamma)
+    _add_bf16("subsample.ln1_gamma_64", torch.cat([ln1_gamma_32, ln1_gamma_32], dim=0))
+
+    # ---- Per-layer Conformer weights ----
+    L_count = len(am.layers)
+    clip_ranges: list[dict] = []
+    def _finite(x):
+        if x == float("inf"):  return "inf"
+        if x == -float("inf"): return "-inf"
+        return float(x)
+    def _proj_clip(proj):
+        if not getattr(proj, "use_clipped_linears", False):
+            return {"in_min": "-inf", "in_max": "inf", "out_min": "-inf", "out_max": "inf"}
+        return {
+            "in_min":  _finite(proj.input_min.item()),
+            "in_max":  _finite(proj.input_max.item()),
+            "out_min": _finite(proj.output_min.item()),
+            "out_max": _finite(proj.output_max.item()),
+        }
+
+    for li in range(L_count):
+        L = am.layers[li]
+        pre = f"layer{li}"
+        ff1 = L.feed_forward1
+        sa = L.self_attn
+        cv = L.lconv1d
+        ff2 = L.feed_forward2
+        # BF16 norms / scales (8 per layer)
+        _add_bf16(f"{pre}.ff1_pre_norm",    ff1.pre_layer_norm.weight.detach().cpu().to(torch.bfloat16))
+        _add_bf16(f"{pre}.ff1_post_norm",   ff1.post_layer_norm.weight.detach().cpu().to(torch.bfloat16))
+        _add_bf16(f"{pre}.attn_pre_norm",   L.norm_pre_attn.weight.detach().cpu().to(torch.bfloat16))
+        _add_bf16(f"{pre}.per_dim_scale",   sa.per_dim_scale.detach().cpu().to(torch.bfloat16))
+        _add_bf16(f"{pre}.attn_post_norm",  L.norm_post_attn.weight.detach().cpu().to(torch.bfloat16))
+        _add_bf16(f"{pre}.conv_pre_norm",   cv.pre_layer_norm.weight.detach().cpu().to(torch.bfloat16))
+        dw_w = cv.depthwise_conv1d.weight.detach().cpu().to(torch.bfloat16).squeeze(1)
+        _add_bf16(f"{pre}.conv_dw_w",       dw_w)
+        _add_bf16(f"{pre}.conv_norm",       cv.conv_norm.weight.detach().cpu().to(torch.bfloat16))
+        _add_bf16(f"{pre}.ff2_pre_norm",    ff2.pre_layer_norm.weight.detach().cpu().to(torch.bfloat16))
+        _add_bf16(f"{pre}.ff2_post_norm",   ff2.post_layer_norm.weight.detach().cpu().to(torch.bfloat16))
+        _add_bf16(f"{pre}.norm_out",        L.norm_out.weight.detach().cpu().to(torch.bfloat16))
+        # IF4 projections (11 per layer)
+        _add_if4_batch([
+            (f"{pre}.ff1_w1",         ff1.ffw_layer_1.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.ff1_w2",         ff1.ffw_layer_2.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.q_proj",         sa.q_proj.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.k_proj",         sa.k_proj.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.v_proj",         sa.v_proj.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.o_proj",         sa.post.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.rel_k_proj",     sa.relative_k_proj.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.conv_lin_start", cv.linear_start.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.conv_lin_end",   cv.linear_end.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.ff2_w1",         ff2.ffw_layer_1.linear.weight.detach().cpu().to(torch.bfloat16)),
+            (f"{pre}.ff2_w2",         ff2.ffw_layer_2.linear.weight.detach().cpu().to(torch.bfloat16)),
+        ])
+        # Per-layer clip ranges for the ClippableLinear wrappers (small JSON).
+        clip_ranges.append({
+            "ff1_w1":         _proj_clip(ff1.ffw_layer_1),
+            "ff1_w2":         _proj_clip(ff1.ffw_layer_2),
+            "q_proj":         _proj_clip(sa.q_proj),
+            "k_proj":         _proj_clip(sa.k_proj),
+            "v_proj":         _proj_clip(sa.v_proj),
+            "o_proj":         _proj_clip(sa.post),
+            "conv_lin_start": _proj_clip(cv.linear_start),
+            "conv_lin_end":   _proj_clip(cv.linear_end),
+            "ff2_w1":         _proj_clip(ff2.ffw_layer_1),
+            "ff2_w2":         _proj_clip(ff2.ffw_layer_2),
+        })
+
+    # ---- Output projection + multimodal embedder ----
+    out_proj_w = am.output_proj.weight.detach().cpu().to(torch.bfloat16)
+    out_proj_b = am.output_proj.bias.detach().cpu().to(torch.bfloat16)
+    embedder_w = ea.embedding_projection.weight.detach().cpu().to(torch.bfloat16)
+    _add_if4_batch([
+        ("output_proj",   out_proj_w),
+        ("embedder_proj", embedder_w),
+    ])
+    _add_bf16("output_proj_bias", out_proj_b)
+
+    # Concatenate and build manifest.
+    out = bytearray()
+    section_meta: dict = {}
+    cur = 0
+    for key, b, shape, dtype in sections:
+        section_meta[key] = {"offset": cur, "size": len(b), "shape": shape, "dtype": dtype}
+        out.extend(b)
+        cur += len(b)
+    manifest = {
+        "audio_quant_precision": AUDIO_QUANT_PRECISION,
+        "num_layers": L_count,
+        "AUD_H":         int(am.config.hidden_size),
+        "AUD_HEADS":     int(am.config.num_attention_heads),
+        "AUD_HEAD_DIM":  int(am.config.hidden_size) // int(am.config.num_attention_heads),
+        "AUD_FFN":       int(am.config.hidden_size) * 4,
+        "AUD_OUT_DIM":   int(ea.embedding_projection.weight.shape[0]),
+        "sections":      section_meta,
+        "clip_ranges":   clip_ranges,
+    }
+    print(f"  Audio section: {cur/1024**2:.1f} MiB, {len(section_meta)} tensors")
+    return bytes(out), manifest
+
+
+def tokenizer_subset_extract(bin_dir: str, cfg: dict) -> str:
+    """Copy the minimal tokenizer / processor files needed by
+    gemma4_e2b_run_from_bin.py into `<bin_dir>/tokenizer/`. The full HF
+    model directory (with the multi-GB .safetensors checkpoint) is not
+    required at run time once this subset is in place.
+
+    Returns the destination directory path.
+    """
+    import shutil
+    hf_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
+    dst    = os.path.join(bin_dir, "tokenizer")
+    os.makedirs(dst, exist_ok=True)
+    # Required for AutoTokenizer (text) and AutoProcessor (image / audio).
+    # Everything else (model.safetensors, config.json, .gitattributes, etc.)
+    # is intentionally skipped.
+    wanted = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "special_tokens_map.json",
+        "processor_config.json",
+    ]
+    copied = []
+    for name in wanted:
+        src = os.path.join(hf_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dst, name))
+            copied.append(name)
+    print(f"Bundled tokenizer subset to {dst} ({len(copied)} files: {', '.join(copied)})")
+    return dst
+
+
+def _build_host_section_bytes(text_model, cfg) -> tuple[bytes, dict]:
+    """Build host-side tensor section bytes + manifest. The few tensors
+    `_compute_per_layer_inputs` needs (per-layer embedding table, projection,
+    projection norm) are concatenated as bf16 bytes; per-layer scalars and
+    the KV-shared-layer map travel in the manifest dict.
+
+    The big tensor (`embed_tokens_per_layer`, ~4.5 GB bf16) is laid down
+    first so the run-time loader can mmap exactly its offset and pull rows
+    on demand — RSS stays low even on a 16 GB Pi.
+    """
+    file_info = cfg["file_info"]
+    num_layers = file_info["num_layers"]
+    per_layer_input_dim = file_info["per_layer_input_dim"]
+
+    # 1. per_layer_embed_tokens, pre-scaled by sqrt(per_layer_input_dim).
+    # Chunked scale-and-cast so we don't materialize the full fp32 tensor
+    # (would be 9.4 GB for vocab=262144, dim=8960 — blows past 16 GB).
+    src = text_model.embed_tokens_per_layer.weight.detach().cpu().to(torch.bfloat16)
+    per_layer_embed_scale = per_layer_input_dim ** 0.5
+    embed_bf16 = torch.empty_like(src)
+    chunk = 8192
+    for i in range(0, src.shape[0], chunk):
+        embed_bf16[i:i+chunk] = (src[i:i+chunk].float() * per_layer_embed_scale).to(torch.bfloat16)
+    del src
+
+    # 2. per_layer_model_proj_weight  [8960, 1536]
+    proj_bf16 = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16).contiguous()
+    # 3. per_layer_proj_norm_weight   [256]  (raw, no gamma_offset — host-side norm wants raw w)
+    norm_bf16 = text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).contiguous()
+
+    # 4. Scalars + KV-shared map
+    layer_scalars = []
+    kv_shared_map: dict[int, int] = {}
+    for layer_idx in range(num_layers):
+        layer = text_model.layers[layer_idx]
+        layer_scalars.append(float(layer.layer_scalar.item()))
+        attn = layer.self_attn
+        if attn.is_kv_shared_layer and attn.kv_shared_layer_index is not None:
+            kv_shared_map[layer_idx] = int(attn.kv_shared_layer_index)
+
+    embed_b = embed_bf16.contiguous().view(torch.uint8).numpy().tobytes()
+    proj_b  = proj_bf16.view(torch.uint8).numpy().tobytes()
+    norm_b  = norm_bf16.view(torch.uint8).numpy().tobytes()
+
+    embed_off = 0
+    proj_off  = embed_off + len(embed_b)
+    norm_off  = proj_off  + len(proj_b)
+    total     = norm_off  + len(norm_b)
+
+    out = embed_b + proj_b + norm_b
+    manifest = {
+        "embed_tokens_per_layer": {"offset": embed_off, "size": len(embed_b), "shape": list(embed_bf16.shape)},
+        "per_layer_model_proj":   {"offset": proj_off,  "size": len(proj_b),  "shape": list(proj_bf16.shape)},
+        "per_layer_proj_norm":    {"offset": norm_off,  "size": len(norm_b),  "shape": list(norm_bf16.shape)},
+        "layer_scalars": layer_scalars,
+        # JSON keys must be strings — convert int → str.
+        "kv_shared_map": {str(k): v for k, v in kv_shared_map.items()},
+    }
+    print(f"  Host section: {total/1024**3:.2f} GiB, 3 tensors + scalars + kv_shared_map")
+    return out, manifest
+
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
     """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
@@ -764,17 +1216,18 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _prog_dram_base_save = self._program_dram_base
 
         # ---- Unified-bin vision path ----
-        # Vision encoder ISA lives inside gemma4_instruction.bin at address
-        # `lm_base + lm_size`. If the unified bin doesn't exist yet (first run
-        # ever, or LM-only-first scenario), build the LM core now; then
-        # extend with vision. This keeps the single-bin contract intact across
-        # any LM/VLM run order.
+        # Vision encoder ISA lives inside gemma4_instruction.bin at the
+        # `vision_program_start_addr` baked by compile_instruction_bin. The
+        # bin MUST already exist with vision folded in — main()
+        # / run_from_bin invoke compile_instruction_bin(image_path=...,
+        # audio_path=...) at cold start to guarantee that.
         bin_dir    = os.path.join(self.script_dir, "gemma4_e2b_bin")
         instr_bin  = os.path.join(bin_dir, "gemma4_instruction.bin")
         instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
         if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
-            print("[VLM] LM instruction bin missing; building core (LM-only) before vision extend.")
-            self.compile_instruction_bin()
+            raise SystemExit(
+                "[VLM] gemma4_instruction.bin missing — compile_instruction_bin "
+                "must run first (main() handles this on cold start).")
         with open(instr_meta, "r") as f:
             _peek = json.load(f)
         if _peek.get("compile_version") != INSTRUCTION_BIN_COMPILE_VERSION:
@@ -782,73 +1235,41 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 f"Instruction bin compile_version mismatch (disk: {_peek.get('compile_version')!r}, "
                 f"expected {INSTRUCTION_BIN_COMPILE_VERSION!r}). "
                 f"Delete {instr_bin} and rerun.")
-        _lm_base = int(_peek["instruction_base_addr"], 16)
-        _lm_size = _peek["instruction_total_size"]
-        # If the bin already contains vision, vision_target_addr is the
-        # already-baked vision start; otherwise the next free byte after LM.
-        vision_target_addr = (int(_peek["vision_program_start_addr"], 16)
-                              if _peek.get("contains_vision")
-                              else _lm_base + _lm_size)
+        if not _peek.get("contains_vision"):
+            raise SystemExit(
+                "[VLM] unified bin was built without the vision section. "
+                "Delete gemma4_instruction.bin and rerun so the cold-start "
+                "compile folds vision in too.")
+        vision_target_addr = int(_peek["vision_program_start_addr"], 16)
 
-        # Vision setup. Pass program_base so PBI baking in subsequent compile
-        # (if we need to extend) targets the right unified-bin address.
+        # Replicate the compile-time allocator order so addresses baked into
+        # the vision ISA resolve to the same DRAM bytes at runtime.
         self.vision_weight_init(hf_model)
         self.vision_tensor_init(num_patches, program_base=vision_target_addr)
         self.set_vision_attention_bias(padding_positions)
 
-        # 2D-RoPE tables (cos / neg_sin / sin_hi tiled+padded) for FPGA RoPE.
-        # If the unified bin already contains rope pads (subsequent VLM run),
-        # read the bytes directly from the bin file at the manifest offsets.
-        # Else compute fresh on host and pass them into the extend call so they
-        # land in the same unified bin alongside the vision ISA.
-        cos_pad_tiled = neg_sin_pad_tiled = sin_hi_pad_tiled = None
-        if (_peek.get("contains_vision")
-                and all(k in _peek for k in (
-                    "vision_rope_cos_offset", "vision_rope_neg_sin_offset",
-                    "vision_rope_sin_hi_offset"))):
-            HD = self.VIS_HEAD_DIM
-            NH = self.VIS_HEADS
-            n_rows = num_patches * NH
-            bytes_per_buffer = n_rows * HD * self.bytes_per_element
-            print(f"  [Vision] [host] reading rope pads from unified bin "
-                  f"(offsets cos={_peek['vision_rope_cos_offset']}, "
-                  f"neg_sin={_peek['vision_rope_neg_sin_offset']}, "
-                  f"sin_hi={_peek['vision_rope_sin_hi_offset']})", flush=True)
-            with open(instr_bin, "rb") as f:
-                def _slice_pad(off, sz):
-                    f.seek(off)
-                    buf = f.read(sz)
-                    if len(buf) != sz:
-                        raise RuntimeError(f"truncated rope pad read at offset {off}")
-                    return torch.frombuffer(bytearray(buf), dtype=torch.bfloat16).reshape(n_rows, HD).clone()
-                cos_pad_tiled     = _slice_pad(_peek["vision_rope_cos_offset"],     _peek["vision_rope_cos_size"])
-                neg_sin_pad_tiled = _slice_pad(_peek["vision_rope_neg_sin_offset"], _peek["vision_rope_neg_sin_size"])
-                sin_hi_pad_tiled  = _slice_pad(_peek["vision_rope_sin_hi_offset"],  _peek["vision_rope_sin_hi_size"])
-        else:
-            cos_pad_tiled, neg_sin_pad_tiled, sin_hi_pad_tiled = self._load_or_build_vision_rope_pads(
-                hf_model, pixel_position_ids, num_patches)
+        # 2D-RoPE tables live in the bin's trailing data region; slice them
+        # out and DMA to the vision tensor buffers.
+        HD = self.VIS_HEAD_DIM
+        NH = self.VIS_HEADS
+        n_rows = num_patches * NH
+        with open(instr_bin, "rb") as f:
+            def _slice_pad(off, sz):
+                f.seek(off)
+                buf = f.read(sz)
+                if len(buf) != sz:
+                    raise RuntimeError(f"truncated rope pad read at offset {off}")
+                return torch.frombuffer(bytearray(buf), dtype=torch.bfloat16).reshape(n_rows, HD).clone()
+            cos_pad_tiled     = _slice_pad(_peek["vision_rope_cos_offset"],     _peek["vision_rope_cos_size"])
+            neg_sin_pad_tiled = _slice_pad(_peek["vision_rope_neg_sin_offset"], _peek["vision_rope_neg_sin_size"])
+            sin_hi_pad_tiled  = _slice_pad(_peek["vision_rope_sin_hi_offset"],  _peek["vision_rope_sin_hi_size"])
         self.dma_to_accelerator_memory(self.VIS_ROPE_COS_PAD_TILED, cos_pad_tiled)
         self.dma_to_accelerator_memory(self.VIS_ROPE_NEG_SIN_PAD_TILED, neg_sin_pad_tiled)
         self.dma_to_accelerator_memory(self.VIS_ROPE_SIN_HI_PAD_TILED, sin_hi_pad_tiled)
 
-        # Extend the unified bin with vision ISA if not yet present.
-        # This is the incremental-compile path: LM bytes are reused as-is, only
-        # vision ISA is emitted. Saves the ~3.5 min LM recompile that a full
-        # rebuild would cost. Rope pads (host-computed) are also embedded
-        # in the same atomic rewrite, so the bin holds everything vision needs.
-        if not _peek.get("contains_vision"):
-            import hashlib
-            _pos_hash = hashlib.sha256(
-                pixel_position_ids.detach().cpu().contiguous().numpy().tobytes()
-            ).hexdigest()
-            self.extend_instruction_bin_with_vision(
-                num_patches,
-                rope_pads_tuple=(cos_pad_tiled, neg_sin_pad_tiled, sin_hi_pad_tiled),
-                position_ids_sha256=_pos_hash)
-
-        # Load (or reload) the unified bin to FPGA program DRAM.
-        # Both LM and vision sections now sit at their baked absolute
-        # addresses; PBI JUMP_ABS targets resolve correctly.
+        # Load the unified bin to FPGA program DRAM (idempotent — main()
+        # already loaded it, but reloading is cheap and ensures the vision
+        # ISA bytes are in DRAM if anything else clobbered them).
         manifest = self.load_instruction_bin()
         vision_program_addr = manifest["_vision_addr_int"]
 
@@ -1014,72 +1435,102 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _prog_dram_addr_save = self._next_program_dram_addr
         _prog_dram_base_save = self._program_dram_base
 
-        # Audio ISA sub-region per fixed Gemma4 DRAM layout (full 4 GB) — see
-        # notes/notes_gemma4_e2b_vision.md "Master layout table".
-        # ISA Audio = 0x98000000 – 0xa0000000 (128 MB; required ~100 MB).
-        audio_prog_base = 0x98000000
+        # ---- Unified-bin audio path ----
+        # The audio encoder ISA lives inside gemma4_instruction.bin (folded
+        # at compile time by compile_instruction_bin → load_instruction_bin
+        # already DMA'd it into program DRAM). We just need to:
+        #   1) upload weights (params region; deterministic addresses)
+        #   2) allocate audio tensor DRAM (must match the addresses baked
+        #      into the captured ISA — same call order as compile time)
+        #   3) host DMAs: actual mel input → AUD_SUB_INPUT, zero scratch
+        #      (R_combined, PATCHES1, AUD_IO_A)
+        #   4) start_execute_from_dram(audio_program_addr); wait
+        #   5) read AUD_FEATURES_FINAL
+        bin_dir    = os.path.join(self.script_dir, "gemma4_e2b_bin")
+        instr_bin  = os.path.join(bin_dir, "gemma4_instruction.bin")
+        instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
+        if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
+            raise SystemExit(
+                "[Audio] gemma4_instruction.bin missing — compile_instruction_bin "
+                "must run first (main() handles this on cold start). Delete the "
+                "bin file to force a rebuild including the audio section.")
+        with open(instr_meta, "r") as f:
+            _peek = json.load(f)
+        if not _peek.get("contains_audio"):
+            raise SystemExit(
+                "[Audio] unified bin was built without the audio section. "
+                "Delete gemma4_instruction.bin and rerun so the cold-start "
+                "compile folds audio in too.")
+        T_raw = int(input_features.shape[1])
+        bin_T_raw = _peek["audio_T_raw"]
+        if T_raw != bin_T_raw:
+            raise SystemExit(
+                f"[Audio] input_features shape mismatch: got T_raw={T_raw}, "
+                f"bin was compiled for T_raw={bin_T_raw}. HF's audio "
+                f"processor should produce a fixed-length input — confirm "
+                f"the processor version, or delete the bin to rebuild.")
+        H0 = (T_raw + 2 - 3) // 2 + 1
+        H1 = (H0 + 2 - 3) // 2 + 1
+        T_sub = H1
 
-        # ---- FPGA audio ----
-        # reset_allocator=False: keep LM tensor DRAM intact; audio weights go
-        # immediately after LM tensor's current end.
+        # Replicate the compile-time allocator order so addresses baked into
+        # the audio ISA resolve to the same DRAM bytes at runtime.
+        # CRITICAL: compile_instruction_bin calls vision_weight_init BEFORE
+        # audio_weight_init, and vision_weight_init advances the tensor DRAM
+        # cursor by ~80 MB (it loads the vision weight tensors into tensor
+        # DRAM, not just params DRAM). audio_weight_init then saves the
+        # cursor at V+80MB and restores it on exit; audio_tensor_init starts
+        # allocating audio buffers from V+80MB. The audio ISA bakes those
+        # V+80MB addresses. If runtime skips vision_weight_init, audio
+        # buffers land 80 MB lower and the bin reads uninitialized memory
+        # — manifests as NaN audio_features and all-<pad> decode. So we
+        # ALSO run vision_weight_init at audio runtime (cheap: it loads
+        # from the combined weight bin's vision_section, no HF model
+        # required) purely to match the cursor state.
+        self.vision_weight_init(hf_model)
         self.audio_weight_init(hf_model, reset_allocator=False)
-
-        # audio_tensor_init allocates intermediates AFTER weights (current
-        # cursor). Intermediates clobber nothing yet because we're past LM
-        # tensors. But we also need to set _program_dram_base / _next_program
-        # so captured audio instructions go to audio_prog_base, not into the
-        # LM program area that's already in use.
-        self._next_program_dram_addr = audio_prog_base
-        self._program_dram_base = audio_prog_base
-
-        # Subsample on host (Conv2d stem is tiny; not worth FPGA-ing).
-        sub_hidden, _ = self.audio_subsample_host(input_features, input_features_mask)
-        T_sub = int(sub_hidden.shape[1])
-
-        # Allocate intermediates. This starts at current cursor (after audio
-        # weights) and grows upward. Total audio footprint (weights + inter)
-        # is ~200 MB, which lands around ~0xFE000000 — close to the 4 GB
-        # boundary but safe because audio_prog_base is past it (will wrap?
-        # no — audio_prog_base < tensor cursor if weights are bigger than
-        # 200 MB. We'll allocate programs there during compile, and they
-        # don't overlap tensors because program_base = tensor_save + 200 MB
-        # and tensor cursor after audio weights ≈ tensor_save + 160 MB).
         self.audio_tensor_init(T_sub)
-
-        # Seed AUD_IO_A with the subsampled hidden state (padded to L_pad).
         L_pad = self._aud_L_pad
         H = self.AUD_H
-        seed = torch.zeros(L_pad, H, dtype=torch.bfloat16)
-        seed[:T_sub] = sub_hidden[0, :T_sub].to(torch.bfloat16)
-        self.dma_to_accelerator_memory(self.AUD_IO_A, seed.contiguous())
 
-        # Per-segment FPGA program cache (skip Python ISA emission on subsequent
-        # runs with the same L_pad). Keyed at the file level by L_pad — different
-        # audio durations get separate caches. Delete the file to force a rebuild
-        # after structural changes.
-        cache_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
-        bin_path = os.path.join(cache_dir, f"audio_program_cache_{L_pad}f.bin")
-        meta_path = os.path.join(cache_dir, f"audio_program_cache_{L_pad}f.json")
-        self._aud_program_cache = _ProgramCache(bin_path, meta_path)
-        n_cached = self._aud_program_cache.load()
-        print(f"  [Audio] Program cache: {n_cached} segments loaded "
-              f"(0 = cold build, will populate on first run)")
+        # Host DMAs: upload actual mel input + zero subsample scratch +
+        # zero encoder input. audio_subsample_fpga in oneshot mode runs the
+        # host setup (upload AUD_SUB_INPUT, zero AUD_SUB_R_COMBINED/PATCHES1
+        # and lazy-allocates AUD_SUB_* if not yet present); we suppress the
+        # ISA emit by clearing capture_buffer to None so emits become no-ops
+        # while the host DMAs still move bytes to FPGA DRAM.
+        _saved_capture_buffer = self.capture_buffer
+        _saved_capture_count  = self.capture_count
+        _saved_is_capture_on  = self.is_capture_on
+        self.capture_buffer = None      # suppress FPGA ISA emit
+        self.is_capture_on  = False
+        self._oneshot_mode  = True
+        try:
+            self.audio_subsample_fpga(input_features, input_features_mask)
+        finally:
+            self._oneshot_mode  = False
+            self.capture_buffer = _saved_capture_buffer
+            self.capture_count  = _saved_capture_count
+            self.is_capture_on  = _saved_is_capture_on
+        # Pre-zero AUD_IO_A so padding rows beyond T_sub stay zero after the
+        # subsample proj writes the first H1_pad rows.
+        self.dma_to_accelerator_memory(self.AUD_IO_A,
+            torch.zeros(L_pad * H, dtype=torch.bfloat16))
 
-        # Run all 12 Conformer layers on FPGA.
+        # Trigger the audio program at its baked address inside the bin.
+        audio_program_addr = int(_peek["audio_program_start_addr"], 16)
+        audio_program_size = _peek["audio_program_size"]
+        _original_print(f"  [Audio] launching audio one-shot at 0x{audio_program_addr:X} "
+                        f"({audio_program_size/1024/1024:.1f} MB ISA)", flush=True)
         aud_t0 = time.perf_counter()
-        for li in range(self.AUD_LAYERS):
-            self.run_audio_layer(li)
-            print(f"    [Audio] layer {li+1}/{self.AUD_LAYERS} done ({time.perf_counter()-aud_t0:.1f}s total)")
+        self.start_execute_from_dram(audio_program_addr)
+        self.wait_queue(180.0)
+        print(f"    [Audio] one-shot audio pipeline done in {time.perf_counter()-aud_t0:.1f}s")
 
-        # Read encoder output, then run output_proj + multimodal embedder on host.
-        encoder_out = self.dma_from_accelerator_memory(self.AUD_IO_A, (L_pad, H)).cpu()[:T_sub]
-        # TEMP diagnostic: dump raw encoder output if GEMMA4_AUDIO_DUMP=<path>.
-        # Used to compare pre/post one-shot refactor; remove after verification.
-        _dump = os.environ.get("GEMMA4_AUDIO_DUMP")
-        if _dump:
-            torch.save(encoder_out, _dump)
-            print(f"  [Audio] DIAG dumped encoder_out {tuple(encoder_out.shape)} -> {_dump}", flush=True)
-        audio_features = self.audio_embed_project_host(encoder_out)
+        # DMA the final audio_features back. Slice to T_sub valid rows.
+        OUT_DIM = self.AUD_OUT_DIM
+        audio_features = self.dma_from_accelerator_memory(
+            self.AUD_FEATURES_FINAL, (L_pad, OUT_DIM)).cpu()[:T_sub].to(torch.bfloat16)
         # Sanity: number of audio soft tokens equals mm_types count of 3s.
         n_audio_slots = sum(1 for m in mm_types if m == 3)
         if audio_features.shape[0] != n_audio_slots:
@@ -1094,9 +1545,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 audio_features = torch.cat([audio_features, pad], dim=0)
 
         # ---- Restore LM state so decoder can run ----
-        # Same story as vision: audio intermediates clobbered LAYER0_V/K_ROPE
-        # (KV cache) and may have touched IDENTITY_DRAM. Re-zero KV and
-        # re-upload IDENTITY so the LM decoder path is clean.
+        # audio intermediates clobbered LAYER0_V/K_ROPE (KV cache) and may
+        # have touched IDENTITY_DRAM. Re-zero KV and re-upload IDENTITY.
         self._tensor_dram_addr = _tensor_dram_save
         self._next_program_dram_addr = _prog_dram_addr_save
         self._program_dram_base = _prog_dram_base_save
@@ -1109,13 +1559,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
 
         del hf_model
-
-        # Persist any newly-captured FPGA program segments so subsequent runs
-        # with the same L_pad skip the Python ISA emission.
-        if self._aud_program_cache is not None and self._aud_program_cache._dirty:
-            self._aud_program_cache.save()
-            print(f"  [Audio] Program cache saved: "
-                  f"{len(self._aud_program_cache)} segments → {self._aud_program_cache.bin_path}")
 
         print(f"  [Audio] FPGA path complete: {T_sub} frames → "
               f"{audio_features.shape[0]} soft tokens, "
@@ -1579,17 +2022,131 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     VIS_LAYERS = 16      # num_hidden_layers
     VIS_ROPE_DIM = 32    # half of head_dim for 2D RoPE (64 / 2)
 
+    def _vision_weight_init_from_combined_bin(self, weights_bin_path: str, vision_section: dict) -> None:
+        """Load pre-quantized vision weights from the combined weights bin
+        and DMA to FPGA. No HF model load, no quantization.
+        `vision_section["manifest"]["sections"]` gives tensor offsets
+        RELATIVE to the vision section start; we add
+        `vision_section["offset"]` (absolute file offset of the vision
+        section) when seeking.
+        """
+        base_offset = int(vision_section["offset"])
+        meta = vision_section["manifest"]
+        if meta.get("vision_quant_precision") != VISION_QUANT_PRECISION:
+            raise RuntimeError(
+                f"vision section quant precision mismatch (disk: {meta.get('vision_quant_precision')!r}, "
+                f"expected {VISION_QUANT_PRECISION!r}). Regenerate the weights bin.")
+        self.VIS_ROPE_PERM = torch.tensor(meta["VIS_ROPE_PERM"], dtype=torch.long)
+        self.VIS_POOL_K    = int(meta["VIS_POOL_K"])
+        self.VIS_TEXT_H    = int(meta["VIS_TEXT_H"])
+        L_count = int(meta["num_layers"])
+        sections = meta["sections"]
+
+        def _str_to_float(v):
+            if v == "inf":  return float("inf")
+            if v == "-inf": return -float("inf")
+            return float(v)
+        self._vis_clip_ranges = []
+        for cr in meta["clip_ranges"]:
+            row = {}
+            for k, v in cr.items():
+                row[k] = {
+                    "input":  (_str_to_float(v["input"][0]),  _str_to_float(v["input"][1])),
+                    "output": (_str_to_float(v["output"][0]), _str_to_float(v["output"][1])),
+                }
+            self._vis_clip_ranges.append(row)
+
+        print(f"\n[Vision] Loading pre-quantized vision weights from combined weights bin "
+              f"({VISION_QUANT_PRECISION.upper()} block=64 + BF16 norms) ...")
+        f = open(weights_bin_path, "rb")
+        try:
+            def _dma_section(key: str) -> int:
+                s = sections[key]
+                f.seek(base_offset + s["offset"])
+                bts = f.read(s["size"])
+                if len(bts) != s["size"]:
+                    raise RuntimeError(f"truncated section read {key} at offset {base_offset + s['offset']}")
+                addr = self.allocate_tensor_dram(s["size"])
+                self.dma_write(DMA_DEVICE_H2C, addr, bts, s["size"])
+                return addr
+
+            # Per-layer
+            layer_weight_addrs = []
+            for li in range(L_count):
+                pre = f"layer{li}"
+                addrs = {}
+                for n in ["input_layernorm", "post_attention_layernorm",
+                          "pre_feedforward_layernorm", "post_feedforward_layernorm",
+                          "q_norm", "k_norm"]:
+                    addrs[n] = _dma_section(f"{pre}.{n}")
+                for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj",
+                                  "gate_proj", "up_proj", "down_proj"]:
+                    scale_addr = _dma_section(f"{pre}.{proj_name}.scale")
+                    data_addr  = _dma_section(f"{pre}.{proj_name}.data")
+                    addrs[proj_name] = {
+                        "data": data_addr, "scale": scale_addr,
+                        "shape": tuple(sections[f"{pre}.{proj_name}.data"]["shape"]),
+                    }
+                layer_weight_addrs.append(addrs)
+            self._vis_weight_addrs = layer_weight_addrs
+
+            # Position embedding table stays on host (one-time host gather in
+            # vision_patch_embed; ~15 MB).
+            # Match the legacy vision_weight_init allocation order exactly so
+            # that DRAM addresses produced here are identical to the addresses
+            # baked into the instruction bin. Diverging order = wrong
+            # tensors at every vision op → garbage output.
+            s = sections["pos_embedding_table"]
+            f.seek(base_offset + s["offset"])
+            bts = f.read(s["size"])
+            self._vis_pos_embed_table = torch.frombuffer(
+                bytearray(bts), dtype=torch.bfloat16
+            ).reshape(*s["shape"]).clone()
+
+            self.VIS_EMBED_NORM_HAS_SCALE = False
+            self.VIS_EMBED_NORM_GAMMA = _dma_section("embed_norm_gamma")
+
+            for nm in ("patch_proj", "embed_proj"):
+                scale_addr = _dma_section(f"{nm}.scale")
+                data_addr  = _dma_section(f"{nm}.data")
+                info = {"data": data_addr, "scale": scale_addr,
+                        "shape": tuple(sections[f"{nm}.data"]["shape"])}
+                if nm == "patch_proj":
+                    self.VIS_PATCH_PROJ_INFO = info
+                else:
+                    self.VIS_EMBED_PROJ_INFO = info
+
+            # V-norm ones-gamma allocated LAST in the legacy path.
+            self.VIS_V_NORM_ONES_GAMMA = _dma_section("v_norm_ones_gamma")
+        finally:
+            f.close()
+        self._vis_weight_end = self.get_tensor_dram_addr()
+        print(f"  Vision weights loaded from cache. Tensor DRAM usage: "
+              f"{self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
+
     def vision_weight_init(self, hf_model) -> None:
         """Upload vision encoder weights to FPGA DRAM.
 
-        Q/K/V/O, MLP gate/up/down, patch embedder input_proj, and the
-        embed_vision projection are quantized via the canonical codec wrapper
-        (codebook = ``VISION_QUANT_PRECISION``, default ``"if4"``) with BF16
-        per-block scales (block_size=64 along K). Norms stay BF16. Each
-        quantized projection stores a dict {'data': addr, 'scale': addr} in
-        the per-layer address table so the compile functions can pass
-        SCALE_DRAM_ADDR alongside B_DRAM_ADDR.
+        Prefers the pre-quantized vision section inside the combined
+        weights bin (no HF model, no IF4 quantization). Falls back to
+        the HF-model + quantize path only if the weights bin has not
+        yet been regenerated under the combined layout.
+
+        Idempotent: a second call (e.g., when the audio runtime path
+        invokes it to match compile-time cursor advance) is a no-op.
+        Re-allocating vision weight tensors would double-advance the
+        tensor cursor and break addresses baked into the captured ISA.
         """
+        if getattr(self, "_vision_weight_init_done", False):
+            return
+        master = getattr(self, "_weights_master", None)
+        if master is not None and "vision_section" in master and "manifest" in master["vision_section"]:
+            weights_bin_path = os.path.join(self.script_dir, self._weights_bin_rel)
+            self._vision_weight_init_from_combined_bin(weights_bin_path, master["vision_section"])
+            self._vision_weight_init_done = True
+            return
+        print(f"[Vision] combined-bin vision section not present — falling back to HF + quantize. "
+              f"Re-run gemma4_e2b_test.py to regenerate the weights bin in combined layout.")
         vt = hf_model.model.vision_tower
         bpe = self.bytes_per_element
         H = self.VIS_H
@@ -1766,6 +2323,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         # Save vision weight end address — program DRAM must start AFTER this
         self._vis_weight_end = self.get_tensor_dram_addr()
+        self._vision_weight_init_done = True
         print(f"  Vision weights uploaded. Tensor DRAM usage: {self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
 
     def vision_tensor_init(self, num_patches: int, *, program_base: int | None = None) -> None:
@@ -2029,50 +2587,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(addr, t)
 
     def _load_or_build_vision_rope_pads(self, hf_model, pixel_position_ids, num_patches):
-        """Get the three FPGA-ready 2D-RoPE padded buffers (cos/neg_sin/sin_hi),
-        each (S * NH, HD) bf16, for the given image.
-
-        First run: compute via HF rotary_emb on host, then save raw bytes to
-        a bin file (acts as cached "weights" for this image's RoPE tables).
-        Subsequent runs: load directly from bin — no host compute, no padding,
-        just bytes ready to DMA to FPGA. The bin is keyed by num_patches and
-        verified against a sha256 of pixel_position_ids.
+        """Compute the three FPGA-ready 2D-RoPE padded buffers
+        (cos / neg_sin / sin_hi), each (S * NH, HD) bf16, for the canonical
+        image grid. The result is embedded in the unified instruction bin
+        (gemma4_instruction.bin) by compile_instruction_bin, so we don't
+        keep a separate vision_rope_pads_*.bin cache file on disk anymore:
+        the bin already holds these bytes.
         """
-        import hashlib
-        cache_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
-        bin_path  = os.path.join(cache_dir, f"vision_rope_pads_{num_patches}p.bin")
-        meta_path = os.path.join(cache_dir, f"vision_rope_pads_{num_patches}p.json")
-
         HD = self.VIS_HEAD_DIM
         NH = self.VIS_HEADS
-        bytes_per_buffer = num_patches * NH * HD * self.bytes_per_element
-        pos_bytes = pixel_position_ids.detach().cpu().contiguous().numpy().tobytes()
-        pos_hash = hashlib.sha256(pos_bytes).hexdigest()
-
-        if os.path.exists(bin_path) and os.path.exists(meta_path):
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-            if (meta.get("position_ids_sha256") == pos_hash
-                    and meta.get("num_patches") == num_patches
-                    and meta.get("num_heads") == NH
-                    and meta.get("head_dim") == HD):
-                with open(bin_path, "rb") as f:
-                    blob = f.read()
-                expected = bytes_per_buffer * 3
-                if len(blob) == expected:
-                    print(f"  [Vision] [host] 2D-RoPE pads loaded from cache {os.path.basename(bin_path)} ({expected/1024/1024:.1f} MB)", flush=True)
-                    # Wrap slices in bytearray to silence the "non-writable
-                    # buffer" warning (the .clone() below makes the result
-                    # writable anyway, but bytearray avoids the warning).
-                    def _slice(i):
-                        return torch.frombuffer(
-                            bytearray(blob[i * bytes_per_buffer : (i + 1) * bytes_per_buffer]),
-                            dtype=torch.bfloat16,
-                        ).reshape(num_patches * NH, HD).clone()
-                    return _slice(0), _slice(1), _slice(2)
-
-        # Compute fresh.
-        print(f"  [Vision] [host] 2D-RoPE pads not cached; computing once...", flush=True)
+        print(f"  [Vision] [host] computing 2D-RoPE pads...", flush=True)
         t0 = time.perf_counter()
         with torch.no_grad():
             vt = hf_model.model.vision_tower
@@ -2095,22 +2619,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         cos_pad_tiled     = cos_pad.unsqueeze(1).expand(-1, NH, -1).contiguous().reshape(num_patches * NH, HD)
         neg_sin_pad_tiled = neg_sin_pad.unsqueeze(1).expand(-1, NH, -1).contiguous().reshape(num_patches * NH, HD)
         sin_hi_pad_tiled  = sin_hi_pad.unsqueeze(1).expand(-1, NH, -1).contiguous().reshape(num_patches * NH, HD)
-
-        os.makedirs(cache_dir, exist_ok=True)
-        # numpy() doesn't support bf16; view as uint8 to get the raw bytes.
-        with open(bin_path, "wb") as f:
-            f.write(cos_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes())
-            f.write(neg_sin_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes())
-            f.write(sin_hi_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes())
-        with open(meta_path, "w") as f:
-            json.dump({
-                "num_patches": num_patches,
-                "num_heads": NH,
-                "head_dim": HD,
-                "position_ids_sha256": pos_hash,
-                "format": "concat[cos_pad_tiled, neg_sin_pad_tiled, sin_hi_pad_tiled] each (num_patches*num_heads, head_dim) bf16",
-            }, f, indent=2)
-        print(f"  [Vision] [host] 2D-RoPE pads computed in {time.perf_counter()-t0:.2f}s, saved to {os.path.basename(bin_path)} ({bytes_per_buffer*3/1024/1024:.1f} MB)", flush=True)
+        bytes_per_buffer = num_patches * NH * HD * self.bytes_per_element
+        print(f"  [Vision] [host] 2D-RoPE pads computed in {time.perf_counter()-t0:.2f}s "
+              f"({bytes_per_buffer*3/1024/1024:.1f} MB, embedded into unified bin)", flush=True)
         return cos_pad_tiled, neg_sin_pad_tiled, sin_hi_pad_tiled
 
     def _emit_qkv_transpose_to_hm(self, src_dram: int, dst_dram: int,
@@ -2240,7 +2751,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
     def _emit_clamp_dram_to_dram(self, src_dram: int, dst_dram: int,
                                    num_elements: int,
-                                   clamp_min: float, clamp_max: float) -> None:
+                                   clamp_min: float, clamp_max: float,
+                                   *, identity_addr: int | None = None,
+                                   use_pbi: bool | None = None) -> None:
         """FPGA DRAM→DRAM clamp via matmul-with-identity-weight + fused clamp.
 
         HW only routes through LALU (which has CLAMP) during DOT_PRODUCT,
@@ -2250,10 +2763,19 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         (SNR=inf at all sizes up to 1.9M elements).
 
         Replaces _host_clip_dram (read DRAM → torch.clamp → write DRAM) with
-        a pure FPGA op so vision encoder can be captured as a single program.
+        a pure FPGA op so vision/audio encoders can be captured one-shot.
+
+        ``identity_addr``: 64x64 bf16 identity. Defaults to VIS_IDENTITY_64;
+            audio passes AUD_IDENTITY_64 so vision init isn't required.
+        ``use_pbi``: optional override; default = vision default.
         """
         assert num_elements % 64 == 0, f"num_elements ({num_elements}) must be multiple of 64"
-        assert hasattr(self, "VIS_IDENTITY_64"), "VIS_IDENTITY_64 must be allocated (vision_tensor_init)"
+        if identity_addr is None:
+            assert hasattr(self, "VIS_IDENTITY_64"), \
+                "VIS_IDENTITY_64 not allocated; pass identity_addr=AUD_IDENTITY_64"
+            identity_addr = self.VIS_IDENTITY_64
+        if use_pbi is None:
+            use_pbi = getattr(self, "_vis_use_pbi_nonflash", True)
         saved_a = user_dma_core.LALU_CLAMP_RELU_A
         saved_b = user_dma_core.LALU_CLAMP_RELU_B
         try:
@@ -2262,15 +2784,30 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.matmat_mul_core(
                 M=num_elements // 64, K=64, N=64,
                 A_DRAM_ADDR=src_dram,
-                B_DRAM_ADDR=self.VIS_IDENTITY_64,
+                B_DRAM_ADDR=identity_addr,
                 OUTPUT_DRAM_ADDR=dst_dram,
                 is_B_quantized=False,
                 clamp_enable=True,
-                use_pbi=getattr(self, "_vis_use_pbi_nonflash", True),  # PBI: collapses chunk loops; large reduction at S=2520.
+                use_pbi=use_pbi,
             )
         finally:
             user_dma_core.LALU_CLAMP_RELU_A = saved_a
             user_dma_core.LALU_CLAMP_RELU_B = saved_b
+
+    def _aud_clip_dram(self, addr: int, shape: tuple,
+                        clamp_min: float, clamp_max: float) -> None:
+        """Audio-encoder clip (Phase 1). FPGA clamp via matmul-with-AUD_IDENTITY_64."""
+        rows, cols = shape
+        num_elements = rows * cols
+        assert hasattr(self, "AUD_IDENTITY_64"), \
+            "AUD_IDENTITY_64 not allocated (audio_tensor_init)"
+        label = f"aud_clip_{addr:08x}_{num_elements}"
+        self._compile_and_run_single(label, lambda: self._emit_clamp_dram_to_dram(
+            src_dram=addr, dst_dram=addr,
+            num_elements=num_elements,
+            clamp_min=clamp_min, clamp_max=clamp_max,
+            identity_addr=self.AUD_IDENTITY_64,
+            use_pbi=False))
 
     def _matmul_with_output_clamp(self, *, clamp_min: float, clamp_max: float, use_pbi: bool = True, **mm_kwargs) -> None:
         """matmat_mul_core with arbitrary output-clamp bounds.
@@ -3067,16 +3604,190 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # q_scale = (head_dim^-0.5) / log(2),  k_scale = log(1 + e) / log(2)
         self.AUD_Q_SCALE = (self.AUD_HEAD_DIM ** -0.5) / math.log(2)
         self.AUD_K_SCALE = math.log(1.0 + math.e) / math.log(2)
+        # Phase 4: PBI variants of per-layer rms_norms + matmuls. Real ISA-loop
+        # compression for norms; per-tile pointer-backed descriptors for matmuls.
+        # 14 percent encoder-bin shrink end-to-end. Always on.
         print(f"[Audio] config loaded: {self.AUD_LAYERS} layers, "
               f"H={self.AUD_H}, heads={self.AUD_HEADS}, FFN={self.AUD_FFN}, "
               f"conv_k={self.AUD_CONV_K}, chunk={self.AUD_CHUNK}, ctx={self.AUD_CTX}")
 
+    def _audio_weight_init_from_combined_bin(self, weights_bin_path: str, audio_section: dict) -> None:
+        """Load pre-quantized audio weights from the combined weights bin.
+        Mirrors _vision_weight_init_from_combined_bin: no HF model, no
+        quantization. The allocation ORDER below MUST match audio_weight_init
+        (HF path) so that DRAM addresses baked into the captured audio ISA
+        resolve to the same buffers at runtime.
+
+        Generated tensors (G_s0 / ID_64) are not in the bin — they are
+        deterministic functions of canonical-shape constants and we
+        recompute them here on host before DMA.
+        """
+        self.audio_config_init()
+        bpe = self.bytes_per_element
+        base_offset = int(audio_section["offset"])
+        meta = audio_section["manifest"]
+        if meta.get("audio_quant_precision") != AUDIO_QUANT_PRECISION:
+            raise RuntimeError(
+                f"audio section quant precision mismatch (disk: "
+                f"{meta.get('audio_quant_precision')!r}, expected "
+                f"{AUDIO_QUANT_PRECISION!r}). Regenerate the weights bin.")
+        L_count = int(meta["num_layers"])
+        sections = meta["sections"]
+
+        # Route audio weight uploads to the dedicated Weight Audio params
+        # region (0x6c000000–0x78000000); restore the tensor cursor at the
+        # end so encoder intermediates start from the LM tensor end. Same
+        # contract as audio_weight_init (HF path).
+        _aud_weight_tensor_cursor_save = self._tensor_dram_addr
+        self._tensor_dram_addr = 0x6c000000
+
+        print(f"\n[Audio] Loading pre-quantized audio weights from combined weights bin "
+              f"({AUDIO_QUANT_PRECISION.upper()} block=64 + BF16 norms) ...")
+        f = open(weights_bin_path, "rb")
+        try:
+            def _dma_section(key: str) -> int:
+                s = sections[key]
+                f.seek(base_offset + s["offset"])
+                bts = f.read(s["size"])
+                if len(bts) != s["size"]:
+                    raise RuntimeError(f"truncated section read {key} at offset {base_offset + s['offset']}")
+                addr = self.allocate_tensor_dram(s["size"])
+                self.dma_write(DMA_DEVICE_H2C, addr, bts, s["size"])
+                return addr
+
+            def _alloc_if4(name: str) -> dict:
+                # Order MUST match _upload_fp4_batch: scale first, then data.
+                scale_addr = _dma_section(f"{name}.scale")
+                data_addr  = _dma_section(f"{name}.data")
+                return {"data": data_addr, "scale": scale_addr,
+                        "shape": tuple(sections[f"{name}.data"]["shape"])}
+
+            # ---- Subsample IF4 weights (conv0, conv1, proj) — batched order ----
+            self._aud_sub_conv0_addrs = _alloc_if4("subsample.conv0")
+            self._aud_sub_conv1_addrs = _alloc_if4("subsample.conv1")
+            self._aud_sub_proj_addrs  = _alloc_if4("subsample.proj")
+
+            # ---- Subsample BF16 gammas and runtime-generated helpers ----
+            self._aud_sub_ln0_gamma_addr = _dma_section("subsample.ln0_gamma")
+            self._aud_sub_ln1_gamma_addr = _dma_section("subsample.ln1_gamma_64")
+            # ID_64 is just eye(64); recompute on host.
+            id_64_addr = self.allocate_tensor_dram(64 * 64 * bpe)
+            self.dma_to_accelerator_memory(id_64_addr,
+                torch.eye(64, dtype=torch.bfloat16).contiguous())
+            self._aud_sub_id_64_addr = id_64_addr
+            # G_s0 is deterministic (parakeet pattern, depends only on n_mels=128);
+            # recompute on host. Must follow exact size used by audio_weight_init.
+            VS = UE_VECTOR_SIZE
+            _W_in_s0 = 128
+            _W_out_s0 = (_W_in_s0 + 2 - 3) // 2 + 1
+            K_g_s0 = ((3 * _W_in_s0 + VS - 1) // VS) * VS
+            N_g_s0 = _W_out_s0 * 64
+            G_s0 = torch.zeros(N_g_s0, K_g_s0, dtype=torch.bfloat16)
+            for kh in range(3):
+                for kw in range(3):
+                    for ow in range(_W_out_s0):
+                        col = ow * 2 - 1 + kw
+                        if 0 <= col < _W_in_s0:
+                            G_s0[ow * 64 + kh * 3 + kw, kh * _W_in_s0 + col] = 1.0
+            g_s0_addr = self.allocate_tensor_dram(N_g_s0 * K_g_s0 * bpe)
+            self.dma_to_accelerator_memory(g_s0_addr, G_s0.contiguous())
+            self._aud_sub_G_s0_addr = g_s0_addr
+            self._aud_sub_K_g_s0 = K_g_s0
+            self._aud_sub_N_g_s0 = N_g_s0
+
+            # ---- Per-layer Conformer weights ----
+            # Allocation order MUST match audio_weight_init exactly:
+            # BF16 norms first (in order), then 11 IF4 projections batched.
+            layer_addrs: list[dict] = []
+            clip_ranges: list[dict] = []
+            def _str_to_float(v):
+                if v == "inf":  return float("inf")
+                if v == "-inf": return -float("inf")
+                return float(v)
+            def _to_old_clip(cr: dict) -> dict:
+                # _audio_weight_init returns dict with keys "in_min" etc; same here.
+                return {
+                    "in_min":  _str_to_float(cr["in_min"]),
+                    "in_max":  _str_to_float(cr["in_max"]),
+                    "out_min": _str_to_float(cr["out_min"]),
+                    "out_max": _str_to_float(cr["out_max"]),
+                }
+            hf_cache: list[dict] = []
+            for li in range(L_count):
+                pre = f"layer{li}"
+                addrs: dict = {}
+                addrs["FF1_PRE_NORM"]    = _dma_section(f"{pre}.ff1_pre_norm")
+                addrs["FF1_POST_NORM"]   = _dma_section(f"{pre}.ff1_post_norm")
+                addrs["ATTN_PRE_NORM"]   = _dma_section(f"{pre}.attn_pre_norm")
+                addrs["PER_DIM_SCALE"]   = _dma_section(f"{pre}.per_dim_scale")
+                addrs["ATTN_POST_NORM"]  = _dma_section(f"{pre}.attn_post_norm")
+                addrs["CONV_PRE_NORM"]   = _dma_section(f"{pre}.conv_pre_norm")
+                # CONV_DW_W is both DMA'd (for FPGA) AND kept on host because
+                # audio_tensor_init reads dw_w[:, t] to build per-tap tile
+                # buffers. Read the bytes once, parse to a host tensor, then
+                # DMA from those bytes — avoids a separate C2H read.
+                dw_section = sections[f"{pre}.conv_dw_w"]
+                f.seek(base_offset + dw_section["offset"])
+                dw_bytes = f.read(dw_section["size"])
+                addrs["CONV_DW_W"] = self.allocate_tensor_dram(dw_section["size"])
+                self.dma_write(DMA_DEVICE_H2C, addrs["CONV_DW_W"], dw_bytes, dw_section["size"])
+                dw_w_host = torch.frombuffer(
+                    bytearray(dw_bytes), dtype=torch.bfloat16
+                ).reshape(*dw_section["shape"]).clone()
+                addrs["CONV_NORM"]       = _dma_section(f"{pre}.conv_norm")
+                addrs["FF2_PRE_NORM"]    = _dma_section(f"{pre}.ff2_pre_norm")
+                addrs["FF2_POST_NORM"]   = _dma_section(f"{pre}.ff2_post_norm")
+                addrs["NORM_OUT"]        = _dma_section(f"{pre}.norm_out")
+                # IF4 batch (11 tensors in the audio_weight_init order)
+                for proj in ["FF1_W1", "FF1_W2", "Q_PROJ", "K_PROJ", "V_PROJ",
+                              "O_PROJ", "REL_K_PROJ", "CONV_LIN_START", "CONV_LIN_END",
+                              "FF2_W1", "FF2_W2"]:
+                    addrs[proj] = _alloc_if4(f"{pre}.{proj.lower()}")
+                layer_addrs.append(addrs)
+                hf_cache.append({"dw_w": dw_w_host})  # other fields not needed in FPGA pipeline
+                # Clip ranges per layer
+                cr_src = meta["clip_ranges"][li]
+                layer_cr: dict = {}
+                for k in ("ff1_w1", "ff1_w2", "q_proj", "k_proj", "v_proj", "o_proj",
+                          "conv_lin_start", "conv_lin_end", "ff2_w1", "ff2_w2"):
+                    layer_cr[k.upper()] = _to_old_clip(cr_src[k])
+                clip_ranges.append(layer_cr)
+            self._aud_weight_addrs = layer_addrs
+            self._aud_clip_ranges = clip_ranges
+            self._aud_hf_layers = hf_cache
+
+            # ---- Output projection + multimodal embedder (IF4 batch + BF16 bias) ----
+            self._aud_output_proj_addrs = _alloc_if4("output_proj")
+            self._aud_embedder_proj_addrs = _alloc_if4("embedder_proj")
+            self._aud_output_proj_b_addr = _dma_section("output_proj_bias")
+        finally:
+            f.close()
+
+        # Sanity: assert audio weights fit in the 192 MB region.
+        audio_weight_end = self._tensor_dram_addr
+        AUDIO_WEIGHT_REGION_END = 0x78000000
+        assert audio_weight_end <= AUDIO_WEIGHT_REGION_END, (
+            f"Audio weights overflowed dedicated region: cursor="
+            f"0x{audio_weight_end:X} > 0x{AUDIO_WEIGHT_REGION_END:X}")
+        self._tensor_dram_addr = _aud_weight_tensor_cursor_save
+
+        print(f"[Audio] uploaded {self.AUD_LAYERS} layers + subsample + projector "
+              f"(weights in params region 0x6c000000-0x{audio_weight_end:X}, "
+              f"{(audio_weight_end - 0x6c000000)/(1024*1024):.1f} MB from bin; "
+              f"tensor cursor restored to 0x{self._tensor_dram_addr:X})")
+
     def audio_weight_init(self, hf_model, *, reset_allocator: bool = True) -> None:
         """Upload Gemma4 audio encoder weights to FPGA DRAM.
 
-        Quantization: matmul weights via the canonical codec wrapper
-        (codebook = ``AUDIO_QUANT_PRECISION``, default ``"if4"``,
-        block_size=64 along K), norms / depthwise kernel / per_dim_scale → BF16.
+        Prefers the pre-quantized audio section inside the combined
+        weights bin (no HF model, no IF4 quantization). Falls back to
+        the HF-model + quantize path only if the weights bin has not
+        yet been regenerated with the audio section.
+
+        Quantization (fallback path): matmul weights via the canonical
+        codec wrapper (codebook = ``AUDIO_QUANT_PRECISION``, default
+        ``"if4"``, block_size=64 along K), norms / depthwise kernel /
+        per_dim_scale → BF16.
 
         Stores per-layer DRAM addresses in self._aud_weight_addrs[i]:
             "FF1_W1" / "FF1_W2" / "Q_PROJ" / ... / "CONV_LIN_START" / ...
@@ -3091,6 +3802,18 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             test script (which interleaves audio + LM) should pass False
             and use the save/restore pattern in _run_audio_encoder_fpga.
         """
+        # Prefer the combined-bin fast path if the weights bin includes an
+        # audio_section (no HF model needed).
+        master = getattr(self, "_weights_master", None)
+        if master is not None and "audio_section" in master and "manifest" in master["audio_section"]:
+            weights_bin_path = os.path.join(self.script_dir, self._weights_bin_rel)
+            self._audio_weight_init_from_combined_bin(weights_bin_path, master["audio_section"])
+            return
+        if hf_model is None:
+            raise RuntimeError(
+                "audio_weight_init: combined-bin audio section not present and "
+                "no HF model provided. Regenerate weights_gemma4_e2b_hf.bin via "
+                "`python gemma4_e2b_test.py` so the audio section gets folded in.")
         self.audio_config_init()
         am = hf_model.model.audio_tower
         bpe = self.bytes_per_element
@@ -3100,6 +3823,19 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self._aud_tensor_dram_save = self._tensor_dram_addr
             self.reset_tensor_dram_addr()
             print(f"\n[Audio] Tensor allocator reset for audio weights")
+
+        # Route audio weight uploads to the dedicated Weight Audio region
+        # (params DRAM 0x6c000000–0x78000000, 192 MB) instead of stacking on
+        # top of LM tensor DRAM. The tensor DRAM region (0x78000000–0x98000000,
+        # 512 MB) is sized only for LM activations (~257 MB) + audio encoder
+        # intermediates (~102 MB); stacking 156 MB of audio weights in front
+        # of intermediates pushed the tail past 0x98000000, corrupting the
+        # audio ISA region — and shifting the tail by even 3 MB silently
+        # broke downstream LM state. Putting weights in the proper layout
+        # region keeps tensor DRAM usage within budget regardless of
+        # subsequent audio-weight additions.
+        _aud_weight_tensor_cursor_save = self._tensor_dram_addr
+        self._tensor_dram_addr = 0x6c000000  # Weight Audio region base
 
         print(f"\n[Audio] Uploading audio encoder weights to DRAM "
               f"({AUDIO_QUANT_PRECISION.upper()} block=64 + BF16 norms) ...")
@@ -3132,16 +3868,97 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 out[name] = {"data": data_addr, "scale": scale_addr, "shape": (N, K)}
             return out
 
-        # ---- Subsample conv weights (kept on host, used by audio_subsample_host)
-        # Conv2d weights are tiny (~64 KB total) and run on host. Cached as
-        # Python attrs so the host helper can call F.conv2d without round-tripping
-        # through HF.
+        # ---- Subsample conv weights ----
+        # Host copies (used by audio_subsample_host fallback and as the
+        # source for FPGA-side quantization in Phase A).
         sub = am.subsample_conv_projection
         self._aud_sub_w0_conv = sub.layer0.conv.weight.detach().cpu().to(torch.bfloat16)
         self._aud_sub_w0_norm = sub.layer0.norm.weight.detach().cpu().to(torch.bfloat16)
         self._aud_sub_w1_conv = sub.layer1.conv.weight.detach().cpu().to(torch.bfloat16)
         self._aud_sub_w1_norm = sub.layer1.norm.weight.detach().cpu().to(torch.bfloat16)
         self._aud_sub_proj_w  = sub.input_proj_linear.weight.detach().cpu().to(torch.bfloat16)
+
+        # Phase A: FPGA-side subsample weights. Layer-0 conv is (out=128, in=1, 3, 3)
+        # -> flatten to (out=128, kh*kw=9), pad K to 64 for IF4 (K%64==0 required).
+        # Layer-1 conv is (out=32, in=128, 3, 3) -> permute to (out, kh, kw, in)
+        # then flatten to (out=32, 9*128=1152), pad N to 64.
+        K0_pad = 64
+        w0 = self._aud_sub_w0_conv.reshape(128, 9)  # (out, kh*kw)
+        w0_padded = torch.zeros(128, K0_pad, dtype=torch.bfloat16)
+        w0_padded[:, :9] = w0
+        # Layer-1 weight: original (out=32, in=128, kh=3, kw=3). Patches will be
+        # laid out as (N1, (kh*3+kw)*in_ch + c) so weight must be permuted to
+        # (out, kh, kw, in) then flattened.
+        w1 = self._aud_sub_w1_conv.permute(0, 2, 3, 1).reshape(32, 9 * 128)  # (32, 1152)
+        # Pad N (out_ch) from 32 to 64. Phase A2.3: instead of zero-padding
+        # rows 32-63, DUPLICATE rows 0-31. This makes conv1 output (N1_pad, 64)
+        # have cols 32-63 == cols 0-31, which is the key trick that lets us
+        # run the N=32 LayerNorm via the standard layer_norm_core_dram with
+        # N=64: mean and variance computed over the duplicated 64 values are
+        # mathematically identical to the same statistics over the real 32
+        # values (each value appears twice, both sum and sum-of-squares double,
+        # the /N divisor doubles → same mean and same variance).
+        w1_padded = torch.zeros(64, 9 * 128, dtype=torch.bfloat16)
+        w1_padded[:32] = w1
+        w1_padded[32:] = w1
+        # Phase A2.3: pad proj weight K=1024 → 2048 to consume the duplicated
+        # 64-channel layout of (LN1+ReLU) output. proj_new[:, w1*64+c] for
+        # c<32 = proj_orig[:, w1*32+c]; cols [32:64] of each w1 group are
+        # zero so the duplicate input does not double-count. Then proj_new @
+        # flat_new (with K=2048) equals proj_orig @ flat_orig.
+        W1_sub = 32
+        proj_orig = self._aud_sub_proj_w               # (1024, 1024)
+        proj_padded = torch.zeros(1024, 2 * 1024, dtype=torch.bfloat16)
+        for w1_idx in range(W1_sub):
+            proj_padded[:, w1_idx * 64:w1_idx * 64 + 32] = proj_orig[:, w1_idx * 32:(w1_idx + 1) * 32]
+            # cols [w1*64+32:w1*64+64] remain zero (duplicate input → zero weight)
+        sub_if4_named = [
+            ("AUD_SUB_CONV0_W", w0_padded),  # (N=128, K=64)
+            ("AUD_SUB_CONV1_W", w1_padded),  # (N=64, K=1152) — rows 32-63 duplicate 0-31
+            ("AUD_SUB_PROJ_W",  proj_padded),  # (1024, 2048) — odd 32-blocks zero
+        ]
+        sub_addrs = _upload_fp4_batch(sub_if4_named)
+        self._aud_sub_conv0_addrs = sub_addrs["AUD_SUB_CONV0_W"]
+        self._aud_sub_conv1_addrs = sub_addrs["AUD_SUB_CONV1_W"]
+        self._aud_sub_proj_addrs  = sub_addrs["AUD_SUB_PROJ_W"]
+
+        # LayerNorm gammas (bf16, no IF4). Bias is None (HF Gemma4 subsample
+        # LayerNorm has bias=False).
+        self._aud_sub_ln0_gamma_addr = _upload_bf16("aud_sub_ln0_gamma", self._aud_sub_w0_norm)
+        # Phase A2.3: gamma_64 = concat(gamma_32, gamma_32) for the duplicated
+        # 64-channel LN1 input. The duplicate trick relies on gamma_64[i] ==
+        # gamma_real[i] for i < 32 so that LN_64[i<32] equals the real LN_32.
+        # gamma_64[i>=32] can be anything (those cols feed zero proj weights),
+        # but the symmetric pattern keeps the FPGA output cleanly mirrored.
+        ln1_gamma_64 = torch.cat([self._aud_sub_w1_norm, self._aud_sub_w1_norm], dim=0)
+        self._aud_sub_ln1_gamma_addr = _upload_bf16("aud_sub_ln1_gamma_64", ln1_gamma_64)
+        # Identity matrix for FPGA ReLU on (N1_pad, 64) via matmul + clamp.
+        # Lives in params region; small (64*64*2 = 8 KB).
+        self._aud_sub_id_64_addr = _upload_bf16("aud_sub_id_64",
+            torch.eye(64, dtype=torch.bfloat16))
+
+        # Phase A2.1: FPGA im2col stage-0 gather matrix G_s0 (parakeet pattern).
+        # G_s0[ow*64 + kh*3 + kw, kh*W_in + col] = 1.0 where col = ow*2 - 1 + kw.
+        # Used as the B-matrix in a permutation matmul R_combined @ G_s0^T that
+        # turns 3 strided DMA gathers of mel input into the (H0, W0, 9) patches
+        # consumed by conv0 — replacing the host im2col loop. Stored in (N, K)
+        # layout to match matmat_mul_core's B convention. Phase A2.2 will add
+        # G_s1 for stage 1 (multi-channel).
+        VS = UE_VECTOR_SIZE
+        _W_in_s0 = 128
+        _W_out_s0 = (_W_in_s0 + 2 - 3) // 2 + 1   # 64
+        K_g_s0 = ((3 * _W_in_s0 + VS - 1) // VS) * VS   # 384 (already 64-aligned)
+        N_g_s0 = _W_out_s0 * 64                          # 4096
+        G_s0 = torch.zeros(N_g_s0, K_g_s0, dtype=torch.bfloat16)
+        for kh in range(3):
+            for kw in range(3):
+                for ow in range(_W_out_s0):
+                    col = ow * 2 - 1 + kw
+                    if 0 <= col < _W_in_s0:
+                        G_s0[ow * 64 + kh * 3 + kw, kh * _W_in_s0 + col] = 1.0
+        self._aud_sub_G_s0_addr = _upload_bf16("aud_sub_G_s0", G_s0)
+        self._aud_sub_K_g_s0 = K_g_s0
+        self._aud_sub_N_g_s0 = N_g_s0
 
         # ---- Per-layer encoder weights ----
         # Cache BF16 host copies of weights used by host-fallback ops
@@ -3224,8 +4041,36 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         ea = hf_model.model.embed_audio
         self._aud_embedder_proj_w = ea.embedding_projection.weight.detach().cpu().to(torch.bfloat16)
 
+        # Phase B: FPGA-side output_proj + multimodal embedder.
+        # IF4-quantize the two Linear weights and upload, plus the bias as
+        # BF16. The host copies above remain so legacy/host paths still work.
+        embed_if4_named = [
+            ("AUD_OUTPUT_PROJ", self._aud_output_proj_w),  # (OUT_DIM, H)
+            ("AUD_EMBEDDER_PROJ", self._aud_embedder_proj_w),  # (OUT_DIM, OUT_DIM)
+        ]
+        embed_addrs = _upload_fp4_batch(embed_if4_named)
+        self._aud_output_proj_addrs = embed_addrs["AUD_OUTPUT_PROJ"]
+        self._aud_embedder_proj_addrs = embed_addrs["AUD_EMBEDDER_PROJ"]
+        # Bias for output_proj (broadcast_N during matmul)
+        self._aud_output_proj_b_addr = _upload_bf16(
+            "aud_output_proj_bias", self._aud_output_proj_b)
+
+        # Verify audio weights fit in the dedicated 192 MB region, then
+        # restore the tensor cursor so audio intermediates start back at
+        # the LM tensor end (audio_tensor_init bumps from here).
+        audio_weight_end = self._tensor_dram_addr
+        AUDIO_WEIGHT_REGION_END = 0x78000000
+        assert audio_weight_end <= AUDIO_WEIGHT_REGION_END, (
+            f"Audio weights overflowed dedicated region: cursor="
+            f"0x{audio_weight_end:X} > 0x{AUDIO_WEIGHT_REGION_END:X} "
+            f"(used {(audio_weight_end - 0x6c000000) / (1024*1024):.1f} MB "
+            f"of 192 MB budget)")
+        self._tensor_dram_addr = _aud_weight_tensor_cursor_save
+
         print(f"[Audio] uploaded {self.AUD_LAYERS} layers + subsample + projector "
-              f"(tensor DRAM at 0x{self.get_tensor_dram_addr():X})")
+              f"(weights in params region 0x6c000000-0x{audio_weight_end:X}, "
+              f"{(audio_weight_end - 0x6c000000)/(1024*1024):.1f} MB; "
+              f"tensor cursor restored to 0x{self._tensor_dram_addr:X})")
 
     @staticmethod
     def _extract_clips(clippable_linear) -> dict:
@@ -3290,6 +4135,12 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.AUD_IDENTITY_H = self.allocate_tensor_dram(H * H * bpe)
         self.dma_to_accelerator_memory(self.AUD_IDENTITY_H,
             torch.eye(H, dtype=torch.bfloat16).contiguous())
+        # 64×64 identity for FPGA standalone clamp via matmul-w/-identity
+        # trick (see _emit_clamp_dram_to_dram). Required to replace
+        # _host_clip_dram with a pure-FPGA op (Phase 1).
+        self.AUD_IDENTITY_64 = self.allocate_tensor_dram(VS * VS * bpe)
+        self.dma_to_accelerator_memory(self.AUD_IDENTITY_64,
+            torch.eye(VS, dtype=torch.bfloat16).contiguous())
         # Alias used by the compare script's audio FFN1 verification path.
         self.AUD_IDENTITY = self.AUD_IDENTITY_FF
 
@@ -3302,7 +4153,611 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.AUD_REL_K_PROJ_OUT = self.allocate_tensor_dram(self.AUD_CTX_LEFT * NH * HD * bpe)
         self.AUD_ATTN_OUT = self.allocate_tensor_dram(L_pad * H * bpe)
 
+        # Phase 2A: depthwise conv1d FPGA buffers (4-tap shifted-eltwise).
+        # AUD_DW_ZERO_KM1 holds (K-1) rows of zeros for the top-of-shifted-buf
+        # reset before each layer; the SHIFT/SCRATCH scratch is reused from
+        # AUD_FFN_MID (L_pad × FF = 4× L_pad × H) at compile time.
+        K = self.AUD_CONV_K
+        if K > 1:
+            self.AUD_DW_ZERO_KM1 = self.allocate_tensor_dram((K - 1) * H * bpe)
+            self.dma_to_accelerator_memory(
+                self.AUD_DW_ZERO_KM1,
+                torch.zeros((K - 1) * H, dtype=torch.bfloat16).contiguous())
+            # Per-(layer, tap) tiled weight buffers: each (L_pad, H) bf16,
+            # built by broadcasting w[c, t] across all L_pad rows. Stored into
+            # _aud_weight_addrs[li]["CONV_DW_TAP_TILES"][t]. Audio weight init
+            # must have already cached the host kernel.
+            assert hasattr(self, "_aud_hf_layers"), \
+                "audio_weight_init must run BEFORE audio_tensor_init"
+            for li in range(self.AUD_LAYERS):
+                dw_w = self._aud_hf_layers[li]["dw_w"]  # (H, K) bf16
+                tile_addrs = []
+                for t in range(K):
+                    addr = self.allocate_tensor_dram(L_pad * H * bpe)
+                    # tile[r, c] = w[c, t]
+                    tile = dw_w[:, t].to(torch.bfloat16).contiguous()  # (H,)
+                    tile = tile.unsqueeze(0).expand(L_pad, H).contiguous()
+                    self.dma_to_accelerator_memory(addr, tile)
+                    tile_addrs.append(addr)
+                self._aud_weight_addrs[li]["CONV_DW_TAP_TILES"] = tile_addrs
+
+        # Phase 2B.b: per-layer Q-scale tile = q_scale * softplus(per_dim_scale),
+        # tiled to (L_pad, H) with the (HD,) vector broadcast across heads.
+        # eltwise_mul AUD_Q × Q_SCALE_TILE reproduces:
+        #   Q[r, h, d] *= q_scale * softplus(per_dim_scale[d])
+        HD = self.AUD_HEAD_DIM
+        NH = self.AUD_HEADS
+        for li in range(self.AUD_LAYERS):
+            pds_addr = self._aud_weight_addrs[li]["PER_DIM_SCALE"]
+            pds = self.dma_from_accelerator_memory(pds_addr, (HD,)).cpu().float()
+            scale_vec = (F.softplus(pds) * self.AUD_Q_SCALE).to(torch.bfloat16)  # (HD,)
+            row_vec = scale_vec.repeat(NH).contiguous()                          # (H,)
+            tile = row_vec.unsqueeze(0).expand(L_pad, H).contiguous()
+            addr = self.allocate_tensor_dram(L_pad * H * bpe)
+            self.dma_to_accelerator_memory(addr, tile)
+            self._aud_weight_addrs[li]["Q_SCALE_TILE"] = addr
+
+        # Phase 2B.c: FPGA chunked attention scratch + pre-baked constants.
+        # ──────────────────────────────────────────────────────────────────
+        chunk = self.AUD_CHUNK                    # 12
+        ctx_size = self.AUD_CTX                   # 24
+        # ctx_pad must satisfy ctx_pad >= (chunk - 1) + num_pos_pad so the per-row
+        # rel-shift can write num_pos_pad=VS=64 elements at offset r in [0, chunk)
+        # without overflowing. Round to next VS multiple. For chunk=12, num_pos_pad=64,
+        # that's 75 -> 128. Per-row reads are VS-aligned, destination offset is
+        # row index r (not VS-aligned, which the FPGA permits).
+        ctx_pad = ((chunk - 1 + VS + VS - 1) // VS) * VS
+        max_past = self.AUD_CTX_LEFT - 1          # 12
+        max_future = self.AUD_CTX_RIGHT           # 0
+        num_pos = self.AUD_CTX_LEFT               # 13
+        num_pos_pad = VS                          # 64
+        T = num_frames
+        num_blocks = (T + chunk - 1) // chunk
+        chunk_pad = VS                            # 64 (chunk padded for matmul A row count)
+        T_pad_padded = ((num_blocks * chunk + VS - 1) // VS) * VS
+        # matrix_bd matmul writes N=bd_unshifted_N columns per row, structured as:
+        #   cols [0, chunk_pad): zero  (so per-row rel-shift reads from offset
+        #                               chunk_pad-r get pre-pad zeros for c < r)
+        #   cols [chunk_pad, chunk_pad+num_pos_pad): real Q @ rel_k row
+        #   cols [chunk_pad+num_pos_pad, bd_unshifted_N): zero (post-pad zeros
+        #                                                       for c >= r+num_pos_pad)
+        # The zero bands are baked into the per-head REL_K_T row layout, so the
+        # matmul output naturally carries the structure with no separate fill step.
+        bd_unshifted_N = ((chunk_pad * 2 + num_pos_pad + VS - 1) // VS) * VS
+        self._aud_num_blocks = num_blocks
+        self._aud_ctx_pad = ctx_pad
+        self._aud_num_pos_pad = num_pos_pad
+        self._aud_chunk_pad = chunk_pad
+        self._aud_T_pad_padded = T_pad_padded
+        self._aud_bd_unshifted_N = bd_unshifted_N
+
+        # K_PADDED / V_PADDED: max_past || L_pad || (max_future + chunk - 1) padded
+        L_padded_full_unaligned = max_past + L_pad + max_future + chunk - 1
+        L_padded_full = ((L_padded_full_unaligned + VS - 1) // VS) * VS
+        self._aud_L_padded_full = L_padded_full
+        self.AUD_K_PADDED = self.allocate_tensor_dram(L_padded_full * H * bpe)
+        self.AUD_V_PADDED = self.allocate_tensor_dram(L_padded_full * H * bpe)
+        # Zero the whole padded buffer once (pad regions remain zero across layers,
+        # the middle gets overwritten by AUD_K / AUD_V each layer).
+        zeros_buf = torch.zeros(L_padded_full * H, dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.AUD_K_PADDED, zeros_buf)
+        self.dma_to_accelerator_memory(self.AUD_V_PADDED, zeros_buf)
+
+        # Per-block K and V context blocks: (num_blocks, ctx_pad=64, H).
+        self.AUD_K_CTX_BLOCKS = self.allocate_tensor_dram(num_blocks * ctx_pad * H * bpe)
+        self.AUD_V_CTX_BLOCKS = self.allocate_tensor_dram(num_blocks * ctx_pad * H * bpe)
+        # Pre-zero so trailing rows (ctx_size..ctx_pad) are always zero, regardless of layer.
+        block_zeros = torch.zeros(num_blocks * ctx_pad * H, dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.AUD_K_CTX_BLOCKS, block_zeros)
+        self.dma_to_accelerator_memory(self.AUD_V_CTX_BLOCKS, block_zeros)
+
+        # K_CTX_T_BLOCKS: per-(block, head) head slice of K_CTX_BLOCKS stored as
+        # (num_blocks, NH, ctx_pad, HD). NOTE: not transposed; this IS the FPGA-
+        # native B layout (N=ctx_pad, K=HD) so matmul A @ B^T = Q @ K^T.
+        self.AUD_K_CTX_T_BLOCKS = self.allocate_tensor_dram(
+            num_blocks * NH * ctx_pad * HD * bpe)
+
+        # V_CTX_T_BLOCKS: per-(block, head) V_ctx ACTUALLY TRANSPOSED to (HD, ctx_pad).
+        # Built via matmul-with-AUD_IDENTITY_HD trick (FPGA strided DMA can't do the
+        # column-stride read needed for an explicit transpose). This is the FPGA-
+        # native B layout (N=HD, K=ctx_pad) for the attn @ V matmul.
+        self.AUD_V_CTX_T_BLOCKS = self.allocate_tensor_dram(
+            num_blocks * NH * HD * ctx_pad * bpe)
+
+        # Q_HEAD_BLOCK scratch: (chunk_pad=64, HD). Reused per (block, head).
+        self.AUD_Q_HEAD_BLOCK = self.allocate_tensor_dram(chunk_pad * HD * bpe)
+
+        # K_BLOCK_HEAD scratch: (ctx_pad, HD). Reused per (block, head).
+        self.AUD_K_BLOCK_HEAD = self.allocate_tensor_dram(ctx_pad * HD * bpe)
+
+        # V_BLOCK_HEAD scratch: (ctx_pad, HD). Reused per (block, head) — staging
+        # for the V_ctx_T transpose-via-matmul.
+        self.AUD_V_BLOCK_HEAD = self.allocate_tensor_dram(ctx_pad * HD * bpe)
+
+        # Identity for HD-sized matmul-with-identity (e.g. for transpose
+        # via permute, sigmoid via matmul, etc.). HD=128 here.
+        self.AUD_IDENTITY_HD = self.allocate_tensor_dram(HD * HD * bpe)
+        self.dma_to_accelerator_memory(self.AUD_IDENTITY_HD,
+            torch.eye(HD, dtype=torch.bfloat16).contiguous())
+        # ctx_pad-sized identity for tanh-via-identity-matmul on (chunk_pad, ctx_pad)
+        self.AUD_IDENTITY_CTX = self.allocate_tensor_dram(ctx_pad * ctx_pad * bpe)
+        self.dma_to_accelerator_memory(self.AUD_IDENTITY_CTX,
+            torch.eye(ctx_pad, dtype=torch.bfloat16).contiguous())
+
+        # MATRIX_AC: (num_blocks, NH, chunk_pad, ctx_pad). First `chunk` rows valid.
+        self.AUD_MATRIX_AC = self.allocate_tensor_dram(
+            num_blocks * NH * chunk_pad * ctx_pad * bpe)
+
+        # MATRIX_BD_UNSHIFTED: (NH, T_pad_padded, bd_unshifted_N=192). Per-head Q@rel_k_T
+        # output with zero pre/post padding bands so per-row rel-shift can do
+        # non-aligned source reads while keeping VS-aligned destination writes.
+        self.AUD_MATRIX_BD_UNSHIFTED = self.allocate_tensor_dram(
+            NH * T_pad_padded * bd_unshifted_N * bpe)
+
+        # MATRIX_BD_SHIFTED: (num_blocks, NH, chunk_pad, ctx_pad) — rel-shifted.
+        self.AUD_MATRIX_BD_SHIFTED = self.allocate_tensor_dram(
+            num_blocks * NH * chunk_pad * ctx_pad * bpe)
+        # Pre-zero so unfilled cells stay zero. Rel-shift writes only valid range.
+        self.dma_to_accelerator_memory(self.AUD_MATRIX_BD_SHIFTED,
+            torch.zeros(num_blocks * NH * chunk_pad * ctx_pad, dtype=torch.bfloat16))
+
+        # REL_K_T per layer: per-head slice of rel_k = pos_emb @ relative_k_proj,
+        # stored as (NH, bd_unshifted_N, HD) with zero pre-pad + real + zero post-pad
+        # row bands (see bd_unshifted_N comment). This is the native B layout
+        # (N=bd_unshifted_N, K=HD) for matrix_bd matmul.
+        self.AUD_REL_K_T = self.allocate_tensor_dram(NH * bd_unshifted_N * HD * bpe)
+        # Pre-zero the entire REL_K_T buffer so the pre/post-pad bands stay zero
+        # across layer iterations; only rows [chunk_pad, chunk_pad+num_pos_pad)
+        # are rewritten by the per-layer build step.
+        self.dma_to_accelerator_memory(self.AUD_REL_K_T,
+            torch.zeros(NH * bd_unshifted_N * HD, dtype=torch.bfloat16).contiguous())
+
+        # REL_K_OUT scratch (per layer): pos_emb_padded @ rel_k_proj -> (num_pos_pad, H).
+        self.AUD_REL_K_OUT = self.allocate_tensor_dram(num_pos_pad * H * bpe)
+
+        # Per-head Q_HEAD_FULL scratch for matrix_bd matmul: (T_pad_padded, HD).
+        # Rows [0, L_pad) = AUD_Q[:, h*HD:(h+1)*HD]; rows [L_pad, T_pad_padded) = 0.
+        self.AUD_Q_HEAD_FULL = self.allocate_tensor_dram(T_pad_padded * HD * bpe)
+        # Pre-zero so the tail rows stay zero across iterations.
+        self.dma_to_accelerator_memory(self.AUD_Q_HEAD_FULL,
+            torch.zeros(T_pad_padded * HD, dtype=torch.bfloat16).contiguous())
+
+        # POS_EMB_PADDED: (num_pos_pad=64, H). First num_pos rows = audio_rel_pos_host(),
+        # rest zero. Uploaded once at init time (shared across layers).
+        pos_emb = self.audio_rel_pos_host()  # (num_pos, H) bf16
+        pos_emb_pad = torch.zeros(num_pos_pad, H, dtype=torch.bfloat16)
+        pos_emb_pad[:num_pos] = pos_emb
+        self.AUD_POS_EMB_PADDED = self.allocate_tensor_dram(num_pos_pad * H * bpe)
+        self.dma_to_accelerator_memory(self.AUD_POS_EMB_PADDED, pos_emb_pad.contiguous())
+
+        # MASK_ADDEND: (num_blocks, NH, chunk_pad, ctx_pad) bf16 — 0 where valid,
+        # -1e9 elsewhere. Tiled across heads (identical per-head) so it can be
+        # eltwise-added to logits via a single (num_blocks*NH*chunk_pad, ctx_pad)
+        # tensor op. Memory is 8× a per-(b,c,c) tile but simplifies the addition.
+        mask_5d = self._aud_make_blocked_mask(T, num_blocks, chunk, max_past, max_future)
+        mask_b = mask_5d.view(num_blocks, chunk, ctx_size)
+        invalid_val = float(self.AUD_INVALID_LOGIT)
+        addend_bcc = torch.full((num_blocks, chunk_pad, ctx_pad), invalid_val, dtype=torch.bfloat16)
+        addend_bcc[:, :chunk, :ctx_size] = torch.where(
+            mask_b, torch.tensor(0.0, dtype=torch.bfloat16),
+                     torch.tensor(invalid_val, dtype=torch.bfloat16))
+        # Tile to (num_blocks, NH, chunk_pad, ctx_pad)
+        addend = addend_bcc.unsqueeze(1).expand(num_blocks, NH, chunk_pad, ctx_pad).contiguous()
+        self.AUD_MASK_ADDEND = self.allocate_tensor_dram(
+            num_blocks * NH * chunk_pad * ctx_pad * bpe)
+        self.dma_to_accelerator_memory(self.AUD_MASK_ADDEND, addend)
+
+        # LOGITS scratch (reused per (block, head)): (chunk_pad, ctx_pad).
+        self.AUD_LOGITS_BH = self.allocate_tensor_dram(chunk_pad * ctx_pad * bpe)
+        # OUT scratch per (block, head): (chunk_pad, HD).
+        self.AUD_ATTN_OUT_BH = self.allocate_tensor_dram(chunk_pad * HD * bpe)
+
+        # AUD_Q_HEAD_BLOCK / AUD_K_BLOCK_HEAD: bottom rows (above the real data
+        # rows) must stay zero across iterations. Initialize once.
+        self.dma_to_accelerator_memory(self.AUD_Q_HEAD_BLOCK,
+            torch.zeros(chunk_pad * HD, dtype=torch.bfloat16).contiguous())
+        self.dma_to_accelerator_memory(self.AUD_K_BLOCK_HEAD,
+            torch.zeros(ctx_pad * HD, dtype=torch.bfloat16).contiguous())
+
+        # Phase B: FPGA output_proj + multimodal embedder.
+        OUT_DIM = self.AUD_OUT_DIM  # 1536
+        # Output of output_proj: (L_pad, OUT_DIM). First T_sub rows valid.
+        self.AUD_FEATURES_MID = self.allocate_tensor_dram(L_pad * OUT_DIM * bpe)
+        # Output of multimodal embedder: same shape; the final audio_features.
+        self.AUD_FEATURES_FINAL = self.allocate_tensor_dram(L_pad * OUT_DIM * bpe)
+        # All-ones gamma for the embedder's RMSNorm (with_scale=False in HF).
+        # rms_norm_core_dram expects a gamma tile; passing ones gives plain RMSNorm.
+        self.AUD_EMB_ONES_GAMMA = self.allocate_tensor_dram(OUT_DIM * bpe)
+        self.dma_to_accelerator_memory(self.AUD_EMB_ONES_GAMMA,
+            torch.ones(OUT_DIM, dtype=torch.bfloat16).contiguous())
+
+        # Phase 2B.c step 3: per-r shift matrices M_r for rel-shift via matmul.
+        # M_r in (N=ctx_pad, K=num_pos_pad) layout has M_r[c, p]=1 if c == p+r
+        # AND p < num_pos AND c < r+num_pos (HF rel-shift output is zero outside
+        # the [r, r+num_pos) column range).
+        # Sidesteps the 32-byte AXI src alignment by using only matmul (which is
+        # well-defined for arbitrary M/K/N as long as K and N are 64-aligned).
+        # Stored at AUD_REL_SHIFT_M[r] = base + r * ctx_pad * num_pos_pad * bpe.
+        self.AUD_REL_SHIFT_M = self.allocate_tensor_dram(chunk * ctx_pad * num_pos_pad * bpe)
+        shift_tensor = torch.zeros(chunk, ctx_pad, num_pos_pad, dtype=torch.bfloat16)
+        for r in range(chunk):
+            for p in range(num_pos):
+                c = p + r
+                if c < ctx_pad:
+                    shift_tensor[r, c, p] = 1.0
+        self.dma_to_accelerator_memory(self.AUD_REL_SHIFT_M,
+            shift_tensor.contiguous().view(-1))
+
+        # Zero source for trailing-row fill in AUD_Q_HEAD_BLOCK on partial last block.
+        self.AUD_ZEROS_CHUNK_HD = self.allocate_tensor_dram(chunk_pad * HD * bpe)
+        self.dma_to_accelerator_memory(self.AUD_ZEROS_CHUNK_HD,
+            torch.zeros(chunk_pad * HD, dtype=torch.bfloat16).contiguous())
+
         print(f"[Audio] tensor DRAM usage: {self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
+
+    def audio_subsample_fpga(self,
+                              input_features: torch.Tensor,
+                              input_features_mask: torch.Tensor | None = None
+                              ) -> tuple[torch.Tensor, torch.Tensor]:
+        """FPGA port of audio_subsample_host (Phase A).
+
+        Real compute (matmul, LayerNorm, ReLU, Linear) on FPGA. The im2col
+        data rearrangement is computed on host (deterministic shuffle, no
+        learned params -- same category as the log-mel feature extraction
+        in stage 0). When fully validated, the im2col can move to FPGA via
+        the parakeet im2col-via-G pattern.
+
+        Mirrors Gemma4AudioSubSampleConvProjection:
+            mask -> Conv2d -> LayerNorm -> ReLU -> mask -> Conv2d -> LayerNorm
+            -> ReLU -> flatten -> input_proj_linear
+
+        Returns (hidden_states, mask_downsampled_2x) for parity with
+        audio_subsample_host.
+        """
+        if not hasattr(self, "_aud_sub_conv0_addrs"):
+            raise RuntimeError("audio_weight_init must run before audio_subsample_fpga")
+        H_OUT = self.AUD_H            # 1024
+        bpe = self.bytes_per_element
+        x = input_features.detach().cpu()    # (B, T_raw, n_mels)
+        mask = input_features_mask
+        if x.dim() != 3 or x.shape[0] != 1:
+            raise RuntimeError(f"audio_subsample_fpga only supports B=1; got {tuple(x.shape)}")
+        T_raw = int(x.shape[1])
+        N_MELS = int(x.shape[2])
+        assert N_MELS == 128, f"expected n_mels=128, got {N_MELS}"
+        # Padding=1 stride=2 on both dims: T_raw must be even for the integer
+        # divisions below to line up.
+        H0 = (T_raw + 2 - 3) // 2 + 1     # post-conv0 height (time)
+        W0 = (N_MELS + 2 - 3) // 2 + 1    # post-conv0 width (freq) = 64
+        H1 = (H0 + 2 - 3) // 2 + 1        # post-conv1 height
+        W1 = (W0 + 2 - 3) // 2 + 1        # post-conv1 width = 32
+        N0 = H0 * W0                       # patches count after conv0 = output rows
+        N1 = H1 * W1                       # patches count after conv1
+        N1_pad = ((N1 + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        N0_pad = ((N0 + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+
+        # ---- Apply mask on host (zero invalid input rows) ----
+        if mask is not None:
+            x = x * mask[:, :, None].to(x.dtype)
+        x = x.to(torch.bfloat16).squeeze(0).contiguous()  # (T_raw, n_mels=128)
+
+        # ---- Stage 0 im2col on FPGA (Phase A2.1) ------------------------
+        # Parakeet pattern: gather 3 strided rows of input into R_combined
+        # (H0_pad, K_g=384), then matmul R_combined @ G_s0^T to produce the
+        # (H0_pad, W_out*64=4096) im2col patches. The output's byte layout
+        # is bit-identical to the (N0_pad=H0*W0, 64) patches0 view that
+        # conv0 consumes, because W_out_s0 = 64 (matmul N-stride matches
+        # patch row stride).
+        K_g_s0 = self._aud_sub_K_g_s0   # 384
+        N_g_s0 = self._aud_sub_N_g_s0   # 4096
+        H0_pad = ((H0 + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        # AUD_SUB_PATCHES0 must hold matmul output H0_pad * N_g_s0 * bpe.
+        patches0_buf_bytes = H0_pad * N_g_s0 * bpe
+        # Source input buffer: T_raw rows of 128 mel bins, aligned to a
+        # 64-byte boundary on the DMA side. Pad T_raw to even for stride=2.
+        T_raw_pad = T_raw + (T_raw & 1)
+
+        # Allocate buffers lazily on first call. Size by the current audio's
+        # N0/N1, padded to VS. Re-uses the same DRAM addresses on subsequent
+        # calls if the dimensions match (cached by an explicit size tag).
+        cache_key = (N0_pad, N1_pad, H0_pad, T_raw_pad)
+        if getattr(self, "_aud_sub_buf_key", None) != cache_key:
+            self._aud_sub_buf_key = cache_key
+            # Raw mel input (T_raw_pad, 128) — FPGA-side source for the
+            # strided gather DMAs that build R_combined.
+            self.AUD_SUB_INPUT = self.allocate_tensor_dram(T_raw_pad * 128 * bpe)
+            # R_combined (H0_pad, K_g_s0): 3 strided rows of input
+            # concatenated per output time index, padded for matmul K alignment.
+            self.AUD_SUB_R_COMBINED = self.allocate_tensor_dram(H0_pad * K_g_s0 * bpe)
+            # patches0: holds the im2col matmul output (H0_pad, N_g_s0). Sized
+            # for the matmul write; conv0 reads the first (N0_pad, 64) view.
+            self.AUD_SUB_PATCHES0 = self.allocate_tensor_dram(patches0_buf_bytes)
+            self.AUD_SUB_PATCHES1 = self.allocate_tensor_dram(N1_pad * 1152 * bpe)
+            # Conv outputs (M, N_pad). N0 → 128, N1 → 64 (real 32).
+            self.AUD_SUB_OUT0 = self.allocate_tensor_dram(N0_pad * 128 * bpe)
+            self.AUD_SUB_OUT1 = self.allocate_tensor_dram(N1_pad * 64 * bpe)
+            # Identity matrices for the ReLU-via-matmul fold (shape (N, N) where
+            # N = post-LN feature dim, multiple of 64 required).
+            self.AUD_SUB_ID_128 = self.allocate_tensor_dram(128 * 128 * bpe)
+            self.dma_to_accelerator_memory(self.AUD_SUB_ID_128,
+                torch.eye(128, dtype=torch.bfloat16).contiguous())
+            # Compact (N1, 32) buffer for stage-1 LN input. LN needs N=32 to
+            # average over the right feature count.
+            self.AUD_SUB_OUT1_COMPACT = self.allocate_tensor_dram(N1_pad * 32 * bpe)
+            # Flatten target for the final Linear input.
+            # Final shape: (N1, 32*32=1024). N1 < L_pad; we pad with zeros so
+            # the encoder seed only uses the first T_sub=N1 rows.
+            self.AUD_SUB_FLAT = self.allocate_tensor_dram(N1_pad * 1024 * bpe)
+
+        # DMA raw input (T_raw rows, padded with zeros to T_raw_pad).
+        x_input = torch.zeros(T_raw_pad, 128, dtype=torch.bfloat16)
+        x_input[:T_raw] = x
+        self.dma_to_accelerator_memory(self.AUD_SUB_INPUT, x_input.contiguous())
+
+        # Pre-zero R_combined. Padding rows (oh outside [0, H0)) stay zero so
+        # the matmul produces zero rows there, which translate to zero patches
+        # for the N0_pad-N0 padding positions consumed by conv0.
+        self.dma_to_accelerator_memory(self.AUD_SUB_R_COMBINED,
+            torch.zeros(H0_pad * K_g_s0, dtype=torch.bfloat16))
+
+        # Emit the im2col segment (3 strided DMA gathers + 1 matmul).
+        self._compile_and_run_single("aud_sub_im2col_s0",
+            lambda: self._emit_aud_sub_im2col_s0(T_raw, H0, H0_pad))
+
+        # ---- Stage 0 on FPGA: matmul -> LN -> ReLU ----------------------
+        c0 = self._aud_sub_conv0_addrs
+        self._compile_and_run_single("aud_sub_conv0", lambda: self.matmat_mul_core(
+            M=N0_pad, K=64, N=128,
+            A_DRAM_ADDR=self.AUD_SUB_PATCHES0,
+            B_DRAM_ADDR=c0["data"],
+            OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT0,
+            is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=c0["scale"]))
+        self._compile_and_run_single("aud_sub_ln0", lambda: self.layer_norm_core_dram(
+            M=N0_pad, N=128,
+            A_DRAM_ADDR=self.AUD_SUB_OUT0,
+            OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT0,
+            GAMMA_DRAM_ADDR=self._aud_sub_ln0_gamma_addr))
+        # ReLU via identity matmul with clamp_enable=True (LALU_CLAMP_RELU).
+        self._compile_and_run_single("aud_sub_relu0", lambda: self.matmat_mul_core(
+            M=N0_pad, K=128, N=128,
+            A_DRAM_ADDR=self.AUD_SUB_OUT0,
+            B_DRAM_ADDR=self.AUD_SUB_ID_128,
+            OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT0,
+            clamp_enable=True))
+
+        # ---- Stage 1 im2col on FPGA (Phase A2.2) ------------------------
+        # 9*H1 strided DMA pairs (one per (kh, kw, oh1)) gather 128-channel
+        # chunks from AUD_SUB_OUT0 and scatter them into the (kh*3+kw)-th
+        # 128-column block of AUD_SUB_PATCHES1. Padding positions (oh1*2-1+kh
+        # out of [0, H0) or ow1*2-1+kw out of [0, W0)) are left as zero from
+        # the pre-zero step below — handles all border cases without branches
+        # in the emitter.
+        mask_s1 = mask[:, ::2] if mask is not None else None
+        if mask_s1 is not None:
+            # Mask must be applied to AUD_SUB_OUT0 BEFORE im2col so masked
+            # time rows don't bleed into patches1. Zero affected rows in DRAM.
+            valid_h0 = mask_s1[0, :H0].to(torch.bfloat16)
+            if (valid_h0 == 0).any():
+                out0_local = self.dma_from_accelerator_memory(
+                    self.AUD_SUB_OUT0, (N0_pad, 128)).cpu()
+                for oh in range(H0):
+                    if valid_h0[oh] == 0:
+                        out0_local[oh * W0:(oh + 1) * W0].zero_()
+                self.dma_to_accelerator_memory(self.AUD_SUB_OUT0, out0_local.contiguous())
+
+        # Pre-zero patches1 so out-of-bounds (kh, kw) positions stay zero.
+        self.dma_to_accelerator_memory(self.AUD_SUB_PATCHES1,
+            torch.zeros(N1_pad * 1152, dtype=torch.bfloat16))
+        self._compile_and_run_single("aud_sub_im2col_s1",
+            lambda: self._emit_aud_sub_im2col_s1(H0, W0, H1, W1))
+
+        # ---- Stage 1 on FPGA: matmul -> LN1 -> ReLU1 -> proj ------------
+        # Phase A2.3: with the duplicate-channel trick (conv1 weight rows
+        # 32-63 = rows 0-31), conv1 output is (N1_pad, 64) where cols 32-63
+        # mirror cols 0-31. LN1 then runs as a standard N=64 LayerNorm (mean
+        # and variance over the 64 duplicated values equal mean/variance over
+        # the real 32 values), avoiding the N=32 alignment headache. ReLU1
+        # runs as identity-matmul + clamp on (N1_pad, 64). Finally, because
+        # the (N1_pad, 64) buffer's byte layout *is already* the (H1, W1*64)
+        # flat-for-proj layout, the flatten step is a zero-op: we pass
+        # AUD_SUB_OUT1 directly to the proj matmul with K=2048, and the proj
+        # weight has zeros in the duplicate columns so the math reduces to
+        # the original proj_orig @ flat_orig.
+        c1 = self._aud_sub_conv1_addrs
+        self._compile_and_run_single("aud_sub_conv1", lambda: self.matmat_mul_core(
+            M=N1_pad, K=1152, N=64,
+            A_DRAM_ADDR=self.AUD_SUB_PATCHES1,
+            B_DRAM_ADDR=c1["data"],
+            OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT1,
+            is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=c1["scale"]))
+        self._compile_and_run_single("aud_sub_ln1", lambda: self.layer_norm_core_dram(
+            M=N1_pad, N=64,
+            A_DRAM_ADDR=self.AUD_SUB_OUT1,
+            OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT1,
+            GAMMA_DRAM_ADDR=self._aud_sub_ln1_gamma_addr))
+        # ReLU1 via identity matmul on (N1_pad, 64) with clamp_enable=True.
+        self._compile_and_run_single("aud_sub_relu1", lambda: self.matmat_mul_core(
+            M=N1_pad, K=64, N=64,
+            A_DRAM_ADDR=self.AUD_SUB_OUT1,
+            B_DRAM_ADDR=self._aud_sub_id_64_addr,
+            OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT1,
+            clamp_enable=True))
+
+        # Optional: apply layer-1 mask on FPGA-side (zero invalid time rows
+        # after LN+ReLU). For the apex.wav test case mask is typically None;
+        # if non-None, we re-zero affected rows in DRAM. Cheap (N1*64*bpe).
+        mask_s2 = mask[:, ::4] if mask is not None else None
+        if mask_s2 is not None:
+            valid_h = mask_s2[0, :H1].to(torch.bfloat16)
+            if (valid_h == 0).any():
+                out1_local = self.dma_from_accelerator_memory(
+                    self.AUD_SUB_OUT1, (N1_pad, 64)).cpu()
+                for oh in range(H1):
+                    if valid_h[oh] == 0:
+                        out1_local[oh * W1:(oh + 1) * W1].zero_()
+                self.dma_to_accelerator_memory(self.AUD_SUB_OUT1, out1_local.contiguous())
+
+        # ---- Final input_proj_linear on FPGA -----------------------------
+        # AUD_SUB_OUT1 (N1_pad, 64) bytes IS already (H1_pad, W1*64=2048) bytes
+        # row-major — no flatten DMA needed. proj weight is padded to K=2048
+        # with zeros in duplicate cols so proj_new @ out1 = proj_orig @ first-32.
+        # Output buffer: in oneshot fold (_oneshot_mode=True), proj writes
+        # straight to AUD_IO_A so the encoder one-shot bin consumes it without
+        # a host roundtrip. Otherwise (per-op compile path), output stays in
+        # AUD_SUB_OUT0 scratch and the caller seeds AUD_IO_A separately.
+        proj = self._aud_sub_proj_addrs
+        H1_pad = ((H1 + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        in_oneshot = getattr(self, "_oneshot_mode", False)
+        proj_out_addr = self.AUD_IO_A if in_oneshot else self.AUD_SUB_OUT0
+        self._compile_and_run_single("aud_sub_proj", lambda: self.matmat_mul_core(
+            M=H1_pad, K=2 * 1024, N=1024,
+            A_DRAM_ADDR=self.AUD_SUB_OUT1,   # reused as flat — see comment above
+            B_DRAM_ADDR=proj["data"],
+            OUTPUT_DRAM_ADDR=proj_out_addr,
+            is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=proj["scale"]))
+
+        if in_oneshot:
+            # In oneshot mode, the FPGA hasn't executed yet — there's nothing
+            # to read back. Subsample output lives in AUD_IO_A and the encoder
+            # one-shot bin will read it as the input sequence.
+            return None, mask_s2
+
+        # Read back as the host-side sub_hidden contract: (B=1, T_sub, H=1024).
+        hidden = self.dma_from_accelerator_memory(
+            self.AUD_SUB_OUT0, (H1_pad, 1024)).cpu()[:H1].to(torch.bfloat16).unsqueeze(0)
+        return hidden, mask_s2
+
+    def _emit_aud_sub_im2col_s0(self, T_raw: int, H0: int, H0_pad: int) -> None:
+        """FPGA emitter for stage-0 im2col (parakeet pattern).
+
+        Builds R_combined(H0_pad, K_g=384) in AUD_SUB_R_COMBINED via 3 strided
+        DMAs (one per kh in {0,1,2}), each gathering H0 rows of the raw mel
+        input with stride=2 (matching the stride-2 conv0) and scattering them
+        into the kh-th 128-column block of R_combined. Then matmuls R @ G_s0
+        to produce the (N0_pad, 64) im2col patches at AUD_SUB_PATCHES0.
+
+        Pre-conditions (the caller's responsibility):
+          - AUD_SUB_INPUT holds (T_raw_pad, 128) of mel input (host DMA).
+          - AUD_SUB_R_COMBINED was pre-zeroed (padding rows stay zero).
+        """
+        bpe_local = self.bytes_per_element
+        W_in_local = 128
+        stride = 2
+        padding = 1
+        row_bytes = W_in_local * bpe_local  # 256 — already 32-byte aligned for AXI
+        K_g_s0 = self._aud_sub_K_g_s0       # 384
+        N_g_s0 = self._aud_sub_N_g_s0       # 4096
+
+        for kh in range(3):
+            # Valid oh range where input row = oh*stride + kh - padding is in
+            # [0, T_raw). Solve for oh: oh*2 - 1 + kh ∈ [0, T_raw).
+            #   lower: oh >= (1 - kh) / 2  →  oh_start = ceil((padding-kh)/stride)
+            #   upper: oh <  (T_raw + 1 - kh) / 2  →  oh_end = ceil((T_raw+padding-kh)/stride)
+            oh_start = max(0, (padding - kh + stride - 1) // stride)
+            oh_end = min(H0, (T_raw + padding - kh + stride - 1) // stride)
+            n_rows = oh_end - oh_start
+            if n_rows <= 0:
+                continue
+            first_input_row = oh_start * stride - padding + kh
+            read_bytes = n_rows * row_bytes
+
+            # Chunk to fit URAM. row_bytes (256) divides URAM_NEAR_FULL_SIZE so
+            # chunks are integer multiples of row_bytes.
+            max_read = (URAM_NEAR_FULL_SIZE // row_bytes) * row_bytes
+            offset = 0
+            while offset < read_bytes:
+                chunk = min(read_bytes - offset, max_read)
+                src_row = first_input_row + (offset // row_bytes) * stride
+                oh_base = oh_start + offset // row_bytes
+
+                # Strided read: gather every-other (stride=2) mel row into
+                # URAM_A, packed contiguous.
+                src = self.AUD_SUB_INPUT + src_row * row_bytes
+                self.ue_memcpy_from_dram(
+                    src, chunk, 0, URAM_START_ADDR,
+                    URAM_SECTION.URAM_A.value,
+                    stride_bytes_per_chunk=row_bytes,
+                    stride_jump_bytes=stride * row_bytes)
+
+                # Strided write: scatter contiguous URAM rows into the kh-th
+                # 128-column block of R_combined. Each row writes 128 bf16
+                # elements at offset (oh*K_g + kh*W_in)*bpe in DRAM.
+                dst = (self.AUD_SUB_R_COMBINED
+                       + oh_base * K_g_s0 * bpe_local
+                       + kh * W_in_local * bpe_local)
+                self.ue_memcpy_to_dram(
+                    0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                    dst, chunk,
+                    stride_bytes_per_chunk=row_bytes,
+                    stride_jump_bytes=K_g_s0 * bpe_local)
+                offset += chunk
+
+        # Matmul: R_combined(H0_pad, K_g) @ G_s0(N_g, K_g)^T → (H0_pad, N_g).
+        # Byte layout is identical to (N0_pad, 64) patches0 view since
+        # W_out_s0 = 64 (matmul stride per row = N_g = W_out_s0 * 64 = patch
+        # row stride * W_out_s0).
+        self.matmat_mul_core(
+            M=H0_pad, K=K_g_s0, N=N_g_s0,
+            A_DRAM_ADDR=self.AUD_SUB_R_COMBINED,
+            B_DRAM_ADDR=self._aud_sub_G_s0_addr,
+            OUTPUT_DRAM_ADDR=self.AUD_SUB_PATCHES0)
+
+    def _emit_aud_sub_im2col_s1(self, H0: int, W0: int, H1: int, W1: int) -> None:
+        """FPGA emitter for stage-1 im2col (multi-channel).
+
+        Unlike stage-0 (single-channel, parakeet G-matrix), stage-1 has 128
+        channels per spatial position, so we use direct strided-DMA gather +
+        scatter rather than a permutation matmul. For each valid
+        (kh, kw, oh1) triple, ONE strided-read pulls W1 chunks of 128 bf16
+        elements (256 bytes each) from AUD_SUB_OUT0 (source stride = 2 spatial
+        positions = 512 bytes); ONE strided-write scatters them into the
+        (kh*3+kw)-th 128-column block of AUD_SUB_PATCHES1 (dest stride = one
+        patches1 row = 1152*bpe = 2304 bytes).
+
+        Out-of-bounds positions (oh1*2-1+kh outside [0, H0) or
+        ow1*2-1+kw outside [0, W0)) are skipped — the caller pre-zeros
+        AUD_SUB_PATCHES1 so those slots remain zero.
+
+        Pre-conditions (the caller's responsibility):
+          - AUD_SUB_OUT0 holds (H0, W0, 128) im2col-conv0+LN0+ReLU0 output
+            in row-major (oh, ow, c) layout.
+          - AUD_SUB_PATCHES1 was pre-zeroed.
+        """
+        bpe_local = self.bytes_per_element
+        chunk_bytes = 128 * bpe_local       # 256 — one 128-channel pixel
+        src_stride = 2 * chunk_bytes        # 512 — ow1-step in source
+        dst_stride = 1152 * bpe_local       # 2304 — row-step in patches1
+        for kh in range(3):
+            oh1_start = max(0, (1 - kh + 1) // 2)
+            oh1_end = min(H1, (H0 + 2 - kh) // 2)
+            for kw in range(3):
+                ow1_start = max(0, (1 - kw + 1) // 2)
+                ow1_end = min(W1, (W0 + 2 - kw) // 2)
+                n_ow1 = ow1_end - ow1_start
+                if n_ow1 <= 0:
+                    continue
+                slot = kh * 3 + kw
+                chunk_total_bytes = n_ow1 * chunk_bytes
+                for oh1 in range(oh1_start, oh1_end):
+                    in_row = oh1 * 2 - 1 + kh           # 0 <= in_row < H0
+                    in_col_start = ow1_start * 2 - 1 + kw
+                    src = (self.AUD_SUB_OUT0
+                           + (in_row * W0 + in_col_start) * chunk_bytes)
+                    self.ue_memcpy_from_dram(
+                        src, chunk_total_bytes, 0, URAM_START_ADDR,
+                        URAM_SECTION.URAM_A.value,
+                        stride_bytes_per_chunk=chunk_bytes,
+                        stride_jump_bytes=src_stride)
+                    dst = (self.AUD_SUB_PATCHES1
+                           + ((oh1 * W1 + ow1_start) * 1152 + slot * 128) * bpe_local)
+                    self.ue_memcpy_to_dram(
+                        0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                        dst, chunk_total_bytes,
+                        stride_bytes_per_chunk=chunk_bytes,
+                        stride_jump_bytes=dst_stride)
 
     def audio_subsample_host(self,
                               input_features: torch.Tensor,
@@ -3383,6 +4838,68 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             pe = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1)
         return pe.to(torch.bfloat16)
 
+    def _emit_aud_embed_project_chain(self) -> None:
+        """Phase B embed+projector ISA emitter (no DMA-back, no host work).
+
+        Designed to be folded into the encoder one-shot capture: when called
+        with ``self._oneshot_mode=True``, the three sub-ops emit inline into
+        the caller's open capture instead of issuing separate per-op triggers.
+        Reads from AUD_IO_A (encoder output), writes to AUD_FEATURES_FINAL.
+        """
+        H = self.AUD_H
+        OUT_DIM = self.AUD_OUT_DIM
+        L_pad = self._aud_L_pad
+
+        # Step 1: encoder_out @ W_op.T + b_op  ->  AUD_FEATURES_MID
+        op = self._aud_output_proj_addrs
+        self._compile_and_run_single("aud_embed_output_proj",
+            lambda: self.matmat_mul_core(
+                M=L_pad, K=H, N=OUT_DIM,
+                A_DRAM_ADDR=self.AUD_IO_A,
+                B_DRAM_ADDR=op["data"],
+                OUTPUT_DRAM_ADDR=self.AUD_FEATURES_MID,
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=op["scale"],
+                C_DRAM_ADDR=self._aud_output_proj_b_addr,
+                bias_mode="broadcast_N"))
+
+        # Step 2: RMSNorm with all-ones gamma (HF embedder uses with_scale=False).
+        self._compile_and_run_single("aud_embed_rmsnorm",
+            lambda: self.rms_norm_core_dram(
+                M=L_pad, N=OUT_DIM,
+                A_DRAM_ADDR=self.AUD_FEATURES_MID,
+                OUTPUT_DRAM_ADDR=self.AUD_FEATURES_MID,
+                GAMMA_DRAM_ADDR=self.AUD_EMB_ONES_GAMMA,
+                use_pbi=True))
+
+        # Step 3: x @ W_em.T  ->  AUD_FEATURES_FINAL
+        em = self._aud_embedder_proj_addrs
+        self._compile_and_run_single("aud_embed_emb_proj",
+            lambda: self.matmat_mul_core(
+                M=L_pad, K=OUT_DIM, N=OUT_DIM,
+                A_DRAM_ADDR=self.AUD_FEATURES_MID,
+                B_DRAM_ADDR=em["data"],
+                OUTPUT_DRAM_ADDR=self.AUD_FEATURES_FINAL,
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=em["scale"]))
+
+    def audio_embed_project_fpga(self) -> torch.Tensor:
+        """FPGA port of audio_embed_project_host. Per-op triggers (3 FPGA
+        programs) followed by a DMA-back. For the one-shot path this is
+        replaced by folding ``_emit_aud_embed_project_chain`` into the
+        encoder bin and reading AUD_FEATURES_FINAL directly afterwards.
+        """
+        L_pad = self._aud_L_pad
+        T_sub = self._aud_num_frames
+        OUT_DIM = self.AUD_OUT_DIM
+        self._emit_aud_embed_project_chain()
+
+        # DMA back, slice to T_sub valid rows (host returns this; the caller
+        # merges into LM embeddings).
+        out = self.dma_from_accelerator_memory(
+            self.AUD_FEATURES_FINAL, (L_pad, OUT_DIM)).cpu()[:T_sub]
+        return out.to(torch.bfloat16)
+
     def audio_embed_project_host(self, encoder_out: torch.Tensor) -> torch.Tensor:
         """Run output_proj (1024→1536, with bias) and the multimodal embedder
         (RMSNorm with_scale=False + Linear 1536→1536 bias=False) on host.
@@ -3446,12 +4963,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=L_pad, N=H,
             A_DRAM_ADDR=IN_BUF,
             OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w["FF1_PRE_NORM"]),
+            GAMMA_DRAM_ADDR=w["FF1_PRE_NORM"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("ff1_pre_norm"))
 
         # 2. ffw_layer_1 (clippable, IF4 (block=64)). Apply input clip on host,
         #    run matmul, apply output clip on host.
-        self._host_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
+        self._aud_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
                               cr["FF1_W1"]["in_min"], cr["FF1_W1"]["in_max"])
         ff1w1 = w["FF1_W1"]
         self._compile_and_run_single("aud_ff1_w1", lambda: self.matmat_mul_core(
@@ -3461,9 +4979,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.AUD_FFN_MID,
             is_B_quantized=True,
             data_type=TYPE.IF4,
-            SCALE_DRAM_ADDR=ff1w1["scale"]),
+            SCALE_DRAM_ADDR=ff1w1["scale"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("ff1_w1"))
-        self._host_clip_dram(self.AUD_FFN_MID, (L_pad, FF),
+        self._aud_clip_dram(self.AUD_FFN_MID, (L_pad, FF),
                               cr["FF1_W1"]["out_min"], cr["FF1_W1"]["out_max"])
 
         # 3. SiLU on (L_pad, FF) — out goes to a SEPARATE buffer because the
@@ -3474,7 +4993,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             cache=cache, cache_key=_ck("ff1_silu"))
 
         # 4. ffw_layer_2 (clippable, IF4 (block=64)). Reads from SiLU output.
-        self._host_clip_dram(self.AUD_SILU_OUT, (L_pad, FF),
+        self._aud_clip_dram(self.AUD_SILU_OUT, (L_pad, FF),
                               cr["FF1_W2"]["in_min"], cr["FF1_W2"]["in_max"])
         ff1w2 = w["FF1_W2"]
         self._compile_and_run_single("aud_ff1_w2", lambda: self.matmat_mul_core(
@@ -3484,9 +5003,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.AUD_FFN_OUT,
             is_B_quantized=True,
             data_type=TYPE.IF4,
-            SCALE_DRAM_ADDR=ff1w2["scale"]),
+            SCALE_DRAM_ADDR=ff1w2["scale"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("ff1_w2"))
-        self._host_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
+        self._aud_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
                               cr["FF1_W2"]["out_min"], cr["FF1_W2"]["out_max"])
 
         # 5. post_layer_norm
@@ -3494,7 +5014,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=L_pad, N=H,
             A_DRAM_ADDR=self.AUD_FFN_OUT,
             OUTPUT_DRAM_ADDR=self.AUD_FFN_OUT,
-            GAMMA_DRAM_ADDR=w["FF1_POST_NORM"]),
+            GAMMA_DRAM_ADDR=w["FF1_POST_NORM"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("ff1_post_norm"))
 
         # 6. Half-step residual: out = residual + 0.5 * ffn_out → IN_BUF
@@ -3549,7 +5070,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=L_pad, N=H,
             A_DRAM_ADDR=IN_BUF,
             OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w["ATTN_PRE_NORM"]),
+            GAMMA_DRAM_ADDR=w["ATTN_PRE_NORM"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("attn_pre_norm"))
 
         # 2. Q / K / V projections (IF4 (block=64), ClippableLinear).
@@ -3560,7 +5082,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             ("K_PROJ", "K_PROJ", self.AUD_K),
             ("V_PROJ", "V_PROJ", self.AUD_V),
         ]:
-            self._host_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
+            self._aud_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
                                   cr[addr_key]["in_min"], cr[addr_key]["in_max"])
             wq = w[addr_key]
             label = f"aud_attn_{proj_name.lower()}"
@@ -3570,31 +5092,131 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=ww["data"],
                 OUTPUT_DRAM_ADDR=d,
                 is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=ww["scale"]),
+                SCALE_DRAM_ADDR=ww["scale"],
+                use_pbi=True),
                 cache=cache, cache_key=_ck(f"attn_{proj_name.lower()}"))
-            self._host_clip_dram(dst, (L_pad, H),
+            self._aud_clip_dram(dst, (L_pad, H),
                                   cr[addr_key]["out_min"], cr[addr_key]["out_max"])
 
-        # 3..N: chunked local attention on HOST. Pull Q, K, V back, run the
-        # HF attention math (rel-pos + soft-cap + softmax), and DMA the post-
-        # projection result back to AUD_ATTN_OUT.
-        attn_out_host = self._aud_chunked_attn_host(layer_idx, T)  # [T, H] bf16
-        attn_out_padded = torch.zeros(L_pad, H, dtype=torch.bfloat16)
-        attn_out_padded[:T] = attn_out_host
-        self.dma_to_accelerator_memory(self.AUD_ATTN_OUT, attn_out_padded.contiguous())
+        # Phase 2B.b: Q / K scaling on FPGA.
+        # Q *= q_scale * softplus(per_dim_scale[d])  — eltwise_mul by Q_SCALE_TILE
+        # K *= k_scale                                — broadcast_mul by AUD_K_SCALE
+        self._compile_and_run_single("aud_attn_q_scale",
+            lambda: self._emit_aud_q_scale_fpga(layer_idx),
+            cache=cache, cache_key=_ck("attn_q_scale"))
+        self._compile_and_run_single("aud_attn_k_scale",
+            lambda: self._emit_aud_k_scale_fpga(),
+            cache=cache, cache_key=_ck("attn_k_scale"))
+
+        # Phase 2B.c: full FPGA chunked attention chain (Q@K^T, rel-shift,
+        # softcap-tanh, mask, softmax, attn@V) writes pre-o_proj output to
+        # AUD_ATTN_OUT. Then FPGA o_proj clamp -> IF4 matmul -> clamp in place.
+        self._compile_and_run_single("aud_attn_fpga_chain",
+            lambda: self._emit_aud_attn_fpga_chain(layer_idx),
+            cache=cache, cache_key=_ck("attn_fpga_chain"))
+        self._aud_clip_dram(self.AUD_ATTN_OUT, (L_pad, H),
+                              cr["O_PROJ"]["in_min"], cr["O_PROJ"]["in_max"])
+        op = w["O_PROJ"]
+        self._compile_and_run_single("aud_attn_o_proj",
+            lambda: self.matmat_mul_core(
+                M=L_pad, K=H, N=H,
+                A_DRAM_ADDR=self.AUD_ATTN_OUT,
+                B_DRAM_ADDR=op["data"],
+                OUTPUT_DRAM_ADDR=self.AUD_ATTN_OUT,
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=op["scale"],
+                use_pbi=True),
+            cache=cache, cache_key=_ck("attn_o_proj"))
+        self._aud_clip_dram(self.AUD_ATTN_OUT, (L_pad, H),
+                              cr["O_PROJ"]["out_min"], cr["O_PROJ"]["out_max"])
 
         # 4. norm_post_attn (RMSNorm)
         self._compile_and_run_single("aud_attn_post_norm", lambda: self.rms_norm_core_dram(
             M=L_pad, N=H,
             A_DRAM_ADDR=self.AUD_ATTN_OUT,
             OUTPUT_DRAM_ADDR=self.AUD_ATTN_OUT,
-            GAMMA_DRAM_ADDR=w["ATTN_POST_NORM"]),
+            GAMMA_DRAM_ADDR=w["ATTN_POST_NORM"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("attn_post_norm"))
 
         # 5. Residual add: out = norm_post_attn(attn) + saved residual → IN_BUF
         self._compile_and_run_single("aud_attn_residual", lambda: _aud_eltwise_add(
             self, L_pad, H, self.AUD_RESIDUAL, self.AUD_ATTN_OUT, IN_BUF),
             cache=cache, cache_key=_ck("attn_residual"))
+
+    def _aud_chunked_attn_host_preproj(self, layer_idx: int, T: int,
+                                          *, qk_prescaled: bool = False) -> torch.Tensor:
+        """Run chunked self-attention math on host, returning the attn@V
+        result [T, H] BEFORE the o_proj output projection. The caller is
+        expected to run o_proj (clamp → matmul → clamp) on FPGA. Mirrors
+        steps 1–9 of ``_aud_chunked_attn_host`` exactly; only step 10 (the
+        o_proj) is omitted.
+
+        ``qk_prescaled``: when True, AUD_Q / AUD_K in DRAM already include the
+        per-dim Q-scale (q_scale * softplus(per_dim_scale)) and the K-scale
+        (k_scale), so the host scaling lines are skipped."""
+        H = self.AUD_H
+        HD = self.AUD_HEAD_DIM
+        NH = self.AUD_HEADS
+        L_pad = self._aud_L_pad
+        chunk_size = self.AUD_CHUNK
+        max_past = self.AUD_CTX_LEFT - 1
+        max_future = self.AUD_CTX_RIGHT
+        context_size = chunk_size + max_past + max_future
+        soft_cap = self.AUD_SOFT_CAP
+        invalid_logit = self.AUD_INVALID_LOGIT
+        w_layer = self._aud_weight_addrs[layer_idx]
+
+        Q = self.dma_from_accelerator_memory(self.AUD_Q, (L_pad, H)).cpu()[:T].float()
+        K = self.dma_from_accelerator_memory(self.AUD_K, (L_pad, H)).cpu()[:T].float()
+        V = self.dma_from_accelerator_memory(self.AUD_V, (L_pad, H)).cpu()[:T].float()
+
+        Q = Q.view(1, T, NH, HD); K = K.view(1, T, NH, HD); V = V.view(1, T, NH, HD)
+
+        if not qk_prescaled:
+            per_dim_scale = self.dma_from_accelerator_memory(
+                w_layer["PER_DIM_SCALE"], (HD,)).cpu().float()
+            Q = Q * self.AUD_Q_SCALE * F.softplus(per_dim_scale)
+            K = K * self.AUD_K_SCALE
+
+        num_blocks = (T + chunk_size - 1) // chunk_size
+        pad = num_blocks * chunk_size - T
+        Q_pad = F.pad(Q, (0, 0, 0, 0, 0, pad))
+        Q_blocks = Q_pad.view(1, num_blocks, chunk_size, NH, HD).contiguous()
+
+        K_pad = F.pad(K, (0, 0, 0, 0, max_past, max_future + chunk_size - 1))
+        V_pad = F.pad(V, (0, 0, 0, 0, max_past, max_future + chunk_size - 1))
+        K_ctx = K_pad.unfold(1, context_size, chunk_size)
+        V_ctx = V_pad.unfold(1, context_size, chunk_size)
+        K_ctx = torch.movedim(K_ctx, -1, 2).contiguous()
+        V_ctx = torch.movedim(V_ctx, -1, 2).contiguous()
+
+        pos_emb = self.audio_rel_pos_host().float()
+        rel_k_w = self._get_audio_rel_k_proj_weight(layer_idx).float()
+        rel_k = (pos_emb @ rel_k_w.T).view(-1, NH, HD)
+
+        queries = Q_blocks.permute(0, 3, 1, 2, 4)
+        K_ctx_perm = K_ctx.permute(0, 3, 1, 4, 2)
+        matrix_ac = queries @ K_ctx_perm
+
+        queries_flat = queries.reshape(1, NH, -1, HD)
+        rel_k_perm = rel_k.permute(1, 2, 0)
+        matrix_bd = queries_flat @ rel_k_perm
+        matrix_bd = matrix_bd.reshape(1, NH, num_blocks, chunk_size, -1)
+        matrix_bd = self._aud_rel_shift_host(matrix_bd, context_size)
+
+        attn_w = matrix_ac + matrix_bd
+        attn_w = soft_cap * torch.tanh(attn_w / soft_cap)
+        mask_5d = self._aud_make_blocked_mask(T, num_blocks, chunk_size,
+                                                 max_past, max_future)
+        attn_w = attn_w.masked_fill(~mask_5d, invalid_logit)
+        attn_w = F.softmax(attn_w, dim=-1, dtype=torch.float32).to(V_ctx.dtype)
+
+        V_ctx_perm = V_ctx.permute(0, 3, 1, 2, 4)
+        attn_out = attn_w @ V_ctx_perm
+        attn_out = attn_out.permute(0, 2, 3, 1, 4).reshape(1, num_blocks * chunk_size, -1)
+        attn_out = attn_out[:, :T].contiguous().squeeze(0)  # [T, H]
+        return attn_out.to(torch.bfloat16)
 
     def _aud_chunked_attn_host(self, layer_idx: int, T: int) -> torch.Tensor:
         """HOST implementation of Gemma4 chunked local self-attention.
@@ -3770,12 +5392,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=L_pad, N=H,
             A_DRAM_ADDR=IN_BUF,
             OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w["CONV_PRE_NORM"]),
+            GAMMA_DRAM_ADDR=w["CONV_PRE_NORM"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("conv_pre_norm"))
 
         # 2. linear_start (1024 → 2048). Output goes to AUD_FFN_MID temporarily
         # (which is L_pad × FF=4096 = enough for L_pad × 2H=2048).
-        self._host_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
+        self._aud_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
                               cr["CONV_LIN_START"]["in_min"], cr["CONV_LIN_START"]["in_max"])
         cls = w["CONV_LIN_START"]
         self._compile_and_run_single("aud_conv_lin_start", lambda: self.matmat_mul_core(
@@ -3784,9 +5407,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             B_DRAM_ADDR=cls["data"],
             OUTPUT_DRAM_ADDR=self.AUD_FFN_MID,
             is_B_quantized=True, data_type=TYPE.IF4,
-            SCALE_DRAM_ADDR=cls["scale"]),
+            SCALE_DRAM_ADDR=cls["scale"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("conv_lin_start"))
-        self._host_clip_dram(self.AUD_FFN_MID, (L_pad, 2 * H),
+        self._aud_clip_dram(self.AUD_FFN_MID, (L_pad, 2 * H),
                               cr["CONV_LIN_START"]["out_min"], cr["CONV_LIN_START"]["out_max"])
 
         # 3. GLU: split (L_pad, 2H) into gate=(L_pad, H) and value=(L_pad, H),
@@ -3813,20 +5437,18 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.AUD_IDENTITY_H),  # H×H identity for K=N=H matmul
             cache=cache, cache_key=_ck("conv_glu"))
 
-        # 4. depthwise_conv1d (HOST, kernel size 5)
-        glu_out = self.dma_from_accelerator_memory(self.AUD_NORM_OUT, (L_pad, H)).cpu()
-        dw_w = self._aud_hf_layers[layer_idx]["dw_w"]  # [H, k]
-        dw_out_host = self._aud_depthwise_conv1d_host(glu_out[:T], dw_w)
-        dw_padded = torch.zeros(L_pad, H, dtype=torch.bfloat16)
-        dw_padded[:T] = dw_out_host
-        self.dma_to_accelerator_memory(self.AUD_NORM_OUT, dw_padded.contiguous())
+        # 4. depthwise_conv1d (FPGA 4-tap shifted-eltwise).
+        self._aud_dw_conv1d_dispatch(
+            layer_idx, in_addr=self.AUD_NORM_OUT, out_addr=self.AUD_NORM_OUT,
+            cache=cache, cache_key=_ck("conv_dw"))
 
         # 5. conv_norm (RMSNorm with learned scale)
         self._compile_and_run_single("aud_conv_norm", lambda: self.rms_norm_core_dram(
             M=L_pad, N=H,
             A_DRAM_ADDR=self.AUD_NORM_OUT,
             OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w["CONV_NORM"]),
+            GAMMA_DRAM_ADDR=w["CONV_NORM"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("conv_norm"))
 
         # 6. SiLU
@@ -3835,7 +5457,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             cache=cache, cache_key=_ck("conv_silu"))
 
         # 7. linear_end (1024 → 1024)
-        self._host_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
+        self._aud_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
                               cr["CONV_LIN_END"]["in_min"], cr["CONV_LIN_END"]["in_max"])
         cle = w["CONV_LIN_END"]
         self._compile_and_run_single("aud_conv_lin_end", lambda: self.matmat_mul_core(
@@ -3844,9 +5466,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             B_DRAM_ADDR=cle["data"],
             OUTPUT_DRAM_ADDR=self.AUD_FFN_OUT,
             is_B_quantized=True, data_type=TYPE.IF4,
-            SCALE_DRAM_ADDR=cle["scale"]),
+            SCALE_DRAM_ADDR=cle["scale"],
+            use_pbi=True),
             cache=cache, cache_key=_ck("conv_lin_end"))
-        self._host_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
+        self._aud_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
                               cr["CONV_LIN_END"]["out_min"], cr["CONV_LIN_END"]["out_max"])
 
         # 8. Residual: out = AUD_FFN_OUT + AUD_RESIDUAL → IN_BUF
@@ -3894,6 +5517,583 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         out = F.conv1d(x_p, w_t, bias=None, stride=1, padding=0, groups=H)
         return out.squeeze(0).transpose(0, 1).to(torch.bfloat16)  # [T, H]
 
+    def _aud_dw_conv1d_dispatch(self, layer_idx: int, *,
+                                  in_addr: int, out_addr: int,
+                                  cache, cache_key: str) -> None:
+        """Phase 2A depthwise conv1d on FPGA (4-tap shifted-eltwise)."""
+        self._compile_and_run_single(
+            f"aud_L{layer_idx}_conv_dw",
+            lambda: self._emit_aud_dw_conv1d_fpga(layer_idx,
+                                                   in_addr=in_addr,
+                                                   out_addr=out_addr),
+            cache=cache, cache_key=cache_key)
+
+    def _emit_aud_q_scale_fpga(self, layer_idx: int) -> None:
+        """Phase 2B.b Q-scaling on FPGA: AUD_Q *= Q_SCALE_TILE (eltwise_mul).
+        The tile is pre-computed in audio_tensor_init as
+        q_scale * softplus(per_dim_scale) broadcast over (L_pad, H)."""
+        from audio_primitives import (URAM_A_BASE, URAM_B_BASE, _row_chunk)
+        H = self.AUD_H
+        L_pad = self._aud_L_pad
+        bpe = self.bytes_per_element
+        scale_addr = self._aud_weight_addrs[layer_idx]["Q_SCALE_TILE"]
+        M_chunk = _row_chunk(L_pad, H, divisor=2)
+        rb = H * bpe
+        for m_start in range(0, L_pad, M_chunk):
+            m_take = min(M_chunk, L_pad - m_start)
+            n = m_take * H
+            self.accelerator_memory_to_sram(self.AUD_Q + m_start * rb,
+                                             URAM_A_BASE, n)
+            self.accelerator_memory_to_sram(scale_addr + m_start * rb,
+                                             URAM_B_BASE, n)
+            self.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE,
+                                   vector_B_sram_start_addr=URAM_B_BASE,
+                                   vector_C_sram_wb_addr=URAM_A_BASE,
+                                   element_size=n)
+            self.sram_to_accelerator_memory(URAM_A_BASE,
+                                             self.AUD_Q + m_start * rb, n)
+
+    def _emit_aud_k_scale_fpga(self) -> None:
+        """Phase 2B.b K-scaling on FPGA: AUD_K *= AUD_K_SCALE (broadcast_mul)."""
+        from audio_primitives import URAM_A_BASE, _row_chunk
+        H = self.AUD_H
+        L_pad = self._aud_L_pad
+        bpe = self.bytes_per_element
+        scale = float(self.AUD_K_SCALE)
+        M_chunk = _row_chunk(L_pad, H, divisor=1)
+        rb = H * bpe
+        for m_start in range(0, L_pad, M_chunk):
+            m_take = min(M_chunk, L_pad - m_start)
+            n = m_take * H
+            self.accelerator_memory_to_sram(self.AUD_K + m_start * rb,
+                                             URAM_A_BASE, n)
+            self.broadcast_mul(scalar=scale,
+                                sram_start_addr=URAM_A_BASE,
+                                sram_wb_addr=URAM_A_BASE,
+                                element_size=n)
+            self.sram_to_accelerator_memory(URAM_A_BASE,
+                                             self.AUD_K + m_start * rb, n)
+
+    def _emit_aud_attn_build_kctx_t(self, layer_idx: int) -> None:
+        """Phase 2B.c step 1: build K_PADDED, K_CTX_BLOCKS, K_CTX_HEAD_BLOCKS on FPGA.
+
+        K_PADDED          := zero-padded K (max_past leading zeros + AUD_K + trailing).
+        K_CTX_BLOCKS      := per-block window of K_PADDED, shape (num_blocks, ctx_pad, H).
+                             Rows [0:ctx_size) are real; [ctx_size:ctx_pad) are zero.
+        K_CTX_T_BLOCKS    := per-(block, head) head slice of K_CTX_BLOCKS, shape
+                             (num_blocks, NH, ctx_pad, HD).  NOTE: this is the
+                             NATIVE B layout for FPGA matmul, which expects B as
+                             (N, K) row-major and computes A @ B^T. So passing
+                             K_ctx (ctx_pad, HD) as B yields A @ K_ctx^T = Q @ K^T.
+                             No explicit transpose required.
+        """
+        from audio_primitives import (copy_dram_to_dram_chunked,
+                                       URAM_A_BASE)
+        H = self.AUD_H
+        HD = self.AUD_HEAD_DIM
+        NH = self.AUD_HEADS
+        L_pad = self._aud_L_pad
+        chunk = self.AUD_CHUNK
+        ctx_size = self.AUD_CTX
+        ctx_pad = self._aud_ctx_pad
+        num_blocks = self._aud_num_blocks
+        max_past = self.AUD_CTX_LEFT - 1
+        bpe = self.bytes_per_element
+
+        copy_dram_to_dram_chunked(self, self.AUD_K,
+                                   self.AUD_K_PADDED + max_past * H * bpe,
+                                   L_pad * H, row_n=H)
+        for b in range(num_blocks):
+            copy_dram_to_dram_chunked(self,
+                self.AUD_K_PADDED + b * chunk * H * bpe,
+                self.AUD_K_CTX_BLOCKS + b * ctx_pad * H * bpe,
+                ctx_size * H, row_n=H)
+
+        # Per-(block, head) extract head slice (ctx_pad, HD) into K_CTX_T_BLOCKS.
+        # This is the per-(b, h) B matrix in (N=ctx_pad, K=HD) layout that
+        # matmat_mul_core will read as A @ B^T = Q @ K^T.
+        for b in range(num_blocks):
+            for h in range(NH):
+                src = self.AUD_K_CTX_BLOCKS + (b * ctx_pad * H + h * HD) * bpe
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=src,
+                    sram_address=URAM_A_BASE,
+                    element_size=ctx_pad * HD,
+                    stride_bytes_per_chunk=HD * bpe,
+                    stride_jump_bytes=H * bpe)
+                dst = self.AUD_K_CTX_T_BLOCKS + (b * NH + h) * ctx_pad * HD * bpe
+                self.sram_to_accelerator_memory(URAM_A_BASE,
+                    dst, ctx_pad * HD)
+
+    def _emit_aud_attn_build_vctx_t(self, layer_idx: int) -> None:
+        """Phase 2B.c step 5 prep: build V_PADDED, V_CTX_BLOCKS, V_CTX_T_BLOCKS.
+
+        V_PADDED         := zero-padded V (mirrors K_PADDED).
+        V_CTX_BLOCKS     := per-block window of V_PADDED, (num_blocks, ctx_pad, H).
+        V_CTX_T_BLOCKS   := per-(block, head) ACTUAL transpose of V_BLOCK_HEAD,
+                            shape (num_blocks, NH, HD, ctx_pad). Transposition uses
+                            matmul-with-AUD_IDENTITY_HD trick since the FPGA strided
+                            DMA can't do per-column reads (stride 2 bytes < 32 byte
+                            AXI alignment). The matmul A=I (HD, HD) @ B=V_BLOCK_HEAD
+                            (in (N=ctx_pad, K=HD) layout) yields output[m, n]
+                            = sum_k delta(m, k) * V_BLOCK_HEAD[n, k] = V_BLOCK_HEAD[n, m],
+                            which is V_BLOCK_HEAD transposed.
+        """
+        from audio_primitives import (copy_dram_to_dram_chunked, URAM_A_BASE)
+        H = self.AUD_H
+        HD = self.AUD_HEAD_DIM
+        NH = self.AUD_HEADS
+        L_pad = self._aud_L_pad
+        chunk = self.AUD_CHUNK
+        ctx_size = self.AUD_CTX
+        ctx_pad = self._aud_ctx_pad
+        num_blocks = self._aud_num_blocks
+        max_past = self.AUD_CTX_LEFT - 1
+        bpe = self.bytes_per_element
+
+        copy_dram_to_dram_chunked(self, self.AUD_V,
+                                   self.AUD_V_PADDED + max_past * H * bpe,
+                                   L_pad * H, row_n=H)
+        for b in range(num_blocks):
+            copy_dram_to_dram_chunked(self,
+                self.AUD_V_PADDED + b * chunk * H * bpe,
+                self.AUD_V_CTX_BLOCKS + b * ctx_pad * H * bpe,
+                ctx_size * H, row_n=H)
+
+        # Per-(block, head): strided extract head slice into V_BLOCK_HEAD, then
+        # matmul-transpose into V_CTX_T_BLOCKS.
+        for b in range(num_blocks):
+            for h in range(NH):
+                src = self.AUD_V_CTX_BLOCKS + (b * ctx_pad * H + h * HD) * bpe
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=src,
+                    sram_address=URAM_A_BASE,
+                    element_size=ctx_pad * HD,
+                    stride_bytes_per_chunk=HD * bpe,
+                    stride_jump_bytes=H * bpe)
+                self.sram_to_accelerator_memory(URAM_A_BASE,
+                    self.AUD_V_BLOCK_HEAD, ctx_pad * HD)
+                # matmul I (HD, HD) @ V_BLOCK_HEAD^T (HD, ctx_pad) = V transposed.
+                dst = self.AUD_V_CTX_T_BLOCKS + (b * NH + h) * HD * ctx_pad * bpe
+                self.matmat_mul_core(M=HD, K=HD, N=ctx_pad,
+                    A_DRAM_ADDR=self.AUD_IDENTITY_HD,
+                    B_DRAM_ADDR=self.AUD_V_BLOCK_HEAD,
+                    OUTPUT_DRAM_ADDR=dst)
+
+    def _emit_aud_attn_matrix_bd_unshifted(self, layer_idx: int) -> None:
+        """Phase 2B.c step 2: matrix_bd_unshifted = Q @ rel_k^T (per head).
+
+        REL_K_T per-head layout is (bd_unshifted_N, HD) with rows structured as:
+          [0, chunk_pad):                    zero (pre-pad)  — survives across layers
+          [chunk_pad, chunk_pad+num_pos_pad): real rel_k rows
+          [chunk_pad+num_pos_pad, end):      zero (post-pad) — survives across layers
+        Pre-pad/post-pad bands are zeroed once at audio_tensor_init. Per layer
+        we only re-fill the real-row band; pre/post bands persist as zeros.
+
+        matrix_bd_unshifted matmul N = bd_unshifted_N so output rows have the
+        same pre-pad/real/post-pad structure. The rel-shift then reads
+        bd_unshifted_N - chunk_pad = chunk_pad+num_pos_pad = ctx_pad columns
+        starting at non-aligned offset (chunk_pad - r) in the source.
+        """
+        from audio_primitives import URAM_A_BASE
+        H = self.AUD_H
+        HD = self.AUD_HEAD_DIM
+        NH = self.AUD_HEADS
+        L_pad = self._aud_L_pad
+        T_pad_padded = self._aud_T_pad_padded
+        num_pos_pad = self._aud_num_pos_pad
+        chunk_pad = self._aud_chunk_pad
+        bd_N = self._aud_bd_unshifted_N
+        bpe = self.bytes_per_element
+        w = self._aud_weight_addrs[layer_idx]
+
+        # (a) REL_K_OUT = POS_EMB_PADDED @ REL_K_PROJ  (num_pos_pad, H, H)
+        rk = w["REL_K_PROJ"]
+        self.matmat_mul_core(M=num_pos_pad, K=H, N=H,
+            A_DRAM_ADDR=self.AUD_POS_EMB_PADDED,
+            B_DRAM_ADDR=rk["data"],
+            OUTPUT_DRAM_ADDR=self.AUD_REL_K_OUT,
+            is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=rk["scale"])
+
+        # (b) Per-head strided extract of REL_K_OUT[:, h*HD:(h+1)*HD] (num_pos_pad, HD)
+        # into REL_K_T[h, chunk_pad:chunk_pad+num_pos_pad, :]. The destination is
+        # at row offset chunk_pad in a (bd_N, HD) per-head buffer; chunk_pad*HD*bpe
+        # is VS-aligned (chunk_pad=VS) so the write is VS-aligned.
+        for h in range(NH):
+            src = self.AUD_REL_K_OUT + h * HD * bpe
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=src,
+                sram_address=URAM_A_BASE,
+                element_size=num_pos_pad * HD,
+                stride_bytes_per_chunk=HD * bpe,
+                stride_jump_bytes=H * bpe)
+            dst = self.AUD_REL_K_T + (h * bd_N + chunk_pad) * HD * bpe
+            self.sram_to_accelerator_memory(URAM_A_BASE, dst, num_pos_pad * HD)
+
+        # (c) + (d) Per-head Q-extract + matmul (N = bd_N).
+        for h in range(NH):
+            src = self.AUD_Q + h * HD * bpe
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=src,
+                sram_address=URAM_A_BASE,
+                element_size=L_pad * HD,
+                stride_bytes_per_chunk=HD * bpe,
+                stride_jump_bytes=H * bpe)
+            self.sram_to_accelerator_memory(URAM_A_BASE,
+                self.AUD_Q_HEAD_FULL, L_pad * HD)
+
+            B_addr = self.AUD_REL_K_T + h * bd_N * HD * bpe
+            bd_addr = self.AUD_MATRIX_BD_UNSHIFTED + h * T_pad_padded * bd_N * bpe
+            self.matmat_mul_core(M=T_pad_padded, K=HD, N=bd_N,
+                A_DRAM_ADDR=self.AUD_Q_HEAD_FULL,
+                B_DRAM_ADDR=B_addr,
+                OUTPUT_DRAM_ADDR=bd_addr)
+
+    def _emit_aud_attn_rel_shift(self, layer_idx: int) -> None:
+        """Phase 2B.c step 3: build AUD_MATRIX_BD_SHIFTED via per-(b, h, r) matmul.
+
+        Reading non-aligned source rows fails because the FPGA rounds the source
+        DRAM address DOWN to a 32-byte (16-element) boundary, scrambling the
+        shift for r in [1, 11]. Instead we use a tiny matmul per row:
+
+            bd_shifted[b, h, r, :ctx_pad] = bd_unshifted[h, b*chunk+r, :num_pos_pad]
+                                            @ M_r[:num_pos_pad, :ctx_pad].T
+
+        where M_r[p, c] = 1 if c == p+r AND p < num_pos else 0. The shift
+        matrices M_r are pre-built at audio_tensor_init in (N=ctx_pad, K=num_pos_pad)
+        layout so FPGA's native A @ B^T computes the right thing.
+        """
+        NH = self.AUD_HEADS
+        chunk = self.AUD_CHUNK
+        ctx_pad = self._aud_ctx_pad
+        chunk_pad = self._aud_chunk_pad
+        num_blocks = self._aud_num_blocks
+        T_pad_padded = self._aud_T_pad_padded
+        num_pos_pad = self._aud_num_pos_pad
+        bd_N = self._aud_bd_unshifted_N
+        bpe = self.bytes_per_element
+
+        for b in range(num_blocks):
+            for h in range(NH):
+                for r in range(chunk):
+                    # A = bd_unshifted[h, b*chunk+r, chunk_pad:chunk_pad+num_pos_pad]
+                    # The real values live at cols [chunk_pad, chunk_pad+num_pos_pad)
+                    # within bd_unshifted's row (zero-bands flank them).
+                    A = (self.AUD_MATRIX_BD_UNSHIFTED
+                         + ((h * T_pad_padded + b * chunk + r) * bd_N + chunk_pad) * bpe)
+                    B = self.AUD_REL_SHIFT_M + r * ctx_pad * num_pos_pad * bpe
+                    C = (self.AUD_MATRIX_BD_SHIFTED
+                         + ((b * NH + h) * chunk_pad + r) * ctx_pad * bpe)
+                    self.matmat_mul_core(M=1, K=num_pos_pad, N=ctx_pad,
+                        A_DRAM_ADDR=A, B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=C)
+
+    def _emit_aud_attn_matrix_ac(self, layer_idx: int) -> None:
+        """Phase 2B.c step 2: per-(block, head) Q[b,h] @ K_CTX^T[b,h] -> matrix_ac[b,h].
+
+        Q extraction: strided DMA AUD_Q[b*chunk:(b+1)*chunk, h*HD:(h+1)*HD] into
+        AUD_Q_HEAD_BLOCK (top valid_rows rows; rows [valid_rows:chunk_pad] forced to
+        zero per-iteration so the last partial block sees the zeros HF F.pad inserts).
+
+        Matmul: (chunk_pad=64, HD) @ (N=ctx_pad=64, K=HD) -> (chunk_pad, ctx_pad).
+        FPGA computes A @ B^T natively (B in (N, K) layout). Only output rows
+        [0:chunk) × cols [0:ctx_size) are semantically valid.
+        """
+        from audio_primitives import URAM_A_BASE
+        H = self.AUD_H
+        HD = self.AUD_HEAD_DIM
+        NH = self.AUD_HEADS
+        L_pad = self._aud_L_pad
+        chunk = self.AUD_CHUNK
+        ctx_pad = self._aud_ctx_pad
+        chunk_pad = self._aud_chunk_pad
+        num_blocks = self._aud_num_blocks
+        bpe = self.bytes_per_element
+
+        for b in range(num_blocks):
+            valid_rows = min(chunk, L_pad - b * chunk)
+            for h in range(NH):
+                # Zero AUD_Q_HEAD_BLOCK[valid_rows:chunk_pad] first (matters only
+                # for the partial last block, but cheap so do it always).
+                if valid_rows < chunk_pad:
+                    fill_elems = (chunk_pad - valid_rows) * HD
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=self.AUD_ZEROS_CHUNK_HD,
+                        sram_address=URAM_A_BASE,
+                        element_size=fill_elems)
+                    self.sram_to_accelerator_memory(URAM_A_BASE,
+                        self.AUD_Q_HEAD_BLOCK + valid_rows * HD * bpe,
+                        fill_elems)
+                if valid_rows > 0:
+                    src = self.AUD_Q + (b * chunk * H + h * HD) * bpe
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=src,
+                        sram_address=URAM_A_BASE,
+                        element_size=valid_rows * HD,
+                        stride_bytes_per_chunk=HD * bpe,
+                        stride_jump_bytes=H * bpe)
+                    self.sram_to_accelerator_memory(URAM_A_BASE,
+                        self.AUD_Q_HEAD_BLOCK, valid_rows * HD)
+
+                # B = K_ctx[b, h] in (N=ctx_pad, K=HD); FPGA computes A @ B^T.
+                K_B = self.AUD_K_CTX_T_BLOCKS + (b * NH + h) * ctx_pad * HD * bpe
+                ac = self.AUD_MATRIX_AC + (b * NH + h) * chunk_pad * ctx_pad * bpe
+                self.matmat_mul_core(M=chunk_pad, K=HD, N=ctx_pad,
+                    A_DRAM_ADDR=self.AUD_Q_HEAD_BLOCK,
+                    B_DRAM_ADDR=K_B,
+                    OUTPUT_DRAM_ADDR=ac)
+
+    def _emit_aud_softcap_tanh_dram(self, addr: int, M: int, N: int,
+                                     soft_cap: float, identity_addr: int) -> None:
+        """In-place soft_cap * tanh(x / soft_cap) on a (M, N) bf16 DRAM tensor.
+
+        Decomposes via tanh(y) = 2*sigmoid(2y) - 1:
+            out = 2*soft_cap * sigmoid(2x / soft_cap) - soft_cap
+        Steps: broadcast_mul(2/sc) -> sigmoid via identity matmul -> broadcast_mul(2*sc)
+               -> broadcast_add(-sc).
+        ``identity_addr`` must point to an (N, N) bf16 identity matrix.
+        """
+        from audio_primitives import URAM_A_BASE, _row_chunk
+        bpe = self.bytes_per_element
+        a = 2.0 / soft_cap
+        b = 2.0 * soft_cap
+        row_bytes = N * bpe
+        M_chunk = _row_chunk(M, N, divisor=2)
+
+        for m_start in range(0, M, M_chunk):
+            m_take = min(M_chunk, M - m_start)
+            n = m_take * N
+            chunk = addr + m_start * row_bytes
+            self.accelerator_memory_to_sram(chunk, URAM_A_BASE, n)
+            self.broadcast_mul(scalar=a,
+                                sram_start_addr=URAM_A_BASE,
+                                sram_wb_addr=URAM_A_BASE,
+                                element_size=n)
+            self.sram_to_accelerator_memory(URAM_A_BASE, chunk, n)
+
+        # In-place sigmoid via identity matmul over all M rows.
+        self.matmat_mul_core(M=M, K=N, N=N,
+            A_DRAM_ADDR=addr, B_DRAM_ADDR=identity_addr,
+            OUTPUT_DRAM_ADDR=addr, sigmoid_enable=True)
+
+        for m_start in range(0, M, M_chunk):
+            m_take = min(M_chunk, M - m_start)
+            n = m_take * N
+            chunk = addr + m_start * row_bytes
+            self.accelerator_memory_to_sram(chunk, URAM_A_BASE, n)
+            self.broadcast_mul(scalar=b,
+                                sram_start_addr=URAM_A_BASE,
+                                sram_wb_addr=URAM_A_BASE,
+                                element_size=n)
+            self.broadcast_add(scalar=-soft_cap,
+                                sram_start_addr=URAM_A_BASE,
+                                sram_wb_addr=URAM_A_BASE,
+                                element_size=n)
+            self.sram_to_accelerator_memory(URAM_A_BASE, chunk, n)
+
+    def _emit_aud_attn_logits_softcap_mask_softmax(self, layer_idx: int) -> None:
+        """Phase 2B.c steps 4-6: produce attn_w in AUD_MATRIX_AC by:
+            (i)   AUD_MATRIX_AC += AUD_MATRIX_BD_SHIFTED      (eltwise_add)
+            (ii)  AUD_MATRIX_AC = soft_cap * tanh(AUD_MATRIX_AC / soft_cap)
+            (iii) AUD_MATRIX_AC += AUD_MASK_ADDEND            (-1e9 outside valid)
+            (iv)  AUD_MATRIX_AC = softmax(AUD_MATRIX_AC, dim=-1)
+        Operates on the flat (num_blocks*NH*chunk_pad, ctx_pad) view of the tile.
+        """
+        from audio_primitives import eltwise_add_core_dram
+        NH = self.AUD_HEADS
+        chunk_pad = self._aud_chunk_pad
+        ctx_pad = self._aud_ctx_pad
+        num_blocks = self._aud_num_blocks
+        M_total = num_blocks * NH * chunk_pad
+
+        # (i) AC += BD_SHIFTED
+        eltwise_add_core_dram(self, M=M_total, N=ctx_pad,
+            A_DRAM_ADDR=self.AUD_MATRIX_AC,
+            B_DRAM_ADDR=self.AUD_MATRIX_BD_SHIFTED,
+            OUTPUT_DRAM_ADDR=self.AUD_MATRIX_AC)
+        # (ii) softcap in place
+        self._emit_aud_softcap_tanh_dram(
+            self.AUD_MATRIX_AC, M=M_total, N=ctx_pad,
+            soft_cap=float(self.AUD_SOFT_CAP),
+            identity_addr=self.AUD_IDENTITY_CTX)
+        # (iii) AC += MASK_ADDEND (additive bias: 0 for valid, -1e9 for masked)
+        eltwise_add_core_dram(self, M=M_total, N=ctx_pad,
+            A_DRAM_ADDR=self.AUD_MATRIX_AC,
+            B_DRAM_ADDR=self.AUD_MASK_ADDEND,
+            OUTPUT_DRAM_ADDR=self.AUD_MATRIX_AC)
+        # (iv) softmax along last dim via matmul-with-identity
+        self.matmat_mul_core(M=M_total, K=ctx_pad, N=ctx_pad,
+            A_DRAM_ADDR=self.AUD_MATRIX_AC,
+            B_DRAM_ADDR=self.AUD_IDENTITY_CTX,
+            OUTPUT_DRAM_ADDR=self.AUD_MATRIX_AC,
+            softmax_enable=True)
+
+    def _emit_aud_attn_fpga_chain(self, layer_idx: int) -> None:
+        """Phase 2B.c full FPGA chunked-attention chain. Called inline (no
+        per-sub-op capture), so it works inside either an outer
+        ``_compile_and_run_single`` capture OR the encoder one-shot capture
+        with ``_oneshot_mode=True``.
+
+        Assumes Q/K/V are already populated in AUD_Q/K/V (post-QK scaling)
+        and writes the pre-o_proj attention output to AUD_ATTN_OUT[:T, :H].
+        Subsequent o_proj clamps+matmul transforms it in place.
+        """
+        self._emit_aud_attn_build_kctx_t(layer_idx)
+        self._emit_aud_attn_matrix_ac(layer_idx)
+        self._emit_aud_attn_matrix_bd_unshifted(layer_idx)
+        self._emit_aud_attn_rel_shift(layer_idx)
+        self._emit_aud_attn_build_vctx_t(layer_idx)
+        self._emit_aud_attn_logits_softcap_mask_softmax(layer_idx)
+        self._emit_aud_attn_value_and_scatter(layer_idx)
+
+    def _emit_aud_attn_value_and_scatter(self, layer_idx: int) -> None:
+        """Phase 2B.c step 7: per-(block, head) attn @ V_ctx, then scatter to
+        AUD_ATTN_OUT.
+
+        Per (b, h):
+            attn_tile = AUD_MATRIX_AC[b, h]    (chunk_pad, ctx_pad)
+            V_T       = AUD_V_CTX_T_BLOCKS[b, h]  (HD, ctx_pad)  -- B in (N=HD, K=ctx_pad)
+            tmp = attn_tile @ V_T^T            (chunk_pad, HD)  -- attn @ V_ctx
+            scatter tmp[:valid_rows] to AUD_ATTN_OUT[b*chunk:b*chunk+valid_rows,
+                                                     h*HD:(h+1)*HD]
+        where valid_rows = min(chunk, L_pad - b*chunk).
+        """
+        from audio_primitives import URAM_A_BASE
+        H = self.AUD_H
+        HD = self.AUD_HEAD_DIM
+        NH = self.AUD_HEADS
+        L_pad = self._aud_L_pad
+        chunk = self.AUD_CHUNK
+        ctx_pad = self._aud_ctx_pad
+        chunk_pad = self._aud_chunk_pad
+        num_blocks = self._aud_num_blocks
+        bpe = self.bytes_per_element
+
+        for b in range(num_blocks):
+            valid_rows = min(chunk, L_pad - b * chunk)
+            for h in range(NH):
+                attn = self.AUD_MATRIX_AC + (b * NH + h) * chunk_pad * ctx_pad * bpe
+                V_T  = self.AUD_V_CTX_T_BLOCKS + (b * NH + h) * HD * ctx_pad * bpe
+                self.matmat_mul_core(M=chunk_pad, K=ctx_pad, N=HD,
+                    A_DRAM_ADDR=attn,
+                    B_DRAM_ADDR=V_T,
+                    OUTPUT_DRAM_ADDR=self.AUD_ATTN_OUT_BH)
+                if valid_rows <= 0:
+                    continue
+                # Strided scatter top valid_rows rows of (chunk_pad, HD) into
+                # AUD_ATTN_OUT[b*chunk:b*chunk+valid_rows, h*HD:(h+1)*HD]:
+                # row stride at dst = H*bpe (full row of AUD_ATTN_OUT),
+                # row stride at src = HD*bpe (tile is contiguous).
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=self.AUD_ATTN_OUT_BH,
+                    sram_address=URAM_A_BASE,
+                    element_size=valid_rows * HD)
+                dst = self.AUD_ATTN_OUT + (b * chunk * H + h * HD) * bpe
+                self.sram_to_accelerator_memory(
+                    sram_address=URAM_A_BASE,
+                    accelerator_dram_address=dst,
+                    element_size=valid_rows * HD,
+                    stride_bytes_per_chunk=HD * bpe,
+                    stride_jump_bytes=H * bpe)
+
+    def _emit_aud_dw_conv1d_fpga(self, layer_idx: int, *,
+                                   in_addr: int, out_addr: int) -> None:
+        """4-tap shifted-eltwise depthwise causal conv1d on FPGA.
+
+        For causal conv with kernel size K and per-channel weight w[c, t]:
+            y[r, c] = sum_{t=0..K-1} w[c, t] * x[r - (K-1-t), c]   for r ≥ K-1-t
+                                                                   else 0
+
+        Implementation:
+          1. Pre-stage SHIFT[0:K-1, :] = 0 (copy from AUD_DW_ZERO_KM1).
+          2. For each tap t = 0 .. K-1, with shift_t = K-1-t:
+               Build SHIFT[shift_t:L_pad, :] = x[0:L_pad-shift_t, :] via a
+               DRAM-to-DRAM copy. Rows [0:shift_t] are already zero (from
+               step 1 for shift_t = K-1, and preserved across taps because we
+               iterate from largest shift to smallest, so each tap's zero-pad
+               region is a subset of the previous tap's untouched region).
+               Then SCRATCH = SHIFT * tap_tile[t]   (eltwise_mul).
+               For t == 0: ACCUM = SCRATCH (direct write).
+               For t >  0: ACCUM = ACCUM + SCRATCH (eltwise_add into out).
+          3. Final ACCUM lives at ``out_addr``.
+
+        We use AUD_FFN_MID (L_pad × 4H) as scratch:
+          SHIFT   = AUD_FFN_MID + 0
+          SCRATCH = AUD_FFN_MID + L_pad*H*bpe
+        AUD_FFN_OUT is a third (L_pad × H) buffer used to hold ``in_addr``'s
+        contents when in_addr == out_addr (so we don't read after partial
+        write). Because in_addr == AUD_NORM_OUT == out_addr in the conv
+        pipeline, we copy AUD_NORM_OUT into AUD_FFN_OUT once at the top and
+        read x from AUD_FFN_OUT throughout.
+        """
+        H = self.AUD_H
+        L_pad = self._aud_L_pad
+        K = self.AUD_CONV_K
+        bpe = self.bytes_per_element
+        row_bytes = H * bpe
+        w = self._aud_weight_addrs[layer_idx]
+        tap_tiles = w["CONV_DW_TAP_TILES"]
+        assert len(tap_tiles) == K, f"tap_tiles len {len(tap_tiles)} != K {K}"
+
+        from audio_primitives import (
+            eltwise_add_core_dram, copy_dram_to_dram_chunked,
+            URAM_A_BASE, URAM_B_BASE, _row_chunk,
+        )
+
+        # Stage x into AUD_FFN_OUT (safe vs. in-place out_addr).
+        x_buf = self.AUD_FFN_OUT
+        copy_dram_to_dram_chunked(self, in_addr, x_buf, L_pad * H, row_n=H)
+
+        shift_buf = self.AUD_FFN_MID
+        scratch_buf = self.AUD_FFN_MID + L_pad * H * bpe
+        accum_buf = out_addr
+
+        # Pre-zero SHIFT[0:K-1, :] using the cached zero tile. After this,
+        # every subsequent copy into SHIFT[shift_t:L_pad, :] preserves the
+        # top zero region because shift_t decreases monotonically.
+        copy_dram_to_dram_chunked(
+            self, self.AUD_DW_ZERO_KM1, shift_buf, (K - 1) * H, row_n=H)
+
+        def _eltwise_mul_dram(src_a: int, src_b: int, dst: int, M: int, N: int):
+            """eltwise_mul over (M, N) bf16 DRAM tensors, chunked."""
+            M_chunk = _row_chunk(M, N, divisor=2)
+            rb = N * bpe
+            for m_start in range(0, M, M_chunk):
+                m_take = min(M_chunk, M - m_start)
+                n = m_take * N
+                self.accelerator_memory_to_sram(src_a + m_start * rb,
+                                                URAM_A_BASE, n)
+                self.accelerator_memory_to_sram(src_b + m_start * rb,
+                                                URAM_B_BASE, n)
+                self.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE,
+                                       vector_B_sram_start_addr=URAM_B_BASE,
+                                       vector_C_sram_wb_addr=URAM_A_BASE,
+                                       element_size=n)
+                self.sram_to_accelerator_memory(URAM_A_BASE,
+                                                dst + m_start * rb, n)
+
+        for t in range(K):
+            shift_t = (K - 1) - t  # K-1, K-2, ..., 0
+            # Place x[0:L_pad-shift_t] into SHIFT[shift_t:L_pad].
+            n_rows = L_pad - shift_t
+            if n_rows > 0:
+                copy_dram_to_dram_chunked(
+                    self, x_buf,
+                    shift_buf + shift_t * row_bytes,
+                    n_rows * H, row_n=H)
+            # SCRATCH = SHIFT * tap_tile[t]
+            _eltwise_mul_dram(shift_buf, tap_tiles[t], scratch_buf, L_pad, H)
+            if t == 0:
+                # ACCUM := SCRATCH
+                copy_dram_to_dram_chunked(self, scratch_buf, accum_buf,
+                                           L_pad * H, row_n=H)
+            else:
+                # ACCUM += SCRATCH
+                eltwise_add_core_dram(self, M=L_pad, N=H,
+                                       A_DRAM_ADDR=accum_buf,
+                                       B_DRAM_ADDR=scratch_buf,
+                                       OUTPUT_DRAM_ADDR=accum_buf)
+
     def compile_audio_layer_ffn2(self, layer_idx: int) -> None:
         """Run the FFN2 macaron half. Identical to FFN1 except for the
         weight keys (FF2_*) so we just call _compile_audio_ffn_macaron with
@@ -3923,10 +6123,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=L_pad, N=H,
             A_DRAM_ADDR=IN_BUF,
             OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w[f"{prefix}_PRE_NORM"]),
+            GAMMA_DRAM_ADDR=w[f"{prefix}_PRE_NORM"],
+            use_pbi=True),
             cache=cache, cache_key=_ck(f"{plow}_pre_norm"))
 
-        self._host_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
+        self._aud_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
                               cr[f"{prefix}_W1"]["in_min"], cr[f"{prefix}_W1"]["in_max"])
         w1 = w[f"{prefix}_W1"]
         self._compile_and_run_single(f"aud_{plow}_w1", lambda: self.matmat_mul_core(
@@ -3935,16 +6136,17 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             B_DRAM_ADDR=w1["data"],
             OUTPUT_DRAM_ADDR=self.AUD_FFN_MID,
             is_B_quantized=True, data_type=TYPE.IF4,
-            SCALE_DRAM_ADDR=w1["scale"]),
+            SCALE_DRAM_ADDR=w1["scale"],
+            use_pbi=True),
             cache=cache, cache_key=_ck(f"{plow}_w1"))
-        self._host_clip_dram(self.AUD_FFN_MID, (L_pad, FF),
+        self._aud_clip_dram(self.AUD_FFN_MID, (L_pad, FF),
                               cr[f"{prefix}_W1"]["out_min"], cr[f"{prefix}_W1"]["out_max"])
 
         self._compile_and_run_single(f"aud_{plow}_silu", lambda: _aud_silu(
             self, L_pad, FF, self.AUD_FFN_MID, self.AUD_SILU_OUT, self.AUD_IDENTITY_FF),
             cache=cache, cache_key=_ck(f"{plow}_silu"))
 
-        self._host_clip_dram(self.AUD_SILU_OUT, (L_pad, FF),
+        self._aud_clip_dram(self.AUD_SILU_OUT, (L_pad, FF),
                               cr[f"{prefix}_W2"]["in_min"], cr[f"{prefix}_W2"]["in_max"])
         w2 = w[f"{prefix}_W2"]
         self._compile_and_run_single(f"aud_{plow}_w2", lambda: self.matmat_mul_core(
@@ -3953,16 +6155,18 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             B_DRAM_ADDR=w2["data"],
             OUTPUT_DRAM_ADDR=self.AUD_FFN_OUT,
             is_B_quantized=True, data_type=TYPE.IF4,
-            SCALE_DRAM_ADDR=w2["scale"]),
+            SCALE_DRAM_ADDR=w2["scale"],
+            use_pbi=True),
             cache=cache, cache_key=_ck(f"{plow}_w2"))
-        self._host_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
+        self._aud_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
                               cr[f"{prefix}_W2"]["out_min"], cr[f"{prefix}_W2"]["out_max"])
 
         self._compile_and_run_single(f"aud_{plow}_post_norm", lambda: self.rms_norm_core_dram(
             M=L_pad, N=H,
             A_DRAM_ADDR=self.AUD_FFN_OUT,
             OUTPUT_DRAM_ADDR=self.AUD_FFN_OUT,
-            GAMMA_DRAM_ADDR=w[f"{prefix}_POST_NORM"]),
+            GAMMA_DRAM_ADDR=w[f"{prefix}_POST_NORM"],
+            use_pbi=True),
             cache=cache, cache_key=_ck(f"{plow}_post_norm"))
 
         self._compile_and_run_single(f"aud_{plow}_half_residual",
@@ -3981,7 +6185,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=L_pad, N=H,
             A_DRAM_ADDR=IN_BUF,
             OUTPUT_DRAM_ADDR=IN_BUF,
-            GAMMA_DRAM_ADDR=w["NORM_OUT"]),
+            GAMMA_DRAM_ADDR=w["NORM_OUT"],
+            use_pbi=True),
             cache=cache, cache_key=f"aud_L{layer_idx}_norm_out")
 
     def run_audio_layer(self, layer_idx: int) -> int:
@@ -3996,6 +6201,138 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.compile_audio_layer_conv(layer_idx)
         self.compile_audio_layer_ffn2(layer_idx)
         self.compile_audio_layer_norm_out(layer_idx)
+        return self.AUD_IO_A
+
+    def _audio_encoder_bin_paths(self) -> tuple[str, str]:
+        cache_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
+        os.makedirs(cache_dir, exist_ok=True)
+        L_pad = self._aud_L_pad
+        bin_path = os.path.join(cache_dir, f"audio_encoder_{L_pad}f.bin")
+        meta_path = os.path.join(cache_dir, f"audio_encoder_{L_pad}f.json")
+        return bin_path, meta_path
+
+    def compile_audio_encoder_bin(self, input_features=None,
+                                    input_features_mask=None) -> str:
+        """Phase 3+A2.5: capture the entire audio pipeline (subsample stem +
+        12 Conformer layers + output_proj/RMSNorm/embedder) into a single
+        on-disk ISA bin. One trigger then drives everything forward.
+
+        If ``input_features`` is provided, the subsample stem is folded into
+        the bin (Phase A2.5 — true full-encoder one-shot). The caller must
+        have run ``audio_tensor_init`` first so AUD_IO_A is allocated;
+        ``audio_subsample_fpga`` (called inside the capture with
+        _oneshot_mode=True) routes its proj output directly to AUD_IO_A.
+
+        Skips if the bin and meta are already cached on disk. Returns the
+        bin path.
+        """
+        bin_path, meta_path = self._audio_encoder_bin_paths()
+        if os.path.exists(bin_path) and os.path.exists(meta_path):
+            print(f"  [Audio] encoder bin cached: {os.path.basename(bin_path)}")
+            return bin_path
+
+        L = self.AUD_LAYERS
+        L_pad = self._aud_L_pad
+        fold_subsample = input_features is not None
+        print(f"  [Audio] compiling {'subsample + ' if fold_subsample else ''}"
+              f"{L} layers into one-shot bin (L_pad={L_pad}) ...",
+              flush=True)
+        t_capture = time.perf_counter()
+
+        # CRITICAL: reset program DRAM addr BEFORE start_capture so any PBI
+        # baked into the capture targets the correct absolute address. The
+        # final load address must equal the program DRAM address used here
+        # (see fpga_pbi_jump_target_bake memory note).
+        saved_next = self._next_program_dram_addr
+        self.reset_program_dram_addr()
+
+        import builtins
+        _orig_print = builtins.print
+        global _SILENT_MODE
+        self._oneshot_mode = True
+        try:
+            _SILENT_MODE = True
+            builtins.print = lambda *a, **kw: None
+            self.clear_capture_buffer()
+            self.start_capture()
+            if fold_subsample:
+                t_sub = time.perf_counter()
+                # audio_subsample_fpga sees _oneshot_mode=True, routes proj
+                # output to AUD_IO_A, and skips the host-side read-back.
+                self.audio_subsample_fpga(input_features, input_features_mask)
+                _original_print(
+                    f"  [Audio] subsample captured in {time.perf_counter()-t_sub:.2f}s",
+                    flush=True)
+            for li in range(L):
+                t_layer = time.perf_counter()
+                self.compile_audio_layer_ffn1(li)
+                self.compile_audio_layer_attn(li)
+                self.compile_audio_layer_conv(li)
+                self.compile_audio_layer_ffn2(li)
+                self.compile_audio_layer_norm_out(li)
+                _original_print(
+                    f"  [Audio] layer {li+1}/{L} captured in {time.perf_counter()-t_layer:.2f}s",
+                    flush=True)
+            # Fold the embed+projector chain into the same one-shot bin so a
+            # single trigger drives encoder -> output_proj -> RMSNorm -> embedder.
+            # Final audio_features land in AUD_FEATURES_FINAL.
+            t_embed = time.perf_counter()
+            self._emit_aud_embed_project_chain()
+            _original_print(
+                f"  [Audio] embed+projector captured in {time.perf_counter()-t_embed:.2f}s",
+                flush=True)
+            self.stop_capture()
+            self.generate_instruction_halt()
+        finally:
+            builtins.print = _orig_print
+            _SILENT_MODE = False
+            self._oneshot_mode = False
+        self._next_program_dram_addr = saved_next
+
+        bin_bytes = bytearray()
+        for inst in self.capture_buffer:
+            bin_bytes.extend(inst.get_bytes())
+        self.clear_capture_buffer()
+
+        bin_tmp = bin_path + ".tmp"
+        meta_tmp = meta_path + ".tmp"
+        with open(bin_tmp, "wb") as f:
+            f.write(bin_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        with open(meta_tmp, "w") as f:
+            json.dump({
+                "aud_layers": L,
+                "aud_L_pad": L_pad,
+                "aud_num_frames": self._aud_num_frames,
+                "total_bytes": len(bin_bytes),
+            }, f, indent=2)
+        os.rename(bin_tmp, bin_path)
+        os.rename(meta_tmp, meta_path)
+        print(f"  [Audio] encoder bin: {len(bin_bytes)/1024/1024:.1f} MB "
+              f"in {time.perf_counter()-t_capture:.1f}s -> {os.path.basename(bin_path)}",
+              flush=True)
+        return bin_path
+
+    def run_audio_encoder_oneshot(self, bin_path: str | None = None) -> int:
+        """Load the cached audio-encoder bin into program DRAM and trigger
+        a single execute. The encoder seed must already be in AUD_IO_A and
+        all weight/tensor buffers initialized. Returns AUD_IO_A address."""
+        if bin_path is None:
+            bin_path, _ = self._audio_encoder_bin_paths()
+        with open(bin_path, "rb") as f:
+            bin_bytes = f.read()
+        # Bin was captured starting at reset_program_dram_addr() — load at
+        # the same address so absolute jump targets baked into PBI match.
+        self.reset_program_dram_addr()
+        prog_addr = self.get_program_dram_addr()
+        t0 = time.perf_counter()
+        self.dma_write(DMA_DEVICE_H2C, prog_addr, bin_bytes, len(bin_bytes))
+        self.allocate_program_dram(len(bin_bytes))
+        self.start_execute_from_dram(prog_addr)
+        self.wait_queue(600.0)
+        print(f"  [Audio] encoder one-shot exec done in {time.perf_counter()-t0:.2f}s "
+              f"({len(bin_bytes)/1024/1024:.1f} MB ISA)", flush=True)
         return self.AUD_IO_A
 
     def _aud_copy_buf(self, label: str, src: int, dst: int, n_elems: int,
@@ -4056,47 +6393,107 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
         self.DRAM_ADDR_ROPE_GLOBAL = addr
 
+    def _load_host_weights_from_combined_bin(self, host_section: dict, base_offset: int) -> None:
+        """mmap the combined weights bin and create read-only torch tensor
+        views over the host section. Zero-copy: nothing materializes in
+        RSS until a row is indexed.
+
+        `host_section["manifest"]` gives tensor offsets RELATIVE to the
+        host section start; we add `base_offset` (the host section's
+        absolute file offset) when creating the view.
+        """
+        sub = host_section["manifest"]
+
+        def _view(section_name: str) -> torch.Tensor:
+            s = sub[section_name]
+            shape = tuple(s["shape"])
+            n_elems = 1
+            for d in shape:
+                n_elems *= d
+            return torch.frombuffer(
+                self.weight_bin,
+                dtype=torch.bfloat16,
+                count=n_elems,
+                offset=base_offset + s["offset"],
+            ).reshape(shape)
+
+        self.embed_tokens_per_layer_weight = _view("embed_tokens_per_layer")
+        self.per_layer_model_proj_weight   = _view("per_layer_model_proj")
+        self.per_layer_proj_norm_weight    = _view("per_layer_proj_norm")
+        self._layer_scalars = list(sub["layer_scalars"])
+        self._kv_shared_map = {int(k): int(v) for k, v in sub.get("kv_shared_map", {}).items()}
+        print(f"[weight_init] host section mmap'd at file offset 0x{base_offset:X}: "
+              f"embed_tokens_per_layer={tuple(self.embed_tokens_per_layer_weight.shape)} bf16 "
+              f"({sub['embed_tokens_per_layer']['size']/1024**3:.2f} GiB, page-cached on demand)")
+
     def weight_init(self) -> None:
-        """Ensure weight bin exists (generate from HF if missing), load it, then initialize DRAM: embedding, layers from bin, RoPE, OUTPUT_NORM/LM_HEAD.
-        Also loads per-layer embedding and projection weights for host-side computation."""
+        """Ensure weight bin exists (generate from HF if missing), then mmap it
+        and initialize FPGA DRAM: embedding, layers from bin, RoPE, OUTPUT_NORM/LM_HEAD.
+
+        Host-side tensors needed for per-layer-input computation
+        (per_layer_embed_tokens, per_layer_model_proj, per_layer_proj_norm,
+        layer_scalars, kv_shared_map) come from `host_weights.bin` if it
+        exists, mmap'd so RSS stays minimal. Otherwise we fall back to
+        loading the HF model — which costs 6-12 GB host RAM and is OOM on
+        a 16 GB Raspberry Pi. The first run on a beefier machine should
+        generate the side-cache so subsequent runs anywhere can skip the
+        HF model entirely.
+        """
+        import mmap as _mmap
+
         full_path = os.path.join(self.script_dir, self._weights_bin_rel)
         if os.path.exists(full_path):
             print(f"Weight bin exists, skip generation: {full_path}")
         else:
             print(f"Weight bin not found, generating: {full_path}")
             weight_bin_generate(output_path=full_path)
-        with open(full_path, "rb") as f:
-            self.weight_bin = f.read()
 
-        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
-        text_model = model.model.language_model
+        # mmap the weight bin — read-only, OS pages in only what's touched.
+        # Replaces a 2.4 GB f.read() that pinned the whole bin in RSS.
+        self._weight_bin_fp = open(full_path, "rb")
+        self.weight_bin = _mmap.mmap(self._weight_bin_fp.fileno(), 0,
+                                     prot=_mmap.PROT_READ)
 
-        # Embedding: scale by sqrt(hidden_size)
-        embed = text_model.embed_tokens.weight.detach().cpu().to(torch.bfloat16)
-        embedding_scale = self.vector_length ** 0.5
-        self.embedding_weight = (embed.float() * embedding_scale).to(torch.bfloat16)
+        # Master manifest: one JSON per combined weight bin. Holds the
+        # offsets/sizes of the three sections (lm, vision, host) plus each
+        # section's sub-manifest. If missing, the bin was generated with
+        # the old multi-file layout and we need to regenerate.
+        master_meta_path = full_path.rsplit(".", 1)[0] + ".json"
+        if not os.path.exists(master_meta_path):
+            raise RuntimeError(
+                f"weights master manifest missing: {master_meta_path}\n"
+                f"This bin was produced by the old multi-file layout. "
+                f"Delete {full_path} (and any stale host_weights.bin / "
+                f"vision_weights.bin) and re-run gemma4_e2b_test.py to "
+                f"regenerate the combined bin.")
+        with open(master_meta_path, "r") as f:
+            self._weights_master = json.load(f)
 
-        # Per-layer embedding for host-side lookup: [262144, 8960], pre-scaled by sqrt(per_layer_input_dim)
-        per_layer_embed_scale = self.per_layer_input_dim ** 0.5  # sqrt(256) = 16.0
-        self.embed_tokens_per_layer_weight = (text_model.embed_tokens_per_layer.weight.detach().cpu().float() * per_layer_embed_scale).to(torch.bfloat16)
+        # Embedding: a zero-copy mmap view directly into the weight bin.
+        # No 770 MB host allocation; only the touched rows (one per decode
+        # token, ~3 KB) cost RSS. Read-only is fine because we only do
+        # `embedding_weight[token_ids]` lookups.
+        emb_cfg = self._cfg["special"]["embedding"]
+        token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
+        vocab_size  = self.EMBEDDING_ELEMENTS         # 262144
+        emb_dim     = self.vector_length              # 1536
+        self.embedding_weight = torch.frombuffer(
+            self.weight_bin,
+            dtype=torch.bfloat16,
+            count=vocab_size * emb_dim,
+            offset=token_embd_offset,
+        ).reshape(vocab_size, emb_dim)
 
-        # Per-layer model projection weight for host-side computation: [8960, 1536] (transposed for matmul)
-        self.per_layer_model_proj_weight = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16)  # [8960, 1536]
+        host_section = self._weights_master["host_section"]
+        self._load_host_weights_from_combined_bin(host_section, host_section["offset"])
 
-        # Per-layer projection norm weight for host-side computation (raw weight, no gamma_offset)
-        # Host-side norm uses w directly; gamma_offset is only for HW norm (HW internally adds 1.0)
-        self.per_layer_proj_norm_weight = text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16)  # [256]
-
-        # Layer scalars and KV sharing map
-        self._layer_scalars = []
-        for layer_idx in range(self.LAYER_SIZE):
-            layer = text_model.layers[layer_idx]
-            self._layer_scalars.append(layer.layer_scalar.item())
-            attn = layer.self_attn
-            if attn.is_kv_shared_layer and attn.kv_shared_layer_index is not None:
-                self._kv_shared_map[layer_idx] = attn.kv_shared_layer_index
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        # Tokenizer: from the bundled subset; full HF model not needed.
+        tok_subset = os.path.join(self.script_dir, "gemma4_e2b_bin", "tokenizer")
+        if os.path.exists(os.path.join(tok_subset, "tokenizer.json")):
+            tok_dir = tok_subset
+        else:
+            tok_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
+        self.tokenizer = AutoTokenizer.from_pretrained(tok_dir, trust_remote_code=True)
 
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         base_layer0 = self.weight_defs["BLK0_ATTN_NORM_WEIGHT"]
@@ -5185,14 +7582,35 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         return None, program_sizes, total_flops_list
 
     # ------------------------------------------------------------------
-    # Single instruction bin: prefill (all buckets) + decode (all buckets)
+    # Single-pass unified instruction bin
     # ------------------------------------------------------------------
-    def compile_instruction_bin(self, layer_size: int = 35) -> tuple[str, dict]:
-        """Compile prefill buckets + decode buckets into ONE capture session,
-        dump to gemma4_instruction.bin + gemma4_instruction.json. Mirrors
-        gemma3's single-bin pattern. Absolute addrs in the manifest are
-        baked against the program-DRAM address captured at start_capture,
-        so the loader MUST DMA the bin to that exact same base address.
+    # Captures LM (prefill+decode buckets) + vision encoder + audio
+    # encoder into ONE start_capture/stop_capture session. The resulting
+    # gemma4_instruction.bin is a self-contained artifact that the
+    # customer-facing run_from_bin script consumes directly: no
+    # incremental rewrites, no per-modality cache files, no extra DMA
+    # roundtrips between sections at runtime.
+    # ------------------------------------------------------------------
+    def compile_instruction_bin(self, layer_size: int = 35, *,
+                                  image_path: str | None = None,
+                                  audio_path: str | None = None) -> tuple[str, dict]:
+        """Compile LM core + vision encoder + audio encoder into one bin.
+
+        image_path / audio_path:
+          - When provided, fold the corresponding encoder ISA into the bin.
+            Only the canonical SHAPE of the sample matters (vision is forced
+            to ``VISION_CANONICAL_SIZE`` → fixed 2520 patches; audio is
+            forced by HF's processor to ``AUDIO_FIXED_SOFT_TOKENS = 128`` →
+            fixed T_raw). The sample content is irrelevant for the captured
+            ISA; the actual mel/pixel data is uploaded fresh at runtime.
+          - When ``None``, the corresponding section is omitted from the bin.
+          - When the caller wants the default behavior (build everything at
+            first run), main() passes ``DEFAULT_IMAGE`` / ``DEFAULT_AUDIO``.
+
+        Absolute addresses baked into the manifest are tied to the
+        program-DRAM address captured at ``start_capture`` time, so the
+        loader (``load_instruction_bin``) MUST DMA the bin to that exact
+        same base. PBI JUMP_ABS targets resolve against this base.
         """
         bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
         os.makedirs(bin_dir, exist_ok=True)
@@ -5202,6 +7620,113 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         prefill_buckets = self._cfg["model"]["prefill_seq_len_buckets"]
         decoder_buckets = self._cfg["model"]["decoder_seq_len_buckets"]
 
+        # ------------------------------------------------------------------
+        # 1. Host-side: derive canonical encoder inputs (shape only) and
+        # upload encoder weights. Done BEFORE start_capture so weight uploads
+        # (host DMAs, not FPGA ISA) and tensor allocations don't pollute the
+        # captured buffer.
+        # ------------------------------------------------------------------
+        hf_model = None
+        pixel_position_ids = None
+        padding_positions = None
+        num_patches = None
+        cos_pad_tiled = neg_sin_pad_tiled = sin_hi_pad_tiled = None
+        pos_hash = None
+        audio_input_features = None
+        audio_input_features_mask = None
+        audio_T_raw = None
+
+        if image_path is not None or audio_path is not None:
+            from transformers import AutoProcessor
+            hf_model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
+            hf_model.eval()
+            processor = AutoProcessor.from_pretrained(model_dir)
+
+            if image_path is not None:
+                from PIL import Image
+                image = Image.open(image_path).convert("RGB")
+                image = image.resize(VISION_CANONICAL_SIZE, Image.BICUBIC)
+                conversation = [{"role": "user", "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "describe this image"},
+                ]}]
+                text_prompt = processor.apply_chat_template(
+                    conversation, add_generation_prompt=True, tokenize=False)
+                vision_inputs = processor(text=[text_prompt], images=[[image]],
+                                            return_tensors="pt")
+                pixel_position_ids = vision_inputs['image_position_ids']
+                padding_positions = (pixel_position_ids == -1).all(dim=-1)
+                num_patches = pixel_position_ids.shape[1]
+                assert num_patches == VISION_FIXED_NUM_PATCHES, (
+                    f"Vision shape contract broken: got num_patches={num_patches}, "
+                    f"expected {VISION_FIXED_NUM_PATCHES}.")
+
+            if audio_path is not None:
+                try:
+                    import soundfile as sf
+                except ImportError as e:
+                    raise RuntimeError(
+                        "soundfile is required for audio. `pip install soundfile`.") from e
+                audio_array, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+                if audio_array.ndim > 1:
+                    audio_array = audio_array.mean(axis=-1)
+                target_sr = getattr(processor.feature_extractor, "sampling_rate", 16000)
+                if sr != target_sr:
+                    t = torch.from_numpy(audio_array).float().unsqueeze(0).unsqueeze(0)
+                    t = F.interpolate(t, size=int(audio_array.shape[0] * target_sr / sr),
+                                        mode="linear", align_corners=False)
+                    audio_array = t.squeeze().numpy()
+                conversation = [{"role": "user", "content": [
+                    {"type": "audio"},
+                    {"type": "text", "text": "transcribe"},
+                ]}]
+                text_prompt = processor.apply_chat_template(
+                    conversation, add_generation_prompt=True, tokenize=False)
+                audio_inputs = processor(
+                    text=[text_prompt], audio=[audio_array],
+                    sampling_rate=target_sr, return_tensors="pt")
+                audio_input_features = audio_inputs["input_features"]
+                audio_input_features_mask = audio_inputs.get("input_features_mask")
+                audio_T_raw = int(audio_input_features.shape[1])
+
+            # Encoder weight uploads (host DMA, no ISA emit).
+            if image_path is not None:
+                print(f"[instr-bin] Uploading vision encoder weights...")
+                self.vision_weight_init(hf_model)
+            if audio_path is not None:
+                # audio_weight_init routes weights into the dedicated Weight
+                # Audio params region (0x6c000000-0x78000000) and restores
+                # the tensor cursor on exit — see audio_weight_init.
+                self.audio_weight_init(hf_model, reset_allocator=False)
+
+            # Vision rope_pads (canonical: pixel_position_ids only depends on
+            # the canonical image grid, so the result is reusable across any
+            # input image at runtime).
+            if image_path is not None:
+                cos_pad_tiled, neg_sin_pad_tiled, sin_hi_pad_tiled = \
+                    self._load_or_build_vision_rope_pads(
+                        hf_model, pixel_position_ids, num_patches)
+                import hashlib
+                pos_hash = hashlib.sha256(
+                    pixel_position_ids.detach().cpu().contiguous().numpy().tobytes()
+                ).hexdigest()
+
+        # Save the LM tensor cursor before vision_tensor_init (vision reuses
+        # LM tensor DRAM by resetting the cursor); restored before audio so
+        # audio intermediates land after LM tensors as designed.
+        _lm_tensor_dram_save = self._tensor_dram_addr
+
+        # ------------------------------------------------------------------
+        # 2. Capture LM section (independent capture session).
+        # ------------------------------------------------------------------
+        # Each section uses its OWN start_capture/stop_capture session so
+        # the per-session capture_count stays under the engine's
+        # MAX_DECODER_INSTRUCTIONS cap. The on-disk bin still ends up as a
+        # single file (we concatenate the section bytes below). PBI
+        # JUMP_ABS targets in each section bake against the section's
+        # absolute target address (controlled via _program_dram_base /
+        # _next_program_dram_addr), so the loader sees a contiguous bin
+        # with valid jump targets across the whole region.
         global _SILENT_MODE
         _SILENT_MODE = True
         self.clear_inst_id()
@@ -5209,24 +7734,18 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.start_capture()
         self.generate_instruction_flag_clear()
 
-        # PBI bakes JUMP_ABS targets against get_program_dram_addr() at capture
-        # time. We never call allocate_program_dram between buckets, so the
-        # base addr stays fixed for the whole capture session.
         instruction_base_addr = self.get_program_dram_addr()
 
         prefill_program_starts: list[int] = []
         prefill_program_sizes:  list[int] = []
         prefill_total_flops:    list[int] = []
 
-        print(f"[instr-bin] Compiling {len(prefill_buckets)} prefill buckets...")
+        _original_print(f"[instr-bin] Compiling {len(prefill_buckets)} prefill buckets...")
         for bi, bucket_seq_len in enumerate(prefill_buckets):
             count_at_start = self.capture_count
             t0 = time.perf_counter()
-            # compile_prefill expects the caller-visible seq_len (it does -=1
-            # internally). The bucket size IS the post-decrement target, so
-            # pass bucket+1 to match.
             _, flops = self.compile_prefill(seq_len=bucket_seq_len + 1,
-                                            layer_size=layer_size)
+                                              layer_size=layer_size)
             size_bytes = (self.capture_count - count_at_start) * 32
             prefill_program_starts.append(instruction_base_addr + count_at_start * 32)
             prefill_program_sizes.append(size_bytes)
@@ -5235,12 +7754,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                             f"seq_len={bucket_seq_len} → {size_bytes/1024:.1f} KB "
                             f"({time.perf_counter()-t0:.1f}s)")
 
-        # Decoder: compile_decoder loops all buckets internally in shared mode.
         decoder_count_at_start = self.capture_count
-        print(f"[instr-bin] Compiling {len(decoder_buckets)} decoder buckets...")
+        _original_print(f"[instr-bin] Compiling {len(decoder_buckets)} decoder buckets...")
         _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
             layer_size=layer_size)
-        # Compute absolute start addrs per decoder bucket from cumulative sizes
         decoder_program_starts: list[int] = []
         cursor = instruction_base_addr + decoder_count_at_start * 32
         for sz in decoder_program_sizes:
@@ -5248,19 +7765,145 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             cursor += sz
 
         self.stop_capture()
+        lm_bytes = bytearray()
+        for inst in self.capture_buffer:
+            lm_bytes.extend(inst.get_bytes())
+        self.clear_capture_buffer()
+        lm_size_bytes = len(lm_bytes)
+        _original_print(f"[instr-bin] LM section: {lm_size_bytes/1024/1024:.1f} MB")
+
+        # ------------------------------------------------------------------
+        # 3. Capture vision section (independent session, one-shot mode).
+        # ------------------------------------------------------------------
+        vision_program_size = 0
+        vision_target_addr = instruction_base_addr + lm_size_bytes
+        vision_bytes = bytearray()
+        if image_path is not None:
+            # vision_tensor_init resets the tensor cursor (vision reuses LM
+            # tensor DRAM). program_base controls vision's PBI bake base.
+            self.vision_tensor_init(num_patches, program_base=vision_target_addr)
+            self.set_vision_attention_bias(padding_positions)
+            self.dma_to_accelerator_memory(self.VIS_ROPE_COS_PAD_TILED, cos_pad_tiled)
+            self.dma_to_accelerator_memory(self.VIS_ROPE_NEG_SIN_PAD_TILED, neg_sin_pad_tiled)
+            self.dma_to_accelerator_memory(self.VIS_ROPE_SIN_HI_PAD_TILED, sin_hi_pad_tiled)
+
+            _original_print(f"[instr-bin] Compiling vision encoder at 0x{vision_target_addr:X}...")
+            nf_pbi = os.environ.get("GEMMA4_VISION_PBI_NONFLASH", "1") == "1"
+            self._vis_use_pbi_nonflash = nf_pbi
+            self.clear_inst_id()
+            self.clear_capture_buffer()
+            self.start_capture()
+            self._oneshot_mode = True
+            t_vis = time.perf_counter()
+            try:
+                for li in range(self.VIS_LAYERS):
+                    t_layer = time.perf_counter()
+                    self.compile_vision_layer(li)
+                    self.host_vision_v_norm_rope_gather(li)
+                    self.run_vision_attention_all_heads(li)
+                    self.compile_vision_layer_post_attn(li)
+                    _original_print(f"  [vision layer {li+1}/{self.VIS_LAYERS}] "
+                                    f"{time.perf_counter()-t_layer:.2f}s")
+                self.generate_instruction_halt()
+            finally:
+                self._oneshot_mode = False
+            self.stop_capture()
+            for inst in self.capture_buffer:
+                vision_bytes.extend(inst.get_bytes())
+            self.clear_capture_buffer()
+            vision_program_size = len(vision_bytes)
+            _original_print(f"[instr-bin] Vision section: {vision_program_size/1024/1024:.1f} MB "
+                            f"({time.perf_counter()-t_vis:.1f}s)")
+
+        # ------------------------------------------------------------------
+        # 4. Capture audio section (independent session, one-shot mode).
+        # ------------------------------------------------------------------
+        audio_program_size = 0
+        audio_target_addr = vision_target_addr + vision_program_size
+        audio_L_pad = None
+        audio_bytes = bytearray()
+        if audio_path is not None:
+            # Restore LM tensor cursor — vision_tensor_init reset it for VIS_*
+            # allocations; audio intermediates stack after LM tensor end.
+            self._tensor_dram_addr = _lm_tensor_dram_save
+
+            H0 = (audio_T_raw + 2 - 3) // 2 + 1
+            H1 = (H0 + 2 - 3) // 2 + 1
+            T_sub = H1
+            self.audio_tensor_init(T_sub)
+            audio_L_pad = self._aud_L_pad
+
+            # Set program-DRAM bake base so audio PBI JUMP_ABS targets land
+            # in the audio section of the final concatenated bin.
+            self._next_program_dram_addr = audio_target_addr
+            self._program_dram_base = audio_target_addr
+
+            _original_print(f"[instr-bin] Compiling audio encoder at 0x{audio_target_addr:X}...")
+            self.clear_inst_id()
+            self.clear_capture_buffer()
+            self.start_capture()
+            self._oneshot_mode = True
+            t_aud = time.perf_counter()
+            try:
+                # Subsample: host DMAs (sample mel upload + scratch zero) +
+                # FPGA emit. proj routes its output to AUD_IO_A in one-shot
+                # mode. The sample upload here lands in FPGA DRAM at compile
+                # time; at runtime we overwrite with the actual mel.
+                self.audio_subsample_fpga(audio_input_features, audio_input_features_mask)
+                for li in range(self.AUD_LAYERS):
+                    t_layer = time.perf_counter()
+                    self.compile_audio_layer_ffn1(li)
+                    self.compile_audio_layer_attn(li)
+                    self.compile_audio_layer_conv(li)
+                    self.compile_audio_layer_ffn2(li)
+                    self.compile_audio_layer_norm_out(li)
+                    _original_print(f"  [audio layer {li+1}/{self.AUD_LAYERS}] "
+                                    f"{time.perf_counter()-t_layer:.2f}s")
+                self._emit_aud_embed_project_chain()
+                self.generate_instruction_halt()
+            finally:
+                self._oneshot_mode = False
+            self.stop_capture()
+            for inst in self.capture_buffer:
+                audio_bytes.extend(inst.get_bytes())
+            self.clear_capture_buffer()
+            audio_program_size = len(audio_bytes)
+            _original_print(f"[instr-bin] Audio section: {audio_program_size/1024/1024:.1f} MB "
+                            f"({time.perf_counter()-t_aud:.1f}s)")
+
         _SILENT_MODE = False
 
+        # ------------------------------------------------------------------
+        # 5. Concatenate section bytes + optional rope blob; write atomically.
+        # ------------------------------------------------------------------
         all_bytes = bytearray()
-        for inst in self.capture_buffer:
-            all_bytes.extend(inst.get_bytes())
-        with open(bin_path, "wb") as f:
-            f.write(all_bytes)
+        all_bytes.extend(lm_bytes)
+        all_bytes.extend(vision_bytes)
+        all_bytes.extend(audio_bytes)
+        program_size = len(all_bytes)
+
+        if cos_pad_tiled is not None:
+            cos_b     = cos_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes()
+            neg_sin_b = neg_sin_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes()
+            sin_hi_b  = sin_hi_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes()
+            rope_blob = cos_b + neg_sin_b + sin_hi_b
+        else:
+            cos_b = neg_sin_b = sin_hi_b = rope_blob = b""
+
+        final_bytes = bytes(all_bytes) + rope_blob
+
+        bin_tmp  = bin_path  + ".tmp"
+        meta_tmp = meta_path + ".tmp"
+        with open(bin_tmp, "wb") as f:
+            f.write(final_bytes)
+            f.flush()
+            os.fsync(f.fileno())
 
         manifest = {
             "compile_version": INSTRUCTION_BIN_COMPILE_VERSION,
             "instruction_bin": os.path.relpath(bin_path, self.script_dir),
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
-            "instruction_total_size": len(all_bytes),
+            "instruction_total_size": program_size,
             "prefill_seq_len_buckets": list(prefill_buckets),
             "prefill_program_start_addrs": [f"0x{a:X}" for a in prefill_program_starts],
             "prefill_program_sizes": prefill_program_sizes,
@@ -5270,14 +7913,65 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             "decoder_program_sizes": decoder_program_sizes,
             "decoder_total_flops": decoder_total_flops,
             "layer_size": layer_size,
-            "contains_vision": False,
-            "contains_audio":  False,
+            "contains_vision": image_path is not None,
+            "contains_audio":  audio_path is not None,
         }
-        with open(meta_path, "w") as f:
+        if image_path is not None:
+            manifest["vision_program_start_addr"] = f"0x{vision_target_addr:X}"
+            manifest["vision_program_size"]    = vision_program_size
+            manifest["vision_num_patches"]     = num_patches
+            manifest["vision_layers_per_group"] = self.VIS_LAYERS
+            manifest["vision_groups"]          = [[0, self.VIS_LAYERS]]
+            manifest["vision_group_offsets"]   = [0]
+            manifest["vision_group_sizes"]     = [vision_program_size]
+            if rope_blob:
+                cos_off     = program_size
+                neg_sin_off = cos_off + len(cos_b)
+                sin_hi_off  = neg_sin_off + len(neg_sin_b)
+                manifest["vision_rope_cos_offset"]     = cos_off
+                manifest["vision_rope_cos_size"]       = len(cos_b)
+                manifest["vision_rope_neg_sin_offset"] = neg_sin_off
+                manifest["vision_rope_neg_sin_size"]   = len(neg_sin_b)
+                manifest["vision_rope_sin_hi_offset"]  = sin_hi_off
+                manifest["vision_rope_sin_hi_size"]    = len(sin_hi_b)
+                if pos_hash:
+                    manifest["vision_rope_position_ids_sha256"] = pos_hash
+        if audio_path is not None:
+            manifest["audio_program_start_addr"] = f"0x{audio_target_addr:X}"
+            manifest["audio_program_size"]      = audio_program_size
+            manifest["audio_T_raw"]             = audio_T_raw
+            manifest["audio_L_pad"]             = audio_L_pad
+            manifest["audio_layers"]            = self.AUD_LAYERS
+            manifest["audio_fixed_soft_tokens"] = AUDIO_FIXED_SOFT_TOKENS
+        manifest["total_file_size"] = len(final_bytes)
+
+        with open(meta_tmp, "w") as f:
             json.dump(manifest, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(bin_tmp, bin_path)
+        os.rename(meta_tmp, meta_path)
 
         self.clear_capture_buffer()
-        print(f"[instr-bin] Wrote {len(all_bytes)/1024/1024:.2f} MB → {bin_path}")
+        if hf_model is not None:
+            del hf_model
+
+        # Restore tensor / program cursors to LM-end / LM-base so that a
+        # subsequent _run_vision_encoder_fpga or _run_audio_encoder_fpga in
+        # the SAME process sees the same allocator state a fresh process
+        # would (i.e. cursor at LM tensor end). Without this, the audio
+        # encoder buffers re-allocated during the runtime call would land
+        # at addresses different from those baked into the captured audio
+        # ISA, producing NaN audio_features.
+        self._tensor_dram_addr = _lm_tensor_dram_save
+        self._next_program_dram_addr = instruction_base_addr
+        self._program_dram_base = instruction_base_addr
+
+        print(f"[instr-bin] Wrote {len(final_bytes)/1024/1024:.2f} MB → {bin_path}")
+        print(f"[instr-bin]   LM: {lm_size_bytes/1024/1024:.1f} MB"
+              + (f"  +Vision: {vision_program_size/1024/1024:.1f} MB" if image_path else "")
+              + (f"  +Audio: {audio_program_size/1024/1024:.1f} MB" if audio_path else "")
+              + (f"  +rope_pads: {len(rope_blob)/1024/1024:.2f} MB" if rope_blob else ""))
         print(f"[instr-bin] Manifest: {meta_path}")
         return bin_path, manifest
 
@@ -5295,25 +7989,31 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 f"Instruction bin missing: {bin_path}. Run compile_instruction_bin() first.")
         with open(meta_path, "r") as f:
             manifest = json.load(f)
-        # Read only the program region (instruction_total_size bytes). Any
-        # trailing data sections (rope pads etc.) live in the file but are
-        # read on demand by the caller (e.g. vision setup) and DMA'd to
-        # tensor DRAM, not program DRAM.
+        # Read only the program region (instruction_total_size bytes) via
+        # chunked DMA from disk, avoiding a ~1 GB f.read() that would spike
+        # host RSS (problematic on 16 GB Raspberry Pi). Read in 64 MB chunks
+        # so peak transient is bounded — the dma_write transfers to FPGA
+        # then we drop the chunk before reading the next one.
         prog_size = manifest["instruction_total_size"]
-        with open(bin_path, "rb") as f:
-            bin_bytes = f.read(prog_size)
-        if len(bin_bytes) != prog_size:
-            raise RuntimeError(
-                f"Truncated instruction bin: read {len(bin_bytes)} of {prog_size} bytes.")
-
         base_addr = int(manifest["instruction_base_addr"], 16)
         cur_addr  = self.get_program_dram_addr()
         if cur_addr != base_addr:
             # Rewind allocator so the bin lands at the baked base. The PBI
             # JUMP_ABS targets in the bin reference that exact address.
             self._next_program_dram_addr = base_addr
-        self.dma_write(DMA_DEVICE_H2C, base_addr, bin_bytes, len(bin_bytes))
-        self.allocate_program_dram(len(bin_bytes))
+        CHUNK = 64 * 1024 * 1024
+        bytes_written = 0
+        with open(bin_path, "rb") as _f:
+            while bytes_written < prog_size:
+                sz = min(CHUNK, prog_size - bytes_written)
+                chunk = _f.read(sz)
+                if len(chunk) != sz:
+                    raise RuntimeError(
+                        f"Truncated instruction bin: read {bytes_written + len(chunk)} of {prog_size} bytes.")
+                self.dma_write(DMA_DEVICE_H2C, base_addr + bytes_written, chunk, sz)
+                bytes_written += sz
+                del chunk
+        self.allocate_program_dram(prog_size)
 
         # Resolve addr strings → ints for caller convenience.
         manifest["_prefill_addrs_int"] = [int(a, 16) for a in manifest["prefill_program_start_addrs"]]
@@ -5323,18 +8023,24 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             manifest["_vision_addr_int"] = int(manifest["vision_program_start_addr"], 16)
         if manifest.get("contains_audio") and "audio_program_start_addr" in manifest:
             manifest["_audio_addr_int"] = int(manifest["audio_program_start_addr"], 16)
-        print(f"[instr-bin] Loaded {len(bin_bytes)/1024/1024:.2f} MB at 0x{base_addr:X}"
+        print(f"[instr-bin] Loaded {prog_size/1024/1024:.2f} MB at 0x{base_addr:X}"
               + (" (+vision)" if manifest.get("contains_vision") else "")
               + (" (+audio)"  if manifest.get("contains_audio") else ""))
         return manifest
 
     # ------------------------------------------------------------------
-    # Incremental extension: append vision encoder ISA to the unified bin
+    # LEGACY (commented out 2026-05-21):
+    # Incremental vision extension. Folded into single-pass
+    # compile_instruction_bin (which captures LM+vision+audio in one
+    # session). Kept here in source for fast revival if we ever need the
+    # add-vision-later workflow back (e.g. if vision becomes input-
+    # shape-dependent or we ship LM-only bins separately).
     # ------------------------------------------------------------------
+    """
     def extend_instruction_bin_with_vision(self, num_patches: int,
                                             rope_pads_tuple: tuple | None = None,
                                             position_ids_sha256: str | None = None) -> dict:
-        """Append the vision encoder program to gemma4_instruction.bin so
+        '''Append the vision encoder program to gemma4_instruction.bin so
         the unified bin holds LM + vision in one file. The vision ISA is
         compiled with PBI baked against `lm_base + lm_size`, exactly where
         the new bytes land at runtime — so JUMP_ABS targets in the vision
@@ -5361,7 +8067,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
           - instruction_total_size is updated to include the vision bytes
 
         Returns the updated manifest dict (with int addrs resolved).
-        """
+        '''
         bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
         bin_path  = os.path.join(bin_dir, "gemma4_instruction.bin")
         meta_path = os.path.join(bin_dir, "gemma4_instruction.json")
@@ -5522,6 +8228,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
               f" (program region {program_size/1024/1024:.2f} MB, data region {len(rope_blob)/1024/1024:.2f} MB)")
         print(f"[instr-bin] Manifest updated: contains_vision=true, vision at 0x{vision_target_addr:X}")
         return manifest
+    """
+    # End of LEGACY extend_instruction_bin_with_vision (commented out).
 
     # ------------------------------------------------------------------
     # Bucketed prefill dispatch (used with single instruction bin)
@@ -5715,14 +8423,9 @@ def main():
     #   * --audio PATH             → audio with that file
     #   * --audio-enable (no path) → audio with the shipped default file
     #   * none of the above        → pure LM
-    # Default example inputs live in a shared test_samples directory at the
-    # template level (two levels up from this script). Multiple model folders
-    # can share the same example files.
-    _HERE = os.path.dirname(os.path.abspath(__file__))
-    _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))
-    DEFAULT_IMAGE = os.path.join(_TEST_SAMPLES, "yosemite.jpg")
-    DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
-
+    # Default example inputs (DEFAULT_IMAGE / DEFAULT_AUDIO) are module
+    # constants — defined once at the top of the file and reused by
+    # compile_instruction_bin's cold-start build.
     vision_on = bool(args.image) or args.vision_enable
     audio_on = bool(args.audio) or args.audio_enable
     if vision_on and audio_on:
@@ -5738,6 +8441,33 @@ def main():
         raise SystemExit(f"Audio file not found: {audio_path}")
 
     ue = Gemma4_UnifiedEngine(local_weights=args.local_weights)
+
+    # ------------------------------------------------------------------
+    # Cold-start build: if the unified bin is missing, generate it ONCE
+    # containing LM + vision + audio. Subsequent runs (and run_from_bin)
+    # just load the bin and execute. This is the build-everything-upfront
+    # contract: no incremental per-modality compile, no separate audio
+    # encoder bin. Uses DEFAULT_IMAGE / DEFAULT_AUDIO as canonical-shape
+    # samples — actual content is irrelevant since the bin holds ISA
+    # only; the actual pixel/mel data is uploaded fresh at runtime.
+    # ------------------------------------------------------------------
+    bin_dir = os.path.join(SCRIPT_DIR, "gemma4_e2b_bin")
+    instr_bin = os.path.join(bin_dir, "gemma4_instruction.bin")
+    instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
+    if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
+        print(f"\n--- First-time compile: building LM + vision + audio into gemma4_instruction.bin ---")
+        timer = time.perf_counter()
+        ue.compile_instruction_bin(image_path=DEFAULT_IMAGE,
+                                    audio_path=DEFAULT_AUDIO)
+        print(f"[compile] unified bin built in {time.perf_counter() - timer:.2f} seconds")
+    else:
+        print(f"[compile] gemma4_instruction.bin already present, skipping ISA emission.")
+
+    # Load the unified bin once; both VLM and audio reload it after their
+    # tensor allocator state changes, but the first load primes
+    # the decoder-base pointers used by the LM dispatch below.
+    manifest = ue.load_instruction_bin()
+
     if vision_on:
         print(f"[Mode] VLM — image: {image_path}")
         ue.set_prefill_seq_vlm(image_path, prompt=args.prompt)
@@ -5756,21 +8486,10 @@ def main():
               "skipping prefill+decode.")
         return
 
-    print(f"\n--- Compiling LM (host-side ISA emission) ---")
-    # Single instruction bin: all prefill buckets + all decode buckets
-    # in one capture, dumped to gemma4_instruction.bin + .json. This is
-    # the only supported path. The legacy per-prompt prefill + standalone
-    # decoder bins are no longer produced or consumed by main.
-    bin_dir = os.path.join(SCRIPT_DIR, "gemma4_e2b_bin")
-    instr_bin = os.path.join(bin_dir, "gemma4_instruction.bin")
-    instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
-    if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
-        timer = time.perf_counter()
-        ue.compile_instruction_bin()
-        print(f"[compile] instruction bin built in {time.perf_counter() - timer:.2f} seconds")
-    else:
-        print(f"[compile] instruction bin already present, skipping ISA emission.")
-    manifest = ue.load_instruction_bin()
+    # Re-load manifest in case set_prefill_seq_vlm/audio re-loaded the bin
+    # (they do, after their tensor allocations change). For LM-only the
+    # initial load above is the one used.
+    manifest = ue.load_instruction_bin() if (vision_on or audio_on) else manifest
     decoder_program_sizes = manifest["decoder_program_sizes"]
     flops_per_token = manifest["decoder_total_flops"]
     decoder_base_addr = manifest["_decoder_addrs_int"][0]
