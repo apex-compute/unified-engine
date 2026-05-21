@@ -1,0 +1,26 @@
+{
+  "model": {
+    "name": "MobileNetV2-1.0",
+    "input_size": 640,
+    "width_mult": 1.0,
+    "num_classes": 1001
+  },
+  "paths": {
+    "hf_model_repo": "google/mobilenet_v2_1.0_224",
+    "hf_model_dir": "mobilenetv2_bin/hf_model",
+    "weights_bin": "mobilenetv2_bin/weights_mobilenetv2.bin"
+  },
+  "backbone": {
+    "stem_out_channels": 32,
+    "head_out_channels": 1280,
+    "inverted_residual_setting": [
+      [1, 16, 1, 1],
+      [6, 24, 2, 2],
+      [6, 32, 3, 2],
+      [6, 64, 4, 2],
+      [6, 96, 3, 1],
+      [6, 160, 3, 2],
+      [6, 320, 1, 1]
+    ]
+  }
+}
