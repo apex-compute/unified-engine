@@ -80,6 +80,22 @@ DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
 # scratch rather than incrementally extended.
 INSTRUCTION_BIN_COMPILE_VERSION = "v1"
 
+# We run on FPGA + CPU only; disable CUDA before importing torch so PyTorch
+# doesn't probe the GPU driver (avoids a noisy "Error 804: forward compatibility"
+# warning on hosts whose CUDA driver/runtime doesn't match the installed GPU).
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "0")
+
+# Embedding table is read zero-copy from the read-only mmap'd weight bin via
+# torch.frombuffer (avoids a 770 MB host allocation). We never write to it,
+# so the "buffer is not writable" UserWarning is harmless — silence it.
+import warnings as _warnings
+_warnings.filterwarnings(
+    "ignore",
+    message="The given buffer is not writable",
+    category=UserWarning,
+)
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
@@ -622,9 +638,19 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         # Vision setup. Pass program_base so PBI baking in subsequent compile
         # (if we need to extend) targets the right unified-bin address.
-        self.vision_weight_init(hf_model)
-        self.vision_tensor_init(num_patches, program_base=vision_target_addr)
-        self.set_vision_attention_bias(padding_positions)
+        # Silence library tile-planner prints across the setup block
+        # (belt-and-suspenders: _SILENT_MODE + builtins.print swap).
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        _orig_builtin_print = builtins.print
+        builtins.print = lambda *a, **kw: None
+        try:
+            self.vision_weight_init(hf_model)
+            self.vision_tensor_init(num_patches, program_base=vision_target_addr)
+            self.set_vision_attention_bias(padding_positions)
+        finally:
+            _SILENT_MODE = False
+            builtins.print = _orig_builtin_print
 
         # 2D-RoPE tables (cos / neg_sin / sin_hi tiled+padded) for FPGA RoPE.
         # If the unified bin already contains rope pads (subsequent VLM run),
@@ -884,28 +910,41 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # buffers 80 MB lower → bin reads uninitialized memory → NaN audio
         # features → all-<pad> decode. So we run vision_weight_init at audio
         # runtime too (cheap: loads from combined weight bin's vision_section).
-        self.vision_weight_init(hf_model)
-        self.audio_weight_init(hf_model, reset_allocator=False)
-        self.audio_tensor_init(T_sub)
-        L_pad = self._aud_L_pad
-        H = self.AUD_H
-
-        # Host DMAs: upload mel + zero scratch via audio_subsample_fpga in
-        # capture-suppressed mode (capture_buffer=None) so FPGA emits are
-        # no-ops while host DMAs still move bytes to FPGA DRAM.
-        _saved_capture_buffer = self.capture_buffer
-        _saved_capture_count  = self.capture_count
-        _saved_is_capture_on  = self.is_capture_on
-        self.capture_buffer = None
-        self.is_capture_on  = False
-        self._oneshot_mode  = True
+        # Silence the library's tile-planner prints across the encoder
+        # init + subsample setup. _SILENT_MODE catches anything routed
+        # through our `quiet_print` wrapper; the builtins.print swap catches
+        # library prints that pre-captured a reference to the original
+        # builtin (belt-and-suspenders).
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        _orig_builtin_print = builtins.print
+        builtins.print = lambda *a, **kw: None
         try:
-            self.audio_subsample_fpga(input_features, input_features_mask)
+            self.vision_weight_init(hf_model)
+            self.audio_weight_init(hf_model, reset_allocator=False)
+            self.audio_tensor_init(T_sub)
+            L_pad = self._aud_L_pad
+            H = self.AUD_H
+
+            # Host DMAs: upload mel + zero scratch via audio_subsample_fpga in
+            # capture-suppressed mode (capture_buffer=None) so FPGA emits are
+            # no-ops while host DMAs still move bytes to FPGA DRAM.
+            _saved_capture_buffer = self.capture_buffer
+            _saved_capture_count  = self.capture_count
+            _saved_is_capture_on  = self.is_capture_on
+            self.capture_buffer = None
+            self.is_capture_on  = False
+            self._oneshot_mode  = True
+            try:
+                self.audio_subsample_fpga(input_features, input_features_mask)
+            finally:
+                self._oneshot_mode  = False
+                self.capture_buffer = _saved_capture_buffer
+                self.capture_count  = _saved_capture_count
+                self.is_capture_on  = _saved_is_capture_on
         finally:
-            self._oneshot_mode  = False
-            self.capture_buffer = _saved_capture_buffer
-            self.capture_count  = _saved_capture_count
-            self.is_capture_on  = _saved_is_capture_on
+            _SILENT_MODE = False
+            builtins.print = _orig_builtin_print
         self.dma_to_accelerator_memory(self.AUD_IO_A,
             torch.zeros(L_pad * H, dtype=torch.bfloat16))
 

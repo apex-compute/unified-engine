@@ -78,6 +78,12 @@ DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
 # scratch rather than incrementally extended.
 INSTRUCTION_BIN_COMPILE_VERSION = "v1"
 
+# We run on FPGA + CPU only; disable CUDA before importing torch so PyTorch
+# doesn't probe the GPU driver (avoids a noisy "Error 804: forward compatibility"
+# warning on hosts whose CUDA driver/runtime doesn't match the installed GPU).
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "0")
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForImageTextToText, AutoTokenizer
@@ -1244,9 +1250,19 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         # Replicate the compile-time allocator order so addresses baked into
         # the vision ISA resolve to the same DRAM bytes at runtime.
-        self.vision_weight_init(hf_model)
-        self.vision_tensor_init(num_patches, program_base=vision_target_addr)
-        self.set_vision_attention_bias(padding_positions)
+        # Silence library tile-planner prints across the setup block
+        # (belt-and-suspenders: _SILENT_MODE + builtins.print swap).
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        _orig_builtin_print = builtins.print
+        builtins.print = lambda *a, **kw: None
+        try:
+            self.vision_weight_init(hf_model)
+            self.vision_tensor_init(num_patches, program_base=vision_target_addr)
+            self.set_vision_attention_bias(padding_positions)
+        finally:
+            _SILENT_MODE = False
+            builtins.print = _orig_builtin_print
 
         # 2D-RoPE tables live in the bin's trailing data region; slice them
         # out and DMA to the vision tensor buffers.
@@ -1487,31 +1503,44 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # ALSO run vision_weight_init at audio runtime (cheap: it loads
         # from the combined weight bin's vision_section, no HF model
         # required) purely to match the cursor state.
-        self.vision_weight_init(hf_model)
-        self.audio_weight_init(hf_model, reset_allocator=False)
-        self.audio_tensor_init(T_sub)
-        L_pad = self._aud_L_pad
-        H = self.AUD_H
-
-        # Host DMAs: upload actual mel input + zero subsample scratch +
-        # zero encoder input. audio_subsample_fpga in oneshot mode runs the
-        # host setup (upload AUD_SUB_INPUT, zero AUD_SUB_R_COMBINED/PATCHES1
-        # and lazy-allocates AUD_SUB_* if not yet present); we suppress the
-        # ISA emit by clearing capture_buffer to None so emits become no-ops
-        # while the host DMAs still move bytes to FPGA DRAM.
-        _saved_capture_buffer = self.capture_buffer
-        _saved_capture_count  = self.capture_count
-        _saved_is_capture_on  = self.is_capture_on
-        self.capture_buffer = None      # suppress FPGA ISA emit
-        self.is_capture_on  = False
-        self._oneshot_mode  = True
+        # Silence the library's tile-planner prints across the encoder
+        # init + subsample setup. _SILENT_MODE catches anything routed
+        # through our `quiet_print` wrapper; the builtins.print swap catches
+        # library prints that pre-captured a reference to the original
+        # builtin (belt-and-suspenders).
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        _orig_builtin_print = builtins.print
+        builtins.print = lambda *a, **kw: None
         try:
-            self.audio_subsample_fpga(input_features, input_features_mask)
+            self.vision_weight_init(hf_model)
+            self.audio_weight_init(hf_model, reset_allocator=False)
+            self.audio_tensor_init(T_sub)
+            L_pad = self._aud_L_pad
+            H = self.AUD_H
+
+            # Host DMAs: upload actual mel input + zero subsample scratch +
+            # zero encoder input. audio_subsample_fpga in oneshot mode runs the
+            # host setup (upload AUD_SUB_INPUT, zero AUD_SUB_R_COMBINED/PATCHES1
+            # and lazy-allocates AUD_SUB_* if not yet present); we suppress the
+            # ISA emit by clearing capture_buffer to None so emits become no-ops
+            # while the host DMAs still move bytes to FPGA DRAM.
+            _saved_capture_buffer = self.capture_buffer
+            _saved_capture_count  = self.capture_count
+            _saved_is_capture_on  = self.is_capture_on
+            self.capture_buffer = None      # suppress FPGA ISA emit
+            self.is_capture_on  = False
+            self._oneshot_mode  = True
+            try:
+                self.audio_subsample_fpga(input_features, input_features_mask)
+            finally:
+                self._oneshot_mode  = False
+                self.capture_buffer = _saved_capture_buffer
+                self.capture_count  = _saved_capture_count
+                self.is_capture_on  = _saved_is_capture_on
         finally:
-            self._oneshot_mode  = False
-            self.capture_buffer = _saved_capture_buffer
-            self.capture_count  = _saved_capture_count
-            self.is_capture_on  = _saved_is_capture_on
+            _SILENT_MODE = False
+            builtins.print = _orig_builtin_print
         # Pre-zero AUD_IO_A so padding rows beyond T_sub stay zero after the
         # subsample proj writes the first H1_pad rows.
         self.dma_to_accelerator_memory(self.AUD_IO_A,
@@ -7689,15 +7718,21 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 audio_input_features_mask = audio_inputs.get("input_features_mask")
                 audio_T_raw = int(audio_input_features.shape[1])
 
-            # Encoder weight uploads (host DMA, no ISA emit).
-            if image_path is not None:
-                print(f"[instr-bin] Uploading vision encoder weights...")
-                self.vision_weight_init(hf_model)
-            if audio_path is not None:
-                # audio_weight_init routes weights into the dedicated Weight
-                # Audio params region (0x6c000000-0x78000000) and restores
-                # the tensor cursor on exit — see audio_weight_init.
-                self.audio_weight_init(hf_model, reset_allocator=False)
+            # Encoder weight uploads (host DMA, no ISA emit). The library's
+            # tile planner prints during these calls — silence them.
+            global _SILENT_MODE
+            _SILENT_MODE = True
+            try:
+                if image_path is not None:
+                    _original_print(f"[instr-bin] Uploading vision encoder weights...")
+                    self.vision_weight_init(hf_model)
+                if audio_path is not None:
+                    # audio_weight_init routes weights into the dedicated Weight
+                    # Audio params region (0x6c000000-0x78000000) and restores
+                    # the tensor cursor on exit — see audio_weight_init.
+                    self.audio_weight_init(hf_model, reset_allocator=False)
+            finally:
+                _SILENT_MODE = False
 
             # Vision rope_pads (canonical: pixel_position_ids only depends on
             # the canonical image grid, so the result is reusable across any
@@ -7727,8 +7762,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # absolute target address (controlled via _program_dram_base /
         # _next_program_dram_addr), so the loader sees a contiguous bin
         # with valid jump targets across the whole region.
-        global _SILENT_MODE
+        #
+        # Belt-and-suspenders silencing: _SILENT_MODE only suppresses prints
+        # routed through our `quiet_print` wrapper. Some library prints reach
+        # `builtins.print` via a captured reference that pre-dates our
+        # override, so we ALSO swap builtins.print to a no-op here and
+        # restore it just before returning (in the `_SILENT_MODE = False`
+        # block below).
         _SILENT_MODE = True
+        _orig_builtin_print = builtins.print
+        builtins.print = lambda *a, **kw: None
         self.clear_inst_id()
         self.clear_capture_buffer()
         self.start_capture()
@@ -7756,21 +7799,27 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         decoder_count_at_start = self.capture_count
         _original_print(f"[instr-bin] Compiling {len(decoder_buckets)} decoder buckets...")
+        _t_dec = time.perf_counter()
         _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
             layer_size=layer_size)
+        _original_print(f"  [decoder] {len(decoder_program_sizes)} buckets compiled "
+                        f"({time.perf_counter()-_t_dec:.1f}s)")
         decoder_program_starts: list[int] = []
         cursor = instruction_base_addr + decoder_count_at_start * 32
         for sz in decoder_program_sizes:
             decoder_program_starts.append(cursor)
             cursor += sz
 
+        _t_serialize = time.perf_counter()
+        _original_print(f"[instr-bin] Serializing LM instruction stream ({self.capture_count:,} insts)...", flush=True)
         self.stop_capture()
         lm_bytes = bytearray()
         for inst in self.capture_buffer:
             lm_bytes.extend(inst.get_bytes())
         self.clear_capture_buffer()
         lm_size_bytes = len(lm_bytes)
-        _original_print(f"[instr-bin] LM section: {lm_size_bytes/1024/1024:.1f} MB")
+        _original_print(f"[instr-bin] LM section: {lm_size_bytes/1024/1024:.1f} MB "
+                        f"(serialize {time.perf_counter()-_t_serialize:.1f}s)")
 
         # ------------------------------------------------------------------
         # 3. Capture vision section (independent session, one-shot mode).
@@ -7781,11 +7830,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         if image_path is not None:
             # vision_tensor_init resets the tensor cursor (vision reuses LM
             # tensor DRAM). program_base controls vision's PBI bake base.
+            _t_vsetup = time.perf_counter()
+            _original_print(f"[instr-bin] Vision setup (tensor init + rope DMA)...", flush=True)
             self.vision_tensor_init(num_patches, program_base=vision_target_addr)
             self.set_vision_attention_bias(padding_positions)
             self.dma_to_accelerator_memory(self.VIS_ROPE_COS_PAD_TILED, cos_pad_tiled)
             self.dma_to_accelerator_memory(self.VIS_ROPE_NEG_SIN_PAD_TILED, neg_sin_pad_tiled)
             self.dma_to_accelerator_memory(self.VIS_ROPE_SIN_HI_PAD_TILED, sin_hi_pad_tiled)
+            _original_print(f"  [vision setup] {time.perf_counter()-_t_vsetup:.1f}s")
 
             _original_print(f"[instr-bin] Compiling vision encoder at 0x{vision_target_addr:X}...")
             nf_pbi = os.environ.get("GEMMA4_VISION_PBI_NONFLASH", "1") == "1"
@@ -7872,6 +7924,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                             f"({time.perf_counter()-t_aud:.1f}s)")
 
         _SILENT_MODE = False
+        builtins.print = _orig_builtin_print
 
         # ------------------------------------------------------------------
         # 5. Concatenate section bytes + optional rope blob; write atomically.
