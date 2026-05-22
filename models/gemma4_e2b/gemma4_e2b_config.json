@@ -1,0 +1,378 @@
+{
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "TMP_REG": 2,
+    "ROPE_SIZE_REG": 3,
+    "ROPE_GLOBAL_SIZE_REG": 4
+  },
+  "file_info": {
+    "layer_size": 39191808,
+    "num_layers": 35,
+    "head_dim": 512,
+    "head_dim_sliding": 256,
+    "hidden_size": 1536,
+    "embedding_vocab": 262144,
+    "group_size": 8,
+    "mlp_elements": 6144,
+    "mlp_elements_wide": 12288,
+    "bytes_per_element": 2,
+    "per_layer_input_dim": 256
+  },
+  "model": {
+    "max_context_size": 1024,
+    "max_prefill_seq_len": 512,
+    "sliding_window": 512,
+    "end_of_turn_token_id": 106,
+    "prefill_seq_len_buckets": [
+      64,
+      128,
+      192,
+      256,
+      320,
+      384,
+      448,
+      512
+    ],
+    "decoder_seq_len_buckets": [
+      64,
+      128,
+      192,
+      256,
+      320,
+      384,
+      448,
+      512,
+      576,
+      640,
+      704,
+      768,
+      832,
+      896,
+      960,
+      1024
+    ],
+    "rope_global_layers": [
+      4,
+      9,
+      14,
+      19,
+      24,
+      29,
+      34
+    ],
+    "full_attention_layers": [
+      4,
+      9,
+      14,
+      19,
+      24,
+      29,
+      34
+    ],
+    "double_wide_mlp_first_layer": 15,
+    "per_layer_model_proj_scale": 0.02551551815399144,
+    "per_layer_input_scale": 0.7071067811865476
+  },
+  "paths": {
+    "weights_bin": "gemma4_e2b_bin/weights_gemma4_e2b_hf.bin",
+    "hf_model_dir": "gemma4_e2b_bin/gemma-4-E2B-it",
+    "hf_model_repo": "google/gemma-4-E2B-it"
+  },
+  "default_prefill_tokens": [
+    2,
+    105,
+    2364,
+    107,
+    54593,
+    786,
+    1003,
+    506,
+    94648,
+    25822,
+    236761,
+    2900,
+    1051,
+    691,
+    625,
+    5284,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107
+  ],
+  "layers": {
+    "structure": [
+      {
+        "key": "BLK0_ATTN_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_PRE_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_ATTN_Q_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LAYER0_Q_PROJ_SCALE"
+      },
+      {
+        "key": "BLK0_ATTN_Q_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LAYER0_Q_PROJ_QUANT"
+      },
+      {
+        "key": "BLK0_ATTN_K_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LAYER0_K_PROJ_SCALE"
+      },
+      {
+        "key": "BLK0_ATTN_K_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LAYER0_K_PROJ_QUANT"
+      },
+      {
+        "key": "BLK0_ATTN_V_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LAYER0_V_PROJ_SCALE"
+      },
+      {
+        "key": "BLK0_ATTN_V_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LAYER0_V_PROJ_QUANT"
+      },
+      {
+        "key": "BLK0_ATTN_Q_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_Q_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_ATTN_K_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_K_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_ATTN_OUTPUT_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE"
+      },
+      {
+        "key": "BLK0_ATTN_OUTPUT_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT"
+      },
+      {
+        "key": "BLK0_POST_ATTENTION_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_POST_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_FFN_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_FFN_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_FFN_UP_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LAYER0_MLP_UP_SCALE"
+      },
+      {
+        "key": "BLK0_FFN_UP_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LAYER0_MLP_UP_QUANT"
+      },
+      {
+        "key": "BLK0_FFN_GATE_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LAYER0_MLP_GATE_SCALE"
+      },
+      {
+        "key": "BLK0_FFN_GATE_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LAYER0_MLP_GATE_QUANT"
+      },
+      {
+        "key": "BLK0_FFN_DOWN_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_SCALE"
+      },
+      {
+        "key": "BLK0_FFN_DOWN_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_QUANT"
+      },
+      {
+        "key": "BLK0_POST_FFW_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_PER_LAYER_INPUT_GATE_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_PER_LAYER_GATE"
+      },
+      {
+        "key": "BLK0_PER_LAYER_PROJECTION_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_PER_LAYER_PROJ"
+      },
+      {
+        "key": "BLK0_POST_PER_LAYER_INPUT_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_POST_PER_LAYER_NORM_GAMMA"
+      },
+      {
+        "key": "BLK0_LAYER_SCALAR_WEIGHT",
+        "attr": "DRAM_ADDR_LAYER0_LAYER_SCALAR"
+      }
+    ],
+    "non_layer": [
+      {
+        "key": "OUTPUT_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_OUTPUT_NORM_GAMMA"
+      },
+      {
+        "key": "PER_LAYER_MODEL_PROJ_WEIGHT",
+        "attr": "DRAM_ADDR_PER_LAYER_MODEL_PROJ"
+      },
+      {
+        "key": "PER_LAYER_PROJ_NORM_WEIGHT",
+        "attr": "DRAM_ADDR_PER_LAYER_PROJ_NORM"
+      },
+      {
+        "key": "LM_HEAD_WEIGHT_SCALE",
+        "attr": "DRAM_ADDR_LM_HEAD_SCALE"
+      },
+      {
+        "key": "LM_HEAD_WEIGHT_DATA",
+        "attr": "DRAM_ADDR_LM_HEAD_QUANT"
+      },
+      {
+        "key": "ROPE_LOCAL",
+        "attr": "DRAM_ADDR_ROPE_LOCAL"
+      },
+      {
+        "key": "ROPE_GLOBAL",
+        "attr": "DRAM_ADDR_ROPE_GLOBAL"
+      }
+    ]
+  },
+  "regions": {
+    "BLK0_ATTN_NORM_WEIGHT": {
+      "offset": "0x30000000",
+      "size": 3072
+    },
+    "BLK0_ATTN_Q_WEIGHT_SCALE": {
+      "offset": "0x30000C00",
+      "size": 196608
+    },
+    "BLK0_ATTN_Q_WEIGHT_DATA": {
+      "offset": "0x30030C00",
+      "size": 3145728
+    },
+    "BLK0_ATTN_K_WEIGHT_SCALE": {
+      "offset": "0x30330C00",
+      "size": 24576
+    },
+    "BLK0_ATTN_K_WEIGHT_DATA": {
+      "offset": "0x30336C00",
+      "size": 393216
+    },
+    "BLK0_ATTN_V_WEIGHT_SCALE": {
+      "offset": "0x30396C00",
+      "size": 24576
+    },
+    "BLK0_ATTN_V_WEIGHT_DATA": {
+      "offset": "0x3039CC00",
+      "size": 393216
+    },
+    "BLK0_ATTN_Q_NORM_WEIGHT": {
+      "offset": "0x303FCC00",
+      "size": 1024
+    },
+    "BLK0_ATTN_K_NORM_WEIGHT": {
+      "offset": "0x303FD000",
+      "size": 1024
+    },
+    "BLK0_ATTN_OUTPUT_WEIGHT_SCALE": {
+      "offset": "0x303FD400",
+      "size": 196608
+    },
+    "BLK0_ATTN_OUTPUT_WEIGHT_DATA": {
+      "offset": "0x3042D400",
+      "size": 3145728
+    },
+    "BLK0_POST_ATTENTION_NORM_WEIGHT": {
+      "offset": "0x3072D400",
+      "size": 3072
+    },
+    "BLK0_FFN_NORM_WEIGHT": {
+      "offset": "0x3072E000",
+      "size": 3072
+    },
+    "BLK0_FFN_UP_WEIGHT_SCALE": {
+      "offset": "0x3072EC00",
+      "size": 589824
+    },
+    "BLK0_FFN_UP_WEIGHT_DATA": {
+      "offset": "0x307BEC00",
+      "size": 9437184
+    },
+    "BLK0_FFN_GATE_WEIGHT_SCALE": {
+      "offset": "0x310BEC00",
+      "size": 589824
+    },
+    "BLK0_FFN_GATE_WEIGHT_DATA": {
+      "offset": "0x3114EC00",
+      "size": 9437184
+    },
+    "BLK0_FFN_DOWN_WEIGHT_SCALE": {
+      "offset": "0x31A4EC00",
+      "size": 589824
+    },
+    "BLK0_FFN_DOWN_WEIGHT_DATA": {
+      "offset": "0x31ADEC00",
+      "size": 9437184
+    },
+    "BLK0_POST_FFW_NORM_WEIGHT": {
+      "offset": "0x323DEC00",
+      "size": 3072
+    },
+    "BLK0_PER_LAYER_INPUT_GATE_WEIGHT": {
+      "offset": "0x323DF800",
+      "size": 786432
+    },
+    "BLK0_PER_LAYER_PROJECTION_WEIGHT": {
+      "offset": "0x3249F800",
+      "size": 786432
+    },
+    "BLK0_POST_PER_LAYER_INPUT_NORM_WEIGHT": {
+      "offset": "0x3255F800",
+      "size": 3072
+    },
+    "BLK0_LAYER_SCALAR_WEIGHT": {
+      "offset": "0x32560400",
+      "size": 64
+    }
+  },
+  "non_layer_regions": {
+    "OUTPUT_NORM_WEIGHT": {
+      "offset": "0x81C2AF00",
+      "size": 3072
+    },
+    "PER_LAYER_MODEL_PROJ_WEIGHT": {
+      "offset": "0x81C2BB00",
+      "size": 27525120
+    },
+    "PER_LAYER_PROJ_NORM_WEIGHT": {
+      "offset": "0x8366BB00",
+      "size": 512
+    },
+    "LM_HEAD_WEIGHT_SCALE": {
+      "offset": "0x8366BD00",
+      "size": 12582912
+    },
+    "LM_HEAD_WEIGHT_DATA": {
+      "offset": "0x8426BD00",
+      "size": 201326592
+    },
+    "ROPE_LOCAL": {
+      "offset": "0x9026BD00",
+      "size": 1048576
+    },
+    "ROPE_GLOBAL": {
+      "offset": "0x9036BD00",
+      "size": 1048576
+    }
+  },
+  "special": {
+    "embedding": {
+      "token_embd_offset": "0x0",
+      "token_embd_size": "0x30000000"
+    },
+    "rope": {
+      "num_positions": 1024,
+      "theta": 1000000.0,
+      "local_base": 10000.0,
+      "partial_rotary_factor_global": 0.25
+    },
+    "rms_norm": {
+      "gamma_offset": 0.0
+    }
+  }
+}
