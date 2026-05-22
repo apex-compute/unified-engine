@@ -28,7 +28,7 @@ from user_dma_core import (
     DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
     UnifiedEngine, ue_35bit_addr_shifter,
 )
-from model_lib_core import (
+from nn_lib import (
     smart_bf16_permute_core,
     store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
     eltwise_add_core_dram, eltwise_mul_core_dram,

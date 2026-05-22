@@ -1,4 +1,4 @@
-"""model_lib_core.py
+"""nn_lib.py
 
 Shared helpers extracted from per-model bring-up files. Every public op uses the
 ``_core_dram`` naming convention for DRAM-in/DRAM-out wrappers around the SRAM

@@ -35,7 +35,7 @@ from user_dma_core import (
     UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     UnifiedEngine, set_dma_device, ue_35bit_addr_shifter,
 )
-from model_lib_core import load_config_with_weight_defs
+from nn_lib import load_config_with_weight_defs
 
 
 def _set_silent(val: bool) -> None:

@@ -1627,7 +1627,6 @@ def main():
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = GPT2_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
-    ue.software_reset()
 
     if args.prompt is not None:
         prefill_seq = tuple(ue.tokenizer.encode(args.prompt))
