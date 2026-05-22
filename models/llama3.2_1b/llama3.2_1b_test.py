@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
-"""
-Llama-3.2-1B inference on accelerator: prefill + decode.
+"""Llama-3.2-1B inference on accelerator: prefill + decode.
 
-  - Config from llama3.2_1b_config.json; weights from a single bin (see below).
-  - Prefill: compiled each run. Decoder: if llama3.2_1b_bin/decoder_program.bin and
-    llama3.2_1b_bin/decoder_program.json exist, skip decoder compile and load
-    program sizes from meta; otherwise compile and write the bin + meta.
-  - Run prefill then decode loop.
+First run produces two bin files under ``llama3.2_1b_bin/``:
+  * ``weights_llama3.2_1b_hf.bin``      — IF4-quantized weights + bf16 embedding
+  * ``llama3.2_1b_instruction.bin``     — unified PBI-compressed bin holding all
+                                          prefill buckets followed by all decoder
+                                          buckets, with a ``.json`` meta listing
+                                          per-bucket offsets and total FLOPs.
 
-Architecture differences vs Gemma3:
-  - No per-head Q/K normalization (q_norm, k_norm absent).
-  - No post-attention normalization (Gemma3 only).
-  - No post-FFN normalization (Gemma3 only).
-  - layer.post_attention_layernorm is the pre-FFN norm (not post-attn).
-  - Embedding is NOT scaled by sqrt(hidden_size).
-  - LM head weight is tied to the embedding weight.
-  - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
+The weight bin is generated from the HuggingFace model (downloaded if missing).
+The instruction bin is captured by compiling every bucket once and dumping the
+PBI ISA.  Subsequent runs simply load both bins from disk and execute — no
+HuggingFace model load, no recompile.  Tokenizer files persist under
+``llama3.2_1b_bin/Llama-3.2-1B-Instruct/`` from the first download and are read
+locally thereafter, so the script needs no network on subsequent runs.
 
-Weights:
-  - Default: llama3.2_1b_bin/weights_llama3.2_1b_hf.bin (generated from HF model if missing).
-  - --local-weights: use llama3.2_1b_bin/full_model_weights.bin instead.
+Architecture (vs Gemma3): no per-head Q/K norm, no post-attn/post-MLP norm,
+``post_attention_layernorm`` is the pre-FFN norm, embedding not sqrt-scaled,
+LM head ties to the embedding, ``gamma_offset = 0``.
 
 Usage:
   python llama3.2_1b_test.py
   python llama3.2_1b_test.py --prompt "your prompt"
-  python llama3.2_1b_test.py --dev xdma0 [--cycle 5.88]
-  python llama3.2_1b_test.py --local-weights
+  python llama3.2_1b_test.py --dev xdma0 --cycle 5.88
 """
 
 import json
@@ -39,7 +36,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 import time
 
-# This file's folder; user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
+# user_dma_core.py lives at src/template/ (this file is at src/template/models/llama3.2_1b/).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
@@ -47,20 +44,16 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 
-# --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
+# Toggled inside compile_instructions to suppress the per-instruction prints
+# emitted by the user_dma_core kernels during bucket capture.
 import builtins
-
 _original_print = builtins.print
 _SILENT_MODE = False
-
-def quiet_print(*args, **kwargs):
-    """Suppress prints when _SILENT_MODE is True; otherwise print normally."""
+def _quiet_print(*args, **kwargs):
     if _SILENT_MODE:
         return
     _original_print(*args, **kwargs)
-
-builtins.print = quiet_print
-# ---------------------------------------------
+builtins.print = _quiet_print
 
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
@@ -420,11 +413,32 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             setattr(self, attr, addr)
 
     def weight_init(self) -> None:
-        """Initialize DRAM: load HF embedding+tokenizer, layer weights from bin, host-computed RoPE, OUTPUT_NORM/LM_HEAD from bin."""
-        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
-        # LLaMA does NOT scale the embedding by sqrt(hidden_size)
-        embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
-        self.embedding_weight = embed
+        """Initialize DRAM from local files only.
+
+        Embedding is read from the weight bin (already serialized there by
+        weight_bin_generate). Tokenizer is loaded from the local HF model
+        directory if it exists. The HF model itself is NEVER loaded here —
+        only weight_bin_generate touches HuggingFace.
+        """
+        # Embedding from weight bin (bf16 stored as raw bytes at token_embd_offset)
+        emb_cfg = self._cfg["special"]["embedding"]
+        emb_off = _parse_offset(emb_cfg["token_embd_offset"])
+        vocab_size = emb_cfg["vocab_size"]
+        emb_dim = emb_cfg["embedding_dim"]
+        emb_nbytes = vocab_size * emb_dim * self.bytes_per_element
+        emb_raw = self.weight_bin[emb_off : emb_off + emb_nbytes]
+        emb_u16 = np.frombuffer(emb_raw, dtype=np.uint16).copy()
+        self.embedding_weight = torch.from_numpy(emb_u16).view(torch.bfloat16).reshape(vocab_size, emb_dim)
+
+        # Tokenizer from local files only (no network)
+        model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
+        if not os.path.exists(os.path.join(model_dir, "tokenizer_config.json")):
+            raise RuntimeError(
+                f"Tokenizer files not found at {model_dir}. "
+                "First-time setup requires the HF model to be downloaded "
+                "(run weight_bin_generate to fetch it). After that, the "
+                "tokenizer files persist locally and no HF access is needed."
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
@@ -841,17 +855,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
-                # LLaMA 8-head GQA decoder: rope_hf_core(N=512) on [lo|hi]-permuted K and Q
-                # in-place, then scatter 64-dim per-head slices to KV cache (via
-                # V_CACHE_SIZE_REG for decode position), then decoder_attention(head_dim=64).
-                ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
-                ahd      = self.actual_head_dim   # 64
-                nkvh     = self.num_kv_heads      # 8
-                qpkv     = self.group_size        # 4
-                bpe      = self.bytes_per_element
-                hd       = self.head_dim          # 512
-                total_q_dim = hd * qpkv           # 2048
-                half_ahd = ahd // 2               # 32
+            # LLaMA 8-head GQA decoder: rope_hf_core(N=512) on [lo|hi]-permuted K and Q
+            # in-place, then scatter 64-dim per-head slices to KV cache (via
+            # V_CACHE_SIZE_REG for decode position), then decoder_attention(head_dim=64).
+            ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
+            ahd      = self.actual_head_dim   # 64
+            nkvh     = self.num_kv_heads      # 8
+            qpkv     = self.group_size        # 4
+            bpe      = self.bytes_per_element
+            hd       = self.head_dim          # 512
+            total_q_dim = hd * qpkv           # 2048
+            half_ahd = ahd // 2               # 32
 
                 # Step 1: K rope in-place (N=512, uses ROPE_SIZE_REG for decode position)
                 total_flops += self.rope_hf_core_decode(
@@ -874,39 +888,39 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         rope_size_reg=self.ROPE_SIZE_REG,
                         tmp_reg=self.TMP_REG)
 
-                # Step 3: Per-KV-head scatter K/V to cache + scatter Q → decoder_attention
-                for kv_h in range(nkvh):
-                    k_cache_base = (self.LAYER0_K_ROPE_DRAM
-                                    + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                                    + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
-                    v_cache_base = (self.LAYER0_V_DRAM
-                                    + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                                    + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+            # Step 3: Per-KV-head scatter K/V to cache + scatter Q → decoder_attention
+            for kv_h in range(nkvh):
+                k_cache_base = (self.LAYER0_K_ROPE_DRAM
+                                + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
+                                + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                v_cache_base = (self.LAYER0_V_DRAM
+                                + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
+                                + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
 
-                    # Scatter K_h_roped (64-dim) → KV cache at decode position
-                    # lo→SRAM 0x10000, hi→SRAM 0x10080 (128-byte aligned slots)
-                    self.accelerator_memory_to_sram(
-                        self.LAYER0_K_DRAM + kv_h * half_ahd * bpe, 0x10000, half_ahd)
-                    self.accelerator_memory_to_sram(
-                        self.LAYER0_K_DRAM + (hd // 2 + kv_h * half_ahd) * bpe,
-                        0x10080, half_ahd)
-                    self.generate_instruction_add_imm(
-                        self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x10000, 0, half_ahd)
-                    self.overwrite_instruction_with_general_register(self.TMP_REG)
-                    self.generate_instruction_add_imm(
-                        self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base + half_ahd * bpe), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x10080, 0, half_ahd)
-                    self.overwrite_instruction_with_general_register(self.TMP_REG)
+                # Scatter K_h_roped (64-dim) → KV cache at decode position
+                # lo→SRAM 0x10000, hi→SRAM 0x10080 (128-byte aligned slots)
+                self.accelerator_memory_to_sram(
+                    self.LAYER0_K_DRAM + kv_h * half_ahd * bpe, 0x10000, half_ahd)
+                self.accelerator_memory_to_sram(
+                    self.LAYER0_K_DRAM + (hd // 2 + kv_h * half_ahd) * bpe,
+                    0x10080, half_ahd)
+                self.generate_instruction_add_imm(
+                    self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
+                self.sram_to_accelerator_memory(0x10000, 0, half_ahd)
+                self.overwrite_instruction_with_general_register(self.TMP_REG)
+                self.generate_instruction_add_imm(
+                    self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base + half_ahd * bpe), self.TMP_REG)
+                self.sram_to_accelerator_memory(0x10080, 0, half_ahd)
+                self.overwrite_instruction_with_general_register(self.TMP_REG)
 
-                    # Scatter V_h (64-dim, standard layout) → V cache at decode position
-                    # v_proj output at LAYER0_FLASH_V_DRAM: [V_KV0(64)..V_KV7(64)] = 512-dim
-                    self.accelerator_memory_to_sram(
-                        self.LAYER0_FLASH_V_DRAM + kv_h * ahd * bpe, 0x20000, ahd)
-                    self.generate_instruction_add_imm(
-                        self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x20000, 0, ahd)
-                    self.overwrite_instruction_with_general_register(self.TMP_REG)
+                # Scatter V_h (64-dim, standard layout) → V cache at decode position
+                # v_proj output at LAYER0_FLASH_V_DRAM: [V_KV0(64)..V_KV7(64)] = 512-dim
+                self.accelerator_memory_to_sram(
+                    self.LAYER0_FLASH_V_DRAM + kv_h * ahd * bpe, 0x20000, ahd)
+                self.generate_instruction_add_imm(
+                    self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
+                self.sram_to_accelerator_memory(0x20000, 0, ahd)
+                self.overwrite_instruction_with_general_register(self.TMP_REG)
 
                     # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q → decoder_attn
                     # KV head kv_h → Q group g = kv_h//2; sub_idx = (kv_h%2)*qpkv + q
@@ -942,37 +956,44 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
-                # LLaMA: no post-attention norm; residual directly on o_proj output
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.vector_length)
-                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
+            # LLaMA: no post-attention norm; residual directly on o_proj output
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.vector_length)
+            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
 
-                # LLaMA: post_attention_layernorm IS the pre-FFN norm
-                total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
+            # LLaMA: post_attention_layernorm IS the pre-FFN norm
+            total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                          OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
+                          use_pbi=True) or 0)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4)
+            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, silu_enable=True,
+                use_pbi=True) or 0)
+            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
+                use_pbi=True) or 0)
 
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
-                self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
+            self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
+            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.mlp_elements, N=self.vector_length,
-                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4)
+            total_flops += (self.matmat_mul_core(M=1, K=self.mlp_elements, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
+                use_pbi=True) or 0)
 
-                # LLaMA: no post-FFN norm; residual directly on down_proj output
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.vector_length)
-                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
+            # LLaMA: no post-FFN norm; residual directly on down_proj output
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.vector_length)
+            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
 
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
@@ -1214,6 +1235,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
             bias_host[0, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
+            _t_bias = time.perf_counter()
 
             # Decoder preamble: prime 3 position GPRs + bucket, then jump into cached decoder.
             self.clear_inst_id()
@@ -1230,6 +1252,18 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             token_id = self._select_next_token(recent_tokens)
             recent_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
+            _t_end = time.perf_counter()
+            if decoded_count < 5 or decoded_count % 20 == 0:
+                _original_print(f"  [decode#{decoded_count} pos={self.seq_len}] "
+                                f"reg={1e3*(_t_reg-_t0):.1f}ms "
+                                f"emb={1e3*(_t_emb-_t_reg):.1f}ms "
+                                f"bias={1e3*(_t_bias-_t_emb):.1f}ms "
+                                f"exec(wall)={1e3*(_t_exec-_t_bias):.1f}ms "
+                                f"FPGA={_fpga_us/1e3:.1f}ms "
+                                f"argmax+dec={1e3*(_t_end-_t_exec):.1f}ms "
+                                f"total={1e3*(_t_end-_t0):.1f}ms")
+            per_token_times.append(time.perf_counter() - timer_start)
+            decoded_count += 1
             _SILENT_MODE = False
             if token_id in _llama_stop_tokens:
                 if _use_status:
@@ -1267,13 +1301,11 @@ def main():
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if args.local_weights:
-        weights_bin_rel = "llama3.2_1b_bin/full_model_weights.bin"
-    else:
-        weights_bin_rel = "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin"
-        weights_bin_full = os.path.join(script_dir, weights_bin_rel)
-        if not os.path.exists(weights_bin_full):
-            weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
+    weights_bin_rel = "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin"
+    weights_bin_full = os.path.join(script_dir, weights_bin_rel)
+    if not os.path.exists(weights_bin_full):
+        # First-time setup: download the HF model and produce the weight bin.
+        weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
