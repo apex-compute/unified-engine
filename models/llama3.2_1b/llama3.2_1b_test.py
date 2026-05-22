@@ -35,6 +35,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 import time
+import threading
 
 # user_dma_core.py lives at src/template/ (this file is at src/template/models/llama3.2_1b/).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1252,16 +1253,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             token_id = self._select_next_token(recent_tokens)
             recent_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
-            _t_end = time.perf_counter()
-            if decoded_count < 5 or decoded_count % 20 == 0:
-                _original_print(f"  [decode#{decoded_count} pos={self.seq_len}] "
-                                f"reg={1e3*(_t_reg-_t0):.1f}ms "
-                                f"emb={1e3*(_t_emb-_t_reg):.1f}ms "
-                                f"bias={1e3*(_t_bias-_t_emb):.1f}ms "
-                                f"exec(wall)={1e3*(_t_exec-_t_bias):.1f}ms "
-                                f"FPGA={_fpga_us/1e3:.1f}ms "
-                                f"argmax+dec={1e3*(_t_end-_t_exec):.1f}ms "
-                                f"total={1e3*(_t_end-_t0):.1f}ms")
             per_token_times.append(time.perf_counter() - timer_start)
             decoded_count += 1
             _SILENT_MODE = False

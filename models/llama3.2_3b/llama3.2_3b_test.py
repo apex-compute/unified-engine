@@ -36,6 +36,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 import time
+import threading
 
 # This file's folder; user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1577,7 +1578,19 @@ def main():
     # === Unified instruction bin: compile-once cached on disk, no recompile on rerun ===
     print(f"\n--- Compiling instruction bin (if not cached) ---")
     timer = time.perf_counter()
-    inst_meta = ue.compile_instructions()
+    _compile_done = threading.Event()
+    def _compile_heartbeat():
+        # Bypass _quiet_print: compile_instructions() flips _SILENT_MODE=True
+        # so the regular print() is swallowed during compile.
+        while not _compile_done.wait(10.0):
+            _original_print(f"  ... still compiling ({time.perf_counter() - timer:.0f}s elapsed)", flush=True)
+    _hb_thread = threading.Thread(target=_compile_heartbeat, daemon=True)
+    _hb_thread.start()
+    try:
+        inst_meta = ue.compile_instructions()
+    finally:
+        _compile_done.set()
+        _hb_thread.join()
     print(f"Instruction bin ready in {time.perf_counter() - timer:.2f}s")
 
     # Load the unified bin into program DRAM at a single base address.
