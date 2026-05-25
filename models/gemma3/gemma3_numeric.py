@@ -680,6 +680,12 @@ def main():
     args = parser.parse_args()
 
     set_dma_device(args.dev)
+    # Refresh local bindings shadowed at import time so DMA goes to the right device
+    import sys as _sys, user_dma_core as _udc
+    _mod = _sys.modules[__name__]
+    _mod.DMA_DEVICE_H2C = _udc.DMA_DEVICE_H2C
+    _mod.DMA_DEVICE_C2H = _udc.DMA_DEVICE_C2H
+    _mod.DMA_DEVICE_USER = _udc.DMA_DEVICE_USER
     gemma3_test.DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     gemma3_test.DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     gemma3_test.DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
