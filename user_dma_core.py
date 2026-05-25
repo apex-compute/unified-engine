@@ -4023,7 +4023,7 @@ class UnifiedEngine:
             fmax_context_addr=fmax_context_addr
         )
 
-    def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> None:
+    def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None) -> None:
         """
         Transposes a (M x N) input matrix X to produce an (N x M) output matrix Y = X^T.
 
@@ -4034,9 +4034,12 @@ class UnifiedEngine:
         bytes_per_element = 2
         # Allocate identity matrix of size UE_VECTOR_SIZE x UE_VECTOR_SIZE in URAM_A start
         identity_matrix_sram_start_addr = 0x00000
-        identity_matrix_dram_addr = self.get_params_dram_addr()
-        self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-        self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+        if IDENTITY_DRAM_ADDR is not None:
+            identity_matrix_dram_addr = IDENTITY_DRAM_ADDR
+        else:
+            identity_matrix_dram_addr = self.get_params_dram_addr()
+            self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+            self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
 
         identity_tensor = torch.eye(N, dtype=torch.bfloat16)
 
@@ -4289,7 +4292,7 @@ class UnifiedEngine:
 
         # no FLOPS for this operation
 
-    def flash_attention_core_legacy(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
+    def flash_attention_core_legacy(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
 
         bytes_per_element = 2
@@ -4308,16 +4311,11 @@ class UnifiedEngine:
         K = head_dim  # identity dimension (inner product dim)
         N = seq_len   # V length (columns of V^T)
 
-        # Allocate identity matrix of size UE_VECTOR_SIZE x UE_VECTOR_SIZE in URAM_A start
+        # Load UE_VECTOR_SIZE x UE_VECTOR_SIZE identity block into URAM_A start
         identity_matrix_sram_start_addr = 0x00000
-        identity_matrix_dram_addr = self.get_params_dram_addr()
-        self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-        self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-
-        identity_tensor = torch.eye(head_dim, dtype=torch.bfloat16)
 
         # transfer identity matrix to URAM_A start
-        self.accelerator_memory_to_sram(accelerator_dram_address=identity_matrix_dram_addr,
+        self.accelerator_memory_to_sram(accelerator_dram_address=IDENTITY_DRAM_ADDR,
                                         sram_address=identity_matrix_sram_start_addr,
                                         element_size=UE_VECTOR_SIZE * UE_VECTOR_SIZE)
 
@@ -4360,8 +4358,9 @@ class UnifiedEngine:
                     else:
                         out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
 
-                    ones_idx = identity_tensor[output_row+i, :].reshape(-1, UE_VECTOR_SIZE).sum(axis=1).argmax(axis=0)
-                    vector_idx = identity_tensor[output_row+i, :].reshape(-1, UE_VECTOR_SIZE)[ones_idx, :].argmax(axis=0)
+                    row = output_row + i
+                    ones_idx = row // UE_VECTOR_SIZE
+                    vector_idx = row % UE_VECTOR_SIZE
 
                     self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
                                                             fmax_context_addr=0,
@@ -4562,7 +4561,7 @@ class UnifiedEngine:
         print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
         return total_flops
 
-    def flash_attention_core_pbi(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
+    def flash_attention_core_pbi(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
         bytes_per_element = 2
         bias_enable = BIAS_DRAM_ADDR is not None
@@ -4576,19 +4575,11 @@ class UnifiedEngine:
         # ----------------------------------------------------------------------------------------------------------------
         # I @ V^T migrated to matmat_mul_core_pbi in phase 1. This materializes V^T in
         # SCRATCH_DRAM_ADDR so the remaining stages can keep using the legacy flow.
-        identity_matrix_dram_addr = self.get_params_dram_addr()
-        self.allocate_params_dram(head_dim * head_dim * bytes_per_element)
-        self.dma_write(
-            DMA_DEVICE_H2C,
-            identity_matrix_dram_addr,
-            torch.eye(head_dim, dtype=torch.bfloat16),
-            head_dim * head_dim * bytes_per_element,
-        )
         self.matmat_mul_core(
             M=head_dim,
             K=head_dim,
             N=seq_len,
-            A_DRAM_ADDR=identity_matrix_dram_addr,
+            A_DRAM_ADDR=IDENTITY_DRAM_ADDR,
             B_DRAM_ADDR=V_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
             use_pbi=True,
@@ -5306,7 +5297,7 @@ class UnifiedEngine:
         print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
         return total_flops
 
-    def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
+    def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, use_pbi: bool = False) -> None:
         """Flash-attention entrypoint; switch between PBI and legacy core paths."""
         if use_pbi:
@@ -5321,6 +5312,7 @@ class UnifiedEngine:
                 BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 debug_mode=debug_mode,
                 SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
+                IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
             )
 
         return self.flash_attention_core_legacy(
@@ -5334,6 +5326,7 @@ class UnifiedEngine:
             BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
             debug_mode=debug_mode,
             SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
         )
 
     def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False) -> None:
