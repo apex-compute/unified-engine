@@ -453,12 +453,8 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
     SCRATCH_DRAM_ADDR = ue.allocate_tensor_dram(max(head_dim, UE_FMAX_CONTEXT_SIZE) * seq_len_padded * 2 + head_dim * seq_len_padded * 2)
     ATTN_P_DRAM_ADDR = ue.allocate_tensor_dram(seq_len_padded * seq_len_padded * 2) if use_pbi else None
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(seq_len_padded * head_dim * 2)
-    if use_pbi:
-        IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(head_dim * head_dim * 2)
-        ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, torch.eye(head_dim, dtype=torch.bfloat16))
-    else:
-        IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * 2)
-        ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
+    IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * 2)
+    ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
 
     # Bucket-index GPR is held for the entire dispatcher (decremented by the per-bucket JZ
     # cascade), so allocate it before capture; the kernel's internal allocations nest above it.
