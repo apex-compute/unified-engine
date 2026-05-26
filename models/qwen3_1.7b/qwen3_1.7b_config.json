@@ -1,9 +1,10 @@
 {
-  "_template_note": "Qwen3-1.7B config for qwen3_1.7b_test.py. 28 layers, 16Q/8KV heads, head_dim=128, SwiGLU, QK RMSNorm, no post-attn/post-FFN norm, single RoPE base.",
+  "_template_note": "Qwen3-1.7B config for qwen3_1.7b_test.py. 28 layers, 16Q/8KV heads, head_dim=128, SwiGLU, QK RMSNorm, no post-attn/post-FFN norm, single RoPE base. Dynamic-PBI single-bin flow: prefill and decoder are each ONE program in the unified bin; host primes gf_seq_len / gf_q_seq_len / gf_bucket_idx via a runtime preamble + jump_abs before each call.",
   "fixed_isa_regs": {
-    "V_CACHE_SIZE_REG": 1,
-    "TMP_REG": 2,
-    "ROPE_SIZE_REG": 3
+    "TMP_REG":           1,
+    "GF_SEQ_LEN_REG":    2,
+    "GF_Q_SEQ_LEN_REG":  3,
+    "GF_BUCKET_IDX_REG": 4
   },
   "file_info": {
     "layer_size": 26759168,
@@ -19,67 +20,19 @@
   },
   "model": {
     "max_context_size": 2048,
-    "end_of_turn_token_id": 151645,
-    "decoder_seq_len_buckets": [
-      256,
-      512,
-      768,
-      1024,
-      1280,
-      1536,
-      1792,
-      2048
-    ],
-    "rope_global_layers": []
+    "prefill_max_seq_len": 64,
+    "end_of_turn_token_id": 151645
   },
   "paths": {
     "weights_bin": "qwen3_1.7b_bin/weights_qwen3_1.7b_hf.bin",
     "local_weights_bin": "qwen3_1.7b_bin/full_model_weights.bin",
     "hf_model_dir": "qwen3_1.7b_bin/Qwen3-1.7B",
     "hf_model_repo": "Qwen/Qwen3-1.7B",
-    "decoder_program_bin": "qwen3_1.7b_bin/decoder_program.bin",
-    "decoder_program_meta": "qwen3_1.7b_bin/decoder_program.json"
+    "instruction_bin": "qwen3_1.7b_bin/qwen3_1.7b_instruction.bin",
+    "instruction_meta": "qwen3_1.7b_bin/qwen3_1.7b_instruction.json"
   },
-  "default_prefill_tokens": [
-    151644,
-    8948,
-    198,
-    2610,
-    525,
-    1195,
-    58,
-    16,
-    13,
-    358,
-    1079,
-    498,
-    279,
-    4226,
-    311,
-    856,
-    3405,
-    1191,
-    20173,
-    13,
-    151645,
-    198,
-    151644,
-    872,
-    198,
-    3838,
-    374,
-    220,
-    18,
-    488,
-    220,
-    20,
-    30,
-    151645,
-    198,
-    151644,
-    77091,
-    198
-  ],
+  "default_system_prompt": "You are a helpful assistant.",
+  "default_prompt": "What is 3 + 5?",
   "layers": {
     "structure": [
       {
