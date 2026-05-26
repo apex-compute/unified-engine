@@ -36,9 +36,9 @@ from read_trace import generate_trace
 import gemma3_test
 from gemma3_test import (
     Gemma3_UnifiedEngine,
+    _parse_offset,
     SCRIPT_DIR,
 )
-from model_lib_core import parse_offset as _parse_offset
 
 def _dequantize_int4_from_bin(
     weight_bin: bytes,
@@ -722,7 +722,7 @@ def main():
     timer_dec = time.perf_counter()
     decoder_bin_path, decoder_program_sizes, flops_per_token = ue.compile_decoder(layer_size=args.layer_size)
     print(f"Decoder compile done in {time.perf_counter() - timer_dec:.2f} seconds.")
-    decoder_base_addr, _ = ue.load_instructions(decoder_bin_path)
+    decoder_base_addr, _ = ue.load_program_instructions_from_file(decoder_bin_path)
 
     print(f"\n--- Running decoder ---")
     ue.MAX_CONTEXT_SIZE = len(ue.prefill_seq)

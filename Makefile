@@ -10,6 +10,15 @@ clean:
 	rm -f user_dma_core
 	rm -f *.mcs *.prm *.jou *.log *.json *.csv
 	rm -rf andromeda_IP-* andromeda_wrapper-*
+	rm -rf models/gemma3/gemma3_bin/
+	rm -rf models/gpt2/gpt2_bin/
+	rm -rf models/llama3.2_1b/llama3.2_1b_bin/
+	rm -rf models/mobilesam/mobilesam_bin/
+	rm -rf models/parakeet/parakeet_bin/
+	rm -rf models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/
+	rm -rf models/qwen3_1.7b/qwen3_1.7b_bin/
+	rm -rf models/smolvlm2/smolvlm2_bin/
+	rm -rf models/swin/swin_bin/
 
 load_drivers:
 	sudo insmod /lib/modules/$$(uname -r)/xdma/xdma.ko interrupt_mode=0 config_bar_num=0

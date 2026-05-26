@@ -2683,11 +2683,13 @@ def main():
                         help='Run vision encoder on CPU (fp32) instead of FPGA — for quality comparison')
     parser.add_argument('--rep-penalty', type=float, default=1.05,
                         help='Repetition penalty (1.0=off, default: 1.05)')
+    parser.add_argument('--dev', type=str, default='xdma0',
+                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    set_dma_device('xdma0')
+    set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H

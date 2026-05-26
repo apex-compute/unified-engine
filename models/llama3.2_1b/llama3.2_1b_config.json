@@ -3,7 +3,8 @@
   "fixed_isa_regs": {
     "V_CACHE_SIZE_REG": 1,
     "TMP_REG": 2,
-    "ROPE_SIZE_REG": 3
+    "ROPE_SIZE_REG": 3,
+    "GF_BUCKET_IDX_REG": 4
   },
   "file_info": {
     "layer_size": 32327680,
