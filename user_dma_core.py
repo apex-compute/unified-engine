@@ -5270,7 +5270,8 @@ class UnifiedEngine:
     def flash_attention_core_pbi(self, head_dim: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, ATTN_P_DRAM_ADDR: int, gf_bucket_idx: int,
                             IDENTITY_DRAM_ADDR: int = None,
                             num_buckets: int = 8,
-                            BIAS_DRAM_ADDR: int = None, debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None):
+                            BIAS_DRAM_ADDR: int = None, debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None,
+                            use_pbi: bool = True):
         """
         **Vᵀ** at ``SCRATCH_DRAM_ADDR``: prefer ``bf16_transpose_core`` (PBI) when available; currently uses
         ``I @ V`` via :meth:`matmat_mul_core` ``use_pbi=True`` (**no identity fast path**—full GEMM cost).
@@ -5340,8 +5341,8 @@ class UnifiedEngine:
             self.pad_capture_to_64b_boundary()
             bucket_start_capture_indices.append(self.capture_count)
             bucket_seq_len = bucket_step * (i + 1)
-            bucket_flops.append(
-                self._flash_attention_pbi_body(
+            if use_pbi:
+                _body_flops = self._flash_attention_pbi_body(
                     head_dim=head_dim,
                     seq_len=bucket_seq_len,
                     Q_DRAM_ADDR=Q_DRAM_ADDR,
@@ -5354,7 +5355,19 @@ class UnifiedEngine:
                     _silent=True,
                     IDENTITY_TRANSPOSE_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 )
-            )
+            else:
+                _body_flops = self.flash_attention_core_legacy(
+                    head_dim=head_dim,
+                    seq_len=bucket_seq_len,
+                    Q_DRAM_ADDR=Q_DRAM_ADDR,
+                    K_DRAM_ADDR=K_DRAM_ADDR,
+                    V_DRAM_ADDR=V_DRAM_ADDR,
+                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                    SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+                    IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+                    BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+                )
+            bucket_flops.append(_body_flops)
             end_jmp_capture_indices.append(self.capture_count)
             self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
@@ -5540,7 +5553,7 @@ class UnifiedEngine:
 
     def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, ATTN_P_DRAM_ADDR: int = None,
-                            gf_bucket_idx: int = None, num_buckets: int = 8):
+                            gf_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True):
         """Flash attention entrypoint; dispatches based on ``gf_bucket_idx``:
 
         - ``gf_bucket_idx`` is a GPR index (1..15): :meth:`flash_attention_core_pbi` — captured
@@ -5580,6 +5593,7 @@ class UnifiedEngine:
                 IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 gf_bucket_idx=gf_bucket_idx,
                 num_buckets=num_buckets,
+                use_pbi=use_pbi,
             )
 
         return self.flash_attention_core_legacy(
@@ -5903,6 +5917,7 @@ class UnifiedEngine:
         BIAS_DRAM_ADDR: int = None,
         debug_mode: bool = False,
         SM_OUTPUT_DRAM_ADDR: int = None,
+        use_pbi: bool = True,
     ) -> list:
         """Bucketized decoder group attention. Mirrors the dispatcher shape of
         :meth:`flash_attention_core_pbi`: emits ``num_buckets`` complete bucket bodies (one per
@@ -5952,8 +5967,8 @@ class UnifiedEngine:
             self.pad_capture_to_64b_boundary()
             bucket_start_capture_indices.append(self.capture_count)
             bucket_seq_len = bucket_step * (i + 1)
-            bucket_flops.append(
-                self._decoder_group_attention_pbi_body(
+            if use_pbi:
+                _body_flops = self._decoder_group_attention_pbi_body(
                     group_size=group_size,
                     head_dim=head_dim,
                     seq_len=bucket_seq_len,
@@ -5965,7 +5980,20 @@ class UnifiedEngine:
                     BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                     IDENTITY_TRANSPOSE_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 )
-            )
+            else:
+                _body_flops = self.decoder_group_attention_core_legacy(
+                    group_size=group_size,
+                    head_dim=head_dim,
+                    seq_len=bucket_seq_len,
+                    Q_DRAM_ADDR=Q_DRAM_ADDR,
+                    K_DRAM_ADDR=K_DRAM_ADDR,
+                    V_DRAM_ADDR=V_DRAM_ADDR,
+                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                    SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+                    IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+                    BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+                )
+            bucket_flops.append(_body_flops)
             end_jmp_capture_indices.append(self.capture_count)
             self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
@@ -6097,6 +6125,7 @@ class UnifiedEngine:
         SM_OUTPUT_DRAM_ADDR: int = None,
         gf_bucket_idx: int = None,
         num_buckets: int = 8,
+        use_pbi: bool = True,
     ):
         """Decoder group attention entrypoint; dispatches based on ``gf_bucket_idx``:
 
@@ -6121,6 +6150,7 @@ class UnifiedEngine:
                 BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 debug_mode=debug_mode,
                 SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
+                use_pbi=use_pbi,
             )
         return self.decoder_group_attention_core_legacy(
             group_size=group_size,

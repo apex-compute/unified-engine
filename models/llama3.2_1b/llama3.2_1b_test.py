@@ -692,6 +692,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                 )
 
@@ -918,6 +919,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                             head_dim=ahd,
                             seq_len=self.MAX_CONTEXT_SIZE,
                             gf_bucket_idx=self.gf_bucket_idx,
+                            use_pbi=False,
                             num_buckets=8,
                             Q_DRAM_ADDR=flash_q_addr,
                             K_DRAM_ADDR=k_cache_base,
