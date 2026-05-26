@@ -6278,6 +6278,22 @@ class UnifiedEngine:
         self.is_capture_on = False
         print(f"Capture stopped. Total instructions captured: {self.capture_count}, size: {self.capture_count * 32} bytes")
 
+    def clear_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
+        dram_total_bytes = 0xffffffff - DRAM_START_ADDR + 1
+        fill = b'\xff' * chunk_size_bytes
+        offset = 0
+        bar_width = 40
+        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..0xffffffff] ({dram_total_bytes / 1024**3:.2f} GB)")
+        while offset < dram_total_bytes:
+            write_size = min(chunk_size_bytes, dram_total_bytes - offset)
+            self.dma_write(DMA_DEVICE_H2C, DRAM_START_ADDR + offset, fill[:write_size], write_size)
+            offset += write_size
+            pct = offset / dram_total_bytes
+            filled = int(bar_width * pct)
+            bar = '█' * filled + '░' * (bar_width - filled)
+            print(f"\r  [{bar}] {pct*100:5.1f}%  {offset/1024**2:.0f}/{dram_total_bytes/1024**2:.0f} MB", end='', flush=True)
+        print()
+
     def clear_capture_buffer(self):
         """Clear the capture buffer"""
         self.capture_buffer = []

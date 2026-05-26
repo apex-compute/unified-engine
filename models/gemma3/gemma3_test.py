@@ -1434,6 +1434,7 @@ def main():
     run_result = ue.run_gemma3(slave_engine=ue2 if dual_engine else None)
     print("Gemma3 test ends.")
 
+    ue.clear_dram()
     global _SILENT_MODE
     _SILENT_MODE = True
     ue.software_reset()
