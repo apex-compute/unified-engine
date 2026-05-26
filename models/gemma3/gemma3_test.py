@@ -772,7 +772,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_FULL_DRAM_ADDR if use_pbi else self.IDENTITY_DRAM_ADDR,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM if use_pbi else None,
                     gf_bucket_idx=self.gf_bucket_idx if use_pbi else None,
                     num_buckets=(self.PREFILL_MAX_SEQ_LEN * self.group_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,

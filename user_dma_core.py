@@ -4436,7 +4436,7 @@ class UnifiedEngine:
     def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, use_pbi: bool = False, IDENTITY_DRAM_ADDR: int = None) -> None:
         """Transpose ``M×N`` → ``N×M``. ``use_pbi``: :meth:`bf16_transpose_core_pbi` vs :meth:`bf16_transpose_core_legacy`."""
         if use_pbi:
-            return self.bf16_transpose_core_pbi(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR)
+            return self.bf16_transpose_core_pbi(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR)
         return self.bf16_transpose_core_legacy(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR)
 
     def bf16_transpose_core_legacy(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None) -> None:
@@ -4530,17 +4530,26 @@ class UnifiedEngine:
 
         # No FLOPS for this operation
     
-    def bf16_transpose_core_pbi(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> None:
+    def bf16_transpose_core_pbi(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None) -> None:
         """
         Transposes a (M x N) input matrix X to produce an (N x M) output matrix Y = X^T.
         Optimized with the PBI mechanism for the innermost loop.
+
+        IDENTITY_DRAM_ADDR: pre-allocated UE_VECTOR_SIZE×UE_VECTOR_SIZE identity matrix in DRAM.
+        Pass the caller-managed address to avoid a per-call allocate_params_dram + dma_write during
+        compile — without this, the write is skipped when the compiled .bin is reused and the
+        identity data is absent at runtime, corrupting all transpose outputs.
+        If None, falls back to allocating + writing inline (compile-time only, breaks on bin skip).
         """
         bytes_per_element = 2
         # Allocate identity matrix of size UE_VECTOR_SIZE x UE_VECTOR_SIZE in URAM_A start
         identity_matrix_sram_start_addr = 0x00000
-        identity_matrix_dram_addr = self.get_params_dram_addr()
-        self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-        self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+        if IDENTITY_DRAM_ADDR is not None:
+            identity_matrix_dram_addr = IDENTITY_DRAM_ADDR
+        else:
+            identity_matrix_dram_addr = self.get_params_dram_addr()
+            self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+            self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
 
         # transfer identity matrix to URAM_A start
         self.accelerator_memory_to_sram(accelerator_dram_address=identity_matrix_dram_addr,
@@ -5310,19 +5319,6 @@ class UnifiedEngine:
         if num_buckets < 1:
             raise ValueError(f"flash_attention_core_pbi: num_buckets={num_buckets} must be >= 1")
 
-        # Identity matrix for the I @ V (V^T materialization) is shared across all bucket bodies.
-        if IDENTITY_DRAM_ADDR is not None:
-            identity_matrix_dram_addr = IDENTITY_DRAM_ADDR
-        else:
-            identity_matrix_dram_addr = self.get_params_dram_addr()
-            self.allocate_params_dram(head_dim * head_dim * bytes_per_element)
-            self.dma_write(
-                DMA_DEVICE_H2C,
-                identity_matrix_dram_addr,
-                torch.eye(head_dim, dtype=torch.bfloat16),
-                head_dim * head_dim * bytes_per_element,
-            )
-
         program_dram_start_addr = self.get_program_dram_addr()
 
         # Bucket jump header: num_buckets pairs of (ADD_DEC temp, JZ -> bucket_i_placeholder). Placeholder target = 0
@@ -5355,8 +5351,8 @@ class UnifiedEngine:
                     SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
                     ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
                     BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
-                    identity_matrix_dram_addr=identity_matrix_dram_addr,
                     _silent=True,
+                    IDENTITY_TRANSPOSE_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 )
             )
             end_jmp_capture_indices.append(self.capture_count)
@@ -5392,11 +5388,12 @@ class UnifiedEngine:
     def _flash_attention_pbi_body(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
                                    V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int,
                                    ATTN_P_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
-                                   identity_matrix_dram_addr: int, _silent: bool = False) -> int:
+                                   _silent: bool = False,
+                                   IDENTITY_TRANSPOSE_DRAM_ADDR: int = None) -> int:
         """Single concrete-``seq_len`` body of :meth:`flash_attention_core_pbi`.
 
-        Identity matrix for I @ V is **caller-allocated** at ``identity_matrix_dram_addr`` (one DRAM
-        buffer shared across all bucket invocations in the dynamic-seq_len path).
+        IDENTITY_TRANSPOSE_DRAM_ADDR: forwarded from IDENTITY_DRAM_ADDR of the outer call; passed
+        to bf16_transpose_core_pbi to avoid a per-bucket allocate_params_dram + dma_write.
         """
         bytes_per_element = 2
 
@@ -5410,7 +5407,8 @@ class UnifiedEngine:
             M=seq_len,
             N=head_dim,
             INPUT_DRAM_ADDR=V_DRAM_ADDR,
-            OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR
+            OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            IDENTITY_DRAM_ADDR=IDENTITY_TRANSPOSE_DRAM_ADDR,
         )
 
         bias_enable = BIAS_DRAM_ADDR is not None
@@ -5918,7 +5916,7 @@ class UnifiedEngine:
 
         Returns ``list[int]`` — per-bucket FLOPS; caller picks ``bucket_flops[gf_bucket_idx - 1]``.
         """
-        del debug_mode, SM_OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR
+        del debug_mode, SM_OUTPUT_DRAM_ADDR
 
         if not (1 <= gf_bucket_idx <= 15):
             raise ValueError(
@@ -5965,6 +5963,7 @@ class UnifiedEngine:
                     OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                     SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
                     BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+                    IDENTITY_TRANSPOSE_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 )
             )
             end_jmp_capture_indices.append(self.capture_count)
@@ -6008,6 +6007,7 @@ class UnifiedEngine:
         OUTPUT_DRAM_ADDR: int,
         SCRATCH_DRAM_ADDR: int,
         BIAS_DRAM_ADDR: int = None,
+        IDENTITY_TRANSPOSE_DRAM_ADDR: int = None,
     ) -> int:
         """Single concrete-``seq_len`` body of :meth:`decoder_group_attention_core_pbi`.
 
@@ -6015,6 +6015,8 @@ class UnifiedEngine:
         ``score`` / ``scaled_q`` scratch using its own static ``seq_len``-derived offsets within
         SCRATCH_DRAM_ADDR. As long as the caller has allocated SCRATCH_DRAM_ADDR for the maximum
         bucket's seq_len, the per-bucket offsets stay inside the allocation.
+        IDENTITY_TRANSPOSE_DRAM_ADDR: forwarded from IDENTITY_DRAM_ADDR; passed to
+        bf16_transpose_core_pbi to avoid a per-bucket allocate_params_dram + dma_write.
         """
         bytes_per_element = self.bytes_per_element
         score_dram_addr = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element
@@ -6026,6 +6028,7 @@ class UnifiedEngine:
             N=head_dim,
             INPUT_DRAM_ADDR=V_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            IDENTITY_DRAM_ADDR=IDENTITY_TRANSPOSE_DRAM_ADDR,
         )
 
         self.accelerator_memory_to_sram(
