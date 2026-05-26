@@ -349,7 +349,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.V_CACHE_SIZE_REG = fixed["V_CACHE_SIZE_REG"]
         self.TMP_REG = fixed["TMP_REG"]
         self.ROPE_SIZE_REG = fixed["ROPE_SIZE_REG"]
-        self.gf_bucket_idx = fixed["GF_BUCKET_IDX_REG"]
+        self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
         self._isa_reg_counter = max(fixed.values()) + 1  # must start past all fixed ISA regs
         self.causal_mask_upper = False
         self._rope_global_layers = set(model["rope_global_layers"])
@@ -686,7 +686,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         self.sram_to_accelerator_memory(0x30080, q_dst + half_ahd * bpe, half_ahd)
 
                 # Flash attention for this KV head (head_dim=64) — PBI bucket dispatcher;
-                # gf_bucket_idx is primed at program start (ADD_SET above) so the dispatcher
+                # gpr_bucket_idx is primed at program start (ADD_SET above) so the dispatcher
                 # routes to the correct bucket body for the actual runtime seq_len.
                 flash_result = self.flash_attention_core(
                     head_dim=ahd,
@@ -699,7 +699,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-                    gf_bucket_idx=self.gf_bucket_idx,
+                    gpr_bucket_idx=self.gpr_bucket_idx,
                     num_buckets=bucket_idx,
                 )
                 total_flops += flash_result[bucket_idx - 1]
@@ -803,9 +803,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         bias_one_group.masked_fill_(valid_mask, 0.0)
         bias_one_group[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
-        # Set gf_bucket_idx to the 1-based bucket selector for the actual runtime seq_len.
+        # Set gpr_bucket_idx to the 1-based bucket selector for the actual runtime seq_len.
         bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
-        self.isa_add_set_core(self.gf_bucket_idx, bucket_idx)
+        self.isa_add_set_core(self.gpr_bucket_idx, bucket_idx)
         self.program_execute(prefill_program_addr, gflops=gflops)
 
     def compile_decoder(self, layer_size: int | None = None) -> tuple[int, int]:
@@ -929,7 +929,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                             group_size=1,
                             head_dim=ahd,
                             seq_len=self.MAX_CONTEXT_SIZE,
-                            gf_bucket_idx=self.gf_bucket_idx,
+                            gpr_bucket_idx=self.gpr_bucket_idx,
                             use_pbi=False,
                             num_buckets=8,
                             Q_DRAM_ADDR=flash_q_addr,
@@ -1018,8 +1018,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             prog_addr = decoder_base_addr
             gflops = total_flops
 
-            # GF_BUCKET_IDX_REG: 1-based bucket index (seq_len → bucket 1..8, each covers 64 tokens)
-            self.isa_add_set_core(self.gf_bucket_idx, min((self.seq_len + 63) // 64, 8))
+            # GPR_BUCKET_IDX_REG: 1-based bucket index (seq_len → bucket 1..8, each covers 64 tokens)
+            self.isa_add_set_core(self.gpr_bucket_idx, min((self.seq_len + 63) // 64, 8))
             # V_CACHE_SIZE_REG: decode_pos × actual_hd × bpe (per-head KV cache stride = 128B)
             # ROPE_SIZE_REG:    decode_pos × head_dim × 2 × bpe (N=512 rope row = 2048B)
             _kv_stride  = self.actual_head_dim * self.bytes_per_element  # 128 bytes/position

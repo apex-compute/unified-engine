@@ -420,7 +420,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
       and the JZ cascade routes to that bucket at execute time. Bucket step is fixed to
       ``UE_VECTOR_SIZE``.
     - Otherwise captures :meth:`~UnifiedEngine.flash_attention_core_legacy` via
-      ``flash_attention_core(..., gf_bucket_idx=None)``.
+      ``flash_attention_core(..., gpr_bucket_idx=None)``.
 
     Unaligned seq_len values are handled by zero-padding Q/K/V to the next multiple of
     ``UE_VECTOR_SIZE`` and masking padded key positions with ``-inf`` in the attention bias
@@ -478,7 +478,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
         debug_mode=debug_mode,
         SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
         ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
-        gf_bucket_idx=bucket_reg,
+        gpr_bucket_idx=bucket_reg,
         use_pbi=not force_legacy,
         num_buckets=num_buckets,
     )
@@ -626,7 +626,7 @@ def decoder_group_attention_test(head_dim: int = 256, seq_len: int = 8192, use_p
         V_DRAM_ADDR=V_DRAM_ADDR,
         OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
         SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-        gf_bucket_idx=bucket_reg if use_pbi else None,
+        gpr_bucket_idx=bucket_reg if use_pbi else None,
         num_buckets=num_buckets,
         IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
         BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
@@ -713,7 +713,7 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
             ZERO_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * 2)
             FMAX_DRAM_ADDR = ue.allocate_tensor_dram(M * UE_VECTOR_SIZE * 2)
 
-    # PBI path is driven by gf_M_reg; allocate + prime a GPR with M when use_pbi is requested.
+    # PBI path is driven by gpr_M_reg; allocate + prime a GPR with M when use_pbi is requested.
     m_reg = ue.alloc_isa_reg() if use_pbi else None
 
     ue.start_capture()
@@ -735,7 +735,7 @@ def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_e
                                                     debug_fmax=debug_fmax,
                                                     ZERO_DRAM_ADDR=ZERO_DRAM_ADDR,
                                                     FMAX_DRAM_ADDR=FMAX_DRAM_ADDR,
-                                                    gf_M_reg=m_reg,
+                                                    gpr_M_reg=m_reg,
                                                     )
 
     ue.stop_capture()
@@ -903,11 +903,11 @@ def matmat_mul_dynamic_m_test(
 
     ue = UnifiedEngine()
 
-    # ── gf_M_reg is a persistent register allocated OUTSIDE any capture session.
+    # ── gpr_M_reg is a persistent register allocated OUTSIDE any capture session.
     # The main matmul body references it by index only; its value is injected
-    # at runtime by the per-M preamble — exactly as self.gf_seq_len works in
+    # at runtime by the per-M preamble — exactly as self.gpr_seq_len works in
     # _compile_prefill_program.
-    gf_M_reg = ue.alloc_isa_reg()
+    gpr_M_reg = ue.alloc_isa_reg()
 
     MAX_CONTEXT_SIZE = 512
     M_template = UE_VECTOR_SIZE
@@ -937,7 +937,7 @@ def matmat_mul_dynamic_m_test(
         gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable,
         clamp_enable=clamp_enable, log_enable=log_enable,
         ZERO_DRAM_ADDR=ZERO_DRAM_ADDR, FMAX_DRAM_ADDR=FMAX_DRAM_ADDR,
-        gf_M_reg=gf_M_reg,   # register index is fixed at compile time; value injected at runtime
+        gpr_M_reg=gpr_M_reg,   # register index is fixed at compile time; value injected at runtime
     )
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -948,7 +948,7 @@ def matmat_mul_dynamic_m_test(
 
     # ── Reserve a fixed preamble DRAM slot right after the main body.
     # Each runtime M overwrites this same slot with a fresh 2-instruction preamble
-    # (add_set gf_M_reg, M_test  +  jump_abs → main body), then executes from it.
+    # (add_set gpr_M_reg, M_test  +  jump_abs → main body), then executes from it.
     # 4 slots reserved to absorb any NOP padding _generate_instruction_jump may emit.
     PREAMBLE_RESERVED_BYTES = 4 * INSTRUCTION_SIZE_BYTES
     preamble_dram_addr = ue.get_program_dram_addr()
@@ -974,13 +974,13 @@ def matmat_mul_dynamic_m_test(
         print(f"[PBI] M_test={M_test}, K={K}, N={N})")
 
         # Compile the 2-instruction preamble for this M_test:
-        #   add_set  gf_M_reg, M_test        <- seeds the runtime row count
+        #   add_set  gpr_M_reg, M_test        <- seeds the runtime row count
         #   jump_abs main_program_word_addr  <- enters the cached matmul body
         # This mirrors how _compile_prefill_program's runtime preamble primes
-        # gf_seq_len / gf_q_seq_len / gf_bucket_idx before entering the cached bin.
+        # gpr_seq_len / gpr_q_seq_len / gpr_bucket_idx before entering the cached bin.
         ue.clear_capture_buffer()
         ue.start_capture()
-        ue.generate_instruction_add_set(gf_M_reg, M_test)
+        ue.generate_instruction_add_set(gpr_M_reg, M_test)
         ue.generate_instruction_jump_abs(main_program_word_addr)
         ue.stop_capture()
         # Overwrite the fixed preamble slot — main body in DRAM is untouched
@@ -995,7 +995,7 @@ def matmat_mul_dynamic_m_test(
             c_logical = torch.randn(M_test, N, dtype=torch.bfloat16)
             ue.dma_to_accelerator_memory(C_DRAM_ADDR, c_logical)
 
-        # Execute from preamble: add_set seeds gf_M_reg, jump enters matmul
+        # Execute from preamble: add_set seeds gpr_M_reg, jump enters matmul
         ue.start_execute_from_dram(preamble_dram_addr)
         ue.wait_queue(10.0)
         ue.report_timing_and_instruction_count()
@@ -1031,7 +1031,7 @@ def matmat_mul_dynamic_m_test(
             snr_db=snr_db, gflops=report_gflops, inst_bytes=main_instruction_size,
         )
 
-    ue.release_isa_reg()  # gf_M_reg — release after all PBI runs are done
+    ue.release_isa_reg()  # gpr_M_reg — release after all PBI runs are done
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
@@ -1138,7 +1138,7 @@ def rms_norm_test(shape: tuple, use_pbi: bool = False):
     Tests rms norm core.
 
     When ``use_pbi=True``, primes a fixed GPR with ``M`` before the kernel and passes that register
-    as ``gf_M_reg`` so the wrapper routes to :meth:`rms_norm_core_dram_pbi` (outer row loop uses
+    as ``gpr_M_reg`` so the wrapper routes to :meth:`rms_norm_core_dram_pbi` (outer row loop uses
     runtime trip count). When ``use_pbi=False`` the wrapper routes to the legacy compile-time path.
     """
     ue = UnifiedEngine()
@@ -1153,18 +1153,18 @@ def rms_norm_test(shape: tuple, use_pbi: bool = False):
     GAMMA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
 
     # Fixed GPR for row count — stays above aliasing with loop counter from loop_start (~1–2 during capture).
-    _GF_M_GPR = 8
+    _GPR_M_REG = 8
 
     ue.start_capture()
     if use_pbi:
-        ue.generate_instruction_add_set(_GF_M_GPR, M)
+        ue.generate_instruction_add_set(_GPR_M_REG, M)
     total_flops_from_rms_norm = ue.rms_norm_core_dram(
         M=M,
         N=N,
         A_DRAM_ADDR=A_DRAM_ADDR,
         OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
         GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
-        gf_M_reg=_GF_M_GPR if use_pbi else None,
+        gpr_M_reg=_GPR_M_REG if use_pbi else None,
     )
 
     ue.stop_capture()
@@ -1370,7 +1370,7 @@ def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False):
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
     ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * N * 2)
 
-    # PBI path is driven by gf_M_reg; allocate + prime a GPR with M when use_pbi is requested.
+    # PBI path is driven by gpr_M_reg; allocate + prime a GPR with M when use_pbi is requested.
     m_reg = ue.alloc_isa_reg() if use_pbi else None
 
     ue.start_capture()
@@ -1383,7 +1383,7 @@ def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False):
         output_dram_addr=OUTPUT_DRAM_ADDR,
         cos_dram_addr=ROPE_DRAM_ADDR,
         sin_dram_addr=ROPE_DRAM_ADDR + N * 2,
-        gf_M_reg=m_reg,
+        gpr_M_reg=m_reg,
     )
     ue.stop_capture()
     if use_pbi:
@@ -1450,7 +1450,7 @@ def rope_hf_core_dram_gqa_test(M: int, group_size: int, N: int, use_pbi: bool = 
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * group_size * N * 2)
     ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * N * 2)
 
-    # PBI path is driven by gf_M_reg; allocate + prime a GPR with M when use_pbi is requested.
+    # PBI path is driven by gpr_M_reg; allocate + prime a GPR with M when use_pbi is requested.
     m_reg = ue.alloc_isa_reg() if use_pbi else None
 
     ue.start_capture()
@@ -1464,7 +1464,7 @@ def rope_hf_core_dram_gqa_test(M: int, group_size: int, N: int, use_pbi: bool = 
         output_dram_addr=OUTPUT_DRAM_ADDR,
         cos_dram_addr=ROPE_DRAM_ADDR,
         sin_dram_addr=ROPE_DRAM_ADDR + N * 2,
-        gf_M_reg=m_reg,
+        gpr_M_reg=m_reg,
     )
     ue.stop_capture()
     if use_pbi:
@@ -3171,7 +3171,7 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
         else:
             assert False, f"bias_mode={bias_mode} is not supported"
 
-    # PBI path is driven by gf_M_reg; allocate + prime a GPR with M when use_pbi is requested.
+    # PBI path is driven by gpr_M_reg; allocate + prime a GPR with M when use_pbi is requested.
     m_reg = ue.alloc_isa_reg() if use_pbi else None
 
     ue.start_capture()
@@ -3191,7 +3191,7 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
                                                     sigmoid_enable=sigmoid_enable,
                                                     clamp_enable=clamp_enable,
                                                     log_enable=log_enable,
-                                                    gf_M_reg=m_reg,
+                                                    gpr_M_reg=m_reg,
                                                     )
 
     ue.stop_capture()
@@ -3593,7 +3593,7 @@ def eltwise_core_dram_test(M=None, N=None, use_pbi: bool = False):
                     ue.generate_instruction_add_set(m_reg, m)
                 total_flops = ue.eltwise_core_dram(
                     m, n, a_dram, b_dram, out_dram, mode,
-                    gf_M_reg=m_reg,
+                    gpr_M_reg=m_reg,
                 )
                 ue.stop_capture()
                 if use_pbi:
@@ -4379,7 +4379,7 @@ def isa_reg_min_sub_mul_test() -> None:
     n_setup = 3
 
     # --- Loop 1: SUB result drives trip count ---
-    ue.loop_start(expected_sub, gf_loop_cnt=reg_sub)          # header: ADD_IMM (1 inst)
+    ue.loop_start(expected_sub, gpr_loop_cnt=reg_sub)          # header: ADD_IMM (1 inst)
     ue.generate_instruction_add_inc(reg_a)                    # body: dummy (1 inst)
     loop1_body_size = ue.loop_end()                           # ADD_DEC + JNZ; returns 3
 
@@ -4389,7 +4389,7 @@ def isa_reg_min_sub_mul_test() -> None:
     n_between = 2
 
     # --- Loop 2: MIN result drives trip count ---
-    ue.loop_start(expected_min, gf_loop_cnt=reg_min)          # header: ADD_IMM (1 inst)
+    ue.loop_start(expected_min, gpr_loop_cnt=reg_min)          # header: ADD_IMM (1 inst)
     ue.generate_instruction_add_inc(reg_a)                    # body: dummy (1 inst)
     loop2_body_size = ue.loop_end()                           # ADD_DEC + JNZ; returns 3
 
@@ -4403,7 +4403,7 @@ def isa_reg_min_sub_mul_test() -> None:
     ue.generate_instruction_reg_sub(reg_mul, reg_mul, reg_mul_adj)  # reg_mul -> loop trips
     n_between_mul = 4
 
-    ue.loop_start(expected_mul_loop, gf_loop_cnt=reg_mul)  # header: ADD_IMM from reg_mul
+    ue.loop_start(expected_mul_loop, gpr_loop_cnt=reg_mul)  # header: ADD_IMM from reg_mul
     ue.generate_instruction_add_inc(reg_a)
     loop3_body_size = ue.loop_end()
 

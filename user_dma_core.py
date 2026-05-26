@@ -1876,24 +1876,24 @@ class UnifiedEngine:
         dram_b: int,
         dram_out: int,
         mode: UE_MODE,
-        gf_M_reg: Optional[int] = None,
+        gpr_M_reg: Optional[int] = None,
     ) -> int:
-        """Dispatches based on ``gf_M_reg``:
+        """Dispatches based on ``gpr_M_reg``:
 
-        - ``gf_M_reg`` is a GPR index (1..15): :meth:`eltwise_core_dram_pbi` — one row per ISA
+        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`eltwise_core_dram_pbi` — one row per ISA
           iteration with runtime row count carried in that register. Captured program has no
           static reference to ``M``; ``M`` is FLOPs-accounting only.
-        - ``gf_M_reg is None`` (default): :meth:`eltwise_core_dram_legacy` — compile-time
+        - ``gpr_M_reg is None`` (default): :meth:`eltwise_core_dram_legacy` — compile-time
           ``m_chunk`` tiling, no GPR needed.
 
         Returns ``M * N`` (one flop per output BF16 element).
         """
-        if gf_M_reg is not None:
+        if gpr_M_reg is not None:
             return self.eltwise_core_dram_pbi(
                 M=M, N=N,
                 dram_a=dram_a, dram_b=dram_b, dram_out=dram_out,
                 mode=mode,
-                gf_M_reg=gf_M_reg,
+                gpr_M_reg=gpr_M_reg,
             )
         return self.eltwise_core_dram_legacy(
             M=M, N=N,
@@ -2091,7 +2091,7 @@ class UnifiedEngine:
         dram_b: int,
         dram_out: int,
         mode: UE_MODE,
-        gf_M_reg: int,
+        gpr_M_reg: int,
     ) -> int:
         """
         PBI BF16 element-wise ADD / MUL / SUB on ``[M, N]`` DRAM tensors (**no vertical tiling**).
@@ -2105,7 +2105,7 @@ class UnifiedEngine:
         **Staging (fixed):** A at ``0x00000``, B at ``0x80000``, output reuses A.
 
         **Batch dimension / M (dynamic, required):**
-        ``gf_M_reg`` is a **required** GPR index 1..15 holding the runtime row count. Caller
+        ``gpr_M_reg`` is a **required** GPR index 1..15 holding the runtime row count. Caller
         must prime that register beforehand (typically with ``ADD_SET``). The hardware loop
         runs for whatever value that register holds at execute time; ``M`` is still required
         as a compile-time argument purely for FLOPs accounting / asserts — the captured
@@ -2132,9 +2132,9 @@ class UnifiedEngine:
                 f"{fn}: N={N} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}; "
                 "one row must fit staging."
             )
-        if not (1 <= gf_M_reg <= 15):
+        if not (1 <= gpr_M_reg <= 15):
             raise ValueError(
-                f"{fn}: gf_M_reg must be a GPR index 1..15, got {gf_M_reg}"
+                f"{fn}: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}"
             )
 
         row_bytes = N * 2
@@ -2199,7 +2199,7 @@ class UnifiedEngine:
                 program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
             )
         )
-        self.loop_start(loop_cnt=M, gf_loop_cnt=gf_M_reg)
+        self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
 
         self.accelerator_memory_to_sram(
             accelerator_dram_address=row_bytes,
@@ -2545,7 +2545,7 @@ class UnifiedEngine:
             self.eltwise_mul_core(output_sram_wb_addr, gamma_sram_start_addr, output_sram_wb_addr, N)
 
 
-    def rms_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int, gf_M_reg: int) -> int:
+    def rms_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int, gpr_M_reg: int) -> int:
         """
         Core RMS norm: normalizes vector x -> x / rms(x).
 
@@ -2555,7 +2555,7 @@ class UnifiedEngine:
         pointers).
 
         **Batch dimension / M (dynamic, required):**
-        ``gf_M_reg`` is a **required** GPR index 1..15 holding the runtime row count. Caller must
+        ``gpr_M_reg`` is a **required** GPR index 1..15 holding the runtime row count. Caller must
         prime that register beforehand (typically with ``ADD_SET``). The hardware loop runs for
         whatever value that register holds at execute time; ``M`` is still required as a
         compile-time argument purely for FLOPs accounting / asserts — the captured program contains
@@ -2564,8 +2564,8 @@ class UnifiedEngine:
         Caller must have start_capture() active.
         """
         assert M >= 1, "rms_norm_core_dram_pbi() requires M >= 1"
-        if not (1 <= gf_M_reg <= 15):
-            raise ValueError(f"rms_norm_core_dram_pbi: gf_M_reg must be a GPR index 1..15, got {gf_M_reg}")
+        if not (1 <= gpr_M_reg <= 15):
+            raise ValueError(f"rms_norm_core_dram_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
 
         vector_sram_addr = 0x00000
         gamma_sram_addr = 0x80000
@@ -2624,7 +2624,7 @@ class UnifiedEngine:
             program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
         )
         self.generate_instruction_jump_abs(jump_target_word_addr)
-        self.loop_start(loop_cnt=M, gf_loop_cnt=gf_M_reg)
+        self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
 
         self.accelerator_memory_to_sram(
             accelerator_dram_address=row_bytes,
@@ -2651,7 +2651,7 @@ class UnifiedEngine:
         )
 
         outer_loop_size = self.loop_end()
-        m_src = f"GPR[{gf_M_reg}]" if gf_M_reg is not None else str(M)
+        m_src = f"GPR[{gpr_M_reg}]" if gpr_M_reg is not None else str(M)
         print(f"RMS norm PBI outer loop body size: {outer_loop_size} (one row × trips={m_src}, N={N})")
         assert outer_loop_size <= 256, (
             f"Outer loop body size {outer_loop_size} is greater than i-cache size of 256 instructions"
@@ -2695,23 +2695,23 @@ class UnifiedEngine:
 
     # rms_norm dram version of rms norm core
     def rms_norm_core_dram(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int,
-                           gf_M_reg: Optional[int] = None) -> None:
-        """RMS norm DRAM entrypoint; dispatches based on ``gf_M_reg``:
+                           gpr_M_reg: Optional[int] = None) -> None:
+        """RMS norm DRAM entrypoint; dispatches based on ``gpr_M_reg``:
 
-        - ``gf_M_reg`` is a GPR index (1..15): :meth:`rms_norm_core_dram_pbi` — outer row loop trip
+        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`rms_norm_core_dram_pbi` — outer row loop trip
           count is taken from that register at runtime (caller must prime it via ``ADD_SET``). The
           captured program has no static reference to ``M``; ``M`` is FLOPs-accounting only.
-        - ``gf_M_reg is None`` (default): :meth:`rms_norm_core_dram_legacy` — compile-time
+        - ``gpr_M_reg is None`` (default): :meth:`rms_norm_core_dram_legacy` — compile-time
           ``chunk_size`` tiling, no GPR needed.
         """
-        if gf_M_reg is not None:
+        if gpr_M_reg is not None:
             return self.rms_norm_core_dram_pbi(
                 M=M,
                 N=N,
                 A_DRAM_ADDR=A_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
-                gf_M_reg=gf_M_reg,
+                gpr_M_reg=gpr_M_reg,
             )
 
         return self.rms_norm_core_dram_legacy(
@@ -2927,16 +2927,16 @@ class UnifiedEngine:
         total_flops = 3 * M * N
         return total_flops
 
-    def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gf_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
-        """HF RoPE DRAM entrypoint; dispatches based on ``gf_M_reg``:
+    def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
+        """HF RoPE DRAM entrypoint; dispatches based on ``gpr_M_reg``:
 
-        - ``gf_M_reg`` is a GPR index (1..15): :meth:`rope_hf_core_dram_pbi` — outer M loop uses
+        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`rope_hf_core_dram_pbi` — outer M loop uses
           runtime trip count from that register (caller must prime via ``ADD_SET``). ``M`` is
           FLOPs-accounting only; captured program has no static reference to it.
-        - ``gf_M_reg is None`` (default): :meth:`rope_hf_core_dram_legacy` — Python-unrolled rows.
+        - ``gpr_M_reg is None`` (default): :meth:`rope_hf_core_dram_legacy` — Python-unrolled rows.
         """
-        if gf_M_reg is not None:
-            return self.rope_hf_core_dram_pbi(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gf_M_reg=gf_M_reg)
+        if gpr_M_reg is not None:
+            return self.rope_hf_core_dram_pbi(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg)
         return self.rope_hf_core_dram_legacy(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr)
 
     def rope_hf_core_dram_legacy(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int) -> int:
@@ -2966,11 +2966,11 @@ class UnifiedEngine:
             self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr + row_idx * row_bytes, element_size=N)
         return 4 * M * N
 
-    def rope_hf_core_dram_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gf_M_reg: int = None) -> int:
+    def rope_hf_core_dram_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None) -> int:
         """PBI-backed HF RoPE over M rows. Caller must have start_capture() before and stop_capture() after.
 
         **Batch dimension / M (dynamic, required):**
-        ``gf_M_reg`` is a **required** GPR index 1..15 holding the runtime row count. Caller must
+        ``gpr_M_reg`` is a **required** GPR index 1..15 holding the runtime row count. Caller must
         prime that register beforehand (typically with ``ADD_SET``). The hardware loop runs for
         whatever value that register holds at execute time; ``M`` is FLOPs-accounting / template
         only — the captured program has no static reference to ``M``.
@@ -2979,8 +2979,8 @@ class UnifiedEngine:
         assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
         assert N % 2 == 0, "N must be even for RoPE half layout"
         assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
-        if gf_M_reg is None or not (1 <= gf_M_reg <= 15):
-            raise ValueError(f"rope_hf_core_dram_pbi: gf_M_reg must be a GPR index 1..15, got {gf_M_reg}")
+        if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
+            raise ValueError(f"rope_hf_core_dram_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
 
         half = N // 2
         bytes_per_elem = 2
@@ -3046,7 +3046,7 @@ class UnifiedEngine:
             program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
         )
         self.generate_instruction_jump_abs(jump_target_word_addr)
-        self.loop_start(loop_cnt=M, gf_loop_cnt=gf_M_reg)
+        self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
         self.accelerator_memory_to_sram(
             accelerator_dram_address=row_bytes,
             sram_address=sram_x,
@@ -3076,16 +3076,16 @@ class UnifiedEngine:
         self.release_inst_ptr(x_ptr)
         return 4 * M * N
 
-    def rope_hf_core_dram_gqa(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gf_M_reg: Optional[int] = None) -> int:
-        """HF GQA RoPE DRAM entrypoint; dispatches based on ``gf_M_reg``:
+    def rope_hf_core_dram_gqa(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None) -> int:
+        """HF GQA RoPE DRAM entrypoint; dispatches based on ``gpr_M_reg``:
 
-        - ``gf_M_reg`` is a GPR index (1..15): :meth:`rope_hf_core_dram_gqa_pbi` — outer M loop uses
+        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`rope_hf_core_dram_gqa_pbi` — outer M loop uses
           runtime trip count from that register (caller must prime via ``ADD_SET``). Inner
           ``group_size`` loop remains compile-time. ``M`` is FLOPs-accounting only.
-        - ``gf_M_reg is None`` (default): :meth:`rope_hf_core_dram_gqa_legacy` — Python-unrolled rows.
+        - ``gpr_M_reg is None`` (default): :meth:`rope_hf_core_dram_gqa_legacy` — Python-unrolled rows.
         """
-        if gf_M_reg is not None:
-            return self.rope_hf_core_dram_gqa_pbi(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gf_M_reg=gf_M_reg)
+        if gpr_M_reg is not None:
+            return self.rope_hf_core_dram_gqa_pbi(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg)
         return self.rope_hf_core_dram_gqa_legacy(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr)
 
     def rope_hf_core_dram_gqa_legacy(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int) -> int:
@@ -3118,11 +3118,11 @@ class UnifiedEngine:
                 self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr + q_row_idx * row_bytes, element_size=N)
         return 4 * M * group_size * N
 
-    def rope_hf_core_dram_gqa_pbi(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gf_M_reg: int = None) -> int:
+    def rope_hf_core_dram_gqa_pbi(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None) -> int:
         """PBI-backed grouped-query RoPE. Q rows are [M, group_size, N], RoPE rows are [M, N].
 
         **Batch dimension / M (dynamic, required):**
-        ``gf_M_reg`` is a **required** GPR index 1..15 holding the runtime outer-loop trip count.
+        ``gpr_M_reg`` is a **required** GPR index 1..15 holding the runtime outer-loop trip count.
         Caller must prime that register beforehand (typically with ``ADD_SET``). The inner
         ``group_size`` loop is still compile-time. ``M`` is FLOPs-accounting only — the captured
         program has no static reference to it.
@@ -3132,8 +3132,8 @@ class UnifiedEngine:
         assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
         assert N % 2 == 0, "N must be even for RoPE half layout"
         assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
-        if gf_M_reg is None or not (1 <= gf_M_reg <= 15):
-            raise ValueError(f"rope_hf_core_dram_gqa_pbi: gf_M_reg must be a GPR index 1..15, got {gf_M_reg}")
+        if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
+            raise ValueError(f"rope_hf_core_dram_gqa_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
 
         half = N // 2
         bytes_per_elem = 2
@@ -3199,7 +3199,7 @@ class UnifiedEngine:
             program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
         )
         self.generate_instruction_jump_abs(jump_target_word_addr)
-        self.loop_start(loop_cnt=M, gf_loop_cnt=gf_M_reg)
+        self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
         self.accelerator_memory_to_sram(
             accelerator_dram_address=rope_row_bytes,
             sram_address=sram_cos,
@@ -3358,24 +3358,24 @@ class UnifiedEngine:
                              is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
                              clamp_enable: bool = False, log_enable: bool = False,
                              debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
-                             write_back_disable: bool = False, gf_M_reg: int = None) -> int:
+                             write_back_disable: bool = False, gpr_M_reg: int = None) -> int:
         """
         Matmul capture path with a hardware while-loop over the M dimension.
 
         Args:
             M: Compile-time row count, used only for FLOPS reporting and as the fallback
-                initial value of the hardware loop counter when ``gf_M_reg`` is not supplied.
-            gf_M_reg: Optional ISA register index already holding the **runtime** row count.
-                When provided, ``gf_M_counter`` is seeded by copying this register
-                (``add_imm dst=gf_M_counter, src=gf_M_reg, imm=0``).
-                When ``None``, ``gf_M_counter`` is seeded directly from compile-time ``M``
-                (``add_set gf_M_counter, M``).
+                initial value of the hardware loop counter when ``gpr_M_reg`` is not supplied.
+            gpr_M_reg: Optional ISA register index already holding the **runtime** row count.
+                When provided, ``gpr_M_counter`` is seeded by copying this register
+                (``add_imm dst=gpr_M_counter, src=gpr_M_reg, imm=0``).
+                When ``None``, ``gpr_M_counter`` is seeded directly from compile-time ``M``
+                (``add_set gpr_M_counter, M``).
 
         M-tiling:
         - ``M_chunk`` is chosen purely from URAM capacity (no compile-time M bound).
-          Each tile takes ``m_take = min(gf_M_counter, M_chunk)`` rows, so the last tile
+          Each tile takes ``m_take = min(gpr_M_counter, M_chunk)`` rows, so the last tile
           is a partial tile when M is not a multiple of M_chunk.
-        - The outer loop terminates via ``ALU_MODE_SUB + JUMP_RELA_JNZ`` on ``gf_M_counter``.
+        - The outer loop terminates via ``ALU_MODE_SUB + JUMP_RELA_JNZ`` on ``gpr_M_counter``.
 
         N-tiling:
         - **Uniform** strips — largest ``N_chunk`` that divides ``N`` and fits URAM.
@@ -3471,7 +3471,7 @@ class UnifiedEngine:
             N_chunk = _largest_uniform_strip(N, n_cap_small, 16, 16)
             assert N_chunk is not None, (
                 f"matmat_mul_core_pbi: no uniform N strip (multiple of 16, ≤{n_cap_small}) divides N={N}. "
-                "Adjust N or drop gf_M_reg from the wrapper call to route to the legacy core."
+                "Adjust N or drop gpr_M_reg from the wrapper call to route to the legacy core."
             )
             num_full_n_tiles = N // N_chunk
 
@@ -3496,7 +3496,7 @@ class UnifiedEngine:
         assert M_chunk >= 1, f"M_chunk={M_chunk} must be >= 1 (K={K}, N_chunk={N_chunk} too large for URAM?)"
 
         print(
-            f"M_chunk: {M_chunk} (URAM cap, dynamic M from gf_M_reg={gf_M_reg}), "
+            f"M_chunk: {M_chunk} (URAM cap, dynamic M from gpr_M_reg={gpr_M_reg}), "
             f"N_chunk: {N_chunk} (uniform ×{num_full_n_tiles}), "
             f"n_cap_main: {n_cap_main}, N_chunk_aligned: {N_chunk_aligned}",
         )
@@ -3511,16 +3511,16 @@ class UnifiedEngine:
         pointer_idx = [self.alloc_inst_ptr() for _ in range(13)]
 
         M_chunk_reg  = self.alloc_isa_reg()   # holds compile-time M_chunk constant
-        m_take_reg   = self.alloc_isa_reg()   # min(gf_M_counter, M_chunk) per tile
-        gf_M_counter = self.alloc_isa_reg()   # remaining M rows, decremented each tile
+        m_take_reg   = self.alloc_isa_reg()   # min(gpr_M_counter, M_chunk) per tile
+        gpr_M_counter = self.alloc_isa_reg()   # remaining M rows, decremented each tile
         dma_bytes_reg = self.alloc_isa_reg()  # scratch: m_take_reg * stride bytes, reused per callsite
 
         self.generate_instruction_add_set(M_chunk_reg, M_chunk)
-        if gf_M_reg is not None:
-            self.generate_instruction_add_imm(src_reg_idx=gf_M_reg, immediate_value=0, dst_reg_idx=gf_M_counter)
+        if gpr_M_reg is not None:
+            self.generate_instruction_add_imm(src_reg_idx=gpr_M_reg, immediate_value=0, dst_reg_idx=gpr_M_counter)
         else:
-            self.generate_instruction_add_set(gf_M_counter, M)
-        self.generate_instruction_reg_min(m_take_reg, gf_M_counter, M_chunk_reg)
+            self.generate_instruction_add_set(gpr_M_counter, M)
+        self.generate_instruction_reg_min(m_take_reg, gpr_M_counter, M_chunk_reg)
 
         ISA_FOR_LOOP = 1
 
@@ -3705,7 +3705,7 @@ class UnifiedEngine:
             )
 
             for j in range(ISA_FOR_LOOP):
-                self.loop_start(gf_loop_cnt=m_take_reg)
+                self.loop_start(gpr_loop_cnt=m_take_reg)
                 if bias_enable and bias_mode == "full_matrix":
                     self.accelerator_memory_to_bias_sram(
                         accelerator_dram_address=N * bytes_per_element,
@@ -3741,7 +3741,7 @@ class UnifiedEngine:
 
             if bias_enable and bias_mode == "full_matrix":
                 # rewind that row stride m_take_reg times (ISA loop), then step by N_chunk for the next N strip.
-                self.loop_start(gf_loop_cnt=m_take_reg)
+                self.loop_start(gpr_loop_cnt=m_take_reg)
                 self.generate_instruction_pbi_inc(
                     dram_shared_addr=-N * bytes_per_element,
                     inst_pointer_idx=pointer_idx[0],
@@ -3771,7 +3771,7 @@ class UnifiedEngine:
                         inst_pointer_idx=pointer_idx[5],
                     )
                 else:
-                    self.loop_start(gf_loop_cnt=m_take_reg)
+                    self.loop_start(gpr_loop_cnt=m_take_reg)
                     self.ue_memcpy_to_dram(
                         memcpy_type=MEMCPY_TYPE.URAM.value,
                         uram_type=URAM_SECTION.URAM_A.value,
@@ -3783,7 +3783,7 @@ class UnifiedEngine:
                     self.loop_end()
 
                     # rewind m_take_reg row strides, then step by N_chunk for the next N strip.
-                    self.loop_start(gf_loop_cnt=m_take_reg)
+                    self.loop_start(gpr_loop_cnt=m_take_reg)
                     self.generate_instruction_pbi_inc(
                         dram_shared_addr=-N * bytes_per_element,
                         uram_a_start_addr=-1,
@@ -3800,7 +3800,7 @@ class UnifiedEngine:
         # Advance output PBI pointer by (m_take_reg - 1)*N*2 to the start of the next M strip.
         # Loop m_take_reg times (+N*2 each), then subtract one step (-N*2) for net (m_take_reg-1)*N*2.
         if not write_back_disable:
-            self.loop_start(gf_loop_cnt=m_take_reg)
+            self.loop_start(gpr_loop_cnt=m_take_reg)
             self.generate_instruction_pbi_inc(
                 dram_shared_addr=N * bytes_per_element,
                 inst_pointer_idx=pointer_idx[5],
@@ -3813,7 +3813,7 @@ class UnifiedEngine:
 
         # Advance bias PBI pointer by (m_take_reg - 1)*N*2 to the start of the next M strip.
         if bias_enable and bias_mode == "full_matrix":
-            self.loop_start(gf_loop_cnt=m_take_reg)
+            self.loop_start(gpr_loop_cnt=m_take_reg)
             self.generate_instruction_pbi_inc(
                 dram_shared_addr=N * bytes_per_element,
                 inst_pointer_idx=pointer_idx[0],
@@ -3866,7 +3866,7 @@ class UnifiedEngine:
             )
 
             for j in range(ISA_FOR_LOOP):
-                self.loop_start(gf_loop_cnt=m_take_reg)
+                self.loop_start(gpr_loop_cnt=m_take_reg)
                 if debug_fmax:
                     self.ue_memcpy_from_dram(
                         ZERO_DRAM_ADDR,
@@ -3976,13 +3976,13 @@ class UnifiedEngine:
             )
         # ===== while-loop end =====
         # Decrement remaining-row counter by actual m_take; jump back if rows remain.
-        self.generate_instruction_reg_sub(gf_M_counter, gf_M_counter, m_take_reg)
-        self.generate_instruction_reg_min(m_take_reg, gf_M_counter, M_chunk_reg)
+        self.generate_instruction_reg_sub(gpr_M_counter, gpr_M_counter, m_take_reg)
+        self.generate_instruction_reg_min(m_take_reg, gpr_M_counter, M_chunk_reg)
         outer_loop_size = self.capture_count - body_start_inst_cnt + 2
-        self.generate_instruction_jump_rela_jnz(outer_loop_size, gf_M_counter)
+        self.generate_instruction_jump_rela_jnz(outer_loop_size, gpr_M_counter)
 
         self.release_isa_reg()  # dma_bytes_reg
-        self.release_isa_reg()  # gf_M_counter
+        self.release_isa_reg()  # gpr_M_counter
         self.release_isa_reg()  # m_take_reg
         self.release_isa_reg()  # M_chunk_reg
 
@@ -4010,24 +4010,24 @@ class UnifiedEngine:
                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
                             clamp_enable: bool = False, log_enable: bool = False,
                             debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
-                            write_back_disable: bool = False, gf_M_reg: int = None) -> None:
-        """Matrix multiply entrypoint; dispatches based on ``gf_M_reg``:
+                            write_back_disable: bool = False, gpr_M_reg: int = None) -> None:
+        """Matrix multiply entrypoint; dispatches based on ``gpr_M_reg``:
 
-        - ``gf_M_reg`` is a GPR index (1..15): :meth:`matmat_mul_core_pbi` — outer M-tile loop trip
+        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`matmat_mul_core_pbi` — outer M-tile loop trip
           count is taken from that register at runtime (caller must prime it via ``ADD_SET``). The
           captured program has no static reference to ``M``; ``M`` is FLOPs-accounting only.
-        - ``gf_M_reg is None`` (default): :meth:`matmat_mul_core_legacy` — compile-time M tiling.
+        - ``gpr_M_reg is None`` (default): :meth:`matmat_mul_core_legacy` — compile-time M tiling.
 
         **Layout:** ``A`` is **M×K** (row-major). ``B`` is **N×K** (row-major); the accelerator uses ``B`` as above and
         applies an implicit transpose so the computed result is **A @ Bᵀ**, i.e. **M×N**, without a separate transpose pass.
         """
-        if gf_M_reg is not None:
+        if gpr_M_reg is not None:
             return self.matmat_mul_core_pbi(
                 M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
                 is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
                 clamp_enable, log_enable,
                 debug_fmax, ZERO_DRAM_ADDR, FMAX_DRAM_ADDR,
-                write_back_disable=write_back_disable, gf_M_reg=gf_M_reg,
+                write_back_disable=write_back_disable, gpr_M_reg=gpr_M_reg,
             )
         return self.matmat_mul_core_legacy(
             M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
@@ -4308,7 +4308,7 @@ class UnifiedEngine:
         if C_DRAM_ADDR is not None and bias_mode == "full_matrix":
             C1_DRAM_ADDR = C_DRAM_ADDR + m_engine0 * N * bytes_per_element
 
-        # PBI path is driven by gf_M_reg; allocate + prime a GPR with M on each engine when use_pbi.
+        # PBI path is driven by gpr_M_reg; allocate + prime a GPR with M on each engine when use_pbi.
         m_reg0 = ue0.alloc_isa_reg() if use_pbi else None
         m_reg1 = ue1.alloc_isa_reg() if use_pbi else None
 
@@ -4335,7 +4335,7 @@ class UnifiedEngine:
             sigmoid_enable=sigmoid_enable,
             clamp_enable=clamp_enable,
             log_enable=log_enable,
-            gf_M_reg=m_reg0,
+            gpr_M_reg=m_reg0,
         )
         ue0.generate_instruction_flag_set()
         ue0.generate_instruction_halt()
@@ -4369,7 +4369,7 @@ class UnifiedEngine:
             sigmoid_enable=sigmoid_enable,
             clamp_enable=clamp_enable,
             log_enable=log_enable,
-            gf_M_reg=m_reg1,
+            gpr_M_reg=m_reg1,
         )
         ue1.generate_instruction_flag_check(target_engine_idx=0)
         ue1.generate_instruction_halt()
@@ -4623,15 +4623,15 @@ class UnifiedEngine:
         pointer_output = self.alloc_inst_ptr()
 
         # Allocate ISA registers for the unified inner hardware loop
-        gf_n_counter = self.alloc_isa_reg()
+        gpr_n_counter = self.alloc_isa_reg()
         chunk_size_reg = self.alloc_isa_reg()
         n_take_reg = self.alloc_isa_reg()
         dma_bytes_reg = self.alloc_isa_reg()  # scratch: n_take_reg * stride bytes, reused per callsite
 
         self.generate_instruction_add_set(chunk_size_reg, UE_VECTOR_SIZE)
         # 1. Initialize N loop counters for this tile
-        self.generate_instruction_add_set(gf_n_counter, N)
-        self.generate_instruction_reg_min(n_take_reg, gf_n_counter, chunk_size_reg)
+        self.generate_instruction_add_set(gpr_n_counter, N)
+        self.generate_instruction_reg_min(n_take_reg, gpr_n_counter, chunk_size_reg)
 
         ISA_FOR_LOOP = 1
         
@@ -4704,7 +4704,7 @@ class UnifiedEngine:
             stride_in_rows = N // UE_VECTOR_SIZE
 
             for j in range(ISA_FOR_LOOP):
-                self.loop_start(gf_loop_cnt=n_take_reg)
+                self.loop_start(gpr_loop_cnt=n_take_reg)
                 
                 self.ue_arithmetic_op(
                     broadcast_mode=0,
@@ -4733,7 +4733,7 @@ class UnifiedEngine:
 
                 self.loop_end() 
 
-            self.loop_start(gf_loop_cnt=n_take_reg)
+            self.loop_start(gpr_loop_cnt=n_take_reg)
             self.generate_instruction_pbi_inc(
                 uram_a_start_addr=-1,
                 uram_wb_addr=-wb_line_delta,
@@ -4759,7 +4759,7 @@ class UnifiedEngine:
                     inst_pointer_idx=pointer_output,
                 )
             else:
-                self.loop_start(gf_loop_cnt=n_take_reg)
+                self.loop_start(gpr_loop_cnt=n_take_reg)
                 self.ue_memcpy_to_dram(
                     memcpy_type=MEMCPY_TYPE.URAM.value,
                     uram_type=URAM_SECTION.URAM_A.value,
@@ -4771,7 +4771,7 @@ class UnifiedEngine:
                 self.loop_end()
 
                 # rewind m_take_reg row strides, then step by N_chunk for the next N strip.
-                self.loop_start(gf_loop_cnt=n_take_reg)
+                self.loop_start(gpr_loop_cnt=n_take_reg)
                 self.generate_instruction_pbi_inc(
                     dram_shared_addr=-M * bytes_per_element,
                     uram_a_start_addr=-1,
@@ -4787,7 +4787,7 @@ class UnifiedEngine:
 
         # Advance output PBI pointer by (n_take_reg - 1)*M*2 to the start of the next N strip.
         # Loop n_take_reg times (+M*2 each), then subtract one step (-M*2) for net (n_take_reg-1)*M*2.
-        self.loop_start(gf_loop_cnt=n_take_reg)
+        self.loop_start(gpr_loop_cnt=n_take_reg)
         self.generate_instruction_pbi_inc(
             dram_shared_addr=M * bytes_per_element,
             inst_pointer_idx=pointer_output,
@@ -4805,10 +4805,10 @@ class UnifiedEngine:
 
         # ===== while-loop end =====
         # Decrement remaining-row counter by actual n_take; jump back if rows remain.
-        self.generate_instruction_reg_sub(gf_n_counter, gf_n_counter, n_take_reg)
-        self.generate_instruction_reg_min(n_take_reg, gf_n_counter, chunk_size_reg)
+        self.generate_instruction_reg_sub(gpr_n_counter, gpr_n_counter, n_take_reg)
+        self.generate_instruction_reg_min(n_take_reg, gpr_n_counter, chunk_size_reg)
         outer_loop_size = self.capture_count - body_start_inst_cnt + 2
-        self.generate_instruction_jump_rela_jnz(outer_loop_size, gf_n_counter)
+        self.generate_instruction_jump_rela_jnz(outer_loop_size, gpr_n_counter)
 
         # Release ISA and Local Pointer Tracking
         self.release_isa_reg()
@@ -5267,7 +5267,7 @@ class UnifiedEngine:
         print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
         return total_flops
 
-    def flash_attention_core_pbi(self, head_dim: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, ATTN_P_DRAM_ADDR: int, gf_bucket_idx: int,
+    def flash_attention_core_pbi(self, head_dim: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, ATTN_P_DRAM_ADDR: int, gpr_bucket_idx: int,
                             IDENTITY_DRAM_ADDR: int = None,
                             num_buckets: int = 8,
                             BIAS_DRAM_ADDR: int = None, debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None,
@@ -5279,26 +5279,26 @@ class UnifiedEngine:
         full-matrix bias + row softmax via :meth:`matmat_mul_core` ``use_pbi=True`` into ``ATTN_P_DRAM_ADDR``;
         then **P @ V** with a second ``matmat_mul_core`` (``use_pbi=True``). ``debug_mode`` is not supported.
 
-        Dynamic seq_len via bucketization is **mandatory** (``gf_bucket_idx`` is a required GPR index
-        1..15): emits a header that copies ``gf_bucket_idx`` into a temp register and runs
+        Dynamic seq_len via bucketization is **mandatory** (``gpr_bucket_idx`` is a required GPR index
+        1..15): emits a header that copies ``gpr_bucket_idx`` into a temp register and runs
         ``num_buckets`` pairs of ``(ADD_DEC temp, JZ -> bucket_i)`` on the temp, followed by
         ``num_buckets`` bucket bodies covering ``seq_len = UE_VECTOR_SIZE * i`` for ``i = 1..num_buckets``;
-        each bucket ends with a ``JMP -> end`` label. **``gf_bucket_idx`` itself is read-only and
+        each bucket ends with a ``JMP -> end`` label. **``gpr_bucket_idx`` itself is read-only and
         preserved across calls** — caller can prime it once and invoke flash_attention many times.
 
         **Bucket indexing is 1-based** (falls out of the "decrement-until-zero" cascade):
-        ``gf_bucket_idx = K`` selects the Kth bucket body whose compile-time seq_len is
+        ``gpr_bucket_idx = K`` selects the Kth bucket body whose compile-time seq_len is
         ``K * UE_VECTOR_SIZE``. So callers should compute::
 
-            gf_bucket_idx = aligned_seq_len // UE_VECTOR_SIZE  # NOT (aligned_seq_len // VEC) - 1
+            gpr_bucket_idx = aligned_seq_len // UE_VECTOR_SIZE  # NOT (aligned_seq_len // VEC) - 1
 
         Examples: ``aligned_seq_len = 64 → 1``, ``128 → 2``, ``UE_VECTOR_SIZE*N → N``.
-        Caller must ensure ``gf_bucket_idx ∈ [1, num_buckets]``; out-of-range values silently fall
+        Caller must ensure ``gpr_bucket_idx ∈ [1, num_buckets]``; out-of-range values silently fall
         through into the bucket_1 body (seq_len=UE_VECTOR_SIZE), which usually produces wrong
         activations rather than crashing.
 
         The returned ``bucket_flops`` is a plain Python list, so caller-side FLOPs lookup uses the
-        usual 0-based offset: ``bucket_flops[gf_bucket_idx - 1]``.
+        usual 0-based offset: ``bucket_flops[gpr_bucket_idx - 1]``.
 
         Q/K/V/OUTPUT/SCRATCH/ATTN_P buffers must be sized for the maximum bucket
         (``UE_VECTOR_SIZE * num_buckets``). The bucket step is fixed to ``UE_VECTOR_SIZE`` (hardware
@@ -5324,7 +5324,7 @@ class UnifiedEngine:
 
         # Bucket jump header: num_buckets pairs of (ADD_DEC temp, JZ -> bucket_i_placeholder). Placeholder target = 0
         bucket_scratch_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_imm(src_reg_idx=gf_bucket_idx, immediate_value=0, dst_reg_idx=bucket_scratch_reg)
+        self.generate_instruction_add_imm(src_reg_idx=gpr_bucket_idx, immediate_value=0, dst_reg_idx=bucket_scratch_reg)
         jz_capture_indices: list[int] = []
         for _ in range(num_buckets):
             self.generate_instruction_add_dec(reg_idx=bucket_scratch_reg)
@@ -5410,7 +5410,7 @@ class UnifiedEngine:
         """
         bytes_per_element = 2
 
-        # matmat PBI path is now driven by gf_M_reg; allocate a shared GPR for this bucket body
+        # matmat PBI path is now driven by gpr_M_reg; allocate a shared GPR for this bucket body
         # and re-prime it before each matmul (each uses a different compile-time M).
         m_reg = self.alloc_isa_reg()
 
@@ -5524,7 +5524,7 @@ class UnifiedEngine:
             softmax_enable=True,
             C_DRAM_ADDR=BIAS_DRAM_ADDR if bias_enable else None,
             bias_mode="full_matrix",
-            gf_M_reg=m_reg,
+            gpr_M_reg=m_reg,
         )
 
         # P @ V: A = P (M×K), B = V^T DRAM (N×K); matmat_mul_core yields A @ B^T → (seq_len, head_dim)
@@ -5536,7 +5536,7 @@ class UnifiedEngine:
             A_DRAM_ADDR=ATTN_P_DRAM_ADDR,
             B_DRAM_ADDR=SCRATCH_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            gf_M_reg=m_reg,
+            gpr_M_reg=m_reg,
         )
         self.release_isa_reg()
 
@@ -5553,10 +5553,10 @@ class UnifiedEngine:
 
     def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, ATTN_P_DRAM_ADDR: int = None,
-                            gf_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True):
-        """Flash attention entrypoint; dispatches based on ``gf_bucket_idx``:
+                            gpr_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True):
+        """Flash attention entrypoint; dispatches based on ``gpr_bucket_idx``:
 
-        - ``gf_bucket_idx`` is a GPR index (1..15): :meth:`flash_attention_core_pbi` — captured
+        - ``gpr_bucket_idx`` is a GPR index (1..15): :meth:`flash_attention_core_pbi` — captured
           program is the ``num_buckets``-way dispatcher; caller must prime that register **with the
           1-based selector** ``bucket_idx = aligned_seq_len // UE_VECTOR_SIZE`` (via ``ADD_SET``)
           *before* program execution starts. So ``aligned_seq_len = 64 → 1``, ``128 → 2``,
@@ -5566,17 +5566,17 @@ class UnifiedEngine:
           raw one. Requires ``ATTN_P_DRAM_ADDR``. ``seq_len`` is ignored here since the bucketized
           program covers all bucket sizes; the register is preserved across calls so caller can
           prime once and invoke many times.
-        - ``gf_bucket_idx is None`` (default): :meth:`flash_attention_core_legacy` — single static
+        - ``gpr_bucket_idx is None`` (default): :meth:`flash_attention_core_legacy` — single static
           ``seq_len`` body, no dispatcher.
 
         Returns ``int`` total FLOPS for the legacy path, or ``list[int]`` per-bucket FLOPS for the
-        PBI path (caller selects with ``bucket_flops[gf_bucket_idx - 1]`` — Python list is 0-based
+        PBI path (caller selects with ``bucket_flops[gpr_bucket_idx - 1]`` — Python list is 0-based
         even though the runtime selector is 1-based; see :meth:`flash_attention_core_pbi`).
         """
-        if gf_bucket_idx is not None:
+        if gpr_bucket_idx is not None:
             if ATTN_P_DRAM_ADDR is None:
                 raise ValueError(
-                    "flash_attention_core: gf_bucket_idx-driven PBI path requires ATTN_P_DRAM_ADDR "
+                    "flash_attention_core: gpr_bucket_idx-driven PBI path requires ATTN_P_DRAM_ADDR "
                     f"(allocate seq_len*seq_len BF16s, i.e. {seq_len * seq_len * 2} bytes)"
                 )
             return self.flash_attention_core_pbi(
@@ -5591,7 +5591,7 @@ class UnifiedEngine:
                 debug_mode=debug_mode,
                 SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
                 IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                gf_bucket_idx=gf_bucket_idx,
+                gpr_bucket_idx=gpr_bucket_idx,
                 num_buckets=num_buckets,
                 use_pbi=use_pbi,
             )
@@ -5911,7 +5911,7 @@ class UnifiedEngine:
         V_DRAM_ADDR: int,
         OUTPUT_DRAM_ADDR: int,
         SCRATCH_DRAM_ADDR: int,
-        gf_bucket_idx: int,
+        gpr_bucket_idx: int,
         num_buckets: int = 8,
         IDENTITY_DRAM_ADDR: int = None,
         BIAS_DRAM_ADDR: int = None,
@@ -5922,20 +5922,20 @@ class UnifiedEngine:
         """Bucketized decoder group attention. Mirrors the dispatcher shape of
         :meth:`flash_attention_core_pbi`: emits ``num_buckets`` complete bucket bodies (one per
         ``seq_len = UE_VECTOR_SIZE * i`` for ``i = 1..num_buckets``), with a JZ-cascade header
-        that routes via the runtime ``gf_bucket_idx`` GPR (1-based selector preserved across calls).
+        that routes via the runtime ``gpr_bucket_idx`` GPR (1-based selector preserved across calls).
 
         ``group_size`` is the matmul ``M`` dimension and is always static (fixed by the model).
 
         Caller must size ``SCRATCH_DRAM_ADDR`` for the **maximum** bucket so the per-bucket offset
         arithmetic for ``score_dram_addr`` / ``scaled_q_dram_addr`` lands inside the allocation.
 
-        Returns ``list[int]`` — per-bucket FLOPS; caller picks ``bucket_flops[gf_bucket_idx - 1]``.
+        Returns ``list[int]`` — per-bucket FLOPS; caller picks ``bucket_flops[gpr_bucket_idx - 1]``.
         """
         del debug_mode, SM_OUTPUT_DRAM_ADDR
 
-        if not (1 <= gf_bucket_idx <= 15):
+        if not (1 <= gpr_bucket_idx <= 15):
             raise ValueError(
-                f"decoder_group_attention_core_pbi: gf_bucket_idx={gf_bucket_idx} must be a GPR index in [1, 15]"
+                f"decoder_group_attention_core_pbi: gpr_bucket_idx={gpr_bucket_idx} must be a GPR index in [1, 15]"
             )
         if num_buckets < 1:
             raise ValueError(
@@ -5945,11 +5945,11 @@ class UnifiedEngine:
         program_dram_start_addr = self.get_program_dram_addr()
         bucket_step = UE_VECTOR_SIZE
 
-        # Bucket jump header: copy gf_bucket_idx into a scratch reg so the JZ cascade leaves the
+        # Bucket jump header: copy gpr_bucket_idx into a scratch reg so the JZ cascade leaves the
         # caller's bucket register untouched.
         bucket_scratch_reg = self.alloc_isa_reg()
         self.generate_instruction_add_imm(
-            src_reg_idx=gf_bucket_idx, immediate_value=0, dst_reg_idx=bucket_scratch_reg
+            src_reg_idx=gpr_bucket_idx, immediate_value=0, dst_reg_idx=bucket_scratch_reg
         )
         jz_capture_indices: list = []
         for _ in range(num_buckets):
@@ -6076,7 +6076,7 @@ class UnifiedEngine:
             element_size=group_size * head_dim,
         )
 
-        # PBI matmul path is driven by gf_M_reg; allocate a GPR primed with group_size.
+        # PBI matmul path is driven by gpr_M_reg; allocate a GPR primed with group_size.
         m_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(m_reg, group_size)
 
@@ -6089,7 +6089,7 @@ class UnifiedEngine:
             OUTPUT_DRAM_ADDR=score_dram_addr,
             softmax_enable=True,
             C_DRAM_ADDR=BIAS_DRAM_ADDR,
-            gf_M_reg=m_reg,
+            gpr_M_reg=m_reg,
         )
         self.matmat_mul_core(
             M=group_size,
@@ -6098,7 +6098,7 @@ class UnifiedEngine:
             A_DRAM_ADDR=score_dram_addr,
             B_DRAM_ADDR=SCRATCH_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            gf_M_reg=m_reg,
+            gpr_M_reg=m_reg,
         )
         self.release_isa_reg()  # m_reg
 
@@ -6123,19 +6123,19 @@ class UnifiedEngine:
         BIAS_DRAM_ADDR: int = None,
         debug_mode: bool = False,
         SM_OUTPUT_DRAM_ADDR: int = None,
-        gf_bucket_idx: int = None,
+        gpr_bucket_idx: int = None,
         num_buckets: int = 8,
         use_pbi: bool = True,
     ):
-        """Decoder group attention entrypoint; dispatches based on ``gf_bucket_idx``:
+        """Decoder group attention entrypoint; dispatches based on ``gpr_bucket_idx``:
 
-        - ``gf_bucket_idx`` is a GPR index (1..15): :meth:`decoder_group_attention_core_pbi` — emits
+        - ``gpr_bucket_idx`` is a GPR index (1..15): :meth:`decoder_group_attention_core_pbi` — emits
           a ``num_buckets``-way bucket dispatcher (each body sized for ``seq_len = K*UE_VECTOR_SIZE``).
           ``seq_len`` arg is ignored (bucket bodies cover the range). Returns a per-bucket FLOPS list.
-        - ``gf_bucket_idx is None`` (default): :meth:`decoder_group_attention_core_legacy` — single
+        - ``gpr_bucket_idx is None`` (default): :meth:`decoder_group_attention_core_legacy` — single
           static-seq_len body. Returns int total FLOPS.
         """
-        if gf_bucket_idx is not None:
+        if gpr_bucket_idx is not None:
             return self.decoder_group_attention_core_pbi(
                 group_size=group_size,
                 head_dim=head_dim,
@@ -6144,7 +6144,7 @@ class UnifiedEngine:
                 V_DRAM_ADDR=V_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-                gf_bucket_idx=gf_bucket_idx,
+                gpr_bucket_idx=gpr_bucket_idx,
                 num_buckets=num_buckets,
                 IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
@@ -6790,7 +6790,7 @@ class UnifiedEngine:
         """Relative backward jump if ``reg_id == 0`` (``JUMP_MODE_RELA_JZ``)."""
         self._generate_instruction_jump(backward_instruction_words, JUMP_MODE_RELA_JZ, reg_id)
 
-    def loop_start(self, loop_cnt: int = 0, gf_loop_cnt: int = None) -> int:
+    def loop_start(self, loop_cnt: int = 0, gpr_loop_cnt: int = None) -> int:
         """
         Open a counted backward-branch loop during instruction capture (stack-nested).
 
@@ -6801,11 +6801,11 @@ class UnifiedEngine:
         start index.
 
         Args:
-            loop_cnt: Initial iteration count **when** ``gf_loop_cnt`` is omitted (same semantics as
-                :meth:`generate_instruction_add_set`). Still used when ``gf_loop_cnt`` is set — for
+            loop_cnt: Initial iteration count **when** ``gpr_loop_cnt`` is omitted (same semantics as
+                :meth:`generate_instruction_add_set`). Still used when ``gpr_loop_cnt`` is set — for
                 documentation / templates only; emission copies the iteration count from
-                ``gf_loop_cnt`` instead.
-            gf_loop_cnt: If not ``None``, non-zero GPR index holding the runtime loop trip count.
+                ``gpr_loop_cnt`` instead.
+            gpr_loop_cnt: If not ``None``, non-zero GPR index holding the runtime loop trip count.
                 Emits ``ADD_IMM`` into the allocated counter register as ``dst = src + 0`` so the
                 counter starts from whatever value that GPR held at execution time (typically set with
                 :meth:`generate_instruction_add_set` earlier in the same program).
@@ -6815,15 +6815,15 @@ class UnifiedEngine:
 
         Raises:
             RuntimeError: If capture is not active.
-            ValueError: If ``gf_loop_cnt == 0``.
+            ValueError: If ``gpr_loop_cnt == 0``.
         """
         if not self.is_capture_on or self.capture_buffer is None:
             raise RuntimeError("loop_start() requires an active capture (call start_capture() first).")
         reg = self.alloc_isa_reg()
-        if gf_loop_cnt is not None:
-            if gf_loop_cnt == 0:
-                raise ValueError("loop_start(): gf_loop_cnt must not be 0 (register 0 is hard-wired)")
-            self.generate_instruction_add_imm(src_reg_idx=gf_loop_cnt, immediate_value=0, dst_reg_idx=reg)
+        if gpr_loop_cnt is not None:
+            if gpr_loop_cnt == 0:
+                raise ValueError("loop_start(): gpr_loop_cnt must not be 0 (register 0 is hard-wired)")
+            self.generate_instruction_add_imm(src_reg_idx=gpr_loop_cnt, immediate_value=0, dst_reg_idx=reg)
         else:
             self.generate_instruction_add_set(dst_reg_idx=reg, immediate_value=loop_cnt)
         body_start_inst_cnt = self.capture_count
