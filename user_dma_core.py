@@ -2722,6 +2722,155 @@ class UnifiedEngine:
             GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
         )
 
+    def layer_norm_core_dram_pbi(
+        self,
+        M: int,
+        N: int,
+        A_DRAM_ADDR: int,
+        OUTPUT_DRAM_ADDR: int,
+        GAMMA_DRAM_ADDR: int = None,
+        BETA_DRAM_ADDR: int = None,
+        *,
+        gf_M_reg: int,
+    ) -> int:
+        """LayerNorm DRAM PBI variant: one captured row body, trip count from GPR[gf_M_reg] at runtime.
+
+        ``M`` is compile-time template only (FLOPs / asserts); the captured program has no static
+        reference to it. Caller must prime ``gf_M_reg`` with the actual row count (via ``ADD_SET``)
+        before executing.
+        """
+        # ---- validation ----
+        assert M >= 1, "layer_norm_core_dram_pbi() requires M >= 1"
+        if not (1 <= gf_M_reg <= 15):
+            raise ValueError(f"layer_norm_core_dram_pbi: gf_M_reg must be a GPR index 1..15, got {gf_M_reg}")
+        assert N % UE_VECTOR_SIZE == 0, f"layer_norm_core_dram_pbi() requires N % UE_VECTOR_SIZE == 0, got N={N}"
+        if N > URAM_NEAR_FULL_ELEMENTS:
+            raise ValueError(
+                f"layer_norm_core_dram_pbi: N={N} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS} "
+                "(one row must fit URAM staging)."
+            )
+        assert self.is_capture_on, "layer_norm_core_dram_pbi() requires active capture"
+
+        # ---- SRAM layout: URAM_A holds the rotating input/output row; URAM_B holds the constants ----
+        vector_sram_addr = 0x00000
+        zeros_sram_addr = 0x80000
+
+        # Stage a zeros vector once (the mean-queue op needs a zero reference broadcast).
+        zeros_dram_addr = self.get_params_dram_addr()
+        self.allocate_params_dram(N * 2)
+        self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * 2)
+        self.accelerator_memory_to_sram(accelerator_dram_address=zeros_dram_addr,
+                                        sram_address=zeros_sram_addr,
+                                        element_size=N)
+        params_sram_addr = zeros_sram_addr + N * 2
+
+        gamma_sram_addr = None
+        beta_sram_addr = None
+        if GAMMA_DRAM_ADDR is not None:
+            gamma_sram_addr = params_sram_addr
+            self.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
+                                            sram_address=gamma_sram_addr,
+                                            element_size=N)
+            params_sram_addr += N * 2
+        if BETA_DRAM_ADDR is not None:
+            beta_sram_addr = params_sram_addr
+            self.accelerator_memory_to_sram(accelerator_dram_address=BETA_DRAM_ADDR,
+                                            sram_address=beta_sram_addr,
+                                            element_size=N)
+            params_sram_addr += N * 2
+
+        vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_addr)
+        zeros_uram_type, _ = self.sram_address_to_uram_address(zeros_sram_addr)
+        assert vector_uram_type == URAM_SECTION.URAM_A, f"vector_sram_addr must be in URAM_A, got {hex(vector_sram_addr)}"
+        assert zeros_uram_type == URAM_SECTION.URAM_B, f"zeros_sram_addr must be in URAM_B, got {hex(zeros_sram_addr)}"
+
+        bytes_per_element = 2
+        row_bytes = N * bytes_per_element
+
+        # ---- two PBI pointer rows: one streams input rows in, one streams output rows out ----
+        row_load_ptr = self.alloc_inst_ptr()
+        row_store_ptr = self.alloc_inst_ptr()
+
+        self.generate_instruction_pbi_init(
+            dram_shared_addr=A_DRAM_ADDR,
+            dma_length=row_bytes,
+            output_size=0,
+            uram_length=0,
+            uram_a_start_addr=0,
+            uram_b_start_addr=0,
+            uram_wb_addr=0,
+            uram_dst_addr=vector_uram_start_addr,
+            fmax_context_addr=0,
+            inst_pointer_idx=row_load_ptr,
+        )
+        self.generate_instruction_pbi_init(
+            dram_shared_addr=OUTPUT_DRAM_ADDR,
+            dma_length=row_bytes,
+            output_size=0,
+            uram_length=0,
+            uram_a_start_addr=vector_uram_start_addr,
+            uram_b_start_addr=vector_uram_start_addr,
+            uram_wb_addr=0,
+            uram_dst_addr=0,
+            fmax_context_addr=0,
+            inst_pointer_idx=row_store_ptr,
+        )
+
+        # Pipeline drain after pointer-row init (mirrors rms_norm_core_dram_pbi).
+        program_dram_start_addr = self.get_program_dram_addr()
+        cur_inst_count = self.capture_count
+        jump_target_word_addr = ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
+        )
+        self.generate_instruction_jump_abs(jump_target_word_addr)
+
+        # ---- runtime-counted outer loop: trip count copied from GPR[gf_M_reg] ----
+        self.loop_start(loop_cnt=M, gf_loop_cnt=gf_M_reg)
+
+        # Load one input row: element_size=0 + inst_pointer_idx uses pre-loaded ptr row;
+        # accelerator_dram_address=row_bytes is the post-DMA increment (advance by one row).
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=row_bytes,
+            sram_address=vector_sram_addr,
+            element_size=0,
+            inst_pointer_idx=row_load_ptr,
+        )
+
+        # Inner per-row LayerNorm: mean → subtract → rms → mul → optional gamma → optional beta.
+        self.layer_norm_core(
+            vector_sram_addr,
+            vector_sram_addr,
+            N,
+            zeros_sram_addr,
+            gamma_sram_addr,
+            beta_sram_addr,
+        )
+
+        # Store one output row through its pointer row (same row_bytes post-increment).
+        self.sram_to_accelerator_memory(
+            sram_address=vector_sram_addr,
+            accelerator_dram_address=row_bytes,
+            element_size=0,
+            inst_pointer_idx=row_store_ptr,
+        )
+
+        outer_loop_size = self.loop_end()
+        print(f"LayerNorm PBI outer loop body size: {outer_loop_size} (one row × trips=GPR[{gf_M_reg}], N={N})")
+        assert outer_loop_size <= 256, (
+            f"Outer loop body size {outer_loop_size} is greater than i-cache size of 256 instructions"
+        )
+
+        self.release_inst_ptr(row_store_ptr)
+        self.release_inst_ptr(row_load_ptr)
+
+        # FLOPs: same accounting as legacy (5*M*N base + M*N per gamma/beta).
+        total_flops = 5 * M * N
+        if gamma_sram_addr is not None:
+            total_flops += M * N
+        if beta_sram_addr is not None:
+            total_flops += M * N
+        return total_flops
+
     # we need a layer norm core that takes in a vector and outputs a vector
     def layer_norm_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, zeros_sram_start_addr: int = None, input_gamma_sram_start_addr: int = None, input_beta_sram_start_addr: int = None) -> None:
         """
