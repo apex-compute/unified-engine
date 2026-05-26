@@ -518,6 +518,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.head_dim * self.group_size * self.bytes_per_element)
         self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(max(self.head_dim, UE_FMAX_CONTEXT_SIZE) * aligned_seq_len * 2 + self.head_dim * aligned_seq_len * 2)
         self.LAYER0_FLASH_BIAS_DRAM = self.allocate_tensor_dram(aligned_seq_len * aligned_seq_len * self.bytes_per_element)
+        self.LAYER0_FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(aligned_seq_len * aligned_seq_len * self.bytes_per_element)
         self.LAYER0_ATTN_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.LAYER0_POST_ATTN_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.LAYER0_POST_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
@@ -561,6 +562,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # --- LLaMA 3.2 16 layers: compile---
         global _SILENT_MODE
         _SILENT_MODE = True
+        bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
         self.start_capture()
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
@@ -683,8 +685,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         self.sram_to_accelerator_memory(0x30000, q_dst, half_ahd)
                         self.sram_to_accelerator_memory(0x30080, q_dst + half_ahd * bpe, half_ahd)
 
-                # Flash attention for this KV head (head_dim=64)
-                total_flops += self.flash_attention_core(
+                # Flash attention for this KV head (head_dim=64) — PBI bucket dispatcher;
+                # gf_bucket_idx is primed at program start (ADD_SET above) so the dispatcher
+                # routes to the correct bucket body for the actual runtime seq_len.
+                flash_result = self.flash_attention_core(
                     head_dim=ahd,
                     seq_len=aligned_seq_len,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
@@ -694,7 +698,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+                    gf_bucket_idx=self.gf_bucket_idx,
+                    num_buckets=bucket_idx,
                 )
+                total_flops += flash_result[bucket_idx - 1]
 
                 # Assemble output into LAYER0_FLASH_OUTPUT_DRAM
                 # Standard GQA layout per token: [kv0_q0(64), kv0_q1..q3, kv1_q0..q3, ...]
@@ -795,6 +803,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         bias_one_group.masked_fill_(valid_mask, 0.0)
         bias_one_group[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
+        # Set gf_bucket_idx to the 1-based bucket selector for the actual runtime seq_len.
+        bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
+        self.isa_add_set_core(self.gf_bucket_idx, bucket_idx)
         self.program_execute(prefill_program_addr, gflops=gflops)
 
     def compile_decoder(self, layer_size: int | None = None) -> tuple[int, int]:
