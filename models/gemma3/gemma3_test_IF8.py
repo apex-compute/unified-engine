@@ -1076,6 +1076,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
         self.IDENTITY_DRAM_ADDR = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
+        self.IDENTITY_FULL_DRAM_ADDR = self.allocate_tensor_dram(self.head_dim * self.head_dim * self.bytes_per_element)
+        self.dma_to_accelerator_memory(self.IDENTITY_FULL_DRAM_ADDR, torch.eye(self.head_dim, dtype=torch.bfloat16))
         # Allocate memory for flash attention and zero pad:
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(aligned_seq_len_q * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(aligned_seq_len_q * self.head_dim * self.bytes_per_element)
@@ -1346,6 +1348,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_FULL_DRAM_ADDR if use_pbi else self.IDENTITY_DRAM_ADDR,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     use_pbi=use_pbi
                 )

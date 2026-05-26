@@ -396,6 +396,12 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
     SCRATCH_DRAM_ADDR = ue.allocate_tensor_dram(max(head_dim, UE_FMAX_CONTEXT_SIZE) * seq_len * 2 + head_dim * seq_len * 2) # V_trans + partial softmax output
     BIAS_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * seq_len * 2)
     SM_OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * seq_len * 2) if debug_mode else None
+    if use_pbi:
+        IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(head_dim * head_dim * 2)
+        ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, torch.eye(head_dim, dtype=torch.bfloat16))
+    else:
+        IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * 2)
+        ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
 
     ue.start_capture() # -------------------------------------------------------------
 
@@ -405,6 +411,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
                                                             V_DRAM_ADDR=V_DRAM_ADDR,
                                                             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                                                             SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+                                                            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                                                             BIAS_DRAM_ADDR=BIAS_DRAM_ADDR if bias_enable else None,
                                                             debug_mode=debug_mode,
                                                             SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,

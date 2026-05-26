@@ -740,7 +740,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         debug_mode: bool = False,
         SM_OUTPUT_DRAM_ADDR: int = None,
     ) -> int:
-        del debug_mode, SM_OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR
+        del debug_mode, SM_OUTPUT_DRAM_ADDR
 
         bytes_per_element = self.bytes_per_element
         score_dram_addr = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element
@@ -753,6 +753,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             N=head_dim,
             INPUT_DRAM_ADDR=V_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
         )
 
         self.accelerator_memory_to_sram(
@@ -965,6 +966,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
         self.IDENTITY_DRAM_ADDR = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
+        self.IDENTITY_FULL_DRAM_ADDR = self.allocate_tensor_dram(self.head_dim * self.head_dim * self.bytes_per_element)
+        self.dma_to_accelerator_memory(self.IDENTITY_FULL_DRAM_ADDR, torch.eye(self.head_dim, dtype=torch.bfloat16))
         # Allocate memory for flash attention and zero pad:
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(aligned_seq_len_q * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(aligned_seq_len_q * self.head_dim * self.bytes_per_element)
@@ -1236,6 +1239,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_FULL_DRAM_ADDR if use_pbi else self.IDENTITY_DRAM_ADDR,
                     use_pbi=use_pbi
                 )
             total_flops += self.matmat_mul_core(
