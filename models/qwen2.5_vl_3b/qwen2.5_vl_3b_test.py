@@ -4,7 +4,7 @@ config-driven via qwen2.5_vl_3b_config.json::precision.{lm,vision}
 (values: int4 / fp4 / if4). Defaults: lm=if4 (eval-winning text codec
 per src/models/qwen2.5_VL_3b/compare/summary.md), vision=int4 (legacy
 released codec, byte-identical to the prior Q4_64 path). All
-quantization goes through src/template/quant_schemas.py."""
+quantization goes through src/template/quant_lib.py."""
 
 import json
 import math
@@ -24,7 +24,7 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
 from user_dma_core import ue_35bit_addr_shifter
-import quant_schemas
+import quant_lib
 
 import builtins
 
@@ -365,7 +365,7 @@ def rms_norm_core_dram_post_add(ue, M: int, N: int,
     return total_flops
 
 def _qs_pack(precision: str, tensor: torch.Tensor):
-    """Run a 64-block codec via quant_schemas and emit the scale-then-data
+    """Run a 64-block codec via quant_lib and emit the scale-then-data
     byte layout the released wire format uses (consumed by
     store_quantized_weight() as 34 bytes per block: 2 B bf16 scale + 32 B
     nibbles). Accepts arbitrary input shape; flattens and zero-pads to a
@@ -376,7 +376,7 @@ def _qs_pack(precision: str, tensor: torch.Tensor):
     # the unbounded distance-tensor allocation when flattened to (1, N*K)).
     if bf.dim() == 2 and bf.shape[1] % 64 == 0:
         n_blocks = bf.numel() // 64
-        data_bytes, scale_bytes = quant_schemas.quantize(precision, bf, block_size=64)
+        data_bytes, scale_bytes = quant_lib.quantize(precision, bf, block_size=64)
         return np.frombuffer(scale_bytes + data_bytes, dtype=np.uint8), n_blocks
     # Generic path: flatten + zero-pad to a multiple of 64. Used for
     # arbitrary-rank tensors (e.g. the 5D Conv3D patch_embed weight).
@@ -385,7 +385,7 @@ def _qs_pack(precision: str, tensor: torch.Tensor):
     if bf.numel() != n_blocks * 64:
         bf = torch.nn.functional.pad(bf, (0, n_blocks * 64 - bf.numel()))
     bf = bf.view(1, -1)
-    data_bytes, scale_bytes = quant_schemas.quantize(precision, bf, block_size=64)
+    data_bytes, scale_bytes = quant_lib.quantize(precision, bf, block_size=64)
     return np.frombuffer(scale_bytes + data_bytes, dtype=np.uint8), n_blocks
 
 _LAYER_MAP = {
@@ -428,7 +428,7 @@ _VALID_PRECISIONS = ('int4', 'fp4', 'if4')
 
 def _lm_precision(cfg: dict) -> str:
     """Read LM precision from the config, defaulting to the eval-winner 'if4'.
-    Validates against the codecs the quant_schemas wrapper actually supports."""
+    Validates against the codecs the quant_lib wrapper actually supports."""
     p = cfg.get("precision", {}).get("lm", "if4")
     if p not in _VALID_PRECISIONS:
         raise ValueError(f"config precision.lm={p!r} not in {_VALID_PRECISIONS}")
@@ -492,7 +492,7 @@ def _write_weight_bin(bin_path, model, param_filter, mode, suffix, quant_layers,
     print(f"Weights: {count} tensors, {os.path.getsize(bin_path)/1048576:.1f} MB -> {bin_path}")
 
 def generate_lm_weights(model, output_path, precision: str = "if4"):
-    """Generate LM weight bin using the given quant_schemas precision
+    """Generate LM weight bin using the given quant_lib precision
     ('int4' / 'fp4' / 'if4'). The precision string is also the manifest
     suffix the runtime loader looks for.
 
@@ -523,7 +523,7 @@ def generate_lm_weights(model, output_path, precision: str = "if4"):
 
 def generate_vision_weights(model, output_path, precision: str = "int4"):
     """Generate vision weight bin with pre-padded QKV (80→128) and MLP
-    (3420→3456). The given quant_schemas precision ('int4' / 'fp4' / 'if4')
+    (3420→3456). The given quant_lib precision ('int4' / 'fp4' / 'if4')
     drives both the codec and the manifest suffix.
 
     The binary stores padded weights so the runtime doesn't need the HF model.

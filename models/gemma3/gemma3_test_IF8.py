@@ -95,7 +95,7 @@ def _parse_offset(val) -> int:
 # codebooks (e.g. "if4"); for IF8 the default per-block MixMSE selection
 # between INT8 and FP8 is what we want -- do NOT force pure INT8 here, see
 # module docstring point 3.
-from quant_schemas import quantize
+from quant_lib import quantize
 
 QUANT_PRECISION = "if8"
 

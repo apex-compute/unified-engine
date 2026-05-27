@@ -77,7 +77,7 @@ def _parse_offset(val) -> int:
 # To switch codebooks, change QUANT_PRECISION (``int4`` / ``fp4`` / ``if4``); to force
 # a per-block variant within IF4, pass ``int_variant=True`` (uniform INT4) or ``False``
 # (uniform FP4) to quantize().
-from quant_schemas import quantize
+from quant_lib import quantize
 
 QUANT_PRECISION = "if4"
 
