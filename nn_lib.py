@@ -20,7 +20,7 @@ Grouping:
     §9  Flash attention (decode + prefill, smolvlm2-style)
   PART B — Fixed-shape host helpers (init-time, not PBI-relevant)
     §1  Weight staging / DRAM loaders (store_weight, load_weight_cache, etc.)
-    §4  Quantization helpers (bf16 → INT4 packed, Q4_64, FP4 E2M1)
+    §4  (moved to quant_lib.py — legacy concatenated-format codecs)
     §5  Weight-bin plumbing (manifest writer, name mapping hook)
     §6  Simple-LM boilerplate (config loading, HF download, quiet print)
 """
@@ -1151,79 +1151,10 @@ def store_identity_matrix(ue) -> int:
     return addr
 
 
-# =============================================================================
-# §4 Quantization helpers
-# =============================================================================
-# FP4 E2M1 lookup table (16 values, codes 0-7 positive, 8-15 negative).
-# Kept here as the canonical default; callers may override by passing their own
-# table as ``fp4_table`` to ``quantize_fp4_64``.
-_FP4_E2M1_TABLE = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-    dtype=torch.bfloat16,
-)
-
-
-def quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor,
-                                 block_size: int = 64) -> tuple[bytes, bytes]:
-    """Quantize bf16 (N_w, K_w) to INT4 packed + per-block bf16 scale along K.
-
-    Returns ``(data_bytes, scale_bytes)``. ``K_w`` must be a multiple of ``block_size``.
-    """
-    w = weight_bf16.detach().cpu().float().reshape(-1)
-    N_w, K_w = weight_bf16.shape
-    assert K_w % block_size == 0
-    w_blocks = w.reshape(N_w, K_w // block_size, block_size)
-    scale = w_blocks.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
-    scale_bf16 = -scale.to(torch.bfloat16)
-    w_int8 = (w_blocks / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
-    w_nibbles = w_int8.numpy().astype(np.int16) & 0x0F
-    low = w_nibbles[:, :, 0::2].reshape(N_w, -1)
-    high = w_nibbles[:, :, 1::2].reshape(N_w, -1)
-    packed = (high << 4) | low
-    data_bytes = packed.astype(np.uint8).tobytes()
-    scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
-    return data_bytes, scale_bytes
-
-
-def quantize_q4_64(tensor: torch.Tensor) -> tuple[np.ndarray, int]:
-    """INT4 quantization with 64-element blocks. Returns (packed_uint8_array, n_blocks).
-
-    Layout: [bf16 scales per block][packed int4 data]. Matches GGUF Q4_64.
-    """
-    data = tensor.flatten().cpu().float().numpy()
-    n_blocks = int(np.ceil(len(data) / 64))
-    padded = np.pad(data, (0, n_blocks * 64 - len(data)))
-    blocks = padded.reshape(n_blocks, 64)
-    scales = np.max(np.abs(blocks), axis=1)
-    scales[scales == 0] = 1.0
-    scales /= 7.0
-    quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
-    pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
-    packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
-    scale_bytes = torch.tensor(-scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
-    return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
-
-
-def quantize_fp4_64(tensor: torch.Tensor,
-                    fp4_table: torch.Tensor | None = None) -> tuple[np.ndarray, int]:
-    """FP4 E2M1 quantization with 64-element blocks. Returns (packed_uint8_array, n_blocks)."""
-    table = fp4_table if fp4_table is not None else _FP4_E2M1_TABLE
-    x = tensor.to(torch.bfloat16).cpu().flatten()
-    n_blocks = int(np.ceil(x.numel() / 64))
-    if x.numel() % 64 != 0:
-        x = torch.nn.functional.pad(x, (0, n_blocks * 64 - x.numel()))
-    blocks = x.view(n_blocks, 64)
-    fp4_max = torch.tensor(6.0, dtype=torch.bfloat16)
-    scales = (blocks.abs().max(dim=1).values / fp4_max).clamp(min=1e-8).to(torch.bfloat16)
-    scaled = (blocks / scales[:, None]).to(torch.bfloat16)
-    codes = torch.argmin(torch.abs(scaled.unsqueeze(-1) - table), dim=-1).to(torch.uint8)
-    codes_np = codes.numpy().flatten()
-    if len(codes_np) % 2 != 0:
-        codes_np = np.pad(codes_np, (0, 1))
-    packed = (codes_np[0::2] & 0x0F) | ((codes_np[1::2] & 0x0F) << 4)
-    scales_np = scales.view(torch.uint16).numpy()
-    return np.frombuffer(scales_np.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
+# §4 Quantization helpers — MOVED to quant_lib.py. The legacy concatenated-
+# format codecs (quantize_bf16_to_int4_packed, quantize_q4_64, quantize_fp4_64,
+# _FP4_E2M1_TABLE) now live in quant_lib.py's "Legacy concatenated-format
+# codecs" section. Import from quant_lib in new code.
 
 
 # =============================================================================

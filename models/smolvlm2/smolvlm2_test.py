@@ -33,6 +33,8 @@ from nn_lib import (
     store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
     eltwise_add_core_dram, eltwise_mul_core_dram,
     rms_norm_core_dram_post_add, layer_norm_core_dram_post_add,
+)
+from quant_lib import (
     quantize_q4_64 as _mlc_quantize_q4_64,
     quantize_fp4_64 as _mlc_quantize_fp4_64,
 )
