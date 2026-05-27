@@ -19,8 +19,8 @@
     "bytes_per_element": 2
   },
   "model": {
-    "max_context_size": 2048,
-    "prefill_max_seq_len": 64,
+    "max_context_size": 512,
+    "prefill_max_seq_len": 192,
     "end_of_turn_token_id": 151645
   },
   "paths": {

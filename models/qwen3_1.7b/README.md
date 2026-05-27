@@ -27,6 +27,13 @@ python src/template/models/qwen3_1.7b/qwen3_1.7b_test.py --prompt "What is 2+2?"
 python src/template/models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py --prompt "What is 2+2?"
 ```
 
+**Prompt-length range:** the cached bin handles any prompt from 1 to
+`prefill_max_seq_len` tokens (default **256**) without recompile.
+Prefill is a single seq_len-agnostic PBI program; the bucket cap on
+flash attention is what sets the upper bound. Bump
+`model.prefill_max_seq_len` in the config and delete the cached bin
+to extend the range (bin grows roughly linearly with that knob).
+
 Force a recompile of the instruction bin by deleting both files:
 
 ```bash

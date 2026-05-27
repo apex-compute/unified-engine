@@ -27,6 +27,13 @@ python src/template/models/qwen3_4b/qwen3_4b_test.py --prompt "What is 2+2?"
 python src/template/models/qwen3_4b/qwen3_4b_run_from_bin.py --prompt "What is 2+2?"
 ```
 
+**Prompt-length range:** the cached bin handles any prompt from 1 to
+`prefill_max_seq_len` tokens (default **256**) without recompile.
+For long prompts (>50 tokens) prefill can take 25-30 s wall-clock because
+flash attention's high bucket bodies do `seq_len²` work × 8 KV heads ×
+36 layers. The `program_execute` wait_queue timeout is set to 120 s
+in this template to absorb that.
+
 Force a recompile of the instruction bin by deleting both files:
 
 ```bash

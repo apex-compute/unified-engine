@@ -47,7 +47,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -411,12 +411,24 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self.DRAM_ADDR_ROPE_GLOBAL = rope_base + local_sz
 
     def weight_init(self) -> None:
-        """Initialize DRAM from weight bin: load HF embedding+tokenizer, layers from bin, host-computed RoPE, then OUTPUT_NORM/LM_HEAD from bin."""
-        model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
-        # Qwen3 does NOT scale the embedding by sqrt(hidden_size)
-        embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
-        self.embedding_weight = embed
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        """Initialize DRAM from weight bin: load embedding+tokenizer offline from
+        cached files, layers from bin, host-computed RoPE, then OUTPUT_NORM/LM_HEAD
+        from bin. The embedding is read straight out of ``self.weight_bin`` (no HF
+        model needed at this stage); the tokenizer is loaded with
+        ``local_files_only=True``. ``main()`` runs ``weight_bin_generate`` first
+        on a fresh machine — it handles the HF download — so by the time we get
+        here both the weight bin and the tokenizer files exist locally."""
+        emb_cfg = self._cfg["special"]["embedding"]
+        token_embd_offset = _parse_offset(emb_cfg["token_embd_offset"])
+        vocab_size = emb_cfg["vocab_size"]
+        emb_dim = emb_cfg["embedding_dim"]
+        emb_bytes = vocab_size * emb_dim * self.bytes_per_element
+        raw_emb = bytearray(self.weight_bin[token_embd_offset : token_embd_offset + emb_bytes])
+        self.embedding_weight = torch.frombuffer(raw_emb, dtype=torch.bfloat16).reshape(vocab_size, emb_dim).clone()
+        model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_dir, trust_remote_code=True, local_files_only=True,
+        )
 
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         base_layer0 = self.weight_defs["BLK0_ATTN_NORM_WEIGHT"]
@@ -562,7 +574,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
-    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 10.0, gflops: float = None) -> None:
+    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 60.0, gflops: float = None) -> None:
         """Execute compiled program from DRAM instruction memory.
         """
         print(f"Execute program start at 0x{program_start_addr:X}")
@@ -591,6 +603,72 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self._isa_reg_counter += 1
         return reg_idx
 
+    def _emit_pbi_scatter_per_token(self, *, read_base, read_stride_bytes,
+                                    write_specs, sram_byte_addr, element_count,
+                                    gf_seq_len, template_seq_len):
+        """Emit one PBI runtime loop that staged-copies one ``element_count``-row
+        per outer iteration from ``read_base`` to each (base, stride) in
+        ``write_specs``. The outer trip count is taken from GPR ``gf_seq_len`` so
+        the body executes exactly ``actual_seq_len`` times at runtime — making
+        the captured bin truly seq_len-agnostic up to ``MAX_CONTEXT_SIZE``.
+
+        Read side uses register-computed addresses (``reg_mul_imm`` + ``add_imm``
+        + ``general_reg_src=TMP_REG``) — the same pattern used by the decoder
+        bin. The write side uses gemma3-style ``pbi_init`` pointers + per-call
+        DRAM-delta DMAs, which is the proven SRAM→DRAM PBI scatter shape.
+
+        Per-iteration t-counter is a locally-allocated GPR that increments by 1
+        at end-of-body via ``add_inc``. Released after the loop.
+        """
+        bpe = self.bytes_per_element
+        bytes_per_call = element_count * bpe
+        _, sram_words = self.sram_address_to_uram_address(sram_byte_addr)
+
+        # Allocate write PBI pointers (one per destination stream).
+        ptr_ws = [self.alloc_inst_ptr() for _ in write_specs]
+        for ptr_w, (dst_base, _stride) in zip(ptr_ws, write_specs):
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=dst_base,
+                dma_length=bytes_per_call,
+                uram_a_start_addr=sram_words,
+                uram_b_start_addr=sram_words,
+                inst_pointer_idx=ptr_w,
+            )
+
+        # Per-token counter t (0, 1, 2, ...) — used to compute read DRAM addr.
+        t_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(t_reg, 0)
+
+        self.loop_start(loop_cnt=template_seq_len, gf_loop_cnt=gf_seq_len)
+        # Read DRAM addr = read_base + t * read_stride_bytes
+        self.generate_instruction_reg_mul_imm(
+            self.TMP_REG, t_reg, ue_35bit_addr_shifter(read_stride_bytes))
+        self.generate_instruction_add_imm(
+            self.TMP_REG, ue_35bit_addr_shifter(read_base), self.TMP_REG)
+        # DRAM→SRAM with runtime-computed source DRAM addr (delivered via TMP_REG).
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=0,
+            sram_address=sram_byte_addr,
+            element_size=element_count,
+            general_reg_src=self.TMP_REG,
+        )
+        # SRAM→DRAM via PBI pointers (each advances its DRAM addr by its stride).
+        for ptr_w, (_base, dst_stride) in zip(ptr_ws, write_specs):
+            self.sram_to_accelerator_memory(
+                sram_address=0,
+                accelerator_dram_address=dst_stride,
+                element_size=element_count,
+                inst_pointer_idx=ptr_w,
+                memcpy_length_bytes=0,
+            )
+        # t += 1
+        self.generate_instruction_add_inc(t_reg)
+        self.loop_end()
+
+        self.release_isa_reg()  # t_reg
+        for ptr in reversed(ptr_ws):
+            self.release_inst_ptr(ptr)
+
     def _emit_prefill_program(self, seq_len: int, layer_size: int) -> int:
         """Emit ONE seq_len-agnostic prefill program (no capture-session boundary).
 
@@ -598,13 +676,12 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         ends with a halt so it can be jumped to via a runtime preamble that
         primes gf_seq_len / gf_q_seq_len / gf_bucket_idx GPRs.
 
-        ``seq_len`` here is the **compile-time template** (typically
-        ``PREFILL_MAX_SEQ_LEN``). It drives:
-          - FLOPS bookkeeping (the reported total_flops scales by template seq_len)
-          - Static unroll of K/V/Q scatter Python loops (writes positions
-            0..template-1 unconditionally; runtime bias masks invalid positions
-            so the actual seq_len at runtime can be ≤ template)
-          - Static M arg passed to PBI ops (overridden at runtime by gf_M_reg)
+        ``seq_len`` here is a **compile-time template** used only for FLOPS
+        bookkeeping and as the static ``M=`` arg to PBI ops (overridden at
+        runtime by ``gf_M_reg``). K/V/Q scatter, FLASH_K/V duplication, and the
+        FLASH_OUTPUT assembly are emitted as **PBI runtime loops** keyed off
+        ``gf_seq_len``, so the bin is truly seq_len-agnostic up to
+        ``MAX_CONTEXT_SIZE`` regardless of the template value.
 
         All bulk ops (rms_norm, matmat, rope, eltwise) are PBI-dispatched via
         gf_M_reg=self.gf_seq_len. Per-token outer loops for matmul/norm/rope
@@ -634,8 +711,19 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             _original_print(f"    prefill layer {layer_idx + 1}/{layer_size}", end="\r", flush=True)
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=seq_len * self.vector_length)
+                # Inter-layer copy: previous layer's OUTPUT → next layer's INPUT.
+                # Per-token PBI loop (one row of vector_length per iter) to avoid the
+                # URAM-A overflow that a single seq_len*vector_length SRAM stage hits
+                # once seq_len * vector_length * bpe > 512 KB (URAM_A capacity).
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_OUTPUT_DRAM,
+                    read_stride_bytes=self.vector_length * bpe,
+                    write_specs=[(self.LAYER0_INPUT_DRAM, self.vector_length * bpe)],
+                    sram_byte_addr=0x10000,
+                    element_count=self.vector_length,
+                    gf_seq_len=self.gf_seq_len,
+                    template_seq_len=seq_len,
+                )
 
             # Pre-norm (input_layernorm) — M=seq_len rows at runtime via gf_seq_len
             total_flops += (self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
@@ -686,7 +774,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
                 gf_M_reg=self.gf_seq_len)
 
-            # Per-KV-head: scatter K/V to cache + flash buffers, scatter Q, then flash_attention
+            # Per-KV-head: scatter K/V to cache + flash buffers, scatter Q, then flash_attention.
+            # All per-token scatters are PBI runtime loops (gf_seq_len trips) — the bin is
+            # truly seq_len-agnostic up to MAX_CONTEXT_SIZE; no PREFILL_MAX_SEQ_LEN cap.
             for kv_h in range(nkvh):
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
                                 + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
@@ -695,28 +785,45 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                                 + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
                                 + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
 
-                # Scatter roped K_h (standard layout) → KV cache + FLASH_K (GQA dup x qpkv)
-                for t in range(seq_len):
-                    k_src = self.LAYER0_K_NORM_DRAM + (t * nkvh + kv_h) * ahd * bpe
-                    self.accelerator_memory_to_sram(k_src, 0x10000, ahd)
-                    self.sram_to_accelerator_memory(0x10000, k_cache_base + t * ahd * bpe, ahd)
-                    for g in range(qpkv):
-                        self.sram_to_accelerator_memory(0x10000, self.LAYER0_FLASH_K_DRAM + (t * qpkv + g) * ahd * bpe, ahd)
+                # K scatter: K_NORM[t][kv_h] → K cache[kv_h][t] + FLASH_K[t*qpkv+g] for g in 0..qpkv-1
+                k_write_specs = [(k_cache_base, ahd * bpe)]
+                for g in range(qpkv):
+                    k_write_specs.append((self.LAYER0_FLASH_K_DRAM + g * ahd * bpe, qpkv * ahd * bpe))
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
+                    read_stride_bytes=nkvh * ahd * bpe,
+                    write_specs=k_write_specs,
+                    sram_byte_addr=0x10000,
+                    element_count=ahd,
+                    gf_seq_len=self.gf_seq_len,
+                    template_seq_len=seq_len,
+                )
 
-                # Scatter V_h from V_PROJ_TEMP → KV cache + FLASH_V (GQA dup x qpkv)
-                for t in range(seq_len):
-                    v_src = self.LAYER0_V_PROJ_TEMP + (t * nkvh + kv_h) * ahd * bpe
-                    self.accelerator_memory_to_sram(v_src, 0x20000, ahd)
-                    self.sram_to_accelerator_memory(0x20000, v_cache_base + t * ahd * bpe, ahd)
-                    for g in range(qpkv):
-                        self.sram_to_accelerator_memory(0x20000, self.LAYER0_FLASH_V_DRAM + (t * qpkv + g) * ahd * bpe, ahd)
+                # V scatter: V_PROJ_TEMP[t][kv_h] → V cache[kv_h][t] + FLASH_V[t*qpkv+g]
+                v_write_specs = [(v_cache_base, ahd * bpe)]
+                for g in range(qpkv):
+                    v_write_specs.append((self.LAYER0_FLASH_V_DRAM + g * ahd * bpe, qpkv * ahd * bpe))
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe,
+                    read_stride_bytes=nkvh * ahd * bpe,
+                    write_specs=v_write_specs,
+                    sram_byte_addr=0x20000,
+                    element_count=ahd,
+                    gf_seq_len=self.gf_seq_len,
+                    template_seq_len=seq_len,
+                )
 
-                # Scatter Q heads for this KV head → FLASH_Q
-                for t in range(seq_len):
-                    for q in range(qpkv):
-                        q_src = self.LAYER0_Q_NORM_DRAM + (t * nkvh * qpkv + kv_h * qpkv + q) * ahd * bpe
-                        self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
-                        self.sram_to_accelerator_memory(0x30000, self.LAYER0_FLASH_Q_DRAM + (t * qpkv + q) * ahd * bpe, ahd)
+                # Q scatter: Q_NORM[t][kv_h*qpkv:kv_h*qpkv+qpkv] → FLASH_Q[t*qpkv:(t+1)*qpkv]
+                # Per token, copy qpkv contiguous Q rows (qpkv*ahd elements) in one DMA.
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_Q_NORM_DRAM + kv_h * qpkv * ahd * bpe,
+                    read_stride_bytes=nkvh * qpkv * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_Q_DRAM, qpkv * ahd * bpe)],
+                    sram_byte_addr=0x30000,
+                    element_count=qpkv * ahd,
+                    gf_seq_len=self.gf_seq_len,
+                    template_seq_len=seq_len,
+                )
 
                 # Flash attention for this KV head (head_dim=128, GQA group_size=2).
                 # Bucket dispatcher: bin contains num_buckets_prefill bodies (one per
@@ -741,14 +848,19 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 total_flops += (flash_result[num_buckets_prefill - 1]
                                 if isinstance(flash_result, (list, tuple)) else (flash_result or 0))
 
-                # Assemble per-head output into FLASH_OUTPUT_DRAM
-                out_h_base = kv_h * qpkv * ahd * bpe
-                for t in range(seq_len):
-                    for g in range(qpkv):
-                        src = self.LAYER0_FLASH_OUT_HEAD_DRAM + (t * qpkv + g) * ahd * bpe
-                        dst = self.LAYER0_FLASH_OUTPUT_DRAM + t * hd * qpkv * bpe + out_h_base + g * ahd * bpe
-                        self.accelerator_memory_to_sram(src, 0x40000, ahd)
-                        self.sram_to_accelerator_memory(0x40000, dst, ahd)
+                # Assemble per-head output into FLASH_OUTPUT_DRAM. Per token, copy
+                # qpkv contiguous rows from FLASH_OUT_HEAD[t*qpkv:(t+1)*qpkv] to
+                # FLASH_OUTPUT[t][kv_h*qpkv:(kv_h+1)*qpkv]. PBI runtime loop.
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                    read_stride_bytes=qpkv * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
+                                  hd * qpkv * bpe)],
+                    sram_byte_addr=0x40000,
+                    element_count=qpkv * ahd,
+                    gf_seq_len=self.gf_seq_len,
+                    template_seq_len=seq_len,
+                )
 
             # o_proj
             total_flops += (self.matmat_mul_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
@@ -756,11 +868,16 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, gf_M_reg=self.gf_seq_len) or 0)
 
-            # Qwen3: no post-attention norm; add residual directly to o_proj output
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=seq_len * self.vector_length)
+            # Qwen3: no post-attention norm; add residual directly to o_proj output.
+            # PBI runtime loop (one row per iter, gf_seq_len trips) so seq_len > URAM-A capacity is safe.
+            self.eltwise_core_dram(
+                M=seq_len, N=self.vector_length,
+                dram_a=self.LAYER0_INPUT_DRAM,
+                dram_b=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                dram_out=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                mode=UE_MODE.ELTWISE_ADD,
+                gf_M_reg=self.gf_seq_len,
+            )
 
             # Qwen3: post_attention_layernorm IS the pre-FFN norm
             total_flops += (self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
@@ -779,18 +896,15 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
                 gf_M_reg=self.gf_seq_len) or 0)
 
-            # gate x up chunked: process M_CHUNK rows at a time to fit in SRAM banks
-            _bpe = self.bytes_per_element
-            _M_CHUNK = min(25, seq_len)
-            for _t in range(0, seq_len, _M_CHUNK):
-                _m_take = min(_M_CHUNK, seq_len - _t)
-                _g_row = self.LAYER0_MLP_GATE_DRAM + _t * self.mlp_elements * _bpe
-                _u_row = self.LAYER0_MLP_UP_DRAM   + _t * self.mlp_elements * _bpe
-                _m_row = self.LAYER0_MLP_MULT_DRAM  + _t * self.mlp_elements * _bpe
-                self.accelerator_memory_to_sram(_g_row, 0x10000, _m_take * self.mlp_elements)
-                self.accelerator_memory_to_sram(_u_row, 0x90000, _m_take * self.mlp_elements)
-                self.eltwise_mul_core(0x10000, 0x90000, 0x10000, _m_take * self.mlp_elements)
-                self.sram_to_accelerator_memory(0x10000, _m_row, _m_take * self.mlp_elements)
+            # gate × up: PBI runtime loop, one row of mlp_elements per iter (gf_seq_len trips).
+            self.eltwise_core_dram(
+                M=seq_len, N=self.mlp_elements,
+                dram_a=self.LAYER0_MLP_GATE_DRAM,
+                dram_b=self.LAYER0_MLP_UP_DRAM,
+                dram_out=self.LAYER0_MLP_MULT_DRAM,
+                mode=UE_MODE.ELTWISE_MUL,
+                gf_M_reg=self.gf_seq_len,
+            )
 
             # down_proj: K=6144 ≤ SCALE_BRAM_ELEMENTS=8192, single call
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
@@ -800,10 +914,15 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 gf_M_reg=self.gf_seq_len) or 0)
 
             # Qwen3: no post-FFN norm; add residual directly to down_proj output
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=seq_len * self.vector_length)
+            # Post-MLP residual: layer_output = POST_ATTN_RESIDUAL + MLP_DOWN. PBI runtime loop.
+            self.eltwise_core_dram(
+                M=seq_len, N=self.vector_length,
+                dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                dram_b=self.LAYER0_MLP_DOWN_DRAM,
+                dram_out=self.LAYER0_OUTPUT_DRAM,
+                mode=UE_MODE.ELTWISE_ADD,
+                gf_M_reg=self.gf_seq_len,
+            )
 
         # Per-bucket halt so each bucket-program is independently executable.
         self.generate_instruction_halt()
@@ -1147,11 +1266,16 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         bin_path  = os.path.join(self.script_dir, bin_rel)
         meta_path = os.path.join(self.script_dir, meta_rel)
 
-        if os.path.exists(bin_path) and os.path.exists(meta_path):
-            with open(meta_path) as f:
-                meta = json.load(f)
-            print(f"Instruction bin found, skipping compile: {bin_path}")
-            return meta
+        # Always run the full compile, even if the bin is cached, because
+        # ``flash_attention_core_pbi`` and ``bf16_transpose_core_pbi`` do
+        # **host-side identity-matrix DMA writes** during compile and the
+        # captured bin references those exact DRAM addresses. Skipping the
+        # compile would leave those addresses holding whatever any other
+        # script wrote to them since the bin was generated (e.g. another
+        # model's weights), which produces NaN attention and all-`!` decode.
+        # The disk bin is still re-used as a cache for the *bytes* — we
+        # skip the bin-write step if the existing file matches.
+        bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
 
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         # Template seq_len: drives static M= args (overridden at runtime by gf_M_reg),
@@ -1195,8 +1319,6 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         all_bytes = bytearray()
         for inst in self.capture_buffer:
             all_bytes.extend(inst.get_bytes())
-        with open(bin_path, "wb") as f:
-            f.write(all_bytes)
 
         prefill_program_start_addr = instruction_base_addr
         decoder_program_start_addr = instruction_base_addr + prefill_program_size
@@ -1212,11 +1334,16 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             "decoder_program_size":         decoder_program_size,
             "decoder_total_flops":          decoder_flops,
         }
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
+        if bin_cached:
+            print(f"Compile re-run for identity-matrix DMAs; bin already on disk at {bin_path}.")
+        else:
+            with open(bin_path, "wb") as f:
+                f.write(all_bytes)
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+            print(f"Instruction bin written: {bin_path} ({len(all_bytes)} bytes; "
+                  f"prefill {prefill_program_size} B + decoder {decoder_program_size} B)")
         self.clear_capture_buffer()
-        print(f"Instruction bin written: {bin_path} ({len(all_bytes)} bytes; "
-              f"prefill {prefill_program_size} B + decoder {decoder_program_size} B)")
         return meta
 
     def run_decoder(self, decoder_program_addr: int, preamble_addr: int,
