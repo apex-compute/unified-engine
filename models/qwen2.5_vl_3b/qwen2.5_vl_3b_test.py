@@ -22,6 +22,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
+from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_dram_post_add
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
 from user_dma_core import ue_35bit_addr_shifter
 import quant_lib
@@ -101,55 +102,7 @@ def store_identity_matrix(ue):
     ue.allocate_params_dram(size)
     return addr
 
-def eltwise_add_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
-    """OUTPUT = A + B (DRAM)."""
-    bytes_per_element = 2
-    uram_a_addr = 0x00000
-    uram_b_addr = 0x80000
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS, size)
 
-    for start, take in ue.chunk_ranges(size, chunk_size):
-        offset_bytes = start * bytes_per_element
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=A_DRAM_ADDR + offset_bytes,
-            sram_address=uram_a_addr, element_size=take)
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=B_DRAM_ADDR + offset_bytes,
-            sram_address=uram_b_addr, element_size=take)
-        ue.eltwise_add_core(
-            vector_A_sram_start_addr=uram_a_addr,
-            vector_B_sram_start_addr=uram_b_addr,
-            vector_C_sram_wb_addr=uram_a_addr, element_size=take)
-        ue.sram_to_accelerator_memory(
-            sram_address=uram_a_addr,
-            accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
-            element_size=take)
-    return size
-
-def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
-    """OUTPUT = A * B (DRAM)."""
-    bytes_per_element = 2
-    uram_a_addr = 0x00000
-    uram_b_addr = 0x80000
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS, size)
-
-    for start, take in ue.chunk_ranges(size, chunk_size):
-        offset_bytes = start * bytes_per_element
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=A_DRAM_ADDR + offset_bytes,
-            sram_address=uram_a_addr, element_size=take)
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=B_DRAM_ADDR + offset_bytes,
-            sram_address=uram_b_addr, element_size=take)
-        ue.eltwise_mul_core(
-            vector_A_sram_start_addr=uram_a_addr,
-            vector_B_sram_start_addr=uram_b_addr,
-            vector_C_sram_wb_addr=uram_a_addr, element_size=take)
-        ue.sram_to_accelerator_memory(
-            sram_address=uram_a_addr,
-            accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
-            element_size=take)
-    return size
 
 def bf16_permute_core_v2(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                           params_dram_addr, temp_dram_start):
@@ -319,50 +272,6 @@ def bf16_permute_core_v2(ue, dims, permute_indices, input_dram_addr, output_dram
 
     return (2, output_shape)
 
-def rms_norm_core_dram_post_add(ue, M: int, N: int,
-                                 A_DRAM_ADDR: int, B_DRAM_ADDR: int,
-                                 ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int,
-                                 GAMMA_DRAM_ADDR: int = None) -> int:
-    """rms_norm(A + B) with residual output."""
-    gamma_sram_addr = 0x80000
-    params_sram_addr = gamma_sram_addr
-
-    if GAMMA_DRAM_ADDR is not None:
-        ue.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
-                                    sram_address=gamma_sram_addr, element_size=N)
-        params_sram_addr += N * 2
-    else:
-        gamma_sram_addr = None
-
-    vector_A_sram_addr = 0x00000
-    vector_B_sram_addr = params_sram_addr
-    uram_b_remaining_elements = URAM_NEAR_FULL_ELEMENTS - (params_sram_addr - 0x80000) // 2
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, uram_b_remaining_elements // N, M)
-    assert chunk_size >= 1 and chunk_size <= M
-
-    for i, m_take in ue.chunk_ranges(M, chunk_size):
-        chunk_elements = m_take * N
-        ue.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * N * 2,
-                                    sram_address=vector_A_sram_addr, element_size=chunk_elements)
-        ue.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + i * N * 2,
-                                    sram_address=vector_B_sram_addr, element_size=chunk_elements)
-        for j in range(m_take):
-            ue.eltwise_add_core(vector_A_sram_addr + j * N * 2, vector_B_sram_addr + j * N * 2,
-                                vector_A_sram_addr + j * N * 2, N)
-        ue.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
-                                        accelerator_dram_address=ADDOUTPUT_DRAM_ADDR + i * N * 2,
-                                        element_size=chunk_elements)
-        for j in range(m_take):
-            ue.rms_norm_core(vector_A_sram_addr + j * N * 2, vector_A_sram_addr + j * N * 2,
-                             N, gamma_sram_addr)
-        ue.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
-                                        accelerator_dram_address=NORMOUTPUT_DRAM_ADDR + i * N * 2,
-                                        element_size=chunk_elements)
-
-    total_flops = M * N + 3 * M * N
-    if gamma_sram_addr is not None:
-        total_flops += M * N
-    return total_flops
 
 def _qs_pack(precision: str, tensor: torch.Tensor):
     """Run a 64-block codec via quant_lib and emit the scale-then-data
