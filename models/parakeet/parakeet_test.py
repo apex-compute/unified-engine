@@ -44,6 +44,10 @@ from user_dma_core import (
     UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX,
     ue_35bit_addr_shifter, calculate_snr
 )
+from nn_lib import (
+    batch_norm_core_dram, tanh_core_dram, silu_core_dram, glu_core_dram,
+    half_step_residual_core_dram, rel_shift_core_dram, chunked_transpose_core_dram,
+)
 
 URAM_A_BASE = 0x00000
 URAM_B_BASE = 0x80000
@@ -103,43 +107,6 @@ def batch_norm_prepare_tiled(ue, C, L, SCALE_DRAM_ADDR, SHIFT_DRAM_ADDR):
     ue.allocate_params_dram(C * L * bpe)
     ue.dma_to_accelerator_memory(shift_tiled_addr, shift_tiled)
     return scale_tiled_addr, shift_tiled_addr
-def batch_norm_core_dram(ue: UnifiedEngine, C: int, L: int,
-                         A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                         SCALE_DRAM_ADDR: int, SHIFT_DRAM_ADDR: int,
-                         tiled_scale_addr: int = None,
-                         tiled_shift_addr: int = None) -> None:
-    """Emit instructions for fused eval-mode batch norm on (C, L) tensor.
-    If tiled_scale_addr and tiled_shift_addr are provided, uses bulk ops (6 instructions).
-    Otherwise falls back to per-channel loop.
-    """
-    assert L % UE_VECTOR_SIZE == 0, f"L={L} must be a multiple of {UE_VECTOR_SIZE}"
-    if tiled_scale_addr is not None and tiled_shift_addr is not None:
-        total_elems = C * L
-        # Load input, load tiled scale, multiply
-        ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
-        ue.accelerator_memory_to_sram(tiled_scale_addr, URAM_B_BASE, total_elems)
-        ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE,
-                           vector_B_sram_start_addr=URAM_B_BASE,
-                           vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
-        # Load tiled shift, add
-        ue.accelerator_memory_to_sram(tiled_shift_addr, URAM_B_BASE, total_elems)
-        ue.eltwise_add_core(vector_A_sram_start_addr=URAM_A_BASE,
-                           vector_B_sram_start_addr=URAM_B_BASE,
-                           vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
-        # Write result
-        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
-        return
-    # Fallback: per-channel (original behavior)
-    row_bytes = L * 2
-    scale_host = torch.zeros(C, dtype=torch.bfloat16)
-    shift_host = torch.zeros(C, dtype=torch.bfloat16)
-    ue.dma_read(DMA_DEVICE_C2H, SCALE_DRAM_ADDR, scale_host, C * 2)
-    ue.dma_read(DMA_DEVICE_C2H, SHIFT_DRAM_ADDR, shift_host, C * 2)
-    for c in range(C):
-        ue.accelerator_memory_to_sram(A_DRAM_ADDR + c * row_bytes, URAM_A_BASE, L)
-        ue.broadcast_mul(scalar=scale_host[c].float().item(), sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=L)
-        ue.broadcast_add(scalar=shift_host[c].float().item(), sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=L)
-        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + c * row_bytes, L)
 def allocate_identity(ue: UnifiedEngine, N: int):
     """Allocate and write an (N, N) bf16 identity matrix to DRAM. Call once at init.
     Returns DRAM address. Reused by tanh_core_dram and glu_core_dram.
@@ -150,167 +117,6 @@ def allocate_identity(ue: UnifiedEngine, N: int):
     ue.allocate_params_dram(N * N * 2)
     ue.dma_write(DMA_DEVICE_H2C, addr, identity, N * N * 2)
     return addr
-def tanh_core_dram(ue: UnifiedEngine, M: int, N: int,
-                   A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                   IDENTITY_DRAM_ADDR: int) -> None:
-    """Emit instructions for tanh(x) = 2*sigmoid(2x) - 1 on (M, N) tensor.
-    Steps:
-        1. MUL_BROADCAST scalar=2.0 on each row         →  2x
-        2. matmat_mul_core (M,N)@(N,N) sigmoid_enable   →  sigmoid(2x)
-        3. MUL_BROADCAST scalar=2.0 on each row         →  2*sigmoid(2x)
-        4. ADD_BROADCAST scalar=-1.0 on each row        →  tanh(x)
-    """
-    assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
-    row_bytes = N * 2
-    # Step 1: 2x → OUTPUT as temp
-    for m in range(M):
-        ue.accelerator_memory_to_sram(A_DRAM_ADDR + m * row_bytes, URAM_A_BASE, N)
-        ue.broadcast_mul(scalar=2.0, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
-        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, N)
-    # Step 2: sigmoid(2x) via identity matmul with LALU sigmoid
-    ue.matmat_mul_core(M=M, K=N, N=N,
-                       A_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                       B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                       OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                       sigmoid_enable=True)
-    # Steps 3+4: 2*sigmoid(2x) - 1
-    for m in range(M):
-        ue.accelerator_memory_to_sram(OUTPUT_DRAM_ADDR + m * row_bytes, URAM_A_BASE, N)
-        ue.broadcast_mul(scalar=2.0, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
-        ue.broadcast_add(scalar=-1.0, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE, element_size=N)
-        ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR + m * row_bytes, N)
-def silu_core_dram(ue: UnifiedEngine, M: int, N: int,
-                   A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                   IDENTITY_DRAM_ADDR: int) -> None:
-    """Emit instructions for standalone SiLU: output = x * sigmoid(x) on (M, N) tensor.
-    Steps:
-        1. Copy input to OUTPUT as temp (preserve x for step 3)
-        2. matmat_mul_core (M,N)@I(N,N) sigmoid_enable on temp  → sigmoid(x)
-        3. eltwise_mul row-by-row: x * sigmoid(x) → OUTPUT
-    """
-    assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
-    total_elems = M * N
-    # Step 1: bulk copy input to OUTPUT (so we can sigmoid in-place there)
-    ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
-    ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
-    # Step 2: sigmoid(x) via identity matmul with LALU sigmoid → OUTPUT in-place
-    ue.matmat_mul_core(M=M, K=N, N=N, A_DRAM_ADDR=OUTPUT_DRAM_ADDR, B_DRAM_ADDR=IDENTITY_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, sigmoid_enable=True)
-    # Step 3: bulk x * sigmoid(x)
-    ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
-    ue.accelerator_memory_to_sram(OUTPUT_DRAM_ADDR, URAM_B_BASE, total_elems)
-    ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
-    ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
-def glu_core_dram(ue: UnifiedEngine, M: int, C: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int) -> None:
-    """Emit instructions for GLU: output = a * sigmoid(b).
-    Assumes PW Conv1 was split into two matmuls writing a and b separately:
-        PW Conv1a: (M, D) @ W_a(D, C) → a at A_DRAM_ADDR     (M, C)
-        PW Conv1b: (M, D) @ W_b(D, C) → b at B_DRAM_ADDR     (M, C)
-    Steps:
-        1. matmat_mul_core (M,C)@I(C,C) sigmoid_enable on b  → sigmoid(b) in-place
-        2. eltwise_mul row-by-row: a * sigmoid(b) → OUTPUT
-    """
-    assert C % UE_VECTOR_SIZE == 0, f"C={C} must be a multiple of {UE_VECTOR_SIZE}"
-    total_elems = M * C
-    # Step 1: sigmoid(b) via identity matmul
-    ue.matmat_mul_core(M=M, K=C, N=C, A_DRAM_ADDR=B_DRAM_ADDR, B_DRAM_ADDR=IDENTITY_DRAM_ADDR, OUTPUT_DRAM_ADDR=B_DRAM_ADDR, sigmoid_enable=True)
-    # Step 2: bulk a * sigmoid(b)
-    ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
-    ue.accelerator_memory_to_sram(B_DRAM_ADDR, URAM_B_BASE, total_elems)
-    ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE, vector_C_sram_wb_addr=URAM_A_BASE, element_size=total_elems)
-    ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
-def rel_shift_core_dram(ue: UnifiedEngine, L: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                        input_row_stride: int = None) -> None:
-    """Emit instructions for rel_shift: extract (L, L) from (L, P_pad) positional scores.
-    Row i of output = input[i, (L-1-i) : (L-1-i)+L]
-    Each is a contiguous L-element DMA copy at a computed source offset.
-    No arithmetic — pure memory rearrangement.
-    Args:
-        ue: UnifiedEngine instance
-        L: sequence length (L_pad, bucketed, must be multiple of UE_VECTOR_SIZE)
-        INPUT_DRAM_ADDR: (L, input_row_stride) bf16 positional score matrix
-        OUTPUT_DRAM_ADDR: (L, L) bf16 output
-        input_row_stride: actual number of elements per row in input (P_pad from matmul).
-                          Defaults to 2*L-1 for backwards compatibility.
-    """
-    assert L % UE_VECTOR_SIZE == 0, f"L={L} must be a multiple of {UE_VECTOR_SIZE}"
-    P_stride = input_row_stride if input_row_stride is not None else (2 * L - 1)
-    bpe = 2          # bf16
-    for i in range(L):
-        src = INPUT_DRAM_ADDR + (i * P_stride + (L - 1 - i)) * bpe
-        dst = OUTPUT_DRAM_ADDR + i * L * bpe
-        ue.accelerator_memory_to_sram(src, URAM_A_BASE, L)
-        ue.sram_to_accelerator_memory(URAM_A_BASE, dst, L)
-def chunked_transpose_core_dram(ue: UnifiedEngine, M: int, N: int,
-                                 input_dram_addr: int, output_dram_addr: int,
-                                 identity_dram_addr: int, temp_dram_addr: int) -> None:
-    """Transpose (M, N) -> (N, M) by processing N in UE_VECTOR_SIZE-column chunks.
-
-    bf16_smart_permute_core's dot-product transpose accumulates across
-    N_transpose // UE_VECTOR_SIZE groups, which corrupts results when
-    N > UE_VECTOR_SIZE.  This helper splits into chunks where each sub-transpose
-    has N_transpose = UE_VECTOR_SIZE (=64), avoiding the bug.
-
-    Input at input_dram_addr: (M, N) contiguous bf16.
-    Output at output_dram_addr: (N, M_aligned) contiguous bf16,
-        where M_aligned = pad_to_multiple(M, UE_VECTOR_SIZE).
-    """
-    bpe = 2
-    VS = UE_VECTOR_SIZE  # 64
-    M_aligned = ((M - 1) // VS + 1) * VS
-    n_chunks = (N + VS - 1) // VS
-
-    for c in range(n_chunks):
-        col_start = c * VS
-        col_end = min(col_start + VS, N)
-        chunk_cols = col_end - col_start
-        chunk_cols_pad = ((chunk_cols - 1) // VS + 1) * VS  # = VS for full chunks
-
-        # Extract columns [col_start:col_end] from each of M rows via strided DMA
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=input_dram_addr + col_start * bpe,
-            sram_address=URAM_A_BASE,
-            element_size=M * chunk_cols,
-            stride_bytes_per_chunk=chunk_cols * bpe,
-            stride_jump_bytes=N * bpe)
-        ue.sram_to_accelerator_memory(
-            sram_address=URAM_A_BASE,
-            accelerator_dram_address=temp_dram_addr,
-            element_size=M * chunk_cols_pad)
-
-        # Transpose (M, chunk_cols_pad) -> (chunk_cols_pad, M_aligned)
-        # N_transpose = chunk_cols_pad = VS, so dot product has 1 group. Safe.
-        bf16_smart_permute_core(ue,
-            dims=[M, chunk_cols_pad], permute_indices=[1, 0],
-            input_dram_addr=temp_dram_addr,
-            output_dram_addr=output_dram_addr + col_start * M_aligned * bpe,
-            params_dram_addr=identity_dram_addr,
-            temp_dram_start=temp_dram_addr + M * chunk_cols_pad * bpe)
-def half_step_residual_core_dram(ue: UnifiedEngine, M: int, N: int,
-                                 RESIDUAL_DRAM_ADDR: int, FF_DRAM_ADDR: int,
-                                 OUTPUT_DRAM_ADDR: int) -> None:
-    """Emit instructions for half-step residual: output = residual + 0.5 * ff_output.
-    Args:
-        ue: UnifiedEngine instance
-        M: number of rows
-        N: vector dimension (must be multiple of UE_VECTOR_SIZE)
-        RESIDUAL_DRAM_ADDR: (M, N) bf16 — original input x
-        FF_DRAM_ADDR: (M, N) bf16 — feed-forward output, modified in-place
-        OUTPUT_DRAM_ADDR: (M, N) bf16 — result
-    """
-    assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
-    total_elems = M * N
-    # Load FF output, scale by 0.5
-    ue.accelerator_memory_to_sram(FF_DRAM_ADDR, URAM_A_BASE, total_elems)
-    ue.broadcast_mul(scalar=0.5, sram_start_addr=URAM_A_BASE,
-                     sram_wb_addr=URAM_A_BASE, element_size=total_elems)
-    # Load residual, add
-    ue.accelerator_memory_to_sram(RESIDUAL_DRAM_ADDR, URAM_B_BASE, total_elems)
-    ue.eltwise_add_core(vector_A_sram_start_addr=URAM_A_BASE,
-                        vector_B_sram_start_addr=URAM_B_BASE,
-                        vector_C_sram_wb_addr=URAM_A_BASE,
-                        element_size=total_elems)
-    # Write result
-    ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
 def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                              params_dram_addr, temp_dram_start):
     """Permute via DMA gather + batched transpose decomposition."""

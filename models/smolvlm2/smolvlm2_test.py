@@ -28,11 +28,14 @@ from user_dma_core import (
     DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
     UnifiedEngine, ue_35bit_addr_shifter,
 )
-from model_lib_core import (
+from nn_lib import (
+    prefill_flash_attention_core,
     smart_bf16_permute_core,
     store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
     eltwise_add_core_dram, eltwise_mul_core_dram,
     rms_norm_core_dram_post_add, layer_norm_core_dram_post_add,
+)
+from quant_lib import (
     quantize_q4_64 as _mlc_quantize_q4_64,
     quantize_fp4_64 as _mlc_quantize_fp4_64,
 )
@@ -426,184 +429,6 @@ def decode_flash_attention_core(ue, head_dim: int, kv_len: int,
         total_flops += 1 * kv_len
     total_flops += 1 * kv_len * 5
     total_flops += 2 * 1 * kv_len * head_dim
-    return total_flops
-def prefill_flash_attention_core(ue, head_dim: int, seq_len: int,
-                                  Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int,
-                                  OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int,
-                                  IDENTITY_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
-                                  num_q_heads: int = 1) -> int:
-    """GQA-batched prefill attention. V^T once, then Q@K^T + softmax + sm@V^T per Q head."""
-    from user_dma_core import UE_FMAX_CONTEXT_SIZE
-
-    bpe = 2
-    bias_enable = BIAS_DRAM_ADDR is not None
-    head_bytes = seq_len * head_dim * bpe
-    SCRATCH_VT = SCRATCH_DRAM_ADDR
-    SCRATCH_SM = SCRATCH_DRAM_ADDR + head_dim * seq_len * bpe
-
-    identity_tensor = torch.eye(head_dim, dtype=torch.bfloat16)
-
-    # ========== Step 1: V^T transpose (done ONCE for all Q heads) ==========
-    # I @ V^T: [head_dim, head_dim] @ [seq_len, head_dim]^T → [head_dim, seq_len]
-    identity_sram = 0x00000
-    ue.accelerator_memory_to_sram(IDENTITY_DRAM_ADDR, identity_sram, UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-
-    usable_a_start = identity_sram + UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe
-    M, K, N = head_dim, head_dim, seq_len
-
-    usable_b_elements = URAM_NEAR_FULL_ELEMENTS
-    N_chunk = min(N, (usable_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-    N_chunk_aligned = None
-    if N_chunk < UE_VECTOR_SIZE:
-        if (K * 32) <= usable_b_elements:
-            N_chunk = 32
-        elif (K * 16) <= usable_b_elements:
-            N_chunk = 16
-        else:
-            assert False, f"V^T: K={K} too large for URAM"
-        N_chunk_aligned = UE_VECTOR_SIZE
-
-    usable_a_elements = URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE
-    out_N = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
-    M_chunk = min(M, usable_a_elements // out_N)
-    assert M_chunk >= 1
-
-    out_sram = usable_a_start
-    b_sram = 0x80000
-    for i, m_take in ue.chunk_ranges(M, M_chunk):
-        for j, n_take in ue.chunk_ranges(N, N_chunk):
-            ue.accelerator_memory_to_sram(V_DRAM_ADDR + j * K * bpe, b_sram, n_take * K)
-            for r in range(m_take):
-                sram_off = r * (N_chunk_aligned or n_take) * bpe
-                ones_idx = identity_tensor[r + i, :].reshape(-1, UE_VECTOR_SIZE).sum(axis=1).argmax(axis=0)
-                vec_idx = identity_tensor[r + i, :].reshape(-1, UE_VECTOR_SIZE)[ones_idx, :].argmax(axis=0)
-                ue.start_queue_for_bf16_matvec_operation(
-                    max_clear_en=0, fmax_context_addr=0,
-                    vector_sram_start_addr=identity_sram + vec_idx * UE_VECTOR_SIZE * bpe,
-                    matrix_sram_start_addr=b_sram + ones_idx * UE_VECTOR_SIZE * bpe,
-                    output_sram_wb_addr=out_sram + sram_off, K=UE_VECTOR_SIZE, N=n_take, stride_z=m_take)
-            dst = SCRATCH_VT + i * N * bpe + j * bpe
-            if N_chunk_aligned is None:
-                ue.sram_to_accelerator_memory(out_sram, dst, m_take * n_take,
-                    stride_bytes_per_chunk=n_take * bpe, stride_jump_bytes=N * bpe)
-            else:
-                for o in range(m_take):
-                    ue.sram_to_accelerator_memory(out_sram + o * N_chunk_aligned * bpe,
-                        dst + o * N * bpe, n_take)
-
-    # ========== Step 2: Per-head Q@K^T + softmax + sm@V^T ==========
-    M_q, K_q, N_q = seq_len, head_dim, seq_len
-
-    # Q@K^T tiling
-    usable_b_elements = URAM_NEAR_FULL_ELEMENTS
-    N_chunk = min(N_q, (usable_b_elements // K_q) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-    N_chunk_aligned = None
-    if N_chunk < UE_VECTOR_SIZE:
-        if (K_q * 32) <= usable_b_elements:
-            N_chunk = 32
-        elif (K_q * 16) <= usable_b_elements:
-            N_chunk = 16
-        else:
-            assert False, f"Q@K^T: K={K_q} too large"
-        N_chunk_aligned = UE_VECTOR_SIZE
-
-    out_N = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
-    M_chunk = min(UE_FMAX_CONTEXT_SIZE, M_q, URAM_FULL_ELEMENTS // (K_q + out_N))
-    assert M_chunk >= 1
-
-    a_sram = 0x00000
-    b_sram = 0x80000
-
-    for g in range(num_q_heads):
-        q_base = Q_DRAM_ADDR + g * head_bytes
-        out_base = OUTPUT_DRAM_ADDR + g * head_bytes
-
-        for i, m_take in ue.chunk_ranges(M_q, M_chunk):
-            # Load Q chunk + scale
-            ue.accelerator_memory_to_sram(q_base + i * K_q * bpe, a_sram, m_take * K_q)
-            ue.broadcast_mul(scalar=1 / math.sqrt(head_dim),
-                             sram_start_addr=a_sram, sram_wb_addr=a_sram,
-                             element_size=m_take * K_q)
-            qkt_sram = a_sram + m_take * K_q * bpe
-            assert qkt_sram < 0x80000
-
-            clear_en = 1
-            for j, n_take in ue.chunk_ranges(N_q, N_chunk):
-                ue.accelerator_memory_to_sram(K_DRAM_ADDR + j * K_q * bpe, b_sram, n_take * K_q)
-                for r in range(m_take):
-                    if bias_enable:
-                        ue.accelerator_memory_to_bias_sram(
-                            BIAS_DRAM_ADDR + ((i + r) * N_q + j) * bpe, n_take)
-                    sram_off = r * (N_chunk_aligned or n_take) * bpe
-                    ue.start_queue_for_bf16_matvec_operation(
-                        max_clear_en=clear_en, fmax_context_addr=r,
-                        vector_sram_start_addr=a_sram + r * K_q * bpe,
-                        matrix_sram_start_addr=b_sram,
-                        output_sram_wb_addr=qkt_sram + sram_off,
-                        K=K_q, N=n_take, bias_enable=bias_enable)
-                    clear_en = 0
-                dst = SCRATCH_SM + j * bpe
-                if N_chunk_aligned is None:
-                    ue.sram_to_accelerator_memory(qkt_sram, dst, m_take * n_take,
-                        stride_bytes_per_chunk=n_take * bpe, stride_jump_bytes=N_q * bpe)
-                else:
-                    for o in range(m_take):
-                        ue.sram_to_accelerator_memory(qkt_sram + o * N_chunk_aligned * bpe,
-                            dst + o * N_q * bpe, n_take)
-
-            # Softmax + sm@V^T (per M_chunk rows)
-            max_sm = min((URAM_FULL_ELEMENTS - UE_VECTOR_SIZE) // N_q, UE_FMAX_CONTEXT_SIZE)
-            for si, s_take in ue.chunk_ranges(m_take, max_sm):
-                ue.accelerator_memory_to_sram(SCRATCH_SM + si * N_q * bpe, a_sram, s_take * N_q)
-                for row in range(s_take):
-                    ue.start_queue_for_bf16_softmax_operation(
-                        fmax_context_addr=row + si,
-                        vector_sram_start_addr=a_sram + row * N_q * bpe,
-                        output_sram_wb_addr=a_sram + row * N_q * bpe, N=N_q)
-
-                # sm @ V^T chunks
-                vt_chunk = min((URAM_NEAR_FULL_ELEMENTS // seq_len // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
-                               ((URAM_FULL_ELEMENTS - s_take * seq_len) // s_take // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
-                               head_dim)
-                vt_aligned = None
-                if vt_chunk < UE_VECTOR_SIZE:
-                    vt_aligned = UE_VECTOR_SIZE
-                    if seq_len * 32 <= URAM_NEAR_FULL_ELEMENTS:
-                        vt_chunk = 32
-                    elif seq_len * 16 <= URAM_NEAR_FULL_ELEMENTS:
-                        vt_chunk = 16
-                    else:
-                        assert False, "vt_chunk too small"
-                vt_sram = 0x80000
-                sm_out_sram = a_sram + s_take * seq_len * bpe
-
-                for vi, v_take in ue.chunk_ranges(head_dim, vt_chunk):
-                    ue.accelerator_memory_to_sram(SCRATCH_VT + vi * seq_len * bpe, vt_sram, v_take * seq_len)
-                    for pr in range(s_take):
-                        wb_off = 0 if vt_aligned is not None else pr * v_take * bpe
-                        ue.start_queue_for_bf16_matvec_operation(
-                            max_clear_en=0, fmax_context_addr=0,
-                            vector_sram_start_addr=a_sram + pr * seq_len * bpe,
-                            matrix_sram_start_addr=vt_sram,
-                            output_sram_wb_addr=sm_out_sram + wb_off,
-                            K=seq_len, N=v_take)
-                        if vt_aligned is not None:
-                            ue.sram_to_accelerator_memory(sm_out_sram + wb_off,
-                                out_base + (i + si) * head_dim * bpe + vi * bpe + pr * head_dim * bpe,
-                                v_take)
-                    if vt_aligned is None:
-                        ue.sram_to_accelerator_memory(sm_out_sram,
-                            out_base + (i + si) * head_dim * bpe + vi * bpe,
-                            s_take * v_take,
-                            stride_bytes_per_chunk=v_take * bpe,
-                            stride_jump_bytes=head_dim * bpe)
-
-    total_flops = head_dim * seq_len  # V^T (once)
-    total_flops += num_q_heads * (seq_len * head_dim + 2 * seq_len * head_dim * seq_len)  # scale + Q@K^T
-    if bias_enable:
-        total_flops += num_q_heads * seq_len * seq_len
-    total_flops += num_q_heads * seq_len * seq_len * 5  # softmax
-    total_flops += num_q_heads * 2 * seq_len * seq_len * head_dim  # sm@V^T
     return total_flops
 # =============================================================================
 # GGUF generation — quantization helpers

@@ -89,11 +89,37 @@ DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
 
 def set_dma_device(device_name: str):
-    """Set DMA device paths based on device name (e.g., 'xdma0' -> '/dev/xdma0_*')"""
+    """Set DMA device paths based on device name (e.g., 'xdma0' -> '/dev/xdma0_*').
+
+    Also rebinds the names in any module that imported them by value
+    (``from user_dma_core import DMA_DEVICE_H2C``), so callers that took the
+    pre-set_dma_device snapshot still see the right device. Without this,
+    models split across xdma0/xdma1 — methods on UnifiedEngine read the live
+    module global (correct), while bare references in the model file read the
+    stale import snapshot (wrong).
+    """
+    import sys as _sys
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
     DMA_DEVICE_C2H = f"/dev/{device_name}_c2h_0"
     DMA_DEVICE_USER = f"/dev/{device_name}_user"
+    for _mod in list(_sys.modules.values()):
+        if _mod is None or _mod is _sys.modules[__name__]:
+            continue
+        # Probe via __dict__ to avoid triggering lazy ``__getattr__`` hooks (e.g.
+        # transformers.models.* prints a deprecation warning for any name access).
+        _md = getattr(_mod, "__dict__", None)
+        if _md is None:
+            continue
+        for _name, _old, _new in (("DMA_DEVICE_H2C", old_h2c, DMA_DEVICE_H2C),
+                                  ("DMA_DEVICE_C2H", old_c2h, DMA_DEVICE_C2H),
+                                  ("DMA_DEVICE_USER", old_user, DMA_DEVICE_USER)):
+            if _md.get(_name) == _old:
+                try:
+                    setattr(_mod, _name, _new)
+                except Exception:
+                    pass
 
 # Constants
 UE_VECTOR_SIZE = 64
@@ -493,8 +519,17 @@ class UnifiedEngine:
                  params_dram_base: int = DRAM_START_ADDR,
                  program_dram_base: int = DRAM_INSTRUCTION_ADDR,
                  tensor_dram_base: int = DRAM_ACTIVATION_ADDR,
-                 clock_period_ns: float = None):
+                 clock_period_ns: float = None,
+                 device_name: Optional[str] = None):
         self.device = device
+        if device_name is not None:
+            set_dma_device(device_name)
+        # Snapshot the live DMA device paths so the engine is bound to one FPGA
+        # for its lifetime; prefer self.h2c_device/self.c2h_device/self.user_device
+        # over module-level constants in new code.
+        self.h2c_device = DMA_DEVICE_H2C
+        self.c2h_device = DMA_DEVICE_C2H
+        self.user_device = DMA_DEVICE_USER
         if BASE_ADDR is None:
             BASE_ADDR = UE_0_BASE_ADDR
 

@@ -1,3 +1,6 @@
+# Consolidated quantization library.
+# Merges the former quant_schemas.py (block-scale codecs: int4/fp4/if4/int8/fp8/if8)
+# and tq_utils.py (TurboQuant Lloyd-Max codebooks, rotation matrices).
 """Block-scale quantization for the unified-engine HW.
 
 Six codebooks (one quantize/dequantize pair each) plus a string-dispatch
@@ -44,9 +47,15 @@ The same flag is exposed at the SW boundary in
 ``user_dma_core.UnifiedEngine.quantize_weight`` so the two APIs stay in
 sync. ``int_variant`` is meaningful only for ``if4`` / ``if8``; passing
 it for any other precision raises ``ValueError``.
+
+Also included (formerly tq_utils.py): Lloyd-Max codebook computation and
+random rotation matrices for TurboQuant. See the ``TurboQuant`` section
+near the bottom of the file.
 """
 
 import math
+import os
+import json
 
 import numpy as np
 import torch
@@ -574,7 +583,7 @@ def dequantize_if8(
 # the code.
 #
 # Example:
-#     from quant_schemas import quantize, dequant
+#     from quant_lib import quantize, dequant
 #     data, scale = quantize(cfg["precision"], weight)   # int4 / fp4 / if4 / int8 / fp8 / if8
 #     w_back      = dequant(cfg["precision"], data, scale, N, K)
 
@@ -635,6 +644,305 @@ def dequant(precision: str, data_bytes: bytes, scale_bytes: bytes,
     return fn(data_bytes, scale_bytes, N, K, block_size=block_size)
 
 
+# ===========================================================================
+# TurboQuant: Lloyd-Max codebooks for random-rotation post-quantization.
+# ===========================================================================
+# After random rotation, each coordinate of a unit-norm vector follows:
+#     f(x) = Gamma(d/2) / (sqrt(pi) * Gamma((d-1)/2)) * (1 - x^2)^((d-3)/2)
+# which is a scaled Beta distribution on [-1, 1]. For high d this
+# converges to N(0, 1/d). The continuous 1D k-means (Lloyd-Max) below
+# computes the MSE-optimal centroids for that distribution.
+
+
+def beta_pdf(x: np.ndarray, d: int) -> np.ndarray:
+    """PDF of a single coordinate of a uniform random point on S^{d-1}."""
+    if d <= 2:
+        # d=1: point mass at +-1, d=2: arcsine distribution
+        # For practical purposes (d >= 64 for head_dim), we won't hit this
+        raise ValueError(f"Dimension d={d} too small, need d >= 3")
+
+    # Replaced scipy.special.gammaln with math.lgamma
+    log_const = (
+        math.lgamma(d / 2.0)
+        - 0.5 * math.log(math.pi)
+        - math.lgamma((d - 1) / 2.0)
+    )
+    exponent = (d - 3) / 2.0
+
+    # Clip x to avoid numerical issues at boundaries
+    x = np.clip(x, -1 + 1e-15, 1 - 1e-15)
+    log_val = log_const + exponent * np.log(1 - x**2)
+    return np.exp(log_val)
+
+
+def _integrate(func, lo: float, hi: float, steps: int = 5000) -> float:
+    """Simple vectorized trapezoidal rule integration to replace scipy.integrate.quad."""
+    if hi <= lo:
+        return 0.0
+    x = np.linspace(lo, hi, steps)
+    y = func(x)
+    dx = (hi - lo) / (steps - 1)
+    return (np.sum(y) - 0.5 * (y[0] + y[-1])) * dx
+
+
+def _conditional_mean(lo: float, hi: float, d: int) -> float:
+    """E[X | lo < X < hi] under the Beta PDF on [-1, 1]."""
+    num = _integrate(lambda x: x * beta_pdf(x, d), lo, hi)
+    den = _integrate(lambda x: beta_pdf(x, d), lo, hi)
+    if den < 1e-30:
+        return (lo + hi) / 2.0
+    return num / den
+
+
+def _mse_cost(centroids: np.ndarray, d: int) -> float:
+    """Compute MSE cost for a given set of sorted centroids."""
+    n = len(centroids)
+    boundaries = np.zeros(n + 1)
+    boundaries[0] = -1.0
+    boundaries[-1] = 1.0
+    for i in range(n - 1):
+        boundaries[i + 1] = (centroids[i] + centroids[i + 1]) / 2.0
+
+    cost = 0.0
+    for i in range(n):
+        lo, hi = boundaries[i], boundaries[i + 1]
+        c = centroids[i]
+        val = _integrate(lambda x: (x - c) ** 2 * beta_pdf(x, d), lo, hi)
+        cost += val
+    return cost
+
+
+def compute_lloyd_max_codebook(d: int, bits: int, max_iter: int = 200, tol: float = 1e-12) -> dict:
+    """
+    Compute optimal Lloyd-Max codebook for the Beta distribution on [-1, 1]
+    arising from random rotation of d-dimensional unit vectors.
+
+    Args:
+        d: dimension of the embedding space (e.g., head_dim = 128)
+        bits: number of bits per coordinate (1, 2, 3, or 4)
+        max_iter: max Lloyd-Max iterations
+        tol: convergence tolerance
+
+    Returns:
+        dict with keys:
+            'centroids': sorted array of 2^bits centroids
+            'boundaries': sorted array of 2^bits + 1 boundaries (includes -1 and 1)
+            'mse': achieved MSE cost per coordinate
+            'd': dimension
+            'bits': bit-width
+    """
+    n_clusters = 2**bits
+
+    # Initialize centroids using quantiles of the distribution
+    # Approximate CDF via numerical integration
+    x_grid = np.linspace(-1 + 1e-10, 1 - 1e-10, 10000)
+    pdf_vals = beta_pdf(x_grid, d)
+    cdf_vals = np.cumsum(pdf_vals) * (x_grid[1] - x_grid[0])
+    cdf_vals /= cdf_vals[-1]
+
+    # Place initial centroids at quantile midpoints
+    quantile_edges = np.linspace(0, 1, n_clusters + 1)
+    centroids = np.zeros(n_clusters)
+    for i in range(n_clusters):
+        q_lo = quantile_edges[i]
+        q_hi = quantile_edges[i + 1]
+        q_mid = (q_lo + q_hi) / 2.0
+        idx = np.searchsorted(cdf_vals, q_mid)
+        idx = min(idx, len(x_grid) - 1)
+        centroids[i] = x_grid[idx]
+
+    # Lloyd-Max iterations
+    prev_cost = float("inf")
+    for iteration in range(max_iter):
+        # Compute boundaries (midpoints between consecutive centroids)
+        boundaries = np.zeros(n_clusters + 1)
+        boundaries[0] = -1.0
+        boundaries[-1] = 1.0
+        for i in range(n_clusters - 1):
+            boundaries[i + 1] = (centroids[i] + centroids[i + 1]) / 2.0
+
+        # Update centroids as conditional means
+        new_centroids = np.zeros(n_clusters)
+        for i in range(n_clusters):
+            new_centroids[i] = _conditional_mean(boundaries[i], boundaries[i + 1], d)
+
+        cost = _mse_cost(new_centroids, d)
+        centroids = new_centroids
+
+        if abs(prev_cost - cost) < tol:
+            break
+        prev_cost = cost
+
+    # Recompute final boundaries
+    boundaries = np.zeros(n_clusters + 1)
+    boundaries[0] = -1.0
+    boundaries[-1] = 1.0
+    for i in range(n_clusters - 1):
+        boundaries[i + 1] = (centroids[i] + centroids[i + 1]) / 2.0
+
+    return {
+        "centroids": centroids.tolist(),
+        "boundaries": boundaries.tolist(),
+        "mse_per_coord": float(cost),
+        "mse_total": float(cost * d),
+        "d": d,
+        "bits": bits,
+    }
+
+
+# ── Codebook cache ──────────────────────────────────────────────────────
+_CODEBOOK_CACHE: dict[tuple[int, int], dict] = {}
+_CODEBOOK_DIR = os.path.join(os.path.dirname(__file__), "codebooks")
+
+
+def get_codebook(d: int, bits: int) -> dict:
+    """Get or compute a codebook, with on-disk caching."""
+    key = (d, bits)
+    if key in _CODEBOOK_CACHE:
+        return _CODEBOOK_CACHE[key]
+
+    # Try loading from disk
+    os.makedirs(_CODEBOOK_DIR, exist_ok=True)
+    path = os.path.join(_CODEBOOK_DIR, f"codebook_d{d}_b{bits}.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            cb = json.load(f)
+        _CODEBOOK_CACHE[key] = cb
+        return cb
+
+    # Compute and save
+    print(f"[TurboQuant] Computing Lloyd-Max codebook for d={d}, bits={bits}...")
+    cb = compute_lloyd_max_codebook(d, bits)
+    with open(path, "w") as f:
+        json.dump(cb, f, indent=2)
+    print(f"[TurboQuant] MSE per coord = {cb['mse_per_coord']:.6e}, total MSE = {cb['mse_total']:.6f}")
+    _CODEBOOK_CACHE[key] = cb
+    return cb
+
+
+def get_codebook_tensors(d: int, bits: int, device: torch.device, dtype: torch.dtype = torch.float32):
+    """Get codebook as GPU tensors ready for quantization."""
+    cb = get_codebook(d, bits)
+    centroids = torch.tensor(cb["centroids"], device=device, dtype=dtype)
+    boundaries = torch.tensor(cb["boundaries"], device=device, dtype=dtype)
+    return centroids, boundaries
+
+
+def generate_rotation_matrix(
+    d: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    Generate a random orthogonal matrix Π ∈ R^{d×d} via QR decomposition.
+
+    This is the method described in Algorithm 1 of the paper.
+    For head_dim=128, this is a 128×128 matrix = 64KB in float32, negligible.
+    """
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(seed)
+
+    # Generate on CPU for reproducibility, then move to device
+    G = torch.randn(d, d, generator=rng, dtype=torch.float32)
+    Q, R = torch.linalg.qr(G)
+
+    # Ensure proper rotation (det = +1) by fixing signs
+    diag_sign = torch.sign(torch.diag(R))
+    Q = Q * diag_sign.unsqueeze(0)
+
+    return Q.to(device=device, dtype=dtype)
+
+
+# ===========================================================================
+# Legacy concatenated-format codecs (GGUF-style; kept for backwards compat)
+# ===========================================================================
+# These older codecs return a single flat ``(scales || packed_data)`` byte
+# buffer instead of the ``(data_bytes, scale_bytes)`` tuple that the modern
+# codecs above return. They're still used by smolvlm2 (and the lm-head path
+# in some text models). Prefer the modern codecs in new code; keep these
+# alive only for byte-compat with already-shipped weight bins.
+
+# FP4 E2M1 lookup table for the legacy ``quantize_fp4_64``. Single
+# positive-then-negative table (codes 0-7 positive, 8-15 negative). Distinct
+# from the modern ``_FP4_VALUES_BF16`` / ``_FP4_NIBBLES`` / ``_FP4_DECODE_F32``
+# triple used by the new codecs. Callers may override by passing their own
+# table as the ``fp4_table`` argument.
+_FP4_E2M1_TABLE = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.bfloat16,
+)
+
+
+def quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor,
+                                 block_size: int = 64) -> tuple[bytes, bytes]:
+    """Quantize bf16 (N_w, K_w) to INT4 packed + per-block bf16 scale along K.
+
+    Returns ``(data_bytes, scale_bytes)``. ``K_w`` must be a multiple of
+    ``block_size``. Differs from ``quantize_int4`` in that the intermediate
+    division is fp32 (not bf16-throughout), so output bytes may differ on
+    edge values.
+    """
+    w = weight_bf16.detach().cpu().float().reshape(-1)
+    N_w, K_w = weight_bf16.shape
+    assert K_w % block_size == 0
+    w_blocks = w.reshape(N_w, K_w // block_size, block_size)
+    scale = w_blocks.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
+    scale_bf16 = -scale.to(torch.bfloat16)
+    w_int8 = (w_blocks / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
+    w_nibbles = w_int8.numpy().astype(np.int16) & 0x0F
+    low = w_nibbles[:, :, 0::2].reshape(N_w, -1)
+    high = w_nibbles[:, :, 1::2].reshape(N_w, -1)
+    packed = (high << 4) | low
+    data_bytes = packed.astype(np.uint8).tobytes()
+    scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
+    return data_bytes, scale_bytes
+
+
+def quantize_q4_64(tensor: torch.Tensor) -> tuple[np.ndarray, int]:
+    """INT4 quantization with 64-element blocks. Returns ``(packed_uint8_array, n_blocks)``.
+
+    Layout: ``[bf16 scales per block][packed int4 data]`` — concatenated
+    GGUF-style Q4_64 wire format. Used by smolvlm2 weight bins.
+    """
+    data = tensor.flatten().cpu().float().numpy()
+    n_blocks = int(np.ceil(len(data) / 64))
+    padded = np.pad(data, (0, n_blocks * 64 - len(data)))
+    blocks = padded.reshape(n_blocks, 64)
+    scales = np.max(np.abs(blocks), axis=1)
+    scales[scales == 0] = 1.0
+    scales /= 7.0
+    quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
+    pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
+    packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
+    scale_bytes = torch.tensor(-scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
+    return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
+
+
+def quantize_fp4_64(tensor: torch.Tensor,
+                    fp4_table: torch.Tensor | None = None) -> tuple[np.ndarray, int]:
+    """FP4 E2M1 quantization with 64-element blocks. Returns
+    ``(packed_uint8_array, n_blocks)`` in the same concatenated layout as
+    :func:`quantize_q4_64`. Used by smolvlm2 weight bins."""
+    table = fp4_table if fp4_table is not None else _FP4_E2M1_TABLE
+    x = tensor.to(torch.bfloat16).cpu().flatten()
+    n_blocks = int(np.ceil(x.numel() / 64))
+    if x.numel() % 64 != 0:
+        x = torch.nn.functional.pad(x, (0, n_blocks * 64 - x.numel()))
+    blocks = x.view(n_blocks, 64)
+    fp4_max = torch.tensor(6.0, dtype=torch.bfloat16)
+    scales = (blocks.abs().max(dim=1).values / fp4_max).clamp(min=1e-8).to(torch.bfloat16)
+    scaled = (blocks / scales[:, None]).to(torch.bfloat16)
+    codes = torch.argmin(torch.abs(scaled.unsqueeze(-1) - table), dim=-1).to(torch.uint8)
+    codes_np = codes.numpy().flatten()
+    if len(codes_np) % 2 != 0:
+        codes_np = np.pad(codes_np, (0, 1))
+    packed = (codes_np[0::2] & 0x0F) | ((codes_np[1::2] & 0x0F) << 4)
+    scales_np = scales.view(torch.uint16).numpy()
+    return np.frombuffer(scales_np.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
+
+
 __all__ = [
     # Recommended customer entry points (config-driven precision).
     "quantize", "dequant",
@@ -645,4 +953,14 @@ __all__ = [
     "quantize_int8", "dequantize_int8",
     "quantize_fp8",  "dequantize_fp8",
     "quantize_if8",  "dequantize_if8",
+    # TurboQuant Lloyd-Max codebooks and rotation matrices.
+    "beta_pdf",
+    "compute_lloyd_max_codebook",
+    "get_codebook",
+    "get_codebook_tensors",
+    "generate_rotation_matrix",
+    # Legacy concatenated-format codecs (kept for backwards compat).
+    "quantize_bf16_to_int4_packed",
+    "quantize_q4_64",
+    "quantize_fp4_64",
 ]

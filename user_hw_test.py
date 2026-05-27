@@ -2719,7 +2719,7 @@ def run_turboquant_mse(dim: int):
     """
     Executes TurboQuant MSE (Algorithm 1) using the custom UnifiedEngine hardware.
     """
-    from tq_utils import get_codebook_tensors, generate_rotation_matrix
+    from quant_lib import get_codebook_tensors, generate_rotation_matrix
     from user_dma_core import DMA_DEVICE_H2C
 
     M = dim

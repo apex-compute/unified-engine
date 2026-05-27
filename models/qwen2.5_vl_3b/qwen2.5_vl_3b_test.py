@@ -4,7 +4,7 @@ config-driven via qwen2.5_vl_3b_config.json::precision.{lm,vision}
 (values: int4 / fp4 / if4). Defaults: lm=if4 (eval-winning text codec
 per src/models/qwen2.5_VL_3b/compare/summary.md), vision=int4 (legacy
 released codec, byte-identical to the prior Q4_64 path). All
-quantization goes through src/template/quant_schemas.py."""
+quantization goes through src/template/quant_lib.py."""
 
 import json
 import math
@@ -22,9 +22,10 @@ sys.path.insert(0, PROJECT_ROOT)
 
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device
+from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_dram_post_add
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
 from user_dma_core import ue_35bit_addr_shifter
-import quant_schemas
+import quant_lib
 
 import builtins
 
@@ -101,55 +102,7 @@ def store_identity_matrix(ue):
     ue.allocate_params_dram(size)
     return addr
 
-def eltwise_add_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
-    """OUTPUT = A + B (DRAM)."""
-    bytes_per_element = 2
-    uram_a_addr = 0x00000
-    uram_b_addr = 0x80000
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS, size)
 
-    for start, take in ue.chunk_ranges(size, chunk_size):
-        offset_bytes = start * bytes_per_element
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=A_DRAM_ADDR + offset_bytes,
-            sram_address=uram_a_addr, element_size=take)
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=B_DRAM_ADDR + offset_bytes,
-            sram_address=uram_b_addr, element_size=take)
-        ue.eltwise_add_core(
-            vector_A_sram_start_addr=uram_a_addr,
-            vector_B_sram_start_addr=uram_b_addr,
-            vector_C_sram_wb_addr=uram_a_addr, element_size=take)
-        ue.sram_to_accelerator_memory(
-            sram_address=uram_a_addr,
-            accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
-            element_size=take)
-    return size
-
-def eltwise_mul_core_dram(ue, size: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
-    """OUTPUT = A * B (DRAM)."""
-    bytes_per_element = 2
-    uram_a_addr = 0x00000
-    uram_b_addr = 0x80000
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS, size)
-
-    for start, take in ue.chunk_ranges(size, chunk_size):
-        offset_bytes = start * bytes_per_element
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=A_DRAM_ADDR + offset_bytes,
-            sram_address=uram_a_addr, element_size=take)
-        ue.accelerator_memory_to_sram(
-            accelerator_dram_address=B_DRAM_ADDR + offset_bytes,
-            sram_address=uram_b_addr, element_size=take)
-        ue.eltwise_mul_core(
-            vector_A_sram_start_addr=uram_a_addr,
-            vector_B_sram_start_addr=uram_b_addr,
-            vector_C_sram_wb_addr=uram_a_addr, element_size=take)
-        ue.sram_to_accelerator_memory(
-            sram_address=uram_a_addr,
-            accelerator_dram_address=OUTPUT_DRAM_ADDR + offset_bytes,
-            element_size=take)
-    return size
 
 def bf16_permute_core_v2(ue, dims, permute_indices, input_dram_addr, output_dram_addr,
                           params_dram_addr, temp_dram_start):
@@ -319,53 +272,9 @@ def bf16_permute_core_v2(ue, dims, permute_indices, input_dram_addr, output_dram
 
     return (2, output_shape)
 
-def rms_norm_core_dram_post_add(ue, M: int, N: int,
-                                 A_DRAM_ADDR: int, B_DRAM_ADDR: int,
-                                 ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int,
-                                 GAMMA_DRAM_ADDR: int = None) -> int:
-    """rms_norm(A + B) with residual output."""
-    gamma_sram_addr = 0x80000
-    params_sram_addr = gamma_sram_addr
-
-    if GAMMA_DRAM_ADDR is not None:
-        ue.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
-                                    sram_address=gamma_sram_addr, element_size=N)
-        params_sram_addr += N * 2
-    else:
-        gamma_sram_addr = None
-
-    vector_A_sram_addr = 0x00000
-    vector_B_sram_addr = params_sram_addr
-    uram_b_remaining_elements = URAM_NEAR_FULL_ELEMENTS - (params_sram_addr - 0x80000) // 2
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, uram_b_remaining_elements // N, M)
-    assert chunk_size >= 1 and chunk_size <= M
-
-    for i, m_take in ue.chunk_ranges(M, chunk_size):
-        chunk_elements = m_take * N
-        ue.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * N * 2,
-                                    sram_address=vector_A_sram_addr, element_size=chunk_elements)
-        ue.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + i * N * 2,
-                                    sram_address=vector_B_sram_addr, element_size=chunk_elements)
-        for j in range(m_take):
-            ue.eltwise_add_core(vector_A_sram_addr + j * N * 2, vector_B_sram_addr + j * N * 2,
-                                vector_A_sram_addr + j * N * 2, N)
-        ue.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
-                                        accelerator_dram_address=ADDOUTPUT_DRAM_ADDR + i * N * 2,
-                                        element_size=chunk_elements)
-        for j in range(m_take):
-            ue.rms_norm_core(vector_A_sram_addr + j * N * 2, vector_A_sram_addr + j * N * 2,
-                             N, gamma_sram_addr)
-        ue.sram_to_accelerator_memory(sram_address=vector_A_sram_addr,
-                                        accelerator_dram_address=NORMOUTPUT_DRAM_ADDR + i * N * 2,
-                                        element_size=chunk_elements)
-
-    total_flops = M * N + 3 * M * N
-    if gamma_sram_addr is not None:
-        total_flops += M * N
-    return total_flops
 
 def _qs_pack(precision: str, tensor: torch.Tensor):
-    """Run a 64-block codec via quant_schemas and emit the scale-then-data
+    """Run a 64-block codec via quant_lib and emit the scale-then-data
     byte layout the released wire format uses (consumed by
     store_quantized_weight() as 34 bytes per block: 2 B bf16 scale + 32 B
     nibbles). Accepts arbitrary input shape; flattens and zero-pads to a
@@ -376,7 +285,7 @@ def _qs_pack(precision: str, tensor: torch.Tensor):
     # the unbounded distance-tensor allocation when flattened to (1, N*K)).
     if bf.dim() == 2 and bf.shape[1] % 64 == 0:
         n_blocks = bf.numel() // 64
-        data_bytes, scale_bytes = quant_schemas.quantize(precision, bf, block_size=64)
+        data_bytes, scale_bytes = quant_lib.quantize(precision, bf, block_size=64)
         return np.frombuffer(scale_bytes + data_bytes, dtype=np.uint8), n_blocks
     # Generic path: flatten + zero-pad to a multiple of 64. Used for
     # arbitrary-rank tensors (e.g. the 5D Conv3D patch_embed weight).
@@ -385,7 +294,7 @@ def _qs_pack(precision: str, tensor: torch.Tensor):
     if bf.numel() != n_blocks * 64:
         bf = torch.nn.functional.pad(bf, (0, n_blocks * 64 - bf.numel()))
     bf = bf.view(1, -1)
-    data_bytes, scale_bytes = quant_schemas.quantize(precision, bf, block_size=64)
+    data_bytes, scale_bytes = quant_lib.quantize(precision, bf, block_size=64)
     return np.frombuffer(scale_bytes + data_bytes, dtype=np.uint8), n_blocks
 
 _LAYER_MAP = {
@@ -428,7 +337,7 @@ _VALID_PRECISIONS = ('int4', 'fp4', 'if4')
 
 def _lm_precision(cfg: dict) -> str:
     """Read LM precision from the config, defaulting to the eval-winner 'if4'.
-    Validates against the codecs the quant_schemas wrapper actually supports."""
+    Validates against the codecs the quant_lib wrapper actually supports."""
     p = cfg.get("precision", {}).get("lm", "if4")
     if p not in _VALID_PRECISIONS:
         raise ValueError(f"config precision.lm={p!r} not in {_VALID_PRECISIONS}")
@@ -492,7 +401,7 @@ def _write_weight_bin(bin_path, model, param_filter, mode, suffix, quant_layers,
     print(f"Weights: {count} tensors, {os.path.getsize(bin_path)/1048576:.1f} MB -> {bin_path}")
 
 def generate_lm_weights(model, output_path, precision: str = "if4"):
-    """Generate LM weight bin using the given quant_schemas precision
+    """Generate LM weight bin using the given quant_lib precision
     ('int4' / 'fp4' / 'if4'). The precision string is also the manifest
     suffix the runtime loader looks for.
 
@@ -523,7 +432,7 @@ def generate_lm_weights(model, output_path, precision: str = "if4"):
 
 def generate_vision_weights(model, output_path, precision: str = "int4"):
     """Generate vision weight bin with pre-padded QKV (80→128) and MLP
-    (3420→3456). The given quant_schemas precision ('int4' / 'fp4' / 'if4')
+    (3420→3456). The given quant_lib precision ('int4' / 'fp4' / 'if4')
     drives both the codec and the manifest suffix.
 
     The binary stores padded weights so the runtime doesn't need the HF model.
