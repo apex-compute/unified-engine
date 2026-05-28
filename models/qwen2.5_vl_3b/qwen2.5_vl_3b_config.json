@@ -20,7 +20,7 @@
   },
   "model": {
     "max_context_size": 512,
-    "prefill_max_seq_len": 256,
+    "prefill_max_seq_len": 384,
     "end_of_turn_token_id": 151645,
     "rope_global_layers": []
   },
