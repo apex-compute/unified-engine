@@ -1301,6 +1301,35 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         max_seq_len = self.MAX_CONTEXT_SIZE
         total_latency, total_flop_rate = 0, 0
         decoder_token_cnt = 0
+
+        # Two-region live counter: pin the bottom terminal row as a status line via
+        # an ANSI scroll region; tokens stream in the area above it and the counter
+        # refreshes in place. Only when stdout is a real TTY (skip when piped/redirected).
+        import shutil
+        _use_status = sys.stdout.isatty()
+        def _status_setup():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")   # scroll region = rows 1..rows-1
+            sys.stdout.write(f"\033[{rows - 1};1H")   # park cursor at bottom of region
+            sys.stdout.flush()
+        def _status_update():
+            rows = shutil.get_terminal_size().lines
+            elapsed = time.perf_counter() - timer
+            rate = decoder_token_cnt / elapsed if elapsed > 0 else 0.0
+            sys.stdout.write("\0337")                 # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # bottom row, clear it
+            sys.stdout.write(f" decoding… {decoder_token_cnt} tokens  (pos {self.seq_len}/{max_seq_len})  "
+                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
+            sys.stdout.write("\0338")                 # restore cursor
+            sys.stdout.flush()
+        def _status_teardown():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")                # reset scroll region
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # clear the status row
+            sys.stdout.flush()
+        if _use_status:
+            _status_setup()
+
         while self.seq_len < max_seq_len:
             decoder_token_cnt += 1
             _SILENT_MODE = True
@@ -1335,9 +1364,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             if token_id in [1, self._end_of_turn_token_id]:
+                if _use_status:
+                    _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+            if _use_status:
+                _status_update()
+        else:
+            if _use_status:
+                _status_teardown()
 
         token_cnt_decoded = self.seq_len
         latency_hw_decoder = total_latency

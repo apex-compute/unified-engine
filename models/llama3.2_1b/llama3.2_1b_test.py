@@ -940,7 +940,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         head_dim=ahd,
                         seq_len=self.MAX_CONTEXT_SIZE,
                         gpr_bucket_idx=self.gpr_bucket_idx,
-                        num_buckets=8,
+                        num_buckets=(self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,
                         Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM + kv_h * qpkv * ahd * bpe,
                         K_DRAM_ADDR=k_cache_base,
                         V_DRAM_ADDR=v_cache_base,
@@ -1067,6 +1067,45 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         print(f"Combined instruction image written to {instruction_bin_path} ({len(instruction_bytes)} bytes)")
         print(f"Metadata written to {instruction_meta_path}")
 
+    def _select_next_token(self, recent) -> int:
+        """Pick the next token from the hardware top-4 argmax indices.
+
+        The accelerator exposes the 4 highest-logit token indices (rank 1..4)
+        but not their logit values, so sampling uses a rank-based prior:
+        weight(rank r) = exp(-(r-1)/temperature), with recently emitted tokens
+        divided by ``rep_penalty`` to break greedy repetition loops.
+
+        Defaults (top_k=1, rep_penalty=1.0) reproduce pure greedy argmax.
+        """
+        top_k = max(1, min(int(getattr(self, "gen_top_k", 1)), 4))
+        temperature = max(1e-3, float(getattr(self, "gen_temperature", 1.0)))
+        rep_penalty = float(getattr(self, "gen_rep_penalty", 1.0))
+
+        if top_k == 1 and rep_penalty == 1.0:
+            return self.get_arg_max_index(rank=1)
+
+        cands = []
+        for r in range(1, top_k + 1):
+            idx = self.get_arg_max_index(rank=r)
+            if idx not in cands:
+                cands.append(idx)
+
+        weights = []
+        for r, idx in enumerate(cands):
+            w = math.exp(-r / temperature)
+            if rep_penalty != 1.0 and idx in recent:
+                w /= rep_penalty
+            weights.append(w)
+
+        total = sum(weights)
+        if total <= 0:
+            return cands[0]
+        rng = getattr(self, "_gen_rng", None)
+        if rng is None:
+            rng = self._gen_rng = np.random.default_rng()
+        probs = [w / total for w in weights]
+        return int(rng.choice(cands, p=probs))
+
     def run_llama(self) -> None:
         """Load the unified instruction image and run prefill + decoder loop.
 
@@ -1138,6 +1177,40 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _llama_stop_tokens = {128001, 128008, self._end_of_turn_token_id}
         global _SILENT_MODE
 
+        # Recent-token window for the repetition penalty in _select_next_token.
+        from collections import deque
+        _rep_window = int(getattr(self, "gen_rep_window", 64))
+        recent_tokens = deque(self.prefill_seq[-_rep_window:], maxlen=_rep_window)
+
+        # Two-region live counter: pin the bottom terminal row as a status line via
+        # an ANSI scroll region; tokens stream in the area above it and the counter
+        # refreshes in place. Only when stdout is a real TTY (skip when piped/redirected).
+        import shutil
+        _use_status = sys.stdout.isatty()
+        def _status_setup():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")   # scroll region = rows 1..rows-1
+            sys.stdout.write(f"\033[{rows - 1};1H")   # park cursor at bottom of region
+            sys.stdout.flush()
+        def _status_update():
+            rows = shutil.get_terminal_size().lines
+            n = self.seq_len - prefill_seq_len
+            elapsed = time.perf_counter() - timer
+            rate = n / elapsed if elapsed > 0 else 0.0
+            sys.stdout.write("\0337")                 # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # bottom row, clear it
+            sys.stdout.write(f" decoding… {n} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})  "
+                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
+            sys.stdout.write("\0338")                 # restore cursor
+            sys.stdout.flush()
+        def _status_teardown():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")                # reset scroll region
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # clear the status row
+            sys.stdout.flush()
+        if _use_status:
+            _status_setup()
+
         while self.seq_len < self.MAX_CONTEXT_SIZE:
             _SILENT_MODE = True
             self.seq_len += 1
@@ -1163,13 +1236,21 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             self.clear_capture_buffer()
 
             self.program_execute(preamble_addr, gflops=decoder_flops_per_token)
-            token_id = self.get_arg_max_index()
+            token_id = self._select_next_token(recent_tokens)
+            recent_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             if token_id in _llama_stop_tokens:
+                if _use_status:
+                    _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+            if _use_status:
+                _status_update()
+        else:
+            if _use_status:
+                _status_teardown()
 
         latency_decoder = time.perf_counter() - timer
         tokens_decoded = self.seq_len - prefill_seq_len
@@ -1187,6 +1268,11 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=1/0.17, help='Clock cycle time in ns (default: ~5.88ns)')
+    parser.add_argument('--top-k', type=int, default=1, help='Sample among the top-k HW argmax indices (1..4). 1 = greedy (default).')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Rank-prior temperature; higher = more diverse (default: 1.0).')
+    parser.add_argument('--repetition-penalty', type=float, default=1.0, help='Divide weight of recently emitted tokens by this (>1 discourages repeats; default: 1.0).')
+    parser.add_argument('--rep-window', type=int, default=64, help='How many recent tokens the repetition penalty considers (default: 64).')
+    parser.add_argument('--seed', type=int, default=None, help='RNG seed for sampling reproducibility.')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1225,6 +1311,13 @@ def main():
         prefill_seq = tuple(cfg["default_prefill_tokens"])
 
     ue.prefill_seq = prefill_seq
+
+    # Sampling config (consumed by _select_next_token). Defaults reproduce greedy argmax.
+    ue.gen_top_k = args.top_k
+    ue.gen_temperature = args.temperature
+    ue.gen_rep_penalty = args.repetition_penalty
+    ue.gen_rep_window = args.rep_window
+    ue._gen_rng = np.random.default_rng(args.seed)
 
     print("\n--- Compiling ---")
     timer = time.perf_counter()
