@@ -6332,6 +6332,72 @@ class UnifiedEngine:
             total_flops += 2 * M * N
         return total_flops
 
+    def _emit_pbi_scatter_per_token(self, *, read_base, read_stride_bytes,
+                                    write_specs, sram_byte_addr, element_count,
+                                    gpr_seq_len, template_seq_len):
+        """Emit one PBI runtime loop that staged-copies one ``element_count``-row
+        per outer iteration from ``read_base`` to each (base, stride) in
+        ``write_specs``. The outer trip count is taken from GPR ``gpr_seq_len`` so
+        the body executes exactly ``actual_seq_len`` times at runtime — making
+        the captured bin truly seq_len-agnostic up to ``MAX_CONTEXT_SIZE``.
+
+        Read side uses register-computed addresses (``reg_mul_imm`` + ``add_imm``
+        + ``general_reg_src=TMP_REG``) — the same pattern used by the decoder
+        bin. The write side uses gemma3-style ``pbi_init`` pointers + per-call
+        DRAM-delta DMAs, which is the proven SRAM→DRAM PBI scatter shape.
+
+        Per-iteration t-counter is a locally-allocated GPR that increments by 1
+        at end-of-body via ``add_inc``. Released after the loop.
+        """
+        bpe = self.bytes_per_element
+        bytes_per_call = element_count * bpe
+        _, sram_words = self.sram_address_to_uram_address(sram_byte_addr)
+
+        # Allocate write PBI pointers (one per destination stream).
+        ptr_ws = [self.alloc_inst_ptr() for _ in write_specs]
+        for ptr_w, (dst_base, _stride) in zip(ptr_ws, write_specs):
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=dst_base,
+                dma_length=bytes_per_call,
+                uram_a_start_addr=sram_words,
+                uram_b_start_addr=sram_words,
+                inst_pointer_idx=ptr_w,
+            )
+
+        # Per-token counter t (0, 1, 2, ...) — used to compute read DRAM addr.
+        t_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(t_reg, 0)
+
+        self.loop_start(loop_cnt=template_seq_len, gpr_loop_cnt=gpr_seq_len)
+        # Read DRAM addr = read_base + t * read_stride_bytes
+        self.generate_instruction_reg_mul_imm(
+            self.TMP_REG, t_reg, ue_35bit_addr_shifter(read_stride_bytes))
+        self.generate_instruction_add_imm(
+            self.TMP_REG, ue_35bit_addr_shifter(read_base), self.TMP_REG)
+        # DRAM→SRAM with runtime-computed source DRAM addr (delivered via TMP_REG).
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=0,
+            sram_address=sram_byte_addr,
+            element_size=element_count,
+            general_reg_src=self.TMP_REG,
+        )
+        # SRAM→DRAM via PBI pointers (each advances its DRAM addr by its stride).
+        for ptr_w, (_base, dst_stride) in zip(ptr_ws, write_specs):
+            self.sram_to_accelerator_memory(
+                sram_address=0,
+                accelerator_dram_address=dst_stride,
+                element_size=element_count,
+                inst_pointer_idx=ptr_w,
+                memcpy_length_bytes=0,
+            )
+        # t += 1
+        self.generate_instruction_add_inc(t_reg)
+        self.loop_end()
+
+        self.release_isa_reg()  # t_reg
+        for ptr in reversed(ptr_ws):
+            self.release_inst_ptr(ptr)
+            
     def start_capture(self):
         """Start capturing instructions instead of executing them"""
         self._inst_id = 0

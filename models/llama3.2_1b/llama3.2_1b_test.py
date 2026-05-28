@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -343,6 +343,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.actual_head_dim = 64
         self.num_kv_heads = self.head_dim // self.actual_head_dim  # = 8
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
+        self.PREFILL_CONTEXT_SIZE = model["prefill_context_size"]
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
         fixed = self._cfg.get("fixed_isa_regs", {})
@@ -350,6 +351,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.TMP_REG = fixed["TMP_REG"]
         self.ROPE_SIZE_REG = fixed["ROPE_SIZE_REG"]
         self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
+        self.gpr_seq_len = fixed["GPR_SEQ_LEN_REG"]
         self._isa_reg_counter = max(fixed.values()) + 1  # must start past all fixed ISA regs
         self.causal_mask_upper = False
         self._rope_global_layers = set(model["rope_global_layers"])
@@ -546,44 +548,50 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             gflops_program, _ = self.report_flop_rate_gflops(gflops)
             print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
 
-    def compile_prefill(self, seq_len: int, layer_size: int | None = None) -> dict:
-        """Compile prefill for the given sequence length.
+    def _compile_prefill_program(self, template_seq_len: int, layer_size: int) -> dict:
+        """Compile prefill into the active capture session.
 
-        LLaMA differences: Q/K norm steps are skipped; post-attn and post-MLP norm
-        steps are skipped; K_DRAM/Q_DRAM are used directly for RoPE.
+        ``template_seq_len`` is used only for FLOPs accounting and static M= args;
+        all runtime loop counts are driven by ``gpr_seq_len`` / ``gpr_bucket_idx``
+        primed by the caller's preamble, so a single bin works for any seq_len.
+        Returns dict with ``size_bytes`` and ``flops``.
         """
-        if layer_size is None:
-            layer_size = self.LAYER_SIZE
-        seq_len -= 1
-        self.seq_len = seq_len
+        if not getattr(self, "is_capture_on", False):
+            raise RuntimeError("_compile_prefill_program() requires an active capture session")
+        count_at_start = self.capture_count
+        seq_len = template_seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
 
-        # --- LLaMA 3.2 16 layers: compile---
         global _SILENT_MODE
         _SILENT_MODE = True
-        bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
-        self.start_capture()
+        num_bucket = (self.PREFILL_CONTEXT_SIZE * self.group_size + 63) // 64
+        gpr_tmp = self.alloc_isa_reg()
+        self.generate_instruction_reg_mul_imm(gpr_tmp, self.gpr_seq_len, self.vector_length * self.bytes_per_element)
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=seq_len * self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
             total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
+                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
+                              gpr_M_reg=self.gpr_seq_len)
 
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.head_dim * self.group_size,
+            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim * self.group_size,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.head_dim,
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
+                gpr_M_reg=self.gpr_seq_len)
+            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
+                gpr_M_reg=self.gpr_seq_len)
             # v_proj writes to interleaved temp (T, 512); per-head KV cache populated below.
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.head_dim,
+            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
+                gpr_M_reg=self.gpr_seq_len)
 
             # LLaMA 8-head GQA: rope_hf_core(N=512) on [lo|hi]-permuted K and Q,
             # then scatter 64-dim per-head slices into per-head flash buffers and KV
@@ -605,27 +613,31 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             half_ahd = ahd // 2               # 32  (lo or hi slice width)
             rope_row = hd * 2 * bpe           # 2048 bytes per rope table row (N=512)
 
-            # Phase 1: K rope in-place on LAYER0_K_DRAM (N=512, [lo|hi] layout)
-            # After this, K_DRAM[t] = [K0_lo_r..K7_lo_r(256), K0_hi_r..K7_hi_r(256)]
-            for t in range(seq_len):
-                total_flops += self.rope_hf_core(
-                    N=hd,
-                    input_dram_addr=self.LAYER0_K_DRAM + t * hd * bpe,
-                    output_dram_addr=self.LAYER0_K_DRAM + t * hd * bpe,
-                    cos_dram_addr=ROPE_WEIGHT_ADDR + t * rope_row,
-                    sin_dram_addr=ROPE_WEIGHT_ADDR + t * rope_row + hd * bpe)
+            # Phase 1: K rope in-place on LAYER0_K_DRAM (N=512, [lo|hi] layout).
+            # K layout = [seq_len, hd]. PBI: outer M loop driven by gpr_seq_len.
+            total_flops += self.rope_hf_core_dram(
+                M=seq_len,
+                N=hd,
+                input_dram_addr=self.LAYER0_K_DRAM,
+                output_dram_addr=self.LAYER0_K_DRAM,
+                cos_dram_addr=ROPE_WEIGHT_ADDR,
+                sin_dram_addr=ROPE_WEIGHT_ADDR + hd * bpe,
+                gpr_M_reg=self.gpr_seq_len,
+            )
 
-            # Phase 2: Q rope in-place per 512-dim group (N=512, [lo|hi] layout)
-            # 4 groups × T tokens; group g covers Q for KV heads 2g and 2g+1
-            for g in range(qpkv):
-                for t in range(seq_len):
-                    q_t_g = self.LAYER0_Q_DRAM + t * total_q_dim * bpe + g * hd * bpe
-                    total_flops += self.rope_hf_core(
-                        N=hd,
-                        input_dram_addr=q_t_g,
-                        output_dram_addr=q_t_g,
-                        cos_dram_addr=ROPE_WEIGHT_ADDR + t * rope_row,
-                        sin_dram_addr=ROPE_WEIGHT_ADDR + t * rope_row + hd * bpe)
+            # Phase 2: Q rope in-place (N=512, [lo|hi] layout).
+            # Q layout = [seq_len, qpkv=4, hd] — 4 sub-rows per token share one cos/sin.
+            # PBI: outer M loop driven by gpr_seq_len; inner group loop is static.
+            total_flops += self.rope_hf_core_dram_gqa(
+                M=seq_len,
+                group_size=qpkv,
+                N=hd,
+                input_dram_addr=self.LAYER0_Q_DRAM,
+                output_dram_addr=self.LAYER0_Q_DRAM,
+                cos_dram_addr=ROPE_WEIGHT_ADDR,
+                sin_dram_addr=ROPE_WEIGHT_ADDR + hd * bpe,
+                gpr_M_reg=self.gpr_seq_len,
+            )
 
             # Phase 3: Per-KV-head scatter → KV cache + flash buffers → flash_attention
             for kv_h in range(nkvh):
@@ -637,53 +649,81 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                                 + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
 
                 # Scatter K_h_roped (64-dim) from [lo|hi] K_DRAM → KV cache + FLASH_K
-                # K_DRAM[t][lo]: kv_h*half_ahd..kv_h*half_ahd+32
-                # K_DRAM[t][hi]: hd//2+kv_h*half_ahd..hd//2+kv_h*half_ahd+32
-                # SRAM slots: lo→0x10000, hi→0x10080 (each 64 bytes; must be 128-byte aligned)
-                for t in range(seq_len):
-                    k_t = self.LAYER0_K_DRAM + t * hd * bpe
-                    self.accelerator_memory_to_sram(
-                        k_t + kv_h * half_ahd * bpe, 0x10000, half_ahd)
-                    self.accelerator_memory_to_sram(
-                        k_t + (hd // 2 + kv_h * half_ahd) * bpe,
-                        0x10080, half_ahd)
-                    k_dst = k_cache_base + t * ahd * bpe
-                    self.sram_to_accelerator_memory(0x10000, k_dst, half_ahd)
-                    self.sram_to_accelerator_memory(0x10080, k_dst + half_ahd * bpe, half_ahd)
-                    for g in range(qpkv):
-                        k_f = self.LAYER0_FLASH_K_DRAM + (t * qpkv + g) * ahd * bpe
-                        self.sram_to_accelerator_memory(0x10000, k_f, half_ahd)
-                        self.sram_to_accelerator_memory(0x10080, k_f + half_ahd * bpe, half_ahd)
+                # lo half and hi half are non-contiguous in K_DRAM → two PBI loops.
+                k_flash_lo_specs = (
+                    [(k_cache_base,               ahd * bpe)]
+                    + [(self.LAYER0_FLASH_K_DRAM + g * ahd * bpe,               qpkv * ahd * bpe) for g in range(qpkv)]
+                )
+                k_flash_hi_specs = (
+                    [(k_cache_base + half_ahd * bpe, ahd * bpe)]
+                    + [(self.LAYER0_FLASH_K_DRAM + g * ahd * bpe + half_ahd * bpe, qpkv * ahd * bpe) for g in range(qpkv)]
+                )
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_K_DRAM + kv_h * half_ahd * bpe,
+                    read_stride_bytes=hd * bpe,
+                    write_specs=k_flash_lo_specs,
+                    sram_byte_addr=0x10000,
+                    element_count=half_ahd,
+                    gpr_seq_len=self.gpr_seq_len,
+                    template_seq_len=seq_len,
+                )
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_K_DRAM + (hd // 2 + kv_h * half_ahd) * bpe,
+                    read_stride_bytes=hd * bpe,
+                    write_specs=k_flash_hi_specs,
+                    sram_byte_addr=0x10080,
+                    element_count=half_ahd,
+                    gpr_seq_len=self.gpr_seq_len,
+                    template_seq_len=seq_len,
+                )
 
                 # Scatter V_h (64-dim, standard layout) from V_PROJ_TEMP → KV cache + FLASH_V
-                # V_PROJ_TEMP[t] = [V_KV0(64), V_KV1(64), ..., V_KV7(64)] = 512-dim
-                for t in range(seq_len):
-                    v_src = self.LAYER0_V_PROJ_TEMP + (t * nkvh + kv_h) * ahd * bpe
-                    self.accelerator_memory_to_sram(v_src, 0x20000, ahd)
-                    self.sram_to_accelerator_memory(
-                        0x20000, v_cache_base + t * ahd * bpe, ahd)
-                    for g in range(qpkv):
-                        self.sram_to_accelerator_memory(
-                            0x20000,
-                            self.LAYER0_FLASH_V_DRAM + (t * qpkv + g) * ahd * bpe, ahd)
+                # V_PROJ_TEMP layout: [seq_len, nkvh, ahd] → stride = nkvh*ahd*bpe per token.
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe,
+                    read_stride_bytes=nkvh * ahd * bpe,
+                    write_specs=(
+                        [(v_cache_base, ahd * bpe)]
+                        + [(self.LAYER0_FLASH_V_DRAM + g * ahd * bpe, qpkv * ahd * bpe) for g in range(qpkv)]
+                    ),
+                    sram_byte_addr=0x20000,
+                    element_count=ahd,
+                    gpr_seq_len=self.gpr_seq_len,
+                    template_seq_len=seq_len,
+                )
 
                 # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q
-                # KV head kv_h → Q group g = kv_h//2, local_kv = kv_h%2
-                # Sub-head q of KV head kv_h: sub_idx = local_kv*qpkv + q  (0..7 within group)
+                # Q group g_for_kv = kv_h//2; sub-heads 0..qpkv-1 within that group.
                 g_for_kv = kv_h // 2
                 local_kv = kv_h % 2
-                for t in range(seq_len):
-                    q_g_t = self.LAYER0_Q_DRAM + t * total_q_dim * bpe + g_for_kv * hd * bpe
-                    for q in range(qpkv):
-                        sub_idx = local_kv * qpkv + q
-                        self.accelerator_memory_to_sram(
-                            q_g_t + sub_idx * half_ahd * bpe, 0x30000, half_ahd)
-                        self.accelerator_memory_to_sram(
-                            q_g_t + (hd // 2 + sub_idx * half_ahd) * bpe,
-                            0x30080, half_ahd)
-                        q_dst = self.LAYER0_FLASH_Q_DRAM + (t * qpkv + q) * ahd * bpe
-                        self.sram_to_accelerator_memory(0x30000, q_dst, half_ahd)
-                        self.sram_to_accelerator_memory(0x30080, q_dst + half_ahd * bpe, half_ahd)
+                for q in range(qpkv):
+                    sub_idx = local_kv * qpkv + q
+                    q_lo_base = (self.LAYER0_Q_DRAM
+                                 + g_for_kv * hd * bpe
+                                 + sub_idx * half_ahd * bpe)
+                    q_hi_base = (self.LAYER0_Q_DRAM
+                                 + g_for_kv * hd * bpe
+                                 + (hd // 2 + sub_idx * half_ahd) * bpe)
+                    flash_q_lo = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
+                    flash_q_hi = flash_q_lo + half_ahd * bpe
+                    self._emit_pbi_scatter_per_token(
+                        read_base=q_lo_base,
+                        read_stride_bytes=total_q_dim * bpe,
+                        write_specs=[(flash_q_lo, qpkv * ahd * bpe)],
+                        sram_byte_addr=0x30000,
+                        element_count=half_ahd,
+                        gpr_seq_len=self.gpr_seq_len,
+                        template_seq_len=seq_len,
+                    )
+                    self._emit_pbi_scatter_per_token(
+                        read_base=q_hi_base,
+                        read_stride_bytes=total_q_dim * bpe,
+                        write_specs=[(flash_q_hi, qpkv * ahd * bpe)],
+                        sram_byte_addr=0x30080,
+                        element_count=half_ahd,
+                        gpr_seq_len=self.gpr_seq_len,
+                        template_seq_len=seq_len,
+                    )
 
                 # Flash attention for this KV head (head_dim=64) — PBI bucket dispatcher;
                 # gpr_bucket_idx is primed at program start (ADD_SET above) so the dispatcher
@@ -700,132 +740,102 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
                     gpr_bucket_idx=self.gpr_bucket_idx,
-                    num_buckets=bucket_idx,
+                    num_buckets=num_bucket,
                 )
-                total_flops += flash_result[bucket_idx - 1]
+                total_flops += flash_result[num_bucket - 1]
 
                 # Assemble output into LAYER0_FLASH_OUTPUT_DRAM
                 # Standard GQA layout per token: [kv0_q0(64), kv0_q1..q3, kv1_q0..q3, ...]
                 out_h_base = kv_h * qpkv * ahd * bpe
-                for t in range(seq_len):
-                    for g in range(qpkv):
-                        src = self.LAYER0_FLASH_OUT_HEAD_DRAM + (t * qpkv + g) * ahd * bpe
-                        dst = (self.LAYER0_FLASH_OUTPUT_DRAM
-                               + t * total_q_dim * bpe + out_h_base + g * ahd * bpe)
-                        self.accelerator_memory_to_sram(src, 0x40000, ahd)
-                        self.sram_to_accelerator_memory(0x40000, dst, ahd)
+                t_reg = self.alloc_isa_reg()
+                src_off_reg = self.alloc_isa_reg()
+                dst_off_reg = self.alloc_isa_reg()
+                self.generate_instruction_add_set(t_reg, 0)
+                self.loop_start(loop_cnt=seq_len, gpr_loop_cnt=self.gpr_seq_len)
+                self.generate_instruction_reg_mul_imm(src_off_reg, t_reg, ue_35bit_addr_shifter(qpkv * ahd * bpe))
+                self.generate_instruction_reg_mul_imm(dst_off_reg, t_reg, ue_35bit_addr_shifter(total_q_dim * bpe))
+                for g in range(qpkv):
+                    self.generate_instruction_add_imm(src_off_reg, ue_35bit_addr_shifter(self.LAYER0_FLASH_OUT_HEAD_DRAM + g * ahd * bpe), self.TMP_REG)
+                    self.accelerator_memory_to_sram(0, 0x40000, ahd, general_reg_src=self.TMP_REG)
+                    self.generate_instruction_add_imm(dst_off_reg, ue_35bit_addr_shifter(self.LAYER0_FLASH_OUTPUT_DRAM + out_h_base + g * ahd * bpe), self.TMP_REG)
+                    self.sram_to_accelerator_memory(0x40000, 0, ahd, general_reg_src=self.TMP_REG)
+                self.generate_instruction_add_inc(t_reg)
+                self.loop_end()
+                self.release_isa_reg()  # dst_off_reg
+                self.release_isa_reg()  # src_off_reg
+                self.release_isa_reg()  # t_reg
 
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.head_dim * self.group_size, N=self.vector_length,
+            total_flops += self.matmat_mul_core(M=seq_len, K=self.head_dim * self.group_size, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
+                gpr_M_reg=self.gpr_seq_len)
 
             # LLaMA: no post-attention norm; add residual directly to o_proj output
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=seq_len * self.vector_length)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
 
             # LLaMA: post_attention_layernorm IS the pre-FFN norm
             total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
+                              gpr_M_reg=self.gpr_seq_len)
+            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True,
+                gpr_M_reg=self.gpr_seq_len)
+            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4)
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4,
+                gpr_M_reg=self.gpr_seq_len)
             # gate × up — chunked row-by-row; seq_len*mlp_elements = 344064 elems = 688KB
             # which overflows SRAM if loaded in one shot at 0x10000/0x90000.  One row = 16KB ✓
             _bpe = self.bytes_per_element
-            for _t in range(seq_len):
-                _g_row = self.LAYER0_MLP_GATE_DRAM + _t * self.mlp_elements * _bpe
-                _u_row = self.LAYER0_MLP_UP_DRAM   + _t * self.mlp_elements * _bpe
-                _m_row = self.LAYER0_MLP_MULT_DRAM  + _t * self.mlp_elements * _bpe
-                self.accelerator_memory_to_sram(_g_row, 0x10000, self.mlp_elements)
-                self.accelerator_memory_to_sram(_u_row, 0x90000, self.mlp_elements)
-                self.eltwise_mul_core(0x10000, 0x90000, 0x10000, self.mlp_elements)
-                self.sram_to_accelerator_memory(0x10000, _m_row, self.mlp_elements)
-            total_flops += self.quantized_matmat_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
+            _row_bytes = self.mlp_elements * _bpe
+            _t_reg = self.alloc_isa_reg()
+            _off_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(_t_reg, 0)
+            self.loop_start(loop_cnt=seq_len, gpr_loop_cnt=self.gpr_seq_len)
+            self.generate_instruction_reg_mul_imm(_off_reg, _t_reg, ue_35bit_addr_shifter(_row_bytes))
+            self.generate_instruction_add_imm(_off_reg, ue_35bit_addr_shifter(self.LAYER0_MLP_GATE_DRAM), self.TMP_REG)
+            self.accelerator_memory_to_sram(0, 0x10000, self.mlp_elements, general_reg_src=self.TMP_REG)
+            self.generate_instruction_add_imm(_off_reg, ue_35bit_addr_shifter(self.LAYER0_MLP_UP_DRAM), self.TMP_REG)
+            self.accelerator_memory_to_sram(0, 0x90000, self.mlp_elements, general_reg_src=self.TMP_REG)
+            self.eltwise_mul_core(0x10000, 0x90000, 0x10000, self.mlp_elements)
+            self.generate_instruction_add_imm(_off_reg, ue_35bit_addr_shifter(self.LAYER0_MLP_MULT_DRAM), self.TMP_REG)
+            self.sram_to_accelerator_memory(0x10000, 0, self.mlp_elements, general_reg_src=self.TMP_REG)
+            self.generate_instruction_add_inc(_t_reg)
+            self.loop_end()
+            self.release_isa_reg()  # _off_reg
+            self.release_isa_reg()  # _t_reg
+            total_flops += self.matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4)
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4,
+                gpr_M_reg=self.gpr_seq_len)
 
             # LLaMA: no post-FFN norm; add residual directly to down_proj output
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=seq_len * self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=seq_len * self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=seq_len * self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=seq_len * self.vector_length)
-        self.stop_capture()
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+        self.release_isa_reg()  # gpr_tmp
         self.generate_instruction_halt()
-        prefill_program_addr = self.get_program_dram_addr()
-        self.write_captured_instructions_to_dram(prefill_program_addr)
-        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        self.clear_capture_buffer()
+        prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
-        print(f"    Prefill program start at 0x{prefill_program_addr:X} end at 0x{self.get_program_dram_addr():X}, usage: {self.get_program_dram_usage()} bytes")
+        return {"size_bytes": prefill_program_size, "flops": total_flops}
 
-        return prefill_program_addr, total_flops
-        
-    def run_prefill(self, prefill_program_addr: int, prefill_seq, gflops: int = None) -> dict:
+    def _compile_decoder_program(self, layer_size: int) -> dict:
+        """Compile decoder into the active capture session.
+        Returns dict with ``program_size_bytes`` and ``total_flops``.
         """
-        Run prefill for the given prefill sequence.
-        
-        Args:
-            prefill_program_addr: The address of the prefill program in DRAM.
-            prefill_seq: The prefill sequence.
-            gflops: The number of GFLOPS to use for the prefill.
-        
-        Returns:
-            A dictionary containing the results of the prefill.
-        """
-        if prefill_seq is None:
-            prefill_seq = tuple(self._cfg["default_prefill_tokens"])
-        
-        # Prefill processes all but the last token
-        if len(prefill_seq) > 1:
-            prefill_seq = prefill_seq[:-1]
-            assert len(prefill_seq) == self.seq_len, f"Expected seq_len {self.seq_len}, but got {len(prefill_seq)}"
-        else:
-            raise ValueError("Prefill sequence must have at least 2 tokens.")
-
-        seq_len = len(prefill_seq)
-        q_seq_len = seq_len * self.group_size
-        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
-
-        embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
-        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
-        # Block-causal mask: all group_size Q copies of token t may attend to ALL
-        # group_size K copies of tokens 0..t (not just j <= i as in tril).
-        # This is correct for GQA duplication where K[t*gs+g] = K_unique[t] for all g.
-        bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
-        rows = torch.arange(aligned_seq_len).unsqueeze(1)
-        cols = torch.arange(aligned_seq_len).unsqueeze(0)
-        valid_mask = (cols // self.group_size) <= (rows // self.group_size)
-        bias_one_group.masked_fill_(valid_mask, 0.0)
-        bias_one_group[:, q_seq_len:] = float("-inf")
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
-        # Set gpr_bucket_idx to the 1-based bucket selector for the actual runtime seq_len.
-        bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
-        self.isa_add_set_core(self.gpr_bucket_idx, bucket_idx)
-        self.program_execute(prefill_program_addr, gflops=gflops)
-
-    def compile_decoder(self, layer_size: int | None = None) -> tuple[int, int]:
-        """Compile single-segment PBI decoder; write decoder_program.bin and decoder_program.json.
-        Returns (program_size_bytes, total_flops)."""
-        if layer_size is None:
-            layer_size = self.LAYER_SIZE
-        paths_cfg = self._cfg.get("paths", {})
-        decoder_bin_rel = paths_cfg.get("decoder_program_bin", "llama3.2_1b_bin/decoder_program.bin")
-        decoder_meta_rel = paths_cfg.get("decoder_program_meta", "llama3.2_1b_bin/decoder_program.json")
-        decoder_bin_path = os.path.join(self.script_dir, decoder_bin_rel)
-        decoder_meta_path = os.path.join(self.script_dir, decoder_meta_rel)
-        os.makedirs(os.path.dirname(decoder_bin_path), exist_ok=True)
+        if not getattr(self, "is_capture_on", False):
+            raise RuntimeError("_compile_decoder_program() requires an active capture session")
+        count_at_start = self.capture_count
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         total_flops = 0
 
         global _SILENT_MODE
         _SILENT_MODE = True
-        self.clear_inst_id()
-        self.start_capture()
         for layer_idx in range(layer_size):
                 layer_off = layer_idx * LAYER_WEIGHT_SIZE
                 if layer_idx != 0:
@@ -925,22 +935,21 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                             0x30080, half_ahd)
                         self.sram_to_accelerator_memory(0x30000, flash_q_addr, half_ahd)
                         self.sram_to_accelerator_memory(0x30080, flash_q_addr + half_ahd * bpe, half_ahd)
-                        attn_flops = self.decoder_group_attention_core(
-                            group_size=1,
-                            head_dim=ahd,
-                            seq_len=self.MAX_CONTEXT_SIZE,
-                            gpr_bucket_idx=self.gpr_bucket_idx,
-                            use_pbi=False,
-                            num_buckets=8,
-                            Q_DRAM_ADDR=flash_q_addr,
-                            K_DRAM_ADDR=k_cache_base,
-                            V_DRAM_ADDR=v_cache_base,
-                            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + (kv_h * qpkv + q) * ahd * bpe,
-                            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                        )
-                        total_flops += attn_flops[-1]
+                    attn_flops = self.decoder_group_attention_core(
+                        group_size=qpkv,
+                        head_dim=ahd,
+                        seq_len=self.MAX_CONTEXT_SIZE,
+                        gpr_bucket_idx=self.gpr_bucket_idx,
+                        num_buckets=8,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM + kv_h * qpkv * ahd * bpe,
+                        K_DRAM_ADDR=k_cache_base,
+                        V_DRAM_ADDR=v_cache_base,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
+                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    )
+                    total_flops += attn_flops[-1]
                 total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
@@ -985,57 +994,175 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4)
 
         self.generate_instruction_halt()
-        self.stop_capture()
+        decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
-        program_bytes = bytearray()
+        return {"program_size_bytes": decoder_program_size, "total_flops": total_flops}
+
+    def compile_llama(self, layer_size: int | None = None) -> None:
+        """Compile prefill + decoder into a single combined instruction image.
+
+        Layout in program DRAM:  [prefill][decoder]
+
+        Prefill is compiled with a fixed template (UE_VECTOR_SIZE) — all runtime
+        loop counts are driven by GPRs primed by the preamble, so the same bin
+        works for any seq_len. If both bin and meta already exist, this is a no-op.
+
+        Writes:
+          - paths.instruction_bin  : combined raw instruction stream
+          - paths.instruction_meta : per-stage start addresses, sizes, FLOPs
+        """
+        if layer_size is None:
+            layer_size = self.LAYER_SIZE
+        paths_cfg = self._cfg.get("paths", {})
+        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_1b_bin/llama_instruction.bin"))
+        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
+        if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
+            print(f"Reusing existing instruction image at {instruction_bin_path}")
+            print(f"  delete {instruction_bin_path} to force recompile.")
+            return
+
+        template_seq_len = UE_VECTOR_SIZE
+
+        self.clear_inst_id()
+        self.start_capture()
+
+        print(f"Compiling prefill (template_seq_len={template_seq_len})...")
+        t0 = time.perf_counter()
+        prefill_prog = self._compile_prefill_program(template_seq_len=template_seq_len, layer_size=layer_size)
+        print(f"  prefill compiled: {prefill_prog['size_bytes']} bytes, {time.perf_counter() - t0:.1f}s")
+
+        print("Compiling decoder...")
+        t0 = time.perf_counter()
+        decoder_prog = self._compile_decoder_program(layer_size=layer_size)
+        print(f"  decoder compiled: {decoder_prog['program_size_bytes']} bytes, {time.perf_counter() - t0:.1f}s")
+
+        self.stop_capture()
+
+        os.makedirs(os.path.dirname(instruction_bin_path), exist_ok=True)
+        instruction_bytes = bytearray()
         for inst in self.capture_buffer:
-            program_bytes.extend(inst.get_bytes())
-        with open(decoder_bin_path, "wb") as f:
-            f.write(program_bytes)
-        program_size = len(program_bytes)
-        with open(decoder_meta_path, "w") as f:
-            json.dump({"program_size": program_size, "total_flops": total_flops}, f, indent=0)
+            instruction_bytes.extend(inst.get_bytes())
+        with open(instruction_bin_path, "wb") as f:
+            f.write(instruction_bytes)
         self.clear_capture_buffer()
-        print(f"Decoder program written to {decoder_bin_path} ({program_size} bytes)")
-        return program_size, total_flops
 
-    def run_decoder(self, decoder_base_addr: int, token_id: int, total_flops: int | None = None) -> int:
-        """Run decode loop. seq_len capped at MAX_CONTEXT_SIZE. Breaks on LLaMA EOS/EOT tokens."""
-        if token_id is None:
-            print("No last token available for decode.")
-            return 0
+        instruction_base_addr = self.get_program_dram_addr()
+        prefill_program_addr = instruction_base_addr
+        decoder_program_addr = instruction_base_addr + prefill_prog["size_bytes"]
 
-        # LLaMA stop tokens: <|end_of_text|>=128001, <|eom_id|>=128008, <|eot_id|>=128009
+        metadata = {
+            "instruction_bin": os.path.relpath(instruction_bin_path, self.script_dir),
+            "instruction_base_addr": f"0x{instruction_base_addr:X}",
+            "instruction_total_size": len(instruction_bytes),
+            "prefill_template_seq_len": template_seq_len,
+            "prefill_program_start_addr": f"0x{prefill_program_addr:X}",
+            "prefill_program_size": prefill_prog["size_bytes"],
+            "prefill_template_flops": prefill_prog["flops"],
+            "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
+            "decoder_program_size": decoder_prog["program_size_bytes"],
+            "decoder_total_flops": decoder_prog["total_flops"],
+        }
+        with open(instruction_meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Combined instruction image written to {instruction_bin_path} ({len(instruction_bytes)} bytes)")
+        print(f"Metadata written to {instruction_meta_path}")
+
+    def run_llama(self) -> None:
+        """Load the unified instruction image and run prefill + decoder loop.
+
+        Primes GPRs via a small captured preamble that jumps into the cached
+        prefill or decoder program at runtime.
+        """
+        paths_cfg = self._cfg.get("paths", {})
+        meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
+        preamble_addr = self.get_program_dram_addr()
+
+        prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
+        decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
+        template_seq_len = int(meta["prefill_template_seq_len"])
+        flops_prefill_template = meta["prefill_template_flops"]
+        decoder_flops_per_token = meta["decoder_total_flops"]
+        _max_gpr_bucket = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        _kv_stride = self.actual_head_dim * self.bytes_per_element
+        _rope_row  = self.head_dim * 2 * self.bytes_per_element
+
+        prefill_seq = self.prefill_seq
+        if prefill_seq is None:
+            prefill_seq = tuple(self._cfg["default_prefill_tokens"])
+        if len(prefill_seq) < 2:
+            raise ValueError("Prefill sequence must have at least 2 tokens.")
+        prefill_seq = prefill_seq[:-1]  # last token starts the decoder
+        prefill_seq_len = len(prefill_seq)
+        self.seq_len = prefill_seq_len
+
+        q_seq_len = prefill_seq_len * self.group_size
+        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
+        flops_prefill = flops_prefill_template * prefill_seq_len // max(template_seq_len, 1)
+
+        # Prefill preamble: prime gpr_seq_len + gpr_bucket_idx, then jump into cached prefill.
+        self.clear_inst_id()
+        self.start_capture()
+        self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(preamble_addr)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.clear_capture_buffer()
+
+        embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+        bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
+        rows = torch.arange(aligned_seq_len).unsqueeze(1)
+        cols = torch.arange(aligned_seq_len).unsqueeze(0)
+        valid_mask = (cols // self.group_size) <= (rows // self.group_size)
+        bias_one_group.masked_fill_(valid_mask, 0.0)
+        bias_one_group[:, q_seq_len:] = float("-inf")
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
+
+        print(f"\n--- Starting prefill (seq_len={prefill_seq_len}) ---")
+        print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
+        timer = time.perf_counter()
+        self.program_execute(preamble_addr, gflops=flops_prefill)
+        latency_prefill = time.perf_counter() - timer
+        print(f"Prefill done in {latency_prefill:.2f}s\n")
+
+        print("--- Starting decoder ---")
+        timer = time.perf_counter()
+        token_id = self.prefill_seq[-1]
         _llama_stop_tokens = {128001, 128008, self._end_of_turn_token_id}
-
         global _SILENT_MODE
-        max_seq_len = self.MAX_CONTEXT_SIZE
-        while self.seq_len < max_seq_len:
+
+        while self.seq_len < self.MAX_CONTEXT_SIZE:
             _SILENT_MODE = True
-            timer_start = time.perf_counter()
             self.seq_len += 1
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
-            prog_addr = decoder_base_addr
-            gflops = total_flops
-
-            # GPR_BUCKET_IDX_REG: 1-based bucket index (seq_len → bucket 1..8, each covers 64 tokens)
-            self.isa_add_set_core(self.gpr_bucket_idx, min((self.seq_len + 63) // 64, 8))
-            # V_CACHE_SIZE_REG: decode_pos × actual_hd × bpe (per-head KV cache stride = 128B)
-            # ROPE_SIZE_REG:    decode_pos × head_dim × 2 × bpe (N=512 rope row = 2048B)
-            _kv_stride  = self.actual_head_dim * self.bytes_per_element  # 128 bytes/position
-            _rope_row   = self.head_dim * 2 * self.bytes_per_element     # 2048 bytes/position
-            self.isa_add_set_core(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter((self.seq_len - 1) * _kv_stride))
-            self.isa_add_set_core(self.ROPE_SIZE_REG,    ue_35bit_addr_shifter((self.seq_len - 1) * _rope_row))
+            bucket_idx = min((self.seq_len + 63) // 64, _max_gpr_bucket)
+            decode_pos = self.seq_len - 1
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
-
             bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
             bias_host[0, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
 
-            self.start_execute_from_dram(prog_addr)
-            self.wait_queue(10.0)
+            # Decoder preamble: prime 3 position GPRs + bucket, then jump into cached decoder.
+            self.clear_inst_id()
+            self.start_capture()
+            self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            self.generate_instruction_add_set(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _kv_stride))
+            self.generate_instruction_add_set(self.ROPE_SIZE_REG,    ue_35bit_addr_shifter(decode_pos * _rope_row))
+            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+            self.stop_capture()
+            self.write_captured_instructions_to_dram(preamble_addr)
+            self.clear_capture_buffer()
+
+            self.program_execute(preamble_addr, gflops=decoder_flops_per_token)
             token_id = self.get_arg_max_index()
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -1043,20 +1170,23 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
-        return self.seq_len
-        
+
+        latency_decoder = time.perf_counter() - timer
+        tokens_decoded = self.seq_len - prefill_seq_len
+        print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
+              f"speed: {tokens_decoded / latency_decoder:.2f} tokens/s, "
+              f"total {self.seq_len} tokens.")
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
-    parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
-    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin instead of generated weights_llama3.2_1b_hf.bin")
-    parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=1/0.17,
-                        help='Clock cycle time in nanoseconds (default: ~5.88ns)')
+    parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
+    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")
+    parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
+    parser.add_argument('--cycle', type=float, default=1/0.17, help='Clock cycle time in ns (default: ~5.88ns)')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1074,58 +1204,36 @@ def main():
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Using DMA device: {args.dev}")
-    print(f"  H2C: {DMA_DEVICE_H2C}")
-    print(f"  C2H: {DMA_DEVICE_C2H}")
-    print(f"  USER: {DMA_DEVICE_USER}")
-    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
+    print(f"Using DMA device: {args.dev}, CLOCK_CYCLE_TIME_NS={user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)
+
     if args.prompt is not None:
         tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
         tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
         conversation = [{"role": "user", "content": args.prompt}]
-        prompt_with_template = tokenizer.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        )
+        prompt_with_template = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
         prefill_seq = tuple(tokenizer.encode(prompt_with_template, add_special_tokens=False))
         print(f"Prefill from prompt ({len(prefill_seq)} tokens): {args.prompt!r}")
-        print(f"Sequence ids: {prefill_seq}")
     else:
         prefill_seq = tuple(cfg["default_prefill_tokens"])
 
-    print(f"\n--- Compiling ---")
+    max_prefill = ue.PREFILL_CONTEXT_SIZE
+    if len(prefill_seq) < 2 or len(prefill_seq) > max_prefill + 1:
+        print(f"WARNING: prompt length {len(prefill_seq)} out of range [2, {max_prefill + 1}], falling back to default.")
+        prefill_seq = tuple(cfg["default_prefill_tokens"])
+
+    ue.prefill_seq = prefill_seq
+
+    print("\n--- Compiling ---")
     timer = time.perf_counter()
-    prefill_program_addr, gflops_prefill = ue.compile_prefill(seq_len=len(prefill_seq))
-    print(f"Prefill compile done in {time.perf_counter() - timer:.2f} seconds, start decoder compile...")
-    decoder_bin_path = os.path.join(script_dir, "llama3.2_1b_bin", "decoder_program.bin")
-    decoder_meta_path = os.path.join(script_dir, "llama3.2_1b_bin", "decoder_program.json")
-    if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
-        with open(decoder_meta_path, "r") as f:
-            meta = json.load(f)
-        # Support old multi-segment format: total_flops was a list; use max bucket value.
-        raw_flops = meta["total_flops"]
-        total_flops = raw_flops[-1] if isinstance(raw_flops, list) else raw_flops
-        print(f"Decoder bin found, skipped compile ({time.perf_counter() - timer:.2f}s).")
-    else:
-        timer_dec = time.perf_counter()
-        _, total_flops = ue.compile_decoder()
-        print(f"Decoder compile done in {time.perf_counter() - timer_dec:.2f} seconds.")
-    decoder_base_addr, _ = ue.load_program_instructions_from_file(decoder_bin_path)
+    ue.compile_llama()
+    print(f"Compile done in {time.perf_counter() - timer:.2f}s")
 
-    print(f"\n--- Starting prefill ---")
-    print(f"Prompt tokens ({len(prefill_seq)}): {prefill_seq}")
-    timer=time.perf_counter()
-    ue.run_prefill(prefill_program_addr, prefill_seq=prefill_seq, gflops=gflops_prefill)
-    latency_prefill = time.perf_counter() - timer
-    print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n")
-
-    print(f"\n--- Starting decoder ---")
-    timer=time.perf_counter()
-    token_cnt_decoded = ue.run_decoder(decoder_base_addr, token_id=prefill_seq[-1], total_flops=total_flops)
-    latency_decoder = time.perf_counter() - timer
-    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, total {token_cnt_decoded} tokens.")
+    print("\n--- Running ---")
+    ue.run_llama()
+    ue.clear_dram()
     print("Llama-3.2-1B test ends.")
 
 if __name__ == "__main__":

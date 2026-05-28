@@ -4,7 +4,8 @@
     "V_CACHE_SIZE_REG": 1,
     "TMP_REG": 2,
     "ROPE_SIZE_REG": 3,
-    "GPR_BUCKET_IDX_REG": 4
+    "GPR_BUCKET_IDX_REG": 4,
+    "GPR_SEQ_LEN_REG": 5
   },
   "file_info": {
     "layer_size": 32327680,
@@ -18,6 +19,7 @@
   },
   "model": {
     "max_context_size": 512,
+    "prefill_context_size": 64,
     "end_of_turn_token_id": 128009,
     "decoder_seq_len_buckets": [64, 128, 192, 256, 320, 384, 448, 512],
     "rope_global_layers": []
