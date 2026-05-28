@@ -989,9 +989,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            # LM head: argmax is tracked in HW during the matvec, so skip the full
+            # vocab-logits writeback to DRAM (write_back_disable). Matches gemma3.
+            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4)
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
+                write_back_disable=True)
 
         self.generate_instruction_halt()
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES

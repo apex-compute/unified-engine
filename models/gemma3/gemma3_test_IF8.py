@@ -970,8 +970,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         _SILENT_MODE = True
-        gpr_one = self.alloc_isa_reg()
-        self.generate_instruction_add_set(gpr_one, 1)
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
@@ -979,32 +977,26 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
-            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
+            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
                                                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                                                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
                                                 OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                                                is_B_quantized=True,
                                                 data_type=TYPE.IF8,
                                                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
-                                                gpr_M_reg=gpr_one,
                                                 )
-            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.head_dim,
+            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                is_B_quantized=True,
                 data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
-                gpr_M_reg=gpr_one,
                 )
-            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.head_dim,
+            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                is_B_quantized=True,
                 data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
-                gpr_M_reg=gpr_one,
                 )
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_FLASH_V_DRAM, sram_address=0x10000, element_size=self.head_dim)
             self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size))
@@ -1044,14 +1036,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 num_buckets=num_buckets,
             )
             total_flops += attn_result[-1] if use_pbi else attn_result
-            total_flops += self.matmat_mul_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
+            total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                is_B_quantized=True,
                 data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
-                gpr_M_reg=gpr_one,
                 )
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off)
@@ -1064,24 +1054,20 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
 
-            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.mlp_elements,
+            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                is_B_quantized=True,
                 data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
                 gelu_enable=True,
-                gpr_M_reg=gpr_one,
                 )
-            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.mlp_elements,
+            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                is_B_quantized=True,
                 data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
-                gpr_M_reg=gpr_one,
                 )
 
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
@@ -1089,14 +1075,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
-            total_flops += self.matmat_mul_core(M=1, K=self.mlp_elements, N=self.vector_length,
+            total_flops += self.quantized_matmat_core(M=1, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                is_B_quantized=True,
                 data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
-                gpr_M_reg=gpr_one,
                 )
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off)
@@ -1117,7 +1101,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
                 write_back_disable=True,
-                gpr_M_reg=gpr_one,
                 )
 
         # Advance token position; K/V/RoPE offsets are derived as gpr_seq_len * stride at each usage site.
@@ -1126,7 +1109,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_halt()
         inst_count = self.capture_count - count_at_start
         _SILENT_MODE = False
-        self.release_isa_reg()
         decoder_program_addr = self.get_program_dram_addr() + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
         program_size_bytes = inst_count * INSTRUCTION_SIZE_BYTES
         print(
