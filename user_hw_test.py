@@ -3200,7 +3200,8 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
     ue.generate_instruction_halt()
     program_dram_addr = ue.get_program_dram_addr()
     ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(instruction_size_bytes)
 
     a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
     ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
@@ -3263,7 +3264,8 @@ def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool 
     record_test(f"matmat_mul_quantized_weights+{'+'.join(flags)}",
                 f"M={M}, K={K}, N={N}",
                 snr_db=snr_db_ref,
-                gflops=report_flop_rate_gflops)
+                gflops=report_flop_rate_gflops,
+                inst_bytes=instruction_size_bytes)
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
@@ -3317,7 +3319,8 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.IF4
     ue.generate_instruction_halt()
     program_dram_addr = ue.get_program_dram_addr()
     ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(instruction_size_bytes)
 
     a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
     ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
@@ -3380,7 +3383,8 @@ def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.IF4
     record_test(f"quantized_matmat_mul+{'+'.join(flags)}",
                 f"M={M}, K={K}, N={N}",
                 snr_db=snr_db_ref,
-                gflops=report_flop_rate_gflops)
+                gflops=report_flop_rate_gflops,
+                inst_bytes=instruction_size_bytes)
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
