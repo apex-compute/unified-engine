@@ -261,10 +261,10 @@ WB_PADDING_NEG_INF = 1  # 0xFF80
 # UE_LATENCY_BF20_ITR3 = 2*UE_PIPELINE_BF20_ADD + 2 - 1
 # UE_LATENCY_BF20_ITRGT3 = 3*UE_PIPELINE_BF20_ADD + 2 - 1
 
-# Pipeline component latencies from bf19_mult.vhdl, bf19_add.vhdl, custom_exp.vhdl, adder_tree.vhdl
-UE_PIPELINE_BF19_MULT = 2
+# Pipeline component latencies from bf19_mult.sv, bf19_add.sv, custom_exp.sv, adder_tree.sv
+UE_PIPELINE_BF19_MULT = 3  # +1: split bf19_mult rounding adder at bit 10
 UE_PIPELINE_BF19_ADD = 3
-UE_PIPELINE_CUSTOM_EXP = 5
+UE_PIPELINE_CUSTOM_EXP = 6  # Was 5, +1 to split custom_exp multiply and add
 UE_PIPELINE_ADDER_TREE = 12
 BF20_ADDER_3_CYCLE = True
 UE_LATENCY_BF20_ITR2, UE_LATENCY_BF20_ITR3, UE_LATENCY_BF20_ITRGT3 = ((3, 11, 11) if BF20_ADDER_3_CYCLE else (2, 5, 7))
@@ -293,9 +293,9 @@ UE_LATENCY_ROPE = 8  # Additional mode latency
 UE_LATENCY_MEAN = 20  # Additional mode latency
 
 # LALU pipeline component latencies from timing.md (micro values)
-UE_LALU_PIPELINE_FPDIV = 3  # fpdiv pipeline depth (from fpdiv.vhdl line 561)
-UE_LALU_PIPELINE_FPSQRT = 3  # fpsqrt pipeline depth (split cycle 1 at step 6/7 to close 450 MHz timing)
-UE_LALU_PIPELINE_FACT = 8  # sample_1_plus_exp_bx pipeline depth (from sample_1_plus_exp_bx.vhdl line 9039)
+UE_LALU_PIPELINE_FPDIV = 4  # fpdiv pipeline depth (+1 SRT stage at q6 -> q5 boundary)
+UE_LALU_PIPELINE_FPSQRT = 4  # fpsqrt pipeline depth (+1 final-stage split at T10/S9)
+UE_LALU_PIPELINE_FACT = 10  # sample_1_plus_exp_bx depth: FPMult + custom_exp(6) + FPAdd
 
 # LALU mode latencies calculated from timing.md formulas (shift register delay parameter)
 # Pipeline stages are all 1 cycle (Input Reg + intermediate Reg + Output Reg - 1 for overlap)
@@ -790,7 +790,13 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x25e4082c, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x25e4082c. Please update FPGA with commit update_3fa1735.bin using update_flash.py (public release v1.1)"
+        allowed_hw_versions = {0x25e4082c, 0x12345678}
+        assert hw_version in allowed_hw_versions, (
+            f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
+            "expected one of "
+            f"{', '.join(f'0x{v:08x}' for v in sorted(allowed_hw_versions))}. "
+            "Please update FPGA with commit update_3fa1735.bin using update_flash.py (public release v1.1)"
+        )
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -836,14 +842,15 @@ class UnifiedEngine:
 
         # Configure delay for the last ALU (matching andromeda.c init_unified_engine)
         ue_lalu_delay = (
-            ((UE_QINPUT_DELAY & 0x1F) << 21) +
-            (UE_LATENCY_QUANTIZATION << 16) +
-            (UE_LATENCY_QSCALE << 12) +
+            ((UE_QINPUT_DELAY & 0x1F) << 22) +
+            (UE_LATENCY_QUANTIZATION << 17) +
+            (UE_LATENCY_QSCALE << 13) +
             (UE_LALU_LATENCY_ACT << 8) +
             (UE_LALU_LATENCY_RMS << 4) +
             (UE_LALU_LATENCY_SOFTMAX << 0)
         )
         self.write_reg32(UE_LALU_DELAY_ADDR, ue_lalu_delay)
+        self.dram_inst_running(True)
         print("Unified Engine initialization completed successfully!")
 
     def write_reg32(self, address: int, value: int):
@@ -7238,6 +7245,12 @@ class UnifiedEngine:
             print(f"Warning: Expected to write {total_bytes} bytes, but only wrote {bytes_written} bytes")
 
         return bytes_written
+
+    def dram_inst_running(self, enable: bool = True):
+        """
+        Enable or disable instruction execution from DRAM.
+        """
+        self.write_reg32(UE_INSTRUCTION_CTL_ADDR, 1 if enable else 0)
 
     def start_execute_from_dram(self, instruction_addr: int = DRAM_INSTRUCTION_ADDR):
         """

@@ -49,6 +49,43 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
+
+def configure_device(device_name: str, dma_device: str | None = None, base_addr: int | None = None) -> dict:
+    """Apply board-specific DMA and DRAM layout, with a local Efinix fallback.
+
+    Newer pcie_utils has user_dma_core.configure_device(); this branch may not.
+    Keep the board profile here so Gemma3 can still run on the Efinix PCIe DMA
+    driver without requiring a user_dma_core.py update in this request.
+    """
+    if hasattr(user_dma_core, "configure_device"):
+        return user_dma_core.configure_device(device_name, dma_device=dma_device, base_addr=base_addr)
+
+    if device_name == "efinix":
+        user_dma_core.UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
+        user_dma_core.DRAM_START_ADDR = 0x00000000
+        user_dma_core.DRAM_ACTIVATION_ADDR = 0x30000000
+        user_dma_core.DRAM_INSTRUCTION_ADDR = 0x3F000000
+        user_dma_core.DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
+        user_dma_core.DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
+        user_dma_core.DMA_DEVICE_USER = "/dev/pcie_dma0_user"
+    else:
+        user_dma_core.UE_0_BASE_ADDR = 0x02000000 if base_addr is None else int(base_addr)
+        user_dma_core.DRAM_START_ADDR = 0x80000000
+        user_dma_core.DRAM_ACTIVATION_ADDR = 0xB0000000
+        user_dma_core.DRAM_INSTRUCTION_ADDR = 0xD0000000
+        set_dma_device(dma_device or "xdma0")
+
+    return {
+        "device": device_name,
+        "ue_0_base_addr": user_dma_core.UE_0_BASE_ADDR,
+        "dram_start_addr": user_dma_core.DRAM_START_ADDR,
+        "dram_activation_addr": user_dma_core.DRAM_ACTIVATION_ADDR,
+        "dram_instruction_addr": user_dma_core.DRAM_INSTRUCTION_ADDR,
+        "dma_h2c": user_dma_core.DMA_DEVICE_H2C,
+        "dma_c2h": user_dma_core.DMA_DEVICE_C2H,
+        "dma_user": user_dma_core.DMA_DEVICE_USER,
+    }
+
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
 
@@ -254,7 +291,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False):
-        program_dram_base = DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else DRAM_INSTRUCTION_ADDR
+        program_dram_base = user_dma_core.DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else user_dma_core.DRAM_INSTRUCTION_ADDR
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
         super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
         self.dual_engine = dual_engine
@@ -1358,6 +1395,8 @@ def _clock_ns_default_for_device(device: str) -> float:
         return 3.0
     if device == "bittware":
         return 4.166666666
+    if device == "efinix":
+        return 5.0
     return 10.0
 
 
@@ -1372,7 +1411,7 @@ def main():
         help="Dual-engine path (compile-time sharding hooks exist; PBI + dual not verified end-to-end—CLI still rejects).",
     )
     parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+                        help='DMA device name (e.g., xdma0, xdma1). Ignored for --device efinix.')
     parser.add_argument(
         '--device',
         type=str,
@@ -1387,11 +1426,12 @@ def main():
     )
     args = parser.parse_args()
 
-    set_dma_device(args.dev)
+    configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    globals()["DRAM_INSTRUCTION_ADDR"] = user_dma_core.DRAM_INSTRUCTION_ADDR
 
     # Match user_hw_test.py: Bittware uses 512-bit AXI beat; other profiles use 256-bit.
     axi_width_bits = 512 if args.device == "bittware" else 256
