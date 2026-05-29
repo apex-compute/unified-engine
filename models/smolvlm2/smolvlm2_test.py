@@ -597,7 +597,25 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                      cos_dram_addr: int, sin_dram_addr: int,
                      rope_size_reg: int = None, output_addr_inc_reg: int = None,
                      tmp_reg: int = None) -> int:
-        """Per-token decode RoPE (D=64) with register-addressed cos/sin."""
+        """Per-token decode RoPE for N=64 (half=32). Caller must bracket with start/stop_capture.
+
+        Compute flow — splits N into lo/hi halves (32 each) to meet 128-byte SRAM alignment:
+          1. Load x_lo[32], x_hi[32]       → sram_x_lo, sram_x_hi      (two 128-byte slots)
+          2. Load cos_lo[32], cos_hi[32]   → sram_cos_lo, sram_cos_hi
+             Load sin_lo[32], sin_hi[32]   → sram_sin_lo, sram_sin_hi   (sin pre-negated in table)
+          3. a_lo[32] = x_lo * cos_lo      (eltwise_mul)
+             a_hi[32] = x_hi * cos_hi      (eltwise_mul)
+          4. b_lo[32] = x_hi * sin_lo      (eltwise_mul, rotate_half lo: x_hi * (-sin_lo))
+             b_hi[32] = x_lo * sin_hi      (eltwise_mul, rotate_half hi: x_lo * sin_hi)
+          5. result_lo[32] = a_lo + b_lo   (eltwise_add)
+             result_hi[32] = a_hi + b_hi   (eltwise_add)
+          6. Write result_lo, result_hi → output_dram_addr
+
+        rope_size_reg: ISA register holding a per-position byte offset added to cos/sin addresses
+          at runtime. tmp_reg required.
+        output_addr_inc_reg: ISA register holding a per-position byte offset applied to output_dram_addr.
+        Returns: approximate FLOPs (4*N).
+        """
         use_reg = rope_size_reg is not None and tmp_reg is not None
         bpe = 2
         half = N // 2
