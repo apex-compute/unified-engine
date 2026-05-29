@@ -47,7 +47,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, SCALE_BRAM_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -292,7 +292,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         super().__init__(
             params_dram_base=0x00000000,
             tensor_dram_base=0x58000000,
-            program_dram_base=0x98000000,
+            program_dram_base=0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
@@ -319,19 +319,24 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
         # Dynamic-PBI GPR layout (see core_changes.md §3a):
         #   reg 1 = TMP_REG          — scratch for reg_mul_imm + add_imm address math
-        #   reg 2 = GF_SEQ_LEN_REG   — runtime row count for matmul/norm/rope (M=seq_len ops)
-        #   reg 3 = GF_Q_SEQ_LEN_REG — for ops with M = seq_len * group_size (Q-side norms/rope)
-        #   reg 4 = GF_BUCKET_IDX_REG— 1-based bucket selector for flash / group-attention kernels
+        #   reg 2 = GPR_SEQ_LEN_REG   — runtime row count for matmul/norm/rope (M=seq_len ops)
+        #   reg 3 = GPR_Q_SEQ_LEN_REG — for ops with M = seq_len * group_size (Q-side norms/rope)
+        #   reg 4 = GPR_BUCKET_IDX_REG— 1-based bucket selector for flash / group-attention kernels
         # Dynamic GPR allocation (via alloc_isa_reg) starts at 5; PBI op-internal loop counters
         # consume from there and release back at loop_end.
         fixed = self._cfg.get("fixed_isa_regs", {})
         self.TMP_REG       = fixed["TMP_REG"]
-        self.gf_seq_len    = fixed["GF_SEQ_LEN_REG"]
-        self.gf_q_seq_len  = fixed["GF_Q_SEQ_LEN_REG"]
-        self.gf_bucket_idx = fixed["GF_BUCKET_IDX_REG"]
+        self.gpr_seq_len    = fixed["GPR_SEQ_LEN_REG"]
+        self.gpr_q_seq_len  = fixed["GPR_Q_SEQ_LEN_REG"]
+        self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
         self._isa_reg_counter = 5
         self.causal_mask_upper = False
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
+
+        # Single shared identity matrix slot (UE_VECTOR_SIZE × UE_VECTOR_SIZE,
+        # populated by tensor_init). Passed as IDENTITY_DRAM_ADDR= to every
+        # attention/transpose kernel call site. See Trick 4 in
+        # build_API_for_FPGAcomponents.md.
 
         bin_path = weights_bin or paths["weights_bin"]
         full_path = os.path.join(self.script_dir, bin_path)
@@ -371,9 +376,57 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         """Reset instruction ID counter for the next capture."""
         self._inst_id = 0
 
+
     def get_arg_max_index(self) -> int:
         """Get the arg max index from the Unified Engine"""
         return self.read_reg32(UE_ARGMAX_INDEX)
+
+    def sample_next_token(self, prev_tokens: list[int]) -> int:
+        """Read full logits from LOGITS_DRAM and sample the next token using the
+        engine's configured ``temperature`` / ``top_k`` / ``top_p`` /
+        ``repetition_penalty``. Greedy fast path (UE_ARGMAX_INDEX) is used when
+        ``temperature == 0`` — caller is expected to dispatch.
+
+        prev_tokens: list of token ids already in the sequence (prompt + decoded).
+                     Used by repetition penalty to down-weight repeated tokens.
+        """
+        vocab = self.EMBEDDING_ELEMENTS
+        bpe = self.bytes_per_element
+        # DMA logits row to host. ~304 KB for Qwen3 vocab; negligible vs decode latency.
+        buf = torch.empty(vocab, dtype=torch.bfloat16)
+        self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
+        logits = buf.float()
+        # Repetition penalty (HF-style): for tokens already seen, divide positive
+        # logits by penalty, multiply negative logits by penalty.
+        rep_pen = float(getattr(self, "repetition_penalty", 1.0))
+        if rep_pen != 1.0 and prev_tokens:
+            seen = torch.tensor(list(set(prev_tokens)), dtype=torch.long)
+            v = logits[seen]
+            logits[seen] = torch.where(v > 0, v / rep_pen, v * rep_pen)
+        # Temperature
+        temp = float(getattr(self, "temperature", 1.0))
+        if temp <= 0:
+            return int(logits.argmax().item())
+        logits = logits / temp
+        # Top-k
+        top_k = int(getattr(self, "top_k", 0) or 0)
+        if top_k > 0 and top_k < vocab:
+            kth = torch.topk(logits, top_k).values[-1]
+            logits[logits < kth] = float("-inf")
+        # Top-p (nucleus)
+        top_p = float(getattr(self, "top_p", 1.0))
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cumprob = torch.cumsum(probs, dim=-1)
+            # mask tokens whose cumulative prob > top_p (keep at least 1)
+            keep = cumprob <= top_p
+            keep[0] = True
+            drop_idx = sorted_idx[~keep]
+            logits[drop_idx] = float("-inf")
+        probs = torch.softmax(logits, dim=-1)
+        token_id = int(torch.multinomial(probs, num_samples=1).item())
+        return token_id
 
     def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
         """Return (len(token_ids), vector_length) bfloat16 tensor from self.embedding_weight (no scaling)."""
@@ -382,6 +435,120 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         valid = tid_t < self.embedding_weight.shape[0]
         out[valid] = self.embedding_weight[tid_t[valid]]
         return out
+
+    def _load_last_layer_bf16(self) -> None:
+        """Load the last layer's 7 matmul weights as bf16 from the HF model and
+        DMA them to params DRAM. The prefill+decoder emit below routes layer
+        L=LAYER_SIZE-1 matmuls to these bf16 addresses via the bf16 matmul path,
+        eliminating the INT4 quantization noise that's amplified by L27's
+        extreme RMSNorm gammas (max=153 vs ~1 elsewhere) — which otherwise
+        cascades into long-context "the the the..." / "and and and..." filler
+        token lock-in past ~1500 decoded tokens.
+
+        ~100 MB of params DRAM (50 M params × 2 bytes bf16). Disable via env
+        ``QWEN3_L27_BF16=0`` if DRAM is constrained.
+        """
+        self._last_layer_bf16_addrs: dict[str, int] = {}
+        if os.environ.get("QWEN3_L27_BF16", "1") in ("0", "false", "no"):
+            print(f"  QWEN3_L27_BF16=0 → keeping L{self.LAYER_SIZE-1} as INT4 (long-context output may degrade).")
+            return
+        import time as _time
+        print(f"  Loading HF model L{self.LAYER_SIZE-1} weights as bf16 (mitigates INT4 amplification) ...")
+        _t0 = _time.perf_counter()
+        hf_model, _ = _ensure_hf_model(self.script_dir, self._cfg)
+        layer = hf_model.model.layers[self.LAYER_SIZE - 1]
+        weights = {
+            "q":    layer.self_attn.q_proj.weight.detach().cpu().to(torch.bfloat16).contiguous(),
+            "k":    layer.self_attn.k_proj.weight.detach().cpu().to(torch.bfloat16).contiguous(),
+            "v":    layer.self_attn.v_proj.weight.detach().cpu().to(torch.bfloat16).contiguous(),
+            "o":    layer.self_attn.o_proj.weight.detach().cpu().to(torch.bfloat16).contiguous(),
+            "gate": layer.mlp.gate_proj.weight.detach().cpu().to(torch.bfloat16).contiguous(),
+            "up":   layer.mlp.up_proj.weight.detach().cpu().to(torch.bfloat16).contiguous(),
+            "down": layer.mlp.down_proj.weight.detach().cpu().to(torch.bfloat16).contiguous(),
+        }
+        total_bytes = 0
+        for name, w in weights.items():
+            sz = w.numel() * 2  # bf16
+            addr = self.allocate_params_dram(sz)
+            raw = w.view(torch.uint8).numpy().tobytes()
+            self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
+            self._last_layer_bf16_addrs[name] = addr
+            total_bytes += sz
+        # Free the HF model now that we've extracted what we need.
+        del hf_model
+        print(f"  bf16 L{self.LAYER_SIZE-1} weights DMA'd: {total_bytes / 1024 / 1024:.1f} MB "
+              f"in {_time.perf_counter() - _t0:.1f}s")
+
+    def _matmul_b_kwargs(self, layer_idx: int, proj: str) -> dict:
+        """Return the matmat_mul_core B/scale/quant kwargs for a layer projection.
+        Routes the last layer (L=LAYER_SIZE-1) through bf16 when QWEN3_L27_BF16
+        is enabled and `_maybe_load_last_layer_bf16` has populated the addrs;
+        all other layers go through the standard INT4 path.
+
+        proj is one of: 'q', 'k', 'v', 'o', 'gate', 'up', 'down'.
+        """
+        if (layer_idx == self.LAYER_SIZE - 1
+                and self._last_layer_bf16_addrs
+                and proj in self._last_layer_bf16_addrs):
+            return {
+                "B_DRAM_ADDR":   self._last_layer_bf16_addrs[proj],
+                "is_B_quantized": False,
+            }
+        # Default INT4 path
+        proj_to_attrs = {
+            "q":    ("DRAM_ADDR_LAYER0_Q_PROJ_QUANT",     "DRAM_ADDR_LAYER0_Q_PROJ_SCALE"),
+            "k":    ("DRAM_ADDR_LAYER0_K_PROJ_QUANT",     "DRAM_ADDR_LAYER0_K_PROJ_SCALE"),
+            "v":    ("DRAM_ADDR_LAYER0_V_PROJ_QUANT",     "DRAM_ADDR_LAYER0_V_PROJ_SCALE"),
+            "o":    ("DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT",  "DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE"),
+            "gate": ("DRAM_ADDR_LAYER0_MLP_GATE_QUANT",   "DRAM_ADDR_LAYER0_MLP_GATE_SCALE"),
+            "up":   ("DRAM_ADDR_LAYER0_MLP_UP_QUANT",     "DRAM_ADDR_LAYER0_MLP_UP_SCALE"),
+            "down": ("DRAM_ADDR_LAYER0_MLP_DOWN_QUANT",   "DRAM_ADDR_LAYER0_MLP_DOWN_SCALE"),
+        }
+        quant_attr, scale_attr = proj_to_attrs[proj]
+        LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
+        layer_off = layer_idx * LAYER_WEIGHT_SIZE
+        return {
+            "B_DRAM_ADDR":     getattr(self, quant_attr) + layer_off,
+            "is_B_quantized":  True,
+            "data_type":       TYPE.IF4,
+            "SCALE_DRAM_ADDR": getattr(self, scale_attr) + layer_off,
+        }
+
+    def _decode_matmul(self, layer_idx: int, proj: str, *,
+                       M: int, K: int, N: int,
+                       A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                       gpr_M_reg: int = None, **extras) -> int:
+        """Decode-path matmul dispatcher (Trick 5 in build_API_for_FPGAcomponents.md).
+
+        IF4 path → quantized_matmat_core (fused, ~2× at M=1) — BUT only when
+        ``K <= SCALE_BRAM_ELEMENTS`` (=8192). For K > 8192 the kernel's chunk
+        math collapses to ``SCALE_BRAM // K = 0`` → ``N_chunk = 0`` →
+        ``chunk_ranges(N, 0)`` infinite loop. Fall back to ``matmat_mul_core``
+        unfused for those (Qwen3-1.7B never trips this — max K = 6144 — but
+        the guard is here for safety/portability).
+
+        bf16 path (L27 mitigation) → matmat_mul_core(is_B_quantized=False).
+        Returns total FLOPS for accounting.
+        """
+        b = self._matmul_b_kwargs(layer_idx, proj)
+        if b.get("is_B_quantized") and K <= SCALE_BRAM_ELEMENTS:
+            # Fused: kernel streams IF4 + scales through the dot-product pipeline.
+            # M is static (M=1 in decode); quantized_matmat_core has no PBI variant.
+            self.quantized_matmat_core(
+                M=M, K=K, N=N,
+                A_DRAM_ADDR=A_DRAM_ADDR,
+                B_DRAM_ADDR=b["B_DRAM_ADDR"],
+                OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                SCALE_DRAM_ADDR=b["SCALE_DRAM_ADDR"],
+                data_type=b["data_type"],
+                **extras)
+            return 2 * M * K * N
+        # Unfused (bf16 path or K > SCALE_BRAM_ELEMENTS): uses PBI gpr_M_reg.
+        return self.matmat_mul_core(
+            M=M, K=K, N=N,
+            A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            gpr_M_reg=gpr_M_reg,
+            **b, **extras) or 0
 
     def _load_rope_host(self, rope_theta: float | None = None) -> None:
         """Generate per-head RoPE (cos, cos, -sin, sin) on host and write to DRAM.
@@ -485,6 +652,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             nl_offset += self.weight_defs[sz_key]
 
         self._load_rope_host()
+
+        # Load last-layer matmul weights as bf16 to mitigate INT4 amplification
+        # at L27's extreme RMSNorm gammas (default-on; QWEN3_L27_BF16=0 to opt out).
+        # NOTE: the bin's baked addresses + matmul instruction shape depend on
+        # this toggle, so delete the cached *_instruction.bin if you flip it.
+        self._load_last_layer_bf16()
+
         print(f"    Allocate weights end at DRAM address: 0x{self.get_params_dram_addr():X}, usage: {self.get_params_dram_usage()} bytes")
         print("Tokenizer loaded successfully.")
 
@@ -511,8 +685,11 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         zero_add = torch.zeros(seq_len * self.head_dim * bpe, dtype=torch.bfloat16)
         self.ZERO_DRAM_ADDR = self.allocate_tensor_dram(seq_len * self.head_dim * bpe)
         self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
-        # 64×64 identity for decoder_attention_core / decoder_group_attention_core
-        # (legacy and PBI paths still read this slot for their I @ V^T tile).
+        # Single UE_VECTOR_SIZE × UE_VECTOR_SIZE identity matrix reused by every
+        # attention/transpose kernel that needs one (Trick 4):
+        #   - flash_attention_core (forwarded to bf16_transpose_core_pbi for V^T)
+        #   - decoder_group_attention_core (qwen3 decode)
+        # Passed as IDENTITY_DRAM_ADDR= at every call site; bin bakes one address.
         self.IDENTITY_DRAM_ADDR = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe)
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
         # Flash-attention bucket-dispatcher scratch buffer. Sized for the
@@ -568,7 +745,12 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         kv_cache_total = self.LAYER_SIZE * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(kv_cache_total)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(kv_cache_total)
-        zero_kv = torch.zeros(kv_cache_total, dtype=torch.bfloat16)
+        # kv_cache_total is in BYTES (bpe=2 baked in). torch.zeros(N, bf16) treats N
+        # as element count, so we want N = kv_cache_total // 2 to get the right
+        # numel × 2 = kv_cache_total bytes. Without the //2 the DMA wrote 2× the
+        # reserved slot, overflowing 224 MB past K_ROPE end into instruction region
+        # (harmless because bin load overwrites it, but sloppy).
+        zero_kv = torch.zeros(kv_cache_total // 2, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_kv)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_kv)
 
@@ -605,10 +787,10 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
     def _emit_pbi_scatter_per_token(self, *, read_base, read_stride_bytes,
                                     write_specs, sram_byte_addr, element_count,
-                                    gf_seq_len, template_seq_len):
+                                    gpr_seq_len, template_seq_len):
         """Emit one PBI runtime loop that staged-copies one ``element_count``-row
         per outer iteration from ``read_base`` to each (base, stride) in
-        ``write_specs``. The outer trip count is taken from GPR ``gf_seq_len`` so
+        ``write_specs``. The outer trip count is taken from GPR ``gpr_seq_len`` so
         the body executes exactly ``actual_seq_len`` times at runtime — making
         the captured bin truly seq_len-agnostic up to ``MAX_CONTEXT_SIZE``.
 
@@ -639,7 +821,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         t_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(t_reg, 0)
 
-        self.loop_start(loop_cnt=template_seq_len, gf_loop_cnt=gf_seq_len)
+        self.loop_start(loop_cnt=template_seq_len, gpr_loop_cnt=gpr_seq_len)
         # Read DRAM addr = read_base + t * read_stride_bytes
         self.generate_instruction_reg_mul_imm(
             self.TMP_REG, t_reg, ue_35bit_addr_shifter(read_stride_bytes))
@@ -674,23 +856,23 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
         Caller wraps this in start_capture()/stop_capture(). The emitted program
         ends with a halt so it can be jumped to via a runtime preamble that
-        primes gf_seq_len / gf_q_seq_len / gf_bucket_idx GPRs.
+        primes gpr_seq_len / gpr_q_seq_len / gpr_bucket_idx GPRs.
 
         ``seq_len`` here is a **compile-time template** used only for FLOPS
         bookkeeping and as the static ``M=`` arg to PBI ops (overridden at
-        runtime by ``gf_M_reg``). K/V/Q scatter, FLASH_K/V duplication, and the
+        runtime by ``gpr_M_reg``). K/V/Q scatter, FLASH_K/V duplication, and the
         FLASH_OUTPUT assembly are emitted as **PBI runtime loops** keyed off
-        ``gf_seq_len``, so the bin is truly seq_len-agnostic up to
+        ``gpr_seq_len``, so the bin is truly seq_len-agnostic up to
         ``MAX_CONTEXT_SIZE`` regardless of the template value.
 
         All bulk ops (rms_norm, matmat, rope, eltwise) are PBI-dispatched via
-        gf_M_reg=self.gf_seq_len. Per-token outer loops for matmul/norm/rope
-        run gf_seq_len iterations at runtime regardless of the template value.
-        Flash attention dispatches on gf_bucket_idx.
+        gpr_M_reg=self.gpr_seq_len. Per-token outer loops for matmul/norm/rope
+        run gpr_seq_len iterations at runtime regardless of the template value.
+        Flash attention dispatches on gpr_bucket_idx.
         """
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
-        # 1-based bucket selector at the static template; runtime overrides via gf_bucket_idx.
+        # 1-based bucket selector at the static template; runtime overrides via gpr_bucket_idx.
         num_buckets_prefill = max(1, aligned_seq_len // UE_VECTOR_SIZE)
 
         ahd  = self.actual_head_dim   # 128
@@ -721,61 +903,58 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     write_specs=[(self.LAYER0_INPUT_DRAM, self.vector_length * bpe)],
                     sram_byte_addr=0x10000,
                     element_count=self.vector_length,
-                    gf_seq_len=self.gf_seq_len,
+                    gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
 
-            # Pre-norm (input_layernorm) — M=seq_len rows at runtime via gf_seq_len
+            # Pre-norm (input_layernorm) — M=seq_len rows at runtime via gpr_seq_len
             total_flops += (self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
-                              gf_M_reg=self.gf_seq_len) or 0)
+                              gpr_M_reg=self.gpr_seq_len) or 0)
 
             # Q, K, V projections — M=seq_len rows at runtime
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd * qpkv,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, gf_M_reg=self.gf_seq_len) or 0)
+                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                gpr_M_reg=self.gpr_seq_len, **self._matmul_b_kwargs(layer_idx, "q")) or 0)
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, gf_M_reg=self.gf_seq_len) or 0)
+                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                gpr_M_reg=self.gpr_seq_len, **self._matmul_b_kwargs(layer_idx, "k")) or 0)
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, gf_M_reg=self.gf_seq_len) or 0)
+                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
+                gpr_M_reg=self.gpr_seq_len, **self._matmul_b_kwargs(layer_idx, "v")) or 0)
 
             # QK RMSNorm per head — M = seq_len * nkvh and M = seq_len * nkvh * qpkv.
-            # Compute M for each into TMP_REG via reg_mul_imm(gf_seq_len, multiplier).
-            self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gf_seq_len, nkvh)
+            # Compute M for each into TMP_REG via reg_mul_imm(gpr_seq_len, multiplier).
+            self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, nkvh)
             total_flops += (self.rms_norm_core_dram(M=seq_len * nkvh, N=ahd, A_DRAM_ADDR=self.LAYER0_K_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off,
-                              gf_M_reg=self.TMP_REG) or 0)
-            self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gf_seq_len, nkvh * qpkv)
+                              gpr_M_reg=self.TMP_REG) or 0)
+            self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, nkvh * qpkv)
             total_flops += (self.rms_norm_core_dram(M=seq_len * nkvh * qpkv, N=ahd, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off,
-                              gf_M_reg=self.TMP_REG) or 0)
+                              gpr_M_reg=self.TMP_REG) or 0)
 
             # RoPE per head per token via rope_hf_core_dram_gqa:
             # K_NORM layout per token: nkvh groups sharing one cos/sin row.
             # Q_NORM layout per token: (nkvh*qpkv) groups sharing one cos/sin row.
-            # Runtime row count = gf_seq_len tokens.
+            # Runtime row count = gpr_seq_len tokens.
             total_flops += self.rope_hf_core_dram_gqa(
                 M=seq_len, group_size=nkvh, N=ahd,
                 input_dram_addr=self.LAYER0_K_NORM_DRAM,
                 output_dram_addr=self.LAYER0_K_NORM_DRAM,
                 cos_dram_addr=ROPE_WEIGHT_ADDR,
                 sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
-                gf_M_reg=self.gf_seq_len)
+                gpr_M_reg=self.gpr_seq_len)
             total_flops += self.rope_hf_core_dram_gqa(
                 M=seq_len, group_size=nkvh * qpkv, N=ahd,
                 input_dram_addr=self.LAYER0_Q_NORM_DRAM,
                 output_dram_addr=self.LAYER0_Q_NORM_DRAM,
                 cos_dram_addr=ROPE_WEIGHT_ADDR,
                 sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
-                gf_M_reg=self.gf_seq_len)
+                gpr_M_reg=self.gpr_seq_len)
 
             # Per-KV-head: scatter K/V to cache + flash buffers, scatter Q, then flash_attention.
-            # All per-token scatters are PBI runtime loops (gf_seq_len trips) — the bin is
+            # All per-token scatters are PBI runtime loops (gpr_seq_len trips) — the bin is
             # truly seq_len-agnostic up to MAX_CONTEXT_SIZE; no PREFILL_MAX_SEQ_LEN cap.
             for kv_h in range(nkvh):
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
@@ -795,7 +974,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     write_specs=k_write_specs,
                     sram_byte_addr=0x10000,
                     element_count=ahd,
-                    gf_seq_len=self.gf_seq_len,
+                    gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
 
@@ -809,7 +988,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     write_specs=v_write_specs,
                     sram_byte_addr=0x20000,
                     element_count=ahd,
-                    gf_seq_len=self.gf_seq_len,
+                    gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
 
@@ -821,13 +1000,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     write_specs=[(self.LAYER0_FLASH_Q_DRAM, qpkv * ahd * bpe)],
                     sram_byte_addr=0x30000,
                     element_count=qpkv * ahd,
-                    gf_seq_len=self.gf_seq_len,
+                    gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
 
                 # Flash attention for this KV head (head_dim=128, GQA group_size=2).
                 # Bucket dispatcher: bin contains num_buckets_prefill bodies (one per
-                # 64-token block of aligned Q seq), runtime gf_bucket_idx GPR selects.
+                # 64-token block of aligned Q seq), runtime gpr_bucket_idx GPR selects.
                 # The new flash kernel inlines V^T materialization via PBI matmul —
                 # no host-side identity DMA, so cache-hit replay is deterministic.
                 flash_result = self.flash_attention_core(
@@ -840,8 +1019,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-                    gf_bucket_idx=self.gf_bucket_idx,
+                    gpr_bucket_idx=self.gpr_bucket_idx,
                     num_buckets=num_buckets_prefill,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                 )
                 # PBI flash returns a per-bucket FLOPS list; pick the bucket the
                 # template targets for FLOPS bookkeeping.
@@ -858,60 +1038,54 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                                   hd * qpkv * bpe)],
                     sram_byte_addr=0x40000,
                     element_count=qpkv * ahd,
-                    gf_seq_len=self.gf_seq_len,
+                    gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
 
             # o_proj
             total_flops += (self.matmat_mul_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, gf_M_reg=self.gf_seq_len) or 0)
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                gpr_M_reg=self.gpr_seq_len, **self._matmul_b_kwargs(layer_idx, "o")) or 0)
 
             # Qwen3: no post-attention norm; add residual directly to o_proj output.
-            # PBI runtime loop (one row per iter, gf_seq_len trips) so seq_len > URAM-A capacity is safe.
+            # PBI runtime loop (one row per iter, gpr_seq_len trips) so seq_len > URAM-A capacity is safe.
             self.eltwise_core_dram(
                 M=seq_len, N=self.vector_length,
                 dram_a=self.LAYER0_INPUT_DRAM,
                 dram_b=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 dram_out=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                 mode=UE_MODE.ELTWISE_ADD,
-                gf_M_reg=self.gf_seq_len,
+                gpr_M_reg=self.gpr_seq_len,
             )
 
             # Qwen3: post_attention_layernorm IS the pre-FFN norm
             total_flops += (self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
-                              gf_M_reg=self.gf_seq_len) or 0)
+                              gpr_M_reg=self.gpr_seq_len) or 0)
 
             # MLP: gate_proj with SiLU, up_proj, gate x up element-wise, down_proj
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, silu_enable=True,
-                gf_M_reg=self.gf_seq_len) or 0)
+                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                silu_enable=True, gpr_M_reg=self.gpr_seq_len,
+                **self._matmul_b_kwargs(layer_idx, "gate")) or 0)
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
-                gf_M_reg=self.gf_seq_len) or 0)
+                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                gpr_M_reg=self.gpr_seq_len, **self._matmul_b_kwargs(layer_idx, "up")) or 0)
 
-            # gate × up: PBI runtime loop, one row of mlp_elements per iter (gf_seq_len trips).
+            # gate × up: PBI runtime loop, one row of mlp_elements per iter (gpr_seq_len trips).
             self.eltwise_core_dram(
                 M=seq_len, N=self.mlp_elements,
                 dram_a=self.LAYER0_MLP_GATE_DRAM,
                 dram_b=self.LAYER0_MLP_UP_DRAM,
                 dram_out=self.LAYER0_MLP_MULT_DRAM,
                 mode=UE_MODE.ELTWISE_MUL,
-                gf_M_reg=self.gf_seq_len,
+                gpr_M_reg=self.gpr_seq_len,
             )
 
             # down_proj: K=6144 ≤ SCALE_BRAM_ELEMENTS=8192, single call
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
-                gf_M_reg=self.gf_seq_len) or 0)
+                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                gpr_M_reg=self.gpr_seq_len, **self._matmul_b_kwargs(layer_idx, "down")) or 0)
 
             # Qwen3: no post-FFN norm; add residual directly to down_proj output
             # Post-MLP residual: layer_output = POST_ATTN_RESIDUAL + MLP_DOWN. PBI runtime loop.
@@ -921,7 +1095,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 dram_b=self.LAYER0_MLP_DOWN_DRAM,
                 dram_out=self.LAYER0_OUTPUT_DRAM,
                 mode=UE_MODE.ELTWISE_ADD,
-                gf_M_reg=self.gf_seq_len,
+                gpr_M_reg=self.gpr_seq_len,
             )
 
         # Per-bucket halt so each bucket-program is independently executable.
@@ -933,7 +1107,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         """Run prefill via dynamic-PBI runtime preamble.
 
         Emits a tiny preamble program at ``preamble_addr`` that primes the three
-        runtime GPRs (gf_seq_len, gf_q_seq_len, gf_bucket_idx) and then
+        runtime GPRs (gpr_seq_len, gpr_q_seq_len, gpr_bucket_idx) and then
         unconditional-jumps into the cached prefill program. Single cached bin
         handles any actual_seq_len ≤ PREFILL_MAX_SEQ_LEN — no padding needed.
 
@@ -965,7 +1139,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         bucket_idx = max(1, aligned_seq_len // UE_VECTOR_SIZE)
 
         # Zero the intermediate buffers that the prefill scatter loop reads at
-        # ``template_seq_len`` rows. With ``gf_M_reg=gf_seq_len``, ops compute only
+        # ``template_seq_len`` rows. With ``gpr_M_reg=gpr_seq_len``, ops compute only
         # ``actual_seq_len`` rows but the static-unrolled scatter still iterates
         # ``template_seq_len`` rows, so slots [actual_seq_len..template_seq_len) would
         # otherwise pick up stale DRAM (potentially NaN bits from prior runs) and
@@ -995,9 +1169,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         # Same slot is reused across calls (overwritten each time).
         self.clear_inst_id()
         self.start_capture()
-        self.generate_instruction_add_set(self.gf_seq_len,    actual_seq_len)
-        self.generate_instruction_add_set(self.gf_q_seq_len,  q_seq_len)
-        self.generate_instruction_add_set(self.gf_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gpr_seq_len,    actual_seq_len)
+        self.generate_instruction_add_set(self.gpr_q_seq_len,  q_seq_len)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -1011,23 +1185,23 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
         Caller wraps this in start_capture()/stop_capture(). The emitted program
         ends with a halt so it can be jumped to via a runtime preamble that
-        primes gf_bucket_idx (1-based KV context bucket). gf_seq_len is
+        primes gpr_bucket_idx (1-based KV context bucket). gpr_seq_len is
         primed once by the prefill preamble and auto-incremented at the end
         of every decoder execution via ADD_INC.
 
         Address math: K/V cache write addresses are computed at runtime as
-        ``base + gf_seq_len * (ahd*bpe)`` via reg_mul_imm + add_imm into TMP_REG,
+        ``base + gpr_seq_len * (ahd*bpe)`` via reg_mul_imm + add_imm into TMP_REG,
         then passed as ``general_reg_src=TMP_REG`` to the scatter store.
 
         Decoder attention uses the PBI-bucketed
         ``decoder_group_attention_core`` (one body per KV head, processing all
         ``qpkv`` Q heads at once), with bucket selection driven by
-        ``gf_bucket_idx``. Each bucket body covers exactly the active KV
+        ``gpr_bucket_idx``. Each bucket body covers exactly the active KV
         range — no stale-cache positions enter the softmax, eliminating the
         NaN cascade the legacy static-seq_len kernel produced.
 
-        All bulk ops (matmul, rms_norm) use ``gf_M_reg`` GPRs (gf_one for M=1,
-        gf_nkvh for M=nkvh, gf_nkvh_qpkv for M=nkvh*qpkv).
+        All bulk ops (matmul, rms_norm) use ``gpr_M_reg`` GPRs (gpr_one for M=1,
+        gpr_nkvh for M=nkvh, gpr_nkvh_qpkv for M=nkvh*qpkv).
         """
         ahd  = self.actual_head_dim   # 128
         nkvh = self.num_kv_heads      # 8
@@ -1045,18 +1219,18 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         # decoder kernel internally allocates registers per bucket body (bucket_scratch,
         # m_reg, transpose's 4 + nested loop counters), so we have a tight budget.
         # Only two locals survive across the layer loop:
-        #   gf_one          (5) — gf_M_reg for M=1 matmul/norm ops
-        #   gf_rope_cos_abs (6) — absolute cos-base addr for this step's rope; reused
+        #   gpr_one          (5) — gpr_M_reg for M=1 matmul/norm ops
+        #   gpr_rope_cos_abs (6) — absolute cos-base addr for this step's rope; reused
         #                         across all rope_hf_core calls in all layers
         self._isa_reg_counter = 5
-        gf_one          = self.alloc_isa_reg()
-        gf_rope_cos_abs = self.alloc_isa_reg()
-        self.generate_instruction_add_set(gf_one, 1)
-        # gf_rope_cos_abs = ROPE_LOCAL_BASE + gf_seq_len * rope_row_bytes (word address)
+        gpr_one          = self.alloc_isa_reg()
+        gpr_rope_cos_abs = self.alloc_isa_reg()
+        self.generate_instruction_add_set(gpr_one, 1)
+        # gpr_rope_cos_abs = ROPE_LOCAL_BASE + gpr_seq_len * rope_row_bytes (word address)
         self.generate_instruction_reg_mul_imm(
-            gf_rope_cos_abs, self.gf_seq_len, ue_35bit_addr_shifter(rope_row_bytes))
+            gpr_rope_cos_abs, self.gpr_seq_len, ue_35bit_addr_shifter(rope_row_bytes))
         self.generate_instruction_add_imm(
-            gf_rope_cos_abs, ue_35bit_addr_shifter(ROPE_WEIGHT_ADDR), gf_rope_cos_abs)
+            gpr_rope_cos_abs, ue_35bit_addr_shifter(ROPE_WEIGHT_ADDR), gpr_rope_cos_abs)
 
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
@@ -1066,52 +1240,52 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
 
-            # Pre-norm — M=1 via gf_one
+            # Pre-norm — M=1 via gpr_one
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
-                          gf_M_reg=gf_one) or 0)
+                          gpr_M_reg=gpr_one) or 0)
 
-            # Q, K, V projections
-            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=hd * qpkv,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, gf_M_reg=gf_one) or 0)
-            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=hd,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, gf_M_reg=gf_one) or 0)
-            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=hd,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, gf_M_reg=gf_one) or 0)
+            # Q, K, V projections — fused for IF4 layers, unfused for L27 bf16 (see Trick 5).
+            total_flops += self._decode_matmul(layer_idx, "q",
+                M=1, K=self.vector_length, N=hd * qpkv,
+                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                gpr_M_reg=gpr_one)
+            total_flops += self._decode_matmul(layer_idx, "k",
+                M=1, K=self.vector_length, N=hd,
+                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                gpr_M_reg=gpr_one)
+            total_flops += self._decode_matmul(layer_idx, "v",
+                M=1, K=self.vector_length, N=hd,
+                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
+                gpr_M_reg=gpr_one)
 
             # QK RMSNorm: M is a compile-time constant (nkvh for K, nkvh*qpkv for Q).
-            # Pass static M; no gf_M_reg needed.
+            # Pass static M; no gpr_M_reg needed.
             total_flops += (self.rms_norm_core_dram(M=nkvh, N=ahd, A_DRAM_ADDR=self.LAYER0_K_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off) or 0)
             total_flops += (self.rms_norm_core_dram(M=nkvh * qpkv, N=ahd, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off) or 0)
 
             # RoPE per head — use base-class rope_hf_core with gr_weight_dram (single GPR
-            # holding absolute cos-base address). gf_rope_cos_abs was primed once at the
-            # start of the bin (= ROPE_LOCAL + gf_seq_len * rope_row_bytes).
+            # holding absolute cos-base address). gpr_rope_cos_abs was primed once at the
+            # start of the bin (= ROPE_LOCAL + gpr_seq_len * rope_row_bytes).
             for kv_h in range(nkvh):
                 total_flops += user_dma_core.UnifiedEngine.rope_hf_core(self,
                     N=ahd,
                     input_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
                     cos_dram_addr=ROPE_WEIGHT_ADDR,
-                    gr_weight_dram=gf_rope_cos_abs)
+                    gr_weight_dram=gpr_rope_cos_abs)
             for q_h in range(nkvh * qpkv):
                 total_flops += user_dma_core.UnifiedEngine.rope_hf_core(self,
                     N=ahd,
                     input_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
                     cos_dram_addr=ROPE_WEIGHT_ADDR,
-                    gr_weight_dram=gf_rope_cos_abs)
+                    gr_weight_dram=gpr_rope_cos_abs)
 
             # Per-KV-head: store new K/V to cache at decode position, then per-Q-head attention.
-            # K cache write addr = k_cache_base + gf_seq_len * (ahd*bpe); same for V.
+            # K cache write addr = k_cache_base + gpr_seq_len * (ahd*bpe); same for V.
             for kv_h in range(nkvh):
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
                                 + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
@@ -1123,7 +1297,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 # K cache write
                 self.accelerator_memory_to_sram(self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
                 self.generate_instruction_reg_mul_imm(
-                    self.TMP_REG, self.gf_seq_len, ue_35bit_addr_shifter(ahd * bpe))
+                    self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(ahd * bpe))
                 self.generate_instruction_add_imm(
                     self.TMP_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
                 self.sram_to_accelerator_memory(
@@ -1133,7 +1307,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 # V cache write
                 self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
                 self.generate_instruction_reg_mul_imm(
-                    self.TMP_REG, self.gf_seq_len, ue_35bit_addr_shifter(ahd * bpe))
+                    self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(ahd * bpe))
                 self.generate_instruction_add_imm(
                     self.TMP_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
                 self.sram_to_accelerator_memory(
@@ -1148,7 +1322,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
 
                 # PBI-bucketed group attention: one call processes all qpkv Q heads for
-                # this KV head. gf_bucket_idx selects the bucket body whose seq_len
+                # this KV head. gpr_bucket_idx selects the bucket body whose seq_len
                 # exactly covers the current KV range — uninitialized cache slots are
                 # never read, eliminating the NaN cascade the legacy kernel had.
                 attn_result = self.decoder_group_attention_core(
@@ -1162,17 +1336,17 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    gf_bucket_idx=self.gf_bucket_idx,
+                    gpr_bucket_idx=self.gpr_bucket_idx,
                     num_buckets=num_buckets_decoder,
                 )
                 total_flops += (attn_result[-1]
                                 if isinstance(attn_result, (list, tuple)) else (attn_result or 0))
 
             # o_proj
-            total_flops += (self.matmat_mul_core(M=1, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, gf_M_reg=gf_one) or 0)
+            total_flops += self._decode_matmul(layer_idx, "o",
+                M=1, K=hd * qpkv, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                gpr_M_reg=gpr_one)
 
             # Qwen3: no post-attention norm; residual direct on o_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
@@ -1183,18 +1357,17 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # Qwen3: post_attention_layernorm IS the pre-FFN norm
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
-                          gf_M_reg=gf_one) or 0)
+                          gpr_M_reg=gpr_one) or 0)
 
             # MLP: SwiGLU
-            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, silu_enable=True,
-                gf_M_reg=gf_one) or 0)
-            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, gf_M_reg=gf_one) or 0)
+            total_flops += self._decode_matmul(layer_idx, "gate",
+                M=1, K=self.vector_length, N=self.mlp_elements,
+                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                silu_enable=True, gpr_M_reg=gpr_one)
+            total_flops += self._decode_matmul(layer_idx, "up",
+                M=1, K=self.vector_length, N=self.mlp_elements,
+                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                gpr_M_reg=gpr_one)
 
             # gate x up (M=1: mlp_elements fits in SRAM in one shot)
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
@@ -1203,10 +1376,10 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
             # down_proj: K=6144 ≤ SCALE_BRAM_ELEMENTS=8192, single call
-            total_flops += (self.matmat_mul_core(M=1, K=self.mlp_elements, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, gf_M_reg=gf_one) or 0)
+            total_flops += self._decode_matmul(layer_idx, "down",
+                M=1, K=self.mlp_elements, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                gpr_M_reg=gpr_one)
 
             # Qwen3: no post-FFN norm; residual direct on down_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
@@ -1217,16 +1390,25 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA,
-                gf_M_reg=gf_one) or 0)
+                gpr_M_reg=gpr_one) or 0)
+            # LM head: unfused + write_back_disable=True when greedy
+            # (Trick 5 in build_API_for_FPGAcomponents.md). For greedy decode
+            # the HW argmax register is populated as a pipeline side-effect,
+            # so get_arg_max_index() works without the ~304 KB DRAM writeback.
+            # For sampling (temperature > 0) writeback is required so the host
+            # can DMA logits back for top-p / top-k / multinomial. Compile-time
+            # gate reads ue.temperature, which main() sets before this method.
+            _greedy_lm_head = float(getattr(self, "temperature", 0.0)) <= 0
             total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, gf_M_reg=gf_one) or 0)
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, gpr_M_reg=gpr_one,
+                write_back_disable=_greedy_lm_head) or 0)
 
-        # Advance gf_seq_len for next decode step (matches gemma3 convention).
-        # Host preamble primes only gf_bucket_idx between steps; gf_seq_len carries
+        # Advance gpr_seq_len for next decode step (matches gemma3 convention).
+        # Host preamble primes only gpr_bucket_idx between steps; gpr_seq_len carries
         # across via this in-bin increment.
-        self.generate_instruction_add_inc(self.gf_seq_len)
+        self.generate_instruction_add_inc(self.gpr_seq_len)
 
         # End-of-program halt so the runtime preamble's JUMP_ABS returns control after execute.
         self.generate_instruction_halt()
@@ -1238,8 +1420,8 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         ``qwen3_1.7b_instruction.bin`` + matching ``.json`` meta to disk.
 
         Both programs are **seq_len-agnostic**: matmul/norm/rope row counts come
-        from gf_seq_len / gf_q_seq_len GPRs, and flash attention dispatches on
-        gf_bucket_idx — all primed by the runtime preamble in run_prefill /
+        from gpr_seq_len / gpr_q_seq_len GPRs, and flash attention dispatches on
+        gpr_bucket_idx — all primed by the runtime preamble in run_prefill /
         run_decoder per call. The cached bin therefore works across any prompt
         length ≤ PREFILL_MAX_SEQ_LEN and any decode position < MAX_CONTEXT_SIZE.
 
@@ -1266,19 +1448,22 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         bin_path  = os.path.join(self.script_dir, bin_rel)
         meta_path = os.path.join(self.script_dir, meta_rel)
 
-        # Always run the full compile, even if the bin is cached, because
-        # ``flash_attention_core_pbi`` and ``bf16_transpose_core_pbi`` do
-        # **host-side identity-matrix DMA writes** during compile and the
-        # captured bin references those exact DRAM addresses. Skipping the
-        # compile would leave those addresses holding whatever any other
-        # script wrote to them since the bin was generated (e.g. another
-        # model's weights), which produces NaN attention and all-`!` decode.
-        # The disk bin is still re-used as a cache for the *bytes* — we
-        # skip the bin-write step if the existing file matches.
+        # Cache short-circuit: if bin + meta already exist, skip the capture work
+        # entirely. The identity-matrix DMAs (the only host-DMA side effect that
+        # used to require a re-compile) now happen in weight_init at fixed
+        # addresses (_setup_identity_dma); the bin's baked references point at
+        # those addresses, and weight_init runs every invocation. So just
+        # loading the bin off disk is sufficient — no need to re-emit thousands
+        # of ISA instructions.
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
+        if bin_cached:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
+            return meta
 
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
-        # Template seq_len: drives static M= args (overridden at runtime by gf_M_reg),
+        # Template seq_len: drives static M= args (overridden at runtime by gpr_M_reg),
         # FLOPs estimate, and unrolled scatter-loop iteration count. Set to
         # PREFILL_MAX_SEQ_LEN so the bin can handle any actual_seq_len up to that.
         prefill_template_seq_len = self.PREFILL_MAX_SEQ_LEN
@@ -1334,15 +1519,12 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             "decoder_program_size":         decoder_program_size,
             "decoder_total_flops":          decoder_flops,
         }
-        if bin_cached:
-            print(f"Compile re-run for identity-matrix DMAs; bin already on disk at {bin_path}.")
-        else:
-            with open(bin_path, "wb") as f:
-                f.write(all_bytes)
-            with open(meta_path, "w") as f:
-                json.dump(meta, f, indent=2)
-            print(f"Instruction bin written: {bin_path} ({len(all_bytes)} bytes; "
-                  f"prefill {prefill_program_size} B + decoder {decoder_program_size} B)")
+        with open(bin_path, "wb") as f:
+            f.write(all_bytes)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"Instruction bin written: {bin_path} ({len(all_bytes)} bytes; "
+              f"prefill {prefill_program_size} B + decoder {decoder_program_size} B)")
         self.clear_capture_buffer()
         return meta
 
@@ -1351,8 +1533,8 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         """Run decode loop via dynamic-PBI runtime preamble.
 
         Each step emits a small preamble at ``preamble_addr`` that primes
-        gf_seq_len (current decode position, ==previous token count) and
-        gf_bucket_idx (1-based KV context bucket), then jump_abs's into the
+        gpr_seq_len (current decode position, ==previous token count) and
+        gpr_bucket_idx (1-based KV context bucket), then jump_abs's into the
         cached decoder program. Same preamble slot is overwritten per token.
 
         Args:
@@ -1394,11 +1576,11 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             bias_host[0, :new_ctx_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
 
-            # Decode preamble: prime gf_bucket_idx only; gf_seq_len is carried over
+            # Decode preamble: prime gpr_bucket_idx only; gpr_seq_len is carried over
             # from prefill (or previous decode step) via the in-bin ADD_INC.
             self.clear_inst_id()
             self.start_capture()
-            self.generate_instruction_add_set(self.gf_bucket_idx, bucket_idx)
+            self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
             self.write_captured_instructions_to_dram(preamble_addr)
@@ -1406,7 +1588,34 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(10.0)
-            token_id = self.get_arg_max_index()
+            # Greedy fast path uses the HW argmax register; sampling reads logits.
+            # _generated_tokens is set by main() for sampling/repetition penalty;
+            # default to [] for run_from_bin where main() doesn't run.
+            if not hasattr(self, "_generated_tokens"):
+                self._generated_tokens = []
+            # Optional per-step logit-magnitude diagnostic. Detects numerical
+            # overflow in the decode pipeline: if logits flip from finite (~20)
+            # to INF/NaN at step T, the K/V cache got poisoned at T and every
+            # following step propagates NaN. Gated on self._diag_logit_mag set
+            # by main() (CLI --diag-logit-mag); requires a 304 KB C2H DMA per
+            # step (~1 ms vs ~270 ms decode latency).
+            if getattr(self, "_diag_logit_mag", False):
+                vocab = self.EMBEDDING_ELEMENTS
+                bpe = self.bytes_per_element
+                _buf = torch.empty(vocab, dtype=torch.bfloat16)
+                self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, _buf, vocab * bpe)
+                _lg = _buf.float()
+                _abs = _lg.abs()
+                _step = len(self._generated_tokens)
+                if torch.isnan(_lg).any() or torch.isinf(_lg).any():
+                    print(f"\n[diag] step={_step} LOGITS HIT NaN/INF — argmax={int(_lg.argmax().item())}", flush=True)
+                else:
+                    print(f"[diag] step={_step} max|logit|={_abs.max().item():.2f} top1={int(_lg.argmax().item())}", flush=True)
+            if float(getattr(self, "temperature", 0.0)) > 0:
+                token_id = self.sample_next_token(self._generated_tokens)
+            else:
+                token_id = self.get_arg_max_index()
+            self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             self.seq_len += 1
@@ -1428,6 +1637,22 @@ def main():
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
                         help='Clock cycle time in nanoseconds (default: 5.62ns ≈ peak 22.8 GFLOPS)')
+    # Sampling: temperature=0 is the existing greedy fast path (UE_ARGMAX_INDEX).
+    # Any value > 0 enables logit-readback sampling on host with top-k/top-p/rep-penalty.
+    parser.add_argument('--temperature', type=float, default=0.0,
+                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling)')
+    parser.add_argument('--top-k', type=int, default=0,
+                        help='Top-k filter (0=disabled). Active only when --temperature > 0.')
+    parser.add_argument('--top-p', type=float, default=1.0,
+                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p.')
+    parser.add_argument('--repetition-penalty', type=float, default=1.0,
+                        help='HF-style repetition penalty (>1 down-weights repeated tokens).')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='RNG seed for reproducible sampling (only when --temperature > 0).')
+    parser.add_argument('--diag-logit-mag', action='store_true',
+                        help='Per-step diagnostic: print max(|logits|) every decode step and '
+                             'flag NaN/INF. Adds one C2H DMA per step (~1 ms). Use to localize '
+                             'the exact decode position where logits explode under long context.')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1468,6 +1693,19 @@ def main():
     print(f"User prompt ({len(prefill_seq)} tokens): {user_prompt!r}")
     print(f"Sequence ids: {prefill_seq}")
 
+    # Stash sampling config on the engine so run_decoder/sample_next_token can read it.
+    ue.temperature = float(args.temperature)
+    ue.top_k = int(args.top_k)
+    ue.top_p = float(args.top_p)
+    ue.repetition_penalty = float(args.repetition_penalty)
+    ue._generated_tokens = list(prefill_seq)   # seed repetition penalty with the prompt
+    if args.seed is not None and ue.temperature > 0:
+        torch.manual_seed(args.seed)
+    if ue.temperature > 0:
+        print(f"Sampling: temperature={ue.temperature}  top_k={ue.top_k}  "
+              f"top_p={ue.top_p}  repetition_penalty={ue.repetition_penalty}  "
+              f"seed={args.seed}")
+
     print(f"\n--- Compiling unified instruction bin (1 prefill + 1 decoder, dynamic PBI) ---")
     timer = time.perf_counter()
     inst_meta = ue.compile_instructions()
@@ -1479,7 +1717,7 @@ def main():
     base_addr, _ = ue.load_instructions(inst_bin_path)
     # Reserve a slot AFTER the loaded bin for the runtime preamble. Prefill preamble
     # is 4 instructions (3 ADD_SET + JUMP_ABS) = 128 B; decode preamble is 2 instructions
-    # (ADD_SET gf_bucket_idx + JUMP_ABS) and overwrites the same slot.
+    # (ADD_SET gpr_bucket_idx + JUMP_ABS) and overwrites the same slot.
     preamble_addr = ue.get_program_dram_addr()
     ue.allocate_program_dram(128)
 
@@ -1490,7 +1728,7 @@ def main():
     actual_seq_len = len(prefill_seq) - 1
     # Rescale prefill FLOPs from the compile-time template to the actual seq_len.
     # The meta records FLOPs for ``prefill_template_seq_len`` rows; runtime ops execute
-    # ``actual_seq_len`` rows (via gf_seq_len-driven PBI loops), so linear scaling gives
+    # ``actual_seq_len`` rows (via gpr_seq_len-driven PBI loops), so linear scaling gives
     # the real work count for the GFLOPS report.
     template_seq_len = int(inst_meta["prefill_template_seq_len"])
     gflops_prefill = inst_meta["prefill_template_flops"] * actual_seq_len // max(template_seq_len, 1)

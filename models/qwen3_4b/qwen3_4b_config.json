@@ -2,9 +2,9 @@
   "_template_note": "Qwen3-4B config for qwen3_4b_test.py. 36 layers, 32Q/8KV heads, head_dim=128, SwiGLU, QK RMSNorm, no post-attn/post-FFN norm, single RoPE base. Dynamic-PBI single-bin flow: prefill and decoder are each ONE program in the unified bin; host primes gf_seq_len / gf_q_seq_len / gf_bucket_idx via a runtime preamble + jump_abs before each call.",
   "fixed_isa_regs": {
     "TMP_REG": 1,
-    "GF_SEQ_LEN_REG": 2,
-    "GF_Q_SEQ_LEN_REG": 3,
-    "GF_BUCKET_IDX_REG": 4
+    "GPR_SEQ_LEN_REG": 2,
+    "GPR_Q_SEQ_LEN_REG": 3,
+    "GPR_BUCKET_IDX_REG": 4
   },
   "file_info": {
     "layer_size": 53657600,
@@ -19,8 +19,8 @@
     "bytes_per_element": 2
   },
   "model": {
-    "max_context_size": 512,
-    "prefill_max_seq_len": 192,
+    "max_context_size": 3072,
+    "prefill_max_seq_len": 512,
     "end_of_turn_token_id": 151645
   },
   "paths": {
