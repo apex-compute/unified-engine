@@ -412,6 +412,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         max_seq_len = self.MAX_CONTEXT_SIZE
         decoded_count = 0
         per_token_times: list[float] = []
+        per_token_fpga_us: list[float] = []
+        per_token_flops:   list[int]   = []
         decode_loop_start = time.perf_counter()
 
         while self.seq_len < max_seq_len:
@@ -421,6 +423,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
             prog_idx = min((self.seq_len - 1) // 64, len(decoder_program_sizes) - 1)
             prog_addr = decoder_base_addr + sum(decoder_program_sizes[:prog_idx])
+            gflops_this_tok = gflops_per_token[prog_idx] if gflops_per_token else None
 
             _kv_stride = self.actual_head_dim * self.bytes_per_element
             _rope_row  = self.head_dim * 2 * self.bytes_per_element
@@ -436,6 +439,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
             self.start_execute_from_dram(prog_addr)
             self.wait_queue(30.0)
+            per_token_fpga_us.append(self.report_latency_in_us())
+            if gflops_this_tok is not None:
+                per_token_flops.append(gflops_this_tok)
             token_id = self.get_arg_max_index()
             token_char = self.tokenizer.decode([token_id])
             per_token_times.append(time.perf_counter() - t0)
@@ -449,17 +455,27 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         decode_elapsed = time.perf_counter() - decode_loop_start
         tps = decoded_count / decode_elapsed if decode_elapsed > 0 else 0.0
         avg_ms = (sum(per_token_times) / len(per_token_times) * 1000.0) if per_token_times else 0.0
+        avg_fpga_ms = (sum(per_token_fpga_us) / len(per_token_fpga_us) / 1e3) if per_token_fpga_us else 0.0
+        avg_decode_gflops = 0.0
+        if per_token_flops and per_token_fpga_us:
+            total_flops = sum(per_token_flops)
+            total_fpga_ns = sum(us * 1000 for us in per_token_fpga_us)
+            avg_decode_gflops = total_flops / total_fpga_ns if total_fpga_ns > 0 else 0.0
         _original_print(f"\n--- Decode benchmark ---")
-        _original_print(f"  Tokens decoded : {decoded_count}")
-        _original_print(f"  Elapsed        : {decode_elapsed:.3f} s")
-        _original_print(f"  Throughput     : {tps:.3f} tokens/s")
-        _original_print(f"  Avg per token  : {avg_ms:.2f} ms")
+        _original_print(f"  Tokens decoded     : {decoded_count}")
+        _original_print(f"  Elapsed wall       : {decode_elapsed:.3f} s")
+        _original_print(f"  Throughput         : {tps:.3f} tokens/s")
+        _original_print(f"  Avg wall per token : {avg_ms:.2f} ms")
+        _original_print(f"  Avg FPGA per token : {avg_fpga_ms:.2f} ms")
+        _original_print(f"  Avg decode GFLOPS  : {avg_decode_gflops:.2f}")
         return {
             "decoded_count": decoded_count,
             "seq_len": self.seq_len,
             "decode_elapsed_s": decode_elapsed,
             "tokens_per_second": tps,
             "avg_per_token_ms": avg_ms,
+            "avg_fpga_per_token_ms": avg_fpga_ms,
+            "avg_decode_gflops": avg_decode_gflops,
         }
 
 
