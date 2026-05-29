@@ -1470,10 +1470,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.VIS_MERGER_INTER_DRAM = self.allocate_tensor_dram(self.NUM_MERGED_TOKENS * merge_dim * bpe)
         # Final encoder output [256, 2048]
         self.VIS_ENCODER_OUT_DRAM = self.allocate_tensor_dram(self.NUM_MERGED_TOKENS * VH_OUT * bpe)
-        # 2D RoPE cos/sin tables (computed on host per image, DMA'd before encoder run)
-        # Shape: [1024, 128] each — padded from 80 to 128 for aligned rope_hf_core
-        self.VIS_ROPE_COS_DRAM = self.allocate_tensor_dram(VS * VD_PAD * bpe)
-        self.VIS_ROPE_SIN_DRAM = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        # 2D RoPE table, interleaved per-token rows [cos(VD_PAD) || sin(VD_PAD)] so the
+        # shared PBI rope core loads both with ONE auto-advancing pointer (sin = cos +
+        # row_bytes). Padded from head_dim 80 to VD_PAD=128 for 64-aligned rope_hf_core_dram.
+        self.VIS_ROPE_DRAM = self.allocate_tensor_dram(VS * 2 * VD_PAD * bpe)
+        self.VIS_ROPE_COS_DRAM = self.VIS_ROPE_DRAM
+        self.VIS_ROPE_SIN_DRAM = self.VIS_ROPE_DRAM + VD_PAD * bpe
         # Permute params (identity matrix for bf16_permute_core_v2)
         permute_size = UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe
         self.VIS_PERMUTE_PARAMS_DRAM = self.get_params_dram_addr()
@@ -1587,14 +1589,14 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = True
 
         _bf16_mode = getattr(self, '_vision_bf16_mode', False)
-        def vis_matmul(M, K, N, A, la_key_prefix, la, OUT, bias=None, silu_en=False, gelu_en=False):
+        def vis_matmul(M, K, N, A, la_key_prefix, la, OUT, bias=None, silu_en=False, gelu_en=False, gpr_M_reg=None):
             if _bf16_mode and f'{la_key_prefix}_weight_bf16' in la:
                 self.matmat_mul_core(
                     M=M, K=K, N=N, A_DRAM_ADDR=A,
                     B_DRAM_ADDR=la[f'{la_key_prefix}_weight_bf16'],
                     OUTPUT_DRAM_ADDR=OUT,
                     C_DRAM_ADDR=la.get(f'{la_key_prefix}_bias_bf16', bias), bias_mode="broadcast_N",
-                    silu_enable=silu_en, gelu_enable=gelu_en)
+                    silu_enable=silu_en, gelu_enable=gelu_en, gpr_M_reg=gpr_M_reg)
             else:
                 self.matmat_mul_core(
                     M=M, K=K, N=N, A_DRAM_ADDR=A,
@@ -1603,12 +1605,20 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                     is_B_quantized=True, data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=la[f'{la_key_prefix}_scale'],
-                    silu_enable=silu_en, gelu_enable=gelu_en)
+                    silu_enable=silu_en, gelu_enable=gelu_en, gpr_M_reg=gpr_M_reg)
 
         total_bytes = 0
 
         _original_print(f"  Compiling vision encoder: {total_layers} layers (single program)...")
         self.start_capture()
+
+        # Runtime row-count register (M=VS) shared by all M-agnostic PBI ops in the
+        # encoder — matmuls, norm1, and the rope core. Constant across heads/layers;
+        # primed once, not consumed by the hardware loop. Drives the per-layer ISA to
+        # be M-agnostic (single hardware loop instead of VS-row unrolling).
+        self.reset_isa_reg_counter()
+        vis_M_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(vis_M_reg, VS)
 
         for layer_idx in range(total_layers):
             _original_print(f"    vision layer {layer_idx + 1}/{total_layers}", end="\r", flush=True)
@@ -1630,7 +1640,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
             self.rms_norm_core_dram(M=VS, N=VH,
                 A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['norm1_weight'])
+                GAMMA_DRAM_ADDR=la['norm1_weight'], gpr_M_reg=vis_M_reg)
 
             VN_VD_PAD = VN * VD_PAD
             if _bf16_mode and 'qk_weight_bf16' in la:
@@ -1639,7 +1649,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
                     B_DRAM_ADDR=la['qk_weight_bf16'],
                     OUTPUT_DRAM_ADDR=self.VIS_QK_DRAM,
-                    C_DRAM_ADDR=la['qk_bias_bf16'], bias_mode="broadcast_N")
+                    C_DRAM_ADDR=la['qk_bias_bf16'], bias_mode="broadcast_N",
+                    gpr_M_reg=vis_M_reg)
             else:
                 self.matmat_mul_core(
                     M=VS, K=VH, N=VN_VD_PAD * 2,
@@ -1648,7 +1659,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.VIS_QK_DRAM,
                     C_DRAM_ADDR=la['qk_bias'], bias_mode="broadcast_N",
                     is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=la['qk_scale'])
+                SCALE_DRAM_ADDR=la['qk_scale'], gpr_M_reg=vis_M_reg)
 
             if _bf16_mode and 'v_weight_bf16' in la:
                 self.matmat_mul_core(
@@ -1656,7 +1667,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
                     B_DRAM_ADDR=la['v_weight_bf16'],
                     OUTPUT_DRAM_ADDR=self.VIS_V_DRAM,
-                    C_DRAM_ADDR=la['v_bias_bf16'], bias_mode="broadcast_N")
+                    C_DRAM_ADDR=la['v_bias_bf16'], bias_mode="broadcast_N",
+                    gpr_M_reg=vis_M_reg)
             else:
                 self.matmat_mul_core(
                     M=VS, K=VH, N=VN_VD_PAD,
@@ -1665,7 +1677,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.VIS_V_DRAM,
                     C_DRAM_ADDR=la['v_bias'], bias_mode="broadcast_N",
                     is_B_quantized=True, data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=la['v_scale'])
+                    SCALE_DRAM_ADDR=la['v_scale'], gpr_M_reg=vis_M_reg)
 
             qk_row_pad = VN_VD_PAD * 2
             extract_buf = self.VIS_PERMUTE_TEMP_DRAM
@@ -1701,37 +1713,20 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
                 temp_dram_start=perm_temp)
 
-            # Batched RoPE: load all tokens for one head, bulk eltwise for x*cos,
-            # then per-token cross-terms (x_hi*sin_lo, x_lo*sin_hi), store all at once.
-            half = VD_PAD // 2
-            q_all_elems = VS * VD_PAD
-            # SRAM layout: URAM_A has Q + result buffer, URAM_B has cos + sin
-            sram_q   = 0x00000                         # Q/K [VS, 128] = 73728 elems (URAM_A)
-            sram_a   = sram_q + q_all_elems * bpe      # x*cos result [VS, 128] (URAM_A)
-            sram_cos = 0x80000                         # cos [VS, 128] (URAM_B)
-            sram_sin = sram_cos + q_all_elems * bpe    # sin [VS, 128] (URAM_B)
-            sram_bc  = sram_sin + q_all_elems * bpe    # cross-term temp [128] (URAM_B)
-            # Load cos/sin once per layer
-            self.accelerator_memory_to_sram(self.VIS_ROPE_COS_DRAM, sram_cos, q_all_elems)
-            self.accelerator_memory_to_sram(self.VIS_ROPE_SIN_DRAM, sram_sin, q_all_elems)
+            # RoPE via the shared PBI core (rope_hf_core_dram). Per token it loads x plus
+            # the interleaved [cos||sin] row through 2 auto-advancing load pointers (+1
+            # store) — the proven-good pointer count, unlike the old 3-separate-load path
+            # whose 3rd pointer didn't reliably advance and corrupted vision output.
+            # cos/sin are position-only, so the same table is reused for every head.
             for h in range(VN):
                 for buf_dram in (self.VIS_Q_PAD_DRAM, self.VIS_K_PAD_DRAM):
                     head_addr = buf_dram + h * head_stride_pad
-                    self.accelerator_memory_to_sram(head_addr, sram_q, q_all_elems)
-                    # Bulk: a = x * cos (all 73728 elements at once)
-                    self.eltwise_mul_core(sram_q, sram_cos, sram_a, q_all_elems)
-                    # Per-token cross-terms and accumulate into a
-                    for t in range(VS):
-                        t_off = t * VD_PAD * bpe
-                        sx = sram_q + t_off
-                        ss = sram_sin + t_off
-                        sa = sram_a + t_off
-                        # bc_lo = x_hi * sin_lo; bc_hi = x_lo * sin_hi
-                        self.eltwise_mul_core(sx + half * bpe, ss, sram_bc, half)
-                        self.eltwise_mul_core(sx, ss + half * bpe, sram_bc + half * bpe, half)
-                        # a += bc (result in sram_a, overwrites x*cos with final RoPE)
-                        self.eltwise_add_core(sa, sram_bc, sa, VD_PAD)
-                    self.sram_to_accelerator_memory(sram_a, head_addr, q_all_elems)
+                    self.rope_hf_core_dram(
+                        M=VS, N=VD_PAD,
+                        input_dram_addr=head_addr, output_dram_addr=head_addr,
+                        cos_dram_addr=self.VIS_ROPE_COS_DRAM,
+                        sin_dram_addr=self.VIS_ROPE_SIN_DRAM,
+                        gpr_M_reg=vis_M_reg)
 
             # flash_attention_core scales by 1/sqrt(128) instead of 1/sqrt(80).
             # The softer attention (sqrt(128)) is more robust to INT4 quantization noise
@@ -1789,7 +1784,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 temp_dram_start=self.VIS_PERMUTE_TEMP_DRAM)
 
             vis_matmul(VS, VH, VH, self.VIS_ATTN_RESULT_DRAM, 'o', la,
-                       self.VIS_O_PROJ_DRAM, bias=la['o_bias'])
+                       self.VIS_O_PROJ_DRAM, bias=la['o_bias'], gpr_M_reg=vis_M_reg)
 
             rms_norm_core_dram_post_add(self, M=VS, N=VH,
                 A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
@@ -1804,14 +1799,14 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE_DRAM,
                 SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['gate_bias'], bias_mode="broadcast_N",
-                silu_enable=True)
+                silu_enable=True, gpr_M_reg=vis_M_reg)
             self.matmat_mul_core(is_B_quantized=True,
                 M=VS, K=VH, N=VIS_MLP_PAD,
                 A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
                 B_DRAM_ADDR=la['up_data'],
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_UP_DRAM,
                 SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['up_bias'], bias_mode="broadcast_N")
+                C_DRAM_ADDR=la['up_bias'], bias_mode="broadcast_N", gpr_M_reg=vis_M_reg)
 
             # gate * up chunked
             _M_CHUNK = min((0x80000 - 0x10000) // 2 // VIS_MLP_PAD, VS)
@@ -1832,7 +1827,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=la['down_data'],
                 OUTPUT_DRAM_ADDR=self.VIS_MLP_DOWN_DRAM,
                 SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['down_bias'], bias_mode="broadcast_N")
+                C_DRAM_ADDR=la['down_bias'], bias_mode="broadcast_N", gpr_M_reg=vis_M_reg)
 
             eltwise_add_core_dram(self, size=VS * VH,
                 A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
@@ -2024,23 +2019,24 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             cos_raw = rotary_pos_emb.cos().to(torch.bfloat16)  # [VS, 40]
             sin_raw = rotary_pos_emb.sin().to(torch.bfloat16)  # [VS, 40]
 
-            # Build cos table: [VS, VD_PAD=128]
-            cos_table = torch.ones(VS, VD_PAD, dtype=torch.bfloat16)
+            # Interleaved table [VS, 2, VD_PAD]: row t = [cos(128) || sin(128)] so the
+            # PBI rope core loads cos+sin with a single auto-advancing pointer.
+            rope_table = torch.empty(VS, 2, VD_PAD, dtype=torch.bfloat16)
+            cos_table = rope_table[:, 0, :]
+            sin_table = rope_table[:, 1, :]
+
+            # cos: ones everywhere (identity for zero-padded dims), real cos in both halves
+            cos_table.fill_(1.0)
             cos_table[:, :half_d] = cos_raw           # [0:40] = cos
-            # [40:64] stays ones (identity for zero-padded dims)
-            cos_table[:, 64:64 + half_d] = cos_raw    # [64:104] = cos
-            # [104:128] stays ones
+            cos_table[:, 64:64 + half_d] = cos_raw    # [64:104] = cos; [40:64],[104:128] = 1
 
-            # Build sin table: [VS, VD_PAD=128]
-            sin_table = torch.zeros(VS, VD_PAD, dtype=torch.bfloat16)
+            # sin: zeros in pad gaps; -sin in lo half, +sin in hi half (rotate-half sign)
+            sin_table.zero_()
             sin_table[:, :half_d] = -sin_raw           # [0:40] = -sin
-            # [40:64] stays zeros
-            sin_table[:, 64:64 + half_d] = sin_raw     # [64:104] = +sin
-            # [104:128] stays zeros
+            sin_table[:, 64:64 + half_d] = sin_raw     # [64:104] = +sin; gaps = 0
 
-            self.dma_to_accelerator_memory(self.VIS_ROPE_COS_DRAM, cos_table.flatten())
-            self.dma_to_accelerator_memory(self.VIS_ROPE_SIN_DRAM, sin_table.flatten())
-        print(f"    Vision RoPE tables [{VS}, {VD_PAD}] DMA'd to FPGA")
+            self.dma_to_accelerator_memory(self.VIS_ROPE_DRAM, rope_table.flatten())
+        print(f"    Vision RoPE table [{VS}, 2, {VD_PAD}] (interleaved cos||sin) DMA'd to FPGA")
 
         # Vision encoder FLOP estimate
         vis_cfg = self._vis_cfg
