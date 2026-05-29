@@ -2504,7 +2504,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # RoPE per head — use gr_weight_dram=gf_rope_cos_abs (absolute cos base addr
             # primed by per-step preamble = ROPE_LOCAL + (seq_len-1 + _rope_offset) * rope_row_bytes).
             for kv_h in range(nkvh):
-                total_flops += (self.rope_hf_core(
+                total_flops += (self.rope_hf_core_decode(
                     N=ahd,
                     input_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
@@ -2512,7 +2512,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
                     gr_weight_dram=gf_rope_cos_abs) or 0)
             for q_h in range(nkvh * qpkv):
-                total_flops += (self.rope_hf_core(
+                total_flops += (self.rope_hf_core_decode(
                     N=ahd,
                     input_dram_addr=self.LAYER0_Q_DRAM + q_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_Q_DRAM + q_h * ahd * bpe,
@@ -2814,8 +2814,6 @@ def main():
 
     ue = Qwen25VL3B_UnifiedEngine(script_dir=script_dir)
 
-    # Stop any stale FPGA execution from a previous crashed/timed-out run
-    ue.dram_inst_running(False)
     ue.start_capture()
     ue.generate_instruction_halt()
     ue.stop_capture()
