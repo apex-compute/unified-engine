@@ -1786,6 +1786,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             vis_matmul(VS, VH, VH, self.VIS_ATTN_RESULT_DRAM, 'o', la,
                        self.VIS_O_PROJ_DRAM, bias=la['o_bias'], gpr_M_reg=vis_M_reg)
 
+            # norm2 kept LEGACY (static): its PBI variant uses a 2-load+2-store pointer
+            # pattern that corrupts output on device (verified 2026-05-29) AND saved only
+            # ~2MB — net loss. See [[project_qwenvl_rope_pbi_bug]].
             rms_norm_core_dram_post_add(self, M=VS, N=VH,
                 A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
                 ADDOUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
