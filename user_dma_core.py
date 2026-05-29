@@ -2791,14 +2791,23 @@ class UnifiedEngine:
                      output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
         """HuggingFace-style RoPE on N bf16 elements. Caller must bracket with start/stop_capture.
 
+        Compute flow (single token, head_dim=N, half=N//2):
+          1. Load x[N]          → sram_x
+          2. Load cos[N], sin[N] → sram_cos, sram_sin
+             Table layout per position: [cos(half) | cos(half) | -sin(half) | sin(half)]
+             so sram_cos holds the full duplicated cos and sram_sin holds the signed sin.
+          3. a[N]    = x[N]      * cos[N]           (eltwise_mul, full N)
+          4. bc_lo[half] = x[half+:] * sin[:half]   (eltwise_mul, rotate_half lo: x_hi * (-sin_lo))
+          5. bc_hi[half] = x[:half]  * sin[half:]   (eltwise_mul, rotate_half hi: x_lo * sin_hi)
+          6. d[N]    = a[N] + bc[N]                 (eltwise_add, full N)
+          7. Write d[N] → output_dram_addr
+
         Three mutually exclusive dynamic-address modes for cos/sin:
         - Static (default): load from cos_dram_addr / sin_dram_addr as-is.
         - rope_size_reg: ISA register holding a per-position byte offset added to cos/sin_dram_addr
-          at runtime via generate_instruction_add_imm + overwrite_instruction_with_general_register.
-          tmp_reg required.
+          at runtime. tmp_reg required.
         - gr_weight_dram: ISA register holding the absolute cos base address at runtime; sin derived
-          as cos_base + N*2 bytes via general_reg_src (INSTRUCTION_REG_REWRITE). Allocates an
-          internal scratch register. cos/sin_dram_addr are template placeholders and ignored.
+          as cos_base + N*2 bytes. Allocates an internal scratch register.
 
         output_addr_inc_reg: ISA register holding a per-position byte offset applied to output_dram_addr.
         Returns: approximate FLOPs (4*N).
