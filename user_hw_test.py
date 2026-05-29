@@ -1286,80 +1286,6 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def rope_core_dram_test(M: int, N: int):
-    """
-    Tests rope_core_dram with M rows of N elements using HF-style RoPE.
-    """
-    ue = UnifiedEngine()
-
-    X_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    COS_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    SIN_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-
-    ue.start_capture()
-
-    total_flops = ue.rope_core_dram(M=M, N=N,
-                                    X_DRAM_ADDR=X_DRAM_ADDR,
-                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                                    COS_DRAM_ADDR=COS_DRAM_ADDR,
-                                    SIN_DRAM_ADDR=SIN_DRAM_ADDR)
-
-    ue.stop_capture()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-
-    head_dim = N
-    MAX_SEQ_LEN = 32768
-    freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
-    random_seq_index = random.randint(0, MAX_SEQ_LEN - 1)
-    one_rope_seq_params = freqs_cis[random_seq_index, :]
-    one_rope_seq = torch.view_as_real(one_rope_seq_params).to(torch.bfloat16).reshape(-1)
-    cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)
-    sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)
-
-    # Negate sin's first half (rope_core_dram expects pre-negated sin)
-    sin_negated = sin.clone()
-    sin_negated[:N // 2] = -sin_negated[:N // 2]
-
-    x_hf = torch.randn(M, N, dtype=torch.bfloat16)
-
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_hf)
-    ue.dma_to_accelerator_memory(COS_DRAM_ADDR, cos)
-    ue.dma_to_accelerator_memory(SIN_DRAM_ADDR, sin_negated)
-
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(f"Report FLOPS for RoPE core DRAM: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}")
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-
-    def rotate_half(x):
-        x1 = x[..., :x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
-    ref = x_hf * cos + rotate_half(x_hf) * sin
-
-    snr_db = calculate_snr(ref, output)
-    print(f"RoPE core DRAM SNR Analysis: {snr_db:.2f} dB for M={M}, N={N}")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-
-    record_test("rope_core_dram",
-                f"M={M}, N={N}",
-                snr_db=snr_db,
-                gflops=flop_rate_gflops,
-                inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-
 def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False):
     """
     Tests rope_hf_core_dram by emitting one HF-style RoPE instruction sequence per row.
@@ -4665,7 +4591,8 @@ if __name__ == "__main__":
     dequantize_test(TYPE.IF8, int_variant=True)
     dequantize_test(TYPE.IF8, int_variant=False)
     matmat_mul_non_aligned_writeback_test()
-    rope_core_dram_test(M=4, N=256)
+    rope_hf_core_dram_test(64, 512)
+    rope_hf_core_dram_test(64, 512, use_pbi=True)
     bf16_permute_test(dim_0=144, dim_1=48, dim_2=64)
     patching_test()
     mix_of_broadcast_eltwise_add_eltwise_mul_core_test()
@@ -4730,7 +4657,6 @@ if __name__ == "__main__":
     # --- Additional coverage: extra dimension/feature combinations ---
     bf16_transpose_test(M=2048, N=2048)
     bf16_transpose_test(M=64, N=4096)
-    rope_core_dram_test(M=8, N=512)
     rms_norm_test(shape=(2048, 2048))
     layer_norm_test(shape=(1024, 1024), gamma_enable=True)
     layer_norm_test(shape=(1024, 1024), beta_enable=True)

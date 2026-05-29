@@ -603,23 +603,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
-    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 50.0, flops: float = None) -> None:
-        """Execute compiled program from DRAM instruction memory.
-        """
-        print(f"Execute program start at 0x{program_start_addr:X}")
-        self.start_execute_from_dram(program_start_addr)
-        latency, flop_rate_program = 0, 0
-        if timeout == 0:
-            print("Program started")
-        else:
-            self.wait_queue(timeout)
-            latency = self.report_latency_in_us()
-            print(f"    Total program execution latency = {latency} us")
-            if flops is not None:
-                flop_rate_program, _ = self.report_flop_rate_gflops(flops)
-                print(f"Report FLOPS for program execution: {flop_rate_program:.2f} GFLOPS")
-        return latency, flop_rate_program
-
     def _compile_prefill_program(self, prefill_seq_len: int, layer_size: int = 26, use_pbi: bool = False) -> dict:
         """
         Compile a single prefill program for the given prefill seq_len and return
@@ -1011,7 +994,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             k_rope_layer_addr = self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
             self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size * 2))
             self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(ROPE_WEIGHT_ADDR), self.TMP_REG)
-            total_flops += self.rope_hf_core(N=self.head_dim, input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=k_rope_layer_addr,
+            total_flops += self.rope_hf_core_decode(N=self.head_dim, input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=k_rope_layer_addr,
                     gr_weight_dram=self.TMP_REG)
             self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size))
             self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(k_rope_layer_addr), self.TMP_REG)
@@ -1019,7 +1002,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size * 2))
             self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(ROPE_WEIGHT_ADDR), self.TMP_REG)
             for g in range(self.group_size):
-                total_flops += self.rope_hf_core(N=self.head_dim, input_dram_addr=self.LAYER0_Q_NORM_DRAM + g * self.head_dim * self.bytes_per_element, output_dram_addr=self.LAYER0_FLASH_Q_DRAM + g * self.head_dim * self.bytes_per_element,
+                total_flops += self.rope_hf_core_decode(N=self.head_dim, input_dram_addr=self.LAYER0_Q_NORM_DRAM + g * self.head_dim * self.bytes_per_element, output_dram_addr=self.LAYER0_FLASH_Q_DRAM + g * self.head_dim * self.bytes_per_element,
                         gr_weight_dram=self.TMP_REG)
             attn_result = self.decoder_group_attention_core(
                 group_size=self.group_size,

@@ -844,7 +844,6 @@ class UnifiedEngine:
             (UE_LALU_LATENCY_SOFTMAX << 0)
         )
         self.write_reg32(UE_LALU_DELAY_ADDR, ue_lalu_delay)
-        self.dram_inst_running(True)
         print("Unified Engine initialization completed successfully!")
 
     def write_reg32(self, address: int, value: int):
@@ -1823,66 +1822,6 @@ class UnifiedEngine:
             uram_wb_addr, uram_wb_type.value, row_size
         )
 
-    def rope_hf_core(self, N: int, input_dram_addr: int, output_dram_addr: int,
-                     cos_dram_addr: int = 0, sin_dram_addr: int = 0,
-                     rope_size_reg: int = None, gr_weight_dram: int = 0,
-                     output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
-        """HuggingFace-style RoPE on N bf16 elements. Caller must bracket with start/stop_capture.
-
-        Three mutually exclusive dynamic-address modes for cos/sin:
-        - Static (default): load from cos_dram_addr / sin_dram_addr as-is.
-        - rope_size_reg: ISA register holding a per-position byte offset added to cos/sin_dram_addr
-          at runtime via generate_instruction_add_imm + overwrite_instruction_with_general_register.
-          tmp_reg required.
-        - gr_weight_dram: ISA register holding the absolute cos base address at runtime; sin derived
-          as cos_base + N*2 bytes via general_reg_src (INSTRUCTION_REG_REWRITE). Allocates an
-          internal scratch register. cos/sin_dram_addr are template placeholders and ignored.
-
-        output_addr_inc_reg: ISA register holding a per-position byte offset applied to output_dram_addr.
-        Returns: approximate FLOPs (4*N).
-        """
-        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
-        assert N % 2 == 0, "N must be even for RoPE half layout"
-        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
-        half = N // 2
-        bytes_per_elem = 2
-        sram_x   = 0x00000
-        sram_a   = 0x20000
-        sram_d   = 0x40000
-        sram_cos = 0x80000
-        sram_sin = 0x80000 + N * bytes_per_elem
-        sram_bc  = 0x80000 + N * bytes_per_elem * 2
-        self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr, sram_address=sram_x, element_size=N)
-        if rope_size_reg is not None:
-            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(cos_dram_addr), tmp_reg)
-            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(sin_dram_addr), tmp_reg)
-            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-        elif gr_weight_dram != 0:
-            tmp_gr = self.alloc_isa_reg()
-            self.generate_instruction_add_imm(gr_weight_dram, ue_35bit_addr_shifter(N * bytes_per_elem), tmp_gr)
-            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N, general_reg_src=gr_weight_dram)
-            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr + N * bytes_per_elem, sram_address=sram_sin, element_size=N, general_reg_src=tmp_gr)
-        else:
-            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
-            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
-        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
-        if output_addr_inc_reg is not None:
-            self.generate_instruction_add_imm(output_addr_inc_reg, ue_35bit_addr_shifter(output_dram_addr), tmp_reg)
-            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
-            self.overwrite_instruction_with_general_register(tmp_reg)
-        else:
-            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
-        if gr_weight_dram != 0:
-            self.release_isa_reg()
-        return 4 * N
-
-
     def eltwise_sub_core(self, vector_A_sram_start_addr: int, vector_B_sram_start_addr: int, vector_C_sram_wb_addr: int,
                                 element_size: int) -> Optional[torch.Tensor]:
         """Start queue for element-wise subtract (A - B). Wraps ue_arithmetic_op with UE_MODE.ELTWISE_SUB.
@@ -2846,122 +2785,65 @@ class UnifiedEngine:
             total_flops += M * N # add(beta) N times
         return total_flops
 
-    def rope_core(self, N: int,
-                  x_sram_addr: int,
-                  cos_sram_addr: int,
-                  sin_sram_addr: int,
-                  output_sram_addr: int,
-                  a_sram_addr: int,
-                  bc_sram_addr: int) -> None:
+    def rope_hf_core_decode(self, N: int, input_dram_addr: int, output_dram_addr: int,
+                     cos_dram_addr: int = 0, sin_dram_addr: int = 0,
+                     rope_size_reg: int = None, gr_weight_dram: int = 0,
+                     output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
+        """HuggingFace-style RoPE on N bf16 elements. Caller must bracket with start/stop_capture.
+
+        Three mutually exclusive dynamic-address modes for cos/sin:
+        - Static (default): load from cos_dram_addr / sin_dram_addr as-is.
+        - rope_size_reg: ISA register holding a per-position byte offset added to cos/sin_dram_addr
+          at runtime via generate_instruction_add_imm + overwrite_instruction_with_general_register.
+          tmp_reg required.
+        - gr_weight_dram: ISA register holding the absolute cos base address at runtime; sin derived
+          as cos_base + N*2 bytes via general_reg_src (INSTRUCTION_REG_REWRITE). Allocates an
+          internal scratch register. cos/sin_dram_addr are template placeholders and ignored.
+
+        output_addr_inc_reg: ISA register holding a per-position byte offset applied to output_dram_addr.
+        Returns: approximate FLOPs (4*N).
         """
-        Core HF-style RoPE on SRAM vectors.
-
-        Computes: output = x * cos + cat(x[hi]*sin[lo], x[lo]*sin[hi])
-
-        sin must have its first half pre-negated for the standard HF RoPE formula:
-          rotate_half(x) * sin = cat(-x[hi], x[lo]) * sin
-
-        SRAM constraints:
-          - x, output, a must be in URAM_A
-          - cos, sin, bc must be in URAM_B
-          - bc must have room for N elements (b=N/2 then c=N/2, contiguous)
-
-        Args:
-            N: vector length (must be multiple of UE_VECTOR_SIZE and even)
-            x_sram_addr: input vector x in URAM_A (N elements)
-            cos_sram_addr: cosine values in URAM_B (N elements)
-            sin_sram_addr: sine values in URAM_B (N elements, first half negated)
-            output_sram_addr: output in URAM_A (N elements, may alias x_sram_addr)
-            a_sram_addr: scratch in URAM_A for intermediate a = x*cos (N elements)
-            bc_sram_addr: scratch in URAM_B for b and c (N elements total)
-        """
-        half_N = N // 2
-        bytes_per_element = 2
-
-        # Step 1: a = x * cos
-        self.eltwise_mul_core(x_sram_addr, cos_sram_addr, a_sram_addr, N)
-
-        # Step 2: b = x[hi] * sin[lo]  →  stored at bc_sram_addr (first half)
-        self.eltwise_mul_core(x_sram_addr + half_N * bytes_per_element,
-                              sin_sram_addr,
-                              bc_sram_addr, half_N)
-
-        # Step 3: c = x[lo] * sin[hi]  →  stored at bc_sram_addr + half (second half)
-        self.eltwise_mul_core(x_sram_addr,
-                              sin_sram_addr + half_N * bytes_per_element,
-                              bc_sram_addr + half_N * bytes_per_element, half_N)
-
-        # Step 4: output = a + cat(b, c)   (b and c are already contiguous at bc_sram_addr)
-        self.eltwise_add_core(a_sram_addr, bc_sram_addr, output_sram_addr, N)
-
-    def rope_core_dram(self, M: int, N: int,
-                       X_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                       COS_DRAM_ADDR: int, SIN_DRAM_ADDR: int) -> int:
-        """
-        DRAM-level HF-style RoPE over M rows of N elements.
-
-        cos and sin are loaded once into URAM_B and reused for every row.
-        sin must have its first half pre-negated.
-
-        URAM layout:
-          URAM_A: [input rows chunk] [scratch a (N)]
-          URAM_B: [cos (N)] [sin (N)] [scratch bc (N)]
-
-        Args:
-            M: number of rows
-            N: vector length per row (must be multiple of UE_VECTOR_SIZE and even)
-            X_DRAM_ADDR: DRAM address of input matrix (M x N, bf16)
-            OUTPUT_DRAM_ADDR: DRAM address for output matrix (M x N, bf16)
-            COS_DRAM_ADDR: DRAM address for cosine values (N elements, bf16)
-            SIN_DRAM_ADDR: DRAM address for sine values (N elements, bf16, first half negated)
-
-        Returns:
-            total_flops: theoretical FLOP count (4 * M * N)
-        """
-        bytes_per_element = 2
-        assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
-        assert N % 2 == 0, f"N={N} must be even for HF RoPE"
-
-        # URAM_B: cos (N) + sin (N) + bc scratch (N) = 3N elements
-        cos_sram_addr = 0x80000
-        sin_sram_addr = cos_sram_addr + N * bytes_per_element
-        bc_sram_addr = sin_sram_addr + N * bytes_per_element
-
-        self.accelerator_memory_to_sram(accelerator_dram_address=COS_DRAM_ADDR,
-                                        sram_address=cos_sram_addr,
-                                        element_size=N)
-        self.accelerator_memory_to_sram(accelerator_dram_address=SIN_DRAM_ADDR,
-                                        sram_address=sin_sram_addr,
-                                        element_size=N)
-
-        # URAM_A: chunk of input rows + scratch a (N)
-        # Reserve N elements at the end of URAM_A for scratch a
-        usable_uram_a_elements = URAM_NEAR_FULL_ELEMENTS - N
-        chunk_size = min(M, usable_uram_a_elements // N)
-        assert chunk_size >= 1, f"N={N} too large: need at least 2*N elements in URAM_A"
-
-        x_sram_base = 0x00000
-        a_sram_addr = x_sram_base + chunk_size * N * bytes_per_element
-
-        print(f"rope_core_dram: M={M}, N={N}, chunk_size={chunk_size}")
-
-        for i, m_take in self.chunk_ranges(M, chunk_size):
-            self.accelerator_memory_to_sram(accelerator_dram_address=X_DRAM_ADDR + i * N * bytes_per_element,
-                                            sram_address=x_sram_base,
-                                            element_size=m_take * N)
-
-            for j in range(m_take):
-                row_sram_addr = x_sram_base + j * N * bytes_per_element
-                self.rope_core(N, row_sram_addr, cos_sram_addr, sin_sram_addr,
-                               row_sram_addr, a_sram_addr, bc_sram_addr)
-
-            self.sram_to_accelerator_memory(sram_address=x_sram_base,
-                                            accelerator_dram_address=OUTPUT_DRAM_ADDR + i * N * bytes_per_element,
-                                            element_size=m_take * N)
-
-        total_flops = 3 * M * N
-        return total_flops
-
+        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
+        assert N % 2 == 0, "N must be even for RoPE half layout"
+        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
+        half = N // 2
+        bytes_per_elem = 2
+        sram_x   = 0x00000
+        sram_a   = 0x20000
+        sram_d   = 0x40000
+        sram_cos = 0x80000
+        sram_sin = 0x80000 + N * bytes_per_elem
+        sram_bc  = 0x80000 + N * bytes_per_elem * 2
+        self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr, sram_address=sram_x, element_size=N)
+        if rope_size_reg is not None:
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(cos_dram_addr), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+            self.generate_instruction_add_imm(rope_size_reg, ue_35bit_addr_shifter(sin_dram_addr), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+        elif gr_weight_dram != 0:
+            tmp_gr = self.alloc_isa_reg()
+            self.generate_instruction_add_imm(gr_weight_dram, ue_35bit_addr_shifter(N * bytes_per_elem), tmp_gr)
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N, general_reg_src=gr_weight_dram)
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr + N * bytes_per_elem, sram_address=sram_sin, element_size=N, general_reg_src=tmp_gr)
+        else:
+            self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
+            self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
+        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
+        if output_addr_inc_reg is not None:
+            self.generate_instruction_add_imm(output_addr_inc_reg, ue_35bit_addr_shifter(output_dram_addr), tmp_reg)
+            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
+            self.overwrite_instruction_with_general_register(tmp_reg)
+        else:
+            self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N)
+        if gr_weight_dram != 0:
+            self.release_isa_reg()
+        return 4 * N
+        
     def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
         """HF RoPE DRAM entrypoint; dispatches based on ``gpr_M_reg``:
 
@@ -3388,6 +3270,258 @@ class UnifiedEngine:
             sram_address=URAM_B_BASE_SRAM_ADDR,
             element_size=UE_VECTOR_SIZE,
         )
+
+    def matmat_mul_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
+                            is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
+                            clamp_enable: bool = False, log_enable: bool = False,
+                            debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
+                            write_back_disable: bool = False, gpr_M_reg: int = None) -> None:
+        """Matrix multiply entrypoint; dispatches based on ``gpr_M_reg``:
+
+        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`matmat_mul_core_pbi` — outer M-tile loop trip
+          count is taken from that register at runtime (caller must prime it via ``ADD_SET``). The
+          captured program has no static reference to ``M``; ``M`` is FLOPs-accounting only.
+        - ``gpr_M_reg is None`` (default): :meth:`matmat_mul_core_legacy` — compile-time M tiling.
+
+        **Layout:** ``A`` is **M×K** (row-major). ``B`` is **N×K** (row-major); the accelerator uses ``B`` as above and
+        applies an implicit transpose so the computed result is **A @ Bᵀ**, i.e. **M×N**, without a separate transpose pass.
+        """
+        if gpr_M_reg is not None:
+            return self.matmat_mul_core_pbi(
+                M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
+                is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
+                clamp_enable, log_enable,
+                debug_fmax, ZERO_DRAM_ADDR, FMAX_DRAM_ADDR,
+                write_back_disable=write_back_disable, gpr_M_reg=gpr_M_reg,
+            )
+        return self.matmat_mul_core_legacy(
+            M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
+            is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
+            clamp_enable, log_enable,
+            debug_fmax, ZERO_DRAM_ADDR, FMAX_DRAM_ADDR,
+            write_back_disable=write_back_disable,
+        )
+
+    def matmat_mul_core_legacy(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
+                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
+                             clamp_enable: bool = False, log_enable: bool = False,
+                             debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
+                             write_back_disable: bool = False) -> None:
+        # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
+        # 1. M_chunk can be any value between 1 and M
+        # 2. N_chunk needs to be a multiple of UE_VECTOR_SIZE
+        # 3. M_chunk * K + N_chunk * M_chunk must be less than or equal to URAM_FULL_ELEMENTS
+
+        bytes_per_element = 2
+        bias_enable = C_DRAM_ADDR is not None
+
+        if bias_enable:
+            assert bias_mode in ("broadcast_N", "full_matrix"), f"bias_mode={bias_mode} must be either 'broadcast_N' or 'full_matrix'"
+
+        if is_B_quantized:
+            assert data_type in (TYPE.IF4, TYPE.IF8), f"data_type={data_type} must be one of TYPE.IF4, TYPE.IF8"
+
+        assert sum([gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable]) <= 1, "only one activation can be True"
+
+        if softmax_enable:
+            if debug_fmax:
+                assert ZERO_DRAM_ADDR is not None, "ZERO_DRAM_ADDR must be provided when debug_fmax=True"
+                assert FMAX_DRAM_ADDR is not None, "FMAX_DRAM_ADDR must be provided when debug_fmax=True"
+
+        lalu_mode = LALU_MODE.BYPASS
+        lalu_a = 0
+        lalu_b = 0
+        if gelu_enable:
+            lalu_mode = LALU_MODE.ACT
+            lalu_a = LALU_ACT_GELU_A
+            lalu_b = LALU_ACT_GELU_B
+        elif silu_enable:
+            lalu_mode = LALU_MODE.ACT
+            lalu_a = LALU_ACT_SILU_A
+            lalu_b = LALU_ACT_SILU_B
+        elif sigmoid_enable:
+            lalu_mode = LALU_MODE.ACT_NO_X
+            lalu_a = LALU_ACT_SIGMOID_A
+            lalu_b = LALU_ACT_SIGMOID_B
+        elif clamp_enable:
+            lalu_mode = LALU_MODE.CLAMP
+            lalu_a = LALU_CLAMP_RELU_A
+            lalu_b = LALU_CLAMP_RELU_B
+        elif log_enable:
+            lalu_mode = LALU_MODE.LOG
+            lalu_a = LALU_LOG_A
+            lalu_b = LALU_LOG_B
+
+        # Calculate N_chunk
+        N_chunk = min(N, (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+        N_chunk_aligned = None
+        if N_chunk < UE_VECTOR_SIZE:
+            # Try 32(2 bursts) and 16(1 burst)
+            if (K * 32) <= URAM_NEAR_FULL_ELEMENTS:
+                N_chunk = 32
+            elif (K * 16) <= URAM_NEAR_FULL_ELEMENTS:
+                N_chunk = 16
+            else:
+                assert False, f"N={N} is too large to fit in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
+            N_chunk_aligned = UE_VECTOR_SIZE
+
+        assert N_chunk <= N, f"N_chunk={N_chunk} must be less than or equal to N={N}"
+
+        if N_chunk_aligned is None:
+            # Calculate M_chunk
+            if softmax_enable:
+                M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, URAM_FULL_ELEMENTS // (K + N_chunk)) # fmax_context is UE_FMAX_CONTEXT_SIZE elements
+            else:
+                M_chunk = min(M, URAM_FULL_ELEMENTS // (K + N_chunk))
+        else:
+            # Calculate M_chunk
+            if softmax_enable:
+                M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, URAM_FULL_ELEMENTS // (K + N_chunk_aligned)) # fmax_context is UE_FMAX_CONTEXT_SIZE elements
+            else:
+                M_chunk = min(M, URAM_FULL_ELEMENTS // (K + N_chunk_aligned))
+
+        assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
+
+        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
+
+        if N_chunk_aligned is None:
+            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+        else:
+            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk_aligned) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
+
+        for i, m_take in self.chunk_ranges(M, M_chunk):
+            self.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * K * bytes_per_element,
+                                            sram_address=0x00000,
+                                            element_size=m_take * K)
+
+            output_sram_wb_addr = 0x00000 + m_take * K * bytes_per_element
+            assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} is greater than or equal to 0x80000, which is the size of URAM_B"
+
+            clear_en = 1
+            for j, n_take in self.chunk_ranges(N, N_chunk):
+                if is_B_quantized:
+                    if data_type == TYPE.IF4:
+                        offset = j * K >> 1
+                    elif data_type == TYPE.IF8:
+                        offset = j * K
+                    self.start_queue_for_bf16_dequantize_operation(VECTOR_INPUT_DRAM_ADDR=B_DRAM_ADDR + offset,
+                                                                  SCALE_INPUT_DRAM_ADDR=SCALE_DRAM_ADDR + ((j * K) // UE_VECTOR_SIZE) * bytes_per_element,
+                                                                  data_type=data_type,
+                                                                  output_sram_wb_addr=0x80000,
+                                                                  element_size=n_take * K)
+                else:
+                    self.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + j * K * bytes_per_element,
+                                                sram_address=0x80000,
+                                                element_size=n_take * K)
+
+                if bias_enable and bias_mode == "broadcast_N":
+                    self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + j * bytes_per_element, element_size=n_take)
+
+                for output_row in range(m_take):
+
+                    if bias_enable and bias_mode == "full_matrix":
+                        self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + ((i + output_row) * N + j) * bytes_per_element,
+                                                             element_size=n_take)
+
+                    in_sram_offset = output_row * K * bytes_per_element
+                    if N_chunk_aligned is None:
+                        out_sram_offset = output_row * n_take * bytes_per_element
+                    else:
+                        out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
+
+                    self.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
+                                                            fmax_context_addr=output_row,
+                                                            vector_sram_start_addr=0x00000 + in_sram_offset,
+                                                            matrix_sram_start_addr=0x80000,
+                                                            output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
+                                                            K=K,
+                                                            N=n_take,
+                                                            bias_enable=bias_enable,
+                                                            lalu_mode=lalu_mode,
+                                                            lalu_a=lalu_a,
+                                                            lalu_b=lalu_b)
+                    clear_en = 0
+
+                # generated matrix is m_take x n_take
+                start_dram_address_of_partial_matrix = OUTPUT_DRAM_ADDR + (i * N + j) * bytes_per_element
+
+                # # LEGACY NOTE: This is the legacy way of copying m_take x n_take matrix to DRAM, check below for new way of copying with stride
+                # for output_row in range(m_take):
+                #     self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + output_row * n_take * bytes_per_element, # every row is n_take elements
+                #                                 accelerator_dram_address=start_dram_address_of_partial_matrix + output_row * N * bytes_per_element,
+                #                                 element_size=n_take)
+
+                # New way of copying with stride
+                if not write_back_disable:
+                    if N_chunk_aligned is None:
+                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                    accelerator_dram_address=start_dram_address_of_partial_matrix,
+                                                    element_size=m_take * n_take,
+                                                    stride_bytes_per_chunk=n_take * bytes_per_element,
+                                                    stride_jump_bytes=N * bytes_per_element)
+                    else: # this means output from matrix-vector operation is non-aligned - less than UE_VECTOR_SIZE elements
+                        for o_row_idx in range(m_take):
+                            self.ue_memcpy_to_dram(
+                                memcpy_type=MEMCPY_TYPE.URAM.value,
+                                uram_type=URAM_SECTION.URAM_A.value,
+                                uram_src_addr=(m_take * K * bytes_per_element >> 7) + o_row_idx,
+                                dram_dst_addr=OUTPUT_DRAM_ADDR + (i * N + j) * bytes_per_element + o_row_idx * N * bytes_per_element,
+                                memcpy_length_bytes=n_take * 2,
+                            )
+
+            if softmax_enable:
+                m_take_chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, m_take)
+                assert m_take_chunk_size >= 1 and m_take_chunk_size <= m_take, f"m_take_chunk_size={m_take_chunk_size} must be greater than 0 and less than m_take={m_take}"
+
+                for m_take_chunk_idx, m_take_chunk in self.chunk_ranges(m_take, m_take_chunk_size):
+                    start_dram_address_of_partial_row_complete_matrix = OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * N * bytes_per_element
+
+                    input_sram_start_addr = 0x00000 # URAM_A start
+                    self.accelerator_memory_to_sram(accelerator_dram_address=start_dram_address_of_partial_row_complete_matrix,
+                                                sram_address=input_sram_start_addr,
+                                                element_size=m_take_chunk * N)
+
+                    output_sram_wb_addr = 0x80000 # URAM_B start
+                    for row_idx in range(m_take_chunk):
+                        if debug_fmax:
+                            zero_sram_addr = input_sram_start_addr + m_take_chunk * N * bytes_per_element
+                            self.accelerator_memory_to_sram(accelerator_dram_address=ZERO_DRAM_ADDR,
+                                                            sram_address=zero_sram_addr,
+                                                            element_size=UE_VECTOR_SIZE)
+
+                            self.fmax_core(vector_sram_start_addr=zero_sram_addr,
+                                        output_sram_wb_addr=zero_sram_addr,
+                                        N=UE_VECTOR_SIZE,
+                                        fmax_context_addr=row_idx + m_take_chunk_idx)
+                            self.sram_to_accelerator_memory(sram_address=zero_sram_addr,
+                                                            accelerator_dram_address=FMAX_DRAM_ADDR + (i + row_idx + m_take_chunk_idx) * UE_VECTOR_SIZE * bytes_per_element,
+                                                            element_size=UE_VECTOR_SIZE)
+
+                        self.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
+                                                                vector_sram_start_addr=input_sram_start_addr + row_idx * N * bytes_per_element,
+                                                                output_sram_wb_addr=output_sram_wb_addr + row_idx * N * bytes_per_element,
+                                                                N=N)
+
+                    self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
+                                                accelerator_dram_address=start_dram_address_of_partial_row_complete_matrix,
+                                                element_size=m_take_chunk * N)
+
+        # Total Theoretical FLOPS: 2 * M * K * N + M * N * 5 (softmax)
+        total_flops = 2 * M * K * N
+        if softmax_enable:
+            total_flops += M * N * 5
+        if bias_enable:
+            total_flops += M * N
+        if gelu_enable or silu_enable:
+            total_flops += 4 * M * N
+        if clamp_enable:
+            total_flops += M * N  # 1 compare + clamp per element
+        if log_enable:
+            total_flops += 2 * M * N  # clamp + log per element
+        print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
+        return total_flops
 
     def matmat_mul_core_pbi(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
                              is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
@@ -4034,258 +4168,6 @@ class UnifiedEngine:
             total_flops += M * N * 5
         if gelu_enable or silu_enable or sigmoid_enable:
             total_flops += M * N
-        if clamp_enable:
-            total_flops += M * N  # 1 compare + clamp per element
-        if log_enable:
-            total_flops += 2 * M * N  # clamp + log per element
-        print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
-        return total_flops
-
-    def matmat_mul_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
-                            is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
-                            clamp_enable: bool = False, log_enable: bool = False,
-                            debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
-                            write_back_disable: bool = False, gpr_M_reg: int = None) -> None:
-        """Matrix multiply entrypoint; dispatches based on ``gpr_M_reg``:
-
-        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`matmat_mul_core_pbi` — outer M-tile loop trip
-          count is taken from that register at runtime (caller must prime it via ``ADD_SET``). The
-          captured program has no static reference to ``M``; ``M`` is FLOPs-accounting only.
-        - ``gpr_M_reg is None`` (default): :meth:`matmat_mul_core_legacy` — compile-time M tiling.
-
-        **Layout:** ``A`` is **M×K** (row-major). ``B`` is **N×K** (row-major); the accelerator uses ``B`` as above and
-        applies an implicit transpose so the computed result is **A @ Bᵀ**, i.e. **M×N**, without a separate transpose pass.
-        """
-        if gpr_M_reg is not None:
-            return self.matmat_mul_core_pbi(
-                M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
-                is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
-                clamp_enable, log_enable,
-                debug_fmax, ZERO_DRAM_ADDR, FMAX_DRAM_ADDR,
-                write_back_disable=write_back_disable, gpr_M_reg=gpr_M_reg,
-            )
-        return self.matmat_mul_core_legacy(
-            M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
-            is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
-            clamp_enable, log_enable,
-            debug_fmax, ZERO_DRAM_ADDR, FMAX_DRAM_ADDR,
-            write_back_disable=write_back_disable,
-        )
-
-    def matmat_mul_core_legacy(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
-                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
-                             clamp_enable: bool = False, log_enable: bool = False,
-                             debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
-                             write_back_disable: bool = False) -> None:
-        # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
-        # 1. M_chunk can be any value between 1 and M
-        # 2. N_chunk needs to be a multiple of UE_VECTOR_SIZE
-        # 3. M_chunk * K + N_chunk * M_chunk must be less than or equal to URAM_FULL_ELEMENTS
-
-        bytes_per_element = 2
-        bias_enable = C_DRAM_ADDR is not None
-
-        if bias_enable:
-            assert bias_mode in ("broadcast_N", "full_matrix"), f"bias_mode={bias_mode} must be either 'broadcast_N' or 'full_matrix'"
-
-        if is_B_quantized:
-            assert data_type in (TYPE.IF4, TYPE.IF8), f"data_type={data_type} must be one of TYPE.IF4, TYPE.IF8"
-
-        assert sum([gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable]) <= 1, "only one activation can be True"
-
-        if softmax_enable:
-            if debug_fmax:
-                assert ZERO_DRAM_ADDR is not None, "ZERO_DRAM_ADDR must be provided when debug_fmax=True"
-                assert FMAX_DRAM_ADDR is not None, "FMAX_DRAM_ADDR must be provided when debug_fmax=True"
-
-        lalu_mode = LALU_MODE.BYPASS
-        lalu_a = 0
-        lalu_b = 0
-        if gelu_enable:
-            lalu_mode = LALU_MODE.ACT
-            lalu_a = LALU_ACT_GELU_A
-            lalu_b = LALU_ACT_GELU_B
-        elif silu_enable:
-            lalu_mode = LALU_MODE.ACT
-            lalu_a = LALU_ACT_SILU_A
-            lalu_b = LALU_ACT_SILU_B
-        elif sigmoid_enable:
-            lalu_mode = LALU_MODE.ACT_NO_X
-            lalu_a = LALU_ACT_SIGMOID_A
-            lalu_b = LALU_ACT_SIGMOID_B
-        elif clamp_enable:
-            lalu_mode = LALU_MODE.CLAMP
-            lalu_a = LALU_CLAMP_RELU_A
-            lalu_b = LALU_CLAMP_RELU_B
-        elif log_enable:
-            lalu_mode = LALU_MODE.LOG
-            lalu_a = LALU_LOG_A
-            lalu_b = LALU_LOG_B
-
-        # Calculate N_chunk
-        N_chunk = min(N, (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-        N_chunk_aligned = None
-        if N_chunk < UE_VECTOR_SIZE:
-            # Try 32(2 bursts) and 16(1 burst)
-            if (K * 32) <= URAM_NEAR_FULL_ELEMENTS:
-                N_chunk = 32
-            elif (K * 16) <= URAM_NEAR_FULL_ELEMENTS:
-                N_chunk = 16
-            else:
-                assert False, f"N={N} is too large to fit in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
-            N_chunk_aligned = UE_VECTOR_SIZE
-
-        assert N_chunk <= N, f"N_chunk={N_chunk} must be less than or equal to N={N}"
-
-        if N_chunk_aligned is None:
-            # Calculate M_chunk
-            if softmax_enable:
-                M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, URAM_FULL_ELEMENTS // (K + N_chunk)) # fmax_context is UE_FMAX_CONTEXT_SIZE elements
-            else:
-                M_chunk = min(M, URAM_FULL_ELEMENTS // (K + N_chunk))
-        else:
-            # Calculate M_chunk
-            if softmax_enable:
-                M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, URAM_FULL_ELEMENTS // (K + N_chunk_aligned)) # fmax_context is UE_FMAX_CONTEXT_SIZE elements
-            else:
-                M_chunk = min(M, URAM_FULL_ELEMENTS // (K + N_chunk_aligned))
-
-        assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
-
-        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
-
-        if N_chunk_aligned is None:
-            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-        else:
-            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk_aligned) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-
-        for i, m_take in self.chunk_ranges(M, M_chunk):
-            self.accelerator_memory_to_sram(accelerator_dram_address=A_DRAM_ADDR + i * K * bytes_per_element,
-                                            sram_address=0x00000,
-                                            element_size=m_take * K)
-
-            output_sram_wb_addr = 0x00000 + m_take * K * bytes_per_element
-            assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} is greater than or equal to 0x80000, which is the size of URAM_B"
-
-            clear_en = 1
-            for j, n_take in self.chunk_ranges(N, N_chunk):
-                if is_B_quantized:
-                    if data_type == TYPE.IF4:
-                        offset = j * K >> 1
-                    elif data_type == TYPE.IF8:
-                        offset = j * K
-                    self.start_queue_for_bf16_dequantize_operation(VECTOR_INPUT_DRAM_ADDR=B_DRAM_ADDR + offset,
-                                                                  SCALE_INPUT_DRAM_ADDR=SCALE_DRAM_ADDR + ((j * K) // UE_VECTOR_SIZE) * bytes_per_element,
-                                                                  data_type=data_type,
-                                                                  output_sram_wb_addr=0x80000,
-                                                                  element_size=n_take * K)
-                else:
-                    self.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + j * K * bytes_per_element,
-                                                sram_address=0x80000,
-                                                element_size=n_take * K)
-
-                if bias_enable and bias_mode == "broadcast_N":
-                    self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + j * bytes_per_element, element_size=n_take)
-
-                for output_row in range(m_take):
-
-                    if bias_enable and bias_mode == "full_matrix":
-                        self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + ((i + output_row) * N + j) * bytes_per_element,
-                                                             element_size=n_take)
-
-                    in_sram_offset = output_row * K * bytes_per_element
-                    if N_chunk_aligned is None:
-                        out_sram_offset = output_row * n_take * bytes_per_element
-                    else:
-                        out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
-
-                    self.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
-                                                            fmax_context_addr=output_row,
-                                                            vector_sram_start_addr=0x00000 + in_sram_offset,
-                                                            matrix_sram_start_addr=0x80000,
-                                                            output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
-                                                            K=K,
-                                                            N=n_take,
-                                                            bias_enable=bias_enable,
-                                                            lalu_mode=lalu_mode,
-                                                            lalu_a=lalu_a,
-                                                            lalu_b=lalu_b)
-                    clear_en = 0
-
-                # generated matrix is m_take x n_take
-                start_dram_address_of_partial_matrix = OUTPUT_DRAM_ADDR + (i * N + j) * bytes_per_element
-
-                # # LEGACY NOTE: This is the legacy way of copying m_take x n_take matrix to DRAM, check below for new way of copying with stride
-                # for output_row in range(m_take):
-                #     self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + output_row * n_take * bytes_per_element, # every row is n_take elements
-                #                                 accelerator_dram_address=start_dram_address_of_partial_matrix + output_row * N * bytes_per_element,
-                #                                 element_size=n_take)
-
-                # New way of copying with stride
-                if not write_back_disable:
-                    if N_chunk_aligned is None:
-                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                    accelerator_dram_address=start_dram_address_of_partial_matrix,
-                                                    element_size=m_take * n_take,
-                                                    stride_bytes_per_chunk=n_take * bytes_per_element,
-                                                    stride_jump_bytes=N * bytes_per_element)
-                    else: # this means output from matrix-vector operation is non-aligned - less than UE_VECTOR_SIZE elements
-                        for o_row_idx in range(m_take):
-                            self.ue_memcpy_to_dram(
-                                memcpy_type=MEMCPY_TYPE.URAM.value,
-                                uram_type=URAM_SECTION.URAM_A.value,
-                                uram_src_addr=(m_take * K * bytes_per_element >> 7) + o_row_idx,
-                                dram_dst_addr=OUTPUT_DRAM_ADDR + (i * N + j) * bytes_per_element + o_row_idx * N * bytes_per_element,
-                                memcpy_length_bytes=n_take * 2,
-                            )
-
-            if softmax_enable:
-                m_take_chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, m_take)
-                assert m_take_chunk_size >= 1 and m_take_chunk_size <= m_take, f"m_take_chunk_size={m_take_chunk_size} must be greater than 0 and less than m_take={m_take}"
-
-                for m_take_chunk_idx, m_take_chunk in self.chunk_ranges(m_take, m_take_chunk_size):
-                    start_dram_address_of_partial_row_complete_matrix = OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * N * bytes_per_element
-
-                    input_sram_start_addr = 0x00000 # URAM_A start
-                    self.accelerator_memory_to_sram(accelerator_dram_address=start_dram_address_of_partial_row_complete_matrix,
-                                                sram_address=input_sram_start_addr,
-                                                element_size=m_take_chunk * N)
-
-                    output_sram_wb_addr = 0x80000 # URAM_B start
-                    for row_idx in range(m_take_chunk):
-                        if debug_fmax:
-                            zero_sram_addr = input_sram_start_addr + m_take_chunk * N * bytes_per_element
-                            self.accelerator_memory_to_sram(accelerator_dram_address=ZERO_DRAM_ADDR,
-                                                            sram_address=zero_sram_addr,
-                                                            element_size=UE_VECTOR_SIZE)
-
-                            self.fmax_core(vector_sram_start_addr=zero_sram_addr,
-                                        output_sram_wb_addr=zero_sram_addr,
-                                        N=UE_VECTOR_SIZE,
-                                        fmax_context_addr=row_idx + m_take_chunk_idx)
-                            self.sram_to_accelerator_memory(sram_address=zero_sram_addr,
-                                                            accelerator_dram_address=FMAX_DRAM_ADDR + (i + row_idx + m_take_chunk_idx) * UE_VECTOR_SIZE * bytes_per_element,
-                                                            element_size=UE_VECTOR_SIZE)
-
-                        self.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
-                                                                vector_sram_start_addr=input_sram_start_addr + row_idx * N * bytes_per_element,
-                                                                output_sram_wb_addr=output_sram_wb_addr + row_idx * N * bytes_per_element,
-                                                                N=N)
-
-                    self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                accelerator_dram_address=start_dram_address_of_partial_row_complete_matrix,
-                                                element_size=m_take_chunk * N)
-
-        # Total Theoretical FLOPS: 2 * M * K * N + M * N * 5 (softmax)
-        total_flops = 2 * M * K * N
-        if softmax_enable:
-            total_flops += M * N * 5
-        if bias_enable:
-            total_flops += M * N
-        if gelu_enable or silu_enable:
-            total_flops += 4 * M * N
         if clamp_enable:
             total_flops += M * N  # 1 compare + clamp per element
         if log_enable:
@@ -5033,6 +4915,65 @@ class UnifiedEngine:
 
         # no FLOPS for this operation
 
+    def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
+                            debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, ATTN_P_DRAM_ADDR: int = None,
+                            gpr_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True):
+        """Flash attention entrypoint; dispatches based on ``gpr_bucket_idx``:
+
+        - ``gpr_bucket_idx`` is a GPR index (1..15): :meth:`flash_attention_core_pbi` — captured
+          program is the ``num_buckets``-way dispatcher; caller must prime that register **with the
+          1-based selector** ``bucket_idx = aligned_seq_len // UE_VECTOR_SIZE`` (via ``ADD_SET``)
+          *before* program execution starts. So ``aligned_seq_len = 64 → 1``, ``128 → 2``,
+          ``UE_VECTOR_SIZE*N → N``. Out-of-range values silently fall through into bucket_1
+          (seq_len=UE_VECTOR_SIZE), which produces wrong activations rather than crashing — so
+          double-check the selector matches the aligned (padded-to-UE_VECTOR_SIZE) seq_len, not the
+          raw one. Requires ``ATTN_P_DRAM_ADDR``. ``seq_len`` is ignored here since the bucketized
+          program covers all bucket sizes; the register is preserved across calls so caller can
+          prime once and invoke many times.
+        - ``gpr_bucket_idx is None`` (default): :meth:`flash_attention_core_legacy` — single static
+          ``seq_len`` body, no dispatcher.
+
+        Returns ``int`` total FLOPS for the legacy path, or ``list[int]`` per-bucket FLOPS for the
+        PBI path (caller selects with ``bucket_flops[gpr_bucket_idx - 1]`` — Python list is 0-based
+        even though the runtime selector is 1-based; see :meth:`flash_attention_core_pbi`).
+        """
+        if gpr_bucket_idx is not None:
+            if ATTN_P_DRAM_ADDR is None:
+                raise ValueError(
+                    "flash_attention_core: gpr_bucket_idx-driven PBI path requires ATTN_P_DRAM_ADDR "
+                    f"(allocate seq_len*seq_len BF16s, i.e. {seq_len * seq_len * 2} bytes)"
+                )
+            return self.flash_attention_core_pbi(
+                head_dim=head_dim,
+                Q_DRAM_ADDR=Q_DRAM_ADDR,
+                K_DRAM_ADDR=K_DRAM_ADDR,
+                V_DRAM_ADDR=V_DRAM_ADDR,
+                OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+                ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
+                BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+                debug_mode=debug_mode,
+                SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
+                IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+                gpr_bucket_idx=gpr_bucket_idx,
+                num_buckets=num_buckets,
+                use_pbi=use_pbi,
+            )
+
+        return self.flash_attention_core_legacy(
+            head_dim=head_dim,
+            seq_len=seq_len,
+            Q_DRAM_ADDR=Q_DRAM_ADDR,
+            K_DRAM_ADDR=K_DRAM_ADDR,
+            V_DRAM_ADDR=V_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+            debug_mode=debug_mode,
+            SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+        )
+
     def flash_attention_core_legacy(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
 
@@ -5585,53 +5526,54 @@ class UnifiedEngine:
             print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
         return total_flops
 
+    # =========================================================================
+    # Decoder group attention (single-query GQA used by autoregressive decode)
+    # =========================================================================
+    def decoder_group_attention_core(
+        self,
+        group_size: int,
+        head_dim: int,
+        seq_len: int,
+        Q_DRAM_ADDR: int,
+        K_DRAM_ADDR: int,
+        V_DRAM_ADDR: int,
+        OUTPUT_DRAM_ADDR: int,
+        SCRATCH_DRAM_ADDR: int,
+        IDENTITY_DRAM_ADDR: int = None,
+        BIAS_DRAM_ADDR: int = None,
+        debug_mode: bool = False,
+        SM_OUTPUT_DRAM_ADDR: int = None,
+        gpr_bucket_idx: int = None,
+        num_buckets: int = 8,
+        use_pbi: bool = True,
+    ):
+        """Decoder group attention entrypoint; dispatches based on ``gpr_bucket_idx``:
 
-    def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
-                            debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, ATTN_P_DRAM_ADDR: int = None,
-                            gpr_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True):
-        """Flash attention entrypoint; dispatches based on ``gpr_bucket_idx``:
-
-        - ``gpr_bucket_idx`` is a GPR index (1..15): :meth:`flash_attention_core_pbi` — captured
-          program is the ``num_buckets``-way dispatcher; caller must prime that register **with the
-          1-based selector** ``bucket_idx = aligned_seq_len // UE_VECTOR_SIZE`` (via ``ADD_SET``)
-          *before* program execution starts. So ``aligned_seq_len = 64 → 1``, ``128 → 2``,
-          ``UE_VECTOR_SIZE*N → N``. Out-of-range values silently fall through into bucket_1
-          (seq_len=UE_VECTOR_SIZE), which produces wrong activations rather than crashing — so
-          double-check the selector matches the aligned (padded-to-UE_VECTOR_SIZE) seq_len, not the
-          raw one. Requires ``ATTN_P_DRAM_ADDR``. ``seq_len`` is ignored here since the bucketized
-          program covers all bucket sizes; the register is preserved across calls so caller can
-          prime once and invoke many times.
-        - ``gpr_bucket_idx is None`` (default): :meth:`flash_attention_core_legacy` — single static
-          ``seq_len`` body, no dispatcher.
-
-        Returns ``int`` total FLOPS for the legacy path, or ``list[int]`` per-bucket FLOPS for the
-        PBI path (caller selects with ``bucket_flops[gpr_bucket_idx - 1]`` — Python list is 0-based
-        even though the runtime selector is 1-based; see :meth:`flash_attention_core_pbi`).
+        - ``gpr_bucket_idx`` is a GPR index (1..15): :meth:`decoder_group_attention_core_pbi` — emits
+          a ``num_buckets``-way bucket dispatcher (each body sized for ``seq_len = K*UE_VECTOR_SIZE``).
+          ``seq_len`` arg is ignored (bucket bodies cover the range). Returns a per-bucket FLOPS list.
+        - ``gpr_bucket_idx is None`` (default): :meth:`decoder_group_attention_core_legacy` — single
+          static-seq_len body. Returns int total FLOPS.
         """
         if gpr_bucket_idx is not None:
-            if ATTN_P_DRAM_ADDR is None:
-                raise ValueError(
-                    "flash_attention_core: gpr_bucket_idx-driven PBI path requires ATTN_P_DRAM_ADDR "
-                    f"(allocate seq_len*seq_len BF16s, i.e. {seq_len * seq_len * 2} bytes)"
-                )
-            return self.flash_attention_core_pbi(
+            return self.decoder_group_attention_core_pbi(
+                group_size=group_size,
                 head_dim=head_dim,
                 Q_DRAM_ADDR=Q_DRAM_ADDR,
                 K_DRAM_ADDR=K_DRAM_ADDR,
                 V_DRAM_ADDR=V_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-                ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
+                gpr_bucket_idx=gpr_bucket_idx,
+                num_buckets=num_buckets,
+                IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 debug_mode=debug_mode,
                 SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
-                IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                gpr_bucket_idx=gpr_bucket_idx,
-                num_buckets=num_buckets,
                 use_pbi=use_pbi,
             )
-
-        return self.flash_attention_core_legacy(
+        return self.decoder_group_attention_core_legacy(
+            group_size=group_size,
             head_dim=head_dim,
             seq_len=seq_len,
             Q_DRAM_ADDR=Q_DRAM_ADDR,
@@ -5639,15 +5581,11 @@ class UnifiedEngine:
             V_DRAM_ADDR=V_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
             SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
             BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
             debug_mode=debug_mode,
             SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
-            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
         )
-
-    # =========================================================================
-    # Decoder group attention (single-query GQA used by autoregressive decode)
-    # =========================================================================
 
     def decoder_group_attention_core_legacy(
         self,
@@ -6143,64 +6081,6 @@ class UnifiedEngine:
         group_flops += 1 * seq_len * 5
         group_flops += 2 * 1 * seq_len * head_dim
         return group_size * group_flops
-
-    def decoder_group_attention_core(
-        self,
-        group_size: int,
-        head_dim: int,
-        seq_len: int,
-        Q_DRAM_ADDR: int,
-        K_DRAM_ADDR: int,
-        V_DRAM_ADDR: int,
-        OUTPUT_DRAM_ADDR: int,
-        SCRATCH_DRAM_ADDR: int,
-        IDENTITY_DRAM_ADDR: int = None,
-        BIAS_DRAM_ADDR: int = None,
-        debug_mode: bool = False,
-        SM_OUTPUT_DRAM_ADDR: int = None,
-        gpr_bucket_idx: int = None,
-        num_buckets: int = 8,
-        use_pbi: bool = True,
-    ):
-        """Decoder group attention entrypoint; dispatches based on ``gpr_bucket_idx``:
-
-        - ``gpr_bucket_idx`` is a GPR index (1..15): :meth:`decoder_group_attention_core_pbi` — emits
-          a ``num_buckets``-way bucket dispatcher (each body sized for ``seq_len = K*UE_VECTOR_SIZE``).
-          ``seq_len`` arg is ignored (bucket bodies cover the range). Returns a per-bucket FLOPS list.
-        - ``gpr_bucket_idx is None`` (default): :meth:`decoder_group_attention_core_legacy` — single
-          static-seq_len body. Returns int total FLOPS.
-        """
-        if gpr_bucket_idx is not None:
-            return self.decoder_group_attention_core_pbi(
-                group_size=group_size,
-                head_dim=head_dim,
-                Q_DRAM_ADDR=Q_DRAM_ADDR,
-                K_DRAM_ADDR=K_DRAM_ADDR,
-                V_DRAM_ADDR=V_DRAM_ADDR,
-                OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-                gpr_bucket_idx=gpr_bucket_idx,
-                num_buckets=num_buckets,
-                IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
-                debug_mode=debug_mode,
-                SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
-                use_pbi=use_pbi,
-            )
-        return self.decoder_group_attention_core_legacy(
-            group_size=group_size,
-            head_dim=head_dim,
-            seq_len=seq_len,
-            Q_DRAM_ADDR=Q_DRAM_ADDR,
-            K_DRAM_ADDR=K_DRAM_ADDR,
-            V_DRAM_ADDR=V_DRAM_ADDR,
-            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
-            debug_mode=debug_mode,
-            SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
-        )
 
     def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False) -> None:
         """Quantized matrix-matrix multiplication core.
@@ -7350,12 +7230,6 @@ class UnifiedEngine:
 
         return bytes_written
 
-    def dram_inst_running(self, enable: bool = True):
-        """
-        Run instructions from DRAM one by one
-        """
-        self.write_reg32(UE_INSTRUCTION_CTL_ADDR, 1 if enable else 0)
-
     def start_execute_from_dram(self, instruction_addr: int = DRAM_INSTRUCTION_ADDR):
         """
         Start executing instructions from DRAM
@@ -7369,6 +7243,23 @@ class UnifiedEngine:
                             (default: DRAM_INSTRUCTION_ADDR)
         """
         self.write_reg32(UE_INSTRUCTION_ADDR, ue_35bit_addr_shifter(instruction_addr))
+
+    def program_execute(self, program_start_addr: int = DRAM_INSTRUCTION_ADDR, timeout: float = 50.0, flops: float = None) -> None:
+        """Execute compiled program from DRAM instruction memory.
+        """
+        print(f"Execute program start at 0x{program_start_addr:X}")
+        self.start_execute_from_dram(program_start_addr)
+        latency, flop_rate_program = 0, 0
+        if timeout == 0:
+            print("Program started")
+        else:
+            self.wait_queue(timeout)
+            latency = self.report_latency_in_us()
+            print(f"    Total program execution latency = {latency} us")
+            if flops is not None:
+                flop_rate_program, _ = self.report_flop_rate_gflops(flops)
+                print(f"Report FLOPS for program execution: {flop_rate_program:.2f} GFLOPS")
+        return latency, flop_rate_program
 
     def software_reset(self):
         """

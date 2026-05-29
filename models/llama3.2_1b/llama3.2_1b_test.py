@@ -536,18 +536,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
-    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 10.0, gflops: float = None) -> None:
-        """Execute compiled program from DRAM instruction memory.
-        """
-        print(f"Execute program start at 0x{program_start_addr:X}")
-        self.start_execute_from_dram(program_start_addr)
-        self.wait_queue(timeout)
-        latency = self.report_latency_in_us()
-        print(f"    Total program execution latency = {latency} us")
-        if gflops is not None:
-            gflops_program, _ = self.report_flop_rate_gflops(gflops)
-            print(f"Report FLOPS for program execution: {gflops_program:.2f} GFLOPS")
-
     def _compile_prefill_program(self, template_seq_len: int, layer_size: int) -> dict:
         """Compile prefill into the active capture session.
 
@@ -866,7 +854,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 half_ahd = ahd // 2               # 32
 
                 # Step 1: K rope in-place (N=512, uses ROPE_SIZE_REG for decode position)
-                total_flops += self.rope_hf_core(
+                total_flops += self.rope_hf_core_decode(
                     N=hd,
                     input_dram_addr=self.LAYER0_K_DRAM,
                     output_dram_addr=self.LAYER0_K_DRAM,
@@ -877,7 +865,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
                 # Step 2: Q rope in-place per 512-dim group (N=512, uses ROPE_SIZE_REG)
                 for g in range(qpkv):
-                    total_flops += self.rope_hf_core(
+                    total_flops += self.rope_hf_core_decode(
                         N=hd,
                         input_dram_addr=self.LAYER0_Q_DRAM + g * hd * bpe,
                         output_dram_addr=self.LAYER0_Q_DRAM + g * hd * bpe,
@@ -1170,7 +1158,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         print(f"\n--- Starting prefill (seq_len={prefill_seq_len}) ---")
         print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
         timer = time.perf_counter()
-        self.program_execute(preamble_addr, gflops=flops_prefill)
+        self.program_execute(preamble_addr, flops=flops_prefill)
         latency_prefill = time.perf_counter() - timer
         print(f"Prefill done in {latency_prefill:.2f}s\n")
 
@@ -1238,7 +1226,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
-            self.program_execute(preamble_addr, gflops=decoder_flops_per_token)
+            self.program_execute(preamble_addr, flops=decoder_flops_per_token)
             token_id = self._select_next_token(recent_tokens)
             recent_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
