@@ -382,6 +382,52 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         """Get the arg max index from the Unified Engine"""
         return self.read_reg32(UE_ARGMAX_INDEX)
 
+    def sample_next_token(self, prev_tokens: list[int]) -> int:
+        """Read full logits from LOGITS_DRAM and sample the next token using the
+        engine's configured ``temperature`` / ``top_k`` / ``top_p`` /
+        ``repetition_penalty``. Greedy fast path (UE_ARGMAX_INDEX) is used when
+        ``temperature == 0`` — caller is expected to dispatch.
+
+        prev_tokens: list of token ids already in the sequence (prompt + decoded).
+                     Used by repetition penalty to down-weight repeated tokens.
+        """
+        vocab = self.EMBEDDING_ELEMENTS
+        bpe = self.bytes_per_element
+        # DMA logits row to host. ~304 KB for Qwen3 vocab; negligible vs decode latency.
+        buf = torch.empty(vocab, dtype=torch.bfloat16)
+        self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
+        logits = buf.float()
+        # Repetition penalty (HF-style): for tokens already seen, divide positive
+        # logits by penalty, multiply negative logits by penalty.
+        rep_pen = float(getattr(self, "repetition_penalty", 1.0))
+        if rep_pen != 1.0 and prev_tokens:
+            seen = torch.tensor(list(set(prev_tokens)), dtype=torch.long)
+            v = logits[seen]
+            logits[seen] = torch.where(v > 0, v / rep_pen, v * rep_pen)
+        # Temperature
+        temp = float(getattr(self, "temperature", 1.0))
+        if temp <= 0:
+            return int(logits.argmax().item())
+        logits = logits / temp
+        # Top-k
+        top_k = int(getattr(self, "top_k", 0) or 0)
+        if top_k > 0 and top_k < vocab:
+            kth = torch.topk(logits, top_k).values[-1]
+            logits[logits < kth] = float("-inf")
+        # Top-p (nucleus)
+        top_p = float(getattr(self, "top_p", 1.0))
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cumprob = torch.cumsum(probs, dim=-1)
+            keep = cumprob <= top_p
+            keep[0] = True
+            drop_idx = sorted_idx[~keep]
+            logits[drop_idx] = float("-inf")
+        probs = torch.softmax(logits, dim=-1)
+        token_id = int(torch.multinomial(probs, num_samples=1).item())
+        return token_id
+
     def _load_last_layer_bf16(self) -> None:
         """Load the last layer's 7 matmul weights as bf16 from the HF model and
         DMA them to params DRAM. The prefill+decoder emit below routes layer
@@ -1215,14 +1261,14 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             # holding absolute cos-base address). gpr_rope_cos_abs was primed once at the
             # start of the bin (= ROPE_LOCAL + gpr_seq_len * rope_row_bytes).
             for kv_h in range(nkvh):
-                total_flops += user_dma_core.UnifiedEngine.rope_hf_core(self,
+                total_flops += user_dma_core.UnifiedEngine.rope_hf_core_decode(self,
                     N=ahd,
                     input_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
                     cos_dram_addr=ROPE_WEIGHT_ADDR,
                     gr_weight_dram=gpr_rope_cos_abs)
             for q_h in range(nkvh * qpkv):
-                total_flops += user_dma_core.UnifiedEngine.rope_hf_core(self,
+                total_flops += user_dma_core.UnifiedEngine.rope_hf_core_decode(self,
                     N=ahd,
                     input_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
@@ -1533,7 +1579,16 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
 
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(10.0)
-            token_id = self.get_arg_max_index()
+            # Greedy fast path uses the HW argmax register; sampling reads logits.
+            # _generated_tokens set by main() for sampling/repetition penalty;
+            # default [] for run_from_bin if main() didn't set it.
+            if not hasattr(self, "_generated_tokens"):
+                self._generated_tokens = []
+            if float(getattr(self, "temperature", 0.0)) > 0:
+                token_id = self.sample_next_token(self._generated_tokens)
+            else:
+                token_id = self.get_arg_max_index()
+            self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             self.seq_len += 1
@@ -1555,6 +1610,20 @@ def main():
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
                         help='Clock cycle time in nanoseconds (default: 5.62ns ≈ peak 22.8 GFLOPS)')
+    # Sampling DEFAULTS to the validated long-context config (temp 0.7 / top-p 0.9
+    # / rep-penalty 1.2): greedy degenerates into template repetition on long
+    # generations, so sampling is the correct default. --temperature 0 forces
+    # the greedy fast path (UE_ARGMAX_INDEX) for deterministic short-prompt tests.
+    parser.add_argument('--temperature', type=float, default=0.7,
+                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.7.')
+    parser.add_argument('--top-k', type=int, default=0,
+                        help='Top-k filter (0=disabled). Active only when --temperature > 0.')
+    parser.add_argument('--top-p', type=float, default=0.9,
+                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p. Default 0.9.')
+    parser.add_argument('--repetition-penalty', type=float, default=1.2,
+                        help='HF-style repetition penalty (>1 down-weights repeated tokens). Default 1.2.')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='RNG seed for reproducible sampling (only when --temperature > 0).')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1594,6 +1663,19 @@ def main():
     prefill_seq = tuple(ue.tokenizer.encode(prompt_with_template, add_special_tokens=False))
     print(f"User prompt ({len(prefill_seq)} tokens): {user_prompt!r}")
     print(f"Sequence ids: {prefill_seq}")
+
+    # Wire sampling config onto the engine BEFORE compile_instructions: the LM-head
+    # writeback gate reads ue.temperature at emit time (writeback ON when sampling).
+    ue.temperature = float(args.temperature)
+    ue.top_k = int(args.top_k)
+    ue.top_p = float(args.top_p)
+    ue.repetition_penalty = float(args.repetition_penalty)
+    ue._generated_tokens = list(prefill_seq)
+    if args.seed is not None and ue.temperature > 0:
+        torch.manual_seed(args.seed)
+    if ue.temperature > 0:
+        print(f"Sampling: temperature={ue.temperature}  top_k={ue.top_k}  "
+              f"top_p={ue.top_p}  repetition_penalty={ue.repetition_penalty}  seed={args.seed}")
 
     print(f"\n--- Compiling unified instruction bin (1 prefill + 1 decoder, dynamic PBI) ---")
     timer = time.perf_counter()

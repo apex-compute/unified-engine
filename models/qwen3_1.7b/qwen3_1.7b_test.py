@@ -1270,14 +1270,14 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # holding absolute cos-base address). gpr_rope_cos_abs was primed once at the
             # start of the bin (= ROPE_LOCAL + gpr_seq_len * rope_row_bytes).
             for kv_h in range(nkvh):
-                total_flops += user_dma_core.UnifiedEngine.rope_hf_core(self,
+                total_flops += user_dma_core.UnifiedEngine.rope_hf_core_decode(self,
                     N=ahd,
                     input_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_K_NORM_DRAM + kv_h * ahd * bpe,
                     cos_dram_addr=ROPE_WEIGHT_ADDR,
                     gr_weight_dram=gpr_rope_cos_abs)
             for q_h in range(nkvh * qpkv):
-                total_flops += user_dma_core.UnifiedEngine.rope_hf_core(self,
+                total_flops += user_dma_core.UnifiedEngine.rope_hf_core_decode(self,
                     N=ahd,
                     input_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_Q_NORM_DRAM + q_h * ahd * bpe,
@@ -1398,7 +1398,11 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # For sampling (temperature > 0) writeback is required so the host
             # can DMA logits back for top-p / top-k / multinomial. Compile-time
             # gate reads ue.temperature, which main() sets before this method.
-            _greedy_lm_head = float(getattr(self, "temperature", 0.0)) <= 0
+            # The diagnostic (_diag_logit_mag) DMA-reads LOGITS_DRAM each step,
+            # so it needs writeback ON even in greedy mode — otherwise it reads
+            # stale DRAM (false NaN/INF). Force writeback when diag is enabled.
+            _greedy_lm_head = (float(getattr(self, "temperature", 0.0)) <= 0
+                               and not getattr(self, "_diag_logit_mag", False))
             total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 is_B_quantized=True, data_type=TYPE.IF4,
@@ -1599,7 +1603,8 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # following step propagates NaN. Gated on self._diag_logit_mag set
             # by main() (CLI --diag-logit-mag); requires a 304 KB C2H DMA per
             # step (~1 ms vs ~270 ms decode latency).
-            if getattr(self, "_diag_logit_mag", False):
+            _diag_on = getattr(self, "_diag_logit_mag", False)
+            if _diag_on:
                 vocab = self.EMBEDDING_ELEMENTS
                 bpe = self.bytes_per_element
                 _buf = torch.empty(vocab, dtype=torch.bfloat16)
@@ -1607,10 +1612,23 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 _lg = _buf.float()
                 _abs = _lg.abs()
                 _step = len(self._generated_tokens)
-                if torch.isnan(_lg).any() or torch.isinf(_lg).any():
-                    print(f"\n[diag] step={_step} LOGITS HIT NaN/INF — argmax={int(_lg.argmax().item())}", flush=True)
+                # top1/top2 margin: a degenerate (near-uniform / collapsed)
+                # distribution shows a small margin; a confident one shows a
+                # large margin. Captured to distinguish "wrong-but-confident"
+                # (upstream KV/hidden corruption) from "flat/collapsed logits".
+                _top2 = torch.topk(_lg, 2).values
+                _margin = (_top2[0] - _top2[1]).item()
+                _tok1 = int(_lg.argmax().item())
+                _ctx = decode_pos + 1
+                _nan = bool(torch.isnan(_lg).any() or torch.isinf(_lg).any())
+                # Use _original_print: the decode loop sets _SILENT_MODE=True so
+                # plain print() (= quiet_print) would swallow the diagnostic.
+                if _nan:
+                    _original_print(f"\n[diag] step={_step} ctx={_ctx} bucket={bucket_idx} LOGITS NaN/INF top1={_tok1}", flush=True)
                 else:
-                    print(f"[diag] step={_step} max|logit|={_abs.max().item():.2f} top1={int(_lg.argmax().item())}", flush=True)
+                    _original_print(f"[diag] step={_step} ctx={_ctx} bucket={bucket_idx} "
+                                    f"max|logit|={_abs.max().item():.2f} margin={_margin:.2f} "
+                                    f"top1={_tok1} {self.tokenizer.decode([_tok1])!r}", flush=True)
             if float(getattr(self, "temperature", 0.0)) > 0:
                 token_id = self.sample_next_token(self._generated_tokens)
             else:
@@ -1637,16 +1655,19 @@ def main():
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
                         help='Clock cycle time in nanoseconds (default: 5.62ns ≈ peak 22.8 GFLOPS)')
-    # Sampling: temperature=0 is the existing greedy fast path (UE_ARGMAX_INDEX).
-    # Any value > 0 enables logit-readback sampling on host with top-k/top-p/rep-penalty.
-    parser.add_argument('--temperature', type=float, default=0.0,
-                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling)')
+    # Sampling DEFAULTS to the validated long-context config (temp 0.7 / top-p 0.9
+    # / rep-penalty 1.2): greedy decoding on this small model degenerates into
+    # template repetition on long generations, so sampling is the correct default.
+    # Pass --temperature 0 to force the greedy fast path (UE_ARGMAX_INDEX, no
+    # host logit readback) for deterministic short-prompt testing.
+    parser.add_argument('--temperature', type=float, default=0.7,
+                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.7.')
     parser.add_argument('--top-k', type=int, default=0,
                         help='Top-k filter (0=disabled). Active only when --temperature > 0.')
-    parser.add_argument('--top-p', type=float, default=1.0,
-                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p.')
-    parser.add_argument('--repetition-penalty', type=float, default=1.0,
-                        help='HF-style repetition penalty (>1 down-weights repeated tokens).')
+    parser.add_argument('--top-p', type=float, default=0.9,
+                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p. Default 0.9.')
+    parser.add_argument('--repetition-penalty', type=float, default=1.2,
+                        help='HF-style repetition penalty (>1 down-weights repeated tokens). Default 1.2.')
     parser.add_argument('--seed', type=int, default=None,
                         help='RNG seed for reproducible sampling (only when --temperature > 0).')
     parser.add_argument('--diag-logit-mag', action='store_true',
@@ -1699,6 +1720,7 @@ def main():
     ue.top_p = float(args.top_p)
     ue.repetition_penalty = float(args.repetition_penalty)
     ue._generated_tokens = list(prefill_seq)   # seed repetition penalty with the prompt
+    ue._diag_logit_mag = bool(args.diag_logit_mag)
     if args.seed is not None and ue.temperature > 0:
         torch.manual_seed(args.seed)
     if ue.temperature > 0:

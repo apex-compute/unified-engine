@@ -293,7 +293,7 @@
     },
     "rope": {
       "head_dim": 1024,
-      "num_positions": 2048,
+      "num_positions": 3072,
       "theta": 1000000.0,
       "local_base": 1000000.0
     },

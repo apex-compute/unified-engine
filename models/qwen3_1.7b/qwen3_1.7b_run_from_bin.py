@@ -895,15 +895,18 @@ def main():
                         help="DMA device name (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=5.62,
                         help="Clock cycle time in ns (default: 5.62ns ≈ peak 22.8 GFLOPS)")
-    # Sampling: temperature=0 → greedy via HW argmax; >0 → host-side sampler with top-k/top-p/rep-penalty.
-    parser.add_argument('--temperature', type=float, default=0.0,
-                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling)')
+    # Sampling DEFAULTS to the validated long-context config (temp 0.7 / top-p 0.9
+    # / rep-penalty 1.2). Greedy decoding degenerates into template repetition on
+    # long generations for this small model, so sampling is the correct default.
+    # Pass --temperature 0 to force the greedy fast path for deterministic testing.
+    parser.add_argument('--temperature', type=float, default=0.7,
+                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.7.')
     parser.add_argument('--top-k', type=int, default=0,
                         help='Top-k filter (0=disabled). Active only when --temperature > 0.')
-    parser.add_argument('--top-p', type=float, default=1.0,
-                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p.')
-    parser.add_argument('--repetition-penalty', type=float, default=1.0,
-                        help='HF-style repetition penalty (>1 down-weights repeated tokens).')
+    parser.add_argument('--top-p', type=float, default=0.9,
+                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p. Default 0.9.')
+    parser.add_argument('--repetition-penalty', type=float, default=1.2,
+                        help='HF-style repetition penalty (>1 down-weights repeated tokens). Default 1.2.')
     parser.add_argument('--seed', type=int, default=None,
                         help='RNG seed for reproducible sampling (only when --temperature > 0).')
     args = parser.parse_args()
