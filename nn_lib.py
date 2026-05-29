@@ -43,8 +43,6 @@ from user_dma_core import (
     UE_VECTOR_SIZE,
     URAM_FULL_ELEMENTS,
     URAM_NEAR_FULL_ELEMENTS,
-    INSTRUCTION_SIZE_BYTES,
-    ue_35bit_addr_shifter,
 )
 
 # Standard URAM section bases used across all _core_dram helpers.
@@ -321,120 +319,11 @@ def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
 # =============================================================================
 # §3 Fused post-add norm variants
 # =============================================================================
-def _rms_norm_core_dram_post_add_pbi(ue, M: int, N: int,
-                                     A_DRAM_ADDR: int, B_DRAM_ADDR: int,
-                                     ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int,
-                                     GAMMA_DRAM_ADDR: int, gpr_M_reg: int) -> int:
-    """PBI runtime-loop variant of rms_norm_core_dram_post_add. One row per iteration:
-    DMA A, DMA B, A+=B, store ADDOUT, rms_norm(A) with preloaded gamma, store NORMOUT.
-    Four pbi_init pointer rows auto-advance by row_bytes per iter; outer loop trip count
-    comes from ``gpr_M_reg`` at runtime."""
-    assert M >= 1, "rms_norm_core_dram_post_add_pbi requires M >= 1"
-    assert N % UE_VECTOR_SIZE == 0, f"PBI requires N % UE_VECTOR_SIZE == 0, got N={N}"
-    assert N <= URAM_NEAR_FULL_ELEMENTS, f"N={N} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
-    assert GAMMA_DRAM_ADDR is not None, "PBI variant requires GAMMA_DRAM_ADDR (use legacy otherwise)"
-    if not (1 <= gpr_M_reg <= 15):
-        raise ValueError(f"gpr_M_reg must be 1..15, got {gpr_M_reg}")
-    assert ue.is_capture_on, "rms_norm_core_dram_post_add_pbi requires active capture"
-
-    bpe = 2
-    row_bytes = N * bpe
-
-    # SRAM layout (matches legacy ordering): vector_A in URAM_A, gamma + vector_B in URAM_B.
-    vector_A_sram = 0x00000
-    gamma_sram   = 0x80000
-    vector_B_sram = gamma_sram + N * bpe
-    assert (vector_B_sram - 0x80000) // bpe + N <= URAM_NEAR_FULL_ELEMENTS, \
-        f"gamma + vector_B don't fit in URAM_B"
-
-    # Preload gamma once (outside the loop).
-    ue.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
-                                  sram_address=gamma_sram, element_size=N)
-
-    _, vector_A_uram_off = ue.sram_address_to_uram_address(vector_A_sram)
-    _, vector_B_uram_off = ue.sram_address_to_uram_address(vector_B_sram)
-
-    ptr_A_load     = ue.alloc_inst_ptr()
-    ptr_B_load     = ue.alloc_inst_ptr()
-    ptr_ADD_store  = ue.alloc_inst_ptr()
-    ptr_NORM_store = ue.alloc_inst_ptr()
-
-    ue.generate_instruction_pbi_init(
-        dram_shared_addr=A_DRAM_ADDR, dma_length=row_bytes,
-        uram_dst_addr=vector_A_uram_off, inst_pointer_idx=ptr_A_load)
-    ue.generate_instruction_pbi_init(
-        dram_shared_addr=B_DRAM_ADDR, dma_length=row_bytes,
-        uram_dst_addr=vector_B_uram_off, inst_pointer_idx=ptr_B_load)
-    ue.generate_instruction_pbi_init(
-        dram_shared_addr=ADDOUTPUT_DRAM_ADDR, dma_length=row_bytes,
-        uram_a_start_addr=vector_A_uram_off, uram_b_start_addr=vector_A_uram_off,
-        inst_pointer_idx=ptr_ADD_store)
-    ue.generate_instruction_pbi_init(
-        dram_shared_addr=NORMOUTPUT_DRAM_ADDR, dma_length=row_bytes,
-        uram_a_start_addr=vector_A_uram_off, uram_b_start_addr=vector_A_uram_off,
-        inst_pointer_idx=ptr_NORM_store)
-
-    # Align loop body so JUMP_ABS lands on the first body instruction (mirrors rms_norm_core_dram_pbi).
-    program_dram_start_addr = ue.get_program_dram_addr()
-    cur_inst_count = ue.capture_count
-    jump_target_word_addr = ue_35bit_addr_shifter(
-        program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
-    )
-    ue.generate_instruction_jump_abs(jump_target_word_addr)
-    ue.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
-
-    # 1. Load A row
-    ue.accelerator_memory_to_sram(accelerator_dram_address=row_bytes,
-                                  sram_address=vector_A_sram, element_size=0,
-                                  inst_pointer_idx=ptr_A_load)
-    # 2. Load B row
-    ue.accelerator_memory_to_sram(accelerator_dram_address=row_bytes,
-                                  sram_address=vector_B_sram, element_size=0,
-                                  inst_pointer_idx=ptr_B_load)
-    # 3. A = A + B (in URAM_A)
-    ue.eltwise_add_core(vector_A_sram, vector_B_sram, vector_A_sram, N)
-    # 4. Store residual (A+B) to ADDOUTPUT
-    ue.sram_to_accelerator_memory(sram_address=vector_A_sram,
-                                  accelerator_dram_address=row_bytes, element_size=0,
-                                  inst_pointer_idx=ptr_ADD_store)
-    # 5. rms_norm in place with preloaded gamma
-    ue.rms_norm_core(vector_A_sram, vector_A_sram, N, gamma_sram)
-    # 6. Store normed result to NORMOUTPUT
-    ue.sram_to_accelerator_memory(sram_address=vector_A_sram,
-                                  accelerator_dram_address=row_bytes, element_size=0,
-                                  inst_pointer_idx=ptr_NORM_store)
-
-    outer_loop_size = ue.loop_end()
-    assert outer_loop_size <= 256, \
-        f"post_add PBI loop body size {outer_loop_size} exceeds i-cache (256)"
-
-    ue.release_inst_ptr(ptr_NORM_store)
-    ue.release_inst_ptr(ptr_ADD_store)
-    ue.release_inst_ptr(ptr_B_load)
-    ue.release_inst_ptr(ptr_A_load)
-
-    total_flops = M * N + 3 * M * N + M * N  # add + rms + gamma_mul
-    return total_flops
-
-
 def rms_norm_core_dram_post_add(ue, M: int, N: int,
                                 A_DRAM_ADDR: int, B_DRAM_ADDR: int,
                                 ADDOUTPUT_DRAM_ADDR: int, NORMOUTPUT_DRAM_ADDR: int,
-                                GAMMA_DRAM_ADDR: int | None = None,
-                                gpr_M_reg: int | None = None) -> int:
-    """rms_norm(A + B). Writes both the pre-norm sum (residual) and the normed output.
-
-    ``gpr_M_reg`` (GPR 1..15): runtime row count via PBI. Captured ISA is M-agnostic;
-    caller must prime the register (ADD_SET) and have ``start_capture`` active. Requires
-    ``GAMMA_DRAM_ADDR`` and ``N % UE_VECTOR_SIZE == 0``. M still required for FLOPs accounting.
-    """
-    if gpr_M_reg is not None:
-        return _rms_norm_core_dram_post_add_pbi(
-            ue, M=M, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR,
-            ADDOUTPUT_DRAM_ADDR=ADDOUTPUT_DRAM_ADDR, NORMOUTPUT_DRAM_ADDR=NORMOUTPUT_DRAM_ADDR,
-            GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, gpr_M_reg=gpr_M_reg,
-        )
-
+                                GAMMA_DRAM_ADDR: int | None = None) -> int:
+    """rms_norm(A + B). Writes both the pre-norm sum (residual) and the normed output."""
     gamma_sram_addr = 0x80000
     params_sram_addr = gamma_sram_addr
 
@@ -786,43 +675,6 @@ def rope_hf_core_dram(ue, M: int, D: int,
 # =============================================================================
 # §9 Flash attention (smolvlm2-derived; decode + prefill GQA-batched)
 # =============================================================================
-def flash_attention_core_pbi_fixed(ue, head_dim: int, seq_len: int,
-                                   Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int,
-                                   OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int,
-                                   ATTN_P_DRAM_ADDR: int,
-                                   BIAS_DRAM_ADDR: int | None = None,
-                                   IDENTITY_DRAM_ADDR: int | None = None) -> int:
-    """Plain PBI flash attention for a **fixed compile-time ``seq_len``** — no bucket
-    dispatcher, no JZ cascade, no ``gpr_bucket_idx``.
-
-    Thin public wrapper over ``ue._flash_attention_pbi_body`` (the same body the bucketized
-    ``flash_attention_core_pbi`` runs inside each bucket). Emits: Vᵀ transpose, Q-scale
-    (1/√head_dim ISA loop), fused Q@Kᵀ + optional full-matrix bias + row softmax →
-    ``ATTN_P_DRAM_ADDR``, then P@V → ``OUTPUT_DRAM_ADDR``. All internal matmuls are
-    ``gpr_M_reg``-driven so the captured ISA is M-agnostic; the body owns its own M-register
-    (allocated + released per call) and contains no outer loop. Caller must have
-    ``start_capture`` active.
-
-    Buffer sizing (caller-allocated): ``ATTN_P_DRAM_ADDR`` holds the ``seq_len² × 2``-byte
-    P = softmax(Q@Kᵀ) intermediate; ``SCRATCH_DRAM_ADDR`` holds Vᵀ. ``BIAS_DRAM_ADDR`` is
-    optional (None = no mask; pass a full-matrix ``seq_len²`` bias for causal/window masking).
-    ``IDENTITY_DRAM_ADDR`` enables the identity-matrix transpose fast path for Vᵀ.
-    Requires ``seq_len % UE_VECTOR_SIZE == 0``. Returns FLOPs for this single body.
-    """
-    return ue._flash_attention_pbi_body(
-        head_dim=head_dim,
-        seq_len=seq_len,
-        Q_DRAM_ADDR=Q_DRAM_ADDR,
-        K_DRAM_ADDR=K_DRAM_ADDR,
-        V_DRAM_ADDR=V_DRAM_ADDR,
-        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-        SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-        ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
-        BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
-        IDENTITY_TRANSPOSE_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-    )
-
-
 def decode_flash_attention_core(ue, head_dim: int, kv_len: int,
                                 Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int,
                                 OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int,
