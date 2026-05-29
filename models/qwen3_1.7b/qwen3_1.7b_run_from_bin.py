@@ -936,6 +936,13 @@ def main():
         sys.exit(1)
 
     set_dma_device(args.dev)
+    # Mirror test.py: rebind the device-name module globals after set_dma_device
+    # so sample_next_token's dma_read(DMA_DEVICE_C2H, ...) resolves (and tracks
+    # the chosen --dev). Without this, DMA_DEVICE_C2H is undefined in this module.
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
     _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
