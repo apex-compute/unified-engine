@@ -60,7 +60,6 @@ class MobileSAM_UE_Run(UnifiedEngine):
         super().__init__(clock_period_ns=clock_period_ns)
         self.script_dir = SCRIPT_DIR
         # Hang prevention
-        self.dram_inst_running(False)
         self.start_capture()
         self.generate_instruction_halt()
         self.stop_capture()

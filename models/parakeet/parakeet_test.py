@@ -385,7 +385,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR, params_dram_base=PARAKEET_PARAMS_BASE, tensor_dram_base=PARAKEET_TENSOR_BASE, program_dram_base=PARAKEET_PROGRAM_BASE, clock_period_ns=clock_period_ns)
         self.script_dir = script_dir or SCRIPT_DIR
         # Hang prevention: stop stale execution, write HALT to program base
-        self.dram_inst_running(False)
         self.start_capture()
         self.generate_instruction_halt()
         self.stop_capture()

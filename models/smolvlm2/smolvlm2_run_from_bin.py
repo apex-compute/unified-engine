@@ -48,7 +48,6 @@ _SMOLVLM2_CFG = _load_smolvlm2_config()
 def init_hang_prevention(ue) -> None:
     """Stop stale execution and write HALT to instruction DRAM base."""
     print("[Init] Hang prevention: disabling instruction execution...")
-    ue.dram_inst_running(False)
     ue.start_capture()
     ue.generate_instruction_halt()
     ue.stop_capture()

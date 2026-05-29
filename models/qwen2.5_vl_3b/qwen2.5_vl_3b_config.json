@@ -1,9 +1,10 @@
 {
   "_template_note": "Qwen2.5-VL-3B-Instruct config. 36 LM layers, 16Q/2KV heads (GQA g=8), head_dim=128, SwiGLU, no QK norm, Q/K/V bias, mRoPE. 32-layer vision encoder.",
   "fixed_isa_regs": {
-    "V_CACHE_SIZE_REG": 1,
-    "TMP_REG": 2,
-    "ROPE_SIZE_REG": 3
+    "TMP_REG":           1,
+    "GF_SEQ_LEN_REG":    2,
+    "GF_Q_SEQ_LEN_REG":  3,
+    "GF_BUCKET_IDX_REG": 4
   },
   "file_info": {
     "layer_size": 40965632,
@@ -19,17 +20,8 @@
   },
   "model": {
     "max_context_size": 512,
+    "prefill_max_seq_len": 384,
     "end_of_turn_token_id": 151645,
-    "decoder_seq_len_buckets": [
-      64,
-      128,
-      192,
-      256,
-      320,
-      384,
-      448,
-      512
-    ],
     "rope_global_layers": []
   },
   "vision": {

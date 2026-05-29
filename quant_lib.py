@@ -360,39 +360,51 @@ def quantize_if4(weight: torch.Tensor, block_size: int = 64,
     """
     N, K, num_blocks_k = _check_2d_blocked(weight, block_size)
     w_bf = weight.detach().cpu().to(torch.bfloat16)
-    blocks_f = w_bf.float().view(N, num_blocks_k, block_size)
-    blocks_bf = w_bf.view(N, num_blocks_k, block_size)
-    abs_max = blocks_f.abs().amax(dim=-1).clamp(min=1e-8)
-
-    # INT4 candidate. The intermediate division is done in fp32
-    int4_scale_bf = (abs_max / 7.0).to(torch.bfloat16)
-    # int4_scaled = (blocks_bf / int4_scale_bf.unsqueeze(-1)).to(torch.bfloat16)
-    int4_scaled = blocks_f / int4_scale_bf.float().unsqueeze(-1)
-    int4_q = int4_scaled.round().clamp(-8, 7)
-    int4_recon = int4_q * int4_scale_bf.float().unsqueeze(-1)
-    int4_err = ((blocks_f - int4_recon) ** 2).sum(dim=-1)
-
-    # FP4 candidate: argmin against neg-to-pos value table, then remap to HW nibble.
     fp4_v = _FP4_VALUES_BF16.float()
-    fp4_scale_bf = (abs_max / 6.0).to(torch.bfloat16)
-    # fp4_scaled = (blocks_bf / fp4_scale_bf.unsqueeze(-1)).to(torch.bfloat16)
-    fp4_scaled = blocks_f / fp4_scale_bf.float().unsqueeze(-1)
-    fp4_idx = (fp4_scaled.float().unsqueeze(-1) - fp4_v).abs().argmin(dim=-1)
-    fp4_recon = fp4_v[fp4_idx] * fp4_scale_bf.float().unsqueeze(-1)
-    fp4_err = ((blocks_f - fp4_recon) ** 2).sum(dim=-1)
 
-    use_q4 = int4_err <= fp4_err
-    if int_variant is True:
-        use_q4 = torch.ones_like(use_q4)
-    elif int_variant is False:
-        use_q4 = torch.zeros_like(use_q4)
+    # Chunk along N to bound peak memory: the FP4 search materializes an
+    # (n_chunk, num_blocks_k, block_size, 16) fp32 tensor — for gemma3's
+    # 262144-row LM head that's ~19 GB unchunked. Cap per-chunk elements
+    # at ~256M (≈1 GB fp32) for that intermediate.
+    elems_per_row = num_blocks_k * block_size * 16
+    chunk_n = max(1, min(N, (256 * 1024 * 1024) // max(1, elems_per_row)))
 
-    scale_bf16 = torch.where(use_q4, -int4_scale_bf, fp4_scale_bf)
+    data_parts: list[bytes] = []
+    scale_parts: list[bytes] = []
+    for start in range(0, N, chunk_n):
+        end = min(start + chunk_n, N)
+        n = end - start
+        blocks_f = w_bf[start:end].float().view(n, num_blocks_k, block_size)
+        abs_max = blocks_f.abs().amax(dim=-1).clamp(min=1e-8)
 
-    q4_nib = (int4_q.to(torch.int8).numpy().astype(np.int16) & 0x0F).astype(np.uint8)
-    fp4_nib = _FP4_NIBBLES[fp4_idx.numpy()]
-    nibbles = np.where(use_q4.numpy()[..., None], q4_nib, fp4_nib).reshape(N, K)
-    return _pack_nibbles(nibbles), _scale_bytes(scale_bf16)
+        int4_scale_bf = (abs_max / 7.0).to(torch.bfloat16)
+        int4_scaled = blocks_f / int4_scale_bf.float().unsqueeze(-1)
+        int4_q = int4_scaled.round().clamp(-8, 7)
+        int4_recon = int4_q * int4_scale_bf.float().unsqueeze(-1)
+        int4_err = ((blocks_f - int4_recon) ** 2).sum(dim=-1)
+
+        fp4_scale_bf = (abs_max / 6.0).to(torch.bfloat16)
+        fp4_scaled = blocks_f / fp4_scale_bf.float().unsqueeze(-1)
+        fp4_idx = (fp4_scaled.float().unsqueeze(-1) - fp4_v).abs().argmin(dim=-1)
+        fp4_recon = fp4_v[fp4_idx] * fp4_scale_bf.float().unsqueeze(-1)
+        fp4_err = ((blocks_f - fp4_recon) ** 2).sum(dim=-1)
+
+        use_q4 = int4_err <= fp4_err
+        if int_variant is True:
+            use_q4 = torch.ones_like(use_q4)
+        elif int_variant is False:
+            use_q4 = torch.zeros_like(use_q4)
+
+        scale_bf16 = torch.where(use_q4, -int4_scale_bf, fp4_scale_bf)
+
+        q4_nib = (int4_q.to(torch.int8).numpy().astype(np.int16) & 0x0F).astype(np.uint8)
+        fp4_nib = _FP4_NIBBLES[fp4_idx.numpy()]
+        nibbles = np.where(use_q4.numpy()[..., None], q4_nib, fp4_nib).reshape(n, K)
+
+        data_parts.append(_pack_nibbles(nibbles))
+        scale_parts.append(_scale_bytes(scale_bf16))
+
+    return b"".join(data_parts), b"".join(scale_parts)
 
 
 def dequantize_if4(
