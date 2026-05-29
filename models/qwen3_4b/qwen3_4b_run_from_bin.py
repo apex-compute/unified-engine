@@ -1,35 +1,33 @@
 #!/usr/bin/env python3
-"""Qwen3-1.7B inference from pre-compiled bins (self-contained offline runner).
+"""Qwen3-4B inference from pre-compiled bins (self-contained offline runner).
 
-This script is self-contained: it does NOT import from qwen3_1.7b_test.py. It
+This script is self-contained: it does NOT import from qwen3_4b_test.py. It
 ships with everything needed to load weights, initialize tensors, load a
-pre-compiled instruction bin from disk, and run prefill + decode. Supports
-host-side temperature / top-p / top-k / repetition-penalty sampling.
+pre-compiled instruction bin from disk, and run prefill + decode.
 
 Requirements on disk (relative to this file):
-  - ``qwen3_1.7b_bin/qwen3_1.7b_config.json``   model config
-  - ``qwen3_1.7b_bin/weights_qwen3_1.7b_hf.bin`` quantized weight bin
-  - ``qwen3_1.7b_bin/qwen3_1.7b_instruction.bin`` pre-compiled program bin
-  - ``qwen3_1.7b_bin/qwen3_1.7b_instruction.json`` compile-meta sidecar
-  - ``qwen3_1.7b_bin/Qwen3-1.7B/`` tokenizer files
+  - ``qwen3_4b_bin/qwen3_4b_config.json``   model config
+  - ``qwen3_4b_bin/weights_qwen3_4b_hf.bin`` quantized weight bin
+  - ``qwen3_4b_bin/qwen3_4b_instruction.bin`` pre-compiled program bin
+  - ``qwen3_4b_bin/qwen3_4b_instruction.json`` compile-meta sidecar
+  - ``qwen3_4b_bin/Qwen3-4B/`` tokenizer files
 
 If any of those are missing, exit early with a clear message. Generate them
-on a build machine that has HF access by running qwen3_1.7b_test.py once.
+on a build machine that has HF access by running qwen3_4b_test.py once.
 
 Architecture notes:
-  - 28 layers, 16 Q / 8 KV heads (group_size=2), actual head_dim=128.
-  - hidden_size=2048, mlp_intermediate=6144, vocab=151936.
+  - 36 layers, 32 Q / 8 KV heads (group_size=4), actual head_dim=128.
+  - hidden_size=2560, mlp_intermediate=9728, vocab=151936.
   - QK RMSNorm per head (gamma_offset=0.0). No post-attn/post-FFN norm.
-  - SwiGLU. Single RoPE base theta=1_000_000.
+  - SwiGLU activation. Single RoPE base theta=1_000_000.
   - Separate lm_head weight (not tied to embedding).
-  - Last layer (L27) routed through bf16 to mitigate INT4 amplification.
+  - Last layer (L35) routed through bf16 to mitigate INT4 amplification.
 
 Usage:
-  python qwen3_1.7b_run_from_bin.py
-  python qwen3_1.7b_run_from_bin.py --prompt "your prompt"
-  python qwen3_1.7b_run_from_bin.py --dev xdma0 [--cycle 5.62]
-  python qwen3_1.7b_run_from_bin.py --local-weights
-  python qwen3_1.7b_run_from_bin.py --temperature 0.7 --top-p 0.9 --repetition-penalty 1.15 --seed 42
+  python qwen3_4b_run_from_bin.py
+  python qwen3_4b_run_from_bin.py --prompt "your prompt"
+  python qwen3_4b_run_from_bin.py --dev xdma0 [--cycle 5.62]
+  python qwen3_4b_run_from_bin.py --local-weights
 """
 
 import json
@@ -94,7 +92,7 @@ def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 6
     return (data_bytes, scale_bytes)
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_qwen3_1.7b_hf.bin from Hugging Face model per qwen3_1.7b_config.json layout.
+    """Generate weights_qwen3_4b_hf.bin from Hugging Face model per qwen3_4b_config.json layout.
     Returns the path to the written file. Use this bin to replace full_model_weights.bin."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -253,8 +251,8 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     return model, model_dir
 
 def _load_config(script_dir: str) -> dict:
-    """Load qwen3_1.7b_config.json and build weight_defs (offset/size dict) from regions."""
-    config_path = os.path.join(script_dir, "qwen3_1.7b_config.json")
+    """Load qwen3_4b_config.json and build weight_defs (offset/size dict) from regions."""
+    config_path = os.path.join(script_dir, "qwen3_4b_config.json")
     with open(config_path, "r") as f:
         cfg = json.load(f)
     weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
@@ -268,10 +266,10 @@ def _load_config(script_dir: str) -> dict:
     return cfg
 
 # -----------------------------------------------------------------------------
-# Qwen3-1.7B unified engine
+# Qwen3-4B unified engine
 # -----------------------------------------------------------------------------
-class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
-    """UnifiedEngine for Qwen3-1.7B: loads config + weight bin, compile_prefill/compile_decoder, run_prefill/run_decoder.
+class Qwen3_4b_UnifiedEngine(UnifiedEngine):
+    """UnifiedEngine for Qwen3-4B: loads config + weight bin, compile_prefill/compile_decoder, run_prefill/run_decoder.
 
     Key architectural differences from Gemma3:
       - QK RMSNorm per actual head dim (128), gamma_offset=0.0.
@@ -286,13 +284,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        # Qwen3 DRAM layout starting from 0x00000000 (4 GB DRAM):
-        #   params: 0x00000000 – 0x58000000 (~1.4 GB, covers layers + LM_HEAD + ROPE)
-        #   tensors: 0x58000000 – 0x98000000 (~1 GB, intermediates + KV cache)
-        #   instructions: 0x98000000 – 0xA0000000 (128 MB)
+        # Qwen3-4B DRAM layout (weights ~2.15 GB → needs more params region than 1.7B):
+        #   params:       0x00000000 – 0x90000000 (~2.25 GB)
+        #   tensors:      0x90000000 – 0xE0000000 (~1.25 GB, KV cache + activations)
+        #   instructions: 0xE0000000 – 0x100000000 (~512 MB, compiled bin)
         super().__init__(
             params_dram_base=0x00000000,
-            tensor_dram_base=0x58000000,
+            tensor_dram_base=0x90000000,
             program_dram_base=0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
@@ -383,71 +381,48 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         return self.read_reg32(UE_ARGMAX_INDEX)
 
     def sample_next_token(self, prev_tokens: list[int]) -> int:
-        """Read full logits from LOGITS_DRAM and sample the next token using the
-        engine's configured ``temperature`` / ``top_k`` / ``top_p`` /
-        ``repetition_penalty``. Greedy fast path (UE_ARGMAX_INDEX) is used when
-        ``temperature == 0`` — caller is expected to dispatch.
-
-        prev_tokens: list of token ids already in the sequence (prompt + decoded).
-                     Used by repetition penalty to down-weight repeated tokens.
-        """
+        """Read full logits from LOGITS_DRAM and sample using temperature /
+        top_k / top_p / repetition_penalty. Greedy (argmax) when temperature==0."""
         vocab = self.EMBEDDING_ELEMENTS
         bpe = self.bytes_per_element
-        # DMA logits row to host. ~304 KB for Qwen3 vocab; negligible vs decode latency.
         buf = torch.empty(vocab, dtype=torch.bfloat16)
         self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
         logits = buf.float()
-        # Repetition penalty (HF-style): for tokens already seen, divide positive
-        # logits by penalty, multiply negative logits by penalty.
         rep_pen = float(getattr(self, "repetition_penalty", 1.0))
         if rep_pen != 1.0 and prev_tokens:
             seen = torch.tensor(list(set(prev_tokens)), dtype=torch.long)
             v = logits[seen]
             logits[seen] = torch.where(v > 0, v / rep_pen, v * rep_pen)
-        # Temperature
         temp = float(getattr(self, "temperature", 1.0))
         if temp <= 0:
             return int(logits.argmax().item())
         logits = logits / temp
-        # Top-k
         top_k = int(getattr(self, "top_k", 0) or 0)
         if top_k > 0 and top_k < vocab:
             kth = torch.topk(logits, top_k).values[-1]
             logits[logits < kth] = float("-inf")
-        # Top-p (nucleus)
         top_p = float(getattr(self, "top_p", 1.0))
         if 0.0 < top_p < 1.0:
             sorted_logits, sorted_idx = torch.sort(logits, descending=True)
             probs = torch.softmax(sorted_logits, dim=-1)
             cumprob = torch.cumsum(probs, dim=-1)
-            # mask tokens whose cumulative prob > top_p (keep at least 1)
             keep = cumprob <= top_p
             keep[0] = True
             drop_idx = sorted_idx[~keep]
             logits[drop_idx] = float("-inf")
         probs = torch.softmax(logits, dim=-1)
-        token_id = int(torch.multinomial(probs, num_samples=1).item())
-        return token_id
-
-    def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
-        """Return (len(token_ids), vector_length) bfloat16 tensor from self.embedding_weight (no scaling)."""
-        tid_t = torch.tensor(token_ids, dtype=torch.long)
-        out = torch.zeros(len(token_ids), self.vector_length, dtype=torch.bfloat16)
-        valid = tid_t < self.embedding_weight.shape[0]
-        out[valid] = self.embedding_weight[tid_t[valid]]
-        return out
+        return int(torch.multinomial(probs, num_samples=1).item())
 
     def _load_last_layer_bf16(self) -> None:
         """Load the last layer's 7 matmul weights as bf16 from the HF model and
         DMA them to params DRAM. The prefill+decoder emit below routes layer
         L=LAYER_SIZE-1 matmuls to these bf16 addresses via the bf16 matmul path,
-        eliminating the INT4 quantization noise that's amplified by L27's
-        extreme RMSNorm gammas (max=153 vs ~1 elsewhere) — which otherwise
-        cascades into long-context "the the the..." / "and and and..." filler
-        token lock-in past ~1500 decoded tokens.
+        eliminating the INT4 quantization noise that's amplified by L35's
+        extreme RMSNorm gammas (which otherwise cascades into long-context
+        filler-token lock-in past ~1500 decoded tokens).
 
-        ~100 MB of params DRAM (50 M params × 2 bytes bf16). Disable via env
-        ``QWEN3_L27_BF16=0`` if DRAM is constrained.
+        Disable via env ``QWEN3_L27_BF16=0`` (env name kept for cross-model
+        consistency with qwen3_1.7b) if DRAM is constrained.
         """
         self._last_layer_bf16_addrs: dict[str, int] = {}
         if os.environ.get("QWEN3_L27_BF16", "1") in ("0", "false", "no"):
@@ -475,10 +450,17 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
             self._last_layer_bf16_addrs[name] = addr
             total_bytes += sz
-        # Free the HF model now that we've extracted what we need.
         del hf_model
         print(f"  bf16 L{self.LAYER_SIZE-1} weights DMA'd: {total_bytes / 1024 / 1024:.1f} MB "
               f"in {_time.perf_counter() - _t0:.1f}s")
+
+    def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
+        """Return (len(token_ids), vector_length) bfloat16 tensor from self.embedding_weight (no scaling)."""
+        tid_t = torch.tensor(token_ids, dtype=torch.long)
+        out = torch.zeros(len(token_ids), self.vector_length, dtype=torch.bfloat16)
+        valid = tid_t < self.embedding_weight.shape[0]
+        out[valid] = self.embedding_weight[tid_t[valid]]
+        return out
 
     def _load_rope_host(self, rope_theta: float | None = None) -> None:
         """Generate per-head RoPE (cos, cos, -sin, sin) on host and write to DRAM.
@@ -584,7 +566,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self._load_rope_host()
 
         # Load last-layer matmul weights as bf16 to mitigate INT4 amplification
-        # at L27's extreme RMSNorm gammas (default-on; QWEN3_L27_BF16=0 to opt out).
+        # at L35's extreme RMSNorm gammas (default-on; QWEN3_L27_BF16=0 to opt out).
         # NOTE: the bin's baked addresses + matmul instruction shape depend on
         # this toggle, so delete the cached *_instruction.bin if you flip it.
         self._load_last_layer_bf16()
@@ -593,7 +575,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         print("Tokenizer loaded successfully.")
 
     def tensor_init(self) -> None:
-        """Initialize hardware DRAM tensors for Qwen3-1.7B.
+        """Initialize hardware DRAM tensors for Qwen3-4B.
 
         KV cache layout (per layer, per KV head):
           LAYER0_V_DRAM[layer][kv_h][t]  (MAX_CONTEXT_SIZE * actual_head_dim per head)
@@ -675,18 +657,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         kv_cache_total = self.LAYER_SIZE * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(kv_cache_total)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(kv_cache_total)
-        # kv_cache_total is in BYTES (bpe=2 baked in). torch.zeros(N, bf16) treats N
-        # as element count, so we want N = kv_cache_total // 2 to get the right
-        # numel × 2 = kv_cache_total bytes. Without the //2 the DMA wrote 2× the
-        # reserved slot, overflowing 224 MB past K_ROPE end into instruction region
-        # (harmless because bin load overwrites it, but sloppy).
-        zero_kv = torch.zeros(kv_cache_total // 2, dtype=torch.bfloat16)
+        zero_kv = torch.zeros(kv_cache_total, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_kv)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_kv)
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
-    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 60.0, gflops: float = None) -> None:
+    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 120.0, gflops: float = None) -> None:
         """Execute compiled program from DRAM instruction memory.
         """
         print(f"Execute program start at 0x{program_start_addr:X}")
@@ -839,29 +816,8 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(10.0)
-            # Greedy fast path uses the HW argmax register; sampling reads logits.
-            # _generated_tokens is set by main() for sampling/repetition penalty;
-            # default to [] for run_from_bin where main() doesn't run.
             if not hasattr(self, "_generated_tokens"):
                 self._generated_tokens = []
-            # Optional per-step logit-magnitude diagnostic. Detects numerical
-            # overflow in the decode pipeline: if logits flip from finite (~20)
-            # to INF/NaN at step T, the K/V cache got poisoned at T and every
-            # following step propagates NaN. Gated on self._diag_logit_mag set
-            # by main() (CLI --diag-logit-mag); requires a 304 KB C2H DMA per
-            # step (~1 ms vs ~270 ms decode latency).
-            if getattr(self, "_diag_logit_mag", False):
-                vocab = self.EMBEDDING_ELEMENTS
-                bpe = self.bytes_per_element
-                _buf = torch.empty(vocab, dtype=torch.bfloat16)
-                self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, _buf, vocab * bpe)
-                _lg = _buf.float()
-                _abs = _lg.abs()
-                _step = len(self._generated_tokens)
-                if torch.isnan(_lg).any() or torch.isinf(_lg).any():
-                    print(f"\n[diag] step={_step} LOGITS HIT NaN/INF — argmax={int(_lg.argmax().item())}", flush=True)
-                else:
-                    print(f"[diag] step={_step} max|logit|={_abs.max().item():.2f} top1={int(_lg.argmax().item())}", flush=True)
             if float(getattr(self, "temperature", 0.0)) > 0:
                 token_id = self.sample_next_token(self._generated_tokens)
             else:
@@ -882,55 +838,53 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
 # -----------------------------------------------------------------------------
 # Offline runner — no compile machinery. Reads meta JSON from disk, loads the
-# pre-compiled bin to DRAM, runs prefill + decoder. Supports sampling.
+# pre-compiled bin to DRAM, runs prefill + decoder.
 # -----------------------------------------------------------------------------
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Qwen3-1.7B inference from pre-compiled bins (offline)")
+    parser = argparse.ArgumentParser(description="Qwen3-4B inference from pre-compiled bins (offline)")
     parser.add_argument("--prompt", type=str, default=None,
-                        help="Text prompt (default: from qwen3_1.7b_config.json default_prompt)")
+                        help="Text prompt (default: from qwen3_4b_config.json default_prompt)")
     parser.add_argument("--local-weights", action="store_true",
-                        help="Use qwen3_1.7b_bin/full_model_weights.bin instead of weights_qwen3_1.7b_hf.bin")
+                        help="Use qwen3_4b_bin/full_model_weights.bin instead of weights_qwen3_4b_hf.bin")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=5.62,
                         help="Clock cycle time in ns (default: 5.62ns ≈ peak 22.8 GFLOPS)")
     # Sampling DEFAULTS to the validated long-context config (temp 0.7 / top-p 0.9
-    # / rep-penalty 1.2). Greedy decoding degenerates into template repetition on
-    # long generations for this small model, so sampling is the correct default.
-    # Pass --temperature 0 to force the greedy fast path for deterministic testing.
+    # / rep-penalty 1.2). --temperature 0 forces greedy fast path.
     parser.add_argument('--temperature', type=float, default=0.7,
                         help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.7.')
     parser.add_argument('--top-k', type=int, default=0,
                         help='Top-k filter (0=disabled). Active only when --temperature > 0.')
     parser.add_argument('--top-p', type=float, default=0.9,
-                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p. Default 0.9.')
+                        help='Top-p (nucleus) filter. Default 0.9.')
     parser.add_argument('--repetition-penalty', type=float, default=1.2,
-                        help='HF-style repetition penalty (>1 down-weights repeated tokens). Default 1.2.')
+                        help='HF-style repetition penalty (>1 down-weights repeats). Default 1.2.')
     parser.add_argument('--seed', type=int, default=None,
                         help='RNG seed for reproducible sampling (only when --temperature > 0).')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    bin_dir = os.path.join(script_dir, "qwen3_1.7b_bin")
+    bin_dir = os.path.join(script_dir, "qwen3_4b_bin")
 
-    weights_bin_rel = ("qwen3_1.7b_bin/full_model_weights.bin" if args.local_weights
-                       else "qwen3_1.7b_bin/weights_qwen3_1.7b_hf.bin")
+    weights_bin_rel = ("qwen3_4b_bin/full_model_weights.bin" if args.local_weights
+                       else "qwen3_4b_bin/weights_qwen3_4b_hf.bin")
     weights_bin_full = os.path.join(script_dir, weights_bin_rel)
 
     # Hard-fail BEFORE any FPGA / HF touch if a required local file is missing.
     missing = []
     if not os.path.exists(weights_bin_full):
         missing.append(os.path.relpath(weights_bin_full, script_dir))
-    for name in ("qwen3_1.7b_instruction.bin", "qwen3_1.7b_instruction.json"):
+    for name in ("qwen3_4b_instruction.bin", "qwen3_4b_instruction.json"):
         if not os.path.exists(os.path.join(bin_dir, name)):
             missing.append(name)
-    tokenizer_dir = os.path.join(bin_dir, "Qwen3-1.7B")
+    tokenizer_dir = os.path.join(bin_dir, "Qwen3-4B")
     if not (os.path.exists(os.path.join(tokenizer_dir, "tokenizer.json")) or
             os.path.exists(os.path.join(tokenizer_dir, "tokenizer_config.json"))):
-        missing.append("Qwen3-1.7B/{tokenizer.json,tokenizer_config.json}")
+        missing.append("Qwen3-4B/{tokenizer.json,tokenizer_config.json}")
     if missing:
-        _original_print("Missing local files (run qwen3_1.7b_test.py first on a build machine with HF access):")
+        _original_print("Missing local files (run qwen3_4b_test.py first on a build machine with HF access):")
         for f in missing:
             _original_print(f"  {f}")
         sys.exit(1)
@@ -950,7 +904,7 @@ def main():
 
     global _SILENT_MODE
     _SILENT_MODE = True
-    ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue = Qwen3_4b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     _SILENT_MODE = False
 
     cfg = ue._cfg
@@ -966,7 +920,12 @@ def main():
     prefill_seq = tuple(ue.tokenizer.encode(prompt_with_template, add_special_tokens=False))
     _original_print(f"User prompt ({len(prefill_seq)} tokens): {user_prompt!r}")
 
-    # Wire sampling config onto the engine so run_decoder/sample_next_token can read it.
+    # Sampling config. NOTE: the LM-head writeback mode is baked into the
+    # pre-compiled bin at compile time (qwen3_4b_test.py). Sampling needs logits
+    # in DRAM (writeback ON), which is the default since test.py defaults to
+    # temperature>0. If the bin was compiled with --temperature 0 (greedy,
+    # writeback OFF), sampling here would read stale logits — recompile via
+    # test.py with sampling defaults first.
     ue.temperature = float(args.temperature)
     ue.top_k = int(args.top_k)
     ue.top_p = float(args.top_p)
@@ -981,7 +940,7 @@ def main():
     # Read meta JSON directly from disk — no compile_instructions call.
     paths_cfg = cfg.get("paths", {})
     inst_bin_path = os.path.join(script_dir, paths_cfg.get("instruction_bin",
-                                  "qwen3_1.7b_bin/qwen3_1.7b_instruction.bin"))
+                                  "qwen3_4b_bin/qwen3_4b_instruction.bin"))
     meta_path = os.path.splitext(inst_bin_path)[0] + ".json"
     with open(meta_path) as _f:
         inst_meta = json.load(_f)
