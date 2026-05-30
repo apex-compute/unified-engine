@@ -133,7 +133,7 @@ def _parse_offset(val) -> int:
 # 1000-image SW eval (src/models/gemma4/compare/summary.md) selected IF4 as
 # the production codec for both LM and vision matmuls; FP4 is a one-string
 # fallback that produces byte-identical wire format.
-from quant_schemas import quantize as _qs_quantize
+from quant_lib import quantize as _qs_quantize
 
 # Parallel quantization. The IF4 codec is pure-CPU and stateless, so we run
 # many tensor quants concurrently via a thread pool — torch ops release the

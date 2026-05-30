@@ -154,7 +154,7 @@ def _parse_offset(val) -> int:
 # deploys never hit this code path, so the import is lazy — that lets the
 # deploy host omit quant_schemas.py entirely for text-only inference.
 try:
-    from quant_schemas import quantize as _qs_quantize
+    from quant_lib import quantize as _qs_quantize
 except ImportError:
     _qs_quantize = None
 
