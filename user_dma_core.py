@@ -261,10 +261,10 @@ WB_PADDING_NEG_INF = 1  # 0xFF80
 # UE_LATENCY_BF20_ITR3 = 2*UE_PIPELINE_BF20_ADD + 2 - 1
 # UE_LATENCY_BF20_ITRGT3 = 3*UE_PIPELINE_BF20_ADD + 2 - 1
 
-# Pipeline component latencies from bf19_mult.vhdl, bf19_add.vhdl, custom_exp.vhdl, adder_tree.vhdl
-UE_PIPELINE_BF19_MULT = 2
+# Pipeline component latencies from bf19_mult.sv, bf19_add.sv, custom_exp.sv, adder_tree.sv
+UE_PIPELINE_BF19_MULT = 3  # +1: split bf19_mult rounding adder at bit 10
 UE_PIPELINE_BF19_ADD = 3
-UE_PIPELINE_CUSTOM_EXP = 5
+UE_PIPELINE_CUSTOM_EXP = 6  # Was 5, +1 to split custom_exp multiply and add
 UE_PIPELINE_ADDER_TREE = 12
 BF20_ADDER_3_CYCLE = True
 UE_LATENCY_BF20_ITR2, UE_LATENCY_BF20_ITR3, UE_LATENCY_BF20_ITRGT3 = ((3, 11, 11) if BF20_ADDER_3_CYCLE else (2, 5, 7))
@@ -293,9 +293,9 @@ UE_LATENCY_ROPE = 8  # Additional mode latency
 UE_LATENCY_MEAN = 20  # Additional mode latency
 
 # LALU pipeline component latencies from timing.md (micro values)
-UE_LALU_PIPELINE_FPDIV = 3  # fpdiv pipeline depth (from fpdiv.vhdl line 561)
-UE_LALU_PIPELINE_FPSQRT = 3  # fpsqrt pipeline depth (split cycle 1 at step 6/7 to close 450 MHz timing)
-UE_LALU_PIPELINE_FACT = 8  # sample_1_plus_exp_bx pipeline depth (from sample_1_plus_exp_bx.vhdl line 9039)
+UE_LALU_PIPELINE_FPDIV = 4  # fpdiv pipeline depth (+1 SRT stage at q6 -> q5 boundary)
+UE_LALU_PIPELINE_FPSQRT = 4  # fpsqrt pipeline depth (+1 final-stage split at T10/S9)
+UE_LALU_PIPELINE_FACT = 10  # sample_1_plus_exp_bx depth: FPMult + custom_exp(6) + FPAdd
 
 # LALU mode latencies calculated from timing.md formulas (shift register delay parameter)
 # Pipeline stages are all 1 cycle (Input Reg + intermediate Reg + Output Reg - 1 for overlap)
@@ -790,7 +790,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x25e4082c, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x25e4082c. Please update FPGA with commit update_3fa1735.bin using update_flash.py (public release v1.1)"
+        assert hw_version == 0x40faba47, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x40faba47. Please update FPGA with commit update_3fa1735.bin using update_flash.py (public release v1.1)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -836,9 +836,9 @@ class UnifiedEngine:
 
         # Configure delay for the last ALU (matching andromeda.c init_unified_engine)
         ue_lalu_delay = (
-            ((UE_QINPUT_DELAY & 0x1F) << 21) +
-            (UE_LATENCY_QUANTIZATION << 16) +
-            (UE_LATENCY_QSCALE << 12) +
+            ((UE_QINPUT_DELAY & 0x1F) << 22) +
+            (UE_LATENCY_QUANTIZATION << 17) +
+            (UE_LATENCY_QSCALE << 13) +
             (UE_LALU_LATENCY_ACT << 8) +
             (UE_LALU_LATENCY_RMS << 4) +
             (UE_LALU_LATENCY_SOFTMAX << 0)
@@ -4459,13 +4459,8 @@ class UnifiedEngine:
     def bf16_transpose_core_pbi(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None) -> None:
         """
         Transposes a (M x N) input matrix X to produce an (N x M) output matrix Y = X^T.
-        Optimized with the PBI mechanism for the innermost loop.
-
-        IDENTITY_DRAM_ADDR: pre-allocated UE_VECTOR_SIZE×UE_VECTOR_SIZE identity matrix in DRAM.
-        Pass the caller-managed address to avoid a per-call allocate_params_dram + dma_write during
-        compile — without this, the write is skipped when the compiled .bin is reused and the
-        identity data is absent at runtime, corrupting all transpose outputs.
-        If None, falls back to allocating + writing inline (compile-time only, breaks on bin skip).
+        Hybrid mode: Python outer loop for N (legacy style for bandwidth efficiency), 
+        Hardware mapped loop for M (PBI optimized).
         """
         bytes_per_element = 2
         # Allocate identity matrix of size UE_VECTOR_SIZE x UE_VECTOR_SIZE in URAM_A start
@@ -4476,7 +4471,7 @@ class UnifiedEngine:
             identity_matrix_dram_addr = self.get_params_dram_addr()
             self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
             self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-
+        
         # transfer identity matrix to URAM_A start
         self.accelerator_memory_to_sram(accelerator_dram_address=identity_matrix_dram_addr,
                                         sram_address=identity_matrix_sram_start_addr,
@@ -4484,50 +4479,27 @@ class UnifiedEngine:
 
         usable_uram_a_start_addr = identity_matrix_sram_start_addr + UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element
         
-        # URAM cap on row strip height.
-        def _largest_uniform_strip(
-            total_dim: int, strip_cap: int, step: int, min_strip: int
-        ) -> int | None:
-            """Largest ``w`` with ``w | total_dim``, ``min_strip <= w <= strip_cap``, ``w % step == 0``."""
-            if strip_cap < min_strip or total_dim < 1:
-                return None
-            upper = min(strip_cap, total_dim)
-            upper = (upper // step) * step
-            if upper < min_strip:
-                return None
-            for cand in range(upper, min_strip - 1, -step):
-                if total_dim % cand == 0:
-                    return cand
-            return None
+        # 1. Calculate theoretical max M_chunk
+        M_chunk = min(M, (URAM_NEAR_FULL_ELEMENTS // N) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+        
+        # 2. Force M_chunk to be a perfect divisor of M so the static hardware loop drops no remainders
+        while M_chunk > 0 and M % M_chunk != 0:
+            M_chunk -= UE_VECTOR_SIZE
+            
+        if M_chunk == 0:
+            raise ValueError(f"Cannot find an M_chunk that evenly divides M={M} with UE_VECTOR_SIZE={UE_VECTOR_SIZE}")
 
-        m_cap_main = min(M, (URAM_NEAR_FULL_ELEMENTS // N) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
         M_chunk_aligned = None
-        num_full_m_tiles = None
-        M_chunk = None
-
-        if m_cap_main >= UE_VECTOR_SIZE:
-            # Multiples-of-64 strips only; maximizes URAM B height subject to cap and ``M_chunk | M``.
-            M_chunk = _largest_uniform_strip(M, m_cap_main, UE_VECTOR_SIZE, UE_VECTOR_SIZE)
-            if M_chunk is not None:
-                num_full_m_tiles = M // M_chunk
-
-        if num_full_m_tiles is None:
-            # Legacy small-``M_chunk`` path: 32 or 16 from N, ``M_chunk_aligned`` for URAM-A output alignment.
+        if M_chunk < UE_VECTOR_SIZE:
             if (N * 32) <= URAM_NEAR_FULL_ELEMENTS:
-                m_cap_small = 32
+                M_chunk = 32
             elif (N * 16) <= URAM_NEAR_FULL_ELEMENTS:
-                m_cap_small = 16
+                M_chunk = 16
             else:
                 assert False, f"N={N} is too large to fit in usable URAM elements={URAM_NEAR_FULL_ELEMENTS}"
-            
             M_chunk_aligned = UE_VECTOR_SIZE
-            M_chunk = _largest_uniform_strip(M, m_cap_small, 16, 16)
-            
-            assert M_chunk is not None, (
-                f"bf16_transpose_core_pbi: no uniform M strip (multiple of 16, ≤{m_cap_small}) divides M={M}. "
-                "Ensure M is perfectly divisible by a valid chunk size to avoid dropping rows."
-            )
-            num_full_m_tiles = M // M_chunk_aligned
+
+        num_full_m_tiles = M // M_chunk
 
         usable_uram_a_elements = URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE
         output_M_size = M_chunk_aligned if M_chunk_aligned is not None else M_chunk
@@ -4548,73 +4520,61 @@ class UnifiedEngine:
         pointer_compute = self.alloc_inst_ptr()
         pointer_output = self.alloc_inst_ptr()
 
-        # Allocate ISA registers for the unified inner hardware loop
-        gpr_n_counter = self.alloc_isa_reg()
-        chunk_size_reg = self.alloc_isa_reg()
-        n_take_reg = self.alloc_isa_reg()
-        dma_bytes_reg = self.alloc_isa_reg()  # scratch: n_take_reg * stride bytes, reused per callsite
-
-        self.generate_instruction_add_set(chunk_size_reg, UE_VECTOR_SIZE)
-        # 1. Initialize N loop counters for this tile
-        self.generate_instruction_add_set(gpr_n_counter, N)
-        self.generate_instruction_reg_min(n_take_reg, gpr_n_counter, chunk_size_reg)
-
-        ISA_FOR_LOOP = 1
-        
-        # --- one-time PBI inits (outside the tile loop) ---
-        if M_chunk_aligned is None:
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=OUTPUT_DRAM_ADDR,
-                output_size=M_chunk * bytes_per_element,
-                uram_a_start_addr=usable_uram_a_start_addr >> 7,
-                inst_pointer_idx=pointer_output,
-            )
-        else:
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=OUTPUT_DRAM_ADDR,
-                dma_length=M_chunk * 2,
-                uram_a_start_addr=usable_uram_a_start_addr >> 7,
-                uram_b_start_addr=usable_uram_a_start_addr >> 7,
-                inst_pointer_idx=pointer_output,
-            )
-
         stride_in_rows = N // UE_VECTOR_SIZE
         init_dma_length = UE_VECTOR_SIZE * M_chunk if stride_in_rows == 1 else M_chunk * N
         init_vector_sram_addr = 0x00000
-        init_matrix_sram_addr = uram_b_start_addr
-        init_output_sram_wb_addr = output_sram_wb_addr
 
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=0,
-            dma_length=init_dma_length,
-            output_size=M_chunk,
-            uram_length=1, # Explicitly seed the exact 1-block dot product length
-            uram_a_start_addr=init_vector_sram_addr >> 7,
-            uram_b_start_addr=init_matrix_sram_addr >> 7,
-            uram_wb_addr=init_output_sram_wb_addr >> 7,
-            inst_pointer_idx=pointer_compute
-        )
+        row_stride_elements = M_chunk if M_chunk_aligned is None else M_chunk_aligned
+        wb_line_delta = row_stride_elements // UE_VECTOR_SIZE
 
-        # abs jump to flush i-cache so the while-loop body lands at the start of a fresh line
-        program_dram_start_addr = self.get_program_dram_addr()
-        cur_inst_count = self.capture_count
-        jump_target_word_addr = ue_35bit_addr_shifter(program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES)
-        self.generate_instruction_jump_abs(jump_target_word_addr)
+        # ===== Legacy Style Python Outer N Loop =====
+        for n_offset, n_take in self.chunk_ranges(N, N_chunk):
+            
+            OUTPUT_DRAM_ADDR_LOCAL = OUTPUT_DRAM_ADDR + n_offset * M * bytes_per_element
+            
+            # Init Input Pointer
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=INPUT_DRAM_ADDR,
+                dma_length=M_chunk * N * bytes_per_element,
+                uram_b_start_addr=(uram_b_start_addr >> 7) & 0xFFF,
+                inst_pointer_idx=pointer_input,
+            )
 
-        # ===== while-loop body start =====
-        body_start_inst_cnt = self.capture_count
+            # Init Output Pointer
+            if M_chunk_aligned is None:
+                self.generate_instruction_pbi_init(
+                    dram_shared_addr=OUTPUT_DRAM_ADDR_LOCAL,
+                    dma_length=n_take * M_chunk * bytes_per_element, # Total DMA bytes explicitly set here
+                    output_size=M_chunk * bytes_per_element,         # Chunk size (prevents 16-bit overflow)
+                    uram_a_start_addr=output_sram_wb_addr >> 7,
+                    inst_pointer_idx=pointer_output,
+                )
+            else:
+                self.generate_instruction_pbi_init(
+                    dram_shared_addr=OUTPUT_DRAM_ADDR_LOCAL,
+                    dma_length=M_chunk * 2,
+                    uram_a_start_addr=output_sram_wb_addr >> 7,
+                    uram_b_start_addr=output_sram_wb_addr >> 7,
+                    inst_pointer_idx=pointer_output,
+                )
 
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=INPUT_DRAM_ADDR,
-            dma_length=M_chunk * N * bytes_per_element,
-            uram_b_start_addr=(0x80000 >> 7) & 0xFFF,
-            inst_pointer_idx=pointer_input,
-        )
+            # Init Compute Pointer (Offsetting uram_b so we pull from the correct columns)
+            compute_uram_b_offset = (n_offset // UE_VECTOR_SIZE)
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=0,
+                dma_length=init_dma_length,
+                output_size=M_chunk,
+                uram_length=1, 
+                uram_a_start_addr=init_vector_sram_addr >> 7,
+                uram_b_start_addr=(uram_b_start_addr >> 7) + compute_uram_b_offset,
+                uram_wb_addr=output_sram_wb_addr >> 7,
+                inst_pointer_idx=pointer_compute
+            )
 
-        for i in range(ISA_FOR_LOOP):
-            # N strip loop
+            # ===== Inner Hardware M Loop =====
             self.loop_start(num_full_m_tiles)
 
+            # 1. Fetch exactly one horizontal M slice (M_chunk * N)
             self.ue_memcpy_from_dram(
                 N * bytes_per_element * M_chunk,
                 0,
@@ -4624,13 +4584,10 @@ class UnifiedEngine:
                 inst_pointer_idx=pointer_input,
             )
 
-            # Hardware Tiling Definitions
-            row_stride_elements = M_chunk if M_chunk_aligned is None else M_chunk_aligned
-            wb_line_delta = row_stride_elements // UE_VECTOR_SIZE
-            stride_in_rows = N // UE_VECTOR_SIZE
-
-            for j in range(ISA_FOR_LOOP):
-                self.loop_start(gpr_loop_cnt=n_take_reg)
+            # 2. Compute `n_take` rows in increments of UE_VECTOR_SIZE
+            for inner_n_offset, inner_n_take in self.chunk_ranges(n_take, UE_VECTOR_SIZE):
+                
+                self.loop_start(inner_n_take)
                 
                 self.ue_arithmetic_op(
                     broadcast_mode=0,
@@ -4647,7 +4604,7 @@ class UnifiedEngine:
                     mode=UE_MODE.BF16_DOT_PRODUCT,
                     data_type=0,
                     uram_a_start_addr=1,                    # +1 line per iteration
-                    uram_b_start_addr=0,                    # 0 (matrix pointer remains stationary)
+                    uram_b_start_addr=0,                    # 0 (matrix pointer remains stationary for these rows)
                     uram_length=0,                          
                     dma_start_addr=0,
                     dma_length=0,                           
@@ -4656,36 +4613,29 @@ class UnifiedEngine:
                     fmax_context_addr=0,
                     inst_pointer_idx=pointer_compute,
                 )
-
                 self.loop_end() 
 
-            self.loop_start(gpr_loop_cnt=n_take_reg)
-            self.generate_instruction_pbi_inc(
-                uram_a_start_addr=-1,
-                uram_wb_addr=-wb_line_delta,
-                inst_pointer_idx=pointer_compute
-            )
-            self.loop_end()
-
-            if M_chunk_aligned is None:
-                self.generate_instruction_reg_mul_imm(dma_bytes_reg, n_take_reg, M_chunk * 2)
+                # Reset uram_a (identity matrix) and advance uram_b (matrix window) for next UE_VECTOR chunk
                 self.generate_instruction_pbi_inc(
-                    general_reg_src=dma_bytes_reg,
-                    pbi_field_select=PBI_FIELD.DMA_LENGTH,
-                    inst_pointer_idx=pointer_output,
+                    uram_a_start_addr=-inner_n_take,
+                    uram_b_start_addr=1,
+                    inst_pointer_idx=pointer_compute
                 )
+
+            # 3. Write back outputs to DRAM
+            if M_chunk_aligned is None:
                 self.ue_memcpy_to_dram(
                     memcpy_type=MEMCPY_TYPE.URAM.value,
                     uram_type=URAM_SECTION.URAM_A.value,
                     uram_src_addr=0,
                     dram_dst_addr=bytes_per_element * M_chunk,
-                    memcpy_length_bytes=0,
-                    stride_bytes_per_chunk=0,
+                    memcpy_length_bytes=0,    # Falls back to PBI pointer's dma_length 
+                    stride_bytes_per_chunk=0, # Falls back to PBI pointer's output_size 
                     stride_jump_bytes=M * bytes_per_element,
                     inst_pointer_idx=pointer_output,
                 )
             else:
-                self.loop_start(gpr_loop_cnt=n_take_reg)
+                self.loop_start(n_take)
                 self.ue_memcpy_to_dram(
                     memcpy_type=MEMCPY_TYPE.URAM.value,
                     uram_type=URAM_SECTION.URAM_A.value,
@@ -4696,8 +4646,8 @@ class UnifiedEngine:
                 )
                 self.loop_end()
 
-                # rewind m_take_reg row strides, then step by N_chunk for the next N strip.
-                self.loop_start(gpr_loop_cnt=n_take_reg)
+                # Rewind and step
+                self.loop_start(n_take)
                 self.generate_instruction_pbi_inc(
                     dram_shared_addr=-M * bytes_per_element,
                     uram_a_start_addr=-1,
@@ -4709,42 +4659,24 @@ class UnifiedEngine:
                     dram_shared_addr=M_chunk * bytes_per_element,
                     inst_pointer_idx=pointer_output,
                 )
+
+            # 4. Rewind Compute Pointers (uram_b and uram_wb) for the next M tile
+            for inner_n_offset, inner_n_take in self.chunk_ranges(n_take, UE_VECTOR_SIZE):
+                self.generate_instruction_pbi_inc(
+                    uram_b_start_addr=-1,
+                    uram_wb_addr=-inner_n_take * wb_line_delta,
+                    inst_pointer_idx=pointer_compute
+                )
+
             self.loop_end()
+            # ===== End Hardware M Loop =====
 
-        # Advance output PBI pointer by (n_take_reg - 1)*M*2 to the start of the next N strip.
-        # Loop n_take_reg times (+M*2 each), then subtract one step (-M*2) for net (n_take_reg-1)*M*2.
-        self.loop_start(gpr_loop_cnt=n_take_reg)
-        self.generate_instruction_pbi_inc(
-            dram_shared_addr=M * bytes_per_element,
-            inst_pointer_idx=pointer_output,
-        )
-        self.loop_end()
-        self.generate_instruction_pbi_inc(
-            dram_shared_addr=-M * bytes_per_element,
-            inst_pointer_idx=pointer_output,
-        )
-
-        self.generate_instruction_pbi_inc(
-            uram_b_start_addr=1,
-            inst_pointer_idx=pointer_compute
-        )
-
-        # ===== while-loop end =====
-        # Decrement remaining-row counter by actual n_take; jump back if rows remain.
-        self.generate_instruction_reg_sub(gpr_n_counter, gpr_n_counter, n_take_reg)
-        self.generate_instruction_reg_min(n_take_reg, gpr_n_counter, chunk_size_reg)
-        outer_loop_size = self.capture_count - body_start_inst_cnt + 2
-        self.generate_instruction_jump_rela_jnz(outer_loop_size, gpr_n_counter)
-
-        # Release ISA and Local Pointer Tracking
-        self.release_isa_reg()
-        self.release_isa_reg()
-        self.release_isa_reg()
-        self.release_isa_reg()
-
+        # Release Local Pointer Tracking
         self.release_inst_ptr(pointer_input)
         self.release_inst_ptr(pointer_compute)
         self.release_inst_ptr(pointer_output)
+
+
 
     def bf16_permute_core(self, dim_0: int, dim_1: int, dim_2: int,
                           INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
