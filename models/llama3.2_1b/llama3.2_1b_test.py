@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -322,7 +322,18 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        super().__init__()
+        # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
+        # 512 MB for the tensor region, which overflows at max_context_size=4096
+        # (attention + activation buffers in tensor_init scale with context). The
+        # tensor region here is 0x58000000..0xE0000000 = 2.25 GB.
+        #   params : 0x00000000 .. 0x58000000  (1.375 GB)  weights + host RoPE
+        #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
+        #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
+        super().__init__(
+            params_dram_base=0x00000000,
+            tensor_dram_base=0x58000000,
+            program_dram_base=0xE0000000,
+        )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
@@ -561,8 +572,19 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+                # Inter-layer copy: previous layer's OUTPUT → next layer's INPUT.
+                # Per-token PBI loop (one row of vector_length per iter, gpr_seq_len trips)
+                # so it never exceeds URAM-A; a single seq_len*vector_length SRAM stage
+                # would overflow URAM once PREFILL_CONTEXT_SIZE > 64 (see notes).
+                self._emit_pbi_scatter_per_token(
+                    read_base=self.LAYER0_OUTPUT_DRAM,
+                    read_stride_bytes=self.vector_length * self.bytes_per_element,
+                    write_specs=[(self.LAYER0_INPUT_DRAM, self.vector_length * self.bytes_per_element)],
+                    sram_byte_addr=0x10000,
+                    element_count=self.vector_length,
+                    gpr_seq_len=self.gpr_seq_len,
+                    template_seq_len=seq_len,
+                )
             total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                               gpr_M_reg=self.gpr_seq_len)
@@ -758,11 +780,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
 
-            # LLaMA: no post-attention norm; add residual directly to o_proj output
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+            # LLaMA: no post-attention norm; add residual directly to o_proj output.
+            # Per-row PBI loop (gpr_seq_len trips) — no URAM cap on prefill length.
+            self.eltwise_core_dram(
+                M=seq_len, N=self.vector_length,
+                dram_a=self.LAYER0_INPUT_DRAM,
+                dram_b=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                dram_out=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                mode=UE_MODE.ELTWISE_ADD,
+                gpr_M_reg=self.gpr_seq_len,
+            )
 
             # LLaMA: post_attention_layernorm IS the pre-FFN norm
             total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
@@ -776,36 +803,30 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
-            # gate × up — chunked row-by-row; seq_len*mlp_elements = 344064 elems = 688KB
-            # which overflows SRAM if loaded in one shot at 0x10000/0x90000.  One row = 16KB ✓
-            _bpe = self.bytes_per_element
-            _row_bytes = self.mlp_elements * _bpe
-            _t_reg = self.alloc_isa_reg()
-            _off_reg = self.alloc_isa_reg()
-            self.generate_instruction_add_set(_t_reg, 0)
-            self.loop_start(loop_cnt=seq_len, gpr_loop_cnt=self.gpr_seq_len)
-            self.generate_instruction_reg_mul_imm(_off_reg, _t_reg, ue_35bit_addr_shifter(_row_bytes))
-            self.generate_instruction_add_imm(_off_reg, ue_35bit_addr_shifter(self.LAYER0_MLP_GATE_DRAM), self.TMP_REG)
-            self.accelerator_memory_to_sram(0, 0x10000, self.mlp_elements, general_reg_src=self.TMP_REG)
-            self.generate_instruction_add_imm(_off_reg, ue_35bit_addr_shifter(self.LAYER0_MLP_UP_DRAM), self.TMP_REG)
-            self.accelerator_memory_to_sram(0, 0x90000, self.mlp_elements, general_reg_src=self.TMP_REG)
-            self.eltwise_mul_core(0x10000, 0x90000, 0x10000, self.mlp_elements)
-            self.generate_instruction_add_imm(_off_reg, ue_35bit_addr_shifter(self.LAYER0_MLP_MULT_DRAM), self.TMP_REG)
-            self.sram_to_accelerator_memory(0x10000, 0, self.mlp_elements, general_reg_src=self.TMP_REG)
-            self.generate_instruction_add_inc(_t_reg)
-            self.loop_end()
-            self.release_isa_reg()  # _off_reg
-            self.release_isa_reg()  # _t_reg
+            # gate × up — per-row PBI loop (gpr_seq_len trips); one row of mlp_elements per iter.
+            self.eltwise_core_dram(
+                M=seq_len, N=self.mlp_elements,
+                dram_a=self.LAYER0_MLP_GATE_DRAM,
+                dram_b=self.LAYER0_MLP_UP_DRAM,
+                dram_out=self.LAYER0_MLP_MULT_DRAM,
+                mode=UE_MODE.ELTWISE_MUL,
+                gpr_M_reg=self.gpr_seq_len,
+            )
             total_flops += self.matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
 
-            # LLaMA: no post-FFN norm; add residual directly to down_proj output
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.PREFILL_CONTEXT_SIZE * self.vector_length)
+            # LLaMA: no post-FFN norm; add residual directly to down_proj output.
+            # Per-row PBI loop (gpr_seq_len trips) — layer_output = POST_ATTN_RESIDUAL + MLP_DOWN.
+            self.eltwise_core_dram(
+                M=seq_len, N=self.vector_length,
+                dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                dram_b=self.LAYER0_MLP_DOWN_DRAM,
+                dram_out=self.LAYER0_OUTPUT_DRAM,
+                mode=UE_MODE.ELTWISE_ADD,
+                gpr_M_reg=self.gpr_seq_len,
+            )
         self.release_isa_reg()  # gpr_tmp
         self.generate_instruction_halt()
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
@@ -977,12 +998,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            # LM head: argmax is tracked in HW during the matvec, so skip the full
-            # vocab-logits writeback to DRAM (write_back_disable). Matches gemma3.
+            # LM head: in greedy mode the HW argmax register is populated as a
+            # pipeline side-effect, so skip the full vocab-logits writeback to DRAM
+            # (write_back_disable). For sampling (temperature > 0) writeback MUST be
+            # enabled so the host can DMA the logits row back for repetition-penalty /
+            # top-k / top-p / multinomial in sample_next_token(). This is a compile-time
+            # gate reading ue.temperature, which main() sets before compile_llama().
+            _greedy_lm_head = float(getattr(self, "temperature", 0.0)) <= 0
             total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                write_back_disable=True)
+                write_back_disable=_greedy_lm_head)
 
         self.generate_instruction_halt()
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
@@ -1012,7 +1038,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             print(f"  delete {instruction_bin_path} to force recompile.")
             return
 
-        template_seq_len = UE_VECTOR_SIZE
+        # Compile the prefill template at PREFILL_CONTEXT_SIZE (the max prompt length).
+        # All loop counts are GPR-driven (gpr_seq_len), so the single cached program
+        # handles any actual prompt length <= PREFILL_CONTEXT_SIZE; template_seq_len is
+        # used only for FLOPs accounting and the flash bucket count.
+        template_seq_len = self.PREFILL_CONTEXT_SIZE
 
         self.clear_inst_id()
         self.start_capture()
@@ -1058,44 +1088,105 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         print(f"Combined instruction image written to {instruction_bin_path} ({len(instruction_bytes)} bytes)")
         print(f"Metadata written to {instruction_meta_path}")
 
-    def _select_next_token(self, recent) -> int:
-        """Pick the next token from the hardware top-4 argmax indices.
+    def _structural_token_ids(self) -> set:
+        """Token ids that must NEVER be repetition-penalized: punctuation, whitespace,
+        newline, and special tokens. Precomputed once from the tokenizer vocab and cached.
 
-        The accelerator exposes the 4 highest-logit token indices (rank 1..4)
-        but not their logit values, so sampling uses a rank-based prior:
-        weight(rank r) = exp(-(r-1)/temperature), with recently emitted tokens
-        divided by ``rep_penalty`` to break greedy repetition loops.
-
-        Defaults (top_k=1, rep_penalty=1.0) reproduce pure greedy argmax.
+        These 'glue' tokens recur constantly in any text; penalizing them over a long
+        generation is what starves a small model of grammatical structure and produces
+        word-salad. Exempting them lets the repetition penalty target only content tokens.
         """
-        top_k = max(1, min(int(getattr(self, "gen_top_k", 1)), 4))
-        temperature = max(1e-3, float(getattr(self, "gen_temperature", 1.0)))
-        rep_penalty = float(getattr(self, "gen_rep_penalty", 1.0))
+        cached = getattr(self, "_struct_ids_cache", None)
+        if cached is not None:
+            return cached
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–’‘“”…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        for i in range(self.EMBEDDING_ELEMENTS):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
 
-        if top_k == 1 and rep_penalty == 1.0:
-            return self.get_arg_max_index(rank=1)
+    def _structural_ids_tensor(self) -> torch.Tensor:
+        """1-D LongTensor of the structural/special token ids (cached) for vectorized
+        exemption in the repetition penalty."""
+        t = getattr(self, "_struct_ids_tensor_cache", None)
+        if t is None:
+            t = torch.tensor(sorted(self._structural_token_ids()), dtype=torch.long)
+            self._struct_ids_tensor_cache = t
+        return t
 
-        cands = []
-        for r in range(1, top_k + 1):
-            idx = self.get_arg_max_index(rank=r)
-            if idx not in cands:
-                cands.append(idx)
+    def sample_next_token(self, prev_tokens: list[int]) -> int:
+        """Read full logits from LOGITS_DRAM and sample the next token using the
+        engine's configured ``temperature`` / ``top_k`` / ``top_p`` /
+        ``repetition_penalty`` (mechanism mirrors qwen3_1.7b). Greedy fast path
+        (HW argmax register) is used when ``temperature <= 0`` — the caller
+        dispatches, this method assumes sampling is enabled.
 
-        weights = []
-        for r, idx in enumerate(cands):
-            w = math.exp(-r / temperature)
-            if rep_penalty != 1.0 and idx in recent:
-                w /= rep_penalty
-            weights.append(w)
+        prev_tokens: token ids already in the sequence (prompt + decoded), used
+                     by the repetition penalty to down-weight repeats.
 
-        total = sum(weights)
-        if total <= 0:
-            return cands[0]
-        rng = getattr(self, "_gen_rng", None)
-        if rng is None:
-            rng = self._gen_rng = np.random.default_rng()
-        probs = [w / total for w in weights]
-        return int(rng.choice(cands, p=probs))
+        Requires the decoder bin to have been compiled with LM-head writeback
+        ENABLED (i.e. temperature > 0 at compile time), so LOGITS_DRAM holds the
+        full vocab row rather than only the HW argmax index.
+        """
+        vocab = self.EMBEDDING_ELEMENTS
+        bpe = self.bytes_per_element
+        # DMA logits row to host. ~256 KB for the Llama vocab; negligible vs decode latency.
+        buf = torch.empty(vocab, dtype=torch.bfloat16)
+        self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
+        logits = buf.float()
+        # Repetition penalty — recency-decayed frequency form (not flat binary).
+        # For each token in the last ``rep_window`` tokens, accumulate a weight
+        #   w[t] = sum over its occurrences of  rep_decay ** age   (age 0 = most recent),
+        # then scale logits by  rep_pen ** w[t]  (divide positives / multiply negatives).
+        # So a token used ONCE a while ago gets w≈small → factor≈1 (barely touched), while
+        # a token looped several times very recently gets a large w → strong suppression.
+        # This fixes two failure modes of the old flat penalty: (1) it no longer flips
+        # intentionally-repeated scaffolding (e.g. "Chapter" reused a paragraph later is
+        # only mildly nudged), and (2) it still crushes genuine short-range loops.
+        # Structural "glue" tokens (punctuation/whitespace/newline/special) stay exempt.
+        rep_pen = float(getattr(self, "repetition_penalty", 1.0))
+        if rep_pen != 1.0 and prev_tokens:
+            rep_window = int(getattr(self, "rep_window", 256))
+            rep_decay = float(getattr(self, "rep_decay", 0.97))
+            window = torch.tensor(prev_tokens[-rep_window:], dtype=torch.long)
+            L = window.numel()
+            ages = torch.arange(L - 1, -1, -1, dtype=torch.float32)   # oldest=L-1 ... newest=0
+            contrib = rep_decay ** ages
+            weight = torch.zeros(vocab, dtype=torch.float32)
+            weight.index_add_(0, window, contrib)                     # recency-weighted count per id
+            weight[self._structural_ids_tensor()] = 0.0               # never penalize glue/special
+            nz = weight > 0
+            if bool(nz.any()):
+                factor = rep_pen ** weight[nz]                        # >= 1, grows with recency*count
+                v = logits[nz]
+                logits[nz] = torch.where(v > 0, v / factor, v * factor)
+        # Temperature
+        temp = float(getattr(self, "temperature", 1.0))
+        if temp <= 0:
+            return int(logits.argmax().item())
+        logits = logits / temp
+        # Top-k
+        top_k = int(getattr(self, "top_k", 0) or 0)
+        if top_k > 0 and top_k < vocab:
+            kth = torch.topk(logits, top_k).values[-1]
+            logits[logits < kth] = float("-inf")
+        # Top-p (nucleus)
+        top_p = float(getattr(self, "top_p", 1.0))
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cumprob = torch.cumsum(probs, dim=-1)
+            # mask tokens whose cumulative prob > top_p (keep at least 1)
+            keep = cumprob <= top_p
+            keep[0] = True
+            drop_idx = sorted_idx[~keep]
+            logits[drop_idx] = float("-inf")
+        probs = torch.softmax(logits, dim=-1)
+        return int(torch.multinomial(probs, num_samples=1).item())
 
     def run_llama(self) -> None:
         """Load the unified instruction image and run prefill + decoder loop.
@@ -1168,10 +1259,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _llama_stop_tokens = {128001, 128008, self._end_of_turn_token_id}
         global _SILENT_MODE
 
-        # Recent-token window for the repetition penalty in _select_next_token.
-        from collections import deque
-        _rep_window = int(getattr(self, "gen_rep_window", 64))
-        recent_tokens = deque(self.prefill_seq[-_rep_window:], maxlen=_rep_window)
+        # Sampling state: repetition penalty in sample_next_token() considers every
+        # token seen so far (prompt + decoded), seeded by main() with the prompt ids.
+        # Falls back to the full prompt when run without main() (e.g. run_from_bin).
+        if not hasattr(self, "_generated_tokens"):
+            self._generated_tokens = list(self.prefill_seq)
+        _sampling = float(getattr(self, "temperature", 0.0)) > 0
 
         # Two-region live counter: pin the bottom terminal row as a status line via
         # an ANSI scroll region; tokens stream in the area above it and the counter
@@ -1227,8 +1320,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             self.clear_capture_buffer()
 
             self.program_execute(preamble_addr, flops=decoder_flops_per_token)
-            token_id = self._select_next_token(recent_tokens)
-            recent_tokens.append(token_id)
+            # Sampling reads the full logits row (writeback enabled at compile time);
+            # greedy uses the HW argmax register (no host readback).
+            if _sampling:
+                token_id = self.sample_next_token(self._generated_tokens)
+            else:
+                token_id = self.get_arg_max_index(rank=1)
+            self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             if token_id in _llama_stop_tokens:
@@ -1259,11 +1357,35 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=1/0.17, help='Clock cycle time in ns (default: ~5.88ns)')
-    parser.add_argument('--top-k', type=int, default=1, help='Sample among the top-k HW argmax indices (1..4). 1 = greedy (default).')
-    parser.add_argument('--temperature', type=float, default=1.0, help='Rank-prior temperature; higher = more diverse (default: 1.0).')
-    parser.add_argument('--repetition-penalty', type=float, default=1.0, help='Divide weight of recently emitted tokens by this (>1 discourages repeats; default: 1.0).')
-    parser.add_argument('--rep-window', type=int, default=64, help='How many recent tokens the repetition penalty considers (default: 64).')
-    parser.add_argument('--seed', type=int, default=None, help='RNG seed for sampling reproducibility.')
+    # Sampling DEFAULTS tuned for the quantized FPGA model (temp 0.6 / top-p 0.9 /
+    # rep-penalty 1.2, recency-decayed + structural-exempt). Two findings drive this:
+    #   - Greedy (temp 0) loops on the FPGA: its reduced-precision arithmetic perturbs
+    #     the logits enough that argmax falls into repetition (greedy is fine on a clean
+    #     int4 GPU run, so this is a hardware-arithmetic effect, not the 4-bit weights).
+    #     => need temperature > 0 to escape the loops.
+    #   - High temp (0.7) samples from the int4-noisy tail and drifts. => keep it modest.
+    # 0.6 is the compromise: enough randomness (with the repetition penalty) to escape
+    # the arithmetic-induced loops, low enough to stay near the robust argmax region.
+    # Pass --temperature 0 for deterministic greedy (HW argmax, no logit readback).
+    parser.add_argument('--temperature', type=float, default=0.6,
+                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.6.')
+    parser.add_argument('--top-k', type=int, default=0,
+                        help='Top-k filter (0=disabled). Active only when --temperature > 0. Default 0.')
+    parser.add_argument('--top-p', type=float, default=0.9,
+                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p. Default 0.9.')
+    parser.add_argument('--repetition-penalty', type=float, default=1.2,
+                        help='HF-style repetition penalty (>1 down-weights repeated tokens). Default 1.2.')
+    parser.add_argument('--rep-window', type=int, default=256,
+                        help='Repetition penalty considers only the last N tokens (and never penalizes '
+                             'punctuation/whitespace/special tokens). Smaller = less structural starvation '
+                             'on long generations. Default 256.')
+    parser.add_argument('--rep-decay', type=float, default=0.97,
+                        help='Recency decay for the repetition penalty (per-token, age-based): a repeat '
+                             'k tokens ago contributes rep_decay**k to its penalty weight. 1.0 = pure '
+                             'frequency (no decay); lower = only very recent repeats matter. Default 0.97 '
+                             '(half-life ~23 tokens).')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='RNG seed for reproducible sampling (only when --temperature > 0).')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1303,12 +1425,27 @@ def main():
 
     ue.prefill_seq = prefill_seq
 
-    # Sampling config (consumed by _select_next_token). Defaults reproduce greedy argmax.
-    ue.gen_top_k = args.top_k
-    ue.gen_temperature = args.temperature
-    ue.gen_rep_penalty = args.repetition_penalty
-    ue.gen_rep_window = args.rep_window
-    ue._gen_rng = np.random.default_rng(args.seed)
+    # Sampling config (consumed by sample_next_token / the LM-head writeback gate).
+    # Must be set BEFORE compile_llama() so the decoder bin is compiled with logits
+    # writeback ON when temperature > 0. Mirrors qwen3_1.7b.
+    ue.temperature = float(args.temperature)
+    ue.top_k = int(args.top_k)
+    ue.top_p = float(args.top_p)
+    ue.repetition_penalty = float(args.repetition_penalty)
+    ue.rep_window = int(args.rep_window)
+    ue.rep_decay = float(args.rep_decay)
+    ue._generated_tokens = list(prefill_seq)   # seed repetition penalty with the prompt
+    if args.seed is not None and ue.temperature > 0:
+        torch.manual_seed(args.seed)
+    if ue.temperature > 0:
+        print(f"Sampling: temperature={ue.temperature}  top_k={ue.top_k}  "
+              f"top_p={ue.top_p}  repetition_penalty={ue.repetition_penalty}  "
+              f"rep_window={ue.rep_window}  rep_decay={ue.rep_decay}  seed={args.seed}")
+        # Precompute the structural-token exemption set upfront (one vocab scan) so it
+        # doesn't stall the first decode step.
+        if ue.repetition_penalty != 1.0:
+            _n = len(ue._structural_token_ids())
+            print(f"  repetition penalty exempts {_n} structural/special tokens (punctuation/whitespace/newline)")
 
     print("\n--- Compiling ---")
     timer = time.perf_counter()
