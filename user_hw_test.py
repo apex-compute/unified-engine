@@ -1471,6 +1471,177 @@ def rope_hf_core_dram_gqa_test(M: int, group_size: int, N: int, use_pbi: bool = 
     ue.reset_tensor_dram_addr()
     ue.reset_program_dram_addr()
 
+def smolvlm_rope_hf_core_dram_pbi_test(M: int, N: int = 64, theta: float = 100000.0):
+    """
+    Exercises rope_hf_core_dram in PBI mode at SmolVLM2 dimensions (head_dim N=64).
+
+    SmolVLM2's RoPE table convention (see _load_rope_tables): per position p,
+        cos_row = [cos(freqs_p) || cos(freqs_p)]            (N elements)
+        sin_row = [sin(freqs_p) || sin(freqs_p)]            (N elements, first half pre-negated)
+    laid out contiguously as [cos_row || sin_row] per token so the kernel reads one
+    2N-element rope row per token. Positions are sequential (0..M-1) as in real prefill.
+
+    head_dim=64 is below the shared PBI rope's N>=128 / 128-byte-half-alignment
+    requirement; this test is the concrete repro for that gap.
+    """
+    ue = UnifiedEngine()
+
+    X_DRAM_ADDR      = ue.allocate_tensor_dram(M * N * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+    ROPE_DRAM_ADDR   = ue.allocate_tensor_dram(M * 2 * N * 2)
+
+    m_reg = ue.alloc_isa_reg()
+
+    ue.start_capture()
+    ue.generate_instruction_add_set(m_reg, M)
+    total_flops = ue.rope_hf_core_dram(
+        M=M, N=N,
+        input_dram_addr=X_DRAM_ADDR,
+        output_dram_addr=OUTPUT_DRAM_ADDR,
+        cos_dram_addr=ROPE_DRAM_ADDR,
+        sin_dram_addr=ROPE_DRAM_ADDR + N * 2,
+        gpr_M_reg=m_reg,
+    )
+    ue.stop_capture()
+    ue.release_isa_reg()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    # Build SmolVLM-style cos/sin for sequential positions 0..M-1.
+    half = N // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, N, 2, dtype=torch.float32) / N))
+    freqs = torch.outer(torch.arange(M, dtype=torch.float32), inv_freq)  # [M, N/2]
+    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=1).to(torch.bfloat16)  # [M, N]
+    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=1).to(torch.bfloat16)  # [M, N]
+    sin_negated = sin.clone()
+    sin_negated[:, :half] = -sin_negated[:, :half]
+
+    x_hf = torch.randn(M, N, dtype=torch.bfloat16)
+    rope_table = torch.cat([cos, sin_negated], dim=1).reshape(-1)  # [M, 2N] -> flat
+
+    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_hf)
+    ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+    print(f"Report FLOPS for SmolVLM HF RoPE PBI: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for M={M}, N={N}")
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+
+    def rotate_half(x):
+        x1 = x[..., :x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    ref = x_hf * cos + rotate_half(x_hf) * sin
+    snr_db = calculate_snr(ref, output)
+    print(f"SmolVLM HF RoPE PBI SNR Analysis: {snr_db:.2f} dB for M={M}, N={N}")
+    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+
+    record_test("smolvlm_rope_hf_core_dram+pbi",
+                f"M={M}, N={N}",
+                snr_db=snr_db,
+                gflops=flop_rate_gflops,
+                inst_bytes=instruction_size_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+def smolvlm_rope_d64_pbi_test(M: int, D: int = 64, theta: float = 100000.0):
+    """
+    Tests nn_lib.rope_hf_core_dram_pbi: the D<128 padded-split RoPE wrapped in a PBI
+    hardware loop (register-addressed reads/writes, 0 PBI pointers). This is the kernel
+    SmolVLM2 prefill needs (head_dim=64).
+
+    Packed per-token rope table = [cos_lo | cos_hi | sin_lo | sin_hi], each 32-elem half
+    zero-padded to UE_VECTOR_SIZE (64) so it is one full 128-byte SRAM row. sin_lo is
+    pre-negated (HW add-only). Positions are sequential (real prefill).
+    """
+    from nn_lib import rope_hf_core_dram_pbi
+
+    ue = UnifiedEngine()
+    PAD = UE_VECTOR_SIZE  # 64
+    half = D // 2
+
+    X_DRAM_ADDR      = ue.allocate_tensor_dram(M * D * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * D * 2)
+    ROPE_PACKED_ADDR = ue.allocate_tensor_dram(M * 4 * PAD * 2)
+
+    gpr_M_reg = ue.alloc_isa_reg()
+    tmp_reg   = ue.alloc_isa_reg()
+    t_reg     = ue.alloc_isa_reg()
+
+    ue.start_capture()
+    ue.generate_instruction_add_set(gpr_M_reg, M)
+    total_flops = rope_hf_core_dram_pbi(
+        ue, M=M, D=D,
+        X_DRAM_ADDR=X_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+        ROPE_PACKED_ADDR=ROPE_PACKED_ADDR,
+        gpr_M_reg=gpr_M_reg, tmp_reg=tmp_reg, t_reg=t_reg,
+    )
+    ue.stop_capture()
+    ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(instruction_size_bytes)
+
+    # SmolVLM-style cos/sin, sequential positions 0..M-1 (only the 32 unique freqs).
+    inv_freq = 1.0 / (theta ** (torch.arange(0, D, 2, dtype=torch.float32) / D))  # [32]
+    freqs = torch.outer(torch.arange(M, dtype=torch.float32), inv_freq)           # [M, 32]
+    cos = torch.cos(freqs).to(torch.bfloat16)  # [M, 32]
+    sin = torch.sin(freqs).to(torch.bfloat16)  # [M, 32]
+
+    def _pad(t):
+        p = torch.zeros(M, PAD, dtype=torch.bfloat16)
+        p[:, :half] = t
+        return p
+    # [cos_lo | cos_hi | sin_lo(neg) | sin_hi], each padded to 64
+    packed = torch.cat([_pad(cos), _pad(cos), _pad(-sin), _pad(sin)], dim=1)  # [M, 256]
+
+    x = torch.randn(M, D, dtype=torch.bfloat16)
+
+    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x)
+    ue.dma_to_accelerator_memory(ROPE_PACKED_ADDR, packed.reshape(-1))
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+    print(f"Report FLOPS for SmolVLM D=64 RoPE PBI: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for M={M}, D={D}")
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, D))
+
+    cos_full = torch.cat([cos, cos], dim=1)  # [M, 64]
+    sin_full = torch.cat([sin, sin], dim=1)  # [M, 64]
+    def rotate_half(t):
+        t1 = t[..., :t.shape[-1] // 2]
+        t2 = t[..., t.shape[-1] // 2:]
+        return torch.cat((-t2, t1), dim=-1)
+    ref = x * cos_full + rotate_half(x) * sin_full
+    snr_db = calculate_snr(ref, output)
+    print(f"SmolVLM D=64 RoPE PBI SNR Analysis: {snr_db:.2f} dB for M={M}, D={D}")
+    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+
+    record_test("smolvlm_rope_d64+pbi",
+                f"M={M}, D={D}",
+                snr_db=snr_db,
+                gflops=flop_rate_gflops,
+                inst_bytes=instruction_size_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
 def bf16_permute_test(dim_0: int, dim_1: int, dim_2: int):
     """
     Tests bf16_permute_core: permutes (dim_0, dim_1, dim_2) -> (dim_1, dim_0, dim_2).
