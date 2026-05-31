@@ -65,6 +65,7 @@ def configure_device(device_name: str, dma_device: str | None = None, base_addr:
         user_dma_core.DRAM_START_ADDR = 0x00000000
         user_dma_core.DRAM_ACTIVATION_ADDR = 0x30000000
         user_dma_core.DRAM_INSTRUCTION_ADDR = 0x3F000000
+        user_dma_core.DRAM_END_ADDR = 0x3FFFFFFF
         user_dma_core.DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
         user_dma_core.DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
         user_dma_core.DMA_DEVICE_USER = "/dev/pcie_dma0_user"
@@ -73,6 +74,7 @@ def configure_device(device_name: str, dma_device: str | None = None, base_addr:
         user_dma_core.DRAM_START_ADDR = 0x80000000
         user_dma_core.DRAM_ACTIVATION_ADDR = 0xB0000000
         user_dma_core.DRAM_INSTRUCTION_ADDR = 0xD0000000
+        user_dma_core.DRAM_END_ADDR = 0xFFFFFFFF
         set_dma_device(dma_device or "xdma0")
 
     return {
@@ -293,7 +295,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False):
         program_dram_base = user_dma_core.DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else user_dma_core.DRAM_INSTRUCTION_ADDR
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
-        super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
+        super().__init__(
+            BASE_ADDR=engine_base,
+            params_dram_base=user_dma_core.DRAM_START_ADDR,
+            program_dram_base=program_dram_base,
+            tensor_dram_base=user_dma_core.DRAM_ACTIVATION_ADDR,
+        )
         self.dual_engine = dual_engine
         self.script_dir = script_dir or SCRIPT_DIR
         self._cfg = self.load_config(script_dir=self.script_dir)
