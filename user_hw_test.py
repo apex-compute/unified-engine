@@ -1207,9 +1207,14 @@ def rms_norm_test(shape: tuple, use_pbi: bool = False):
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool = False):
-    """
-    Tests layer norm core.
+def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool = False,
+                    use_pbi: bool = False):
+    """Tests layer_norm_core_dram.
+
+    When ``use_pbi=True``, primes a fixed GPR with ``M`` before the kernel and passes that
+    register as ``gpr_M_reg`` so the wrapper routes to :meth:`layer_norm_core_dram_pbi` (outer
+    row loop uses a runtime trip count).  When ``use_pbi=False`` the wrapper routes to the
+    legacy compile-time path.
     """
     ue = UnifiedEngine()
 
@@ -1223,23 +1228,29 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     GAMMA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2) if gamma_enable else None
     BETA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2) if beta_enable else None
 
+    _GPR_M_REG = 8  # fixed GPR for PBI row count, stays clear of loop_start internal regs
+
     ue.start_capture()
-
-    total_flops_from_layer_norm = ue.layer_norm_core_dram(M=M, N=N,
-                                                          A_DRAM_ADDR=A_DRAM_ADDR,
-                                                          OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                                                          GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
-                                                          BETA_DRAM_ADDR=BETA_DRAM_ADDR)
-
+    if use_pbi:
+        ue.generate_instruction_add_set(_GPR_M_REG, M)
+    total_flops = ue.layer_norm_core_dram(
+        M=M, N=N,
+        A_DRAM_ADDR=A_DRAM_ADDR,
+        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+        GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
+        BETA_DRAM_ADDR=BETA_DRAM_ADDR,
+        gpr_M_reg=_GPR_M_REG if use_pbi else None,
+    )
     ue.stop_capture()
     ue.generate_instruction_halt()
     program_dram_addr = ue.get_program_dram_addr()
     ue.write_captured_instructions_to_dram(program_dram_addr)
     ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.clear_capture_buffer()
 
-    # Test Time
     x = torch.randn(M, N, dtype=torch.bfloat16)
     ue.dma_to_accelerator_memory(A_DRAM_ADDR, x)
+    gamma = beta = None
     if gamma_enable:
         gamma = torch.randn(N, dtype=torch.bfloat16)
         ue.dma_to_accelerator_memory(GAMMA_DRAM_ADDR, gamma)
@@ -1248,13 +1259,15 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
         ue.dma_to_accelerator_memory(BETA_DRAM_ADDR, beta)
 
     ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0) # 10 seconds timeout
+    ue.wait_queue(10.0)
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"layer_norm_core_trace_{M}_{N}_{'gamma_enabled' if gamma_enable else 'gamma_disabled'}_{'beta_enabled' if beta_enable else 'beta_disabled'}.csv")
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_layer_norm)
-    print(f"Report FLOPS for Layer Norm: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}, gamma_enable={gamma_enable}, beta_enable={beta_enable}")
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+    print(
+        f"Report FLOPS for Layer Norm{'(PBI)' if use_pbi else ''}: "
+        f"{flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for "
+        f"M={M}, N={N}, gamma={gamma_enable}, beta={beta_enable}"
+    )
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
@@ -1270,21 +1283,20 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
         layer_norm.bias.data = torch.zeros(N, dtype=torch.bfloat16)
 
     ref = layer_norm(x)
-    snr_db_ref = calculate_snr(ref, output)
-    print(f"Reference SNR Analysis for Layer Norm: {snr_db_ref:.2f} dB")
-    assert snr_db_ref >= 40 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    snr_db = calculate_snr(ref, output)
+    print(f"Layer Norm SNR Analysis: {snr_db:.2f} dB")
+    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
 
     flags = []
     if gamma_enable: flags.append("gamma")
     if beta_enable:  flags.append("beta")
     flag_str = ("+" + "+".join(flags)) if flags else ""
-    record_test(f"layer_norm{flag_str}",
-                f"M={M}, N={N}",
-                snr_db=snr_db_ref,
-                gflops=flop_rate_gflops)
+    test_name = f"layer_norm{'_pbi' if use_pbi else ''}{flag_str}"
+    record_test(test_name, f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops)
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
 
 def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False):
     """
@@ -1448,6 +1460,77 @@ def rope_hf_core_dram_gqa_test(M: int, group_size: int, N: int, use_pbi: bool = 
 
     record_test(f"rope_hf_core_dram_gqa{'+pbi' if use_pbi else ''}",
                 f"M={M}, G={group_size}, N={N}",
+                snr_db=snr_db,
+                gflops=flop_rate_gflops,
+                inst_bytes=instruction_size_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+def rope_hf_core_decode_test(N: int):
+    """Single-token decode RoPE test exercising rope_hf_core_decode for arbitrary N (including N=64)."""
+    ue = UnifiedEngine()
+
+    X_DRAM_ADDR      = ue.allocate_tensor_dram(N * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
+    COS_DRAM_ADDR    = ue.allocate_tensor_dram(N * 2)
+    SIN_DRAM_ADDR    = ue.allocate_tensor_dram(N * 2)
+
+    ue.start_capture()
+    total_flops = ue.rope_hf_core_decode(
+        N=N,
+        input_dram_addr=X_DRAM_ADDR,
+        output_dram_addr=OUTPUT_DRAM_ADDR,
+        cos_dram_addr=COS_DRAM_ADDR,
+        sin_dram_addr=SIN_DRAM_ADDR,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    head_dim = N
+    MAX_SEQ_LEN = 32768
+    freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
+    random_seq_index = random.randint(0, MAX_SEQ_LEN - 1)
+    one_rope_seq_params = freqs_cis[random_seq_index, :]
+    one_rope_seq = torch.view_as_real(one_rope_seq_params).to(torch.bfloat16).reshape(-1)
+    cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)
+    sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)
+
+    sin_negated = sin.clone()
+    sin_negated[:N // 2] = -sin_negated[:N // 2]
+
+    x_hf = torch.randn(N, dtype=torch.bfloat16)
+
+    ue.dma_to_accelerator_memory(X_DRAM_ADDR,   x_hf)
+    ue.dma_to_accelerator_memory(COS_DRAM_ADDR, cos)
+    ue.dma_to_accelerator_memory(SIN_DRAM_ADDR, sin_negated)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+    print(f"Report FLOPS for HF RoPE decode: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for N={N}")
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (N,))
+
+    def rotate_half(x):
+        x1 = x[..., :x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    ref = x_hf * cos + rotate_half(x_hf) * sin
+    snr_db = calculate_snr(ref, output)
+    print(f"HF RoPE decode SNR Analysis: {snr_db:.2f} dB for N={N}")
+    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+
+    record_test("rope_hf_core_decode",
+                f"N={N}",
                 snr_db=snr_db,
                 gflops=flop_rate_gflops,
                 inst_bytes=instruction_size_bytes)
@@ -4591,6 +4674,10 @@ if __name__ == "__main__":
     dequantize_test(TYPE.IF8, int_variant=True)
     dequantize_test(TYPE.IF8, int_variant=False)
     matmat_mul_non_aligned_writeback_test()
+    rope_hf_core_decode_test(64)
+    rope_hf_core_decode_test(128)
+    rope_hf_core_dram_test(4, 64)
+    rope_hf_core_dram_test(4, 64, use_pbi=True)
     rope_hf_core_dram_test(64, 512)
     rope_hf_core_dram_test(64, 512, use_pbi=True)
     bf16_permute_test(dim_0=144, dim_1=48, dim_2=64)
@@ -4652,14 +4739,16 @@ if __name__ == "__main__":
     matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix", use_pbi=True)
     flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True)
     rms_norm_test(shape=(768, 1024))
-    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True)
+    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True, use_pbi=True)
 
     # --- Additional coverage: extra dimension/feature combinations ---
     bf16_transpose_test(M=2048, N=2048)
     bf16_transpose_test(M=64, N=4096)
     rms_norm_test(shape=(2048, 2048))
     layer_norm_test(shape=(1024, 1024), gamma_enable=True)
+    layer_norm_test(shape=(1024, 1024), gamma_enable=True, use_pbi=True)
     layer_norm_test(shape=(1024, 1024), beta_enable=True)
+    layer_norm_test(shape=(1024, 1024), beta_enable=True, use_pbi=True)
     bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
     matmat_mul_test(M=512, K=2048, N=2048)
     matmat_mul_test(M=128, K=4096, N=512, gelu_enable=True)
