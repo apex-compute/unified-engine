@@ -92,7 +92,7 @@
       },
       {
         "key": "BLK0_ATTN_Q_WEIGHT_DATA",
-        "type": "int4",
+        "type": "if4",
         "attr": "DRAM_ADDR_LAYER0_Q_PROJ_QUANT"
       },
       {
@@ -102,7 +102,7 @@
       },
       {
         "key": "BLK0_ATTN_K_WEIGHT_DATA",
-        "type": "int4",
+        "type": "if4",
         "attr": "DRAM_ADDR_LAYER0_K_PROJ_QUANT"
       },
       {
@@ -112,7 +112,7 @@
       },
       {
         "key": "BLK0_ATTN_V_WEIGHT_DATA",
-        "type": "int4",
+        "type": "if4",
         "attr": "DRAM_ADDR_LAYER0_V_PROJ_QUANT"
       },
       {
@@ -132,7 +132,7 @@
       },
       {
         "key": "BLK0_ATTN_OUTPUT_WEIGHT_DATA",
-        "type": "int4",
+        "type": "if4",
         "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT"
       },
       {
@@ -152,7 +152,7 @@
       },
       {
         "key": "BLK0_FFN_UP_WEIGHT_DATA",
-        "type": "int4",
+        "type": "if4",
         "attr": "DRAM_ADDR_LAYER0_MLP_UP_QUANT"
       },
       {
@@ -162,7 +162,7 @@
       },
       {
         "key": "BLK0_FFN_GATE_WEIGHT_DATA",
-        "type": "int4",
+        "type": "if4",
         "attr": "DRAM_ADDR_LAYER0_MLP_GATE_QUANT"
       },
       {
@@ -172,7 +172,7 @@
       },
       {
         "key": "BLK0_FFN_DOWN_WEIGHT_DATA",
-        "type": "int4",
+        "type": "if4",
         "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_QUANT"
       },
       {
@@ -218,7 +218,7 @@
     "BLK0_ATTN_Q_WEIGHT_DATA": {
       "offset": "0x2F049800",
       "size": 4718592,
-      "type": "int4"
+      "type": "if4"
     },
     "BLK0_ATTN_K_WEIGHT_SCALE": {
       "offset": "0x2F4C9800",
@@ -228,7 +228,7 @@
     "BLK0_ATTN_K_WEIGHT_DATA": {
       "offset": "0x2F4E1800",
       "size": 1572864,
-      "type": "int4"
+      "type": "if4"
     },
     "BLK0_ATTN_V_WEIGHT_SCALE": {
       "offset": "0x2F661800",
@@ -238,7 +238,7 @@
     "BLK0_ATTN_V_WEIGHT_DATA": {
       "offset": "0x2F679800",
       "size": 1572864,
-      "type": "int4"
+      "type": "if4"
     },
     "BLK0_ATTN_Q_NORM_WEIGHT": {
       "offset": "0x2F7F9800",
@@ -258,7 +258,7 @@
     "BLK0_ATTN_OUTPUT_WEIGHT_DATA": {
       "offset": "0x2F842800",
       "size": 4718592,
-      "type": "int4"
+      "type": "if4"
     },
     "BLK0_POST_ATTENTION_NORM_WEIGHT": {
       "offset": "0x2FCC2800",
@@ -278,7 +278,7 @@
     "BLK0_FFN_UP_WEIGHT_DATA": {
       "offset": "0x2FD85800",
       "size": 12582912,
-      "type": "int4"
+      "type": "if4"
     },
     "BLK0_FFN_GATE_WEIGHT_SCALE": {
       "offset": "0x30985800",
@@ -288,7 +288,7 @@
     "BLK0_FFN_GATE_WEIGHT_DATA": {
       "offset": "0x30A45800",
       "size": 12582912,
-      "type": "int4"
+      "type": "if4"
     },
     "BLK0_FFN_DOWN_WEIGHT_SCALE": {
       "offset": "0x31645800",
@@ -298,7 +298,7 @@
     "BLK0_FFN_DOWN_WEIGHT_DATA": {
       "offset": "0x31705800",
       "size": 12582912,
-      "type": "int4"
+      "type": "if4"
     },
     "BLK0_POST_FFW_NORM_WEIGHT": {
       "offset": "0x32305800",
@@ -333,8 +333,7 @@
       "token_embd_offset": "0x0",
       "token_embd_size": "0x2F000000",
       "vocab_size": 128256,
-      "embedding_dim": 3072,
-      "scale": 0.5
+      "embedding_dim": 3072
     },
     "rope": {
       "head_dim": 1024,
@@ -344,11 +343,8 @@
     },
     "quantization": {
       "block_size": 64,
-      "bits": 4,
-      "range": [
-        -8,
-        7
-      ]
+      "if4_variant": "mix",
+      "_note": "4-bit IF4 container (per-block scale sign selects INT4 vs FP4). if4_variant picks the packing policy: int=pure INT4, fp=pure FP4, mix=per-block MixMSE. 3B best=mix; see src/models/llama3.2_3b/compare/summary.md."
     },
     "rms_norm": {
       "gamma_offset": 0.0

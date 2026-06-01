@@ -45,6 +45,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
+# Canonical, HW-aligned 4-bit codec shared across all model templates.
+from quant_lib import quantize_if4
+
+# Map the config's quantization variant string to quantize_if4's int_variant arg.
+# "int" → pure INT4, "fp" → pure FP4, "mix"/"mixmse" → per-block min-MSE (INT4 or FP4).
+_IF4_VARIANT = {"int": True, "fp": False, "mix": None, "mixmse": None}
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -67,25 +73,6 @@ def _parse_offset(val) -> int:
         return int(val, 0)
     return int(val)
 
-def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 64) -> tuple[bytes, bytes]:
-    """Quantize bf16 weight (N_w, K_w) to INT4 packed + scale per block of 64 along K. Returns (data_bytes, scale_bytes)."""
-    w = weight_bf16.detach().cpu().float().reshape(-1)
-    N_w, K_w = weight_bf16.shape
-    assert K_w % block_size == 0
-    w_blocks = w.reshape(N_w, K_w // block_size, block_size)
-    scale = w_blocks.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
-    # IF4 dispatches INT4 vs FP4 by bf16 scale sign (negative=INT4 codebook).
-    scale_bf16 = (-scale).to(torch.bfloat16)
-    w_int8 = (w_blocks / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
-    w_nibbles = w_int8.numpy().astype(np.int16) & 0x0F
-    low = w_nibbles[:, :, 0::2].reshape(N_w, -1)
-    high = w_nibbles[:, :, 1::2].reshape(N_w, -1)
-    packed = (high << 4) | low
-    data_bytes = packed.astype(np.uint8).tobytes()
-    scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
-    return (data_bytes, scale_bytes)
-
-
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
     """Generate weights_llama3.2_3b_hf.bin from HuggingFace model per llama3.2_3b_config.json layout.
     Returns the path to the written file."""
@@ -95,6 +82,10 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     paths = cfg["paths"]
     paths_full = os.path.join(script_dir, paths["weights_bin"])
     out_path = output_path or paths_full
+
+    _q = cfg["special"]["quantization"]
+    block_size = _q.get("block_size", 64)
+    if4_variant = _IF4_VARIANT[_q.get("if4_variant", "int")]   # quantize_if4 int_variant
 
     model, model_dir = _ensure_hf_model(script_dir, cfg)
     gamma_offset = cfg["special"]["rms_norm"]["gamma_offset"]  # 0.0 for LLaMA
@@ -162,17 +153,17 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
         region_writes = [
             (gamma_in, "bf16"),
-            (q_w, "int4"),
-            (k_w, "int4"),
-            (v_w, "int4"),
+            (q_w, "if4"),
+            (k_w, "if4"),
+            (v_w, "if4"),
             (gamma_q, "bf16"),
             (gamma_k, "bf16"),
-            (o_w, "int4"),
+            (o_w, "if4"),
             (gamma_post, "bf16"),
             (gamma_ffn, "bf16"),
-            (up_w, "int4"),
-            (gate_w, "int4"),
-            (down_w, "int4"),
+            (up_w, "if4"),
+            (gate_w, "if4"),
+            (down_w, "if4"),
             (gamma_post_ffn, "bf16"),
         ]
         j = 0
@@ -184,10 +175,10 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
             sz = weight_defs[sz_key]
             file_off = off + layer_idx * LAYER_WEIGHT_SIZE
             tensor, kind = region_writes[j]
-            if kind == "int4":
+            if kind == "if4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
-                data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(tensor)
+                data_bytes, scale_bytes = quantize_if4(tensor, block_size=block_size, int_variant=if4_variant)
                 scale_padded = (scale_bytes + b"\x00" * sz)[:sz]
                 data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
                 write_at(file_off, scale_padded)
@@ -236,7 +227,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     lm_head_w = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
-    data_bytes, scale_bytes = _quantize_bf16_to_int4_packed(lm_head_w)
+    data_bytes, scale_bytes = quantize_if4(lm_head_w, block_size=block_size, int_variant=if4_variant)
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
@@ -1270,9 +1261,9 @@ def main():
     # rep-penalty 1.2, recency-decayed + structural-exempt). Two findings drive this:
     #   - Greedy (temp 0) loops on the FPGA: its reduced-precision arithmetic perturbs
     #     the logits enough that argmax falls into repetition (greedy is fine on a clean
-    #     int4 GPU run, so this is a hardware-arithmetic effect, not the 4-bit weights).
+    #     4-bit GPU run, so this is a hardware-arithmetic effect, not the 4-bit weights).
     #     => need temperature > 0 to escape the loops.
-    #   - High temp (0.7) samples from the int4-noisy tail and drifts. => keep it modest.
+    #   - High temp (0.7) samples from the 4-bit-noisy tail and drifts. => keep it modest.
     # 0.6 is the compromise: enough randomness (with the repetition penalty) to escape
     # the arithmetic-induced loops, low enough to stay near the robust argmax region.
     # Pass --temperature 0 for deterministic greedy (HW argmax, no logit readback).
