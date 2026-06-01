@@ -602,6 +602,45 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self._inst_id = 0
     def get_arg_max_index(self) -> int:
         return self.read_reg32(UE_ARGMAX_INDEX)
+    def dbg_dram(self, addr: int, n_elems: int, name: str, ref: "torch.Tensor" = None,
+                 raise_on_nan: bool = True):
+        """Read n_elems bf16 from DRAM and report NaN/Inf + stats (and max-abs-err / cosine vs an
+        optional CPU reference). Used by the debug harness to localize where activations go bad."""
+        buf = bytearray(n_elems * 2)
+        self.dma_read(DMA_DEVICE_C2H, addr, buf, n_elems * 2)
+        t = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).float()
+        n_nan = int(torch.isnan(t).sum()); n_inf = int(torch.isinf(t).sum())
+        finite = t[torch.isfinite(t)]
+        lo = float(finite.min()) if finite.numel() else float("nan")
+        hi = float(finite.max()) if finite.numel() else float("nan")
+        mn = float(finite.mean()) if finite.numel() else float("nan")
+        msg = (f"[dbg] {name:30s} n={n_elems:<8d} nan={n_nan:<6d} inf={n_inf:<5d} "
+               f"min={lo:+.3f} max={hi:+.3f} mean={mn:+.4f}")
+        if ref is not None:
+            rflat = ref.flatten().float()
+            m = min(rflat.numel(), t.numel())
+            d, r = t[:m], rflat[:m]
+            err = float((d - r).abs().max())
+            cos = float(torch.nn.functional.cosine_similarity(d, r, dim=0))
+            rel = float((d - r).norm() / (r.norm() + 1e-9))
+            msg += f"  maxerr={err:.3f} cos={cos:.4f} relL2={rel:.3f}"
+            # Outlier-robust: SmolLM2 "massive activations" (a few huge channels) dominate plain
+            # cosine. If ref is 2D [T,H], also report cosine with the top-8 |channel| dims masked
+            # and the mean per-token cosine — these expose errors the big dims hide.
+            if ref.dim() == 2 and d.numel() == ref.numel():
+                T, Hd = ref.shape
+                dd, rr = d.view(T, Hd), r.view(T, Hd)
+                chan = rr.abs().mean(0)
+                topk = torch.topk(chan, min(8, Hd)).indices
+                mask = torch.ones(Hd); mask[topk] = 0.0
+                cos_excl = float(torch.nn.functional.cosine_similarity(
+                    (dd * mask).flatten(), (rr * mask).flatten(), dim=0))
+                pertok = float(torch.nn.functional.cosine_similarity(dd, rr, dim=1).mean())
+                msg += f" cos_excl8={cos_excl:.4f} cos_tok={pertok:.4f}"
+        print(msg, flush=True)
+        if raise_on_nan and (n_nan or n_inf):
+            raise FloatingPointError(f"NaN/Inf detected in {name} (nan={n_nan}, inf={n_inf})")
+        return t
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         """Set ISA register to immediate value."""
         isa_set_register(self, dst_reg_idx, immediate_value, timeout_s)
@@ -1219,7 +1258,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             f.write(self._prefill_raw)
         print(f"    Prefill compiled (S={S}): {len(self._prefill_raw)} bytes raw + scratch {worst_case} bytes → {bin_path}")
 
-    def compile_prefill_v2(self) -> None:
+    def compile_prefill_v2(self, halt_after_layer: int = None, debug_dump: bool = False) -> None:
         """Seq-len-agnostic gemma3-style prefill. Compiled ONCE for PREFILL_MAX; the runtime length
         is read by the bucket-dispatcher flash via gpr_bucket_idx. Permutes/matmuls/norms run static
         at PREFILL_MAX (shorter prompts padded with epsilon, masked by the block-diagonal bias);
@@ -1278,6 +1317,11 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self.loop_end()
             self.release_inst_ptr(ptr)
 
+        # Debug: per-layer hidden-state dump [NUM_LAYERS, PM, H] so one run captures every layer's
+        # output for NaN/cosine comparison against a CPU reference (localizes the first bad layer).
+        if debug_dump:
+            self.DBG_LAYER_DUMP = self.allocate_tensor_dram(self.NUM_LAYERS * PM * H * bpe)
+            print(f"    [dbg] layer dump @0x{self.DBG_LAYER_DUMP:X} ({self.NUM_LAYERS}x{PM}x{H})")
         # Scratch ISA regs start past the fixed gpr regs (1..6) so rope/flash scratch don't clobber them.
         self._isa_reg_counter = max(self._cfg["fixed_isa_regs"].values()) + 1
         self.start_capture()
@@ -1353,11 +1397,22 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 A_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM)
             lm_matmul(PM, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
-            # MLP residual (only last layer — others fused into next layer's input norm)
-            if layer_idx == self.NUM_LAYERS - 1:
+            # Debug: dump this layer's output (residual + MLP) to its own slot; does not disturb the
+            # fused path (next layer's input norm recomputes from RESIDUAL + MLP_DOWN).
+            if debug_dump:
+                eltwise_add_core_dram(self, size=PM * H,
+                    A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    OUTPUT_DRAM_ADDR=self.DBG_LAYER_DUMP + layer_idx * PM * H * bpe)
+            # MLP residual: materialize the layer output (normally fused into the next layer's input
+            # norm; done explicitly for the last layer, or the bisection halt layer, so it can be read).
+            if layer_idx == self.NUM_LAYERS - 1 or layer_idx == halt_after_layer:
                 eltwise_add_core_dram(self, size=PM * H,
                     A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                     OUTPUT_DRAM_ADDR=h_out)
+            if halt_after_layer is not None and layer_idx == halt_after_layer:
+                # Bisection: stop after this layer; h_out holds its output hidden state.
+                self._prefill_v2_layer_out_buf = h_out
+                break
         self.generate_instruction_halt()
         self.stop_capture()
         self.write_captured_instructions_to_dram(prefill_addr)
@@ -1376,10 +1431,14 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         print(f"    Prefill v2 compiled @0x{prefill_addr:X}: {size_bytes} bytes, "
               f"{num_buckets} buckets, PM={PM}, qmax={qmax}")
 
-    def run_prefill_v2(self, token_ids, has_image: bool = False, total_flops: int = None) -> int:
+    def run_prefill_v2(self, token_ids, has_image: bool = False, total_flops: int = None,
+                       skip_postamble: bool = False) -> int:
         """Run the seq-len-agnostic prefill: host prep (epsilon pad + block bias), a preamble that
         does on-device embed/merge + primes gpr_bucket_idx + jumps into the cached prefill, then a
-        postamble that does final-norm + LM head on the runtime last token. Returns argmax."""
+        postamble that does final-norm + LM head on the runtime last token. Returns argmax.
+
+        skip_postamble=True runs only the preamble->prefill (for bisection: read intermediate
+        buffers afterward) and returns None."""
         from user_dma_core import TYPE
         seq_len = len(token_ids)
         self.seq_len = seq_len
@@ -1430,6 +1489,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
         self.start_execute_from_dram(self._prefill_v2_preamble_addr)
         self.wait_queue(180.0)
+        if skip_postamble:
+            return None  # bisection: caller reads intermediate buffers
 
         # 5. Postamble: final norm + LM head on the runtime last real token -> logits
         last = self._prefill_v2_final_buf + (seq_len - 1) * H * bpe
@@ -1970,6 +2031,96 @@ def build_input_ids(tokenizer, prompt: str, has_image: bool = True) -> list:
         else:
             expanded.append(t)
     return expanded
+def _hf_reference(model_dir, tokenizer, prompt, image_path):
+    """HF CPU fp32 reference for --debug. Returns (token_ids, hidden[L+1] x [S,H], logits[S,V],
+    image_features[64,H] or None). Image mode runs the full multimodal forward (vision + LM) so the
+    per-layer hidden states are directly comparable to the device's image-mode prefill."""
+    from transformers import AutoModelForImageTextToText
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_dir, local_files_only=True, torch_dtype=torch.float32,
+        device_map=None, attn_implementation="eager").cpu().eval()
+    image_features = None
+    if image_path:
+        from PIL import Image
+        from transformers import AutoProcessor
+        proc = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
+        img = Image.open(image_path).convert("RGB")
+        # Use the DEVICE token layout (build_input_ids) for both, so sequences align 1:1.
+        token_ids = build_input_ids(tokenizer, prompt, has_image=True)
+        pv = proc.image_processor(images=[img], return_tensors="pt")
+        kw = {"input_ids": torch.tensor([token_ids]),
+              "pixel_values": pv["pixel_values"].to(torch.float32),
+              "output_hidden_states": True, "use_cache": False}
+        if "pixel_attention_mask" in pv:
+            kw["pixel_attention_mask"] = pv["pixel_attention_mask"]
+        with torch.no_grad():
+            try:
+                feat = model.get_image_features(pixel_values=kw["pixel_values"],
+                                                pixel_attention_mask=kw.get("pixel_attention_mask"))
+                image_features = torch.as_tensor(feat).reshape(-1, model.config.text_config.hidden_size).float()
+            except Exception as e:
+                print(f"[dbg] get_image_features unavailable ({e}); vision checked by NaN/stats only")
+            out = model(**kw)
+    else:
+        token_ids = build_input_ids(tokenizer, prompt, has_image=False)
+        with torch.no_grad():
+            out = model(input_ids=torch.tensor([token_ids]), output_hidden_states=True, use_cache=False)
+    hidden = [h[0].float() for h in out.hidden_states]
+    logits = out.logits[0].float()
+    del model
+    return token_ids, hidden, logits, image_features
+
+
+def run_debug(ue, args, script_dir, has_image):
+    """Staged NaN/cosine localizer (one device session): (1) vision encoder output vs HF image
+    features, (2) prefill_v2 every-layer hidden vs HF (single run). First layer whose cosine
+    collapses / NaNs = bug. Use --image None for the clean text-only LM check (no vision confound)."""
+    model_dir = os.path.join(script_dir, _SMOLVLM2_CFG["paths"]["hf_model_dir"])
+    H, bpe = ue.HIDDEN_SIZE, 2
+    PM = ue.PREFILL_MAX_SEQ_LEN
+
+    print("\nLoading HF reference (CPU fp32)…")
+    token_ids, hidden, logits, image_features = _hf_reference(
+        model_dir, ue.tokenizer, args.prompt, args.image if has_image else None)
+    seq_len = len(token_ids)
+    gold = int(logits[-1].argmax())
+    print(f"=== DEBUG tokens={seq_len} image={has_image} prompt={args.prompt!r} ===")
+    print(f"HF golden first token: id={gold} {ue.tokenizer.decode([gold])!r}")
+
+    # --- Stage 1: vision encoder ---
+    if has_image:
+        print("\n--- Stage 1: vision encoder (VIS_CONNECTOR vs HF image features) ---")
+        enc_addr = ue.compile_encoder()
+        ue.run_encoder(enc_addr, process_image(args.image))
+        ue.dbg_dram(ue.VIS_CONNECTOR_DRAM, 64 * H, "VIS_CONNECTOR", ref=image_features,
+                    raise_on_nan=False)
+
+    # --- Stage 2: prefill_v2 per-layer hidden vs HF (one run) ---
+    print("\n--- Stage 2: prefill_v2 per-layer hidden vs HF (one run) ---")
+    ue.compile_prefill_v2(debug_dump=True)
+    ue.run_prefill_v2(token_ids, has_image=has_image, skip_postamble=True)
+    for n in range(ue.NUM_LAYERS):
+        ue.dbg_dram(ue.DBG_LAYER_DUMP + n * PM * H * bpe, seq_len * H, f"L{n:02d}_out",
+                    ref=hidden[n + 1][:seq_len], raise_on_nan=False)
+    print("\nKV cache NaN spot-check (layer 0 / last):")
+    for layer in (0, ue.NUM_LAYERS - 1):
+        for h in range(ue.NUM_KV_HEADS):
+            base_k = ue.LAYER0_K_DRAM + layer * ue.KV_LAYER_STRIDE + h * ue.KV_HEAD_STRIDE
+            ue.dbg_dram(base_k, seq_len * ue.HEAD_DIM, f"K[L{layer}h{h}]", raise_on_nan=False)
+
+    # --- Stage 3: full prefill -> first-token logits (validates the postamble: final-norm + LM head) ---
+    # NOTE: per-layer L31 looks "collapsed" only because HF's last hidden_states entry is already
+    # final-normed while the device dump is raw — that is a comparison artifact, not a bug.
+    print("\n--- Stage 3: full prefill first token (postamble: final-norm + LM head) ---")
+    tok = ue.run_prefill_v2(token_ids, has_image=has_image)  # full run, with postamble
+    ue.dbg_dram(ue.LOGITS_DRAM, ue.VOCAB_SIZE, "LOGITS", ref=logits[-1], raise_on_nan=False)
+    verdict = "MATCH ✓" if tok == gold else "MISMATCH ✗"
+    print(f"device first token: id={tok} {ue.tokenizer.decode([tok])!r}  |  "
+          f"golden id={gold} {ue.tokenizer.decode([gold])!r}   -> {verdict}")
+    print("\nIf MATCH: prefill+postamble are correct -> bug is the decoder loop.\n"
+          "If MISMATCH: bug is the postamble (final-norm / LM head / last-token offset).")
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1987,6 +2138,7 @@ def main():
     parser.add_argument("--cycle", type=float, default=_d["cycle_ns"], help="Clock cycle time in ns")
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"], help="Max sequence length")
     parser.add_argument("--vision-fp4", action="store_true", help="Use FP4 quantized weights for vision encoder (default: BF16)")
+    parser.add_argument("--debug", action="store_true", help="Staged NaN/cosine localizer: verify vision + per-layer prefill_v2 vs HF CPU reference, then exit (no decode)")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2041,6 +2193,9 @@ def main():
         image_path = os.path.abspath(args.image)
         _original_print(f"Image: {image_path}")
     _original_print(f"Prompt: {args.prompt!r} ({seq_len} tokens, image={'yes' if has_image else 'no'})")
+    if args.debug:
+        run_debug(ue, args, script_dir, has_image)
+        return
     # --- Compile (or load from bin) ---
     _SILENT_MODE = True
     timer = time.perf_counter()
