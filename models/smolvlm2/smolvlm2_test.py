@@ -553,6 +553,15 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
     V_CACHE_SIZE_REG = _cfg["fixed_isa_regs"]["V_CACHE_SIZE_REG"]
     ROPE_SIZE_REG    = _cfg["fixed_isa_regs"]["ROPE_SIZE_REG"]
     TMP_REG          = _cfg["fixed_isa_regs"]["TMP_REG"]
+    # Prefill PBI (seq-len-agnostic, gemma3-style): three runtime GPRs primed by run_prefill_v2.
+    #   gpr_seq_len    — token count S (matmul/norm/rope/eltwise/gather row loops)
+    #   gpr_q_seq_len  — S * GROUP_SIZE (token-major stacked Q rope row loop)
+    #   gpr_bucket_idx — aligned(S*GROUP_SIZE)/64, 1-based flash bucket selector
+    GPR_SEQ_LEN_REG    = _cfg["fixed_isa_regs"]["GPR_SEQ_LEN_REG"]
+    GPR_Q_SEQ_LEN_REG  = _cfg["fixed_isa_regs"]["GPR_Q_SEQ_LEN_REG"]
+    GPR_BUCKET_IDX_REG = _cfg["fixed_isa_regs"]["GPR_BUCKET_IDX_REG"]
+    # Max prompt length the compile-once prefill program supports (sets flash bucket count).
+    PREFILL_MAX_SEQ_LEN = _cfg["model"]["prefill_max_seq_len"]
 
     def __init__(self, script_dir: str = None, lm_weights: str = None, vision_weights: str = None,
                  vision_bf16: bool = True):
@@ -569,6 +578,9 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         else:
             super().__init__()
         self._isa_reg_counter = 1
+        self.gpr_seq_len = self.GPR_SEQ_LEN_REG      # primed to S in run_prefill_v2
+        self.gpr_q_seq_len = self.GPR_Q_SEQ_LEN_REG  # primed to S*GROUP_SIZE in run_prefill_v2
+        self.gpr_bucket_idx = self.GPR_BUCKET_IDX_REG  # primed to flash bucket in run_prefill_v2
         self.vision_bf16 = vision_bf16
         self.lm_bf16 = False
 
@@ -862,6 +874,22 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.CAUSAL_MASK_DRAM = self.allocate_tensor_dram(seq_len * seq_len * bpe)
         # Decode bias: [GROUP_SIZE, max_seq_len] — written each decode step
         self.DECODE_BIAS_DRAM = self.allocate_tensor_dram(self.GROUP_SIZE * seq_len * bpe)
+        # --- gemma3-style stacked-GQA flash buffers (seq-len-agnostic prefill v2) ---
+        # One bucket-dispatcher flash per kv-group operates on a square of aligned(S*GROUP_SIZE)
+        # rows. Buffers are sized for the largest bucket = aligned(PREFILL_MAX_SEQ_LEN*GROUP_SIZE).
+        G = self.GROUP_SIZE
+        qmax = ((self.PREFILL_MAX_SEQ_LEN * G + 63) // 64) * 64
+        self.PREFILL_QMAX = qmax
+        self.FLASH_NUM_BUCKETS = qmax // UE_VECTOR_SIZE
+        D = self.HEAD_DIM
+        self.FLASH_Q_DRAM = self.allocate_tensor_dram(qmax * D * bpe)       # token-major stacked Q
+        self.FLASH_K_DRAM = self.allocate_tensor_dram(qmax * D * bpe)       # K duplicated token-major
+        self.FLASH_V_DRAM = self.allocate_tensor_dram(qmax * D * bpe)       # V duplicated token-major
+        self.FLASH_OUT_DRAM = self.allocate_tensor_dram(qmax * D * bpe)     # attention output (stacked)
+        self.FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(
+            UE_VECTOR_SIZE * qmax * bpe + D * qmax * bpe)                   # Vᵀ + softmax scratch
+        self.FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(qmax * qmax * bpe)  # fused QKᵀ+softmax probs
+        self.FLASH_BIAS_DRAM = self.allocate_tensor_dram(qmax * qmax * bpe)    # block-diagonal causal bias
         # RoPE cos/sin tables
         self._load_rope_tables()
         # Vision encoder intermediates (fixed seq=1024, hidden=768, intermediate=3072):
@@ -914,6 +942,23 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, self.ROPE_SIN_DRAM, sin_full.flatten(), table_size)
         self.allocate_params_dram(table_size)
         self._hw_cos, self._hw_sin = cos_full, sin_full  # CPU copies for decode position updates
+        # Contiguous packed table for the prefill d64 PBI RoPE (rope_hf_core_dram_d64_pbi):
+        # per token [cos(D) || sin(D)] = 2D elems, sin first half pre-negated. The d64 path
+        # asserts sin_dram_addr == cos_dram_addr + D*bpe, so cos/sin must be interleaved per
+        # token (NOT two separate [S,D] tables like ROPE_COS_DRAM/ROPE_SIN_DRAM above).
+        packed = torch.cat([cos_full, sin_full], dim=1).contiguous()  # [S, 2D]
+        self.ROPE_PACKED_DRAM = self.get_params_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, self.ROPE_PACKED_DRAM, packed.flatten(), S * 2 * D * bpe)
+        self.allocate_params_dram(S * 2 * D * bpe)
+        # Token-major-DUPLICATED packed table for the gemma3-style stacked-Q rope. The stacked Q
+        # for one kv-group is [S, GROUP_SIZE, D] flattened to rows r = t*G + g; roping it as one
+        # M=S*G d64 loop needs row r to use token (r//G)'s cos/sin. There is no d64 GQA rope, so
+        # we pre-duplicate each token's [cos||sin] row GROUP_SIZE times → row r holds packed[r//G].
+        G = self.GROUP_SIZE
+        packed_gqa = packed.repeat_interleave(G, dim=0).contiguous()  # [G*S, 2D]
+        self.ROPE_PACKED_GQA_DRAM = self.get_params_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, self.ROPE_PACKED_GQA_DRAM, packed_gqa.flatten(), G * S * 2 * D * bpe)
+        self.allocate_params_dram(G * S * 2 * D * bpe)
         # Padded-split cos/sin for prefill RoPE (D<128 path):
         # Each 32-element half is zero-padded to 64 elements = 128 bytes = 1 URAM row
         half = D // 2
@@ -993,7 +1038,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                     K_DRAM_ADDR=self.VIS_K_PERM_DRAM + h * head_stride,
                     V_DRAM_ADDR=self.VIS_V_PERM_DRAM + h * head_stride,
                     OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT_DRAM + h * head_stride,
-                    SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM)
+                    SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.identity_addr)
             # Inverse permute: [12, S, 64] → [S, 768]
             smart_bf16_permute_core(self, dims=inv_permute_dims, permute_indices=permute_indices,
                 input_dram_addr=self.VIS_ATTN_OUT_DRAM, output_dram_addr=self.VIS_ATTN_RESULT_DRAM,
@@ -1075,6 +1121,13 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.IF4, **kw)
 
         self.start_capture()
+        # Prime gpr_seq_len for the d64 PBI RoPE hardware loop. S is known at compile time
+        # (prefill is per-S compiled because flash stays legacy/static — see PBI flash
+        # back-to-back bug), so this is a static ADD_SET at the top of the captured program.
+        # ISA scratch-reg allocation must start past the fixed regs (1..4) so the rope's
+        # internal alloc_isa_reg() (tmp_reg/t_reg) does not clobber gpr_seq_len.
+        self._isa_reg_counter = max(self._cfg["fixed_isa_regs"].values()) + 1  # = 5
+        self.generate_instruction_add_set(self.gpr_seq_len, S)
         for layer_idx in range(self.NUM_LAYERS):
             la = self.lm_layer_addrs[layer_idx]
             h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
@@ -1096,19 +1149,17 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 q_head = self.LAYER0_Q_PERM_DRAM + h * head_stride
                 self.accelerator_memory_to_sram(self.LAYER0_Q_DRAM + h * D * bpe, 0x00000, S * D,stride_bytes_per_chunk=D * bpe, stride_jump_bytes=H * bpe)
                 self.sram_to_accelerator_memory(0x00000, q_head, S * D)
-                rope_hf_core_dram(self, M=S, D=D, X_DRAM_ADDR=q_head, OUTPUT_DRAM_ADDR=q_head,
-                    COS_DRAM_ADDR=self.ROPE_COS_DRAM, SIN_DRAM_ADDR=self.ROPE_SIN_DRAM,
-                    COS_LO_PAD_ADDR=self.ROPE_COS_LO_PAD_DRAM, COS_HI_PAD_ADDR=self.ROPE_COS_HI_PAD_DRAM,
-                    SIN_LO_PAD_ADDR=self.ROPE_SIN_LO_PAD_DRAM, SIN_HI_PAD_ADDR=self.ROPE_SIN_HI_PAD_DRAM)
+                self.rope_hf_core_dram(M=S, N=D, input_dram_addr=q_head, output_dram_addr=q_head,
+                    cos_dram_addr=self.ROPE_PACKED_DRAM, sin_dram_addr=self.ROPE_PACKED_DRAM + D * bpe,
+                    gpr_M_reg=self.gpr_seq_len)
             # Permute K [S,320]→KV cache [5,S,64] + RoPE per head
             for h in range(self.NUM_KV_HEADS):
                 k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
                 self.accelerator_memory_to_sram(self.LAYER0_K_PROJ_DRAM + h * D * bpe, 0x00000, S * D,stride_bytes_per_chunk=D * bpe, stride_jump_bytes=KV * bpe)
                 self.sram_to_accelerator_memory(0x00000, k_cache, S * D)
-                rope_hf_core_dram(self, M=S, D=D, X_DRAM_ADDR=k_cache, OUTPUT_DRAM_ADDR=k_cache,
-                    COS_DRAM_ADDR=self.ROPE_COS_DRAM, SIN_DRAM_ADDR=self.ROPE_SIN_DRAM,
-                    COS_LO_PAD_ADDR=self.ROPE_COS_LO_PAD_DRAM, COS_HI_PAD_ADDR=self.ROPE_COS_HI_PAD_DRAM,
-                    SIN_LO_PAD_ADDR=self.ROPE_SIN_LO_PAD_DRAM, SIN_HI_PAD_ADDR=self.ROPE_SIN_HI_PAD_DRAM)
+                self.rope_hf_core_dram(M=S, N=D, input_dram_addr=k_cache, output_dram_addr=k_cache,
+                    cos_dram_addr=self.ROPE_PACKED_DRAM, sin_dram_addr=self.ROPE_PACKED_DRAM + D * bpe,
+                    gpr_M_reg=self.gpr_seq_len)
             # Permute V [S,320]→KV cache [5,S,64] (no RoPE)
             for h in range(self.NUM_KV_HEADS):
                 v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
@@ -1167,6 +1218,245 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         with open(bin_path, "wb") as f:
             f.write(self._prefill_raw)
         print(f"    Prefill compiled (S={S}): {len(self._prefill_raw)} bytes raw + scratch {worst_case} bytes → {bin_path}")
+
+    def compile_prefill_v2(self) -> None:
+        """Seq-len-agnostic gemma3-style prefill. Compiled ONCE for PREFILL_MAX; the runtime length
+        is read by the bucket-dispatcher flash via gpr_bucket_idx. Permutes/matmuls/norms run static
+        at PREFILL_MAX (shorter prompts padded with epsilon, masked by the block-diagonal bias);
+        only the d64 RoPE (gpr) and the O(seq^2) flash (bucket) are runtime-sized.
+
+        Per kv-group GQA into one flash: gather the 3 q-heads token-major [PM,G,D]; rope it (M=PM*G,
+        token-major-duplicated table); rope the kv-head into the decoder KV cache then duplicate its
+        rows xG token-major; one flash_attention_core(gpr_bucket_idx); un-stack the output back into
+        [PM,H]. Ends after the 32 layers with HALT (no final-norm/LM head — those depend on the
+        runtime last-token offset and are emitted by run_prefill_v2). Captured in place at a fixed
+        program-DRAM address so the flash dispatcher's absolute jumps stay valid; run_prefill_v2's
+        preamble primes gpr_bucket_idx and jump_abs-es into this program.
+        """
+        from user_dma_core import TYPE
+        H, D, I = self.HIDDEN_SIZE, self.HEAD_DIM, self.INTERMEDIATE_SIZE
+        KV = self.NUM_KV_HEADS * D
+        G = self.GROUP_SIZE
+        bpe = 2
+        PM = self.PREFILL_MAX_SEQ_LEN          # static row count for non-attention ops
+        qmax = self.PREFILL_QMAX                # aligned(PM*G) — stacked flash rows
+        num_buckets = self.FLASH_NUM_BUCKETS
+
+        def lm_matmul(M, K, N, A, proj, la, OUT, **kw):
+            if self.lm_bf16:
+                self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_weight'],
+                    OUTPUT_DRAM_ADDR=OUT, **kw)
+            else:
+                self.quantized_matmat_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
+                    OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.IF4, **kw)
+
+        def strided_copy(src, src_jump, dst, dst_jump, rows, width):
+            # static [rows, width] copy: strided gather -> contiguous SRAM -> strided scatter
+            self.accelerator_memory_to_sram(src, 0x00000, rows * width,
+                stride_bytes_per_chunk=width * bpe, stride_jump_bytes=src_jump)
+            self.sram_to_accelerator_memory(0x00000, dst, rows * width,
+                stride_bytes_per_chunk=width * bpe, stride_jump_bytes=dst_jump)
+
+        def duplicate_gqa_rows(src_sram_addr, dst_dram_addr):
+            # token-major duplication: dst row t*G+g = src row t (kv head broadcast across the group)
+            row_bytes = D * bpe
+            row_uram_words = row_bytes // (UE_VECTOR_SIZE * bpe)
+            _, src_uram_addr = self.sram_address_to_uram_address(src_sram_addr)
+            ptr = self.alloc_inst_ptr()
+            self.generate_instruction_pbi_init(dram_shared_addr=dst_dram_addr, dma_length=row_bytes,
+                output_size=0, uram_length=0, uram_a_start_addr=src_uram_addr,
+                uram_b_start_addr=src_uram_addr, uram_wb_addr=0, uram_dst_addr=0,
+                fmax_context_addr=0, inst_pointer_idx=ptr)
+            self.loop_start(loop_cnt=PM)
+            self.loop_start(G)
+            self.sram_to_accelerator_memory(sram_address=0, accelerator_dram_address=row_bytes,
+                element_size=D, inst_pointer_idx=ptr, memcpy_length_bytes=0)
+            self.loop_end()
+            self.generate_instruction_pbi_inc(dram_shared_addr=0, dma_length=0, output_size=0,
+                uram_length=0, uram_a_start_addr=row_uram_words, uram_b_start_addr=row_uram_words,
+                uram_wb_addr=0, uram_dst_addr=0, fmax_context_addr=0, inst_pointer_idx=ptr)
+            self.loop_end()
+            self.release_inst_ptr(ptr)
+
+        # Scratch ISA regs start past the fixed gpr regs (1..6) so rope/flash scratch don't clobber them.
+        self._isa_reg_counter = max(self._cfg["fixed_isa_regs"].values()) + 1
+        self.start_capture()
+        prefill_addr = self.get_program_dram_addr()
+        # Constant runtime regs for the d64 RoPE loops (PM is compile-time fixed).
+        self.generate_instruction_add_set(self.gpr_seq_len, PM)
+        self.generate_instruction_add_set(self.gpr_q_seq_len, PM * G)
+        for layer_idx in range(self.NUM_LAYERS):
+            la = self.lm_layer_addrs[layer_idx]
+            h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
+            h_out = self.LAYER0_OUTPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_INPUT_DRAM
+            # Input layernorm (fused with previous layer's MLP residual for layers 1+)
+            if layer_idx == 0:
+                self.rms_norm_core_dram(M=PM, N=H, A_DRAM_ADDR=h_in,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'])
+            else:
+                rms_norm_core_dram_post_add(self, M=PM, N=H,
+                    A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    ADDOUTPUT_DRAM_ADDR=h_in, NORMOUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    GAMMA_DRAM_ADDR=la['ln1_gamma'])
+            # Q/K/V projections
+            lm_matmul(PM, H, H,  self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM)
+            lm_matmul(PM, H, KV, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM)
+            lm_matmul(PM, H, KV, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM)
+            # K per kv-head -> decoder KV cache (contiguous [PM,D]) + RoPE
+            for h in range(self.NUM_KV_HEADS):
+                k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
+                strided_copy(self.LAYER0_K_PROJ_DRAM + h * D * bpe, KV * bpe, k_cache, D * bpe, PM, D)
+                self.rope_hf_core_dram(M=PM, N=D, input_dram_addr=k_cache, output_dram_addr=k_cache,
+                    cos_dram_addr=self.ROPE_PACKED_DRAM, sin_dram_addr=self.ROPE_PACKED_DRAM + D * bpe,
+                    gpr_M_reg=self.gpr_seq_len)
+            # V per kv-head -> decoder KV cache (no RoPE)
+            for h in range(self.NUM_KV_HEADS):
+                v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
+                strided_copy(self.LAYER0_V_PROJ_DRAM + h * D * bpe, KV * bpe, v_cache, D * bpe, PM, D)
+            # Per kv-group GQA: stack Q token-major, rope, duplicate K/V, one bucket flash, un-stack
+            for kv_b in range(self.NUM_KV_HEADS):
+                k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
+                v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
+                # gather the group's 3 q-heads into token-major FLASH_Q (row t*G+g = q-head kv_b*G+g)
+                for g in range(G):
+                    strided_copy(self.LAYER0_Q_DRAM + (kv_b * G + g) * D * bpe, H * bpe,
+                                 self.FLASH_Q_DRAM + g * D * bpe, G * D * bpe, PM, D)
+                # rope stacked Q over M=PM*G using the token-major-duplicated table
+                self.rope_hf_core_dram(M=PM * G, N=D, input_dram_addr=self.FLASH_Q_DRAM,
+                    output_dram_addr=self.FLASH_Q_DRAM, cos_dram_addr=self.ROPE_PACKED_GQA_DRAM,
+                    sin_dram_addr=self.ROPE_PACKED_GQA_DRAM + D * bpe, gpr_M_reg=self.gpr_q_seq_len)
+                # duplicate K/V rows token-major into the flash buffers
+                self.accelerator_memory_to_sram(k_cache, 0x10000, PM * D)
+                duplicate_gqa_rows(0x10000, self.FLASH_K_DRAM)
+                self.accelerator_memory_to_sram(v_cache, 0x20000, PM * D)
+                duplicate_gqa_rows(0x20000, self.FLASH_V_DRAM)
+                # one bucket-dispatcher flash for the whole group
+                self.flash_attention_core(head_dim=D, seq_len=qmax,
+                    Q_DRAM_ADDR=self.FLASH_Q_DRAM, K_DRAM_ADDR=self.FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.FLASH_V_DRAM, OUTPUT_DRAM_ADDR=self.FLASH_OUT_DRAM,
+                    SCRATCH_DRAM_ADDR=self.FLASH_SCRATCH_DRAM, ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM,
+                    IDENTITY_DRAM_ADDR=self.identity_addr, BIAS_DRAM_ADDR=self.FLASH_BIAS_DRAM,
+                    gpr_bucket_idx=self.gpr_bucket_idx, num_buckets=num_buckets)
+                # un-stack FLASH_OUT [PM,G,D] -> ATTN_RESULT [PM,H] at this group's head columns
+                for g in range(G):
+                    strided_copy(self.FLASH_OUT_DRAM + g * D * bpe, G * D * bpe,
+                                 self.LAYER0_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe, H * bpe, PM, D)
+            # O projection + residual + RMS norm
+            lm_matmul(PM, H, H, self.LAYER0_ATTN_RESULT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM)
+            rms_norm_core_dram_post_add(self, M=PM, N=H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.LAYER0_O_PROJ_DRAM,
+                ADDOUTPUT_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, NORMOUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                GAMMA_DRAM_ADDR=la['ln2_gamma'])
+            # MLP: gate+SiLU, up, gate*up, down
+            lm_matmul(PM, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
+            lm_matmul(PM, H, I, self.LAYER0_PRE_NORM_DRAM, 'up', la, self.LAYER0_MLP_UP_DRAM)
+            eltwise_mul_core_dram(self, size=PM * I,
+                A_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                OUTPUT_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM)
+            lm_matmul(PM, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
+            # MLP residual (only last layer — others fused into next layer's input norm)
+            if layer_idx == self.NUM_LAYERS - 1:
+                eltwise_add_core_dram(self, size=PM * H,
+                    A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    OUTPUT_DRAM_ADDR=h_out)
+        self.generate_instruction_halt()
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(prefill_addr)
+        size_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(size_bytes)
+        self.clear_capture_buffer()
+        self._prefill_v2_addr = prefill_addr
+        # Reserve preamble (embed/merge + reg prime + jump) and postamble (final-norm + LM head)
+        # scratch regions; both are captured fresh per run.
+        self._prefill_v2_preamble_addr = self.get_program_dram_addr()
+        self.allocate_program_dram(PM * 2 * 32 + IMAGE_SEQ_LEN * 2 * 32 + 256)
+        self._prefill_v2_postamble_addr = self.get_program_dram_addr()
+        self.allocate_program_dram(4096)
+        # Final hidden lands in the buffer matching the layer ping-pong parity.
+        self._prefill_v2_final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
+        print(f"    Prefill v2 compiled @0x{prefill_addr:X}: {size_bytes} bytes, "
+              f"{num_buckets} buckets, PM={PM}, qmax={qmax}")
+
+    def run_prefill_v2(self, token_ids, has_image: bool = False, total_flops: int = None) -> int:
+        """Run the seq-len-agnostic prefill: host prep (epsilon pad + block bias), a preamble that
+        does on-device embed/merge + primes gpr_bucket_idx + jumps into the cached prefill, then a
+        postamble that does final-norm + LM head on the runtime last token. Returns argmax."""
+        from user_dma_core import TYPE
+        seq_len = len(token_ids)
+        self.seq_len = seq_len
+        H, D, G, bpe = self.HIDDEN_SIZE, self.HEAD_DIM, self.GROUP_SIZE, 2
+        PM = self.PREFILL_MAX_SEQ_LEN
+        assert seq_len <= PM, f"prompt {seq_len} exceeds PREFILL_MAX_SEQ_LEN={PM}"
+        qmax = self.PREFILL_QMAX
+        qS = seq_len * G
+        aligned_q = ((qS + 63) // 64) * 64
+        bucket_idx = aligned_q // UE_VECTOR_SIZE
+        embed_row_bytes = H * bpe
+
+        # 1. epsilon-fill INPUT padding rows [seq_len:PM] (non-attention ops run static PM rows)
+        if PM > seq_len:
+            epsilon = torch.full(((PM - seq_len) * H,), 1e-6, dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM + seq_len * embed_row_bytes, epsilon)
+        # 2. fill flash Q/K/V tails finite so masked-out padded rows can't produce NaN in softmax
+        eps_flash = torch.full((qmax * D,), 1e-6, dtype=torch.bfloat16)
+        for buf in (self.FLASH_Q_DRAM, self.FLASH_K_DRAM, self.FLASH_V_DRAM):
+            self.dma_to_accelerator_memory(buf, eps_flash)
+        # 3. block-diagonal causal bias [aligned_q, aligned_q]: allow (t,g)->(t',g') iff g==g' & t'<=t
+        rq = torch.arange(aligned_q).unsqueeze(1)
+        rk = torch.arange(aligned_q).unsqueeze(0)
+        allow = (rq < qS) & (rk < qS) & (rq % G == rk % G) & (rk // G <= rq // G)
+        bias = torch.where(allow, torch.tensor(0.0), torch.tensor(-1e38)).to(torch.bfloat16)
+        bias[torch.arange(aligned_q) >= qS, 0] = 0.0  # padded query rows attend row 0 (discarded)
+        self.dma_to_accelerator_memory(self.FLASH_BIAS_DRAM, bias)
+
+        # 4. Preamble: on-device embed gather + vision merge + prime gpr_bucket_idx + jump into prefill
+        self.clear_inst_id()
+        self.start_capture()
+        for t in range(seq_len):
+            src = self.embed_addr + token_ids[t] * embed_row_bytes
+            self.accelerator_memory_to_sram(src, 0x00000, H)
+            self.sram_to_accelerator_memory(0x00000, self.LAYER0_INPUT_DRAM + t * embed_row_bytes, H)
+        if has_image:
+            img_positions = [i for i, t in enumerate(token_ids) if t == IMAGE_TOKEN_ID]
+            if len(img_positions) > 0:
+                assert len(img_positions) == IMAGE_SEQ_LEN, \
+                    f"Expected {IMAGE_SEQ_LEN} image tokens, got {len(img_positions)}"
+                for i, pos in enumerate(img_positions):
+                    self.accelerator_memory_to_sram(self.VIS_CONNECTOR_DRAM + i * embed_row_bytes, 0x00000, H)
+                    self.sram_to_accelerator_memory(0x00000, self.LAYER0_INPUT_DRAM + pos * embed_row_bytes, H)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(self._prefill_v2_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(self._prefill_v2_preamble_addr)
+        self.clear_capture_buffer()
+        self.start_execute_from_dram(self._prefill_v2_preamble_addr)
+        self.wait_queue(180.0)
+
+        # 5. Postamble: final norm + LM head on the runtime last real token -> logits
+        last = self._prefill_v2_final_buf + (seq_len - 1) * H * bpe
+        self.clear_inst_id()
+        self.start_capture()
+        self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=last,
+            OUTPUT_DRAM_ADDR=self.FINAL_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
+        if self.lm_bf16:
+            self.matmat_mul_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
+                B_DRAM_ADDR=self.lm_head_weight, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM)
+        else:
+            self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
+                B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
+        self.generate_instruction_halt()
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(self._prefill_v2_postamble_addr)
+        self.clear_capture_buffer()
+        self.start_execute_from_dram(self._prefill_v2_postamble_addr)
+        self.wait_queue(30.0)
+        if total_flops is not None:
+            self._last_hw_gflops, _ = self.report_flop_rate_gflops(total_flops)
+            self._last_total_flops = total_flops
+        else:
+            self._last_hw_gflops = None
+            self._last_total_flops = None
+        return self.get_arg_max_index()
 
     def compile_decoder(self, kv_len_buckets=None) -> None:
         """Compile per-bucket decode programs + per-token embed programs."""
@@ -1405,6 +1695,10 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             "VIS_ATTN_OUT_DRAM", "VIS_ATTN_SCRATCH_DRAM", "VIS_ATTN_RESULT_DRAM",
             "VIS_O_PROJ_DRAM", "VIS_RESIDUAL_DRAM", "VIS_MLP_INTER_DRAM", "VIS_MLP_OUT_DRAM",
             "VIS_POST_LN_DRAM", "VIS_SHUFFLED_DRAM", "VIS_CONNECTOR_DRAM", "PERMUTE_TEMP_DRAM",
+            # Prefill v2 (gemma3-style) RoPE tables + stacked-GQA flash buffers
+            "ROPE_PACKED_DRAM", "ROPE_PACKED_GQA_DRAM",
+            "FLASH_Q_DRAM", "FLASH_K_DRAM", "FLASH_V_DRAM", "FLASH_OUT_DRAM",
+            "FLASH_SCRATCH_DRAM", "FLASH_ATTN_P_DRAM", "FLASH_BIAS_DRAM",
         ]
         meta = {
             "params_size": total,
@@ -1415,6 +1709,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             "KV_LAYER_STRIDE": self.KV_LAYER_STRIDE,
             "vision_bf16": self.vision_bf16,
             "_num_vis_layers": len(self.vis_layer_addrs),
+            "PREFILL_QMAX": self.PREFILL_QMAX,
+            "FLASH_NUM_BUCKETS": self.FLASH_NUM_BUCKETS,
         }
         for attr in addr_attrs:
             meta[attr] = getattr(self, attr)
@@ -1560,7 +1856,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         # Write fused program to scratch and dispatch
         self.dma_write(DMA_DEVICE_H2C, self._prefill_scratch_addr, bytes(fused), len(fused))
         self.start_execute_from_dram(self._prefill_scratch_addr)
-        self.wait_queue(30.0)
+        self.wait_queue(180.0)  # TEMP: diagnose d64-rope prefill slow-vs-hang (was 30.0)
         if total_flops is not None:
             self._last_hw_gflops, _ = self.report_flop_rate_gflops(total_flops)
             self._last_total_flops = total_flops
@@ -1737,7 +2033,7 @@ def main():
         ue.weight_init()
         ue.tensor_init(max_seq_len=args.max_seq)
         ue.dump_snapshot()
-    has_image = args.image is not None
+    has_image = args.image is not None and str(args.image).strip().lower() not in ("none", "")
     token_ids = build_input_ids(ue.tokenizer, args.prompt, has_image=has_image)
     seq_len = len(token_ids)
     _SILENT_MODE = False
@@ -1750,8 +2046,9 @@ def main():
     timer = time.perf_counter()
     bin_dir = os.path.join(script_dir, "smolvlm2_bin")
     S = ((seq_len + 63) // 64) * 64
-    use_bin = (os.path.exists(os.path.join(bin_dir, "decoder_program.bin"))
-               and os.path.exists(os.path.join(bin_dir, f"prefill_program_S{S}.bin")))
+    # Prefill v2 is seq-len-agnostic and always compiled fresh (cheap, one bin for any length);
+    # only encoder + decoder use the cached bins.
+    use_bin = os.path.exists(os.path.join(bin_dir, "decoder_program.bin"))
     import threading
     stop_compile = threading.Event()
     def _compile_progress():
@@ -1764,13 +2061,13 @@ def main():
     if use_bin:
         if has_image:
             enc_addr = ue.load_encoder()
-        ue.load_prefill(seq_len=seq_len)
         ue.load_decoder()
     else:
         if has_image:
             enc_addr = ue.compile_encoder()
-        ue.compile_prefill(seq_len=seq_len)
         ue.compile_decoder()
+    # Prefill v2 (seq-len-agnostic) compiled last so its program-DRAM region sits past encoder/decoder.
+    ue.compile_prefill_v2()
     stop_compile.set()
     _SILENT_MODE = False
     elapsed = time.perf_counter() - timer
@@ -1814,15 +2111,17 @@ def main():
     t_pf = threading.Thread(target=_pf_progress, daemon=True)
     t_pf.start()
     _SILENT_MODE = True
-    hw_token = ue.run_prefill(token_ids, has_image=has_image, total_flops=prefill_flops)
+    hw_token = ue.run_prefill_v2(token_ids, has_image=has_image, total_flops=prefill_flops)
     _SILENT_MODE = False
     stop_pf.set()
     t_pf.join()
     prefill_time = time.perf_counter() - timer
     _original_print(f"\r  Prefill ({prefill_time:.0f}s) done")
-    # Zero out stale KV cache positions (seq_len..padded-1) left by padded prefill
-    if padded_seq > seq_len:
-        stale_size = (padded_seq - seq_len) * ue.HEAD_DIM
+    # Zero out stale KV cache positions left by the static PREFILL_MAX prefill v2 (it writes cache
+    # rows [seq_len:PREFILL_MAX] from epsilon-padded input — decode must not read those as real).
+    zero_to = ue.PREFILL_MAX_SEQ_LEN
+    if zero_to > seq_len:
+        stale_size = (zero_to - seq_len) * ue.HEAD_DIM
         stale_zeros = torch.zeros(stale_size, dtype=torch.bfloat16)
         for layer in range(ue.NUM_LAYERS):
             for h in range(ue.NUM_KV_HEADS):
