@@ -880,6 +880,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         seq_len = max_seq_len
         bpe = 2
         # KV cache offset constants (Gemma3-style flat layout: [layer, head, seq, dim])
+        self.bytes_per_element = bpe
         self.k_size = self.HEAD_DIM * bpe                             # 128 bytes per position per head
         self.KV_HEAD_STRIDE = seq_len * self.k_size                   # one head, all positions
         self.KV_LAYER_STRIDE = self.NUM_KV_HEADS * self.KV_HEAD_STRIDE  # all heads, one layer
@@ -1553,16 +1554,14 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self._last_total_flops = None
         return self.get_arg_max_index()
 
-    def compile_decoder(self, kv_len_buckets=None) -> None:
-        """Compile per-bucket decode programs + per-token embed programs."""
+    def compile_decoder(self) -> None:
+        """Compile single decoder program with runtime kv_len dispatch via gpr_bucket_idx."""
         from user_dma_core import TYPE
-        if kv_len_buckets is None:
-            kv_len_buckets = [64 * (i + 1) for i in range(self.max_seq_len // 64)]
-        self._kv_len_buckets = kv_len_buckets
-        H, KV, D, I = self.HIDDEN_SIZE, self.NUM_KV_HEADS * self.HEAD_DIM, self.HEAD_DIM, self.INTERMEDIATE_SIZE
+        H, D, I = self.HIDDEN_SIZE, self.HEAD_DIM, self.INTERMEDIATE_SIZE
         bpe = 2
+        G = self.GROUP_SIZE
+        num_buckets = (self.max_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
 
-        # Helper: dispatch matmul as BF16 or Q4_64
         def lm_matmul(M, K, N, A, proj, la, OUT, **kw):
             if self.lm_bf16:
                 self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_weight'],
@@ -1571,126 +1570,147 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 self.quantized_matmat_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
                     OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.IF4, **kw)
 
-        # --- Pre-compile per-token embed programs (on-device DMA gather) ---
-        embed_row_bytes = H * bpe
-        print(f"    Pre-compiling {self.VOCAB_SIZE} embed programs (on-device DMA gather)...")
-        self._decode_embed_raw = []
-        for tid in range(self.VOCAB_SIZE):
-            src_addr = self.embed_addr + tid * embed_row_bytes
-            self.start_capture()
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=src_addr,
-                sram_address=0x00000,
-                element_size=H)
-            self.sram_to_accelerator_memory(
-                sram_address=0x00000,
-                accelerator_dram_address=self.LAYER0_INPUT_DRAM,
-                element_size=H)
-            self._decode_embed_raw.append(capture_to_raw(self))
+        # Guarantee counter starts at 1 regardless of prior compilations.
+        self.reset_isa_reg_counter()
+        # Reserve fixed ISA registers (1-6) so alloc_isa_reg() inside
+        # decoder_group_attention_core_pbi / matmat_mul_core never clobbers
+        # V_CACHE_SIZE_REG(1), ROPE_SIZE_REG(2), TMP_REG(3),
+        # gpr_seq_len(4), gpr_q_seq_len(5), gpr_bucket_idx(6) at runtime.
+        _NUM_FIXED_REGS = 6
+        for _ in range(_NUM_FIXED_REGS):
+            self.alloc_isa_reg()
 
-        # --- Compile bucket programs (one per kv_len, with halt) ---
-        self._decode_bucket_raw = []
+        global _SILENT_MODE
+        _SILENT_MODE = True
         self.clear_inst_id()
-        for kv_len in kv_len_buckets:
-            self.start_capture()
-            for layer_idx in range(self.NUM_LAYERS):
-                la = self.lm_layer_addrs[layer_idx]
-                h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
-                h_out = self.LAYER0_OUTPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_INPUT_DRAM
-                # RMS norm (input_layernorm)
-                self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=h_in,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'])
-                # Q/K/V projections M=1
-                lm_matmul(1, H, H, self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM)
-                lm_matmul(1, H, KV, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM)
-                lm_matmul(1, H, KV, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM)
-                # Store V [1,320]=[1,5*64] to KV cache at current pos (register-addressed)
-                for h in range(self.NUM_KV_HEADS):
-                    v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                    self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_DRAM + h * D * bpe, 0x10000, D)
-                    self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x10000, v_cache, D)
-                    self.overwrite_instruction_with_general_register(self.TMP_REG)
-                # RoPE on K (5 heads), store to KV cache at current pos
-                for h in range(self.NUM_KV_HEADS):
-                    k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                    self.rope_hf_core(N=D,input_dram_addr=self.LAYER0_K_PROJ_DRAM + h * D * bpe,output_dram_addr=k_cache,cos_dram_addr=self.ROPE_COS_DRAM, sin_dram_addr=self.ROPE_SIN_DRAM,rope_size_reg=self.ROPE_SIZE_REG, output_addr_inc_reg=self.V_CACHE_SIZE_REG,tmp_reg=self.TMP_REG)
-                # RoPE on Q (15 heads) — Q is [1,960]=[1,15*64], output to Q_PERM
-                for h in range(self.NUM_HEADS):
-                    self.rope_hf_core(N=D,input_dram_addr=self.LAYER0_Q_DRAM + h * D * bpe,output_dram_addr=self.LAYER0_Q_PERM_DRAM + h * D * bpe,cos_dram_addr=self.ROPE_COS_DRAM, sin_dram_addr=self.ROPE_SIN_DRAM,rope_size_reg=self.ROPE_SIZE_REG, tmp_reg=self.TMP_REG)
-                # 5 decode attention calls (GQA: 3 Q heads batched per KV head)
-                for kv_b in range(self.NUM_KV_HEADS):
-                    q_start = kv_b * self.GROUP_SIZE * D * bpe
-                    decode_flash_attention_core(self, head_dim=D, kv_len=kv_len,Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + q_start,K_DRAM_ADDR=self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE,V_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE,OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + q_start,SCRATCH_DRAM_ADDR=self.LAYER0_ATTN_SCRATCH_DRAM,IDENTITY_DRAM_ADDR=self.identity_addr,BIAS_DRAM_ADDR=self.DECODE_BIAS_DRAM,num_q_heads=self.GROUP_SIZE,bias_row_stride=self.max_seq_len)
-                # O projection M=1
-                lm_matmul(1, H, H, self.LAYER0_ATTN_OUT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM)
-                # Fused residual + RMS norm
-                rms_norm_core_dram_post_add(self, M=1, N=H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.LAYER0_O_PROJ_DRAM,
-                    ADDOUTPUT_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, NORMOUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                    GAMMA_DRAM_ADDR=la['ln2_gamma'])
-                # MLP M=1
-                lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
-                lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'up', la, self.LAYER0_MLP_UP_DRAM)
-                self.accelerator_memory_to_sram(self.LAYER0_MLP_GATE_DRAM, 0x10000, I)
-                self.accelerator_memory_to_sram(self.LAYER0_MLP_UP_DRAM, 0x90000, I)
-                self.eltwise_mul_core(0x10000, 0x90000, 0x10000, I)
-                self.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM, I)
-                lm_matmul(1, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
-                # MLP residual M=1
-                self.accelerator_memory_to_sram(self.LAYER0_RESIDUAL_DRAM, 0x10000, H)
-                self.accelerator_memory_to_sram(self.LAYER0_MLP_DOWN_DRAM, 0x90000, H)
-                self.eltwise_add_core(0x10000, 0x90000, 0x10000, H)
-                self.sram_to_accelerator_memory(0x10000, h_out, H)
-            # Final norm + LM head M=1
-            final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
-            self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=final_buf,
-                OUTPUT_DRAM_ADDR=self.FINAL_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
-            if self.lm_bf16:
-                self.matmat_mul_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
-                    B_DRAM_ADDR=self.lm_head_weight, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM)
-            else:
-                self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
-                    B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
-            self.generate_instruction_halt()
-            bucket_raw = capture_to_raw(self)
-            self._decode_bucket_raw.append(bucket_raw)
+        self.start_capture()
 
-        # Allocate scratch for fused decode program: reg_set (64B) + embed + largest bucket
-        max_embed = max(len(r) for r in self._decode_embed_raw)
-        max_bucket = max(len(r) for r in self._decode_bucket_raw)
-        worst_case = 64 + max_embed + max_bucket  # 64 bytes for 2 x 32-byte ADD_SET
-        self._decode_scratch_addr = self.get_program_dram_addr()
-        self.allocate_program_dram(worst_case)
+        for layer_idx in range(self.NUM_LAYERS):
+            la = self.lm_layer_addrs[layer_idx]
+            h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
+            h_out = self.LAYER0_OUTPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_INPUT_DRAM
 
-        # Save to bin files for fast reload
+            # RMS norm (input_layernorm)
+            self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=h_in,
+                OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'])
+            # Q/K/V projections
+            lm_matmul(1, H, H,                     self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM)
+            lm_matmul(1, H, self.NUM_KV_HEADS * D, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM)
+            lm_matmul(1, H, self.NUM_KV_HEADS * D, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM)
+
+            # Compute position-based register offsets once per layer
+            # V_CACHE_SIZE_REG = gpr_seq_len * k_size  (byte offset into KV cache)
+            # ROPE_SIZE_REG    = gpr_seq_len * D * bpe (byte offset into cos/sin tables)
+            self.generate_instruction_reg_mul_imm(self.V_CACHE_SIZE_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size))
+            self.generate_instruction_reg_mul_imm(self.ROPE_SIZE_REG, self.gpr_seq_len, ue_35bit_addr_shifter(D * bpe))
+
+            # Write V to KV cache at current position
+            for h in range(self.NUM_KV_HEADS):
+                v_base = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
+                self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_DRAM + h * D * bpe, 0x10000, D)
+                self.generate_instruction_add_imm(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_base), self.TMP_REG)
+                self.sram_to_accelerator_memory(0x10000, 0, D, general_reg_src=self.TMP_REG)
+
+            # RoPE K: write RoPE'd result directly to K cache via output_addr_inc_reg
+            for h in range(self.NUM_KV_HEADS):
+                k_base = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
+                self.rope_hf_core(N=D,
+                    input_dram_addr=self.LAYER0_K_PROJ_DRAM + h * D * bpe,
+                    output_dram_addr=k_base,
+                    cos_dram_addr=self.ROPE_COS_DRAM, sin_dram_addr=self.ROPE_SIN_DRAM,
+                    rope_size_reg=self.ROPE_SIZE_REG,
+                    output_addr_inc_reg=self.V_CACHE_SIZE_REG,
+                    tmp_reg=self.TMP_REG)
+
+            # RoPE Q: output to Q_PERM_DRAM (attention reads from there)
+            for h in range(self.NUM_HEADS):
+                self.rope_hf_core(N=D,
+                    input_dram_addr=self.LAYER0_Q_DRAM + h * D * bpe,
+                    output_dram_addr=self.LAYER0_Q_PERM_DRAM + h * D * bpe,
+                    cos_dram_addr=self.ROPE_COS_DRAM, sin_dram_addr=self.ROPE_SIN_DRAM,
+                    rope_size_reg=self.ROPE_SIZE_REG,
+                    tmp_reg=self.TMP_REG)
+
+            # GQA decode attention: NUM_KV_HEADS groups × GROUP_SIZE Q heads each
+            for kv_b in range(self.NUM_KV_HEADS):
+                q_start = kv_b * G * D * bpe
+                self.decoder_group_attention_core_pbi(
+                    group_size=G,
+                    head_dim=D,
+                    Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + q_start,
+                    K_DRAM_ADDR=self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE,
+                    V_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + q_start,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_ATTN_SCRATCH_DRAM,
+                    BIAS_DRAM_ADDR=self.DECODE_BIAS_DRAM,
+                    IDENTITY_DRAM_ADDR=self.identity_addr,
+                    gpr_bucket_idx=self.gpr_bucket_idx,
+                    num_buckets=num_buckets,
+                )
+
+            # O projection
+            lm_matmul(1, H, H, self.LAYER0_ATTN_OUT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM)
+            # Post-attn residual + RMS norm
+            rms_norm_core_dram_post_add(self, M=1, N=H,
+                A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.LAYER0_O_PROJ_DRAM,
+                ADDOUTPUT_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM,
+                NORMOUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                GAMMA_DRAM_ADDR=la['ln2_gamma'])
+            # MLP
+            lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
+            lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'up',   la, self.LAYER0_MLP_UP_DRAM)
+            self.accelerator_memory_to_sram(self.LAYER0_MLP_GATE_DRAM, 0x10000, I)
+            self.accelerator_memory_to_sram(self.LAYER0_MLP_UP_DRAM,   0x90000, I)
+            self.eltwise_mul_core(0x10000, 0x90000, 0x10000, I)
+            self.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM, I)
+            lm_matmul(1, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
+            # MLP residual
+            self.accelerator_memory_to_sram(self.LAYER0_RESIDUAL_DRAM,  0x10000, H)
+            self.accelerator_memory_to_sram(self.LAYER0_MLP_DOWN_DRAM,  0x90000, H)
+            self.eltwise_add_core(0x10000, 0x90000, 0x10000, H)
+            self.sram_to_accelerator_memory(0x10000, h_out, H)
+
+        # Final norm + LM head
+        final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
+        self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=final_buf,
+            OUTPUT_DRAM_ADDR=self.FINAL_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
+        if self.lm_bf16:
+            self.matmat_mul_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
+                B_DRAM_ADDR=self.lm_head_weight, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM)
+        else:
+            self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
+                B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
+
+        # Advance token position on-device so next decode step writes to the right KV slot
+        self.generate_instruction_add_inc(self.gpr_seq_len)
+        self.generate_instruction_halt()
+        self.stop_capture()
+        for _ in range(_NUM_FIXED_REGS):
+            self.release_isa_reg()
+        _SILENT_MODE = False
+
+        raw = bytearray()
+        for inst in self.capture_buffer:
+            raw.extend(inst.get_bytes())
+        self.clear_capture_buffer()
+
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
-        # Save bucket programs
-        bucket_meta = []
-        bucket_all = bytearray()
-        for raw in self._decode_bucket_raw:
-            bucket_meta.append({"offset": len(bucket_all), "size": len(raw)})
-            bucket_all.extend(raw)
         bin_path = os.path.join(bin_dir, "decoder_program.bin")
         with open(bin_path, "wb") as f:
-            f.write(bucket_all)
-        # Save embed programs (all same size, stride-indexed)
-        embed_stride = len(self._decode_embed_raw[0])
-        embed_bin_path = os.path.join(bin_dir, "decoder_embed.bin")
-        with open(embed_bin_path, "wb") as f:
-            for raw in self._decode_embed_raw:
-                f.write(raw)
+            f.write(bytes(raw))
         meta_path = os.path.join(bin_dir, "decoder_program.json")
         with open(meta_path, "w") as f:
-            json.dump({
-                "kv_len_buckets": kv_len_buckets,
-                "bucket_meta": bucket_meta,
-                "embed_stride": embed_stride,
-                "embed_count": len(self._decode_embed_raw),
-            }, f)
-        embed_total = sum(len(r) for r in self._decode_embed_raw)
-        print(f"    Decoder compiled: {len(kv_len_buckets)} buckets ({len(bucket_all)} bytes), "
-              f"{self.VOCAB_SIZE} embed programs ({embed_total} bytes) → {bin_dir}")
+            json.dump({"decoder_program_size": len(raw), "num_buckets": num_buckets, "version": 2}, f)
+
+        # Load into program DRAM for immediate use (same session)
+        self._decoder_program_addr = self.get_program_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, self._decoder_program_addr, bytes(raw), len(raw))
+        self.allocate_program_dram(len(raw))
+        self._decoder_preamble_addr = self.get_program_dram_addr()
+        self.allocate_program_dram(256)
+        self._decoder_num_buckets = num_buckets
+        print(f"    Decoder compiled: single program {len(raw)} bytes, {num_buckets} attention buckets → {bin_dir}")
 
     def _load_bin(self, bin_path: str) -> int:
         """Load a program bin file into program DRAM. Returns DRAM address."""
@@ -1800,6 +1820,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             "tensor_size": self.get_tensor_dram_usage(),
             "max_seq_len": self.max_seq_len,
             "k_size": self.k_size,
+            "bytes_per_element": self.bytes_per_element,
             "KV_HEAD_STRIDE": self.KV_HEAD_STRIDE,
             "KV_LAYER_STRIDE": self.KV_LAYER_STRIDE,
             "vision_bf16": self.vision_bf16,
@@ -1835,6 +1856,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         for key, val in meta.items():
             if key not in ("params_size", "tensor_size"):
                 setattr(self, key, val)
+        self.bytes_per_element = 2  # always bf16; not in snapshot, needed by attention PBI body
         from transformers import AutoTokenizer
         model_dir = os.path.join(self.script_dir, "smolvlm2_bin", "SmolVLM2-500M-Video-Instruct")
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -1845,34 +1867,26 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         return True
 
     def load_decoder(self) -> None:
-        """Load pre-compiled decoder from bin (embed programs + bucket programs)."""
+        """Load pre-compiled decoder program from bin."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         meta_path = os.path.join(bin_dir, "decoder_program.json")
-        with open(meta_path, "r") as f:
+        with open(meta_path) as f:
             meta = json.load(f)
-        self._kv_len_buckets = meta["kv_len_buckets"]
-        # Load bucket programs
+        if "num_buckets" not in meta:
+            raise RuntimeError(
+                "decoder_program.json is from the old bucket format; "
+                "delete decoder_program.bin and decoder_program.json to recompile"
+            )
         bin_path = os.path.join(bin_dir, "decoder_program.bin")
         with open(bin_path, "rb") as f:
-            bucket_all = f.read()
-        self._decode_bucket_raw = []
-        for bm in meta["bucket_meta"]:
-            self._decode_bucket_raw.append(bucket_all[bm["offset"]:bm["offset"] + bm["size"]])
-        # Load embed programs (stride-indexed)
-        embed_bin_path = os.path.join(bin_dir, "decoder_embed.bin")
-        with open(embed_bin_path, "rb") as f:
-            embed_all = f.read()
-        stride = meta["embed_stride"]
-        count = meta["embed_count"]
-        self._decode_embed_raw = [embed_all[i * stride:(i + 1) * stride] for i in range(count)]
-        # Allocate scratch for fused decode program: reg_set (64B) + embed + largest bucket
-        max_embed = max(len(r) for r in self._decode_embed_raw)
-        max_bucket = max(len(r) for r in self._decode_bucket_raw)
-        worst_case = 64 + max_embed + max_bucket  # 64 bytes for 2 x 32-byte ADD_SET
-        self._decode_scratch_addr = self.get_program_dram_addr()
-        self.allocate_program_dram(worst_case)
-        print(f"    Loaded decoder: {len(self._decode_bucket_raw)} buckets, "
-              f"{len(self._decode_embed_raw)} embed programs, scratch {worst_case} bytes")
+            raw = f.read()
+        self._decoder_program_addr = self.get_program_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, self._decoder_program_addr, raw, len(raw))
+        self.allocate_program_dram(len(raw))
+        self._decoder_preamble_addr = self.get_program_dram_addr()
+        self.allocate_program_dram(256)
+        self._decoder_num_buckets = meta["num_buckets"]
+        print(f"    Loaded decoder @0x{self._decoder_program_addr:X}: {len(raw)} bytes, {self._decoder_num_buckets} buckets")
 
     # --- Run ---
     def run_encoder(self, encoder_addr: int, pixel_values) -> None:
@@ -1961,66 +1975,57 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         return self.get_arg_max_index()
     def run_decoder(self, token_id: int, max_new_tokens: int = 512) -> list:
         """Auto-regressive decode loop. Returns generated token IDs."""
-        bpe = 2
         global _SILENT_MODE
         generated = []
-        H, D, I = self.HIDDEN_SIZE, self.HEAD_DIM, self.INTERMEDIATE_SIZE
-        QH, KVH, G = self.NUM_HEADS, self.NUM_KV_HEADS, self.GROUP_SIZE
-        self._decode_total_flops = 0
-        self._decode_total_hw_ns = 0
-        # All embed programs are the same size (2 DMA instructions)
-        embed_size = len(self._decode_embed_raw[0])
-        REG_SET_SIZE = 64  # 2 x 32-byte ADD_SET instructions
-        bucket_offset = REG_SET_SIZE + embed_size  # bucket starts after reg_set + embed
-        last_bucket_idx = -1  # track cached bucket to avoid re-DMA
+        H = self.HIDDEN_SIZE
+        bpe = 2
+        embed_row_bytes = H * bpe
+        num_buckets = self._decoder_num_buckets
+        decoder_program_addr = self._decoder_program_addr
+        preamble_addr = self._decoder_preamble_addr
+
         while len(generated) < max_new_tokens and self.seq_len < self.max_seq_len:
             _SILENT_MODE = True
             self.seq_len += 1
-            pos = self.seq_len - 1
-            # Decode attention bias: [GROUP_SIZE, max_seq_len] with proper stride
-            # Each row must be max_seq_len wide to match bias_row_stride in attention
             aligned_kv = ((self.seq_len + 63) // 64) * 64
-            bias = torch.full((self.GROUP_SIZE * self.max_seq_len,), -1e38, dtype=torch.bfloat16)
-            for g in range(self.GROUP_SIZE):
-                bias[g * self.max_seq_len:g * self.max_seq_len + self.seq_len] = 0.0
+            bucket_idx = min(aligned_kv // UE_VECTOR_SIZE, num_buckets)
+
+            # Decode bias: [GROUP_SIZE, max_seq_len] with zeros at valid KV positions
+            bias = torch.full((self.GROUP_SIZE, self.max_seq_len), -1e38, dtype=torch.bfloat16)
+            bias[:, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.DECODE_BIAS_DRAM, bias)
-            # Fuse: reg_set + embed + bucket → single dispatch (no separate isa_set_register)
-            prog_idx = min((self.seq_len - 1) // 64, len(self._decode_bucket_raw) - 1)
-            if prog_idx != last_bucket_idx:
-                bucket_raw = self._decode_bucket_raw[prog_idx]
-                self.dma_write(DMA_DEVICE_H2C,
-                               self._decode_scratch_addr + bucket_offset,
-                               bucket_raw, len(bucket_raw))
-                last_bucket_idx = prog_idx
-            # Build fused reg_set + embed bytes (64 + 64 = 128 bytes)
-            reg_set_bytes = bytearray()
-            reg_set_bytes.extend(_make_add_set_bytes(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(pos * self.k_size)))
-            reg_set_bytes.extend(_make_add_set_bytes(self.ROPE_SIZE_REG, ue_35bit_addr_shifter(pos * self.HEAD_DIM * bpe)))
-            embed_raw = self._decode_embed_raw[token_id]
-            fused_head = bytes(reg_set_bytes) + embed_raw
-            # DMA fused reg_set + embed to start of scratch (bucket already cached after)
-            self.dma_write(DMA_DEVICE_H2C, self._decode_scratch_addr, fused_head, len(fused_head))
-            self.start_execute_from_dram(self._decode_scratch_addr)
+
+            # Host-side embed DMA (same as gemma3) — avoids on-device C2H before decoder
+            src_addr = self.embed_addr + token_id * embed_row_bytes
+            embed_vec = self.dma_from_accelerator_memory(src_addr, torch.Size([H]))
+            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embed_vec)
+
+            # Preamble: prime gpr_seq_len + gpr_bucket_idx + jump into decoder
+            self.clear_inst_id()
+            self.start_capture()
+            self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len - 1)
+            self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+            self.stop_capture()
+            self.write_captured_instructions_to_dram(preamble_addr)
+            self.clear_capture_buffer()
+
+            self.start_execute_from_dram(preamble_addr)
             self.wait_queue(10.0)
-            # Accumulate decode FLOPs from HW cycle counter
-            hw_cycles = self.read_reg32(user_dma_core.UE_LATENCY_COUNT_ADDR)
-            self._decode_total_hw_ns += hw_cycles * user_dma_core.CLOCK_CYCLE_TIME_NS
-            per_layer = (4 * H + 2 * H * (H + 2 * KVH * D)
-                + (QH + KVH) * D * 4
-                + KVH * (D * aligned_kv + G * (D + 2 * D * aligned_kv
-                    + aligned_kv + aligned_kv * 5 + 2 * aligned_kv * D))
-                + 2 * H * H + 5 * H + 4 * H * I + I + 2 * I * H + H)
-            self._decode_total_flops += self.NUM_LAYERS * per_layer + 4 * H + 2 * H * self.VOCAB_SIZE
+
             token_id = self.get_arg_max_index()
+            # Debug: first 2 steps only
+            if len(generated) < 2:
+                logits = self.dma_from_accelerator_memory(self.LOGITS_DRAM, torch.Size([self.VOCAB_SIZE]))
+                top5 = logits.topk(5)
+                _original_print(f"\n[dbg step={len(generated)+1}] seq_len={self.seq_len} gpr_seq_len_set={self.seq_len-1} bucket={bucket_idx} argmax={token_id} top5_ids={top5.indices.tolist()} top5_vals={top5.values.tolist()}")
             generated.append(token_id)
             _SILENT_MODE = False
-            if token_id in _SMOLVLM2_CFG["model"]["stop_token_ids"]:  # <|endoftext|>, BOS, PAD, <end_of_utterance>
+            if token_id in _SMOLVLM2_CFG["model"]["stop_token_ids"]:
                 _original_print(f"\nStop token {token_id} reached.")
                 break
             _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
         _SILENT_MODE = False
-        self._decode_hw_gflops = (self._decode_total_flops / self._decode_total_hw_ns
-                                  if self._decode_total_hw_ns > 0 else 0)
         return generated
     def program_execute(self, program_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR,
                         timeout: float = 10.0, total_flops: int = None) -> None:
@@ -2252,6 +2257,41 @@ def run_debug(ue, args, script_dir, has_image):
 
 
 # =============================================================================
+# CPU decode verification (--verify_prefill)
+# =============================================================================
+def _verify_prefill_cpu(ue, token_ids, hw_first_token, model_dir, image_path, prompt, max_new=30):
+    """Use AutoProcessor + model.generate() — the standard HF path — to get ground-truth output."""
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from PIL import Image
+
+    _original_print("  Loading HF model + processor on CPU...")
+    hf = AutoModelForImageTextToText.from_pretrained(
+        model_dir, local_files_only=True, torch_dtype=torch.bfloat16,
+        device_map="cpu", attn_implementation="eager").eval()
+    proc = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
+
+    has_image = image_path is not None
+    if has_image:
+        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+        img = Image.open(image_path).convert("RGB")
+        prompt_text = proc.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = proc(text=prompt_text, images=[img], return_tensors="pt")
+    else:
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        prompt_text = proc.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = proc(text=prompt_text, return_tensors="pt")
+    inputs = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in inputs.items()}
+
+    _original_print(f"  hw first token: {hw_first_token} ({ue.tokenizer.decode([hw_first_token])})")
+    _original_print("  CPU generate output: ", end="", flush=True)
+    with torch.no_grad():
+        out_ids = hf.generate(**inputs, max_new_tokens=max_new, do_sample=False)
+    new_ids = out_ids[0, inputs["input_ids"].shape[1]:]
+    _original_print(proc.decode(new_ids, skip_special_tokens=True))
+    del hf
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -2269,6 +2309,7 @@ def main():
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"], help="Max sequence length")
     parser.add_argument("--vision-fp4", action="store_true", help="Use FP4 quantized weights for vision encoder (default: BF16)")
     parser.add_argument("--debug", action="store_true", help="Staged NaN/cosine localizer: verify vision + per-layer prefill_v2 vs HF CPU reference, then exit (no decode)")
+    parser.add_argument("--verify_prefill", action="store_true", help="After hardware prefill, run CPU decode using HF model to confirm model output (skips hardware decoder)")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2416,6 +2457,14 @@ def main():
                 v_stale = ue.LAYER0_V_DRAM + layer * ue.KV_LAYER_STRIDE + h * ue.KV_HEAD_STRIDE + seq_len * ue.HEAD_DIM * 2
                 ue.dma_to_accelerator_memory(k_stale, stale_zeros)
                 ue.dma_to_accelerator_memory(v_stale, stale_zeros)
+    if args.verify_prefill:
+        _original_print(f"\n--- verify_prefill: CPU ground-truth decode ---")
+        _verify_prefill_cpu(ue, token_ids, hw_token, model_dir,
+                            image_path=args.image if has_image else None,
+                            prompt=args.prompt, max_new=30)
+        _original_print("verify_prefill done — exiting (no hardware decode).")
+        return
+
     # --- Decode (on-device embed fused with decoder, single dispatch per token) ---
     max_new = args.max_seq - seq_len
     _original_print(f"\n--- Starting decoder ---")
