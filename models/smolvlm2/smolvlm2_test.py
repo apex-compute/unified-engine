@@ -614,6 +614,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         lo = float(finite.min()) if finite.numel() else float("nan")
         hi = float(finite.max()) if finite.numel() else float("nan")
         mn = float(finite.mean()) if finite.numel() else float("nan")
+        info = {"t": t, "nan": n_nan, "inf": n_inf, "cos": None, "cos_excl8": None,
+                "cos_tok": None, "relL2": None}
         msg = (f"[dbg] {name:30s} n={n_elems:<8d} nan={n_nan:<6d} inf={n_inf:<5d} "
                f"min={lo:+.3f} max={hi:+.3f} mean={mn:+.4f}")
         if ref is not None:
@@ -621,9 +623,9 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             m = min(rflat.numel(), t.numel())
             d, r = t[:m], rflat[:m]
             err = float((d - r).abs().max())
-            cos = float(torch.nn.functional.cosine_similarity(d, r, dim=0))
-            rel = float((d - r).norm() / (r.norm() + 1e-9))
-            msg += f"  maxerr={err:.3f} cos={cos:.4f} relL2={rel:.3f}"
+            info["cos"] = float(torch.nn.functional.cosine_similarity(d, r, dim=0))
+            info["relL2"] = float((d - r).norm() / (r.norm() + 1e-9))
+            msg += f"  maxerr={err:.3f} cos={info['cos']:.4f} relL2={info['relL2']:.3f}"
             # Outlier-robust: SmolLM2 "massive activations" (a few huge channels) dominate plain
             # cosine. If ref is 2D [T,H], also report cosine with the top-8 |channel| dims masked
             # and the mean per-token cosine — these expose errors the big dims hide.
@@ -633,14 +635,14 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 chan = rr.abs().mean(0)
                 topk = torch.topk(chan, min(8, Hd)).indices
                 mask = torch.ones(Hd); mask[topk] = 0.0
-                cos_excl = float(torch.nn.functional.cosine_similarity(
+                info["cos_excl8"] = float(torch.nn.functional.cosine_similarity(
                     (dd * mask).flatten(), (rr * mask).flatten(), dim=0))
-                pertok = float(torch.nn.functional.cosine_similarity(dd, rr, dim=1).mean())
-                msg += f" cos_excl8={cos_excl:.4f} cos_tok={pertok:.4f}"
+                info["cos_tok"] = float(torch.nn.functional.cosine_similarity(dd, rr, dim=1).mean())
+                msg += f" cos_excl8={info['cos_excl8']:.4f} cos_tok={info['cos_tok']:.4f}"
         print(msg, flush=True)
         if raise_on_nan and (n_nan or n_inf):
             raise FloatingPointError(f"NaN/Inf detected in {name} (nan={n_nan}, inf={n_inf})")
-        return t
+        return info
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         """Set ISA register to immediate value."""
         isa_set_register(self, dst_reg_idx, immediate_value, timeout_s)
@@ -1417,6 +1419,15 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.stop_capture()
         self.write_captured_instructions_to_dram(prefill_addr)
         size_bytes = self.get_capture_instruction_size_bytes()
+        # Cache the full program to bin (gemma3 convention) so later runs load_prefill_v2 in ~1s
+        # instead of recompiling. Only the canonical program (no debug dump / no early halt).
+        if halt_after_layer is None and not debug_dump:
+            raw = bytearray()
+            for inst in self.capture_buffer:
+                raw.extend(inst.get_bytes())
+            bin_path = os.path.join(self.script_dir, "smolvlm2_bin", "prefill_v2_program.bin")
+            with open(bin_path, "wb") as f:
+                f.write(bytes(raw))
         self.allocate_program_dram(size_bytes)
         self.clear_capture_buffer()
         self._prefill_v2_addr = prefill_addr
@@ -1430,6 +1441,26 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self._prefill_v2_final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
         print(f"    Prefill v2 compiled @0x{prefill_addr:X}: {size_bytes} bytes, "
               f"{num_buckets} buckets, PM={PM}, qmax={qmax}")
+
+    def load_prefill_v2(self) -> None:
+        """Load the cached seq-len-agnostic prefill program. Replays compile_prefill_v2's exact
+        program-DRAM allocations so the body lands at the same address its flash absolute-jumps
+        were baked against (must be called at the same point in the alloc sequence: after the
+        decoder is loaded)."""
+        PM = self.PREFILL_MAX_SEQ_LEN
+        bin_path = os.path.join(self.script_dir, "smolvlm2_bin", "prefill_v2_program.bin")
+        with open(bin_path, "rb") as f:
+            raw = f.read()
+        prefill_addr = self.get_program_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, prefill_addr, raw, len(raw))
+        self.allocate_program_dram(len(raw))
+        self._prefill_v2_addr = prefill_addr
+        self._prefill_v2_preamble_addr = self.get_program_dram_addr()
+        self.allocate_program_dram(PM * 2 * 32 + IMAGE_SEQ_LEN * 2 * 32 + 256)
+        self._prefill_v2_postamble_addr = self.get_program_dram_addr()
+        self.allocate_program_dram(4096)
+        self._prefill_v2_final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
+        print(f"    Loaded prefill v2 @0x{prefill_addr:X}: {len(raw)} bytes")
 
     def run_prefill_v2(self, token_ids, has_image: bool = False, total_flops: int = None,
                        skip_postamble: bool = False) -> int:
@@ -1492,17 +1523,20 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         if skip_postamble:
             return None  # bisection: caller reads intermediate buffers
 
-        # 5. Postamble: final norm + LM head on the runtime last real token -> logits
-        last = self._prefill_v2_final_buf + (seq_len - 1) * H * bpe
+        # 5. Postamble: final norm over ALL tokens (identical to the proven old prefill) + LM head on
+        # the last real token. (RMSNorm is per-row, so M=S then index == M=1 on the last row; using
+        # M=S removes the M=1 path as a variable.)
+        last_off = (seq_len - 1) * H * bpe
         self.clear_inst_id()
         self.start_capture()
-        self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=last,
+        self.rms_norm_core_dram(M=seq_len, N=H, A_DRAM_ADDR=self._prefill_v2_final_buf,
             OUTPUT_DRAM_ADDR=self.FINAL_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
+        last_norm = self.FINAL_NORM_DRAM + last_off
         if self.lm_bf16:
-            self.matmat_mul_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
+            self.matmat_mul_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=last_norm,
                 B_DRAM_ADDR=self.lm_head_weight, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM)
         else:
-            self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
+            self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=last_norm,
                 B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
         self.generate_instruction_halt()
@@ -2031,10 +2065,10 @@ def build_input_ids(tokenizer, prompt: str, has_image: bool = True) -> list:
         else:
             expanded.append(t)
     return expanded
-def _hf_reference(model_dir, tokenizer, prompt, image_path):
+def _hf_reference(model_dir, tokenizer, prompt, image_path, n_greedy=8):
     """HF CPU fp32 reference for --debug. Returns (token_ids, hidden[L+1] x [S,H], logits[S,V],
-    image_features[64,H] or None). Image mode runs the full multimodal forward (vision + LM) so the
-    per-layer hidden states are directly comparable to the device's image-mode prefill."""
+    image_features[64,H] or None, greedy_tokens[n_greedy]). Image mode runs the full multimodal
+    forward so per-layer hidden states match the device's image-mode prefill."""
     from transformers import AutoModelForImageTextToText
     model = AutoModelForImageTextToText.from_pretrained(
         model_dir, local_files_only=True, torch_dtype=torch.float32,
@@ -2049,8 +2083,7 @@ def _hf_reference(model_dir, tokenizer, prompt, image_path):
         token_ids = build_input_ids(tokenizer, prompt, has_image=True)
         pv = proc.image_processor(images=[img], return_tensors="pt")
         kw = {"input_ids": torch.tensor([token_ids]),
-              "pixel_values": pv["pixel_values"].to(torch.float32),
-              "output_hidden_states": True, "use_cache": False}
+              "pixel_values": pv["pixel_values"].to(torch.float32)}
         if "pixel_attention_mask" in pv:
             kw["pixel_attention_mask"] = pv["pixel_attention_mask"]
         with torch.no_grad():
@@ -2060,65 +2093,162 @@ def _hf_reference(model_dir, tokenizer, prompt, image_path):
                 image_features = torch.as_tensor(feat).reshape(-1, model.config.text_config.hidden_size).float()
             except Exception as e:
                 print(f"[dbg] get_image_features unavailable ({e}); vision checked by NaN/stats only")
-            out = model(**kw)
+            out = model(output_hidden_states=True, use_cache=False, **kw)
+            gen = model.generate(max_new_tokens=n_greedy, do_sample=False, **kw)
     else:
         token_ids = build_input_ids(tokenizer, prompt, has_image=False)
+        ids = torch.tensor([token_ids])
         with torch.no_grad():
-            out = model(input_ids=torch.tensor([token_ids]), output_hidden_states=True, use_cache=False)
+            out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
+            gen = model.generate(input_ids=ids, max_new_tokens=n_greedy, do_sample=False)
     hidden = [h[0].float() for h in out.hidden_states]
     logits = out.logits[0].float()
+    greedy = gen[0][len(token_ids):].tolist()
     del model
-    return token_ids, hidden, logits, image_features
+    return token_ids, hidden, logits, image_features, greedy
 
 
 def run_debug(ue, args, script_dir, has_image):
-    """Staged NaN/cosine localizer (one device session): (1) vision encoder output vs HF image
-    features, (2) prefill_v2 every-layer hidden vs HF (single run). First layer whose cosine
-    collapses / NaNs = bug. Use --image None for the clean text-only LM check (no vision confound)."""
+    """End-to-end NaN/cosine localizer (one device session). Verifies, with a HF CPU reference:
+    (1) vision encoder, (2) prefill_v2 every layer, (3) first-token logits / postamble, (4) the
+    decode loop. Compile chatter is suppressed; a single clear DIAGNOSIS is printed at the end.
+    Use --image=None for the clean text-only LM check (no vision confound)."""
+    import io, contextlib
+    quiet = lambda: contextlib.redirect_stdout(io.StringIO())  # hide compile/run chatter
+
     model_dir = os.path.join(script_dir, _SMOLVLM2_CFG["paths"]["hf_model_dir"])
     H, bpe = ue.HIDDEN_SIZE, 2
     PM = ue.PREFILL_MAX_SEQ_LEN
+    F = {}  # findings
 
-    print("\nLoading HF reference (CPU fp32)…")
-    token_ids, hidden, logits, image_features = _hf_reference(
-        model_dir, ue.tokenizer, args.prompt, args.image if has_image else None)
+    print("\nLoading HF reference (CPU fp32)…", flush=True)
+    with quiet():
+        token_ids, hidden, logits, image_features, hf_greedy = _hf_reference(
+            model_dir, ue.tokenizer, args.prompt, args.image if has_image else None)
     seq_len = len(token_ids)
     gold = int(logits[-1].argmax())
-    print(f"=== DEBUG tokens={seq_len} image={has_image} prompt={args.prompt!r} ===")
-    print(f"HF golden first token: id={gold} {ue.tokenizer.decode([gold])!r}")
+    print(f"=== DEBUG  tokens={seq_len}  image={has_image}  prompt={args.prompt!r} ===")
+    print(f"HF golden first token id={gold} {ue.tokenizer.decode([gold])!r}", flush=True)
 
     # --- Stage 1: vision encoder ---
     if has_image:
-        print("\n--- Stage 1: vision encoder (VIS_CONNECTOR vs HF image features) ---")
-        enc_addr = ue.compile_encoder()
-        ue.run_encoder(enc_addr, process_image(args.image))
-        ue.dbg_dram(ue.VIS_CONNECTOR_DRAM, 64 * H, "VIS_CONNECTOR", ref=image_features,
-                    raise_on_nan=False)
+        print("\n--- Stage 1: vision encoder (VIS_CONNECTOR vs HF image features) ---", flush=True)
+        with quiet():
+            enc_addr = ue.compile_encoder()
+            ue.run_encoder(enc_addr, process_image(args.image))
+        vis = ue.dbg_dram(ue.VIS_CONNECTOR_DRAM, 64 * H, "VIS_CONNECTOR",
+                          ref=image_features if image_features is not None else None, raise_on_nan=False)
+        F["vision_cos_excl8"] = vis["cos_excl8"]
+        F["vision_nan"] = vis["nan"] + vis["inf"]
 
     # --- Stage 2: prefill_v2 per-layer hidden vs HF (one run) ---
-    print("\n--- Stage 2: prefill_v2 per-layer hidden vs HF (one run) ---")
-    ue.compile_prefill_v2(debug_dump=True)
-    ue.run_prefill_v2(token_ids, has_image=has_image, skip_postamble=True)
+    print("\n--- Stage 2: prefill_v2 per-layer hidden vs HF (one run) ---", flush=True)
+    print("  compiling prefill_v2 (~496K instrs, silent, ~30-90s)…", flush=True)
+    with quiet():
+        ue.compile_prefill_v2(debug_dump=True)
+    print("  running prefill_v2 on device…", flush=True)
+    with quiet():
+        ue.run_prefill_v2(token_ids, has_image=has_image, skip_postamble=True)
+    layer_excl8, layer_nan = [], 0
     for n in range(ue.NUM_LAYERS):
-        ue.dbg_dram(ue.DBG_LAYER_DUMP + n * PM * H * bpe, seq_len * H, f"L{n:02d}_out",
-                    ref=hidden[n + 1][:seq_len], raise_on_nan=False)
-    print("\nKV cache NaN spot-check (layer 0 / last):")
-    for layer in (0, ue.NUM_LAYERS - 1):
-        for h in range(ue.NUM_KV_HEADS):
-            base_k = ue.LAYER0_K_DRAM + layer * ue.KV_LAYER_STRIDE + h * ue.KV_HEAD_STRIDE
-            ue.dbg_dram(base_k, seq_len * ue.HEAD_DIM, f"K[L{layer}h{h}]", raise_on_nan=False)
+        r = ue.dbg_dram(ue.DBG_LAYER_DUMP + n * PM * H * bpe, seq_len * H, f"L{n:02d}_out",
+                        ref=hidden[n + 1][:seq_len], raise_on_nan=False)
+        layer_excl8.append(r["cos_excl8"]); layer_nan += r["nan"] + r["inf"]
+    # L31 vs HF is raw-vs-final-normed (artifact) -> judge layers on L0..L30 only.
+    early = [c for c in layer_excl8[:3] if c is not None]
+    midlate = [c for c in layer_excl8[3:ue.NUM_LAYERS - 1] if c is not None]
+    F["prefill_early_min"] = min(early) if early else None
+    F["prefill_midlate_min"] = min(midlate) if midlate else None
+    F["prefill_nan"] = layer_nan
 
-    # --- Stage 3: full prefill -> first-token logits (validates the postamble: final-norm + LM head) ---
-    # NOTE: per-layer L31 looks "collapsed" only because HF's last hidden_states entry is already
-    # final-normed while the device dump is raw — that is a comparison artifact, not a bug.
-    print("\n--- Stage 3: full prefill first token (postamble: final-norm + LM head) ---")
-    tok = ue.run_prefill_v2(token_ids, has_image=has_image)  # full run, with postamble
-    ue.dbg_dram(ue.LOGITS_DRAM, ue.VOCAB_SIZE, "LOGITS", ref=logits[-1], raise_on_nan=False)
-    verdict = "MATCH ✓" if tok == gold else "MISMATCH ✗"
-    print(f"device first token: id={tok} {ue.tokenizer.decode([tok])!r}  |  "
-          f"golden id={gold} {ue.tokenizer.decode([gold])!r}   -> {verdict}")
-    print("\nIf MATCH: prefill+postamble are correct -> bug is the decoder loop.\n"
-          "If MISMATCH: bug is the postamble (final-norm / LM head / last-token offset).")
+    # --- Stage 3: full prefill -> first-token logits (postamble: final-norm + LM head) ---
+    print("\n--- Stage 3: full prefill first token (postamble) ---", flush=True)
+    with quiet():
+        tok = ue.run_prefill_v2(token_ids, has_image=has_image)
+    lg = ue.dbg_dram(ue.LOGITS_DRAM, ue.VOCAB_SIZE, "LOGITS", ref=logits[-1], raise_on_nan=False)
+    F["first_tok"] = tok; F["first_tok_match"] = (tok == gold); F["logits_cos"] = lg["cos"]
+    # Split postamble: compare the device's NORMED final hidden (FINAL_NORM, M=1 last token) to HF's
+    # final-normed last hidden (hidden[-1] is post-final-norm). High cos -> norm/L31 fine, LM head is
+    # the bug; low cos -> final-norm or layer-31 output is the bug.
+    hf_fn = hidden[-1][seq_len - 1]
+    print(f"   (HF final-normed last hidden range min={float(hf_fn.min()):+.2f} max={float(hf_fn.max()):+.2f})")
+    fn = ue.dbg_dram(ue.FINAL_NORM_DRAM + (seq_len - 1) * ue.HIDDEN_SIZE * 2, ue.HIDDEN_SIZE,
+                     "FINAL_NORM(last)", ref=hf_fn, raise_on_nan=False)
+    F["final_norm_cos"] = fn["cos"]
+
+    # --- Stage 4: decode loop vs HF greedy continuation ---
+    print("\n--- Stage 4: decode loop vs HF greedy ---", flush=True)
+    n_dec = len(hf_greedy)
+    try:
+        bin_dir = os.path.join(script_dir, "smolvlm2_bin")
+        have_dec = os.path.exists(os.path.join(bin_dir, "decoder_program.bin"))
+        print(f"  {'loading' if have_dec else 'compiling'} decoder"
+              f"{' (~49K embed programs, slow, minutes)' if not have_dec else ''}…", flush=True)
+        with quiet():
+            (ue.load_decoder if have_dec else ue.compile_decoder)()
+            dev_cont = ue.run_decoder(tok, max_new_tokens=n_dec - 1)
+        dev_seq = [tok] + list(dev_cont)
+        m = 0
+        for a, b in zip(dev_seq, hf_greedy):
+            if a == b: m += 1
+            else: break
+        F["decode_match"] = m; F["decode_total"] = n_dec
+        F["dev_text"] = ue.tokenizer.decode(dev_seq)
+        F["hf_text"] = ue.tokenizer.decode(hf_greedy)
+    except Exception as e:
+        F["decode_err"] = repr(e)
+
+    # ---------------- DIAGNOSIS ----------------
+    def ok(c, th=0.90): return c is not None and c >= th
+    print("\n" + "=" * 70)
+    print("                        D I A G N O S I S")
+    print("=" * 70)
+    if has_image:
+        print(f"  vision encoder : cos_excl8={F.get('vision_cos_excl8')}  nan/inf={F.get('vision_nan')}")
+    print(f"  prefill layers : L0-2 min cos_excl8={F['prefill_early_min']:.3f}  "
+          f"L3-30 min={F['prefill_midlate_min']:.3f}  nan/inf={F['prefill_nan']}")
+    print(f"  first token    : device={F['first_tok']} {ue.tokenizer.decode([F['first_tok']])!r}  "
+          f"golden={gold} {ue.tokenizer.decode([gold])!r}  "
+          f"{'MATCH' if F['first_tok_match'] else 'MISMATCH'}  (logits cos={F['logits_cos']:.4f})")
+    fnc = F.get("final_norm_cos")
+    print(f"  final-norm     : normed last-hidden cos vs HF = {fnc if fnc is None else round(fnc,4)}")
+    if "decode_err" in F:
+        print(f"  decode loop    : ERROR {F['decode_err']}")
+    else:
+        print(f"  decode loop    : matched {F['decode_match']}/{F['decode_total']} greedy tokens")
+        print(f"     device: {F['dev_text']!r}")
+        print(f"     golden: {F['hf_text']!r}")
+    print("-" * 70)
+
+    # Per-stage PASS/FAIL — evaluate EVERY stage independently (don't stop at the first failure).
+    def line(name, passed, note=""):
+        print(f"  [{'PASS' if passed else 'FAIL'}] {name:16s} {note}")
+    stages = []
+    if has_image:
+        v_ok = (F.get("vision_nan", 0) == 0) and ok(F.get("vision_cos_excl8"), 0.85)
+        stages.append(("vision encoder", v_ok,
+                       f"cos_excl8={F.get('vision_cos_excl8')} nan={F.get('vision_nan')} "
+                       "(preprocessing differs; low cos may be benign)"))
+    p_ok = (F["prefill_nan"] == 0) and ok(F["prefill_early_min"])
+    stages.append(("prefill layers", p_ok,
+                   f"L0-2 min cos_excl8={F['prefill_early_min']:.3f} nan={F['prefill_nan']}"))
+    fn_ok = ok(fnc, 0.95)
+    stages.append(("final-norm/L31", fn_ok, f"normed-hidden cos={fnc if fnc is None else round(fnc,4)}"))
+    head_ok = F["first_tok_match"]
+    stages.append(("LM head / token", head_ok,
+                   f"device={F['first_tok']!r} golden={gold!r} logits_cos={F['logits_cos']:.3f}"))
+    dec_ok = ("decode_err" not in F) and (F.get("decode_match", 0) == F.get("decode_total", -1))
+    stages.append(("decoder loop", dec_ok,
+                   F.get("decode_err", f"matched {F.get('decode_match')}/{F.get('decode_total')}")))
+    for name, passed, note in stages:
+        line(name, passed, note)
+    print("-" * 70)
+    failed = [n for n, p, _ in stages if not p]
+    if not failed:
+        print("  >>> ALL STAGES PASS — output matches HF.")
+    else:
+        print(f"  >>> FIRST FAILING STAGE: {failed[0].upper()}   (all failures: {', '.join(failed)})")
+    print("=" * 70, flush=True)
 
 
 # =============================================================================
@@ -2201,9 +2331,9 @@ def main():
     timer = time.perf_counter()
     bin_dir = os.path.join(script_dir, "smolvlm2_bin")
     S = ((seq_len + 63) // 64) * 64
-    # Prefill v2 is seq-len-agnostic and always compiled fresh (cheap, one bin for any length);
-    # only encoder + decoder use the cached bins.
-    use_bin = os.path.exists(os.path.join(bin_dir, "decoder_program.bin"))
+    # All three (encoder + decoder + prefill v2) are cached to bin; recompile only when missing.
+    use_bin = (os.path.exists(os.path.join(bin_dir, "decoder_program.bin"))
+               and os.path.exists(os.path.join(bin_dir, "prefill_v2_program.bin")))
     import threading
     stop_compile = threading.Event()
     def _compile_progress():
@@ -2217,12 +2347,14 @@ def main():
         if has_image:
             enc_addr = ue.load_encoder()
         ue.load_decoder()
+        # Prefill v2 loaded last so its program-DRAM region sits past encoder/decoder.
+        ue.load_prefill_v2()
     else:
         if has_image:
             enc_addr = ue.compile_encoder()
         ue.compile_decoder()
-    # Prefill v2 (seq-len-agnostic) compiled last so its program-DRAM region sits past encoder/decoder.
-    ue.compile_prefill_v2()
+        # Prefill v2 compiled last so its program-DRAM region sits past encoder/decoder.
+        ue.compile_prefill_v2()
     stop_compile.set()
     _SILENT_MODE = False
     elapsed = time.perf_counter() - timer
