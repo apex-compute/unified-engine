@@ -18,10 +18,10 @@ running ``llama3.2_3b_test.py`` once on a build machine that has HF access):
 Design mirrors test.py §A–§D (see notes_llama3.2_3b.md): full-4 GB DRAM layout,
 dynamic-PBI single bin (GPR-primed preamble + jump_abs), prefill_context_size=128,
 and sampling decode (recency-decayed / windowed / structural-exempt repetition
-penalty). DECODE DEFAULT is PENALIZED GREEDY (temp 0 + rep-pen 1.1): argmax of the
-penalty-adjusted logits — deterministic, correct math, loop-free; see notes §D. The
-shipped bin is compiled with LM-head writeback enabled, so sampling (temp>0),
-penalized greedy (temp 0 + rep-pen), and pure greedy (temp 0, rep-pen 1.0) all work.
+penalty). DECODE DEFAULT is a position-gated HYBRID (temp 0): pure greedy for the first
+greedy_until (512) tokens — correct math/reasoning — then repetition penalty 1.2 breaks
+long-context loops; deterministic, see notes §D. The shipped bin is compiled with LM-head
+writeback enabled, so sampling (temp>0), the hybrid, and pure greedy (rep-pen 1.0) all work.
 
 Usage:
   python llama3.2_3b_run_from_bin.py
@@ -341,25 +341,19 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
                 factor = rep_pen ** weight[nz]
                 v = logits[nz]
                 logits[nz] = torch.where(v > 0, v / factor, v * factor)
-        temp = float(getattr(self, "temperature", 1.0))
-        if temp <= 0:
-            return int(logits.argmax().item())
-        logits = logits / temp
-        top_k = int(getattr(self, "top_k", 0) or 0)
-        if top_k > 0 and top_k < vocab:
-            kth = torch.topk(logits, top_k).values[-1]
-            logits[logits < kth] = float("-inf")
-        top_p = float(getattr(self, "top_p", 1.0))
-        if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-            probs = torch.softmax(sorted_logits, dim=-1)
-            cumprob = torch.cumsum(probs, dim=-1)
-            keep = cumprob <= top_p
-            keep[0] = True
-            drop_idx = sorted_idx[~keep]
-            logits[drop_idx] = float("-inf")
-        probs = torch.softmax(logits, dim=-1)
-        return int(torch.multinomial(probs, num_samples=1).item())
+        # Deterministic selection: argmax of the (penalty-adjusted) logits.
+        return int(logits.argmax().item())
+        # --- Sampling mechanism (DISABLED) — uncomment + set temperature>0 to re-enable ---
+        # logits = logits / float(getattr(self, "temperature", 1.0))            # temperature
+        # top_k = int(getattr(self, "top_k", 0) or 0)                           # top-k filter
+        # if top_k > 0 and top_k < vocab:
+        #     logits[logits < torch.topk(logits, top_k).values[-1]] = float("-inf")
+        # top_p = float(getattr(self, "top_p", 1.0))                            # top-p (nucleus)
+        # if 0.0 < top_p < 1.0:
+        #     sl, si = torch.sort(logits, descending=True)
+        #     keep = torch.cumsum(torch.softmax(sl, -1), -1) <= top_p; keep[0] = True
+        #     logits[si[~keep]] = float("-inf")
+        # return int(torch.multinomial(torch.softmax(logits, -1), 1).item())    # sample
 
     # ---- run path (dynamic-PBI single bin: preamble + jump_abs) -------------
     def run_llama(self) -> None:
@@ -431,11 +425,11 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
 
         if not hasattr(self, "_generated_tokens"):
             self._generated_tokens = list(self.prefill_seq)
-        # Penalized greedy (temp 0 + rep_pen!=1) and sampling (temp>0) read the logits back
-        # so the repetition penalty applies before token selection; pure HW argmax otherwise.
-        _temperature = float(getattr(self, "temperature", 0.0))
+        # Position-gated hybrid decode (deterministic): PURE greedy (HW argmax) for the first
+        # `greedy_until` decoded tokens — correct math/reasoning, which lands early — then the
+        # repetition penalty turns on to break long-context loops.
         _rep_pen = float(getattr(self, "repetition_penalty", 1.0))
-        _use_logit_readback = _temperature > 0 or _rep_pen != 1.0
+        _greedy_until = int(getattr(self, "greedy_until", 0))
 
         import shutil
         _use_status = sys.stdout.isatty()
@@ -482,7 +476,10 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
             self.clear_capture_buffer()
 
             self.program_execute(preamble_addr, flops=decoder_flops_per_token)
-            if _use_logit_readback:
+            # Hybrid gate: pure HW argmax for the first `greedy_until` decoded tokens, then the
+            # repetition penalty (read logits, argmax of penalized logits).
+            _penalty_active = _rep_pen != 1.0 and (self.seq_len - prefill_seq_len) > _greedy_until
+            if _penalty_active:
                 token_id = self.sample_next_token(self._generated_tokens)
             else:
                 token_id = self.get_arg_max_index(rank=1)
@@ -539,19 +536,23 @@ def main():
                         help="Text prompt (tokenized via the local chat template). Overrides the config default.")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device name. Default: xdma0.")
     parser.add_argument("--cycle", type=float, default=1 / 0.17, help="Clock cycle time in ns. Default ~5.88.")
-    # Decode — defaults match llama3.2_3b_test.py: penalized greedy (temp 0 + rep-pen 1.1); see notes §D.
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="0 = penalized greedy (argmax of penalty-adjusted logits — deterministic, correct math, loop-free; the default). >0 = sampling. Default 0.")
-    parser.add_argument("--top-k", type=int, default=40,
-                        help="Top-k filter (0=off). Caps the tail so wrong tokens can't be sampled. Default 40.")
-    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p (nucleus) filter. Default 0.9.")
-    parser.add_argument("--repetition-penalty", type=float, default=1.1,
-                        help="Recency-decayed repetition penalty (>1 down-weights repeats). Default 1.1.")
+    # Decode — defaults match llama3.2_3b_test.py: hybrid (temp 0: greedy then rep-pen 1.2); see notes §D.
+    # --- Sampling controls (DISABLED) — uncomment + restore the sampling block in
+    #     sample_next_token() to re-enable stochastic sampling ---
+    # parser.add_argument("--temperature", type=float, default=0.0, help=">0 enables sampling.")
+    # parser.add_argument("--top-k", type=int, default=40, help="Top-k filter (sampling only).")
+    # parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus filter (sampling only).")
+    parser.add_argument("--repetition-penalty", type=float, default=1.2,
+                        help="Recency-decayed repetition penalty (>1 down-weights repeats). Default 1.2.")
     parser.add_argument("--rep-window", type=int, default=256,
                         help="Repetition penalty look-back window in tokens. Default 256.")
     parser.add_argument("--rep-decay", type=float, default=0.97,
                         help="Recency decay for the repetition penalty (per-token age). Default 0.97.")
-    parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible sampling.")
+    # parser.add_argument("--seed", type=int, default=None, help="RNG seed (sampling only).")
+    parser.add_argument("--greedy-until", type=int, default=512,
+                        help="Hybrid decode (temp 0): pure greedy for the first N decoded tokens "
+                             "(correct math/reasoning), then the repetition penalty breaks long-context "
+                             "loops. 0 = penalty from the start. Default 512.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -586,22 +587,19 @@ def main():
         prefill_seq = tuple(cfg["default_prefill_tokens"])
 
     ue.prefill_seq = prefill_seq
-    ue.temperature = float(args.temperature)
-    ue.top_k = int(args.top_k)
-    ue.top_p = float(args.top_p)
+    # Sampling controls (temperature/top_k/top_p/seed) disabled — decode is deterministic.
     ue.repetition_penalty = float(args.repetition_penalty)
     ue.rep_window = int(args.rep_window)
     ue.rep_decay = float(args.rep_decay)
+    ue.greedy_until = int(args.greedy_until)
     ue._generated_tokens = list(prefill_seq)
-    if args.seed is not None and ue.temperature > 0:
-        torch.manual_seed(args.seed)
-    if ue.temperature > 0:
-        _original_print(f"Sampling: temperature={ue.temperature}  top_k={ue.top_k}  top_p={ue.top_p}  "
-                        f"repetition_penalty={ue.repetition_penalty}  rep_window={ue.rep_window}  "
-                        f"rep_decay={ue.rep_decay}  seed={args.seed}")
-        if ue.repetition_penalty != 1.0:
-            _n = len(ue._structural_token_ids())  # precompute upfront (no mid-decode stall)
-            _original_print(f"  repetition penalty exempts {_n} structural/special tokens")
+    _penalty_used = ue.repetition_penalty != 1.0
+    _tail = (f"penalty (rep_pen={ue.repetition_penalty}) after {ue.greedy_until} tokens"
+             if _penalty_used else "no penalty")
+    _original_print(f"Decode: greedy (deterministic) — pure greedy then {_tail}")
+    if _penalty_used:
+        _n = len(ue._structural_token_ids())  # precompute upfront (no mid-decode stall)
+        _original_print(f"  repetition penalty exempts {_n} structural/special tokens")
 
     ue.run_llama()
     ue.clear_dram()
