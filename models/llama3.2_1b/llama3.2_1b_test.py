@@ -578,45 +578,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         half_ahd    = ahd // 2              # 32
         rope_row    = hd * 2 * bpe          # bytes per rope table row
 
-        # Compile flash_attention_core once as a subroutine, reused by every
-        # (layer_idx, kv_h) call site via ADD_SET gpr_ret_id + JUMP_ABS.
+        # flash_attention_core compiled once as a subroutine after the layer loop.
+        # Each call site sets gpr_ret_id to its return word address then jumps to the
+        # subroutine; flash_attention returns via JUMP_REG_ABS(gpr_ret_id).
         program_dram_base = self.get_program_dram_addr()
-        num_calls = layer_size * nkvh       # 16 * 8 = 128
         gpr_ret_id = self.alloc_isa_reg()
 
-        flash_sub_start_count = self.capture_count
-        flash_result = self.flash_attention_core(
-            head_dim=ahd,
-            seq_len=aligned_seq_len,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_bucket,
-        )
-        flash_flops_per_call = flash_result[num_bucket - 1]
-        flash_sub_start_addr = program_dram_base + flash_sub_start_count * INSTRUCTION_SIZE_BYTES
-
-        # Return trampoline: ADD_DEC scratch + JZ chain, one entry per call site.
-        # Targets are forward refs patched after the main loop is compiled.
-        scratch_ret = self.alloc_isa_reg()
-        self.generate_instruction_add_imm(
-            src_reg_idx=gpr_ret_id, immediate_value=0, dst_reg_idx=scratch_ret)
-        trampoline_jz_indices: list[int] = []
-        for _ in range(num_calls):
-            self.generate_instruction_add_dec(scratch_ret)
-            trampoline_jz_indices.append(self.capture_count)
-            self.generate_instruction_jump_abs_jz(
-                target_instruction_word_addr=0, reg_id=scratch_ret)
-        self.release_isa_reg()  # scratch_ret
-
-        return_capture_indices: list[int] = []
-        call_id = 1
+        call_site_jump_capture_indices: list[int] = []
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
@@ -775,13 +743,15 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         template_seq_len=seq_len,
                     )
 
-                # Call flash attention subroutine (compiled once above the layer loop).
-                self.generate_instruction_add_set(gpr_ret_id, call_id)
-                self.generate_instruction_jump_abs(
-                    ue_35bit_addr_shifter(flash_sub_start_addr))
-                return_capture_indices.append(self.capture_count)
-                call_id += 1
-                total_flops += flash_flops_per_call
+                # Call flash attention subroutine (compiled after the layer loop).
+                # Pad so capture_count is even; return address = capture_count + 2
+                # (ADD_SET + JUMP_ABS), which is then also even = 512-bit aligned.
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                call_site_jump_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
                 # Assemble output into LAYER0_FLASH_OUTPUT_DRAM
                 # Standard GQA layout per token: [kv0_q0(64), kv0_q1..q3, kv1_q0..q3, ...]
@@ -856,14 +826,35 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gpr_seq_len,
             )
-        # Patch trampoline return targets now that all call site return addresses are known.
-        for jz_idx, ret_count in zip(trampoline_jz_indices, return_capture_indices):
-            self._patch_jump_immediate(
-                jz_idx,
-                ue_35bit_addr_shifter(program_dram_base + ret_count * INSTRUCTION_SIZE_BYTES),
-            )
-        self.release_isa_reg()  # gpr_ret_id
+        # HALT ends the normal execution path; the flash_attention subroutine follows and
+        # is only reachable via the JUMP_ABS call sites within the layer loop above.
         self.generate_instruction_halt()
+
+        # Compile flash_attention subroutine after the HALT; bucket bodies return via
+        # JUMP_REG_ABS(gpr_ret_id), which each call site pre-loaded with its return address.
+        flash_sub_start_inst_dram_addr, flash_flops = self.flash_attention_core(
+            head_dim=ahd,
+            seq_len=aligned_seq_len,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_bucket,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += flash_flops[num_bucket - 1] * layer_size * nkvh
+
+        # Patch all call-site JUMP_ABS placeholders to point at the flash subroutine.
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(
+                jump_idx, ue_35bit_addr_shifter(flash_sub_start_inst_dram_addr))
+
+        self.release_isa_reg()  # gpr_ret_id
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"size_bytes": prefill_program_size, "flops": total_flops}

@@ -5333,7 +5333,8 @@ class UnifiedEngine:
 
     def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, ATTN_P_DRAM_ADDR: int = None,
-                            gpr_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True):
+                            gpr_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True,
+                            gpr_ret_id: int = None):
         """Flash attention entrypoint; dispatches based on ``gpr_bucket_idx``:
 
         - ``gpr_bucket_idx`` is a GPR index (1..15): :meth:`flash_attention_core_pbi` — captured
@@ -5374,6 +5375,7 @@ class UnifiedEngine:
                 gpr_bucket_idx=gpr_bucket_idx,
                 num_buckets=num_buckets,
                 use_pbi=use_pbi,
+                gpr_ret_id=gpr_ret_id,
             )
 
         return self.flash_attention_core_legacy(
@@ -5663,7 +5665,8 @@ class UnifiedEngine:
                             IDENTITY_DRAM_ADDR: int = None,
                             num_buckets: int = 8,
                             BIAS_DRAM_ADDR: int = None, debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None,
-                            use_pbi: bool = True):
+                            use_pbi: bool = True,
+                            gpr_ret_id: int = None):
         """
         **Vᵀ** at ``SCRATCH_DRAM_ADDR``: prefer ``bf16_transpose_core`` (PBI) when available; currently uses
         ``I @ V`` via :meth:`matmat_mul_core` ``use_pbi=True`` (**no identity fast path**—full GEMM cost).
@@ -5713,6 +5716,7 @@ class UnifiedEngine:
             raise ValueError(f"flash_attention_core_pbi: num_buckets={num_buckets} must be >= 1")
 
         program_dram_start_addr = self.get_program_dram_addr()
+        first_capture_count = self.capture_count
 
         # Bucket jump header: num_buckets pairs of (ADD_DEC temp, JZ -> bucket_i_placeholder). Placeholder target = 0
         bucket_scratch_reg = self.alloc_isa_reg()
@@ -5725,7 +5729,8 @@ class UnifiedEngine:
                 target_instruction_word_addr=0, reg_id=bucket_scratch_reg
             )
 
-        # Bucket bodies, each followed by a JMP-to-end placeholder (also target = 0).
+        # Bucket bodies; each ends with JUMP_REG_ABS(gpr_ret_id) when caller supplies a return
+        # register, otherwise a JMP-to-end placeholder patched after all bodies are emitted.
         bucket_start_capture_indices: list[int] = []
         end_jmp_capture_indices: list[int] = []
         bucket_flops: list[int] = []
@@ -5760,14 +5765,11 @@ class UnifiedEngine:
                     BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 )
             bucket_flops.append(_body_flops)
-            end_jmp_capture_indices.append(self.capture_count)
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-
-        self.pad_capture_to_64b_boundary()
-        end_capture_count = self.capture_count
-        end_word_addr = ue_35bit_addr_shifter(
-            program_dram_start_addr + end_capture_count * INSTRUCTION_SIZE_BYTES
-        )
+            if gpr_ret_id is not None:
+                self.generate_instruction_jump_reg_abs(gpr_ret_id)
+            else:
+                end_jmp_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
         # Patch header JZs -> corresponding bucket entry.
         for jz_idx, bucket_idx in zip(jz_capture_indices, bucket_start_capture_indices):
@@ -5776,9 +5778,15 @@ class UnifiedEngine:
             )
             self._patch_jump_immediate(jz_idx, bucket_word_addr)
 
-        # Patch bucket-tail JMPs -> shared end label.
-        for jmp_idx in end_jmp_capture_indices:
-            self._patch_jump_immediate(jmp_idx, end_word_addr)
+        if gpr_ret_id is None:
+            self.pad_capture_to_64b_boundary()
+            end_capture_count = self.capture_count
+            end_word_addr = ue_35bit_addr_shifter(
+                program_dram_start_addr + end_capture_count * INSTRUCTION_SIZE_BYTES
+            )
+            # Patch bucket-tail JMPs -> shared end label.
+            for jmp_idx in end_jmp_capture_indices:
+                self._patch_jump_immediate(jmp_idx, end_word_addr)
 
         self.release_isa_reg()  # bucket_scratch_reg
 
@@ -5788,6 +5796,9 @@ class UnifiedEngine:
             f"Theoretical FLOPS min-bucket={bucket_flops[0] / 1e9:.6f} G, "
             f"max-bucket={bucket_flops[-1] / 1e9:.6f} G"
         )
+        if gpr_ret_id is not None:
+            start_inst_dram_addr = program_dram_start_addr + first_capture_count * INSTRUCTION_SIZE_BYTES
+            return start_inst_dram_addr, bucket_flops
         return bucket_flops
 
     def _flash_attention_pbi_body(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
