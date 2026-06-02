@@ -3032,7 +3032,91 @@ class UnifiedEngine:
         if gr_weight_dram != 0:
             self.release_isa_reg()
         return 4 * N
-        
+
+    def rope_hf_core_decode_d64(self, N: int, input_dram_addr: int, output_dram_addr: int,
+                                packed_table_addr: int, pos_reg: int, tmp_reg: int,
+                                output_pos_strided: bool = False) -> int:
+        """Single-token decode HF RoPE for head_dim ``N < 128`` (the decode analog of
+        :meth:`rope_hf_core_dram_d64_pbi`). :meth:`rope_hf_core_decode` asserts ``N >= 128``;
+        this is the N<128 path. Caller must bracket with start_capture()/stop_capture().
+
+        The token at runtime position ``pos_reg`` (= gpr_seq_len) is roped against the contiguous
+        per-token packed table ``[cos(N) || sin(N)]`` (sin first half pre-negated on the host); the
+        token's row lives at ``packed_table_addr + pos * 2*N*bpe``.
+
+        Alignment discipline (why this path exists): each N/2-element half is < 128 bytes, i.e. half
+        a URAM row, and SRAM cannot be addressed mid-row. Each slice is loaded into the START of its
+        own 128-byte URAM row via register-addressed DMAs (DRAM is byte-addressable; SRAM targets
+        stay row-aligned). No PBI pointers are used.
+
+        input_dram_addr    : single freshly-projected row (static — no position offset).
+        output_pos_strided : True  -> write to ``output_dram_addr + pos*N*bpe`` (KV-cache slot, K).
+                             False -> write to ``output_dram_addr`` (fixed slot, e.g. Q_PERM).
+        """
+        assert 0 < N < 128 and N % 2 == 0, "rope_hf_core_decode_d64 is the N<128 even path"
+        bpe = 2
+        half = N // 2
+        half_bytes = half * bpe
+        row_bytes = N * bpe
+        rope_row_bytes = 2 * row_bytes          # [cos(N) | sin(N)] per token
+        shift = ue_35bit_addr_shifter
+
+        SLOT = 128
+        uram_x_lo      = 0x00000                # URAM_A (x + cos-products + results)
+        uram_x_hi      = 0x00080
+        uram_a_lo      = 0x00100
+        uram_a_hi      = 0x00180
+        uram_result_lo = 0x00200
+        uram_result_hi = 0x00280
+        uram_cos_lo    = 0x80000                # URAM_B (cos/sin slices + sin-products)
+        uram_cos_hi    = uram_cos_lo + SLOT
+        uram_sin_lo    = uram_cos_hi + SLOT
+        uram_sin_hi    = uram_sin_lo + SLOT
+        uram_b_lo      = uram_sin_hi + SLOT
+        uram_b_hi      = uram_b_lo   + SLOT
+
+        cos_base = packed_table_addr
+        sin_base = packed_table_addr + row_bytes
+
+        def _read_pos(base, sram_addr):
+            # tmp_reg = shift(base) + pos_reg * shift(rope_row_bytes) == shift(base + pos*rope_row_bytes)
+            self.generate_instruction_reg_mul_imm(tmp_reg, pos_reg, shift(rope_row_bytes))
+            self.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram_addr,
+                                            element_size=half, general_reg_src=tmp_reg)
+
+        # Input halves: static reads (single row); URAM targets are row-aligned.
+        self.accelerator_memory_to_sram(input_dram_addr, uram_x_lo, half)
+        self.accelerator_memory_to_sram(input_dram_addr + half_bytes, uram_x_hi, half)
+        # Table halves: position-addressed reads from this token's packed [cos||sin] row.
+        _read_pos(cos_base,              uram_cos_lo)   # cos[0:half]
+        _read_pos(cos_base + half_bytes, uram_cos_hi)   # cos[half:N]
+        _read_pos(sin_base,              uram_sin_lo)   # sin[0:half] (pre-negated)
+        _read_pos(sin_base + half_bytes, uram_sin_hi)   # sin[half:N]
+
+        # result = x*cos + rotate_half(x)*sin  (sin_lo pre-negated, so b_lo = x_hi*(-sin))
+        self.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half)
+        self.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half)
+        self.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half)
+        self.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half)
+        self.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half)
+        self.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half)
+
+        if output_pos_strided:
+            def _write_pos(base, sram_addr):
+                self.generate_instruction_reg_mul_imm(tmp_reg, pos_reg, shift(row_bytes))
+                self.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+                self.sram_to_accelerator_memory(sram_address=sram_addr, accelerator_dram_address=0,
+                                                element_size=half, general_reg_src=tmp_reg)
+            _write_pos(output_dram_addr,              uram_result_lo)
+            _write_pos(output_dram_addr + half_bytes, uram_result_hi)
+        else:
+            self.sram_to_accelerator_memory(sram_address=uram_result_lo,
+                                            accelerator_dram_address=output_dram_addr, element_size=half)
+            self.sram_to_accelerator_memory(sram_address=uram_result_hi,
+                                            accelerator_dram_address=output_dram_addr + half_bytes, element_size=half)
+        return 4 * N
+
     def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
         """HF RoPE DRAM entrypoint; dispatches based on ``N`` and ``gpr_M_reg``:
 
