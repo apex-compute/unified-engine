@@ -18,8 +18,10 @@ running ``llama3.2_1b_test.py`` once on a build machine that has HF access):
 Design mirrors test.py §A–§D (see notes_llama3.2_1b.md): full-4 GB DRAM layout,
 dynamic-PBI single bin (GPR-primed preamble + jump_abs), prefill_context_size=128,
 and sampling decode (recency-decayed / windowed / structural-exempt repetition
-penalty; temperature 0.6 default). The shipped bin is compiled with LM-head
-writeback enabled, so both sampling (temp>0) and greedy (temp 0) work.
+penalty). DECODE DEFAULT is PENALIZED GREEDY (temp 0 + rep-pen 1.1): argmax of the
+penalty-adjusted logits — deterministic, correct math, loop-free; see notes §D. The
+shipped bin is compiled with LM-head writeback enabled, so sampling (temp>0),
+penalized greedy (temp 0 + rep-pen), and pure greedy (temp 0, rep-pen 1.0) all work.
 
 Usage:
   python llama3.2_1b_run_from_bin.py
@@ -429,7 +431,11 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
 
         if not hasattr(self, "_generated_tokens"):
             self._generated_tokens = list(self.prefill_seq)
-        _sampling = float(getattr(self, "temperature", 0.0)) > 0
+        # Penalized greedy (temp 0 + rep_pen!=1) and sampling (temp>0) read the logits back
+        # so the repetition penalty applies before token selection; pure HW argmax otherwise.
+        _temperature = float(getattr(self, "temperature", 0.0))
+        _rep_pen = float(getattr(self, "repetition_penalty", 1.0))
+        _use_logit_readback = _temperature > 0 or _rep_pen != 1.0
 
         import shutil
         _use_status = sys.stdout.isatty()
@@ -476,7 +482,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
             self.clear_capture_buffer()
 
             self.program_execute(preamble_addr, flops=decoder_flops_per_token)
-            if _sampling:
+            if _use_logit_readback:
                 token_id = self.sample_next_token(self._generated_tokens)
             else:
                 token_id = self.get_arg_max_index(rank=1)
@@ -533,13 +539,15 @@ def main():
                         help="Text prompt (tokenized via the local chat template). Overrides the config default.")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device name. Default: xdma0.")
     parser.add_argument("--cycle", type=float, default=1 / 0.17, help="Clock cycle time in ns. Default ~5.88.")
-    # Sampling — defaults match llama3.2_1b_test.py (the values the shipped bin was tuned with).
-    parser.add_argument("--temperature", type=float, default=0.6,
-                        help="0 = greedy (HW argmax); >0 = sampling. Default 0.6.")
-    parser.add_argument("--top-k", type=int, default=0, help="Top-k filter (0=off). Default 0.")
+    # Sampling — defaults match llama3.2_1b_test.py (temp 0.4 + top-k 40 fixes FPGA
+    # arithmetic errors while keeping long-context clean; see notes §D).
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="0 = penalized greedy (argmax of penalty-adjusted logits — deterministic, correct math, loop-free; the default). >0 = sampling. Default 0.")
+    parser.add_argument("--top-k", type=int, default=40,
+                        help="Top-k filter (0=off). Caps the tail so wrong tokens can't be sampled. Default 40.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p (nucleus) filter. Default 0.9.")
-    parser.add_argument("--repetition-penalty", type=float, default=1.2,
-                        help="Recency-decayed repetition penalty (>1 down-weights repeats). Default 1.2.")
+    parser.add_argument("--repetition-penalty", type=float, default=1.1,
+                        help="Recency-decayed repetition penalty (>1 down-weights repeats). Default 1.1.")
     parser.add_argument("--rep-window", type=int, default=256,
                         help="Repetition penalty look-back window in tokens. Default 256.")
     parser.add_argument("--rep-decay", type=float, default=0.97,

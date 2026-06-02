@@ -898,17 +898,18 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            # LM head: in greedy mode the HW argmax register is populated as a
-            # pipeline side-effect, so skip the full vocab-logits writeback to DRAM
-            # (write_back_disable). For sampling (temperature > 0) writeback MUST be
-            # enabled so the host can DMA the logits row back for repetition-penalty /
-            # top-k / top-p / multinomial in sample_next_token(). This is a compile-time
-            # gate reading ue.temperature, which main() sets before compile_llama().
-            _greedy_lm_head = float(getattr(self, "temperature", 0.0)) <= 0
+            # LM head: the full vocab-logits writeback to DRAM is needed whenever the host
+            # reads logits — sampling (temp>0) OR penalized greedy (temp 0 + rep_pen!=1, which
+            # argmaxes the penalty-adjusted logits). Disable it ONLY for pure unpenalized greedy
+            # (temp 0 + rep_pen 1.0), where the HW argmax register suffices. This compile-time
+            # gate MUST match the decode dispatch (_use_logit_readback); else the host reads a
+            # never-written LOGITS_DRAM → NaN/garbage ("!!!"). main() sets both before compile.
+            _need_logit_writeback = (float(getattr(self, "temperature", 0.0)) > 0
+                                     or float(getattr(self, "repetition_penalty", 1.0)) != 1.0)
             total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                write_back_disable=_greedy_lm_head)
+                write_back_disable=not _need_logit_writeback)
 
         self.generate_instruction_halt()
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
@@ -1164,7 +1165,11 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         # Falls back to the full prompt when run without main() (e.g. run_from_bin).
         if not hasattr(self, "_generated_tokens"):
             self._generated_tokens = list(self.prefill_seq)
-        _sampling = float(getattr(self, "temperature", 0.0)) > 0
+        # Penalized greedy (temp 0 + rep_pen!=1) and sampling (temp>0) read the logits back
+        # so the repetition penalty applies before token selection; pure HW argmax otherwise.
+        _temperature = float(getattr(self, "temperature", 0.0))
+        _rep_pen = float(getattr(self, "repetition_penalty", 1.0))
+        _use_logit_readback = _temperature > 0 or _rep_pen != 1.0
 
         # Two-region live counter: pin the bottom terminal row as a status line via
         # an ANSI scroll region; tokens stream in the area above it and the counter
@@ -1220,9 +1225,9 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
             self.clear_capture_buffer()
 
             self.program_execute(preamble_addr, flops=decoder_flops_per_token)
-            # Sampling reads the full logits row (writeback enabled at compile time);
-            # greedy uses the HW argmax register (no host readback).
-            if _sampling:
+            # readback path = sampling or penalized greedy (temp<=0 -> argmax of the
+            # penalty-adjusted logits); pure HW argmax only for unpenalized greedy.
+            if _use_logit_readback:
                 token_id = self.sample_next_token(self._generated_tokens)
             else:
                 token_id = self.get_arg_max_index(rank=1)
@@ -1257,24 +1262,20 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_3b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=1/0.17, help='Clock cycle time in ns (default: ~5.88ns)')
-    # Sampling DEFAULTS tuned for the quantized FPGA model (temp 0.6 / top-p 0.9 /
-    # rep-penalty 1.2, recency-decayed + structural-exempt). Two findings drive this:
-    #   - Greedy (temp 0) loops on the FPGA: its reduced-precision arithmetic perturbs
-    #     the logits enough that argmax falls into repetition (greedy is fine on a clean
-    #     4-bit GPU run, so this is a hardware-arithmetic effect, not the 4-bit weights).
-    #     => need temperature > 0 to escape the loops.
-    #   - High temp (0.7) samples from the 4-bit-noisy tail and drifts. => keep it modest.
-    # 0.6 is the compromise: enough randomness (with the repetition penalty) to escape
-    # the arithmetic-induced loops, low enough to stay near the robust argmax region.
-    # Pass --temperature 0 for deterministic greedy (HW argmax, no logit readback).
-    parser.add_argument('--temperature', type=float, default=0.6,
-                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.6.')
-    parser.add_argument('--top-k', type=int, default=0,
-                        help='Top-k filter (0=disabled). Active only when --temperature > 0. Default 0.')
+    # Decode default: penalized greedy (temperature 0 + repetition penalty 1.1) — argmax of
+    # the penalty-adjusted logits: deterministic and arithmetic-accurate, with the penalty
+    # preventing loops on long generations. --temperature > 0 switches to stochastic sampling
+    # (top-k / top-p apply only then). Rationale: notes_llama3.2_1b.md §D.
+    parser.add_argument('--temperature', type=float, default=0.0,
+                        help='0 = penalized greedy (argmax of penalty-adjusted logits — deterministic, '
+                             'correct math, loop-free; the default). >0 = stochastic sampling. Default 0.')
+    parser.add_argument('--top-k', type=int, default=40,
+                        help='Top-k filter (0=disabled). Only used when --temperature > 0 (ignored by penalized '
+                             'greedy). Caps the sampling tail. Default 40.')
     parser.add_argument('--top-p', type=float, default=0.9,
                         help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p. Default 0.9.')
-    parser.add_argument('--repetition-penalty', type=float, default=1.2,
-                        help='HF-style repetition penalty (>1 down-weights repeated tokens). Default 1.2.')
+    parser.add_argument('--repetition-penalty', type=float, default=1.1,
+                        help='HF-style repetition penalty (>1 down-weights repeated tokens). Default 1.1.')
     parser.add_argument('--rep-window', type=int, default=256,
                         help='Repetition penalty considers only the last N tokens (and never penalizes '
                              'punctuation/whitespace/special tokens). Smaller = less structural starvation '
