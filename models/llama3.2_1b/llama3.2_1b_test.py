@@ -565,10 +565,58 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         global _SILENT_MODE
         _SILENT_MODE = True
         num_bucket = (self.PREFILL_CONTEXT_SIZE * self.group_size + 63) // 64
-        gpr_tmp = self.alloc_isa_reg()
-        self.generate_instruction_reg_mul_imm(gpr_tmp, self.gpr_seq_len, self.vector_length * self.bytes_per_element)
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
+
+        # Layer-invariant constants (hoisted so the flash subroutine can use them)
+        ahd         = self.actual_head_dim   # 64
+        nkvh        = self.num_kv_heads      # 8
+        qpkv        = self.group_size        # 4
+        bpe         = self.bytes_per_element
+        hd          = self.head_dim          # 512
+        total_q_dim = hd * qpkv             # 2048
+        half_ahd    = ahd // 2              # 32
+        rope_row    = hd * 2 * bpe          # bytes per rope table row
+
+        # Compile flash_attention_core once as a subroutine, reused by every
+        # (layer_idx, kv_h) call site via ADD_SET gpr_ret_id + JUMP_ABS.
+        program_dram_base = self.get_program_dram_addr()
+        num_calls = layer_size * nkvh       # 16 * 8 = 128
+        gpr_ret_id = self.alloc_isa_reg()
+
+        flash_sub_start_count = self.capture_count
+        flash_result = self.flash_attention_core(
+            head_dim=ahd,
+            seq_len=aligned_seq_len,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_bucket,
+        )
+        flash_flops_per_call = flash_result[num_bucket - 1]
+        flash_sub_start_addr = program_dram_base + flash_sub_start_count * INSTRUCTION_SIZE_BYTES
+
+        # Return trampoline: ADD_DEC scratch + JZ chain, one entry per call site.
+        # Targets are forward refs patched after the main loop is compiled.
+        scratch_ret = self.alloc_isa_reg()
+        self.generate_instruction_add_imm(
+            src_reg_idx=gpr_ret_id, immediate_value=0, dst_reg_idx=scratch_ret)
+        trampoline_jz_indices: list[int] = []
+        for _ in range(num_calls):
+            self.generate_instruction_add_dec(scratch_ret)
+            trampoline_jz_indices.append(self.capture_count)
+            self.generate_instruction_jump_abs_jz(
+                target_instruction_word_addr=0, reg_id=scratch_ret)
+        self.release_isa_reg()  # scratch_ret
+
+        return_capture_indices: list[int] = []
+        call_id = 1
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
@@ -614,14 +662,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             # is scattered from non-contiguous positions in K_DRAM to contiguous 64-dim
             # slots in the KV cache and FLASH_K_DRAM.
             ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
-            ahd      = self.actual_head_dim   # 64
-            nkvh     = self.num_kv_heads      # 8
-            qpkv     = self.group_size        # 4
-            bpe      = self.bytes_per_element
-            hd       = self.head_dim          # 512
-            total_q_dim = hd * qpkv           # 2048 (o_proj input width)
-            half_ahd = ahd // 2               # 32  (lo or hi slice width)
-            rope_row = hd * 2 * bpe           # 2048 bytes per rope table row (N=512)
 
             # Phase 1: K rope in-place on LAYER0_K_DRAM (N=512, [lo|hi] layout).
             # K layout = [seq_len, hd]. PBI: outer M loop driven by gpr_seq_len.
@@ -735,24 +775,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         template_seq_len=seq_len,
                     )
 
-                # Flash attention for this KV head (head_dim=64) — PBI bucket dispatcher;
-                # gpr_bucket_idx is primed at program start (ADD_SET above) so the dispatcher
-                # routes to the correct bucket body for the actual runtime seq_len.
-                flash_result = self.flash_attention_core(
-                    head_dim=ahd,
-                    seq_len=aligned_seq_len,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-                    gpr_bucket_idx=self.gpr_bucket_idx,
-                    num_buckets=num_bucket,
-                )
-                total_flops += flash_result[num_bucket - 1]
+                # Call flash attention subroutine (compiled once above the layer loop).
+                self.generate_instruction_add_set(gpr_ret_id, call_id)
+                self.generate_instruction_jump_abs(
+                    ue_35bit_addr_shifter(flash_sub_start_addr))
+                return_capture_indices.append(self.capture_count)
+                call_id += 1
+                total_flops += flash_flops_per_call
 
                 # Assemble output into LAYER0_FLASH_OUTPUT_DRAM
                 # Standard GQA layout per token: [kv0_q0(64), kv0_q1..q3, kv1_q0..q3, ...]
@@ -827,7 +856,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gpr_seq_len,
             )
-        self.release_isa_reg()  # gpr_tmp
+        # Patch trampoline return targets now that all call site return addresses are known.
+        for jz_idx, ret_count in zip(trampoline_jz_indices, return_capture_indices):
+            self._patch_jump_immediate(
+                jz_idx,
+                ue_35bit_addr_shifter(program_dram_base + ret_count * INSTRUCTION_SIZE_BYTES),
+            )
+        self.release_isa_reg()  # gpr_ret_id
         self.generate_instruction_halt()
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
