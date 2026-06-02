@@ -349,11 +349,13 @@ FLAG_MODE_CHECK = 2  # Spin-wait until target engine's flag is 1
 
 # JUMP mode constants (match queue_state_module.sv / andromeda.c)
 JUMP_MODE_ABSOLUTE = 0
+JUMP_MODE_REG_ABS  = 1  # unconditional absolute jump to regfile_rdata2 (rst_reg_idx)
 JUMP_MODE_JNZ = 2  # absolute if reg != 0
 JUMP_MODE_JZ = 3   # absolute if reg == 0
 JUMP_MODE_RELATIVE = 4  # inst cache read ptr -= immediate[9:0]
 JUMP_MODE_RELA_JNZ = 5
 JUMP_MODE_RELA_JZ = 6
+JUMP_MODE_REG_RELA = 7  # unconditional relative jump: read ptr -= regfile_rdata2[9:0]
 
 # Register ALU sub-modes (isa_mode[3:0]; queue_state_module.sv ALU_MODE_*)
 ALU_MODE_INC = 0  # dst = src + 1
@@ -790,7 +792,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        # assert hw_version == 0x25e4082c, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x25e4082c. Please update FPGA with commit update_3fa1735.bin using update_flash.py (public release v1.1)"
+        assert hw_version == 0x5985796e, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x5985796e. Please update FPGA with commit update_5985796e.bin using update_flash.py (public release v1.1)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -6966,16 +6968,20 @@ class UnifiedEngine:
             reg_id = src_reg_idx
             jump_mode_names = {
                 JUMP_MODE_ABSOLUTE: "ABSOLUTE",
+                JUMP_MODE_REG_ABS:  "REG_ABS",
                 JUMP_MODE_JNZ: "JNZ",
                 JUMP_MODE_JZ: "JZ",
                 JUMP_MODE_RELATIVE: "RELATIVE",
                 JUMP_MODE_RELA_JNZ: "RELA_JNZ",
                 JUMP_MODE_RELA_JZ: "RELA_JZ",
+                JUMP_MODE_REG_RELA: "REG_RELA",
             }
             jump_mode_name = jump_mode_names.get(jump_mode, f"UNKNOWN({jump_mode})")
             result = f"ISA_JUMP ({jump_mode_name})"
             if jump_mode in (JUMP_MODE_RELATIVE, JUMP_MODE_RELA_JNZ, JUMP_MODE_RELA_JZ):
                 result += f"\n    relative_back: {immediate_value} inst words"
+            elif jump_mode in (JUMP_MODE_REG_ABS, JUMP_MODE_REG_RELA):
+                result += f"\n    rst_reg_idx: {rst_reg_idx}"
             else:
                 result += f"\n    target_addr: {_u32(immediate_value):#010X}"
             result += f"\n    transaction_id: {transaction_id}"
@@ -7184,6 +7190,35 @@ class UnifiedEngine:
     def generate_instruction_jump_rela_jz(self, backward_instruction_words: int, reg_id: int) -> None:
         """Relative backward jump if ``reg_id == 0`` (``JUMP_MODE_RELA_JZ``)."""
         self._generate_instruction_jump(backward_instruction_words, JUMP_MODE_RELA_JZ, reg_id)
+
+    def generate_instruction_jump_reg_abs(self, rst_reg_idx: int) -> None:
+        """Unconditional absolute jump to the UE word address held in ``rst_reg_idx`` (``JUMP_MODE_REG_ABS``).
+
+        The register must contain the same word-address format used by
+        :meth:`generate_instruction_jump_abs` (``byte_addr >> 3``), typically written
+        with :meth:`generate_instruction_add_set` before the loop.  No alignment
+        padding is applied because the runtime value is unknown at capture time.
+        """
+        self.ue_isa_descriptor(
+            INSTRUCTION_JUMP,
+            immediate_value=0,
+            isa_mode=JUMP_MODE_REG_ABS,
+            rst_reg_idx=rst_reg_idx,
+        )
+
+    def generate_instruction_jump_reg_rela(self, rst_reg_idx: int) -> None:
+        """Unconditional relative backward jump; offset in instruction words taken from ``rst_reg_idx[9:0]`` (``JUMP_MODE_REG_RELA``).
+
+        ``inst_ram_read_ptr`` is decremented by the register value (saturating at 0),
+        mirroring :meth:`generate_instruction_jump_rela` but with a runtime-computed
+        offset stored in a GPR.
+        """
+        self.ue_isa_descriptor(
+            INSTRUCTION_JUMP,
+            immediate_value=0,
+            isa_mode=JUMP_MODE_REG_RELA,
+            rst_reg_idx=rst_reg_idx,
+        )
 
     def loop_start(self, loop_cnt: int = 0, gpr_loop_cnt: int = None) -> int:
         """
