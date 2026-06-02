@@ -282,6 +282,25 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         return reg
     def clear_inst_id(self) -> None:
         self._inst_id = 0
+    def zero_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
+        """Zero-fill the DRAM working range [DRAM_START_ADDR..0xFFFFFFFF].
+
+        NOTE: the base ``clear_dram()`` fills with 0xFF, which is NaN in bf16. That
+        poisons any region read-before-write on the *next* run (back-to-back runs
+        emit token 0 / endoftext immediately). Calling this at startup guarantees a
+        clean (zeroed) DRAM regardless of what the previous run left behind.
+        Temporary mitigation until the read-before-write gap is found and fixed.
+        """
+        start = user_dma_core.DRAM_START_ADDR
+        total = 0xFFFFFFFF - start + 1
+        zeros = b"\x00" * chunk_size_bytes
+        offset = 0
+        print(f"Zeroing DRAM [{hex(start)}..0xffffffff] ({total / 1024**3:.2f} GB)")
+        while offset < total:
+            n = min(chunk_size_bytes, total - offset)
+            self.dma_write(DMA_DEVICE_H2C, start + offset, zeros[:n], n)
+            offset += n
+        print("  DRAM zeroed.")
     def get_arg_max_index(self) -> int:
         return self.read_reg32(UE_ARGMAX_INDEX)
     def dbg_dram(self, addr: int, n_elems: int, name: str, ref: "torch.Tensor" = None,
@@ -2032,6 +2051,9 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir, vision_bf16=not args.vision_fp4)
+    # Start from clean (zeroed) DRAM. The previous run's clear_dram() fills 0xFF (=NaN
+    # in bf16), which poisons any read-before-write region and breaks back-to-back runs.
+    ue.zero_dram()
     init_hang_prevention(ue)
     if not ue.load_snapshot():
         ue.weight_init()
@@ -2159,9 +2181,10 @@ def main():
     _original_print(f"\nDecoder done in {total_time:.2f} seconds, total {n_generated} tokens.")
     _original_print("SmolVLM2 test ends.")
 
-    # Reset device DRAM + soft-reset at end of execution (same as gemma3) so leftover
-    # program/KV/scratch state doesn't contaminate the next model run.
-    ue.clear_dram()
+    # Reset device DRAM + soft-reset at end of execution so leftover program/KV/scratch
+    # state doesn't contaminate the next model run. Use zero_dram() (not clear_dram(),
+    # which fills 0xFF = NaN in bf16 and would poison a read-before-write region).
+    ue.zero_dram()
     _SILENT_MODE = True
     ue.software_reset()
 
