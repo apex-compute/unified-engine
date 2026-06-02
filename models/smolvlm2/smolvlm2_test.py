@@ -295,12 +295,18 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         total = 0xFFFFFFFF - start + 1
         zeros = b"\x00" * chunk_size_bytes
         offset = 0
-        print(f"Zeroing DRAM [{hex(start)}..0xffffffff] ({total / 1024**3:.2f} GB)")
+        bar_width = 40
+        _original_print(f"Zeroing DRAM [{hex(start)}..0xffffffff] ({total / 1024**3:.2f} GB)")
         while offset < total:
             n = min(chunk_size_bytes, total - offset)
             self.dma_write(DMA_DEVICE_H2C, start + offset, zeros[:n], n)
             offset += n
-        print("  DRAM zeroed.")
+            pct = offset / total
+            filled = int(bar_width * pct)
+            bar = '█' * filled + '░' * (bar_width - filled)
+            _original_print(f"\r  [{bar}] {pct*100:5.1f}%  {offset/1024**2:.0f}/{total/1024**2:.0f} MB",
+                            end='', flush=True)
+        _original_print()
     def get_arg_max_index(self) -> int:
         return self.read_reg32(UE_ARGMAX_INDEX)
     def dbg_dram(self, addr: int, n_elems: int, name: str, ref: "torch.Tensor" = None,
@@ -1454,7 +1460,16 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             "_num_vis_layers": len(self.vis_layer_addrs),
             "PREFILL_QMAX": self.PREFILL_QMAX,
             "FLASH_NUM_BUCKETS": self.FLASH_NUM_BUCKETS,
+            # LM weight addresses: run_prefill_v2 re-captures the decoder + LM postamble fresh
+            # each run, so it needs the real per-layer/final/lm-head addresses (NOT just a count).
+            "lm_layer_addrs": self.lm_layer_addrs,
+            "final_norm_addr": self.final_norm_addr,
         }
+        if self.lm_bf16:
+            meta["lm_head_weight"] = self.lm_head_weight
+        else:
+            meta["lm_head_data"] = self.lm_head_data
+            meta["lm_head_scale"] = self.lm_head_scale
         for attr in addr_attrs:
             meta[attr] = getattr(self, attr)
         with open(meta_path, "w") as f:
@@ -1470,6 +1485,11 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             return False
         with open(meta_path) as f:
             meta = json.load(f)
+        # Self-heal stale snapshots: ones dumped before LM weight addresses were saved lack
+        # these keys and would crash run_prefill_v2. Force a recompile + fresh dump instead.
+        if "lm_layer_addrs" not in meta or "final_norm_addr" not in meta:
+            _original_print("  Snapshot stale (missing LM addresses) — recompiling.")
+            return False
         total = meta["params_size"]
         CHUNK = 1 * 1024 * 1024
         with open(bin_path, "rb") as f:
@@ -1484,6 +1504,10 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             if key not in ("params_size", "tensor_size"):
                 setattr(self, key, val)
         self.bytes_per_element = 2  # always bf16; not in snapshot, needed by attention PBI body
+        # load_encoder/run_encoder only need len(vis_layer_addrs) (the per-layer weight addresses
+        # are already baked into the precompiled encoder_program.bin). Restore a length-correct
+        # placeholder list from the saved layer count so those len() calls work post-snapshot.
+        self.vis_layer_addrs = [None] * self._num_vis_layers
         from transformers import AutoTokenizer
         model_dir = os.path.join(self.script_dir, "smolvlm2_bin", "SmolVLM2-500M-Video-Instruct")
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -1637,6 +1661,37 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         decoder_program_addr = self._decoder_program_addr
         preamble_addr = self._decoder_preamble_addr
 
+        # Live t/s counter (same as gemma3): pin the bottom terminal row as a status line
+        # via an ANSI scroll region; tokens stream above it and the rate refreshes in place.
+        # Only when stdout is a real TTY (skip when piped/redirected).
+        import shutil
+        timer = time.perf_counter()
+        _use_status = sys.stdout.isatty()
+        def _status_setup():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")    # scroll region = rows 1..rows-1
+            sys.stdout.write(f"\033[{rows - 1};1H")    # park cursor at bottom of region
+            sys.stdout.flush()
+        def _status_update():
+            rows = shutil.get_terminal_size().lines
+            elapsed = time.perf_counter() - timer
+            rate = len(generated) / elapsed if elapsed > 0 else 0.0
+            sys.stdout.write("\0337")                   # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K")   # bottom row, clear it
+            sys.stdout.write(f" decoding… {len(generated)} tokens  (pos {self.seq_len}/{self.max_seq_len})  "
+                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
+            sys.stdout.write("\0338")                   # restore cursor
+            sys.stdout.flush()
+        def _status_teardown():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")                  # reset scroll region
+            sys.stdout.write(f"\033[{rows};1H\033[2K")   # clear the status row
+            sys.stdout.flush()
+        if _use_status:
+            _status_setup()
+        # Emit the prefill seed token now (after scroll-region setup, so it isn't clobbered).
+        _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
+
         while len(generated) < max_new_tokens and self.seq_len < self.max_seq_len:
             _SILENT_MODE = True
 
@@ -1677,9 +1732,16 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             generated.append(token_id)
             _SILENT_MODE = False
             if token_id in _SMOLVLM2_CFG["model"]["stop_token_ids"]:
+                if _use_status:
+                    _status_teardown()
                 _original_print(f"\nStop token {token_id} reached.")
                 break
             _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
+            if _use_status:
+                _status_update()
+        else:
+            if _use_status:
+                _status_teardown()
         _SILENT_MODE = False
         return generated
     def program_execute(self, program_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR,
@@ -2078,27 +2140,31 @@ def main():
     # All three (encoder + decoder + prefill v2) are cached to bin; recompile only when missing.
     use_bin = (os.path.exists(os.path.join(bin_dir, "decoder_program.bin"))
                and os.path.exists(os.path.join(bin_dir, "prefill_v2_program.bin")))
-    import threading
+    import threading, io, contextlib
+    _real_out = sys.stdout  # spinner writes here even while stdout is redirected
     stop_compile = threading.Event()
     def _compile_progress():
         while not stop_compile.wait(1.0):
             elapsed = time.perf_counter() - timer
-            _original_print(f"\r  Compiling ({elapsed:.0f}s)", end="", flush=True)
+            _original_print(f"\r  Compiling ({elapsed:.0f}s)", end="", flush=True, file=_real_out)
     if not use_bin:
         t = threading.Thread(target=_compile_progress, daemon=True)
         t.start()
-    if use_bin:
-        if has_image:
-            enc_addr = ue.load_encoder()
-        ue.load_decoder()
-        # Prefill v2 loaded last so its program-DRAM region sits past encoder/decoder.
-        ue.load_prefill_v2()
-    else:
-        if has_image:
-            enc_addr = ue.compile_encoder()
-        ue.compile_decoder()
-        # Prefill v2 compiled last so its program-DRAM region sits past encoder/decoder.
-        ue.compile_prefill_v2()
+    # Hard-silence the core's compile/capture chatter (M_chunk/URAM/Capture stopped/…),
+    # which leaks past _SILENT_MODE. The live spinner above writes to _real_out, so it survives.
+    with contextlib.redirect_stdout(io.StringIO()):
+        if use_bin:
+            if has_image:
+                enc_addr = ue.load_encoder()
+            ue.load_decoder()
+            # Prefill v2 loaded last so its program-DRAM region sits past encoder/decoder.
+            ue.load_prefill_v2()
+        else:
+            if has_image:
+                enc_addr = ue.compile_encoder()
+            ue.compile_decoder()
+            # Prefill v2 compiled last so its program-DRAM region sits past encoder/decoder.
+            ue.compile_prefill_v2()
     stop_compile.set()
     _SILENT_MODE = False
     elapsed = time.perf_counter() - timer
@@ -2172,7 +2238,6 @@ def main():
     # --- Decode (on-device embed fused with decoder, single dispatch per token) ---
     max_new = args.max_seq - seq_len
     _original_print(f"\n--- Starting decoder ---")
-    _original_print(ue.tokenizer.decode([hw_token]), end="", flush=True)
     decode_timer = time.perf_counter()
     hw_tokens = ue.run_decoder(hw_token, max_new_tokens=max_new, clear_scratch=args.clear_scratch)
     decode_time = time.perf_counter() - decode_timer
