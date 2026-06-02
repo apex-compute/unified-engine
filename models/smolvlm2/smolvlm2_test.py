@@ -1249,7 +1249,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             # derived from gpr_seq_len inside the helper via register-addressed DMAs.
             for h in range(self.NUM_KV_HEADS):
                 k_base = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                self.rope_hf_core_decode_d64(N=D,
+                self.rope_hf_core_decode(N=D,
                     input_dram_addr=self.LAYER0_K_PROJ_DRAM + h * D * bpe,
                     output_dram_addr=k_base, output_pos_strided=True,
                     packed_table_addr=self.ROPE_PACKED_DRAM,
@@ -1257,7 +1257,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
             # RoPE Q: same d64 rope, output to the fixed Q_PERM slot (attention reads from there).
             for h in range(self.NUM_HEADS):
-                self.rope_hf_core_decode_d64(N=D,
+                self.rope_hf_core_decode(N=D,
                     input_dram_addr=self.LAYER0_Q_DRAM + h * D * bpe,
                     output_dram_addr=self.LAYER0_Q_PERM_DRAM + h * D * bpe, output_pos_strided=False,
                     packed_table_addr=self.ROPE_PACKED_DRAM,
