@@ -868,6 +868,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         count_at_start = self.capture_count
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         total_flops = 0
+        program_dram_base = self.get_program_dram_addr()
+        gpr_ret_id = self.alloc_isa_reg()
+        call_site_jump_capture_indices: list[int] = []
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -946,6 +949,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(0x10080, 0, half_ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
+                    # Copy valid K history → LAYER0_FLASH_K_DRAM; loop count = gpr_bucket_idx
+                    # so only current_seq_len tokens are copied, not the full MAX_CONTEXT_SIZE.
+                    self._emit_pbi_scatter_per_token(
+                        read_base=k_cache_base,
+                        read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                        write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                        sram_byte_addr=0,
+                        element_count=UE_VECTOR_SIZE * ahd,
+                        gpr_seq_len=self.gpr_bucket_idx,
+                    )
+
                     # Scatter V_h (64-dim, standard layout) → V cache at decode position
                     # v_proj output at LAYER0_FLASH_V_DRAM: [V_KV0(64)..V_KV7(64)] = 512-dim
                     self.accelerator_memory_to_sram(
@@ -954,6 +968,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x20000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
+
+                    # Copy valid V history → LAYER0_FLASH_V_DRAM + k_size; same dynamic size.
+                    # Offset by k_size to avoid the v_proj output at [0..k_size-1].
+                    self._emit_pbi_scatter_per_token(
+                        read_base=v_cache_base,
+                        read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                        write_specs=[(self.LAYER0_FLASH_V_DRAM + self.k_size, UE_VECTOR_SIZE * ahd * bpe)],
+                        sram_byte_addr=0,
+                        element_count=UE_VECTOR_SIZE * ahd,
+                        gpr_seq_len=self.gpr_bucket_idx,
+                    )
 
                     # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q base (no kv_h offset)
                     # KV head kv_h → Q group g = kv_h//2; sub_idx = (kv_h%2)*qpkv + q
@@ -970,21 +995,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                             0x30080, half_ahd)
                         self.sram_to_accelerator_memory(0x30000, flash_q_addr, half_ahd)
                         self.sram_to_accelerator_memory(0x30080, flash_q_addr + half_ahd * bpe, half_ahd)
-                    attn_flops = self.decoder_group_attention_core(
-                        group_size=qpkv,
-                        head_dim=ahd,
-                        seq_len=self.MAX_CONTEXT_SIZE,
-                        gpr_bucket_idx=self.gpr_bucket_idx,
-                        num_buckets=(self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,
-                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                        K_DRAM_ADDR=k_cache_base,
-                        V_DRAM_ADDR=v_cache_base,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    )
-                    total_flops += attn_flops[-1]
+                    self.pad_capture_to_64b_boundary()
+                    return_word_addr = ue_35bit_addr_shifter(
+                        program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                    self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                    call_site_jump_capture_indices.append(self.capture_count)
+                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
                     # Copy per-head output to its slot in FLASH_OUTPUT_DRAM.
                     self.accelerator_memory_to_sram(
                         self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
@@ -1042,6 +1058,35 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 write_back_disable=_greedy_lm_head)
 
         self.generate_instruction_halt()
+        self.pad_capture_to_64b_boundary()
+
+        # Compile decoder_group_attention_core once as a subroutine after HALT.
+        num_buckets = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        ahd = self.actual_head_dim
+        bpe = self.bytes_per_element
+        qpkv = self.group_size
+        dec_sub_start_addr, dec_attn_flops = self.decoder_group_attention_core(
+            group_size=qpkv,
+            head_dim=ahd,
+            seq_len=self.MAX_CONTEXT_SIZE,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_buckets,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM + self.k_size,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += dec_attn_flops[-1] * layer_size * self.num_kv_heads
+
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(
+                jump_idx, ue_35bit_addr_shifter(dec_sub_start_addr))
+
+        self.release_isa_reg()  # gpr_ret_id
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"program_size_bytes": decoder_program_size, "total_flops": total_flops}

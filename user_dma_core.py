@@ -792,7 +792,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x5985796e, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x5985796e. Please update FPGA with commit update_5985796e.bin using update_flash.py (public release v1.1)"
+        assert hw_version == 0x29b64569, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x29b64569. Please update FPGA with commit update_29b64569.bin using update_flash.py (public release v1.1)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -5973,6 +5973,7 @@ class UnifiedEngine:
         gpr_bucket_idx: int = None,
         num_buckets: int = 8,
         use_pbi: bool = True,
+        gpr_ret_id: int = None,
     ):
         """Decoder group attention entrypoint; dispatches based on ``gpr_bucket_idx``:
 
@@ -5998,6 +5999,7 @@ class UnifiedEngine:
                 debug_mode=debug_mode,
                 SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
                 use_pbi=use_pbi,
+                gpr_ret_id=gpr_ret_id,
             )
         return self.decoder_group_attention_core_legacy(
             group_size=group_size,
@@ -6318,6 +6320,7 @@ class UnifiedEngine:
         debug_mode: bool = False,
         SM_OUTPUT_DRAM_ADDR: int = None,
         use_pbi: bool = True,
+        gpr_ret_id: int = None,
     ) -> list:
         """Bucketized decoder group attention. Mirrors the dispatcher shape of
         :meth:`flash_attention_core_pbi`: emits ``num_buckets`` complete bucket bodies (one per
@@ -6343,6 +6346,7 @@ class UnifiedEngine:
             )
 
         program_dram_start_addr = self.get_program_dram_addr()
+        first_capture_count = self.capture_count
         bucket_step = UE_VECTOR_SIZE
 
         # Bucket jump header: copy gpr_bucket_idx into a scratch reg so the JZ cascade leaves the
@@ -6359,7 +6363,8 @@ class UnifiedEngine:
                 target_instruction_word_addr=0, reg_id=bucket_scratch_reg
             )
 
-        # Bucket bodies, each followed by a JMP-to-end placeholder.
+        # Bucket bodies; each ends with JUMP_REG_ABS(gpr_ret_id) when a return register
+        # is supplied, otherwise a JUMP_ABS placeholder patched to the shared end label.
         bucket_start_capture_indices: list = []
         end_jmp_capture_indices: list = []
         bucket_flops: list = []
@@ -6394,25 +6399,23 @@ class UnifiedEngine:
                     BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 )
             bucket_flops.append(_body_flops)
-            end_jmp_capture_indices.append(self.capture_count)
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-
-        self.pad_capture_to_64b_boundary()
-        end_capture_count = self.capture_count
-        end_word_addr = ue_35bit_addr_shifter(
-            program_dram_start_addr + end_capture_count * INSTRUCTION_SIZE_BYTES
-        )
+            if gpr_ret_id is not None:
+                self.generate_instruction_jump_reg_abs(gpr_ret_id)
+            else:
+                end_jmp_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
         # Patch header JZs -> corresponding bucket entry.
         for jz_idx, bucket_start_idx in zip(jz_capture_indices, bucket_start_capture_indices):
-            bucket_word_addr = ue_35bit_addr_shifter(
-                program_dram_start_addr + bucket_start_idx * INSTRUCTION_SIZE_BYTES
-            )
-            self._patch_jump_immediate(jz_idx, bucket_word_addr)
+            self._patch_jump_immediate(jz_idx, ue_35bit_addr_shifter(
+                program_dram_start_addr + bucket_start_idx * INSTRUCTION_SIZE_BYTES))
 
-        # Patch bucket-tail JMPs -> shared end label.
-        for jmp_idx in end_jmp_capture_indices:
-            self._patch_jump_immediate(jmp_idx, end_word_addr)
+        if gpr_ret_id is None:
+            self.pad_capture_to_64b_boundary()
+            end_word_addr = ue_35bit_addr_shifter(
+                program_dram_start_addr + self.capture_count * INSTRUCTION_SIZE_BYTES)
+            for jmp_idx in end_jmp_capture_indices:
+                self._patch_jump_immediate(jmp_idx, end_word_addr)
 
         self.release_isa_reg()  # bucket_scratch_reg
 
@@ -6422,6 +6425,8 @@ class UnifiedEngine:
             f"FLOPS min-bucket={bucket_flops[0] / 1e9:.6f} G, "
             f"max-bucket={bucket_flops[-1] / 1e9:.6f} G"
         )
+        if gpr_ret_id is not None:
+            return program_dram_start_addr + first_capture_count * INSTRUCTION_SIZE_BYTES, bucket_flops
         return bucket_flops
 
     def _decoder_group_attention_pbi_body(
@@ -6641,7 +6646,7 @@ class UnifiedEngine:
 
     def _emit_pbi_scatter_per_token(self, *, read_base, read_stride_bytes,
                                     write_specs, sram_byte_addr, element_count,
-                                    gpr_seq_len, template_seq_len):
+                                    gpr_seq_len, template_seq_len: int = 0):
         """Emit one PBI runtime loop that staged-copies one ``element_count``-row
         per outer iteration from ``read_base`` to each (base, stride) in
         ``write_specs``. The outer trip count is taken from GPR ``gpr_seq_len`` so
