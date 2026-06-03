@@ -24,7 +24,7 @@ See notes_repetition_penalty_fpga_bias.md.
 Usage:
   python llama3.2_3b_run_from_bin.py
   python llama3.2_3b_run_from_bin.py --prompt "your question"
-  python llama3.2_3b_run_from_bin.py --no-fpga-penalty --dev xdma0     # plain greedy (no penalty)
+  python llama3.2_3b_run_from_bin.py --pure-greedy --dev xdma0     # plain greedy (no penalty)
 """
 
 import json
@@ -344,12 +344,12 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
                                  paths_cfg.get("instruction_meta", "llama3.2_3b_bin/llama_instruction.json"))
         if bool(getattr(self, "fpga_penalty", False)):
             # On-FPGA penalty uses a separate bin (LM-head matmul bias on / logit writeback off);
-            # its meta points to the _fpgapenalty bin. Compiled by llama3.2_3b_test.py --fpga-penalty.
+            # its meta points to the _fpgapenalty bin. Compiled by llama3.2_3b_test.py (default).
             meta_path = meta_path.replace(".json", "_fpgapenalty.json")
             if not os.path.exists(meta_path):
                 raise FileNotFoundError(
                     f"on-FPGA penalty bin meta not found: {meta_path}\n"
-                    f"  build it with:  python llama3.2_3b_test.py --fpga-penalty")
+                    f"  build it with:  python llama3.2_3b_test.py")
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -505,7 +505,7 @@ def _verify_artifacts(script_dir: str, cfg: dict, fpga_penalty: bool = False) ->
     """Hard-fail before any FPGA touch if a required artifact is missing."""
     paths = cfg["paths"]
     inst_bin, inst_meta = paths["instruction_bin"], paths["instruction_meta"]
-    if fpga_penalty:  # on-FPGA penalty loads the _fpgapenalty bin/meta (test.py --fpga-penalty)
+    if fpga_penalty:  # on-FPGA penalty loads the _fpgapenalty bin/meta (test.py default)
         inst_bin = inst_bin.replace(".bin", "_fpgapenalty.bin")
         inst_meta = inst_meta.replace(".json", "_fpgapenalty.json")
     required = [
@@ -536,31 +536,32 @@ def main():
                         help="Text prompt (tokenized via the local chat template). Overrides the config default.")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device name. Default: xdma0.")
     parser.add_argument("--cycle", type=float, default=1 / 0.17, help="Clock cycle time in ns. Default ~5.88.")
-    # Decode is deterministic with the on-FPGA penalty only (no host penalty / sampling).
-    parser.add_argument("--greedy-until", type=int, default=512,
+    # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
+    # matmul bias so the HW argmax returns the penalized token directly (no logit readback); loads the
+    # _fpgapenalty bin. --pure-greedy disables it entirely (plain writeback-on bin).
+    parser.add_argument("--pure-greedy", action="store_true",
+                        help="Disable the on-FPGA repetition penalty entirely — plain greedy decode "
+                             "(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy "
+                             "only for the A/B baseline and the compare/calibration tool.")
+    # On-FPGA repetition penalty parameters (active unless --pure-greedy).
+    pen_group = parser.add_argument_group("on-FPGA repetition penalty (active unless --pure-greedy)")
+    pen_group.add_argument("--greedy-until", type=int, default=512,
                         help="Pure greedy for the first N decoded tokens (correct math/reasoning), "
-                             "then the on-FPGA repetition penalty breaks long-context loops. "
+                             "then the penalty breaks long-context loops. "
                              "0 = penalty from the start. Default 512.")
-    # On-FPGA repetition penalty (DEFAULT): the penalty is folded into the LM-head matmul bias so the
-    # HW argmax returns the penalized token directly — no logit readback. Loads the _fpgapenalty bin.
-    parser.add_argument("--fpga-penalty", action=argparse.BooleanOptionalAction, default=True,
-                        help="Apply the repetition penalty on-FPGA via the LM-head matmul bias "
-                             "(argmax of logits+bias on chip, no logit readback). DEFAULT. "
-                             "--no-fpga-penalty = plain greedy (writeback-on bin, no penalty), for "
-                             "the A/B baseline and the compare/calibration tool.")
-    parser.add_argument("--pen-alpha", type=float, default=1.0,
-                        help="On-FPGA penalty: bias[t] = -alpha*count[t] (logit units). Default 1.0.")
-    parser.add_argument("--pen-cap", type=float, default=20.0,
-                        help="On-FPGA penalty: max |bias| per token (floor on -alpha*count). Default 20.")
-    parser.add_argument("--rep-window", type=int, default=256,
-                        help="On-FPGA penalty: count tokens over the last N. Default 256.")
+    pen_group.add_argument("--pen-alpha", type=float, default=1.0,
+                        help="bias[t] = -alpha*count[t] (logit units). Default 1.0.")
+    pen_group.add_argument("--pen-cap", type=float, default=20.0,
+                        help="max |bias| per token (floor on -alpha*count). Default 20.")
+    pen_group.add_argument("--rep-window", type=int, default=256,
+                        help="count tokens over the last N. Default 256.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
 
     # Hard-fail BEFORE touching the FPGA if any artifact is missing.
-    _verify_artifacts(script_dir, cfg, fpga_penalty=bool(args.fpga_penalty))
+    _verify_artifacts(script_dir, cfg, fpga_penalty=not bool(args.pure_greedy))
 
     set_dma_device(args.dev)
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
@@ -590,7 +591,7 @@ def main():
     ue.prefill_seq = prefill_seq
     # Decode config — deterministic, on-FPGA penalty only (no host penalty / sampling).
     ue.greedy_until = int(args.greedy_until)
-    ue.fpga_penalty = bool(args.fpga_penalty)   # selects the _fpgapenalty bin + matmul-bias path
+    ue.fpga_penalty = not bool(args.pure_greedy)   # selects the _fpgapenalty bin + matmul-bias path
     ue.pen_alpha = float(args.pen_alpha)
     ue.pen_cap = float(args.pen_cap)
     ue.rep_window = int(args.rep_window)

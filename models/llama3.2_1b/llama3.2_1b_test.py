@@ -535,7 +535,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.LAYER0_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.OUTPUT_NORM_DRAM = self.allocate_tensor_dram(1 * self.vector_length * self.bytes_per_element)
         self.LOGITS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
-        # Per-vocab additive repetition-penalty bias (on-FPGA penalty, --fpga-penalty). The LM-head
+        # Per-vocab additive repetition-penalty bias (on-FPGA penalty, the default). The LM-head
         # matmul reads this as its C bias (bias_mode="broadcast_N") so the on-chip argmax already
         # returns the penalized token id — no logit readback. Host maintains it with +/-alpha writes
         # (see notes_repetition_penalty_fpga_bias.md); all-zero = no penalty.
@@ -561,10 +561,26 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         global _SILENT_MODE
         _SILENT_MODE = True
         num_bucket = (self.PREFILL_CONTEXT_SIZE * self.group_size + 63) // 64
-        gpr_tmp = self.alloc_isa_reg()
-        self.generate_instruction_reg_mul_imm(gpr_tmp, self.gpr_seq_len, self.vector_length * self.bytes_per_element)
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
+
+        # Layer-invariant constants (hoisted so the flash subroutine can use them)
+        ahd         = self.actual_head_dim   # 64
+        nkvh        = self.num_kv_heads      # 8
+        qpkv        = self.group_size        # 4
+        bpe         = self.bytes_per_element
+        hd          = self.head_dim          # 512
+        total_q_dim = hd * qpkv             # 2048
+        half_ahd    = ahd // 2              # 32
+        rope_row    = hd * 2 * bpe          # bytes per rope table row
+
+        # flash_attention_core compiled once as a subroutine after the layer loop.
+        # Each call site sets gpr_ret_id to its return word address then jumps to the
+        # subroutine; flash_attention returns via JUMP_REG_ABS(gpr_ret_id).
+        program_dram_base = self.get_program_dram_addr()
+        gpr_ret_id = self.alloc_isa_reg()
+
+        call_site_jump_capture_indices: list[int] = []
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
@@ -610,14 +626,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             # is scattered from non-contiguous positions in K_DRAM to contiguous 64-dim
             # slots in the KV cache and FLASH_K_DRAM.
             ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
-            ahd      = self.actual_head_dim   # 64
-            nkvh     = self.num_kv_heads      # 8
-            qpkv     = self.group_size        # 4
-            bpe      = self.bytes_per_element
-            hd       = self.head_dim          # 512
-            total_q_dim = hd * qpkv           # 2048 (o_proj input width)
-            half_ahd = ahd // 2               # 32  (lo or hi slice width)
-            rope_row = hd * 2 * bpe           # 2048 bytes per rope table row (N=512)
 
             # Phase 1: K rope in-place on LAYER0_K_DRAM (N=512, [lo|hi] layout).
             # K layout = [seq_len, hd]. PBI: outer M loop driven by gpr_seq_len.
@@ -731,24 +739,15 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         template_seq_len=seq_len,
                     )
 
-                # Flash attention for this KV head (head_dim=64) — PBI bucket dispatcher;
-                # gpr_bucket_idx is primed at program start (ADD_SET above) so the dispatcher
-                # routes to the correct bucket body for the actual runtime seq_len.
-                flash_result = self.flash_attention_core(
-                    head_dim=ahd,
-                    seq_len=aligned_seq_len,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-                    gpr_bucket_idx=self.gpr_bucket_idx,
-                    num_buckets=num_bucket,
-                )
-                total_flops += flash_result[num_bucket - 1]
+                # Call flash attention subroutine (compiled after the layer loop).
+                # Pad so capture_count is even; return address = capture_count + 2
+                # (ADD_SET + JUMP_ABS), which is then also even = 512-bit aligned.
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                call_site_jump_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
                 # Assemble output into LAYER0_FLASH_OUTPUT_DRAM
                 # Standard GQA layout per token: [kv0_q0(64), kv0_q1..q3, kv1_q0..q3, ...]
@@ -823,8 +822,35 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gpr_seq_len,
             )
-        self.release_isa_reg()  # gpr_tmp
+        # HALT ends the normal execution path; the flash_attention subroutine follows and
+        # is only reachable via the JUMP_ABS call sites within the layer loop above.
         self.generate_instruction_halt()
+
+        # Compile flash_attention subroutine after the HALT; bucket bodies return via
+        # JUMP_REG_ABS(gpr_ret_id), which each call site pre-loaded with its return address.
+        flash_sub_start_inst_dram_addr, flash_flops = self.flash_attention_core(
+            head_dim=ahd,
+            seq_len=aligned_seq_len,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_bucket,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += flash_flops[num_bucket - 1] * layer_size * nkvh
+
+        # Patch all call-site JUMP_ABS placeholders to point at the flash subroutine.
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(
+                jump_idx, ue_35bit_addr_shifter(flash_sub_start_inst_dram_addr))
+
+        self.release_isa_reg()  # gpr_ret_id
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"size_bytes": prefill_program_size, "flops": total_flops}
@@ -838,6 +864,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         count_at_start = self.capture_count
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         total_flops = 0
+        program_dram_base = self.get_program_dram_addr()
+        gpr_ret_id = self.alloc_isa_reg()
+        call_site_jump_capture_indices: list[int] = []
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -916,6 +945,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(0x10080, 0, half_ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
+                    # Copy valid K history → LAYER0_FLASH_K_DRAM; loop count = gpr_bucket_idx
+                    # so only current_seq_len tokens are copied, not the full MAX_CONTEXT_SIZE.
+                    self._emit_pbi_scatter_per_token(
+                        read_base=k_cache_base,
+                        read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                        write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                        sram_byte_addr=0,
+                        element_count=UE_VECTOR_SIZE * ahd,
+                        gpr_seq_len=self.gpr_bucket_idx,
+                    )
+
                     # Scatter V_h (64-dim, standard layout) → V cache at decode position
                     # v_proj output at LAYER0_FLASH_V_DRAM: [V_KV0(64)..V_KV7(64)] = 512-dim
                     self.accelerator_memory_to_sram(
@@ -925,14 +965,25 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(0x20000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
-                    # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q → decoder_attn
+                    # Copy valid V history → LAYER0_FLASH_V_DRAM + k_size; same dynamic size.
+                    # Offset by k_size to avoid the v_proj output at [0..k_size-1].
+                    self._emit_pbi_scatter_per_token(
+                        read_base=v_cache_base,
+                        read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                        write_specs=[(self.LAYER0_FLASH_V_DRAM + self.k_size, UE_VECTOR_SIZE * ahd * bpe)],
+                        sram_byte_addr=0,
+                        element_count=UE_VECTOR_SIZE * ahd,
+                        gpr_seq_len=self.gpr_bucket_idx,
+                    )
+
+                    # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q base (no kv_h offset)
                     # KV head kv_h → Q group g = kv_h//2; sub_idx = (kv_h%2)*qpkv + q
                     g_for_kv = kv_h // 2
                     local_kv = kv_h % 2
                     q_g_addr = self.LAYER0_Q_DRAM + g_for_kv * hd * bpe
                     for q in range(qpkv):
                         sub_idx = local_kv * qpkv + q
-                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + (kv_h * qpkv + q) * ahd * bpe
+                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
                         self.accelerator_memory_to_sram(
                             q_g_addr + sub_idx * half_ahd * bpe, 0x30000, half_ahd)
                         self.accelerator_memory_to_sram(
@@ -940,21 +991,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                             0x30080, half_ahd)
                         self.sram_to_accelerator_memory(0x30000, flash_q_addr, half_ahd)
                         self.sram_to_accelerator_memory(0x30080, flash_q_addr + half_ahd * bpe, half_ahd)
-                    attn_flops = self.decoder_group_attention_core(
-                        group_size=qpkv,
-                        head_dim=ahd,
-                        seq_len=self.MAX_CONTEXT_SIZE,
-                        gpr_bucket_idx=self.gpr_bucket_idx,
-                        num_buckets=(self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,
-                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM + kv_h * qpkv * ahd * bpe,
-                        K_DRAM_ADDR=k_cache_base,
-                        V_DRAM_ADDR=v_cache_base,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
-                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    )
-                    total_flops += attn_flops[-1]
+                    self.pad_capture_to_64b_boundary()
+                    return_word_addr = ue_35bit_addr_shifter(
+                        program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                    self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                    call_site_jump_capture_indices.append(self.capture_count)
+                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                    # Copy per-head output to its slot in FLASH_OUTPUT_DRAM.
+                    self.accelerator_memory_to_sram(
+                        self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
+                    self.sram_to_accelerator_memory(
+                        0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
                 total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
@@ -1006,7 +1053,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
                     write_back_disable=True)
             else:
-                # Plain bin (--no-fpga-penalty): no bias, full vocab-logits row written to DRAM
+                # Plain bin (--pure-greedy): no bias, full vocab-logits row written to DRAM
                 # (writeback ON). Used for the greedy A/B baseline and as the logit source for the
                 # compare/calibration tool (compare/compare_llama3.2_1b_penalty.py), which reads
                 # LOGITS_DRAM and applies the penalty on host. No host penalty runs in production.
@@ -1016,6 +1063,35 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     write_back_disable=False)
 
         self.generate_instruction_halt()
+        self.pad_capture_to_64b_boundary()
+
+        # Compile decoder_group_attention_core once as a subroutine after HALT.
+        num_buckets = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        ahd = self.actual_head_dim
+        bpe = self.bytes_per_element
+        qpkv = self.group_size
+        dec_sub_start_addr, dec_attn_flops = self.decoder_group_attention_core(
+            group_size=qpkv,
+            head_dim=ahd,
+            seq_len=self.MAX_CONTEXT_SIZE,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_buckets,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM + self.k_size,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += dec_attn_flops[-1] * layer_size * self.num_kv_heads
+
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(
+                jump_idx, ue_35bit_addr_shifter(dec_sub_start_addr))
+
+        self.release_isa_reg()  # gpr_ret_id
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"program_size_bytes": decoder_program_size, "total_flops": total_flops}
@@ -1131,7 +1207,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         return t
 
     def _write_penalty_bias(self, prev_tokens) -> None:
-        """On-FPGA repetition penalty (--fpga-penalty): build the per-vocab additive bias from the
+        """On-FPGA repetition penalty (the default): build the per-vocab additive bias from the
         windowed token frequency and DMA it to PENALTY_BIAS_DRAM (the LM-head matmul's C term,
         bias_mode="broadcast_N"). bias[t] = clamp(−alpha·count[t], min=−cap); structural tokens stay
         0. The HW argmax of (logits + bias) then returns the penalized token id — no logit readback.
@@ -1161,7 +1237,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         prefill or decoder program at runtime.
         """
         paths_cfg = self._cfg.get("paths", {})
-        # In --fpga-penalty mode use the penalty-specific bin/meta compile_llama produced.
+        # With the on-FPGA penalty (default) use the penalty-specific bin/meta compile_llama produced.
         meta_path = getattr(self, "_instruction_meta_path", None) or \
             os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
         with open(meta_path, "r") as f:
@@ -1239,7 +1315,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # On-FPGA penalty: the LM-head matmul adds PENALTY_BIAS_DRAM (its C bias) so the HW argmax
         # already returns the penalized token. Zero the buffer first → pure greedy until the gate,
         # then refresh the full bias each step past the gate (_write_penalty_bias). Plain mode
-        # (--no-fpga-penalty, writeback-on bin for compare/baseline) leaves the buffer untouched.
+        # (--pure-greedy, writeback-on bin for compare/baseline) leaves the buffer untouched.
         _fpga_penalty = bool(getattr(self, "fpga_penalty", False))
         if _fpga_penalty:
             self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
@@ -1343,29 +1419,28 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=1/0.17, help='Clock cycle time in ns (default: ~5.88ns)')
-    # Decode is deterministic: pure greedy for the first `greedy_until` (512) decoded tokens —
-    # correct math/reasoning, which lands early — then the on-FPGA repetition penalty turns on to
-    # break long-context loops. The penalty runs entirely on the FPGA (LM-head matmul bias); there
-    # is no host-side penalty or sampling.
-    parser.add_argument('--greedy-until', type=int, default=512,
+    # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
+    # matmul bias so the HW argmax returns the penalized token directly — no 256 KB logit readback,
+    # fully deterministic (separate bias-on / writeback-off bin). --pure-greedy disables it entirely.
+    parser.add_argument('--pure-greedy', action='store_true',
+                        help='Disable the on-FPGA repetition penalty entirely — plain greedy decode '
+                             '(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy '
+                             'only for the A/B baseline and the compare/calibration tool.')
+    # On-FPGA repetition penalty parameters (active unless --pure-greedy). The penalty is folded into
+    # the LM-head matmul bias (on-chip argmax of logits+bias, no logit readback).
+    # See notes_repetition_penalty_fpga_bias.md.
+    pen_group = parser.add_argument_group('on-FPGA repetition penalty (active unless --pure-greedy)')
+    pen_group.add_argument('--greedy-until', type=int, default=512,
                         help='Pure greedy for the first N decoded tokens (correct math/reasoning, '
-                             'which lands early), then the on-FPGA repetition penalty turns on to '
-                             'break long-context loops. 0 = penalty from the start. Default 512.')
-    # On-FPGA repetition penalty (DEFAULT): fold the penalty into the LM-head matmul bias so the HW
-    # argmax returns the penalized token directly — no 256 KB logit readback, fully deterministic.
-    # Separate bin (bias on / writeback off). See notes_repetition_penalty_fpga_bias.md.
-    parser.add_argument('--fpga-penalty', action=argparse.BooleanOptionalAction, default=True,
-                        help='Apply the repetition penalty on-FPGA via the LM-head matmul bias '
-                             '(argmax of logits+bias on chip, no logit readback). DEFAULT. '
-                             '--no-fpga-penalty = plain greedy (writeback-on bin, no penalty) for the '
-                             'A/B baseline and the compare/calibration tool.')
-    parser.add_argument('--pen-alpha', type=float, default=1.0,
-                        help='On-FPGA penalty: bias[t] = -alpha*count[t] (logit units). Default 1.0.')
-    parser.add_argument('--pen-cap', type=float, default=20.0,
-                        help='On-FPGA penalty: max |bias| per token (floor on -alpha*count). Default 20.')
-    parser.add_argument('--rep-window', type=int, default=256,
-                        help='On-FPGA penalty: count tokens over the last N (never penalizes '
-                             'punctuation/whitespace/special tokens). Default 256.')
+                             'which lands early), then the penalty turns on to break long-context '
+                             'loops. 0 = penalty from the start. Default 512.')
+    pen_group.add_argument('--pen-alpha', type=float, default=1.0,
+                        help='bias[t] = -alpha*count[t] (logit units). Default 1.0.')
+    pen_group.add_argument('--pen-cap', type=float, default=20.0,
+                        help='max |bias| per token (floor on -alpha*count). Default 20.')
+    pen_group.add_argument('--rep-window', type=int, default=256,
+                        help='count tokens over the last N (never penalizes punctuation/whitespace/'
+                             'special tokens). Default 256.')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1408,7 +1483,7 @@ def main():
     # Decode config — deterministic, on-FPGA penalty only. Must be set BEFORE compile_llama() since
     # fpga_penalty changes the compiled LM-head matmul (bias on / writeback off).
     ue.greedy_until = int(args.greedy_until)
-    ue.fpga_penalty = bool(args.fpga_penalty)
+    ue.fpga_penalty = not bool(args.pure_greedy)
     ue.pen_alpha = float(args.pen_alpha)
     ue.pen_cap = float(args.pen_cap)
     ue.rep_window = int(args.rep_window)
