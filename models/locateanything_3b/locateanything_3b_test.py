@@ -43,10 +43,13 @@ def _import_qwen_engine():
     return mod
 
 
-def _gpu_vision(query, prompt_kind, image_path, device="cuda"):
-    """Run our MoonViT on GPU (the connector now runs on FPGA). Returns
-    (vit[N,4608] bf16 cpu, connector_out[N,2048] bf16 cpu reference for validation,
-    prefill_seq tuple with image placeholders, n_img, (W,H))."""
+def _gpu_vision(query, prompt_kind, image_path, device="cuda", compute_vit=True, keep_model=False):
+    """Build the MoonViT model, process the image, tokenize. Optionally compute the
+    GPU vit/connector reference. Returns a dict; the FPGA-vision path reuses the model
+    + pixel_values to run MoonViT on the board instead.
+
+    Keys: vit ([N,4608] bf16 cpu or None), conn_ref ([N,2048] or None), prefill_seq,
+    n_img, wh, model (or None), pixel_values, grid_hw, cfg."""
     import locateanything_3b_cpu_test as la
     cfg = json.load(open(os.path.join(LA_DIR, "locateanything_3b_config.json")))
     model = la.LocateAnything(cfg).eval()
@@ -58,10 +61,12 @@ def _gpu_vision(query, prompt_kind, image_path, device="cuda"):
     mk = cfg["vision_config"]["merge_kernel_size"]
     n_img = (grid_hw[0] * grid_hw[1]) // (mk[0] * mk[1])
 
-    with torch.no_grad():
-        vit = model.vision_features(pv.to(device, dtype=torch.bfloat16), grid_hw)  # [N,4608]
-        conn_ref = model.mlp1(vit).to(torch.bfloat16).cpu()                        # [N,2048] (GPU ref)
-        vit = vit.to(torch.bfloat16).cpu()
+    vit = conn_ref = None
+    if compute_vit:
+        with torch.no_grad():
+            vit = model.vision_features(pv.to(device, dtype=torch.bfloat16), grid_hw)  # [N,4608]
+            conn_ref = model.mlp1(vit).to(torch.bfloat16).cpu()                        # [N,2048]
+            vit = vit.to(torch.bfloat16).cpu()
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(la.MODEL_DIR, trust_remote_code=True)
@@ -70,10 +75,14 @@ def _gpu_vision(query, prompt_kind, image_path, device="cuda"):
     # remap our <IMG_CONTEXT> onto the placeholder run_prefill replaces with vision
     ids = [ENGINE_IMG_PLACEHOLDER if t == LA_IMAGE_TOKEN else t for t in ids]
 
-    del model
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    return vit, conn_ref, tuple(ids), n_img, (img.width, img.height)
+    if not keep_model:
+        del model
+        model = None
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    return dict(vit=vit, conn_ref=conn_ref, prefill_seq=tuple(ids), n_img=n_img,
+                wh=(img.width, img.height), model=model, pixel_values=pv,
+                grid_hw=grid_hw, cfg=cfg)
 
 
 def main():
@@ -84,14 +93,35 @@ def main():
     ap.add_argument("--query", default="car")
     ap.add_argument("--check-connector", action="store_true",
                     help="diff FPGA connector output vs the bit-exact GPU connector")
+    ap.add_argument("--fpga-vision", action="store_true",
+                    help="run MoonViT on the FPGA (stitched op flow) instead of the GPU")
+    ap.add_argument("--check-vision", action="store_true",
+                    help="with --fpga-vision: parity-check FPGA vit[N,4608] vs the GPU reference")
+    ap.add_argument("--vision-precision", default="if4", choices=["if4", "bf16"],
+                    help="MoonViT encoder weight precision (if4 fits the params window; "
+                         "bf16 ~0.98GB may overflow)")
+    ap.add_argument("--vision-debug", action="store_true",
+                    help="run MoonViT op-by-op (separate execute per op) with a NaN/Inf "
+                         "check after each stage; halts at the first bad stage")
+    ap.add_argument("--stop-after", default=None,
+                    help="with --vision-debug: force a halt after this stage label "
+                         "(e.g. L0.flash, L0.fc0_gelu, final_norm)")
+    ap.add_argument("--vision-no-mask", action="store_true",
+                    help="with --vision-debug: run flash WITHOUT the pad-key mask bias "
+                         "(isolation: output will be wrong but should be NaN-free)")
     args = ap.parse_args()
 
-    # ---- 1. GPU vision (MoonViT only; connector now on FPGA) ----
-    print("=== Stage 2: GPU MoonViT -> FPGA connector + decoder ===")
+    # ---- 1. Vision prep (build model, process image, tokenize) ----
+    fpga_vision = args.fpga_vision
+    want_gpu_vit = (not fpga_vision) or args.check_vision
+    mode = "FPGA MoonViT" if fpga_vision else "GPU MoonViT"
+    print(f"=== Vision: {mode} -> FPGA connector + decoder ===")
     t0 = time.time()
-    vit, conn_ref, prefill_seq, n_img, (W, H) = _gpu_vision(args.query, args.prompt_kind, args.image)
-    print(f"  vit {tuple(vit.shape)}  image_tokens={n_img}  "
-          f"prefill_len={len(prefill_seq)}  ({time.time()-t0:.1f}s)")
+    prep = _gpu_vision(args.query, args.prompt_kind, args.image,
+                       compute_vit=want_gpu_vit, keep_model=fpga_vision)
+    vit = prep["vit"]; conn_ref = prep["conn_ref"]; prefill_seq = prep["prefill_seq"]
+    n_img = prep["n_img"]; (W, H) = prep["wh"]; vis_cfg = prep["cfg"]
+    print(f"  image_tokens={n_img}  prefill_len={len(prefill_seq)}  ({time.time()-t0:.1f}s)")
 
     # ---- 2. Build FPGA decoder ----
     print("\n=== Building FPGA decoder (loads LM bin to DRAM) ===")
@@ -197,7 +227,37 @@ def main():
     ue = LADecoder(script_dir=LA_DIR)
     ue.load_connector()
 
-    # ---- 3. FPGA connector: GPU vit[N,4608] -> VIS_ENCODER_OUT_DRAM[N,2048] ----
+    # ---- 2b. FPGA MoonViT encoder (optional): produces vit[N_merged,4608] in DRAM ----
+    if fpga_vision:
+        import moonvit_encoder as mv
+        print("\n=== FPGA MoonViT encoder (stitched op flow) ===")
+        model = prep["model"]
+        N = prep["grid_hw"][0] * prep["grid_hw"][1]
+        mv.moonvit_load_weights(ue, model, vis_cfg, precision=args.vision_precision)
+        mv.moonvit_setup_dram(ue, N, vis_cfg)
+        mv.moonvit_prepare_input(ue, model, prep["pixel_values"], prep["grid_hw"], vis_cfg)
+        if args.vision_debug:
+            # op-by-op execute + NaN check; halts at the first bad stage (or --stop-after)
+            mv.moonvit_run_staged(ue, vis_cfg, prep["grid_hw"], stop_after=args.stop_after,
+                                  mask_pad=not args.vision_no_mask)
+        else:
+            prog = mv.moonvit_compile_encoder(ue, vis_cfg, prep["grid_hw"])
+            mv.moonvit_run_encoder(ue, prog)
+        # read vit[N_merged,4608] back from DRAM (also feeds the connector + optional parity)
+        vit = ue.dma_from_accelerator_memory(ue.VIS_MERGED_DRAM, (ue.MV_N_MERGED, 4608)).cpu()
+        if args.check_vision and prep["vit"] is not None:
+            ref = prep["vit"].float()
+            f = vit.float()
+            diff = (f - ref).abs()
+            denom = ref.abs().mean().clamp_min(1e-6)
+            cos = torch.nn.functional.cosine_similarity(f.flatten(), ref.flatten(), dim=0)
+            print(f"  [check-vision] FPGA vit vs GPU: max|Δ|={diff.max():.4f} "
+                  f"mean|Δ|={diff.mean():.5f} rel={diff.mean()/denom:.4f} cos={cos:.5f}")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ---- 3. FPGA connector: vit[N,4608] -> VIS_ENCODER_OUT_DRAM[N,2048] ----
     ue.run_connector(vit)
     print(f"  FPGA connector -> {n_img} vision tokens @ VIS_ENCODER_OUT_DRAM 0x{ue.VIS_ENCODER_OUT_DRAM:X}")
 
