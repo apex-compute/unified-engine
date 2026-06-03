@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Llama-3.2-1B inference on accelerator: prefill + decode.
+Llama-3.2-3B inference on accelerator: prefill + decode.
 
-  - Config from llama3.2_1b_config.json; weights from a single bin (see below).
-  - Prefill: compiled each run. Decoder: if llama3.2_1b_bin/decoder_program.bin and
-    llama3.2_1b_bin/decoder_program.json exist, skip decoder compile and load
+  - Config from llama3.2_3b_config.json; weights from a single bin (see below).
+  - Prefill: compiled each run. Decoder: if llama3.2_3b_bin/decoder_program.bin and
+    llama3.2_3b_bin/decoder_program.json exist, skip decoder compile and load
     program sizes from meta; otherwise compile and write the bin + meta.
   - Run prefill then decode loop.
 
@@ -18,18 +18,17 @@ Architecture differences vs Gemma3:
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
 Weights:
-  - Default: llama3.2_1b_bin/weights_llama3.2_1b_hf.bin (generated from HF model if missing).
-  - --local-weights: use llama3.2_1b_bin/full_model_weights.bin instead.
+  - Default: llama3.2_3b_bin/weights_llama3.2_3b_hf.bin (generated from HF model if missing).
+  - --local-weights: use llama3.2_3b_bin/full_model_weights.bin instead.
 
 Usage:
-  python llama3.2_1b_test.py
-  python llama3.2_1b_test.py --prompt "your prompt"
-  python llama3.2_1b_test.py --dev xdma0 [--cycle 5.88]
-  python llama3.2_1b_test.py --local-weights
+  python llama3.2_3b_test.py
+  python llama3.2_3b_test.py --prompt "your prompt"
+  python llama3.2_3b_test.py --dev xdma0 [--cycle 5.88]
+  python llama3.2_3b_test.py --local-weights
 """
 
 import json
-import math
 import os
 import sys
 
@@ -47,11 +46,11 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
-# 1B uses pure FP4 (E2M1) — the best 4-bit scheme for this model by WikiText-2
-# perplexity; see src/models/llama3.2_1b/compare/summary.md. FP4 blocks are stored
-# in the HW 4-bit container with a positive scale, so the FPGA's IF4 dispatch reads
-# them as FP4. (3B uses MixMSE IF4 instead — the scheme is chosen per model.)
-from quant_lib import quantize_fp4
+from quant_lib import quantize_if4
+
+# Map the config's quantization variant string to quantize_if4's int_variant arg.
+# "int" → pure INT4, "fp" → pure FP4, "mix"/"mixmse" → per-block min-MSE (INT4 or FP4).
+_IF4_VARIANT = {"int": True, "fp": False, "mix": None, "mixmse": None}
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -74,30 +73,8 @@ def _parse_offset(val) -> int:
         return int(val, 0)
     return int(val)
 
-def _rope_kv_perm(num_kv_heads: int, actual_head_dim: int) -> torch.Tensor:
-    """Return the 1-D index permutation that reorders a combined KV-head vector from
-    standard layout  [h0[lo,hi], h1[lo,hi], ..., h_{N-1}[lo,hi]]
-    to lo|hi layout  [h0[lo], ..., h_{N-1}[lo], h0[hi], ..., h_{N-1}[hi]].
-
-    When k_proj / q_proj weight rows are permuted by this index before packing, the
-    rope_hf_core (i, i+D/2) pairing maps exactly to per-head (j, j+head_dim/2) pairing
-    within each 64-dim head rather than crossing head boundaries.
-
-    The same permutation also generates the inverse by sorting:
-        inv = torch.argsort(perm)
-    """
-    half = actual_head_dim // 2          # e.g. 32
-    D    = num_kv_heads * actual_head_dim # e.g. 512
-    perm = torch.empty(D, dtype=torch.long)
-    for h in range(num_kv_heads):
-        for j in range(half):
-            perm[h * half + j]                   = h * actual_head_dim + j         # lo half
-            perm[num_kv_heads * half + h * half + j] = h * actual_head_dim + half + j  # hi half
-    return perm
-
-
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_llama3.2_1b_hf.bin from HuggingFace model per llama3.2_1b_config.json layout.
+    """Generate weights_llama3.2_3b_hf.bin from HuggingFace model per llama3.2_3b_config.json layout.
     Returns the path to the written file."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -108,6 +85,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
     _q = cfg["special"]["quantization"]
     block_size = _q.get("block_size", 64)
+    if4_variant = _IF4_VARIANT[_q.get("if4_variant", "int")]   # quantize_if4 int_variant
 
     model, model_dir = _ensure_hf_model(script_dir, cfg)
     gamma_offset = cfg["special"]["rms_norm"]["gamma_offset"]  # 0.0 for LLaMA
@@ -122,14 +100,10 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     group_size = cfg["file_info"]["group_size"]
     blk0_structure = cfg["layers"]["structure"]
 
-    # [lo|hi] row permutation for k_proj/q_proj weights.
-    # After permutation, rope_hf_core(N=head_dim=512) on the matmul output correctly
-    # applies per-head RoPE using the 8-head tiled table (satisfies N>=128 constraint).
-    head_dim_actual = 64
+    # 3B uses PER-HEAD RoPE (N=actual_head_dim=128) — NO q/k row permutation. HF's
+    # natural per-head [lo,hi] layout is fed directly to rope_hf_core_dram_gqa(N=128).
+    head_dim_actual = cfg["file_info"]["actual_head_dim"]
     num_kv_heads = head_dim // head_dim_actual  # 8
-    kv_perm = _rope_kv_perm(num_kv_heads, head_dim_actual)   # size head_dim=512
-    q_groups = group_size  # 4 groups of 512-dim (each group covers 2 KV heads' Q)
-    q_perm = torch.cat([kv_perm + g * head_dim for g in range(q_groups)])  # size 2048
 
     # Compute total file size
     max_end = 0
@@ -157,12 +131,11 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
         # LLaMA norms: gamma_offset = 0.0 (weight stored as-is)
         gamma_in = (layer.input_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
-        # [lo|hi] permutation on k_proj and q_proj rows so that rope_hf_core(N=512)
-        # applies per-head RoPE correctly via the 8-head tiled frequency table.
-        # After matmul, K output is [K0_lo..K7_lo, K0_hi..K7_hi] and Q is split
-        # into 4 groups of 512 (covering 2 KV heads each), each in [lo|hi] layout.
-        q_w = attn.q_proj.weight.detach().cpu().to(torch.bfloat16)[q_perm, :]
-        k_w = attn.k_proj.weight.detach().cpu().to(torch.bfloat16)[kv_perm, :]
+        # 3B per-head RoPE: NO permutation. HF q/k weights are stored as-is; the matmul
+        # output is in natural per-head order (Q: 24 heads × 128, K: 8 heads × 128), and
+        # each head's native [lo,hi] 128-dim is roped directly by rope_hf_core_dram_gqa(N=128).
+        q_w = attn.q_proj.weight.detach().cpu().to(torch.bfloat16)
+        k_w = attn.k_proj.weight.detach().cpu().to(torch.bfloat16)
         v_w = attn.v_proj.weight.detach().cpu().to(torch.bfloat16)
         # LLaMA has no q_norm / k_norm: write zero placeholders (norm steps are skipped in pipeline)
         gamma_q = torch.zeros(head_dim, dtype=torch.bfloat16)
@@ -205,7 +178,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
             if kind == "if4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
-                data_bytes, scale_bytes = quantize_fp4(tensor, block_size=block_size)
+                data_bytes, scale_bytes = quantize_if4(tensor, block_size=block_size, int_variant=if4_variant)
                 scale_padded = (scale_bytes + b"\x00" * sz)[:sz]
                 data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
                 write_at(file_off, scale_padded)
@@ -224,25 +197,22 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     theta = rope_cfg["theta"]
     local_base = rope_cfg["local_base"]
     num_positions = rope_cfg["num_positions"]
-    # Compute tiled RoPE for LLaMA: repeat per-head 32-freq pattern across all KV heads
-    # head_dim (512) = num_kv_heads (8) x head_dim_actual (64); D_per_head = 32
-    head_dim_actual = 64
+    # 3B per-head RoPE: NO tiling across KV heads. D_per_head = actual_head_dim//2 = 64.
+    # Per-position row = [cos_head(64), cos_head(64), -sin_head(64), sin_head(64)] = 256 elems.
+    head_dim_actual = cfg["file_info"]["actual_head_dim"]
     num_kv_heads = head_dim // head_dim_actual  # = 8
-    D_per_head = head_dim_actual // 2           # = 32
+    D_per_head = head_dim_actual // 2           # = 64
     for name, theta_val, off_key, sz_key in [
         ("ROPE_LOCAL", local_base, "ROPE_LOCAL", "ROPE_LOCAL_SIZE"),
         ("ROPE_GLOBAL", theta, "ROPE_GLOBAL", "ROPE_GLOBAL_SIZE"),
     ]:
         inv_freq = 1.0 / (theta_val ** (torch.arange(D_per_head, dtype=torch.float32) / D_per_head))
         pos = torch.arange(num_positions, dtype=torch.float32)
-        freqs = torch.outer(pos, inv_freq)                     # (num_positions, 32)
-        cos_head = freqs.cos().to(torch.bfloat16)              # (num_positions, 32)
-        sin_head = freqs.sin().to(torch.bfloat16)              # (num_positions, 32)
-        # Tile across num_kv_heads to get (num_positions, head_dim/2)
-        cos_full = cos_head.repeat(1, num_kv_heads)            # (num_positions, 256)
-        sin_full = sin_head.repeat(1, num_kv_heads)            # (num_positions, 256)
-        # Layout expected by rope_hf_core: [cos_full, cos_full, -sin_full, sin_full]
-        rope_tensor = torch.cat([cos_full, cos_full, -sin_full, sin_full], dim=1)
+        freqs = torch.outer(pos, inv_freq)                     # (num_positions, 64)
+        cos_head = freqs.cos().to(torch.bfloat16)              # (num_positions, 64)
+        sin_head = freqs.sin().to(torch.bfloat16)              # (num_positions, 64)
+        # Per-head layout (no tiling): [cos_head, cos_head, -sin_head, sin_head]
+        rope_tensor = torch.cat([cos_head, cos_head, -sin_head, sin_head], dim=1)
         sz = weight_defs[sz_key]
         raw = (rope_tensor.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
         write_at(weight_defs[off_key], raw)
@@ -257,7 +227,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     lm_head_w = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
-    data_bytes, scale_bytes = quantize_fp4(lm_head_w, block_size=block_size)
+    data_bytes, scale_bytes = quantize_if4(lm_head_w, block_size=block_size, int_variant=if4_variant)
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
@@ -283,8 +253,8 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     return model, model_dir
 
 def _load_config(script_dir: str) -> dict:
-    """Load llama3.2_1b_config.json and build weight_defs (offset/size dict) from regions."""
-    config_path = os.path.join(script_dir, "llama3.2_1b_config.json")
+    """Load llama3.2_3b_config.json and build weight_defs (offset/size dict) from regions."""
+    config_path = os.path.join(script_dir, "llama3.2_3b_config.json")
     with open(config_path, "r") as f:
         cfg = json.load(f)
     weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
@@ -298,10 +268,10 @@ def _load_config(script_dir: str) -> dict:
     return cfg
 
 # -----------------------------------------------------------------------------
-# Llama-3.2-1B unified engine
+# Llama-3.2-3B unified engine
 # -----------------------------------------------------------------------------
-class Llama32_1b_UnifiedEngine(UnifiedEngine):
-    """UnifiedEngine for Llama-3.2-1B: loads config + weight bin, compile_prefill/compile_decoder, run_prefill/run_decoder.
+class Llama32_3b_UnifiedEngine(UnifiedEngine):
+    """UnifiedEngine for Llama-3.2-3B: loads config + weight bin, compile_prefill/compile_decoder, run_prefill/run_decoder.
 
     Key architectural differences from Gemma3:
       - No Q/K per-head norm (q_norm, k_norm): compile pipeline skips those RMS norm steps.
@@ -322,7 +292,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
         super().__init__(
             params_dram_base=0x00000000,
-            tensor_dram_base=0x58000000,
+            tensor_dram_base=0x70000000,
             program_dram_base=0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
@@ -341,9 +311,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.hf_model_dir = hf_model_dir or os.path.join(self.script_dir, paths["hf_model_dir"])
         self.q_size = self.head_dim * self.group_size * self.bytes_per_element
         self.k_size = self.head_dim * self.bytes_per_element
-        # LLaMA 3.2 1B GQA: 8 KV heads × 64-dim per head = head_dim=512 combined
-        self.actual_head_dim = 64
+        # LLaMA 3.2 3B GQA: 8 KV heads × 128-dim per head = head_dim=1024 combined,
+        # group_size=3 → 24 Q heads. Per-head RoPE (N=128); no q/k weight permutation.
+        self.actual_head_dim = fi["actual_head_dim"]
         self.num_kv_heads = self.head_dim // self.actual_head_dim  # = 8
+        self.num_q_heads = self.num_kv_heads * self.group_size     # = 24
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
         self.PREFILL_CONTEXT_SIZE = model["prefill_context_size"]
         self.LAYER_SIZE = fi["num_layers"]
@@ -399,7 +371,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         theta = rope_theta if rope_theta is not None else rope_cfg["theta"]
         local_base = rope_local_base if rope_local_base is not None else rope_cfg["local_base"]
         num_rope_positions = rope_cfg["num_positions"]
-        D_per_head = self.actual_head_dim // 2  # = 32 frequencies per KV head
+        # 3B per-head RoPE: D_per_head = actual_head_dim//2 = 64 freqs; NO KV-head tiling.
+        # Each rope_hf_core_dram_gqa(N=128) consumes one head's cos/sin. Per-position row =
+        # [cos_head(64), cos_head(64), -sin_head(64), sin_head(64)] = 256 elems = 512 bytes.
+        D_per_head = self.actual_head_dim // 2  # = 64 frequencies per head
         for name, theta_val, sz_key, attr in [
             ("ROPE_LOCAL", local_base, "ROPE_LOCAL_SIZE", "DRAM_ADDR_ROPE_LOCAL"),
             ("ROPE_GLOBAL", theta, "ROPE_GLOBAL_SIZE", "DRAM_ADDR_ROPE_GLOBAL"),
@@ -407,13 +382,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             inv_freq = 1.0 / (theta_val ** (torch.arange(D_per_head, dtype=torch.float32) / D_per_head))
             pos = torch.arange(num_rope_positions, dtype=torch.float32)
             freqs = torch.outer(pos, inv_freq)
-            cos_head = freqs.cos().to(torch.bfloat16)  # (num_pos, 32)
-            sin_head = freqs.sin().to(torch.bfloat16)  # (num_pos, 32)
-            # Tile 8× → (num_pos, 256): each of 8 KV heads uses same per-head frequencies
-            cos_full = cos_head.repeat(1, self.num_kv_heads)   # (num_pos, 256)
-            sin_full = sin_head.repeat(1, self.num_kv_heads)   # (num_pos, 256)
-            # Layout for rope_hf_core(N=512): [cos_full, cos_full, -sin_full, sin_full]
-            rope_tensor = torch.cat([cos_full, cos_full, -sin_full, sin_full], dim=1)  # (num_pos, 1024)
+            cos_head = freqs.cos().to(torch.bfloat16)  # (num_pos, 64)
+            sin_head = freqs.sin().to(torch.bfloat16)  # (num_pos, 64)
+            # Per-head layout (no tiling): [cos_head, cos_head, -sin_head, sin_head]
+            rope_tensor = torch.cat([cos_head, cos_head, -sin_head, sin_head], dim=1)  # (num_pos, 256)
             sz = self.weight_defs[sz_key]
             raw = rope_tensor.contiguous().view(torch.uint8).numpy().tobytes()
             raw = (raw + b"\x00" * sz)[:sz]
@@ -479,7 +451,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         print("Tokenizer loaded successfully.")
 
     def tensor_init(self) -> None:
-        """Initialize hardware DRAM tensors for Llama-3.2-1B (layer-wise overlap except for kv cache)."""
+        """Initialize hardware DRAM tensors for Llama-3.2-3B (layer-wise overlap except for kv cache)."""
         seq_len = self.MAX_CONTEXT_SIZE
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
@@ -556,26 +528,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         global _SILENT_MODE
         _SILENT_MODE = True
         num_bucket = (self.PREFILL_CONTEXT_SIZE * self.group_size + 63) // 64
+        gpr_tmp = self.alloc_isa_reg()
+        self.generate_instruction_reg_mul_imm(gpr_tmp, self.gpr_seq_len, self.vector_length * self.bytes_per_element)
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
-
-        # Layer-invariant constants (hoisted so the flash subroutine can use them)
-        ahd         = self.actual_head_dim   # 64
-        nkvh        = self.num_kv_heads      # 8
-        qpkv        = self.group_size        # 4
-        bpe         = self.bytes_per_element
-        hd          = self.head_dim          # 512
-        total_q_dim = hd * qpkv             # 2048
-        half_ahd    = ahd // 2              # 32
-        rope_row    = hd * 2 * bpe          # bytes per rope table row
-
-        # flash_attention_core compiled once as a subroutine after the layer loop.
-        # Each call site sets gpr_ret_id to its return word address then jumps to the
-        # subroutine; flash_attention returns via JUMP_REG_ABS(gpr_ret_id).
-        program_dram_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-
-        call_site_jump_capture_indices: list[int] = []
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
@@ -610,45 +566,44 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
 
-            # LLaMA 8-head GQA: rope_hf_core(N=512) on [lo|hi]-permuted K and Q,
-            # then scatter 64-dim per-head slices into per-head flash buffers and KV
-            # cache, then run flash_attention(head_dim=64) × 8 KV heads.
-            #
-            # K/Q weight permutation (_rope_kv_perm) ensures that after k/q_proj matmul
-            # the output is in [lo|hi] layout: [KV0_lo..KV7_lo, KV0_hi..KV7_hi].
-            # rope_hf_core(N=512) with the 8-head tiled table then rotates each 64-dim
-            # head correctly in-place.  After rope, K_h_roped = [K_h_lo(32), K_h_hi(32)]
-            # is scattered from non-contiguous positions in K_DRAM to contiguous 64-dim
-            # slots in the KV cache and FLASH_K_DRAM.
+            # LLaMA 3B per-head GQA: rope_hf_core_dram_gqa(N=actual_head_dim=128) applies
+            # RoPE to each Q/K head independently on HF's natural per-head [lo,hi] layout
+            # (NO q/k weight permutation). Then scatter contiguous ahd-dim per-head slices
+            # into per-head flash buffers + KV cache, then flash_attention(head_dim=128) × 8.
             ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
+            ahd      = self.actual_head_dim   # 128
+            nkvh     = self.num_kv_heads      # 8
+            nqh      = self.num_q_heads       # 24 (= nkvh * group_size)
+            qpkv     = self.group_size        # 3
+            bpe      = self.bytes_per_element
+            hd       = self.head_dim          # 1024 (combined KV-head width)
+            total_q_dim = hd * qpkv           # 3072 (o_proj input width = nqh * ahd)
+            rope_row = 2 * ahd * bpe          # 512 bytes per rope table row (N=128)
 
-            # Phase 1: K rope in-place on LAYER0_K_DRAM (N=512, [lo|hi] layout).
-            # K layout = [seq_len, hd]. PBI: outer M loop driven by gpr_seq_len.
-            total_flops += self.rope_hf_core_dram(
-                M=seq_len,
-                N=hd,
+            # Phase 1: K per-head RoPE in-place (N=ahd=128); K layout [seq_len, nkvh, ahd].
+            # cos/sin shared across heads per token; sin = cos + ahd*bpe (per-head table).
+            total_flops += self.rope_hf_core_dram_gqa(
+                M=seq_len, group_size=nkvh, N=ahd,
                 input_dram_addr=self.LAYER0_K_DRAM,
                 output_dram_addr=self.LAYER0_K_DRAM,
                 cos_dram_addr=ROPE_WEIGHT_ADDR,
-                sin_dram_addr=ROPE_WEIGHT_ADDR + hd * bpe,
+                sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
                 gpr_M_reg=self.gpr_seq_len,
             )
 
-            # Phase 2: Q rope in-place (N=512, [lo|hi] layout).
-            # Q layout = [seq_len, qpkv=4, hd] — 4 sub-rows per token share one cos/sin.
-            # PBI: outer M loop driven by gpr_seq_len; inner group loop is static.
+            # Phase 2: Q per-head RoPE in-place (N=ahd=128); Q layout [seq_len, nqh, ahd].
             total_flops += self.rope_hf_core_dram_gqa(
-                M=seq_len,
-                group_size=qpkv,
-                N=hd,
+                M=seq_len, group_size=nqh, N=ahd,
                 input_dram_addr=self.LAYER0_Q_DRAM,
                 output_dram_addr=self.LAYER0_Q_DRAM,
                 cos_dram_addr=ROPE_WEIGHT_ADDR,
-                sin_dram_addr=ROPE_WEIGHT_ADDR + hd * bpe,
+                sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
                 gpr_M_reg=self.gpr_seq_len,
             )
 
-            # Phase 3: Per-KV-head scatter → KV cache + flash buffers → flash_attention
+            # Phase 3: Per-KV-head scatter → KV cache + flash buffers → flash_attention.
+            # Each kv_h owns qpkv consecutive Q heads (kv_h*qpkv .. kv_h*qpkv+qpkv-1) in HF
+            # order; per-head ahd-dim slices are CONTIGUOUS (no lo/hi split, no permutation).
             for kv_h in range(nkvh):
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
                                 + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
@@ -657,37 +612,21 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                                 + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
                                 + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
 
-                # Scatter K_h_roped (64-dim) from [lo|hi] K_DRAM → KV cache + FLASH_K
-                # lo half and hi half are non-contiguous in K_DRAM → two PBI loops.
-                k_flash_lo_specs = (
-                    [(k_cache_base,               ahd * bpe)]
-                    + [(self.LAYER0_FLASH_K_DRAM + g * ahd * bpe,               qpkv * ahd * bpe) for g in range(qpkv)]
-                )
-                k_flash_hi_specs = (
-                    [(k_cache_base + half_ahd * bpe, ahd * bpe)]
-                    + [(self.LAYER0_FLASH_K_DRAM + g * ahd * bpe + half_ahd * bpe, qpkv * ahd * bpe) for g in range(qpkv)]
-                )
+                # Scatter K head (contiguous ahd at kv_h*ahd in K_DRAM[seq,hd]) → KV cache + FLASH_K (qpkv copies)
                 self._emit_pbi_scatter_per_token(
-                    read_base=self.LAYER0_K_DRAM + kv_h * half_ahd * bpe,
+                    read_base=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
                     read_stride_bytes=hd * bpe,
-                    write_specs=k_flash_lo_specs,
+                    write_specs=(
+                        [(k_cache_base, ahd * bpe)]
+                        + [(self.LAYER0_FLASH_K_DRAM + g * ahd * bpe, qpkv * ahd * bpe) for g in range(qpkv)]
+                    ),
                     sram_byte_addr=0x10000,
-                    element_count=half_ahd,
-                    gpr_seq_len=self.gpr_seq_len,
-                    template_seq_len=seq_len,
-                )
-                self._emit_pbi_scatter_per_token(
-                    read_base=self.LAYER0_K_DRAM + (hd // 2 + kv_h * half_ahd) * bpe,
-                    read_stride_bytes=hd * bpe,
-                    write_specs=k_flash_hi_specs,
-                    sram_byte_addr=0x10080,
-                    element_count=half_ahd,
+                    element_count=ahd,
                     gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
 
-                # Scatter V_h (64-dim, standard layout) from V_PROJ_TEMP → KV cache + FLASH_V
-                # V_PROJ_TEMP layout: [seq_len, nkvh, ahd] → stride = nkvh*ahd*bpe per token.
+                # Scatter V head (contiguous ahd) from V_PROJ_TEMP[seq, nkvh, ahd] → KV cache + FLASH_V (qpkv copies)
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe,
                     read_stride_bytes=nkvh * ahd * bpe,
@@ -701,48 +640,36 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     template_seq_len=seq_len,
                 )
 
-                # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q
-                # Q group g_for_kv = kv_h//2; sub-heads 0..qpkv-1 within that group.
-                g_for_kv = kv_h // 2
-                local_kv = kv_h % 2
+                # Scatter this KV head's qpkv Q heads (each contiguous ahd at (kv_h*qpkv+q)*ahd) → FLASH_Q
                 for q in range(qpkv):
-                    sub_idx = local_kv * qpkv + q
-                    q_lo_base = (self.LAYER0_Q_DRAM
-                                 + g_for_kv * hd * bpe
-                                 + sub_idx * half_ahd * bpe)
-                    q_hi_base = (self.LAYER0_Q_DRAM
-                                 + g_for_kv * hd * bpe
-                                 + (hd // 2 + sub_idx * half_ahd) * bpe)
-                    flash_q_lo = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
-                    flash_q_hi = flash_q_lo + half_ahd * bpe
                     self._emit_pbi_scatter_per_token(
-                        read_base=q_lo_base,
+                        read_base=self.LAYER0_Q_DRAM + (kv_h * qpkv + q) * ahd * bpe,
                         read_stride_bytes=total_q_dim * bpe,
-                        write_specs=[(flash_q_lo, qpkv * ahd * bpe)],
+                        write_specs=[(self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe, qpkv * ahd * bpe)],
                         sram_byte_addr=0x30000,
-                        element_count=half_ahd,
-                        gpr_seq_len=self.gpr_seq_len,
-                        template_seq_len=seq_len,
-                    )
-                    self._emit_pbi_scatter_per_token(
-                        read_base=q_hi_base,
-                        read_stride_bytes=total_q_dim * bpe,
-                        write_specs=[(flash_q_hi, qpkv * ahd * bpe)],
-                        sram_byte_addr=0x30080,
-                        element_count=half_ahd,
+                        element_count=ahd,
                         gpr_seq_len=self.gpr_seq_len,
                         template_seq_len=seq_len,
                     )
 
-                # Call flash attention subroutine (compiled after the layer loop).
-                # Pad so capture_count is even; return address = capture_count + 2
-                # (ADD_SET + JUMP_ABS), which is then also even = 512-bit aligned.
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                call_site_jump_capture_indices.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                # Flash attention for this KV head (head_dim=64) — PBI bucket dispatcher;
+                # gpr_bucket_idx is primed at program start (ADD_SET above) so the dispatcher
+                # routes to the correct bucket body for the actual runtime seq_len.
+                flash_result = self.flash_attention_core(
+                    head_dim=ahd,
+                    seq_len=aligned_seq_len,
+                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+                    gpr_bucket_idx=self.gpr_bucket_idx,
+                    num_buckets=num_bucket,
+                )
+                total_flops += flash_result[num_bucket - 1]
 
                 # Assemble output into LAYER0_FLASH_OUTPUT_DRAM
                 # Standard GQA layout per token: [kv0_q0(64), kv0_q1..q3, kv1_q0..q3, ...]
@@ -817,35 +744,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gpr_seq_len,
             )
-        # HALT ends the normal execution path; the flash_attention subroutine follows and
-        # is only reachable via the JUMP_ABS call sites within the layer loop above.
+        self.release_isa_reg()  # gpr_tmp
         self.generate_instruction_halt()
-
-        # Compile flash_attention subroutine after the HALT; bucket bodies return via
-        # JUMP_REG_ABS(gpr_ret_id), which each call site pre-loaded with its return address.
-        flash_sub_start_inst_dram_addr, flash_flops = self.flash_attention_core(
-            head_dim=ahd,
-            seq_len=aligned_seq_len,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_bucket,
-            gpr_ret_id=gpr_ret_id,
-        )
-        total_flops += flash_flops[num_bucket - 1] * layer_size * nkvh
-
-        # Patch all call-site JUMP_ABS placeholders to point at the flash subroutine.
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(
-                jump_idx, ue_35bit_addr_shifter(flash_sub_start_inst_dram_addr))
-
-        self.release_isa_reg()  # gpr_ret_id
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"size_bytes": prefill_program_size, "flops": total_flops}
@@ -859,9 +759,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         count_at_start = self.capture_count
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         total_flops = 0
-        program_dram_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-        call_site_jump_capture_indices: list[int] = []
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -882,40 +779,41 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
-                # LLaMA 8-head GQA decoder: rope_hf_core(N=512) on [lo|hi]-permuted K and Q
-                # in-place, then scatter 64-dim per-head slices to KV cache (via
-                # V_CACHE_SIZE_REG for decode position), then decoder_attention(head_dim=64).
+                # LLaMA 3B per-head GQA decoder: rope_hf_core_decode(N=128) per head on K and
+                # Q in-place (HF natural layout, no permutation), then scatter contiguous
+                # ahd-dim per-head slices to the KV cache (V_CACHE_SIZE_REG = decode position),
+                # then decoder_group_attention(head_dim=128) per KV head.
                 ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
-                ahd      = self.actual_head_dim   # 64
+                ahd      = self.actual_head_dim   # 128
                 nkvh     = self.num_kv_heads      # 8
-                qpkv     = self.group_size        # 4
+                nqh      = self.num_q_heads       # 24
+                qpkv     = self.group_size        # 3
                 bpe      = self.bytes_per_element
-                hd       = self.head_dim          # 512
-                total_q_dim = hd * qpkv           # 2048
-                half_ahd = ahd // 2               # 32
+                hd       = self.head_dim          # 1024
 
-                # Step 1: K rope in-place (N=512, uses ROPE_SIZE_REG for decode position)
-                total_flops += self.rope_hf_core_decode(
-                    N=hd,
-                    input_dram_addr=self.LAYER0_K_DRAM,
-                    output_dram_addr=self.LAYER0_K_DRAM,
-                    cos_dram_addr=ROPE_WEIGHT_ADDR,
-                    sin_dram_addr=ROPE_WEIGHT_ADDR + hd * bpe,
-                    rope_size_reg=self.ROPE_SIZE_REG,
-                    tmp_reg=self.TMP_REG)
-
-                # Step 2: Q rope in-place per 512-dim group (N=512, uses ROPE_SIZE_REG)
-                for g in range(qpkv):
+                # Step 1: K per-head RoPE in-place (N=ahd=128 per head; ROPE_SIZE_REG = decode pos × rope_row)
+                for kv_h in range(nkvh):
                     total_flops += self.rope_hf_core_decode(
-                        N=hd,
-                        input_dram_addr=self.LAYER0_Q_DRAM + g * hd * bpe,
-                        output_dram_addr=self.LAYER0_Q_DRAM + g * hd * bpe,
+                        N=ahd,
+                        input_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
+                        output_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
                         cos_dram_addr=ROPE_WEIGHT_ADDR,
-                        sin_dram_addr=ROPE_WEIGHT_ADDR + hd * bpe,
+                        sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
                         rope_size_reg=self.ROPE_SIZE_REG,
                         tmp_reg=self.TMP_REG)
 
-                # Step 3: Per-KV-head scatter K/V to cache + scatter Q → decoder_attention
+                # Step 2: Q per-head RoPE in-place (N=ahd=128 per Q head; 24 heads)
+                for qh in range(nqh):
+                    total_flops += self.rope_hf_core_decode(
+                        N=ahd,
+                        input_dram_addr=self.LAYER0_Q_DRAM + qh * ahd * bpe,
+                        output_dram_addr=self.LAYER0_Q_DRAM + qh * ahd * bpe,
+                        cos_dram_addr=ROPE_WEIGHT_ADDR,
+                        sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
+                        rope_size_reg=self.ROPE_SIZE_REG,
+                        tmp_reg=self.TMP_REG)
+
+                # Step 3: Per-KV-head scatter K/V to cache (contiguous) + scatter Q → decoder_attention
                 for kv_h in range(nkvh):
                     k_cache_base = (self.LAYER0_K_ROPE_DRAM
                                     + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
@@ -924,35 +822,15 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                                     + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
                                     + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
 
-                    # Scatter K_h_roped (64-dim) → KV cache at decode position
-                    # lo→SRAM 0x10000, hi→SRAM 0x10080 (128-byte aligned slots)
+                    # Scatter K head (contiguous ahd at kv_h*ahd) → KV cache at decode position
                     self.accelerator_memory_to_sram(
-                        self.LAYER0_K_DRAM + kv_h * half_ahd * bpe, 0x10000, half_ahd)
-                    self.accelerator_memory_to_sram(
-                        self.LAYER0_K_DRAM + (hd // 2 + kv_h * half_ahd) * bpe,
-                        0x10080, half_ahd)
+                        self.LAYER0_K_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
                     self.generate_instruction_add_imm(
                         self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x10000, 0, half_ahd)
-                    self.overwrite_instruction_with_general_register(self.TMP_REG)
-                    self.generate_instruction_add_imm(
-                        self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base + half_ahd * bpe), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x10080, 0, half_ahd)
+                    self.sram_to_accelerator_memory(0x10000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
-                    # Copy valid K history → LAYER0_FLASH_K_DRAM; loop count = gpr_bucket_idx
-                    # so only current_seq_len tokens are copied, not the full MAX_CONTEXT_SIZE.
-                    self._emit_pbi_scatter_per_token(
-                        read_base=k_cache_base,
-                        read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
-                        write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
-                        sram_byte_addr=0,
-                        element_count=UE_VECTOR_SIZE * ahd,
-                        gpr_seq_len=self.gpr_bucket_idx,
-                    )
-
-                    # Scatter V_h (64-dim, standard layout) → V cache at decode position
-                    # v_proj output at LAYER0_FLASH_V_DRAM: [V_KV0(64)..V_KV7(64)] = 512-dim
+                    # Scatter V head (contiguous ahd) from FLASH_V[kv0..kv7] → V cache at decode position
                     self.accelerator_memory_to_sram(
                         self.LAYER0_FLASH_V_DRAM + kv_h * ahd * bpe, 0x20000, ahd)
                     self.generate_instruction_add_imm(
@@ -960,43 +838,27 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(0x20000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
-                    # Copy valid V history → LAYER0_FLASH_V_DRAM + k_size; same dynamic size.
-                    # Offset by k_size to avoid the v_proj output at [0..k_size-1].
-                    self._emit_pbi_scatter_per_token(
-                        read_base=v_cache_base,
-                        read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
-                        write_specs=[(self.LAYER0_FLASH_V_DRAM + self.k_size, UE_VECTOR_SIZE * ahd * bpe)],
-                        sram_byte_addr=0,
-                        element_count=UE_VECTOR_SIZE * ahd,
-                        gpr_seq_len=self.gpr_bucket_idx,
-                    )
-
-                    # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q base (no kv_h offset)
-                    # KV head kv_h → Q group g = kv_h//2; sub_idx = (kv_h%2)*qpkv + q
-                    g_for_kv = kv_h // 2
-                    local_kv = kv_h % 2
-                    q_g_addr = self.LAYER0_Q_DRAM + g_for_kv * hd * bpe
+                    # Scatter this KV head's qpkv Q heads (contiguous ahd at (kv_h*qpkv+q)*ahd) → FLASH_Q
                     for q in range(qpkv):
-                        sub_idx = local_kv * qpkv + q
-                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
+                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + (kv_h * qpkv + q) * ahd * bpe
                         self.accelerator_memory_to_sram(
-                            q_g_addr + sub_idx * half_ahd * bpe, 0x30000, half_ahd)
-                        self.accelerator_memory_to_sram(
-                            q_g_addr + (hd // 2 + sub_idx * half_ahd) * bpe,
-                            0x30080, half_ahd)
-                        self.sram_to_accelerator_memory(0x30000, flash_q_addr, half_ahd)
-                        self.sram_to_accelerator_memory(0x30080, flash_q_addr + half_ahd * bpe, half_ahd)
-                    self.pad_capture_to_64b_boundary()
-                    return_word_addr = ue_35bit_addr_shifter(
-                        program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                    self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                    call_site_jump_capture_indices.append(self.capture_count)
-                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-                    # Copy per-head output to its slot in FLASH_OUTPUT_DRAM.
-                    self.accelerator_memory_to_sram(
-                        self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
-                    self.sram_to_accelerator_memory(
-                        0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
+                            self.LAYER0_Q_DRAM + (kv_h * qpkv + q) * ahd * bpe, 0x30000, ahd)
+                        self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
+                    attn_flops = self.decoder_group_attention_core(
+                        group_size=qpkv,
+                        head_dim=ahd,
+                        seq_len=self.MAX_CONTEXT_SIZE,
+                        gpr_bucket_idx=self.gpr_bucket_idx,
+                        num_buckets=(self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM + kv_h * qpkv * ahd * bpe,
+                        K_DRAM_ADDR=k_cache_base,
+                        V_DRAM_ADDR=v_cache_base,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
+                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    )
+                    total_flops += attn_flops[-1]
                 total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
@@ -1036,47 +898,20 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            # LM head: write the full vocab-logits row to DRAM only when the host reads it —
-            # i.e. when the repetition penalty is on (penalized greedy reads + argmaxes the
-            # penalty-adjusted logits). Pure unpenalized greedy (rep_pen 1.0) uses the HW argmax
-            # register, so writeback is disabled. This compile-time gate MUST match the decode
-            # readback condition; else the host reads a never-written LOGITS_DRAM → garbage ("!!!").
-            _need_logit_writeback = float(getattr(self, "repetition_penalty", 1.0)) != 1.0
+            # LM head: the full vocab-logits writeback to DRAM is needed whenever the host
+            # reads logits — sampling (temp>0) OR penalized greedy (temp 0 + rep_pen!=1, which
+            # argmaxes the penalty-adjusted logits). Disable it ONLY for pure unpenalized greedy
+            # (temp 0 + rep_pen 1.0), where the HW argmax register suffices. This compile-time
+            # gate MUST match the decode readback condition (temp>0 or penalty active); else the host reads a
+            # never-written LOGITS_DRAM → NaN/garbage ("!!!"). main() sets both before compile.
+            _need_logit_writeback = (float(getattr(self, "temperature", 0.0)) > 0
+                                     or float(getattr(self, "repetition_penalty", 1.0)) != 1.0)
             total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
                 write_back_disable=not _need_logit_writeback)
 
         self.generate_instruction_halt()
-        self.pad_capture_to_64b_boundary()
-
-        # Compile decoder_group_attention_core once as a subroutine after HALT.
-        num_buckets = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-        ahd = self.actual_head_dim
-        bpe = self.bytes_per_element
-        qpkv = self.group_size
-        dec_sub_start_addr, dec_attn_flops = self.decoder_group_attention_core(
-            group_size=qpkv,
-            head_dim=ahd,
-            seq_len=self.MAX_CONTEXT_SIZE,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_buckets,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM + self.k_size,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            gpr_ret_id=gpr_ret_id,
-        )
-        total_flops += dec_attn_flops[-1] * layer_size * self.num_kv_heads
-
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(
-                jump_idx, ue_35bit_addr_shifter(dec_sub_start_addr))
-
-        self.release_isa_reg()  # gpr_ret_id
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"program_size_bytes": decoder_program_size, "total_flops": total_flops}
@@ -1097,8 +932,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
         paths_cfg = self._cfg.get("paths", {})
-        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_1b_bin/llama_instruction.bin"))
-        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
+        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_3b_bin/llama_instruction.bin"))
+        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/llama_instruction.json"))
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
@@ -1251,7 +1086,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         prefill or decoder program at runtime.
         """
         paths_cfg = self._cfg.get("paths", {})
-        meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
+        meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/llama_instruction.json"))
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1264,8 +1099,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         flops_prefill_template = meta["prefill_template_flops"]
         decoder_flops_per_token = meta["decoder_total_flops"]
         _max_gpr_bucket = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-        _kv_stride = self.actual_head_dim * self.bytes_per_element
-        _rope_row  = self.head_dim * 2 * self.bytes_per_element
+        _kv_stride = self.actual_head_dim * self.bytes_per_element       # per-head KV cache stride (256 B)
+        _rope_row  = 2 * self.actual_head_dim * self.bytes_per_element    # per-head rope table row (512 B)
 
         prefill_seq = self.prefill_seq
         if prefill_seq is None:
@@ -1413,9 +1248,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
+    parser = argparse.ArgumentParser(description="Llama-3.2-3B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
-    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")
+    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_3b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=1/0.17, help='Clock cycle time in ns (default: ~5.88ns)')
     # Decode is a position-gated hybrid (deterministic): PURE greedy for the first
@@ -1446,9 +1281,9 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:
-        weights_bin_rel = "llama3.2_1b_bin/full_model_weights.bin"
+        weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
     else:
-        weights_bin_rel = "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin"
+        weights_bin_rel = "llama3.2_3b_bin/weights_llama3.2_3b_hf.bin"
         weights_bin_full = os.path.join(script_dir, weights_bin_rel)
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
@@ -1461,7 +1296,7 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
     print(f"Using DMA device: {args.dev}, CLOCK_CYCLE_TIME_NS={user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
-    ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)
 
     if args.prompt is not None:
@@ -1508,7 +1343,7 @@ def main():
     print("\n--- Running ---")
     ue.run_llama()
     ue.clear_dram()
-    print("Llama-3.2-1B test ends.")
+    print("Llama-3.2-3B test ends.")
 
 if __name__ == "__main__":
     main()

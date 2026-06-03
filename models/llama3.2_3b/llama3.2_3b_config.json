@@ -1,5 +1,5 @@
 {
-  "_template_note": "Concrete starter values for llama3.2_1b_test.py using template-compatible layout (sizes are bytes; offsets are weight-file offsets).",
+  "_template_note": "Llama-3.2-3B-Instruct config. Same architecture as 1B (GQA, no q/k norm, no post-attn/post-mlp norm, tied lm_head) but: hidden 3072, layers 28, head_dim_actual 128, num_kv_heads 8, group_size 3, mlp 8192. Because actual_head_dim=128 satisfies rope_hf_core N>=128 per head, 3B uses per-head rope (N=128) rather than the 1B grouped layout (N=512). See notes/notes_llama3.2_3b.md.",
   "fixed_isa_regs": {
     "V_CACHE_SIZE_REG": 1,
     "TMP_REG": 2,
@@ -8,12 +8,13 @@
     "GPR_SEQ_LEN_REG": 5
   },
   "file_info": {
-    "layer_size": 32327680,
-    "num_layers": 16,
-    "head_dim": 512,
-    "hidden_size": 2048,
+    "layer_size": 53506048,
+    "num_layers": 28,
+    "head_dim": 1024,
+    "actual_head_dim": 128,
+    "hidden_size": 3072,
     "embedding_vocab": 128256,
-    "group_size": 4,
+    "group_size": 3,
     "mlp_elements": 8192,
     "bytes_per_element": 2
   },
@@ -24,11 +25,11 @@
     "rope_global_layers": []
   },
   "paths": {
-    "weights_bin": "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin",
-    "hf_model_dir": "llama3.2_1b_bin/Llama-3.2-1B-Instruct",
-    "hf_model_repo": "meta-llama/Llama-3.2-1B-Instruct",
-    "instruction_bin": "llama3.2_1b_bin/llama_instruction.bin",
-    "instruction_meta": "llama3.2_1b_bin/llama_instruction.json"
+    "weights_bin": "llama3.2_3b_bin/weights_llama3.2_3b_hf.bin",
+    "hf_model_dir": "llama3.2_3b_bin/Llama-3.2-3B-Instruct",
+    "hf_model_repo": "meta-llama/Llama-3.2-3B-Instruct",
+    "instruction_bin": "llama3.2_3b_bin/llama3.2_3b_instruction.bin",
+    "instruction_meta": "llama3.2_3b_bin/llama3.2_3b_instruction.json"
   },
   "default_prefill_tokens": [
     128000,
@@ -205,144 +206,145 @@
   },
   "regions": {
     "BLK0_ATTN_NORM_WEIGHT": {
-      "offset": "0x1f500000",
-      "size": 4096,
+      "offset": "0x2F000000",
+      "size": 6144,
       "type": "bf16"
     },
     "BLK0_ATTN_Q_WEIGHT_SCALE": {
-      "offset": "0x1f501000",
-      "size": 131072,
+      "offset": "0x2F001800",
+      "size": 294912,
       "type": "bf16_scale"
     },
     "BLK0_ATTN_Q_WEIGHT_DATA": {
-      "offset": "0x1f521000",
-      "size": 2097152,
+      "offset": "0x2F049800",
+      "size": 4718592,
       "type": "if4"
     },
     "BLK0_ATTN_K_WEIGHT_SCALE": {
-      "offset": "0x1f721000",
-      "size": 32768,
+      "offset": "0x2F4C9800",
+      "size": 98304,
       "type": "bf16_scale"
     },
     "BLK0_ATTN_K_WEIGHT_DATA": {
-      "offset": "0x1f729000",
-      "size": 524288,
+      "offset": "0x2F4E1800",
+      "size": 1572864,
       "type": "if4"
     },
     "BLK0_ATTN_V_WEIGHT_SCALE": {
-      "offset": "0x1f7a9000",
-      "size": 32768,
+      "offset": "0x2F661800",
+      "size": 98304,
       "type": "bf16_scale"
     },
     "BLK0_ATTN_V_WEIGHT_DATA": {
-      "offset": "0x1f7b1000",
-      "size": 524288,
+      "offset": "0x2F679800",
+      "size": 1572864,
       "type": "if4"
     },
     "BLK0_ATTN_Q_NORM_WEIGHT": {
-      "offset": "0x1f831000",
-      "size": 1024,
+      "offset": "0x2F7F9800",
+      "size": 2048,
       "type": "bf16"
     },
     "BLK0_ATTN_K_NORM_WEIGHT": {
-      "offset": "0x1f831400",
-      "size": 1024,
+      "offset": "0x2F7FA000",
+      "size": 2048,
       "type": "bf16"
     },
     "BLK0_ATTN_OUTPUT_WEIGHT_SCALE": {
-      "offset": "0x1f831800",
-      "size": 131072,
+      "offset": "0x2F7FA800",
+      "size": 294912,
       "type": "bf16_scale"
     },
     "BLK0_ATTN_OUTPUT_WEIGHT_DATA": {
-      "offset": "0x1f851800",
-      "size": 2097152,
+      "offset": "0x2F842800",
+      "size": 4718592,
       "type": "if4"
     },
     "BLK0_POST_ATTENTION_NORM_WEIGHT": {
-      "offset": "0x1fa51800",
-      "size": 4096,
+      "offset": "0x2FCC2800",
+      "size": 6144,
       "type": "bf16"
     },
     "BLK0_FFN_NORM_WEIGHT": {
-      "offset": "0x1fa52800",
-      "size": 4096,
+      "offset": "0x2FCC4000",
+      "size": 6144,
       "type": "bf16"
     },
     "BLK0_FFN_UP_WEIGHT_SCALE": {
-      "offset": "0x1fa53800",
-      "size": 524288,
+      "offset": "0x2FCC5800",
+      "size": 786432,
       "type": "bf16_scale"
     },
     "BLK0_FFN_UP_WEIGHT_DATA": {
-      "offset": "0x1fad3800",
-      "size": 8388608,
+      "offset": "0x2FD85800",
+      "size": 12582912,
       "type": "if4"
     },
     "BLK0_FFN_GATE_WEIGHT_SCALE": {
-      "offset": "0x202d3800",
-      "size": 524288,
+      "offset": "0x30985800",
+      "size": 786432,
       "type": "bf16_scale"
     },
     "BLK0_FFN_GATE_WEIGHT_DATA": {
-      "offset": "0x20353800",
-      "size": 8388608,
+      "offset": "0x30A45800",
+      "size": 12582912,
       "type": "if4"
     },
     "BLK0_FFN_DOWN_WEIGHT_SCALE": {
-      "offset": "0x20b53800",
-      "size": 524288,
+      "offset": "0x31645800",
+      "size": 786432,
       "type": "bf16_scale"
     },
     "BLK0_FFN_DOWN_WEIGHT_DATA": {
-      "offset": "0x20bd3800",
-      "size": 8388608,
+      "offset": "0x31705800",
+      "size": 12582912,
       "type": "if4"
     },
     "BLK0_POST_FFW_NORM_WEIGHT": {
-      "offset": "0x213d3800",
-      "size": 4096,
+      "offset": "0x32305800",
+      "size": 6144,
       "type": "bf16"
     }
   },
   "non_layer_regions": {
     "OUTPUT_NORM_WEIGHT": {
-      "offset": "0x3e248000",
-      "size": 4096
+      "offset": "0x884C4000",
+      "size": 6144
     },
     "LM_HEAD_WEIGHT_SCALE": {
-      "offset": "0x3e249000",
-      "size": 8208384
+      "offset": "0x884C5800",
+      "size": 12312576
     },
     "LM_HEAD_WEIGHT_DATA": {
-      "offset": "0x3ea1d000",
-      "size": 131334144
+      "offset": "0x89083800",
+      "size": 197001216
     },
     "ROPE_LOCAL": {
-      "offset": "0x46800000",
-      "size": 8388608
+      "offset": "0x95000000",
+      "size": 16777216
     },
     "ROPE_GLOBAL": {
-      "offset": "0x47000000",
-      "size": 8388608
+      "offset": "0x96000000",
+      "size": 16777216
     }
   },
   "special": {
     "embedding": {
       "token_embd_offset": "0x0",
-      "token_embd_size": "0x1f500000",
+      "token_embd_size": "0x2F000000",
       "vocab_size": 128256,
-      "embedding_dim": 2048
+      "embedding_dim": 3072
     },
     "rope": {
-      "head_dim": 512,
+      "head_dim": 1024,
       "num_positions": 4096,
       "theta": 500000.0,
       "local_base": 500000.0
     },
     "quantization": {
       "block_size": 64,
-      "_note": "1B = pure FP4 (quantize_fp4, E2M1 per 64-block) — best 4-bit scheme for 1B by WikiText-2 PPL; see src/models/llama3.2_1b/compare/summary.md. Packed in the HW 4-bit container with positive scale, so the FPGA IF4 dispatch reads it as FP4. (3B uses MixMSE IF4 — scheme chosen per model.)"
+      "if4_variant": "mix",
+      "_note": "4-bit IF4 container (per-block scale sign selects INT4 vs FP4). if4_variant picks the packing policy: int=pure INT4, fp=pure FP4, mix=per-block MixMSE. 3B best=mix; see src/models/llama3.2_3b/compare/summary.md."
     },
     "rms_norm": {
       "gamma_offset": 0.0

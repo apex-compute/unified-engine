@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Llama-3.2-1B inference from pre-compiled bins — runtime-only, fully self-contained.
+"""Llama-3.2-3B inference from pre-compiled bins — runtime-only, fully self-contained.
 
-This is the runtime counterpart to ``llama3.2_1b_test.py``. It imports **nothing**
+This is the runtime counterpart to ``llama3.2_3b_test.py``. It imports **nothing**
 from the test script — only ``user_dma_core`` and a *local* tokenizer — so it can
 ship to users with just the bin files and run with no build-time code, no
 HuggingFace model, and no internet. If any required local artifact is missing it
 aborts with a clear error before touching the FPGA.
 
-Required artifacts (in ``llama3.2_1b_bin/`` next to this script — produced by
-running ``llama3.2_1b_test.py`` once on a build machine that has HF access):
-  * ``weights_llama3.2_1b_hf.bin``   IF4 layer weights + bf16 embedding
+Required artifacts (in ``llama3.2_3b_bin/`` next to this script — produced by
+running ``llama3.2_3b_test.py`` once on a build machine that has HF access):
+  * ``weights_llama3.2_3b_hf.bin``   IF4 layer weights + bf16 embedding
   * ``llama_instruction.bin``        unified dynamic-PBI instruction bin (prefill + decoder)
   * ``llama_instruction.json``       per-stage start addresses / sizes / FLOPs
-  * ``Llama-3.2-1B-Instruct/``       tokenizer files only (tokenizer.json /
+  * ``Llama-3.2-3B-Instruct/``       tokenizer files only (tokenizer.json /
                                      tokenizer_config.json). Model weights NOT needed.
 
-Design mirrors test.py §A–§D (see notes_llama3.2_1b.md): full-4 GB DRAM layout,
+Design mirrors test.py §A–§D (see notes_llama3.2_3b.md): full-4 GB DRAM layout,
 dynamic-PBI single bin (GPR-primed preamble + jump_abs), prefill_context_size=128,
 and sampling decode (recency-decayed / windowed / structural-exempt repetition
 penalty). DECODE DEFAULT is a position-gated HYBRID (temp 0): pure greedy for the first
@@ -24,9 +24,9 @@ long-context loops; deterministic, see notes §D. The shipped bin is compiled wi
 writeback enabled, so sampling (temp>0), the hybrid, and pure greedy (rep-pen 1.0) all work.
 
 Usage:
-  python llama3.2_1b_run_from_bin.py
-  python llama3.2_1b_run_from_bin.py --prompt "your question"
-  python llama3.2_1b_run_from_bin.py --temperature 0 --dev xdma0     # greedy
+  python llama3.2_3b_run_from_bin.py
+  python llama3.2_3b_run_from_bin.py --prompt "your question"
+  python llama3.2_3b_run_from_bin.py --temperature 0 --dev xdma0     # greedy
 """
 
 import json
@@ -67,7 +67,7 @@ def _parse_offset(val) -> int:
 
 
 def _load_config(script_dir: str) -> dict:
-    config_path = os.path.join(script_dir, "llama3.2_1b_config.json")
+    config_path = os.path.join(script_dir, "llama3.2_3b_config.json")
     with open(config_path, "r") as f:
         cfg = json.load(f)
     weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
@@ -81,18 +81,18 @@ def _load_config(script_dir: str) -> dict:
     return cfg
 
 
-class Llama32_1b_RunFromBin(UnifiedEngine):
+class Llama32_3b_RunFromBin(UnifiedEngine):
     """Self-contained bin-only runtime engine. Loads pre-built weight + instruction
     bins and runs prefill + sampling decode. No compile, no HF model, no test import."""
 
     def __init__(self, script_dir: str | None = None):
-        # Full 4 GB DRAM layout — MUST match llama3.2_1b_test.py at capture time:
+        # Full 4 GB DRAM layout — MUST match llama3.2_3b_test.py at capture time:
         # the instruction bin bakes absolute JUMP_ABS targets AND the tensor-DRAM
         # addresses the decoder program reads, so the layout has to be identical.
-        #   params 0x00000000 | tensor 0x58000000 | program 0xE0000000
+        #   params 0x00000000 | tensor 0x70000000 | program 0xE0000000
         super().__init__(
             params_dram_base=0x00000000,
-            tensor_dram_base=0x58000000,
+            tensor_dram_base=0x70000000,
             program_dram_base=0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
@@ -111,7 +111,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         self.hf_model_dir = os.path.join(self.script_dir, paths["hf_model_dir"])
         self.q_size = self.head_dim * self.group_size * self.bytes_per_element
         self.k_size = self.head_dim * self.bytes_per_element
-        self.actual_head_dim = 64
+        self.actual_head_dim = fi["actual_head_dim"]
         self.num_kv_heads = self.head_dim // self.actual_head_dim   # 8
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
         self.PREFILL_CONTEXT_SIZE = model["prefill_context_size"]
@@ -151,14 +151,16 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         return out
 
     def _load_rope_host(self) -> None:
-        """Host-compute the N=512 tiled RoPE table (8 KV heads tiled) and DMA it to
+        """Host-compute the per-head RoPE table (N=128 per head, no tiling) and DMA it to
         params DRAM. Deterministic from rope config — no HF lookup. Layout per row:
-        [cos_full(256), cos_full(256), -sin_full(256), sin_full(256)] = 1024 bf16."""
+        [cos_head(64), cos_head(64), -sin_head(64), sin_head(64)] = 256 bf16 per row."""
         rope_cfg = self._cfg["special"]["rope"]
         theta = rope_cfg["theta"]
         local_base = rope_cfg["local_base"]
         num_rope_positions = rope_cfg["num_positions"]
-        D_per_head = self.actual_head_dim // 2   # 32 freqs per KV head
+        # 3B per-head RoPE (no KV-head tiling): D_per_head=64; per-position row =
+        # [cos_head, cos_head, -sin_head, sin_head] = 256 elems. Must match test.py.
+        D_per_head = self.actual_head_dim // 2   # 64 freqs per head
         for name, theta_val, sz_key, attr in [
             ("ROPE_LOCAL", local_base, "ROPE_LOCAL_SIZE", "DRAM_ADDR_ROPE_LOCAL"),
             ("ROPE_GLOBAL", theta, "ROPE_GLOBAL_SIZE", "DRAM_ADDR_ROPE_GLOBAL"),
@@ -168,9 +170,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
             freqs = torch.outer(pos, inv_freq)
             cos_head = freqs.cos().to(torch.bfloat16)
             sin_head = freqs.sin().to(torch.bfloat16)
-            cos_full = cos_head.repeat(1, self.num_kv_heads)
-            sin_full = sin_head.repeat(1, self.num_kv_heads)
-            rope_tensor = torch.cat([cos_full, cos_full, -sin_full, sin_full], dim=1)
+            rope_tensor = torch.cat([cos_head, cos_head, -sin_head, sin_head], dim=1)
             sz = self.weight_defs[sz_key]
             raw = rope_tensor.contiguous().view(torch.uint8).numpy().tobytes()
             raw = (raw + b"\x00" * sz)[:sz]
@@ -238,7 +238,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
 
     def tensor_init(self) -> None:
         """Allocate hardware DRAM tensors. The order + sizes MUST match
-        llama3.2_1b_test.py.tensor_init exactly, because the decoder program in the
+        llama3.2_3b_test.py.tensor_init exactly, because the decoder program in the
         bin reads baked tensor-DRAM addresses derived from this allocation order."""
         seq_len = self.MAX_CONTEXT_SIZE
         q_seq_len = seq_len * self.group_size
@@ -324,7 +324,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
         logits = buf.float()
         # Recency-decayed frequency repetition penalty over the last rep_window tokens,
-        # exempting structural/special tokens. See notes_llama3.2_1b.md §D.
+        # exempting structural/special tokens. See notes_llama3.2_3b.md §D.
         rep_pen = float(getattr(self, "repetition_penalty", 1.0))
         if rep_pen != 1.0 and prev_tokens:
             rep_window = int(getattr(self, "rep_window", 256))
@@ -362,7 +362,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         program. ``self.prefill_seq`` must be set by the caller."""
         paths_cfg = self._cfg.get("paths", {})
         meta_path = os.path.join(self.script_dir,
-                                 paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
+                                 paths_cfg.get("instruction_meta", "llama3.2_3b_bin/llama_instruction.json"))
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -376,7 +376,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         decoder_flops_per_token = meta["decoder_total_flops"]
         _max_gpr_bucket = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         _kv_stride = self.actual_head_dim * self.bytes_per_element
-        _rope_row = self.head_dim * 2 * self.bytes_per_element
+        _rope_row = 2 * self.actual_head_dim * self.bytes_per_element
 
         prefill_seq = self.prefill_seq
         if len(prefill_seq) < 2:
@@ -509,7 +509,7 @@ def _verify_artifacts(script_dir: str, cfg: dict) -> None:
     """Hard-fail before any FPGA touch if a required artifact is missing."""
     paths = cfg["paths"]
     required = [
-        ("llama3.2_1b_config.json", "model config"),
+        ("llama3.2_3b_config.json", "model config"),
         (paths["weights_bin"], "weight bin"),
         (paths["instruction_bin"], "unified instruction bin"),
         (paths["instruction_meta"], "instruction bin meta"),
@@ -523,21 +523,20 @@ def _verify_artifacts(script_dir: str, cfg: dict) -> None:
         _original_print("ERROR: runtime-only script — required pre-built artifacts are missing:")
         for line in missing:
             _original_print(line)
-        _original_print("\nGenerate them on a build machine with HF access:\n  python llama3.2_1b_test.py\n"
-                        "then ship the llama3.2_1b_bin/ directory alongside this script.")
+        _original_print("\nGenerate them on a build machine with HF access:\n  python llama3.2_3b_test.py\n"
+                        "then ship the llama3.2_3b_bin/ directory alongside this script.")
         sys.exit(1)
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Llama-3.2-1B inference from pre-compiled bins (no HF, no internet, no test-script import).")
+        description="Llama-3.2-3B inference from pre-compiled bins (no HF, no internet, no test-script import).")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt (tokenized via the local chat template). Overrides the config default.")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device name. Default: xdma0.")
     parser.add_argument("--cycle", type=float, default=1 / 0.17, help="Clock cycle time in ns. Default ~5.88.")
-    # Decode defaults match llama3.2_1b_test.py: deterministic hybrid (greedy 512 + rep-pen 1.2);
-    # see notes §D. (Sampling controls disabled below.)
+    # Decode — defaults match llama3.2_3b_test.py: hybrid (temp 0: greedy then rep-pen 1.2); see notes §D.
     # --- Sampling controls (DISABLED) — uncomment + restore the sampling block in
     #     sample_next_token() to re-enable stochastic sampling ---
     # parser.add_argument("--temperature", type=float, default=0.0, help=">0 enables sampling.")
@@ -564,11 +563,11 @@ def main():
 
     set_dma_device(args.dev)
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    _original_print(f"Llama-3.2-1B on {args.dev} (run from pre-compiled bins)")
+    _original_print(f"Llama-3.2-3B on {args.dev} (run from pre-compiled bins)")
 
     t0 = time.perf_counter()
     _original_print("Loading weights + tokenizer ...")
-    ue = Llama32_1b_RunFromBin(script_dir=script_dir)
+    ue = Llama32_3b_RunFromBin(script_dir=script_dir)
     _original_print(f"  Weights + tensors: {time.perf_counter() - t0:.2f}s")
 
     if args.prompt is not None:
@@ -604,7 +603,7 @@ def main():
 
     ue.run_llama()
     ue.clear_dram()
-    _original_print("Llama-3.2-1B run_from_bin ends.")
+    _original_print("Llama-3.2-3B run_from_bin ends.")
 
 
 if __name__ == "__main__":
