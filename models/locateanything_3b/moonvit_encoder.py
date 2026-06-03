@@ -141,63 +141,94 @@ def _col_pad(W, target_cols):
     return Wp.contiguous()
 
 
-def _store_proj(ue, la, name, W, precision):
-    """Store one projection weight: quantized (if4) -> la[name_scale],la[name_data];
-    or bf16 -> la[name_weight]. K (last dim) is a multiple of 64 for every MoonViT
-    projection, so q4_64's 64-blocks never straddle rows."""
-    if precision == "if4":
-        packed, _ = quantize_q4_64(W)
-        la[f'{name}_scale'], la[f'{name}_data'] = store_quantized_weight(ue, packed)
-    else:
-        la[f'{name}_weight'] = store_weight(ue, W.to(torch.bfloat16).contiguous())
+_BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locateanything_3b_bin")
 
 
-def moonvit_load_weights(ue, model, cfg, precision="if4"):
-    """Store all MoonViT transformer weights to params DRAM. `model` is a built
-    la.LocateAnything (its .vision_model is the MoonVit module). Big matmul weights are
-    if4-quantized by default (~0.28 GB vs ~0.98 GB bf16 — fits the params window);
-    biases + LayerNorm gamma/beta stay bf16. Populates ue.mv_layer_addrs / ue.mv_*."""
+def _prepare_moonvit_weights(model, cfg, precision):
+    """Model-dependent prep (pad/reorder/quantize), independent of DRAM placement.
+    Returns an ordered list of (scope, name, kind, payload) entries replayed by
+    _store_moonvit_weights. Order fixes the bump-allocator addresses, so the same list
+    always lands weights at the same addresses (which the cached program bakes in).
+    kind: 'mat'=precision-dependent matmul weight, 'bf16'=bias/norm. payload: q4-packed
+    np.uint8 (mat+if4) or a bf16 tensor."""
     d = _vis_dims(cfg)
     VN, VD, VH, VI = d["VN"], d["VD"], d["VH"], d["VI"]
-    VIS_MLP_PAD = ((VI + 63) // 64) * 64           # 4352
-    q_scale = math.sqrt(VD_PAD / VD)                # sqrt(128/72) flash-scale correction
-    ue.mv_precision = precision
+    VIS_MLP_PAD = ((VI + 63) // 64) * 64
+    q_scale = math.sqrt(VD_PAD / VD)
 
-    enc = model.vision_model.encoder
-    ue.mv_layer_addrs = []
-    for blk in enc.blocks:
-        la = {}
-        # wqkv: Linear(VH, 3*VH) -> rows [q(VH) | k(VH) | v(VH)], each [VN*VD]
-        Wqkv = blk.wqkv.weight.data.float()         # [3*VH, VH]
-        bqkv = blk.wqkv.bias.data.float()           # [3*VH]
+    def _mat(W):  # matmul weight -> q4-packed bytes or bf16 tensor
+        if precision == "if4":
+            packed, _ = quantize_q4_64(W)
+            return ('mat', packed)
+        return ('mat', W.to(torch.bfloat16).contiguous())
+
+    out = []
+    for li, blk in enumerate(model.vision_model.encoder.blocks):
+        Wqkv = blk.wqkv.weight.data.float(); bqkv = blk.wqkv.bias.data.float()
         qW, kW, vW = Wqkv[:VH], Wqkv[VH:2 * VH], Wqkv[2 * VH:]
         qb, kb, vb = bqkv[:VH], bqkv[VH:2 * VH], bqkv[2 * VH:]
         qWp, qbp = _qk_pad_reorder(qW, qb, VN, VD, scale=q_scale)
         kWp, kbp = _qk_pad_reorder(kW, kb, VN, VD, scale=1.0)
         vWp, vbp = _v_pad(vW, vb, VN, VD)
-        _store_proj(ue, la, 'q', qWp, precision); la['q_bias'] = store_weight(ue, qbp)
-        _store_proj(ue, la, 'k', kWp, precision); la['k_bias'] = store_weight(ue, kbp)
-        _store_proj(ue, la, 'v', vWp, precision); la['v_bias'] = store_weight(ue, vbp)
-        # o proj: Linear(VH, VH); expand input dim VN*VD -> VN*VD_PAD to consume padded attn
-        _store_proj(ue, la, 'o', _o_pad(blk.wo.weight.data.float(), VN, VD), precision)
-        la['o_bias'] = store_weight(ue, blk.wo.bias.data.to(torch.bfloat16).contiguous())
-        # norms (LayerNorm gamma+beta) — always bf16
-        la['norm0_w'] = store_weight(ue, blk.norm0.weight.data.to(torch.bfloat16).contiguous())
-        la['norm0_b'] = store_weight(ue, blk.norm0.bias.data.to(torch.bfloat16).contiguous())
-        la['norm1_w'] = store_weight(ue, blk.norm1.weight.data.to(torch.bfloat16).contiguous())
-        la['norm1_b'] = store_weight(ue, blk.norm1.bias.data.to(torch.bfloat16).contiguous())
-        # MLP: fc0 (VH->VI) pad rows VI->VIS_MLP_PAD; fc1 (VI->VH) pad cols VI->VIS_MLP_PAD
         fc0W, fc0b = _row_pad(blk.mlp.fc0.weight.data.float(), blk.mlp.fc0.bias.data.float(), VIS_MLP_PAD)
         fc1W = _col_pad(blk.mlp.fc1.weight.data.float(), VIS_MLP_PAD)
-        _store_proj(ue, la, 'fc0', fc0W, precision); la['fc0_bias'] = store_weight(ue, fc0b)
-        _store_proj(ue, la, 'fc1', fc1W, precision)
-        la['fc1_bias'] = store_weight(ue, blk.mlp.fc1.bias.data.to(torch.bfloat16).contiguous())
-        ue.mv_layer_addrs.append(la)
+        bf = lambda t: t.to(torch.bfloat16).contiguous()
+        out += [
+            (li, 'q', *_mat(qWp)),   (li, 'q_bias', 'bf16', bf(qbp)),
+            (li, 'k', *_mat(kWp)),   (li, 'k_bias', 'bf16', bf(kbp)),
+            (li, 'v', *_mat(vWp)),   (li, 'v_bias', 'bf16', bf(vbp)),
+            (li, 'o', *_mat(_o_pad(blk.wo.weight.data.float(), VN, VD))),
+            (li, 'o_bias', 'bf16', bf(blk.wo.bias.data)),
+            (li, 'norm0_w', 'bf16', bf(blk.norm0.weight.data)),
+            (li, 'norm0_b', 'bf16', bf(blk.norm0.bias.data)),
+            (li, 'norm1_w', 'bf16', bf(blk.norm1.weight.data)),
+            (li, 'norm1_b', 'bf16', bf(blk.norm1.bias.data)),
+            (li, 'fc0', *_mat(fc0W)), (li, 'fc0_bias', 'bf16', bf(fc0b)),
+            (li, 'fc1', *_mat(fc1W)), (li, 'fc1_bias', 'bf16', bf(blk.mlp.fc1.bias.data)),
+        ]
+    fln = model.vision_model.encoder.final_layernorm
+    out += [('final', 'ln_w', 'bf16', bf(fln.weight.data)),
+            ('final', 'ln_b', 'bf16', bf(fln.bias.data))]
+    return out
 
-    fln = enc.final_layernorm
-    ue.mv_final_ln_w = store_weight(ue, fln.weight.data.to(torch.bfloat16).contiguous())
-    ue.mv_final_ln_b = store_weight(ue, fln.bias.data.to(torch.bfloat16).contiguous())
-    print(f"  MoonViT weights loaded: {len(ue.mv_layer_addrs)} layers ({precision}); "
+
+def _store_moonvit_weights(ue, prepared, cfg):
+    """Replay a prepared list into params DRAM, recording addresses into
+    ue.mv_layer_addrs / ue.mv_final_*. Deterministic store order = stable addresses."""
+    depth = _vis_dims(cfg)["depth"]
+    ue.mv_layer_addrs = [{} for _ in range(depth)]
+    import numpy as np
+    for scope, name, kind, payload in prepared:
+        if kind == 'mat' and ue.mv_precision == "if4":
+            arr = payload if isinstance(payload, np.ndarray) else np.frombuffer(payload, dtype=np.uint8)
+            sa, da = store_quantized_weight(ue, arr)
+            ue.mv_layer_addrs[scope][f'{name}_scale'] = sa
+            ue.mv_layer_addrs[scope][f'{name}_data'] = da
+        elif kind == 'mat':                      # bf16 matmul weight
+            ue.mv_layer_addrs[scope][f'{name}_weight'] = store_weight(ue, payload)
+        elif scope == 'final':
+            setattr(ue, f'mv_final_{name}', store_weight(ue, payload))
+        else:                                    # per-layer bf16 bias/norm
+            ue.mv_layer_addrs[scope][name] = store_weight(ue, payload)
+
+
+def moonvit_load_weights(ue, model, cfg, precision="if4"):
+    """Prepare (or load cached) MoonViT weights, then store to params DRAM. The prepared
+    blobs are cached to disk so repeat runs skip padding/reorder/quantization (and don't
+    need `model` for weights). Big matmuls are if4 by default; biases/norms stay bf16."""
+    ue.mv_precision = precision
+    os.makedirs(_BIN_DIR, exist_ok=True)
+    cache = os.path.join(_BIN_DIR, f"moonvit_weights_{precision}.pt")
+    if os.path.exists(cache):
+        prepared = torch.load(cache, weights_only=False)
+        print(f"  MoonViT weights: loaded prepared cache {os.path.basename(cache)}")
+    else:
+        assert model is not None, "no weight cache and no model to prepare from"
+        prepared = _prepare_moonvit_weights(model, cfg, precision)
+        torch.save(prepared, cache)
+        print(f"  MoonViT weights: prepared from model -> cached {os.path.basename(cache)}")
+    _store_moonvit_weights(ue, prepared, cfg)
+    print(f"  MoonViT weights stored: {len(ue.mv_layer_addrs)} layers ({precision}); "
           f"params DRAM usage: {ue.get_params_dram_usage()/1048576:.0f} MB")
 
 
@@ -356,6 +387,21 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     from user_dma_core import TYPE
     prec = getattr(ue, "mv_precision", "if4")
 
+    # --- program (instruction) cache: keyed on seq + precision; bakes in the (deterministic)
+    # weight/tensor addresses + absolute jumps, so reload is valid only when load_weights/
+    # setup_dram ran first and the program lands at the same addr (deterministic alloc order). ---
+    os.makedirs(_BIN_DIR, exist_ok=True)
+    cache_bin = os.path.join(_BIN_DIR, f"moonvit_encoder_N{N}_{prec}.bin")
+    if os.path.exists(cache_bin):
+        with open(cache_bin, "rb") as f:
+            prog = f.read()
+        program_addr = ue.get_program_dram_addr()
+        ue.dma_write(DMA_DEVICE_H2C, program_addr, prog, len(prog))
+        ue.allocate_program_dram(len(prog))
+        print(f"  MoonViT encoder: loaded cached program {os.path.basename(cache_bin)} "
+              f"({len(prog)} bytes = {len(prog)//32} instructions)")
+        return program_addr
+
     def _mm(M, K, Nn, A, name, la, OUT, bias=None, gelu=False):
         """Precision-aware matmul: if4 (quantized B + scale) or bf16."""
         if prec == "if4":
@@ -459,7 +505,10 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     ue.dma_write(DMA_DEVICE_H2C, program_addr, prog, len(prog))
     ue.allocate_program_dram(len(prog))
     ue.clear_capture_buffer()
-    print(f"  MoonViT encoder compiled: {len(prog)} bytes, {depth} layers (single stream)")
+    with open(cache_bin, "wb") as f:                 # cache for fast reload next run
+        f.write(bytes(prog))
+    print(f"  MoonViT encoder compiled: {len(prog)} bytes = {len(prog)//32} instructions, "
+          f"{depth} layers (single stream) -> cached {os.path.basename(cache_bin)}")
     return program_addr
 
 

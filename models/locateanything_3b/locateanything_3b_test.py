@@ -90,13 +90,13 @@ def main():
     ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "vette.jpg"))
     ap.add_argument("--prompt-kind", default="detect",
                     choices=["detect", "ground_multi", "ground_one", "point"])
-    ap.add_argument("--query", default="car")
+    ap.add_argument("--query", default="sports car")
     ap.add_argument("--check-connector", action="store_true",
                     help="diff FPGA connector output vs the bit-exact GPU connector")
-    ap.add_argument("--fpga-vision", action="store_true",
-                    help="run MoonViT on the FPGA (stitched op flow) instead of the GPU")
+    ap.add_argument("--gpu-vision", action="store_true",
+                    help="run MoonViT on the GPU instead of the FPGA (FPGA is the default)")
     ap.add_argument("--check-vision", action="store_true",
-                    help="with --fpga-vision: parity-check FPGA vit[N,4608] vs the GPU reference")
+                    help="parity-check FPGA vit[N,4608] vs the GPU reference")
     ap.add_argument("--vision-precision", default="if4", choices=["if4", "bf16"],
                     help="MoonViT encoder weight precision (if4 fits the params window; "
                          "bf16 ~0.98GB may overflow)")
@@ -112,7 +112,7 @@ def main():
     args = ap.parse_args()
 
     # ---- 1. Vision prep (build model, process image, tokenize) ----
-    fpga_vision = args.fpga_vision
+    fpga_vision = not args.gpu_vision          # FPGA MoonViT is the default path
     want_gpu_vit = (not fpga_vision) or args.check_vision
     mode = "FPGA MoonViT" if fpga_vision else "GPU MoonViT"
     print(f"=== Vision: {mode} -> FPGA connector + decoder ===")
@@ -278,12 +278,23 @@ def main():
     print("\n=== Decode ===")
     da, gpt = ue.compile_decoder()
     ue._rope_offset = 0  # plain 1D rope, sequential positions (no mRoPE)
-    import io, contextlib
+    # Tee decode stdout: stream to the terminal live AND capture it for the overlay.
+    import io, sys, contextlib
+
+    class _Tee(io.TextIOBase):
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, s):
+            for st in self.streams:
+                st.write(s); st.flush()
+            return len(s)
+
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    real = sys.stdout
+    with contextlib.redirect_stdout(_Tee(real, buf)):
         ue.run_decoder(da, token_id=prefill_seq[-1], gflops=gpt, repetition_penalty=1.0)
     answer = buf.getvalue()
-    print("OUTPUT:", answer.strip())
+    print("\nOUTPUT:", answer.strip())
 
     # ---- 5. Draw overlay (reuse cpu_test renderer) ----
     import re
