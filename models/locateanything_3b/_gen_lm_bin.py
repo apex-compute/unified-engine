@@ -49,9 +49,11 @@ def _pad_vocab(t):
 #   language_model.layers.{i}.input_layernorm.weight         (bf16)
 #   language_model.norm.weight                               (bf16)
 #   lm_head.weight.if4                                       (quantized, tied)
-# q/k/gate/up/down weights are quantized; v/o weights, biases, norms, embed bf16.
+# q/k/gate/up weights are quantized; v/o AND down_proj weights, biases, norms,
+# embed bf16. (LA fork: down_proj moved to bf16 vs the Qwen baseline — must stay
+# in sync with la_decoder_engine.py::_LM_QUANT_LAYERS and the down_weight loader.)
 _LM_QUANT_SUFFIXES = ('self_attn.q_proj.weight', 'self_attn.k_proj.weight',
-                      'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight')
+                      'mlp.gate_proj.weight', 'mlp.up_proj.weight')
 
 
 def _qs_pack(precision, tensor):
