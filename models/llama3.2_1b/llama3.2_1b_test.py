@@ -955,14 +955,14 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(0x20000, 0, ahd)
                     self.overwrite_instruction_with_general_register(self.TMP_REG)
 
-                    # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q → decoder_attn
+                    # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q base (no kv_h offset)
                     # KV head kv_h → Q group g = kv_h//2; sub_idx = (kv_h%2)*qpkv + q
                     g_for_kv = kv_h // 2
                     local_kv = kv_h % 2
                     q_g_addr = self.LAYER0_Q_DRAM + g_for_kv * hd * bpe
                     for q in range(qpkv):
                         sub_idx = local_kv * qpkv + q
-                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + (kv_h * qpkv + q) * ahd * bpe
+                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
                         self.accelerator_memory_to_sram(
                             q_g_addr + sub_idx * half_ahd * bpe, 0x30000, half_ahd)
                         self.accelerator_memory_to_sram(
@@ -976,15 +976,20 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         seq_len=self.MAX_CONTEXT_SIZE,
                         gpr_bucket_idx=self.gpr_bucket_idx,
                         num_buckets=(self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,
-                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM + kv_h * qpkv * ahd * bpe,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
                         K_DRAM_ADDR=k_cache_base,
                         V_DRAM_ADDR=v_cache_base,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
                         IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                         SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                         BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     )
                     total_flops += attn_flops[-1]
+                    # Copy per-head output to its slot in FLASH_OUTPUT_DRAM.
+                    self.accelerator_memory_to_sram(
+                        self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
+                    self.sram_to_accelerator_memory(
+                        0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
                 total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
