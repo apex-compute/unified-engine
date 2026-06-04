@@ -15,6 +15,8 @@ clean:
 	rm -rf models/gpt2/gpt2_bin/
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
+	rm -f models/llama3.2_3b/llama3.2_3b_bin/ llama3.2_3b_instruction_fpgapenalty.bin
+	# rm -f models/locateanything_3b/locateanything_3b_bin/
 	rm -rf models/mobilesam/mobilesam_bin/
 	rm -f models/parakeet/parakeet_bin/*.bin
 	rm -f models/parakeet/parakeet_bin/*.json
@@ -22,7 +24,8 @@ clean:
 	rm -f models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/*.json
 	rm -f models/qwen3_1.7b/qwen3_1.7b_bin/qwen3_1.7b_instruction*
 	rm -f models/qwen3_4b/qwen3_4b_bin/qwen3_4b_instruction*
-	rm -rf models/smolvlm2/smolvlm2_bin/
+	rm -rf models/smolvlm2/smolvlm2_bin/*.bin
+	rm -rf models/smolvlm2/smolvlm2_bin/*.json
 	rm -rf models/swin/swin_bin/
 
 load_drivers:
