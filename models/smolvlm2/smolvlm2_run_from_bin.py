@@ -519,6 +519,15 @@ def build_input_ids(tokenizer, prompt: str, has_image: bool = True) -> list:
 # =============================================================================
 # Main
 # =============================================================================
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
+
 def main():
     import argparse
 
@@ -528,7 +537,8 @@ def main():
     parser.add_argument("--prompt", type=str, default=_d["prompt"])
     parser.add_argument("--image", type=str, default=os.path.join(_root, _d["image"]))
     parser.add_argument("--dev", type=str, default=_d["dev"])
-    parser.add_argument("--cycle", type=float, default=_d["cycle_ns"])
+    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"])
     parser.add_argument("--vision-fp4", action="store_true")
     args = parser.parse_args()
@@ -556,7 +566,13 @@ def main():
         return
 
     set_dma_device(args.dev)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     _SILENT_MODE = True
 
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir, vision_bf16=not args.vision_fp4)

@@ -24,7 +24,7 @@ Weights:
 Usage:
   python llama3.2_3b_test.py
   python llama3.2_3b_test.py --prompt "your prompt"
-  python llama3.2_3b_test.py --dev xdma0 [--cycle 5.88]
+  python llama3.2_3b_test.py --dev xdma0 [--cycle 5.15]
   python llama3.2_3b_test.py --local-weights
 """
 
@@ -1326,13 +1326,23 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-3B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_3b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
-    parser.add_argument('--cycle', type=float, default=1/0.17, help='Clock cycle time in ns (default: ~5.88ns)')
+    parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly (no logit readback), fully
     # deterministic (separate _fpgapenalty bin). --pure-greedy disables it entirely.
@@ -1340,9 +1350,6 @@ def main():
                         help='Disable the on-FPGA repetition penalty entirely — plain greedy decode '
                              '(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy '
                              'only for the A/B baseline and the compare/calibration tool.')
-    # On-FPGA repetition penalty parameters (active unless --pure-greedy). The penalty is folded into
-    # the LM-head matmul bias (on-chip argmax of logits+bias, no logit readback). Validated 3B params
-    # (logit_max~26.9, gap~4.25): alpha=1.0. See notes_repetition_penalty_fpga_bias.md.
     pen_group = parser.add_argument_group('on-FPGA repetition penalty (active unless --pure-greedy)')
     pen_group.add_argument('--greedy-until', type=int, default=512,
                         help='Pure greedy for the first N decoded tokens (correct math/reasoning, '
@@ -1354,7 +1361,7 @@ def main():
                         help='max |bias| per token (floor on -alpha*count). Default 20.')
     pen_group.add_argument('--rep-window', type=int, default=256,
                         help='count tokens over the last N (never penalizes punctuation/whitespace/'
-                             'special tokens). Default 256.')
+                             'special tokens). Default 256. Validated 3B params: see notes_repetition_penalty_fpga_bias.md.')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1371,8 +1378,13 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Using DMA device: {args.dev}, CLOCK_CYCLE_TIME_NS={user_dma_core.CLOCK_CYCLE_TIME_NS}")
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)

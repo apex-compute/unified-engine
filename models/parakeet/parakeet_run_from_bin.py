@@ -450,12 +450,22 @@ def check_bins_early():
     return missing
 
 
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Parakeet-TDT-0.6B inference from pre-compiled bins")
     parser.add_argument("--audio", type=str, default=None)
     parser.add_argument("--dev", type=str, default="xdma0")
-    parser.add_argument("--cycle", type=float, default=5.63)
+    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     parser.add_argument("--max-seconds", type=float, default=None)
     args = parser.parse_args()
 
@@ -468,7 +478,13 @@ def main():
 
     cfg = load_config()
     set_dma_device(args.dev)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     audio_path = args.audio or os.path.join(SCRIPT_DIR, cfg["defaults"]["default_audio"])
     assert os.path.exists(audio_path), f"Audio file not found: {audio_path}"
@@ -490,7 +506,7 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
 
-    engine = Parakeet_UnifiedEngine(clock_period_ns=args.cycle)
+    engine = Parakeet_UnifiedEngine(clock_period_ns=clock)
 
     import numpy as np
     if waveform.shape[0] > 1:
@@ -558,7 +574,7 @@ def main():
     dur_prog       = loaded["dur"]
     restore_prog   = loaded["restore"]
 
-    engine2 = Parakeet_UnifiedEngine(clock_period_ns=args.cycle, engine_slave=True)
+    engine2 = Parakeet_UnifiedEngine(clock_period_ns=clock, engine_slave=True)
     engine2.copy_dram_layout(engine)
     # Slave engine: only use if programs were compiled for the slave base address.
     # programs_slave.bin copied from programs.bin has JUMPs targeting the wrong base,

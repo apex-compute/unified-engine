@@ -5,7 +5,7 @@ Encoder + mask decoder compiled into instruction streams and
 executed on the Unified Engine accelerator.
 
 Usage:
-    python mobilesam_test.py [--dev xdma0] [--freq 194]
+    python mobilesam_test.py [--dev xdma0] [--device kintex7] [--cycle 5.15]
 """
 
 import argparse
@@ -3033,17 +3033,33 @@ def _bn_fold(w_conv, bn_w, bn_b, bn_mean, bn_var, eps=1e-5):
     w_fused = w_conv * scale[:, None, None, None]               # broadcast over kH,kW,C_in
     b_fused = bn_b - bn_mean * scale
     return w_fused.to(torch.bfloat16), b_fused.to(torch.bfloat16)
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
+
 def main():
     parser = argparse.ArgumentParser(description="MobileSAM mask decoder accelerator test")
     parser.add_argument("--dev",   default="xdma0")
-    parser.add_argument("--freq",  type=float, default=194.0, help="Clock frequency MHz")
+    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     parser.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"),
                         default=[512, 512],
                         help="Single-point inference: encode image, run decoder for this point, save best mask")
     args = parser.parse_args()
 
     set_dma_device(args.dev)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = 1e3 / args.freq
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     if not os.path.exists(WEIGHTS):
         import urllib.request
@@ -3056,7 +3072,7 @@ def main():
         _original_print("  Download complete.")
 
     _original_print("MobileSAM — HW test")
-    _original_print(f"  Device: {args.dev}  Freq: {args.freq} MHz")
+    _original_print(f"  Device: {args.dev}  clock={clock:.4f} ns")
 
     # ---- Inputs ----
     from PIL import Image as _PIL_Image

@@ -2055,6 +2055,15 @@ def _verify_prefill_cpu(ue, token_ids, hw_first_token, model_dir, image_path, pr
 # =============================================================================
 # Main
 # =============================================================================
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
+
 def main():
     import argparse
     from user_dma_core import set_dma_device
@@ -2066,7 +2075,8 @@ def main():
     parser.add_argument("--prompt", type=str, default=_d["prompt"], help="Text prompt")
     parser.add_argument("--image", type=str, default=os.path.join(_root, _d["image"]), help="Path to image file (None for text-only)")
     parser.add_argument("--dev", type=str, default=_d["dev"], help="DMA device name")
-    parser.add_argument("--cycle", type=float, default=_d["cycle_ns"], help="Clock cycle time in ns")
+    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"], help="Max sequence length")
     parser.add_argument("--vision-fp4", action="store_true", help="Use FP4 quantized weights for vision encoder (default: BF16)")
     parser.add_argument("--debug", action="store_true", help="Staged NaN/cosine localizer: verify vision + per-layer prefill_v2 vs HF CPU reference, then exit (no decode)")
@@ -2109,7 +2119,13 @@ def main():
 
     # --- Hardware inference ---
     set_dma_device(args.dev)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir, vision_bf16=not args.vision_fp4)

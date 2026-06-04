@@ -6514,7 +6514,7 @@ class UnifiedEngine:
         group_flops += 2 * 1 * seq_len * head_dim
         return group_size * group_flops
 
-    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False) -> None:
+    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, write_back_disable: bool = False) -> None:
         """Quantized matrix-matrix multiplication core.
         Args:
             M: batch dimension (number of input vectors)
@@ -6627,11 +6627,12 @@ class UnifiedEngine:
                                                                 lalu_b=lalu_b)
                     max_clear_en = 0
 
-                self.sram_to_accelerator_memory(sram_address=0x80000,
-                                                accelerator_dram_address=OUTPUT_DRAM_ADDR + (M_chunk_idx * N + N_chunk_idx) * bytes_per_element,
-                                                element_size=M_chunk_size * N_take_size,
-                                                stride_bytes_per_chunk=N_take_size * bytes_per_element,
-                                                stride_jump_bytes=N * bytes_per_element)
+                if not write_back_disable:
+                    self.sram_to_accelerator_memory(sram_address=0x80000,
+                                                    accelerator_dram_address=OUTPUT_DRAM_ADDR + (M_chunk_idx * N + N_chunk_idx) * bytes_per_element,
+                                                    element_size=M_chunk_size * N_take_size,
+                                                    stride_bytes_per_chunk=N_take_size * bytes_per_element,
+                                                    stride_jump_bytes=N * bytes_per_element)
 
         total_flops = 2 * M * N * K
         if bias_enable:
