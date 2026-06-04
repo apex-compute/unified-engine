@@ -15,18 +15,16 @@ running ``llama3.2_3b_test.py`` once on a build machine that has HF access):
   * ``Llama-3.2-3B-Instruct/``       tokenizer files only (tokenizer.json /
                                      tokenizer_config.json). Model weights NOT needed.
 
-Design mirrors test.py §A–§D (see notes_llama3.2_3b.md): full-4 GB DRAM layout,
-dynamic-PBI single bin (GPR-primed preamble + jump_abs), prefill_context_size=128,
-and sampling decode (recency-decayed / windowed / structural-exempt repetition
-penalty). DECODE DEFAULT is a position-gated HYBRID (temp 0): pure greedy for the first
-greedy_until (512) tokens — correct math/reasoning — then repetition penalty 1.2 breaks
-long-context loops; deterministic, see notes §D. The shipped bin is compiled with LM-head
-writeback enabled, so sampling (temp>0), the hybrid, and pure greedy (rep-pen 1.0) all work.
+Design mirrors test.py (see notes_llama3.2_3b.md): full-4 GB DRAM layout, dynamic-PBI single
+bin (GPR-primed preamble + jump_abs), prefill_context_size=128. DECODE DEFAULT is deterministic:
+pure greedy for the first greedy_until (512) tokens — correct math/reasoning — then the on-FPGA
+repetition penalty (LM-head matmul bias) breaks long-context loops. No host penalty / sampling.
+See notes_repetition_penalty_fpga_bias.md.
 
 Usage:
   python llama3.2_3b_run_from_bin.py
   python llama3.2_3b_run_from_bin.py --prompt "your question"
-  python llama3.2_3b_run_from_bin.py --temperature 0 --dev xdma0     # greedy
+  python llama3.2_3b_run_from_bin.py --pure-greedy --dev xdma0     # plain greedy (no penalty)
 """
 
 import json
@@ -286,6 +284,10 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
         self.LAYER0_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.OUTPUT_NORM_DRAM = self.allocate_tensor_dram(1 * self.vector_length * self.bytes_per_element)
         self.LOGITS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
+        # On-FPGA repetition-penalty bias (the LM-head matmul's C term, bias_mode="broadcast_N").
+        # MUST be allocated here, immediately after LOGITS_DRAM and last — identical order/size to
+        # llama3.2_3b_test.py — so its baked address matches the fpga-penalty bin. all-zero = no penalty.
+        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
         _original_print(f"    Tensor dram end 0x{self.get_tensor_dram_addr():X}, usage {self.get_tensor_dram_usage()} bytes")
 
     # ---- sampling (identical mechanism to test.py §D) -----------------------
@@ -313,47 +315,24 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
             self._struct_ids_tensor_cache = t
         return t
 
-    def sample_next_token(self, prev_tokens) -> int:
-        """Read the full logits row from LOGITS_DRAM and sample with the configured
-        temperature / top_k / top_p / repetition_penalty (recency-decayed, windowed,
-        structural-exempt). Greedy (temperature<=0) is handled by the caller via the
-        HW argmax register, so this assumes sampling is on."""
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """On-FPGA repetition penalty: build the per-vocab additive bias from the windowed token
+        frequency and DMA it to PENALTY_BIAS_DRAM (the LM-head matmul's C term, bias_mode="broadcast_N").
+        bias[t] = clamp(-alpha*count[t], min=-cap); structural tokens stay 0. The HW argmax of
+        (logits + bias) then returns the penalized token id — no logit readback. Identical formula to
+        llama3.2_3b_test.py._write_penalty_bias (the bin compiled there bakes this contract)."""
         vocab = self.EMBEDDING_ELEMENTS
-        bpe = self.bytes_per_element
-        buf = torch.empty(vocab, dtype=torch.bfloat16)
-        self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
-        logits = buf.float()
-        # Recency-decayed frequency repetition penalty over the last rep_window tokens,
-        # exempting structural/special tokens. See notes_llama3.2_3b.md §D.
-        rep_pen = float(getattr(self, "repetition_penalty", 1.0))
-        if rep_pen != 1.0 and prev_tokens:
-            rep_window = int(getattr(self, "rep_window", 256))
-            rep_decay = float(getattr(self, "rep_decay", 0.97))
-            window = torch.tensor(prev_tokens[-rep_window:], dtype=torch.long)
-            L = window.numel()
-            ages = torch.arange(L - 1, -1, -1, dtype=torch.float32)
-            contrib = rep_decay ** ages
-            weight = torch.zeros(vocab, dtype=torch.float32)
-            weight.index_add_(0, window, contrib)
-            weight[self._structural_ids_tensor()] = 0.0
-            nz = weight > 0
-            if bool(nz.any()):
-                factor = rep_pen ** weight[nz]
-                v = logits[nz]
-                logits[nz] = torch.where(v > 0, v / factor, v * factor)
-        # Deterministic selection: argmax of the (penalty-adjusted) logits.
-        return int(logits.argmax().item())
-        # --- Sampling mechanism (DISABLED) — uncomment + set temperature>0 to re-enable ---
-        # logits = logits / float(getattr(self, "temperature", 1.0))            # temperature
-        # top_k = int(getattr(self, "top_k", 0) or 0)                           # top-k filter
-        # if top_k > 0 and top_k < vocab:
-        #     logits[logits < torch.topk(logits, top_k).values[-1]] = float("-inf")
-        # top_p = float(getattr(self, "top_p", 1.0))                            # top-p (nucleus)
-        # if 0.0 < top_p < 1.0:
-        #     sl, si = torch.sort(logits, descending=True)
-        #     keep = torch.cumsum(torch.softmax(sl, -1), -1) <= top_p; keep[0] = True
-        #     logits[si[~keep]] = float("-inf")
-        # return int(torch.multinomial(torch.softmax(logits, -1), 1).item())    # sample
+        alpha = float(getattr(self, "pen_alpha", 1.0))
+        cap = float(getattr(self, "pen_cap", 20.0))
+        W = int(getattr(self, "rep_window", 256))
+        window = prev_tokens[-W:]
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0
+        bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
 
     # ---- run path (dynamic-PBI single bin: preamble + jump_abs) -------------
     def run_llama(self) -> None:
@@ -363,6 +342,14 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
         paths_cfg = self._cfg.get("paths", {})
         meta_path = os.path.join(self.script_dir,
                                  paths_cfg.get("instruction_meta", "llama3.2_3b_bin/llama_instruction.json"))
+        if bool(getattr(self, "fpga_penalty", False)):
+            # On-FPGA penalty uses a separate bin (LM-head matmul bias on / logit writeback off);
+            # its meta points to the _fpgapenalty bin. Compiled by llama3.2_3b_test.py (default).
+            meta_path = meta_path.replace(".json", "_fpgapenalty.json")
+            if not os.path.exists(meta_path):
+                raise FileNotFoundError(
+                    f"on-FPGA penalty bin meta not found: {meta_path}\n"
+                    f"  build it with:  python llama3.2_3b_test.py")
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -425,11 +412,16 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
 
         if not hasattr(self, "_generated_tokens"):
             self._generated_tokens = list(self.prefill_seq)
-        # Position-gated hybrid decode (deterministic): PURE greedy (HW argmax) for the first
+        # Position-gated decode (deterministic): PURE greedy (HW argmax) for the first
         # `greedy_until` decoded tokens — correct math/reasoning, which lands early — then the
-        # repetition penalty turns on to break long-context loops.
-        _rep_pen = float(getattr(self, "repetition_penalty", 1.0))
+        # on-FPGA repetition penalty turns on to break long-context loops.
         _greedy_until = int(getattr(self, "greedy_until", 0))
+        # On-FPGA penalty: the LM-head matmul adds PENALTY_BIAS_DRAM (its C bias) so the HW argmax
+        # already returns the penalized token. Zero the buffer first → pure greedy until the gate.
+        _fpga_penalty = bool(getattr(self, "fpga_penalty", False))
+        if _fpga_penalty:
+            self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                           torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
 
         import shutil
         _use_status = sys.stdout.isatty()
@@ -475,14 +467,18 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            # On-FPGA penalty: refresh the per-vocab bias (this step's LM-head matmul C term) from the
+            # windowed token frequency once past the gate, so the HW argmax of (logits + bias) returns
+            # the penalized token directly — no logit readback.
+            if _fpga_penalty and (self.seq_len - prefill_seq_len) > _greedy_until:
+                self._write_penalty_bias(self._generated_tokens)
+
             self.program_execute(preamble_addr, flops=decoder_flops_per_token)
-            # Hybrid gate: pure HW argmax for the first `greedy_until` decoded tokens, then the
-            # repetition penalty (read logits, argmax of penalized logits).
-            _penalty_active = _rep_pen != 1.0 and (self.seq_len - prefill_seq_len) > _greedy_until
-            if _penalty_active:
-                token_id = self.sample_next_token(self._generated_tokens)
-            else:
-                token_id = self.get_arg_max_index(rank=1)
+            # Token selection: read the HW argmax register. In penalty mode the LM-head matmul
+            # already added the bias, so the register holds the penalized token; in plain mode it's
+            # pure greedy. No logit readback. (The compare/calibration tool overrides
+            # get_arg_max_index to apply a host-side penalty against the writeback-on plain bin.)
+            token_id = self.get_arg_max_index(rank=1)
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -505,14 +501,18 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
                         f"total {self.seq_len} tokens.")
 
 
-def _verify_artifacts(script_dir: str, cfg: dict) -> None:
+def _verify_artifacts(script_dir: str, cfg: dict, fpga_penalty: bool = False) -> None:
     """Hard-fail before any FPGA touch if a required artifact is missing."""
     paths = cfg["paths"]
+    inst_bin, inst_meta = paths["instruction_bin"], paths["instruction_meta"]
+    if fpga_penalty:  # on-FPGA penalty loads the _fpgapenalty bin/meta (test.py default)
+        inst_bin = inst_bin.replace(".bin", "_fpgapenalty.bin")
+        inst_meta = inst_meta.replace(".json", "_fpgapenalty.json")
     required = [
         ("llama3.2_3b_config.json", "model config"),
         (paths["weights_bin"], "weight bin"),
-        (paths["instruction_bin"], "unified instruction bin"),
-        (paths["instruction_meta"], "instruction bin meta"),
+        (inst_bin, "unified instruction bin"),
+        (inst_meta, "instruction bin meta"),
     ]
     tok_dir = os.path.join(script_dir, paths["hf_model_dir"])
     missing = [f"  {rel}   ({label})" for rel, label in required
@@ -536,30 +536,32 @@ def main():
                         help="Text prompt (tokenized via the local chat template). Overrides the config default.")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device name. Default: xdma0.")
     parser.add_argument("--cycle", type=float, default=1 / 0.17, help="Clock cycle time in ns. Default ~5.88.")
-    # Decode — defaults match llama3.2_3b_test.py: hybrid (temp 0: greedy then rep-pen 1.2); see notes §D.
-    # --- Sampling controls (DISABLED) — uncomment + restore the sampling block in
-    #     sample_next_token() to re-enable stochastic sampling ---
-    # parser.add_argument("--temperature", type=float, default=0.0, help=">0 enables sampling.")
-    # parser.add_argument("--top-k", type=int, default=40, help="Top-k filter (sampling only).")
-    # parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus filter (sampling only).")
-    parser.add_argument("--repetition-penalty", type=float, default=1.2,
-                        help="Recency-decayed repetition penalty (>1 down-weights repeats). Default 1.2.")
-    parser.add_argument("--rep-window", type=int, default=256,
-                        help="Repetition penalty look-back window in tokens. Default 256.")
-    parser.add_argument("--rep-decay", type=float, default=0.97,
-                        help="Recency decay for the repetition penalty (per-token age). Default 0.97.")
-    # parser.add_argument("--seed", type=int, default=None, help="RNG seed (sampling only).")
-    parser.add_argument("--greedy-until", type=int, default=512,
-                        help="Hybrid decode (temp 0): pure greedy for the first N decoded tokens "
-                             "(correct math/reasoning), then the repetition penalty breaks long-context "
-                             "loops. 0 = penalty from the start. Default 512.")
+    # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
+    # matmul bias so the HW argmax returns the penalized token directly (no logit readback); loads the
+    # _fpgapenalty bin. --pure-greedy disables it entirely (plain writeback-on bin).
+    parser.add_argument("--pure-greedy", action="store_true",
+                        help="Disable the on-FPGA repetition penalty entirely — plain greedy decode "
+                             "(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy "
+                             "only for the A/B baseline and the compare/calibration tool.")
+    # On-FPGA repetition penalty parameters (active unless --pure-greedy).
+    pen_group = parser.add_argument_group("on-FPGA repetition penalty (active unless --pure-greedy)")
+    pen_group.add_argument("--greedy-until", type=int, default=512,
+                        help="Pure greedy for the first N decoded tokens (correct math/reasoning), "
+                             "then the penalty breaks long-context loops. "
+                             "0 = penalty from the start. Default 512.")
+    pen_group.add_argument("--pen-alpha", type=float, default=1.0,
+                        help="bias[t] = -alpha*count[t] (logit units). Default 1.0.")
+    pen_group.add_argument("--pen-cap", type=float, default=20.0,
+                        help="max |bias| per token (floor on -alpha*count). Default 20.")
+    pen_group.add_argument("--rep-window", type=int, default=256,
+                        help="count tokens over the last N. Default 256.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
 
     # Hard-fail BEFORE touching the FPGA if any artifact is missing.
-    _verify_artifacts(script_dir, cfg)
+    _verify_artifacts(script_dir, cfg, fpga_penalty=not bool(args.pure_greedy))
 
     set_dma_device(args.dev)
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
@@ -587,19 +589,20 @@ def main():
         prefill_seq = tuple(cfg["default_prefill_tokens"])
 
     ue.prefill_seq = prefill_seq
-    # Sampling controls (temperature/top_k/top_p/seed) disabled — decode is deterministic.
-    ue.repetition_penalty = float(args.repetition_penalty)
-    ue.rep_window = int(args.rep_window)
-    ue.rep_decay = float(args.rep_decay)
+    # Decode config — deterministic, on-FPGA penalty only (no host penalty / sampling).
     ue.greedy_until = int(args.greedy_until)
+    ue.fpga_penalty = not bool(args.pure_greedy)   # selects the _fpgapenalty bin + matmul-bias path
+    ue.pen_alpha = float(args.pen_alpha)
+    ue.pen_cap = float(args.pen_cap)
+    ue.rep_window = int(args.rep_window)
     ue._generated_tokens = list(prefill_seq)
-    _penalty_used = ue.repetition_penalty != 1.0
-    _tail = (f"penalty (rep_pen={ue.repetition_penalty}) after {ue.greedy_until} tokens"
-             if _penalty_used else "no penalty")
-    _original_print(f"Decode: greedy (deterministic) — pure greedy then {_tail}")
-    if _penalty_used:
+    if ue.fpga_penalty:
+        _original_print(f"Decode: ON-FPGA penalty (bias in LM-head matmul) — pure greedy for "
+                        f"{ue.greedy_until} tokens, then alpha={ue.pen_alpha} cap={ue.pen_cap} window={ue.rep_window}")
         _n = len(ue._structural_token_ids())  # precompute upfront (no mid-decode stall)
-        _original_print(f"  repetition penalty exempts {_n} structural/special tokens")
+        _original_print(f"  penalty exempts {_n} structural/special tokens")
+    else:
+        _original_print("Decode: plain greedy (deterministic) — no penalty (writeback-on bin)")
 
     ue.run_llama()
     ue.clear_dram()
