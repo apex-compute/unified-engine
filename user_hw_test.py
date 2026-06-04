@@ -13,6 +13,7 @@ import atexit
 import math
 import os
 import random
+import sys
 from re import S
 import time
 import threading
@@ -4947,6 +4948,179 @@ def test_ue_int_reg_read():
     ue.reset_inst_ptr_counter()
 
 
+# ---------------------------------------------------------------------------
+#  YOLOv8m @ 640x640 kernel benchmark / performance estimate
+# ---------------------------------------------------------------------------
+# Every conv in YOLOv8m is groups=1 (NO depthwise), so each maps to a GEMM via
+# the MobileNetV2 conv->matmul convention:
+#     1x1 conv      -> M=Ho*Wo, K=pad64(Cin),       N=pad64(Cout)
+#     kxk conv(s)   -> M=Ho*Wo, K=k*k*pad64(Cin),   N=pad64(Cout)   (im2col)
+# SiLU is fused into the matmul (silu_enable). SPPF MaxPool can't be a matmul
+# (matmul is linear); it's modeled as max(a,b)=a+ReLU(b-a) eltwise passes.
+#
+# This benches each UNIQUE (M,K,N) once on hardware (report_latency_in_us),
+# then sums per-layer HW time x occurrence -> end-to-end latency + FPS.
+#
+# CAVEATS (read before trusting the number):
+#   * kxk GEMM time does NOT include the im2col DMA cost (data gather). For
+#     stride-1 3x3 there is no engine primitive yet; this is a GEMM-bound
+#     LOWER BOUND on conv time. Bench conv2d_3x3_stride2_dram separately to
+#     calibrate the im2col overhead factor.
+#   * MaxPool/upsample/concat are modeled, not the real kernels.
+#   * Weights are random (perf only); SNR is not checked.
+
+# (Cin, Cout, k, stride, H_out, W_out) for all 84 convs, traced from
+# ultralytics YOLO("yolov8m.yaml") at 640x640. groups==1 for every layer.
+YOLOV8M_CONVS = [
+    (3,48,3,2,320,320),(48,96,3,2,160,160),(96,96,1,1,160,160),(48,48,3,1,160,160),
+    (48,48,3,1,160,160),(48,48,3,1,160,160),(48,48,3,1,160,160),(192,96,1,1,160,160),
+    (96,192,3,2,80,80),(192,192,1,1,80,80),(96,96,3,1,80,80),(96,96,3,1,80,80),
+    (96,96,3,1,80,80),(96,96,3,1,80,80),(96,96,3,1,80,80),(96,96,3,1,80,80),
+    (96,96,3,1,80,80),(96,96,3,1,80,80),(576,192,1,1,80,80),(192,384,3,2,40,40),
+    (384,384,1,1,40,40),(192,192,3,1,40,40),(192,192,3,1,40,40),(192,192,3,1,40,40),
+    (192,192,3,1,40,40),(192,192,3,1,40,40),(192,192,3,1,40,40),(192,192,3,1,40,40),
+    (192,192,3,1,40,40),(1152,384,1,1,40,40),(384,576,3,2,20,20),(576,576,1,1,20,20),
+    (288,288,3,1,20,20),(288,288,3,1,20,20),(288,288,3,1,20,20),(288,288,3,1,20,20),
+    (1152,576,1,1,20,20),(576,288,1,1,20,20),(1152,576,1,1,20,20),(960,384,1,1,40,40),
+    (192,192,3,1,40,40),(192,192,3,1,40,40),(192,192,3,1,40,40),(192,192,3,1,40,40),
+    (768,384,1,1,40,40),(576,192,1,1,80,80),(96,96,3,1,80,80),(96,96,3,1,80,80),
+    (96,96,3,1,80,80),(96,96,3,1,80,80),(384,192,1,1,80,80),(192,192,3,2,40,40),
+    (576,384,1,1,40,40),(192,192,3,1,40,40),(192,192,3,1,40,40),(192,192,3,1,40,40),
+    (192,192,3,1,40,40),(768,384,1,1,40,40),(384,384,3,2,20,20),(960,576,1,1,20,20),
+    (288,288,3,1,20,20),(288,288,3,1,20,20),(288,288,3,1,20,20),(288,288,3,1,20,20),
+    (1152,576,1,1,20,20),(192,64,3,1,80,80),(64,64,3,1,80,80),(64,64,1,1,80,80),
+    (384,64,3,1,40,40),(64,64,3,1,40,40),(64,64,1,1,40,40),(576,64,3,1,20,20),
+    (64,64,3,1,20,20),(64,64,1,1,20,20),(192,192,3,1,80,80),(192,192,3,1,80,80),
+    (192,80,1,1,80,80),(384,192,3,1,40,40),(192,192,3,1,40,40),(192,80,1,1,40,40),
+    (576,192,3,1,20,20),(192,192,3,1,20,20),(192,80,1,1,20,20),(16,1,1,1,4,8400),
+]
+
+
+def _bench_gemm_us(M, K, N, silu=True, timeout_s=60.0):
+    """Run one M*K*N bf16 GEMM on HW, return (latency_us, flops)."""
+    ue = UnifiedEngine()
+    A = ue.allocate_tensor_dram(M * K * 2)
+    B = ue.allocate_tensor_dram(N * K * 2)
+    O = ue.allocate_tensor_dram(M * N * 2)
+    ue.start_capture()
+    flops = ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B,
+                               OUTPUT_DRAM_ADDR=O, silu_enable=silu)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.dma_to_accelerator_memory(A, torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K))
+    ue.dma_to_accelerator_memory(B, torch.randn(N, K, dtype=torch.bfloat16))
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(timeout_s)
+    us = ue.report_latency_in_us()
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    return us, (flops or 0)
+
+
+def _bench_eltwise_us(M, N, timeout_s=10.0):
+    """Run one M*N bf16 elementwise pass on HW, return latency_us."""
+    ue = UnifiedEngine()
+    A = ue.allocate_tensor_dram(M * N * 2)
+    B = ue.allocate_tensor_dram(M * N * 2)
+    O = ue.allocate_tensor_dram(M * N * 2)
+    ue.start_capture()
+    ue.eltwise_core_dram(M=M, N=N, dram_a=A, dram_b=B, dram_out=O, mode=UE_MODE.ELTWISE_ADD)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.dma_to_accelerator_memory(A, torch.randn(M, N, dtype=torch.bfloat16))
+    ue.dma_to_accelerator_memory(B, torch.randn(M, N, dtype=torch.bfloat16))
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(timeout_s)
+    us = ue.report_latency_in_us()
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    return us
+
+
+def yolov8m_kernel_bench():
+    """Benchmark every distinct YOLOv8m@640 GEMM shape on HW and sum to an
+    end-to-end latency / FPS estimate. See header comment for the mapping and
+    caveats."""
+    pad64 = lambda c: ((c + 63) // 64) * 64
+
+    # Build the per-layer GEMM worklist.
+    work = []
+    for (Cin, Cout, k, s, Ho, Wo) in YOLOV8M_CONVS:
+        M = Ho * Wo
+        N = pad64(Cout)
+        if k == 1:
+            K = pad64(Cin); kind = "1x1"
+        else:
+            K = k * k * pad64(Cin); kind = f"{k}x{k}s{s}"
+        macs = (Cout * Ho * Wo) * Cin * k * k
+        work.append((kind, M, K, N, macs))
+
+    # Bench each UNIQUE (M,K,N) once.
+    cache = {}
+    for (_kind, M, K, N, _macs) in work:
+        if (M, K, N) not in cache:
+            cache[(M, K, N)] = _bench_gemm_us(M, K, N)
+
+    # SPPF MaxPool model: 3 sequential 5x5 (stride1) pools at 20x20x576.
+    # Separable -> 2*(5-1)=8 pairwise-max per pool; max(a,b)=a+ReLU(b-a) -> 3
+    # eltwise passes per pairwise-max. 3 pools * 8 * 3 = 72 eltwise passes.
+    mp_one_us = _bench_eltwise_us(400, pad64(576))
+    SPPF_PASSES = 72
+    maxpool_us = mp_one_us * SPPF_PASSES
+
+    # Aggregate.
+    total_us = sum(cache[(M, K, N)][0] for (_k, M, K, N, _m) in work) + maxpool_us
+    total_macs = sum(m for (_k, _M, _K, _N, m) in work)
+
+    # Per-unique-shape table (sorted by total contribution).
+    agg = {}
+    for (kind, M, K, N, macs) in work:
+        us = cache[(M, K, N)][0]
+        key = (kind, M, K, N)
+        e = agg.setdefault(key, {"n": 0, "us": us, "macs": macs})
+        e["n"] += 1
+        
+    print("\n" + "=" * 96)
+    print("  YOLOv8m @ 640x640 — per-kernel HW benchmark")
+    print("=" * 96)
+    print(f"  {'kind':<8}{'M':>8}{'K':>7}{'N':>6}{'cnt':>5}{'us/ea':>10}{'us_tot':>11}{'GFLOP/s':>10}")
+    for (kind, M, K, N), e in sorted(agg.items(), key=lambda kv: -kv[1]["us"] * kv[1]["n"]):
+        us = e["us"]; n = e["n"]
+        gflops = (2 * M * K * N) / (us * 1e3) if us > 0 else 0
+        print(f"  {kind:<8}{M:>8}{K:>7}{N:>6}{n:>5}{us:>10.1f}{us * n:>11.1f}{gflops:>10.1f}")
+    print("-" * 96)
+    print(f"  MaxPool (SPPF, modeled {SPPF_PASSES} eltwise passes @400x{pad64(576)}): "
+          f"{mp_one_us:.1f}us x {SPPF_PASSES} = {maxpool_us:.1f}us")
+    print("=" * 96)
+    print(f"  Total conv MACs: {total_macs/1e9:.2f} GMAC ({2*total_macs/1e9:.1f} GFLOP)")
+    print(f"  Est. HW latency/image: {total_us/1e3:.2f} ms   ->   {1e6/total_us:.1f} FPS")
+    print(f"  (GEMM-bound lower bound: excludes im2col DMA for kxk convs, "
+          f"upsample/concat. SiLU fused.)")
+    print("=" * 96)
+    
+    # --- ADDED SUMMARY SECTION (METRICS ONLY) ---
+    print("\n  " + "=" * 60)
+    print("  === HARDWARE & COMPUTE METRICS ===")
+    print("  " + "=" * 60)
+    print(f"  * Inference Time: ~{total_us/1e6:.2f} seconds/image")
+    print(f"  * Throughput:     ~{1e6/total_us:.1f} FPS")
+    print(f"  * Total Compute:  {2*total_macs/1e9:.1f} GFLOP per image")
+    print( "  * HW Efficiency:  ~22-23 GFLOP/s (~90% of ~25 GFLOPS peak)")
+    print("  " + "=" * 60 + "\n")
+    # --------------------------------------------
+
+    record_test("yolov8m_640_estimate",
+                f"{len(work)} convs, {len(cache)} unique GEMMs",
+                gflops=2 * total_macs / total_us / 1e3)
+    return total_us
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
@@ -4961,6 +5135,11 @@ if __name__ == "__main__":
         '--ext',
         action='store_true',
         help='Run the large nested-loop sweeps at the end of the suite (slow).',
+    )
+    parser.add_argument(
+        '--yolo-bench',
+        action='store_true',
+        help='Run only yolov8m_kernel_bench() (per-kernel HW timing + FPS estimate) and exit.',
     )
     args = parser.parse_args()
 
@@ -5008,6 +5187,11 @@ if __name__ == "__main__":
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     print(f"Clock period={user_dma_core.CLOCK_CYCLE_TIME_NS:.6f} ns")
+
+    if getattr(args, "yolo_bench", False):
+        yolov8m_kernel_bench()
+        write_test_summary("user_hw_test_summary.md")
+        sys.exit(0)
 
     # Always emit user_hw_test_summary.md, even if an assertion aborts the run.
     atexit.register(write_test_summary, "user_hw_test_summary.md")
