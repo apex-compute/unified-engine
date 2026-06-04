@@ -792,7 +792,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x29b64569, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x29b64569. Please update FPGA with commit update_29b64569.bin using update_flash.py (public release v1.1)"
+        assert hw_version == 0xf158a78a, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xf158a78a. Please update FPGA with commit update_f158a78a.bin using update_flash.py (public release v1.1)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -6514,7 +6514,7 @@ class UnifiedEngine:
         group_flops += 2 * 1 * seq_len * head_dim
         return group_size * group_flops
 
-    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False) -> None:
+    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, write_back_disable: bool = False) -> None:
         """Quantized matrix-matrix multiplication core.
         Args:
             M: batch dimension (number of input vectors)
@@ -6627,11 +6627,12 @@ class UnifiedEngine:
                                                                 lalu_b=lalu_b)
                     max_clear_en = 0
 
-                self.sram_to_accelerator_memory(sram_address=0x80000,
-                                                accelerator_dram_address=OUTPUT_DRAM_ADDR + (M_chunk_idx * N + N_chunk_idx) * bytes_per_element,
-                                                element_size=M_chunk_size * N_take_size,
-                                                stride_bytes_per_chunk=N_take_size * bytes_per_element,
-                                                stride_jump_bytes=N * bytes_per_element)
+                if not write_back_disable:
+                    self.sram_to_accelerator_memory(sram_address=0x80000,
+                                                    accelerator_dram_address=OUTPUT_DRAM_ADDR + (M_chunk_idx * N + N_chunk_idx) * bytes_per_element,
+                                                    element_size=M_chunk_size * N_take_size,
+                                                    stride_bytes_per_chunk=N_take_size * bytes_per_element,
+                                                    stride_jump_bytes=N * bytes_per_element)
 
         total_flops = 2 * M * N * K
         if bias_enable:

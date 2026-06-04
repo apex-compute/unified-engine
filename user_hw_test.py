@@ -4375,41 +4375,51 @@ def isa_rela_loop_test() -> None:
     # so the loop stride can be computed at runtime rather than assembled as an
     # immediate.  Exit is via JZ (absolute, placeholder patched after capture).
     #
-    # Program layout (8 instructions, indices 0-7):
+    # Program layout (3 setup + optional align NOP + 4-instruction body + HALT):
     #   0: SET cnt_reg    = loop_cnt_rela   (setup)
     #   1: SET accum_reg  = 0               (setup)
-    #   2: SET offset_reg = 4               (setup; backward offset from JMP to idx 3)
-    #   3: INC accum_reg                    <- loop body start
-    #   4: DEC cnt_reg
-    #   5: JZ  cnt_reg -> HALT (idx 7)      (placeholder 0, patched after capture)
-    #   6: JMP_REG_RELA offset_reg          (jumps back 4 words: read_ptr 7->3)
-    #   7: HALT
+    #   2: SET offset_reg = 4               (setup; backward offset is always 4)
+    #  [3: NOP]                             (optional 512-bit alignment pad)
+    #   3+a: INC accum_reg                  <- loop body start (a = n_align_nops)
+    #   4+a: DEC cnt_reg
+    #   5+a: JZ  cnt_reg -> HALT            (placeholder 0, patched after capture)
+    #   6+a: JMP_REG_RELA offset_reg        (read_ptr -= 4, lands on loop body)
+    #   7+a: HALT
     #
-    # PC formula: 3 setup + (loop_cnt-1)*4 body iterations + 3 last iteration + 1 HALT
-    #           = 4*loop_cnt + 3
-    # Unlike REG_ABS, relative jumps do not trigger a DMA reload so the loop body
-    # stays in the original cache window.
+    # The backward offset is always 4 regardless of alignment NOPs: the body is
+    # always 4 instructions before the JMP, so read_ptr - 4 lands on INC accum.
+    # Unlike REG_ABS, relative jumps do not trigger a DMA reload; the loop body
+    # stays in the original instruction cache window.
+    #
+    # PC formula: (3 + n_align_nops) setup + (loop_cnt-1)*4 + 3 last + 1 HALT
+    #           = 4*loop_cnt + 3 + n_align_nops
     loop_cnt_rela = 5
     cnt_reg_r  = 5
     accum_reg_r = 6
     offset_reg  = 7
-    # Backward offset: after fetching idx 6 the read_ptr is 7; subtracting 4 lands at 3.
-    bwd_offset = 4
+    bwd_offset = 4  # always 4: distance from JMP_REG_RELA to INC accum in the cache
 
     ue_r = UnifiedEngine()
     program_dram_addr_r = ue_r.get_program_dram_addr()
+
+    # Align the loop body start to a 512-bit (64-byte) DRAM instruction boundary.
+    n_align_nops_r = 0
+    if (program_dram_addr_r + 3 * INSTRUCTION_SIZE_BYTES) % (2 * INSTRUCTION_SIZE_BYTES) != 0:
+        n_align_nops_r = 1
 
     ue_r.start_capture()
     ue_r.generate_instruction_add_set(cnt_reg_r, loop_cnt_rela)         # idx 0
     ue_r.generate_instruction_add_set(accum_reg_r, 0)                   # idx 1
     ue_r.generate_instruction_add_set(offset_reg, bwd_offset)           # idx 2
-    ue_r.generate_instruction_add_inc(accum_reg_r)                      # idx 3 <- loop body
-    ue_r.generate_instruction_add_dec(cnt_reg_r)                        # idx 4
-    jz_capture_idx_r = ue_r.capture_count                               # = 5 before JZ
-    ue_r.generate_instruction_jump_abs_jz(0, cnt_reg_r)                 # idx 5, placeholder
-    ue_r.generate_instruction_jump_reg_rela(offset_reg)                 # idx 6
-    halt_idx_r = ue_r.capture_count                                     # = 7 before HALT
-    ue_r.generate_instruction_halt()                                    # idx 7
+    for _ in range(n_align_nops_r):
+        ue_r.generate_instruction_nop()                                  # idx 3 if needed
+    ue_r.generate_instruction_add_inc(accum_reg_r)                      # loop body start
+    ue_r.generate_instruction_add_dec(cnt_reg_r)
+    jz_capture_idx_r = ue_r.capture_count
+    ue_r.generate_instruction_jump_abs_jz(0, cnt_reg_r)                 # placeholder
+    ue_r.generate_instruction_jump_reg_rela(offset_reg)
+    halt_idx_r = ue_r.capture_count
+    ue_r.generate_instruction_halt()
     ue_r.stop_capture()
 
     halt_word_addr_r = ue_35bit_addr_shifter(program_dram_addr_r + halt_idx_r * INSTRUCTION_SIZE_BYTES)
@@ -4421,14 +4431,14 @@ def isa_rela_loop_test() -> None:
     ue_r.wait_queue(30.0)
 
     _, pc_reg_r = ue_r.report_timing_and_instruction_count()
-    expected_pc_r = 4 * loop_cnt_rela + 3
+    expected_pc_r = 4 * loop_cnt_rela + 3 + n_align_nops_r
     assert pc_reg_r == expected_pc_r, (
         f"isa_rela_loop_reg_rela_test PC mismatch: got {pc_reg_r}, expected {expected_pc_r} "
-        f"(loop_cnt={loop_cnt_rela}, bwd_offset={bwd_offset})"
+        f"(loop_cnt={loop_cnt_rela}, bwd_offset={bwd_offset}, n_align_nops={n_align_nops_r})"
     )
     print(
         f"isa_rela_loop_reg_rela_test: PASS (loop_cnt={loop_cnt_rela}, pc_reg={pc_reg_r}, "
-        f"bwd_offset={bwd_offset})"
+        f"bwd_offset={bwd_offset}, n_align_nops={n_align_nops_r})"
     )
     record_test("isa_rela_loop_reg_rela", f"loop_cnt={loop_cnt_rela}, bwd_offset={bwd_offset}")
     ue_r.clear_capture_buffer()
@@ -4497,18 +4507,19 @@ def isa_abs_loop_test() -> None:
     # setup time via ADD_SET and the unconditional JMP_REG_ABS uses that register as
     # the target each iteration.  Exit is via JZ (immediate target = HALT).
     #
-    # Program layout (8 instructions, indices 0-7):
-    #   0: SET cnt_reg  = loop_cnt        (setup)
-    #   1: SET accum_reg = 0              (setup)
-    #   2: SET addr_reg = word_addr(3)    (setup; word addr of instruction 3)
-    #   3: INC accum_reg                  <- loop body start (addr_reg points here)
-    #   4: DEC cnt_reg
-    #   5: JZ  cnt_reg -> HALT (idx 7)   (placeholder 0, patched after capture)
-    #   6: JMP_REG_ABS addr_reg
-    #   7: HALT
+    # Program layout (3 setup + optional align NOP + 4-instruction body + HALT):
+    #   0: SET cnt_reg   = loop_cnt         (setup)
+    #   1: SET accum_reg = 0                (setup)
+    #   2: SET addr_reg  = word_addr(body)  (setup; 512-bit-aligned loop body address)
+    #  [3: NOP]                             (optional alignment pad)
+    #   3+a: INC accum_reg                  <- loop body start (a = n_align_nops)
+    #   4+a: DEC cnt_reg
+    #   5+a: JZ  cnt_reg -> HALT            (placeholder 0, patched after capture)
+    #   6+a: JMP_REG_ABS addr_reg
+    #   7+a: HALT
     #
-    # PC formula: 3 setup + (loop_cnt-1)*4 body iterations + 3 last iteration + 1 HALT
-    #           = 4*loop_cnt + 3
+    # PC formula: (3 + n_align_nops) setup + (loop_cnt-1)*4 + 3 last + 1 HALT
+    #           = 4*loop_cnt + 3 + n_align_nops
     loop_cnt_reg_abs = 4
     cnt_reg  = 5
     accum_reg = 6
@@ -4516,19 +4527,29 @@ def isa_abs_loop_test() -> None:
 
     ue2 = UnifiedEngine()
     program_dram_addr2 = ue2.get_program_dram_addr()
-    loop_body_word_addr = ue_35bit_addr_shifter(program_dram_addr2 + 3 * INSTRUCTION_SIZE_BYTES)
+
+    # Align the loop body start to a 512-bit (64-byte) DRAM instruction boundary
+    # before storing the word address into the GPR.
+    loop_body_byte_addr = program_dram_addr2 + 3 * INSTRUCTION_SIZE_BYTES
+    n_align_nops = 0
+    if loop_body_byte_addr % (2 * INSTRUCTION_SIZE_BYTES) != 0:
+        loop_body_byte_addr += INSTRUCTION_SIZE_BYTES
+        n_align_nops = 1
+    loop_body_word_addr = ue_35bit_addr_shifter(loop_body_byte_addr)
 
     ue2.start_capture()
     ue2.generate_instruction_add_set(cnt_reg, loop_cnt_reg_abs)         # idx 0
     ue2.generate_instruction_add_set(accum_reg, 0)                      # idx 1
     ue2.generate_instruction_add_set(addr_reg, loop_body_word_addr)     # idx 2
-    ue2.generate_instruction_add_inc(accum_reg)                         # idx 3 <- loop body
-    ue2.generate_instruction_add_dec(cnt_reg)                           # idx 4
-    jz_capture_idx = ue2.capture_count                                  # = 5 before JZ
-    ue2.generate_instruction_jump_abs_jz(0, cnt_reg)                    # idx 5, placeholder
-    ue2.generate_instruction_jump_reg_abs(addr_reg)                     # idx 6
-    halt_idx = ue2.capture_count                                        # = 7 before HALT
-    ue2.generate_instruction_halt()                                     # idx 7
+    for _ in range(n_align_nops):
+        ue2.generate_instruction_nop()                                   # idx 3 if needed
+    ue2.generate_instruction_add_inc(accum_reg)                         # loop body start
+    ue2.generate_instruction_add_dec(cnt_reg)
+    jz_capture_idx = ue2.capture_count
+    ue2.generate_instruction_jump_abs_jz(0, cnt_reg)                    # placeholder
+    ue2.generate_instruction_jump_reg_abs(addr_reg)
+    halt_idx = ue2.capture_count
+    ue2.generate_instruction_halt()
     ue2.stop_capture()
 
     halt_word_addr = ue_35bit_addr_shifter(program_dram_addr2 + halt_idx * INSTRUCTION_SIZE_BYTES)
@@ -4540,14 +4561,14 @@ def isa_abs_loop_test() -> None:
     ue2.wait_queue(30.0)
 
     _, pc_reg2 = ue2.report_timing_and_instruction_count()
-    expected_pc2 = 4 * loop_cnt_reg_abs + 3
+    expected_pc2 = 4 * loop_cnt_reg_abs + 3 + n_align_nops
     assert pc_reg2 == expected_pc2, (
         f"isa_abs_loop_reg_abs_test PC mismatch: got {pc_reg2}, expected {expected_pc2} "
-        f"(loop_cnt={loop_cnt_reg_abs})"
+        f"(loop_cnt={loop_cnt_reg_abs}, n_align_nops={n_align_nops})"
     )
     print(
         f"isa_abs_loop_reg_abs_test: PASS (loop_cnt={loop_cnt_reg_abs}, pc_reg={pc_reg2}, "
-        f"loop_body_word=0x{loop_body_word_addr:x}, halt_word=0x{halt_word_addr:x})"
+        f"loop_body_word=0x{loop_body_word_addr:x}, n_align_nops={n_align_nops})"
     )
     record_test("isa_abs_loop_reg_abs", f"loop_cnt={loop_cnt_reg_abs}")
     ue2.clear_capture_buffer()
