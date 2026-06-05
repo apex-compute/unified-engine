@@ -1207,9 +1207,16 @@ def rms_norm_test(shape: tuple, use_pbi: bool = False):
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool = False):
-    """
-    Tests layer norm core.
+def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool = False,
+                    use_pbi: bool = False):
+    """Tests layer_norm_core_dram.
+
+    When ``use_pbi=True``, primes GPR 8 with the chunk count ``M // chunk_size`` (where
+    ``chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, M)``) and routes to
+    :meth:`layer_norm_core_dram_pbi`.  The PBI loop loads/stores ``chunk_size`` rows per DMA
+    call — identical granularity to the legacy path — so performance is on par while the
+    program shrinks from ~M*6 to ~chunk_size*6+4 instructions.
+    When ``use_pbi=False`` the wrapper routes to the legacy compile-time path.
     """
     ue = UnifiedEngine()
 
@@ -1223,23 +1230,36 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     GAMMA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2) if gamma_enable else None
     BETA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2) if beta_enable else None
 
+    _GPR_M_REG = 8  # fixed GPR; stays clear of loop_start internal registers
+
     ue.start_capture()
-
-    total_flops_from_layer_norm = ue.layer_norm_core_dram(M=M, N=N,
-                                                          A_DRAM_ADDR=A_DRAM_ADDR,
-                                                          OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                                                          GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
-                                                          BETA_DRAM_ADDR=BETA_DRAM_ADDR)
-
+    if use_pbi:
+        # Must mirror the chunk_size logic in layer_norm_core_dram_pbi exactly.
+        _ops = 4 + (1 if gamma_enable else 0) + (1 if beta_enable else 0)
+        _ideal = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256 - 4) // _ops)
+        _chunk_size = _ideal
+        while M % _chunk_size != 0:
+            _chunk_size -= 1
+        ue.generate_instruction_add_set(_GPR_M_REG, M // _chunk_size)
+    total_flops = ue.layer_norm_core_dram(
+        M=M, N=N,
+        A_DRAM_ADDR=A_DRAM_ADDR,
+        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+        GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
+        BETA_DRAM_ADDR=BETA_DRAM_ADDR,
+        gpr_M_reg=_GPR_M_REG if use_pbi else None,
+    )
     ue.stop_capture()
     ue.generate_instruction_halt()
     program_dram_addr = ue.get_program_dram_addr()
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
     ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.allocate_program_dram(instruction_size_bytes)
+    ue.clear_capture_buffer()
 
-    # Test Time
     x = torch.randn(M, N, dtype=torch.bfloat16)
     ue.dma_to_accelerator_memory(A_DRAM_ADDR, x)
+    gamma = beta = None
     if gamma_enable:
         gamma = torch.randn(N, dtype=torch.bfloat16)
         ue.dma_to_accelerator_memory(GAMMA_DRAM_ADDR, gamma)
@@ -1248,44 +1268,39 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
         ue.dma_to_accelerator_memory(BETA_DRAM_ADDR, beta)
 
     ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0) # 10 seconds timeout
+    ue.wait_queue(10.0)
     ue.report_timing_and_instruction_count()
 
-    generate_trace(ue, f"layer_norm_core_trace_{M}_{N}_{'gamma_enabled' if gamma_enable else 'gamma_disabled'}_{'beta_enabled' if beta_enable else 'beta_disabled'}.csv")
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_layer_norm)
-    print(f"Report FLOPS for Layer Norm: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}, gamma_enable={gamma_enable}, beta_enable={beta_enable}")
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+    print(
+        f"Report FLOPS for Layer Norm{'(PBI)' if use_pbi else ''}: "
+        f"{flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for "
+        f"M={M}, N={N}, gamma={gamma_enable}, beta={beta_enable}"
+    )
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
     layer_norm = torch.nn.LayerNorm(N)
-    if gamma_enable:
-        layer_norm.weight.data = gamma
-    else:
-        layer_norm.weight.data = torch.ones(N, dtype=torch.bfloat16)
-
-    if beta_enable:
-        layer_norm.bias.data = beta
-    else:
-        layer_norm.bias.data = torch.zeros(N, dtype=torch.bfloat16)
+    layer_norm.weight.data = gamma if gamma_enable else torch.ones(N, dtype=torch.bfloat16)
+    layer_norm.bias.data   = beta  if beta_enable  else torch.zeros(N, dtype=torch.bfloat16)
 
     ref = layer_norm(x)
-    snr_db_ref = calculate_snr(ref, output)
-    print(f"Reference SNR Analysis for Layer Norm: {snr_db_ref:.2f} dB")
-    assert snr_db_ref >= 40 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    snr_db = calculate_snr(ref, output)
+    print(f"Layer Norm SNR Analysis: {snr_db:.2f} dB")
+    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
 
     flags = []
     if gamma_enable: flags.append("gamma")
     if beta_enable:  flags.append("beta")
     flag_str = ("+" + "+".join(flags)) if flags else ""
-    record_test(f"layer_norm{flag_str}",
-                f"M={M}, N={N}",
-                snr_db=snr_db_ref,
-                gflops=flop_rate_gflops)
+    test_name = f"layer_norm{'_pbi' if use_pbi else ''}{flag_str}"
+    record_test(test_name, f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops,
+                inst_bytes=instruction_size_bytes)
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
-
+    ue.reset_program_dram_addr()
+    
 def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False):
     """
     Tests rope_hf_core_dram by emitting one HF-style RoPE instruction sequence per row.
@@ -1448,6 +1463,177 @@ def rope_hf_core_dram_gqa_test(M: int, group_size: int, N: int, use_pbi: bool = 
 
     record_test(f"rope_hf_core_dram_gqa{'+pbi' if use_pbi else ''}",
                 f"M={M}, G={group_size}, N={N}",
+                snr_db=snr_db,
+                gflops=flop_rate_gflops,
+                inst_bytes=instruction_size_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+def smolvlm_rope_hf_core_dram_pbi_test(M: int, N: int = 64, theta: float = 100000.0):
+    """
+    Exercises rope_hf_core_dram in PBI mode at SmolVLM2 dimensions (head_dim N=64).
+
+    SmolVLM2's RoPE table convention (see _load_rope_tables): per position p,
+        cos_row = [cos(freqs_p) || cos(freqs_p)]            (N elements)
+        sin_row = [sin(freqs_p) || sin(freqs_p)]            (N elements, first half pre-negated)
+    laid out contiguously as [cos_row || sin_row] per token so the kernel reads one
+    2N-element rope row per token. Positions are sequential (0..M-1) as in real prefill.
+
+    head_dim=64 is below the shared PBI rope's N>=128 / 128-byte-half-alignment
+    requirement; this test is the concrete repro for that gap.
+    """
+    ue = UnifiedEngine()
+
+    X_DRAM_ADDR      = ue.allocate_tensor_dram(M * N * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+    ROPE_DRAM_ADDR   = ue.allocate_tensor_dram(M * 2 * N * 2)
+
+    m_reg = ue.alloc_isa_reg()
+
+    ue.start_capture()
+    ue.generate_instruction_add_set(m_reg, M)
+    total_flops = ue.rope_hf_core_dram(
+        M=M, N=N,
+        input_dram_addr=X_DRAM_ADDR,
+        output_dram_addr=OUTPUT_DRAM_ADDR,
+        cos_dram_addr=ROPE_DRAM_ADDR,
+        sin_dram_addr=ROPE_DRAM_ADDR + N * 2,
+        gpr_M_reg=m_reg,
+    )
+    ue.stop_capture()
+    ue.release_isa_reg()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    # Build SmolVLM-style cos/sin for sequential positions 0..M-1.
+    half = N // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, N, 2, dtype=torch.float32) / N))
+    freqs = torch.outer(torch.arange(M, dtype=torch.float32), inv_freq)  # [M, N/2]
+    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=1).to(torch.bfloat16)  # [M, N]
+    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=1).to(torch.bfloat16)  # [M, N]
+    sin_negated = sin.clone()
+    sin_negated[:, :half] = -sin_negated[:, :half]
+
+    x_hf = torch.randn(M, N, dtype=torch.bfloat16)
+    rope_table = torch.cat([cos, sin_negated], dim=1).reshape(-1)  # [M, 2N] -> flat
+
+    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_hf)
+    ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+    print(f"Report FLOPS for SmolVLM HF RoPE PBI: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for M={M}, N={N}")
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+
+    def rotate_half(x):
+        x1 = x[..., :x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    ref = x_hf * cos + rotate_half(x_hf) * sin
+    snr_db = calculate_snr(ref, output)
+    print(f"SmolVLM HF RoPE PBI SNR Analysis: {snr_db:.2f} dB for M={M}, N={N}")
+    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+
+    record_test("smolvlm_rope_hf_core_dram+pbi",
+                f"M={M}, N={N}",
+                snr_db=snr_db,
+                gflops=flop_rate_gflops,
+                inst_bytes=instruction_size_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+def smolvlm_rope_d64_pbi_test(M: int, D: int = 64, theta: float = 100000.0):
+    """
+    Tests nn_lib.rope_hf_core_dram_pbi: the D<128 padded-split RoPE wrapped in a PBI
+    hardware loop (register-addressed reads/writes, 0 PBI pointers). This is the kernel
+    SmolVLM2 prefill needs (head_dim=64).
+
+    Packed per-token rope table = [cos_lo | cos_hi | sin_lo | sin_hi], each 32-elem half
+    zero-padded to UE_VECTOR_SIZE (64) so it is one full 128-byte SRAM row. sin_lo is
+    pre-negated (HW add-only). Positions are sequential (real prefill).
+    """
+    from nn_lib import rope_hf_core_dram_pbi
+
+    ue = UnifiedEngine()
+    PAD = UE_VECTOR_SIZE  # 64
+    half = D // 2
+
+    X_DRAM_ADDR      = ue.allocate_tensor_dram(M * D * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * D * 2)
+    ROPE_PACKED_ADDR = ue.allocate_tensor_dram(M * 4 * PAD * 2)
+
+    gpr_M_reg = ue.alloc_isa_reg()
+    tmp_reg   = ue.alloc_isa_reg()
+    t_reg     = ue.alloc_isa_reg()
+
+    ue.start_capture()
+    ue.generate_instruction_add_set(gpr_M_reg, M)
+    total_flops = rope_hf_core_dram_pbi(
+        ue, M=M, D=D,
+        X_DRAM_ADDR=X_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+        ROPE_PACKED_ADDR=ROPE_PACKED_ADDR,
+        gpr_M_reg=gpr_M_reg, tmp_reg=tmp_reg, t_reg=t_reg,
+    )
+    ue.stop_capture()
+    ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(instruction_size_bytes)
+
+    # SmolVLM-style cos/sin, sequential positions 0..M-1 (only the 32 unique freqs).
+    inv_freq = 1.0 / (theta ** (torch.arange(0, D, 2, dtype=torch.float32) / D))  # [32]
+    freqs = torch.outer(torch.arange(M, dtype=torch.float32), inv_freq)           # [M, 32]
+    cos = torch.cos(freqs).to(torch.bfloat16)  # [M, 32]
+    sin = torch.sin(freqs).to(torch.bfloat16)  # [M, 32]
+
+    def _pad(t):
+        p = torch.zeros(M, PAD, dtype=torch.bfloat16)
+        p[:, :half] = t
+        return p
+    # [cos_lo | cos_hi | sin_lo(neg) | sin_hi], each padded to 64
+    packed = torch.cat([_pad(cos), _pad(cos), _pad(-sin), _pad(sin)], dim=1)  # [M, 256]
+
+    x = torch.randn(M, D, dtype=torch.bfloat16)
+
+    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x)
+    ue.dma_to_accelerator_memory(ROPE_PACKED_ADDR, packed.reshape(-1))
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+    print(f"Report FLOPS for SmolVLM D=64 RoPE PBI: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for M={M}, D={D}")
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, D))
+
+    cos_full = torch.cat([cos, cos], dim=1)  # [M, 64]
+    sin_full = torch.cat([sin, sin], dim=1)  # [M, 64]
+    def rotate_half(t):
+        t1 = t[..., :t.shape[-1] // 2]
+        t2 = t[..., t.shape[-1] // 2:]
+        return torch.cat((-t2, t1), dim=-1)
+    ref = x * cos_full + rotate_half(x) * sin_full
+    snr_db = calculate_snr(ref, output)
+    print(f"SmolVLM D=64 RoPE PBI SNR Analysis: {snr_db:.2f} dB for M={M}, D={D}")
+    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+
+    record_test("smolvlm_rope_d64+pbi",
+                f"M={M}, D={D}",
                 snr_db=snr_db,
                 gflops=flop_rate_gflops,
                 inst_bytes=instruction_size_bytes)
@@ -4184,6 +4370,81 @@ def isa_rela_loop_test() -> None:
     ue.reset_inst_ptr_counter()
     ue.reset_isa_reg_counter()
 
+    # --- REG_RELA sub-test ---
+    # Exercises JUMP_MODE_REG_RELA: a GPR holds the backward instruction-word offset
+    # so the loop stride can be computed at runtime rather than assembled as an
+    # immediate.  Exit is via JZ (absolute, placeholder patched after capture).
+    #
+    # Program layout (3 setup + optional align NOP + 4-instruction body + HALT):
+    #   0: SET cnt_reg    = loop_cnt_rela   (setup)
+    #   1: SET accum_reg  = 0               (setup)
+    #   2: SET offset_reg = 4               (setup; backward offset is always 4)
+    #  [3: NOP]                             (optional 512-bit alignment pad)
+    #   3+a: INC accum_reg                  <- loop body start (a = n_align_nops)
+    #   4+a: DEC cnt_reg
+    #   5+a: JZ  cnt_reg -> HALT            (placeholder 0, patched after capture)
+    #   6+a: JMP_REG_RELA offset_reg        (read_ptr -= 4, lands on loop body)
+    #   7+a: HALT
+    #
+    # The backward offset is always 4 regardless of alignment NOPs: the body is
+    # always 4 instructions before the JMP, so read_ptr - 4 lands on INC accum.
+    # Unlike REG_ABS, relative jumps do not trigger a DMA reload; the loop body
+    # stays in the original instruction cache window.
+    #
+    # PC formula: (3 + n_align_nops) setup + (loop_cnt-1)*4 + 3 last + 1 HALT
+    #           = 4*loop_cnt + 3 + n_align_nops
+    loop_cnt_rela = 5
+    cnt_reg_r  = 5
+    accum_reg_r = 6
+    offset_reg  = 7
+    bwd_offset = 4  # always 4: distance from JMP_REG_RELA to INC accum in the cache
+
+    ue_r = UnifiedEngine()
+    program_dram_addr_r = ue_r.get_program_dram_addr()
+
+    # Align the loop body start to a 512-bit (64-byte) DRAM instruction boundary.
+    n_align_nops_r = 0
+    if (program_dram_addr_r + 3 * INSTRUCTION_SIZE_BYTES) % (2 * INSTRUCTION_SIZE_BYTES) != 0:
+        n_align_nops_r = 1
+
+    ue_r.start_capture()
+    ue_r.generate_instruction_add_set(cnt_reg_r, loop_cnt_rela)         # idx 0
+    ue_r.generate_instruction_add_set(accum_reg_r, 0)                   # idx 1
+    ue_r.generate_instruction_add_set(offset_reg, bwd_offset)           # idx 2
+    for _ in range(n_align_nops_r):
+        ue_r.generate_instruction_nop()                                  # idx 3 if needed
+    ue_r.generate_instruction_add_inc(accum_reg_r)                      # loop body start
+    ue_r.generate_instruction_add_dec(cnt_reg_r)
+    jz_capture_idx_r = ue_r.capture_count
+    ue_r.generate_instruction_jump_abs_jz(0, cnt_reg_r)                 # placeholder
+    ue_r.generate_instruction_jump_reg_rela(offset_reg)
+    halt_idx_r = ue_r.capture_count
+    ue_r.generate_instruction_halt()
+    ue_r.stop_capture()
+
+    halt_word_addr_r = ue_35bit_addr_shifter(program_dram_addr_r + halt_idx_r * INSTRUCTION_SIZE_BYTES)
+    ue_r._patch_jump_immediate(jz_capture_idx_r, halt_word_addr_r)
+
+    ue_r.write_captured_instructions_to_dram(program_dram_addr_r)
+    ue_r.allocate_program_dram(ue_r.get_capture_instruction_size_bytes())
+    ue_r.start_execute_from_dram(program_dram_addr_r)
+    ue_r.wait_queue(30.0)
+
+    _, pc_reg_r = ue_r.report_timing_and_instruction_count()
+    expected_pc_r = 4 * loop_cnt_rela + 3 + n_align_nops_r
+    assert pc_reg_r == expected_pc_r, (
+        f"isa_rela_loop_reg_rela_test PC mismatch: got {pc_reg_r}, expected {expected_pc_r} "
+        f"(loop_cnt={loop_cnt_rela}, bwd_offset={bwd_offset}, n_align_nops={n_align_nops_r})"
+    )
+    print(
+        f"isa_rela_loop_reg_rela_test: PASS (loop_cnt={loop_cnt_rela}, pc_reg={pc_reg_r}, "
+        f"bwd_offset={bwd_offset}, n_align_nops={n_align_nops_r})"
+    )
+    record_test("isa_rela_loop_reg_rela", f"loop_cnt={loop_cnt_rela}, bwd_offset={bwd_offset}")
+    ue_r.clear_capture_buffer()
+    ue_r.reset_tensor_dram_addr()
+    ue_r.reset_isa_reg_counter()
+
 
 def isa_abs_loop_test() -> None:
     """
@@ -4240,6 +4501,78 @@ def isa_abs_loop_test() -> None:
     ue.clear_capture_buffer()
     ue.reset_inst_ptr_counter()
     ue.reset_isa_reg_counter()
+
+    # --- REG_ABS sub-test ---
+    # Exercises JUMP_MODE_REG_ABS: the backward loop address is loaded into a GPR at
+    # setup time via ADD_SET and the unconditional JMP_REG_ABS uses that register as
+    # the target each iteration.  Exit is via JZ (immediate target = HALT).
+    #
+    # Program layout (3 setup + optional align NOP + 4-instruction body + HALT):
+    #   0: SET cnt_reg   = loop_cnt         (setup)
+    #   1: SET accum_reg = 0                (setup)
+    #   2: SET addr_reg  = word_addr(body)  (setup; 512-bit-aligned loop body address)
+    #  [3: NOP]                             (optional alignment pad)
+    #   3+a: INC accum_reg                  <- loop body start (a = n_align_nops)
+    #   4+a: DEC cnt_reg
+    #   5+a: JZ  cnt_reg -> HALT            (placeholder 0, patched after capture)
+    #   6+a: JMP_REG_ABS addr_reg
+    #   7+a: HALT
+    #
+    # PC formula: (3 + n_align_nops) setup + (loop_cnt-1)*4 + 3 last + 1 HALT
+    #           = 4*loop_cnt + 3 + n_align_nops
+    loop_cnt_reg_abs = 4
+    cnt_reg  = 5
+    accum_reg = 6
+    addr_reg  = 7
+
+    ue2 = UnifiedEngine()
+    program_dram_addr2 = ue2.get_program_dram_addr()
+
+    # Align the loop body start to a 512-bit (64-byte) DRAM instruction boundary
+    # before storing the word address into the GPR.
+    loop_body_byte_addr = program_dram_addr2 + 3 * INSTRUCTION_SIZE_BYTES
+    n_align_nops = 0
+    if loop_body_byte_addr % (2 * INSTRUCTION_SIZE_BYTES) != 0:
+        loop_body_byte_addr += INSTRUCTION_SIZE_BYTES
+        n_align_nops = 1
+    loop_body_word_addr = ue_35bit_addr_shifter(loop_body_byte_addr)
+
+    ue2.start_capture()
+    ue2.generate_instruction_add_set(cnt_reg, loop_cnt_reg_abs)         # idx 0
+    ue2.generate_instruction_add_set(accum_reg, 0)                      # idx 1
+    ue2.generate_instruction_add_set(addr_reg, loop_body_word_addr)     # idx 2
+    for _ in range(n_align_nops):
+        ue2.generate_instruction_nop()                                   # idx 3 if needed
+    ue2.generate_instruction_add_inc(accum_reg)                         # loop body start
+    ue2.generate_instruction_add_dec(cnt_reg)
+    jz_capture_idx = ue2.capture_count
+    ue2.generate_instruction_jump_abs_jz(0, cnt_reg)                    # placeholder
+    ue2.generate_instruction_jump_reg_abs(addr_reg)
+    halt_idx = ue2.capture_count
+    ue2.generate_instruction_halt()
+    ue2.stop_capture()
+
+    halt_word_addr = ue_35bit_addr_shifter(program_dram_addr2 + halt_idx * INSTRUCTION_SIZE_BYTES)
+    ue2._patch_jump_immediate(jz_capture_idx, halt_word_addr)
+
+    ue2.write_captured_instructions_to_dram(program_dram_addr2)
+    ue2.allocate_program_dram(ue2.get_capture_instruction_size_bytes())
+    ue2.start_execute_from_dram(program_dram_addr2)
+    ue2.wait_queue(30.0)
+
+    _, pc_reg2 = ue2.report_timing_and_instruction_count()
+    expected_pc2 = 4 * loop_cnt_reg_abs + 3 + n_align_nops
+    assert pc_reg2 == expected_pc2, (
+        f"isa_abs_loop_reg_abs_test PC mismatch: got {pc_reg2}, expected {expected_pc2} "
+        f"(loop_cnt={loop_cnt_reg_abs}, n_align_nops={n_align_nops})"
+    )
+    print(
+        f"isa_abs_loop_reg_abs_test: PASS (loop_cnt={loop_cnt_reg_abs}, pc_reg={pc_reg2}, "
+        f"loop_body_word=0x{loop_body_word_addr:x}, n_align_nops={n_align_nops})"
+    )
+    record_test("isa_abs_loop_reg_abs", f"loop_cnt={loop_cnt_reg_abs}")
+    ue2.clear_capture_buffer()
+    ue2.reset_isa_reg_counter()
 
 
 def isa_reg_min_sub_mul_test() -> None:
@@ -4652,14 +4985,16 @@ if __name__ == "__main__":
     matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix", use_pbi=True)
     flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True)
     rms_norm_test(shape=(768, 1024))
-    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True)
+    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True, use_pbi=True)
 
     # --- Additional coverage: extra dimension/feature combinations ---
     bf16_transpose_test(M=2048, N=2048)
     bf16_transpose_test(M=64, N=4096)
     rms_norm_test(shape=(2048, 2048))
     layer_norm_test(shape=(1024, 1024), gamma_enable=True)
+    layer_norm_test(shape=(1024, 1024), gamma_enable=True, use_pbi=True)
     layer_norm_test(shape=(1024, 1024), beta_enable=True)
+    layer_norm_test(shape=(1024, 1024), beta_enable=True, use_pbi=True)
     bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
     matmat_mul_test(M=512, K=2048, N=2048)
     matmat_mul_test(M=128, K=4096, N=512, gelu_enable=True)

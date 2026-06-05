@@ -936,6 +936,14 @@ def draw_and_save(img: "Image.Image", W0: int, H0: int, size: int,
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
 
 def main():
     import argparse
@@ -943,7 +951,8 @@ def main():
     parser.add_argument("--image", type=str, default=None,
                         help="Input image (default: ../../test_samples/vette.jpg)")
     parser.add_argument("--dev", type=str, default="xdma0")
-    parser.add_argument("--cycle", type=float, default=5.16, help="Clock cycle (ns)")
+    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     parser.add_argument("--score-thresh", type=float, default=0.3)
     parser.add_argument("--iou-thresh", type=float, default=0.6)
     args = parser.parse_args()
@@ -952,7 +961,13 @@ def main():
     _SILENT_MODE = True
 
     set_dma_device(args.dev)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     image_path = args.image or os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     pixel_values, img, W0, H0 = preprocess_image(image_path,
