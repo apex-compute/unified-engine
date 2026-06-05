@@ -1467,7 +1467,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # 2D RoPE table, interleaved per-token rows [cos(VD_PAD) || sin(VD_PAD)] so the
         # shared PBI rope core loads both with ONE auto-advancing pointer (sin = cos +
         # row_bytes). Padded from head_dim 80 to VD_PAD=128 for 64-aligned rope_hf_core_dram.
-        self.VIS_ROPE_DRAM = self.allocate_tensor_dram(VS * 2 * VD_PAD * bpe)
+        # Replicated VN× along rows so ONE rope_hf_core_dram call (M=VN*VS) can
+        # rotate all heads at once (heads are contiguous in VIS_Q/K_PAD_DRAM).
+        self.VIS_ROPE_DRAM = self.allocate_tensor_dram(VN * VS * 2 * VD_PAD * bpe)
         self.VIS_ROPE_COS_DRAM = self.VIS_ROPE_DRAM
         self.VIS_ROPE_SIN_DRAM = self.VIS_ROPE_DRAM + VD_PAD * bpe
         # Permute params (identity matrix for bf16_permute_core_v2)
@@ -1613,6 +1615,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.reset_isa_reg_counter()
         vis_M_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(vis_M_reg, VS)
+        # Separate M-reg for the head-collapsed rope (M=VN*VS over the contiguous
+        # [VN,VS,VD_PAD] head buffer). One call/buf replaces the per-head loop.
+        vis_rope_M_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(vis_rope_M_reg, VN * VS)
 
         for layer_idx in range(total_layers):
             _original_print(f"    vision layer {layer_idx + 1}/{total_layers}", end="\r", flush=True)
@@ -1712,15 +1718,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # store) — the proven-good pointer count, unlike the old 3-separate-load path
             # whose 3rd pointer didn't reliably advance and corrupted vision output.
             # cos/sin are position-only, so the same table is reused for every head.
-            for h in range(VN):
-                for buf_dram in (self.VIS_Q_PAD_DRAM, self.VIS_K_PAD_DRAM):
-                    head_addr = buf_dram + h * head_stride_pad
-                    self.rope_hf_core_dram(
-                        M=VS, N=VD_PAD,
-                        input_dram_addr=head_addr, output_dram_addr=head_addr,
-                        cos_dram_addr=self.VIS_ROPE_COS_DRAM,
-                        sin_dram_addr=self.VIS_ROPE_SIN_DRAM,
-                        gpr_M_reg=vis_M_reg)
+            for buf_dram in (self.VIS_Q_PAD_DRAM, self.VIS_K_PAD_DRAM):
+                self.rope_hf_core_dram(
+                    M=VN * VS, N=VD_PAD,
+                    input_dram_addr=buf_dram, output_dram_addr=buf_dram,
+                    cos_dram_addr=self.VIS_ROPE_COS_DRAM,
+                    sin_dram_addr=self.VIS_ROPE_SIN_DRAM,
+                    gpr_M_reg=vis_rope_M_reg)
 
             # flash_attention_core scales by 1/sqrt(128) instead of 1/sqrt(80).
             # The softer attention (sqrt(128)) is more robust to INT4 quantization noise
@@ -2032,8 +2036,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             sin_table[:, :half_d] = -sin_raw           # [0:40] = -sin
             sin_table[:, 64:64 + half_d] = sin_raw     # [64:104] = +sin; gaps = 0
 
-            self.dma_to_accelerator_memory(self.VIS_ROPE_DRAM, rope_table.flatten())
-        print(f"    Vision RoPE table [{VS}, 2, {VD_PAD}] (interleaved cos||sin) DMA'd to FPGA")
+            # Replicate VN× along rows: block h = identical [VS,2,VD_PAD] copy, so a
+            # single rope call over the contiguous [VN,VS,VD_PAD] head buffer reads the
+            # correct position table for every (head, pos) row.
+            rope_table_rep = rope_table.unsqueeze(0).expand(VN, VS, 2, VD_PAD).reshape(VN * VS, 2, VD_PAD)
+            self.dma_to_accelerator_memory(self.VIS_ROPE_DRAM, rope_table_rep.flatten())
+        print(f"    Vision RoPE table [{VN}x{VS}, 2, {VD_PAD}] (interleaved cos||sin, head-replicated) DMA'd to FPGA")
 
         # Vision encoder FLOP estimate
         vis_cfg = self._vis_cfg
