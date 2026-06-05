@@ -2985,7 +2985,107 @@ from PIL import Image
 
 LA_DIR = SCRIPT_DIR
 REPO_ROOT = PROJECT_ROOT
-FPGA_CFG = os.path.join(LA_DIR, "locateanything_3b_fpga_config.json")
+# FPGA decoder engine config (inlined; formerly locateanything_3b_fpga_config.json).
+# LM is dimensionally identical to Qwen2.5-VL-3B's; differences: vocab 152704 and
+# PLAIN 1D rope (never load_mrope_for_prefill). Vision section only sizes (unused)
+# DRAM buffers since MoonViT runs on GPU in stage 1.
+_FPGA_CFG = {
+    "fixed_isa_regs": {"TMP_REG": 1, "GF_SEQ_LEN_REG": 2, "GF_Q_SEQ_LEN_REG": 3, "GF_BUCKET_IDX_REG": 4},
+    "file_info": {"layer_size": 40965632, "num_layers": 36, "head_dim": 256, "actual_head_dim": 128,
+                  "num_kv_heads": 2, "hidden_size": 2048, "embedding_vocab": 152704, "group_size": 8,
+                  "mlp_elements": 11008, "bytes_per_element": 2},
+    "model": {"max_context_size": 512, "prefill_max_seq_len": 384, "end_of_turn_token_id": 151645,
+              "rope_global_layers": []},
+    "precision": {"lm": "if4"},
+    "vision": {"hidden_size": 1280, "num_heads": 16, "head_dim": 80, "intermediate_size": 3420,
+               "depth": 32, "patch_size": 14, "temporal_patch_size": 2, "spatial_merge_size": 2,
+               "out_hidden_size": 2048, "window_size": 112, "fullatt_block_indexes": [7, 15, 23, 31],
+               "image_size": 336, "num_patches": 576, "num_merged_tokens": 1024},
+    "paths": {"lm_weights": "locateanything_3b_bin/locateanything_3b_lm_if4.bin",
+              "vision_weights": "locateanything_3b_bin/locateanything_3b_vision_UNUSED.bin",
+              "hf_model_dir": "locateanything_3b_bin/LocateAnything-3B",
+              "hf_model_repo": "nvidia/LocateAnything-3B",
+              "decoder_program_bin": "locateanything_3b_bin/decoder_program.bin",
+              "decoder_program_meta": "locateanything_3b_bin/decoder_program.json"},
+    "non_layer_regions": {"ROPE": {"offset": "0x86D98800", "size": 262144}},
+    "special": {"rope": {"head_dim": 256, "actual_head_dim": 128, "num_positions": 512,
+                         "theta": 1000000.0, "_mrope_section_unused": [16, 24, 24]},
+                "rms_norm": {"gamma_offset": 0.0}},
+}
+
+# ---- Weight-bin generators (inlined; formerly _gen_lm_bin.py / _gen_connector_bin.py) ----
+# Read HF safetensors directly and emit the wire format weight_init() consumes.
+_GEN_MODEL_DIR = os.path.join(LA_DIR, "locateanything_3b_bin", "LocateAnything-3B")
+_LM_BIN_OUT    = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_lm_if4.bin")
+_CONN_BIN_OUT  = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_connector.bin")
+_GEN_PAD_VOCAB = 152704   # 152681 -> 64*2386; pad rows are zeros (logit 0, harmless for argmax)
+# if4-quantized weights (rest bf16). MUST match _LM_QUANT_LAYERS / weight_init loader.
+_LM_GEN_QUANT_SUFFIXES = ('self_attn.q_proj.weight', 'self_attn.k_proj.weight',
+                          'self_attn.o_proj.weight', 'mlp.gate_proj.weight',
+                          'mlp.up_proj.weight', 'mlp.down_proj.weight')
+_CONN_KEYS = ["mlp1.0.weight", "mlp1.0.bias", "mlp1.1.weight",
+              "mlp1.1.bias", "mlp1.3.weight", "mlp1.3.bias"]
+
+
+def _gen_pad_vocab(t):
+    if t.shape[0] >= _GEN_PAD_VOCAB:
+        return t
+    pad = torch.zeros(_GEN_PAD_VOCAB - t.shape[0], t.shape[1], dtype=t.dtype)
+    return torch.cat([t, pad], dim=0)
+
+
+def gen_lm_bin(precision="if4"):
+    """Generate locateanything_3b_lm_if4.bin (+ .json): q/k/o/gate/up/down if4,
+    v/norms/biases/embed bf16, tied lm_head appended."""
+    import glob
+    from safetensors.torch import load_file
+    sd_full = {}
+    for f in sorted(glob.glob(os.path.join(_GEN_MODEL_DIR, "*.safetensors"))):
+        sd_full.update(load_file(f))
+    items = {"language_model." + k[len("language_model.model."):]: v
+             for k, v in sd_full.items() if k.startswith("language_model.model.")}
+    assert items, "no language_model.model.* keys found"
+    json_path = _LM_BIN_OUT.rsplit('.', 1)[0] + '.json'
+    manifest = {}; count = 0
+    with open(_LM_BIN_OUT, 'wb') as f:
+        for key, t in items.items():
+            if key == "language_model.embed_tokens.weight":
+                t = _gen_pad_vocab(t)
+            if any(key.endswith(s) for s in _LM_GEN_QUANT_SUFFIXES):
+                data, _ = _qs_pack(precision, t); raw = data.tobytes(); key = f'{key}.{precision}'
+            else:
+                raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            offset = f.tell(); f.write(raw)
+            manifest[key] = {'offset': offset, 'size': len(raw)}; count += 1
+    print(f"Weights: {count} tensors, {os.path.getsize(_LM_BIN_OUT)/1048576:.1f} MB -> {_LM_BIN_OUT}")
+    embed_w = _gen_pad_vocab(sd_full['language_model.model.embed_tokens.weight'].detach().to(torch.bfloat16))
+    combined, _ = _qs_pack(precision, embed_w); combined_bytes = combined.tobytes()
+    with open(_LM_BIN_OUT, 'ab') as f:
+        offset = f.tell(); f.write(combined_bytes)
+    manifest[f'lm_head.weight.{precision}'] = {'offset': offset, 'size': len(combined_bytes)}
+    with open(json_path, 'w') as f:
+        json.dump(manifest, f)
+    print(f"LM head ({precision}) appended: {len(combined_bytes)/1048576:.1f} MB; manifest {len(manifest)} keys")
+
+
+def gen_connector_bin():
+    """Generate locateanything_3b_connector.bin (+ .json): mlp1 LayerNorm + 2 Linears, bf16."""
+    import glob
+    from safetensors.torch import load_file
+    sd = {}
+    for f in sorted(glob.glob(os.path.join(_GEN_MODEL_DIR, "*.safetensors"))):
+        sd.update(load_file(f))
+    missing = [k for k in _CONN_KEYS if k not in sd]
+    assert not missing, f"connector keys missing from safetensors: {missing}"
+    manifest = {}
+    with open(_CONN_BIN_OUT, "wb") as f:
+        for k in _CONN_KEYS:
+            raw = sd[k].detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            offset = f.tell(); f.write(raw)
+            manifest[k] = {"offset": offset, "size": len(raw), "shape": list(sd[k].shape)}
+    with open(_CONN_BIN_OUT.rsplit(".", 1)[0] + ".json", "w") as f:
+        json.dump(manifest, f)
+    print(f"connector: {len(_CONN_KEYS)} tensors, {os.path.getsize(_CONN_BIN_OUT)/1048576:.1f} MB -> {_CONN_BIN_OUT}")
 ENGINE_IMG_PLACEHOLDER = 151655   # what run_prefill() scans for; we remap onto it
 LA_IMAGE_TOKEN = 151665           # <IMG_CONTEXT> in LocateAnything
 
@@ -3094,13 +3194,13 @@ def main():
     lm_bin = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_lm_if4.bin")
     if not os.path.exists(lm_bin):
         print("  LM weight bin missing -> generating (one-time, ~45s) ...")
-        import _gen_lm_bin
-        _gen_lm_bin.main()
+        gen_lm_bin()
     # dummy vision bin so the engine's weight_init existence check passes (vision is on GPU)
     open(os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_vision_UNUSED.bin"), "a").close()
 
     def _la_load_config(script_dir):
-        cfg = json.load(open(FPGA_CFG))
+        import copy
+        cfg = copy.deepcopy(_FPGA_CFG)
         wd = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
         for k, r in cfg.get("regions", {}).items():
             wd[k] = _parse_offset(r["offset"]); wd[f"{k}_SIZE"] = r["size"]
@@ -3121,8 +3221,7 @@ def main():
             man_path = conn_bin.rsplit(".", 1)[0] + ".json"
             if not os.path.exists(conn_bin):
                 print("  connector bin missing -> generating ...")
-                import _gen_connector_bin
-                _gen_connector_bin.main()
+                gen_connector_bin()
             man = json.load(open(man_path))
             blob = open(conn_bin, "rb").read()
 
