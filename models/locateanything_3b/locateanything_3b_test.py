@@ -3184,6 +3184,177 @@ def _cpu_bf16_compare(args, hw_answer, prep):
                 exact=(out_ids[:n] == hw_ids[:n] and len(out_ids) == len(hw_ids)))
 
 
+# ============================================================
+#  Quant comparison: bf16 vs if4 vs tq4 (TurboQuant), CPU reference
+# ============================================================
+# Effective-weight method: the WHT rotation is applied *inside* the quantizer
+# (rotate -> Lloyd-Max quant -> dequant -> un-rotate), yielding a dense weight
+# numerically identical to the folded HW version but needing NO model surgery.
+# This isolates the quantization-quality question and is fully deterministic.
+#   if4 scheme:  q,k,o,gate,up,down -> if4 ; v stays bf16     (matches the HW baseline)
+#   tq4 scheme:  q,k,v,o,gate,up    -> tq4 ; down -> if4      (rotations cancel offline)
+#   lm_head: if4 in if4-scheme, tq4 in tq4-scheme. embed stays bf16 in both.
+
+def _qc_hadamard(n, device):
+    """Normalized (orthonormal, symmetric) n×n Walsh-Hadamard matrix; n=2^k."""
+    H = torch.tensor([[1.0]], device=device)
+    while H.shape[0] < n:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    return H / (n ** 0.5)
+
+
+def _qc_if4_eff(W):
+    """if4 round-trip -> reconstructed dense weight (same shape/dtype)."""
+    from quant_lib import quantize_if4, dequantize_if4
+    d, s = quantize_if4(W.detach().to(torch.bfloat16), block_size=64)
+    return dequantize_if4(d, s, W.shape[0], W.shape[1], block_size=64).to(W.device).to(W.dtype)
+
+
+_QC_CB = None  # cached (centroids, decision_boundaries) for the d=128 Lloyd-Max codebook
+
+
+def _qc_tq4_eff(W, block=128):
+    """TurboQuant round-trip: block-Hadamard rotate -> per-block-norm scale ->
+    Lloyd-Max snap -> dequant -> un-rotate. Returns reconstructed dense weight."""
+    from quant_lib import get_codebook
+    global _QC_CB
+    if _QC_CB is None:
+        cb = get_codebook(block, 4)
+        _QC_CB = (torch.tensor(cb["centroids"], dtype=torch.float32),
+                  torch.tensor(cb["boundaries"][1:-1], dtype=torch.float32))
+    out, K = W.shape
+    assert K % block == 0, f"K={K} not divisible by Hadamard block {block}"
+    dev = W.device
+    cen, bnd = _QC_CB[0].to(dev), _QC_CB[1].to(dev)
+    H = _qc_hadamard(block, dev)
+    Wf = W.detach().float().reshape(out, K // block, block)
+    Wr = Wf @ H                                   # rotate each block (H symmetric orthonormal)
+    nrm = Wr.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    idx = torch.searchsorted(bnd, (Wr / nrm).contiguous())
+    deq = cen[idx] * nrm                          # dequant in rotated space
+    return (deq @ H).reshape(out, K).to(W.dtype)  # un-rotate
+
+
+def _quant_compare(args, prep):
+    """Run the CPU reference decoder bf16 / if4 / tq4 on the SAME vision output and
+    return a metrics dict. Teacher-forced logits (aligned to the bf16 sequence) give
+    clean logit MSE/cos/argmax; free greedy runs give exact-match + box deltas."""
+    import locateanything_3b_cpu_test as la
+    from transformers import AutoTokenizer
+    import torch, re
+    import torch.nn.functional as F
+
+    model = prep.get("model")
+    cfg = prep["cfg"]
+    if model is None:
+        model = la.LocateAnything(cfg).eval()
+        la.load_weights(model, la.MODEL_DIR, "cpu", torch.bfloat16)
+    # Run the comparison on CPU: the GPU already holds the full 3B model (kept for
+    # on-device vision) and won't fit the weight clones + forward (OOM). This is an
+    # offline analysis, so correctness > speed.
+    model = model.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    device = torch.device("cpu")
+    dtype = torch.bfloat16
+
+    tok = AutoTokenizer.from_pretrained(la.MODEL_DIR, trust_remote_code=True)
+    text = la.build_prompt_text(la.PROMPTS[args.prompt_kind].format(q=args.query), prep["n_img"])
+    input_ids = tok([text], return_tensors="pt").input_ids.to(device)
+    n_prompt = input_ids.shape[1]
+
+    with torch.no_grad():                                # vision/connector ONCE -> reused by all 3
+        vit = model.vision_features(prep["pixel_values"].to(device, dtype), prep["grid_hw"])
+        conn = model.mlp1(vit).to(dtype)
+
+    LM = model.language_model
+    layers = LM.model.layers
+    n_layers = len(layers)
+
+    def if4_targets():
+        t = []
+        for L in layers:
+            for n in ("q_proj", "k_proj", "o_proj"):       t.append((getattr(L.self_attn, n), _qc_if4_eff))
+            for n in ("gate_proj", "up_proj", "down_proj"): t.append((getattr(L.mlp, n), _qc_if4_eff))
+        t.append((LM.lm_head, _qc_if4_eff))
+        return t
+
+    def tq4_targets():
+        t = []
+        for L in layers:
+            for n in ("q_proj", "k_proj", "v_proj", "o_proj"): t.append((getattr(L.self_attn, n), _qc_tq4_eff))
+            for n in ("gate_proj", "up_proj"):                 t.append((getattr(L.mlp, n), _qc_tq4_eff))
+            t.append((L.mlp.down_proj, _qc_if4_eff))           # down stays if4 (silu⊙up blocks rotation)
+        t.append((LM.lm_head, _qc_tq4_eff))
+        return t
+
+    def apply(targets):
+        orig, sse, ssq = [], 0.0, 0.0
+        with torch.no_grad():
+            for mod, fn in targets:
+                w = mod.weight; o = w.data.clone(); orig.append((w, o))
+                nw = fn(o)
+                sse += ((nw.float() - o.float()) ** 2).sum().item()
+                ssq += (o.float() ** 2).sum().item()
+                w.data.copy_(nw.to(w.dtype))
+        return orig, (sse / ssq if ssq else 0.0)
+
+    def restore(orig):
+        with torch.no_grad():
+            for w, o in orig:
+                w.data.copy_(o)
+
+    @torch.no_grad()
+    def forced(full_ids):                                # teacher-forced logits for the gen positions
+        ids = full_ids.to(device)
+        emb = LM.model.embed_tokens(ids)
+        sel = (ids[0] == model.image_token_index)
+        emb[0, sel] = conn[: int(sel.sum())].to(emb.dtype)
+        T = ids.shape[1]
+        pos = torch.arange(T, device=device).unsqueeze(0)
+        kv = [{"k": None, "v": None} for _ in range(n_layers)]
+        h = LM.model(emb, pos, kv, causal=True)          # [1, T, H]
+        hs = h[:, n_prompt - 1:T - 1, :]                 # only the gen-predicting positions
+        return LM.lm_head(hs)[0].float()                 # [n_gen, V]
+
+    @torch.no_grad()
+    def freerun():
+        return la.generate_slow(model, tok, cfg, prep["pixel_values"], prep["grid_hw"],
+                                input_ids, device, dtype, conn=conn)
+
+    def boxes(ids):
+        s = tok.decode(ids, skip_special_tokens=False)
+        return s, [tuple(map(int, m)) for m in
+                   re.findall(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", s)]
+
+    ref_ids = freerun()                                  # bf16 reference (free greedy)
+    full = torch.cat([input_ids, torch.tensor([ref_ids], device=device)], dim=1)
+    L_ref = forced(full)
+    ref_s, ref_b = boxes(ref_ids)
+
+    schemes = {}
+    for name, build in (("if4", if4_targets), ("tq4", tq4_targets)):
+        orig, wmse = apply(build())
+        Lf = forced(full)
+        own = freerun()
+        restore(orig)
+        own_s, own_b = boxes(own)
+        d = Lf - L_ref
+        nb = min(len(ref_b), len(own_b))
+        schemes[name] = dict(
+            wmse=wmse,
+            max_abs=d.abs().max().item(),
+            mse=(d ** 2).mean().item(),
+            cos=F.cosine_similarity(Lf.flatten(), L_ref.flatten(), dim=0).item(),
+            arg=(Lf.argmax(-1) == L_ref.argmax(-1)).float().mean().item() * 100.0,
+            exact=(own == ref_ids),
+            nboxes=len(own_b), box_match=nb,
+            box_dmax=max((max(abs(a - b) for a, b in zip(ref_b[i], own_b[i])) for i in range(nb)), default=0),
+            answer=own_s.strip(),
+        )
+    return dict(ref_boxes=len(ref_b), ref_answer=ref_s.strip(), n_gen=len(ref_ids), schemes=schemes)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "vette.jpg"))
@@ -3214,6 +3385,9 @@ def main():
     ap.add_argument("--compare", action="store_true",
                     help="after decode, run the CPU bf16 reference on the same image/query "
                          "and print a token/box agreement report under the timing summary")
+    ap.add_argument("--quant-compare", action="store_true",
+                    help="run the CPU reference decoder bf16 vs if4 vs tq4 on the same vision "
+                         "output and print a quant-fidelity comparison at the very bottom")
     args = ap.parse_args()
 
     # ==================================================================
@@ -3523,6 +3697,30 @@ def main():
     path, nb, npt = la.draw_overlay(args.image, answer, out_path)
     print(f"\n{n_boxes} boxes")
     print(f"overlay saved -> {path}  ({nb} boxes, {npt} points)")
+
+    # ---- Quant fidelity comparison: bf16 vs if4 vs tq4 (CPU reference) ----
+    if args.quant_compare:
+        _original_print(f"\n{'='*72}\n  Quant comparison  (CPU reference, same vision output)\n{'='*72}")
+        try:
+            qc = _quant_compare(args, prep)
+            s = qc["schemes"]
+            _original_print(f"  bf16 reference: {qc['n_gen']} gen tokens, {qc['ref_boxes']} boxes")
+            _original_print(f"  {'scheme':<6}{'wMSE':>10}{'logitMSE':>11}{'logit|Δ|max':>13}"
+                            f"{'cos':>9}{'argmax%':>9}{'exact':>7}{'boxes':>7}{'boxΔmax':>9}")
+            for name in ("if4", "tq4"):
+                m = s[name]
+                _original_print(f"  {name:<6}{m['wmse']:>10.2e}{m['mse']:>11.3e}{m['max_abs']:>13.3f}"
+                                f"{m['cos']:>9.5f}{m['arg']:>9.1f}{('yes' if m['exact'] else 'no'):>7}"
+                                f"{m['nboxes']:>7}{m['box_dmax']:>9}")
+            # verdict: closer-to-bf16 = lower logit MSE, higher cos, higher argmax-agreement
+            closer = min(("if4", "tq4"), key=lambda n: s[n]["mse"])
+            _original_print(f"  ── closer to bf16 (lowest logit MSE): {closer.upper()}  "
+                            f"[if4 cos={s['if4']['cos']:.5f} argmax={s['if4']['arg']:.1f}% | "
+                            f"tq4 cos={s['tq4']['cos']:.5f} argmax={s['tq4']['arg']:.1f}%]")
+        except Exception as e:
+            import traceback
+            _original_print(f"  [quant-compare failed] {e}")
+            traceback.print_exc()
 
 
 
