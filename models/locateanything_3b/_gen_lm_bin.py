@@ -53,7 +53,9 @@ def _pad_vocab(t):
 # embed bf16. (LA fork: down_proj moved to bf16 vs the Qwen baseline — must stay
 # in sync with la_decoder_engine.py::_LM_QUANT_LAYERS and the down_weight loader.)
 _LM_QUANT_SUFFIXES = ('self_attn.q_proj.weight', 'self_attn.k_proj.weight',
-                      'mlp.gate_proj.weight', 'mlp.up_proj.weight')
+                      'self_attn.o_proj.weight',
+                      'mlp.gate_proj.weight', 'mlp.up_proj.weight',
+                      'mlp.down_proj.weight')
 
 
 def _qs_pack(precision, tensor):

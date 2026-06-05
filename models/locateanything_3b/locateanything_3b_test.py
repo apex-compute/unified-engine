@@ -306,11 +306,12 @@ _TOP_MAP = {
         'merger.mlp.2.bias': 'v.merger_mlp2.bias',
     },
 }
-# LM-side quant scope: q/k/gate/up (v_proj, o_proj AND down_proj stay BF16).
-# LocateAnything: down_proj moved to BF16 vs the Qwen baseline for MLP accuracy.
-# Must stay in sync with _gen_lm_bin.py::_LM_QUANT_SUFFIXES.
-_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight',
-                    'gate_proj.weight', 'up_proj.weight'}
+# LM-side quant scope: q/k/o/gate/up/down quantized (if4); only v_proj stays BF16
+# (tiny, attention-value sensitive). o_proj+down_proj moved BF16->if4 to cut the
+# decode weight-bandwidth (down_proj 45MB->11MB/layer). if4 is near-lossless
+# (~+0.9% PPL). Must stay in sync with _gen_lm_bin.py::_LM_QUANT_SUFFIXES.
+_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight', 'o_proj.weight',
+                    'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'}
 
 _VALID_PRECISIONS = ('int4', 'fp4', 'if4')
 
@@ -1233,10 +1234,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             for proj, hf_sub in [('q', 'self_attn.q_proj'), ('k', 'self_attn.k_proj'),
                                   ('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj')]:
                 la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
-            # V, O AND down_proj as BF16 from binary (LA: down_proj un-quantized)
+            # V stays BF16 (small, attention-value sensitive); O + down_proj if4-quantized.
             la['v_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.v_proj.weight'].copy()).view(torch.bfloat16))
-            la['o_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.o_proj.weight'].copy()).view(torch.bfloat16))
-            la['down_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.mlp.down_proj.weight'].copy()).view(torch.bfloat16))
+            la['o_scale'], la['o_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.self_attn.o_proj.weight.{lm_prec}'])
+            la['down_scale'], la['down_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.mlp.down_proj.weight.{lm_prec}'])
             # Biases from binary
             for proj, hf_sub in [('q', 'self_attn.q_proj'), ('k', 'self_attn.k_proj'),
                                   ('v', 'self_attn.v_proj')]:
@@ -2237,9 +2238,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     template_seq_len=seq_len,
                 )
 
-            # o_proj (no quantization params for qwen2.5_vl)
-            total_flops += (self.matmat_mul_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+            # o_proj (if4-quantized)
+            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=hd * qpkv, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=self.gf_seq_len) or 0)
 
             # Post-attn residual: layer_input + o_proj. PBI runtime loop.
@@ -2276,8 +2278,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 gpr_M_reg=self.gf_seq_len,
             )
 
-            total_flops += (self.matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.mlp_elements, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=self.gf_seq_len) or 0)
 
             # Post-MLP residual: layer_output = POST_ATTN_RESIDUAL + MLP_DOWN.
@@ -2745,9 +2748,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 )
                 total_flops += (attn_flops[-1] if isinstance(attn_flops, (list, tuple)) else (attn_flops or 0))
 
-            # o_proj (BF16)
-            total_flops += (self.matmat_mul_core(M=1, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+            # o_proj (if4-quantized)
+            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=hd * qpkv, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=gf_one) or 0)
 
             # Qwen2.5-VL: no post-attention norm; residual direct on o_proj output
@@ -2777,9 +2781,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
-            # down_proj
-            total_flops += (self.matmat_mul_core(M=1, K=self.mlp_elements, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+            # down_proj (if4-quantized)
+            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.mlp_elements, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=gf_one) or 0)
 
             # Qwen2.5-VL: no post-FFN norm; residual direct on down_proj output
