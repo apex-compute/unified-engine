@@ -1454,6 +1454,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         print("--- Starting decoder ---")
         hw_decode_lats_us: list[float] = []
+        decoded_chars: list[str] = []
         timer = time.perf_counter()
         token_id = self.prefill_seq[-1]
         _llama_stop_tokens = {128001, 128008, self._end_of_turn_token_id}
@@ -1552,6 +1553,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
@@ -1573,6 +1575,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _original_print(f"Prefill ({prefill_seq_len} tokens): HW={hw_lat_prefill_us/1e3:,.1f} ms  CPU={latency_prefill*1e3:,.1f} ms")
         _original_print(f"Decode 1st token  : HW={hw_decode_first_ms:,.1f} ms/tok  ({1000/hw_decode_first_ms:.2f} tok/s)")
         _original_print(f"Decode  ({tokens_decoded} tokens): HW={hw_decode_avg_ms:,.1f} ms/tok  CPU={cpu_decode_avg_ms:,.1f} ms/tok  ({tokens_decoded/latency_decoder:.2f} tok/s)")
+
+        return {
+            "prefill_tokens": prefill_seq_len,
+            "decoded_text": "".join(decoded_chars),
+            "decoded_tokens": tokens_decoded,
+            "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
+            "decode_speed_tok_s": round(tokens_decoded / latency_decoder, 2),
+            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
+            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
+        }
 
 # -----------------------------------------------------------------------------
 # Main
@@ -1696,9 +1708,10 @@ def main():
         return
 
     print("\n--- Running ---")
-    ue.run_llama()
+    run_result = ue.run_llama()
     ue.clear_dram()
     print("Llama-3.2-1B test ends.")
+    _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
 if __name__ == "__main__":
     main()

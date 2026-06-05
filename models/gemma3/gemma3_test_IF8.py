@@ -1303,6 +1303,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         max_seq_len = self.MAX_CONTEXT_SIZE
         total_latency, total_flop_rate = 0, 0
         decoder_token_cnt = 0
+        decoded_chars: list[str] = []
         while self.seq_len < max_seq_len:
             decoder_token_cnt += 1
             _SILENT_MODE = True
@@ -1338,6 +1339,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             if token_id in [1, self._end_of_turn_token_id]:
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
 
         token_cnt_decoded = self.seq_len
@@ -1346,6 +1348,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         latency_decoder = time.perf_counter() - timer
         print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(self.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
         print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(self.prefill_seq) + 1):.2f} Gflops")
+
+        return {
+            "prefill_tokens": prefill_seq_len,
+            "decoded_text": "".join(decoded_chars),
+            "decoded_tokens": decoder_token_cnt,
+            "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
+            "decode_speed_tok_s": round(decoder_token_cnt / latency_decoder, 2),
+            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
+            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
+        }
         
 # -----------------------------------------------------------------------------
 # Main
@@ -1415,6 +1427,7 @@ def main():
 
     run_result = ue.run_gemma3(slave_engine=ue2 if dual_engine else None)
     print("Gemma3 test ends.")
+    _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
     global _SILENT_MODE
     _SILENT_MODE = True

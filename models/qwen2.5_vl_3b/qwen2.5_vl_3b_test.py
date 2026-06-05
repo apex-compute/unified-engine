@@ -2713,7 +2713,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             return self.seq_len
 
         _qwen25_stop_tokens = {151643, 151645, self._end_of_turn_token_id}
-
+        decoded_chars: list[str] = []
         ahd = self.actual_head_dim
         bpe = self.bytes_per_element
         rope_row_bytes = ahd * 2 * bpe
@@ -2772,8 +2772,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             if token_id in _qwen25_stop_tokens:
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
-        return self.seq_len
+        return self.seq_len, "".join(decoded_chars)
 
 def process_image(image_path: str, size: int = 448) -> torch.Tensor:
     """Load, resize, normalize image -> [3, size, size] bf16."""
@@ -2981,7 +2982,7 @@ def main():
 
     print(f"\n--- Decode run ---")
     timer = time.perf_counter()
-    token_cnt_decoded = ue.run_decoder(decoder_program_addr, token_id=prefill_seq[-1], gflops=gflops_per_token, repetition_penalty=args.rep_penalty)
+    token_cnt_decoded, decoded_text = ue.run_decoder(decoder_program_addr, token_id=prefill_seq[-1], gflops=gflops_per_token, repetition_penalty=args.rep_penalty)
     latency_decoder = time.perf_counter() - timer
     n_new = token_cnt_decoded - len(prefill_seq)
     print(f"\n  {latency_decoder:.2f}s ({n_new} tokens, {latency_decoder/max(n_new,1):.2f}s/tok)")
@@ -3003,6 +3004,15 @@ def main():
     total = (t_total if has_image else 0) + t_prefill_compile + latency_prefill + t_decode_compile + latency_decoder
     print(f"  ──────────────────────────")
     print(f"  Total:            {total:.2f}s")
+    _original_print(f"TEST_RESULT: {json.dumps({
+        'prefill_tokens':      len(prefill_seq),
+        'decoded_text':        decoded_text,
+        'decoded_tokens':      max(n_new, 0),
+        'prefill_speed_tok_s': round(len(prefill_seq) / latency_prefill, 2),
+        'decode_speed_tok_s':  round(n_new / latency_decoder, 2) if n_new > 0 else 0.0,
+        'prefill_size_kb':     None,
+        'decoder_size_kb':     None,
+    })}")
 
 if __name__ == "__main__":
     main()
