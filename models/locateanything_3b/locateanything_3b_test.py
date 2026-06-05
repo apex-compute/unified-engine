@@ -4064,7 +4064,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     # weight/tensor addresses + absolute jumps, so reload is valid only when load_weights/
     # setup_dram ran first and the program lands at the same addr (deterministic alloc order). ---
     os.makedirs(_BIN_DIR, exist_ok=True)
-    cache_bin = os.path.join(_BIN_DIR, f"moonvit_encoder_N{N}_{prec}.bin")
+    cache_bin = os.path.join(_BIN_DIR, f"moonvit_encoder_N{N}_{prec}_pbi.bin")
     if os.path.exists(cache_bin):
         with open(cache_bin, "rb") as f:
             prog = f.read()
@@ -4076,16 +4076,24 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         return program_addr
 
     def _mm(M, K, Nn, A, name, la, OUT, bias=None, gelu=False):
-        """Precision-aware matmul: if4 (quantized B + scale) or bf16."""
+        """Precision-aware matmul: if4 (quantized B + scale) or bf16.
+
+        PBI runtime-M: passes gpr_M_reg=vis_M_reg (primed with N) so matmat_mul_core
+        routes to matmat_mul_core_pbi -> ONE templated M-iteration + hardware loop
+        instead of unrolling ~M/M_chunk static tiles. This is the dominant program-
+        size win (6 big matmuls/layer x 27 layers). Mirrors the LM prefill matmuls
+        (locateanything_3b_test.py: q/k/v/o/gate/up all pass gpr_M_reg=gf_seq_len).
+        Flash/permute/norm stay static (flash can't be PBI - back-to-back bug)."""
         if prec == "if4":
             ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_data'],
                                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                                is_B_quantized=True, data_type=TYPE.IF4,
-                               SCALE_DRAM_ADDR=la[f'{name}_scale'], gelu_enable=gelu)
+                               SCALE_DRAM_ADDR=la[f'{name}_scale'], gelu_enable=gelu,
+                               gpr_M_reg=vis_M_reg)
         else:
             ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_weight'],
                                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                               gelu_enable=gelu)
+                               gelu_enable=gelu, gpr_M_reg=vis_M_reg)
 
     ue.start_capture()
 
