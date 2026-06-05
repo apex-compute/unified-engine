@@ -578,10 +578,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         #            36 LM layers INT4+BF16 V/O, INT4 lm_head 165MB, RoPE, vision FP4 ~350MB)
         #   tensors: 0x90000000 – 0xA0000000 (256 MB: LM+vision intermediates ~182MB)
         #   instructions: 0xA0000000 – 0x100000000 (1.5 GB: encoder ~648MB + LM ~94MB)
+        # LocateAnything keeps v/o/down in BF16, so LM weights reach ~3.08GB and
+        # run past the old scratch base (0x90000000) and program base (0xA0000000)
+        # -> runtime writes stomped layers ~28-35's weights (NaN at decode layer 29).
+        # Relocate scratch + program arenas ABOVE the weight blob; the device is 4GB
+        # (offset ceiling 0x100000000), so 3.08GB weights + scratch + programs fit.
         super().__init__(
-            params_dram_base=0x00000000,
-            tensor_dram_base=0x90000000,
-            program_dram_base=0xA0000000,
+            params_dram_base=0x00000000,   # weights:  0x0      .. ~0xB96xxxxx (3.08GB + connector)
+            tensor_dram_base=0xC0000000,   # scratch:  0xC0000000.. ~0xCC400000 (~208MB)
+            program_dram_base=0xCE000000,  # programs: 0xCE000000.. <0x100000000 (~800MB)
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
@@ -2386,10 +2391,16 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         # Causal bias for packed FLASH_Q (q_seq_len rows of Q vs q_seq_len rows of K duplicated qpkv times per token).
         # Lower-triangular on aligned_seq_len × aligned_seq_len; mask K cols beyond actual q_seq_len.
-        bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
+        # Use a FINITE mask sentinel (matching run_decoder's -1e36), NOT float("-inf").
+        # The tiled flash softmax tracks a per-tile max; a fully-masked 64-wide tile
+        # (common for early causal rows) gives tile_max=-inf -> exp(-inf-(-inf))=NaN,
+        # which contaminates the running sum and propagates NaN through every layer.
+        # A large finite negative keeps the tile max finite (exp(0)=1, normalized away).
+        NEG_MASK = -1e36
+        bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), NEG_MASK, dtype=torch.bfloat16)
         valid_mask = torch.tril(torch.ones(aligned_seq_len, aligned_seq_len, dtype=torch.bool), diagonal=0) if not self.causal_mask_upper else torch.triu(torch.ones(aligned_seq_len, aligned_seq_len, dtype=torch.bool), diagonal=0)
         bias_one_group.masked_fill_(valid_mask, 0.0)
-        bias_one_group[:, q_seq_len:] = float("-inf")
+        bias_one_group[:, q_seq_len:] = NEG_MASK
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
 
         # Emit runtime preamble: ADD_SETs for the 3 GPRs + JUMP_ABS into prefill.
@@ -2406,6 +2417,189 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.start_execute_from_dram(preamble_addr)
         self.wait_queue(180.0)
         print(f"    Prefill executed: actual_seq_len={actual_seq_len}, q_seq_len={q_seq_len}, bucket_idx={bucket_idx}")
+
+    # ------------------------------------------------------------------
+    # NaN localizer: compile a K-layer prefill (NO cache), run it, and read
+    # back intermediate DRAM buffers to find the first op that produces NaN.
+    # ------------------------------------------------------------------
+    def _compile_klayer_prefill(self, K: int):
+        """Compile a fresh K-layer prefill program (bypasses the s384 cache).
+        Returns (program_addr, preamble_addr)."""
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        self.clear_inst_id()
+        self.start_capture()
+        self._emit_prefill_program(seq_len=self.PREFILL_MAX_SEQ_LEN, layer_size=K)
+        self.stop_capture()
+        prog = bytearray()
+        for inst in self.capture_buffer:
+            prog.extend(inst.get_bytes())
+        addr = self.get_program_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, addr, bytes(prog), len(prog))
+        self.allocate_program_dram(len(prog))
+        preamble = self.allocate_program_dram(256)
+        self.clear_capture_buffer()
+        _SILENT_MODE = False
+        return addr, preamble
+
+    def _scan(self, name: str, addr: int, M: int, N: int):
+        """DMA back [M,N] bf16 from DRAM and report nan/inf/min/max."""
+        t = self.dma_from_accelerator_memory(addr, (M, N)).cpu().float()
+        nan = int(torch.isnan(t).sum())
+        inf = int(torch.isinf(t).sum())
+        finite = t[torch.isfinite(t)]
+        lo = float(finite.min()) if finite.numel() else float("nan")
+        hi = float(finite.max()) if finite.numel() else float("nan")
+        flag = "  <-- FIRST NaN" if nan else ("  <-- inf" if inf else "")
+        _original_print(f"    {name:26s} nan={nan:>7} inf={inf:>5} min={lo:+.3e} max={hi:+.3e}{flag}")
+        return nan, inf
+
+    def _layer_buffer_order(self):
+        """Intermediate buffers in the exact order they are written within a
+        layer. After a K-layer prefill these hold layer (K-1)'s compute."""
+        ahd, qpkv, hd = self.actual_head_dim, self.group_size, self.head_dim
+        V, MLP = self.vector_length, self.mlp_elements
+        return [
+            ("input (residual in)",   self.LAYER0_INPUT_DRAM,             V),
+            ("pre_norm (ln1)",        self.LAYER0_PRE_NORM_DRAM,          V),
+            ("q_proj",                self.LAYER0_Q_DRAM,                 hd * qpkv),
+            ("k_proj+rope",           self.LAYER0_K_DRAM,                 hd),
+            ("v_proj",                self.LAYER0_V_PROJ_TEMP,            hd),
+            ("flash_output",          self.LAYER0_FLASH_OUTPUT_DRAM,      hd * qpkv),
+            ("o_proj",                self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,  V),
+            ("post_attn_residual",    self.LAYER0_POST_ATTN_RESIDUAL_DRAM, V),
+            ("pre_mlp_norm (ln2)",    self.LAYER0_PRE_MLP_NORM_DRAM,      V),
+            ("mlp_gate (silu)",       self.LAYER0_MLP_GATE_DRAM,          MLP),
+            ("mlp_up",                self.LAYER0_MLP_UP_DRAM,            MLP),
+            ("mlp_gate*up",           self.LAYER0_MLP_MULT_DRAM,          MLP),
+            ("mlp_down",              self.LAYER0_MLP_DOWN_DRAM,          V),
+            ("layer_output",          self.LAYER0_OUTPUT_DRAM,            V),
+        ]
+
+    def prefill_nan_probe(self, prefill_seq, max_layers: int = 36):
+        """Walk layers 0..max_layers-1. For each layer j, run a (j+1)-layer
+        prefill (so the LAYER0_* scratch holds layer j's compute) and scan every
+        intermediate buffer in op order. Stop at the FIRST layer that produces a
+        NaN/inf and report the exact op."""
+        _original_print("\n=== NaN PROBE: per-layer op scan (stops at first NaN) ===")
+        order = self._layer_buffer_order()
+        for j in range(max_layers):
+            prog, pre = self._compile_klayer_prefill(K=j + 1)
+            self.run_prefill(prog, pre, prefill_seq=prefill_seq, has_image=True)
+            M = self.seq_len
+            _original_print(f"\n  --- layer {j} (ran K={j + 1} layers) ---")
+            first_bad = None
+            for name, addr, N in order:
+                # For layers >0 the only meaningful "input" is the residual copy;
+                # all op buffers belong to THIS layer j.
+                nan, inf = self._scan(name, addr, M, N)
+                if first_bad is None and (nan or inf):
+                    first_bad = name
+            if first_bad:
+                _original_print(f"\n  >>> FIRST NaN: layer {j}, op '{first_bad}'")
+                return True
+        _original_print(f"\n  No NaN found through {max_layers} prefill layers.")
+        _original_print("  => Prefill is finite. NaN must be in the readout/decode path.")
+        return False
+
+    def _compile_klayer_decoder(self, K: int):
+        """Compile a fresh K-layer decoder program (bypasses cache). For K<36 it
+        omits final-norm/lm_head, leaving layer K-1's output in LAYER0_OUTPUT_DRAM.
+        Returns (program_addr, preamble_addr)."""
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        self.clear_inst_id()
+        self.start_capture()
+        self._emit_decoder_program(layer_size=K)
+        self.stop_capture()
+        prog = bytearray()
+        for inst in self.capture_buffer:
+            prog.extend(inst.get_bytes())
+        addr = self.get_program_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, addr, bytes(prog), len(prog))
+        self.allocate_program_dram(len(prog))
+        preamble = self.allocate_program_dram(256)
+        self.clear_capture_buffer()
+        _SILENT_MODE = False
+        return addr, preamble
+
+    def _decode_one_step(self, program_addr, preamble_addr, token_id, seq_len_before):
+        """Run exactly one decode step (token_id) at position seq_len_before,
+        jumping into program_addr. Mirrors run_decoder's per-step body but does
+        not read logits or advance persistent state beyond self.seq_len."""
+        ahd = self.actual_head_dim
+        bpe = self.bytes_per_element
+        rope_row_bytes = ahd * 2 * bpe
+        ROPE_BASE = self.DRAM_ADDR_ROPE
+
+        self.seq_len = seq_len_before + 1
+        step_pos = self.seq_len - 1
+        aligned_seq_len = ((self.seq_len + 63) // 64) * 64
+        bucket_idx = max(1, aligned_seq_len // UE_VECTOR_SIZE)
+        rope_pos = step_pos + getattr(self, '_rope_offset', 0)
+        cos_abs_addr = ROPE_BASE + rope_pos * rope_row_bytes
+
+        emb = self.get_embedding_for_tokens([token_id])
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, emb)
+        bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+        bias_host[0, :self.seq_len] = 0.0
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
+
+        self.clear_inst_id()
+        self.start_capture()
+        self.generate_instruction_add_set(self.gf_seq_len, step_pos)
+        self.generate_instruction_add_set(self.gf_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self._gf_rope_cos_abs, ue_35bit_addr_shifter(cos_abs_addr))
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(program_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(preamble_addr)
+        self.clear_capture_buffer()
+        self.start_execute_from_dram(preamble_addr)
+        self.wait_queue(10.0)
+
+    def decode_nan_probe(self, token_id, max_layers: int = 36):
+        """After a full prefill, sweep K=1..36 decode layers: run ONE decode step
+        through a K-layer decoder and scan layer (K-1)'s output. Stop at the first
+        decode layer that goes NaN and dump its op buffers."""
+        _original_print("\n=== DECODE NaN PROBE: per-layer single-step scan ===")
+        seq0 = self.seq_len
+        V = self.vector_length
+        for j in range(max_layers):
+            prog, pre = self._compile_klayer_decoder(K=j + 1)
+            self._decode_one_step(prog, pre, token_id, seq_len_before=seq0)
+            nan, inf = self._scan(f"decode layer {j} output", self.LAYER0_OUTPUT_DRAM, 1, V)
+            if nan or inf:
+                _original_print(f"\n  >>> first decode NaN at layer {j}. Op buffers for layer {j}:")
+                for name, addr, N in self._layer_buffer_order():
+                    self._scan(name, addr, 1, N)
+                # Root-cause the ln1 blowup: dump gamma + input, recompute RMSNorm on host.
+                la = self.lm_layer_addrs[j]
+                gamma = self.dma_from_accelerator_memory(la['ln1_gamma'], (V,)).cpu().float()
+                xin = self.dma_from_accelerator_memory(self.LAYER0_INPUT_DRAM, (1, V)).cpu().float().flatten()
+                g_abs = gamma.abs()
+                rms = (xin.pow(2).mean() + 1e-6).sqrt()
+                host_norm = xin / rms * gamma
+                gi = int(g_abs.argmax())
+                _original_print(f"\n  [root] layer {j} ln1_gamma: min={gamma.min():+.3e} max={gamma.max():+.3e} "
+                                f"|max|@dim={gi} (gamma={gamma[gi]:+.3e}, x={xin[gi]:+.3e})")
+                _original_print(f"  [root] input rms={rms:.3e}  host RMSNorm: min={host_norm.min():+.3e} max={host_norm.max():+.3e}")
+                _original_print(f"  [root] => {'GAMMA looks corrupt (huge entries)' if g_abs.max() > 1e3 else 'gamma normal -> HW norm path bug'}")
+                # Address-map / boundary check across neighbor layers.
+                _original_print("\n  [map] per-layer ln1_gamma DRAM addr + readback absmax (source=2.2):")
+                for li in range(max(0, j - 5), min(self.LAYER_SIZE, j + 3)):
+                    a = self.lm_layer_addrs[li]['ln1_gamma']
+                    gv = self.dma_from_accelerator_memory(a, (V,)).cpu().float()
+                    nanc = int(torch.isnan(gv).sum())
+                    over = ">4GB-32b" if a > 0xFFFFFFFF else ""
+                    _original_print(f"    layer {li:2d}: ln1_gamma @ 0x{a:011X} {over:8s} "
+                                    f"absmax={gv.abs().max():.3e} nan={nanc}")
+                _original_print(f"  [map] tensor LAYER0_INPUT_DRAM=0x{self.LAYER0_INPUT_DRAM:011X} "
+                                f"LAYER0_OUTPUT_DRAM=0x{self.LAYER0_OUTPUT_DRAM:011X} "
+                                f"params_base=0x{self._params_dram_base:011X} "
+                                f"params_end=0x{self.get_params_dram_addr():011X}")
+                _original_print(f"\n  >>> FIRST NaN: decode layer {j}")
+                return
+        _original_print("\n  No decode-layer NaN found (?!) — check final-norm/lm_head wiring.")
 
     def _emit_decoder_program(self, layer_size: int) -> int:
         """Emit ONE decode-position-agnostic decoder program (PBI single-bin pattern).
@@ -2744,8 +2938,23 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 token_id = self.get_arg_max_index()
 
             if getattr(self, "_debug_logits", False) and len(generated_tokens) == 0:
+                # Decode layer-35 op scan: after one step the LAYER0_* scratch holds
+                # the LAST decode layer's compute. Localizes NaN within decode.
+                _original_print("\n[HW decode] layer 35 op scan (M=1):")
+                for _name, _addr, _N in self._layer_buffer_order():
+                    self._scan(_name, _addr, 1, _N)
+                # Readout localization: final RMSNorm output, then lm_head logits.
+                _fn = self.dma_from_accelerator_memory(
+                    self.OUTPUT_NORM_DRAM, (1, self.vector_length)).cpu().float()
+                _fn_nan = int(torch.isnan(_fn).sum()); _fn_inf = int(torch.isinf(_fn).sum())
+                _fnf = _fn[torch.isfinite(_fn)]
+                _original_print(f"\n[HW readout] final_norm: nan={_fn_nan} inf={_fn_inf} "
+                                f"min={(_fnf.min() if _fnf.numel() else float('nan')):+.3e} "
+                                f"max={(_fnf.max() if _fnf.numel() else float('nan')):+.3e}")
                 _dl = self.dma_from_accelerator_memory(
                     self.LOGITS_DRAM, (self.EMBEDDING_ELEMENTS,)).cpu().float()
+                _l_nan = int(torch.isnan(_dl).sum()); _l_inf = int(torch.isinf(_dl).sum())
+                _original_print(f"[HW readout] lm_head logits: nan={_l_nan} inf={_l_inf}")
                 _dtopv, _dtopi = _dl.topk(10)
                 _original_print("\n[HW logits] first decode step (post-prefill):")
                 _original_print(f"  argmax={token_id} ({self.tokenizer.decode([token_id])!r})  "
@@ -2846,6 +3055,19 @@ def main():
                     help="suppress compile/engine chatter (URAM usage, captured-instruction "
                          "dumps, etc.); timing summary + output still print")
     args = ap.parse_args()
+
+    # ==================================================================
+    # HARDCODED DEBUG CONFIG (no flags needed). Flip these in code.
+    # ==================================================================
+    args.image       = os.path.join(REPO_ROOT, "test_samples", "people.jpg")
+    args.query       = "person"
+    args.prompt_kind = "detect"
+    args.gpu_vision  = True          # MoonViT on GPU; isolate the LM
+    PROBE_PREFILL_NAN = False        # True: layer-by-layer prefill sweep. False: fast prefill+decode.
+    PROBE_DECODE_NAN  = False        # True: after prefill, sweep decode layers for the first NaN.
+    PROBE_ADDR_MAP    = False        # fast: dump per-layer weight addrs + DRAM readback, then exit (no prefill)
+    FORCE_DEBUG_LOGITS = True        # dump final_norm + lm_head NaN breakdown on first decode step
+    # ==================================================================
 
     global _SILENT_MODE
     _SILENT_MODE = args.silent
@@ -2964,7 +3186,25 @@ def main():
             self._vis_num_tokens = N
 
     ue = LADecoder(script_dir=LA_DIR)
-    ue._debug_logits = bool(os.environ.get("LA_DEBUG_LOGITS"))
+    ue._debug_logits = bool(os.environ.get("LA_DEBUG_LOGITS")) or FORCE_DEBUG_LOGITS
+
+    if PROBE_ADDR_MAP:
+        # Fast: dump per-layer weight addresses + DRAM read-back (source ln1_gamma absmax=2.2),
+        # no prefill/decode needed. Detects unwritten/garbage upper-region weights.
+        V = ue.vector_length
+        _original_print("\n=== ADDR MAP: ln1_gamma per layer (source absmax=2.20) ===")
+        _original_print(f"  params_base=0x{ue._params_dram_base:011X}  params_end=0x{ue.get_params_dram_addr():011X}  "
+                        f"usage={ue.get_params_dram_usage()/1e9:.3f}GB")
+        _original_print(f"  tensor LAYER0_INPUT=0x{ue.LAYER0_INPUT_DRAM:011X}  LAYER0_OUTPUT=0x{ue.LAYER0_OUTPUT_DRAM:011X}")
+        for li in range(ue.LAYER_SIZE):
+            a = ue.lm_layer_addrs[li]['ln1_gamma']
+            gv = ue.dma_from_accelerator_memory(a, (V,)).cpu().float()
+            nanc = int(torch.isnan(gv).sum())
+            over = ">4GB-32b" if a > 0xFFFFFFFF else ""
+            bad = "  <-- BAD" if (nanc or gv.abs().max() > 1e3) else ""
+            _original_print(f"    layer {li:2d}: 0x{a:011X} {over:9s} absmax={gv.abs().max():.3e} nan={nanc}{bad}")
+        return
+
     ue.load_connector()
 
     # ---- 2b. FPGA MoonViT encoder (optional): produces vit[N_merged,4608] in DRAM ----
@@ -3012,6 +3252,15 @@ def main():
         print(f"  [check] connector FPGA vs GPU: max|Δ|={diff.max():.4f}  "
               f"mean|Δ|={diff.mean():.5f}  rel={diff.mean()/denom:.4f}")
 
+    # ---- 3b. NaN localizer (hardcoded debug path) ----
+    if PROBE_PREFILL_NAN:
+        ue._vis_num_tokens = n_img
+        found = ue.prefill_nan_probe(prefill_seq)
+        if found:
+            return
+        # Prefill clean -> fall through to decode with readout NaN dump enabled.
+        ue._debug_logits = True
+
     # ---- 4. Prefill + decode on FPGA ----
     _original_print("\n=== Prefill ===")
     _original_print("--- Prefill compile ---")
@@ -3026,6 +3275,11 @@ def main():
     t_prefill_run = time.perf_counter() - timer
     prefill_hw_gflops = getattr(ue, '_last_hw_gflops', 0)
     _original_print(f"  {t_prefill_run:.2f}s  ({prefill_hw_gflops:.2f} GFLOPS)")
+
+    if PROBE_DECODE_NAN:
+        ue._rope_offset = 0  # plain 1D rope (decode positions sequential)
+        ue.decode_nan_probe(prefill_seq[-1])
+        return
 
     _original_print("\n=== Decode ===")
     _original_print("--- Decode compile ---")
