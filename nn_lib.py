@@ -43,6 +43,7 @@ from user_dma_core import (
     UE_VECTOR_SIZE,
     URAM_FULL_ELEMENTS,
     URAM_NEAR_FULL_ELEMENTS,
+    ue_35bit_addr_shifter,
 )
 
 # Standard URAM section bases used across all _core_dram helpers.
@@ -669,6 +670,101 @@ def rope_hf_core_dram(ue, M: int, D: int,
                                       accelerator_dram_address=OUTPUT_DRAM_ADDR + row_offset + half_bytes,
                                       element_size=half_D)
 
+    return M * D * 4
+
+
+def rope_hf_core_dram_pbi(ue, M: int, D: int,
+                          X_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, ROPE_PACKED_ADDR: int,
+                          gpr_M_reg: int, tmp_reg: int, t_reg: int) -> int:
+    """PBI (hardware-loop) prefill RoPE for head_dim D < 128 (padded-split scheme).
+
+    Token count is a *runtime* trip count from ``gpr_M_reg`` (caller primes it via
+    ADD_SET); ``M`` is FLOPs-accounting / loop-template only, so the captured program
+    is seq_len-agnostic. Caller brackets with start_capture()/stop_capture().
+
+    D=64 means each half is 32 elems = 64 bytes = half a 128-byte SRAM row, and SRAM
+    cannot be addressed mid-row. We sidestep that entirely: every DMA uses a
+    *register-computed* DRAM address (``general_reg_src``) — DRAM is byte-addressable —
+    so the two 32-elem halves land in their own 128-byte-aligned SRAM rows. No PBI
+    pointers are used (reads and writes are both register-addressed), so this stays
+    clear of the >=4-advancing-pointer failure mode.
+
+    ``ROPE_PACKED_ADDR`` points at a per-token packed table laid out as
+    ``[cos_lo | cos_hi | sin_lo | sin_hi]``, each 32-elem half zero-padded to
+    ``UE_VECTOR_SIZE`` (64) so it occupies one full 128-byte SRAM row. ``sin_lo`` must
+    be pre-negated on the host (matches :func:`rope_hf_core_dram`). One DMA loads all
+    four rows contiguously; element_size=32 slices read each row from its aligned start.
+
+    Registers: ``gpr_M_reg`` (outer trip count), ``tmp_reg`` (address scratch),
+    ``t_reg`` (per-token counter, set to 0 here and incremented each iteration).
+    """
+    assert D % 2 == 0, "D must be even for RoPE half layout"
+    assert D < 128, "rope_hf_core_dram_pbi is the D<128 padded-split path; use the shared rope for D>=128"
+    bpe = 2
+    half_D = D // 2                       # 32
+    half_bytes = half_D * bpe             # 64
+    row_bytes = D * bpe                   # 128 (x / output row)
+    PAD = UE_VECTOR_SIZE                  # 64 — pad each half to a full URAM row
+    pad_row_bytes = PAD * bpe             # 128
+    rope_stride = 4 * pad_row_bytes       # 512 — packed cos_lo|cos_hi|sin_lo|sin_hi
+
+    # eltwise requires its two operands in DIFFERENT URAM banks (A: 0x00000+, B: 0x80000+).
+    # URAM_A holds x + cos-products + results; URAM_B holds the packed cos/sin + sin-products.
+    SRAM_SLOT = 128
+    uram_x_lo      = 0x00000              # URAM_A
+    uram_x_hi      = 0x00080
+    uram_a_lo      = 0x00100
+    uram_a_hi      = 0x00180
+    uram_result_lo = 0x00200
+    uram_result_hi = 0x00280
+
+    uram_cos_lo    = 0x80000              # URAM_B — packed read lands the 4 rows here ...
+    uram_cos_hi    = uram_cos_lo + SRAM_SLOT
+    uram_sin_lo    = uram_cos_hi + SRAM_SLOT
+    uram_sin_hi    = uram_sin_lo + SRAM_SLOT
+    uram_b_lo      = uram_sin_hi + SRAM_SLOT
+    uram_b_hi      = uram_b_lo   + SRAM_SLOT
+
+    shift = ue_35bit_addr_shifter
+
+    def _set_addr(base, stride):
+        # tmp_reg = shift(base) + t_reg * shift(stride)  ==  shift(base + t*stride)
+        # (linear because base & stride are 8-byte aligned; shift is >>3)
+        ue.generate_instruction_reg_mul_imm(tmp_reg, t_reg, shift(stride))
+        ue.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+
+    ue.generate_instruction_add_set(t_reg, 0)
+    ue.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
+
+    # --- register-addressed reads (each half into its own aligned row) ---
+    _set_addr(X_DRAM_ADDR, row_bytes)
+    ue.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=uram_x_lo,
+                                  element_size=half_D, general_reg_src=tmp_reg)
+    _set_addr(X_DRAM_ADDR + half_bytes, row_bytes)
+    ue.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=uram_x_hi,
+                                  element_size=half_D, general_reg_src=tmp_reg)
+    _set_addr(ROPE_PACKED_ADDR, rope_stride)
+    ue.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=uram_cos_lo,
+                                  element_size=4 * PAD, general_reg_src=tmp_reg)
+
+    # --- compute (all operands start on 128-byte SRAM rows, element_size=32) ---
+    ue.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half_D)   # a_lo = x_lo * cos_lo
+    ue.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half_D)   # a_hi = x_hi * cos_hi
+    ue.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half_D)   # b_lo = x_hi * (-sin)
+    ue.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half_D)   # b_hi = x_lo * sin
+    ue.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half_D)
+    ue.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half_D)
+
+    # --- register-addressed writes ---
+    _set_addr(OUTPUT_DRAM_ADDR, row_bytes)
+    ue.sram_to_accelerator_memory(sram_address=uram_result_lo, accelerator_dram_address=0,
+                                  element_size=half_D, general_reg_src=tmp_reg)
+    _set_addr(OUTPUT_DRAM_ADDR + half_bytes, row_bytes)
+    ue.sram_to_accelerator_memory(sram_address=uram_result_hi, accelerator_dram_address=0,
+                                  element_size=half_D, general_reg_src=tmp_reg)
+
+    ue.generate_instruction_add_inc(t_reg)
+    ue.loop_end()
     return M * D * 4
 
 

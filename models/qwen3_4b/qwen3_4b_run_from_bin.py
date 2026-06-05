@@ -26,7 +26,7 @@ Architecture notes:
 Usage:
   python qwen3_4b_run_from_bin.py
   python qwen3_4b_run_from_bin.py --prompt "your prompt"
-  python qwen3_4b_run_from_bin.py --dev xdma0 [--cycle 5.62]
+  python qwen3_4b_run_from_bin.py --dev xdma0 [--device kintex7] [--cycle 5.15]
   python qwen3_4b_run_from_bin.py --local-weights
 """
 
@@ -840,6 +840,15 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
 # Offline runner — no compile machinery. Reads meta JSON from disk, loads the
 # pre-compiled bin to DRAM, runs prefill + decoder.
 # -----------------------------------------------------------------------------
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen3-4B inference from pre-compiled bins (offline)")
@@ -849,8 +858,8 @@ def main():
                         help="Use qwen3_4b_bin/full_model_weights.bin instead of weights_qwen3_4b_hf.bin")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (default: xdma0)")
-    parser.add_argument("--cycle", type=float, default=5.62,
-                        help="Clock cycle time in ns (default: 5.62ns ≈ peak 22.8 GFLOPS)")
+    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     # Sampling DEFAULTS to the validated long-context config (temp 0.7 / top-p 0.9
     # / rep-penalty 1.2). --temperature 0 forces greedy fast path.
     parser.add_argument('--temperature', type=float, default=0.7,
@@ -897,10 +906,13 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
-    _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
-                    f"UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     global _SILENT_MODE
     _SILENT_MODE = True
