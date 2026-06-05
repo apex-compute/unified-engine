@@ -2261,6 +2261,16 @@ def main():
     n_generated = len(hw_tokens)
     _original_print(f"\nDecoder done in {total_time:.2f} seconds, total {n_generated} tokens.")
     _original_print("SmolVLM2 test ends.")
+    decoded_text = ue.tokenizer.decode(hw_tokens, skip_special_tokens=True)
+    _original_print(f"TEST_RESULT: {json.dumps({
+        'prefill_tokens':      seq_len,
+        'decoded_text':        decoded_text,
+        'decoded_tokens':      n_generated,
+        'prefill_speed_tok_s': round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0,
+        'decode_speed_tok_s':  round(n_generated / decode_time, 2) if decode_time > 0 else 0.0,
+        'prefill_size_kb':     None,
+        'decoder_size_kb':     None,
+    })}")
 
     # Reset device DRAM + soft-reset at end of execution so leftover program/KV/scratch
     # state doesn't contaminate the next model run. Use zero_dram() (not clear_dram(),

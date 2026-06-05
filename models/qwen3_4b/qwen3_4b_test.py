@@ -1541,7 +1541,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
 
         # Qwen3 stop tokens: <|im_end|>=151645, <|endoftext|>=151643
         _qwen3_stop_tokens = {151643, 151645, self._end_of_turn_token_id}
-
+        decoded_chars: list[str] = []
         global _SILENT_MODE
         # Decoder PBI buckets cover seq_len = i * UE_VECTOR_SIZE for i = 1..num_buckets,
         # spanning MAX_CONTEXT_SIZE. Bias buffer must match the maximum bucket size
@@ -1595,8 +1595,9 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             if token_id in _qwen3_stop_tokens:
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
-        return self.seq_len
+        return self.seq_len, "".join(decoded_chars)
 
 # -----------------------------------------------------------------------------
 # Main
@@ -1723,7 +1724,7 @@ def main():
 
     print(f"\n--- Starting decoder ---")
     timer = time.perf_counter()
-    token_cnt_decoded = ue.run_decoder(decoder_program_addr, preamble_addr,
+    token_cnt_decoded, decoded_text = ue.run_decoder(decoder_program_addr, preamble_addr,
                                        token_id=prefill_seq[-1],
                                        gflops_per_token=decoder_total_flops)
     latency_decoder = time.perf_counter() - timer
@@ -1731,6 +1732,15 @@ def main():
     print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, total {token_cnt_decoded} tokens, "
           f"decode speed: {decoded_tokens / latency_decoder:.2f} tokens/s ({decoded_tokens} decoded tokens / {latency_decoder:.2f}s).")
     print("Qwen3-4B test ends.")
+    _original_print(f"TEST_RESULT: {json.dumps({
+        'prefill_tokens':      len(prefill_seq),
+        'decoded_text':        decoded_text,
+        'decoded_tokens':      decoded_tokens,
+        'prefill_speed_tok_s': round(len(prefill_seq) / latency_prefill, 2),
+        'decode_speed_tok_s':  round(decoded_tokens / latency_decoder, 2),
+        'prefill_size_kb':     round(inst_meta['prefill_program_size'] / 1024, 1),
+        'decoder_size_kb':     round(inst_meta['decoder_program_size'] / 1024, 1),
+    })}")
 
 if __name__ == "__main__":
     main()

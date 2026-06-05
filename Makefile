@@ -89,5 +89,8 @@ program_with_artifact:
 	echo "🔧 Programming FPGA with $$BIT_FILE ..."; \
 	$(MAKE) program TARGET=$(TARGET) BITFILE="$$BIT_FILE"
 
-.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact
+model_test:
+	. myvenv/bin/activate && python model_auto_test.py
+
+.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test
 

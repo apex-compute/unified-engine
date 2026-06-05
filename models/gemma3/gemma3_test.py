@@ -1402,6 +1402,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         total_latency, total_flop_rate = 0, 0
         decoder_token_cnt = 0
         hw_decode_lats_us: list[float] = []
+        decoded_chars: list[str] = []
 
         # Two-region live counter: pin the bottom terminal row as a status line via
         # an ANSI scroll region; tokens stream in the area above it and the counter
@@ -1470,6 +1471,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
@@ -1491,7 +1493,17 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         _original_print(f"Prefill ({prefill_seq_len} tokens): HW={latency_hw_prefill/1e3:,.1f} ms  CPU={latency_prefill*1e3:,.1f} ms")
         _original_print(f"Decode 1st token  : HW={hw_decode_first_ms:,.1f} ms/tok  ({1000/hw_decode_first_ms:.2f} tok/s)")
         _original_print(f"Decode  ({tokens_decoded} tokens): HW={hw_decode_avg_ms:,.1f} ms/tok  CPU={cpu_decode_avg_ms:,.1f} ms/tok  ({tokens_decoded/latency_decoder:.2f} tok/s)")
-        
+
+        return {
+            "prefill_tokens": prefill_seq_len,
+            "decoded_text": "".join(decoded_chars),
+            "decoded_tokens": tokens_decoded,
+            "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
+            "decode_speed_tok_s": round(tokens_decoded / latency_decoder, 2),
+            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
+            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
+        }
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -1579,6 +1591,7 @@ def main():
 
     run_result = ue.run_gemma3(slave_engine=ue2 if dual_engine else None)
     print("Gemma3 test ends.")
+    _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
     ue.clear_dram()
     global _SILENT_MODE
