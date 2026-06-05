@@ -583,11 +583,20 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # run past the old scratch base (0x90000000) and program base (0xA0000000)
         # -> runtime writes stomped layers ~28-35's weights (NaN at decode layer 29).
         # Relocate scratch + program arenas ABOVE the weight blob; the device is 4GB
-        # (offset ceiling 0x100000000), so 3.08GB weights + scratch + programs fit.
+        # (offset ceiling 0x100000000). With o_proj/down_proj now if4 the LM weights
+        # are ~1.7GB (was 3.08GB), and ENABLING THE ON-DEVICE VISION ENCODER adds
+        # ~212MB (if4) / ~800MB (bf16) of MoonViT weights into params PLUS large
+        # VIS_* scratch buffers (~290MB) and a 377MB encoder program. The old
+        # 0xC0/0xCE bases were sized for LM-only and the encoder's buffers/programs
+        # collided near 0xCE000000 -> decode residual NaN. Spread the three arenas:
+        #   params:  0x0          .. <0xB0000000  (2.75GB: LM ~1.7GB + conn + vision)
+        #   tensor:  0xB0000000   .. <0xDC000000  (704MB scratch: LM ~208MB + VIS ~290MB)
+        #   program: 0xDC000000   .. <0x100000000 (576MB: encoder 377MB + prefill/decode)
+        # Invariant: params_end < tensor_dram_base < program_dram_base < 0x100000000.
         super().__init__(
-            params_dram_base=0x00000000,   # weights:  0x0      .. ~0xB96xxxxx (3.08GB + connector)
-            tensor_dram_base=0xC0000000,   # scratch:  0xC0000000.. ~0xCC400000 (~208MB)
-            program_dram_base=0xCE000000,  # programs: 0xCE000000.. <0x100000000 (~800MB)
+            params_dram_base=0x00000000,
+            tensor_dram_base=0xB0000000,
+            program_dram_base=0xDC000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
@@ -3132,6 +3141,49 @@ def _gpu_vision(query, prompt_kind, image_path, device="cuda", compute_vit=True,
                 grid_hw=grid_hw, cfg=cfg)
 
 
+def _cpu_bf16_compare(args, hw_answer, prep):
+    """Run the CPU bf16 reference (generate_slow) on the SAME image/query and
+    return a comparison dict vs the HW decode. Reuses prep['conn_ref'] so the
+    vision tower is NOT recomputed. Greedy decode on both sides => deterministic,
+    so the honest metric is token-sequence agreement + per-box coordinate delta."""
+    import locateanything_3b_cpu_test as la
+    from transformers import AutoTokenizer
+    import torch, re
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = prep["cfg"]
+    model = la.LocateAnything(cfg).eval()
+    la.load_weights(model, la.MODEL_DIR, device, torch.bfloat16)
+    tok = AutoTokenizer.from_pretrained(la.MODEL_DIR, trust_remote_code=True)
+    text = la.build_prompt_text(la.PROMPTS[args.prompt_kind].format(q=args.query), prep["n_img"])
+    input_ids = tok([text], return_tensors="pt").input_ids
+    conn = prep["conn_ref"]
+    if conn is not None:
+        conn = conn.to(device, dtype=torch.bfloat16)
+    out_ids = la.generate_slow(model, tok, cfg, prep["pixel_values"], prep["grid_hw"],
+                               input_ids, device, torch.bfloat16, conn=conn)
+    cpu_answer = tok.decode(out_ids, skip_special_tokens=False)
+
+    # token-level agreement (re-tokenize HW text so both are id sequences)
+    hw_ids = tok(hw_answer, return_tensors="pt").input_ids[0].tolist()
+    n = min(len(out_ids), len(hw_ids))
+    agree = sum(1 for a, b in zip(out_ids[:n], hw_ids[:n]) if a == b)
+
+    def _boxes(s):
+        return [tuple(map(int, m)) for m in
+                re.findall(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", s)]
+    cb, hb = _boxes(cpu_answer), _boxes(hw_answer)
+    nb = min(len(cb), len(hb))
+    max_dl = max((max(abs(c - h) for c, h in zip(cb[i], hb[i])) for i in range(nb)),
+                 default=0)
+    del model
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return dict(cpu_answer=cpu_answer.strip(), cpu_ids=out_ids, hw_ids=hw_ids,
+                tok_agree=agree, tok_total=n, cpu_boxes=len(cb), hw_boxes=len(hb),
+                box_match=nb, max_box_delta=max_dl,
+                exact=(out_ids[:n] == hw_ids[:n] and len(out_ids) == len(hw_ids)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "vette.jpg"))
@@ -3159,6 +3211,9 @@ def main():
     ap.add_argument("--silent", action="store_true",
                     help="suppress compile/engine chatter (URAM usage, captured-instruction "
                          "dumps, etc.); timing summary + output still print")
+    ap.add_argument("--compare", action="store_true",
+                    help="after decode, run the CPU bf16 reference on the same image/query "
+                         "and print a token/box agreement report under the timing summary")
     args = ap.parse_args()
 
     # ==================================================================
@@ -3167,7 +3222,7 @@ def main():
     args.image       = os.path.join(REPO_ROOT, "test_samples", "people.jpg")
     args.query       = "person"
     args.prompt_kind = "detect"
-    args.gpu_vision  = True          # MoonViT on GPU; isolate the LM
+    args.gpu_vision  = False         # MoonViT on the FPGA (full on-device path)
     PROBE_PREFILL_NAN = False        # True: layer-by-layer prefill sweep. False: fast prefill+decode.
     PROBE_DECODE_NAN  = False        # True: after prefill, sweep decode layers for the first NaN.
     PROBE_ADDR_MAP    = False        # fast: dump per-layer weight addrs + DRAM readback, then exit (no prefill)
@@ -3347,6 +3402,17 @@ def main():
     t_connector = time.perf_counter() - timer
     _original_print(f"  FPGA connector -> {n_img} vision tokens @ VIS_ENCODER_OUT_DRAM 0x{ue.VIS_ENCODER_OUT_DRAM:X}  ({t_connector:.2f}s)")
 
+    # ---- DRAM layout guard: params (LM+conn+vision) must not overrun scratch,
+    #      scratch must not overrun the program arena (the on-device-vision NaN
+    #      bug). All addrs are now known (weights + all VIS_* buffers allocated).
+    _pe = ue.get_params_dram_addr(); _te = ue._tensor_dram_addr
+    _tb = ue._tensor_dram_base; _pb = ue._program_dram_base
+    _original_print(f"  [dram] params_end=0x{_pe:09X} ({_pe/2**30:.2f}GB)  "
+                    f"tensor_base=0x{_tb:09X}  tensor_end=0x{_te:09X} ({(_te-_tb)/2**20:.0f}MB)  "
+                    f"program_base=0x{_pb:09X}  ceil=0x100000000")
+    assert _pe <= _tb, f"OVERLAP: params_end 0x{_pe:X} overruns tensor_base 0x{_tb:X} (raise tensor_dram_base)"
+    assert _te <= _pb, f"OVERLAP: tensor_end 0x{_te:X} overruns program_base 0x{_pb:X} (raise program_dram_base)"
+
     if args.check_connector:
         conn_fpga = ue.dma_from_accelerator_memory(
             ue.VIS_ENCODER_OUT_DRAM, (n_img, ue._conn_out)).cpu().float()
@@ -3433,6 +3499,22 @@ def main():
     _original_print(f"  Total (FPGA):             {total:.2f}s")
     _original_print(f"  Throughput:               {tok_s:.2f} tok/s, {boxes_s:.2f} boxes/s "
           f"({n_boxes} boxes in {t_decode_run:.2f}s decode)")
+
+    # ---- CPU bf16 comparison report ----
+    if args.compare:
+        _original_print(f"\n{'='*60}\n  CPU bf16 comparison\n{'='*60}")
+        try:
+            c = _cpu_bf16_compare(args, answer, prep)
+            pct = 100.0 * c["tok_agree"] / max(c["tok_total"], 1)
+            _original_print(f"  CPU output:   {c['cpu_answer']}")
+            _original_print(f"  Token agree:  {c['tok_agree']}/{c['tok_total']} ({pct:.1f}%)"
+                            f"   exact={'yes' if c['exact'] else 'no'}")
+            _original_print(f"  Boxes:        HW={c['hw_boxes']}  CPU={c['cpu_boxes']}  "
+                            f"matched={c['box_match']}  max|Δcoord|={c['max_box_delta']}")
+        except Exception as e:
+            import traceback
+            _original_print(f"  [compare failed] {e}")
+            traceback.print_exc()
 
     # ---- 5. Draw overlay (reuse cpu_test renderer) ----
     import locateanything_3b_cpu_test as la
