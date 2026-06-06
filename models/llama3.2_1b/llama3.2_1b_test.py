@@ -1068,26 +1068,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            if bool(getattr(self, "fpga_penalty", False)):
-                # On-FPGA repetition penalty: feed the per-vocab penalty as the matmul C bias
-                # (bias_mode="broadcast_N" → bias[t] added to logit[t]) so the on-chip argmax
-                # returns the PENALIZED token id directly. No logit writeback (the host reads the
-                # argmax register, not the row). Host maintains PENALTY_BIAS_DRAM with +/-alpha
-                # writes. See notes_repetition_penalty_fpga_bias.md.
-                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
-                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                    write_back_disable=True)
-            else:
-                # Plain bin (--pure-greedy): no bias, full vocab-logits row written to DRAM
-                # (writeback ON). Used for the greedy A/B baseline and as the logit source for the
-                # compare/calibration tool (compare/compare_llama3.2_1b_penalty.py), which reads
-                # LOGITS_DRAM and applies the penalty on host. No host penalty runs in production.
-                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                    write_back_disable=False)
+            penalty_kwargs = dict(C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N") \
+                if bool(getattr(self, "fpga_penalty", False)) else {}
+            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
+                write_back_disable=True, **penalty_kwargs)
 
         self.generate_instruction_halt()
         self.pad_capture_to_64b_boundary()
@@ -1151,6 +1137,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             instruction_meta_path = instruction_meta_path.replace(".json", "_fpgapenalty.json")
             self._instruction_bin_path = instruction_bin_path
             self._instruction_meta_path = instruction_meta_path
+        if profile:
+            # Profile binary uses fixed paths regardless of fpga_penalty so run_llama_profile()
+            # can always find it.  Must be derived after the fpga_penalty substitution so the
+            # bin_dir is correct.
+            bin_dir = os.path.dirname(instruction_bin_path)
+            instruction_bin_path  = os.path.join(bin_dir, "llama_profile_instruction.bin")
+            instruction_meta_path = os.path.join(bin_dir, "llama_profile_instruction.json")
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")

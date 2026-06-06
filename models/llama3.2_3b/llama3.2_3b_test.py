@@ -961,26 +961,12 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            if bool(getattr(self, "fpga_penalty", False)):
-                # On-FPGA repetition penalty: feed the per-vocab penalty as the matmul C bias
-                # (bias_mode="broadcast_N" → bias[t] added to logit[t]) so the on-chip argmax
-                # returns the PENALIZED token id directly. No logit writeback (the host reads the
-                # argmax register, not the row). Host maintains PENALTY_BIAS_DRAM each step.
-                # See notes_repetition_penalty_fpga_bias.md.
-                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
-                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                    write_back_disable=True)
-            else:
-                # Plain bin (--pure-greedy): no bias, full vocab-logits row written to DRAM
-                # (writeback ON). Used for the greedy A/B baseline and as the logit source for the
-                # compare/calibration tool (compare/compare_llama3.2_3b_penalty.py), which reads
-                # LOGITS_DRAM and applies the penalty on host. No host penalty runs in production.
-                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                    write_back_disable=False)
+            penalty_kwargs = dict(C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N") \
+                if bool(getattr(self, "fpga_penalty", False)) else {}
+            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
+                write_back_disable=True, **penalty_kwargs)
 
         self.generate_instruction_halt()
         self.pad_capture_to_64b_boundary()
