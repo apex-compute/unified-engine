@@ -44,3 +44,27 @@ Total: 3.8× smaller vs quantized LM head baseline.
 | mlp_down_post_ffn_norm_residual | 18.59 | 18.59 | 18.59 |
 | norm_lm_head | 51.62 | 26.68 | 26.54 |
 | **Total** | **120.84** | **95.90** | **95.75** |
+
+---
+
+## Gemma3-IF8 Performance (+ flash attn reuse)
+
+Same subroutine reuse applied to both prefill and decoder.
+
+### Instruction Size
+
+| Stage   | + flash attn reuse (kB) |
+|---------|------------------------|
+| Prefill | 382.5                  |
+| Decoder | 418.3                  |
+| Total   | 800.8                  |
+
+### Run Performance
+
+| Metric | + flash attn reuse |
+|--------|--------------------|
+| Prompt tokens (prefill) | 19 |
+| Decode tokens generated | 76 |
+| **Prefill HW time (ms)** | 1,280.4 |
+| **Decode avg HW time (ms/tok)** | 220.0 |
+| Decode throughput (tok/s) | 4.77 |
