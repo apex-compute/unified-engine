@@ -396,11 +396,13 @@ FLAG_MODE_CHECK = 2  # Spin-wait until target engine's flag is 1
 
 # JUMP mode constants (match queue_state_module.sv / andromeda.c)
 JUMP_MODE_ABSOLUTE = 0
+JUMP_MODE_REG_ABS  = 1  # unconditional absolute jump to regfile_rdata2 (rst_reg_idx)
 JUMP_MODE_JNZ = 2  # absolute if reg != 0
 JUMP_MODE_JZ = 3   # absolute if reg == 0
 JUMP_MODE_RELATIVE = 4  # inst cache read ptr -= immediate[9:0]
 JUMP_MODE_RELA_JNZ = 5
 JUMP_MODE_RELA_JZ = 6
+JUMP_MODE_REG_RELA = 7  # unconditional relative jump: read ptr -= regfile_rdata2[9:0]
 
 # Register ALU sub-modes (isa_mode[3:0]; queue_state_module.sv ALU_MODE_*)
 ALU_MODE_INC = 0  # dst = src + 1
@@ -837,7 +839,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        allowed_hw_versions = {0x25e4082c}
+        allowed_hw_versions = {0x75705d47}
         if CURRENT_DEVICE == "efinix":
             allowed_hw_versions.add(0x12345678)
         assert hw_version in allowed_hw_versions, (
@@ -2775,16 +2777,171 @@ class UnifiedEngine:
         if input_beta_sram_start_addr is not None:
             self.eltwise_add_core(output_sram_wb_addr, input_beta_sram_start_addr, output_sram_wb_addr, N)
 
-    def layer_norm_core_dram(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None) -> None:
+
+    def layer_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                                 GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
+                                 gpr_M_reg: int = None) -> int:
+        """PBI-backed layer norm.  Matches the legacy's chunk-tiled DMA granularity so performance
+        is on par, while the captured program shrinks from ~M*6 instructions to ~chunk_size*6+4.
+
+        **DMA chunk tiling (key to performance):**
+        The legacy path loads ``chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, M)`` rows per DMA
+        call to amortise per-transfer overhead.  This PBI path does the same: each loop iteration
+        loads ``chunk_size`` rows in a single DMA, Python-unrolls ``chunk_size`` ``layer_norm_core``
+        calls at different URAM_A offsets, then stores ``chunk_size`` rows in a single DMA.
+
+        **Batch dimension (gpr_M_reg):**
+        ``gpr_M_reg`` is a GPR index 1..15.  The caller must prime it with the number of **chunks**
+        ``M // chunk_size``, *not* with ``M`` directly.  ``chunk_size`` is
+        ``min(URAM_NEAR_FULL_ELEMENTS // N, M)``; both the caller and this function compute it from
+        the same formula so they agree.  ``M`` itself is only used for FLOPs accounting and the
+        ``M % chunk_size == 0`` assertion.
+
+        Caller must have start_capture() active.
         """
-        Core layer norm: normalizes vector x -> x / rms(x).
-        Args:
-            M: number of rows in the input matrix
-            N: number of columns in the input matrix
-            A_DRAM_ADDR: DRAM address of input matrix
-            OUTPUT_DRAM_ADDR: DRAM address for normalized output
-            GAMMA_DRAM_ADDR: DRAM address for gamma
-            BETA_DRAM_ADDR: DRAM address for beta
+        assert M >= 1, "layer_norm_core_dram_pbi() requires M >= 1"
+        if not (1 <= gpr_M_reg <= 15):
+            raise ValueError(f"layer_norm_core_dram_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
+        assert self.is_capture_on, "layer_norm_core_dram_pbi() requires active capture"
+        assert N % UE_VECTOR_SIZE == 0, f"layer_norm_core_dram_pbi() requires N to be a multiple of {UE_VECTOR_SIZE}, got N={N}"
+        if N > URAM_NEAR_FULL_ELEMENTS:
+            raise ValueError(
+                f"layer_norm_core_dram_pbi: N={N} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS} "
+                "(one row must fit in URAM_A staging)."
+            )
+
+        bpe = 2
+        row_bytes = N * bpe
+
+        # ops_per_row: number of ISA instructions layer_norm_core emits for one row.
+        # 4 queue ops (mean, subtract, rms, scale) + 1 per optional param.
+        ops_per_row = 4 + (1 if GAMMA_DRAM_ADDR is not None else 0) + (1 if BETA_DRAM_ADDR is not None else 0)
+        # I-cache is 256 instructions.  Loop body = 1 (pbi_load) + chunk_size*ops_per_row
+        # + 1 (pbi_store) + 2 (loop_end add_dec + jump) = chunk_size*ops_per_row + 4.
+        max_chunk_from_icache = (256 - 4) // ops_per_row
+
+        # Largest divisor of M that satisfies both the URAM capacity and the i-cache limit.
+        ideal = min(URAM_NEAR_FULL_ELEMENTS // N, M, max_chunk_from_icache)
+        chunk_size = ideal
+        while M % chunk_size != 0:
+            chunk_size -= 1  # guaranteed to terminate; M % 1 == 0 always
+        n_chunks    = M // chunk_size
+        chunk_bytes = chunk_size * row_bytes
+
+        # URAM_A: chunk_size input/output rows per iteration
+        # URAM_B: zeros | gamma (opt) | beta (opt) — static, loaded once before the loop
+        vector_sram_addr = 0x00000
+        zeros_sram_addr  = 0x80000
+        params_sram_addr = zeros_sram_addr + N * bpe
+
+        gamma_sram_addr = None
+        beta_sram_addr  = None
+
+        zeros_dram_addr = self.get_params_dram_addr()
+        self.allocate_params_dram(N * bpe)
+        self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * bpe)
+
+        self.accelerator_memory_to_sram(accelerator_dram_address=zeros_dram_addr,
+                                        sram_address=zeros_sram_addr, element_size=N)
+
+        if GAMMA_DRAM_ADDR is not None:
+            gamma_sram_addr = params_sram_addr
+            self.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
+                                            sram_address=gamma_sram_addr, element_size=N)
+            params_sram_addr += N * bpe
+
+        if BETA_DRAM_ADDR is not None:
+            beta_sram_addr = params_sram_addr
+            self.accelerator_memory_to_sram(accelerator_dram_address=BETA_DRAM_ADDR,
+                                            sram_address=beta_sram_addr, element_size=N)
+            params_sram_addr += N * bpe
+
+        _, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_addr)
+
+        row_load_ptr  = self.alloc_inst_ptr()
+        row_store_ptr = self.alloc_inst_ptr()
+
+        # PBI load: one call advances by chunk_bytes, loading chunk_size rows into URAM_A.
+        self.generate_instruction_pbi_init(
+            dram_shared_addr=A_DRAM_ADDR,
+            dma_length=chunk_bytes,
+            output_size=0, uram_length=0,
+            uram_a_start_addr=0, uram_b_start_addr=0, uram_wb_addr=0,
+            uram_dst_addr=vector_uram_start_addr,
+            fmax_context_addr=0,
+            inst_pointer_idx=row_load_ptr,
+        )
+        # PBI store: reads chunk_size rows from URAM_A (lines 0..chunk_size*N/64-1).
+        self.generate_instruction_pbi_init(
+            dram_shared_addr=OUTPUT_DRAM_ADDR,
+            dma_length=chunk_bytes,
+            output_size=0, uram_length=0,
+            uram_a_start_addr=vector_uram_start_addr,
+            uram_b_start_addr=vector_uram_start_addr,
+            uram_wb_addr=0, uram_dst_addr=0, fmax_context_addr=0,
+            inst_pointer_idx=row_store_ptr,
+        )
+
+        program_dram_start_addr = self.get_program_dram_addr()
+        cur_inst_count = self.capture_count
+        jump_target_word_addr = ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
+        )
+        self.generate_instruction_jump_abs(jump_target_word_addr)
+        # gpr_M_reg holds n_chunks (primed by caller with M // chunk_size).
+        self.loop_start(loop_cnt=n_chunks, gpr_loop_cnt=gpr_M_reg)
+
+        # Load chunk_size rows in one DMA.
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=chunk_bytes,
+            sram_address=vector_sram_addr,
+            element_size=0,
+            inst_pointer_idx=row_load_ptr,
+        )
+
+        # Python-unroll chunk_size layer_norm_core calls at consecutive URAM_A offsets.
+        # This mirrors what the legacy inner loop does after loading the chunk.
+        for j in range(chunk_size):
+            row_sram = vector_sram_addr + j * row_bytes
+            self.layer_norm_core(
+                vector_sram_start_addr=row_sram,
+                output_sram_wb_addr=row_sram,
+                N=N,
+                zeros_sram_start_addr=zeros_sram_addr,
+                input_gamma_sram_start_addr=gamma_sram_addr,
+                input_beta_sram_start_addr=beta_sram_addr,
+            )
+
+        # Store chunk_size rows in one DMA.
+        self.sram_to_accelerator_memory(
+            sram_address=vector_sram_addr,
+            accelerator_dram_address=chunk_bytes,
+            element_size=0,
+            inst_pointer_idx=row_store_ptr,
+        )
+
+        outer_loop_size = self.loop_end()
+        print(f"Layer norm PBI outer loop body size: {outer_loop_size} "
+            f"({chunk_size} rows/chunk × {n_chunks} chunks=GPR[{gpr_M_reg}], N={N})"
+        )
+        assert outer_loop_size <= 256, (
+            f"Outer loop body {outer_loop_size} instructions exceeds i-cache limit of 256"
+        )
+
+        self.release_inst_ptr(row_store_ptr)
+        self.release_inst_ptr(row_load_ptr)
+
+        total_flops = 5 * M * N
+        if gamma_sram_addr is not None:
+            total_flops += M * N
+        if beta_sram_addr is not None:
+            total_flops += M * N
+        return total_flops
+
+    def layer_norm_core_dram_legacy(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                                     GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None) -> int:
+        """
+        Legacy layer norm DRAM path: compile-time chunk-tiled, M-unrolled.
         """
         zeros_sram_addr = 0x80000
 
@@ -2840,6 +2997,31 @@ class UnifiedEngine:
         if beta_sram_addr is not None:
             total_flops += M * N # add(beta) N times
         return total_flops
+
+    def layer_norm_core_dram(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                              GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
+                              gpr_M_reg: Optional[int] = None) -> int:
+        """Layer norm DRAM entrypoint; dispatches based on ``gpr_M_reg``:
+
+        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`layer_norm_core_dram_pbi` — outer row loop
+          trip count is taken from that register at runtime (caller must prime it via ``ADD_SET``).
+          ``M`` is FLOPs-accounting only; the captured program has no static reference to it.
+        - ``gpr_M_reg is None`` (default): :meth:`layer_norm_core_dram_legacy` — compile-time
+          chunk-tiled, M-unrolled path.
+        """
+        if gpr_M_reg is not None:
+            return self.layer_norm_core_dram_pbi(
+                M=M, N=N,
+                A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR,
+                gpr_M_reg=gpr_M_reg,
+            )
+        return self.layer_norm_core_dram_legacy(
+            M=M, N=N,
+            A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR,
+        )
+
 
     def rope_hf_core_decode(self, N: int, input_dram_addr: int, output_dram_addr: int,
                      cos_dram_addr: int = 0, sin_dram_addr: int = 0,
@@ -2908,15 +3090,112 @@ class UnifiedEngine:
         if gr_weight_dram != 0:
             self.release_isa_reg()
         return 4 * N
-        
-    def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
-        """HF RoPE DRAM entrypoint; dispatches based on ``gpr_M_reg``:
 
-        - ``gpr_M_reg`` is a GPR index (1..15): :meth:`rope_hf_core_dram_pbi` — outer M loop uses
-          runtime trip count from that register (caller must prime via ``ADD_SET``). ``M`` is
-          FLOPs-accounting only; captured program has no static reference to it.
-        - ``gpr_M_reg is None`` (default): :meth:`rope_hf_core_dram_legacy` — Python-unrolled rows.
+    def rope_hf_core_decode_d64(self, N: int, input_dram_addr: int, output_dram_addr: int,
+                                packed_table_addr: int, pos_reg: int, tmp_reg: int,
+                                output_pos_strided: bool = False) -> int:
+        """Single-token decode HF RoPE for head_dim ``N < 128`` (the decode analog of
+        :meth:`rope_hf_core_dram_d64_pbi`). :meth:`rope_hf_core_decode` asserts ``N >= 128``;
+        this is the N<128 path. Caller must bracket with start_capture()/stop_capture().
+
+        The token at runtime position ``pos_reg`` (= gpr_seq_len) is roped against the contiguous
+        per-token packed table ``[cos(N) || sin(N)]`` (sin first half pre-negated on the host); the
+        token's row lives at ``packed_table_addr + pos * 2*N*bpe``.
+
+        Alignment discipline (why this path exists): each N/2-element half is < 128 bytes, i.e. half
+        a URAM row, and SRAM cannot be addressed mid-row. Each slice is loaded into the START of its
+        own 128-byte URAM row via register-addressed DMAs (DRAM is byte-addressable; SRAM targets
+        stay row-aligned). No PBI pointers are used.
+
+        input_dram_addr    : single freshly-projected row (static — no position offset).
+        output_pos_strided : True  -> write to ``output_dram_addr + pos*N*bpe`` (KV-cache slot, K).
+                             False -> write to ``output_dram_addr`` (fixed slot, e.g. Q_PERM).
         """
+        assert 0 < N < 128 and N % 2 == 0, "rope_hf_core_decode_d64 is the N<128 even path"
+        bpe = 2
+        half = N // 2
+        half_bytes = half * bpe
+        row_bytes = N * bpe
+        rope_row_bytes = 2 * row_bytes          # [cos(N) | sin(N)] per token
+        shift = ue_35bit_addr_shifter
+
+        SLOT = 128
+        uram_x_lo      = 0x00000                # URAM_A (x + cos-products + results)
+        uram_x_hi      = 0x00080
+        uram_a_lo      = 0x00100
+        uram_a_hi      = 0x00180
+        uram_result_lo = 0x00200
+        uram_result_hi = 0x00280
+        uram_cos_lo    = 0x80000                # URAM_B (cos/sin slices + sin-products)
+        uram_cos_hi    = uram_cos_lo + SLOT
+        uram_sin_lo    = uram_cos_hi + SLOT
+        uram_sin_hi    = uram_sin_lo + SLOT
+        uram_b_lo      = uram_sin_hi + SLOT
+        uram_b_hi      = uram_b_lo   + SLOT
+
+        cos_base = packed_table_addr
+        sin_base = packed_table_addr + row_bytes
+
+        def _read_pos(base, sram_addr):
+            # tmp_reg = shift(base) + pos_reg * shift(rope_row_bytes) == shift(base + pos*rope_row_bytes)
+            self.generate_instruction_reg_mul_imm(tmp_reg, pos_reg, shift(rope_row_bytes))
+            self.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram_addr,
+                                            element_size=half, general_reg_src=tmp_reg)
+
+        # Input halves: static reads (single row); URAM targets are row-aligned.
+        self.accelerator_memory_to_sram(input_dram_addr, uram_x_lo, half)
+        self.accelerator_memory_to_sram(input_dram_addr + half_bytes, uram_x_hi, half)
+        # Table halves: position-addressed reads from this token's packed [cos||sin] row.
+        _read_pos(cos_base,              uram_cos_lo)   # cos[0:half]
+        _read_pos(cos_base + half_bytes, uram_cos_hi)   # cos[half:N]
+        _read_pos(sin_base,              uram_sin_lo)   # sin[0:half] (pre-negated)
+        _read_pos(sin_base + half_bytes, uram_sin_hi)   # sin[half:N]
+
+        # result = x*cos + rotate_half(x)*sin  (sin_lo pre-negated, so b_lo = x_hi*(-sin))
+        self.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half)
+        self.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half)
+        self.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half)
+        self.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half)
+        self.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half)
+        self.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half)
+
+        if output_pos_strided:
+            def _write_pos(base, sram_addr):
+                self.generate_instruction_reg_mul_imm(tmp_reg, pos_reg, shift(row_bytes))
+                self.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+                self.sram_to_accelerator_memory(sram_address=sram_addr, accelerator_dram_address=0,
+                                                element_size=half, general_reg_src=tmp_reg)
+            _write_pos(output_dram_addr,              uram_result_lo)
+            _write_pos(output_dram_addr + half_bytes, uram_result_hi)
+        else:
+            self.sram_to_accelerator_memory(sram_address=uram_result_lo,
+                                            accelerator_dram_address=output_dram_addr, element_size=half)
+            self.sram_to_accelerator_memory(sram_address=uram_result_hi,
+                                            accelerator_dram_address=output_dram_addr + half_bytes, element_size=half)
+        return 4 * N
+
+    def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
+        """HF RoPE DRAM entrypoint; dispatches based on ``N`` and ``gpr_M_reg``:
+
+        - ``N < 128``: :meth:`rope_hf_core_dram_d64_pbi` — padded-split path for head_dim<128,
+          where each N/2-elem half is sub-128-byte and cannot be SRAM-sliced mid-row. Requires
+          ``gpr_M_reg`` (PBI hardware loop). Same contiguous ``[cos(N) || sin(N)]`` table layout
+          as the N>=128 path (sin first half pre-negated).
+        - ``N >= 128`` and ``gpr_M_reg`` is a GPR index (1..15): :meth:`rope_hf_core_dram_pbi` —
+          outer M loop uses runtime trip count from that register (caller must prime via
+          ``ADD_SET``). ``M`` is FLOPs-accounting only; captured program has no static reference to it.
+        - ``N >= 128`` and ``gpr_M_reg is None`` (default): :meth:`rope_hf_core_dram_legacy` —
+          Python-unrolled rows.
+        """
+        if N < 128:
+            # D<128 padded-split path: each half-vector is N/2 elems (< 128 bytes), so SRAM can't
+            # slice it mid-row. The unified :meth:`rope_hf_core_dram_pbi` handles this via its
+            # ``needs_padding`` branch (running address registers, register-addressed DMAs, no PBI
+            # pointers). PBI-only — requires gpr_M_reg.
+            if gpr_M_reg is None:
+                raise ValueError("rope_hf_core_dram: N<128 requires gpr_M_reg (PBI padded-split path)")
+            return self.rope_hf_core_dram_pbi(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg)
         if gpr_M_reg is not None:
             return self.rope_hf_core_dram_pbi(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg)
         return self.rope_hf_core_dram_legacy(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr)
@@ -2956,106 +3235,302 @@ class UnifiedEngine:
         prime that register beforehand (typically with ``ADD_SET``). The hardware loop runs for
         whatever value that register holds at execute time; ``M`` is FLOPs-accounting / template
         only — the captured program has no static reference to ``M``.
+
+        When N//2 * 2 < 128 (e.g. N=64, half=32), each half is placed in a padded 128-byte SRAM
+        slot. Eight PBI pointers are used (2×x, 4×rope, 2×output), each transferring half_bytes
+        per iteration with row-stride advances.
         """
         assert M >= 1, "M must be at least 1"
-        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
         assert N % 2 == 0, "N must be even for RoPE half layout"
-        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
+        # The padded-split branch (N<128) places each half in its own 128-byte SRAM slot, so it
+        # only needs even N — any head_dim < 128 works (e.g. 64, 76->38, 80->40). The N>=128
+        # branch slices SRAM mid-row, which requires 64-aligned halves (N a multiple of 64).
+        if N < 128:
+            assert 0 < N < 128, "padded-split RoPE expects 0 < N < 128"
+        else:
+            assert N % UE_VECTOR_SIZE == 0, f"N>=128 RoPE expects N a multiple of {UE_VECTOR_SIZE}"
         if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
             raise ValueError(f"rope_hf_core_dram_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
 
         half = N // 2
         bytes_per_elem = 2
+        half_bytes = half * bytes_per_elem
         row_bytes = N * bytes_per_elem
         rope_row_bytes = 2 * row_bytes
-        sram_x = 0x00000
-        sram_a = 0x20000
-        sram_d = 0x40000
-        sram_cos = 0x80000
-        sram_sin = 0x80000 + N * bytes_per_elem
-        sram_bc = 0x80000 + N * bytes_per_elem * 2
+        SRAM_SLOT = 128
+        needs_padding = half_bytes < SRAM_SLOT  # True when N < 128 (e.g. N=64, half=32)
 
         assert sin_dram_addr == cos_dram_addr + row_bytes, "PBI RoPE expects contiguous [cos, sin] rows"
-        x_uram_type, x_uram_addr = self.sram_address_to_uram_address(sram_x)
-        rope_uram_type, rope_uram_addr = self.sram_address_to_uram_address(sram_cos)
-        d_uram_type, d_uram_addr = self.sram_address_to_uram_address(sram_d)
 
-        x_ptr = self.alloc_inst_ptr()
-        rope_ptr = self.alloc_inst_ptr()
-        out_ptr = self.alloc_inst_ptr()
+        if needs_padding:
+            # Padded split layout: each half occupies a full 128-byte SRAM slot.
+            # No PBI pointers — ISA registers (x_reg, cos_reg, out_reg) track the current-row
+            # DRAM addresses and are incremented by the relevant stride at the end of each
+            # loop body via ADD_IMM.  Per-halfrow loads/stores use
+            # overwrite_instruction_with_general_register, the same mechanism as
+            # rope_hf_core_decode's rope_size_reg path.
+            sram_x_lo      = 0x00000
+            sram_x_hi      = sram_x_lo + SRAM_SLOT
+            sram_a_lo      = sram_x_hi + SRAM_SLOT
+            sram_a_hi      = sram_a_lo + SRAM_SLOT
+            sram_result_lo = sram_a_hi + SRAM_SLOT
+            sram_result_hi = sram_result_lo + SRAM_SLOT
+            sram_cos_lo    = 0x80000
+            sram_cos_hi    = sram_cos_lo + SRAM_SLOT
+            sram_sin_lo    = sram_cos_hi + SRAM_SLOT
+            sram_sin_hi    = sram_sin_lo + SRAM_SLOT
+            sram_bc_lo     = sram_sin_hi + SRAM_SLOT
+            sram_bc_hi     = sram_bc_lo + SRAM_SLOT
 
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=input_dram_addr,
-            dma_length=row_bytes,
-            output_size=0,
-            uram_length=0,
-            uram_a_start_addr=0,
-            uram_b_start_addr=0,
-            uram_wb_addr=0,
-            uram_dst_addr=x_uram_addr,
-            fmax_context_addr=0,
-            inst_pointer_idx=x_ptr,
-        )
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=cos_dram_addr,
-            dma_length=rope_row_bytes,
-            output_size=0,
-            uram_length=0,
-            uram_a_start_addr=0,
-            uram_b_start_addr=0,
-            uram_wb_addr=0,
-            uram_dst_addr=rope_uram_addr,
-            fmax_context_addr=0,
-            inst_pointer_idx=rope_ptr,
-        )
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=output_dram_addr,
-            dma_length=row_bytes,
-            output_size=0,
-            uram_length=0,
-            uram_a_start_addr=d_uram_addr,
-            uram_b_start_addr=d_uram_addr,
-            uram_wb_addr=0,
-            uram_dst_addr=0,
-            fmax_context_addr=0,
-            inst_pointer_idx=out_ptr,
-        )
+            x_reg   = self.alloc_isa_reg()
+            cos_reg = self.alloc_isa_reg()
+            out_reg = self.alloc_isa_reg()
+            tmp_r   = self.alloc_isa_reg()
 
-        # Absolute jump keeps the ISA loop anchored at the current I-cache window.
-        program_dram_start_addr = self.get_program_dram_addr()
-        cur_inst_count = self.capture_count
-        jump_target_word_addr = ue_35bit_addr_shifter(
-            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
-        )
-        self.generate_instruction_jump_abs(jump_target_word_addr)
+            # Prime address registers with starting DRAM addresses (shifted format)
+            self.generate_instruction_add_set(x_reg,   ue_35bit_addr_shifter(input_dram_addr))
+            self.generate_instruction_add_set(cos_reg,  ue_35bit_addr_shifter(cos_dram_addr))
+            self.generate_instruction_add_set(out_reg,  ue_35bit_addr_shifter(output_dram_addr))
+
+            program_dram_start_addr = self.get_program_dram_addr()
+            cur_inst_count = self.capture_count
+            jump_target_word_addr = ue_35bit_addr_shifter(
+                program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
+            )
+            self.generate_instruction_jump_abs(jump_target_word_addr)
+            self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
+
+            # x_lo from [x_reg], x_hi from [x_reg + half_bytes]
+            self.accelerator_memory_to_sram(accelerator_dram_address=0,          sram_address=sram_x_lo, element_size=half)
+            self.overwrite_instruction_with_general_register(x_reg)
+            self.generate_instruction_add_imm(x_reg, ue_35bit_addr_shifter(half_bytes), tmp_r)
+            self.accelerator_memory_to_sram(accelerator_dram_address=half_bytes,  sram_address=sram_x_hi, element_size=half)
+            self.overwrite_instruction_with_general_register(tmp_r)
+
+            # cos_lo/cos_hi from [cos_reg+0/half_bytes], sin_lo/sin_hi from [cos_reg+N*bytes_per_elem / +N*bytes_per_elem+half_bytes]
+            self.accelerator_memory_to_sram(accelerator_dram_address=0,                      sram_address=sram_cos_lo, element_size=half)
+            self.overwrite_instruction_with_general_register(cos_reg)
+            self.generate_instruction_add_imm(cos_reg, ue_35bit_addr_shifter(half_bytes),             tmp_r)
+            self.accelerator_memory_to_sram(accelerator_dram_address=half_bytes,              sram_address=sram_cos_hi, element_size=half)
+            self.overwrite_instruction_with_general_register(tmp_r)
+            self.generate_instruction_add_imm(cos_reg, ue_35bit_addr_shifter(N * bytes_per_elem),                tmp_r)
+            self.accelerator_memory_to_sram(accelerator_dram_address=N * bytes_per_elem,                 sram_address=sram_sin_lo, element_size=half)
+            self.overwrite_instruction_with_general_register(tmp_r)
+            self.generate_instruction_add_imm(cos_reg, ue_35bit_addr_shifter(N * bytes_per_elem + half_bytes),   tmp_r)
+            self.accelerator_memory_to_sram(accelerator_dram_address=N * bytes_per_elem + half_bytes,    sram_address=sram_sin_hi, element_size=half)
+            self.overwrite_instruction_with_general_register(tmp_r)
+
+            self.eltwise_mul_core(sram_x_lo, sram_cos_lo, sram_a_lo,  half)
+            self.eltwise_mul_core(sram_x_hi, sram_cos_hi, sram_a_hi,  half)
+            self.eltwise_mul_core(sram_x_hi, sram_sin_lo, sram_bc_lo, half)
+            self.eltwise_mul_core(sram_x_lo, sram_sin_hi, sram_bc_hi, half)
+            self.eltwise_add_core(sram_a_lo, sram_bc_lo, sram_result_lo, half)
+            self.eltwise_add_core(sram_a_hi, sram_bc_hi, sram_result_hi, half)
+
+            # result_lo to [out_reg], result_hi to [out_reg + half_bytes]
+            self.sram_to_accelerator_memory(sram_address=sram_result_lo, accelerator_dram_address=0,         element_size=half)
+            self.overwrite_instruction_with_general_register(out_reg)
+            self.generate_instruction_add_imm(out_reg, ue_35bit_addr_shifter(half_bytes), tmp_r)
+            self.sram_to_accelerator_memory(sram_address=sram_result_hi, accelerator_dram_address=half_bytes, element_size=half)
+            self.overwrite_instruction_with_general_register(tmp_r)
+
+            # Advance address registers for next row
+            self.generate_instruction_add_imm(x_reg,   ue_35bit_addr_shifter(row_bytes),      x_reg)
+            self.generate_instruction_add_imm(cos_reg,  ue_35bit_addr_shifter(rope_row_bytes), cos_reg)
+            self.generate_instruction_add_imm(out_reg,  ue_35bit_addr_shifter(row_bytes),      out_reg)
+
+            self.loop_end()
+
+            self.release_isa_reg()  # tmp_r
+            self.release_isa_reg()  # out_reg
+            self.release_isa_reg()  # cos_reg
+            self.release_isa_reg()  # x_reg
+        else:
+            # N >= 128: half >= 64 so half_bytes >= 128 — naturally SRAM-slot-aligned
+            sram_x = 0x00000
+            sram_a = 0x20000
+            sram_d = 0x40000
+            sram_cos = 0x80000
+            sram_sin = 0x80000 + N * bytes_per_elem
+            sram_bc = 0x80000 + N * bytes_per_elem * 2
+
+            assert sin_dram_addr == cos_dram_addr + row_bytes, "PBI RoPE expects contiguous [cos, sin] rows"
+            x_uram_type, x_uram_addr = self.sram_address_to_uram_address(sram_x)
+            rope_uram_type, rope_uram_addr = self.sram_address_to_uram_address(sram_cos)
+            d_uram_type, d_uram_addr = self.sram_address_to_uram_address(sram_d)
+
+            x_ptr = self.alloc_inst_ptr()
+            rope_ptr = self.alloc_inst_ptr()
+            out_ptr = self.alloc_inst_ptr()
+
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=input_dram_addr,
+                dma_length=row_bytes,
+                output_size=0,
+                uram_length=0,
+                uram_a_start_addr=0,
+                uram_b_start_addr=0,
+                uram_wb_addr=0,
+                uram_dst_addr=x_uram_addr,
+                fmax_context_addr=0,
+                inst_pointer_idx=x_ptr,
+            )
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=cos_dram_addr,
+                dma_length=rope_row_bytes,
+                output_size=0,
+                uram_length=0,
+                uram_a_start_addr=0,
+                uram_b_start_addr=0,
+                uram_wb_addr=0,
+                uram_dst_addr=rope_uram_addr,
+                fmax_context_addr=0,
+                inst_pointer_idx=rope_ptr,
+            )
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=output_dram_addr,
+                dma_length=row_bytes,
+                output_size=0,
+                uram_length=0,
+                uram_a_start_addr=d_uram_addr,
+                uram_b_start_addr=d_uram_addr,
+                uram_wb_addr=0,
+                uram_dst_addr=0,
+                fmax_context_addr=0,
+                inst_pointer_idx=out_ptr,
+            )
+
+            # Absolute jump keeps the ISA loop anchored at the current I-cache window.
+            program_dram_start_addr = self.get_program_dram_addr()
+            cur_inst_count = self.capture_count
+            jump_target_word_addr = ue_35bit_addr_shifter(
+                program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
+            )
+            self.generate_instruction_jump_abs(jump_target_word_addr)
+            self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=row_bytes,
+                sram_address=sram_x,
+                element_size=0,
+                inst_pointer_idx=x_ptr,
+            )
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=rope_row_bytes,
+                sram_address=sram_cos,
+                element_size=0,
+                inst_pointer_idx=rope_ptr,
+            )
+            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos,              vector_C_sram_wb_addr=sram_a,                   element_size=N)
+            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin,              vector_C_sram_wb_addr=sram_bc,                  element_size=half)
+            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half*bytes_per_elem,   vector_C_sram_wb_addr=sram_bc + half*bytes_per_elem,       element_size=half)
+            self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc,               vector_C_sram_wb_addr=sram_d,                   element_size=N)
+            self.sram_to_accelerator_memory(
+                sram_address=0,
+                accelerator_dram_address=row_bytes,
+                element_size=0,
+                inst_pointer_idx=out_ptr,
+            )
+            self.loop_end()
+
+            self.release_inst_ptr(out_ptr)
+            self.release_inst_ptr(rope_ptr)
+            self.release_inst_ptr(x_ptr)
+        return 4 * M * N
+
+    def rope_hf_core_dram_d64_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None) -> int:
+        """PBI HF RoPE for head_dim ``N < 128`` (padded-split). Caller brackets with
+        start_capture()/stop_capture().
+
+        For ``N < 128`` each rotate-half operand is N/2 elems = N bytes < 128, i.e. half a
+        URAM row, and SRAM cannot be addressed mid-row. We sidestep this by issuing
+        **register-addressed DMAs** (``general_reg_src`` — DRAM is byte-addressable) so each
+        N/2-elem slice lands at the start of its own 128-byte-aligned URAM row. Reads AND
+        writes are register-addressed, so **no PBI pointers** are used (clear of the
+        >=4-advancing-pointer failure mode).
+
+        Table layout is identical to the N>=128 path: contiguous ``[cos(N) || sin(N)]`` rows,
+        ``sin_dram_addr == cos_dram_addr + N*2``, sin first half pre-negated on the host. The
+        four slices cos_lo/cos_hi/sin_lo/sin_hi are read from byte offsets 0 / N / 2N / 3N of
+        each token's rope row.
+
+        **Batch dimension / M (dynamic, required):** ``gpr_M_reg`` is a GPR index 1..15 holding
+        the runtime token count (caller primes via ``ADD_SET``). ``M`` is FLOPs-accounting /
+        loop-template only. Scratch GPRs (address calc + token counter) are allocated internally.
+        """
+        assert N % 2 == 0, "N must be even for RoPE half layout"
+        assert 0 < N < 128, "rope_hf_core_dram_d64_pbi is the N<128 path; use rope_hf_core_dram_pbi for N>=128"
+        if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
+            raise ValueError(f"rope_hf_core_dram_d64_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
+        assert sin_dram_addr == cos_dram_addr + N * 2, "d64 RoPE expects contiguous [cos, sin] rows"
+
+        bpe = 2
+        half = N // 2
+        half_bytes = half * bpe            # offset of x_hi / sin_hi within their N-elem source
+        row_bytes = N * bpe                # x / output row stride
+        rope_row_bytes = 2 * row_bytes     # [cos(N) | sin(N)] per token
+
+        # eltwise requires its two operands in DIFFERENT URAM banks.
+        # URAM_A: x + cos-products + results; URAM_B: cos/sin slices + sin-products.
+        SLOT = 128
+        uram_x_lo      = 0x00000           # URAM_A
+        uram_x_hi      = 0x00080
+        uram_a_lo      = 0x00100
+        uram_a_hi      = 0x00180
+        uram_result_lo = 0x00200
+        uram_result_hi = 0x00280
+
+        uram_cos_lo    = 0x80000           # URAM_B
+        uram_cos_hi    = uram_cos_lo + SLOT
+        uram_sin_lo    = uram_cos_hi + SLOT
+        uram_sin_hi    = uram_sin_lo + SLOT
+        uram_b_lo      = uram_sin_hi + SLOT
+        uram_b_hi      = uram_b_lo   + SLOT
+
+        shift = ue_35bit_addr_shifter
+        tmp_reg = self.alloc_isa_reg()
+        t_reg   = self.alloc_isa_reg()
+
+        def _read(base, stride, sram_addr):
+            # tmp_reg = shift(base) + t_reg * shift(stride) == shift(base + t*stride)
+            self.generate_instruction_reg_mul_imm(tmp_reg, t_reg, shift(stride))
+            self.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram_addr,
+                                            element_size=half, general_reg_src=tmp_reg)
+
+        def _write(base, stride, sram_addr):
+            self.generate_instruction_reg_mul_imm(tmp_reg, t_reg, shift(stride))
+            self.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+            self.sram_to_accelerator_memory(sram_address=sram_addr, accelerator_dram_address=0,
+                                            element_size=half, general_reg_src=tmp_reg)
+
+        self.generate_instruction_add_set(t_reg, 0)
         self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
-        self.accelerator_memory_to_sram(
-            accelerator_dram_address=row_bytes,
-            sram_address=sram_x,
-            element_size=0,
-            inst_pointer_idx=x_ptr,
-        )
-        self.accelerator_memory_to_sram(
-            accelerator_dram_address=rope_row_bytes,
-            sram_address=sram_cos,
-            element_size=0,
-            inst_pointer_idx=rope_ptr,
-        )
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
-        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
-        self.sram_to_accelerator_memory(
-            sram_address=0,
-            accelerator_dram_address=row_bytes,
-            element_size=0,
-            inst_pointer_idx=out_ptr,
-        )
+
+        # Reads — each N/2-elem slice into its own aligned row (DRAM byte offsets are free).
+        _read(input_dram_addr,                 row_bytes,      uram_x_lo)   # x_lo
+        _read(input_dram_addr + half_bytes,    row_bytes,      uram_x_hi)   # x_hi
+        _read(cos_dram_addr,                   rope_row_bytes, uram_cos_lo) # cos[0:half]
+        _read(cos_dram_addr + half_bytes,      rope_row_bytes, uram_cos_hi) # cos[half:N]
+        _read(sin_dram_addr,                   rope_row_bytes, uram_sin_lo) # sin[0:half] (pre-negated)
+        _read(sin_dram_addr + half_bytes,      rope_row_bytes, uram_sin_hi) # sin[half:N]
+
+        # Compute (operands span URAM_A/URAM_B; element_size=half from row starts).
+        self.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half)      # a_lo = x_lo * cos_lo
+        self.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half)      # a_hi = x_hi * cos_hi
+        self.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half)      # b_lo = x_hi * (-sin)
+        self.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half)      # b_hi = x_lo * sin
+        self.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half)
+        self.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half)
+
+        # Writes — two aligned halves back to the output row.
+        _write(output_dram_addr,              row_bytes, uram_result_lo)
+        _write(output_dram_addr + half_bytes, row_bytes, uram_result_hi)
+
+        self.generate_instruction_add_inc(t_reg)
         self.loop_end()
 
-        self.release_inst_ptr(out_ptr)
-        self.release_inst_ptr(rope_ptr)
-        self.release_inst_ptr(x_ptr)
+        self.release_isa_reg()  # t_reg
+        self.release_isa_reg()  # tmp_reg
         return 4 * M * N
 
     def rope_hf_core_dram_gqa(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None) -> int:
@@ -4515,13 +4990,8 @@ class UnifiedEngine:
     def bf16_transpose_core_pbi(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None) -> None:
         """
         Transposes a (M x N) input matrix X to produce an (N x M) output matrix Y = X^T.
-        Optimized with the PBI mechanism for the innermost loop.
-
-        IDENTITY_DRAM_ADDR: pre-allocated UE_VECTOR_SIZE×UE_VECTOR_SIZE identity matrix in DRAM.
-        Pass the caller-managed address to avoid a per-call allocate_params_dram + dma_write during
-        compile — without this, the write is skipped when the compiled .bin is reused and the
-        identity data is absent at runtime, corrupting all transpose outputs.
-        If None, falls back to allocating + writing inline (compile-time only, breaks on bin skip).
+        Hybrid mode: Python outer loop for N (legacy style for bandwidth efficiency), 
+        Hardware mapped loop for M (PBI optimized).
         """
         bytes_per_element = 2
         # Allocate identity matrix of size UE_VECTOR_SIZE x UE_VECTOR_SIZE in URAM_A start
@@ -4532,7 +5002,7 @@ class UnifiedEngine:
             identity_matrix_dram_addr = self.get_params_dram_addr()
             self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
             self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-
+        
         # transfer identity matrix to URAM_A start
         self.accelerator_memory_to_sram(accelerator_dram_address=identity_matrix_dram_addr,
                                         sram_address=identity_matrix_sram_start_addr,
@@ -4540,50 +5010,27 @@ class UnifiedEngine:
 
         usable_uram_a_start_addr = identity_matrix_sram_start_addr + UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element
         
-        # URAM cap on row strip height.
-        def _largest_uniform_strip(
-            total_dim: int, strip_cap: int, step: int, min_strip: int
-        ) -> int | None:
-            """Largest ``w`` with ``w | total_dim``, ``min_strip <= w <= strip_cap``, ``w % step == 0``."""
-            if strip_cap < min_strip or total_dim < 1:
-                return None
-            upper = min(strip_cap, total_dim)
-            upper = (upper // step) * step
-            if upper < min_strip:
-                return None
-            for cand in range(upper, min_strip - 1, -step):
-                if total_dim % cand == 0:
-                    return cand
-            return None
+        # 1. Calculate theoretical max M_chunk
+        M_chunk = min(M, (URAM_NEAR_FULL_ELEMENTS // N) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+        
+        # 2. Force M_chunk to be a perfect divisor of M so the static hardware loop drops no remainders
+        while M_chunk > 0 and M % M_chunk != 0:
+            M_chunk -= UE_VECTOR_SIZE
+            
+        if M_chunk == 0:
+            raise ValueError(f"Cannot find an M_chunk that evenly divides M={M} with UE_VECTOR_SIZE={UE_VECTOR_SIZE}")
 
-        m_cap_main = min(M, (URAM_NEAR_FULL_ELEMENTS // N) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
         M_chunk_aligned = None
-        num_full_m_tiles = None
-        M_chunk = None
-
-        if m_cap_main >= UE_VECTOR_SIZE:
-            # Multiples-of-64 strips only; maximizes URAM B height subject to cap and ``M_chunk | M``.
-            M_chunk = _largest_uniform_strip(M, m_cap_main, UE_VECTOR_SIZE, UE_VECTOR_SIZE)
-            if M_chunk is not None:
-                num_full_m_tiles = M // M_chunk
-
-        if num_full_m_tiles is None:
-            # Legacy small-``M_chunk`` path: 32 or 16 from N, ``M_chunk_aligned`` for URAM-A output alignment.
+        if M_chunk < UE_VECTOR_SIZE:
             if (N * 32) <= URAM_NEAR_FULL_ELEMENTS:
-                m_cap_small = 32
+                M_chunk = 32
             elif (N * 16) <= URAM_NEAR_FULL_ELEMENTS:
-                m_cap_small = 16
+                M_chunk = 16
             else:
                 assert False, f"N={N} is too large to fit in usable URAM elements={URAM_NEAR_FULL_ELEMENTS}"
-            
             M_chunk_aligned = UE_VECTOR_SIZE
-            M_chunk = _largest_uniform_strip(M, m_cap_small, 16, 16)
-            
-            assert M_chunk is not None, (
-                f"bf16_transpose_core_pbi: no uniform M strip (multiple of 16, ≤{m_cap_small}) divides M={M}. "
-                "Ensure M is perfectly divisible by a valid chunk size to avoid dropping rows."
-            )
-            num_full_m_tiles = M // M_chunk_aligned
+
+        num_full_m_tiles = M // M_chunk
 
         usable_uram_a_elements = URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE
         output_M_size = M_chunk_aligned if M_chunk_aligned is not None else M_chunk
@@ -4604,73 +5051,61 @@ class UnifiedEngine:
         pointer_compute = self.alloc_inst_ptr()
         pointer_output = self.alloc_inst_ptr()
 
-        # Allocate ISA registers for the unified inner hardware loop
-        gpr_n_counter = self.alloc_isa_reg()
-        chunk_size_reg = self.alloc_isa_reg()
-        n_take_reg = self.alloc_isa_reg()
-        dma_bytes_reg = self.alloc_isa_reg()  # scratch: n_take_reg * stride bytes, reused per callsite
-
-        self.generate_instruction_add_set(chunk_size_reg, UE_VECTOR_SIZE)
-        # 1. Initialize N loop counters for this tile
-        self.generate_instruction_add_set(gpr_n_counter, N)
-        self.generate_instruction_reg_min(n_take_reg, gpr_n_counter, chunk_size_reg)
-
-        ISA_FOR_LOOP = 1
-        
-        # --- one-time PBI inits (outside the tile loop) ---
-        if M_chunk_aligned is None:
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=OUTPUT_DRAM_ADDR,
-                output_size=M_chunk * bytes_per_element,
-                uram_a_start_addr=usable_uram_a_start_addr >> 7,
-                inst_pointer_idx=pointer_output,
-            )
-        else:
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=OUTPUT_DRAM_ADDR,
-                dma_length=M_chunk * 2,
-                uram_a_start_addr=usable_uram_a_start_addr >> 7,
-                uram_b_start_addr=usable_uram_a_start_addr >> 7,
-                inst_pointer_idx=pointer_output,
-            )
-
         stride_in_rows = N // UE_VECTOR_SIZE
         init_dma_length = UE_VECTOR_SIZE * M_chunk if stride_in_rows == 1 else M_chunk * N
         init_vector_sram_addr = 0x00000
-        init_matrix_sram_addr = uram_b_start_addr
-        init_output_sram_wb_addr = output_sram_wb_addr
 
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=0,
-            dma_length=init_dma_length,
-            output_size=M_chunk,
-            uram_length=1, # Explicitly seed the exact 1-block dot product length
-            uram_a_start_addr=init_vector_sram_addr >> 7,
-            uram_b_start_addr=init_matrix_sram_addr >> 7,
-            uram_wb_addr=init_output_sram_wb_addr >> 7,
-            inst_pointer_idx=pointer_compute
-        )
+        row_stride_elements = M_chunk if M_chunk_aligned is None else M_chunk_aligned
+        wb_line_delta = row_stride_elements // UE_VECTOR_SIZE
 
-        # abs jump to flush i-cache so the while-loop body lands at the start of a fresh line
-        program_dram_start_addr = self.get_program_dram_addr()
-        cur_inst_count = self.capture_count
-        jump_target_word_addr = ue_35bit_addr_shifter(program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES)
-        self.generate_instruction_jump_abs(jump_target_word_addr)
+        # ===== Legacy Style Python Outer N Loop =====
+        for n_offset, n_take in self.chunk_ranges(N, N_chunk):
+            
+            OUTPUT_DRAM_ADDR_LOCAL = OUTPUT_DRAM_ADDR + n_offset * M * bytes_per_element
+            
+            # Init Input Pointer
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=INPUT_DRAM_ADDR,
+                dma_length=M_chunk * N * bytes_per_element,
+                uram_b_start_addr=(uram_b_start_addr >> 7) & 0xFFF,
+                inst_pointer_idx=pointer_input,
+            )
 
-        # ===== while-loop body start =====
-        body_start_inst_cnt = self.capture_count
+            # Init Output Pointer
+            if M_chunk_aligned is None:
+                self.generate_instruction_pbi_init(
+                    dram_shared_addr=OUTPUT_DRAM_ADDR_LOCAL,
+                    dma_length=n_take * M_chunk * bytes_per_element, # Total DMA bytes explicitly set here
+                    output_size=M_chunk * bytes_per_element,         # Chunk size (prevents 16-bit overflow)
+                    uram_a_start_addr=output_sram_wb_addr >> 7,
+                    inst_pointer_idx=pointer_output,
+                )
+            else:
+                self.generate_instruction_pbi_init(
+                    dram_shared_addr=OUTPUT_DRAM_ADDR_LOCAL,
+                    dma_length=M_chunk * 2,
+                    uram_a_start_addr=output_sram_wb_addr >> 7,
+                    uram_b_start_addr=output_sram_wb_addr >> 7,
+                    inst_pointer_idx=pointer_output,
+                )
 
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=INPUT_DRAM_ADDR,
-            dma_length=M_chunk * N * bytes_per_element,
-            uram_b_start_addr=(0x80000 >> 7) & 0xFFF,
-            inst_pointer_idx=pointer_input,
-        )
+            # Init Compute Pointer (Offsetting uram_b so we pull from the correct columns)
+            compute_uram_b_offset = (n_offset // UE_VECTOR_SIZE)
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=0,
+                dma_length=init_dma_length,
+                output_size=M_chunk,
+                uram_length=1, 
+                uram_a_start_addr=init_vector_sram_addr >> 7,
+                uram_b_start_addr=(uram_b_start_addr >> 7) + compute_uram_b_offset,
+                uram_wb_addr=output_sram_wb_addr >> 7,
+                inst_pointer_idx=pointer_compute
+            )
 
-        for i in range(ISA_FOR_LOOP):
-            # N strip loop
+            # ===== Inner Hardware M Loop =====
             self.loop_start(num_full_m_tiles)
 
+            # 1. Fetch exactly one horizontal M slice (M_chunk * N)
             self.ue_memcpy_from_dram(
                 N * bytes_per_element * M_chunk,
                 0,
@@ -4680,13 +5115,10 @@ class UnifiedEngine:
                 inst_pointer_idx=pointer_input,
             )
 
-            # Hardware Tiling Definitions
-            row_stride_elements = M_chunk if M_chunk_aligned is None else M_chunk_aligned
-            wb_line_delta = row_stride_elements // UE_VECTOR_SIZE
-            stride_in_rows = N // UE_VECTOR_SIZE
-
-            for j in range(ISA_FOR_LOOP):
-                self.loop_start(gpr_loop_cnt=n_take_reg)
+            # 2. Compute `n_take` rows in increments of UE_VECTOR_SIZE
+            for inner_n_offset, inner_n_take in self.chunk_ranges(n_take, UE_VECTOR_SIZE):
+                
+                self.loop_start(inner_n_take)
                 
                 self.ue_arithmetic_op(
                     broadcast_mode=0,
@@ -4703,7 +5135,7 @@ class UnifiedEngine:
                     mode=UE_MODE.BF16_DOT_PRODUCT,
                     data_type=0,
                     uram_a_start_addr=1,                    # +1 line per iteration
-                    uram_b_start_addr=0,                    # 0 (matrix pointer remains stationary)
+                    uram_b_start_addr=0,                    # 0 (matrix pointer remains stationary for these rows)
                     uram_length=0,                          
                     dma_start_addr=0,
                     dma_length=0,                           
@@ -4712,36 +5144,29 @@ class UnifiedEngine:
                     fmax_context_addr=0,
                     inst_pointer_idx=pointer_compute,
                 )
-
                 self.loop_end() 
 
-            self.loop_start(gpr_loop_cnt=n_take_reg)
-            self.generate_instruction_pbi_inc(
-                uram_a_start_addr=-1,
-                uram_wb_addr=-wb_line_delta,
-                inst_pointer_idx=pointer_compute
-            )
-            self.loop_end()
-
-            if M_chunk_aligned is None:
-                self.generate_instruction_reg_mul_imm(dma_bytes_reg, n_take_reg, M_chunk * 2)
+                # Reset uram_a (identity matrix) and advance uram_b (matrix window) for next UE_VECTOR chunk
                 self.generate_instruction_pbi_inc(
-                    general_reg_src=dma_bytes_reg,
-                    pbi_field_select=PBI_FIELD.DMA_LENGTH,
-                    inst_pointer_idx=pointer_output,
+                    uram_a_start_addr=-inner_n_take,
+                    uram_b_start_addr=1,
+                    inst_pointer_idx=pointer_compute
                 )
+
+            # 3. Write back outputs to DRAM
+            if M_chunk_aligned is None:
                 self.ue_memcpy_to_dram(
                     memcpy_type=MEMCPY_TYPE.URAM.value,
                     uram_type=URAM_SECTION.URAM_A.value,
                     uram_src_addr=0,
                     dram_dst_addr=bytes_per_element * M_chunk,
-                    memcpy_length_bytes=0,
-                    stride_bytes_per_chunk=0,
+                    memcpy_length_bytes=0,    # Falls back to PBI pointer's dma_length 
+                    stride_bytes_per_chunk=0, # Falls back to PBI pointer's output_size 
                     stride_jump_bytes=M * bytes_per_element,
                     inst_pointer_idx=pointer_output,
                 )
             else:
-                self.loop_start(gpr_loop_cnt=n_take_reg)
+                self.loop_start(n_take)
                 self.ue_memcpy_to_dram(
                     memcpy_type=MEMCPY_TYPE.URAM.value,
                     uram_type=URAM_SECTION.URAM_A.value,
@@ -4752,8 +5177,8 @@ class UnifiedEngine:
                 )
                 self.loop_end()
 
-                # rewind m_take_reg row strides, then step by N_chunk for the next N strip.
-                self.loop_start(gpr_loop_cnt=n_take_reg)
+                # Rewind and step
+                self.loop_start(n_take)
                 self.generate_instruction_pbi_inc(
                     dram_shared_addr=-M * bytes_per_element,
                     uram_a_start_addr=-1,
@@ -4765,42 +5190,24 @@ class UnifiedEngine:
                     dram_shared_addr=M_chunk * bytes_per_element,
                     inst_pointer_idx=pointer_output,
                 )
+
+            # 4. Rewind Compute Pointers (uram_b and uram_wb) for the next M tile
+            for inner_n_offset, inner_n_take in self.chunk_ranges(n_take, UE_VECTOR_SIZE):
+                self.generate_instruction_pbi_inc(
+                    uram_b_start_addr=-1,
+                    uram_wb_addr=-inner_n_take * wb_line_delta,
+                    inst_pointer_idx=pointer_compute
+                )
+
             self.loop_end()
+            # ===== End Hardware M Loop =====
 
-        # Advance output PBI pointer by (n_take_reg - 1)*M*2 to the start of the next N strip.
-        # Loop n_take_reg times (+M*2 each), then subtract one step (-M*2) for net (n_take_reg-1)*M*2.
-        self.loop_start(gpr_loop_cnt=n_take_reg)
-        self.generate_instruction_pbi_inc(
-            dram_shared_addr=M * bytes_per_element,
-            inst_pointer_idx=pointer_output,
-        )
-        self.loop_end()
-        self.generate_instruction_pbi_inc(
-            dram_shared_addr=-M * bytes_per_element,
-            inst_pointer_idx=pointer_output,
-        )
-
-        self.generate_instruction_pbi_inc(
-            uram_b_start_addr=1,
-            inst_pointer_idx=pointer_compute
-        )
-
-        # ===== while-loop end =====
-        # Decrement remaining-row counter by actual n_take; jump back if rows remain.
-        self.generate_instruction_reg_sub(gpr_n_counter, gpr_n_counter, n_take_reg)
-        self.generate_instruction_reg_min(n_take_reg, gpr_n_counter, chunk_size_reg)
-        outer_loop_size = self.capture_count - body_start_inst_cnt + 2
-        self.generate_instruction_jump_rela_jnz(outer_loop_size, gpr_n_counter)
-
-        # Release ISA and Local Pointer Tracking
-        self.release_isa_reg()
-        self.release_isa_reg()
-        self.release_isa_reg()
-        self.release_isa_reg()
-
+        # Release Local Pointer Tracking
         self.release_inst_ptr(pointer_input)
         self.release_inst_ptr(pointer_compute)
         self.release_inst_ptr(pointer_output)
+
+
 
     def bf16_permute_core(self, dim_0: int, dim_1: int, dim_2: int,
                           INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
@@ -4982,7 +5389,8 @@ class UnifiedEngine:
 
     def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, ATTN_P_DRAM_ADDR: int = None,
-                            gpr_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True):
+                            gpr_bucket_idx: int = None, num_buckets: int = 8, use_pbi: bool = True,
+                            gpr_ret_id: int = None):
         """Flash attention entrypoint; dispatches based on ``gpr_bucket_idx``:
 
         - ``gpr_bucket_idx`` is a GPR index (1..15): :meth:`flash_attention_core_pbi` — captured
@@ -5023,6 +5431,7 @@ class UnifiedEngine:
                 gpr_bucket_idx=gpr_bucket_idx,
                 num_buckets=num_buckets,
                 use_pbi=use_pbi,
+                gpr_ret_id=gpr_ret_id,
             )
 
         return self.flash_attention_core_legacy(
@@ -5312,7 +5721,8 @@ class UnifiedEngine:
                             IDENTITY_DRAM_ADDR: int = None,
                             num_buckets: int = 8,
                             BIAS_DRAM_ADDR: int = None, debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None,
-                            use_pbi: bool = True):
+                            use_pbi: bool = True,
+                            gpr_ret_id: int = None):
         """
         **Vᵀ** at ``SCRATCH_DRAM_ADDR``: prefer ``bf16_transpose_core`` (PBI) when available; currently uses
         ``I @ V`` via :meth:`matmat_mul_core` ``use_pbi=True`` (**no identity fast path**—full GEMM cost).
@@ -5362,6 +5772,7 @@ class UnifiedEngine:
             raise ValueError(f"flash_attention_core_pbi: num_buckets={num_buckets} must be >= 1")
 
         program_dram_start_addr = self.get_program_dram_addr()
+        first_capture_count = self.capture_count
 
         # Bucket jump header: num_buckets pairs of (ADD_DEC temp, JZ -> bucket_i_placeholder). Placeholder target = 0
         bucket_scratch_reg = self.alloc_isa_reg()
@@ -5374,7 +5785,8 @@ class UnifiedEngine:
                 target_instruction_word_addr=0, reg_id=bucket_scratch_reg
             )
 
-        # Bucket bodies, each followed by a JMP-to-end placeholder (also target = 0).
+        # Bucket bodies; each ends with JUMP_REG_ABS(gpr_ret_id) when caller supplies a return
+        # register, otherwise a JMP-to-end placeholder patched after all bodies are emitted.
         bucket_start_capture_indices: list[int] = []
         end_jmp_capture_indices: list[int] = []
         bucket_flops: list[int] = []
@@ -5409,14 +5821,11 @@ class UnifiedEngine:
                     BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 )
             bucket_flops.append(_body_flops)
-            end_jmp_capture_indices.append(self.capture_count)
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-
-        self.pad_capture_to_64b_boundary()
-        end_capture_count = self.capture_count
-        end_word_addr = ue_35bit_addr_shifter(
-            program_dram_start_addr + end_capture_count * INSTRUCTION_SIZE_BYTES
-        )
+            if gpr_ret_id is not None:
+                self.generate_instruction_jump_reg_abs(gpr_ret_id)
+            else:
+                end_jmp_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
         # Patch header JZs -> corresponding bucket entry.
         for jz_idx, bucket_idx in zip(jz_capture_indices, bucket_start_capture_indices):
@@ -5425,9 +5834,15 @@ class UnifiedEngine:
             )
             self._patch_jump_immediate(jz_idx, bucket_word_addr)
 
-        # Patch bucket-tail JMPs -> shared end label.
-        for jmp_idx in end_jmp_capture_indices:
-            self._patch_jump_immediate(jmp_idx, end_word_addr)
+        if gpr_ret_id is None:
+            self.pad_capture_to_64b_boundary()
+            end_capture_count = self.capture_count
+            end_word_addr = ue_35bit_addr_shifter(
+                program_dram_start_addr + end_capture_count * INSTRUCTION_SIZE_BYTES
+            )
+            # Patch bucket-tail JMPs -> shared end label.
+            for jmp_idx in end_jmp_capture_indices:
+                self._patch_jump_immediate(jmp_idx, end_word_addr)
 
         self.release_isa_reg()  # bucket_scratch_reg
 
@@ -5437,6 +5852,9 @@ class UnifiedEngine:
             f"Theoretical FLOPS min-bucket={bucket_flops[0] / 1e9:.6f} G, "
             f"max-bucket={bucket_flops[-1] / 1e9:.6f} G"
         )
+        if gpr_ret_id is not None:
+            start_inst_dram_addr = program_dram_start_addr + first_capture_count * INSTRUCTION_SIZE_BYTES
+            return start_inst_dram_addr, bucket_flops
         return bucket_flops
 
     def _flash_attention_pbi_body(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
@@ -5611,6 +6029,7 @@ class UnifiedEngine:
         gpr_bucket_idx: int = None,
         num_buckets: int = 8,
         use_pbi: bool = True,
+        gpr_ret_id: int = None,
     ):
         """Decoder group attention entrypoint; dispatches based on ``gpr_bucket_idx``:
 
@@ -5636,6 +6055,7 @@ class UnifiedEngine:
                 debug_mode=debug_mode,
                 SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
                 use_pbi=use_pbi,
+                gpr_ret_id=gpr_ret_id,
             )
         return self.decoder_group_attention_core_legacy(
             group_size=group_size,
@@ -5956,6 +6376,7 @@ class UnifiedEngine:
         debug_mode: bool = False,
         SM_OUTPUT_DRAM_ADDR: int = None,
         use_pbi: bool = True,
+        gpr_ret_id: int = None,
     ) -> list:
         """Bucketized decoder group attention. Mirrors the dispatcher shape of
         :meth:`flash_attention_core_pbi`: emits ``num_buckets`` complete bucket bodies (one per
@@ -5981,6 +6402,7 @@ class UnifiedEngine:
             )
 
         program_dram_start_addr = self.get_program_dram_addr()
+        first_capture_count = self.capture_count
         bucket_step = UE_VECTOR_SIZE
 
         # Bucket jump header: copy gpr_bucket_idx into a scratch reg so the JZ cascade leaves the
@@ -5997,7 +6419,8 @@ class UnifiedEngine:
                 target_instruction_word_addr=0, reg_id=bucket_scratch_reg
             )
 
-        # Bucket bodies, each followed by a JMP-to-end placeholder.
+        # Bucket bodies; each ends with JUMP_REG_ABS(gpr_ret_id) when a return register
+        # is supplied, otherwise a JUMP_ABS placeholder patched to the shared end label.
         bucket_start_capture_indices: list = []
         end_jmp_capture_indices: list = []
         bucket_flops: list = []
@@ -6032,25 +6455,23 @@ class UnifiedEngine:
                     BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 )
             bucket_flops.append(_body_flops)
-            end_jmp_capture_indices.append(self.capture_count)
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-
-        self.pad_capture_to_64b_boundary()
-        end_capture_count = self.capture_count
-        end_word_addr = ue_35bit_addr_shifter(
-            program_dram_start_addr + end_capture_count * INSTRUCTION_SIZE_BYTES
-        )
+            if gpr_ret_id is not None:
+                self.generate_instruction_jump_reg_abs(gpr_ret_id)
+            else:
+                end_jmp_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
         # Patch header JZs -> corresponding bucket entry.
         for jz_idx, bucket_start_idx in zip(jz_capture_indices, bucket_start_capture_indices):
-            bucket_word_addr = ue_35bit_addr_shifter(
-                program_dram_start_addr + bucket_start_idx * INSTRUCTION_SIZE_BYTES
-            )
-            self._patch_jump_immediate(jz_idx, bucket_word_addr)
+            self._patch_jump_immediate(jz_idx, ue_35bit_addr_shifter(
+                program_dram_start_addr + bucket_start_idx * INSTRUCTION_SIZE_BYTES))
 
-        # Patch bucket-tail JMPs -> shared end label.
-        for jmp_idx in end_jmp_capture_indices:
-            self._patch_jump_immediate(jmp_idx, end_word_addr)
+        if gpr_ret_id is None:
+            self.pad_capture_to_64b_boundary()
+            end_word_addr = ue_35bit_addr_shifter(
+                program_dram_start_addr + self.capture_count * INSTRUCTION_SIZE_BYTES)
+            for jmp_idx in end_jmp_capture_indices:
+                self._patch_jump_immediate(jmp_idx, end_word_addr)
 
         self.release_isa_reg()  # bucket_scratch_reg
 
@@ -6060,6 +6481,8 @@ class UnifiedEngine:
             f"FLOPS min-bucket={bucket_flops[0] / 1e9:.6f} G, "
             f"max-bucket={bucket_flops[-1] / 1e9:.6f} G"
         )
+        if gpr_ret_id is not None:
+            return program_dram_start_addr + first_capture_count * INSTRUCTION_SIZE_BYTES, bucket_flops
         return bucket_flops
 
     def _decoder_group_attention_pbi_body(
@@ -6147,7 +6570,7 @@ class UnifiedEngine:
         group_flops += 2 * 1 * seq_len * head_dim
         return group_size * group_flops
 
-    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False) -> None:
+    def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, write_back_disable: bool = False) -> None:
         """Quantized matrix-matrix multiplication core.
         Args:
             M: batch dimension (number of input vectors)
@@ -6260,11 +6683,12 @@ class UnifiedEngine:
                                                                 lalu_b=lalu_b)
                     max_clear_en = 0
 
-                self.sram_to_accelerator_memory(sram_address=0x80000,
-                                                accelerator_dram_address=OUTPUT_DRAM_ADDR + (M_chunk_idx * N + N_chunk_idx) * bytes_per_element,
-                                                element_size=M_chunk_size * N_take_size,
-                                                stride_bytes_per_chunk=N_take_size * bytes_per_element,
-                                                stride_jump_bytes=N * bytes_per_element)
+                if not write_back_disable:
+                    self.sram_to_accelerator_memory(sram_address=0x80000,
+                                                    accelerator_dram_address=OUTPUT_DRAM_ADDR + (M_chunk_idx * N + N_chunk_idx) * bytes_per_element,
+                                                    element_size=M_chunk_size * N_take_size,
+                                                    stride_bytes_per_chunk=N_take_size * bytes_per_element,
+                                                    stride_jump_bytes=N * bytes_per_element)
 
         total_flops = 2 * M * N * K
         if bias_enable:
@@ -6279,7 +6703,7 @@ class UnifiedEngine:
 
     def _emit_pbi_scatter_per_token(self, *, read_base, read_stride_bytes,
                                     write_specs, sram_byte_addr, element_count,
-                                    gpr_seq_len, template_seq_len):
+                                    gpr_seq_len, template_seq_len: int = 0):
         """Emit one PBI runtime loop that staged-copies one ``element_count``-row
         per outer iteration from ``read_base`` to each (base, stride) in
         ``write_specs``. The outer trip count is taken from GPR ``gpr_seq_len`` so
@@ -6617,16 +7041,20 @@ class UnifiedEngine:
             reg_id = src_reg_idx
             jump_mode_names = {
                 JUMP_MODE_ABSOLUTE: "ABSOLUTE",
+                JUMP_MODE_REG_ABS:  "REG_ABS",
                 JUMP_MODE_JNZ: "JNZ",
                 JUMP_MODE_JZ: "JZ",
                 JUMP_MODE_RELATIVE: "RELATIVE",
                 JUMP_MODE_RELA_JNZ: "RELA_JNZ",
                 JUMP_MODE_RELA_JZ: "RELA_JZ",
+                JUMP_MODE_REG_RELA: "REG_RELA",
             }
             jump_mode_name = jump_mode_names.get(jump_mode, f"UNKNOWN({jump_mode})")
             result = f"ISA_JUMP ({jump_mode_name})"
             if jump_mode in (JUMP_MODE_RELATIVE, JUMP_MODE_RELA_JNZ, JUMP_MODE_RELA_JZ):
                 result += f"\n    relative_back: {immediate_value} inst words"
+            elif jump_mode in (JUMP_MODE_REG_ABS, JUMP_MODE_REG_RELA):
+                result += f"\n    rst_reg_idx: {rst_reg_idx}"
             else:
                 result += f"\n    target_addr: {_u32(immediate_value):#010X}"
             result += f"\n    transaction_id: {transaction_id}"
@@ -6835,6 +7263,35 @@ class UnifiedEngine:
     def generate_instruction_jump_rela_jz(self, backward_instruction_words: int, reg_id: int) -> None:
         """Relative backward jump if ``reg_id == 0`` (``JUMP_MODE_RELA_JZ``)."""
         self._generate_instruction_jump(backward_instruction_words, JUMP_MODE_RELA_JZ, reg_id)
+
+    def generate_instruction_jump_reg_abs(self, rst_reg_idx: int) -> None:
+        """Unconditional absolute jump to the UE word address held in ``rst_reg_idx`` (``JUMP_MODE_REG_ABS``).
+
+        The register must contain the same word-address format used by
+        :meth:`generate_instruction_jump_abs` (``byte_addr >> 3``), typically written
+        with :meth:`generate_instruction_add_set` before the loop.  No alignment
+        padding is applied because the runtime value is unknown at capture time.
+        """
+        self.ue_isa_descriptor(
+            INSTRUCTION_JUMP,
+            immediate_value=0,
+            isa_mode=JUMP_MODE_REG_ABS,
+            rst_reg_idx=rst_reg_idx,
+        )
+
+    def generate_instruction_jump_reg_rela(self, rst_reg_idx: int) -> None:
+        """Unconditional relative backward jump; offset in instruction words taken from ``rst_reg_idx[9:0]`` (``JUMP_MODE_REG_RELA``).
+
+        ``inst_ram_read_ptr`` is decremented by the register value (saturating at 0),
+        mirroring :meth:`generate_instruction_jump_rela` but with a runtime-computed
+        offset stored in a GPR.
+        """
+        self.ue_isa_descriptor(
+            INSTRUCTION_JUMP,
+            immediate_value=0,
+            isa_mode=JUMP_MODE_REG_RELA,
+            rst_reg_idx=rst_reg_idx,
+        )
 
     def loop_start(self, loop_cnt: int = 0, gpr_loop_cnt: int = None) -> int:
         """

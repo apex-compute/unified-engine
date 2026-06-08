@@ -18,7 +18,7 @@ Weights:
 Usage:
   python gemma3_test.py
   python gemma3_test.py --prompt "your prompt"
-  python gemma3_test.py --dev xdma0 [--cycle 5.62]
+  python gemma3_test.py --dev xdma0 [--device kintex7] [--cycle 5.15]
   python gemma3_test.py --dev xdma0 --device bittware
   python gemma3_test.py --local-weights
   python gemma3_test.py --dual-engine
@@ -892,7 +892,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "flops": total_flops,
         }
         
-    def _compile_decoder_programs(self, layer_size: int = 26, use_pbi: bool = False) -> dict:
+    def _compile_decoder_programs(self, layer_size: int = 26, use_pbi: bool = False, profile: bool = False) -> dict:
         """Compile a single decoder program; KV length is selected at runtime via ``gpr_bucket_idx``.
 
         Grouped attention uses :meth:`decoder_group_attention_core` with ``gpr_bucket_idx`` (same
@@ -907,6 +907,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         decoder_count_at_start = self.capture_count
         count_at_start = self.capture_count
         total_flops = 0
+        checkpoints: list[list] = []
+
+        def _checkpoint(name: str) -> None:
+            self.generate_instruction_halt()
+            self.pad_capture_to_64b_boundary()
+            resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+            checkpoints.append([name, f"0x{resume:X}"])
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -917,6 +924,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
+            if profile:
+                _checkpoint(f"L{layer_idx}_pre_norm")
             total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
                                                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                                                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
@@ -942,6 +951,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size))
             self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size), self.TMP_REG)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=0, element_size=self.head_dim, general_reg_src=self.TMP_REG)
+            if profile:
+                _checkpoint(f"L{layer_idx}_qkv_proj_vcache")
             total_flops += self.rms_norm_core_dram(M=1, N=self.head_dim, A_DRAM_ADDR=self.LAYER0_K_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off)
             total_flops += self.rms_norm_core_dram(M=self.group_size, N=self.head_dim, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
@@ -961,6 +972,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             for g in range(self.group_size):
                 total_flops += self.rope_hf_core_decode(N=self.head_dim, input_dram_addr=self.LAYER0_Q_NORM_DRAM + g * self.head_dim * self.bytes_per_element, output_dram_addr=self.LAYER0_FLASH_Q_DRAM + g * self.head_dim * self.bytes_per_element,
                         gr_weight_dram=self.TMP_REG)
+            if profile:
+                _checkpoint(f"L{layer_idx}_qk_norm_rope")
             attn_result = self.decoder_group_attention_core(
                 group_size=self.group_size,
                 head_dim=self.head_dim,
@@ -976,6 +989,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 num_buckets=num_buckets,
             )
             total_flops += attn_result[-1] if use_pbi else attn_result
+            if profile:
+                _checkpoint(f"L{layer_idx}_attention")
             total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
@@ -990,9 +1005,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
             self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
+            if profile:
+                _checkpoint(f"L{layer_idx}_o_proj_post_attn_norm_residual")
 
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
+            if profile:
+                _checkpoint(f"L{layer_idx}_pre_ffn_norm")
 
             total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
@@ -1014,6 +1033,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
             self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
+            if profile:
+                _checkpoint(f"L{layer_idx}_mlp_gateup_gelu_mul")
 
             total_flops += self.quantized_matmat_core(M=1, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
@@ -1029,15 +1050,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
             self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
+            if profile:
+                _checkpoint(f"L{layer_idx}_mlp_down_post_ffn_norm_residual")
 
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
                 OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                is_B_quantized=True,
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
                 write_back_disable=True,
@@ -1058,9 +1080,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         return {
             "program_size_bytes": program_size_bytes,
             "total_flops": total_flops,
+            "checkpoints": checkpoints,
         }
 
-    def compile_gemma3(self, layer_size: int = 26, use_pbi: bool = False, slave_engine = None) -> None:
+    def compile_gemma3(self, layer_size: int = 26, use_pbi: bool = False, slave_engine = None, profile: bool = False) -> None:
         """Compile a single prefill program (seq_len-agnostic) and one decoder program into a
         combined instruction image.
 
@@ -1085,8 +1108,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             needed so each segment length is a multiple of 64 B; see :meth:`UnifiedEngine.generate_instruction_halt`).
           - paths.instruction_meta : per-stage start addresses, sizes, FLOPs.
         """
-        instruction_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_bin"])
-        instruction_meta_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_meta"])
+        if profile:
+            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_profile_instruction.bin")
+            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_profile_instruction.json")
+        else:
+            instruction_bin_path  = os.path.join(self.script_dir, self._cfg["paths"]["instruction_bin"])
+            instruction_meta_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_meta"])
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
@@ -1104,7 +1131,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         )
         print(f"  prefill compiled, size={prefill_prog['size_bytes']} bytes, "
               f"elapsed={time.perf_counter() - compile_t0:.1f}s")
-        decoder_program = self._compile_decoder_programs(layer_size=layer_size, use_pbi=True)
+        decoder_program = self._compile_decoder_programs(layer_size=layer_size, use_pbi=True, profile=profile)
         self.stop_capture()
 
         os.makedirs(os.path.dirname(instruction_bin_path), exist_ok=True)
@@ -1138,6 +1165,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_program_size": decoder_program["program_size_bytes"],
             "decoder_total_flops": decoder_program["total_flops"],
         }
+        if profile:
+            metadata["decoder_profile_checkpoints"] = decoder_program["checkpoints"]
 
         if slave_engine is not None:
             # Dual-engine slave compiles the same single prefill program.
@@ -1171,6 +1200,112 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         print(f"  prefill: seq_len-agnostic (template={prefill_seq_len}), {prefill_prog['size_bytes']} bytes")
         print(f"  decoder: {decoder_program['program_size_bytes']} bytes")
         print(f"Metadata written to {instruction_meta_path}")
+
+    def _decode_profile_execute(self, preamble_addr: int, checkpoints: list, timeout: float = 30.0) -> list:
+        """Execute one decoder step through profile checkpoints; return per-step HW latencies."""
+        results = []
+        self.start_execute_from_dram(preamble_addr)
+        for name, resume_addr_hex in checkpoints:
+            self.wait_queue(timeout)
+            results.append((name, self.report_latency_in_us() / 1e3))
+            self.start_execute_from_dram(int(resume_addr_hex, 16))
+        self.wait_queue(timeout)
+        results.append(("output_norm_lm_head", self.report_latency_in_us() / 1e3))
+        return results
+
+    def run_gemma3_profile(self) -> None:
+        """Load the profile instruction image, run prefill + one profiled decoder step,
+        and print a per-step latency breakdown for the decoder.
+        """
+        profile_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_profile_instruction.json")
+        with open(profile_meta_path, "r") as f:
+            meta = json.load(f)
+
+        self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
+        preamble_addr = self.get_program_dram_addr()
+
+        prefill_program_addr   = _parse_offset(meta["prefill_program_start_addr"])
+        decoder_program_addr   = _parse_offset(meta["decoder_program_start_addr"])
+        flops_prefill_template = meta["prefill_template_flops"]
+        template_prefill_seq_len = int(meta["prefill_template_seq_len"])
+        checkpoints            = meta["decoder_profile_checkpoints"]
+        _max_gpr_bucket = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+
+        prefill_seq = self.prefill_seq or tuple(self._cfg["default_prefill_tokens"])
+        prefill_seq = prefill_seq[:-1]
+        prefill_seq_len = len(prefill_seq)
+        self.seq_len = prefill_seq_len
+
+        q_seq_len = prefill_seq_len * self.group_size
+        aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
+        bucket_idx = aligned_seq_len_q // UE_VECTOR_SIZE
+        flops_prefill = flops_prefill_template * prefill_seq_len // max(template_prefill_seq_len, 1)
+
+        self.clear_inst_id()
+        self.start_capture()
+        self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
+        self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(preamble_addr)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.clear_capture_buffer()
+
+        embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+        bias_one_group = torch.full((aligned_seq_len_q, aligned_seq_len_q), float("-inf"), dtype=torch.bfloat16)
+        valid_mask = torch.tril(torch.ones(aligned_seq_len_q, aligned_seq_len_q, dtype=torch.bool))
+        bias_one_group.masked_fill_(valid_mask, 0.0)
+        bias_one_group[:, q_seq_len:] = float("-inf")
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
+
+        print(f"\n--- Profiling: prefill (seq_len={prefill_seq_len}) ---")
+        timer = time.perf_counter()
+        self.program_execute(preamble_addr, flops=flops_prefill)
+        print(f"Prefill done in {time.perf_counter() - timer:.2f}s")
+
+        # Decoder preamble for the first decode token
+        token_id = prefill_seq[-1]
+        self.seq_len += 1
+        aligned_dec = ((self.seq_len + 63) // 64) * 64
+        bucket_idx = min(aligned_dec // UE_VECTOR_SIZE, _max_gpr_bucket)
+        embedding_tensor = self.get_embedding_for_tokens([token_id])
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+        bias_host = torch.full((1, aligned_dec), -1e36, dtype=torch.bfloat16)
+        bias_host[0, :self.seq_len] = 0.0
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
+
+        self.clear_inst_id()
+        self.start_capture()
+        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(preamble_addr)
+        self.clear_capture_buffer()
+
+        print("\n--- Profiling: decoder step breakdown ---")
+        results = self._decode_profile_execute(preamble_addr, checkpoints)
+
+        total_ms = sum(ms for _, ms in results)
+        from collections import defaultdict
+        step_totals: dict = defaultdict(float)
+        for name, ms in results:
+            step = name.split("_", 1)[1] if "_" in name else name
+            step_totals[step] += ms
+
+        print(f"\n{'Step (all layers)':<35} {'ms':>9}  {'%':>6}")
+        print("-" * 54)
+        for step, ms in step_totals.items():
+            print(f"{step:<35} {ms:>9.2f}  {ms/total_ms*100:>5.1f}%")
+        print("-" * 54)
+        print(f"{'Total':<35} {total_ms:>9.2f}  100.0%")
+        print(f"\nDecode speed (HW): {1000/total_ms:.2f} tok/s  ({total_ms:.1f} ms/tok)")
+
+        print(f"\n{'Step':<40} {'ms':>8}")
+        print("-" * 50)
+        for name, ms in results:
+            print(f"{name:<40} {ms:>8.2f}")
 
     def run_gemma3(self, slave_engine = None) -> dict:
         """Load the unified instruction image once, then run prefill + decoder loop.
@@ -1272,6 +1407,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         max_seq_len = self.MAX_CONTEXT_SIZE
         total_latency, total_flop_rate = 0, 0
         decoder_token_cnt = 0
+        hw_decode_lats_us: list[float] = []
 
         # Two-region live counter: pin the bottom terminal row as a status line via
         # an ANSI scroll region; tokens stream in the area above it and the counter
@@ -1329,6 +1465,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.clear_capture_buffer()
 
             latency, flop_rate_program = self.program_execute(preamble_addr, flops=flops_hw)
+            hw_decode_lats_us.append(latency)
             total_latency += latency
             total_flop_rate += flop_rate_program
             token_id = self.get_arg_max_index()
@@ -1346,26 +1483,30 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             if _use_status:
                 _status_teardown()
 
-        token_cnt_decoded = self.seq_len
-        latency_hw_decoder = total_latency
-        flop_rate_hw_decoder = total_flop_rate
         latency_decoder = time.perf_counter() - timer
-        print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(self.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
-        print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(self.prefill_seq) + 1):.2f} Gflops")
+        tokens_decoded = decoder_token_cnt
+        print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
+              f"speed: {tokens_decoded / latency_decoder:.2f} tokens/s, "
+              f"total {self.seq_len} tokens.")
+
+        hw_decode_avg_ms  = sum(hw_decode_lats_us) / len(hw_decode_lats_us) / 1e3 if hw_decode_lats_us else 0.0
+        hw_decode_first_ms = hw_decode_lats_us[0] / 1e3 if hw_decode_lats_us else 0.0
+        cpu_decode_avg_ms = latency_decoder * 1e3 / tokens_decoded if tokens_decoded else 0.0
+        _original_print("\n=== Performance Summary ===")
+        _original_print(f"Instruction size  : prefill={meta['prefill_program_size']/1024:.1f} kB  decoder={meta['decoder_program_size']/1024:.1f} kB  total={(meta['prefill_program_size']+meta['decoder_program_size'])/1024:.1f} kB")
+        _original_print(f"Prefill ({prefill_seq_len} tokens): HW={latency_hw_prefill/1e3:,.1f} ms  CPU={latency_prefill*1e3:,.1f} ms")
+        _original_print(f"Decode 1st token  : HW={hw_decode_first_ms:,.1f} ms/tok  ({1000/hw_decode_first_ms:.2f} tok/s)")
+        _original_print(f"Decode  ({tokens_decoded} tokens): HW={hw_decode_avg_ms:,.1f} ms/tok  CPU={cpu_decode_avg_ms:,.1f} ms/tok  ({tokens_decoded/latency_decoder:.2f} tok/s)")
         
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
-    """Default clock period (ns) per FPGA type — same table as ``user_hw_test.py`` ``main``."""
-    if device == "kintex7":
-        return 5.1594
-    if device == "rk" or device == "puzhi":
-        return 3.0
-    if device == "bittware":
-        return 4.166666666
-    if device == "efinix":
-        return 4.0
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device in ("alveo", "efinix"):              return 4.0
     return 10.0
 
 
@@ -1391,8 +1532,10 @@ def main():
         '--cycle',
         type=float,
         default=None,
-        help='Clock cycle time in nanoseconds. Default: from --device (kintex7≈5.16ns, bittware≈4.17ns); legacy fallback 5.62 if device unknown.',
+        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=5.1594ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
     )
+    parser.add_argument('--profile', action='store_true',
+                        help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
     args = parser.parse_args()
 
     configure_device(args.device, dma_device=args.dev)
@@ -1402,27 +1545,17 @@ def main():
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
     globals()["DRAM_INSTRUCTION_ADDR"] = user_dma_core.DRAM_INSTRUCTION_ADDR
 
-    # Match user_hw_test.py: Bittware uses 512-bit AXI beat; other profiles use 256-bit.
-    axi_width_bits = 512 if args.device == "bittware" else 256
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-
-    if args.cycle is not None:
-        clock = args.cycle
-    else:
-        clock = _clock_ns_default_for_device(args.device)
-        if clock == 10.0:
-            clock = 5.62
-
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-
+    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     print(f"Using DMA device: {args.dev}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
-    print(f"FPGA profile: device={args.device}, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
     dual_engine = args.dual_engine
     assert dual_engine == False, (
@@ -1440,6 +1573,16 @@ def main():
     timer = time.perf_counter()
     ue.compile_gemma3(slave_engine=ue2 if dual_engine else None)
     print(f"Compile done in {time.perf_counter() - timer:.2f} seconds")
+
+    if args.profile:
+        print("\n--- Compiling profile binary ---")
+        timer = time.perf_counter()
+        ue.compile_gemma3(profile=True)
+        print(f"Profile compile done in {time.perf_counter() - timer:.2f} seconds")
+        ue.run_gemma3_profile()
+        ue.clear_dram()
+        print("Decoder profile done.")
+        return
 
     run_result = ue.run_gemma3(slave_engine=ue2 if dual_engine else None)
     print("Gemma3 test ends.")

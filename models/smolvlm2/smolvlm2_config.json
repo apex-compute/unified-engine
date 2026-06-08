@@ -2,7 +2,10 @@
   "fixed_isa_regs": {
     "V_CACHE_SIZE_REG": 1,
     "ROPE_SIZE_REG": 2,
-    "TMP_REG": 3
+    "TMP_REG": 3,
+    "GPR_SEQ_LEN_REG": 4,
+    "GPR_Q_SEQ_LEN_REG": 5,
+    "GPR_BUCKET_IDX_REG": 6
   },
   "lm": {
     "hidden_size": 960,
@@ -36,6 +39,7 @@
   "model": {
     "image_seq_len": 64,
     "max_context_size": 512,
+    "prefill_max_seq_len": 192,
     "stop_token_ids": [0, 1, 2, 49279]
   },
   "special_tokens": {

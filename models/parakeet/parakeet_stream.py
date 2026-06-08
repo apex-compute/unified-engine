@@ -404,7 +404,7 @@ _event_loop = None
 
 def main():
     global _event_loop
-    args = argparse.Namespace(dev="xdma0", cycle=5.63, port=8000, chunk_seconds=5)
+    args = argparse.Namespace(dev="xdma0", cycle=5.1594, port=8000, chunk_seconds=5)
 
     _original_print("Initializing FPGA engines...")
     init_engine(args)

@@ -16,7 +16,7 @@ Weights:
 Usage:
   python mobilenetv2_test.py
   python mobilenetv2_test.py --image path/to/image.jpg
-  python mobilenetv2_test.py --dev xdma0 [--cycle 5.62]
+  python mobilenetv2_test.py --dev xdma0 [--device kintex7] [--cycle 5.15]
 
 Fixed layout: mobilenetv2_test.py, mobilenetv2_config.json, mobilenetv2_bin/
 live in the same folder. user_dma_core.py is two folders up (repo root);
@@ -1103,13 +1103,22 @@ def preprocess_image(image_path: str, size: int = 224) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MobileNetV2-1.0 accelerator inference.")
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device (default: xdma0)")
-    parser.add_argument("--cycle", type=float, default=5.62, help="Clock cycle time in ns")
+    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     parser.add_argument("--cleanup", action="store_true",
                         help="Delete compile artifacts from mobilenetv2_bin/ before running. "
                              "Cached HF weights (hf_model/) are preserved.")
@@ -1131,7 +1140,13 @@ def main():
     _SILENT_MODE = True
 
     set_dma_device(args.dev)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     image_path = args.image or os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     pixel_values = preprocess_image(image_path, size=MobileNetV2_UnifiedEngine.IMAGE_SIZE)

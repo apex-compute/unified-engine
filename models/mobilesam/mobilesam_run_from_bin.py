@@ -181,12 +181,22 @@ class MobileSAM_UE_Run(UnifiedEngine):
         return masks_hw, iou_hw
 
 
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    return 10.0
+
+
 def main():
     parser = argparse.ArgumentParser(description="MobileSAM inference from pre-compiled bins")
     parser.add_argument("--point", type=int, nargs=2, metavar=("X", "Y"), default=[512, 512],
                         help="Single-point inference at (x, y) (default: 512 512)")
     parser.add_argument("--dev", type=str, default="xdma0")
-    parser.add_argument("--cycle", type=float, default=None)
+    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     args = parser.parse_args()
 
     # Check bins exist
@@ -207,8 +217,13 @@ def main():
         param_meta = json.load(f)
 
     set_dma_device(args.dev)
-    if args.cycle is not None:
-        user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     # Load image
     img_path = os.path.join(SCRIPT_DIR, "../../../test_samples/vette.jpg")
@@ -223,7 +238,7 @@ def main():
     _original_print(f"MobileSAM on {args.dev} (from pre-compiled bins)\n")
 
     # Build engine
-    engine = MobileSAM_UE_Run(clock_period_ns=args.cycle)
+    engine = MobileSAM_UE_Run(clock_period_ns=clock)
     engine.load_params()
 
     # Allocate tensor DRAM from saved manifest — use absolute offsets from compilation
