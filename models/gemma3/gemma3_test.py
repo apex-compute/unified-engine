@@ -46,47 +46,9 @@ from huggingface_hub import snapshot_download
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, configure_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
-
-def configure_device(device_name: str, dma_device: str | None = None, base_addr: int | None = None) -> dict:
-    """Apply board-specific DMA and DRAM layout, with a local Efinix fallback.
-
-    Newer pcie_utils has user_dma_core.configure_device(); this branch may not.
-    Keep the board profile here so Gemma3 can still run on the Efinix PCIe DMA
-    driver without requiring a user_dma_core.py update in this request.
-    """
-    if hasattr(user_dma_core, "configure_device"):
-        return user_dma_core.configure_device(device_name, dma_device=dma_device, base_addr=base_addr)
-
-    if device_name == "efinix":
-        user_dma_core.UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
-        user_dma_core.DRAM_START_ADDR = 0x00000000
-        user_dma_core.DRAM_ACTIVATION_ADDR = 0x30000000
-        user_dma_core.DRAM_INSTRUCTION_ADDR = 0x3F000000
-        user_dma_core.DRAM_END_ADDR = 0x3FFFFFFF
-        user_dma_core.DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
-        user_dma_core.DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
-        user_dma_core.DMA_DEVICE_USER = "/dev/pcie_dma0_user"
-    else:
-        user_dma_core.UE_0_BASE_ADDR = 0x02000000 if base_addr is None else int(base_addr)
-        user_dma_core.DRAM_START_ADDR = 0x80000000
-        user_dma_core.DRAM_ACTIVATION_ADDR = 0xB0000000
-        user_dma_core.DRAM_INSTRUCTION_ADDR = 0xD0000000
-        user_dma_core.DRAM_END_ADDR = 0xFFFFFFFF
-        set_dma_device(dma_device or "xdma0")
-
-    return {
-        "device": device_name,
-        "ue_0_base_addr": user_dma_core.UE_0_BASE_ADDR,
-        "dram_start_addr": user_dma_core.DRAM_START_ADDR,
-        "dram_activation_addr": user_dma_core.DRAM_ACTIVATION_ADDR,
-        "dram_instruction_addr": user_dma_core.DRAM_INSTRUCTION_ADDR,
-        "dma_h2c": user_dma_core.DMA_DEVICE_H2C,
-        "dma_c2h": user_dma_core.DMA_DEVICE_C2H,
-        "dma_user": user_dma_core.DMA_DEVICE_USER,
-    }
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -1403,7 +1365,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device == "bittware":
         return 4.166666666
     if device == "efinix":
-        return 5.0
+        return 4.0
     return 10.0
 
 

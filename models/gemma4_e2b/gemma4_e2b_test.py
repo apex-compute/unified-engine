@@ -8451,9 +8451,15 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use gemma4_e2b_bin/full_model_weights.bin instead of generated weights_gemma4_e2b_hf.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument('--device', type=str, default='xdma',
+                        help='Target device: xdma (default) or efinix')
     parser.add_argument('--cycle', type=float, default=5.62,
                         help='Clock cycle time in nanoseconds (default: 3.0, use 2.5 for alveo)')
     args = parser.parse_args()
+
+    if args.device == "efinix":
+        print("ERROR: gemma4_e2b requires ~1920 MB of DRAM for weights alone (1600 MB LM + 320 MB vision/audio), exceeding the Efinix board's 1 GB limit.")
+        raise SystemExit(1)
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER

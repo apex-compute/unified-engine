@@ -2800,7 +2800,13 @@ def main():
                         help='Repetition penalty (1.0=off, default: 1.05)')
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument('--device', type=str, default='xdma',
+                        help='Target board (e.g., xdma, bittware, efinix).')
     args = parser.parse_args()
+
+    if args.device == "efinix":
+        print("ERROR: qwen2.5_vl_3b requires ~1564 MB of DRAM for weights, exceeding the Efinix board's 1 GB limit.")
+        raise SystemExit(1)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 

@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, configure_device, clock_ns_for_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -322,7 +322,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        super().__init__()
+        super().__init__(
+            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
+            params_dram_base=user_dma_core.DRAM_START_ADDR,
+            program_dram_base=user_dma_core.DRAM_INSTRUCTION_ADDR,
+            tensor_dram_base=user_dma_core.DRAM_ACTIVATION_ADDR,
+        )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
@@ -1257,8 +1262,9 @@ def main():
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")
-    parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
-    parser.add_argument('--cycle', type=float, default=1/0.17, help='Clock cycle time in ns (default: ~5.88ns)')
+    parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0). Ignored for --device efinix.')
+    parser.add_argument('--device', type=str, default='xdma0', help='Target board (e.g., xdma, efinix).')
+    parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns (default: auto from --device).')
     parser.add_argument('--top-k', type=int, default=1, help='Sample among the top-k HW argmax indices (1..4). 1 = greedy (default).')
     parser.add_argument('--temperature', type=float, default=1.0, help='Rank-prior temperature; higher = more diverse (default: 1.0).')
     parser.add_argument('--repetition-penalty', type=float, default=1.0, help='Divide weight of recently emitted tokens by this (>1 discourages repeats; default: 1.0).')
@@ -1275,13 +1281,13 @@ def main():
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
-    set_dma_device(args.dev)
+    configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Using DMA device: {args.dev}, CLOCK_CYCLE_TIME_NS={user_dma_core.CLOCK_CYCLE_TIME_NS}")
+    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle if args.cycle is not None else clock_ns_for_device(args.device, 1/0.17)
+    print(f"Using device: {args.device}, DMA: {args.dev}, CLOCK_CYCLE_TIME_NS={user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)

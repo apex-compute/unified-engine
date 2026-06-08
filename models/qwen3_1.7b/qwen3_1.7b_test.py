@@ -1486,9 +1486,15 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use qwen3_1.7b_bin/full_model_weights.bin instead of generated weights_qwen3_1.7b_hf.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument('--device', type=str, default='xdma',
+                        help='Target board (e.g., xdma, bittware, efinix).')
     parser.add_argument('--cycle', type=float, default=1/0.17,
                         help='Clock cycle time in nanoseconds (default: ~5.88ns)')
     args = parser.parse_args()
+
+    if args.device == "efinix":
+        print("ERROR: qwen3_1.7b requires ~1134 MB of DRAM for weights, exceeding the Efinix board's 1 GB limit.")
+        raise SystemExit(1)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:

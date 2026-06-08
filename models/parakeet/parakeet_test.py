@@ -1691,8 +1691,13 @@ def main():
     parser = argparse.ArgumentParser(description="Parakeet-TDT-0.6B accelerator inference")
     parser.add_argument("--audio", type=str, default=None, help="Path to audio file (.wav, .flac, etc.)")
     parser.add_argument("--dev", type=str, default="xdma0", help="XDMA device")
+    parser.add_argument("--device", type=str, default="xdma", help="Target board (e.g., xdma, bittware, efinix).")
     parser.add_argument("--cycle", type=float, default=5.63, help="Clock cycle in ns")
     args = parser.parse_args()
+
+    if args.device == "efinix":
+        print("ERROR: parakeet requires ~1199 MB of DRAM for weights, exceeding the Efinix board's 1 GB limit.")
+        raise SystemExit(1)
 
     global _SILENT_MODE
     _SILENT_MODE = True

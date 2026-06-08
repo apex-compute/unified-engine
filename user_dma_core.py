@@ -87,6 +87,7 @@ UE_AXI_DATA_WIDTH_BITS = int(os.environ.get("UE_AXI_DATA_WIDTH_BITS", "256"))
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
+CURRENT_DEVICE = ""  # set by configure_device(); controls board-specific behaviour
 
 def set_dma_device(device_name: str):
     """Set DMA device paths based on device name (e.g., 'xdma0' -> '/dev/xdma0_*').
@@ -120,6 +121,52 @@ def set_dma_device(device_name: str):
                     setattr(_mod, _name, _new)
                 except Exception:
                     pass
+
+def configure_device(device_name: str, dma_device: str | None = None, base_addr: int | None = None) -> dict:
+    """Apply board-specific DMA and DRAM layout globals.
+
+    Args:
+        device_name: "efinix" or default Xilinx Kintex 7 target.
+        dma_device:  xdma device name override (e.g. "xdma0"). Ignored for efinix.
+        base_addr:   Override for UE_0_BASE_ADDR. None = use board default.
+    """
+    global CURRENT_DEVICE, UE_0_BASE_ADDR, DRAM_START_ADDR, DRAM_ACTIVATION_ADDR
+    global DRAM_INSTRUCTION_ADDR, DRAM_END_ADDR
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+
+    CURRENT_DEVICE = device_name
+    if device_name == "efinix":
+        UE_0_BASE_ADDR        = 0x00000000 if base_addr is None else int(base_addr)
+        DRAM_START_ADDR       = 0x00000000
+        DRAM_ACTIVATION_ADDR  = 0x30000000
+        DRAM_INSTRUCTION_ADDR = 0x3F000000
+        DRAM_END_ADDR         = 0x3FFFFFFF
+        DMA_DEVICE_H2C        = "/dev/pcie_dma0_htc_0"
+        DMA_DEVICE_C2H        = "/dev/pcie_dma0_cth_0"
+        DMA_DEVICE_USER       = "/dev/pcie_dma0_user"
+    else:
+        UE_0_BASE_ADDR        = 0x02000000 if base_addr is None else int(base_addr)
+        DRAM_START_ADDR       = 0x80000000
+        DRAM_ACTIVATION_ADDR  = 0xB0000000
+        DRAM_INSTRUCTION_ADDR = 0xD0000000
+        DRAM_END_ADDR         = 0xFFFFFFFF
+        set_dma_device(dma_device or "xdma0")
+
+    return {
+        "device":               device_name,
+        "ue_0_base_addr":       UE_0_BASE_ADDR,
+        "dram_start_addr":      DRAM_START_ADDR,
+        "dram_activation_addr": DRAM_ACTIVATION_ADDR,
+        "dram_instruction_addr":DRAM_INSTRUCTION_ADDR,
+        "dma_h2c":              DMA_DEVICE_H2C,
+        "dma_c2h":              DMA_DEVICE_C2H,
+        "dma_user":             DMA_DEVICE_USER,
+    }
+
+
+def clock_ns_for_device(device: str, default_ns: float = 5.62) -> float:
+    """Return clock period (ns): 4.0 for efinix (250 MHz), else default_ns."""
+    return 4.0 if device == "efinix" else default_ns
 
 # Constants
 UE_VECTOR_SIZE = 64
@@ -790,7 +837,9 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        allowed_hw_versions = {0x25e4082c, 0x12345678}
+        allowed_hw_versions = {0x25e4082c}
+        if CURRENT_DEVICE == "efinix":
+            allowed_hw_versions.add(0x12345678)
         assert hw_version in allowed_hw_versions, (
             f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
             "expected one of "
