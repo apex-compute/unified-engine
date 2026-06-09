@@ -695,6 +695,13 @@ class SSDFPNLite_UnifiedEngine(UnifiedEngine):
         """Emit one instruction stream: stem -> 17 IR -> head -> FPN -> SSD-head."""
         self.start_capture()
 
+        # PBI: one GPR holds the per-layer M=H*W for every 1x1 conv. conv2d_1x1_dram
+        # primes it via ADD_SET and passes gpr_M_reg, so each pointwise GEMM's M-tile
+        # loop runs as a runtime hardware loop instead of a compile-time unroll. Held
+        # for the whole program (never freed) so matmat_mul_core_pbi's internal tile
+        # registers get distinct indices from alloc_isa_reg.
+        self._pbi_M_reg = self.alloc_isa_reg()
+
         # =================== STEM ===================
         conv2d_3x3_stride2_dram(
             self,

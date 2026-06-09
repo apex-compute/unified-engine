@@ -108,13 +108,31 @@ def conv2d_1x1_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: i
     relu6_enable -> clamp_enable on the matmul. The upper-bound bf16 value
     (6.0 instead of +inf) is set via the LALU_CLAMP_RELU_B monkey-patch in
     MobileNetV2_UnifiedEngine.__init__.
+
+    PBI: if ``ue._pbi_M_reg`` is set (a GPR index 1..15), the matmul's M-tile
+    loop trip count is taken from that register at runtime instead of being
+    unrolled at compile time. We prime it with this layer's M=H*W via ADD_SET
+    just before the call, collapsing thousands of static M-tile instructions
+    (M can reach H*W ~= 25k on early SSD levels) into one hardware loop body.
+    Absent the attribute (e.g. the classifier test), the legacy path is used.
     """
+    gpr_M_reg = getattr(ue, "_pbi_M_reg", None)
+    if gpr_M_reg is not None:
+        # matmat_mul_core_pbi grabs 4 isa-regs + 13 inst-ptrs monotonically and
+        # never frees them; across the ~35 pointwise convs that would exhaust the
+        # 15-entry register file. Restart the transient allocators just above the
+        # held M-reg before every call so that scratch gets reused, while the
+        # M-reg itself (allocated first, index gpr_M_reg) is preserved.
+        ue._isa_reg_counter = gpr_M_reg + 1
+        ue.reset_inst_ptr_counter()
+        ue.generate_instruction_add_set(dst_reg_idx=gpr_M_reg, immediate_value=H * W)
     ue.matmat_mul_core(
         M=H * W, K=C_in, N=C_out,
         A_DRAM_ADDR=INPUT_DRAM_ADDR, B_DRAM_ADDR=WEIGHT_DRAM_ADDR,
         OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
         C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="broadcast_N",
         clamp_enable=relu6_enable,
+        gpr_M_reg=gpr_M_reg,
     )
 
 
@@ -233,21 +251,44 @@ def conv2d_3x3_dw_tapwise_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
                     dx = (tap_idx % 3) - 1
 
                     # Strided gather: each output pixel pulls 64 channels from
-                    # input at (h_in+dy, w_in+dx). Per-pixel because the rows
-                    # are C bytes apart in DRAM and we only want 64 of them.
-                    for w_offset in range(w_count):
-                        w_out_pix = w_start + w_offset
-                        w_in_pix = w_out_pix * stride
-                        nh = h_in + dy
-                        nw = w_in_pix + dx
-                        slot = A_SRAM + w_offset * BLK * _BPE
-                        if 0 <= nh < H_in and 0 <= nw < W_in:
+                    # input at (h_in+dy, w_in+dx). The 64-channel slabs for
+                    # consecutive output pixels sit a constant ``stride*C`` bytes
+                    # apart in DRAM, so the whole in-bounds run of the row is ONE
+                    # strided DMA (chunk=64ch=128B, jump=stride*C*_BPE) instead of
+                    # w_count per-pixel DMAs. Out-of-bounds edge pixels (at most
+                    # the first/last column, or the whole row when nh is OOB) are
+                    # zero-filled per-pixel from ZERO_PAD — those are rare.
+                    nh = h_in + dy
+                    if not (0 <= nh < H_in):
+                        # Entire row out of bounds (top/bottom halo): zero all.
+                        for w_offset in range(w_count):
                             ue.accelerator_memory_to_sram(
-                                INPUT_DRAM_ADDR + (nh * W_in + nw) * C * _BPE + c_off * _BPE,
-                                slot, BLK)
-                        else:
+                                ZERO_PAD_DRAM_ADDR, A_SRAM + w_offset * BLK * _BPE, BLK)
+                    else:
+                        # Valid output-pixel window [p_first, p_last] (global w),
+                        # i.e. those with 0 <= p*stride+dx < W_in.
+                        p_first = 1 if dx < 0 else 0            # ceil(-dx/stride) for dx in {-1,0,1}
+                        p_last = (W_in - 1 - dx) // stride      # floor((W_in-1-dx)/stride)
+                        lo = max(w_start, p_first) - w_start
+                        hi = min(w_end - 1, p_last) - w_start + 1
+                        # OOB columns before the valid window -> zero per-pixel.
+                        for w_offset in range(0, lo):
                             ue.accelerator_memory_to_sram(
-                                ZERO_PAD_DRAM_ADDR, slot, BLK)
+                                ZERO_PAD_DRAM_ADDR, A_SRAM + w_offset * BLK * _BPE, BLK)
+                        # In-bounds run -> single strided DMA.
+                        if hi > lo:
+                            nw0 = (w_start + lo) * stride + dx
+                            ue.accelerator_memory_to_sram(
+                                INPUT_DRAM_ADDR + (nh * W_in + nw0) * C * _BPE + c_off * _BPE,
+                                A_SRAM + lo * BLK * _BPE, BLK,
+                                memcpy_length_bytes=(hi - lo) * BLK * _BPE,
+                                stride_bytes_per_chunk=BLK * _BPE,
+                                stride_jump_bytes=stride * C * _BPE,
+                            )
+                        # OOB columns after the valid window -> zero per-pixel.
+                        for w_offset in range(hi, w_count):
+                            ue.accelerator_memory_to_sram(
+                                ZERO_PAD_DRAM_ADDR, A_SRAM + w_offset * BLK * _BPE, BLK)
 
                     # Weight tile for this tap broadcasts the same (64,)
                     # kernel column across all w_count rows.
