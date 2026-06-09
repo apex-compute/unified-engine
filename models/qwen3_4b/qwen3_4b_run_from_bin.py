@@ -26,7 +26,7 @@ Architecture notes:
 Usage:
   python qwen3_4b_run_from_bin.py
   python qwen3_4b_run_from_bin.py --prompt "your prompt"
-  python qwen3_4b_run_from_bin.py --dev xdma0 [--device kintex7] [--cycle 5.15]
+  python qwen3_4b_run_from_bin.py --dev xdma0 [--cycle 5.62]
   python qwen3_4b_run_from_bin.py --local-weights
 """
 
@@ -388,6 +388,16 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         buf = torch.empty(vocab, dtype=torch.bfloat16)
         self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
         logits = buf.float()
+        # Non-finite LOGITS_DRAM ⇒ decoder wrote no valid logits this step (stale
+        # greedy bin reused for sampling, or a decode-compute divergence). Fail with
+        # an actionable message instead of a cryptic torch.multinomial crash.
+        if not torch.isfinite(logits).all():
+            n_nan = int(torch.isnan(logits).sum()); n_inf = int(torch.isinf(logits).sum())
+            raise RuntimeError(
+                f"sample_next_token: LOGITS_DRAM has {n_nan} NaN / {n_inf} Inf of {vocab}. "
+                f"The decoder produced no valid logits — if you switched greedy<->sampling, "
+                f"recompile the bin via qwen3_4b_test.py for this mode; otherwise this is a "
+                f"decode-compute divergence to debug on FPGA.")
         rep_pen = float(getattr(self, "repetition_penalty", 1.0))
         if rep_pen != 1.0 and prev_tokens:
             seen = torch.tensor(list(set(prev_tokens)), dtype=torch.long)
@@ -818,10 +828,12 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             self.wait_queue(10.0)
             if not hasattr(self, "_generated_tokens"):
                 self._generated_tokens = []
-            if float(getattr(self, "temperature", 0.0)) > 0:
-                token_id = self.sample_next_token(self._generated_tokens)
-            else:
-                token_id = self.get_arg_max_index()
+            # Greedy decode only (HW argmax register). Sampling disabled.
+            # if float(getattr(self, "temperature", 0.0)) > 0:
+            #     token_id = self.sample_next_token(self._generated_tokens)
+            # else:
+            #     token_id = self.get_arg_max_index()
+            token_id = self.get_arg_max_index()
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -840,15 +852,6 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
 # Offline runner — no compile machinery. Reads meta JSON from disk, loads the
 # pre-compiled bin to DRAM, runs prefill + decoder.
 # -----------------------------------------------------------------------------
-def _clock_ns_default_for_device(device: str) -> float:
-    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
-    if device in ("rk", "puzhi"):                 return 3.0
-    if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 4.0
-    return 10.0
-
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen3-4B inference from pre-compiled bins (offline)")
@@ -858,12 +861,12 @@ def main():
                         help="Use qwen3_4b_bin/full_model_weights.bin instead of weights_qwen3_4b_hf.bin")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (default: xdma0)")
-    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
-    # Sampling DEFAULTS to the validated long-context config (temp 0.7 / top-p 0.9
-    # / rep-penalty 1.2). --temperature 0 forces greedy fast path.
-    parser.add_argument('--temperature', type=float, default=0.7,
-                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.7.')
+    parser.add_argument("--cycle", type=float, default=5.62,
+                        help="Clock cycle time in ns (default: 5.62ns ≈ peak 22.8 GFLOPS)")
+    # Sampling is DISABLED — greedy-only (HW argmax). The sampling flags below are
+    # kept for CLI compatibility but have no effect (dispatch is commented out).
+    parser.add_argument('--temperature', type=float, default=0.0,
+                        help='(no effect — greedy-only) kept for CLI compatibility.')
     parser.add_argument('--top-k', type=int, default=0,
                         help='Top-k filter (0=disabled). Active only when --temperature > 0.')
     parser.add_argument('--top-p', type=float, default=0.9,
@@ -906,13 +909,10 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
+    _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
+                    f"UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
     global _SILENT_MODE
     _SILENT_MODE = True
@@ -957,6 +957,15 @@ def main():
     with open(meta_path) as _f:
         inst_meta = json.load(_f)
     _original_print(f"  Loaded compile meta from {os.path.relpath(meta_path, script_dir)}")
+    # Guard the writeback-mode trap: a greedy-compiled bin (LM-head writeback OFF)
+    # never writes LOGITS_DRAM, so sampling here would read stale/NaN logits. Fail
+    # early with a clear fix instead of a cryptic torch.multinomial crash mid-decode.
+    if ue.temperature > 0 and inst_meta.get("lm_head_writeback_disabled"):
+        raise SystemExit(
+            "Cached bin was compiled in GREEDY mode (LM-head writeback disabled), but "
+            "you requested sampling (--temperature > 0). The decoder never writes "
+            "LOGITS_DRAM in greedy mode. Recompile via qwen3_4b_test.py with sampling "
+            "defaults (temperature > 0) to regenerate the bin, or run with --temperature 0.")
 
     _original_print(f"\n--- Loading unified instruction bin ---")
     timer = time.perf_counter()
@@ -986,8 +995,9 @@ def main():
                                token_id=prefill_seq[-1], gflops_per_token=decoder_total_flops)
     latency_decoder = time.perf_counter() - timer
     decoded_tokens = max(token_cnt - len(prefill_seq) + 1, 1)
-    _original_print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, total {token_cnt} tokens, "
-                    f"decode speed: {decoded_tokens / latency_decoder:.2f} tokens/s ({decoded_tokens} decoded tokens / {latency_decoder:.2f}s).")
+    _original_print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
+                    f"speed: {decoded_tokens / latency_decoder:.2f} tokens/s, total {token_cnt} tokens.")
+    ue.clear_dram()
 
 
 if __name__ == "__main__":

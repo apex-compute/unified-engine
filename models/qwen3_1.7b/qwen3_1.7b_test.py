@@ -27,7 +27,7 @@ Weights:
 Usage:
   python qwen3_1.7b_test.py
   python qwen3_1.7b_test.py --prompt "your prompt"
-  python qwen3_1.7b_test.py --dev xdma0 [--device kintex7] [--cycle 5.15]
+  python qwen3_1.7b_test.py --dev xdma0 [--cycle 5.88]
   python qwen3_1.7b_test.py --local-weights
 """
 
@@ -47,7 +47,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, SCALE_BRAM_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, SCALE_BRAM_ELEMENTS, INSTRUCTION_SIZE_BYTES, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -396,6 +396,21 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         buf = torch.empty(vocab, dtype=torch.bfloat16)
         self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
         logits = buf.float()
+        # Fail loudly with an actionable message instead of a cryptic
+        # torch.multinomial "contains inf/nan" crash. Non-finite LOGITS_DRAM means
+        # the decoder did not write valid logits this step — almost always (a) a
+        # bin compiled in greedy mode (write_back_disable=True, LOGITS_DRAM never
+        # written) being reused for a sampling run [now prevented by the mode-keyed
+        # cache, but delete qwen3_1.7b_bin/*.bin/.json if an old bin lingers], or
+        # (b) a genuine decode-compute divergence (NaN cascade) to debug on FPGA.
+        if not torch.isfinite(logits).all():
+            n_nan = int(torch.isnan(logits).sum()); n_inf = int(torch.isinf(logits).sum())
+            raise RuntimeError(
+                f"sample_next_token: LOGITS_DRAM has {n_nan} NaN / {n_inf} Inf of {vocab} "
+                f"(max|finite|={logits[torch.isfinite(logits)].abs().max().item() if torch.isfinite(logits).any() else float('nan'):.3g}). "
+                f"The decoder produced no valid logits. If you switched greedy<->sampling, "
+                f"delete the cached instruction bin/meta and re-run so it recompiles for "
+                f"this mode; otherwise this is a decode-compute divergence to debug on FPGA.")
         # Repetition penalty (HF-style): for tokens already seen, divide positive
         # logits by penalty, multiply negative logits by penalty.
         rep_pen = float(getattr(self, "repetition_penalty", 1.0))
@@ -887,6 +902,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         # but defensively reset here too.)
         self._isa_reg_counter = 5
 
+        # §7 shared-subroutine attention: flash_attention_core compiled ONCE after
+        # the program HALT; every (layer, kv_head) call site sets gpr_ret_id and
+        # jumps in, returning via JUMP_REG_ABS(gpr_ret_id).
+        program_dram_base = self.get_program_dram_addr()
+        gpr_ret_id = self.alloc_isa_reg()
+        call_site_jump_capture_indices: list[int] = []
+
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         for layer_idx in range(layer_size):
@@ -1004,29 +1026,13 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     template_seq_len=seq_len,
                 )
 
-                # Flash attention for this KV head (head_dim=128, GQA group_size=2).
-                # Bucket dispatcher: bin contains num_buckets_prefill bodies (one per
-                # 64-token block of aligned Q seq), runtime gpr_bucket_idx GPR selects.
-                # The new flash kernel inlines V^T materialization via PBI matmul —
-                # no host-side identity DMA, so cache-hit replay is deterministic.
-                flash_result = self.flash_attention_core(
-                    head_dim=ahd,
-                    seq_len=aligned_seq_len,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-                    gpr_bucket_idx=self.gpr_bucket_idx,
-                    num_buckets=num_buckets_prefill,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                )
-                # PBI flash returns a per-bucket FLOPS list; pick the bucket the
-                # template targets for FLOPS bookkeeping.
-                total_flops += (flash_result[num_buckets_prefill - 1]
-                                if isinstance(flash_result, (list, tuple)) else (flash_result or 0))
+                # §7 call-site jump into the shared flash subroutine.
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                call_site_jump_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
                 # Assemble per-head output into FLASH_OUTPUT_DRAM. Per token, copy
                 # qpkv contiguous rows from FLASH_OUT_HEAD[t*qpkv:(t+1)*qpkv] to
@@ -1098,8 +1104,28 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                 gpr_M_reg=self.gpr_seq_len,
             )
 
-        # Per-bucket halt so each bucket-program is independently executable.
+        # HALT ends the normal path; the flash subroutine follows, reachable only
+        # via the call-site jumps above.
         self.generate_instruction_halt()
+        flash_sub_start, flash_flops = self.flash_attention_core(
+            head_dim=ahd,
+            seq_len=aligned_seq_len,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_buckets_prefill,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += flash_flops[num_buckets_prefill - 1] * layer_size * nkvh
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(jump_idx, ue_35bit_addr_shifter(flash_sub_start))
+        self.release_isa_reg()  # gpr_ret_id
         return total_flops
 
     def run_prefill(self, prefill_program_addr: int, preamble_addr: int,
@@ -1218,13 +1244,24 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         # Reset GPR allocator. Keep long-lived locals to a minimum — the PBI bucketed
         # decoder kernel internally allocates registers per bucket body (bucket_scratch,
         # m_reg, transpose's 4 + nested loop counters), so we have a tight budget.
-        # Only two locals survive across the layer loop:
-        #   gpr_one          (5) — gpr_M_reg for M=1 matmul/norm ops
-        #   gpr_rope_cos_abs (6) — absolute cos-base addr for this step's rope; reused
+        # Three locals survive across the layer loop:
+        #   gpr_ret_id       (5) — §7 shared-subroutine return-address reg
+        #   gpr_one          (6) — gpr_M_reg for M=1 matmul/norm ops
+        #   gpr_rope_cos_abs (7) — absolute cos-base addr for this step's rope; reused
         #                         across all rope_hf_core calls in all layers
+        # CRITICAL: the shared decode-attention subroutine is emitted after HALT but
+        # CALLED inside the layer loop, BEFORE o_proj/MLP (which use gpr_one as M=1).
+        # So the subroutine's internal regs must allocate ABOVE all three persistent
+        # regs (from counter 8) — do NOT lower _isa_reg_counter before emitting it, or
+        # it reuses reg 6/7, corrupting gpr_one/gpr_rope_cos_abs on every call →
+        # wrong-M matmuls → garbage/hang. The kernel is only ~1-2 regs deep, so base 8
+        # peaks well under the 15-GPR ceiling.
         self._isa_reg_counter = 5
+        gpr_ret_id       = self.alloc_isa_reg()
         gpr_one          = self.alloc_isa_reg()
         gpr_rope_cos_abs = self.alloc_isa_reg()
+        program_dram_base = self.get_program_dram_addr()
+        call_site_jump_capture_indices: list[int] = []
         self.generate_instruction_add_set(gpr_one, 1)
         # gpr_rope_cos_abs = ROPE_LOCAL_BASE + gpr_seq_len * rope_row_bytes (word address)
         self.generate_instruction_reg_mul_imm(
@@ -1304,6 +1341,18 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     sram_address=0x10000, accelerator_dram_address=0,
                     element_size=ahd, general_reg_src=self.TMP_REG)
 
+                # §7: gather valid K history (incl. just-written token) from per-head
+                # cache → fixed FLASH_K. Loop count = gpr_bucket_idx (64-token blocks).
+                self._emit_pbi_scatter_per_token(
+                    read_base=k_cache_base,
+                    read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    sram_byte_addr=0,
+                    element_count=UE_VECTOR_SIZE * ahd,
+                    gpr_seq_len=self.gpr_bucket_idx,
+                    template_seq_len=num_buckets_decoder,
+                )
+
                 # V cache write
                 self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
                 self.generate_instruction_reg_mul_imm(
@@ -1314,6 +1363,18 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     sram_address=0x20000, accelerator_dram_address=0,
                     element_size=ahd, general_reg_src=self.TMP_REG)
 
+                # §7: gather valid V history → fixed FLASH_V base (qwen3 decode puts
+                # v_proj in V_PROJ_TEMP, not FLASH_V, so no k_size offset needed).
+                self._emit_pbi_scatter_per_token(
+                    read_base=v_cache_base,
+                    read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_V_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    sram_byte_addr=0,
+                    element_count=UE_VECTOR_SIZE * ahd,
+                    gpr_seq_len=self.gpr_bucket_idx,
+                    template_seq_len=num_buckets_decoder,
+                )
+
                 # Gather this KV head's Q group (qpkv contiguous head_dim rows) into FLASH_Q.
                 for q in range(qpkv):
                     q_src = self.LAYER0_Q_NORM_DRAM + (kv_h * qpkv + q) * ahd * bpe
@@ -1321,26 +1382,18 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
                     self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
 
-                # PBI-bucketed group attention: one call processes all qpkv Q heads for
-                # this KV head. gpr_bucket_idx selects the bucket body whose seq_len
-                # exactly covers the current KV range — uninitialized cache slots are
-                # never read, eliminating the NaN cascade the legacy kernel had.
-                attn_result = self.decoder_group_attention_core(
-                    group_size=qpkv,
-                    head_dim=ahd,
-                    seq_len=UE_VECTOR_SIZE,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=k_cache_base,
-                    V_DRAM_ADDR=v_cache_base,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    gpr_bucket_idx=self.gpr_bucket_idx,
-                    num_buckets=num_buckets_decoder,
-                )
-                total_flops += (attn_result[-1]
-                                if isinstance(attn_result, (list, tuple)) else (attn_result or 0))
+                # §7 call-site jump into the shared decode-attention subroutine; it
+                # writes this head's output to the fixed FLASH_OUT_HEAD, which we
+                # then copy into this head's slot of FLASH_OUTPUT.
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                call_site_jump_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                self.accelerator_memory_to_sram(self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
+                self.sram_to_accelerator_memory(
+                    0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
 
             # o_proj
             total_flops += self._decode_matmul(layer_idx, "o",
@@ -1416,6 +1469,32 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
         # End-of-program halt so the runtime preamble's JUMP_ABS returns control after execute.
         self.generate_instruction_halt()
+
+        # §7: compile decoder_group_attention_core ONCE as a subroutine after HALT.
+        # Do NOT lower _isa_reg_counter: the subroutine must allocate its scratch
+        # ABOVE gpr_ret_id(5)/gpr_one(6)/gpr_rope_cos_abs(7) — all three are live
+        # when the subroutine is called mid-layer (gpr_one/gpr_rope_cos_abs are used
+        # by o_proj/MLP/rope after the attention call). The kernel is shallow, so
+        # allocating from counter 8 stays well under the 15-GPR ceiling.
+        self.pad_capture_to_64b_boundary()
+        dec_sub_start, dec_attn_flops = self.decoder_group_attention_core(
+            group_size=qpkv,
+            head_dim=ahd,
+            seq_len=self.MAX_CONTEXT_SIZE,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_buckets_decoder,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += dec_attn_flops[-1] * layer_size * nkvh
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(jump_idx, ue_35bit_addr_shifter(dec_sub_start))
         return total_flops
 
     def compile_instructions(self, layer_size: int | None = None) -> dict:
@@ -1452,19 +1531,31 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         bin_path  = os.path.join(self.script_dir, bin_rel)
         meta_path = os.path.join(self.script_dir, meta_rel)
 
-        # Cache short-circuit: if bin + meta already exist, skip the capture work
-        # entirely. The identity-matrix DMAs (the only host-DMA side effect that
-        # used to require a re-compile) now happen in weight_init at fixed
-        # addresses (_setup_identity_dma); the bin's baked references point at
-        # those addresses, and weight_init runs every invocation. So just
-        # loading the bin off disk is sufficient — no need to re-emit thousands
-        # of ISA instructions.
+        # LM-head writeback mode this run will compile for. Greedy decode disables
+        # the 304 KB/token LOGITS_DRAM writeback (HW argmax still fires); sampling
+        # REQUIRES the writeback so the host can DMA logits back. The two modes
+        # produce different decoder bins (one instruction flag differs), so the
+        # cache MUST be keyed on this — otherwise a greedy-compiled bin silently
+        # serves a sampling run and torch.multinomial sees stale/NaN LOGITS_DRAM.
+        greedy_writeback = (float(getattr(self, "temperature", 0.0)) <= 0
+                            and not getattr(self, "_diag_logit_mag", False))
+
+        # Cache short-circuit: reuse the on-disk bin only if it exists AND was
+        # compiled for the SAME LM-head writeback mode. The identity-matrix DMAs
+        # (the only other host-DMA side effect) happen in weight_init at fixed
+        # addresses every invocation, so loading the bin off disk is otherwise
+        # sufficient. A bin from an older build (missing the mode key) compares
+        # unequal to both True/False and is safely recompiled.
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
         if bin_cached:
             with open(meta_path, "r") as f:
                 meta = json.load(f)
-            print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
-            return meta
+            if meta.get("lm_head_writeback_disabled") == greedy_writeback:
+                print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
+                return meta
+            print(f"compile_instructions: cached bin LM-head mode "
+                  f"(writeback_disabled={meta.get('lm_head_writeback_disabled')}) "
+                  f"!= this run (writeback_disabled={greedy_writeback}); recompiling.")
 
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         # Template seq_len: drives static M= args (overridden at runtime by gpr_M_reg),
@@ -1522,6 +1613,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             "decoder_program_start_addr":   f"0x{decoder_program_start_addr:X}",
             "decoder_program_size":         decoder_program_size,
             "decoder_total_flops":          decoder_flops,
+            "lm_head_writeback_disabled":   greedy_writeback,
         }
         with open(bin_path, "wb") as f:
             f.write(all_bytes)
@@ -1554,7 +1646,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
         # Qwen3 stop tokens: <|im_end|>=151645, <|endoftext|>=151643
         _qwen3_stop_tokens = {151643, 151645, self._end_of_turn_token_id}
-        decoded_chars: list[str] = []
+
         global _SILENT_MODE
         # Decoder PBI buckets cover seq_len = i * UE_VECTOR_SIZE for i = 1..num_buckets,
         # spanning MAX_CONTEXT_SIZE. Bias buffer must match the maximum bucket size
@@ -1629,10 +1721,12 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
                     _original_print(f"[diag] step={_step} ctx={_ctx} bucket={bucket_idx} "
                                     f"max|logit|={_abs.max().item():.2f} margin={_margin:.2f} "
                                     f"top1={_tok1} {self.tokenizer.decode([_tok1])!r}", flush=True)
-            if float(getattr(self, "temperature", 0.0)) > 0:
-                token_id = self.sample_next_token(self._generated_tokens)
-            else:
-                token_id = self.get_arg_max_index()
+            # Greedy decode only (HW argmax register). Sampling disabled.
+            # if float(getattr(self, "temperature", 0.0)) > 0:
+            #     token_id = self.sample_next_token(self._generated_tokens)
+            # else:
+            #     token_id = self.get_arg_max_index()
+            token_id = self.get_arg_max_index()
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -1640,22 +1734,12 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             if token_id in _qwen3_stop_tokens:
                 print(f"\nStop token {token_id} reached.")
                 break
-            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
-        return self.seq_len, "".join(decoded_chars)
+        return self.seq_len
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-def _clock_ns_default_for_device(device: str) -> float:
-    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
-    if device in ("rk", "puzhi"):                 return 3.0
-    if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 4.0
-    return 10.0
-
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen3-1.7B prefill + decode on accelerator.")
@@ -1663,15 +1747,14 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use qwen3_1.7b_bin/full_model_weights.bin instead of generated weights_qwen3_1.7b_hf.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
-    # Sampling DEFAULTS to the validated long-context config (temp 0.7 / top-p 0.9
-    # / rep-penalty 1.2): greedy decoding on this small model degenerates into
-    # template repetition on long generations, so sampling is the correct default.
-    # Pass --temperature 0 to force the greedy fast path (UE_ARGMAX_INDEX, no
-    # host logit readback) for deterministic short-prompt testing.
-    parser.add_argument('--temperature', type=float, default=0.7,
-                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.7.')
+    parser.add_argument('--cycle', type=float, default=5.62,
+                        help='Clock cycle time in nanoseconds (default: 5.62ns ≈ peak 22.8 GFLOPS)')
+    # Sampling is DISABLED — this template runs greedy-only (HW argmax register,
+    # no host logit readback). The --temperature / --top-k / --top-p /
+    # --repetition-penalty flags are kept for CLI compatibility but have no effect
+    # on token selection (the sampling dispatch in run_decoder is commented out).
+    parser.add_argument('--temperature', type=float, default=0.0,
+                        help='(no effect — greedy-only) kept for CLI compatibility.')
     parser.add_argument('--top-k', type=int, default=0,
                         help='Top-k filter (0=disabled). Active only when --temperature > 0.')
     parser.add_argument('--top-p', type=float, default=0.9,
@@ -1700,13 +1783,13 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
+    print(f"Using DMA device: {args.dev}")
+    print(f"  H2C: {DMA_DEVICE_H2C}")
+    print(f"  C2H: {DMA_DEVICE_C2H}")
+    print(f"  USER: {DMA_DEVICE_USER}")
+    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
     ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)
@@ -1775,23 +1858,15 @@ def main():
 
     print(f"\n--- Starting decoder ---")
     timer = time.perf_counter()
-    token_cnt_decoded, decoded_text = ue.run_decoder(decoder_program_addr, preamble_addr,
+    token_cnt_decoded = ue.run_decoder(decoder_program_addr, preamble_addr,
                                        token_id=prefill_seq[-1],
                                        gflops_per_token=decoder_total_flops)
     latency_decoder = time.perf_counter() - timer
     decoded_tokens = max(token_cnt_decoded - len(prefill_seq) + 1, 1)
-    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, total {token_cnt_decoded} tokens, "
-          f"decode speed: {decoded_tokens / latency_decoder:.2f} tokens/s ({decoded_tokens} decoded tokens / {latency_decoder:.2f}s).")
+    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
+          f"speed: {decoded_tokens / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
+    ue.clear_dram()
     print("Qwen3-1.7B test ends.")
-    _original_print(f"TEST_RESULT: {json.dumps({
-        'prefill_tokens':      len(prefill_seq),
-        'decoded_text':        decoded_text,
-        'decoded_tokens':      decoded_tokens,
-        'prefill_speed_tok_s': round(len(prefill_seq) / latency_prefill, 2),
-        'decode_speed_tok_s':  round(decoded_tokens / latency_decoder, 2),
-        'prefill_size_kb':     round(inst_meta['prefill_program_size'] / 1024, 1),
-        'decoder_size_kb':     round(inst_meta['decoder_program_size'] / 1024, 1),
-    })}")
 
 if __name__ == "__main__":
     main()
