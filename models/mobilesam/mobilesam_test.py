@@ -2557,6 +2557,194 @@ class MobileSAM_UE(UnifiedEngine):
         self.execute_encoder(prog, image_t)
 
     # ------------------------------------------------------------------
+    # Debug: step through encoder stage by stage, assert no NaNs
+    # ------------------------------------------------------------------
+
+    def _compile_run(self, ops_fn, image_t: torch.Tensor | None = None, timeout: float = 120.0) -> None:
+        """Compile ops_fn() as a single program, execute, wait."""
+        self.start_capture()
+        ops_fn()
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.clear_capture_buffer()
+        if image_t is not None:
+            img_hwc = image_t[0].permute(1, 2, 0).contiguous()
+            img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, ENC_CIN_PAD, dtype=torch.bfloat16)
+            img_pad[:, :3] = img_hwc.reshape(-1, 3)
+            self.dma_to_accelerator_memory(self.PE_IN_DRAM, img_pad.reshape(-1))
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout)
+
+    def _read_tensor(self, addr: int, n_elements: int) -> torch.Tensor:
+        """DMA-read n_elements bf16 values from addr."""
+        buf = bytearray(n_elements * 2)
+        self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+        return torch.frombuffer(buf, dtype=torch.bfloat16).clone()
+
+    def _assert_no_nan(self, label: str, addr: int, n_elements: int) -> None:
+        t = self._read_tensor(addr, n_elements)
+        n_nan = torch.isnan(t).sum().item()
+        n_inf = torch.isinf(t).sum().item()
+        assert n_nan == 0 and n_inf == 0, (
+            f"NaN/Inf after {label}: {n_nan} NaNs, {n_inf} Infs "
+            f"(max={t[~torch.isnan(t)].abs().max().item():.4f})"
+        )
+        _original_print(f"  [OK] {label}: max_abs={t.abs().max().item():.4f}")
+
+    def debug_encode(self, image_t: torch.Tensor) -> None:
+        """Run encoder stage-by-stage, asserting no NaNs at each checkpoint."""
+        _original_print("debug_encode: stepping through encoder ...")
+
+        # conv0 + conv2 (patch embed)
+        self._compile_run(lambda: (
+            conv2d_3x3_stride2_dram(
+                self, self.PE_IN_DRAM, self.PE_MID_DRAM, self.PE_IM2COL,
+                self.PE_W0_DRAM, self.PE_B0_DRAM, self.PE_ZERO_DRAM,
+                ENC_IN_H, ENC_IN_W, ENC_CIN_PAD, ENC_C0P, gelu_enable=True),
+            conv2d_3x3_stride2_dram(
+                self, self.PE_MID_DRAM, self.PE_OUT_DRAM, self.PE_IM2COL,
+                self.PE_W2_DRAM, self.PE_B2_DRAM, self.PE_ZERO_DRAM,
+                ENC_IN_H // 2, ENC_IN_W // 2, ENC_C0P, ENC_C0P),
+        ), image_t=image_t)
+        self._assert_no_nan("patch_embed (PE_OUT)", self.PE_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+
+        # Stage 0 Block 0
+        def _s0b0():
+            conv2d_1x1_dram(self, self.PE_OUT_DRAM, self.S0_EXP_DRAM,
+                            self.S0B0_C1W, self.S0B0_C1B,
+                            ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S0_C_EXP, gelu_enable=True)
+            conv2d_3x3_dw_dram(self, self.S0_EXP_DRAM, self.S0_DW_DRAM, self.S0_IM2COL,
+                               self.S0B0_C2W, self.S0B0_C2B, self.S0_ZERO_DRAM,
+                               ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, gelu_enable=True)
+            conv2d_1x1_dram(self, self.S0_DW_DRAM, self.S0B0_OUT_DRAM,
+                            self.S0B0_C3W, self.S0B0_C3B,
+                            ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, ENC_C0P)
+            eltwise_add_dram(self, self.PE_OUT_DRAM, self.S0B0_OUT_DRAM,
+                             self.S0B0_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+            self.matmat_mul_core(
+                M=ENC_S0_H * ENC_S0_W, K=ENC_C0P, N=ENC_C0P,
+                A_DRAM_ADDR=self.S0B0_OUT_DRAM, B_DRAM_ADDR=self.IDENTITY_DRAM,
+                OUTPUT_DRAM_ADDR=self.S0B0_OUT_DRAM, gelu_enable=True)
+        self._compile_run(_s0b0)
+        self._assert_no_nan("S0B0_OUT", self.S0B0_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+
+        # Stage 0 Block 1
+        def _s0b1():
+            conv2d_1x1_dram(self, self.S0B0_OUT_DRAM, self.S0_EXP_DRAM,
+                            self.S0B1_C1W, self.S0B1_C1B,
+                            ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S0_C_EXP, gelu_enable=True)
+            conv2d_3x3_dw_dram(self, self.S0_EXP_DRAM, self.S0_DW_DRAM, self.S0_IM2COL,
+                               self.S0B1_C2W, self.S0B1_C2B, self.S0_ZERO_DRAM,
+                               ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, gelu_enable=True)
+            conv2d_1x1_dram(self, self.S0_DW_DRAM, self.S0B1_OUT_DRAM,
+                            self.S0B1_C3W, self.S0B1_C3B,
+                            ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, ENC_C0P)
+            eltwise_add_dram(self, self.S0B0_OUT_DRAM, self.S0B1_OUT_DRAM,
+                             self.S0B1_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+            self.matmat_mul_core(
+                M=ENC_S0_H * ENC_S0_W, K=ENC_C0P, N=ENC_C0P,
+                A_DRAM_ADDR=self.S0B1_OUT_DRAM, B_DRAM_ADDR=self.IDENTITY_DRAM,
+                OUTPUT_DRAM_ADDR=self.S0B1_OUT_DRAM, gelu_enable=True)
+        self._compile_run(_s0b1)
+        self._assert_no_nan("S0B1_OUT", self.S0B1_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+
+        # PatchMerging 0→1
+        def _pm01():
+            conv2d_1x1_dram(self, self.S0B1_OUT_DRAM, self.PM01_EXP_DRAM,
+                            self.PM01_W1_DRAM, self.PM01_B1_DRAM,
+                            ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S1_C, gelu_enable=True)
+            conv2d_3x3_dw_stride2_dram(
+                self, self.PM01_EXP_DRAM, self.PM01_DW_DRAM, self.PM01_IM2COL_DRAM,
+                self.PM01_W2_DRAM, self.PM01_B2_DRAM, self.PM01_ZERO_DRAM,
+                ENC_S0_H, ENC_S0_W, ENC_S1_C, gelu_enable=True)
+            conv2d_1x1_dram(self, self.PM01_DW_DRAM, self.PM01_OUT_DRAM,
+                            self.PM01_W3_DRAM, self.PM01_B3_DRAM,
+                            ENC_S1_H, ENC_S1_W, ENC_S1_C, ENC_S1_C)
+        self._compile_run(_pm01)
+        self._assert_no_nan("PM01_OUT", self.PM01_OUT_DRAM, ENC_S1_H * ENC_S1_W * ENC_S1_C)
+
+        # Stage 1 blocks
+        for bi, (inp, out, label) in enumerate([
+            (self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, "S1B0_OUT"),
+            (self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, "S1B1_OUT"),
+        ]):
+            self._compile_run(lambda i=bi, _in=inp, _out=out: self._run_s1_block(self.S1B[i], _in, _out))
+            self._assert_no_nan(label, out, ENC_S1_H * ENC_S1_W * ENC_S1_C)
+
+        # PatchMerging 1→2
+        _CP = ENC_S2_C_PAD
+        def _pm12():
+            conv2d_1x1_dram(self, self.S1B1_OUT_DRAM, self.PM12_EXP_DRAM,
+                            self.PM12_W1_DRAM, self.PM12_B1_DRAM,
+                            ENC_S1_H, ENC_S1_W, ENC_S1_C, _CP, gelu_enable=True)
+            conv2d_3x3_dw_stride2_dram(self, self.PM12_EXP_DRAM, self.PM12_DW_DRAM,
+                                       self.PM12_IM2COL_DRAM,
+                                       self.PM12_W2_DRAM, self.PM12_B2_DRAM, self.PM12_ZERO_DRAM,
+                                       ENC_S1_H, ENC_S1_W, _CP, gelu_enable=True)
+            conv2d_1x1_dram(self, self.PM12_DW_DRAM, self.PM12_OUT_DRAM,
+                            self.PM12_W3_DRAM, self.PM12_B3_DRAM,
+                            ENC_S2_H, ENC_S2_W, _CP, _CP, gelu_enable=False)
+        self._compile_run(_pm12)
+        self._assert_no_nan("PM12_OUT", self.PM12_OUT_DRAM, ENC_S2_H * ENC_S2_W * _CP)
+
+        # Stage 2 blocks
+        _s2_io = [
+            (self.PM12_OUT_DRAM, self.S2B0_OUT_DRAM, "S2B0_OUT"),
+            (self.S2B0_OUT_DRAM, self.S2B1_OUT_DRAM, "S2B1_OUT"),
+            (self.S2B1_OUT_DRAM, self.S2B2_OUT_DRAM, "S2B2_OUT"),
+            (self.S2B2_OUT_DRAM, self.S2B3_OUT_DRAM, "S2B3_OUT"),
+            (self.S2B3_OUT_DRAM, self.S2B4_OUT_DRAM, "S2B4_OUT"),
+            (self.S2B4_OUT_DRAM, self.S2B5_OUT_DRAM, "S2B5_OUT"),
+        ]
+        for bi, (_in, _out, label) in enumerate(_s2_io):
+            self._compile_run(lambda i=bi, _i=_in, _o=_out: self._run_s2_block(self.S2B[i], _i, _o))
+            self._assert_no_nan(label, _out, ENC_S2_H * ENC_S2_W * _CP)
+
+        # PatchMerging 2→3
+        _C23 = ENC_S3_C
+        def _pm23():
+            conv2d_1x1_dram(self, self.S2B5_OUT_DRAM, self.PM23_EXP_DRAM,
+                            self.PM23_W1_DRAM, self.PM23_B1_DRAM,
+                            ENC_S2_H, ENC_S2_W, _CP, _C23, gelu_enable=True)
+            conv2d_3x3_dw_dram(self, self.PM23_EXP_DRAM, self.PM23_DW_DRAM, self.PM23_IM2COL_DRAM,
+                               self.PM23_W2_DRAM, self.PM23_B2_DRAM, self.PM23_ZERO_DRAM,
+                               ENC_S2_H, ENC_S2_W, _C23, gelu_enable=True)
+            conv2d_1x1_dram(self, self.PM23_DW_DRAM, self.PM23_OUT_DRAM,
+                            self.PM23_W3_DRAM, self.PM23_B3_DRAM,
+                            ENC_S2_H, ENC_S2_W, _C23, _C23, gelu_enable=False)
+        self._compile_run(_pm23)
+        self._assert_no_nan("PM23_OUT", self.PM23_OUT_DRAM, ENC_S2_H * ENC_S2_W * _C23)
+
+        # Stage 3 blocks
+        for bi, (_in, _out, label) in enumerate([
+            (self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, "S3B0_OUT"),
+            (self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, "S3B1_OUT"),
+        ]):
+            self._compile_run(lambda i=bi, _i=_in, _o=_out: self._run_s3_block(self.S3B[i], _i, _o))
+            self._assert_no_nan(label, _out, ENC_S3_H * ENC_S3_W * ENC_S3_C)
+
+        # Neck
+        _NECK_C_IN  = ENC_S3_C
+        _NECK_C_OUT = 256
+        _NECK_HW    = ENC_S3_H * ENC_S3_W
+        def _neck():
+            self.matmat_mul_core(
+                M=_NECK_HW, K=_NECK_C_IN, N=_NECK_C_OUT,
+                A_DRAM_ADDR=self.S3B1_OUT_DRAM, B_DRAM_ADDR=self.NECK_C1_W,
+                OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM)
+            self.layer_norm_core_dram(
+                M=_NECK_HW, N=_NECK_C_OUT,
+                A_DRAM_ADDR=self.NECK_BUF1_DRAM, OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
+                GAMMA_DRAM_ADDR=self.NECK_LN1_G, BETA_DRAM_ADDR=self.NECK_LN1_B)
+        self._compile_run(_neck)
+        self._assert_no_nan("neck_conv1+ln1", self.NECK_BUF1_DRAM, _NECK_HW * _NECK_C_OUT)
+
+        _original_print("debug_encode: all checkpoints passed — NaN must be in neck conv2 or later")
+
+    # ------------------------------------------------------------------
     # Binary dump (for run_from_bin)
     # ------------------------------------------------------------------
 
@@ -3050,6 +3238,8 @@ def main():
     parser.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"),
                         default=[512, 512],
                         help="Single-point inference: encode image, run decoder for this point, save best mask")
+    parser.add_argument("--debug-encode", action="store_true",
+                        help="Step through encoder stage-by-stage, asserting no NaNs at each checkpoint")
     args = parser.parse_args()
 
     set_dma_device(args.dev)
@@ -3162,6 +3352,14 @@ def main():
         ue.dump_params_to_file(BIN_DIR)
         ue.dump_programs_to_file(enc_prog, dec_prog, BIN_DIR)
         _original_print("  Done saving bins.")
+
+    if args.debug_encode:
+        if bins_exist:
+            _original_print("--debug-encode requires a fresh compile (bins found — delete mobilesam_bin/ and re-run)")
+        else:
+            ue.software_reset()
+            ue.debug_encode(image_t)
+        return
 
     if args.point:
         px, py = args.point
