@@ -750,6 +750,8 @@ class IRHarness(Ops):
         self.chain = Chain(self)                       # back-to-back op runner
         self.programs = {}                             # name -> Program (addr, size)
         self.growing = {}                              # name -> GrowingBuffer (KV caches)
+        self.C = {}                                    # name -> Tensor (compile-time constants)
+        self.constant_groups = {}                      # group -> [name, ...]
         self._addr_tmp = self.ue.alloc_isa_reg()       # scratch GPR for runtime address math
         self.verbose = verbose                         # show engine's own prints?
         cls = type(self).__name__
@@ -762,6 +764,11 @@ class IRHarness(Ops):
             gtot = sum(g.nbytes for g in self.growing.values())
             gcnt = len(self.growing)
             print(f"  buffers   {gcnt} growing  ({gtot/1024/1024:.1f} MB reserved)")
+        if self.C:
+            ctot = sum(t.nbytes for t in self.C.values())
+            cgrp = "  ".join(
+                f"{g}={len(ns)}" for g, ns in sorted(self.constant_groups.items()))
+            print(f"  constants  {cgrp}  ({ctot/1024/1024:.1f} MB)")
 
     # ---- weight declaration (used inside prep) -----------------------------
     def scan_weights(self, state_dict=None):
@@ -1062,6 +1069,15 @@ class IRHarness(Ops):
         import torch
         t = self.arena.alloc(tuple(data.shape), name=name)
         self.ue.dma_to_accelerator_memory(t.addr, data.to(torch.bfloat16))
+        return t
+
+    def register_constant(self, group: str, name: str, data) -> "Tensor":
+        """Allocate a compile-time constant (calls self.const internally) and tag it with
+        a group string for reporting. Stores the handle in self.C[name] and tracks the
+        group in self.constant_groups. Returns the Tensor handle (same as self.const)."""
+        t = self.const(data, name)
+        self.C[name] = t
+        self.constant_groups.setdefault(group, []).append(name)
         return t
 
     # ---- user hooks --------------------------------------------------------

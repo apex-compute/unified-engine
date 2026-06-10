@@ -39,7 +39,7 @@ class Gemma3Real(IRHarness):
 
     def prep(self):
         sd = self.hf_sd
-        def C(t, n): return self.const(t.float(), n)
+        def C(t, n): return self.register_constant("aux", n, t.float())
         proj = {}
         for li in range(LAYERS):
             p = f"model.layers.{li}"
@@ -67,7 +67,7 @@ class Gemma3Real(IRHarness):
         for tag, theta in (("global", 1000000.0), ("local", 10000.0)):
             inv = 1.0 / (theta ** (torch.arange(d).float() / d)); ang = pos * inv[None, :]
             packed = torch.cat([ang.cos(), ang.cos(), -ang.sin(), ang.sin()], -1)
-            tbl = self.const(packed, f"rope_{tag}")
+            tbl = self.register_constant("rope", f"rope_{tag}", packed)
             self.rope_base[tag] = tbl.addr
             self.rope[tag] = (Tensor(addr=tbl.addr, shape=(SEQ, self.HD), name=f"cos_{tag}"),
                               Tensor(addr=tbl.addr + self.HD * 2, shape=(SEQ, self.HD), name=f"sin_{tag}"))
@@ -84,19 +84,19 @@ class Gemma3Real(IRHarness):
         pbias = torch.full((A, A), float("-inf"))
         pbias.masked_fill_(torch.tril(torch.ones(A, A, dtype=torch.bool)), 0.0)
         pbias[:, self.QS:] = float("-inf")
-        self.mask = self.const(pbias, "mask")
-        self.identity = self.const(torch.eye(64), "identity")
-        self.scratch = self.const(torch.zeros(16 * A * self.HD), "scratch")
-        self.attn_p = self.const(torch.zeros(A * A), "attn_p")
+        self.mask = self.register_constant("masks", "mask", pbias)
+        self.identity = self.register_constant("aux", "identity", torch.eye(64))
+        self.scratch = self.register_constant("aux", "scratch", torch.zeros(16 * A * self.HD))
+        self.attn_p = self.register_constant("aux", "attn_p", torch.zeros(A * A))
         # decode scaffolding. Bias spans the full context (MAXPOS) so multi-bucket decode
         # (context > 64) is supported: each step re-DMAs (1, MAXPOS) with [0:pos+1]=0, rest
         # -inf, and the bucket body reads the first bucket_reg*64 entries.
-        self.dmask = self.const(torch.zeros(1, MAXPOS), "dmask")       # gemma decode bias: (1, aligned_q)
-        self.dx = self.const(torch.zeros(1, self.H), "dx")            # decode input token
-        self.dscratch = self.const(torch.zeros(16 * 64 * self.HD), "dscratch")
-        self.dattn_p = self.const(torch.zeros(64 * 64), "dattn_p")
+        self.dmask = self.register_constant("masks", "dmask", torch.zeros(1, MAXPOS))       # gemma decode bias: (1, aligned_q)
+        self.dx = self.register_constant("input", "dx", torch.zeros(1, self.H))            # decode input token
+        self.dscratch = self.register_constant("aux", "dscratch", torch.zeros(16 * 64 * self.HD))
+        self.dattn_p = self.register_constant("aux", "dattn_p", torch.zeros(64 * 64))
 
-        self.x = self.const(self.x_input, "x")                        # HF embedded prompt
+        self.x = self.register_constant("input", "x", self.x_input)                        # HF embedded prompt
         self.seq = self.gpr("seq_len"); self.qseq = self.gpr("q_seq_len"); self.bucket = self.gpr("bucket_idx")
 
     def _rope_tag(self, li): return "global" if (li + 1) % self.SW_PATTERN == 0 else "local"

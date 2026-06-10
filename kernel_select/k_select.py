@@ -141,7 +141,7 @@ class ExtractedDecoder(IRHarness):
         self.H = H; self.GRP = nq // max(1, nkv)
         L = c["layers"]
 
-        def C(t, n): return self.const(t.float(), n)
+        def C(t, n): return self.register_constant("aux", n, t.float())
         # attention variants, all derived from traits:
         #   multikv  = nkv>1  -> per-head scatter + per-KV-head flash
         #   lohi     = hd<128 -> per-head d64 rope (padded-split, 128B-aligned via reg-addr DMA)
@@ -204,7 +204,7 @@ class ExtractedDecoder(IRHarness):
             sinP = torch.cat([_hp(sb), _hp(sb)], -1)
             sinP[:, :hP2] = -sinP[:, :hP2]                              # pre-negate lo half
             packed = torch.cat([cosP, sinP], -1)                        # [MAXPOS, 2*HDP]
-            tbl = self.const(packed, "rope_pad")
+            tbl = self.register_constant("rope", "rope_pad", packed)
             for tag in ("global", "local"):
                 self.rope_base[tag] = tbl.addr
                 self.rope[tag] = (Tensor(addr=tbl.addr, shape=(self.SEQ, hd), name=f"cos_{tag}"),
@@ -219,10 +219,10 @@ class ExtractedDecoder(IRHarness):
             sin_full = torch.cat([sb, sb], -1)
             sin_full[:, :d] = -sin_full[:, :d]                          # pre-negate lo half
             packed = torch.cat([cos_full, sin_full], -1)               # [MAXPOS, 2*hd]
-            self.rope_packed = self.const(packed, "rope_packed").addr
+            self.rope_packed = self.register_constant("rope", "rope_packed", packed).addr
             if self.GRP > 1:
                 pg = packed.repeat_interleave(self.GRP, dim=0)         # [MAXPOS*group, 2*hd]
-                self.rope_packed_gqa = self.const(pg, "rope_packed_gqa").addr
+                self.rope_packed_gqa = self.register_constant("rope", "rope_packed_gqa", pg).addr
             else:
                 self.rope_packed_gqa = self.rope_packed
         else:
@@ -231,7 +231,7 @@ class ExtractedDecoder(IRHarness):
             for tag, th in thetas.items():
                 inv = 1.0 / (th ** (torch.arange(d).float() / d)); ang = pos * inv[None, :]
                 packed = torch.cat([ang.cos(), ang.cos(), -ang.sin(), ang.sin()], -1)
-                tbl = self.const(packed, f"rope_{tag}")
+                tbl = self.register_constant("rope", f"rope_{tag}", packed)
                 self.rope_base[tag] = tbl.addr
                 self.rope[tag] = (Tensor(addr=tbl.addr, shape=(self.SEQ, hd), name=f"cos_{tag}"),
                                   Tensor(addr=tbl.addr + hd * 2, shape=(self.SEQ, hd), name=f"sin_{tag}"))
@@ -249,23 +249,23 @@ class ExtractedDecoder(IRHarness):
         pbias = torch.full((A, A), float("-inf"))
         pbias.masked_fill_(torch.tril(torch.ones(A, A, dtype=torch.bool)), 0.0)
         pbias[:, QS:] = float("-inf")
-        self.mask = self.const(pbias, "mask")
-        self.identity = self.const(torch.eye(64), "identity")
-        self.scratch = self.const(torch.zeros(16 * A * hd), "scratch")
-        self.attn_p = self.const(torch.zeros(A * A), "attn_p")
-        self.dmask = self.const(torch.zeros(1, MAXPOS), "dmask")
+        self.mask = self.register_constant("masks", "mask", pbias)
+        self.identity = self.register_constant("aux", "identity", torch.eye(64))
+        self.scratch = self.register_constant("aux", "scratch", torch.zeros(16 * A * hd))
+        self.attn_p = self.register_constant("aux", "attn_p", torch.zeros(A * A))
+        self.dmask = self.register_constant("masks", "dmask", torch.zeros(1, MAXPOS))
         # Verified bucketized decode (group_attn_pbi, from smolvlm2.py) — gated on nkv: each KV head
         # emits its own PBI bucket-dispatcher, so large nkv (SmolLM2=32) blows up the program +
         # risks back-to-back PBI corruption. Small nkv -> use the verified flow; else legacy group_attn.
         self.pbi_decode = self.multikv and nkv <= PBI_DECODE_MAX_NKV
         if self.pbi_decode:
             # group-row decode bias (group query rows, all at the same position); filled per-step in main
-            self.dmask_pbi = self.const(torch.zeros(self.GRP, MAXPOS), "dmask_pbi")
+            self.dmask_pbi = self.register_constant("masks", "dmask_pbi", torch.zeros(self.GRP, MAXPOS))
             self.dec_nbuckets = max(1, (MAXPOS + 63) // 64)
-        self.dx = self.const(torch.zeros(1, H), "dx")
-        self.dscratch = self.const(torch.zeros(16 * 64 * hd), "dscratch")
-        self.dec_probe = self.const(torch.zeros(L + 1, H), "dec_probe")  # clobber-safe per-layer decode taps
-        self.x = self.const(self.x_input, "x")
+        self.dx = self.register_constant("input", "dx", torch.zeros(1, H))
+        self.dscratch = self.register_constant("aux", "dscratch", torch.zeros(16 * 64 * hd))
+        self.dec_probe = self.register_constant("aux", "dec_probe", torch.zeros(L + 1, H))  # clobber-safe per-layer decode taps
+        self.x = self.register_constant("input", "x", self.x_input)
         self.seq = self.gpr("seq_len"); self.qseq = self.gpr("q_seq_len"); self.bucket = self.gpr("bucket_idx")
         self.qall = self.gpr("q_all_heads"); self.kall = self.gpr("k_all_heads")  # qk-norm M = seq*nq / seq*nkv
 
@@ -919,7 +919,7 @@ def main():
     ExtractedDecoder.plan = plan; ExtractedDecoder.SEQ = SEQ; ExtractedDecoder.x_input = x_input
     ExtractedDecoder._capture_map = True             # log every chain()->UE_HLO resolution during build
     m = ExtractedDecoder()
-    _dump_mapping(m, block, btrace, args.model, dec)   # the useful one: fx op + source -> UE_HLO hashtable
+    _dump_mapping(m, block, btrace, args.model, dec, model)   # the useful one: fx op + source -> UE_HLO hashtable
     if os.environ.get("LOOM_DUMP_ALL"):           # raw fx / extraction / ir: opt-in (verbose, rarely read)
         _dump_ir(m, spec, block, model, args.model)
         _dump_fx(model, dec, args.model)         # raw torch.fx pull + per-node op mapping, per region
@@ -1052,6 +1052,32 @@ _FX_COMPUTE = {
 }
 _FX_SHAPE = {"permute", "transpose", "reshape", "view", "_unsafe_view", "expand", "contiguous",
              "flatten", "unflatten", "clone", "squeeze", "unsqueeze", "select", "slice"}
+# Scalar/index bookkeeping — never map to a hardware kernel; drop from workload graph.
+_FX_SCAFFOLD = {
+    # tensor creation
+    "arange", "zeros", "ones", "full", "zeros_like", "ones_like", "full_like",
+    "new_zeros", "new_ones", "new_full", "empty", "empty_like",
+    # reductions (scalar outputs — host side)
+    "sum", "cumsum", "prod", "mean", "max", "min", "any", "all",
+    # scalar math
+    "reciprocal", "sqrt", "rsqrt", "abs", "neg", "sign", "ceil", "floor", "round",
+    "clamp", "clamp_", "clip",
+    # masking / filling
+    "where", "masked_fill", "masked_fill_", "tril", "triu",
+    # aggregation / gathering helpers
+    "cat", "stack", "chunk", "split", "gather", "index_select",
+    # dtype casts
+    "to", "type_as", "float", "int", "long", "bool", "half", "bfloat16",
+    # comparisons
+    "lt", "le", "gt", "ge", "eq", "ne", "logical_and", "logical_or", "logical_not",
+    "__and__", "__or__", "__not__", "__xor__",
+    # assertions / metadata checks
+    "assert_tensor_metadata", "_assert_tensor_metadata",
+    "_assert_scalar", "sym_constrain_range_for_size", "sym_size",
+    # misc
+    "item", "size", "shape", "numel", "sub", "div", "floordiv",
+    "index_put_", "scatter_", "fill_",
+}
 
 
 def _dump_fx(model, dec, model_path):
@@ -1168,7 +1194,7 @@ def _ctx_tag(ctx):
     return f"[{j}] {kind}" + (f":{role}" if role else "")
 
 
-def _dump_mapping(m, block, trace, model_path, dec=None):
+def _dump_mapping(m, block, trace, model_path, dec=None, model=None):
     """STEP 4 — the UE_HLO execution flow: the ordered list of hardware kernels actually
     called for one decoder layer, each with a one-line note on how it was recognized.
 
@@ -1483,6 +1509,194 @@ def _dump_mapping(m, block, trace, model_path, dec=None):
                       "", *mer]
         except Exception as e:
             L.append(f"_(fx export failed: {type(e).__name__}: {e})_")
+
+    # ── workload Mermaid diagram ──────────────────────────────────────────────────────
+    # Decoder programs (prefill / decode) are built from m._map_log — the real compiled
+    # kernel sequence — so nodes carry actual UE_HLO kernel names and execution labels.
+    # One layer's op chain is shown as the repeat unit, annotated "x L layers".
+    # Encoder / connector (VLM only) are built from torch.export FX since they have no
+    # compiled programs yet; every detected op appears (unsupported flagged ?).
+    # All workloads are connected in forward-pass order: encoder → connector → prefill → decode.
+    # ─────────────────────────────────────────────────────────────────────────────────
+    L += ["", "## Workload graph", "",
+          "Decoder programs built from the **compiled kernel log** (actual UE_HLO kernels, "
+          "execution order). Encoder/connector built from the **torch.fx graph** (all detected "
+          "ops; unsupported flagged `?`). One layer shown as the repeat unit with `x N` count. "
+          "Renders in VS Code / GitHub."]
+
+    import re as _re
+    def _mid(s):
+        return _re.sub(r"[^A-Za-z0-9_]", "_", s)
+
+    _FX_COMPUTE_SET  = set(_FX_COMPUTE.keys())
+    _FX_SHAPE_SET    = set(_FX_SHAPE)
+    _FX_SCAFFOLD_SET = set(_FX_SCAFFOLD)
+
+    mer = ["```mermaid", "flowchart TD"]
+    node_id = [0]
+    def nid():
+        node_id[0] += 1
+        return f"n{node_id[0]}"
+
+    prev_last = None   # last node of previous workload for chaining arrows
+
+    def _emit_node(mer, uid, label, supported, indent="    "):
+        if supported:
+            mer.append(f'{indent}{uid}["{label}"]')
+        else:
+            mer.append(f'{indent}{uid}{{"{label}"}}')
+
+    def _chain(mer, a, b, indent="    "):
+        if a and b:
+            mer.append(f"{indent}{a} --> {b}")
+
+    # ── 1. ENCODER + CONNECTOR (FX-based, VLM only) ──────────────────────────────
+    def _safe_export(mod, args, kwargs):
+        try:
+            return torch.export.export(mod, args, kwargs=kwargs or {}, strict=False)
+        except Exception:
+            try:
+                return torch.export.export(mod, args, strict=False)
+            except Exception:
+                return None
+
+    if model is not None and detect_model_type(model) == "vlm":
+        mm = getattr(model, "model", None)
+        vis = getattr(mm, "vision_model", None) or getattr(mm, "vision_tower", None)
+        conn = getattr(mm, "connector", None) or getattr(mm, "multi_modal_projector", None)
+
+        fx_workloads = []
+        if vis is not None:
+            H_v = vis.config.hidden_size
+            P   = vis.config.patch_size
+            IMG = getattr(vis.config, "image_size", 384)
+            n_layers_v = vis.config.num_hidden_layers
+            fx_workloads.append(("Vision Encoder", "vision_encoder", vis,
+                (torch.zeros(1, 3, IMG, IMG),),
+                {"patch_attention_mask": torch.ones(1, IMG//P, IMG//P, dtype=torch.bool),
+                 "output_hidden_states": None, "output_attentions": None, "return_dict": None},
+                n_layers_v))
+        if conn is not None:
+            H_vis = vis.config.hidden_size if vis else 1152
+            n_tok = ((IMG // P) ** 2) if vis else 729
+            fx_workloads.append(("Connector", "connector", conn,
+                (torch.zeros(1, n_tok, H_vis),), {}, 1))
+
+        for wl_label, wl_id, wl_mod, wl_args, wl_kwargs, n_layers in fx_workloads:
+            ep = _safe_export(wl_mod, wl_args, wl_kwargs)
+            if ep is None:
+                uid = nid(); _emit_node(mer, uid, f"{wl_label} export failed", False, "  ")
+                _chain(mer, prev_last, uid, "  "); prev_last = uid; continue
+
+            # Partition by L1 segment; collapse consecutive same-op runs
+            sections = {}; sec_order = []
+            for n in ep.graph_module.graph.nodes:
+                if n.op != "call_function": continue
+                t = getattr(n.target, "__name__", str(n.target)).split(".")[0]
+                if t in _FX_SHAPE_SET or t in _FX_SCAFFOLD_SET: continue
+                ms = n.meta.get("nn_module_stack")
+                lv = list(ms.values()) if ms else []
+                p1 = lv[1][0] if len(lv) > 1 else ""
+                raw = p1.split(".")[0] if p1 else "root_scope"
+                seg = _mid(raw); supp = t in _FX_COMPUTE_SET
+                cls = str(lv[-1][1]).rsplit(".", 1)[-1].rstrip("'>") if lv else ""
+                if seg not in sections:
+                    sections[seg] = {"label": raw, "ops": []}; sec_order.append(seg)
+                ops = sections[seg]["ops"]
+                prev_op = ops[-1] if ops else None
+                if prev_op and prev_op[0] == t and prev_op[1] == cls:
+                    ops[-1] = (t, cls, supp, prev_op[3] + 1)
+                else:
+                    ops.append((t, cls, supp, 1))
+
+            layer_cnt = f" x{n_layers} layers" if n_layers > 1 else ""
+            mer.append(f'  subgraph {wl_id}["{wl_label}{layer_cnt}"]')
+            first_wl = None; prev_n = None
+            for seg in sec_order:
+                info = sections[seg]
+                sec_id = f"{wl_id}_{seg}"
+                mer.append(f'    subgraph {sec_id}["{info["label"]}"]')
+                for (t, cls, supp, cnt) in info["ops"]:
+                    uid = nid()
+                    kern = _FX_COMPUTE.get(t, "")
+                    cnt_s = f" x{cnt}" if cnt > 1 else ""
+                    if supp:
+                        lbl = t + (f" -> {kern}" if kern and kern != t else "") + cnt_s
+                    else:
+                        lbl = f"? {t}{cnt_s}"
+                    _emit_node(mer, uid, lbl, supp, "      ")
+                    _chain(mer, prev_n, uid, "      ")
+                    prev_n = uid
+                    if first_wl is None: first_wl = uid
+                mer.append("    end")
+            mer.append("  end")
+            _chain(mer, prev_last, first_wl, "  ")
+            prev_last = prev_n
+
+    # ── 2. DECODER PROGRAMS (log-based: prefill then decode) ─────────────────────
+    # One layer's op sequence is the repeat unit (ctx[1]==0); head ops at ctx[1]==-1.
+    # Both programs side-by-side, connected: encoder/conn → prefill → decode.
+    n_dec_layers = m.spec.get("layers", 1) if hasattr(m, "spec") else 1
+    programs_order = sorted(set(r["program"] for r in log), key=lambda p: (p != "prefill", p))
+
+    for prog in programs_order:
+        prog_id = _mid(prog)
+        prog_label = prog.capitalize()
+
+        # collect layer-0 steps in order, then head steps
+        layer_steps = []   # [(step_label, kernel_label)]
+        head_steps  = []
+        seen_steps  = set()
+        for r in log:
+            if r["program"] != prog: continue
+            ctx = r["ctx"]
+            if not ctx: continue
+            _, li, j, kind, role = ctx
+            step_key = (li, j, kind, role)
+            if step_key in seen_steps: continue
+            seen_steps.add(step_key)
+            step_lbl = kind + (f":{role}" if role else "")
+            kern_lbl = r["kernel"]
+            if li == 0:
+                layer_steps.append((step_lbl, kern_lbl))
+            elif li == -1:
+                head_steps.append((step_lbl, kern_lbl))
+
+        mer.append(f'  subgraph {prog_id}["{prog_label}"]')
+        first_prog = None; prev_n = None
+
+        # layer repeat unit
+        if layer_steps:
+            sub_id = f"{prog_id}_layer"
+            mer.append(f'    subgraph {sub_id}["Decoder Layer x{n_dec_layers}"]')
+            for (step_lbl, kern_lbl) in layer_steps:
+                uid = nid()
+                lbl = f"{step_lbl} | {kern_lbl}"
+                _emit_node(mer, uid, lbl, True, "      ")
+                _chain(mer, prev_n, uid, "      ")
+                prev_n = uid
+                if first_prog is None: first_prog = uid
+            mer.append("    end")
+
+        # head ops (final_norm, lm_head)
+        if head_steps:
+            sub_id = f"{prog_id}_head"
+            mer.append(f'    subgraph {sub_id}["Head"]')
+            for (step_lbl, kern_lbl) in head_steps:
+                uid = nid()
+                lbl = f"{step_lbl} | {kern_lbl}"
+                _emit_node(mer, uid, lbl, True, "      ")
+                _chain(mer, prev_n, uid, "      ")
+                prev_n = uid
+                if first_prog is None: first_prog = uid
+            mer.append("    end")
+
+        mer.append("  end")
+        _chain(mer, prev_last, first_prog, "  ")
+        prev_last = prev_n
+
+    mer.append("```")
+    L += ["", *mer]
 
     fn = os.path.join(d, f"{slug}_mapping.md")
     open(fn, "w").write("\n".join(L) + "\n")
