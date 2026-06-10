@@ -1055,12 +1055,13 @@ _FX_SHAPE = {"permute", "transpose", "reshape", "view", "_unsafe_view", "expand"
 
 
 def _dump_fx(model, dec, model_path):
-    """Write the RAW torch.export fx graph + a per-node op mapping for every region present
-    (decoder always; encoder/connector for VLMs). Runs automatically on each --model so the
-    'what maps to our ops' view is always available in discard/<slug>_fx_<region>.txt.
-    Coverage header reports 0 unmapped COMPUTE ops when the catalog fully covers the region."""
-    import os, io, contextlib
-    from collections import Counter
+    """Export the decoder once and partition every call_function node by its top-level
+    leaf_path prefix — each distinct prefix is one execution workload (e.g. vision_model,
+    multi_modal_projector, language_model / model). Within each workload, nodes are grouped
+    by layer index so the repeated block structure is visible. Written to
+    discard/<slug>_fx_workloads.txt."""
+    import os, re
+    from collections import Counter, defaultdict
     d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "discard")
     os.makedirs(d, exist_ok=True)
     slug = model_path.replace("/", "_").lower()
@@ -1071,42 +1072,48 @@ def _dump_fx(model, dec, model_path):
         if t in _FX_COMPUTE: return "COMPUTE", _FX_COMPUTE[t]
         if t in _FX_SHAPE:   return "SHAPE", "permute/reshape"
         return "SCAFFOLD", "(host index/mask/cast/assert)"
+    def top_prefix(path):
+        # first path segment before any "layers.N" — this is the workload region
+        if not path: return "<no_stack>"
+        m = re.match(r"^(.*?)(?:\.layers\.\d|$)", path)
+        return m.group(1) if m and m.group(1) else path.split(".")[0]
+    def layer_idx(path):
+        m = re.search(r"layers\.(\d+)", path or "")
+        return int(m.group(1)) if m else -1
 
-    def one(mod, args, kwargs, region):
-        try:
-            ep = torch.export.export(mod, args, kwargs, strict=False)
-        except Exception as e:
-            print(f"  fx dump [{region}] skipped: {type(e).__name__}: {e}"); return
-        out, cat = [], Counter()
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            ep.graph.print_tabular()
-        body = []
-        for n in ep.graph_module.graph.nodes:
-            if n.op != "call_function":
-                continue
-            path, _ = leaf(n); t = base(n.target); k, tag = classify(t); cat[k] += 1
-            owner = ".".join((path or "").split(".")[-3:]) if path else "<scope>"
-            body.append(f"{n.name:22s} {t:30s} [{k:8s}] -> {tag:30s} @ {owner}")
-        hdr = (f"# {model_path}  region={region}\n"
-               f"# COMPUTE={cat['COMPUTE']}  SHAPE={cat['SHAPE']}  SCAFFOLD={cat['SCAFFOLD']}"
-               f"  ({'0 unmapped compute ops' if True else ''})\n")
-        fn = os.path.join(d, f"{slug}_fx_{region}.txt")
-        open(fn, "w").write(hdr + "\n# RAW torch.fx GRAPH (print_tabular)\n\n" + buf.getvalue()
-                            + "\n\n# PER-NODE OP MAPPING\n\n" + "\n".join(body))
-        print(f"  step 2 → fx dump       {fn}  (COMPUTE={cat['COMPUTE']} SHAPE={cat['SHAPE']} SCAFFOLD={cat['SCAFFOLD']})")
+    try:
+        ids = torch.tensor([[1, 2, 3, 4]])
+        ep = torch.export.export(dec, (ids,), {"use_cache": False}, strict=False)
+    except Exception as e:
+        print(f"  fx dump skipped: {type(e).__name__}: {e}"); return
 
-    ids = torch.tensor([[1, 2, 3, 4]])
-    one(dec, (ids,), {"use_cache": False}, "decoder")
-    if detect_model_type(model) == "vlm":
-        vm = getattr(model.model, "vision_model", None) or getattr(model.model, "vision_tower", None)
-        if vm is not None:
-            vcfg = model.config.vision_config
-            px = torch.zeros(1, getattr(vcfg, "num_channels", 3), vcfg.image_size, vcfg.image_size)
-            one(vm, (px,), {}, "encoder")
-        conn = getattr(model.model, "connector", None) or getattr(model.model, "multi_modal_projector", None)
-        if conn is not None:
-            one(conn, (torch.zeros(1, 1024, model.config.vision_config.hidden_size),), {}, "connector")
+    # partition: workload -> layer_idx -> [row strings]
+    workloads = defaultdict(lambda: defaultdict(list))
+    cats = defaultdict(Counter)
+    for n in ep.graph_module.graph.nodes:
+        if n.op != "call_function": continue
+        path, cls = leaf(n); t = base(n.target); k, tag = classify(t)
+        wp = top_prefix(path); li = layer_idx(path)
+        cats[wp][k] += 1
+        leafname = (path or "").split(".")[-1]
+        shape = str(tuple(n.meta["val"].shape)) if hasattr(n.meta.get("val", None), "shape") else "—"
+        workloads[wp][li].append(
+            f"  {n.name:28s} {t:28s} [{k:8s}]  leaf={leafname:20s}  shape={shape:20s}  cls={str(cls)[:30]}")
+
+    lines = [f"# {model_path} — execution workloads (full graph, partitioned by leaf_path prefix)", ""]
+    for wi, (wp, layers) in enumerate(workloads.items()):
+        c = cats[wp]
+        lines.append(f"## workload[{wi}]  prefix='{wp}'  COMPUTE={c['COMPUTE']} SHAPE={c['SHAPE']} SCAFFOLD={c['SCAFFOLD']}")
+        for li in sorted(layers):
+            lbl = f"layers.{li}" if li >= 0 else "<no_layer>"
+            lines.append(f"  # {lbl}")
+            lines.extend(layers[li])
+        lines.append("")
+
+    fn = os.path.join(d, f"{slug}_fx_workloads.txt")
+    open(fn, "w").write("\n".join(lines))
+    wl_summary = "  ".join(f"workload[{i}]='{wp}'" for i, wp in enumerate(workloads))
+    print(f"  step 2 → fx workloads  {fn}  ({wl_summary})")
 
 
 def _dump_extraction(model, dec, model_path):
