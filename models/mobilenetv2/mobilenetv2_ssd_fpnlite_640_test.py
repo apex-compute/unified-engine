@@ -30,8 +30,11 @@ import builtins
 import json
 import math
 import os
+import struct
 import sys
+import tarfile
 import time
+import urllib.request
 import warnings
 warnings.filterwarnings("ignore", message=".*torchao.*")
 warnings.filterwarnings("ignore", message=".*torch_dtype.*")
@@ -43,6 +46,8 @@ if SCRIPT_DIR not in sys.path:
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
 _original_print = builtins.print
@@ -760,9 +765,6 @@ class MobileNetV2_SSD_FPNLite(nn.Module):
 # entries), parse the BundleEntryProto (only the dtype/shape/offset/size fields),
 # and slice each tensor out of the data file via numpy.frombuffer.
 # ---------------------------------------------------------------------------
-
-import struct
-import numpy as np
 
 _TF_MAGIC = 0xdb4775248b80fb57   # LevelDB SSTable kTableMagicNumber
 _TF_DTYPE = {
