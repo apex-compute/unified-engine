@@ -3180,9 +3180,15 @@ def _clock_ns_default_for_device(device: str) -> float:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen2.5-VL-3B prefill + decode on accelerator.")
-    parser.add_argument("--prompt", type=str, default="please describe the image in details.", help="Text prompt")
-    parser.add_argument("--image", type=str, default=os.path.join(SCRIPT_DIR, "../../test_samples/yosemite.jpg"),
-                        help="Path to image file (default: test_samples/yosemite.jpg, use 'none' for text-only)")
+    parser.add_argument("--prompt", type=str, default=None,
+                        help="Text prompt (default: an image-describe prompt in VLM mode, "
+                             "a text-only prompt in LM mode)")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Path to an image file -> VLM mode. Default is LM (text-only); "
+                             "'none' also forces text-only.")
+    parser.add_argument("--vision-enable", action="store_true",
+                        help="Enable VLM mode with the default sample image "
+                             "(test_samples/yosemite.jpg) when no --image is given.")
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
     # fully deterministic. --pure-greedy disables it (the bias buffer is zeroed; one bin serves both).
@@ -3237,11 +3243,19 @@ def main():
     cfg = _load_config(script_dir)
     if args.image and args.image.lower() == "none":
         args.image = None
+    # Default is LM (text-only). VLM runs when --image is given, or when
+    # --vision-enable is set (which falls back to the default sample image).
+    if args.vision_enable and args.image is None:
+        args.image = os.path.join(SCRIPT_DIR, "../../test_samples/yosemite.jpg")
     has_image = args.image is not None
     # Vision encoder always runs on FPGA when an image is given.
     fpga_vision = has_image
+    if args.prompt is None:
+        args.prompt = ("please describe the image in details." if has_image
+                       else "What is the capital of France?")
 
     print(f"\n--- Configuration ---")
+    print(f"  Mode  : {'VLM (vision + LM)' if has_image else 'LM (text-only)'}")
     print(f"  Image : {args.image if has_image else '(none)'}")
     print(f"  Prompt: {args.prompt!r}")
 

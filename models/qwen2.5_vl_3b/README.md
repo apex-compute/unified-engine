@@ -39,15 +39,18 @@ see the roadmap below).
 ## Usage
 
 ```bash
-# VLM with the default image + prompt
-python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py
+# Default: LM / text-only (the vision encoder is compiled into the bin but not run)
+python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --prompt "What is 2+2?"
 
 # VLM with a custom image + prompt
 python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --image /path/to/photo.jpg --prompt "What do you see?"
 
-# Text-only (the vision encoder is compiled into the bin but not executed)
-python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --image none --prompt "What is 2+2?"
+# VLM with the default sample image (test_samples/yosemite.jpg)
+python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --vision-enable
 ```
+
+VLM mode runs when you pass `--image <path>` or `--vision-enable` (which uses the
+default sample image); otherwise it runs LM / text-only.
 
 ### Decode options (on-FPGA repetition penalty)
 
