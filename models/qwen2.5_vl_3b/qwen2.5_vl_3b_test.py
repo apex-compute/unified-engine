@@ -3393,15 +3393,6 @@ def main():
     total = (t_total if fpga_vision else 0) + t_uni_compile + latency_prefill + latency_decoder
     print(f"  ──────────────────────────")
     print(f"  Total:            {total:.2f}s")
-    _original_print(f"TEST_RESULT: {json.dumps({
-        'prefill_tokens':      len(prefill_seq),
-        'decoded_text':        decoded_text,
-        'decoded_tokens':      max(n_new, 0),
-        'prefill_speed_tok_s': round(len(prefill_seq) / latency_prefill, 2),
-        'decode_speed_tok_s':  round(n_new / latency_decoder, 2) if n_new > 0 else 0.0,
-        'prefill_size_kb':     None,
-        'decoder_size_kb':     None,
-    })}")
 
     # Clear FPGA DRAM so stale scratch doesn't bleed into subsequent runs
     # (see [[fpga_compare_clear_dram_oracle.md]] — 400 max|d| floor without this).
