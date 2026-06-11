@@ -2758,14 +2758,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                           gpr_M_reg=gf_one) or 0)
 
             # Q, K, V projections with bias
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=hd * qpkv,
+            # Q/K (IF4, K=2048<8192) use quantized_matmat_core M=1 GEMV (fused dequant+dot ~2×)
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['q_bias'], gpr_M_reg=gf_one) or 0)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=hd,
+                C_DRAM_ADDR=la['q_bias']) or 0)
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                 SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['k_bias'], gpr_M_reg=gf_one) or 0)
+                C_DRAM_ADDR=la['k_bias']) or 0)
             total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
                 C_DRAM_ADDR=la['v_bias'], gpr_M_reg=gf_one) or 0)
@@ -2863,11 +2864,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 self.sram_to_accelerator_memory(
                     0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
 
-            # o_proj (if4-quantized)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=hd * qpkv, N=self.vector_length,
+            # o_proj (IF4, K=hd*qpkv=2048<8192 → quantized_matmat_core M=1 GEMV)
+            total_flops += (self.quantized_matmat_core(M=1, K=hd * qpkv, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4,
-                gpr_M_reg=gf_one) or 0)
+                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4) or 0)
 
             # Qwen2.5-VL: no post-attention norm; residual direct on o_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
@@ -2880,15 +2880,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln2_gamma'],
                           gpr_M_reg=gf_one) or 0)
 
-            # MLP: SwiGLU
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.mlp_elements,
+            # MLP: SwiGLU (gate/up IF4, K=2048<8192 → quantized_matmat_core M=1 GEMV)
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True,
-                gpr_M_reg=gf_one) or 0)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.mlp_elements,
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True) or 0)
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
-                gpr_M_reg=gf_one) or 0)
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4) or 0)
 
             # gate x up (M=1: mlp_elements fits in SRAM in one shot)
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
@@ -2917,12 +2915,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # (bias_mode="broadcast_N"). HW argmax of (logits + bias) returns the penalized
             # token directly — no logit readback. write_back_disable=True always (no 304 KB
             # LOGITS_DRAM writeback needed). Bias buffer all-zero = pure greedy.
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
                 C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
-                write_back_disable=True,
-                gpr_M_reg=gf_one) or 0)
+                write_back_disable=True) or 0)
 
         # End-of-body: bump gf_seq_len for next decode step, then halt.
         self.generate_instruction_add_inc(self.gf_seq_len)
