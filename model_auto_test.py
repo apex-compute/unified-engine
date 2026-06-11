@@ -306,10 +306,16 @@ def write_summary(results: list, output_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--only", nargs="+", metavar="NAME", help="Run only these named tests")
+    args = ap.parse_args()
+
     summary_path = os.path.join(SCRIPT_DIR, "model_auto_test_results.txt")
     results = []
 
-    for test in TESTS:
+    tests = [t for t in TESTS if t["name"] in args.only] if args.only else TESTS
+    for test in tests:
         result = run_test(test)
         results.append(result)
         status = "PASS" if result["passed"] else "FAIL"
@@ -318,6 +324,7 @@ def main():
     write_summary(results, summary_path)
 
     all_passed = all(r["passed"] for r in results)
+
     sys.exit(0 if all_passed else 1)
 
 
