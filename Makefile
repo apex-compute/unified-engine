@@ -15,7 +15,7 @@ clean:
 	rm -rf models/gpt2/gpt2_bin/
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
-	rm -f models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin
+	rm -f models/llama3.2_3b/llama3.2_3b_bin/ llama3.2_3b_instruction_fpgapenalty.bin
 	# rm -f models/locateanything_3b/locateanything_3b_bin/
 	rm -rf models/mobilesam/mobilesam_bin/
 	rm -f models/parakeet/parakeet_bin/*.bin
@@ -89,8 +89,5 @@ program_with_artifact:
 	echo "🔧 Programming FPGA with $$BIT_FILE ..."; \
 	$(MAKE) program TARGET=$(TARGET) BITFILE="$$BIT_FILE"
 
-model_test:
-	. myvenv/bin/activate && python model_auto_test.py
-
-.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test
+.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact
 

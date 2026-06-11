@@ -13,19 +13,6 @@ HuggingFace (`openai-community/gpt2`).
 - **Fused QKV**: HF model uses Conv1D c_attn; weights transposed and split during generation.
 - **Weight tying**: lm_head weight = token embedding weight.
 
-## Instruction Bin (dynamic PBI + shared-subroutine attention)
-
-One prefill program + one decoder program are compiled into a single cached
-instruction image `gpt2_bin/gpt2_instruction.bin` (+ `.json` meta, ~0.72 MiB
-total). Runtime seq_len and attention bucket selection are driven by GPRs primed
-by a tiny per-call preamble, so the same bin serves any prompt length up to
-`prefill_context_size` (256) and any decode position up to `max_context_size`
-(1024). The flash / decoder attention cores are compiled once as subroutines
-after the program HALT; per-head call sites jump in and return.
-
-Delete `gpt2_bin/gpt2_instruction.bin` to force a recompile (required after any
-change to `tensor_init` buffer layout — DRAM addresses are baked into the bin).
-
 ## Usage
 
 ```bash
