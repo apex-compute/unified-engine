@@ -1411,6 +1411,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.LAYER0_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.OUTPUT_NORM_DRAM = self.allocate_tensor_dram(1 * self.vector_length * bpe)
         self.LOGITS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * bpe)
+        # Per-vocab additive repetition-penalty bias — the LM-head matmul's C term
+        # (bias_mode="broadcast_N", write_back_disable). The HW argmax of
+        # (logits + bias) returns the penalized token directly — NO logit readback
+        # (llama3.2_1b style on-FPGA penalty). All-zero buffer = pure greedy.
+        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * bpe)
 
         vis_cfg = self._vis_cfg
         self.NUM_MERGED_TOKENS = vis_cfg.get("num_merged_tokens", 256)
@@ -1448,6 +1453,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Flash attention scratch
         self.VIS_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram(
             (max(VD_PAD, UE_FMAX_CONTEXT_SIZE) * VS * 2 + VD_PAD * VS * 2))
+        # §7 shared-subroutine vision flash: FIXED operand buffers the one flash
+        # body reads/writes; each per-(head,window) call site marshals its segment
+        # in/out. Sized for the largest segment (full attention = VS patches).
+        self.VIS_FLASH_Q_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        self.VIS_FLASH_K_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        self.VIS_FLASH_V_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        self.VIS_FLASH_OUT_DRAM = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        # Bucket dispatcher softmax-intermediate scratch (VS×VS for full attention)
+        self.VIS_ATTN_P_DRAM    = self.allocate_tensor_dram(VS * VS * bpe)
         # Attention result after inverse permute [1024, 1280]
         self.VIS_ATTN_RESULT_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
         # Unpermuted attention output (trimmed from 128 back to 80) [16, 1024, 80]
@@ -1473,7 +1487,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # 2D RoPE table, interleaved per-token rows [cos(VD_PAD) || sin(VD_PAD)] so the
         # shared PBI rope core loads both with ONE auto-advancing pointer (sin = cos +
         # row_bytes). Padded from head_dim 80 to VD_PAD=128 for 64-aligned rope_hf_core_dram.
-        self.VIS_ROPE_DRAM = self.allocate_tensor_dram(VS * 2 * VD_PAD * bpe)
+        # Tiled VN times (one block per head) so a single M=VN*VS rope call covers all
+        # heads in one PBI hardware loop instead of 16 per-head calls (Tier-1 shrink).
+        self.VIS_ROPE_DRAM = self.allocate_tensor_dram(VN * VS * 2 * VD_PAD * bpe)
         self.VIS_ROPE_COS_DRAM = self.VIS_ROPE_DRAM
         self.VIS_ROPE_SIN_DRAM = self.VIS_ROPE_DRAM + VD_PAD * bpe
         # Permute params (identity matrix for bf16_permute_core_v2)
@@ -1530,18 +1546,63 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             t.join(timeout=interval_s)
         return time.perf_counter() - t0
 
-    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 120.0, gflops: float = None) -> None:
-        """Execute compiled program from DRAM instruction memory."""
-        print(f"  Running program on FPGA (DRAM addr 0x{program_start_addr:X})...", flush=True)
+    def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR,
+                        timeout: float = 120.0, flops: float = None, gflops: float = None,
+                        verbose: bool = True) -> tuple[float, float]:
+        """Execute compiled program from DRAM. Returns (latency_us, flop_rate_gflops).
+
+        Either ``flops`` (raw FLOPs) or ``gflops`` (already in GFLOPs) may be passed
+        for throughput reporting; both map to the same internal value. flop_rate is
+        0.0 when neither is provided.
+        """
+        if verbose:
+            print(f"  Running program on FPGA (DRAM addr 0x{program_start_addr:X})...", flush=True)
         self.start_execute_from_dram(program_start_addr)
-        wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(timeout), label="FPGA")
+        if verbose:
+            wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(timeout), label="FPGA")
+        else:
+            # Still measure wall time — _corrected_hw_latency_us reads the HW
+            # cycle counter but needs wall time to fix 32-bit overflow wrap.
+            _t0 = time.perf_counter()
+            self.wait_queue(timeout)
+            wall_s = time.perf_counter() - _t0
         latency_us = self._corrected_hw_latency_us(wall_s)
-        print(f"    Total program execution latency = {latency_us:.0f} us")
-        if gflops is not None:
-            gflops_program = gflops / (latency_us * 1e-6) / 1e9
-            self._last_hw_gflops = gflops_program
-            self._last_total_flops = gflops
-            print(f"    Throughput: {gflops_program:.2f} GFLOPS")
+        total_flops = flops if flops is not None else gflops
+        flop_rate = 0.0
+        if total_flops is not None:
+            flop_rate = total_flops / (latency_us * 1e-6) / 1e9
+            self._last_hw_gflops = flop_rate
+            self._last_total_flops = total_flops
+            if verbose:
+                print(f"    Total program execution latency = {latency_us:.0f} us")
+                print(f"    Throughput: {flop_rate:.2f} GFLOPS")
+        elif verbose:
+            print(f"    Total program execution latency = {latency_us:.0f} us")
+        return latency_us, flop_rate
+
+    def _vis_transpose_10(self, input_addr: int, output_addr: int, d0: int, d1: int, last: int) -> None:
+        """Transpose [d0, d1, last] -> [d1, d0, last] (permute [1,0,2]) via strided DMA.
+
+        One gather DMA pair per OUTPUT block (d1 iterations) instead of
+        bf16_permute_core_v2's per-row unroll (d0*d1 rows): for output block i1,
+        gather the d0 strided `last`-chunks {input[i0, i1, :]} into contiguous SRAM,
+        then store. For the head<->token swaps (one dim = VN = 16) this is ~16 or
+        ~576 iters vs ~9216 — the dominant encoder bin-size cost. SRAM holds one
+        d0*last slab (< URAM_NEAR_FULL_ELEMENTS for VS=576)."""
+        # NOTE: looping the smaller dim with a strided WRITE (scatter) would cut the
+        # merge from 576 to 16 iters, but a many-chunk strided write produces wrong
+        # output on device (verified 2026-06-10: ATTN_RESULT cos=0.06) even though the
+        # symmetric strided READ is correct. Stay on the gather (strided read) path.
+        bpe = self.bytes_per_element
+        for i1 in range(d1):
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=input_addr + i1 * last * bpe,
+                sram_address=0x00000, element_size=d0 * last,
+                stride_bytes_per_chunk=last * bpe, stride_jump_bytes=d1 * last * bpe)
+            self.sram_to_accelerator_memory(
+                sram_address=0x00000,
+                accelerator_dram_address=output_addr + i1 * d0 * last * bpe,
+                element_size=d0 * last)
 
     def compile_encoder(self, num_layers: int = None) -> int:
         """Compile vision encoder FPGA program. Returns program DRAM address."""
@@ -1569,21 +1630,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         _bf16_mode = getattr(self, '_vision_bf16_mode', False)
         bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
         os.makedirs(bin_dir, exist_ok=True)
-        cache_suffix = f"_{total_layers}L" if total_layers != vis_cfg["depth"] else ""
-        if _bf16_mode:
-            cache_suffix += "_bf16"
-        enc_bin_path = os.path.join(bin_dir, f"encoder_program{cache_suffix}.bin")
-
-        if os.path.exists(enc_bin_path):
-            _original_print(f"  Loading cached encoder program from {enc_bin_path} ...")
-            with open(enc_bin_path, "rb") as f:
-                prog_bytes = f.read()
-            program_addr = self.get_program_dram_addr()
-            self.dma_write(DMA_DEVICE_H2C, program_addr, prog_bytes, len(prog_bytes))
-            self.allocate_program_dram(len(prog_bytes))
-            self._vis_program_addr = program_addr
-            _original_print(f"    Loaded {len(prog_bytes)} bytes at 0x{program_addr:X}")
-            return program_addr
+        # NOTE: no standalone encoder_program.bin — the ONLY instruction bin is
+        # the unified instructions.bin written by compile_all. Direct callers
+        # (e.g. the compare script's per-layer vision checks) just compile fresh
+        # into program DRAM; nothing is cached to disk here.
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -1620,11 +1670,43 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         vis_M_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(vis_M_reg, VS)
 
+        # §7 shared-subroutine attention (core_changes §7g): compile ONE bucketed
+        # flash body after the encoder HALT; every per-(head,window) call site
+        # marshals its segment into the FIXED VIS_FLASH_* buffers and jumps in.
+        # Collapses ~4096 inline flash bodies → 1 (~103 MB → ~6 MB).
+        from user_dma_core import INSTRUCTION_SIZE_BYTES as _INSTR_SZ
+        vis_prog_base = self.get_program_dram_addr()
+        vis_gpr_bucket = self.alloc_isa_reg()
+        vis_gpr_ret    = self.alloc_isa_reg()
+        vis_flash_call_sites: list[int] = []
+        vis_num_buckets = max(1, ((VS + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE))  # cover full attn (VS)
+
+        def _vis_flash_call(q_src, k_src, v_src, out_dst, seg_len):
+            """Marshal one segment's Q/K/V into the fixed flash buffers, jump into
+            the shared flash subroutine, scatter the result to out_dst. Identical
+            numerics to the inline per-segment flash (no bias, 1/sqrt(VD_PAD))."""
+            elems = seg_len * VD_PAD
+            for src, dst in ((q_src, self.VIS_FLASH_Q_DRAM),
+                             (k_src, self.VIS_FLASH_K_DRAM),
+                             (v_src, self.VIS_FLASH_V_DRAM)):
+                self.accelerator_memory_to_sram(src, 0x00000, elems)
+                self.sram_to_accelerator_memory(0x00000, dst, elems)
+            self.generate_instruction_add_set(vis_gpr_bucket, seg_len // UE_VECTOR_SIZE)
+            self.pad_capture_to_64b_boundary()
+            return_word_addr = ue_35bit_addr_shifter(
+                vis_prog_base + (self.capture_count + 2) * _INSTR_SZ)
+            self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
+            vis_flash_call_sites.append(self.capture_count)
+            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+            self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
+            self.sram_to_accelerator_memory(0x00000, out_dst, elems)
+
         for layer_idx in range(total_layers):
             _original_print(f"    vision layer {layer_idx + 1}/{total_layers}", end="\r", flush=True)
             la = self.vis_layer_addrs[layer_idx]
             h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
             h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
+
 
             # Layer 0 copies patch input to IO_A
             if layer_idx == 0:
@@ -1699,34 +1781,32 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         stride_jump_bytes=qk_row_pad * bpe)
                     self.sram_to_accelerator_memory(0x00000, dst, t_take * VN_VD_PAD)
 
-                bf16_permute_core_v2(self,
-                    dims=[VS, VN, VD_PAD], permute_indices=[1, 0, 2],
-                    input_dram_addr=extract_buf,
-                    output_dram_addr=pad_dst,
-                    params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
-                    temp_dram_start=perm_temp)
+                # Token-major [VS, VN, VD_PAD] -> head-major [VN, VS, VD_PAD] via
+                # strided DMA (16 iters), replacing the per-row-unrolled permute.
+                self._vis_transpose_10(extract_buf, pad_dst, d0=VS, d1=VN, last=VD_PAD)
 
-            bf16_permute_core_v2(self,
-                dims=[VS, VN, VD_PAD], permute_indices=[1, 0, 2],
-                input_dram_addr=self.VIS_V_DRAM,
-                output_dram_addr=self.VIS_V_PAD_DRAM,
-                params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
-                temp_dram_start=perm_temp)
+            self._vis_transpose_10(self.VIS_V_DRAM, self.VIS_V_PAD_DRAM,
+                                   d0=VS, d1=VN, last=VD_PAD)
 
             # RoPE via the shared PBI core (rope_hf_core_dram). Per token it loads x plus
             # the interleaved [cos||sin] row through 2 auto-advancing load pointers (+1
             # store) — the proven-good pointer count, unlike the old 3-separate-load path
             # whose 3rd pointer didn't reliably advance and corrupted vision output.
             # cos/sin are position-only, so the same table is reused for every head.
-            for h in range(VN):
-                for buf_dram in (self.VIS_Q_PAD_DRAM, self.VIS_K_PAD_DRAM):
-                    head_addr = buf_dram + h * head_stride_pad
-                    self.rope_hf_core_dram(
-                        M=VS, N=VD_PAD,
-                        input_dram_addr=head_addr, output_dram_addr=head_addr,
-                        cos_dram_addr=self.VIS_ROPE_COS_DRAM,
-                        sin_dram_addr=self.VIS_ROPE_SIN_DRAM,
-                        gpr_M_reg=vis_M_reg)
+            # One rope call per buffer over ALL heads (M=VN*VS, head-major Q/K_PAD).
+            # The VN-tiled cos/sin table makes row h*VS+t use cos/sin[t]. Replaces the
+            # old 16-heads x (Q,K) = 32 per-head calls with 2 PBI-looped calls.
+            # Re-prime the shared M register to VN*VS for the rope, then back to VS
+            # (no extra ISA register — the encoder is at the reg budget).
+            self.generate_instruction_add_set(vis_M_reg, VN * VS)
+            for buf_dram in (self.VIS_Q_PAD_DRAM, self.VIS_K_PAD_DRAM):
+                self.rope_hf_core_dram(
+                    M=VN * VS, N=VD_PAD,
+                    input_dram_addr=buf_dram, output_dram_addr=buf_dram,
+                    cos_dram_addr=self.VIS_ROPE_COS_DRAM,
+                    sin_dram_addr=self.VIS_ROPE_SIN_DRAM,
+                    gpr_M_reg=vis_M_reg)
+            self.generate_instruction_add_set(vis_M_reg, VS)
 
             # flash_attention_core scales by 1/sqrt(128) instead of 1/sqrt(80).
             # The softer attention (sqrt(128)) is more robust to INT4 quantization noise
@@ -1735,16 +1815,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             cu_win = getattr(self, '_cu_window_seqlens', [0, VS])
             is_full_attn = (layer_idx in fullatt_indexes)
 
+            # §7: each call site marshals its segment into VIS_FLASH_* and jumps
+            # into the shared flash subroutine (compiled after HALT below).
             if is_full_attn:
                 for h in range(VN):
-                    self._flash_attention_core_cached(
-                        head_dim=VD_PAD,
-                        seq_len=VS,
-                        Q_DRAM_ADDR=self.VIS_Q_PAD_DRAM + h * head_stride_pad,
-                        K_DRAM_ADDR=self.VIS_K_PAD_DRAM + h * head_stride_pad,
-                        V_DRAM_ADDR=self.VIS_V_PAD_DRAM + h * head_stride_pad,
-                        OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT_DRAM + h * head_stride_pad,
-                        SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM)
+                    base = h * head_stride_pad
+                    _vis_flash_call(self.VIS_Q_PAD_DRAM + base, self.VIS_K_PAD_DRAM + base,
+                                    self.VIS_V_PAD_DRAM + base, self.VIS_ATTN_OUT_DRAM + base, VS)
             else:
                 for h in range(VN):
                     for w_idx in range(len(cu_win) - 1):
@@ -1752,15 +1829,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         w_len = cu_win[w_idx + 1] - w_start
                         if w_len <= 0:
                             continue
-                        w_off = w_start * VD_PAD * bpe  # byte offset within head
-                        self._flash_attention_core_cached(
-                            head_dim=VD_PAD,
-                            seq_len=w_len,
-                            Q_DRAM_ADDR=self.VIS_Q_PAD_DRAM + h * head_stride_pad + w_off,
-                            K_DRAM_ADDR=self.VIS_K_PAD_DRAM + h * head_stride_pad + w_off,
-                            V_DRAM_ADDR=self.VIS_V_PAD_DRAM + h * head_stride_pad + w_off,
-                            OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT_DRAM + h * head_stride_pad + w_off,
-                            SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM)
+                        off = h * head_stride_pad + w_start * VD_PAD * bpe
+                        _vis_flash_call(self.VIS_Q_PAD_DRAM + off, self.VIS_K_PAD_DRAM + off,
+                                        self.VIS_V_PAD_DRAM + off, self.VIS_ATTN_OUT_DRAM + off, w_len)
 
             # Trim: extract first 80 from each 128-element row. Batch per head using strided DMA.
             trim_chunk = URAM_NEAR_FULL_ELEMENTS // VD  # rows per SRAM batch
@@ -1776,12 +1847,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(
                         0x00000, dst_head + t_start * VD * bpe, t_take * VD)
 
-            bf16_permute_core_v2(self,
-                dims=permute_dims_merge, permute_indices=permute_idx,
-                input_dram_addr=self.VIS_ATTN_TRIM_DRAM,
-                output_dram_addr=self.VIS_ATTN_RESULT_DRAM,
-                params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
-                temp_dram_start=self.VIS_PERMUTE_TEMP_DRAM)
+            # Head-major [VN, VS, VD] -> token-major [VS, VN, VD] via strided DMA.
+            self._vis_transpose_10(self.VIS_ATTN_TRIM_DRAM, self.VIS_ATTN_RESULT_DRAM,
+                                   d0=VN, d1=VS, last=VD)
 
             vis_matmul(VS, VH, VH, self.VIS_ATTN_RESULT_DRAM, 'o', la,
                        self.VIS_O_PROJ_DRAM, bias=la['o_bias'], gpr_M_reg=vis_M_reg)
@@ -1789,11 +1857,16 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # norm2 kept LEGACY (static): its PBI variant uses a 2-load+2-store pointer
             # pattern that corrupts output on device (verified 2026-05-29) AND saved only
             # ~2MB — net loss. See [[project_qwenvl_rope_pbi_bug]].
-            rms_norm_core_dram_post_add(self, M=VS, N=VH,
+            # post-attn residual + norm2, split into an efficient chunked eltwise-add
+            # and an M-looped rms_norm instead of the fused post_add (whose legacy form
+            # is M-unrolled over VS rows ≈ 2400 instr/layer, and whose PBI form corrupts
+            # on device). Same result: residual = h_in + o_proj; norm = rms_norm(residual).
+            eltwise_add_core_dram(self, size=VS * VH,
                 A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
-                ADDOUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
-                NORMOUTPUT_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['norm2_weight'])
+                OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
+            self.rms_norm_core_dram(M=VS, N=VH,
+                A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
+                GAMMA_DRAM_ADDR=la['norm2_weight'], gpr_M_reg=vis_M_reg)
 
             self.matmat_mul_core(is_B_quantized=True,
                 M=VS, K=VH, N=VIS_MLP_PAD,
@@ -1843,7 +1916,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         self.rms_norm_core_dram(M=VS, N=VH,
             A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_NORM_DRAM,
-            GAMMA_DRAM_ADDR=self.merger_ln_q_weight)
+            GAMMA_DRAM_ADDR=self.merger_ln_q_weight, gpr_M_reg=vis_M_reg)
 
         merge_dim = VMERGE * VMERGE * VH
         for chunk_start in range(0, VS * VH, URAM_NEAR_FULL_ELEMENTS):
@@ -1886,9 +1959,34 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.merger_mlp2_scale)
 
+        # End of the normal execution path. The shared flash subroutine follows
+        # and is only reachable via the per-call-site JUMP_ABS placeholders below.
+        self.generate_instruction_halt()
+
+        # §7: compile the bucketed flash body ONCE (no bias = full attention within
+        # each segment, matching the inline per-segment numerics), then patch every
+        # call-site jump to its entry. head_dim/seq_len here are FLOPS-only; the
+        # bucket selected at each call site (gpr_bucket_idx) sets the real seq_len.
+        self.pad_capture_to_64b_boundary()
+        vis_sub_start, _vis_sub_flops = self.flash_attention_core(
+            head_dim=VD_PAD, seq_len=VS,
+            Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.VIS_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
+            SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            ATTN_P_DRAM_ADDR=self.VIS_ATTN_P_DRAM,
+            gpr_bucket_idx=vis_gpr_bucket,
+            num_buckets=vis_num_buckets,
+            gpr_ret_id=vis_gpr_ret)
+        for _idx in vis_flash_call_sites:
+            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(vis_sub_start))
+        self.release_isa_reg()  # vis_gpr_ret
+        self.release_isa_reg()  # vis_gpr_bucket
+
         # Finalize single program
         self.stop_capture()
-        self.generate_instruction_halt()
         prog_bytes = bytearray()
         for inst in self.capture_buffer:
             prog_bytes.extend(inst.get_bytes())
@@ -1901,11 +1999,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = False
         self._vis_program_addr = program_addr
 
-        # Save compiled program to cache for fast reload next time
-        with open(enc_bin_path, "wb") as f:
-            f.write(prog_bytes)
-        _original_print(f"    Vision encoder compiled: {total_bytes} total bytes, {total_layers} layers + merger (single program)")
-        _original_print(f"    Program addr: 0x{program_addr:X}, cached to {enc_bin_path}")
+        if getattr(self, '_unified_active', False):
+            # Unified single-bin mode: hand bytes to compile_all for instructions.bin.
+            self._seg_encoder = (program_addr, bytes(prog_bytes))
+        _original_print(f"    Vision encoder compiled: {total_bytes} bytes at 0x{program_addr:X}, "
+                        f"{total_layers} layers + merger")
         return program_addr
 
     def prepare_encoder_input(self, pixel_values: torch.Tensor,
@@ -2038,8 +2136,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             sin_table[:, :half_d] = -sin_raw           # [0:40] = -sin
             sin_table[:, 64:64 + half_d] = sin_raw     # [64:104] = +sin; gaps = 0
 
-            self.dma_to_accelerator_memory(self.VIS_ROPE_DRAM, rope_table.flatten())
-        print(f"    Vision RoPE table [{VS}, 2, {VD_PAD}] (interleaved cos||sin) DMA'd to FPGA")
+            # Tile VN times (one block per head): row h*VS+t = table[t], so a single
+            # M=VN*VS rope call over the head-major Q_PAD/K_PAD applies cos/sin[t] to
+            # every head's token t (cos/sin are position-only, shared across heads).
+            self.dma_to_accelerator_memory(self.VIS_ROPE_DRAM, rope_table.repeat(VN, 1, 1).flatten())
+        print(f"    Vision RoPE table [{VN}*{VS}, 2, {VD_PAD}] (tiled per head) DMA'd to FPGA")
 
         # Vision encoder FLOP estimate
         vis_cfg = self._vis_cfg
@@ -2124,6 +2225,16 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         self._isa_reg_counter = 5
         total_flops = 0
+
+        # §7 shared-subroutine attention: compile flash_attention_core ONCE after
+        # the layer loop's HALT; each per-(layer × kv_head) call site emits only
+        # an `add_set gpr_ret_id, return_word_addr` + `jump_abs <subroutine>`.
+        # Shrinks the prefill bin by ~num_layers × num_kv_heads (≈70× for qwen2.5-VL).
+        from user_dma_core import INSTRUCTION_SIZE_BYTES
+        program_dram_base = self.get_program_dram_addr()
+        gpr_ret_id = self.alloc_isa_reg()
+        call_site_jump_capture_indices: list[int] = []
+
         for layer_idx in range(layer_size):
             _original_print(f"    prefill layer {layer_idx + 1}/{layer_size}", end="\r", flush=True)
             la = self.lm_layer_addrs[layer_idx]
@@ -2223,22 +2334,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     template_seq_len=seq_len,
                 )
 
-                # Bucketed flash attention; bucket_idx GPR selects body at runtime.
-                flash_result = self.flash_attention_core(
-                    head_dim=ahd,
-                    seq_len=aligned_seq_len,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-                    gpr_bucket_idx=self.gf_bucket_idx,
-                    num_buckets=num_buckets_prefill,
-                )
-                total_flops += (flash_result[num_buckets_prefill - 1]
-                                if isinstance(flash_result, (list, tuple)) else (flash_result or 0))
+                # §7 call site: jump into shared flash subroutine (compiled after HALT).
+                # gpr_ret_id holds the absolute word-address of the instruction AFTER
+                # the jump_abs (capture_count + 2: the ADD_SET + the JUMP_ABS itself).
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                call_site_jump_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
 
                 # Assemble: per token, copy qpkv rows from FLASH_OUT_HEAD[t*qpkv:(t+1)*qpkv]
                 # to FLASH_OUTPUT[t][kv_h*qpkv:(kv_h+1)*qpkv].
@@ -2307,36 +2411,50 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 gpr_M_reg=self.gf_seq_len,
             )
 
+        # End of normal execution path. The flash subroutine follows and is only
+        # reachable via the per-call-site JUMP_ABS placeholders patched below.
         self.generate_instruction_halt()
+
+        # §7: compile flash_attention_core ONCE as a subroutine, then patch every
+        # call-site jump_abs immediate to point at its entry instruction.
+        # IDENTITY_DRAM_ADDR is REQUIRED: without it flash_attention_core lazily
+        # alloc+DMAs torch.eye at compile time only. A cached bin then has NO
+        # identity in DRAM at run time → flash reads NaN → garbage KV cache →
+        # all-`!` decode. Pass the pre-seeded slot (same one the decoder uses).
+        # See [[fpga_identity_matrix_memoize]] / core_changes §1.
+        flash_sub_start, flash_flops = self.flash_attention_core(
+            head_dim=ahd,
+            seq_len=aligned_seq_len,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            gpr_bucket_idx=self.gf_bucket_idx,
+            num_buckets=num_buckets_prefill,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += flash_flops[num_buckets_prefill - 1] * layer_size * nkvh
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(
+                jump_idx, ue_35bit_addr_shifter(flash_sub_start))
+        self.release_isa_reg()  # gpr_ret_id
+
         return total_flops
 
     def compile_prefill(self, layer_size: int | None = None) -> tuple[int, int, int]:
-        """Compile single PBI prefill program. Returns (program_addr, preamble_addr, total_flops).
-
-        Cache key: (PREFILL_MAX_SEQ_LEN, layer_size). The bin is seq_len-agnostic
-        for actual_seq_len ≤ PREFILL_MAX_SEQ_LEN, primed at runtime via the
-        preamble emitted in run_prefill.
+        """Emit the single PBI prefill program into program DRAM and return
+        (program_addr, preamble_addr, total_flops). No standalone disk cache — the
+        bytes are handed to compile_all (via self._seg_prefill) for the unified
+        instructions.bin. The program is seq_len-agnostic for actual_seq_len ≤
+        PREFILL_MAX_SEQ_LEN, primed at runtime by the preamble in run_prefill.
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
-
-        bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
-        os.makedirs(bin_dir, exist_ok=True)
         template_seq_len = self.PREFILL_MAX_SEQ_LEN
-        cache_path = os.path.join(bin_dir, f"prefill_program_pbi_s{template_seq_len}.bin")
-        meta_path  = os.path.join(bin_dir, f"prefill_program_pbi_s{template_seq_len}.json")
-
-        if os.path.exists(cache_path) and os.path.exists(meta_path):
-            _original_print(f"  Loading cached PBI prefill program (template={template_seq_len}) from {cache_path} ...")
-            with open(cache_path, "rb") as f:
-                prog_bytes = f.read()
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-            program_addr = self.get_program_dram_addr()
-            self.dma_write(DMA_DEVICE_H2C, program_addr, prog_bytes, len(prog_bytes))
-            self.allocate_program_dram(len(prog_bytes))
-            preamble_addr = self.allocate_program_dram(256)
-            return program_addr, preamble_addr, meta["total_flops"]
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -2357,12 +2475,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = False
         _original_print()
 
-        with open(cache_path, "wb") as f:
-            f.write(prog_bytes)
-        with open(meta_path, "w") as f:
-            json.dump({"total_flops": total_flops, "template_seq_len": template_seq_len, "layer_size": layer_size}, f)
-        print(f"    PBI prefill cached to {cache_path} ({len(prog_bytes)} bytes)")
-        print(f"    Prefill program at 0x{program_addr:X}, preamble slot at 0x{preamble_addr:X}")
+        if getattr(self, '_unified_active', False):
+            self._seg_prefill = (program_addr, bytes(prog_bytes))
+        print(f"    Prefill compiled: {len(prog_bytes)} bytes at 0x{program_addr:X}, preamble 0x{preamble_addr:X}")
         return program_addr, preamble_addr, total_flops
 
     def run_prefill(self, prefill_program_addr: int, preamble_addr: int,
@@ -2425,9 +2540,14 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(preamble_addr)
         self.clear_capture_buffer()
 
-        self.start_execute_from_dram(preamble_addr)
-        self.wait_queue(180.0)
+        prefill_flops = gflops if isinstance(gflops, (int, float)) else 0
+        latency_us, flop_rate = self.program_execute(preamble_addr, timeout=180.0,
+                                                     flops=prefill_flops, verbose=False)
+        self._latency_hw_prefill = latency_us
+        self._flop_rate_hw_prefill = flop_rate
+        self._last_hw_gflops = flop_rate
         print(f"    Prefill executed: actual_seq_len={actual_seq_len}, q_seq_len={q_seq_len}, bucket_idx={bucket_idx}")
+        print(f"    HW latency: {latency_us/1e6:.2f}s, {flop_rate:.2f} GFLOPS")
 
     def _emit_decoder_program(self, layer_size: int) -> int:
         """Emit ONE decode-position-agnostic decoder program (PBI single-bin pattern).
@@ -2471,6 +2591,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_set(gf_one, 1)
         # gf_rope_cos_abs is primed per-step by run_decoder's preamble (depends on _rope_offset).
 
+        # §7 shared-subroutine attention: compile decoder_group_attention_core ONCE
+        # after HALT; per-(layer × kv_head) call sites emit only an
+        # `add_set gpr_ret_id, return_word_addr` + `jump_abs <subroutine>`.
+        # Shrinks the decoder bin by ~num_layers × num_kv_heads (72× for qwen2.5-VL).
+        from user_dma_core import INSTRUCTION_SIZE_BYTES
+        program_dram_base = self.get_program_dram_addr()
+        gpr_ret_id = self.alloc_isa_reg()
+        call_site_jump_capture_indices: list[int] = []
+
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         for layer_idx in range(layer_size):
@@ -2485,15 +2614,18 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'],
                           gpr_M_reg=gf_one) or 0)
 
-            # Q, K, V projections with bias
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=hd * qpkv,
+            # Q, K, V projections with bias.
+            # §3h: q_proj, k_proj (IF4, K=2048<8192) use the M=1 GEMV kernel.
+            # v_proj is BF16 — quantized_matmat_core asserts IF4/IF8/TQ4 only
+            # (see [[bf16_models_no_quantized_gemv]]), so it stays on matmat_mul_core.
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['q_bias'], gpr_M_reg=gf_one) or 0)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=hd,
+                C_DRAM_ADDR=la['q_bias']) or 0)
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                 SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['k_bias'], gpr_M_reg=gf_one) or 0)
+                C_DRAM_ADDR=la['k_bias']) or 0)
             total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
                 C_DRAM_ADDR=la['v_bias'], gpr_M_reg=gf_one) or 0)
@@ -2555,23 +2687,43 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
                     self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
 
-                # PBI decoder_group_attention_core: one call processes all qpkv Q heads for this KV head.
-                # ``seq_len`` arg is ignored on the PBI path (bucket bodies cover the range).
-                attn_flops = self.decoder_group_attention_core(
-                    group_size=qpkv,
-                    head_dim=ahd,
-                    seq_len=self.MAX_CONTEXT_SIZE,  # ignored under PBI dispatch
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=k_cache_base,
-                    V_DRAM_ADDR=v_cache_base,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    gpr_bucket_idx=self.gf_bucket_idx,
-                    num_buckets=num_buckets_decoder,
+                # §7: marshal K/V history into the FIXED FLASH_K / FLASH_V buffers
+                # the shared subroutine reads from. Loop count = gf_bucket_idx, so
+                # each iter copies one UE_VECTOR_SIZE bucket of tokens.
+                self._emit_pbi_scatter_per_token(
+                    read_base=k_cache_base,
+                    read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    sram_byte_addr=0x50000,
+                    element_count=UE_VECTOR_SIZE * ahd,
+                    gf_seq_len=self.gf_bucket_idx,
+                    template_seq_len=num_buckets_decoder,
                 )
-                total_flops += (attn_flops[-1] if isinstance(attn_flops, (list, tuple)) else (attn_flops or 0))
+                self._emit_pbi_scatter_per_token(
+                    read_base=v_cache_base,
+                    read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_V_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    sram_byte_addr=0x60000,
+                    element_count=UE_VECTOR_SIZE * ahd,
+                    gf_seq_len=self.gf_bucket_idx,
+                    template_seq_len=num_buckets_decoder,
+                )
+
+                # §7 call site: jump into shared decoder_group_attention subroutine.
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                call_site_jump_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+
+                # Post-return: copy FLASH_OUT_HEAD (qpkv × ahd) → assembled FLASH_OUTPUT
+                # at this KV head's offset. Decode M=1 → 2 KB per copy.
+                self.accelerator_memory_to_sram(
+                    self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
+                self.sram_to_accelerator_memory(
+                    0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
+                    qpkv * ahd)
 
             # o_proj (BF16)
             total_flops += (self.matmat_mul_core(M=1, K=hd * qpkv, N=self.vector_length,
@@ -2590,14 +2742,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                           gpr_M_reg=gf_one) or 0)
 
             # MLP: SwiGLU
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.mlp_elements,
+            # §3h: gate_proj, up_proj (IF4, K=2048<8192) use the M=1 GEMV kernel.
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True,
-                gpr_M_reg=gf_one) or 0)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.mlp_elements,
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True) or 0)
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
-                gpr_M_reg=gf_one) or 0)
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4) or 0)
 
             # gate x up (M=1: mlp_elements fits in SRAM in one shot)
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
@@ -2605,7 +2756,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
-            # down_proj
+            # down_proj — K=mlp_elements=11008 > SCALE_BRAM_ELEMENTS=8192 triggers
+            # quantized_matmat_core N_chunk=0 compile-hang (§3h), so stay on matmat_mul_core.
             total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
@@ -2622,105 +2774,316 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr,
                 gpr_M_reg=gf_one) or 0)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            # §3h LM head (M=1 GEMV). On-FPGA repetition penalty (llama3.2_1b style):
+            # the per-vocab PENALTY_BIAS_DRAM is the matmul's C term (broadcast_N), so
+            # the HW argmax of (logits + bias) returns the penalized token directly —
+            # write_back_disable=True means LOGITS_DRAM is never written and there is
+            # NO host logit readback. All-zero bias buffer = pure greedy.
+            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
-                gpr_M_reg=gf_one) or 0)
+                C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
+                write_back_disable=True) or 0)
 
         # End-of-body: bump gf_seq_len for next decode step, then halt.
+        # The decoder_group_attention subroutine follows the halt and is only
+        # reachable via the per-call-site JUMP_ABS placeholders patched below.
         self.generate_instruction_add_inc(self.gf_seq_len)
         self.generate_instruction_halt()
+        self.pad_capture_to_64b_boundary()
+
+        # §7: compile decoder_group_attention_core ONCE as a subroutine, then patch
+        # every call-site jump_abs immediate to point at its entry instruction.
+        dec_sub_start, dec_attn_flops = self.decoder_group_attention_core(
+            group_size=qpkv,
+            head_dim=ahd,
+            seq_len=self.MAX_CONTEXT_SIZE,  # ignored under PBI dispatch
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            gpr_bucket_idx=self.gf_bucket_idx,
+            num_buckets=num_buckets_decoder,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += dec_attn_flops[-1] * layer_size * nkvh
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(
+                jump_idx, ue_35bit_addr_shifter(dec_sub_start))
+        self.release_isa_reg()  # gpr_ret_id
+
         return total_flops
 
     def compile_decoder(self, layer_size: int | None = None) -> tuple[int, int]:
-        """Compile-or-load single PBI decoder program; allocate per-step preamble slot.
-
-        Cache hit: load bin from disk, DMA to program DRAM, restore stashed GPR indices.
-        Cache miss: capture _emit_decoder_program, write to DRAM + bin/meta.
-
-        Either way, ``self._decoder_preamble_addr`` is allocated as a small program slot
-        rewritten each decode step by run_decoder.
-
-        Returns (decoder_program_addr, total_flops).
+        """Emit the single PBI decoder program into program DRAM and allocate the
+        per-step preamble slot. No standalone disk cache — bytes are handed to
+        compile_all (via self._seg_decoder) for the unified instructions.bin.
+        ``self._decoder_preamble_addr`` is the small slot run_decoder rewrites each
+        step. Returns (decoder_program_addr, total_flops).
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
-        paths_cfg = self._cfg.get("paths", {})
-        decoder_bin_rel = paths_cfg.get("decoder_program_bin", "qwen2.5_vl_3b_bin/decoder_program.bin")
-        decoder_meta_rel = paths_cfg.get("decoder_program_meta", "qwen2.5_vl_3b_bin/decoder_program.json")
-        decoder_bin_path = os.path.join(self.script_dir, decoder_bin_rel)
-        decoder_meta_path = os.path.join(self.script_dir, decoder_meta_rel)
-        os.makedirs(os.path.dirname(decoder_bin_path), exist_ok=True)
 
-        # PBI meta has scalar "total_flops"; legacy bucket meta had list — detect to invalidate.
-        cache_hit = False
-        if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
-            with open(decoder_meta_path, "r") as f:
-                meta = json.load(f)
-            if "program_size" in meta and isinstance(meta.get("total_flops"), int):
-                cache_hit = True
-            else:
-                _original_print(f"  Decoder cache exists but is legacy bucketed format — recompiling.")
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        _original_print(f"  Compiling PBI decoder ({layer_size} layers)...")
+        self.clear_inst_id()
+        self.start_capture()
+        total_flops = self._emit_decoder_program(layer_size)
+        self.stop_capture()
+        _SILENT_MODE = False
 
-        if cache_hit:
-            with open(decoder_bin_path, "rb") as f:
-                prog_bytes = f.read()
-            decoder_program_addr = self.get_program_dram_addr()
-            self.dma_write(DMA_DEVICE_H2C, decoder_program_addr, prog_bytes, len(prog_bytes))
-            self.allocate_program_dram(len(prog_bytes))
-            total_flops = meta["total_flops"]
-            # Restore the GPR indices _emit_decoder_program would have allocated (5, 6).
-            self._gf_one          = 5
-            self._gf_rope_cos_abs = 6
-            print(f"  Decoder loaded from cache ({len(prog_bytes)} bytes) at 0x{decoder_program_addr:X}")
-        else:
-            global _SILENT_MODE
-            _SILENT_MODE = True
-            _original_print(f"  Compiling PBI decoder ({layer_size} layers)...")
-            self.clear_inst_id()
-            self.start_capture()
-            total_flops = self._emit_decoder_program(layer_size)
-            self.stop_capture()
-            _SILENT_MODE = False
+        decoder_program_addr = self.get_program_dram_addr()
+        prog_bytes = bytearray()
+        for inst in self.capture_buffer:
+            prog_bytes.extend(inst.get_bytes())
+        self.write_captured_instructions_to_dram(decoder_program_addr)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.clear_capture_buffer()
 
-            decoder_program_addr = self.get_program_dram_addr()
-            prog_bytes = bytearray()
-            for inst in self.capture_buffer:
-                prog_bytes.extend(inst.get_bytes())
-            self.write_captured_instructions_to_dram(decoder_program_addr)
-            self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-            self.clear_capture_buffer()
-
-            with open(decoder_bin_path, "wb") as f:
-                f.write(prog_bytes)
-            with open(decoder_meta_path, "w") as f:
-                json.dump({"program_size": len(prog_bytes), "total_flops": total_flops}, f, indent=0)
-            print(f"  Decoder program: 0x{decoder_program_addr:X} – 0x{self.get_program_dram_addr():X} "
-                  f"({len(prog_bytes)} bytes), total_flops={total_flops}")
+        if getattr(self, '_unified_active', False):
+            self._seg_decoder = (decoder_program_addr, bytes(prog_bytes))
+        print(f"  Decoder compiled: {len(prog_bytes)} bytes at 0x{decoder_program_addr:X}, "
+              f"total_flops={total_flops}")
 
         # Allocate a small preamble slot (5 instructions × 32 B = 160 B; round up to 256 B).
         self._decoder_preamble_addr = self.get_program_dram_addr()
         self.allocate_program_dram(256)
         return decoder_program_addr, total_flops
 
+    def _ensure_canonical_vision_layout(self) -> None:
+        """Ensure self._cu_window_seqlens is set so the encoder ISA can be
+        captured even on a text-only first compile. The vision window layout is
+        a deterministic function of the canonical image size (336×336 → fixed
+        576 patches), NOT of pixel content — so a synthetic black image yields
+        the exact window layout any real image will use at runtime."""
+        if getattr(self, '_cu_window_seqlens', None) is not None:
+            return
+        img_size = self._vis_cfg.get("image_size", 336)
+        synthetic = torch.zeros(3, img_size, img_size, dtype=torch.bfloat16)
+        _original_print(f"  [unified bin] deriving canonical vision window layout "
+                        f"({img_size}×{img_size}) for the encoder section...")
+        self.prepare_encoder_input(synthetic)
+
+    def compile_all(self, layer_size: int | None = None) -> dict:
+        """Build the COMPLETE single instruction bin (prefill + decoder + encoder),
+        once, serving BOTH LM-only and VLM requests.
+
+        Ordering is the fix (mirrors gemma4_e2b compile_instruction_bin):
+        prefill + decoder are captured FIRST at the fixed instruction base, the
+        encoder is appended AFTER. So the §7 shared-subroutine JUMP_ABS targets
+        in prefill/decoder bake against a base that never depends on the encoder's
+        presence (see fpga_pbi_jump_target_bake). LM-only loads the bin and runs
+        prefill/decoder (skips encoder execution); VLM additionally runs the
+        encoder. One mode-agnostic bin → instructions_s{tmpl}.bin.
+
+        The encoder section is always compiled (canonical 336×336 window layout),
+        so the first run builds the complete bin regardless of LM/VLM. Subsequent
+        runs load it. Cache key: PREFILL_MAX_SEQ_LEN + layer_size.
+
+        Returns dict: encoder_addr, prefill_addr, prefill_preamble, decoder_addr,
+        decoder_preamble, prefill_flops, decoder_flops.
+        """
+        if layer_size is None:
+            layer_size = self.LAYER_SIZE
+        bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        tmpl = self.PREFILL_MAX_SEQ_LEN
+        uni_bin  = os.path.join(bin_dir, "instructions.bin")
+        uni_meta = os.path.join(bin_dir, "instructions.json")
+
+        # ---- cache hit: load the one bin, DMA each segment at its stored addr ----
+        # Filename is fixed (instructions.bin), so validate the baked layout
+        # signature — a bin built for a different prefill_max_seq_len / layer_size
+        # has different bucket bodies and addresses (core_changes §6) and must be
+        # rebuilt, not silently reused.
+        _meta_ok = False
+        if os.path.exists(uni_bin) and os.path.exists(uni_meta):
+            with open(uni_meta) as f:
+                meta = json.load(f)
+            _meta_ok = (meta.get("template_seq_len") == tmpl
+                        and meta.get("layer_size") == layer_size)
+            if not _meta_ok:
+                _original_print(f"  instructions.bin was built for template_seq_len="
+                                f"{meta.get('template_seq_len')}/layer_size={meta.get('layer_size')} "
+                                f"≠ current {tmpl}/{layer_size} — rebuilding.")
+        if _meta_ok:
+            with open(uni_bin, "rb") as f:
+                raw = f.read()
+            for seg in meta["segments"]:
+                b = raw[seg["off"]:seg["off"] + seg["size"]]
+                self.dma_write(DMA_DEVICE_H2C, seg["addr"], b, len(b))
+            self._next_program_dram_addr = meta["end_addr"]
+            self._gf_one = meta["gf_one"]
+            self._gf_rope_cos_abs = meta["gf_rope_cos_abs"]
+            self._decoder_preamble_addr = meta["decoder_preamble"]
+            self._vis_program_addr = meta["encoder_addr"]
+            _original_print(f"  Loaded unified instruction bin "
+                            f"({len(raw)/1024/1024:.1f} MB, {len(meta['segments'])} segments) from {uni_bin}")
+            return {k: meta[k] for k in ("encoder_addr", "prefill_addr", "prefill_preamble",
+                                          "decoder_addr", "decoder_preamble",
+                                          "prefill_flops", "decoder_flops")}
+
+        # ---- cache miss: compile the complete bin (LM first, encoder appended) ----
+        _original_print(f"  Compiling complete instruction bin (prefill + decoder + encoder)...")
+        self._ensure_canonical_vision_layout()
+        self._unified_active = True
+        self._seg_encoder = self._seg_prefill = self._seg_decoder = None
+        try:
+            # LM FIRST → prefill/decoder land at the fixed base; their §7 jumps
+            # bake here and stay valid whether or not the encoder runs.
+            prefill_addr, prefill_preamble, prefill_flops = self.compile_prefill(layer_size)
+            decoder_addr, decoder_flops = self.compile_decoder(layer_size)
+            decoder_preamble = self._decoder_preamble_addr
+            # ENCODER LAST → appended after the LM section.
+            enc_addr = self.compile_encoder()
+        finally:
+            self._unified_active = False
+        end_addr = self.get_program_dram_addr()
+
+        # Assemble one bin: concat segment bytes; meta records each at its abs addr.
+        segments, raw = [], bytearray()
+        for name, seg in (("prefill", self._seg_prefill),
+                          ("decoder", self._seg_decoder),
+                          ("encoder", self._seg_encoder)):
+            if seg is None:
+                continue
+            addr, b = seg
+            segments.append({"name": name, "addr": addr, "off": len(raw), "size": len(b)})
+            raw.extend(b)
+        meta = {
+            "template_seq_len": tmpl, "layer_size": layer_size,
+            "segments": segments, "end_addr": end_addr,
+            "encoder_addr": enc_addr,
+            "prefill_addr": prefill_addr, "prefill_preamble": prefill_preamble,
+            "prefill_flops": prefill_flops,
+            "decoder_addr": decoder_addr, "decoder_preamble": decoder_preamble,
+            "decoder_flops": decoder_flops,
+            "gf_one": self._gf_one, "gf_rope_cos_abs": self._gf_rope_cos_abs,
+        }
+        with open(uni_bin, "wb") as f:
+            f.write(raw)
+        with open(uni_meta, "w") as f:
+            json.dump(meta, f)
+        print(f"  Complete instruction bin: {len(raw)/1024/1024:.1f} MB, "
+              f"{len(segments)} segments (prefill+decoder+encoder) → {uni_bin}")
+        return {k: meta[k] for k in ("encoder_addr", "prefill_addr", "prefill_preamble",
+                                      "decoder_addr", "decoder_preamble",
+                                      "prefill_flops", "decoder_flops")}
+
+    def _structural_token_ids(self) -> set:
+        """Token ids that must NEVER be repetition-penalized: punctuation, whitespace,
+        newline, special tokens. Penalizing these 'glue' tokens over a long generation
+        starves a small model of grammar → word-salad. Computed once, cached."""
+        cached = getattr(self, "_struct_ids_cache", None)
+        if cached is not None:
+            return cached
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–’‘“”…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        for i in range(self.EMBEDDING_ELEMENTS):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
+
+    def _structural_ids_tensor(self) -> torch.Tensor:
+        """1-D LongTensor of structural/special token ids (cached) for vectorized exemption."""
+        t = getattr(self, "_struct_ids_tensor_cache", None)
+        if t is None:
+            t = torch.tensor(sorted(self._structural_token_ids()), dtype=torch.long)
+            self._struct_ids_tensor_cache = t
+        return t
+
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """On-FPGA repetition penalty: build the per-vocab additive bias from the windowed
+        token frequency and DMA it to PENALTY_BIAS_DRAM (the LM-head matmul's C term).
+        bias[t] = clamp(-alpha*count[t], min=-cap); structural tokens stay 0. The HW argmax
+        of (logits + bias) then returns the penalized token — NO logit readback. One full-
+        buffer DMA per step (push only). Mirrors llama3.2_1b._write_penalty_bias."""
+        vocab = self.EMBEDDING_ELEMENTS
+        alpha = float(getattr(self, "pen_alpha", 1.0))
+        cap   = float(getattr(self, "pen_cap", 20.0))
+        W     = int(getattr(self, "rep_window", 256))
+        window = prev_tokens[-W:]
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0
+        bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
+
     def run_decoder(self, decoder_program_addr: int, token_id: int,
-                    gflops: int | None = None, repetition_penalty: float = 1.2) -> int:
+                    gflops: int | None = None, latency_prefill_wall: float = 0.0) -> tuple[int, str]:
         """Run PBI decode loop. Per-step preamble primes gf_seq_len / gf_bucket_idx /
         gf_rope_cos_abs, then JUMP_ABS into the single cached decoder program. Breaks on EOS/EOT.
+        Accumulates HW counters (total_latency_us, total_flop_rate) and prints the
+        Decoder/HW counter status block at the end (matches gemma3/llama3.2 format).
         """
         if token_id is None:
             print("No last token available for decode.")
-            return self.seq_len
+            return self.seq_len, ""
 
         _qwen25_stop_tokens = {151643, 151645, self._end_of_turn_token_id}
-
+        decoded_chars: list[str] = []
         ahd = self.actual_head_dim
         bpe = self.bytes_per_element
         rope_row_bytes = ahd * 2 * bpe
         ROPE_BASE = self.DRAM_ADDR_ROPE
         preamble_addr = self._decoder_preamble_addr
 
-        generated_tokens = set()
+        per_token_flops = gflops if isinstance(gflops, (int, float)) else 0
+        total_latency_us = 0.0
+        total_flop_rate = 0.0
+        decode_start = time.perf_counter()
+        prefill_seq_start = self.seq_len  # seq_len after prefill, before any decode step
+
+        # On-FPGA repetition penalty (llama3.2_1b style — NO logit readback). The
+        # per-vocab bias is the LM-head matmul's C term; the HW argmax of
+        # (logits + bias) returns the penalized token. Position-gated: pure greedy
+        # (zero bias) for the first `greedy_until` decoded tokens, then the bias is
+        # refreshed each step from the windowed token frequency. _generated_tokens
+        # is seeded with the prompt by main().
+        if not hasattr(self, '_generated_tokens'):
+            self._generated_tokens = []
+        fpga_penalty = bool(getattr(self, 'fpga_penalty', True))
+        greedy_until = int(getattr(self, 'greedy_until', 512))
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+            torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
+
+        # Live status bar (matches llama3.2_1b): pin the bottom terminal row as a
+        # status line via an ANSI scroll region; tokens stream above it and the
+        # tok/s counter refreshes in place. Only on a real TTY (skip when piped).
+        import shutil
+        _use_status = sys.stdout.isatty()
+        def _status_setup():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")    # scroll region = rows 1..rows-1
+            sys.stdout.write(f"\033[{rows - 1};1H")    # park cursor at bottom of region
+            sys.stdout.flush()
+        def _status_update():
+            rows = shutil.get_terminal_size().lines
+            n = self.seq_len - prefill_seq_start
+            elapsed = time.perf_counter() - decode_start
+            rate = n / elapsed if elapsed > 0 else 0.0
+            sys.stdout.write("\0337")                  # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # bottom row, clear it
+            sys.stdout.write(f" decoding… {n} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})  "
+                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
+            sys.stdout.write("\0338")                  # restore cursor
+            sys.stdout.flush()
+        def _status_teardown():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")                 # reset scroll region
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # clear the status row
+            sys.stdout.flush()
+        if _use_status:
+            _status_setup()
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
@@ -2740,6 +3103,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             bias_host[0, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
 
+            # Refresh the LM-head penalty bias past the greedy gate (push only — the
+            # HW argmax of logits+bias yields the penalized token, no readback).
+            if fpga_penalty and (self.seq_len - prefill_seq_start) > greedy_until:
+                self._write_penalty_bias(self._generated_tokens)
+
             # Per-step preamble: prime 3 GPRs + JUMP_ABS into cached decoder program.
             self.clear_inst_id()
             self.start_capture()
@@ -2751,29 +3119,41 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
-            self.start_execute_from_dram(preamble_addr)
-            self.wait_queue(10.0)
+            step_latency_us, step_flop_rate = self.program_execute(
+                preamble_addr, timeout=10.0, flops=per_token_flops, verbose=False)
+            total_latency_us += step_latency_us
+            total_flop_rate += step_flop_rate
 
-            if repetition_penalty != 1.0 and len(generated_tokens) > 0:
-                logits = self.dma_from_accelerator_memory(
-                    self.LOGITS_DRAM, (self.EMBEDDING_ELEMENTS,)).cpu().float()
-                for prev_tok in generated_tokens:
-                    if logits[prev_tok] > 0:
-                        logits[prev_tok] /= repetition_penalty
-                    else:
-                        logits[prev_tok] *= repetition_penalty
-                token_id = int(logits.argmax().item())
-            else:
-                token_id = self.get_arg_max_index()
-
-            generated_tokens.add(token_id)
+            # Token selection: HW argmax register holds argmax(logits + penalty bias).
+            token_id = self.get_arg_max_index()
+            self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             if token_id in _qwen25_stop_tokens:
+                if _use_status:
+                    _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
-        return self.seq_len
+            if _use_status:
+                _status_update()
+        else:
+            if _use_status:
+                _status_teardown()
+
+        # Decoder/HW counter status block (matches gemma3 / llama3.2 format).
+        latency_decoder_wall = time.perf_counter() - decode_start
+        tokens_decoded = max(1, self.seq_len - prefill_seq_start)
+        total_wall = latency_prefill_wall + latency_decoder_wall
+        hw_total_s = (getattr(self, '_latency_hw_prefill', 0.0) + total_latency_us) / 1e6
+        avg_hw_gflops = total_flop_rate / tokens_decoded
+        print(f"\nDecoder done in {total_wall:.2f} seconds, "
+              f"speed: {tokens_decoded / latency_decoder_wall:.2f} tokens/s, "
+              f"total {self.seq_len} tokens.")
+        print(f"HW counter: Latency: {hw_total_s:.2f} seconds, "
+              f"decoder average Gflops: {avg_hw_gflops:.2f} Gflops")
+        return self.seq_len, "".join(decoded_chars)
 
 def process_image(image_path: str, size: int = 448) -> torch.Tensor:
     """Load, resize, normalize image -> [3, size, size] bf16."""
@@ -2800,13 +3180,34 @@ def _clock_ns_default_for_device(device: str) -> float:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen2.5-VL-3B prefill + decode on accelerator.")
-    parser.add_argument("--prompt", type=str, default="please describe the image in details.", help="Text prompt")
-    parser.add_argument("--image", type=str, default=os.path.join(SCRIPT_DIR, "../../test_samples/yosemite.jpg"),
-                        help="Path to image file (default: test_samples/yosemite.jpg, use 'none' for text-only)")
-    parser.add_argument('--vision-cpu', action='store_true',
-                        help='Run vision encoder on CPU (fp32) instead of FPGA — for quality comparison')
-    parser.add_argument('--rep-penalty', type=float, default=1.05,
-                        help='Repetition penalty (1.0=off, default: 1.05)')
+    parser.add_argument("--prompt", type=str, default=None,
+                        help="Text prompt (default: an image-describe prompt in VLM mode, "
+                             "a text-only prompt in LM mode)")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Path to an image file -> VLM mode. Default is LM (text-only); "
+                             "'none' also forces text-only.")
+    parser.add_argument("--vision-enable", action="store_true",
+                        help="Enable VLM mode with the default sample image "
+                             "(test_samples/yosemite.jpg) when no --image is given.")
+    # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
+    # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
+    # fully deterministic. --pure-greedy disables it (the bias buffer is zeroed; one bin serves both).
+    parser.add_argument('--pure-greedy', action='store_true',
+                        help='Disable the on-FPGA repetition penalty entirely — plain greedy decode. '
+                             'The penalty is ENABLED by default; use --pure-greedy only for the A/B '
+                             'baseline and the compare/calibration tool.')
+    pen_group = parser.add_argument_group('on-FPGA repetition penalty (active unless --pure-greedy)')
+    pen_group.add_argument('--greedy-until', type=int, default=512,
+                        help='Pure greedy for the first N decoded tokens (correct math/reasoning, '
+                             'which lands early), then the penalty turns on to break long-context '
+                             'loops. 0 = penalty from the start. Default 512.')
+    pen_group.add_argument('--pen-alpha', type=float, default=1.0,
+                        help='bias[t] = -alpha*count[t] (logit units). Default 1.0.')
+    pen_group.add_argument('--pen-cap', type=float, default=20.0,
+                        help='max |bias| per token (floor on -alpha*count). Default 20.')
+    pen_group.add_argument('--rep-window', type=int, default=256,
+                        help='count tokens over the last N (never penalizes punctuation/whitespace/'
+                             'special tokens). Default 256.')
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
@@ -2842,53 +3243,46 @@ def main():
     cfg = _load_config(script_dir)
     if args.image and args.image.lower() == "none":
         args.image = None
+    # Default is LM (text-only). VLM runs when --image is given, or when
+    # --vision-enable is set (which falls back to the default sample image).
+    if args.vision_enable and args.image is None:
+        args.image = os.path.join(SCRIPT_DIR, "../../test_samples/yosemite.jpg")
     has_image = args.image is not None
+    # Vision encoder always runs on FPGA when an image is given.
+    fpga_vision = has_image
+    if args.prompt is None:
+        args.prompt = ("please describe the image in details." if has_image
+                       else "What is the capital of France?")
 
     print(f"\n--- Configuration ---")
+    print(f"  Mode  : {'VLM (vision + LM)' if has_image else 'LM (text-only)'}")
     print(f"  Image : {args.image if has_image else '(none)'}")
     print(f"  Prompt: {args.prompt!r}")
 
-    if has_image and args.vision_cpu:
-        # CPU vision encoder (fp32 precision, for quality comparison)
-        print(f"\n--- Vision Encoder (CPU) ---")
-        timer_vis = time.perf_counter()
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-        from PIL import Image
-        model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
-        hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_dir, torch_dtype=torch.bfloat16, device_map="cpu")
-        if not hasattr(hf_model, 'visual') and hasattr(hf_model, 'model') and hasattr(hf_model.model, 'visual'):
-            hf_model.visual = hf_model.model.visual
-        hf_model.eval()
-        processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
-        img_size = cfg["vision"].get("image_size", 336)
-        image = Image.open(args.image).convert("RGB").resize((img_size, img_size))
-        messages = [{"role": "user", "content": [{"type": "image", "image": image}]}]
-        text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        inputs = processor(text=[text_prompt], images=[image], return_tensors="pt")
-        pixel_values_hf = inputs["pixel_values"].to(torch.bfloat16)
-        image_grid_thw = inputs["image_grid_thw"]
-        with torch.no_grad():
-            vis_output = hf_model.visual(pixel_values_hf, grid_thw=image_grid_thw)
-        # DMA vision output to FPGA
-        num_merged = vis_output.shape[0]
-        ue.dma_to_accelerator_memory(ue.VIS_ENCODER_OUT_DRAM, vis_output.to(torch.bfloat16).flatten())
-        ue._vis_num_tokens = num_merged
-        ue._image_grid_thw = image_grid_thw
-        t_total = time.perf_counter() - timer_vis
-        t_compile = 0
-        print(f"CPU vision encoder: {num_merged} tokens in {t_total:.2f}s")
-        del hf_model
-    elif has_image:
-        # FPGA vision encoder
+    t_compile = t_total = 0.0  # vision compile/total wall (set by the FPGA vision branch)
+
+    if fpga_vision:
+        # FPGA vision encoder — preprocess only; the encoder PROGRAM is compiled
+        # as part of the unified instruction bin (compile_all) below, then run.
         print(f"\n--- Vision Encoder (FPGA) ---")
         timer_vis = time.perf_counter()
-        pixel_values = process_image(args.image)
-        print(f"Image loaded: {args.image} -> {pixel_values.shape}")
-        ue.prepare_encoder_input(pixel_values)  # sets _cu_window_seqlens before compile
-        encoder_addr = ue.compile_encoder()
+        _pixel_values = process_image(args.image)
+        print(f"Image loaded: {args.image} -> {_pixel_values.shape}")
+        ue.prepare_encoder_input(_pixel_values)  # sets _cu_window_seqlens before compile
+
+    # ---- Single complete instruction bin: prefill + decoder + encoder ----
+    # Built once (first run), serves BOTH LM-only and VLM. LM section is captured
+    # first at a fixed base so its §7 JUMP_ABS targets never depend on the encoder;
+    # the encoder is appended after and only executed for VLM. See compile_all.
+    print(f"\n--- Compiling complete instruction bin ---")
+    _t_uni = time.perf_counter()
+    progs = ue.compile_all()
+    t_uni_compile = time.perf_counter() - _t_uni
+    print(f"  {t_uni_compile:.2f}s")
+
+    if fpga_vision:
         t_compile = time.perf_counter() - timer_vis
-        ue.run_encoder(encoder_addr, pixel_values)
+        ue.run_encoder(progs["encoder_addr"], _pixel_values)
         t_total = time.perf_counter() - timer_vis
         print(f"Vision encoder: compile {t_compile:.2f}s + run {t_total - t_compile:.2f}s = {t_total:.2f}s total")
 
@@ -2953,11 +3347,13 @@ def main():
             _parts.append(str(_seq[_i])); _i += 1
     print(f"Prompt ({len(prefill_seq)} tokens): [{', '.join(_parts)}]")
 
-    print(f"\n--- Prefill compile ---")
-    timer = time.perf_counter()
-    prefill_program_addr, prefill_preamble_addr, gflops_prefill = ue.compile_prefill()
-    t_prefill_compile = time.perf_counter() - timer
-    print(f"  {t_prefill_compile:.2f}s")
+    # Prefill + decoder programs already live in the unified bin (compile_all).
+    prefill_program_addr  = progs["prefill_addr"]
+    prefill_preamble_addr = progs["prefill_preamble"]
+    gflops_prefill        = progs["prefill_flops"]
+    decoder_program_addr  = progs["decoder_addr"]
+    gflops_per_token      = progs["decoder_flops"]
+    t_prefill_compile = t_decode_compile = 0.0  # folded into the unified compile
 
     print(f"\n--- Prefill run ({len(prefill_seq)} tokens) ---")
     timer = time.perf_counter()
@@ -2966,12 +3362,6 @@ def main():
     prefill_hw_gflops = getattr(ue, '_last_hw_gflops', 0)
     print(f"  {latency_prefill:.2f}s")
 
-    print(f"\n--- Decode compile ---")
-    timer = time.perf_counter()
-    decoder_program_addr, gflops_per_token = ue.compile_decoder()
-    t_decode_compile = time.perf_counter() - timer
-    print(f"  {t_decode_compile:.2f}s")
-
     # Restore RoPE for decoder
     if has_image:
         ue.restore_rope_for_decoder()
@@ -2979,9 +3369,24 @@ def main():
     else:
         ue._rope_offset = 0
 
+    # On-FPGA repetition-penalty config (deterministic, no logit readback).
+    ue.fpga_penalty = not args.pure_greedy
+    ue.greedy_until = int(args.greedy_until)
+    ue.pen_alpha    = float(args.pen_alpha)
+    ue.pen_cap      = float(args.pen_cap)
+    ue.rep_window   = int(args.rep_window)
+    ue._generated_tokens = list(prefill_seq)  # seed the penalty window with the prompt
+    if ue.fpga_penalty:
+        print(f"Decode: on-FPGA penalty (LM-head bias) — pure greedy for {ue.greedy_until} tokens, "
+              f"then alpha={ue.pen_alpha} cap={ue.pen_cap} window={ue.rep_window}")
+    else:
+        print("Decode: plain greedy (--pure-greedy)")
+
     print(f"\n--- Decode run ---")
     timer = time.perf_counter()
-    token_cnt_decoded = ue.run_decoder(decoder_program_addr, token_id=prefill_seq[-1], gflops=gflops_per_token, repetition_penalty=args.rep_penalty)
+    token_cnt_decoded, decoded_text = ue.run_decoder(
+        decoder_program_addr, token_id=prefill_seq[-1],
+        gflops=gflops_per_token, latency_prefill_wall=latency_prefill)
     latency_decoder = time.perf_counter() - timer
     n_new = token_cnt_decoded - len(prefill_seq)
     print(f"\n  {latency_decoder:.2f}s ({n_new} tokens, {latency_decoder/max(n_new,1):.2f}s/tok)")
@@ -2995,14 +3400,18 @@ def main():
         vis_run = t_total - t_compile
         print(f"  Vision compile:   {t_compile:.2f}s")
         print(f"  Vision run:       {vis_run:.2f}s  ({vis_gflops:.2f} GFLOPS)")
-    print(f"  Prefill compile:  {t_prefill_compile:.2f}s")
+    print(f"  Unified compile:  {t_uni_compile:.2f}s  (encoder+prefill+decoder, one bin)")
     prefill_flops = gflops_prefill if isinstance(gflops_prefill, (int, float)) else 0
     print(f"  Prefill run:      {latency_prefill:.2f}s  ({prefill_hw_gflops:.2f} GFLOPS)  ({len(prefill_seq)} tokens)")
-    print(f"  Decode compile:   {t_decode_compile:.2f}s")
     print(f"  Decode run:       {latency_decoder:.2f}s  ({n_new} tokens, {latency_decoder/max(n_new,1):.2f}s/tok)")
-    total = (t_total if has_image else 0) + t_prefill_compile + latency_prefill + t_decode_compile + latency_decoder
+    total = (t_total if fpga_vision else 0) + t_uni_compile + latency_prefill + latency_decoder
     print(f"  ──────────────────────────")
     print(f"  Total:            {total:.2f}s")
+
+    # Clear FPGA DRAM so stale scratch doesn't bleed into subsequent runs
+    # (see [[fpga_compare_clear_dram_oracle.md]] — 400 max|d| floor without this).
+    ue.clear_dram()
+    print("Qwen2.5-VL-3B test ends.")
 
 if __name__ == "__main__":
     main()
