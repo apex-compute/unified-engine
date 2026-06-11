@@ -3099,7 +3099,37 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
+
+        # Live t/s counter (same as gemma3/smolvlm2)
+        import shutil
+        _use_status = sys.stdout.isatty()
+        _timer = time.perf_counter()
+        _decoder_token_cnt = 0
+        def _status_setup():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")
+            sys.stdout.write(f"\033[{rows - 1};1H")
+            sys.stdout.flush()
+        def _status_update():
+            rows = shutil.get_terminal_size().lines
+            elapsed = time.perf_counter() - _timer
+            rate = _decoder_token_cnt / elapsed if elapsed > 0 else 0.0
+            sys.stdout.write("\0337")
+            sys.stdout.write(f"\033[{rows};1H\033[2K")
+            sys.stdout.write(f" decoding… {_decoder_token_cnt} tokens  (pos {self.seq_len}/{max_seq_len})  "
+                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
+            sys.stdout.write("\0338")
+            sys.stdout.flush()
+        def _status_teardown():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")
+            sys.stdout.write(f"\033[{rows};1H\033[2K")
+            sys.stdout.flush()
+        if _use_status:
+            _status_setup()
+
         while self.seq_len < max_seq_len:
+            _decoder_token_cnt += 1
             _SILENT_MODE = True
             self.seq_len += 1
             step_pos = self.seq_len - 1  # KV-fill index for THIS step
@@ -3139,9 +3169,16 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             if token_id in _qwen25_stop_tokens:
+                if _use_status:
+                    _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+            if _use_status:
+                _status_update()
+        else:
+            if _use_status:
+                _status_teardown()
         return self.seq_len
 
 
@@ -3520,6 +3557,10 @@ def _run_decode_only():
     lm_bin = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_lm_if4.bin")
     if not os.path.exists(lm_bin):
         print("  LM weight bin missing -> generating ...")
+        hf_dir = os.path.join(LA_DIR, "locateanything_3b_bin", "LocateAnything-3B")
+        if not os.path.exists(os.path.join(hf_dir, "config.json")):
+            print(f"  Downloading HF model nvidia/LocateAnything-3B ...")
+            snapshot_download(repo_id="nvidia/LocateAnything-3B", local_dir=hf_dir, local_dir_use_symlinks=False)
         gen_lm_bin()
     open(os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_vision_UNUSED.bin"), "a").close()
 

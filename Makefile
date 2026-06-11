@@ -90,7 +90,7 @@ program_with_artifact:
 	$(MAKE) program TARGET=$(TARGET) BITFILE="$$BIT_FILE"
 
 model_test:
-	. myvenv/bin/activate && python model_auto_test.py
+	python model_auto_test.py
 
 .PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test
 
