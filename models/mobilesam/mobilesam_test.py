@@ -187,8 +187,13 @@ def flash_attention_batched(ue: UnifiedEngine, num_batches: int, head_dim: int,
                              seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
                              V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                              SCRATCH_DRAM_ADDR: int,
+                             IDENTITY_DRAM_ADDR: int = None,
                              BIAS_DRAM_ADDR: int = None,
-                             bias_shared: bool = False) -> None:
+                             bias_shared: bool = False,
+                             gpr_bucket_idx: int = None,
+                             ATTN_P_DRAM_ADDR: int = None,
+                             num_buckets: int = 8) -> None:
+    identity_addr = IDENTITY_DRAM_ADDR if IDENTITY_DRAM_ADDR is not None else getattr(ue, "IDENTITY_DRAM", None)
     stride = seq_len * head_dim * _BPE
     scratch_stride = head_dim * seq_len * _BPE + seq_len * seq_len * _BPE
     bias_stride = 0 if (BIAS_DRAM_ADDR is None or bias_shared) else seq_len * seq_len * _BPE
@@ -203,7 +208,11 @@ def flash_attention_batched(ue: UnifiedEngine, num_batches: int, head_dim: int,
             V_DRAM_ADDR=V_DRAM_ADDR + b * stride,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + b * stride,
             SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR + b * scratch_stride,
+            IDENTITY_DRAM_ADDR=identity_addr,
             BIAS_DRAM_ADDR=bias_addr,
+            gpr_bucket_idx=gpr_bucket_idx,
+            ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
+            num_buckets=num_buckets,
         )
 
 
@@ -296,14 +305,14 @@ def conv_transpose2d_2x2_dram(
 def conv2d_1x1_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                     WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
                     H: int, W: int, C_in: int, C_out: int,
-                    gelu_enable: bool = False) -> None:
+                    gelu_enable: bool = False, gpr_M_reg: int | None = None) -> None:
     """Conv2d(kernel=1) = matmul. HWC layout. Weight (C_out, C_in)."""
     ue.matmat_mul_core(
         M=H * W, K=C_in, N=C_out,
         A_DRAM_ADDR=INPUT_DRAM_ADDR, B_DRAM_ADDR=WEIGHT_DRAM_ADDR,
         OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
         C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="broadcast_N",
-        gelu_enable=gelu_enable)
+        gelu_enable=gelu_enable, gpr_M_reg=gpr_M_reg)
 
 
 def conv2d_3x3_stride1_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
@@ -524,7 +533,10 @@ class MobileSAM_UE(UnifiedEngine):
     """
 
     def __init__(self, checkpoint_path: str):
-        super().__init__()
+        # Tensor region needs ~555 MB (overflows default 0xD0000000 program base).
+        # Tensors end at ~0xD2B10C00; push programs to 0xD3000000.
+        # Programs (~463 MB) then end at ~0xEFF00000, within 4 GB.
+        super().__init__(program_dram_base=0xD3000000)
         self.init_unified_engine()
         sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.weight_init(sd)
@@ -1563,6 +1575,10 @@ class MobileSAM_UE(UnifiedEngine):
         self.S0_ZERO_DRAM = self.allocate_params_dram(ENC_S0_C_EXP * _BPE, "s0_zero")
         self.dma_to_accelerator_memory(self.S0_ZERO_DRAM,
                                        torch.zeros(ENC_S0_C_EXP, dtype=torch.bfloat16))
+        # Zero row for depthwise boundary padding: W*BLK zeros (one full input row, one channel block)
+        self.S0_ZERO_ROW_DRAM = self.allocate_params_dram(ENC_S0_W * 64 * _BPE, "s0_zero_row")
+        self.dma_to_accelerator_memory(self.S0_ZERO_ROW_DRAM,
+                                       torch.zeros(ENC_S0_W * 64, dtype=torch.bfloat16))
 
         # Stage 0 activations: (256*256, 256) expand buffer, (256*256, 64) output
         self.S0_EXP_DRAM = self.allocate_tensor_dram(
@@ -2199,6 +2215,9 @@ class MobileSAM_UE(UnifiedEngine):
         self.S3B0_OUT_DRAM   = self.allocate_tensor_dram(_HW3   * _C3 * _BPE,    "s3b0_out")
         self.S3B1_OUT_DRAM   = self.allocate_tensor_dram(_HW3   * _C3 * _BPE,    "s3b1_out")
 
+        # Shared ATTN_P buffer for PBI flash attention (sized for S2 max: 256² × 2 bytes)
+        self.FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(ENC_S2_WIN_PAD * ENC_S2_WIN_PAD * _BPE, "flash_attn_p")
+
         # ---- Neck: Conv1x1(320→256) → LN → Conv3x3(256→256) → LN ----
         _NECK_C_IN  = ENC_S3_C   # 320
         _NECK_C_OUT = 256        # multiple of 64 ✓
@@ -2234,54 +2253,80 @@ class MobileSAM_UE(UnifiedEngine):
 
 
 
-    def _run_s1_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int) -> None:
+    def _run_s1_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
+                      gpr_ntok: int = None, gpr_hw: int = None,
+                      gpr_flash: int = None) -> None:
         """Run one TinyViTBlock: attn → residual → local_conv → mlp+residual."""
         _HW   = ENC_S1_H * ENC_S1_W
         _NTOK = ENC_S1_NWIN * ENC_S1_WIN_PAD
         _WPAD = ENC_S1_WIN_PAD
         _HP   = ENC_S1_HEAD_PAD
 
-        # attn norm on spatial tokens BEFORE window partition (no zero-padding, avoids hardware LN NaN)
-        _LN_BATCH = 512
-        for _off in range(0, _HW, _LN_BATCH):
-            _take = min(_LN_BATCH, _HW - _off)
-            self.layer_norm_core_dram(
-                M=_take, N=ENC_S1_C,
-                A_DRAM_ADDR=INPUT_DRAM + _off * ENC_S1_C * _BPE,
-                OUTPUT_DRAM_ADDR=self.S1_LN_DRAM + _off * ENC_S1_C * _BPE,
-                GAMMA_DRAM_ADDR=w["an_g"], BETA_DRAM_ADDR=w["an_b"])
+        def _set_ntok():
+            if gpr_ntok is not None:
+                self._isa_reg_counter = gpr_ntok + 1
+                self.reset_inst_ptr_counter()
+                self.generate_instruction_add_set(dst_reg_idx=gpr_ntok, immediate_value=_NTOK)
 
-        # window partition LN output
+        def _set_hw():
+            if gpr_hw is not None:
+                self._isa_reg_counter = gpr_hw + 1
+                self.reset_inst_ptr_counter()
+                self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_HW)
+
+        def _ln_hw(src, dst, g, b):
+            _reg = gpr_hw if gpr_hw is not None else 14
+            _ops = 4 + (1 if g is not None else 0) + (1 if b is not None else 0)
+            _ideal = min(URAM_NEAR_FULL_ELEMENTS // ENC_S1_C, _HW, (256 - 4) // _ops)
+            _cs = _ideal
+            while _HW % _cs != 0:
+                _cs -= 1
+            self._isa_reg_counter = _reg + 1
+            self.reset_inst_ptr_counter()
+            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW // _cs)
+            self.layer_norm_core_dram(M=_HW, N=ENC_S1_C, A_DRAM_ADDR=src,
+                OUTPUT_DRAM_ADDR=dst, GAMMA_DRAM_ADDR=g, BETA_DRAM_ADDR=b,
+                gpr_M_reg=_reg)
+
+        # attn norm
+        _ln_hw(INPUT_DRAM, self.S1_LN_DRAM, w["an_g"], w["an_b"])
+
         window_partition_dram(self, self.S1_LN_DRAM, self.S1_WIN_DRAM,
                               ENC_S1_H, ENC_S1_W, ENC_S1_C, ENC_S1_WS)
 
-        # Q, K, V projections (from windowed LN tokens)
+        # Q, K, V projections
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=ENC_S1_C, N=ENC_S1_C,
                              A_DRAM_ADDR=self.S1_WIN_DRAM, B_DRAM_ADDR=w["W_q"],
                              OUTPUT_DRAM_ADDR=self.S1_Q_DRAM,
-                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=ENC_S1_C, N=ENC_S1_C,
                              A_DRAM_ADDR=self.S1_WIN_DRAM, B_DRAM_ADDR=w["W_k"],
                              OUTPUT_DRAM_ADDR=self.S1_K_DRAM,
-                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=ENC_S1_C, N=ENC_S1_C,
                              A_DRAM_ADDR=self.S1_WIN_DRAM, B_DRAM_ADDR=w["W_v"],
                              OUTPUT_DRAM_ADDR=self.S1_V_DRAM,
-                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
 
-        # multihead reshape: (NTOK, C) → (heads, NTOK, HEAD_PAD)
         multihead_reshape_dram(self, self.S1_Q_DRAM, self.S1_Q_HEAD_DRAM, self.S1_MH_TEMP,
                                _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
         multihead_reshape_dram(self, self.S1_K_DRAM, self.S1_K_HEAD_DRAM, self.S1_MH_TEMP,
                                _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
         multihead_reshape_dram(self, self.S1_V_DRAM, self.S1_V_HEAD_DRAM, self.S1_MH_TEMP,
                                _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
-        # flash_attn uses 1/sqrt(head_dim_pad=64); true scale is 1/sqrt(head_dim=32)
         broadcast_mul_dram(self, self.S1_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S1_HEADS * _NTOK * _HP)
 
-        # flash attention: process one head at a time, bias shared across windows
         _head_stride = ENC_S1_NWIN * _WPAD * _HP * _BPE
+        _s1_buckets = _WPAD // UE_VECTOR_SIZE  # 64//64 = 1
+        if gpr_flash is not None:
+            self.generate_instruction_add_set(gpr_flash, _s1_buckets)
         for h in range(ENC_S1_HEADS):
             flash_attention_batched(
                 self, num_batches=ENC_S1_NWIN, head_dim=_HP, seq_len=_WPAD,
@@ -2291,86 +2336,110 @@ class MobileSAM_UE(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.S1_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S1_FLASH_SCRATCH,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True)
+                bias_shared=True,
+                gpr_bucket_idx=gpr_flash,
+                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
+                num_buckets=_s1_buckets)
 
-        # multihead merge: (heads, NTOK, HEAD_PAD) → (NTOK, C)
         multihead_merge_dram(self, self.S1_ATTN_DRAM, self.S1_MERGED_DRAM, self.S1_MH_TEMP,
                              _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP,
                              UNPAD_WEIGHT_ADDR=w["unpad"])
 
         # proj
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=ENC_S1_C, N=ENC_S1_C,
                              A_DRAM_ADDR=self.S1_MERGED_DRAM, B_DRAM_ADDR=w["proj_w"],
                              OUTPUT_DRAM_ADDR=self.S1_PROJ_DRAM,
-                             C_DRAM_ADDR=w["proj_b"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["proj_b"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
 
-        # window reverse → S1_REV_DRAM (zero-fill first, then scatter)
         dram_zero_fill(self, self.S1_REV_DRAM, _HW * ENC_S1_C)
         window_reverse_dram(self, self.S1_PROJ_DRAM, self.S1_REV_DRAM,
                             ENC_S1_H, ENC_S1_W, ENC_S1_C, ENC_S1_WS,
                             ENC_S1_NH, ENC_S1_NW, ENC_S1_WIN_PAD)
 
-        # attn residual: x_in + window_reverse → OUTPUT_DRAM (temporarily, reuse as post_attn)
         eltwise_add_dram(self, INPUT_DRAM, self.S1_REV_DRAM, OUTPUT_DRAM, _HW * ENC_S1_C)
 
-        # local_conv (replaces x — no residual): depthwise 3×3 stride1
         conv2d_3x3_dw_dram(self, OUTPUT_DRAM, self.S1_REV_DRAM, self.S1_LC_IM2COL,
                            w["lc_w"], w["lc_b"], w["lc_zero"],
                            ENC_S1_H, ENC_S1_W, ENC_S1_C)
 
-        # mlp norm in batches
-        for _off in range(0, _HW, _LN_BATCH):
-            _take = min(_LN_BATCH, _HW - _off)
-            self.layer_norm_core_dram(
-                M=_take, N=ENC_S1_C,
-                A_DRAM_ADDR=self.S1_REV_DRAM + _off * ENC_S1_C * _BPE,
-                OUTPUT_DRAM_ADDR=OUTPUT_DRAM  + _off * ENC_S1_C * _BPE,
-                GAMMA_DRAM_ADDR=w["mn_g"], BETA_DRAM_ADDR=w["mn_b"])
+        # mlp norm
+        _ln_hw(self.S1_REV_DRAM, OUTPUT_DRAM, w["mn_g"], w["mn_b"])
+
+        _set_hw()
         self.matmat_mul_core(M=_HW, K=ENC_S1_C, N=ENC_S1_MLP_HID,
                              A_DRAM_ADDR=OUTPUT_DRAM, B_DRAM_ADDR=w["fc1_w"],
                              OUTPUT_DRAM_ADDR=self.S1_MLP_FC1_DRAM,
                              C_DRAM_ADDR=w["fc1_b"], bias_mode="broadcast_N",
-                             gelu_enable=True)
+                             gelu_enable=True, gpr_M_reg=gpr_hw)
+        _set_hw()
         self.matmat_mul_core(M=_HW, K=ENC_S1_MLP_HID, N=ENC_S1_C,
                              A_DRAM_ADDR=self.S1_MLP_FC1_DRAM, B_DRAM_ADDR=w["fc2_w"],
                              OUTPUT_DRAM_ADDR=OUTPUT_DRAM,
-                             C_DRAM_ADDR=w["fc2_b"], bias_mode="broadcast_N")
-        # mlp residual: local_conv_out + mlp_out → OUTPUT_DRAM
+                             C_DRAM_ADDR=w["fc2_b"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_hw)
         eltwise_add_dram(self, self.S1_REV_DRAM, OUTPUT_DRAM, OUTPUT_DRAM, _HW * ENC_S1_C)
 
-    def _run_s2_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int) -> None:
+    def _run_s2_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
+                      gpr_ntok: int = None, gpr_hw: int = None,
+                      gpr_flash: int = None) -> None:
         """Run one Stage-2 TinyViTBlock: C=160 padded to 192, 5 heads, ws=14."""
         _HW   = ENC_S2_H * ENC_S2_W          # 4096
         _NTOK = ENC_S2_NWIN * ENC_S2_WIN_PAD  # 6400
         _WPAD = ENC_S2_WIN_PAD                 # 256
         _HP   = ENC_S2_HEAD_PAD                # 64
         _CP   = ENC_S2_C_PAD                   # 192
-        _LN_BATCH = 512
 
-        # attn norm on spatial tokens BEFORE window partition
-        for _off in range(0, _HW, _LN_BATCH):
-            _take = min(_LN_BATCH, _HW - _off)
-            self.layer_norm_core_dram(
-                M=_take, N=_CP,
-                A_DRAM_ADDR=INPUT_DRAM + _off * _CP * _BPE,
-                OUTPUT_DRAM_ADDR=self.S2_LN_DRAM + _off * _CP * _BPE,
-                GAMMA_DRAM_ADDR=w["an_g"], BETA_DRAM_ADDR=w["an_b"])
+        def _set_ntok():
+            if gpr_ntok is not None:
+                self._isa_reg_counter = gpr_ntok + 1
+                self.reset_inst_ptr_counter()
+                self.generate_instruction_add_set(dst_reg_idx=gpr_ntok, immediate_value=_NTOK)
+
+        def _set_hw():
+            if gpr_hw is not None:
+                self._isa_reg_counter = gpr_hw + 1
+                self.reset_inst_ptr_counter()
+                self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_HW)
+
+        def _ln_hw(src, dst, g, b):
+            _reg = gpr_hw if gpr_hw is not None else 14
+            _ops = 4 + (1 if g is not None else 0) + (1 if b is not None else 0)
+            _ideal = min(URAM_NEAR_FULL_ELEMENTS // _CP, _HW, (256 - 4) // _ops)
+            _cs = _ideal
+            while _HW % _cs != 0:
+                _cs -= 1
+            self._isa_reg_counter = _reg + 1
+            self.reset_inst_ptr_counter()
+            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW // _cs)
+            self.layer_norm_core_dram(M=_HW, N=_CP, A_DRAM_ADDR=src,
+                OUTPUT_DRAM_ADDR=dst, GAMMA_DRAM_ADDR=g, BETA_DRAM_ADDR=b,
+                gpr_M_reg=_reg)
+
+        _ln_hw(INPUT_DRAM, self.S2_LN_DRAM, w["an_g"], w["an_b"])
 
         window_partition_dram(self, self.S2_LN_DRAM, self.S2_WIN_DRAM,
                               ENC_S2_H, ENC_S2_W, _CP, ENC_S2_WS)
 
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_CP, N=_CP,
                              A_DRAM_ADDR=self.S2_WIN_DRAM, B_DRAM_ADDR=w["W_q"],
                              OUTPUT_DRAM_ADDR=self.S2_Q_DRAM,
-                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_CP, N=_CP,
                              A_DRAM_ADDR=self.S2_WIN_DRAM, B_DRAM_ADDR=w["W_k"],
                              OUTPUT_DRAM_ADDR=self.S2_K_DRAM,
-                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_CP, N=_CP,
                              A_DRAM_ADDR=self.S2_WIN_DRAM, B_DRAM_ADDR=w["W_v"],
                              OUTPUT_DRAM_ADDR=self.S2_V_DRAM,
-                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
 
         multihead_reshape_dram(self, self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM, self.S2_MH_TEMP,
                                _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, input_row_stride=_CP)
@@ -2382,6 +2451,9 @@ class MobileSAM_UE(UnifiedEngine):
                            ENC_S2_HEADS * _NTOK * _HP)
 
         _head_stride = ENC_S2_NWIN * _WPAD * _HP * _BPE
+        _s2_buckets = _WPAD // UE_VECTOR_SIZE  # 256//64 = 4
+        if gpr_flash is not None:
+            self.generate_instruction_add_set(gpr_flash, _s2_buckets)
         for h in range(ENC_S2_HEADS):
             flash_attention_batched(
                 self, num_batches=ENC_S2_NWIN, head_dim=_HP, seq_len=_WPAD,
@@ -2391,21 +2463,27 @@ class MobileSAM_UE(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.S2_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S2_FLASH_SCRATCH,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True)
+                bias_shared=True,
+                gpr_bucket_idx=gpr_flash,
+                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
+                num_buckets=_s2_buckets)
 
-        # merge: permute (heads,NTOK,HP) → (NTOK,heads*HP), then matmul → (NTOK, C_PAD=192)
         self.bf16_permute_core(dim_0=ENC_S2_HEADS, dim_1=_NTOK, dim_2=_HP,
                                INPUT_DRAM_ADDR=self.S2_ATTN_DRAM,
                                OUTPUT_DRAM_ADDR=self.S2_MH_TEMP)
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=ENC_S2_HEADS * _HP, N=_CP,
                              A_DRAM_ADDR=self.S2_MH_TEMP,
                              B_DRAM_ADDR=w["unpad"],
-                             OUTPUT_DRAM_ADDR=self.S2_MERGED_DRAM)
+                             OUTPUT_DRAM_ADDR=self.S2_MERGED_DRAM,
+                             gpr_M_reg=gpr_ntok)
 
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_CP, N=_CP,
                              A_DRAM_ADDR=self.S2_MERGED_DRAM, B_DRAM_ADDR=w["proj_w"],
                              OUTPUT_DRAM_ADDR=self.S2_PROJ_DRAM,
-                             C_DRAM_ADDR=w["proj_b"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["proj_b"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
 
         dram_zero_fill(self, self.S2_REV_DRAM, _HW * _CP)
         window_reverse_dram(self, self.S2_PROJ_DRAM, self.S2_REV_DRAM,
@@ -2418,57 +2496,81 @@ class MobileSAM_UE(UnifiedEngine):
                            w["lc_w"], w["lc_b"], w["lc_zero"],
                            ENC_S2_H, ENC_S2_W, _CP)
 
-        for _off in range(0, _HW, _LN_BATCH):
-            _take = min(_LN_BATCH, _HW - _off)
-            self.layer_norm_core_dram(
-                M=_take, N=_CP,
-                A_DRAM_ADDR=self.S2_REV_DRAM + _off * _CP * _BPE,
-                OUTPUT_DRAM_ADDR=OUTPUT_DRAM  + _off * _CP * _BPE,
-                GAMMA_DRAM_ADDR=w["mn_g"], BETA_DRAM_ADDR=w["mn_b"])
+        _ln_hw(self.S2_REV_DRAM, OUTPUT_DRAM, w["mn_g"], w["mn_b"])
 
+        _set_hw()
         self.matmat_mul_core(M=_HW, K=_CP, N=ENC_S2_MLP_HID,
                              A_DRAM_ADDR=OUTPUT_DRAM, B_DRAM_ADDR=w["fc1_w"],
                              OUTPUT_DRAM_ADDR=self.S2_MLP_FC1_DRAM,
                              C_DRAM_ADDR=w["fc1_b"], bias_mode="broadcast_N",
-                             gelu_enable=True)
+                             gelu_enable=True, gpr_M_reg=gpr_hw)
+        _set_hw()
         self.matmat_mul_core(M=_HW, K=ENC_S2_MLP_HID, N=_CP,
                              A_DRAM_ADDR=self.S2_MLP_FC1_DRAM, B_DRAM_ADDR=w["fc2_w"],
                              OUTPUT_DRAM_ADDR=OUTPUT_DRAM,
-                             C_DRAM_ADDR=w["fc2_b"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["fc2_b"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_hw)
         eltwise_add_dram(self, self.S2_REV_DRAM, OUTPUT_DRAM, OUTPUT_DRAM, _HW * _CP)
 
-    def _run_s3_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int) -> None:
+    def _run_s3_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
+                      gpr_ntok: int = None, gpr_hw: int = None,
+                      gpr_flash: int = None) -> None:
         """Run one Stage-3 TinyViTBlock: C=320, 10 heads, ws=7. No padding needed."""
         _HW   = ENC_S3_H * ENC_S3_W           # 4096
         _NTOK = ENC_S3_NWIN * ENC_S3_WIN_PAD   # 6400
         _WPAD = ENC_S3_WIN_PAD                  # 64
         _HP   = ENC_S3_HEAD_PAD                 # 64
         _C    = ENC_S3_C                        # 320
-        _LN_BATCH = 512
 
-        for _off in range(0, _HW, _LN_BATCH):
-            _take = min(_LN_BATCH, _HW - _off)
-            self.layer_norm_core_dram(
-                M=_take, N=_C,
-                A_DRAM_ADDR=INPUT_DRAM + _off * _C * _BPE,
-                OUTPUT_DRAM_ADDR=self.S3_LN_DRAM + _off * _C * _BPE,
-                GAMMA_DRAM_ADDR=w["an_g"], BETA_DRAM_ADDR=w["an_b"])
+        def _set_ntok():
+            if gpr_ntok is not None:
+                self._isa_reg_counter = gpr_ntok + 1
+                self.reset_inst_ptr_counter()
+                self.generate_instruction_add_set(dst_reg_idx=gpr_ntok, immediate_value=_NTOK)
+
+        def _set_hw():
+            if gpr_hw is not None:
+                self._isa_reg_counter = gpr_hw + 1
+                self.reset_inst_ptr_counter()
+                self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_HW)
+
+        def _ln_hw(src, dst, g, b):
+            _reg = gpr_hw if gpr_hw is not None else 14
+            _ops = 4 + (1 if g is not None else 0) + (1 if b is not None else 0)
+            _ideal = min(URAM_NEAR_FULL_ELEMENTS // _C, _HW, (256 - 4) // _ops)
+            _cs = _ideal
+            while _HW % _cs != 0:
+                _cs -= 1
+            self._isa_reg_counter = _reg + 1
+            self.reset_inst_ptr_counter()
+            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW // _cs)
+            self.layer_norm_core_dram(M=_HW, N=_C, A_DRAM_ADDR=src,
+                OUTPUT_DRAM_ADDR=dst, GAMMA_DRAM_ADDR=g, BETA_DRAM_ADDR=b,
+                gpr_M_reg=_reg)
+
+        _ln_hw(INPUT_DRAM, self.S3_LN_DRAM, w["an_g"], w["an_b"])
 
         window_partition_dram(self, self.S3_LN_DRAM, self.S3_WIN_DRAM,
                               ENC_S3_H, ENC_S3_W, _C, ENC_S3_WS)
 
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_C, N=_C,
                              A_DRAM_ADDR=self.S3_WIN_DRAM, B_DRAM_ADDR=w["W_q"],
                              OUTPUT_DRAM_ADDR=self.S3_Q_DRAM,
-                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_C, N=_C,
                              A_DRAM_ADDR=self.S3_WIN_DRAM, B_DRAM_ADDR=w["W_k"],
                              OUTPUT_DRAM_ADDR=self.S3_K_DRAM,
-                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_C, N=_C,
                              A_DRAM_ADDR=self.S3_WIN_DRAM, B_DRAM_ADDR=w["W_v"],
                              OUTPUT_DRAM_ADDR=self.S3_V_DRAM,
-                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
 
         multihead_reshape_dram(self, self.S3_Q_DRAM, self.S3_Q_HEAD_DRAM, self.S3_MH_TEMP,
                                _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP)
@@ -2480,6 +2582,9 @@ class MobileSAM_UE(UnifiedEngine):
                            ENC_S3_HEADS * _NTOK * _HP)
 
         _head_stride = ENC_S3_NWIN * _WPAD * _HP * _BPE
+        _s3_buckets = _WPAD // UE_VECTOR_SIZE  # 64//64 = 1
+        if gpr_flash is not None:
+            self.generate_instruction_add_set(gpr_flash, _s3_buckets)
         for h in range(ENC_S3_HEADS):
             flash_attention_batched(
                 self, num_batches=ENC_S3_NWIN, head_dim=_HP, seq_len=_WPAD,
@@ -2489,16 +2594,21 @@ class MobileSAM_UE(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.S3_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S3_FLASH_SCRATCH,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True)
+                bias_shared=True,
+                gpr_bucket_idx=gpr_flash,
+                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
+                num_buckets=_s3_buckets)
 
         multihead_merge_dram(self, self.S3_ATTN_DRAM, self.S3_MERGED_DRAM, self.S3_MH_TEMP,
                              _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP,
                              UNPAD_WEIGHT_ADDR=w["unpad"])
 
+        _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_C, N=_C,
                              A_DRAM_ADDR=self.S3_MERGED_DRAM, B_DRAM_ADDR=w["proj_w"],
                              OUTPUT_DRAM_ADDR=self.S3_PROJ_DRAM,
-                             C_DRAM_ADDR=w["proj_b"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["proj_b"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_ntok)
 
         dram_zero_fill(self, self.S3_REV_DRAM, _HW * _C)
         window_reverse_dram(self, self.S3_PROJ_DRAM, self.S3_REV_DRAM,
@@ -2511,29 +2621,34 @@ class MobileSAM_UE(UnifiedEngine):
                            w["lc_w"], w["lc_b"], w["lc_zero"],
                            ENC_S3_H, ENC_S3_W, _C)
 
-        for _off in range(0, _HW, _LN_BATCH):
-            _take = min(_LN_BATCH, _HW - _off)
-            self.layer_norm_core_dram(
-                M=_take, N=_C,
-                A_DRAM_ADDR=self.S3_REV_DRAM + _off * _C * _BPE,
-                OUTPUT_DRAM_ADDR=OUTPUT_DRAM  + _off * _C * _BPE,
-                GAMMA_DRAM_ADDR=w["mn_g"], BETA_DRAM_ADDR=w["mn_b"])
+        _ln_hw(self.S3_REV_DRAM, OUTPUT_DRAM, w["mn_g"], w["mn_b"])
 
+        _set_hw()
         self.matmat_mul_core(M=_HW, K=_C, N=ENC_S3_MLP_HID,
                              A_DRAM_ADDR=OUTPUT_DRAM, B_DRAM_ADDR=w["fc1_w"],
                              OUTPUT_DRAM_ADDR=self.S3_MLP_FC1_DRAM,
                              C_DRAM_ADDR=w["fc1_b"], bias_mode="broadcast_N",
-                             gelu_enable=True)
+                             gelu_enable=True, gpr_M_reg=gpr_hw)
+        _set_hw()
         self.matmat_mul_core(M=_HW, K=ENC_S3_MLP_HID, N=_C,
                              A_DRAM_ADDR=self.S3_MLP_FC1_DRAM, B_DRAM_ADDR=w["fc2_w"],
                              OUTPUT_DRAM_ADDR=OUTPUT_DRAM,
-                             C_DRAM_ADDR=w["fc2_b"], bias_mode="broadcast_N")
+                             C_DRAM_ADDR=w["fc2_b"], bias_mode="broadcast_N",
+                             gpr_M_reg=gpr_hw)
         eltwise_add_dram(self, self.S3_REV_DRAM, OUTPUT_DRAM, OUTPUT_DRAM, _HW * _C)
 
     def compile_encoder(self) -> int:
         """Compile all encoder instructions into a single DRAM program. Returns prog addr."""
         self.start_capture()
-        self._encoder_ops(lambda: None)  # no flush — one continuous instruction stream
+        # GPR 1: Stage-0 M=ENC_S0_H*ENC_S0_W=65536 (1x1 convs + identity matmuls)
+        # GPR 2: Stage 1-3 NTOK (window tokens)
+        # GPR 3: Stage 1-3 HW (spatial after window merge)
+        # GPR 4: flash attention bucket index (1=seq64, 4=seq256)
+        gpr_s0    = self.alloc_isa_reg()
+        gpr_ntok  = self.alloc_isa_reg()
+        gpr_hw    = self.alloc_isa_reg()
+        gpr_flash = self.alloc_isa_reg()
+        self._encoder_ops(lambda: None, gpr_s0=gpr_s0, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
         self.stop_capture()
         self.generate_instruction_halt()
         prog = self.get_program_dram_addr()
@@ -2549,12 +2664,294 @@ class MobileSAM_UE(UnifiedEngine):
         img_pad[:, :3] = img_hwc.reshape(-1, 3)
         self.dma_to_accelerator_memory(self.PE_IN_DRAM, img_pad.reshape(-1))
         self.start_execute_from_dram(prog)
-        self.wait_queue(120.0)
+        self.wait_queue(600.0)
 
     def encode(self, image_t: torch.Tensor):
         """Compile + execute in one call — single instruction stream."""
         prog = self.compile_encoder()
         self.execute_encoder(prog, image_t)
+
+    # ------------------------------------------------------------------
+    # Debug: step through encoder stage by stage, assert no NaNs
+    # ------------------------------------------------------------------
+
+    def _compile_run(self, ops_fn, image_t: torch.Tensor | None = None, timeout: float = 120.0) -> None:
+        """Compile ops_fn() as a single program, execute, wait."""
+        self.start_capture()
+        ops_fn()
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.clear_capture_buffer()
+        if image_t is not None:
+            img_hwc = image_t[0].permute(1, 2, 0).contiguous()
+            img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, ENC_CIN_PAD, dtype=torch.bfloat16)
+            img_pad[:, :3] = img_hwc.reshape(-1, 3)
+            self.dma_to_accelerator_memory(self.PE_IN_DRAM, img_pad.reshape(-1))
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout)
+
+    def _read_tensor(self, addr: int, n_elements: int) -> torch.Tensor:
+        """DMA-read n_elements bf16 values from addr."""
+        buf = bytearray(n_elements * 2)
+        self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+        return torch.frombuffer(buf, dtype=torch.bfloat16).clone()
+
+    def _assert_no_nan(self, label: str, addr: int, n_elements: int,
+                       shape: tuple | None = None) -> None:
+        t = self._read_tensor(addr, n_elements)
+        n_nan = torch.isnan(t).sum().item()
+        n_inf = torch.isinf(t).sum().item()
+        if n_nan > 0 or n_inf > 0:
+            if shape is not None:
+                tv = t.reshape(shape)
+                nan_mask = torch.isnan(tv).any(dim=-1)
+                positions = nan_mask.nonzero(as_tuple=False)
+                _original_print(f"  NaN rows: {positions.squeeze(-1).tolist()[:20]} ({len(positions)}/{shape[0]} total)")
+            finite = t[torch.isfinite(t)]
+            max_abs_str = f"{finite.abs().max().item():.4f}" if finite.numel() > 0 else "all-NaN"
+            assert False, (
+                f"NaN/Inf after {label}: {n_nan} NaNs, {n_inf} Infs "
+                f"(max_abs={max_abs_str})"
+            )
+        _original_print(f"  [OK] {label}: max_abs={t.abs().max().item():.4f}")
+
+    def debug_encode(self, image_t: torch.Tensor) -> None:
+        """Run encoder stage-by-stage, asserting no NaNs at each checkpoint."""
+        _original_print("debug_encode: stepping through encoder ...")
+
+        # conv0 (patch embed, first stride-2)
+        self._compile_run(lambda: conv2d_3x3_stride2_dram(
+            self, self.PE_IN_DRAM, self.PE_MID_DRAM, self.PE_IM2COL,
+            self.PE_W0_DRAM, self.PE_B0_DRAM, self.PE_ZERO_DRAM,
+            ENC_IN_H, ENC_IN_W, ENC_CIN_PAD, ENC_C0P, gelu_enable=True),
+            image_t=image_t)
+        self._assert_no_nan("patch_embed conv0 (PE_MID)", self.PE_MID_DRAM,
+                            (ENC_IN_H // 2) * (ENC_IN_W // 2) * ENC_C0P,
+                            shape=(ENC_IN_H // 2, ENC_IN_W // 2, ENC_C0P))
+
+        # zero PE_OUT_DRAM before conv2 so stale DRAM can't masquerade as NaN
+        self.dma_to_accelerator_memory(
+            self.PE_OUT_DRAM,
+            torch.zeros(ENC_S0_H * ENC_S0_W * ENC_C0P, dtype=torch.bfloat16))
+
+        # conv2 (patch embed, second stride-2)
+        self._compile_run(lambda: conv2d_3x3_stride2_dram(
+            self, self.PE_MID_DRAM, self.PE_OUT_DRAM, self.PE_IM2COL,
+            self.PE_W2_DRAM, self.PE_B2_DRAM, self.PE_ZERO_DRAM,
+            ENC_IN_H // 2, ENC_IN_W // 2, ENC_C0P, ENC_C0P))
+        self._assert_no_nan("patch_embed conv2 (PE_OUT)", self.PE_OUT_DRAM,
+                            ENC_S0_H * ENC_S0_W * ENC_C0P,
+                            shape=(ENC_S0_H, ENC_S0_W, ENC_C0P))
+
+        # Stage 0 Block 0 — pre-zero all output/intermediate buffers to flush stale NaN
+        for addr, n in [
+            (self.S0_EXP_DRAM,    ENC_S0_H * ENC_S0_W * ENC_S0_C_EXP),
+            (self.S0_DW_DRAM,     ENC_S0_H * ENC_S0_W * ENC_S0_C_EXP),
+            (self.S0B0_OUT_DRAM,  ENC_S0_H * ENC_S0_W * ENC_C0P),
+        ]:
+            self.dma_to_accelerator_memory(addr, torch.zeros(n, dtype=torch.bfloat16))
+
+        def _s0b0():
+            conv2d_1x1_dram(self, self.PE_OUT_DRAM, self.S0_EXP_DRAM,
+                            self.S0B0_C1W, self.S0B0_C1B,
+                            ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S0_C_EXP, gelu_enable=True)
+            conv2d_3x3_dw_dram(self, self.S0_EXP_DRAM, self.S0_DW_DRAM, self.S0_IM2COL,
+                               self.S0B0_C2W, self.S0B0_C2B, self.S0_ZERO_DRAM,
+                               ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, gelu_enable=True)
+            conv2d_1x1_dram(self, self.S0_DW_DRAM, self.S0B0_OUT_DRAM,
+                            self.S0B0_C3W, self.S0B0_C3B,
+                            ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, ENC_C0P)
+            eltwise_add_dram(self, self.PE_OUT_DRAM, self.S0B0_OUT_DRAM,
+                             self.S0B0_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+            self.matmat_mul_core(
+                M=ENC_S0_H * ENC_S0_W, K=ENC_C0P, N=ENC_C0P,
+                A_DRAM_ADDR=self.S0B0_OUT_DRAM, B_DRAM_ADDR=self.IDENTITY_DRAM,
+                OUTPUT_DRAM_ADDR=self.S0B0_OUT_DRAM, gelu_enable=True)
+        self._compile_run(_s0b0)
+        self._assert_no_nan("S0B0_OUT", self.S0B0_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+
+        # Stage 0 Block 1
+        def _s0b1():
+            conv2d_1x1_dram(self, self.S0B0_OUT_DRAM, self.S0_EXP_DRAM,
+                            self.S0B1_C1W, self.S0B1_C1B,
+                            ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S0_C_EXP, gelu_enable=True)
+            conv2d_3x3_dw_dram(self, self.S0_EXP_DRAM, self.S0_DW_DRAM, self.S0_IM2COL,
+                               self.S0B1_C2W, self.S0B1_C2B, self.S0_ZERO_DRAM,
+                               ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, gelu_enable=True)
+            conv2d_1x1_dram(self, self.S0_DW_DRAM, self.S0B1_OUT_DRAM,
+                            self.S0B1_C3W, self.S0B1_C3B,
+                            ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, ENC_C0P)
+            eltwise_add_dram(self, self.S0B0_OUT_DRAM, self.S0B1_OUT_DRAM,
+                             self.S0B1_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+            self.matmat_mul_core(
+                M=ENC_S0_H * ENC_S0_W, K=ENC_C0P, N=ENC_C0P,
+                A_DRAM_ADDR=self.S0B1_OUT_DRAM, B_DRAM_ADDR=self.IDENTITY_DRAM,
+                OUTPUT_DRAM_ADDR=self.S0B1_OUT_DRAM, gelu_enable=True)
+        self._compile_run(_s0b1)
+        self._assert_no_nan("S0B1_OUT", self.S0B1_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+
+        # PatchMerging 0→1
+        def _pm01():
+            conv2d_1x1_dram(self, self.S0B1_OUT_DRAM, self.PM01_EXP_DRAM,
+                            self.PM01_W1_DRAM, self.PM01_B1_DRAM,
+                            ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S1_C, gelu_enable=True)
+            conv2d_3x3_dw_stride2_dram(
+                self, self.PM01_EXP_DRAM, self.PM01_DW_DRAM, self.PM01_IM2COL_DRAM,
+                self.PM01_W2_DRAM, self.PM01_B2_DRAM, self.PM01_ZERO_DRAM,
+                ENC_S0_H, ENC_S0_W, ENC_S1_C, gelu_enable=True)
+            conv2d_1x1_dram(self, self.PM01_DW_DRAM, self.PM01_OUT_DRAM,
+                            self.PM01_W3_DRAM, self.PM01_B3_DRAM,
+                            ENC_S1_H, ENC_S1_W, ENC_S1_C, ENC_S1_C)
+        self._compile_run(_pm01)
+        self._assert_no_nan("PM01_OUT", self.PM01_OUT_DRAM, ENC_S1_H * ENC_S1_W * ENC_S1_C)
+
+        # Stage 1 blocks
+        for bi, (inp, out, label) in enumerate([
+            (self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, "S1B0_OUT"),
+            (self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, "S1B1_OUT"),
+        ]):
+            self._compile_run(lambda i=bi, _in=inp, _out=out: self._run_s1_block(self.S1B[i], _in, _out))
+            self._assert_no_nan(label, out, ENC_S1_H * ENC_S1_W * ENC_S1_C)
+
+        # PatchMerging 1→2
+        _CP = ENC_S2_C_PAD
+        def _pm12():
+            conv2d_1x1_dram(self, self.S1B1_OUT_DRAM, self.PM12_EXP_DRAM,
+                            self.PM12_W1_DRAM, self.PM12_B1_DRAM,
+                            ENC_S1_H, ENC_S1_W, ENC_S1_C, _CP, gelu_enable=True)
+            conv2d_3x3_dw_stride2_dram(self, self.PM12_EXP_DRAM, self.PM12_DW_DRAM,
+                                       self.PM12_IM2COL_DRAM,
+                                       self.PM12_W2_DRAM, self.PM12_B2_DRAM, self.PM12_ZERO_DRAM,
+                                       ENC_S1_H, ENC_S1_W, _CP, gelu_enable=True)
+            conv2d_1x1_dram(self, self.PM12_DW_DRAM, self.PM12_OUT_DRAM,
+                            self.PM12_W3_DRAM, self.PM12_B3_DRAM,
+                            ENC_S2_H, ENC_S2_W, _CP, _CP, gelu_enable=False)
+        self._compile_run(_pm12)
+        self._assert_no_nan("PM12_OUT", self.PM12_OUT_DRAM, ENC_S2_H * ENC_S2_W * _CP)
+
+        # Stage 2 blocks
+        # S2B0 step-by-step
+        _w2 = self.S2B[0]; _in2 = self.PM12_OUT_DRAM
+        _HW2 = ENC_S2_H * ENC_S2_W; _NTOK2 = ENC_S2_NWIN * ENC_S2_WIN_PAD
+        _HP2 = ENC_S2_HEAD_PAD; _HD2 = ENC_S2_HEAD_DIM
+
+        def _s2b0_ln():
+            _ops = 4 + 2  # gamma + beta
+            _ideal = min(URAM_NEAR_FULL_ELEMENTS // _CP, _HW2, (256 - 4) // _ops)
+            _cs = _ideal
+            while _HW2 % _cs != 0:
+                _cs -= 1
+            _original_print(f"  [DBG] _s2b0_ln: HW2={_HW2} CP={_CP} chunk_size={_cs} n_chunks={_HW2//_cs} GPR14={_HW2//_cs}")
+            self._isa_reg_counter = 15; self.reset_inst_ptr_counter()
+            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_HW2 // _cs)
+            self.layer_norm_core_dram(M=_HW2, N=_CP, A_DRAM_ADDR=_in2,
+                OUTPUT_DRAM_ADDR=self.S2_LN_DRAM, GAMMA_DRAM_ADDR=_w2["an_g"],
+                BETA_DRAM_ADDR=_w2["an_b"], gpr_M_reg=14)
+        self._compile_run(_s2b0_ln)
+        self._assert_no_nan("S2B0 attn_ln", self.S2_LN_DRAM, _HW2 * _CP, shape=(_HW2, _CP))
+
+        self._compile_run(lambda: window_partition_dram(
+            self, self.S2_LN_DRAM, self.S2_WIN_DRAM, ENC_S2_H, ENC_S2_W, _CP, ENC_S2_WS))
+        self._assert_no_nan("S2B0 win_part", self.S2_WIN_DRAM, _NTOK2 * _CP)
+
+        def _s2b0_qkv():
+            for proj, dst in [("W_q","S2_Q_DRAM"),("W_k","S2_K_DRAM"),("W_v","S2_V_DRAM")]:
+                self.matmat_mul_core(M=_NTOK2, K=_CP, N=_CP,
+                    A_DRAM_ADDR=self.S2_WIN_DRAM, B_DRAM_ADDR=_w2[proj],
+                    OUTPUT_DRAM_ADDR=getattr(self, dst),
+                    C_DRAM_ADDR=_w2[proj.replace("W_","b_")], bias_mode="broadcast_N")
+        self._compile_run(_s2b0_qkv)
+        self._assert_no_nan("S2B0 Q", self.S2_Q_DRAM, _NTOK2 * _CP)
+        self._assert_no_nan("S2B0 K", self.S2_K_DRAM, _NTOK2 * _CP)
+        self._assert_no_nan("S2B0 V", self.S2_V_DRAM, _NTOK2 * _CP)
+
+        def _s2b0_flash():
+            for src, dst in [(self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM),
+                              (self.S2_K_DRAM, self.S2_K_HEAD_DRAM),
+                              (self.S2_V_DRAM, self.S2_V_HEAD_DRAM)]:
+                multihead_reshape_dram(self, src, dst, self.S2_MH_TEMP,
+                    _NTOK2, ENC_S2_HEADS, _HD2, _HP2, input_row_stride=_CP)
+            broadcast_mul_dram(self, self.S2_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
+                               ENC_S2_HEADS * _NTOK2 * _HP2)
+            _hs = ENC_S2_NWIN * ENC_S2_WIN_PAD * _HP2 * _BPE
+            for h in range(ENC_S2_HEADS):
+                flash_attention_batched(self, num_batches=ENC_S2_NWIN, head_dim=_HP2,
+                    seq_len=ENC_S2_WIN_PAD,
+                    Q_DRAM_ADDR=self.S2_Q_HEAD_DRAM + h*_hs,
+                    K_DRAM_ADDR=self.S2_K_HEAD_DRAM + h*_hs,
+                    V_DRAM_ADDR=self.S2_V_HEAD_DRAM + h*_hs,
+                    OUTPUT_DRAM_ADDR=self.S2_ATTN_DRAM + h*_hs,
+                    SCRATCH_DRAM_ADDR=self.S2_FLASH_SCRATCH,
+                    BIAS_DRAM_ADDR=_w2["bias"] + h*ENC_S2_WIN_PAD*ENC_S2_WIN_PAD*_BPE,
+                    bias_shared=True, num_buckets=ENC_S2_WIN_PAD//UE_VECTOR_SIZE)
+        self._compile_run(_s2b0_flash)
+        self._assert_no_nan("S2B0 attn_out", self.S2_ATTN_DRAM, ENC_S2_HEADS * _NTOK2 * _HP2)
+
+        self._compile_run(lambda: self._run_s2_block(self.S2B[0], _in2, self.S2B0_OUT_DRAM))
+        self._assert_no_nan("S2B0_OUT", self.S2B0_OUT_DRAM, _HW2 * _CP)
+
+        _s2_io = [
+            (self.S2B0_OUT_DRAM, self.S2B1_OUT_DRAM, "S2B1_OUT"),
+            (self.S2B1_OUT_DRAM, self.S2B2_OUT_DRAM, "S2B2_OUT"),
+            (self.S2B2_OUT_DRAM, self.S2B3_OUT_DRAM, "S2B3_OUT"),
+            (self.S2B3_OUT_DRAM, self.S2B4_OUT_DRAM, "S2B4_OUT"),
+            (self.S2B4_OUT_DRAM, self.S2B5_OUT_DRAM, "S2B5_OUT"),
+        ]
+        for bi, (_in, _out, label) in enumerate(_s2_io, start=1):
+            self._compile_run(lambda i=bi, _i=_in, _o=_out: self._run_s2_block(self.S2B[i], _i, _o))
+            self._assert_no_nan(label, _out, ENC_S2_H * ENC_S2_W * _CP)
+
+        # PatchMerging 2→3
+        _C23 = ENC_S3_C
+        def _pm23():
+            conv2d_1x1_dram(self, self.S2B5_OUT_DRAM, self.PM23_EXP_DRAM,
+                            self.PM23_W1_DRAM, self.PM23_B1_DRAM,
+                            ENC_S2_H, ENC_S2_W, _CP, _C23, gelu_enable=True)
+            conv2d_3x3_dw_dram(self, self.PM23_EXP_DRAM, self.PM23_DW_DRAM, self.PM23_IM2COL_DRAM,
+                               self.PM23_W2_DRAM, self.PM23_B2_DRAM, self.PM23_ZERO_DRAM,
+                               ENC_S2_H, ENC_S2_W, _C23, gelu_enable=True)
+            conv2d_1x1_dram(self, self.PM23_DW_DRAM, self.PM23_OUT_DRAM,
+                            self.PM23_W3_DRAM, self.PM23_B3_DRAM,
+                            ENC_S2_H, ENC_S2_W, _C23, _C23, gelu_enable=False)
+        self._compile_run(_pm23)
+        self._assert_no_nan("PM23_OUT", self.PM23_OUT_DRAM, ENC_S2_H * ENC_S2_W * _C23)
+
+        # Stage 3 blocks
+        for bi, (_in, _out, label) in enumerate([
+            (self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, "S3B0_OUT"),
+            (self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, "S3B1_OUT"),
+        ]):
+            self._compile_run(lambda i=bi, _i=_in, _o=_out: self._run_s3_block(self.S3B[i], _i, _o))
+            self._assert_no_nan(label, _out, ENC_S3_H * ENC_S3_W * ENC_S3_C)
+
+        # Neck
+        _NECK_C_IN  = ENC_S3_C
+        _NECK_C_OUT = 256
+        _NECK_HW    = ENC_S3_H * ENC_S3_W
+        def _neck():
+            _ops = 6
+            _ideal = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _ops)
+            _cs = _ideal
+            while _NECK_HW % _cs != 0:
+                _cs -= 1
+            self.matmat_mul_core(
+                M=_NECK_HW, K=_NECK_C_IN, N=_NECK_C_OUT,
+                A_DRAM_ADDR=self.S3B1_OUT_DRAM, B_DRAM_ADDR=self.NECK_C1_W,
+                OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM)
+            self._isa_reg_counter = 15; self.reset_inst_ptr_counter()
+            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_NECK_HW // _cs)
+            self.layer_norm_core_dram(
+                M=_NECK_HW, N=_NECK_C_OUT,
+                A_DRAM_ADDR=self.NECK_BUF1_DRAM, OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
+                GAMMA_DRAM_ADDR=self.NECK_LN1_G, BETA_DRAM_ADDR=self.NECK_LN1_B,
+                gpr_M_reg=14)
+        self._compile_run(_neck)
+        self._assert_no_nan("neck_conv1+ln1", self.NECK_BUF1_DRAM, _NECK_HW * _NECK_C_OUT)
+
+        _original_print("debug_encode: all checkpoints passed — NaN must be in neck conv2 or later")
 
     # ------------------------------------------------------------------
     # Binary dump (for run_from_bin)
@@ -2633,10 +3030,21 @@ class MobileSAM_UE(UnifiedEngine):
             f.write(all_bytes)
         with open(meta_path, "w") as f:
             json.dump(manifest, f)
-        _original_print(f"  Programs: {len(all_bytes)} bytes → {bin_path}")
+        _sz = len(all_bytes)
+        _sz_str = f"{_sz/1024**3:.2f} GB" if _sz >= 1024**3 else f"{_sz/1024**2:.1f} MB"
+        _original_print(f"  Programs: {_sz_str} ({_sz} bytes) → {bin_path}")
 
-    def _encoder_ops(self, flush):
+    def _encoder_ops(self, flush, gpr_s0: int = None,
+                     gpr_ntok: int = None, gpr_hw: int = None, gpr_flash: int = None):
         """All encoder instruction ops."""
+
+        def _set_s0():
+            if gpr_s0 is not None:
+                self._isa_reg_counter = gpr_s0 + 1
+                self.reset_inst_ptr_counter()
+                self.generate_instruction_add_set(
+                    dst_reg_idx=gpr_s0, immediate_value=ENC_S0_H * ENC_S0_W)
+
         # conv0: (1024×1024, 64) → (512×512, 64)  [Conv-BN-GELU]
         conv2d_3x3_stride2_dram(
             self, self.PE_IN_DRAM, self.PE_MID_DRAM, self.PE_IM2COL,
@@ -2652,65 +3060,78 @@ class MobileSAM_UE(UnifiedEngine):
         flush()
 
         # Stage 0 Block 0 conv1: 1×1 expand (256×256, 64) → (256×256, 256) + GELU
+        _set_s0()
         conv2d_1x1_dram(self, self.PE_OUT_DRAM, self.S0_EXP_DRAM,
                         self.S0B0_C1W, self.S0B0_C1B,
-                        ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S0_C_EXP, gelu_enable=True)
+                        ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S0_C_EXP,
+                        gelu_enable=True, gpr_M_reg=gpr_s0)
 
         # Stage 0 Block 0 conv2: depthwise 3×3 (256×256, 256→256) + GELU
         conv2d_3x3_dw_dram(
             self, self.S0_EXP_DRAM, self.S0_DW_DRAM, self.S0_IM2COL,
             self.S0B0_C2W, self.S0B0_C2B, self.S0_ZERO_DRAM,
-            ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, gelu_enable=True)
+            ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, gelu_enable=True,
+            gpr_M_reg=gpr_s0, ZERO_ROW_DRAM_ADDR=self.S0_ZERO_ROW_DRAM)
 
         flush()
 
         # Stage 0 Block 0 conv3: 1×1 project (256×256, 256→64)
+        _set_s0()
         conv2d_1x1_dram(self, self.S0_DW_DRAM, self.S0B0_OUT_DRAM,
                         self.S0B0_C3W, self.S0B0_C3B,
-                        ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, ENC_C0P)
+                        ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, ENC_C0P,
+                        gpr_M_reg=gpr_s0)
 
-        # residual add: x + conv3_out → S0B0_OUT_DRAM (PE_OUT_DRAM holds patch_embed_out)
+        # residual add + GELU via identity matmul
         eltwise_add_dram(self, self.PE_OUT_DRAM, self.S0B0_OUT_DRAM,
                          self.S0B0_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
-        # GELU in-place: re-run conv3 with gelu fused using identity weight on sum
-        # Simpler: matmul with identity (C,C) to apply GELU row by row
+        _set_s0()
         self.matmat_mul_core(
             M=ENC_S0_H * ENC_S0_W, K=ENC_C0P, N=ENC_C0P,
             A_DRAM_ADDR=self.S0B0_OUT_DRAM,
             B_DRAM_ADDR=self.IDENTITY_DRAM,
             OUTPUT_DRAM_ADDR=self.S0B0_OUT_DRAM,
-            gelu_enable=True)
+            gelu_enable=True, gpr_M_reg=gpr_s0)
 
         flush()
 
         # ---- Stage 0 Block 1 ----
+        _set_s0()
         conv2d_1x1_dram(self, self.S0B0_OUT_DRAM, self.S0_EXP_DRAM,
                         self.S0B1_C1W, self.S0B1_C1B,
-                        ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S0_C_EXP, gelu_enable=True)
+                        ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S0_C_EXP,
+                        gelu_enable=True, gpr_M_reg=gpr_s0)
         conv2d_3x3_dw_dram(self, self.S0_EXP_DRAM, self.S0_DW_DRAM, self.S0_IM2COL,
                            self.S0B1_C2W, self.S0B1_C2B, self.S0_ZERO_DRAM,
-                           ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, gelu_enable=True)
+                           ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, gelu_enable=True,
+                           gpr_M_reg=gpr_s0, ZERO_ROW_DRAM_ADDR=self.S0_ZERO_ROW_DRAM)
+        _set_s0()
         conv2d_1x1_dram(self, self.S0_DW_DRAM, self.S0B1_OUT_DRAM,
                         self.S0B1_C3W, self.S0B1_C3B,
-                        ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, ENC_C0P)
+                        ENC_S0_H, ENC_S0_W, ENC_S0_C_EXP, ENC_C0P,
+                        gpr_M_reg=gpr_s0)
         eltwise_add_dram(self, self.S0B0_OUT_DRAM, self.S0B1_OUT_DRAM,
                          self.S0B1_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
+        _set_s0()
         self.matmat_mul_core(
             M=ENC_S0_H * ENC_S0_W, K=ENC_C0P, N=ENC_C0P,
             A_DRAM_ADDR=self.S0B1_OUT_DRAM,
             B_DRAM_ADDR=self.IDENTITY_DRAM,
             OUTPUT_DRAM_ADDR=self.S0B1_OUT_DRAM,
-            gelu_enable=True)
+            gelu_enable=True, gpr_M_reg=gpr_s0)
         flush()
 
         # ---- PatchMerging 0→1 ----
+        _set_s0()
         conv2d_1x1_dram(self, self.S0B1_OUT_DRAM, self.PM01_EXP_DRAM,
                         self.PM01_W1_DRAM, self.PM01_B1_DRAM,
-                        ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S1_C, gelu_enable=True)
+                        ENC_S0_H, ENC_S0_W, ENC_C0P, ENC_S1_C,
+                        gelu_enable=True, gpr_M_reg=gpr_s0)
         conv2d_3x3_dw_stride2_dram(
             self, self.PM01_EXP_DRAM, self.PM01_DW_DRAM, self.PM01_IM2COL_DRAM,
             self.PM01_W2_DRAM, self.PM01_B2_DRAM, self.PM01_ZERO_DRAM,
-            ENC_S0_H, ENC_S0_W, ENC_S1_C, gelu_enable=True)
+            ENC_S0_H, ENC_S0_W, ENC_S1_C, gelu_enable=True,
+            gpr_M_reg=gpr_s0)
         conv2d_1x1_dram(self, self.PM01_DW_DRAM, self.PM01_OUT_DRAM,
                         self.PM01_W3_DRAM, self.PM01_B3_DRAM,
                         ENC_S1_H, ENC_S1_W, ENC_S1_C, ENC_S1_C)
@@ -2718,9 +3139,9 @@ class MobileSAM_UE(UnifiedEngine):
 
         # ---- Stage 1: 2× TinyViTBlock ----
         _HW1 = ENC_S1_H * ENC_S1_W
-        self._run_s1_block(self.S1B[0], self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM)
+        self._run_s1_block(self.S1B[0], self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
         flush()
-        self._run_s1_block(self.S1B[1], self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM)
+        self._run_s1_block(self.S1B[1], self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
         flush()
 
         # ---- PatchMerging 1→2 ----
@@ -2748,7 +3169,7 @@ class MobileSAM_UE(UnifiedEngine):
             (self.S2B4_OUT_DRAM, self.S2B5_OUT_DRAM),
         ]
         for _bi, (_in, _out) in enumerate(_s2_io):
-            self._run_s2_block(self.S2B[_bi], _in, _out)
+            self._run_s2_block(self.S2B[_bi], _in, _out, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
             flush()
 
         # ---- PatchMerging 2→3 ----
@@ -2767,9 +3188,9 @@ class MobileSAM_UE(UnifiedEngine):
         # ---- Stage 3: 2× TinyViTBlock ----
         _C3  = ENC_S3_C
         _HW3 = ENC_S3_H * ENC_S3_W
-        self._run_s3_block(self.S3B[0], self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM)
+        self._run_s3_block(self.S3B[0], self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
         flush()
-        self._run_s3_block(self.S3B[1], self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM)
+        self._run_s3_block(self.S3B[1], self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
         flush()
 
         # ---- Neck ----
@@ -2786,12 +3207,21 @@ class MobileSAM_UE(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
         )
         # neck.1: LayerNorm2d(256) — normalizes over 256 channels per pixel
+        _neck_ln_ops = 6  # 4 + gamma + beta
+        _neck_ln_ideal = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _neck_ln_ops)
+        _neck_ln_cs = _neck_ln_ideal
+        while _NECK_HW % _neck_ln_cs != 0:
+            _neck_ln_cs -= 1
+        self._isa_reg_counter = gpr_hw + 1
+        self.reset_inst_ptr_counter()
+        self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_NECK_HW // _neck_ln_cs)
         self.layer_norm_core_dram(
             M=_NECK_HW, N=_NECK_C_OUT,
             A_DRAM_ADDR=self.NECK_BUF1_DRAM,
             OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
             GAMMA_DRAM_ADDR=self.NECK_LN1_G,
             BETA_DRAM_ADDR=self.NECK_LN1_B,
+            gpr_M_reg=gpr_hw,
         )
         flush()
 
@@ -2807,12 +3237,16 @@ class MobileSAM_UE(UnifiedEngine):
             H=_NECK_H, W=_NECK_W, C_in=_NECK_C_OUT, C_out=_NECK_C_OUT,
         )
         # neck.3: LayerNorm2d(256)
+        self._isa_reg_counter = gpr_hw + 1
+        self.reset_inst_ptr_counter()
+        self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_NECK_HW // _neck_ln_cs)
         self.layer_norm_core_dram(
             M=_NECK_HW, N=_NECK_C_OUT,
             A_DRAM_ADDR=self.NECK_OUT_DRAM,
             OUTPUT_DRAM_ADDR=self.NECK_OUT_DRAM,
             GAMMA_DRAM_ADDR=self.NECK_LN2_G,
             BETA_DRAM_ADDR=self.NECK_LN2_B,
+            gpr_M_reg=gpr_hw,
         )
         flush()
 
@@ -2844,17 +3278,106 @@ def conv2d_3x3_dw_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR
                         IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
                         ZERO_PAD_DRAM_ADDR: int,
                         H: int, W: int, C: int,
-                        gelu_enable: bool = False) -> None:
+                        gelu_enable: bool = False,
+                        gpr_M_reg: int | None = None,
+                        ZERO_ROW_DRAM_ADDR: int | None = None) -> None:
     """Depthwise Conv2d(kernel=3, stride=1, pad=1, groups=C). HWC layout.
-    C must be a multiple of 64. Processes 64 channels at a time as a block-diagonal matmul.
-    WEIGHT_DRAM_ADDR holds (C//64) block-diagonal matrices each (64, 9*64), contiguous.
-    For each block the matmul output (H*W, 64) is scattered into the correct channel
-    columns of OUTPUT_DRAM (H*W, C) via per-pixel SRAM copy.
+    C must be a multiple of 64. Block-diagonal matmul per 64-channel block.
+    If ZERO_ROW_DRAM_ADDR is provided (W*64 zeros), uses the fast full-row SRAM approach:
+    loads 3 input rows to SRAM per output row and does 9 strided scatter writes to build
+    im2col — reducing Python DMA calls by ~128x vs the per-pixel approach.
     """
     BLK = 64
     K   = 9 * BLK
-    W_CHUNK = max(1, URAM_NEAR_FULL_ELEMENTS // (K + BLK))
     n_blocks = C // BLK
+
+    if ZERO_ROW_DRAM_ADDR is not None:
+        # ---- Fast path: full-row SRAM approach ----
+        # SRAM layout (elements, not bytes):
+        #   [0          : W*BLK]      row h-1
+        #   [W*BLK      : 2*W*BLK]   row h
+        #   [2*W*BLK    : 3*W*BLK]   row h+1
+        #   [3*W*BLK    : 4*W*BLK]   TEMP_OUT (output scatter)
+        #   [4*W*BLK    : 4*W*BLK+BLK]  zero pixel (permanent, for boundary writes)
+        W_BLK_B = W * BLK * _BPE          # bytes per row in SRAM
+        SRAM_ROWS = [0, W_BLK_B, 2 * W_BLK_B]
+        SRAM_TEMP = 3 * W_BLK_B
+        SRAM_ZERO = 4 * W_BLK_B           # permanent zero pixel slot
+        TEMP_OUT  = IM2COL_DRAM_ADDR + W * K * _BPE  # DRAM temp after im2col
+
+        # Load one BLK zero pixel into SRAM once (reused for all boundary writes)
+        ue.accelerator_memory_to_sram(ZERO_PAD_DRAM_ADDR, SRAM_ZERO, BLK)
+
+        for blk in range(n_blocks):
+            c_off  = blk * BLK
+            W_ADDR = WEIGHT_DRAM_ADDR + blk * BLK * K * _BPE
+            B_ADDR = BIAS_DRAM_ADDR   + c_off * _BPE
+
+            for h in range(H):
+                # Load 3 input rows (use ZERO_ROW for out-of-bounds h)
+                for dy_i, dy in enumerate((-1, 0, 1)):
+                    nh = h + dy
+                    if 0 <= nh < H:
+                        src = INPUT_DRAM_ADDR + nh * W * C * _BPE + c_off * _BPE
+                    else:
+                        src = ZERO_ROW_DRAM_ADDR
+                    ue.accelerator_memory_to_sram(src, SRAM_ROWS[dy_i], W * BLK)
+
+                # Build im2col via 9 strided scatter writes (one per patch position)
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        ki = (dy + 1) * 3 + (dx + 1)
+                        sram_row = SRAM_ROWS[dy + 1]
+                        # valid output column range where input col w+dx is in-bounds
+                        w0 = max(0, -dx)          # first valid output col
+                        w1 = min(W, W - dx)       # exclusive last
+                        w_valid = w1 - w0
+
+                        # zero-write for the one boundary pixel (if any)
+                        if dx == -1:
+                            ue.sram_to_accelerator_memory(
+                                SRAM_ZERO,
+                                IM2COL_DRAM_ADDR + 0 * K * _BPE + ki * BLK * _BPE, BLK)
+                        elif dx == 1:
+                            ue.sram_to_accelerator_memory(
+                                SRAM_ZERO,
+                                IM2COL_DRAM_ADDR + (W - 1) * K * _BPE + ki * BLK * _BPE, BLK)
+
+                        # strided scatter: input pixels w0..w1-1 → im2col rows w0..w1-1
+                        # source SRAM: sram_row + max(0,dx)*BLK*_BPE  (first input pixel = w0+dx)
+                        ue.sram_to_accelerator_memory(
+                            sram_row + max(0, dx) * BLK * _BPE,
+                            IM2COL_DRAM_ADDR + w0 * K * _BPE + ki * BLK * _BPE,
+                            w_valid * BLK,
+                            stride_bytes_per_chunk=BLK * _BPE,
+                            stride_jump_bytes=K * _BPE)
+
+                # Matmul: (W, K) × (K, BLK) → TEMP_OUT (W, BLK)
+                if gpr_M_reg is not None:
+                    ue._isa_reg_counter = gpr_M_reg + 1
+                    ue.reset_inst_ptr_counter()
+                    ue.generate_instruction_add_set(dst_reg_idx=gpr_M_reg, immediate_value=W)
+                ue.matmat_mul_core(
+                    M=W, K=K, N=BLK,
+                    A_DRAM_ADDR=IM2COL_DRAM_ADDR,
+                    B_DRAM_ADDR=W_ADDR,
+                    OUTPUT_DRAM_ADDR=TEMP_OUT,
+                    C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                    gelu_enable=gelu_enable,
+                    gpr_M_reg=gpr_M_reg)
+
+                # Scatter output: (W, BLK) → OUTPUT with channel stride C
+                ue.accelerator_memory_to_sram(TEMP_OUT, SRAM_TEMP, W * BLK)
+                ue.sram_to_accelerator_memory(
+                    SRAM_TEMP,
+                    OUTPUT_DRAM_ADDR + h * W * C * _BPE + c_off * _BPE,
+                    W * BLK,
+                    stride_bytes_per_chunk=BLK * _BPE,
+                    stride_jump_bytes=C * _BPE)
+        return
+
+    # ---- Fallback: per-pixel approach (no ZERO_ROW_DRAM provided) ----
+    W_CHUNK = max(1, URAM_NEAR_FULL_ELEMENTS // (K + BLK))
     for blk in range(n_blocks):
         c_off  = blk * BLK
         W_ADDR = WEIGHT_DRAM_ADDR + blk * BLK * K * _BPE
@@ -2878,14 +3401,18 @@ def conv2d_3x3_dw_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR
                                 ue.accelerator_memory_to_sram(ZERO_PAD_DRAM_ADDR, patch_sram, BLK)
                     sram_off += K * _BPE
                 ue.sram_to_accelerator_memory(0x00000, IM2COL_DRAM_ADDR, w_count * K)
+                if gpr_M_reg is not None:
+                    ue._isa_reg_counter = gpr_M_reg + 1
+                    ue.reset_inst_ptr_counter()
+                    ue.generate_instruction_add_set(dst_reg_idx=gpr_M_reg, immediate_value=w_count)
                 ue.matmat_mul_core(
                     M=w_count, K=K, N=BLK,
                     A_DRAM_ADDR=IM2COL_DRAM_ADDR,
                     B_DRAM_ADDR=W_ADDR,
                     OUTPUT_DRAM_ADDR=TEMP_OUT,
                     C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
-                    gelu_enable=gelu_enable)
-                # strided write: scatter (w_count, BLK) temp into correct channel columns
+                    gelu_enable=gelu_enable,
+                    gpr_M_reg=gpr_M_reg)
                 ue.accelerator_memory_to_sram(TEMP_OUT, 0x00000, w_count * BLK)
                 ue.sram_to_accelerator_memory(
                     0x00000,
@@ -2899,10 +3426,12 @@ def conv2d_3x3_dw_stride2_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
                                 IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
                                 ZERO_PAD_DRAM_ADDR: int,
                                 H_in: int, W_in: int, C: int,
-                                gelu_enable: bool = False) -> None:
+                                gelu_enable: bool = False,
+                                gpr_M_reg: int | None = None) -> None:
     """Depthwise Conv2d(kernel=3, stride=2, pad=1, groups=C). HWC layout.
     C must be a multiple of 64. Block-diagonal matmul + strided scatter, same as
     conv2d_3x3_dw_dram but with stride=2 in the spatial gather loop.
+    gpr_M_reg: if set, collapses the matmul M-unroll via PBI hw for-loop.
     """
     BLK = 64
     K   = 9 * BLK
@@ -2935,13 +3464,18 @@ def conv2d_3x3_dw_stride2_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
                                 ue.accelerator_memory_to_sram(ZERO_PAD_DRAM_ADDR, patch_sram, BLK)
                     sram_off += K * _BPE
                 ue.sram_to_accelerator_memory(0x00000, IM2COL_DRAM_ADDR, w_count * K)
+                if gpr_M_reg is not None:
+                    ue._isa_reg_counter = gpr_M_reg + 1
+                    ue.reset_inst_ptr_counter()
+                    ue.generate_instruction_add_set(dst_reg_idx=gpr_M_reg, immediate_value=w_count)
                 ue.matmat_mul_core(
                     M=w_count, K=K, N=BLK,
                     A_DRAM_ADDR=IM2COL_DRAM_ADDR,
                     B_DRAM_ADDR=W_ADDR,
                     OUTPUT_DRAM_ADDR=TEMP_OUT,
                     C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
-                    gelu_enable=gelu_enable)
+                    gelu_enable=gelu_enable,
+                    gpr_M_reg=gpr_M_reg)
                 ue.accelerator_memory_to_sram(TEMP_OUT, 0x00000, w_count * BLK)
                 ue.sram_to_accelerator_memory(
                     0x00000,
@@ -3050,6 +3584,8 @@ def main():
     parser.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"),
                         default=[512, 512],
                         help="Single-point inference: encode image, run decoder for this point, save best mask")
+    parser.add_argument("--debug-encode", action="store_true",
+                        help="Step through encoder stage-by-stage, asserting no NaNs at each checkpoint")
     args = parser.parse_args()
 
     set_dma_device(args.dev)
@@ -3163,6 +3699,14 @@ def main():
         ue.dump_programs_to_file(enc_prog, dec_prog, BIN_DIR)
         _original_print("  Done saving bins.")
 
+    if args.debug_encode:
+        if bins_exist:
+            _original_print("--debug-encode requires a fresh compile (bins found — delete mobilesam_bin/ and re-run)")
+        else:
+            ue.software_reset()
+            ue.debug_encode(image_t)
+        return
+
     if args.point:
         px, py = args.point
         _original_print(f"\nSingle-point inference at ({px}, {py}) …")
@@ -3177,6 +3721,9 @@ def main():
         ue.execute_encoder(enc_prog, image_t)
         _original_print(f"  HW encoder done in {time.perf_counter() - t_enc:.2f}s")
         image_emb_t = ue.dma_from_accelerator_memory(ue.NECK_OUT_DRAM, (GA, DEC_DIM)).bfloat16()
+        _n_nan = torch.isnan(image_emb_t).sum().item()
+        _n_inf = torch.isinf(image_emb_t).sum().item()
+        assert _n_nan == 0 and _n_inf == 0, f"Encoder output (NECK_OUT) has {_n_nan} NaNs and {_n_inf} Infs — NaN is in encoder"
         ue.preload_decoder_image(image_emb_t, image_pe_t, dense_t)
         t_dec = time.perf_counter()
         masks_hw, iou_hw = ue.run_decoder_tokens(dec_prog, tokens_t)
@@ -3215,6 +3762,9 @@ def main():
     image_emb_t = ue.dma_from_accelerator_memory(ue.NECK_OUT_DRAM, (GA, DEC_DIM)).bfloat16()
     _original_print(f"  NECK_OUT:    mean={image_emb_t.float().mean():.4f} std={image_emb_t.float().std():.4f} "
                     f"min={image_emb_t.float().min():.4f} max={image_emb_t.float().max():.4f}")
+    n_nan = torch.isnan(image_emb_t).sum().item()
+    n_inf = torch.isinf(image_emb_t).sum().item()
+    assert n_nan == 0 and n_inf == 0, f"Encoder output (NECK_OUT) has {n_nan} NaNs and {n_inf} Infs — NaN is in encoder"
     _original_print("Running HW AMG …")
     t0 = time.perf_counter()
     hw_masks = _amg_run_hw(ue, dec_prog, image_emb_t, image_pe_t, dense_t, _get_prompt_weights(), points_per_side=4)

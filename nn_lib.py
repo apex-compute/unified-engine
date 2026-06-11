@@ -498,7 +498,8 @@ def tanh_core_dram(ue, M: int, N: int,
 
 def silu_core_dram(ue, M: int, N: int,
                    A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                   IDENTITY_DRAM_ADDR: int) -> None:
+                   IDENTITY_DRAM_ADDR: int,
+                   gpr_M_reg: int = None) -> None:
     """SiLU: output = x * sigmoid(x) on an (M, N) tensor. Identity-matmul sigmoid
     then elementwise multiply against the original input."""
     assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
@@ -507,7 +508,8 @@ def silu_core_dram(ue, M: int, N: int,
     ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
     ue.matmat_mul_core(M=M, K=N, N=N, A_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                        B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                       OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, sigmoid_enable=True)
+                       OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, sigmoid_enable=True,
+                       gpr_M_reg=gpr_M_reg)
     ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
     ue.accelerator_memory_to_sram(OUTPUT_DRAM_ADDR, URAM_B_BASE, total_elems)
     ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE,
