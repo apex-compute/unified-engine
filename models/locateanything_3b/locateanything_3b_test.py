@@ -1442,6 +1442,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Flash attention scratch
         self.VIS_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram(
             (max(VD_PAD, UE_FMAX_CONTEXT_SIZE) * VS * 2 + VD_PAD * VS * 2))
+        # §7 shared-subroutine vision flash: fixed operand buffers the one flash
+        # body reads/writes; each per-(head,window) call site marshals its segment
+        # in/out. Sized for the largest segment (full attention = VS patches).
+        self.VIS_FLASH_Q_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        self.VIS_FLASH_K_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        self.VIS_FLASH_V_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        self.VIS_FLASH_OUT_DRAM = self.allocate_tensor_dram(VS * VD_PAD * bpe)
+        # Bucket dispatcher softmax-intermediate scratch (VS×VS for full attention)
+        self.VIS_ATTN_P_DRAM    = self.allocate_tensor_dram(VS * VS * bpe)
         # Attention result after inverse permute [1024, 1280]
         self.VIS_ATTN_RESULT_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
         # Unpermuted attention output (trimmed from 128 back to 80) [16, 1024, 80]
@@ -1488,6 +1497,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         zero_kv = torch.zeros(kv_cache_elems, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_kv)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_kv)
+
+        # On-FPGA repetition penalty: per-vocab additive bias (the LM-head matmul's C term,
+        # bias_mode="broadcast_N"). Allocated LAST so adding it never shifts addresses
+        # baked into the bin. All-zero = no penalty.
+        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * bpe)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                       torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
         # Pre-allocate the identity matrix used by flash_attention_core
@@ -1539,6 +1555,25 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self._last_total_flops = gflops
             print(f"    Throughput: {gflops_program:.2f} GFLOPS")
 
+    def _vis_transpose_10(self, input_addr: int, output_addr: int, d0: int, d1: int, last: int) -> None:
+        """Transpose [d0, d1, last] -> [d1, d0, last] (permute [1,0,2]) via strided DMA.
+
+        One gather DMA pair per OUTPUT block (d1 iterations) instead of
+        bf16_permute_core_v2's per-row unroll (d0*d1 rows). For the head<->token
+        swaps (one dim = VN = 16) this is ~16 or ~576 iters vs ~9216.
+        NOTE: strided WRITE (scatter) produces wrong output on device — stay on
+        the gather (strided read) path."""
+        bpe = self.bytes_per_element
+        for i1 in range(d1):
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=input_addr + i1 * last * bpe,
+                sram_address=0x00000, element_size=d0 * last,
+                stride_bytes_per_chunk=last * bpe, stride_jump_bytes=d1 * last * bpe)
+            self.sram_to_accelerator_memory(
+                sram_address=0x00000,
+                accelerator_dram_address=output_addr + i1 * d0 * last * bpe,
+                element_size=d0 * last)
+
     def compile_encoder(self, num_layers: int = None) -> int:
         """Compile vision encoder FPGA program. Returns program DRAM address."""
         from user_dma_core import TYPE
@@ -1563,7 +1598,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         permute_idx = [1, 0, 2]                  # swap dim 0 and dim 1
 
         _bf16_mode = getattr(self, '_vision_bf16_mode', False)
-        bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
+        bin_dir = os.path.join(self.script_dir, "locateanything_3b_bin")
         os.makedirs(bin_dir, exist_ok=True)
         cache_suffix = f"_{total_layers}L" if total_layers != vis_cfg["depth"] else ""
         if _bf16_mode:
@@ -1619,6 +1654,36 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # [VN,VS,VD_PAD] head buffer). One call/buf replaces the per-head loop.
         vis_rope_M_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(vis_rope_M_reg, VN * VS)
+
+        # §7 shared-subroutine attention: compile ONE bucketed flash body after the
+        # encoder HALT; every per-(head,window) call site marshals its segment into
+        # the FIXED VIS_FLASH_* buffers and jumps in. Collapses ~4096 inline flash
+        # bodies → 1 (~100 MB → ~6 MB).
+        from user_dma_core import INSTRUCTION_SIZE_BYTES as _INSTR_SZ
+        vis_prog_base = self.get_program_dram_addr()
+        vis_gpr_bucket = self.alloc_isa_reg()
+        vis_gpr_ret    = self.alloc_isa_reg()
+        vis_flash_call_sites: list[int] = []
+        vis_num_buckets = max(1, ((VS + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE))
+
+        def _vis_flash_call(q_src, k_src, v_src, out_dst, seg_len):
+            """Marshal one segment's Q/K/V into the fixed flash buffers, jump into
+            the shared flash subroutine, scatter the result to out_dst."""
+            elems = seg_len * VD_PAD
+            for src, dst in ((q_src, self.VIS_FLASH_Q_DRAM),
+                             (k_src, self.VIS_FLASH_K_DRAM),
+                             (v_src, self.VIS_FLASH_V_DRAM)):
+                self.accelerator_memory_to_sram(src, 0x00000, elems)
+                self.sram_to_accelerator_memory(0x00000, dst, elems)
+            self.generate_instruction_add_set(vis_gpr_bucket, seg_len // UE_VECTOR_SIZE)
+            self.pad_capture_to_64b_boundary()
+            return_word_addr = ue_35bit_addr_shifter(
+                vis_prog_base + (self.capture_count + 2) * _INSTR_SZ)
+            self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
+            vis_flash_call_sites.append(self.capture_count)
+            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+            self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
+            self.sram_to_accelerator_memory(0x00000, out_dst, elems)
 
         for layer_idx in range(total_layers):
             _original_print(f"    vision layer {layer_idx + 1}/{total_layers}", end="\r", flush=True)
@@ -1699,19 +1764,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         stride_jump_bytes=qk_row_pad * bpe)
                     self.sram_to_accelerator_memory(0x00000, dst, t_take * VN_VD_PAD)
 
-                bf16_permute_core_v2(self,
-                    dims=[VS, VN, VD_PAD], permute_indices=[1, 0, 2],
-                    input_dram_addr=extract_buf,
-                    output_dram_addr=pad_dst,
-                    params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
-                    temp_dram_start=perm_temp)
+                # Token-major [VS, VN, VD_PAD] -> head-major [VN, VS, VD_PAD] via
+                # strided DMA (16 iters), replacing the per-row-unrolled permute.
+                self._vis_transpose_10(extract_buf, pad_dst, d0=VS, d1=VN, last=VD_PAD)
 
-            bf16_permute_core_v2(self,
-                dims=[VS, VN, VD_PAD], permute_indices=[1, 0, 2],
-                input_dram_addr=self.VIS_V_DRAM,
-                output_dram_addr=self.VIS_V_PAD_DRAM,
-                params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
-                temp_dram_start=perm_temp)
+            self._vis_transpose_10(self.VIS_V_DRAM, self.VIS_V_PAD_DRAM,
+                                   d0=VS, d1=VN, last=VD_PAD)
 
             # RoPE via the shared PBI core (rope_hf_core_dram). Per token it loads x plus
             # the interleaved [cos||sin] row through 2 auto-advancing load pointers (+1
@@ -1733,16 +1791,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             cu_win = getattr(self, '_cu_window_seqlens', [0, VS])
             is_full_attn = (layer_idx in fullatt_indexes)
 
+            # §7: each call site marshals its segment into VIS_FLASH_* and jumps
+            # into the shared flash subroutine compiled after HALT below.
             if is_full_attn:
                 for h in range(VN):
-                    self._flash_attention_core_cached(
-                        head_dim=VD_PAD,
-                        seq_len=VS,
-                        Q_DRAM_ADDR=self.VIS_Q_PAD_DRAM + h * head_stride_pad,
-                        K_DRAM_ADDR=self.VIS_K_PAD_DRAM + h * head_stride_pad,
-                        V_DRAM_ADDR=self.VIS_V_PAD_DRAM + h * head_stride_pad,
-                        OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT_DRAM + h * head_stride_pad,
-                        SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM)
+                    base = h * head_stride_pad
+                    _vis_flash_call(self.VIS_Q_PAD_DRAM + base, self.VIS_K_PAD_DRAM + base,
+                                    self.VIS_V_PAD_DRAM + base, self.VIS_ATTN_OUT_DRAM + base, VS)
             else:
                 for h in range(VN):
                     for w_idx in range(len(cu_win) - 1):
@@ -1750,15 +1805,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         w_len = cu_win[w_idx + 1] - w_start
                         if w_len <= 0:
                             continue
-                        w_off = w_start * VD_PAD * bpe  # byte offset within head
-                        self._flash_attention_core_cached(
-                            head_dim=VD_PAD,
-                            seq_len=w_len,
-                            Q_DRAM_ADDR=self.VIS_Q_PAD_DRAM + h * head_stride_pad + w_off,
-                            K_DRAM_ADDR=self.VIS_K_PAD_DRAM + h * head_stride_pad + w_off,
-                            V_DRAM_ADDR=self.VIS_V_PAD_DRAM + h * head_stride_pad + w_off,
-                            OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT_DRAM + h * head_stride_pad + w_off,
-                            SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM)
+                        off = h * head_stride_pad + w_start * VD_PAD * bpe
+                        _vis_flash_call(self.VIS_Q_PAD_DRAM + off, self.VIS_K_PAD_DRAM + off,
+                                        self.VIS_V_PAD_DRAM + off, self.VIS_ATTN_OUT_DRAM + off, w_len)
 
             # Trim: extract first 80 from each 128-element row. Batch per head using strided DMA.
             trim_chunk = URAM_NEAR_FULL_ELEMENTS // VD  # rows per SRAM batch
@@ -1774,12 +1823,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(
                         0x00000, dst_head + t_start * VD * bpe, t_take * VD)
 
-            bf16_permute_core_v2(self,
-                dims=permute_dims_merge, permute_indices=permute_idx,
-                input_dram_addr=self.VIS_ATTN_TRIM_DRAM,
-                output_dram_addr=self.VIS_ATTN_RESULT_DRAM,
-                params_dram_addr=self.VIS_PERMUTE_PARAMS_DRAM,
-                temp_dram_start=self.VIS_PERMUTE_TEMP_DRAM)
+            # Head-major [VN, VS, VD] -> token-major [VS, VN, VD] via strided DMA.
+            self._vis_transpose_10(self.VIS_ATTN_TRIM_DRAM, self.VIS_ATTN_RESULT_DRAM,
+                                   d0=VN, d1=VS, last=VD)
 
             vis_matmul(VS, VH, VH, self.VIS_ATTN_RESULT_DRAM, 'o', la,
                        self.VIS_O_PROJ_DRAM, bias=la['o_bias'], gpr_M_reg=vis_M_reg)
@@ -1884,9 +1930,33 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.merger_mlp2_scale)
 
+        _original_print()  # newline after \r progress
+
+        # End of the normal execution path. The shared flash subroutine follows
+        # and is only reachable via the per-call-site JUMP_ABS placeholders above.
+        self.generate_instruction_halt()
+
+        # §7: compile the bucketed flash body ONCE, then patch every call-site jump.
+        self.pad_capture_to_64b_boundary()
+        vis_sub_start, _vis_sub_flops = self.flash_attention_core(
+            head_dim=VD_PAD, seq_len=VS,
+            Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.VIS_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
+            SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            ATTN_P_DRAM_ADDR=self.VIS_ATTN_P_DRAM,
+            gpr_bucket_idx=vis_gpr_bucket,
+            num_buckets=vis_num_buckets,
+            gpr_ret_id=vis_gpr_ret)
+        for _idx in vis_flash_call_sites:
+            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(vis_sub_start))
+        self.release_isa_reg()  # vis_gpr_ret
+        self.release_isa_reg()  # vis_gpr_bucket
+
         # Finalize single program
         self.stop_capture()
-        self.generate_instruction_halt()
         prog_bytes = bytearray()
         for inst in self.capture_buffer:
             prog_bytes.extend(inst.get_bytes())
@@ -2323,7 +2393,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
 
-        bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
+        bin_dir = os.path.join(self.script_dir, "locateanything_3b_bin")
         os.makedirs(bin_dir, exist_ok=True)
         template_seq_len = self.PREFILL_MAX_SEQ_LEN
         cache_path = os.path.join(bin_dir, f"prefill_program_pbi_s{template_seq_len}.bin")
@@ -2815,9 +2885,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr,
                 gpr_M_reg=gf_one) or 0)
+            # LM head with on-FPGA repetition-penalty bias folded in as the matmul's C term
+            # (bias_mode="broadcast_N"). HW argmax of (logits + bias) returns the penalized
+            # token directly — no logit readback. write_back_disable=True always (no 304 KB
+            # LOGITS_DRAM writeback needed). Bias buffer all-zero = pure greedy.
             total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
+                C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
+                write_back_disable=True,
                 gpr_M_reg=gf_one) or 0)
 
         # End-of-body: bump gf_seq_len for next decode step, then halt.
@@ -2839,21 +2915,25 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
         paths_cfg = self._cfg.get("paths", {})
-        decoder_bin_rel = paths_cfg.get("decoder_program_bin", "qwen2.5_vl_3b_bin/decoder_program.bin")
-        decoder_meta_rel = paths_cfg.get("decoder_program_meta", "qwen2.5_vl_3b_bin/decoder_program.json")
+        decoder_bin_rel = paths_cfg.get("decoder_program_bin", "locateanything_3b_bin/decoder_program.bin")
+        decoder_meta_rel = paths_cfg.get("decoder_program_meta", "locateanything_3b_bin/decoder_program.json")
         decoder_bin_path = os.path.join(self.script_dir, decoder_bin_rel)
         decoder_meta_path = os.path.join(self.script_dir, decoder_meta_rel)
         os.makedirs(os.path.dirname(decoder_bin_path), exist_ok=True)
 
-        # PBI meta has scalar "total_flops"; legacy bucket meta had list — detect to invalidate.
+        # Cache key: "penalty_bias_argmax" identifies the on-FPGA penalty LM head
+        # (C_DRAM_ADDR=PENALTY_BIAS_DRAM, write_back_disable=True). A stale bin from
+        # the old host-side repetition-penalty build (missing or different key) is recompiled.
+        lm_head_sig = "penalty_bias_argmax"
         cache_hit = False
         if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
             with open(decoder_meta_path, "r") as f:
                 meta = json.load(f)
-            if "program_size" in meta and isinstance(meta.get("total_flops"), int):
+            if "program_size" in meta and isinstance(meta.get("total_flops"), int) \
+                    and meta.get("lm_head_sig") == lm_head_sig:
                 cache_hit = True
             else:
-                _original_print(f"  Decoder cache exists but is legacy bucketed format — recompiling.")
+                _original_print(f"  Decoder cache sig ({meta.get('lm_head_sig')!r}) != {lm_head_sig!r} — recompiling.")
 
         if cache_hit:
             with open(decoder_bin_path, "rb") as f:
@@ -2887,7 +2967,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             with open(decoder_bin_path, "wb") as f:
                 f.write(prog_bytes)
             with open(decoder_meta_path, "w") as f:
-                json.dump({"program_size": len(prog_bytes), "total_flops": total_flops}, f, indent=0)
+                json.dump({"program_size": len(prog_bytes), "total_flops": total_flops,
+                           "lm_head_sig": lm_head_sig}, f, indent=0)
             print(f"  Decoder program: 0x{decoder_program_addr:X} – 0x{self.get_program_dram_addr():X} "
                   f"({len(prog_bytes)} bytes), total_flops={total_flops}")
 
@@ -2896,10 +2977,53 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.allocate_program_dram(256)
         return decoder_program_addr, total_flops
 
+    # ---- On-FPGA repetition penalty ----
+    def _structural_token_ids(self) -> set:
+        """Token ids that must never be repetition-penalized: punctuation, whitespace,
+        newline, and special tokens. Cached on first call."""
+        cached = getattr(self, "_struct_ids_cache", None)
+        if cached is not None:
+            return cached
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–''""…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        for i in range(self.EMBEDDING_ELEMENTS):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
+
+    def _structural_ids_tensor(self) -> torch.Tensor:
+        """1-D LongTensor of the structural/special token ids (cached)."""
+        t = getattr(self, "_struct_ids_tensor_cache", None)
+        if t is None:
+            t = torch.tensor(sorted(self._structural_token_ids()), dtype=torch.long)
+            self._struct_ids_tensor_cache = t
+        return t
+
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """Build per-vocab additive bias from windowed token frequency and DMA it to
+        PENALTY_BIAS_DRAM (LM-head matmul C term). bias[t] = clamp(-alpha*count[t], min=-cap);
+        structural tokens stay 0. HW argmax of (logits + bias) returns the penalized token."""
+        vocab = self.EMBEDDING_ELEMENTS
+        alpha = float(getattr(self, "pen_alpha", 1.0))
+        cap   = float(getattr(self, "pen_cap", 20.0))
+        W     = int(getattr(self, "rep_window", 256))
+        window = prev_tokens[-W:]
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0
+        bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
+
     def run_decoder(self, decoder_program_addr: int, token_id: int,
-                    gflops: int | None = None, repetition_penalty: float = 1.2) -> int:
+                    gflops: int | None = None) -> int:
         """Run PBI decode loop. Per-step preamble primes gf_seq_len / gf_bucket_idx /
         gf_rope_cos_abs, then JUMP_ABS into the single cached decoder program. Breaks on EOS/EOT.
+        Token selection is always the HW argmax of (logits + PENALTY_BIAS_DRAM); no logit readback.
         """
         if token_id is None:
             print("No last token available for decode.")
@@ -2913,7 +3037,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         ROPE_BASE = self.DRAM_ADDR_ROPE
         preamble_addr = self._decoder_preamble_addr
 
-        generated_tokens = set()
+        if not hasattr(self, '_generated_tokens'):
+            self._generated_tokens = []
+        fpga_penalty   = bool(getattr(self, 'fpga_penalty', True))
+        greedy_until   = int(getattr(self, 'greedy_until', 512))
+        prefill_seq_start = len(self._generated_tokens)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+            torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
@@ -2944,47 +3074,16 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            # Refresh penalty bias past the greedy gate, BEFORE execute.
+            if fpga_penalty and (len(self._generated_tokens) - prefill_seq_start) > greedy_until:
+                self._write_penalty_bias(self._generated_tokens)
+
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(10.0)
 
-            if repetition_penalty != 1.0 and len(generated_tokens) > 0:
-                logits = self.dma_from_accelerator_memory(
-                    self.LOGITS_DRAM, (self.EMBEDDING_ELEMENTS,)).cpu().float()
-                for prev_tok in generated_tokens:
-                    if logits[prev_tok] > 0:
-                        logits[prev_tok] /= repetition_penalty
-                    else:
-                        logits[prev_tok] *= repetition_penalty
-                token_id = int(logits.argmax().item())
-            else:
-                token_id = self.get_arg_max_index()
-
-            if getattr(self, "_debug_logits", False) and len(generated_tokens) == 0:
-                # Decode layer-35 op scan: after one step the LAYER0_* scratch holds
-                # the LAST decode layer's compute. Localizes NaN within decode.
-                _original_print("\n[HW decode] layer 35 op scan (M=1):")
-                for _name, _addr, _N in self._layer_buffer_order():
-                    self._scan(_name, _addr, 1, _N)
-                # Readout localization: final RMSNorm output, then lm_head logits.
-                _fn = self.dma_from_accelerator_memory(
-                    self.OUTPUT_NORM_DRAM, (1, self.vector_length)).cpu().float()
-                _fn_nan = int(torch.isnan(_fn).sum()); _fn_inf = int(torch.isinf(_fn).sum())
-                _fnf = _fn[torch.isfinite(_fn)]
-                _original_print(f"\n[HW readout] final_norm: nan={_fn_nan} inf={_fn_inf} "
-                                f"min={(_fnf.min() if _fnf.numel() else float('nan')):+.3e} "
-                                f"max={(_fnf.max() if _fnf.numel() else float('nan')):+.3e}")
-                _dl = self.dma_from_accelerator_memory(
-                    self.LOGITS_DRAM, (self.EMBEDDING_ELEMENTS,)).cpu().float()
-                _l_nan = int(torch.isnan(_dl).sum()); _l_inf = int(torch.isinf(_dl).sum())
-                _original_print(f"[HW readout] lm_head logits: nan={_l_nan} inf={_l_inf}")
-                _dtopv, _dtopi = _dl.topk(10)
-                _original_print("\n[HW logits] first decode step (post-prefill):")
-                _original_print(f"  argmax={token_id} ({self.tokenizer.decode([token_id])!r})  "
-                                f"max={_dl.max():.3f} min={_dl.min():.3f} mean={_dl.mean():.3f}")
-                for _v, _i in zip(_dtopv.tolist(), _dtopi.tolist()):
-                    _original_print(f"    {int(_i):>7}  {_v:8.3f}  {self.tokenizer.decode([int(_i)])!r}")
-
-            generated_tokens.add(token_id)
+            # Token selection: HW argmax already has penalty folded in on chip.
+            token_id = self.get_arg_max_index()
+            self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             if token_id in _qwen25_stop_tokens:
@@ -3653,10 +3752,11 @@ def main():
 
     buf = io.StringIO()
     real = sys.stdout
+    ue._generated_tokens = list(prefill_seq)   # seed on-FPGA penalty window with prompt
     _original_print("--- Decode run ---")
     timer = time.perf_counter()
     with contextlib.redirect_stdout(_Tee(real, buf)):
-        tok_cnt = ue.run_decoder(da, token_id=prefill_seq[-1], gflops=gpt, repetition_penalty=1.0)
+        tok_cnt = ue.run_decoder(da, token_id=prefill_seq[-1], gflops=gpt)
     t_decode_run = time.perf_counter() - timer
     answer = buf.getvalue()
     n_new = (tok_cnt - len(prefill_seq)) if isinstance(tok_cnt, int) else 0
@@ -3970,10 +4070,18 @@ def moonvit_setup_dram(ue, N, cfg):
     ue.MV_MLP_INTER = ue.allocate_tensor_dram(N * VIS_MLP_PAD * bpe)
     ue.MV_MLP_OUT = ue.allocate_tensor_dram(N * VH * bpe)
     ue.MV_POST_NORM = ue.allocate_tensor_dram(N * VH * bpe)
-    ue.MV_ROPE = ue.allocate_tensor_dram(N * 2 * VD_PAD * bpe)  # [cos(128)||sin(128)] per token
+    # Rope table tiled VN× so a single rope_hf_core_dram call at M=VN*N covers all
+    # heads. Row h*N+t uses cos/sin[t] — identical across heads (position-only rope).
+    ue.MV_ROPE = ue.allocate_tensor_dram(VN * N * 2 * VD_PAD * bpe)
     ue.MV_ROPE_COS = ue.MV_ROPE
     ue.MV_ROPE_SIN = ue.MV_ROPE + VD_PAD * bpe
     ue.MV_PERM_TEMP = ue.allocate_tensor_dram(VN * N * VD_PAD * bpe * 2)
+    # §7 shared-subroutine flash fixed operand buffers (one flash body for all heads/layers).
+    ue.MV_FLASH_Q   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
+    ue.MV_FLASH_K   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
+    ue.MV_FLASH_V   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
+    ue.MV_FLASH_OUT = ue.allocate_tensor_dram(N * VD_PAD * bpe)
+    ue.MV_ATTN_P    = ue.allocate_tensor_dram(N * N * bpe)
     # Flash BIAS [N, N] row-major (added to QK^T before softmax): mask padded KEY
     # columns (>= N_real) with a large negative so real queries ignore them. Same mask
     # for every head/layer (depends only on key index).
@@ -4003,7 +4111,7 @@ def moonvit_prepare_input(ue, model, pixel_values, grid_hw, cfg, device="cuda"):
     """Run patch_embed (conv + learnable 2D-interp pos-emb) and build the rope table on
     host; DMA both to the board. Returns N (token count)."""
     d = _vis_dims(cfg)
-    VD = d["VD"]
+    VD, VN = d["VD"], d["VN"]
     N_real = grid_hw[0] * grid_hw[1]
     N = ue.MV_N                       # padded (64-aligned) seq len; rope/patch sized to it
     half = VD // 2  # 36
@@ -4042,8 +4150,10 @@ def moonvit_prepare_input(ue, model, pixel_values, grid_hw, cfg, device="cuda"):
     cos_t[:N_real, 64:64 + half] = cos_raw
     sin_t[:N_real, :half] = -sin_raw
     sin_t[:N_real, 64:64 + half] = sin_raw
-    ue.dma_to_accelerator_memory(ue.MV_ROPE, rope_table.contiguous().flatten())
-    print(f"  MoonViT patch[{N_real},{patch.shape[1]}] + rope[{N},2,{VD_PAD}] "
+    # Tile VN× so the single per-buffer rope call (M=VN*N) reads the right row per token.
+    rope_tiled = rope_table.unsqueeze(0).expand(VN, N, 2, VD_PAD).reshape(VN * N, 2, VD_PAD)
+    ue.dma_to_accelerator_memory(ue.MV_ROPE, rope_tiled.contiguous().flatten())
+    print(f"  MoonViT patch[{N_real},{patch.shape[1]}] + rope[{VN}x{N},2,{VD_PAD}] "
           f"(seq padded {N_real}->{N}) DMA'd")
     return N
 
@@ -4105,13 +4215,33 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
 
     ue.start_capture()
 
-    # Runtime row-count register for the PBI rope core only (matmul/norm/flash tile or
-    # unroll fine at static M, but legacy rope unrolls PER ROW -> instruction blow-up for
-    # N*VN*2*depth calls). Primed once with N; the N>=128 PBI rope is the validated path
-    # (user_hw_test.py vision_rope_hf_core_dram_test).
     ue.reset_isa_reg_counter()
     vis_M_reg = ue.alloc_isa_reg()
     ue.generate_instruction_add_set(vis_M_reg, N)
+
+    # §7 shared-subroutine flash: one body after HALT, all per-head call sites jump in.
+    from user_dma_core import INSTRUCTION_SIZE_BYTES as _INSTR_SZ
+    mv_prog_base = ue.get_program_dram_addr()
+    mv_gpr_bucket = ue.alloc_isa_reg()
+    mv_gpr_ret    = ue.alloc_isa_reg()
+    mv_flash_call_sites: list[int] = []
+    mv_num_buckets = max(1, ((N + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE))
+
+    def _mv_flash_call(q_src, k_src, v_src, out_dst):
+        """Marshal one head's Q/K/V into fixed flash buffers, jump into shared subroutine."""
+        elems = N * VD_PAD
+        for src, dst in ((q_src, ue.MV_FLASH_Q), (k_src, ue.MV_FLASH_K), (v_src, ue.MV_FLASH_V)):
+            ue.accelerator_memory_to_sram(src, 0x00000, elems)
+            ue.sram_to_accelerator_memory(0x00000, dst, elems)
+        ue.generate_instruction_add_set(mv_gpr_bucket, N // UE_VECTOR_SIZE)
+        ue.pad_capture_to_64b_boundary()
+        return_word_addr = ue_35bit_addr_shifter(
+            mv_prog_base + (ue.capture_count + 2) * _INSTR_SZ)
+        ue.generate_instruction_add_set(mv_gpr_ret, return_word_addr)
+        mv_flash_call_sites.append(ue.capture_count)
+        ue.generate_instruction_jump_abs(target_instruction_word_addr=0)
+        ue.accelerator_memory_to_sram(ue.MV_FLASH_OUT, 0x00000, elems)
+        ue.sram_to_accelerator_memory(0x00000, out_dst, elems)
 
     for li in range(depth):
         la = ue.mv_layer_addrs[li]
@@ -4126,37 +4256,32 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         for proj, dst in [('q', ue.MV_Q), ('k', ue.MV_K), ('v', ue.MV_V)]:
             _mm(N, VH, VN_VD_PAD, ue.MV_NORM_OUT, proj, la, dst, bias=la[f'{proj}_bias'])
 
-        # --- permute [N, VN, 128] -> [VN, N, 128] for each of q/k/v ---
+        # --- permute [N, VN, 128] -> [VN, N, 128] for q/k/v via strided DMA ---
+        # Each SRAM load: d0*last = N*VD_PAD = 1408*128 = 180224 elems = 352KB < 512KB SRAM.
+        # Chunk size (last=VD_PAD=128 elems = 256 bytes) is a multiple of 128-byte SRAM rows.
         for src, dst in [(ue.MV_Q, ue.MV_Q_PAD), (ue.MV_K, ue.MV_K_PAD), (ue.MV_V, ue.MV_V_PAD)]:
-            smart_bf16_permute_core(ue, dims=[N, VN, VD_PAD], permute_indices=[1, 0, 2],
-                                    input_dram_addr=src, output_dram_addr=dst,
-                                    params_dram_addr=ue.VIS_PERMUTE_PARAMS_DRAM,
-                                    temp_dram_start=ue.MV_PERM_TEMP)
+            ue._vis_transpose_10(src, dst, d0=N, d1=VN, last=VD_PAD)
 
-        # --- 2D RoPE on q and k (pad-128 rotate_half kernel; cos/sin shared across heads) ---
+        # --- 2D RoPE: one call per buffer over ALL heads (M=VN*N, head-major Q/K_PAD) ---
+        # Reprime vis_M_reg to VN*N for the rope calls, then restore to N for matmuls.
+        ue.generate_instruction_add_set(vis_M_reg, VN * N)
+        for buf in (ue.MV_Q_PAD, ue.MV_K_PAD):
+            ue.rope_hf_core_dram(M=VN * N, N=VD_PAD,
+                                 input_dram_addr=buf, output_dram_addr=buf,
+                                 cos_dram_addr=ue.MV_ROPE_COS, sin_dram_addr=ue.MV_ROPE_SIN,
+                                 gpr_M_reg=vis_M_reg)
+        ue.generate_instruction_add_set(vis_M_reg, N)
+
+        # --- per-head flash via shared subroutine (§7) ---
         for h in range(VN):
-            for buf in (ue.MV_Q_PAD, ue.MV_K_PAD):
-                addr = buf + h * head_stride_pad
-                ue.rope_hf_core_dram(M=N, N=VD_PAD, input_dram_addr=addr, output_dram_addr=addr,
-                                     cos_dram_addr=ue.MV_ROPE_COS, sin_dram_addr=ue.MV_ROPE_SIN,
-                                     gpr_M_reg=vis_M_reg)
+            _mv_flash_call(ue.MV_Q_PAD + h * head_stride_pad,
+                           ue.MV_K_PAD + h * head_stride_pad,
+                           ue.MV_V_PAD + h * head_stride_pad,
+                           ue.MV_ATTN_OUT + h * head_stride_pad)
 
-        # --- per-head full bidirectional flash attention (head_dim=128) ---
-        for h in range(VN):
-            ue._flash_attention_core_cached(
-                head_dim=VD_PAD, seq_len=N,
-                Q_DRAM_ADDR=ue.MV_Q_PAD + h * head_stride_pad,
-                K_DRAM_ADDR=ue.MV_K_PAD + h * head_stride_pad,
-                V_DRAM_ADDR=ue.MV_V_PAD + h * head_stride_pad,
-                OUTPUT_DRAM_ADDR=ue.MV_ATTN_OUT + h * head_stride_pad,
-                SCRATCH_DRAM_ADDR=ue.MV_ATTN_SCRATCH,
-                BIAS_DRAM_ADDR=ue.MV_ATTN_BIAS)  # mask padded key columns
-
-        # --- inverse permute [VN, N, 128] -> [N, VN*128] (padded; aligned last dim) ---
-        smart_bf16_permute_core(ue, dims=[VN, N, VD_PAD], permute_indices=[1, 0, 2],
-                                input_dram_addr=ue.MV_ATTN_OUT, output_dram_addr=ue.MV_ATTN_RESULT,
-                                params_dram_addr=ue.VIS_PERMUTE_PARAMS_DRAM,
-                                temp_dram_start=ue.MV_PERM_TEMP)
+        # --- inverse permute [VN, N, 128] -> [N, VN*128] via strided DMA ---
+        # Each SRAM load: d0*last = VN*VD_PAD = 16*128 = 2048 elems = 4KB — trivial.
+        ue._vis_transpose_10(ue.MV_ATTN_OUT, ue.MV_ATTN_RESULT, d0=VN, d1=N, last=VD_PAD)
 
         # --- o proj (K=VN*128, pad cols zeroed in weight) + residual + norm1 fused ---
         _mm(N, VN_VD_PAD, VH, ue.MV_ATTN_RESULT, 'o', la, ue.MV_O_PROJ, bias=la['o_bias'])
@@ -4185,8 +4310,31 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
                             params_dram_addr=ue.VIS_PERMUTE_PARAMS_DRAM,
                             temp_dram_start=ue.MV_PERM_TEMP)
 
-    ue.stop_capture()
+    # End of main execution path. Flash subroutine follows, reachable only via JUMP_ABS.
     ue.generate_instruction_halt()
+
+    # §7: compile ONE bucketed flash body, patch all call-site jumps to its entry.
+    # MV_ATTN_BIAS is constant (same padding mask for every head/layer) — baked in.
+    ue.pad_capture_to_64b_boundary()
+    mv_sub_start, _ = ue.flash_attention_core(
+        head_dim=VD_PAD, seq_len=N,
+        Q_DRAM_ADDR=ue.MV_FLASH_Q,
+        K_DRAM_ADDR=ue.MV_FLASH_K,
+        V_DRAM_ADDR=ue.MV_FLASH_V,
+        OUTPUT_DRAM_ADDR=ue.MV_FLASH_OUT,
+        SCRATCH_DRAM_ADDR=ue.MV_ATTN_SCRATCH,
+        IDENTITY_DRAM_ADDR=ue.IDENTITY_DRAM_ADDR,
+        ATTN_P_DRAM_ADDR=ue.MV_ATTN_P,
+        BIAS_DRAM_ADDR=ue.MV_ATTN_BIAS,
+        gpr_bucket_idx=mv_gpr_bucket,
+        num_buckets=mv_num_buckets,
+        gpr_ret_id=mv_gpr_ret)
+    for _idx in mv_flash_call_sites:
+        ue._patch_jump_immediate(_idx, ue_35bit_addr_shifter(mv_sub_start))
+    ue.release_isa_reg()  # mv_gpr_ret
+    ue.release_isa_reg()  # mv_gpr_bucket
+
+    ue.stop_capture()
     prog = bytearray()
     for inst in ue.capture_buffer:
         prog.extend(inst.get_bytes())

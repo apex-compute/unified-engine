@@ -1591,12 +1591,13 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             f.write(all_bytes)
         with open(meta_path, "w") as f:
             json.dump(manifest, f)
-        slave_bin_path = os.path.join(bin_dir, "programs_slave.bin")
-        slave_meta_path = os.path.join(bin_dir, "programs_slave.json")
-        with open(slave_bin_path, "wb") as f:
-            f.write(all_bytes)
-        with open(slave_meta_path, "w") as f:
-            json.dump(manifest, f)
+        # slave copy unused on single-engine
+        # slave_bin_path = os.path.join(bin_dir, "programs_slave.bin")
+        # slave_meta_path = os.path.join(bin_dir, "programs_slave.json")
+        # with open(slave_bin_path, "wb") as f:
+        #     f.write(all_bytes)
+        # with open(slave_meta_path, "w") as f:
+        #     json.dump(manifest, f)
         _original_print(f"  Programs dumped: {len(all_bytes)} bytes → {bin_path}")
     def load_programs(self, L_pad):
         """Load compiled programs from bin. Returns dict of {name: dram_addr} or None if not found."""
