@@ -1247,6 +1247,11 @@ def main():
     _original_print(f"  Prediction: {label!r} (class {predicted_idx})")
     _original_print(f"  Inference (pure HW): {ue.last_inference_seconds * 1000:.3f} ms")
 
+    import json as _json
+    _original_print("TEST_RESULT:" + _json.dumps({
+        "decoded_text": label,
+    }))
+
     if args.diff:
         # pixel_values is (1, 3, H, W) float; CPU module expects (1, 3, H, W) too.
         if pixel_values.dim() == 3:

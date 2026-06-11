@@ -2263,6 +2263,13 @@ def main():
     draw_and_save(img, W0, H0, size, keep_boxes, keep_scores, keep_labels, order, out_path)
     _original_print(f"  Saved: {out_path}")
 
+    import json as _json
+    det_labels = [COCO_LABELS[int(keep_labels[i])] for i in order] if keep_scores.numel() > 0 else []
+    _original_print("TEST_RESULT:" + _json.dumps({
+        "decoded_text": ", ".join(det_labels) if det_labels else "(no detections)",
+        "n_detections": len(det_labels),
+    }))
+
 
 if __name__ == "__main__":
     main()

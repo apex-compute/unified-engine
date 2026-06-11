@@ -1982,5 +1982,10 @@ def main():
     _original_print(f"    Decoder:             {t_dec_done - t_enc_done:.3f}s")
     _original_print(f"    Total:               {total:.3f}s")
 
+    import json as _json
+    _original_print("TEST_RESULT:" + _json.dumps({
+        "decoded_text": hw_text,
+    }))
+
 if __name__ == "__main__":
     main()

@@ -42,6 +42,41 @@ def _check_smolvlm2(text):
         else "did not find 'x + 3' in decoded output"
     )
 
+def _check_locateanything(text):
+    n_boxes = len(re.findall(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", text))
+    return n_boxes > 0, (
+        f"detected {n_boxes} box(es)"
+        if n_boxes > 0
+        else "no boxes detected"
+    )
+
+def _check_parakeet(text):
+    # Pass if any non-empty transcription was produced
+    found = bool(text.strip())
+    return found, (
+        "non-empty transcription produced"
+        if found
+        else "empty transcription"
+    )
+
+def _check_mbv2_224(text):
+    # vette.jpg is a sports car — expect a car-related ImageNet label
+    found = bool(re.search(r"sports.car|sport.car|racer|race.car|car", text, re.IGNORECASE))
+    return found, (
+        f"car-class label found: {text!r}"
+        if found
+        else f"unexpected label: {text!r}"
+    )
+
+def _check_mbv2_ssd(text):
+    # vette.jpg should produce at least one detection
+    found = text.strip() != "(no detections)"
+    return found, (
+        f"detections found: {text}"
+        if found
+        else "no detections above threshold"
+    )
+
 TESTS = [
     {
         "name": "gemma3",
@@ -90,6 +125,26 @@ TESTS = [
         "script": "models/smolvlm2/smolvlm2_test.py",
         "prompt": "If x + 3 = 5, what is x?",
         "pass_check": _check_smolvlm2,
+    },
+    {
+        "name": "locateanything_3b",
+        "script": "models/locateanything_3b/locateanything_3b_test.py",
+        "pass_check": _check_locateanything,
+    },
+    {
+        "name": "parakeet",
+        "script": "models/parakeet/parakeet_test.py",
+        "pass_check": _check_parakeet,
+    },
+    {
+        "name": "mobilenetv2_224",
+        "script": "models/mobilenetv2/mobilenetv2_224_test.py",
+        "pass_check": _check_mbv2_224,
+    },
+    {
+        "name": "mobilenetv2_ssd_640",
+        "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",
+        "pass_check": _check_mbv2_ssd,
     },
 ]
 

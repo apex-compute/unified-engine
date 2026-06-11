@@ -3963,6 +3963,15 @@ def main():
     print(f"\n{n_boxes} boxes")
     print(f"overlay saved -> {path}  ({nb} boxes, {npt} points)")
 
+    prefill_tok_s = len(prefill_seq) / max(t_prefill_run, 1e-9)
+    _original_print("TEST_RESULT:" + json.dumps({
+        "decoded_text":        answer.strip(),
+        "decoded_tokens":      n_new,
+        "prefill_tokens":      len(prefill_seq),
+        "prefill_speed_tok_s": round(prefill_tok_s, 2),
+        "decode_speed_tok_s":  round(tok_s, 2),
+    }))
+
     # ---- Quant fidelity comparison: bf16 vs if4 vs tq4 (CPU reference) ----
     if args.quant_compare:
         _original_print(f"\n{'='*72}\n  Quant comparison  (CPU reference, same vision output)\n{'='*72}")
