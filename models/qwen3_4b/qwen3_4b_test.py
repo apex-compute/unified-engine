@@ -337,7 +337,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         # Single shared identity matrix slot (UE_VECTOR_SIZE × UE_VECTOR_SIZE,
         # populated by tensor_init). Passed as IDENTITY_DRAM_ADDR= to every
         # attention/transpose kernel call site. See Trick 4 in
-        # build_API_for_FPGAcomponents.md.
+        # shared_design_notes.md.
 
         bin_path = weights_bin or paths["weights_bin"]
         full_path = os.path.join(self.script_dir, bin_path)
@@ -382,66 +382,53 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         """Get the arg max index from the Unified Engine"""
         return self.read_reg32(UE_ARGMAX_INDEX)
 
-    def sample_next_token(self, prev_tokens: list[int]) -> int:
-        """Read full logits from LOGITS_DRAM and sample the next token using the
-        engine's configured ``temperature`` / ``top_k`` / ``top_p`` /
-        ``repetition_penalty``. Greedy fast path (UE_ARGMAX_INDEX) is used when
-        ``temperature == 0`` — caller is expected to dispatch.
+    # ---- On-FPGA repetition penalty (the sole decode path; no host sampling) ----
+    # The penalty is folded into the LM-head matmul as its per-vocab additive C bias
+    # (bias_mode="broadcast_N"): logits = W·h + bias, argmaxed ON CHIP, so the HW
+    # argmax register already holds the penalized token id — no logit readback, no
+    # host sort, fully deterministic. See notes_repetition_penalty_fpga_bias.md.
+    def _structural_token_ids(self) -> set:
+        """Token ids that must NEVER be repetition-penalized: punctuation, whitespace,
+        newline, and special tokens. These 'glue' tokens recur constantly; penalizing
+        them over a long generation starves the model of grammar → word-salad. Cached."""
+        cached = getattr(self, "_struct_ids_cache", None)
+        if cached is not None:
+            return cached
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–’‘“”…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        for i in range(self.EMBEDDING_ELEMENTS):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
 
-        prev_tokens: list of token ids already in the sequence (prompt + decoded).
-                     Used by repetition penalty to down-weight repeated tokens.
-        """
+    def _structural_ids_tensor(self) -> torch.Tensor:
+        """1-D LongTensor of the structural/special token ids (cached)."""
+        t = getattr(self, "_struct_ids_tensor_cache", None)
+        if t is None:
+            t = torch.tensor(sorted(self._structural_token_ids()), dtype=torch.long)
+            self._struct_ids_tensor_cache = t
+        return t
+
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """Build the per-vocab additive bias from the windowed token frequency and DMA it
+        to PENALTY_BIAS_DRAM (the LM-head matmul's C term). bias[t] = clamp(−alpha·count[t],
+        min=−cap); structural tokens stay 0. The HW argmax of (logits + bias) then returns
+        the penalized token id — no logit readback. One full-buffer DMA per step."""
         vocab = self.EMBEDDING_ELEMENTS
-        bpe = self.bytes_per_element
-        # DMA logits row to host. ~304 KB for Qwen3 vocab; negligible vs decode latency.
-        buf = torch.empty(vocab, dtype=torch.bfloat16)
-        self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
-        logits = buf.float()
-        # Fail loudly with an actionable message instead of a cryptic
-        # torch.multinomial "contains inf/nan" crash. Non-finite LOGITS_DRAM means
-        # the decoder did not write valid logits this step — almost always (a) a
-        # bin compiled in greedy mode (write_back_disable=True, LOGITS_DRAM never
-        # written) being reused for a sampling run [now prevented by the mode-keyed
-        # cache, but delete qwen3_4b_bin/*.bin/.json if an old bin lingers], or
-        # (b) a genuine decode-compute divergence (NaN cascade) to debug on FPGA.
-        if not torch.isfinite(logits).all():
-            n_nan = int(torch.isnan(logits).sum()); n_inf = int(torch.isinf(logits).sum())
-            raise RuntimeError(
-                f"sample_next_token: LOGITS_DRAM has {n_nan} NaN / {n_inf} Inf of {vocab} "
-                f"(max|finite|={logits[torch.isfinite(logits)].abs().max().item() if torch.isfinite(logits).any() else float('nan'):.3g}). "
-                f"The decoder produced no valid logits. If you switched greedy<->sampling, "
-                f"delete the cached instruction bin/meta and re-run so it recompiles for "
-                f"this mode; otherwise this is a decode-compute divergence to debug on FPGA.")
-        # Repetition penalty (HF-style): for tokens already seen, divide positive
-        # logits by penalty, multiply negative logits by penalty.
-        rep_pen = float(getattr(self, "repetition_penalty", 1.0))
-        if rep_pen != 1.0 and prev_tokens:
-            seen = torch.tensor(list(set(prev_tokens)), dtype=torch.long)
-            v = logits[seen]
-            logits[seen] = torch.where(v > 0, v / rep_pen, v * rep_pen)
-        # Temperature
-        temp = float(getattr(self, "temperature", 1.0))
-        if temp <= 0:
-            return int(logits.argmax().item())
-        logits = logits / temp
-        # Top-k
-        top_k = int(getattr(self, "top_k", 0) or 0)
-        if top_k > 0 and top_k < vocab:
-            kth = torch.topk(logits, top_k).values[-1]
-            logits[logits < kth] = float("-inf")
-        # Top-p (nucleus)
-        top_p = float(getattr(self, "top_p", 1.0))
-        if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-            probs = torch.softmax(sorted_logits, dim=-1)
-            cumprob = torch.cumsum(probs, dim=-1)
-            keep = cumprob <= top_p
-            keep[0] = True
-            drop_idx = sorted_idx[~keep]
-            logits[drop_idx] = float("-inf")
-        probs = torch.softmax(logits, dim=-1)
-        token_id = int(torch.multinomial(probs, num_samples=1).item())
-        return token_id
+        alpha = float(getattr(self, "pen_alpha", 1.0))
+        cap = float(getattr(self, "pen_cap", 20.0))
+        W = int(getattr(self, "rep_window", 256))
+        window = prev_tokens[-W:]
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0   # never penalize punctuation/whitespace/specials
+        bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
 
     def _load_last_layer_bf16(self) -> None:
         """Load the last layer's 7 matmul weights as bf16 from the HF model and
@@ -517,7 +504,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
                        M: int, K: int, N: int,
                        A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                        gpr_M_reg: int = None, **extras) -> int:
-        """Decode-path matmul dispatcher (Trick 5 in build_API_for_FPGAcomponents.md).
+        """Decode-path matmul dispatcher (Trick 7 in shared_design_notes.md).
 
         IF4 path → quantized_matmat_core (fused, ~2× at M=1) — BUT only when
         ``K <= SCALE_BRAM_ELEMENTS`` (=8192). For K > 8192 (e.g. Qwen3-4B
@@ -753,6 +740,14 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         zero_kv = torch.zeros(kv_cache_total, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_kv)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_kv)
+
+        # On-FPGA repetition penalty: per-vocab additive bias (the LM-head matmul's C term,
+        # bias_mode="broadcast_N"). Allocated LAST so adding it never shifts the addresses
+        # baked into the bin; run_from_bin's tensor_init allocates it at the same position.
+        # All-zero = no penalty. The host refreshes it each penalized step (_write_penalty_bias).
+        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                       torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
@@ -1285,7 +1280,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                           gpr_M_reg=gpr_one) or 0)
 
-            # Q, K, V projections — fused for IF4 layers, unfused for L35 bf16 (see Trick 5).
+            # Q, K, V projections — fused for IF4 layers, unfused for L35 bf16 (see Trick 7).
             total_flops += self._decode_matmul(layer_idx, "q",
                 M=1, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
@@ -1452,19 +1447,18 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA,
                 gpr_M_reg=gpr_one) or 0)
-            # LM head: unfused + write_back_disable=True when greedy
-            # (Trick 5 in build_API_for_FPGAcomponents.md). For greedy decode
-            # the HW argmax register is populated as a pipeline side-effect,
-            # so get_arg_max_index() works without the ~304 KB DRAM writeback.
-            # For sampling (temperature > 0) writeback is required so the host
-            # can DMA logits back for top-p / top-k / multinomial. Compile-time
-            # gate reads ue.temperature, which main() sets before this method.
-            _greedy_lm_head = float(getattr(self, "temperature", 0.0)) <= 0
+            # LM head with the on-FPGA repetition-penalty bias folded in: the matmul adds
+            # PENALTY_BIAS_DRAM (its per-vocab C term, bias_mode="broadcast_N") before the
+            # on-chip argmax, so the HW argmax register holds the PENALIZED token id directly.
+            # write_back_disable=True: greedy/argmax needs no 304 KB LOGITS_DRAM writeback
+            # (no host logit readback at all). The bias buffer is zero pre-gate / in
+            # --pure-greedy, so the same bin serves plain greedy and penalty.
             total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, gpr_M_reg=gpr_one,
-                write_back_disable=_greedy_lm_head) or 0)
+                C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
+                write_back_disable=True) or 0)
 
         # Advance gpr_seq_len for next decode step (matches gemma3 convention).
         # Host preamble primes only gpr_bucket_idx between steps; gpr_seq_len carries
@@ -1538,30 +1532,26 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         bin_path  = os.path.join(self.script_dir, bin_rel)
         meta_path = os.path.join(self.script_dir, meta_rel)
 
-        # LM-head writeback mode this run will compile for. Greedy decode disables
-        # the per-token LOGITS_DRAM writeback (HW argmax still fires); sampling
-        # REQUIRES the writeback so the host can DMA logits back. The two modes
-        # produce different decoder bins (one instruction flag differs), so the
-        # cache MUST be keyed on this — otherwise a greedy-compiled bin silently
-        # serves a sampling run and torch.multinomial sees stale/NaN LOGITS_DRAM.
-        greedy_writeback = (float(getattr(self, "temperature", 0.0)) <= 0
-                            and not getattr(self, "_diag_logit_mag", False))
+        # The decode LM head is uniform now: write_back_disable=True + the penalty C bias
+        # (PENALTY_BIAS_DRAM). Penalty vs --pure-greedy differ only in the runtime bias
+        # buffer contents, NOT in the instructions, so one bin serves both. The cache is
+        # keyed on this signature so a stale bin from the older sampling/greedy builds is
+        # detected and recompiled.
+        lm_head_sig = "penalty_bias_argmax"
 
-        # Cache short-circuit: reuse the on-disk bin only if it exists AND was
-        # compiled for the SAME LM-head writeback mode. The identity-matrix DMAs
-        # (the only other host-DMA side effect) happen in weight_init at fixed
-        # addresses every invocation. A bin from an older build (missing the mode
-        # key) compares unequal to both True/False and is safely recompiled.
+        # Cache short-circuit: reuse the on-disk bin only if it exists AND was compiled
+        # with the same LM-head signature. Identity-matrix DMAs happen in weight_init at
+        # fixed addresses every invocation, so loading the bin off disk is otherwise
+        # sufficient. A bin from an older build (missing/different key) is recompiled.
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
         if bin_cached:
             with open(meta_path, "r") as f:
                 meta = json.load(f)
-            if meta.get("lm_head_writeback_disabled") == greedy_writeback:
+            if meta.get("lm_head_sig") == lm_head_sig:
                 print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
                 return meta
-            print(f"compile_instructions: cached bin LM-head mode "
-                  f"(writeback_disabled={meta.get('lm_head_writeback_disabled')}) "
-                  f"!= this run (writeback_disabled={greedy_writeback}); recompiling.")
+            print(f"compile_instructions: cached bin LM-head sig "
+                  f"({meta.get('lm_head_sig')}) != this run ({lm_head_sig}); recompiling.")
 
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         # Template seq_len: drives static M= args (overridden at runtime by gpr_M_reg),
@@ -1619,7 +1609,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             "decoder_program_start_addr":   f"0x{decoder_program_start_addr:X}",
             "decoder_program_size":         decoder_program_size,
             "decoder_total_flops":          decoder_flops,
-            "lm_head_writeback_disabled":   greedy_writeback,
+            "lm_head_sig":                  lm_head_sig,
         }
         with open(bin_path, "wb") as f:
             f.write(all_bytes)
@@ -1660,6 +1650,20 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         num_buckets_decoder = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         max_bucket_seq_len = num_buckets_decoder * UE_VECTOR_SIZE
         max_seq_len = self.MAX_CONTEXT_SIZE
+
+        # On-FPGA repetition-penalty state. _generated_tokens is seeded with the prompt by
+        # main() (or run_from_bin); decoded ids are appended below. The penalty is folded
+        # into the LM-head matmul bias, so token selection is always the HW argmax — no host
+        # logit readback. Position-gated: pure greedy for the first `greedy_until` decoded
+        # tokens, then the per-vocab bias turns on. --pure-greedy leaves the bias all-zero.
+        if not hasattr(self, "_generated_tokens"):
+            self._generated_tokens = []
+        _fpga_penalty = bool(getattr(self, "fpga_penalty", True))
+        _greedy_until = int(getattr(self, "greedy_until", 512))
+        _prompt_len = len(self._generated_tokens)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                       torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
+
         while self.seq_len < max_seq_len:
             _SILENT_MODE = True
             # self.seq_len at entry is the count of K/V already in cache; the
@@ -1688,18 +1692,16 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            # Refresh the per-vocab penalty bias (this step's LM-head matmul C term) once
+            # past the gate, BEFORE execute, so the HW argmax of (logits + bias) returns the
+            # penalized token directly. One full-buffer DMA per step.
+            if _fpga_penalty and (len(self._generated_tokens) - _prompt_len) > _greedy_until:
+                self._write_penalty_bias(self._generated_tokens)
+
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(10.0)
-            # Greedy fast path uses the HW argmax register; sampling reads logits.
-            # _generated_tokens set by main() for sampling/repetition penalty;
-            # default [] for run_from_bin if main() didn't set it.
-            if not hasattr(self, "_generated_tokens"):
-                self._generated_tokens = []
-            # Greedy decode only (HW argmax register). Sampling disabled.
-            # if float(getattr(self, "temperature", 0.0)) > 0:
-            #     token_id = self.sample_next_token(self._generated_tokens)
-            # else:
-            #     token_id = self.get_arg_max_index()
+            # Read the HW argmax register — the LM-head matmul already added the penalty bias
+            # on chip, so this is the penalized (or pure-greedy) token. No host logit readback.
             token_id = self.get_arg_max_index()
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
@@ -1723,20 +1725,24 @@ def main():
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
                         help='Clock cycle time in nanoseconds (default: 5.62ns ≈ peak 22.8 GFLOPS)')
-    # Sampling is DISABLED — this template runs greedy-only (HW argmax register,
-    # no host logit readback). The --temperature / --top-k / --top-p /
-    # --repetition-penalty flags are kept for CLI compatibility but have no effect
-    # on token selection (the sampling dispatch in run_decoder is commented out).
-    parser.add_argument('--temperature', type=float, default=0.0,
-                        help='(no effect — greedy-only) kept for CLI compatibility.')
-    parser.add_argument('--top-k', type=int, default=0,
-                        help='Top-k filter (0=disabled). Active only when --temperature > 0.')
-    parser.add_argument('--top-p', type=float, default=0.9,
-                        help='Top-p (nucleus) filter, 0<p<1 keeps the smallest set with cumulative prob >= p. Default 0.9.')
-    parser.add_argument('--repetition-penalty', type=float, default=1.2,
-                        help='HF-style repetition penalty (>1 down-weights repeated tokens). Default 1.2.')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='RNG seed for reproducible sampling (only when --temperature > 0).')
+    # Decode is deterministic, on-FPGA only: token selection is always the HW argmax of
+    # (logits + penalty bias). No host sampling (temperature/top-k/top-p/multinomial) — the
+    # repetition penalty is folded into the LM-head matmul bias (notes_repetition_penalty_fpga_bias.md).
+    parser.add_argument('--pure-greedy', action='store_true',
+                        help='Disable the on-FPGA repetition penalty — plain greedy decode '
+                             '(the penalty bias stays all-zero). Penalty is ENABLED by default.')
+    pen_group = parser.add_argument_group('on-FPGA repetition penalty (active unless --pure-greedy)')
+    pen_group.add_argument('--greedy-until', type=int, default=512,
+                        help='Pure greedy for the first N decoded tokens (math/reasoning lands '
+                             'early), then the penalty turns on to break long-context loops. '
+                             '0 = penalty from the start. Default 512.')
+    pen_group.add_argument('--pen-alpha', type=float, default=1.0,
+                        help='bias[t] = -alpha*count[t] (logit units). Default 1.0.')
+    pen_group.add_argument('--pen-cap', type=float, default=20.0,
+                        help='max |bias| per token (floor on -alpha*count). Default 20.')
+    pen_group.add_argument('--rep-window', type=int, default=256,
+                        help='count tokens over the last N (never penalizes punctuation/whitespace/'
+                             'special tokens). Default 256.')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1777,18 +1783,18 @@ def main():
     print(f"User prompt ({len(prefill_seq)} tokens): {user_prompt!r}")
     print(f"Sequence ids: {prefill_seq}")
 
-    # Wire sampling config onto the engine BEFORE compile_instructions: the LM-head
-    # writeback gate reads ue.temperature at emit time (writeback ON when sampling).
-    ue.temperature = float(args.temperature)
-    ue.top_k = int(args.top_k)
-    ue.top_p = float(args.top_p)
-    ue.repetition_penalty = float(args.repetition_penalty)
-    ue._generated_tokens = list(prefill_seq)
-    if args.seed is not None and ue.temperature > 0:
-        torch.manual_seed(args.seed)
-    if ue.temperature > 0:
-        print(f"Sampling: temperature={ue.temperature}  top_k={ue.top_k}  "
-              f"top_p={ue.top_p}  repetition_penalty={ue.repetition_penalty}  seed={args.seed}")
+    # On-FPGA repetition-penalty config (deterministic; the sole decode path).
+    ue.fpga_penalty = not bool(args.pure_greedy)
+    ue.greedy_until = int(args.greedy_until)
+    ue.pen_alpha = float(args.pen_alpha)
+    ue.pen_cap = float(args.pen_cap)
+    ue.rep_window = int(args.rep_window)
+    ue._generated_tokens = list(prefill_seq)   # seed the penalty window with the prompt
+    if ue.fpga_penalty:
+        print(f"On-FPGA penalty: alpha={ue.pen_alpha} cap={ue.pen_cap} "
+              f"rep_window={ue.rep_window} greedy_until={ue.greedy_until}")
+    else:
+        print("Pure greedy (on-FPGA penalty disabled).")
 
     print(f"\n--- Compiling unified instruction bin (1 prefill + 1 decoder, dynamic PBI) ---")
     timer = time.perf_counter()
