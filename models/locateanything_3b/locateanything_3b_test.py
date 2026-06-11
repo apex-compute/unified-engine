@@ -37,7 +37,7 @@ from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_d
 from nn_lib import store_weight, store_quantized_weight, smart_bf16_permute_core, layer_norm_core_dram_post_add
 from quant_lib import quantize_q4_64
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
-from user_dma_core import ue_35bit_addr_shifter
+from user_dma_core import ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 import quant_lib
 
 import builtins
@@ -2722,9 +2722,19 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE
 
         # Reset dynamic GPR allocator.
+        # §7 shared-subroutine decode attention: decoder_group_attention_core compiled ONCE
+        # after HALT; every (layer, kv_head) call site sets gf_ret_id and jumps in.
+        # Three persistent regs survive the layer loop:
+        #   gf_ret_id       (5) — §7 subroutine return-address reg
+        #   gf_one          (6) — gpr_M_reg for M=1 matmul/norm ops
+        #   gf_rope_cos_abs (7) — absolute cos-base addr, primed per step by preamble
+        # Subroutine allocates from counter 8 to stay above all three.
         self._isa_reg_counter = 5
+        gf_ret_id          = self.alloc_isa_reg()
         gf_one             = self.alloc_isa_reg()
         gf_rope_cos_abs    = self.alloc_isa_reg()
+        program_dram_base  = self.get_program_dram_addr()
+        call_site_jump_capture_indices: list = []
         # Stash for run_decoder preamble to use the same indices.
         self._gf_one          = gf_one
         self._gf_rope_cos_abs = gf_rope_cos_abs
@@ -2800,6 +2810,18 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     sram_address=0x10000, accelerator_dram_address=0,
                     element_size=ahd, general_reg_src=self.TMP_REG)
 
+                # §7: gather valid K history (incl. just-written token) from cache → FLASH_K.
+                # PBI loop over gf_bucket_idx buckets, each UE_VECTOR_SIZE tokens.
+                self._emit_pbi_scatter_per_token(
+                    read_base=k_cache_base,
+                    read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    sram_byte_addr=0x10000,
+                    element_count=UE_VECTOR_SIZE * ahd,
+                    gf_seq_len=self.gf_bucket_idx,
+                    template_seq_len=num_buckets_decoder,
+                )
+
                 # V cache write
                 self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
                 self.generate_instruction_reg_mul_imm(
@@ -2810,6 +2832,17 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     sram_address=0x20000, accelerator_dram_address=0,
                     element_size=ahd, general_reg_src=self.TMP_REG)
 
+                # §7: gather valid V history from cache → FLASH_V.
+                self._emit_pbi_scatter_per_token(
+                    read_base=v_cache_base,
+                    read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_V_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    sram_byte_addr=0x20000,
+                    element_count=UE_VECTOR_SIZE * ahd,
+                    gf_seq_len=self.gf_bucket_idx,
+                    template_seq_len=num_buckets_decoder,
+                )
+
                 # Gather qpkv Q heads for this KV head into FLASH_Q (contiguous: 0, ahd*bpe, ...)
                 for q in range(qpkv):
                     q_src = self.LAYER0_Q_DRAM + (kv_h * qpkv + q) * ahd * bpe
@@ -2817,23 +2850,18 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
                     self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
 
-                # PBI decoder_group_attention_core: one call processes all qpkv Q heads for this KV head.
-                # ``seq_len`` arg is ignored on the PBI path (bucket bodies cover the range).
-                attn_flops = self.decoder_group_attention_core(
-                    group_size=qpkv,
-                    head_dim=ahd,
-                    seq_len=self.MAX_CONTEXT_SIZE,  # ignored under PBI dispatch
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=k_cache_base,
-                    V_DRAM_ADDR=v_cache_base,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    gpr_bucket_idx=self.gf_bucket_idx,
-                    num_buckets=num_buckets_decoder,
-                )
-                total_flops += (attn_flops[-1] if isinstance(attn_flops, (list, tuple)) else (attn_flops or 0))
+                # §7 call-site jump into the shared decode-attention subroutine.
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(gf_ret_id, return_word_addr)
+                call_site_jump_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+
+                # Copy subroutine output (FLASH_OUT_HEAD) → this head's slot in FLASH_OUTPUT.
+                self.accelerator_memory_to_sram(self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
+                self.sram_to_accelerator_memory(
+                    0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
 
             # o_proj (if4-quantized)
             total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=hd * qpkv, N=self.vector_length,
@@ -2899,6 +2927,30 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # End-of-body: bump gf_seq_len for next decode step, then halt.
         self.generate_instruction_add_inc(self.gf_seq_len)
         self.generate_instruction_halt()
+
+        # §7: compile decoder_group_attention_core ONCE as a subroutine after HALT.
+        # Do NOT lower _isa_reg_counter: the subroutine allocates from the current
+        # counter (8) so its scratch regs stay above gf_ret_id(5)/gf_one(6)/gf_rope_cos_abs(7),
+        # all of which are live when the subroutine is called mid-layer.
+        self.pad_capture_to_64b_boundary()
+        dec_sub_start, dec_attn_flops = self.decoder_group_attention_core(
+            group_size=qpkv,
+            head_dim=ahd,
+            seq_len=self.MAX_CONTEXT_SIZE,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            gpr_bucket_idx=self.gf_bucket_idx,
+            num_buckets=num_buckets_decoder,
+            gpr_ret_id=gf_ret_id,
+        )
+        total_flops += (dec_attn_flops[-1] if isinstance(dec_attn_flops, (list, tuple)) else (dec_attn_flops or 0)) * layer_size * nkvh
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(jump_idx, ue_35bit_addr_shifter(dec_sub_start))
         return total_flops
 
     def compile_decoder(self, layer_size: int | None = None) -> tuple[int, int]:
@@ -2924,7 +2976,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Cache key: "penalty_bias_argmax" identifies the on-FPGA penalty LM head
         # (C_DRAM_ADDR=PENALTY_BIAS_DRAM, write_back_disable=True). A stale bin from
         # the old host-side repetition-penalty build (missing or different key) is recompiled.
-        lm_head_sig = "penalty_bias_argmax"
+        lm_head_sig = "penalty_bias_argmax_s7dec"
         cache_hit = False
         if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
             with open(decoder_meta_path, "r") as f:
@@ -2942,9 +2994,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.dma_write(DMA_DEVICE_H2C, decoder_program_addr, prog_bytes, len(prog_bytes))
             self.allocate_program_dram(len(prog_bytes))
             total_flops = meta["total_flops"]
-            # Restore the GPR indices _emit_decoder_program would have allocated (5, 6).
-            self._gf_one          = 5
-            self._gf_rope_cos_abs = 6
+            # Restore the GPR indices _emit_decoder_program would have allocated (6, 7).
+            self._gf_one          = 6
+            self._gf_rope_cos_abs = 7
             print(f"  Decoder loaded from cache ({len(prog_bytes)} bytes) at 0x{decoder_program_addr:X}")
         else:
             global _SILENT_MODE
@@ -3462,12 +3514,81 @@ def _quant_compare(args, prep):
     return dict(ref_boxes=len(ref_b), ref_answer=ref_s.strip(), n_gen=len(ref_ids), schemes=schemes)
 
 
+def _run_decode_only():
+    """Skip vision/connector; text-only prefill + decode to isolate the LM + decoder path."""
+    print("=== Decode-only mode (no vision) ===")
+    lm_bin = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_lm_if4.bin")
+    if not os.path.exists(lm_bin):
+        print("  LM weight bin missing -> generating ...")
+        gen_lm_bin()
+    open(os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_vision_UNUSED.bin"), "a").close()
+
+    def _la_load_config(script_dir):
+        import copy
+        cfg = copy.deepcopy(_FPGA_CFG)
+        wd = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
+        for k, r in cfg.get("regions", {}).items():
+            wd[k] = _parse_offset(r["offset"]); wd[f"{k}_SIZE"] = r["size"]
+        for k, r in cfg.get("non_layer_regions", {}).items():
+            wd[k] = _parse_offset(r["offset"]); wd[f"{k}_SIZE"] = r["size"]
+        cfg["_weight_defs"] = wd
+        return cfg
+
+    class LADecoderTextOnly(Qwen25VL3B_UnifiedEngine):
+        def _load_vision_weights(self, *a, **k):
+            pass
+
+    global _load_config
+    _load_config = _la_load_config
+
+    ue = LADecoderTextOnly(script_dir=LA_DIR)
+    ue._rope_offset = 0
+
+    # Use tokenizer from HF dir
+    from transformers import AutoTokenizer
+    tok_dir = os.path.join(LA_DIR, "locateanything_3b_bin", "LocateAnything-3B")
+    tokenizer = AutoTokenizer.from_pretrained(tok_dir, trust_remote_code=True)
+    ue.tokenizer = tokenizer
+
+    prompt = "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+    token_ids = tokenizer.encode(prompt)
+    print(f"  Prompt: {prompt!r}")
+    print(f"  Token ids ({len(token_ids)}): {token_ids}")
+
+    print("\n--- Prefill compile ---")
+    t0 = time.perf_counter()
+    pa, pre, gflops = ue.compile_prefill()
+    print(f"  {time.perf_counter()-t0:.2f}s")
+
+    print(f"--- Prefill run ({len(token_ids)} tokens) ---")
+    t0 = time.perf_counter()
+    ue.run_prefill(pa, pre, prefill_seq=token_ids, gflops=gflops, has_image=False)
+    t_pre = time.perf_counter() - t0
+    print(f"  {t_pre:.2f}s")
+
+    print("\n--- Decode compile ---")
+    t0 = time.perf_counter()
+    da, gpt = ue.compile_decoder()
+    t_dc = time.perf_counter() - t0
+    print(f"  {t_dc:.2f}s  (decoder size: {os.path.getsize(os.path.join(LA_DIR, 'locateanything_3b_bin', 'decoder_program.bin'))/1024:.0f} KB)")
+
+    print("--- Decode run ---")
+    ue._generated_tokens = list(token_ids)
+    t0 = time.perf_counter()
+    tok_cnt = ue.run_decoder(da, token_id=token_ids[-1], gflops=gpt)
+    t_dec = time.perf_counter() - t0
+    n_new = (tok_cnt - len(token_ids)) if isinstance(tok_cnt, int) else 0
+    print(f"\n  {t_dec:.2f}s  {n_new} tokens  {n_new/max(t_dec,1e-9):.2f} tok/s")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "vette.jpg"))
     ap.add_argument("--prompt-kind", default="detect",
                     choices=["detect", "ground_multi", "ground_one", "point"])
     ap.add_argument("--query", default="sports car")
+    ap.add_argument("--decode-only", action="store_true",
+                    help="skip vision/connector entirely; prefill+decode a short text prompt to isolate the LM decode path")
     ap.add_argument("--check-connector", action="store_true",
                     help="diff FPGA connector output vs the bit-exact GPU connector")
     ap.add_argument("--gpu-vision", action="store_true",
@@ -3512,6 +3633,10 @@ def main():
 
     global _SILENT_MODE
     _SILENT_MODE = args.silent
+
+    if args.decode_only:
+        _run_decode_only()
+        return
 
     # ---- 1. Vision prep (build model, process image, tokenize) ----
     fpga_vision = not args.gpu_vision          # FPGA MoonViT is the default path
@@ -3580,48 +3705,80 @@ def main():
                   f"Linear({self._conn_in},{self._conn_hidden}) -> GELU -> "
                   f"Linear({self._conn_hidden},{self._conn_out})")
 
-        def run_connector(self, vit):
-            """FPGA connector: vit[N,4608] -> VIS_ENCODER_OUT_DRAM[N,2048].
-            LayerNorm(g,b) -> matmul+bias+GELU -> matmul+bias. Reuses the stub
-            vision scratch buffers (ping-pong); no new DRAM.
+        def compile_connector(self, N):
+            """Compile-or-load the connector program for N vision tokens.
 
-            The compute cores only EMIT instructions into the capture buffer; they
-            run on hardware solely via start_capture -> write_to_dram ->
-            start_execute_from_dram -> wait_queue (same scaffold as compile_encoder).
-            Without this wrapper the matmuls never execute and the output is stale."""
+            Allocates a permanent program slot keyed by N. Called from run_connector
+            on first use so N is known. Prefill/decoder compile after this, which
+            preserves program-arena ordering.
+            """
+            if getattr(self, "_connector_program_addr", None) is not None and self._connector_compiled_N == N:
+                return  # already compiled for this N
+
+            Cin = self._conn_in
+            IN  = self.VIS_MERGED_DRAM
+            LN  = self.VIS_MERGER_INTER_DRAM
+
+            bin_dir  = os.path.join(self.script_dir, "locateanything_3b_bin")
+            bin_path  = os.path.join(bin_dir, f"connector_program_N{N}.bin")
+            meta_path = os.path.join(bin_dir, f"connector_program_N{N}.json")
+            os.makedirs(bin_dir, exist_ok=True)
+
+            cache_hit = False
+            if os.path.exists(bin_path) and os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                if meta.get("num_tokens") == N and meta.get("conn_in") == Cin:
+                    cache_hit = True
+
+            if cache_hit:
+                with open(bin_path, "rb") as f:
+                    prog_bytes = f.read()
+                self._connector_program_addr = self.get_program_dram_addr()
+                self.dma_write(DMA_DEVICE_H2C, self._connector_program_addr, prog_bytes, len(prog_bytes))
+                self.allocate_program_dram(len(prog_bytes))
+                self._connector_compiled_N = N
+                print(f"  Connector loaded from cache ({len(prog_bytes)} bytes) at 0x{self._connector_program_addr:X}")
+            else:
+                _original_print(f"  Compiling connector program (N={N})...")
+                self.clear_inst_id()
+                self.start_capture()
+                self.layer_norm_core_dram(M=N, N=Cin, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=LN,
+                                          GAMMA_DRAM_ADDR=self.conn_ln_g, BETA_DRAM_ADDR=self.conn_ln_b)
+                self.matmat_mul_core(M=N, K=Cin, N=self._conn_hidden,
+                                     A_DRAM_ADDR=LN, B_DRAM_ADDR=self.conn_w0,
+                                     OUTPUT_DRAM_ADDR=IN,
+                                     C_DRAM_ADDR=self.conn_b0, bias_mode="broadcast_N",
+                                     gelu_enable=True)
+                self.matmat_mul_core(M=N, K=self._conn_hidden, N=self._conn_out,
+                                     A_DRAM_ADDR=IN, B_DRAM_ADDR=self.conn_w2,
+                                     OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM,
+                                     C_DRAM_ADDR=self.conn_b2, bias_mode="broadcast_N")
+                self.stop_capture()
+                self.generate_instruction_halt()
+
+                self._connector_program_addr = self.get_program_dram_addr()
+                prog_bytes = bytearray()
+                for inst in self.capture_buffer:
+                    prog_bytes.extend(inst.get_bytes())
+                self.write_captured_instructions_to_dram(self._connector_program_addr)
+                self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+                self.clear_capture_buffer()
+                self._connector_compiled_N = N
+
+                with open(bin_path, "wb") as f:
+                    f.write(prog_bytes)
+                with open(meta_path, "w") as f:
+                    json.dump({"num_tokens": N, "conn_in": Cin, "program_size": len(prog_bytes)}, f, indent=0)
+                _original_print(f"  Connector compiled ({len(prog_bytes)} bytes) at 0x{self._connector_program_addr:X}")
+
+        def run_connector(self, vit):
+            """Compile (once per N) and execute the connector program."""
             N, Cin = vit.shape
             assert Cin == self._conn_in, f"connector in {Cin} != {self._conn_in}"
-            IN = self.VIS_MERGED_DRAM          # holds [N,4608] in, later [N,2048]
-            LN = self.VIS_MERGER_INTER_DRAM    # holds LayerNorm output [N,4608]
-
-            # input embeddings -> DRAM (immediate host->device DMA, fine pre-capture)
-            self.dma_to_accelerator_memory(IN, vit.contiguous().flatten())
-
-            # capture the 3-core connector program
-            self.clear_inst_id()
-            self.start_capture()
-            # 0) LayerNorm(4608) with gamma+beta
-            self.layer_norm_core_dram(M=N, N=Cin, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=LN,
-                                      GAMMA_DRAM_ADDR=self.conn_ln_g, BETA_DRAM_ADDR=self.conn_ln_b)
-            # 1+2) Linear(4608->2048) + bias + GELU  (engine GELU = sigmoid-approx)
-            self.matmat_mul_core(M=N, K=Cin, N=self._conn_hidden,
-                                 A_DRAM_ADDR=LN, B_DRAM_ADDR=self.conn_w0,
-                                 OUTPUT_DRAM_ADDR=IN,
-                                 C_DRAM_ADDR=self.conn_b0, bias_mode="broadcast_N",
-                                 gelu_enable=True)
-            # 3) Linear(2048->2048) + bias -> VIS_ENCODER_OUT_DRAM
-            self.matmat_mul_core(M=N, K=self._conn_hidden, N=self._conn_out,
-                                 A_DRAM_ADDR=IN, B_DRAM_ADDR=self.conn_w2,
-                                 OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM,
-                                 C_DRAM_ADDR=self.conn_b2, bias_mode="broadcast_N")
-            self.stop_capture()
-            self.generate_instruction_halt()
-
-            # transient program: run it before prefill compiles (which reuses this region)
-            prog_addr = self.get_program_dram_addr()
-            self.write_captured_instructions_to_dram(prog_addr)
-            self.clear_capture_buffer()
-            self.start_execute_from_dram(prog_addr)
+            self.compile_connector(N)
+            self.dma_to_accelerator_memory(self.VIS_MERGED_DRAM, vit.contiguous().flatten())
+            self.start_execute_from_dram(self._connector_program_addr)
             self.wait_queue(120.0)
             self._vis_num_tokens = N
 
@@ -3677,7 +3834,7 @@ def main():
             torch.cuda.empty_cache()
 
     # ---- 3. FPGA connector: vit[N,4608] -> VIS_ENCODER_OUT_DRAM[N,2048] ----
-    print("\n=== FPGA connector (compile + hw exec) ===")
+    print("\n=== FPGA connector (hw exec) ===")
     timer = time.perf_counter()
     ue.run_connector(vit)
     t_connector = time.perf_counter() - timer
