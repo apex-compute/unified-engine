@@ -4213,6 +4213,8 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
                                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                                gelu_enable=gelu, gpr_M_reg=vis_M_reg)
 
+    global _SILENT_MODE
+    _SILENT_MODE = True
     ue.start_capture()
 
     ue.reset_isa_reg_counter()
@@ -4335,6 +4337,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     ue.release_isa_reg()  # mv_gpr_bucket
 
     ue.stop_capture()
+    _SILENT_MODE = False
     prog = bytearray()
     for inst in ue.capture_buffer:
         prog.extend(inst.get_bytes())
@@ -4344,8 +4347,8 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     ue.clear_capture_buffer()
     with open(cache_bin, "wb") as f:                 # cache for fast reload next run
         f.write(bytes(prog))
-    print(f"  MoonViT encoder compiled: {len(prog)} bytes = {len(prog)//32} instructions, "
-          f"{depth} layers (single stream) -> cached {os.path.basename(cache_bin)}")
+    _original_print(f"  MoonViT encoder compiled: {len(prog)//1024//1024}MB "
+                    f"({len(prog)//32} instructions, {depth} layers) -> cached {os.path.basename(cache_bin)}")
     return program_addr
 
 
