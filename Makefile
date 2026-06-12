@@ -89,11 +89,63 @@ program_with_artifact:
 	echo "🔧 Programming FPGA with $$BIT_FILE ..."; \
 	$(MAKE) program TARGET=$(TARGET) BITFILE="$$BIT_FILE"
 
-model_test: clean
-	python model_auto_test.py
+# model_test run modes — pass extra words after the target:
+#   make model_test                concise: banner + PASS/FAIL per model + final summary
+#   make model_test verbose        also stream each model's live run log as it prints
+#   make model_test nohup          run in background; output -> model_test_bg.out,
+#                                  results -> model_auto_test_results.txt
+#   make model_test gemma3         run only that model (any registered model name)
+#   make model_test gemma3 llama3.2_1b verbose   combine: several models + a mode
+# (make can't take a literal --verbose flag, so the modifiers are bare words.)
+_MT_MODELS := $(shell python model_auto_test.py --list-names 2>/dev/null)
+_MT_ARGS :=
+ifneq (,$(filter verbose,$(MAKECMDGOALS)))
+  _MT_ARGS := --verbose
+endif
+_MT_ONLY := $(filter $(_MT_MODELS),$(MAKECMDGOALS))
+ifneq (,$(_MT_ONLY))
+  _MT_ARGS += --only $(_MT_ONLY)
+endif
+# model_test cleans first by default; `run_from_bin` skips clean to reuse cached bins.
+_MT_PREREQ := clean
+ifneq (,$(filter run_from_bin,$(MAKECMDGOALS)))
+  _MT_PREREQ :=
+endif
+
+model_test: $(_MT_PREREQ)
+ifneq (,$(filter nohup,$(MAKECMDGOALS)))
+	@nohup python model_auto_test.py $(_MT_ARGS) > model_test_bg.out 2>&1 & \
+	echo "model_test started in background (PID $$!). Log -> model_test_bg.out, results -> model_auto_test_results.txt"
+else
+	python model_auto_test.py $(_MT_ARGS)
+endif
+
+# No-op modifier goals so `make model_test verbose|nohup|run_from_bin|<model-name>` doesn't error.
+verbose nohup run_from_bin $(_MT_MODELS):
+	@:
+
+model_test_help:
+	@echo "Usage: make model_test [MODEL...] [verbose] [nohup] [run_from_bin]"
+	@echo ""
+	@echo "Modes (bare words after the target):"
+	@echo "  (none)    concise  : banner + PASS/FAIL per model + final summary"
+	@echo "  verbose            : also stream each model's live run log as it prints"
+	@echo "  nohup              : run in background -> model_test_bg.out,"
+	@echo "                       results -> model_auto_test_results.txt"
+	@echo "  run_from_bin       : skip 'make clean'; reuse existing compiled bins"
+	@echo ""
+	@echo "Models (run one or more by name; default = all):"
+	@echo "  $(_MT_MODELS)"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make model_test                              # all models, concise"
+	@echo "  make model_test gemma3                       # just one model"
+	@echo "  make model_test gemma3 llama3.2_1b verbose   # two models + live log"
+	@echo "  make model_test qwen3_4b nohup               # one model, in background"
+	@echo "  make model_test gemma3 run_from_bin          # reuse cached bin, no rebuild"
 
 model_test_new:
 	python model_auto_test.py --only locateanything_3b parakeet mobilenetv2_224 mobilenetv2_ssd_640
 
-.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test model_test_new
+.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test model_test_new model_test_help verbose nohup run_from_bin $(_MT_MODELS)
 

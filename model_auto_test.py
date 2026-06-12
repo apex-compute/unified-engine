@@ -159,12 +159,40 @@ TESTS = [
 
 
 # ---------------------------------------------------------------------------
+# Device reset
+# ---------------------------------------------------------------------------
+
+def reset_device(dev: str = "xdma0") -> None:
+    """Initialize the FPGA once before the suite: instantiate the engine and
+    software-reset it. (Optional zero-fill DRAM with 0x00 is left commented —
+    0xff would be NaN in bf16; 0x00 is a safe 0.0 — enable if cross-model
+    contamination resurfaces.) Runs in this orchestrator process, not during a
+    model's own device access.
+    """
+    try:
+        import user_dma_core
+        ue = user_dma_core.UnifiedEngine(device_name=dev)
+        ue.software_reset()
+        # ue.clear_dram(fill_byte=0x00)
+    except Exception as e:
+        print(f"[reset_device] WARNING: reset failed: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_test(test: dict) -> dict:
+def run_test(test: dict, verbose: bool = False) -> dict:
+    """Run one model test as a subprocess.
+
+    verbose=True  — stream the model's stdout live, as it prints (tee to console).
+    verbose=False — show only the banner + verdict; the model's own run log is
+                    captured for parsing but not echoed.
+    """
     script = os.path.join(SCRIPT_DIR, test["script"])
-    cmd = [sys.executable, script]
+    # -u: force the child's stdout unbuffered so verbose mode streams live
+    # instead of arriving in big blocks (its stdout is a pipe, not a TTY).
+    cmd = [sys.executable, "-u", script]
     if test.get("prompt"):
         cmd += ["--prompt", test["prompt"]]
 
@@ -176,22 +204,28 @@ def run_test(test: dict) -> dict:
     print(f"{'='*60}\n", flush=True)
 
     t_start = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=SCRIPT_DIR,
-    )
+    if verbose:
+        # Stream live while still capturing for the pass-check / summary.
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, cwd=SCRIPT_DIR,
+        )
+        captured = []
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            captured.append(line)
+        proc.wait()
+        stdout, returncode = "".join(captured), proc.returncode
+    else:
+        # concise: capture but do not echo the model's run log.
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=SCRIPT_DIR,
+        )
+        stdout, returncode = proc.stdout, proc.returncode
     elapsed = time.perf_counter() - t_start
 
-    # Echo captured output to terminal
-    if proc.stdout:
-        print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
-
-    return _parse_output(test, proc.stdout, proc.returncode, elapsed)
+    return _parse_output(test, stdout, returncode, elapsed)
 
 
 def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> dict:
@@ -318,14 +352,25 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="+", metavar="NAME", help="Run only these named tests")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Stream each model's live stdout as it runs (full run log)")
+    ap.add_argument("--list-names", action="store_true",
+                    help="Print the registered test names (space-separated) and exit")
     args = ap.parse_args()
+
+    if args.list_names:
+        print(" ".join(t["name"] for t in TESTS))
+        return
 
     summary_path = os.path.join(SCRIPT_DIR, "model_auto_test_results.txt")
     results = []
 
+    # Initialize the FPGA once before running any model (software reset).
+    reset_device()
+
     tests = [t for t in TESTS if t["name"] in args.only] if args.only else TESTS
     for test in tests:
-        result = run_test(test)
+        result = run_test(test, verbose=args.verbose)
         results.append(result)
         status = "PASS" if result["passed"] else "FAIL"
         print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}\n")

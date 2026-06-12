@@ -1292,7 +1292,6 @@ def main():
     print("\n--- Running ---")
     run_result = ue.run_gpt2(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
                              repetition_penalty=args.repetition_penalty, max_new_tokens=args.max_new_tokens)
-    ue.clear_dram()
     print("GPT-2 test ends.")
     print(f"TEST_RESULT: {json.dumps(run_result)}")
 

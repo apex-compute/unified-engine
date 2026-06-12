@@ -1657,7 +1657,6 @@ def main():
         ue.compile_gemma3(profile=True)
         print(f"Profile compile done in {time.perf_counter() - timer:.2f} seconds")
         ue.run_gemma3_profile()
-        ue.clear_dram()
         print("Decoder profile done.")
         return
 
@@ -1665,7 +1664,6 @@ def main():
     print("Gemma3 test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
-    ue.clear_dram()
     global _SILENT_MODE
     _SILENT_MODE = True
     ue.software_reset()

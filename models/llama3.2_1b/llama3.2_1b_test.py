@@ -1696,13 +1696,11 @@ def main():
         ue.compile_llama(profile=True)
         print(f"Profile compile done in {time.perf_counter() - timer:.2f}s")
         ue.run_llama_profile()
-        ue.clear_dram()
         print("Decoder profile done.")
         return
 
     print("\n--- Running ---")
     run_result = ue.run_llama()
-    ue.clear_dram()
     print("Llama-3.2-1B test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 

@@ -1834,7 +1834,6 @@ def main():
     decoded_tokens = max(token_cnt_decoded - len(prefill_seq) + 1, 1)
     print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
           f"speed: {decoded_tokens / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
-    ue.clear_dram()
     print("Qwen3-1.7B test ends.")
 
     run_result = {

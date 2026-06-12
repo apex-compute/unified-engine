@@ -6739,12 +6739,14 @@ class UnifiedEngine:
         self.is_capture_on = False
         print(f"Capture stopped. Total instructions captured: {self.capture_count}, size: {self.capture_count * 32} bytes")
 
-    def clear_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
+    def clear_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024, fill_byte: int = 0xff) -> None:
+        # fill_byte default 0xff = NaN in bf16 (legacy behavior). Pass 0x00 to zero-fill,
+        # which is a valid bf16 0.0 and safe for read-before-write regions on the next run.
         dram_total_bytes = 0xffffffff - DRAM_START_ADDR + 1
-        fill = b'\xff' * chunk_size_bytes
+        fill = bytes([fill_byte & 0xff]) * chunk_size_bytes
         offset = 0
         bar_width = 40
-        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..0xffffffff] ({dram_total_bytes / 1024**3:.2f} GB)")
+        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..0xffffffff] with 0x{fill_byte & 0xff:02x} ({dram_total_bytes / 1024**3:.2f} GB)")
         while offset < dram_total_bytes:
             write_size = min(chunk_size_bytes, dram_total_bytes - offset)
             self.dma_write(DMA_DEVICE_H2C, DRAM_START_ADDR + offset, fill[:write_size], write_size)

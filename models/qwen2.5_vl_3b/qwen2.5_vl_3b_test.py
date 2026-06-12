@@ -3408,9 +3408,6 @@ def main():
     print(f"  ──────────────────────────")
     print(f"  Total:            {total:.2f}s")
 
-    # Clear FPGA DRAM so stale scratch doesn't bleed into subsequent runs
-    # (see [[fpga_compare_clear_dram_oracle.md]] — 400 max|d| floor without this).
-    ue.clear_dram()
     print("Qwen2.5-VL-3B test ends.")
 
     run_result = {
