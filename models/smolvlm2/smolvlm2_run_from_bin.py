@@ -235,11 +235,16 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         final post-layernorm) so the params-DRAM pointer + baked addresses match the compile. The §7
         shared flash body allocates NO params, so these LN zeros are the encoder's only lazy params."""
         N, bpe = 768, 2
+        N_VIS_LAYERS = 12  # SigLIP vision encoder (run_from_bin loads from bin; no vis_layer_addrs)
         zeros = torch.zeros(N, dtype=torch.bfloat16)
-        for _ in range(3):  # final post-LN + shared-body LN1 + LN2 (layer_norm emitted once now)
-            addr = self.get_params_dram_addr()
-            self.allocate_params_dram(N * bpe)
-            self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
+        for _ in range(N_VIS_LAYERS):
+            for _ in range(2):  # LN1 + LN2
+                addr = self.get_params_dram_addr()
+                self.allocate_params_dram(N * bpe)
+                self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
+        addr = self.get_params_dram_addr()  # final post-layernorm
+        self.allocate_params_dram(N * bpe)
+        self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
 
     def load_all(self) -> dict:
         """Load the unified single instruction bin (encoder + decoder + prefill_v2) — mirror of
@@ -360,6 +365,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         from user_dma_core import TYPE
         seq_len = len(token_ids)
         self.seq_len = seq_len
+        self._prefill_token_ids = list(token_ids)  # seeds the repetition-penalty window in run_decoder
         H, D, G, bpe = self.HIDDEN_SIZE, self.HEAD_DIM, self.GROUP_SIZE, 2
         PM = self.PREFILL_MAX_SEQ_LEN
         assert seq_len <= PM, f"prompt {seq_len} exceeds PREFILL_MAX_SEQ_LEN={PM}"
@@ -436,6 +442,45 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self._last_total_flops = None
         return self.get_arg_max_index()
 
+    def _structural_token_ids(self):
+        """Token ids never repetition-penalized: punctuation, whitespace, and special tokens. Cached."""
+        cached = getattr(self, "_struct_ids_cache", None)
+        if cached is not None:
+            return cached
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–’‘“”…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        ids |= set(int(v) for v in _SMOLVLM2_CFG["special_tokens"].values())
+        for i in range(self.VOCAB_SIZE):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
+
+    def _structural_ids_tensor(self):
+        t = getattr(self, "_struct_ids_tensor_cache", None)
+        if t is None:
+            t = torch.tensor(sorted(self._structural_token_ids()), dtype=torch.long)
+            self._struct_ids_tensor_cache = t
+        return t
+
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """Per-vocab additive repetition bias → PENALTY_BIAS_DRAM (decode LM-head C term). bias[t] =
+        clamp(−alpha·count[t], min=−cap); structural tokens stay 0. HW argmax of (logits+bias) penalizes."""
+        vocab = self.VOCAB_SIZE
+        alpha = float(getattr(self, "pen_alpha", 1.0))
+        cap = float(getattr(self, "pen_cap", 20.0))
+        W = int(getattr(self, "rep_window", 256))
+        window = prev_tokens[-W:]
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0
+        bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
+
     def run_decoder(self, token_id: int, max_new_tokens: int = 512) -> list:
         """Auto-regressive decode loop (dynamic-PBI / §7). Each step writes a tiny preamble that
         primes gpr_seq_len + gpr_bucket_idx and jumps into the single cached decoder program."""
@@ -447,6 +492,16 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         num_buckets = self._decoder_num_buckets
         decoder_program_addr = self._decoder_program_addr
         preamble_addr = self._decoder_preamble_addr
+
+        # On-FPGA repetition penalty (same as test.py): the decode LM-head always adds PENALTY_BIAS_DRAM;
+        # zero it up front, then refresh each step past the greedy_until gate from the windowed frequency.
+        _fpga_penalty = bool(getattr(self, "fpga_penalty", True))
+        _greedy_until = int(getattr(self, "greedy_until", 0))
+        self._generated_tokens = list(getattr(self, "_prefill_token_ids", [])) + [token_id]
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                       torch.zeros(1, self.VOCAB_SIZE, dtype=torch.bfloat16))
+        if _fpga_penalty:
+            self._structural_ids_tensor()  # warm the structural-token cache off the first decode token
 
         _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
         while len(generated) < max_new_tokens and self.seq_len < self.max_seq_len:
@@ -475,13 +530,17 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            if _fpga_penalty and len(generated) >= _greedy_until:
+                self._write_penalty_bias(self._generated_tokens)
+
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(30.0)
 
-            # HW argmax: read the 4-byte argmax-index register the LM-head left, not the full logits.
+            # HW argmax: read the 4-byte (penalized) argmax-index register the LM-head left.
             token_id = self.get_arg_max_index()
 
             generated.append(token_id)
+            self._generated_tokens.append(token_id)
             _SILENT_MODE = False
             if token_id in _SMOLVLM2_CFG["model"]["stop_token_ids"]:
                 _original_print(f"\nStop token {token_id} reached.")
@@ -555,18 +614,28 @@ def main():
     parser = argparse.ArgumentParser(description="SmolVLM2-500M inference from pre-compiled bins")
     _d = _SMOLVLM2_CFG["defaults"]
     _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    parser.add_argument("--prompt", type=str, default=_d["prompt"])
-    parser.add_argument("--image", type=str, default=os.path.join(_root, _d["image"]))
+    _default_image = os.path.join(_root, _d["image"])
+    parser.add_argument("--prompt", type=str, default=None,
+                        help="Text prompt. Default: a text question (LM-only) or 'Describe this image.' (VLM).")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Path to an image. Providing it enables VLM. Default: none (LM-only text).")
+    parser.add_argument("--vision-enable", action="store_true",
+                        help="Enable the vision encoder (VLM) using --image, or the default sample image.")
     parser.add_argument("--dev", type=str, default=_d["dev"])
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"])
+    parser.add_argument("--pure-greedy", action="store_true", help="Disable the on-FPGA repetition penalty.")
+    parser.add_argument("--pen-alpha", type=float, default=1.0, help="Penalty strength α. Default 1.0.")
+    parser.add_argument("--pen-cap", type=float, default=20.0, help="Max penalty magnitude. Default 20.0.")
+    parser.add_argument("--rep-window", type=int, default=256, help="Penalty token window. Default 256.")
+    parser.add_argument("--greedy-until", type=int, default=None,
+                        help="Greedy for the first N tokens, then penalty. Default: 0 (LM) / 64 (VLM).")
     args = parser.parse_args()
 
     global _SILENT_MODE
     script_dir = os.path.dirname(os.path.abspath(__file__))
     bin_dir = os.path.join(script_dir, "smolvlm2_bin")
-    has_image = args.image is not None
 
     # Check all static bins before any hardware init
     def _missing_static_bins():
@@ -582,6 +651,16 @@ def main():
         for f in early_missing:
             _original_print(f"  {os.path.join(bin_dir, f)}")
         return
+
+    # VLM is opt-in at runtime: --vision-enable or --image. The bin is always the full VLM bin, so the
+    # encoder is available either way; this only decides whether vision RUNS. Default = LM-only text.
+    vision_on = bool(args.vision_enable) or (args.image is not None
+                                             and str(args.image).strip().lower() not in ("none", ""))
+    if vision_on and (args.image is None or str(args.image).strip().lower() in ("none", "")):
+        args.image = _default_image
+    if args.prompt is None:           # mode-appropriate default prompt (a text Q for LM-only)
+        args.prompt = _d["vlm_prompt"] if vision_on else _d["lm_prompt"]
+    has_image = vision_on
 
     set_dma_device(args.dev)
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
@@ -657,9 +736,14 @@ def main():
                 ue.dma_to_accelerator_memory(k_stale, stale_zeros)
                 ue.dma_to_accelerator_memory(v_stale, stale_zeros)
 
-    # Decode
+    # Decode — greedy_until is mode-dependent unless overridden (VLM postpones; LM penalizes from start).
+    _greedy_until = args.greedy_until if args.greedy_until is not None \
+        else (_d["vlm_greedy_until"] if vision_on else _d["lm_greedy_until"])
+    ue.fpga_penalty = not args.pure_greedy
+    ue.pen_alpha, ue.pen_cap, ue.rep_window, ue.greedy_until = args.pen_alpha, args.pen_cap, args.rep_window, _greedy_until
     max_new = args.max_seq - seq_len
-    _original_print(f"\n--- Starting decoder ---")
+    _original_print(f"\nPrompt:   {args.prompt}")
+    _original_print(f"Response: ", end="", flush=True)   # the generated answer streams right after this
     # run_decoder prints the seed token itself (mirrors smolvlm2_test.run_decoder), so don't pre-print.
     decode_timer = time.perf_counter()
     hw_tokens = ue.run_decoder(hw_token, max_new_tokens=max_new)

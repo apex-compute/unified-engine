@@ -288,7 +288,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         _original_print(f"  Params DRAM: {params_used/1024/1024:.1f} MB used / {params_limit/1024/1024:.0f} MB available"
                         + (" OVERFLOW!" if params_used > params_limit else ""))
 
-        # --- Vision encoder weights (bf16) ---
+        # --- Vision encoder weights (bf16) — always built so the instruction bin is the full VLM bin
+        # (one bin, robust + easy to maintain); whether vision RUNS is a runtime decision (--image). ---
         NPS = 32  # num_patches_per_side = 512 / 16
         boundaries = torch.arange(1.0 / NPS, 1.0, 1.0 / NPS, dtype=torch.float32)
         frac = torch.arange(NPS, dtype=torch.float32) / NPS * (1 - 1e-6)
@@ -487,76 +488,115 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             print(f"    RoPE padded-split [{S}, {pad_D}] × 4 arrays DMA'd")
         print(f"    RoPE cos/sin [{S}, {D}] DMA'd, theta={self.ROPE_THETA}")
 
+        # On-FPGA repetition-penalty per-vocab additive bias (the decode LM-head's C term, broadcast_N).
+        # Allocated LAST so its presence never shifts any earlier baked tensor address; zeros = no penalty.
+        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.VOCAB_SIZE * bpe)
+
     # --- Compile ---
     def compile_encoder(self) -> int:
-        """Compile vision encoder program. Returns DRAM address."""
+        """Compile vision encoder program (PORTABLE — released API only). Returns DRAM address.
+
+        12 structurally-identical SigLIP layers, UNROLLED, with every per-row op a PBI hardware loop so
+        the captured bin is structure-bound, not M-bound. No ``gpr_B_reg`` / layer-body sharing (that
+        needed a non-released ``matmat_mul_core`` extension — reverted). The two PBI row counts have
+        DIFFERENT meaning so they need two primed registers: ``matmat``/``eltwise`` ``gpr_M_reg`` is the
+        row count (= S); ``layer_norm`` ``gpr_M_reg`` is the *chunk* count (= S // chunk_size). §7 shared
+        flash + the strided-DMA fused head transpose are kept as-is.
+        """
         from user_dma_core import TYPE
         S, H, D, N_HEADS, I = 1024, 768, 64, 12, 3072
         bpe = 2
-        head_stride = S * D * bpe
-        permute_dims = [S, N_HEADS, D]          # [1024, 12, 64]
-        inv_permute_dims = [N_HEADS, S, D]      # [12, 1024, 64]
-        permute_indices = [1, 0, 2]             # swap first two dims
+
+        # layer_norm_core_dram_pbi chunking (replicated from the engine so we prime n_chunks correctly):
+        # ops_per_row = 4 + gamma + beta = 6; max_chunk = (256-4)//6; ideal = min(URAM//N, S, max_chunk);
+        # then the largest divisor of S that is <= ideal. All encoder LNs share M=S, N=H, gamma+beta.
+        _ln_ops_per_row = 6
+        _ln_chunk = min(URAM_NEAR_FULL_ELEMENTS // H, S, (256 - 4) // _ln_ops_per_row)
+        while S % _ln_chunk != 0:
+            _ln_chunk -= 1
+        ln_n_chunks = S // _ln_chunk
 
         self.start_capture()
 
+        # PBI row counts, primed once. vis_S_reg = S rows (matmat/eltwise); vis_ln_chunks = S//chunk (LN).
+        vis_S_reg = self.alloc_isa_reg()
+        vis_ln_chunks = self.alloc_isa_reg()
+        self.generate_instruction_add_set(vis_S_reg, S)
+        self.generate_instruction_add_set(vis_ln_chunks, ln_n_chunks)
+
         # === Patch embedding: pixels → [1024, 768] ===
-        # Permute: [C=3, H_patches=32, P=16, W_patches=32, P=16] → [32, 32, 3, 16, 16]
         P = 16
         H_patches = 32  # 512 / 16
-        smart_bf16_permute_core(self,dims=[3, H_patches, P, H_patches, P], permute_indices=[1, 3, 0, 2, 4],input_dram_addr=self.VIS_PIXEL_IN_DRAM, output_dram_addr=self.VIS_PATCH_PERM_DRAM,params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
-
-        # Patch projection: [1024, 768] @ weight + bias → [1024, 768]
-        self.matmat_mul_core(M=S, K=H, N=H,A_DRAM_ADDR=self.VIS_PATCH_PERM_DRAM, B_DRAM_ADDR=self.patch_weight_addr,OUTPUT_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM,C_DRAM_ADDR=self.patch_bias_addr, bias_mode="broadcast_N")
-
-        # Add position embeddings → first layer input
-        eltwise_add_core_dram(self, size=S * H,A_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM, B_DRAM_ADDR=self.pos_embed_addr,OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM)
+        smart_bf16_permute_core(self, dims=[3, H_patches, P, H_patches, P], permute_indices=[1, 3, 0, 2, 4],
+            input_dram_addr=self.VIS_PIXEL_IN_DRAM, output_dram_addr=self.VIS_PATCH_PERM_DRAM,
+            params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
+        self.matmat_mul_core(M=S, K=H, N=H, A_DRAM_ADDR=self.VIS_PATCH_PERM_DRAM, B_DRAM_ADDR=self.patch_weight_addr,
+            OUTPUT_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM, C_DRAM_ADDR=self.patch_bias_addr, bias_mode="broadcast_N",
+            gpr_M_reg=vis_S_reg)
+        eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM,
+            B_DRAM_ADDR=self.pos_embed_addr, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM)
 
         # §7 shared-subroutine attention (vision): the per-head flash body is compiled ONCE after the
         # encoder HALT; every per-(layer,head) call site marshals its head's [S, D] Q/K/V into the fixed
-        # VIS_FLASH buffers, bakes ADD_SET gpr_bucket(=S/64=16)+gpr_ret(return addr), and jumps in. This
-        # is a one-shot program: no runtime preamble, no fixed GPRs — vis_gpr_* alloc from a free index.
-        # vis_prog_base == the program-DRAM addr the bin is written to (no program-DRAM advance during
-        # capture), so the baked return addresses stay valid.
+        # VIS_FLASH buffers via a strided DMA (= the [S,768]→[12,S,64] head transpose), bakes ADD_SET
+        # gpr_bucket(=S/64=16)+gpr_ret, and jumps in. One-shot program; vis_prog_base == the bin load addr.
         vis_prog_base = self.get_program_dram_addr()
-        vis_gpr_bucket = self.alloc_isa_reg()           # §7 flash bucket selector
-        vis_gpr_ret = self.alloc_isa_reg()              # §7 flash return address
-        weight_base_reg = self.alloc_isa_reg()          # per-layer weight base (primed per call site)
-        layer_gpr_ret = self.alloc_isa_reg()            # shared-layer-body return address
-        vis_tmp_reg = self.alloc_isa_reg()              # marshalling / B-base address math
-        vis_call_sites: list[int] = []                  # §7 flash jump sites (inside the shared body)
-        vis_num_buckets = S // UE_VECTOR_SIZE           # 1024 // 64 = 16 (single full-attention segment)
+        vis_gpr_bucket = self.alloc_isa_reg()
+        vis_gpr_ret = self.alloc_isa_reg()
+        vis_call_sites: list[int] = []
+        vis_num_buckets = S // UE_VECTOR_SIZE   # 16 (single full-attention segment)
 
-        # === Encoder layers: ONE shared layer body (emitted after HALT); 12 tiny call-site stubs here.
-        # Per-layer weights sit at a uniform stride in params DRAM, so the shared body reads each layer's
-        # weights from weight_base_reg (primed per call site) + a fixed within-layer offset (big weights
-        # via gpr_B_reg; small biases/LN-gamma/beta marshalled to fixed scratch). Activations use VIS_CUR
-        # (= VIS_IO_A) in-place: LN1/LN2 read it, the residual writes it (after LN2's last read), so no
-        # ping-pong/copy is needed.
-        las = self.vis_layer_addrs
-        n_vis = len(las)
-        vwb = las[0]['q_weight']                         # vision weight base (first stored in weight_init)
-        per_layer_stride = las[1]['q_weight'] - vwb
-        woff = {k: las[0][k] - vwb for k in las[0]}      # within-layer byte offset of each weight/bias/ln
-        for _i in range(n_vis):                          # uniform-stride invariant (the shared body relies on it)
-            for _k, _o in woff.items():
-                assert las[_i][_k] == vwb + _i * per_layer_stride + _o, f"non-uniform vision weight layout: layer {_i} {_k}"
-        VIS_CUR = self.VIS_IO_A_DRAM                      # layer in/out, in-place
+        def vis_matmul(M, K, N, A, la, proj, OUT, bias=None, **kw):
+            self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_weight'],
+                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N", gpr_M_reg=vis_S_reg, **kw)
 
-        for layer_idx in range(n_vis):
-            self.generate_instruction_add_set(weight_base_reg, ue_35bit_addr_shifter(vwb + layer_idx * per_layer_stride))
-            self.pad_capture_to_64b_boundary()
-            ret_addr = ue_35bit_addr_shifter(vis_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-            self.generate_instruction_add_set(layer_gpr_ret, ret_addr)
-            layer_call_sites_idx = self.capture_count
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)   # → shared layer body (patched)
-            if layer_idx == 0:
-                layer_call_sites = []
-            layer_call_sites.append(layer_call_sites_idx)
+        for layer_idx, la in enumerate(self.vis_layer_addrs):
+            h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
+            h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
+            # LN1 (PBI)
+            self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
+                GAMMA_DRAM_ADDR=la['ln1_weight'], BETA_DRAM_ADDR=la['ln1_bias'], gpr_M_reg=vis_ln_chunks)
+            # Q/K/V projections (PBI)
+            for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
+                vis_matmul(S, H, H, self.VIS_LN_OUT_DRAM, la, proj, dst, bias=la[f'{proj}_bias'])
+            # §7 attention with fused strided-DMA head transpose (per-head gather → flash → scatter).
+            elems = S * D
+            col_stride = D * bpe   # one head's column block width
+            row_jump = H * bpe     # full [S, 768] row stride
+            for h in range(N_HEADS):
+                col = h * col_stride
+                for src, dst in ((self.VIS_Q_DRAM + col, self.VIS_FLASH_Q_DRAM),
+                                 (self.VIS_K_DRAM + col, self.VIS_FLASH_K_DRAM),
+                                 (self.VIS_V_DRAM + col, self.VIS_FLASH_V_DRAM)):
+                    self.accelerator_memory_to_sram(src, 0x00000, elems,
+                        stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+                    self.sram_to_accelerator_memory(0x00000, dst, elems)
+                self.generate_instruction_add_set(vis_gpr_bucket, S // UE_VECTOR_SIZE)
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    vis_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
+                vis_call_sites.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
+                self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
+                    stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+            # O projection + residual (eltwise) + LN2 (PBI) — split from the static post-add
+            vis_matmul(S, H, H, self.VIS_ATTN_RESULT_DRAM, la, 'o', self.VIS_O_PROJ_DRAM, bias=la['o_bias'])
+            eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
+                OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
+            self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
+                GAMMA_DRAM_ADDR=la['ln2_weight'], BETA_DRAM_ADDR=la['ln2_bias'], gpr_M_reg=vis_ln_chunks)
+            # MLP: fc1 + GELU, fc2, residual
+            vis_matmul(S, H, I, self.VIS_LN_OUT_DRAM, la, 'fc1', self.VIS_MLP_INTER_DRAM, bias=la['fc1_bias'], gelu_enable=True)
+            vis_matmul(S, I, H, self.VIS_MLP_INTER_DRAM, la, 'fc2', self.VIS_MLP_OUT_DRAM, bias=la['fc2_bias'])
+            eltwise_add_core_dram(self, size=S * H,
+                A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM, OUTPUT_DRAM_ADDR=h_out)
 
-        # Post-layernorm (reads VIS_CUR = final layer output), pixel shuffle, connector.
-        self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=VIS_CUR, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
-            GAMMA_DRAM_ADDR=self.vis_post_ln_weight, BETA_DRAM_ADDR=self.vis_post_ln_bias)
+        # Post-layernorm (PBI), pixel shuffle, connector (M=64, static).
+        final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
+        self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
+            GAMMA_DRAM_ADDR=self.vis_post_ln_weight, BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=vis_ln_chunks)
         smart_bf16_permute_core(self, dims=[8, 4, 8, 4, H], permute_indices=[0, 2, 1, 3, 4],
             input_dram_addr=self.VIS_POST_LN_DRAM, output_dram_addr=self.VIS_SHUFFLED_DRAM,
             params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
@@ -564,76 +604,9 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             A_DRAM_ADDR=self.VIS_SHUFFLED_DRAM, B_DRAM_ADDR=self.connector_weight_addr,
             OUTPUT_DRAM_ADDR=self.VIS_CONNECTOR_DRAM)
 
-        self.generate_instruction_halt()   # encoder ends; shared layer body + flash body follow.
+        self.generate_instruction_halt()   # encoder ends; shared flash body follows.
 
-        # ---- shared vision layer body (reached only via the call-site jumps) ----
-        def vis_marshal(name, dst_scratch, n):
-            # copy n bf16 elems from (weight_base_reg + woff[name]) → fixed dst_scratch via SRAM stage.
-            self.generate_instruction_add_imm(src_reg_idx=weight_base_reg,
-                immediate_value=ue_35bit_addr_shifter(woff[name]), dst_reg_idx=vis_tmp_reg)
-            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=0x60000,
-                element_size=n, general_reg_src=vis_tmp_reg)
-            self.sram_to_accelerator_memory(0x60000, dst_scratch, n)
-
-        def vis_matmul(M, K, N, A, proj, OUT, has_bias=True, **kw):
-            C = None
-            if has_bias:
-                vis_marshal(f'{proj}_bias', self.VIS_BIAS_SCRATCH, N)   # uses vis_tmp_reg, so set B base AFTER
-                C = self.VIS_BIAS_SCRATCH
-            self.generate_instruction_add_imm(src_reg_idx=weight_base_reg,
-                immediate_value=ue_35bit_addr_shifter(woff[f'{proj}_weight']), dst_reg_idx=vis_tmp_reg)
-            self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=0, OUTPUT_DRAM_ADDR=OUT,
-                C_DRAM_ADDR=C, bias_mode="broadcast_N", gpr_B_reg=vis_tmp_reg, **kw)
-
-        self.pad_capture_to_64b_boundary()
-        layer_body_start = vis_prog_base + self.capture_count * INSTRUCTION_SIZE_BYTES
-        # LN1
-        vis_marshal('ln1_weight', self.VIS_GAMMA_SCRATCH, H)
-        vis_marshal('ln1_bias', self.VIS_BETA_SCRATCH, H)
-        self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=VIS_CUR, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-            GAMMA_DRAM_ADDR=self.VIS_GAMMA_SCRATCH, BETA_DRAM_ADDR=self.VIS_BETA_SCRATCH)
-        # Q/K/V projections
-        for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
-            vis_matmul(S, H, H, self.VIS_LN_OUT_DRAM, proj, dst)
-        # §7 attention with fused strided-DMA head transpose (per-head gather → flash → scatter).
-        elems = S * D
-        col_stride = D * bpe   # one head's column block width
-        row_jump = H * bpe     # full [S, 768] row stride
-        for h in range(N_HEADS):
-            col = h * col_stride
-            for src, dst in ((self.VIS_Q_DRAM + col, self.VIS_FLASH_Q_DRAM),
-                             (self.VIS_K_DRAM + col, self.VIS_FLASH_K_DRAM),
-                             (self.VIS_V_DRAM + col, self.VIS_FLASH_V_DRAM)):
-                self.accelerator_memory_to_sram(src, 0x00000, elems,
-                    stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
-                self.sram_to_accelerator_memory(0x00000, dst, elems)
-            self.generate_instruction_add_set(vis_gpr_bucket, S // UE_VECTOR_SIZE)
-            self.pad_capture_to_64b_boundary()
-            return_word_addr = ue_35bit_addr_shifter(
-                vis_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-            self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
-            vis_call_sites.append(self.capture_count)
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-            self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
-            self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
-                stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
-        # O projection + LN2 post-add (residual + norm) + MLP + residual → VIS_CUR (in-place)
-        vis_matmul(S, H, H, self.VIS_ATTN_RESULT_DRAM, 'o', self.VIS_O_PROJ_DRAM)
-        vis_marshal('ln2_weight', self.VIS_GAMMA_SCRATCH, H)
-        vis_marshal('ln2_bias', self.VIS_BETA_SCRATCH, H)
-        layer_norm_core_dram_post_add(self, M=S, N=H, A_DRAM_ADDR=VIS_CUR, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
-            ADDOUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, NORMOUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-            GAMMA_DRAM_ADDR=self.VIS_GAMMA_SCRATCH, BETA_DRAM_ADDR=self.VIS_BETA_SCRATCH)
-        vis_matmul(S, H, I, self.VIS_LN_OUT_DRAM, 'fc1', self.VIS_MLP_INTER_DRAM, gelu_enable=True)
-        vis_matmul(S, I, H, self.VIS_MLP_INTER_DRAM, 'fc2', self.VIS_MLP_OUT_DRAM)
-        eltwise_add_core_dram(self, size=S * H,
-            A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM, OUTPUT_DRAM_ADDR=VIS_CUR)
-        self.generate_instruction_jump_reg_abs(layer_gpr_ret)   # return to the call site
-        # Patch the 12 layer call-site jumps → the shared layer body.
-        for _idx in layer_call_sites:
-            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(layer_body_start))
-
-        # ---- shared flash body (the §7 attention), after the layer body; patch the attention jumps ----
+        # ---- shared flash body (the §7 attention), after HALT; patch the attention jumps ----
         vis_sub_start, _vis_flops = self.flash_attention_core(head_dim=D, seq_len=S,
             Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM, K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
             V_DRAM_ADDR=self.VIS_FLASH_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
@@ -642,11 +615,10 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             gpr_bucket_idx=vis_gpr_bucket, num_buckets=vis_num_buckets, gpr_ret_id=vis_gpr_ret)
         for _idx in vis_call_sites:
             self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(vis_sub_start))
-        self.release_isa_reg()  # vis_tmp_reg
-        self.release_isa_reg()  # layer_gpr_ret
-        self.release_isa_reg()  # weight_base_reg
         self.release_isa_reg()  # vis_gpr_ret
         self.release_isa_reg()  # vis_gpr_bucket
+        self.release_isa_reg()  # vis_ln_chunks
+        self.release_isa_reg()  # vis_S_reg
         self.stop_capture()
         all_bytes = bytearray()
         for inst in self.capture_buffer:
@@ -880,16 +852,22 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
               f"{num_buckets} buckets, PM={PM}, qmax={qmax}")
 
     def _replay_encoder_ln_params(self) -> None:
-        """Replay compile_encoder's lazy layer_norm zero-buffer allocations so the params-DRAM pointer
-        + baked addresses match a fresh compile. Used by the cached-load path (compile_all cache hit /
-        run_from_bin). With the SHARED layer body, layer_norm is emitted once, so the only lazy LN
-        params are: final post-layernorm + the shared body's LN1 + LN2 = 3 buffers (traced)."""
+        """Replay compile_encoder's lazy layer_norm zero-buffer allocations (LN1 + LN2 per layer + one
+        final post-layernorm) so the params-DRAM pointer + baked addresses match a fresh compile. Used by
+        the cached-load path (compile_all cache hit / run_from_bin). The unrolled PBI encoder emits
+        layer_norm_core_dram (PBI) for every LN, each allocating one N-bf16 zeros buffer; the §7 flash
+        body + matmat/eltwise allocate NO params, so these LN zeros are the encoder's ONLY lazy params
+        (traced: N_vis*2+1)."""
         N, bpe = 768, 2
         zeros = torch.zeros(N, dtype=torch.bfloat16)
-        for _ in range(3):  # final post-LN + shared-body LN1 + LN2
-            addr = self.get_params_dram_addr()
-            self.allocate_params_dram(N * bpe)
-            self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
+        for _ in range(len(self.vis_layer_addrs)):
+            for _ in range(2):  # LN1 + LN2
+                addr = self.get_params_dram_addr()
+                self.allocate_params_dram(N * bpe)
+                self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
+        addr = self.get_params_dram_addr()  # final post-layernorm
+        self.allocate_params_dram(N * bpe)
+        self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
 
     def _restore_unified_addrs(self, meta: dict) -> None:
         """Set the program/preamble addresses the run_* methods read, from the unified-bin meta."""
@@ -914,7 +892,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         uni_bin = os.path.join(bin_dir, "instructions.bin")
         uni_meta = os.path.join(bin_dir, "instructions.json")
         sig = {"prefill_max_seq_len": self.PREFILL_MAX_SEQ_LEN, "num_layers": self.NUM_LAYERS,
-               "num_vis_layers": len(self.vis_layer_addrs)}
+               "num_vis_layers": len(self.vis_layer_addrs), "lm_head": "penalty_bias_argmax"}
 
         # ---- cache hit: replay the encoder LN params, DMA each segment to its stored abs addr ----
         if os.path.exists(uni_bin) and os.path.exists(uni_meta):
@@ -966,7 +944,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         with open(uni_meta, "w") as f:
             json.dump(meta, f)
         print(f"  Complete instruction bin: {len(raw)/1024/1024:.1f} MB, "
-              f"{len(segments)} segments (encoder+decoder+prefill) → {uni_bin}")
+              f"{len(segments)} segments ({'+'.join(s['name'] for s in segments)}) → {uni_bin}")
         return meta
 
     def load_prefill_v2(self) -> None:
@@ -1000,6 +978,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         from user_dma_core import TYPE
         seq_len = len(token_ids)
         self.seq_len = seq_len
+        self._prefill_token_ids = list(token_ids)  # seeds the repetition-penalty window in run_decoder
         H, D, G, bpe = self.HIDDEN_SIZE, self.HEAD_DIM, self.GROUP_SIZE, 2
         PM = self.PREFILL_MAX_SEQ_LEN
         assert seq_len <= PM, f"prompt {seq_len} exceeds PREFILL_MAX_SEQ_LEN={PM}"
@@ -1219,9 +1198,14 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
         self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=final_buf,
             OUTPUT_DRAM_ADDR=self.FINAL_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
+        # On-FPGA repetition penalty (llama3.2-style): the LM-head adds PENALTY_BIAS_DRAM as its per-vocab
+        # C bias (broadcast_N), so the HW argmax already returns the penalized token — no logit readback.
+        # The bias is always wired (zeros = pure greedy), so there is ONE decoder bin. write_back_disable
+        # skips the LOGITS_DRAM write (decode reads only the argmax register).
         self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
             B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-            SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
+            SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
+            C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N", write_back_disable=True)
 
         # Advance token position on-device so next decode step writes to the right KV slot
         self.generate_instruction_add_inc(self.gpr_seq_len)
@@ -1325,7 +1309,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             "LAYER0_Q_PERM_DRAM", "LAYER0_ATTN_OUT_DRAM", "LAYER0_ATTN_SCRATCH_DRAM",
             "LAYER0_ATTN_RESULT_DRAM", "LAYER0_O_PROJ_DRAM", "LAYER0_RESIDUAL_DRAM",
             "LAYER0_MLP_GATE_DRAM", "LAYER0_MLP_UP_DRAM", "LAYER0_MLP_MULT_DRAM",
-            "LAYER0_MLP_DOWN_DRAM", "FINAL_NORM_DRAM", "LOGITS_DRAM",
+            "LAYER0_MLP_DOWN_DRAM", "FINAL_NORM_DRAM", "LOGITS_DRAM", "PENALTY_BIAS_DRAM",
             "CAUSAL_MASK_DRAM", "DECODE_BIAS_DRAM",
             "VIS_PIXEL_IN_DRAM", "VIS_PATCH_PERM_DRAM", "VIS_PATCH_PROJ_DRAM",
             "VIS_IO_A_DRAM", "VIS_IO_B_DRAM", "VIS_LN_OUT_DRAM",
@@ -1469,6 +1453,51 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.LAYER0_ATTN_SCRATCH_DRAM, z_scr)
         self.dma_to_accelerator_memory(self.LOGITS_DRAM, z_V)
 
+    def _structural_token_ids(self):
+        """Token ids that must NEVER be repetition-penalized: punctuation, whitespace, and special
+        tokens (image/fake/global/end-of-utterance). These 'glue' tokens recur in any text; penalizing
+        them over a long generation is what starves a small model of grammar and yields word-salad.
+        Computed once from the vocab + config special tokens, cached."""
+        cached = getattr(self, "_struct_ids_cache", None)
+        if cached is not None:
+            return cached
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–’‘“”…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        ids |= set(int(v) for v in _SMOLVLM2_CFG["special_tokens"].values())
+        for i in range(self.VOCAB_SIZE):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
+
+    def _structural_ids_tensor(self):
+        t = getattr(self, "_struct_ids_tensor_cache", None)
+        if t is None:
+            t = torch.tensor(sorted(self._structural_token_ids()), dtype=torch.long)
+            self._struct_ids_tensor_cache = t
+        return t
+
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """Build the per-vocab additive repetition bias from windowed token frequency and DMA it to
+        PENALTY_BIAS_DRAM (the decode LM-head's C term, broadcast_N). bias[t] = clamp(−alpha·count[t],
+        min=−cap); structural tokens stay 0. The HW argmax of (logits + bias) returns the penalized
+        token — no logit readback. One full-buffer DMA per step (incremental writes pay more in device
+        open/close than the tiny transfer saves)."""
+        vocab = self.VOCAB_SIZE
+        alpha = float(getattr(self, "pen_alpha", 1.0))
+        cap = float(getattr(self, "pen_cap", 20.0))
+        W = int(getattr(self, "rep_window", 256))
+        window = prev_tokens[-W:]
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0
+        bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
+
     def run_decoder(self, token_id: int, max_new_tokens: int = 512, clear_scratch: bool = False) -> list:
         """Auto-regressive decode loop. Returns generated token IDs.
         clear_scratch=True zeros all scratch DRAM between steps (diagnostic)."""
@@ -1480,6 +1509,17 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         num_buckets = self._decoder_num_buckets
         decoder_program_addr = self._decoder_program_addr
         preamble_addr = self._decoder_preamble_addr
+
+        # On-FPGA repetition penalty: track every token seen (prompt + the prefill seed token + decoded)
+        # for the windowed bias. The decode LM-head always adds PENALTY_BIAS_DRAM as its C term, so zero
+        # it up front (→ pure greedy until the greedy_until gate), then refresh per step past the gate.
+        _fpga_penalty = bool(getattr(self, "fpga_penalty", True))
+        _greedy_until = int(getattr(self, "greedy_until", 0))
+        self._generated_tokens = list(getattr(self, "_prefill_token_ids", [])) + [token_id]
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                       torch.zeros(1, self.VOCAB_SIZE, dtype=torch.bfloat16))
+        if _fpga_penalty:
+            self._structural_ids_tensor()  # warm the structural-token cache off the first decode token
 
         # Live t/s counter (same as gemma3): pin the bottom terminal row as a status line
         # via an ANSI scroll region; tokens stream above it and the rate refreshes in place.
@@ -1543,14 +1583,21 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            # Refresh the per-vocab penalty bias (this step's LM-head C term) from the windowed token
+            # frequency once past the greedy_until gate, so the HW argmax of (logits + bias) returns the
+            # penalized token directly. Before the gate the bias stays zero → pure greedy.
+            if _fpga_penalty and len(generated) >= _greedy_until:
+                self._write_penalty_bias(self._generated_tokens)
+
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(30.0)
 
-            # HW argmax: the LM-head matmul leaves the argmax index in a register, so read 4 bytes
-            # instead of DMA-ing back the full VOCAB_SIZE logits (~98 KB) + host argmax every token.
+            # HW argmax: the LM-head matmul leaves the (penalized) argmax index in a register, so read 4
+            # bytes instead of DMA-ing back the full VOCAB_SIZE logits (~98 KB) + host argmax every token.
             token_id = self.get_arg_max_index()
 
             generated.append(token_id)
+            self._generated_tokens.append(token_id)
             _SILENT_MODE = False
             if token_id in _SMOLVLM2_CFG["model"]["stop_token_ids"]:
                 if _use_status:
@@ -1892,8 +1939,13 @@ def main():
     parser = argparse.ArgumentParser(description="SmolVLM2-500M on accelerator (bf16 vision + q4 LM)")
     _d = _SMOLVLM2_CFG["defaults"]
     _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    parser.add_argument("--prompt", type=str, default=_d["prompt"], help="Text prompt")
-    parser.add_argument("--image", type=str, default=os.path.join(_root, _d["image"]), help="Path to image file (None for text-only)")
+    _default_image = os.path.join(_root, _d["image"])
+    parser.add_argument("--prompt", type=str, default=None,
+                        help="Text prompt. Default: a text question (LM-only) or 'Describe this image.' (VLM).")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Path to an image. Providing it enables VLM. Default: none (LM-only text).")
+    parser.add_argument("--vision-enable", action="store_true",
+                        help="Enable the vision encoder (VLM) using --image, or the default sample image if none is given.")
     parser.add_argument("--dev", type=str, default=_d["dev"], help="DMA device name")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
@@ -1901,6 +1953,15 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Staged NaN/cosine localizer: verify vision + per-layer prefill_v2 vs HF CPU reference, then exit (no decode)")
     parser.add_argument("--verify_prefill", action="store_true", help="After hardware prefill, run CPU decode using HF model to confirm model output (skips hardware decoder)")
     parser.add_argument("--clear_scratch", action="store_true", help="Zero all scratch DRAM between decode steps (diagnostic for step-2 hang)")
+    pen = parser.add_argument_group("on-FPGA repetition penalty (ENABLED by default; breaks decode loops)")
+    pen.add_argument("--pure-greedy", action="store_true",
+                     help="Disable the on-FPGA repetition penalty — plain greedy decode.")
+    pen.add_argument("--pen-alpha", type=float, default=1.0, help="Penalty strength α (bias = −α·count). Default 1.0.")
+    pen.add_argument("--pen-cap", type=float, default=20.0, help="Max penalty magnitude (clamp). Default 20.0.")
+    pen.add_argument("--rep-window", type=int, default=256, help="Token window counted for the penalty. Default 256.")
+    pen.add_argument("--greedy-until", type=int, default=None,
+                     help="Pure greedy for the first N decoded tokens, then penalty turns on. "
+                          "Default: 0 (LM-only, loops early) or 64 (VLM, let the caption form first).")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1923,14 +1984,22 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
-    # Start from clean (zeroed) DRAM. The previous run's clear_dram() fills 0xFF (=NaN
-    # in bf16), which poisons any read-before-write region and breaks back-to-back runs.
-    ue.zero_dram()
+    # VLM (vision) is opt-in at RUNTIME: enabled by --vision-enable or by passing --image. The instruction
+    # bin is ALWAYS the full VLM bin (encoder+decoder+prefill) — built once, robust + easy to maintain;
+    # this flag only decides whether the vision encoder actually RUNS this invocation. Default = LM-only.
+    vision_on = bool(args.vision_enable) or (args.image is not None
+                                             and str(args.image).strip().lower() not in ("none", ""))
+    if vision_on and (args.image is None or str(args.image).strip().lower() in ("none", "")):
+        args.image = _default_image   # --vision-enable with no --image → use the default sample image
+    if args.prompt is None:           # mode-appropriate default prompt (a text Q for LM-only)
+        args.prompt = _d["vlm_prompt"] if vision_on else _d["lm_prompt"]
+    # No startup DRAM zeroing: each run already zero_dram()s at the END (below), so the next run starts
+    # clean; weights/instructions are DMA'd over their regions. (Avoids the slow 2 GB zero every launch.)
     init_hang_prevention(ue)
     # Load the snapshot (weights.bin) ONLY when the instruction bin also exists — i.e. a pure load run.
     # If instructions.bin is missing we must compile_all, and compile_encoder needs the full vision
-    # weight addresses (patch_weight_addr, vis_layer_addrs, …) that weight_init sets but the snapshot
-    # does not restore. So: load-both, or build-both — never load-snapshot-then-compile.
+    # weight addresses that weight_init sets but the snapshot does not restore. So: load-both, or
+    # build-both — never load-snapshot-then-compile.
     _bin_dir = os.path.join(script_dir, "smolvlm2_bin")
     _have_instr_bin = (os.path.exists(os.path.join(_bin_dir, "instructions.bin"))
                        and os.path.exists(os.path.join(_bin_dir, "instructions.json")))
@@ -1938,7 +2007,7 @@ def main():
         ue.weight_init()
         ue.tensor_init(max_seq_len=args.max_seq)
         ue.dump_snapshot()
-    has_image = args.image is not None and str(args.image).strip().lower() not in ("none", "")
+    has_image = vision_on
     token_ids = build_input_ids(ue.tokenizer, args.prompt, has_image=has_image)
     seq_len = len(token_ids)
     _SILENT_MODE = False
@@ -2044,25 +2113,25 @@ def main():
         return
 
     # --- Decode (on-device embed fused with decoder, single dispatch per token) ---
+    # On-FPGA repetition penalty config (runtime-only; the bias is always wired into the decode LM-head).
+    # greedy_until is mode-dependent unless the user overrode it: VLM captions are bounded + good early,
+    # so postpone the penalty; LM-only loops early, so penalize from the first token.
+    _greedy_until = args.greedy_until if args.greedy_until is not None \
+        else (_d["vlm_greedy_until"] if vision_on else _d["lm_greedy_until"])
+    ue.fpga_penalty = not args.pure_greedy
+    ue.pen_alpha, ue.pen_cap, ue.rep_window, ue.greedy_until = args.pen_alpha, args.pen_cap, args.rep_window, _greedy_until
     max_new = args.max_seq - seq_len
-    _original_print(f"\n--- Starting decoder ---")
+    _original_print(f"\nPrompt:   {args.prompt}")
+    _original_print(f"Response: ", end="", flush=True)   # the generated answer streams right after this
     decode_timer = time.perf_counter()
     hw_tokens = ue.run_decoder(hw_token, max_new_tokens=max_new, clear_scratch=args.clear_scratch)
     decode_time = time.perf_counter() - decode_timer
     total_time = prefill_time + decode_time
     n_generated = len(hw_tokens)
     _original_print(f"\nDecoder done in {total_time:.2f} seconds, total {n_generated} tokens.")
-    _original_print("SmolVLM2 test ends.")
-    decoded_text = ue.tokenizer.decode(hw_tokens, skip_special_tokens=True)
-    _original_print(f"TEST_RESULT: {json.dumps({
-        'prefill_tokens':      seq_len,
-        'decoded_text':        decoded_text,
-        'decoded_tokens':      n_generated,
-        'prefill_speed_tok_s': round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0,
-        'decode_speed_tok_s':  round(n_generated / decode_time, 2) if decode_time > 0 else 0.0,
-        'prefill_size_kb':     None,
-        'decoder_size_kb':     None,
-    })}")
+    _original_print(
+        f"SmolVLM2 test ends. prefill {round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0} tok/s, "
+        f"decode {round(n_generated / decode_time, 2) if decode_time > 0 else 0.0} tok/s.")
 
     # Reset device DRAM + soft-reset at end of execution so leftover program/KV/scratch
     # state doesn't contaminate the next model run. Use zero_dram() (not clear_dram(),

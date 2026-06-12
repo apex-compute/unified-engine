@@ -66,7 +66,10 @@
     "hf_model_dir": "smolvlm2_bin/SmolVLM2-500M-Video-Instruct"
   },
   "defaults": {
-    "prompt": "Describe this image.",
+    "lm_prompt": "What is the capital of France?",
+    "vlm_prompt": "Describe this image.",
+    "lm_greedy_until": 0,
+    "vlm_greedy_until": 64,
     "image": "test_samples/vette.jpg",
     "dev": "xdma0",
     "cycle_ns": 5.63,
