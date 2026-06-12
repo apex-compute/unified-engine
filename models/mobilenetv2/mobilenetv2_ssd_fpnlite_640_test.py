@@ -1184,11 +1184,34 @@ def decode_boxes(box_deltas: torch.Tensor, anchors: torch.Tensor) -> torch.Tenso
     return torch.stack([ymin, xmin, ymax, xmax], dim=-1)
 
 
+def _nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
+    """Greedy NMS, pure torch (torchvision-free). boxes: (N,4) xyxy, scores: (N,).
+    Returns kept indices ordered by descending score, matching torchvision.ops.nms."""
+    if boxes.numel() == 0:
+        return torch.empty(0, dtype=torch.int64)
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        i = order[0]
+        keep.append(int(i))
+        if order.numel() == 1:
+            break
+        rest = order[1:]
+        xx1 = torch.maximum(x1[i], x1[rest]); yy1 = torch.maximum(y1[i], y1[rest])
+        xx2 = torch.minimum(x2[i], x2[rest]); yy2 = torch.minimum(y2[i], y2[rest])
+        inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
+        iou = inter / (areas[i] + areas[rest] - inter)
+        order = rest[iou <= iou_thresh]
+    return torch.tensor(keep, dtype=torch.int64)
+
+
 def nms_detections(boxes: torch.Tensor, scores: torch.Tensor,
                    score_thresh: float = 0.3, iou_thresh: float = 0.6,
                    max_total: int = 100):
     """Per-class NMS. scores: (N, K) for K foreground classes. Returns lists."""
-    from torchvision.ops import nms
+    nms = _nms
     keep_boxes, keep_scores, keep_labels = [], [], []
     K = scores.shape[1]
     for c in range(K):
@@ -1335,6 +1358,11 @@ class SSDFPNLite_UnifiedEngine(UnifiedEngine):
         self.N_TOWER      = m["n_tower"]
         self.CLS_OUT_CH   = self.NUM_ANCHORS * self.NUM_CLASSES
         self.BOX_OUT_CH   = self.NUM_ANCHORS * 4
+        # Padded output channels are deterministic from config and are needed by
+        # tensor_init() even on the cached-params path (where weight_init(), which
+        # also sets these, is skipped). Compute them here so both paths have them.
+        self.CLS_OUT_CH_PAD = self.pad_dim(self.CLS_OUT_CH)
+        self.BOX_OUT_CH_PAD = self.pad_dim(self.BOX_OUT_CH)
 
         # Flatten IR_SETTING into 17 per-block dicts with TRUE & padded channels.
         self.blocks = self._expand_blocks()

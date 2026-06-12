@@ -3413,5 +3413,16 @@ def main():
     ue.clear_dram()
     print("Qwen2.5-VL-3B test ends.")
 
+    run_result = {
+        "prefill_tokens": len(prefill_seq),
+        "decoded_text": decoded_text,
+        "decoded_tokens": n_new,
+        "prefill_speed_tok_s": round(len(prefill_seq) / latency_prefill, 2) if latency_prefill > 0 else None,
+        "decode_speed_tok_s": round(n_new / latency_decoder, 2) if latency_decoder > 0 else None,
+        "prefill_size_kb": None,
+        "decoder_size_kb": None,
+    }
+    print(f"TEST_RESULT: {json.dumps(run_result)}")
+
 if __name__ == "__main__":
     main()

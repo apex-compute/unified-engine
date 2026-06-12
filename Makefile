@@ -89,7 +89,7 @@ program_with_artifact:
 	echo "🔧 Programming FPGA with $$BIT_FILE ..."; \
 	$(MAKE) program TARGET=$(TARGET) BITFILE="$$BIT_FILE"
 
-model_test:
+model_test: clean
 	python model_auto_test.py
 
 model_test_new:

@@ -1664,6 +1664,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
                                        torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
 
+        decoded_chars: list[str] = []
         while self.seq_len < max_seq_len:
             _SILENT_MODE = True
             # self.seq_len at entry is the count of K/V already in cache; the
@@ -1710,7 +1711,9 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             if token_id in _qwen3_stop_tokens:
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
+        self.last_decoded_text = "".join(decoded_chars)
         return self.seq_len
 
 # -----------------------------------------------------------------------------
@@ -1842,6 +1845,17 @@ def main():
           f"speed: {decoded_tokens / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
     ue.clear_dram()
     print("Qwen3-4B test ends.")
+
+    run_result = {
+        "prefill_tokens": actual_seq_len,
+        "decoded_text": getattr(ue, "last_decoded_text", ""),
+        "decoded_tokens": decoded_tokens,
+        "prefill_speed_tok_s": round(actual_seq_len / latency_prefill, 2) if latency_prefill > 0 else None,
+        "decode_speed_tok_s": round(decoded_tokens / latency_decoder, 2) if latency_decoder > 0 else None,
+        "prefill_size_kb": None,
+        "decoder_size_kb": None,
+    }
+    print(f"TEST_RESULT: {json.dumps(run_result)}")
 
 if __name__ == "__main__":
     main()
