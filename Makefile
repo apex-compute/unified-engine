@@ -145,7 +145,7 @@ model_test_help:
 	@echo "  make model_test gemma3 run_from_bin          # reuse cached bin, no rebuild"
 
 model_test_new:
-	python model_auto_test.py --only locateanything_3b parakeet mobilenetv2_224 mobilenetv2_ssd_640
+	python model_auto_test.py --only locateanything_3b parakeet mobilenetv2_224 mobilenetv2_ssd_640 swin
 
 .PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test model_test_new model_test_help verbose nohup run_from_bin $(_MT_MODELS)
 

@@ -155,6 +155,11 @@ TESTS = [
         "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",
         "pass_check": _check_mbv2_ssd,
     },
+    {
+        "name": "swin",
+        "script": "models/swin/swin_test.py",
+        "pass_check": _check_nonempty,
+    },
 ]
 
 
