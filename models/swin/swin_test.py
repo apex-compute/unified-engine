@@ -1706,6 +1706,9 @@ def main():
     _original_print(f"\n  Image: {image_path}")
     _original_print(f"  Prediction: {label!r} (class {predicted_idx})")
 
+    import json as _json
+    _original_print(f"TEST_RESULT: {_json.dumps({'decoded_text': label})}")
+
 
 if __name__ == "__main__":
     main()
