@@ -8912,7 +8912,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         if hasattr(self, "_mm_types") and self._mm_types is not None and pad_count > 0:
             self._mm_types = list(self._mm_types[:actual_seq_len]) + [0] * pad_count
 
-        print(f"[dyn-prefill] actual={actual_seq_len} padded_to={prefill_max}, addr=0x{prefill_program_addr:X}")
+        print(f"[dyn-prefill] actual={actual_seq_len}, template_buffer={prefill_max}, "
+              f"gpr_seq_len={prefill_max}, addr=0x{prefill_program_addr:X}")
 
         # ------------------------------------------------------------------
         # LM-state restore (post vision/audio compile). vision_tensor_init
@@ -8981,6 +8982,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
+        _maxdec = os.environ.get("GEMMA4_MAX_DECODE")   # benchmark cap (e.g. 128); default off
+        if _maxdec:
+            max_seq_len = min(max_seq_len, self.seq_len + int(_maxdec))
         total_latency, total_flop_rate = 0, 0
         # Single program (dynamic PBI). Ignore decoder_program_sizes length.
         prog_addr = decoder_base_addr
@@ -9206,15 +9210,12 @@ def main():
     instr_bin = os.path.join(bin_dir, "gemma4_instruction.bin")
     instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
     if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
-        # GEMMA4_LM_ONLY_BIN=1 skips the vision/audio sections (smaller bin,
-        # faster compile for text-only experimentation).
-        _lm_only = bool(int(os.environ.get("GEMMA4_LM_ONLY_BIN", "0")))
-        _img = None if _lm_only else DEFAULT_IMAGE
-        _aud = None if _lm_only else DEFAULT_AUDIO
-        section_desc = "LM" if _lm_only else "LM + vision + audio"
-        print(f"\n--- First-time compile: building {section_desc} into gemma4_instruction.bin ---")
+        # Always build the COMPLETE LM + vision + audio bin (no LM-only option):
+        # the bin holds ISA only, so unused modes cost nothing at runtime, and any
+        # later run / run_from_bin / mode can rely on every section being present.
+        print(f"\n--- First-time compile: building LM + vision + audio into gemma4_instruction.bin ---")
         timer = time.perf_counter()
-        ue.compile_instruction_bin(image_path=_img, audio_path=_aud)
+        ue.compile_instruction_bin(image_path=DEFAULT_IMAGE, audio_path=DEFAULT_AUDIO)
         print(f"[compile] unified bin built in {time.perf_counter() - timer:.2f} seconds")
     else:
         print(f"[compile] gemma4_instruction.bin already present, skipping ISA emission.")

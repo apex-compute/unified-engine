@@ -106,15 +106,17 @@ gemma4_e2b_bin/
 - `GEMMA4_LM_ONLY_BIN=1` during build skips the vision/audio instruction
   sections for a smaller LM-only artifact.
 
-## Prompt-length limits (dynamic PBI)
+## Prompt-length limits
 
-The model ships as a single prefill + single decoder program
-(`prefill_max_seq_len` and bucket-dispatched decoder; no per-bucket
-ISA copies):
+The model ships as a single prefill template plus a single dynamic
+decoder program (`prefill_max_seq_len` and bucket-dispatched decoder;
+no per-bucket ISA copies):
 
 - **`prefill_max_seq_len` (config, default `512`)** — prompts up to
-  this length are supported. Shorter prompts are padded at the host
-  with the last real token; causal bias masks padded positions.
+  this length are supported. Shorter prompts are extended in the host
+  buffer with the last real token for the static prefill template;
+  decode starts from the actual prompt length, so those extra KV rows
+  are not used as context.
 - **Decoder:** single captured program serves all context lengths
   up to `max_context_size` (default `1024`) via the
   `decoder_group_attention_core` bucket dispatcher.

@@ -7379,7 +7379,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         if hasattr(self, "_mm_types") and self._mm_types is not None and pad_count > 0:
             self._mm_types = list(self._mm_types[:actual_seq_len]) + [0] * pad_count
 
-        print(f"[dyn-prefill] actual={actual_seq_len} padded_to={prefill_max}, addr=0x{prefill_program_addr:X}")
+        print(f"[dyn-prefill] actual={actual_seq_len}, template_buffer={prefill_max}, "
+              f"gpr_seq_len={prefill_max}, addr=0x{prefill_program_addr:X}")
 
         # ------------------------------------------------------------------
         # LM-state restore (post vision/audio compile). vision_tensor_init
@@ -7444,6 +7445,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
+        _maxdec = os.environ.get("GEMMA4_MAX_DECODE")   # benchmark cap (e.g. 128); default off
+        if _maxdec:
+            max_seq_len = min(max_seq_len, self.seq_len + int(_maxdec))
         total_latency, total_flop_rate = 0, 0
         prog_addr = decoder_base_addr
         flops_per_token_scalar = flops_per_token[0] if flops_per_token else None
@@ -7477,6 +7481,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         import shutil
         _dec_start_seq = self.seq_len
         _dec_timer = time.perf_counter()
+        _first_tok_dt = None   # wall-clock of the 1st decoded token → peak tok/s
+        _decoded_n = 0         # number of decode steps (for average tok/s)
         _use_status = sys.stdout.isatty()
         def _status_setup():
             rows = shutil.get_terminal_size().lines
@@ -7504,6 +7510,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         while self.seq_len < max_seq_len:
             _SILENT_MODE = True
+            _tok_t0 = time.perf_counter()               # per-token wall-clock start
             self.seq_len += 1
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
             dec_bucket_idx = aligned_seq_len // UE_VECTOR_SIZE  # 1-based
@@ -7546,6 +7553,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
 
+            _tok_dt = time.perf_counter() - _tok_t0
+            if _first_tok_dt is None:
+                _first_tok_dt = _tok_dt                  # 1st token (shortest context) → peak
+            _decoded_n += 1
+
             if token_id in [1, self._end_of_turn_token_id]:
                 if _use_status:
                     _status_teardown()
@@ -7557,6 +7569,12 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         else:
             if _use_status:
                 _status_teardown()
+        # Decode-speed report (loop wall-clock basis — matches gemma4_e2b_test.py).
+        _elapsed = time.perf_counter() - _dec_timer
+        _peak = (1.0 / _first_tok_dt) if _first_tok_dt else 0.0
+        _avg = (_decoded_n / _elapsed) if _elapsed > 0 else 0.0
+        print(f"\nDecode speed: peak (1st token) {_peak:.2f} tok/s, "
+              f"average {_avg:.2f} tok/s  ({_decoded_n} tokens in {_elapsed:.2f}s)")
         return self.seq_len, total_latency, total_flop_rate
 
 # -----------------------------------------------------------------------------
