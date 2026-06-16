@@ -33,10 +33,13 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, UE_FMAX_CONTEXT_SIZE,
     set_dma_device, UnifiedEngine, calculate_snr,
+    INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,
 )
 import warnings as _warnings
 _warnings.filterwarnings("ignore")
 import torch.nn as _nn
+
+from nn_lib import flash_attention_batched_pbi
 
 COMPUTE_DTYPE = torch.bfloat16
 
@@ -127,6 +130,99 @@ def broadcast_mul_dram(ue: UnifiedEngine, ADDR: int,
         ue.broadcast_mul(scalar=scalar, sram_start_addr=0x00000,
                          sram_wb_addr=0x00000, element_size=take)
         ue.sram_to_accelerator_memory(0x00000, ADDR + offset * _BPE, take)
+
+
+def pbi_strided_copy(ue: UnifiedEngine, gpr: int,
+                     src_base: int, dst_base: int, count: int,
+                     copy_bytes: int, src_stride: int, dst_stride: int) -> None:
+    if copy_bytes <= 0 or copy_bytes % 2 != 0:
+        raise ValueError(f"pbi_strided_copy: copy_bytes must be a positive even (bf16) byte count, got {copy_bytes}")
+    if copy_bytes > URAM_NEAR_FULL_ELEMENTS * 2:
+        raise ValueError(
+            f"pbi_strided_copy: copy_bytes={copy_bytes} exceeds one staging row "
+            f"({URAM_NEAR_FULL_ELEMENTS * 2} bytes)")
+    if count < 1:
+        raise ValueError(f"pbi_strided_copy: count must be >=1, got {count}")
+
+    ue._isa_reg_counter = gpr + 1
+    ue.reset_inst_ptr_counter()
+    ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=count)
+
+    _, load_uram_row = ue.sram_address_to_uram_address(0x00000)
+    _, store_uram_row = ue.sram_address_to_uram_address(0x00000)
+
+    ptr_src = ue.alloc_inst_ptr()
+    ptr_dst = ue.alloc_inst_ptr()
+
+    ue.generate_instruction_pbi_init(
+        dram_shared_addr=src_base, dma_length=copy_bytes,
+        uram_dst_addr=load_uram_row, inst_pointer_idx=ptr_src,
+    )
+    ue.generate_instruction_pbi_init(
+        dram_shared_addr=dst_base, dma_length=copy_bytes,
+        uram_a_start_addr=store_uram_row, inst_pointer_idx=ptr_dst,
+    )
+
+    program_dram_start_addr = ue.get_program_dram_addr()
+    cur_inst_count = ue.capture_count
+    ue.generate_instruction_jump_abs(
+        ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
+        )
+    )
+
+    ue.loop_start(loop_cnt=count, gpr_loop_cnt=gpr)
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src_stride, sram_address=0x00000,
+        element_size=0, inst_pointer_idx=ptr_src,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000, accelerator_dram_address=dst_stride,
+        element_size=0, inst_pointer_idx=ptr_dst,
+    )
+    body = ue.loop_end()
+    assert body <= 256, f"pbi_strided_copy: loop body {body} exceeds 256 i-cache budget"
+
+    ue.release_inst_ptr(ptr_dst)
+    ue.release_inst_ptr(ptr_src)
+
+
+def multihead_reshape_dram_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
+                                OUTPUT_DRAM_ADDR: int, TEMP_DRAM_ADDR: int,
+                                seq_len: int, num_heads: int,
+                                head_dim: int, head_dim_pad: int,
+                                gpr_pbi: int,
+                                input_row_stride: int = None) -> None:
+    if input_row_stride is None:
+        input_row_stride = num_heads * head_dim
+
+    padded_dim = num_heads * head_dim_pad
+    dram_zero_fill(ue, TEMP_DRAM_ADDR, seq_len * padded_dim)
+
+    pbi_strided_copy(
+        ue, gpr_pbi,
+        src_base=INPUT_DRAM_ADDR,
+        dst_base=TEMP_DRAM_ADDR,
+        count=seq_len * num_heads,
+        copy_bytes=head_dim * _BPE,
+        src_stride=head_dim * _BPE,
+        dst_stride=head_dim_pad * _BPE,
+    )
+
+    head_bytes = head_dim_pad * _BPE
+    temp_row_stride = padded_dim * _BPE
+    output_head_stride = seq_len * head_dim_pad * _BPE
+
+    for h in range(num_heads):
+        pbi_strided_copy(
+            ue, gpr_pbi,
+            src_base=TEMP_DRAM_ADDR + h * head_bytes,
+            dst_base=OUTPUT_DRAM_ADDR + h * output_head_stride,
+            count=seq_len,
+            copy_bytes=head_bytes,
+            src_stride=temp_row_stride,
+            dst_stride=head_bytes,
+        )
 
 
 def multihead_reshape_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
@@ -907,9 +1003,7 @@ class MobileSAM_UE(UnifiedEngine):
                            SA_SCALE_CORRECTION,
                            DEC_HEADS * NT_PAD * DEC_HD_PAD)
 
-        # flash_attention_batched: (8 batches, seq=64, head_dim=64)
-        dram_zero_fill(self, self.SA_ATTN_OUT, DEC_HEADS * NT_PAD * DEC_HD_PAD)
-        flash_attention_batched(
+        flash_attention_batched_pbi(
             self,
             num_batches=DEC_HEADS,
             head_dim=DEC_HD_PAD,
@@ -919,7 +1013,10 @@ class MobileSAM_UE(UnifiedEngine):
             V_DRAM_ADDR=self.SA_V_HEADS,
             OUTPUT_DRAM_ADDR=self.SA_ATTN_OUT,
             SCRATCH_DRAM_ADDR=self.SA_SCRATCH,
+            ATTN_P_DRAM_ADDR=0,
+            IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
             BIAS_DRAM_ADDR=self.DEC_SA_BIAS,
+            _silent=True,
         )
 
         # Merge (heads, NT_PAD, hd_pad) → (NT_PAD, 256) via permute + unpad matmul
@@ -2255,7 +2352,7 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _run_s1_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
                       gpr_ntok: int = None, gpr_hw: int = None,
-                      gpr_flash: int = None) -> None:
+                      gpr_flash: int = None, gpr_pbi: int = None) -> None:
         """Run one TinyViTBlock: attn → residual → local_conv → mlp+residual."""
         _HW   = ENC_S1_H * ENC_S1_W
         _NTOK = ENC_S1_NWIN * ENC_S1_WIN_PAD
@@ -2314,32 +2411,28 @@ class MobileSAM_UE(UnifiedEngine):
                              C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
                              gpr_M_reg=gpr_ntok)
 
-        multihead_reshape_dram(self, self.S1_Q_DRAM, self.S1_Q_HEAD_DRAM, self.S1_MH_TEMP,
-                               _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
-        multihead_reshape_dram(self, self.S1_K_DRAM, self.S1_K_HEAD_DRAM, self.S1_MH_TEMP,
-                               _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
-        multihead_reshape_dram(self, self.S1_V_DRAM, self.S1_V_HEAD_DRAM, self.S1_MH_TEMP,
-                               _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
+        multihead_reshape_dram_pbi(self, self.S1_Q_DRAM, self.S1_Q_HEAD_DRAM, self.S1_MH_TEMP,
+                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
+        multihead_reshape_dram_pbi(self, self.S1_K_DRAM, self.S1_K_HEAD_DRAM, self.S1_MH_TEMP,
+                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
+        multihead_reshape_dram_pbi(self, self.S1_V_DRAM, self.S1_V_HEAD_DRAM, self.S1_MH_TEMP,
+                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
         broadcast_mul_dram(self, self.S1_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S1_HEADS * _NTOK * _HP)
 
         _head_stride = ENC_S1_NWIN * _WPAD * _HP * _BPE
-        _s1_buckets = _WPAD // UE_VECTOR_SIZE  # 64//64 = 1
-        if gpr_flash is not None:
-            self.generate_instruction_add_set(gpr_flash, _s1_buckets)
         for h in range(ENC_S1_HEADS):
-            flash_attention_batched(
+            flash_attention_batched_pbi(
                 self, num_batches=ENC_S1_NWIN, head_dim=_HP, seq_len=_WPAD,
                 Q_DRAM_ADDR=self.S1_Q_HEAD_DRAM + h * _head_stride,
                 K_DRAM_ADDR=self.S1_K_HEAD_DRAM + h * _head_stride,
                 V_DRAM_ADDR=self.S1_V_HEAD_DRAM + h * _head_stride,
                 OUTPUT_DRAM_ADDR=self.S1_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S1_FLASH_SCRATCH,
+                ATTN_P_DRAM_ADDR=0,
+                IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True,
-                gpr_bucket_idx=gpr_flash,
-                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
-                num_buckets=_s1_buckets)
+                bias_shared=True, _silent=True)
 
         multihead_merge_dram(self, self.S1_ATTN_DRAM, self.S1_MERGED_DRAM, self.S1_MH_TEMP,
                              _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP,
@@ -2383,7 +2476,7 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _run_s2_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
                       gpr_ntok: int = None, gpr_hw: int = None,
-                      gpr_flash: int = None) -> None:
+                      gpr_flash: int = None, gpr_pbi: int = None) -> None:
         """Run one Stage-2 TinyViTBlock: C=160 padded to 192, 5 heads, ws=14."""
         _HW   = ENC_S2_H * ENC_S2_W          # 4096
         _NTOK = ENC_S2_NWIN * ENC_S2_WIN_PAD  # 6400
@@ -2441,32 +2534,31 @@ class MobileSAM_UE(UnifiedEngine):
                              C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
                              gpr_M_reg=gpr_ntok)
 
-        multihead_reshape_dram(self, self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM, self.S2_MH_TEMP,
-                               _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, input_row_stride=_CP)
-        multihead_reshape_dram(self, self.S2_K_DRAM, self.S2_K_HEAD_DRAM, self.S2_MH_TEMP,
-                               _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, input_row_stride=_CP)
-        multihead_reshape_dram(self, self.S2_V_DRAM, self.S2_V_HEAD_DRAM, self.S2_MH_TEMP,
-                               _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, input_row_stride=_CP)
+        multihead_reshape_dram_pbi(self, self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM, self.S2_MH_TEMP,
+                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
+                                   input_row_stride=_CP)
+        multihead_reshape_dram_pbi(self, self.S2_K_DRAM, self.S2_K_HEAD_DRAM, self.S2_MH_TEMP,
+                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
+                                   input_row_stride=_CP)
+        multihead_reshape_dram_pbi(self, self.S2_V_DRAM, self.S2_V_HEAD_DRAM, self.S2_MH_TEMP,
+                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
+                                   input_row_stride=_CP)
         broadcast_mul_dram(self, self.S2_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S2_HEADS * _NTOK * _HP)
 
         _head_stride = ENC_S2_NWIN * _WPAD * _HP * _BPE
-        _s2_buckets = _WPAD // UE_VECTOR_SIZE  # 256//64 = 4
-        if gpr_flash is not None:
-            self.generate_instruction_add_set(gpr_flash, _s2_buckets)
         for h in range(ENC_S2_HEADS):
-            flash_attention_batched(
+            flash_attention_batched_pbi(
                 self, num_batches=ENC_S2_NWIN, head_dim=_HP, seq_len=_WPAD,
                 Q_DRAM_ADDR=self.S2_Q_HEAD_DRAM + h * _head_stride,
                 K_DRAM_ADDR=self.S2_K_HEAD_DRAM + h * _head_stride,
                 V_DRAM_ADDR=self.S2_V_HEAD_DRAM + h * _head_stride,
                 OUTPUT_DRAM_ADDR=self.S2_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S2_FLASH_SCRATCH,
+                ATTN_P_DRAM_ADDR=0,
+                IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True,
-                gpr_bucket_idx=gpr_flash,
-                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
-                num_buckets=_s2_buckets)
+                bias_shared=True, _silent=True)
 
         self.bf16_permute_core(dim_0=ENC_S2_HEADS, dim_1=_NTOK, dim_2=_HP,
                                INPUT_DRAM_ADDR=self.S2_ATTN_DRAM,
@@ -2514,7 +2606,7 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _run_s3_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
                       gpr_ntok: int = None, gpr_hw: int = None,
-                      gpr_flash: int = None) -> None:
+                      gpr_flash: int = None, gpr_pbi: int = None) -> None:
         """Run one Stage-3 TinyViTBlock: C=320, 10 heads, ws=7. No padding needed."""
         _HW   = ENC_S3_H * ENC_S3_W           # 4096
         _NTOK = ENC_S3_NWIN * ENC_S3_WIN_PAD   # 6400
@@ -2572,32 +2664,28 @@ class MobileSAM_UE(UnifiedEngine):
                              C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
                              gpr_M_reg=gpr_ntok)
 
-        multihead_reshape_dram(self, self.S3_Q_DRAM, self.S3_Q_HEAD_DRAM, self.S3_MH_TEMP,
-                               _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP)
-        multihead_reshape_dram(self, self.S3_K_DRAM, self.S3_K_HEAD_DRAM, self.S3_MH_TEMP,
-                               _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP)
-        multihead_reshape_dram(self, self.S3_V_DRAM, self.S3_V_HEAD_DRAM, self.S3_MH_TEMP,
-                               _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP)
+        multihead_reshape_dram_pbi(self, self.S3_Q_DRAM, self.S3_Q_HEAD_DRAM, self.S3_MH_TEMP,
+                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
+        multihead_reshape_dram_pbi(self, self.S3_K_DRAM, self.S3_K_HEAD_DRAM, self.S3_MH_TEMP,
+                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
+        multihead_reshape_dram_pbi(self, self.S3_V_DRAM, self.S3_V_HEAD_DRAM, self.S3_MH_TEMP,
+                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
         broadcast_mul_dram(self, self.S3_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S3_HEADS * _NTOK * _HP)
 
         _head_stride = ENC_S3_NWIN * _WPAD * _HP * _BPE
-        _s3_buckets = _WPAD // UE_VECTOR_SIZE  # 64//64 = 1
-        if gpr_flash is not None:
-            self.generate_instruction_add_set(gpr_flash, _s3_buckets)
         for h in range(ENC_S3_HEADS):
-            flash_attention_batched(
+            flash_attention_batched_pbi(
                 self, num_batches=ENC_S3_NWIN, head_dim=_HP, seq_len=_WPAD,
                 Q_DRAM_ADDR=self.S3_Q_HEAD_DRAM + h * _head_stride,
                 K_DRAM_ADDR=self.S3_K_HEAD_DRAM + h * _head_stride,
                 V_DRAM_ADDR=self.S3_V_HEAD_DRAM + h * _head_stride,
                 OUTPUT_DRAM_ADDR=self.S3_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S3_FLASH_SCRATCH,
+                ATTN_P_DRAM_ADDR=0,
+                IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True,
-                gpr_bucket_idx=gpr_flash,
-                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
-                num_buckets=_s3_buckets)
+                bias_shared=True, _silent=True)
 
         multihead_merge_dram(self, self.S3_ATTN_DRAM, self.S3_MERGED_DRAM, self.S3_MH_TEMP,
                              _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP,
@@ -2644,11 +2732,13 @@ class MobileSAM_UE(UnifiedEngine):
         # GPR 2: Stage 1-3 NTOK (window tokens)
         # GPR 3: Stage 1-3 HW (spatial after window merge)
         # GPR 4: flash attention bucket index (1=seq64, 4=seq256)
+        # GPR 5: PBI loop counter for multihead_reshape_dram_pbi
         gpr_s0    = self.alloc_isa_reg()
         gpr_ntok  = self.alloc_isa_reg()
         gpr_hw    = self.alloc_isa_reg()
         gpr_flash = self.alloc_isa_reg()
-        self._encoder_ops(lambda: None, gpr_s0=gpr_s0, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        gpr_pbi   = self.alloc_isa_reg()
+        self._encoder_ops(lambda: None, gpr_s0=gpr_s0, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         self.stop_capture()
         self.generate_instruction_halt()
         prog = self.get_program_dram_addr()
@@ -2665,6 +2755,18 @@ class MobileSAM_UE(UnifiedEngine):
         self.dma_to_accelerator_memory(self.PE_IN_DRAM, img_pad.reshape(-1))
         self.start_execute_from_dram(prog)
         self.wait_queue(600.0)
+        _HW1 = ENC_S1_H * ENC_S1_W
+        _HW2 = ENC_S2_H * ENC_S2_W
+        _HW3 = ENC_S3_H * ENC_S3_W
+        _CP2 = ENC_S2_C_PAD
+        self._assert_no_nan("S1B0", self.S1B0_OUT_DRAM, _HW1 * ENC_S1_C)
+        self._assert_no_nan("S1B1", self.S1B1_OUT_DRAM, _HW1 * ENC_S1_C)
+        for _bi in range(6):
+            _buf = getattr(self, f"S2B{_bi}_OUT_DRAM")
+            self._assert_no_nan(f"S2B{_bi}", _buf, _HW2 * _CP2)
+        self._assert_no_nan("S3B0", self.S3B0_OUT_DRAM, _HW3 * ENC_S3_C)
+        self._assert_no_nan("S3B1", self.S3B1_OUT_DRAM, _HW3 * ENC_S3_C)
+        self._assert_no_nan("NECK", self.NECK_OUT_DRAM, _HW3 * 256)
 
     def encode(self, image_t: torch.Tensor):
         """Compile + execute in one call — single instruction stream."""
@@ -2677,6 +2779,7 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _compile_run(self, ops_fn, image_t: torch.Tensor | None = None, timeout: float = 120.0) -> None:
         """Compile ops_fn() as a single program, execute, wait."""
+        self.reset_isa_reg_counter()
         self.start_capture()
         ops_fn()
         self.stop_capture()
@@ -2809,11 +2912,15 @@ class MobileSAM_UE(UnifiedEngine):
         self._assert_no_nan("PM01_OUT", self.PM01_OUT_DRAM, ENC_S1_H * ENC_S1_W * ENC_S1_C)
 
         # Stage 1 blocks
+        def _s1_lambda(i, _in, _out):
+            _gpr_pbi = self.alloc_isa_reg()
+            self._run_s1_block(self.S1B[i], _in, _out, gpr_pbi=_gpr_pbi)
+            self.release_isa_reg()
         for bi, (inp, out, label) in enumerate([
             (self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, "S1B0_OUT"),
             (self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, "S1B1_OUT"),
         ]):
-            self._compile_run(lambda i=bi, _in=inp, _out=out: self._run_s1_block(self.S1B[i], _in, _out))
+            self._compile_run(lambda i=bi, _in=inp, _out=out: _s1_lambda(i, _in, _out))
             self._assert_no_nan(label, out, ENC_S1_H * ENC_S1_W * ENC_S1_C)
 
         # PatchMerging 1→2
@@ -2869,28 +2976,36 @@ class MobileSAM_UE(UnifiedEngine):
         self._assert_no_nan("S2B0 V", self.S2_V_DRAM, _NTOK2 * _CP)
 
         def _s2b0_flash():
+            _gpr_pbi = self.alloc_isa_reg()
             for src, dst in [(self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM),
                               (self.S2_K_DRAM, self.S2_K_HEAD_DRAM),
                               (self.S2_V_DRAM, self.S2_V_HEAD_DRAM)]:
-                multihead_reshape_dram(self, src, dst, self.S2_MH_TEMP,
-                    _NTOK2, ENC_S2_HEADS, _HD2, _HP2, input_row_stride=_CP)
+                multihead_reshape_dram_pbi(self, src, dst, self.S2_MH_TEMP,
+                    _NTOK2, ENC_S2_HEADS, _HD2, _HP2, _gpr_pbi, input_row_stride=_CP)
             broadcast_mul_dram(self, self.S2_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                                ENC_S2_HEADS * _NTOK2 * _HP2)
             _hs = ENC_S2_NWIN * ENC_S2_WIN_PAD * _HP2 * _BPE
             for h in range(ENC_S2_HEADS):
-                flash_attention_batched(self, num_batches=ENC_S2_NWIN, head_dim=_HP2,
+                flash_attention_batched_pbi(
+                    self, num_batches=ENC_S2_NWIN, head_dim=_HP2,
                     seq_len=ENC_S2_WIN_PAD,
                     Q_DRAM_ADDR=self.S2_Q_HEAD_DRAM + h*_hs,
                     K_DRAM_ADDR=self.S2_K_HEAD_DRAM + h*_hs,
                     V_DRAM_ADDR=self.S2_V_HEAD_DRAM + h*_hs,
                     OUTPUT_DRAM_ADDR=self.S2_ATTN_DRAM + h*_hs,
                     SCRATCH_DRAM_ADDR=self.S2_FLASH_SCRATCH,
+                    ATTN_P_DRAM_ADDR=0,
+                    IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
                     BIAS_DRAM_ADDR=_w2["bias"] + h*ENC_S2_WIN_PAD*ENC_S2_WIN_PAD*_BPE,
-                    bias_shared=True, num_buckets=ENC_S2_WIN_PAD//UE_VECTOR_SIZE)
+                    bias_shared=True, _silent=True)
         self._compile_run(_s2b0_flash)
         self._assert_no_nan("S2B0 attn_out", self.S2_ATTN_DRAM, ENC_S2_HEADS * _NTOK2 * _HP2)
 
-        self._compile_run(lambda: self._run_s2_block(self.S2B[0], _in2, self.S2B0_OUT_DRAM))
+        def _s2_lambda(i, _in, _out):
+            _gpr_pbi = self.alloc_isa_reg()
+            self._run_s2_block(self.S2B[i], _in, _out, gpr_pbi=_gpr_pbi)
+            self.release_isa_reg()
+        self._compile_run(lambda: _s2_lambda(0, _in2, self.S2B0_OUT_DRAM))
         self._assert_no_nan("S2B0_OUT", self.S2B0_OUT_DRAM, _HW2 * _CP)
 
         _s2_io = [
@@ -2901,7 +3016,7 @@ class MobileSAM_UE(UnifiedEngine):
             (self.S2B4_OUT_DRAM, self.S2B5_OUT_DRAM, "S2B5_OUT"),
         ]
         for bi, (_in, _out, label) in enumerate(_s2_io, start=1):
-            self._compile_run(lambda i=bi, _i=_in, _o=_out: self._run_s2_block(self.S2B[i], _i, _o))
+            self._compile_run(lambda i=bi, _i=_in, _o=_out: _s2_lambda(i, _i, _o))
             self._assert_no_nan(label, _out, ENC_S2_H * ENC_S2_W * _CP)
 
         # PatchMerging 2→3
@@ -2920,18 +3035,24 @@ class MobileSAM_UE(UnifiedEngine):
         self._assert_no_nan("PM23_OUT", self.PM23_OUT_DRAM, ENC_S2_H * ENC_S2_W * _C23)
 
         # Stage 3 blocks
+        def _s3_lambda(i, _in, _out):
+            _gpr_pbi = self.alloc_isa_reg()
+            self._run_s3_block(self.S3B[i], _in, _out, gpr_pbi=_gpr_pbi)
+            self.release_isa_reg()
         for bi, (_in, _out, label) in enumerate([
             (self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, "S3B0_OUT"),
             (self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, "S3B1_OUT"),
         ]):
-            self._compile_run(lambda i=bi, _i=_in, _o=_out: self._run_s3_block(self.S3B[i], _i, _o))
+            self._compile_run(lambda i=bi, _i=_in, _o=_out: _s3_lambda(i, _i, _o))
             self._assert_no_nan(label, _out, ENC_S3_H * ENC_S3_W * ENC_S3_C)
 
         # Neck
         _NECK_C_IN  = ENC_S3_C
         _NECK_C_OUT = 256
-        _NECK_HW    = ENC_S3_H * ENC_S3_W
-        def _neck():
+        _NECK_H    = ENC_S3_H
+        _NECK_W    = ENC_S3_W
+        _NECK_HW    = _NECK_H * _NECK_W
+        def _neck_matmul_ln():
             _ops = 6
             _ideal = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _ops)
             _cs = _ideal
@@ -2948,10 +3069,35 @@ class MobileSAM_UE(UnifiedEngine):
                 A_DRAM_ADDR=self.NECK_BUF1_DRAM, OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
                 GAMMA_DRAM_ADDR=self.NECK_LN1_G, BETA_DRAM_ADDR=self.NECK_LN1_B,
                 gpr_M_reg=14)
-        self._compile_run(_neck)
+        self._compile_run(_neck_matmul_ln)
         self._assert_no_nan("neck_conv1+ln1", self.NECK_BUF1_DRAM, _NECK_HW * _NECK_C_OUT)
 
-        _original_print("debug_encode: all checkpoints passed — NaN must be in neck conv2 or later")
+        def _neck_conv_ln():
+            conv2d_3x3_stride1_dram(
+                self,
+                INPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
+                OUTPUT_DRAM_ADDR=self.NECK_OUT_DRAM,
+                IM2COL_DRAM_ADDR=self.NECK_IM2COL_DRAM,
+                WEIGHT_DRAM_ADDR=self.NECK_C3_W,
+                BIAS_DRAM_ADDR=self.NECK_ZERO,
+                ZERO_PAD_DRAM_ADDR=self.NECK_ZERO,
+                H=_NECK_H, W=_NECK_W, C_in=_NECK_C_OUT, C_out=_NECK_C_OUT,
+            )
+            _neck_ln2_ops = 6
+            _cs = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _neck_ln2_ops)
+            while _NECK_HW % _cs != 0:
+                _cs -= 1
+            self._isa_reg_counter = 15; self.reset_inst_ptr_counter()
+            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_NECK_HW // _cs)
+            self.layer_norm_core_dram(
+                M=_NECK_HW, N=_NECK_C_OUT,
+                A_DRAM_ADDR=self.NECK_OUT_DRAM, OUTPUT_DRAM_ADDR=self.NECK_OUT_DRAM,
+                GAMMA_DRAM_ADDR=self.NECK_LN2_G, BETA_DRAM_ADDR=self.NECK_LN2_B,
+                gpr_M_reg=14)
+        self._compile_run(_neck_conv_ln)
+        self._assert_no_nan("neck_conv2+ln2", self.NECK_OUT_DRAM, _NECK_HW * _NECK_C_OUT)
+
+        _original_print("debug_encode: all checkpoints passed ✓")
 
     # ------------------------------------------------------------------
     # Binary dump (for run_from_bin)
@@ -3035,7 +3181,8 @@ class MobileSAM_UE(UnifiedEngine):
         _original_print(f"  Programs: {_sz_str} ({_sz} bytes) → {bin_path}")
 
     def _encoder_ops(self, flush, gpr_s0: int = None,
-                     gpr_ntok: int = None, gpr_hw: int = None, gpr_flash: int = None):
+                     gpr_ntok: int = None, gpr_hw: int = None, gpr_flash: int = None,
+                     gpr_pbi: int = None):
         """All encoder instruction ops."""
 
         def _set_s0():
@@ -3139,9 +3286,9 @@ class MobileSAM_UE(UnifiedEngine):
 
         # ---- Stage 1: 2× TinyViTBlock ----
         _HW1 = ENC_S1_H * ENC_S1_W
-        self._run_s1_block(self.S1B[0], self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        self._run_s1_block(self.S1B[0], self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         flush()
-        self._run_s1_block(self.S1B[1], self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        self._run_s1_block(self.S1B[1], self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         flush()
 
         # ---- PatchMerging 1→2 ----
@@ -3169,7 +3316,7 @@ class MobileSAM_UE(UnifiedEngine):
             (self.S2B4_OUT_DRAM, self.S2B5_OUT_DRAM),
         ]
         for _bi, (_in, _out) in enumerate(_s2_io):
-            self._run_s2_block(self.S2B[_bi], _in, _out, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+            self._run_s2_block(self.S2B[_bi], _in, _out, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
             flush()
 
         # ---- PatchMerging 2→3 ----
@@ -3188,9 +3335,9 @@ class MobileSAM_UE(UnifiedEngine):
         # ---- Stage 3: 2× TinyViTBlock ----
         _C3  = ENC_S3_C
         _HW3 = ENC_S3_H * ENC_S3_W
-        self._run_s3_block(self.S3B[0], self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        self._run_s3_block(self.S3B[0], self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         flush()
-        self._run_s3_block(self.S3B[1], self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        self._run_s3_block(self.S3B[1], self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         flush()
 
         # ---- Neck ----

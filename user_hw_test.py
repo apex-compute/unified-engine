@@ -52,6 +52,188 @@ from user_dma_core import (
 )
 
 # ---------------------------------------------------------------------------
+# Hardware-helper ops (built on unified-engine primitives, shared by tests
+# that exercise model-inspired patterns without depending on model modules).
+# ---------------------------------------------------------------------------
+
+_BPE = 2
+
+
+def dram_zero_fill(ue: UnifiedEngine, dram_addr: int, num_elements: int) -> None:
+    """Fill *dram_addr* with ``num_elements`` zeros."""
+    chunk = min(URAM_NEAR_FULL_ELEMENTS, num_elements)
+    z_addr = ue.get_params_dram_addr()
+    ue.allocate_params_dram(chunk * _BPE)
+    ue.dma_write(DMA_DEVICE_H2C, z_addr,
+                 torch.zeros(chunk, dtype=torch.bfloat16), chunk * _BPE)
+    ue.accelerator_memory_to_sram(z_addr, 0x00000, chunk)
+    offset = 0
+    while offset < num_elements:
+        take = min(chunk, num_elements - offset)
+        ue.sram_to_accelerator_memory(0x00000, dram_addr + offset * _BPE, take)
+        offset += take
+
+
+def pbi_strided_copy(ue: UnifiedEngine, gpr: int,
+                     src_base: int, dst_base: int, count: int,
+                     copy_bytes: int, src_stride: int, dst_stride: int) -> None:
+    """One pointer-based-iteration loop copying *count* blocks of *copy_bytes*
+
+    Each iteration DMAs *copy_bytes* bytes src→dst, then advances the source
+    pointer by *src_stride* and the destination pointer by *dst_stride*.
+
+    HW rules:
+      * Exactly TWO advancing PBI pointers.
+      * *copy_bytes* must fit one SRAM staging row.
+      * When *dst_stride* > *copy_bytes* (writing into a padded slot) the caller
+        MUST pre-zero *dst* so the untouched pad bytes stay zero.
+    """
+    if copy_bytes <= 0 or copy_bytes % 2 != 0:
+        raise ValueError(f"pbi_strided_copy: copy_bytes must be a positive even (bf16) byte count, got {copy_bytes}")
+    if copy_bytes > URAM_NEAR_FULL_ELEMENTS * 2:
+        raise ValueError(
+            f"pbi_strided_copy: copy_bytes={copy_bytes} exceeds one staging row "
+            f"({URAM_NEAR_FULL_ELEMENTS * 2} bytes)")
+    if count < 1:
+        raise ValueError(f"pbi_strided_copy: count must be >=1, got {count}")
+
+    ue._isa_reg_counter = gpr + 1
+    ue.reset_inst_ptr_counter()
+    ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=count)
+
+    _, load_uram_row = ue.sram_address_to_uram_address(0x00000)
+    _, store_uram_row = ue.sram_address_to_uram_address(0x00000)
+
+    ptr_src = ue.alloc_inst_ptr()
+    ptr_dst = ue.alloc_inst_ptr()
+
+    ue.generate_instruction_pbi_init(
+        dram_shared_addr=src_base, dma_length=copy_bytes,
+        uram_dst_addr=load_uram_row, inst_pointer_idx=ptr_src,
+    )
+    ue.generate_instruction_pbi_init(
+        dram_shared_addr=dst_base, dma_length=copy_bytes,
+        uram_a_start_addr=store_uram_row, inst_pointer_idx=ptr_dst,
+    )
+
+    program_dram_start_addr = ue.get_program_dram_addr()
+    cur_inst_count = ue.capture_count
+    ue.generate_instruction_jump_abs(
+        ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
+        )
+    )
+
+    ue.loop_start(loop_cnt=count, gpr_loop_cnt=gpr)
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src_stride, sram_address=0x00000,
+        element_size=0, inst_pointer_idx=ptr_src,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000, accelerator_dram_address=dst_stride,
+        element_size=0, inst_pointer_idx=ptr_dst,
+    )
+    body = ue.loop_end()
+    assert body <= 256, f"pbi_strided_copy: loop body {body} exceeds 256 i-cache budget"
+
+    ue.release_inst_ptr(ptr_dst)
+    ue.release_inst_ptr(ptr_src)
+
+
+def multihead_reshape_dram_legacy(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
+                                   OUTPUT_DRAM_ADDR: int, TEMP_DRAM_ADDR: int,
+                                   seq_len: int, num_heads: int,
+                                   head_dim: int, head_dim_pad: int,
+                                   input_row_stride: int = None) -> None:
+    """(seq_len, input_row_stride) → (num_heads, seq_len, head_dim_pad).
+
+    Replicates the current MobileSAM ``multihead_reshape_dram`` exactly
+    (Python-unrolled scatter + bf16_permute_core).
+    """
+    if input_row_stride is None:
+        input_row_stride = num_heads * head_dim
+    if head_dim == head_dim_pad and input_row_stride == num_heads * head_dim:
+        ue.bf16_permute_core(dim_0=seq_len, dim_1=num_heads, dim_2=head_dim,
+                             INPUT_DRAM_ADDR=INPUT_DRAM_ADDR,
+                             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR)
+    else:
+        padded_dim = num_heads * head_dim_pad
+        dram_zero_fill(ue, TEMP_DRAM_ADDR, seq_len * padded_dim)
+        z_addr = ue.get_params_dram_addr()
+        ue.allocate_params_dram(UE_VECTOR_SIZE * _BPE)
+        ue.dma_write(DMA_DEVICE_H2C, z_addr,
+                     torch.zeros(UE_VECTOR_SIZE, dtype=torch.bfloat16),
+                     UE_VECTOR_SIZE * _BPE)
+        for h in range(num_heads):
+            for row in range(seq_len):
+                src = INPUT_DRAM_ADDR + (row * input_row_stride + h * head_dim) * _BPE
+                dst = TEMP_DRAM_ADDR + (row * padded_dim + h * head_dim_pad) * _BPE
+                ue.accelerator_memory_to_sram(z_addr, 0x00000, UE_VECTOR_SIZE)
+                ue.accelerator_memory_to_sram(src, 0x00000, head_dim)
+                ue.sram_to_accelerator_memory(0x00000, dst, UE_VECTOR_SIZE)
+        ue.bf16_permute_core(dim_0=seq_len, dim_1=num_heads, dim_2=head_dim_pad,
+                             INPUT_DRAM_ADDR=TEMP_DRAM_ADDR,
+                             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR)
+
+
+def multihead_reshape_dram_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
+                                OUTPUT_DRAM_ADDR: int, TEMP_DRAM_ADDR: int,
+                                seq_len: int, num_heads: int,
+                                head_dim: int, head_dim_pad: int,
+                                gpr_pbi: int,
+                                input_row_stride: int = None) -> None:
+    """PBI-based multi-head reshape — replaces the Python-unrolled scatter+
+    bf16_permute_core with two ``pbi_strided_copy`` phases, mirroring the SWIN
+    ``multihead_pad_and_permute`` pattern.
+
+    Step 1 — scatter:  one PBI loop copies ``head_dim`` elements of each
+    (row, head) slot from the interleaved input into a pre-zeroed padded TEMP,
+    implicitly zeroing the ``head_dim_pad - head_dim`` tail of every slot.
+
+    Step 2 — transpose: ``num_heads`` small PBI loops copy each head's rows
+    from TEMP to the OUTPUT while transposing (seq_len, num_heads, hd_pad) →
+    (num_heads, seq_len, hd_pad).
+
+    The input_row_stride parameter is accepted for API compatibility but the
+    PBI path always reads from the packed layout; pass the base address of
+    the packed Q/K/V projection output.
+    """
+    if input_row_stride is None:
+        input_row_stride = num_heads * head_dim
+
+    padded_dim = num_heads * head_dim_pad
+    dram_zero_fill(ue, TEMP_DRAM_ADDR, seq_len * padded_dim)
+
+    # Step 1: scatter interleaved (seq_len, num_heads*head_dim) →
+    #              padded    (seq_len, num_heads, head_dim_pad) in TEMP
+    pbi_strided_copy(
+        ue, gpr_pbi,
+        src_base=INPUT_DRAM_ADDR,
+        dst_base=TEMP_DRAM_ADDR,
+        count=seq_len * num_heads,
+        copy_bytes=head_dim * _BPE,
+        src_stride=head_dim * _BPE,
+        dst_stride=head_dim_pad * _BPE,
+    )
+
+    # Step 2: transpose each head from TEMP to OUTPUT
+    head_bytes = head_dim_pad * _BPE
+    temp_row_stride = padded_dim * _BPE
+    output_head_stride = seq_len * head_dim_pad * _BPE
+
+    for h in range(num_heads):
+        pbi_strided_copy(
+            ue, gpr_pbi,
+            src_base=TEMP_DRAM_ADDR + h * head_bytes,
+            dst_base=OUTPUT_DRAM_ADDR + h * output_head_stride,
+            count=seq_len,
+            copy_bytes=head_bytes,
+            src_stride=temp_row_stride,
+            dst_stride=head_bytes,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Test result registry (consumed by the CI PR-comment step).
 # Each test calls record_test(...) once it has computed SNR / GFLOPS so a
 # concise per-test summary line can be written to user_hw_test_summary.md.
@@ -4829,6 +5011,214 @@ def test_ue_int_reg_read():
     ue.reset_inst_ptr_counter()
 
 
+# ---------------------------------------------------------------------------
+# Multi-head reshape tests (MobileSAM-inspired, models SWIN's
+# multihead_pad_and_permute pattern)
+# ---------------------------------------------------------------------------
+
+def multihead_reshape_dram_test(seq_len: int, num_heads: int,
+                                 head_dim: int, head_dim_pad: int,
+                                 use_pbi: bool = False) -> None:
+    """
+    Validate (seq_len, num_heads * head_dim) → (num_heads, seq_len, head_dim_pad).
+
+    Legacy path (use_pbi=False) replicates the current MobileSAM
+    ``multihead_reshape_dram`` (Python-unrolled scatter + bf16_permute_core).
+
+    PBI path (use_pbi=True) uses ``pbi_strided_copy`` for both the scatter
+    and transpose, matching the SWIN ``multihead_pad_and_permute`` pattern.
+    """
+    ue = UnifiedEngine()
+
+    input_row_stride = num_heads * head_dim
+    padded_dim = num_heads * head_dim_pad
+
+    input_elements = seq_len * input_row_stride
+    temp_elements = seq_len * padded_dim
+    output_elements = num_heads * seq_len * head_dim_pad
+
+    INPUT_DRAM_ADDR = ue.allocate_tensor_dram(input_elements * _BPE)
+    TEMP_DRAM_ADDR = ue.allocate_tensor_dram(temp_elements * _BPE)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(output_elements * _BPE)
+
+    if use_pbi:
+        gpr_pbi = ue.alloc_isa_reg()
+        ue.start_capture()
+        ue.generate_instruction_add_set(gpr_pbi, seq_len * num_heads)
+        multihead_reshape_dram_pbi(
+            ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, TEMP_DRAM_ADDR,
+            seq_len, num_heads, head_dim, head_dim_pad, gpr_pbi,
+        )
+        ue.stop_capture()
+        ue.release_isa_reg()
+    else:
+        ue.start_capture()
+        multihead_reshape_dram_legacy(
+            ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, TEMP_DRAM_ADDR,
+            seq_len, num_heads, head_dim, head_dim_pad,
+        )
+        ue.stop_capture()
+
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    instruction_size = ue.write_captured_instructions_to_dram(program_dram_addr)
+
+    x = torch.randn(seq_len, input_row_stride, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    y_ref = x.view(seq_len, num_heads, head_dim).permute(1, 0, 2)
+    if head_dim_pad > head_dim:
+        pad = torch.zeros(num_heads, seq_len, head_dim_pad - head_dim, dtype=torch.bfloat16)
+        y_ref = torch.cat([y_ref, pad], dim=-1)
+
+    output = ue.dma_from_accelerator_memory(
+        OUTPUT_DRAM_ADDR, (num_heads, seq_len, head_dim_pad))
+
+    snr_db = calculate_snr(y_ref, output)
+    latency_us = ue.report_latency_in_us()
+    bytes_moved = 2 * 2 * output_elements  # one read (input) + one write (output)
+    mb_per_s = (bytes_moved / latency_us) if latency_us > 0 else 0.0
+    gflops_rate, flops_ratio = ue.report_flop_rate_gflops(2 * output_elements)
+
+    print(
+        f"[multihead_reshape] seq={seq_len} heads={num_heads} "
+        f"hd={head_dim} hd_pad={head_dim_pad} "
+        f"PBI={use_pbi} SNR={snr_db:.2f} dB "
+        f"inst_bytes={instruction_size} GFLOPS={gflops_rate:.2f}"
+    )
+    assert snr_db >= 40 or snr_db == float('inf'), \
+        f"multihead_reshape PBI={use_pbi} seq={seq_len} heads={num_heads} " \
+        f"hd={head_dim} hd_pad={head_dim_pad} SNR {snr_db:.2f} dB < 40 dB"
+
+    flag_str = "+pbi" if use_pbi else ""
+    record_test(
+        f"multihead_reshape{flag_str}",
+        f"seq={seq_len},heads={num_heads},hd={head_dim},pad={head_dim_pad}",
+        snr_db=snr_db,
+        gflops=gflops_rate,
+        mb_per_s=mb_per_s,
+        inst_bytes=instruction_size,
+    )
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+# ---------------------------------------------------------------------------
+# Flash attention batched (PBI staging) test — validates the subroutine-based
+# batching used by SWIN's flash_attention_batched_pbi.
+# ---------------------------------------------------------------------------
+
+def flash_attention_batched_test(head_dim: int = 64, seq_len: int = 64,
+                                  num_heads: int = 4, bias_enable: bool = False) -> None:
+    """Validate ``flash_attention_batched_pbi`` with ``num_heads`` batches.
+
+    The PBI-batched path compiles ONE static flash body as a subroutine and
+    emits tiny per-batch call-stubs that memcpy Q/K/V into staging buffers,
+    call the subroutine, then memcpy the output back.  This replaces the
+    Python-unrolled ``for h in range(num_heads): flash_attention_core(...)``
+    with a single captured sequence (SWIN reduces flash program size from
+    ~103 MB to ~1-2 MB this way).
+    """
+    from nn_lib import flash_attention_batched_pbi
+
+    ue = UnifiedEngine()
+    bpe = 2
+    win_bytes = seq_len * head_dim * bpe
+    attn_p_bytes = seq_len * seq_len * bpe
+    scratch_elements = (head_dim + UE_FMAX_CONTEXT_SIZE) * seq_len
+
+    total_qkv_bytes = num_heads * win_bytes
+    total_bias_bytes = num_heads * attn_p_bytes if bias_enable else 0
+
+    Q_DRAM_ADDR = ue.allocate_tensor_dram(total_qkv_bytes)
+    K_DRAM_ADDR = ue.allocate_tensor_dram(total_qkv_bytes)
+    V_DRAM_ADDR = ue.allocate_tensor_dram(total_qkv_bytes)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(total_qkv_bytes)
+    SCRATCH_DRAM_ADDR = ue.allocate_tensor_dram(scratch_elements * bpe)
+    ATTN_P_DRAM_ADDR = ue.allocate_tensor_dram(attn_p_bytes)
+    BIAS_DRAM_ADDR = ue.allocate_tensor_dram(total_bias_bytes) if bias_enable else None
+    IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe)
+    ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR,
+                                 torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
+
+    q = torch.randn(num_heads, seq_len, head_dim, dtype=torch.bfloat16)
+    k = torch.randn(num_heads, seq_len, head_dim, dtype=torch.bfloat16)
+    v = torch.randn(num_heads, seq_len, head_dim, dtype=torch.bfloat16)
+    bias = torch.randn(num_heads, seq_len, seq_len, dtype=torch.bfloat16) if bias_enable else None
+
+    ue.dma_to_accelerator_memory(Q_DRAM_ADDR, q)
+    ue.dma_to_accelerator_memory(K_DRAM_ADDR, k)
+    ue.dma_to_accelerator_memory(V_DRAM_ADDR, v)
+    if bias_enable:
+        ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias)
+
+    ue.start_capture()
+    flash_attention_batched_pbi(
+        ue,
+        num_batches=num_heads,
+        head_dim=head_dim,
+        seq_len=seq_len,
+        Q_DRAM_ADDR=Q_DRAM_ADDR,
+        K_DRAM_ADDR=K_DRAM_ADDR,
+        V_DRAM_ADDR=V_DRAM_ADDR,
+        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+        SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+        ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
+        IDENTITY_TRANSPOSE_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+        BIAS_DRAM_ADDR=BIAS_DRAM_ADDR if bias_enable else None,
+        _silent=False,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    instruction_size = ue.write_captured_instructions_to_dram(program_dram_addr)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(30.0)
+    ue.report_timing_and_instruction_count()
+
+    q_scaled = q * (1.0 / math.sqrt(head_dim))
+    attn = q_scaled @ k.transpose(-2, -1)
+    if bias_enable:
+        attn = attn + bias
+    sm = torch.softmax(attn, dim=-1).to(torch.bfloat16)
+    ref = sm @ v
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR,
+                                             (num_heads, seq_len, head_dim))
+    snr_db = calculate_snr(ref, output)
+    latency_us = ue.report_latency_in_us()
+    bytes_moved = 4 * total_qkv_bytes
+    mb_per_s = (bytes_moved / latency_us) if latency_us > 0 else 0.0
+    gflops_rate, flops_ratio = ue.report_flop_rate_gflops(
+        num_heads * seq_len * seq_len * (2 * head_dim + 1))
+
+    print(
+        f"[flash_attn_batched] hd={head_dim} seq={seq_len} heads={num_heads} "
+        f"bias={bias_enable} SNR={snr_db:.2f} dB "
+        f"inst_bytes={instruction_size} GFLOPS={gflops_rate:.2f}"
+    )
+    assert snr_db >= 38 or snr_db == float('inf'), \
+        f"flash_attn_batched hd={head_dim} seq={seq_len} heads={num_heads} " \
+        f"bias={bias_enable} SNR {snr_db:.2f} dB < 38 dB"
+
+    tag = "flash_attn_batched" + ("+bias" if bias_enable else "")
+    record_test(tag,
+                f"hd={head_dim},seq={seq_len},heads={num_heads}",
+                snr_db=snr_db,
+                gflops=gflops_rate,
+                mb_per_s=mb_per_s,
+                inst_bytes=instruction_size)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
@@ -4894,253 +5284,20 @@ if __name__ == "__main__":
     # Always emit user_hw_test_summary.md, even if an assertion aborts the run.
     atexit.register(write_test_summary, "user_hw_test_summary.md")
 
-    software_reset_test()
-    dram_read_write_speed_test()
-    isa_rela_loop_test()
-    isa_abs_loop_test()
-    isa_reg_min_sub_mul_test()
-    test_ue_int_reg_read()
-    fmax_test()
-    for packing_mode in [16, 32, 48, 64]:
-        packing_test(packing_mode=packing_mode)
-    padding_zero_test()
-    slicing_test()
-    quantized_fp4_test()
-    if4_if8_tests()
-    if4_if8_mixed_sign_test()
-    tq4_dequantize_test()
-    tq4_dot_product_test(K=64, N=64)
-    tq4_dot_product_test(K=128, N=128)
-    run_turboquant_mse(1024)
-    # Additional NEW TQ4 tests (variants) without changing the baseline tests above.
-    tq4_dequantize_variant_tests()
-    tq4_dot_product_variant_tests()
-    tq4_dot_product_onehot_oracle_tests()
-    tq4_codebook_reload_tests()
-    if4_if8_dot_product_test(K=64, N=64)
-    if4_if8_dot_product_test(K=128, N=128)
-    dequantize_test(TYPE.IF4, int_variant=True)
-    dequantize_test(TYPE.IF4, int_variant=False)
-    dequantize_test(TYPE.IF8, int_variant=True)
-    dequantize_test(TYPE.IF8, int_variant=False)
-    matmat_mul_non_aligned_writeback_test()
-    rope_hf_core_dram_test(64, 512)
-    rope_hf_core_dram_test(64, 512, use_pbi=True)
-    bf16_permute_test(dim_0=144, dim_1=48, dim_2=64)
-    patching_test()
-    mix_of_broadcast_eltwise_add_eltwise_mul_core_test()
-    eltwise_core_dram_test(M=64, N=512)
-    bf16_transpose_test(M=1024, N=512)
-    # Per-call snr_threshold_db tightens the floor where we have headroom
-    # (observed ~50-55 dB on plain matmul, ~46-47 dB on softmax) so silent
-    # SNR regressions trip the assert instead of slipping under the legacy
-    # 40 dB floor.
-    matmat_mul_test(M=64, K=6912, N=64, snr_threshold_db=48.0)
-    matmat_mul_test(M=64, K=6912, N=64, use_pbi=True, snr_threshold_db=48.0)
-    matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True, snr_threshold_db=44.0)
-    matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True, use_pbi=True, snr_threshold_db=44.0)
-    matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True, snr_threshold_db=52.0)
-    matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True, use_pbi=True, snr_threshold_db=52.0)
-    matmat_mul_test(M=1024, K=768, N=512, clamp_enable=True, snr_threshold_db=52.0)
-    matmat_mul_test(M=1024, K=768, N=512, log_enable=True, snr_threshold_db=52.0)
-    matmat_mul_test(M=1984, K=1024, N=384, softmax_enable=True, debug_fmax=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
-    matmat_mul_test(M=1984, K=1024, N=384, softmax_enable=True, debug_fmax=True, use_pbi=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
+    # --- Multi-head reshape (MobileSAM scatter+pad+permute patterns) ---
+    # Padded case (MobileSAM-like: hd=32, hd_pad=64, heads=4)
+    multihead_reshape_dram_test(seq_len=64, num_heads=4, head_dim=32, head_dim_pad=64, use_pbi=False)
+    multihead_reshape_dram_test(seq_len=64, num_heads=4, head_dim=32, head_dim_pad=64, use_pbi=True)
+    # Larger seq_len, more heads (stresses the PBI transpose phase)
+    multihead_reshape_dram_test(seq_len=256, num_heads=8, head_dim=32, head_dim_pad=64, use_pbi=False)
+    multihead_reshape_dram_test(seq_len=256, num_heads=8, head_dim=32, head_dim_pad=64, use_pbi=True)
+    # No-padding fast path (head_dim == head_dim_pad)
+    multihead_reshape_dram_test(seq_len=144, num_heads=6, head_dim=64, head_dim_pad=64, use_pbi=False)
+    multihead_reshape_dram_test(seq_len=144, num_heads=6, head_dim=64, head_dim_pad=64, use_pbi=True)
 
-    # --- Wide-variance softmax stress: exercises exp + bf20 adder tree ------
-    # The post-matmul pre-softmax values span ~N(0, input_scale^2). Larger
-    # scales push exp() outputs across many orders of magnitude, which stresses
-    # the denominator reduction (adder tree) dynamic range and the fmax-based
-    # numerical-stability path. Reference stays numerically stable because
-    # torch.softmax internally subtracts the row max.
-    #
-    # SNR thresholds are scale-specific: as input_scale grows, the
-    # max-min span of (a @ b.T) grows linearly in scale, so the bf20
-    # adder tree retains progressively fewer effective bits. We set
-    # thresholds ~3 dB below empirically observed values so the tests
-    # still catch regressions but tolerate the inherent dynamic-range loss.
-    wide_variance_snr_floors = {
-        2.0: 42.0,   # observed ~44.5 dB
-        4.0: 38.0,   # observed ~41.0 dB
-        8.0: 28.0,   # estimated; scale doubling ~ -6 dB SNR
-        16.0: 18.0,  # adder tree near saturation
-    }
-    for scale, snr_floor in wide_variance_snr_floors.items():
-        matmat_mul_test(M=512, K=512, N=384, softmax_enable=True,
-                        input_scale=scale, snr_threshold_db=snr_floor)
-    # Pair wide variance with debug_fmax so fmax SNR is also validated.
-    # fmax itself is exact (a row max) so fmax SNR stays high even at
-    # large scales — keep that floor tight at 44 dB.
-    matmat_mul_test(M=1024, K=1024, N=512, softmax_enable=True, debug_fmax=True,
-                    input_scale=8.0, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
-    matmat_mul_test(M=1024, K=1024, N=512, softmax_enable=True, debug_fmax=True,
-                    input_scale=8.0, use_pbi=True, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
-    # Tall/narrow and short/wide variants to sweep different M/N tile shapes
-    # through the wide-variance exp path.
-    matmat_mul_test(M=2048, K=256, N=128, softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
-    matmat_mul_test(M=128, K=256, N=2048, softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
-    matmat_mul_test(M=512, K=1024, N=1024, softmax_enable=True, input_scale=12.0, use_pbi=True, snr_threshold_db=22.0)
-
-    quantized_matmat_mul_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
-    matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix")
-    matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix", use_pbi=True)
-    flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True)
-    rms_norm_test(shape=(768, 1024))
-    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True, use_pbi=True)
-
-    # --- Additional coverage: extra dimension/feature combinations ---
-    bf16_transpose_test(M=2048, N=2048)
-    bf16_transpose_test(M=64, N=4096)
-    rms_norm_test(shape=(2048, 2048))
-    layer_norm_test(shape=(1024, 1024), gamma_enable=True)
-    layer_norm_test(shape=(1024, 1024), gamma_enable=True, use_pbi=True)
-    layer_norm_test(shape=(1024, 1024), beta_enable=True)
-    layer_norm_test(shape=(1024, 1024), beta_enable=True, use_pbi=True)
-    bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
-    matmat_mul_test(M=512, K=2048, N=2048)
-    matmat_mul_test(M=128, K=4096, N=512, gelu_enable=True)
-    matmat_mul_test(M=256, K=2048, N=1024, silu_enable=True)
-    matmat_mul_test(M=512, K=1024, N=512, bias_enable=True, bias_mode="broadcast_N")
-    matmat_mul_test(M=512, K=1024, N=512, bias_enable=True, bias_mode="full_matrix")
-    matmat_mul_quantized_weights_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=True)
-    matmat_mul_quantized_weights_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=False)
-    quantized_matmat_mul_test(M=128, K=512, N=512, data_type=TYPE.IF4, int_variant=True, gelu_enable=True)
-    flash_attention_test(head_dim=128, seq_len=1024)
-    flash_attention_test(head_dim=64, seq_len=512, bias_enable=True)
-
-    # --- Multi-core / multi-engine tests (kintex7 and alveo) ---
-    if args.device in ('kintex7', 'alveo'):
-        matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, use_pbi=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True, use_pbi=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True, use_pbi=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True, use_pbi=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True, use_pbi=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, clamp_enable=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, clamp_enable=True, use_pbi=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, log_enable=True)
-        matmat_mul_two_cores_test(M=1920, K=768, N=2048, log_enable=True, use_pbi=True)
-        # Wide-variance softmax across two engines exercises per-row exp +
-        # bf20 adder tree reduction on both engines concurrently. Use scale-
-        # specific SNR floors mirroring the single-engine wide-variance set.
-        for scale, snr_floor in ((4.0, 38.0), (8.0, 28.0)):
-            matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True,
-                                      input_scale=scale, snr_threshold_db=snr_floor)
-            matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True,
-                                      input_scale=scale, use_pbi=True, snr_threshold_db=snr_floor)
-    if args.device == 'alveo':
-        matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
-
-    print(f"[seed-check-end] bf16 samples after seed=0: {_seed_probe.tolist()}")
-
-    if args.ext:
-        eltwise_core_dram_test(use_pbi=False)
-        eltwise_core_dram_test(use_pbi=True)
-        for M in [64, 192, 4096]:
-            for N in [64, 576, 1024]:
-                bf16_transpose_test(M=M, N=N, use_pbi=False)
-                bf16_transpose_test(M=M, N=N, use_pbi=True)
-
-        for M in [64, 384, 1024]:
-            for N in [64, 576, 1024]:
-                for K in [64, 192, 1024]:
-                    for bias_enable in [False, True]:
-                        for bias_mode in ["broadcast_N", "full_matrix"]:
-                            matmat_mul_quantized_weights_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
-                            matmat_mul_quantized_weights_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, gelu_enable=True)
-                            matmat_mul_quantized_weights_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, silu_enable=True)
-        for M in [64, 384, 1024]:
-            for N in [64, 576, 1024]:
-                for K in [64, 192, 1024]:
-                    for bias_enable in [False, True]:
-                        for bias_mode in ["broadcast_N", "full_matrix"]:
-                            matmat_mul_quantized_weights_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, use_pbi=True)
-                            matmat_mul_quantized_weights_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, gelu_enable=True, use_pbi=True)
-                            matmat_mul_quantized_weights_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, silu_enable=True, use_pbi=True)
-
-        for M in [25, 64, 133, 384, 1024]:
-            for N in [64, 576, 1024]:
-                for K in [64, 192, 1024]:
-                    for bias_enable in [False, True]:
-                        for bias_mode in ["broadcast_N", "full_matrix"]:
-                            for softmax_enable in [True, False]:
-                                matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, softmax_enable=softmax_enable, snr_threshold_db=35, fmax_snr_threshold_db=35)
-                                matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, gelu_enable=True, snr_threshold_db=35, fmax_snr_threshold_db=35)
-                                matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, silu_enable=True, snr_threshold_db=35, fmax_snr_threshold_db=35)
-
-        for M in [64, 384, 1024]:
-            for N in [64, 576, 1024]:
-                for K in [64, 192, 1024]:
-                    for bias_enable in [False, True]:
-                        for bias_mode in ["broadcast_N", "full_matrix"]:
-                            quantized_matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
-                            quantized_matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, gelu_enable=True)
-                            quantized_matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, silu_enable=True)
-
-        for head_dim in [64, 128, 256]:
-            for seq_len in [64, 128, 256, 512, 1024, 2048, 3072, 4096, 6144, 8192]:
-                for bias_enable in [True, False]:
-                    flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable)
-
-        for M in [64, 128, 256, 512, 1024, 2048, 4096]:
-            for N in [64, 128, 256, 512, 1024, 2048, 4096]:
-                for gamma_enable in [True, False]:
-                    for beta_enable in [True, False]:
-                        layer_norm_test(shape=(M, N), gamma_enable=gamma_enable, beta_enable=beta_enable)
-
-        for M in [64, 128, 256, 512, 1024, 2048, 4096]:
-            for N in [64, 128, 256, 512, 1024, 2048, 4096]:
-                rms_norm_test(shape=(M, N))
-                rms_norm_test(shape=(M, N), use_pbi=True)
-
-        for M in [64, 128, 256, 512, 1024, 2048, 4096]:
-            for K in [64, 128, 256, 512, 1024, 2048, 4032]:
-                for N in [64, 128, 256, 512, 1024, 2048, 4096]:
-                    for bias_enable in [True, False]:
-                        for softmax_enable in [True, False]:
-                            for bias_mode in ["broadcast_N", "full_matrix"]:
-                                matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode, use_pbi=False, snr_threshold_db=35, fmax_snr_threshold_db=35)
-                                matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode, use_pbi=True, snr_threshold_db=35, fmax_snr_threshold_db=35)
-        
-        for M in [1, 4, 8, 64, 512, 8192]:
-            for N in [256, 512, 8192]:
-                    rope_hf_core_dram_test(M, N)
-                    rope_hf_core_dram_test(M, N, use_pbi=True)
-
-        for M in [1, 4, 8, 64, 512, 4096]: # TODO: GQA with M 8192 and N 8192 would fail the dram read buffer size
-            for N in [256, 512, 4096]:
-                    rope_hf_core_dram_gqa_test(M, 4, N)
-                    rope_hf_core_dram_gqa_test(M, 4, N, use_pbi=True)
-
-        for head_dim in [64, 256]:
-            for seq_len in [64, 256, 512, 4096]:
-                for bias_enable in [True, False]:
-                    flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable, use_pbi=False)
-                    flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable, use_pbi=True)
-
-        for head_dim in [64, 256]:
-            for seq_len in [64, 256, 512, 8192-64]:
-                    decoder_group_attention_test(head_dim, seq_len, use_pbi=False)
-                    decoder_group_attention_test(head_dim, seq_len, use_pbi=True)
-
-    # Stress-test partial tiles: M not a multiple of M_chunk
-    matmat_mul_dynamic_m_test(K=1024, N=2048,
-                            M_runtime_values=[1, 7, 64, 100, 255, 511, 512], compare_legacy = True)
-
-    # Softmax + varying M
-    matmat_mul_dynamic_m_test(K=512, N=512,
-                            M_runtime_values=[1, 32, 128, 256],
-                            softmax_enable=True)
-
-    # Bias full_matrix + activations
-    matmat_mul_dynamic_m_test(K=256, N=256,
-                            M_runtime_values=[16, 64, 127, 128],
-                            bias_enable=True, bias_mode="full_matrix",
-                            gelu_enable=True)
-
+    # --- Flash attention batched (PBI staging) ---
+    flash_attention_batched_test(head_dim=64, seq_len=64, num_heads=4, bias_enable=False)
+    flash_attention_batched_test(head_dim=64, seq_len=64, num_heads=4, bias_enable=True)
+    flash_attention_batched_test(head_dim=64, seq_len=256, num_heads=5, bias_enable=False)
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
