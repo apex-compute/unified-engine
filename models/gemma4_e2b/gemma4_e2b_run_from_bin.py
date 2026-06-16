@@ -7469,11 +7469,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         # Prime gpr_seq_len once (= prompt length); program advances it per step.
         self.isa_add_set_core(self.gpr_seq_len, self.seq_len)
-
-        # Header prints AFTER the priming register-set above (whose capture/DMA
-        # lines are the pre-decode system info) and directly atop the streamed
-        # generation, separated from the system info by one blank line.
-        print("\n--- Starting decoder ---")
+        print("\n------------------------------ DECODE START ------------------------------\n", flush=True)
 
         # Live decode status bar (mirrors llama3.2_1b): pin the bottom terminal
         # row via an ANSI scroll region; generated tokens stream above it while a
@@ -7748,7 +7744,7 @@ def main():
     try:
         latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
         latency_prefill = time.perf_counter() - timer
-        print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n")
+        print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
         timer=time.perf_counter()
         token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
