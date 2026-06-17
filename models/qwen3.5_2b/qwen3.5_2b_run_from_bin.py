@@ -101,9 +101,12 @@ def main():
             f"Unified bin not found: {uni_bin}\n"
             f"Generate it first with a VLM run of qwen3.5_2b_test.py "
             f"(e.g. `python3 qwen3.5_2b_test.py --vision-enable --vision-on-hardware`).")
+    if not os.path.exists(uni_meta):
+        raise SystemExit(f"Unified bin metadata not found: {uni_meta}")
     with open(uni_meta) as f:
         meta = json.load(f)
-    raw = open(uni_bin, "rb").read()
+    with open(uni_bin, "rb") as f:
+        raw = f.read()
     print("=" * 78)
     print(f"  Qwen3.5-2B run-from-bin ({'VLM' if vision_on else 'LM'}) — "
           f"{T.UNIFIED_BIN_NAME} ({len(raw)/1024/1024:.2f} MB)")
@@ -123,7 +126,10 @@ def main():
             raise SystemExit("Unified bin has no vision-encoder section — rebuild "
                              "it with a --vision-on-hardware run of test.py.")
 
-    weights = torch.load(os.path.join(script_dir, cfg["paths"]["weights_bin"]),
+    weights_path = os.path.join(script_dir, cfg["paths"]["weights_bin"])
+    if not os.path.exists(weights_path):
+        raise SystemExit(f"Quantized weights not found: {weights_path}")
+    weights = torch.load(weights_path,
                          weights_only=False, map_location="cpu")
 
     print("  FPGA init ...", end=" ", flush=True)

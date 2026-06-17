@@ -92,8 +92,8 @@ Decode samples **on the FPGA**: the LM head is a quantized (FP4) matmul of the
 tied embedding with a per-vocab penalty bias as its C term (`bias_mode="broadcast_N"`,
 `write_back_disable=True`), and the **hardware argmax** of `logits + bias` returns
 the next token — no logits are read back to the host. The penalty is **ON by
-default** (it gives the model a reasonable, non-looping ending); `--pure-greedy`
-zeroes the bias for bit-identical greedy. The host rebuilds the bias each step as
+default**; `Q35_PURE_GREEDY=1` zeroes the bias for bit-identical greedy. The
+host rebuilds the bias each step as
 `bias[t] = clamp(-α·count[t], min=-cap)` over a window of recent tokens;
 punctuation/whitespace/special tokens are exempt, and a token repeated
 `PEN_LOOP_RUN` times in a row is hard-banned to break stuck loops.
@@ -103,7 +103,7 @@ punctuation/whitespace/special tokens are exempt, and a token repeated
 | Var | Effect |
 |-----|--------|
 | `Q35_PURE_GREEDY=1` | Disable the repetition penalty (zero bias = bit-identical greedy). |
-| `PEN_ALPHA` | Penalty strength `bias=-α·count` (default `1.0`). |
+| `PEN_ALPHA` | Penalty strength `bias=-α·count` (default `3.0`). |
 | `PEN_CAP` | Penalty floor `clamp(min=-cap)` (default `20.0`). |
 | `REP_WINDOW` | Token-frequency window, last N decoded (default `256`). |
 | `GREEDY_UNTIL` | Pure greedy for the first N decoded tokens (default `8`). |
@@ -111,7 +111,6 @@ punctuation/whitespace/special tokens are exempt, and a token repeated
 | `VIS_LEGACY=1` | Use the unrolled multi-capture vision encoder instead of the compact §7/§3b one. |
 | `Q35_NO_S7_FLASH=1` | Disable the shared §7 flash subroutine (inline bodies — bigger bin). |
 | `Q35_VIS_LN_STATIC=1` | Static (non-PBI) vision LayerNorm fallback. |
-| `Q35_INSTR_BREAKDOWN=1` | Print a per-op instruction-size breakdown (diagnostic). |
 
 See `../../notes/notes_qwen3.5_2b.md` for the full implementation notes
 (bin minimization, vision compaction, and the single-bin design + root cause).

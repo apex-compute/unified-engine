@@ -28,26 +28,23 @@ Usage:
     python3 qwen3.5_2b_test.py --vision-enable --vision-on-hardware   # VLM, FPGA vision encoder
     python3 qwen3.5_2b_test.py --image my.jpg --prompt "What is in this image?"
 
-Generation strategy: each decode step re-runs the full sequence through all
-24 layers (fresh S state per step, no KV cache).  Correct but O(n²) in seq
-length — suitable for short outputs on the test harness; proper incremental
-decoding (persistent S + KV cache) is deferred.
+Generation uses persistent Gated-DeltaNet, convolution, and attention-cache
+state. Prefill replays the compiled decoder once per prompt token; each decode
+token then runs one incremental FPGA decoder step.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
 import math
 import os
-import pickle
 import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -72,7 +69,6 @@ from user_dma_core import (                          # noqa: E402
     MEMCPY_TYPE, URAM_START_ADDR, URAM_NEAR_FULL_ELEMENTS,
     DRAM_ACTIVATION_ADDR,
     LALU_CLAMP_RELU_A, LALU_CLAMP_RELU_B,
-    LALU_LOG_A, LALU_LOG_B,
     ue_35bit_addr_shifter,
 )
 
@@ -980,7 +976,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         # Per-layer scratch DRAM for α-on-FPGA pipeline intermediates:
         #   alpha_x_dram:    [UE_VECTOR_SIZE] raw x = a_raw + dt_bias
         #   alpha_rx_dram:   [UE_VECTOR_SIZE] relu(x) via identity matmul
-        #   alpha_y_dram:    [UE_VECTOR_SIZE] 1/α output (scattered to alpha_dram slots)
+        #   alpha_y_dram:    [UE_VECTOR_SIZE] α output (scattered to alpha_dram slots)
         self._alpha_x_dram_by_s:  Dict[int, int] = {}
         self._alpha_rx_dram_by_s: Dict[int, int] = {}
         self._alpha_y_dram_by_s:  Dict[int, int] = {}
@@ -1722,10 +1718,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                       f"{avg_gflops:.1f} GFLOP/s")
 
         # §8b: clear tensor DRAM at the end of the run so the next process that
-        # reads a scratch buffer before overwriting it doesn't see stale/NaN data
-        # (a ~400 max|d| floor in compare, or an all-`!` cascade in a fresh
-        # decode).  A run killed mid-decode skips this — use COMPARE_CLEAR_DRAM=1
-        # for bit-exact compares, or just let runs finish.
+        # reads a scratch buffer before overwriting it doesn't see stale/NaN data.
         with _quiet():
             self.clear_dram()
 
@@ -1737,109 +1730,6 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             "wall_time_s":    total_dt,
             "tok_per_s":      n / max(total_dt, 1e-9),
             "hw_gflops_s":    avg_gflops,
-        }
-
-    def transpose_s_caches_to_decode_form(self) -> None:
-        """After prefill, flip each linear-attn layer's S cache from its
-        natural [num_heads, Dk, Dv] layout to [num_heads, Dv, Dk].  The
-        decode recurrence (`_record_recurrence_runtime_ab`) stores S in
-        transposed form so steps 2 and 6 can read B=S directly without any
-        bf16_transpose instructions in the loop.  Host-side torch transpose
-        → DMA write; runs once per generate() call after prefill."""
-        num_vh = self.lin_num_v_heads
-        Dk = self.lin_head_k_dim
-        Dv = self.lin_head_v_dim
-        elems_per_head = Dk * Dv
-        for layer_idx, addr in self._s_dram.items():
-            s_flat = torch.zeros(num_vh * elems_per_head, dtype=torch.bfloat16)
-            self.dma_read(DMA_DEVICE_C2H, addr, s_flat,
-                          num_vh * elems_per_head * BF16)
-            # [num_heads, Dk, Dv] → [num_heads, Dv, Dk]
-            s_T = (s_flat.view(num_vh, Dk, Dv)
-                        .permute(0, 2, 1).contiguous().reshape(-1))
-            self.dma_write(DMA_DEVICE_H2C, addr, s_T,
-                           num_vh * elems_per_head * BF16)
-
-    # ---- Prefill state snapshot (TEMPORARY test-iteration cache) -----------
-    # Dumps every DRAM region prefill populates (S / KV / conv / Q_FLASH) plus
-    # cache_pos and the prefill-logits argmax.  On reload, DMA-upload them and
-    # skip prefill entirely.  Keyed on (prompt_ids, max_context) so a different
-    # prompt or context size transparently re-runs prefill.
-    #
-    # NOT a production path: bypasses the computation we want to profile and
-    # debug.  Intended for fast iteration on decode fixes where prefill is an
-    # expensive constant.  Delete the cache file (or pass --no-prefill-cache)
-    # to force a real prefill.
-    def _prefill_cache_buffers(self):
-        """Yield (name, addr, nbytes) for every DRAM region to snapshot."""
-        T_al = self.max_context_aligned
-        H    = self.full_num_heads
-        Dh   = self.full_head_dim
-        kv_elems = H * T_al * Dh
-        q_flash_elems = kv_elems
-        s_elems = (self.lin_num_v_heads * self.lin_head_k_dim
-                   * self.lin_head_v_dim)
-        conv_elems = (self._conv_K - 1) * self.lin_conv_dim
-        for idx, addr in self._s_dram.items():
-            yield ("s", idx, addr, s_elems)
-        for idx, addr in self._k_cache.items():
-            yield ("k", idx, addr, kv_elems)
-        for idx, addr in self._v_cache.items():
-            yield ("v", idx, addr, kv_elems)
-        for idx, addr in self._conv_state_dram.items():
-            yield ("conv", idx, addr, conv_elems)
-        for idx, addr in self._fa_q_flash_dram.items():
-            yield ("qflash", idx, addr, q_flash_elems)
-
-    def save_prefill_state(self, cache_path: str, prompt_ids, max_context: int,
-                           first_token_id: int, final_logits) -> None:
-        """Dump every prefill-populated DRAM region + metadata to `cache_path`."""
-        payload = {
-            "prompt_ids":      list(int(x) for x in prompt_ids),
-            "max_context":     int(max_context),
-            "cache_pos":       int(self._cache_pos),
-            "first_token_id":  int(first_token_id),
-            "final_logits":    final_logits.detach().float().cpu().contiguous(),
-            "host_conv_state": {idx: t.clone() for idx, t in self._conv_state.items()},
-            "buffers":         {},
-        }
-        for kind, idx, addr, nelem in self._prefill_cache_buffers():
-            nbytes = nelem * BF16
-            buf = torch.zeros(nelem, dtype=torch.bfloat16)
-            self.dma_read(DMA_DEVICE_C2H, addr, buf, nbytes)
-            payload["buffers"][(kind, idx)] = buf.clone()
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def load_prefill_state(self, cache_path: str, prompt_ids,
-                           max_context: int) -> Optional[dict]:
-        """Load a prefill snapshot; return (first_token_id, final_logits) or
-        None if the cache is missing / stale / mismatched."""
-        if not os.path.exists(cache_path):
-            return None
-        try:
-            with open(cache_path, "rb") as f:
-                payload = pickle.load(f)
-        except Exception:
-            return None
-        if (payload.get("prompt_ids") != list(int(x) for x in prompt_ids)
-                or payload.get("max_context") != int(max_context)):
-            return None
-        for kind, idx, addr, nelem in self._prefill_cache_buffers():
-            key = (kind, idx)
-            buf = payload["buffers"].get(key)
-            if buf is None or buf.numel() != nelem:
-                return None
-            self.dma_write(DMA_DEVICE_H2C, addr,
-                           _bf(buf), nelem * BF16)
-        for idx, t in payload["host_conv_state"].items():
-            if idx in self._conv_state:
-                self._conv_state[idx] = t.clone()
-        self._cache_pos = int(payload["cache_pos"])
-        return {
-            "first_token_id": int(payload["first_token_id"]),
-            "final_logits":   payload["final_logits"],
         }
 
     def reset_state(self) -> None:
@@ -1960,8 +1850,8 @@ def _emit_alpha_fpga_to_slots(ue, A_RAW_DRAM: int, DT_BIAS_DRAM: int,
                               num_heads: int) -> None:
     """Emit α-on-FPGA pipeline into the active capture.
 
-    Computes y[h] = exp(c[h] · softplus(x[h])) = 1/α[h] for each head, then
-    scatters each y[h] into the padded alpha_dram slot so the recurrence's
+    Computes α[h] = exp(-c[h] · softplus(x[h])) for each head, then scatters
+    each value into the padded alpha_dram slot so the recurrence's
     scalar-load reads the correct value without a host round-trip.
 
     Inputs (pre-uploaded to params DRAM, 64-element padded bf16 vectors):
@@ -1969,7 +1859,7 @@ def _emit_alpha_fpga_to_slots(ue, A_RAW_DRAM: int, DT_BIAS_DRAM: int,
       DT_BIAS_DRAM : dt_bias constants
       C_DRAM       : c = exp(A_log) constants
       alpha_dram   : pre-zeroed slot array [num_heads, 64] bf16; position 0 of
-                     each 64-element block receives 1/α[h]
+                     each 64-element block receives α[h]
 
     Scratch DRAM (temporary, UE_VECTOR_SIZE elements each):
       x_scratch, rx_scratch, y_scratch
@@ -1977,9 +1867,7 @@ def _emit_alpha_fpga_to_slots(ue, A_RAW_DRAM: int, DT_BIAS_DRAM: int,
     softplus is computed via the native identity:
         softplus(x) = relu(x) + log(1 + exp(-|x|))
     using LALU's CLAMP (=ReLU with [0, +inf]) and LOG (=log·clamp(1e-3, +inf))
-    modes — the +1 and the LOG fuse into a single ADD_BROADCAST+LALU.LOG op.
-    Replaces a 9-instruction L∞-optimal polynomial fit (max err 7.9e-4) with
-    a 4-instruction sequence whose error is bf16-noise-limited.
+    modes. The add and log must be emitted separately; see _emit_log1p_add.
     """
     N = UE_VECTOR_SIZE
 
@@ -1993,7 +1881,7 @@ def _emit_alpha_fpga_to_slots(ue, A_RAW_DRAM: int, DT_BIAS_DRAM: int,
     SA_ABSX  = 0x00600  # |x| = 2·relu(x) - x                  (URAM_A)
     SA_NABSX = 0x00800  # -|x|                                 (URAM_A)
     SA_E     = 0x00A00  # exp(-|x|)                            (URAM_A)
-    SB_L1P   = 0x80400  # log(1 + exp(-|x|))  [fused LALU.LOG] (URAM_B; eltwise_add needs cross-bank operands)
+    SB_L1P   = 0x80400  # log(1 + exp(-|x|))                 (URAM_B; eltwise_add needs cross-bank operands)
     SA_SP    = 0x01400  # softplus = relu(x) + log1p           (URAM_A)
     SB_C     = 0x80800  # c = exp(A_log)                        (URAM_B)
     SA_CS    = 0x01600  # c · softplus                         (URAM_A)
@@ -2016,16 +1904,18 @@ def _emit_alpha_fpga_to_slots(ue, A_RAW_DRAM: int, DT_BIAS_DRAM: int,
         )
 
     def _emit_log1p_add(src_sram, dst_sram, n):
-        """dst = log(src + 1.0), one fused op (ADD_BROADCAST + LALU.LOG).
-        The LOG mode applies clamp(·, 1e-3, +inf) before log; harmless here
-        since (src + 1.0) ≥ 1 always (src = exp(-|x|) ∈ [0, 1])."""
+        """Compute dst = log(src + 1.0) using supported, explicit stages."""
         src_type, src_addr = ue.sram_address_to_uram_address(src_sram)
         dst_type, dst_addr = ue.sram_address_to_uram_address(dst_sram)
         rs = (n + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        # Do not fuse ADD_BROADCAST(+1) with LALU.LOG here. On hardware that
+        # path applied the +1 but dropped LOG, turning log1p(x) into 1+x and
+        # causing DeltaNet alpha over-decay. Use the tested
+        # matmat_mul_core(log_enable=True) path instead.
         ue.ue_arithmetic_op(
             BROADCAST_MODE.SCALAR_IN_REG.value, 0, 1,
-            LALU_LOG_A, LALU_LOG_B,
-            LALU_MODE.LOG.value,
+            0, 0,
+            LALU_MODE.BYPASS.value,
             ue.float_to_bf16(1.0),
             dst_type.value, 0, dst_addr,
             URAM_WRITE_SRC.URAM_WRITE_BACK.value,
@@ -2033,6 +1923,16 @@ def _emit_alpha_fpga_to_slots(ue, A_RAW_DRAM: int, DT_BIAS_DRAM: int,
             src_addr, 0, rs,
             0, 0, 0,
         )
+        # Spill src+1 to scratch, apply log through the tested identity-matmul
+        # path, then restore relu(x), because matmat_mul_core clobbers SRAM.
+        ue.sram_to_accelerator_memory(dst_sram, y_scratch, n)
+        ue.matmat_mul_core(M=1, K=n, N=n,
+                           A_DRAM_ADDR=y_scratch,
+                           B_DRAM_ADDR=ue._identity_dram_addr,
+                           OUTPUT_DRAM_ADDR=y_scratch,
+                           log_enable=True)
+        ue.accelerator_memory_to_sram(y_scratch, dst_sram, n)
+        ue.accelerator_memory_to_sram(rx_scratch, SA_RX, n)
 
     # 1. Load dt_bias and a_raw; x = a_raw + dt_bias
     ue.accelerator_memory_to_sram(DT_BIAS_DRAM, SB_BIAS, N)
@@ -2057,9 +1957,7 @@ def _emit_alpha_fpga_to_slots(ue, A_RAW_DRAM: int, DT_BIAS_DRAM: int,
     ue.eltwise_add_core(SB_2RX, SA_NX, SA_ABSX, N)
 
     # 4. Native softplus: softplus(x) = relu(x) + log(1 + exp(-|x|)).
-    #    Uses LALU's native LOG mode (post-v1.2); the +1 and log fuse into one
-    #    ADD_BROADCAST+LALU.LOG op.  4 ops vs 9 for the old polynomial fit;
-    #    error is bf16-noise-limited rather than 7.9e-4 algorithmic.
+    #    The +1 and LOG are intentionally separate; see _emit_log1p_add.
     ue.broadcast_mul(scalar=-1.0, sram_start_addr=SA_ABSX, sram_wb_addr=SA_NABSX, element_size=N)
     _emit_exp(SA_NABSX, SA_E, N)              # exp(-|x|)
     _emit_log1p_add(SA_E, SB_L1P, N)          # log(1 + exp(-|x|)) → URAM_B
@@ -3201,9 +3099,6 @@ def _run_linear_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
         beta_dram  = ue._beta_dram_by_s[S_DRAM]
         k_pad_dram = ue._k_pad_dram_by_s[S_DRAM]
 
-        _q35_brk = (os.environ.get("Q35_INSTR_BREAKDOWN")
-                    and getattr(ue, "_compile_mode", False) and layer_idx == 0)
-        _cc_abk0 = getattr(ue, "capture_count", 0)
         _emit_alpha_fpga_to_slots(
             ue,
             A_RAW_DRAM=A_PAD_DRAM,
@@ -3231,7 +3126,6 @@ def _run_linear_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
         alpha_dummy = torch.ones(T, num_vh, dtype=torch.bfloat16)
         beta_dummy  = torch.ones(T, num_vh, dtype=torch.bfloat16)
         k_dummy     = torch.zeros(T, num_vh, Dk, dtype=torch.bfloat16)
-        _cc_b = getattr(ue, "capture_count", 0)
         ue.recurrent_gated_delta_rule_core(
             T=T, num_heads=num_vh, Dk=Dk, Dv=Dv,
             Q_DRAM_ADDR=Q_L2_DRAM, K_DRAM_ADDR=K_L2_DRAM,
@@ -3244,10 +3138,6 @@ def _run_linear_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
             alpha_on_fpga=True,
             beta_on_fpga=True,
             k_on_fpga=True)
-        if _q35_brk:
-            _cc_rec = getattr(ue, "capture_count", 0)
-            print(f"  [instr-L0] abk_pipelines={_cc_b - _cc_abk0}  "
-                  f"recurrence_core={_cc_rec - _cc_b}", file=sys.stderr, flush=True)
     else:
         # === PREFILL: host barrier for α/β/k (T>1 path unchanged). ===
         _exec_captured(ue)
@@ -3780,18 +3670,12 @@ def _forward_range(ue: Qwen3_5_2b_UnifiedEngine, token_ids: torch.Tensor,
                 # T=1 decode: pass FPGA-side result directly — zero host round-trip.
                 # Scratch accumulates across layers (24 layers × small T=1 scratch ≪ DRAM cap).
                 NEXT_X = cur_dram
-            _cc0 = getattr(ue, "capture_count", 0)
             if idx in ue.linear_attn_layers:
                 cur_dram = _run_linear_attn_layer(
                     ue, NEXT_X, idx, T, zero_s=zero_s)
             else:
                 cur_dram = _run_full_attn_layer(
                     ue, NEXT_X, idx, T, pos_start=pos_start)
-            if os.environ.get("Q35_INSTR_BREAKDOWN") and getattr(ue, "_compile_mode", False):
-                _kind = "LIN" if idx in ue.linear_attn_layers else "FULL"
-                print(f"  [instr] layer {idx:2d} {_kind}: "
-                      f"{ue.capture_count - _cc0} instrs "
-                      f"(cum {ue.capture_count})", file=sys.stderr, flush=True)
 
     with _quiet():
         FINAL_NORM_DRAM = run_rms_norm_dram(ue, M=T, N=H,
@@ -3936,28 +3820,10 @@ def _sample_next(logits_row: torch.Tensor, temperature: float, top_k: int) -> in
     return int(torch.multinomial(probs, 1).item())
 
 
-def _prefill_cache_path(ue, prompt_ids) -> str:
-    """Path for the temporary prefill-state cache (keyed on prompt tokens +
-    max_context so a different prompt or size regenerates transparently).
-
-    The ``v2`` tag encodes the *decode-form S layout* (transposed to
-    [Dv, Dk]); bumping it invalidates older caches that stored S in the
-    prefill-native [Dk, Dv] form.
-    """
-    key = hashlib.sha1(
-        f"v2_{list(int(x) for x in prompt_ids)}_{int(ue.max_context)}"
-        .encode()).hexdigest()[:12]
-    bin_dir = os.path.dirname(ue._decoder_bin_path)
-    return os.path.join(bin_dir, f"prefill_cache_{key}.pkl")
-
-
 def generate(ue: Qwen3_5_2b_UnifiedEngine, tokenizer,
              prompt: str, max_new_tokens: int = 32,
              temperature: float = 0.0, top_k: int = 0,
              verbose: bool = True,
-             decode_bin_path: str = None,
-             decode_meta_path: str = None,
-             use_prefill_cache: bool = False,
              processor=None, image=None,
              model_dir: str = None,
              precomputed_vision_tokens: torch.Tensor = None,
@@ -3969,13 +3835,7 @@ def generate(ue: Qwen3_5_2b_UnifiedEngine, tokenizer,
     pass, but with zero host barriers inside the layer — see
     `prefill_via_decode()` and the "Fast prefill via decoder-binary replay"
     section in `template/notes/notes_qwen3.5_2b.md`.  After prefill, each
-    decode step is one FPGA trigger at ~1.19 s / 14.3 GFLOP/s HW.
-
-    `use_prefill_cache=True` (opt-in, CLI flag `--prefill-cache`) pickles
-    every post-prefill DRAM region (S, KV, conv, Q_FLASH, `cache_pos`, first
-    logits) to disk and DMA-reloads them on the next run with the same
-    `(prompt_ids, max_context)`.  Off by default — intended as a
-    development-iteration speedup, not a production feature.
+    decode step is one FPGA trigger.
     """
     # Wrap the user prompt in the chat template (user role + assistant
     # generation prompt) — same convention Gemma4 uses for its LM prompt path.
@@ -4033,40 +3893,15 @@ def generate(ue: Qwen3_5_2b_UnifiedEngine, tokenizer,
             bin_mb = os.path.getsize(bin_path) / (1024 * 1024)
             print(f"done ({time.time()-t_c0:.1f}s, {bin_mb:.1f} MB binary).")
 
-    cache_path = _prefill_cache_path(ue, ids.tolist())
-    t_load = time.time()
-    loaded = ue.load_prefill_state(cache_path, ids.tolist(),
-                                   ue.max_context) if use_prefill_cache else None
-    load_dt = time.time() - t_load
-    if loaded is not None:
-        if verbose:
-            print(f"  Prefill cache HIT → {os.path.basename(cache_path)} "
-                  f"({os.path.getsize(cache_path)/1024/1024:.1f} MB, "
-                  f"loaded in {load_dt:.2f}s — skipped prefill)")
-        nxt = loaded["first_token_id"]  # final_logits in the cache is vestigial now
-    else:
-        # Token-by-token replay of the decoder binary from zero state.
-        # Produces S directly in [Dv, Dk] decode form, so no post-prefill
-        # transpose step is needed.
-        # prefill returns the first generated token directly (HW argmax of the
-        # last prompt token's on-chip LM head — no host sampling).
-        nxt = prefill_via_decode(ue, ids, verbose=verbose,
-                                 vision_tokens=vision_tokens,
-                                 image_token_id=image_token_id)
-        if use_prefill_cache:
-            t_save = time.time()
-            # final_logits is vestigial under the HW-argmax path (the first token
-            # is prefill's argmax); store a placeholder to keep the cache format.
-            ue.save_prefill_state(cache_path, ids.tolist(), ue.max_context,
-                                  nxt, torch.zeros(1))
-            if verbose:
-                print(f"  Prefill cache SAVED → {os.path.basename(cache_path)} "
-                      f"({os.path.getsize(cache_path)/1024/1024:.1f} MB, "
-                      f"{time.time()-t_save:.1f}s)")
+    # Token-by-token replay of the decoder binary from zero state. This
+    # produces S directly in [Dv, Dk] decode form.
+    nxt = prefill_via_decode(ue, ids, verbose=verbose,
+                             vision_tokens=vision_tokens,
+                             image_token_id=image_token_id)
 
     eot = ue._cfg["model"].get("end_of_turn_token_id", None)
 
-    # Clear prefill caches (T>1 path) before switching to decode (T=1).
+    # Clear instruction-emission caches before switching to the T=1 path.
     ue._primitive_cache.clear()
     ue._rec_cache.clear()
     ue._exec_cache.clear()
@@ -4082,11 +3917,6 @@ def generate(ue: Qwen3_5_2b_UnifiedEngine, tokenizer,
         verbose=verbose,
     )
     return result["generated_text"]
-
-
-# ============================================================================
-# CLI
-# ============================================================================
 
 
 # ============================================================================
@@ -4125,8 +3955,8 @@ def run_fpga_vision_encoder(ue, model_dir: str, hf_inputs, setup_only: bool = Fa
     """Run the compact single-capture vision encoder STANDALONE (build + execute
     at program base) and return the merged ``[N_merged, fc2_dim]`` tokens; the
     encoder bytes are stashed on ``ue._vis_encoder_bytes`` for the unified bin.
-    ``setup_only=True`` only uploads the vision weights + per-image inputs (used
-    by the experimental bin-load path in run_from_bin) and returns None."""
+    ``setup_only=True`` only uploads the vision weights + per-image inputs for
+    the bin-load path and returns None."""
     if os.environ.get("VIS_LEGACY"):
         return _run_fpga_vision_encoder_legacy(ue, model_dir, hf_inputs)
     return _run_fpga_vision_encoder_compact(ue, model_dir, hf_inputs, setup_only, build_only)
@@ -4338,7 +4168,7 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     del hf
     print(f"({time.time()-t_w:.1f}s)")
 
-    # setup_only (experimental bin-load path in run_from_bin): vision weights +
+    # setup_only (bin-load path in run_from_bin): vision weights +
     # per-image inputs are now resident at the same deterministic addresses the
     # prebuilt encoder section was baked against. No emit/execute — the caller
     # DMAs the encoder bytes from the bin and triggers them. Record the readback
@@ -4839,16 +4669,11 @@ def main():
                     help="text prompt for the model to answer/continue. "
                          "Defaults: VLM mode (--vision-enable or --image) → "
                          "'Describe what you see in this image.'; LM-only → "
-                         "'Once upon a time'.")
+                         "'Tell me about the Eiffel Tower. What year was it built?'.")
     ap.add_argument("--max-new-tokens", type=int, default=0,
                     help="max tokens to generate.  0 (default) = run until "
                          "EOT or the KV cache is full (`max_context - "
                          "prompt_len`).  Pass a positive integer to cap.")
-    ap.add_argument("--prefill-cache", action="store_true",
-                    help="pickle and reload the post-prefill S/KV/conv/Q_FLASH "
-                         "buffers to disk, keyed on (prompt_ids, max_context). "
-                         "Off by default — intended for dev iteration on decode "
-                         "changes so repeated runs skip the ~30 s prefill.")
     # VLM opt-in (gemma4 pattern). Default mode is pure LM; vision activates
     # only when --image PATH or --vision-enable is given.  Vision encoder
     # runs on FPGA (Phase 4) by default; the host-side HF path (Phase 1) is
@@ -4861,9 +4686,9 @@ def main():
                          "(src/template/test_samples/yosemite.jpg). "
                          "Ignored if --image is also given.")
     ap.add_argument("--vision-on-hardware", action="store_true",
-                    help="Run the vision encoder on FPGA (Phase 4). "
-                         "Default uses the HF host-side vision encoder "
-                         "(Phase 1 path). Only meaningful with "
+                    help="Run the vision encoder on FPGA. By default the vision "
+                         "encoder runs through Hugging Face on the host. "
+                         "Only meaningful with "
                          "--vision-enable / --image.")
     args = ap.parse_args()
     if args.vision_on_hardware and not (args.vision_enable or args.image):
@@ -5072,7 +4897,6 @@ def main():
                          max_new_tokens=args.max_new_tokens,
                          temperature=TEMPERATURE,
                          top_k=TOP_K,
-                         use_prefill_cache=args.prefill_cache,
                          processor=processor,
                          image=image,
                          model_dir=model_dir,
