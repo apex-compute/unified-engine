@@ -6325,6 +6325,106 @@ def mobilesam_s2_flash_btb_test(n_calls: int = 5, num_batches: int = 25,
     return worst
 
 
+def mobilesam_i2t_em_test(timeout_s: float = 120.0):
+    """EXACT-MATCH recreation of the decoder i2t cross-attention in user_hw_test.
+
+    Mirrors mobilesam_test._cross_attn_i2t's flash loop bit-for-bit: DEC_HEADS=8 heads,
+    GA=4096 image rows chunked by ROW_CHUNK=64 -> 8*64 = 512 cross-attn calls emitted
+    BACK-TO-BACK in ONE program, at the real dims (head_dim=64, kv_len=64), with the same
+    per-head Q/K/V^T/OUT address layout. Runs both the legacy unrolled kernel and the PBI
+    hardware-loop kernel, then reports per-kernel: bit-exactness vs each other, program size,
+    and EXECUTE LATENCY (the thing that stalled the model — a slow PBI path blows the 120s
+    decode timeout even when it's numerically correct).
+    """
+    import time as _time, sys as _sys
+    def _e(x): _sys.stderr.write(str(x)+"\n"); _sys.stderr.flush()
+    import importlib
+    M = importlib.import_module("models.mobilesam.mobilesam_test")
+    DEC_HEADS = M.DEC_HEADS; GA = M.GA; NT_PAD = M.NT_PAD
+    HD = M.DEC_HD_PAD; ROW_CHUNK = M.ROW_CHUNK; BPE = M.BPE
+    q_stride  = GA * HD
+    kv_stride = NT_PAD * HD
+    vt_stride = HD * NT_PAD
+
+    def _alloc(ue):
+        Q  = ue.allocate_tensor_dram(DEC_HEADS * GA * HD * BPE)
+        K  = ue.allocate_tensor_dram(DEC_HEADS * NT_PAD * HD * BPE)
+        VT = ue.allocate_tensor_dram(DEC_HEADS * HD * NT_PAD * BPE)
+        O  = ue.allocate_tensor_dram(DEC_HEADS * GA * HD * BPE)
+        SC = ue.allocate_tensor_dram(ROW_CHUNK * NT_PAD * BPE)
+        BI = ue.allocate_tensor_dram(NT_PAD * BPE)
+        return Q, K, VT, O, SC, BI
+
+    torch.manual_seed(0)
+    q  = torch.randn(DEC_HEADS, GA, HD, dtype=torch.bfloat16) * 0.3
+    k  = torch.randn(DEC_HEADS, NT_PAD, HD, dtype=torch.bfloat16) * 0.3
+    v  = torch.randn(DEC_HEADS, NT_PAD, HD, dtype=torch.bfloat16) * 0.3
+    vt = v.transpose(1, 2).contiguous()
+    bias = torch.randn(NT_PAD, dtype=torch.bfloat16)
+
+    def _emit_i2t(ue, Q, K, VT, O, SC, BI, use_pbi):
+        for h in range(DEC_HEADS):
+            q_h  = Q  + h * q_stride  * BPE
+            k_h  = K  + h * kv_stride * BPE
+            vt_h = VT + h * vt_stride * BPE
+            o_h  = O  + h * q_stride  * BPE
+            if use_pbi:
+                # ONE hardware loop over all GA rows per head -> DEC_HEADS loops total
+                # (under the ~32-loops-per-program ceiling that NaN'd the 512-chunk version).
+                M.cross_attn_flash_single_head_pbi(
+                    ue=ue, head_dim=HD, q_len=GA, kv_len=NT_PAD,
+                    Q_DRAM_ADDR=q_h, K_DRAM_ADDR=k_h, V_T_DRAM_ADDR=vt_h,
+                    OUTPUT_DRAM_ADDR=o_h, gpr_loop=8, BIAS_DRAM_ADDR=BI)
+            else:
+                for row_base in range(0, GA, ROW_CHUNK):
+                    row_take = min(ROW_CHUNK, GA - row_base)
+                    M.cross_attn_flash_single_head(
+                        ue=ue, head_dim=HD, q_len=row_take, kv_len=NT_PAD,
+                        Q_DRAM_ADDR=q_h + row_base * HD * BPE, K_DRAM_ADDR=k_h,
+                        V_T_DRAM_ADDR=vt_h, OUTPUT_DRAM_ADDR=o_h + row_base * HD * BPE,
+                        SCORES_SCRATCH_ADDR=SC, BIAS_DRAM_ADDR=BI)
+
+    def _run(use_pbi):
+        ue = UnifiedEngine()
+        Q, K, VT, O, SC, BI = _alloc(ue)
+        ue.dma_to_accelerator_memory(Q, q.reshape(-1, HD))
+        ue.dma_to_accelerator_memory(K, k.reshape(-1, HD))
+        ue.dma_to_accelerator_memory(VT, vt.reshape(-1, NT_PAD))
+        ue.dma_to_accelerator_memory(BI, bias)
+        ue.start_capture()
+        _emit_i2t(ue, Q, K, VT, O, SC, BI, use_pbi)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr()
+        isz = ue.get_capture_instruction_size_bytes()
+        ue.write_captured_instructions_to_dram(prog)
+        ue.allocate_program_dram(isz)
+        t0 = _time.perf_counter()
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(timeout_s)
+        dt = _time.perf_counter() - t0
+        out = ue.dma_from_accelerator_memory(O, (DEC_HEADS, GA, HD)).float()
+        return out, isz, dt
+
+    _e(f"\n[i2t_em] EXACT-MATCH decoder i2t: {DEC_HEADS} heads x {GA//ROW_CHUNK} chunks "
+          f"= {DEC_HEADS*(GA//ROW_CHUNK)} back-to-back calls (hd={HD}, kv={NT_PAD})")
+    ref = torch.zeros(DEC_HEADS, GA, HD)
+    for h in range(DEC_HEADS):
+        att = q[h].float() @ k[h].float().t() + bias.float()
+        ref[h] = torch.softmax(att, -1) @ v[h].float()
+    out_l, isz_l, dt_l = _run(False)
+    _e(f"  legacy : {isz_l/1e6:6.2f} MB  exec {dt_l:6.2f}s  max_abs={out_l.abs().max():.3f}  vs_torch={calculate_snr(ref,out_l):.1f}dB")
+    out_p, isz_p, dt_p = _run(True)
+    _e(f"  pbi    : {isz_p/1e6:6.2f} MB  exec {dt_p:6.2f}s  max_abs={out_p.abs().max():.3f}  vs_torch={calculate_snr(ref,out_p):.1f}dB")
+    for h in range(DEC_HEADS):
+        _e(f"    head {h}: pbi-vs-legacy {calculate_snr(out_l[h], out_p[h]):7.2f} dB")
+    snr = calculate_snr(out_l, out_p)
+    _e(f"  pbi-vs-legacy SNR = {snr:.2f} dB  (inf = bit-exact)")
+    _e(f"  size shrink = {isz_l/max(isz_p,1):.1f}x   latency ratio pbi/legacy = {dt_p/max(dt_l,1e-6):.2f}x")
+    record_test("i2t_em_pbi", f"heads={DEC_HEADS},GA={GA}", snr_db=snr, inst_bytes=isz_p)
+    return snr, dt_l, dt_p
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')

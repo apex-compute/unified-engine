@@ -600,6 +600,87 @@ def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
                 out_sram, OUTPUT_DRAM_ADDR + r * head_dim * _BPE + v_col * _BPE, v_take)
 
 
+def cross_attn_flash_single_head_pbi(ue: UnifiedEngine, head_dim: int,
+                                     q_len: int, kv_len: int,
+                                     Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
+                                     V_T_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                                     gpr_loop: int,
+                                     BIAS_DRAM_ADDR: int = None) -> None:
+    """Hardware-loop version of cross_attn_flash_single_head for the i2t single-chunk
+    case (kv_len fits one score chunk AND head_dim*kv_len fits one V slab — true for the
+    decoder i2t: kv_len=64, head_dim=64). Emits the per-row body ONCE inside a PBI loop
+    over q_len rows; only the Q-in and OUTPUT-out DRAM pointers advance (by head_dim*2).
+    K / V^T / bias are window-shared (fixed addresses, reloaded each iter). Bit-exact with
+    cross_attn_flash_single_head; collapses q_len unrolled row-bodies -> one body + loop.
+
+    This is the unroll that dominated the decoder binary: i2t was 8 heads x 64 chunks x 64
+    rows = 32768 inline row-bodies. With this it is 8 head-loops."""
+    K = head_dim
+    N = kv_len
+    assert N % UE_VECTOR_SIZE == 0 and head_dim % UE_VECTOR_SIZE == 0
+    assert N <= URAM_NEAR_FULL_ELEMENTS // K, \
+        f"kv_len={N} needs >1 score chunk; PBI path is single-chunk only"
+    assert head_dim * N <= URAM_NEAR_FULL_ELEMENTS, \
+        f"head_dim*kv_len={head_dim*N} needs >1 V chunk; PBI path is single-chunk only"
+    # NOTE: legacy caps q_len<=UE_FMAX_CONTEXT_SIZE for its batched scratch; this per-row
+    # loop processes each row independently (max_clear_en per row) so q_len is unbounded.
+
+    scores_sram = K * _BPE
+    out_sram = scores_sram + N * _BPE
+    gpr_qaddr = gpr_loop + 1   # runtime Q-row DRAM address (REG_REWRITE source)
+    gpr_oaddr = gpr_loop + 2   # runtime OUT-row DRAM address
+    row_stride = head_dim * _BPE
+
+    # Per-row address advance uses register-computed addresses (general_reg_src) rather than
+    # auto-advancing PBI pointers: the intervening fixed K/V/bias DMAs would otherwise bump
+    # the PBI pointer descriptors and desync the row stride. We hold Q/OUT addresses in GPRs
+    # and increment them explicitly each iteration — immune to the intervening DMAs.
+    ue.generate_instruction_add_set(dst_reg_idx=gpr_loop, immediate_value=q_len)
+    ue.generate_instruction_add_set(dst_reg_idx=gpr_qaddr,
+                                    immediate_value=ue_35bit_addr_shifter(Q_DRAM_ADDR))
+    ue.generate_instruction_add_set(dst_reg_idx=gpr_oaddr,
+                                    immediate_value=ue_35bit_addr_shifter(OUTPUT_DRAM_ADDR))
+
+    # loop_start allocates its counter register via alloc_isa_reg(); pin _isa_reg_counter
+    # above our 3 GPRs so that allocation is the SAME register on every call. Without this,
+    # 512 sequential calls each allocate a fresh register that eventually collides with
+    # gpr_qaddr/gpr_oaddr -> corrupted addresses, NaN (only shows back-to-back, not isolated).
+    ue.reset_inst_ptr_counter()
+    ue._isa_reg_counter = gpr_loop + 3
+    ue.loop_start(loop_cnt=q_len, gpr_loop_cnt=gpr_loop)
+    # Q row [reg addr] -> URAM_A 0x00000
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=0, sram_address=0x00000,
+        element_size=head_dim, general_reg_src=gpr_qaddr)
+    # K [fixed] -> URAM_B 0x80000 ; scores = Q @ K^T
+    ue.accelerator_memory_to_sram(K_DRAM_ADDR, 0x80000, N * K)
+    ue.start_queue_for_bf16_matvec_operation(
+        max_clear_en=1, fmax_context_addr=0,
+        vector_sram_start_addr=0x00000, matrix_sram_start_addr=0x80000,
+        output_sram_wb_addr=scores_sram, K=K, N=N)
+    if BIAS_DRAM_ADDR is not None:
+        ue.accelerator_memory_to_sram(BIAS_DRAM_ADDR, 0x80000, N)
+        ue.eltwise_add_core(scores_sram, 0x80000, scores_sram, N)
+    ue.start_queue_for_bf16_softmax_operation(
+        fmax_context_addr=0, vector_sram_start_addr=scores_sram,
+        output_sram_wb_addr=scores_sram, N=N)
+    # V^T [fixed] -> URAM_B 0x80000 ; out = P @ V
+    ue.accelerator_memory_to_sram(V_T_DRAM_ADDR, 0x80000, head_dim * N)
+    ue.start_queue_for_bf16_matvec_operation(
+        max_clear_en=1, fmax_context_addr=1,
+        vector_sram_start_addr=scores_sram, matrix_sram_start_addr=0x80000,
+        output_sram_wb_addr=out_sram, K=N, N=head_dim)
+    # out row [reg addr]
+    ue.sram_to_accelerator_memory(
+        sram_address=out_sram, accelerator_dram_address=0,
+        element_size=head_dim, general_reg_src=gpr_oaddr)
+    # advance Q/OUT row addresses
+    ue.generate_instruction_add_imm(gpr_qaddr, ue_35bit_addr_shifter(row_stride), gpr_qaddr)
+    ue.generate_instruction_add_imm(gpr_oaddr, ue_35bit_addr_shifter(row_stride), gpr_oaddr)
+    body = ue.loop_end()
+    assert body <= 256, f"cross_attn_flash_single_head_pbi: loop body {body} exceeds 256"
+
+
 def conv_transpose2d_2x2_dram(
     ue: UnifiedEngine,
     INPUT_DRAM_ADDR: int,
@@ -1472,26 +1553,21 @@ class MobileSAM_UE(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.I2T_VT     + h * DEC_HD_PAD * NT_PAD * BPE,
             )
 
-        # cross_attn_flash_single_head per head, chunked by ROW_CHUNK=64
-        # q=4096, kv=64, hd=64
+        # cross_attn_flash_single_head_pbi: ONE hardware loop over all GA rows per head =
+        # DEC_HEADS loops total (was 8 heads x 64 chunks = 512 unrolled bodies, 11.5 MB ->
+        # ~5 KB). Validated bit-exact vs the chunked legacy in user_hw_test.mobilesam_i2t_em_test
+        # (the EXACT 8-head pattern). The 512-chunk version NaN'd because >~32 PBI loops in one
+        # program hit a hardware loop-count ceiling; one big loop per head stays well under it.
         for h in range(DEC_HEADS):
-            q_h_addr   = self.I2T_Q_HEADS + h * q_stride  * BPE
-            k_h_addr   = self.I2T_K_HEADS + h * kv_stride * BPE
-            vt_h_addr  = self.I2T_VT      + h * DEC_HD_PAD * NT_PAD * BPE
-            out_h_addr = self.I2T_ATTN_OUT+ h * q_stride  * BPE
-
-            for row_base in range(0, GA, ROW_CHUNK):
-                row_take = min(ROW_CHUNK, GA - row_base)
-                cross_attn_flash_single_head(
-                    ue=self, head_dim=DEC_HD_PAD,
-                    q_len=row_take, kv_len=NT_PAD,
-                    Q_DRAM_ADDR     = q_h_addr   + row_base * DEC_HD_PAD * BPE,
-                    K_DRAM_ADDR     = k_h_addr,
-                    V_T_DRAM_ADDR   = vt_h_addr,
-                    OUTPUT_DRAM_ADDR= out_h_addr + row_base * DEC_HD_PAD * BPE,
-                    SCORES_SCRATCH_ADDR=self.I2T_SCORES,
-                    BIAS_DRAM_ADDR  = self.DEC_I2T_KV_MASK,
-                )
+            cross_attn_flash_single_head_pbi(
+                ue=self, head_dim=DEC_HD_PAD, q_len=GA, kv_len=NT_PAD,
+                Q_DRAM_ADDR     = self.I2T_Q_HEADS  + h * q_stride  * BPE,
+                K_DRAM_ADDR     = self.I2T_K_HEADS  + h * kv_stride * BPE,
+                V_T_DRAM_ADDR   = self.I2T_VT       + h * DEC_HD_PAD * NT_PAD * BPE,
+                OUTPUT_DRAM_ADDR= self.I2T_ATTN_OUT + h * q_stride  * BPE,
+                gpr_loop        = 8,
+                BIAS_DRAM_ADDR  = self.DEC_I2T_KV_MASK,
+            )
 
         # Merge + unpad: (heads, 4096, hd_pad) → (4096, 128)
         multihead_merge_dram(
