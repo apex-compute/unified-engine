@@ -230,31 +230,14 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         print(f"    Loaded {len(data)} bytes from {os.path.basename(bin_path)}")
         return addr
 
-    def _replay_encoder_ln_params(self) -> None:
-        """Replay compile_encoder's lazy layer_norm zero-buffer allocations (LN1 + LN2 per layer + one
-        final post-layernorm) so the params-DRAM pointer + baked addresses match the compile. The §7
-        shared flash body allocates NO params, so these LN zeros are the encoder's only lazy params."""
-        N, bpe = 768, 2
-        N_VIS_LAYERS = 12  # SigLIP vision encoder (run_from_bin loads from bin; no vis_layer_addrs)
-        zeros = torch.zeros(N, dtype=torch.bfloat16)
-        for _ in range(N_VIS_LAYERS):
-            for _ in range(2):  # LN1 + LN2
-                addr = self.get_params_dram_addr()
-                self.allocate_params_dram(N * bpe)
-                self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
-        addr = self.get_params_dram_addr()  # final post-layernorm
-        self.allocate_params_dram(N * bpe)
-        self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
-
     def load_all(self) -> dict:
         """Load the unified single instruction bin (encoder + decoder + prefill_v2) — mirror of
-        smolvlm2_test.compile_all's cache-hit path. Replays the encoder LN params, then DMAs each
-        segment to its recorded absolute address, and sets the program/preamble addrs the run_*
-        methods read. Must be called AFTER load_snapshot (params restored to pre-compile state)."""
+        smolvlm2_test.compile_all's cache-hit path. DMAs each segment to its recorded absolute address
+        and sets the program/preamble addrs the run_* methods read. Must be called AFTER load_snapshot
+        (which restores params, including the shared vis_zeros LN buffer — Trick 9, no replay needed)."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         with open(os.path.join(bin_dir, "instructions.json")) as f:
             meta = json.load(f)
-        self._replay_encoder_ln_params()
         with open(os.path.join(bin_dir, "instructions.bin"), "rb") as f:
             raw = f.read()
         for seg in meta["segments"]:
