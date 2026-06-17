@@ -18,8 +18,10 @@ instruction bin.
 ## Quick start
 
 ```bash
-# 1) First run (VLM) BUILDS the unified bin + runs an image caption:
-python3 qwen3.5_2b_test.py --vision-enable --vision-on-hardware
+# 1) First run BUILDS the comprehensive unified bin (encoder + decoder).
+#    Either mode works — both write the same full bin:
+python3 qwen3.5_2b_test.py --vision-enable --vision-on-hardware   # VLM: builds + captions
+python3 qwen3.5_2b_test.py --prompt "Tell me about the Eiffel Tower."  # LM-only: still builds the full bin
 
 # 2) LM-only text generation (test.py or the runtime-only runner):
 python3 qwen3.5_2b_test.py     --prompt "Tell me about the Eiffel Tower."
@@ -56,9 +58,12 @@ prefill (replay decoder per prompt token) + decode
 
 LM-only skips the encoder entirely.
 
-**Load-only:** the **first** VLM run of `test.py` builds the encoder + decoder and
-writes the bin; **every later run** of `test.py` AND all runs of `run_from_bin`
-LOAD both program sections from the bin — nothing is recompiled.
+**Load-only:** the **first** run of `test.py` — LM-only *or* VLM — builds the
+encoder + decoder and writes the comprehensive bin (an LM-only first run still
+builds the encoder section, using the bundled sample image, so the single bin
+always holds the full model; it just isn't executed). **Every later run** of
+`test.py` AND all runs of `run_from_bin` LOAD both program sections from the bin —
+nothing is recompiled.
 
 ### ⚠ Two rules baked into this design
 
