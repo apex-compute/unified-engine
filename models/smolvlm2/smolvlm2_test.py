@@ -283,6 +283,15 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         print(f"LM weights loaded (Q4): {self.NUM_LAYERS} layers, params DRAM usage: {self.get_params_dram_usage()} bytes")
         # Identity matrix for decode attention
         self.identity_addr = store_identity_matrix(self)
+        # Shared zeros buffer for the vision encoder's LayerNorms (Trick 9 — the released
+        # layer_norm_core_dram self-allocates+dma_writes a zeros operand at COMPILE time, which the
+        # bin-load path never re-emits → stale DRAM/NaN). Seeding it HERE (params DRAM, before
+        # dump_snapshot) makes it part of the weights snapshot, so build + every load path get it with
+        # no replay. All encoder LNs use N=768. Passed as ZEROS_DRAM_ADDR to each layer_norm call.
+        _vz = 768  # vision hidden dim (all encoder LayerNorms use N=768)
+        self.vis_zeros_addr = self.get_params_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, self.vis_zeros_addr, torch.zeros(_vz, dtype=torch.bfloat16), _vz * 2)
+        self.allocate_params_dram(_vz * 2)
         params_used = self.get_params_dram_usage()
         params_limit = self._tensor_dram_base - self._params_dram_base
         _original_print(f"  Params DRAM: {params_used/1024/1024:.1f} MB used / {params_limit/1024/1024:.0f} MB available"
@@ -555,7 +564,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
             # LN1 (PBI)
             self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['ln1_weight'], BETA_DRAM_ADDR=la['ln1_bias'], gpr_M_reg=vis_ln_chunks)
+                GAMMA_DRAM_ADDR=la['ln1_weight'], BETA_DRAM_ADDR=la['ln1_bias'], gpr_M_reg=vis_ln_chunks,
+                ZEROS_DRAM_ADDR=self.vis_zeros_addr)
             # Q/K/V projections (PBI)
             for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
                 vis_matmul(S, H, H, self.VIS_LN_OUT_DRAM, la, proj, dst, bias=la[f'{proj}_bias'])
@@ -586,7 +596,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
                 OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
             self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['ln2_weight'], BETA_DRAM_ADDR=la['ln2_bias'], gpr_M_reg=vis_ln_chunks)
+                GAMMA_DRAM_ADDR=la['ln2_weight'], BETA_DRAM_ADDR=la['ln2_bias'], gpr_M_reg=vis_ln_chunks,
+                ZEROS_DRAM_ADDR=self.vis_zeros_addr)
             # MLP: fc1 + GELU, fc2, residual
             vis_matmul(S, H, I, self.VIS_LN_OUT_DRAM, la, 'fc1', self.VIS_MLP_INTER_DRAM, bias=la['fc1_bias'], gelu_enable=True)
             vis_matmul(S, I, H, self.VIS_MLP_INTER_DRAM, la, 'fc2', self.VIS_MLP_OUT_DRAM, bias=la['fc2_bias'])
@@ -596,7 +607,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         # Post-layernorm (PBI), pixel shuffle, connector (M=64, static).
         final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
         self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
-            GAMMA_DRAM_ADDR=self.vis_post_ln_weight, BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=vis_ln_chunks)
+            GAMMA_DRAM_ADDR=self.vis_post_ln_weight, BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=vis_ln_chunks,
+            ZEROS_DRAM_ADDR=self.vis_zeros_addr)
         smart_bf16_permute_core(self, dims=[8, 4, 8, 4, H], permute_indices=[0, 2, 1, 3, 4],
             input_dram_addr=self.VIS_POST_LN_DRAM, output_dram_addr=self.VIS_SHUFFLED_DRAM,
             params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
@@ -851,24 +863,6 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         print(f"    Prefill v2 compiled @0x{prefill_addr:X}: {size_bytes} bytes, "
               f"{num_buckets} buckets, PM={PM}, qmax={qmax}")
 
-    def _replay_encoder_ln_params(self) -> None:
-        """Replay compile_encoder's lazy layer_norm zero-buffer allocations (LN1 + LN2 per layer + one
-        final post-layernorm) so the params-DRAM pointer + baked addresses match a fresh compile. Used by
-        the cached-load path (compile_all cache hit / run_from_bin). The unrolled PBI encoder emits
-        layer_norm_core_dram (PBI) for every LN, each allocating one N-bf16 zeros buffer; the §7 flash
-        body + matmat/eltwise allocate NO params, so these LN zeros are the encoder's ONLY lazy params
-        (traced: N_vis*2+1)."""
-        N, bpe = 768, 2
-        zeros = torch.zeros(N, dtype=torch.bfloat16)
-        for _ in range(len(self.vis_layer_addrs)):
-            for _ in range(2):  # LN1 + LN2
-                addr = self.get_params_dram_addr()
-                self.allocate_params_dram(N * bpe)
-                self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
-        addr = self.get_params_dram_addr()  # final post-layernorm
-        self.allocate_params_dram(N * bpe)
-        self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
-
     def _restore_unified_addrs(self, meta: dict) -> None:
         """Set the program/preamble addresses the run_* methods read, from the unified-bin meta."""
         self._vis_program_addr = meta["encoder_addr"]
@@ -892,14 +886,16 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         uni_bin = os.path.join(bin_dir, "instructions.bin")
         uni_meta = os.path.join(bin_dir, "instructions.json")
         sig = {"prefill_max_seq_len": self.PREFILL_MAX_SEQ_LEN, "num_layers": self.NUM_LAYERS,
-               "num_vis_layers": len(self.vis_layer_addrs), "lm_head": "penalty_bias_argmax"}
+               "num_vis_layers": len(self.vis_layer_addrs), "lm_head": "penalty_bias_argmax",
+               "encoder_ln": "shared_zeros"}
 
         # ---- cache hit: replay the encoder LN params, DMA each segment to its stored abs addr ----
         if os.path.exists(uni_bin) and os.path.exists(uni_meta):
             with open(uni_meta) as f:
                 meta = json.load(f)
             if all(meta.get(k) == v for k, v in sig.items()):
-                self._replay_encoder_ln_params()
+                # No LN-zeros replay: the shared vis_zeros_addr buffer is part of the weights snapshot
+                # (seeded in weight_init), so load_snapshot already restored it (Trick 9).
                 with open(uni_bin, "rb") as f:
                     raw = f.read()
                 for seg in meta["segments"]:
@@ -1125,7 +1121,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             # derived from gpr_seq_len inside the helper via register-addressed DMAs.
             for h in range(self.NUM_KV_HEADS):
                 k_base = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                self.rope_hf_core_decode(N=D,
+                self.rope_hf_core_decode_d64(N=D,
                     input_dram_addr=self.LAYER0_K_PROJ_DRAM + h * D * bpe,
                     output_dram_addr=k_base, output_pos_strided=True,
                     packed_table_addr=self.ROPE_PACKED_DRAM,
@@ -1133,7 +1129,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
             # RoPE Q: same d64 rope, output to the fixed Q_PERM slot (attention reads from there).
             for h in range(self.NUM_HEADS):
-                self.rope_hf_core_decode(N=D,
+                self.rope_hf_core_decode_d64(N=D,
                     input_dram_addr=self.LAYER0_Q_DRAM + h * D * bpe,
                     output_dram_addr=self.LAYER0_Q_PERM_DRAM + h * D * bpe, output_pos_strided=False,
                     packed_table_addr=self.ROPE_PACKED_DRAM,
