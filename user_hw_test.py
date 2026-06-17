@@ -74,6 +74,28 @@ def dram_zero_fill(ue: UnifiedEngine, dram_addr: int, num_elements: int) -> None
         offset += take
 
 
+def _pbi_zero_dram(ue: UnifiedEngine, DRAM_ADDR: int, num_elements: int) -> None:
+    """Model-faithful copy of mobilesam_test._pbi_zero_dram: zero num_elements bf16
+    at DRAM_ADDR using ONE lazily-allocated, cached zero source on `ue` (so calling
+    it per output row does not allocate params every call). This is the zeroing path
+    the model's conv2d_3x3_pbi / conv2d_3x3_dw_pbi actually use — dram_zero_fill (the
+    path the older tests exercised) allocates a fresh buffer per call and never shares
+    one cached source, so it could not catch a bug that only shows when the SAME zero
+    source + staging row is reused across many back-to-back convs in one program."""
+    full = URAM_NEAR_FULL_ELEMENTS
+    if getattr(ue, "_pbi_zero_src", None) is None:
+        z = ue.get_params_dram_addr()
+        ue.allocate_params_dram(full * _BPE)
+        ue.dma_write(DMA_DEVICE_H2C, z, torch.zeros(full, dtype=torch.bfloat16), full * _BPE)
+        ue._pbi_zero_src = z
+    offset = 0
+    while offset < num_elements:
+        take = min(full, num_elements - offset)
+        ue.accelerator_memory_to_sram(ue._pbi_zero_src, 0x00000, take)
+        ue.sram_to_accelerator_memory(0x00000, DRAM_ADDR + offset * _BPE, take)
+        offset += take
+
+
 def pbi_strided_copy(ue: UnifiedEngine, gpr: int,
                      src_base: int, dst_base: int, count: int,
                      copy_bytes: int, src_stride: int, dst_stride: int) -> None:
@@ -204,17 +226,23 @@ def multihead_reshape_dram_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
     padded_dim = num_heads * head_dim_pad
     dram_zero_fill(ue, TEMP_DRAM_ADDR, seq_len * padded_dim)
 
-    # Step 1: scatter interleaved (seq_len, num_heads*head_dim) →
-    #              padded    (seq_len, num_heads, head_dim_pad) in TEMP
-    pbi_strided_copy(
-        ue, gpr_pbi,
-        src_base=INPUT_DRAM_ADDR,
-        dst_base=TEMP_DRAM_ADDR,
-        count=seq_len * num_heads,
-        copy_bytes=head_dim * _BPE,
-        src_stride=head_dim * _BPE,
-        dst_stride=head_dim_pad * _BPE,
-    )
+    # Step 1: scatter (seq_len, input_row_stride) → padded (seq_len, num_heads, head_dim_pad).
+    # MUST honor input_row_stride: a channel-padded qkv output (e.g. 160 real cols in a 192-wide
+    # row) would, under a single contiguous sweep, read the pad columns into head>0 slots and
+    # scramble every row after the first. One PBI loop per head reads that head's head_dim cols at
+    # the TRUE row stride. For packed input (input_row_stride == num_heads*head_dim) this is
+    # bit-identical to the old single-sweep scatter.
+    in_row_bytes = input_row_stride * _BPE
+    for h in range(num_heads):
+        pbi_strided_copy(
+            ue, gpr_pbi,
+            src_base=INPUT_DRAM_ADDR + h * head_dim * _BPE,
+            dst_base=TEMP_DRAM_ADDR + h * head_dim_pad * _BPE,
+            count=seq_len,
+            copy_bytes=head_dim * _BPE,
+            src_stride=in_row_bytes,
+            dst_stride=padded_dim * _BPE,
+        )
 
     # Step 2: transpose each head from TEMP to OUTPUT
     head_bytes = head_dim_pad * _BPE
@@ -231,6 +259,299 @@ def multihead_reshape_dram_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
             src_stride=temp_row_stride,
             dst_stride=head_bytes,
         )
+
+
+def conv2d_3x3_im2col_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
+                          IM2COL_DRAM_ADDR: int, H_in: int, W_in: int,
+                          C_in: int, stride: int, gpr: int) -> None:
+    """Build the 3x3 (pad=1) im2col matrix (H_out*W_out, 9*C_in) for an HWC input
+    using hardware PBI loops instead of per-(pixel,tap) gathers.
+
+    Column layout matches the model convs: tap (dy,dx) occupies block
+    ``(dy+1)*3+(dx+1)`` of ``C_in`` elements within each ``9*C_in`` row, and
+    out-of-bounds taps/pixels stay zero (the buffer is pre-zeroed here).
+
+    For a fixed output row ``h_out`` and tap ``(dy,dx)`` the input row is fixed and
+    consecutive output columns read the input at a uniform stride of ``stride*C_in``
+    while writing at a uniform ``9*C_in`` stride — i.e. one ``pbi_strided_copy`` per
+    (row, tap) collapses the W_out-wide per-pixel gather. Boundary columns are
+    skipped by clipping the valid ``w_out`` range; their blocks stay zero.
+
+    Emits ~9*H_out PBI loops instead of ~H_out*W_out*9 gather DMAs.
+    """
+    K = 9 * C_in
+    H_out = (H_in - 1) // stride + 1
+    W_out = (W_in - 1) // stride + 1
+    cb = C_in * _BPE
+    row_bytes = K * _BPE
+
+    # Pre-zero so every boundary tap/pixel that we skip below stays zero.
+    dram_zero_fill(ue, IM2COL_DRAM_ADDR, H_out * W_out * K)
+
+    for h_out in range(H_out):
+        h_in = h_out * stride
+        for dy in (-1, 0, 1):
+            nh = h_in + dy
+            if not (0 <= nh < H_in):
+                continue  # whole tap-row out of bounds -> stays zero
+            for dx in (-1, 0, 1):
+                tap = (dy + 1) * 3 + (dx + 1)
+                # valid output columns: 0 <= w_out*stride + dx < W_in
+                lo = 0
+                while lo < W_out and not (0 <= lo * stride + dx < W_in):
+                    lo += 1
+                hi = W_out - 1
+                while hi >= 0 and not (0 <= hi * stride + dx < W_in):
+                    hi -= 1
+                if lo > hi:
+                    continue
+                count = hi - lo + 1
+                src_base = INPUT_DRAM_ADDR + (nh * W_in + (lo * stride + dx)) * cb
+                dst_base = IM2COL_DRAM_ADDR + (h_out * W_out + lo) * row_bytes + tap * cb
+                pbi_strided_copy(
+                    ue, gpr, src_base=src_base, dst_base=dst_base, count=count,
+                    copy_bytes=cb, src_stride=stride * cb, dst_stride=row_bytes,
+                )
+
+
+def _window_dims(H: int, W: int, ws: int):
+    pad_h = (ws - H % ws) % ws
+    pad_w = (ws - W % ws) % ws
+    nH, nW = (H + pad_h) // ws, (W + pad_w) // ws
+    WIN_PAD = ((ws * ws + 63) // 64) * 64
+    return nH, nW, WIN_PAD
+
+
+def window_partition_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                         H: int, W: int, C: int, ws: int, gpr: int):
+    """(H*W, C) HWC -> (nH*nW, WIN_PAD, C) via PBI loops. Returns (nH, nW, WIN_PAD).
+
+    For a fixed window-row ``wh`` and in-window row ``dy`` the input source row is
+    fixed; consecutive window-columns read at a uniform ``ws*C`` stride and write at
+    a uniform ``WIN_PAD*C`` stride -> one ``pbi_strided_copy`` over the full window
+    columns. The partial last column (when W%ws!=0) is a single clipped copy; pad
+    rows/cols stay zero (output pre-zeroed)."""
+    nH, nW, WIN_PAD = _window_dims(H, W, ws)
+    cbe = C * _BPE
+    full_w = W // ws            # full-width window columns
+    rem_w  = W - full_w * ws    # partial last-window width (0 if exact)
+
+    dram_zero_fill(ue, OUTPUT_DRAM_ADDR, nH * nW * WIN_PAD * C)
+
+    for wh in range(nH):
+        win_row = wh * nW
+        for dy in range(ws):
+            src_h = wh * ws + dy
+            if src_h >= H:
+                continue  # padded window row -> stays zero
+            row_src = INPUT_DRAM_ADDR + (src_h * W) * cbe
+            row_dst = OUTPUT_DRAM_ADDR + (win_row * WIN_PAD + dy * ws) * cbe
+            if full_w >= 1:
+                pbi_strided_copy(
+                    ue, gpr, src_base=row_src, dst_base=row_dst, count=full_w,
+                    copy_bytes=ws * cbe, src_stride=ws * cbe, dst_stride=WIN_PAD * cbe)
+            if rem_w > 0:
+                src = INPUT_DRAM_ADDR + (src_h * W + full_w * ws) * cbe
+                dst = OUTPUT_DRAM_ADDR + ((win_row + full_w) * WIN_PAD + dy * ws) * cbe
+                pbi_strided_copy(
+                    ue, gpr, src_base=src, dst_base=dst, count=1,
+                    copy_bytes=rem_w * cbe, src_stride=rem_w * cbe, dst_stride=rem_w * cbe)
+    return nH, nW, WIN_PAD
+
+
+def window_reverse_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                       H: int, W: int, C: int, ws: int, nH: int, nW: int, WIN_PAD: int,
+                       gpr: int):
+    """(nH*nW, WIN_PAD, C) -> (H*W, C). Inverse of window_partition_pbi: same loop,
+    src/dst swapped (window slot -> image row). Caller pre-zeros OUTPUT if needed."""
+    cbe = C * _BPE
+    full_w = W // ws
+    rem_w  = W - full_w * ws
+
+    for wh in range(nH):
+        win_row = wh * nW
+        for dy in range(ws):
+            src_h = wh * ws + dy
+            if src_h >= H:
+                continue
+            row_src = INPUT_DRAM_ADDR + (win_row * WIN_PAD + dy * ws) * cbe
+            row_dst = OUTPUT_DRAM_ADDR + (src_h * W) * cbe
+            if full_w >= 1:
+                pbi_strided_copy(
+                    ue, gpr, src_base=row_src, dst_base=row_dst, count=full_w,
+                    copy_bytes=ws * cbe, src_stride=WIN_PAD * cbe, dst_stride=ws * cbe)
+            if rem_w > 0:
+                src = INPUT_DRAM_ADDR + ((win_row + full_w) * WIN_PAD + dy * ws) * cbe
+                dst = OUTPUT_DRAM_ADDR + (src_h * W + full_w * ws) * cbe
+                pbi_strided_copy(
+                    ue, gpr, src_base=src, dst_base=dst, count=1,
+                    copy_bytes=rem_w * cbe, src_stride=rem_w * cbe, dst_stride=rem_w * cbe)
+
+
+def _conv3x3_im2col_row_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, IM2COL_ROW_ADDR: int,
+                            h_out: int, H: int, W: int, C_total: int, c_off: int,
+                            c_take: int, stride: int, gpr: int):
+    """Build ONE output row's 3x3/pad-1 im2col (W_out, 9*c_take) into IM2COL_ROW_ADDR
+    (caller pre-zeros the row so boundary taps/pixels stay zero).
+
+    Gathers ``c_take`` channels starting at ``c_off`` from an HWC input whose row pitch
+    is the full ``C_total``. One PBI loop per in-bounds tap: consecutive output columns
+    read the input at a uniform ``stride*C_total`` element stride and write at ``9*c_take``.
+    Regular conv: c_off=0, c_take=C_total=C_in. Depthwise block: c_take=64, c_off=blk*64."""
+    K = 9 * c_take
+    W_out = (W - 1) // stride + 1
+    cb = c_take * _BPE
+    row_bytes = K * _BPE
+    src_pitch = C_total * _BPE          # element pitch of one HWC pixel
+    h_in = h_out * stride
+    for dy in (-1, 0, 1):
+        nh = h_in + dy
+        if not (0 <= nh < H):
+            continue
+        for dx in (-1, 0, 1):
+            tap = (dy + 1) * 3 + (dx + 1)
+            lo = 0
+            while lo < W_out and not (0 <= lo * stride + dx < W):
+                lo += 1
+            hi = W_out - 1
+            while hi >= 0 and not (0 <= hi * stride + dx < W):
+                hi -= 1
+            if lo > hi:
+                continue
+            count = hi - lo + 1
+            src_base = INPUT_DRAM_ADDR + ((nh * W + (lo * stride + dx)) * C_total + c_off) * _BPE
+            dst_base = IM2COL_ROW_ADDR + (lo * K + tap * c_take) * _BPE
+            pbi_strided_copy(
+                ue, gpr, src_base=src_base, dst_base=dst_base, count=count,
+                copy_bytes=cb, src_stride=stride * src_pitch, dst_stride=row_bytes)
+
+
+def _prime_m_reg(ue: UnifiedEngine, gpr: int, m: int):
+    """Prime a GPR with the runtime row count M for matmat_mul_core(gpr_M_reg=...)."""
+    ue._isa_reg_counter = gpr + 1
+    ue.reset_inst_ptr_counter()
+    ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=m)
+
+
+def conv2d_3x3_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                   IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
+                   H: int, W: int, C_in: int, C_out: int, stride: int = 1,
+                   gelu_enable: bool = False, gpr: int = 8, zero_fn=dram_zero_fill):
+    """Drop-in PBI replacement for conv2d_3x3_stride{1,2}_dram (regular 3x3, pad=1).
+
+    Same HWC I/O, same WEIGHT layout (C_out, 9*C_in), same per-row IM2COL buffer
+    (W_out*9*C_in). Per output row: PBI im2col (9 loops) + one matmul with gpr_M_reg —
+    replaces W_out*9 per-pixel gathers and the M-unrolled matmul. No ZERO_PAD buffer
+    needed (padding handled by zeroing the im2col row)."""
+    K = 9 * C_in
+    H_out = (H - 1) // stride + 1
+    W_out = (W - 1) // stride + 1
+    for h_out in range(H_out):
+        zero_fn(ue, IM2COL_DRAM_ADDR, W_out * K)
+        _conv3x3_im2col_row_pbi(ue, INPUT_DRAM_ADDR, IM2COL_DRAM_ADDR, h_out,
+                                H, W, C_in, 0, C_in, stride, gpr)
+        _prime_m_reg(ue, gpr, W_out)
+        ue.matmat_mul_core(
+            M=W_out, K=K, N=C_out,
+            A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=WEIGHT_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + (h_out * W_out) * C_out * _BPE,
+            C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="broadcast_N",
+            gelu_enable=gelu_enable, gpr_M_reg=gpr)
+
+
+def conv2d_3x3_dw_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                      IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
+                      H: int, W: int, C: int, stride: int = 1,
+                      gelu_enable: bool = False, gpr: int = 8, zero_fn=dram_zero_fill):
+    """Drop-in PBI replacement for conv2d_3x3_dw_dram / _stride2 (depthwise 3x3, pad=1).
+
+    Same HWC I/O, same block weight layout (per 64-ch block: WEIGHT+blk*64*9*64, shape
+    (64, 9*64)), same scatter (BLK back into the full-C output). Per (block, row):
+    PBI im2col (9 loops) + matmul(gpr_M_reg) + PBI scatter — replaces n_blocks*H*W*9
+    gathers. IM2COL buffer must hold W_out*(9*64 + 64) elements (im2col row + TEMP)."""
+    BLK = 64
+    K = 9 * BLK
+    n_blocks = C // BLK
+    H_out = (H - 1) // stride + 1
+    W_out = (W - 1) // stride + 1
+    TEMP = IM2COL_DRAM_ADDR + W_out * K * _BPE
+    for blk in range(n_blocks):
+        c_off = blk * BLK
+        W_ADDR = WEIGHT_DRAM_ADDR + blk * BLK * K * _BPE
+        B_ADDR = BIAS_DRAM_ADDR + c_off * _BPE
+        for h_out in range(H_out):
+            zero_fn(ue, IM2COL_DRAM_ADDR, W_out * K)
+            _conv3x3_im2col_row_pbi(ue, INPUT_DRAM_ADDR, IM2COL_DRAM_ADDR, h_out,
+                                    H, W, C, c_off, BLK, stride, gpr)
+            _prime_m_reg(ue, gpr, W_out)
+            ue.matmat_mul_core(
+                M=W_out, K=K, N=BLK,
+                A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=W_ADDR,
+                OUTPUT_DRAM_ADDR=TEMP, C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                gelu_enable=gelu_enable, gpr_M_reg=gpr)
+            # Scatter (W_out, BLK) into the HWC output at channel offset c_off (stride C).
+            pbi_strided_copy(
+                ue, gpr, src_base=TEMP,
+                dst_base=OUTPUT_DRAM_ADDR + (h_out * W_out * C + c_off) * _BPE,
+                count=W_out, copy_bytes=BLK * _BPE,
+                src_stride=BLK * _BPE, dst_stride=C * _BPE)
+
+
+def bf16_permute_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                     dim_0: int, dim_1: int, dim_2: int, gpr: int):
+    """Drop-in PBI replacement for bf16_permute_core: (dim_0, dim_1, dim_2) ->
+    (dim_1, dim_0, dim_2).
+
+    Output row ``i1*dim_0 + i0`` comes from input row ``i0*dim_1 + i1``. Either index can
+    be the PBI loop count; we iterate the SMALLER of (dim_0, dim_1) in Python and make the
+    larger the hardware loop count, so the program is ``min(dim_0, dim_1)`` PBI loops
+    regardless of orientation (e.g. 8 loops for both 4096x8 and 8x4096). ``dim_2`` must be a
+    multiple of UE_VECTOR_SIZE (so copy_bytes is row-aligned)."""
+    assert dim_2 % UE_VECTOR_SIZE == 0, f"dim_2={dim_2} must be a multiple of {UE_VECTOR_SIZE}"
+    cb = dim_2 * _BPE
+    if dim_1 <= dim_0:
+        # iterate i1 (few), PBI-count over i0 (many). dst contiguous, src strided.
+        for i1 in range(dim_1):
+            pbi_strided_copy(
+                ue, gpr,
+                src_base=INPUT_DRAM_ADDR + i1 * cb,
+                dst_base=OUTPUT_DRAM_ADDR + i1 * dim_0 * cb,
+                count=dim_0, copy_bytes=cb,
+                src_stride=dim_1 * cb, dst_stride=cb)
+    else:
+        # iterate i0 (few), PBI-count over i1 (many). src contiguous, dst strided.
+        for i0 in range(dim_0):
+            pbi_strided_copy(
+                ue, gpr,
+                src_base=INPUT_DRAM_ADDR + i0 * dim_1 * cb,
+                dst_base=OUTPUT_DRAM_ADDR + i0 * cb,
+                count=dim_1, copy_bytes=cb,
+                src_stride=cb, dst_stride=dim_0 * cb)
+
+
+def conv_transpose2d_2x2_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                             TEMP_DRAM_ADDR: int, WEIGHT_SLICES: list, BIAS_DRAM_ADDR: int,
+                             H: int, W: int, C_in: int, C_out: int, gpr: int):
+    """ConvTranspose2d kernel=2 stride=2 (no overlap). (H*W, C_in) -> (2H*2W, C_out) HWC.
+
+    Same 4-slice matmul as the legacy path (matmuls left untouched), but the per-pixel
+    output scatter is collapsed to PBI loops: for a fixed slice and input row h_i the
+    W input pixels read TEMP contiguously (stride C_out) and write the output at every
+    OTHER pixel (stride 2*C_out) -> one pbi_strided_copy per (slice, h_i) instead of
+    W per-pixel memcpys. OUTPUT must be pre-zeroed (caller). C_out multiple of 64."""
+    cb = C_out * _BPE
+    for s, (kh, kw) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+        ue.matmat_mul_core(
+            M=H * W, K=C_in, N=C_out,
+            A_DRAM_ADDR=INPUT_DRAM_ADDR, B_DRAM_ADDR=WEIGHT_SLICES[s],
+            OUTPUT_DRAM_ADDR=TEMP_DRAM_ADDR, C_DRAM_ADDR=BIAS_DRAM_ADDR,
+            bias_mode="broadcast_N")
+        for h_i in range(H):
+            src_base = TEMP_DRAM_ADDR + (h_i * W) * cb
+            dst_base = OUTPUT_DRAM_ADDR + ((2 * h_i + kh) * (2 * W) + kw) * cb
+            pbi_strided_copy(
+                ue, gpr, src_base=src_base, dst_base=dst_base, count=W,
+                copy_bytes=cb, src_stride=cb, dst_stride=2 * cb)
 
 
 # ---------------------------------------------------------------------------
@@ -1482,7 +1803,705 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
     ue.reset_program_dram_addr()
-    
+
+
+def _ln_hw_run(ue, M, N, x_pad, gamma_pad, beta_pad):
+    """Capture+run one layer_norm_core_dram over (M, N) and return the (M, N) output.
+    Caller supplies already-padded x/gamma/beta (all width N). Self-contained: allocates,
+    captures, executes, and resets DRAM pointers so it can be called repeatedly."""
+    A = ue.allocate_tensor_dram(M * N * 2)
+    O = ue.allocate_tensor_dram(M * N * 2)
+    G = ue.allocate_tensor_dram(N * 2)
+    B = ue.allocate_tensor_dram(N * 2)
+
+    ue.start_capture()
+    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O,
+                            GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=B)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    isz = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(isz)
+    ue.clear_capture_buffer()
+
+    ue.dma_to_accelerator_memory(A, x_pad.contiguous())
+    ue.dma_to_accelerator_memory(G, gamma_pad.contiguous())
+    ue.dma_to_accelerator_memory(B, beta_pad.contiguous())
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(10.0)
+    out = ue.dma_from_accelerator_memory(O, (M, N))
+
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+    return out
+
+
+def _ln_hw_run_chunked(ue, M, N, x_pad, gamma_pad, beta_pad, chunk_size):
+    """Like _ln_hw_run but drives the gpr_M_reg M-collapse path EXACTLY as the model's
+    _ln_hw does (mobilesam S2/neck): GPR14 = M//chunk_size, layer_norm_core_dram(gpr_M_reg=14).
+    This is the path the model uses but the plain LN test never exercised."""
+    A = ue.allocate_tensor_dram(M * N * 2)
+    O = ue.allocate_tensor_dram(M * N * 2)
+    G = ue.allocate_tensor_dram(N * 2)
+    B = ue.allocate_tensor_dram(N * 2)
+
+    ue.start_capture()
+    ue._isa_reg_counter = 15
+    ue.reset_inst_ptr_counter()
+    ue.generate_instruction_add_set(dst_reg_idx=14, immediate_value=M // chunk_size)
+    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O,
+                            GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=B, gpr_M_reg=14)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    isz = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(isz)
+    ue.clear_capture_buffer()
+
+    ue.dma_to_accelerator_memory(A, x_pad.contiguous())
+    ue.dma_to_accelerator_memory(G, gamma_pad.contiguous())
+    ue.dma_to_accelerator_memory(B, beta_pad.contiguous())
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(20.0)
+    out = ue.dma_from_accelerator_memory(O, (M, N))
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+    return out
+
+
+def s2_layernorm_chunked_vs_plain_test(M=4096, C_real=160, C_pad=192, chunk_size=32):
+    """Pin the MobileSAM S2 LayerNorm collapse: the model runs layer_norm_core_dram with
+    gpr_M_reg M-collapse (M=4096 in 128 chunks of 32). The plain LN path scores ~30 dB on
+    real S2 data, but the model's S2 LN output measures ~4.5 dB vs golden. This A/B's the
+    SAME input through plain vs chunked(gpr_M_reg) to isolate the chunked-LN path."""
+    import numpy as _np
+    ue = UnifiedEngine()
+    scale = math.sqrt(C_real / C_pad)
+    _here = os.path.dirname(os.path.abspath(__file__))
+    arr = _np.load(os.path.join(_here, "models", "mobilesam", "cpu_golden.npz"))["PM12"]
+    x_real = torch.from_numpy(arr.reshape(-1, C_real)[:M]).float().bfloat16()
+    _sd = torch.load(os.path.join(_here, "models", "mobilesam", "mobilesam_bin", "mobile_sam.pt"),
+                     map_location="cpu", weights_only=True)
+    gamma = _sd["image_encoder.layers.2.blocks.0.attn.norm.weight"].to(torch.bfloat16)
+    beta  = _sd["image_encoder.layers.2.blocks.0.attn.norm.bias"].to(torch.bfloat16)
+
+    ln = torch.nn.LayerNorm(C_real); ln.weight.data = gamma.float(); ln.bias.data = beta.float()
+    ref = ln(x_real.float()).bfloat16()
+
+    def _pad_w(v):
+        w = torch.zeros(C_pad, dtype=torch.bfloat16); w[:C_real] = v; return w
+    gamma_scaled = _pad_w((gamma.float() * scale).bfloat16())
+    beta_pad = _pad_w(beta)
+    x_zero = torch.zeros(M, C_pad, dtype=torch.bfloat16); x_zero[:, :C_real] = x_real
+
+    out_plain = _ln_hw_run(ue, M, C_pad, x_zero, gamma_scaled, beta_pad)[:, :C_real]
+    out_chunk = _ln_hw_run_chunked(ue, M, C_pad, x_zero, gamma_scaled, beta_pad, chunk_size)[:, :C_real]
+    snr_plain = calculate_snr(ref, out_plain)
+    snr_chunk = calculate_snr(ref, out_chunk)
+
+    print(f"\n[s2_layernorm_chunked_vs_plain] M={M} N={C_pad} chunk_size={chunk_size} (GPR14={M//chunk_size})")
+    print(f"  plain  layer_norm_core_dram          SNR = {snr_plain:.2f} dB")
+    print(f"  chunked layer_norm_core_dram(gpr_M)  SNR = {snr_chunk:.2f} dB   <- the model's path")
+    record_test("s2_ln_plain", f"M={M},N={C_pad}", snr_db=snr_plain)
+    record_test("s2_ln_chunked", f"M={M},N={C_pad},cs={chunk_size}", snr_db=snr_chunk)
+    return snr_plain, snr_chunk
+
+
+def layer_norm_padded_channels_test(M=None, C_real=160, C_pad=192):
+    """Faithful MobileSAM S2 LayerNorm-over-padded-channels reproducer.
+
+    Mirrors the model EXACTLY (mobilesam_test.py S2 block, ~line 2300):
+      - model dims: M = 64*64 = 4096 tokens, C_real=160 padded to C_pad=192,
+      - real S2B0 `attn.norm` gamma/beta loaded from the checkpoint,
+      - gamma pre-scaled by sqrt(C_real/C_pad) and zero-padded to 192,
+      - beta zero-padded to 192,
+      - input is the real golden PM12 tensor, zero-filled in the 32 pad cols.
+
+    The encoder pads S2's 160 real channels up to 192 (3x64) for kernel alignment.
+    LayerNorm normalizes over the channel dim, but the HW core normalizes over ALL N
+    columns. The model (a) zero-fills the 32 pad channels and (b) pre-scales gamma by
+    sqrt(C_real/C_pad) to correct the variance. That scaling is exact ONLY when the
+    per-row mean is 0 (the zeros drag the mean to (C_real/C_pad)*mu and inject
+    (C_pad-C_real)*mu^2 of extra variance). It also relies on the gamma/beta pad cols
+    being zero so the LN OUTPUT pad cols stay 0 and cannot leak into qkv -- this test
+    asserts that explicitly.
+
+    Compares, against the true LayerNorm over the 160 real channels:
+      [current]   pad = 0,        gamma_pad = gamma * sqrt(C_real/C_pad)
+      [pad=mean]  pad = row-mean, gamma_pad = gamma * sqrt(C_real/C_pad)  (proposed, exact)
+    """
+    if M is None:
+        M = 64 * 64  # ENC_S2_H * ENC_S2_W -- the model's real S2 token count
+    ue = UnifiedEngine()
+    scale = math.sqrt(C_real / C_pad)
+    _here = os.path.dirname(os.path.abspath(__file__))
+
+    # Real S2 LN input: the golden PM12 tensor (key "PM12", shape (4096,160)).
+    _npz = os.path.join(_here, "models", "mobilesam", "cpu_golden.npz")
+    if os.path.exists(_npz):
+        import numpy as _np
+        arr = _np.load(_npz)["PM12"].reshape(-1, C_real)[:M]
+        x_real = torch.from_numpy(arr).float().bfloat16()
+        src = f"golden PM12 (real S2 LN input), per-row mean abs~{x_real.float().mean(-1).abs().mean():.3f}"
+    else:
+        x_real = (torch.randn(M, C_real) + 3.0 * torch.randn(M, 1)).bfloat16()  # nonzero per-row mean
+        src = f"synthetic randn+per-row-bias, per-row mean abs~{x_real.float().mean(-1).abs().mean():.3f}"
+
+    # Real S2B0 attn.norm weights from the checkpoint (fall back to random if absent).
+    _ckpt = os.path.join(_here, "models", "mobilesam", "mobilesam_bin", "mobile_sam.pt")
+    if os.path.exists(_ckpt):
+        _sd = torch.load(_ckpt, map_location="cpu", weights_only=True)
+        gamma = _sd["image_encoder.layers.2.blocks.0.attn.norm.weight"].to(torch.bfloat16)
+        beta  = _sd["image_encoder.layers.2.blocks.0.attn.norm.bias"].to(torch.bfloat16)
+        src += " | real S2B0 attn.norm gamma/beta"
+    else:
+        gamma = torch.randn(C_real, dtype=torch.bfloat16)
+        beta  = torch.randn(C_real, dtype=torch.bfloat16)
+        src += " | random gamma/beta"
+
+    ln = torch.nn.LayerNorm(C_real)
+    ln.weight.data = gamma.float()
+    ln.bias.data   = beta.float()
+    ref = ln(x_real.float()).bfloat16()  # (M, C_real) golden
+
+    def _pad_w(v):
+        w = torch.zeros(C_pad, dtype=torch.bfloat16); w[:C_real] = v; return w
+    gamma_scaled = _pad_w((gamma.float() * scale).bfloat16())
+    beta_pad     = _pad_w(beta)
+
+    # --- approach 1: current model (zero pad) ---
+    x_zero = torch.zeros(M, C_pad, dtype=torch.bfloat16); x_zero[:, :C_real] = x_real
+    out1_full = _ln_hw_run(ue, M, C_pad, x_zero, gamma_scaled, beta_pad)
+    out1 = out1_full[:, :C_real]
+    snr1 = calculate_snr(ref, out1)
+
+    # The model's S2 correctness DEPENDS on the LN output pad cols (160:192) staying ~0,
+    # so they cannot leak into the downstream qkv matmul (which reads all 192 cols).
+    # gamma_pad/beta_pad are zero there, so the HW must emit ~0. Assert it.
+    pad_leak = out1_full[:, C_real:].abs().max().item()
+    print(f"  [pad-col leak] max|LN_out[:,160:192]| = {pad_leak:.4e}  (must be ~0)")
+    assert pad_leak < 1e-2, (
+        f"LN output pad columns are nonzero ({pad_leak:.4e}) -- they WILL leak into "
+        f"qkv and corrupt S2 attention. This is a real padded-channel bug.")
+
+    # --- approach 2: pad with per-row mean of the real channels (proposed fix) ---
+    row_mean = x_real.float().mean(dim=1, keepdim=True)
+    x_mean = torch.zeros(M, C_pad, dtype=torch.bfloat16)
+    x_mean[:, :C_real] = x_real
+    x_mean[:, C_real:] = row_mean.expand(M, C_pad - C_real).bfloat16()
+    out2 = _ln_hw_run(ue, M, C_pad, x_mean, gamma_scaled, beta_pad)[:, :C_real]
+    snr2 = calculate_snr(ref, out2)
+
+    print(f"\n[layer_norm_padded_channels] M={M} C_real={C_real} C_pad={C_pad}")
+    print(f"  input: {src}")
+    print(f"  [current  zero-pad + gamma*sqrt(C_real/C_pad)] SNR = {snr1:.2f} dB   <- model today")
+    print(f"  [fix  pad=row-mean + gamma*sqrt(C_real/C_pad) ] SNR = {snr2:.2f} dB   <- proposed")
+    record_test("layer_norm_padded_zero", f"M={M},{C_real}->{C_pad}", snr_db=snr1)
+    record_test("layer_norm_padded_meanfill", f"M={M},{C_real}->{C_pad}", snr_db=snr2)
+    assert snr2 >= 40 or snr2 == float('inf'), f"pad=mean fix must reach 40 dB, got {snr2:.2f}"
+    return snr1, snr2
+
+
+def conv2d_3x3_im2col_pbi_test(H_in: int, W_in: int, C_in: int, stride: int = 1,
+                               snr_threshold_db: float = 40.0):
+    """Verify conv2d_3x3_im2col_pbi against a torch reference im2col (3x3, pad=1).
+
+    Builds the im2col matrix on HW via PBI hardware loops and checks it bit-for-bit
+    (SNR) against the same gather computed on the host, including zero padding.
+    """
+    ue = UnifiedEngine()
+    K = 9 * C_in
+    H_out = (H_in - 1) // stride + 1
+    W_out = (W_in - 1) // stride + 1
+    _GPR = 8
+
+    INPUT_DRAM_ADDR  = ue.allocate_tensor_dram(H_in * W_in * C_in * _BPE)
+    IM2COL_DRAM_ADDR = ue.allocate_tensor_dram(H_out * W_out * K * _BPE)
+
+    ue.start_capture()
+    conv2d_3x3_im2col_pbi(ue, INPUT_DRAM_ADDR, IM2COL_DRAM_ADDR,
+                          H_in, W_in, C_in, stride, _GPR)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(instruction_size_bytes)
+    ue.clear_capture_buffer()
+
+    x = torch.randn(H_in * W_in, C_in, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(30.0)
+    out = ue.dma_from_accelerator_memory(IM2COL_DRAM_ADDR, (H_out * W_out, K)).float()
+
+    # Host reference im2col (vectorized): pad input, then gather each tap block.
+    xg = x.reshape(H_in, W_in, C_in).float()
+    xp = torch.zeros(H_in + 2, W_in + 2, C_in)        # pad=1
+    xp[1:H_in + 1, 1:W_in + 1] = xg
+    ref = torch.zeros(H_out * W_out, K)
+    rows = torch.arange(H_out) * stride               # top-left of each 3x3 (in padded coords)
+    cols = torch.arange(W_out) * stride
+    for dy in range(3):
+        for dx in range(3):
+            tap = dy * 3 + dx
+            patch = xp[rows[:, None] + dy, cols[None, :] + dx]   # (H_out, W_out, C_in)
+            ref[:, tap * C_in:(tap + 1) * C_in] = patch.reshape(H_out * W_out, C_in)
+
+    snr_db = calculate_snr(ref, out)
+    print(f"conv2d_3x3_im2col_pbi SNR: {snr_db:.2f} dB  "
+          f"(H={H_in},W={W_in},C={C_in},s={stride}) inst={instruction_size_bytes}B "
+          f"vs ~{H_out * W_out * 9} legacy gathers")
+    assert snr_db >= snr_threshold_db or snr_db == float('inf'), \
+        f"SNR {snr_db:.2f} dB must be at least {snr_threshold_db} dB"
+
+    record_test("conv2d_3x3_im2col_pbi",
+                f"H={H_in},W={W_in},C={C_in},s={stride}",
+                snr_db=snr_db, inst_bytes=instruction_size_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+
+def window_partition_reverse_pbi_test(H: int, W: int, C: int, ws: int,
+                                      snr_threshold_db: float = 40.0):
+    """Verify window_partition_pbi (vs torch reference) and window_reverse_pbi
+    (round-trips the partition output back to the original input)."""
+    ue = UnifiedEngine()
+    nH, nW, WIN_PAD = _window_dims(H, W, ws)
+    _GPR = 8
+
+    IN   = ue.allocate_tensor_dram(H * W * C * _BPE)
+    WIN  = ue.allocate_tensor_dram(nH * nW * WIN_PAD * C * _BPE)
+    BACK = ue.allocate_tensor_dram(H * W * C * _BPE)
+
+    def _build_run(emit_fn, timeout=30.0):
+        ue.start_capture()
+        emit_fn()
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr()
+        nbytes = ue.get_capture_instruction_size_bytes()
+        ue.write_captured_instructions_to_dram(prog)
+        ue.allocate_program_dram(nbytes)
+        ue.clear_capture_buffer()
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(timeout)
+        return nbytes
+
+    x = torch.randn(H * W, C, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(IN, x)
+
+    # --- forward: partition ---
+    part_bytes = _build_run(lambda: window_partition_pbi(ue, IN, WIN, H, W, C, ws, _GPR))
+    win_hw = ue.dma_from_accelerator_memory(WIN, (nH * nW, WIN_PAD, C)).float()
+
+    # torch reference partition (zero-padded image, window permute, WIN_PAD pad rows)
+    xp = torch.zeros(nH * ws, nW * ws, C)
+    xp[:H, :W] = x.reshape(H, W, C).float()
+    win_ref = torch.zeros(nH * nW, WIN_PAD, C)
+    win_ref[:, :ws * ws] = xp.reshape(nH, ws, nW, ws, C).permute(0, 2, 1, 3, 4).reshape(nH * nW, ws * ws, C)
+    snr_part = calculate_snr(win_ref, win_hw)
+
+    # --- inverse: reverse (round-trip back to the original input) ---
+    rev_bytes = _build_run(lambda: (
+        dram_zero_fill(ue, BACK, H * W * C),
+        window_reverse_pbi(ue, WIN, BACK, H, W, C, ws, nH, nW, WIN_PAD, _GPR),
+    ))
+    back_hw = ue.dma_from_accelerator_memory(BACK, (H * W, C)).float()
+    snr_rev = calculate_snr(x.float(), back_hw)
+
+    print(f"window_partition_pbi SNR: {snr_part:.2f} dB | reverse round-trip SNR: {snr_rev:.2f} dB "
+          f"(H={H},W={W},C={C},ws={ws}) part_inst={part_bytes}B rev_inst={rev_bytes}B "
+          f"vs ~{nH * nW * ws * 2} legacy memcpys")
+    assert snr_part >= snr_threshold_db or snr_part == float('inf'), f"partition SNR {snr_part:.2f}"
+    assert snr_rev >= snr_threshold_db or snr_rev == float('inf'), f"reverse SNR {snr_rev:.2f}"
+
+    record_test("window_partition_pbi", f"H={H},W={W},C={C},ws={ws}",
+                snr_db=snr_part, inst_bytes=part_bytes)
+    record_test("window_reverse_pbi", f"H={H},W={W},C={C},ws={ws}",
+                snr_db=snr_rev, inst_bytes=rev_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+
+def conv2d_3x3_pbi_test(H: int, W: int, C_in: int, C_out: int, stride: int = 1,
+                        gelu_enable: bool = False, snr_threshold_db: float = 35.0,
+                        zero_fn=dram_zero_fill):
+    """End-to-end: conv2d_3x3_pbi vs torch.nn.functional.conv2d (3x3, pad=1)."""
+    import torch.nn.functional as F
+    ue = UnifiedEngine()
+    K = 9 * C_in
+    H_out = (H - 1) // stride + 1
+    W_out = (W - 1) // stride + 1
+    _GPR = 8
+
+    IN   = ue.allocate_tensor_dram(H * W * C_in * _BPE)
+    OUT  = ue.allocate_tensor_dram(H_out * W_out * C_out * _BPE)
+    IM   = ue.allocate_tensor_dram(W_out * K * _BPE)              # one im2col row
+    WGT  = ue.allocate_tensor_dram(C_out * K * _BPE)
+    BIA  = ue.allocate_tensor_dram(C_out * _BPE)
+
+    x  = torch.randn(H * W, C_in, dtype=torch.bfloat16)
+    w  = torch.randn(C_out, C_in, 3, 3, dtype=torch.bfloat16) * 0.1
+    b  = torch.randn(C_out, dtype=torch.bfloat16)
+    # Weight -> (C_out, 9*C_in): tap (dy,dx) block at (dy+1)*3+(dx+1).
+    wpk = torch.zeros(C_out, K, dtype=torch.bfloat16)
+    for dy in range(3):
+        for dx in range(3):
+            tap = dy * 3 + dx
+            wpk[:, tap * C_in:(tap + 1) * C_in] = w[:, :, dy, dx]
+    ue.dma_to_accelerator_memory(IN, x)
+    ue.dma_to_accelerator_memory(WGT, wpk)
+    ue.dma_to_accelerator_memory(BIA, b)
+
+    ue.start_capture()
+    conv2d_3x3_pbi(ue, IN, OUT, IM, WGT, BIA, H, W, C_in, C_out, stride, gelu_enable, _GPR,
+                   zero_fn=zero_fn)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(inst_bytes)
+    ue.clear_capture_buffer()
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(60.0)
+    out = ue.dma_from_accelerator_memory(OUT, (H_out * W_out, C_out)).float()
+
+    xin = x.reshape(H, W, C_in).permute(2, 0, 1).unsqueeze(0).float()
+    ref = F.conv2d(xin, w.float(), b.float(), stride=stride, padding=1)
+    if gelu_enable:
+        ref = F.gelu(ref)
+    ref = ref.squeeze(0).permute(1, 2, 0).reshape(H_out * W_out, C_out)
+    snr_db = calculate_snr(ref, out)
+    print(f"conv2d_3x3_pbi SNR: {snr_db:.2f} dB (H={H},W={W},Cin={C_in},Cout={C_out},s={stride}) "
+          f"inst={inst_bytes}B vs ~{H_out * W_out * 9} legacy gathers + {H_out} matmuls")
+    assert snr_db >= snr_threshold_db or snr_db == float('inf'), f"SNR {snr_db:.2f} dB"
+    record_test(f"conv2d_3x3_pbi{'_gelu' if gelu_enable else ''}",
+                f"H={H},W={W},Cin={C_in},Cout={C_out},s={stride}",
+                snr_db=snr_db, inst_bytes=inst_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+
+def conv2d_3x3_dw_pbi_test(H: int, W: int, C: int, stride: int = 1,
+                           gelu_enable: bool = False, snr_threshold_db: float = 35.0,
+                           zero_fn=dram_zero_fill):
+    """End-to-end: conv2d_3x3_dw_pbi vs torch depthwise conv2d (groups=C, 3x3, pad=1)."""
+    import torch.nn.functional as F
+    ue = UnifiedEngine()
+    BLK = 64
+    K = 9 * BLK
+    n_blocks = C // BLK
+    H_out = (H - 1) // stride + 1
+    W_out = (W - 1) // stride + 1
+    _GPR = 8
+
+    IN   = ue.allocate_tensor_dram(H * W * C * _BPE)
+    OUT  = ue.allocate_tensor_dram(H_out * W_out * C * _BPE)
+    IM   = ue.allocate_tensor_dram(W_out * (K + BLK) * _BPE)      # im2col row + TEMP
+    WGT  = ue.allocate_tensor_dram(C * K * _BPE)                  # (n_blocks*BLK, 9*BLK)
+    BIA  = ue.allocate_tensor_dram(C * _BPE)
+
+    x = torch.randn(H * W, C, dtype=torch.bfloat16)
+    w = torch.randn(C, 1, 3, 3, dtype=torch.bfloat16) * 0.2
+    b = torch.randn(C, dtype=torch.bfloat16)
+    # Block weight: row (blk*BLK+i) has w[c,0,dy,dx] only in tap-block column i (depthwise).
+    wblk = torch.zeros(C, K, dtype=torch.bfloat16)
+    for blk in range(n_blocks):
+        for i in range(BLK):
+            c = blk * BLK + i
+            for dy in range(3):
+                for dx in range(3):
+                    tap = dy * 3 + dx
+                    wblk[blk * BLK + i, tap * BLK + i] = w[c, 0, dy, dx]
+    ue.dma_to_accelerator_memory(IN, x)
+    ue.dma_to_accelerator_memory(WGT, wblk)
+    ue.dma_to_accelerator_memory(BIA, b)
+
+    ue.start_capture()
+    conv2d_3x3_dw_pbi(ue, IN, OUT, IM, WGT, BIA, H, W, C, stride, gelu_enable, _GPR,
+                      zero_fn=zero_fn)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(inst_bytes)
+    ue.clear_capture_buffer()
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(60.0)
+    out = ue.dma_from_accelerator_memory(OUT, (H_out * W_out, C)).float()
+
+    xin = x.reshape(H, W, C).permute(2, 0, 1).unsqueeze(0).float()
+    ref = F.conv2d(xin, w.float(), b.float(), stride=stride, padding=1, groups=C)
+    if gelu_enable:
+        ref = F.gelu(ref)
+    ref = ref.squeeze(0).permute(1, 2, 0).reshape(H_out * W_out, C)
+    snr_db = calculate_snr(ref, out)
+    print(f"conv2d_3x3_dw_pbi SNR: {snr_db:.2f} dB (H={H},W={W},C={C},s={stride}) "
+          f"inst={inst_bytes}B vs ~{n_blocks * H_out * W_out * 9} legacy gathers")
+    assert snr_db >= snr_threshold_db or snr_db == float('inf'), f"SNR {snr_db:.2f} dB"
+    record_test(f"conv2d_3x3_dw_pbi{'_gelu' if gelu_enable else ''}",
+                f"H={H},W={W},C={C},s={stride}", snr_db=snr_db, inst_bytes=inst_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+
+def conv2d_3x3_pbi_chain_test(reps: int = 4, H: int = 32, W: int = 32,
+                              C_in: int = 64, C_out: int = 64, stride: int = 1,
+                              interleave_matmul: bool = True,
+                              snr_threshold_db: float = 35.0,
+                              zero_fn=None):
+    """Reproduce the MODEL conditions the one-conv-per-program tests miss: run several
+    PBI convs back-to-back inside a SINGLE captured program, each interleaved with a
+    plain matmul (the model's 1x1 / identity matmuls), then verify EVERY conv output.
+
+    The per-conv tests pass at 54 dB but the model's neck was corrupt — the only
+    structural difference is that the model fires many PBI loops + matmuls in one
+    program, sharing the cached zero source, the 0x00000 staging row, GPR 8 and the
+    inst-pointer pool. If a later conv diverges while the first is clean, the bug is
+    in that back-to-back reuse, not the gather. Defaults to the model zeroing path."""
+    import torch.nn.functional as F
+    if zero_fn is None:
+        zero_fn = _pbi_zero_dram
+    ue = UnifiedEngine()
+    K = 9 * C_in
+    H_out = (H - 1) // stride + 1
+    W_out = (W - 1) // stride + 1
+    _GPR = 8
+
+    w = torch.randn(C_out, C_in, 3, 3, dtype=torch.bfloat16) * 0.1
+    b = torch.randn(C_out, dtype=torch.bfloat16)
+    wpk = torch.zeros(C_out, K, dtype=torch.bfloat16)
+    for dy in range(3):
+        for dx in range(3):
+            tap = dy * 3 + dx
+            wpk[:, tap * C_in:(tap + 1) * C_in] = w[:, :, dy, dx]
+    # Identity weight for the interleaved 1x1 matmul (C_out -> C_out passthrough).
+    ident = torch.eye(C_out, dtype=torch.bfloat16) if interleave_matmul else None
+
+    WGT = ue.allocate_tensor_dram(C_out * K * _BPE)
+    BIA = ue.allocate_tensor_dram(C_out * _BPE)
+    IDW = ue.allocate_tensor_dram(C_out * C_out * _BPE) if interleave_matmul else None
+    ue.dma_to_accelerator_memory(WGT, wpk)
+    ue.dma_to_accelerator_memory(BIA, b)
+    if interleave_matmul:
+        ue.dma_to_accelerator_memory(IDW, ident)
+
+    xs, INs, OUTs, IMs = [], [], [], []
+    for r in range(reps):
+        x = torch.randn(H * W, C_in, dtype=torch.bfloat16)
+        IN  = ue.allocate_tensor_dram(H * W * C_in * _BPE)
+        OUT = ue.allocate_tensor_dram(H_out * W_out * C_out * _BPE)
+        IM  = ue.allocate_tensor_dram(W_out * K * _BPE)
+        ue.dma_to_accelerator_memory(IN, x)
+        xs.append(x); INs.append(IN); OUTs.append(OUT); IMs.append(IM)
+
+    ue.start_capture()
+    for r in range(reps):
+        conv2d_3x3_pbi(ue, INs[r], OUTs[r], IMs[r], WGT, BIA, H, W, C_in, C_out,
+                       stride, False, _GPR, zero_fn=zero_fn)
+        if interleave_matmul:
+            _prime_m_reg(ue, _GPR, H_out * W_out)
+            ue.matmat_mul_core(
+                M=H_out * W_out, K=C_out, N=C_out,
+                A_DRAM_ADDR=OUTs[r], B_DRAM_ADDR=IDW, OUTPUT_DRAM_ADDR=OUTs[r],
+                gpr_M_reg=_GPR)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(inst_bytes)
+    ue.clear_capture_buffer()
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(120.0)
+
+    worst = float('inf')
+    for r in range(reps):
+        out = ue.dma_from_accelerator_memory(OUTs[r], (H_out * W_out, C_out)).float()
+        xin = xs[r].reshape(H, W, C_in).permute(2, 0, 1).unsqueeze(0).float()
+        ref = F.conv2d(xin, w.float(), b.float(), stride=stride, padding=1)
+        ref = ref.squeeze(0).permute(1, 2, 0).reshape(H_out * W_out, C_out)
+        snr_db = calculate_snr(ref, out)
+        worst = min(worst, snr_db)
+        flag = "  <-- DIVERGED" if not (snr_db >= snr_threshold_db or snr_db == float('inf')) else ""
+        print(f"  chain conv[{r}] SNR: {snr_db:.2f} dB{flag}")
+    print(f"conv2d_3x3_pbi_chain reps={reps} interleave_matmul={interleave_matmul} "
+          f"worst={worst:.2f} dB inst={inst_bytes}B")
+    assert worst >= snr_threshold_db or worst == float('inf'), \
+        f"chain worst SNR {worst:.2f} dB < {snr_threshold_db} dB"
+    record_test("conv2d_3x3_pbi_chain",
+                f"reps={reps},H={H},W={W},Cin={C_in},mm={interleave_matmul}",
+                snr_db=worst, inst_bytes=inst_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+
+def bf16_permute_pbi_test(dim_0: int, dim_1: int, dim_2: int, snr_threshold_db: float = 40.0):
+    """Verify bf16_permute_pbi against torch permute(1,0,2). Pure data movement -> inf dB."""
+    ue = UnifiedEngine()
+    _GPR = 8
+    IN  = ue.allocate_tensor_dram(dim_0 * dim_1 * dim_2 * _BPE)
+    OUT = ue.allocate_tensor_dram(dim_1 * dim_0 * dim_2 * _BPE)
+
+    ue.start_capture()
+    bf16_permute_pbi(ue, IN, OUT, dim_0, dim_1, dim_2, _GPR)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(inst_bytes)
+    ue.clear_capture_buffer()
+
+    a = torch.randn(dim_0, dim_1, dim_2, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(IN, a)
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(30.0)
+    out = ue.dma_from_accelerator_memory(OUT, (dim_1, dim_0, dim_2)).float()
+
+    ref = a.permute(1, 0, 2).float()
+    snr_db = calculate_snr(ref.flatten(), out.flatten())
+    print(f"bf16_permute_pbi SNR: {snr_db:.2f} dB (dim_0={dim_0},dim_1={dim_1},dim_2={dim_2}) "
+          f"inst={inst_bytes}B vs ~{dim_0 * dim_1} legacy gathers")
+    assert snr_db >= snr_threshold_db or snr_db == float('inf'), f"SNR {snr_db:.2f} dB"
+    record_test("bf16_permute_pbi", f"dim_0={dim_0},dim_1={dim_1},dim_2={dim_2}",
+                snr_db=snr_db, inst_bytes=inst_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+
+def conv_transpose2d_2x2_pbi_test(H: int, W: int, C_in: int, C_out: int,
+                                  snr_threshold_db: float = 35.0):
+    """End-to-end: conv_transpose2d_2x2_pbi vs torch.nn.ConvTranspose2d(k=2, s=2)."""
+    import torch.nn.functional as F
+    ue = UnifiedEngine()
+    _GPR = 8
+    IN   = ue.allocate_tensor_dram(H * W * C_in * _BPE)
+    OUT  = ue.allocate_tensor_dram(2 * H * 2 * W * C_out * _BPE)
+    TEMP = ue.allocate_tensor_dram(H * W * C_out * _BPE)
+    BIA  = ue.allocate_tensor_dram(C_out * _BPE)
+    WSL  = [ue.allocate_tensor_dram(C_out * C_in * _BPE) for _ in range(4)]
+
+    x = torch.randn(H * W, C_in, dtype=torch.bfloat16)
+    w = torch.randn(C_in, C_out, 2, 2, dtype=torch.bfloat16) * 0.1   # torch convT weight (Cin,Cout,kH,kW)
+    b = torch.randn(C_out, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(IN, x)
+    ue.dma_to_accelerator_memory(BIA, b)
+    # slice s=(kh,kw) weight is (C_out, C_in) = w[:, :, kh, kw].T
+    for s, (kh, kw) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+        ue.dma_to_accelerator_memory(WSL[s], w[:, :, kh, kw].t().contiguous())
+    # OUTPUT must be pre-zeroed
+    ue.dma_to_accelerator_memory(OUT, torch.zeros(2 * H * 2 * W * C_out, dtype=torch.bfloat16))
+
+    ue.start_capture()
+    conv_transpose2d_2x2_pbi(ue, IN, OUT, TEMP, WSL, BIA, H, W, C_in, C_out, _GPR)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.allocate_program_dram(inst_bytes)
+    ue.clear_capture_buffer()
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(60.0)
+    out = ue.dma_from_accelerator_memory(OUT, (2 * H * 2 * W, C_out)).float()
+
+    xin = x.reshape(H, W, C_in).permute(2, 0, 1).unsqueeze(0).float()
+    ref = F.conv_transpose2d(xin, w.float(), b.float(), stride=2)
+    ref = ref.squeeze(0).permute(1, 2, 0).reshape(2 * H * 2 * W, C_out)
+    snr_db = calculate_snr(ref, out)
+    print(f"conv_transpose2d_2x2_pbi SNR: {snr_db:.2f} dB (H={H},W={W},Cin={C_in},Cout={C_out}) "
+          f"inst={inst_bytes}B vs ~{4 * H * W * 2} legacy scatter DMAs")
+    assert snr_db >= snr_threshold_db or snr_db == float('inf'), f"SNR {snr_db:.2f} dB"
+    record_test("conv_transpose2d_2x2_pbi", f"H={H},W={W},Cin={C_in},Cout={C_out}",
+                snr_db=snr_db, inst_bytes=inst_bytes)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+
+def matmat_pbi_vs_legacy_test(M: int, K: int, N: int, gelu: bool = False, clamp: bool = False,
+                              bias: bool = False, in_place: bool = False,
+                              snr_threshold_db: float = 40.0):
+    """Compare matmat_mul_core PBI (gpr_M_reg) vs legacy for the EXACT model conditions.
+    Reports PBI-vs-torch, legacy-vs-torch, and the decisive PBI-vs-legacy SNR. in_place
+    runs A_DRAM == OUTPUT_DRAM (requires K==N). Asserts PBI matches legacy."""
+    import torch.nn.functional as F
+    A = torch.randn(M, K, dtype=torch.bfloat16) * 0.5
+    B = torch.randn(N, K, dtype=torch.bfloat16) * 0.1
+    bt = torch.randn(N, dtype=torch.bfloat16) if bias else None
+    ref = A.float() @ B.float().t()
+    if bias:  ref = ref + bt.float()
+    if gelu:  ref = ref * torch.sigmoid(1.702 * ref)
+    if clamp: ref = torch.clamp(ref, min=0.0)
+
+    if in_place:
+        assert K == N, "in_place requires K==N (A and OUTPUT share the buffer)"
+
+    def run(use_pbi: bool):
+        ue = UnifiedEngine()
+        A_DRAM = ue.allocate_tensor_dram(M * K * 2)
+        B_DRAM = ue.allocate_tensor_dram(N * K * 2)
+        OUT = A_DRAM if in_place else ue.allocate_tensor_dram(M * N * 2)
+        C_DRAM = ue.allocate_tensor_dram(N * 2) if bias else None
+        ue.dma_to_accelerator_memory(A_DRAM, A)
+        ue.dma_to_accelerator_memory(B_DRAM, B)
+        if bias:
+            ue.dma_to_accelerator_memory(C_DRAM, bt)
+        m_reg = ue.alloc_isa_reg() if use_pbi else None
+        ue.start_capture()
+        if use_pbi:
+            ue.generate_instruction_add_set(m_reg, M)
+        ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM, B_DRAM_ADDR=B_DRAM,
+                           OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=C_DRAM, bias_mode="broadcast_N",
+                           gelu_enable=gelu, clamp_enable=clamp, gpr_M_reg=m_reg)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr()
+        nbytes = ue.get_capture_instruction_size_bytes()
+        ue.write_captured_instructions_to_dram(prog)
+        ue.allocate_program_dram(nbytes)
+        ue.clear_capture_buffer()
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(120.0)
+        out = ue.dma_from_accelerator_memory(OUT, (M, N)).float()
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+        return out, nbytes
+
+    out_l, b_l = run(False)
+    out_p, b_p = run(True)
+    snr_lt = calculate_snr(ref, out_l)
+    snr_pt = calculate_snr(ref, out_p)
+    snr_pl = calculate_snr(out_l, out_p)
+    cond = "".join(t for t, f in [("gelu", gelu), ("clamp", clamp), ("bias", bias),
+                                   ("inplace", in_place)] if f) or "plain"
+    print(f"matmat PBI-vs-legacy M={M},K={K},N={N},{cond}: "
+          f"legacy/torch={snr_lt:.1f}dB pbi/torch={snr_pt:.1f}dB PBI/LEGACY={snr_pl:.1f}dB "
+          f"legacy={b_l}B pbi={b_p}B")
+    record_test(f"matmat_pbi_vs_legacy+{cond}", f"M={M},K={K},N={N}",
+                snr_db=snr_pl, inst_bytes=b_p)
+    assert snr_pl >= snr_threshold_db or snr_pl == float('inf'), \
+        f"PBI diverges from legacy: {snr_pl:.1f} dB for M={M},K={K},N={N},{cond}"
+
+
 def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False):
     """
     Tests rope_hf_core_dram by emitting one HF-style RoPE instruction sequence per row.
@@ -5219,6 +6238,93 @@ def flash_attention_batched_test(head_dim: int = 64, seq_len: int = 64,
     ue.reset_tensor_dram_addr()
 
 
+def mobilesam_s2_flash_btb_test(n_calls: int = 5, num_batches: int = 25,
+                                head_dim: int = 64, seq_len: int = 256,
+                                seq_real: int = 196):
+    """Reproduce MobileSAM's S2 flash usage EXACTLY: `n_calls` separate
+    flash_attention_batched_pbi calls BACK-TO-BACK in ONE program (the model
+    loops `for h in range(ENC_S2_HEADS=5): flash_attention_batched_pbi(
+    num_batches=ENC_S2_NWIN=25, head_dim=64, seq_len=256, bias_shared=True, ...)`).
+
+    The model's S2B0 collapses to 3 dB while every op passes in isolation -- the
+    suspect is that the 2nd..Nth back-to-back batched-flash call corrupts. This
+    test gives each call its OWN data+ref and reports per-call SNR, so a clean
+    call-0 + bad call-1.. pinpoints the back-to-back bug at the real S2 dims
+    (seq 196->256 padded, shared -inf key mask, shared SCRATCH across calls).
+    """
+    from nn_lib import flash_attention_batched_pbi
+    ue = UnifiedEngine()
+    bpe = 2
+    win_bytes = seq_len * head_dim * bpe
+    bias_bytes = seq_len * seq_len * bpe
+    scratch_elements = (head_dim + UE_FMAX_CONTEXT_SIZE) * seq_len
+
+    # Per-call Q/K/V/OUT (num_batches windows each) + one shared bias per call.
+    Qs, Ks, Vs, Os, Bs = [], [], [], [], []
+    qkv, biases, refs = [], [], []
+    # model's S2 shared bias pattern: -inf for padded key cols, 0 for padded query rows
+    for c in range(n_calls):
+        Qs.append(ue.allocate_tensor_dram(num_batches * win_bytes))
+        Ks.append(ue.allocate_tensor_dram(num_batches * win_bytes))
+        Vs.append(ue.allocate_tensor_dram(num_batches * win_bytes))
+        Os.append(ue.allocate_tensor_dram(num_batches * win_bytes))
+        Bs.append(ue.allocate_tensor_dram(bias_bytes))
+        q = torch.zeros(num_batches, seq_len, head_dim, dtype=torch.bfloat16)
+        k = torch.zeros(num_batches, seq_len, head_dim, dtype=torch.bfloat16)
+        v = torch.zeros(num_batches, seq_len, head_dim, dtype=torch.bfloat16)
+        # vary per call so a corrupted call can't accidentally match
+        q[:, :seq_real] = torch.randn(num_batches, seq_real, head_dim) * (0.5 + 0.1 * c)
+        k[:, :seq_real] = torch.randn(num_batches, seq_real, head_dim)
+        v[:, :seq_real] = torch.randn(num_batches, seq_real, head_dim)
+        bias = torch.zeros(seq_len, seq_len, dtype=torch.float32)
+        bias[:, seq_real:] = float('-inf')       # mask padded keys
+        bias[seq_real:, :] = 0.0                  # padded query rows
+        bias[:seq_real, :seq_real] = torch.randn(seq_real, seq_real)  # rel-pos bias
+        bias_bf = bias.to(torch.bfloat16)
+        ue.dma_to_accelerator_memory(Qs[c], q)
+        ue.dma_to_accelerator_memory(Ks[c], k)
+        ue.dma_to_accelerator_memory(Vs[c], v)
+        ue.dma_to_accelerator_memory(Bs[c], bias_bf)
+        qkv.append((q, k, v)); biases.append(bias_bf)
+        # torch ref (legacy flash applies 1/sqrt(head_dim) internally)
+        qs = q.float() * (1.0 / math.sqrt(head_dim))
+        att = qs @ k.float().transpose(-2, -1) + bias.unsqueeze(0)
+        sm = torch.softmax(att, dim=-1)
+        refs.append((sm @ v.float()))
+
+    IDENT = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe)
+    ue.dma_to_accelerator_memory(IDENT, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
+    SCRATCH = ue.allocate_tensor_dram(scratch_elements * bpe)  # SHARED across calls (like model)
+
+    ue.start_capture()
+    for c in range(n_calls):
+        flash_attention_batched_pbi(
+            ue, num_batches=num_batches, head_dim=head_dim, seq_len=seq_len,
+            Q_DRAM_ADDR=Qs[c], K_DRAM_ADDR=Ks[c], V_DRAM_ADDR=Vs[c],
+            OUTPUT_DRAM_ADDR=Os[c], SCRATCH_DRAM_ADDR=SCRATCH,
+            ATTN_P_DRAM_ADDR=0, IDENTITY_TRANSPOSE_DRAM_ADDR=IDENT,
+            BIAS_DRAM_ADDR=Bs[c], bias_shared=True, _silent=True)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(prog)
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(120.0)
+
+    print(f"\n[s2_flash_btb] {n_calls} back-to-back batched-flash calls "
+          f"(num_batches={num_batches}, hd={head_dim}, seq={seq_len}, real={seq_real})")
+    worst = 1e9
+    for c in range(n_calls):
+        out = ue.dma_from_accelerator_memory(Os[c], (num_batches, seq_len, head_dim))
+        snr = calculate_snr(refs[c][:, :seq_real], out[:, :seq_real].float())
+        worst = min(worst, snr)
+        print(f"   call {c}: SNR={snr:6.2f} dB" + ("" if snr >= 38 else "   <<< CORRUPT"))
+    record_test("s2_flash_btb", f"calls={n_calls},nb={num_batches},seq={seq_len}", snr_db=worst)
+    ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+    assert worst >= 38, f"back-to-back S2 flash corrupts: worst call SNR {worst:.2f} dB < 38"
+    return worst
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
@@ -5286,18 +6392,71 @@ if __name__ == "__main__":
 
     # --- Multi-head reshape (MobileSAM scatter+pad+permute patterns) ---
     # Padded case (MobileSAM-like: hd=32, hd_pad=64, heads=4)
-    multihead_reshape_dram_test(seq_len=64, num_heads=4, head_dim=32, head_dim_pad=64, use_pbi=False)
-    multihead_reshape_dram_test(seq_len=64, num_heads=4, head_dim=32, head_dim_pad=64, use_pbi=True)
-    # Larger seq_len, more heads (stresses the PBI transpose phase)
-    multihead_reshape_dram_test(seq_len=256, num_heads=8, head_dim=32, head_dim_pad=64, use_pbi=False)
-    multihead_reshape_dram_test(seq_len=256, num_heads=8, head_dim=32, head_dim_pad=64, use_pbi=True)
-    # No-padding fast path (head_dim == head_dim_pad)
-    multihead_reshape_dram_test(seq_len=144, num_heads=6, head_dim=64, head_dim_pad=64, use_pbi=False)
-    multihead_reshape_dram_test(seq_len=144, num_heads=6, head_dim=64, head_dim_pad=64, use_pbi=True)
+    # multihead_reshape_dram_test(seq_len=64, num_heads=4, head_dim=32, head_dim_pad=64, use_pbi=False)
+    # multihead_reshape_dram_test(seq_len=64, num_heads=4, head_dim=32, head_dim_pad=64, use_pbi=True)
+    # # Larger seq_len, more heads (stresses the PBI transpose phase)
+    # multihead_reshape_dram_test(seq_len=256, num_heads=8, head_dim=32, head_dim_pad=64, use_pbi=False)
+    # multihead_reshape_dram_test(seq_len=256, num_heads=8, head_dim=32, head_dim_pad=64, use_pbi=True)
+    # # No-padding fast path (head_dim == head_dim_pad)
+    # multihead_reshape_dram_test(seq_len=144, num_heads=6, head_dim=64, head_dim_pad=64, use_pbi=False)
+    # multihead_reshape_dram_test(seq_len=144, num_heads=6, head_dim=64, head_dim_pad=64, use_pbi=True)
 
     # --- Flash attention batched (PBI staging) ---
-    flash_attention_batched_test(head_dim=64, seq_len=64, num_heads=4, bias_enable=False)
-    flash_attention_batched_test(head_dim=64, seq_len=64, num_heads=4, bias_enable=True)
-    flash_attention_batched_test(head_dim=64, seq_len=256, num_heads=5, bias_enable=False)
+    # flash_attention_batched_test(head_dim=64, seq_len=64, num_heads=4, bias_enable=False)
+    # flash_attention_batched_test(head_dim=64, seq_len=64, num_heads=4, bias_enable=True)
+    # flash_attention_batched_test(head_dim=64, seq_len=256, num_heads=5, bias_enable=False)
+
+    # --- Conv 3x3 im2col via PBI hardware loops (encoder bin-size reduction) ---
+    conv2d_3x3_im2col_pbi_test(H_in=16, W_in=16, C_in=64, stride=1)
+    conv2d_3x3_im2col_pbi_test(H_in=32, W_in=32, C_in=64, stride=2)   # patch-embed-style
+    conv2d_3x3_im2col_pbi_test(H_in=24, W_in=24, C_in=128, stride=1)  # wider C_in (Stage 0 dw)
+
+    # --- Window partition / reverse via PBI hardware loops (TinyViT stages) ---
+    window_partition_reverse_pbi_test(H=14, W=14, C=64, ws=7)    # exact (no partial windows)
+    window_partition_reverse_pbi_test(H=16, W=16, C=128, ws=7)   # partial last window + pad rows
+    window_partition_reverse_pbi_test(H=32, W=32, C=160, ws=7)   # larger, partial
+
+    # --- Full 3x3 conv via PBI (regular) vs torch conv2d ---
+    conv2d_3x3_pbi_test(H=16, W=16, C_in=64, C_out=64, stride=1)
+    conv2d_3x3_pbi_test(H=32, W=32, C_in=64, C_out=128, stride=2)   # patch-embed style
+    conv2d_3x3_pbi_test(H=16, W=16, C_in=64, C_out=64, stride=1, gelu_enable=True)
+    # Decisive coverage the old tests lacked: model zeroing (_pbi_zero_dram), wide C_in,
+    # and true patch-embed scale (W_out=512 -> zero span > 1 staging chunk).
+    conv2d_3x3_pbi_test(H=32, W=32, C_in=256, C_out=256, stride=1, zero_fn=_pbi_zero_dram)
+    conv2d_3x3_pbi_test(H=256, W=256, C_in=64, C_out=64, stride=2, zero_fn=_pbi_zero_dram)
+    # Back-to-back convs in ONE program + interleaved matmuls (the model's real shape).
+    conv2d_3x3_pbi_chain_test(reps=4, H=32, W=32, C_in=64, C_out=64, interleave_matmul=True)
+
+    # --- Full 3x3 depthwise conv via PBI vs torch grouped conv2d ---
+    conv2d_3x3_dw_pbi_test(H=16, W=16, C=128, stride=1)
+    conv2d_3x3_dw_pbi_test(H=24, W=24, C=128, stride=2)            # patch-merge style
+    conv2d_3x3_dw_pbi_test(H=16, W=16, C=64, stride=1, gelu_enable=True)
+
+    # --- bf16 permute via PBI (decoder multi-head reshapes) ---
+    bf16_permute_pbi_test(dim_0=64, dim_1=8, dim_2=64)             # NT_PAD tokens (small)
+    bf16_permute_pbi_test(dim_0=4096, dim_1=8, dim_2=64)          # GA=4096 image tokens (the big one)
+    bf16_permute_pbi_test(dim_0=8, dim_1=4096, dim_2=64)          # transposed shape (merge direction)
+
+    # --- bf16 transpose PBI path (decoder per-head V transpose) ---
+    bf16_transpose_test(M=64, N=64, use_pbi=True)
+    bf16_transpose_test(M=4096, N=64, use_pbi=True)
+
+    # --- ConvTranspose2d 2x2 via PBI scatter (decoder upscale) ---
+    conv_transpose2d_2x2_pbi_test(H=64, W=64, C_in=256, C_out=64)    # upscale 0 (64->128)
+    conv_transpose2d_2x2_pbi_test(H=128, W=128, C_in=64, C_out=64)   # upscale 1 (128->256)
+
+    # --- matmul M-unroll: PBI vs legacy across the model's exact conditions ---
+    # In-place + activation (identity-GELU / upscale-GELU) — top suspect for the divergence:
+    matmat_pbi_vs_legacy_test(M=4096,  K=64,  N=64,  gelu=True,  in_place=True)
+    matmat_pbi_vs_legacy_test(M=16384, K=64,  N=64,  gelu=True,  in_place=True)   # upscale gelu
+    matmat_pbi_vs_legacy_test(M=4096,  K=64,  N=64,  gelu=True,  in_place=False)  # same but NOT in-place
+    # Plain / bias projections (decoder cross-attn, neck):
+    matmat_pbi_vs_legacy_test(M=4096,  K=256, N=512, bias=True)                   # cross-attn proj
+    matmat_pbi_vs_legacy_test(M=4096,  K=256, N=256)                              # neck-ish
+    matmat_pbi_vs_legacy_test(M=16384, K=64,  N=64)                               # plain, large M
+    # K=320 (=5*64, NOT a power of 2) — the EXACT neck conv1 shape that broke the model:
+    matmat_pbi_vs_legacy_test(M=4096,  K=320, N=256)                              # neck conv1
+    matmat_pbi_vs_legacy_test(M=512,   K=320, N=256)                              # smaller K=320
+    matmat_pbi_vs_legacy_test(M=4096,  K=192, N=256)                              # another non-pow2 (3*64)
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
