@@ -260,13 +260,14 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self.full_attn_layers   = set(mcfg["full_attn_layer_indices"])
         self.rope_theta = self._cfg["special"]["rope"]["theta_full"]
 
-        # ── On-FPGA repetition penalty (the ONLY sampling mechanism) ──────────
+        # ── Optional on-FPGA repetition penalty ──────────────────────────────
         # The LM head matmul always carries the PENALTY_BIAS_DRAM C term + HW
-        # argmax (write_back_disable).  Penalty ON (default) ⇒ the host refreshes
-        # that per-vocab bias each step; --pure-greedy (Q35_PURE_GREEDY=1) leaves
-        # it zero ⇒ bit-identical greedy.  Env knobs mirror llama3.2/qwen3.
+        # argmax (write_back_disable). The default zero bias is bit-identical
+        # greedy. Q35_REPETITION_PENALTY=1 enables the optional host-refreshed
+        # bias; Q35_PURE_GREEDY remains an explicit override.
         _envb = lambda k: os.environ.get(k, "0") not in ("0", "", "false", "False", "no")
-        self.fpga_penalty  = not _envb("Q35_PURE_GREEDY")
+        self.fpga_penalty  = (_envb("Q35_REPETITION_PENALTY")
+                              and not _envb("Q35_PURE_GREEDY"))
         self.pen_alpha     = float(os.environ.get("PEN_ALPHA", "3.0"))   # bias = -alpha*count
         self.pen_cap       = float(os.environ.get("PEN_CAP", "20.0"))    # clamp(min=-cap)
         self.rep_window    = int(os.environ.get("REP_WINDOW", "256"))    # freq over last N decoded
@@ -1645,11 +1646,9 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                     self.isa_add_set_core(self._ISA_POS_K_REG,    ue_35bit_addr_shifter(pos * row_byt))
                     self.isa_add_set_core(self._ISA_POS_ROPE_REG, ue_35bit_addr_shifter(pos * rope_byt))
 
-                    # (3.5) On-FPGA repetition penalty (the only sampling
-                    # mechanism): refresh the per-vocab C bias from the decoded
-                    # history BEFORE the trigger so the LM head's HW argmax already
-                    # returns the penalized token.  Gated by greedy_until; left
-                    # zero (= greedy) when penalty is off.
+                    # (3.5) Optional on-FPGA repetition penalty: refresh the
+                    # per-vocab C bias before the trigger. It remains zero for
+                    # the default pure-greedy path.
                     if self.fpga_penalty and step >= self.greedy_until:
                         self._write_penalty_bias(out_tokens)
 
@@ -3807,7 +3806,7 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
 def _sample_next(logits_row: torch.Tensor, temperature: float, top_k: int) -> int:
     """logits_row: [vocab] float tensor.  Returns int token id.  Host-side
     reference only — the production decode/prefill paths sample via the on-FPGA
-    LM-head argmax + repetition penalty (the only allowed sampling mechanism)."""
+    LM-head argmax with an optional repetition penalty."""
     if temperature <= 0.0:
         return int(torch.argmax(logits_row).item())
     logits = logits_row.float() / temperature

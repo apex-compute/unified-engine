@@ -86,14 +86,14 @@ nothing is recompiled.
    matrix. `setup_only` runs on the load path too, so it "just works." See
    `../../notes/shared_design_notes.md` (Trick 9).
 
-## Sampling — on-FPGA repetition penalty (the only mechanism)
+## Sampling
 
-Decode samples **on the FPGA**: the LM head is a quantized (FP4) matmul of the
-tied embedding with a per-vocab penalty bias as its C term (`bias_mode="broadcast_N"`,
-`write_back_disable=True`), and the **hardware argmax** of `logits + bias` returns
-the next token — no logits are read back to the host. The penalty is **ON by
-default**; `Q35_PURE_GREEDY=1` zeroes the bias for bit-identical greedy. The
-host rebuilds the bias each step as
+Decode is **pure greedy by default**. The quantized FP4 LM head and hardware
+argmax return the next token without reading logits back to the host.
+
+An optional on-FPGA repetition penalty can be enabled with
+`Q35_REPETITION_PENALTY=1`. It uses a per-vocabulary bias as the LM-head C term
+(`bias_mode="broadcast_N"`) and rebuilds the bias each step as
 `bias[t] = clamp(-α·count[t], min=-cap)` over a window of recent tokens;
 punctuation/whitespace/special tokens are exempt, and a token repeated
 `PEN_LOOP_RUN` times in a row is hard-banned to break stuck loops.
@@ -102,7 +102,8 @@ punctuation/whitespace/special tokens are exempt, and a token repeated
 
 | Var | Effect |
 |-----|--------|
-| `Q35_PURE_GREEDY=1` | Disable the repetition penalty (zero bias = bit-identical greedy). |
+| `Q35_REPETITION_PENALTY=1` | Enable the optional on-FPGA repetition penalty. |
+| `Q35_PURE_GREEDY=1` | Force pure greedy even if the penalty was enabled. |
 | `PEN_ALPHA` | Penalty strength `bias=-α·count` (default `3.0`). |
 | `PEN_CAP` | Penalty floor `clamp(min=-cap)` (default `20.0`). |
 | `REP_WINDOW` | Token-frequency window, last N decoded (default `256`). |
