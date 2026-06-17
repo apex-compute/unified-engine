@@ -792,7 +792,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        # assert hw_version == 0x253d5525, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x253d5525. Please update FPGA with commit update_253d5525.bin using update_flash.py (public release v1.3)"
+        assert hw_version == 0x5f9f99db, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x5f9f99db. Please update FPGA with commit update_5f9f99db.bin using update_flash.py (public release v1.3)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -2724,7 +2724,7 @@ class UnifiedEngine:
 
     def layer_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                                  GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
-                                 gpr_M_reg: int = None) -> int:
+                                 gpr_M_reg: int = None, ZEROS_DRAM_ADDR: int = None) -> int:
         """PBI-backed layer norm.  Matches the legacy's chunk-tiled DMA granularity so performance
         is on par, while the captured program shrinks from ~M*6 instructions to ~chunk_size*6+4.
 
@@ -2781,9 +2781,12 @@ class UnifiedEngine:
         gamma_sram_addr = None
         beta_sram_addr  = None
 
-        zeros_dram_addr = self.get_params_dram_addr()
-        self.allocate_params_dram(N * bpe)
-        self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * bpe)
+        if ZEROS_DRAM_ADDR is not None:
+            zeros_dram_addr = ZEROS_DRAM_ADDR          # caller-supplied shared zeros buffer
+        else:
+            zeros_dram_addr = self.get_params_dram_addr()
+            self.allocate_params_dram(N * bpe)
+            self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * bpe)
 
         self.accelerator_memory_to_sram(accelerator_dram_address=zeros_dram_addr,
                                         sram_address=zeros_sram_addr, element_size=N)
@@ -2883,15 +2886,19 @@ class UnifiedEngine:
         return total_flops
 
     def layer_norm_core_dram_legacy(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                                     GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None) -> int:
+                                     GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
+                                     ZEROS_DRAM_ADDR: int = None) -> int:
         """
         Legacy layer norm DRAM path: compile-time chunk-tiled, M-unrolled.
         """
         zeros_sram_addr = 0x80000
 
-        zeros_dram_addr = self.get_params_dram_addr()
-        self.allocate_params_dram(N * 2)
-        self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * 2)
+        if ZEROS_DRAM_ADDR is not None:
+            zeros_dram_addr = ZEROS_DRAM_ADDR          # caller-supplied shared zeros buffer
+        else:
+            zeros_dram_addr = self.get_params_dram_addr()
+            self.allocate_params_dram(N * 2)
+            self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * 2)
 
         # These are small enough to fit in URAM_B, the layout zeros + gamma + beta
         self.accelerator_memory_to_sram(accelerator_dram_address=zeros_dram_addr,
@@ -2944,7 +2951,7 @@ class UnifiedEngine:
 
     def layer_norm_core_dram(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                               GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
-                              gpr_M_reg: Optional[int] = None) -> int:
+                              gpr_M_reg: Optional[int] = None, ZEROS_DRAM_ADDR: int = None) -> int:
         """Layer norm DRAM entrypoint; dispatches based on ``gpr_M_reg``:
 
         - ``gpr_M_reg`` is a GPR index (1..15): :meth:`layer_norm_core_dram_pbi` — outer row loop
@@ -2958,28 +2965,21 @@ class UnifiedEngine:
                 M=M, N=N,
                 A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR,
-                gpr_M_reg=gpr_M_reg,
+                gpr_M_reg=gpr_M_reg, ZEROS_DRAM_ADDR=ZEROS_DRAM_ADDR,
             )
         return self.layer_norm_core_dram_legacy(
             M=M, N=N,
             A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
             GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR,
+            ZEROS_DRAM_ADDR=ZEROS_DRAM_ADDR,
         )
 
 
     def rope_hf_core_decode(self, N: int, input_dram_addr: int, output_dram_addr: int,
                      cos_dram_addr: int = 0, sin_dram_addr: int = 0,
                      rope_size_reg: int = None, gr_weight_dram: int = 0,
-                     output_addr_inc_reg: int = None, tmp_reg: int = None,
-                     packed_table_addr: int = None, pos_reg: int = None,
-                     output_pos_strided: bool = False) -> int:
+                     output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
         """HuggingFace-style RoPE on N bf16 elements. Caller must bracket with start/stop_capture.
-
-        Dispatches on ``N`` (mirrors :meth:`rope_hf_core_dram`):
-        - ``N < 128``: :meth:`rope_hf_core_decode_d64` — padded-split path for head_dim<128
-          (each N/2 half is sub-128-byte and can't be SRAM-sliced mid-row). Requires
-          ``packed_table_addr``, ``pos_reg`` and ``tmp_reg``; honors ``output_pos_strided``.
-        - ``N >= 128``: the legacy single-token body below.
 
         Compute flow (single token, head_dim=N, half=N//2):
           1. Load x[N]          → sram_x
@@ -3002,12 +3002,6 @@ class UnifiedEngine:
         output_addr_inc_reg: ISA register holding a per-position byte offset applied to output_dram_addr.
         Returns: approximate FLOPs (4*N).
         """
-        if N < 128:
-            if packed_table_addr is None or pos_reg is None or tmp_reg is None:
-                raise ValueError("rope_hf_core_decode: N<128 requires packed_table_addr, pos_reg and tmp_reg (d64 padded-split path)")
-            return self.rope_hf_core_decode_d64(N, input_dram_addr, output_dram_addr,
-                                                packed_table_addr=packed_table_addr, pos_reg=pos_reg,
-                                                tmp_reg=tmp_reg, output_pos_strided=output_pos_strided)
         assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
         assert N % 2 == 0, "N must be even for RoPE half layout"
         assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
@@ -6739,14 +6733,12 @@ class UnifiedEngine:
         self.is_capture_on = False
         print(f"Capture stopped. Total instructions captured: {self.capture_count}, size: {self.capture_count * 32} bytes")
 
-    def clear_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024, fill_byte: int = 0xff) -> None:
-        # fill_byte default 0xff = NaN in bf16 (legacy behavior). Pass 0x00 to zero-fill,
-        # which is a valid bf16 0.0 and safe for read-before-write regions on the next run.
+    def clear_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
         dram_total_bytes = 0xffffffff - DRAM_START_ADDR + 1
-        fill = bytes([fill_byte & 0xff]) * chunk_size_bytes
+        fill = b'\xff' * chunk_size_bytes
         offset = 0
         bar_width = 40
-        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..0xffffffff] with 0x{fill_byte & 0xff:02x} ({dram_total_bytes / 1024**3:.2f} GB)")
+        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..0xffffffff] ({dram_total_bytes / 1024**3:.2f} GB)")
         while offset < dram_total_bytes:
             write_size = min(chunk_size_bytes, dram_total_bytes - offset)
             self.dma_write(DMA_DEVICE_H2C, DRAM_START_ADDR + offset, fill[:write_size], write_size)
