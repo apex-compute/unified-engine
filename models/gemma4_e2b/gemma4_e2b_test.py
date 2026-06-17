@@ -1797,6 +1797,26 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
             count[self._structural_ids_tensor()] = 0.0
         bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        # --- anti-loop hard ban (overrides the structural exemption above) ---
+        # The structural exemption keeps glue tokens ("|", newline, space) out of
+        # the soft frequency penalty so penalized text doesn't turn to word-salad
+        # -- but that is exactly why the penalty alone can't break a degenerate
+        # collapse whose tokens ARE structural (e.g. a "|"<->"\n" 2-cycle, which
+        # naive consecutive-run detection would miss). Instead: over the last
+        # `recent_w` generated tokens, hard-ban any token that fills >= `loop_thr`
+        # of them (single-token run = all; 2-cycle = ~half each). No coherent text
+        # fills a third of a short window with one token, so it never fires on
+        # real output. (E2B VLM is empirically immune to the E4B image cycle, but
+        # the penalty path is shared; harmless here, present for symmetry.)
+        # Tunable: GEMMA4_PEN_LOOP_RECENT (window, 0=off), GEMMA4_PEN_LOOP_THR.
+        recent_w = int(getattr(self, "pen_loop_recent", 24))
+        loop_thr = int(getattr(self, "pen_loop_thr", 8))
+        if recent_w > 0 and len(prev_tokens) >= recent_w:
+            from collections import Counter
+            _cnt = Counter(int(t) for t in prev_tokens[-recent_w:])
+            _ban = [tok for tok, c in _cnt.items() if c >= loop_thr]
+            if _ban:
+                bias[0, torch.tensor(_ban, dtype=torch.long)] = -1e9  # finite, bf16-safe
         self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
 
     # rope_hf_core: use base-class implementation in user_dma_core.py which
@@ -3941,6 +3961,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.dma_to_accelerator_memory(id_64_addr,
                 torch.eye(64, dtype=torch.bfloat16).contiguous())
             self._aud_sub_id_64_addr = id_64_addr
+            # Trick 9: shared LayerNorm zeros base (N=128 covers ln0 N=128 + ln1 N=64).
+            # Seeded here like id_64 (deterministic addr, replayed on run_from_bin load);
+            # passed to both subsample LNs via ZEROS_DRAM_ADDR.
+            ln_zeros_addr = self.allocate_tensor_dram(128 * bpe)
+            self.dma_to_accelerator_memory(ln_zeros_addr,
+                torch.zeros(128, dtype=torch.bfloat16).contiguous())
+            self._aud_ln_zeros_addr = ln_zeros_addr
             # G_s0 is deterministic (parakeet pattern, depends only on n_mels=128);
             # recompute on host. Must follow exact size used by audio_weight_init.
             VS = UE_VECTOR_SIZE
@@ -4213,6 +4240,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # Lives in params region; small (64*64*2 = 8 KB).
         self._aud_sub_id_64_addr = _upload_bf16("aud_sub_id_64",
             torch.eye(64, dtype=torch.bfloat16))
+        # Trick 9: shared LayerNorm zeros base (mirrors id_64; same addr as combined-bin path).
+        self._aud_ln_zeros_addr = _upload_bf16("aud_ln_zeros",
+            torch.zeros(128, dtype=torch.bfloat16))
 
         # Phase A2.1: FPGA im2col stage-0 gather matrix G_s0 (parakeet pattern).
         # G_s0[ow*64 + kh*3 + kw, kh*W_in + col] = 1.0 where col = ow*2 - 1 + kw.
@@ -4795,7 +4825,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=N0_pad, N=128,
             A_DRAM_ADDR=self.AUD_SUB_OUT0,
             OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT0,
-            GAMMA_DRAM_ADDR=self._aud_sub_ln0_gamma_addr))
+            GAMMA_DRAM_ADDR=self._aud_sub_ln0_gamma_addr,
+            ZEROS_DRAM_ADDR=self._aud_ln_zeros_addr))
             # layer_norm PBI left legacy: novel one-shot path not covered by the
             # vision all-saves validation; runs once so no bin-shrink benefit.
         # ReLU via identity matmul with clamp_enable=True (LALU_CLAMP_RELU).
@@ -4858,7 +4889,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=N1_pad, N=64,
             A_DRAM_ADDR=self.AUD_SUB_OUT1,
             OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT1,
-            GAMMA_DRAM_ADDR=self._aud_sub_ln1_gamma_addr))
+            GAMMA_DRAM_ADDR=self._aud_sub_ln1_gamma_addr,
+            ZEROS_DRAM_ADDR=self._aud_ln_zeros_addr))
             # layer_norm PBI left legacy (see ln0 note above).
         # ReLU1 via identity matmul on (N1_pad, 64) with clamp_enable=True.
         self._compile_and_run_single("aud_sub_relu1", lambda: self.matmat_mul_core(
@@ -6985,7 +7017,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             latency = self.report_latency_in_us()
             print(f"    Total program execution latency = {latency} us")
             if flops is not None:
-                flop_rate_program, _ = self.report_flop_rate_gflops(flops)
+                try:
+                    flop_rate_program, _ = self.report_flop_rate_gflops(flops)
+                except ZeroDivisionError:
+                    flop_rate_program = 0.0   # transient 0-latency HW counter read → skip GFLOPS, don't abort the run
         return latency, flop_rate_program
 
     def _get_layer_attention_dims(self, layer_idx: int) -> tuple[int, int, int]:
@@ -9002,6 +9037,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.pen_cap    = float(os.environ.get("GEMMA4_PEN_CAP", "20.0"))
         self.rep_window = int(os.environ.get("GEMMA4_REP_WINDOW", "256"))
         _greedy_until   = int(os.environ.get("GEMMA4_GREEDY_UNTIL", "0"))
+        self.pen_loop_recent = int(os.environ.get("GEMMA4_PEN_LOOP_RECENT", "24"))  # anti-loop window (0=off)
+        self.pen_loop_thr    = int(os.environ.get("GEMMA4_PEN_LOOP_THR", "8"))       # ban tok at >= thr of last RECENT
         _gen_tokens: list[int] = []
         _n_generated = 0
         self.dma_to_accelerator_memory(
@@ -9010,7 +9047,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         if not _pen_off:
             print(f"[decode] on-FPGA repetition penalty ON "
                   f"(alpha={self.pen_alpha} cap={self.pen_cap} window={self.rep_window} "
-                  f"greedy_until={_greedy_until}); unset GEMMA4_PENALTY for pure greedy")
+                  f"greedy_until={_greedy_until} loop={self.pen_loop_recent}/{self.pen_loop_thr}); "
+                  f"unset GEMMA4_PENALTY for pure greedy")
 
         # Prime gpr_seq_len to the current decode_pos (= prompt length, since
         # self.seq_len reflects the prompt at this point). Subsequent steps

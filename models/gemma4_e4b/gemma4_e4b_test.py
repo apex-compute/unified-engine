@@ -1878,6 +1878,29 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
             count[self._structural_ids_tensor()] = 0.0
         bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        # --- anti-loop hard ban (overrides the structural exemption above) ---
+        # The structural exemption keeps glue tokens ("|", newline, space) out of
+        # the soft frequency penalty so penalized text doesn't turn to word-salad
+        # -- but that is exactly why the penalty alone can't break a degenerate
+        # collapse whose tokens ARE structural. The observed FPGA failure was a
+        # SHORT CYCLE ("|"<->"\n", period 2), not a single-token run, so naive
+        # consecutive-run detection would miss it. Instead: over the last
+        # `recent_w` generated tokens, hard-ban any token that fills >= `loop_thr`
+        # of them. A single-token run = recent_w/recent_w; a 2-cycle = ~half each;
+        # a 3-cycle = ~third each -- all exceed loop_thr, so every member of the
+        # cycle is banned and the HW argmax is forced onto real text. No coherent
+        # text fills a third of a short window with one token, so it never fires
+        # on real output. (The E4B VLM "|"/"\n" loop is fixed at SOURCE via the
+        # image-blind sliding layers; this is a generic backstop.) Tunable:
+        # GEMMA4_PEN_LOOP_RECENT (window, 0=off), GEMMA4_PEN_LOOP_THR (count).
+        recent_w = int(getattr(self, "pen_loop_recent", 24))
+        loop_thr = int(getattr(self, "pen_loop_thr", 8))
+        if recent_w > 0 and len(prev_tokens) >= recent_w:
+            from collections import Counter
+            _cnt = Counter(int(t) for t in prev_tokens[-recent_w:])
+            _ban = [tok for tok, c in _cnt.items() if c >= loop_thr]
+            if _ban:
+                bias[0, torch.tensor(_ban, dtype=torch.long)] = -1e9  # finite, bf16-safe
         self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
 
     # rope_hf_core override deleted — use user_dma_core base class which
@@ -3956,6 +3979,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.dma_to_accelerator_memory(id_64_addr,
                 torch.eye(64, dtype=torch.bfloat16).contiguous())
             self._aud_sub_id_64_addr = id_64_addr
+            # Trick 9: shared LayerNorm zeros base (N=128 covers ln0 N=128 + ln1 N=64).
+            # Seeded here like id_64 (deterministic addr, replayed on the run_from_bin
+            # load path), then passed to both subsample LNs via ZEROS_DRAM_ADDR so the
+            # kernel skips its compile-time-only self.dma_write(zeros).
+            ln_zeros_addr = self.allocate_tensor_dram(128 * bpe)
+            self.dma_to_accelerator_memory(ln_zeros_addr,
+                torch.zeros(128, dtype=torch.bfloat16).contiguous())
+            self._aud_ln_zeros_addr = ln_zeros_addr
             # G_s0 is deterministic (parakeet pattern, depends only on n_mels=128);
             # recompute on host. Must follow exact size used by audio_weight_init.
             VS = UE_VECTOR_SIZE
@@ -4228,6 +4259,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # Lives in params region; small (64*64*2 = 8 KB).
         self._aud_sub_id_64_addr = _upload_bf16("aud_sub_id_64",
             torch.eye(64, dtype=torch.bfloat16))
+        # Trick 9: shared LayerNorm zeros base (mirrors id_64 so the run_from_bin
+        # combined-bin path lands the seed at the same addr). Passed via ZEROS_DRAM_ADDR.
+        self._aud_ln_zeros_addr = _upload_bf16("aud_ln_zeros",
+            torch.zeros(128, dtype=torch.bfloat16))
 
         # Phase A2.1: FPGA im2col stage-0 gather matrix G_s0 (parakeet pattern).
         # G_s0[ow*64 + kh*3 + kw, kh*W_in + col] = 1.0 where col = ow*2 - 1 + kw.
@@ -4819,7 +4854,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=N0_pad, N=128,
             A_DRAM_ADDR=self.AUD_SUB_OUT0,
             OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT0,
-            GAMMA_DRAM_ADDR=self._aud_sub_ln0_gamma_addr))
+            GAMMA_DRAM_ADDR=self._aud_sub_ln0_gamma_addr,
+            ZEROS_DRAM_ADDR=self._aud_ln_zeros_addr))
         # ReLU via identity matmul with clamp_enable=True (LALU_CLAMP_RELU).
         self._compile_and_run_single("aud_sub_relu0", lambda: self.matmat_mul_core(
             M=N0_pad, K=128, N=128,
@@ -4880,7 +4916,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             M=N1_pad, N=64,
             A_DRAM_ADDR=self.AUD_SUB_OUT1,
             OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT1,
-            GAMMA_DRAM_ADDR=self._aud_sub_ln1_gamma_addr))
+            GAMMA_DRAM_ADDR=self._aud_sub_ln1_gamma_addr,
+            ZEROS_DRAM_ADDR=self._aud_ln_zeros_addr))
         # ReLU1 via identity matmul on (N1_pad, 64) with clamp_enable=True.
         self._compile_and_run_single("aud_sub_relu1", lambda: self.matmat_mul_core(
             M=N1_pad, K=64, N=64,
@@ -7054,7 +7091,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             latency = self.report_latency_in_us()
             print(f"    Total program execution latency = {latency} us")
             if flops is not None:
-                flop_rate_program, _ = self.report_flop_rate_gflops(flops)
+                try:
+                    flop_rate_program, _ = self.report_flop_rate_gflops(flops)
+                except ZeroDivisionError:
+                    flop_rate_program = 0.0   # transient 0-latency HW counter read → skip GFLOPS, don't abort the run
         return latency, flop_rate_program
 
     def _get_layer_attention_dims(self, layer_idx: int) -> tuple[int, int, int]:
@@ -7827,6 +7867,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _img_tok_mask = None
         if hasattr(self, '_mm_types') and self._mm_types is not None:
             _img_tok_mask = (torch.tensor(self._mm_types[:seq_len]) == 1)
+            # Persist the image abs-positions BEFORE _mm_types is cleared below —
+            # decode (IMG-SPAN log + GEMMA4_VLM_NO_IMG_SLIDING masking) needs them
+            # and self._mm_types is None by then.
+            self._img_abs_positions = _img_tok_mask.nonzero().flatten()
 
         # Clear multimodal state now that prefill's per-layer-inputs have been computed.
         # Decode reuses _compute_per_layer_inputs with seq_len=1, and if _mm_types
@@ -7909,6 +7953,26 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             and os.environ.get("GEMMA4_VLM_PURE_CAUSAL", "0") != "1"
         if _img_open is not None and _apply_bidir:
             sliding_bias.masked_fill_(_img_open, 0.0)
+        # VLM FIX (default ON): keep the SLIDING layers from being driven into the
+        # FPGA "|"/"\n" cycle by the image, WITHOUT corrupting the image's own
+        # representation. Mask image KEY columns ONLY for NON-image (text/system)
+        # queries — TEXT tokens on sliding layers don't attend to image keys (that
+        # is what triggers the cycle), but IMAGE queries keep their causal access
+        # to image keys so the image positions still get proper sliding-layer
+        # representations, which the 7 GLOBAL layers then read. (Masking image keys
+        # for ALL queries — incl. image — makes image positions attend to ~nothing,
+        # corrupting the reps the global layers consume; that REGRESSED vette into
+        # bracket/word-salad. Text-only masking avoids that.) GEMMA4_VLM_IMG_SLIDING=1
+        # restores HF-style; GEMMA4_VLM_NOIMG_ALLQ=1 = old all-query masking (debug).
+        if os.environ.get("GEMMA4_VLM_IMG_SLIDING", "0") != "1" and _img_tok_mask is not None:
+            _img_k = _img_tok_mask.repeat_interleave(_na)
+            _img_k_full = torch.zeros(aligned_seq_len, dtype=torch.bool)
+            _img_k_full[:_img_k.shape[0]] = _img_k
+            if os.environ.get("GEMMA4_VLM_NOIMG_ALLQ", "0") == "1":
+                sliding_bias[:, _img_k_full] = float("-inf")            # all queries (old)
+            else:
+                _nonimg_q = ~_img_k_full                               # text/system query rows
+                sliding_bias[_nonimg_q.unsqueeze(1) & _img_k_full.unsqueeze(0)] = float("-inf")
         sliding_bias[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias)
 
@@ -9269,6 +9333,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.pen_cap    = float(os.environ.get("GEMMA4_PEN_CAP", "20.0"))
         self.rep_window = int(os.environ.get("GEMMA4_REP_WINDOW", "256"))
         _greedy_until   = int(os.environ.get("GEMMA4_GREEDY_UNTIL", "0"))
+        self.pen_loop_recent = int(os.environ.get("GEMMA4_PEN_LOOP_RECENT", "24"))  # anti-loop window (0=off)
+        self.pen_loop_thr    = int(os.environ.get("GEMMA4_PEN_LOOP_THR", "8"))       # ban tok at >= thr of last RECENT
         _gen_tokens: list[int] = []   # tokens produced this decode (for the bias window)
         _n_generated = 0
         # Zero the bias up front so penalty-off (and the pre-gate greedy phase)
@@ -9279,9 +9345,24 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         if not _pen_off:
             print(f"[decode] on-FPGA repetition penalty ON "
                   f"(alpha={self.pen_alpha} cap={self.pen_cap} window={self.rep_window} "
-                  f"greedy_until={_greedy_until}); unset GEMMA4_PENALTY for pure greedy")
+                  f"greedy_until={_greedy_until} loop={self.pen_loop_recent}/{self.pen_loop_thr}); "
+                  f"unset GEMMA4_PENALTY for pure greedy")
 
         self.isa_add_set_core(self.gpr_seq_len, self.seq_len)
+        # --- image-token span (for the VLM "|" recovery-position study) ---
+        # Sliding layers attend to the last `sliding_window` tokens; the image
+        # block scrolls out of that window at abs pos ~= img_end + sliding_window.
+        # If a greedy "|" run ends near that position, the loop is driven by the
+        # sliding layers' attention over the image, not by long-decode drift.
+        _img_pos = getattr(self, "_img_abs_positions", None)
+        if _img_pos is not None and _img_pos.numel():
+            self._img_dec_cols = _img_pos
+            _i0, _i1 = int(_img_pos[0]), int(_img_pos[-1])
+            print(f"[IMG-SPAN] image tokens at abs pos [{_i0}..{_i1}] "
+                  f"({_img_pos.numel()} img); prefill_len={self.seq_len}; "
+                  f"sliding_window={self.sliding_window}; "
+                  f"=> sliding layers lose image at abs pos ~{_i1 + self.sliding_window} "
+                  f"(decode step ~{_i1 + self.sliding_window - self.seq_len})", flush=True)
         print("\n------------------------------ DECODE START ------------------------------\n", flush=True)
 
         # Live decode status bar (mirrors llama3.2_1b): pin the bottom terminal
@@ -9339,6 +9420,24 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 sliding_bias_row = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
                 window_start = self.seq_len - self.sliding_window
                 sliding_bias_row[0, window_start:self.seq_len] = 0.0
+            # VLM FIX (default ON): make the SLIDING layers image-blind by masking
+            # the image-token columns. The image is then carried ONLY by the 7
+            # global/full-attention layers (which always see the whole sequence).
+            # WHY: on FPGA, the sliding layers' attention over the image KV drives
+            # a degenerate "|"<->"\n" 2-cycle from decode step 0; greedy only
+            # recovers once the image scrolls out of the 512-token sliding window
+            # (~step 450). FPGA-validated: masking image from sliding layers yields
+            # coherent, image-grounded output from step 0 ("The image captures a
+            # vast, mountainous landscape..."). This matches the model's own steady
+            # state — for any decode > sliding_window the image is already out of
+            # every sliding layer's window, so global layers alone carry it. Host-
+            # side bias only (DMA'd at runtime), no bin rebuild. Set
+            # GEMMA4_VLM_IMG_SLIDING=1 to restore HF-style (reproduces the cycle).
+            if os.environ.get("GEMMA4_VLM_IMG_SLIDING", "0") != "1" \
+                    and getattr(self, "_img_dec_cols", None) is not None:
+                if sliding_bias_row is full_bias_row:
+                    sliding_bias_row = full_bias_row.clone()   # don't corrupt the full bias
+                sliding_bias_row[0, self._img_dec_cols] = -1e36
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias_row)
 
             # On-FPGA penalty: refresh THIS step's per-vocab bias (the LM-head
@@ -9390,6 +9489,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             _n_generated += 1
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
+            # --- decode trace (GEMMA4_DECODE_TRACE=1): per-step structured log for
+            # the VLM "|" recovery-position study. abs pos = self.seq_len; run = the
+            # trailing consecutive-run length of this token. Grep "DTRACE" to find
+            # where a "|" run ends vs image_end+sliding_window. ---
+            if os.environ.get("GEMMA4_DECODE_TRACE", "0") == "1":
+                _run_here = getattr(self, "_rep_run", 0) + 1
+                _original_print(f"[DTRACE] step={_n_generated-1} pos={self.seq_len} "
+                      f"tok={int(token_id)} run={_run_here} repr={token_char!r}")
 
             _tok_dt = time.perf_counter() - _tok_t0
             if _first_tok_dt is None:
