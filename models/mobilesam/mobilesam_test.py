@@ -343,8 +343,13 @@ def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
         ue.start_queue_for_bf16_softmax_operation(
             fmax_context_addr=0, vector_sram_start_addr=scores_sram,
             output_sram_wb_addr=scores_sram, N=N)
-        v_chunk = max(UE_VECTOR_SIZE,
-                      (URAM_NEAR_FULL_ELEMENTS // N // UE_VECTOR_SIZE) * UE_VECTOR_SIZE)
+        # P@V tile: load (v_take, N) of V^T into URAM_B. v_take*N must fit
+        # URAM_NEAR_FULL_ELEMENTS. For kv_len=4096, head_dim=64 the whole
+        # 64*4096=262144 overruns URAM (262080) into the scores region — tile
+        # head_dim down (halving) until the V^T slab fits.
+        v_chunk = head_dim
+        while v_chunk * N > URAM_NEAR_FULL_ELEMENTS and v_chunk > 1:
+            v_chunk //= 2
         out_sram = scores_sram + N * _BPE
         for v_col, v_take in ue.chunk_ranges(head_dim, v_chunk):
             ue.accelerator_memory_to_sram(
@@ -2749,6 +2754,12 @@ class MobileSAM_UE(UnifiedEngine):
 
     def execute_encoder(self, prog: int, image_t: torch.Tensor):
         """Execute pre-compiled encoder program. Result lands in self.NECK_OUT_DRAM."""
+        # Clear stale device state (PBI pointers, loop/queue regs) left by a prior
+        # program before running. DRAM (weights + this program) persists across a
+        # soft reset, so this is safe to do after they are staged. Without it the
+        # encoder's many back-to-back PBI sections intermittently emit NaN/Inf that
+        # depend on whatever the device ran last (see "buggy NaN on consecutive run").
+        self.software_reset()
         img_hwc = image_t[0].permute(1, 2, 0).contiguous()
         img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, ENC_CIN_PAD, dtype=torch.bfloat16)
         img_pad[:, :3] = img_hwc.reshape(-1, 3)
@@ -3098,6 +3109,191 @@ class MobileSAM_UE(UnifiedEngine):
         self._assert_no_nan("neck_conv2+ln2", self.NECK_OUT_DRAM, _NECK_HW * _NECK_C_OUT)
 
         _original_print("debug_encode: all checkpoints passed ✓")
+
+    def debug_decode(self, tokens_t: torch.Tensor) -> None:
+        """Run the mask decoder stage-by-stage as isolated programs, checkpointing
+        every intermediate buffer. Assumes preload_decoder_image() already ran so
+        SRC_DRAM/KEY_PE_DRAM hold the image embedding + PE. Each stage is compiled
+        and executed on its own (fresh device state between, like debug_encode), so a
+        clean pass here = correct logic and the single-stream program is the problem;
+        a failing stage = a real bug in that op.
+
+        Replays compile_decoder()'s EXACT op sequence — do not let the two drift."""
+        _original_print("debug_decode: stepping through decoder ...")
+        toks = tokens_t.to(torch.bfloat16).contiguous()
+        self.dma_to_accelerator_memory(self.TOKENS_DRAM,    toks.flatten())
+        self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, toks.flatten())
+
+        _rows = []
+
+        def _step(label, fn, checks):
+            self._compile_run(fn)
+            for nm, addr, n, *rest in checks:
+                t = self._read_tensor(addr, n)
+                nn = torch.isnan(t).sum().item()
+                ni = torch.isinf(t).sum().item()
+                fin = t[torch.isfinite(t)]
+                mx = f"{fin.abs().max().item():.4f}" if fin.numel() else "all-bad"
+                tag = "OK " if nn == 0 and ni == 0 else "BAD"
+                rowinfo = ""
+                if rest and (nn or ni):  # rest[0] = row width → report bad row indices
+                    width = rest[0]
+                    bad = (~torch.isfinite(t.reshape(-1, width))).any(dim=1).nonzero().squeeze(-1).tolist()
+                    rowinfo = f"  bad_rows={bad[:6]}{'…' if len(bad) > 6 else ''} ({len(bad)})"
+                _original_print(f"  [{tag}] {label}/{nm}: nans={nn} infs={ni}/{n} max_abs={mx}{rowinfo}")
+                _rows.append((f"{label}/{nm}", nn, ni))
+
+        _NTD = NT_PAD * DEC_DIM
+        _GAD = GA * DEC_DIM
+        _HHD = DEC_HEADS * DEC_HD_PAD
+
+        for layer_i in range(DEC_LAYERS):
+            lw = self.dec_layer_weights[layer_i]
+            skip_pe = (layer_i == 0)
+            L = f"L{layer_i}"
+
+            if not skip_pe:
+                _step(f"{L}.q_in", lambda: eltwise_add_dram(
+                    self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.Q_IN_DRAM, _NTD),
+                    [("Q_IN", self.Q_IN_DRAM, _NTD)])
+
+            _step(f"{L}.self_attn", lambda lw=lw, skip_pe=skip_pe: self._self_attn(lw, skip_pe),
+                  [("SA_Q_PROJ", self.SA_Q_PROJ, NT_PAD * _HHD, _HHD),
+                   ("SA_Q_HEADS", self.SA_Q_HEADS, _HHD * NT_PAD),
+                   ("SA_ATTN_OUT", self.SA_ATTN_OUT, DEC_HEADS * NT_PAD * DEC_HD_PAD),
+                   ("SA_MERGED", self.SA_MERGED, _NTD),
+                   ("SA_OUT", self.SA_OUT, _NTD)])
+
+            _step(f"{L}.add1", lambda: eltwise_add_dram(
+                self, self.TOKENS_DRAM, self.SA_OUT, self.TOKENS_DRAM, _NTD),
+                [("TOKENS", self.TOKENS_DRAM, _NTD, DEC_DIM)])
+            _step(f"{L}.norm1", lambda lw=lw: self.layer_norm_core_dram(
+                M=NT_PAD, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM, OUTPUT_DRAM_ADDR=self.TOKENS_DRAM,
+                GAMMA_DRAM_ADDR=lw['norm1_w'], BETA_DRAM_ADDR=lw['norm1_b']),
+                [("TOKENS", self.TOKENS_DRAM, _NTD, DEC_DIM)])
+
+            def _t2i(lw=lw):
+                eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.Q_IN_DRAM, _NTD)
+                eltwise_add_dram(self, self.SRC_DRAM, self.KEY_PE_DRAM, self.SRC_PE_DRAM, _GAD)
+                self._cross_attn_t2i(q_w=lw['t2i_q_w'], q_b=lw['t2i_q_b'], k_w=lw['t2i_k_w'], k_b=lw['t2i_k_b'],
+                    v_w=lw['t2i_v_w'], v_b=lw['t2i_v_b'], out_w=lw['t2i_out_w'], out_b=lw['t2i_out_b'],
+                    Q_SRC=self.Q_IN_DRAM, KV_SRC=self.SRC_PE_DRAM, V_SRC=self.SRC_DRAM, q_len=NT_PAD)
+            _step(f"{L}.t2i", _t2i,
+                  [("T2I_Q_HEADS", self.T2I_Q_HEADS, _HHD * NT_PAD),
+                   ("T2I_VT", self.T2I_VT, DEC_HEADS * DEC_HD_PAD * GA),
+                   ("T2I_ATTN_OUT", self.T2I_ATTN_OUT, DEC_HEADS * NT_PAD * DEC_HD_PAD),
+                   ("T2I_MERGED", self.T2I_MERGED, NT_PAD * DEC_HEADS * DEC_CA_HD),
+                   ("T2I_OUT", self.T2I_OUT, _NTD)])
+
+            _step(f"{L}.add2", lambda: eltwise_add_dram(
+                self, self.TOKENS_DRAM, self.T2I_OUT, self.TOKENS_DRAM, _NTD),
+                [("TOKENS", self.TOKENS_DRAM, _NTD, DEC_DIM)])
+            _step(f"{L}.norm2", lambda lw=lw: self.layer_norm_core_dram(
+                M=NT_PAD, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM, OUTPUT_DRAM_ADDR=self.TOKENS_DRAM,
+                GAMMA_DRAM_ADDR=lw['norm2_w'], BETA_DRAM_ADDR=lw['norm2_b']),
+                [("TOKENS", self.TOKENS_DRAM, _NTD, DEC_DIM)])
+
+            def _mlp(lw=lw):
+                self.matmat_mul_core(M=NT_PAD, K=DEC_DIM, N=DEC_MLP_DIM, A_DRAM_ADDR=self.TOKENS_DRAM,
+                    B_DRAM_ADDR=lw['mlp_lin1_w'], OUTPUT_DRAM_ADDR=self.MLP_MID, C_DRAM_ADDR=lw['mlp_lin1_b'],
+                    bias_mode="broadcast_N", clamp_enable=True)
+                self.matmat_mul_core(M=NT_PAD, K=DEC_MLP_DIM, N=DEC_DIM, A_DRAM_ADDR=self.MLP_MID,
+                    B_DRAM_ADDR=lw['mlp_lin2_w'], OUTPUT_DRAM_ADDR=self.MLP_OUT, C_DRAM_ADDR=lw['mlp_lin2_b'],
+                    bias_mode="broadcast_N")
+            _step(f"{L}.mlp", _mlp, [("MLP_MID", self.MLP_MID, NT_PAD * DEC_MLP_DIM),
+                                     ("MLP_OUT", self.MLP_OUT, _NTD)])
+
+            def _add_norm3(lw=lw):
+                eltwise_add_dram(self, self.TOKENS_DRAM, self.MLP_OUT, self.TOKENS_DRAM, _NTD)
+                self.layer_norm_core_dram(M=NT_PAD, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.TOKENS_DRAM, GAMMA_DRAM_ADDR=lw['norm3_w'], BETA_DRAM_ADDR=lw['norm3_b'])
+            _step(f"{L}.add+norm3", _add_norm3, [("TOKENS", self.TOKENS_DRAM, _NTD)])
+
+            def _i2t(lw=lw):
+                eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.TOK_PE_DRAM, _NTD)
+                self._cross_attn_i2t(q_w=lw['i2t_q_w'], q_b=lw['i2t_q_b'], k_w=lw['i2t_k_w'], k_b=lw['i2t_k_b'],
+                    v_w=lw['i2t_v_w'], v_b=lw['i2t_v_b'], out_w=lw['i2t_out_w'], out_b=lw['i2t_out_b'],
+                    Q_SRC=self.SRC_PE_DRAM, KV_SRC=self.TOK_PE_DRAM, V_SRC=self.TOKENS_DRAM)
+            _step(f"{L}.i2t", _i2t,
+                  [("I2T_ATTN_OUT", self.I2T_ATTN_OUT, DEC_HEADS * GA * DEC_HD_PAD),
+                   ("I2T_MERGED", self.I2T_MERGED, GA * DEC_HEADS * DEC_CA_HD),
+                   ("I2T_OUT", self.I2T_OUT, _GAD)])
+
+            def _add_norm4(lw=lw):
+                eltwise_add_dram(self, self.SRC_DRAM, self.I2T_OUT, self.SRC_DRAM, _GAD)
+                self.layer_norm_core_dram(M=GA, N=DEC_DIM, A_DRAM_ADDR=self.SRC_DRAM,
+                    OUTPUT_DRAM_ADDR=self.SRC_DRAM, GAMMA_DRAM_ADDR=lw['norm4_w'], BETA_DRAM_ADDR=lw['norm4_b'])
+            _step(f"{L}.add+norm4", _add_norm4, [("SRC", self.SRC_DRAM, _GAD)])
+
+        fa = self.dec_final_attn
+        def _final(fa=fa):
+            eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.Q_IN_DRAM, _NTD)
+            eltwise_add_dram(self, self.SRC_DRAM, self.KEY_PE_DRAM, self.SRC_PE_DRAM, _GAD)
+            self._cross_attn_t2i(q_w=fa['q_w'], q_b=fa['q_b'], k_w=fa['k_w'], k_b=fa['k_b'],
+                v_w=fa['v_w'], v_b=fa['v_b'], out_w=fa['out_w'], out_b=fa['out_b'],
+                Q_SRC=self.Q_IN_DRAM, KV_SRC=self.SRC_PE_DRAM, V_SRC=self.SRC_DRAM, q_len=NT_PAD)
+            eltwise_add_dram(self, self.TOKENS_DRAM, self.T2I_OUT, self.TOKENS_DRAM, _NTD)
+            self.layer_norm_core_dram(M=NT_PAD, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM,
+                OUTPUT_DRAM_ADDR=self.TOKENS_DRAM, GAMMA_DRAM_ADDR=self.dec_final_norm['w'],
+                BETA_DRAM_ADDR=self.dec_final_norm['b'])
+        _step("final_attn", _final, [("T2I_OUT", self.T2I_OUT, _NTD),
+                                     ("TOKENS", self.TOKENS_DRAM, _NTD)])
+
+        def _upscale():
+            dram_zero_fill(self, self.UP0_OUT, 128 * 128 * 64)
+            conv_transpose2d_2x2_dram(self, INPUT_DRAM_ADDR=self.SRC_DRAM, OUTPUT_DRAM_ADDR=self.UP0_OUT,
+                TEMP_DRAM_ADDR=self.UP0_SCATTER, WEIGHT_SLICES=self.DEC_UP0_W, BIAS_DRAM_ADDR=self.DEC_UP0_B,
+                H=IMG_H, W=IMG_W, C_in=DEC_DIM, C_out=64)
+            self.layer_norm_core_dram(M=128 * 128, N=64, A_DRAM_ADDR=self.UP0_OUT,
+                OUTPUT_DRAM_ADDR=self.UP_LN_OUT, GAMMA_DRAM_ADDR=self.DEC_UP_LN_W, BETA_DRAM_ADDR=self.DEC_UP_LN_B)
+            self.matmat_mul_core(M=128 * 128, K=64, N=64, A_DRAM_ADDR=self.UP_LN_OUT,
+                B_DRAM_ADDR=self.GELU_ID_ADDR, OUTPUT_DRAM_ADDR=self.UP_LN_OUT, gelu_enable=True)
+            dram_zero_fill(self, self.UP1_OUT, 256 * 256 * 64)
+            conv_transpose2d_2x2_dram(self, INPUT_DRAM_ADDR=self.UP_LN_OUT, OUTPUT_DRAM_ADDR=self.UP1_OUT,
+                TEMP_DRAM_ADDR=self.UP1_SCATTER, WEIGHT_SLICES=self.DEC_UP1_W, BIAS_DRAM_ADDR=self.DEC_UP1_B,
+                H=128, W=128, C_in=64, C_out=64)
+        _step("upscale", _upscale, [("UP0_OUT", self.UP0_OUT, 128 * 128 * 64),
+                                    ("UP_LN_OUT", self.UP_LN_OUT, 128 * 128 * 64),
+                                    ("UP1_OUT", self.UP1_OUT, 256 * 256 * 64)])
+
+        def _hyper():
+            for m in range(4):
+                hw = self.dec_hyper_weights[m]
+                tok_addr = self.TOKENS_DRAM + (1 + m) * DEC_DIM * BPE
+                self.matmat_mul_core(M=1, K=DEC_DIM, N=DEC_DIM, A_DRAM_ADDR=tok_addr, B_DRAM_ADDR=hw['l0_w'],
+                    OUTPUT_DRAM_ADDR=self.HYPER_MID1, C_DRAM_ADDR=hw['l0_b'], bias_mode="broadcast_N", clamp_enable=True)
+                self.matmat_mul_core(M=1, K=DEC_DIM, N=DEC_DIM, A_DRAM_ADDR=self.HYPER_MID1, B_DRAM_ADDR=hw['l1_w'],
+                    OUTPUT_DRAM_ADDR=self.HYPER_MID2, C_DRAM_ADDR=hw['l1_b'], bias_mode="broadcast_N", clamp_enable=True)
+                self.matmat_mul_core(M=1, K=DEC_DIM, N=64, A_DRAM_ADDR=self.HYPER_MID2, B_DRAM_ADDR=hw['l2_w'],
+                    OUTPUT_DRAM_ADDR=self.HYPER_OUT + m * 64 * BPE, C_DRAM_ADDR=hw['l2_b'], bias_mode="broadcast_N")
+        _step("hyper", _hyper, [("HYPER_OUT", self.HYPER_OUT, 4 * 64)])
+
+        def _mask():
+            UP_FLAT_ELEMS = 256 * 256
+            for m in range(4):
+                self.matmat_mul_core(M=1, K=64, N=UP_FLAT_ELEMS, A_DRAM_ADDR=self.HYPER_OUT + m * 64 * BPE,
+                    B_DRAM_ADDR=self.UP1_OUT, OUTPUT_DRAM_ADDR=self.MASK_OUT + m * UP_FLAT_ELEMS * BPE)
+        _step("mask", _mask, [("MASK_OUT", self.MASK_OUT, 4 * 256 * 256)])
+
+        def _iou():
+            iw = self.dec_iou_weights
+            self.matmat_mul_core(M=1, K=DEC_DIM, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM, B_DRAM_ADDR=iw['l0_w'],
+                OUTPUT_DRAM_ADDR=self.IOU_MID1, C_DRAM_ADDR=iw['l0_b'], bias_mode="broadcast_N", clamp_enable=True)
+            self.matmat_mul_core(M=1, K=DEC_DIM, N=DEC_DIM, A_DRAM_ADDR=self.IOU_MID1, B_DRAM_ADDR=iw['l1_w'],
+                OUTPUT_DRAM_ADDR=self.IOU_MID2, C_DRAM_ADDR=iw['l1_b'], bias_mode="broadcast_N", clamp_enable=True)
+            self.matmat_mul_core(M=1, K=DEC_DIM, N=64, A_DRAM_ADDR=self.IOU_MID2, B_DRAM_ADDR=iw['l2_w'],
+                OUTPUT_DRAM_ADDR=self.IOU_OUT, C_DRAM_ADDR=iw['l2_b'], bias_mode="broadcast_N")
+        _step("iou", _iou, [("IOU_OUT", self.IOU_OUT, 64)])
+
+        # SA_Q_PROJ/SA_Q_HEADS carry NaN/Inf only in the head-dim pad columns
+        # (head_dim 32→64), written by matmat_mul_core into the pad slots. Self-attn
+        # discards them: the QK·V flash masks padded KV and multihead_merge unpads to
+        # the real 32 dims, so SA_ATTN_OUT onward is clean. Benign — not a failure.
+        _benign = ("SA_Q_PROJ", "SA_Q_HEADS")
+        _bad = [r[0] for r in _rows if (r[1] or r[2]) and not any(b in r[0] for b in _benign)]
+        if _bad:
+            assert False, f"debug_decode: NaN/Inf first at {_bad[0]} ({len(_bad)} bad checkpoints): {_bad[:8]}"
+        _original_print("debug_decode: all checkpoints passed ✓")
 
     # ------------------------------------------------------------------
     # Binary dump (for run_from_bin)
@@ -3733,6 +3929,8 @@ def main():
                         help="Single-point inference: encode image, run decoder for this point, save best mask")
     parser.add_argument("--debug-encode", action="store_true",
                         help="Step through encoder stage-by-stage, asserting no NaNs at each checkpoint")
+    parser.add_argument("--debug-decode", action="store_true",
+                        help="Step through decoder stage-by-stage, asserting no NaNs at each checkpoint")
     args = parser.parse_args()
 
     set_dma_device(args.dev)
@@ -3852,6 +4050,23 @@ def main():
         else:
             ue.software_reset()
             ue.debug_encode(image_t)
+        return
+
+    if args.debug_decode:
+        if bins_exist:
+            _original_print("--debug-decode requires a fresh compile (bins found — delete mobilesam_bin/ and re-run)")
+            return
+        px, py = args.point
+        _pw = _get_prompt_weights()
+        coord = torch.tensor([[float(px), float(py)]])
+        sparse_tok = _amg_encode_point(coord, _pw)
+        tokens_t = _assemble_tokens(WEIGHTS, sparse_tok)
+        ue.execute_encoder(enc_prog, image_t)  # software_reset + clean encoder
+        image_emb_t = ue.dma_from_accelerator_memory(ue.NECK_OUT_DRAM, (GA, DEC_DIM)).bfloat16()
+        assert torch.isnan(image_emb_t).sum().item() == 0, "encoder output NaN — fix encoder first"
+        ue.software_reset()
+        ue.preload_decoder_image(image_emb_t, image_pe_t, dense_t)
+        ue.debug_decode(tokens_t)
         return
 
     if args.point:

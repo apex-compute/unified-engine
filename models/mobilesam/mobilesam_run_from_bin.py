@@ -119,6 +119,10 @@ class MobileSAM_UE_Run(UnifiedEngine):
 
     def execute_encoder(self, prog: int, image_t: torch.Tensor) -> None:
         """Execute pre-compiled encoder program on input image."""
+        # Clear stale device state before running (DRAM weights + program persist
+        # across a soft reset). Mirrors MobileSAM_UE.execute_encoder; required or the
+        # encoder's back-to-back PBI sections intermittently emit NaN/Inf.
+        self.software_reset()
         img_hwc = image_t[0].permute(1, 2, 0).contiguous()
         img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, 64, dtype=torch.bfloat16)
         img_pad[:, :3] = img_hwc.reshape(-1, 3)
@@ -226,7 +230,7 @@ def main():
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     # Load image
-    img_path = os.path.join(SCRIPT_DIR, "../../../test_samples/vette.jpg")
+    img_path = os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     if not os.path.exists(img_path):
         _original_print(f"Test image not found: {img_path}")
         return
