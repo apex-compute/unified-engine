@@ -192,10 +192,11 @@ def _run_inference(ue, tokenizer, prompt, max_new_tokens, processor=None,
     print("  " + "-" * 74)
     print(f"  PREFILL  (T={T_prompt} prompt tokens)")
     print("  " + "-" * 74)
-    logits = T.prefill_via_decode(ue, ids, verbose=True,
-                                  vision_tokens=precomputed_vision_tokens,
-                                  image_token_id=image_token_id)
-    nxt = T._sample_next(logits[-1], TEMPERATURE, TOP_K)
+    # prefill returns the first generated token directly (on-FPGA LM-head argmax
+    # of the last prompt token — no host sampling).
+    nxt = T.prefill_via_decode(ue, ids, verbose=True,
+                               vision_tokens=precomputed_vision_tokens,
+                               image_token_id=image_token_id)
 
     # Clear prefill (T>1) caches before switching to the T=1 decode path.
     ue._primitive_cache.clear()

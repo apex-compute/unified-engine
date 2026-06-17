@@ -110,6 +110,25 @@ def quantize_fp4_64(tensor: torch.Tensor):
     return scales, torch.from_numpy(packed.astype(np.uint8))
 
 
+def quantize_lm_head_fp4(embed_w: torch.Tensor, rows_per_chunk: int = 4096):
+    """Quantize the (tied) embedding ``[vocab, H]`` to FP4_64 for use as the
+    on-chip LM-head weight (B = ``[N=vocab, K=H]`` for ``quantized_matmat_core``).
+
+    Done chunked-by-rows because ``quantize_fp4_64`` materializes a
+    ``[n_blocks, 64, 16]`` tensor for the codebook argmin — for the full
+    ~500 M-element table that is ~16 GB and OOMs.  ``H`` is a multiple of 64,
+    so a row boundary is always a 64-block boundary ⇒ chunked quantization is
+    bit-identical to quantizing the whole tensor at once.  Returns
+    ``(scales_bf16, packed_u8)``, the same pair shape as ``quantize_fp4_64``."""
+    assert embed_w.shape[1] % 64 == 0, "H must be a multiple of the FP4 block size (64)"
+    s_list, p_list = [], []
+    for i in range(0, embed_w.shape[0], rows_per_chunk):
+        s, p = quantize_fp4_64(embed_w[i:i + rows_per_chunk])
+        s_list.append(s)
+        p_list.append(p)
+    return torch.cat(s_list), torch.cat(p_list)
+
+
 # ============================================================================
 # Stdout noise filter (blanks out user_dma_core chatter during capture/exec)
 # ============================================================================
@@ -117,6 +136,7 @@ def quantize_fp4_64(tensor: torch.Tensor):
 class _NoiseFilterStdout:
     NOISE = (
         "M_chunk", "N_chunk", "While-loop body size",
+        "Layer norm PBI outer loop body size",
         "URAM_A usage", "URAM_B usage", "Total Theoretical FLOPS",
         "Chunk size:", "Capture ", "Writing ", "Successfully wrote",
         "Capture buffer cleared", "init_unified_engine", "Unified Engine init",
@@ -214,6 +234,13 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self._decoder_prog_size: int = 0
         self._decoder_X_dram: int = 0
         self._decoder_final_norm_dram: int = 0
+        # Full-4 GB DRAM layout (like gemma4): params 0x0–0xB0000000 = 2.75 GB.
+        # The kernel default base (0x80000000) gives only 768 MB of params, which
+        # the layer weights (~706 MB) + the on-chip FP4 LM head (~258 MB) = ~964 MB
+        # overflow into tensor DRAM (0xB0000000) — corrupting the KV/S caches →
+        # NaN.  Tensor/program bases stay at the kernel defaults (0xB0000000 /
+        # 0xD0000000); the small unified bin lives at 0xD0000000.
+        kwargs.setdefault("params_dram_base", 0x00000000)
         super().__init__(*args, **kwargs)
         with open(config_path or CONFIG_PATH) as f:
             self._cfg = json.load(f)
@@ -237,6 +264,23 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self.full_attn_layers   = set(mcfg["full_attn_layer_indices"])
         self.rope_theta = self._cfg["special"]["rope"]["theta_full"]
 
+        # ── On-FPGA repetition penalty (the ONLY sampling mechanism) ──────────
+        # The LM head matmul always carries the PENALTY_BIAS_DRAM C term + HW
+        # argmax (write_back_disable).  Penalty ON (default) ⇒ the host refreshes
+        # that per-vocab bias each step; --pure-greedy (Q35_PURE_GREEDY=1) leaves
+        # it zero ⇒ bit-identical greedy.  Env knobs mirror llama3.2/qwen3.
+        _envb = lambda k: os.environ.get(k, "0") not in ("0", "", "false", "False", "no")
+        self.fpga_penalty  = not _envb("Q35_PURE_GREEDY")
+        self.pen_alpha     = float(os.environ.get("PEN_ALPHA", "3.0"))   # bias = -alpha*count
+        self.pen_cap       = float(os.environ.get("PEN_CAP", "20.0"))    # clamp(min=-cap)
+        self.rep_window    = int(os.environ.get("REP_WINDOW", "256"))    # freq over last N decoded
+        self.greedy_until  = int(os.environ.get("GREEDY_UNTIL", "8"))    # pure greedy first N tokens
+        self.pen_ban_count = int(os.environ.get("PEN_BAN_COUNT", "0"))   # ≥N times in window ⇒ hard ban (0=off; backstop)
+        self.pen_loop_run  = int(os.environ.get("PEN_LOOP_RUN", "4"))    # ≥N in a row ⇒ hard ban (-1e9)
+        self.tokenizer = None       # set by generate()/run_decoder for the structural scan
+        self._struct_ids_cache = None
+        self._struct_ids_tensor_cache = None
+
     def _preallocate_identity_matrix(self) -> None:
         if self._identity_dram_addr is not None:
             return
@@ -245,6 +289,67 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         super().dma_write(DMA_DEVICE_H2C, self._identity_dram_addr,
                           eye, self._IDENTITY_MAT_BYTES)
         self._identity_dram_written = True
+
+    # ── On-FPGA repetition penalty helpers ───────────────────────────────────
+    def _structural_token_ids(self) -> set:
+        """Token ids that must NEVER be repetition-penalized: punctuation,
+        whitespace, newline, and special tokens.  Scanned once from the tokenizer
+        vocab and cached.  These 'glue' tokens recur in any text; penalizing them
+        over a long generation starves a small model of grammar (word-salad)."""
+        if self._struct_ids_cache is not None:
+            return self._struct_ids_cache
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–’‘“”…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        for i in range(self.VOCAB):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
+
+    def _structural_ids_tensor(self) -> torch.Tensor:
+        """1-D LongTensor of the structural ids (cached) for vectorized exemption."""
+        if self._struct_ids_tensor_cache is None:
+            self._struct_ids_tensor_cache = torch.tensor(
+                sorted(self._structural_token_ids()), dtype=torch.long)
+        return self._struct_ids_tensor_cache
+
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """Build the per-vocab additive repetition-penalty bias from windowed
+        token frequency and DMA it to PENALTY_BIAS_DRAM (the LM-head matmul's C
+        term, bias_mode="broadcast_N"): bias[t] = clamp(-alpha*count[t], min=-cap);
+        structural tokens stay 0.  The HW argmax of (logits + bias) then returns
+        the penalized token id — no logit readback.  A token emitted
+        >= pen_loop_run times IN A ROW gets a hard ban (-1e9) that OVERRIDES the
+        structural exemption, so the argmax is forced off a stuck loop the
+        frequency penalty alone can't escape (e.g. a punctuation token).  One
+        full-buffer DMA per step; all-zero = no penalty = bit-identical greedy."""
+        vocab = self.VOCAB
+        alpha, cap, W = float(self.pen_alpha), float(self.pen_cap), int(self.rep_window)
+        window = prev_tokens[-W:] if W > 0 else list(prev_tokens)
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0          # never penalize glue tokens
+        bias = (-alpha * count).clamp(min=-cap)
+        # Windowed count ban: any non-structural token seen >= pen_ban_count times
+        # in the window is banned outright (-1e9), even if not consecutive — this
+        # breaks loops that intersperse EXEMPT structural tokens (e.g.
+        # "* 1876 \n * 1876"), which the gentle frequency penalty and the
+        # consecutive-run ban both miss.
+        B = int(self.pen_ban_count)
+        if B > 0:
+            bias[count >= B] = -1e9
+        # Consecutive-run ban: a token emitted >= pen_loop_run times in a row.
+        R = int(self.pen_loop_run)
+        if R > 0 and len(prev_tokens) >= R:
+            last = int(prev_tokens[-1])
+            if all(int(prev_tokens[-1 - j]) == last for j in range(R)):
+                bias[last] = -1e9
+        self.dma_write(DMA_DEVICE_H2C, self.PENALTY_BIAS_DRAM,
+                       _bf(bias.view(1, vocab)), vocab * BF16)
 
     def bf16_transpose_core(self, M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR):
         saved = self._next_params_dram_addr
@@ -1133,6 +1238,20 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             wt_addr = self.allocate_tensor_dram(wt_bytes)
             self._conv_weight_tiles_dram[idx] = wt_addr
 
+        # On-chip LM head outputs (permanent tensors — must survive the per-layer
+        # reset_tensor_dram_addr()).  LOGITS_DRAM is the LM-head matmul target
+        # (never actually written: write_back_disable=True → HW argmax only).
+        # PENALTY_BIAS_DRAM is the matmul's per-vocab C bias (bias_mode="broadcast_N")
+        # for the on-FPGA repetition penalty; the host refreshes it each penalized
+        # step (_write_penalty_bias).  Allocated LAST + seeded to zero (= no penalty
+        # = bit-identical greedy) so adding it never shifts other addresses.
+        self.VOCAB = int(weights["embed_weight"].shape[0])
+        self.LOGITS_DRAM = self.allocate_tensor_dram(self.VOCAB * BF16)
+        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(self.VOCAB * BF16)
+        self.dma_write(DMA_DEVICE_H2C, self.PENALTY_BIAS_DRAM,
+                       _bf(torch.zeros(self.VOCAB, dtype=torch.bfloat16)),
+                       self.VOCAB * BF16)
+
         # FREEZE the tensor-DRAM base: everything allocated above is now
         # permanent; reset_tensor_dram_addr() will only reclaim allocations
         # made above this point.
@@ -1145,6 +1264,18 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
 
         # Embedding table — kept on host (~1 GB bf16 too big for params DRAM).
         self._embed_weight = weights["embed_weight"]
+
+        # On-chip LM head: FP4-quantized tied embedding, B=[N=vocab, K=H].  Loaded
+        # from the weights bin when present (compile-free load path); for a stale
+        # bin without it, quantize on the fly (chunked).  quantized_matmat_core
+        # takes (B_DRAM_ADDR=data, SCALE_DRAM_ADDR=scale).
+        if "lm_head_data" in weights and "lm_head_scale" in weights:
+            _lm_pair = (weights["lm_head_scale"], weights["lm_head_data"])
+        else:
+            print("  (weights bin lacks lm_head_* — quantizing tied embed on the fly)",
+                  flush=True)
+            _lm_pair = quantize_lm_head_fp4(self._embed_weight)
+        self._lm_head_scale_dram, self._lm_head_data_dram = _upload_fp4_pair(self, _lm_pair)
 
         # Per-layer weight upload from pre-extracted dicts.  Each layer's dict
         # in weights["layers"] holds bf16 tensors + (scales, packed) FP4 pairs;
@@ -1266,6 +1397,24 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         dummy_tok = torch.tensor([0], dtype=torch.long)
         with _quiet():
             _forward_range(self, dummy_tok, pos_start=0, zero_s=False)
+
+            # On-chip LM head (M=1 GEMV): logits = final_norm @ embedᵀ + penalty,
+            # argmaxed ON CHIP (write_back_disable=True → no logit readback; the
+            # host reads only the winning index via get_arg_max_index).  The
+            # penalty C bias (PENALTY_BIAS_DRAM, bias_mode="broadcast_N") is zero
+            # by default = bit-identical greedy; the host refreshes it per
+            # penalized decode step.  M=1 ⇒ the fast quantized GEMV path (same as
+            # llama3.2/qwen3).  Prefill replays this program per token, so its
+            # last-token argmax is the first generated token.
+            self.quantized_matmat_core(
+                M=1, K=self.hidden_size, N=self.VOCAB,
+                A_DRAM_ADDR=self._decoder_final_norm_dram,
+                B_DRAM_ADDR=self._lm_head_data_dram,
+                OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                SCALE_DRAM_ADDR=self._lm_head_scale_dram,
+                data_type=TYPE.IF4,
+                C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
+                write_back_disable=True)
 
         self.generate_instruction_halt()
 
@@ -1409,6 +1558,24 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         total_hw_us = 0.0
         step_dts: list = []   # per-token wall time → peak (1st token) + average
 
+        # On-FPGA penalty setup: bind the tokenizer (structural scan needs it),
+        # reset the per-vocab C bias to zero (clean state across generate calls),
+        # and precompute the structural-exemption set ONCE here (a full vocab
+        # scan — not mid-decode).  Penalty off ⇒ bias stays zero ⇒ pure greedy.
+        self.tokenizer = tokenizer
+        self.dma_write(DMA_DEVICE_H2C, self.PENALTY_BIAS_DRAM,
+                       _bf(torch.zeros(self.VOCAB, dtype=torch.bfloat16)),
+                       self.VOCAB * BF16)
+        if verbose:
+            if self.fpga_penalty:
+                _n_struct = len(self._structural_token_ids())
+                print(f"  penalty ON  (alpha={self.pen_alpha} cap={self.pen_cap} "
+                      f"window={self.rep_window} greedy_until={self.greedy_until} "
+                      f"ban_count={self.pen_ban_count} loop_run={self.pen_loop_run}; "
+                      f"{_n_struct} structural tokens exempt)")
+            else:
+                print("  penalty OFF (pure greedy)")
+
         if verbose:
             print()
             print("  " + "-" * 74)
@@ -1482,7 +1649,17 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                     self.isa_add_set_core(self._ISA_POS_K_REG,    ue_35bit_addr_shifter(pos * row_byt))
                     self.isa_add_set_core(self._ISA_POS_ROPE_REG, ue_35bit_addr_shifter(pos * rope_byt))
 
-                    # (4) ONE FPGA trigger for all 24 layers + final_norm.
+                    # (3.5) On-FPGA repetition penalty (the only sampling
+                    # mechanism): refresh the per-vocab C bias from the decoded
+                    # history BEFORE the trigger so the LM head's HW argmax already
+                    # returns the penalized token.  Gated by greedy_until; left
+                    # zero (= greedy) when penalty is off.
+                    if self.fpga_penalty and step >= self.greedy_until:
+                        self._write_penalty_bias(out_tokens)
+
+                    # (4) ONE FPGA trigger: 24 layers + final_norm + LM head, with
+                    # on-chip argmax of (logits + penalty bias); write_back_disable
+                    # ⇒ no logit readback.
                     self.start_execute_from_dram(self._decoder_prog_addr)
                     # Sleep 1 ms between polls — burns ~1000 PCIe reads per step
                     # instead of ~240 k, freeing the CPU core without changing
@@ -1495,17 +1672,16 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                             break
                     self._step_hw_latency_us = self.report_latency_in_us()
 
-                    # (5) Read FINAL_NORM, compute LM head + sample on host.
-                    final_norm_hw = _read_bf(self, FN_DRAM, (1, H))
-                    logits_row = (final_norm_hw.float() @ embed_w.t())[0]
+                    # (5) Read ONLY the winning token index (HW argmax).
+                    nxt = self.get_arg_max_index(rank=1)
                 else:
+                    # Per-layer reference path (one_shot=False): host LM head +
+                    # host argmax (numeric reference only; not a shipping path).
                     self._exec_idx = 0
                     dbg_tok = torch.tensor([cur_tok], dtype=torch.long)
                     logits_row_all = _forward_range(
                         self, dbg_tok, pos_start=pos, zero_s=False)
-                    logits_row = logits_row_all[-1]
-
-            nxt = _sample_next(logits_row, temperature, top_k)
+                    nxt = int(torch.argmax(logits_row_all[-1]).item())
             step_dt = time.time() - t0
             step_dts.append(step_dt)
             step_hw_us = self._step_hw_latency_us
@@ -2514,10 +2690,17 @@ def _extract_all_weights(text_model, linear_attn_layers: set) -> Dict:
             layers.append(_extract_linear_attn_weights(hf_layer))
         else:
             layers.append(_extract_full_attn_weights(hf_layer))
+    embed_w = text_model.embed_tokens.weight.detach().to(torch.bfloat16)
+    # On-chip LM head = FP4-quantized tied embedding (B=[N=vocab, K=H]).  Pre-
+    # quantized here so the load path (test.py reruns + run_from_bin) stays
+    # compile-free; the bf16 table is kept too for the host input-embed gather.
+    lm_scale, lm_data = quantize_lm_head_fp4(embed_w)
     return {
         "layers": layers,
         "final_norm_gamma": (text_model.norm.weight.float() + 1.0).to(torch.bfloat16),
-        "embed_weight": text_model.embed_tokens.weight.detach().to(torch.bfloat16),
+        "embed_weight": embed_w,
+        "lm_head_scale": lm_scale,
+        "lm_head_data":  lm_data,
     }
 
 
@@ -3645,8 +3828,8 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
     `T_prompt` after this returns — this function doesn't touch it because
     the loop already advances `cache_pos` per step.
 
-    Returns logits for the last prompt token, shape [1, vocab] (float32),
-    matching `prefill(...)[-1:]`.
+    Returns the first generated token id (int): the on-chip LM head + HW argmax
+    runs for every prompt token, and this is the last token's argmax.
     """
     T_prompt = int(token_ids.numel())
     H        = ue.hidden_size
@@ -3716,10 +3899,11 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
             if verbose and (i + 1) % 4 == 0:
                 print(".", end="", flush=True)
 
-    # Logits only for the last prompt token — that's all the caller needs
-    # to sample the first generated token.
-    final_norm_hw = _read_bf(ue, FN_DRAM, (1, H))
-    logits_last = (final_norm_hw.float() @ embed_w.t())  # [1, vocab]
+    # The compiled program ran the on-chip LM head + HW argmax for EVERY prompt
+    # token; the LAST token's argmax IS the first generated token (no logit
+    # readback — write_back_disable).  The penalty bias is zero throughout
+    # prefill (the prompt is never penalized), so this is plain greedy.
+    first_token_id = ue.get_arg_max_index(rank=1)
 
     # Surface timing through the same field the caller's pretty-printer uses.
     ue._step_hw_latency_us = total_hw_us
@@ -3729,7 +3913,7 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
         gflops_hw = (flops / 1e9) / max(total_hw_us * 1e-6, 1e-9)
         print(f" done ({dt:.1f}s, {flops/1e9:.1f} GFLOP, "
               f"{gflops_hw:.1f} GFLOP/s HW)")
-    return logits_last
+    return first_token_id
 
 
 # ============================================================================
@@ -3737,7 +3921,9 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
 # ============================================================================
 
 def _sample_next(logits_row: torch.Tensor, temperature: float, top_k: int) -> int:
-    """logits_row: [vocab] float tensor.  Returns int token id."""
+    """logits_row: [vocab] float tensor.  Returns int token id.  Host-side
+    reference only — the production decode/prefill paths sample via the on-FPGA
+    LM-head argmax + repetition penalty (the only allowed sampling mechanism)."""
     if temperature <= 0.0:
         return int(torch.argmax(logits_row).item())
     logits = logits_row.float() / temperature
@@ -3857,20 +4043,22 @@ def generate(ue: Qwen3_5_2b_UnifiedEngine, tokenizer,
             print(f"  Prefill cache HIT → {os.path.basename(cache_path)} "
                   f"({os.path.getsize(cache_path)/1024/1024:.1f} MB, "
                   f"loaded in {load_dt:.2f}s — skipped prefill)")
-        nxt    = loaded["first_token_id"]
-        logits = loaded["final_logits"].unsqueeze(0)  # [1, vocab] shim for later code
+        nxt = loaded["first_token_id"]  # final_logits in the cache is vestigial now
     else:
         # Token-by-token replay of the decoder binary from zero state.
         # Produces S directly in [Dv, Dk] decode form, so no post-prefill
         # transpose step is needed.
-        logits = prefill_via_decode(ue, ids, verbose=verbose,
-                                    vision_tokens=vision_tokens,
-                                    image_token_id=image_token_id)
-        nxt = _sample_next(logits[-1], temperature, top_k)
+        # prefill returns the first generated token directly (HW argmax of the
+        # last prompt token's on-chip LM head — no host sampling).
+        nxt = prefill_via_decode(ue, ids, verbose=verbose,
+                                 vision_tokens=vision_tokens,
+                                 image_token_id=image_token_id)
         if use_prefill_cache:
             t_save = time.time()
+            # final_logits is vestigial under the HW-argmax path (the first token
+            # is prefill's argmax); store a placeholder to keep the cache format.
             ue.save_prefill_state(cache_path, ids.tolist(), ue.max_context,
-                                  nxt, logits[-1])
+                                  nxt, torch.zeros(1))
             if verbose:
                 print(f"  Prefill cache SAVED → {os.path.basename(cache_path)} "
                       f"({os.path.getsize(cache_path)/1024/1024:.1f} MB, "

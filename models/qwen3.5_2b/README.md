@@ -56,7 +56,12 @@ load decoder section @ base
 prefill (replay decoder per prompt token) + decode
 ```
 
-LM-only skips the encoder entirely.
+LM-only **execution** skips the encoder (it is still *built* into the comprehensive
+bin on the first run — see Load-only below — just not run).
+
+The LM head runs **on the FPGA**: after the final norm, a quantized (FP4) matmul of
+the tied embedding produces logits, the per-vocab penalty bias is added as its C
+term, and the hardware argmax returns the next token (no logits read back).
 
 **Load-only:** the **first** run of `test.py` — LM-only *or* VLM — builds the
 encoder + decoder and writes the comprehensive bin (an LM-only first run still
@@ -81,10 +86,28 @@ nothing is recompiled.
    matrix. `setup_only` runs on the load path too, so it "just works." See
    `../../notes/shared_design_notes.md` (Trick 9).
 
+## Sampling — on-FPGA repetition penalty (the only mechanism)
+
+Decode samples **on the FPGA**: the LM head is a quantized (FP4) matmul of the
+tied embedding with a per-vocab penalty bias as its C term (`bias_mode="broadcast_N"`,
+`write_back_disable=True`), and the **hardware argmax** of `logits + bias` returns
+the next token — no logits are read back to the host. The penalty is **ON by
+default** (it gives the model a reasonable, non-looping ending); `--pure-greedy`
+zeroes the bias for bit-identical greedy. The host rebuilds the bias each step as
+`bias[t] = clamp(-α·count[t], min=-cap)` over a window of recent tokens;
+punctuation/whitespace/special tokens are exempt, and a token repeated
+`PEN_LOOP_RUN` times in a row is hard-banned to break stuck loops.
+
 ## Environment toggles (all optional)
 
 | Var | Effect |
 |-----|--------|
+| `Q35_PURE_GREEDY=1` | Disable the repetition penalty (zero bias = bit-identical greedy). |
+| `PEN_ALPHA` | Penalty strength `bias=-α·count` (default `1.0`). |
+| `PEN_CAP` | Penalty floor `clamp(min=-cap)` (default `20.0`). |
+| `REP_WINDOW` | Token-frequency window, last N decoded (default `256`). |
+| `GREEDY_UNTIL` | Pure greedy for the first N decoded tokens (default `8`). |
+| `PEN_LOOP_RUN` | ≥N identical tokens in a row ⇒ hard ban (default `4`). |
 | `VIS_LEGACY=1` | Use the unrolled multi-capture vision encoder instead of the compact §7/§3b one. |
 | `Q35_NO_S7_FLASH=1` | Disable the shared §7 flash subroutine (inline bodies — bigger bin). |
 | `Q35_VIS_LN_STATIC=1` | Static (non-PBI) vision LayerNorm fallback. |
