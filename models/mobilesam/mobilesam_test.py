@@ -4790,6 +4790,7 @@ def main():
             _original_print(f"  Saved {path}")
 
         _save_point_overlay((masks_hw[best] > _MASK_THRESHOLD).cpu().numpy(), "mask_point.png", [0, 255, 100])
+        _original_print(f"TEST_RESULT:{json.dumps({'decoded_text': f'mask_iou={iou_hw[best]:.4f}'})}")
         return
 
     # ---- Execute (HW encoder + AMG decoder) ----
@@ -4816,6 +4817,7 @@ def main():
     # ---- Overlays ----
     _original_print("\nSaving overlays …")
     _save_amg_overlay(image_t, hw_masks,  "mask_hw.png")
+    _original_print(f"TEST_RESULT:{json.dumps({'decoded_text': f'{len(hw_masks)} masks'})}")
 
 
 # ---------------------------------------------------------------------------

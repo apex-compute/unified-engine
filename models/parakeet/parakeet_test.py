@@ -429,6 +429,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.TOKEN_REG = regs.get("TOKEN_REG", 1)
         self.ENC_T_REG = regs.get("ENC_T_REG", 2)
         self.TMP_REG = regs.get("TMP_REG", 3)
+        self.w = {}
     def isa_add_set_core(self, dst_reg_idx, immediate_value, timeout_s=10.0):
         """Set one ISA register to an immediate value via minimal program execution."""
         self.clear_capture_buffer()

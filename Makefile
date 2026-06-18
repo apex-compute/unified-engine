@@ -144,8 +144,14 @@ model_test_help:
 	@echo "  make model_test qwen3_4b nohup               # one model, in background"
 	@echo "  make model_test gemma3 run_from_bin          # reuse cached bin, no rebuild"
 
+_MT_NEW_MODELS := mobilesam locateanything_3b parakeet mobilenetv2_224 mobilenetv2_ssd_640 swin
 model_test_new:
-	python model_auto_test.py --only locateanything_3b parakeet mobilenetv2_224 mobilenetv2_ssd_640 swin
+	@for m in $(_MT_NEW_MODELS); do \
+		echo "--- Randomizing DRAM before $$m ---"; \
+		python randomize_dram.py; \
+		echo "--- Running $$m ---"; \
+		python model_auto_test.py --only $$m; \
+	done
 
-.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test model_test_new model_test_help verbose nohup run_from_bin $(_MT_MODELS)
+.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test model_test_new model_test_help verbose nohup run_from_bin $(_MT_MODELS) $(_MT_NEW_MODELS)
 
