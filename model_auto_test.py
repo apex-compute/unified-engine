@@ -134,12 +134,16 @@ TESTS = [
         "prompt": "If x + 3 = 5, what is x?",
         "pass_check": _check_x_equals_2,
     },
-    # NOTE: smolvlm2 and locateanything_3b are intentionally excluded from the
-    # automated suite. Both run correctly in isolation (smolvlm2 -> "Paris" on a
-    # capability-appropriate prompt; locateanything_3b -> 15 boxes), but produce
-    # degenerate output (immediate EOS / all-"!" tokens) when run back-to-back
-    # after other models, due to cross-model DRAM state contamination. Run them
-    # standalone instead. See conversation notes for details.
+    # NOTE: smolvlm2 is intentionally excluded from the automated suite.
+    # It runs correctly in isolation ("Paris" on a capability-appropriate
+    # prompt) but produces degenerate output (immediate EOS) when run
+    # back-to-back after other models, due to cross-model DRAM state
+    # contamination. Run it standalone instead.
+    {
+        "name": "locateanything_3b",
+        "script": "models/locateanything_3b/locateanything_3b_test.py",
+        "pass_check": _check_locateanything,
+    },
     {
         "name": "parakeet",
         "script": "models/parakeet/parakeet_test.py",
@@ -158,6 +162,11 @@ TESTS = [
     {
         "name": "swin",
         "script": "models/swin/swin_test.py",
+        "pass_check": _check_nonempty,
+    },
+    {
+        "name": "mobilesam",
+        "script": "models/mobilesam/mobilesam_test.py",
         "pass_check": _check_nonempty,
     },
 ]

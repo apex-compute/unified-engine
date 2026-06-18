@@ -57,7 +57,11 @@ class MobileSAM_UE_Run(UnifiedEngine):
     """MobileSAM engine that loads pre-compiled bins (no weight unpacking, no compilation)."""
 
     def __init__(self, clock_period_ns=None):
-        super().__init__(clock_period_ns=clock_period_ns)
+        # MUST match MobileSAM_UE's program base (0xD8000000): the decoder bakes ABSOLUTE
+        # jump addresses (flash subroutines) at compile time, and the tensor region runs to
+        # ~0xD7602780, so the program must load+execute above it. A mismatched base sends every
+        # jump to the wrong address -> hang/garbage.
+        super().__init__(program_dram_base=0xD8000000, clock_period_ns=clock_period_ns)
         self.script_dir = SCRIPT_DIR
         # Hang prevention
         self.start_capture()
@@ -119,12 +123,30 @@ class MobileSAM_UE_Run(UnifiedEngine):
 
     def execute_encoder(self, prog: int, image_t: torch.Tensor) -> None:
         """Execute pre-compiled encoder program on input image."""
+        # Clear stale device state before running (DRAM weights + program persist
+        # across a soft reset). Mirrors MobileSAM_UE.execute_encoder; required or the
+        # encoder's back-to-back PBI sections intermittently emit NaN/Inf.
+        self.software_reset()
         img_hwc = image_t[0].permute(1, 2, 0).contiguous()
         img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, 64, dtype=torch.bfloat16)
         img_pad[:, :3] = img_hwc.reshape(-1, 3)
         self.dma_to_accelerator_memory(self.pe_in_dram, img_pad.reshape(-1))
+        import time, threading, sys
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                sys.stdout.write(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s")
+                sys.stdout.flush()
+                time.sleep(0.5)
+        _timer = threading.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         self.start_execute_from_dram(prog)
         self.wait_queue(120.0)
+        _stop_timer = True
+        _timer.join()
+        sys.stdout.write(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s\n")
+        sys.stdout.flush()
 
     def dma_to_accelerator_memory(self, dma_address, data):
         """Chunked DMA write with flat bf16 handling."""
@@ -226,7 +248,7 @@ def main():
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     # Load image
-    img_path = os.path.join(SCRIPT_DIR, "../../../test_samples/vette.jpg")
+    img_path = os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     if not os.path.exists(img_path):
         _original_print(f"Test image not found: {img_path}")
         return

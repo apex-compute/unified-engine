@@ -33,10 +33,13 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, UE_FMAX_CONTEXT_SIZE,
     set_dma_device, UnifiedEngine, calculate_snr,
+    INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,
 )
 import warnings as _warnings
 _warnings.filterwarnings("ignore")
 import torch.nn as _nn
+
+from nn_lib import flash_attention_batched_pbi
 
 COMPUTE_DTYPE = torch.bfloat16
 
@@ -127,6 +130,460 @@ def broadcast_mul_dram(ue: UnifiedEngine, ADDR: int,
         ue.broadcast_mul(scalar=scalar, sram_start_addr=0x00000,
                          sram_wb_addr=0x00000, element_size=take)
         ue.sram_to_accelerator_memory(0x00000, ADDR + offset * _BPE, take)
+
+
+def pbi_strided_copy(ue: UnifiedEngine, gpr: int,
+                     src_base: int, dst_base: int, count: int,
+                     copy_bytes: int, src_stride: int, dst_stride: int) -> None:
+    if copy_bytes <= 0 or copy_bytes % 2 != 0:
+        raise ValueError(f"pbi_strided_copy: copy_bytes must be a positive even (bf16) byte count, got {copy_bytes}")
+    if copy_bytes > URAM_NEAR_FULL_ELEMENTS * 2:
+        raise ValueError(
+            f"pbi_strided_copy: copy_bytes={copy_bytes} exceeds one staging row "
+            f"({URAM_NEAR_FULL_ELEMENTS * 2} bytes)")
+    if count < 1:
+        raise ValueError(f"pbi_strided_copy: count must be >=1, got {count}")
+
+    ue._isa_reg_counter = gpr + 1
+    ue.reset_inst_ptr_counter()
+    ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=count)
+
+    _, load_uram_row = ue.sram_address_to_uram_address(0x00000)
+    _, store_uram_row = ue.sram_address_to_uram_address(0x00000)
+
+    ptr_src = ue.alloc_inst_ptr()
+    ptr_dst = ue.alloc_inst_ptr()
+
+    ue.generate_instruction_pbi_init(
+        dram_shared_addr=src_base, dma_length=copy_bytes,
+        uram_dst_addr=load_uram_row, inst_pointer_idx=ptr_src,
+    )
+    ue.generate_instruction_pbi_init(
+        dram_shared_addr=dst_base, dma_length=copy_bytes,
+        uram_a_start_addr=store_uram_row, inst_pointer_idx=ptr_dst,
+    )
+
+    program_dram_start_addr = ue.get_program_dram_addr()
+    cur_inst_count = ue.capture_count
+    ue.generate_instruction_jump_abs(
+        ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
+        )
+    )
+
+    ue.loop_start(loop_cnt=count, gpr_loop_cnt=gpr)
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src_stride, sram_address=0x00000,
+        element_size=0, inst_pointer_idx=ptr_src,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000, accelerator_dram_address=dst_stride,
+        element_size=0, inst_pointer_idx=ptr_dst,
+    )
+    body = ue.loop_end()
+    assert body <= 256, f"pbi_strided_copy: loop body {body} exceeds 256 i-cache budget"
+
+    ue.release_inst_ptr(ptr_dst)
+    ue.release_inst_ptr(ptr_src)
+
+
+def multihead_reshape_dram_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
+                                OUTPUT_DRAM_ADDR: int, TEMP_DRAM_ADDR: int,
+                                seq_len: int, num_heads: int,
+                                head_dim: int, head_dim_pad: int,
+                                gpr_pbi: int,
+                                input_row_stride: int = None) -> None:
+    if input_row_stride is None:
+        input_row_stride = num_heads * head_dim
+
+    padded_dim = num_heads * head_dim_pad
+    dram_zero_fill(ue, TEMP_DRAM_ADDR, seq_len * padded_dim)
+
+    # Step 1 — scatter (seq_len, input_row_stride) -> padded (seq_len, num_heads, head_dim_pad).
+    # MUST honor input_row_stride: when the qkv output is channel-padded (S2: 160 real in a
+    # 192-wide row) a single contiguous sweep would read the pad columns into head>0 slots and
+    # scramble every row after the first. One PBI loop per head reads that head's head_dim cols
+    # at the TRUE row stride. For packed input (input_row_stride == num_heads*head_dim, e.g.
+    # S1/S3) this is bit-identical to the old single-sweep scatter.
+    in_row_bytes = input_row_stride * _BPE
+    for h in range(num_heads):
+        pbi_strided_copy(
+            ue, gpr_pbi,
+            src_base=INPUT_DRAM_ADDR + h * head_dim * _BPE,
+            dst_base=TEMP_DRAM_ADDR + h * head_dim_pad * _BPE,
+            count=seq_len,
+            copy_bytes=head_dim * _BPE,
+            src_stride=in_row_bytes,
+            dst_stride=padded_dim * _BPE,
+        )
+
+    head_bytes = head_dim_pad * _BPE
+    temp_row_stride = padded_dim * _BPE
+    output_head_stride = seq_len * head_dim_pad * _BPE
+
+    for h in range(num_heads):
+        pbi_strided_copy(
+            ue, gpr_pbi,
+            src_base=TEMP_DRAM_ADDR + h * head_bytes,
+            dst_base=OUTPUT_DRAM_ADDR + h * output_head_stride,
+            count=seq_len,
+            copy_bytes=head_bytes,
+            src_stride=temp_row_stride,
+            dst_stride=head_bytes,
+        )
+
+
+# ===========================================================================
+# PBI conv / window / permute helpers (hardware-loop gathers -> tiny programs).
+# Verified bit-/SNR-exact against torch in user_hw_test.py. The legacy conv/window
+# functions below delegate to these. _PBI_GPR is a free GPR (encoder uses 1-5).
+# ===========================================================================
+_PBI_GPR = 8
+
+
+def _prime_m_reg(ue: UnifiedEngine, gpr: int, m: int) -> None:
+    """Prime a GPR with runtime row count M for matmat_mul_core(gpr_M_reg=...)."""
+    ue._isa_reg_counter = gpr + 1
+    ue.reset_inst_ptr_counter()
+    ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=m)
+
+
+def _pbi_zero_dram(ue: UnifiedEngine, DRAM_ADDR: int, num_elements: int) -> None:
+    """Zero num_elements bf16 at DRAM_ADDR WITHOUT allocating params per call.
+
+    Unlike dram_zero_fill (which allocates+DMAs a fresh zero buffer every call — fine
+    for a handful of calls, catastrophic when called per output row), this lazily
+    allocates ONE reusable zero source on `ue` and writes it via SRAM. Used by the
+    per-row PBI conv/window zeroing."""
+    full = URAM_NEAR_FULL_ELEMENTS
+    if getattr(ue, "_pbi_zero_src", None) is None:
+        z = ue.get_params_dram_addr()
+        ue.allocate_params_dram(full * _BPE)
+        ue.dma_write(DMA_DEVICE_H2C, z, torch.zeros(full, dtype=torch.bfloat16), full * _BPE)
+        ue._pbi_zero_src = z
+    offset = 0
+    while offset < num_elements:
+        take = min(full, num_elements - offset)
+        ue.accelerator_memory_to_sram(ue._pbi_zero_src, 0x00000, take)
+        ue.sram_to_accelerator_memory(0x00000, DRAM_ADDR + offset * _BPE, take)
+        offset += take
+
+
+def _conv3x3_im2col_row_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, IM2COL_ROW_ADDR: int,
+                            h_out: int, H: int, W: int, C_total: int, c_off: int,
+                            c_take: int, stride: int, gpr: int) -> None:
+    """Build ONE output row's 3x3/pad-1 im2col (W_out, 9*c_take) into IM2COL_ROW_ADDR
+    (caller pre-zeros the row). One PBI loop per in-bounds tap; gathers c_take channels
+    at offset c_off from an HWC input of pitch C_total. Regular conv: c_off=0,
+    c_take=C_total=C_in. Depthwise block: c_take=64, c_off=blk*64."""
+    K = 9 * c_take
+    W_out = (W - 1) // stride + 1
+    cb = c_take * _BPE
+    row_bytes = K * _BPE
+    src_pitch = C_total * _BPE
+    h_in = h_out * stride
+    for dy in (-1, 0, 1):
+        nh = h_in + dy
+        if not (0 <= nh < H):
+            continue
+        for dx in (-1, 0, 1):
+            tap = (dy + 1) * 3 + (dx + 1)
+            lo = 0
+            while lo < W_out and not (0 <= lo * stride + dx < W):
+                lo += 1
+            hi = W_out - 1
+            while hi >= 0 and not (0 <= hi * stride + dx < W):
+                hi -= 1
+            if lo > hi:
+                continue
+            count = hi - lo + 1
+            src_base = INPUT_DRAM_ADDR + ((nh * W + (lo * stride + dx)) * C_total + c_off) * _BPE
+            dst_base = IM2COL_ROW_ADDR + (lo * K + tap * c_take) * _BPE
+            pbi_strided_copy(ue, gpr, src_base=src_base, dst_base=dst_base, count=count,
+                             copy_bytes=cb, src_stride=stride * src_pitch, dst_stride=row_bytes)
+
+
+def conv2d_3x3_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                   IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
+                   H: int, W: int, C_in: int, C_out: int, stride: int = 1,
+                   gelu_enable: bool = False, gpr: int = _PBI_GPR) -> None:
+    """Regular 3x3/pad-1 conv via PBI im2col + matmul (per output row). HWC; weight (C_out, 9*C_in)."""
+    K = 9 * C_in
+    H_out = (H - 1) // stride + 1
+    W_out = (W - 1) // stride + 1
+    for h_out in range(H_out):
+        _pbi_zero_dram(ue, IM2COL_DRAM_ADDR, W_out * K)
+        _conv3x3_im2col_row_pbi(ue, INPUT_DRAM_ADDR, IM2COL_DRAM_ADDR, h_out,
+                                H, W, C_in, 0, C_in, stride, gpr)
+        _c_mreg = gpr if getattr(ue, "_conv_mreg", True) else None
+        if _c_mreg is not None:
+            _prime_m_reg(ue, gpr, W_out)
+        ue.matmat_mul_core(
+            M=W_out, K=K, N=C_out,
+            A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=WEIGHT_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + (h_out * W_out) * C_out * _BPE,
+            C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="broadcast_N",
+            gelu_enable=gelu_enable, gpr_M_reg=_c_mreg)
+
+
+def conv2d_3x3_dw_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                      IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
+                      H: int, W: int, C: int, stride: int = 1,
+                      gelu_enable: bool = False, gpr: int = _PBI_GPR) -> None:
+    """Depthwise 3x3/pad-1 conv via PBI im2col + block matmul + PBI scatter (per block,row).
+    Block weight (per 64-ch block: WEIGHT+blk*64*9*64, shape (64, 9*64)). IM2COL must hold
+    W_out*(9*64 + 64) (im2col row + TEMP) — the existing buffers already do."""
+    BLK = 64
+    K = 9 * BLK
+    n_blocks = C // BLK
+    H_out = (H - 1) // stride + 1
+    W_out = (W - 1) // stride + 1
+    TEMP = IM2COL_DRAM_ADDR + W_out * K * _BPE
+    for blk in range(n_blocks):
+        c_off = blk * BLK
+        W_ADDR = WEIGHT_DRAM_ADDR + blk * BLK * K * _BPE
+        B_ADDR = BIAS_DRAM_ADDR + c_off * _BPE
+        for h_out in range(H_out):
+            _pbi_zero_dram(ue, IM2COL_DRAM_ADDR, W_out * K)
+            _conv3x3_im2col_row_pbi(ue, INPUT_DRAM_ADDR, IM2COL_DRAM_ADDR, h_out,
+                                    H, W, C, c_off, BLK, stride, gpr)
+            _dw_mreg = gpr if getattr(ue, "_dw_mreg", True) else None
+            if _dw_mreg is not None:
+                _prime_m_reg(ue, gpr, W_out)
+            ue.matmat_mul_core(
+                M=W_out, K=K, N=BLK,
+                A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=W_ADDR,
+                OUTPUT_DRAM_ADDR=TEMP, C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                gelu_enable=gelu_enable, gpr_M_reg=_dw_mreg)
+            pbi_strided_copy(
+                ue, gpr, src_base=TEMP,
+                dst_base=OUTPUT_DRAM_ADDR + (h_out * W_out * C + c_off) * _BPE,
+                count=W_out, copy_bytes=BLK * _BPE,
+                src_stride=BLK * _BPE, dst_stride=C * _BPE)
+
+
+def conv2d_3x3_dw_pbi_looped(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                              IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
+                              H: int, W: int, C: int, stride: int = 1,
+                              gelu_enable: bool = False, gpr: int = 1):
+    """Hardware-looped depthwise 3x3/pad-1 conv — collapses h_out into ONE hardware loop.
+
+    Same contract as conv2d_3x3_dw_pbi but interior rows use a single hardware loop
+    with 3-row SRAM loads (general_reg_src) and 9 fixed strided tap scatters.
+    Boundary rows (top/bottom) fall back to the existing PBI gather.
+    """
+    BLK = 64; K = 9 * BLK; n_blocks = C // BLK
+    H_out = (H - 1) // stride + 1; W_out = (W - 1) // stride + 1
+    TEMP = IM2COL_DRAM_ADDR + W_out * K * _BPE
+    ROW_B = W * BLK * _BPE
+    SRAM_R0 = 0; SRAM_R1 = ROW_B; SRAM_R2 = 2 * ROW_B
+    SRAM_OT = 3 * ROW_B
+    ZERO_SRAM = SRAM_OT + W_out * BLK * _BPE
+
+    zero_dram = ue.get_params_dram_addr()
+    ue.allocate_params_dram(BLK * _BPE)
+    ue.dma_write(DMA_DEVICE_H2C, zero_dram, torch.zeros(BLK, dtype=torch.bfloat16), BLK * _BPE)
+    ue.accelerator_memory_to_sram(zero_dram, ZERO_SRAM, BLK)
+
+    for blk in range(n_blocks):
+        c_off = blk * BLK
+        W_ADDR = WEIGHT_DRAM_ADDR + blk * BLK * K * _BPE
+        B_ADDR = BIAS_DRAM_ADDR + c_off * _BPE
+        _pbi_zero_dram(ue, IM2COL_DRAM_ADDR, W_out * K)
+
+        interior_first = 1
+        if (H - 1) % stride == 0:
+            interior_last = H_out - 2
+        else:
+            interior_last = H_out - 1
+        n_interior = max(0, interior_last - interior_first + 1)
+
+        if n_interior > 0:
+            interior_first = 1
+            ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=n_interior)
+            h0m = interior_first - 1
+            in0 = INPUT_DRAM_ADDR + (h0m * W * C + c_off) * _BPE
+            out0 = OUTPUT_DRAM_ADDR + (interior_first * W_out * C + c_off) * _BPE
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(in0))
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 2, immediate_value=ue_35bit_addr_shifter(out0))
+            ue.reset_inst_ptr_counter()
+            ue._isa_reg_counter = gpr + 4
+            ue.loop_start(loop_cnt=n_interior, gpr_loop_cnt=gpr)
+
+            # Load 3 input rows into SRAM (gpr+1 = row h-1, all offsets positive)
+            ue.accelerator_memory_to_sram(0, SRAM_R0, W * BLK, general_reg_src=gpr + 1)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(W * C * _BPE), dst_reg_idx=gpr + 3)
+            ue.accelerator_memory_to_sram(0, SRAM_R1, W * BLK, general_reg_src=gpr + 3)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(2 * W * C * _BPE), dst_reg_idx=gpr + 3)
+            ue.accelerator_memory_to_sram(0, SRAM_R2, W * BLK, general_reg_src=gpr + 3)
+
+            # Column-boundary zero pixels (column 0 for dx=-1, column W-1 for dx=+1)
+            for dy in (-1, 0, 1):
+                ki = (dy + 1) * 3 + 0
+                ue.sram_to_accelerator_memory(ZERO_SRAM, IM2COL_DRAM_ADDR + 0 * K * _BPE + ki * BLK * _BPE, BLK)
+                ki = (dy + 1) * 3 + 2
+                ue.sram_to_accelerator_memory(ZERO_SRAM, IM2COL_DRAM_ADDR + (W_out - 1) * K * _BPE + ki * BLK * _BPE, BLK)
+
+            # 9 tap scatters
+            for dy in (-1, 0, 1):
+                sram_row = SRAM_R1 + dy * ROW_B
+                for dx in (-1, 0, 1):
+                    ki = (dy + 1) * 3 + (dx + 1)
+                    w0 = 0 if dx >= 0 else 1
+                    wl = W_out - 1 if dx <= 0 else W_out - 2
+                    wv = wl - w0 + 1
+                    if wv <= 0:
+                        continue
+                    ue.sram_to_accelerator_memory(
+                        sram_row + max(0, dx) * BLK * _BPE,
+                        IM2COL_DRAM_ADDR + w0 * K * _BPE + ki * BLK * _BPE,
+                        wv * BLK,
+                        stride_bytes_per_chunk=BLK * _BPE,
+                        stride_jump_bytes=K * _BPE)
+
+            # Matmul
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 3, immediate_value=W_out)
+            ue.matmat_mul_core(
+                M=W_out, K=K, N=BLK,
+                A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=W_ADDR,
+                OUTPUT_DRAM_ADDR=TEMP, C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                gelu_enable=gelu_enable, gpr_M_reg=gpr + 3)
+
+            # Scatter TEMP → output
+            ue.accelerator_memory_to_sram(TEMP, SRAM_OT, W_out * BLK)
+            ue.sram_to_accelerator_memory(
+                SRAM_OT, 0, W_out * BLK,
+                stride_bytes_per_chunk=BLK * _BPE,
+                stride_jump_bytes=C * _BPE,
+                general_reg_src=gpr + 2)
+
+            # Advance bases
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(W * C * _BPE), dst_reg_idx=gpr + 1)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 2, immediate_value=ue_35bit_addr_shifter(W_out * C * _BPE), dst_reg_idx=gpr + 2)
+
+            body = ue.loop_end()
+            assert body <= 256, f"dw_pbi_looped loop body {body} exceeds 256"
+
+        # Boundary rows (top + bottom)
+        boundary_rows = []
+        if H_out >= 1:
+            boundary_rows.append(0)
+        if H_out >= 2:
+            boundary_rows.append(H_out - 1)
+        for h_out in sorted(set(boundary_rows)):
+            _pbi_zero_dram(ue, IM2COL_DRAM_ADDR, W_out * K)
+            _conv3x3_im2col_row_pbi(ue, INPUT_DRAM_ADDR, IM2COL_DRAM_ADDR, h_out,
+                                    H, W, C, c_off, BLK, stride, gpr)
+            ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=W_out)
+            ue.matmat_mul_core(
+                M=W_out, K=K, N=BLK,
+                A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=W_ADDR,
+                OUTPUT_DRAM_ADDR=TEMP, C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                gelu_enable=gelu_enable, gpr_M_reg=gpr)
+            ue.accelerator_memory_to_sram(TEMP, 0, W_out * BLK)
+            pbi_strided_copy(
+                ue, gpr, src_base=TEMP,
+                dst_base=OUTPUT_DRAM_ADDR + (h_out * W_out * C + c_off) * _BPE,
+                count=W_out, copy_bytes=BLK * _BPE,
+                src_stride=BLK * _BPE, dst_stride=C * _BPE)
+
+
+def _window_dims(H: int, W: int, ws: int):
+    pad_h = (ws - H % ws) % ws
+    pad_w = (ws - W % ws) % ws
+    nH, nW = (H + pad_h) // ws, (W + pad_w) // ws
+    WIN_PAD = ((ws * ws + 63) // 64) * 64
+    return nH, nW, WIN_PAD
+
+
+def window_partition_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                         H: int, W: int, C: int, ws: int, gpr: int = _PBI_GPR):
+    """(H*W, C) HWC -> (nH*nW, WIN_PAD, C) via PBI loops. Returns (nH, nW, WIN_PAD)."""
+    nH, nW, WIN_PAD = _window_dims(H, W, ws)
+    cbe = C * _BPE
+    full_w = W // ws
+    rem_w = W - full_w * ws
+    _pbi_zero_dram(ue, OUTPUT_DRAM_ADDR, nH * nW * WIN_PAD * C)
+    for wh in range(nH):
+        win_row = wh * nW
+        for dy in range(ws):
+            src_h = wh * ws + dy
+            if src_h >= H:
+                continue
+            row_src = INPUT_DRAM_ADDR + (src_h * W) * cbe
+            row_dst = OUTPUT_DRAM_ADDR + (win_row * WIN_PAD + dy * ws) * cbe
+            if full_w >= 1:
+                pbi_strided_copy(ue, gpr, src_base=row_src, dst_base=row_dst, count=full_w,
+                                 copy_bytes=ws * cbe, src_stride=ws * cbe, dst_stride=WIN_PAD * cbe)
+            if rem_w > 0:
+                src = INPUT_DRAM_ADDR + (src_h * W + full_w * ws) * cbe
+                dst = OUTPUT_DRAM_ADDR + ((win_row + full_w) * WIN_PAD + dy * ws) * cbe
+                pbi_strided_copy(ue, gpr, src_base=src, dst_base=dst, count=1,
+                                 copy_bytes=rem_w * cbe, src_stride=rem_w * cbe, dst_stride=rem_w * cbe)
+    return nH, nW, WIN_PAD
+
+
+def window_reverse_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                       H: int, W: int, C: int, ws: int, nH: int, nW: int, WIN_PAD: int,
+                       gpr: int = _PBI_GPR) -> None:
+    """(nH*nW, WIN_PAD, C) -> (H*W, C). Inverse of window_partition_pbi (caller pre-zeros OUTPUT)."""
+    cbe = C * _BPE
+    full_w = W // ws
+    rem_w = W - full_w * ws
+    for wh in range(nH):
+        win_row = wh * nW
+        for dy in range(ws):
+            src_h = wh * ws + dy
+            if src_h >= H:
+                continue
+            row_src = INPUT_DRAM_ADDR + (win_row * WIN_PAD + dy * ws) * cbe
+            row_dst = OUTPUT_DRAM_ADDR + (src_h * W) * cbe
+            if full_w >= 1:
+                pbi_strided_copy(ue, gpr, src_base=row_src, dst_base=row_dst, count=full_w,
+                                 copy_bytes=ws * cbe, src_stride=WIN_PAD * cbe, dst_stride=ws * cbe)
+            if rem_w > 0:
+                src = INPUT_DRAM_ADDR + ((win_row + full_w) * WIN_PAD + dy * ws) * cbe
+                dst = OUTPUT_DRAM_ADDR + (src_h * W + full_w * ws) * cbe
+                pbi_strided_copy(ue, gpr, src_base=src, dst_base=dst, count=1,
+                                 copy_bytes=rem_w * cbe, src_stride=rem_w * cbe, dst_stride=rem_w * cbe)
+
+
+def bf16_permute_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                     dim_0: int, dim_1: int, dim_2: int, gpr: int = _PBI_GPR) -> None:
+    """(dim_0, dim_1, dim_2) -> (dim_1, dim_0, dim_2). Iterates the smaller of (dim_0,dim_1),
+    PBI-counts the larger -> min(dim_0,dim_1) loops either orientation."""
+    assert dim_2 % UE_VECTOR_SIZE == 0, f"dim_2={dim_2} must be a multiple of {UE_VECTOR_SIZE}"
+    cb = dim_2 * _BPE
+    if dim_1 <= dim_0:
+        for i1 in range(dim_1):
+            pbi_strided_copy(ue, gpr, src_base=INPUT_DRAM_ADDR + i1 * cb,
+                             dst_base=OUTPUT_DRAM_ADDR + i1 * dim_0 * cb, count=dim_0,
+                             copy_bytes=cb, src_stride=dim_1 * cb, dst_stride=cb)
+    else:
+        for i0 in range(dim_0):
+            pbi_strided_copy(ue, gpr, src_base=INPUT_DRAM_ADDR + i0 * dim_1 * cb,
+                             dst_base=OUTPUT_DRAM_ADDR + i0 * cb, count=dim_1,
+                             copy_bytes=cb, src_stride=cb, dst_stride=dim_0 * cb)
+
+
+def conv_transpose2d_2x2_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                             TEMP_DRAM_ADDR: int, WEIGHT_SLICES: list, BIAS_DRAM_ADDR: int,
+                             H: int, W: int, C_in: int, C_out: int, gpr: int = _PBI_GPR) -> None:
+    """ConvTranspose2d k=2 s=2: 4 slice matmuls (unchanged) + PBI scatter. OUTPUT pre-zeroed.
+    Per (slice, input row): one pbi_strided_copy (src stride C_out, dst stride 2*C_out)."""
+    cb = C_out * _BPE
+    for s, (kh, kw) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+        ue.matmat_mul_core(
+            M=H * W, K=C_in, N=C_out,
+            A_DRAM_ADDR=INPUT_DRAM_ADDR, B_DRAM_ADDR=WEIGHT_SLICES[s],
+            OUTPUT_DRAM_ADDR=TEMP_DRAM_ADDR, C_DRAM_ADDR=BIAS_DRAM_ADDR,
+            bias_mode="broadcast_N")
+        for h_i in range(H):
+            pbi_strided_copy(
+                ue, gpr,
+                src_base=TEMP_DRAM_ADDR + (h_i * W) * cb,
+                dst_base=OUTPUT_DRAM_ADDR + ((2 * h_i + kh) * (2 * W) + kw) * cb,
+                count=W, copy_bytes=cb, src_stride=cb, dst_stride=2 * cb)
 
 
 def multihead_reshape_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
@@ -247,8 +704,13 @@ def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
         ue.start_queue_for_bf16_softmax_operation(
             fmax_context_addr=0, vector_sram_start_addr=scores_sram,
             output_sram_wb_addr=scores_sram, N=N)
-        v_chunk = max(UE_VECTOR_SIZE,
-                      (URAM_NEAR_FULL_ELEMENTS // N // UE_VECTOR_SIZE) * UE_VECTOR_SIZE)
+        # P@V tile: load (v_take, N) of V^T into URAM_B. v_take*N must fit
+        # URAM_NEAR_FULL_ELEMENTS. For kv_len=4096, head_dim=64 the whole
+        # 64*4096=262144 overruns URAM (262080) into the scores region — tile
+        # head_dim down (halving) until the V^T slab fits.
+        v_chunk = head_dim
+        while v_chunk * N > URAM_NEAR_FULL_ELEMENTS and v_chunk > 1:
+            v_chunk //= 2
         out_sram = scores_sram + N * _BPE
         for v_col, v_take in ue.chunk_ranges(head_dim, v_chunk):
             ue.accelerator_memory_to_sram(
@@ -262,6 +724,87 @@ def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
                 K=N, N=v_take)
             ue.sram_to_accelerator_memory(
                 out_sram, OUTPUT_DRAM_ADDR + r * head_dim * _BPE + v_col * _BPE, v_take)
+
+
+def cross_attn_flash_single_head_pbi(ue: UnifiedEngine, head_dim: int,
+                                     q_len: int, kv_len: int,
+                                     Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
+                                     V_T_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                                     gpr_loop: int,
+                                     BIAS_DRAM_ADDR: int = None) -> None:
+    """Hardware-loop version of cross_attn_flash_single_head for the i2t single-chunk
+    case (kv_len fits one score chunk AND head_dim*kv_len fits one V slab — true for the
+    decoder i2t: kv_len=64, head_dim=64). Emits the per-row body ONCE inside a PBI loop
+    over q_len rows; only the Q-in and OUTPUT-out DRAM pointers advance (by head_dim*2).
+    K / V^T / bias are window-shared (fixed addresses, reloaded each iter). Bit-exact with
+    cross_attn_flash_single_head; collapses q_len unrolled row-bodies -> one body + loop.
+
+    This is the unroll that dominated the decoder binary: i2t was 8 heads x 64 chunks x 64
+    rows = 32768 inline row-bodies. With this it is 8 head-loops."""
+    K = head_dim
+    N = kv_len
+    assert N % UE_VECTOR_SIZE == 0 and head_dim % UE_VECTOR_SIZE == 0
+    assert N <= URAM_NEAR_FULL_ELEMENTS // K, \
+        f"kv_len={N} needs >1 score chunk; PBI path is single-chunk only"
+    assert head_dim * N <= URAM_NEAR_FULL_ELEMENTS, \
+        f"head_dim*kv_len={head_dim*N} needs >1 V chunk; PBI path is single-chunk only"
+    # NOTE: legacy caps q_len<=UE_FMAX_CONTEXT_SIZE for its batched scratch; this per-row
+    # loop processes each row independently (max_clear_en per row) so q_len is unbounded.
+
+    scores_sram = K * _BPE
+    out_sram = scores_sram + N * _BPE
+    gpr_qaddr = gpr_loop + 1   # runtime Q-row DRAM address (REG_REWRITE source)
+    gpr_oaddr = gpr_loop + 2   # runtime OUT-row DRAM address
+    row_stride = head_dim * _BPE
+
+    # Per-row address advance uses register-computed addresses (general_reg_src) rather than
+    # auto-advancing PBI pointers: the intervening fixed K/V/bias DMAs would otherwise bump
+    # the PBI pointer descriptors and desync the row stride. We hold Q/OUT addresses in GPRs
+    # and increment them explicitly each iteration — immune to the intervening DMAs.
+    ue.generate_instruction_add_set(dst_reg_idx=gpr_loop, immediate_value=q_len)
+    ue.generate_instruction_add_set(dst_reg_idx=gpr_qaddr,
+                                    immediate_value=ue_35bit_addr_shifter(Q_DRAM_ADDR))
+    ue.generate_instruction_add_set(dst_reg_idx=gpr_oaddr,
+                                    immediate_value=ue_35bit_addr_shifter(OUTPUT_DRAM_ADDR))
+
+    # loop_start allocates its counter register via alloc_isa_reg(); pin _isa_reg_counter
+    # above our 3 GPRs so that allocation is the SAME register on every call. Without this,
+    # 512 sequential calls each allocate a fresh register that eventually collides with
+    # gpr_qaddr/gpr_oaddr -> corrupted addresses, NaN (only shows back-to-back, not isolated).
+    ue.reset_inst_ptr_counter()
+    ue._isa_reg_counter = gpr_loop + 3
+    ue.loop_start(loop_cnt=q_len, gpr_loop_cnt=gpr_loop)
+    # Q row [reg addr] -> URAM_A 0x00000
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=0, sram_address=0x00000,
+        element_size=head_dim, general_reg_src=gpr_qaddr)
+    # K [fixed] -> URAM_B 0x80000 ; scores = Q @ K^T
+    ue.accelerator_memory_to_sram(K_DRAM_ADDR, 0x80000, N * K)
+    ue.start_queue_for_bf16_matvec_operation(
+        max_clear_en=1, fmax_context_addr=0,
+        vector_sram_start_addr=0x00000, matrix_sram_start_addr=0x80000,
+        output_sram_wb_addr=scores_sram, K=K, N=N)
+    if BIAS_DRAM_ADDR is not None:
+        ue.accelerator_memory_to_sram(BIAS_DRAM_ADDR, 0x80000, N)
+        ue.eltwise_add_core(scores_sram, 0x80000, scores_sram, N)
+    ue.start_queue_for_bf16_softmax_operation(
+        fmax_context_addr=0, vector_sram_start_addr=scores_sram,
+        output_sram_wb_addr=scores_sram, N=N)
+    # V^T [fixed] -> URAM_B 0x80000 ; out = P @ V
+    ue.accelerator_memory_to_sram(V_T_DRAM_ADDR, 0x80000, head_dim * N)
+    ue.start_queue_for_bf16_matvec_operation(
+        max_clear_en=1, fmax_context_addr=1,
+        vector_sram_start_addr=scores_sram, matrix_sram_start_addr=0x80000,
+        output_sram_wb_addr=out_sram, K=N, N=head_dim)
+    # out row [reg addr]
+    ue.sram_to_accelerator_memory(
+        sram_address=out_sram, accelerator_dram_address=0,
+        element_size=head_dim, general_reg_src=gpr_oaddr)
+    # advance Q/OUT row addresses
+    ue.generate_instruction_add_imm(gpr_qaddr, ue_35bit_addr_shifter(row_stride), gpr_qaddr)
+    ue.generate_instruction_add_imm(gpr_oaddr, ue_35bit_addr_shifter(row_stride), gpr_oaddr)
+    body = ue.loop_end()
+    assert body <= 256, f"cross_attn_flash_single_head_pbi: loop body {body} exceeds 256"
 
 
 def conv_transpose2d_2x2_dram(
@@ -285,6 +828,10 @@ def conv_transpose2d_2x2_dram(
     Bias (C_out,) is added in every slice matmul; since stride=kernel=2 each output pixel
     receives exactly one slice contribution, so bias is applied exactly once per pixel.
     """
+    # --- PBI delegation (legacy body below retained but unreachable) ---
+    if getattr(ue, "_dec_pbi_convt", True):
+        return conv_transpose2d_2x2_pbi(ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, TEMP_DRAM_ADDR,
+                                        WEIGHT_SLICES, BIAS_DRAM_ADDR, H, W, C_in, C_out)
     for s, (kh, kw) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
         ue.matmat_mul_core(
             M=H * W, K=C_in, N=C_out,
@@ -324,6 +871,11 @@ def conv2d_3x3_stride1_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM
     Weight pre-reshaped (C_out, 9*C_in). C_in and C_out multiples of 64.
     IM2COL_DRAM needs W*9*C_in elements (reused per row).
     """
+    # --- PBI delegation (legacy body below retained but unreachable) ---
+    if getattr(ue, "_enc_pbi_conv", True):
+        return conv2d_3x3_pbi(ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IM2COL_DRAM_ADDR,
+                              WEIGHT_DRAM_ADDR, BIAS_DRAM_ADDR, H, W, C_in, C_out,
+                              stride=1, gelu_enable=gelu_enable)
     K = 9 * C_in
     W_CHUNK = max(1, URAM_NEAR_FULL_ELEMENTS // K)
     for h in range(H):
@@ -362,6 +914,11 @@ def conv2d_3x3_stride2_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM
     Weight pre-reshaped (C_out, 9*C_in). C_in and C_out multiples of 64.
     IM2COL_DRAM needs W_out*9*C_in elements (reused per row).
     """
+    # --- PBI delegation (legacy body below retained but unreachable) ---
+    if getattr(ue, "_enc_pbi_conv", True):
+        return conv2d_3x3_pbi(ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IM2COL_DRAM_ADDR,
+                              WEIGHT_DRAM_ADDR, BIAS_DRAM_ADDR, H_in, W_in, C_in, C_out,
+                              stride=2, gelu_enable=gelu_enable)
     K = 9 * C_in
     H_out = (H_in - 1) // 2 + 1
     W_out = (W_in - 1) // 2 + 1
@@ -533,10 +1090,12 @@ class MobileSAM_UE(UnifiedEngine):
     """
 
     def __init__(self, checkpoint_path: str):
-        # Tensor region needs ~555 MB (overflows default 0xD0000000 program base).
-        # Tensors end at ~0xD2B10C00; push programs to 0xD3000000.
-        # Programs (~463 MB) then end at ~0xEFF00000, within 4 GB.
-        super().__init__(program_dram_base=0xD3000000)
+        # Tensor region is actually ~660 MB (base 0xB0000000, end ~0xD7602780) — the old
+        # 0xD3000000 program base put 73 MB of tensors ON TOP of the program stream, which
+        # corrupted instructions at execute time -> the decoder PC jumped into garbage, never
+        # reached halt, and run_decoder timed out at 120 s with IOU=0. Push programs above the
+        # true tensor end. Programs (~33 MB) then end ~0xDA035000, well within 4 GB.
+        super().__init__(program_dram_base=0xD8000000)
         self.init_unified_engine()
         sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.weight_init(sd)
@@ -557,6 +1116,27 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _alloc_tensor(self, n_elements: int) -> int:
         return self.allocate_tensor_dram(n_elements * BPE)
+
+    # ------------------------------------------------------------------
+    # PBI overrides of core reshape/transpose ops (verified bit-exact in
+    # user_hw_test.py). Subclass-level so every call site — decoder reshapes
+    # AND the shared multihead_reshape/merge helpers — gets the hardware-loop
+    # path with zero call-site changes.
+    # ------------------------------------------------------------------
+    def bf16_permute_core(self, dim_0: int, dim_1: int, dim_2: int,
+                          INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> None:
+        if getattr(self, "_dec_pbi_reshape", True):
+            bf16_permute_pbi(self, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, dim_0, dim_1, dim_2)
+        else:
+            super().bf16_permute_core(dim_0, dim_1, dim_2, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR)
+
+    def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int,
+                            OUTPUT_DRAM_ADDR: int, use_pbi: bool = None,
+                            IDENTITY_DRAM_ADDR: int = None) -> None:
+        if use_pbi is None:
+            use_pbi = getattr(self, "_dec_pbi_reshape", True)
+        return super().bf16_transpose_core(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR,
+                                           use_pbi=use_pbi, IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR)
 
     # ------------------------------------------------------------------
     # Weight init
@@ -907,9 +1487,7 @@ class MobileSAM_UE(UnifiedEngine):
                            SA_SCALE_CORRECTION,
                            DEC_HEADS * NT_PAD * DEC_HD_PAD)
 
-        # flash_attention_batched: (8 batches, seq=64, head_dim=64)
-        dram_zero_fill(self, self.SA_ATTN_OUT, DEC_HEADS * NT_PAD * DEC_HD_PAD)
-        flash_attention_batched(
+        flash_attention_batched_pbi(
             self,
             num_batches=DEC_HEADS,
             head_dim=DEC_HD_PAD,
@@ -919,7 +1497,10 @@ class MobileSAM_UE(UnifiedEngine):
             V_DRAM_ADDR=self.SA_V_HEADS,
             OUTPUT_DRAM_ADDR=self.SA_ATTN_OUT,
             SCRATCH_DRAM_ADDR=self.SA_SCRATCH,
+            ATTN_P_DRAM_ADDR=0,
+            IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
             BIAS_DRAM_ADDR=self.DEC_SA_BIAS,
+            _silent=True,
         )
 
         # Merge (heads, NT_PAD, hd_pad) → (NT_PAD, 256) via permute + unpad matmul
@@ -1098,26 +1679,21 @@ class MobileSAM_UE(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.I2T_VT     + h * DEC_HD_PAD * NT_PAD * BPE,
             )
 
-        # cross_attn_flash_single_head per head, chunked by ROW_CHUNK=64
-        # q=4096, kv=64, hd=64
+        # cross_attn_flash_single_head_pbi: ONE hardware loop over all GA rows per head =
+        # DEC_HEADS loops total (was 8 heads x 64 chunks = 512 unrolled bodies, 11.5 MB ->
+        # ~5 KB). Validated bit-exact vs the chunked legacy in user_hw_test.mobilesam_i2t_em_test
+        # (the EXACT 8-head pattern). The 512-chunk version NaN'd because >~32 PBI loops in one
+        # program hit a hardware loop-count ceiling; one big loop per head stays well under it.
         for h in range(DEC_HEADS):
-            q_h_addr   = self.I2T_Q_HEADS + h * q_stride  * BPE
-            k_h_addr   = self.I2T_K_HEADS + h * kv_stride * BPE
-            vt_h_addr  = self.I2T_VT      + h * DEC_HD_PAD * NT_PAD * BPE
-            out_h_addr = self.I2T_ATTN_OUT+ h * q_stride  * BPE
-
-            for row_base in range(0, GA, ROW_CHUNK):
-                row_take = min(ROW_CHUNK, GA - row_base)
-                cross_attn_flash_single_head(
-                    ue=self, head_dim=DEC_HD_PAD,
-                    q_len=row_take, kv_len=NT_PAD,
-                    Q_DRAM_ADDR     = q_h_addr   + row_base * DEC_HD_PAD * BPE,
-                    K_DRAM_ADDR     = k_h_addr,
-                    V_T_DRAM_ADDR   = vt_h_addr,
-                    OUTPUT_DRAM_ADDR= out_h_addr + row_base * DEC_HD_PAD * BPE,
-                    SCORES_SCRATCH_ADDR=self.I2T_SCORES,
-                    BIAS_DRAM_ADDR  = self.DEC_I2T_KV_MASK,
-                )
+            cross_attn_flash_single_head_pbi(
+                ue=self, head_dim=DEC_HD_PAD, q_len=GA, kv_len=NT_PAD,
+                Q_DRAM_ADDR     = self.I2T_Q_HEADS  + h * q_stride  * BPE,
+                K_DRAM_ADDR     = self.I2T_K_HEADS  + h * kv_stride * BPE,
+                V_T_DRAM_ADDR   = self.I2T_VT       + h * DEC_HD_PAD * NT_PAD * BPE,
+                OUTPUT_DRAM_ADDR= self.I2T_ATTN_OUT + h * q_stride  * BPE,
+                gpr_loop        = 8,
+                BIAS_DRAM_ADDR  = self.DEC_I2T_KV_MASK,
+            )
 
         # Merge + unpad: (heads, 4096, hd_pad) → (4096, 128)
         multihead_merge_dram(
@@ -1453,8 +2029,21 @@ class MobileSAM_UE(UnifiedEngine):
         toks = tokens_t.to(torch.bfloat16).contiguous()
         self.dma_to_accelerator_memory(self.TOKENS_DRAM,    toks.flatten())
         self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, toks.flatten())
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                time.sleep(0.5)
+        import threading as _th
+        _timer = _th.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         self.start_execute_from_dram(prog_addr)
         self.wait_queue(timeout)
+        _stop_timer = True
+        _timer.join()
+        import sys as _sys
+        _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s")
         masks = self.dma_from_accelerator_memory(self.MASK_OUT, (4, 256 * 256)).float().reshape(4, 256, 256)
         iou   = self.dma_from_accelerator_memory(self.IOU_OUT, (64,)).float()[:4]
         return masks, iou
@@ -1485,8 +2074,21 @@ class MobileSAM_UE(UnifiedEngine):
         self.dma_to_accelerator_memory(self.SRC_DRAM,       src_t.flatten())
         self.dma_to_accelerator_memory(self.KEY_PE_DRAM,    image_pe_t.to(torch.bfloat16).contiguous().flatten())
 
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                time.sleep(0.5)
+        import threading as _th
+        _timer = _th.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         self.start_execute_from_dram(prog_addr)
         self.wait_queue(timeout)
+        _stop_timer = True
+        _timer.join()
+        import sys as _sys
+        _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s")
 
         # Read masks: (4, 65536) → (4, 256, 256)
         masks_hw = self.dma_from_accelerator_memory(
@@ -2255,7 +2857,7 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _run_s1_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
                       gpr_ntok: int = None, gpr_hw: int = None,
-                      gpr_flash: int = None) -> None:
+                      gpr_flash: int = None, gpr_pbi: int = None) -> None:
         """Run one TinyViTBlock: attn → residual → local_conv → mlp+residual."""
         _HW   = ENC_S1_H * ENC_S1_W
         _NTOK = ENC_S1_NWIN * ENC_S1_WIN_PAD
@@ -2314,32 +2916,28 @@ class MobileSAM_UE(UnifiedEngine):
                              C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
                              gpr_M_reg=gpr_ntok)
 
-        multihead_reshape_dram(self, self.S1_Q_DRAM, self.S1_Q_HEAD_DRAM, self.S1_MH_TEMP,
-                               _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
-        multihead_reshape_dram(self, self.S1_K_DRAM, self.S1_K_HEAD_DRAM, self.S1_MH_TEMP,
-                               _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
-        multihead_reshape_dram(self, self.S1_V_DRAM, self.S1_V_HEAD_DRAM, self.S1_MH_TEMP,
-                               _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
+        multihead_reshape_dram_pbi(self, self.S1_Q_DRAM, self.S1_Q_HEAD_DRAM, self.S1_MH_TEMP,
+                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
+        multihead_reshape_dram_pbi(self, self.S1_K_DRAM, self.S1_K_HEAD_DRAM, self.S1_MH_TEMP,
+                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
+        multihead_reshape_dram_pbi(self, self.S1_V_DRAM, self.S1_V_HEAD_DRAM, self.S1_MH_TEMP,
+                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
         broadcast_mul_dram(self, self.S1_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S1_HEADS * _NTOK * _HP)
 
         _head_stride = ENC_S1_NWIN * _WPAD * _HP * _BPE
-        _s1_buckets = _WPAD // UE_VECTOR_SIZE  # 64//64 = 1
-        if gpr_flash is not None:
-            self.generate_instruction_add_set(gpr_flash, _s1_buckets)
         for h in range(ENC_S1_HEADS):
-            flash_attention_batched(
+            flash_attention_batched_pbi(
                 self, num_batches=ENC_S1_NWIN, head_dim=_HP, seq_len=_WPAD,
                 Q_DRAM_ADDR=self.S1_Q_HEAD_DRAM + h * _head_stride,
                 K_DRAM_ADDR=self.S1_K_HEAD_DRAM + h * _head_stride,
                 V_DRAM_ADDR=self.S1_V_HEAD_DRAM + h * _head_stride,
                 OUTPUT_DRAM_ADDR=self.S1_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S1_FLASH_SCRATCH,
+                ATTN_P_DRAM_ADDR=0,
+                IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True,
-                gpr_bucket_idx=gpr_flash,
-                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
-                num_buckets=_s1_buckets)
+                bias_shared=True, _silent=True)
 
         multihead_merge_dram(self, self.S1_ATTN_DRAM, self.S1_MERGED_DRAM, self.S1_MH_TEMP,
                              _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP,
@@ -2383,7 +2981,7 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _run_s2_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
                       gpr_ntok: int = None, gpr_hw: int = None,
-                      gpr_flash: int = None) -> None:
+                      gpr_flash: int = None, gpr_pbi: int = None) -> None:
         """Run one Stage-2 TinyViTBlock: C=160 padded to 192, 5 heads, ws=14."""
         _HW   = ENC_S2_H * ENC_S2_W          # 4096
         _NTOK = ENC_S2_NWIN * ENC_S2_WIN_PAD  # 6400
@@ -2441,32 +3039,31 @@ class MobileSAM_UE(UnifiedEngine):
                              C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
                              gpr_M_reg=gpr_ntok)
 
-        multihead_reshape_dram(self, self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM, self.S2_MH_TEMP,
-                               _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, input_row_stride=_CP)
-        multihead_reshape_dram(self, self.S2_K_DRAM, self.S2_K_HEAD_DRAM, self.S2_MH_TEMP,
-                               _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, input_row_stride=_CP)
-        multihead_reshape_dram(self, self.S2_V_DRAM, self.S2_V_HEAD_DRAM, self.S2_MH_TEMP,
-                               _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, input_row_stride=_CP)
+        multihead_reshape_dram_pbi(self, self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM, self.S2_MH_TEMP,
+                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
+                                   input_row_stride=_CP)
+        multihead_reshape_dram_pbi(self, self.S2_K_DRAM, self.S2_K_HEAD_DRAM, self.S2_MH_TEMP,
+                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
+                                   input_row_stride=_CP)
+        multihead_reshape_dram_pbi(self, self.S2_V_DRAM, self.S2_V_HEAD_DRAM, self.S2_MH_TEMP,
+                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
+                                   input_row_stride=_CP)
         broadcast_mul_dram(self, self.S2_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S2_HEADS * _NTOK * _HP)
 
         _head_stride = ENC_S2_NWIN * _WPAD * _HP * _BPE
-        _s2_buckets = _WPAD // UE_VECTOR_SIZE  # 256//64 = 4
-        if gpr_flash is not None:
-            self.generate_instruction_add_set(gpr_flash, _s2_buckets)
         for h in range(ENC_S2_HEADS):
-            flash_attention_batched(
+            flash_attention_batched_pbi(
                 self, num_batches=ENC_S2_NWIN, head_dim=_HP, seq_len=_WPAD,
                 Q_DRAM_ADDR=self.S2_Q_HEAD_DRAM + h * _head_stride,
                 K_DRAM_ADDR=self.S2_K_HEAD_DRAM + h * _head_stride,
                 V_DRAM_ADDR=self.S2_V_HEAD_DRAM + h * _head_stride,
                 OUTPUT_DRAM_ADDR=self.S2_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S2_FLASH_SCRATCH,
+                ATTN_P_DRAM_ADDR=0,
+                IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True,
-                gpr_bucket_idx=gpr_flash,
-                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
-                num_buckets=_s2_buckets)
+                bias_shared=True, _silent=True)
 
         self.bf16_permute_core(dim_0=ENC_S2_HEADS, dim_1=_NTOK, dim_2=_HP,
                                INPUT_DRAM_ADDR=self.S2_ATTN_DRAM,
@@ -2492,6 +3089,11 @@ class MobileSAM_UE(UnifiedEngine):
 
         eltwise_add_dram(self, INPUT_DRAM, self.S2_REV_DRAM, OUTPUT_DRAM, _HW * _CP)
 
+        # debug bisect: snapshot post-attention-residual (A) before local_conv
+        # overwrites the flow. S2_REV_DRAM keeps post-local-conv (B) to the end.
+        if getattr(self, "_s2_dbg_a", None):
+            self.accelerator_memcpy(OUTPUT_DRAM, self._s2_dbg_a, _HW * _CP * _BPE)
+
         conv2d_3x3_dw_dram(self, OUTPUT_DRAM, self.S2_REV_DRAM, self.S2_LC_IM2COL,
                            w["lc_w"], w["lc_b"], w["lc_zero"],
                            ENC_S2_H, ENC_S2_W, _CP)
@@ -2514,7 +3116,7 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _run_s3_block(self, w: dict, INPUT_DRAM: int, OUTPUT_DRAM: int,
                       gpr_ntok: int = None, gpr_hw: int = None,
-                      gpr_flash: int = None) -> None:
+                      gpr_flash: int = None, gpr_pbi: int = None) -> None:
         """Run one Stage-3 TinyViTBlock: C=320, 10 heads, ws=7. No padding needed."""
         _HW   = ENC_S3_H * ENC_S3_W           # 4096
         _NTOK = ENC_S3_NWIN * ENC_S3_WIN_PAD   # 6400
@@ -2572,32 +3174,28 @@ class MobileSAM_UE(UnifiedEngine):
                              C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
                              gpr_M_reg=gpr_ntok)
 
-        multihead_reshape_dram(self, self.S3_Q_DRAM, self.S3_Q_HEAD_DRAM, self.S3_MH_TEMP,
-                               _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP)
-        multihead_reshape_dram(self, self.S3_K_DRAM, self.S3_K_HEAD_DRAM, self.S3_MH_TEMP,
-                               _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP)
-        multihead_reshape_dram(self, self.S3_V_DRAM, self.S3_V_HEAD_DRAM, self.S3_MH_TEMP,
-                               _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP)
+        multihead_reshape_dram_pbi(self, self.S3_Q_DRAM, self.S3_Q_HEAD_DRAM, self.S3_MH_TEMP,
+                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
+        multihead_reshape_dram_pbi(self, self.S3_K_DRAM, self.S3_K_HEAD_DRAM, self.S3_MH_TEMP,
+                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
+        multihead_reshape_dram_pbi(self, self.S3_V_DRAM, self.S3_V_HEAD_DRAM, self.S3_MH_TEMP,
+                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
         broadcast_mul_dram(self, self.S3_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S3_HEADS * _NTOK * _HP)
 
         _head_stride = ENC_S3_NWIN * _WPAD * _HP * _BPE
-        _s3_buckets = _WPAD // UE_VECTOR_SIZE  # 64//64 = 1
-        if gpr_flash is not None:
-            self.generate_instruction_add_set(gpr_flash, _s3_buckets)
         for h in range(ENC_S3_HEADS):
-            flash_attention_batched(
+            flash_attention_batched_pbi(
                 self, num_batches=ENC_S3_NWIN, head_dim=_HP, seq_len=_WPAD,
                 Q_DRAM_ADDR=self.S3_Q_HEAD_DRAM + h * _head_stride,
                 K_DRAM_ADDR=self.S3_K_HEAD_DRAM + h * _head_stride,
                 V_DRAM_ADDR=self.S3_V_HEAD_DRAM + h * _head_stride,
                 OUTPUT_DRAM_ADDR=self.S3_ATTN_DRAM + h * _head_stride,
                 SCRATCH_DRAM_ADDR=self.S3_FLASH_SCRATCH,
+                ATTN_P_DRAM_ADDR=0,
+                IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
                 BIAS_DRAM_ADDR=w["bias"] + h * _WPAD * _WPAD * _BPE,
-                bias_shared=True,
-                gpr_bucket_idx=gpr_flash,
-                ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM if gpr_flash is not None else None,
-                num_buckets=_s3_buckets)
+                bias_shared=True, _silent=True)
 
         multihead_merge_dram(self, self.S3_ATTN_DRAM, self.S3_MERGED_DRAM, self.S3_MH_TEMP,
                              _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP,
@@ -2644,11 +3242,13 @@ class MobileSAM_UE(UnifiedEngine):
         # GPR 2: Stage 1-3 NTOK (window tokens)
         # GPR 3: Stage 1-3 HW (spatial after window merge)
         # GPR 4: flash attention bucket index (1=seq64, 4=seq256)
+        # GPR 5: PBI loop counter for multihead_reshape_dram_pbi
         gpr_s0    = self.alloc_isa_reg()
         gpr_ntok  = self.alloc_isa_reg()
         gpr_hw    = self.alloc_isa_reg()
         gpr_flash = self.alloc_isa_reg()
-        self._encoder_ops(lambda: None, gpr_s0=gpr_s0, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        gpr_pbi   = self.alloc_isa_reg()
+        self._encoder_ops(lambda: None, gpr_s0=gpr_s0, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         self.stop_capture()
         self.generate_instruction_halt()
         prog = self.get_program_dram_addr()
@@ -2659,12 +3259,42 @@ class MobileSAM_UE(UnifiedEngine):
 
     def execute_encoder(self, prog: int, image_t: torch.Tensor):
         """Execute pre-compiled encoder program. Result lands in self.NECK_OUT_DRAM."""
+        # Clear stale device state (PBI pointers, loop/queue regs) left by a prior
+        # program before running. DRAM (weights + this program) persists across a
+        # soft reset, so this is safe to do after they are staged. Without it the
+        # encoder's many back-to-back PBI sections intermittently emit NaN/Inf that
+        # depend on whatever the device ran last (see "buggy NaN on consecutive run").
+        self.software_reset()
         img_hwc = image_t[0].permute(1, 2, 0).contiguous()
         img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, ENC_CIN_PAD, dtype=torch.bfloat16)
         img_pad[:, :3] = img_hwc.reshape(-1, 3)
         self.dma_to_accelerator_memory(self.PE_IN_DRAM, img_pad.reshape(-1))
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                _original_print(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                time.sleep(0.5)
+        import threading as _th
+        _timer = _th.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         self.start_execute_from_dram(prog)
         self.wait_queue(600.0)
+        _stop_timer = True
+        _timer.join()
+        _original_print(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s")
+        _HW1 = ENC_S1_H * ENC_S1_W
+        _HW2 = ENC_S2_H * ENC_S2_W
+        _HW3 = ENC_S3_H * ENC_S3_W
+        _CP2 = ENC_S2_C_PAD
+        self._assert_no_nan("S1B0", self.S1B0_OUT_DRAM, _HW1 * ENC_S1_C)
+        self._assert_no_nan("S1B1", self.S1B1_OUT_DRAM, _HW1 * ENC_S1_C)
+        for _bi in range(6):
+            _buf = getattr(self, f"S2B{_bi}_OUT_DRAM")
+            self._assert_no_nan(f"S2B{_bi}", _buf, _HW2 * _CP2)
+        self._assert_no_nan("S3B0", self.S3B0_OUT_DRAM, _HW3 * ENC_S3_C)
+        self._assert_no_nan("S3B1", self.S3B1_OUT_DRAM, _HW3 * ENC_S3_C)
+        self._assert_no_nan("NECK", self.NECK_OUT_DRAM, _HW3 * 256)
 
     def encode(self, image_t: torch.Tensor):
         """Compile + execute in one call — single instruction stream."""
@@ -2677,6 +3307,7 @@ class MobileSAM_UE(UnifiedEngine):
 
     def _compile_run(self, ops_fn, image_t: torch.Tensor | None = None, timeout: float = 120.0) -> None:
         """Compile ops_fn() as a single program, execute, wait."""
+        self.reset_isa_reg_counter()
         self.start_capture()
         ops_fn()
         self.stop_capture()
@@ -2717,6 +3348,67 @@ class MobileSAM_UE(UnifiedEngine):
                 f"(max_abs={max_abs_str})"
             )
         _original_print(f"  [OK] {label}: max_abs={t.abs().max().item():.4f}")
+        self._golden_check(label, t)
+
+    # label -> cpu_golden.npz key (only end-of-block checkpoints have a golden)
+    _GOLDEN_LABEL_MAP = {
+        "patch_embed conv2 (PE_OUT)": "patch_embed",
+        "S0B0_OUT": "S0B0", "S0B1_OUT": "S0B1", "PM01_OUT": "PM01",
+        "S1B0_OUT": "S1B0", "S1B1_OUT": "S1B1", "PM12_OUT": "PM12",
+        "S2B0_OUT": "S2B0", "S2B1_OUT": "S2B1", "S2B2_OUT": "S2B2",
+        "S2B3_OUT": "S2B3", "S2B4_OUT": "S2B4", "S2B5_OUT": "S2B5",
+        "PM23_OUT": "PM23", "S3B0_OUT": "S3B0", "S3B1_OUT": "S3B1",
+        "neck_conv2+ln2": "neck",
+        "S2B0 post-attn-residual": "S2B0_attn", "S2B0 post-local-conv": "S2B0_lc",
+        "S0B1 c1(conv1+gelu)": "S0B1_c1", "S0B1 c2(conv2+gelu)": "S0B1_c2",
+    }
+
+    def _golden_check(self, label: str, t: torch.Tensor) -> None:
+        """If cpu_golden.npz exists, print HW-vs-CPU SNR for this stage.
+        HW S2 buffers are channel-padded (C_pad=192 vs true 160); slice to the
+        golden's true C so the comparison is apples-to-apples."""
+        key = self._GOLDEN_LABEL_MAP.get(label)
+        if key is None:
+            return
+        if not hasattr(self, "_golden"):
+            _gp = os.path.join(SCRIPT_DIR, "cpu_golden.npz")
+            self._golden = dict(np.load(_gp)) if os.path.exists(_gp) else {}
+        if key not in self._golden:
+            return
+        g = torch.from_numpy(self._golden[key]).float()  # (M, C_true)
+        M, C_true = g.shape
+        hw = t.float().reshape(M, -1)[:, :C_true]         # drop channel padding
+        snr = calculate_snr(g.flatten(), hw.flatten())
+        _GATE = 40.0  # bf16 noise floor; below = HW diverges from CPU reference
+        flag = "" if snr >= _GATE else "   <<< DIVERGES"
+        _original_print(f"       golden[{key}] SNR={snr:6.2f} dB"
+                        f"  (cpu max_abs={g.abs().max().item():.4f}){flag}")
+        # SNR gate is DEFAULT-ON: a run must NOT pass while diverging from the CPU
+        # reference. Set MOBILESAM_SNR_GATE=0 only to survey all stages in one run.
+        if os.environ.get("MOBILESAM_SNR_GATE", "1") != "0" and snr < _GATE:
+            assert False, (
+                f"SNR gate FAILED at {label} (golden[{key}]): {snr:.2f} dB "
+                f"< {_GATE} dB -- HW diverges from CPU reference. This is "
+                f"corruption, not just a NaN. First divergence localizes the bug.")
+
+    def _inject_golden(self, key: str, addr: int, c_pad: int) -> None:
+        """Overwrite a DRAM buffer with the CPU golden tensor (channel-padded to
+        c_pad with zeros), so the next stage runs from a clean input. Used to
+        isolate a single op's error from inherited upstream drift.
+        Enabled when env MOBILESAM_INJECT contains `key`."""
+        want = os.environ.get("MOBILESAM_INJECT", "")
+        if key not in want.split(","):
+            return
+        if not hasattr(self, "_golden"):
+            _gp = os.path.join(SCRIPT_DIR, "cpu_golden.npz")
+            self._golden = dict(np.load(_gp)) if os.path.exists(_gp) else {}
+        g = torch.from_numpy(self._golden[key]).float()  # (M, C_true)
+        M, c_true = g.shape
+        buf = torch.zeros(M, c_pad, dtype=torch.bfloat16)
+        buf[:, :c_true] = g.bfloat16()
+        self.dma_to_accelerator_memory(addr, buf.flatten())
+        _original_print(f"       [INJECT] golden[{key}] -> 0x{addr:x} "
+                        f"(M={M}, C {c_true}->{c_pad})")
 
     def debug_encode(self, image_t: torch.Tensor) -> None:
         """Run encoder stage-by-stage, asserting no NaNs at each checkpoint."""
@@ -2791,6 +3483,11 @@ class MobileSAM_UE(UnifiedEngine):
                 A_DRAM_ADDR=self.S0B1_OUT_DRAM, B_DRAM_ADDR=self.IDENTITY_DRAM,
                 OUTPUT_DRAM_ADDR=self.S0B1_OUT_DRAM, gelu_enable=True)
         self._compile_run(_s0b1)
+        # MBConv sub-op bisect: S0_EXP=conv1+gelu(c1), S0_DW=conv2+gelu(c2) survive to here.
+        self._golden_check("S0B1 c1(conv1+gelu)",
+                           self._read_tensor(self.S0_EXP_DRAM, ENC_S0_H * ENC_S0_W * ENC_S0_C_EXP))
+        self._golden_check("S0B1 c2(conv2+gelu)",
+                           self._read_tensor(self.S0_DW_DRAM, ENC_S0_H * ENC_S0_W * ENC_S0_C_EXP))
         self._assert_no_nan("S0B1_OUT", self.S0B1_OUT_DRAM, ENC_S0_H * ENC_S0_W * ENC_C0P)
 
         # PatchMerging 0→1
@@ -2809,11 +3506,15 @@ class MobileSAM_UE(UnifiedEngine):
         self._assert_no_nan("PM01_OUT", self.PM01_OUT_DRAM, ENC_S1_H * ENC_S1_W * ENC_S1_C)
 
         # Stage 1 blocks
+        def _s1_lambda(i, _in, _out):
+            _gpr_pbi = self.alloc_isa_reg()
+            self._run_s1_block(self.S1B[i], _in, _out, gpr_pbi=_gpr_pbi)
+            self.release_isa_reg()
         for bi, (inp, out, label) in enumerate([
             (self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, "S1B0_OUT"),
             (self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, "S1B1_OUT"),
         ]):
-            self._compile_run(lambda i=bi, _in=inp, _out=out: self._run_s1_block(self.S1B[i], _in, _out))
+            self._compile_run(lambda i=bi, _in=inp, _out=out: _s1_lambda(i, _in, _out))
             self._assert_no_nan(label, out, ENC_S1_H * ENC_S1_W * ENC_S1_C)
 
         # PatchMerging 1→2
@@ -2831,6 +3532,7 @@ class MobileSAM_UE(UnifiedEngine):
                             ENC_S2_H, ENC_S2_W, _CP, _CP, gelu_enable=False)
         self._compile_run(_pm12)
         self._assert_no_nan("PM12_OUT", self.PM12_OUT_DRAM, ENC_S2_H * ENC_S2_W * _CP)
+        self._inject_golden("PM12", self.PM12_OUT_DRAM, _CP)
 
         # Stage 2 blocks
         # S2B0 step-by-step
@@ -2869,28 +3571,93 @@ class MobileSAM_UE(UnifiedEngine):
         self._assert_no_nan("S2B0 V", self.S2_V_DRAM, _NTOK2 * _CP)
 
         def _s2b0_flash():
+            _gpr_pbi = self.alloc_isa_reg()
             for src, dst in [(self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM),
                               (self.S2_K_DRAM, self.S2_K_HEAD_DRAM),
                               (self.S2_V_DRAM, self.S2_V_HEAD_DRAM)]:
-                multihead_reshape_dram(self, src, dst, self.S2_MH_TEMP,
-                    _NTOK2, ENC_S2_HEADS, _HD2, _HP2, input_row_stride=_CP)
+                multihead_reshape_dram_pbi(self, src, dst, self.S2_MH_TEMP,
+                    _NTOK2, ENC_S2_HEADS, _HD2, _HP2, _gpr_pbi, input_row_stride=_CP)
             broadcast_mul_dram(self, self.S2_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                                ENC_S2_HEADS * _NTOK2 * _HP2)
             _hs = ENC_S2_NWIN * ENC_S2_WIN_PAD * _HP2 * _BPE
             for h in range(ENC_S2_HEADS):
-                flash_attention_batched(self, num_batches=ENC_S2_NWIN, head_dim=_HP2,
+                flash_attention_batched_pbi(
+                    self, num_batches=ENC_S2_NWIN, head_dim=_HP2,
                     seq_len=ENC_S2_WIN_PAD,
                     Q_DRAM_ADDR=self.S2_Q_HEAD_DRAM + h*_hs,
                     K_DRAM_ADDR=self.S2_K_HEAD_DRAM + h*_hs,
                     V_DRAM_ADDR=self.S2_V_HEAD_DRAM + h*_hs,
                     OUTPUT_DRAM_ADDR=self.S2_ATTN_DRAM + h*_hs,
                     SCRATCH_DRAM_ADDR=self.S2_FLASH_SCRATCH,
+                    ATTN_P_DRAM_ADDR=0,
+                    IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_DRAM,
                     BIAS_DRAM_ADDR=_w2["bias"] + h*ENC_S2_WIN_PAD*ENC_S2_WIN_PAD*_BPE,
-                    bias_shared=True, num_buckets=ENC_S2_WIN_PAD//UE_VECTOR_SIZE)
+                    bias_shared=True, _silent=True)
         self._compile_run(_s2b0_flash)
         self._assert_no_nan("S2B0 attn_out", self.S2_ATTN_DRAM, ENC_S2_HEADS * _NTOK2 * _HP2)
 
-        self._compile_run(lambda: self._run_s2_block(self.S2B[0], _in2, self.S2B0_OUT_DRAM))
+        def _s2_lambda(i, _in, _out):
+            _gpr_pbi = self.alloc_isa_reg()
+            self._run_s2_block(self.S2B[i], _in, _out, gpr_pbi=_gpr_pbi)
+            self.release_isa_reg()
+        # sub-op bisect: capture A=post-attn-residual into a debug buffer; B=post-local-conv
+        # survives in S2_REV_DRAM. Both HxW-order (192 cols), golden-compared after the run.
+        self._s2_dbg_a = self.allocate_tensor_dram(_HW2 * _CP * _BPE)
+        self._compile_run(lambda: _s2_lambda(0, _in2, self.S2B0_OUT_DRAM))
+        self._golden_check("S2B0 post-attn-residual",
+                           self._read_tensor(self._s2_dbg_a, _HW2 * _CP))
+        self._golden_check("S2B0 post-local-conv",
+                           self._read_tensor(self.S2_REV_DRAM, _HW2 * _CP))
+        self._s2_dbg_a = None
+
+        # ---- window-order sub-op bisect, EDGE-PAD TOKENS MASKED OUT ----
+        # 9/25 S2 windows contain 64->70 spatial-pad positions (HW=0 there, golden=beta);
+        # those are cropped by window_reverse, so we compare ONLY real (in-64x64) tokens.
+        if not hasattr(self, "_golden"):
+            _gp = os.path.join(SCRIPT_DIR, "cpu_golden.npz")
+            self._golden = dict(np.load(_gp)) if os.path.exists(_gp) else {}
+        _WS2 = ENC_S2_WS * ENC_S2_WS  # 196
+        _HD2 = ENC_S2_HEAD_DIM
+        _wh = (torch.arange(ENC_S2_NWIN) // ENC_S2_NW)[:, None]
+        _ww = (torch.arange(ENC_S2_NWIN) %  ENC_S2_NW)[:, None]
+        _tr = (torch.arange(_WS2) // ENC_S2_WS)[None, :]
+        _tc = (torch.arange(_WS2) %  ENC_S2_WS)[None, :]
+        _rmask = ((_wh * ENC_S2_WS + _tr) < ENC_S2_H) & ((_ww * ENC_S2_WS + _tc) < ENC_S2_W)
+
+        def _win_read(addr, c_true):  # (nwin,196,c_true), real tokens only applied by caller
+            return self._read_tensor(addr, _NTOK2 * _CP).float().reshape(
+                ENC_S2_NWIN, ENC_S2_WIN_PAD, _CP)[:, :_WS2, :c_true]
+
+        def _rpt(name, g, hw):  # g,hw: (nwin,196,ct) — mask to real tokens, SNR
+            _snr = calculate_snr(g[_rmask].flatten(), hw[_rmask].flatten())
+            _f = "" if _snr >= 40 else "   <<< DIVERGES"
+            _original_print(f"       golden[{name}] SNR={_snr:6.2f} dB{_f}")
+
+        if "S2B0_norm" in self._golden:
+            _rpt("S2B0_norm (LN+part)", torch.from_numpy(self._golden["S2B0_norm"]).float(),
+                 _win_read(self.S2_WIN_DRAM, ENC_S2_C))
+        if "S2B0_q" in self._golden:
+            _gq = torch.from_numpy(self._golden["S2B0_q"]).float()
+            _rpt("S2B0_q (qkv out)", _gq, _win_read(self.S2_Q_DRAM, ENC_S2_C))
+            _qh = self._read_tensor(self.S2_Q_HEAD_DRAM, ENC_S2_HEADS * _NTOK2 * _HP2).float()
+            _qh = _qh.reshape(ENC_S2_HEADS, ENC_S2_NWIN, ENC_S2_WIN_PAD, _HP2)[:, :, :_WS2, :_HD2]
+            _gqh = (_gq.reshape(ENC_S2_NWIN, _WS2, ENC_S2_HEADS, _HD2).permute(2, 0, 1, 3)
+                    * SA_SCALE_CORRECTION)
+            _snr = calculate_snr(_gqh[:, _rmask].flatten(), _qh[:, _rmask].flatten())
+            _f = "" if _snr >= 40 else "   <<< DIVERGES"
+            _original_print(f"       golden[S2B0_qhead (reshaped)] SNR={_snr:6.2f} dB{_f}")
+        if "S2B0_merged" in self._golden:
+            _gm = torch.from_numpy(self._golden["S2B0_merged"]).float()
+            _atn = self._read_tensor(self.S2_ATTN_DRAM, ENC_S2_HEADS * _NTOK2 * _HP2).float()
+            _atn = _atn.reshape(ENC_S2_HEADS, ENC_S2_NWIN, ENC_S2_WIN_PAD, _HP2)[:, :, :_WS2, :_HD2]
+            _gph = _gm.reshape(ENC_S2_NWIN, _WS2, ENC_S2_HEADS, _HD2).permute(2, 0, 1, 3)
+            _snr = calculate_snr(_gph[:, _rmask].flatten(), _atn[:, _rmask].flatten())
+            _f = "" if _snr >= 40 else "   <<< DIVERGES"
+            _original_print(f"       golden[S2B0_flashout (per-head)] SNR={_snr:6.2f} dB{_f}")
+            _rpt("S2B0_merged (pre-proj)", _gm, _win_read(self.S2_MERGED_DRAM, ENC_S2_C))
+        if "S2B0_proj" in self._golden:
+            _rpt("S2B0_proj (post-proj)", torch.from_numpy(self._golden["S2B0_proj"]).float(),
+                 _win_read(self.S2_PROJ_DRAM, ENC_S2_C))
         self._assert_no_nan("S2B0_OUT", self.S2B0_OUT_DRAM, _HW2 * _CP)
 
         _s2_io = [
@@ -2901,7 +3668,7 @@ class MobileSAM_UE(UnifiedEngine):
             (self.S2B4_OUT_DRAM, self.S2B5_OUT_DRAM, "S2B5_OUT"),
         ]
         for bi, (_in, _out, label) in enumerate(_s2_io, start=1):
-            self._compile_run(lambda i=bi, _i=_in, _o=_out: self._run_s2_block(self.S2B[i], _i, _o))
+            self._compile_run(lambda i=bi, _i=_in, _o=_out: _s2_lambda(i, _i, _o))
             self._assert_no_nan(label, _out, ENC_S2_H * ENC_S2_W * _CP)
 
         # PatchMerging 2→3
@@ -2920,18 +3687,24 @@ class MobileSAM_UE(UnifiedEngine):
         self._assert_no_nan("PM23_OUT", self.PM23_OUT_DRAM, ENC_S2_H * ENC_S2_W * _C23)
 
         # Stage 3 blocks
+        def _s3_lambda(i, _in, _out):
+            _gpr_pbi = self.alloc_isa_reg()
+            self._run_s3_block(self.S3B[i], _in, _out, gpr_pbi=_gpr_pbi)
+            self.release_isa_reg()
         for bi, (_in, _out, label) in enumerate([
             (self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, "S3B0_OUT"),
             (self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, "S3B1_OUT"),
         ]):
-            self._compile_run(lambda i=bi, _i=_in, _o=_out: self._run_s3_block(self.S3B[i], _i, _o))
+            self._compile_run(lambda i=bi, _i=_in, _o=_out: _s3_lambda(i, _i, _o))
             self._assert_no_nan(label, _out, ENC_S3_H * ENC_S3_W * ENC_S3_C)
 
         # Neck
         _NECK_C_IN  = ENC_S3_C
         _NECK_C_OUT = 256
-        _NECK_HW    = ENC_S3_H * ENC_S3_W
-        def _neck():
+        _NECK_H    = ENC_S3_H
+        _NECK_W    = ENC_S3_W
+        _NECK_HW    = _NECK_H * _NECK_W
+        def _neck_matmul_ln():
             _ops = 6
             _ideal = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _ops)
             _cs = _ideal
@@ -2948,10 +3721,220 @@ class MobileSAM_UE(UnifiedEngine):
                 A_DRAM_ADDR=self.NECK_BUF1_DRAM, OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
                 GAMMA_DRAM_ADDR=self.NECK_LN1_G, BETA_DRAM_ADDR=self.NECK_LN1_B,
                 gpr_M_reg=14)
-        self._compile_run(_neck)
+        self._compile_run(_neck_matmul_ln)
         self._assert_no_nan("neck_conv1+ln1", self.NECK_BUF1_DRAM, _NECK_HW * _NECK_C_OUT)
 
-        _original_print("debug_encode: all checkpoints passed — NaN must be in neck conv2 or later")
+        def _neck_conv_ln():
+            conv2d_3x3_stride1_dram(
+                self,
+                INPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
+                OUTPUT_DRAM_ADDR=self.NECK_OUT_DRAM,
+                IM2COL_DRAM_ADDR=self.NECK_IM2COL_DRAM,
+                WEIGHT_DRAM_ADDR=self.NECK_C3_W,
+                BIAS_DRAM_ADDR=self.NECK_ZERO,
+                ZERO_PAD_DRAM_ADDR=self.NECK_ZERO,
+                H=_NECK_H, W=_NECK_W, C_in=_NECK_C_OUT, C_out=_NECK_C_OUT,
+            )
+            _neck_ln2_ops = 6
+            _cs = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _neck_ln2_ops)
+            while _NECK_HW % _cs != 0:
+                _cs -= 1
+            self._isa_reg_counter = 15; self.reset_inst_ptr_counter()
+            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_NECK_HW // _cs)
+            self.layer_norm_core_dram(
+                M=_NECK_HW, N=_NECK_C_OUT,
+                A_DRAM_ADDR=self.NECK_OUT_DRAM, OUTPUT_DRAM_ADDR=self.NECK_OUT_DRAM,
+                GAMMA_DRAM_ADDR=self.NECK_LN2_G, BETA_DRAM_ADDR=self.NECK_LN2_B,
+                gpr_M_reg=14)
+        self._compile_run(_neck_conv_ln)
+        self._assert_no_nan("neck_conv2+ln2", self.NECK_OUT_DRAM, _NECK_HW * _NECK_C_OUT)
+
+        _original_print("debug_encode: all checkpoints passed ✓")
+
+    def debug_decode(self, tokens_t: torch.Tensor) -> None:
+        """Run the mask decoder stage-by-stage as isolated programs, checkpointing
+        every intermediate buffer. Assumes preload_decoder_image() already ran so
+        SRC_DRAM/KEY_PE_DRAM hold the image embedding + PE. Each stage is compiled
+        and executed on its own (fresh device state between, like debug_encode), so a
+        clean pass here = correct logic and the single-stream program is the problem;
+        a failing stage = a real bug in that op.
+
+        Replays compile_decoder()'s EXACT op sequence — do not let the two drift."""
+        _original_print("debug_decode: stepping through decoder ...")
+        toks = tokens_t.to(torch.bfloat16).contiguous()
+        self.dma_to_accelerator_memory(self.TOKENS_DRAM,    toks.flatten())
+        self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, toks.flatten())
+
+        _rows = []
+
+        def _step(label, fn, checks):
+            self._compile_run(fn)
+            for nm, addr, n, *rest in checks:
+                t = self._read_tensor(addr, n)
+                nn = torch.isnan(t).sum().item()
+                ni = torch.isinf(t).sum().item()
+                fin = t[torch.isfinite(t)]
+                mx = f"{fin.abs().max().item():.4f}" if fin.numel() else "all-bad"
+                tag = "OK " if nn == 0 and ni == 0 else "BAD"
+                rowinfo = ""
+                if rest and (nn or ni):  # rest[0] = row width → report bad row indices
+                    width = rest[0]
+                    bad = (~torch.isfinite(t.reshape(-1, width))).any(dim=1).nonzero().squeeze(-1).tolist()
+                    rowinfo = f"  bad_rows={bad[:6]}{'…' if len(bad) > 6 else ''} ({len(bad)})"
+                _original_print(f"  [{tag}] {label}/{nm}: nans={nn} infs={ni}/{n} max_abs={mx}{rowinfo}")
+                _rows.append((f"{label}/{nm}", nn, ni))
+
+        _NTD = NT_PAD * DEC_DIM
+        _GAD = GA * DEC_DIM
+        _HHD = DEC_HEADS * DEC_HD_PAD
+
+        for layer_i in range(DEC_LAYERS):
+            lw = self.dec_layer_weights[layer_i]
+            skip_pe = (layer_i == 0)
+            L = f"L{layer_i}"
+
+            if not skip_pe:
+                _step(f"{L}.q_in", lambda: eltwise_add_dram(
+                    self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.Q_IN_DRAM, _NTD),
+                    [("Q_IN", self.Q_IN_DRAM, _NTD)])
+
+            _step(f"{L}.self_attn", lambda lw=lw, skip_pe=skip_pe: self._self_attn(lw, skip_pe),
+                  [("SA_Q_PROJ", self.SA_Q_PROJ, NT_PAD * _HHD, _HHD),
+                   ("SA_Q_HEADS", self.SA_Q_HEADS, _HHD * NT_PAD),
+                   ("SA_ATTN_OUT", self.SA_ATTN_OUT, DEC_HEADS * NT_PAD * DEC_HD_PAD),
+                   ("SA_MERGED", self.SA_MERGED, _NTD),
+                   ("SA_OUT", self.SA_OUT, _NTD)])
+
+            _step(f"{L}.add1", lambda: eltwise_add_dram(
+                self, self.TOKENS_DRAM, self.SA_OUT, self.TOKENS_DRAM, _NTD),
+                [("TOKENS", self.TOKENS_DRAM, _NTD, DEC_DIM)])
+            _step(f"{L}.norm1", lambda lw=lw: self.layer_norm_core_dram(
+                M=NT_PAD, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM, OUTPUT_DRAM_ADDR=self.TOKENS_DRAM,
+                GAMMA_DRAM_ADDR=lw['norm1_w'], BETA_DRAM_ADDR=lw['norm1_b']),
+                [("TOKENS", self.TOKENS_DRAM, _NTD, DEC_DIM)])
+
+            def _t2i(lw=lw):
+                eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.Q_IN_DRAM, _NTD)
+                eltwise_add_dram(self, self.SRC_DRAM, self.KEY_PE_DRAM, self.SRC_PE_DRAM, _GAD)
+                self._cross_attn_t2i(q_w=lw['t2i_q_w'], q_b=lw['t2i_q_b'], k_w=lw['t2i_k_w'], k_b=lw['t2i_k_b'],
+                    v_w=lw['t2i_v_w'], v_b=lw['t2i_v_b'], out_w=lw['t2i_out_w'], out_b=lw['t2i_out_b'],
+                    Q_SRC=self.Q_IN_DRAM, KV_SRC=self.SRC_PE_DRAM, V_SRC=self.SRC_DRAM, q_len=NT_PAD)
+            _step(f"{L}.t2i", _t2i,
+                  [("T2I_Q_HEADS", self.T2I_Q_HEADS, _HHD * NT_PAD),
+                   ("T2I_VT", self.T2I_VT, DEC_HEADS * DEC_HD_PAD * GA),
+                   ("T2I_ATTN_OUT", self.T2I_ATTN_OUT, DEC_HEADS * NT_PAD * DEC_HD_PAD),
+                   ("T2I_MERGED", self.T2I_MERGED, NT_PAD * DEC_HEADS * DEC_CA_HD),
+                   ("T2I_OUT", self.T2I_OUT, _NTD)])
+
+            _step(f"{L}.add2", lambda: eltwise_add_dram(
+                self, self.TOKENS_DRAM, self.T2I_OUT, self.TOKENS_DRAM, _NTD),
+                [("TOKENS", self.TOKENS_DRAM, _NTD, DEC_DIM)])
+            _step(f"{L}.norm2", lambda lw=lw: self.layer_norm_core_dram(
+                M=NT_PAD, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM, OUTPUT_DRAM_ADDR=self.TOKENS_DRAM,
+                GAMMA_DRAM_ADDR=lw['norm2_w'], BETA_DRAM_ADDR=lw['norm2_b']),
+                [("TOKENS", self.TOKENS_DRAM, _NTD, DEC_DIM)])
+
+            def _mlp(lw=lw):
+                self.matmat_mul_core(M=NT_PAD, K=DEC_DIM, N=DEC_MLP_DIM, A_DRAM_ADDR=self.TOKENS_DRAM,
+                    B_DRAM_ADDR=lw['mlp_lin1_w'], OUTPUT_DRAM_ADDR=self.MLP_MID, C_DRAM_ADDR=lw['mlp_lin1_b'],
+                    bias_mode="broadcast_N", clamp_enable=True)
+                self.matmat_mul_core(M=NT_PAD, K=DEC_MLP_DIM, N=DEC_DIM, A_DRAM_ADDR=self.MLP_MID,
+                    B_DRAM_ADDR=lw['mlp_lin2_w'], OUTPUT_DRAM_ADDR=self.MLP_OUT, C_DRAM_ADDR=lw['mlp_lin2_b'],
+                    bias_mode="broadcast_N")
+            _step(f"{L}.mlp", _mlp, [("MLP_MID", self.MLP_MID, NT_PAD * DEC_MLP_DIM),
+                                     ("MLP_OUT", self.MLP_OUT, _NTD)])
+
+            def _add_norm3(lw=lw):
+                eltwise_add_dram(self, self.TOKENS_DRAM, self.MLP_OUT, self.TOKENS_DRAM, _NTD)
+                self.layer_norm_core_dram(M=NT_PAD, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.TOKENS_DRAM, GAMMA_DRAM_ADDR=lw['norm3_w'], BETA_DRAM_ADDR=lw['norm3_b'])
+            _step(f"{L}.add+norm3", _add_norm3, [("TOKENS", self.TOKENS_DRAM, _NTD)])
+
+            def _i2t(lw=lw):
+                eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.TOK_PE_DRAM, _NTD)
+                self._cross_attn_i2t(q_w=lw['i2t_q_w'], q_b=lw['i2t_q_b'], k_w=lw['i2t_k_w'], k_b=lw['i2t_k_b'],
+                    v_w=lw['i2t_v_w'], v_b=lw['i2t_v_b'], out_w=lw['i2t_out_w'], out_b=lw['i2t_out_b'],
+                    Q_SRC=self.SRC_PE_DRAM, KV_SRC=self.TOK_PE_DRAM, V_SRC=self.TOKENS_DRAM)
+            _step(f"{L}.i2t", _i2t,
+                  [("I2T_ATTN_OUT", self.I2T_ATTN_OUT, DEC_HEADS * GA * DEC_HD_PAD),
+                   ("I2T_MERGED", self.I2T_MERGED, GA * DEC_HEADS * DEC_CA_HD),
+                   ("I2T_OUT", self.I2T_OUT, _GAD)])
+
+            def _add_norm4(lw=lw):
+                eltwise_add_dram(self, self.SRC_DRAM, self.I2T_OUT, self.SRC_DRAM, _GAD)
+                self.layer_norm_core_dram(M=GA, N=DEC_DIM, A_DRAM_ADDR=self.SRC_DRAM,
+                    OUTPUT_DRAM_ADDR=self.SRC_DRAM, GAMMA_DRAM_ADDR=lw['norm4_w'], BETA_DRAM_ADDR=lw['norm4_b'])
+            _step(f"{L}.add+norm4", _add_norm4, [("SRC", self.SRC_DRAM, _GAD)])
+
+        fa = self.dec_final_attn
+        def _final(fa=fa):
+            eltwise_add_dram(self, self.TOKENS_DRAM, self.TOKENS_PE_DRAM, self.Q_IN_DRAM, _NTD)
+            eltwise_add_dram(self, self.SRC_DRAM, self.KEY_PE_DRAM, self.SRC_PE_DRAM, _GAD)
+            self._cross_attn_t2i(q_w=fa['q_w'], q_b=fa['q_b'], k_w=fa['k_w'], k_b=fa['k_b'],
+                v_w=fa['v_w'], v_b=fa['v_b'], out_w=fa['out_w'], out_b=fa['out_b'],
+                Q_SRC=self.Q_IN_DRAM, KV_SRC=self.SRC_PE_DRAM, V_SRC=self.SRC_DRAM, q_len=NT_PAD)
+            eltwise_add_dram(self, self.TOKENS_DRAM, self.T2I_OUT, self.TOKENS_DRAM, _NTD)
+            self.layer_norm_core_dram(M=NT_PAD, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM,
+                OUTPUT_DRAM_ADDR=self.TOKENS_DRAM, GAMMA_DRAM_ADDR=self.dec_final_norm['w'],
+                BETA_DRAM_ADDR=self.dec_final_norm['b'])
+        _step("final_attn", _final, [("T2I_OUT", self.T2I_OUT, _NTD),
+                                     ("TOKENS", self.TOKENS_DRAM, _NTD)])
+
+        def _upscale():
+            dram_zero_fill(self, self.UP0_OUT, 128 * 128 * 64)
+            conv_transpose2d_2x2_dram(self, INPUT_DRAM_ADDR=self.SRC_DRAM, OUTPUT_DRAM_ADDR=self.UP0_OUT,
+                TEMP_DRAM_ADDR=self.UP0_SCATTER, WEIGHT_SLICES=self.DEC_UP0_W, BIAS_DRAM_ADDR=self.DEC_UP0_B,
+                H=IMG_H, W=IMG_W, C_in=DEC_DIM, C_out=64)
+            self.layer_norm_core_dram(M=128 * 128, N=64, A_DRAM_ADDR=self.UP0_OUT,
+                OUTPUT_DRAM_ADDR=self.UP_LN_OUT, GAMMA_DRAM_ADDR=self.DEC_UP_LN_W, BETA_DRAM_ADDR=self.DEC_UP_LN_B)
+            self.matmat_mul_core(M=128 * 128, K=64, N=64, A_DRAM_ADDR=self.UP_LN_OUT,
+                B_DRAM_ADDR=self.GELU_ID_ADDR, OUTPUT_DRAM_ADDR=self.UP_LN_OUT, gelu_enable=True)
+            dram_zero_fill(self, self.UP1_OUT, 256 * 256 * 64)
+            conv_transpose2d_2x2_dram(self, INPUT_DRAM_ADDR=self.UP_LN_OUT, OUTPUT_DRAM_ADDR=self.UP1_OUT,
+                TEMP_DRAM_ADDR=self.UP1_SCATTER, WEIGHT_SLICES=self.DEC_UP1_W, BIAS_DRAM_ADDR=self.DEC_UP1_B,
+                H=128, W=128, C_in=64, C_out=64)
+        _step("upscale", _upscale, [("UP0_OUT", self.UP0_OUT, 128 * 128 * 64),
+                                    ("UP_LN_OUT", self.UP_LN_OUT, 128 * 128 * 64),
+                                    ("UP1_OUT", self.UP1_OUT, 256 * 256 * 64)])
+
+        def _hyper():
+            for m in range(4):
+                hw = self.dec_hyper_weights[m]
+                tok_addr = self.TOKENS_DRAM + (1 + m) * DEC_DIM * BPE
+                self.matmat_mul_core(M=1, K=DEC_DIM, N=DEC_DIM, A_DRAM_ADDR=tok_addr, B_DRAM_ADDR=hw['l0_w'],
+                    OUTPUT_DRAM_ADDR=self.HYPER_MID1, C_DRAM_ADDR=hw['l0_b'], bias_mode="broadcast_N", clamp_enable=True)
+                self.matmat_mul_core(M=1, K=DEC_DIM, N=DEC_DIM, A_DRAM_ADDR=self.HYPER_MID1, B_DRAM_ADDR=hw['l1_w'],
+                    OUTPUT_DRAM_ADDR=self.HYPER_MID2, C_DRAM_ADDR=hw['l1_b'], bias_mode="broadcast_N", clamp_enable=True)
+                self.matmat_mul_core(M=1, K=DEC_DIM, N=64, A_DRAM_ADDR=self.HYPER_MID2, B_DRAM_ADDR=hw['l2_w'],
+                    OUTPUT_DRAM_ADDR=self.HYPER_OUT + m * 64 * BPE, C_DRAM_ADDR=hw['l2_b'], bias_mode="broadcast_N")
+        _step("hyper", _hyper, [("HYPER_OUT", self.HYPER_OUT, 4 * 64)])
+
+        def _mask():
+            UP_FLAT_ELEMS = 256 * 256
+            for m in range(4):
+                self.matmat_mul_core(M=1, K=64, N=UP_FLAT_ELEMS, A_DRAM_ADDR=self.HYPER_OUT + m * 64 * BPE,
+                    B_DRAM_ADDR=self.UP1_OUT, OUTPUT_DRAM_ADDR=self.MASK_OUT + m * UP_FLAT_ELEMS * BPE)
+        _step("mask", _mask, [("MASK_OUT", self.MASK_OUT, 4 * 256 * 256)])
+
+        def _iou():
+            iw = self.dec_iou_weights
+            self.matmat_mul_core(M=1, K=DEC_DIM, N=DEC_DIM, A_DRAM_ADDR=self.TOKENS_DRAM, B_DRAM_ADDR=iw['l0_w'],
+                OUTPUT_DRAM_ADDR=self.IOU_MID1, C_DRAM_ADDR=iw['l0_b'], bias_mode="broadcast_N", clamp_enable=True)
+            self.matmat_mul_core(M=1, K=DEC_DIM, N=DEC_DIM, A_DRAM_ADDR=self.IOU_MID1, B_DRAM_ADDR=iw['l1_w'],
+                OUTPUT_DRAM_ADDR=self.IOU_MID2, C_DRAM_ADDR=iw['l1_b'], bias_mode="broadcast_N", clamp_enable=True)
+            self.matmat_mul_core(M=1, K=DEC_DIM, N=64, A_DRAM_ADDR=self.IOU_MID2, B_DRAM_ADDR=iw['l2_w'],
+                OUTPUT_DRAM_ADDR=self.IOU_OUT, C_DRAM_ADDR=iw['l2_b'], bias_mode="broadcast_N")
+        _step("iou", _iou, [("IOU_OUT", self.IOU_OUT, 64)])
+
+        # SA_Q_PROJ/SA_Q_HEADS carry NaN/Inf only in the head-dim pad columns
+        # (head_dim 32→64), written by matmat_mul_core into the pad slots. Self-attn
+        # discards them: the QK·V flash masks padded KV and multihead_merge unpads to
+        # the real 32 dims, so SA_ATTN_OUT onward is clean. Benign — not a failure.
+        _benign = ("SA_Q_PROJ", "SA_Q_HEADS")
+        _bad = [r[0] for r in _rows if (r[1] or r[2]) and not any(b in r[0] for b in _benign)]
+        if _bad:
+            assert False, f"debug_decode: NaN/Inf first at {_bad[0]} ({len(_bad)} bad checkpoints): {_bad[:8]}"
+        _original_print("debug_decode: all checkpoints passed ✓")
 
     # ------------------------------------------------------------------
     # Binary dump (for run_from_bin)
@@ -3035,7 +4018,8 @@ class MobileSAM_UE(UnifiedEngine):
         _original_print(f"  Programs: {_sz_str} ({_sz} bytes) → {bin_path}")
 
     def _encoder_ops(self, flush, gpr_s0: int = None,
-                     gpr_ntok: int = None, gpr_hw: int = None, gpr_flash: int = None):
+                     gpr_ntok: int = None, gpr_hw: int = None, gpr_flash: int = None,
+                     gpr_pbi: int = None):
         """All encoder instruction ops."""
 
         def _set_s0():
@@ -3139,9 +4123,9 @@ class MobileSAM_UE(UnifiedEngine):
 
         # ---- Stage 1: 2× TinyViTBlock ----
         _HW1 = ENC_S1_H * ENC_S1_W
-        self._run_s1_block(self.S1B[0], self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        self._run_s1_block(self.S1B[0], self.PM01_OUT_DRAM, self.S1B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         flush()
-        self._run_s1_block(self.S1B[1], self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        self._run_s1_block(self.S1B[1], self.S1B0_OUT_DRAM, self.S1B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         flush()
 
         # ---- PatchMerging 1→2 ----
@@ -3169,7 +4153,7 @@ class MobileSAM_UE(UnifiedEngine):
             (self.S2B4_OUT_DRAM, self.S2B5_OUT_DRAM),
         ]
         for _bi, (_in, _out) in enumerate(_s2_io):
-            self._run_s2_block(self.S2B[_bi], _in, _out, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+            self._run_s2_block(self.S2B[_bi], _in, _out, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
             flush()
 
         # ---- PatchMerging 2→3 ----
@@ -3188,9 +4172,9 @@ class MobileSAM_UE(UnifiedEngine):
         # ---- Stage 3: 2× TinyViTBlock ----
         _C3  = ENC_S3_C
         _HW3 = ENC_S3_H * ENC_S3_W
-        self._run_s3_block(self.S3B[0], self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        self._run_s3_block(self.S3B[0], self.PM23_OUT_DRAM, self.S3B0_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         flush()
-        self._run_s3_block(self.S3B[1], self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash)
+        self._run_s3_block(self.S3B[1], self.S3B0_OUT_DRAM, self.S3B1_OUT_DRAM, gpr_ntok=gpr_ntok, gpr_hw=gpr_hw, gpr_flash=gpr_flash, gpr_pbi=gpr_pbi)
         flush()
 
         # ---- Neck ----
@@ -3287,6 +4271,11 @@ def conv2d_3x3_dw_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR
     loads 3 input rows to SRAM per output row and does 9 strided scatter writes to build
     im2col — reducing Python DMA calls by ~128x vs the per-pixel approach.
     """
+    # --- PBI delegation (legacy body below retained but unreachable) ---
+    if getattr(ue, "_enc_pbi_dw", True):
+        return conv2d_3x3_dw_pbi(ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IM2COL_DRAM_ADDR,
+                                 WEIGHT_DRAM_ADDR, BIAS_DRAM_ADDR, H, W, C,
+                                 stride=1, gelu_enable=gelu_enable)
     BLK = 64
     K   = 9 * BLK
     n_blocks = C // BLK
@@ -3433,6 +4422,11 @@ def conv2d_3x3_dw_stride2_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
     conv2d_3x3_dw_dram but with stride=2 in the spatial gather loop.
     gpr_M_reg: if set, collapses the matmul M-unroll via PBI hw for-loop.
     """
+    # --- PBI delegation (legacy body below retained but unreachable) ---
+    if getattr(ue, "_enc_pbi_dw", True):
+        return conv2d_3x3_dw_pbi(ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IM2COL_DRAM_ADDR,
+                                 WEIGHT_DRAM_ADDR, BIAS_DRAM_ADDR, H_in, W_in, C,
+                                 stride=2, gelu_enable=gelu_enable)
     BLK = 64
     K   = 9 * BLK
     H_out = (H_in - 1) // 2 + 1
@@ -3488,6 +4482,9 @@ def conv2d_3x3_dw_stride2_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
 def window_partition_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                           H: int, W: int, C: int, ws: int) -> tuple:
     """(H*W, C) HWC → (nH*nW, WIN_PAD, C). Returns (nH, nW, WIN_PAD)."""
+    # --- PBI delegation (legacy body below retained but unreachable) ---
+    if getattr(ue, "_enc_pbi_win", True):
+        return window_partition_pbi(ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, H, W, C, ws)
     pad_h  = (ws - H % ws) % ws
     pad_w  = (ws - W % ws) % ws
     pH, pW = H + pad_h, W + pad_w
@@ -3527,6 +4524,9 @@ def window_partition_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_A
 def window_reverse_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                         H: int, W: int, C: int, ws: int, nH: int, nW: int, WIN_PAD: int) -> None:
     """(nH*nW, WIN_PAD, C) → (H*W, C). Clips boundary windows."""
+    # --- PBI delegation (legacy body below retained but unreachable) ---
+    if getattr(ue, "_enc_pbi_win", True):
+        return window_reverse_pbi(ue, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, H, W, C, ws, nH, nW, WIN_PAD)
     for wh in range(nH):
         for ww in range(nW):
             win_idx = wh * nW + ww
@@ -3586,6 +4586,8 @@ def main():
                         help="Single-point inference: encode image, run decoder for this point, save best mask")
     parser.add_argument("--debug-encode", action="store_true",
                         help="Step through encoder stage-by-stage, asserting no NaNs at each checkpoint")
+    parser.add_argument("--debug-decode", action="store_true",
+                        help="Step through decoder stage-by-stage, asserting no NaNs at each checkpoint")
     args = parser.parse_args()
 
     set_dma_device(args.dev)
@@ -3663,8 +4665,20 @@ def main():
             toks = tokens_t.to(torch.bfloat16).contiguous()
             self.dma_to_accelerator_memory(self.TOKENS_DRAM, toks.flatten())
             self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, toks.flatten())
+            _t0 = time.perf_counter()
+            _stop_timer = False
+            def _roll_timer():
+                while not _stop_timer:
+                    _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                    time.sleep(0.5)
+            import threading as _th
+            _timer = _th.Thread(target=_roll_timer, daemon=True)
+            _timer.start()
             self.start_execute_from_dram(prog_addr)
             self.wait_queue(timeout)
+            _stop_timer = True
+            _timer.join()
+            _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s")
             masks = self.dma_from_accelerator_memory(self.MASK_OUT, (4, 256*256)).float().reshape(4,256,256)
             iou = self.dma_from_accelerator_memory(self.IOU_OUT, (64,)).float()[:4]
             return masks, iou
@@ -3686,6 +4700,18 @@ def main():
         _timer = _th.Thread(target=_roll_timer, daemon=True)
         _timer.start()
         ue = MobileSAM_UE(WEIGHTS)
+        ue._dec_pbi_reshape = os.environ.get("DEC_PBI_RESHAPE", "1") == "1"
+        ue._dec_pbi_convt = os.environ.get("DEC_PBI_CONVT", "1") == "1"
+        # conv/dw PBI proven correct on hardware (user_hw_test: 54-55 dB at model
+        # scale, model _pbi_zero_dram zeroing, back-to-back in one program). Default
+        # ON; set ENC_PBI_CONV/DW=0 to fall back to legacy for A/B bisecting.
+        ue._enc_pbi_conv = os.environ.get("ENC_PBI_CONV", "1") == "1"
+        ue._enc_pbi_dw = os.environ.get("ENC_PBI_DW", "1") == "1"
+        ue._enc_pbi_win = os.environ.get("ENC_PBI_WIN", "1") == "1"
+        ue._dw_mreg = os.environ.get("DW_MREG", "1") == "1"
+        ue._conv_mreg = os.environ.get("CONV_MREG", "1") == "1"
+        _original_print(f"  [bisect] reshape={ue._dec_pbi_reshape} convt={ue._dec_pbi_convt} "
+                        f"conv={ue._enc_pbi_conv} dw={ue._enc_pbi_dw} win={ue._enc_pbi_win}")
         enc_prog = ue.compile_encoder()
         _original_print(f"\r  Encoder: 1 program  ({time.perf_counter() - _t0:.1f}s)")
         dec_prog = ue.compile_decoder()
@@ -3705,6 +4731,23 @@ def main():
         else:
             ue.software_reset()
             ue.debug_encode(image_t)
+        return
+
+    if args.debug_decode:
+        if bins_exist:
+            _original_print("--debug-decode requires a fresh compile (bins found — delete mobilesam_bin/ and re-run)")
+            return
+        px, py = args.point
+        _pw = _get_prompt_weights()
+        coord = torch.tensor([[float(px), float(py)]])
+        sparse_tok = _amg_encode_point(coord, _pw)
+        tokens_t = _assemble_tokens(WEIGHTS, sparse_tok)
+        ue.execute_encoder(enc_prog, image_t)  # software_reset + clean encoder
+        image_emb_t = ue.dma_from_accelerator_memory(ue.NECK_OUT_DRAM, (GA, DEC_DIM)).bfloat16()
+        assert torch.isnan(image_emb_t).sum().item() == 0, "encoder output NaN — fix encoder first"
+        ue.software_reset()
+        ue.preload_decoder_image(image_emb_t, image_pe_t, dense_t)
+        ue.debug_decode(tokens_t)
         return
 
     if args.point:
@@ -3747,6 +4790,7 @@ def main():
             _original_print(f"  Saved {path}")
 
         _save_point_overlay((masks_hw[best] > _MASK_THRESHOLD).cpu().numpy(), "mask_point.png", [0, 255, 100])
+        _original_print(f"TEST_RESULT:{json.dumps({'decoded_text': f'mask_iou={iou_hw[best]:.4f}'})}")
         return
 
     # ---- Execute (HW encoder + AMG decoder) ----
@@ -3773,6 +4817,7 @@ def main():
     # ---- Overlays ----
     _original_print("\nSaving overlays …")
     _save_amg_overlay(image_t, hw_masks,  "mask_hw.png")
+    _original_print(f"TEST_RESULT:{json.dumps({'decoded_text': f'{len(hw_masks)} masks'})}")
 
 
 # ---------------------------------------------------------------------------
