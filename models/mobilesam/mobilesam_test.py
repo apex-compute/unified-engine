@@ -2029,8 +2029,21 @@ class MobileSAM_UE(UnifiedEngine):
         toks = tokens_t.to(torch.bfloat16).contiguous()
         self.dma_to_accelerator_memory(self.TOKENS_DRAM,    toks.flatten())
         self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, toks.flatten())
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                time.sleep(0.5)
+        import threading as _th
+        _timer = _th.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         self.start_execute_from_dram(prog_addr)
         self.wait_queue(timeout)
+        _stop_timer = True
+        _timer.join()
+        import sys as _sys
+        _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s")
         masks = self.dma_from_accelerator_memory(self.MASK_OUT, (4, 256 * 256)).float().reshape(4, 256, 256)
         iou   = self.dma_from_accelerator_memory(self.IOU_OUT, (64,)).float()[:4]
         return masks, iou
@@ -2061,8 +2074,21 @@ class MobileSAM_UE(UnifiedEngine):
         self.dma_to_accelerator_memory(self.SRC_DRAM,       src_t.flatten())
         self.dma_to_accelerator_memory(self.KEY_PE_DRAM,    image_pe_t.to(torch.bfloat16).contiguous().flatten())
 
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                time.sleep(0.5)
+        import threading as _th
+        _timer = _th.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         self.start_execute_from_dram(prog_addr)
         self.wait_queue(timeout)
+        _stop_timer = True
+        _timer.join()
+        import sys as _sys
+        _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s")
 
         # Read masks: (4, 65536) → (4, 256, 256)
         masks_hw = self.dma_from_accelerator_memory(
@@ -3243,8 +3269,20 @@ class MobileSAM_UE(UnifiedEngine):
         img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, ENC_CIN_PAD, dtype=torch.bfloat16)
         img_pad[:, :3] = img_hwc.reshape(-1, 3)
         self.dma_to_accelerator_memory(self.PE_IN_DRAM, img_pad.reshape(-1))
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                _original_print(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                time.sleep(0.5)
+        import threading as _th
+        _timer = _th.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         self.start_execute_from_dram(prog)
         self.wait_queue(600.0)
+        _stop_timer = True
+        _timer.join()
+        _original_print(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s")
         _HW1 = ENC_S1_H * ENC_S1_W
         _HW2 = ENC_S2_H * ENC_S2_W
         _HW3 = ENC_S3_H * ENC_S3_W
@@ -4627,8 +4665,20 @@ def main():
             toks = tokens_t.to(torch.bfloat16).contiguous()
             self.dma_to_accelerator_memory(self.TOKENS_DRAM, toks.flatten())
             self.dma_to_accelerator_memory(self.TOKENS_PE_DRAM, toks.flatten())
+            _t0 = time.perf_counter()
+            _stop_timer = False
+            def _roll_timer():
+                while not _stop_timer:
+                    _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s", end="", flush=True)
+                    time.sleep(0.5)
+            import threading as _th
+            _timer = _th.Thread(target=_roll_timer, daemon=True)
+            _timer.start()
             self.start_execute_from_dram(prog_addr)
             self.wait_queue(timeout)
+            _stop_timer = True
+            _timer.join()
+            _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s")
             masks = self.dma_from_accelerator_memory(self.MASK_OUT, (4, 256*256)).float().reshape(4,256,256)
             iou = self.dma_from_accelerator_memory(self.IOU_OUT, (64,)).float()[:4]
             return masks, iou

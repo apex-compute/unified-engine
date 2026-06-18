@@ -131,8 +131,22 @@ class MobileSAM_UE_Run(UnifiedEngine):
         img_pad = torch.zeros(ENC_IN_H * ENC_IN_W, 64, dtype=torch.bfloat16)
         img_pad[:, :3] = img_hwc.reshape(-1, 3)
         self.dma_to_accelerator_memory(self.pe_in_dram, img_pad.reshape(-1))
+        import time, threading, sys
+        _t0 = time.perf_counter()
+        _stop_timer = False
+        def _roll_timer():
+            while not _stop_timer:
+                sys.stdout.write(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s")
+                sys.stdout.flush()
+                time.sleep(0.5)
+        _timer = threading.Thread(target=_roll_timer, daemon=True)
+        _timer.start()
         self.start_execute_from_dram(prog)
         self.wait_queue(120.0)
+        _stop_timer = True
+        _timer.join()
+        sys.stdout.write(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s\n")
+        sys.stdout.flush()
 
     def dma_to_accelerator_memory(self, dma_address, data):
         """Chunked DMA write with flat bf16 handling."""
