@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Qwen2.5-VL-3B on accelerator. LM and vision precisions are
-config-driven via qwen2.5_vl_3b_config.json::precision.{lm,vision}
-(values: int4 / fp4 / if4). Defaults: lm=if4 (eval-winning text codec
-per src/models/qwen2.5_VL_3b/compare/summary.md), vision=int4 (legacy
-released codec, byte-identical to the prior Q4_64 path). All
-quantization goes through src/template/quant_lib.py."""
+"""Qwen2.5-VL-3B inference from pre-generated weight and instruction bins.
+
+This entry point is intentionally independent of qwen2.5_vl_3b_test.py. It
+never downloads a model, generates weights, or compiles accelerator programs.
+All model/tokenizer assets must already exist under qwen2.5_vl_3b_bin/.
+"""
 
 import json
 import math
@@ -13,7 +13,6 @@ import sys
 
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -552,17 +551,15 @@ def _load_config(script_dir: str) -> dict:
     return cfg
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
-    """Ensure HF model is downloaded and loaded. Returns (model, model_dir)."""
+    """Load an already-present local HF model. Network access is never attempted."""
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
-    hf_repo = cfg["paths"]["hf_model_repo"]
     config_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(config_path):
-        _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
-        snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
-        _original_print("Download complete.")
+        raise FileNotFoundError(f"Local model config not found: {config_path}")
     from transformers import Qwen2_5_VLForConditionalGeneration
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16, device_map=None, trust_remote_code=True
+        model_dir, torch_dtype=torch.bfloat16, device_map=None,
+        trust_remote_code=True, local_files_only=True
     )
     # Newer transformers nests vision encoder under model.model.visual;
     # expose it as model.visual so the rest of the code can access it directly.
@@ -1202,22 +1199,25 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                            self._rope_table_bytes, len(self._rope_table_bytes))
 
     def weight_init(self) -> None:
-        """Load LM + vision weights from bin files to DRAM."""
+        """Load local LM + vision weight bins to DRAM; never download/generate."""
         from transformers import AutoTokenizer
         model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
-        hf_repo = self._cfg["paths"]["hf_model_repo"]
-        config_path = os.path.join(model_dir, "config.json")
-        if not os.path.exists(config_path):
-            _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
-            snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
-            _original_print("Download complete.")
-
-        # Generate weight bins if missing
         lm_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["lm_weights"])
         vis_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["vision_weights"])
-        if not os.path.exists(lm_bin_path) or not os.path.exists(vis_bin_path):
-            _original_print("Weight bins not found, generating...")
-            weight_bin_generate(script_dir=self.script_dir, output_lm=lm_bin_path, output_vis=vis_bin_path)
+        required = [
+            os.path.join(model_dir, "config.json"),
+            os.path.join(model_dir, "tokenizer_config.json"),
+            lm_bin_path,
+            lm_bin_path.rsplit(".", 1)[0] + ".json",
+            vis_bin_path,
+            vis_bin_path.rsplit(".", 1)[0] + ".json",
+        ]
+        missing = [path for path in required if not os.path.isfile(path)]
+        if missing:
+            raise FileNotFoundError(
+                "Missing local runtime assets; run qwen2.5_vl_3b_test.py on the "
+                "build system first:\n  " + "\n  ".join(missing)
+            )
 
         # Load LM weights
         print(f"  Reading LM weight bin (memmap)...", flush=True)
@@ -1229,7 +1229,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         embed_bf16 = torch.from_numpy(embed_raw.copy()).view(torch.bfloat16).reshape(self.EMBEDDING_ELEMENTS, self.vector_length)
         self.embedding_weight = embed_bf16.clone()  # host copy for token lookup
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_dir, trust_remote_code=True, local_files_only=True)
 
         # Per-layer weights — config-driven precision (precision.lm) for
         # Q/K/gate/up/down, BF16 for V/O (all from binary). Default 'if4'
@@ -1339,7 +1340,26 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.vis_layer_addrs.append(la)
 
         # Patch embedding (Conv3D weight [1280, 3, 2, 14, 14]); precision per cfg.
-        self.patch_weight_scale, self.patch_weight_data = store_quantized_weight(self, vis_cache[f'visual.patch_embed.proj.weight.{vis_prec}'])
+        patch_raw = vis_cache[f'visual.patch_embed.proj.weight.{vis_prec}']
+        self.patch_weight_scale, self.patch_weight_data = store_quantized_weight(self, patch_raw)
+        # Keep a host-side dequantized copy for image patch embedding. This avoids
+        # loading the original HF model/safetensor shards at runtime.
+        patch_shape = (
+            VH,
+            3 * self._vis_cfg["temporal_patch_size"]
+            * self._vis_cfg["patch_size"] * self._vis_cfg["patch_size"],
+        )
+        patch_blocks = patch_raw.nbytes // 34
+        patch_scale_bytes = patch_blocks * 2
+        patch_bytes = patch_raw.tobytes()
+        self._patch_weight_host = quant_lib.dequant(
+            vis_prec,
+            patch_bytes[patch_scale_bytes:],
+            patch_bytes[:patch_scale_bytes],
+            N=1,
+            K=patch_shape[0] * patch_shape[1],
+            block_size=64,
+        ).reshape(*patch_shape).contiguous()
 
         # Merger
         self.merger_ln_q_weight = store_weight(self, torch.from_numpy(vis_cache['visual.merger.ln_q.weight'].copy()).view(torch.bfloat16))
@@ -2008,32 +2028,18 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
     def prepare_encoder_input(self, pixel_values: torch.Tensor,
                               image_grid_thw: torch.Tensor = None) -> dict:
-        """Preprocess image: patch_embed, window reorder, RoPE tables. Call before compile_encoder()."""
+        """Preprocess an image using local processor metadata and binned patch weights."""
         vis_cfg = self._vis_cfg
         VS = vis_cfg["num_patches"]
         VH = vis_cfg["hidden_size"]
         VD = vis_cfg["head_dim"]
-        VD_PAD = 128
         model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
-
-        if not hasattr(self, '_hf_model'):
-            print("    Loading HF model for patch embedding...")
-            from transformers import Qwen2_5_VLForConditionalGeneration
-            self._hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_dir, torch_dtype=torch.bfloat16
-            )
-            if not hasattr(self._hf_model, 'visual') and hasattr(self._hf_model, 'model') and hasattr(self._hf_model.model, 'visual'):
-                self._hf_model.visual = self._hf_model.model.visual
-            self._hf_model.eval()
-            print("    HF model loaded.")
-
-        model = self._hf_model
 
         with torch.no_grad():
             if image_grid_thw is not None:
                 pixel_values_hf = pixel_values.to(torch.bfloat16)
             else:
-                from transformers import AutoTokenizer, Qwen2VLImageProcessor
+                from transformers import Qwen2VLImageProcessor
                 from PIL import Image
                 img_np = pixel_values.float().permute(1, 2, 0).numpy()
                 img_cfg = self._cfg.get("image_processing", {})
@@ -2045,26 +2051,74 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 pil_img = Image.fromarray(img_np)
                 img_size = vis_cfg.get("image_size", 336)
                 pil_img = pil_img.resize((img_size, img_size), Image.Resampling.BILINEAR)
-                messages = [{"role": "user", "content": [
-                    {"type": "image", "image": pil_img},
-                    {"type": "text", "text": "Describe this image."},
-                ]}]
-                tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-                text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                image_processor = Qwen2VLImageProcessor.from_pretrained(model_dir, trust_remote_code=True)
+                image_processor = Qwen2VLImageProcessor.from_pretrained(
+                    model_dir, trust_remote_code=True, local_files_only=True)
                 img_inputs = image_processor(images=[pil_img], return_tensors="pt")
-                text_enc = tokenizer(text_input, return_tensors="pt")
                 pixel_values_hf = img_inputs["pixel_values"].to(torch.bfloat16)
                 image_grid_thw = img_inputs["image_grid_thw"]
 
-            visual = model.visual
-            patch_embeds = visual.patch_embed(pixel_values_hf)
+            patch_embeds = torch.nn.functional.linear(
+                pixel_values_hf, self._patch_weight_host)
             assert patch_embeds.shape == (VS, VH), \
                 f"Patch embed shape {patch_embeds.shape} != ({VS}, {VH})"
-            rotary_pos_emb = visual.rot_pos_emb(image_grid_thw)
 
-            window_index, cu_window_seqlens = visual.get_window_index(image_grid_thw)
-            spatial_merge_unit = visual.spatial_merge_size ** 2
+            # Reproduce Qwen2.5-VL rot_pos_emb without instantiating the model.
+            spatial_merge_size = vis_cfg["spatial_merge_size"]
+            pos_ids = []
+            for grid_t, grid_h, grid_w in image_grid_thw.tolist():
+                hpos = torch.arange(grid_h).unsqueeze(1).expand(-1, grid_w)
+                hpos = hpos.reshape(
+                    grid_h // spatial_merge_size, spatial_merge_size,
+                    grid_w // spatial_merge_size, spatial_merge_size,
+                ).permute(0, 2, 1, 3).flatten()
+                wpos = torch.arange(grid_w).unsqueeze(0).expand(grid_h, -1)
+                wpos = wpos.reshape(
+                    grid_h // spatial_merge_size, spatial_merge_size,
+                    grid_w // spatial_merge_size, spatial_merge_size,
+                ).permute(0, 2, 1, 3).flatten()
+                pos_ids.append(torch.stack([hpos, wpos], dim=-1).repeat(grid_t, 1))
+            pos_ids = torch.cat(pos_ids, dim=0)
+            rotary_dim = VD // 2
+            inv_freq = 1.0 / (
+                10000.0 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+            )
+            rotary_full = torch.outer(
+                torch.arange(int(image_grid_thw[:, 1:].max()), dtype=torch.float32),
+                inv_freq,
+            )
+            rotary_pos_emb = rotary_full[pos_ids].flatten(1)
+
+            # Reproduce get_window_index for the fixed image grid.
+            window_parts = []
+            cu_window_seqlens = [0]
+            window_index_id = 0
+            merger_window = (
+                vis_cfg["window_size"] // spatial_merge_size // vis_cfg["patch_size"]
+            )
+            for grid_t, grid_h, grid_w in image_grid_thw.tolist():
+                llm_h = grid_h // spatial_merge_size
+                llm_w = grid_w // spatial_merge_size
+                index = torch.arange(grid_t * llm_h * llm_w).reshape(grid_t, llm_h, llm_w)
+                pad_h = merger_window - llm_h % merger_window
+                pad_w = merger_window - llm_w % merger_window
+                num_h = (llm_h + pad_h) // merger_window
+                num_w = (llm_w + pad_w) // merger_window
+                padded = torch.nn.functional.pad(index, (0, pad_w, 0, pad_h), value=-100)
+                padded = padded.reshape(
+                    grid_t, num_h, merger_window, num_w, merger_window,
+                ).permute(0, 1, 3, 2, 4).reshape(
+                    grid_t, num_h * num_w, merger_window, merger_window)
+                seqlens = (padded != -100).sum((2, 3)).reshape(-1)
+                flattened = padded.reshape(-1)
+                window_parts.append(flattened[flattened != -100] + window_index_id)
+                cumulative = (
+                    seqlens.cumsum(0) * spatial_merge_size**2 + cu_window_seqlens[-1]
+                )
+                cu_window_seqlens.extend(cumulative.tolist())
+                window_index_id += grid_t * llm_h * llm_w
+            window_index = torch.cat(window_parts)
+
+            spatial_merge_unit = spatial_merge_size ** 2
             patch_embeds = patch_embeds.reshape(VS // spatial_merge_unit, spatial_merge_unit, -1)
             patch_embeds = patch_embeds[window_index, :, :]
             patch_embeds = patch_embeds.reshape(VS, -1)
@@ -2974,6 +3028,52 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                                       "decoder_addr", "decoder_preamble",
                                       "prefill_flops", "decoder_flops")}
 
+    def load_all_from_bin(self) -> dict:
+        """Load the complete pre-generated prefill+decoder+encoder instruction bin."""
+        bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
+        bin_path = os.path.join(bin_dir, "instructions.bin")
+        meta_path = os.path.join(bin_dir, "instructions.json")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        expected_template = self.PREFILL_MAX_SEQ_LEN
+        expected_layers = self.LAYER_SIZE
+        if (meta.get("template_seq_len") != expected_template
+                or meta.get("layer_size") != expected_layers):
+            raise RuntimeError(
+                "Instruction bin/config mismatch: bin was generated for "
+                f"template_seq_len={meta.get('template_seq_len')}, "
+                f"layer_size={meta.get('layer_size')}; runtime config requires "
+                f"{expected_template}, {expected_layers}."
+            )
+
+        with open(bin_path, "rb") as f:
+            raw = f.read()
+        for seg in meta.get("segments", []):
+            start = int(seg["off"])
+            end = start + int(seg["size"])
+            payload = raw[start:end]
+            if len(payload) != int(seg["size"]):
+                raise RuntimeError(
+                    f"Truncated instruction segment {seg.get('name', '<unnamed>')}: "
+                    f"expected {seg['size']} bytes, got {len(payload)}"
+                )
+            self.dma_write(DMA_DEVICE_H2C, int(seg["addr"]), payload, len(payload))
+
+        self._next_program_dram_addr = int(meta["end_addr"])
+        self._gf_one = int(meta["gf_one"])
+        self._gf_rope_cos_abs = int(meta["gf_rope_cos_abs"])
+        self._decoder_preamble_addr = int(meta["decoder_preamble"])
+        self._vis_program_addr = int(meta["encoder_addr"])
+        _original_print(
+            f"  Loaded unified instruction bin ({len(raw) / 1024**2:.1f} MB, "
+            f"{len(meta.get('segments', []))} segments)"
+        )
+        return {key: meta[key] for key in (
+            "encoder_addr", "prefill_addr", "prefill_preamble",
+            "decoder_addr", "decoder_preamble", "prefill_flops", "decoder_flops",
+        )}
+
     def _structural_token_ids(self) -> set:
         """Token ids that must NEVER be repetition-penalized: punctuation, whitespace,
         newline, special tokens. Penalizing these 'glue' tokens over a long generation
@@ -3179,7 +3279,8 @@ def _clock_ns_default_for_device(device: str) -> float:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Qwen2.5-VL-3B prefill + decode on accelerator.")
+    parser = argparse.ArgumentParser(
+        description="Qwen2.5-VL-3B inference from pre-generated local bins.")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt (default: an image-describe prompt in VLM mode, "
                              "a text-only prompt in LM mode)")
@@ -3215,6 +3316,32 @@ def main():
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg = _load_config(script_dir)
+    bin_dir = os.path.join(script_dir, "qwen2.5_vl_3b_bin")
+
+    # Fail before hardware initialization. This runtime never downloads,
+    # generates, or recompiles missing artifacts.
+    lm_bin = os.path.join(script_dir, cfg["paths"]["lm_weights"])
+    vis_bin = os.path.join(script_dir, cfg["paths"]["vision_weights"])
+    model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
+    required = [
+        lm_bin,
+        lm_bin.rsplit(".", 1)[0] + ".json",
+        vis_bin,
+        vis_bin.rsplit(".", 1)[0] + ".json",
+        os.path.join(bin_dir, "instructions.bin"),
+        os.path.join(bin_dir, "instructions.json"),
+        os.path.join(model_dir, "config.json"),
+        os.path.join(model_dir, "tokenizer_config.json"),
+        os.path.join(model_dir, "tokenizer.json"),
+        os.path.join(model_dir, "preprocessor_config.json"),
+    ]
+    missing = [path for path in required if not os.path.isfile(path)]
+    if missing:
+        parser.error(
+            "missing pre-generated runtime assets (run qwen2.5_vl_3b_test.py "
+            "on the build system first):\n  " + "\n  ".join(missing)
+        )
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
@@ -3240,7 +3367,6 @@ def main():
     ue.dma_write(DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, halt_bytes, len(halt_bytes))
     ue.clear_capture_buffer()
 
-    cfg = _load_config(script_dir)
     if args.image and args.image.lower() == "none":
         args.image = None
     # Default is LM (text-only). VLM runs when --image is given, or when
@@ -3274,11 +3400,11 @@ def main():
     # Built once (first run), serves BOTH LM-only and VLM. LM section is captured
     # first at a fixed base so its §7 JUMP_ABS targets never depend on the encoder;
     # the encoder is appended after and only executed for VLM. See compile_all.
-    print(f"\n--- Compiling complete instruction bin ---")
+    print(f"\n--- Loading complete instruction bin ---")
     _t_uni = time.perf_counter()
-    progs = ue.compile_all()
-    t_uni_compile = time.perf_counter() - _t_uni
-    print(f"  {t_uni_compile:.2f}s")
+    progs = ue.load_all_from_bin()
+    t_uni_load = time.perf_counter() - _t_uni
+    print(f"  {t_uni_load:.2f}s")
 
     if fpga_vision:
         t_compile = time.perf_counter() - timer_vis
@@ -3289,7 +3415,8 @@ def main():
     if args.prompt is not None or has_image:
         tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tok_path, trust_remote_code=True, local_files_only=True)
         prompt_text = args.prompt or "Describe this image."
         if has_image:
             # Build prompt with image placeholder tokens for Qwen2.5-VL
@@ -3353,8 +3480,6 @@ def main():
     gflops_prefill        = progs["prefill_flops"]
     decoder_program_addr  = progs["decoder_addr"]
     gflops_per_token      = progs["decoder_flops"]
-    t_prefill_compile = t_decode_compile = 0.0  # folded into the unified compile
-
     print(f"\n--- Prefill run ({len(prefill_seq)} tokens) ---")
     timer = time.perf_counter()
     ue.run_prefill(prefill_program_addr, prefill_preamble_addr, prefill_seq=prefill_seq, gflops=gflops_prefill, has_image=has_image)
@@ -3400,18 +3525,18 @@ def main():
         vis_run = t_total - t_compile
         print(f"  Vision compile:   {t_compile:.2f}s")
         print(f"  Vision run:       {vis_run:.2f}s  ({vis_gflops:.2f} GFLOPS)")
-    print(f"  Unified compile:  {t_uni_compile:.2f}s  (encoder+prefill+decoder, one bin)")
+    print(f"  Unified bin load: {t_uni_load:.2f}s  (encoder+prefill+decoder, one bin)")
     prefill_flops = gflops_prefill if isinstance(gflops_prefill, (int, float)) else 0
     print(f"  Prefill run:      {latency_prefill:.2f}s  ({prefill_hw_gflops:.2f} GFLOPS)  ({len(prefill_seq)} tokens)")
     print(f"  Decode run:       {latency_decoder:.2f}s  ({n_new} tokens, {latency_decoder/max(n_new,1):.2f}s/tok)")
-    total = (t_total if fpga_vision else 0) + t_uni_compile + latency_prefill + latency_decoder
+    total = (t_total if fpga_vision else 0) + t_uni_load + latency_prefill + latency_decoder
     print(f"  ──────────────────────────")
     print(f"  Total:            {total:.2f}s")
 
     # Clear FPGA DRAM so stale scratch doesn't bleed into subsequent runs
     # (see [[fpga_compare_clear_dram_oracle.md]] — 400 max|d| floor without this).
     ue.clear_dram()
-    print("Qwen2.5-VL-3B test ends.")
+    print("Qwen2.5-VL-3B runtime ends.")
 
 if __name__ == "__main__":
     main()
