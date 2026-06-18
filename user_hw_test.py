@@ -497,6 +497,172 @@ def conv2d_3x3_dw_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR:
                 src_stride=BLK * _BPE, dst_stride=C * _BPE)
 
 
+def conv2d_3x3_dw_pbi_looped(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                              IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
+                              H: int, W: int, C: int, stride: int = 1,
+                              gelu_enable: bool = False, gpr: int = 1):
+    """Hardware-looped depthwise 3x3/pad-1 conv — collapses h_out into ONE hardware loop.
+
+    Same block-diagonal weight layout, same IM2COL+TEMP buffer contract as
+    conv2d_3x3_dw_pbi, but the per-block h_out Python loop is replaced by a
+    single hardware loop over interior rows (h=1..H-2). Interior rows load 3
+    contiguous input rows into SRAM via general_reg_src (runtime-adressed) and
+    build im2col with fixed strided scatters; boundary rows (top/bottom) fall
+    back to the existing PBI gather so the boundary-cost code path is never
+    exercised inside the hardware loop.
+
+    This reduces the instruction footprint from H_out*(zero+9*gather+matmul+scatter)
+    to zero + (3*load + 9*scatter + matmul + scatter) per interior row → the
+    instruction count is O(width) not O(height*width), critical for tall encoder
+    inputs like the S0 MBConv (256x256).
+    """
+    BLK = 64
+    K = 9 * BLK
+    n_blocks = C // BLK
+    H_out = (H - 1) // stride + 1
+    W_out = (W - 1) // stride + 1
+    TEMP = IM2COL_DRAM_ADDR + W_out * K * _BPE
+
+    # --- SRAM layout (BYTE offsets, matching the fast-path pattern) ---
+    ROW_B = W * BLK * _BPE           # bytes per input row
+    SRAM_R0 = 0                      # row  h-1
+    SRAM_R1 = ROW_B                  # row  h
+    SRAM_R2 = 2 * ROW_B              # row  h+1
+    SRAM_OT = 3 * ROW_B              # output temp (W_out*BLK elements → bytes)
+    SRAM_SZ = SRAM_OT + W_out * BLK * _BPE  # total SRAM bytes
+
+    # Pre-load BLK zeros into SRAM (reused for column-boundary pixels every iteration)
+    zero_dram = ue.get_params_dram_addr()
+    ue.allocate_params_dram(BLK * _BPE)
+    ue.dma_write(DMA_DEVICE_H2C, zero_dram, torch.zeros(BLK, dtype=torch.bfloat16), BLK * _BPE)
+    ue.accelerator_memory_to_sram(zero_dram, SRAM_SZ, BLK)  # zero pixel at SRAM_SZ
+
+    # ------------------------------------------------------------------ #
+    # Per-block: Python loop over 64-channel groups (weight layout changes)
+    # ------------------------------------------------------------------ #
+    for blk in range(n_blocks):
+        c_off = blk * BLK
+        W_ADDR = WEIGHT_DRAM_ADDR + blk * BLK * K * _BPE
+        B_ADDR = BIAS_DRAM_ADDR + c_off * _BPE
+        _pbi_zero_dram(ue, IM2COL_DRAM_ADDR, W_out * K)
+
+        # ----- interior rows (all 3 input rows in-bounds, no boundary) -----
+        # Interior: h_out where h_in-1>=0 AND h_in+1<H.
+        # h_in = h_out*stride. Condition: h_out >= 1 AND h_out*stride+1 < H.
+        # h_out < (H-1)/stride = H_out-1 + ((H-1)%stride != 0)
+        # So interior_last = H_out-2 when (H-1)%stride==0, else H_out-1.
+        interior_first = 1
+        if (H - 1) % stride == 0:
+            interior_last = H_out - 2
+        else:
+            interior_last = H_out - 1
+        n_interior = max(0, interior_last - interior_first + 1)
+
+        if n_interior > 0:
+            # Prime h_out-loop counter
+            ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=n_interior)
+            # GPR layout:
+            #   gpr+0 = loop counter (OVERRIDDEN by loop_start alloc: set via gpr_loop_cnt=gpr)
+            #   gpr+1 = input-row byte address for current h_out (includes c_off)
+            #   gpr+2 = output-row byte address for current h_out (includes c_off)
+            #   gpr+3 = tmp for address arithmetic
+
+            # Prime input base to point to row h-1 of the first interior h_out
+            # (so inside the loop we only add POSITIVE W*C*BPE offsets).
+            h0_minus = interior_first - 1  # row h-1 for first interior iteration
+            in0 = INPUT_DRAM_ADDR + (h0_minus * W * C + c_off) * _BPE
+            out0 = OUTPUT_DRAM_ADDR + (interior_first * W_out * C + c_off) * _BPE
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(in0))
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 2, immediate_value=ue_35bit_addr_shifter(out0))
+
+            ue.reset_inst_ptr_counter()
+            ue._isa_reg_counter = gpr + 4  # pin loop-counter allocation ABOVE our 4 GPRs
+            ue.loop_start(loop_cnt=n_interior, gpr_loop_cnt=gpr)
+
+            # -------- Loop body: gather 3 input rows into SRAM --------
+            # Row h-1: gpr+1 + 0
+            ue.accelerator_memory_to_sram(0, SRAM_R0, W * BLK, general_reg_src=gpr + 1)
+
+            # Row h: gpr+1 + W*C*BPE
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(W * C * _BPE), dst_reg_idx=gpr + 3)
+            ue.accelerator_memory_to_sram(0, SRAM_R1, W * BLK, general_reg_src=gpr + 3)
+
+            # Row h+1: gpr+1 + 2*W*C*BPE
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(2 * W * C * _BPE), dst_reg_idx=gpr + 3)
+            ue.accelerator_memory_to_sram(0, SRAM_R2, W * BLK, general_reg_src=gpr + 3)
+
+            # -------- Build im2col via 9 strided scatters --------
+            # Pre-write zero boundary pixels at column 0 (dx=-1 taps) and column W-1 (dx=+1 taps)
+            for dy in (-1, 0, 1):
+                ki = (dy + 1) * 3 + 0  # dx=-1
+                ue.sram_to_accelerator_memory(SRAM_SZ, IM2COL_DRAM_ADDR + 0 * K * _BPE + ki * BLK * _BPE, BLK)
+                ki = (dy + 1) * 3 + 2  # dx=+1
+                ue.sram_to_accelerator_memory(SRAM_SZ, IM2COL_DRAM_ADDR + (W_out - 1) * K * _BPE + ki * BLK * _BPE, BLK)
+
+            # 9 tap scatters
+            for dy in (-1, 0, 1):
+                sram_row = SRAM_R1 + dy * ROW_B  # byte offset in SRAM for this dy
+                for dx in (-1, 0, 1):
+                    ki = (dy + 1) * 3 + (dx + 1)
+                    w0 = 0 if dx >= 0 else 1  # first valid output column
+                    w_last = W_out - 1 if dx <= 0 else W_out - 2
+                    w_valid = w_last - w0 + 1
+                    if w_valid <= 0:
+                        continue
+                    ue.sram_to_accelerator_memory(
+                        sram_row + max(0, dx) * BLK * _BPE,
+                        IM2COL_DRAM_ADDR + w0 * K * _BPE + ki * BLK * _BPE,
+                        w_valid * BLK,
+                        stride_bytes_per_chunk=BLK * _BPE,
+                        stride_jump_bytes=K * _BPE)
+
+            # -------- Matmul: IM2COL (W_out, K) × WEIGHT (K, BLK) → TEMP (W_out, BLK) --------
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 3, immediate_value=W_out)
+            ue.matmat_mul_core(
+                M=W_out, K=K, N=BLK,
+                A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=W_ADDR,
+                OUTPUT_DRAM_ADDR=TEMP, C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                gelu_enable=gelu_enable, gpr_M_reg=gpr + 3)
+
+            # -------- Scatter TEMP → output (runtime output base in gpr+2) --------
+            ue.accelerator_memory_to_sram(TEMP, SRAM_OT, W_out * BLK)
+            ue.sram_to_accelerator_memory(
+                SRAM_OT, 0, W_out * BLK,
+                stride_bytes_per_chunk=BLK * _BPE,
+                stride_jump_bytes=C * _BPE,
+                general_reg_src=gpr + 2)
+
+            # -------- Advance input/output row bases --------
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(W * C * _BPE), dst_reg_idx=gpr + 1)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 2, immediate_value=ue_35bit_addr_shifter(W_out * C * _BPE), dst_reg_idx=gpr + 2)
+
+            body = ue.loop_end()
+            assert body <= 256, f"dw_pbi_looped: loop body {body} exceeds 256 i-cache budget"
+
+        # ----- Boundary rows (top + bottom) — fall back to existing per-row PBI gather -----
+        boundary_rows = []
+        if H_out >= 1:
+            boundary_rows.append(0)
+        if H_out >= 2:
+            boundary_rows.append(H_out - 1)
+        for h_out in sorted(set(boundary_rows)):
+            _pbi_zero_dram(ue, IM2COL_DRAM_ADDR, W_out * K)
+            _conv3x3_im2col_row_pbi(ue, INPUT_DRAM_ADDR, IM2COL_DRAM_ADDR, h_out,
+                                    H, W, C, c_off, BLK, stride, gpr)
+            ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=W_out)
+            ue.matmat_mul_core(
+                M=W_out, K=K, N=BLK,
+                A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=W_ADDR,
+                OUTPUT_DRAM_ADDR=TEMP, C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                gelu_enable=gelu_enable, gpr_M_reg=gpr)
+            ue.accelerator_memory_to_sram(TEMP, 0, W_out * BLK)
+            pbi_strided_copy(
+                ue, gpr, src_base=TEMP,
+                dst_base=OUTPUT_DRAM_ADDR + (h_out * W_out * C + c_off) * _BPE,
+                count=W_out, copy_bytes=BLK * _BPE,
+                src_stride=BLK * _BPE, dst_stride=C * _BPE)
+
+
 def bf16_permute_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                      dim_0: int, dim_1: int, dim_2: int, gpr: int):
     """Drop-in PBI replacement for bf16_permute_core: (dim_0, dim_1, dim_2) ->
@@ -6325,6 +6491,74 @@ def mobilesam_s2_flash_btb_test(n_calls: int = 5, num_batches: int = 25,
     return worst
 
 
+def mobilesam_dw_conv_em_test(use_looped: bool = False):
+    """EXACT-MATCH recreation of the encoder depthwise-conv situation (the encoder's #1
+    instruction hog, ~20 MB). Runs conv2d_3x3_dw at the real model dims vs torch F.conv2d
+    (depthwise, groups=C) — the exact oracle — and reports SNR + program size, for the
+    current per-row-unrolled kernel (use_looped=False) or the h_out-hardware-loop kernel
+    (use_looped=True). Also runs 2 convs BACK-TO-BACK (S0 has 2 MBConv dw convs) to catch
+    any loop-ceiling/state issue, exactly like the i2t EM gate.
+
+    Model dw-conv shapes: S0 MBConv dw (256x256, C=256, gelu), PatchMerging dw (stride2),
+    S2/S3 local_conv (64x64). S0 is the 4.45 MB/conv case that dominates.
+    """
+    import sys as _sys, importlib
+    import torch.nn.functional as F
+    def _e(x): _sys.stderr.write(str(x) + "\n"); _sys.stderr.flush()
+    M = importlib.import_module("models.mobilesam.mobilesam_test")
+    kernel = (M.conv2d_3x3_dw_pbi_looped if use_looped else M.conv2d_3x3_dw_pbi)
+
+    def _one(H, W, C, stride, gelu, n_btb):
+        ue = UnifiedEngine()
+        BLK = 64; K = 9 * BLK; n_blocks = C // BLK
+        H_out = (H - 1) // stride + 1; W_out = (W - 1) // stride + 1
+        ins, outs, ims, xs = [], [], [], []
+        WGT = ue.allocate_tensor_dram(C * K * _BPE); BIA = ue.allocate_tensor_dram(C * _BPE)
+        torch.manual_seed(0)
+        w = torch.randn(C, 1, 3, 3, dtype=torch.bfloat16) * 0.2
+        b = torch.randn(C, dtype=torch.bfloat16)
+        wblk = torch.zeros(C, K, dtype=torch.bfloat16)
+        for blk in range(n_blocks):
+            for i in range(BLK):
+                c = blk * BLK + i
+                for dy in range(3):
+                    for dx in range(3):
+                        wblk[blk * BLK + i, (dy * 3 + dx) * BLK + i] = w[c, 0, dy, dx]
+        ue.dma_to_accelerator_memory(WGT, wblk); ue.dma_to_accelerator_memory(BIA, b)
+        for j in range(n_btb):
+            IN = ue.allocate_tensor_dram(H * W * C * _BPE)
+            OUT = ue.allocate_tensor_dram(H_out * W_out * C * _BPE)
+            IM = ue.allocate_tensor_dram(W_out * (K + BLK) * _BPE)
+            x = torch.randn(H * W, C, dtype=torch.bfloat16)
+            ue.dma_to_accelerator_memory(IN, x)
+            ins.append(IN); outs.append(OUT); ims.append(IM); xs.append(x)
+        ue.start_capture()
+        gpr_arg = 1 if use_looped else 8
+        for j in range(n_btb):
+            kernel(ue, ins[j], outs[j], ims[j], WGT, BIA, H, W, C, stride, gelu, gpr_arg)
+        ue.stop_capture(); ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr(); isz = ue.get_capture_instruction_size_bytes()
+        ue.write_captured_instructions_to_dram(prog); ue.allocate_program_dram(isz)
+        ue.start_execute_from_dram(prog); ue.wait_queue(120.0)
+        worst = float("inf")
+        for j in range(n_btb):
+            out = ue.dma_from_accelerator_memory(outs[j], (H_out * W_out, C)).float()
+            xin = xs[j].reshape(H, W, C).permute(2, 0, 1).unsqueeze(0).float()
+            ref = F.conv2d(xin, w.float(), b.float(), stride=stride, padding=1, groups=C)
+            if gelu: ref = F.gelu(ref)
+            ref = ref.squeeze(0).permute(1, 2, 0).reshape(H_out * W_out, C)
+            worst = min(worst, calculate_snr(ref, out))
+        return worst, isz
+
+    _e(f"\n[dw_conv_em] kernel={'LOOPED' if use_looped else 'current'}")
+    for (H, W, C, st, g, n) in [(256, 256, 256, 1, True, 2), (128, 128, 128, 2, True, 1),
+                                 (64, 64, 192, 1, False, 1)]:
+        snr, isz = _one(H, W, C, st, g, n)
+        nanf = "" if snr >= 35 else "  <<< FAIL"
+        _e(f"  {H}x{W} C={C} s={st} gelu={g} btb={n}: SNR={snr:6.2f} dB  "
+           f"{isz/1e6:6.3f} MB{nanf}")
+
+
 def mobilesam_i2t_em_test(timeout_s: float = 120.0):
     """EXACT-MATCH recreation of the decoder i2t cross-attention in user_hw_test.
 
@@ -6506,57 +6740,10 @@ if __name__ == "__main__":
     # flash_attention_batched_test(head_dim=64, seq_len=64, num_heads=4, bias_enable=True)
     # flash_attention_batched_test(head_dim=64, seq_len=256, num_heads=5, bias_enable=False)
 
-    # --- Conv 3x3 im2col via PBI hardware loops (encoder bin-size reduction) ---
-    conv2d_3x3_im2col_pbi_test(H_in=16, W_in=16, C_in=64, stride=1)
-    conv2d_3x3_im2col_pbi_test(H_in=32, W_in=32, C_in=64, stride=2)   # patch-embed-style
-    conv2d_3x3_im2col_pbi_test(H_in=24, W_in=24, C_in=128, stride=1)  # wider C_in (Stage 0 dw)
+    # --- MobileSAM dw conv: baseline (current per-row-unrolled PBI) ---
+    # mobilesam_dw_conv_em_test(use_looped=False)
 
-    # --- Window partition / reverse via PBI hardware loops (TinyViT stages) ---
-    window_partition_reverse_pbi_test(H=14, W=14, C=64, ws=7)    # exact (no partial windows)
-    window_partition_reverse_pbi_test(H=16, W=16, C=128, ws=7)   # partial last window + pad rows
-    window_partition_reverse_pbi_test(H=32, W=32, C=160, ws=7)   # larger, partial
-
-    # --- Full 3x3 conv via PBI (regular) vs torch conv2d ---
-    conv2d_3x3_pbi_test(H=16, W=16, C_in=64, C_out=64, stride=1)
-    conv2d_3x3_pbi_test(H=32, W=32, C_in=64, C_out=128, stride=2)   # patch-embed style
-    conv2d_3x3_pbi_test(H=16, W=16, C_in=64, C_out=64, stride=1, gelu_enable=True)
-    # Decisive coverage the old tests lacked: model zeroing (_pbi_zero_dram), wide C_in,
-    # and true patch-embed scale (W_out=512 -> zero span > 1 staging chunk).
-    conv2d_3x3_pbi_test(H=32, W=32, C_in=256, C_out=256, stride=1, zero_fn=_pbi_zero_dram)
-    conv2d_3x3_pbi_test(H=256, W=256, C_in=64, C_out=64, stride=2, zero_fn=_pbi_zero_dram)
-    # Back-to-back convs in ONE program + interleaved matmuls (the model's real shape).
-    conv2d_3x3_pbi_chain_test(reps=4, H=32, W=32, C_in=64, C_out=64, interleave_matmul=True)
-
-    # --- Full 3x3 depthwise conv via PBI vs torch grouped conv2d ---
-    conv2d_3x3_dw_pbi_test(H=16, W=16, C=128, stride=1)
-    conv2d_3x3_dw_pbi_test(H=24, W=24, C=128, stride=2)            # patch-merge style
-    conv2d_3x3_dw_pbi_test(H=16, W=16, C=64, stride=1, gelu_enable=True)
-
-    # --- bf16 permute via PBI (decoder multi-head reshapes) ---
-    bf16_permute_pbi_test(dim_0=64, dim_1=8, dim_2=64)             # NT_PAD tokens (small)
-    bf16_permute_pbi_test(dim_0=4096, dim_1=8, dim_2=64)          # GA=4096 image tokens (the big one)
-    bf16_permute_pbi_test(dim_0=8, dim_1=4096, dim_2=64)          # transposed shape (merge direction)
-
-    # --- bf16 transpose PBI path (decoder per-head V transpose) ---
-    bf16_transpose_test(M=64, N=64, use_pbi=True)
-    bf16_transpose_test(M=4096, N=64, use_pbi=True)
-
-    # --- ConvTranspose2d 2x2 via PBI scatter (decoder upscale) ---
-    conv_transpose2d_2x2_pbi_test(H=64, W=64, C_in=256, C_out=64)    # upscale 0 (64->128)
-    conv_transpose2d_2x2_pbi_test(H=128, W=128, C_in=64, C_out=64)   # upscale 1 (128->256)
-
-    # --- matmul M-unroll: PBI vs legacy across the model's exact conditions ---
-    # In-place + activation (identity-GELU / upscale-GELU) — top suspect for the divergence:
-    matmat_pbi_vs_legacy_test(M=4096,  K=64,  N=64,  gelu=True,  in_place=True)
-    matmat_pbi_vs_legacy_test(M=16384, K=64,  N=64,  gelu=True,  in_place=True)   # upscale gelu
-    matmat_pbi_vs_legacy_test(M=4096,  K=64,  N=64,  gelu=True,  in_place=False)  # same but NOT in-place
-    # Plain / bias projections (decoder cross-attn, neck):
-    matmat_pbi_vs_legacy_test(M=4096,  K=256, N=512, bias=True)                   # cross-attn proj
-    matmat_pbi_vs_legacy_test(M=4096,  K=256, N=256)                              # neck-ish
-    matmat_pbi_vs_legacy_test(M=16384, K=64,  N=64)                               # plain, large M
-    # K=320 (=5*64, NOT a power of 2) — the EXACT neck conv1 shape that broke the model:
-    matmat_pbi_vs_legacy_test(M=4096,  K=320, N=256)                              # neck conv1
-    matmat_pbi_vs_legacy_test(M=512,   K=320, N=256)                              # smaller K=320
-    matmat_pbi_vs_legacy_test(M=4096,  K=192, N=256)                              # another non-pow2 (3*64)
+    # --- MobileSAM dw conv: LOOPED (h_out hardware loop) ---
+    mobilesam_dw_conv_em_test(use_looped=True)
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True

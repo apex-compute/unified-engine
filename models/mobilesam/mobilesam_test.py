@@ -362,6 +362,132 @@ def conv2d_3x3_dw_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR:
                 src_stride=BLK * _BPE, dst_stride=C * _BPE)
 
 
+def conv2d_3x3_dw_pbi_looped(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                              IM2COL_DRAM_ADDR: int, WEIGHT_DRAM_ADDR: int, BIAS_DRAM_ADDR: int,
+                              H: int, W: int, C: int, stride: int = 1,
+                              gelu_enable: bool = False, gpr: int = 1):
+    """Hardware-looped depthwise 3x3/pad-1 conv — collapses h_out into ONE hardware loop.
+
+    Same contract as conv2d_3x3_dw_pbi but interior rows use a single hardware loop
+    with 3-row SRAM loads (general_reg_src) and 9 fixed strided tap scatters.
+    Boundary rows (top/bottom) fall back to the existing PBI gather.
+    """
+    BLK = 64; K = 9 * BLK; n_blocks = C // BLK
+    H_out = (H - 1) // stride + 1; W_out = (W - 1) // stride + 1
+    TEMP = IM2COL_DRAM_ADDR + W_out * K * _BPE
+    ROW_B = W * BLK * _BPE
+    SRAM_R0 = 0; SRAM_R1 = ROW_B; SRAM_R2 = 2 * ROW_B
+    SRAM_OT = 3 * ROW_B
+    ZERO_SRAM = SRAM_OT + W_out * BLK * _BPE
+
+    zero_dram = ue.get_params_dram_addr()
+    ue.allocate_params_dram(BLK * _BPE)
+    ue.dma_write(DMA_DEVICE_H2C, zero_dram, torch.zeros(BLK, dtype=torch.bfloat16), BLK * _BPE)
+    ue.accelerator_memory_to_sram(zero_dram, ZERO_SRAM, BLK)
+
+    for blk in range(n_blocks):
+        c_off = blk * BLK
+        W_ADDR = WEIGHT_DRAM_ADDR + blk * BLK * K * _BPE
+        B_ADDR = BIAS_DRAM_ADDR + c_off * _BPE
+        _pbi_zero_dram(ue, IM2COL_DRAM_ADDR, W_out * K)
+
+        interior_first = 1
+        if (H - 1) % stride == 0:
+            interior_last = H_out - 2
+        else:
+            interior_last = H_out - 1
+        n_interior = max(0, interior_last - interior_first + 1)
+
+        if n_interior > 0:
+            interior_first = 1
+            ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=n_interior)
+            h0m = interior_first - 1
+            in0 = INPUT_DRAM_ADDR + (h0m * W * C + c_off) * _BPE
+            out0 = OUTPUT_DRAM_ADDR + (interior_first * W_out * C + c_off) * _BPE
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(in0))
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 2, immediate_value=ue_35bit_addr_shifter(out0))
+            ue.reset_inst_ptr_counter()
+            ue._isa_reg_counter = gpr + 4
+            ue.loop_start(loop_cnt=n_interior, gpr_loop_cnt=gpr)
+
+            # Load 3 input rows into SRAM (gpr+1 = row h-1, all offsets positive)
+            ue.accelerator_memory_to_sram(0, SRAM_R0, W * BLK, general_reg_src=gpr + 1)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(W * C * _BPE), dst_reg_idx=gpr + 3)
+            ue.accelerator_memory_to_sram(0, SRAM_R1, W * BLK, general_reg_src=gpr + 3)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(2 * W * C * _BPE), dst_reg_idx=gpr + 3)
+            ue.accelerator_memory_to_sram(0, SRAM_R2, W * BLK, general_reg_src=gpr + 3)
+
+            # Column-boundary zero pixels (column 0 for dx=-1, column W-1 for dx=+1)
+            for dy in (-1, 0, 1):
+                ki = (dy + 1) * 3 + 0
+                ue.sram_to_accelerator_memory(ZERO_SRAM, IM2COL_DRAM_ADDR + 0 * K * _BPE + ki * BLK * _BPE, BLK)
+                ki = (dy + 1) * 3 + 2
+                ue.sram_to_accelerator_memory(ZERO_SRAM, IM2COL_DRAM_ADDR + (W_out - 1) * K * _BPE + ki * BLK * _BPE, BLK)
+
+            # 9 tap scatters
+            for dy in (-1, 0, 1):
+                sram_row = SRAM_R1 + dy * ROW_B
+                for dx in (-1, 0, 1):
+                    ki = (dy + 1) * 3 + (dx + 1)
+                    w0 = 0 if dx >= 0 else 1
+                    wl = W_out - 1 if dx <= 0 else W_out - 2
+                    wv = wl - w0 + 1
+                    if wv <= 0:
+                        continue
+                    ue.sram_to_accelerator_memory(
+                        sram_row + max(0, dx) * BLK * _BPE,
+                        IM2COL_DRAM_ADDR + w0 * K * _BPE + ki * BLK * _BPE,
+                        wv * BLK,
+                        stride_bytes_per_chunk=BLK * _BPE,
+                        stride_jump_bytes=K * _BPE)
+
+            # Matmul
+            ue.generate_instruction_add_set(dst_reg_idx=gpr + 3, immediate_value=W_out)
+            ue.matmat_mul_core(
+                M=W_out, K=K, N=BLK,
+                A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=W_ADDR,
+                OUTPUT_DRAM_ADDR=TEMP, C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                gelu_enable=gelu_enable, gpr_M_reg=gpr + 3)
+
+            # Scatter TEMP → output
+            ue.accelerator_memory_to_sram(TEMP, SRAM_OT, W_out * BLK)
+            ue.sram_to_accelerator_memory(
+                SRAM_OT, 0, W_out * BLK,
+                stride_bytes_per_chunk=BLK * _BPE,
+                stride_jump_bytes=C * _BPE,
+                general_reg_src=gpr + 2)
+
+            # Advance bases
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 1, immediate_value=ue_35bit_addr_shifter(W * C * _BPE), dst_reg_idx=gpr + 1)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr + 2, immediate_value=ue_35bit_addr_shifter(W_out * C * _BPE), dst_reg_idx=gpr + 2)
+
+            body = ue.loop_end()
+            assert body <= 256, f"dw_pbi_looped loop body {body} exceeds 256"
+
+        # Boundary rows (top + bottom)
+        boundary_rows = []
+        if H_out >= 1:
+            boundary_rows.append(0)
+        if H_out >= 2:
+            boundary_rows.append(H_out - 1)
+        for h_out in sorted(set(boundary_rows)):
+            _pbi_zero_dram(ue, IM2COL_DRAM_ADDR, W_out * K)
+            _conv3x3_im2col_row_pbi(ue, INPUT_DRAM_ADDR, IM2COL_DRAM_ADDR, h_out,
+                                    H, W, C, c_off, BLK, stride, gpr)
+            ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=W_out)
+            ue.matmat_mul_core(
+                M=W_out, K=K, N=BLK,
+                A_DRAM_ADDR=IM2COL_DRAM_ADDR, B_DRAM_ADDR=W_ADDR,
+                OUTPUT_DRAM_ADDR=TEMP, C_DRAM_ADDR=B_ADDR, bias_mode="broadcast_N",
+                gelu_enable=gelu_enable, gpr_M_reg=gpr)
+            ue.accelerator_memory_to_sram(TEMP, 0, W_out * BLK)
+            pbi_strided_copy(
+                ue, gpr, src_base=TEMP,
+                dst_base=OUTPUT_DRAM_ADDR + (h_out * W_out * C + c_off) * _BPE,
+                count=W_out, copy_bytes=BLK * _BPE,
+                src_stride=BLK * _BPE, dst_stride=C * _BPE)
+
+
 def _window_dims(H: int, W: int, ws: int):
     pad_h = (ws - H % ws) % ws
     pad_w = (ws - W % ws) % ws
