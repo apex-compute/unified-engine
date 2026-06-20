@@ -55,6 +55,10 @@ def build_parser():
                     help="decode sampling temperature (0 = greedy argmax; >0 samples on CPU from FPGA logits)")
     ap.add_argument("--check", action="store_true",
                     help="compare FPGA prefill hidden to CPU-IF4 (rel err)")
+    ap.add_argument("--debug", action="store_true",
+                    help="VLM only: lower the vision encoder + build+exec + connector + merge, then exit")
+    ap.add_argument("--image", type=str, default=None,
+                    help="path to input image for VLM debug (requires --debug)")
     return ap
 
 
@@ -513,6 +517,21 @@ class ExtractedDecoder(IRHarness):
             self.ue.accelerator_memcpy(a.addr, out.addr + h * group * hd * bpe, group * hd * bpe)
         return out
 
+    def _attn_vit(self, li, q, k, v, nm):
+        """Bidirectional encoder attention: flash_attn_pf with no mask, no KV cache.
+        Used by WorkloadBuilder for encoder workloads."""
+        from nn_lib import prefill_flash_attention_core
+        head_dim = q.shape[-1]
+        group = self.spec.get("v_heads", 1)
+        scratch = getattr(self, "v_scratch", self.scratch)
+        identity = getattr(self, "v_identity", self.identity)
+        out = self.arena.alloc(q.shape, q.dtype, name=f"attn_{nm}")
+        prefill_flash_attention_core(self.ue, head_dim=head_dim, seq_len=q.shape[0],
+            Q_DRAM_ADDR=q.addr, K_DRAM_ADDR=k.addr, V_DRAM_ADDR=v.addr,
+            OUTPUT_DRAM_ADDR=out.addr, SCRATCH_DRAM_ADDR=scratch.addr,
+            IDENTITY_DRAM_ADDR=identity.addr, BIAS_DRAM_ADDR=None, num_q_heads=group)
+        return out
+
 
 def _pad_proj_out(w, n_heads, hr, HDP, mode, scale=1.0):
     """Pad an OUTPUT projection weight [n_heads*hr, H] -> [n_heads*HDP, H] so the matmul emits a
@@ -917,9 +936,19 @@ def main():
 
     ExtractedDecoder.spec = spec; ExtractedDecoder.sd = model.state_dict(); ExtractedDecoder.block = block; ExtractedDecoder.wpfx = wpfx
     ExtractedDecoder.plan = plan; ExtractedDecoder.SEQ = SEQ; ExtractedDecoder.x_input = x_input
+    # --debug: exit early for non-VLM (no encoder to lower)
+    if args.debug and mtype != "vlm":
+        print("--debug: model is not a VLM (no vision encoder to lower)")
+        sys.exit(0)
+
     ExtractedDecoder._capture_map = True             # log every chain()->UE_HLO resolution during build
     m = ExtractedDecoder()
     _dump_mapping(m, block, btrace, args.model, dec, model)   # the useful one: fx op + source -> UE_HLO hashtable
+
+    # --debug VLM: lower encoder, build+run on hardware, then exit
+    if args.debug:
+        _debug_lower_encoder(model, spec, m, tok, args.image)
+
     if os.environ.get("LOOM_DUMP_ALL"):           # raw fx / extraction / ir: opt-in (verbose, rarely read)
         _dump_ir(m, spec, block, model, args.model)
         _dump_fx(model, dec, args.model)         # raw torch.fx pull + per-node op mapping, per region
@@ -1047,7 +1076,7 @@ def main():
 _FX_COMPUTE = {
     "scaled_dot_product_attention": "flash_attn", "linear": "matmul",
     "add": "add", "add_": "add", "mul": "mul", "layer_norm": "layer_norm",
-    "native_layer_norm": "layer_norm", "conv2d": "patch-conv -> permute+matmul",
+    "native_layer_norm": "layer_norm",     "conv2d": "patching",
     "gelu": "activation(fold)", "silu": "activation(fold)", "embedding": "(host embed lookup)",
 }
 _FX_SHAPE = {"permute", "transpose", "reshape", "view", "_unsafe_view", "expand", "contiguous",
@@ -1948,6 +1977,477 @@ HF forward pass falls into one of these patterns, which `derive_block()` recogni
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"  step 1 → ir dump       {path}")
+
+
+# =============================================================================
+# --debug: encoder lowering coverage check
+# =============================================================================
+_BLOCK_TO_HLO = {
+    ("attention",):       "flash_attn_pf",     # non-causal, prefill-style
+    ("attention", None):  "flash_attn_pf",
+    ("matmul", "out"):    "matmul",
+    ("matmul", "o"):      "matmul",
+    ("matmul", None):     "matmul",
+    ("mlp",):             "matmul",            # expands to 2 matmuls + activation fold
+    ("norm",):            "layer_norm",        # vision encoder uses LayerNorm (gamma+beta)
+    ("residual",):        "add",
+    ("swiglu",):          "matmul",            # expands to 3 matmuls
+}
+
+def _block_to_hlo(block):
+    """Expand block descriptors to HLO op name sequence.
+    Returns list of (hlo_op, block_step_index, block_step)."""
+    hlos = []
+    for j, step in enumerate(block):
+        key = tuple(step[:2]) if step[1] is not None else (step[0],)
+        hlo = _BLOCK_TO_HLO.get(key)
+        if hlo is None:
+            hlo = _BLOCK_TO_HLO.get((step[0],))   # fallback: match kind only
+        if hlo is None:
+            hlos.append(("?", j, step))
+            continue
+        if step[0] == "mlp":
+            act = step[2].get("act", "gelu") if len(step) > 2 else "gelu"
+            hlos.append((hlo, j, step))          # fc1 (act folded)
+            hlos.append((hlo, j, step))          # fc2 (no act)
+        elif step[0] == "swiglu":
+            hlos.append((hlo, j, step))          # gate
+            hlos.append((hlo, j, step))          # up
+            hlos.append((hlo, j, step))          # down (after mul)
+        else:
+            hlos.append((hlo, j, step))
+    return hlos
+
+def _test_prefill(m, model, spec, label=""):
+    """Run prefill with a simple text-only prompt to verify prefill correctness."""
+    import torch
+    H = spec.get("H", 960)
+    text_ids = torch.tensor([[1, 380, 533, 29871]], dtype=torch.long)
+    emb = model.model.text_model.get_input_embeddings()(text_ids)
+    with torch.no_grad():
+        cpu_out = model.model.text_model(inputs_embeds=emb, use_cache=False)
+        cpu_logit = model.lm_head(cpu_out.last_hidden_state[0, -1])
+        cpu_tok = int(cpu_logit.argmax().item())
+    m.ue.dma_to_accelerator_memory(m.x.addr, emb[0].to(torch.bfloat16))
+    m.execute("prefill", bind={m.seq: 4})
+    hw_hid = m.ue.dma_from_accelerator_memory(m.out.addr, (4, H))
+    hw_tok = int((hw_hid[-1].float() @ model.lm_head.weight.T.float()).argmax().item())
+    match = "✓" if hw_tok == cpu_tok else "✗"
+    print(f"  {label}prefill-diagnostic: CPU={cpu_tok}  HW={hw_tok}  {match}")
+
+
+def _reset_pbi(m):
+    import torch
+    ue = m.ue
+    saved = torch.zeros(8192, dtype=torch.uint16)
+    ue.dma_read(ue.c2h_device, ue._params_dram_base, saved, 16384)
+    ue.software_reset()
+    ue.dma_write(ue.h2c_device, ue._params_dram_base, saved, 16384)
+    print("  PBI reset complete")
+
+
+def _debug_lower_encoder(model, spec, m, tok, image_path=None):
+    """FX-export the vision encoder, map ops to HLO, check UE_HLO coverage,
+    then build + execute the encoder on hardware."""
+
+    vm = getattr(model.model, "vision_model", None) or getattr(model.model, "vision_tower", None)
+    if vm is None:
+        print("  --debug: no vision encoder found"); sys.exit(1)
+
+    H = vm.config.hidden_size
+    P = vm.config.patch_size
+    IMG = getattr(vm.config, "image_size", 384)
+    n_layers = vm.config.num_hidden_layers
+    print(f"\n{'═'*60}")
+    print(f"  VISION ENCODER LOWERING  ({type(vm).__name__})")
+    print(f"  hidden={H} layers={n_layers} patch={P} image={IMG}")
+    print(f"{'═'*60}")
+
+    # ── 1. Derive encoder block topology ─────────────────────────────────────
+    from hlo import UE_HLO
+    trace = []
+    try:
+        block = derive_block(model, dec=vm, region="encoder", trace=trace)
+    except Exception as e:
+        print(f"  encoder block extraction failed: {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+    hlos = _block_to_hlo(block)
+
+    # ── 2. Report block steps → HLO sequence ─────────────────────────────────
+    print(f"\n  Encoder layer block ({len(block)} steps → {len(hlos)} HLO ops):")
+    for j, step in enumerate(block):
+        kind, role = step[0], step[1]
+        traits = step[2] if len(step) > 2 else {}
+        print(f"    [{j:2d}] {kind}" + (f":{role}" if role else "")
+              + (f"  {traits}" if traits else ""))
+
+    print(f"\n  HLO sequence (one layer, repeats x{n_layers}):")
+    missing = set()
+    for (hlo, src_j, _) in hlos:
+        present = hlo in UE_HLO
+        if not present:
+            missing.add(hlo)
+        mk = "+" if present else "?"
+        print(f"    [{mk}] {hlo:20s}  <- step[{src_j}]"
+              + (f"  MISSING from UE_HLO" if not present else ""))
+
+    # ── 3. Full-model export: pos encoding, mask type, head/tail ops ────────
+    print(f"\n  Full-model export (head + tail):")
+    head_ops = []; tail_ops = []
+    pe_type = "none"
+    mask_type = "none"
+    has_pos_embed = False
+    has_rope_module = False
+    try:
+        # Detect RoPE by module structure (most reliable signal)
+        if hasattr(vm, "rotary_emb") or hasattr(vm, "rope"):
+            has_rope_module = True
+        for _, mod in vm.named_modules():
+            cname = type(mod).__name__.lower()
+            if any(kw in cname for kw in ("rotary", "rope")):
+                has_rope_module = True
+
+        batch = torch.zeros(1, 3, IMG, IMG)
+        ep = torch.export.export(vm, (batch,),
+                                 kwargs={"output_hidden_states": None,
+                                         "output_attentions": None,
+                                         "return_dict": None},
+                                 strict=False)
+        base = lambda t: getattr(t, "__name__", str(t)).split(".")[0]
+        seen_layer = False
+        last_input = {}  # tensor name -> producing node (for provenance tracing)
+        for n in ep.graph_module.graph.nodes:
+            # Track data flow: which tensor each node produces
+            if n.op == "placeholder":
+                last_input[n.name] = None  # model input
+            elif n.op == "get_attr":
+                last_input[n.name] = ("param", n.target)  # module parameter
+            elif n.op == "call_function":
+                t = base(n.target)
+                path = ""
+                ms = n.meta.get("nn_module_stack")
+                if ms:
+                    path = list(ms.values())[-1][0] if len(ms) > 0 else ""
+                in_layer = "layers." in path or "encoder.layers" in path
+                # Detect absolute PE: embedding in the head
+                if t == "embedding" and not in_layer:
+                    has_pos_embed = True
+                # Partition head / tail
+                if not seen_layer and not in_layer:
+                    head_ops.append((t, path))
+                elif in_layer:
+                    seen_layer = True
+                elif seen_layer and not in_layer:
+                    tail_ops.append((t, path))
+                # Record output for data-flow tracking
+                if len(n.users) > 0:
+                    last_input[n.name] = ("computed", t)
+            # Classify mask from sdpa argument analysis
+            if n.op == "call_function" and base(n.target) == "scaled_dot_product_attention":
+                am = n.kwargs.get("attn_mask")
+                if am is None:
+                    # positional attn_mask
+                    a = list(n.args)
+                    am = a[3] if len(a) > 3 else None
+                causal = n.kwargs.get("is_causal", False)
+                if am is None and not causal:
+                    mask_type = "none"
+                elif am is None and causal:
+                    mask_type = "causal"
+                elif isinstance(am, str):
+                    src = last_input.get(am)
+                    if src is None:
+                        mask_type = "input_dependent"
+                    elif src[0] == "param":
+                        mask_type = "static_relative_bias"
+                    elif src[0] == "computed" and src[1] == "where":
+                        mask_type = "computed_mask"
+                    else:
+                        mask_type = f"other({str(src)})"
+                elif isinstance(am, (bool, type(None))):
+                    mask_type = "none"
+                else:
+                    mask_type = f"constant({am})"
+
+        # ── Classify position encoding ─────────────────────────────────────
+        if has_rope_module:
+            pe_type = "rope"
+            if has_pos_embed:
+                pe_type = "rope + absolute_pe"  # both (Gemma4 vision)
+        elif has_pos_embed:
+            pe_type = "absolute"
+        else:
+            pe_type = "none"
+
+        print(f"\n  Position encoding: {pe_type}")
+        print(f"  Attention mask:    {mask_type}")
+
+        # ── Display head / tail ops ─────────────────────────────────────────
+        def _show_ops(label, ops):
+            print(f"    {label} ({len(ops)} ops):")
+            shown = 0
+            for t, p in ops:
+                if t in _FX_SHAPE or t in _FX_SCAFFOLD:
+                    continue
+                hlo = _FX_COMPUTE.get(t)
+                if hlo is None:
+                    print(f"      [?] {t:20s} → {'?':30s}  UNMAPPED")
+                else:
+                    present = hlo in UE_HLO
+                    mk = "+" if present else "?"
+                    print(f"      [{mk}] {t:20s} → {hlo:30s}"
+                          + (f"  MISSING from UE_HLO" if not present else ""))
+                shown += 1
+            if shown < len(ops):
+                print(f"      … ({len(ops) - shown} shape/scaffold ops hidden)")
+
+        if head_ops:
+            _show_ops("Head ops", head_ops)
+        if tail_ops:
+            _show_ops("Tail ops", tail_ops)
+
+    except Exception as e:
+        print(f"    full export failed: {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc()
+
+    # ── 4. Summary ───────────────────────────────────────────────────────────
+    print(f"\n{'─'*60}")
+    if missing:
+        print(f"  MISSING from UE_HLO ({len(missing)}):")
+        for m in sorted(missing):
+            print(f"    {m}")
+    else:
+        print(f"  All HLO ops PRESENT in UE_HLO")
+    print(f"  Layer body: {len(hlos)} HLO ops × {n_layers} layers"
+          + (f" + {len(head_ops)} head + {len(tail_ops)} tail" if head_ops or tail_ops else ""))
+    print(f"{'─'*60}")
+
+    enc_result = _build_encoder(m, model, spec, block, image_path)
+    print()
+    conn_result = _build_connector(m, model, enc_result)
+    print()
+
+    # Reset PBI to clear residual state from encoder/connector programs
+    _reset_pbi(m)
+    _merge_and_show(model, spec, conn_result, m, tok)
+    sys.exit(0)
+
+
+def _build_encoder(m, model, spec, block, image_path=None):
+    """Build and execute one encoder layer on hardware."""
+    import torch
+    import re
+    vm = getattr(model.model, "vision_model", None) or getattr(model.model, "vision_tower", None)
+    v_sd = dict(vm.named_parameters())       # {(short)name: tensor}
+    v_cfg = vm.config
+    H = v_cfg.hidden_size
+    P = v_cfg.patch_size
+    IMG = getattr(v_cfg, "image_size", 384)
+    seq = (IMG // P) ** 2
+    n_heads = v_cfg.num_attention_heads
+
+    print(f"\n{'═'*60}")
+    print(f"  BUILDING ENCODER  (1 layer, {seq} patches, H={H})")
+    print(f"{'═'*60}")
+
+    proj_map = {"q":"self_attn.q_proj","k":"self_attn.k_proj",
+                "v":"self_attn.v_proj","out":"self_attn.out_proj",
+                "fc1":"mlp.fc1","fc2":"mlp.fc2"}
+    norm_map = {"ln1":"layer_norm1","ln2":"layer_norm2"}
+    enc_W, enc_N = {}, {}
+
+    l0_mask = re.compile(r"^encoder\.layers\.0\.(.+)\.weight$")
+    for name, w in v_sd.items():
+        m1 = l0_mask.match(name)
+        if not m1:
+            continue
+        suf = m1.group(1)
+        w_t = m.const(w.float(), f"W_{suf.replace('.','_')}")
+        for role, sp in proj_map.items():
+            if suf == sp:
+                enc_W[f"l0.{role}"] = w_t
+        for role, sp in norm_map.items():
+            if suf == sp:
+                enc_N[f"l0.{role}"] = w_t
+                bname = name.replace(".weight", ".bias")
+                if bname in v_sd:
+                    enc_N[f"l0.{role}beta"] = m.const(v_sd[bname].float(),
+                                                       f"N_{suf.replace('.','_')}_b")
+
+    fn_w = fn_b = None
+    for name, w in v_sd.items():
+        if name.endswith("final_layer_norm.weight") or name.endswith("post_layernorm.weight"):
+            fn_w = m.const(w.float(), "fn_w")
+            bname = name.replace(".weight", ".bias")
+            if bname in v_sd:
+                fn_b = m.const(v_sd[bname].float(), "fn_b")
+            break
+
+    hd = H // n_heads
+    m.v_scratch = m.register_constant("aux", "v_scratch",
+        torch.zeros(16 * pad64(seq) * hd))
+    m.v_identity = m.register_constant("aux", "v_identity", torch.eye(64))
+
+    if image_path is not None:
+        from PIL import Image
+        from torchvision import transforms
+        img = Image.open(image_path).convert("RGB")
+        tform = transforms.Compose([
+            transforms.Resize((IMG, IMG)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
+        ])
+        px = tform(img)[None]  # [1, 3, IMG, IMG]
+        n_patches = IMG // P
+        attn_mask = torch.ones(1, n_patches, n_patches, dtype=torch.bool)
+        patch_embeds = vm.embeddings(px, patch_attention_mask=attn_mask).squeeze(0)
+        inp = m.const(patch_embeds.to(torch.bfloat16), "v_in")
+        print(f"  Image: {image_path}  → {seq} patches")
+    else:
+        inp = m.const(torch.randn(seq, H), "v_in")
+
+    def W(li, r): return enc_W[f"l{li}.{r}"]
+    def N(li, r, *s):
+        return enc_N.get(f"l{li}.{r}{s[0] if s else ''}")
+
+    def attn_fn(li, q, k, v, nm, tr):
+        return m._attn_vit(li, q, k, v, nm)
+
+    from ir_harness import WorkloadBuilder
+    wb = WorkloadBuilder(m)
+    out = wb.build("encoder", block, 1, W, N,
+                   mm="matmul", attn_fn=attn_fn,
+                   head_fn=lambda: inp,
+                   tail_fn=lambda x: m.chain(("layer_norm", x, fn_w, fn_b, "tail"))
+                   if fn_w else x)
+
+    print(f"  Programs: {list(m.programs.keys())}")
+    m.execute("encoder", banner=True)
+    result = m.ue.dma_from_accelerator_memory(out.addr, (seq, H))
+    print(f"\n  Output: shape={list(result.shape)}  "
+          f"mean={result.mean():.4f}  std={result.std():.4f}  "
+          f"min={result.min():.4f}  max={result.max():.4f}")
+    return result
+
+
+def _build_connector(m, model, enc_out):
+    """Pixel-shuffle encoder output, then do the projection matmul on hardware."""
+    import torch, math
+    conn = model.model.connector
+    scale = conn.scale_factor  # 4 for SmolVLM2
+    w = conn.modality_projection.proj.weight.float()  # [960, 12288]
+
+    # Pixel shuffle in software
+    bsz, seq, H = 1, *enc_out.shape
+    HW = int(math.isqrt(seq))
+    x = enc_out[None]  # [1, seq, H]
+    x = x.view(bsz, HW, HW, H)
+    x = x.view(bsz, HW, HW // scale, H * scale)
+    x = x.permute(0, 2, 1, 3)
+    x = x.reshape(bsz, HW // scale, HW // scale, H * (scale ** 2))
+    x = x.permute(0, 2, 1, 3)
+    x = x.reshape(bsz, seq // (scale ** 2), H * (scale ** 2))
+    shuffled = x.squeeze(0).contiguous()  # [64, 12288]
+
+    S, D_in = shuffled.shape     # 64, 12288
+    D_out = w.shape[0]           # 960
+
+    print(f"{'═'*60}")
+    print(f"  BUILDING CONNECTOR  ({S} patches, {D_in}→{D_out})")
+    print(f"{'═'*60}")
+
+    m.conn_in = m.const(shuffled, "conn_in")
+    m.conn_w = m.const(w, "conn_w")  # [960, 12288] — N×K, matmul now reads shape[0]
+    with m.program("conn"):
+        out = m.chain(("matmul", m.conn_in, m.conn_w, "conn"))
+
+    print(f"  DMA'd connector weights  w={list(w.shape)}  in={list(shuffled.shape)}")
+    m.execute("conn", banner=True)
+    result = m.ue.dma_from_accelerator_memory(out.addr, (S, D_out))
+    print(f"\n  Connector output: shape={list(result.shape)}  "
+          f"mean={result.mean():.4f}  std={result.std():.4f}  "
+          f"min={result.min():.4f}  max={result.max():.4f}")
+    return result
+
+
+def _merge_and_show(model, spec, conn_out, m=None, tok=None):
+    """Run inputs_merger with a dummy prompt, show merged tensor,
+    then execute HW prefill if harness is provided."""
+    import torch
+    from workload_detect import detect_merger_pattern
+    info = detect_merger_pattern(model)
+    hidden = spec.get("H", 960)
+
+    if info["pattern"] == "token_replacement":
+        img_id = info["image_token_id"]
+        seq_len = conn_out.shape[0]  # 64
+
+        # Build dummy prompt: <image>×64 + a few text tokens
+        text_ids = torch.tensor([[img_id] * seq_len + [1, 380, 533, 29871]], dtype=torch.long)
+        emb = model.model.text_model.get_input_embeddings()(text_ids)
+
+        if info["merger_fn"] is not None:
+            merged = info["merger_fn"](
+                input_ids=text_ids,
+                inputs_embeds=emb,
+                image_hidden_states=conn_out[None].to(emb.dtype),
+            )
+        else:
+            # Fallback: simple scatter
+            mask = text_ids == img_id
+            merged = emb.clone()
+            merged[mask] = conn_out[None].to(merged.dtype).reshape(-1, hidden)
+
+        total_seq = merged.shape[1]
+        n_text = total_seq - seq_len
+        print(f"{'═'*60}")
+        print(f"  INPUTS MERGER  (token_replacement)")
+        print(f"{'═'*60}")
+        print(f"  Image tokens: {seq_len}  Text tokens: {n_text}  Total: {total_seq}")
+        print(f"  Merged shape: {list(merged.shape)}  ready for LM prefill")
+        print(f"  mean={merged.mean():.4f}  std={merged.std():.4f}")
+
+        # Quick CPU forward through the text decoder to validate end-to-end
+        with torch.no_grad():
+            dec_out = model.model.text_model(inputs_embeds=merged, use_cache=False)
+            logits = model.lm_head(dec_out.last_hidden_state)
+            next_tok = logits[0, -1].argmax().item()
+            print(f"  LM prefill (CPU): logits shape={list(logits.shape)}"
+                  f"  next token id={next_tok}")
+
+        # HW prefill: DMA merged embeddings into the decoder's input buffer
+        if m is not None and hasattr(m, "x") and hasattr(m, "seq"):
+            print(f"\n  Running HW prefill (seq={total_seq}) ...")
+            m.ue.dma_to_accelerator_memory(m.x.addr, merged[0].to(torch.bfloat16))
+            m.execute("prefill", bind={m.seq: total_seq})
+            hw_hidden = m.ue.dma_from_accelerator_memory(m.out.addr, (total_seq, hidden))
+            hw_logit = hw_hidden[-1].float() @ model.lm_head.weight.T.float()
+            hw_tok = int(hw_logit.argmax().item())
+            print(f"  HW prefill: next token id={hw_tok}  (CPU={next_tok})")
+
+            # ── Auto-regressive decode (greedy) ──
+            embed_mod = model.model.text_model.get_input_embeddings()
+            embed_tbl = embed_mod.weight
+            probe = embed_mod(torch.tensor([[0]]))[0, 0].float()
+            norm = (probe / embed_tbl[0]).median().item()
+            lmw = model.lm_head.weight.float()
+            generated = [hw_tok]
+            for step in range(5):
+                pos = total_seq + step
+                emb = (embed_tbl[generated[-1]] * norm).float().view(1, -1)
+                m.ue.dma_to_accelerator_memory(m.dx.addr, emb.to(torch.bfloat16))
+                _set_decode_bias(m, pos + 1)
+                m.execute("decode", bind={m.bucket: max(1, (pos + 1 + 63) // 64)}, banner=False)
+                h = m.ue.dma_from_accelerator_memory(m.dout.addr, (1, hidden)).float()[0]
+                generated.append(int((h @ lmw.T).argmax().item()))
+                if generated[-1] in {tok.eos_token_id}:
+                    break
+            print(f"  HW decode (5 steps): {tok.decode(generated)}")
+        print(f"{'─'*60}")
+    else:
+        print(f"  Merger pattern '{info['pattern']}' not implemented in debug flow")
 
 
 if __name__ == "__main__":

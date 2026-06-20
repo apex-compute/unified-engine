@@ -135,7 +135,7 @@ parity harness (tests/parity.md) before any in-tree adoption.
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 # This file lives in <unified-engine>/kernel_select/. The engine modules
 # (user_dma_core, nn_lib, quant_lib) live at the repo root = parent dir.
@@ -485,6 +485,239 @@ class Reg(int):
 
 
 # =============================================================================
+# Port / Workload / WorkflowRunner — typed I/O ports + workload orchestration.
+# Workloads are compiled separately (in build()); the runner wires their ports
+# together and executes them in order.
+# =============================================================================
+@dataclass
+class Port:
+    """A named connection point on a workload.
+
+    Two workloads that declare a port with the same name share the same DRAM
+    tensor after wire() — the runner auto-connects producer to consumer.
+    """
+    name: str
+    kind: str = "data"       # data | weight | constant | buffer
+    tensor: Any = field(default=None)   # Tensor | GrowingBuffer | None
+    role: str = "input"      # input | output | inout
+
+
+class Workload:
+    """A named computation phase wrapping compiled programs.
+
+    Each workload declares:
+      - which compiled programs run (by name)
+      - what GPR bindings are needed
+      - which ports (I/O, weights, buffers, constants) it touches
+
+    Ports are the wiring interface: two workloads with a port named
+    "hidden_states" share the same DRAM tensor after the runner wires them.
+
+    Usage (in prep()):
+        wl = Workload("prefill")
+        wl.add("prefill_prog").bind("seq_len", self.gpr("seq"))
+        wl.output("hidden", my_tensor)
+
+    The wrapped programs are compiled in build() separately.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self.programs: list[str] = []
+        self.bindings: dict[str, Reg] = {}      # logical name -> hw GPR
+        self.inputs: dict[str, Port] = {}
+        self.outputs: dict[str, Port] = {}
+        self.weights: dict[str, Port] = {}
+        self.buffers: dict[str, Port] = {}
+        self.constants: dict[str, Port] = {}
+
+    def add(self, *program_names: str) -> "Workload":
+        self.programs.extend(program_names)
+        return self
+
+    def bind(self, name: str, reg: Reg) -> "Workload":
+        self.bindings[name] = reg
+        return self
+
+    def input(self, name: str, tensor=None) -> Port:
+        p = Port(name, "data", tensor, "input")
+        self.inputs[name] = p
+        return p
+
+    def output(self, name: str, tensor=None) -> Port:
+        p = Port(name, "data", tensor, "output")
+        self.outputs[name] = p
+        return p
+
+    def weight(self, name: str, tensor=None) -> Port:
+        p = Port(name, "weight", tensor, "input")
+        self.weights[name] = p
+        return p
+
+    def buffer(self, name: str, buf=None) -> Port:
+        p = Port(name, "buffer", buf, "inout")
+        self.buffers[name] = p
+        return p
+
+    def constant(self, name: str, tensor=None) -> Port:
+        p = Port(name, "constant", tensor, "input")
+        self.constants[name] = p
+        return p
+
+    @property
+    def all_ports(self) -> list[Port]:
+        """Iterate all ports (inputs, outputs, weights, buffers, constants)."""
+        out = []
+        for d in (self.inputs, self.outputs, self.weights, self.buffers, self.constants):
+            out.extend(d.values())
+        return out
+
+    def __repr__(self):
+        return f"Workload({self.name!r}, {len(self.programs)} progs, {len(self.all_ports)} ports)"
+
+
+class WorkflowRunner:
+    """Orchestrate the I/O flow between workloads and execute in order.
+
+    Workloads are compiled independently (in build()); the runner connects them
+    by wiring ports that share a name — if workload A outputs "hidden" and
+    workload B inputs "hidden", they get the same DRAM tensor.
+
+    Usage:
+        runner = WorkflowRunner(harness)
+
+        # Declare workloads in prep()
+        prefill = runner.workload("prefill")
+        prefill.add("prefill").bind("seq", gpr_s).output("hidden", mid)
+
+        decode = runner.workload("decode")
+        decode.add("decode").bind("pos", gpr_p).input("hidden", mid)
+
+        # Auto-wire shared ports
+        runner.wire()
+
+        # Execute in order
+        runner.run("prefill", seq=128)
+        runner.run("decode", pos=0)
+    """
+
+    def __init__(self, harness: "IRHarness"):
+        self.harness = harness
+        self.workloads: dict[str, Workload] = {}
+
+    def workload(self, name: str) -> Workload:
+        if name not in self.workloads:
+            self.workloads[name] = Workload(name)
+        return self.workloads[name]
+
+    def wire(self):
+        """Connect ports with the same name across all workloads.
+
+        For each port name, the first non-None tensor seen is shared with all
+        other workloads that declare a port of that name.  Call after prep()
+        (all tensors allocated) and before run().
+        """
+        pool: dict[str, Any] = {}
+        for wl in self.workloads.values():
+            for p in wl.all_ports:
+                if p.tensor is not None:
+                    pool.setdefault(p.name, p.tensor)
+        for wl in self.workloads.values():
+            for p in wl.all_ports:
+                if p.tensor is None and p.name in pool:
+                    p.tensor = pool[p.name]
+
+    def run(self, *names, **bindings):
+        """Execute workloads in order.
+
+        Args:
+            *names: workload names to run (default: all in definition order).
+            **bindings: runtime GPR values by logical name, e.g. seq=128.
+        """
+        names = names or list(self.workloads.keys())
+        for wl_name in names:
+            wl = self.workloads[wl_name]
+            bind = {}
+            for bname, reg in wl.bindings.items():
+                bind[reg] = bindings.get(bname, int(reg))
+            for pname in wl.programs:
+                self.harness.execute(pname, bind=bind, banner=False)
+
+    def __getitem__(self, name: str) -> Workload:
+        return self.workloads[name]
+
+    def __repr__(self):
+        return f"WorkflowRunner({list(self.workloads)})"
+
+
+class WorkloadBuilder:
+    """Block-descriptor-driven program builder. Agnostic to workload type.
+
+    Emits chain() calls from a block descriptor (list of (kind, role, traits)
+    tuples) — works for encoder, connector, or LM workloads.
+    The caller provides weight/norm lookup callbacks and an attention function.
+
+    Usage:
+        wb = WorkloadBuilder(harness)
+        wb.build("encoder", block, n_layers=v_layers,
+                 W=lambda li,k: W[f"l{li}.{k}"],
+                 N=lambda li,k,*a: N.get(f"l{li}.{k}{a[0] if a else ''}"),
+                 attn_fn=vit_attn,
+                 head_fn=lambda: patches,
+                 tail_fn=lambda x: h.chain(("layer_norm", x, fn_g, fn_b, "tail")))
+    """
+
+    def __init__(self, harness):
+        self.h = harness
+
+    def build(self, name, block, n_layers, W, N, *,
+              mm="matmul", leg=None, attn_fn=None,
+              head_fn=None, tail_fn=None):
+        with self.h.program(name):
+            x = head_fn() if head_fn else None
+            for li in range(n_layers):
+                x = self._layer(li, x, block, W, N, mm, leg or {}, attn_fn)
+            if tail_fn:
+                x = tail_fn(x)
+        return x
+
+    def _layer(self, li, x, block, W, N, mm, leg, attn_fn):
+        resid = cur = x
+        for j, entry in enumerate(block):
+            kind, role = entry[0], entry[1]
+            tr = entry[2] if len(entry) > 2 else {}
+            nm = f"l{li}_{j}"
+            if kind == "norm":
+                b = N(li, role, "beta") if tr.get("type") == "layer" else None
+                if b:
+                    cur = self.h.chain(("layer_norm", cur, N(li, role), b, f"n{nm}", leg))
+                else:
+                    cur = self.h.chain(("rms_norm", cur, N(li, role), f"n{nm}", leg))
+            elif kind == "attention":
+                q = self.h.chain((mm, cur, W(li, "q"), f"q{nm}"))
+                k = self.h.chain((mm, cur, W(li, "k"), f"k{nm}"))
+                v = self.h.chain((mm, cur, W(li, "v"), f"v{nm}"))
+                cur = attn_fn(li, q, k, v, nm, tr) if attn_fn else \
+                      self.h.chain(("flash_attn_pf", q, k, v, f"a{nm}", {"group": 1}))
+            elif kind == "matmul":
+                cur = self.h.chain((mm, cur, W(li, role), f"o{nm}"))
+            elif kind == "swiglu":
+                gg = self.h.chain((mm, cur, W(li, "gate"), f"g{nm}",
+                                   {"act": tr.get("act", "silu")}))
+                uu = self.h.chain((mm, cur, W(li, "up"), f"u{nm}"))
+                ml = self.h.chain(("mul", gg, uu, f"m{nm}"))
+                cur = self.h.chain((mm, ml, W(li, "down"), f"d{nm}"))
+            elif kind == "mlp":
+                h = self.h.chain((mm, cur, W(li, "fc1"), f"f1{nm}",
+                                  {"act": tr.get("act", "gelu")}))
+                cur = self.h.chain((mm, h, W(li, "fc2"), f"f2{nm}"))
+            elif kind == "residual":
+                resid = self.h.chain(("add", resid, cur, f"r{nm}"))
+                cur = resid
+        return resid
+
+
+# =============================================================================
 # Program capture — `with sel.program(name):` wraps the engine's capture lifecycle:
 #   enter -> clear_inst_id + start_capture
 #   exit  -> generate_instruction_halt + stop_capture + write stream to its own
@@ -595,9 +828,10 @@ class Ops:
 
     # ---- matmul ------------------------------------------------------------
     def matmul(self, a: Tensor, w: Tensor, *, bias=None, act=None, out=None) -> Tensor:
-        """a:(M,K) @ w:(K,N) -> (M,N). act in {None,'gelu','silu'}. Quant from w.dtype."""
+        """a:(M,K) @ w:(N,K) -> (M,N).  B is N×K row-major; accelerator does A @ Bᵀ.
+        act in {None,'gelu','silu'}. Quant from w.dtype."""
         M, K = a.shape
-        N = w.shape[1]
+        N = w.shape[0]
         out = out or self.arena.alloc((M, N), a.dtype, name="matmul")
         quant = w.dtype != "bf16"
         self.ue.matmat_mul_core(
@@ -1132,4 +1366,5 @@ class IRHarness(Ops):
 __all__ = [
     "IRHarness", "Tensor", "pad64",
     "PBI_ALLOW", "Chain", "FUSIONS", "select_plan", "Reg", "GrowingBuffer", "Arena",
+    "Port", "Workload", "WorkflowRunner", "WorkloadBuilder",
 ]
