@@ -640,6 +640,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
 
+        # flash_attention_core compiled once as a subroutine after the layer loop.
+        # Each call site sets gpr_ret_id to its return word address then jumps to the
+        # subroutine; flash_attention returns via JUMP_REG_ABS(gpr_ret_id).
+        program_dram_base = self.get_program_dram_addr()
+        gpr_ret_id = self.alloc_isa_reg()
+        call_site_jump_capture_indices: list[int] = []
+
         # NOTE: gpr_seq_len / gpr_q_seq_len / gpr_bucket_idx are primed in the runtime preamble for dynamic seq_len
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
@@ -746,26 +753,15 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 self.accelerator_memory_to_sram(self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size, 0x20000, self.PREFILL_CONTEXT_SIZE * self.head_dim)
                 duplicate_gqa_rows_pbi(0x20000, self.LAYER0_FLASH_V_DRAM, self.gpr_seq_len if use_pbi else None)
 
-                flash_attention_result = self.flash_attention_core(
-                    head_dim=self.head_dim,
-                    seq_len=aligned_seq_len_q,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM if use_pbi else None,
-                    gpr_bucket_idx=self.gpr_bucket_idx if use_pbi else None,
-                    num_buckets=(self.PREFILL_MAX_SEQ_LEN * self.group_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,
-                )
-                if use_pbi:
-                    runtime_bucket_idx = aligned_seq_len_q // UE_VECTOR_SIZE  # 1-indexed
-                    total_flops += flash_attention_result[runtime_bucket_idx - 1]
-                else:
-                    total_flops += flash_attention_result
-                use_pbi = True
+                # Call flash attention subroutine (compiled once after the layer loop).
+                # Each call site sets gpr_ret_id to its return address then jumps to the
+                # subroutine; the subroutine returns via JUMP_REG_ABS(gpr_ret_id).
+                self.pad_capture_to_64b_boundary()
+                return_word_addr = ue_35bit_addr_shifter(
+                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+                call_site_jump_capture_indices.append(self.capture_count)
+                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
             total_flops += self.matmat_mul_core(
                 M=seq_len,
                 K=self.head_dim * self.group_size,
@@ -875,6 +871,35 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # NOTE: gpr_seq_len holds the current token position and is primed by the runtime preamble.
         # K/V and RoPE DRAM offsets are derived at runtime via MUL_IMM(gpr_seq_len, stride) + ADD_IMM(base).
         self.generate_instruction_halt()
+
+        # Compile flash_attention subroutine after the HALT; bucket bodies return via
+        # JUMP_REG_ABS(gpr_ret_id), which each call site pre-loaded with its return address.
+        num_buckets = (self.PREFILL_MAX_SEQ_LEN * self.group_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        flash_sub_start_inst_dram_addr, flash_flops = self.flash_attention_core(
+            head_dim=self.head_dim,
+            seq_len=aligned_seq_len_q,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_buckets,
+            gpr_ret_id=gpr_ret_id,
+        )
+        runtime_bucket_idx = aligned_seq_len_q // UE_VECTOR_SIZE  # 1-indexed
+        total_flops += flash_flops[runtime_bucket_idx - 1] * layer_size
+
+        # Patch all call-site JUMP_ABS placeholders to point at the flash subroutine.
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(
+                jump_idx, ue_35bit_addr_shifter(flash_sub_start_inst_dram_addr))
+
+        self.release_isa_reg()  # gpr_ret_id
+
         prefill_program_addr = self.get_program_dram_addr() + count_at_start * INSTRUCTION_SIZE_BYTES
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
@@ -908,6 +933,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.pad_capture_to_64b_boundary()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
+
+        # decoder_group_attention_core compiled once as a subroutine after the layer loop.
+        # Each call site sets gpr_ret_id to its return word address then jumps to the
+        # subroutine; the subroutine returns via JUMP_REG_ABS(gpr_ret_id).
+        program_dram_base = self.get_program_dram_addr()
+        gpr_ret_id = self.alloc_isa_reg()
+        call_site_jump_capture_indices: list[int] = []
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -968,21 +1000,33 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                         gr_weight_dram=self.TMP_REG)
             if profile:
                 _checkpoint(f"L{layer_idx}_qk_norm_rope")
-            attn_result = self.decoder_group_attention_core(
-                group_size=self.group_size,
-                head_dim=self.head_dim,
-                seq_len=UE_VECTOR_SIZE,
-                Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
-                V_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
-                OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                gpr_bucket_idx=self.gpr_bucket_idx if use_pbi else None,
-                num_buckets=num_buckets,
+            # Copy this layer's KV history into fixed staging buffers for the shared subroutine.
+            # gpr_bucket_idx drives the loop count so only the valid token range is copied.
+            k_cache_layer_addr = self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
+            v_cache_layer_addr = self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
+            self._emit_pbi_scatter_per_token(
+                read_base=k_cache_layer_addr,
+                read_stride_bytes=UE_VECTOR_SIZE * self.head_dim * self.bytes_per_element,
+                write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * self.head_dim * self.bytes_per_element)],
+                sram_byte_addr=0,
+                element_count=UE_VECTOR_SIZE * self.head_dim,
+                gpr_seq_len=self.gpr_bucket_idx,
             )
-            total_flops += attn_result[-1] if use_pbi else attn_result
+            self._emit_pbi_scatter_per_token(
+                read_base=v_cache_layer_addr,
+                read_stride_bytes=UE_VECTOR_SIZE * self.head_dim * self.bytes_per_element,
+                write_specs=[(self.LAYER0_FLASH_V_DRAM, UE_VECTOR_SIZE * self.head_dim * self.bytes_per_element)],
+                sram_byte_addr=0,
+                element_count=UE_VECTOR_SIZE * self.head_dim,
+                gpr_seq_len=self.gpr_bucket_idx,
+            )
+            # Call decoder_group_attention_core subroutine (compiled once after the layer loop).
+            self.pad_capture_to_64b_boundary()
+            return_word_addr = ue_35bit_addr_shifter(
+                program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+            self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
+            call_site_jump_capture_indices.append(self.capture_count)
+            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
             if profile:
                 _checkpoint(f"L{layer_idx}_attention")
             total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
@@ -1063,6 +1107,34 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_inc(self.gpr_seq_len)
 
         self.generate_instruction_halt()
+        self.pad_capture_to_64b_boundary()
+
+        # Compile decoder_group_attention_core once as a subroutine after HALT.
+        # All 26 per-layer call sites jump here; the subroutine returns via JUMP_REG_ABS(gpr_ret_id).
+        dec_sub_start_addr, dec_attn_flops = self.decoder_group_attention_core(
+            group_size=self.group_size,
+            head_dim=self.head_dim,
+            seq_len=UE_VECTOR_SIZE,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+            gpr_bucket_idx=self.gpr_bucket_idx,
+            num_buckets=num_buckets,
+            gpr_ret_id=gpr_ret_id,
+        )
+        total_flops += dec_attn_flops[-1] * layer_size
+
+        # Patch all call-site JUMP_ABS placeholders to point at the decoder subroutine.
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(
+                jump_idx, ue_35bit_addr_shifter(dec_sub_start_addr))
+
+        self.release_isa_reg()  # gpr_ret_id
+
         inst_count = self.capture_count - count_at_start
         _SILENT_MODE = False
         decoder_program_addr = self.get_program_dram_addr() + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
@@ -1402,6 +1474,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         total_latency, total_flop_rate = 0, 0
         decoder_token_cnt = 0
         hw_decode_lats_us: list[float] = []
+        decoded_chars: list[str] = []
 
         # Two-region live counter: pin the bottom terminal row as a status line via
         # an ANSI scroll region; tokens stream in the area above it and the counter
@@ -1470,6 +1543,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
@@ -1491,7 +1565,17 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         _original_print(f"Prefill ({prefill_seq_len} tokens): HW={latency_hw_prefill/1e3:,.1f} ms  CPU={latency_prefill*1e3:,.1f} ms")
         _original_print(f"Decode 1st token  : HW={hw_decode_first_ms:,.1f} ms/tok  ({1000/hw_decode_first_ms:.2f} tok/s)")
         _original_print(f"Decode  ({tokens_decoded} tokens): HW={hw_decode_avg_ms:,.1f} ms/tok  CPU={cpu_decode_avg_ms:,.1f} ms/tok  ({tokens_decoded/latency_decoder:.2f} tok/s)")
-        
+
+        return {
+            "prefill_tokens": prefill_seq_len,
+            "decoded_text": "".join(decoded_chars),
+            "decoded_tokens": tokens_decoded,
+            "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
+            "decode_speed_tok_s": round(tokens_decoded / latency_decoder, 2),
+            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
+            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
+        }
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -1573,14 +1657,13 @@ def main():
         ue.compile_gemma3(profile=True)
         print(f"Profile compile done in {time.perf_counter() - timer:.2f} seconds")
         ue.run_gemma3_profile()
-        ue.clear_dram()
         print("Decoder profile done.")
         return
 
     run_result = ue.run_gemma3(slave_engine=ue2 if dual_engine else None)
     print("Gemma3 test ends.")
+    _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
-    ue.clear_dram()
     global _SILENT_MODE
     _SILENT_MODE = True
     ue.software_reset()

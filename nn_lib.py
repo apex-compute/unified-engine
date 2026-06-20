@@ -39,6 +39,7 @@ import torch
 from user_dma_core import (
     DMA_DEVICE_C2H,
     DMA_DEVICE_H2C,
+    INSTRUCTION_SIZE_BYTES,
     MEMCPY_TYPE,
     UE_VECTOR_SIZE,
     URAM_FULL_ELEMENTS,
@@ -498,7 +499,8 @@ def tanh_core_dram(ue, M: int, N: int,
 
 def silu_core_dram(ue, M: int, N: int,
                    A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                   IDENTITY_DRAM_ADDR: int) -> None:
+                   IDENTITY_DRAM_ADDR: int,
+                   gpr_M_reg: int = None) -> None:
     """SiLU: output = x * sigmoid(x) on an (M, N) tensor. Identity-matmul sigmoid
     then elementwise multiply against the original input."""
     assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
@@ -507,7 +509,8 @@ def silu_core_dram(ue, M: int, N: int,
     ue.sram_to_accelerator_memory(URAM_A_BASE, OUTPUT_DRAM_ADDR, total_elems)
     ue.matmat_mul_core(M=M, K=N, N=N, A_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                        B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                       OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, sigmoid_enable=True)
+                       OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, sigmoid_enable=True,
+                       gpr_M_reg=gpr_M_reg)
     ue.accelerator_memory_to_sram(A_DRAM_ADDR, URAM_A_BASE, total_elems)
     ue.accelerator_memory_to_sram(OUTPUT_DRAM_ADDR, URAM_B_BASE, total_elems)
     ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE,
@@ -1178,6 +1181,133 @@ def prefill_flash_attention_core(ue, head_dim: int, seq_len: int,
     total_flops += num_q_heads * seq_len * seq_len * 5
     total_flops += num_q_heads * 2 * seq_len * seq_len * head_dim
     return total_flops
+
+def flash_attention_batched_pbi(
+    ue,
+    num_batches: int,
+    head_dim: int,
+    seq_len: int,
+    Q_DRAM_ADDR: int,
+    K_DRAM_ADDR: int,
+    V_DRAM_ADDR: int,
+    OUTPUT_DRAM_ADDR: int,
+    SCRATCH_DRAM_ADDR: int,
+    ATTN_P_DRAM_ADDR: int,
+    IDENTITY_TRANSPOSE_DRAM_ADDR: int = None,
+    BIAS_DRAM_ADDR: int = None,
+    bias_shared: bool = False,
+    _silent: bool = False,
+    gpr_M_reg: int = None,
+    STAGE_Q_DRAM_ADDR: int = None,
+    STAGE_K_DRAM_ADDR: int = None,
+    STAGE_V_DRAM_ADDR: int = None,
+    STAGE_O_DRAM_ADDR: int = None,
+    STAGE_BIAS_DRAM_ADDR: int = None,
+    _debug_no_advance: bool = False,
+) -> None:
+    """Run flash attention over ``num_batches`` windows reusing ONE compiled flash body, via
+    a static call/return SUBROUTINE + per-window DRAM STAGING.
+
+    HOW THIS DIFFERS FROM THE OTHER FLASH ENTRY POINTS
+    --------------------------------------------------
+    There are four ways to emit flash in this file; this one is the only one that shrinks a
+    many-window workload WITHOUT either unrolling or runtime address-injection:
+
+    * ``flash_attention_core_legacy`` — single static body, fixed Q/K/V/O addresses. Correct
+      and re-executable, but emitting it once per window UNROLLS the program (Swin: ~103 MB).
+    * ``flash_attention_core_pbi`` (bucket dispatcher, used by gemma decode) — runtime
+      ``seq_len`` selection via ``gpr_bucket_idx``; addresses are still effectively fixed.
+    * ``_flash_attention_pbi_body`` with ``_batch_gprs`` — the INJECTION approach: rewrite the
+      matmul/transpose PBI pointer DRAM_ADDR fields from GPRs at runtime so one body serves many
+      windows. Compact, but it DOES NOT SURVIVE A 2nd EXECUTION — the injected PBI-pointer state
+      does not reset and the device hard-wedges on call 2 (DMA never completes -> XDMA driver
+      D-state -> whole box freeze, physical reset required). This path is therefore dead; kept
+      only for reference. See memory project_pbi_flash_back_to_back_bug.
+    * THIS function — keeps the body fully STATIC (no injection) and varies the window by COPYING
+      data instead of rewriting addresses. Proven: gemma3 reuses a static flash body thousands of
+      times the same way; _flash_probe validated two static bodies back-to-back at 45-46 dB with
+      per-window bias and no wedge, where the injected body wedged.
+
+    CONSTRUCTION
+    ------------
+      1. Compile the flash body ONCE as ``flash_attention_core_legacy`` reading from FIXED
+         staging buffers FQ/FK/FV/FO (+ FBIAS). It ends in JUMP_REG_ABS(gpr_ret).
+      2. Per window, a tiny CALL STUB: memcpy that window's Q/K/V (and its per-window bias slice,
+         since rel-pos bias is tiled per batch with stride seq_len*seq_len) into the fixed
+         buffers, set the return-address GPR, JUMP_ABS into the subroutine; on return, memcpy the
+         staged output back to that window's slot. All addresses are compile-time constants, so
+         the stubs use plain static memcpy — NO PBI address-injection anywhere.
+      3. Normal flow jumps over the subroutine body.
+
+    Legacy flash applies the 1/sqrt(head_dim) Q-scale internally, so no separate prescale.
+    Binary cost: one shared body + ~10-instruction stubs per window (vs a full unrolled body
+    each) -> keeps the ~100x size reduction (Swin 103 MB -> ~1-2 MB for the flash stage).
+    Runtime cost: extra DMA per window (staging copies in/out) — a latency, not a size, cost.
+    """
+    bpe = 2
+    win_bytes = seq_len * head_dim * bpe
+    bias_win_bytes = seq_len * seq_len * bpe
+    bias_stride = 0 if bias_shared else bias_win_bytes
+    bias_enable = BIAS_DRAM_ADDR is not None
+    program_base = ue.get_program_dram_addr()
+
+    FQ = STAGE_Q_DRAM_ADDR if STAGE_Q_DRAM_ADDR is not None else ue.allocate_tensor_dram(win_bytes)
+    FK = STAGE_K_DRAM_ADDR if STAGE_K_DRAM_ADDR is not None else ue.allocate_tensor_dram(win_bytes)
+    FV = STAGE_V_DRAM_ADDR if STAGE_V_DRAM_ADDR is not None else ue.allocate_tensor_dram(win_bytes)
+    FO = STAGE_O_DRAM_ADDR if STAGE_O_DRAM_ADDR is not None else ue.allocate_tensor_dram(win_bytes)
+    FBIAS = None
+    if bias_enable:
+        FBIAS = STAGE_BIAS_DRAM_ADDR if STAGE_BIAS_DRAM_ADDR is not None else ue.allocate_tensor_dram(bias_win_bytes)
+
+    gpr_ret = ue.alloc_isa_reg()
+
+    call_jump_indices: list[int] = []
+    for i in range(num_batches):
+        ue.pad_capture_to_64b_boundary()
+        off = i * win_bytes
+        ue.accelerator_memcpy(Q_DRAM_ADDR + off, FQ, win_bytes)
+        ue.accelerator_memcpy(K_DRAM_ADDR + off, FK, win_bytes)
+        ue.accelerator_memcpy(V_DRAM_ADDR + off, FV, win_bytes)
+        if bias_enable:
+            ue.accelerator_memcpy(BIAS_DRAM_ADDR + i * bias_stride, FBIAS, bias_win_bytes)
+        return_word_addr = ue_35bit_addr_shifter(
+            program_base + (ue.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+        ue.generate_instruction_add_set(gpr_ret, return_word_addr)
+        call_jump_indices.append(ue.capture_count)
+        ue.generate_instruction_jump_abs(target_instruction_word_addr=0)
+        ue.accelerator_memcpy(FO, OUTPUT_DRAM_ADDR + off, win_bytes)
+
+    skip_jump_idx = ue.capture_count
+    ue.generate_instruction_jump_abs(target_instruction_word_addr=0)
+
+    ue.pad_capture_to_64b_boundary()
+    sub_start_inst_dram_addr = program_base + ue.capture_count * INSTRUCTION_SIZE_BYTES
+    ue.flash_attention_core_legacy(
+        head_dim=head_dim,
+        seq_len=seq_len,
+        Q_DRAM_ADDR=FQ,
+        K_DRAM_ADDR=FK,
+        V_DRAM_ADDR=FV,
+        OUTPUT_DRAM_ADDR=FO,
+        SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+        IDENTITY_DRAM_ADDR=IDENTITY_TRANSPOSE_DRAM_ADDR,
+        BIAS_DRAM_ADDR=FBIAS,
+    )
+    ue.generate_instruction_jump_reg_abs(gpr_ret)
+
+    ue.pad_capture_to_64b_boundary()
+    end_inst_dram_addr = program_base + ue.capture_count * INSTRUCTION_SIZE_BYTES
+
+    for jidx in call_jump_indices:
+        ue._patch_jump_immediate(jidx, ue_35bit_addr_shifter(sub_start_inst_dram_addr))
+    ue._patch_jump_immediate(skip_jump_idx, ue_35bit_addr_shifter(end_inst_dram_addr))
+
+    if not _silent:
+        print(f"flash_attention_batched_pbi: {num_batches} staged call stubs + 1 static "
+              f"subroutine (sub @ 0x{sub_start_inst_dram_addr:08x})")
+
+    ue.release_isa_reg()
+
 
 # =============================================================================
 # PART B — Fixed-shape host helpers

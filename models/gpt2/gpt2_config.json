@@ -1,8 +1,10 @@
 {
-  "_template_note": "GPT-2 Base (124M) config for gpt2_test.py. 12 layers, 12 heads (MHA), head_dim=64, GELU MLP, LayerNorm with bias, learned positional embeddings (no RoPE), weight-tied lm_head. Vocab padded to 50304 (multiple of 64). BF16 weights (no quantization) for best quality on small model.",
+  "_template_note": "GPT-2 Base (124M) config for gpt2_test.py. 12 layers, 12 heads (MHA), head_dim=64, GELU MLP, LayerNorm with bias, learned positional embeddings (no RoPE), weight-tied lm_head. Vocab padded to 50304 (multiple of 64). BF16 weights (no quantization) for best quality on small model. Dynamic-PBI flow: one prefill + one decoder program in a single instruction bin, GPR-driven seq_len/bucket dispatch, shared-subroutine attention.",
   "fixed_isa_regs": {
     "V_CACHE_SIZE_REG": 1,
-    "TMP_REG": 2
+    "TMP_REG": 2,
+    "GPR_BUCKET_IDX_REG": 3,
+    "GPR_SEQ_LEN_REG": 4
   },
   "file_info": {
     "layer_size": 14200832,
@@ -18,25 +20,17 @@
   },
   "model": {
     "max_context_size": 1024,
-    "end_of_turn_token_id": 50256,
-    "decoder_seq_len_buckets": [
-      128,
-      256,
-      384,
-      512,
-      640,
-      768,
-      896,
-      1024
-    ]
+    "prefill_context_size": 256,
+    "prefill_max_seq_len": 256,
+    "end_of_turn_token_id": 50256
   },
   "paths": {
     "weights_bin": "gpt2_bin/weights_gpt2_hf.bin",
     "local_weights_bin": "gpt2_bin/full_model_weights.bin",
     "hf_model_dir": "gpt2_bin/gpt2",
     "hf_model_repo": "openai-community/gpt2",
-    "decoder_program_bin": "gpt2_bin/decoder_program.bin",
-    "decoder_program_meta": "gpt2_bin/decoder_program.json"
+    "instruction_bin": "gpt2_bin/gpt2_instruction.bin",
+    "instruction_meta": "gpt2_bin/gpt2_instruction.json"
   },
   "default_prefill_tokens": [
     464,
