@@ -29,9 +29,11 @@ permute elimination, single bin, encoder layer-body sharing, prefill GEMM kernel
 | `--greedy-enable` | Use **pure greedy** decoding (penalty off). Same bin; only the runtime bias tensor differs (zeros = greedy). |
 | `--decode-matmat_mul_core-enable` | **Deterministic control path.** Every *per-layer* decoder and prefill linear (Q/K/V/O/gate/up/down) runs through the general IF4 `matmat_mul_core(is_B_quantized=True)` path instead of the fused dot-product kernel (which can show rare run-to-run ULP differences on bit-identical inputs). Same packed IF4 weights + scales; only the kernel differs. The final LM-head GEMV stays on the fused `quantized_matmat_core` in both modes (the optimized GEMV for the 49280-wide vocab + on-chip argmax). |
 
-Vision is opt-in at runtime: the default run is **LM-only** (text). Pass `--image` (or `--vision-enable`
-to use the default sample image) to run the vision encoder. The instruction bin is **always the full
-VLM bin** (encoder + decoder + prefill), built once and then loaded.
+The default run is **VLM** (vision): with no `--image` it uses the bundled sample image
+(`test_samples/vette.jpg`) and the prompt *"Describe this image."* Pass `--image PATH` for a different
+image, or `--lm-enable` (or `--image none`) for **pure LM** text-only mode (skips the vision encoder).
+The instruction bin is **always the full VLM bin** (encoder + decoder + prefill), built once and loaded;
+the mode only decides whether the encoder runs.
 
 ## Artifacts (`smolvlm2_bin/`)
 
@@ -53,15 +55,17 @@ same flags to `smolvlm2_run_from_bin.py` to **load and run** the bin that `test.
 compiles.
 
 ```bash
-# ---- Default (fused decode + on-FPGA repetition penalty) ----------------------------------
-# LM-only — builds weights.bin + instructions.bin on first run
-python models/smolvlm2/smolvlm2_test.py --prompt "What is the capital of France?"
-# LM-only, run from the bin (no compile, fully offline)
-python models/smolvlm2/smolvlm2_run_from_bin.py --prompt "What is the capital of France?"
-
-# VLM — pass an image (or --vision-enable for the default sample image)
-python models/smolvlm2/smolvlm2_test.py --image test_samples/vette.jpg --prompt "Describe this image."
+# ---- Default: VLM (fused decode + on-FPGA repetition penalty), bundled sample image --------
+# builds weights.bin + instructions.bin on first run
+python models/smolvlm2/smolvlm2_test.py
+# run from the bin (no compile, fully offline)
+python models/smolvlm2/smolvlm2_run_from_bin.py
+# VLM with your own image / prompt
 python models/smolvlm2/smolvlm2_run_from_bin.py --image test_samples/vette.jpg --prompt "Describe this image."
+
+# ---- Pure LM (text-only) ------------------------------------------------------------------
+python models/smolvlm2/smolvlm2_test.py --lm-enable --prompt "What is the capital of France?"
+python models/smolvlm2/smolvlm2_run_from_bin.py --lm-enable --prompt "What is the capital of France?"
 
 # ---- Pure greedy (penalty off; same bin) --------------------------------------------------
 python models/smolvlm2/smolvlm2_run_from_bin.py --greedy-enable --prompt "What is the capital of France?"

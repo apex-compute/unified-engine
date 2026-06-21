@@ -645,11 +645,11 @@ def main():
     _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     _default_image = os.path.join(_root, _d["image"])
     parser.add_argument("--prompt", type=str, default=None,
-                        help="Text prompt. Default: a text question (LM-only) or 'Describe this image.' (VLM).")
+                        help="Text prompt. Default: 'Describe this image.' (VLM) or a text question (--lm-enable).")
     parser.add_argument("--image", type=str, default=None,
-                        help="Path to an image. Providing it enables VLM. Default: none (LM-only text).")
-    parser.add_argument("--vision-enable", action="store_true",
-                        help="Enable the vision encoder (VLM) using --image, or the default sample image.")
+                        help="Path to an image for VLM. Default: the bundled sample image. Ignored with --lm-enable.")
+    parser.add_argument("--lm-enable", action="store_true",
+                        help="Pure language-model (text-only) mode — skip the vision encoder. Default is VLM (vision).")
     parser.add_argument("--dev", type=str, default=_d["dev"])
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
@@ -693,14 +693,15 @@ def main():
             _original_print(f"  {os.path.join(bin_dir, f)}")
         return
 
-    # VLM is opt-in at runtime: --vision-enable or --image. The bin is always the full VLM bin, so the
-    # encoder is available either way; this only decides whether vision RUNS. Default = LM-only text.
-    vision_on = bool(args.vision_enable) or (args.image is not None
-                                             and str(args.image).strip().lower() not in ("none", ""))
+    # Default is VLM (vision). The bin is always the full VLM bin, so the encoder is available either way;
+    # this only decides whether vision RUNS. --lm-enable (or --image none) selects pure LM-only text mode.
+    lm_only = bool(args.lm_enable) or (args.image is not None
+                                       and str(args.image).strip().lower() in ("none", ""))
+    vision_on = not lm_only
     if vision_on and (args.image is None or str(args.image).strip().lower() in ("none", "")):
         args.image = _default_image
-    if args.prompt is None:           # mode-appropriate default prompt (a text Q for LM-only)
-        args.prompt = _d["vlm_prompt"] if vision_on else _d["lm_prompt"]
+    if args.prompt is None:           # mode-appropriate default prompt
+        args.prompt = _d["lm_prompt"] if lm_only else _d["vlm_prompt"]
     has_image = vision_on
 
     set_dma_device(args.dev)

@@ -1670,11 +1670,11 @@ def main():
     _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     _default_image = os.path.join(_root, _d["image"])
     parser.add_argument("--prompt", type=str, default=None,
-                        help="Text prompt. Default: a text question (LM-only) or 'Describe this image.' (VLM).")
+                        help="Text prompt. Default: 'Describe this image.' (VLM) or a text question (--lm-enable).")
     parser.add_argument("--image", type=str, default=None,
-                        help="Path to an image. Providing it enables VLM. Default: none (LM-only text).")
-    parser.add_argument("--vision-enable", action="store_true",
-                        help="Enable the vision encoder (VLM) using --image, or the default sample image if none is given.")
+                        help="Path to an image for VLM. Default: the bundled sample image. Ignored with --lm-enable.")
+    parser.add_argument("--lm-enable", action="store_true",
+                        help="Pure language-model (text-only) mode — skip the vision encoder. Default is VLM (vision).")
     parser.add_argument("--dev", type=str, default=_d["dev"], help="DMA device name")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
@@ -1717,15 +1717,16 @@ def main():
     ue.penalty_enable = not bool(args.greedy_enable)
     _original_print(f"decode_linear={ 'if4_matmat_mul_core' if ue.decode_matmat_mul_core_enable else 'quantized_matmat_core' }")
     _original_print(f"generation={ 'hardware_penalty' if ue.penalty_enable else 'greedy' }")
-    # VLM (vision) is opt-in at RUNTIME: enabled by --vision-enable or by passing --image. The instruction
-    # bin is ALWAYS the full VLM bin (encoder+decoder+prefill) — built once, robust + easy to maintain;
-    # this flag only decides whether the vision encoder actually RUNS this invocation. Default = LM-only.
-    vision_on = bool(args.vision_enable) or (args.image is not None
-                                             and str(args.image).strip().lower() not in ("none", ""))
+    # Default is VLM (vision). The instruction bin is ALWAYS the full VLM bin (encoder+decoder+prefill) —
+    # built once; this flag only decides whether the vision encoder actually RUNS this invocation.
+    # --lm-enable (or --image none) selects pure LM-only text mode.
+    lm_only = bool(args.lm_enable) or (args.image is not None
+                                       and str(args.image).strip().lower() in ("none", ""))
+    vision_on = not lm_only
     if vision_on and (args.image is None or str(args.image).strip().lower() in ("none", "")):
-        args.image = _default_image   # --vision-enable with no --image → use the default sample image
-    if args.prompt is None:           # mode-appropriate default prompt (a text Q for LM-only)
-        args.prompt = _d["vlm_prompt"] if vision_on else _d["lm_prompt"]
+        args.image = _default_image   # VLM default with no --image → use the bundled sample image
+    if args.prompt is None:           # mode-appropriate default prompt
+        args.prompt = _d["lm_prompt"] if lm_only else _d["vlm_prompt"]
     # No startup DRAM zeroing: each run already zero_dram()s at the END (below), so the next run starts
     # clean; weights/instructions are DMA'd over their regions. (Avoids the slow 2 GB zero every launch.)
     init_hang_prevention(ue)
