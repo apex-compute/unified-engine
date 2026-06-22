@@ -801,8 +801,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 and self._identity_dram_addr is not None
                 and addr == self._identity_dram_addr
                 and size == self._IDENTITY_MAT_BYTES):
-            return  # already written; same content, skip
-        super().dma_write(device, addr, data, size)
+            return size  # already written; report the requested transfer as satisfied
+        return super().dma_write(device, addr, data, size)
 
     def reset_isa_reg_counter(self) -> None:
         """Reset PBI ISA-reg allocator back to 5 (regs 1-4 are fixed/reserved)."""

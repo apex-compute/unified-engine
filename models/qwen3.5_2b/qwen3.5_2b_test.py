@@ -1525,7 +1525,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         return prog_addr, prog_size
 
     def run_decoder(self, tokenizer, first_token_id: int,
-                    max_new_tokens: int = 32,
+                    max_new_tokens: int = 128,
                     temperature: float = 0.0,
                     top_k: int = 0,
                     verbose: bool = True,
@@ -3821,7 +3821,7 @@ def _sample_next(logits_row: torch.Tensor, temperature: float, top_k: int) -> in
 
 
 def generate(ue: Qwen3_5_2b_UnifiedEngine, tokenizer,
-             prompt: str, max_new_tokens: int = 32,
+             prompt: str, max_new_tokens: int = 128,
              temperature: float = 0.0, top_k: int = 0,
              verbose: bool = True,
              processor=None, image=None,
@@ -4677,10 +4677,10 @@ def main():
                          "Defaults: VLM mode (--vision-enable or --image) → "
                          "'Describe what you see in this image.'; LM-only → "
                          "'Tell me about the Eiffel Tower. What year was it built?'.")
-    ap.add_argument("--max-new-tokens", type=int, default=0,
-                    help="max tokens to generate.  0 (default) = run until "
-                         "EOT or the KV cache is full (`max_context - "
-                         "prompt_len`).  Pass a positive integer to cap.")
+    ap.add_argument("--max-new-tokens", type=int, default=128,
+                    help="max tokens to generate (default: 128). "
+                         "Pass 0 to run until EOT or the KV cache is full "
+                         "(`max_context - prompt_len`).")
     # VLM opt-in (gemma4 pattern). Default mode is pure LM; vision activates
     # only when --image PATH or --vision-enable is given.  Vision encoder
     # runs on FPGA (Phase 4) by default; the host-side HF path (Phase 1) is

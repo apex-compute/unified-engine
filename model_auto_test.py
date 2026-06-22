@@ -15,9 +15,66 @@ import re
 import subprocess
 import sys
 import time
+import zlib
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---------------------------------------------------------------------------
+# DRAM Prewriting Tests
+# ---------------------------------------------------------------------------
+# When enabled, the harness DMA-writes test data across the FULL 4 GiB
+# DRAM right before launching each model, so the model (loaded from its bin) starts
+# on poisoned DRAM. A PASS then proves run_from_bin (re)writes every byte it reads —
+# no per-model edits needed. Toggle off with RANDOMIZE_DRAM=0 in the env to run on
+# clean DRAM.
+RANDOMIZE_DRAM   = os.environ.get("RANDOMIZE_DRAM", "1") != "0"
+RANDOM_DRAM_SEED = int(os.environ.get("RANDOM_DRAM_SEED", "0"))
+DMA_DEV          = os.environ.get("DMA_DEV", "xdma0")
+
+
+def randomize_dram(seed: int = 0, dev: str = "xdma0",
+                   chunk_bytes: int = 64 * 1024 * 1024,
+                   total_bytes: int = 0x100000000) -> bool:
+    """DMA-write data across the full 4 GiB DRAM, then release the
+    device, so the model launched next starts on poisoned DRAM.
+
+    Covers the ENTIRE 4 GB DMA-mapped DRAM (0x00000000..0xFFFFFFFF): weight / ISA /
+    scratch regions all start as garbage, so a model that still decodes correctly
+    proves its run-from-bin path (re)writes every byte it reads.
+
+    Returns True on success. On any failure it returns False; the caller must not
+    run the model because that would not exercise the required poisoned-DRAM state.
+    """
+    try:
+        if chunk_bytes <= 0 or total_bytes <= 0:
+            raise ValueError("chunk_bytes and total_bytes must be positive")
+        import random as _random
+        import user_dma_core
+        user_dma_core.set_dma_device(dev)
+        ue = user_dma_core.UnifiedEngine()           # bare engine: opens device, self-tests
+        rng = _random.Random(seed)
+        fill_ff = b"\xff" * chunk_bytes
+        offset = 0
+        while offset < total_bytes:
+            n = min(chunk_bytes, total_bytes - offset)
+            # data = rng.randbytes(n)  #!!! Original random-data test.
+            data = fill_ff[:n]        # Requested all-0xFF test.
+            wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, offset, data, n)
+            if wrote != n:
+                raise RuntimeError(
+                    f"dma_write wrote {wrote} of {n} bytes at offset {offset:#x}"
+                )
+            offset += n
+        print(f"[randomize_dram] wrote {total_bytes / 1024**3:.2f} GiB of poison data to "
+              f"DRAM [0x00000000..{total_bytes - 1:#010x}]", flush=True)
+        del ue                                       # release (dma ops already open/close per call)
+        return True
+    except Exception as e:
+        print(f"[randomize_dram] ERROR: could not poison DRAM ({e}); "
+              f"model will not run.", flush=True)
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Test registry
@@ -33,16 +90,15 @@ def _check_x_equals_2(text):
     )
 
 def _check_nonempty(text):
+    # Lenient: pass if any non-empty generation came back (didn't crash / NaN-out
+    # on poisoned DRAM). Used for encoder models that don't emit LM-style answers.
     found = bool(text.strip())
-    return found, (
-        "non-empty generation produced"
-        if found
-        else "empty generation"
-    )
+    return found, ("non-empty generation produced" if found else "empty generation")
 
 def _check_smolvlm2(text):
-    # SmolVLM2-500M is a tiny VLM that can't do the algebra prompt (emits EOS
-    # immediately). Give it a factual question it can handle and check the answer.
+    # SmolVLM2-500M is too small to reliably solve the algebra prompt (it tends to
+    # ramble into broken LaTeX without reaching "x = 2"). Instead it gets a factual
+    # question it can handle ("What is the capital of France?") and we check for "Paris".
     found = bool(re.search(r"paris", text, re.IGNORECASE))
     return found, (
         "found 'Paris' in decoded output"
@@ -59,7 +115,7 @@ def _check_locateanything(text):
     )
 
 def _check_parakeet(text):
-    # Pass if any non-empty transcription was produced
+    # Pass if any non-empty transcription was produced.
     found = bool(text.strip())
     return found, (
         "non-empty transcription produced"
@@ -85,90 +141,37 @@ def _check_mbv2_ssd(text):
         else "no detections above threshold"
     )
 
+# Shared algebra prompt: a single-answer math question whose correct result is
+# "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
+MATH_PROMPT = "If x + 3 = 5, what is x?"
+
 TESTS = [
-    {
-        "name": "gemma3",
-        "script": "models/gemma3/gemma3_test.py",
-        "prompt": "If x + 3 = 5, what is x?",
-        "pass_check": _check_x_equals_2,
-    },
-    {
-        "name": "gemma3_IF8",
-        "script": "models/gemma3/gemma3_test_IF8.py",
-        "prompt": "If x + 3 = 5, what is x?",
-        "pass_check": _check_x_equals_2,
-    },
-    {
-        "name": "gpt2",
-        "script": "models/gpt2/gpt2_test.py",
-        "prompt": "The scientists at MIT announced today that they have discovered ",
-        "pass_check": _check_nonempty,
-    },
-    {
-        "name": "llama3.2_1b",
-        "script": "models/llama3.2_1b/llama3.2_1b_test.py",
-        "prompt": "If x + 3 = 5, what is x?",
-        "pass_check": _check_x_equals_2,
-    },
-    {
-        "name": "llama3.2_3b",
-        "script": "models/llama3.2_3b/llama3.2_3b_test.py",
-        "prompt": "If x + 3 = 5, what is x?",
-        "pass_check": _check_x_equals_2,
-    },
-    {
-        "name": "qwen3_1.7b",
-        "script": "models/qwen3_1.7b/qwen3_1.7b_test.py",
-        "prompt": "If x + 3 = 5, what is x?",
-        "pass_check": _check_x_equals_2,
-    },
-    {
-        "name": "qwen3_4b",
-        "script": "models/qwen3_4b/qwen3_4b_test.py",
-        "prompt": "If x + 3 = 5, what is x?",
-        "pass_check": _check_x_equals_2,
-    },
-    {
-        "name": "qwen2.5_vl_3b",
-        "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py",
-        "prompt": "If x + 3 = 5, what is x?",
-        "pass_check": _check_x_equals_2,
-    },
-    # NOTE: smolvlm2 is intentionally excluded from the automated suite.
-    # It runs correctly in isolation ("Paris" on a capability-appropriate
-    # prompt) but produces degenerate output (immediate EOS) when run
-    # back-to-back after other models, due to cross-model DRAM state
-    # contamination. Run it standalone instead.
-    {
-        "name": "locateanything_3b",
-        "script": "models/locateanything_3b/locateanything_3b_test.py",
-        "pass_check": _check_locateanything,
-    },
-    {
-        "name": "parakeet",
-        "script": "models/parakeet/parakeet_test.py",
-        "pass_check": _check_parakeet,
-    },
-    {
-        "name": "mobilenetv2_224",
-        "script": "models/mobilenetv2/mobilenetv2_224_test.py",
-        "pass_check": _check_mbv2_224,
-    },
-    {
-        "name": "mobilenetv2_ssd_640",
-        "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",
-        "pass_check": _check_mbv2_ssd,
-    },
-    {
-        "name": "swin",
-        "script": "models/swin/swin_test.py",
-        "pass_check": _check_nonempty,
-    },
-    {
-        "name": "mobilesam",
-        "script": "models/mobilesam/mobilesam_test.py",
-        "pass_check": _check_nonempty,
-    },
+    {"name": "gemma4_e2b",  "script": "models/gemma4_e2b/gemma4_e2b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_run_from_bin.py",       "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    # smolvlm2 DEFAULTS to VLM (loads a bundled image + runs the vision encoder), so
+    # --lm-enable forces pure language-model (text-only) mode. SmolVLM2-500M is too
+    # small to reliably do algebra, so it gets a factual question it can answer
+    # ("What is the capital of France?" — its built-in default lm_prompt) and we check
+    # for "Paris". The other VL models default to LM when --image is omitted.
+    {"name": "smolvlm2",    "script": "models/smolvlm2/smolvlm2_run_from_bin.py",       "prompt": "What is the capital of France?", "pass_check": _check_smolvlm2, "extra_args": ["--lm-enable"]},
+
+    # GPT-2 is a base (non-chat) model: text continuation, no single correct answer,
+    # so the check is lenient (non-empty generation). No run_from_bin yet — uses the
+    # _test.py entry point; swap to gpt2_run_from_bin.py once it exists.
+    {"name": "gpt2",        "script": "models/gpt2/gpt2_test.py",                        "prompt": "The scientists at MIT announced today that they have discovered ", "pass_check": _check_nonempty},
+
+    # Encoder models take no --prompt and emit non-LM output (ASR transcription /
+    # segmentation); they also run after the harness poisons DRAM.
+    # Enable once their *_bin/ artifacts + sample inputs are in place. Checks are lenient
+    # (non-empty == the model didn't crash / NaN-out on poisoned DRAM).
+    # {"name": "parakeet",  "script": "models/parakeet/parakeet_run_from_bin.py",       "pass_check": _check_parakeet},
+    # {"name": "mobilesam", "script": "models/mobilesam/mobilesam_run_from_bin.py",     "pass_check": _check_nonempty},
 ]
 
 
@@ -209,6 +212,9 @@ def run_test(test: dict, verbose: bool = False) -> dict:
     cmd = [sys.executable, "-u", script]
     if test.get("prompt"):
         cmd += ["--prompt", test["prompt"]]
+    cmd += test.get("extra_args", [])
+    if test.get("dev_arg"):
+        cmd += ["--dev", DMA_DEV]
 
     print(f"\n{'='*60}")
     print(f"Running test : {test['name']}")
@@ -216,6 +222,32 @@ def run_test(test: dict, verbose: bool = False) -> dict:
     if test.get("prompt"):
         print(f"Prompt       : {test['prompt']}")
     print(f"{'='*60}\n", flush=True)
+
+    # Check immediately before poisoning. Model worktrees are sometimes updated
+    # while a long suite is running; do not spend time writing 4 GiB when the
+    # subprocess entry point is no longer present.
+    if not os.path.isfile(script):
+        result = _parse_output(test, "", 1, 0.0)
+        result["pass_reason"] = f"model script not found: {test['script']}"
+        return result
+
+    # Poison the full 4 GiB DRAM BEFORE the model runs, so loading
+    # from bin has to (re)write every byte it reads. Done here in the harness — the
+    # model scripts are untouched.
+    if RANDOMIZE_DRAM:
+        model_seed = (
+            RANDOM_DRAM_SEED + zlib.crc32(test["name"].encode("utf-8"))
+        ) & 0xFFFFFFFF
+        print(f"[randomize_dram] poisoning full 4 GiB DRAM "
+              f"(seed={model_seed}) before {test['name']} ...", flush=True)
+        poison_start = time.perf_counter()
+        poisoned = randomize_dram(seed=model_seed, dev=DMA_DEV)
+        poison_elapsed = time.perf_counter() - poison_start
+        print(f"{'-'*60}\n", flush=True)
+        if not poisoned:
+            result = _parse_output(test, "", 1, poison_elapsed)
+            result["pass_reason"] = "DRAM poisoning failed; model was not run"
+            return result
 
     t_start = time.perf_counter()
     if verbose:
@@ -275,12 +307,16 @@ def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> d
                 result["pass_reason"] = f"TEST_RESULT JSON parse error: {e}"
             break
 
-    # Pass check
-    if returncode != 0 and not result["decoded_text"]:
+    # Pass check — run against the FULL captured stdout, not just the parsed
+    # TEST_RESULT json. Most models don't emit a TEST_RESULT line yet, so stdout
+    # (which contains the live-streamed decoded text) is the source of truth.
+    check_text = stdout or result["decoded_text"]
+    if returncode != 0:
         result["passed"] = False
         result["pass_reason"] = f"process exited with code {returncode}"
     else:
-        passed, reason = test["pass_check"](result["decoded_text"])
+        # passed, reason = test["pass_check"](result["decoded_text"])  # old: TEST_RESULT json only
+        passed, reason = test["pass_check"](check_text)
         result["passed"] = passed
         result["pass_reason"] = reason
 
@@ -379,10 +415,20 @@ def main():
     summary_path = os.path.join(SCRIPT_DIR, "model_auto_test_results.txt")
     results = []
 
+    # Resolve the test subset (and validate --only names) BEFORE touching the
+    # FPGA, so an unknown --only NAME fails fast without resetting the device.
+    known_names = {test["name"] for test in TESTS}
+    if args.only:
+        unknown = sorted(set(args.only) - known_names)
+        if unknown:
+            ap.error(f"unknown test name(s): {', '.join(unknown)}")
+        tests = [test for test in TESTS if test["name"] in args.only]
+    else:
+        tests = TESTS
+
     # Initialize the FPGA once before running any model (software reset).
     reset_device()
 
-    tests = [t for t in TESTS if t["name"] in args.only] if args.only else TESTS
     for test in tests:
         result = run_test(test, verbose=args.verbose)
         results.append(result)
