@@ -785,7 +785,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_before_gamma'] = self._alloc_param(block.layernorm_before.weight.data)
                 lw['ln_before_beta'] = self._alloc_param(block.layernorm_before.bias.data)
 
-                # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages
+                # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages.
+                # transformers>=5 nests projections under SwinAttention.self (query/key/value).
                 attn = block.attention.self
                 for name, proj in [('q', attn.query), ('k', attn.key), ('v', attn.value)]:
                     lw[f'{name}_weight'] = self._alloc_param(proj.weight.data)
@@ -798,7 +799,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # gets bias at offset b * wa_pad * wa_pad. Since all windows share
                 # the same per-head bias, we tile num_windows copies.
                 rel_pos_bias_table = attn.relative_position_bias_table  # (529, num_heads)
-                rel_pos_index = attn.relative_position_index  # (144, 144)
+                rel_pos_index = attn.relative_position_index  # flat (window_area*window_area,)
                 rpb = rel_pos_bias_table[rel_pos_index.view(-1)].view(window_area, window_area, num_heads)
                 rpb = rpb.permute(2, 0, 1).contiguous().to(torch.bfloat16)  # (num_heads, 144, 144)
                 # Pad to (num_heads, 192, 192) with -100 in padding positions
@@ -811,7 +812,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     nw * num_heads, window_area_pad, window_area_pad).contiguous()
                 lw['rel_pos_bias'] = self._alloc_param(rpb_tiled)
 
-                # Output projection (attention)
+                # Output projection (attention) — transformers>=5: SwinAttention.output.dense
                 out_proj = block.attention.output.dense
                 lw['out_proj_weight'] = self._alloc_param(out_proj.weight.data)
                 lw['out_proj_bias'] = self._alloc_param(out_proj.bias.data)
@@ -820,11 +821,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_after_gamma'] = self._alloc_param(block.layernorm_after.weight.data)
                 lw['ln_after_beta'] = self._alloc_param(block.layernorm_after.bias.data)
 
-                # MLP expand: (mlp_dim, dim)
+                # MLP expand: (mlp_dim, dim) — transformers>=5: SwinIntermediate.dense
                 lw['mlp_expand_weight'] = self._alloc_param(block.intermediate.dense.weight.data)
                 lw['mlp_expand_bias'] = self._alloc_param(block.intermediate.dense.bias.data)
 
-                # MLP contract: (dim, mlp_dim)
+                # MLP contract: (dim, mlp_dim) — transformers>=5: SwinOutput.dense
                 lw['mlp_contract_weight'] = self._alloc_param(block.output.dense.weight.data)
                 lw['mlp_contract_bias'] = self._alloc_param(block.output.dense.bias.data)
 

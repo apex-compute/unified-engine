@@ -3,7 +3,7 @@
 and execute it.  No compilation, no instruction capture — just DMA the prebuilt
 program sections to DRAM and trigger the FPGA.  This is the customer-facing
 runner; ship it together with the kernel (`user_dma_core.py`), the config, the
-quantized-weights bin, and `qwen3.5_2b_instruction.bin` (+ its `.json` meta).
+quantized-weights bin (`params.bin` + `params.json`), and `programs.bin` (+ `programs.json`).
 
   # LM-only
   python3 qwen3.5_2b_run_from_bin.py --prompt "Tell me about the Eiffel Tower."
@@ -72,7 +72,7 @@ def _load_program_section(ue, raw: bytes, off: int, size: int) -> int:
 def main():
     ap = argparse.ArgumentParser(description="Qwen3.5-2B runtime-only bin runner")
     ap.add_argument("--prompt", type=str, default=None)
-    ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--image", type=str, default=None,
                     help="Image path → VLM mode (caption the image).")
     ap.add_argument("--vision-enable", action="store_true",

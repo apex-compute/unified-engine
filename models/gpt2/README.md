@@ -16,14 +16,14 @@ HuggingFace (`openai-community/gpt2`).
 ## Instruction Bin (dynamic PBI + shared-subroutine attention)
 
 One prefill program + one decoder program are compiled into a single cached
-instruction image `gpt2_bin/gpt2_instruction.bin` (+ `.json` meta, ~0.72 MiB
+instruction image `gpt2_bin/programs.bin` (+ `.json` meta, ~0.72 MiB
 total). Runtime seq_len and attention bucket selection are driven by GPRs primed
 by a tiny per-call preamble, so the same bin serves any prompt length up to
 `prefill_context_size` (256) and any decode position up to `max_context_size`
 (1024). The flash / decoder attention cores are compiled once as subroutines
 after the program HALT; per-head call sites jump in and return.
 
-Delete `gpt2_bin/gpt2_instruction.bin` to force a recompile (required after any
+Delete `gpt2_bin/programs.bin` to force a recompile (required after any
 change to `tensor_init` buffer layout — DRAM addresses are baked into the bin).
 
 ## Usage
@@ -41,7 +41,7 @@ python models/gpt2/gpt2_test.py --prompt "The scientists at MIT announced today 
 ## Weight Binary
 
 Generated automatically on first run from HuggingFace model. Stored at
-`gpt2_bin/weights_gpt2_hf.bin` (~311 MB).
+`gpt2_bin/params.bin` (~311 MB).
 
 BF16 weights (no quantization). The 124M parameter model is small enough to fit
 in full precision, avoiding quality loss from weight quantization.

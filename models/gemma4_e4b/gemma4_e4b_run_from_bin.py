@@ -9,12 +9,14 @@ deploys where only this one Python file plus the bin artifacts ship.
 Required files in `gemma4_e4b_bin/` (produced once by gemma4_e4b_test.py
 on a beefier machine):
 
-  weights_gemma4_e4b_hf.bin         FPGA weights (2.4 GB)
-  host_weights.bin + .json          host-side side-cache (4.4 GB)
-  gemma4_instruction.bin + .json    unified instruction bin (1.1 GB)
-  tokenizer/                        minimal tokenizer subset (~32 MB):
-                                      tokenizer.json, tokenizer_config.json,
-                                      chat_template.jinja, processor_config.json
+  params.bin + params.json     unified weight bin (LM + vision + audio +
+                                host sections; manifest gives offsets)
+  programs.bin + programs.json unified ISA bin (LM prefill + decode +
+                                vision encoder + audio encoder; manifest
+                                gives per-program offsets and addrs)
+  tokenizer/                   minimal tokenizer subset (~32 MB):
+                                tokenizer.json, tokenizer_config.json,
+                                chat_template.jinja, processor_config.json
 
 Usage (run from repo root):
   python models/gemma4_e4b/gemma4_e4b_run_from_bin.py                       # LM, default prompt
@@ -75,7 +77,7 @@ _TEST_SAMPLES = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samp
 DEFAULT_IMAGE = os.path.join(_TEST_SAMPLES, "yosemite.jpg")
 DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
 
-# Bumped any time the on-disk gemma4_instruction.bin layout / ISA semantics
+# Bumped any time the on-disk programs.bin layout / ISA semantics
 # change in an incompatible way. On version mismatch the bin is rebuilt from
 # scratch rather than incrementally extended.
 INSTRUCTION_BIN_COMPILE_VERSION = "v1"
@@ -265,13 +267,13 @@ def _host_rms_norm(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> t
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
     """run_from_bin never loads the HF model. All weights live in
-    ``weights_gemma4_e4b_hf.bin`` (LM + vision_section + audio_section
+    ``params.bin`` (LM + vision_section + audio_section
     + host_section). This stub is kept only because legacy reachable
     paths may still reference it; calling it is a programming error.
     """
     raise RuntimeError(
         "run_from_bin: HF model load is forbidden. All weights — LM, "
-        "vision, audio — live in weights_gemma4_e4b_hf.bin sections. If "
+        "vision, audio — live in params.bin sections. If "
         "this error fires, the bin was produced before the audio_section "
         "was added; regenerate it on the build host with "
         "`python gemma4_e4b_test.py` and copy the new weight bin here.")
@@ -381,7 +383,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._identity_dram_addr = None
         self._identity_dram_written = False
 
-        self._weights_bin_rel = "gemma4_e4b_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
+        self._weights_bin_rel = paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
         self._preallocate_identity_matrix()
@@ -606,14 +608,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _prog_dram_base_save = self._program_dram_base
 
         # ---- Unified-bin vision path ----
-        # Vision encoder ISA lives inside gemma4_instruction.bin at address
+        # Vision encoder ISA lives inside programs.bin at address
         # `lm_base + lm_size`. If the unified bin doesn't exist yet (first run
         # ever, or LM-only-first scenario), build the LM core now; then
         # extend with vision. This keeps the single-bin contract intact across
         # any LM/VLM run order.
         bin_dir    = os.path.join(self.script_dir, "gemma4_e4b_bin")
-        instr_bin  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
+        instr_bin  = os.path.join(bin_dir, "programs.bin")
+        instr_meta = os.path.join(bin_dir, "programs.json")
         if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
             raise RuntimeError(
                 f"VLM mode requires a pre-compiled unified instruction bin. Missing:\n"
@@ -891,11 +893,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _prog_dram_base_save = self._program_dram_base
 
         bin_dir    = os.path.join(self.script_dir, "gemma4_e4b_bin")
-        instr_bin  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
+        instr_bin  = os.path.join(bin_dir, "programs.bin")
+        instr_meta = os.path.join(bin_dir, "programs.json")
         if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
             raise SystemExit(
-                "[Audio] gemma4_instruction.bin missing — generate it on the "
+                "[Audio] programs.bin missing — generate it on the "
                 "build host with `python gemma4_e4b_test.py --audio-enable` and "
                 "copy the bin into gemma4_e4b_bin/ here.")
         with open(instr_meta, "r") as f:
@@ -2100,7 +2102,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
     def _load_or_build_vision_rope_pads(self, hf_model, pixel_position_ids, num_patches):
         """Bin-only stub: in run_from_bin we NEVER touch the HF model. Vision
-        rope_pads are embedded in gemma4_instruction.bin (offsets in the
+        rope_pads are embedded in programs.bin (offsets in the
         manifest) by compile_instruction_bin on the build host. The caller
         in _run_vision_encoder_fpga reads them directly from the bin file
         — this method is only invoked if those offsets are missing from the
@@ -2113,7 +2115,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             "instruction bin's manifest. The bin you are running was built "
             "before vision rope_pads were embedded — rebuild it on the build "
             "host with `python gemma4_e4b_test.py --vision-enable` and ship "
-            "the new gemma4_instruction.{bin,json}. (Never touching the HF "
+            "the new programs.{bin,json}. (Never touching the HF "
             "model is a hard contract for run_from_bin.)")
 
     def _emit_qkv_transpose_to_hm(self, src_dram: int, dst_dram: int,
@@ -2763,161 +2765,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         print(f"  [Vision L{layer_idx+1}/{self.VIS_LAYERS}] done (A={tA:.2f}s B={tB:.2f}s C={tC:.2f}s D={tD:.2f}s, total={tA+tB+tC+tD:.2f}s)", flush=True)
         return self.VIS_IO_B if layer_idx % 2 == 0 else self.VIS_IO_A
 
-    def _vision_encoder_bin_paths(self, num_patches: int) -> tuple[int, list[tuple[int, int]], str, str]:
-        """Resolve G, group plan, and bin/meta paths for the vision encoder
-        one-shot. Pure resolution — no I/O, no state mutation."""
-        L = self.VIS_LAYERS
-        try:
-            G = int(os.environ.get("GEMMA4_VISION_LAYERS_PER_GROUP", "16"))
-        except ValueError:
-            G = 16
-        G = max(1, min(G, L))
-        groups = []
-        i = 0
-        while i < L:
-            n = min(G, L - i)
-            groups.append((i, n))
-            i += n
-        cache_dir = os.path.join(self.script_dir, "gemma4_e4b_bin")
-        os.makedirs(cache_dir, exist_ok=True)
-        bin_path  = os.path.join(cache_dir, f"vision_encoder_oneshot_v6_{num_patches}p_g{G}.bin")
-        meta_path = os.path.join(cache_dir, f"vision_encoder_oneshot_v6_{num_patches}p_g{G}.json")
-        return G, groups, bin_path, meta_path
-
-    def compile_vision_encoder_bin(self, num_patches: int) -> None:
-        """Compile the 16-layer vision encoder ISA into a bin file on disk.
-        Atomic write + post-save assertions. Skips if the bin is already cached.
-        No FPGA activity — pure host-side ISA emission."""
-        L = self.VIS_LAYERS
-        G, groups, bin_path, meta_path = self._vision_encoder_bin_paths(num_patches)
-
-        if os.path.exists(bin_path) and os.path.exists(meta_path):
-            print(f"  [Vision] bin cached, skipping compile: {os.path.basename(bin_path)}", flush=True)
-            return
-
-        print(f"  [Vision] compiling {L} layers into bin (G={G}) ...", flush=True)
-        t_capture = time.perf_counter()
-        group_offsets = []
-        group_sizes = []
-        full_bytes = bytearray()
-        import builtins
-        _orig_print = builtins.print
-        global _SILENT_MODE
-        for gi, (start, n) in enumerate(groups):
-            # CRITICAL: reset program DRAM addr BEFORE start_capture so PBI
-            # loops in this group bake correct absolute jump targets.
-            self.reset_program_dram_addr()
-            self._oneshot_mode = True
-            _SILENT_MODE = True
-            self.clear_capture_buffer()
-            self.start_capture()
-            builtins.print = lambda *a, **kw: None
-            try:
-                for li in range(start, start + n):
-                    t_layer = time.perf_counter()
-                    self.compile_vision_layer(li)
-                    self.host_vision_v_norm_rope_gather(li)
-                    self.run_vision_attention_all_heads(li)
-                    self.compile_vision_layer_post_attn(li)
-                    # Per-layer heartbeat. Must use the module-level
-                    # `_original_print` (the REAL print captured at import
-                    # time, line 61) — NOT `_orig_print` here which is the
-                    # `quiet_print` wrapper that respects _SILENT_MODE and
-                    # would silently drop the heartbeat.
-                    _original_print(
-                        f"  [Vision] layer {li-start+1}/{n} compiled in {time.perf_counter()-t_layer:.2f}s",
-                        flush=True,
-                    )
-            finally:
-                builtins.print = _orig_print
-                _SILENT_MODE = False
-                self._oneshot_mode = False
-            self.stop_capture()
-            self.generate_instruction_halt()
-            grp_bytes = bytearray()
-            for inst in self.capture_buffer:
-                grp_bytes.extend(inst.get_bytes())
-            self.clear_capture_buffer()
-            group_offsets.append(len(full_bytes))
-            full_bytes.extend(grp_bytes)
-            group_sizes.append(len(grp_bytes))
-            _original_print(f"  [Vision] {n} layers captured: {len(grp_bytes)/1024/1024:.1f} MB", flush=True)
-        # Atomic write: write to .tmp then rename so a crash mid-write
-        # cannot leave a half-written bin behind.
-        bin_tmp = bin_path + ".tmp"
-        meta_tmp = meta_path + ".tmp"
-        with open(bin_tmp, "wb") as f:
-            f.write(full_bytes)
-            f.flush()
-            os.fsync(f.fileno())
-        with open(meta_tmp, "w") as f:
-            json.dump({
-                "num_patches": num_patches,
-                "vis_layers": L,
-                "layers_per_group": G,
-                "groups": groups,
-                "group_offsets": group_offsets,
-                "group_sizes": group_sizes,
-                "total_bytes": len(full_bytes),
-            }, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.rename(bin_tmp, bin_path)
-        os.rename(meta_tmp, meta_path)
-        # Verify on disk before continuing.
-        assert os.path.exists(bin_path), f"vision bin save failed: {bin_path} not on disk"
-        assert os.path.exists(meta_path), f"vision meta save failed: {meta_path} not on disk"
-        bin_disk_size = os.path.getsize(bin_path)
-        assert bin_disk_size == len(full_bytes), \
-            f"vision bin size mismatch: disk={bin_disk_size}, expected={len(full_bytes)}"
-        print(f"  [Vision] bin saved ({bin_disk_size/1024/1024:.1f} MB, {time.perf_counter()-t_capture:.1f}s)", flush=True)
-
-    def execute_vision_encoder_bin(self, num_patches: int) -> float:
-        """Load the encoder bin from disk, DMA it to FPGA program DRAM, and
-        execute. Returns total elapsed seconds (DMA + execute across groups)."""
-        G, groups, bin_path, meta_path = self._vision_encoder_bin_paths(num_patches)
-        # Read bin from disk, DMA to FPGA, execute each group with halt+wait between.
-        t_read = time.perf_counter()
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-        group_offsets = meta["group_offsets"]
-        group_sizes = meta["group_sizes"]
-        with open(bin_path, "rb") as f:
-            full_bytes = f.read()
-        print(f"  [Vision] bin loaded: {len(full_bytes)/1024/1024:.1f} MB in {time.perf_counter()-t_read:.2f}s", flush=True)
-
-        import threading
-        # Use the unified vision FPGA timer if set by the caller (so heartbeat
-        # elapsed counts from patch-embed start). Fall back to local t0 if not.
-        t0 = time.perf_counter()
-        _hb_anchor = getattr(self, "_vis_fpga_t0", t0)
-        for gi in range(len(group_offsets)):
-            grp_bytes = full_bytes[group_offsets[gi]:group_offsets[gi] + group_sizes[gi]]
-            self.reset_program_dram_addr()
-            program_addr = self.get_program_dram_addr()
-            t_dma = time.perf_counter()
-            self.dma_write(DMA_DEVICE_H2C, program_addr, grp_bytes, len(grp_bytes))
-            self.allocate_program_dram(len(grp_bytes))
-            dt_dma = time.perf_counter() - t_dma
-            print(f"  [Vision] running on FPGA: DMA {len(grp_bytes)/1024/1024:.1f} MB in {dt_dma:.2f}s ({len(grp_bytes)/1024/1024/dt_dma:.0f} MB/s)", flush=True)
-            # Trigger FPGA execute and wait for halt — long blocking step
-            # (~60-80 s for vision G=16). 10s heartbeat avoids "stuck" feel.
-            t_exec = time.perf_counter()
-            _hb_stop = threading.Event()
-            def _hb_run(_anchor=_hb_anchor):
-                while not _hb_stop.wait(10):
-                    _original_print(f"  [Vision] ... running on FPGA ({time.perf_counter()-_anchor:.0f}s)", flush=True)
-            _hb_th = threading.Thread(target=_hb_run, daemon=True)
-            _hb_th.start()
-            try:
-                self.start_execute_from_dram(program_addr)
-                self.wait_queue(180.0)
-            finally:
-                _hb_stop.set()
-                _hb_th.join(timeout=1.0)
-            print(f"  [Vision] running on FPGA: encoder execute done in {time.perf_counter()-t_exec:.2f}s", flush=True)
-        elapsed = time.perf_counter() - t0
-        return elapsed
+    # NOTE: legacy per-modality cache writers (compile_vision_encoder_bin /
+    # execute_vision_encoder_bin / _vision_encoder_bin_paths) have been
+    # removed — the unified programs.bin produced by compile_instruction_bin
+    # now holds the vision encoder ISA inline.
 
     def vision_patch_embed(self,
                             pixel_values: torch.Tensor,
@@ -3302,7 +3153,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             raise RuntimeError(
                 "audio_weight_init: combined-bin audio section not present. "
                 "run_from_bin needs the audio_section folded into "
-                "weights_gemma4_e4b_hf.bin. Regenerate on the build host via "
+                "params.bin. Regenerate on the build host via "
                 "`python gemma4_e4b_test.py` and copy the new weight bin here.")
         self.audio_config_init()
         am = hf_model.model.audio_tower
@@ -6075,7 +5926,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         """Dynamic-PBI prefill emission (E4B) — LEGACY / REFERENCE ONLY.
 
         run_from_bin's execution path LOADS the prefill+decoder ISA from
-        gemma4_instruction.bin (built by gemma4_e4b_test.py.compile_instruction_bin),
+        programs.bin (built by gemma4_e4b_test.py.compile_instruction_bin),
         so this method is NOT used at runtime. It retains the older dual-engine /
         self.group_size structure, which under-counts Q heads for E4B
         (num_kv_heads=2, group_size=4 != num_attention_heads=8). The authoritative,
@@ -6937,7 +6788,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     # ------------------------------------------------------------------
     def compile_instruction_bin(self, layer_size: int = 42) -> tuple[str, dict]:
         """Compile prefill buckets + decode buckets into ONE capture session,
-        dump to gemma4_instruction.bin + gemma4_instruction.json. Mirrors
+        dump to programs.bin + programs.json. Mirrors
         gemma3's single-bin pattern. Absolute addrs in the manifest are
         baked against the program-DRAM address captured at start_capture,
         so the loader MUST DMA the bin to that exact same base address.
@@ -6948,14 +6799,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # so building a bin here would produce a broken prefill. Refuse loudly.
         raise NotImplementedError(
             "run_from_bin.compile_instruction_bin is not the E4B bin builder. "
-            "Build gemma4_instruction.bin with gemma4_e4b_test.py (its "
+            "Build programs.bin with gemma4_e4b_test.py (its "
             "compile_instruction_bin is single-engine + num_attention_heads GQA, "
             "and §3h decode GEMV). run_from_bin only LOADS + EXECUTES that bin.")
 
         bin_dir = os.path.join(self.script_dir, "gemma4_e4b_bin")
         os.makedirs(bin_dir, exist_ok=True)
-        bin_path  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        meta_path = os.path.join(bin_dir, "gemma4_instruction.json")
+        bin_path  = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
 
         prefill_max_seq_len = self._cfg["model"].get("prefill_max_seq_len", 320)
 
@@ -7019,14 +6870,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         return bin_path, manifest
 
     def load_instruction_bin(self) -> dict:
-        """Load gemma4_instruction.bin into program DRAM at the manifest's
+        """Load programs.bin into program DRAM at the manifest's
         baked base address. Returns the manifest dict (with int addrs).
         Sets self._instruction_loaded = True; subsequent prefill/decode
         dispatches read from manifest addrs.
         """
         bin_dir = os.path.join(self.script_dir, "gemma4_e4b_bin")
-        bin_path  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        meta_path = os.path.join(bin_dir, "gemma4_instruction.json")
+        bin_path  = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
         if not (os.path.exists(bin_path) and os.path.exists(meta_path)):
             raise FileNotFoundError(
                 f"Instruction bin missing: {bin_path}. Run compile_instruction_bin() first.")
@@ -7083,7 +6934,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     def extend_instruction_bin_with_vision(self, num_patches: int,
                                             rope_pads_tuple: tuple | None = None,
                                             position_ids_sha256: str | None = None) -> dict:
-        '''Append the vision encoder program to gemma4_instruction.bin so
+        '''Append the vision encoder program to programs.bin so
         the unified bin holds LM + vision in one file. The vision ISA is
         compiled with PBI baked against `lm_base + lm_size`, exactly where
         the new bytes land at runtime — so JUMP_ABS targets in the vision
@@ -7100,9 +6951,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
           - the LM instruction bin already exists on disk
 
         On exit:
-          - gemma4_instruction.bin is rewritten atomically (old LM bytes +
+          - programs.bin is rewritten atomically (old LM bytes +
             new vision bytes)
-          - gemma4_instruction.json gains: contains_vision=true,
+          - programs.json gains: contains_vision=true,
             vision_program_start_addr, vision_program_size,
             vision_num_patches, vision_layers_per_group, vision_groups,
             vision_group_offsets (relative to vision section),
@@ -7112,8 +6963,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         Returns the updated manifest dict (with int addrs resolved).
         '''
         bin_dir = os.path.join(self.script_dir, "gemma4_e4b_bin")
-        bin_path  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        meta_path = os.path.join(bin_dir, "gemma4_instruction.json")
+        bin_path  = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
 
         # 1. Read existing bin + manifest.
         with open(meta_path, "r") as f:
@@ -7546,7 +7397,6 @@ def main():
                         help="Enable audio mode with the default example audio "
                              "(../../test_samples/apex.wav, relative to this script). "
                              "Ignored if --audio is also given.")
-    parser.add_argument("--local-weights", action="store_true", help="Use gemma4_e4b_bin/full_model_weights.bin instead of generated weights_gemma4_e4b_hf.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
@@ -7598,24 +7448,24 @@ def main():
     if audio_on and audio_path and not os.path.exists(audio_path):
         raise SystemExit(f"Audio file not found: {audio_path}")
 
-    ue = Gemma4_UnifiedEngine(local_weights=args.local_weights)
+    ue = Gemma4_UnifiedEngine()
 
     # Execute-only: the unified instruction bin MUST already exist on disk
     # (built once on the beefier build host by gemma4_e4b_test.py). Refuse
     # to compile here. Load BEFORE set_prefill_seq_{vlm,audio} so the
     # encoder run paths find the bin already in DRAM with its manifest.
     bin_dir = os.path.join(SCRIPT_DIR, "gemma4_e4b_bin")
-    instr_bin = os.path.join(bin_dir, "gemma4_instruction.bin")
-    instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
+    instr_bin = os.path.join(bin_dir, "programs.bin")
+    instr_meta = os.path.join(bin_dir, "programs.json")
     if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
         raise SystemExit(
-            f"ERROR: gemma4_instruction.bin not found.\n"
+            f"ERROR: programs.bin not found.\n"
             f"  Missing: {instr_bin}\n"
             f"           {instr_meta}\n"
             f"Generate it on the build host with:\n"
             f"  python models/gemma4_e4b/gemma4_e4b_test.py\n"
             f"  (builds the complete LM + vision + audio bin by default)\n"
-            f"Copy gemma4_e4b_bin/gemma4_instruction.{{bin,json}} here.")
+            f"Copy gemma4_e4b_bin/programs.{{bin,json}} here.")
     print(f"[run_from_bin] instruction bin present, loading...")
     manifest = ue.load_instruction_bin()
 

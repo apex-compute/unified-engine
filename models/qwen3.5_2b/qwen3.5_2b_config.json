@@ -39,12 +39,13 @@
     "full_attn_layer_indices": [3, 7, 11, 15, 19, 23]
   },
   "paths": {
-    "weights_bin": "qwen3.5_2b_bin/weights_qwen3.5_2b_hf.bin",
+    "weights_bin": "qwen3.5_2b_bin/params.bin",
+    "weights_meta": "qwen3.5_2b_bin/params.json",
     "hf_model_dir": "qwen3.5_2b_bin/Qwen3.5-2B",
     "hf_model_repo": "Qwen/Qwen3.5-2B",
     "hf_model_fallback_dir": "/srv/model_files/Qwen3.5-2B-ModelFiles/Qwen3.5-2B",
-    "decoder_program_bin": "qwen3.5_2b_bin/decoder_program.bin",
-    "decoder_program_meta": "qwen3.5_2b_bin/decoder_program.json"
+    "programs_bin": "qwen3.5_2b_bin/programs.bin",
+    "programs_meta": "qwen3.5_2b_bin/programs.json"
   },
   "default_prefill_tokens_comment": "Filled by template at runtime via tokenizer.apply_chat_template. Qwen3.5 uses different vocab than Qwen3.",
   "special": {

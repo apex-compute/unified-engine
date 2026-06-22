@@ -37,7 +37,7 @@ to extend the range (bin grows roughly linearly with that knob).
 Force a recompile of the instruction bin by deleting both files:
 
 ```bash
-rm qwen3_1.7b_bin/qwen3_1.7b_instruction.bin qwen3_1.7b_bin/qwen3_1.7b_instruction.json
+rm qwen3_1.7b_bin/programs.bin qwen3_1.7b_bin/programs.json
 ```
 
 ## CLI flags (both scripts)

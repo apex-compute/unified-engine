@@ -50,7 +50,7 @@
     "per_layer_input_scale": 0.7071067811865476
   },
   "paths": {
-    "weights_bin": "gemma4_e4b_bin/weights_gemma4_e4b_hf.bin",
+    "weights_bin": "gemma4_e4b_bin/params.bin",
     "hf_model_dir": "gemma4_e4b_bin/gemma-4-E4B-it",
     "hf_model_repo": "google/gemma-4-E4B-it"
   },

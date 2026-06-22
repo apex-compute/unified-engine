@@ -25,12 +25,12 @@
     "end_of_turn_token_id": 50256
   },
   "paths": {
-    "weights_bin": "gpt2_bin/weights_gpt2_hf.bin",
+    "weights_bin": "gpt2_bin/params.bin",
     "local_weights_bin": "gpt2_bin/full_model_weights.bin",
     "hf_model_dir": "gpt2_bin/gpt2",
     "hf_model_repo": "openai-community/gpt2",
-    "instruction_bin": "gpt2_bin/gpt2_instruction.bin",
-    "instruction_meta": "gpt2_bin/gpt2_instruction.json"
+    "instruction_bin": "gpt2_bin/programs.bin",
+    "instruction_meta": "gpt2_bin/programs.json"
   },
   "default_prefill_tokens": [
     464,

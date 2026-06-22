@@ -11,7 +11,7 @@ GPT-2 Base (124M) inference on accelerator: prefill + decode.
     (prefill) and decoder_group_attention_core (decode) are each compiled ONCE
     after the program HALT; every per-head call site jumps in and the body
     returns via JUMP_REG_ABS(gpr_ret_id).
-  - If gpt2_bin/gpt2_instruction.bin + .json exist, compile is skipped and the
+  - If gpt2_bin/programs.bin + .json exist, compile is skipped and the
     cached image is reused (delete the bin to force recompile).
 
 Architecture notes (vs LLaMA/Gemma3):
@@ -28,7 +28,7 @@ Architecture notes (vs LLaMA/Gemma3):
     requires quantized weight/scale tensors that this GPT-2 bin does not have.
 
 Weights:
-  - Default: gpt2_bin/weights_gpt2_hf.bin (generated from HF model if missing).
+  - Default: gpt2_bin/params.bin (generated from HF model if missing).
   - --local-weights: use gpt2_bin/full_model_weights.bin instead.
 
 Usage:
@@ -83,7 +83,7 @@ def _bf16_bytes(tensor: torch.Tensor) -> bytes:
 
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_gpt2_hf.bin from HuggingFace model per gpt2_config.json layout.
+    """Generate params.bin from HuggingFace model per gpt2_config.json layout.
     Returns the path to the written file.
 
     Key differences from LLaMA/Qwen3 weight gen:
@@ -886,8 +886,8 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
         paths_cfg = self._cfg.get("paths", {})
-        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "gpt2_bin/gpt2_instruction.bin"))
-        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "gpt2_bin/gpt2_instruction.json"))
+        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "gpt2_bin/programs.bin"))
+        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "gpt2_bin/programs.json"))
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             with open(instruction_meta_path, "r") as f:
                 existing_meta = json.load(f)
@@ -1030,7 +1030,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
             max_new_tokens: Optional decode limit for short-context speed runs.
         """
         paths_cfg = self._cfg.get("paths", {})
-        meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "gpt2_bin/gpt2_instruction.json"))
+        meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "gpt2_bin/programs.json"))
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1233,7 +1233,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="GPT-2 Base (124M) prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt (GPT-2 is a base model; no chat template applied)")
-    parser.add_argument("--local-weights", action="store_true", help="Use gpt2_bin/full_model_weights.bin instead of generated weights_gpt2_hf.bin")
+    parser.add_argument("--local-weights", action="store_true", help="Use gpt2_bin/full_model_weights.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=1/0.17,

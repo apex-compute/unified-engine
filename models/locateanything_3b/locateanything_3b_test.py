@@ -9,7 +9,7 @@ later the connector, then MoonViT, move onto the FPGA at the same DRAM seam.
 
 The decoder reuses the qwen2.5_vl_3b engine verbatim (dimensionally identical LM):
   * config redirected to locateanything_3b_fpga_config.json (vocab 152681, 1D rope)
-  * LM weights from locateanything_3b_lm_if4.bin (see _gen_lm_bin.py)
+  * LM weights from params.bin region 'lm' (see gen_lm_bin)
   * vision-weight load skipped (vision is on GPU)
   * image-token id remapped to the placeholder run_prefill scans for
 
@@ -70,6 +70,149 @@ def load_weight_cache(bin_path):
     for name, meta in manifest.items():
         cache[name] = np.frombuffer(raw[meta['offset']:meta['offset'] + meta['size']], dtype=np.uint8).copy()
     return cache
+
+
+# ============================================================================
+# Consolidated bin helpers: params.bin/params.json + programs.bin/programs.json
+# All weights (lm, connector, ...) live in ONE params.bin with a region manifest.
+# All compiled programs (encoder, prefill variants, decoder, connector variants)
+# live in ONE programs.bin with a per-program manifest.
+# ============================================================================
+
+def _la_bin_dir(script_dir):
+    d = os.path.join(script_dir, "locateanything_3b_bin")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _params_paths(script_dir):
+    d = _la_bin_dir(script_dir)
+    return os.path.join(d, "params.bin"), os.path.join(d, "params.json")
+
+
+def _programs_paths(script_dir):
+    d = _la_bin_dir(script_dir)
+    return os.path.join(d, "programs.bin"), os.path.join(d, "programs.json")
+
+
+def params_bin_write_region(script_dir, region_name, raw_bytes, sub_manifest):
+    """Append/overwrite a region in params.bin. Region's sub_manifest entries
+    have offsets relative to region start; we store absolute offsets in
+    params.json under regions[region_name].entries.
+    """
+    bin_path, meta_path = _params_paths(script_dir)
+    # Load existing manifest if any
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            manifest = json.load(f)
+    else:
+        manifest = {"regions": {}}
+    manifest.setdefault("regions", {})
+
+    # If region already present, we rewrite the whole file (simpler than splicing).
+    regions = manifest["regions"]
+    # Collect existing region blobs (excluding the one we're (re)writing)
+    keep = []
+    if os.path.exists(bin_path):
+        with open(bin_path, "rb") as f:
+            old = f.read()
+        for rname, rmeta in regions.items():
+            if rname == region_name:
+                continue
+            keep.append((rname, rmeta, old[rmeta["offset"]:rmeta["offset"] + rmeta["size"]]))
+
+    # Rebuild
+    out = bytearray()
+    new_regions = {}
+    for rname, rmeta, blob in keep:
+        new_regions[rname] = {"offset": len(out), "size": len(blob), "entries": rmeta.get("entries", {})}
+        out.extend(blob)
+    # Append the new/updated region
+    region_offset = len(out)
+    new_regions[region_name] = {"offset": region_offset, "size": len(raw_bytes), "entries": sub_manifest}
+    out.extend(raw_bytes)
+
+    with open(bin_path, "wb") as f:
+        f.write(bytes(out))
+    manifest["regions"] = new_regions
+    with open(meta_path, "w") as f:
+        json.dump(manifest, f)
+
+
+def params_bin_load_region(script_dir, region_name):
+    """Return {entry_key: raw_numpy_uint8} for a region, or None if missing."""
+    bin_path, meta_path = _params_paths(script_dir)
+    if not (os.path.exists(bin_path) and os.path.exists(meta_path)):
+        return None
+    with open(meta_path) as f:
+        manifest = json.load(f)
+    regions = manifest.get("regions", {})
+    if region_name not in regions:
+        return None
+    rmeta = regions[region_name]
+    region_start = rmeta["offset"]
+    with open(bin_path, "rb") as f:
+        f.seek(region_start)
+        blob = f.read(rmeta["size"])
+    cache = {}
+    for k, m in rmeta.get("entries", {}).items():
+        cache[k] = np.frombuffer(blob[m["offset"]:m["offset"] + m["size"]], dtype=np.uint8).copy()
+    # Also expose entry meta (e.g. shape) under a sentinel
+    cache["__entries__"] = rmeta.get("entries", {})
+    return cache
+
+
+def programs_bin_load(script_dir, key):
+    """Return (prog_bytes, meta_dict) for a program key, or None if absent."""
+    bin_path, meta_path = _programs_paths(script_dir)
+    if not (os.path.exists(bin_path) and os.path.exists(meta_path)):
+        return None
+    with open(meta_path) as f:
+        manifest = json.load(f)
+    progs = manifest.get("programs", {})
+    if key not in progs:
+        return None
+    m = progs[key]
+    with open(bin_path, "rb") as f:
+        f.seek(m["offset"])
+        data = f.read(m["size"])
+    return data, m.get("meta", {})
+
+
+def programs_bin_store(script_dir, key, prog_bytes, meta=None):
+    """Append/overwrite a program entry in programs.bin + programs.json."""
+    bin_path, meta_path = _programs_paths(script_dir)
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            manifest = json.load(f)
+    else:
+        manifest = {"programs": {}}
+    manifest.setdefault("programs", {})
+    progs = manifest["programs"]
+
+    # Rewrite to keep file in sync with manifest (drop the key if present).
+    keep = []
+    if os.path.exists(bin_path):
+        with open(bin_path, "rb") as f:
+            old = f.read()
+        for pname, pmeta in progs.items():
+            if pname == key:
+                continue
+            keep.append((pname, pmeta, old[pmeta["offset"]:pmeta["offset"] + pmeta["size"]]))
+
+    out = bytearray()
+    new_progs = {}
+    for pname, pmeta, blob in keep:
+        new_progs[pname] = {"offset": len(out), "size": len(blob), "meta": pmeta.get("meta", {})}
+        out.extend(blob)
+    new_progs[key] = {"offset": len(out), "size": len(prog_bytes), "meta": (meta or {})}
+    out.extend(bytes(prog_bytes))
+
+    with open(bin_path, "wb") as f:
+        f.write(bytes(out))
+    manifest["programs"] = new_progs
+    with open(meta_path, "w") as f:
+        json.dump(manifest, f)
 
 def store_identity_matrix(ue):
     """Store identity matrix in DRAM once. Returns DRAM address."""
@@ -1206,16 +1349,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
             _original_print("Download complete.")
 
-        # Generate weight bins if missing
-        lm_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["lm_weights"])
-        vis_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["vision_weights"])
-        if not os.path.exists(lm_bin_path) or not os.path.exists(vis_bin_path):
-            _original_print("Weight bins not found, generating...")
-            weight_bin_generate(script_dir=self.script_dir, output_lm=lm_bin_path, output_vis=vis_bin_path)
-
-        # Load LM weights
-        print(f"  Reading LM weight bin (memmap)...", flush=True)
-        lm_cache = load_weight_cache(lm_bin_path)
+        # Load LM weights from consolidated params.bin (region "lm").
+        # Auto-generate if the region is missing.
+        print(f"  Reading LM weight region from params.bin ...", flush=True)
+        lm_cache = params_bin_load_region(self.script_dir, "lm")
+        if lm_cache is None:
+            _original_print("LM region not found in params.bin, generating...")
+            gen_lm_bin(precision=_lm_precision(self._cfg))
+            lm_cache = params_bin_load_region(self.script_dir, "lm")
+            assert lm_cache is not None, "gen_lm_bin did not produce 'lm' region"
 
         # Embedding (host-side only — NOT uploaded to FPGA DRAM)
         # Embedding lookup is done on host in get_embedding_for_tokens()
@@ -1286,8 +1428,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # RoPE
         self._load_rope_host()
 
-        # Vision weights (all from binary — pre-padded QKV and MLP)
-        self._load_vision_weights(vis_bin_path)
+        # Vision weights (all from binary — pre-padded QKV and MLP).
+        # LADecoder overrides this to a no-op (FPGA MoonViT pulls live HF weights);
+        # the base Qwen2.5-VL implementation expects a path argument and is unused
+        # in LA paths.
+        self._load_vision_weights(None)
 
         print(f"    Allocate weights end at DRAM address: 0x{self.get_params_dram_addr():X}, usage: {self.get_params_dram_usage()} bytes")
         print("Tokenizer loaded successfully.")
@@ -1598,17 +1743,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         permute_idx = [1, 0, 2]                  # swap dim 0 and dim 1
 
         _bf16_mode = getattr(self, '_vision_bf16_mode', False)
-        bin_dir = os.path.join(self.script_dir, "locateanything_3b_bin")
-        os.makedirs(bin_dir, exist_ok=True)
         cache_suffix = f"_{total_layers}L" if total_layers != vis_cfg["depth"] else ""
         if _bf16_mode:
             cache_suffix += "_bf16"
-        enc_bin_path = os.path.join(bin_dir, f"encoder_program{cache_suffix}.bin")
+        enc_prog_key = f"encoder{cache_suffix}"
 
-        if os.path.exists(enc_bin_path):
-            _original_print(f"  Loading cached encoder program from {enc_bin_path} ...")
-            with open(enc_bin_path, "rb") as f:
-                prog_bytes = f.read()
+        _cached = programs_bin_load(self.script_dir, enc_prog_key)
+        if _cached is not None:
+            prog_bytes, _ = _cached
+            _original_print(f"  Loading cached encoder program ({enc_prog_key}) from programs.bin ...")
             program_addr = self.get_program_dram_addr()
             self.dma_write(DMA_DEVICE_H2C, program_addr, prog_bytes, len(prog_bytes))
             self.allocate_program_dram(len(prog_bytes))
@@ -1969,11 +2112,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = False
         self._vis_program_addr = program_addr
 
-        # Save compiled program to cache for fast reload next time
-        with open(enc_bin_path, "wb") as f:
-            f.write(prog_bytes)
+        # Save compiled program to consolidated programs.bin for fast reload next time
+        programs_bin_store(self.script_dir, enc_prog_key, prog_bytes,
+                           meta={"total_layers": total_layers, "bf16_mode": _bf16_mode})
         _original_print(f"    Vision encoder compiled: {total_bytes} total bytes, {total_layers} layers + merger (single program)")
-        _original_print(f"    Program addr: 0x{program_addr:X}, cached to {enc_bin_path}")
+        _original_print(f"    Program addr: 0x{program_addr:X}, cached to programs.bin[{enc_prog_key}]")
         return program_addr
 
     def prepare_encoder_input(self, pixel_values: torch.Tensor,
@@ -2393,18 +2536,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
 
-        bin_dir = os.path.join(self.script_dir, "locateanything_3b_bin")
-        os.makedirs(bin_dir, exist_ok=True)
         template_seq_len = self.PREFILL_MAX_SEQ_LEN
-        cache_path = os.path.join(bin_dir, f"prefill_program_pbi_s{template_seq_len}.bin")
-        meta_path  = os.path.join(bin_dir, f"prefill_program_pbi_s{template_seq_len}.json")
+        prefill_key = f"prefill_pbi_s{template_seq_len}"
 
-        if os.path.exists(cache_path) and os.path.exists(meta_path):
-            _original_print(f"  Loading cached PBI prefill program (template={template_seq_len}) from {cache_path} ...")
-            with open(cache_path, "rb") as f:
-                prog_bytes = f.read()
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
+        _cached = programs_bin_load(self.script_dir, prefill_key)
+        if _cached is not None:
+            prog_bytes, meta = _cached
+            _original_print(f"  Loading cached PBI prefill program ({prefill_key}) from programs.bin ...")
             program_addr = self.get_program_dram_addr()
             self.dma_write(DMA_DEVICE_H2C, program_addr, prog_bytes, len(prog_bytes))
             self.allocate_program_dram(len(prog_bytes))
@@ -2430,11 +2568,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = False
         _original_print()
 
-        with open(cache_path, "wb") as f:
-            f.write(prog_bytes)
-        with open(meta_path, "w") as f:
-            json.dump({"total_flops": total_flops, "template_seq_len": template_seq_len, "layer_size": layer_size}, f)
-        print(f"    PBI prefill cached to {cache_path} ({len(prog_bytes)} bytes)")
+        programs_bin_store(self.script_dir, prefill_key, prog_bytes,
+                           meta={"total_flops": total_flops, "template_seq_len": template_seq_len, "layer_size": layer_size})
+        print(f"    PBI prefill cached to programs.bin[{prefill_key}] ({len(prog_bytes)} bytes)")
         print(f"    Prefill program at 0x{program_addr:X}, preamble slot at 0x{preamble_addr:X}")
         return program_addr, preamble_addr, total_flops
 
@@ -2963,21 +3099,16 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
-        paths_cfg = self._cfg.get("paths", {})
-        decoder_bin_rel = paths_cfg.get("decoder_program_bin", "locateanything_3b_bin/decoder_program.bin")
-        decoder_meta_rel = paths_cfg.get("decoder_program_meta", "locateanything_3b_bin/decoder_program.json")
-        decoder_bin_path = os.path.join(self.script_dir, decoder_bin_rel)
-        decoder_meta_path = os.path.join(self.script_dir, decoder_meta_rel)
-        os.makedirs(os.path.dirname(decoder_bin_path), exist_ok=True)
-
         # Cache key: "penalty_bias_argmax" identifies the on-FPGA penalty LM head
         # (C_DRAM_ADDR=PENALTY_BIAS_DRAM, write_back_disable=True). A stale bin from
         # the old host-side repetition-penalty build (missing or different key) is recompiled.
         lm_head_sig = "penalty_bias_argmax_s7dec"
         cache_hit = False
-        if os.path.exists(decoder_bin_path) and os.path.exists(decoder_meta_path):
-            with open(decoder_meta_path, "r") as f:
-                meta = json.load(f)
+        prog_bytes = None
+        meta = {}
+        _cached = programs_bin_load(self.script_dir, "decoder")
+        if _cached is not None:
+            prog_bytes, meta = _cached
             if "program_size" in meta and isinstance(meta.get("total_flops"), int) \
                     and meta.get("lm_head_sig") == lm_head_sig:
                 cache_hit = True
@@ -2985,8 +3116,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 _original_print(f"  Decoder cache sig ({meta.get('lm_head_sig')!r}) != {lm_head_sig!r} — recompiling.")
 
         if cache_hit:
-            with open(decoder_bin_path, "rb") as f:
-                prog_bytes = f.read()
             decoder_program_addr = self.get_program_dram_addr()
             self.dma_write(DMA_DEVICE_H2C, decoder_program_addr, prog_bytes, len(prog_bytes))
             self.allocate_program_dram(len(prog_bytes))
@@ -3013,11 +3142,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.allocate_program_dram(self.get_capture_instruction_size_bytes())
             self.clear_capture_buffer()
 
-            with open(decoder_bin_path, "wb") as f:
-                f.write(prog_bytes)
-            with open(decoder_meta_path, "w") as f:
-                json.dump({"program_size": len(prog_bytes), "total_flops": total_flops,
-                           "lm_head_sig": lm_head_sig}, f, indent=0)
+            programs_bin_store(self.script_dir, "decoder", prog_bytes,
+                               meta={"program_size": len(prog_bytes), "total_flops": total_flops,
+                                     "lm_head_sig": lm_head_sig})
             print(f"  Decoder program: 0x{decoder_program_addr:X} – 0x{self.get_program_dram_addr():X} "
                   f"({len(prog_bytes)} bytes), total_flops={total_flops}")
 
@@ -3203,12 +3330,8 @@ _FPGA_CFG = {
                "depth": 32, "patch_size": 14, "temporal_patch_size": 2, "spatial_merge_size": 2,
                "out_hidden_size": 2048, "window_size": 112, "fullatt_block_indexes": [7, 15, 23, 31],
                "image_size": 336, "num_patches": 576, "num_merged_tokens": 1024},
-    "paths": {"lm_weights": "locateanything_3b_bin/locateanything_3b_lm_if4.bin",
-              "vision_weights": "locateanything_3b_bin/locateanything_3b_vision_UNUSED.bin",
-              "hf_model_dir": "locateanything_3b_bin/LocateAnything-3B",
-              "hf_model_repo": "nvidia/LocateAnything-3B",
-              "decoder_program_bin": "locateanything_3b_bin/decoder_program.bin",
-              "decoder_program_meta": "locateanything_3b_bin/decoder_program.json"},
+    "paths": {"hf_model_dir": "locateanything_3b_bin/LocateAnything-3B",
+              "hf_model_repo": "nvidia/LocateAnything-3B"},
     "non_layer_regions": {"ROPE": {"offset": "0x86D98800", "size": 262144}},
     "special": {"rope": {"head_dim": 256, "actual_head_dim": 128, "num_positions": 512,
                          "theta": 1000000.0, "_mrope_section_unused": [16, 24, 24]},
@@ -3218,8 +3341,6 @@ _FPGA_CFG = {
 # ---- Weight-bin generators (inlined; formerly _gen_lm_bin.py / _gen_connector_bin.py) ----
 # Read HF safetensors directly and emit the wire format weight_init() consumes.
 _GEN_MODEL_DIR = os.path.join(LA_DIR, "locateanything_3b_bin", "LocateAnything-3B")
-_LM_BIN_OUT    = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_lm_if4.bin")
-_CONN_BIN_OUT  = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_connector.bin")
 _GEN_PAD_VOCAB = 152704   # 152681 -> 64*2386; pad rows are zeros (logit 0, harmless for argmax)
 # if4-quantized weights (rest bf16). MUST match _LM_QUANT_LAYERS / weight_init loader.
 _LM_GEN_QUANT_SUFFIXES = ('self_attn.q_proj.weight', 'self_attn.k_proj.weight',
@@ -3237,7 +3358,7 @@ def _gen_pad_vocab(t):
 
 
 def gen_lm_bin(precision="if4"):
-    """Generate locateanything_3b_lm_if4.bin (+ .json): q/k/o/gate/up/down if4,
+    """Generate the 'lm' region of params.bin: q/k/o/gate/up/down if4,
     v/norms/biases/embed bf16, tied lm_head appended."""
     import glob
     from safetensors.torch import load_file
@@ -3247,31 +3368,28 @@ def gen_lm_bin(precision="if4"):
     items = {"language_model." + k[len("language_model.model."):]: v
              for k, v in sd_full.items() if k.startswith("language_model.model.")}
     assert items, "no language_model.model.* keys found"
-    json_path = _LM_BIN_OUT.rsplit('.', 1)[0] + '.json'
-    manifest = {}; count = 0
-    with open(_LM_BIN_OUT, 'wb') as f:
-        for key, t in items.items():
-            if key == "language_model.embed_tokens.weight":
-                t = _gen_pad_vocab(t)
-            if any(key.endswith(s) for s in _LM_GEN_QUANT_SUFFIXES):
-                data, _ = _qs_pack(precision, t); raw = data.tobytes(); key = f'{key}.{precision}'
-            else:
-                raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
-            offset = f.tell(); f.write(raw)
-            manifest[key] = {'offset': offset, 'size': len(raw)}; count += 1
-    print(f"Weights: {count} tensors, {os.path.getsize(_LM_BIN_OUT)/1048576:.1f} MB -> {_LM_BIN_OUT}")
+    sub_manifest = {}
+    region_buf = bytearray()
+    count = 0
+    for key, t in items.items():
+        if key == "language_model.embed_tokens.weight":
+            t = _gen_pad_vocab(t)
+        if any(key.endswith(s) for s in _LM_GEN_QUANT_SUFFIXES):
+            data, _ = _qs_pack(precision, t); raw = data.tobytes(); key = f'{key}.{precision}'
+        else:
+            raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+        offset = len(region_buf); region_buf.extend(raw)
+        sub_manifest[key] = {'offset': offset, 'size': len(raw)}; count += 1
     embed_w = _gen_pad_vocab(sd_full['language_model.model.embed_tokens.weight'].detach().to(torch.bfloat16))
     combined, _ = _qs_pack(precision, embed_w); combined_bytes = combined.tobytes()
-    with open(_LM_BIN_OUT, 'ab') as f:
-        offset = f.tell(); f.write(combined_bytes)
-    manifest[f'lm_head.weight.{precision}'] = {'offset': offset, 'size': len(combined_bytes)}
-    with open(json_path, 'w') as f:
-        json.dump(manifest, f)
-    print(f"LM head ({precision}) appended: {len(combined_bytes)/1048576:.1f} MB; manifest {len(manifest)} keys")
+    offset = len(region_buf); region_buf.extend(combined_bytes)
+    sub_manifest[f'lm_head.weight.{precision}'] = {'offset': offset, 'size': len(combined_bytes)}
+    params_bin_write_region(LA_DIR, "lm", bytes(region_buf), sub_manifest)
+    print(f"LM region: {count + 1} tensors, {len(region_buf)/1048576:.1f} MB -> params.bin[lm]")
 
 
 def gen_connector_bin():
-    """Generate locateanything_3b_connector.bin (+ .json): mlp1 LayerNorm + 2 Linears, bf16."""
+    """Generate the 'connector' region of params.bin: mlp1 LayerNorm + 2 Linears, bf16."""
     import glob
     from safetensors.torch import load_file
     sd = {}
@@ -3279,15 +3397,14 @@ def gen_connector_bin():
         sd.update(load_file(f))
     missing = [k for k in _CONN_KEYS if k not in sd]
     assert not missing, f"connector keys missing from safetensors: {missing}"
-    manifest = {}
-    with open(_CONN_BIN_OUT, "wb") as f:
-        for k in _CONN_KEYS:
-            raw = sd[k].detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
-            offset = f.tell(); f.write(raw)
-            manifest[k] = {"offset": offset, "size": len(raw), "shape": list(sd[k].shape)}
-    with open(_CONN_BIN_OUT.rsplit(".", 1)[0] + ".json", "w") as f:
-        json.dump(manifest, f)
-    print(f"connector: {len(_CONN_KEYS)} tensors, {os.path.getsize(_CONN_BIN_OUT)/1048576:.1f} MB -> {_CONN_BIN_OUT}")
+    sub_manifest = {}
+    region_buf = bytearray()
+    for k in _CONN_KEYS:
+        raw = sd[k].detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+        offset = len(region_buf); region_buf.extend(raw)
+        sub_manifest[k] = {"offset": offset, "size": len(raw), "shape": list(sd[k].shape)}
+    params_bin_write_region(LA_DIR, "connector", bytes(region_buf), sub_manifest)
+    print(f"connector region: {len(_CONN_KEYS)} tensors, {len(region_buf)/1048576:.1f} MB -> params.bin[connector]")
 ENGINE_IMG_PLACEHOLDER = 151655   # what run_prefill() scans for; we remap onto it
 LA_IMAGE_TOKEN = 151665           # <IMG_CONTEXT> in LocateAnything
 
@@ -3551,15 +3668,13 @@ def _quant_compare(args, prep):
 def _run_decode_only():
     """Skip vision/connector; text-only prefill + decode to isolate the LM + decoder path."""
     print("=== Decode-only mode (no vision) ===")
-    lm_bin = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_lm_if4.bin")
-    if not os.path.exists(lm_bin):
-        print("  LM weight bin missing -> generating ...")
+    if params_bin_load_region(LA_DIR, "lm") is None:
+        print("  LM region missing from params.bin -> generating ...")
         hf_dir = os.path.join(LA_DIR, "locateanything_3b_bin", "LocateAnything-3B")
         if not os.path.exists(os.path.join(hf_dir, "config.json")):
             print(f"  Downloading HF model nvidia/LocateAnything-3B ...")
             snapshot_download(repo_id="nvidia/LocateAnything-3B", local_dir=hf_dir, local_dir_use_symlinks=False)
         gen_lm_bin()
-    open(os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_vision_UNUSED.bin"), "a").close()
 
     def _la_load_config(script_dir):
         import copy
@@ -3608,7 +3723,9 @@ def _run_decode_only():
     t0 = time.perf_counter()
     da, gpt = ue.compile_decoder()
     t_dc = time.perf_counter() - t0
-    print(f"  {t_dc:.2f}s  (decoder size: {os.path.getsize(os.path.join(LA_DIR, 'locateanything_3b_bin', 'decoder_program.bin'))/1024:.0f} KB)")
+    _dec_cached = programs_bin_load(LA_DIR, "decoder")
+    _dec_kb = (len(_dec_cached[0]) / 1024) if _dec_cached else 0
+    print(f"  {t_dc:.2f}s  (decoder size: {_dec_kb:.0f} KB)")
 
     print("--- Decode run ---")
     ue._generated_tokens = list(token_ids)
@@ -3690,12 +3807,9 @@ def main():
 
     # ---- 2. Build FPGA decoder ----
     print("\n=== Building FPGA decoder (loads LM bin to DRAM) ===")
-    lm_bin = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_lm_if4.bin")
-    if not os.path.exists(lm_bin):
-        print("  LM weight bin missing -> generating (one-time, ~45s) ...")
+    if params_bin_load_region(LA_DIR, "lm") is None:
+        print("  LM region missing from params.bin -> generating (one-time, ~45s) ...")
         gen_lm_bin()
-    # dummy vision bin so the engine's weight_init existence check passes (vision is on GPU)
-    open(os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_vision_UNUSED.bin"), "a").close()
 
     def _la_load_config(script_dir):
         import copy
@@ -3715,19 +3829,19 @@ def main():
             print("  [stage2] MoonViT on GPU -> skipping FPGA vision-weight load")
 
         def load_connector(self):
-            """Load the connector (mlp1) bf16 weights into params DRAM."""
-            conn_bin = os.path.join(LA_DIR, "locateanything_3b_bin", "locateanything_3b_connector.bin")
-            man_path = conn_bin.rsplit(".", 1)[0] + ".json"
-            if not os.path.exists(conn_bin):
-                print("  connector bin missing -> generating ...")
+            """Load the connector (mlp1) bf16 weights into params DRAM
+            from params.bin region 'connector'."""
+            conn_cache = params_bin_load_region(LA_DIR, "connector")
+            if conn_cache is None:
+                print("  connector region missing in params.bin -> generating ...")
                 gen_connector_bin()
-            man = json.load(open(man_path))
-            blob = open(conn_bin, "rb").read()
+                conn_cache = params_bin_load_region(LA_DIR, "connector")
+                assert conn_cache is not None, "gen_connector_bin did not produce 'connector' region"
+            man = conn_cache["__entries__"]
 
             def _ld(key):
                 m = man[key]
-                import numpy as np
-                arr = np.frombuffer(blob[m["offset"]:m["offset"] + m["size"]], dtype=np.uint16).copy()
+                arr = np.frombuffer(conn_cache[key], dtype=np.uint16).copy()
                 t = torch.from_numpy(arr).view(torch.bfloat16).reshape(m["shape"])
                 return store_weight(self, t)
 
@@ -3757,21 +3871,16 @@ def main():
             IN  = self.VIS_MERGED_DRAM
             LN  = self.VIS_MERGER_INTER_DRAM
 
-            bin_dir  = os.path.join(self.script_dir, "locateanything_3b_bin")
-            bin_path  = os.path.join(bin_dir, f"connector_program_N{N}.bin")
-            meta_path = os.path.join(bin_dir, f"connector_program_N{N}.json")
-            os.makedirs(bin_dir, exist_ok=True)
-
+            conn_key = f"connector_N{N}"
             cache_hit = False
-            if os.path.exists(bin_path) and os.path.exists(meta_path):
-                with open(meta_path) as f:
-                    meta = json.load(f)
+            prog_bytes = None
+            _cached = programs_bin_load(self.script_dir, conn_key)
+            if _cached is not None:
+                prog_bytes, meta = _cached
                 if meta.get("num_tokens") == N and meta.get("conn_in") == Cin:
                     cache_hit = True
 
             if cache_hit:
-                with open(bin_path, "rb") as f:
-                    prog_bytes = f.read()
                 self._connector_program_addr = self.get_program_dram_addr()
                 self.dma_write(DMA_DEVICE_H2C, self._connector_program_addr, prog_bytes, len(prog_bytes))
                 self.allocate_program_dram(len(prog_bytes))
@@ -3804,10 +3913,8 @@ def main():
                 self.clear_capture_buffer()
                 self._connector_compiled_N = N
 
-                with open(bin_path, "wb") as f:
-                    f.write(prog_bytes)
-                with open(meta_path, "w") as f:
-                    json.dump({"num_tokens": N, "conn_in": Cin, "program_size": len(prog_bytes)}, f, indent=0)
+                programs_bin_store(self.script_dir, conn_key, prog_bytes,
+                                   meta={"num_tokens": N, "conn_in": Cin, "program_size": len(prog_bytes)})
                 _original_print(f"  Connector compiled ({len(prog_bytes)} bytes) at 0x{self._connector_program_addr:X}")
 
         def run_connector(self, vit):
@@ -4386,14 +4493,14 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     # weight/tensor addresses + absolute jumps, so reload is valid only when load_weights/
     # setup_dram ran first and the program lands at the same addr (deterministic alloc order). ---
     os.makedirs(_BIN_DIR, exist_ok=True)
-    cache_bin = os.path.join(_BIN_DIR, f"moonvit_encoder_N{N}_{prec}_pbi.bin")
-    if os.path.exists(cache_bin):
-        with open(cache_bin, "rb") as f:
-            prog = f.read()
+    moonvit_key = f"moonvit_encoder_N{N}_{prec}_pbi"
+    _cached = programs_bin_load(os.path.dirname(_BIN_DIR), moonvit_key)
+    if _cached is not None:
+        prog, _ = _cached
         program_addr = ue.get_program_dram_addr()
         ue.dma_write(DMA_DEVICE_H2C, program_addr, prog, len(prog))
         ue.allocate_program_dram(len(prog))
-        print(f"  MoonViT encoder: loaded cached program {os.path.basename(cache_bin)} "
+        print(f"  MoonViT encoder: loaded cached program programs.bin[{moonvit_key}] "
               f"({len(prog)} bytes = {len(prog)//32} instructions)")
         return program_addr
 
@@ -4549,10 +4656,10 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     ue.dma_write(DMA_DEVICE_H2C, program_addr, prog, len(prog))
     ue.allocate_program_dram(len(prog))
     ue.clear_capture_buffer()
-    with open(cache_bin, "wb") as f:                 # cache for fast reload next run
-        f.write(bytes(prog))
+    programs_bin_store(os.path.dirname(_BIN_DIR), moonvit_key, bytes(prog),
+                       meta={"N": N, "precision": prec, "depth": depth})
     _original_print(f"  MoonViT encoder compiled: {len(prog)//1024//1024}MB "
-                    f"({len(prog)//32} instructions, {depth} layers) -> cached {os.path.basename(cache_bin)}")
+                    f"({len(prog)//32} instructions, {depth} layers) -> cached programs.bin[{moonvit_key}]")
     return program_addr
 
 

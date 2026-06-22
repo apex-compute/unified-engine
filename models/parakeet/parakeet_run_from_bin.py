@@ -444,7 +444,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
 def check_bins_early():
     missing = []
-    for name in ("params.bin", "programs.bin", "programs_slave.bin", "mel_fb.npy", "mel_window.npy"):
+    for name in ("params.bin", "params.json", "programs.bin", "programs.json"):
         if not os.path.exists(os.path.join(BIN_DIR, name)):
             missing.append(name)
     return missing
@@ -513,8 +513,17 @@ def main():
         waveform = waveform[:1, :]  # mono
     n_mels = cfg["encoder"]["n_mels"]
     pre = cfg["preprocessing"]
-    fb = torch.from_numpy(np.load(os.path.join(BIN_DIR, "mel_fb.npy")))
-    window = torch.from_numpy(np.load(os.path.join(BIN_DIR, "mel_window.npy")))
+    import json as _json
+    with open(os.path.join(BIN_DIR, "params.json")) as _pf:
+        _pmeta = _json.load(_pf)
+    _extras = _pmeta.get("extras", {})
+    with open(os.path.join(BIN_DIR, "params.bin"), "rb") as _pb:
+        def _read_extra(name):
+            e = _extras[name]
+            _pb.seek(e["offset"])
+            return np.frombuffer(_pb.read(e["size"]), dtype=np.dtype(e["dtype"])).reshape(e["shape"]).copy()
+        fb = torch.from_numpy(_read_extra("mel_fb"))
+        window = torch.from_numpy(_read_extra("mel_window"))
     stft = torch.stft(waveform.float(), pre["n_fft"], pre["hop_length"], pre["win_length"],
                       window=window, center=True, pad_mode="reflect", return_complex=True)
     power = stft.abs() ** 2

@@ -3,8 +3,8 @@
 Qwen3-1.7B inference on accelerator: prefill + decode.
 
   - Config from qwen3_1.7b_bin/qwen3_1.7b_config.json; weights from a single bin (see below).
-  - Prefill: compiled each run. Decoder: if qwen3_1.7b_bin/decoder_program.bin and
-    qwen3_1.7b_bin/decoder_program.json exist, skip decoder compile and load
+  - Prefill: compiled each run. Decoder: if qwen3_1.7b_bin/programs.bin and
+    qwen3_1.7b_bin/programs.json exist, skip decoder compile and load
     program sizes from meta; otherwise compile and write the bin + meta.
   - Run prefill then decode loop. For numeric verification use qwen3_1.7b_numeric.py.
 
@@ -21,7 +21,7 @@ Architecture notes vs Gemma3:
   - RoPE applied per head (N=128) without lo|hi permutation.
 
 Weights:
-  - Default: qwen3_1.7b_bin/weights_qwen3_1.7b_hf.bin (generated from HF model if missing).
+  - Default: qwen3_1.7b_bin/params.bin (generated from HF model if missing).
   - --local-weights: use qwen3_1.7b_bin/full_model_weights.bin instead.
 
 Usage:
@@ -93,7 +93,7 @@ def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 6
     return (data_bytes, scale_bytes)
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_qwen3_1.7b_hf.bin from Hugging Face model per qwen3_1.7b_config.json layout.
+    """Generate params.bin from Hugging Face model per qwen3_1.7b_config.json layout.
     Returns the path to the written file. Use this bin to replace full_model_weights.bin."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -1489,7 +1489,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
     def compile_instructions(self, layer_size: int | None = None) -> dict:
         """Compile a UNIFIED single-bin instruction image: ONE prefill program
         + ONE decoder program in one capture session. Writes
-        ``qwen3_1.7b_instruction.bin`` + matching ``.json`` meta to disk.
+        ``programs.bin`` + matching ``programs.json`` meta to disk.
 
         Both programs are **seq_len-agnostic**: matmul/norm/rope row counts come
         from gpr_seq_len / gpr_q_seq_len GPRs, and flash attention dispatches on
@@ -1515,8 +1515,8 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             layer_size = self.LAYER_SIZE
 
         paths_cfg = self._cfg.get("paths", {})
-        bin_rel  = paths_cfg.get("instruction_bin",  "qwen3_1.7b_bin/qwen3_1.7b_instruction.bin")
-        meta_rel = paths_cfg.get("instruction_meta", "qwen3_1.7b_bin/qwen3_1.7b_instruction.json")
+        bin_rel  = paths_cfg.get("instruction_bin",  "qwen3_1.7b_bin/programs.bin")
+        meta_rel = paths_cfg.get("instruction_meta", "qwen3_1.7b_bin/programs.json")
         bin_path  = os.path.join(self.script_dir, bin_rel)
         meta_path = os.path.join(self.script_dir, meta_rel)
 
@@ -1714,7 +1714,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen3-1.7B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
-    parser.add_argument("--local-weights", action="store_true", help="Use qwen3_1.7b_bin/full_model_weights.bin instead of generated weights_qwen3_1.7b_hf.bin")
+    parser.add_argument("--local-weights", action="store_true", help="Use qwen3_1.7b_bin/full_model_weights.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
@@ -1743,7 +1743,7 @@ def main():
     if args.local_weights:
         weights_bin_rel = "qwen3_1.7b_bin/full_model_weights.bin"
     else:
-        weights_bin_rel = "qwen3_1.7b_bin/weights_qwen3_1.7b_hf.bin"
+        weights_bin_rel = "qwen3_1.7b_bin/params.bin"
         weights_bin_full = os.path.join(script_dir, weights_bin_rel)
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
@@ -1797,7 +1797,7 @@ def main():
 
     paths_cfg = cfg.get("paths", {})
     inst_bin_path = os.path.join(script_dir, paths_cfg.get("instruction_bin",
-                                  "qwen3_1.7b_bin/qwen3_1.7b_instruction.bin"))
+                                  "qwen3_1.7b_bin/programs.bin"))
     base_addr, _ = ue.load_instructions(inst_bin_path)
     # Reserve a slot AFTER the loaded bin for the runtime preamble. Prefill preamble
     # is 4 instructions (3 ADD_SET + JUMP_ABS) = 128 B; decode preamble is 2 instructions

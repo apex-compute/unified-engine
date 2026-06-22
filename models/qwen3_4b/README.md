@@ -37,7 +37,7 @@ in this template to absorb that.
 Force a recompile of the instruction bin by deleting both files:
 
 ```bash
-rm qwen3_4b_bin/qwen3_4b_instruction.bin qwen3_4b_bin/qwen3_4b_instruction.json
+rm qwen3_4b_bin/programs.bin qwen3_4b_bin/programs.json
 ```
 
 ## CLI flags (both scripts)
