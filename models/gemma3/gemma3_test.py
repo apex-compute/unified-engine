@@ -27,7 +27,7 @@ Usage:
 ``--dev`` is the XDMA device name (e.g. ``xdma0``). For Bittware use ``--device bittware``; override clock with ``--cycle`` if needed.
 
 Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in the same folder.
-  user_dma_core.py is one folder up; that parent is added to sys.path.
+  user_dma_core.py is two folders up; that parent is added to sys.path.
 """
 
 import json
@@ -35,16 +35,16 @@ import math
 import os
 import sys
 
-# This file's folder: gemma3_bin/, *.json live here. user_dma_core is one folder up.
+# This file's folder: gemma3_bin/, *.json live here. user_dma_core is two folders up.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
+sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 import time
-# pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
+# unified-engine imports (run from unified-engine root or with PYTHONPATH)
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
