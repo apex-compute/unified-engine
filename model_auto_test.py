@@ -146,6 +146,9 @@ def _check_mbv2_ssd(text):
 MATH_PROMPT = "If x + 3 = 5, what is x?"
 
 TESTS = [
+    # gemma3 has no run_from_bin yet — uses the _test.py entry point (like gpt2);
+    # swap to gemma3_run_from_bin.py once it exists.
+    {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "gemma4_e2b",  "script": "models/gemma4_e2b/gemma4_e2b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
@@ -166,12 +169,18 @@ TESTS = [
     # _test.py entry point; swap to gpt2_run_from_bin.py once it exists.
     {"name": "gpt2",        "script": "models/gpt2/gpt2_test.py",                        "prompt": "The scientists at MIT announced today that they have discovered ", "pass_check": _check_nonempty},
 
+    # Vision / detection models: no --prompt; emit detections / class labels parsed
+    # from stdout. No run_from_bin yet — use the _test.py entry points (like gpt2).
+    {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},
+    {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
+    {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
+
     # Encoder models take no --prompt and emit non-LM output (ASR transcription /
-    # segmentation); they also run after the harness poisons DRAM.
-    # Enable once their *_bin/ artifacts + sample inputs are in place. Checks are lenient
+    # segmentation). Use the _test.py entry points for this round; checks are lenient
     # (non-empty == the model didn't crash / NaN-out on poisoned DRAM).
-    # {"name": "parakeet",  "script": "models/parakeet/parakeet_run_from_bin.py",       "pass_check": _check_parakeet},
-    # {"name": "mobilesam", "script": "models/mobilesam/mobilesam_run_from_bin.py",     "pass_check": _check_nonempty},
+    {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",                "pass_check": _check_parakeet},
+    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",              "pass_check": _check_nonempty},
+    {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_nonempty},
 ]
 
 

@@ -915,8 +915,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         os.makedirs(bin_dir, exist_ok=True)
         artifact_suffix = self._artifact_mode_suffix()
-        uni_bin = os.path.join(bin_dir, f"instructions{artifact_suffix}.bin")
-        uni_meta = os.path.join(bin_dir, f"instructions{artifact_suffix}.json")
+        uni_bin = os.path.join(bin_dir, f"programs{artifact_suffix}.bin")
+        uni_meta = os.path.join(bin_dir, f"programs{artifact_suffix}.json")
         sig = {"prefill_max_seq_len": self.PREFILL_MAX_SEQ_LEN, "num_layers": self.NUM_LAYERS,
                "num_vis_layers": len(self.vis_layer_addrs),
                "encoder_ln": "shared_zeros",
@@ -929,7 +929,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         if os.path.exists(uni_bin) and os.path.exists(uni_meta):
             with open(uni_meta) as f:
                 meta = json.load(f)
-            if all(meta.get(k) == v for k, v in sig.items()) and "programs" in meta:
+            if all(meta.get(k) == v for k, v in sig.items()) and "segments" in meta:
                 # No LN-zeros replay: the shared vis_zeros_addr buffer is part of the weights snapshot
                 # (seeded in weight_init), so load_snapshot already restored it (Trick 9).
                 with open(uni_bin, "rb") as f:
@@ -943,7 +943,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 print(f"  Loaded unified instruction bin ({len(raw)/1024/1024:.1f} MB, "
                       f"{len(meta['segments'])} segments)")
                 return meta
-            print(f"  instructions{artifact_suffix or ''}.bin layout signature "
+            print(f"  programs{artifact_suffix or ''}.bin layout signature "
                   f"{dict((k, meta.get(k)) for k in sig)} ≠ current {sig} — rebuilding.")
 
         # ---- cache miss: compile all three in ONE session (encoder, decoder, prefill) ----
@@ -956,15 +956,15 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         finally:
             self._unified_active = False
         end_addr = self.get_program_dram_addr()
-        programs, raw = {}, bytearray()
+        segments, raw = [], bytearray()
         for name, seg in (("encoder", self._seg_encoder), ("decoder", self._seg_decoder),
                           ("prefill", self._seg_prefill)):
             if seg is None:
                 continue
             addr, b = seg
-            programs[name] = {"addr": addr, "offset": len(raw), "size": len(b)}
+            segments.append({"name": name, "addr": addr, "off": len(raw), "size": len(b)})
             raw.extend(b)
-        meta = {**sig, "programs": programs, "end_addr": end_addr,
+        meta = {**sig, "segments": segments, "end_addr": end_addr,
                 "encoder_addr": enc_addr,
                 "decoder_addr": self._decoder_program_addr,
                 "decoder_preamble": self._decoder_preamble_addr,
@@ -1301,8 +1301,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         """Dump params DRAM + all runtime address metadata to smolvlm2_bin/params.bin + params.json."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         suffix = self._artifact_mode_suffix()
-        bin_path = os.path.join(bin_dir, f"weights{suffix}.bin")
-        meta_path = os.path.join(bin_dir, f"weights{suffix}.json")
+        bin_path = os.path.join(bin_dir, f"params{suffix}.bin")
+        meta_path = os.path.join(bin_dir, f"params{suffix}.json")
         total = self.get_params_dram_usage()
         CHUNK = 1 * 1024 * 1024
         with open(bin_path, "wb") as f:
@@ -1365,8 +1365,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         """Load params DRAM from snapshot bin + restore all address metadata. Returns True if loaded."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         suffix = self._artifact_mode_suffix()
-        bin_path = os.path.join(bin_dir, f"weights{suffix}.bin")
-        meta_path = os.path.join(bin_dir, f"weights{suffix}.json")
+        bin_path = os.path.join(bin_dir, f"params{suffix}.bin")
+        meta_path = os.path.join(bin_dir, f"params{suffix}.json")
         if not os.path.exists(bin_path) or not os.path.exists(meta_path):
             return False
         with open(meta_path) as f:
@@ -1732,10 +1732,10 @@ def main():
     # clean; weights/instructions are DMA'd over their regions. (Avoids the slow 2 GB zero every launch.)
     init_hang_prevention(ue)
     _artifact_suffix = ue._artifact_mode_suffix()
-    # Load the snapshot (weights.bin) only when the single instruction bin also exists.
+    # Load the snapshot (params.bin) only when the single program bin also exists.
     _bin_dir = os.path.join(script_dir, "smolvlm2_bin")
-    _have_instr_bin = (os.path.exists(os.path.join(_bin_dir, f"instructions{_artifact_suffix}.bin"))
-                       and os.path.exists(os.path.join(_bin_dir, f"instructions{_artifact_suffix}.json")))
+    _have_instr_bin = (os.path.exists(os.path.join(_bin_dir, f"programs{_artifact_suffix}.bin"))
+                       and os.path.exists(os.path.join(_bin_dir, f"programs{_artifact_suffix}.json")))
     loaded_snapshot = _have_instr_bin and ue.load_snapshot()
     if not loaded_snapshot:
         ue.weight_init()
@@ -1758,8 +1758,8 @@ def main():
     S = ((seq_len + 63) // 64) * 64
     # ONE unified instruction bin (encoder + decoder + prefill). compile_all() builds it on the
     # first run and loads it (cache key = layout signature) on subsequent runs.
-    use_bin = (os.path.exists(os.path.join(bin_dir, f"instructions{_artifact_suffix}.bin"))
-               and os.path.exists(os.path.join(bin_dir, f"instructions{_artifact_suffix}.json")))
+    use_bin = (os.path.exists(os.path.join(bin_dir, f"programs{_artifact_suffix}.bin"))
+               and os.path.exists(os.path.join(bin_dir, f"programs{_artifact_suffix}.json")))
     import threading, io, contextlib
     _real_out = sys.stdout  # spinner writes here even while stdout is redirected
     stop_compile = threading.Event()
