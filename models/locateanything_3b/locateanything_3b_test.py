@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""LocateAnything-3B — Stage 1 hybrid: GPU(MoonViT + connector) -> FPGA decoder.
+"""LocateAnything-3B — full on-device path: FPGA(MoonViT + connector + decoder).
 
-The vision encoder + MLP connector run on GPU (our verified own-PyTorch impl in
-locateanything_3b_cpu_test.py). Their [N, 2048] output is DMA'd into the FPGA's
-VIS_ENCODER_OUT_DRAM, and the Qwen2.5-3B decoder runs prefill+decode on the
-board to emit grounding boxes. This is the first step of the staged migration:
-later the connector, then MoonViT, move onto the FPGA at the same DRAM seam.
+MoonViT, the MLP connector, and the Qwen2.5-3B decoder all run on the FPGA board.
+No CUDA/GPU is required. A CPU-only PyTorch reference (own-PyTorch impl in
+locateanything_3b_cpu_test.py) is built solely to supply weights/tokenizer and,
+when --check-vision/--compare are passed, an optional parity reference.
 
 The decoder reuses the qwen2.5_vl_3b engine verbatim (dimensionally identical LM):
   * config redirected to locateanything_3b_fpga_config.json (vocab 152681, 1D rope)
   * LM weights from params.bin region 'lm' (see gen_lm_bin)
-  * vision-weight load skipped (vision is on GPU)
+  * vision runs on the board (MoonViT weights loaded separately)
   * image-token id remapped to the placeholder run_prefill scans for
 
 Run (apex-compute env, board attached):
@@ -2574,6 +2573,26 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         print(f"    Prefill program at 0x{program_addr:X}, preamble slot at 0x{preamble_addr:X}")
         return program_addr, preamble_addr, total_flops
 
+    def prefill_theoretical_flops(self, seq_len: int, layer_size: int | None = None) -> int:
+        """Analytic forward-pass FLOPs for a `seq_len`-token prefill (2 flops/MAC).
+        Uses the model's true dims (not the padded/packed engine internals) so the
+        achieved-GFLOPS number is a meaningful MFU-style figure. Attention is
+        non-causal (LocateAnything block decoding) -> full S^2."""
+        L   = layer_size if layer_size is not None else self.LAYER_SIZE
+        S   = seq_len
+        d   = self.vector_length
+        dff = self.mlp_elements
+        hd  = self.actual_head_dim
+        nkv = self.num_kv_heads
+        nh  = nkv * self.group_size          # query heads
+        per_layer = (
+            2 * S * d * (nh * hd + 2 * nkv * hd)   # Q,K,V projections
+            + 2 * 2 * S * S * nh * hd              # QK^T + scores·V (full, non-causal)
+            + 2 * S * (nh * hd) * d                # output projection
+            + 6 * S * d * dff                      # SwiGLU MLP (gate+up+down)
+        )
+        return per_layer * L
+
     def run_prefill(self, prefill_program_addr: int, preamble_addr: int,
                     prefill_seq, gflops: int = None, has_image: bool = False) -> dict:
         """Run prefill via runtime preamble that primes gf_seq_len / gf_q_seq_len /
@@ -2641,8 +2660,19 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
 
         self.start_execute_from_dram(preamble_addr)
-        self.wait_queue(180.0)
+        wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(180.0), label="prefill")
+        latency_us = self._corrected_hw_latency_us(wall_s)
         print(f"    Prefill executed: actual_seq_len={actual_seq_len}, q_seq_len={q_seq_len}, bucket_idx={bucket_idx}")
+
+        # Throughput: theoretical model FLOPs at the ACTUAL seq len / measured HW latency.
+        total_flops = self.prefill_theoretical_flops(actual_seq_len)
+        hw_gflops = total_flops / (latency_us * 1e-6) / 1e9
+        self._last_total_flops = total_flops
+        self._last_hw_gflops = hw_gflops
+        self._last_prefill_latency_us = latency_us
+        print(f"    Prefill HW latency = {latency_us/1e3:.1f} ms  "
+              f"({total_flops/1e9:.1f} GFLOP -> {hw_gflops:.1f} GFLOPS)")
+        return dict(latency_us=latency_us, total_flops=total_flops, gflops=hw_gflops)
 
     # ------------------------------------------------------------------
     # NaN localizer: compile a K-layer prefill (NO cache), run it, and read
@@ -3409,7 +3439,7 @@ ENGINE_IMG_PLACEHOLDER = 151655   # what run_prefill() scans for; we remap onto 
 LA_IMAGE_TOKEN = 151665           # <IMG_CONTEXT> in LocateAnything
 
 
-def _gpu_vision(query, prompt_kind, image_path, device="cuda", compute_vit=True, keep_model=False):
+def _gpu_vision(query, prompt_kind, image_path, device="cpu", compute_vit=True, keep_model=False):
     """Build the MoonViT model, process the image, tokenize. Optionally compute the
     GPU vit/connector reference. Returns a dict; the FPGA-vision path reuses the model
     + pixel_values to run MoonViT on the board instead.
@@ -3459,7 +3489,7 @@ def _cpu_bf16_compare(args, hw_answer, prep):
     import locateanything_3b_cpu_test as la
     from transformers import AutoTokenizer
     import torch, re
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     cfg = prep["cfg"]
     model = la.LocateAnything(cfg).eval()
     la.load_weights(model, la.MODEL_DIR, device, torch.bfloat16)
@@ -3746,10 +3776,8 @@ def main():
                     help="skip vision/connector entirely; prefill+decode a short text prompt to isolate the LM decode path")
     ap.add_argument("--check-connector", action="store_true",
                     help="diff FPGA connector output vs the bit-exact GPU connector")
-    ap.add_argument("--gpu-vision", action="store_true",
-                    help="run MoonViT on the GPU instead of the FPGA (FPGA is the default)")
     ap.add_argument("--check-vision", action="store_true",
-                    help="parity-check FPGA vit[N,4608] vs the GPU reference")
+                    help="parity-check FPGA vit[N,4608] vs the CPU reference")
     ap.add_argument("--vision-precision", default="if4", choices=["if4", "bf16"],
                     help="MoonViT encoder weight precision (if4 fits the params window; "
                          "bf16 ~0.98GB may overflow)")
@@ -3779,7 +3807,6 @@ def main():
     args.image       = os.path.join(REPO_ROOT, "test_samples", "people.jpg")
     args.query       = "person"
     args.prompt_kind = "detect"
-    args.gpu_vision  = False         # MoonViT on the FPGA (full on-device path)
     PROBE_PREFILL_NAN = False        # True: layer-by-layer prefill sweep. False: fast prefill+decode.
     PROBE_DECODE_NAN  = False        # True: after prefill, sweep decode layers for the first NaN.
     PROBE_ADDR_MAP    = False        # fast: dump per-layer weight addrs + DRAM readback, then exit (no prefill)
@@ -3794,13 +3821,12 @@ def main():
         return
 
     # ---- 1. Vision prep (build model, process image, tokenize) ----
-    fpga_vision = not args.gpu_vision          # FPGA MoonViT is the default path
-    want_gpu_vit = (not fpga_vision) or args.check_vision
-    mode = "FPGA MoonViT" if fpga_vision else "GPU MoonViT"
-    print(f"=== Vision: {mode} -> FPGA connector + decoder ===")
+    fpga_vision = True                          # MoonViT always runs on the FPGA board
+    want_cpu_vit = args.check_vision            # CPU reference only when parity-checking
+    print("=== Vision: FPGA MoonViT -> FPGA connector + decoder ===")
     t0 = time.time()
     prep = _gpu_vision(args.query, args.prompt_kind, args.image,
-                       compute_vit=want_gpu_vit, keep_model=fpga_vision)
+                       compute_vit=want_cpu_vit, keep_model=fpga_vision)
     vit = prep["vit"]; conn_ref = prep["conn_ref"]; prefill_seq = prep["prefill_seq"]
     n_img = prep["n_img"]; (W, H) = prep["wh"]; vis_cfg = prep["cfg"]
     print(f"  image_tokens={n_img}  prefill_len={len(prefill_seq)}  ({time.time()-t0:.1f}s)")
@@ -3826,7 +3852,7 @@ def main():
 
     class LADecoder(Qwen25VL3B_UnifiedEngine):
         def _load_vision_weights(self, *a, **k):
-            print("  [stage2] MoonViT on GPU -> skipping FPGA vision-weight load")
+            print("  [stage2] MoonViT loaded separately -> skipping LM vision-weight load")
 
         def load_connector(self):
             """Load the connector (mlp1) bf16 weights into params DRAM
@@ -3972,7 +3998,7 @@ def main():
             diff = (f - ref).abs()
             denom = ref.abs().mean().clamp_min(1e-6)
             cos = torch.nn.functional.cosine_similarity(f.flatten(), ref.flatten(), dim=0)
-            print(f"  [check-vision] FPGA vit vs GPU: max|Δ|={diff.max():.4f} "
+            print(f"  [check-vision] FPGA vit vs CPU ref: max|Δ|={diff.max():.4f} "
                   f"mean|Δ|={diff.mean():.5f} rel={diff.mean()/denom:.4f} cos={cos:.5f}")
         del model
         if torch.cuda.is_available():
@@ -4418,7 +4444,7 @@ def moonvit_setup_dram(ue, N, cfg):
 # Host-side input prep: patch embedding (+pos emb) and the 2D-RoPE cos/sin table
 # =====================================================================================
 
-def moonvit_prepare_input(ue, model, pixel_values, grid_hw, cfg, device="cuda"):
+def moonvit_prepare_input(ue, model, pixel_values, grid_hw, cfg, device="cpu"):
     """Run patch_embed (conv + learnable 2D-interp pos-emb) and build the rope table on
     host; DMA both to the board. Returns N (token count)."""
     d = _vis_dims(cfg)
