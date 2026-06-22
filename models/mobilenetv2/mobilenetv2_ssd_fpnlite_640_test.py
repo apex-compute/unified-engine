@@ -1826,12 +1826,6 @@ class SSDFPNLite_UnifiedEngine(UnifiedEngine):
         _original_print(f"  Program loaded: {len(data) / 1024**2:.1f} MB from bin")
         return addr
 
-    def dump_instructions(self, program_addr: int) -> None:
-        bin_dir = self._bin_dir()
-        os.makedirs(bin_dir, exist_ok=True)
-        out_path = os.path.join(bin_dir, "instructions.bin")
-        self.write_captured_instructions_to_file(program_addr, filename=out_path)
-
     # ------------------------------------------------------------------
     # Compile: stem -> backbone -> head -> FPN -> SSD head (single program)
     # ------------------------------------------------------------------
@@ -2093,7 +2087,6 @@ class SSDFPNLite_UnifiedEngine(UnifiedEngine):
         prog_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prog_addr)
         inst_count = self.capture_count
-        self.dump_instructions(prog_addr)
         self.allocate_program_dram(inst_count * 32)
         self.clear_capture_buffer()
         return prog_addr, inst_count

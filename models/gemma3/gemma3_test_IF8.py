@@ -404,6 +404,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         with open(config_path, "r") as f:
             cfg = json.load(f)
         cfg = _if4_to_if8_layout(cfg)
+        # Route IF8 bins to a dedicated dir so IF4 and IF8 caches never
+        # collide. (Both variants bake DRAM addresses into captured programs;
+        # sharing a programs.bin between them produces silent NaN on the
+        # second runner.)
+        if "paths" in cfg:
+            for _k, _v in list(cfg["paths"].items()):
+                if isinstance(_v, str) and _v.startswith("gemma3_bin/"):
+                    cfg["paths"][_k] = "gemma3_if8_bin/" + _v[len("gemma3_bin/"):]
         weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
         for key, r in cfg.get("regions", {}).items():
             weight_defs[key] = _parse_offset(r["offset"])
