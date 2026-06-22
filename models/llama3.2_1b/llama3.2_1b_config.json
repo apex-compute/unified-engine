@@ -24,11 +24,12 @@
     "rope_global_layers": []
   },
   "paths": {
-    "weights_bin": "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin",
+    "weights_bin": "llama3.2_1b_bin/params.bin",
+    "params_meta": "llama3.2_1b_bin/params.json",
     "hf_model_dir": "llama3.2_1b_bin/Llama-3.2-1B-Instruct",
     "hf_model_repo": "meta-llama/Llama-3.2-1B-Instruct",
-    "instruction_bin": "llama3.2_1b_bin/llama_instruction.bin",
-    "instruction_meta": "llama3.2_1b_bin/llama_instruction.json"
+    "instruction_bin": "llama3.2_1b_bin/programs.bin",
+    "instruction_meta": "llama3.2_1b_bin/programs.json"
   },
   "default_prefill_tokens": [
     128000,

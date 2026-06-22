@@ -80,15 +80,34 @@ def store_quantized_weight(ue, raw_data):
 
     return scale_addr, data_addr
 
-def load_weight_cache(bin_path):
-    """Load bin+json weight file. Returns {tensor_name: raw_numpy_data}."""
+def load_weight_cache(bin_path, region=None):
+    """Load bin+json weight file. Returns {tensor_name: raw_numpy_data}.
+
+    When ``region`` is provided, ``bin_path`` is expected to be the unified
+    ``params.bin`` whose sidecar ``params.json`` contains a ``regions`` map
+    (each entry has ``offset``, ``size``, and a ``manifest`` of tensors with
+    region-relative offsets). The selected region's bytes are sliced out and
+    its sub-manifest is used. Without ``region``, the legacy flat layout
+    (top-level manifest of {name: {offset, size}}) is honored.
+    """
     json_path = bin_path.rsplit('.', 1)[0] + '.json'
     with open(json_path) as f:
         manifest = json.load(f)
     with open(bin_path, 'rb') as f:
         raw = f.read()
+    if region is not None:
+        regions = manifest.get('regions') or {}
+        if region not in regions:
+            raise KeyError(f"region {region!r} not in {json_path} (regions={list(regions)})")
+        r = regions[region]
+        base = int(r['offset'])
+        size = int(r['size'])
+        raw = raw[base:base + size]
+        sub_manifest = r['manifest']
+    else:
+        sub_manifest = manifest
     cache = {}
-    for name, meta in manifest.items():
+    for name, meta in sub_manifest.items():
         cache[name] = np.frombuffer(raw[meta['offset']:meta['offset'] + meta['size']], dtype=np.uint8).copy()
     return cache
 
@@ -567,21 +586,63 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
         model.visual = model.model.visual
     return model, model_dir
 
-def weight_bin_generate(script_dir: str | None = None, output_lm: str | None = None, output_vis: str | None = None) -> tuple[str, str]:
-    """Generate LM and vision weight bins from Hugging Face model.
-    Returns (lm_path, vis_path)."""
+def weight_bin_generate(script_dir: str | None = None, output_params: str | None = None) -> str:
+    """Generate the unified params.bin (LM + vision) from a Hugging Face model.
+
+    LM and vision weight bytes are generated into temporary sidecar files,
+    then concatenated into a single ``params.bin`` whose ``params.json``
+    sidecar carries a ``regions`` map ({lm,vision} → {offset, size,
+    manifest}) where each region's manifest holds region-relative tensor
+    offsets. Returns the unified params.bin path."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
     paths = cfg["paths"]
-    lm_path = output_lm or os.path.join(script_dir, paths["lm_weights"])
-    vis_path = output_vis or os.path.join(script_dir, paths["vision_weights"])
-    os.makedirs(os.path.dirname(lm_path), exist_ok=True)
+    params_path = output_params or os.path.join(script_dir, paths["params"])
+    os.makedirs(os.path.dirname(params_path), exist_ok=True)
+    bin_dir = os.path.dirname(params_path)
+
+    lm_tmp = os.path.join(bin_dir, "_params_lm.tmp.bin")
+    vis_tmp = os.path.join(bin_dir, "_params_vision.tmp.bin")
 
     model, model_dir = _ensure_hf_model(script_dir, cfg)
-    generate_lm_weights(model, lm_path, precision=_lm_precision(cfg))
-    generate_vision_weights(model, vis_path, precision=_vision_precision(cfg))
+    generate_lm_weights(model, lm_tmp, precision=_lm_precision(cfg))
+    generate_vision_weights(model, vis_tmp, precision=_vision_precision(cfg))
     del model
-    return lm_path, vis_path
+
+    lm_json = lm_tmp.rsplit('.', 1)[0] + '.json'
+    vis_json = vis_tmp.rsplit('.', 1)[0] + '.json'
+    with open(lm_json) as f:
+        lm_manifest = json.load(f)
+    with open(vis_json) as f:
+        vis_manifest = json.load(f)
+    lm_size = os.path.getsize(lm_tmp)
+    vis_size = os.path.getsize(vis_tmp)
+
+    CHUNK = 4 * 1024 * 1024
+    with open(params_path, 'wb') as out:
+        for tmp in (lm_tmp, vis_tmp):
+            with open(tmp, 'rb') as src:
+                while True:
+                    buf = src.read(CHUNK)
+                    if not buf:
+                        break
+                    out.write(buf)
+
+    regions = {
+        "lm":     {"offset": 0,       "size": lm_size,  "manifest": lm_manifest},
+        "vision": {"offset": lm_size, "size": vis_size, "manifest": vis_manifest},
+    }
+    params_json = params_path.rsplit('.', 1)[0] + '.json'
+    with open(params_json, 'w') as f:
+        json.dump({"regions": regions}, f)
+
+    for tmp in (lm_tmp, vis_tmp, lm_json, vis_json):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    print(f"Unified params.bin: lm={lm_size/1048576:.1f} MB + vision={vis_size/1048576:.1f} MB -> {params_path}")
+    return params_path
 
 class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine for Qwen2.5-VL-3B-Instruct: config + weight bins, compile, run."""
@@ -1202,15 +1263,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         """Load local LM + vision weight bins to DRAM; never download/generate."""
         from transformers import AutoTokenizer
         model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
-        lm_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["lm_weights"])
-        vis_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["vision_weights"])
+        params_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["params"])
+        params_json_path = params_bin_path.rsplit(".", 1)[0] + ".json"
         required = [
             os.path.join(model_dir, "config.json"),
             os.path.join(model_dir, "tokenizer_config.json"),
-            lm_bin_path,
-            lm_bin_path.rsplit(".", 1)[0] + ".json",
-            vis_bin_path,
-            vis_bin_path.rsplit(".", 1)[0] + ".json",
+            params_bin_path,
+            params_json_path,
         ]
         missing = [path for path in required if not os.path.isfile(path)]
         if missing:
@@ -1219,9 +1278,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 "build system first:\n  " + "\n  ".join(missing)
             )
 
-        # Load LM weights
-        print(f"  Reading LM weight bin (memmap)...", flush=True)
-        lm_cache = load_weight_cache(lm_bin_path)
+        # Load LM weights (lm region of unified params.bin)
+        print(f"  Reading LM weight region from params.bin...", flush=True)
+        lm_cache = load_weight_cache(params_bin_path, region="lm")
 
         # Embedding (host-side only — NOT uploaded to FPGA DRAM)
         # Embedding lookup is done on host in get_embedding_for_tokens()
@@ -1280,7 +1339,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         if lm_head_key not in lm_cache:
             raise RuntimeError(
                 f"LM head entry {lm_head_key!r} not found in bin "
-                f"{lm_bin_path!r}. The bin was generated by an older "
+                f"{params_bin_path!r}. The bin was generated by an older "
                 f"version of the script. Delete the bin and rerun to "
                 f"regenerate with the LM head pre-quantized."
             )
@@ -1294,16 +1353,17 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._load_rope_host()
 
         # Vision weights (all from binary — pre-padded QKV and MLP)
-        self._load_vision_weights(vis_bin_path)
+        self._load_vision_weights(params_bin_path)
 
         print(f"    Allocate weights end at DRAM address: 0x{self.get_params_dram_addr():X}, usage: {self.get_params_dram_usage()} bytes")
         print("Tokenizer loaded successfully.")
 
-    def _load_vision_weights(self, vis_bin_path: str, hf_model=None) -> None:
-        """Load vision encoder weights from bin file. Manifest-key suffix
-        comes from cfg['precision']['vision'] — same string the generator
-        wrote, so changing precision in the config switches both ends."""
-        vis_cache = load_weight_cache(vis_bin_path)
+    def _load_vision_weights(self, params_bin_path: str, hf_model=None) -> None:
+        """Load vision encoder weights from the unified params.bin (vision
+        region). Manifest-key suffix comes from cfg['precision']['vision'] —
+        same string the generator wrote, so changing precision in the
+        config switches both ends."""
+        vis_cache = load_weight_cache(params_bin_path, region="vision")
         vis_cfg = self._vis_cfg
         vis_depth = vis_cfg["depth"]
         VI = vis_cfg["intermediate_size"]
@@ -1651,7 +1711,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
         os.makedirs(bin_dir, exist_ok=True)
         # NOTE: no standalone encoder_program.bin — the ONLY instruction bin is
-        # the unified instructions.bin written by compile_all. Direct callers
+        # the unified programs.bin written by compile_all. Direct callers
         # (e.g. the compare script's per-layer vision checks) just compile fresh
         # into program DRAM; nothing is cached to disk here.
 
@@ -2020,7 +2080,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._vis_program_addr = program_addr
 
         if getattr(self, '_unified_active', False):
-            # Unified single-bin mode: hand bytes to compile_all for instructions.bin.
+            # Unified single-bin mode: hand bytes to compile_all for programs.bin.
             self._seg_encoder = (program_addr, bytes(prog_bytes))
         _original_print(f"    Vision encoder compiled: {total_bytes} bytes at 0x{program_addr:X}, "
                         f"{total_layers} layers + merger")
@@ -2503,7 +2563,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         """Emit the single PBI prefill program into program DRAM and return
         (program_addr, preamble_addr, total_flops). No standalone disk cache — the
         bytes are handed to compile_all (via self._seg_prefill) for the unified
-        instructions.bin. The program is seq_len-agnostic for actual_seq_len ≤
+        programs.bin. The program is seq_len-agnostic for actual_seq_len ≤
         PREFILL_MAX_SEQ_LEN, primed at runtime by the preamble in run_prefill.
         """
         if layer_size is None:
@@ -2874,7 +2934,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     def compile_decoder(self, layer_size: int | None = None) -> tuple[int, int]:
         """Emit the single PBI decoder program into program DRAM and allocate the
         per-step preamble slot. No standalone disk cache — bytes are handed to
-        compile_all (via self._seg_decoder) for the unified instructions.bin.
+        compile_all (via self._seg_decoder) for the unified programs.bin.
         ``self._decoder_preamble_addr`` is the small slot run_decoder rewrites each
         step. Returns (decoder_program_addr, total_flops).
         """
@@ -2946,11 +3006,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
         os.makedirs(bin_dir, exist_ok=True)
         tmpl = self.PREFILL_MAX_SEQ_LEN
-        uni_bin  = os.path.join(bin_dir, "instructions.bin")
-        uni_meta = os.path.join(bin_dir, "instructions.json")
+        uni_bin  = os.path.join(bin_dir, "programs.bin")
+        uni_meta = os.path.join(bin_dir, "programs.json")
 
         # ---- cache hit: load the one bin, DMA each segment at its stored addr ----
-        # Filename is fixed (instructions.bin), so validate the baked layout
+        # Filename is fixed (programs.bin), so validate the baked layout
         # signature — a bin built for a different prefill_max_seq_len / layer_size
         # has different bucket bodies and addresses (core_changes §6) and must be
         # rebuilt, not silently reused.
@@ -2961,7 +3021,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             _meta_ok = (meta.get("template_seq_len") == tmpl
                         and meta.get("layer_size") == layer_size)
             if not _meta_ok:
-                _original_print(f"  instructions.bin was built for template_seq_len="
+                _original_print(f"  programs.bin was built for template_seq_len="
                                 f"{meta.get('template_seq_len')}/layer_size={meta.get('layer_size')} "
                                 f"≠ current {tmpl}/{layer_size} — rebuilding.")
         if _meta_ok:
@@ -3031,8 +3091,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     def load_all_from_bin(self) -> dict:
         """Load the complete pre-generated prefill+decoder+encoder instruction bin."""
         bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
-        bin_path = os.path.join(bin_dir, "instructions.bin")
-        meta_path = os.path.join(bin_dir, "instructions.json")
+        bin_path = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -3321,16 +3381,13 @@ def main():
 
     # Fail before hardware initialization. This runtime never downloads,
     # generates, or recompiles missing artifacts.
-    lm_bin = os.path.join(script_dir, cfg["paths"]["lm_weights"])
-    vis_bin = os.path.join(script_dir, cfg["paths"]["vision_weights"])
+    params_bin = os.path.join(script_dir, cfg["paths"]["params"])
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
     required = [
-        lm_bin,
-        lm_bin.rsplit(".", 1)[0] + ".json",
-        vis_bin,
-        vis_bin.rsplit(".", 1)[0] + ".json",
-        os.path.join(bin_dir, "instructions.bin"),
-        os.path.join(bin_dir, "instructions.json"),
+        params_bin,
+        params_bin.rsplit(".", 1)[0] + ".json",
+        os.path.join(bin_dir, "programs.bin"),
+        os.path.join(bin_dir, "programs.json"),
         os.path.join(model_dir, "config.json"),
         os.path.join(model_dir, "tokenizer_config.json"),
         os.path.join(model_dir, "tokenizer.json"),

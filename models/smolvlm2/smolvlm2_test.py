@@ -254,7 +254,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
     def weight_init(self) -> None:
         """Build ALL weights into params DRAM straight from the HF model — q4_64 LM (quantized on the
         fly) + bf16 vision. No intermediate weight bins: dump_snapshot then captures the assembled
-        params DRAM into the single weights.bin. (Fixed scheme: bf16 vision + q4 LM; no other options.)"""
+        params DRAM into the single params.bin. (Fixed scheme: bf16 vision + q4 LM; no other options.)"""
         from transformers import AutoTokenizer, AutoModelForImageTextToText
         model_dir = os.path.join(self.script_dir, "smolvlm2_bin", "SmolVLM2-500M-Video-Instruct")
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -642,9 +642,10 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         if self._unified_active:
             self._seg_encoder = (program_addr, bytes(all_bytes))
         else:
-            bin_path = os.path.join(self.script_dir, "smolvlm2_bin", "encoder_program.bin")
-            with open(bin_path, "wb") as f:
-                f.write(all_bytes)
+            # Standalone encoder compile path is not used in production (main always goes through
+            # compile_all). Keep the bytes in _seg_encoder so the unified programs.bin writer (if
+            # ever invoked with a partial set) has the segment available.
+            self._seg_encoder = (program_addr, bytes(all_bytes))
         self._vis_program_addr = program_addr
         print(f"    Vision encoder compiled: {len(all_bytes)} bytes at 0x{program_addr:X}")
         return program_addr
@@ -838,17 +839,14 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         size_bytes = self.get_capture_instruction_size_bytes()
         # Cache the full program (gemma3 convention) so later runs load in ~1s instead of recompiling.
         # Only the canonical program (no debug dump / no early halt). Under compile_all, the bytes are
-        # stashed for the unified instructions.bin instead of a separate prefill_v2_program.bin.
+        # stashed for the unified programs.bin instead of a separate per-segment bin.
         if halt_after_layer is None and not debug_dump:
             raw = bytearray()
             for inst in self.capture_buffer:
                 raw.extend(inst.get_bytes())
-            if self._unified_active:
-                self._seg_prefill = (prefill_addr, bytes(raw))
-            else:
-                bin_path = os.path.join(self.script_dir, "smolvlm2_bin", "prefill_v2_program.bin")
-                with open(bin_path, "wb") as f:
-                    f.write(bytes(raw))
+            # Standalone prefill compile is never used in production; stash bytes either way so a
+            # later programs.bin writer can pick them up.
+            self._seg_prefill = (prefill_addr, bytes(raw))
         self.allocate_program_dram(size_bytes)
         self.clear_capture_buffer()
         self._prefill_v2_addr = prefill_addr
@@ -877,35 +875,35 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
 
     def compile_all(self) -> dict:
         """Build (or load) the COMPLETE single instruction bin — encoder + decoder + prefill_v2 in ONE
-        instructions.bin. Mirrors qwen2.5_vl compile_all. The compile order (encoder, decoder,
+        programs.bin. Mirrors qwen2.5_vl compile_all. The compile order (encoder, decoder,
         prefill_v2) matches the validated 3-bin order, so every §7 JUMP_ABS bakes against the exact
         program-DRAM address it did before; the bin just bundles the three segments, each recorded with
         its absolute load address (see fpga_pbi_jump_target_bake). Cache key = layout signature."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         os.makedirs(bin_dir, exist_ok=True)
-        uni_bin = os.path.join(bin_dir, "instructions.bin")
-        uni_meta = os.path.join(bin_dir, "instructions.json")
+        uni_bin = os.path.join(bin_dir, "programs.bin")
+        uni_meta = os.path.join(bin_dir, "programs.json")
         sig = {"prefill_max_seq_len": self.PREFILL_MAX_SEQ_LEN, "num_layers": self.NUM_LAYERS,
                "num_vis_layers": len(self.vis_layer_addrs), "lm_head": "penalty_bias_argmax",
                "encoder_ln": "shared_zeros"}
 
-        # ---- cache hit: replay the encoder LN params, DMA each segment to its stored abs addr ----
+        # ---- cache hit: replay the encoder LN params, DMA each program to its stored abs addr ----
         if os.path.exists(uni_bin) and os.path.exists(uni_meta):
             with open(uni_meta) as f:
                 meta = json.load(f)
-            if all(meta.get(k) == v for k, v in sig.items()):
+            if all(meta.get(k) == v for k, v in sig.items()) and "programs" in meta:
                 # No LN-zeros replay: the shared vis_zeros_addr buffer is part of the weights snapshot
                 # (seeded in weight_init), so load_snapshot already restored it (Trick 9).
                 with open(uni_bin, "rb") as f:
                     raw = f.read()
-                for seg in meta["segments"]:
-                    b = raw[seg["off"]:seg["off"] + seg["size"]]
-                    self.dma_write(DMA_DEVICE_H2C, seg["addr"], b, len(b))
+                for name, entry in meta["programs"].items():
+                    b = raw[entry["offset"]:entry["offset"] + entry["size"]]
+                    self.dma_write(DMA_DEVICE_H2C, entry["addr"], b, len(b))
                 self._restore_unified_addrs(meta)
-                print(f"  Loaded unified instruction bin ({len(raw)/1024/1024:.1f} MB, "
-                      f"{len(meta['segments'])} segments)")
+                print(f"  Loaded unified programs.bin ({len(raw)/1024/1024:.1f} MB, "
+                      f"{len(meta['programs'])} programs)")
                 return meta
-            print(f"  instructions.bin layout signature {dict((k, meta.get(k)) for k in sig)} "
+            print(f"  programs.bin layout signature {dict((k, meta.get(k)) for k in sig)} "
                   f"≠ current {sig} — rebuilding.")
 
         # ---- cache miss: compile all three in ONE session (encoder, decoder, prefill_v2) ----
@@ -918,15 +916,15 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         finally:
             self._unified_active = False
         end_addr = self.get_program_dram_addr()
-        segments, raw = [], bytearray()
+        programs, raw = {}, bytearray()
         for name, seg in (("encoder", self._seg_encoder), ("decoder", self._seg_decoder),
                           ("prefill", self._seg_prefill)):
             if seg is None:
                 continue
             addr, b = seg
-            segments.append({"name": name, "addr": addr, "off": len(raw), "size": len(b)})
+            programs[name] = {"addr": addr, "offset": len(raw), "size": len(b)}
             raw.extend(b)
-        meta = {**sig, "segments": segments, "end_addr": end_addr,
+        meta = {**sig, "programs": programs, "end_addr": end_addr,
                 "encoder_addr": enc_addr,
                 "decoder_addr": self._decoder_program_addr,
                 "decoder_preamble": self._decoder_preamble_addr,
@@ -939,9 +937,19 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             f.write(raw)
         with open(uni_meta, "w") as f:
             json.dump(meta, f)
-        print(f"  Complete instruction bin: {len(raw)/1024/1024:.1f} MB, "
-              f"{len(segments)} segments ({'+'.join(s['name'] for s in segments)}) → {uni_bin}")
+        print(f"  Complete programs.bin: {len(raw)/1024/1024:.1f} MB, "
+              f"{len(programs)} programs ({'+'.join(programs.keys())}) → {uni_bin}")
         return meta
+
+    def _read_program_from_bin(self, name: str) -> bytes:
+        """Look up a named program in smolvlm2_bin/programs.{bin,json} and return its raw bytes."""
+        bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
+        with open(os.path.join(bin_dir, "programs.json")) as f:
+            meta = json.load(f)
+        entry = meta["programs"][name]
+        with open(os.path.join(bin_dir, "programs.bin"), "rb") as f:
+            f.seek(entry["offset"])
+            return f.read(entry["size"])
 
     def load_prefill_v2(self) -> None:
         """Load the cached seq-len-agnostic prefill program. Replays compile_prefill_v2's exact
@@ -949,9 +957,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         were baked against (must be called at the same point in the alloc sequence: after the
         decoder is loaded)."""
         PM = self.PREFILL_MAX_SEQ_LEN
-        bin_path = os.path.join(self.script_dir, "smolvlm2_bin", "prefill_v2_program.bin")
-        with open(bin_path, "rb") as f:
-            raw = f.read()
+        raw = self._read_program_from_bin("prefill")
         prefill_addr = self.get_program_dram_addr()
         self.dma_write(DMA_DEVICE_H2C, prefill_addr, raw, len(raw))
         self.allocate_program_dram(len(raw))
@@ -1241,10 +1247,19 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         if self._unified_active:
             self._seg_decoder = (self._decoder_program_addr, bytes(raw))
         else:
-            with open(os.path.join(bin_dir, "decoder_program.bin"), "wb") as f:
-                f.write(bytes(raw))
-            with open(os.path.join(bin_dir, "decoder_program.json"), "w") as f:
-                json.dump({"decoder_program_size": len(raw), "num_buckets": num_buckets, "version": 2}, f)
+            # Standalone decoder compile (e.g. user_hw_test Stage 4): emit a single-program
+            # programs.bin + programs.json with just the decoder entry. Matches the parakeet
+            # concat-with-manifest pattern (parakeet_test.py:1590-1614).
+            data = bytes(raw)
+            programs = {"decoder": {"addr": self._decoder_program_addr, "offset": 0, "size": len(data)}}
+            meta = {"programs": programs, "num_buckets": num_buckets, "version": 2,
+                    "decoder_addr": self._decoder_program_addr,
+                    "decoder_preamble": self._decoder_preamble_addr,
+                    "decoder_num_buckets": num_buckets}
+            with open(os.path.join(bin_dir, "programs.bin"), "wb") as f:
+                f.write(data)
+            with open(os.path.join(bin_dir, "programs.json"), "w") as f:
+                json.dump(meta, f)
         print(f"    Decoder compiled: single program {len(raw)} bytes at 0x{self._decoder_program_addr:X}, {num_buckets} attention buckets")
 
     def _load_bin(self, bin_path: str) -> int:
@@ -1281,13 +1296,18 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.allocate_params_dram(N * bpe)
         self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
 
-        return self._load_bin(os.path.join(self.script_dir, "smolvlm2_bin", "encoder_program.bin"))
+        raw = self._read_program_from_bin("encoder")
+        addr = self.get_program_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, addr, raw, len(raw))
+        self.allocate_program_dram(len(raw))
+        print(f"    Loaded {len(raw)} bytes from programs.bin[encoder]")
+        return addr
 
     def dump_snapshot(self) -> None:
-        """Dump params DRAM + all runtime address metadata to smolvlm2_bin/weights.bin + weights.json."""
+        """Dump params DRAM + all runtime address metadata to smolvlm2_bin/params.bin + params.json."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
-        bin_path = os.path.join(bin_dir, "weights.bin")
-        meta_path = os.path.join(bin_dir, "weights.json")
+        bin_path = os.path.join(bin_dir, "params.bin")
+        meta_path = os.path.join(bin_dir, "params.json")
         total = self.get_params_dram_usage()
         CHUNK = 1 * 1024 * 1024
         with open(bin_path, "wb") as f:
@@ -1347,8 +1367,8 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
     def load_snapshot(self) -> bool:
         """Load params DRAM from snapshot bin + restore all address metadata. Returns True if loaded."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
-        bin_path = os.path.join(bin_dir, "weights.bin")
-        meta_path = os.path.join(bin_dir, "weights.json")
+        bin_path = os.path.join(bin_dir, "params.bin")
+        meta_path = os.path.join(bin_dir, "params.json")
         if not os.path.exists(bin_path) or not os.path.exists(meta_path):
             return False
         with open(meta_path) as f:
@@ -1373,7 +1393,7 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
                 setattr(self, key, val)
         self.bytes_per_element = 2  # always bf16; not in snapshot, needed by attention PBI body
         # load_encoder/run_encoder only need len(vis_layer_addrs) (the per-layer weight addresses
-        # are already baked into the precompiled encoder_program.bin). Restore a length-correct
+        # are already baked into the precompiled encoder program in programs.bin). Restore a length-correct
         # placeholder list from the saved layer count so those len() calls work post-snapshot.
         self.vis_layer_addrs = [None] * self._num_vis_layers
         from transformers import AutoTokenizer
@@ -1386,25 +1406,23 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         return True
 
     def load_decoder(self) -> None:
-        """Load pre-compiled decoder program from bin."""
+        """Load pre-compiled decoder program from programs.bin."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
-        meta_path = os.path.join(bin_dir, "decoder_program.json")
+        meta_path = os.path.join(bin_dir, "programs.json")
         with open(meta_path) as f:
             meta = json.load(f)
-        if "num_buckets" not in meta:
+        if "num_buckets" not in meta and "decoder_num_buckets" not in meta:
             raise RuntimeError(
-                "decoder_program.json is from the old bucket format; "
-                "delete decoder_program.bin and decoder_program.json to recompile"
+                "programs.json is from the old bucket format; "
+                "delete programs.bin and programs.json to recompile"
             )
-        bin_path = os.path.join(bin_dir, "decoder_program.bin")
-        with open(bin_path, "rb") as f:
-            raw = f.read()
+        raw = self._read_program_from_bin("decoder")
         self._decoder_program_addr = self.get_program_dram_addr()
         self.dma_write(DMA_DEVICE_H2C, self._decoder_program_addr, raw, len(raw))
         self.allocate_program_dram(len(raw))
         self._decoder_preamble_addr = self.get_program_dram_addr()
         self.allocate_program_dram(256)
-        self._decoder_num_buckets = meta["num_buckets"]
+        self._decoder_num_buckets = meta.get("decoder_num_buckets", meta.get("num_buckets"))
         print(f"    Loaded decoder @0x{self._decoder_program_addr:X}: {len(raw)} bytes, {self._decoder_num_buckets} buckets")
 
     # --- Run ---
@@ -1767,7 +1785,7 @@ def run_debug(ue, args, script_dir, has_image):
     n_dec = len(hf_greedy)
     try:
         bin_dir = os.path.join(script_dir, "smolvlm2_bin")
-        have_dec = os.path.exists(os.path.join(bin_dir, "decoder_program.bin"))
+        have_dec = os.path.exists(os.path.join(bin_dir, "programs.bin"))
         print(f"  {'loading' if have_dec else 'compiling'} decoder"
               f"{' (~49K embed programs, slow, minutes)' if not have_dec else ''}…", flush=True)
         with quiet():
@@ -1963,7 +1981,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     model_dir = os.path.join(script_dir, _SMOLVLM2_CFG["paths"]["hf_model_dir"])
     # Download HF model if needed (the only weight source — weight_init quantizes/loads from it,
-    # producing the single weights.bin snapshot; there are no intermediate weight bins).
+    # producing the single params.bin snapshot; there are no intermediate weight bins).
     if not os.path.exists(os.path.join(model_dir, "config.json")):
         print(f"Downloading {HF_MODEL_REPO} ...")
         snapshot_download(repo_id=HF_MODEL_REPO, local_dir=model_dir, local_dir_use_symlinks=False, ignore_patterns=["onnx/*"])
@@ -1992,13 +2010,13 @@ def main():
     # No startup DRAM zeroing: each run already zero_dram()s at the END (below), so the next run starts
     # clean; weights/instructions are DMA'd over their regions. (Avoids the slow 2 GB zero every launch.)
     init_hang_prevention(ue)
-    # Load the snapshot (weights.bin) ONLY when the instruction bin also exists — i.e. a pure load run.
-    # If instructions.bin is missing we must compile_all, and compile_encoder needs the full vision
+    # Load the snapshot (params.bin) ONLY when the programs bin also exists — i.e. a pure load run.
+    # If programs.bin is missing we must compile_all, and compile_encoder needs the full vision
     # weight addresses that weight_init sets but the snapshot does not restore. So: load-both, or
     # build-both — never load-snapshot-then-compile.
     _bin_dir = os.path.join(script_dir, "smolvlm2_bin")
-    _have_instr_bin = (os.path.exists(os.path.join(_bin_dir, "instructions.bin"))
-                       and os.path.exists(os.path.join(_bin_dir, "instructions.json")))
+    _have_instr_bin = (os.path.exists(os.path.join(_bin_dir, "programs.bin"))
+                       and os.path.exists(os.path.join(_bin_dir, "programs.json")))
     if not (_have_instr_bin and ue.load_snapshot()):
         ue.weight_init()
         ue.tensor_init(max_seq_len=args.max_seq)
@@ -2021,8 +2039,8 @@ def main():
     S = ((seq_len + 63) // 64) * 64
     # ONE unified instruction bin (encoder + decoder + prefill_v2). compile_all() builds it on the
     # first run and loads it (cache key = layout signature) on subsequent runs.
-    use_bin = (os.path.exists(os.path.join(bin_dir, "instructions.bin"))
-               and os.path.exists(os.path.join(bin_dir, "instructions.json")))
+    use_bin = (os.path.exists(os.path.join(bin_dir, "programs.bin"))
+               and os.path.exists(os.path.join(bin_dir, "programs.json")))
     import threading, io, contextlib
     _real_out = sys.stdout  # spinner writes here even while stdout is redirected
     stop_compile = threading.Event()

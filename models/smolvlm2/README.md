@@ -11,8 +11,9 @@ language.** SigLIP vision encoder (12 layers) → pixel-shuffle connector → Sm
 - **smolvlm2_headless_check.py** – stubs the FPGA DMA and runs `compile_all` for a no-hardware
   compile/size check.
 - **smolvlm2_bin/** – generated at runtime: the HF model dir (sole weight source) + the two deployable
-  bins: **`instructions.bin`** (the one instruction bin: encoder + decoder + prefill via `compile_all`)
-  and **`weights.bin`** (the assembled params snapshot — q4 LM + bf16 vision).
+  bins: **`programs.bin`** + **`programs.json`** (the unified programs bin: encoder + decoder + prefill
+  via `compile_all`, with a name->{offset,size,addr} manifest) and **`params.bin`** + **`params.json`**
+  (the assembled params snapshot — q4 LM + bf16 vision).
 
 See `../../notes/notes_smolvlm2.md` for the optimization mechanisms (§7 shared attention, strided-DMA
 permute elimination, single bin, encoder layer-body sharing, prefill GEMM kernel).

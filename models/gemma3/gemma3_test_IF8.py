@@ -146,19 +146,11 @@ def _if4_to_if8_layout(cfg: dict) -> dict:
             r["offset"] = f"0x{cur:08X}"
             cur += r["size"]
 
-    # Distinct filenames so stale IF4 artifacts don't get reused. Both the
-    # weights bin AND the captured instruction image (which embeds literal
-    # IF8 DRAM addresses) must be separate from the IF4 reference's caches.
-    paths = cfg.setdefault("paths", {})
-    for key, default in (
-        ("weights_bin",     "gemma3_bin/weights_gemma3_hf.bin"),
-        ("instruction_bin", "gemma3_bin/gemma3_instruction.bin"),
-        ("instruction_meta","gemma3_bin/gemma3_instruction.json"),
-    ):
-        rel = paths.get(key, default)
-        if "_if8" not in rel:
-            stem, sep, ext = rel.rpartition(".")
-            paths[key] = f"{stem}_if8{sep}{ext}" if sep else f"{rel}_if8"
+    # IF4 and IF8 share the same canonical bin layout (gemma3_bin/params.bin,
+    # gemma3_bin/programs.bin). The two variants are mutually exclusive at runtime —
+    # whichever script runs last owns the cached artifacts. Delete the bins to switch
+    # variants cleanly. The captured instruction image embeds literal IF8 DRAM addresses,
+    # so a stale IF4 cache will be rebuilt the first time IF8 compiles.
     return cfg
 
 def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
@@ -172,7 +164,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     cfg = Gemma3_UnifiedEngine.load_config(config_path=config_path, script_dir=SCRIPT_DIR)
     weight_defs = cfg["_weight_defs"]
     paths = cfg["paths"]
-    paths_full = os.path.join(SCRIPT_DIR, paths["weights_bin"])
+    paths_full = os.path.join(SCRIPT_DIR, paths["params_bin"])
     out_path = output_path or paths_full
 
     model, model_dir = _ensure_hf_model(SCRIPT_DIR, cfg)
@@ -311,9 +303,13 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
     write_at(weight_defs["LM_HEAD_WEIGHT_DATA"], data_padded)
 
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(buf)
-    print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
+    meta_path = os.path.join(os.path.dirname(out_path), "params.json")
+    with open(meta_path, "w") as f:
+        json.dump({"size": len(buf), "source": "hf", "quant": QUANT_PRECISION}, f, indent=2)
+    print(f"Generated params bin: {out_path} ({len(buf)} bytes)")
     return out_path
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
@@ -392,7 +388,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.prefill_seq = None 
         self.engine_slave = engine_slave
 
-        self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
+        # Single canonical params bin path; --local-weights only suppresses HF regeneration.
+        self._weights_bin_rel = paths["params_bin"]
+        self._local_weights = local_weights
         self.weight_init()
         self.tensor_init()
 
@@ -483,9 +481,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """Ensure weight bin exists (generate from HF if missing), load it, then initialize DRAM: embedding, layers from bin, RoPE, OUTPUT_NORM/LM_HEAD."""
         full_path = os.path.join(self.script_dir, self._weights_bin_rel)
         if os.path.exists(full_path):
-            print(f"Weight bin exists, skip generation: {full_path}")
+            print(f"Params bin exists, skip generation: {full_path}")
+        elif self._local_weights:
+            raise FileNotFoundError(
+                f"--local-weights set but params bin not found at {full_path}"
+            )
         else:
-            print(f"Weight bin not found, generating: {full_path}")
+            print(f"Params bin not found, generating: {full_path}")
             weight_bin_generate(output_path=full_path)
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
@@ -1176,6 +1178,39 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "total_flops": total_flops,
         }
 
+    def _load_master_programs_from_bin(self, meta: dict) -> None:
+        """Load prefill+decoder slice of programs.bin into program DRAM."""
+        programs_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["programs_bin"])
+        with open(programs_bin_path, "rb") as f:
+            blob = f.read()
+        progs = meta["programs"]
+        master_start = progs["prefill"]["offset"]
+        master_end = progs["decoder"]["offset"] + progs["decoder"]["size"]
+        data = blob[master_start:master_end]
+        start_addr = self.allocate_program_dram(len(data))
+        written = self.dma_write(DMA_DEVICE_H2C, start_addr, data, len(data))
+        if written != len(data):
+            raise RuntimeError(
+                f"_load_master_programs_from_bin: DMA wrote {written} of {len(data)} bytes"
+            )
+        print(f"    Loaded {len(data)} bytes master programs (prefill+decoder) to DRAM at 0x{start_addr:x}")
+
+    def _load_slave_prefill_from_bin(self, meta: dict, programs_bin_path: str) -> None:
+        progs = meta.get("programs", {})
+        if "slave_prefill" not in progs:
+            raise RuntimeError("programs.json has no 'slave_prefill' entry; recompile with slave_engine")
+        with open(programs_bin_path, "rb") as f:
+            blob = f.read()
+        entry = progs["slave_prefill"]
+        data = blob[entry["offset"]:entry["offset"] + entry["size"]]
+        start_addr = self.allocate_program_dram(len(data))
+        written = self.dma_write(DMA_DEVICE_H2C, start_addr, data, len(data))
+        if written != len(data):
+            raise RuntimeError(
+                f"_load_slave_prefill_from_bin: DMA wrote {written} of {len(data)} bytes"
+            )
+        print(f"    Loaded {len(data)} bytes slave prefill to DRAM at 0x{start_addr:x}")
+
     def compile_gemma3(self, layer_size: int = 26, use_pbi: bool = False, slave_engine = None) -> None:
         """Compile a single prefill program (seq_len-agnostic) and one decoder program into a
         combined instruction image.
@@ -1200,10 +1235,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
           - paths.instruction_bin : raw 32 B/instruction stream
           - paths.instruction_meta : per-stage start addresses, sizes, FLOPs.
         """
-        instruction_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_bin"])
-        instruction_meta_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_meta"])
+        instruction_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["programs_bin"])
+        instruction_meta_path = os.path.join(self.script_dir, self._cfg["paths"]["programs_meta"])
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
-            print(f"Reusing existing instruction image at {instruction_bin_path}")
+            print(f"Reusing existing programs image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
             return
 
@@ -1229,8 +1264,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         assert len(instruction_bytes) % 64 == 0, (
             "combined instruction image must be 64-byte aligned"
         )
-        with open(instruction_bin_path, "wb") as f:
-            f.write(instruction_bytes)
         self.clear_capture_buffer()
 
         # Start address of the single decoder segment (after prefill in the combined image).
@@ -1238,8 +1271,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         prefill_program_addr = instruction_base_addr
         decoder_program_addr = instruction_base_addr + prefill_prog["size_bytes"]
 
+        # Single programs.bin + manifest of named entries (see IF4 for layout rationale).
+        programs_blob = bytearray()
+        manifest_programs: dict = {}
+        manifest_programs["prefill"] = {"offset": len(programs_blob), "size": prefill_prog["size_bytes"]}
+        programs_blob.extend(instruction_bytes[:prefill_prog["size_bytes"]])
+        manifest_programs["decoder"] = {"offset": len(programs_blob), "size": decoder_program["program_size_bytes"]}
+        programs_blob.extend(instruction_bytes[prefill_prog["size_bytes"]:])
+
         metadata = {
-            "instruction_bin": os.path.relpath(instruction_bin_path, self.script_dir),
+            "profile": False,
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "instruction_total_size": len(instruction_bytes),
             "prefill_template_seq_len": prefill_seq_len,
@@ -1249,6 +1290,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_program["program_size_bytes"],
             "decoder_total_flops": decoder_program["total_flops"],
+            "programs": manifest_programs,
         }
 
         if slave_engine is not None:
@@ -1258,27 +1300,27 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=True
             )
             slave_engine.stop_capture()
-            slave_bin_path = os.path.join(self.script_dir, "gemma3_bin", "prefill_program_slave_if8.bin")
             slave_program_bytes = bytearray()
             for inst in slave_engine.capture_buffer:
                 slave_program_bytes.extend(inst.get_bytes())
             assert len(slave_program_bytes) % 64 == 0, (
                 "slave prefill instruction image must be 64-byte aligned"
             )
-            with open(slave_bin_path, "wb") as f:
-                f.write(slave_program_bytes)
             slave_engine.clear_capture_buffer()
             slave_prefill_addr = slave_engine.get_program_dram_addr()
+            manifest_programs["slave_prefill"] = {"offset": len(programs_blob), "size": len(slave_program_bytes)}
+            programs_blob.extend(slave_program_bytes)
             metadata["dual_engine_slave_prefill"] = {
-                "bin_path": os.path.relpath(slave_bin_path, self.script_dir),
                 "start_addr": f"0x{slave_prefill_addr:X}",
                 "flops": slave_prefill_prog["flops"],
             }
 
+        with open(instruction_bin_path, "wb") as f:
+            f.write(programs_blob)
         with open(instruction_meta_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
-        print(f"Combined gemma3-IF8 instruction image written to {instruction_bin_path} ({len(instruction_bytes)} bytes)")
+        print(f"Combined gemma3-IF8 programs image written to {instruction_bin_path} ({len(programs_blob)} bytes)")
         print(f"  prefill: seq_len-agnostic (template={prefill_seq_len}), {prefill_prog['size_bytes']} bytes")
         print(f"  decoder: {decoder_program['program_size_bytes']} bytes")
         print(f"Metadata written to {instruction_meta_path}")
@@ -1295,10 +1337,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         jump into the cached decoder program), DMAs it over the same program-DRAM words
         as the prefill preamble (``preamble_addr``), and executes from that address again.
         """
-        meta_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_meta"])
+        meta_path = os.path.join(self.script_dir, self._cfg["paths"]["programs_meta"])
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
+        self._load_master_programs_from_bin(meta)
         preamble_addr = self.get_program_dram_addr()
 
         prefill_program_addr = _parse_offset(meta["prefill_program_start_addr"])
@@ -1326,9 +1368,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         slave_prefill_addr = None
         slave_prefill = meta.get("dual_engine_slave_prefill")
         if slave_engine is not None and slave_prefill is not None:
-            slave_bin_path = os.path.join(self.script_dir, slave_prefill["bin_path"])
             slave_engine.reset_program_dram_addr()
-            slave_engine.load_program_instructions_from_file(slave_bin_path)
+            slave_engine._load_slave_prefill_from_bin(meta, programs_bin_path=os.path.join(self.script_dir, self._cfg["paths"]["programs_bin"]))
             slave_prefill_addr = _parse_offset(slave_prefill["start_addr"])
             slave_prefill_flops = slave_prefill["flops"]
 
@@ -1448,7 +1489,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Gemma3 layer-0 prefill: run on accelerator, verify with torch ref.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
-    parser.add_argument("--local-weights", action="store_true", help="Use gemma3_bin/full_model_weights.bin instead of generated weights_gemma3_hf.bin")
+    parser.add_argument("--local-weights", action="store_true", help="Require existing gemma3_bin/params.bin (skip HF regeneration)")
     parser.add_argument("--dual-engine", action="store_true", help="Use dual engine")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')

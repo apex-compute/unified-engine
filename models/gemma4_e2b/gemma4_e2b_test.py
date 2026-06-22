@@ -9,8 +9,8 @@ Gemma4 E2B inference on accelerator: prefill + decode.
   - Run prefill then decode loop. For numeric verification use gemma4_e2b_numeric.py.
 
 Weights:
-  - Default: gemma4_e2b_bin/weights_gemma4_e2b_hf.bin (generated from HF model if missing).
-  - --local-weights: use gemma4_e2b_bin/full_model_weights.bin instead.
+  - Default: gemma4_e2b_bin/params.bin (generated from HF model if missing).
+  - --local-weights: use gemma4_e2b_bin/params.bin instead.
 
 Usage:
   python gemma4_e2b_test.py
@@ -65,7 +65,7 @@ VISION_FIXED_NUM_PATCHES = 2520
 AUDIO_FIXED_SOFT_TOKENS = 128
 
 # Default sample assets used at first-run compile time to bake the vision
-# and audio sections into gemma4_instruction.bin. The actual sample values
+# and audio sections into programs.bin. The actual sample values
 # don't matter for vision (pixel_position_ids depend only on the canonical
 # image SHAPE, not its pixels) or audio (the mel input gets re-uploaded at
 # runtime); only their shapes pin the ISA.
@@ -73,7 +73,7 @@ _TEST_SAMPLES = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samp
 DEFAULT_IMAGE = os.path.join(_TEST_SAMPLES, "yosemite.jpg")
 DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
 
-# Bumped any time the on-disk gemma4_instruction.bin layout / ISA semantics
+# Bumped any time the on-disk programs.bin layout / ISA semantics
 # change in an incompatible way. On version mismatch the bin is rebuilt from
 # scratch rather than incrementally extended.
 INSTRUCTION_BIN_COMPILE_VERSION = "v1"
@@ -250,7 +250,7 @@ def _host_rms_norm(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> t
     return ((x_f / rms) * gamma.float()).to(x.dtype)
 
 def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
-    """Generate full_model_weights.bin from Hugging Face model per gemma4_e2b_config.json layout.
+    """Generate params.bin from Hugging Face model per gemma4_e2b_config.json layout.
     Returns the path to the written file."""
     cfg = Gemma4_UnifiedEngine.load_config(config_path=config_path, script_dir=SCRIPT_DIR)
     weight_defs = cfg["_weight_defs"]
@@ -478,7 +478,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     #   [LM | vision | host]
     # plus a single master manifest JSON that holds section offsets and the
     # sub-manifests (per-tensor offsets relative to each section's start).
-    # Two binary files total — gemma4_instruction.bin and weights_gemma4_e2b_hf.bin —
+    # Two binary files total — programs.bin and params.bin —
     # matching the "one instruction bin, one weight bin" design.
     vision_bytes, vision_manifest = _build_vision_section_bytes(model)
     audio_bytes,  audio_manifest  = _build_audio_section_bytes(model)
@@ -942,7 +942,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         #   ISA Audio     : 0x98000000 – 0xa0000000  (128 MB)
         #   ISA Unified   : 0xa0000000 – 0x100000000 (1.5 GB) ← program_base default
         #     (formerly split into vision/prefill/decoder regions; collapsed
-        #     into one contiguous region for the unified gemma4_instruction.bin
+        #     into one contiguous region for the unified programs.bin
         #     which holds LM prefill+decode buckets + vision encoder ISA in
         #     one contiguous blob. Total fits comfortably under 4 GB; the prior
         #     base 0xC0000000 caused the bin to overflow 4 GB once vision
@@ -1020,7 +1020,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._identity_dram_addr = None
         self._identity_dram_written = False
 
-        self._weights_bin_rel = "gemma4_e2b_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
+        self._weights_bin_rel = "gemma4_e2b_bin/params.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
         self._preallocate_identity_matrix()
@@ -1235,17 +1235,17 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _prog_dram_base_save = self._program_dram_base
 
         # ---- Unified-bin vision path ----
-        # Vision encoder ISA lives inside gemma4_instruction.bin at the
+        # Vision encoder ISA lives inside programs.bin at the
         # `vision_program_start_addr` baked by compile_instruction_bin. The
         # bin MUST already exist with vision folded in — main()
         # / run_from_bin invoke compile_instruction_bin(image_path=...,
         # audio_path=...) at cold start to guarantee that.
         bin_dir    = os.path.join(self.script_dir, "gemma4_e2b_bin")
-        instr_bin  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
+        instr_bin  = os.path.join(bin_dir, "programs.bin")
+        instr_meta = os.path.join(bin_dir, "programs.json")
         if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
             raise SystemExit(
-                "[VLM] gemma4_instruction.bin missing — compile_instruction_bin "
+                "[VLM] programs.bin missing — compile_instruction_bin "
                 "must run first (main() handles this on cold start).")
         with open(instr_meta, "r") as f:
             _peek = json.load(f)
@@ -1257,7 +1257,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         if not _peek.get("contains_vision"):
             raise SystemExit(
                 "[VLM] unified bin was built without the vision section. "
-                "Delete gemma4_instruction.bin and rerun so the cold-start "
+                "Delete programs.bin and rerun so the cold-start "
                 "compile folds vision in too.")
         vision_target_addr = int(_peek["vision_program_start_addr"], 16)
 
@@ -1467,7 +1467,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _prog_dram_base_save = self._program_dram_base
 
         # ---- Unified-bin audio path ----
-        # The audio encoder ISA lives inside gemma4_instruction.bin (folded
+        # The audio encoder ISA lives inside programs.bin (folded
         # at compile time by compile_instruction_bin → load_instruction_bin
         # already DMA'd it into program DRAM). We just need to:
         #   1) upload weights (params region; deterministic addresses)
@@ -1478,11 +1478,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         #   4) start_execute_from_dram(audio_program_addr); wait
         #   5) read AUD_FEATURES_FINAL
         bin_dir    = os.path.join(self.script_dir, "gemma4_e2b_bin")
-        instr_bin  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
+        instr_bin  = os.path.join(bin_dir, "programs.bin")
+        instr_meta = os.path.join(bin_dir, "programs.json")
         if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
             raise SystemExit(
-                "[Audio] gemma4_instruction.bin missing — compile_instruction_bin "
+                "[Audio] programs.bin missing — compile_instruction_bin "
                 "must run first (main() handles this on cold start). Delete the "
                 "bin file to force a rebuild including the audio section.")
         with open(instr_meta, "r") as f:
@@ -1490,7 +1490,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         if not _peek.get("contains_audio"):
             raise SystemExit(
                 "[Audio] unified bin was built without the audio section. "
-                "Delete gemma4_instruction.bin and rerun so the cold-start "
+                "Delete programs.bin and rerun so the cold-start "
                 "compile folds audio in too.")
         T_raw = int(input_features.shape[1])
         bin_T_raw = _peek["audio_T_raw"]
@@ -2687,7 +2687,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         """Compute the three FPGA-ready 2D-RoPE padded buffers
         (cos / neg_sin / sin_hi), each (S * NH, HD) bf16, for the canonical
         image grid. The result is embedded in the unified instruction bin
-        (gemma4_instruction.bin) by compile_instruction_bin, so we don't
+        (programs.bin) by compile_instruction_bin, so we don't
         keep a separate vision_rope_pads_*.bin cache file on disk anymore:
         the bin already holds these bytes.
         """
@@ -4116,7 +4116,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         if hf_model is None:
             raise RuntimeError(
                 "audio_weight_init: combined-bin audio section not present and "
-                "no HF model provided. Regenerate weights_gemma4_e2b_hf.bin via "
+                "no HF model provided. Regenerate params.bin via "
                 "`python gemma4_e2b_test.py` so the audio section gets folded in.")
         self.audio_config_init()
         am = hf_model.model.audio_tower
@@ -8171,7 +8171,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     # ------------------------------------------------------------------
     # Captures LM (prefill+decode buckets) + vision encoder + audio
     # encoder into ONE start_capture/stop_capture session. The resulting
-    # gemma4_instruction.bin is a self-contained artifact that the
+    # programs.bin is a self-contained artifact that the
     # customer-facing run_from_bin script consumes directly: no
     # incremental rewrites, no per-modality cache files, no extra DMA
     # roundtrips between sections at runtime.
@@ -8199,8 +8199,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         """
         bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
         os.makedirs(bin_dir, exist_ok=True)
-        bin_path  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        meta_path = os.path.join(bin_dir, "gemma4_instruction.json")
+        bin_path  = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
 
         # Dynamic PBI: single prefill program (max_seq_len) + single decoder program.
         prefill_max_seq_len = self._cfg["model"].get("prefill_max_seq_len", 512)
@@ -8656,14 +8656,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         return bin_path, manifest
 
     def load_instruction_bin(self) -> dict:
-        """Load gemma4_instruction.bin into program DRAM at the manifest's
+        """Load programs.bin into program DRAM at the manifest's
         baked base address. Returns the manifest dict (with int addrs).
         Sets self._instruction_loaded = True; subsequent prefill/decode
         dispatches read from manifest addrs.
         """
         bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
-        bin_path  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        meta_path = os.path.join(bin_dir, "gemma4_instruction.json")
+        bin_path  = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
         if not (os.path.exists(bin_path) and os.path.exists(meta_path)):
             raise FileNotFoundError(
                 f"Instruction bin missing: {bin_path}. Run compile_instruction_bin() first.")
@@ -8721,7 +8721,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     def extend_instruction_bin_with_vision(self, num_patches: int,
                                             rope_pads_tuple: tuple | None = None,
                                             position_ids_sha256: str | None = None) -> dict:
-        '''Append the vision encoder program to gemma4_instruction.bin so
+        '''Append the vision encoder program to programs.bin so
         the unified bin holds LM + vision in one file. The vision ISA is
         compiled with PBI baked against `lm_base + lm_size`, exactly where
         the new bytes land at runtime — so JUMP_ABS targets in the vision
@@ -8738,9 +8738,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
           - the LM instruction bin already exists on disk
 
         On exit:
-          - gemma4_instruction.bin is rewritten atomically (old LM bytes +
+          - programs.bin is rewritten atomically (old LM bytes +
             new vision bytes)
-          - gemma4_instruction.json gains: contains_vision=true,
+          - programs.json gains: contains_vision=true,
             vision_program_start_addr, vision_program_size,
             vision_num_patches, vision_layers_per_group, vision_groups,
             vision_group_offsets (relative to vision section),
@@ -8750,8 +8750,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         Returns the updated manifest dict (with int addrs resolved).
         '''
         bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
-        bin_path  = os.path.join(bin_dir, "gemma4_instruction.bin")
-        meta_path = os.path.join(bin_dir, "gemma4_instruction.json")
+        bin_path  = os.path.join(bin_dir, "programs.bin")
+        meta_path = os.path.join(bin_dir, "programs.json")
 
         # 1. Read existing bin + manifest.
         with open(meta_path, "r") as f:
@@ -9188,7 +9188,7 @@ def main():
                         help="Enable audio mode with the default example audio "
                              "(../../test_samples/apex.wav, relative to this script). "
                              "Ignored if --audio is also given.")
-    parser.add_argument("--local-weights", action="store_true", help="Use gemma4_e2b_bin/full_model_weights.bin instead of generated weights_gemma4_e2b_hf.bin")
+    parser.add_argument("--local-weights", action="store_true", help="Use gemma4_e2b_bin/params.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
@@ -9245,18 +9245,18 @@ def main():
     # only; the actual pixel/mel data is uploaded fresh at runtime.
     # ------------------------------------------------------------------
     bin_dir = os.path.join(SCRIPT_DIR, "gemma4_e2b_bin")
-    instr_bin = os.path.join(bin_dir, "gemma4_instruction.bin")
-    instr_meta = os.path.join(bin_dir, "gemma4_instruction.json")
+    instr_bin = os.path.join(bin_dir, "programs.bin")
+    instr_meta = os.path.join(bin_dir, "programs.json")
     if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
         # Always build the COMPLETE LM + vision + audio bin (no LM-only option):
         # the bin holds ISA only, so unused modes cost nothing at runtime, and any
         # later run / run_from_bin / mode can rely on every section being present.
-        print(f"\n--- First-time compile: building LM + vision + audio into gemma4_instruction.bin ---")
+        print(f"\n--- First-time compile: building LM + vision + audio into programs.bin ---")
         timer = time.perf_counter()
         ue.compile_instruction_bin(image_path=DEFAULT_IMAGE, audio_path=DEFAULT_AUDIO)
         print(f"[compile] unified bin built in {time.perf_counter() - timer:.2f} seconds")
     else:
-        print(f"[compile] gemma4_instruction.bin already present, skipping ISA emission.")
+        print(f"[compile] programs.bin already present, skipping ISA emission.")
 
     # Load the unified bin once; both VLM and audio reload it after their
     # tensor allocator state changes, but the first load primes

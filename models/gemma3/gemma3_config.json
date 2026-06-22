@@ -23,11 +23,12 @@
     "rope_global_layers": [5, 11, 17, 23]
   },
   "paths": {
-    "weights_bin": "gemma3_bin/weights_gemma3_hf.bin",
+    "params_bin": "gemma3_bin/params.bin",
+    "params_meta": "gemma3_bin/params.json",
     "hf_model_dir": "gemma3_bin/gemma-3-1b-it",
     "hf_model_repo": "google/gemma-3-1b-it",
-    "instruction_bin": "gemma3_bin/gemma3_instruction.bin",
-    "instruction_meta": "gemma3_bin/gemma3_instruction.json"
+    "programs_bin": "gemma3_bin/programs.bin",
+    "programs_meta": "gemma3_bin/programs.json"
   },
   "default_prefill_tokens": [2, 2, 105, 2364, 107, 236781, 236862, 236800, 236784, 236810, 236764, 1144, 563, 1123, 236881, 106, 107, 105, 4368, 107],
   "layers": {

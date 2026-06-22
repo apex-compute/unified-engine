@@ -12,8 +12,8 @@ instruction bin.
 | `qwen3.5_2b_test.py` | Builder + reference runner. Compiles the model, **generates the unified bin**, and runs LM/VLM inference. |
 | `qwen3.5_2b_run_from_bin.py` | Customer-facing **runtime-only** runner. Loads the prebuilt bin and runs — no compilation. |
 | `qwen3.5_2b_config.json` | Architecture + paths config. |
-| `qwen3.5_2b_bin/qwen3.5_2b_instruction.bin` (+ `.json`) | The unified instruction bin (**4.32 MB** = encoder 0.82 + decoder 3.50) + meta. |
-| `qwen3.5_2b_bin/weights_qwen3.5_2b_hf.bin` | Quantized weights (built on first run). |
+| `qwen3.5_2b_bin/programs.bin` (+ `programs.json`) | Unified programs bin (**4.32 MB** = encoder 0.82 + decoder 3.50). Manifest lists `{programs: {encoder: {offset, size}, decoder: {offset, size}}}`. |
+| `qwen3.5_2b_bin/params.bin` (+ `params.json`) | Quantized weights (built on first run) + manifest. |
 
 ## Quick start
 

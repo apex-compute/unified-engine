@@ -1545,14 +1545,15 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
     # -----------------------------------------------------------------------
     # Bin dump / load
     # -----------------------------------------------------------------------
-    def dump_params(self, L_pad):
-        """Dump entire params DRAM to parakeet_bin/params.bin + params.json."""
+    def dump_params(self, L_pad, extras=None):
+        """Dump entire params DRAM to parakeet_bin/params.bin + params.json.
+        extras: optional dict {name: numpy.ndarray} appended after the DRAM region;
+        offsets/shapes/dtypes recorded in params.json under 'extras'."""
         bin_dir = os.path.join(self.script_dir, "parakeet_bin")
         bin_path = os.path.join(bin_dir, "params.bin")
         meta_path = os.path.join(bin_dir, "params.json")
         total = self.get_params_dram_usage()
-        # Read back entire params region in chunks
-        CHUNK = 1 * 1024 * 1024  # 1 MB
+        CHUNK = 1 * 1024 * 1024
         with open(bin_path, "wb") as f:
             offset = 0
             while offset < total:
@@ -1561,8 +1562,16 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.dma_read(DMA_DEVICE_C2H, self._params_dram_base + offset, buf, sz)
                 f.write(buf)
                 offset += sz
+            extras_meta = {}
+            cursor = total
+            for name, arr in (extras or {}).items():
+                b = arr.tobytes()
+                f.write(b)
+                extras_meta[name] = {"offset": cursor, "size": len(b),
+                                     "shape": list(arr.shape), "dtype": str(arr.dtype)}
+                cursor += len(b)
         with open(meta_path, "w") as f:
-            json.dump({"L_pad": L_pad, "size": total}, f)
+            json.dump({"L_pad": L_pad, "size": total, "extras": extras_meta}, f)
         _original_print(f"  Params dumped: {total / 1024**2:.1f} MB → {bin_path}")
     def load_params(self, L_pad):
         """Load params DRAM from bin. Returns True if loaded, False if not found/mismatch."""
@@ -1841,10 +1850,10 @@ def main():
 
     # Dump params to bin (weights + Toeplitz + BN + attention biases)
     if not params_loaded:
-        engine.dump_params(L_pad)
-        bin_dir = os.path.join(engine.script_dir, "parakeet_bin")
-        np.save(os.path.join(bin_dir, "mel_fb.npy"), sd["preprocessor.featurizer.fb"].float().numpy())
-        np.save(os.path.join(bin_dir, "mel_window.npy"), sd["preprocessor.featurizer.window"].float().numpy())
+        engine.dump_params(L_pad, extras={
+            "mel_fb": sd["preprocessor.featurizer.fb"].float().numpy(),
+            "mel_window": sd["preprocessor.featurizer.window"].float().numpy(),
+        })
 
     # ==================================================================
     # Compile (or load from bin)

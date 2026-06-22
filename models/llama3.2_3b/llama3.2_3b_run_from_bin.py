@@ -9,9 +9,14 @@ aborts with a clear error before touching the FPGA.
 
 Required artifacts (in ``llama3.2_3b_bin/`` next to this script — produced by
 running ``llama3.2_3b_test.py`` once on a build machine that has HF access):
-  * ``weights_llama3.2_3b_hf.bin``   IF4 layer weights + bf16 embedding
-  * ``llama_instruction.bin``        unified dynamic-PBI instruction bin (prefill + decoder)
-  * ``llama_instruction.json``       per-stage start addresses / sizes / FLOPs
+  * ``params.bin``                   IF4 layer weights + bf16 embedding
+  * ``params.json``                  size metadata for params.bin
+  * ``programs.bin``                 unified dynamic-PBI instruction bin (prefill + decoder).
+                                     The on-FPGA repetition-penalty build is shipped as the
+                                     parallel ``programs_fpgapenalty.bin`` (separate compile;
+                                     LM-head matmul bias differs). --pure-greedy uses programs.bin.
+  * ``programs.json``                per-stage start addresses / sizes / FLOPs
+                                     (``programs_fpgapenalty.json`` for the penalty build)
   * ``Llama-3.2-3B-Instruct/``       tokenizer files only (tokenizer.json /
                                      tokenizer_config.json). Model weights NOT needed.
 
@@ -341,7 +346,7 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
         program. ``self.prefill_seq`` must be set by the caller."""
         paths_cfg = self._cfg.get("paths", {})
         meta_path = os.path.join(self.script_dir,
-                                 paths_cfg.get("instruction_meta", "llama3.2_3b_bin/llama_instruction.json"))
+                                 paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json"))
         if bool(getattr(self, "fpga_penalty", False)):
             # On-FPGA penalty uses a separate bin (LM-head matmul bias on / logit writeback off);
             # its meta points to the _fpgapenalty bin. Compiled by llama3.2_3b_test.py (default).

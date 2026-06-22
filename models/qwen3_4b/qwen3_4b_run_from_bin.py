@@ -7,9 +7,10 @@ pre-compiled instruction bin from disk, and run prefill + decode.
 
 Requirements on disk (relative to this file):
   - ``qwen3_4b_bin/qwen3_4b_config.json``   model config
-  - ``qwen3_4b_bin/weights_qwen3_4b_hf.bin`` quantized weight bin
-  - ``qwen3_4b_bin/qwen3_4b_instruction.bin`` pre-compiled program bin
-  - ``qwen3_4b_bin/qwen3_4b_instruction.json`` compile-meta sidecar
+  - ``qwen3_4b_bin/params.bin`` quantized weight bin
+  - ``qwen3_4b_bin/params.json`` weight-bin sidecar
+  - ``qwen3_4b_bin/programs.bin`` pre-compiled program bin
+  - ``qwen3_4b_bin/programs.json`` compile-meta sidecar
   - ``qwen3_4b_bin/Qwen3-4B/`` tokenizer files
 
 If any of those are missing, exit early with a clear message. Generate them
@@ -92,7 +93,7 @@ def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 6
     return (data_bytes, scale_bytes)
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_qwen3_4b_hf.bin from Hugging Face model per qwen3_4b_config.json layout.
+    """Generate params.bin from Hugging Face model per qwen3_4b_config.json layout.
     Returns the path to the written file. Use this bin to replace full_model_weights.bin."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -874,7 +875,7 @@ def main():
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt (default: from qwen3_4b_config.json default_prompt)")
     parser.add_argument("--local-weights", action="store_true",
-                        help="Use qwen3_4b_bin/full_model_weights.bin instead of weights_qwen3_4b_hf.bin")
+                        help="Use qwen3_4b_bin/full_model_weights.bin instead of params.bin")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=5.62,
@@ -900,14 +901,14 @@ def main():
     bin_dir = os.path.join(script_dir, "qwen3_4b_bin")
 
     weights_bin_rel = ("qwen3_4b_bin/full_model_weights.bin" if args.local_weights
-                       else "qwen3_4b_bin/weights_qwen3_4b_hf.bin")
+                       else "qwen3_4b_bin/params.bin")
     weights_bin_full = os.path.join(script_dir, weights_bin_rel)
 
     # Hard-fail BEFORE any FPGA / HF touch if a required local file is missing.
     missing = []
     if not os.path.exists(weights_bin_full):
         missing.append(os.path.relpath(weights_bin_full, script_dir))
-    for name in ("qwen3_4b_instruction.bin", "qwen3_4b_instruction.json"):
+    for name in ("programs.bin", "programs.json"):
         if not os.path.exists(os.path.join(bin_dir, name)):
             missing.append(name)
     tokenizer_dir = os.path.join(bin_dir, "Qwen3-4B")
@@ -967,7 +968,7 @@ def main():
     # Read meta JSON directly from disk — no compile_instructions call.
     paths_cfg = cfg.get("paths", {})
     inst_bin_path = os.path.join(script_dir, paths_cfg.get("instruction_bin",
-                                  "qwen3_4b_bin/qwen3_4b_instruction.bin"))
+                                  "qwen3_4b_bin/programs.bin"))
     meta_path = os.path.splitext(inst_bin_path)[0] + ".json"
     with open(meta_path) as _f:
         inst_meta = json.load(_f)
