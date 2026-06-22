@@ -259,7 +259,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     def weight_init(self) -> None:
         """Build ALL weights into params DRAM straight from the HF model — q4_64 LM (quantized on the
         fly) + bf16 vision. No intermediate weight bins: dump_snapshot then captures the assembled
-        params DRAM into the single weights.bin. (Fixed scheme: bf16 vision + q4 LM; no other options.)"""
+        params DRAM into the single params.bin. (Fixed scheme: bf16 vision + q4 LM; no other options.)"""
         from transformers import AutoTokenizer, AutoModelForImageTextToText
         model_dir = os.path.join(self.script_dir, "smolvlm2_bin", "SmolVLM2-500M-Video-Instruct")
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -664,9 +664,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         if self._unified_active:
             self._seg_encoder = (program_addr, bytes(all_bytes))
         else:
-            bin_path = os.path.join(self.script_dir, "smolvlm2_bin", "encoder_program.bin")
-            with open(bin_path, "wb") as f:
-                f.write(all_bytes)
+            # Standalone encoder compile path is not used in production (main always goes through
+            # compile_all). Keep the bytes in _seg_encoder so the unified programs.bin writer (if
+            # ever invoked with a partial set) has the segment available.
+            self._seg_encoder = (program_addr, bytes(all_bytes))
         self._vis_program_addr = program_addr
         print(f"    Vision encoder compiled: {len(all_bytes)} bytes at 0x{program_addr:X}")
         return program_addr
@@ -924,11 +925,11 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                "decoder_attention_shared_subroutine": True,
                **self._artifact_mode_meta()}
 
-        # ---- cache hit: replay the encoder LN params, DMA each segment to its stored abs addr ----
+        # ---- cache hit: replay the encoder LN params, DMA each program to its stored abs addr ----
         if os.path.exists(uni_bin) and os.path.exists(uni_meta):
             with open(uni_meta) as f:
                 meta = json.load(f)
-            if all(meta.get(k) == v for k, v in sig.items()):
+            if all(meta.get(k) == v for k, v in sig.items()) and "programs" in meta:
                 # No LN-zeros replay: the shared vis_zeros_addr buffer is part of the weights snapshot
                 # (seeded in weight_init), so load_snapshot already restored it (Trick 9).
                 with open(uni_bin, "rb") as f:
@@ -955,15 +956,15 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         finally:
             self._unified_active = False
         end_addr = self.get_program_dram_addr()
-        segments, raw = [], bytearray()
+        programs, raw = {}, bytearray()
         for name, seg in (("encoder", self._seg_encoder), ("decoder", self._seg_decoder),
                           ("prefill", self._seg_prefill)):
             if seg is None:
                 continue
             addr, b = seg
-            segments.append({"name": name, "addr": addr, "off": len(raw), "size": len(b)})
+            programs[name] = {"addr": addr, "offset": len(raw), "size": len(b)}
             raw.extend(b)
-        meta = {**sig, "segments": segments, "end_addr": end_addr,
+        meta = {**sig, "programs": programs, "end_addr": end_addr,
                 "encoder_addr": enc_addr,
                 "decoder_addr": self._decoder_program_addr,
                 "decoder_preamble": self._decoder_preamble_addr,
@@ -1297,7 +1298,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         artifact_sha256 = hashlib.sha256(bytes(raw)).hexdigest()
 
     def dump_snapshot(self) -> None:
-        """Dump params DRAM + all runtime address metadata to smolvlm2_bin/weights.bin + weights.json."""
+        """Dump params DRAM + all runtime address metadata to smolvlm2_bin/params.bin + params.json."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         suffix = self._artifact_mode_suffix()
         bin_path = os.path.join(bin_dir, f"weights{suffix}.bin")
@@ -1395,7 +1396,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 setattr(self, key, val)
         self.bytes_per_element = 2  # always bf16; not in snapshot, needed by attention PBI body
         # load_encoder/run_encoder only need len(vis_layer_addrs) (the per-layer weight addresses
-        # are already baked into the precompiled encoder_program.bin). Restore a length-correct
+        # are already baked into the precompiled encoder program in programs.bin). Restore a length-correct
         # placeholder list from the saved layer count so those len() calls work post-snapshot.
         self.vis_layer_addrs = [None] * self._num_vis_layers
         from transformers import AutoTokenizer
@@ -1696,7 +1697,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     model_dir = os.path.join(script_dir, _SMOLVLM2_CFG["paths"]["hf_model_dir"])
     # Download HF model if needed (the only weight source — weight_init quantizes/loads from it,
-    # producing the single weights.bin snapshot; there are no intermediate weight bins).
+    # producing the single params.bin snapshot; there are no intermediate weight bins).
     if not os.path.exists(os.path.join(model_dir, "config.json")):
         print(f"Downloading {HF_MODEL_REPO} ...")
         snapshot_download(repo_id=HF_MODEL_REPO, local_dir=model_dir, local_dir_use_symlinks=False, ignore_patterns=["onnx/*"])

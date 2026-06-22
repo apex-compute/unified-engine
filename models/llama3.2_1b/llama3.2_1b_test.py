@@ -18,7 +18,7 @@ Architecture differences vs Gemma3:
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
 Weights:
-  - Default: llama3.2_1b_bin/weights_llama3.2_1b_hf.bin (generated from HF model if missing).
+  - Default: llama3.2_1b_bin/params.bin (generated from HF model if missing).
   - --local-weights: use llama3.2_1b_bin/full_model_weights.bin instead.
 
 Usage:
@@ -97,7 +97,7 @@ def _rope_kv_perm(num_kv_heads: int, actual_head_dim: int) -> torch.Tensor:
 
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_llama3.2_1b_hf.bin from HuggingFace model per llama3.2_1b_config.json layout.
+    """Generate params.bin from HuggingFace model per llama3.2_1b_config.json layout.
     Returns the path to the written file."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -265,7 +265,12 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
     with open(out_path, "wb") as f:
         f.write(buf)
+    meta_path = paths.get("params_meta")
+    meta_full = os.path.join(script_dir, meta_path) if meta_path else os.path.splitext(out_path)[0] + ".json"
+    with open(meta_full, "w") as f:
+        json.dump({"size": len(buf), "num_layers": num_layers, "layer_size": LAYER_WEIGHT_SIZE}, f, indent=2)
     print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
+    print(f"Generated params meta: {meta_full}")
     return out_path
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
@@ -1128,23 +1133,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
         paths_cfg = self._cfg.get("paths", {})
-        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_1b_bin/llama_instruction.bin"))
-        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
-        if bool(getattr(self, "fpga_penalty", False)):
-            # On-FPGA penalty changes the LM-head matmul (bias on / writeback off) → a different
-            # bin. Use a separate cache file so it never clobbers the shipped host-path bin.
-            instruction_bin_path = instruction_bin_path.replace(".bin", "_fpgapenalty.bin")
-            instruction_meta_path = instruction_meta_path.replace(".json", "_fpgapenalty.json")
-            self._instruction_bin_path = instruction_bin_path
-            self._instruction_meta_path = instruction_meta_path
-        if profile:
-            # Profile binary uses fixed paths regardless of fpga_penalty so run_llama_profile()
-            # can always find it.  Must be derived after the fpga_penalty substitution so the
-            # bin_dir is correct.
-            bin_dir = os.path.dirname(instruction_bin_path)
-            instruction_bin_path  = os.path.join(bin_dir, "llama_profile_instruction.bin")
-            instruction_meta_path = os.path.join(bin_dir, "llama_profile_instruction.json")
-        if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
+        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_1b_bin/programs.bin"))
+        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
+        # Single programs.bin: fpga_penalty and profile modes share one output path; rebuild as needed.
+        self._instruction_bin_path = instruction_bin_path
+        self._instruction_meta_path = instruction_meta_path
+        if not profile and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
             return
@@ -1279,7 +1273,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """Load the profile instruction image, run prefill + one profiled decoder step,
         and print a per-step latency breakdown for the decoder.
         """
-        profile_meta_path = os.path.join(self.script_dir, "llama3.2_1b_bin/llama_profile_instruction.json")
+        paths_cfg = self._cfg.get("paths", {})
+        profile_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
         with open(profile_meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1387,7 +1382,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         paths_cfg = self._cfg.get("paths", {})
         # With the on-FPGA penalty (default) use the penalty-specific bin/meta compile_llama produced.
         meta_path = getattr(self, "_instruction_meta_path", None) or \
-            os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
+            os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1595,7 +1590,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
-    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")
+    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")  # legacy dev path; not in standard bin set
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
@@ -1603,7 +1598,7 @@ def main():
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
-    # fully deterministic (separate _fpgapenalty bin). --pure-greedy disables it entirely.
+    # fully deterministic. --pure-greedy disables it entirely.
     parser.add_argument('--pure-greedy', action='store_true',
                         help='Disable the on-FPGA repetition penalty entirely — plain greedy decode '
                              '(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy '
@@ -1626,7 +1621,7 @@ def main():
     if args.local_weights:
         weights_bin_rel = "llama3.2_1b_bin/full_model_weights.bin"
     else:
-        weights_bin_rel = "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin"
+        weights_bin_rel = "llama3.2_1b_bin/params.bin"
         weights_bin_full = os.path.join(script_dir, weights_bin_rel)
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)

@@ -894,7 +894,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
     def prepare_inference(self, weights: dict, max_context: int = 256) -> None:
         """Allocate persistent S/KV caches and upload every layer's weights
         from a pre-extracted dict (produced by _extract_all_weights or loaded
-        from qwen3.5_2b_bin/weights_qwen3.5_2b_hf.bin).  `weights` must have
+        from qwen3.5_2b_bin/params.bin).  `weights` must have
         keys: 'layers' (list of per-layer extracted dicts), 'final_norm_gamma'
         (bf16 tensor), 'embed_weight' (bf16 tensor).
 
@@ -911,12 +911,13 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         # can be called without passing paths explicitly, matching Gemma3 API).
         _script_dir = str(Path(__file__).parent)
         _cfg_paths  = self._cfg.get("paths", {})
+        # Transient compile artifacts — folded into programs.bin and removed by
+        # the caller. Kept under qwen3.5_2b_bin/ but hidden (leading dot) so the
+        # final output directory only contains params.{bin,json} + programs.{bin,json}.
         self._decoder_bin_path  = os.path.join(
-            _script_dir, _cfg_paths.get("decoder_program_bin",
-                                        "qwen3.5_2b_bin/decoder_program.bin"))
+            _script_dir, "qwen3.5_2b_bin", ".decoder_compile.bin")
         self._decoder_meta_path = os.path.join(
-            _script_dir, _cfg_paths.get("decoder_program_meta",
-                                        "qwen3.5_2b_bin/decoder_program.json"))
+            _script_dir, "qwen3.5_2b_bin", ".decoder_compile.json")
         T_aligned = max_context
         if T_aligned < UE_VECTOR_SIZE:
             T_aligned = UE_VECTOR_SIZE
@@ -2605,7 +2606,7 @@ def _extract_all_weights(text_model, linear_attn_layers: set) -> Dict:
 # Instruction-bin save/load
 # ----------------------------------------------------------------------------
 # After the first decode step populates the instruction caches, we serialize
-# them to qwen3.5_2b_bin/decoder_program.bin.  On subsequent runs we load the
+# them into the unified qwen3.5_2b_bin/programs.bin (decoder section). On subsequent runs we load the
 # caches back and DMA the recorded bytes to the same prog_addrs — skipping
 # the ~12 s of Python instruction emission on the first decode step.
 #
@@ -3880,7 +3881,7 @@ def generate(ue: Qwen3_5_2b_UnifiedEngine, tokenizer,
     # Load the single-binary decoder up-front (prefill replays it per prompt
     # token, so it must be resident first).  ``decoder_preloaded`` skips this when
     # the caller already DMA'd the decoder section from the unified bin (the
-    # load-only path) — there is no separate decoder_program.bin to re-read.
+    # load-only path) — the decoder is read from programs.bin's decoder section.
     if not decoder_preloaded:
         if verbose:
             print(f"  Compiling / loading decoder binary ...", end=" ", flush=True)
@@ -3961,13 +3962,13 @@ def run_fpga_vision_encoder(ue, model_dir: str, hf_inputs, setup_only: bool = Fa
     return _run_fpga_vision_encoder_compact(ue, model_dir, hf_inputs, setup_only, build_only)
 
 
-UNIFIED_BIN_NAME  = "qwen3.5_2b_instruction.bin"
-UNIFIED_META_NAME = "qwen3.5_2b_instruction.json"
+UNIFIED_BIN_NAME  = "programs.bin"
+UNIFIED_META_NAME = "programs.json"
 
 
 def write_unified_bin(ue, bin_dir: str, encoder_bytes: bytes, vis_meta: dict,
                       decoder_bin_path: str, flops) -> dict:
-    """Assemble the UNIFIED single instruction bin + meta JSON = ``[encoder][decoder]``,
+    """Assemble the UNIFIED programs bin + manifest = ``[encoder][decoder]``,
     both baked for the SAME program base (0xD0000000) and run SEQUENTIALLY with a
     DRAM reset between them (vision encoder → reset → LM decoder) — never resident
     together, so no base-shift / coexistence issue.
@@ -3988,8 +3989,15 @@ def write_unified_bin(ue, bin_dir: str, encoder_bytes: bytes, vis_meta: dict,
 
     raw = bytearray(encoder_bytes)
     raw.extend(decoder_bytes)
+    programs = {}
+    if encoder_size:
+        programs["encoder"] = {"offset": 0, "size": encoder_size}
+    programs["decoder"] = {"offset": encoder_size, "size": decoder_size}
     meta = {
         "layout": "encoder|decoder @base",
+        "programs": programs,
+        # Back-compat duplicate fields (offset/size pairs) so callers using the
+        # flat keys keep working until they migrate to ``programs[...]``.
         "encoder_off": 0,            "encoder_size": encoder_size,
         "decoder_off": encoder_size, "decoder_size": decoder_size,
         "decoder_flops": int(flops[0]),
@@ -4755,12 +4763,22 @@ def main():
     # load + quantize + torch.save (~25 s total); subsequent runs do only
     # torch.load (~2 s).
     weights_bin = os.path.join(script_dir, cfg["paths"]["weights_bin"])
+    weights_meta = os.path.join(
+        script_dir, cfg["paths"].get("weights_meta", "qwen3.5_2b_bin/params.json"))
     if os.path.exists(weights_bin):
         print(f"  Loading weights from {weights_bin} ...", flush=True)
         t0 = time.time()
         weights = torch.load(weights_bin, weights_only=False,
                              map_location="cpu")
         print(f"  Weights loaded ({time.time()-t0:.1f}s).")
+        if not os.path.exists(weights_meta):
+            with open(weights_meta, "w") as _wm:
+                json.dump({
+                    "format": "torch.save",
+                    "size": os.path.getsize(weights_bin),
+                    "hf_model_repo": cfg["paths"].get("hf_model_repo"),
+                    "num_layers": cfg["file_info"]["num_layers"],
+                }, _wm)
     else:
         print(f"  Weight bin not found at {weights_bin}")
         print(f"  Loading HF model from {model_dir} ...", flush=True)
@@ -4776,6 +4794,13 @@ def main():
         t0 = time.time()
         torch.save(weights, weights_bin)
         sz_mb = os.path.getsize(weights_bin) / (1024 * 1024)
+        with open(weights_meta, "w") as _wm:
+            json.dump({
+                "format": "torch.save",
+                "size": os.path.getsize(weights_bin),
+                "hf_model_repo": cfg["paths"].get("hf_model_repo"),
+                "num_layers": cfg["file_info"]["num_layers"],
+            }, _wm)
         print(f"  Wrote {weights_bin} ({sz_mb:.0f} MB, {time.time()-t0:.1f}s).")
         # Free the HF model — all the tensors we need are in `weights` now.
         del hf, text_model
@@ -4794,12 +4819,12 @@ def main():
     # params/program at base 0xD0000000; we reset the bump pointers afterward so
     # the LM gets that same base.
     #
-    # THE SINGLE comprehensive instruction bin (qwen3.5_2b_instruction.bin) holds
-    # [encoder?][decoder] — vision encoder (if built via a --vision-on-hardware
+    # THE SINGLE comprehensive programs bin (programs.bin + programs.json manifest)
+    # holds [encoder?][decoder] — vision encoder (if built via a --vision-on-hardware
     # run) + LM decoder, both baked for program base 0xD0000000.  There is no
-    # separate decoder_program.bin artifact: it is a transient compile output that
-    # is folded into the unified bin and removed.  FIRST run BUILDS + writes the
-    # bin; EVERY later run (test.py or run_from_bin) LOADS it — no recompilation.
+    # separate persisted decoder bin: the transient compile output is folded into
+    # programs.bin and removed.  FIRST run BUILDS + writes the bin; EVERY later run
+    # (test.py or run_from_bin) LOADS it — no recompilation.
     uni_bin       = os.path.join(bin_dir, UNIFIED_BIN_NAME)
     uni_meta_path = os.path.join(bin_dir, UNIFIED_META_NAME)
     _raw = _meta = None
@@ -4873,7 +4898,7 @@ def main():
         ue.prepare_inference(weights, max_context=MAX_CONTEXT)
 
     # LM decoder: BUILD (compile → write the unified bin → drop the transient
-    # decoder_program.bin) on the first run, else LOAD the decoder section from the
+    # transient .decoder_compile.bin) on the first run, else LOAD the decoder section from the
     # unified bin.  Either way the decoder ends up resident in DRAM, so generate()
     # is told it is preloaded and skips compilation.
     if need_build:

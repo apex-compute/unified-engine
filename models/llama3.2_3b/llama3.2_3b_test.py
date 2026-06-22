@@ -3,9 +3,9 @@
 Llama-3.2-3B inference on accelerator: prefill + decode.
 
   - Config from llama3.2_3b_config.json; weights from a single bin (see below).
-  - Prefill: compiled each run. Decoder: if llama3.2_3b_bin/decoder_program.bin and
-    llama3.2_3b_bin/decoder_program.json exist, skip decoder compile and load
-    program sizes from meta; otherwise compile and write the bin + meta.
+  - Prefill + decoder are compiled into a unified instruction image
+    (llama3.2_3b_bin/programs.bin + llama3.2_3b_bin/programs.json). If both
+    exist they are reused; otherwise both are (re)written.
   - Run prefill then decode loop.
 
 Architecture differences vs Gemma3:
@@ -18,7 +18,7 @@ Architecture differences vs Gemma3:
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
 Weights:
-  - Default: llama3.2_3b_bin/weights_llama3.2_3b_hf.bin (generated from HF model if missing).
+  - Default: llama3.2_3b_bin/params.bin (generated from HF model if missing; sidecar params.json records size).
   - --local-weights: use llama3.2_3b_bin/full_model_weights.bin instead.
 
 Usage:
@@ -74,7 +74,7 @@ def _parse_offset(val) -> int:
     return int(val)
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_llama3.2_3b_hf.bin from HuggingFace model per llama3.2_3b_config.json layout.
+    """Generate params.bin (+ sidecar params.json) from HuggingFace model per llama3.2_3b_config.json layout.
     Returns the path to the written file."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -235,7 +235,16 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
     with open(out_path, "wb") as f:
         f.write(buf)
+    # Sidecar params.json with size metadata (parallel to programs.json).
+    meta_rel = paths.get("weights_meta", "llama3.2_3b_bin/params.json")
+    meta_path = os.path.join(script_dir, meta_rel) if not os.path.isabs(meta_rel) else meta_rel
+    if output_path is not None:
+        # honor caller's output path location for the sidecar
+        meta_path = os.path.splitext(output_path)[0] + ".json"
+    with open(meta_path, "w") as f:
+        json.dump({"size": len(buf), "weights_bin": os.path.basename(out_path)}, f)
     print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
+    print(f"Wrote params metadata: {meta_path}")
     return out_path
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
@@ -1020,8 +1029,8 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
         paths_cfg = self._cfg.get("paths", {})
-        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_3b_bin/llama_instruction.bin"))
-        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/llama_instruction.json"))
+        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_3b_bin/programs.bin"))
+        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json"))
         if bool(getattr(self, "fpga_penalty", False)):
             # On-FPGA penalty changes the LM-head matmul (bias on / writeback off) → a different bin.
             # Separate cache file so it never clobbers the host-path bin. run_from_bin loads the same.
@@ -1143,7 +1152,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         # When fpga_penalty, compile_llama set _instruction_meta_path to the _fpgapenalty meta — use
         # it so we load the bias bin (whose meta's instruction_bin points to the _fpgapenalty bin).
         meta_path = getattr(self, "_instruction_meta_path", None) or \
-            os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/llama_instruction.json"))
+            os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json"))
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1366,7 +1375,7 @@ def main():
     if args.local_weights:
         weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
     else:
-        weights_bin_rel = "llama3.2_3b_bin/weights_llama3.2_3b_hf.bin"
+        weights_bin_rel = "llama3.2_3b_bin/params.bin"
         weights_bin_full = os.path.join(script_dir, weights_bin_rel)
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)

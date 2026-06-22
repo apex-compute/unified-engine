@@ -9,8 +9,12 @@ language.** SigLIP vision encoder (12 layers) → pixel-shuffle connector → Sm
 - **smolvlm2_run_from_bin.py** – runtime-only: loads the bins and runs, no compilation (hard-errors if a
   required bin is missing or its metadata does not match the requested mode).
 - **smolvlm2_config.json** – model dims, fixed ISA regs, DRAM layout.
-- **smolvlm2_bin/** – generated on the first run: the HF model dir (sole weight source) plus the
-  deployable bins (see *Artifacts* below).
+- **smolvlm2_headless_check.py** – stubs the FPGA DMA and runs `compile_all` for a no-hardware
+  compile/size check.
+- **smolvlm2_bin/** – generated at runtime: the HF model dir (sole weight source) + the two deployable
+  bins: **`programs.bin`** + **`programs.json`** (the unified programs bin: encoder + decoder + prefill
+  via `compile_all`, with a name->{offset,size,addr} manifest) and **`params.bin`** + **`params.json`**
+  (the assembled params snapshot — q4 LM + bf16 vision).
 
 See `../../notes/notes_smolvlm2.md` for the optimization mechanisms (§7 shared attention, strided-DMA
 permute elimination, single bin, encoder layer-body sharing, prefill GEMM kernel).

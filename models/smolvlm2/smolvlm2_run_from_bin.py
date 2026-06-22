@@ -293,9 +293,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._validate_artifact_mode(meta, os.path.basename(meta_path))
         with open(bin_path, "rb") as f:
             raw = f.read()
-        for seg in meta["segments"]:
-            b = raw[seg["off"]:seg["off"] + seg["size"]]
-            self.dma_write(DMA_DEVICE_H2C, seg["addr"], b, len(b))
+        for name, entry in meta["programs"].items():
+            b = raw[entry["offset"]:entry["offset"] + entry["size"]]
+            self.dma_write(DMA_DEVICE_H2C, entry["addr"], b, len(b))
         self._vis_program_addr = meta["encoder_addr"]
         self._decoder_program_addr = meta["decoder_addr"]
         self._decoder_preamble_addr = meta["decoder_preamble"]

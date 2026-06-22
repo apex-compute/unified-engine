@@ -50,10 +50,11 @@ Both scripts share `--prompt`, `--dev`, `--cycle`, and the sampling flags
 
 ```bash
 # Recompile the instruction bin (e.g. after editing the compile path)
-rm llama3.2_3b_bin/llama3.2_3b_instruction.bin llama3.2_3b_bin/llama3.2_3b_instruction.json
+rm llama3.2_3b_bin/programs.bin llama3.2_3b_bin/programs.json
+# (and llama3.2_3b_bin/programs_fpgapenalty.{bin,json} for the on-FPGA penalty build)
 
 # Re-quantize the weight bin (from the cached HF model)
-rm llama3.2_3b_bin/weights_llama3.2_3b_hf.bin
+rm llama3.2_3b_bin/params.bin llama3.2_3b_bin/params.json
 ```
 
 ## Shipping `run_from_bin`

@@ -1195,6 +1195,7 @@ def flash_attention_batched_pbi(
     ATTN_P_DRAM_ADDR: int,
     IDENTITY_TRANSPOSE_DRAM_ADDR: int = None,
     BIAS_DRAM_ADDR: int = None,
+    bias_shared: bool = False,
     _silent: bool = False,
     gpr_M_reg: int = None,
     STAGE_Q_DRAM_ADDR: int = None,
@@ -1246,6 +1247,7 @@ def flash_attention_batched_pbi(
     bpe = 2
     win_bytes = seq_len * head_dim * bpe
     bias_win_bytes = seq_len * seq_len * bpe
+    bias_stride = 0 if bias_shared else bias_win_bytes
     bias_enable = BIAS_DRAM_ADDR is not None
     program_base = ue.get_program_dram_addr()
 
@@ -1267,7 +1269,7 @@ def flash_attention_batched_pbi(
         ue.accelerator_memcpy(K_DRAM_ADDR + off, FK, win_bytes)
         ue.accelerator_memcpy(V_DRAM_ADDR + off, FV, win_bytes)
         if bias_enable:
-            ue.accelerator_memcpy(BIAS_DRAM_ADDR + i * bias_win_bytes, FBIAS, bias_win_bytes)
+            ue.accelerator_memcpy(BIAS_DRAM_ADDR + i * bias_stride, FBIAS, bias_win_bytes)
         return_word_addr = ue_35bit_addr_shifter(
             program_base + (ue.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
         ue.generate_instruction_add_set(gpr_ret, return_word_addr)

@@ -3,7 +3,7 @@
 and execute it.  No compilation, no instruction capture — just DMA the prebuilt
 program sections to DRAM and trigger the FPGA.  This is the customer-facing
 runner; ship it together with the kernel (`user_dma_core.py`), the config, the
-quantized-weights bin, and `qwen3.5_2b_instruction.bin` (+ its `.json` meta).
+quantized-weights bin (`params.bin` + `params.json`), and `programs.bin` (+ `programs.json`).
 
   # LM-only
   python3 qwen3.5_2b_run_from_bin.py --prompt "Tell me about the Eiffel Tower."

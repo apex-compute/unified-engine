@@ -24,12 +24,13 @@
     "end_of_turn_token_id": 151645
   },
   "paths": {
-    "weights_bin": "qwen3_4b_bin/weights_qwen3_4b_hf.bin",
+    "weights_bin": "qwen3_4b_bin/params.bin",
+    "weights_meta": "qwen3_4b_bin/params.json",
     "local_weights_bin": "qwen3_4b_bin/full_model_weights.bin",
     "hf_model_dir": "qwen3_4b_bin/Qwen3-4B",
     "hf_model_repo": "Qwen/Qwen3-4B",
-    "instruction_bin": "qwen3_4b_bin/qwen3_4b_instruction.bin",
-    "instruction_meta": "qwen3_4b_bin/qwen3_4b_instruction.json"
+    "instruction_bin": "qwen3_4b_bin/programs.bin",
+    "instruction_meta": "qwen3_4b_bin/programs.json"
   },
   "default_system_prompt": "You are a helpful assistant.",
   "default_prompt": "What is 3 + 5?",
