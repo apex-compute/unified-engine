@@ -813,6 +813,37 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
                                        torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
 
+        # Live decode status bar (llama3.2-style): pin the bottom terminal row as a status
+        # line via an ANSI scroll region; tokens stream above it and the counter refreshes in
+        # place. Only on a real TTY (skipped when piped/redirected, so logs stay clean).
+        import shutil
+        _dec_timer = time.perf_counter()
+        _seq_len_start = self.seq_len
+        _use_status = sys.stdout.isatty()
+        def _status_setup():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")    # scroll region = rows 1..rows-1
+            sys.stdout.write(f"\033[{rows - 1};1H")    # park cursor at bottom of region
+            sys.stdout.flush()
+        def _status_update():
+            rows = shutil.get_terminal_size().lines
+            n = self.seq_len - _seq_len_start
+            elapsed = time.perf_counter() - _dec_timer
+            rate = n / elapsed if elapsed > 0 else 0.0
+            sys.stdout.write("\0337")                  # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # bottom row, clear it
+            sys.stdout.write(f" decoding… {n} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})  "
+                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
+            sys.stdout.write("\0338")                  # restore cursor
+            sys.stdout.flush()
+        def _status_teardown():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")                 # reset scroll region
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # clear the status row
+            sys.stdout.flush()
+        if _use_status:
+            _status_setup()
+
         while self.seq_len < max_seq_len:
             _SILENT_MODE = True
             # self.seq_len at entry is the count of K/V already in cache; the
@@ -856,9 +887,16 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             _SILENT_MODE = False
             self.seq_len += 1
             if token_id in _qwen3_stop_tokens:
+                if _use_status:
+                    _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+            if _use_status:
+                _status_update()
+        else:
+            if _use_status:
+                _status_teardown()
         return self.seq_len
 
 # -----------------------------------------------------------------------------

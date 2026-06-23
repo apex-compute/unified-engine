@@ -1102,7 +1102,6 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         _stop_tokens = {self._end_of_turn_token_id}  # 50256
         use_sampling = temperature > 0
         generated_ids: list[int] = list(self.prefill_seq)
-        decoded_chars: list[str] = []
         bad_token_ids = {self._end_of_turn_token_id}
         bad_token_ids.update(range(50257, self.EMBEDDING_ELEMENTS))
         bad_token_ids.update(self.tokenizer.encode("!"))
@@ -1198,7 +1197,6 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
-            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
@@ -1214,16 +1212,6 @@ class GPT2_UnifiedEngine(UnifiedEngine):
               f"total {self.seq_len} tokens.")
         print(f"Decode speed (greedy): peak {peak_decode_speed or 0.0:.2f} tok/s "
               f"(1st token {first_decode_speed or 0.0:.2f}), average {avg_decode_speed:.2f} tok/s.")
-
-        return {
-            "prefill_tokens": prefill_seq_len,
-            "decoded_text": "".join(decoded_chars),
-            "decoded_tokens": tokens_decoded,
-            "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2) if latency_prefill > 0 else None,
-            "decode_speed_tok_s": round(avg_decode_speed, 2),
-            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1) if "prefill_program_size" in meta else None,
-            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1) if "decoder_program_size" in meta else None,
-        }
 
 
 # -----------------------------------------------------------------------------
@@ -1293,7 +1281,6 @@ def main():
     run_result = ue.run_gpt2(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
                              repetition_penalty=args.repetition_penalty, max_new_tokens=args.max_new_tokens)
     print("GPT-2 test ends.")
-    print(f"TEST_RESULT: {json.dumps(run_result)}")
 
 if __name__ == "__main__":
     main()

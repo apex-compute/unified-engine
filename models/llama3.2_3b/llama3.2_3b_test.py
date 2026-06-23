@@ -1211,7 +1211,6 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         print(f"Prefill done in {latency_prefill:.2f}s\n")
 
         print("--- Starting decoder ---")
-        decoded_chars: list[str] = []
         timer = time.perf_counter()
         token_id = self.prefill_seq[-1]
         _llama_stop_tokens = {128001, 128008, self._end_of_turn_token_id}
@@ -1306,7 +1305,6 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
-            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
@@ -1319,16 +1317,6 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
               f"speed: {tokens_decoded / latency_decoder:.2f} tokens/s, "
               f"total {self.seq_len} tokens.")
-
-        return {
-            "prefill_tokens": prefill_seq_len,
-            "decoded_text": "".join(decoded_chars),
-            "decoded_tokens": tokens_decoded,
-            "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
-            "decode_speed_tok_s": round(tokens_decoded / latency_decoder, 2),
-            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
-            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
-        }
 
 # -----------------------------------------------------------------------------
 # Main
@@ -1357,6 +1345,9 @@ def main():
                         help='Disable the on-FPGA repetition penalty entirely — plain greedy decode '
                              '(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy '
                              'only for the A/B baseline and the compare/calibration tool.')
+    # On-FPGA repetition penalty parameters (active unless --pure-greedy). The penalty is folded into
+    # the LM-head matmul bias (on-chip argmax of logits+bias, no logit readback). Validated 3B params
+    # (logit_max~26.9, gap~4.25): alpha=1.0. See notes_repetition_penalty_fpga_bias.md.
     pen_group = parser.add_argument_group('on-FPGA repetition penalty (active unless --pure-greedy)')
     pen_group.add_argument('--greedy-until', type=int, default=512,
                         help='Pure greedy for the first N decoded tokens (correct math/reasoning, '
@@ -1437,9 +1428,9 @@ def main():
     print(f"Compile done in {time.perf_counter() - timer:.2f}s")
 
     print("\n--- Running ---")
-    run_result = ue.run_llama()
+    ue.run_llama()
+    ue.clear_dram()
     print("Llama-3.2-3B test ends.")
-    _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
 if __name__ == "__main__":
     main()
