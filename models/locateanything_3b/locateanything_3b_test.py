@@ -3439,21 +3439,77 @@ ENGINE_IMG_PLACEHOLDER = 151655   # what run_prefill() scans for; we remap onto 
 LA_IMAGE_TOKEN = 151665           # <IMG_CONTEXT> in LocateAnything
 
 
-def _gpu_vision(query, prompt_kind, image_path, device="cpu", compute_vit=True, keep_model=False):
+def _remap_boxes_to_original(text, xform):
+    """Map <box> coords from the letterboxed-square frame back to the original image's
+    normalized [0,1000] frame. Identity when xform is None (no letterbox)."""
+    if not xform:
+        return text
+    import re
+    S = xform["side"]; px = xform["pad_x"]; py = xform["pad_y"]
+    cw = xform["cw"]; ch = xform["ch"]
+
+    def _mx(v):
+        o = (int(v) / 1000.0 * S - px) / cw * 1000.0
+        return max(0, min(1000, round(o)))
+
+    def _my(v):
+        o = (int(v) / 1000.0 * S - py) / ch * 1000.0
+        return max(0, min(1000, round(o)))
+
+    # 4-coord boxes first, then 2-coord points (won't match the 4-coord form).
+    text = re.sub(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>",
+                  lambda m: f"<box><{_mx(m[1])}><{_my(m[2])}><{_mx(m[3])}><{_my(m[4])}></box>",
+                  text)
+    text = re.sub(r"<box><(\d+)><(\d+)></box>",
+                  lambda m: f"<box><{_mx(m[1])}><{_my(m[2])}></box>",
+                  text)
+    return text
+
+
+def _gpu_vision(query, prompt_kind, image_path, device="cpu", compute_vit=True,
+                keep_model=False, square=224, max_side=0):
     """Build the MoonViT model, process the image, tokenize. Optionally compute the
     GPU vit/connector reference. Returns a dict; the FPGA-vision path reuses the model
     + pixel_values to run MoonViT on the board instead.
 
-    Keys: vit ([N,4608] bf16 cpu or None), conn_ref ([N,2048] or None), prefill_seq,
-    n_img, wh, model (or None), pixel_values, grid_hw, cfg."""
+    Resolution control (pick ONE):
+      * square > 0  : letterbox (aspect-preserving, gray pad) to square×square BEFORE
+        the patchifier. Every image -> the SAME patch grid -> the SAME compiled encoder
+        program for ANY image. Predicted boxes come out in the padded frame, so they're
+        remapped back to the original via `vis_xform` (returned).
+      * max_side > 0: aspect-preserving cap on the longest side (no pad). Bounds cost but
+        N still varies with aspect ratio (multiple cached programs). vis_xform=None.
+
+    Keys: vit, conn_ref, prefill_seq, n_img, wh, model, pixel_values, grid_hw, cfg,
+    vis_xform (letterbox geometry or None)."""
     import locateanything_3b_cpu_test as la
     cfg = json.load(open(os.path.join(LA_DIR, "locateanything_3b_config.json")))
+    print("  loading weights ...", flush=True)
     model = la.LocateAnything(cfg).eval()
     la.load_weights(model, la.MODEL_DIR, device, torch.bfloat16)
 
     improc = la.ImageProcessor(merge_kernel_size=tuple(cfg["vision_config"]["merge_kernel_size"]))
     img = Image.open(image_path).convert("RGB")
-    pv, grid_hw = improc(img)
+    orig_w, orig_h = img.width, img.height          # keep original for the box overlay
+    vis_img = img
+    vis_xform = None
+    if square and square > 0:
+        scale = square / float(max(orig_w, orig_h))
+        cw, ch = max(1, round(orig_w * scale)), max(1, round(orig_h * scale))
+        resized = img.resize((cw, ch), Image.BICUBIC)
+        canvas = Image.new("RGB", (square, square), (127, 127, 127))
+        pad_x, pad_y = (square - cw) // 2, (square - ch) // 2
+        canvas.paste(resized, (pad_x, pad_y))
+        vis_img = canvas
+        vis_xform = dict(side=square, pad_x=pad_x, pad_y=pad_y, cw=cw, ch=ch)
+        print(f"  vision letterbox {orig_w}x{orig_h} -> {square}x{square} "
+              f"(content {cw}x{ch}, pad {pad_x},{pad_y})")
+    elif max_side and max(orig_w, orig_h) > max_side:
+        scale = max_side / float(max(orig_w, orig_h))
+        new_wh = (max(1, round(orig_w * scale)), max(1, round(orig_h * scale)))
+        vis_img = img.resize(new_wh, Image.BICUBIC)
+        print(f"  vision input resized {orig_w}x{orig_h} -> {new_wh[0]}x{new_wh[1]} (max_side={max_side})")
+    pv, grid_hw = improc(vis_img)
     mk = cfg["vision_config"]["merge_kernel_size"]
     n_img = (grid_hw[0] * grid_hw[1]) // (mk[0] * mk[1])
 
@@ -3477,8 +3533,8 @@ def _gpu_vision(query, prompt_kind, image_path, device="cpu", compute_vit=True, 
         if device == "cuda":
             torch.cuda.empty_cache()
     return dict(vit=vit, conn_ref=conn_ref, prefill_seq=tuple(ids), n_img=n_img,
-                wh=(img.width, img.height), model=model, pixel_values=pv,
-                grid_hw=grid_hw, cfg=cfg)
+                wh=(orig_w, orig_h), model=model, pixel_values=pv,
+                grid_hw=grid_hw, cfg=cfg, vis_xform=vis_xform)
 
 
 def _cpu_bf16_compare(args, hw_answer, prep):
@@ -3772,6 +3828,14 @@ def main():
     ap.add_argument("--prompt-kind", default="detect",
                     choices=["detect", "ground_multi", "ground_one", "point"])
     ap.add_argument("--query", default="sports car")
+    ap.add_argument("--square", type=int, default=224, choices=[0, 224, 384],
+                    help="letterbox every image to square×square (aspect-preserving, gray pad) "
+                         "before patchifying -> ONE compiled encoder program for any image. "
+                         "384 (~196 tok, higher quality) or 224 (~64 tok, fastest). 0 = disable "
+                         "(use --max-side instead). Boxes are remapped back to the original frame.")
+    ap.add_argument("--max-side", type=int, default=0,
+                    help="only when --square 0: aspect-preserving cap on the longest dim "
+                         "(bounds cost but N varies with aspect ratio -> multiple cached programs).")
     ap.add_argument("--decode-only", action="store_true",
                     help="skip vision/connector entirely; prefill+decode a short text prompt to isolate the LM decode path")
     ap.add_argument("--check-connector", action="store_true",
@@ -3802,11 +3866,9 @@ def main():
     args = ap.parse_args()
 
     # ==================================================================
-    # HARDCODED DEBUG CONFIG (no flags needed). Flip these in code.
+    # DEBUG CONFIG (no flags needed). Flip these in code.
+    # image / query / prompt_kind now come from the CLI (--image/--query/--prompt-kind).
     # ==================================================================
-    args.image       = os.path.join(REPO_ROOT, "test_samples", "people.jpg")
-    args.query       = "person"
-    args.prompt_kind = "detect"
     PROBE_PREFILL_NAN = False        # True: layer-by-layer prefill sweep. False: fast prefill+decode.
     PROBE_DECODE_NAN  = False        # True: after prefill, sweep decode layers for the first NaN.
     PROBE_ADDR_MAP    = False        # fast: dump per-layer weight addrs + DRAM readback, then exit (no prefill)
@@ -3826,7 +3888,8 @@ def main():
     print("=== Vision: FPGA MoonViT -> FPGA connector + decoder ===")
     t0 = time.time()
     prep = _gpu_vision(args.query, args.prompt_kind, args.image,
-                       compute_vit=want_cpu_vit, keep_model=fpga_vision)
+                       compute_vit=want_cpu_vit, keep_model=fpga_vision,
+                       square=args.square, max_side=args.max_side)
     vit = prep["vit"]; conn_ref = prep["conn_ref"]; prefill_seq = prep["prefill_seq"]
     n_img = prep["n_img"]; (W, H) = prep["wh"]; vis_cfg = prep["cfg"]
     print(f"  image_tokens={n_img}  prefill_len={len(prefill_seq)}  ({time.time()-t0:.1f}s)")
@@ -3976,6 +4039,7 @@ def main():
     ue.load_connector()
 
     # ---- 2b. FPGA MoonViT encoder (optional): produces vit[N_merged,4608] in DRAM ----
+    t_moonvit_compile = t_moonvit_run = 0.0
     if fpga_vision:
         print("\n=== FPGA MoonViT encoder (stitched op flow) ===")
         model = prep["model"]
@@ -3988,8 +4052,15 @@ def main():
             moonvit_run_staged(ue, vis_cfg, prep["grid_hw"], stop_after=args.stop_after,
                                   mask_pad=not args.vision_no_mask)
         else:
+            _t = time.perf_counter()
             prog = moonvit_compile_encoder(ue, vis_cfg, prep["grid_hw"])
+            t_moonvit_compile = time.perf_counter() - _t
+            print(f"  MoonViT encoder compile: {t_moonvit_compile:.2f}s (N={ue.MV_N})")
+            _t = time.perf_counter()
             moonvit_run_encoder(ue, prog)
+            t_moonvit_run = time.perf_counter() - _t
+            mv_us = getattr(ue, '_last_moonvit_latency_us', 0)
+            print(f"  MoonViT encoder run:     {t_moonvit_run:.2f}s wall  ({mv_us/1e3:.1f} ms HW)")
         # read vit[N_merged,4608] back from DRAM (also feeds the connector + optional parity)
         vit = ue.dma_from_accelerator_memory(ue.VIS_MERGED_DRAM, (ue.MV_N_MERGED, 4608)).cpu()
         if args.check_vision and prep["vit"] is not None:
@@ -4086,7 +4157,9 @@ def main():
     with contextlib.redirect_stdout(_Tee(real, buf)):
         tok_cnt = ue.run_decoder(da, token_id=prefill_seq[-1], gflops=gpt)
     t_decode_run = time.perf_counter() - timer
-    answer = buf.getvalue()
+    answer_raw = buf.getvalue()                       # padded-frame coords (for --compare)
+    # Map boxes out of the letterboxed square back to the original image frame.
+    answer = _remap_boxes_to_original(answer_raw, prep.get("vis_xform"))
     n_new = (tok_cnt - len(prefill_seq)) if isinstance(tok_cnt, int) else 0
     tok_s = max(n_new, 0) / max(t_decode_run, 1e-9)
     _original_print(f"\n  {t_decode_run:.2f}s ({n_new} tokens, {t_decode_run/max(n_new,1):.3f}s/tok, "
@@ -4098,8 +4171,11 @@ def main():
     boxes_s = n_boxes / max(t_decode_run, 1e-9)
 
     # ---- Timing summary ----
-    total = t_connector + t_prefill_compile + t_prefill_run + t_decode_compile + t_decode_run
+    total = (t_moonvit_compile + t_moonvit_run + t_connector + t_prefill_compile
+             + t_prefill_run + t_decode_compile + t_decode_run)
     _original_print(f"\n{'='*60}\n  Timing summary\n{'='*60}")
+    _original_print(f"  MoonViT compile:          {t_moonvit_compile:.2f}s")
+    _original_print(f"  MoonViT run:              {t_moonvit_run:.2f}s")
     _original_print(f"  Connector (compile+exec): {t_connector:.2f}s")
     _original_print(f"  Prefill compile:          {t_prefill_compile:.2f}s")
     _original_print(f"  Prefill run:              {t_prefill_run:.2f}s  ({len(prefill_seq)} tokens)")
@@ -4114,7 +4190,7 @@ def main():
     if args.compare:
         _original_print(f"\n{'='*60}\n  CPU bf16 comparison\n{'='*60}")
         try:
-            c = _cpu_bf16_compare(args, answer, prep)
+            c = _cpu_bf16_compare(args, answer_raw, prep)
             pct = 100.0 * c["tok_agree"] / max(c["tok_total"], 1)
             _original_print(f"  CPU output:   {c['cpu_answer']}")
             _original_print(f"  Token agree:  {c['tok_agree']}/{c['tok_total']} ({pct:.1f}%)"
@@ -4693,8 +4769,12 @@ def moonvit_run_encoder(ue, program_addr, timeout_s=300.0):
     """Execute the compiled MoonViT program. Output [N_merged, 4608] lands in
     ue.VIS_MERGED_DRAM, ready for run_connector."""
     ue.start_execute_from_dram(program_addr)
-    ue.wait_queue(timeout_s)
-    print(f"  MoonViT encoder executed -> VIS_MERGED_DRAM 0x{ue.VIS_MERGED_DRAM:X}")
+    wall_s = ue._wait_with_heartbeat(lambda: ue.wait_queue(timeout_s), label="moonvit")
+    latency_us = ue._corrected_hw_latency_us(wall_s)
+    ue._last_moonvit_latency_us = latency_us
+    print(f"  MoonViT encoder executed -> VIS_MERGED_DRAM 0x{ue.VIS_MERGED_DRAM:X}  "
+          f"(HW {latency_us/1e3:.1f} ms)")
+    return latency_us
 
 
 # =====================================================================================
