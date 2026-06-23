@@ -945,9 +945,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         """Reset instruction ID counter for the next capture."""
         self._inst_id = 0
 
-    def get_arg_max_index(self) -> int:
-        """Get the arg max index from the Unified Engine"""
-        return self.read_reg32(UE_ARGMAX1_INDEX)
+    def get_arg_max_index(self, rank: int = 1) -> int:
+        """Get the rank-th argmax index (1..4) from the Unified Engine's top-4 regs."""
+        reg = {1: UE_ARGMAX1_INDEX,
+               2: user_dma_core.UE_ARGMAX2_INDEX,
+               3: user_dma_core.UE_ARGMAX3_INDEX,
+               4: user_dma_core.UE_ARGMAX4_INDEX}[rank]
+        return self.read_reg32(reg)
 
     def decoder_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
@@ -3335,6 +3339,441 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 _status_teardown()
         return self.seq_len
 
+    # =====================================================================
+    #  Parallel Box Decoding (PBD / MTP)  —  FIRST-CUT, isolated from M=1 path
+    # =====================================================================
+    #  The model is trained (block_size=6, causal_attn=False) so that a block of
+    #  B=block_size positions can be predicted jointly in ONE forward pass:
+    #    block input  = [last_committed_token, <mask> × (B-1)]   (n_future_tokens)
+    #    block attn   = B queries attend to the KV-cache prefix AND each other
+    #                   (NON-causal within block), then the shared head emits B rows.
+    #  On our HW this is the existing decode op-graph run at M=B instead of M=1
+    #  (see reference_pbi_runtime_m_cores): same kernels, gpr_M_reg = block.
+    #  Genuinely-different vs M=1: per-position RoPE, B-row KV writes, a non-causal
+    #  block bias, and B-row logits read back to the host for box decoding.
+    #  Everything below is additive; the M=1 _emit_decoder_program / run_decoder
+    #  are untouched.
+
+    def _alloc_pbd_dram(self, B: int) -> None:
+        """Allocate block-sized (M=B) activation + logits regions for the PBD path.
+        Idempotent: skips if already allocated for this B."""
+        if getattr(self, "_pbd_dram_B", None) == B:
+            return
+        bpe = self.bytes_per_element
+        vl  = self.vector_length
+        hd  = self.head_dim
+        ahd = self.actual_head_dim
+        nkvh = self.num_kv_heads
+        qpkv = self.group_size
+        mlp = self.mlp_elements
+        q_w  = nkvh * qpkv * ahd      # = hd*qpkv = 2048 (per-position Q width)
+        kv_w = nkvh * ahd             # = hd      = 256  (per-position K/V width)
+        a = self.allocate_tensor_dram
+        self.PBD_INPUT_DRAM      = a(B * vl  * bpe)
+        self.PBD_PRE_NORM_DRAM   = a(B * vl  * bpe)
+        self.PBD_Q_DRAM          = a(B * q_w * bpe)
+        self.PBD_K_DRAM          = a(B * kv_w * bpe)
+        self.PBD_V_PROJ_TEMP     = a(B * kv_w * bpe)
+        self.PBD_ATTN_PROJ_DRAM  = a(B * vl  * bpe)
+        self.PBD_POST_ATTN_DRAM  = a(B * vl  * bpe)
+        self.PBD_PRE_MLP_NORM    = a(B * vl  * bpe)
+        self.PBD_MLP_GATE_DRAM   = a(B * mlp * bpe)
+        self.PBD_MLP_UP_DRAM     = a(B * mlp * bpe)
+        self.PBD_MLP_MULT_DRAM   = a(B * mlp * bpe)
+        self.PBD_MLP_DOWN_DRAM   = a(B * vl  * bpe)
+        self.PBD_OUTPUT_DRAM     = a(B * vl  * bpe)
+        self.PBD_OUTPUT_NORM     = a(B * vl  * bpe)
+        self.PBD_LOGITS_DRAM     = a(B * self.EMBEDDING_ELEMENTS * bpe)
+        # FLASH_Q for one (position, kv_head): qpkv heads × ahd — reused per call.
+        self._pbd_dram_B = B
+
+    def _emit_decoder_program_pbd(self, layer_size: int, B: int) -> int:
+        """Emit ONE block-parallel (M=B) decoder program. Mirrors _emit_decoder_program
+        but every bulk op runs at M=B via gf_block, K/V are written for B positions,
+        RoPE is applied per block position, and the head writes B logit rows back to
+        PBD_LOGITS_DRAM (no on-chip argmax — host samples the block).
+
+        Per-step preamble (set in run_decoder_pbd) primes:
+          gf_seq_len      = step_pos (first block position / KV-fill base)
+          gf_bucket_idx   = ceil((step_pos+B)/UE_VECTOR_SIZE)
+          gf_rope_cos_abs = ROPE_BASE + step_pos*rope_row_bytes
+        """
+        ahd  = self.actual_head_dim
+        nkvh = self.num_kv_heads
+        qpkv = self.group_size
+        bpe  = self.bytes_per_element
+        hd   = self.head_dim
+        vl   = self.vector_length
+        mlp  = self.mlp_elements
+        q_w  = nkvh * qpkv * ahd
+        kv_w = nkvh * ahd
+        rope_row_bytes = ahd * 2 * bpe
+        num_buckets_decoder = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE
+
+        # Persistent regs: identical budget to M=1 decoder (gf_block replaces gf_one).
+        self._isa_reg_counter = 5
+        gf_ret_id       = self.alloc_isa_reg()   # 5  subroutine return addr
+        gf_block        = self.alloc_isa_reg()   # 6  gpr_M_reg = B
+        gf_rope_cos_abs = self.alloc_isa_reg()   # 7  abs cos base (block pos 0), primed per step
+        # per-position cos addr uses TMP_REG (free between uses) — NO extra persistent reg,
+        # so the PBI attention subroutine keeps the same budget as the M=1 decoder.
+        program_dram_base = self.get_program_dram_addr()
+        call_site_jump_capture_indices: list = []
+        self._gf_block         = gf_block
+        self._gf_rope_cos_abs  = gf_rope_cos_abs
+
+        self.generate_instruction_add_set(gf_block, B)
+
+        total_flops = 0
+        LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
+        for layer_idx in range(layer_size):
+            la = self.lm_layer_addrs[layer_idx]
+            if layer_idx != 0:
+                # carry previous layer's B-row output into this layer's input
+                for b in range(B):
+                    self.accelerator_memory_to_sram(self.PBD_OUTPUT_DRAM + b * vl * bpe, 0x10000, vl)
+                    self.sram_to_accelerator_memory(0x10000, self.PBD_INPUT_DRAM + b * vl * bpe, vl)
+
+            # Pre-norm (M=B)
+            total_flops += (self.rms_norm_core_dram(M=B, N=vl, A_DRAM_ADDR=self.PBD_INPUT_DRAM,
+                          OUTPUT_DRAM_ADDR=self.PBD_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'],
+                          gpr_M_reg=gf_block) or 0)
+
+            # Q,K,V projections (M=B)
+            total_flops += (self.quantized_matmat_core(M=B, K=vl, N=q_w,
+                A_DRAM_ADDR=self.PBD_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.PBD_Q_DRAM,
+                SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4, C_DRAM_ADDR=la['q_bias']) or 0)
+            total_flops += (self.quantized_matmat_core(M=B, K=vl, N=kv_w,
+                A_DRAM_ADDR=self.PBD_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.PBD_K_DRAM,
+                SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4, C_DRAM_ADDR=la['k_bias']) or 0)
+            total_flops += (self.matmat_mul_core(M=B, K=vl, N=kv_w,
+                A_DRAM_ADDR=self.PBD_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.PBD_V_PROJ_TEMP,
+                C_DRAM_ADDR=la['v_bias'], gpr_M_reg=gf_block) or 0)
+
+            # RoPE per block position b, per head. cos addr = gf_rope_cos_abs + b*rope_row_bytes.
+            for b in range(B):
+                # TMP_REG = gf_rope_cos_abs + b*rope_row_bytes  (cos base for block position b)
+                self.generate_instruction_add_imm(
+                    self.TMP_REG, ue_35bit_addr_shifter(b * rope_row_bytes), gf_rope_cos_abs)
+                for kv_h in range(nkvh):
+                    self.rope_hf_core_decode(N=ahd,
+                        input_dram_addr=self.PBD_K_DRAM + b * kv_w * bpe + kv_h * ahd * bpe,
+                        output_dram_addr=self.PBD_K_DRAM + b * kv_w * bpe + kv_h * ahd * bpe,
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
+                        gr_weight_dram=self.TMP_REG)
+                for q_h in range(nkvh * qpkv):
+                    self.rope_hf_core_decode(N=ahd,
+                        input_dram_addr=self.PBD_Q_DRAM + b * q_w * bpe + q_h * ahd * bpe,
+                        output_dram_addr=self.PBD_Q_DRAM + b * q_w * bpe + q_h * ahd * bpe,
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
+                        gr_weight_dram=self.TMP_REG)
+
+            # Per KV head: write B new K/V rows to cache (positions step_pos..step_pos+B-1),
+            # gather valid history, then run NON-causal block attention per position.
+            for kv_h in range(nkvh):
+                k_cache_base = (self.LAYER0_K_ROPE_DRAM
+                                + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
+                                + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                v_cache_base = (self.LAYER0_V_DRAM
+                                + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
+                                + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                for b in range(B):
+                    # K row b -> cache[step_pos + b]: TMP = gf_seq_len*(ahd*bpe) + k_cache_base + b*ahd*bpe
+                    self.accelerator_memory_to_sram(self.PBD_K_DRAM + b * kv_w * bpe + kv_h * ahd * bpe, 0x10000, ahd)
+                    self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gf_seq_len, ue_35bit_addr_shifter(ahd * bpe))
+                    self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(k_cache_base + b * ahd * bpe), self.TMP_REG)
+                    self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=0,
+                                                    element_size=ahd, general_reg_src=self.TMP_REG)
+                    # V row b -> cache[step_pos + b]
+                    self.accelerator_memory_to_sram(self.PBD_V_PROJ_TEMP + b * kv_w * bpe + kv_h * ahd * bpe, 0x20000, ahd)
+                    self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gf_seq_len, ue_35bit_addr_shifter(ahd * bpe))
+                    self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(v_cache_base + b * ahd * bpe), self.TMP_REG)
+                    self.sram_to_accelerator_memory(sram_address=0x20000, accelerator_dram_address=0,
+                                                    element_size=ahd, general_reg_src=self.TMP_REG)
+
+                # Gather valid K/V history (prefix + block) into FLASH_K/FLASH_V (covers bucket range).
+                self._emit_pbi_scatter_per_token(
+                    read_base=k_cache_base, read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    sram_byte_addr=0x10000, element_count=UE_VECTOR_SIZE * ahd,
+                    gf_seq_len=self.gf_bucket_idx, template_seq_len=num_buckets_decoder)
+                self._emit_pbi_scatter_per_token(
+                    read_base=v_cache_base, read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_V_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    sram_byte_addr=0x20000, element_count=UE_VECTOR_SIZE * ahd,
+                    gf_seq_len=self.gf_bucket_idx, template_seq_len=num_buckets_decoder)
+
+                # One group-attention call per block position (qpkv Q heads vs cache+block keys).
+                for b in range(B):
+                    for q in range(qpkv):
+                        q_src = self.PBD_Q_DRAM + b * q_w * bpe + (kv_h * qpkv + q) * ahd * bpe
+                        self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
+                        self.sram_to_accelerator_memory(0x30000, self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe, ahd)
+                    self.pad_capture_to_64b_boundary()
+                    return_word_addr = ue_35bit_addr_shifter(
+                        program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                    self.generate_instruction_add_set(gf_ret_id, return_word_addr)
+                    call_site_jump_capture_indices.append(self.capture_count)
+                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                    # subroutine output -> this (position,kv_head) slot in PBD attn output staging
+                    self.accelerator_memory_to_sram(self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
+                    self.sram_to_accelerator_memory(
+                        0x40000, self.PBD_ATTN_PROJ_DRAM + b * vl * bpe + kv_h * qpkv * ahd * bpe, qpkv * ahd)
+
+            # NOTE: PBD_ATTN_PROJ_DRAM is reused above as the concatenated flash output
+            # (B rows × vl). o_proj reads it in place and overwrites with the projection.
+            total_flops += (self.quantized_matmat_core(M=B, K=hd * qpkv, N=vl,
+                A_DRAM_ADDR=self.PBD_ATTN_PROJ_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.PBD_POST_ATTN_DRAM,
+                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4) or 0)
+
+            # Residual: input + attn_out (per block row)
+            for b in range(B):
+                self.accelerator_memory_to_sram(self.PBD_INPUT_DRAM + b * vl * bpe, 0x10000, vl)
+                self.accelerator_memory_to_sram(self.PBD_POST_ATTN_DRAM + b * vl * bpe, 0x90000, vl)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000,
+                                      vector_C_sram_wb_addr=0x10000, element_size=vl)
+                self.sram_to_accelerator_memory(0x10000, self.PBD_POST_ATTN_DRAM + b * vl * bpe, vl)
+
+            # Pre-FFN norm (M=B)
+            total_flops += (self.rms_norm_core_dram(M=B, N=vl, A_DRAM_ADDR=self.PBD_POST_ATTN_DRAM,
+                          OUTPUT_DRAM_ADDR=self.PBD_PRE_MLP_NORM, GAMMA_DRAM_ADDR=la['ln2_gamma'],
+                          gpr_M_reg=gf_block) or 0)
+
+            # MLP SwiGLU (M=B)
+            total_flops += (self.quantized_matmat_core(M=B, K=vl, N=mlp,
+                A_DRAM_ADDR=self.PBD_PRE_MLP_NORM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.PBD_MLP_GATE_DRAM,
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True) or 0)
+            total_flops += (self.quantized_matmat_core(M=B, K=vl, N=mlp,
+                A_DRAM_ADDR=self.PBD_PRE_MLP_NORM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.PBD_MLP_UP_DRAM,
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4) or 0)
+            # gate ⊙ up (per block row)
+            for b in range(B):
+                self.accelerator_memory_to_sram(self.PBD_MLP_GATE_DRAM + b * mlp * bpe, 0x10000, mlp)
+                self.accelerator_memory_to_sram(self.PBD_MLP_UP_DRAM + b * mlp * bpe, 0x90000, mlp)
+                self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000,
+                                      vector_C_sram_wb_addr=0x10000, element_size=mlp)
+                self.sram_to_accelerator_memory(0x10000, self.PBD_MLP_MULT_DRAM + b * mlp * bpe, mlp)
+            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=B, K=mlp, N=vl,
+                A_DRAM_ADDR=self.PBD_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.PBD_MLP_DOWN_DRAM,
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4, gpr_M_reg=gf_block) or 0)
+            # Residual: post_attn + mlp_down (per block row)
+            for b in range(B):
+                self.accelerator_memory_to_sram(self.PBD_POST_ATTN_DRAM + b * vl * bpe, 0x10000, vl)
+                self.accelerator_memory_to_sram(self.PBD_MLP_DOWN_DRAM + b * vl * bpe, 0x90000, vl)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000,
+                                      vector_C_sram_wb_addr=0x10000, element_size=vl)
+                self.sram_to_accelerator_memory(0x10000, self.PBD_OUTPUT_DRAM + b * vl * bpe, vl)
+
+        # Final norm only (M=B) → PBD_OUTPUT_NORM holds B rows. The LM head is NOT run
+        # here: run_decoder_pbd executes a per-row head program (Solution B) so each block
+        # row's top-4 lands in UE_ARGMAX1..4, reusing the 4 regs across the B rows.
+        if layer_size == self.LAYER_SIZE:
+            total_flops += (self.rms_norm_core_dram(M=B, N=vl, A_DRAM_ADDR=self.PBD_OUTPUT_DRAM,
+                OUTPUT_DRAM_ADDR=self.PBD_OUTPUT_NORM, GAMMA_DRAM_ADDR=self.final_norm_addr,
+                gpr_M_reg=gf_block) or 0)
+
+        # Advance committed position by B and halt.
+        for _ in range(B):
+            self.generate_instruction_add_inc(self.gf_seq_len)
+        self.generate_instruction_halt()
+
+        # §7 shared decode-attention subroutine (group_size=qpkv) compiled once after HALT.
+        self.pad_capture_to_64b_boundary()
+        dec_sub_start, dec_attn_flops = self.decoder_group_attention_core(
+            group_size=qpkv, head_dim=ahd, seq_len=self.MAX_CONTEXT_SIZE,
+            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM, K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR, SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM, gpr_bucket_idx=self.gf_bucket_idx,
+            num_buckets=num_buckets_decoder, gpr_ret_id=gf_ret_id)
+        total_flops += (dec_attn_flops[-1] if isinstance(dec_attn_flops, (list, tuple)) else (dec_attn_flops or 0)) * layer_size * nkvh * B
+        for jump_idx in call_site_jump_capture_indices:
+            self._patch_jump_immediate(jump_idx, ue_35bit_addr_shifter(dec_sub_start))
+        return total_flops
+
+    def compile_decoder_pbd(self, block: int = 6, layer_size: int | None = None) -> tuple[int, int]:
+        """Compile the block-parallel (M=block) decoder program. Separate program bin /
+        cache signature from the M=1 decoder so the two never collide."""
+        if layer_size is None:
+            layer_size = self.LAYER_SIZE
+        self._alloc_pbd_dram(block)
+        sig = f"pbd_block{block}_logits_s1"
+        _cached = programs_bin_load(self.script_dir, "decoder_pbd")
+        prog_bytes = None; meta = {}; cache_hit = False
+        if _cached is not None:
+            prog_bytes, meta = _cached
+            if meta.get("pbd_sig") == sig and isinstance(meta.get("total_flops"), int):
+                cache_hit = True
+            else:
+                _original_print(f"  PBD decoder cache sig {meta.get('pbd_sig')!r} != {sig!r} — recompiling.")
+        if cache_hit:
+            decoder_program_addr = self.get_program_dram_addr()
+            self.dma_write(DMA_DEVICE_H2C, decoder_program_addr, prog_bytes, len(prog_bytes))
+            self.allocate_program_dram(len(prog_bytes))
+            total_flops = meta["total_flops"]
+            self._gf_block        = 6
+            self._gf_rope_cos_abs = 7
+            print(f"  PBD decoder loaded from cache ({len(prog_bytes)} bytes) at 0x{decoder_program_addr:X}")
+        else:
+            global _SILENT_MODE
+            _SILENT_MODE = True
+            _original_print(f"  Compiling PBD decoder (block={block}, {layer_size} layers)...")
+            self.clear_inst_id()
+            self.start_capture()
+            total_flops = self._emit_decoder_program_pbd(layer_size, block)
+            self.stop_capture()
+            _SILENT_MODE = False
+            decoder_program_addr = self.get_program_dram_addr()
+            prog_bytes = bytearray()
+            for inst in self.capture_buffer:
+                prog_bytes.extend(inst.get_bytes())
+            self.write_captured_instructions_to_dram(decoder_program_addr)
+            self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+            self.clear_capture_buffer()
+            programs_bin_store(self.script_dir, "decoder_pbd", prog_bytes,
+                               meta={"program_size": len(prog_bytes), "total_flops": total_flops, "pbd_sig": sig})
+            print(f"  PBD decoder program: 0x{decoder_program_addr:X} ({len(prog_bytes)} bytes), total_flops={total_flops}")
+        self._decoder_preamble_addr = self.get_program_dram_addr()
+        self.allocate_program_dram(256)
+
+        # Per-row LM-head programs (Solution B): one tiny program per block row, each runs the
+        # IF4 head at M=1 from PBD_OUTPUT_NORM[row b] with write_back_disable=True so the chip's
+        # top-4 argmax (UE_ARGMAX1..4) is populated for that row. Executed B times per step;
+        # the 4 argmax regs are reused across rows.
+        vl = self.vector_length
+        bpe = self.bytes_per_element
+        self._pbd_head_addrs = []
+        for b in range(block):
+            self._isa_reg_counter = 5
+            self.clear_inst_id()
+            self.start_capture()
+            self.quantized_matmat_core(M=1, K=vl, N=self.EMBEDDING_ELEMENTS,
+                A_DRAM_ADDR=self.PBD_OUTPUT_NORM + b * vl * bpe,
+                B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
+                C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
+                write_back_disable=True)
+            self.generate_instruction_halt()
+            self.stop_capture()
+            head_addr = self.get_program_dram_addr()
+            self.write_captured_instructions_to_dram(head_addr)
+            self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+            self.clear_capture_buffer()
+            self._pbd_head_addrs.append(head_addr)
+        return decoder_program_addr, total_flops
+
+    def run_decoder_pbd(self, decoder_program_addr: int, token_id: int, block: int = 6,
+                        gflops: int | None = None) -> int:
+        """First-cut PBD decode loop (fast mode). Each step:
+          1. feed block input = [last_committed_token, <mask> × (block-1)] as B embeddings,
+          2. build a NON-causal block bias (block sees prefix + all block positions),
+          3. prime preamble (gf_seq_len=step_pos, gf_bucket_idx, gf_rope_cos_abs) + JUMP,
+          4. read B logit rows back, greedily pick B tokens, commit them, advance by B.
+        Greedy host sampling for now; box-average refinement (decode_bbox_avg) is a TODO.
+        """
+        if token_id is None:
+            print("No last token available for PBD decode.")
+            return self.seq_len
+        B = block
+        ahd = self.actual_head_dim
+        bpe = self.bytes_per_element
+        rope_row_bytes = ahd * 2 * bpe
+        ROPE_BASE = self.DRAM_ADDR_ROPE
+        preamble_addr = self._decoder_preamble_addr
+        head_addrs = self._pbd_head_addrs
+        mask_id = 151676                       # <text_mask>
+        box_start, box_end = 151668, 151669    # <box> </box>
+        coord_lo, coord_hi = 151677, 152677    # <0> .. <1000>
+        _stop = {151643, 151645, self._end_of_turn_token_id}
+        if not hasattr(self, '_generated_tokens'):
+            self._generated_tokens = []
+
+        global _SILENT_MODE
+        max_seq_len = self.MAX_CONTEXT_SIZE
+        last_tok = token_id
+        while self.seq_len + B <= max_seq_len:
+            _SILENT_MODE = True
+            # Match the WORKING M=1 convention: its first decode token sits at position
+            # `seq_len` (it does seq_len+=1 then step_pos=seq_len-1, net == entry seq_len).
+            # Block row 0 takes that same slot; rows 1..B-1 follow at base_pos+1..base_pos+B-1.
+            # (The reference's position_ids[-n:]-=1 shift is for its re-fed dup convention,
+            # NOT our prefill-cache convention — using it desyncs RoPE/KV/bias → garbage/null.)
+            base_pos = self.seq_len
+            visible = base_pos + B                        # keys [0, base_pos+B)
+            aligned = ((visible + 63) // 64) * 64
+            bucket_idx = max(1, aligned // UE_VECTOR_SIZE)
+            cos_abs_addr = ROPE_BASE + (base_pos + getattr(self, '_rope_offset', 0)) * rope_row_bytes
+
+            block_tokens = [last_tok] + [mask_id] * (B - 1)
+            emb = self.get_embedding_for_tokens(block_tokens)          # (B, vl)
+            self.dma_to_accelerator_memory(self.PBD_INPUT_DRAM, emb)
+
+            # Non-causal block bias: 0 for keys [0, visible), -inf beyond.
+            bias_host = torch.full((1, aligned), -1e36, dtype=torch.bfloat16)
+            bias_host[0, :visible] = 0.0
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
+
+            # Preamble: prime GPRs + jump into the block body (produces PBD_OUTPUT_NORM, B rows).
+            self.clear_inst_id()
+            self.start_capture()
+            self.generate_instruction_add_set(self.gf_seq_len,       base_pos)
+            self.generate_instruction_add_set(self.gf_bucket_idx,    bucket_idx)
+            self.generate_instruction_add_set(self._gf_rope_cos_abs, ue_35bit_addr_shifter(cos_abs_addr))
+            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+            self.stop_capture()
+            self.write_captured_instructions_to_dram(preamble_addr)
+            self.clear_capture_buffer()
+            self.start_execute_from_dram(preamble_addr)
+            self.wait_queue(10.0)
+
+            # Solution B: per-row head → top-4 argmax (reuse UE_ARGMAX1..4 across rows).
+            top4 = []
+            for b in range(B):
+                self.start_execute_from_dram(head_addrs[b])
+                self.wait_queue(10.0)
+                top4.append([self.get_arg_max_index(rank) for rank in (1, 2, 3, 4)])
+            toks = [t[0] for t in top4]                    # greedy top-1 per row
+            _SILENT_MODE = False
+
+            # One-shot diagnostic: does the block forward produce the right row-0 token?
+            # M=1's first decode token is <ref> (151672). If row-0 top-1 is <ref>/<box>,
+            # the forward is fine and the bug is host decode; if it's junk, forward is broken.
+            if not getattr(self, "_pbd_dbg_done", False):
+                self._pbd_dbg_done = True
+                REF_S, BOX_S = 151672, 151668
+                print("\n[PBD DEBUG] first block step  base_pos=%d  bucket=%d" % (base_pos, bucket_idx))
+                for b in range(B):
+                    decoded = [self.tokenizer.decode([t]) for t in top4[b]]
+                    flags = []
+                    if REF_S in top4[b]: flags.append("<ref>@rank%d" % (top4[b].index(REF_S) + 1))
+                    if BOX_S in top4[b]: flags.append("<box>@rank%d" % (top4[b].index(BOX_S) + 1))
+                    print("  row %d top4=%s toks=%s %s" % (b, top4[b], decoded, " ".join(flags)))
+                print("[PBD DEBUG] verdict: row0 top1 = %d (%r) — %s\n" % (
+                    toks[0], self.tokenizer.decode([toks[0]]),
+                    "FORWARD LIKELY OK (port handle_pattern)" if toks[0] in (REF_S, BOX_S)
+                    else "FORWARD SUSPECT (chase RoPE/attention)"))
+
+            # Commit gate: a real box is <box> + 4 coord tokens (+ </box>); else it's text → commit 1.
+            is_box = (toks[0] == box_start
+                      and all(coord_lo <= toks[i] <= coord_hi for i in (1, 2, 3, 4)))
+            committed = toks[:B] if is_box else toks[:1]
+
+            stop_hit = False
+            for t in committed:
+                if t in _stop:
+                    stop_hit = True
+                    break
+                self._generated_tokens.append(t)
+                print(self.tokenizer.decode([t]), end="", flush=True)
+            if self._generated_tokens:
+                last_tok = self._generated_tokens[-1]
+            self.seq_len += sum(1 for t in committed if t not in _stop)
+            if stop_hit:
+                print(f"\nStop token reached (PBD).")
+                break
+        return self.seq_len
+
 
 # ============================================================
 #  LocateAnything-specific: vision prep + driver (engine inlined above)
@@ -3863,6 +4302,16 @@ def main():
     ap.add_argument("--quant-compare", action="store_true",
                     help="run the CPU reference decoder bf16 vs if4 vs tq4 on the same vision "
                          "output and print a quant-fidelity comparison at the very bottom")
+    ap.add_argument("--pbd", action="store_true",
+                    help="Parallel Box Decoding: decode the model's MTP block (block_size positions) "
+                         "per step instead of one token at a time. Non-causal within block; reuses the "
+                         "trained joint-prediction heads. First-cut block-parallel decode path "
+                         "(compile_decoder_pbd / run_decoder_pbd); leaves the M=1 path untouched.")
+    ap.add_argument("--pbd-block", type=int, default=6,
+                    help="PBD block size (n_future_tokens). Must match the checkpoint's block_size (=6).")
+    ap.add_argument("--pbd-mode", default="fast", choices=["fast", "hybrid"],
+                    help="PBD generation mode: 'fast' = pure MTP every step; 'hybrid' = MTP with "
+                         "switch-to-AR on malformed boxes (mirrors reference generate()).")
     args = ap.parse_args()
 
     # ==================================================================
@@ -4134,7 +4583,13 @@ def main():
     _original_print("\n=== Decode ===")
     _original_print("--- Decode compile ---")
     timer = time.perf_counter()
-    da, gpt = ue.compile_decoder()
+    _pbd = bool(getattr(args, "pbd", False))
+    if _pbd:
+        ue.pbd_block = int(args.pbd_block)
+        ue.pbd_mode = args.pbd_mode
+        da, gpt = ue.compile_decoder_pbd(block=ue.pbd_block)
+    else:
+        da, gpt = ue.compile_decoder()
     t_decode_compile = time.perf_counter() - timer
     _original_print(f"  {t_decode_compile:.2f}s")
     ue._rope_offset = 0  # plain 1D rope, sequential positions (no mRoPE)
@@ -4155,7 +4610,10 @@ def main():
     _original_print("--- Decode run ---")
     timer = time.perf_counter()
     with contextlib.redirect_stdout(_Tee(real, buf)):
-        tok_cnt = ue.run_decoder(da, token_id=prefill_seq[-1], gflops=gpt)
+        if _pbd:
+            tok_cnt = ue.run_decoder_pbd(da, token_id=prefill_seq[-1], block=ue.pbd_block, gflops=gpt)
+        else:
+            tok_cnt = ue.run_decoder(da, token_id=prefill_seq[-1], gflops=gpt)
     t_decode_run = time.perf_counter() - timer
     answer_raw = buf.getvalue()                       # padded-frame coords (for --compare)
     # Map boxes out of the letterboxed square back to the original image frame.
