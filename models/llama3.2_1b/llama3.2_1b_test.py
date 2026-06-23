@@ -1696,6 +1696,7 @@ def main():
 
     print("\n--- Running ---")
     run_result = ue.run_llama()
+    ue.clear_dram()
     print("Llama-3.2-1B test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
