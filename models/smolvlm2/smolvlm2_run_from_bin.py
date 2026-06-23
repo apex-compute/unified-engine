@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """SmolVLM2-500M standalone inference from pre-compiled bin files.
 
-Self-contained and OFFLINE: it loads the deployable artifacts under ``smolvlm2_bin/`` (weights.bin,
-instructions.bin, and the shipped tokenizer dir) and runs prefill + decode with no compilation and no
+Self-contained and OFFLINE: it loads the deployable artifacts under ``smolvlm2_bin/`` (params.bin,
+programs.bin, and the shipped tokenizer dir) and runs prefill + decode with no compilation and no
 network access. It does not import the build script and never downloads anything, so it can be shipped
 to a customer on its own. Generate the bins once with smolvlm2_test.py (the build/offline-prep step)."""
 import builtins
@@ -186,7 +186,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     def _artifact_mode_suffix(self) -> str:
         # Only the decode linear kernel changes the compiled artifacts. The repetition penalty is a pure
         # RUNTIME tensor-DRAM write (PENALTY_BIAS_DRAM, always wired as the LM-head C term with zeros =
-        # greedy), so it never affects weights.bin or instructions.bin and is not part of the suffix.
+        # greedy), so it never affects params.bin or programs.bin and is not part of the suffix.
         if bool(getattr(self, "decode_matmat_mul_core_enable", False)):
             return "_decode_matmat_mul_core"
         return ""
@@ -249,8 +249,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         """Load params DRAM from snapshot bin + restore all address metadata. Returns True if loaded."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         suffix = self._artifact_mode_suffix()
-        bin_path = os.path.join(bin_dir, f"weights{suffix}.bin")
-        meta_path = os.path.join(bin_dir, f"weights{suffix}.json")
+        bin_path = os.path.join(bin_dir, f"params{suffix}.bin")
+        meta_path = os.path.join(bin_dir, f"params{suffix}.json")
         if not os.path.exists(bin_path) or not os.path.exists(meta_path):
             raise RuntimeError(
                 f"[artifact-mode] missing snapshot artifact for current mode: "
@@ -286,15 +286,15 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         (which restores params, including the shared vis_zeros LN buffer — Trick 9, no replay needed)."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         suffix = self._artifact_mode_suffix()
-        meta_path = os.path.join(bin_dir, f"instructions{suffix}.json")
-        bin_path = os.path.join(bin_dir, f"instructions{suffix}.bin")
+        meta_path = os.path.join(bin_dir, f"programs{suffix}.json")
+        bin_path = os.path.join(bin_dir, f"programs{suffix}.bin")
         with open(meta_path) as f:
             meta = json.load(f)
         self._validate_artifact_mode(meta, os.path.basename(meta_path))
         with open(bin_path, "rb") as f:
             raw = f.read()
-        for name, entry in meta["programs"].items():
-            b = raw[entry["offset"]:entry["offset"] + entry["size"]]
+        for entry in meta["segments"]:
+            b = raw[entry["off"]:entry["off"] + entry["size"]]
             self.dma_write(DMA_DEVICE_H2C, entry["addr"], b, len(b))
         self._vis_program_addr = meta["encoder_addr"]
         self._decoder_program_addr = meta["decoder_addr"]
@@ -676,12 +676,12 @@ def main():
     snapshot_suffix = "_decode_matmat_mul_core" if args.decode_matmat_mul_core_enable else ""
     instruction_suffix = snapshot_suffix
 
-    # Check all static bins before any hardware init. SmolVLM2 now uses one instruction artifact:
-    # instructions.bin / instructions.json.
+    # Check all static bins before any hardware init. SmolVLM2 uses the unified scheme:
+    # params.bin / params.json (snapshot) + programs.bin / programs.json (instructions).
     def _missing_static_bins():
         missing = []
-        for name in (f"weights{snapshot_suffix}.bin", f"weights{snapshot_suffix}.json",
-                     f"instructions{instruction_suffix}.bin", f"instructions{instruction_suffix}.json"):
+        for name in (f"params{snapshot_suffix}.bin", f"params{snapshot_suffix}.json",
+                     f"programs{instruction_suffix}.bin", f"programs{instruction_suffix}.json"):
             if not os.path.exists(os.path.join(bin_dir, name)):
                 missing.append(name)
         return missing

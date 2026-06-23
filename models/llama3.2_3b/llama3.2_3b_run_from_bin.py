@@ -12,11 +12,9 @@ running ``llama3.2_3b_test.py`` once on a build machine that has HF access):
   * ``params.bin``                   IF4 layer weights + bf16 embedding
   * ``params.json``                  size metadata for params.bin
   * ``programs.bin``                 unified dynamic-PBI instruction bin (prefill + decoder).
-                                     The on-FPGA repetition-penalty build is shipped as the
-                                     parallel ``programs_fpgapenalty.bin`` (separate compile;
-                                     LM-head matmul bias differs). --pure-greedy uses programs.bin.
+                                     The LM-head matmul ALWAYS carries the penalty C bias, so one
+                                     bin serves both modes: greedy zeroes the bias, penalty writes it.
   * ``programs.json``                per-stage start addresses / sizes / FLOPs
-                                     (``programs_fpgapenalty.json`` for the penalty build)
   * ``Llama-3.2-3B-Instruct/``       tokenizer files only (tokenizer.json /
                                      tokenizer_config.json). Model weights NOT needed.
 
@@ -347,14 +345,8 @@ class Llama32_3b_RunFromBin(UnifiedEngine):
         paths_cfg = self._cfg.get("paths", {})
         meta_path = os.path.join(self.script_dir,
                                  paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json"))
-        if bool(getattr(self, "fpga_penalty", False)):
-            # On-FPGA penalty uses a separate bin (LM-head matmul bias on / logit writeback off);
-            # its meta points to the _fpgapenalty bin. Compiled by llama3.2_3b_test.py (default).
-            meta_path = meta_path.replace(".json", "_fpgapenalty.json")
-            if not os.path.exists(meta_path):
-                raise FileNotFoundError(
-                    f"on-FPGA penalty bin meta not found: {meta_path}\n"
-                    f"  build it with:  python llama3.2_3b_test.py")
+        # Single unified bin: the LM-head matmul always carries the penalty C bias, so greedy
+        # (zero bias) and penalty (real bias) share one programs.bin — no _fpgapenalty file.
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -510,9 +502,7 @@ def _verify_artifacts(script_dir: str, cfg: dict, fpga_penalty: bool = False) ->
     """Hard-fail before any FPGA touch if a required artifact is missing."""
     paths = cfg["paths"]
     inst_bin, inst_meta = paths["instruction_bin"], paths["instruction_meta"]
-    if fpga_penalty:  # on-FPGA penalty loads the _fpgapenalty bin/meta (test.py default)
-        inst_bin = inst_bin.replace(".bin", "_fpgapenalty.bin")
-        inst_meta = inst_meta.replace(".json", "_fpgapenalty.json")
+    # Single unified bin: greedy and penalty share one programs.bin (no _fpgapenalty variant).
     required = [
         ("llama3.2_3b_config.json", "model config"),
         (paths["weights_bin"], "weight bin"),
@@ -552,12 +542,12 @@ def main():
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
-    # matmul bias so the HW argmax returns the penalized token directly (no logit readback); loads the
-    # _fpgapenalty bin. --pure-greedy disables it entirely (plain writeback-on bin).
+    # matmul bias so the HW argmax returns the penalized token directly (no logit readback). One
+    # unified programs.bin serves both modes; --pure-greedy just leaves the bias buffer zero.
     parser.add_argument("--pure-greedy", action="store_true",
-                        help="Disable the on-FPGA repetition penalty entirely — plain greedy decode "
-                             "(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy "
-                             "only for the A/B baseline and the compare/calibration tool.")
+                        help="Disable the on-FPGA repetition penalty — plain greedy decode (the bias "
+                             "buffer stays zero; same programs.bin). The penalty is ENABLED by default; "
+                             "use --pure-greedy only for the A/B baseline and the compare/calibration tool.")
     pen_group = parser.add_argument_group("on-FPGA repetition penalty (active unless --pure-greedy)")
     pen_group.add_argument("--greedy-until", type=int, default=512,
                         help="Pure greedy for the first N decoded tokens (correct math/reasoning), "
@@ -611,7 +601,7 @@ def main():
     ue.prefill_seq = prefill_seq
     # Decode config — deterministic, on-FPGA penalty only (no host penalty / sampling).
     ue.greedy_until = int(args.greedy_until)
-    ue.fpga_penalty = not bool(args.pure_greedy)   # selects the _fpgapenalty bin + matmul-bias path
+    ue.fpga_penalty = not bool(args.pure_greedy)   # enables the matmul-bias penalty path (runtime bias)
     ue.pen_alpha = float(args.pen_alpha)
     ue.pen_cap = float(args.pen_cap)
     ue.rep_window = int(args.rep_window)

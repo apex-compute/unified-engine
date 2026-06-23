@@ -970,12 +970,15 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            penalty_kwargs = dict(C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N") \
-                if bool(getattr(self, "fpga_penalty", False)) else {}
+            # LM head with the on-FPGA repetition-penalty bias folded in UNCONDITIONALLY (qwen3 style):
+            # the matmul ALWAYS adds PENALTY_BIAS_DRAM (its per-vocab C term, bias_mode="broadcast_N")
+            # before the on-chip argmax. The bias buffer is zero pre-gate / in --pure-greedy, so the
+            # SAME programs.bin serves plain greedy and penalty — no separate _fpgapenalty build.
             total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                write_back_disable=True, **penalty_kwargs)
+                write_back_disable=True,
+                C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N")
 
         self.generate_instruction_halt()
         self.pad_capture_to_64b_boundary()
@@ -1031,13 +1034,11 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         paths_cfg = self._cfg.get("paths", {})
         instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_3b_bin/programs.bin"))
         instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json"))
-        if bool(getattr(self, "fpga_penalty", False)):
-            # On-FPGA penalty changes the LM-head matmul (bias on / writeback off) → a different bin.
-            # Separate cache file so it never clobbers the host-path bin. run_from_bin loads the same.
-            instruction_bin_path = instruction_bin_path.replace(".bin", "_fpgapenalty.bin")
-            instruction_meta_path = instruction_meta_path.replace(".json", "_fpgapenalty.json")
-            self._instruction_bin_path = instruction_bin_path
-            self._instruction_meta_path = instruction_meta_path
+        # Single unified bin (qwen3 style): the LM-head matmul always carries the penalty C bias,
+        # so one programs.bin serves both greedy (zero bias) and penalty (real bias) — no
+        # _fpgapenalty split. Record the paths so run_llama loads this same bin/meta.
+        self._instruction_bin_path = instruction_bin_path
+        self._instruction_meta_path = instruction_meta_path
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
@@ -1149,8 +1150,8 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         prefill or decoder program at runtime.
         """
         paths_cfg = self._cfg.get("paths", {})
-        # When fpga_penalty, compile_llama set _instruction_meta_path to the _fpgapenalty meta — use
-        # it so we load the bias bin (whose meta's instruction_bin points to the _fpgapenalty bin).
+        # compile_llama records _instruction_meta_path = the single programs.json; load it so we read
+        # the unified bin (its meta's instruction_bin points to programs.bin).
         meta_path = getattr(self, "_instruction_meta_path", None) or \
             os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json"))
         with open(meta_path, "r") as f:
@@ -1340,7 +1341,7 @@ def main():
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly (no logit readback), fully
-    # deterministic (separate _fpgapenalty bin). --pure-greedy disables it entirely.
+    # deterministic. One unified programs.bin serves both modes; --pure-greedy leaves the bias zero.
     parser.add_argument('--pure-greedy', action='store_true',
                         help='Disable the on-FPGA repetition penalty entirely — plain greedy decode '
                              '(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy '
