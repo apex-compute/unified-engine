@@ -50,8 +50,9 @@ Both scripts share `--prompt`, `--dev`, `--cycle`, and the sampling flags
 
 ```bash
 # Recompile the instruction bin (e.g. after editing the compile path)
+# One unified programs.bin serves both greedy and the on-FPGA penalty (the LM-head matmul
+# always carries the penalty C bias; greedy just zeroes it). No separate _fpgapenalty build.
 rm llama3.2_3b_bin/programs.bin llama3.2_3b_bin/programs.json
-# (and llama3.2_3b_bin/programs_fpgapenalty.{bin,json} for the on-FPGA penalty build)
 
 # Re-quantize the weight bin (from the cached HF model)
 rm llama3.2_3b_bin/params.bin llama3.2_3b_bin/params.json

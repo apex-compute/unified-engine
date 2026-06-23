@@ -1073,12 +1073,15 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            penalty_kwargs = dict(C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N") \
-                if bool(getattr(self, "fpga_penalty", False)) else {}
+            # LM head with the on-FPGA repetition-penalty bias folded in UNCONDITIONALLY (qwen3 style):
+            # the matmul ALWAYS adds PENALTY_BIAS_DRAM (its per-vocab C term, bias_mode="broadcast_N")
+            # before the on-chip argmax. The bias buffer is zero pre-gate / in --pure-greedy, so the
+            # SAME programs.bin serves plain greedy and penalty.
             total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                write_back_disable=True, **penalty_kwargs)
+                write_back_disable=True,
+                C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N")
 
         self.generate_instruction_halt()
         self.pad_capture_to_64b_boundary()
@@ -1135,7 +1138,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         paths_cfg = self._cfg.get("paths", {})
         instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_1b_bin/programs.bin"))
         instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
-        # Single programs.bin: fpga_penalty and profile modes share one output path; rebuild as needed.
+        # Single unified programs.bin (qwen3 style): the LM-head matmul always carries the penalty C
+        # bias, so one bin serves greedy (zero bias) and penalty (real bias) — no per-mode rebuild.
         self._instruction_bin_path = instruction_bin_path
         self._instruction_meta_path = instruction_meta_path
         if not profile and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
