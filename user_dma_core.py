@@ -3792,16 +3792,14 @@ class UnifiedEngine:
                             gpr_K_reg: int = None, gpr_N_reg: int = None) -> None:
         """Matrix multiply entrypoint; dispatches based on which dimensions are runtime registers:
 
-        - ``gpr_K_reg`` and/or ``gpr_N_reg`` provided: :meth:`matmat_mul_dynamic_core` — fully
-          dynamic M/K/N, all tiling constants computed in the ISA register file at runtime.
-        - only ``gpr_M_reg`` provided: :meth:`matmat_mul_core_pbi` — dynamic M, compile-time K/N.
-          The captured program has no static reference to ``M``; ``M`` is FLOPs-accounting only.
+        - any of ``gpr_M_reg``, ``gpr_K_reg``, ``gpr_N_reg`` provided: :meth:`matmat_mul_dynamic_core` —
+          fully dynamic M/K/N; dimensions with no GPR are seeded from compile-time literals.
         - none provided (default): :meth:`matmat_mul_core_legacy` — compile-time M/K/N tiling.
 
         **Layout:** ``A`` is **M×K** (row-major). ``B`` is **N×K** (row-major); the accelerator uses ``B`` as above and
         applies an implicit transpose so the computed result is **A @ Bᵀ**, i.e. **M×N**, without a separate transpose pass.
         """
-        if gpr_K_reg is not None or gpr_N_reg is not None:
+        if gpr_M_reg is not None or gpr_K_reg is not None or gpr_N_reg is not None:
             return self.matmat_mul_dynamic_core(
                 M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
                 is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
@@ -3809,15 +3807,6 @@ class UnifiedEngine:
                 clamp_min=clamp_min, clamp_max=clamp_max,
                 write_back_disable=write_back_disable,
                 gpr_M_reg=gpr_M_reg, gpr_K_reg=gpr_K_reg, gpr_N_reg=gpr_N_reg,
-            )
-        if gpr_M_reg is not None:
-            return self.matmat_mul_core_pbi(
-                M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
-                is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
-                clamp_enable, log_enable,
-                clamp_min=clamp_min, clamp_max=clamp_max,
-                debug_fmax=debug_fmax, ZERO_DRAM_ADDR=ZERO_DRAM_ADDR, FMAX_DRAM_ADDR=FMAX_DRAM_ADDR,
-                write_back_disable=write_back_disable, gpr_M_reg=gpr_M_reg,
             )
         return self.matmat_mul_core_legacy(
             M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
@@ -4050,659 +4039,6 @@ class UnifiedEngine:
         print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
         return total_flops
 
-    def matmat_mul_core_pbi(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
-                             is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
-                             clamp_enable: bool = False, log_enable: bool = False,
-                             clamp_min: float = 0.0, clamp_max: float = float("inf"),
-                             debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
-                             write_back_disable: bool = False, gpr_M_reg: int = None) -> int:
-        """
-        Matmul capture path with a hardware while-loop over the M dimension.
-
-        Args:
-            M: Compile-time row count, used only for FLOPS reporting and as the fallback
-                initial value of the hardware loop counter when ``gpr_M_reg`` is not supplied.
-            gpr_M_reg: Optional ISA register index already holding the **runtime** row count.
-                When provided, ``gpr_M_counter`` is seeded by copying this register
-                (``add_imm dst=gpr_M_counter, src=gpr_M_reg, imm=0``).
-                When ``None``, ``gpr_M_counter`` is seeded directly from compile-time ``M``
-                (``add_set gpr_M_counter, M``).
-
-        M-tiling:
-        - ``M_chunk`` is chosen purely from URAM capacity (no compile-time M bound).
-          Each tile takes ``m_take = min(gpr_M_counter, M_chunk)`` rows, so the last tile
-          is a partial tile when M is not a multiple of M_chunk.
-        - The outer loop terminates via ``ALU_MODE_SUB + JUMP_RELA_JNZ`` on ``gpr_M_counter``.
-
-        N-tiling:
-        - **Uniform** strips — largest ``N_chunk`` that divides ``N`` and fits URAM.
-          Multiples of 64 (``UE_VECTOR_SIZE``) on the main path; 16/32 on the legacy small path.
-
-        Softmax (when ``softmax_enable``): ``M_chunk`` is also capped by
-        ``URAM_NEAR_FULL_ELEMENTS // N`` so one softmax slab fits the near-full URAM row budget.
-        """
-        # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
-        # 1. M_chunk can be any value between 1 and M
-        # 2. On the main N path ``N_chunk`` is a multiple of ``UE_VECTOR_SIZE``; on the small path, 16 or 32.
-        # 3. M_chunk * K + N_chunk * M_chunk must be less than or equal to URAM_FULL_ELEMENTS
-
-        bytes_per_element = 2
-        bias_enable = C_DRAM_ADDR is not None
-
-        if bias_enable:
-            assert bias_mode in ("broadcast_N", "full_matrix"), f"bias_mode={bias_mode} must be either 'broadcast_N' or 'full_matrix'"
-
-        if is_B_quantized:
-            assert data_type in (TYPE.IF4, TYPE.IF8), f"data_type={data_type} must be one of TYPE.IF4, TYPE.IF8"
-            assert K % UE_VECTOR_SIZE == 0, (
-                f"quantized B path uses scale DRAM stride linear in j; require K % UE_VECTOR_SIZE == 0, got K={K}"
-            )
-
-        assert sum([gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable]) <= 1, "only one activation can be True"
-
-        if softmax_enable:
-            if debug_fmax:
-                assert ZERO_DRAM_ADDR is not None, "ZERO_DRAM_ADDR must be provided when debug_fmax=True"
-                assert FMAX_DRAM_ADDR is not None, "FMAX_DRAM_ADDR must be provided when debug_fmax=True"
-
-        lalu_mode = LALU_MODE.BYPASS
-        lalu_a = 0
-        lalu_b = 0
-        if gelu_enable:
-            lalu_mode = LALU_MODE.ACT
-            lalu_a = LALU_ACT_GELU_A
-            lalu_b = LALU_ACT_GELU_B
-        elif silu_enable:
-            lalu_mode = LALU_MODE.ACT
-            lalu_a = LALU_ACT_SILU_A
-            lalu_b = LALU_ACT_SILU_B
-        elif sigmoid_enable:
-            lalu_mode = LALU_MODE.ACT_NO_X
-            lalu_a = LALU_ACT_SIGMOID_A
-            lalu_b = LALU_ACT_SIGMOID_B
-        elif clamp_enable:
-            lalu_mode = LALU_MODE.CLAMP
-            lalu_a = self.float_to_bf16(clamp_min)
-            lalu_b = self.float_to_bf16(clamp_max)
-        elif log_enable:
-            lalu_mode = LALU_MODE.LOG
-            lalu_a = LALU_LOG_A
-            lalu_b = LALU_LOG_B
-
-        # URAM cap on column strip width (same as legacy first-pass N_chunk).
-        def _largest_uniform_strip(
-            total_n: int, strip_cap: int, step: int, min_strip: int
-        ) -> int | None:
-            """Largest ``w`` with ``w | total_n``, ``min_strip <= w <= strip_cap``, ``w % step == 0``."""
-            if strip_cap < min_strip or total_n < 1:
-                return None
-            upper = min(strip_cap, total_n)
-            upper = (upper // step) * step
-            if upper < min_strip:
-                return None
-            for cand in range(upper, min_strip - 1, -step):
-                if total_n % cand == 0:
-                    return cand
-            return None
-
-        n_cap_main = min(N, (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-        N_chunk_aligned = None
-        num_full_n_tiles = None
-        N_chunk = None
-
-        if n_cap_main >= UE_VECTOR_SIZE:
-            # Multiples-of-64 strips only; maximizes URAM B width subject to cap and ``N_chunk | N``.
-            N_chunk = _largest_uniform_strip(N, n_cap_main, UE_VECTOR_SIZE, UE_VECTOR_SIZE)
-            if N_chunk is not None:
-                num_full_n_tiles = N // N_chunk
-
-        if num_full_n_tiles is None:
-            # Legacy small-``N_chunk`` path: 32 or 16 from K, ``N_chunk_aligned`` for URAM-A matvec rows.
-            if (K * 32) <= URAM_NEAR_FULL_ELEMENTS:
-                n_cap_small = 32
-            elif (K * 16) <= URAM_NEAR_FULL_ELEMENTS:
-                n_cap_small = 16
-            else:
-                assert False, f"N={N} is too large to fit in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
-            N_chunk_aligned = UE_VECTOR_SIZE
-            N_chunk = _largest_uniform_strip(N, n_cap_small, 16, 16)
-            assert N_chunk is not None, (
-                f"matmat_mul_core_pbi: no uniform N strip (multiple of 16, ≤{n_cap_small}) divides N={N}. "
-                "Adjust N or drop gpr_M_reg from the wrapper call to route to the legacy core."
-            )
-            num_full_n_tiles = N // N_chunk
-
-        if N_chunk_aligned is None:
-            if softmax_enable:
-                M_chunk = min(UE_FMAX_CONTEXT_SIZE, URAM_FULL_ELEMENTS // (K + N_chunk))
-            else:
-                M_chunk = URAM_FULL_ELEMENTS // (K + N_chunk)
-        else:
-            if softmax_enable:
-                M_chunk = min(UE_FMAX_CONTEXT_SIZE, URAM_FULL_ELEMENTS // (K + N_chunk_aligned))
-            else:
-                M_chunk = URAM_FULL_ELEMENTS // (K + N_chunk_aligned)
-
-        if softmax_enable:
-            softmax_max_rows_per_slab = URAM_NEAR_FULL_ELEMENTS // N
-            assert softmax_max_rows_per_slab >= 1, (
-                f"matmat_mul_core_pbi softmax: row length N={N} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
-            )
-            M_chunk = min(M_chunk, softmax_max_rows_per_slab)
-
-        assert M_chunk >= 1, f"M_chunk={M_chunk} must be >= 1 (K={K}, N_chunk={N_chunk} too large for URAM?)"
-
-        print(
-            f"M_chunk: {M_chunk} (URAM cap, dynamic M from gpr_M_reg={gpr_M_reg}), "
-            f"N_chunk: {N_chunk} (uniform ×{num_full_n_tiles}), "
-            f"n_cap_main: {n_cap_main}, N_chunk_aligned: {N_chunk_aligned}",
-        )
-
-        if N_chunk_aligned is None:
-            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-        else:
-            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * N_chunk_aligned) / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-
-        pointer_idx = [self.alloc_inst_ptr() for _ in range(13)]
-
-        M_chunk_reg  = self.alloc_isa_reg()   # holds compile-time M_chunk constant
-        m_take_reg   = self.alloc_isa_reg()   # min(gpr_M_counter, M_chunk) per tile
-        gpr_M_counter = self.alloc_isa_reg()   # remaining M rows, decremented each tile
-        dma_bytes_reg = self.alloc_isa_reg()  # scratch: m_take_reg * stride bytes, reused per callsite
-
-        self.generate_instruction_add_set(M_chunk_reg, M_chunk)
-        if gpr_M_reg is not None:
-            self.generate_instruction_add_imm(src_reg_idx=gpr_M_reg, immediate_value=0, dst_reg_idx=gpr_M_counter)
-        else:
-            self.generate_instruction_add_set(gpr_M_counter, M)
-        self.generate_instruction_reg_min(m_take_reg, gpr_M_counter, M_chunk_reg)
-
-        ISA_FOR_LOOP = 1
-
-        # --- one-time PBI inits (outside the tile loop) ---
-        if bias_enable and bias_mode == "full_matrix":
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=C_DRAM_ADDR,
-                dma_length=N_chunk * bytes_per_element,
-                inst_pointer_idx=pointer_idx[0],
-            )
-        if softmax_enable:
-            softmax_dram_row0 = OUTPUT_DRAM_ADDR
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=softmax_dram_row0,
-                inst_pointer_idx=pointer_idx[11],
-            )
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=softmax_dram_row0,
-                inst_pointer_idx=pointer_idx[12],
-            )
-        if not write_back_disable:
-            if N_chunk_aligned is None:
-                self.generate_instruction_pbi_init(
-                    dram_shared_addr=OUTPUT_DRAM_ADDR,
-                    output_size=N_chunk * bytes_per_element,
-                    uram_a_start_addr=(M_chunk * K * bytes_per_element) >> 7,
-                    inst_pointer_idx=pointer_idx[5],
-                )
-            else:
-                self.generate_instruction_pbi_init(
-                    dram_shared_addr=OUTPUT_DRAM_ADDR,
-                    dma_length=N_chunk * 2,
-                    uram_a_start_addr=M_chunk * K * bytes_per_element >> 7,
-                    uram_b_start_addr=M_chunk * K * bytes_per_element >> 7,
-                    inst_pointer_idx=pointer_idx[5],
-                )
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=A_DRAM_ADDR,
-            inst_pointer_idx=pointer_idx[10],
-        )
-        if softmax_enable and debug_fmax:
-            uram_start_addr = (M_chunk * N * bytes_per_element) >> 7
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=FMAX_DRAM_ADDR,
-                dma_length=UE_VECTOR_SIZE * 2,
-                uram_a_start_addr=uram_start_addr,
-                uram_b_start_addr=uram_start_addr,
-                inst_pointer_idx=pointer_idx[7],
-            )
-
-        # abs jump to flush i-cache so the while-loop body lands at the start of a fresh line
-        program_dram_start_addr = self.get_program_dram_addr()
-        cur_inst_count = self.capture_count
-        jump_target_word_addr = ue_35bit_addr_shifter(program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES)
-        self.generate_instruction_jump_abs(jump_target_word_addr)
-
-        # ===== while-loop body start =====
-        body_start_inst_cnt = self.capture_count
-
-        self.generate_instruction_reg_mul_imm(dma_bytes_reg, m_take_reg, K * 2)
-        self.generate_instruction_pbi_inc(
-            general_reg_src=dma_bytes_reg,
-            pbi_field_select=PBI_FIELD.DMA_LENGTH,
-            inst_pointer_idx=pointer_idx[10],
-        )
-        self.accelerator_memory_to_sram(accelerator_dram_address=M_chunk * K * bytes_per_element,
-                                            sram_address=0,
-                                            element_size=0,
-                                            inst_pointer_idx=pointer_idx[10],
-                                            )
-
-        # clear max for each M tile
-        self.generate_instruction_clear_fmax()
-
-        ue_b = UE_VECTOR_SIZE * bytes_per_element
-        k_row_b = K * bytes_per_element
-        output_sram_wb_addr = M_chunk * K * bytes_per_element
-        row_full_b = (N_chunk if N_chunk_aligned is None else N_chunk_aligned) * bytes_per_element
-        pbi_inc_dot_product_uram_start_addr = k_row_b // ue_b
-        pbi_inc_dot_product_uram_wb_addr_full = row_full_b // ue_b
-
-        pbi_base_dot_product_uram_wb_addr = output_sram_wb_addr // ue_b
-        pbi_inc_dot_product_uram_wb_addr = pbi_inc_dot_product_uram_wb_addr_full
-
-        # PBI over N: ``num_full_n_tiles`` strips of uniform width ``N_chunk``.
-        if is_B_quantized:
-            if data_type == TYPE.IF4:
-                offset = (K * N_chunk) >> 1
-            elif data_type == TYPE.IF8:
-                offset = K * N_chunk
-
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=SCALE_DRAM_ADDR,
-                dma_length=((N_chunk * K + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * bytes_per_element,
-                inst_pointer_idx=pointer_idx[2],
-            )
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=B_DRAM_ADDR,
-                dma_length=N_chunk * K if data_type == TYPE.IF8 else N_chunk * K >> 1,
-                output_size=(N_chunk * K + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,
-                uram_length=(N_chunk * K + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE,
-                uram_wb_addr=0x80000 >> 7,
-                inst_pointer_idx=pointer_idx[3],
-            )
-        else:
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=B_DRAM_ADDR,
-                dma_length=N_chunk * K * bytes_per_element,
-                uram_b_start_addr=(0x80000 >> 7) & 0xFFF,
-                inst_pointer_idx=pointer_idx[2],
-            )
-        if bias_enable and bias_mode == "broadcast_N":
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=C_DRAM_ADDR,
-                dma_length=N_chunk * bytes_per_element,
-                inst_pointer_idx=pointer_idx[4],
-            )
-
-        for i in range(ISA_FOR_LOOP):
-            # N strip loop
-            self.loop_start(num_full_n_tiles)
-            if is_B_quantized:
-                self.ue_memcpy_from_dram(
-                    (K // UE_VECTOR_SIZE) * bytes_per_element * N_chunk,
-                    0,
-                    MEMCPY_TYPE.BRAM.value, 0, 0,
-                    inst_pointer_idx=pointer_idx[2])
-
-                self.ue_arithmetic_op(
-                    broadcast_mode=0,
-                    max_clear_en=0,
-                    stride_z=1,
-                    lalu_a=0,
-                    lalu_b=0,
-                    lalu_mode=LALU_MODE.BYPASS.value,
-                    scalar=0,
-                    uram_section=URAM_SECTION.URAM_B.value,
-                    uram_dst_addr=0,
-                    uram_wb_addr=0,
-                    uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value,
-                    mode=UE_MODE.DEQUANTIZE,
-                    data_type=data_type.value,
-                    uram_a_start_addr=0,
-                    uram_b_start_addr=0,
-                    uram_length=0,
-                    dma_start_addr=offset,
-                    dma_length=0,
-                    output_size=0,
-                    inst_pointer_idx=pointer_idx[3],
-                )
-            else:
-                self.ue_memcpy_from_dram(
-                    K * bytes_per_element * N_chunk,
-                    0,
-                    MEMCPY_TYPE.URAM.value,
-                    0,
-                    URAM_SECTION.URAM_B,
-                    inst_pointer_idx=pointer_idx[2],
-                )
-
-            if bias_enable and bias_mode == "broadcast_N":
-                self.ue_memcpy_from_dram(
-                    bytes_per_element * N_chunk,
-                    0,
-                    MEMCPY_TYPE.BIAS_BRAM.value,
-                    0,
-                    0,
-                    inst_pointer_idx=pointer_idx[4],
-                )
-
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=0,
-                dma_length=K * N_chunk,
-                output_size=N_chunk,
-                uram_length=K // UE_VECTOR_SIZE,
-                uram_a_start_addr=0,
-                uram_b_start_addr=0,
-                uram_wb_addr=pbi_base_dot_product_uram_wb_addr,
-                uram_dst_addr=0,
-                fmax_context_addr=0,
-                inst_pointer_idx=pointer_idx[1],
-            )
-
-            for j in range(ISA_FOR_LOOP):
-                self.loop_start(gpr_loop_cnt=m_take_reg)
-                if bias_enable and bias_mode == "full_matrix":
-                    self.accelerator_memory_to_bias_sram(
-                        accelerator_dram_address=N * bytes_per_element,
-                        element_size=0,
-                        inst_pointer_idx=pointer_idx[0],
-                    )
-
-                self.ue_arithmetic_op(
-                    broadcast_mode=0,
-                    max_clear_en=0,
-                    stride_z=1,
-                    lalu_a=lalu_a,
-                    lalu_b=lalu_b,
-                    lalu_mode=lalu_mode.value,
-                    scalar=0,
-                    uram_section=URAM_SECTION.URAM_A.value,
-                    uram_dst_addr=0,
-                    uram_wb_addr=pbi_inc_dot_product_uram_wb_addr,
-                    uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value,
-                    mode=UE_MODE.BF16_DOT_PRODUCT,
-                    data_type=0,
-                    uram_a_start_addr=pbi_inc_dot_product_uram_start_addr,
-                    uram_b_start_addr=0,
-                    uram_length=0,
-                    dma_start_addr=0,
-                    dma_length=0,
-                    output_size=0,
-                    bias_adder_en=bias_enable,
-                    fmax_context_addr=1,
-                    inst_pointer_idx=pointer_idx[1],
-                )
-                self.loop_end()
-
-            if bias_enable and bias_mode == "full_matrix":
-                # rewind that row stride m_take_reg times (ISA loop), then step by N_chunk for the next N strip.
-                self.loop_start(gpr_loop_cnt=m_take_reg)
-                self.generate_instruction_pbi_inc(
-                    dram_shared_addr=-N * bytes_per_element,
-                    inst_pointer_idx=pointer_idx[0],
-                )
-                self.loop_end()
-                self.generate_instruction_pbi_inc(
-                    dram_shared_addr=N_chunk * bytes_per_element,
-                    inst_pointer_idx=pointer_idx[0],
-                )
-
-            if not write_back_disable:
-                if N_chunk_aligned is None:
-                    self.generate_instruction_reg_mul_imm(dma_bytes_reg, m_take_reg, N_chunk * 2)
-                    self.generate_instruction_pbi_inc(
-                        general_reg_src=dma_bytes_reg,
-                        pbi_field_select=PBI_FIELD.DMA_LENGTH,
-                        inst_pointer_idx=pointer_idx[5],
-                    )
-                    self.ue_memcpy_to_dram(
-                        memcpy_type=MEMCPY_TYPE.URAM.value,
-                        uram_type=URAM_SECTION.URAM_A.value,
-                        uram_src_addr=0,
-                        dram_dst_addr=bytes_per_element * N_chunk,
-                        memcpy_length_bytes=0,
-                        stride_bytes_per_chunk=0,
-                        stride_jump_bytes=N * bytes_per_element,
-                        inst_pointer_idx=pointer_idx[5],
-                    )
-                else:
-                    self.loop_start(gpr_loop_cnt=m_take_reg)
-                    self.ue_memcpy_to_dram(
-                        memcpy_type=MEMCPY_TYPE.URAM.value,
-                        uram_type=URAM_SECTION.URAM_A.value,
-                        uram_src_addr=1,
-                        dram_dst_addr=N * bytes_per_element,
-                        memcpy_length_bytes=0,
-                        inst_pointer_idx=pointer_idx[5],
-                    )
-                    self.loop_end()
-
-                    # rewind m_take_reg row strides, then step by N_chunk for the next N strip.
-                    self.loop_start(gpr_loop_cnt=m_take_reg)
-                    self.generate_instruction_pbi_inc(
-                        dram_shared_addr=-N * bytes_per_element,
-                        uram_a_start_addr=-1,
-                        uram_b_start_addr=-1,
-                        inst_pointer_idx=pointer_idx[5],
-                    )
-                    self.loop_end()
-                    self.generate_instruction_pbi_inc(
-                        dram_shared_addr=N_chunk * bytes_per_element,
-                        inst_pointer_idx=pointer_idx[5],
-                    )
-            self.loop_end()
-
-        # Advance output PBI pointer by (m_take_reg - 1)*N*2 to the start of the next M strip.
-        # Loop m_take_reg times (+N*2 each), then subtract one step (-N*2) for net (m_take_reg-1)*N*2.
-        if not write_back_disable:
-            self.loop_start(gpr_loop_cnt=m_take_reg)
-            self.generate_instruction_pbi_inc(
-                dram_shared_addr=N * bytes_per_element,
-                inst_pointer_idx=pointer_idx[5],
-            )
-            self.loop_end()
-            self.generate_instruction_pbi_inc(
-                dram_shared_addr=-N * bytes_per_element,
-                inst_pointer_idx=pointer_idx[5],
-            )
-
-        # Advance bias PBI pointer by (m_take_reg - 1)*N*2 to the start of the next M strip.
-        if bias_enable and bias_mode == "full_matrix":
-            self.loop_start(gpr_loop_cnt=m_take_reg)
-            self.generate_instruction_pbi_inc(
-                dram_shared_addr=N * bytes_per_element,
-                inst_pointer_idx=pointer_idx[0],
-            )
-            self.loop_end()
-            self.generate_instruction_pbi_inc(
-                dram_shared_addr=-N * bytes_per_element,
-                inst_pointer_idx=pointer_idx[0],
-            )
-
-        # Optional softmax operation
-        if softmax_enable:
-            assert N % UE_VECTOR_SIZE == 0, "N must be a multiple of UE_VECTOR_SIZE"
-            # input_sram_start_addr = 0x00000, softmax_out_sram_wb_addr = 0x80000
-            self.generate_instruction_reg_mul_imm(dma_bytes_reg, m_take_reg, N * 2)
-            self.generate_instruction_pbi_inc(
-                general_reg_src=dma_bytes_reg,
-                pbi_field_select=PBI_FIELD.DMA_LENGTH,
-                inst_pointer_idx=pointer_idx[11],
-            )
-            self.ue_memcpy_from_dram(
-                dram_src_addr=M_chunk * N * bytes_per_element,
-                memcpy_length_bytes=0,
-                memcpy_type=MEMCPY_TYPE.URAM.value,
-                uram_dst_addr=0,
-                uram_type=URAM_SECTION.URAM_A.value,
-                inst_pointer_idx=pointer_idx[11],
-            )
-
-            uram_wb_row_stride = N * bytes_per_element >> 7
-            row_size = N // UE_VECTOR_SIZE
-            if debug_fmax:
-                uram_sfmx_trace_addr = (M_chunk * N * bytes_per_element) >> 7
-                sfmx_dbg_nbytes = UE_VECTOR_SIZE * 2
-                row_size_fmax = (UE_VECTOR_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-                self.generate_instruction_pbi_init(
-                    uram_length=row_size_fmax,
-                    uram_a_start_addr=uram_sfmx_trace_addr,
-                    uram_wb_addr=uram_sfmx_trace_addr,
-                    inst_pointer_idx=pointer_idx[6],
-                )
-            self.generate_instruction_pbi_init(
-                uram_length=row_size,
-                inst_pointer_idx=pointer_idx[8],
-            )
-            self.generate_instruction_pbi_init(
-                uram_length=row_size,
-                uram_wb_addr=(0x80000 >> 7),
-                inst_pointer_idx=pointer_idx[9],
-            )
-
-            for j in range(ISA_FOR_LOOP):
-                self.loop_start(gpr_loop_cnt=m_take_reg)
-                if debug_fmax:
-                    self.ue_memcpy_from_dram(
-                        ZERO_DRAM_ADDR,
-                        sfmx_dbg_nbytes,
-                        memcpy_type=MEMCPY_TYPE.URAM.value,
-                        uram_dst_addr=uram_sfmx_trace_addr,
-                        uram_type=URAM_SECTION.URAM_A.value,
-                        stride_bytes_per_chunk=0,
-                        stride_jump_bytes=0,
-                    )
-
-                    self.ue_arithmetic_op(
-                        broadcast_mode=BROADCAST_MODE.FMAX_NEGATE.value,
-                        max_clear_en=0,
-                        stride_z=1,
-                        lalu_a=0,
-                        lalu_b=0,
-                        lalu_mode=LALU_MODE.BYPASS.value,
-                        scalar=0,
-                        uram_section=URAM_SECTION.URAM_A.value,
-                        uram_dst_addr=0,
-                        uram_wb_addr=0,
-                        uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value,
-                        mode=UE_MODE.ADD_BROADCAST,
-                        data_type=0,
-                        uram_a_start_addr=0,
-                        uram_b_start_addr=0,
-                        uram_length=0,
-                        dma_start_addr=0,
-                        dma_length=0,
-                        output_size=0,
-                        fmax_context_addr=1,
-                        inst_pointer_idx=pointer_idx[6],
-                    )
-
-                    self.ue_memcpy_to_dram(
-                        memcpy_type=MEMCPY_TYPE.URAM.value,
-                        uram_type=URAM_SECTION.URAM_A.value,
-                        uram_src_addr=0,
-                        dram_dst_addr=UE_VECTOR_SIZE * bytes_per_element,
-                        memcpy_length_bytes=0,
-                        stride_bytes_per_chunk=0,
-                        stride_jump_bytes=0,
-                        inst_pointer_idx=pointer_idx[7],
-                    )
-
-                self.ue_arithmetic_op(
-                    broadcast_mode=BROADCAST_MODE.FMAX_NEGATE.value,
-                    max_clear_en=0,
-                    stride_z=1,
-                    lalu_a=0,
-                    lalu_b=0,
-                    lalu_mode=LALU_MODE.MODE_RECIP.value,
-                    scalar=self.float_to_bf19(1.0),
-                    uram_section=URAM_SECTION.URAM_A,
-                    uram_dst_addr=0,
-                    uram_wb_addr=uram_wb_row_stride,
-                    uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value,
-                    mode=UE_MODE.EXP,
-                    data_type=0,
-                    uram_a_start_addr=uram_wb_row_stride,
-                    uram_b_start_addr=0,
-                    uram_length=0,
-                    dma_start_addr=0,
-                    dma_length=0,
-                    output_size=0,
-                    fmax_context_addr=1,
-                    inst_pointer_idx=pointer_idx[8],
-                )
-
-                self.ue_arithmetic_op(
-                    broadcast_mode=BROADCAST_MODE.LALU_RESULT.value,
-                    max_clear_en=0,
-                    stride_z=1,
-                    lalu_a=0,
-                    lalu_b=0,
-                    lalu_mode=LALU_MODE.BYPASS.value,
-                    scalar=self.float_to_bf19(1.0),
-                    uram_section=URAM_SECTION.URAM_B,
-                    uram_dst_addr=0,
-                    uram_wb_addr=uram_wb_row_stride,
-                    uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value,
-                    mode=UE_MODE.MUL_BROADCAST,
-                    data_type=0,
-                    uram_a_start_addr=uram_wb_row_stride,
-                    uram_b_start_addr=0,
-                    uram_length=0,
-                    dma_start_addr=0,
-                    dma_length=0,
-                    output_size=0,
-                    fmax_context_addr=0,
-                    inst_pointer_idx=pointer_idx[9],
-                )
-                self.loop_end()
-            self.generate_instruction_pbi_inc(
-                general_reg_src=dma_bytes_reg,
-                pbi_field_select=PBI_FIELD.DMA_LENGTH,
-                inst_pointer_idx=pointer_idx[12],
-            )
-            self.ue_memcpy_to_dram(
-                memcpy_type=MEMCPY_TYPE.URAM.value,
-                uram_type=URAM_SECTION.URAM_B.value,
-                uram_src_addr=0,
-                dram_dst_addr=M_chunk * N * bytes_per_element,
-                memcpy_length_bytes=0,
-                inst_pointer_idx=pointer_idx[12],
-            )
-        # ===== while-loop end =====
-        # Decrement remaining-row counter by actual m_take; jump back if rows remain.
-        self.generate_instruction_reg_sub(gpr_M_counter, gpr_M_counter, m_take_reg)
-        self.generate_instruction_reg_min(m_take_reg, gpr_M_counter, M_chunk_reg)
-        outer_loop_size = self.capture_count - body_start_inst_cnt + 2
-        self.generate_instruction_jump_rela_jnz(outer_loop_size, gpr_M_counter)
-
-        self.release_isa_reg()  # dma_bytes_reg
-        self.release_isa_reg()  # gpr_M_counter
-        self.release_isa_reg()  # m_take_reg
-        self.release_isa_reg()  # M_chunk_reg
-
-        print(f"While-loop body size: {outer_loop_size}")
-        assert outer_loop_size <= 512, (
-            f"Outer while-loop body size {outer_loop_size} exceeds i-cache limit of 512 instructions"
-        )
-
-        for ptr in reversed(pointer_idx):
-            self.release_inst_ptr(ptr)
-
-        total_flops = 2 * M * K * N
-        if softmax_enable:
-            total_flops += M * N * 5
-        if gelu_enable or silu_enable or sigmoid_enable:
-            total_flops += M * N
-        if clamp_enable:
-            total_flops += M * N  # 1 compare + clamp per element
-        if log_enable:
-            total_flops += 2 * M * N  # clamp + log per element
-        print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
-        return total_flops
-
     def matmat_mul_dynamic_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                                 softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
                                 is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None,
@@ -4714,7 +4050,7 @@ class UnifiedEngine:
         """
         Fully dynamic M/K/N matmul captured as an ISA program (A @ Bᵀ -> M×N).
 
-        Unlike :meth:`matmat_mul_core_pbi` (dynamic M only, compile-time K/N), this kernel
+        Unlike the legacy static-tiling path, this kernel
         computes every tiling constant in the ISA register file at startup using the integer
         ALU ops (``div_reg``, ``mul32_reg``, ``shr``, ``shl``, ``reg_min``) so K and N can be
         runtime registers. The software ``for i,j in chunk_ranges`` tile loops become ISA
@@ -5445,10 +4781,10 @@ class UnifiedEngine:
             fmax_context_addr=fmax_context_addr
         )
 
-    def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, use_pbi: bool = False, IDENTITY_DRAM_ADDR: int = None, gpr_M_reg: int = None, gpr_N_reg: int = None) -> None:
-        """Transpose ``M×N`` → ``N×M``. ``use_pbi``: :meth:`bf16_transpose_core_pbi` vs :meth:`bf16_transpose_core_legacy`."""
-        if gpr_M_reg is not None:
-            return self.bf16_transpose_core_pbi(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR, gpr_M_reg, gpr_N_reg)
+    def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, gpr_M_reg: int = None, gpr_N_reg: int = None) -> None:
+        """Transpose ``M×N`` → ``N×M``. Routes to :meth:`bf16_transpose_dynamic_core` when any gpr param is set, else :meth:`bf16_transpose_core_legacy`."""
+        if gpr_M_reg is not None or gpr_N_reg is not None:
+            return self.bf16_transpose_dynamic_core(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR, gpr_M_reg, gpr_N_reg)
         return self.bf16_transpose_core_legacy(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR)
 
     def bf16_transpose_core_legacy(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None) -> None:
@@ -5542,7 +4878,7 @@ class UnifiedEngine:
 
         # No FLOPS for this operation
     
-    def bf16_transpose_core_pbi(self, M_fallback: int, N_fallback: int,
+    def bf16_transpose_dynamic_core(self, M_fallback: int, N_fallback: int,
                                     INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                                     IDENTITY_DRAM_ADDR: int = None,
                                     gpr_M_reg: int = None, gpr_N_reg: int = None) -> None:
@@ -5586,7 +4922,7 @@ class UnifiedEngine:
         """
         bytes_per_element = 2
 
-        assert gpr_M_reg is not None, "bf16_transpose_core_pbi requires gpr_M_reg (dynamic M)."
+        assert gpr_M_reg is not None, "bf16_transpose_dynamic_core requires gpr_M_reg (dynamic M)."
 
         # Dynamic N is enabled when the caller supplies gpr_N_reg. The column-gather matvec's
         # uram_row_stride_z (= N/64) is held in pointer-row field 10 (URAM_ROW_STRIDE_Z) and
@@ -5982,7 +5318,7 @@ class UnifiedEngine:
                             gpr_seq_len: int = None):
         """Flash attention entrypoint.
 
-        - ``gpr_seq_len`` is a GPR index (1..15): :meth:`flash_attention_core_pbi` — single dynamic
+        - ``gpr_seq_len`` is a GPR index (1..15): :meth:`flash_attention_dynamic_core` — single dynamic
           ISA body, seq_len read from the GPR at execute time. ``seq_len`` is a compile-time hint for
           FLOPS accounting and address layout (pass the maximum expected seq_len). Requires
           ``ATTN_P_DRAM_ADDR``. Returns ``int`` FLOPS.
@@ -5995,7 +5331,7 @@ class UnifiedEngine:
                     "flash_attention_core: gpr_seq_len dynamic path requires ATTN_P_DRAM_ADDR "
                     f"(allocate seq_len*seq_len BF16s, i.e. {seq_len * seq_len * 2} bytes)"
                 )
-            return self.flash_attention_core_pbi(
+            return self.flash_attention_dynamic_core(
                 head_dim=head_dim,
                 seq_len=seq_len,
                 Q_DRAM_ADDR=Q_DRAM_ADDR,
@@ -6292,7 +5628,7 @@ class UnifiedEngine:
         print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
         return total_flops
 
-    def flash_attention_core_pbi(self, head_dim: int, seq_len: int,
+    def flash_attention_dynamic_core(self, head_dim: int, seq_len: int,
                                  Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int,
                                  OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, ATTN_P_DRAM_ADDR: int,
                                  IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
@@ -6306,7 +5642,7 @@ class UnifiedEngine:
         Emits a single ISA body: Vᵀ transpose → Q-scale loop → Q@Kᵀ+softmax → P@Vᵀ.
         """
         if gpr_seq_len is None:
-            raise ValueError("flash_attention_core_pbi requires gpr_seq_len; for static seq_len use flash_attention_core_legacy")
+            raise ValueError("flash_attention_dynamic_core requires gpr_seq_len; for static seq_len use flash_attention_core_legacy")
 
         bytes_per_element = 2
         bias_enable = BIAS_DRAM_ADDR is not None
@@ -6316,11 +5652,11 @@ class UnifiedEngine:
 
         if N % UE_VECTOR_SIZE != 0:
             raise ValueError(
-                f"flash_attention_core_pbi: fused softmax requires seq_len % UE_VECTOR_SIZE == 0, got seq_len={N}"
+                f"flash_attention_dynamic_core: fused softmax requires seq_len % UE_VECTOR_SIZE == 0, got seq_len={N}"
             )
 
         # V (seq_len × head_dim) → V^T at SCRATCH_DRAM_ADDR (head_dim × seq_len)
-        self.bf16_transpose_core_pbi(
+        self.bf16_transpose_dynamic_core(
             M_fallback=seq_len, N_fallback=head_dim,
             INPUT_DRAM_ADDR=V_DRAM_ADDR, OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
             IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR, gpr_M_reg=gpr_seq_len,
@@ -6332,7 +5668,7 @@ class UnifiedEngine:
         vector_sram_addr = 0x00000
         if qk_k > URAM_NEAR_FULL_ELEMENTS:
             raise ValueError(
-                f"flash_attention_core_pbi: head_dim={qk_k} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS} "
+                f"flash_attention_dynamic_core: head_dim={qk_k} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS} "
                 "(ISA Q-scale loop stages one full row in URAM)"
             )
 
@@ -6371,7 +5707,7 @@ class UnifiedEngine:
             element_size=0, inst_pointer_idx=row_store_ptr,
         )
         q_scale_loop_size = self.loop_end()
-        print(f"flash_attention_core_pbi Q-scale loop body: {q_scale_loop_size} instructions (M={M}, head_dim={qk_k})")
+        print(f"flash_attention_dynamic_core Q-scale loop body: {q_scale_loop_size} instructions (M={M}, head_dim={qk_k})")
         assert q_scale_loop_size <= 256, f"Q-scale ISA loop body {q_scale_loop_size} exceeds i-cache 256"
         self.release_inst_ptr(row_store_ptr)
         self.release_inst_ptr(row_load_ptr)
@@ -6400,7 +5736,7 @@ class UnifiedEngine:
             total_flops += seq_len * seq_len
         total_flops += seq_len * seq_len * 5
         total_flops += 2 * seq_len * seq_len * head_dim
-        print(f"flash_attention_core_pbi: seq_len ref={seq_len}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
+        print(f"flash_attention_dynamic_core: seq_len ref={seq_len}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
         return total_flops
 
     # =========================================================================
@@ -6424,7 +5760,7 @@ class UnifiedEngine:
     ):
         """Decoder group attention entrypoint.
 
-        - ``gpr_seq_len`` is a GPR index (1..15): :meth:`decoder_group_attention_core_pbi` — single
+        - ``gpr_seq_len`` is a GPR index (1..15): :meth:`decoder_group_attention_dynamic_core` — single
           dynamic ISA body, seq_len read from the GPR at execute time. ``seq_len`` must equal the
           maximum seq_len so Python-level SCRATCH sub-address layout (Vᵀ / score / scaled_q) stays
           within the allocation. Returns ``int`` FLOPS.
@@ -6432,7 +5768,7 @@ class UnifiedEngine:
           single ``seq_len`` body.
         """
         if gpr_seq_len is not None:
-            return self.decoder_group_attention_core_pbi(
+            return self.decoder_group_attention_dynamic_core(
                 group_size=group_size,
                 head_dim=head_dim,
                 seq_len=seq_len,
@@ -6748,7 +6084,7 @@ class UnifiedEngine:
             total_flops += group_flops
         return total_flops
 
-    def decoder_group_attention_core_pbi(
+    def decoder_group_attention_dynamic_core(
         self,
         group_size: int,
         head_dim: int,
@@ -6774,14 +6110,14 @@ class UnifiedEngine:
           [.. +group_size*head_dim*2)             → scaled_q (group_size × head_dim)
         """
         if gpr_seq_len is None:
-            raise ValueError("decoder_group_attention_core_pbi requires gpr_seq_len; for static seq_len use decoder_group_attention_core_legacy")
+            raise ValueError("decoder_group_attention_dynamic_core requires gpr_seq_len; for static seq_len use decoder_group_attention_core_legacy")
 
         bytes_per_element = self.bytes_per_element
         score_dram_addr = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element
         scaled_q_dram_addr = score_dram_addr + group_size * seq_len * bytes_per_element
 
         # V (seq_len × head_dim) → V^T at SCRATCH_DRAM_ADDR (head_dim × seq_len)
-        self.bf16_transpose_core_pbi(
+        self.bf16_transpose_dynamic_core(
             M_fallback=seq_len, N_fallback=head_dim,
             INPUT_DRAM_ADDR=V_DRAM_ADDR, OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
             IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR, gpr_M_reg=gpr_seq_len,
@@ -6830,7 +6166,7 @@ class UnifiedEngine:
         group_flops += 1 * seq_len * 5
         group_flops += 2 * 1 * seq_len * head_dim
         total_flops = group_size * group_flops
-        print(f"decoder_group_attention_core_pbi: seq_len ref={seq_len}, group_size={group_size}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
+        print(f"decoder_group_attention_dynamic_core: seq_len ref={seq_len}, group_size={group_size}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
         return total_flops
 
     def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, write_back_disable: bool = False) -> None:
@@ -7458,8 +6794,8 @@ class UnifiedEngine:
 
         - :meth:`generate_instruction_halt` (program-end alignment)
         - :meth:`write_captured_instructions_to_dram` (DRAM-flush alignment)
-        - bucket dispatchers (:meth:`flash_attention_core_pbi`,
-          :meth:`decoder_group_attention_core_pbi`) before each bucket body's entry point.
+        - bucket dispatchers (:meth:`flash_attention_dynamic_core`,
+          :meth:`decoder_group_attention_dynamic_core`) before each bucket body's entry point.
 
         :meth:`_generate_instruction_jump` has its own related logic that adjusts the **jump
         target** address (not the current capture position), which is a different concern.
@@ -7950,7 +7286,7 @@ class UnifiedEngine:
         Layout (see :meth:`ue_isa_descriptor`): immediate occupies bits [82:51] split as
         ``w[1][31:19]`` (low 13) and ``w[2][18:0]`` (high 19).
 
-        Used by :meth:`flash_attention_core_pbi` bucketization to fill placeholder JZ /
+        Used by :meth:`flash_attention_dynamic_core` bucketization to fill placeholder JZ /
         JMP targets after forward bucket-entry and end-label addresses become known.
         """
         if self.capture_buffer is None or capture_idx < 0 or capture_idx >= len(self.capture_buffer):

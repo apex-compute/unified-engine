@@ -599,12 +599,12 @@ def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = Fal
     ue1.reset_tensor_dram_addr()
     ue1.clear_capture_buffer()
 
-def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False, use_pbi: bool = False, force_legacy: bool = False):
+def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False, use_dynamic: bool = False, force_legacy: bool = False):
     """
     Tests flash attention core.
 
-    - ``use_pbi=True`` and ``force_legacy=False``: emits the single dynamic ISA body via
-      :meth:`~UnifiedEngine.flash_attention_core_pbi`; a seq-len GPR is primed with
+    - ``use_dynamic=True`` and ``force_legacy=False``: emits the single dynamic ISA body via
+      :meth:`~UnifiedEngine.flash_attention_dynamic_core`; a seq-len GPR is primed with
       ``seq_len_padded`` before the ISA body runs. Requires ``ATTN_P_DRAM_ADDR`` (``seq_len**2``
       BF16s).
     - Otherwise: :meth:`~UnifiedEngine.flash_attention_core_legacy` — static single ``seq_len``
@@ -622,7 +622,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
     # A mask bias is required whenever key positions are padded out.
     bias_mask_needed = bias_enable or needs_padding
 
-    use_dynamic = use_pbi and not force_legacy
+    use_dynamic = use_dynamic and not force_legacy
 
     Q_DRAM_ADDR = ue.allocate_tensor_dram(seq_len_padded * head_dim * 2)
     K_DRAM_ADDR = ue.allocate_tensor_dram(seq_len_padded * head_dim * 2)
@@ -703,7 +703,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
     ue.wait_queue(50.0) # 30 seconds timeout
     ue.report_timing_and_instruction_count()
 
-    trace_suffix = "_pbi" if use_pbi else ""
+    trace_suffix = "_dynamic" if use_dynamic else ""
     generate_trace(ue, f"flash_attention_core_trace_{head_dim}_{seq_len}_{'bias_enabled' if bias_enable else 'bias_disabled'}{trace_suffix}.csv")
 
     output_padded = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (seq_len_padded, head_dim))
@@ -715,7 +715,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
 
     executed_flops = total_flops_from_flash_attention
     report_flop_rate_gflops, report_gflops_ratio = ue.report_flop_rate_gflops(executed_flops)
-    print(f"Report FLOPS for Flash Attention: {report_flop_rate_gflops:.2f} GFLOPS, {report_gflops_ratio:.2f}% peak throughput for head_dim={head_dim} and seq_len={seq_len} and bias_enable={bias_enable} and use_pbi={use_pbi}")
+    print(f"Report FLOPS for Flash Attention: {report_flop_rate_gflops:.2f} GFLOPS, {report_gflops_ratio:.2f}% peak throughput for head_dim={head_dim} and seq_len={seq_len} and bias_enable={bias_enable} and use_dynamic={use_dynamic}")
 
     # Reference calculation (CPU) — use padded inputs + same mask so reference matches HW output
     start_time = time.time()
@@ -742,7 +742,7 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
     print(f"Reference SNR Analysis for Flash Attention: {snr_db_ref:.2f} dB")
     assert snr_db_ref >= 38 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 38 dB"
 
-    _fa_tag = "+dynamic" if use_pbi else ""
+    _fa_tag = "+dynamic" if use_dynamic else ""
     record_test(f"flash_attention{'+bias' if bias_enable else ''}{_fa_tag}",
                 f"head_dim={head_dim}, seq_len={seq_len}",
                 snr_db=snr_db_ref,
@@ -754,20 +754,20 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
     ue.reset_tensor_dram_addr()
     ue.reset_program_dram_addr()
 
-def decoder_group_attention_test(head_dim: int = 256, seq_len: int = 8192, use_pbi: bool = False, force_legacy: bool = False, group_size: int = 4):
+def decoder_group_attention_test(head_dim: int = 256, seq_len: int = 8192, use_dynamic: bool = False, force_legacy: bool = False, group_size: int = 4):
     """
     Tests decoder group attention core (single-query GQA, used in autoregressive decode).
     Bias is always enabled and group_size is fixed to 4.
 
-    - ``use_pbi=True`` and ``force_legacy=False``: emits the single dynamic ISA body via
-      :meth:`~UnifiedEngine.decoder_group_attention_core_pbi`; a seq-len GPR is primed with
+    - ``use_dynamic=True`` and ``force_legacy=False``: emits the single dynamic ISA body via
+      :meth:`~UnifiedEngine.decoder_group_attention_dynamic_core`; a seq-len GPR is primed with
       ``seq_len`` before the ISA body runs.
     - Otherwise: :meth:`~UnifiedEngine.decoder_group_attention_core_legacy` — static body.
     """
     ue = UnifiedEngine()
     ue.bytes_per_element = 2
 
-    use_dynamic = use_pbi and not force_legacy
+    use_dynamic = use_dynamic and not force_legacy
 
     Q_DRAM_ADDR = ue.allocate_tensor_dram(group_size * head_dim * ue.bytes_per_element)
     K_DRAM_ADDR = ue.allocate_tensor_dram(seq_len * head_dim * ue.bytes_per_element)
@@ -827,7 +827,7 @@ def decoder_group_attention_test(head_dim: int = 256, seq_len: int = 8192, use_p
     print(
         f"Report FLOPS for Decoder Group Attention: {report_flop_rate_gflops:.2f} GFLOPS, "
         f"{report_gflops_ratio:.2f}% peak throughput for head_dim={head_dim}, seq_len={seq_len}, "
-        f"group_size={group_size}, use_pbi={use_pbi}"
+        f"group_size={group_size}, use_dynamic={use_dynamic}"
     )
 
     q_scaled = q * (1 / math.sqrt(head_dim))
@@ -840,7 +840,7 @@ def decoder_group_attention_test(head_dim: int = 256, seq_len: int = 8192, use_p
     print(f"Reference SNR Analysis for Decoder Group Attention: {snr_db_ref:.2f} dB")
     assert snr_db_ref >= 32 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 32 dB"
 
-    tag = "+pbi" if (use_pbi and not force_legacy) else ("+pbi+legacy_body" if (use_pbi and force_legacy) else "")
+    tag = "+dynamic" if (use_dynamic and not force_legacy) else ("+dynamic+legacy_body" if (use_dynamic and force_legacy) else "")
     record_test(
         f"decoder_group_attention{tag}",
         f"group_size={group_size}, head_dim={head_dim}, seq_len={seq_len}",
@@ -1097,16 +1097,16 @@ def matmat_mul_dynamic_mkn_test(
     N_template = UE_VECTOR_SIZE
 
     # =========================================================================
-    # Interleaved loop — one fresh engine per run, PBI then legacy per (m, k, n)
+    # Interleaved loop — one fresh engine per run, dynamic then legacy per (m, k, n)
     # =========================================================================
     print(f"\n{'#'*64}")
-    print(f"# PBI dynamic [{tag}] template M={M_template}, K={K_template}, N={N_template}")
+    print(f"# Dynamic [{tag}] template M={M_template}, K={K_template}, N={N_template}")
     if compare_legacy:
         print(f"# (interleaved with legacy runs)")
     print(f"{'#'*64}")
 
-    def _run_pbi(m, k, n):
-        print(f"\n{'='*64}\n[PBI] m={m}, k={k}, n={n}")
+    def _run_dynamic(m, k, n):
+        print(f"\n{'='*64}\n[Dynamic] m={m}, k={k}, n={n}")
 
         ue = UnifiedEngine()
 
@@ -1193,7 +1193,7 @@ def matmat_mul_dynamic_mkn_test(
         if log_enable:                                      iter_flops += 2 * m * n
 
         report_gflops, flops_ratio = ue.report_flop_rate_gflops(iter_flops)
-        print(f"[PBI] {report_gflops:.2f} GFLOPS ({flops_ratio:.2f}% peak), "
+        print(f"[Dynamic] {report_gflops:.2f} GFLOPS ({flops_ratio:.2f}% peak), "
               f"{main_instruction_size // 32} instructions")
 
         output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (m, n))
@@ -1206,13 +1206,13 @@ def matmat_mul_dynamic_mkn_test(
             ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
 
         snr_db = calculate_snr(ref, output)
-        print(f"[PBI] SNR: {snr_db:.2f} dB")
+        print(f"[Dynamic] SNR: {snr_db:.2f} dB")
         assert snr_db >= snr_threshold_db or snr_db == float("inf"), (
-            f"[PBI] m={m}, k={k}, n={n}: SNR {snr_db:.2f} dB below {snr_threshold_db:g} dB"
+            f"[Dynamic] m={m}, k={k}, n={n}: SNR {snr_db:.2f} dB below {snr_threshold_db:g} dB"
         )
 
         record_test(
-            f"matmat_mul{_flags(f'pbi+dynamic_{tag}')}",
+            f"matmat_mul{_flags(f'dynamic_{tag}')}",
             f"m={m}, k={k}, n={n}",
             snr_db=snr_db, gflops=report_gflops, inst_bytes=main_instruction_size,
         )
@@ -1321,7 +1321,7 @@ def matmat_mul_dynamic_mkn_test(
 
     for (m, k, n) in runtime_list:
         rng_state = _capture_rng_state() if compare_legacy else None
-        _run_pbi(m, k, n)
+        _run_dynamic(m, k, n)
         if compare_legacy:
             _restore_rng_state(rng_state)
             _run_legacy(m, k, n)
@@ -1401,15 +1401,15 @@ def rms_norm_test(shape: tuple, use_pbi: bool = False):
     ue.reset_tensor_dram_addr()
 
 def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool = False,
-                    use_pbi: bool = False):
+                    use_dynamic: bool = False):
     """Tests layer_norm_core_dram.
 
-    When ``use_pbi=True``, primes GPR 8 with the chunk count ``M // chunk_size`` (where
+    When ``use_dynamic=True``, primes GPR 8 with the chunk count ``M // chunk_size`` (where
     ``chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, M)``) and routes to
     :meth:`layer_norm_core_dram_pbi`.  The PBI loop loads/stores ``chunk_size`` rows per DMA
     call — identical granularity to the legacy path — so performance is on par while the
     program shrinks from ~M*6 to ~chunk_size*6+4 instructions.
-    When ``use_pbi=False`` the wrapper routes to the legacy compile-time path.
+    When ``use_dynamic=False`` the wrapper routes to the legacy compile-time path.
     """
     ue = UnifiedEngine()
 
@@ -1426,7 +1426,7 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     _GPR_M_REG = 8  # fixed GPR; stays clear of loop_start internal registers
 
     ue.start_capture()
-    if use_pbi:
+    if use_dynamic:
         # Must mirror the chunk_size logic in layer_norm_core_dram_pbi exactly.
         _ops = 4 + (1 if gamma_enable else 0) + (1 if beta_enable else 0)
         _ideal = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256 - 4) // _ops)
@@ -1440,7 +1440,7 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
         OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
         GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
         BETA_DRAM_ADDR=BETA_DRAM_ADDR,
-        gpr_M_reg=_GPR_M_REG if use_pbi else None,
+        gpr_M_reg=_GPR_M_REG if use_dynamic else None,
     )
     ue.stop_capture()
     ue.generate_instruction_halt()
@@ -1466,7 +1466,7 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
 
     flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
     print(
-        f"Report FLOPS for Layer Norm{'(PBI)' if use_pbi else ''}: "
+        f"Report FLOPS for Layer Norm{'(PBI)' if use_dynamic else ''}: "
         f"{flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for "
         f"M={M}, N={N}, gamma={gamma_enable}, beta={beta_enable}"
     )
@@ -1486,7 +1486,7 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     if gamma_enable: flags.append("gamma")
     if beta_enable:  flags.append("beta")
     flag_str = ("+" + "+".join(flags)) if flags else ""
-    test_name = f"layer_norm{'_pbi' if use_pbi else ''}{flag_str}"
+    test_name = f"layer_norm{'_pbi' if use_dynamic else ''}{flag_str}"
     record_test(test_name, f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops,
                 inst_bytes=instruction_size_bytes)
 
@@ -4206,9 +4206,9 @@ def bf16_transpose_dynamic_test(
     dyn_N: bool = False,
     snr_threshold_db: float = 40.0,
 ):
-    """Compile `bf16_transpose_core_pbi` ONCE with template (M, N) + chosen
+    """Compile `bf16_transpose_dynamic_core` ONCE with template (M, N) + chosen
     dynamic-dimension register(s), then re-run it for every `m` in `M_runtime_values`.
-    Each PBI run is paired with a legacy compile-time run on the same random data so
+    Each dynamic run is paired with a legacy compile-time run on the same random data so
     the summary table can show SNR and GFLOPS diffs side-by-side.
     """
     assert M_runtime_values, "M_runtime_values must be non-empty"
@@ -4228,15 +4228,15 @@ def bf16_transpose_dynamic_test(
     N_template = UE_VECTOR_SIZE if dyn_N else N
 
     # =========================================================================
-    # Interleaved loop — one fresh engine per run, PBI then legacy per (m, N)
+    # Interleaved loop — one fresh engine per run, dynamic then legacy per (m, N)
     # =========================================================================
     print(f"\n{'#'*64}")
-    print(f"# PBI transpose dynamic [{tag}] template M={M_template}, N={N_template}")
+    print(f"# Dynamic transpose [{tag}] template M={M_template}, N={N_template}")
     print(f"# (interleaved with legacy runs)")
     print(f"{'#'*64}")
 
-    def _run_pbi(m):
-        print(f"\n{'='*64}\n[PBI] m={m}, N={N}")
+    def _run_dynamic(m):
+        print(f"\n{'='*64}\n[Dynamic] m={m}, N={N}")
 
         ue = UnifiedEngine()
 
@@ -4251,7 +4251,7 @@ def bf16_transpose_dynamic_test(
 
         # 1. Compile Main Body ONCE
         ue.start_capture()
-        ue.bf16_transpose_core_pbi(
+        ue.bf16_transpose_dynamic_core(
             M_fallback=M_template, N_fallback=N_template,
             INPUT_DRAM_ADDR=INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
             gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg
@@ -4293,11 +4293,11 @@ def bf16_transpose_dynamic_test(
         output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (N, m))
         snr_db = calculate_snr(x.T, output)
 
-        print(f"[PBI] m={m}: SNR {snr_db:.2f} dB, {mb_per_s:.2f} MB/s, "
+        print(f"[Dynamic] m={m}: SNR {snr_db:.2f} dB, {mb_per_s:.2f} MB/s, "
               f"{main_instruction_size // 32} body instructions")
         
         assert snr_db >= snr_threshold_db or snr_db == float("inf"), (
-            f"[PBI] transpose m={m}, N={N}: SNR {snr_db:.2f} dB below {snr_threshold_db:g} dB"
+            f"[Dynamic] transpose m={m}, N={N}: SNR {snr_db:.2f} dB below {snr_threshold_db:g} dB"
         )
 
         # Record under a name whose +dynamic-stripped form ("bf16_transpose+pbi+") does NOT
@@ -4306,7 +4306,7 @@ def bf16_transpose_dynamic_test(
         # legacy row with a diff column. (Stripping "+dynamic" from the old
         # "bf16_transpose+legacy+dynamic" yielded "bf16_transpose+legacy" → collision → merge.)
         record_test(
-            "bf16_transpose+pbi+dynamic",
+            "bf16_transpose+dynamic",
             f"M={m}, N={N}",
             snr_db=snr_db, gflops=gflops_rate, mb_per_s=mb_per_s, inst_bytes=main_instruction_size,
         )
@@ -4369,7 +4369,7 @@ def bf16_transpose_dynamic_test(
     # --- Run Interleaved Sweeps ---
     for m in M_runtime_values:
         _run_rng_matched_pair(
-            lambda m=m: _run_pbi(m),
+            lambda m=m: _run_dynamic(m),
             lambda m=m: _run_legacy(m),
         )
 
@@ -5518,25 +5518,25 @@ if __name__ == "__main__":
 
     _run_rng_matched_pair(
         lambda: flash_attention_test(head_dim=128, seq_len=1024),
-        lambda: flash_attention_test(head_dim=128, seq_len=1024, use_pbi=True),
+        lambda: flash_attention_test(head_dim=128, seq_len=1024, use_dynamic=True),
     )
     _run_rng_matched_pair(
         lambda: flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True),
-        lambda: flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True, use_pbi=True),
+        lambda: flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True, use_dynamic=True),
     )
     decoder_group_attention_test(head_dim=128, seq_len=1024)
-    decoder_group_attention_test(head_dim=128, seq_len=1024, use_pbi=True)
+    decoder_group_attention_test(head_dim=128, seq_len=1024, use_dynamic=True)
     decoder_group_attention_test(head_dim=256, seq_len=2048)
-    decoder_group_attention_test(head_dim=256, seq_len=2048, use_pbi=True)
+    decoder_group_attention_test(head_dim=256, seq_len=2048, use_dynamic=True)
     
     # --- Additional coverage: extra dimension/feature combinations ---
     rms_norm_test(shape=(768, 1024))
     rms_norm_test(shape=(2048, 2048))
     layer_norm_test(shape=(1024, 1024), gamma_enable=True)
-    layer_norm_test(shape=(1024, 1024), gamma_enable=True, use_pbi=True)
+    layer_norm_test(shape=(1024, 1024), gamma_enable=True, use_dynamic=True)
     layer_norm_test(shape=(1024, 1024), beta_enable=True)
-    layer_norm_test(shape=(1024, 1024), beta_enable=True, use_pbi=True)
-    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True, use_pbi=True)
+    layer_norm_test(shape=(1024, 1024), beta_enable=True, use_dynamic=True)
+    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True, use_dynamic=True)
     bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
     matmat_mul_test(M=512, K=2048, N=2048)
     matmat_mul_test(M=128, K=4096, N=512, gelu_enable=True)
@@ -5638,20 +5638,20 @@ if __name__ == "__main__":
                         for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
                             quantized_matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
 
-        # flash_attention: full coverage — head_dim × seq_len × bias × use_pbi.
+        # flash_attention: full coverage — head_dim × seq_len × bias × use_dynamic.
         for head_dim in [64, 128, 256, 512, 1024]:
             for seq_len in [64, 256, 512, 1024, 4096, 8192-64]: # Reminder: seq_len=8192 breaks on 512-b dram setup
                 for bias_enable in [True, False]:
                     _run_rng_matched_pair(
-                        lambda: flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable, use_pbi=False),
-                        lambda: flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable, use_pbi=True),
+                        lambda: flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable, use_dynamic=False),
+                        lambda: flash_attention_test(head_dim=head_dim, seq_len=seq_len, bias_enable=bias_enable, use_dynamic=True),
                     )
 
         # decoder_group_attention: same head_dim × seq_len coverage, no bias parameter.
         for head_dim in [64, 128, 256, 512, 1024]:
             for seq_len in [64, 256, 512, 1024, 4096, 8192-64]: # Reminder: seq_len=8192 breaks on 512-b dram setup
-                decoder_group_attention_test(head_dim, seq_len, use_pbi=False)
-                decoder_group_attention_test(head_dim, seq_len, use_pbi=True)
+                decoder_group_attention_test(head_dim, seq_len, use_dynamic=False)
+                decoder_group_attention_test(head_dim, seq_len, use_dynamic=True)
 
         # layer_norm / rms_norm: M and N sweep using the same dim ladder as flash_attention.
         _NORM_DIMS = [64, 256, 512, 1024, 4096, 8192]

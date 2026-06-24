@@ -10,8 +10,7 @@ clean:
 	rm -f user_dma_core
 	rm -f *.mcs *.prm *.jou *.log *.json *.csv
 	rm -rf andromeda_IP-* andromeda_wrapper-*
-	rm -f models/gemma3/gemma3_bin/gemma3_instruction*
-	rm -f models/gemma3/gemma3_bin/gemma3_profile_instruction*
+	rm -f models/gemma3/gemma3_bin/program*
 	rm -rf models/gpt2/gpt2_bin/
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
