@@ -839,7 +839,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        allowed_hw_versions = {0x75705d47}
+        allowed_hw_versions = {0x5f9f99db}
         if CURRENT_DEVICE == "efinix":
             allowed_hw_versions.add(0x12345678)
         assert hw_version in allowed_hw_versions, (
@@ -2780,7 +2780,7 @@ class UnifiedEngine:
 
     def layer_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                                  GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
-                                 gpr_M_reg: int = None) -> int:
+                                 gpr_M_reg: int = None, ZEROS_DRAM_ADDR: int = None) -> int:
         """PBI-backed layer norm.  Matches the legacy's chunk-tiled DMA granularity so performance
         is on par, while the captured program shrinks from ~M*6 instructions to ~chunk_size*6+4.
 
@@ -2837,9 +2837,12 @@ class UnifiedEngine:
         gamma_sram_addr = None
         beta_sram_addr  = None
 
-        zeros_dram_addr = self.get_params_dram_addr()
-        self.allocate_params_dram(N * bpe)
-        self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * bpe)
+        if ZEROS_DRAM_ADDR is not None:
+            zeros_dram_addr = ZEROS_DRAM_ADDR          # caller-supplied shared zeros buffer
+        else:
+            zeros_dram_addr = self.get_params_dram_addr()
+            self.allocate_params_dram(N * bpe)
+            self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * bpe)
 
         self.accelerator_memory_to_sram(accelerator_dram_address=zeros_dram_addr,
                                         sram_address=zeros_sram_addr, element_size=N)
@@ -2939,15 +2942,19 @@ class UnifiedEngine:
         return total_flops
 
     def layer_norm_core_dram_legacy(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                                     GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None) -> int:
+                                     GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
+                                     ZEROS_DRAM_ADDR: int = None) -> int:
         """
         Legacy layer norm DRAM path: compile-time chunk-tiled, M-unrolled.
         """
         zeros_sram_addr = 0x80000
 
-        zeros_dram_addr = self.get_params_dram_addr()
-        self.allocate_params_dram(N * 2)
-        self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * 2)
+        if ZEROS_DRAM_ADDR is not None:
+            zeros_dram_addr = ZEROS_DRAM_ADDR          # caller-supplied shared zeros buffer
+        else:
+            zeros_dram_addr = self.get_params_dram_addr()
+            self.allocate_params_dram(N * 2)
+            self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * 2)
 
         # These are small enough to fit in URAM_B, the layout zeros + gamma + beta
         self.accelerator_memory_to_sram(accelerator_dram_address=zeros_dram_addr,
@@ -3000,7 +3007,7 @@ class UnifiedEngine:
 
     def layer_norm_core_dram(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                               GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
-                              gpr_M_reg: Optional[int] = None) -> int:
+                              gpr_M_reg: Optional[int] = None, ZEROS_DRAM_ADDR: int = None) -> int:
         """Layer norm DRAM entrypoint; dispatches based on ``gpr_M_reg``:
 
         - ``gpr_M_reg`` is a GPR index (1..15): :meth:`layer_norm_core_dram_pbi` — outer row loop
@@ -3014,12 +3021,13 @@ class UnifiedEngine:
                 M=M, N=N,
                 A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR,
-                gpr_M_reg=gpr_M_reg,
+                gpr_M_reg=gpr_M_reg, ZEROS_DRAM_ADDR=ZEROS_DRAM_ADDR,
             )
         return self.layer_norm_core_dram_legacy(
             M=M, N=N,
             A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
             GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR,
+            ZEROS_DRAM_ADDR=ZEROS_DRAM_ADDR,
         )
 
 

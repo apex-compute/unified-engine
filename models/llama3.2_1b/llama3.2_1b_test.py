@@ -18,7 +18,7 @@ Architecture differences vs Gemma3:
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
 Weights:
-  - Default: llama3.2_1b_bin/weights_llama3.2_1b_hf.bin (generated from HF model if missing).
+  - Default: llama3.2_1b_bin/params.bin (generated from HF model if missing).
   - --local-weights: use llama3.2_1b_bin/full_model_weights.bin instead.
 
 Usage:
@@ -97,7 +97,7 @@ def _rope_kv_perm(num_kv_heads: int, actual_head_dim: int) -> torch.Tensor:
 
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_llama3.2_1b_hf.bin from HuggingFace model per llama3.2_1b_config.json layout.
+    """Generate params.bin from HuggingFace model per llama3.2_1b_config.json layout.
     Returns the path to the written file."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -265,7 +265,12 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
     with open(out_path, "wb") as f:
         f.write(buf)
+    meta_path = paths.get("params_meta")
+    meta_full = os.path.join(script_dir, meta_path) if meta_path else os.path.splitext(out_path)[0] + ".json"
+    with open(meta_full, "w") as f:
+        json.dump({"size": len(buf), "num_layers": num_layers, "layer_size": LAYER_WEIGHT_SIZE}, f, indent=2)
     print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
+    print(f"Generated params meta: {meta_full}")
     return out_path
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
@@ -1069,26 +1074,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size == self.LAYER_SIZE:
             total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
-            if bool(getattr(self, "fpga_penalty", False)):
-                # On-FPGA repetition penalty: feed the per-vocab penalty as the matmul C bias
-                # (bias_mode="broadcast_N" → bias[t] added to logit[t]) so the on-chip argmax
-                # returns the PENALIZED token id directly. No logit writeback (the host reads the
-                # argmax register, not the row). Host maintains PENALTY_BIAS_DRAM with +/-alpha
-                # writes. See notes_repetition_penalty_fpga_bias.md.
-                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
-                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                    write_back_disable=True)
-            else:
-                # Plain bin (--pure-greedy): no bias, full vocab-logits row written to DRAM
-                # (writeback ON). Used for the greedy A/B baseline and as the logit source for the
-                # compare/calibration tool (compare/compare_llama3.2_1b_penalty.py), which reads
-                # LOGITS_DRAM and applies the penalty on host. No host penalty runs in production.
-                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
-                    write_back_disable=False)
+            penalty_kwargs = dict(C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N") \
+                if bool(getattr(self, "fpga_penalty", False)) else {}
+            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
+                write_back_disable=True, **penalty_kwargs)
 
         self.generate_instruction_halt()
         self.pad_capture_to_64b_boundary()
@@ -1143,16 +1134,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
         paths_cfg = self._cfg.get("paths", {})
-        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_1b_bin/llama_instruction.bin"))
-        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
-        if bool(getattr(self, "fpga_penalty", False)):
-            # On-FPGA penalty changes the LM-head matmul (bias on / writeback off) → a different
-            # bin. Use a separate cache file so it never clobbers the shipped host-path bin.
-            instruction_bin_path = instruction_bin_path.replace(".bin", "_fpgapenalty.bin")
-            instruction_meta_path = instruction_meta_path.replace(".json", "_fpgapenalty.json")
-            self._instruction_bin_path = instruction_bin_path
-            self._instruction_meta_path = instruction_meta_path
-        if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
+        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_1b_bin/programs.bin"))
+        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
+        # Single programs.bin: fpga_penalty and profile modes share one output path; rebuild as needed.
+        self._instruction_bin_path = instruction_bin_path
+        self._instruction_meta_path = instruction_meta_path
+        if not profile and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
             return
@@ -1287,7 +1274,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """Load the profile instruction image, run prefill + one profiled decoder step,
         and print a per-step latency breakdown for the decoder.
         """
-        profile_meta_path = os.path.join(self.script_dir, "llama3.2_1b_bin/llama_profile_instruction.json")
+        paths_cfg = self._cfg.get("paths", {})
+        profile_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
         with open(profile_meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1395,7 +1383,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         paths_cfg = self._cfg.get("paths", {})
         # With the on-FPGA penalty (default) use the penalty-specific bin/meta compile_llama produced.
         meta_path = getattr(self, "_instruction_meta_path", None) or \
-            os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
+            os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1455,6 +1443,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         print("--- Starting decoder ---")
         hw_decode_lats_us: list[float] = []
+        decoded_chars: list[str] = []
         timer = time.perf_counter()
         token_id = self.prefill_seq[-1]
         _llama_stop_tokens = {128001, 128008, self._end_of_turn_token_id}
@@ -1553,6 +1542,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
+            decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
@@ -1575,6 +1565,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _original_print(f"Decode 1st token  : HW={hw_decode_first_ms:,.1f} ms/tok  ({1000/hw_decode_first_ms:.2f} tok/s)")
         _original_print(f"Decode  ({tokens_decoded} tokens): HW={hw_decode_avg_ms:,.1f} ms/tok  CPU={cpu_decode_avg_ms:,.1f} ms/tok  ({tokens_decoded/latency_decoder:.2f} tok/s)")
 
+        return {
+            "prefill_tokens": prefill_seq_len,
+            "decoded_text": "".join(decoded_chars),
+            "decoded_tokens": tokens_decoded,
+            "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
+            "decode_speed_tok_s": round(tokens_decoded / latency_decoder, 2),
+            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
+            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
+        }
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -1591,15 +1591,15 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
-    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")
-    parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0). Ignored for --device efinix.')
+    parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")  # legacy dev path; not in standard bin set
+    parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
-    # fully deterministic (separate _fpgapenalty bin). --pure-greedy disables it entirely.
+    # fully deterministic. --pure-greedy disables it entirely.
     parser.add_argument('--pure-greedy', action='store_true',
                         help='Disable the on-FPGA repetition penalty entirely — plain greedy decode '
                              '(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy '
@@ -1622,7 +1622,7 @@ def main():
     if args.local_weights:
         weights_bin_rel = "llama3.2_1b_bin/full_model_weights.bin"
     else:
-        weights_bin_rel = "llama3.2_1b_bin/weights_llama3.2_1b_hf.bin"
+        weights_bin_rel = "llama3.2_1b_bin/params.bin"
         weights_bin_full = os.path.join(script_dir, weights_bin_rel)
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
@@ -1692,14 +1692,14 @@ def main():
         ue.compile_llama(profile=True)
         print(f"Profile compile done in {time.perf_counter() - timer:.2f}s")
         ue.run_llama_profile()
-        ue.clear_dram()
         print("Decoder profile done.")
         return
 
     print("\n--- Running ---")
-    ue.run_llama()
+    run_result = ue.run_llama()
     ue.clear_dram()
     print("Llama-3.2-1B test ends.")
+    _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
 if __name__ == "__main__":
     main()

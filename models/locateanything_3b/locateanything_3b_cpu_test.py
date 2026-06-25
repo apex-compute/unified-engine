@@ -547,6 +547,15 @@ def generate_slow(model, tok, cfg, pixel_values, grid_hw, input_ids, device, dty
     logits = model.language_model.lm_head(h[:, -1:])
     next_id = int(logits[0, -1].argmax())
 
+    if os.environ.get("LA_DEBUG_LOGITS"):
+        lg = logits[0, -1].float()
+        topv, topi = lg.topk(10)
+        print("\n[CPU logits] first decode step (post-prefill):")
+        print(f"  argmax={next_id} ({tok.decode([next_id])!r})  "
+              f"max={lg.max():.3f} min={lg.min():.3f} mean={lg.mean():.3f}")
+        for v, i in zip(topv.tolist(), topi.tolist()):
+            print(f"    {i:>7}  {v:8.3f}  {tok.decode([int(i)])!r}")
+
     out = [next_id]
     cur = T
     while next_id != im_end and len(out) < max_new_tokens:

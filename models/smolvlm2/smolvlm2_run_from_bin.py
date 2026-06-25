@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""SmolVLM2-500M inference from pre-compiled bin files. Run smolvlm2_test.py first to generate bins."""
+"""SmolVLM2-500M standalone inference from pre-compiled bin files.
+
+Self-contained and OFFLINE: it loads the deployable artifacts under ``smolvlm2_bin/`` (weights.bin,
+instructions.bin, and the shipped tokenizer dir) and runs prefill + decode with no compilation and no
+network access. It does not import the build script and never downloads anything, so it can be shipped
+to a customer on its own. Generate the bins once with smolvlm2_test.py (the build/offline-prep step)."""
 import builtins
+import hashlib
 import json
-import math
 import os
 import sys
 import time
 import threading
+
+# Hard offline: guarantee transformers / huggingface_hub never reach the network (set before import).
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -25,9 +34,8 @@ from transformers import AutoTokenizer
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, UE_ARGMAX1_INDEX,
-    URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
-    DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX,
+    DRAM_INSTRUCTION_ADDR,
     UnifiedEngine, set_dma_device, ue_35bit_addr_shifter,
 )
 
@@ -41,6 +49,76 @@ def _load_smolvlm2_config(path: str = None) -> dict:
         return json.load(f)
 
 _SMOLVLM2_CFG = _load_smolvlm2_config()
+
+
+class SmolVLM2RuntimeAttentionStateMixin:
+    """Runtime helper mixin for volatile LM attention state."""
+
+    def _zero_runtime_attention_state(self, seq_len: int | None = None, bucket_len: int | None = None,
+                                      preserve_kv_prefix: bool = False) -> None:
+        """Clear volatile tensor state used by LM attention.
+
+        Runtime correctness must not depend on tensor_init() zeroing.
+        This helper zeroes the decode attention workspace and the KV tail.
+        """
+        if seq_len is None:
+            seq_len = getattr(self, "seq_len", None)
+        if bucket_len is None:
+            bucket_len = seq_len
+        if seq_len is None:
+            raise ValueError("seq_len is required")
+        max_context = int(getattr(self, "max_seq_len", 0) or 0)
+        if seq_len < 0 or seq_len > max_context:
+            raise ValueError(f"seq_len={seq_len} is outside [0, {max_context}]")
+        if bucket_len < seq_len:
+            raise ValueError(f"bucket_len={bucket_len} must be >= seq_len={seq_len}")
+        if bucket_len > max_context:
+            bucket_len = max_context
+        bpe = int(getattr(self, "bytes_per_element", 2) or 2)
+        head_dim = int(getattr(self, "HEAD_DIM", 0) or 0)
+        num_layers = int(getattr(self, "NUM_LAYERS", 0) or 0)
+        num_kv_heads = int(getattr(self, "NUM_KV_HEADS", 0) or 0)
+        kv_head_stride = int(getattr(self, "KV_HEAD_STRIDE", max_context * head_dim * bpe) or (max_context * head_dim * bpe))
+        kv_layer_stride = int(getattr(self, "KV_LAYER_STRIDE", num_kv_heads * kv_head_stride) or (num_kv_heads * kv_head_stride))
+        self._last_runtime_zero_tail_start = seq_len
+        self._runtime_attention_zero_calls_total = getattr(self, "_runtime_attention_zero_calls_total", 0) + 1
+        if getattr(self, "seq_len", None) == seq_len:
+            self._runtime_attention_zero_decode_calls = getattr(self, "_runtime_attention_zero_decode_calls", 0) + 1
+        else:
+            self._runtime_attention_zero_decode_calls = 0
+
+        if max_context > seq_len:
+            zero_tail = torch.zeros((max_context - seq_len) * head_dim, dtype=torch.bfloat16)
+            for layer_idx in range(num_layers):
+                layer_k_base = self.LAYER0_K_DRAM + layer_idx * kv_layer_stride
+                layer_v_base = self.LAYER0_V_DRAM + layer_idx * kv_layer_stride
+                for head_idx in range(num_kv_heads):
+                    self.dma_to_accelerator_memory(
+                        layer_k_base + head_idx * kv_head_stride + seq_len * head_dim * bpe,
+                        zero_tail,
+                    )
+                    self.dma_to_accelerator_memory(
+                        layer_v_base + head_idx * kv_head_stride + seq_len * head_dim * bpe,
+                        zero_tail,
+                    )
+
+        if hasattr(self, "FLASH_Q_DRAM") and hasattr(self, "FLASH_K_DRAM") and hasattr(self, "FLASH_V_DRAM"):
+            flash_len = int(getattr(self, "PREFILL_QMAX", bucket_len) or bucket_len) * head_dim
+            flash_q = torch.zeros((flash_len,), dtype=torch.bfloat16)
+            flash_kv = torch.zeros((flash_len,), dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(self.FLASH_Q_DRAM, flash_q)
+            self.dma_to_accelerator_memory(self.FLASH_K_DRAM, flash_kv)
+            self.dma_to_accelerator_memory(self.FLASH_V_DRAM, flash_kv)
+            if hasattr(self, "FLASH_OUT_DRAM"):
+                self.dma_to_accelerator_memory(self.FLASH_OUT_DRAM, torch.zeros_like(flash_q))
+        if hasattr(self, "FLASH_BIAS_DRAM"):
+            bias_len = int(getattr(self, "PREFILL_QMAX", bucket_len) or bucket_len)
+            bias = torch.full((bias_len, bias_len), -1e38, dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(self.FLASH_BIAS_DRAM, bias)
+        if hasattr(self, "DECODE_BIAS_DRAM"):
+            decode_bias = torch.full((int(getattr(self, "GROUP_SIZE", 1) or 1), max_context), -1e38, dtype=torch.bfloat16)
+            decode_bias[:, :seq_len] = 0.0
+            self.dma_to_accelerator_memory(self.DECODE_BIAS_DRAM, decode_bias)
 
 # =============================================================================
 # Helper functions
@@ -58,75 +136,12 @@ def init_hang_prevention(ue) -> None:
     ue.clear_capture_buffer()
     print("[Init] HALT written to instruction DRAM base")
 
-def isa_set_register(ue, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
-    """Set one ISA register to an immediate value via minimal program."""
-    ue._inst_id = 0
-    ue.start_capture()
-    ue.generate_instruction_add_set(dst_reg_idx, immediate_value)
-    ue.generate_instruction_halt()
-    ue.stop_capture()
-    program_addr = ue.get_program_dram_addr()
-    ue.write_captured_instructions_to_dram(program_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-    ue.clear_capture_buffer()
-    ue.start_execute_from_dram(program_addr)
-    ue.wait_queue(timeout_s)
 
-def _make_add_set_bytes(dst_reg: int, immediate_value: int) -> bytes:
-    """Build raw 32-byte ADD_SET instruction: dst_reg = immediate_value.
-    Encoding must match user_dma_core.generate_instruction / andromeda.c layout."""
-    import struct
-    INSTRUCTION_ADD = 2
-    INST_ADD_SET = 4
-    w = [0] * 8
-    w[0] = (INSTRUCTION_ADD & 0xF) << 8
-    w[1] = ((INST_ADD_SET & 0xF) << 0) | \
-           ((dst_reg & 0xF) << 4) | \
-           ((dst_reg & 0xF) << 8) | \
-           ((0 & 0xF) << 12) | \
-           ((immediate_value & 0xFFFF) << 16)
-    w[2] = (immediate_value >> 16) & 0xFFFF
-    result = bytearray(32)
-    for i in range(8):
-        result[i*4:(i+1)*4] = struct.pack('<I', w[i] & 0xFFFFFFFF)
-    return bytes(result)
-
-def accelerator_memory_to_sram_reg(ue, accelerator_dram_address: int, sram_address: int,
-                                    element_size: int, general_reg_src: int,
-                                    stride_bytes_per_chunk: int = 0, stride_jump_bytes: int = 0) -> None:
-    """accelerator_memory_to_sram with register-based DRAM address."""
-    element_size_bytes = element_size * 2
-    uram_type, uram_start_addr = ue.sram_address_to_uram_address(sram_address)
-    ue.ue_memcpy_from_dram(accelerator_dram_address, element_size_bytes, MEMCPY_TYPE.URAM.value,
-                           uram_start_addr, uram_type.value,
-                           stride_bytes_per_chunk=stride_bytes_per_chunk,
-                           stride_jump_bytes=stride_jump_bytes,
-                           general_reg_src=general_reg_src)
-
-def capture_to_raw(ue):
-    """Stop capture, extract raw instruction bytes (no halt), clear buffer."""
-    ue.stop_capture()
-    raw = bytearray()
-    for inst in ue.capture_buffer:
-        raw.extend(inst.get_bytes())
-    ue.clear_capture_buffer()
-    return bytes(raw)
-
-def generate_halt_raw(ue):
-    """Return raw bytes for a single HALT instruction."""
-    ue.start_capture()
-    ue.generate_instruction_halt()
-    ue.stop_capture()
-    raw = bytearray()
-    for inst in ue.capture_buffer:
-        raw.extend(inst.get_bytes())
-    ue.clear_capture_buffer()
-    return bytes(raw)
 
 # =============================================================================
 # SmolVLM2_UnifiedEngine class
 # =============================================================================
-class SmolVLM2_UnifiedEngine(UnifiedEngine):
+class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     """SmolVLM2-500M accelerator engine: weight loading and inference."""
     # --- Model dimensions (SmolVLM2-500M) — loaded from smolvlm2_config.json ---
     _cfg = _SMOLVLM2_CFG
@@ -145,28 +160,57 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
     V_CACHE_SIZE_REG = _cfg["fixed_isa_regs"]["V_CACHE_SIZE_REG"]
     ROPE_SIZE_REG    = _cfg["fixed_isa_regs"]["ROPE_SIZE_REG"]
     TMP_REG          = _cfg["fixed_isa_regs"]["TMP_REG"]
+    GPR_SEQ_LEN_REG    = _cfg["fixed_isa_regs"]["GPR_SEQ_LEN_REG"]
+    GPR_Q_SEQ_LEN_REG  = _cfg["fixed_isa_regs"]["GPR_Q_SEQ_LEN_REG"]
+    GPR_BUCKET_IDX_REG = _cfg["fixed_isa_regs"]["GPR_BUCKET_IDX_REG"]
+    PREFILL_MAX_SEQ_LEN = _cfg["model"]["prefill_max_seq_len"]
 
-    def __init__(self, script_dir: str = None, lm_weights: str = None, vision_weights: str = None,
-                 vision_bf16: bool = True):
+    def __init__(self, script_dir: str = None):
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _SMOLVLM2_CFG
-        # DRAM layout: bf16 layout needed when vision uses BF16 weights
-        if vision_bf16:
-            dl = self._cfg["dram_layout"]["bf16"]
-            super().__init__(
-                params_dram_base=int(dl["params_dram_base"], 16),
-                tensor_dram_base=int(dl["tensor_dram_base"], 16),
-                program_dram_base=int(dl["program_dram_base"], 16),
-            )
-        else:
-            super().__init__()
+        # Fixed precision scheme: bf16 vision + q4 LM → the bf16 DRAM layout.
+        dl = self._cfg["dram_layout"]["bf16"]
+        super().__init__(
+            params_dram_base=int(dl["params_dram_base"], 16),
+            tensor_dram_base=int(dl["tensor_dram_base"], 16),
+            program_dram_base=int(dl["program_dram_base"], 16),
+        )
         self._isa_reg_counter = 1
-        self.vision_bf16 = vision_bf16
-        self.lm_bf16 = False
+        self.gpr_seq_len = self.GPR_SEQ_LEN_REG       # primed to S in run_prefill / seq pos in decode
+        self.gpr_q_seq_len = self.GPR_Q_SEQ_LEN_REG   # primed to S*GROUP_SIZE in run_prefill
+        self.gpr_bucket_idx = self.GPR_BUCKET_IDX_REG  # primed to flash/decoder bucket selector
+        self.vision_bf16 = True
+        self.decode_matmat_mul_core_enable = False
+        self.penalty_enable = False
 
-        # Weight bin paths (generated by --gen-weights)
-        self.lm_weights_path = lm_weights or os.path.join(self.script_dir, self._cfg["paths"]["lm_weights"])
-        self.vision_weights_path = vision_weights or os.path.join(self.script_dir, self._cfg["paths"]["vision_weights"])
+    def _artifact_mode_suffix(self) -> str:
+        # Only the decode linear kernel changes the compiled artifacts. The repetition penalty is a pure
+        # RUNTIME tensor-DRAM write (PENALTY_BIAS_DRAM, always wired as the LM-head C term with zeros =
+        # greedy), so it never affects weights.bin or instructions.bin and is not part of the suffix.
+        if bool(getattr(self, "decode_matmat_mul_core_enable", False)):
+            return "_decode_matmat_mul_core"
+        return ""
+
+    def _artifact_mode_meta(self) -> dict:
+        return {
+            "decode_matmat_mul_core_enable": bool(getattr(self, "decode_matmat_mul_core_enable", False)),
+        }
+
+    def _validate_artifact_mode(self, meta: dict, artifact_name: str) -> None:
+        expected = self._artifact_mode_meta()
+        missing = [k for k in expected if k not in meta]
+        if missing:
+            raise RuntimeError(
+                f"[artifact-mode] {artifact_name} is missing metadata keys {missing}; rebuild it with "
+                "smolvlm2_test.py"
+            )
+        mismatched = [f"{k}={meta.get(k)!r}" for k, v in expected.items() if bool(meta.get(k)) != bool(v)]
+        if mismatched:
+            exp = ", ".join(f"{k}={v}" for k, v in expected.items())
+            got = ", ".join(mismatched)
+            raise RuntimeError(
+                f"[artifact-mode] {artifact_name} metadata mismatch: expected {exp}, got {got}"
+            )
 
     # --- ISA register helpers ---
     def reset_isa_reg_counter(self) -> None:
@@ -187,19 +231,34 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
     def get_arg_max_index(self) -> int:
         return self.read_reg32(UE_ARGMAX_INDEX)
 
-    def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
-        """Set ISA register to immediate value."""
-        isa_set_register(self, dst_reg_idx, immediate_value, timeout_s)
+    def zero_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
+        """Zero-fill the DRAM working range [DRAM_START_ADDR..0xFFFFFFFF] with 0x00 (mirror of
+        smolvlm2_test.zero_dram). The base clear_dram() fills 0xFF (NaN in bf16), which poisons any
+        region read-before-write on the NEXT run — back-to-back runs then emit garbage / endoftext.
+        run_from_bin calls this at the END of main() so consecutive load-only runs each start clean."""
+        start = user_dma_core.DRAM_START_ADDR
+        total = 0xFFFFFFFF - start + 1
+        zeros = b"\x00" * chunk_size_bytes
+        offset = 0
+        while offset < total:
+            n = min(chunk_size_bytes, total - offset)
+            self.dma_write(DMA_DEVICE_H2C, start + offset, zeros[:n], n)
+            offset += n
 
     def load_snapshot(self) -> bool:
         """Load params DRAM from snapshot bin + restore all address metadata. Returns True if loaded."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
-        bin_path = os.path.join(bin_dir, "params.bin")
-        meta_path = os.path.join(bin_dir, "params.json")
+        suffix = self._artifact_mode_suffix()
+        bin_path = os.path.join(bin_dir, f"weights{suffix}.bin")
+        meta_path = os.path.join(bin_dir, f"weights{suffix}.json")
         if not os.path.exists(bin_path) or not os.path.exists(meta_path):
-            return False
+            raise RuntimeError(
+                f"[artifact-mode] missing snapshot artifact for current mode: "
+                f"{os.path.basename(bin_path)} / {os.path.basename(meta_path)}"
+            )
         with open(meta_path) as f:
             meta = json.load(f)
+        self._validate_artifact_mode(meta, os.path.basename(meta_path))
         total = meta["params_size"]
         CHUNK = 1 * 1024 * 1024
         with open(bin_path, "rb") as f:
@@ -214,109 +273,67 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
             if key not in ("params_size", "tensor_size"):
                 setattr(self, key, val)
         model_dir = os.path.join(self.script_dir, "smolvlm2_bin", "SmolVLM2-500M-Video-Instruct")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-        kv_zeros = torch.zeros(self.NUM_LAYERS * self.NUM_KV_HEADS * self.max_seq_len * self.HEAD_DIM, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_K_DRAM, kv_zeros)
-        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zeros)
+        # Offline-only: load the shipped tokenizer files from disk; never reach the network. This script
+        # is releasable standalone (bins + tokenizer dir) and must run without internet.
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, local_files_only=True)
         _original_print(f"  Snapshot loaded: {total / 1024**2:.1f} MB")
         return True
 
-    def _load_bin(self, bin_path: str) -> int:
-        """Load a program bin file into program DRAM. Returns DRAM address."""
-        with open(bin_path, "rb") as f:
-            data = f.read()
-        addr = self.get_program_dram_addr()
-        self.dma_write(DMA_DEVICE_H2C, addr, data, len(data))
-        self.allocate_program_dram(len(data))
-        print(f"    Loaded {len(data)} bytes from {os.path.basename(bin_path)}")
-        return addr
-
-    def load_encoder(self) -> int:
-        """Load pre-compiled encoder from bin. Reproduces compile-time DRAM allocations."""
-        N = 768  # vision hidden size
-        N_HEADS = 12
-        bpe = 2
-        zeros = torch.zeros(N, dtype=torch.bfloat16)
-        identity = torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16)
-        identity_size = UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe
-
-        num_vis_layers = self._num_vis_layers
-        for _ in range(num_vis_layers):
-            # LN1 zeros
-            addr = self.get_params_dram_addr()
-            self.allocate_params_dram(N * bpe)
-            self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
-            # 12× flash_attention_core identity matrices
-            for _ in range(N_HEADS):
-                addr = self.get_params_dram_addr()
-                self.allocate_params_dram(identity_size)
-                self.dma_write(DMA_DEVICE_H2C, addr, identity, identity_size)
-            # LN2 post-add zeros
-            addr = self.get_params_dram_addr()
-            self.allocate_params_dram(N * bpe)
-            self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
-        # Final post-layernorm zeros
-        addr = self.get_params_dram_addr()
-        self.allocate_params_dram(N * bpe)
-        self.dma_write(DMA_DEVICE_H2C, addr, zeros, N * bpe)
-
-        return self._load_bin(os.path.join(self.script_dir, "smolvlm2_bin", "encoder_program.bin"))
-
-    def load_prefill(self, seq_len: int) -> None:
-        """Load pre-compiled prefill raw bytes from bin. Sets up causal mask and scratch."""
-        S = ((seq_len + 63) // 64) * 64
-        self.prefill_seq_len = seq_len
-        self._prefill_padded = S
-        bpe = 2
-        # Causal mask for the padded size
-        causal = torch.full((S, S), -1e38, dtype=torch.bfloat16)
-        causal = torch.triu(causal, diagonal=1)
-        causal[:, seq_len:] = -1e38
-        causal[seq_len:, :] = -1e38
-        causal[seq_len:, 0] = 0.0
-        self.dma_write(DMA_DEVICE_H2C, self.CAUSAL_MASK_DRAM, causal.flatten(), S * S * bpe)
-        # Load prefill raw bytes (no halt)
-        bin_path = os.path.join(self.script_dir, "smolvlm2_bin", f"prefill_program_S{S}.bin")
-        with open(bin_path, "rb") as f:
-            self._prefill_raw = f.read()
-        self._halt_raw = generate_halt_raw(self)
-        # Allocate scratch for fused program
-        max_embed_insts = seq_len * 2 * 32
-        max_merge_insts = IMAGE_SEQ_LEN * 2 * 32
-        worst_case = max_embed_insts + max_merge_insts + len(self._prefill_raw) + len(self._halt_raw)
-        self._prefill_scratch_addr = self.get_program_dram_addr()
-        self.allocate_program_dram(worst_case)
-        print(f"    Loaded prefill raw ({len(self._prefill_raw)} bytes) + scratch ({worst_case} bytes)")
-
-    def load_decoder(self) -> None:
-        """Load pre-compiled decoder from bin (embed programs + bucket programs)."""
+    def load_all(self) -> dict:
+        """Load the unified single instruction bin (encoder + decoder + prefill) — mirror of
+        smolvlm2_test.compile_all's cache-hit path. DMAs each segment to its recorded absolute address
+        and sets the program/preamble addrs the run_* methods read. Must be called AFTER load_snapshot
+        (which restores params, including the shared vis_zeros LN buffer — Trick 9, no replay needed)."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
-        meta_path = os.path.join(bin_dir, "decoder_program.json")
-        with open(meta_path, "r") as f:
+        suffix = self._artifact_mode_suffix()
+        meta_path = os.path.join(bin_dir, f"instructions{suffix}.json")
+        bin_path = os.path.join(bin_dir, f"instructions{suffix}.bin")
+        with open(meta_path) as f:
             meta = json.load(f)
-        self._kv_len_buckets = meta["kv_len_buckets"]
-        # Load bucket programs
-        bin_path = os.path.join(bin_dir, "decoder_program.bin")
+        self._validate_artifact_mode(meta, os.path.basename(meta_path))
         with open(bin_path, "rb") as f:
-            bucket_all = f.read()
-        self._decode_bucket_raw = []
-        for bm in meta["bucket_meta"]:
-            self._decode_bucket_raw.append(bucket_all[bm["offset"]:bm["offset"] + bm["size"]])
-        # Load embed programs (stride-indexed)
-        embed_bin_path = os.path.join(bin_dir, "decoder_embed.bin")
-        with open(embed_bin_path, "rb") as f:
-            embed_all = f.read()
-        stride = meta["embed_stride"]
-        count = meta["embed_count"]
-        self._decode_embed_raw = [embed_all[i * stride:(i + 1) * stride] for i in range(count)]
-        # Allocate scratch for fused decode program: reg_set (64B) + embed + largest bucket
-        max_embed = max(len(r) for r in self._decode_embed_raw)
-        max_bucket = max(len(r) for r in self._decode_bucket_raw)
-        worst_case = 64 + max_embed + max_bucket  # 64 bytes for 2 x 32-byte ADD_SET
-        self._decode_scratch_addr = self.get_program_dram_addr()
-        self.allocate_program_dram(worst_case)
-        print(f"    Loaded decoder: {len(self._decode_bucket_raw)} buckets, "
-              f"{len(self._decode_embed_raw)} embed programs, scratch {worst_case} bytes")
+            raw = f.read()
+        for name, entry in meta["programs"].items():
+            b = raw[entry["offset"]:entry["offset"] + entry["size"]]
+            self.dma_write(DMA_DEVICE_H2C, entry["addr"], b, len(b))
+        self._vis_program_addr = meta["encoder_addr"]
+        self._decoder_program_addr = meta["decoder_addr"]
+        self._decoder_preamble_addr = meta["decoder_preamble"]
+        self._decoder_num_buckets = meta["decoder_num_buckets"]
+        self._decoder_subroutine_start = meta.get("decoder_subroutine_start")
+        self._decoder_subroutine_call_sites = meta.get("decoder_subroutine_call_sites")
+        self._decoder_attention_use_pbi = meta.get("decoder_attention_use_pbi")
+        self._decoder_attention_impl = meta.get("decoder_attention_impl")
+        self._decoder_attention_shared_subroutine = meta.get("decoder_attention_shared_subroutine")
+        self._prefill_addr = meta["prefill_addr"]
+        self._prefill_preamble_addr = meta["prefill_preamble"]
+        self._prefill_postamble_addr = meta["prefill_postamble"]
+        self._prefill_final_buf = meta["prefill_final_buf"]
+        self._next_program_dram_addr = meta["end_addr"]
+        if (self._decoder_attention_impl is None or self._decoder_attention_use_pbi is None or
+                self._decoder_attention_shared_subroutine is None or
+                self._decoder_subroutine_start is None or self._decoder_subroutine_call_sites is None):
+            raise RuntimeError(
+                "[decoder-attn-path] loaded instructions.json lacks decoder-attention branch metadata; "
+                "the artifact is stale/incompatible — rebuild it with smolvlm2_test.py")
+        if bool(self._decoder_attention_use_pbi) is not True or self._decoder_attention_impl != "pbi":
+            raise RuntimeError(
+                "[decoder-attn-path] loaded artifact is not the required SmolVLM2 PBI decoder-attention implementation")
+        artifact_sha256 = hashlib.sha256(raw).hexdigest()
+        self._loaded_artifact_sha256 = artifact_sha256
+        # _original_print: this is a required runtime deliverable, so it must survive _SILENT_MODE
+        # (load_all runs after _SILENT_MODE=True in main).
+        _original_print(
+            f"    [decoder-attn-path] model=smolvlm2 phase=lm_decode "
+            f"shared_subroutine=yes use_pbi=true implementation=pbi "
+            f"subroutine_start=0x{self._decoder_subroutine_start:X} "
+            f"call_sites={self._decoder_subroutine_call_sites} "
+            f"artifact_sha256={artifact_sha256} "
+            f"metadata_validated=yes"
+        )
+        print(f"    Loaded unified instruction bin ({len(raw)/1024/1024:.1f} MB, "
+              f"{len(meta['segments'])} segments)")
+        return meta
 
     # --- Run ---
     def run_encoder(self, encoder_addr: int, pixel_values) -> None:
@@ -337,136 +354,228 @@ class SmolVLM2_UnifiedEngine(UnifiedEngine):
         self.program_execute(encoder_addr, timeout=30.0, total_flops=enc_flops)
 
     def run_prefill(self, token_ids, has_image: bool = False, total_flops: int = None) -> int:
-        """On-device prefill: embed gather + vision merge + decoder layers. Returns argmax."""
+        """Run the seq-len-agnostic prefill (dynamic-PBI / §7): host prep (epsilon pad + block bias),
+        a preamble that does on-device embed/merge + primes gpr_bucket_idx + jumps into the cached
+        prefill, then a postamble that does final-norm + LM head on the runtime last token. Mirrors
+        smolvlm2_test.run_prefill exactly (runtime-only; no compilation). Returns argmax."""
+        from user_dma_core import TYPE
         seq_len = len(token_ids)
         self.seq_len = seq_len
-        S = self._prefill_padded
-        H = self.HIDDEN_SIZE
-        bpe = 2
+        self._prefill_token_ids = list(token_ids)  # seeds the repetition-penalty window in run_decoder
+        H, D, G, bpe = self.HIDDEN_SIZE, self.HEAD_DIM, self.GROUP_SIZE, 2
+        PM = self.PREFILL_MAX_SEQ_LEN
+        assert seq_len <= PM, f"prompt {seq_len} exceeds PREFILL_MAX_SEQ_LEN={PM}"
+        qmax = self.PREFILL_QMAX
+        qS = seq_len * G
+        aligned_q = ((qS + 63) // 64) * 64
+        bucket_idx = aligned_q // UE_VECTOR_SIZE
         embed_row_bytes = H * bpe
 
-        # Epsilon-fill padding rows to prevent RMS norm NaN on zero rows
-        if S > seq_len:
-            pad_rows = S - seq_len
-            epsilon_fill = torch.full((pad_rows * H,), 1e-6, dtype=torch.bfloat16)
-            pad_offset = seq_len * embed_row_bytes
-            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM + pad_offset, epsilon_fill)
+        # Vision/connector execution is complete before run_prefill. Clear all
+        # volatile LM attention state before any prefill instruction can read it.
+        self._zero_runtime_attention_state(seq_len=seq_len, bucket_len=aligned_q)
+        # 1. epsilon-fill INPUT padding rows [seq_len:PM] (non-attention ops run static PM rows)
+        if PM > seq_len:
+            epsilon = torch.full(((PM - seq_len) * H,), 1e-6, dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM + seq_len * embed_row_bytes, epsilon)
+        # 2. block-diagonal causal bias [aligned_q, aligned_q]: allow (t,g)->(t',g') iff g==g' & t'<=t
+        rq = torch.arange(aligned_q).unsqueeze(1)
+        rk = torch.arange(aligned_q).unsqueeze(0)
+        allow = (rq < qS) & (rk < qS) & (rq % G == rk % G) & (rk // G <= rq // G)
+        bias = torch.where(allow, torch.tensor(0.0), torch.tensor(-1e38)).to(torch.bfloat16)
+        bias[torch.arange(aligned_q) >= qS, 0] = 0.0  # padded query rows attend row 0 (discarded)
+        self.dma_to_accelerator_memory(self.FLASH_BIAS_DRAM, bias)
 
-        # Generate on-device embedding gather instructions
+        # 4. Preamble: on-device embed gather + vision merge + prime gpr_bucket_idx + jump into prefill
+        self.clear_inst_id()
         self.start_capture()
         for t in range(seq_len):
-            token_id = token_ids[t]
-            src_addr = self.embed_addr + token_id * embed_row_bytes
-            dst_addr = self.LAYER0_INPUT_DRAM + t * embed_row_bytes
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=src_addr,
-                sram_address=0x00000,
-                element_size=H)
-            self.sram_to_accelerator_memory(
-                sram_address=0x00000,
-                accelerator_dram_address=dst_addr,
-                element_size=H)
-
-        # Generate on-device vision merge instructions (overwrite image token positions)
+            src = self.embed_addr + token_ids[t] * embed_row_bytes
+            self.accelerator_memory_to_sram(src, 0x00000, H)
+            self.sram_to_accelerator_memory(0x00000, self.LAYER0_INPUT_DRAM + t * embed_row_bytes, H)
         if has_image:
             img_positions = [i for i, t in enumerate(token_ids) if t == IMAGE_TOKEN_ID]
             if len(img_positions) > 0:
                 assert len(img_positions) == IMAGE_SEQ_LEN, \
                     f"Expected {IMAGE_SEQ_LEN} image tokens, got {len(img_positions)}"
                 for i, pos in enumerate(img_positions):
-                    src_addr = self.VIS_CONNECTOR_DRAM + i * embed_row_bytes
-                    dst_addr = self.LAYER0_INPUT_DRAM + pos * embed_row_bytes
-                    self.accelerator_memory_to_sram(
-                        accelerator_dram_address=src_addr,
-                        sram_address=0x00000,
-                        element_size=H)
-                    self.sram_to_accelerator_memory(
-                        sram_address=0x00000,
-                        accelerator_dram_address=dst_addr,
-                        element_size=H)
+                    self.accelerator_memory_to_sram(self.VIS_CONNECTOR_DRAM + i * embed_row_bytes, 0x00000, H)
+                    self.sram_to_accelerator_memory(0x00000, self.LAYER0_INPUT_DRAM + pos * embed_row_bytes, H)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(self._prefill_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(self._prefill_preamble_addr)
+        self.clear_capture_buffer()
+        self.start_execute_from_dram(self._prefill_preamble_addr)
+        self.wait_queue(180.0)
+        # Static prefill writes epsilon-derived KV rows through PREFILL_MAX.
+        # Retain real tokens and clear every remaining context row before decode.
+        self._zero_runtime_attention_state(
+            seq_len=seq_len, bucket_len=aligned_q, preserve_kv_prefix=True
+        )
 
-        dynamic_raw = capture_to_raw(self)
-
-        # Fuse: dynamic embed/merge + prefill layers + halt → single dispatch
-        fused = bytearray()
-        fused.extend(dynamic_raw)
-        fused.extend(self._prefill_raw)
-        fused.extend(self._halt_raw)
-
-        # Write fused program to scratch and dispatch
-        self.dma_write(DMA_DEVICE_H2C, self._prefill_scratch_addr, bytes(fused), len(fused))
-        self.start_execute_from_dram(self._prefill_scratch_addr)
+        # 5. Postamble: final norm over ALL tokens + LM head on the last real token.
+        last_off = (seq_len - 1) * H * bpe
+        self.clear_inst_id()
+        self.start_capture()
+        self.rms_norm_core_dram(M=seq_len, N=H, A_DRAM_ADDR=self._prefill_final_buf,
+            OUTPUT_DRAM_ADDR=self.FINAL_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
+        last_norm = self.FINAL_NORM_DRAM + last_off
+        # Prefill LM-head stays fused in both modes (mirrors smolvlm2_test.run_prefill): quantized_matmat_core
+        # is the optimized GEMV for the 49280-wide vocab; the deterministic flag only de-fuses per-layer linears.
+        self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=last_norm,
+            B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+            SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4)
+        self.generate_instruction_halt()
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(self._prefill_postamble_addr)
+        self.clear_capture_buffer()
+        self.start_execute_from_dram(self._prefill_postamble_addr)
         self.wait_queue(30.0)
         if total_flops is not None:
-            self._last_hw_gflops, _ = self.report_flop_rate_gflops(total_flops)
+            try:
+                self._last_hw_gflops, _ = self.report_flop_rate_gflops(total_flops)
+            except ZeroDivisionError:
+                self._last_hw_gflops = None
             self._last_total_flops = total_flops
         else:
             self._last_hw_gflops = None
             self._last_total_flops = None
         return self.get_arg_max_index()
 
-    def run_decoder(self, token_id: int, max_new_tokens: int = 512) -> list:
-        """Auto-regressive decode loop. Returns generated token IDs."""
-        bpe = 2
+    def _structural_token_ids(self):
+        """Token ids never repetition-penalized: punctuation, whitespace, and special tokens. Cached."""
+        cached = getattr(self, "_struct_ids_cache", None)
+        if cached is not None:
+            return cached
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–’‘“”…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        ids |= set(int(v) for v in _SMOLVLM2_CFG["special_tokens"].values())
+        for i in range(self.VOCAB_SIZE):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
+
+    def _structural_ids_tensor(self):
+        t = getattr(self, "_struct_ids_tensor_cache", None)
+        if t is None:
+            t = torch.tensor(sorted(self._structural_token_ids()), dtype=torch.long)
+            self._struct_ids_tensor_cache = t
+        return t
+
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """Per-vocab additive repetition bias → PENALTY_BIAS_DRAM (decode LM-head C term). bias[t] =
+        clamp(−alpha·count[t], min=−cap); structural tokens stay 0. HW argmax of (logits+bias) penalizes."""
+        vocab = self.VOCAB_SIZE
+        alpha = float(getattr(self, "pen_alpha", 3.0))
+        cap = float(getattr(self, "pen_cap", 100.0))
+        W = int(getattr(self, "rep_window", 256))
+        window = prev_tokens[-W:]
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0
+        bias = (-alpha * count).clamp(min=-cap)
+        # Short-window loop backstop (mirrors smolvlm2_test): hard-ban (-1e9) any NON-structural token
+        # that fills >= pen_loop_thr of the last pen_loop_recent tokens — breaks 2-cycles / single-token
+        # runs the soft count penalty cannot, pushing the HW argmax toward EOS / new content.
+        loop_recent = int(getattr(self, "pen_loop_recent", 24))
+        loop_thr = int(getattr(self, "pen_loop_thr", 6))
+        recent = prev_tokens[-loop_recent:]
+        if len(recent) >= loop_recent:
+            rc = torch.zeros(vocab, dtype=torch.float32)
+            rt = torch.tensor(recent, dtype=torch.long)
+            rc.index_add_(0, rt, torch.ones(rt.numel(), dtype=torch.float32))
+            rc[self._structural_ids_tensor()] = 0.0
+            bias[rc >= loop_thr] = -1e9
+        # Soft length nudge toward EOS (mirrors smolvlm2_test): past a soft token budget, grow a positive
+        # bias on the end-of-utterance token so open-ended generations terminate instead of hitting the cap.
+        soft = int(getattr(self, "pen_eos_soft", 96))
+        n_gen = len(prev_tokens) - len(getattr(self, "_prefill_token_ids", []) or [])
+        if n_gen > soft:
+            eos = int(self._cfg["special_tokens"]["end_of_utterance_id"])
+            bias[eos] = max(float(bias[eos]), float(n_gen - soft))
+        bias = bias.to(torch.bfloat16).view(1, vocab)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
+
+    def run_decoder(
+        self,
+        token_id: int,
+        max_new_tokens: int = 512,
+    ) -> list:
+        """Auto-regressive decode loop (dynamic-PBI / §7). Each step writes a tiny preamble that
+        primes gpr_seq_len + gpr_bucket_idx and jumps into the single cached decoder program."""
         global _SILENT_MODE
         generated = []
-        H, D, I = self.HIDDEN_SIZE, self.HEAD_DIM, self.INTERMEDIATE_SIZE
-        QH, KVH, G = self.NUM_HEADS, self.NUM_KV_HEADS, self.GROUP_SIZE
-        self._decode_total_flops = 0
-        self._decode_total_hw_ns = 0
-        # All embed programs are the same size (2 DMA instructions)
-        embed_size = len(self._decode_embed_raw[0])
-        REG_SET_SIZE = 64  # 2 x 32-byte ADD_SET instructions
-        bucket_offset = REG_SET_SIZE + embed_size  # bucket starts after reg_set + embed
-        last_bucket_idx = -1  # track cached bucket to avoid re-DMA
+        H = self.HIDDEN_SIZE
+        bpe = 2
+        embed_row_bytes = H * bpe
+        num_buckets = self._decoder_num_buckets
+        decoder_program_addr = self._decoder_program_addr
+        preamble_addr = self._decoder_preamble_addr
+
+        # On-FPGA repetition penalty (same as test.py): the decode LM-head always adds PENALTY_BIAS_DRAM;
+        # zero it up front, then refresh each step past the greedy_until gate from the windowed frequency.
+        _fpga_penalty = bool(getattr(self, "penalty_enable", False))
+        _greedy_until = int(getattr(self, "greedy_until", 0))
+        self._generated_tokens = list(getattr(self, "_prefill_token_ids", [])) + [token_id]
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                       torch.zeros(1, self.VOCAB_SIZE, dtype=torch.bfloat16))
+        if _fpga_penalty:
+            self._structural_ids_tensor()  # warm the structural-token cache off the first decode token
+
+        _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
         while len(generated) < max_new_tokens and self.seq_len < self.max_seq_len:
             _SILENT_MODE = True
             self.seq_len += 1
-            pos = self.seq_len - 1
-            # Decode attention bias: [GROUP_SIZE, max_seq_len] with proper stride
-            # Each row must be max_seq_len wide to match bias_row_stride in attention
             aligned_kv = ((self.seq_len + 63) // 64) * 64
-            bias = torch.full((self.GROUP_SIZE * self.max_seq_len,), -1e38, dtype=torch.bfloat16)
-            for g in range(self.GROUP_SIZE):
-                bias[g * self.max_seq_len:g * self.max_seq_len + self.seq_len] = 0.0
+            bucket_idx = min(aligned_kv // UE_VECTOR_SIZE, num_buckets)
+
+            # Decode bias: [GROUP_SIZE, max_seq_len] with zeros at valid KV positions
+            bias = torch.full((self.GROUP_SIZE, self.max_seq_len), -1e38, dtype=torch.bfloat16)
+            bias[:, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.DECODE_BIAS_DRAM, bias)
-            # Fuse: reg_set + embed + bucket → single dispatch (no separate isa_set_register)
-            prog_idx = min((self.seq_len - 1) // 64, len(self._decode_bucket_raw) - 1)
-            if prog_idx != last_bucket_idx:
-                bucket_raw = self._decode_bucket_raw[prog_idx]
-                self.dma_write(DMA_DEVICE_H2C,
-                               self._decode_scratch_addr + bucket_offset,
-                               bucket_raw, len(bucket_raw))
-                last_bucket_idx = prog_idx
-            # Build fused reg_set + embed bytes (64 + 64 = 128 bytes)
-            reg_set_bytes = bytearray()
-            reg_set_bytes.extend(_make_add_set_bytes(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(pos * self.k_size)))
-            reg_set_bytes.extend(_make_add_set_bytes(self.ROPE_SIZE_REG, ue_35bit_addr_shifter(pos * self.HEAD_DIM * bpe)))
-            embed_raw = self._decode_embed_raw[token_id]
-            fused_head = bytes(reg_set_bytes) + embed_raw
-            # DMA fused reg_set + embed to start of scratch (bucket already cached after)
-            self.dma_write(DMA_DEVICE_H2C, self._decode_scratch_addr, fused_head, len(fused_head))
-            self.start_execute_from_dram(self._decode_scratch_addr)
-            self.wait_queue(10.0)
-            # Accumulate decode FLOPs from HW cycle counter
-            hw_cycles = self.read_reg32(user_dma_core.UE_LATENCY_COUNT_ADDR)
-            self._decode_total_hw_ns += hw_cycles * user_dma_core.CLOCK_CYCLE_TIME_NS
-            per_layer = (4 * H + 2 * H * (H + 2 * KVH * D)
-                + (QH + KVH) * D * 4
-                + KVH * (D * aligned_kv + G * (D + 2 * D * aligned_kv
-                    + aligned_kv + aligned_kv * 5 + 2 * aligned_kv * D))
-                + 2 * H * H + 5 * H + 4 * H * I + I + 2 * I * H + H)
-            self._decode_total_flops += self.NUM_LAYERS * per_layer + 4 * H + 2 * H * self.VOCAB_SIZE
+
+            # Host-side embed DMA — avoids on-device C2H before decoder
+            src_addr = self.embed_addr + token_id * embed_row_bytes
+            embed_vec = self.dma_from_accelerator_memory(src_addr, torch.Size([H]))
+            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embed_vec)
+
+            # Preamble: prime gpr_seq_len + gpr_bucket_idx + jump into decoder
+            self.clear_inst_id()
+            self.start_capture()
+            self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len - 1)
+            self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+            self.stop_capture()
+            self.write_captured_instructions_to_dram(preamble_addr)
+            self.clear_capture_buffer()
+
+            if _fpga_penalty and len(generated) >= _greedy_until:
+                self._write_penalty_bias(self._generated_tokens)
+
+            self.start_execute_from_dram(preamble_addr)
+            self.wait_queue(30.0)
+
+            # HW argmax: read the 4-byte (penalized) argmax-index register the LM-head left.
             token_id = self.get_arg_max_index()
             generated.append(token_id)
+            self._generated_tokens.append(token_id)
             _SILENT_MODE = False
-            if token_id in _SMOLVLM2_CFG["model"]["stop_token_ids"]:  # <|endoftext|>, BOS, PAD, <end_of_utterance>
+            if token_id in _SMOLVLM2_CFG["model"]["stop_token_ids"]:
                 _original_print(f"\nStop token {token_id} reached.")
                 break
             _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
+        else:
+            # Loop ended without hitting an EOS stop token — report which cap stopped it.
+            _reason = ("max decode tokens" if len(generated) >= max_new_tokens
+                       else "max sequence length")
+            _original_print(f"\nStopped: {_reason} ({len(generated)} tokens).")
         _SILENT_MODE = False
-        self._decode_hw_gflops = (self._decode_total_flops / self._decode_total_hw_ns
-                                  if self._decode_total_hw_ns > 0 else 0)
         return generated
 
     def program_execute(self, program_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR,
@@ -534,36 +643,66 @@ def main():
     parser = argparse.ArgumentParser(description="SmolVLM2-500M inference from pre-compiled bins")
     _d = _SMOLVLM2_CFG["defaults"]
     _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    parser.add_argument("--prompt", type=str, default=_d["prompt"])
-    parser.add_argument("--image", type=str, default=os.path.join(_root, _d["image"]))
+    _default_image = os.path.join(_root, _d["image"])
+    parser.add_argument("--prompt", type=str, default=None,
+                        help="Text prompt. Default: 'Describe this image.' (VLM) or a text question (--lm-enable).")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Path to an image for VLM. Default: the bundled sample image. Ignored with --lm-enable.")
+    parser.add_argument("--lm-enable", action="store_true",
+                        help="Pure language-model (text-only) mode — skip the vision encoder. Default is VLM (vision).")
     parser.add_argument("--dev", type=str, default=_d["dev"])
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"])
-    parser.add_argument("--vision-fp4", action="store_true")
+    parser.add_argument("--max-decode-tokens", type=int, default=None,
+                        help="Cap the number of generated decode tokens.")
+    parser.add_argument(
+        "--decode-matmat_mul_core-enable",
+        action="store_true",
+        help="Use matmat_mul_core for decode linear layers instead of quantized_matmat_core.",
+    )
+    parser.add_argument(
+        "--greedy-enable",
+        action="store_true",
+        help="Use pure greedy decoding. Default generation uses the on-FPGA repetition penalty.",
+    )
     args = parser.parse_args()
 
     global _SILENT_MODE
     script_dir = os.path.dirname(os.path.abspath(__file__))
     bin_dir = os.path.join(script_dir, "smolvlm2_bin")
-    has_image = args.image is not None
+    # Penalty is a pure runtime tensor write, so it never affects the artifact names; only the decode
+    # linear kernel does (see _artifact_mode_suffix).
+    snapshot_suffix = "_decode_matmat_mul_core" if args.decode_matmat_mul_core_enable else ""
+    instruction_suffix = snapshot_suffix
 
-    # Check all static bins before any hardware init
+    # Check all static bins before any hardware init. SmolVLM2 now uses one instruction artifact:
+    # instructions.bin / instructions.json.
     def _missing_static_bins():
         missing = []
-        for name in ("params.bin", "params.json", "decoder_program.bin"):
+        for name in (f"weights{snapshot_suffix}.bin", f"weights{snapshot_suffix}.json",
+                     f"instructions{instruction_suffix}.bin", f"instructions{instruction_suffix}.json"):
             if not os.path.exists(os.path.join(bin_dir, name)):
                 missing.append(name)
-        if has_image and not os.path.exists(os.path.join(bin_dir, "encoder_program.bin")):
-            missing.append("encoder_program.bin")
         return missing
 
     early_missing = _missing_static_bins()
     if early_missing:
-        _original_print("Missing bin files (run smolvlm2_test.py first to generate):")
+        _original_print("Missing required bin files (these must be shipped in smolvlm2_bin/ alongside this script):")
         for f in early_missing:
             _original_print(f"  {os.path.join(bin_dir, f)}")
         return
+
+    # Default is VLM (vision). The bin is always the full VLM bin, so the encoder is available either way;
+    # this only decides whether vision RUNS. --lm-enable (or --image none) selects pure LM-only text mode.
+    lm_only = bool(args.lm_enable) or (args.image is not None
+                                       and str(args.image).strip().lower() in ("none", ""))
+    vision_on = not lm_only
+    if vision_on and (args.image is None or str(args.image).strip().lower() in ("none", "")):
+        args.image = _default_image
+    if args.prompt is None:           # mode-appropriate default prompt
+        args.prompt = _d["lm_prompt"] if lm_only else _d["vlm_prompt"]
+    has_image = vision_on
 
     set_dma_device(args.dev)
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
@@ -575,31 +714,27 @@ def main():
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     _SILENT_MODE = True
 
-    ue = SmolVLM2_UnifiedEngine(script_dir=script_dir, vision_bf16=not args.vision_fp4)
+    ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
+    ue.decode_matmat_mul_core_enable = bool(args.decode_matmat_mul_core_enable)
+    ue.penalty_enable = not bool(args.greedy_enable)
+    _original_print(f"decode_linear={ 'if4_matmat_mul_core' if ue.decode_matmat_mul_core_enable else 'quantized_matmat_core' }")
+    _original_print(f"generation={ 'hardware_penalty' if ue.penalty_enable else 'greedy' }")
     init_hang_prevention(ue)
     ue.load_snapshot()
 
     token_ids = build_input_ids(ue.tokenizer, args.prompt, has_image=has_image)
     seq_len = len(token_ids)
-
-    # Check prefill bin now that we know seq_len
-    S = ((seq_len + 63) // 64) * 64
-    prefill_bin = f"prefill_program_S{S}.bin"
-    if not os.path.exists(os.path.join(bin_dir, prefill_bin)):
-        _original_print(f"Missing bin file (run smolvlm2_test.py first to compile):")
-        _original_print(f"  {os.path.join(bin_dir, prefill_bin)}")
-        return
+    num_image_tokens = sum(t == IMAGE_TOKEN_ID for t in token_ids)
+    num_text_tokens = seq_len - num_image_tokens
 
     if has_image:
         _original_print(f"Image: {os.path.abspath(args.image)}")
     _original_print(f"Prompt: {args.prompt!r} ({seq_len} tokens, image={'yes' if has_image else 'no'})")
 
-    # Load programs from bin
+    # Load the ONE unified instruction bin (encoder + decoder + prefill).
     timer = time.perf_counter()
-    if has_image:
-        enc_addr = ue.load_encoder()
-    ue.load_prefill(seq_len=seq_len)
-    ue.load_decoder()
+    uni_meta = ue.load_all()
+    enc_addr = uni_meta["encoder_addr"]
     _original_print(f"  Loaded from bin in {time.perf_counter() - timer:.2f}s")
 
     # Vision encoder
@@ -636,25 +771,29 @@ def main():
     prefill_time = time.perf_counter() - timer
     _original_print(f"\r  Prefill ({prefill_time:.0f}s) done")
 
-    # Zero stale KV cache positions from padding
-    if padded_seq > seq_len:
-        stale_size = (padded_seq - seq_len) * ue.HEAD_DIM
-        stale_zeros = torch.zeros(stale_size, dtype=torch.bfloat16)
-        for layer in range(ue.NUM_LAYERS):
-            for h in range(ue.NUM_KV_HEADS):
-                k_stale = ue.LAYER0_K_DRAM + layer * ue.KV_LAYER_STRIDE + h * ue.KV_HEAD_STRIDE + seq_len * ue.HEAD_DIM * 2
-                v_stale = ue.LAYER0_V_DRAM + layer * ue.KV_LAYER_STRIDE + h * ue.KV_HEAD_STRIDE + seq_len * ue.HEAD_DIM * 2
-                ue.dma_to_accelerator_memory(k_stale, stale_zeros)
-                ue.dma_to_accelerator_memory(v_stale, stale_zeros)
-
-    # Decode
-    max_new = args.max_seq - seq_len
-    _original_print(f"\n--- Starting decoder ---")
-    _original_print(ue.tokenizer.decode([hw_token]), end="", flush=True)
+    _greedy_until = _d["vlm_greedy_until"] if vision_on else _d["lm_greedy_until"]
+    ue.penalty_enable = not bool(args.greedy_enable)
+    ue.greedy_until = _greedy_until
+    max_new = args.max_decode_tokens if args.max_decode_tokens is not None else args.max_seq - seq_len
+    _original_print(f"\nPrompt:   {args.prompt}")
+    _original_print(f"Response: ", end="", flush=True)   # the generated answer streams right after this
+    # run_decoder prints the seed token itself (mirrors smolvlm2_test.run_decoder), so don't pre-print.
     decode_timer = time.perf_counter()
-    hw_tokens = ue.run_decoder(hw_token, max_new_tokens=max_new)
+    hw_tokens = ue.run_decoder(
+        hw_token,
+        max_new_tokens=max_new,
+    )
     decode_time = time.perf_counter() - decode_timer
     _original_print(f"\nDecoder done in {prefill_time + decode_time:.2f}s total, {len(hw_tokens)} tokens.")
+    _original_print(
+        f"prefill {round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0} tok/s, "
+        f"decode {round(len(hw_tokens) / decode_time, 2) if decode_time > 0 else 0.0} tok/s.")
+
+    # Leave the FPGA DRAM clean for the next run (mirrors smolvlm2_test.py). Without this, consecutive
+    # load-only runs start on stale DRAM, which can corrupt the next run's output.
+    _SILENT_MODE = True
+    ue.zero_dram()
+    ue.software_reset()
 
 
 if __name__ == "__main__":

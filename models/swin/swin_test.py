@@ -47,10 +47,12 @@ def quiet_print(*args, **kwargs):
 
 builtins.print = quiet_print
 
+import nn_lib
 import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
+    INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,
     set_dma_device, UnifiedEngine,
 )
 
@@ -163,6 +165,7 @@ def bf16_patching_core(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR
 def flash_attention_batched(ue: UnifiedEngine, num_batches: int, head_dim: int, seq_len: int,
                             Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int,
                             OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int,
+                            IDENTITY_DRAM_ADDR: int,
                             BIAS_DRAM_ADDR: int = None) -> int:
     """Batched flash attention: loop over num_batches calling flash_attention_core.
 
@@ -189,6 +192,7 @@ def flash_attention_batched(ue: UnifiedEngine, num_batches: int, head_dim: int, 
             V_DRAM_ADDR=V_DRAM_ADDR + b * qkv_batch_stride,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + b * output_batch_stride,
             SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR + b * scratch_batch_stride,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
             BIAS_DRAM_ADDR=bias_addr,
         )
     return total_flops
@@ -388,11 +392,88 @@ def dram_zero_fill(ue: UnifiedEngine, DRAM_ADDR: int, num_elements: int) -> None
         offset += take
 
 
+def pbi_strided_copy(ue: UnifiedEngine, gpr: int,
+                     src_base: int, dst_base: int, count: int,
+                     copy_bytes: int, src_stride: int, dst_stride: int) -> None:
+    """Capture ONE pointer-based-iteration (PBI) loop copying ``count`` blocks.
+
+    Each iteration DMAs ``copy_bytes`` bytes src->dst, then advances the source
+    pointer by ``src_stride`` and the destination pointer by ``dst_stride``. The
+    captured program holds no static ``count`` — ``gpr`` is primed with the trip
+    count and the hardware loop reads it at execute time. This replaces an
+    N-iteration Python-unrolled copy with a ~5-instruction captured body.
+
+    HW rules honoured:
+      * exactly TWO advancing PBI pointers (limit is 3; 4+ corrupt — see
+        qwen-vl rope PBI note). Composes freely with the legacy flash path.
+      * ``copy_bytes`` must fit one SRAM staging row.
+      * when ``dst_stride > copy_bytes`` (writing into a padded slot) the caller
+        MUST pre-zero ``dst`` so the untouched pad bytes stay zero.
+
+    Strides must be uniform across all ``count`` iterations (single PBI_MODE_INC
+    delta per pointer); decompose non-uniform copies before calling.
+    """
+    if copy_bytes <= 0 or copy_bytes % 2 != 0:
+        raise ValueError(f"pbi_strided_copy: copy_bytes must be a positive even (bf16) byte count, got {copy_bytes}")
+    if copy_bytes > URAM_NEAR_FULL_ELEMENTS * 2:
+        raise ValueError(
+            f"pbi_strided_copy: copy_bytes={copy_bytes} exceeds one staging row "
+            f"({URAM_NEAR_FULL_ELEMENTS * 2} bytes)")
+    if count < 1:
+        raise ValueError(f"pbi_strided_copy: count must be >=1, got {count}")
+
+    # Prime the trip count and reset the inst-ptr allocator before alloc_inst_ptr
+    # (same ordering/semantics as Swin_UnifiedEngine._pbi_set and the matmul/LN PBI
+    # cores). The loop counter register is taken from gpr+1 by loop_start.
+    ue._isa_reg_counter = gpr + 1
+    ue.reset_inst_ptr_counter()
+    ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=count)
+
+    _, load_uram_row = ue.sram_address_to_uram_address(0x00000)
+    _, store_uram_row = ue.sram_address_to_uram_address(0x00000)
+
+    ptr_src = ue.alloc_inst_ptr()
+    ptr_dst = ue.alloc_inst_ptr()
+
+    ue.generate_instruction_pbi_init(
+        dram_shared_addr=src_base, dma_length=copy_bytes,
+        uram_dst_addr=load_uram_row, inst_pointer_idx=ptr_src,
+    )
+    ue.generate_instruction_pbi_init(
+        dram_shared_addr=dst_base, dma_length=copy_bytes,
+        uram_a_start_addr=store_uram_row, inst_pointer_idx=ptr_dst,
+    )
+
+    program_dram_start_addr = ue.get_program_dram_addr()
+    cur_inst_count = ue.capture_count
+    ue.generate_instruction_jump_abs(
+        ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
+        )
+    )
+
+    ue.loop_start(loop_cnt=count, gpr_loop_cnt=gpr)
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src_stride, sram_address=0x00000,
+        element_size=0, inst_pointer_idx=ptr_src,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000, accelerator_dram_address=dst_stride,
+        element_size=0, inst_pointer_idx=ptr_dst,
+    )
+    body = ue.loop_end()
+    assert body <= 256, f"pbi_strided_copy: loop body {body} exceeds 256 i-cache budget"
+
+    ue.release_inst_ptr(ptr_dst)
+    ue.release_inst_ptr(ptr_src)
+
+
 def multihead_pad_and_permute(ue: UnifiedEngine,
                               INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                               TEMP_DRAM_ADDR: int,
                               num_windows: int, wa: int, num_heads: int,
-                              head_dim: int, head_dim_pad: int, wa_pad: int) -> None:
+                              head_dim: int, head_dim_pad: int, wa_pad: int,
+                              gpr_pbi: int) -> None:
     """Reshape Q/K/V from projection layout to multi-head attention layout.
 
     Input:  (num_windows * wa, num_heads * head_dim) in INPUT_DRAM_ADDR
@@ -416,68 +497,48 @@ def multihead_pad_and_permute(ue: UnifiedEngine,
     temp_row_width = num_heads * head_dim_pad  # elements per row in padded layout
     output_head_stride = wa_pad * head_dim_pad * bytes_per_element  # per (window, head) block
 
-    # Allocate a single zeros row in params DRAM for padding
-    zeros_addr = ue.get_params_dram_addr()
-    ue.allocate_params_dram(UE_VECTOR_SIZE * bytes_per_element)
-    ue.dma_write(DMA_DEVICE_H2C, zeros_addr,
-                 torch.zeros(UE_VECTOR_SIZE, dtype=torch.bfloat16),
-                 UE_VECTOR_SIZE * bytes_per_element)
+    # Zero TEMP once for the whole call: every window's scatter overwrites only the
+    # head_dim low half of the same head_dim_pad slots, so the padded tails stay zero
+    # across all windows — no need to re-zero per window.
+    dram_zero_fill(ue, TEMP_DRAM_ADDR, wa * temp_row_width)
 
     for w in range(num_windows):
         input_base = INPUT_DRAM_ADDR + w * input_window_stride
 
-        # Step 2: Zero-fill TEMP for this window, then scatter real data
-        dram_zero_fill(ue, TEMP_DRAM_ADDR, wa * temp_row_width)
-
-        for h in range(num_heads):
-            for row in range(wa):
-                src = input_base + (row * dim + h * head_dim) * bytes_per_element
-                dst = TEMP_DRAM_ADDR + (row * temp_row_width + h * head_dim_pad) * bytes_per_element
-
-                # Zero the SRAM row first
-                ue.accelerator_memory_to_sram(
-                    accelerator_dram_address=zeros_addr,
-                    sram_address=0x00000,
-                    element_size=UE_VECTOR_SIZE,
-                )
-                # Load 32 real elements into first half of the zeroed row
-                ue.accelerator_memory_to_sram(
-                    accelerator_dram_address=src,
-                    sram_address=0x00000,
-                    element_size=head_dim,
-                )
-                # Write full 64 elements (32 real + 32 zeros) to TEMP
-                ue.sram_to_accelerator_memory(
-                    sram_address=0x00000,
-                    accelerator_dram_address=dst,
-                    element_size=UE_VECTOR_SIZE,
-                )
-
-        # Step 3: Permute (wa, num_heads, head_dim_pad) -> (num_heads, wa, head_dim_pad)
-        # Output goes to a temp region, then we copy to final output with wa_pad stride
-        permute_out = TEMP_DRAM_ADDR + wa * temp_row_width * bytes_per_element  # second half of temp
-        ue.bf16_permute_core(
-            dim_0=wa, dim_1=num_heads, dim_2=head_dim_pad,
-            INPUT_DRAM_ADDR=TEMP_DRAM_ADDR,
-            OUTPUT_DRAM_ADDR=permute_out,
+        # Step 2: scatter real data into the (pre-zeroed) padded TEMP layout.
+        # Iterating heads innermost (i = row*num_heads + h) makes BOTH the source and
+        # destination perfectly contiguous within the window:
+        #   src offset = (row*dim + h*head_dim)        = i*head_dim     (dim = num_heads*head_dim)
+        #   dst offset = (row*temp_row_width + h*head_dim_pad) = i*head_dim_pad
+        # so the whole scatter collapses to one uniform-stride PBI loop. The PBI copy
+        # writes only the head_dim real elements; padded tails remain zero.
+        pbi_strided_copy(
+            ue, gpr_pbi,
+            src_base=input_base,
+            dst_base=TEMP_DRAM_ADDR,
+            count=wa * num_heads,
+            copy_bytes=head_dim * bytes_per_element,
+            src_stride=head_dim * bytes_per_element,
+            dst_stride=head_dim_pad * bytes_per_element,
         )
 
-        # Step 4: Copy each head's (wa, head_dim_pad) block into output at (wa_pad, head_dim_pad)
-        # with zero-padding rows wa..wa_pad-1 (already zeroed)
+        # Steps 3+4 fused: transpose (wa, num_heads, head_dim_pad) -> per-head padded
+        # blocks (num_heads, wa_pad, head_dim_pad) directly, with NO bf16_permute_core
+        # (which unrolls into wa*num_heads gather instructions per window). For a fixed
+        # output head h, source rows sit at a uniform stride of num_heads*head_dim_pad
+        # in TEMP, so the gather+pad collapses to one small PBI loop per head. Rows
+        # wa..wa_pad-1 stay zero (OUTPUT pre-zeroed by the caller).
+        out_window_base = OUTPUT_DRAM_ADDR + w * num_heads * output_head_stride
+        head_bytes = head_dim_pad * bytes_per_element
         for h in range(num_heads):
-            src_head = permute_out + h * wa * head_dim_pad * bytes_per_element
-            dst_head = OUTPUT_DRAM_ADDR + (w * num_heads + h) * output_head_stride
-
-            # Copy wa rows of head_dim_pad elements each
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=src_head,
-                sram_address=0x00000,
-                element_size=wa * head_dim_pad,
-            )
-            ue.sram_to_accelerator_memory(
-                sram_address=0x00000,
-                accelerator_dram_address=dst_head,
-                element_size=wa * head_dim_pad,
+            pbi_strided_copy(
+                ue, gpr_pbi,
+                src_base=TEMP_DRAM_ADDR + h * head_bytes,
+                dst_base=out_window_base + h * output_head_stride,
+                count=wa,
+                copy_bytes=head_bytes,
+                src_stride=temp_row_width * bytes_per_element,
+                dst_stride=head_bytes,
             )
 
 
@@ -598,6 +659,22 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
     DMA_CHUNK_BYTES = 1 * 1024 * 1024  # 1 MB chunks for large DMA writes
 
+    def _pbi_set(self, gpr: int, val: int) -> None:
+        """Prime GPR for a PBI core call (matmul or layer-norm)."""
+        self._isa_reg_counter = gpr + 1
+        self.reset_inst_ptr_counter()
+        self.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=val)
+
+    @staticmethod
+    def _ln_chunks(M: int, N: int) -> int:
+        """Return the n_chunks value layer_norm_core_dram_pbi expects for (M, N)."""
+        ops_per_row = 6  # 4 core ops + GAMMA + BETA
+        ideal = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256 - 4) // ops_per_row)
+        cs = ideal
+        while M % cs != 0:
+            cs -= 1
+        return M // cs
+
     def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
         """Chunked override to avoid segfault on large instruction DMA writes."""
         if not self.capture_buffer or self.capture_count == 0:
@@ -708,7 +785,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_before_gamma'] = self._alloc_param(block.layernorm_before.weight.data)
                 lw['ln_before_beta'] = self._alloc_param(block.layernorm_before.bias.data)
 
-                # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages
+                # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages.
+                # transformers>=5 nests projections under SwinAttention.self (query/key/value).
                 attn = block.attention.self
                 for name, proj in [('q', attn.query), ('k', attn.key), ('v', attn.value)]:
                     lw[f'{name}_weight'] = self._alloc_param(proj.weight.data)
@@ -721,7 +799,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # gets bias at offset b * wa_pad * wa_pad. Since all windows share
                 # the same per-head bias, we tile num_windows copies.
                 rel_pos_bias_table = attn.relative_position_bias_table  # (529, num_heads)
-                rel_pos_index = attn.relative_position_index  # (144, 144)
+                rel_pos_index = attn.relative_position_index  # flat (window_area*window_area,)
                 rpb = rel_pos_bias_table[rel_pos_index.view(-1)].view(window_area, window_area, num_heads)
                 rpb = rpb.permute(2, 0, 1).contiguous().to(torch.bfloat16)  # (num_heads, 144, 144)
                 # Pad to (num_heads, 192, 192) with -100 in padding positions
@@ -734,7 +812,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     nw * num_heads, window_area_pad, window_area_pad).contiguous()
                 lw['rel_pos_bias'] = self._alloc_param(rpb_tiled)
 
-                # Output projection (attention)
+                # Output projection (attention) — transformers>=5: SwinAttention.output.dense
                 out_proj = block.attention.output.dense
                 lw['out_proj_weight'] = self._alloc_param(out_proj.weight.data)
                 lw['out_proj_bias'] = self._alloc_param(out_proj.bias.data)
@@ -743,11 +821,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_after_gamma'] = self._alloc_param(block.layernorm_after.weight.data)
                 lw['ln_after_beta'] = self._alloc_param(block.layernorm_after.bias.data)
 
-                # MLP expand: (mlp_dim, dim)
+                # MLP expand: (mlp_dim, dim) — transformers>=5: SwinIntermediate.dense
                 lw['mlp_expand_weight'] = self._alloc_param(block.intermediate.dense.weight.data)
                 lw['mlp_expand_bias'] = self._alloc_param(block.intermediate.dense.bias.data)
 
-                # MLP contract: (dim, mlp_dim)
+                # MLP contract: (dim, mlp_dim) — transformers>=5: SwinOutput.dense
                 lw['mlp_contract_weight'] = self._alloc_param(block.output.dense.weight.data)
                 lw['mlp_contract_bias'] = self._alloc_param(block.output.dense.bias.data)
 
@@ -844,9 +922,21 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
             # Attention output: (total_batches, wa_pad, hd_pad)
             st['attn_output'] = self._alloc_tensor(total_batches * wa_pad * hd_pad)
-            # Scratch for flash attention: per batch needs hd*seq + seq*seq
-            scratch_per_batch = hd_pad * wa_pad + wa_pad * wa_pad
-            st['attn_scratch'] = self._alloc_tensor(total_batches * scratch_per_batch)
+            # Shared scratch for the staged legacy flash subroutine: V^T (hd_pad*wa_pad) +
+            # partial-softmax region (UE_FMAX_CONTEXT_SIZE*wa_pad), reused per window.
+            from user_dma_core import UE_FMAX_CONTEXT_SIZE
+            scratch_shared = (hd_pad + UE_FMAX_CONTEXT_SIZE) * wa_pad
+            st['attn_scratch'] = self._alloc_tensor(scratch_shared)
+            # Shared ATTN_P buffer (unused by legacy flash; kept for call compat)
+            st['attn_p'] = self._alloc_tensor(wa_pad * wa_pad)
+            # Fixed staging buffers: the shared flash subroutine reads/writes these; each window
+            # is memcpy'd in/out around the call (no PBI address-injection -> no back-to-back wedge).
+            st['flash_stage_q'] = self._alloc_tensor(wa_pad * hd_pad)
+            st['flash_stage_k'] = self._alloc_tensor(wa_pad * hd_pad)
+            st['flash_stage_v'] = self._alloc_tensor(wa_pad * hd_pad)
+            st['flash_stage_o'] = self._alloc_tensor(wa_pad * hd_pad)
+            # Per-window relative-position bias slice (rel_pos_bias is tiled per batch).
+            st['flash_stage_bias'] = self._alloc_tensor(wa_pad * wa_pad)
 
             # After inverse permute: (num_windows * wa, num_heads * hd_pad)
             st['attn_permuted'] = self._alloc_tensor(num_windows * wa * num_heads * hd_pad)
@@ -879,6 +969,17 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.FINAL_LN_OUTPUT_DRAM = self._alloc_tensor(final_M * final_C)
         self.POOLED_OUTPUT_DRAM = self._alloc_tensor(1 * final_C)              # (1, 1536) avg pooled
         self.CLASSIFIER_OUTPUT_DRAM = self._alloc_tensor(1 * self.pad_dim(self.NUM_LABELS))  # (1, num_labels_pad)
+
+        # 64x64 bf16 identity for the legacy flash-attention I @ V^T pass. Not a
+        # learned weight: it lives in a dedicated tensor-DRAM buffer (so nothing else
+        # overwrites it) and is re-written here on every construction, keeping it out
+        # of params.bin. Deterministic allocation order ⇒ stable address across
+        # compile and bin-load runs.
+        self.IDENTITY_64_DRAM = self._alloc_tensor(UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+        self.dma_to_accelerator_memory(
+            self.IDENTITY_64_DRAM,
+            torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16).contiguous(),
+        )
 
     # ------------------------------------------------------------------
     # Unpad weight construction
@@ -1003,6 +1104,21 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
         self.start_capture()
 
+        if os.environ.get("SWIN_SMOKE") == "halt":
+            # Bare program: nothing but a HALT. Tests program start/load + halt opcode.
+            print("SWIN_SMOKE=halt: emitting a halt-only program")
+            self.generate_instruction_halt()
+            self.stop_capture()
+            pa = self.get_program_dram_addr()
+            self.write_captured_instructions_to_dram(pa)
+            self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+            self.clear_capture_buffer()
+            return pa
+
+        gpr_mm = self.alloc_isa_reg()   # matmul M (= spatial^2 per stage)
+        gpr_ln = self.alloc_isa_reg()   # LN n_chunks (= M // chunk_size per stage)
+        gpr_pbi = self.alloc_isa_reg()  # PBI strided-copy trip count (permute loops)
+
         # ================================================================
         # PRE-ENCODER: patch extraction + bias + LayerNorm
         # ================================================================
@@ -1058,6 +1174,24 @@ class Swin_UnifiedEngine(UnifiedEngine):
             BETA_DRAM_ADDR=self.PATCH_EMBED_LN_BETA,
         )
 
+        # ---- smoke-test finalizer: emit halt + write program early, for fast
+        # localization of the execution hang. Set SWIN_SMOKE=patch (halt right after
+        # patch embed) or SWIN_SMOKE=L<n> (halt after n encoder layer-iterations).
+        def _finalize_smoke():
+            self.generate_instruction_halt()
+            self.stop_capture()
+            pa = self.get_program_dram_addr()
+            self.write_captured_instructions_to_dram(pa)
+            self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+            self.clear_capture_buffer()
+            return pa
+        _smoke = os.environ.get("SWIN_SMOKE")
+        if _smoke == "patch":
+            print("SWIN_SMOKE=patch: halting after patch embed")
+            return _finalize_smoke()
+        _smoke_layers = int(_smoke[1:]) if (_smoke and _smoke.startswith("L")) else None
+        _layer_iter = 0
+
         # ================================================================
         # ENCODER: all stages, layers, and patch merges
         # ================================================================
@@ -1074,18 +1208,22 @@ class Swin_UnifiedEngine(UnifiedEngine):
             total_batches = num_windows * num_heads
             st = self.stage_tensors[s]
 
+            ln_nchunks = self._ln_chunks(M, dim)
+
             for l in range(self.DEPTHS[s]):
                 lw = self.encoder_weights[s][l]
                 shift_size = 0 if l % 2 == 0 else self.WINDOW_SIZE // 2
 
                 # --- 1. Pre-attention LayerNorm ---
                 layer_input_addr = self.EMBED_OUTPUT_DRAM if (s == 0 and l == 0) else st['layer_input']
+                self._pbi_set(gpr_ln, ln_nchunks)
                 self.layer_norm_core_dram(
                     M=M, N=dim,
                     A_DRAM_ADDR=layer_input_addr,
                     OUTPUT_DRAM_ADDR=st['ln_output'],
                     GAMMA_DRAM_ADDR=lw['ln_before_gamma'],
                     BETA_DRAM_ADDR=lw['ln_before_beta'],
+                    gpr_M_reg=gpr_ln,
                 )
 
                 # --- 2. Cyclic shift (odd layers only) ---
@@ -1109,6 +1247,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # --- 4. Q/K/V projections ---
                 M_win = num_windows * wa
                 for name, out_addr in [('q', st['q_proj']), ('k', st['k_proj']), ('v', st['v_proj'])]:
+                    self._pbi_set(gpr_mm, M_win)
                     self.matmat_mul_core(
                         M=M_win, K=dim, N=dim,
                         A_DRAM_ADDR=st['windowed'],
@@ -1116,6 +1255,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                         OUTPUT_DRAM_ADDR=out_addr,
                         C_DRAM_ADDR=lw[f'{name}_bias'],
                         bias_mode="broadcast_N",
+                        gpr_M_reg=gpr_mm,
                     )
 
                 # --- 5. Zero-fill + pad + permute Q/K/V to multi-head ---
@@ -1131,7 +1271,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                         OUTPUT_DRAM_ADDR=heads_addr,
                         TEMP_DRAM_ADDR=st['permute_temp'],
                         num_windows=num_windows, wa=wa, num_heads=num_heads,
-                        head_dim=head_dim, head_dim_pad=hd_pad, wa_pad=wa_pad)
+                        head_dim=head_dim, head_dim_pad=hd_pad, wa_pad=wa_pad,
+                        gpr_pbi=gpr_pbi)
 
                 # --- 5b. Pre-scale Q ---
                 scale_correction = math.sqrt(hd_pad) / math.sqrt(head_dim)
@@ -1156,9 +1297,9 @@ class Swin_UnifiedEngine(UnifiedEngine):
                         element_size=take,
                     )
 
-                # --- 6. Flash attention batched ---
+                # --- 6. Flash attention batched (PBI hardware loop) ---
                 dram_zero_fill(self, st['attn_output'], total_batches * wa_pad * hd_pad)
-                flash_attention_batched(self,
+                nn_lib.flash_attention_batched_pbi(self,
                     num_batches=total_batches,
                     head_dim=hd_pad,
                     seq_len=wa_pad,
@@ -1167,58 +1308,53 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     V_DRAM_ADDR=st['v_heads'],
                     OUTPUT_DRAM_ADDR=st['attn_output'],
                     SCRATCH_DRAM_ADDR=st['attn_scratch'],
+                    ATTN_P_DRAM_ADDR=st['attn_p'],
+                    IDENTITY_TRANSPOSE_DRAM_ADDR=self.IDENTITY_64_DRAM,
                     BIAS_DRAM_ADDR=lw['rel_pos_bias'],
+                    STAGE_Q_DRAM_ADDR=st['flash_stage_q'],
+                    STAGE_K_DRAM_ADDR=st['flash_stage_k'],
+                    STAGE_V_DRAM_ADDR=st['flash_stage_v'],
+                    STAGE_O_DRAM_ADDR=st['flash_stage_o'],
+                    STAGE_BIAS_DRAM_ADDR=st['flash_stage_bias'],
+                    _silent=True,
+                    gpr_M_reg=gpr_mm,
                 )
 
-                # --- 7. Inverse permute ---
+                # --- 7. Inverse permute (fused) ---
+                # Transpose per-head attention blocks (num_heads, wa_pad, hd_pad) back to
+                # token-major (wa, num_heads, hd_pad), dropping the wa_pad padding — all in
+                # one PBI loop per head, with NO bf16_permute_core and no intermediate
+                # buffer. For a fixed head h, source rows are contiguous (stride hd_pad)
+                # and destination rows step by num_heads*hd_pad (uniform), so the gather +
+                # transpose collapses to one small PBI loop per head.
+                head_bytes = hd_pad * 2
+                row_stride = num_heads * hd_pad * 2
                 for w in range(num_windows):
+                    src_window = st['attn_output'] + w * num_heads * wa_pad * hd_pad * 2
+                    dst_window = st['attn_permuted'] + w * wa * num_heads * hd_pad * 2
                     for h in range(num_heads):
-                        src = st['attn_output'] + (w * num_heads + h) * wa_pad * hd_pad * 2
-                        dst = st['permute_temp'] + h * wa * hd_pad * 2
-                        self.accelerator_memory_to_sram(
-                            accelerator_dram_address=src,
-                            sram_address=0x00000,
-                            element_size=wa * hd_pad,
-                        )
-                        self.sram_to_accelerator_memory(
-                            sram_address=0x00000,
-                            accelerator_dram_address=dst,
-                            element_size=wa * hd_pad,
-                        )
-
-                    permute_out = st['permute_temp'] + num_heads * wa * hd_pad * 2
-                    self.bf16_permute_core(
-                        dim_0=num_heads, dim_1=wa, dim_2=hd_pad,
-                        INPUT_DRAM_ADDR=st['permute_temp'],
-                        OUTPUT_DRAM_ADDR=permute_out,
-                    )
-
-                    out_dst = st['attn_permuted'] + w * wa * num_heads * hd_pad * 2
-                    row_elems = num_heads * hd_pad
-                    rows_per_chunk = max(1, URAM_NEAR_FULL_ELEMENTS // row_elems)
-                    for row_start in range(0, wa, rows_per_chunk):
-                        row_take = min(rows_per_chunk, wa - row_start)
-                        chunk_elems = row_take * row_elems
-                        self.accelerator_memory_to_sram(
-                            accelerator_dram_address=permute_out + row_start * row_elems * 2,
-                            sram_address=0x00000,
-                            element_size=chunk_elems,
-                        )
-                        self.sram_to_accelerator_memory(
-                            sram_address=0x00000,
-                            accelerator_dram_address=out_dst + row_start * row_elems * 2,
-                            element_size=chunk_elems,
+                        pbi_strided_copy(
+                            self, gpr_pbi,
+                            src_base=src_window + h * wa_pad * hd_pad * 2,
+                            dst_base=dst_window + h * head_bytes,
+                            count=wa,
+                            copy_bytes=head_bytes,
+                            src_stride=head_bytes,
+                            dst_stride=row_stride,
                         )
 
                 # --- 8. Unpad matmul ---
+                self._pbi_set(gpr_mm, M_win)
                 self.matmat_mul_core(
                     M=M_win, K=num_heads * hd_pad, N=dim,
                     A_DRAM_ADDR=st['attn_permuted'],
                     B_DRAM_ADDR=self.unpad_weight_addrs[s],
                     OUTPUT_DRAM_ADDR=st['attn_unpadded'],
+                    gpr_M_reg=gpr_mm,
                 )
 
                 # --- 9. Output projection ---
+                self._pbi_set(gpr_mm, M_win)
                 self.matmat_mul_core(
                     M=M_win, K=dim, N=dim,
                     A_DRAM_ADDR=st['attn_unpadded'],
@@ -1226,6 +1362,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=st['out_proj'],
                     C_DRAM_ADDR=lw['out_proj_bias'],
                     bias_mode="broadcast_N",
+                    gpr_M_reg=gpr_mm,
                 )
 
                 # --- 10. Window reverse ---
@@ -1271,15 +1408,18 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     )
 
                 # --- 13. Pre-MLP LayerNorm ---
+                self._pbi_set(gpr_ln, ln_nchunks)
                 self.layer_norm_core_dram(
                     M=M, N=dim,
                     A_DRAM_ADDR=st['residual1'],
                     OUTPUT_DRAM_ADDR=st['mlp_ln'],
                     GAMMA_DRAM_ADDR=lw['ln_after_gamma'],
                     BETA_DRAM_ADDR=lw['ln_after_beta'],
+                    gpr_M_reg=gpr_ln,
                 )
 
                 # --- 14. MLP expand ---
+                self._pbi_set(gpr_mm, M)
                 self.matmat_mul_core(
                     M=M, K=dim, N=mlp_dim,
                     A_DRAM_ADDR=st['mlp_ln'],
@@ -1288,9 +1428,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     C_DRAM_ADDR=lw['mlp_expand_bias'],
                     bias_mode="broadcast_N",
                     gelu_enable=True,
+                    gpr_M_reg=gpr_mm,
                 )
 
                 # --- 15. MLP contract ---
+                self._pbi_set(gpr_mm, M)
                 self.matmat_mul_core(
                     M=M, K=mlp_dim, N=dim,
                     A_DRAM_ADDR=st['mlp_mid'],
@@ -1298,6 +1440,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=st['mlp_out'],
                     C_DRAM_ADDR=lw['mlp_contract_bias'],
                     bias_mode="broadcast_N",
+                    gpr_M_reg=gpr_mm,
                 )
 
                 # --- 16. Residual add 2 ---
@@ -1327,6 +1470,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
                         element_size=take,
                     )
 
+                _layer_iter += 1
+                if _smoke_layers is not None and _layer_iter >= _smoke_layers:
+                    print(f"SWIN_SMOKE=L{_smoke_layers}: halting after {_layer_iter} layer-iteration(s)")
+                    return _finalize_smoke()
+
             # ---- Patch merging (after all layers in stages 0-2) ----
             if s < self.NUM_STAGES - 1:
                 pmw = self.patch_merge_weights[s]
@@ -1339,19 +1487,24 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=st['merge_buf'],
                     H=spatial, W=spatial, C=dim)
 
+                pm_ln_chunks = self._ln_chunks(next_M, 4 * dim)
+                self._pbi_set(gpr_ln, pm_ln_chunks)
                 self.layer_norm_core_dram(
                     M=next_M, N=4 * dim,
                     A_DRAM_ADDR=st['merge_buf'],
                     OUTPUT_DRAM_ADDR=st['merge_buf'],
                     GAMMA_DRAM_ADDR=pmw['norm_gamma'],
                     BETA_DRAM_ADDR=pmw['norm_beta'],
+                    gpr_M_reg=gpr_ln,
                 )
 
+                self._pbi_set(gpr_mm, next_M)
                 self.matmat_mul_core(
                     M=next_M, K=4 * dim, N=next_dim,
                     A_DRAM_ADDR=st['merge_buf'],
                     B_DRAM_ADDR=pmw['reduction'],
                     OUTPUT_DRAM_ADDR=self.stage_tensors[s + 1]['layer_input'],
+                    gpr_M_reg=gpr_mm,
                 )
 
         # ================================================================
@@ -1423,8 +1576,12 @@ class Swin_UnifiedEngine(UnifiedEngine):
             bias_mode="broadcast_N",
         )
 
-        self.stop_capture()
+        # HALT must be the LAST captured instruction so the HW stops at the end of
+        # the program; emitting it after stop_capture() (as before) left it out of the
+        # captured buffer entirely, so execution ran off into garbage DRAM and the
+        # queue never went idle (wait_queue timed out → stale argmax).
         self.generate_instruction_halt()
+        self.stop_capture()
 
         prog_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prog_addr)
@@ -1433,7 +1590,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
         return prog_addr
 
-    def run_full_fused(self, pixel_values: torch.Tensor, program_addr: int, timeout: float = 120.0) -> int:
+    def run_full_fused(self, pixel_values: torch.Tensor, program_addr: int, timeout: float = 900.0) -> int:
         """Run the fully-fused forward pass. Returns predicted class index (from HW argmax)."""
         image_chw = pixel_values.squeeze(0).to(torch.bfloat16)
         self.dma_to_accelerator_memory(self.IMAGE_DRAM, image_chw.contiguous().flatten())
@@ -1549,6 +1706,9 @@ def main():
     label = id2label.get(predicted_idx, str(predicted_idx))
     _original_print(f"\n  Image: {image_path}")
     _original_print(f"  Prediction: {label!r} (class {predicted_idx})")
+
+    import json as _json
+    _original_print(f"TEST_RESULT: {_json.dumps({'decoded_text': label})}")
 
 
 if __name__ == "__main__":

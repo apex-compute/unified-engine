@@ -9,9 +9,10 @@ aborts with a clear error before touching the FPGA.
 
 Required artifacts (in ``llama3.2_1b_bin/`` next to this script — produced by
 running ``llama3.2_1b_test.py`` once on a build machine that has HF access):
-  * ``weights_llama3.2_1b_hf.bin``   IF4 layer weights + bf16 embedding
-  * ``llama_instruction.bin``        unified dynamic-PBI instruction bin (prefill + decoder)
-  * ``llama_instruction.json``       per-stage start addresses / sizes / FLOPs
+  * ``params.bin``                   IF4 layer weights + bf16 embedding
+  * ``params.json``                  weight bin metadata (size / layer layout)
+  * ``programs.bin``                 unified dynamic-PBI instruction bin (prefill + decoder)
+  * ``programs.json``                per-stage start addresses / sizes / FLOPs
   * ``Llama-3.2-1B-Instruct/``       tokenizer files only (tokenizer.json /
                                      tokenizer_config.json). Model weights NOT needed.
 
@@ -341,15 +342,11 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         program. ``self.prefill_seq`` must be set by the caller."""
         paths_cfg = self._cfg.get("paths", {})
         meta_path = os.path.join(self.script_dir,
-                                 paths_cfg.get("instruction_meta", "llama3.2_1b_bin/llama_instruction.json"))
-        if bool(getattr(self, "fpga_penalty", False)):
-            # On-FPGA penalty uses a separate bin (LM-head matmul bias on / logit writeback off);
-            # its meta points to llama_instruction_fpgapenalty.bin. Compiled by llama3.2_1b_test.py.
-            meta_path = meta_path.replace(".json", "_fpgapenalty.json")
-            if not os.path.exists(meta_path):
-                raise FileNotFoundError(
-                    f"on-FPGA penalty bin meta not found: {meta_path}\n"
-                    f"  build it with:  python llama3.2_1b_test.py")
+                                 paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(
+                f"programs meta not found: {meta_path}\n"
+                f"  build it with:  python llama3.2_1b_test.py")
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -505,14 +502,12 @@ def _verify_artifacts(script_dir: str, cfg: dict, fpga_penalty: bool = False) ->
     """Hard-fail before any FPGA touch if a required artifact is missing."""
     paths = cfg["paths"]
     inst_bin, inst_meta = paths["instruction_bin"], paths["instruction_meta"]
-    if fpga_penalty:  # on-FPGA penalty loads the _fpgapenalty bin/meta (test.py default)
-        inst_bin = inst_bin.replace(".bin", "_fpgapenalty.bin")
-        inst_meta = inst_meta.replace(".json", "_fpgapenalty.json")
     required = [
         ("llama3.2_1b_config.json", "model config"),
-        (paths["weights_bin"], "weight bin"),
-        (inst_bin, "unified instruction bin"),
-        (inst_meta, "instruction bin meta"),
+        (paths["weights_bin"], "params bin"),
+        (paths.get("params_meta", "llama3.2_1b_bin/params.json"), "params meta"),
+        (inst_bin, "programs bin"),
+        (inst_meta, "programs meta"),
     ]
     tok_dir = os.path.join(script_dir, paths["hf_model_dir"])
     missing = [f"  {rel}   ({label})" for rel, label in required
@@ -548,7 +543,7 @@ def main():
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly (no logit readback); loads the
-    # _fpgapenalty bin. --pure-greedy disables it entirely (plain writeback-on bin).
+    # the unified programs.bin. --pure-greedy disables it entirely.
     parser.add_argument("--pure-greedy", action="store_true",
                         help="Disable the on-FPGA repetition penalty entirely — plain greedy decode "
                              "(writeback-on bin). The penalty is ENABLED by default; use --pure-greedy "
@@ -606,7 +601,7 @@ def main():
     ue.prefill_seq = prefill_seq
     # Decode config — deterministic, on-FPGA penalty only (no host penalty / sampling).
     ue.greedy_until = int(args.greedy_until)
-    ue.fpga_penalty = not bool(args.pure_greedy)   # selects the _fpgapenalty bin + matmul-bias path
+    ue.fpga_penalty = not bool(args.pure_greedy)   # enables the matmul-bias penalty path
     ue.pen_alpha = float(args.pen_alpha)
     ue.pen_cap = float(args.pen_cap)
     ue.rep_window = int(args.rep_window)

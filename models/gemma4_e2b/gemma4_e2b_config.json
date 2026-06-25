@@ -1,9 +1,9 @@
 {
   "fixed_isa_regs": {
-    "V_CACHE_SIZE_REG": 1,
-    "TMP_REG": 2,
-    "ROPE_SIZE_REG": 3,
-    "ROPE_GLOBAL_SIZE_REG": 4
+    "TMP_REG": 1,
+    "GPR_SEQ_LEN_REG": 2,
+    "GPR_Q_SEQ_LEN_REG": 3,
+    "GPR_BUCKET_IDX_REG": 4
   },
   "file_info": {
     "layer_size": 39191808,
@@ -20,37 +20,10 @@
   },
   "model": {
     "max_context_size": 1024,
+    "prefill_max_seq_len": 512,
     "max_prefill_seq_len": 512,
     "sliding_window": 512,
     "end_of_turn_token_id": 106,
-    "prefill_seq_len_buckets": [
-      64,
-      128,
-      192,
-      256,
-      320,
-      384,
-      448,
-      512
-    ],
-    "decoder_seq_len_buckets": [
-      64,
-      128,
-      192,
-      256,
-      320,
-      384,
-      448,
-      512,
-      576,
-      640,
-      704,
-      768,
-      832,
-      896,
-      960,
-      1024
-    ],
     "rope_global_layers": [
       4,
       9,
@@ -74,7 +47,7 @@
     "per_layer_input_scale": 0.7071067811865476
   },
   "paths": {
-    "weights_bin": "gemma4_e2b_bin/weights_gemma4_e2b_hf.bin",
+    "weights_bin": "gemma4_e2b_bin/params.bin",
     "hf_model_dir": "gemma4_e2b_bin/gemma-4-E2B-it",
     "hf_model_repo": "google/gemma-4-E2B-it"
   },

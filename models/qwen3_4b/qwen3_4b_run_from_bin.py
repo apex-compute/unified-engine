@@ -7,9 +7,10 @@ pre-compiled instruction bin from disk, and run prefill + decode.
 
 Requirements on disk (relative to this file):
   - ``qwen3_4b_bin/qwen3_4b_config.json``   model config
-  - ``qwen3_4b_bin/weights_qwen3_4b_hf.bin`` quantized weight bin
-  - ``qwen3_4b_bin/qwen3_4b_instruction.bin`` pre-compiled program bin
-  - ``qwen3_4b_bin/qwen3_4b_instruction.json`` compile-meta sidecar
+  - ``qwen3_4b_bin/params.bin`` quantized weight bin
+  - ``qwen3_4b_bin/params.json`` weight-bin sidecar
+  - ``qwen3_4b_bin/programs.bin`` pre-compiled program bin
+  - ``qwen3_4b_bin/programs.json`` compile-meta sidecar
   - ``qwen3_4b_bin/Qwen3-4B/`` tokenizer files
 
 If any of those are missing, exit early with a clear message. Generate them
@@ -26,7 +27,7 @@ Architecture notes:
 Usage:
   python qwen3_4b_run_from_bin.py
   python qwen3_4b_run_from_bin.py --prompt "your prompt"
-  python qwen3_4b_run_from_bin.py --dev xdma0 [--device kintex7] [--cycle 5.15]
+  python qwen3_4b_run_from_bin.py --dev xdma0 [--cycle 5.62]
   python qwen3_4b_run_from_bin.py --local-weights
 """
 
@@ -92,7 +93,7 @@ def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 6
     return (data_bytes, scale_bytes)
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
-    """Generate weights_qwen3_4b_hf.bin from Hugging Face model per qwen3_4b_config.json layout.
+    """Generate params.bin from Hugging Face model per qwen3_4b_config.json layout.
     Returns the path to the written file. Use this bin to replace full_model_weights.bin."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -335,7 +336,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         # Single shared identity matrix slot (UE_VECTOR_SIZE × UE_VECTOR_SIZE,
         # populated by tensor_init). Passed as IDENTITY_DRAM_ADDR= to every
         # attention/transpose kernel call site. See Trick 4 in
-        # build_API_for_FPGAcomponents.md.
+        # shared_design_notes.md.
 
         bin_path = weights_bin or paths["weights_bin"]
         full_path = os.path.join(self.script_dir, bin_path)
@@ -380,38 +381,46 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         """Get the arg max index from the Unified Engine"""
         return self.read_reg32(UE_ARGMAX_INDEX)
 
-    def sample_next_token(self, prev_tokens: list[int]) -> int:
-        """Read full logits from LOGITS_DRAM and sample using temperature /
-        top_k / top_p / repetition_penalty. Greedy (argmax) when temperature==0."""
+    # ---- On-FPGA repetition penalty (the sole decode path; no host sampling). The penalty
+    # is folded into the LM-head matmul as its per-vocab additive C bias, argmaxed ON CHIP —
+    # the HW argmax register holds the penalized token id, no logit readback. ----
+    def _structural_token_ids(self) -> set:
+        """Token ids never repetition-penalized: punctuation, whitespace, newline, specials."""
+        cached = getattr(self, "_struct_ids_cache", None)
+        if cached is not None:
+            return cached
+        import string
+        allowed = set(string.punctuation) | set(string.whitespace) | set("—–’‘“”…·•‹›«»¡¿")
+        ids = set(int(i) for i in (getattr(self.tokenizer, "all_special_ids", []) or []))
+        for i in range(self.EMBEDDING_ELEMENTS):
+            s = self.tokenizer.decode([i]).strip()
+            if s == "" or all(ch in allowed for ch in s):
+                ids.add(i)
+        self._struct_ids_cache = ids
+        return ids
+
+    def _structural_ids_tensor(self) -> torch.Tensor:
+        t = getattr(self, "_struct_ids_tensor_cache", None)
+        if t is None:
+            t = torch.tensor(sorted(self._structural_token_ids()), dtype=torch.long)
+            self._struct_ids_tensor_cache = t
+        return t
+
+    def _write_penalty_bias(self, prev_tokens) -> None:
+        """bias[t] = clamp(−alpha·count[t], min=−cap) over the last rep_window tokens (structural
+        tokens stay 0); DMA to PENALTY_BIAS_DRAM so the HW argmax of (logits+bias) is penalized."""
         vocab = self.EMBEDDING_ELEMENTS
-        bpe = self.bytes_per_element
-        buf = torch.empty(vocab, dtype=torch.bfloat16)
-        self.dma_read(DMA_DEVICE_C2H, self.LOGITS_DRAM, buf, vocab * bpe)
-        logits = buf.float()
-        rep_pen = float(getattr(self, "repetition_penalty", 1.0))
-        if rep_pen != 1.0 and prev_tokens:
-            seen = torch.tensor(list(set(prev_tokens)), dtype=torch.long)
-            v = logits[seen]
-            logits[seen] = torch.where(v > 0, v / rep_pen, v * rep_pen)
-        temp = float(getattr(self, "temperature", 1.0))
-        if temp <= 0:
-            return int(logits.argmax().item())
-        logits = logits / temp
-        top_k = int(getattr(self, "top_k", 0) or 0)
-        if top_k > 0 and top_k < vocab:
-            kth = torch.topk(logits, top_k).values[-1]
-            logits[logits < kth] = float("-inf")
-        top_p = float(getattr(self, "top_p", 1.0))
-        if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-            probs = torch.softmax(sorted_logits, dim=-1)
-            cumprob = torch.cumsum(probs, dim=-1)
-            keep = cumprob <= top_p
-            keep[0] = True
-            drop_idx = sorted_idx[~keep]
-            logits[drop_idx] = float("-inf")
-        probs = torch.softmax(logits, dim=-1)
-        return int(torch.multinomial(probs, num_samples=1).item())
+        alpha = float(getattr(self, "pen_alpha", 1.0))
+        cap = float(getattr(self, "pen_cap", 20.0))
+        W = int(getattr(self, "rep_window", 256))
+        window = prev_tokens[-W:]
+        count = torch.zeros(vocab, dtype=torch.float32)
+        if window:
+            win = torch.tensor(window, dtype=torch.long)
+            count.index_add_(0, win, torch.ones(win.numel(), dtype=torch.float32))
+            count[self._structural_ids_tensor()] = 0.0
+        bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)
 
     def _load_last_layer_bf16(self) -> None:
         """Load the last layer's 7 matmul weights as bf16 from the HF model and
@@ -661,6 +670,12 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_kv)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_kv)
 
+        # On-FPGA repetition penalty bias (LM-head matmul C term). MUST be allocated LAST,
+        # exactly as in qwen3_4b_test.py, so its address matches the one baked into the bin.
+        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                       torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
+
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
     def program_execute(self, program_start_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR, timeout: float = 120.0, gflops: float = None) -> None:
@@ -786,6 +801,49 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         num_buckets_decoder = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         max_bucket_seq_len = num_buckets_decoder * UE_VECTOR_SIZE
         max_seq_len = self.MAX_CONTEXT_SIZE
+
+        # On-FPGA repetition-penalty state (the LM-head matmul already adds PENALTY_BIAS_DRAM;
+        # token selection is always the HW argmax — no host logit readback). Position-gated:
+        # pure greedy for the first `greedy_until` decoded tokens, then the bias turns on.
+        if not hasattr(self, "_generated_tokens"):
+            self._generated_tokens = []
+        _fpga_penalty = bool(getattr(self, "fpga_penalty", True))
+        _greedy_until = int(getattr(self, "greedy_until", 512))
+        _prompt_len = len(self._generated_tokens)
+        self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
+                                       torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
+
+        # Live decode status bar (llama3.2-style): pin the bottom terminal row as a status
+        # line via an ANSI scroll region; tokens stream above it and the counter refreshes in
+        # place. Only on a real TTY (skipped when piped/redirected, so logs stay clean).
+        import shutil
+        _dec_timer = time.perf_counter()
+        _seq_len_start = self.seq_len
+        _use_status = sys.stdout.isatty()
+        def _status_setup():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")    # scroll region = rows 1..rows-1
+            sys.stdout.write(f"\033[{rows - 1};1H")    # park cursor at bottom of region
+            sys.stdout.flush()
+        def _status_update():
+            rows = shutil.get_terminal_size().lines
+            n = self.seq_len - _seq_len_start
+            elapsed = time.perf_counter() - _dec_timer
+            rate = n / elapsed if elapsed > 0 else 0.0
+            sys.stdout.write("\0337")                  # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # bottom row, clear it
+            sys.stdout.write(f" decoding… {n} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})  "
+                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
+            sys.stdout.write("\0338")                  # restore cursor
+            sys.stdout.flush()
+        def _status_teardown():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")                 # reset scroll region
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # clear the status row
+            sys.stdout.flush()
+        if _use_status:
+            _status_setup()
+
         while self.seq_len < max_seq_len:
             _SILENT_MODE = True
             # self.seq_len at entry is the count of K/V already in cache; the
@@ -814,22 +872,31 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            # Refresh the per-vocab penalty bias (this step's LM-head C term) once past the
+            # gate, BEFORE execute, so the HW argmax of (logits + bias) is already penalized.
+            if _fpga_penalty and (len(self._generated_tokens) - _prompt_len) > _greedy_until:
+                self._write_penalty_bias(self._generated_tokens)
+
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(10.0)
-            if not hasattr(self, "_generated_tokens"):
-                self._generated_tokens = []
-            if float(getattr(self, "temperature", 0.0)) > 0:
-                token_id = self.sample_next_token(self._generated_tokens)
-            else:
-                token_id = self.get_arg_max_index()
+            # Read the HW argmax register — the LM-head matmul already added the penalty bias
+            # on chip, so this is the penalized (or pure-greedy) token. No host logit readback.
+            token_id = self.get_arg_max_index()
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             self.seq_len += 1
             if token_id in _qwen3_stop_tokens:
+                if _use_status:
+                    _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+            if _use_status:
+                _status_update()
+        else:
+            if _use_status:
+                _status_teardown()
         return self.seq_len
 
 # -----------------------------------------------------------------------------
@@ -840,52 +907,46 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
 # Offline runner — no compile machinery. Reads meta JSON from disk, loads the
 # pre-compiled bin to DRAM, runs prefill + decoder.
 # -----------------------------------------------------------------------------
-def _clock_ns_default_for_device(device: str) -> float:
-    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
-    if device in ("rk", "puzhi"):                 return 3.0
-    if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 4.0
-    return 10.0
-
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Qwen3-4B inference from pre-compiled bins (offline)")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt (default: from qwen3_4b_config.json default_prompt)")
     parser.add_argument("--local-weights", action="store_true",
-                        help="Use qwen3_4b_bin/full_model_weights.bin instead of weights_qwen3_4b_hf.bin")
+                        help="Use qwen3_4b_bin/full_model_weights.bin instead of params.bin")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (default: xdma0)")
-    parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
-    # Sampling DEFAULTS to the validated long-context config (temp 0.7 / top-p 0.9
-    # / rep-penalty 1.2). --temperature 0 forces greedy fast path.
-    parser.add_argument('--temperature', type=float, default=0.7,
-                        help='Sampling temperature (0=greedy via HW argmax; >0 enables SW sampling). Default 0.7.')
-    parser.add_argument('--top-k', type=int, default=0,
-                        help='Top-k filter (0=disabled). Active only when --temperature > 0.')
-    parser.add_argument('--top-p', type=float, default=0.9,
-                        help='Top-p (nucleus) filter. Default 0.9.')
-    parser.add_argument('--repetition-penalty', type=float, default=1.2,
-                        help='HF-style repetition penalty (>1 down-weights repeats). Default 1.2.')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='RNG seed for reproducible sampling (only when --temperature > 0).')
+    parser.add_argument("--cycle", type=float, default=5.62,
+                        help="Clock cycle time in ns (default: 5.62ns ≈ peak 22.8 GFLOPS)")
+    # Deterministic on-FPGA decode: token selection is always the HW argmax of
+    # (logits + penalty bias). No host sampling — the repetition penalty is folded into
+    # the LM-head matmul bias (notes_repetition_penalty_fpga_bias.md).
+    parser.add_argument('--pure-greedy', action='store_true',
+                        help='Disable the on-FPGA repetition penalty — plain greedy '
+                             '(bias stays all-zero). Penalty is ENABLED by default.')
+    pen_group = parser.add_argument_group('on-FPGA repetition penalty (active unless --pure-greedy)')
+    pen_group.add_argument('--greedy-until', type=int, default=512,
+                        help='Pure greedy for the first N decoded tokens, then the penalty turns on. Default 512.')
+    pen_group.add_argument('--pen-alpha', type=float, default=1.0,
+                        help='bias[t] = -alpha*count[t] (logit units). Default 1.0.')
+    pen_group.add_argument('--pen-cap', type=float, default=20.0,
+                        help='max |bias| per token (floor on -alpha*count). Default 20.')
+    pen_group.add_argument('--rep-window', type=int, default=256,
+                        help='count tokens over the last N (structural tokens exempt). Default 256.')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     bin_dir = os.path.join(script_dir, "qwen3_4b_bin")
 
     weights_bin_rel = ("qwen3_4b_bin/full_model_weights.bin" if args.local_weights
-                       else "qwen3_4b_bin/weights_qwen3_4b_hf.bin")
+                       else "qwen3_4b_bin/params.bin")
     weights_bin_full = os.path.join(script_dir, weights_bin_rel)
 
     # Hard-fail BEFORE any FPGA / HF touch if a required local file is missing.
     missing = []
     if not os.path.exists(weights_bin_full):
         missing.append(os.path.relpath(weights_bin_full, script_dir))
-    for name in ("qwen3_4b_instruction.bin", "qwen3_4b_instruction.json"):
+    for name in ("programs.bin", "programs.json"):
         if not os.path.exists(os.path.join(bin_dir, name)):
             missing.append(name)
     tokenizer_dir = os.path.join(bin_dir, "Qwen3-4B")
@@ -906,13 +967,10 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
+    _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
+                    f"UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
     global _SILENT_MODE
     _SILENT_MODE = True
@@ -932,31 +990,34 @@ def main():
     prefill_seq = tuple(ue.tokenizer.encode(prompt_with_template, add_special_tokens=False))
     _original_print(f"User prompt ({len(prefill_seq)} tokens): {user_prompt!r}")
 
-    # Sampling config. NOTE: the LM-head writeback mode is baked into the
-    # pre-compiled bin at compile time (qwen3_4b_test.py). Sampling needs logits
-    # in DRAM (writeback ON), which is the default since test.py defaults to
-    # temperature>0. If the bin was compiled with --temperature 0 (greedy,
-    # writeback OFF), sampling here would read stale logits — recompile via
-    # test.py with sampling defaults first.
-    ue.temperature = float(args.temperature)
-    ue.top_k = int(args.top_k)
-    ue.top_p = float(args.top_p)
-    ue.repetition_penalty = float(args.repetition_penalty)
-    ue._generated_tokens = list(prefill_seq)
-    if args.seed is not None and ue.temperature > 0:
-        torch.manual_seed(args.seed)
-    if ue.temperature > 0:
-        _original_print(f"Sampling: temperature={ue.temperature}  top_k={ue.top_k}  "
-                        f"top_p={ue.top_p}  repetition_penalty={ue.repetition_penalty}  seed={args.seed}")
+    # Wire the on-FPGA penalty config onto the engine so run_decoder can read it.
+    ue.fpga_penalty = not bool(args.pure_greedy)
+    ue.greedy_until = int(args.greedy_until)
+    ue.pen_alpha = float(args.pen_alpha)
+    ue.pen_cap = float(args.pen_cap)
+    ue.rep_window = int(args.rep_window)
+    ue._generated_tokens = list(prefill_seq)   # seed the penalty window with the prompt
+    if ue.fpga_penalty:
+        _original_print(f"On-FPGA penalty: alpha={ue.pen_alpha} cap={ue.pen_cap} "
+                        f"rep_window={ue.rep_window} greedy_until={ue.greedy_until}")
+    else:
+        _original_print("Pure greedy (on-FPGA penalty disabled).")
 
     # Read meta JSON directly from disk — no compile_instructions call.
     paths_cfg = cfg.get("paths", {})
     inst_bin_path = os.path.join(script_dir, paths_cfg.get("instruction_bin",
-                                  "qwen3_4b_bin/qwen3_4b_instruction.bin"))
+                                  "qwen3_4b_bin/programs.bin"))
     meta_path = os.path.splitext(inst_bin_path)[0] + ".json"
     with open(meta_path) as _f:
         inst_meta = json.load(_f)
     _original_print(f"  Loaded compile meta from {os.path.relpath(meta_path, script_dir)}")
+    # The released bin must carry the penalty-bias LM head; a stale bin from an older
+    # build (no bias / writeback-on) would silently decode without the penalty.
+    if inst_meta.get("lm_head_sig") != "penalty_bias_argmax":
+        raise SystemExit(
+            f"Instruction bin lm_head_sig={inst_meta.get('lm_head_sig')!r} != 'penalty_bias_argmax'. "
+            "Recompile the bin via qwen3_4b_test.py (it now folds the repetition penalty into "
+            "the LM-head matmul bias).")
 
     _original_print(f"\n--- Loading unified instruction bin ---")
     timer = time.perf_counter()
@@ -986,8 +1047,9 @@ def main():
                                token_id=prefill_seq[-1], gflops_per_token=decoder_total_flops)
     latency_decoder = time.perf_counter() - timer
     decoded_tokens = max(token_cnt - len(prefill_seq) + 1, 1)
-    _original_print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, total {token_cnt} tokens, "
-                    f"decode speed: {decoded_tokens / latency_decoder:.2f} tokens/s ({decoded_tokens} decoded tokens / {latency_decoder:.2f}s).")
+    _original_print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
+                    f"speed: {decoded_tokens / latency_decoder:.2f} tokens/s, total {token_cnt} tokens.")
+    ue.clear_dram()
 
 
 if __name__ == "__main__":

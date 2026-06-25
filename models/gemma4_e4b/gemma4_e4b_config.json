@@ -1,0 +1,170 @@
+{
+  "fixed_isa_regs": {
+    "TMP_REG":            1,
+    "GPR_SEQ_LEN_REG":     2,
+    "GPR_Q_SEQ_LEN_REG":   3,
+    "GPR_BUCKET_IDX_REG":  4
+  },
+  "file_info": {
+    "_comment": "E4B dims. Differences from E2B: hidden 1536->2560, num_layers 35->42, num_key_value_heads 1->2 (group_size 8->4), intermediate 6144->10240, use_double_wide_mlp=false (E2B had double-wide for layers 15-34). Vision and audio encoder dims unchanged.",
+    "layer_size": 58354944,
+    "num_layers": 42,
+    "head_dim": 512,
+    "head_dim_sliding": 256,
+    "hidden_size": 2560,
+    "embedding_vocab": 262144,
+    "group_size": 4,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "mlp_elements": 10240,
+    "mlp_elements_wide": 10240,
+    "bytes_per_element": 2,
+    "per_layer_input_dim": 256
+  },
+  "model": {
+    "max_context_size": 1024,
+    "max_prefill_seq_len": 320,
+    "prefill_max_seq_len": 320,
+    "sliding_window": 512,
+    "end_of_turn_token_id": 106,
+    "rope_global_layers": [
+      5,
+      11,
+      17,
+      23,
+      29,
+      35,
+      41
+    ],
+    "full_attention_layers": [
+      5,
+      11,
+      17,
+      23,
+      29,
+      35,
+      41
+    ],
+    "double_wide_mlp_first_layer": 42,
+    "per_layer_model_proj_scale": 0.019764235376052374,
+    "per_layer_input_scale": 0.7071067811865476
+  },
+  "paths": {
+    "weights_bin": "gemma4_e4b_bin/params.bin",
+    "hf_model_dir": "gemma4_e4b_bin/gemma-4-E4B-it",
+    "hf_model_repo": "google/gemma-4-E4B-it"
+  },
+  "default_prefill_tokens": [
+    2,
+    105,
+    2364,
+    107,
+    54593,
+    786,
+    1003,
+    506,
+    94648,
+    25822,
+    236761,
+    2900,
+    1051,
+    691,
+    625,
+    5284,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107
+  ],
+  "layers": {
+    "structure": [
+      {"key": "BLK0_ATTN_NORM_WEIGHT", "attr": "DRAM_ADDR_LAYER0_PRE_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_Q_WEIGHT_SCALE", "attr": "DRAM_ADDR_LAYER0_Q_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_Q_WEIGHT_DATA", "attr": "DRAM_ADDR_LAYER0_Q_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_K_WEIGHT_SCALE", "attr": "DRAM_ADDR_LAYER0_K_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_K_WEIGHT_DATA", "attr": "DRAM_ADDR_LAYER0_K_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_V_WEIGHT_SCALE", "attr": "DRAM_ADDR_LAYER0_V_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_V_WEIGHT_DATA", "attr": "DRAM_ADDR_LAYER0_V_PROJ_QUANT"},
+      {"key": "BLK0_ATTN_Q_NORM_WEIGHT", "attr": "DRAM_ADDR_LAYER0_Q_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_K_NORM_WEIGHT", "attr": "DRAM_ADDR_LAYER0_K_NORM_GAMMA"},
+      {"key": "BLK0_ATTN_OUTPUT_WEIGHT_SCALE", "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE"},
+      {"key": "BLK0_ATTN_OUTPUT_WEIGHT_DATA", "attr": "DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT"},
+      {"key": "BLK0_POST_ATTENTION_NORM_WEIGHT", "attr": "DRAM_ADDR_LAYER0_POST_NORM_GAMMA"},
+      {"key": "BLK0_FFN_NORM_WEIGHT", "attr": "DRAM_ADDR_LAYER0_FFN_NORM_GAMMA"},
+      {"key": "BLK0_FFN_UP_WEIGHT_SCALE", "attr": "DRAM_ADDR_LAYER0_MLP_UP_SCALE"},
+      {"key": "BLK0_FFN_UP_WEIGHT_DATA", "attr": "DRAM_ADDR_LAYER0_MLP_UP_QUANT"},
+      {"key": "BLK0_FFN_GATE_WEIGHT_SCALE", "attr": "DRAM_ADDR_LAYER0_MLP_GATE_SCALE"},
+      {"key": "BLK0_FFN_GATE_WEIGHT_DATA", "attr": "DRAM_ADDR_LAYER0_MLP_GATE_QUANT"},
+      {"key": "BLK0_FFN_DOWN_WEIGHT_SCALE", "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_SCALE"},
+      {"key": "BLK0_FFN_DOWN_WEIGHT_DATA", "attr": "DRAM_ADDR_LAYER0_MLP_DOWN_QUANT"},
+      {"key": "BLK0_POST_FFW_NORM_WEIGHT", "attr": "DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA"},
+      {"key": "BLK0_PER_LAYER_INPUT_GATE_WEIGHT", "attr": "DRAM_ADDR_LAYER0_PER_LAYER_GATE"},
+      {"key": "BLK0_PER_LAYER_PROJECTION_WEIGHT", "attr": "DRAM_ADDR_LAYER0_PER_LAYER_PROJ"},
+      {"key": "BLK0_POST_PER_LAYER_INPUT_NORM_WEIGHT", "attr": "DRAM_ADDR_LAYER0_POST_PER_LAYER_NORM_GAMMA"},
+      {"key": "BLK0_LAYER_SCALAR_WEIGHT", "attr": "DRAM_ADDR_LAYER0_LAYER_SCALAR"}
+    ],
+    "non_layer": [
+      {"key": "OUTPUT_NORM_WEIGHT", "attr": "DRAM_ADDR_OUTPUT_NORM_GAMMA"},
+      {"key": "PER_LAYER_MODEL_PROJ_WEIGHT", "attr": "DRAM_ADDR_PER_LAYER_MODEL_PROJ"},
+      {"key": "PER_LAYER_PROJ_NORM_WEIGHT", "attr": "DRAM_ADDR_PER_LAYER_PROJ_NORM"},
+      {"key": "LM_HEAD_WEIGHT_SCALE", "attr": "DRAM_ADDR_LM_HEAD_SCALE"},
+      {"key": "LM_HEAD_WEIGHT_DATA", "attr": "DRAM_ADDR_LM_HEAD_QUANT"},
+      {"key": "ROPE_LOCAL", "attr": "DRAM_ADDR_ROPE_LOCAL"},
+      {"key": "ROPE_GLOBAL", "attr": "DRAM_ADDR_ROPE_GLOBAL"}
+    ]
+  },
+  "_regions_layout_comment": "BLK0 starts after token embedding (vocab=262144 * hidden=2560 * 2 = 0x50000000). Per-layer tensor sizes match E4B dims (hidden=2560, num_kv_heads=2, intermediate=10240). layer_size=0x37A6D00 (58354944), padding 192B at end. Storage uses MAX dims (head_dim_full=512 for Q/O, head_dim=256 for K/V, num_kv_heads=2). Sliding layers use only first half of Q/O.",
+  "regions": {
+    "BLK0_ATTN_NORM_WEIGHT":            {"offset": "0x50000000", "size": 5120},
+    "BLK0_ATTN_Q_WEIGHT_SCALE":         {"offset": "0x50001400", "size": 327680},
+    "BLK0_ATTN_Q_WEIGHT_DATA":          {"offset": "0x50051400", "size": 5242880},
+    "BLK0_ATTN_K_WEIGHT_SCALE":         {"offset": "0x50551400", "size": 81920},
+    "BLK0_ATTN_K_WEIGHT_DATA":          {"offset": "0x50565400", "size": 1310720},
+    "BLK0_ATTN_V_WEIGHT_SCALE":         {"offset": "0x506A5400", "size": 81920},
+    "BLK0_ATTN_V_WEIGHT_DATA":          {"offset": "0x506B9400", "size": 1310720},
+    "BLK0_ATTN_Q_NORM_WEIGHT":          {"offset": "0x507F9400", "size": 1024},
+    "BLK0_ATTN_K_NORM_WEIGHT":          {"offset": "0x507F9800", "size": 1024},
+    "BLK0_ATTN_OUTPUT_WEIGHT_SCALE":    {"offset": "0x507F9C00", "size": 327680},
+    "BLK0_ATTN_OUTPUT_WEIGHT_DATA":     {"offset": "0x50849C00", "size": 5242880},
+    "BLK0_POST_ATTENTION_NORM_WEIGHT":  {"offset": "0x50D49C00", "size": 5120},
+    "BLK0_FFN_NORM_WEIGHT":             {"offset": "0x50D4B000", "size": 5120},
+    "BLK0_FFN_UP_WEIGHT_SCALE":         {"offset": "0x50D4C400", "size": 819200},
+    "BLK0_FFN_UP_WEIGHT_DATA":          {"offset": "0x50E14400", "size": 13107200},
+    "BLK0_FFN_GATE_WEIGHT_SCALE":       {"offset": "0x51A94400", "size": 819200},
+    "BLK0_FFN_GATE_WEIGHT_DATA":        {"offset": "0x51B5C400", "size": 13107200},
+    "BLK0_FFN_DOWN_WEIGHT_SCALE":       {"offset": "0x527DC400", "size": 819200},
+    "BLK0_FFN_DOWN_WEIGHT_DATA":        {"offset": "0x528A4400", "size": 13107200},
+    "BLK0_POST_FFW_NORM_WEIGHT":        {"offset": "0x53524400", "size": 5120},
+    "BLK0_PER_LAYER_INPUT_GATE_WEIGHT": {"offset": "0x53525800", "size": 1310720},
+    "BLK0_PER_LAYER_PROJECTION_WEIGHT": {"offset": "0x53665800", "size": 1310720},
+    "BLK0_POST_PER_LAYER_INPUT_NORM_WEIGHT": {"offset": "0x537A5800", "size": 5120},
+    "BLK0_LAYER_SCALAR_WEIGHT":         {"offset": "0x537A6C00", "size": 64}
+  },
+  "_non_layer_regions_layout_comment": "Non-layer region starts after 42 layers: BLK0_base(0x50000000) + 42 * layer_size(0x37A6D00) = 0xE215E200. Sizes: PER_LAYER_MODEL_PROJ_WEIGHT = 256*42*2560*2 = 55050240 (=0x3480000); LM_HEAD_SCALE = 262144*40*2 = 20971520 (=0x1400000); LM_HEAD_DATA = 262144*1280 = 335544320 (=0x14000000). LM-section in bin ends at 0xFABDF800 (~3.92 GB). host_section + vision/audio sections come after. FPGA-resident weights need ~2.7 GB; see notes_gemma4_e4b_scaleup.md.",
+  "non_layer_regions": {
+    "OUTPUT_NORM_WEIGHT":   {"offset": "0xE215E200", "size": 5120},
+    "PER_LAYER_MODEL_PROJ_WEIGHT": {"offset": "0xE215F600", "size": 55050240},
+    "PER_LAYER_PROJ_NORM_WEIGHT":  {"offset": "0xE55DF600", "size": 512},
+    "LM_HEAD_WEIGHT_SCALE": {"offset": "0xE55DF800", "size": 20971520},
+    "LM_HEAD_WEIGHT_DATA":  {"offset": "0xE69DF800", "size": 335544320},
+    "ROPE_LOCAL":           {"offset": "0xFA9DF800", "size": 1048576},
+    "ROPE_GLOBAL":          {"offset": "0xFAADF800", "size": 1048576}
+  },
+  "special": {
+    "embedding": {
+      "token_embd_offset": "0x0",
+      "token_embd_size": "0x50000000"
+    },
+    "rope": {
+      "num_positions": 1024,
+      "theta": 1000000.0,
+      "local_base": 10000.0,
+      "partial_rotary_factor_global": 0.25
+    },
+    "rms_norm": {
+      "gamma_offset": 0.0
+    }
+  }
+}

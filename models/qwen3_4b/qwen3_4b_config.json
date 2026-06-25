@@ -1,5 +1,5 @@
 {
-  "_template_note": "Qwen3-4B config for qwen3_4b_test.py. 36 layers, 32Q/8KV heads, head_dim=128, SwiGLU, QK RMSNorm, no post-attn/post-FFN norm, single RoPE base. Dynamic-PBI single-bin flow: prefill and decoder are each ONE program in the unified bin; host primes gf_seq_len / gf_q_seq_len / gf_bucket_idx via a runtime preamble + jump_abs before each call.",
+  "_template_note": "Qwen3-4B config for qwen3_4b_test.py. 36 layers, 32Q/8KV heads, head_dim=128, SwiGLU, QK RMSNorm, no post-attn/post-FFN norm, single RoPE base. Dynamic-PBI single-bin flow: prefill and decoder are each ONE program in the unified bin; host primes gpr_seq_len / gpr_q_seq_len / gpr_bucket_idx via a runtime preamble + jump_abs before each call.",
   "fixed_isa_regs": {
     "TMP_REG": 1,
     "GPR_SEQ_LEN_REG": 2,
@@ -24,12 +24,13 @@
     "end_of_turn_token_id": 151645
   },
   "paths": {
-    "weights_bin": "qwen3_4b_bin/weights_qwen3_4b_hf.bin",
+    "weights_bin": "qwen3_4b_bin/params.bin",
+    "weights_meta": "qwen3_4b_bin/params.json",
     "local_weights_bin": "qwen3_4b_bin/full_model_weights.bin",
     "hf_model_dir": "qwen3_4b_bin/Qwen3-4B",
     "hf_model_repo": "Qwen/Qwen3-4B",
-    "instruction_bin": "qwen3_4b_bin/qwen3_4b_instruction.bin",
-    "instruction_meta": "qwen3_4b_bin/qwen3_4b_instruction.json"
+    "instruction_bin": "qwen3_4b_bin/programs.bin",
+    "instruction_meta": "qwen3_4b_bin/programs.json"
   },
   "default_system_prompt": "You are a helpful assistant.",
   "default_prompt": "What is 3 + 5?",

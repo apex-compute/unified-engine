@@ -53,23 +53,7 @@
     "normalize_mean": 0.5,
     "normalize_std": 0.5
   },
-  "quantization": {
-    "q4_64": {
-      "block_size": 64,
-      "bits": 4,
-      "scale_divisor": 7.0,
-      "range": [-8, 7]
-    },
-    "fp4_e2m1": {
-      "block_size": 64,
-      "max_value": 6.0,
-      "table": [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-    }
-  },
   "dram_layout": {
-    "q4_default": {
-      "comment": "params ~300MB | tensors 512MB | instructions open"
-    },
     "bf16": {
       "params_dram_base": "0x80000000",
       "tensor_dram_base": "0xC0000000",
@@ -79,13 +63,13 @@
   },
   "paths": {
     "hf_model_repo": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
-    "hf_model_dir": "smolvlm2_bin/SmolVLM2-500M-Video-Instruct",
-    "weights_dir": "smolvlm2_bin",
-    "lm_weights": "smolvlm2_bin/smolvlm2_lm_q4.bin",
-    "vision_weights": "smolvlm2_bin/smolvlm2_vision_fp4.bin"
+    "hf_model_dir": "smolvlm2_bin/SmolVLM2-500M-Video-Instruct"
   },
   "defaults": {
-    "prompt": "Describe this image.",
+    "lm_prompt": "What is the capital of France?",
+    "vlm_prompt": "Describe this image.",
+    "lm_greedy_until": 0,
+    "vlm_greedy_until": 64,
     "image": "test_samples/vette.jpg",
     "dev": "xdma0",
     "cycle_ns": 5.63,

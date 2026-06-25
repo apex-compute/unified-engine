@@ -682,7 +682,7 @@ def main():
     parser = argparse.ArgumentParser(description="Gemma3 layer-0 prefill: run on accelerator, verify with torch ref.")
     parser.add_argument("--layer-size",type=int,default=26,help="Number of layers to compile and verify (default: 1)")
     parser.add_argument("--prompt", type=str, default=None, help="User prompt for prefill; if not set, use config default_prefill_tokens")
-    parser.add_argument("--local-weights", action="store_true", help="Use gemma3_bin/full_model_weights.bin instead of generated weights_gemma3_hf.bin")
+    parser.add_argument("--local-weights", action="store_true", help="Require existing gemma3_bin/params.bin (skip HF regeneration)")
     parser.add_argument("--dual-engine", action="store_true", help="Use dual engine")
     parser.add_argument('--dev', type=str, default='xdma0',help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
