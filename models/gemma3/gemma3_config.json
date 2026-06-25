@@ -3,7 +3,7 @@
     "TMP_REG": 1,
     "GPR_SEQ_LEN_REG": 2,
     "GPR_Q_SEQ_LEN_REG": 3,
-    "GPR_BUCKET_IDX_REG": 4
+    "GPR_ATTN_LEN_REG": 4
   },
   "file_info": {
     "layer_size": 14267392,
