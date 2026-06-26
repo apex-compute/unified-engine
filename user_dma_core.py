@@ -839,7 +839,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        allowed_hw_versions = {0x5f9f99db}
+        allowed_hw_versions = {0x253d5525}
         if CURRENT_DEVICE == "efinix":
             allowed_hw_versions.add(0x12345678)
         assert hw_version in allowed_hw_versions, (
