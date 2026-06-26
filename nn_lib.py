@@ -1501,3 +1501,215 @@ def load_config_with_weight_defs(config_path: str) -> dict:
     return cfg
 
 
+
+
+# =============================================================================
+# Swin windowing kernels (ported from models/swin/swin_test.py for the hlo
+# catalog). Self-contained: only use the SRAM<->DRAM DMA primitives. Both treat
+# the activation as row-major (H, W, C) in DRAM and rearrange via strided DMA.
+# =============================================================================
+def window_partition_dram(ue, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                          H: int, W: int, C: int, window_size: int) -> None:
+    """(H, W, C) -> (num_windows, window_size*window_size, C), each window a
+    contiguous block in the output. Inverse of window_reverse_dram."""
+    bytes_per_element = 2
+    num_windows_h = H // window_size
+    num_windows_w = W // window_size
+    input_row_stride = W * C * bytes_per_element
+    window_elements = window_size * window_size * C
+    row_elements = window_size * C
+    output_offset = 0
+    for wh in range(num_windows_h):
+        for ww in range(num_windows_w):
+            window_src = INPUT_DRAM_ADDR + (wh * window_size * W + ww * window_size) * C * bytes_per_element
+            for row in range(window_size):
+                row_src = window_src + row * input_row_stride
+                row_sram = row * row_elements * bytes_per_element
+                ue.accelerator_memory_to_sram(
+                    accelerator_dram_address=row_src,
+                    sram_address=row_sram,
+                    element_size=row_elements,
+                )
+            ue.sram_to_accelerator_memory(
+                sram_address=0x00000,
+                accelerator_dram_address=OUTPUT_DRAM_ADDR + output_offset,
+                element_size=window_elements,
+            )
+            output_offset += window_elements * bytes_per_element
+
+
+def window_reverse_dram(ue, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                        H: int, W: int, C: int, window_size: int) -> None:
+    """(num_windows, window_size*window_size, C) -> (H, W, C). Inverse of
+    window_partition_dram: read each window contiguously, strided-write rows back."""
+    bytes_per_element = 2
+    num_windows_h = H // window_size
+    num_windows_w = W // window_size
+    output_row_stride = W * C * bytes_per_element
+    window_elements = window_size * window_size * C
+    row_elements = window_size * C
+    input_offset = 0
+    for wh in range(num_windows_h):
+        for ww in range(num_windows_w):
+            window_dst = OUTPUT_DRAM_ADDR + (wh * window_size * W + ww * window_size) * C * bytes_per_element
+            ue.accelerator_memory_to_sram(
+                accelerator_dram_address=INPUT_DRAM_ADDR + input_offset,
+                sram_address=0x00000,
+                element_size=window_elements,
+            )
+            for row in range(window_size):
+                row_sram = row * row_elements * bytes_per_element
+                row_dst = window_dst + row * output_row_stride
+                ue.sram_to_accelerator_memory(
+                    sram_address=row_sram,
+                    accelerator_dram_address=row_dst,
+                    element_size=row_elements,
+                )
+            input_offset += window_elements * bytes_per_element
+
+
+def cyclic_shift_dram(ue, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                      H: int, W: int, C: int, shift_h: int, shift_w: int) -> None:
+    """Cyclic shift (torch.roll) of (H, W, C) tensor in DRAM.
+
+    Shifts by (-shift_h, -shift_w): rows [shift_h:] go first, then rows [:shift_h].
+    Within each row, columns [shift_w:] go first, then columns [:shift_w].
+    Implemented as two contiguous copies per row (right part, then left part).
+    """
+    bytes_per_element = 2
+    row_bytes = W * C * bytes_per_element
+    right_cols = W - shift_w
+    right_bytes = right_cols * C * bytes_per_element
+    for dst_row in range(H):
+        src_row = (dst_row + shift_h) % H
+        src_row_addr = INPUT_DRAM_ADDR + src_row * row_bytes
+        dst_row_addr = OUTPUT_DRAM_ADDR + dst_row * row_bytes
+        # columns [shift_w:] -> [0:right_cols]
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=src_row_addr + shift_w * C * bytes_per_element,
+            sram_address=0x00000, element_size=right_cols * C)
+        ue.sram_to_accelerator_memory(
+            sram_address=0x00000, accelerator_dram_address=dst_row_addr,
+            element_size=right_cols * C)
+        # columns [0:shift_w] -> [right_cols:]
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=src_row_addr, sram_address=0x00000,
+            element_size=shift_w * C)
+        ue.sram_to_accelerator_memory(
+            sram_address=0x00000, accelerator_dram_address=dst_row_addr + right_bytes,
+            element_size=shift_w * C)
+
+
+def patch_merging_gather_dram(ue, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                              H: int, W: int, C: int) -> None:
+    """Gather 2x2 spatial neighbors and concatenate along C.
+
+    Input (H, W, C) -> Output (H/2, W/2, 4*C). For each 2x2 block the 4 elements
+    are concatenated: [x[0::2,0::2], x[1::2,0::2], x[0::2,1::2], x[1::2,1::2]].
+    """
+    bytes_per_element = 2
+    H2, W2 = H // 2, W // 2
+    input_row_bytes = W * C * bytes_per_element
+    output_row_bytes = W2 * 4 * C * bytes_per_element
+    quadrants = [(0, 0), (1, 0), (0, 1), (1, 1)]
+    for out_row in range(H2):
+        for q_idx, (dr, dc) in enumerate(quadrants):
+            src_row = out_row * 2 + dr
+            src_addr = INPUT_DRAM_ADDR + src_row * input_row_bytes + dc * C * bytes_per_element
+            ue.accelerator_memory_to_sram(
+                accelerator_dram_address=src_addr, sram_address=0x00000,
+                element_size=W2 * C, stride_bytes_per_chunk=C * bytes_per_element,
+                stride_jump_bytes=2 * C * bytes_per_element)
+            dst_addr = OUTPUT_DRAM_ADDR + out_row * output_row_bytes + q_idx * C * bytes_per_element
+            ue.sram_to_accelerator_memory(
+                sram_address=0x00000, accelerator_dram_address=dst_addr,
+                element_size=W2 * C, stride_bytes_per_chunk=C * bytes_per_element,
+                stride_jump_bytes=4 * C * bytes_per_element)
+
+
+def dram_zero_fill(ue, DRAM_ADDR: int, num_elements: int) -> None:
+    """Fill a DRAM region with zeros using SRAM as staging buffer."""
+    bytes_per_element = 2
+    chunk_elems = min(URAM_NEAR_FULL_ELEMENTS, num_elements)
+    zeros = torch.zeros(chunk_elems, dtype=torch.bfloat16)
+    zeros_dram = ue.get_params_dram_addr()
+    ue.allocate_params_dram(chunk_elems * bytes_per_element)
+    ue.dma_write(DMA_DEVICE_H2C, zeros_dram, zeros, chunk_elems * bytes_per_element)
+    ue.accelerator_memory_to_sram(accelerator_dram_address=zeros_dram,
+                                  sram_address=0x00000, element_size=chunk_elems)
+    offset = 0
+    while offset < num_elements:
+        take = min(chunk_elems, num_elements - offset)
+        ue.sram_to_accelerator_memory(sram_address=0x00000,
+            accelerator_dram_address=DRAM_ADDR + offset * bytes_per_element,
+            element_size=take)
+        offset += take
+
+
+def pbi_strided_copy(ue, gpr: int, src_base: int, dst_base: int, count: int,
+                     copy_bytes: int, src_stride: int, dst_stride: int) -> None:
+    """Capture ONE pointer-based-iteration (PBI) loop copying ``count`` blocks:
+    each iteration DMAs ``copy_bytes`` src->dst then advances src by ``src_stride``
+    and dst by ``dst_stride``. Trip count lives in ``gpr`` (read at execute time).
+    HW rules: exactly two advancing PBI pointers; copy_bytes fits one SRAM row;
+    pre-zero dst when dst_stride>copy_bytes; strides must be uniform."""
+    if copy_bytes <= 0 or copy_bytes % 2 != 0:
+        raise ValueError(f"pbi_strided_copy: copy_bytes must be positive even, got {copy_bytes}")
+    if copy_bytes > URAM_NEAR_FULL_ELEMENTS * 2:
+        raise ValueError(f"pbi_strided_copy: copy_bytes={copy_bytes} exceeds one staging row")
+    if count < 1:
+        raise ValueError(f"pbi_strided_copy: count must be >=1, got {count}")
+    ue._isa_reg_counter = gpr + 1
+    ue.reset_inst_ptr_counter()
+    ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=count)
+    _, load_uram_row = ue.sram_address_to_uram_address(0x00000)
+    _, store_uram_row = ue.sram_address_to_uram_address(0x00000)
+    ptr_src = ue.alloc_inst_ptr()
+    ptr_dst = ue.alloc_inst_ptr()
+    ue.generate_instruction_pbi_init(dram_shared_addr=src_base, dma_length=copy_bytes,
+        uram_dst_addr=load_uram_row, inst_pointer_idx=ptr_src)
+    ue.generate_instruction_pbi_init(dram_shared_addr=dst_base, dma_length=copy_bytes,
+        uram_a_start_addr=store_uram_row, inst_pointer_idx=ptr_dst)
+    program_dram_start_addr = ue.get_program_dram_addr()
+    cur_inst_count = ue.capture_count
+    ue.generate_instruction_jump_abs(ue_35bit_addr_shifter(
+        program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES))
+    ue.loop_start(loop_cnt=count, gpr_loop_cnt=gpr)
+    ue.accelerator_memory_to_sram(accelerator_dram_address=src_stride,
+        sram_address=0x00000, element_size=0, inst_pointer_idx=ptr_src)
+    ue.sram_to_accelerator_memory(sram_address=0x00000,
+        accelerator_dram_address=dst_stride, element_size=0, inst_pointer_idx=ptr_dst)
+    body = ue.loop_end()
+    assert body <= 256, f"pbi_strided_copy: loop body {body} exceeds 256 i-cache budget"
+    ue.release_inst_ptr(ptr_dst)
+    ue.release_inst_ptr(ptr_src)
+
+
+def multihead_pad_and_permute(ue, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                              TEMP_DRAM_ADDR: int, num_windows: int, wa: int,
+                              num_heads: int, head_dim: int, head_dim_pad: int,
+                              wa_pad: int, gpr_pbi: int) -> None:
+    """Reshape Q/K/V from projection layout (num_windows*wa, num_heads*head_dim)
+    to multi-head attention layout (num_windows*num_heads, wa_pad, head_dim_pad),
+    scattering head_dim real elements into head_dim_pad slots. OUTPUT must be
+    pre-zeroed (dram_zero_fill). TEMP needs >= wa*num_heads*head_dim_pad elements."""
+    bytes_per_element = 2
+    dim = num_heads * head_dim
+    input_window_stride = wa * dim * bytes_per_element
+    temp_row_width = num_heads * head_dim_pad
+    output_head_stride = wa_pad * head_dim_pad * bytes_per_element
+    dram_zero_fill(ue, TEMP_DRAM_ADDR, wa * temp_row_width)
+    for w in range(num_windows):
+        input_base = INPUT_DRAM_ADDR + w * input_window_stride
+        pbi_strided_copy(ue, gpr_pbi, src_base=input_base, dst_base=TEMP_DRAM_ADDR,
+            count=wa * num_heads, copy_bytes=head_dim * bytes_per_element,
+            src_stride=head_dim * bytes_per_element,
+            dst_stride=head_dim_pad * bytes_per_element)
+        out_window_base = OUTPUT_DRAM_ADDR + w * num_heads * output_head_stride
+        head_bytes = head_dim_pad * bytes_per_element
+        for h in range(num_heads):
+            pbi_strided_copy(ue, gpr_pbi,
+                src_base=TEMP_DRAM_ADDR + h * head_bytes,
+                dst_base=out_window_base + h * output_head_stride,
+                count=wa, copy_bytes=head_bytes,
+                src_stride=temp_row_width * bytes_per_element, dst_stride=head_bytes)

@@ -337,6 +337,49 @@ UE_HLO: dict[str, KernelSpec] = {
             data_type=_type(a.get("dtype", "if4"))),
     ),
 
+    # ---- Swin windowing (dedicated kernels; order-sensitive, no PBI). The flat
+    # activation is (H*W, C); partition rearranges rows into per-window blocks (total
+    # element count unchanged), reverse is the exact inverse. Caller passes spatial
+    # H, W (the token grid side lengths) + window_size in attrs; C is taken from input.
+    "window_partition": KernelSpec(   # nn_lib.window_partition_dram
+        name="window_partition", fn="window_partition_dram", src="nn", pbi=False,
+        out_shape=lambda ins, a: ins[0].shape,
+        build=lambda h, ins, out, a, reg: dict(
+            INPUT_DRAM_ADDR=ins[0].addr, OUTPUT_DRAM_ADDR=out.addr,
+            H=a["H"], W=a["W"], C=ins[0].shape[1], window_size=a["window_size"]),
+    ),
+
+    "window_reverse": KernelSpec(     # nn_lib.window_reverse_dram
+        name="window_reverse", fn="window_reverse_dram", src="nn", pbi=False,
+        out_shape=lambda ins, a: ins[0].shape,
+        build=lambda h, ins, out, a, reg: dict(
+            INPUT_DRAM_ADDR=ins[0].addr, OUTPUT_DRAM_ADDR=out.addr,
+            H=a["H"], W=a["W"], C=ins[0].shape[1], window_size=a["window_size"]),
+    ),
+
+    "roll": KernelSpec(   # nn_lib.cyclic_shift_dram — torch.roll on a spatial (H,W,C) map
+        name="roll", fn="cyclic_shift_dram", src="nn", pbi=False,
+        out_shape=lambda ins, a: ins[0].shape,
+        build=lambda h, ins, out, a, reg: dict(
+            INPUT_DRAM_ADDR=ins[0].addr, OUTPUT_DRAM_ADDR=out.addr,
+            H=a["H"], W=a["W"], C=a["C"],
+            shift_h=a["shift_h"], shift_w=a["shift_w"]),
+    ),
+
+    "patch_merge": KernelSpec(   # nn_lib.patch_merging_gather_dram — 2x2 gather, (H,W,C)->(H/2,W/2,4C)
+        name="patch_merge", fn="patch_merging_gather_dram", src="nn", pbi=False,
+        out_shape=lambda ins, a: (a["H"] // 2 * a["W"] // 2, 4 * a["C"]),
+        build=lambda h, ins, out, a, reg: dict(
+            INPUT_DRAM_ADDR=ins[0].addr, OUTPUT_DRAM_ADDR=out.addr,
+            H=a["H"], W=a["W"], C=a["C"]),
+    ),
+
+    "mean": KernelSpec(   # sequence mean-pool (final vision head); HOST op, no device kernel
+        name="mean", fn=None, src="host", pbi=False,
+        out_shape=lambda ins, a: (ins[0].shape[0], ins[0].shape[-1]),
+        build=lambda h, ins, out, a, reg: dict(),
+    ),
+
     # ---- data movement (SRAM<->DRAM). Not chainable tensor ops — addresses only.
     # Used for inter-layer residual carry and GQA staging. Call via host helpers
     # (sel.load_sram / sel.store_dram), not through chain(), since they produce no

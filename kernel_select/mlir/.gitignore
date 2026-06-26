@@ -1,0 +1,15 @@
+# LLVM monorepo clone — 4.8GB, has its own .git, build DEPENDENCY not our source.
+# Rebuild via: configure ue-mlir against this with -DLLVM_EXTERNAL_PROJECTS=ue.
+llvm-project/
+
+# build outputs
+ue-mlir/build/
+
+# python
+__pycache__/
+*.pyc
+
+# regenerable artifacts / logs
+*.err
+*.bin
+swin_*.unrolled.txt
