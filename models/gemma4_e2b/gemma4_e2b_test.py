@@ -9195,6 +9195,10 @@ def main():
                         help='Clock cycle time in nanoseconds (default: 3.0, use 2.5 for alveo)')
     args = parser.parse_args()
 
+    if args.device == "efinix":
+        print("ERROR: gemma4_e2b requires ~1920 MB of DRAM for weights alone (1600 MB LM + 320 MB vision/audio), exceeding the Efinix board's 1 GB limit.")
+        raise SystemExit(1)
+
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C

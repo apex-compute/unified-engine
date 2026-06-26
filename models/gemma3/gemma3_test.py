@@ -46,8 +46,9 @@ from huggingface_hub import snapshot_download
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, configure_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
+
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -258,9 +259,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False):
-        program_dram_base = DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else DRAM_INSTRUCTION_ADDR
+        program_dram_base = user_dma_core.DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else user_dma_core.DRAM_INSTRUCTION_ADDR
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
-        super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
+        super().__init__(
+            BASE_ADDR=engine_base,
+            params_dram_base=user_dma_core.DRAM_START_ADDR,
+            program_dram_base=program_dram_base,
+            tensor_dram_base=user_dma_core.DRAM_ACTIVATION_ADDR,
+        )
         self.dual_engine = dual_engine
         self.script_dir = script_dir or SCRIPT_DIR
         self._cfg = self.load_config(script_dir=self.script_dir)
@@ -1664,7 +1670,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device == "kintex7":                       return 5.1594
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 4.0
+    if device in ("alveo", "efinix"):              return 4.0
     return 10.0
 
 
@@ -1679,7 +1685,7 @@ def main():
         help="Dual-engine path (compile-time sharding hooks exist; PBI + dual not verified end-to-end—CLI still rejects).",
     )
     parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+                        help='DMA device name (e.g., xdma0, xdma1). Ignored for --device efinix.')
     parser.add_argument(
         '--device',
         type=str,
@@ -1696,11 +1702,12 @@ def main():
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
     args = parser.parse_args()
 
-    set_dma_device(args.dev)
+    configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    globals()["DRAM_INSTRUCTION_ADDR"] = user_dma_core.DRAM_INSTRUCTION_ADDR
 
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
