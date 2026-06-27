@@ -52,7 +52,9 @@ def parse_mlir(text):
         attrs = {}
         ab = re.search(r"\{(.*)\}", mid)
         if ab:
-            for k, v in re.findall(r"(\w+)\s*=\s*([^,]+?)(?:,|$)", ab.group(1)):
+            # value is either a [bracketed, list] or a comma-free scalar; match the
+            # bracket form first so perm=[0, 2, 1, 3] isn't split on its commas.
+            for k, v in re.findall(r"(\w+)\s*=\s*(\[[^\]]*\]|[^,]+)", ab.group(1)):
                 attrs[k] = v.strip()
         out_shape = _parse_shape(types.split("->")[-1])
         ops.append(dict(res=res, op=op, operands=operands, attrs=attrs, out=out_shape))

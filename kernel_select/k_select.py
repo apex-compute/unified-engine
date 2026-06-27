@@ -64,7 +64,9 @@ def build_parser():
 
 # Engine modules resolve via relative paths (this file lives in <repo>/kernel_select/),
 # so no repo path needs to be configured here.
-ARGS = build_parser().parse_args()
+# Parse real argv only when run as the CLI; on import (e.g. from loom.engine) use
+# defaults so the module is import-safe and doesn't consume the importer's argv.
+ARGS = build_parser().parse_args([] if __name__ != "__main__" else None)
 
 import torch
 from ir_harness import IRHarness, Tensor, pad64, FUSIONS, FUSION_LABEL

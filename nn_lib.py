@@ -186,6 +186,25 @@ def smart_bf16_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
         out_addr = output_dram_addr
         remaining = total_elements
         aligned = (URAM_NEAR_FULL_ELEMENTS // (UE_VECTOR_SIZE * last_dim)) * UE_VECTOR_SIZE * last_dim
+        if aligned == 0:
+            # Row wider than URAM (e.g. pixel-shuffle's 12288-wide rows): a whole
+            # row can't be staged, so copy each row in URAM-sized column chunks.
+            # (Case 1 keeps the last dim fixed, so this is a pure row reorder.)
+            cap = (URAM_NEAR_FULL_ELEMENTS // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+            n_rows = total_elements // last_dim
+            for j in range(n_rows):
+                src_row = permute_a[j * last_dim].item()
+                off = 0
+                while off < last_dim:
+                    c = min(cap, last_dim - off)
+                    ue.ue_memcpy_from_dram(input_dram_addr + (src_row + off) * bpe,
+                        c * bpe, 0, URAM_START_ADDR, URAM_SECTION.URAM_A.value)
+                    ue.wait_queue()
+                    ue.ue_memcpy_to_dram(0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
+                        output_dram_addr + (j * last_dim + off) * bpe, c * bpe)
+                    ue.wait_queue()
+                    off += c
+            return (1, output_shape)
         i = 0
         while remaining > 0:
             cur = min(aligned, remaining)

@@ -15,7 +15,10 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(os.path.dirname(HERE))     # repo root: the single nn_lib lives here
 sys.path.insert(0, HERE)
+if _REPO not in sys.path:
+    sys.path.append(_REPO)
 
 import torch
 
@@ -28,7 +31,9 @@ from validate_attention import snr_db
 # (nn_lib), NOT from any model's reference test file. The executor resolves
 # op-name -> kernel; it has no per-model dependency.
 from nn_lib import (window_partition_dram, window_reverse_dram,
-                    cyclic_shift_dram, patch_merging_gather_dram)
+                    cyclic_shift_dram, patch_merging_gather_dram,
+                    smart_bf16_permute_core)
+import re as _re
 from loom_plan import AttentionSpec
 from user_dma_core import UE_VECTOR_SIZE
 
@@ -74,7 +79,8 @@ def _trace_fwd_matmul(ssa, consumers):
 class IRExecutor:
     """Walk ue MLIR ops, bind real weights, execute the whole graph on the FPGA."""
 
-    def __init__(self, model, example_inputs, *, ws=12, patch_spec=None, strict=True):
+    def __init__(self, model, example_inputs, *, ws=12, patch_spec=None, strict=True,
+                 ue=None):
         self.mlir, self.em, self.argvals = torch_to_ue.lower(
             model, example_inputs, patch_spec=patch_spec, strict=strict)
         self.args, self.ops = parse_mlir(self.mlir)
@@ -82,6 +88,7 @@ class IRExecutor:
         self.in_ssa = self.em.input_ssa       # arg ssa -> real input tensor
         self.ws = ws
         self.model, self.example_inputs = model, example_inputs
+        self._injected_ue = ue                # shared engine (loom Engine owns one)
         self._analyze()
 
     # ---- idiom recognition (generic; no Swin hardcode) --------------------
@@ -239,12 +246,12 @@ class IRExecutor:
         all ops up to it (the host region). stop_after=ssa: last device op; ops
         after it are the host head and are skipped."""
         from user_dma_core import UnifiedEngine
-        # Rebase the DRAM map for full-model scale: the default tensor-scratch
-        # region (0xB0000000..0xD0000000 = 512MB) overflows for an 830-op encoder
-        # whose stage-0 tensors are 9216 tokens. Push the program base up to
-        # 0xFC000000 so scratch gets ~1.3GB; keep everything < 0x100000000 (the
+        # Use the injected shared engine if loom's Engine owns one (single ue across
+        # all workloads); otherwise construct a standalone engine. Rebased DRAM map:
+        # tensor scratch at 0xB2000000, program at 0xF0000000 (< 0x100000000, the
         # 4GB-map contract). params stays at 0x80000000 (default, ~700MB headroom).
-        ue = UnifiedEngine(tensor_dram_base=0xB2000000, program_dram_base=0xF0000000)
+        ue = self._injected_ue if self._injected_ue is not None else \
+            UnifiedEngine(tensor_dram_base=0xB2000000, program_dram_base=0xF0000000)
         sym = {}                                       # ssa -> dram addr
         shp = {}                                       # ssa -> shape
         idx = {o["res"]: i for i, o in enumerate(self.ops)}
@@ -262,6 +269,7 @@ class IRExecutor:
                 shp[a_ssa] = list(val.shape)
         gpr_mm, gpr_ln, gpr_pbi = ue.alloc_isa_reg(), ue.alloc_isa_reg(), ue.alloc_isa_reg()
         alloc = lambda n: _alloc(ue, n)
+        perm_identity = _alloc_param(ue, torch.eye(UE_VECTOR_SIZE))  # for ue.permute transpose
 
         prog = ue.get_program_dram_addr()
         ue.clear_inst_id(); ue.start_capture()
@@ -323,8 +331,28 @@ class IRExecutor:
                 patch_merging_gather_dram(ue, INPUT_DRAM_ADDR=sym[inp],
                                           OUTPUT_DRAM_ADDR=out, H=side, W=side, C=C)
                 sym[res] = out; last = res; continue
-            # --- views: alias (skip dead/span-internal views) ---
-            if op in ("reshape", "select", "permute"):
+            # --- real permute: data-moving rearrange via the ND permute kernel.
+            # (Idiom permutes — window/attention — were marked consumed and skipped
+            # above; only standalone permutes like the connector pixel-shuffle reach
+            # here, and those genuinely move memory, so emit the kernel.) ---
+            if op == "permute":
+                src = o["operands"][0]
+                if src not in sym:
+                    continue
+                perm = [int(x) for x in _re.findall(r"\d+", o["attrs"].get("perm", ""))]
+                in_shape = list(shp[src])
+                if not perm or perm == list(range(len(perm))):   # identity -> alias
+                    sym[res] = sym[src]; last = res; continue
+                numel = 1
+                for d in in_shape:
+                    numel *= d
+                out = alloc(numel); tmp = alloc(numel)
+                smart_bf16_permute_core(ue, dims=in_shape, permute_indices=perm,
+                                        input_dram_addr=sym[src], output_dram_addr=out,
+                                        params_dram_addr=perm_identity, temp_dram_start=tmp)
+                sym[res] = out; last = res; continue
+            # --- views: alias (reshape/select are contiguous reinterprets) ---
+            if op in ("reshape", "select"):
                 src = o["operands"][0]
                 if src in sym:
                     sym[res] = sym[src]; last = res
@@ -372,21 +400,13 @@ class IRExecutor:
         ue.program_execute(prog)
         M, N = _MN(shp[last])
         hw = ue.dma_from_accelerator_memory(sym[last], (M, N)).float()
+        # stats hook (read by loom.engine for the dump header; behavior unchanged)
+        self.ue = ue
+        self.stats = dict(ops=len(self.ops), attn=len(self.attn),
+                          window=len(self.window), program_mb=size / 1e6,
+                          tensor_mb=ue.get_tensor_dram_usage() / 1e6,
+                          params_mb=ue.get_params_dram_usage() / 1e6)
         return hw, last
-
-
-def validate(dim=192, heads=6, ws=12, H=12):
-    torch.manual_seed(0)
-    blk = torch_to_ue.SwinBlock(dim=dim, heads=heads, ws=ws).eval()
-    x = torch.randn(1, H, H, dim)
-    ref = blk(x).reshape(H * H, dim)
-    ex = IRExecutor(blk, (x,), ws=ws)
-    hw, last = ex.run()
-    s = snr_db(ref, hw[:, :dim])
-    print(f"[ir] IR-driven Swin block  SNR = {s:.2f} dB  [{'PASS' if s > 19 else 'FAIL'}]")
-    print(f"     ref[0,:4] = {[round(v,4) for v in ref[0,:4].tolist()]}")
-    print(f"     hw [0,:4] = {[round(v,4) for v in hw[0,:4].tolist()]}")
-    return s
 
 
 def run_real(model_id="microsoft/swin-large-patch4-window12-384-in22k",
@@ -448,12 +468,8 @@ def run_real(model_id="microsoft/swin-large-patch4-window12-384-in22k",
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--real", action="store_true", help="run a real HF Swin model")
     ap.add_argument("--model", default="microsoft/swin-large-patch4-window12-384-in22k")
     ap.add_argument("--image", default="../../test_samples/vette.jpg")
     ap.add_argument("--ws", type=int, default=None)
     args = ap.parse_args()
-    if args.real:
-        run_real(args.model, args.image, args.ws)
-    else:
-        validate()
+    run_real(args.model, args.image, args.ws)
