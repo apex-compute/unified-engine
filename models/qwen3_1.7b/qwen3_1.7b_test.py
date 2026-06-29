@@ -1774,6 +1774,10 @@ def main():
                              'special tokens). Default 256.')
     args = parser.parse_args()
 
+    if args.device == "efinix":
+        print("ERROR: qwen3_1.7b requires ~1134 MB of DRAM for weights, exceeding the Efinix board's 1 GB limit.")
+        raise SystemExit(1)
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:
         weights_bin_rel = "qwen3_1.7b_bin/full_model_weights.bin"
