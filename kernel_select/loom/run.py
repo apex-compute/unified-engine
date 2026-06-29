@@ -212,7 +212,7 @@ def main():
     args = ap.parse_args()
 
     model, cfg = _load(args.model)
-    engine = eng.Engine(args.model)
+    engine = eng.Engine(args.model, model=model)   # model -> DRAM map sized to footprint
 
     # SCHEDULE: model -> ordered, numbered workloads (the forward pass).
     workloads = core.schedule(model, cfg, lower=None)

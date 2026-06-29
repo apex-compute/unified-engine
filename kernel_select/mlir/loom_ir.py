@@ -270,6 +270,13 @@ class IRExecutor:
         gpr_mm, gpr_ln, gpr_pbi = ue.alloc_isa_reg(), ue.alloc_isa_reg(), ue.alloc_isa_reg()
         alloc = lambda n: _alloc(ue, n)
         perm_identity = _alloc_param(ue, torch.eye(UE_VECTOR_SIZE))  # for ue.permute transpose
+        # Persistent zeros buffer for layer_norm. If ZEROS_DRAM_ADDR is None the kernel
+        # writes its zeros to get_params_dram_addr() WITHOUT allocating it, so the next
+        # _alloc_param weight overwrites the zeros -> the norm reads garbage -> NaN
+        # (non-deterministic, whichever norm's zeros get clobbered). Allocate ONE real
+        # zeros buffer sized to the widest norm and pass it to every layer_norm.
+        _ln_ns = [_MN(o["out"])[1] for o in self.ops if o["op"] == "layer_norm"]
+        ln_zeros = _alloc_param(ue, torch.zeros(max(_ln_ns))) if _ln_ns else None
 
         prog = ue.get_program_dram_addr()
         ue.clear_inst_id(); ue.start_capture()
@@ -362,10 +369,17 @@ class IRExecutor:
                 M, N = _MN(o["out"]); ow = self.ow[res]
                 g = _alloc_param(ue, ow["gamma"]); b = _alloc_param(ue, ow["beta"])
                 out = alloc(M * N)
-                _pbi_set(ue, gpr_ln, _ln_chunks(M, N))
-                ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=sym[o["operands"][0]],
-                                        OUTPUT_DRAM_ADDR=out, GAMMA_DRAM_ADDR=g,
-                                        BETA_DRAM_ADDR=b, gpr_M_reg=gpr_ln)
+                if os.environ.get("LOOM_LN_NOPBI"):     # diagnostic: non-PBI layer_norm
+                    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=sym[o["operands"][0]],
+                                            OUTPUT_DRAM_ADDR=out, GAMMA_DRAM_ADDR=g,
+                                            BETA_DRAM_ADDR=b, gpr_M_reg=None,
+                                            ZEROS_DRAM_ADDR=ln_zeros)
+                else:
+                    _pbi_set(ue, gpr_ln, _ln_chunks(M, N))
+                    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=sym[o["operands"][0]],
+                                            OUTPUT_DRAM_ADDR=out, GAMMA_DRAM_ADDR=g,
+                                            BETA_DRAM_ADDR=b, gpr_M_reg=gpr_ln,
+                                            ZEROS_DRAM_ADDR=ln_zeros)
                 sym[res] = out; last = res; continue
             # --- matmul (MLP fc1/fc2; act gelu) ---
             if op == "matmul":
@@ -398,6 +412,61 @@ class IRExecutor:
               f"tensor={ue.get_tensor_dram_usage()/1e6:.0f}MB (limit "
               f"{(0xF0000000-0xB2000000)/1e6:.0f}MB) program={size/1e6:.1f}MB")
         ue.program_execute(prog)
+
+        # first-NaN scan: walk ops in order, read each output, report the FIRST op
+        # whose result contains NaN/Inf. Pinpoints where corruption enters instead
+        # of guessing. Gated by env so normal runs aren't slowed by the readbacks.
+        if os.environ.get("LOOM_NAN_SCAN"):
+            # DRAM region audit — verify the auto-partition didn't overlap or run
+            # out of range for this (larger) model.
+            pb = getattr(ue, "_params_dram_base", 0); pn = ue.get_params_dram_addr()
+            tb = getattr(ue, "_tensor_dram_base", 0); tn = getattr(ue, "_tensor_dram_addr", 0)
+            gb = getattr(ue, "_program_dram_base", 0)
+            print(f"[nan-scan] DRAM audit:")
+            print(f"   params : base={pb:#011x}  end={pn:#011x}  used={(pn-pb)/1e6:.0f}MB")
+            print(f"   tensor : base={tb:#011x}  end={tn:#011x}  used={(tn-tb)/1e6:.0f}MB  room={(gb-tb)/1e6:.0f}MB")
+            print(f"   program: base={gb:#011x}")
+            print(f"   params_end < tensor_base ? {pn <= tb}  (overlap if False)")
+            print(f"   tensor_end < program_base ? {tn <= gb}  (overlap if False)")
+            # op#0 in/out addresses
+            o0 = self.ops[0]
+            print(f"   op0 {o0['res']}={o0['op']}: out_addr={sym.get(o0['res'], 0):#011x}  "
+                  f"in_addr={sym.get(o0['operands'][0], 0):#011x}")
+            print("[nan-scan] walking ops for the first NaN/Inf output...")
+            for i, o in enumerate(self.ops):
+                r = o["res"]
+                if r not in sym or r in self.consumed:
+                    continue
+                try:
+                    M2, N2 = _MN(shp[r])
+                    t = ue.dma_from_accelerator_memory(sym[r], (M2, N2)).float()
+                except Exception:
+                    continue
+                bad = torch.isnan(t).any() or torch.isinf(t).any()
+                if bad:
+                    nnan = int(torch.isnan(t).sum()); ninf = int(torch.isinf(t).sum())
+                    print(f"[nan-scan] FIRST BAD op #{i}: {r} = {o['op']}  "
+                          f"shape={tuple(shp[r])}  NaN={nnan} Inf={ninf}  "
+                          f"operands={o['operands']}")
+                    # is the corruption already in the INPUTS, or does this op make it?
+                    for opd in o["operands"]:
+                        if opd in sym and opd in shp:
+                            try:
+                                im, iN = _MN(shp[opd])
+                                ti = ue.dma_from_accelerator_memory(sym[opd], (im, iN)).float()
+                                print(f"[nan-scan]    input {opd} {tuple(shp[opd])}: "
+                                      f"NaN={int(torch.isnan(ti).sum())} "
+                                      f"Inf={int(torch.isinf(ti).sum())} "
+                                      f"absmax={float(ti.abs().nan_to_num().max()):.3g}")
+                            except Exception as e:
+                                print(f"[nan-scan]    input {opd}: unreadable ({e})")
+                    break
+                if i < 12:
+                    print(f"[nan-scan]   ok op #{i}: {r}={o['op']} "
+                          f"absmax={float(t.abs().max()):.3g}")
+            else:
+                print("[nan-scan] no NaN/Inf found in any op output.")
+
         M, N = _MN(shp[last])
         hw = ue.dma_from_accelerator_memory(sym[last], (M, N)).float()
         # stats hook (read by loom.engine for the dump header; behavior unchanged)

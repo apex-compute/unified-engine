@@ -1674,10 +1674,23 @@ def pbi_strided_copy(ue, gpr: int, src_base: int, dst_base: int, count: int,
     pre-zero dst when dst_stride>copy_bytes; strides must be uniform."""
     if copy_bytes <= 0 or copy_bytes % 2 != 0:
         raise ValueError(f"pbi_strided_copy: copy_bytes must be positive even, got {copy_bytes}")
-    if copy_bytes > URAM_NEAR_FULL_ELEMENTS * 2:
-        raise ValueError(f"pbi_strided_copy: copy_bytes={copy_bytes} exceeds one staging row")
     if count < 1:
         raise ValueError(f"pbi_strided_copy: count must be >=1, got {count}")
+    # A single PBI stage moves at most one SRAM row (UE_VECTOR_SIZE elements). A
+    # block wider than that — e.g. a head_dim=72 (144B) or padded-128 (256B) head —
+    # must be split into <=row-sized column chunks, each its own strided loop with
+    # the same per-block strides but offset within the block. This is what lets
+    # non-64-multiple head dims (72->128 padded) copy correctly instead of
+    # corrupting past the row (the SigLIP-SO400M / hd=72 NaN).
+    ROW = UE_VECTOR_SIZE * 2
+    if copy_bytes > ROW:
+        off = 0
+        while off < copy_bytes:
+            c = min(ROW, copy_bytes - off)
+            pbi_strided_copy(ue, gpr, src_base + off, dst_base + off, count, c,
+                             src_stride, dst_stride)
+            off += c
+        return
     ue._isa_reg_counter = gpr + 1
     ue.reset_inst_ptr_counter()
     ue.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=count)

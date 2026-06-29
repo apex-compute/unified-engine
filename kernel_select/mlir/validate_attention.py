@@ -56,12 +56,14 @@ def _pbi_set(ue, gpr, val):
 # THE EMITTER — windowed attention, parameterized by AttentionSpec
 # =============================================================================
 def emit_windowed_attention(ue, spec, *, in_addr, w, bias_addr, identity_addr,
-                            gpr_mm, gpr_pbi, alloc):
+                            gpr_mm, gpr_pbi, alloc, debug=None):
     """Emit steps 4-9 of windowed attention into the current capture.
 
     in_addr : windowed tokens (num_windows*wa, dim) already partitioned
     w       : dict of weight addrs: q/k/v_weight, q/k/v_bias, unpad_weight,
               out_weight, out_bias
+    debug   : optional dict; if given, gets {name: (addr, shape)} for the stage
+              buffers so a caller can read them back and SNR each stage.
     returns : out_addr holding (num_windows*wa, dim) = attention block output
     """
     nh, hd = spec.num_q_heads, spec.head_dim
@@ -88,6 +90,17 @@ def emit_windowed_attention(ue, spec, *, in_addr, w, bias_addr, identity_addr,
     attn_permuted = alloc(M_win * nh * hd_pad)
     attn_unpadded = alloc(M_win * dim)
     out_addr = alloc(M_win * dim)
+
+    if debug is not None:
+        # (addr, shape) for each stage buffer, so the caller can read+SNR each.
+        debug.update(
+            q_proj=(q_proj, (M_win, dim)),
+            q_heads=(q_heads, (total_batches, wa_pad, hd_pad)),
+            attn_output=(attn_output, (total_batches, wa_pad, hd_pad)),
+            attn_permuted=(attn_permuted, (M_win, nh * hd_pad)),
+            attn_unpadded=(attn_unpadded, (M_win, dim)),
+            out_addr=(out_addr, (M_win, dim)),
+        )
 
     # --- 4. Q/K/V projections (windowed flat) ---
     for nm, dst in [("q", q_proj), ("k", k_proj), ("v", v_proj)]:
@@ -239,6 +252,85 @@ def validate(nh=6, hd=32, wa=144, nw=1):
     print(f"       ref[0,0,:4] = {ref[0,0,:4].tolist()}")
     print(f"       hw [0,0,:4] = {hw[0,0,:4].tolist()}")
     return s
+
+
+def validate_stages(nh=16, hd=128, wa=1024, nw=1):
+    """Per-STAGE SNR of the windowed attention path, to pin WHICH stage corrupts
+    at hd_pad=128 (two SRAM rows). Reads back q_heads (flash input), attn_output
+    (flash output), attn_permuted (inverse permute), attn_unpadded (unpad), and the
+    final out, each vs its torch reference in the exact hw layout. The first stage
+    that drops below ~19 dB is the bug."""
+    torch.manual_seed(0)
+    dim = nh * hd
+    hd_pad = ((hd + 63) // 64) * 64
+    wa_pad = ((wa + 63) // 64) * 64
+    spec = AttentionSpec(kind="windowed", num_q_heads=nh, num_kv_heads=nh,
+                         head_dim=hd, seq_len=wa, batch=nw, bias="none")
+    print(f"[stages] {spec}")
+    x = torch.randn(nw, wa, dim)
+    wt = {f"{p}_{s}": (torch.randn(dim, dim) * 0.05 if s == "w" else torch.zeros(dim))
+          for p in ("q", "k", "v", "o") for s in ("w", "b")}
+
+    # --- torch per-stage references in HW layout ---
+    def proj(W, b):
+        return (x @ W.T + b).view(nw, wa, nh, hd).permute(0, 2, 1, 3)   # [nw,nh,wa,hd]
+    q, k, v = proj(wt["q_w"], wt["q_b"]), proj(wt["k_w"], wt["k_b"]), proj(wt["v_w"], wt["v_b"])
+    a = torch.softmax(q @ k.transpose(-1, -2) / math.sqrt(hd), dim=-1) @ v   # [nw,nh,wa,hd]
+    pre = spec.q_prescale
+    def pad_bm(t, scale=1.0):                 # batch-major [nw,nh,wa,hd] -> [nw*nh,wa_pad,hd_pad]
+        o = torch.zeros(nw, nh, wa_pad, hd_pad); o[:, :, :wa, :hd] = t * scale
+        return o.reshape(nw * nh, wa_pad, hd_pad)
+    def pad_tm(t):                            # token-major -> [nw*wa, nh*hd_pad]
+        tm = t.permute(0, 2, 1, 3)            # [nw,wa,nh,hd]
+        o = torch.zeros(nw, wa, nh, hd_pad); o[..., :hd] = tm
+        return o.reshape(nw * wa, nh * hd_pad)
+    refs = {
+        "q_proj":        (x @ wt["q_w"].T + wt["q_b"]).reshape(nw * wa, dim),
+        "q_heads":       pad_bm(q, pre),
+        "attn_output":   pad_bm(a),
+        "attn_permuted": pad_tm(a),
+        "attn_unpadded": a.permute(0, 2, 1, 3).reshape(nw * wa, dim),
+        "out_addr":      (a.permute(0, 2, 1, 3).reshape(nw * wa, dim) @ wt["o_w"].T + wt["o_b"]),
+    }
+
+    from user_dma_core import UnifiedEngine
+    ue = UnifiedEngine()
+    w = {}
+    for p, key in [("q", "q"), ("k", "k"), ("v", "v"), ("o", "out")]:
+        w[f"{key}_weight"] = _alloc_param(ue, wt[f"{p}_w"])
+        w[f"{key}_bias"] = _alloc_param(ue, wt[f"{p}_b"])
+    unpad = torch.zeros(dim, nh * hd_pad)
+    for h in range(nh):
+        for d in range(hd):
+            unpad[h * hd + d, h * hd_pad + d] = 1.0
+    w["unpad_weight"] = _alloc_param(ue, unpad)
+    identity_addr = _alloc_param(ue, torch.eye(UE_VECTOR_SIZE))
+    mask = torch.zeros(nw * nh, wa_pad, wa_pad); mask[:, :, wa:] = -1e4
+    bias_addr = _alloc_param(ue, mask)
+    in_addr = _alloc_param(ue, x.reshape(nw * wa, dim))
+    gpr_mm, gpr_pbi = ue.alloc_isa_reg(), ue.alloc_isa_reg()
+
+    dbg = {}
+    prog_addr = ue.get_program_dram_addr()
+    ue.clear_inst_id(); ue.start_capture()
+    emit_windowed_attention(ue, spec, in_addr=in_addr, w=w, bias_addr=bias_addr,
+                            identity_addr=identity_addr, gpr_mm=gpr_mm, gpr_pbi=gpr_pbi,
+                            alloc=lambda n: _alloc(ue, n), debug=dbg)
+    ue.generate_instruction_halt(); ue.stop_capture()
+    size = ue.write_captured_instructions_to_dram(prog_addr)
+    ue.allocate_program_dram(size)
+    ue.program_execute(prog_addr)
+
+    print(f"[stages] per-stage SNR (first FAIL = the bug):")
+    for name in ("q_proj", "q_heads", "attn_output", "attn_permuted", "attn_unpadded", "out_addr"):
+        addr, shape = dbg[name]
+        flat = 1
+        for d in shape:
+            flat *= d
+        hw = ue.dma_from_accelerator_memory(addr, (flat // shape[-1], shape[-1])).float()
+        ref = refs[name].reshape(flat // shape[-1], shape[-1])
+        s = snr_db(ref, hw)
+        print(f"   {name:<14} {tuple(shape)}  SNR = {s:7.2f} dB  [{'PASS' if s > 19 else 'FAIL'}]")
 
 
 if __name__ == "__main__":

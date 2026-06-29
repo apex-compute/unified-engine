@@ -585,6 +585,36 @@ def flash_attention_test(head_dim: int, seq_len: int, bias_enable: bool = False,
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
     ue.reset_program_dram_addr()
+    return snr_db_ref
+
+
+def vision_flash_head_dim_test():
+    """Pin down whether the LEGACY flash body (the one the windowed/vision batched
+    flash uses) handles head_dim > 64. The PBI variant already passes at 128/256
+    (gemma decode), but SigLIP-SO400M vision has head_dim 72 -> padded to 128, and
+    that runs through `flash_attention_core_legacy`, which loads a fixed 64x64
+    transpose identity. Sweep the LEGACY path at:
+        hd=64  -> control, must PASS (one vector, exact identity)
+        hd=72  -> raw SigLIP head_dim (not a 64-multiple)
+        hd=128 -> the padded width the vision encoder actually runs
+
+    A clean PASS at 64 and FAIL at 72/128 confirms the legacy body is the bug and
+    the fix is its head_dim>64 (M-chunk) transpose, NOT padding/masking/DRAM.
+    """
+    print("\n=== vision_flash_head_dim_test (LEGACY flash, head_dim sweep) ===")
+    results = {}
+    for hd in (64, 72, 128):
+        try:
+            snr = flash_attention_test(head_dim=hd, seq_len=1024, force_legacy=True)
+        except Exception as e:
+            snr = f"ERROR: {type(e).__name__}: {e}"
+        results[hd] = snr
+        verdict = ("PASS" if isinstance(snr, (int, float)) and snr > 19 else "FAIL")
+        print(f"[vision-flash] LEGACY head_dim={hd:<3} seq=1024  SNR={snr}  [{verdict}]")
+    print("=== summary:", {k: (round(v, 2) if isinstance(v, (int, float)) else v)
+                            for k, v in results.items()}, "===")
+    return results
+
 
 def decoder_group_attention_test(head_dim: int = 256, seq_len: int = 8192, use_pbi: bool = False, num_buckets: int = 64, force_legacy: bool = False, group_size: int = 4):
     """
@@ -1301,6 +1331,138 @@ def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool 
     ue.reset_tensor_dram_addr()
     ue.reset_program_dram_addr()
     
+def layer_norm_magnitude_test(M: int = 256, N: int = 1152, absmax: float = 170.0,
+                              scale_down: float = 16.0):
+    """Confirm the hardware LayerNorm NaNs on LARGE-magnitude / outlier inputs, and
+    that pre-scaling the input (which LayerNorm is mathematically invariant to) fixes
+    it. This is the SmolVLM-SO400M case: vision embeddings absmax ~169 -> first
+    LayerNorm outputs all-NaN. LayerNorm((x)/s) == LayerNorm(x), so feeding x/s gives
+    the identical normalized result while keeping the variance computation in range.
+
+    Builds an outlier input (small std + a few large spikes, like real embeddings),
+    runs the kernel at full magnitude (expect NaN) and at x/scale_down (expect a
+    clean match to torch LayerNorm of the ORIGINAL x)."""
+    def _run(x):
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(M * N * 2); O = ue.allocate_tensor_dram(M * N * 2)
+        G = ue.allocate_tensor_dram(N * 2); B = ue.allocate_tensor_dram(N * 2)
+        # PBI layer_norm exactly like loom/IRExecutor (gpr primed with M//chunk).
+        _ops = 6
+        _chunk = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256 - 4) // _ops)
+        while M % _chunk != 0:
+            _chunk -= 1
+        _GPR = 8
+        ue.start_capture()
+        ue.generate_instruction_add_set(_GPR, M // _chunk)
+        ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O,
+                                GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=B, gpr_M_reg=_GPR)
+        ue.stop_capture(); ue.generate_instruction_halt()
+        p = ue.get_program_dram_addr(); ue.write_captured_instructions_to_dram(p)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        # pre-zero the OUTPUT so any unwritten region reads as 0 (finite), not the
+        # 0xFF NaN that clear_dram leaves — isolates REAL layer_norm NaN from
+        # "kernel didn't write the whole buffer".
+        ue.dma_to_accelerator_memory(O, torch.zeros(M * N, dtype=torch.bfloat16))
+        ue.dma_to_accelerator_memory(A, x.to(torch.bfloat16))
+        ue.dma_to_accelerator_memory(G, torch.ones(N, dtype=torch.bfloat16))
+        ue.dma_to_accelerator_memory(B, torch.zeros(N, dtype=torch.bfloat16))
+        ue.program_execute(p)   # match the real loom execution path
+        return ue.dma_from_accelerator_memory(O, (M, N)).float()
+
+    torch.manual_seed(0)
+    x = torch.randn(M, N) * 0.86
+    # inject outliers so absmax hits the target (mimics SigLIP embeddings)
+    for r in range(M):
+        x[r, torch.randint(0, N, (2,))] = absmax * (1 if r % 2 else -1)
+    ref = torch.nn.functional.layer_norm(x, (N,))     # torch ref of ORIGINAL x
+
+    print(f"\n=== layer_norm_magnitude_test  absmax={x.abs().max():.0f}  N={N} ===")
+    full = _run(x)
+    nfull = int(torch.isnan(full).sum())
+    print(f"[ln-mag] FULL magnitude (absmax={x.abs().max():.0f}): "
+          f"NaN={nfull}  SNR={'nan' if nfull else f'{calculate_snr(ref, full):.2f}'} dB  "
+          f"[{'FAIL(NaN)' if nfull else 'ok'}]")
+    scaled = _run(x / scale_down)                      # LayerNorm is scale-invariant
+    nsc = int(torch.isnan(scaled).sum())
+    snr = calculate_snr(ref, scaled)                   # vs ORIGINAL ref -> must match
+    print(f"[ln-mag] SCALED x/{scale_down:.0f} (absmax={x.abs().max()/scale_down:.0f}): "
+          f"NaN={nsc}  SNR={snr:.2f} dB vs torch LayerNorm(original)  "
+          f"[{'PASS' if (nsc == 0 and snr > 19) else 'FAIL'}]")
+    print(f"[ln-mag] => verdict: {'scaling FIXES the LayerNorm NaN' if (nfull and nsc==0 and snr>19) else 'inconclusive'}")
+
+
+def _ln_run(M, N, x, gamma=None, beta=None, use_pbi=True, prezero=True):
+    """Run ONE layer_norm_core_dram exactly like loom/IRExecutor and return the
+    output tensor (M,N) float. PBI path with gpr primed to M//chunk, output
+    pre-zeroed so unwritten lanes read 0 (finite) not 0xFF (NaN)."""
+    ue = UnifiedEngine()
+    A = ue.allocate_tensor_dram(M * N * 2); O = ue.allocate_tensor_dram(M * N * 2)
+    G = ue.allocate_tensor_dram(N * 2) if gamma is not None else None
+    B = ue.allocate_tensor_dram(N * 2) if beta is not None else None
+    _ops = 4 + (1 if gamma is not None else 0) + (1 if beta is not None else 0)
+    _chunk = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256 - 4) // _ops)
+    while M % _chunk != 0:
+        _chunk -= 1
+    ue.start_capture()
+    if use_pbi:
+        ue.generate_instruction_add_set(8, M // _chunk)
+    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O,
+                            GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=B,
+                            gpr_M_reg=8 if use_pbi else None)
+    ue.stop_capture(); ue.generate_instruction_halt()
+    p = ue.get_program_dram_addr(); ue.write_captured_instructions_to_dram(p)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    if prezero:
+        ue.dma_to_accelerator_memory(O, torch.zeros(M * N, dtype=torch.bfloat16))
+    ue.dma_to_accelerator_memory(A, x.to(torch.bfloat16))
+    if gamma is not None: ue.dma_to_accelerator_memory(G, gamma.to(torch.bfloat16))
+    if beta is not None:  ue.dma_to_accelerator_memory(B, beta.to(torch.bfloat16))
+    ue.program_execute(p)
+    return ue.dma_from_accelerator_memory(O, (M, N)).float(), _chunk
+
+
+def layer_norm_nan_sweep():
+    """Systematic characterization of the LayerNorm -inf/NaN. Each case runs ONE
+    layer_norm_core_dram (PBI, pre-zeroed output, gamma=ones/beta=zeros) and
+    reports NaN count + SNR vs torch. The grid isolates which property triggers
+    the NaN: M-alignment (729 vs 768 vs 1024), N (768 vs 1152), chunk divisibility,
+    and input magnitude. 500M config (1024,768) MUST pass; 2.2B config (729,1152)
+    is the suspect."""
+    torch.manual_seed(0)
+    # (M, N, scale, absmax, note) — absmax>0 injects outliers to that magnitude
+    # (mimics SigLIP residual stream); absmax=0 leaves x as randn*scale.
+    grid = [
+        (729,  1152, 1.0,   0, "2.2B dims, randn (absmax~5)"),
+        (729,  1152, 1.0,  12, "2.2B dims, absmax 12 (like op#0: OK)"),
+        (729,  1152, 1.0,  40, "2.2B dims, absmax 40"),
+        (729,  1152, 1.0,  80, "2.2B dims, absmax 80"),
+        (729,  1152, 1.0, 120, "2.2B dims, absmax 120"),
+        (729,  1152, 1.0, 168, "2.2B dims, absmax 168 (like op#19: NaN?)"),
+        (729,  1152, 1.0, 256, "2.2B dims, absmax 256"),
+        (1024, 768,  1.0, 168, "500M dims, absmax 168"),
+    ]
+    print("\n=== layer_norm_nan_sweep ===")
+    print(f"{'M':>5} {'N':>5} {'scale':>5} {'absmax':>6} {'chunk':>5} {'n_chunk':>7} "
+          f"{'NaN':>6} {'SNR(dB)':>8}  note")
+    for M, N, scale, absmax, note in grid:
+        x = torch.randn(M, N) * scale
+        if absmax:
+            for r in range(M):
+                x[r, torch.randint(0, N, (2,))] = absmax * (1 if r % 2 else -1)
+        try:
+            out, chunk = _ln_run(M, N, x,
+                                 gamma=torch.ones(N), beta=torch.zeros(N))
+            ref = torch.nn.functional.layer_norm(x, (N,))
+            nan = int(torch.isnan(out).sum() + torch.isinf(out).sum())
+            snr = float('nan') if nan else calculate_snr(ref, out)
+            tag = "FAIL" if nan else ("ok" if snr > 30 else "LOWSNR")
+            print(f"{M:>5} {N:>5} {scale:>5.1f} {absmax:>6} {chunk:>5} {M//chunk:>7} "
+                  f"{nan:>6} {snr:>8.2f}  {note}  [{tag}]")
+        except Exception as e:
+            print(f"{M:>5} {N:>5} {scale:>5.1f} {absmax:>6}    -      -      ERR  "
+                  f"     -  {note}  [EXC {type(e).__name__}: {e}]")
+
+
 def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False):
     """
     Tests rope_hf_core_dram by emitting one HF-style RoPE instruction sequence per row.
@@ -4895,6 +5057,8 @@ if __name__ == "__main__":
     atexit.register(write_test_summary, "user_hw_test_summary.md")
 
     software_reset_test()
+    layer_norm_nan_sweep()
+    import sys as _sys; _sys.exit(0)   # LN-NaN characterization run: skip the rest
     dram_read_write_speed_test()
     isa_rela_loop_test()
     isa_abs_loop_test()

@@ -77,11 +77,49 @@ class Engine:
     the delegated IRExecutor constructs the single `ue` for the device span; as
     archetypes move inward, the ue lifetime hoists here. One Engine per process."""
 
-    def __init__(self, model_id, *, verbose=True):
+    def __init__(self, model_id, *, model=None, verbose=True):
         self.model_id = model_id
+        self.model = model                   # used to size the DRAM map to the footprint
         self.verbose = verbose
         self._reg_n = 0
         self._ue = None                      # the ONE UnifiedEngine (lazy: init on first use)
+
+    # --- 4GB DRAM partitioning (offsets from 0x80000000; DMA adds the base) ---
+    def _dram_bases(self):
+        """Size the three arenas to the model, per the 4GB rule: params from
+        offset 0x0, tensor ABOVE the largest single-workload params_end, program
+        pinned just under the 4GB ceiling. Workloads reset between runs, so the
+        peak params is the MAX of (bf16 vision encoder, q4 decoder) — not the sum.
+        Fixed 2GB-era bases overflow big bf16 vision encoders (error 512)."""
+        TOP = 0x100000000                    # 4GB offset ceiling (absolute 0x180000000)
+        PROG = 0x10000000                    # 256MB program at the top
+        MIN_TENSOR = 0x20000000              # >=512MB activations/KV to run
+        align = lambda x, a=0x1000000: (x + a - 1) // a * a
+        params_bytes = 0
+        if self.model is not None:
+            vis = dec = 0
+            for n, p in self.model.named_parameters():
+                nl = n.lower()
+                if any(h in nl for h in ("vision", "visual", "image", "patch", "vit",
+                                         "siglip", "connector")):
+                    vis += p.numel() * 2                 # vision/connector stay bf16
+                else:
+                    dec += int(p.numel() * 0.5 * 1.18)   # decoder is q4 (+scale/pad)
+            # The vision encoder ALLOCATES ~2.8x its weight bytes — the per-layer
+            # attention emit (emit_windowed_attention) allocates scratch/identity/
+            # bias per layer on top of the weights. Size to that real footprint so
+            # params_end clears tensor_base (else overlap -> NaN). TODO: share those
+            # per-layer attention buffers to drop the encoder back toward 1x.
+            VIS_ALLOC = 2.8
+            params_bytes = int(max(vis * VIS_ALLOC, dec) * 1.05)
+        tensor_base = max(align(params_bytes), 0x40000000)   # >=1GB floor for params
+        program_base = TOP - PROG
+        if tensor_base + MIN_TENSOR > program_base:
+            raise MemoryError(
+                f"params footprint {params_bytes/1e9:.2f}GB leaves <"
+                f"{MIN_TENSOR/1e6:.0f}MB for tensor before program; model too big "
+                f"for the 4GB map (quantize the vision encoder).")
+        return 0x0, tensor_base, program_base
 
     # --- the single shared engine --------------------------------------------
     @property
@@ -90,8 +128,37 @@ class Engine:
         to every workload's executor. No workload constructs its own."""
         if self._ue is None:
             from user_dma_core import UnifiedEngine
-            self._ue = UnifiedEngine(tensor_dram_base=0xB2000000,
-                                     program_dram_base=0xF0000000)
+            params_base, tensor_base, program_base = self._dram_bases()
+            if self.verbose:
+                print(f"[loom] DRAM map (offsets): params 0x0 / "
+                      f"tensor 0x{tensor_base:08X} / program 0x{program_base:08X}")
+            self._ue = UnifiedEngine(params_dram_base=params_base,
+                                     tensor_dram_base=tensor_base,
+                                     program_dram_base=program_base)
+            self._clear_full_dram(self._ue)
+        return self._ue
+
+    def _clear_full_dram(self, ue, fill_byte=0x00, chunk=64 * 1024 * 1024):
+        """Clear the ENTIRE physical 4GB DRAM, using the SAME absolute range as
+        randomize_dram.py: raw addresses [0x0 .. 0x100000000). Raw dma_write
+        takes the absolute physical address (no base added), so the range is
+        0-based, NOT 0x80000000-based — writing past 0x100000000 returns
+        'error 512' (out of range). Fill with 0x00 so any unwritten lane reads
+        finite 0.0, not the 0xFF (=bf16 NaN) that stale DRAM holds. Uses only
+        the public DMA API (no user_dma_core edits)."""
+        from user_dma_core import DMA_DEVICE_H2C
+        DRAM_BASE = 0x0
+        DRAM_END  = 0x100000000                 # 4GB physical ceiling (0-based)
+        total = DRAM_END - DRAM_BASE
+        buf = bytes([fill_byte]) * chunk
+        off = 0
+        if self.verbose:
+            print(f"[loom] clearing full 4GB DRAM "
+                  f"[{DRAM_BASE:#x}..{DRAM_END:#x}) fill=0x{fill_byte:02x}")
+        while off < total:
+            n = min(chunk, total - off)
+            ue.dma_write(DMA_DEVICE_H2C, DRAM_BASE + off, buf[:n], n)
+            off += n
         return self._ue
 
     def reset_device(self):
@@ -366,6 +433,40 @@ class Engine:
         dialect; only the input boundary differs (embeddings instead of pixels)."""
         from loom_ir import IRExecutor, snr_db
         from loom_walker import parse_mlir
+
+        # COMPILE-TIME LARGE-MAGNITUDE FLAG: the hardware LayerNorm computes
+        # variance naively and overflows -> NaN on large-magnitude / outlier inputs
+        # (SigLIP-SO400M vision: embeddings absmax ~169 vs the 500M's ~12). Detect it
+        # up front so it's a clear flagged condition, not a silent device NaN.
+        # DIAGNOSTIC: LOOM_EMB_SCALE=s divides the injected embedding by s before
+        # lowering, to test whether op#0's LayerNorm NaN is magnitude-driven (op#0
+        # input shrinks; if it goes finite, magnitude is the cause). Changes the
+        # downstream result (residual), so it's a diagnostic, not a fix.
+        _sc = float(os.environ.get("LOOM_EMB_SCALE", "1") or "1")
+        if _sc != 1.0:
+            import torch as _t
+            embeds = (embeds.float() / _sc).to(embeds.dtype)
+            print(f"[loom] DIAGNOSTIC: scaled embeds by 1/{_sc} -> absmax={float(embeds.abs().max()):.1f}")
+
+        # DIAGNOSTIC/FIX: pad the TOKEN dim (M) to a multiple of 64 with zero rows.
+        # 729 (27x27 patch grid) is not 64-aligned -> the row-wise kernels (LayerNorm
+        # etc.) corrupt -> NaN. Padding M to pad64 fixes the alignment; the dummy
+        # rows are zeros (harmless for per-row ops; attention masks padded keys).
+        if os.environ.get("LOOM_PAD_M"):
+            import torch as _t
+            M0 = embeds.shape[-2]
+            Mp = ((M0 + 63) // 64) * 64
+            if Mp != M0:
+                pad = _t.zeros(*embeds.shape[:-2], Mp - M0, embeds.shape[-1], dtype=embeds.dtype)
+                embeds = _t.cat([embeds, pad], dim=-2)
+                print(f"[loom] DIAGNOSTIC: padded token dim M {M0} -> {Mp} (64-aligned)")
+
+        amax = float(embeds.abs().max())
+        LN_SAFE_ABSMAX = 64.0
+        if amax > LN_SAFE_ABSMAX:
+            print(f"[loom] ⚠ LayerNorm-overflow risk: encoder input absmax={amax:.1f} "
+                  f"> {LN_SAFE_ABSMAX:.0f} (outlier embeddings). The hardware LayerNorm "
+                  f"can NaN on this magnitude — flagged at compile time.")
 
         # `stack` is expected to already be a clean forward(x)->tensor module (the
         # caller builds it). We lower it DIRECTLY — wrapping it again here would
