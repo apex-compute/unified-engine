@@ -3,11 +3,11 @@
 Gemma3 inference on accelerator: prefill + decode.
 
   - Config from gemma3_config.json; weights from a single bin (see below).
-  - A single prefill program (sized to ``len(prompt) - 1``) plus every decoder seq_len bucket are
-    compiled into ONE combined instruction image plus a metadata sidecar (per-stage start
-    addresses, sizes, FLOPs). Both are runtime-generated tmp artifacts inside gemma3_bin/, with
-    relative paths declared in gemma3_config.json (paths.instruction_bin / instruction_meta).
-    The bin is tied to the prompt length used at compile time and is recompiled per run.
+  - A single prefill program plus a single decoder program are compiled into ONE combined
+    instruction image plus a metadata sidecar (per-stage start addresses, sizes, FLOPs). Both are
+    runtime-generated tmp artifacts inside gemma3_bin/, with relative paths declared in
+    gemma3_config.json (paths.instruction_bin / instruction_meta). The bin is tied to the prompt
+    length used at compile time and is recompiled per run.
   - Run phase loads the combined bin once into program DRAM, executes the single prefill
     program, then dispatches per-token decoder programs by start address.
 
@@ -27,7 +27,7 @@ Usage:
 ``--dev`` is the XDMA device name (e.g. ``xdma0``). For Bittware use ``--device bittware``; override clock with ``--cycle`` if needed.
 
 Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in the same folder.
-  user_dma_core.py is one folder up; that parent is added to sys.path.
+  user_dma_core.py is two folders up (models/../..); that grandparent is added to sys.path.
 """
 
 import json
@@ -35,20 +35,17 @@ import math
 import os
 import sys
 
-# This file's folder: gemma3_bin/, *.json live here. user_dma_core is two folders up.
+# This file's folder: gemma3_bin/, *.json live here. user_dma_core is two folders up (models/../..).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from huggingface_hub import snapshot_download
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, configure_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, configure_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
-
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -93,7 +90,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     cfg = Gemma3_UnifiedEngine.load_config(config_path=config_path, script_dir=SCRIPT_DIR)
     weight_defs = cfg["_weight_defs"]
     paths = cfg["paths"]
-    paths_full = os.path.join(SCRIPT_DIR, paths["params_bin"])
+    paths_full = os.path.join(SCRIPT_DIR, paths["weights_bin"])
     out_path = output_path or paths_full
 
     model, model_dir = _ensure_hf_model(SCRIPT_DIR, cfg)
@@ -223,13 +220,9 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
     write_at(weight_defs["LM_HEAD_WEIGHT_DATA"], data_padded)
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(buf)
-    meta_path = os.path.join(os.path.dirname(out_path), "params.json")
-    with open(meta_path, "w") as f:
-        json.dump({"size": len(buf), "source": "hf", "quant": QUANT_PRECISION}, f, indent=2)
-    print(f"Generated params bin: {out_path} ({len(buf)} bytes)")
+    print(f"Generated weights bin: {out_path} ({len(buf)} bytes)")
     return out_path
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
@@ -238,9 +231,11 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     hf_repo = cfg["paths"]["hf_model_repo"]
     config_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(config_path):
+        from huggingface_hub import snapshot_download
         _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
         snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
         _original_print("Download complete.")
+    from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(
         model_dir, torch_dtype=torch.bfloat16, device_map=None, trust_remote_code=True
     )
@@ -258,16 +253,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     can build on the same structure; runtime enablement remains gated until validated.
     """
 
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False):
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False, legacy: bool = False):
         program_dram_base = user_dma_core.DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else user_dma_core.DRAM_INSTRUCTION_ADDR
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
-        super().__init__(
-            BASE_ADDR=engine_base,
-            params_dram_base=user_dma_core.DRAM_START_ADDR,
-            program_dram_base=program_dram_base,
-            tensor_dram_base=user_dma_core.DRAM_ACTIVATION_ADDR,
-        )
+        super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
         self.dual_engine = dual_engine
+        self.legacy = legacy
         self.script_dir = script_dir or SCRIPT_DIR
         self._cfg = self.load_config(script_dir=self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
@@ -293,7 +284,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # Fixed GPR indices (see ``fixed_isa_regs`` in gemma3_config.json):
         #   GPR_SEQ_LEN — current token position; multiplied at runtime to derive K/V/RoPE offsets.
         #   GPR_Q_SEQ_LEN — row count for PBI Q-head RMS outer loops.
-        #   GPR_BUCKET_IDX — flash-attention bucket selector (= seq_len // UE_VECTOR_SIZE).
+        #   GPR_BUCKET_IDX — 64-aligned seq_len for dynamic attention (= ceil(seq_len/64)*64).
         self.gpr_seq_len = fixed["GPR_SEQ_LEN_REG"]
         self.gpr_q_seq_len = fixed["GPR_Q_SEQ_LEN_REG"]
         self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
@@ -306,10 +297,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.prefill_seq = None 
         self.engine_slave = engine_slave
 
-        # Single canonical params bin path; --local-weights only suppresses HF regeneration
-        # (expects params.bin to already exist at this path, e.g. user-provided).
-        self._weights_bin_rel = paths["params_bin"]
-        self._local_weights = local_weights
+        self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
 
@@ -396,13 +384,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """Ensure weight bin exists (generate from HF if missing), load it, then initialize DRAM: embedding, layers from bin, RoPE, OUTPUT_NORM/LM_HEAD."""
         full_path = os.path.join(self.script_dir, self._weights_bin_rel)
         if os.path.exists(full_path):
-            print(f"Params bin exists, skip generation: {full_path}")
-        elif self._local_weights:
-            raise FileNotFoundError(
-                f"--local-weights set but params bin not found at {full_path}"
-            )
+            print(f"Weight bin exists, skip generation: {full_path}")
         else:
-            print(f"Params bin not found, generating: {full_path}")
+            print(f"Weight bin not found, generating: {full_path}")
             weight_bin_generate(output_path=full_path)
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
@@ -410,6 +394,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
         embedding_scale = model.config.hidden_size ** 0.5
         self.embedding_weight = (embed.float() * embedding_scale).to(torch.bfloat16)
+        from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
@@ -526,8 +511,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         ``gpr_bucket_idx`` for the actual runtime row count, so the static M only affects FLOPs and
         asserts — not the captured program semantics). The captured program reads the *real*
         seq_len at execute time from three GPRs the **caller must prime before entering this
-        program**: ``self.gpr_seq_len``, ``self.gpr_q_seq_len``, ``self.gpr_bucket_idx`` (1-based
-        bucket selector). This function emits **no** ADD_SETs for these registers, so a single
+        program**: ``self.gpr_seq_len``, ``self.gpr_q_seq_len``, ``self.gpr_bucket_idx`` (64-aligned
+        seq_len). This function emits **no** ADD_SETs for these registers, so a single
         cached prefill bin works for any real prefill_seq_len.
 
         Args:
@@ -551,8 +536,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         seq_len = prefill_seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
-        # flash_attention bucket dispatcher uses **1-based** indexing: gpr_bucket_idx = K runs the bucket body sized for seq_len = K * UE_VECTOR_SIZE. 
-        bucket_idx = aligned_seq_len_q // UE_VECTOR_SIZE
+        attention_m_reg = self.gpr_bucket_idx  # 64-aligned dynamic M for flash attention.
         engine_master = not self.engine_slave
         row_offset = 0 if engine_master else seq_len // 2
         # Dual-engine: halve per-engine ``seq_len`` and offset DRAM views. Not validated with PBI
@@ -581,6 +565,34 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             else:
                 self.generate_instruction_flag_check(target_engine_idx=1)
 
+        def dynamic_matmat_mul_core(
+            *,
+            M: int,
+            K: int,
+            N: int,
+            gpr_M_reg: int,
+            **kwargs,
+        ) -> int:
+            if not use_pbi:
+                return self.matmat_mul_core(M=M, K=K, N=N, **kwargs)
+
+            gpr_K_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(gpr_K_reg, K)
+            gpr_N_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(gpr_N_reg, N)
+            flops = self.matmat_mul_core(
+                M=M,
+                K=K,
+                N=N,
+                gpr_M_reg=gpr_M_reg,
+                gpr_K_reg=gpr_K_reg,
+                gpr_N_reg=gpr_N_reg,
+                **kwargs,
+            )
+            self.release_isa_reg()  # gpr_N_reg
+            self.release_isa_reg()  # gpr_K_reg
+            return flops
+
         def partitioned_matmat_mul_core(
             input_dram_addr: int,
             k_dim: int,
@@ -591,17 +603,17 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             **kwargs,
         ) -> int:
             begin_parallel_stage()
-            flops = self.matmat_mul_core(
+            flops = dynamic_matmat_mul_core(
                 M=seq_len,
                 K=k_dim,
                 N=n_dim,
+                gpr_M_reg=self.gpr_seq_len,
                 A_DRAM_ADDR=shard_dram_addr(input_dram_addr, row_offset, k_dim),
                 B_DRAM_ADDR=weight_dram_addr,
                 OUTPUT_DRAM_ADDR=shard_dram_addr(output_dram_addr, row_offset, n_dim),
                 is_B_quantized=True,
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=scale_dram_addr,
-                gpr_M_reg=self.gpr_seq_len if use_pbi else None,
                 **kwargs,
             )
             end_parallel_stage()
@@ -657,13 +669,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
 
-        # flash_attention_core compiled once as a subroutine after the layer loop.
-        # Each call site sets gpr_ret_id to its return word address then jumps to the
-        # subroutine; flash_attention returns via JUMP_REG_ABS(gpr_ret_id).
-        program_dram_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-        call_site_jump_capture_indices: list[int] = []
-
         # NOTE: gpr_seq_len / gpr_q_seq_len / gpr_bucket_idx are primed in the runtime preamble for dynamic seq_len
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
@@ -681,41 +686,41 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     gpr_M_reg=self.gpr_seq_len if use_pbi else None,
                 )
             # Dual-engine PBI matmul sharding is only partially wired; full validation is TBD.
-            total_flops += self.matmat_mul_core(
+            total_flops += dynamic_matmat_mul_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.head_dim * self.group_size,
+                gpr_M_reg=self.gpr_seq_len,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 is_B_quantized=True,
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
-                gpr_M_reg=self.gpr_seq_len if use_pbi else None,
             )
-            total_flops += self.matmat_mul_core(
+            total_flops += dynamic_matmat_mul_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.head_dim,
+                gpr_M_reg=self.gpr_seq_len,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                 is_B_quantized=True,
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
-                gpr_M_reg=self.gpr_seq_len if use_pbi else None,
             )
-            total_flops += self.matmat_mul_core(
+            total_flops += dynamic_matmat_mul_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.head_dim,
+                gpr_M_reg=self.gpr_seq_len,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
                 is_B_quantized=True,
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
-                gpr_M_reg=self.gpr_seq_len if use_pbi else None,
             )
             # TODO: OUTPUT_DRAM_ADDR=temp addr. Then memcpy from temp addr to self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
             if engine_master:
@@ -770,26 +775,31 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 self.accelerator_memory_to_sram(self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size, 0x20000, self.PREFILL_CONTEXT_SIZE * self.head_dim)
                 duplicate_gqa_rows_pbi(0x20000, self.LAYER0_FLASH_V_DRAM, self.gpr_seq_len if use_pbi else None)
 
-                # Call flash attention subroutine (compiled once after the layer loop).
-                # Each call site sets gpr_ret_id to its return address then jumps to the
-                # subroutine; the subroutine returns via JUMP_REG_ABS(gpr_ret_id).
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                call_site_jump_capture_indices.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-            total_flops += self.matmat_mul_core(
+                flash_attention_result = self.flash_attention_core(
+                    head_dim=self.head_dim,
+                    seq_len=aligned_seq_len_q,
+                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+                    gpr_seq_len=attention_m_reg,
+                )
+                total_flops += flash_attention_result or 0
+            total_flops += dynamic_matmat_mul_core(
                 M=seq_len,
                 K=self.head_dim * self.group_size,
                 N=self.vector_length,
+                gpr_M_reg=self.gpr_seq_len,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 is_B_quantized=True,
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
-                gpr_M_reg=self.gpr_seq_len if use_pbi else None,
             )
             if engine_master:
                 total_flops += self.rms_norm_core_dram(
@@ -817,10 +827,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                     gpr_M_reg=self.gpr_seq_len if use_pbi else None,
                 )
-            total_flops += self.matmat_mul_core(
+            total_flops += dynamic_matmat_mul_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.mlp_elements,
+                gpr_M_reg=self.gpr_seq_len,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
@@ -828,19 +839,18 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
                 gelu_enable=True,
-                gpr_M_reg=self.gpr_seq_len if use_pbi else None,
             )
-            total_flops += self.matmat_mul_core(
+            total_flops += dynamic_matmat_mul_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.mlp_elements,
+                gpr_M_reg=self.gpr_seq_len,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 is_B_quantized=True,
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
-                gpr_M_reg=self.gpr_seq_len if use_pbi else None,
             )
             if engine_master:
                 # BF16 multiply of [seq_len, mlp_elements] tensors in DRAM; tiles inside
@@ -855,17 +865,17 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     UE_MODE.ELTWISE_MUL,
                     gpr_M_reg=self.gpr_seq_len if use_pbi else None,
                 )
-            total_flops += self.matmat_mul_core(
+            total_flops += dynamic_matmat_mul_core(
                 M=seq_len,
                 K=self.mlp_elements,
                 N=self.vector_length,
+                gpr_M_reg=self.gpr_seq_len,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 is_B_quantized=True,
                 data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
-                gpr_M_reg=self.gpr_seq_len if use_pbi else None,
             )
             if engine_master:
                 total_flops += self.rms_norm_core_dram(
@@ -888,35 +898,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # NOTE: gpr_seq_len holds the current token position and is primed by the runtime preamble.
         # K/V and RoPE DRAM offsets are derived at runtime via MUL_IMM(gpr_seq_len, stride) + ADD_IMM(base).
         self.generate_instruction_halt()
-
-        # Compile flash_attention subroutine after the HALT; bucket bodies return via
-        # JUMP_REG_ABS(gpr_ret_id), which each call site pre-loaded with its return address.
-        num_buckets = (self.PREFILL_MAX_SEQ_LEN * self.group_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-        flash_sub_start_inst_dram_addr, flash_flops = self.flash_attention_core(
-            head_dim=self.head_dim,
-            seq_len=aligned_seq_len_q,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_buckets,
-            gpr_ret_id=gpr_ret_id,
-        )
-        runtime_bucket_idx = aligned_seq_len_q // UE_VECTOR_SIZE  # 1-indexed
-        total_flops += flash_flops[runtime_bucket_idx - 1] * layer_size
-
-        # Patch all call-site JUMP_ABS placeholders to point at the flash subroutine.
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(
-                jump_idx, ue_35bit_addr_shifter(flash_sub_start_inst_dram_addr))
-
-        self.release_isa_reg()  # gpr_ret_id
-
         prefill_program_addr = self.get_program_dram_addr() + count_at_start * INSTRUCTION_SIZE_BYTES
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
@@ -931,14 +912,15 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     def _compile_decoder_programs(self, layer_size: int = 26, use_pbi: bool = False, profile: bool = False) -> dict:
         """Compile a single decoder program; KV length is selected at runtime via ``gpr_bucket_idx``.
 
-        Grouped attention uses :meth:`decoder_group_attention_core` with ``gpr_bucket_idx`` (same
-        1-based convention as prefill flash attention). ``num_buckets`` is derived from
-        ``max_context_size`` (``(max_context_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE``).
+        Grouped attention uses :meth:`decoder_group_attention_core` with ``gpr_bucket_idx``
+        holding the 64-aligned seq_len. ``num_buckets`` is still used internally to size the
+        static ``seq_len=`` arg for SCRATCH address layout (must be max possible seq_len).
         """
         if not getattr(self, "is_capture_on", False):
             raise RuntimeError("_compile_decoder_programs() requires an active capture session")
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         num_buckets = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        attention_m_reg = self.gpr_bucket_idx  # 64-aligned dynamic M/KV length for decoder attention.
 
         decoder_count_at_start = self.capture_count
         count_at_start = self.capture_count
@@ -950,13 +932,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.pad_capture_to_64b_boundary()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
-
-        # decoder_group_attention_core compiled once as a subroutine after the layer loop.
-        # Each call site sets gpr_ret_id to its return word address then jumps to the
-        # subroutine; the subroutine returns via JUMP_REG_ABS(gpr_ret_id).
-        program_dram_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-        call_site_jump_capture_indices: list[int] = []
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -1017,33 +992,20 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                         gr_weight_dram=self.TMP_REG)
             if profile:
                 _checkpoint(f"L{layer_idx}_qk_norm_rope")
-            # Copy this layer's KV history into fixed staging buffers for the shared subroutine.
-            # gpr_bucket_idx drives the loop count so only the valid token range is copied.
-            k_cache_layer_addr = self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-            v_cache_layer_addr = self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-            self._emit_pbi_scatter_per_token(
-                read_base=k_cache_layer_addr,
-                read_stride_bytes=UE_VECTOR_SIZE * self.head_dim * self.bytes_per_element,
-                write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * self.head_dim * self.bytes_per_element)],
-                sram_byte_addr=0,
-                element_count=UE_VECTOR_SIZE * self.head_dim,
-                gpr_seq_len=self.gpr_bucket_idx,
+            attn_result = self.decoder_group_attention_core(
+                group_size=self.group_size,
+                head_dim=self.head_dim,
+                seq_len=num_buckets * UE_VECTOR_SIZE,
+                Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
+                V_DRAM_ADDR=self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
+                OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                gpr_seq_len=attention_m_reg,
             )
-            self._emit_pbi_scatter_per_token(
-                read_base=v_cache_layer_addr,
-                read_stride_bytes=UE_VECTOR_SIZE * self.head_dim * self.bytes_per_element,
-                write_specs=[(self.LAYER0_FLASH_V_DRAM, UE_VECTOR_SIZE * self.head_dim * self.bytes_per_element)],
-                sram_byte_addr=0,
-                element_count=UE_VECTOR_SIZE * self.head_dim,
-                gpr_seq_len=self.gpr_bucket_idx,
-            )
-            # Call decoder_group_attention_core subroutine (compiled once after the layer loop).
-            self.pad_capture_to_64b_boundary()
-            return_word_addr = ue_35bit_addr_shifter(
-                program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-            self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-            call_site_jump_capture_indices.append(self.capture_count)
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+            total_flops += attn_result
             if profile:
                 _checkpoint(f"L{layer_idx}_attention")
             total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
@@ -1124,41 +1086,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_inc(self.gpr_seq_len)
 
         self.generate_instruction_halt()
-        self.pad_capture_to_64b_boundary()
-
-        # Compile decoder_group_attention_core once as a subroutine after HALT.
-        # All 26 per-layer call sites jump here; the subroutine returns via JUMP_REG_ABS(gpr_ret_id).
-        dec_sub_start_addr, dec_attn_flops = self.decoder_group_attention_core(
-            group_size=self.group_size,
-            head_dim=self.head_dim,
-            seq_len=UE_VECTOR_SIZE,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_buckets,
-            gpr_ret_id=gpr_ret_id,
-        )
-        total_flops += dec_attn_flops[-1] * layer_size
-
-        # Patch all call-site JUMP_ABS placeholders to point at the decoder subroutine.
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(
-                jump_idx, ue_35bit_addr_shifter(dec_sub_start_addr))
-
-        self.release_isa_reg()  # gpr_ret_id
-
         inst_count = self.capture_count - count_at_start
         _SILENT_MODE = False
         decoder_program_addr = self.get_program_dram_addr() + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
         program_size_bytes = inst_count * INSTRUCTION_SIZE_BYTES
         print(
             f"Decoder program compiled at 0x{decoder_program_addr:X}, single segment with "
-            f"PBI grouped attention ({num_buckets} attention buckets), size {program_size_bytes} bytes"
+            f"PBI grouped attention (dynamic seq_len via gpr), size {program_size_bytes} bytes"
         )
         return {
             "program_size_bytes": program_size_bytes,
@@ -1180,9 +1114,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         (gpr_seq_len, gpr_q_seq_len, gpr_bucket_idx) before entering the cached prefill program,
         so the same bin works across all prompt lengths and we only need to compile once.
 
-        The decoder program is also captured once; grouped attention uses ``gpr_bucket_idx`` (same
-        1-based convention as prefill flash attention). Each decode step rebuilds a tiny dispatch
-        stub that sets ``gpr_bucket_idx`` then jumps into the cached decoder program.
+        The decoder program is also captured once; grouped attention uses ``gpr_bucket_idx``
+        (64-aligned seq_len). Each decode step rebuilds a tiny dispatch stub that sets
+        ``gpr_bucket_idx`` then jumps into the cached decoder program.
 
         If both the bin and meta sidecar already exist, this is a no-op (reuse the cached image).
 
@@ -1191,33 +1125,36 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             needed so each segment length is a multiple of 64 B; see :meth:`UnifiedEngine.generate_instruction_halt`).
           - paths.instruction_meta : per-stage start addresses, sizes, FLOPs.
         """
-        # Profile vs non-profile builds are mutually exclusive at compile time and write to the
-        # same canonical programs.bin / programs.json. The manifest carries a "profile" flag and
-        # (when set) per-checkpoint metadata so the runtime can tell what was cached.
-        instruction_bin_path  = os.path.join(self.script_dir, self._cfg["paths"]["programs_bin"])
-        instruction_meta_path = os.path.join(self.script_dir, self._cfg["paths"]["programs_meta"])
+        use_pbi = not self.legacy
+        if self.legacy:
+            # Static: prefill seq_len is baked in at compile time, so the binary is prompt-specific.
+            assert self.prefill_seq is not None, "--legacy requires set_prefill_seq() before compile_gemma3()"
+            prefill_seq_len = len(self.prefill_seq) - 1
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy_{prefill_seq_len}_instruction.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy_{prefill_seq_len}_instruction.json")
+        elif profile:
+            prefill_seq_len = UE_VECTOR_SIZE
+            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_profile_instruction.bin")
+            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_profile_instruction.json")
+        else:
+            prefill_seq_len = UE_VECTOR_SIZE
+            instruction_bin_path  = os.path.join(self.script_dir, self._cfg["paths"]["instruction_bin"])
+            instruction_meta_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_meta"])
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
-            with open(instruction_meta_path, "r") as _f:
-                _cached = json.load(_f)
-            if bool(_cached.get("profile", False)) == bool(profile):
-                print(f"Reusing existing programs image at {instruction_bin_path}")
-                print(f"  delete {instruction_bin_path} to force recompile.")
-                return
-            print(f"Cached programs.bin profile flag mismatch (cached={_cached.get('profile')}, requested={profile}); recompiling.")
-
-        # Fixed compile-time template; runtime preamble overrides the actual seq_len via GPRs.
-        prefill_seq_len = UE_VECTOR_SIZE
+            print(f"Reusing existing instruction image at {instruction_bin_path}")
+            print(f"  delete {instruction_bin_path} to force recompile.")
+            return
 
         self.clear_inst_id()
         self.start_capture()
-        print(f"Compiling prefill (seq_len-agnostic; template={prefill_seq_len})...")
+        print(f"Compiling prefill (prefill_seq_len={prefill_seq_len}; use_pbi={use_pbi})...")
         compile_t0 = time.perf_counter()
         prefill_prog = self._compile_prefill_program(
-            prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=True
+            prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=use_pbi
         )
         print(f"  prefill compiled, size={prefill_prog['size_bytes']} bytes, "
               f"elapsed={time.perf_counter() - compile_t0:.1f}s")
-        decoder_program = self._compile_decoder_programs(layer_size=layer_size, use_pbi=True, profile=profile)
+        decoder_program = self._compile_decoder_programs(layer_size=layer_size, use_pbi=use_pbi, profile=profile)
         self.stop_capture()
 
         os.makedirs(os.path.dirname(instruction_bin_path), exist_ok=True)
@@ -1227,6 +1164,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         assert len(instruction_bytes) % 64 == 0, (
             "combined instruction image must be 64-byte aligned (HALT emits trailing NOP via generate_instruction_halt)"
         )
+        with open(instruction_bin_path, "wb") as f:
+            f.write(instruction_bytes)
         self.clear_capture_buffer()
 
         # Start address of the single decoder segment (after prefill in the combined image).
@@ -1234,29 +1173,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         prefill_program_addr = instruction_base_addr
         decoder_program_addr = instruction_base_addr + prefill_prog["size_bytes"]
 
-        # Build a single programs.bin with a name->{offset,size} manifest.
-        # Entries:
-        #   prefill : seq_len-agnostic prefill template
-        #   decoder : decoder body (profile variant when profile=True)
-        #   slave_prefill : (optional) dual-engine slave prefill image
-        programs_blob = bytearray()
-        manifest_programs: dict = {}
-        manifest_programs["prefill"] = {
-            "offset": len(programs_blob),
-            "size": prefill_prog["size_bytes"],
-        }
-        programs_blob.extend(instruction_bytes[:prefill_prog["size_bytes"]])
-        manifest_programs["decoder"] = {
-            "offset": len(programs_blob),
-            "size": decoder_program["program_size_bytes"],
-        }
-        programs_blob.extend(instruction_bytes[prefill_prog["size_bytes"]:])
-
         # Only fields the compiler decides at capture time go in the meta (start addresses,
         # sizes, FLOPs). The prefill bin is seq_len-agnostic, so no prefill_seq_len cross-check is
         # stored — the runtime preamble in run_gemma3 sets the actual seq_len via GPRs.
         metadata = {
-            "profile": bool(profile),
+            "instruction_bin": os.path.relpath(instruction_bin_path, self.script_dir),
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "instruction_total_size": len(instruction_bytes),
             "prefill_template_seq_len": prefill_seq_len,
@@ -1266,88 +1187,42 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_program["program_size_bytes"],
             "decoder_total_flops": decoder_program["total_flops"],
-            "programs": manifest_programs,
         }
         if profile:
             metadata["decoder_profile_checkpoints"] = decoder_program["checkpoints"]
 
         if slave_engine is not None:
-            # Dual-engine slave compiles the same single prefill program; appended to programs.bin.
+            # Dual-engine slave compiles the same single prefill program.
             slave_engine.clear_inst_id()
             slave_engine.start_capture()
             slave_prefill_prog = slave_engine._compile_prefill_program(
                 prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=use_pbi
             )
             slave_engine.stop_capture()
+            slave_bin_path = os.path.join(self.script_dir, "gemma3_bin", "prefill_program_slave.bin")
             slave_program_bytes = bytearray()
             for inst in slave_engine.capture_buffer:
                 slave_program_bytes.extend(inst.get_bytes())
             assert len(slave_program_bytes) % 64 == 0, (
                 "slave prefill instruction image must be 64-byte aligned"
             )
+            with open(slave_bin_path, "wb") as f:
+                f.write(slave_program_bytes)
             slave_engine.clear_capture_buffer()
             slave_prefill_addr = slave_engine.get_program_dram_addr()
-            manifest_programs["slave_prefill"] = {
-                "offset": len(programs_blob),
-                "size": len(slave_program_bytes),
-            }
-            programs_blob.extend(slave_program_bytes)
             metadata["dual_engine_slave_prefill"] = {
+                "bin_path": os.path.relpath(slave_bin_path, self.script_dir),
                 "start_addr": f"0x{slave_prefill_addr:X}",
                 "flops": slave_prefill_prog["flops"],
             }
 
-        with open(instruction_bin_path, "wb") as f:
-            f.write(programs_blob)
         with open(instruction_meta_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
-        print(f"Combined gemma3 programs image written to {instruction_bin_path} ({len(programs_blob)} bytes)")
+        print(f"Combined gemma3 instruction image written to {instruction_bin_path} ({len(instruction_bytes)} bytes)")
         print(f"  prefill: seq_len-agnostic (template={prefill_seq_len}), {prefill_prog['size_bytes']} bytes")
         print(f"  decoder: {decoder_program['program_size_bytes']} bytes")
-        print(f"Manifest written to {instruction_meta_path}")
-
-    def _load_master_programs_from_bin(self, meta: dict) -> None:
-        """Load the master prefill+decoder slice of programs.bin into program DRAM.
-
-        Slave_prefill bytes (if present) are skipped — they are loaded into the slave engine's
-        own DRAM region via :meth:`_load_slave_prefill_from_bin`.
-        """
-        programs_bin_path = os.path.join(self.script_dir, self._cfg["paths"]["programs_bin"])
-        with open(programs_bin_path, "rb") as f:
-            blob = f.read()
-        progs = meta["programs"]
-        prefill = progs["prefill"]
-        decoder = progs["decoder"]
-        # Master image = contiguous prefill+decoder (compile-time concat is preserved by the
-        # manifest offsets, so this slice is exactly the original combined instruction stream).
-        master_start = prefill["offset"]
-        master_end = decoder["offset"] + decoder["size"]
-        data = blob[master_start:master_end]
-        start_addr = self.allocate_program_dram(len(data))
-        written = self.dma_write(DMA_DEVICE_H2C, start_addr, data, len(data))
-        if written != len(data):
-            raise RuntimeError(
-                f"_load_master_programs_from_bin: DMA wrote {written} of {len(data)} bytes"
-            )
-        print(f"    Loaded {len(data)} bytes master programs (prefill+decoder) to DRAM at 0x{start_addr:x}")
-
-    def _load_slave_prefill_from_bin(self, meta: dict, programs_bin_path: str) -> None:
-        """Load the slave_prefill slice of programs.bin into this (slave) engine's program DRAM."""
-        progs = meta.get("programs", {})
-        if "slave_prefill" not in progs:
-            raise RuntimeError("programs.json has no 'slave_prefill' entry; recompile with slave_engine")
-        with open(programs_bin_path, "rb") as f:
-            blob = f.read()
-        entry = progs["slave_prefill"]
-        data = blob[entry["offset"]:entry["offset"] + entry["size"]]
-        start_addr = self.allocate_program_dram(len(data))
-        written = self.dma_write(DMA_DEVICE_H2C, start_addr, data, len(data))
-        if written != len(data):
-            raise RuntimeError(
-                f"_load_slave_prefill_from_bin: DMA wrote {written} of {len(data)} bytes"
-            )
-        print(f"    Loaded {len(data)} bytes slave prefill to DRAM at 0x{start_addr:x}")
+        print(f"Metadata written to {instruction_meta_path}")
 
     def _decode_profile_execute(self, preamble_addr: int, checkpoints: list, timeout: float = 30.0) -> list:
         """Execute one decoder step through profile checkpoints; return per-step HW latencies."""
@@ -1365,16 +1240,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """Load the profile instruction image, run prefill + one profiled decoder step,
         and print a per-step latency breakdown for the decoder.
         """
-        profile_meta_path = os.path.join(self.script_dir, self._cfg["paths"]["programs_meta"])
+        profile_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_profile_instruction.json")
         with open(profile_meta_path, "r") as f:
             meta = json.load(f)
-        if not meta.get("profile"):
-            raise RuntimeError(
-                f"programs.bin at {profile_meta_path} was built without profile=True; "
-                "recompile with compile_gemma3(profile=True)."
-            )
 
-        self._load_master_programs_from_bin(meta)
+        self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
 
         prefill_program_addr   = _parse_offset(meta["prefill_program_start_addr"])
@@ -1391,14 +1261,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         q_seq_len = prefill_seq_len * self.group_size
         aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
-        bucket_idx = aligned_seq_len_q // UE_VECTOR_SIZE
         flops_prefill = flops_prefill_template * prefill_seq_len // max(template_prefill_seq_len, 1)
 
         self.clear_inst_id()
         self.start_capture()
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
         self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
-        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, aligned_seq_len_q)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -1422,7 +1291,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         token_id = prefill_seq[-1]
         self.seq_len += 1
         aligned_dec = ((self.seq_len + 63) // 64) * 64
-        bucket_idx = min(aligned_dec // UE_VECTOR_SIZE, _max_gpr_bucket)
         embedding_tensor = self.get_embedding_for_tokens([token_id])
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
         bias_host = torch.full((1, aligned_dec), -1e36, dtype=torch.bfloat16)
@@ -1431,7 +1299,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         self.clear_inst_id()
         self.start_capture()
-        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, aligned_dec)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -1468,17 +1336,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         (gpr_seq_len, gpr_q_seq_len, gpr_bucket_idx) and then unconditional-jumps into the cached
         prefill program.
 
-        Each decode token captures the same short dispatch stub (``gpr_bucket_idx`` +
-        jump into the cached decoder program), DMAs it over the **same** program-DRAM words
+        Each decode token captures the same short dispatch stub (sets ``gpr_bucket_idx`` to the
+        64-aligned seq_len + jump into the cached decoder program), DMAs it over the **same** program-DRAM words
         as the prefill preamble (``preamble_addr``), and executes from that address again.
         The single ``allocate_program_dram`` after the preamble already reserved that
         region; the allocator tail is not moved for decode. ``decoder_total_flops`` is a
         single template value for GFLOPS reporting.
         """
-        meta_path = os.path.join(self.script_dir, self._cfg["paths"]["programs_meta"])
+        if self.legacy:
+            prefill_seq_len = len(self.prefill_seq) - 1
+            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy_{prefill_seq_len}_instruction.json")
+        else:
+            meta_path = os.path.join(self.script_dir, self._cfg["paths"]["instruction_meta"])
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        self._load_master_programs_from_bin(meta)
+        self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
 
         prefill_program_addr = _parse_offset(meta["prefill_program_start_addr"])
@@ -1509,8 +1381,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         slave_prefill_addr = None
         slave_prefill = meta.get("dual_engine_slave_prefill")
         if slave_engine is not None and slave_prefill is not None:
+            slave_bin_path = os.path.join(self.script_dir, slave_prefill["bin_path"])
             slave_engine.reset_program_dram_addr()
-            slave_engine._load_slave_prefill_from_bin(meta, programs_bin_path=os.path.join(self.script_dir, self._cfg["paths"]["programs_bin"]))
+            slave_engine.load_program_instructions_from_file(slave_bin_path)
             slave_prefill_addr = _parse_offset(slave_prefill["start_addr"])
             slave_prefill_flops = slave_prefill["flops"]
 
@@ -1523,14 +1396,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         seq_len = prefill_seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
-        bucket_idx = aligned_seq_len_q // UE_VECTOR_SIZE  # 1-based, matches flash_attention dispatcher
 
         # ----- Runtime preamble: prime three GPRs, then jump into the cached prefill -----
         self.clear_inst_id()
         self.start_capture()
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
         self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
-        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, aligned_seq_len_q)
         # Unconditional absolute jump into the cached prefill program.
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
@@ -1560,7 +1432,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         total_latency, total_flop_rate = 0, 0
         decoder_token_cnt = 0
         hw_decode_lats_us: list[float] = []
-        decoded_chars: list[str] = []
+        decoded_text = ""
 
         # Two-region live counter: pin the bottom terminal row as a status line via
         # an ANSI scroll region; tokens stream in the area above it and the counter
@@ -1595,7 +1467,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _SILENT_MODE = True
             self.seq_len += 1
             aligned_seq_len_q = ((self.seq_len + 63) // 64) * 64
-            bucket_idx = min(aligned_seq_len_q // UE_VECTOR_SIZE, _max_gpr_bucket)
             flops_hw = (
                 decoder_flops_per_token
                 if isinstance(decoder_flops_per_token, (int, float))
@@ -1611,7 +1482,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
             self.clear_inst_id()
             self.start_capture()
-            self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            self.generate_instruction_add_set(self.gpr_bucket_idx, aligned_seq_len_q)
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
             self.write_captured_instructions_to_dram(preamble_addr)
@@ -1629,7 +1500,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
-            decoded_chars.append(token_char)
+            decoded_text += token_char
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
@@ -1651,15 +1522,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         _original_print(f"Prefill ({prefill_seq_len} tokens): HW={latency_hw_prefill/1e3:,.1f} ms  CPU={latency_prefill*1e3:,.1f} ms")
         _original_print(f"Decode 1st token  : HW={hw_decode_first_ms:,.1f} ms/tok  ({1000/hw_decode_first_ms:.2f} tok/s)")
         _original_print(f"Decode  ({tokens_decoded} tokens): HW={hw_decode_avg_ms:,.1f} ms/tok  CPU={cpu_decode_avg_ms:,.1f} ms/tok  ({tokens_decoded/latency_decoder:.2f} tok/s)")
-
+        peak_tokens_per_s = 1000.0 / hw_decode_first_ms if hw_decode_first_ms > 0 else 0.0
+        avg_tokens_per_s = tokens_decoded / latency_decoder if latency_decoder > 0 else 0.0
         return {
-            "prefill_tokens": prefill_seq_len,
-            "decoded_text": "".join(decoded_chars),
-            "decoded_tokens": tokens_decoded,
-            "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
-            "decode_speed_tok_s": round(tokens_decoded / latency_decoder, 2),
-            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
-            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
+            "decoded_text": decoded_text,
+            "tokens_decoded": tokens_decoded,
+            "avg_tokens_per_s": avg_tokens_per_s,
+            "peak_tokens_per_s": peak_tokens_per_s,
         }
 
 # -----------------------------------------------------------------------------
@@ -1670,7 +1539,8 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device == "kintex7":                       return 5.1594
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
-    if device in ("alveo", "efinix"):              return 4.0
+    if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -1678,14 +1548,14 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Gemma3 layer-0 prefill: run on accelerator, verify with torch ref.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
-    parser.add_argument("--local-weights", action="store_true", help="Require existing gemma3_bin/params.bin (skip HF regeneration)")
+    parser.add_argument("--local-weights", action="store_true", help="Use gemma3_bin/full_model_weights.bin instead of generated weights_gemma3_hf.bin")
     parser.add_argument(
         "--dual-engine",
         action="store_true",
         help="Dual-engine path (compile-time sharding hooks exist; PBI + dual not verified end-to-end—CLI still rejects).",
     )
     parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Ignored for --device efinix.')
+                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument(
         '--device',
         type=str,
@@ -1700,14 +1570,21 @@ def main():
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
+    parser.add_argument('--legacy', action='store_true',
+                        help='Compile without PBI for non-attention ops (static M/K/N). '
+                             'Attention (flash_attention, decoder_group_attention) stays dynamic. '
+                             'Uses a separate gemma3_legacy_instruction.bin cache.')
     args = parser.parse_args()
 
-    configure_device(args.device, dma_device=args.dev)
+    profile = configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    globals()["DRAM_INSTRUCTION_ADDR"] = user_dma_core.DRAM_INSTRUCTION_ADDR
+
+    _boot = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
+    _boot.software_reset()
+    _boot.clear_dram()
 
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
@@ -1715,18 +1592,20 @@ def main():
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     print(f"Using DMA device: {args.dev}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
+    print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
+    print(f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}")
 
     dual_engine = args.dual_engine
     assert dual_engine == False, (
         "Dual-engine Gemma3 PBI is not verified end-to-end yet; compile preserves sharding hooks for "
         "future work. Re-run without --dual-engine until validation lands."
     )
-    ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine)
+    ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine, legacy=args.legacy)
     ue.set_prefill_seq(args.prompt)
 
     if dual_engine:
@@ -1744,16 +1623,12 @@ def main():
         ue.compile_gemma3(profile=True)
         print(f"Profile compile done in {time.perf_counter() - timer:.2f} seconds")
         ue.run_gemma3_profile()
+        ue.clear_dram()
         print("Decoder profile done.")
         return
 
     run_result = ue.run_gemma3(slave_engine=ue2 if dual_engine else None)
     print("Gemma3 test ends.")
-    _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
-
-    global _SILENT_MODE
-    _SILENT_MODE = True
-    ue.software_reset()
 
 if __name__ == "__main__":
     main()
