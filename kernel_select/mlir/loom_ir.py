@@ -257,6 +257,14 @@ class IRExecutor:
         idx = {o["res"]: i for i, o in enumerate(self.ops)}
         inject_idx = idx[inject[0]] if inject else -1
         stop_idx = idx[stop_after] if stop_after else len(self.ops)
+        # bisect hook: LOOM_STOP_AFTER=<op-index> truncates the program to end
+        # right after that op (matches the index the nan-scan prints as 'op #N').
+        # Lets us binary-search where the in-program NaN first appears without
+        # the rest of the program writing over buffers afterward.
+        _sa = os.environ.get("LOOM_STOP_AFTER")
+        if _sa is not None:
+            stop_idx = min(stop_idx, int(_sa))
+            print(f"[ir] LOOM_STOP_AFTER: truncating program after op #{int(_sa)}")
         if inject is not None:
             inj_ssa, inj_val = inject
             v = inj_val.reshape(_MN(tuple(inj_val.shape)))
@@ -268,7 +276,17 @@ class IRExecutor:
                 sym[a_ssa] = _alloc_param(ue, v.to(torch.bfloat16))
                 shp[a_ssa] = list(val.shape)
         gpr_mm, gpr_ln, gpr_pbi = ue.alloc_isa_reg(), ue.alloc_isa_reg(), ue.alloc_isa_reg()
-        alloc = lambda n: _alloc(ue, n)
+        # alloc + ZERO: the bump allocator hands out uninitialized DRAM, and
+        # kernels don't always write 100% of their output (tiling remainders),
+        # so stale 0xFF (=bf16 NaN) leaks into the next op and poisons the whole
+        # tensor (the non-deterministic encoder NaN). Zero every scratch buffer
+        # at alloc time using the SAME tensor-dram addressing the kernels use.
+        _noz = os.environ.get("LOOM_NOZERO")
+        def alloc(n):
+            a = _alloc(ue, n)
+            if not _noz:
+                ue.dma_to_accelerator_memory(a, torch.zeros(n, dtype=torch.bfloat16))
+            return a
         perm_identity = _alloc_param(ue, torch.eye(UE_VECTOR_SIZE))  # for ue.permute transpose
         # Persistent zeros buffer for layer_norm. If ZEROS_DRAM_ADDR is None the kernel
         # writes its zeros to get_params_dram_addr() WITHOUT allocating it, so the next
@@ -369,14 +387,15 @@ class IRExecutor:
                 M, N = _MN(o["out"]); ow = self.ow[res]
                 g = _alloc_param(ue, ow["gamma"]); b = _alloc_param(ue, ow["beta"])
                 out = alloc(M * N)
+                a_in = sym[o["operands"][0]]
                 if os.environ.get("LOOM_LN_NOPBI"):     # diagnostic: non-PBI layer_norm
-                    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=sym[o["operands"][0]],
+                    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=a_in,
                                             OUTPUT_DRAM_ADDR=out, GAMMA_DRAM_ADDR=g,
                                             BETA_DRAM_ADDR=b, gpr_M_reg=None,
                                             ZEROS_DRAM_ADDR=ln_zeros)
                 else:
                     _pbi_set(ue, gpr_ln, _ln_chunks(M, N))
-                    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=sym[o["operands"][0]],
+                    ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=a_in,
                                             OUTPUT_DRAM_ADDR=out, GAMMA_DRAM_ADDR=g,
                                             BETA_DRAM_ADDR=b, gpr_M_reg=gpr_ln,
                                             ZEROS_DRAM_ADDR=ln_zeros)
@@ -458,6 +477,15 @@ class IRExecutor:
                                       f"NaN={int(torch.isnan(ti).sum())} "
                                       f"Inf={int(torch.isinf(ti).sum())} "
                                       f"absmax={float(ti.abs().nan_to_num().max()):.3g}")
+                                # dump the real consumed tensors so the isolated
+                                # kernel test can replay the EXACT data (LOOM_NAN_DUMP=dir)
+                                dd = os.environ.get("LOOM_NAN_DUMP")
+                                if dd:
+                                    import numpy as _np
+                                    os.makedirs(dd, exist_ok=True)
+                                    fn = f"{dd}/op{i}_{opd.strip('%')}_{im}x{iN}.npy"
+                                    _np.save(fn, ti.numpy())
+                                    print(f"[nan-scan]    -> dumped {fn}")
                             except Exception as e:
                                 print(f"[nan-scan]    input {opd}: unreadable ({e})")
                     break

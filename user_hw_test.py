@@ -1391,7 +1391,22 @@ def layer_norm_magnitude_test(M: int = 256, N: int = 1152, absmax: float = 170.0
     print(f"[ln-mag] => verdict: {'scaling FIXES the LayerNorm NaN' if (nfull and nsc==0 and snr>19) else 'inconclusive'}")
 
 
-def _ln_run(M, N, x, gamma=None, beta=None, use_pbi=True, prezero=True):
+def _ln_guard_ramp(N, eps=1e-2):
+    """Per-column ramp r in [-eps, eps] (same every row). The host-baked
+    zero-variance guard is MULTIPLICATIVE+additive: x_guard = x*(1+r) + r.
+    The (1+r) factor perturbs constant rows PROPORTIONALLY to their magnitude
+    (survives bf16 rounding at any scale); the +r term covers exact-zero rows.
+    Mirror this formula EXACTLY in loom_ir."""
+    return ((torch.arange(N) % 64) - 32).float() / 32.0 * eps
+
+
+def _ln_apply_guard(x):
+    M, N = x.shape
+    r = _ln_guard_ramp(N).unsqueeze(0)        # (1,N) broadcast over rows
+    return x * (1.0 + r) + r
+
+
+def _ln_run(M, N, x, gamma=None, beta=None, use_pbi=True, prezero=True, guard=False):
     """Run ONE layer_norm_core_dram exactly like loom/IRExecutor and return the
     output tensor (M,N) float. PBI path with gpr primed to M//chunk, output
     pre-zeroed so unwritten lanes read 0 (finite) not 0xFF (NaN)."""
@@ -1414,6 +1429,8 @@ def _ln_run(M, N, x, gamma=None, beta=None, use_pbi=True, prezero=True):
     ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
     if prezero:
         ue.dma_to_accelerator_memory(O, torch.zeros(M * N, dtype=torch.bfloat16))
+    if guard:
+        x = _ln_apply_guard(x)   # x*(1+r)+r — mirror loom_ir's in-stream mul+add
     ue.dma_to_accelerator_memory(A, x.to(torch.bfloat16))
     if gamma is not None: ue.dma_to_accelerator_memory(G, gamma.to(torch.bfloat16))
     if beta is not None:  ue.dma_to_accelerator_memory(B, beta.to(torch.bfloat16))
@@ -1440,17 +1457,34 @@ def layer_norm_nan_sweep():
         (729,  1152, 1.0, 168, "2.2B dims, absmax 168 (like op#19: NaN?)"),
         (729,  1152, 1.0, 256, "2.2B dims, absmax 256"),
         (1024, 768,  1.0, 168, "500M dims, absmax 168"),
+        (729,  1152, 0.0,  -1, "ALL rows zero-variance (constant) -> NaN?"),
+        (729,  1152, 0.0,  -2, "SOME rows zero-variance, rest normal -> NaN?"),
+        (729,  1152, 0.0,  -3, "GUARD: ALL constant + ramp -> finite?"),
+        (729,  1152, 0.0,  -4, "GUARD: some constant + ramp -> finite?"),
+        (729,  1152, 1.0,  -5, "GUARD: normal rows + ramp -> SNR intact?"),
     ]
     print("\n=== layer_norm_nan_sweep ===")
     print(f"{'M':>5} {'N':>5} {'scale':>5} {'absmax':>6} {'chunk':>5} {'n_chunk':>7} "
           f"{'NaN':>6} {'SNR(dB)':>8}  note")
     for M, N, scale, absmax, note in grid:
         x = torch.randn(M, N) * scale
-        if absmax:
+        guard = False
+        if absmax in (-1, -3):
+            # every row constant -> per-row variance is exactly 0
+            x = torch.arange(M, dtype=torch.float32).reshape(M, 1).repeat(1, N) * 0.3
+            guard = (absmax == -3)
+        elif absmax in (-2, -4):
+            x = torch.randn(M, N)
+            x[::3] = 1.7   # every 3rd row constant (zero variance), rest normal
+            guard = (absmax == -4)
+        elif absmax == -5:
+            x = torch.randn(M, N)
+            guard = True
+        elif absmax:
             for r in range(M):
                 x[r, torch.randint(0, N, (2,))] = absmax * (1 if r % 2 else -1)
         try:
-            out, chunk = _ln_run(M, N, x,
+            out, chunk = _ln_run(M, N, x, guard=guard,
                                  gamma=torch.ones(N), beta=torch.zeros(N))
             ref = torch.nn.functional.layer_norm(x, (N,))
             nan = int(torch.isnan(out).sum() + torch.isinf(out).sum())
@@ -1461,6 +1495,487 @@ def layer_norm_nan_sweep():
         except Exception as e:
             print(f"{M:>5} {N:>5} {scale:>5.1f} {absmax:>6}    -      -      ERR  "
                   f"     -  {note}  [EXC {type(e).__name__}: {e}]")
+
+
+def chain_bisect_test():
+    """Bisect the failing MLP block (fc1[gelu,wide] -> fc2 -> eltwise -> LN) to
+    the MINIMAL op adjacency that makes the LayerNorm NaN on HEALTHY input. All
+    buffers pre-zeroed and the LN input is verified NaN-free, so any LN NaN is a
+    pure execution-state interaction, not data. Each variant toggles fc1, gelu,
+    fc2, eltwise, and the intermediate width."""
+    M, H = 729, 1152
+    torch.manual_seed(0)
+    gm = torch.randn(H, dtype=torch.bfloat16); bt = torch.randn(H, dtype=torch.bfloat16)
+    x  = torch.randn(M, H, dtype=torch.bfloat16) * 0.5
+
+    def _v(do_fc1, gelu, inter, do_fc2, do_elt):
+        ue = UnifiedEngine()
+        W1 = ue.allocate_tensor_dram(inter * H * 2)
+        W2 = ue.allocate_tensor_dram(H * inter * 2)
+        C1 = ue.allocate_tensor_dram(inter * 2); C2 = ue.allocate_tensor_dram(H * 2)
+        T1 = ue.allocate_tensor_dram(M * inter * 2)   # fc1 out (M,inter)
+        PF = ue.allocate_tensor_dram(M * inter * 2)   # pre-filled fc2 src when no fc1
+        T2 = ue.allocate_tensor_dram(M * H * 2)
+        X  = ue.allocate_tensor_dram(M * H * 2)
+        R  = ue.allocate_tensor_dram(M * H * 2)
+        O  = ue.allocate_tensor_dram(M * H * 2)
+        G  = ue.allocate_tensor_dram(H * 2); BT = ue.allocate_tensor_dram(H * 2)
+        w1 = torch.randn(inter, H, dtype=torch.bfloat16) * 0.05
+        w2 = torch.randn(H, inter, dtype=torch.bfloat16) * 0.05
+        pf = torch.randn(M, inter, dtype=torch.bfloat16) * 0.3
+        for addr, t in [(W1, w1), (W2, w2), (X, x), (G, gm), (BT, bt), (PF, pf),
+                        (C1, torch.randn(inter, dtype=torch.bfloat16)*0.1),
+                        (C2, torch.randn(H, dtype=torch.bfloat16)*0.1),
+                        (T1, torch.zeros(M*inter, dtype=torch.bfloat16)),
+                        (T2, torch.zeros(M*H, dtype=torch.bfloat16)),
+                        (R,  torch.zeros(M*H, dtype=torch.bfloat16)),
+                        (O,  torch.zeros(M*H, dtype=torch.bfloat16))]:
+            ue.dma_to_accelerator_memory(addr, t)
+        gpr = 8
+        _chunk = min(URAM_NEAR_FULL_ELEMENTS // H, M, (256-4)//6)
+        while M % _chunk: _chunk -= 1
+        ue.start_capture()
+        fc2_src = PF
+        if do_fc1:
+            ue.generate_instruction_add_set(gpr, M)
+            ue.matmat_mul_core(M=M, K=H, N=inter, A_DRAM_ADDR=X, B_DRAM_ADDR=W1,
+                               OUTPUT_DRAM_ADDR=T1, C_DRAM_ADDR=C1,
+                               bias_mode="broadcast_N", gelu_enable=gelu, gpr_M_reg=gpr)
+            fc2_src = T1
+        ln_src = X
+        if do_fc2:
+            ue.generate_instruction_add_set(gpr, M)
+            ue.matmat_mul_core(M=M, K=inter, N=H, A_DRAM_ADDR=fc2_src, B_DRAM_ADDR=W2,
+                               OUTPUT_DRAM_ADDR=T2, C_DRAM_ADDR=C2,
+                               bias_mode="broadcast_N", gpr_M_reg=gpr)
+            ln_src = T2
+        if do_elt:
+            ue.eltwise_core_dram(M=M, N=H, dram_a=X, dram_b=ln_src, dram_out=R,
+                                 mode=UE_MODE.ELTWISE_ADD)
+            ln_src = R
+        ue.generate_instruction_add_set(gpr, M // _chunk)
+        ue.layer_norm_core_dram(M=M, N=H, A_DRAM_ADDR=ln_src, OUTPUT_DRAM_ADDR=O,
+                                GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=BT, gpr_M_reg=gpr)
+        ue.stop_capture(); ue.generate_instruction_halt()
+        p = ue.get_program_dram_addr(); ue.write_captured_instructions_to_dram(p)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(p); ue.wait_queue(30.0)
+        lin = ue.dma_from_accelerator_memory(ln_src, (M, H)).float()
+        out = ue.dma_from_accelerator_memory(O, (M, H)).float()
+        return (int(torch.isnan(lin).sum()+torch.isinf(lin).sum()),
+                int(torch.isnan(out).sum()+torch.isinf(out).sum()))
+
+    print("\n=== chain_bisect_test (find minimal LN-NaN trigger) ===")
+    variants = [
+        ("fc1g+fc2+elt+LN (full)",   True,  True,  4352, True,  True),
+        ("fc1g+fc2+LN (no elt)",     True,  True,  4352, True,  False),
+        ("fc1g+elt+LN (no fc2)",     True,  True,  4352, False, True),
+        ("fc2+elt+LN (no fc1)",      False, False, 4352, True,  True),
+        ("fc1(NOgelu)+fc2+elt+LN",   True,  False, 4352, True,  True),
+        ("fc1g+fc2+elt+LN narrow",   True,  True,  1152, True,  True),
+        ("fc1g+fc2+LN narrow",       True,  True,  1152, True,  False),
+    ]
+    for name, f1, g, inter, f2, e in variants:
+        try:
+            lnan, onan = _v(f1, g, inter, f2, e)
+            tag = "FAIL(NaN)" if onan else "ok"
+            print(f"[bisect] {name:<28} LNin_NaN={lnan:>6}  LNout_NaN={onan:>7}  [{tag}]")
+        except Exception as ex:
+            print(f"[bisect] {name:<28} EXC {type(ex).__name__}: {ex}")
+    # cross-program state probe: run the SAME full chain repeatedly (each a fresh
+    # UnifiedEngine, but the FPGA hardware state persists between programs). If a
+    # later repeat NaNs while the first was ok, the trigger is accumulated HW
+    # state across programs -> exactly the real-model condition.
+    print("--- repeat full chain (cross-program state) ---")
+    for i in range(5):
+        lnan, onan = _v(True, True, 4352, True, True)
+        print(f"[bisect] repeat #{i}                  LNin_NaN={lnan:>6}  "
+              f"LNout_NaN={onan:>7}  [{'FAIL(NaN)' if onan else 'ok'}]")
+
+
+def matmul_then_layernorm_minimal_test():
+    """MINIMAL repro of the op#19 NaN: ONE matmul then ONE layer_norm in the same
+    program, healthy random data, all buffers pre-zeroed. The layer_norm is
+    known-good in isolation (see layer_norm_nan_sweep), so if it NaNs HERE the
+    matmul left hardware state (URAM/config) that breaks the following LN. Also
+    runs layer_norm-only (no matmul) as the control, and a variant with a
+    software_reset between, to see if a reset clears the state."""
+    M, K, N = 729, 1152, 1152
+    torch.manual_seed(0)
+    a = torch.randn(M, K, dtype=torch.bfloat16) * 0.3
+    w = torch.randn(N, K, dtype=torch.bfloat16) * 0.05
+    gm = torch.randn(N, dtype=torch.bfloat16); bt = torch.randn(N, dtype=torch.bfloat16)
+    ln_in = torch.randn(M, N, dtype=torch.bfloat16) * 1.0   # healthy LN input
+
+    def _build(do_matmul, do_reset):
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(M * K * 2); B = ue.allocate_tensor_dram(N * K * 2)
+        MMO = ue.allocate_tensor_dram(M * N * 2)
+        LNI = ue.allocate_tensor_dram(M * N * 2); O = ue.allocate_tensor_dram(M * N * 2)
+        G = ue.allocate_tensor_dram(N * 2); BT = ue.allocate_tensor_dram(N * 2)
+        for addr, t in [(A, a), (B, w), (G, gm), (BT, bt), (LNI, ln_in),
+                        (MMO, torch.zeros(M*N, dtype=torch.bfloat16)),
+                        (O, torch.zeros(M*N, dtype=torch.bfloat16))]:
+            ue.dma_to_accelerator_memory(addr, t)
+        gpr = 8
+        _chunk = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256-4)//6)
+        while M % _chunk: _chunk -= 1
+        ue.start_capture()
+        if do_matmul:
+            ue.generate_instruction_add_set(gpr, M)
+            ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B,
+                               OUTPUT_DRAM_ADDR=MMO, gpr_M_reg=gpr)
+        if do_reset:
+            ue.software_reset()
+        ue.generate_instruction_add_set(gpr, M // _chunk)
+        ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=LNI, OUTPUT_DRAM_ADDR=O,
+                                GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=BT, gpr_M_reg=gpr)
+        ue.stop_capture(); ue.generate_instruction_halt()
+        p = ue.get_program_dram_addr(); ue.write_captured_instructions_to_dram(p)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(p); ue.wait_queue(20.0)
+        out = ue.dma_from_accelerator_memory(O, (M, N)).float()
+        ln = torch.nn.LayerNorm(N); ln.weight.data = gm; ln.bias.data = bt
+        ref = ln(ln_in)
+        nan = int(torch.isnan(out).sum() + torch.isinf(out).sum())
+        snr = float('nan') if nan else calculate_snr(ref, out)
+        return nan, snr
+
+    def _build2(pre):
+        """pre in {'eltwise','gelu_wide','wide_k'}: run one preceding op (wide
+        dims / gelu / eltwise) then LN on healthy LNI. All output buffers zeroed."""
+        ue = UnifiedEngine()
+        WIDE = 4352
+        A = ue.allocate_tensor_dram(M * max(K, WIDE) * 2)
+        B = ue.allocate_tensor_dram(WIDE * max(K, WIDE) * 2)
+        MMO = ue.allocate_tensor_dram(M * WIDE * 2)
+        LNI = ue.allocate_tensor_dram(M * N * 2); O = ue.allocate_tensor_dram(M * N * 2)
+        G = ue.allocate_tensor_dram(N * 2); BT = ue.allocate_tensor_dram(N * 2)
+        EB = ue.allocate_tensor_dram(M * N * 2)
+        for addr, t in [(G, gm), (BT, bt), (LNI, ln_in),
+                        (A, torch.randn(M, max(K, WIDE), dtype=torch.bfloat16)*0.1),
+                        (B, torch.randn(WIDE, max(K, WIDE), dtype=torch.bfloat16)*0.05),
+                        (EB, torch.randn(M, N, dtype=torch.bfloat16)*0.5),
+                        (MMO, torch.zeros(M*WIDE, dtype=torch.bfloat16)),
+                        (O, torch.zeros(M*N, dtype=torch.bfloat16))]:
+            ue.dma_to_accelerator_memory(addr, t)
+        gpr = 8
+        _chunk = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256-4)//6)
+        while M % _chunk: _chunk -= 1
+        ue.start_capture()
+        if pre == "eltwise":
+            ue.eltwise_core_dram(M=M, N=N, dram_a=LNI, dram_b=EB, dram_out=LNI, mode=UE_MODE.ELTWISE_ADD)
+        elif pre == "gelu_wide":
+            ue.generate_instruction_add_set(gpr, M)
+            ue.matmat_mul_core(M=M, K=K, N=WIDE, A_DRAM_ADDR=A, B_DRAM_ADDR=B,
+                               OUTPUT_DRAM_ADDR=MMO, gelu_enable=True, gpr_M_reg=gpr)
+        elif pre == "wide_k":
+            ue.generate_instruction_add_set(gpr, M)
+            ue.matmat_mul_core(M=M, K=WIDE, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B,
+                               OUTPUT_DRAM_ADDR=MMO, gpr_M_reg=gpr)
+        ue.generate_instruction_add_set(gpr, M // _chunk)
+        ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=LNI, OUTPUT_DRAM_ADDR=O,
+                                GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=BT, gpr_M_reg=gpr)
+        ue.stop_capture(); ue.generate_instruction_halt()
+        p = ue.get_program_dram_addr(); ue.write_captured_instructions_to_dram(p)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(p); ue.wait_queue(20.0)
+        out = ue.dma_from_accelerator_memory(O, (M, N)).float()
+        return int(torch.isnan(out).sum() + torch.isinf(out).sum())
+
+    print("\n=== matmul_then_layernorm_minimal_test ===")
+    for label, mm, rs in [("LN only (control)", False, False),
+                          ("matmul -> LN", True, False),
+                          ("matmul -> reset -> LN", True, True)]:
+        try:
+            nan, snr = _build(mm, rs)
+            print(f"[mm-ln] {label:<26} NaN={nan:>7}  SNR={snr:>7.2f} dB  "
+                  f"[{'FAIL(NaN)' if nan else 'ok'}]")
+        except Exception as e:
+            print(f"[mm-ln] {label:<26} EXC {type(e).__name__}: {e}")
+    # two matmuls back-to-back then LN (PBI inst-ptr / loop-state accumulation)
+    def _build_n(n_matmul):
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(M * K * 2); B = ue.allocate_tensor_dram(N * K * 2)
+        outs = [ue.allocate_tensor_dram(M * N * 2) for _ in range(n_matmul)]
+        LNI = ue.allocate_tensor_dram(M * N * 2); O = ue.allocate_tensor_dram(M * N * 2)
+        G = ue.allocate_tensor_dram(N * 2); BT = ue.allocate_tensor_dram(N * 2)
+        for addr, t in [(A, a), (B, w), (G, gm), (BT, bt), (LNI, ln_in),
+                        (O, torch.zeros(M*N, dtype=torch.bfloat16))]:
+            ue.dma_to_accelerator_memory(addr, t)
+        for o in outs:
+            ue.dma_to_accelerator_memory(o, torch.zeros(M*N, dtype=torch.bfloat16))
+        gpr = 8
+        _chunk = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256-4)//6)
+        while M % _chunk: _chunk -= 1
+        ue.start_capture()
+        for o in outs:
+            ue.generate_instruction_add_set(gpr, M)
+            ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B,
+                               OUTPUT_DRAM_ADDR=o, gpr_M_reg=gpr)
+        ue.generate_instruction_add_set(gpr, M // _chunk)
+        ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=LNI, OUTPUT_DRAM_ADDR=O,
+                                GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=BT, gpr_M_reg=gpr)
+        ue.stop_capture(); ue.generate_instruction_halt()
+        p = ue.get_program_dram_addr(); ue.write_captured_instructions_to_dram(p)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(p); ue.wait_queue(20.0)
+        out = ue.dma_from_accelerator_memory(O, (M, N)).float()
+        return int(torch.isnan(out).sum() + torch.isinf(out).sum())
+    for nm in (2, 3):
+        try:
+            nan = _build_n(nm)
+            print(f"[mm-ln] {str(nm)+'x matmul -> LN':<26} NaN={nan:>7}  "
+                  f"[{'FAIL(NaN)' if nan else 'ok'}]")
+        except Exception as e:
+            print(f"[mm-ln] {str(nm)+'x matmul -> LN':<26} EXC {type(e).__name__}: {e}")
+    for pre in ("eltwise", "gelu_wide", "wide_k"):
+        try:
+            nan = _build2(pre)
+            print(f"[mm-ln] {pre+' -> LN':<26} NaN={nan:>7}  "
+                  f"[{'FAIL(NaN)' if nan else 'ok'}]")
+        except Exception as e:
+            print(f"[mm-ln] {pre+' -> LN':<26} EXC {type(e).__name__}: {e}")
+
+
+def mlp_then_layernorm_chain_test():
+    """Reproduce the model's op#16->17->18->19 chain in ONE program (shared HW
+    state), since every piece is clean in isolation but op#19's LayerNorm NaNs
+    in-program. Sequence: fc1 (K=1152,N=4304,gelu) -> fc2 (K=4304,N=1152) ->
+    residual add -> layer_norm (N=1152). The fc1/fc2 use the UNALIGNED 4304
+    intermediate (SigLIP-SO400M). If the final LN NaNs here on healthy random
+    input, the bug is the MLP(4304)->LN state interaction, not data.
+    Control: same chain with an ALIGNED intermediate (4352)."""
+    import nn_lib  # noqa
+    for INTER in (4304, 4352):
+        M, H = 729, 1152
+        ue = UnifiedEngine()
+        X  = ue.allocate_tensor_dram(M * H * 2)        # block input / residual
+        W1 = ue.allocate_tensor_dram(INTER * H * 2); B1 = ue.allocate_tensor_dram(INTER * 2)
+        T1 = ue.allocate_tensor_dram(M * INTER * 2)    # fc1 out (gelu)
+        W2 = ue.allocate_tensor_dram(H * INTER * 2); B2 = ue.allocate_tensor_dram(H * 2)
+        T2 = ue.allocate_tensor_dram(M * H * 2)        # fc2 out
+        R  = ue.allocate_tensor_dram(M * H * 2)        # residual add
+        G  = ue.allocate_tensor_dram(H * 2); BT = ue.allocate_tensor_dram(H * 2)
+        O  = ue.allocate_tensor_dram(M * H * 2)        # LN out
+        torch.manual_seed(0)
+        x  = torch.randn(M, H, dtype=torch.bfloat16) * 0.5
+        w1 = torch.randn(INTER, H, dtype=torch.bfloat16) * 0.05
+        w2 = torch.randn(H, INTER, dtype=torch.bfloat16) * 0.05
+        gm = torch.randn(H, dtype=torch.bfloat16); bt = torch.randn(H, dtype=torch.bfloat16)
+        prezero = bool(int(os.environ.get("PREZERO", "1")))
+        inits = [(X, x), (W1, w1), (B1, torch.zeros(INTER, dtype=torch.bfloat16)),
+                 (W2, w2), (B2, torch.zeros(H, dtype=torch.bfloat16)),
+                 (G, gm), (BT, bt), (O, torch.zeros(M * H, dtype=torch.bfloat16))]
+        if prezero:   # pre-zero matmul/residual output buffers (hypothesis: stale-NaN lanes)
+            inits += [(T1, torch.zeros(M * INTER, dtype=torch.bfloat16)),
+                      (T2, torch.zeros(M * H, dtype=torch.bfloat16)),
+                      (R,  torch.zeros(M * H, dtype=torch.bfloat16))]
+        for addr, t in inits:
+            ue.dma_to_accelerator_memory(addr, t)
+        gpr = 8
+        _ops = 6; _chunk = min(URAM_NEAR_FULL_ELEMENTS // H, M, (256 - 4) // _ops)
+        while M % _chunk: _chunk -= 1
+        ue.start_capture()
+        ue.generate_instruction_add_set(gpr, M)
+        ue.matmat_mul_core(M=M, K=H, N=INTER, A_DRAM_ADDR=X, B_DRAM_ADDR=W1,
+                           OUTPUT_DRAM_ADDR=T1, C_DRAM_ADDR=B1,
+                           bias_mode="broadcast_N", gelu_enable=True, gpr_M_reg=gpr)
+        ue.generate_instruction_add_set(gpr, M)
+        ue.matmat_mul_core(M=M, K=INTER, N=H, A_DRAM_ADDR=T1, B_DRAM_ADDR=W2,
+                           OUTPUT_DRAM_ADDR=T2, C_DRAM_ADDR=B2,
+                           bias_mode="broadcast_N", gpr_M_reg=gpr)
+        nn_lib._sram_add(ue, X, T2, R, M * H) if hasattr(nn_lib, "_sram_add") else None
+        # residual add via eltwise core (mode add)
+        if not hasattr(nn_lib, "_sram_add"):
+            ue.eltwise_core_dram(M=M, N=H, dram_a=X, dram_b=T2, dram_out=R, mode=UE_MODE.ELTWISE_ADD)
+        ue.generate_instruction_add_set(gpr, M // _chunk)
+        ue.layer_norm_core_dram(M=M, N=H, A_DRAM_ADDR=R, OUTPUT_DRAM_ADDR=O,
+                                GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=BT, gpr_M_reg=gpr)
+        ue.stop_capture(); ue.generate_instruction_halt()
+        p = ue.get_program_dram_addr(); ue.write_captured_instructions_to_dram(p)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(p); ue.wait_queue(30.0)
+        # per-stage readback to localize where NaN enters
+        t1hw = ue.dma_from_accelerator_memory(T1, (M, INTER)).float()
+        t2hw = ue.dma_from_accelerator_memory(T2, (M, H)).float()
+        rhw  = ue.dma_from_accelerator_memory(R,  (M, H)).float()
+        def _bad(t): return int(torch.isnan(t).sum() + torch.isinf(t).sum())
+        print(f"[mlp-ln]   stages: fc1={_bad(t1hw)} fc2={_bad(t2hw)} "
+              f"resid={_bad(rhw)} (absmax R={float(rhw.abs().nan_to_num().max()):.3g})")
+        out = ue.dma_from_accelerator_memory(O, (M, H)).float()
+        # torch ref
+        t1 = torch.nn.functional.gelu(x.float() @ w1.float().T)
+        t2 = t1 @ w2.float().T
+        r  = x.float() + t2
+        ln = torch.nn.LayerNorm(H); ln.weight.data = gm; ln.bias.data = bt
+        ref = ln(r.to(torch.bfloat16))
+        nan = int(torch.isnan(out).sum() + torch.isinf(out).sum())
+        snr = float('nan') if nan else calculate_snr(ref, out)
+        print(f"[mlp-ln] intermediate={INTER} ({'UNALIGNED' if INTER%64 else 'ALIGNED'})  "
+              f"LN NaN={nan}  SNR={snr:.2f} dB  [{'FAIL(NaN)' if nan else 'ok'}]")
+
+
+def matmul_unaligned_n_overrun_test():
+    """Test the SigLIP-SO400M FFN fc1 shape: M=729, K=1152, N=4304 (NOT a
+    multiple of 64; 64*67=4288, +16). Hypothesis: the matmul rounds N up to
+    4352 and writes past the M*N output buffer, stomping the neighbor that
+    becomes the next block's LayerNorm input -> the op#19 NaN. Canary buffer
+    placed right after the output detects the overrun. N=4352 (aligned) is the
+    control."""
+    for N in (4304, 4352):
+        M, K = 729, 1152
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(M * K * 2)
+        B = ue.allocate_tensor_dram(K * N * 2)
+        C = ue.allocate_tensor_dram(N * 2)
+        canary_elems = 8192
+        O = ue.allocate_tensor_dram(M * N * 2 + canary_elems * 2)
+        torch.manual_seed(0)
+        a = torch.randn(M, K, dtype=torch.bfloat16) * 0.1
+        b = torch.randn(N, K, dtype=torch.bfloat16) * 0.1   # weight (N,K) row-major
+        c = torch.zeros(N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(A, a)
+        ue.dma_to_accelerator_memory(B, b)
+        ue.dma_to_accelerator_memory(C, c)
+        ue.dma_to_accelerator_memory(O, torch.zeros(M * N, dtype=torch.bfloat16))
+        ue.dma_to_accelerator_memory(O + M * N * 2,
+                                     torch.full((canary_elems,), 7.0, dtype=torch.bfloat16))
+        gpr = 8
+        ue.start_capture()
+        ue.generate_instruction_add_set(gpr, M)
+        ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B,
+                           OUTPUT_DRAM_ADDR=O, C_DRAM_ADDR=C,
+                           bias_mode="broadcast_N", gelu_enable=True, gpr_M_reg=gpr)
+        ue.stop_capture(); ue.generate_instruction_halt()
+        p = ue.get_program_dram_addr(); ue.write_captured_instructions_to_dram(p)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(p); ue.wait_queue(20.0)
+        out = ue.dma_from_accelerator_memory(O, ((M * N + canary_elems),)).float()
+        body = out[:M * N]
+        can = out[M * N:]
+        nan = int(torch.isnan(body).sum() + torch.isinf(body).sum())
+        bad_canary = int((can != 7.0).sum())
+        ref = torch.nn.functional.gelu((a.float() @ b.float().T))
+        snr = float('nan') if nan else calculate_snr(ref, body.reshape(M, N))
+        print(f"[mm-N] N={N} ({'ALIGNED' if N % 64 == 0 else 'UNALIGNED'})  "
+              f"NaN={nan}  canary_stomped={bad_canary}  SNR={snr:.2f} dB  "
+              f"[{'ok' if bad_canary == 0 and nan == 0 else 'FAIL'}]")
+
+
+def pbi_strided_copy_overrun_test():
+    """Isolate the head_dim-72 (hd_pad=128) attention corruption to its source:
+    the inverse-permute's per-head pbi_strided_copy. Reproduces emit_windowed
+    step-7 params for ONE head and checks (a) the gather is correct and (b) a
+    CANARY buffer placed immediately after dst is untouched. hd_pad=64 (Swin,
+    known-good) is the control; hd_pad=128 is the suspect. If the canary is
+    clobbered at 128 but not 64, the >128B copy_bytes path overruns -> that is
+    the buffer stomp that feeds op#19 a NaN."""
+    from nn_lib import pbi_strided_copy
+
+    def _run(hd_pad, count=16, nh=2):
+        ue = UnifiedEngine()
+        copy_bytes = hd_pad * 2
+        dst_stride = nh * hd_pad * 2           # token-major row (other heads interleaved)
+        src_elems = count * hd_pad
+        # dst region spans (count-1)*dst_stride + copy_bytes; pad a canary after it
+        dst_span = (count - 1) * dst_stride + copy_bytes
+        canary_elems = 4096
+        SRC = ue.allocate_tensor_dram(src_elems * 2)
+        DST = ue.allocate_tensor_dram(dst_span + canary_elems * 2)
+        src = torch.arange(1, src_elems + 1, dtype=torch.float32).to(torch.bfloat16)
+        canary = torch.full((canary_elems,), 7.0, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(SRC, src)
+        # pre-zero dst, then lay the canary right after the dst span
+        ue.dma_to_accelerator_memory(DST, torch.zeros(dst_span // 2, dtype=torch.bfloat16))
+        ue.dma_to_accelerator_memory(DST + dst_span, canary)
+
+        ue.start_capture()
+        pbi_strided_copy(ue, 8, src_base=SRC, dst_base=DST, count=count,
+                         copy_bytes=copy_bytes, src_stride=copy_bytes, dst_stride=dst_stride)
+        ue.generate_instruction_halt()
+        p = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(p)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(p); ue.wait_queue(10.0)
+
+        # read back dst blocks + canary
+        out = ue.dma_from_accelerator_memory(DST, ((dst_span + canary_elems * 2) // 2,)).float()
+        got = torch.stack([out[b * (dst_stride // 2): b * (dst_stride // 2) + hd_pad]
+                           for b in range(count)])
+        exp = src.float().reshape(count, hd_pad)
+        copy_ok = torch.equal(got, exp)
+        can = out[dst_span // 2: dst_span // 2 + canary_elems]
+        canary_ok = bool((can == 7.0).all())
+        bad_canary = int((can != 7.0).sum())
+        print(f"[pbi-copy] hd_pad={hd_pad:>3} copy_bytes={copy_bytes:>3}  "
+              f"gather={'OK' if copy_ok else 'WRONG'}  "
+              f"canary={'intact' if canary_ok else f'STOMPED({bad_canary} elems)'}  "
+              f"[{'ok' if copy_ok and canary_ok else 'FAIL'}]")
+
+    print("\n=== pbi_strided_copy_overrun_test (inverse-permute step-7) ===")
+    _run(hd_pad=64)    # Swin control (one SRAM row)
+    _run(hd_pad=128)   # SigLIP hd=72->128 suspect (two SRAM rows)
+
+
+def layer_norm_op19_test():
+    """Reproduce the EXACT SmolVLM-Instruct encoder op#19 LayerNorm that NaNs:
+      input  %453 : (1, 729, 1152)  absmax ~165
+      gamma  %24  : (1152,)         absmax ~2.28
+      beta   %25  : (1152,)         absmax ~2.94
+    M=729, N=1152, chunk=27, PBI path — identical to loom/IRExecutor. Runs the
+    real gamma/beta (not ones/zeros) at the real magnitude, with and without the
+    zero-variance guard, so we can see whether THIS exact situation NaNs on
+    synthetic data. (Next step: feed the real %453 tensor dumped from a run.)"""
+    M, N = 729, 1152
+    torch.manual_seed(0)
+    # gamma/beta scaled to the model's observed absmax
+    gamma = torch.randn(N); gamma = gamma / gamma.abs().max() * 2.28
+    beta  = torch.randn(N); beta  = beta  / beta.abs().max()  * 2.94
+
+    def _case(label, x, guard):
+        out, chunk = _ln_run(M, N, x, gamma=gamma, beta=beta, guard=guard)
+        ln = torch.nn.LayerNorm(N)
+        ln.weight.data = gamma.to(torch.bfloat16); ln.bias.data = beta.to(torch.bfloat16)
+        ref = ln(x.to(torch.bfloat16))
+        nan = int(torch.isnan(out).sum() + torch.isinf(out).sum())
+        snr = float('nan') if nan else calculate_snr(ref, out)
+        tag = "FAIL(NaN)" if nan else ("ok" if snr > 30 else "LOWSNR")
+        print(f"[op19] {label:<34} guard={int(guard)}  NaN={nan:>7}  "
+              f"SNR={snr:>7.2f} dB  [{tag}]")
+
+    print(f"\n=== layer_norm_op19_test  M={M} N={N}  gamma~2.28 beta~2.94 ===")
+    # normal-ish residual-stream input at absmax 165 (massive-activation style:
+    # mostly small values + a few large per-row spikes, like real SigLIP)
+    x = torch.randn(M, N) * 0.9
+    for r in range(M):
+        x[r, torch.randint(0, N, (3,))] = 165.0 * (1 if r % 2 else -1)
+    _case("massive-activation absmax165", x, guard=False)
+    _case("massive-activation absmax165", x, guard=True)
+    # degenerate: some rows perfectly constant at the big magnitude
+    xd = x.clone(); xd[::5] = 165.0
+    _case("+constant rows @165", xd, guard=False)
+    _case("+constant rows @165", xd, guard=True)
+
+    # --- replay the REAL dumped op#19 tensors, if present -------------------
+    import os as _os
+    f453 = "op19_453_729x1152.npy"
+    if _os.path.exists(f453):
+        import numpy as _np
+        xr = torch.tensor(_np.load(f453))
+        gr = torch.tensor(_np.load("op19_24_1x1152.npy")).reshape(-1)
+        br = torch.tensor(_np.load("op19_25_1x1152.npy")).reshape(-1)
+        rstd = xr.std(dim=1)
+        print(f"[op19] REAL %453: min_std={float(rstd.min()):.3f} "
+              f"zero_std_rows={int((rstd==0).sum())} absmax={float(xr.abs().max()):.0f}")
+        outr, _ = _ln_run(M, N, xr, gamma=gr, beta=br, guard=False)
+        ln = torch.nn.LayerNorm(N); ln.weight.data = gr.to(torch.bfloat16); ln.bias.data = br.to(torch.bfloat16)
+        refr = ln(xr.to(torch.bfloat16))
+        nanr = int(torch.isnan(outr).sum() + torch.isinf(outr).sum())
+        snrr = float('nan') if nanr else calculate_snr(refr, outr)
+        tag = "FAIL(NaN)" if nanr else ("ok" if snrr > 30 else "LOWSNR")
+        print(f"[op19] REAL %453 replay (no guard)   NaN={nanr:>7}  "
+              f"SNR={snrr:>7.2f} dB  [{tag}]")
 
 
 def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False):
@@ -5057,7 +5572,7 @@ if __name__ == "__main__":
     atexit.register(write_test_summary, "user_hw_test_summary.md")
 
     software_reset_test()
-    layer_norm_nan_sweep()
+    chain_bisect_test()
     import sys as _sys; _sys.exit(0)   # LN-NaN characterization run: skip the rest
     dram_read_write_speed_test()
     isa_rela_loop_test()
