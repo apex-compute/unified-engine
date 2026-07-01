@@ -145,42 +145,47 @@ def _check_mbv2_ssd(text):
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
 MATH_PROMPT = "If x + 3 = 5, what is x?"
 
+# Each test now declares TWO entry points:
+#   compile_script       — always compiles from scratch (its model_bin dir is wiped
+#                           before this runs). Proves the compile path works.
+#   run_from_bin_script  — loads the program the compile pass just wrote and executes
+#                           it (no recompile). Proves the cached-bin path works.
+# If a model has no dedicated run_from_bin script yet, run_from_bin_script is None and
+# the harness reruns compile_script a second time — its own bin-cache check (see e.g.
+# gpt2_test.py) makes that second run a real load-from-bin pass.
 TESTS = [
-    # gemma3 has no run_from_bin yet — uses the _test.py entry point (like gpt2);
-    # swap to gemma3_run_from_bin.py once it exists.
-    {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "gemma4_e2b",  "script": "models/gemma4_e2b/gemma4_e2b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_run_from_bin.py",       "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "gemma3",      "compile_script": "models/gemma3/gemma3_test.py",                   "run_from_bin_script": None,                                       "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "gemma4_e2b",  "compile_script": "models/gemma4_e2b/gemma4_e2b_test.py",            "run_from_bin_script": "models/gemma4_e2b/gemma4_e2b_run_from_bin.py",            "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "gemma4_e4b",  "compile_script": "models/gemma4_e4b/gemma4_e4b_test.py",            "run_from_bin_script": "models/gemma4_e4b/gemma4_e4b_run_from_bin.py",            "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "llama3.2_1b", "compile_script": "models/llama3.2_1b/llama3.2_1b_test.py",          "run_from_bin_script": "models/llama3.2_1b/llama3.2_1b_run_from_bin.py",          "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "llama3.2_3b", "compile_script": "models/llama3.2_3b/llama3.2_3b_test.py",          "run_from_bin_script": "models/llama3.2_3b/llama3.2_3b_run_from_bin.py",          "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3_1.7b",  "compile_script": "models/qwen3_1.7b/qwen3_1.7b_test.py",            "run_from_bin_script": "models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py",            "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3_4b",    "compile_script": "models/qwen3_4b/qwen3_4b_test.py",                "run_from_bin_script": "models/qwen3_4b/qwen3_4b_run_from_bin.py",                "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3.5_2b",  "compile_script": "models/qwen3.5_2b/qwen3.5_2b_test.py",            "run_from_bin_script": "models/qwen3.5_2b/qwen3.5_2b_run_from_bin.py",            "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen2.5_vl_3b", "compile_script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py",    "run_from_bin_script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_run_from_bin.py",      "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     # smolvlm2 DEFAULTS to VLM (loads a bundled image + runs the vision encoder), so
     # --lm-enable forces pure language-model (text-only) mode. SmolVLM2-500M is too
     # small to reliably do algebra, so it gets a factual question it can answer
     # ("What is the capital of France?" — its built-in default lm_prompt) and we check
     # for "Paris". The other VL models default to LM when --image is omitted.
-    {"name": "smolvlm2",    "script": "models/smolvlm2/smolvlm2_run_from_bin.py",       "prompt": "What is the capital of France?", "pass_check": _check_smolvlm2, "extra_args": ["--lm-enable"]},
+    {"name": "smolvlm2",    "compile_script": "models/smolvlm2/smolvlm2_test.py",                "run_from_bin_script": "models/smolvlm2/smolvlm2_run_from_bin.py",                "prompt": "What is the capital of France?", "pass_check": _check_smolvlm2, "extra_args": ["--lm-enable"]},
 
     # GPT-2 is a base (non-chat) model: text continuation, no single correct answer,
-    # so the check is lenient (non-empty generation). No run_from_bin yet — uses the
-    # _test.py entry point; swap to gpt2_run_from_bin.py once it exists.
-    {"name": "gpt2",        "script": "models/gpt2/gpt2_test.py",                        "prompt": "The scientists at MIT announced today that they have discovered ", "pass_check": _check_nonempty},
+    # so the check is lenient (non-empty generation). No run_from_bin yet.
+    {"name": "gpt2",        "compile_script": "models/gpt2/gpt2_test.py",                        "run_from_bin_script": None, "prompt": "The scientists at MIT announced today that they have discovered ", "pass_check": _check_nonempty},
 
     # Vision / detection models: no --prompt; emit detections / class labels parsed
-    # from stdout. No run_from_bin yet — use the _test.py entry points (like gpt2).
-    {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},
-    {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
-    {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
+    # from stdout. No run_from_bin yet.
+    {"name": "locateanything_3b", "compile_script": "models/locateanything_3b/locateanything_3b_test.py",            "run_from_bin_script": None, "pass_check": _check_locateanything},
+    {"name": "mobilenetv2_224",   "compile_script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "run_from_bin_script": None, "pass_check": _check_mbv2_224},
+    {"name": "mobilenetv2_ssd",   "compile_script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "run_from_bin_script": None, "pass_check": _check_mbv2_ssd},
 
     # Encoder models take no --prompt and emit non-LM output (ASR transcription /
-    # segmentation). Use the _test.py entry points for this round; checks are lenient
-    # (non-empty == the model didn't crash / NaN-out on poisoned DRAM).
-    {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",                "pass_check": _check_parakeet},
-    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",              "pass_check": _check_nonempty},
-    {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_nonempty},
+    # segmentation). parakeet and mobilesam have dedicated run_from_bin scripts; swin
+    # doesn't yet, so it reruns its own _test.py for the second (cached) pass.
+    {"name": "parakeet",  "compile_script": "models/parakeet/parakeet_test.py",                "run_from_bin_script": "models/parakeet/parakeet_run_from_bin.py",   "pass_check": _check_parakeet},
+    {"name": "mobilesam", "compile_script": "models/mobilesam/mobilesam_test.py",              "run_from_bin_script": "models/mobilesam/mobilesam_run_from_bin.py", "pass_check": _check_nonempty},
+    {"name": "swin",      "compile_script": "models/swin/swin_test.py",                        "run_from_bin_script": None,                                          "pass_check": _check_nonempty},
 ]
 
 
@@ -205,20 +210,48 @@ def reset_device(dev: str = "xdma0") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-model bin cache cleanup
+# ---------------------------------------------------------------------------
+
+def model_bin_dir(script: str) -> str:
+    """models/<model>/<model>_test.py -> models/<model>/<model>_bin"""
+    d = os.path.dirname(script)
+    return os.path.join(d, os.path.basename(d) + "_bin")
+
+
+def clean_model_bin(script: str) -> None:
+    """Delete cached programs.bin/programs.json under this model's bin dir so
+    the next run is forced to compile from scratch. Leaves weights untouched."""
+    bin_dir = os.path.join(SCRIPT_DIR, model_bin_dir(script))
+    removed = []
+    for root, _, files in os.walk(bin_dir):
+        for f in files:
+            if f in ("programs.bin", "programs.json"):
+                path = os.path.join(root, f)
+                os.remove(path)
+                removed.append(path)
+    if removed:
+        print(f"[clean_model_bin] removed: {', '.join(removed)}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_test(test: dict, verbose: bool = False) -> dict:
-    """Run one model test as a subprocess.
+def run_test(test: dict, script: str, phase: str, verbose: bool = True) -> dict:
+    """Run one model entry point (compile or run-from-bin pass) as a subprocess,
+    poisoning DRAM immediately before it.
 
     verbose=True  — stream the model's stdout live, as it prints (tee to console).
+                    Default ON: a CI run that fails fast needs to show *why* it
+                    failed, not just a bare exit code.
     verbose=False — show only the banner + verdict; the model's own run log is
                     captured for parsing but not echoed.
     """
-    script = os.path.join(SCRIPT_DIR, test["script"])
+    script_abs = os.path.join(SCRIPT_DIR, script)
     # -u: force the child's stdout unbuffered so verbose mode streams live
     # instead of arriving in big blocks (its stdout is a pipe, not a TTY).
-    cmd = [sys.executable, "-u", script]
+    cmd = [sys.executable, "-u", script_abs]
     if test.get("prompt"):
         cmd += ["--prompt", test["prompt"]]
     cmd += test.get("extra_args", [])
@@ -226,8 +259,8 @@ def run_test(test: dict, verbose: bool = False) -> dict:
         cmd += ["--dev", DMA_DEV]
 
     print(f"\n{'='*60}")
-    print(f"Running test : {test['name']}")
-    print(f"Script       : {test['script']}")
+    print(f"Running test : {test['name']} [{phase}]")
+    print(f"Script       : {script}")
     if test.get("prompt"):
         print(f"Prompt       : {test['prompt']}")
     print(f"{'='*60}\n", flush=True)
@@ -235,26 +268,25 @@ def run_test(test: dict, verbose: bool = False) -> dict:
     # Check immediately before poisoning. Model worktrees are sometimes updated
     # while a long suite is running; do not spend time writing 4 GiB when the
     # subprocess entry point is no longer present.
-    if not os.path.isfile(script):
-        result = _parse_output(test, "", 1, 0.0)
-        result["pass_reason"] = f"model script not found: {test['script']}"
+    if not os.path.isfile(script_abs):
+        result = _parse_output(test, phase, "", 1, 0.0)
+        result["pass_reason"] = f"model script not found: {script}"
         return result
 
-    # Poison the full 4 GiB DRAM BEFORE the model runs, so loading
-    # from bin has to (re)write every byte it reads. Done here in the harness — the
-    # model scripts are untouched.
+    # Poison the full 4 GiB DRAM BEFORE every single run (compile pass AND
+    # run-from-bin pass), so each pass has to (re)write every byte it reads.
     if RANDOMIZE_DRAM:
         model_seed = (
-            RANDOM_DRAM_SEED + zlib.crc32(test["name"].encode("utf-8"))
+            RANDOM_DRAM_SEED + zlib.crc32(f"{test['name']}:{phase}".encode("utf-8"))
         ) & 0xFFFFFFFF
         print(f"[randomize_dram] poisoning full 4 GiB DRAM "
-              f"(seed={model_seed}) before {test['name']} ...", flush=True)
+              f"(seed={model_seed}) before {test['name']} [{phase}] ...", flush=True)
         poison_start = time.perf_counter()
         poisoned = randomize_dram(seed=model_seed, dev=DMA_DEV)
         poison_elapsed = time.perf_counter() - poison_start
         print(f"{'-'*60}\n", flush=True)
         if not poisoned:
-            result = _parse_output(test, "", 1, poison_elapsed)
+            result = _parse_output(test, phase, "", 1, poison_elapsed)
             result["pass_reason"] = "DRAM poisoning failed; model was not run"
             return result
 
@@ -280,14 +312,81 @@ def run_test(test: dict, verbose: bool = False) -> dict:
         stdout, returncode = proc.stdout, proc.returncode
     elapsed = time.perf_counter() - t_start
 
-    return _parse_output(test, stdout, returncode, elapsed)
+    result = _parse_output(test, phase, stdout, returncode, elapsed)
+    if not result["passed"] and not verbose:
+        # Always show the failing run's full output, even in concise mode —
+        # a CI run that stops on first failure must show *why* immediately.
+        print(stdout)
+    return result
 
 
-def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> dict:
+def run_model_two_pass(test: dict, verbose: bool = True) -> list:
+    """Compile-from-scratch pass, then run-from-cached-bin pass. DRAM is
+    randomized before each. Returns the list of phase results produced before
+    either a failure or completion (stops early on first failure)."""
+    compile_script = test["compile_script"]
+    runfrombin_script = test.get("run_from_bin_script") or compile_script
+
+    clean_model_bin(compile_script)
+
+    results = []
+    compile_result = run_test(test, compile_script, "compile", verbose=verbose)
+    results.append(compile_result)
+    if not compile_result["passed"]:
+        return results
+
+    runfrombin_result = run_test(test, runfrombin_script, "run_from_bin", verbose=verbose)
+    results.append(runfrombin_result)
+    return results
+
+
+# Best-effort regex extraction of HW compile / execute time from a model
+# script's stdout. Model scripts report these inconsistently (no shared
+# TEST_RESULT fields exist yet), so this tries the known print formats in
+# order and sums all matches found (e.g. separate prefill/decoder compiles,
+# or a hardware-reported "execution latency" per program).
+_COMPILE_TIME_PATTERNS = [
+    r"Compile done in ([\d.]+)\s*s",                 # gpt2, gemma3, qwen3_1.7b style
+    r"Compile:\s*([\d.]+)\s*s",                       # swin style
+    r"(?:prefill|decoder) compiled:.*?([\d.]+)\s*s",  # gpt2 per-stage compiles
+]
+_EXEC_TIME_PATTERNS = [
+    r"Total program execution latency = ([\d.]+)\s*us",  # HW register readout (program_execute)
+    r"Executing:\s*([\d.]+)\s*s",                          # swin style
+]
+
+
+def _extract_timing(stdout: str) -> tuple:
+    """Returns (compile_time_s, exec_time_s), either None if not found."""
+    compile_s = None
+    for pat in _COMPILE_TIME_PATTERNS:
+        matches = re.findall(pat, stdout)
+        if matches:
+            compile_s = (compile_s or 0.0) + sum(float(m) for m in matches)
+
+    exec_s = None
+    for pat in _EXEC_TIME_PATTERNS:
+        matches = re.findall(pat, stdout)
+        if not matches:
+            continue
+        total = sum(float(m) for m in matches)
+        if "latency" in pat:  # hardware readout is in microseconds
+            total /= 1_000_000.0
+        exec_s = (exec_s or 0.0) + total
+
+    return compile_s, exec_s
+
+
+def _parse_output(test: dict, phase: str, stdout: str, returncode: int, elapsed: float) -> dict:
+    compile_time_s, exec_time_s = _extract_timing(stdout)
     result = {
         "name": test["name"],
+        "phase": phase,
         "returncode": returncode,
         "elapsed_s": elapsed,
+        "executed": returncode == 0,
+        "compile_time_s": compile_time_s,
+        "exec_time_s": exec_time_s,
         "prefill_text": test.get("prompt", "(default)"),
         "prefill_tokens": None,
         "decoded_text": "",
@@ -372,9 +471,19 @@ def write_summary(results: list, output_path: str) -> None:
             else "N/A"
         )
 
+        compile_t = (
+            f"{r['compile_time_s']:.2f}s" if r.get("compile_time_s") is not None else "N/A"
+        )
+        exec_t = (
+            f"{r['exec_time_s']:.3f}s" if r.get("exec_time_s") is not None else "N/A"
+        )
+
         lines += [
-            f"Test             : {r['name']}",
+            f"Test             : {r['name']} [{r['phase']}]",
             f"  Result         : {status}",
+            f"  Executed       : {'YES' if r['executed'] else 'NO'}",
+            f"  HW compile time: {compile_t}",
+            f"  HW exec time   : {exec_t}",
             f"  Pass reason    : {r['pass_reason']}",
             f"  Prefill text   : {r['prefill_text']}",
             f"  Prefill tokens : {r['prefill_tokens']}",
@@ -387,6 +496,16 @@ def write_summary(results: list, output_path: str) -> None:
             f"  Total time     : {r['elapsed_s']:.1f}s",
             "",
         ]
+
+    lines += ["=" * 60, "Summary table", "-" * 60,
+              f"{'Model':<22}{'Phase':<14}{'Executed':<10}{'Compile':<12}{'Exec':<12}{'Result':<6}"]
+    for r in results:
+        compile_t = f"{r['compile_time_s']:.2f}s" if r.get("compile_time_s") is not None else "N/A"
+        exec_t = f"{r['exec_time_s']:.3f}s" if r.get("exec_time_s") is not None else "N/A"
+        lines.append(
+            f"{r['name']:<22}{r['phase']:<14}{'YES' if r['executed'] else 'NO':<10}{compile_t:<12}{exec_t:<12}"
+            f"{'PASS' if r['passed'] else 'FAIL':<6}"
+        )
 
     total = len(results)
     passed = sum(1 for r in results if r["passed"])
@@ -411,10 +530,12 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="+", metavar="NAME", help="Run only these named tests")
-    ap.add_argument("--verbose", action="store_true",
-                    help="Stream each model's live stdout as it runs (full run log)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="Don't stream each model's live stdout (still shown on failure)")
     ap.add_argument("--list-names", action="store_true",
                     help="Print the registered test names (space-separated) and exit")
+    ap.add_argument("--no-fail-fast", action="store_true",
+                    help="Keep running remaining models after a failure (default: stop immediately)")
     args = ap.parse_args()
 
     if args.list_names:
@@ -438,15 +559,26 @@ def main():
     # Initialize the FPGA once before running any model (software reset).
     reset_device()
 
+    stopped_early = False
     for test in tests:
-        result = run_test(test, verbose=args.verbose)
-        results.append(result)
-        status = "PASS" if result["passed"] else "FAIL"
-        print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}\n")
+        phase_results = run_model_two_pass(test, verbose=not args.quiet)
+        results.extend(phase_results)
+        for r in phase_results:
+            status = "PASS" if r["passed"] else "FAIL"
+            print(f"\n>>> {test['name']} [{r['phase']}]: {status} — {r['pass_reason']}\n")
+
+        if not all(r["passed"] for r in phase_results) and not args.no_fail_fast:
+            print(f"!!! Stopping immediately: {test['name']} failed.\n", flush=True)
+            stopped_early = True
+            break
 
     write_summary(results, summary_path)
+    if stopped_early:
+        skipped = [t["name"] for t in tests if t["name"] not in {r["name"] for r in results}]
+        if skipped:
+            print(f"Skipped (suite stopped early): {', '.join(skipped)}")
 
-    all_passed = all(r["passed"] for r in results)
+    all_passed = bool(results) and all(r["passed"] for r in results)
 
     sys.exit(0 if all_passed else 1)
 

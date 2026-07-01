@@ -307,11 +307,19 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         gamma_in = (layer.input_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
 
-        # Q/K/V weights: actual sizes differ per layer, zero-pad to max (full attention) sizes
+        # Q/K/V weights: actual sizes differ per layer, zero-pad to max (full attention) sizes.
+        # KV-shared layers (see kv_shared_map in _build_host_section_bytes) have no k_proj/v_proj/
+        # k_norm of their own — the runtime resolves K/V from the owning layer instead, so these
+        # regions are unused for shared layers and left as zeros.
+        is_kv_shared = attn.is_kv_shared_layer
         q_w_actual = attn.q_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_q_size, hidden_size]
-        k_w_actual = attn.k_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_k_size, hidden_size]
-        v_w_actual = attn.v_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_k_size, hidden_size]
         o_w_actual = attn.o_proj.weight.detach().cpu().to(torch.bfloat16)  # [hidden_size, cur_q_size]
+        if is_kv_shared:
+            k_w_actual = torch.zeros(cur_k_size, hidden_size, dtype=torch.bfloat16)
+            v_w_actual = torch.zeros(cur_k_size, hidden_size, dtype=torch.bfloat16)
+        else:
+            k_w_actual = attn.k_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_k_size, hidden_size]
+            v_w_actual = attn.v_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_k_size, hidden_size]
 
         # Pad Q/K/V rows to max sizes (N dimension padding — contiguous rows, safe for sub-N matmul).
         # O weight: do NOT pad K dimension — quantize with actual K so scale/data blocks align correctly.
@@ -328,11 +336,12 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         # Q/K norm: pad to max head_dim
         gamma_q_actual = (attn.q_norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
-        gamma_k_actual = (attn.k_norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
         gamma_q = torch.ones(head_dim, dtype=torch.bfloat16)  # default 1.0 (gamma_offset already applied)
         gamma_q[:cur_head_dim] = gamma_q_actual[:cur_head_dim]
         gamma_k = torch.ones(head_dim, dtype=torch.bfloat16)
-        gamma_k[:cur_head_dim] = gamma_k_actual
+        if not is_kv_shared:
+            gamma_k_actual = (attn.k_norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
+            gamma_k[:cur_head_dim] = gamma_k_actual
 
         gamma_post = (layer.post_attention_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
         gamma_ffn = (layer.pre_feedforward_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
@@ -879,12 +888,20 @@ def _build_host_section_bytes(text_model, cfg) -> tuple[bytes, dict]:
     # 4. Scalars + KV-shared map
     layer_scalars = []
     kv_shared_map: dict[int, int] = {}
+    # Newer transformers resolves KV sharing by layer_type at runtime (see
+    # Gemma4TextAttention.forward: shared_kv_states[self.layer_type]) rather than
+    # exposing an explicit owner-layer index, so we reconstruct the same mapping
+    # here: each layer_type's K/V is cached at the last layer with
+    # store_full_length_kv=True seen so far, and shared layers read from that.
+    last_full_layer_by_type: dict[str, int] = {}
     for layer_idx in range(num_layers):
         layer = text_model.layers[layer_idx]
         layer_scalars.append(float(layer.layer_scalar.item()))
         attn = layer.self_attn
-        if attn.is_kv_shared_layer and attn.kv_shared_layer_index is not None:
-            kv_shared_map[layer_idx] = int(attn.kv_shared_layer_index)
+        if attn.store_full_length_kv:
+            last_full_layer_by_type[attn.layer_type] = layer_idx
+        if attn.is_kv_shared_layer:
+            kv_shared_map[layer_idx] = last_full_layer_by_type[attn.layer_type]
 
     embed_b = embed_bf16.contiguous().view(torch.uint8).numpy().tobytes()
     proj_b  = proj_bf16.view(torch.uint8).numpy().tobytes()
@@ -9056,36 +9073,34 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.isa_add_set_core(self.gpr_seq_len, self.seq_len)
         print("\n------------------------------ DECODE START ------------------------------\n", flush=True)
 
-        # Live decode status bar (mirrors llama3.2_1b): pin the bottom terminal
-        # row via an ANSI scroll region; generated tokens stream above it while a
-        # tokens/s counter refreshes in place. TTY-only (skipped when piped).
-        import shutil
+        # Live decode counter: stdout and stderr render to the SAME terminal row
+        # when no newline separates them, so any in-place ("\r" or cursor-restore)
+        # overwrite on either stream erases whatever the other stream just wrote
+        # to that row — that's what was clobbering the decoded token text before
+        # (both the original scroll-region version and a prior \r-on-stderr
+        # attempt). Fix: never overwrite in place. Print status as its own line,
+        # with a leading newline, throttled by elapsed time so it doesn't spam.
         _dec_start_seq = self.seq_len
         _dec_timer = time.perf_counter()
         _first_tok_dt = None   # wall-clock of the 1st decoded token → peak tok/s
         _decoded_n = 0         # number of decode steps (for average tok/s)
         _use_status = sys.stdout.isatty()
+        _status_last_print = 0.0
         def _status_setup():
-            rows = shutil.get_terminal_size().lines
-            sys.stdout.write(f"\033[1;{rows - 1}r")   # scroll region = rows 1..rows-1
-            sys.stdout.write(f"\033[{rows - 1};1H")   # park cursor at bottom of region
-            sys.stdout.flush()
+            pass
         def _status_update():
-            rows = shutil.get_terminal_size().lines
+            nonlocal _status_last_print
+            now = time.perf_counter()
+            if now - _status_last_print < 1.0:
+                return
+            _status_last_print = now
             n = self.seq_len - _dec_start_seq
-            elapsed = time.perf_counter() - _dec_timer
+            elapsed = now - _dec_timer
             rate = n / elapsed if elapsed > 0 else 0.0
-            sys.stdout.write("\0337")                  # save cursor
-            sys.stdout.write(f"\033[{rows};1H\033[2K") # bottom row, clear it
-            sys.stdout.write(f" decoding… {n} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})  "
-                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
-            sys.stdout.write("\0338")                  # restore cursor
-            sys.stdout.flush()
+            print(f"\n[decoding… {n} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})  "
+                  f"{elapsed:.1f}s  {rate:.1f} tok/s]", flush=True)
         def _status_teardown():
-            rows = shutil.get_terminal_size().lines
-            sys.stdout.write("\033[r")                 # reset scroll region
-            sys.stdout.write(f"\033[{rows};1H\033[2K") # clear the status row
-            sys.stdout.flush()
+            pass
         if _use_status:
             _status_setup()
 
