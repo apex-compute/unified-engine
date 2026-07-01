@@ -1,0 +1,34 @@
+name: Clean Model Bin Dirs
+
+# Manually triggerable from the Actions tab. Deletes entire models/*/*_bin
+# directories (weights, HF cache, and compiled programs) for every model.
+# More aggressive than "Clean Program Bins" — the next run redownloads
+# weights from scratch, not just recompiles.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be deleted without actually deleting"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: model-hw-ci
+  cancel-in-progress: false  # never race with a live CI/HW run
+
+jobs:
+  clean:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean model bin dirs
+        run: |
+          ARGS=()
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          ./clean_model_bin_dirs.sh "${ARGS[@]}"
