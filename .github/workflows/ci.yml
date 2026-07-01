@@ -32,6 +32,11 @@ jobs:
   hw-ci:
     runs-on: self-hosted
     timeout-minutes: 180
+    env:
+      # Reuse the already-populated HF cache on the runner host instead of
+      # re-downloading every model's weights on each CI run (readable by any
+      # user via the 775 perms on ~rohit/.cache/huggingface).
+      HF_HOME: /home/rohit/.cache/huggingface
     steps:
       - name: Checkout
         uses: actions/checkout@v4
