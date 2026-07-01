@@ -1,12 +1,10 @@
 name: Model HW CI
 
-# MOCK MODE: the real step (run_ci.sh — full HW suite: generic op tests, then
-# every model compiled from scratch + run from its cached bin, DRAM randomized
-# before every pass) is commented out below in favor of a hello-world smoke
-# test, so the runner/workflow plumbing (registration, triggers, artifact
-# upload) can be validated without needing a working model suite yet.
-# To switch back: delete the "Hello world (mock)" step and uncomment
-# "Run CI suite".
+# Runs the full local CI suite (run_ci.sh): generic hardware op tests, then
+# every model compiled from scratch + run from its cached bin, with DRAM
+# randomized (poisoned) before every single pass. Stops on first failure.
+# Requires the FPGA device, so this must run on a self-hosted runner with the
+# board attached.
 
 on:
   workflow_dispatch:
@@ -38,26 +36,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Hello world (mock)
-        run: python3 -c "print('Hello, world! CI runner is wired up.')"
+      - name: Run CI suite
+        run: |
+          ARGS=()
+          if [[ "${{ inputs.clean_bins }}" == "true" ]]; then
+            ARGS+=(--clean-bins)
+          fi
+          if [[ -n "${{ inputs.only }}" ]]; then
+            ARGS+=(--only ${{ inputs.only }})
+          fi
+          ./run_ci.sh "${ARGS[@]}"
 
-      # - name: Run CI suite
-      #   run: |
-      #     ARGS=()
-      #     if [[ "${{ inputs.clean_bins }}" == "true" ]]; then
-      #       ARGS+=(--clean-bins)
-      #     fi
-      #     if [[ -n "${{ inputs.only }}" ]]; then
-      #       ARGS+=(--only ${{ inputs.only }})
-      #     fi
-      #     ./run_ci.sh "${ARGS[@]}"
-      #
-      # - name: Upload result artifacts
-      #   if: always()
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: model-hw-ci-results
-      #     path: |
-      #       model_auto_test_results.txt
-      #       user_hw_test_summary.md
-      #     if-no-files-found: warn
+      - name: Upload result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-hw-ci-results
+          path: |
+            model_auto_test_results.txt
+            user_hw_test_summary.md
+          if-no-files-found: warn
