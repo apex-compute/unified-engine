@@ -307,11 +307,19 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         gamma_in = (layer.input_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
 
-        # Q/K/V weights: actual sizes differ per layer, zero-pad to max (full attention) sizes
+        # Q/K/V weights: actual sizes differ per layer, zero-pad to max (full attention) sizes.
+        # KV-shared layers (see kv_shared_map in _build_host_section_bytes) have no k_proj/v_proj/
+        # k_norm of their own — the runtime resolves K/V from the owning layer instead, so these
+        # regions are unused for shared layers and left as zeros.
+        is_kv_shared = attn.is_kv_shared_layer
         q_w_actual = attn.q_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_q_size, hidden_size]
-        k_w_actual = attn.k_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_k_size, hidden_size]
-        v_w_actual = attn.v_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_k_size, hidden_size]
         o_w_actual = attn.o_proj.weight.detach().cpu().to(torch.bfloat16)  # [hidden_size, cur_q_size]
+        if is_kv_shared:
+            k_w_actual = torch.zeros(cur_k_size, hidden_size, dtype=torch.bfloat16)
+            v_w_actual = torch.zeros(cur_k_size, hidden_size, dtype=torch.bfloat16)
+        else:
+            k_w_actual = attn.k_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_k_size, hidden_size]
+            v_w_actual = attn.v_proj.weight.detach().cpu().to(torch.bfloat16)  # [cur_k_size, hidden_size]
 
         # Pad Q/K/V rows to max sizes (N dimension padding — contiguous rows, safe for sub-N matmul).
         # O weight: do NOT pad K dimension — quantize with actual K so scale/data blocks align correctly.
@@ -328,11 +336,12 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         # Q/K norm: pad to max head_dim
         gamma_q_actual = (attn.q_norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
-        gamma_k_actual = (attn.k_norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
         gamma_q = torch.ones(head_dim, dtype=torch.bfloat16)  # default 1.0 (gamma_offset already applied)
         gamma_q[:cur_head_dim] = gamma_q_actual[:cur_head_dim]
         gamma_k = torch.ones(head_dim, dtype=torch.bfloat16)
-        gamma_k[:cur_head_dim] = gamma_k_actual
+        if not is_kv_shared:
+            gamma_k_actual = (attn.k_norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
+            gamma_k[:cur_head_dim] = gamma_k_actual
 
         gamma_post = (layer.post_attention_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
         gamma_ffn = (layer.pre_feedforward_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
@@ -879,12 +888,20 @@ def _build_host_section_bytes(text_model, cfg) -> tuple[bytes, dict]:
     # 4. Scalars + KV-shared map
     layer_scalars = []
     kv_shared_map: dict[int, int] = {}
+    # Newer transformers resolves KV sharing by layer_type at runtime (see
+    # Gemma4TextAttention.forward: shared_kv_states[self.layer_type]) rather than
+    # exposing an explicit owner-layer index, so we reconstruct the same mapping
+    # here: each layer_type's K/V is cached at the last layer with
+    # store_full_length_kv=True seen so far, and shared layers read from that.
+    last_full_layer_by_type: dict[str, int] = {}
     for layer_idx in range(num_layers):
         layer = text_model.layers[layer_idx]
         layer_scalars.append(float(layer.layer_scalar.item()))
         attn = layer.self_attn
-        if attn.is_kv_shared_layer and attn.kv_shared_layer_index is not None:
-            kv_shared_map[layer_idx] = int(attn.kv_shared_layer_index)
+        if attn.store_full_length_kv:
+            last_full_layer_by_type[attn.layer_type] = layer_idx
+        if attn.is_kv_shared_layer:
+            kv_shared_map[layer_idx] = last_full_layer_by_type[attn.layer_type]
 
     embed_b = embed_bf16.contiguous().view(torch.uint8).numpy().tobytes()
     proj_b  = proj_bf16.view(torch.uint8).numpy().tobytes()
