@@ -36,6 +36,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Clean workspace and program bins
+        run: |
+          git reset --hard HEAD
+          ./clean_program_bins.sh
+
       - name: Run CI suite
         run: |
           ARGS=()
