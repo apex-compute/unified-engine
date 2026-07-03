@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Exported/downloaded model weights are large, deterministic outputs of a
+# checkpoint-export script (e.g. models/pi05_libero/export_weights.py) --
+# regenerate locally rather than committing multi-GB binaries to git.
+weights_export/
+*_bin/
