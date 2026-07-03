@@ -1,0 +1,70 @@
+{
+  "name": "pi05_libero",
+  "lm": {
+    "hidden_size": 2048,
+    "num_layers": 18,
+    "num_heads": 8,
+    "num_kv_heads": 1,
+    "head_dim": 256,
+    "intermediate_size": 16384,
+    "vocab_size": 257152,
+    "rope_theta": null,
+    "rms_norm_eps": 1e-6,
+    "max_position_embeddings": 1024
+  },
+  "vision": {
+    "hidden_size": 1152,
+    "num_heads": 16,
+    "head_dim": 72,
+    "intermediate_size": 4304,
+    "num_patches": 256,
+    "num_patches_per_side": 16,
+    "patch_size": 14,
+    "image_size": 224,
+    "num_image_slots": 3
+  },
+  "connector": {
+    "pixel_shuffle_scale_factor": 1,
+    "input_size": 1152,
+    "output_size": 2048,
+    "num_tokens": 256
+  },
+  "model": {
+    "max_context_size": 1024,
+    "prefill_max_seq_len": 1024,
+    "stop_token_ids": []
+  },
+  "ops": {
+    "norm": "rms",
+    "rope": "none",
+    "mlp": "gated_silu",
+    "attn": "prefill_flash",
+    "causal": false,
+    "mlp_bias": false,
+    "lm_quant": "q4_64",
+    "vision_quant": "q4_64"
+  },
+  "hw_notes": [
+    "lm hidden_size=2048, head_dim=256, intermediate=16384 all multiples of 64: no padding",
+    "prefix seq = 3*256 (image) + 200 (text) = 968 tokens; padded to 1024 (16*64) for alignment; pad mask via attention bias, same mechanism as flash_attention_test seq-padding",
+    "vision head_dim=72 is NOT a multiple of 64: pad to 128 for flash attention, unpad via selection matrix on output (proven pattern from Swin 32->64 and MoonViT head_dim=72 -- same exact dim recurs here)",
+    "no RoPE anywhere in this model (pi0.5 uses AdaRMSNorm + sincos position embed for vision, absolute learned pos-embed for vision, no rotary at all in either LLM stack)",
+    "attention mask is NOT pure causal: prefix tokens attend bidirectionally to each other; suffix (action-expert) tokens attend causally relative to prefix + bidirectionally within the action block -- requires a precomputed static BIAS_DRAM tensor per flash_attention_core call, not the causal=true/false flag alone",
+    "SECOND LM STACK NOT REPRESENTABLE IN THIS SCHEMA: action-expert (Gemma-300M: 18 layers, hidden=1024, heads=8, kv_heads=1, head_dim=256, intermediate=4096) is a separate weight set sharing attention geometry with the prefix LM but run in a flow-matching denoising loop (x10, cached prefix KV reused). This manifest's lm block covers ONLY the prefix (Gemma-2B). The action-expert stack, AdaRMSNorm conditioning (matmul cond->3*hidden then split scale/shift/gate), sinusoidal timestep embedding (10 precomputed values, dt=-0.1 fixed schedule), and Euler integration loop are all hand-written deltas in pi05_libero_test.py -- not covered by generator flags.",
+    "output head is NOT a vocab/logit head: action_out_proj is a plain (1024,32) linear producing continuous 7-dim x 10-timestep action values, no softmax/argmax",
+    "quant note: matmat_mul_quantized_weights_test at IF4 on shape (M=968,K=2048,N=16384) passed 53-54dB SNR in isolation on real hw this session; failed catastrophically (-2.97dB) when chained after other quantized-weight test allocations in the same process -- suspected DRAM allocator overlap bug in test harness sequencing, not a model/op issue. Re-verify in isolation before trusting any IF4 numbers for this model; consider bf16 for first bring-up pass to de-risk."
+  ],
+  "paths": {
+    "hf_model_repo": null,
+    "openpi_checkpoint": "gs://openpi-assets/checkpoints/pi05_libero",
+    "weights_export_dir": "models/pi05_libero/weights_export",
+    "weights_manifest": "models/pi05_libero/weights_export/manifest.json"
+  },
+  "defaults": {
+    "prompt": "pick up the object",
+    "image": "models/pi05_libero/sample_data_placeholder",
+    "dev": "xdma0",
+    "cycle_ns": 5.63,
+    "max_seq": 1024
+  }
+}
