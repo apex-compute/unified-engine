@@ -7215,11 +7215,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.seq_len = actual_seq_len
         return latency, flop_rate
 
-    def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> dict:
+    def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> tuple[int, float, float]:
         """Dynamic-PBI decoder loop (E4B run_from_bin)."""
         if token_id is None:
-            print("No last token available for decode.")
-            return {}
+            raise ValueError("run_decoder called with token_id=None (no last prompt token)")
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
