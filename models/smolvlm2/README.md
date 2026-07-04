@@ -21,7 +21,7 @@ permute elimination, single bin, encoder layer-body sharing, prefill GEMM kernel
 
 ## Prerequisites
 
-- `user_dma_core` is on the path automatically (the scripts self-insert `src/template`), so they run
+- `user_dma_core` is on the path automatically (the scripts put the repo root on `sys.path`), so they run
   from any working directory.
 - Python with `torch`, `transformers`, and DMA device access. The first run downloads the HF model.
 

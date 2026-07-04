@@ -15,16 +15,16 @@ Qwen3-1.7B inference on the accelerator.
 
 - Run from the **repo root** so `user_dma_core` is on `sys.path`.
 - Python with `torch`, `transformers`, and DMA access (`/dev/xdma0_*`).
-- Between runs that may have left the FPGA in a bad state: `python src/template/user_hw_test.py` (software reset).
+- Between runs that may have left the FPGA in a bad state: `python user_hw_test.py` (software reset).
 
 ## Usage
 
 ```bash
 # First run (with network — downloads HF model, builds weight + instruction bins):
-python src/template/models/qwen3_1.7b/qwen3_1.7b_test.py --prompt "What is 2+2?"
+python models/qwen3_1.7b/qwen3_1.7b_test.py --prompt "What is 2+2?"
 
 # Subsequent runs from cached bins (offline-safe):
-python src/template/models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py --prompt "What is 2+2?"
+python models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py --prompt "What is 2+2?"
 ```
 
 **Prompt-length range:** the cached bin handles any prompt from 1 to
@@ -62,8 +62,3 @@ Decoder done in ~8.4s, total 38 tokens, decode speed: ~2.7 tokens/s.
 ```
 
 Prefill reports about 19.9 GFLOPS at 5.62 ns clock (~87 % of 22.8 GFLOPS peak).
-
-## More detail
-
-Design and architecture notes: `src/template/notes/notes_qwen3_1.7b.md`.
-Cross-model dynamic-PBI design that these scripts implement: `src/template/core_changes.md`.

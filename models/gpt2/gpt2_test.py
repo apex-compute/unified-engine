@@ -3,7 +3,7 @@
 GPT-2 Base (124M) inference on accelerator: prefill + decode.
 
   - Config from gpt2_config.json; weights from a single bin (see below).
-  - Dynamic-PBI flow (see src/template/core_changes.md): ONE prefill program +
+  - Dynamic-PBI flow: ONE prefill program +
     ONE decoder program compiled into a single instruction bin. Runtime row
     counts and attention bucket selection are driven by fixed-index GPRs
     (gpr_seq_len / gpr_bucket_idx) primed by a tiny per-call preamble program.

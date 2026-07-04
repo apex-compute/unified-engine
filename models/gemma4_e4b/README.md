@@ -14,7 +14,7 @@ opt-in (`GEMMA4_E4B_ALLOW_ENCODER=1` with `--vision-enable`/`--audio-enable`).
 
 | Stage | Script | Notes |
 |---|---|---|
-| Build (once) | `gemma4_e4b_test.py` | Builds `gemma4_instruction.bin` + `weights_gemma4_e4b_hf.bin`, then sanity-runs. Needs the HF model locally. Default build is LM-only; set `GEMMA4_LM_ONLY_BIN=0` and `GEMMA4_E4B_ALLOW_ENCODER=1` to build/test encoder modes. |
+| Build (once) | `gemma4_e4b_test.py` | Builds `programs.bin` + `params.bin`, then sanity-runs. Needs the HF model locally. Default build is LM-only; set `GEMMA4_LM_ONLY_BIN=0` and `GEMMA4_E4B_ALLOW_ENCODER=1` to build/test encoder modes. |
 | Deploy (every run after) | `gemma4_e4b_run_from_bin.py` | Loads the bin files and runs. Never touches the HF model. |
 
 After the first `gemma4_e4b_test.py` run, every subsequent invocation
@@ -28,11 +28,11 @@ After the first `gemma4_e4b_test.py` run, every subsequent invocation
   refuses to compile, no HF model on disk required.
 - **gemma4_e4b_config.json** – Model + layout config.
 - **gemma4_e4b_bin/** – On-disk artifacts:
-  - `gemma4_instruction.bin` + `.json` – instruction ISA. Full multimodal
+  - `programs.bin` + `.json` – instruction ISA. Full multimodal
     bin is 15.02 MiB on disk (15,746,912 B): LM prefill + decode + vision
     + audio encoders + vision RoPE tables. Used size by mode: LM-only
     6.38 MiB, VLM 7.84 MiB, audio 13.56 MiB.
-  - `weights_gemma4_e4b_hf.bin` + `.json` – combined weights (~10 GB)
+  - `params.bin` – combined weights (~10 GB)
     with sections: `[LM | vision | audio | host]`.
   - `tokenizer/` – minimal tokenizer + processor configs (~32 MB).
 
@@ -47,14 +47,14 @@ After the first `gemma4_e4b_test.py` run, every subsequent invocation
 ## Build / sanity-check — `gemma4_e4b_test.py`
 
 ```bash
-python src/template/models/gemma4_e4b/gemma4_e4b_test.py
-python src/template/models/gemma4_e4b/gemma4_e4b_test.py --prompt "What is 2+2?"
+python models/gemma4_e4b/gemma4_e4b_test.py
+python models/gemma4_e4b/gemma4_e4b_test.py --prompt "What is 2+2?"
 
 # Build/test encoder modes into the unified bin
 GEMMA4_LM_ONLY_BIN=0 GEMMA4_E4B_ALLOW_ENCODER=1 \
-  python src/template/models/gemma4_e4b/gemma4_e4b_test.py --vision-enable
+  python models/gemma4_e4b/gemma4_e4b_test.py --vision-enable
 GEMMA4_LM_ONLY_BIN=0 GEMMA4_E4B_ALLOW_ENCODER=1 \
-  python src/template/models/gemma4_e4b/gemma4_e4b_test.py --audio-enable
+  python models/gemma4_e4b/gemma4_e4b_test.py --audio-enable
 ```
 
 First run builds the instruction bin and combined weight bin. Subsequent
@@ -63,9 +63,9 @@ runs just load and execute.
 Force a clean rebuild:
 
 ```bash
-rm gemma4_e4b_bin/gemma4_instruction.bin gemma4_e4b_bin/gemma4_instruction.json
-rm gemma4_e4b_bin/weights_gemma4_e4b_hf.bin gemma4_e4b_bin/weights_gemma4_e4b_hf.json
-python src/template/models/gemma4_e4b/gemma4_e4b_test.py
+rm models/gemma4_e4b/gemma4_e4b_bin/programs.bin models/gemma4_e4b/gemma4_e4b_bin/programs.json
+rm models/gemma4_e4b/gemma4_e4b_bin/params.bin
+python models/gemma4_e4b/gemma4_e4b_test.py
 ```
 
 ## Deploy / demo — `gemma4_e4b_run_from_bin.py`
@@ -73,14 +73,14 @@ python src/template/models/gemma4_e4b/gemma4_e4b_test.py
 Execute-only. Refuses to compile, never imports the HF model class.
 
 ```bash
-python src/template/models/gemma4_e4b/gemma4_e4b_run_from_bin.py
-python src/template/models/gemma4_e4b/gemma4_e4b_run_from_bin.py --prompt "What is 2+2?"
+python models/gemma4_e4b/gemma4_e4b_run_from_bin.py
+python models/gemma4_e4b/gemma4_e4b_run_from_bin.py --prompt "What is 2+2?"
 
 # Encoder modes require an encoder-containing bin and the runtime gate.
 GEMMA4_E4B_ALLOW_ENCODER=1 GEMMA4_PENALTY=1 \
-  python src/template/models/gemma4_e4b/gemma4_e4b_run_from_bin.py --vision-enable
+  python models/gemma4_e4b/gemma4_e4b_run_from_bin.py --vision-enable
 GEMMA4_E4B_ALLOW_ENCODER=1 GEMMA4_PENALTY=1 \
-  python src/template/models/gemma4_e4b/gemma4_e4b_run_from_bin.py --audio-enable
+  python models/gemma4_e4b/gemma4_e4b_run_from_bin.py --audio-enable
 ```
 
 ### Deploy footprint
@@ -90,8 +90,8 @@ gemma4_e4b_run_from_bin.py
 gemma4_e4b_config.json
 user_dma_core.py + quant_lib.py
 gemma4_e4b_bin/
-  gemma4_instruction.bin + .json       (15.02 MiB full multimodal)
-  weights_gemma4_e4b_hf.bin  + .json   (~10 GB; LM + vision + audio + host sections)
+  programs.bin + .json       (15.02 MiB full multimodal)
+  params.bin   (~10 GB; LM + vision + audio + host sections)
   tokenizer/                           (~32 MB)
 ```
 

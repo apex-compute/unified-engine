@@ -50,7 +50,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# user_dma_core lives at src/template/ — add that to path.
+# user_dma_core lives at the repo root — add that to path.
 _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parents[2]))
 
@@ -4690,7 +4690,7 @@ def main():
                     help="Path to image file for VLM inference. Implies --vision-enable.")
     ap.add_argument("--vision-enable", action="store_true",
                     help="Run as VLM using the default sample image "
-                         "(src/template/test_samples/yosemite.jpg). "
+                         "(test_samples/yosemite.jpg). "
                          "Ignored if --image is also given.")
     ap.add_argument("--vision-on-hardware", action="store_true",
                     help="Run the vision encoder on FPGA. By default the vision "

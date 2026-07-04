@@ -7,7 +7,7 @@ text (VLM), and audio + text — run from a single instruction bin.
 
 | Stage | Script | Notes |
 |---|---|---|
-| Build (once) | `gemma4_e2b_test.py` | Builds `gemma4_instruction.bin` + `weights_gemma4_e2b_hf.bin`, then sanity-runs. Needs the HF model locally. Default build includes LM + VLM + audio unless `GEMMA4_LM_ONLY_BIN=1`. |
+| Build (once) | `gemma4_e2b_test.py` | Builds `programs.bin` + `params.bin`, then sanity-runs. Needs the HF model locally. Default build includes LM + VLM + audio unless `GEMMA4_LM_ONLY_BIN=1`. |
 | Deploy (every run after) | `gemma4_e2b_run_from_bin.py` | Loads the bin files and runs. Never touches the HF model. |
 
 After the first `gemma4_e2b_test.py` run, every subsequent invocation
@@ -21,11 +21,11 @@ After the first `gemma4_e2b_test.py` run, every subsequent invocation
   refuses to compile, no HF model on disk required.
 - **gemma4_e2b_config.json** – Model + layout config.
 - **gemma4_e2b_bin/** – On-disk artifacts:
-  - `gemma4_instruction.bin` + `.json` – unified ISA. Full multimodal bin
+  - `programs.bin` + `.json` – unified ISA. Full multimodal bin
     is 14.39 MiB on disk (15,086,688 B): LM prefill + decode + vision
     + audio encoders + vision RoPE tables. Used size by mode: LM-only
     5.78 MiB, VLM 7.24 MiB, audio 12.93 MiB.
-  - `weights_gemma4_e2b_hf.bin` + `.json` – combined weights (~7 GB)
+  - `params.bin` – combined weights (~7 GB)
     with sections: `[LM | vision | audio | host]`.
   - `tokenizer/` – minimal tokenizer + processor configs (~32 MB).
 
@@ -42,16 +42,16 @@ After the first `gemma4_e2b_test.py` run, every subsequent invocation
 
 ```bash
 # VLM (recommended first run — builds vision encoder into the bin)
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --image my.jpg --prompt "?"
+python models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
+python models/gemma4_e2b/gemma4_e2b_test.py --image my.jpg --prompt "?"
 
 # Audio
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --audio-enable
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --audio my.wav --prompt "Describe this audio."
+python models/gemma4_e2b/gemma4_e2b_test.py --audio-enable
+python models/gemma4_e2b/gemma4_e2b_test.py --audio my.wav --prompt "Describe this audio."
 
 # LM only
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --prompt "What is 2+2?"
+python models/gemma4_e2b/gemma4_e2b_test.py
+python models/gemma4_e2b/gemma4_e2b_test.py --prompt "What is 2+2?"
 ```
 
 The first run builds the instruction bin and combined weight bin. Subsequent
@@ -60,9 +60,9 @@ runs just load and execute.
 Force a clean rebuild:
 
 ```bash
-rm gemma4_e2b_bin/gemma4_instruction.bin gemma4_e2b_bin/gemma4_instruction.json
-rm gemma4_e2b_bin/weights_gemma4_e2b_hf.bin gemma4_e2b_bin/weights_gemma4_e2b_hf.json
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
+rm models/gemma4_e2b/gemma4_e2b_bin/programs.bin models/gemma4_e2b/gemma4_e2b_bin/programs.json
+rm models/gemma4_e2b/gemma4_e2b_bin/params.bin
+python models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
 ```
 
 ## Deploy / demo — `gemma4_e2b_run_from_bin.py`
@@ -71,16 +71,16 @@ Execute-only. Refuses to compile, never imports the HF model class.
 
 ```bash
 # LM
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --prompt "What is 2+2?"
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --prompt "What is 2+2?"
 
 # VLM
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --vision-enable
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --image my.jpg --prompt "?"
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --vision-enable
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --image my.jpg --prompt "?"
 
 # Audio
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --audio-enable
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --audio my.wav --prompt "Describe this audio."
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --audio-enable
+python models/gemma4_e2b/gemma4_e2b_run_from_bin.py --audio my.wav --prompt "Describe this audio."
 ```
 
 ### Deploy footprint
@@ -90,8 +90,8 @@ gemma4_e2b_run_from_bin.py
 gemma4_e2b_config.json
 user_dma_core.py + quant_lib.py
 gemma4_e2b_bin/
-  gemma4_instruction.bin + .json       (14.39 MiB full multimodal)
-  weights_gemma4_e2b_hf.bin  + .json   (~7 GB; LM + vision + audio + host sections)
+  programs.bin + .json       (14.39 MiB full multimodal)
+  params.bin   (~7 GB; LM + vision + audio + host sections)
   tokenizer/                           (~32 MB)
 ```
 
@@ -123,4 +123,4 @@ no per-bucket ISA copies):
 
 Both knobs live in `gemma4_e2b_config.json`. Increasing
 `prefill_max_seq_len` linearly grows the prefill ISA in
-`gemma4_instruction.bin`; the decoder bin size is fixed.
+`programs.bin`; the decoder bin size is fixed.

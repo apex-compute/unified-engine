@@ -4,7 +4,7 @@ config-driven via qwen2.5_vl_3b_config.json::precision.{lm,vision}
 (values: int4 / fp4 / if4). Defaults: lm=if4 (eval-winning text codec
 per src/models/qwen2.5_VL_3b/compare/summary.md), vision=int4 (legacy
 released codec, byte-identical to the prior Q4_64 path). All
-quantization goes through src/template/quant_lib.py."""
+quantization goes through quant_lib.py."""
 
 import json
 import math

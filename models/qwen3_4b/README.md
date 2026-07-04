@@ -15,16 +15,16 @@ Qwen3-4B inference on the accelerator.
 
 - Run from the **repo root** so `user_dma_core` is on `sys.path`.
 - Python with `torch`, `transformers`, and DMA access (`/dev/xdma0_*`).
-- Between runs that may have left the FPGA in a bad state: `python src/template/user_hw_test.py` (software reset).
+- Between runs that may have left the FPGA in a bad state: `python user_hw_test.py` (software reset).
 
 ## Usage
 
 ```bash
 # First run (with network — downloads HF model, builds weight + instruction bins):
-python src/template/models/qwen3_4b/qwen3_4b_test.py --prompt "What is 2+2?"
+python models/qwen3_4b/qwen3_4b_test.py --prompt "What is 2+2?"
 
 # Subsequent runs from cached bins (offline-safe):
-python src/template/models/qwen3_4b/qwen3_4b_run_from_bin.py --prompt "What is 2+2?"
+python models/qwen3_4b/qwen3_4b_run_from_bin.py --prompt "What is 2+2?"
 ```
 
 **Prompt-length range:** the cached bin handles any prompt from 1 to
@@ -70,8 +70,3 @@ Prefill reports about **20.12 GFLOPS** at 5.62 ns clock (~88 % of 22.8 GFLOPS pe
 - Tensor DRAM: **730 MB** (KV cache 288 MB + activations 442 MB).
 - Program DRAM: **58 MB** (one prefill + one decoder program).
 - Host: 778 MB bf16 embedding stays in CPU RAM (per-token row pushed inline).
-
-## More detail
-
-Design and architecture notes: `src/template/notes/notes_qwen3_4b.md`.
-Cross-model dynamic-PBI design that these scripts implement: `src/template/core_changes.md`.
