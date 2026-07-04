@@ -7407,16 +7407,35 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         prefill_program_addr = manifest["_prefill_addr_int"]
         flops = manifest["prefill_total_flops"]
 
-        # Pad to template_seq_len so static per-token loops see valid data.
+        # Pad target. The compiled prefill is dynamic-PBI (bulk matmuls read
+        # M from gpr_seq_len at execute time; see compile_prefill), so padding
+        # to prefill_max spends template-sized matmul work on every prompt.
+        # GEMMA4_DYN_PREFILL=1 pads only to the next 64-aligned bucket:
+        # compiled per-token loops beyond the bucket still iterate at
+        # PREFILL_MAX, but their outputs land in KV rows that (a) causal
+        # prefill attention never lets real rows see, (b) the decode bias
+        # masks until (c) decode overwrites them position by position. The
+        # matmul M drops to the bucket length. Off by default until the
+        # A/B token-stream parity run passes on hardware.
+        if os.environ.get("GEMMA4_DYN_PREFILL", "0") == "1":
+            pad_to = min(prefill_max, ((actual_seq_len + 63) // 64) * 64)
+            # Report FLOPs scaled to the primed M (linear approximation;
+            # the attention term is quadratic, so the printed GFLOPS is
+            # indicative only in this mode).
+            flops = int(flops * pad_to / prefill_max)
+        else:
+            pad_to = prefill_max
+
+        # Pad so per-token loops up to the primed length see valid data.
         pad_token = prefill_tokens[-1]
-        pad_count = prefill_max - actual_seq_len
+        pad_count = pad_to - actual_seq_len
         padded_tokens = list(prefill_tokens) + [pad_token] * pad_count
         padded_seq = tuple(padded_tokens) + (prefill_seq[-1],)
         if hasattr(self, "_mm_types") and self._mm_types is not None and pad_count > 0:
             self._mm_types = list(self._mm_types[:actual_seq_len]) + [0] * pad_count
 
         print(f"[dyn-prefill] actual={actual_seq_len}, template_buffer={prefill_max}, "
-              f"gpr_seq_len={prefill_max}, addr=0x{prefill_program_addr:X}")
+              f"gpr_seq_len={pad_to}, addr=0x{prefill_program_addr:X}")
 
         # ------------------------------------------------------------------
         # LM-state restore (post vision/audio compile). vision_tensor_init
@@ -7462,7 +7481,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                        torch.eye(_UE_VS, dtype=torch.bfloat16))
         print(f"[dyn-prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
 
-        self.seq_len = prefill_max
+        self.seq_len = pad_to
         latency, flop_rate = self.run_prefill(prefill_program_addr,
                                               prefill_seq=padded_seq,
                                               flops=flops)
