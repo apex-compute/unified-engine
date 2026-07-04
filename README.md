@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="update_2461830.bin">&#9881;&#65039; Hardware Architecture Update v1.2(update_2461830.bin)</a>
+  <a href="update_253d5525.bin">&#9881;&#65039; Hardware Architecture Update v1.3 (update_253d5525.bin)</a>
 </p>
 
 <p align="center">
