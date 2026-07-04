@@ -1,11 +1,11 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 torch>=2.4
-torchvision>=0.23.0
-torchaudio>=2.4
+torchvision>=0.23.0   # vision models (qwen2.5_vl, smolvlm2, mobilesam, swin, ...)
+torchaudio>=2.4       # speech models (parakeet, gemma4 audio mode)
 soundfile
 numpy<2
-transformers>=4.40.0
+transformers>=5.5.0   # gemma4_e2b/e4b and qwen3.5_2b need >= 5.5.0 (see model READMEs)
 huggingface-hub>=0.20.0
 pillow>=12.1.1
 sentencepiece
