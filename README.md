@@ -135,6 +135,41 @@ Cold reboot the PC.
 
 ---
 
+## Supported Models
+
+Gemma3 above is just the quick-start example. Every model below runs on the
+engine today; each folder has its own README/config, and most LLMs ship a
+`*_run_from_bin.py` for execute-only deploys from precompiled bins.
+
+| Model | Folder | Type |
+|---|---|---|
+| Gemma 3 1B | [`models/gemma3`](models/gemma3) | Text LM |
+| Gemma 4 E2B | [`models/gemma4_e2b`](models/gemma4_e2b) | Multimodal LM (text, vision, audio) |
+| Gemma 4 E4B | [`models/gemma4_e4b`](models/gemma4_e4b) | Multimodal LM (text, vision, audio) |
+| Llama 3.2 1B | [`models/llama3.2_1b`](models/llama3.2_1b) | Text LM |
+| Llama 3.2 3B | [`models/llama3.2_3b`](models/llama3.2_3b) | Text LM |
+| Qwen3 1.7B | [`models/qwen3_1.7b`](models/qwen3_1.7b) | Text LM |
+| Qwen3 4B | [`models/qwen3_4b`](models/qwen3_4b) | Text LM |
+| Qwen3.5 2B | [`models/qwen3.5_2b`](models/qwen3.5_2b) | Text LM |
+| Qwen2.5-VL 3B | [`models/qwen2.5_vl_3b`](models/qwen2.5_vl_3b) | Vision-language |
+| SmolVLM2 | [`models/smolvlm2`](models/smolvlm2) | Vision-language |
+| GPT-2 | [`models/gpt2`](models/gpt2) | Text LM |
+| LocateAnything 3B | [`models/locateanything_3b`](models/locateanything_3b) | Open-vocabulary localization |
+| MobileNetV2 (224 + SSD-FPNLite 640) | [`models/mobilenetv2`](models/mobilenetv2) | Classification / detection |
+| Parakeet | [`models/parakeet`](models/parakeet) | Speech recognition (incl. streaming) |
+| MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
+| Swin | [`models/swin`](models/swin) | Image classification |
+
+Run the whole suite (or a subset) with the automated tester:
+
+```bash
+make model_test              # all models, concise PASS/FAIL summary
+make model_test gemma4_e2b   # one model
+make model_test_help         # all modes
+```
+
+---
+
 ## Apex Compute Unified Engine v1.1 — Benchmark Results
 
 All benchmarks were collected on RTL running on a Kintex UltraScale+ FPGA in real time.
