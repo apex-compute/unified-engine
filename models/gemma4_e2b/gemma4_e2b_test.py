@@ -9163,7 +9163,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Gemma4 E2B layer-0 prefill: run on accelerator, verify with torch ref.")
+    parser = argparse.ArgumentParser(description="Gemma4 E2B on the Unified Engine: build the instruction/weight bins if missing, then run prefill + decode.")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt. Default is a built-in prompt per mode "
                              "(LM: a test question; VLM: 'Describe this image in detail.'; "
@@ -9192,7 +9192,7 @@ def main():
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
-                        help='Clock cycle time in nanoseconds (default: 3.0, use 2.5 for alveo)')
+                        help='Clock cycle time in nanoseconds (default: 5.62; use 2.5 for Alveo)')
     args = parser.parse_args()
 
     set_dma_device(args.dev)
