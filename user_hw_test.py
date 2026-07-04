@@ -13,7 +13,6 @@ import atexit
 import math
 import os
 import random
-from re import S
 import time
 import threading
 from read_trace import generate_trace

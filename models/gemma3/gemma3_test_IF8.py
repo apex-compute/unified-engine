@@ -1534,7 +1534,7 @@ def main():
     print(f"  USER: {DMA_DEVICE_USER}")
 
     dual_engine = args.dual_engine
-    assert dual_engine == False, "Dual engine is not supported yet for pbi mode"
+    assert not dual_engine, "Dual engine is not supported yet for pbi mode"
     ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine)
     ue.set_prefill_seq(args.prompt)
 

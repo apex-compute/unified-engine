@@ -9,8 +9,8 @@ This module provides:
 - High-level engine APIs built on them (eltwise_add, matmat_mul, ...)
 - ``ue_35bit_addr_shifter()``: byte DRAM address to 35-bit word address for UE registers / captured instructions
 
-For tests and bf16 helpers (precompute_freqs_cis, calculate_snr, generic_tests),
-use user_dma_tests_bf16 or the combined user_dma_ops.
+For end-to-end usage see user_hw_test.py and the per-model scripts under
+models/ (e.g. models/gemma3/gemma3_test.py), which drive UnifiedEngine directly.
 
 Usage:
     from user_dma_core import UnifiedEngine, UE_MODE, DRAM_ACTIVATION_ADDR, ue_35bit_addr_shifter
@@ -19,7 +19,6 @@ Usage:
     result = handler(vec1, vec2)
 """
 
-from re import U
 import struct
 import os
 import sys
