@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Model build artifacts (rebuilt by models/*/*_test.py)
+models/*/*_bin/
+model_test_bg.out
+model_auto_test_results.txt
+
+# Vivado / flash programming
+*.mcs
+*.prm
+*.jou
+*.log
+andromeda_IP-*/
+andromeda_wrapper-*/
+
+# Editors / OS
+.DS_Store
+.vscode/
+*.swp

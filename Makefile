@@ -16,6 +16,9 @@ clean:
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
 	rm -f models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin
+	rm -f models/gemma4_e2b/gemma4_e2b_bin/programs.* models/gemma4_e2b/gemma4_e2b_bin/params.*
+	rm -f models/gemma4_e4b/gemma4_e4b_bin/programs.* models/gemma4_e4b/gemma4_e4b_bin/params.*
+	rm -f models/qwen3.5_2b/qwen3.5_2b_bin/programs.* models/qwen3.5_2b/qwen3.5_2b_bin/params.*
 	# rm -f models/locateanything_3b/locateanything_3b_bin/
 	rm -rf models/mobilesam/mobilesam_bin/
 	rm -f models/parakeet/parakeet_bin/*.bin
