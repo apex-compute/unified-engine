@@ -4,7 +4,9 @@
     "V_CACHE_SIZE_REG": 1,
     "TMP_REG": 2,
     "GPR_BUCKET_IDX_REG": 3,
-    "GPR_SEQ_LEN_REG": 4
+    "GPR_SEQ_LEN_REG": 4,
+    "GPR_Q_SEQ_LEN_REG": 5,
+    "GPR_ALIGNED_SEQ_LEN_REG": 6
   },
   "file_info": {
     "layer_size": 14200832,

@@ -18,6 +18,15 @@ clean:
 	rm -f models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin
 	rm -f models/locateanything_3b/locateanything_3b_bin/programs*.bin
 	rm -f models/locateanything_3b/locateanything_3b_bin/programs*.json
+	rm -f models/mobilenetv2/mobilenetv2_bin/programs*.bin
+	rm -f models/mobilenetv2/mobilenetv2_bin/programs*.json
+	rm -f models/mobilenetv2/mobilenetv2_bin/params*.bin
+	rm -f models/mobilenetv2/mobilenetv2_bin/params*.json
+	rm -f models/mobilenetv2/mobilenetv2_bin/labels.json
+	rm -f models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/programs*.bin
+	rm -f models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/programs*.json
+	rm -f models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/params*.bin
+	rm -f models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/params*.json
 	rm -rf models/mobilesam/mobilesam_bin/
 	rm -f models/parakeet/parakeet_bin/programs.bin
 	rm -f models/parakeet/parakeet_bin/programs.json
