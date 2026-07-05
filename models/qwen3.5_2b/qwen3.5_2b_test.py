@@ -69,7 +69,7 @@ from user_dma_core import (                          # noqa: E402
     MEMCPY_TYPE, URAM_START_ADDR, URAM_NEAR_FULL_ELEMENTS,
     DRAM_ACTIVATION_ADDR,
     LALU_CLAMP_RELU_A, LALU_CLAMP_RELU_B,
-    ue_35bit_addr_shifter,
+    ue_35bit_addr_shifter, set_dma_device,
 )
 
 BF16 = 2
@@ -348,26 +348,35 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, self.PENALTY_BIAS_DRAM,
                        _bf(bias.view(1, vocab)), vocab * BF16)
 
-    def bf16_transpose_core(self, M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR):
+    def bf16_transpose_core(self, M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, **kwargs):
         saved = self._next_params_dram_addr
         self._next_params_dram_addr = self._identity_dram_addr
         super().bf16_transpose_core(M=M, N=N,
                                     INPUT_DRAM_ADDR=INPUT_DRAM_ADDR,
-                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR)
+                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                                    **kwargs)
         self._next_params_dram_addr = saved
 
     def flash_attention_core_cached(self, **kwargs):
-        # Released user_dma_core.flash_attention_core no longer auto-allocates the
-        # eye(64) identity; it reads it from the explicit IDENTITY_DRAM_ADDR kwarg
-        # (legacy path crashes on None). Inject our pre-seeded eye(64) slot. The
-        # kernel reads exactly UE_VECTOR_SIZE*UE_VECTOR_SIZE elements regardless of
-        # head_dim, so the single eye(64) slot serves every head_dim.
+        kwargs.pop("ATTN_P_DRAM_ADDR", None)
+        kwargs.pop("gpr_bucket_idx", None)
+        kwargs.pop("num_buckets", None)
+        kwargs.pop("gpr_ret_id", None)
+        seq_len = int(kwargs.pop("seq_len"))
+        head_dim = int(kwargs["head_dim"])
         kwargs.setdefault("IDENTITY_DRAM_ADDR", self._identity_dram_addr)
-        saved = self._next_params_dram_addr
-        self._next_params_dram_addr = self._identity_dram_addr
-        result = self.flash_attention_core(**kwargs)
-        self._next_params_dram_addr = saved
-        return result
+        return self.unified_attention_core(
+            batch=seq_len,
+            aligned_seq_len=seq_len,
+            head_dim=head_dim,
+            Q_DRAM_ADDR=kwargs["Q_DRAM_ADDR"],
+            K_DRAM_ADDR=kwargs["K_DRAM_ADDR"],
+            V_DRAM_ADDR=kwargs["V_DRAM_ADDR"],
+            BIAS_DRAM_ADDR=kwargs["BIAS_DRAM_ADDR"],
+            OUTPUT_DRAM_ADDR=kwargs["OUTPUT_DRAM_ADDR"],
+            SCRATCH_DRAM_ADDR=kwargs["SCRATCH_DRAM_ADDR"],
+            IDENTITY_DRAM_ADDR=kwargs["IDENTITY_DRAM_ADDR"],
+        )
 
     def dma_write(self, device, addr, data, size):
         if (self._identity_dram_written
@@ -1372,16 +1381,12 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self.is_capture_on  = True
         self._compile_mode  = True
 
-        # §7 shared full-attn flash subroutine setup.  Reserve ISA regs ABOVE
-        # the 3 fixed decode regs (POS_K=1 / TMP=2 / POS_ROPE=3) so the bucket
-        # dispatcher's internal alloc_isa_reg() (and the body's) start at 6 and
-        # can't clobber them.  The selector is constant (full context); the
-        # per-step causal bias handles the actual decode position, so output is
-        # bit-identical to the prior inline per-head flash.
+        # Old S7 shared full-attn flash subroutine used the removed
+        # flash_attention_core/gpr_bucket_idx path. Keep full attention inline so
+        # every call goes through flash_attention_core_cached -> unified_attention_core.
         self._s7_full_attn_active = False
         self._s7_flash_call_sites = []
-        s7_enabled = (os.environ.get("Q35_NO_S7_FLASH") is None
-                      and len(self.full_attn_layers) > 0)
+        s7_enabled = False
         if s7_enabled:
             self._isa_reg_counter = 4
             self._s7_gpr_ret_id = self.alloc_isa_reg()   # reg 4
@@ -1416,30 +1421,6 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
 
         self.generate_instruction_halt()
 
-        # §7: compile the shared full-attn flash body ONCE after HALT (reachable
-        # only via the call-site jumps recorded during _forward_range), then
-        # back-patch every call site to its entry and release the ISA regs.
-        if self._s7_full_attn_active and self._s7_flash_call_sites:
-            self.pad_capture_to_64b_boundary()
-            _s7_sub_start, _ = self.flash_attention_core(
-                head_dim=self.full_head_dim,
-                seq_len=self.max_context_aligned,
-                Q_DRAM_ADDR=self._s7_flash_q,
-                K_DRAM_ADDR=self._s7_flash_k,
-                V_DRAM_ADDR=self._s7_flash_v,
-                OUTPUT_DRAM_ADDR=self._s7_flash_out,
-                SCRATCH_DRAM_ADDR=self._s7_flash_scratch,
-                BIAS_DRAM_ADDR=self._bias_dram,
-                ATTN_P_DRAM_ADDR=self._s7_attn_p,
-                IDENTITY_DRAM_ADDR=self._identity_dram_addr,
-                gpr_bucket_idx=self._s7_gpr_bucket,
-                num_buckets=self._s7_num_buckets,
-                gpr_ret_id=self._s7_gpr_ret_id,
-            )
-            for _cs in self._s7_flash_call_sites:
-                self._patch_jump_immediate(_cs, ue_35bit_addr_shifter(_s7_sub_start))
-            self.release_isa_reg()   # gpr_bucket  (reg 5)
-            self.release_isa_reg()   # gpr_ret_id  (reg 4)
         self._s7_full_attn_active = False
 
         self._compile_mode = False
@@ -4113,13 +4094,14 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     POST_ATTN      = ue.allocate_tensor_dram(N_P * HIDDEN * BF16)
     FC1_GELU_OUT   = ue.allocate_tensor_dram(N_P * MLP_INT * BF16)
     FC2_OUT        = ue.allocate_tensor_dram(N_P * HIDDEN * BF16)
-    # §7 shared flash fixed operand buffers (sized for the full N_P segment).
+    # Shared flash fixed operand buffers (sized for the full N_P segment).
     VIS_FLASH_Q    = ue.allocate_tensor_dram(N_P * HEAD_D * BF16)
     VIS_FLASH_K    = ue.allocate_tensor_dram(N_P * HEAD_D * BF16)
     VIS_FLASH_V    = ue.allocate_tensor_dram(N_P * HEAD_D * BF16)
     VIS_FLASH_OUT  = ue.allocate_tensor_dram(N_P * HEAD_D * BF16)
-    ATTN_SCRATCH   = ue.allocate_tensor_dram(2 * HEAD_D * N_P * BF16 + N_P * HEAD_D * 2)
+    ATTN_SCRATCH   = ue.allocate_tensor_dram((HEAD_D + N_P) * N_P * BF16 + N_P * HEAD_D * BF16)
     VIS_ATTN_P     = ue.allocate_tensor_dram(N_P * N_P * BF16)
+    VIS_BIAS       = ue.allocate_tensor_dram(N_P * N_P * BF16)
     VIS_EYE        = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * BF16)
     VIS_ZEROS      = ue.allocate_tensor_dram(HIDDEN * BF16)   # shared LayerNorm zeros base
     VIS_ROPE       = ue.allocate_tensor_dram(N_HEADS * N_P * 2 * HEAD_D * BF16)
@@ -4168,6 +4150,9 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     ue.dma_write(DMA_DEVICE_H2C, VIS_EYE,
                  _bf(torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16)),
                  UE_VECTOR_SIZE * UE_VECTOR_SIZE * BF16)
+    ue.dma_write(DMA_DEVICE_H2C, VIS_BIAS,
+                 _bf(torch.zeros(N_P, N_P, dtype=torch.bfloat16)),
+                 N_P * N_P * BF16)
     ue.dma_write(DMA_DEVICE_H2C, VIS_ZEROS,
                  _bf(torch.zeros(HIDDEN, dtype=torch.bfloat16)), HIDDEN * BF16)
     ue.dma_write(DMA_DEVICE_H2C, VIS_ROPE, _bf(rope_tiled),
@@ -4197,10 +4182,6 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     prog_base = ue.get_program_dram_addr()
     ue.reset_isa_reg_counter()
     vis_M      = ue.alloc_isa_reg()   # gpr_M_reg for matmul/norm row count
-    vis_bucket = ue.alloc_isa_reg()   # §7 flash bucket selector
-    vis_ret    = ue.alloc_isa_reg()   # §7 return address
-    num_buckets = N_P // UE_VECTOR_SIZE
-    flash_call_sites: list[int] = []
 
     head_stride = head_bytes          # per-head block in Q_PERM/K_PERM/V_PERM/ATTN_OUT
     chunk_elems = 65536
@@ -4230,13 +4211,11 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
         for src, dst in ((q_src, VIS_FLASH_Q), (k_src, VIS_FLASH_K), (v_src, VIS_FLASH_V)):
             ue.accelerator_memory_to_sram(src, 0x00000, elems)
             ue.sram_to_accelerator_memory(0x00000, dst, elems)
-        ue.generate_instruction_add_set(vis_bucket, num_buckets)
-        ue.pad_capture_to_64b_boundary()
-        ret = ue_35bit_addr_shifter(
-            prog_base + (ue.capture_count + 2) * user_dma_core.INSTRUCTION_SIZE_BYTES)
-        ue.generate_instruction_add_set(vis_ret, ret)
-        flash_call_sites.append(ue.capture_count)
-        ue.generate_instruction_jump_abs(target_instruction_word_addr=0)
+        ue.flash_attention_core_cached(
+            head_dim=HEAD_D, seq_len=N_P,
+            Q_DRAM_ADDR=VIS_FLASH_Q, K_DRAM_ADDR=VIS_FLASH_K, V_DRAM_ADDR=VIS_FLASH_V,
+            OUTPUT_DRAM_ADDR=VIS_FLASH_OUT, SCRATCH_DRAM_ADDR=ATTN_SCRATCH,
+            IDENTITY_DRAM_ADDR=VIS_EYE, BIAS_DRAM_ADDR=VIS_BIAS)
         ue.accelerator_memory_to_sram(VIS_FLASH_OUT, 0x00000, elems)
         ue.sram_to_accelerator_memory(0x00000, out_dst, elems)
 
@@ -4333,22 +4312,12 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
         is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=MG_FC2_S,
         gpr_M_reg=vis_M)
 
-    # --- §7: HALT, then compile the ONE shared flash body; patch call sites. ---
     ue.generate_instruction_halt()
-    ue.pad_capture_to_64b_boundary()
-    sub_start, _ = ue.flash_attention_core(
-        head_dim=HEAD_D, seq_len=N_P,
-        Q_DRAM_ADDR=VIS_FLASH_Q, K_DRAM_ADDR=VIS_FLASH_K, V_DRAM_ADDR=VIS_FLASH_V,
-        OUTPUT_DRAM_ADDR=VIS_FLASH_OUT, SCRATCH_DRAM_ADDR=ATTN_SCRATCH,
-        IDENTITY_DRAM_ADDR=VIS_EYE, ATTN_P_DRAM_ADDR=VIS_ATTN_P,
-        gpr_bucket_idx=vis_bucket, num_buckets=num_buckets, gpr_ret_id=vis_ret)
-    for cs in flash_call_sites:
-        ue._patch_jump_immediate(cs, ue_35bit_addr_shifter(sub_start))
     ue.stop_capture()
 
     prog_size = ue.get_capture_instruction_size_bytes()
     print(f"({time.time()-t_e:.1f}s, {prog_size/1024/1024:.2f} MB, "
-          f"{ue.capture_count} instr, {len(flash_call_sites)} flash call sites)")
+          f"{ue.capture_count} instr)")
 
     # Capture the encoder bytes (baked for prog_base) + meta so the caller can
     # write them into the unified bin — the encoder runs STANDALONE (vision
@@ -4469,11 +4438,15 @@ def _run_fpga_vision_encoder_legacy(ue, model_dir: str, hf_inputs) -> torch.Tens
     POST_ATTN      = ue.allocate_tensor_dram(N_P * HIDDEN * BF16)
     FC1_GELU_OUT   = ue.allocate_tensor_dram(N_P * MLP_INT * BF16)
     FC2_OUT        = ue.allocate_tensor_dram(N_P * HIDDEN * BF16)
-    ATTN_SCRATCH   = ue.allocate_tensor_dram(2 * HEAD_D * N_P * BF16)
+    ATTN_SCRATCH   = ue.allocate_tensor_dram((HEAD_D + N_P) * N_P * BF16 + N_P * HEAD_D * BF16)
+    VIS_BIAS = ue.allocate_tensor_dram(N_P * N_P * BF16)
     VIS_EYE = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * BF16)
     ue.dma_write(DMA_DEVICE_H2C, VIS_EYE,
                  _bf(torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16)),
                  UE_VECTOR_SIZE * UE_VECTOR_SIZE * BF16)
+    ue.dma_write(DMA_DEVICE_H2C, VIS_BIAS,
+                 _bf(torch.zeros(N_P, N_P, dtype=torch.bfloat16)),
+                 N_P * N_P * BF16)
     N_M     = N_P // 4
     K_FC    = HIDDEN * 4
     FC2_DIM = 2048
@@ -4602,10 +4575,11 @@ def _run_fpga_vision_encoder_legacy(ue, model_dir: str, hf_inputs) -> torch.Tens
             ue.ue_memcpy_to_dram(MEMCPY_TYPE.URAM.value, URAM_SECTION.URAM_A.value,
                 URAM_START_ADDR, V_PERM + h * head_bytes, N_P * HEAD_D * BF16)
         for h in range(N_HEADS):
-            ue.flash_attention_core(head_dim=HEAD_D, seq_len=N_P,
+            ue.flash_attention_core_cached(head_dim=HEAD_D, seq_len=N_P,
                 Q_DRAM_ADDR=Q_PERM + h * head_bytes, K_DRAM_ADDR=K_PERM + h * head_bytes,
                 V_DRAM_ADDR=V_PERM + h * head_bytes, OUTPUT_DRAM_ADDR=ATTN_OUT + h * head_bytes,
-                SCRATCH_DRAM_ADDR=ATTN_SCRATCH, IDENTITY_DRAM_ADDR=VIS_EYE)
+                SCRATCH_DRAM_ADDR=ATTN_SCRATCH, IDENTITY_DRAM_ADDR=VIS_EYE,
+                BIAS_DRAM_ADDR=VIS_BIAS)
         for h in range(N_HEADS):
             ue.ue_memcpy_from_dram(ATTN_OUT + h * head_bytes,
                 N_P * HEAD_D * BF16, MEMCPY_TYPE.URAM.value, URAM_START_ADDR,
@@ -4681,6 +4655,8 @@ def main():
                     help="max tokens to generate (default: 128). "
                          "Pass 0 to run until EOT or the KV cache is full "
                          "(`max_context - prompt_len`).")
+    ap.add_argument("--dev", type=str, default="xdma0",
+                    help="DMA device name (default: xdma0).")
     # VLM opt-in (gemma4 pattern). Default mode is pure LM; vision activates
     # only when --image PATH or --vision-enable is given.  Vision encoder
     # runs on FPGA (Phase 4) by default; the host-side HF path (Phase 1) is
@@ -4700,6 +4676,11 @@ def main():
     args = ap.parse_args()
     if args.vision_on_hardware and not (args.vision_enable or args.image):
         ap.error("--vision-on-hardware requires --vision-enable or --image")
+
+    set_dma_device(args.dev)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
 
     # Hard-coded inference settings (formerly CLI flags, now defaults).
     MAX_CONTEXT = 256

@@ -16,14 +16,19 @@ clean:
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
 	rm -f models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin
-	# rm -f models/locateanything_3b/locateanything_3b_bin/
 	rm -rf models/mobilesam/mobilesam_bin/
-	rm -f models/parakeet/parakeet_bin/*.bin
-	rm -f models/parakeet/parakeet_bin/*.json
-	rm -f models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/*.bin
-	rm -f models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/*.json
+	rm -f models/parakeet/parakeet_bin/programs.bin
+	rm -f models/parakeet/parakeet_bin/programs.json
+	rm -f models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.bin
+	rm -f models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.json
 	rm -f models/qwen3_1.7b/qwen3_1.7b_bin/qwen3_1.7b_instruction*
+	rm -f models/qwen3_1.7b/qwen3_1.7b_bin/programs.bin
+	rm -f models/qwen3_1.7b/qwen3_1.7b_bin/programs.json
 	rm -f models/qwen3_4b/qwen3_4b_bin/qwen3_4b_instruction*
+	rm -f models/qwen3_4b/qwen3_4b_bin/programs.bin
+	rm -f models/qwen3_4b/qwen3_4b_bin/programs.json
+	rm -f models/qwen3.5_2b/qwen3.5_2b_bin/programs.bin
+	rm -f models/qwen3.5_2b/qwen3.5_2b_bin/programs.json
 	rm -rf models/smolvlm2/smolvlm2_bin/*.bin
 	rm -rf models/smolvlm2/smolvlm2_bin/*.json
 	rm -rf models/swin/swin_bin/
@@ -154,4 +159,3 @@ model_test_new:
 	done
 
 .PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test model_test_new model_test_help verbose nohup run_from_bin $(_MT_MODELS) $(_MT_NEW_MODELS)
-
