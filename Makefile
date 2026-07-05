@@ -29,8 +29,10 @@ clean:
 	rm -f models/qwen3_4b/qwen3_4b_bin/programs.json
 	rm -f models/qwen3.5_2b/qwen3.5_2b_bin/programs.bin
 	rm -f models/qwen3.5_2b/qwen3.5_2b_bin/programs.json
-	rm -rf models/smolvlm2/smolvlm2_bin/*.bin
-	rm -rf models/smolvlm2/smolvlm2_bin/*.json
+	rm -f models/smolvlm2/smolvlm2_bin/programs*.bin
+	rm -f models/smolvlm2/smolvlm2_bin/programs*.json
+	rm -f models/smolvlm2/smolvlm2_bin/decoder_program.bin
+	rm -f models/smolvlm2/smolvlm2_bin/decoder_program.json
 	rm -rf models/swin/swin_bin/
 
 load_drivers:

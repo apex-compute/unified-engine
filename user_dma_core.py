@@ -8753,12 +8753,15 @@ class UnifiedEngine:
             fmax_context_addr=0,
         )
 
-    def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
+    def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR, chunk_bytes: int | None = None) -> int:
         """
         Write all captured instructions to DRAM
 
         Args:
             start_addr: Starting DRAM address to write instructions (default: DRAM_INSTRUCTION_ADDR)
+            chunk_bytes: If set, split the DMA write into pieces of at most this many bytes.
+                         A single-shot write can segfault on large instruction streams (e.g. swin's
+                         ~10 MB image); chunking avoids it. ``None`` (default) writes in one call.
 
         Returns:
             Number of bytes written, or -1 on error
@@ -8788,7 +8791,16 @@ class UnifiedEngine:
 
         # Write to DRAM
         print(f"Writing {self.capture_count} captured instructions ({total_bytes} bytes) to DRAM at 0x{start_addr:x}...")
-        bytes_written = self.dma_write(DMA_DEVICE_H2C, start_addr, instructions_bytes, total_bytes)
+        if chunk_bytes is not None and chunk_bytes > 0:
+            bytes_written = 0
+            offset = 0
+            while offset < total_bytes:
+                chunk = min(chunk_bytes, total_bytes - offset)
+                bytes_written += self.dma_write(DMA_DEVICE_H2C, start_addr + offset,
+                                                instructions_bytes[offset:offset + chunk], chunk)
+                offset += chunk
+        else:
+            bytes_written = self.dma_write(DMA_DEVICE_H2C, start_addr, instructions_bytes, total_bytes)
 
         if bytes_written == total_bytes:
             print(f"Successfully wrote {bytes_written} bytes ({self.capture_count} instructions) to DRAM")
