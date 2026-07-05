@@ -16,6 +16,8 @@ clean:
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
 	rm -f models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
 	rm -f models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin
+	rm -f models/locateanything_3b/locateanything_3b_bin/programs*.bin
+	rm -f models/locateanything_3b/locateanything_3b_bin/programs*.json
 	rm -rf models/mobilesam/mobilesam_bin/
 	rm -f models/parakeet/parakeet_bin/programs.bin
 	rm -f models/parakeet/parakeet_bin/programs.json
