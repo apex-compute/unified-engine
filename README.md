@@ -163,10 +163,15 @@ engine today; each folder has its own README/config, and most LLMs ship a
 Run the whole suite (or a subset) with the automated tester:
 
 ```bash
-make model_test              # all models, concise PASS/FAIL summary
-make model_test gemma4_e2b   # one model
-make model_test_help         # all modes
+make model_test run_from_bin   # all models, reusing existing compiled bins
+make model_test gemma4_e2b     # one model (clean + rebuild from the HF model)
+make model_test_help           # all modes
 ```
+
+Note: without the `run_from_bin` word, `model_test` runs `make clean`
+first, which deletes cached model bins and rebuilds them from the HF
+models. On a deploy host that only has pregenerated bins (no HF models
+on disk), always use `make model_test run_from_bin`.
 
 ---
 
