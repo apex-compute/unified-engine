@@ -17,8 +17,16 @@ Usage:
   python gemma4_e2b_test.py --prompt "your prompt"
   python gemma4_e2b_test.py --image path/to/image.jpg
   python gemma4_e2b_test.py --image path/to/image.jpg --prompt "What is in this image?"
+  python gemma4_e2b_test.py --vision-enable                 # default image, vision encoder on FPGA
+  python gemma4_e2b_test.py --audio-enable                  # default audio, audio encoder on FPGA
   python gemma4_e2b_test.py --dev xdma0 [--cycle 5.62]
   python gemma4_e2b_test.py --local-weights
+
+Defaults (sample files live in repo-root test_samples/, i.e. ../../test_samples/ from here):
+  LM prompt: "Tell me about the Eiffel Tower. What year was it built?"
+             (pre-tokenized as default_prefill_tokens in gemma4_e2b_config.json)
+  image: yosemite.jpg (default vision prompt: "Describe this image in detail.")
+  audio: apex.wav     (default audio prompt: "Describe what you hear.")
 
 Fixed layout: gemma4_e2b_test.py, gemma4_e2b_numeric.py, *.json, and gemma4_e2b_bin/ live in the same folder.
   user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
@@ -73,10 +81,16 @@ _TEST_SAMPLES = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samp
 DEFAULT_IMAGE = os.path.join(_TEST_SAMPLES, "yosemite.jpg")
 DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
 
-# Bumped any time the on-disk programs.bin layout / ISA semantics
-# change in an incompatible way. On version mismatch the bin is rebuilt from
-# scratch rather than incrementally extended.
-INSTRUCTION_BIN_COMPILE_VERSION = "v1"
+# Stamped into the programs.bin manifest at compile time and compared on load;
+# a mismatch hard-errors so a stale bin is rebuilt from scratch. Bump this string
+# whenever the on-disk bin's ISA/layout changes incompatibly.
+#
+# Attention design: vision and LM (prefill + decode) all run the library
+# unified_attention_core with dynamic batch / aligned-length GPRs and a
+# full-matrix bias. Calls pass q_scale=1.0 (no QKᵀ rescale — Gemma folds the
+# query scaling into q_norm), so there is no separate Q pre-scale. There are no
+# flash/decoder bucket dispatchers and no shared post-HALT attention subroutines.
+INSTRUCTION_BIN_COMPILE_VERSION = "v6-uac-cleanup"
 
 # We run on FPGA + CPU only; disable CUDA before importing torch so PyTorch
 # doesn't probe the GPU driver (avoids a noisy "Error 804: forward compatibility"
@@ -104,6 +118,8 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, URAM_NEAR_FULL_SIZE, URAM_START_ADDR, URAM_SECTION, set_dma_device
 from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
+from user_dma_core import INSTRUCTION_SIZE_BYTES
+from user_dma_core import UE_MODE
 
 # Audio encoder primitives (Conformer ops ported from Parakeet)
 from audio_primitives import (
@@ -963,7 +979,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         #   ISA Unified   : 0xa0000000 – 0x100000000 (1.5 GB) ← program_base default
         #     (formerly split into vision/prefill/decoder regions; collapsed
         #     into one contiguous region for the unified programs.bin
-        #     which holds LM prefill+decode buckets + vision encoder ISA in
+        #     which holds LM prefill+decode + vision encoder ISA in
         #     one contiguous blob. Total fits comfortably under 4 GB; the prior
         #     base 0xC0000000 caused the bin to overflow 4 GB once vision
         #     (~385 MB) was appended to LM (~661 MB).)
@@ -1004,12 +1020,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         #   TMP_REG (scratch for reg_mul_imm + add_imm address math)
         #   GPR_SEQ_LEN_REG     — runtime seq_len / decode_pos
         #   GPR_Q_SEQ_LEN_REG   — seq_len × group_size (Q-side row count)
-        #   GPR_BUCKET_IDX_REG  — 1-based flash/decoder bucket selector
+        #   GPR_BUCKET_IDX_REG  — retired bucket selector, now a general scratch reg
+        #       (reused by vision RoPE loops). Bound to self.gpr_scratch below. The
+        #       JSON key keeps its legacy name for gemma4_e2b_run_from_bin.py, which
+        #       still reads it; rename the key when that file is migrated.
         #   GPR_ALIGNED_SEQ_LEN_REG — feeds unified_attention_core's dynamic aligned_seq_len
         self.TMP_REG       = fixed["TMP_REG"]
         self.gpr_seq_len    = fixed["GPR_SEQ_LEN_REG"]
         self.gpr_q_seq_len  = fixed["GPR_Q_SEQ_LEN_REG"]
-        self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
+        self.gpr_scratch    = fixed["GPR_BUCKET_IDX_REG"]  # retired bucket reg → scratch
         self.gpr_aligned_seq_len = fixed["GPR_ALIGNED_SEQ_LEN_REG"]
         # Dynamic GPR allocation starts past the five reserved regs. The ISA
         # register file holds 31 GPRs total (see user_dma_core.py's
@@ -1026,11 +1045,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # `sliding_window` tokens. Default to MAX_CONTEXT_SIZE so older configs
         # without this key keep their old behaviour (no real windowing).
         self.sliding_window = model.get("sliding_window", model["max_context_size"])
-        # max_prefill_seq_len caps the flash attention scratch/bias buffer sizes
-        # independently of max_context_size. Flash buffers are only used at full
-        # size during prefill (for the whole prompt); decode uses 1 row. Sizing
-        # them for max_context_size wastes ~200+ MB of DRAM that the decoder
-        # program bin later tries to occupy, causing overlap.
+        # max_prefill_seq_len caps the LM prefill attention shapes independently
+        # of max_context_size. Decode may still need MAX_CONTEXT_SIZE KV rows, so
+        # tensor_init sizes shared attention buffers for the larger aligned shape.
         self.max_prefill_seq_len = model.get("max_prefill_seq_len", model["max_context_size"])
         # KV sharing map: built from HF model during weight_init
         self._kv_shared_map = {}  # layer_idx -> reference_layer_idx (populated in weight_init)
@@ -1039,7 +1056,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._per_layer_input_scale = model["per_layer_input_scale"]
         self.prefill_seq = None
         self.engine_slave = engine_slave
-        # Identity matrix cache (fix for flash_attention_core DRAM leak)
+        # Identity matrix cache for transpose/matmul helper kernels.
         self._identity_dram_addr = None
         self._identity_dram_written = False
 
@@ -1048,7 +1065,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.tensor_init()
         self._preallocate_identity_matrix()
 
-    # ─── Identity matrix cache (fix for flash_attention_core DRAM leak) ─────
+    # ─── Identity matrix cache ──────────────────────────────────────────────
     _IDENTITY_MAT_BYTES = UE_VECTOR_SIZE * UE_VECTOR_SIZE * 2  # 8192
 
     def _preallocate_identity_matrix(self) -> None:
@@ -1059,12 +1076,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         super().dma_write(DMA_DEVICE_H2C, self._identity_dram_addr, eye, self._IDENTITY_MAT_BYTES)
         self._identity_dram_written = True
 
-    def _flash_attention_core_cached(self, **kwargs) -> int:
-        saved = self._next_params_dram_addr
-        self._next_params_dram_addr = self._identity_dram_addr
-        result = self.flash_attention_core(**kwargs)
-        self._next_params_dram_addr = saved
-        return result
+    def dma_write(self, device, addr, data, size):
+        if (getattr(self, '_identity_dram_written', False)
+                and self._identity_dram_addr is not None
+                and addr == self._identity_dram_addr
+                and size == self._IDENTITY_MAT_BYTES):
+            return size  # redundant identity DMA already on-card; report success
+        # Propagate the base class's byte count so callers (e.g.
+        # write_captured_instructions_to_dram's success check) don't see None
+        # and print a spurious "wrote None bytes" warning on every register set.
+        return super().dma_write(device, addr, data, size)
 
     def _emit_sram_eltwise_chunked(self, kind: str,
                                     addr_A: int, addr_B: int, addr_out: int,
@@ -1233,6 +1254,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         pixel_position_ids = inputs['image_position_ids']       # [1, S_patches, 2]
         padding_positions = (pixel_position_ids == -1).all(dim=-1)  # [1, S_patches]
         num_patches = pixel_values.shape[1]
+        token_ids = inputs['input_ids'][0].tolist()
+        mm_types = inputs['mm_token_type_ids'][0].tolist()
         assert num_patches == VISION_FIXED_NUM_PATCHES, (
             f"Vision shape contract broken: got num_patches={num_patches}, "
             f"expected {VISION_FIXED_NUM_PATCHES}. The cached vision bin "
@@ -1240,6 +1263,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             f"patch count; a mismatch will produce wrong output. Check that "
             f"the HF processor still maps {VISION_CANONICAL_SIZE} → "
             f"{VISION_FIXED_NUM_PATCHES} patches.")
+
+        # Vision encoder runs on FPGA. FPGA checkpoint readbacks are stashed in
+        # self._vis_ckpt; all reference/numeric comparison is done in
+        # gemma4_e2b_numeric.py (no in-process host-encoder path here).
 
         # Save LM allocator state so we can restore it after vision finishes.
         _tensor_dram_save = self._tensor_dram_addr
@@ -1319,8 +1346,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # Execute vision pipeline: patch_embed (FPGA, compile-and-run) → encoder
         # one-shot (start at vision_program_addr from manifest).
         self._vis_fpga_t0 = time.perf_counter()
-        self.vision_patch_embed(pixel_values.cpu(), pixel_position_ids.cpu(),
-                                 padding_positions.cpu())
+        patch_embeds_fpga = self.vision_patch_embed(pixel_values.cpu(), pixel_position_ids.cpu(),
+                                                    padding_positions.cpu())
         # FPGA dispatch quirk: start_execute_from_dram is reliable only when
         # preceded by a DMA write that touches the program region. After
         # patch_embed runs many small compile-and-run programs, the FPGA's
@@ -1361,11 +1388,70 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         final_buf = self.VIS_IO_A if self.VIS_LAYERS % 2 == 0 else self.VIS_IO_B
         encoder_out = self.dma_from_accelerator_memory(
             final_buf, (num_patches, self.VIS_H)).cpu()
+        # Layer-0 checkpoint snapshots (GEMMA4_VIS_L0_CKPT): read the baked copies.
+        if os.environ.get("GEMMA4_VIS_L0_CKPT") == "1":
+            _S, _H = num_patches, self.VIS_H
+            _aS, _HD = self._vis_aligned_S, self.VIS_HEAD_DIM
+            self._vis_l0 = {
+                "before_attn": self.dma_from_accelerator_memory(self.VIS_L0_BEFORE_ATTN, (_S, _H)).cpu(),
+                "q_proj":      self.dma_from_accelerator_memory(self.VIS_L0_QPROJ,       (_S, _H)).cpu(),
+                "k_proj":      self.dma_from_accelerator_memory(self.VIS_L0_KPROJ,       (_S, _H)).cpu(),
+                "v_proj":      self.dma_from_accelerator_memory(self.VIS_L0_VPROJ,       (_S, _H)).cpu(),
+                "q_pre_rope":  self.dma_from_accelerator_memory(self.VIS_L0_QPRE,          (_S, _H)).cpu(),
+                "k_pre_rope":  self.dma_from_accelerator_memory(self.VIS_L0_KPRE,          (_S, _H)).cpu(),
+                "v_norm":      self.dma_from_accelerator_memory(self.VIS_L0_VNORM,         (_S, _H)).cpu(),
+                "rope_q":      self.dma_from_accelerator_memory(self.VIS_L0_ROPE_Q,       (_S, _H)).cpu(),
+                "rope_k":      self.dma_from_accelerator_memory(self.VIS_L0_ROPE_K,       (_S, _H)).cpu(),
+                "q_hm":        self.dma_from_accelerator_memory(self.VIS_L0_Q_HM,       (self.VIS_HEADS * _aS, _HD)).cpu(),
+                "k_hm":        self.dma_from_accelerator_memory(self.VIS_L0_K_HM,       (self.VIS_HEADS * _aS, _HD)).cpu(),
+                "v_hm":        self.dma_from_accelerator_memory(self.VIS_L0_V_HM,       (self.VIS_HEADS * _aS, _HD)).cpu(),
+                "attn_out_hm": self.dma_from_accelerator_memory(self.VIS_L0_ATTN_OUT_HM,(self.VIS_HEADS * _aS, _HD)).cpu(),
+                "attn_core":   self.dma_from_accelerator_memory(self.VIS_L0_ATTN_CORE,    (_S, _H)).cpu(),
+                "after_attn":  self.dma_from_accelerator_memory(self.VIS_L0_AFTER_ATTN,  (_S, _H)).cpu(),
+                "end_l0":      self.dma_from_accelerator_memory(self.VIS_L0_END,          (_S, _H)).cpu(),
+            }
+            # Single-head (L0,H0) self-contained probe: the exact Q/K/V the core read,
+            # the OUT it wrote, and the (persistent) bias — for a host recompute check.
+            _aS, _HD = self._vis_aligned_S, self.VIS_HEAD_DIM
+            self._vis_l0h0 = {
+                "q":    self.dma_from_accelerator_memory(self.VIS_L0H0_Q,   (_aS, _HD)).cpu(),
+                "k":    self.dma_from_accelerator_memory(self.VIS_L0H0_K,   (_aS, _HD)).cpu(),
+                "v":    self.dma_from_accelerator_memory(self.VIS_L0H0_V,   (_aS, _HD)).cpu(),
+                "out":  self.dma_from_accelerator_memory(self.VIS_L0H0_OUT, (_aS, _HD)).cpu(),
+                "bias": self.dma_from_accelerator_memory(self.VIS_FLASH_BIAS, (_aS, _aS)).cpu(),
+            }
+        if os.environ.get("GEMMA4_VISION_STATS") == "1":
+            _x = encoder_out.float()
+            _fin = torch.isfinite(_x)
+            _xf = _x[_fin]
+            print("  [Vision stats] encoder_out "
+                  f"finite={int(_fin.sum())}/{_x.numel()} "
+                  f"nan={int(torch.isnan(_x).sum())} inf={int(torch.isinf(_x).sum())} "
+                  f"min={float(_xf.min()) if _xf.numel() else float('nan'):.4g} "
+                  f"max={float(_xf.max()) if _xf.numel() else float('nan'):.4g} "
+                  f"mean={float(_xf.mean()) if _xf.numel() else float('nan'):.4g} "
+                  f"rms={float(torch.sqrt((_xf * _xf).mean())) if _xf.numel() else float('nan'):.4g}",
+                  flush=True)
 
         # Pooler + embed_vision tail on FPGA → [N_soft, 1536]
         image_features = self.vision_embed_project(
             encoder_out, pixel_position_ids.cpu(), padding_positions.cpu())
         image_features = image_features.to(torch.bfloat16)
+        # Stash FPGA checkpoint readbacks for gemma4_e2b_numeric.py:
+        #   A = patch_embed, B = encoder_out (pre-pool), C = image_features.
+        self._vis_ckpt = {"A": patch_embeds_fpga, "B": encoder_out, "C": image_features}
+        if os.environ.get("GEMMA4_VISION_STATS") == "1":
+            _x = image_features.float()
+            _fin = torch.isfinite(_x)
+            _xf = _x[_fin]
+            print("  [Vision stats] image_features "
+                  f"finite={int(_fin.sum())}/{_x.numel()} "
+                  f"nan={int(torch.isnan(_x).sum())} inf={int(torch.isinf(_x).sum())} "
+                  f"min={float(_xf.min()) if _xf.numel() else float('nan'):.4g} "
+                  f"max={float(_xf.max()) if _xf.numel() else float('nan'):.4g} "
+                  f"mean={float(_xf.mean()) if _xf.numel() else float('nan'):.4g} "
+                  f"rms={float(torch.sqrt((_xf * _xf).mean())) if _xf.numel() else float('nan'):.4g}",
+                  flush=True)
 
         # ---- Restore LM state so decoder can run ----
         # Restore allocator pointers. Vision tensors clobbered the LM tensor
@@ -1396,9 +1482,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(
             self.IDENTITY_DRAM_ADDR,
             torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
-
-        token_ids = inputs['input_ids'][0].tolist()
-        mm_types = inputs['mm_token_type_ids'][0].tolist()
 
         del hf_model
 
@@ -2397,6 +2480,37 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.VIS_IO_A = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_IO_B = self.allocate_tensor_dram(S * H * bpe)
 
+        # Layer-0 checkpoint snapshot buffers (GEMMA4_VIS_L0_CKPT=1): baked DMA
+        # copies in the layer-0 encoder ISA snapshot the before-attn / after-attn /
+        # end-of-layer-0 tensors here (they'd otherwise be overwritten by later
+        # layers), then gemma4_e2b_numeric.py reads them back after the replay.
+        if os.environ.get("GEMMA4_VIS_L0_CKPT") == "1":
+            aS = ((S + 63) // 64) * 64
+            self.VIS_L0_BEFORE_ATTN = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_QPROJ       = self.allocate_tensor_dram(S * H * bpe)  # Q projection output, FPGA per-head perm layout
+            self.VIS_L0_KPROJ       = self.allocate_tensor_dram(S * H * bpe)  # K projection output, FPGA per-head perm layout
+            self.VIS_L0_VPROJ       = self.allocate_tensor_dram(S * H * bpe)  # V projection output, FPGA per-head perm layout
+            self.VIS_L0_QPRE        = self.allocate_tensor_dram(S * H * bpe)  # Q after q_norm, BEFORE 2D RoPE
+            self.VIS_L0_KPRE        = self.allocate_tensor_dram(S * H * bpe)  # K after k_norm, BEFORE 2D RoPE
+            self.VIS_L0_VNORM       = self.allocate_tensor_dram(S * H * bpe)  # V after v_norm
+            self.VIS_L0_ROPE_Q      = self.allocate_tensor_dram(S * H * bpe)  # roped Q (after 2D RoPE)
+            self.VIS_L0_ROPE_K      = self.allocate_tensor_dram(S * H * bpe)  # roped K (after 2D RoPE)
+            self.VIS_L0_Q_HM        = self.allocate_tensor_dram(NH * aS * HD * bpe)  # Q head-major after transpose + prescale
+            self.VIS_L0_K_HM        = self.allocate_tensor_dram(NH * aS * HD * bpe)  # K head-major after transpose
+            self.VIS_L0_V_HM        = self.allocate_tensor_dram(NH * aS * HD * bpe)  # V head-major after transpose
+            self.VIS_L0_ATTN_OUT_HM = self.allocate_tensor_dram(NH * aS * HD * bpe)  # per-head attn outputs before inverse transpose
+            self.VIS_L0_ATTN_CORE   = self.allocate_tensor_dram(S * H * bpe)  # raw attn output (pre o_proj)
+            self.VIS_L0_AFTER_ATTN  = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_END         = self.allocate_tensor_dram(S * H * bpe)
+            # Single-head (layer 0, head 0) self-contained attention probe: snapshot
+            # the exact Q/K/V the core reads and the OUT it writes, so the host can
+            # recompute softmax(Q/√d·Kᵀ+bias)·V on those inputs and SNR-compare — no
+            # HF, no head re-assembly, isolates ONE of the 12 per-head attention runs.
+            self.VIS_L0H0_Q   = self.allocate_tensor_dram(aS * HD * bpe)
+            self.VIS_L0H0_K   = self.allocate_tensor_dram(aS * HD * bpe)
+            self.VIS_L0H0_V   = self.allocate_tensor_dram(aS * HD * bpe)
+            self.VIS_L0H0_OUT = self.allocate_tensor_dram(aS * HD * bpe)
+
         # Intermediates
         self.VIS_NORM_OUT = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_Q_DRAM = self.allocate_tensor_dram(S * NH * HD * bpe)
@@ -2414,7 +2528,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.VIS_MLP_DOWN = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_POST_FFN_NORM = self.allocate_tensor_dram(S * H * bpe)
 
-        # Flash attention buffers (per-head, process heads sequentially)
+        # Unified attention buffers (per-head, process heads sequentially)
         aligned_S = ((S + 63) // 64) * 64
         self.VIS_FLASH_Q = self.allocate_tensor_dram(aligned_S * HD * bpe)
         self.VIS_FLASH_K = self.allocate_tensor_dram(aligned_S * HD * bpe)
@@ -2432,12 +2546,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._vis_bias_guard_pre  = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
         self.VIS_FLASH_BIAS = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
         self._vis_bias_guard_post = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
+        # unified_attention_core folds Vᵀ + score + scaled_q into one SCRATCH:
+        # aligned_S² + 2·HD·aligned_S BF16 elements.
         self.VIS_FLASH_SCRATCH = self.allocate_tensor_dram(
-            (HD + aligned_S) * aligned_S * 2)
-        # §7g shared-subroutine vision flash: the bucketed-PBI flash body needs a
-        # softmax-intermediate (P) scratch of aligned_S × aligned_S BF16. Only the
-        # ONE shared body (compiled after the encoder HALT) reads it; the legacy
-        # inline per-head path (VIS_FLASH_LEGACY) does not. See compile_instruction_bin.
+            (aligned_S * aligned_S + 2 * HD * aligned_S) * 2)
+        # VIS_ATTN_P is unused by unified_attention_core (scores live in SCRATCH);
+        # kept only so the tensor-allocation order — and every baked address after
+        # it — stays stable for the current bin.
         self.VIS_ATTN_P = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
 
         # 64×64 BF16 identity matrix for FPGA clamp passes (used by
@@ -2491,7 +2606,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.VIS_ROPE_NEG_SIN_PAD_TILED = self.allocate_tensor_dram(S * (HD // 2) * bpe)
         self.VIS_ROPE_SIN_HI_PAD_TILED  = self.allocate_tensor_dram(S * (HD // 2) * bpe)
 
-        # Identity matrix for flash attention
+        # Identity matrix for transpose/matmul helper kernels.
         self.VIS_IDENTITY = self.allocate_tensor_dram(HD * HD * bpe)
         self.dma_to_accelerator_memory(self.VIS_IDENTITY,
                                         torch.eye(HD, dtype=torch.bfloat16))
@@ -2818,11 +2933,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # memcpy via general_reg_src (REG_REWRITE). The result MUST land in TMP_REG
         # (== general_reg_src): add_imm(off_reg, base, TMP_REG) computes
         # regfile[TMP_REG] = regfile[off_reg] + base. patch_reg drives the per-PATCH
-        # rope address; t_reg the flat per-ROW Q/K address. gpr_bucket_idx is free
-        # here (the flash sets it per-head AFTER rope); nested loop counters alloc ≥5.
+        # rope address; t_reg the flat per-ROW Q/K address. gpr_scratch is free
+        # here (unified_attention_core drives its own dims); nested loop counters alloc ≥5.
         t_reg     = self.gpr_seq_len
         off_reg   = self.gpr_q_seq_len
-        patch_reg = self.gpr_bucket_idx
+        patch_reg = self.gpr_scratch
         S = M // self.VIS_HEADS
         self.generate_instruction_add_set(t_reg, 0)
         self.generate_instruction_add_set(patch_reg, 0)
@@ -2879,32 +2994,26 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             assert hasattr(self, "VIS_IDENTITY_64"), \
                 "VIS_IDENTITY_64 not allocated; pass identity_addr=AUD_IDENTITY_64"
             identity_addr = self.VIS_IDENTITY_64
-        saved_a = user_dma_core.LALU_CLAMP_RELU_A
-        saved_b = user_dma_core.LALU_CLAMP_RELU_B
         # PBI clamp (gpr_M_reg) is the default. The two HW bugs it used to hit — the
         # clamp-bound bit-pattern hang AND the pipeline side-effect that cratered the
         # encoder mid-stream — are fixed in HW v0x5f9f99db (verified: audio PBI clamp
         # = 58/2/0, identical to legacy; was 53/5/2 on the old HW). Set CLAMP_NO_GPRM=1
         # to force the legacy clamp. See AUDIO_pbi_clamp_hang_ISSUE.md for history.
         _use_pbi_path = use_pbi and os.environ.get("CLAMP_NO_GPRM") != "1"
-        try:
-            user_dma_core.LALU_CLAMP_RELU_A = self.float_to_bf16(clamp_min)
-            user_dma_core.LALU_CLAMP_RELU_B = self.float_to_bf16(clamp_max)
-            _mm_kw = {}
-            if _use_pbi_path:
-                _mm_kw["gpr_M_reg"] = self._prime_M(num_elements // 64)
-            self.matmat_mul_core(
-                M=num_elements // 64, K=64, N=64,
-                A_DRAM_ADDR=src_dram,
-                B_DRAM_ADDR=identity_addr,
-                OUTPUT_DRAM_ADDR=dst_dram,
-                is_B_quantized=False,
-                clamp_enable=True,
-                **_mm_kw,
-            )
-        finally:
-            user_dma_core.LALU_CLAMP_RELU_A = saved_a
-            user_dma_core.LALU_CLAMP_RELU_B = saved_b
+        _mm_kw = {}
+        if _use_pbi_path:
+            _mm_kw["gpr_M_reg"] = self._prime_M(num_elements // 64)
+        self.matmat_mul_core(
+            M=num_elements // 64, K=64, N=64,
+            A_DRAM_ADDR=src_dram,
+            B_DRAM_ADDR=identity_addr,
+            OUTPUT_DRAM_ADDR=dst_dram,
+            is_B_quantized=False,
+            clamp_enable=True,
+            clamp_min=clamp_min,
+            clamp_max=clamp_max,
+            **_mm_kw,
+        )
 
     def _aud_clip_dram(self, addr: int, shape: tuple,
                         clamp_min: float, clamp_max: float) -> None:
@@ -2972,23 +3081,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         return self._prime_M(M)
 
     def _matmul_with_output_clamp(self, *, clamp_min: float, clamp_max: float, **mm_kwargs) -> None:
-        """matmat_mul_core with arbitrary output-clamp bounds.
-
-        Why: HW supports ``clamp(x, a, b) = max(a, min(x, b))`` via
-        LALU_MODE.CLAMP, but matmat_mul_core reads bounds from module-level
-        constants (LALU_CLAMP_RELU_A/B = 0.0, +inf — i.e. ReLU). To use
-        custom bounds without modifying user_dma_core.py, monkey-patch those
-        constants for the single call. Sequential ISA emission only —
-        not thread-safe.
-        """
-        saved_a, saved_b = user_dma_core.LALU_CLAMP_RELU_A, user_dma_core.LALU_CLAMP_RELU_B
-        try:
-            user_dma_core.LALU_CLAMP_RELU_A = self.float_to_bf16(clamp_min)
-            user_dma_core.LALU_CLAMP_RELU_B = self.float_to_bf16(clamp_max)
-            return self.matmat_mul_core(clamp_enable=True, **mm_kwargs)
-        finally:
-            user_dma_core.LALU_CLAMP_RELU_A = saved_a
-            user_dma_core.LALU_CLAMP_RELU_B = saved_b
+        """matmat_mul_core with arbitrary output-clamp bounds."""
+        return self.matmat_mul_core(
+            clamp_enable=True,
+            clamp_min=clamp_min,
+            clamp_max=clamp_max,
+            **mm_kwargs,
+        )
 
     def compile_vision_layer(self, layer_idx: int) -> int:
         """Run vision layer part A: pre_norm + Q/K/V projections + Q/K norms.
@@ -3120,15 +3219,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     def host_vision_v_norm_rope_gather(self, layer_idx: int,
                                         cos_2d: torch.Tensor = None,
                                         sin_2d: torch.Tensor = None) -> None:
-        """V-norm, 2D RoPE, per-head transpose, and Q pre-scale — all on FPGA.
+        """V-norm, 2D RoPE, and per-head transpose — all on FPGA.
 
         - V norm (FPGA): rms_norm_core_dram with constant ones(HD) gamma.
         - 2D RoPE (FPGA): qwen3.5 split-64 trick. See VIS_ROPE_PERM.
         - Per-head transpose (FPGA, #4): (S*NH, HD) interleaved →
           (NH, aligned_S, HD) head-major into VIS_FLASH_*_HM. Eliminates
           the host gather + per-head DMA upload of the old per-head loop.
-        - Q pre-scale (FPGA, #4): broadcast_mul Q_HM by sqrt(HD) to cancel
-          flash_attention_core's internal 1/sqrt(d).
+
+        (No Q pre-scale: attention passes q_scale=1.0 so unified_attention_core
+        applies no QKᵀ scaling — Gemma vision folds it into q_norm.)
 
         cos_2d/sin_2d args kept for back-compat with compare scripts; unused.
         Sets self._vis_q_roped / k_roped / v_normed only when called by the
@@ -3188,14 +3288,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             S=S, dst_aligned_S=aligned_S),
             cache=cache, cache_key=f"vis_L{layer_idx}_transpose_v")
 
-        # Q pre-scale on FPGA (cancel flash_attention_core's internal 1/sqrt(d)).
-        # Apply to all NH * aligned_S * HD elements in Q_HM in place.
-        # Padding rows are zero so multiplying them by sqrt(HD) keeps them zero.
-        self._compile_and_run_single("q_prescale", lambda: self._emit_sram_broadcast_mul_chunked(
-            src_addr=self.VIS_FLASH_Q_HM, dst_addr=self.VIS_FLASH_Q_HM,
-            num_elements=NH * aligned_S * HD,
-            scalar=math.sqrt(HD)),
-            cache=cache, cache_key=f"vis_L{layer_idx}_q_prescale")
+        # No Q pre-scale: _vis_emit_attn passes q_scale=1.0 to unified_attention_core
+        # so the core applies no QKᵀ scaling (Gemma vision folds the query scaling into
+        # q_norm). This replaces the old √HD pre-scale-then-cancel-1/√HD dance.
 
         # Compare-script back-compat: if the per-head host-attention path is
         # still expected, also read Q/K/V back to host. Production path skips
@@ -3211,11 +3306,36 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self._vis_k_roped = k_roped.reshape(S, NH, HD).float()
             self._vis_v_normed = v_normed.reshape(S, NH, HD)
 
+    def _vis_emit_attn(self, Q, K, V, O, HD, aligned_S):
+        """Emit one head's vision attention via the library `unified_attention_core`.
+
+        batch = aligned_seq_len = aligned_S (every patch is a query), full-matrix
+        bias (VIS_FLASH_BIAS). unified_attention_core folds Vᵀ / score / scaled_q
+        into SCRATCH — VIS_FLASH_SCRATCH is sized for exactly that
+        (HD·S + S² + batch·HD), and no dedicated VIS_ATTN_P is used. Dynamic
+        (gpr-driven) dispatch keeps the per-head baked ISA compact. q_scale=1.0 →
+        the core applies no QKᵀ scaling (Gemma vision folds it into q_norm), so no
+        upstream Q pre-scale is needed."""
+        _batch_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(_batch_reg, aligned_S)
+        _aligned_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(_aligned_reg, aligned_S)
+        total = self.unified_attention_core(
+            batch=aligned_S, aligned_seq_len=aligned_S, head_dim=HD,
+            Q_DRAM_ADDR=Q, K_DRAM_ADDR=K, V_DRAM_ADDR=V,
+            BIAS_DRAM_ADDR=self.VIS_FLASH_BIAS, OUTPUT_DRAM_ADDR=O,
+            SCRATCH_DRAM_ADDR=self.VIS_FLASH_SCRATCH,
+            IDENTITY_DRAM_ADDR=self._identity_dram_addr,
+            gpr_batch_reg=_batch_reg, gpr_aligned_seq_len_reg=_aligned_reg,
+            q_scale=1.0)
+        self.release_isa_reg()  # _aligned_reg
+        self.release_isa_reg()  # _batch_reg
+        return total
+
     def run_vision_attention_all_heads(self, layer_idx: int) -> None:
         """Run attention for all heads: host gather -> FPGA attn -> host scatter.
 
-        Q pre-scale is done on host to avoid SRAM overflow (aligned_S * HD can
-        exceed available SRAM for large patch counts).
+        Attention uses q_scale=1.0 (no QKᵀ scaling); no Q pre-scale step.
 
         Per-head FPGA program is cached in self._vis_program_cache.
         """
@@ -3234,18 +3354,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # then inverse-transposed to interleaved VIS_Q_DRAM for o_proj.
         head_stride_bytes = aligned_S * HD * bpe
 
-        # §7g vision attention (unified-bin capture, _vis_s7): each head marshals its
-        # head-major Q/K/V slice into the FIXED VIS_FLASH_Q/K/V, calls
-        # unified_attention_core inline (replaces the old flash_attention_core
-        # subroutine + JUMP_ABS call-site pattern — same migration as the LM path),
-        # then marshals the result back to OUT_HM. batch=S and aligned_seq_len=
-        # aligned_S are compile-time constant for this bin (vision always processes
-        # a fixed canonical patch count), but gpr_aligned_seq_len_reg is still
-        # passed to force unified_attention_core's dynamic/PBI dispatch — the
-        # static/legacy path fully unrolls per M/K/N and would reproduce the exact
-        # ISA bloat this subroutine mechanism was built to avoid (NH×VIS_LAYERS
-        # inline flash bodies). Same numerics as before (identical seq_len, bias,
-        # identity).
+        # §7g vision attention (unified-bin capture, _vis_s7): each head marshals
+        # its head-major Q/K/V slice into the FIXED VIS_FLASH_Q/K/V, then calls
+        # _vis_emit_attn → library unified_attention_core inline (Vᵀ + score +
+        # scaled_q all fold into VIS_FLASH_SCRATCH).
         if getattr(self, "_vis_s7", False):
             _elems = aligned_S * HD
             def _bounce(_src, _dst):
@@ -3255,41 +3367,21 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                         accelerator_dram_address=_src + _o * bpe, sram_address=0x10000, element_size=_n)
                     self.sram_to_accelerator_memory(
                         sram_address=0x10000, accelerator_dram_address=_dst + _o * bpe, element_size=_n)
+            _l0h0 = (layer_idx == 0 and os.environ.get("GEMMA4_VIS_L0_CKPT") == "1")
+            _h_elems = aligned_S * HD
             for h in range(NH):
                 base = h * head_stride_bytes
                 _bounce(self.VIS_FLASH_Q_HM + base, self.VIS_FLASH_Q)
                 _bounce(self.VIS_FLASH_K_HM + base, self.VIS_FLASH_K)
                 _bounce(self.VIS_FLASH_V_HM + base, self.VIS_FLASH_V)
-                # aligned_S is compile-time constant, but a fresh register is
-                # allocated+primed+released right around this single call (rather
-                # than reused across head iterations) — _oneshot_mode resets
-                # _isa_reg_counter to _isa_reg_base before every
-                # _compile_and_run_single sub-op elsewhere in this layer, so a
-                # register that "lived across" those resets could silently
-                # collide with a later sub-op's own temp allocations. Proper
-                # alloc/release right here keeps this call self-contained
-                # regardless of what the counter is doing elsewhere.
-                _vis_aligned_reg = self.alloc_isa_reg()
-                self.generate_instruction_add_set(_vis_aligned_reg, aligned_S)
-                self.unified_attention_core(
-                    # Match the old subroutine's M=N=seq_len exactly (both driven
-                    # from the same aligned_S): all aligned_S rows are valid Q rows
-                    # here (including padding-patch rows), not just the S real
-                    # patches — the later inverse-transpose already slices out only
-                    # the first S rows, so padding rows' output is simply discarded.
-                    batch=aligned_S,
-                    aligned_seq_len=aligned_S,
-                    head_dim=HD,
-                    Q_DRAM_ADDR=self.VIS_FLASH_Q,
-                    K_DRAM_ADDR=self.VIS_FLASH_K,
-                    V_DRAM_ADDR=self.VIS_FLASH_V,
-                    BIAS_DRAM_ADDR=self.VIS_FLASH_BIAS,
-                    OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT,
-                    SCRATCH_DRAM_ADDR=self.VIS_FLASH_SCRATCH,
-                    IDENTITY_DRAM_ADDR=self._identity_dram_addr,
-                    gpr_aligned_seq_len_reg=_vis_aligned_reg,
-                )
-                self.release_isa_reg()  # _vis_aligned_reg
+                if _l0h0 and h == 0:  # snapshot head-0 attention INPUTS (what the core reads)
+                    self._emit_sram_copy_chunked(self.VIS_FLASH_Q, self.VIS_L0H0_Q, _h_elems)
+                    self._emit_sram_copy_chunked(self.VIS_FLASH_K, self.VIS_L0H0_K, _h_elems)
+                    self._emit_sram_copy_chunked(self.VIS_FLASH_V, self.VIS_L0H0_V, _h_elems)
+                self._vis_emit_attn(self.VIS_FLASH_Q, self.VIS_FLASH_K,
+                                    self.VIS_FLASH_V, self.VIS_FLASH_OUT, HD, aligned_S)
+                if _l0h0 and h == 0:  # snapshot head-0 attention OUTPUT
+                    self._emit_sram_copy_chunked(self.VIS_FLASH_OUT, self.VIS_L0H0_OUT, _h_elems)
                 _bounce(self.VIS_FLASH_OUT, self.VIS_FLASH_OUT_HM + base)
             # FPGA inverse transpose: OUT_HM (NH, aligned_S, HD) → VIS_Q_DRAM (S, NH*HD)
             self._compile_and_run_single("transpose_attn_out", lambda:
@@ -3304,22 +3396,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             k_addr = self.VIS_FLASH_K_HM   + h * head_stride_bytes
             v_addr = self.VIS_FLASH_V_HM   + h * head_stride_bytes
             o_addr = self.VIS_FLASH_OUT_HM + h * head_stride_bytes
-            _vis_flash_pbi = os.environ.get("VIS_FLASH_LEGACY") != "1"  # diagnostic: VIS_FLASH_LEGACY=1 forces legacy flash
-            self._compile_and_run_single(f"attn_h{h}", lambda q=q_addr, k=k_addr, v=v_addr, o=o_addr:
-                self._flash_attention_core_cached(
-                    head_dim=HD,
-                    seq_len=aligned_S,
-                    Q_DRAM_ADDR=q,
-                    K_DRAM_ADDR=k,
-                    V_DRAM_ADDR=v,
-                    OUTPUT_DRAM_ADDR=o,
-                    SCRATCH_DRAM_ADDR=self.VIS_FLASH_SCRATCH,
-                    BIAS_DRAM_ADDR=self.VIS_FLASH_BIAS,
-                    use_pbi=_vis_flash_pbi,
-                    # New-PBI legacy flash requires an explicit UE_VECTOR_SIZE²
-                    # identity (it no longer self-allocates). Use the deterministic
-                    # preallocated slot so run_from_bin (load-only) has it too.
-                    IDENTITY_DRAM_ADDR=self._identity_dram_addr),  # safe now that VIS_FLASH_SCRATCH is correctly sized; ~6× per-layer ISA shrink enables true 1-trigger one-shot
+            def _emit_vis_attn(q=q_addr, k=k_addr, v=v_addr, o=o_addr):
+                return self._vis_emit_attn(q, k, v, o, HD, aligned_S)
+            self._compile_and_run_single(f"attn_h{h}", _emit_vis_attn,
                 cache=cache, cache_key=f"vis_L{layer_idx}_attn_h{h}")
 
         # FPGA inverse transpose: OUT_HM (NH, aligned_S, HD) → VIS_Q_DRAM (S, NH*HD)
@@ -3478,8 +3557,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         """Run one full vision encoder layer on HW.
 
         Orchestrates: pre_norm + Q/K/V/O projections + Q/K norms (FPGA) →
-        V norm + 2D RoPE + per-head transpose + Q pre-scale (FPGA) →
-        per-head flash attention reading from head-major buffers (FPGA) →
+        V norm + 2D RoPE + per-head transpose (FPGA) →
+        per-head unified attention reading from head-major buffers (FPGA) →
         attn-out inverse transpose + O proj + post_attn_norm + residual +
         MLP + post_ffn_norm + residual (FPGA).
 
@@ -3784,6 +3863,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             pooler_mask = torch.logical_not((weights == 0).all(dim=1))  # [1, L]
             pooled = pooled * (H ** 0.5)
             pooled = pooled[pooler_mask]                        # [N_final, 768]
+        self._last_vision_pooled = pooled.detach().cpu().to(torch.bfloat16)
         N_final = int(pooled.shape[0])
         assert N_final <= S, f"pooler produced {N_final} rows, scratch sized for {S}"
 
@@ -6891,13 +6971,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         seq_len = self.MAX_CONTEXT_SIZE
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
-        # Flash attention scratch/bias buffers are only used at full capacity
-        # during prefill. Sizing them for MAX_CONTEXT_SIZE wastes ~200+ MB that
-        # the decoder program bin would otherwise overlap with. Use
-        # max_prefill_seq_len (capped at MAX_CONTEXT_SIZE) instead.
+        # Unified attention scratch/bias buffers are largest during prefill,
+        # but decode can still require MAX_CONTEXT_SIZE KV rows. Size the
+        # shared attention buffers for the larger aligned dimension.
         prefill_seq_len = min(self.max_prefill_seq_len, self.MAX_CONTEXT_SIZE)
         prefill_q_seq_len = prefill_seq_len * self.group_size
         prefill_aligned_seq_len = ((prefill_q_seq_len + 63) // 64) * 64
+        decode_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
+        attention_aligned_seq_len = max(prefill_aligned_seq_len, decode_aligned_seq_len)
 
         # Build compact KV slot map: only layers that own KV state get a slot.
         # KV-shared layers point at their reference layer's slot, so L15-34 do not
@@ -6924,11 +7005,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
         self.IDENTITY_DRAM_ADDR = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
-        # Allocate memory for flash attention and zero pad (sized for prefill only):
-        self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        zero_pad = torch.zeros(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
+        # Allocate memory for attention and zero pad. Prefill uses
+        # seq_len*group_size rows; decode uses MAX_CONTEXT_SIZE KV rows, so size
+        # the shared buffers for the larger aligned dimension.
+        self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
+        self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
+        self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
+        zero_pad = torch.zeros(attention_aligned_seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_pad)
@@ -6939,21 +7022,21 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.LAYER0_K_DRAM = self.allocate_tensor_dram(seq_len * self.k_size)
         self.LAYER0_K_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.k_size)
         self.LAYER0_Q_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.q_size)
-        self.LAYER0_FLASH_OUTPUT_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(max(self.head_dim, UE_FMAX_CONTEXT_SIZE) * prefill_aligned_seq_len * 2 + self.head_dim * prefill_aligned_seq_len * 2)
-        # Two flash-attention bias buffers: full-attention layers attend to
+        self.LAYER0_FLASH_OUTPUT_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
+        # unified_attention_core scratch layout:
+        #   V.T [HD, S] + scores [S, S] + scaled_q [batch, HD].
+        # Worst case batch <= S, so allocate S*S + 2*HD*S elements.
+        self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(
+            (attention_aligned_seq_len * attention_aligned_seq_len
+             + 2 * self.head_dim * attention_aligned_seq_len) * self.bytes_per_element)
+        # Two full-matrix bias buffers: full-attention layers attend to
         # the entire causal window, sliding-attention layers are limited to
         # `sliding_window` tokens. compile_prefill / compile_decoder pick the
         # right address per layer; run_prefill / run_decoder upload both.
-        # Sized for prefill (not MAX_CONTEXT_SIZE) — see comment above.
-        self.LAYER0_FLASH_BIAS_FULL_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * prefill_aligned_seq_len * self.bytes_per_element)
-        self.LAYER0_FLASH_BIAS_SLIDING_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * prefill_aligned_seq_len * self.bytes_per_element)
+        self.LAYER0_FLASH_BIAS_FULL_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * attention_aligned_seq_len * self.bytes_per_element)
+        self.LAYER0_FLASH_BIAS_SLIDING_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * attention_aligned_seq_len * self.bytes_per_element)
         # Backwards-compat alias (older callers use the singular name).
         self.LAYER0_FLASH_BIAS_DRAM = self.LAYER0_FLASH_BIAS_FULL_DRAM
-        # Dynamic-PBI flash-attention scratch buffer for the bucket dispatcher.
-        # Sized for the largest aligned Q seq length the dispatcher will emit a
-        # body for. Same size as bias buffers above.
-        self.LAYER0_FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * prefill_aligned_seq_len * self.bytes_per_element)
         self.LAYER0_ATTN_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.LAYER0_POST_ATTN_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.LAYER0_POST_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
@@ -7179,15 +7262,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         DYNAMIC PBI (see notes_gemma4_e2b.md): seq_len-agnostic
         captured program. Bulk PBI ops (matmat / rms_norm / eltwise) read M
-        from self.gpr_seq_len at execute time. Flash attention uses
-        gpr_bucket_idx + ATTN_P_DRAM dispatcher with num_buckets bodies.
+        from self.gpr_seq_len at execute time. Attention calls the library
+        unified_attention_core inline with dynamic batch/aligned dimensions.
         Per-token Python loops (V-norm, RoPE, K/V dup, partial-rotary copies,
         broadcast_mul) iterate at PREFILL_MAX_SEQ_LEN; runtime ops beyond
-        actual seq_len consume stale K cache rows that flash bias masks out.
+        actual seq_len consume stale K cache rows that attention bias masks out.
 
         ``seq_len`` arg is FLOPs/template only — host preamble primes
-        gpr_seq_len / gpr_q_seq_len / gpr_bucket_idx with actual runtime values
-        before each program execute.
+        gpr_seq_len / gpr_q_seq_len / gpr_aligned_seq_len with actual runtime
+        values before each program execute.
         """
         # Template iteration counts come from PREFILL_MAX_SEQ_LEN so the captured
         # program is portable across all real seq_lens ≤ PREFILL_MAX.
@@ -7205,9 +7288,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = True
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
-        _original_print(f"  Emitting dynamic-PBI prefill: {layer_size} layers, template={template_seq_len}")
+        _original_print(f"  Emitting dynamic-PBI prefill: {layer_size} layers, template={template_seq_len}, attention=unified-inline")
         prefill_t0 = time.perf_counter()
-
         for layer_idx in range(layer_size):
             if layer_idx > 0 and layer_idx % 10 == 0:
                 _original_print(f"    prefill layer {layer_idx}/{layer_size} ({time.perf_counter()-prefill_t0:.1f}s)")
@@ -7377,31 +7459,20 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 self._emit_gqa_duplicate_pbi(k_cache_base, self.LAYER0_FLASH_K_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=self.k_size)
                 self._emit_gqa_duplicate_pbi(v_cache_base, self.LAYER0_FLASH_V_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=self.k_size)
 
-                # Gemma4 uses scaling=1.0 (no 1/sqrt(d) in attention scores).
-                # flash_attention_core internally applies 1/sqrt(head_dim), so pre-scale Q by sqrt(head_dim) to cancel it.
-                self._emit_sram_broadcast_mul_chunked(
-                    self.LAYER0_FLASH_Q_DRAM, self.LAYER0_FLASH_Q_DRAM,
-                    aligned_seq_len * cur_head_dim, math.sqrt(cur_head_dim))
+                # Gemma4 uses scaling=1.0 (no 1/sqrt(d) in attention scores), so pass
+                # q_scale=1.0 below; no Q pre-scale needed.
 
                 # Pick the per-layer bias: full attention layers see the
                 # entire causal window; sliding-attention layers are limited
                 # to `sliding_window` tokens (run_prefill builds both biases).
-                # Both geometries share the same aligned_seq_len buffer size;
-                # only the bias content differs.
                 bias_addr_layer = (self.LAYER0_FLASH_BIAS_FULL_DRAM
                                    if layer_idx in self._full_attention_layers
                                    else self.LAYER0_FLASH_BIAS_SLIDING_DRAM)
-                # Scaled dot-product attention for this layer's single KV head
-                # (num_kv=1 for E2B; group_size query heads already share the
-                # fixed FLASH_Q/K/V buffers), called inline per layer via
-                # unified_attention_core — replaces the old flash_attention_core
-                # subroutine + JUMP_ABS call-site pattern (andromeda's
-                # unified_attention_core is a different, already-hardware-
-                # validated implementation than unified-engine's own PBI flash
-                # path, so the back-to-back-call degradation noted above for
-                # the legacy subroutine does not apply here).
-                attn_result = self.unified_attention_core(
-                    batch=q_seq_len,
+                # unified_attention_core uses bias_mode="full_matrix" internally.
+                # Prefill bias is [aligned_q, aligned_q], while the dynamic batch
+                # GPR limits the live rows to q_seq_len.
+                total_flops += self.unified_attention_core(
+                    batch=aligned_seq_len,
                     aligned_seq_len=aligned_seq_len,
                     head_dim=cur_head_dim,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
@@ -7413,8 +7484,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     gpr_batch_reg=self.gpr_q_seq_len,
                     gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                    q_scale=1.0,
                 )
-                total_flops += attn_result or 0
             if not self.engine_slave:
                 # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
                 self.generate_instruction_flag_set()
@@ -7566,11 +7637,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         seq_len = len(token_ids)
         tid_t = torch.tensor(token_ids, dtype=torch.long)
 
-        # VLM mode: replace image token IDs with pad_token_id for per_layer_embed lookup
+        # Multimodal mode: image/audio soft-token rows already carry the real
+        # modality embedding in embedding_tensor. Use pad_token_id for the
+        # per-layer token lookup so placeholder IDs do not inject extra text
+        # token-specific per-layer embeddings.
         if hasattr(self, '_mm_types') and self._mm_types is not None:
             mm_mask = torch.tensor(self._mm_types[:len(token_ids)])
             tid_t_for_pli = tid_t.clone()
-            tid_t_for_pli[mm_mask == 1] = 0  # pad_token_id
+            tid_t_for_pli[(mm_mask == 1) | (mm_mask == 3)] = 0  # pad_token_id
         else:
             tid_t_for_pli = tid_t
 
@@ -7711,11 +7785,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             sliding_bias[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias)
 
-        # Dynamic-PBI preamble: prime gpr_seq_len / gpr_q_seq_len (+ gpr_aligned_seq_len
-        # for unified_attention_core's dynamic aligned_seq_len) before launching so the
-        # captured PBI body reads the right row counts. gpr_bucket_idx isn't primed here —
-        # prefill's old bucket-dispatch subroutine was replaced by unified_attention_core,
-        # so that slot is decoder-only now (primed separately in run_decoder).
+        # Dynamic-PBI preamble: prime seq_len, Q rows, and aligned attention
+        # length before launching so the captured dynamic bodies read the right
+        # row counts.
         self._isa_add_set_core(self.gpr_seq_len,    seq_len)
         self._isa_add_set_core(self.gpr_q_seq_len,  q_seq_len)
         self._isa_add_set_core(self.gpr_aligned_seq_len, aligned_seq_len)
@@ -7740,54 +7812,35 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         return latency, flop_rate_program
 
     def compile_decoder(self, layer_size: int = 35) -> tuple[None, list[int], list[int]]:
-        """Compile a single decoder program (no buckets) with dynamic PBI.
+        """Compile a single decoder program with dynamic PBI.
 
         DYNAMIC PBI (see notes_gemma4_e2b.md): one captured
         program handles all decode positions. Per-token KV/RoPE addresses
         are computed at execute time via reg_mul_imm(gpr_seq_len, stride) +
-        add_imm(base) → TMP_REG. Decoder attention uses
-        decoder_group_attention_core with gpr_bucket_idx + num_buckets bucket
-        dispatcher. End of program issues add_inc(gpr_seq_len) so subsequent
-        decode steps advance automatically.
+        add_imm(base) → TMP_REG. Decoder attention calls unified_attention_core
+        inline with batch=group_size and dynamic aligned KV length. End of
+        program issues add_inc(gpr_seq_len) so subsequent decode steps advance
+        automatically.
 
         Returns (None, [program_size_bytes], [total_flops]) — backward-compat
         single-element lists; caller uses [0] index.
         """
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
-        # Decoder bucket dispatcher: emits one body per UE_VECTOR_SIZE multiple
-        # of K context length, up to MAX_CONTEXT_SIZE aligned.
-        dec_num_buckets = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
 
         global _SILENT_MODE
         _SILENT_MODE = True
-        _original_print(f"  Emitting dynamic-PBI decoder: 1 segment x {layer_size} layers, dec_buckets={dec_num_buckets}")
+        _original_print(f"  Emitting dynamic-PBI decoder: 1 segment x {layer_size} layers, attention=unified-inline")
         seg_t0 = time.perf_counter()
         count_at_start = self.capture_count
         total_flops = 0
         # gpr_one holds the constant 1 — used as gpr_M_reg for all M=1 ops.
         gpr_one = self.alloc_isa_reg()
         self.generate_instruction_add_set(gpr_one, 1)
-
-        # Per-layer decoder attention: gathers this layer's K/V into the fixed
-        # FLASH_K/V buffers (PBI strided copy, runtime trip = gpr_gather_n =
-        # aligned_seq_len) then calls unified_attention_core inline. E2B is
-        # num_kv=1 (group_size = all Q heads), so the Q group is already at
-        # the FLASH_Q base and the call writes FLASH_OUTPUT directly — no
-        # Q/OUT marshalling (unlike E4B's per-kv-head loop).
-        # gather trip count: gather only up to the bucket-aligned context length
-        # (gpr_bucket_idx * UE_VECTOR_SIZE = aligned_seq_len = what the attention
-        # actually reads), NOT the full MAX_CONTEXT. Correct — it covers the current
-        # token (aligned >= seq_len) plus the zero/masked tail [seq_len:aligned] —
-        # and far cheaper at runtime (e.g. 64 rows early in decode vs 1024), which
-        # recovers the decode speed the full-attn gather would otherwise cost.
-        # Live across all layers (gpr_bucket_idx is constant for this program).
-        gpr_gather_n = self.alloc_isa_reg()
+        gpr_group_size = self.alloc_isa_reg()
+        self.generate_instruction_add_set(gpr_group_size, self.group_size)
         # Iterate once (no bucket loop)
         for _bi_unused in [0]:
             seq_len = self.MAX_CONTEXT_SIZE  # template only — for FLOPs
-            # aligned_seq_len = gpr_bucket_idx * UE_VECTOR_SIZE (host re-sets
-            # gpr_bucket_idx every decode step). reg_mul_imm is a plain src*imm.
-            self.generate_instruction_reg_mul_imm(gpr_gather_n, self.gpr_bucket_idx, UE_VECTOR_SIZE)
             for layer_idx in range(layer_size):
                 layer_off = layer_idx * LAYER_WEIGHT_SIZE
                 cur_head_dim, cur_q_size, cur_k_size = self._get_layer_attention_dims(layer_idx)
@@ -7905,58 +7958,45 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                         self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(k_cache_nrot_base), self.TMP_REG)
                         self.sram_to_accelerator_memory(0x10000, 0, remaining, general_reg_src=self.TMP_REG)
 
-                # Q pre-scaling: cancel decoder_group_attention_core internal 1/sqrt(head_dim).
-                self.accelerator_memory_to_sram(self.LAYER0_FLASH_Q_DRAM, 0x30000, self.group_size * cur_head_dim)
-                self.broadcast_mul(scalar=math.sqrt(cur_head_dim), sram_start_addr=0x30000, sram_wb_addr=0x30000, element_size=self.group_size * cur_head_dim)
-                self.sram_to_accelerator_memory(0x30000, self.LAYER0_FLASH_Q_DRAM, self.group_size * cur_head_dim)
+                # Gemma4 uses scaling=1.0; q_scale=1.0 on the attention call means no
+                # Q pre-scale is needed here.
 
                 # K/V cache reads — KV-shared layers point at the source layer's cache.
                 kv_slot_off_read = self._kv_slot_for_layer[kv_layer_for_attn] * self.MAX_CONTEXT_SIZE * self.k_size
                 kv_k_base = self.LAYER0_K_ROPE_DRAM + kv_slot_off_read
                 kv_v_base = self.LAYER0_V_DRAM + kv_slot_off_read
 
-                # §7c: gather this layer's K/V into the FIXED FLASH_K/V buffers for
-                # BOTH full and sliding geometries (PBI strided copy — runtime trip
-                # gpr_gather_n = aligned_seq_len, compile-time template MAX_CONTEXT —
-                # replacing the old unrolled MAX_CONTEXT loop), so ONE shared
-                # subroutine per geometry can read fixed addresses. Cache stride =
-                # k_size per token; FLASH_K/V are dense at cur_head_dim*bpe. Cache
-                # rows past decode_pos are zero (run_prefill) so attention bias masks
-                # them. FLASH_K/V are prefill-sized (prefill_aligned =
-                # prefill_max*group_size rows ≫ MAX_CONTEXT), so the head_dim=512 full
-                # gather fits with room to spare.
+                # Gather this layer's K/V into the FIXED FLASH_K/V buffers. Runtime
+                # trip count is the aligned decode context length; cache rows past
+                # decode_pos are zero and the full-matrix bias masks them.
                 _dhb = cur_head_dim * self.bytes_per_element
                 self._emit_strided_copy_pbi(
                     kv_k_base, self.LAYER0_FLASH_K_DRAM, cur_head_dim,
-                    self.k_size, _dhb, self.MAX_CONTEXT_SIZE, gpr_gather_n, sram_addr=0x10000)
+                    self.k_size, _dhb, self.MAX_CONTEXT_SIZE, self.gpr_aligned_seq_len, sram_addr=0x10000)
                 self._emit_strided_copy_pbi(
                     kv_v_base, self.LAYER0_FLASH_V_DRAM, cur_head_dim,
-                    self.k_size, _dhb, self.MAX_CONTEXT_SIZE, gpr_gather_n, sram_addr=0x20000)
-                # Scaled dot-product attention for this layer's single KV head,
-                # called inline via unified_attention_core (replaces the old
-                # decoder_group_attention_core subroutine + JUMP_ABS call-site).
-                # num_kv=1 → the Q group is already at FLASH_Q and the call
-                # writes FLASH_OUTPUT directly (no marshalling). Same
-                # full-vs-sliding bias selection as compile_prefill; gpr_gather_n
-                # (computed on-chip above from gpr_bucket_idx) already holds the
-                # dynamic aligned_seq_len for both geometries.
-                dec_bias_addr_layer = (self.LAYER0_FLASH_BIAS_FULL_DRAM
-                                        if layer_idx in self._full_attention_layers
-                                        else self.LAYER0_FLASH_BIAS_SLIDING_DRAM)
-                attn_result = self.unified_attention_core(
+                    self.k_size, _dhb, self.MAX_CONTEXT_SIZE, self.gpr_aligned_seq_len, sram_addr=0x20000)
+
+                # unified_attention_core uses bias_mode="full_matrix"; run_decoder
+                # uploads group_size identical bias rows for this call.
+                bias_addr_layer = (self.LAYER0_FLASH_BIAS_FULL_DRAM
+                                   if layer_idx in self._full_attention_layers
+                                   else self.LAYER0_FLASH_BIAS_SLIDING_DRAM)
+                total_flops += self.unified_attention_core(
                     batch=self.group_size,
-                    aligned_seq_len=self.MAX_CONTEXT_SIZE,
+                    aligned_seq_len=seq_len,
                     head_dim=cur_head_dim,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
                     K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
                     V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    BIAS_DRAM_ADDR=dec_bias_addr_layer,
+                    BIAS_DRAM_ADDR=bias_addr_layer,
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    gpr_aligned_seq_len_reg=gpr_gather_n,
+                    gpr_batch_reg=gpr_group_size,
+                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                    q_scale=1.0,
                 )
-                total_flops += attn_result or 0
                 # O projection: INT4, K=cur_q_size (actual per-layer attention output dim)
                 total_flops += self.quantized_matmat_core(M=1, K=cur_q_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
@@ -8049,6 +8089,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             # subsequent step the program self-increments.
             self.generate_instruction_add_inc(self.gpr_seq_len)
             self.generate_instruction_halt()
+            self.release_isa_reg()  # gpr_group_size
+            self.release_isa_reg()  # gpr_one
             instr_count = self.capture_count - count_at_start
             _original_print(f"    decoder segment ({instr_count} instr) done in {time.perf_counter()-seg_t0:.1f}s")
         program_sizes = [instr_count * 32]
@@ -8059,7 +8101,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     # ------------------------------------------------------------------
     # Single-pass unified instruction bin
     # ------------------------------------------------------------------
-    # Captures LM (prefill+decode buckets) + vision encoder + audio
+    # Captures LM (prefill+decode) + vision encoder + audio
     # encoder into ONE start_capture/stop_capture session. The resulting
     # programs.bin is a self-contained artifact that the
     # customer-facing run_from_bin script consumes directly: no
@@ -8236,7 +8278,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _original_print(f"  [prefill] {prefill_size_bytes/1024:.1f} KB "
                         f"({time.perf_counter()-t0:.1f}s)")
 
-        # Dynamic PBI: single decoder program (bucket dispatcher at execute time).
+        # Dynamic PBI: single decoder program.
         decoder_count_at_start = self.capture_count
         _original_print(f"[instr-bin] Compiling 1 decoder program (dynamic PBI)...")
         _t_dec = time.perf_counter()
@@ -8281,19 +8323,43 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.clear_capture_buffer()
             self.start_capture()
             self._oneshot_mode = True
-            # §7g: vision attention now calls unified_attention_core inline per
-            # head (replaces the old shared flash_attention_core subroutine +
-            # JUMP_ABS call-site pattern — same migration as the LM path; see
-            # run_vision_attention_all_heads). _vis_s7 just gates that code path.
+            # §7g: vision attention is emitted INLINE per head via
+            # unified_attention_core (see run_vision_attention_all_heads).
+            # No shared-subroutine setup / post-HALT body / JUMP back-patching.
             self._vis_s7 = True
             t_vis = time.perf_counter()
+            _l0_ckpt = os.environ.get("GEMMA4_VIS_L0_CKPT") == "1"
+            _l0_elems = self._vis_num_patches * self.VIS_H
             try:
                 for li in range(self.VIS_LAYERS):
                     t_layer = time.perf_counter()
                     self.compile_vision_layer(li)
+                    if li == 0 and _l0_ckpt:  # snapshot projection/norm boundary before RoPE/attention
+                        self._emit_sram_copy_chunked(self.VIS_NORM_OUT, self.VIS_L0_BEFORE_ATTN, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_Q_DRAM, self.VIS_L0_QPROJ, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_K_DRAM, self.VIS_L0_KPROJ, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_V_DRAM, self.VIS_L0_VPROJ, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_Q_NORM, self.VIS_L0_QPRE, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_K_NORM, self.VIS_L0_KPRE, _l0_elems)
                     self.host_vision_v_norm_rope_gather(li)
+                    if li == 0 and _l0_ckpt:  # snapshot RoPE/transpose boundary before attention
+                        _hm_elems = self.VIS_HEADS * self._vis_aligned_S * self.VIS_HEAD_DIM
+                        self._emit_sram_copy_chunked(self.VIS_V_DRAM, self.VIS_L0_VNORM, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_Q_NORM, self.VIS_L0_ROPE_Q, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_K_NORM, self.VIS_L0_ROPE_K, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_FLASH_Q_HM, self.VIS_L0_Q_HM, _hm_elems)
+                        self._emit_sram_copy_chunked(self.VIS_FLASH_K_HM, self.VIS_L0_K_HM, _hm_elems)
+                        self._emit_sram_copy_chunked(self.VIS_FLASH_V_HM, self.VIS_L0_V_HM, _hm_elems)
                     self.run_vision_attention_all_heads(li)
+                    if li == 0 and _l0_ckpt:  # snapshot attention output before and after inverse transpose
+                        self._emit_sram_copy_chunked(self.VIS_FLASH_OUT_HM, self.VIS_L0_ATTN_OUT_HM, _hm_elems)
+                        self._emit_sram_copy_chunked(self.VIS_Q_DRAM, self.VIS_L0_ATTN_CORE, _l0_elems)
                     self.compile_vision_layer_post_attn(li)
+                    if li == 0 and _l0_ckpt:  # snapshot attn-block output (after o_proj) + layer-0 output
+                        self._emit_sram_copy_chunked(self.VIS_ATTN_OUT, self.VIS_L0_AFTER_ATTN, _l0_elems)
+                        self._emit_sram_copy_chunked(self.VIS_IO_B, self.VIS_L0_END, _l0_elems)
+                        _original_print("  [vision] --layer0: stopping after layer 0 (HALT baked, layers 1-15 skipped)")
+                        break
                     _original_print(f"  [vision layer {li+1}/{self.VIS_LAYERS}] "
                                     f"{time.perf_counter()-t_layer:.2f}s")
                 self.generate_instruction_halt()
@@ -8834,10 +8900,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         kv_zero_pad = torch.zeros(kv_slot_elems, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
-        # Re-DMA the identity matrix (decoder_attention_core reads it for
-        # the I @ V^T step). Done AFTER the K/V zeros so accidental adjacent
-        # buffer overflow from those big DMAs cannot clobber IDENTITY.
-        # Re-zero the flash-attention Q/K/V gather buffers (tensor_init does this).
+        # Re-DMA the identity matrix used by transpose/matmul helper kernels.
+        # Done AFTER the K/V zeros so accidental adjacent buffer overflow from
+        # those big DMAs cannot clobber IDENTITY.
+        # Re-zero the attention Q/K/V gather buffers (tensor_init does this).
         # Decoder writes them per gather but LM prefill's per-token loops at
         # template_seq_len assume zero-padding for rows past actual_seq_len.
         try:
@@ -8870,9 +8936,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         Single decoder program — same address every token. gpr_seq_len is
         primed ONCE before the first decode step to the current decode_pos
         (= prompt length); the captured program's trailing add_inc(gpr_seq_len)
-        advances it automatically for subsequent tokens. gpr_bucket_idx is
-        re-set each step (K context length grows by 1 token, may cross a
-        UE_VECTOR_SIZE boundary).
+        advances it automatically for subsequent tokens. gpr_aligned_seq_len
+        is re-set each step because K context length grows by 1 token and may
+        cross a UE_VECTOR_SIZE boundary.
         """
         if token_id is None:
             print("No last token available for decode.")
@@ -8958,32 +9024,27 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.seq_len += 1
             decode_pos = self.seq_len - 1               # 0-based pos of token now being computed
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
-            dec_bucket_idx = aligned_seq_len // UE_VECTOR_SIZE  # 1-based
 
-            # Re-set gpr_bucket_idx each step (K context length grows).
-            self._isa_add_set_core(self.gpr_bucket_idx, dec_bucket_idx)
+            # Re-set the dynamic attention length each step (K context grows).
+            self._isa_add_set_core(self.gpr_aligned_seq_len, aligned_seq_len)
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
             per_layer_inputs = self._compute_per_layer_inputs([token_id], embedding_tensor)
             self.dma_to_accelerator_memory(self.PER_LAYER_INPUTS_DRAM, per_layer_inputs.permute(1, 0, 2).contiguous())
 
-            # Build BOTH decode bias rows. unified_attention_core's dynamic path
-            # always uses bias_mode="full_matrix" (one bias row per batch item);
-            # the decoder attention call's batch=group_size query heads all share
-            # the same causal (/ sliding-window) mask, so replicate the single
-            # mask row group_size times before DMA — otherwise heads 2..N would
-            # silently read stale/uninitialized DRAM as their mask.
-            full_bias_row = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
-            full_bias_row[0, :self.seq_len] = 0.0
-            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, full_bias_row.repeat(self.group_size, 1))
+            # Build BOTH decode bias matrices. unified_attention_core uses
+            # bias_mode="full_matrix", and decoder batch is group_size Q heads.
+            full_bias_row = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+            full_bias_row[:, :self.seq_len] = 0.0
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, full_bias_row)
             if self.seq_len <= self.sliding_window:
                 sliding_bias_row = full_bias_row
             else:
-                sliding_bias_row = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+                sliding_bias_row = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
                 window_start = self.seq_len - self.sliding_window
-                sliding_bias_row[0, window_start:self.seq_len] = 0.0
-            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias_row.repeat(self.group_size, 1))
+                sliding_bias_row[:, window_start:self.seq_len] = 0.0
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias_row)
 
             # On-FPGA penalty: refresh THIS step's per-vocab bias (the LM-head
             # matmul's C term) once past the greedy gate, so the HW argmax of
@@ -9031,7 +9092,22 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Gemma4 E2B layer-0 prefill: run on accelerator, verify with torch ref.")
+    parser = argparse.ArgumentParser(
+        description="Gemma4 E2B layer-0 prefill: run on accelerator, verify with torch ref.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  python gemma4_e2b_test.py                                 # LM, default prompt
+  python gemma4_e2b_test.py --prompt "your prompt"          # LM, custom prompt
+  python gemma4_e2b_test.py --image path/to/image.jpg --prompt "What is in this image?"
+  python gemma4_e2b_test.py --vision-enable                 # default image, vision encoder on FPGA
+  python gemma4_e2b_test.py --audio-enable                  # default audio, audio encoder on FPGA
+  python gemma4_e2b_test.py --dev xdma1 --vision-enable
+
+defaults (sample files in repo-root test_samples/):
+  LM prompt: "Tell me about the Eiffel Tower. What year was it built?"
+             (pre-tokenized as default_prefill_tokens in gemma4_e2b_config.json)
+  image: yosemite.jpg (default vision prompt: "Describe this image in detail.")
+  audio: apex.wav     (default audio prompt: "Describe what you hear.")""")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt. Default is a built-in prompt per mode "
                              "(LM: a test question; VLM: 'Describe this image in detail.'; "
@@ -9216,21 +9292,15 @@ def main():
         print(f"  text: (decode failed: {_e})")
     print(f"--- Prompt end ---")
     timer=time.perf_counter()
-    try:
-        latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
-        latency_prefill = time.perf_counter() - timer
-        print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
+    latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
+    latency_prefill = time.perf_counter() - timer
+    print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
-        timer=time.perf_counter()
-        token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
-        latency_decoder = time.perf_counter() - timer
-        print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(ue.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
-        print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} Gflops")
-    finally:
-        # Clear DRAM on EVERY exit (normal, Ctrl-C, timeout, exception) — §8b. A
-        # decode killed mid-run otherwise leaves stale scratch/KV → the next run
-        # sees all-`!` / a ~400 max|d| compare floor (fpga_compare_clear_dram_oracle).
-        ue.clear_dram()
+    timer=time.perf_counter()
+    token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
+    latency_decoder = time.perf_counter() - timer
+    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(ue.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
+    print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} Gflops")
     print("Gemma4 E2B test ends.")
 
 if __name__ == "__main__":

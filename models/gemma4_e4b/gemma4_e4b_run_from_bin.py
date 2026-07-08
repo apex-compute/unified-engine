@@ -107,7 +107,7 @@ from transformers import AutoTokenizer
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, URAM_NEAR_FULL_SIZE, URAM_START_ADDR, URAM_SECTION, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, URAM_NEAR_FULL_SIZE, URAM_START_ADDR, URAM_SECTION, set_dma_device
 from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 
@@ -341,7 +341,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.gpr_seq_len    = fixed["GPR_SEQ_LEN_REG"]
         self.gpr_q_seq_len  = fixed["GPR_Q_SEQ_LEN_REG"]
         self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
-        self._isa_reg_counter = 5
+        self.gpr_aligned_seq_len = fixed["GPR_ALIGNED_SEQ_LEN_REG"]
+        self._isa_reg_counter = 6
         self.causal_mask_upper = False
         # VLM image-block bidirectional opening: only when HF text_config has
         # use_bidirectional_attention == "vision" (larger Gemma4 models). E4B
@@ -1176,14 +1177,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         params_dram_addr = self._next_params_dram_addr
         self._next_params_dram_addr += size_bytes
         return params_dram_addr
-
-    def clear_inst_id(self) -> None:
-        """Reset instruction ID counter for the next capture."""
-        self._inst_id = 0
-
-    def get_arg_max_index(self) -> int:
-        """Get the arg max index from the Unified Engine"""
-        return self.read_reg32(UE_ARGMAX_INDEX)
 
     # ---- On-FPGA repetition penalty (llama3.2_1b mechanism, default OFF) -----
     # The LM-head matmul (baked in the bin) adds PENALTY_BIAS_DRAM as its C term;
@@ -6485,6 +6478,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.isa_add_set_core(self.gpr_seq_len,    seq_len)
         self.isa_add_set_core(self.gpr_q_seq_len,  q_seq_len)
         self.isa_add_set_core(self.gpr_bucket_idx, bucket_idx)
+        self.isa_add_set_core(self.gpr_aligned_seq_len, aligned_seq_len)
 
         print(f"[Prefill] [exec] launching prefill program on FPGA ({seq_len} tokens, {self.LAYER_SIZE} layers)...", flush=True)
         # Heartbeat thread: program_execute blocks until the FPGA halts, with no
@@ -7302,6 +7296,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
             dec_bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
             self.isa_add_set_core(self.gpr_bucket_idx, dec_bucket_idx)
+            self.isa_add_set_core(self.gpr_aligned_seq_len, aligned_seq_len)
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
@@ -7564,4 +7559,10 @@ def main():
     print("Gemma4 E4B test ends.")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "DEPRECATED / OUTDATED: gemma4_e4b_run_from_bin.py is no longer runnable. It "
+        "still calls flash_attention_core / decoder_group_attention_core, which were "
+        "removed from user_dma_core.py during the unified_attention_core migration, so "
+        "its compile paths reference methods that no longer exist. Use the migrated "
+        "gemma4_e4b_test.py (unified_attention_core) instead."
+    )
