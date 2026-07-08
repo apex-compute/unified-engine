@@ -55,9 +55,34 @@ def if4_fake_quantize(w: torch.Tensor) -> torch.Tensor:
     return dequant.to(orig_dtype).reshape(orig_shape)
 
 
+def _quantize_kernel_if4(w: torch.Tensor) -> torch.Tensor:
+    """Fake-quantize a JAX-style kernel (..., K_leading_dims, N) the way the
+    hardware actually does: weight_init always reshapes to (K, N) then
+    transposes to (N, K) before calling the real IF4 packer, so blocks of 64
+    are grouped along the REDUCTION axis K. Calling if4_fake_quantize directly
+    on the raw exported shape blocks along whatever axis happens to be last in
+    that shape (almost always N, the output/head axis) -- a real, systematic
+    mismatch versus hardware, not just rounding noise (verified: mean abs diff
+    ~0.0037 on PaliGemma.img.embedding.kernel, values differing well outside
+    bf16 precision). Reshaping to (K,N) then transposing before quantizing,
+    like here, fixes it for every kernel/linear/einsum weight in this file --
+    per-layer/per-head leading dims stay safe to merge into one K-block axis
+    because the true K (the axis adjacent to N) is always a multiple of 64
+    (the IF4 block size), so block boundaries never straddle a layer/head
+    boundary; if4_fake_quantize's own internal zero-padding handles the one
+    exception (patch-embed's K=588) exactly like weight_init's explicit pad."""
+    orig_shape = w.shape
+    N = orig_shape[-1]
+    w2d = w.reshape(-1, N)                      # (K, N)
+    wT = w2d.transpose(0, 1).contiguous()       # (N, K) -- K now last, correct block axis
+    wT_q = if4_fake_quantize(wT)
+    w2d_q = wT_q.transpose(0, 1).contiguous()   # back to (K, N)
+    return w2d_q.reshape(orig_shape)
+
+
 def maybe_quantize(w: torch.Tensor, quant: str) -> torch.Tensor:
     if quant == "if4":
-        return if4_fake_quantize(w)
+        return _quantize_kernel_if4(w)
     return w  # fp32 / bf16 handled by .to(dtype) at load time
 
 
@@ -201,6 +226,86 @@ def vision_encode(images: torch.Tensor, W: Weights) -> torch.Tensor:
     head_b = W["PaliGemma.img.head.bias"]
     x = x @ head_k + head_b  # (n_img, 256, 2048)
     return x
+
+
+def vision_encode_checkpoints(images: torch.Tensor, W: Weights):
+    """Same math as vision_encode, but a generator yielding (name, tensor) at
+    every checkpoint the hardware side (compile_encoder's _debug_op calls)
+    also stops at, in the same order. Used by debug_stepwise.py to compare a
+    single micro-op's hardware output against the matching CPU tensor without
+    re-deriving the whole forward pass by hand. n_img is fixed to 1 here (the
+    debug harness runs one image slot at a time, matching compile_encoder's
+    per-slot compile)."""
+    assert images.shape[0] == 1, "vision_encode_checkpoints: one image slot at a time"
+    patch_size = 14
+    n_side = 224 // patch_size
+    n_patches = n_side * n_side
+
+    kernel = W["PaliGemma.img.embedding.kernel"]
+    bias = W["PaliGemma.img.embedding.bias"]
+    kernel_flat = kernel.reshape(-1, kernel.shape[-1])
+
+    x = images.reshape(1, n_side, patch_size, n_side, patch_size, 3)
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(1, n_patches, patch_size * patch_size * 3)
+    x = x @ kernel_flat + bias
+
+    pos_embed = W["PaliGemma.img.pos_embedding"]
+    x = x + pos_embed
+    yield "patch_embed_pos", x[0]
+
+    depth = 27
+    for layer in range(depth):
+        ln0_s = W["PaliGemma.img.Transformer.encoderblock.LayerNorm_0.scale"][layer]
+        ln0_b = W["PaliGemma.img.Transformer.encoderblock.LayerNorm_0.bias"][layer]
+        h = F.layer_norm(x.float(), (x.shape[-1],), ln0_s.float(), ln0_b.float()).to(x.dtype)
+        yield f"layer{layer}_ln0", h[0]
+
+        q_k = W["PaliGemma.img.Transformer.encoderblock.MultiHeadDotProductAttention_0.query.kernel"][layer]
+        q_b = W["PaliGemma.img.Transformer.encoderblock.MultiHeadDotProductAttention_0.query.bias"][layer]
+        k_k = W["PaliGemma.img.Transformer.encoderblock.MultiHeadDotProductAttention_0.key.kernel"][layer]
+        k_b = W["PaliGemma.img.Transformer.encoderblock.MultiHeadDotProductAttention_0.key.bias"][layer]
+        v_k = W["PaliGemma.img.Transformer.encoderblock.MultiHeadDotProductAttention_0.value.kernel"][layer]
+        v_b = W["PaliGemma.img.Transformer.encoderblock.MultiHeadDotProductAttention_0.value.bias"][layer]
+        o_k = W["PaliGemma.img.Transformer.encoderblock.MultiHeadDotProductAttention_0.out.kernel"][layer]
+        o_b = W["PaliGemma.img.Transformer.encoderblock.MultiHeadDotProductAttention_0.out.bias"][layer]
+
+        q = torch.einsum("ntd,dhk->nthk", h, q_k) + q_b
+        k = torch.einsum("ntd,dhk->nthk", h, k_k) + k_b
+        v = torch.einsum("ntd,dhk->nthk", h, v_k) + v_b
+        q, k, v = (t.permute(0, 2, 1, 3) for t in (q, k, v))
+
+        attn = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+        attn = attn.permute(0, 2, 1, 3).to(x.dtype)
+        attn_out = torch.einsum("nthk,hkd->ntd", attn, o_k) + o_b
+        yield f"layer{layer}_o_proj", attn_out[0]
+
+        x = x + attn_out
+        yield f"layer{layer}_residual1", x[0]
+
+        ln1_s = W["PaliGemma.img.Transformer.encoderblock.LayerNorm_1.scale"][layer]
+        ln1_b = W["PaliGemma.img.Transformer.encoderblock.LayerNorm_1.bias"][layer]
+        h2 = F.layer_norm(x.float(), (x.shape[-1],), ln1_s.float(), ln1_b.float()).to(x.dtype)
+        yield f"layer{layer}_ln1", h2[0]
+
+        d0_k = W["PaliGemma.img.Transformer.encoderblock.MlpBlock_0.Dense_0.kernel"][layer]
+        d0_b = W["PaliGemma.img.Transformer.encoderblock.MlpBlock_0.Dense_0.bias"][layer]
+        d1_k = W["PaliGemma.img.Transformer.encoderblock.MlpBlock_0.Dense_1.kernel"][layer]
+        d1_b = W["PaliGemma.img.Transformer.encoderblock.MlpBlock_0.Dense_1.bias"][layer]
+        mlp_out = F.gelu(h2 @ d0_k + d0_b, approximate="tanh") @ d1_k + d1_b
+        yield f"layer{layer}_mlp_out", mlp_out[0]
+
+        x = x + mlp_out
+        yield f"layer{layer}_residual2", x[0]
+
+    enc_norm_s = W["PaliGemma.img.Transformer.encoder_norm.scale"]
+    enc_norm_b = W["PaliGemma.img.Transformer.encoder_norm.bias"]
+    x = F.layer_norm(x.float(), (x.shape[-1],), enc_norm_s.float(), enc_norm_b.float()).to(x.dtype)
+    yield "encoder_norm", x[0]
+
+    head_k = W["PaliGemma.img.head.kernel"]
+    head_b = W["PaliGemma.img.head.bias"]
+    x = x @ head_k + head_b
+    yield "head_out", x[0]
 
 
 # ---------------------------------------------------------------------------
