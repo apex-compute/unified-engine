@@ -12,6 +12,7 @@ Usage:
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -81,6 +82,22 @@ def randomize_dram(seed: int = 0, dev: str = "xdma0",
 # Each entry: script (relative to SCRIPT_DIR), optional prompt override,
 # and a pass_check callable: (decoded_text: str) -> (passed: bool, reason: str)
 # ---------------------------------------------------------------------------
+def _test_result_field(text, key):
+    """Pull `key` out of a `TEST_RESULT: {json}` line in the model's stdout, or None.
+
+    Model scripts that emit this line hand the harness a structured result to check
+    against instead of scraping free-form stdout. Returns None when there is no such
+    line or it doesn't parse.
+    """
+    for line in text.splitlines():
+        if line.startswith("TEST_RESULT:"):
+            try:
+                return json.loads(line[len("TEST_RESULT:"):].strip()).get(key)
+            except (json.JSONDecodeError, AttributeError):
+                return None
+    return None
+
+
 def _check_x_equals_2(text):
     found = bool(re.search(r"x\s*=\s*2", text))
     return found, (
@@ -105,6 +122,77 @@ def _check_smolvlm2(text):
         if found
         else f"did not find 'Paris' in decoded output: {text[:120]!r}"
     )
+
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+def _extract_decode_text(text):
+    """Return streamed generated text between Gemma-style decode markers."""
+    marker = "------------------------------ DECODE START ------------------------------"
+    if marker not in text:
+        return ""
+    decoded = text.split(marker, 1)[1]
+    for stop in ("\nDecode speed:", "\nStop token ", "\nDecoder done in"):
+        if stop in decoded:
+            decoded = decoded.split(stop, 1)[0]
+            break
+    return _ANSI_RE.sub("", decoded).strip()
+
+def _check_coherent_decode_text(text):
+    decoded = _extract_decode_text(text)
+    if not decoded:
+        return False, "no decoded text found after DECODE START"
+
+    words = re.findall(r"[A-Za-z][A-Za-z']{1,}", decoded)
+    unique_words = {w.lower() for w in words if len(w) >= 3}
+    longest_char_run = max((len(m.group(0)) for m in re.finditer(r"(.)\1{3,}", decoded)), default=0)
+    pipe_count = decoded.count("|")
+    alpha_ratio = (
+        sum(ch.isalpha() for ch in decoded) / max(1, len(decoded))
+    )
+
+    coherent = (
+        len(words) >= 8
+        and len(unique_words) >= 5
+        and alpha_ratio >= 0.35
+        and longest_char_run <= 24
+        and pipe_count <= max(3, len(decoded) // 40)
+    )
+    preview = decoded[:120].replace("\n", " ")
+    return coherent, (
+        f"coherent decoded text found: {preview!r}"
+        if coherent
+        else (
+            "decoded text did not look coherent "
+            f"(words={len(words)}, unique={len(unique_words)}, "
+            f"alpha_ratio={alpha_ratio:.2f}, longest_run={longest_char_run}, "
+            f"pipes={pipe_count}): {preview!r}"
+        )
+    )
+
+def _check_gemma4_vlm_keywords(text, model_name):
+    coherent, reason = _check_coherent_decode_text(text)
+    if not coherent:
+        return False, reason
+
+    decoded = _extract_decode_text(text)
+    required_keywords = ("landscape", "lighting", "sun", "horizon")
+    missing = [
+        kw for kw in required_keywords
+        if not re.search(rf"\b{re.escape(kw)}\b", decoded, re.IGNORECASE)
+    ]
+    if missing:
+        preview = decoded[:120].replace("\n", " ")
+        return False, (
+            f"missing {model_name} VLM keyword(s): {', '.join(missing)}; "
+            f"decoded preview: {preview!r}"
+        )
+    return True, f"{reason}; found keywords: {', '.join(required_keywords)}"
+
+def _check_gemma4_e2b_vlm(text):
+    return _check_gemma4_vlm_keywords(text, "E2B")
+
+def _check_gemma4_e4b_vlm(text):
+    return _check_gemma4_vlm_keywords(text, "E4B")
 
 def _check_locateanything(text):
     n_boxes = len(re.findall(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", text))
@@ -133,10 +221,21 @@ def _check_mbv2_224(text):
     )
 
 def _check_mbv2_ssd(text):
-    # vette.jpg should produce at least one detection
-    found = text.strip() != "(no detections)"
+    # vette.jpg should produce >=1 detection. The model emits a TEST_RESULT line whose
+    # n_detections/decoded_text carry the real result; key on that instead of the raw
+    # stdout (which is hundreds of lines and never equals "(no detections)" exactly).
+    n = _test_result_field(text, "n_detections")
+    labels = _test_result_field(text, "decoded_text")
+    if n is not None:
+        return n > 0, (
+            f"{n} detection(s): {labels}"
+            if n > 0
+            else "no detections above threshold"
+        )
+    # Fallback (no TEST_RESULT): look for a printed detection row like "  73.2%  car".
+    found = bool(re.search(r"\d+\.\d\s*%\s+\S", text))
     return found, (
-        f"detections found: {text}"
+        "detection row found in output"
         if found
         else "no detections above threshold"
     )
@@ -149,8 +248,11 @@ TESTS = [
     # gemma3 has no run_from_bin yet — uses the _test.py entry point (like gpt2);
     # swap to gemma3_run_from_bin.py once it exists.
     {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "gemma4_e2b",  "script": "models/gemma4_e2b/gemma4_e2b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    # Gemma4 run_from_bin entry points are deprecated in this branch; run the
+    # migrated tests in VLM mode with their built-in default image/prompt and
+    # check that the generated decode is coherent text.
+    {"name": "gemma4_e2b",  "script": "models/gemma4_e2b/gemma4_e2b_test.py",           "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
+    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
@@ -176,10 +278,11 @@ TESTS = [
     {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
 
     # Encoder models take no --prompt and emit non-LM output (ASR transcription /
-    # segmentation). Use the _test.py entry points for this round; checks are lenient
-    # (non-empty == the model didn't crash / NaN-out on poisoned DRAM).
-    {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",                "pass_check": _check_parakeet},
-    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",              "pass_check": _check_nonempty},
+    # segmentation). They PREFER their run_from_bin entry point; resolve_script() falls
+    # back to the sibling _test.py automatically when no compiled programs.bin exists.
+    # swin has no run_from_bin yet, so it always uses _test.py.
+    {"name": "parakeet",  "script": "models/parakeet/parakeet_run_from_bin.py",        "pass_check": _check_parakeet},
+    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_run_from_bin.py",      "pass_check": _check_nonempty},
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_nonempty},
 ]
 
@@ -208,27 +311,92 @@ def reset_device(dev: str = "xdma0") -> None:
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_test(test: dict, verbose: bool = False) -> dict:
+def _script_supports_flag(script_path: str, flag: str) -> bool:
+    """True when the model script declares `flag` in its own argparse.
+
+    Not every entry point accepts --dev / --device yet (e.g. the qwen3.5_2b and
+    gemma4 run_from_bin runners), and argparse hard-fails on unknown flags, so the
+    harness forwards a flag only after sniffing the script source for the quoted
+    literal ('--dev' won't false-match '--device' because the closing quote is
+    part of the pattern).
+    """
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="ignore") as f:
+            src = f.read()
+    except OSError:
+        return False
+    return f"'{flag}'" in src or f'"{flag}"' in src
+
+
+def resolve_script(rel_script: str):
+    """Pick the script to actually run, implementing the rule
+    'compiled bins present -> run_from_bin; otherwise -> _test.py'.
+
+    A *_run_from_bin.py entry point loads a pre-compiled programs.bin and cannot
+    recompile, so when that bin is absent we fall back to the sibling *_test.py, which
+    regenerates every artifact on the fly. Returns (chosen_rel_script, note): note is
+    None when the preferred script is kept, else a human-readable downgrade reason.
+    """
+    suffix = "_run_from_bin.py"
+    if rel_script.endswith(suffix):
+        base = rel_script[: -len(suffix)]                  # models/<X>/<X>
+        name = os.path.basename(base)                      # <X>
+        programs = os.path.join(SCRIPT_DIR, os.path.dirname(rel_script),
+                                f"{name}_bin", "programs.bin")
+        if not os.path.isfile(programs):
+            test_py = base + "_test.py"
+            if os.path.isfile(os.path.join(SCRIPT_DIR, test_py)):
+                return test_py, (
+                    f"no compiled {name}_bin/programs.bin — "
+                    f"falling back to {os.path.basename(test_py)}"
+                )
+    return rel_script, None
+
+
+def run_test(test: dict, verbose: bool = False,
+             dev: str = None, device: str = None) -> dict:
     """Run one model test as a subprocess.
 
     verbose=True  — stream the model's stdout live, as it prints (tee to console).
     verbose=False — show only the banner + verdict; the model's own run log is
                     captured for parsing but not echoed.
+    dev / device  — DMA device name / FPGA board profile, forwarded as --dev /
+                    --device to model scripts that declare the flag (see
+                    _script_supports_flag). None means don't forward.
     """
-    script = os.path.join(SCRIPT_DIR, test["script"])
+    rel_script, resolve_note = resolve_script(test["script"])
+    script = os.path.join(SCRIPT_DIR, rel_script)
     # -u: force the child's stdout unbuffered so verbose mode streams live
     # instead of arriving in big blocks (its stdout is a pipe, not a TTY).
     cmd = [sys.executable, "-u", script]
     if test.get("prompt"):
         cmd += ["--prompt", test["prompt"]]
     cmd += test.get("extra_args", [])
-    if test.get("dev_arg"):
-        cmd += ["--dev", DMA_DEV]
+    unsupported = []
+    for flag, value in (("--dev", dev), ("--device", device)):
+        if value is None:
+            continue
+        if _script_supports_flag(script, flag):
+            cmd += [flag, value]
+        else:
+            unsupported.append(f"{flag} {value}")
 
     print(f"\n{'='*60}")
     print(f"Running test : {test['name']}")
-    print(f"Script       : {test['script']}")
-    if test.get("prompt"):
+    print(f"Script       : {rel_script}")
+    display_cmd = [os.path.basename(sys.executable), "-u", rel_script] + cmd[3:]
+    print(f"Command      : {shlex.join(display_cmd)}")
+    if test.get("mode"):
+        print(f"Mode         : {test['mode']}")
+    if test.get("image"):
+        print(f"Image        : {test['image']}")
+    if test.get("prompt_desc"):
+        print(f"Prompt       : {test['prompt_desc']}")
+    if resolve_note:
+        print(f"Note         : {resolve_note}")
+    if unsupported:
+        print(f"Note         : script does not accept {', '.join(unsupported)} — not forwarded")
+    if test.get("prompt") and not test.get("prompt_desc"):
         print(f"Prompt       : {test['prompt']}")
     print(f"{'='*60}\n", flush=True)
 
@@ -237,7 +405,7 @@ def run_test(test: dict, verbose: bool = False) -> dict:
     # subprocess entry point is no longer present.
     if not os.path.isfile(script):
         result = _parse_output(test, "", 1, 0.0)
-        result["pass_reason"] = f"model script not found: {test['script']}"
+        result["pass_reason"] = f"model script not found: {rel_script}"
         return result
 
     # Poison the full 4 GiB DRAM BEFORE the model runs, so loading
@@ -288,7 +456,7 @@ def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> d
         "name": test["name"],
         "returncode": returncode,
         "elapsed_s": elapsed,
-        "prefill_text": test.get("prompt", "(default)"),
+        "prefill_text": test.get("prompt") or test.get("prompt_desc", "(default)"),
         "prefill_tokens": None,
         "decoded_text": "",
         "decoded_tokens": None,
@@ -319,6 +487,8 @@ def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> d
     # Pass check — run against the FULL captured stdout, not just the parsed
     # TEST_RESULT json. Most models don't emit a TEST_RESULT line yet, so stdout
     # (which contains the live-streamed decoded text) is the source of truth.
+    if not result["decoded_text"]:
+        result["decoded_text"] = _extract_decode_text(stdout)
     check_text = stdout or result["decoded_text"]
     if returncode != 0:
         result["passed"] = False
@@ -408,6 +578,7 @@ def write_summary(results: list, output_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    global DMA_DEV
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="+", metavar="NAME", help="Run only these named tests")
@@ -415,7 +586,19 @@ def main():
                     help="Stream each model's live stdout as it runs (full run log)")
     ap.add_argument("--list-names", action="store_true",
                     help="Print the registered test names (space-separated) and exit")
+    ap.add_argument("--dev", type=str, default=DMA_DEV,
+                    help="DMA device name (e.g., xdma0, xdma1). Used for the harness's "
+                         "own reset / DRAM poisoning and forwarded to model scripts "
+                         f"that accept --dev. Default: {DMA_DEV} (env DMA_DEV)")
+    ap.add_argument("--device", type=str, default=None,
+                    help="FPGA board / bitstream profile (kintex7, rk, puzhi, bittware, "
+                         "bittware_256, alveo): affects UE_AXI_DATA_WIDTH_BITS and default "
+                         "--cycle. Forwarded to model scripts that accept --device only when "
+                         "explicitly provided.")
     args = ap.parse_args()
+
+    # --dev also selects the device the harness itself resets and poisons.
+    DMA_DEV = args.dev
 
     if args.list_names:
         print(" ".join(t["name"] for t in TESTS))
@@ -436,10 +619,11 @@ def main():
         tests = TESTS
 
     # Initialize the FPGA once before running any model (software reset).
-    reset_device()
+    reset_device(DMA_DEV)
 
     for test in tests:
-        result = run_test(test, verbose=args.verbose)
+        result = run_test(test, verbose=args.verbose,
+                          dev=args.dev, device=args.device)
         results.append(result)
         status = "PASS" if result["passed"] else "FAIL"
         print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}\n")
