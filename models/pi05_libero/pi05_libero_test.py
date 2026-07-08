@@ -59,6 +59,13 @@ HF_MODEL_REPO = _CFG["paths"].get("hf_model_repo")
 IS_VLM = True
 
 
+class _DebugStop(Exception):
+    """Raised by Pi05Libero_UnifiedEngine._debug_op to unwind out of a compile_*
+    method once the configured DEBUG_STOP_AFTER checkpoint has been emitted +
+    halted, so only a partial (but valid, halted) program gets captured."""
+    pass
+
+
 def init_hang_prevention(ue):
     """5-step hardware clear. MUST stay identical to run_from_bin.py (see skill gotchas)."""
     halt = bytes(64)
@@ -81,6 +88,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     OPS               = _cfg["ops"]
     LM_QUANT          = _cfg["ops"]["lm_quant"]
 
+    # Stepwise micro-op debug mode (see debug_stepwise.py): None = normal full
+    # compile. Set to an int N (or via env var PI05_DEBUG_STOP_AFTER) to halt
+    # the program immediately after the Nth _debug_op() checkpoint is emitted,
+    # instead of compiling the whole thing -- lets us DMA-read that op's exact
+    # HW output and assert it against a CPU reference before trusting the next
+    # op. Move N up one at a time as each checkpoint passes.
+    DEBUG_STOP_AFTER = None
+
     def __init__(self, script_dir=None, **kw):
         layout = self._cfg["dram_layout"]
         kw.setdefault("params_dram_base", int(layout["params_dram_base"], 16))
@@ -88,6 +103,26 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         kw.setdefault("program_dram_base", int(layout["program_dram_base"], 16))
         super().__init__(**kw)
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+        env_stop = os.environ.get("PI05_DEBUG_STOP_AFTER")
+        if env_stop is not None:
+            self.DEBUG_STOP_AFTER = int(env_stop)
+        self._debug_counter = 0
+        self._debug_halt_info = None
+
+    def _debug_op(self, name, dram_addr, numel, shape=None):
+        """Call after emitting each op worth independently verifying. Assigns
+        the next checkpoint index; if it matches DEBUG_STOP_AFTER, halts the
+        program right here and raises _DebugStop so the caller's compile_*
+        method unwinds early (catch it around the main body, then fall through
+        to whatever finalization/subroutine-compile code normally follows)."""
+        idx = self._debug_counter
+        self._debug_counter += 1
+        if self.DEBUG_STOP_AFTER is not None and idx == self.DEBUG_STOP_AFTER:
+            self.generate_instruction_halt()
+            self._debug_halt_info = {"idx": idx, "name": name, "addr": dram_addr,
+                                      "numel": numel, "shape": shape}
+            raise _DebugStop()
+        return idx
 
     # ---- weights -----------------------------------------------------------
     def weight_init(self):
@@ -297,16 +332,31 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             o_2d = o_all[l].reshape(NH * D, H).transpose(0, 1)   # (2048, 2048) = (N=d_out, K=heads*hd)
             la["o_scale"], la["o_data"] = self._quant_store(o_2d)
 
-            gate_2d = gate_up_all[l, 0].transpose(0, 1)   # (2048,16384) in,out -> (16384,2048)
+            # Gated MLP, split gate/up/down into two FF_HALF=8192-wide halves each --
+            # NOT for correctness (gate/up's own N=16384 already fits matmat_mul_core_pbi
+            # fine) but so down_proj's K=16384 input is available as two ALREADY-
+            # SEPARATE, naturally-contiguous FF_HALF buffers from the moment they're
+            # written, with no strided/gather DMA extraction step needed afterward.
+            # matmat_mul_core_pbi asserts K*16 <= URAM_NEAR_FULL_ELEMENTS; K=16384
+            # fails that (16384*16=262144 > 262080) so down_proj genuinely cannot run
+            # as one full-K matmul (confirmed via the assertion firing when tried).
+            # The old fix materialized the two K-halves via _dram_split_copy (a
+            # strided per-row column-slice DMA) AFTER computing gate*up at full width
+            # -- that strided copy was the confirmed hang trigger (debug_stepwise_
+            # prefix.py bisection: clean through layer0_mlp_gate_up, hangs at
+            # layer0_mlp_split_copy). This mirrors parakeet_test.py's proven FF_HALF
+            # K-split pattern instead: split gate/up into two N=FF_HALF matmuls FIRST
+            # (each writes its own naturally-separate buffer), multiply each half
+            # independently, then down-project each half (K=FF_HALF, safely under the
+            # URAM cap) and sum the two partial results -- no strided DMA anywhere.
+            gate_2d = gate_up_all[l, 0].transpose(0, 1)   # (16384,2048) = (N,K)
             up_2d = gate_up_all[l, 1].transpose(0, 1)
-            la["gate_scale"], la["gate_data"] = self._quant_store(gate_2d)
-            la["up_scale"], la["up_data"] = self._quant_store(up_2d)
-
-            # down_proj K=16384 exceeds URAM row capacity for a single matmat_mul_core
-            # call (see compile_prefix's K-split note) -> store as two (2048,8192)
-            # K-half blobs, matmul'd separately and eltwise-added back together.
-            down_2d = down_all[l].transpose(0, 1)   # (16384,2048) in,out -> (2048,16384)
-            FF_HALF = down_2d.shape[1] // 2
+            down_2d = down_all[l].transpose(0, 1)         # (2048,16384) = (N,K)
+            FF_HALF = gate_2d.shape[0] // 2
+            la["gate_lo_scale"], la["gate_lo_data"] = self._quant_store(gate_2d[:FF_HALF].contiguous())
+            la["gate_hi_scale"], la["gate_hi_data"] = self._quant_store(gate_2d[FF_HALF:].contiguous())
+            la["up_lo_scale"], la["up_lo_data"] = self._quant_store(up_2d[:FF_HALF].contiguous())
+            la["up_hi_scale"], la["up_hi_data"] = self._quant_store(up_2d[FF_HALF:].contiguous())
             la["down_lo_scale"], la["down_lo_data"] = self._quant_store(down_2d[:, :FF_HALF].contiguous())
             la["down_hi_scale"], la["down_hi_data"] = self._quant_store(down_2d[:, FF_HALF:].contiguous())
 
@@ -348,9 +398,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_OUT_DRAM = self.allocate_tensor_dram(S * D * bpe)
         self.LAYER0_FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(S * S * bpe)
         self.LAYER0_O_PROJ_DRAM   = self.allocate_tensor_dram(S * H * bpe)
-        self.LAYER0_MLP_GATE_DRAM = self.allocate_tensor_dram(S * I * bpe)
-        self.LAYER0_MLP_UP_DRAM   = self.allocate_tensor_dram(S * I * bpe)
-        self.LAYER0_MLP_MULT_DRAM = self.allocate_tensor_dram(S * I * bpe)
+        # Gated MLP, FF_HALF-split (see _weight_init_lm_prefix's down_proj comment for
+        # why: avoids a strided-DMA K-split extraction that was the confirmed hang
+        # trigger). Each half is independently computed/multiplied/down-projected.
+        FF_HALF = I // 2
+        self.LAYER0_MLP_GATE_LO_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
+        self.LAYER0_MLP_GATE_HI_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
+        self.LAYER0_MLP_UP_LO_DRAM   = self.allocate_tensor_dram(S * FF_HALF * bpe)
+        self.LAYER0_MLP_UP_HI_DRAM   = self.allocate_tensor_dram(S * FF_HALF * bpe)
+        self.LAYER0_MLP_MULT_LO_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
+        self.LAYER0_MLP_MULT_HI_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
+        self.LAYER0_MLP_DOWN_LO_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        self.LAYER0_MLP_DOWN_HI_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.LAYER0_MLP_DOWN_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.FINAL_NORM_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.LOGITS_DRAM     = self.allocate_tensor_dram(self.VOCAB_SIZE * bpe)
@@ -396,6 +455,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.VIS_MLP_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_POST_LN_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_HEAD_OUT_DRAM = self.allocate_tensor_dram(S * HO * bpe)
+
+        # Per-layer output snapshots (probe_nan_report): the real per-layer
+        # output buffer (VIS_IO_A/B_DRAM) ping-pongs between two shared
+        # buffers, so only the LAST layer's value survives a full run --
+        # copy each layer's residual2 output to its own dedicated slot too,
+        # so a single post-run readback can NaN-check every layer at once
+        # instead of paying for 27 separate halt-recompile-rerun cycles.
+        self.VIS_LAYER_SNAPSHOT_DRAM = [self.allocate_tensor_dram(S * H * bpe) for _ in range(27)]
 
         # LN zeros-replay buffer, shared by every LN call (see layer_norm_core_dram_pbi).
         self.vis_zeros_addr = self.allocate_tensor_dram(max(H, I) * bpe)
@@ -488,7 +555,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         valid_len = n_vis + text_embed.shape[0]
         assert valid_len <= seq_len, f"prefix valid_len={valid_len} exceeds seq_len={seq_len}"
 
-        full = torch.zeros((seq_len, H), dtype=torch.bfloat16)
+        # Padding rows [valid_len:seq_len] must NOT be exact zero: rms_norm_core has
+        # no epsilon (confirmed by reading user_dma_core.py -- MODE_RSQRT computes
+        # sqrt(N)/sqrt(sum(x_i^2)) directly, no +eps), so an all-zero row hits
+        # rsqrt(0)=inf, then 0*inf=NaN for that row's "normalized" output. That NaN
+        # then contaminates every REAL row too: attention's masked columns get
+        # ~0 softmax weight but 0*NaN=NaN in IEEE arithmetic, not 0 -- so a single
+        # NaN padding column poisons the weighted sum for every query row. This is
+        # exactly the mechanism confirmed via debug_stepwise_prefix.py --dump
+        # (checkpoints 14/15/16 all 100% NaN). smolvlm2_test.py hit the identical
+        # problem and fixes it the same way: epsilon-fill padding rows instead of
+        # leaving them at exact zero (see its "epsilon-fill INPUT padding rows" step).
+        full = torch.full((seq_len, H), 1e-6, dtype=torch.bfloat16)
         full[:n_vis] = vis
         full[n_vis:valid_len] = text_embed
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, full)
@@ -508,15 +586,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         assert NKV == 1, "compile_prefix assumes pure MQA (num_kv_heads=1); broadcast via num_q_heads"
         bpe = 2
 
+        self._debug_counter = 0
+        self._debug_halt_info = None
+
         valid_len = valid_len if valid_len is not None else S
         self.prefix_bias_dram = store_weight(self, self.build_prefix_attn_bias(S, valid_len))
 
         bpe = 2
-        FF_HALF = I // 2
-        self.LAYER0_MLP_DOWN_LO_IN_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
-        self.LAYER0_MLP_DOWN_HI_IN_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
-        self.LAYER0_MLP_DOWN_LO_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
-        self.LAYER0_MLP_DOWN_HI_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        # Dedicated, non-aliased output buffers for the two residual adds below.
+        # eltwise_add_core_dram(A, B, OUT) with OUT == B (in-place) was the confirmed
+        # hang trigger (checkpoint layer0_residual2) -- real streaming/DMA hardware
+        # reading and writing the same address in one op is a hazard, not just a
+        # correctness footgun. Every add below now writes to a buffer distinct from
+        # both its inputs.
+        self.LAYER0_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        self.LAYER0_LAYER_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
 
         # PBI dynamic-M loop (mirrors compile_encoder's vis_S_reg): without this,
         # every matmul/RMSNorm below compiles a fully-unrolled static instruction
@@ -540,87 +624,114 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         prefix_call_sites: list[int] = []
         prefix_num_buckets = S // UE_VECTOR_SIZE
 
-        for layer_idx in range(self.NUM_LAYERS):
-            la = self.lm_layer_addrs[layer_idx]
-            h_in = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_MLP_DOWN_DRAM
+        try:
+            for layer_idx in range(self.NUM_LAYERS):
+                la = self.lm_layer_addrs[layer_idx]
+                h_in = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_LAYER_OUT_DRAM
 
-            # 1. pre-attention RMSNorm
-            self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,
-                                     OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln1"],
-                                     gpr_M_reg=prefix_S_reg)
+                # 1. pre-attention RMSNorm
+                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,
+                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln1"],
+                                         gpr_M_reg=prefix_S_reg)
+                self._debug_op(f"layer{layer_idx}_ln1", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H))
 
-            # 2. Q/K/V projections (MQA: K/V project to a single head_dim, not NH*D)
-            self._matmul(M=S, K=H, N=H, A=self.LAYER0_PRE_NORM_DRAM, proj="q", la=la, OUT=self.LAYER0_Q_DRAM, gpr_M_reg=prefix_S_reg)
-            self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="k", la=la, OUT=self.LAYER0_K_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
-            self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="v", la=la, OUT=self.LAYER0_V_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
+                # 2. Q/K/V projections (MQA: K/V project to a single head_dim, not NH*D)
+                self._matmul(M=S, K=H, N=H, A=self.LAYER0_PRE_NORM_DRAM, proj="q", la=la, OUT=self.LAYER0_Q_DRAM, gpr_M_reg=prefix_S_reg)
+                self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="k", la=la, OUT=self.LAYER0_K_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
+                self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="v", la=la, OUT=self.LAYER0_V_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
+                self._debug_op(f"layer{layer_idx}_qkv_proj", self.LAYER0_Q_DRAM, S * H, shape=(S, H))
 
-            # 3. permute Q from (seq, heads, head_dim) -> (heads, seq, head_dim); K/V
-            # already (seq, head_dim) since num_kv_heads=1 == the layout
-            # prefill_flash_attention_core expects for a single KV head.
-            smart_bf16_permute_core(self, (S, NH, D), [1, 0, 2],
-                                     self.LAYER0_Q_DRAM, self.LAYER0_Q_PERM_DRAM)
+                # 3. permute Q from (seq, heads, head_dim) -> (heads, seq, head_dim); K/V
+                # already (seq, head_dim) since num_kv_heads=1 == the layout
+                # prefill_flash_attention_core expects for a single KV head.
+                smart_bf16_permute_core(self, (S, NH, D), [1, 0, 2],
+                                         self.LAYER0_Q_DRAM, self.LAYER0_Q_PERM_DRAM)
+                self._debug_op(f"layer{layer_idx}_q_permute", self.LAYER0_Q_PERM_DRAM, S * H, shape=(S, H))
 
-            # 4. stage this layer's K/V into the persistent KV cache for downstream reuse.
-            k_cache_addr = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
-            v_cache_addr = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
-            self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, k_cache_addr)
-            self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr)
+                # 4. stage this layer's K/V into the persistent KV cache for downstream reuse.
+                k_cache_addr = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
+                v_cache_addr = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
+                self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, k_cache_addr)
+                self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr)
+                self._debug_op(f"layer{layer_idx}_kv_cache", k_cache_addr, S * KV, shape=(S, KV))
 
-            # 5. MQA flash attention, bidirectional bias (no causal flag), per head
-            # via the shared subroutine: Q for this head is copied (contiguous,
-            # already separated by the step-3 permute) into the fixed
-            # LAYER0_FLASH_Q_DRAM scratch, then jump into the one compiled flash
-            # body, then the (fixed-address) output is copied into this head's
-            # slot of LAYER0_ATTN_OUT_DRAM. K/V need no marshalling -- MQA means
-            # the same LAYER0_K_PROJ_DRAM/LAYER0_V_PROJ_DRAM buffer (already
-            # current for this layer, see step 2) is valid for every head, and
-            # the subroutine's K/V addresses are fixed to those same buffers.
-            head_bytes = S * D * bpe
-            for h in range(NH):
-                self._dram_copy(head_bytes, self.LAYER0_Q_PERM_DRAM + h * head_bytes, self.LAYER0_FLASH_Q_DRAM)
-                self.generate_instruction_add_set(prefix_gpr_bucket, prefix_num_buckets)
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    prefix_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(prefix_gpr_ret, return_word_addr)
-                prefix_call_sites.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-                self._dram_copy(head_bytes, self.LAYER0_FLASH_OUT_DRAM, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes)
+                # 5. MQA flash attention, bidirectional bias (no causal flag), per head
+                # via the shared subroutine: Q for this head is copied (contiguous,
+                # already separated by the step-3 permute) into the fixed
+                # LAYER0_FLASH_Q_DRAM scratch, then jump into the one compiled flash
+                # body, then the (fixed-address) output is copied into this head's
+                # slot of LAYER0_ATTN_OUT_DRAM. K/V need no marshalling -- MQA means
+                # the same LAYER0_K_PROJ_DRAM/LAYER0_V_PROJ_DRAM buffer (already
+                # current for this layer, see step 2) is valid for every head, and
+                # the subroutine's K/V addresses are fixed to those same buffers.
+                head_bytes = S * D * bpe
+                for h in range(NH):
+                    print(f"    [debug] layer{layer_idx} head{h}: capture_count before jump-site = {self.capture_count}")
+                    self._dram_copy(head_bytes, self.LAYER0_Q_PERM_DRAM + h * head_bytes, self.LAYER0_FLASH_Q_DRAM)
+                    self.generate_instruction_add_set(prefix_gpr_bucket, prefix_num_buckets)
+                    self.pad_capture_to_64b_boundary()
+                    return_word_addr = ue_35bit_addr_shifter(
+                        prefix_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                    self.generate_instruction_add_set(prefix_gpr_ret, return_word_addr)
+                    prefix_call_sites.append(self.capture_count)
+                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                    self._dram_copy(head_bytes, self.LAYER0_FLASH_OUT_DRAM, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes)
+                    self._debug_op(f"layer{layer_idx}_head{h}", self.LAYER0_ATTN_OUT_DRAM + h * head_bytes, S * D, shape=(S, D))
 
-            # 6. permute attn output (heads, seq, head_dim) -> (seq, heads*head_dim)
-            smart_bf16_permute_core(self, (NH, S, D), [1, 0, 2],
-                                     self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
+                # 6. permute attn output (heads, seq, head_dim) -> (seq, heads*head_dim)
+                smart_bf16_permute_core(self, (NH, S, D), [1, 0, 2],
+                                         self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
+                self._debug_op(f"layer{layer_idx}_attn_permute", self.LAYER0_ATTN_RESULT_DRAM, S * H, shape=(S, H))
 
-            # 7. output projection + residual
-            self._matmul(M=S, K=H, N=H, A=self.LAYER0_ATTN_RESULT_DRAM, proj="o", la=la, OUT=self.LAYER0_O_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
-            eltwise_add_core_dram(self, S * H, h_in, self.LAYER0_O_PROJ_DRAM, self.LAYER0_O_PROJ_DRAM)
+                # 7. output projection + residual (non-aliased: OUT distinct from both inputs)
+                self._matmul(M=S, K=H, N=H, A=self.LAYER0_ATTN_RESULT_DRAM, proj="o", la=la, OUT=self.LAYER0_O_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
+                eltwise_add_core_dram(self, S * H, h_in, self.LAYER0_O_PROJ_DRAM, self.LAYER0_ATTN_RESIDUAL_DRAM)
+                self._debug_op(f"layer{layer_idx}_o_proj_residual", self.LAYER0_ATTN_RESIDUAL_DRAM, S * H, shape=(S, H))
 
-            # 8. pre-FFW RMSNorm
-            self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.LAYER0_O_PROJ_DRAM,
-                                     OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln2"],
-                                     gpr_M_reg=prefix_S_reg)
+                # 8. pre-FFW RMSNorm
+                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.LAYER0_ATTN_RESIDUAL_DRAM,
+                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln2"],
+                                         gpr_M_reg=prefix_S_reg)
+                self._debug_op(f"layer{layer_idx}_ln2", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H))
 
-            # 9. gated-SiLU MLP + residual
-            self._matmul(M=S, K=H, N=I, A=self.LAYER0_PRE_NORM_DRAM, proj="gate", la=la,
-                         OUT=self.LAYER0_MLP_GATE_DRAM, silu_enable=True, gpr_M_reg=prefix_S_reg)
-            self._matmul(M=S, K=H, N=I, A=self.LAYER0_PRE_NORM_DRAM, proj="up", la=la, OUT=self.LAYER0_MLP_UP_DRAM, gpr_M_reg=prefix_S_reg)
-            eltwise_mul_core_dram(self, S * I, self.LAYER0_MLP_GATE_DRAM, self.LAYER0_MLP_UP_DRAM, self.LAYER0_MLP_MULT_DRAM)
-            # down_proj K=16384: matmat_mul_core_legacy can't fit a full K=16384 row in
-            # URAM in one call, so split into two K=8192 halves (materialized as
-            # contiguous buffers) and eltwise-add the partial results (parakeet's
-            # FF-down-proj K-split pattern).
-            FF_HALF = I // 2
-            self._dram_split_copy(S, I, 0, FF_HALF, self.LAYER0_MLP_MULT_DRAM, self.LAYER0_MLP_DOWN_LO_IN_DRAM)
-            self._dram_split_copy(S, I, FF_HALF, FF_HALF, self.LAYER0_MLP_MULT_DRAM, self.LAYER0_MLP_DOWN_HI_IN_DRAM)
-            self._matmul(M=S, K=FF_HALF, N=H, A=self.LAYER0_MLP_DOWN_LO_IN_DRAM, proj="down_lo", la=la, OUT=self.LAYER0_MLP_DOWN_LO_OUT_DRAM, gpr_M_reg=prefix_S_reg)
-            self._matmul(M=S, K=FF_HALF, N=H, A=self.LAYER0_MLP_DOWN_HI_IN_DRAM, proj="down_hi", la=la, OUT=self.LAYER0_MLP_DOWN_HI_OUT_DRAM, gpr_M_reg=prefix_S_reg)
-            eltwise_add_core_dram(self, S * H, self.LAYER0_MLP_DOWN_LO_OUT_DRAM, self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.LAYER0_MLP_DOWN_DRAM)
-            eltwise_add_core_dram(self, S * H, self.LAYER0_O_PROJ_DRAM, self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_MLP_DOWN_DRAM)
+                # 9. gated-SiLU MLP + residual, FF_HALF-split (parakeet_test.py pattern,
+                # adapted for the gated variant -- see _weight_init_lm_prefix's comment
+                # for why: matmat_mul_core_pbi can't do K=16384 in one call, and the
+                # strided-DMA extraction alternative (_dram_split_copy) was the
+                # confirmed hang trigger). Each half computed/multiplied/down-projected
+                # independently so down_proj's K-input is naturally contiguous from the
+                # moment it's written -- no slicing step exists to hang on.
+                FF_HALF = I // 2
+                self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="gate_lo", la=la,
+                             OUT=self.LAYER0_MLP_GATE_LO_DRAM, silu_enable=True, gpr_M_reg=prefix_S_reg)
+                self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="up_lo", la=la,
+                             OUT=self.LAYER0_MLP_UP_LO_DRAM, gpr_M_reg=prefix_S_reg)
+                eltwise_mul_core_dram(self, S * FF_HALF, self.LAYER0_MLP_GATE_LO_DRAM, self.LAYER0_MLP_UP_LO_DRAM, self.LAYER0_MLP_MULT_LO_DRAM)
+                self._matmul(M=S, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_LO_DRAM, proj="down_lo", la=la,
+                             OUT=self.LAYER0_MLP_DOWN_LO_OUT_DRAM, gpr_M_reg=prefix_S_reg)
+                self._debug_op(f"layer{layer_idx}_mlp_lo", self.LAYER0_MLP_DOWN_LO_OUT_DRAM, S * H, shape=(S, H))
 
-        # Main per-layer program ends here; the shared flash-attention subroutine
-        # (jumped to from every per-head call site above) is compiled once below,
-        # exactly like compile_encoder's vis_sub_start pattern.
-        self.generate_instruction_halt()
+                self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="gate_hi", la=la,
+                             OUT=self.LAYER0_MLP_GATE_HI_DRAM, silu_enable=True, gpr_M_reg=prefix_S_reg)
+                self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="up_hi", la=la,
+                             OUT=self.LAYER0_MLP_UP_HI_DRAM, gpr_M_reg=prefix_S_reg)
+                eltwise_mul_core_dram(self, S * FF_HALF, self.LAYER0_MLP_GATE_HI_DRAM, self.LAYER0_MLP_UP_HI_DRAM, self.LAYER0_MLP_MULT_HI_DRAM)
+                self._matmul(M=S, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_HI_DRAM, proj="down_hi", la=la,
+                             OUT=self.LAYER0_MLP_DOWN_HI_OUT_DRAM, gpr_M_reg=prefix_S_reg)
+                self._debug_op(f"layer{layer_idx}_mlp_hi", self.LAYER0_MLP_DOWN_HI_OUT_DRAM, S * H, shape=(S, H))
+
+                eltwise_add_core_dram(self, S * H, self.LAYER0_MLP_DOWN_LO_OUT_DRAM, self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.LAYER0_MLP_DOWN_DRAM)
+                self._debug_op(f"layer{layer_idx}_mlp_down", self.LAYER0_MLP_DOWN_DRAM, S * H, shape=(S, H))
+                # non-aliased: OUT (LAYER0_LAYER_OUT_DRAM) distinct from both inputs
+                eltwise_add_core_dram(self, S * H, self.LAYER0_ATTN_RESIDUAL_DRAM, self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_LAYER_OUT_DRAM)
+                self._debug_op(f"layer{layer_idx}_residual2", self.LAYER0_LAYER_OUT_DRAM, S * H, shape=(S, H))
+
+            # Main per-layer program ends here; the shared flash-attention subroutine
+            # (jumped to from every per-head call site above) is compiled once below,
+            # exactly like compile_encoder's vis_sub_start pattern.
+            self.generate_instruction_halt()
+        except _DebugStop:
+            pass   # halt already emitted by _debug_op; fall through to the subroutine compile below.
 
         prefix_sub_start, _prefix_flops = self.flash_attention_core(
             head_dim=D, seq_len=S,
@@ -651,7 +762,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.prefix_k_cache_addr = [self.LAYER0_K_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
         self.prefix_v_cache_addr = [self.LAYER0_V_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
 
-        return self.LAYER0_MLP_DOWN_DRAM
+        return self.LAYER0_LAYER_OUT_DRAM
 
     # ---- prefill -----------------------------------------------------------
     def compile_prefill(self, seq_len):
@@ -695,6 +806,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         ln_n_chunks = S // _ln_chunk
 
         self.start_capture()
+        self._debug_counter = 0
+        self._debug_halt_info = None
 
         vis_S_reg = self.alloc_isa_reg()
         vis_ln_chunks = self.alloc_isa_reg()
@@ -707,13 +820,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 SCALE_DRAM_ADDR=la[f'{proj}_scale'], C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                 gpr_M_reg=vis_S_reg, **kw)
 
-        # === Patch embedding: patchified pixels [S, 588] -> [S, 1152] (+ pos_embedding) ===
-        vis_matmul(S, self.VIS_PATCH_K, H, self.VIS_PIXEL_IN_DRAM,
-            {'embed_data': self.vis_embed_data, 'embed_scale': self.vis_embed_scale}, 'embed',
-            self.VIS_PATCH_PROJ_DRAM, bias=self.vis_embed_bias)
-        eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM,
-            B_DRAM_ADDR=self.vis_pos_embed, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM)
-
         # §7 shared-subroutine attention: the per-head flash body is compiled ONCE after the
         # encoder HALT; every per-(layer,head) call site marshals its head's [S, D] Q/K/V
         # (padded to [S, DP]) into the fixed VIS_FLASH buffers and jumps in.
@@ -723,69 +829,89 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         vis_call_sites: list[int] = []
         vis_num_buckets = S // UE_VECTOR_SIZE
 
-        for layer_idx, la in enumerate(self.vis_layer_addrs):
-            h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
-            h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
-            # LN0 (PBI)
-            self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['ln0_w'], BETA_DRAM_ADDR=la['ln0_b'], gpr_M_reg=vis_ln_chunks,
-                ZEROS_DRAM_ADDR=self.vis_zeros_addr)
-            # Q/K/V projections (PBI, IF4). N=NH*DP: weights are pre-padded per-head
-            # D->DP=128 (see _weight_init_vision's _pad_proj) so the buffers below are
-            # already head-block-aligned at DP=128, no separate real/padded copy needed.
-            HP = NH * DP
-            for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
-                vis_matmul(S, H, HP, self.VIS_LN_OUT_DRAM, la, proj, dst, bias=la[f'{proj}_bias'])
-            # Per-head bidirectional flash attention (no mask, no RoPE). Each head's block is
-            # a full DP=128-wide (256B) column slice -> every DMA stride below is AXI-beat
-            # (32B) aligned, unlike a bare D=72 (144B) slice.
-            elems = S * DP
-            col_stride = DP * bpe   # one head's column block width (aligned)
-            row_jump = HP * bpe     # full [S, HP] row stride
-            for h in range(NH):
-                col = h * col_stride
-                for src, dst in ((self.VIS_Q_DRAM + col, self.VIS_FLASH_Q_DRAM),
-                                 (self.VIS_K_DRAM + col, self.VIS_FLASH_K_DRAM),
-                                 (self.VIS_V_DRAM + col, self.VIS_FLASH_V_DRAM)):
-                    self.accelerator_memory_to_sram(src, 0x00000, elems,
+        try:
+            # === Patch embedding: patchified pixels [S, 588] -> [S, 1152] (+ pos_embedding) ===
+            vis_matmul(S, self.VIS_PATCH_K, H, self.VIS_PIXEL_IN_DRAM,
+                {'embed_data': self.vis_embed_data, 'embed_scale': self.vis_embed_scale}, 'embed',
+                self.VIS_PATCH_PROJ_DRAM, bias=self.vis_embed_bias)
+            eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM,
+                B_DRAM_ADDR=self.vis_pos_embed, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM)
+            self._debug_op("patch_embed_pos", self.VIS_IO_A_DRAM, S * H, shape=(S, H))
+
+            for layer_idx, la in enumerate(self.vis_layer_addrs):
+                h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
+                h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
+                # LN0 (PBI)
+                self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
+                    GAMMA_DRAM_ADDR=la['ln0_w'], BETA_DRAM_ADDR=la['ln0_b'], gpr_M_reg=vis_ln_chunks,
+                    ZEROS_DRAM_ADDR=self.vis_zeros_addr)
+                self._debug_op(f"layer{layer_idx}_ln0", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H))
+                # Q/K/V projections (PBI, IF4). N=NH*DP: weights are pre-padded per-head
+                # D->DP=128 (see _weight_init_vision's _pad_proj) so the buffers below are
+                # already head-block-aligned at DP=128, no separate real/padded copy needed.
+                HP = NH * DP
+                for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
+                    vis_matmul(S, H, HP, self.VIS_LN_OUT_DRAM, la, proj, dst, bias=la[f'{proj}_bias'])
+                # Per-head bidirectional flash attention (no mask, no RoPE). Each head's block is
+                # a full DP=128-wide (256B) column slice -> every DMA stride below is AXI-beat
+                # (32B) aligned, unlike a bare D=72 (144B) slice.
+                elems = S * DP
+                col_stride = DP * bpe   # one head's column block width (aligned)
+                row_jump = HP * bpe     # full [S, HP] row stride
+                for h in range(NH):
+                    col = h * col_stride
+                    for src, dst in ((self.VIS_Q_DRAM + col, self.VIS_FLASH_Q_DRAM),
+                                     (self.VIS_K_DRAM + col, self.VIS_FLASH_K_DRAM),
+                                     (self.VIS_V_DRAM + col, self.VIS_FLASH_V_DRAM)):
+                        self.accelerator_memory_to_sram(src, 0x00000, elems,
+                            stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+                        self.sram_to_accelerator_memory(0x00000, dst, elems)
+                    self.generate_instruction_add_set(vis_gpr_bucket, S // UE_VECTOR_SIZE)
+                    self.pad_capture_to_64b_boundary()
+                    return_word_addr = ue_35bit_addr_shifter(
+                        vis_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                    self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
+                    vis_call_sites.append(self.capture_count)
+                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                    self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
+                    self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
                         stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
-                    self.sram_to_accelerator_memory(0x00000, dst, elems)
-                self.generate_instruction_add_set(vis_gpr_bucket, S // UE_VECTOR_SIZE)
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    vis_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
-                vis_call_sites.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-                self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
-                self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
-                    stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
-            # O projection + residual + LN1 (PBI)
-            vis_matmul(S, HP, H, self.VIS_ATTN_RESULT_DRAM, la, 'o', self.VIS_O_PROJ_DRAM, bias=la['o_bias'])
-            eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
-                OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
-            self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['ln1_w'], BETA_DRAM_ADDR=la['ln1_b'], gpr_M_reg=vis_ln_chunks,
-                ZEROS_DRAM_ADDR=self.vis_zeros_addr)
-            # MLP: Dense_0 + GELU (sigmoid-approx — the engine's only hardware GELU; the
-            # reference uses tanh-approx GELU, a small documented numeric deviation),
-            # Dense_1, residual.
-            vis_matmul(S, H, IP, self.VIS_LN_OUT_DRAM, la, 'fc1', self.VIS_MLP_INTER_DRAM,
-                bias=la['fc1_bias'], gelu_enable=True)
-            vis_matmul(S, IP, H, self.VIS_MLP_INTER_DRAM, la, 'fc2', self.VIS_MLP_OUT_DRAM, bias=la['fc2_bias'])
-            eltwise_add_core_dram(self, size=S * H,
-                A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM, OUTPUT_DRAM_ADDR=h_out)
+                # O projection + residual + LN1 (PBI)
+                vis_matmul(S, HP, H, self.VIS_ATTN_RESULT_DRAM, la, 'o', self.VIS_O_PROJ_DRAM, bias=la['o_bias'])
+                self._debug_op(f"layer{layer_idx}_o_proj", self.VIS_O_PROJ_DRAM, S * H, shape=(S, H))
+                eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
+                    OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
+                self._debug_op(f"layer{layer_idx}_residual1", self.VIS_RESIDUAL_DRAM, S * H, shape=(S, H))
+                self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
+                    GAMMA_DRAM_ADDR=la['ln1_w'], BETA_DRAM_ADDR=la['ln1_b'], gpr_M_reg=vis_ln_chunks,
+                    ZEROS_DRAM_ADDR=self.vis_zeros_addr)
+                self._debug_op(f"layer{layer_idx}_ln1", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H))
+                # MLP: Dense_0 + GELU (sigmoid-approx — the engine's only hardware GELU; the
+                # reference uses tanh-approx GELU, a small documented numeric deviation),
+                # Dense_1, residual.
+                vis_matmul(S, H, IP, self.VIS_LN_OUT_DRAM, la, 'fc1', self.VIS_MLP_INTER_DRAM,
+                    bias=la['fc1_bias'], gelu_enable=True)
+                vis_matmul(S, IP, H, self.VIS_MLP_INTER_DRAM, la, 'fc2', self.VIS_MLP_OUT_DRAM, bias=la['fc2_bias'])
+                self._debug_op(f"layer{layer_idx}_mlp_out", self.VIS_MLP_OUT_DRAM, S * H, shape=(S, H))
+                eltwise_add_core_dram(self, size=S * H,
+                    A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM, OUTPUT_DRAM_ADDR=h_out)
+                self._debug_op(f"layer{layer_idx}_residual2", h_out, S * H, shape=(S, H))
+                self._dram_copy(S * H * bpe, h_out, self.VIS_LAYER_SNAPSHOT_DRAM[layer_idx])
 
-        # Final encoder_norm (PBI) + head projection (IF4).
-        final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
-        self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
-            GAMMA_DRAM_ADDR=self.vis_encoder_norm_w, BETA_DRAM_ADDR=self.vis_encoder_norm_b,
-            gpr_M_reg=vis_ln_chunks, ZEROS_DRAM_ADDR=self.vis_zeros_addr)
-        vis_matmul(S, H, self.VIS_HEAD_OUT, self.VIS_POST_LN_DRAM,
-            {'head_data': self.vis_head_data, 'head_scale': self.vis_head_scale}, 'head',
-            self.VIS_HEAD_OUT_DRAM, bias=self.vis_head_bias)
+            # Final encoder_norm (PBI) + head projection (IF4).
+            final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
+            self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
+                GAMMA_DRAM_ADDR=self.vis_encoder_norm_w, BETA_DRAM_ADDR=self.vis_encoder_norm_b,
+                gpr_M_reg=vis_ln_chunks, ZEROS_DRAM_ADDR=self.vis_zeros_addr)
+            self._debug_op("encoder_norm", self.VIS_POST_LN_DRAM, S * H, shape=(S, H))
+            vis_matmul(S, H, self.VIS_HEAD_OUT, self.VIS_POST_LN_DRAM,
+                {'head_data': self.vis_head_data, 'head_scale': self.vis_head_scale}, 'head',
+                self.VIS_HEAD_OUT_DRAM, bias=self.vis_head_bias)
+            self._debug_op("head_out", self.VIS_HEAD_OUT_DRAM, S * self.VIS_HEAD_OUT, shape=(S, self.VIS_HEAD_OUT))
 
-        self.generate_instruction_halt()   # encoder ends; shared flash body follows.
+            self.generate_instruction_halt()   # encoder ends; shared flash body follows.
+        except _DebugStop:
+            pass   # halt already emitted by _debug_op; fall through to the subroutine compile below.
 
         vis_sub_start, _vis_flops = self.flash_attention_core(head_dim=DP, seq_len=S,
             Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM, K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
@@ -844,6 +970,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_ACTION_HORIZON = 10
     AE_ACTION_HORIZON_PADDED = 64  # padded for 64-alignment (flash / matmul row tiling)
     AE_NUM_DENOISE_STEPS = 10
+    AE_LOOP_TRIP_OVERRIDE = None  # debug knob, see compile_denoise_loop's loop_start call
 
     # ---- action-expert weights ---------------------------------------------
     def weight_init_action_expert(self):
@@ -1067,6 +1194,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.AE_ACTION_TOK_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.AE_XT_DRAM = self.allocate_tensor_dram(S * self.AE_ACTION_DIM_PADDED * bpe)
         self.AE_VT_DRAM = self.allocate_tensor_dram(S * self.AE_ACTION_DIM_PADDED * bpe)
+        # Per-step x_t snapshots (probe_nan_report): AE_XT_DRAM is overwritten in
+        # place every step, so only the LAST step's value survives a full run --
+        # copy each step's post-euler-update x_t to its own dedicated slot too,
+        # so one post-run readback can NaN-check every step at once.
+        self.AE_STEP_SNAPSHOT_DRAM = [self.allocate_tensor_dram(S * self.AE_ACTION_DIM_PADDED * bpe)
+                                       for _ in range(self.AE_NUM_DENOISE_STEPS)]
         # K-padded (32 -> 64) copy of x_t for the action_in_proj matmul (K must be
         # a multiple of UE_VECTOR_SIZE=64); zero-filled once, only cols [0:32] are
         # ever overwritten (cols [32:64] stay zero for the lifetime of the loop).
@@ -1093,14 +1226,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self.prefix_k_cache_addr.append(kaddr)
                 self.prefix_v_cache_addr.append(vaddr)
 
-        # Seed the combined K/V buffers' prefix rows [0:P] once (unchanged across
-        # all 10 Euler steps / all layers' repeated suffix_step calls).
-        for layer in range(self.AE_LAYERS):
-            self.accelerator_memory_to_sram(self.prefix_k_cache_addr[layer], 0x00000, P * D)
-            self.sram_to_accelerator_memory(0x00000, self.ae_k_combined[layer], P * D)
-            self.accelerator_memory_to_sram(self.prefix_v_cache_addr[layer], 0x00000, P * D)
-            self.sram_to_accelerator_memory(0x00000, self.ae_v_combined[layer], P * D)
-
+        # NOTE: the combined K/V buffers' prefix rows [0:P] are seeded by
+        # compile_denoise_loop() itself (as the first thing it captures), NOT
+        # here -- this method only allocates DRAM and runs before any capture
+        # session is open (or after the prefix one was already closed+cleared
+        # by _compile_and_run), so instructions emitted here would just get
+        # silently discarded the moment compile_denoise_loop's start_capture()
+        # resets capture_buffer=[]. That was a real bug: ae_k_combined/
+        # ae_v_combined's prefix rows never actually got written on hardware,
+        # leaving stale/garbage DRAM content that fed straight into the first
+        # suffix layer's attention and NaN'd immediately.
         print(f"tensor_init_action_expert done; tensor DRAM at 0x{self.get_tensor_dram_addr():X}")
 
     # ---- small helpers --------------------------------------------------
@@ -1177,7 +1312,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """Host-computed sincos timestep embedding (dim=AE_HIDDEN, matches
         sincos_pos_embed in pi05_torch_ref.py) DMA'd to AE_SINCOS_DRAM, then
         time_mlp_in -> silu -> time_mlp_out -> silu -> AE_COND_DRAM (the AdaRMSNorm
-        conditioning vector for this Euler step)."""
+        conditioning vector for this Euler step).
+
+        Only used by the legacy fully-unrolled path (kept for reference/tests).
+        compile_denoise_loop itself uses the table + runtime-address variant
+        below (_ae_build_sincos_table / _ae_time_embed_from_table) so the whole
+        10-step Euler loop can be a single compiled body run via a real
+        hardware loop_start/loop_end instead of 10 statically unrolled copies."""
         H = self.AE_HIDDEN
         min_period, max_period = 4e-3, 4.0
         frac = torch.linspace(0.0, 1.0, H // 2)
@@ -1191,8 +1332,50 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self._ae_matmul(1, H, H, self.AE_TIME_HIDDEN_DRAM, self.ae_time_out_scale, self.ae_time_out_data,
                          self.AE_COND_DRAM, bias_addr=self.ae_time_out_bias, silu_enable=True)
 
+    def _ae_build_sincos_table(self):
+        """Host-precompute all AE_NUM_DENOISE_STEPS sincos timestep embeddings
+        (t = 1.0, 0.9, ..., 0.1 -- matches the Euler loop's t=1.0, dt=-1/N
+        schedule) as one contiguous (N, AE_HIDDEN) bf16 table in DRAM. Lets the
+        runtime loop body read the correct row via a GPR-held address instead
+        of a fresh host DMA write per step (which would require re-running
+        Python between hardware loop iterations -- impossible)."""
+        H = self.AE_HIDDEN
+        N = self.AE_NUM_DENOISE_STEPS
+        min_period, max_period = 4e-3, 4.0
+        frac = torch.linspace(0.0, 1.0, H // 2)
+        period = min_period * (max_period / min_period) ** frac
+        dt = -1.0 / N
+        rows = []
+        t = 1.0
+        for _ in range(N):
+            sinusoid = t * (1.0 / period) * 2 * math.pi
+            rows.append(torch.cat([torch.sin(sinusoid), torch.cos(sinusoid)]))
+            t += dt
+        table = torch.stack(rows).to(torch.bfloat16).contiguous()  # (N, H)
+        addr = self.get_params_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, addr, table, N * H * 2)
+        self.allocate_params_dram(N * H * 2)
+        return addr
+
+    def _ae_time_embed_from_table(self, addr_reg):
+        """Runtime-loop-body version of _ae_sincos_time_embed: read the CURRENT
+        row (address held in addr_reg, advanced by the caller each iteration)
+        into AE_SINCOS_DRAM via general_reg_src, then the same time_mlp_in ->
+        silu -> time_mlp_out -> silu -> AE_COND_DRAM chain as before."""
+        H = self.AE_HIDDEN
+        sram = 0x00000
+        self.accelerator_memory_to_sram(0, sram, H, general_reg_src=addr_reg)
+        self.sram_to_accelerator_memory(sram, self.AE_SINCOS_DRAM, H)
+
+        self._ae_matmul(1, H, H, self.AE_SINCOS_DRAM, self.ae_time_in_scale, self.ae_time_in_data,
+                         self.AE_TIME_HIDDEN_DRAM, bias_addr=self.ae_time_in_bias, silu_enable=True)
+        self._ae_matmul(1, H, H, self.AE_TIME_HIDDEN_DRAM, self.ae_time_out_scale, self.ae_time_out_data,
+                         self.AE_COND_DRAM, bias_addr=self.ae_time_out_bias, silu_enable=True)
+        # advance to next step's row for the next loop iteration
+        self.generate_instruction_add_imm(addr_reg, H * 2)
+
     # ---- one action-expert transformer layer (attention + gated MLP) --------
-    def compile_suffix_step(self, layer_idx, x_in_dram, x_out_dram, gpr_M_reg=None, flash_ctx=None):
+    def compile_suffix_step(self, layer_idx, x_in_dram, x_out_dram, gpr_M_reg=None, flash_ctx=None, step=None):
         """One action-expert layer body: AdaRMSNorm -> MQA attention (suffix Q vs
         combined prefix+suffix K/V) -> gated residual -> AdaRMSNorm -> gated MLP
         -> gated residual. Mirrors suffix_step()'s per-layer loop body in
@@ -1211,16 +1394,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         k_combined = self.ae_k_combined[layer_idx]
         v_combined = self.ae_v_combined[layer_idx]
 
+        _pfx = f"step{step}_layer{layer_idx}" if step is not None else f"layer{layer_idx}"
+
         # 1. AdaRMSNorm (attention conditioning)
         self._ae_ada_rms_norm(S, x_in_dram, la["pre_attn_norm_dense_scale"], la["pre_attn_norm_dense_data"],
                                la["pre_attn_norm_dense_bias"], self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM,
                                gpr_M_reg=gpr_M_reg)
+        self._debug_op(f"{_pfx}_preattn_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
 
         # 2. K/V projection for the suffix rows only -> combined buffer rows [P:P+S]
         self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["k_scale"], la["k_data"],
                          k_combined + P * D * 2, gpr_M_reg=gpr_M_reg)
         self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["v_scale"], la["v_data"],
                          v_combined + P * D * 2, gpr_M_reg=gpr_M_reg)
+        self._debug_op(f"{_pfx}_kv_proj", k_combined + P * D * 2, S * D, shape=(S, D))
 
         # 3. Per-head Q projection into the (heads, Tkv, D) padded Q buffer (rows
         #    [0:S] real, [S:Tkv] unused/garbage -- see tensor_init_action_expert).
@@ -1228,6 +1415,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         for h in range(self.AE_HEADS):
             self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
                              self.AE_Q_DRAM + h * head_bytes, gpr_M_reg=gpr_M_reg)
+        self._debug_op(f"{_pfx}_q_proj", self.AE_Q_DRAM, S * D, shape=(S, D))
 
         # 4. MQA flash attention: Q (heads, Tkv, D) vs shared K/V (Tkv, D), additive
         #    bias (Tkv, Tkv). Only rows [0:S] of the output are meaningful.
@@ -1236,6 +1424,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         #    copy the result out to this head's slot in AE_ATTN_OUT_DRAM.
         self._dram_copy(Tkv * D * 2, k_combined, self.AE_FLASH_K_DRAM)
         self._dram_copy(Tkv * D * 2, v_combined, self.AE_FLASH_V_DRAM)
+        self._debug_op(f"{_pfx}_flash_kv_staged", self.AE_FLASH_K_DRAM, Tkv * D, shape=(Tkv, D))
         for h in range(self.AE_HEADS):
             self._dram_copy(head_bytes, self.AE_Q_DRAM + h * head_bytes, self.AE_FLASH_Q_DRAM)
             self.generate_instruction_add_set(flash_ctx["gpr_bucket"], flash_ctx["num_buckets"])
@@ -1246,6 +1435,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             flash_ctx["call_sites"].append(self.capture_count)
             self.generate_instruction_jump_abs(target_instruction_word_addr=0)
             self._dram_copy(head_bytes, self.AE_FLASH_OUT_DRAM, self.AE_ATTN_OUT_DRAM + h * head_bytes)
+        self._debug_op(f"{_pfx}_flash_attn_out", self.AE_ATTN_OUT_DRAM, S * D, shape=(S, D))
 
         # 5. un-stack heads' first S rows -> (S, heads*D) token-major, o-proj
         for h in range(self.AE_HEADS):
@@ -1259,20 +1449,24 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self._ae_matmul(S, D, H, head_slice, la["o_scale"][h], la["o_data"][h],
                              self.AE_O_PROJ_DRAM, bias_addr=(self.AE_O_PROJ_DRAM if h > 0 else None),
                              gpr_M_reg=gpr_M_reg)
+        self._debug_op(f"{_pfx}_o_proj", self.AE_O_PROJ_DRAM, S * H, shape=(S, H))
 
         # 6. gated residual: x = x + gate * attn_out
         eltwise_mul_core_dram(self, size=S * H, A_DRAM_ADDR=self.AE_O_PROJ_DRAM,
                                B_DRAM_ADDR=self.AE_GATE_BCAST_DRAM, OUTPUT_DRAM_ADDR=self.AE_ATTN_GATED_DRAM)
         eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=x_in_dram,
                                B_DRAM_ADDR=self.AE_ATTN_GATED_DRAM, OUTPUT_DRAM_ADDR=self.AE_RESIDUAL_DRAM)
+        self._debug_op(f"{_pfx}_attn_residual", self.AE_RESIDUAL_DRAM, S * H, shape=(S, H))
 
         # 7. AdaRMSNorm (mlp conditioning)
         self._ae_ada_rms_norm(S, self.AE_RESIDUAL_DRAM, la["pre_ffw_norm_dense_scale"],
                                la["pre_ffw_norm_dense_data"], la["pre_ffw_norm_dense_bias"],
                                self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM, gpr_M_reg=gpr_M_reg)
+        self._debug_op(f"{_pfx}_preffw_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
 
         # 8. gated MLP + gated residual
         self._ae_gated_mlp(S, self.AE_NORM_DRAM, la, self.AE_MLP_DOWN_DRAM, gpr_M_reg=gpr_M_reg)
+        self._debug_op(f"{_pfx}_mlp_out", self.AE_MLP_DOWN_DRAM, S * H, shape=(S, H))
         eltwise_mul_core_dram(self, size=S * H, A_DRAM_ADDR=self.AE_MLP_DOWN_DRAM,
                                B_DRAM_ADDR=self.AE_GATE_BCAST_DRAM, OUTPUT_DRAM_ADDR=self.AE_MLP_GATED_DRAM)
         eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=self.AE_RESIDUAL_DRAM,
@@ -1285,17 +1479,25 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         AdaRMSNorm -> action_out_proj -> x_t += dt * v_t. Mirrors the loop body in
         run_pi05() (pi05_torch_ref.py).
 
-        Fully unrolled (10 steps x 18 layers = 180 static layer bodies) at the
-        Euler-step level -- the per-step work (host-computed timestep embedding,
-        weight addresses) is compile-time constant, so unrolling the OUTER loop is
-        simplest for first bring-up. BUT every one of those 180 layer bodies'
-        matmuls/RMSNorms now runs through a PBI runtime M-loop (gpr_M_reg, primed
-        once below) instead of static-M row unrolling -- without this, compiling
-        180 fully-unrolled layer bodies didn't finish in 900s (same root cause as
-        compile_prefix's original 684MB blowup, compounded ~10x by the outer
-        unroll). This is the fix, not a loop_start/loop_end construct around the
-        Euler steps themselves (that's a further possible optimization, not
-        required to get this compiling in reasonable time).
+        Compiled ONCE as a single body wrapped in a real hardware loop_start/
+        loop_end (runtime trip count = AE_NUM_DENOISE_STEPS), not 10 statically
+        unrolled copies -- all 10 steps share identical dims/shapes (S, H, I,
+        Tkv, NH), the only thing that varies per step is the scalar timestep
+        t, which is now handled by precomputing all N sincos embeddings into
+        one DRAM table (_ae_build_sincos_table) and reading the current row at
+        runtime via a GPR-held address that advances each iteration
+        (_ae_time_embed_from_table) -- a true hardware loop can't re-run host
+        Python between iterations, so the old per-step host DMA write had to
+        go. This also collapses the flash-attention shared-subroutine call
+        sites from 1440 (10 x 18 x 8, one set per statically-unrolled step) down
+        to 144 (18 x 8, one copy of the loop body), and the compiled
+        instruction count by roughly the same ~10x.
+
+        Every matmul/RMSNorm inside the loop body still runs through a PBI
+        runtime M-loop (gpr_M_reg, primed once below) -- required independent
+        of the outer step-loop change, since M=S rows per call still needs a
+        runtime trip count to avoid static-M unrolling blowup within a single
+        18-layer body.
 
         Assumes self.AE_XT_DRAM already holds the initial noise sample (S, 32) --
         caller (run harness) DMAs it in before invoking compile_denoise_loop(), or
@@ -1305,14 +1507,44 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         dt = -1.0 / self.AE_NUM_DENOISE_STEPS
         t = 1.0
 
+        self._debug_counter = 0
+        self._debug_halt_info = None
+
         ae_S_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(ae_S_reg, S)
+
+        # Seed the combined K/V buffers' prefix rows [0:P] once (unchanged across
+        # all 10 Euler steps / all layers' repeated suffix_step calls). MUST be
+        # captured here (inside this function's own start_capture session) --
+        # tensor_init_action_expert() runs too early (before any capture is
+        # open, or after a prior one was already cleared) for instructions
+        # emitted there to ever actually execute; see its docstring/comment.
+        P, D = self.AE_PREFIX_SEQ_LEN, self.HEAD_DIM
+        for layer in range(self.AE_LAYERS):
+            self.accelerator_memory_to_sram(self.prefix_k_cache_addr[layer], 0x00000, P * D)
+            self.sram_to_accelerator_memory(0x00000, self.ae_k_combined[layer], P * D)
+            self.accelerator_memory_to_sram(self.prefix_v_cache_addr[layer], 0x00000, P * D)
+            self.sram_to_accelerator_memory(0x00000, self.ae_v_combined[layer], P * D)
 
         # Shared-subroutine flash attention context, threaded into every
         # compile_suffix_step call across all 10 steps x 18 layers; the actual
         # subroutine body is compiled once, after the full loop below, and every
         # accumulated call site gets its jump patched to it (see compile_suffix_step
         # and tensor_init_action_expert's AE_FLASH_* buffers for the full rationale).
+        #
+        # REVERTED from a loop_start/loop_end runtime loop back to full static
+        # unrolling (10 steps x 18 layers = 180 static layer bodies), matching
+        # compile_prefix/compile_encoder's proven pattern exactly. The loop_start/
+        # loop_end version compiled to a single small body (144 jump sites instead
+        # of 1440) and a single Euler step ran clean standalone (loop_cnt=1, 12.4s),
+        # but hung the instant a real backward branch was taken (loop_cnt=2+, and
+        # the real loop_cnt=10) even after fixing a real found bug (loop_start()
+        # not 64B-aligning its re-entry point before generate_instruction_jump_rela_jnz,
+        # the only jump mode _generate_instruction_jump doesn't auto-align). That fix
+        # didn't resolve the hang, and nobody in this codebase has ever combined
+        # loop_start/loop_end with an internal shared-subroutine jump-and-return, so
+        # this is unproven territory not worth continuing to debug blind. Static
+        # unrolling only uses mechanisms already proven at scale this session.
         Tkv = self.AE_TKV
         flash_ctx = {
             "prog_base": self.get_program_dram_addr(),
@@ -1322,53 +1554,71 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             "num_buckets": Tkv // UE_VECTOR_SIZE,
         }
 
-        for step in range(self.AE_NUM_DENOISE_STEPS):
-            # action_in_proj: x_t (S,32) -> action_tokens (S,H). K must be a
-            # multiple of 64 (matmat_mul_core/IF4 block_size), so x_t is copied
-            # into the K-padded (S,64) scratch buffer's first 32 cols first.
-            self.accelerator_memory_to_sram(self.AE_XT_DRAM, 0x00000, S * self.AE_ACTION_DIM_PADDED)
-            self.sram_to_accelerator_memory(0x00000, self.AE_XT_PAD_DRAM, S * self.AE_ACTION_DIM_PADDED,
-                                             stride_bytes_per_chunk=self.AE_ACTION_DIM_PADDED * 2,
-                                             stride_jump_bytes=64 * 2)
-            self._ae_matmul(S, 64, H, self.AE_XT_PAD_DRAM,
-                             self.ae_action_in_scale, self.ae_action_in_data,
-                             self.AE_ACTION_TOK_DRAM, bias_addr=self.ae_action_in_bias, gpr_M_reg=ae_S_reg)
+        try:
+            for step in range(self.AE_NUM_DENOISE_STEPS):
+                # action_in_proj: x_t (S,32) -> action_tokens (S,H). K must be a
+                # multiple of 64 (matmat_mul_core/IF4 block_size), so x_t is copied
+                # into the K-padded (S,64) scratch buffer's first 32 cols first.
+                self.accelerator_memory_to_sram(self.AE_XT_DRAM, 0x00000, S * self.AE_ACTION_DIM_PADDED)
+                self.sram_to_accelerator_memory(0x00000, self.AE_XT_PAD_DRAM, S * self.AE_ACTION_DIM_PADDED,
+                                                 stride_bytes_per_chunk=self.AE_ACTION_DIM_PADDED * 2,
+                                                 stride_jump_bytes=64 * 2)
+                self._ae_matmul(S, 64, H, self.AE_XT_PAD_DRAM,
+                                 self.ae_action_in_scale, self.ae_action_in_data,
+                                 self.AE_ACTION_TOK_DRAM, bias_addr=self.ae_action_in_bias, gpr_M_reg=ae_S_reg)
+                self._debug_op(f"step{step}_action_in_proj", self.AE_ACTION_TOK_DRAM, S * H, shape=(S, H))
 
-            # timestep embedding -> AE_COND_DRAM (this step's AdaRMSNorm conditioning)
-            self._ae_sincos_time_embed(t)
+                # timestep embedding -> AE_COND_DRAM (this step's AdaRMSNorm conditioning)
+                self._ae_sincos_time_embed(t)
+                self._debug_op(f"step{step}_time_embed", self.AE_COND_DRAM, H, shape=(1, H))
 
-            # 18 action-expert layers
-            x_cur = self.AE_ACTION_TOK_DRAM
-            for layer_idx in range(self.AE_LAYERS):
-                x_next = self.AE_X_DRAM if x_cur is not self.AE_X_DRAM else self.AE_ACTION_TOK_DRAM
-                self.compile_suffix_step(layer_idx, x_cur, x_next, gpr_M_reg=ae_S_reg, flash_ctx=flash_ctx)
-                x_cur = x_next
+                # 18 action-expert layers
+                x_cur = self.AE_ACTION_TOK_DRAM
+                for layer_idx in range(self.AE_LAYERS):
+                    x_next = self.AE_X_DRAM if x_cur is not self.AE_X_DRAM else self.AE_ACTION_TOK_DRAM
+                    self.compile_suffix_step(layer_idx, x_cur, x_next, gpr_M_reg=ae_S_reg, flash_ctx=flash_ctx, step=step)
+                    self._debug_op(f"step{step}_suffix_layer{layer_idx}", x_next, S * H, shape=(S, H))
+                    x_cur = x_next
 
-            # final AdaRMSNorm (no gate applied -- action_out_proj consumes the
-            # normed output directly, per the real bug noted in pi05_torch_ref.py)
-            self._ae_ada_rms_norm(S, x_cur, self.ae_final_norm_dense_scale,
-                                   self.ae_final_norm_dense_data, self.ae_final_norm_dense_bias,
-                                   self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM, apply_gate=False,
-                                   gpr_M_reg=ae_S_reg)
+                # final AdaRMSNorm (no gate applied -- action_out_proj consumes the
+                # normed output directly, per the real bug noted in pi05_torch_ref.py)
+                self._ae_ada_rms_norm(S, x_cur, self.ae_final_norm_dense_scale,
+                                       self.ae_final_norm_dense_data, self.ae_final_norm_dense_bias,
+                                       self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM, apply_gate=False,
+                                       gpr_M_reg=ae_S_reg)
+                self._debug_op(f"step{step}_final_ada_rms_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
 
-            # action_out_proj: (S,H) -> v_t (S,32)
-            self._ae_matmul(S, H, self.AE_ACTION_DIM_PADDED, self.AE_NORM_DRAM,
-                             self.ae_action_out_scale, self.ae_action_out_data,
-                             self.AE_VT_DRAM, bias_addr=self.ae_action_out_bias, gpr_M_reg=ae_S_reg)
+                # action_out_proj: (S,H) -> v_t (S,32)
+                self._ae_matmul(S, H, self.AE_ACTION_DIM_PADDED, self.AE_NORM_DRAM,
+                                 self.ae_action_out_scale, self.ae_action_out_data,
+                                 self.AE_VT_DRAM, bias_addr=self.ae_action_out_bias, gpr_M_reg=ae_S_reg)
+                self._debug_op(f"step{step}_action_out_proj", self.AE_VT_DRAM, S * self.AE_ACTION_DIM_PADDED,
+                                shape=(S, self.AE_ACTION_DIM_PADDED))
 
-            # Euler step: x_t = x_t + dt * v_t
-            self.accelerator_memory_to_sram(self.AE_VT_DRAM, 0x00000, S * self.AE_ACTION_DIM_PADDED)
-            self.broadcast_mul(scalar=dt, sram_start_addr=0x00000, sram_wb_addr=0x00000,
-                                element_size=S * self.AE_ACTION_DIM_PADDED)
-            self.sram_to_accelerator_memory(0x00000, self.AE_VT_DRAM, S * self.AE_ACTION_DIM_PADDED)
-            eltwise_add_core_dram(self, size=S * self.AE_ACTION_DIM_PADDED, A_DRAM_ADDR=self.AE_XT_DRAM,
-                                   B_DRAM_ADDR=self.AE_VT_DRAM, OUTPUT_DRAM_ADDR=self.AE_XT_DRAM)
-            t += dt
+                # Euler step: x_t = x_t + dt * v_t
+                # NOTE: OUTPUT_DRAM_ADDR aliases A_DRAM_ADDR (both AE_XT_DRAM) here --
+                # same aliasing shape as the compile_prefix bug we fixed, but this
+                # buffer is tiny (S*32 elements, a single chunk) so it's mathematically
+                # safe by the same per-chunk read-before-write analysis. Left as-is
+                # (not the confirmed bug class) but flagging since we've been burned
+                # by this exact pattern before.
+                self.accelerator_memory_to_sram(self.AE_VT_DRAM, 0x00000, S * self.AE_ACTION_DIM_PADDED)
+                self.broadcast_mul(scalar=dt, sram_start_addr=0x00000, sram_wb_addr=0x00000,
+                                    element_size=S * self.AE_ACTION_DIM_PADDED)
+                self.sram_to_accelerator_memory(0x00000, self.AE_VT_DRAM, S * self.AE_ACTION_DIM_PADDED)
+                eltwise_add_core_dram(self, size=S * self.AE_ACTION_DIM_PADDED, A_DRAM_ADDR=self.AE_XT_DRAM,
+                                       B_DRAM_ADDR=self.AE_VT_DRAM, OUTPUT_DRAM_ADDR=self.AE_XT_DRAM)
+                self._debug_op(f"step{step}_euler_update", self.AE_XT_DRAM, S * self.AE_ACTION_DIM_PADDED,
+                                shape=(S, self.AE_ACTION_DIM_PADDED))
+                self._dram_copy(S * self.AE_ACTION_DIM_PADDED * 2, self.AE_XT_DRAM, self.AE_STEP_SNAPSHOT_DRAM[step])
+                t += dt
 
-        # Main per-(step,layer) program ends here; the shared flash-attention
-        # subroutine (jumped to from every per-head call site inside
-        # compile_suffix_step, 1440 sites total) is compiled once below.
-        self.generate_instruction_halt()
+            # Main per-(step,layer) program ends here; the shared flash-attention
+            # subroutine (jumped to from every per-head call site inside
+            # compile_suffix_step, 1440 sites total) is compiled once below.
+            self.generate_instruction_halt()
+        except _DebugStop:
+            pass   # halt already emitted by _debug_op; fall through to the subroutine compile below.
 
         ae_sub_start, _ae_flops = self.flash_attention_core(
             head_dim=self.HEAD_DIM, seq_len=Tkv,
@@ -1381,10 +1631,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         for _idx in flash_ctx["call_sites"]:
             self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(ae_sub_start))
 
+        # LIFO release, matching alloc order (ae_S_reg, gpr_bucket, gpr_ret).
         self.release_isa_reg()  # flash_ctx["gpr_ret"]
         self.release_isa_reg()  # flash_ctx["gpr_bucket"]
         self.release_isa_reg()  # ae_S_reg
-        print("compile_denoise_loop done: 10-step Euler action-expert flow-matching stack compiled")
+        print("compile_denoise_loop done: 10-step Euler action-expert flow-matching stack compiled "
+              "(statically unrolled, 1440 flash-attention jump sites)")
 
     # =========================================================================
     # End-to-end driver: real sample images -> vision (x3) -> prefix -> denoise
@@ -1407,6 +1659,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         S = self.VIS_S
         PK = self.VIS_PATCH_K
         outs = []
+
+        # compile_encoder() is a pure function of the (fixed) weights -- it never
+        # touches the slot index or pixel data, only VIS_PIXEL_IN_DRAM's *contents*
+        # vary per slot. So the compiled program is identical for all 3 slots;
+        # compile once and just re-DMA pixels + re-execute for slots 1/2.
+        global _SILENT_MODE
+        _original_print("  [vision encoder] compiling...", end="\r", flush=True)
+        t_compile0 = time.perf_counter()
+        _SILENT_MODE = True
+        try:
+            prog_addr = self.compile_encoder()
+        finally:
+            _SILENT_MODE = False
+        _original_print(f"  [vision encoder] compiled in {time.perf_counter()-t_compile0:.1f}s" + " " * 20)
+
         for i, img in enumerate(images_hwc):
             patches = self._patchify(img)  # (256, 588)
             patches_pad = np.zeros((S, PK), dtype=np.float32)
@@ -1414,7 +1681,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             pixel_t = torch.from_numpy(patches_pad).to(torch.bfloat16)
             self.dma_write(DMA_DEVICE_H2C, self.VIS_PIXEL_IN_DRAM, pixel_t, S * PK * 2)
 
-            prog_addr = self.compile_encoder()
             self.start_execute_from_dram(prog_addr)
             self._wait_with_heartbeat(f"vision slot {i}", timeout=180.0)
 
@@ -1424,6 +1690,43 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             outs.append(out)
             print(f"  [vision] slot {i} done")
         return torch.cat(outs, dim=0)  # (3*256, 2048)
+
+    def probe_nan_report(self):
+        """Post-run bulk NaN/Inf scan of every vision layer + every denoise step,
+        using the snapshot buffers compile_encoder/compile_denoise_loop copy
+        each layer/step's output into during the single real run (see
+        VIS_LAYER_SNAPSHOT_DRAM / AE_STEP_SNAPSHOT_DRAM). Cheap: one DMA read
+        per layer/step, no recompiling or re-executing anything -- call this
+        once after run_inference() (or run_vision()/compile_denoise_loop()
+        individually) to see exactly where (if anywhere) NaN first appears,
+        instead of guessing or paying for N separate halt-recompile-rerun probes."""
+        S_vis, H_vis = self.VIS_S, self.VIS_H
+        print("=== vision layer NaN report ===")
+        first_bad = None
+        for i, addr in enumerate(getattr(self, "VIS_LAYER_SNAPSHOT_DRAM", [])):
+            buf = bytearray(S_vis * H_vis * 2)
+            self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+            out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S_vis, H_vis).float()
+            n_nan, n_inf = torch.isnan(out).sum().item(), torch.isinf(out).sum().item()
+            flag = " <-- FIRST BAD" if (n_nan or n_inf) and first_bad is None else ""
+            if flag:
+                first_bad = f"vision_layer{i}"
+            print(f"  vision_layer{i}: nan={n_nan} inf={n_inf} min={out.min():.4f} max={out.max():.4f}{flag}")
+
+        print("=== denoise step NaN report ===")
+        S_ae, AD = self.AE_ACTION_HORIZON_PADDED, self.AE_ACTION_DIM_PADDED
+        for i, addr in enumerate(getattr(self, "AE_STEP_SNAPSHOT_DRAM", [])):
+            buf = bytearray(S_ae * AD * 2)
+            self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+            out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S_ae, AD).float()
+            n_nan, n_inf = torch.isnan(out).sum().item(), torch.isinf(out).sum().item()
+            flag = " <-- FIRST BAD" if (n_nan or n_inf) and first_bad is None else ""
+            if flag:
+                first_bad = f"denoise_step{i}"
+            print(f"  denoise_step{i}: nan={n_nan} inf={n_inf} min={out.min():.4f} max={out.max():.4f}{flag}")
+
+        print(f"first bad checkpoint: {first_bad or 'none -- all clean'}")
+        return first_bad
 
     def run_inference(self, images_hwc, prompt_tokens, noise32=None):
         """Full forward pass on real hardware. images_hwc: list of 3 (224,224,3)
@@ -1439,15 +1742,46 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         prog_addr = self._compile_and_run(lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
         t_prefix = time.perf_counter() - t1
 
+        # K/V cache NaN check: denoise_step0 comes back 100% NaN with the real
+        # prefix K/V cache (the earlier standalone denoise test used a
+        # zero-filled placeholder and was clean) -- check whether the cache
+        # ITSELF already has NaN (real bug, corruption during prefix's own
+        # per-layer K/V write) vs is merely large-but-finite (would point at
+        # an attention-softmax overflow downstream instead). Layer 0 and the
+        # last layer (17), cheap: 2 small DMA reads, no recompiling anything.
+        P, D = self.PREFIX_SEQ_LEN, self.HEAD_DIM
+        for layer in (0, self.NUM_LAYERS - 1):
+            for name, addr in (("K", self.prefix_k_cache_addr[layer]), ("V", self.prefix_v_cache_addr[layer])):
+                buf = bytearray(P * D * 2)
+                self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+                out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(P, D).float()
+                n_nan, n_inf = torch.isnan(out).sum().item(), torch.isinf(out).sum().item()
+                print(f"  [kv_check] layer{layer} {name}: nan={n_nan} inf={n_inf} "
+                      f"min={out.min():.4f} max={out.max():.4f}")
+
         t2 = time.perf_counter()
         self.tensor_init_action_expert()
         S, AD = self.AE_ACTION_HORIZON_PADDED, self.AE_ACTION_DIM_PADDED
         if noise32 is None:
-            noise32 = np.zeros((S, AD), dtype=np.float32)
+            # Padding rows/cols must NOT be exact zero: rms_norm_core has no
+            # epsilon, so an all-zero row -> rsqrt(0)=inf -> NaN, which then
+            # contaminates every real row too since self-attention mixes all
+            # S=64 rows together (same bug class fixed in embed_and_concat_prefix).
+            noise32 = np.full((S, AD), 1e-6, dtype=np.float32)
             noise32[:10, :7] = np.random.RandomState(0).randn(10, 7)
         self.dma_write(DMA_DEVICE_H2C, self.AE_XT_DRAM,
                         torch.from_numpy(noise32).to(torch.bfloat16), S * AD * 2)
-        self._compile_and_run(self.compile_denoise_loop, label="denoise_loop")
+        # compile_denoise_loop is statically unrolled (10 steps x 18 layers = 180
+        # static layer bodies, 1440 flash-attention jump sites) -- same proven
+        # pattern as compile_prefix/compile_encoder. A loop_start/loop_end runtime
+        # loop was tried (single small compiled body, runtime trip count) but hung
+        # on any real repeat even after fixing a genuine found bug (missing 64B
+        # alignment before the backward-branch jump target); that combination
+        # (loop_start/loop_end wrapping an internal shared-subroutine jump-and-
+        # return) isn't proven anywhere else in this codebase, so static unrolling
+        # was reverted to. Confirmed clean: full run completed in 123.9s (close to
+        # the ~120-150s predicted from a standalone single-step measurement).
+        self._compile_and_run(self.compile_denoise_loop, label="denoise_loop", timeout=300.0)
         t_denoise = time.perf_counter() - t2
 
         buf = bytearray(S * AD * 2)
@@ -1497,13 +1831,22 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """wait_queue wrapper that prints elapsed seconds every heartbeat_every
         seconds on a background thread, so a real hang (dead silent, no CPU
         activity) is visually distinguishable from a slow-but-alive execute --
-        we were guessing this blind before and burning time on ambiguous kills."""
+        we were guessing this blind before and burning time on ambiguous kills.
+
+        CRITICAL: user_dma_core.wait_queue() does NOT raise on timeout -- it
+        just prints "Error: wait_queue() timed out..." and returns normally,
+        so callers silently proceed as if the FPGA finished. This wrapper
+        checks is_queue_busy() itself after wait_queue returns and raises for
+        real if the hardware is still busy, so a genuine hang surfaces as a
+        hard failure instead of silently corrupting every downstream stage
+        (this bit us for real: prefix's execution may never have actually
+        finished before we compiled and ran the denoise loop on top of it)."""
         import threading
         t0 = time.perf_counter()
         stop = threading.Event()
         def _hb():
-            while not stop.wait(heartbeat_every):
-                print(f"  [{label}] ... still waiting on FPGA queue ({time.perf_counter()-t0:.0f}s elapsed)", flush=True)
+            while not stop.wait(1.0):
+                _original_print(f"  [{label}] running... {time.perf_counter()-t0:.0f}s", end="\r", flush=True)
         hb_th = threading.Thread(target=_hb, daemon=True)
         hb_th.start()
         try:
@@ -1511,44 +1854,71 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         finally:
             stop.set()
             hb_th.join(timeout=1.0)
-        print(f"  [{label}] done in {time.perf_counter()-t0:.1f}s", flush=True)
+        if self.is_queue_busy():
+            _original_print()
+            raise RuntimeError(
+                f"[{label}] FPGA queue still busy after {timeout:.0f}s timeout -- "
+                f"real hang, not a silent success. wait_queue() does not raise on "
+                f"its own; this check exists specifically to catch that.")
+        _original_print(f"  [{label}] done in {time.perf_counter()-t0:.1f}s" + " " * 20)
 
-    def _compile_and_run(self, compile_fn, label="compile_and_run"):
+    def _compile_and_run(self, compile_fn, label="compile_and_run", timeout=250.0):
         """compile_fn must itself do start_capture/.../stop_capture + DMA the
         program bytes and return the program addr (compile_prefix/compile_denoise_loop
         don't currently do the capture/dma/execute bookkeeping compile_encoder does --
-        wrap them the same way here)."""
-        self.start_capture()
-        prog_addr = compile_fn()
-        # compile_prefix/compile_denoise_loop don't call stop_capture/emit themselves
-        # (only compile_encoder does) -- if compile_fn already stopped capture and
-        # returned an addr (compile_encoder-style), reuse it; else emit now.
-        if self.capture_buffer:
-            all_bytes = bytearray()
-            for inst in self.capture_buffer:
-                all_bytes.extend(inst.get_bytes())
-            prog_addr = self.get_program_dram_addr()
-            self._dma_write_retry(DMA_DEVICE_H2C, prog_addr, all_bytes, len(all_bytes))
-            self.allocate_program_dram(len(all_bytes))
-            self.clear_capture_buffer()
-        self.stop_capture()
+        wrap them the same way here). Compile-phase prints (per-op FLOPs/URAM
+        dumps from user_dma_core) are noisy and drown the timing/NaN signal we
+        actually care about, so they're silenced the same way qwen3_4b/
+        locateanything_3b do it (global _SILENT_MODE flag over builtins.print)."""
+        global _SILENT_MODE
+        _original_print(f"  [{label}] compiling...", end="\r", flush=True)
+        t_compile0 = time.perf_counter()
+        _SILENT_MODE = True
+        try:
+            self.start_capture()
+            prog_addr = compile_fn()
+            # compile_prefix/compile_denoise_loop don't call stop_capture/emit themselves
+            # (only compile_encoder does) -- if compile_fn already stopped capture and
+            # returned an addr (compile_encoder-style), reuse it; else emit now.
+            if self.capture_buffer:
+                all_bytes = bytearray()
+                for inst in self.capture_buffer:
+                    all_bytes.extend(inst.get_bytes())
+                prog_addr = self.get_program_dram_addr()
+                self._dma_write_retry(DMA_DEVICE_H2C, prog_addr, all_bytes, len(all_bytes))
+                self.allocate_program_dram(len(all_bytes))
+                self.clear_capture_buffer()
+            self.stop_capture()
+        finally:
+            _SILENT_MODE = False
+        _original_print(f"  [{label}] compiled in {time.perf_counter()-t_compile0:.1f}s" + " " * 20)
         self.start_execute_from_dram(prog_addr)
-        self._wait_with_heartbeat(label, timeout=180.0)
+        self._wait_with_heartbeat(label, timeout=timeout)
         return prog_addr
 
 
 def main():
-    import time as _time
     ue = Pi05Libero_UnifiedEngine()
     init_hang_prevention(ue)
     ue.weight_init()
     ue.tensor_init(_CFG["defaults"].get("max_seq", 512))
 
+    # Full end-to-end: vision -> prefix -> action-expert denoise loop.
+    # Vision: confirmed hang-free (all 3 slots, 432 head-jumps).
+    # Prefix: NaN (padding-row epsilon) and hang (_dram_split_copy strided DMA)
+    # bugs fixed -- see embed_and_concat_prefix's padding comment and
+    # _weight_init_lm_prefix's FF_HALF-split comment -- confirmed clean for the
+    # FULL 18 layers with real vision data (182s).
+    # Denoise loop: confirmed clean standalone with a placeholder (zero-filled)
+    # K/V cache (123.9s, statically unrolled -- see compile_denoise_loop's
+    # docstring for why it's not a loop_start/loop_end runtime loop). This is
+    # the first time all three stages run back-to-back together with the REAL
+    # prefix K/V cache feeding the action-expert -- genuinely uncharted, so
+    # treat any failure here as new territory, not a regression.
     sample_dir = Path.home() / "apex-compute-ML" / "simple-llm" / "src" / "models" / "pi0_5" / "sample_data"
     img = np.load(sample_dir / "sample_0_image.npy").astype(np.float32) / 127.5 - 1.0
     wrist = np.load(sample_dir / "sample_0_wrist_image.npy").astype(np.float32) / 127.5 - 1.0
     pad = np.zeros_like(img)
-    # resize 256->224 (host-side, matches pi05_torch_ref.py)
     import torch.nn.functional as _F
     def _resize(a):
         t = torch.from_numpy(a).permute(2, 0, 1).unsqueeze(0).float()
@@ -1562,6 +1932,10 @@ def main():
     np.set_printoptions(precision=4, suppress=True)
     print("action_chunk shape:", actions.shape)
     print(actions)
+    print(f"nan={np.isnan(actions).any()} inf={np.isinf(actions).any()} "
+          f"min={actions.min():.4f} max={actions.max():.4f}")
+
+    ue.probe_nan_report()
 
 
 if __name__ == "__main__":
