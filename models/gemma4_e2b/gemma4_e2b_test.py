@@ -9225,16 +9225,7 @@ defaults (sample files in repo-root test_samples/):
             print(f"[Mode] LM — default prompt")
             ue.set_prefill_seq()
     except BaseException:
-        # §8b: the VLM/audio encoder one-shot runs HERE (inside set_prefill_seq_*),
-        # BEFORE the prefill/decode try/finally below. It is the longest single
-        # execute (~10s) and writes scratch DRAM, so a Ctrl-C / crash here would
-        # otherwise escape the finally and leave stale scratch that poisons the
-        # next run or bit-exact compare (fpga_compare_clear_dram_oracle). Clear,
-        # then re-raise. Normal completion does NOT clear — prefill still needs
-        # the encoder's feature DRAM.
-        ue.clear_dram()
         raise
-
     if os.environ.get("GEMMA4_ENCODER_ONLY"):
         print("[Mode] GEMMA4_ENCODER_ONLY set — exiting after encoder, "
               "skipping prefill+decode.")

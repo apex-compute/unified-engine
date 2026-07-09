@@ -447,7 +447,6 @@ def main():
         report("C image_feat",  refs["hf"]["C"], ckpt["C"])
 
     print("\n[numeric] done.")
-    ue.clear_dram()
 
 
 if __name__ == "__main__":

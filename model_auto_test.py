@@ -26,9 +26,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ---------------------------------------------------------------------------
 # When enabled, the harness DMA-writes test data across the FULL 4 GiB
 # DRAM right before launching each model, so the model (loaded from its bin) starts
-# on poisoned DRAM. A PASS then proves run_from_bin (re)writes every byte it reads —
-# no per-model edits needed. Toggle off with RANDOMIZE_DRAM=0 in the env to run on
-# clean DRAM.
+# on poisoned DRAM. A PASS then proves model setup writes every byte it reads.
+# Toggle off with RANDOMIZE_DRAM=0 in the env to run on clean DRAM.
 RANDOMIZE_DRAM   = os.environ.get("RANDOMIZE_DRAM", "1") != "0"
 RANDOM_DRAM_SEED = int(os.environ.get("RANDOM_DRAM_SEED", "0"))
 DMA_DEV          = os.environ.get("DMA_DEV", "xdma0")
@@ -267,48 +266,43 @@ def _check_mbv2_ssd(text):
 MATH_PROMPT = "If x + 3 = 5, what is x?"
 
 TESTS = [
-    # gemma3 has no run_from_bin yet — uses the _test.py entry point (like gpt2);
-    # swap to gemma3_run_from_bin.py once it exists. The deprecated
-    # gemma3_test_IF8.py is deliberately excluded: IF8 is currently not working.
+    # The deprecated gemma3_test_IF8.py is deliberately excluded: IF8 is
+    # currently not working.
     {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    # Gemma4 run_from_bin entry points are deprecated in this branch; run the
-    # migrated tests in VLM mode with their built-in default image/prompt and
-    # check that the generated decode is coherent text.
+    # Run Gemma4 in VLM mode with its built-in default image/prompt and check
+    # that the generated decode is coherent text.
     {"name": "gemma4_e2b",  "script": "models/gemma4_e2b/gemma4_e2b_test.py",           "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
     {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
-    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_run_from_bin.py",       "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_test.py",       "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     # qwen3.5_2b VLM: FPGA vision encoder (--vision-enable defaults to on-FPGA vision)
     # on yosemite.jpg; gemma4-style criteria (coherent decode + scene keywords).
-    {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
-    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_run_from_bin.py", "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the image in detail. (default)"},
+    {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable", "--vision-on-hardware"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
+    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the image in detail. (default)"},
     # smolvlm2 DEFAULTS to VLM (loads a bundled image + runs the vision encoder), so
     # --lm-enable forces pure language-model (text-only) mode. SmolVLM2-500M is too
     # small to reliably do algebra, so it gets a factual question it can answer
     # ("What is the capital of France?" — its built-in default lm_prompt) and we check
     # for "Paris". The other VL models default to LM when --image is omitted.
-    {"name": "smolvlm2",    "script": "models/smolvlm2/smolvlm2_run_from_bin.py",       "prompt": "What is the capital of France?", "pass_check": _check_smolvlm2, "extra_args": ["--lm-enable"]},
+    {"name": "smolvlm2",    "script": "models/smolvlm2/smolvlm2_test.py",       "prompt": "What is the capital of France?", "pass_check": _check_smolvlm2, "extra_args": ["--lm-enable"]},
 
     # GPT-2 is a base (non-chat) model: text continuation, no single correct answer,
-    # so the check is lenient (non-empty generation). No run_from_bin yet — uses the
-    # _test.py entry point; swap to gpt2_run_from_bin.py once it exists.
+    # so the check is lenient (non-empty generation).
     {"name": "gpt2",        "script": "models/gpt2/gpt2_test.py",                        "prompt": "The scientists at MIT announced today that they have discovered ", "pass_check": _check_nonempty},
 
     # Vision / detection models: no --prompt; emit detections / class labels parsed
-    # from stdout. No run_from_bin yet — use the _test.py entry points (like gpt2).
+    # from stdout.
     {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},
     {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
     {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
 
     # Encoder models take no --prompt and emit non-LM output (ASR transcription /
-    # segmentation). They PREFER their run_from_bin entry point; resolve_script() falls
-    # back to the sibling _test.py automatically when no compiled programs.bin exists.
-    # swin has no run_from_bin yet, so it always uses _test.py.
-    {"name": "parakeet",  "script": "models/parakeet/parakeet_run_from_bin.py",        "pass_check": _check_parakeet},
-    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_run_from_bin.py",      "pass_check": _check_nonempty},
+    # segmentation).
+    {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet},
+    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_nonempty},
 ]
 
@@ -340,9 +334,8 @@ def reset_device(dev: str = "xdma0") -> None:
 def _script_supports_flag(script_path: str, flag: str) -> bool:
     """True when the model script declares `flag` in its own argparse.
 
-    Not every entry point accepts --dev / --device yet (e.g. the qwen3.5_2b and
-    gemma4 run_from_bin runners), and argparse hard-fails on unknown flags, so the
-    harness forwards a flag only after sniffing the script source for the quoted
+    Not every entry point accepts --dev / --device yet, and argparse hard-fails
+    on unknown flags, so the harness forwards a flag only after sniffing the script source for the quoted
     literal ('--dev' won't false-match '--device' because the closing quote is
     part of the pattern).
     """
@@ -352,28 +345,6 @@ def _script_supports_flag(script_path: str, flag: str) -> bool:
     except OSError:
         return False
     return f"'{flag}'" in src or f'"{flag}"' in src
-
-
-def resolve_script(rel_script: str):
-    """Pick the script to actually run: ALWAYS the sibling *_test.py.
-
-    run_from_bin is disabled here — the *_run_from_bin.py replay path is bypassed
-    unconditionally in favor of the *_test.py entry point, which regenerates every
-    artifact (weights + instruction bin) on the fly and self-resets the device. Any
-    MODELS entry pointing at *_run_from_bin.py is rewritten to its *_test.py sibling.
-    Returns (chosen_rel_script, note): note is None when nothing was rewritten, else a
-    human-readable reason.
-    """
-    suffix = "_run_from_bin.py"
-    if rel_script.endswith(suffix):
-        base = rel_script[: -len(suffix)]                  # models/<X>/<X>
-        name = os.path.basename(base)                      # <X>
-        test_py = base + "_test.py"
-        if os.path.isfile(os.path.join(SCRIPT_DIR, test_py)):
-            return test_py, (
-                f"run_from_bin disabled — running {os.path.basename(test_py)}"
-            )
-    return rel_script, None
 
 
 def run_test(test: dict, verbose: bool = False,
@@ -387,7 +358,7 @@ def run_test(test: dict, verbose: bool = False,
                     --device to model scripts that declare the flag (see
                     _script_supports_flag). None means don't forward.
     """
-    rel_script, resolve_note = resolve_script(test["script"])
+    rel_script = test["script"]
     script = os.path.join(SCRIPT_DIR, rel_script)
     # -u: force the child's stdout unbuffered so verbose mode streams live
     # instead of arriving in big blocks (its stdout is a pipe, not a TTY).
@@ -411,12 +382,11 @@ def run_test(test: dict, verbose: bool = False,
     print(f"Command      : {shlex.join(display_cmd)}")
     if test.get("mode"):
         print(f"Mode         : {test['mode']}")
+    print("Execution    : FPGA")
     if test.get("image"):
         print(f"Image        : {test['image']}")
     if test.get("prompt_desc"):
         print(f"Prompt       : {test['prompt_desc']}")
-    if resolve_note:
-        print(f"Note         : {resolve_note}")
     if unsupported:
         print(f"Note         : script does not accept {', '.join(unsupported)} — not forwarded")
     if test.get("prompt") and not test.get("prompt_desc"):

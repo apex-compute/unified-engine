@@ -24,8 +24,8 @@ Key architectural specifics (see notes_qwen3.5_2b.md for rationale):
 Usage:
     python3 qwen3.5_2b_test.py                                    # LM-only, default seed
     python3 qwen3.5_2b_test.py --prompt "Once upon a time"
-    python3 qwen3.5_2b_test.py --vision-enable                    # VLM, HF vision encoder (default)
-    python3 qwen3.5_2b_test.py --vision-enable --vision-on-hardware   # VLM, FPGA vision encoder
+    python3 qwen3.5_2b_test.py --vision-enable                    # VLM, FPGA vision encoder (default)
+    python3 qwen3.5_2b_test.py --vision-enable --no-fpga-vision   # VLM, optional HF host fallback
     python3 qwen3.5_2b_test.py --image my.jpg --prompt "What is in this image?"
 
 Generation uses persistent Gated-DeltaNet, convolution, and attention-cache
@@ -1697,11 +1697,6 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             if avg_hw_us > 0:
                 print(f"                  HW: {flops*n/1e9:.1f} GFLOP  "
                       f"{avg_gflops:.1f} GFLOP/s")
-
-        # §8b: clear tensor DRAM at the end of the run so the next process that
-        # reads a scratch buffer before overwriting it doesn't see stale/NaN data.
-        with _quiet():
-            self.clear_dram()
 
         generated = tokenizer.decode(out_tokens, skip_special_tokens=True)
         return {

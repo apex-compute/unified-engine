@@ -1059,7 +1059,6 @@ def main():
     decoded_tokens = max(token_cnt - len(prefill_seq) + 1, 1)
     _original_print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
                     f"speed: {decoded_tokens / latency_decoder:.2f} tokens/s, total {token_cnt} tokens.")
-    ue.clear_dram()
 
 
 if __name__ == "__main__":

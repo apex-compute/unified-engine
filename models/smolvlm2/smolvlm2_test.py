@@ -1607,8 +1607,7 @@ def main():
         args.image = _default_image   # VLM default with no --image → use the bundled sample image
     if args.prompt is None:           # mode-appropriate default prompt
         args.prompt = _d["lm_prompt"] if lm_only else _d["vlm_prompt"]
-    # No startup DRAM zeroing: each run already zero_dram()s at the END (below), so the next run starts
-    # clean; params/programs are DMA'd over their regions. (Avoids the slow 2 GB zero every launch.)
+    # No startup DRAM zeroing; params/programs are DMA'd over their regions.
     init_hang_prevention(ue)
     _artifact_suffix = ue._artifact_mode_suffix()
     # Load the snapshot (params.bin) only when the single program bin also exists.
@@ -1723,7 +1722,6 @@ def main():
         f"SmolVLM2 test ends. prefill {round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0} tok/s, "
         f"decode {round(n_generated / decode_time, 2) if decode_time > 0 else 0.0} tok/s.")
 
-    ue.zero_dram()
     _SILENT_MODE = True
     ue.software_reset()
 

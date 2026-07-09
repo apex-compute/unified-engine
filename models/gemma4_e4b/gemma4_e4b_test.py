@@ -22,12 +22,11 @@ Usage:
   python gemma4_e4b_test.py --prompt "your prompt"
   python gemma4_e4b_test.py --image path/to/image.jpg
   python gemma4_e4b_test.py --image path/to/image.jpg --prompt "What is in this image?"
-  python gemma4_e4b_test.py --vision-enable                 # default image, encoder on host (HF)
+  python gemma4_e4b_test.py --vision-enable                 # default image, vision encoder on FPGA
   python gemma4_e4b_test.py --audio-enable                  # default audio, encoder on host (HF)
   python gemma4_e4b_test.py --dev xdma0 [--cycle 5.62]
-  # DEBUG ONLY — FPGA encoder path is NOT VERIFIED on hardware: vision is buggy
-  # (decodes nonsense), audio untested. Host (default) is the validated path.
-  #   python gemma4_e4b_test.py --vision-enable --fpga-encoder
+  # Vision always runs on FPGA. The optional audio FPGA path remains
+  # debug/unverified and is selected with --fpga-encoder.
   #   python gemma4_e4b_test.py --audio-enable --fpga-encoder
 
 Defaults (sample files live in repo-root test_samples/, i.e. ../../test_samples/ from here):
@@ -9159,13 +9158,12 @@ def main():
   python gemma4_e4b_test.py                                 # LM, default prompt
   python gemma4_e4b_test.py --prompt "your prompt"          # LM, custom prompt
   python gemma4_e4b_test.py --image path/to/image.jpg --prompt "What is in this image?"
-  python gemma4_e4b_test.py --vision-enable                 # default image, encoder on host (HF)
+  python gemma4_e4b_test.py --vision-enable                 # default image, vision encoder on FPGA
   python gemma4_e4b_test.py --audio-enable                  # default audio, encoder on host (HF)
   python gemma4_e4b_test.py --dev xdma1 --vision-enable
 
-  # DEBUG ONLY — FPGA encoder (--fpga-encoder) is NOT VERIFIED on hardware:
-  # vision is buggy (decodes nonsense), audio untested. Host default is the
-  # validated path.
+  # Vision always runs on FPGA. --fpga-encoder applies only to the optional
+  # audio path, which remains a debug/unverified hardware mode.
 
 defaults (sample files in repo-root test_samples/):
   LM prompt: "Tell me about the Eiffel Tower. What year was it built?"
@@ -9333,16 +9331,7 @@ defaults (sample files in repo-root test_samples/):
             print(f"[Mode] LM — default prompt")
             ue.set_prefill_seq()
     except BaseException:
-        # §8b: the VLM/audio encoder one-shot runs HERE (inside set_prefill_seq_*),
-        # BEFORE the prefill/decode try/finally below. It is the longest single
-        # execute (~10s) and writes scratch DRAM, so a Ctrl-C / crash here would
-        # otherwise escape the finally and leave stale scratch that poisons the
-        # next run or bit-exact compare (fpga_compare_clear_dram_oracle). Clear,
-        # then re-raise. Normal completion does NOT clear — prefill still needs
-        # the encoder's feature DRAM.
-        ue.clear_dram()
         raise
-
     if os.environ.get("GEMMA4_ENCODER_ONLY"):
         print("[Mode] GEMMA4_ENCODER_ONLY set — exiting after encoder, "
               "skipping prefill+decode.")

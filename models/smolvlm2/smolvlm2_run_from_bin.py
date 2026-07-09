@@ -752,10 +752,7 @@ def main():
         f"prefill {round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0} tok/s, "
         f"decode {round(len(hw_tokens) / decode_time, 2) if decode_time > 0 else 0.0} tok/s.")
 
-    # Leave the FPGA DRAM clean for the next run (mirrors smolvlm2_test.py). Without this, consecutive
-    # load-only runs start on stale DRAM, which can corrupt the next run's output.
     _SILENT_MODE = True
-    ue.zero_dram()
     ue.software_reset()
 
 

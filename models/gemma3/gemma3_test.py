@@ -2042,7 +2042,6 @@ def main():
         ue.compile_gemma3(profile=True)
         print(f"Profile compile done in {time.perf_counter() - timer:.2f} seconds")
         ue.run_gemma3_profile()
-        ue.clear_dram()
         print("Decoder profile done.")
         return
 

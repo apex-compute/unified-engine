@@ -7478,16 +7478,7 @@ def main():
             print(f"[Mode] LM — default prompt")
             ue.set_prefill_seq()
     except BaseException:
-        # §8b: the VLM/audio encoder one-shot runs HERE (inside set_prefill_seq_*),
-        # BEFORE the prefill/decode try/finally below. It is the longest single
-        # execute (~10s) and writes scratch DRAM, so a Ctrl-C / crash here would
-        # otherwise escape the finally and leave stale scratch that poisons the
-        # next run or bit-exact compare (fpga_compare_clear_dram_oracle). Clear,
-        # then re-raise. Normal completion does NOT clear — prefill still needs
-        # the encoder's feature DRAM.
-        ue.clear_dram()
         raise
-
     if os.environ.get("GEMMA4_ENCODER_ONLY"):
         print("[Mode] GEMMA4_ENCODER_ONLY set — exiting after encoder, "
               "skipping prefill+decode.")
@@ -7543,19 +7534,15 @@ def main():
         print(f"  text: (decode failed: {_e})")
     print(f"--- Prompt end ---")
     timer=time.perf_counter()
-    try:
-        latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
-        latency_prefill = time.perf_counter() - timer
-        print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
+    latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
+    latency_prefill = time.perf_counter() - timer
+    print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
-        timer=time.perf_counter()
-        token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
-        latency_decoder = time.perf_counter() - timer
-        print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(ue.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
-        print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} Gflops")
-    finally:
-        # Clear DRAM on EVERY exit (normal, Ctrl-C, timeout, exception) — §8b.
-        ue.clear_dram()
+    timer=time.perf_counter()
+    token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
+    latency_decoder = time.perf_counter() - timer
+    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(ue.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
+    print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} Gflops")
     print("Gemma4 E4B test ends.")
 
 if __name__ == "__main__":
