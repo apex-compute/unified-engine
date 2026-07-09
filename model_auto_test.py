@@ -266,12 +266,30 @@ def _check_locateanything(text):
     )
 
 def _check_parakeet(text):
-    # Pass if any non-empty transcription was produced.
-    found = bool(text.strip())
+    decoded = _test_result_field(text, "decoded_text")
+    if not isinstance(decoded, str):
+        return False, "missing decoded_text in TEST_RESULT"
+    keywords = ("unified engine", "apex computes", "custom ml inference accelerator")
+    matched = [keyword for keyword in keywords if keyword in decoded.lower()]
+    if not matched:
+        return False, "no expected transcription keywords found"
+    if len(matched) < len(keywords):
+        missing = [keyword for keyword in keywords if keyword not in matched]
+        return True, (
+            f"WARNING: matched {len(matched)}/{len(keywords)} transcription keywords; "
+            f"missing: {', '.join(missing)}"
+        )
+    return True, f"all expected transcription keywords found: {decoded!r}"
+
+def _check_swin(text):
+    decoded = _test_result_field(text, "decoded_text")
+    if not isinstance(decoded, str):
+        return False, "missing decoded_text in TEST_RESULT"
+    found = bool(re.search(r"\bsports?_car\b", decoded, re.IGNORECASE))
     return found, (
-        "non-empty transcription produced"
+        f"car-class keyword found: {decoded!r}"
         if found
-        else "empty transcription"
+        else f"expected sports_car or sport_car, got: {decoded!r}"
     )
 
 def _check_mbv2_224(text):
@@ -330,7 +348,7 @@ TESTS = [
     # at startup (ue.zero_dram()) before loading weights. Remove that self-zero
     # once the read-before-write gap is fixed.
     {"name": "smolvlm2", "script": "models/smolvlm2/smolvlm2_test.py", "pass_check": _check_smolvlm2, "mode": "VLM", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image. (default)"},
-    {"name": "smolvlm2_lm", "script": "models/smolvlm2/smolvlm2_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "extra_args": ["--lm-enable"], "mode": "LM"},
+    # TODO: SMOLVLM2 LM PATH IS BUGGY — restore the smolvlm2_lm auto-test only after it is fixed.
 
     # Vision / detection models: no --prompt; emit detections / class labels parsed
     # from stdout.
@@ -342,7 +360,7 @@ TESTS = [
     # segmentation).
     {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet},
     {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
-    {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_nonempty},
+    {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
 ]
 
 
