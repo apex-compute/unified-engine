@@ -1383,7 +1383,6 @@ def main():
 
     print("\n--- Running ---")
     ue.run_llama()
-    ue.clear_dram()
     print("Llama-3.2-3B test ends.")
 
 if __name__ == "__main__":

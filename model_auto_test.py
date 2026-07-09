@@ -126,30 +126,40 @@ def _check_smolvlm2(text):
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 def _extract_decode_text(text):
-    """Return streamed generated text between Gemma-style decode markers."""
-    marker = "------------------------------ DECODE START ------------------------------"
-    if marker not in text:
-        return ""
-    decoded = text.split(marker, 1)[1]
-    for stop in ("\nDecode speed:", "\nStop token ", "\nDecoder done in"):
-        if stop in decoded:
-            decoded = decoded.split(stop, 1)[0]
-            break
-    return _ANSI_RE.sub("", decoded).strip()
+    """Extract streamed generation from the supported VLM output formats."""
+    formats = (
+        (
+            "------------------------------ DECODE START ------------------------------",
+            ("\nDecode speed:", "\nStop token ", "\nDecoder done in"),
+        ),
+        (
+            "  Generated:",
+            ("\n  Decode summary:", "\nDecode summary", "\n  Decode speed"),
+        ),
+        (
+            "--- Decode run ---",
+            ("\nStop token ", "\nDecoder done in"),
+        ),
+    )
+    for marker, stops in formats:
+        if marker not in text:
+            continue
+        decoded = text.split(marker, 1)[1]
+        stop_positions = [decoded.find(stop) for stop in stops if stop in decoded]
+        if stop_positions:
+            decoded = decoded[:min(stop_positions)]
+        return _ANSI_RE.sub("", decoded).strip()
+    return ""
 
-def _check_coherent_decode_text(text):
-    decoded = _extract_decode_text(text)
+def _score_coherence(decoded):
+    """Heuristic coherence score over already-extracted decode text."""
     if not decoded:
-        return False, "no decoded text found after DECODE START"
-
+        return False, "no decoded text found"
     words = re.findall(r"[A-Za-z][A-Za-z']{1,}", decoded)
     unique_words = {w.lower() for w in words if len(w) >= 3}
     longest_char_run = max((len(m.group(0)) for m in re.finditer(r"(.)\1{3,}", decoded)), default=0)
     pipe_count = decoded.count("|")
-    alpha_ratio = (
-        sum(ch.isalpha() for ch in decoded) / max(1, len(decoded))
-    )
-
+    alpha_ratio = sum(ch.isalpha() for ch in decoded) / max(1, len(decoded))
     coherent = (
         len(words) >= 8
         and len(unique_words) >= 5
@@ -169,30 +179,42 @@ def _check_coherent_decode_text(text):
         )
     )
 
-def _check_gemma4_vlm_keywords(text, model_name):
-    coherent, reason = _check_coherent_decode_text(text)
+def _check_vlm(text, model_name, keywords, minimum_hits=4):
+    """Require coherent generated text and enough image-scene keyword hits."""
+    decoded = _extract_decode_text(text)
+    coherent, reason = _score_coherence(decoded)
     if not coherent:
         return False, reason
 
-    decoded = _extract_decode_text(text)
-    required_keywords = ("landscape", "lighting", "sun", "horizon")
-    missing = [
-        kw for kw in required_keywords
-        if not re.search(rf"\b{re.escape(kw)}\b", decoded, re.IGNORECASE)
+    hits = [
+        kw for kw in keywords
+        if re.search(rf"\b{re.escape(kw)}\b", decoded, re.IGNORECASE)
     ]
-    if missing:
+    if len(hits) < minimum_hits:
         preview = decoded[:120].replace("\n", " ")
         return False, (
-            f"missing {model_name} VLM keyword(s): {', '.join(missing)}; "
+            f"{model_name} VLM: only {len(hits)} scene keyword(s) {hits}; "
+            f"need >={minimum_hits}; "
             f"decoded preview: {preview!r}"
         )
-    return True, f"{reason}; found keywords: {', '.join(required_keywords)}"
+    return True, f"{reason}; scene keywords: {', '.join(hits)}"
+
+
+GEMMA4_VLM_KEYWORDS = ("landscape", "lighting", "sun", "horizon")
+QWEN_VLM_KEYWORDS = (
+    "mountain", "landscape", "valley", "sky", "sun", "sunrise", "sunset",
+    "light", "snow", "tree", "forest", "cliff", "rock", "river", "lake",
+    "water", "horizon", "fog", "mist", "peak",
+)
 
 def _check_gemma4_e2b_vlm(text):
-    return _check_gemma4_vlm_keywords(text, "E2B")
+    return _check_vlm(text, "E2B", GEMMA4_VLM_KEYWORDS)
 
 def _check_gemma4_e4b_vlm(text):
-    return _check_gemma4_vlm_keywords(text, "E4B")
+    return _check_vlm(text, "E4B", GEMMA4_VLM_KEYWORDS)
+
+def _check_qwen_vlm(text, model_name="qwen"):
+    return _check_vlm(text, model_name, QWEN_VLM_KEYWORDS)
 
 def _check_locateanything(text):
     n_boxes = len(re.findall(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", text))
@@ -246,7 +268,8 @@ MATH_PROMPT = "If x + 3 = 5, what is x?"
 
 TESTS = [
     # gemma3 has no run_from_bin yet — uses the _test.py entry point (like gpt2);
-    # swap to gemma3_run_from_bin.py once it exists.
+    # swap to gemma3_run_from_bin.py once it exists. The deprecated
+    # gemma3_test_IF8.py is deliberately excluded: IF8 is currently not working.
     {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     # Gemma4 run_from_bin entry points are deprecated in this branch; run the
     # migrated tests in VLM mode with their built-in default image/prompt and
@@ -258,7 +281,10 @@ TESTS = [
     {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_run_from_bin.py",       "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_run_from_bin.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_run_from_bin.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    # qwen3.5_2b VLM: FPGA vision encoder (--vision-enable defaults to on-FPGA vision)
+    # on yosemite.jpg; gemma4-style criteria (coherent decode + scene keywords).
+    {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
+    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_run_from_bin.py", "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the image in detail. (default)"},
     # smolvlm2 DEFAULTS to VLM (loads a bundled image + runs the vision encoder), so
     # --lm-enable forces pure language-model (text-only) mode. SmolVLM2-500M is too
     # small to reliably do algebra, so it gets a factual question it can answer
@@ -329,27 +355,24 @@ def _script_supports_flag(script_path: str, flag: str) -> bool:
 
 
 def resolve_script(rel_script: str):
-    """Pick the script to actually run, implementing the rule
-    'compiled bins present -> run_from_bin; otherwise -> _test.py'.
+    """Pick the script to actually run: ALWAYS the sibling *_test.py.
 
-    A *_run_from_bin.py entry point loads a pre-compiled programs.bin and cannot
-    recompile, so when that bin is absent we fall back to the sibling *_test.py, which
-    regenerates every artifact on the fly. Returns (chosen_rel_script, note): note is
-    None when the preferred script is kept, else a human-readable downgrade reason.
+    run_from_bin is disabled here — the *_run_from_bin.py replay path is bypassed
+    unconditionally in favor of the *_test.py entry point, which regenerates every
+    artifact (weights + instruction bin) on the fly and self-resets the device. Any
+    MODELS entry pointing at *_run_from_bin.py is rewritten to its *_test.py sibling.
+    Returns (chosen_rel_script, note): note is None when nothing was rewritten, else a
+    human-readable reason.
     """
     suffix = "_run_from_bin.py"
     if rel_script.endswith(suffix):
         base = rel_script[: -len(suffix)]                  # models/<X>/<X>
         name = os.path.basename(base)                      # <X>
-        programs = os.path.join(SCRIPT_DIR, os.path.dirname(rel_script),
-                                f"{name}_bin", "programs.bin")
-        if not os.path.isfile(programs):
-            test_py = base + "_test.py"
-            if os.path.isfile(os.path.join(SCRIPT_DIR, test_py)):
-                return test_py, (
-                    f"no compiled {name}_bin/programs.bin — "
-                    f"falling back to {os.path.basename(test_py)}"
-                )
+        test_py = base + "_test.py"
+        if os.path.isfile(os.path.join(SCRIPT_DIR, test_py)):
+            return test_py, (
+                f"run_from_bin disabled — running {os.path.basename(test_py)}"
+            )
     return rel_script, None
 
 
@@ -428,15 +451,25 @@ def run_test(test: dict, verbose: bool = False,
 
     t_start = time.perf_counter()
     if verbose:
-        # Stream live while still capturing for the pass-check / summary.
+        # Stream live while still capturing for the pass-check / summary. Read raw
+        # bytes: os.read() returns as soon as ANY data is available (it does NOT wait
+        # for a newline), so partial lines and \r progress updates appear the instant
+        # the child emits them. If the screen stops updating, the child is genuinely
+        # stalled — not just buffered behind a missing newline.
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=SCRIPT_DIR,
+            bufsize=0, cwd=SCRIPT_DIR,
         )
         captured = []
-        for line in proc.stdout:
-            print(line, end="", flush=True)
-            captured.append(line)
+        fd = proc.stdout.fileno()
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:                       # EOF — child closed stdout
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            captured.append(text)
         proc.wait()
         stdout, returncode = "".join(captured), proc.returncode
     else:
@@ -621,16 +654,20 @@ def main():
     # Initialize the FPGA once before running any model (software reset).
     reset_device(DMA_DEV)
 
-    for test in tests:
-        result = run_test(test, verbose=args.verbose,
-                          dev=args.dev, device=args.device)
-        results.append(result)
-        status = "PASS" if result["passed"] else "FAIL"
-        print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}\n")
+    try:
+        for test in tests:
+            result = run_test(test, verbose=args.verbose,
+                              dev=args.dev, device=args.device)
+            results.append(result)
+            status = "PASS" if result["passed"] else "FAIL"
+            print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}\n")
+    except KeyboardInterrupt:
+        print("\n[interrupted] writing summary for completed tests so far ...")
+    finally:
+        if results:
+            write_summary(results, summary_path)
 
-    write_summary(results, summary_path)
-
-    all_passed = all(r["passed"] for r in results)
+    all_passed = bool(results) and all(r["passed"] for r in results)
 
     sys.exit(0 if all_passed else 1)
 

@@ -2,6 +2,10 @@
 """
 Gemma3 IF8 inference on accelerator: prefill + decode.
 
+DEPRECATED: IF8 IS CURRENTLY NOT WORKING. This file is retained only for
+historical/debugging reference and is not part of the supported test suite.
+Use gemma3_test.py (IF4) for working Gemma3 inference.
+
 This is the IF8 (8-bit adaptive block-scaled) variant of gemma3_test.py. It is a
 one-for-one mirror of that file except for the IF8-specific design points:
 
@@ -2049,7 +2053,20 @@ def gemma3_decoder_quantized_matmat_compare_test(
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Gemma3 layer-0 prefill: run on accelerator, verify with torch ref.")
+    print(
+        "\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        "WARNING: gemma3_test_IF8.py IS DEPRECATED; IF8 IS NOT WORKING CURRENTLY.\n"
+        "Use gemma3_test.py (IF4) for supported Gemma3 inference.\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
+        file=sys.stderr,
+    )
+    parser = argparse.ArgumentParser(
+        description=(
+            "DEPRECATED, NON-WORKING Gemma3 IF8 experiment. "
+            "Use gemma3_test.py (IF4)."
+        )
+    )
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
     parser.add_argument("--local-weights", action="store_true", help="Use gemma3_if8_bin/full_model_weights.bin instead of generated weights_gemma3_hf.bin")
     parser.add_argument(

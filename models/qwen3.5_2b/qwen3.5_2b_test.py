@@ -4669,13 +4669,13 @@ def main():
                          "(src/template/test_samples/yosemite.jpg). "
                          "Ignored if --image is also given.")
     ap.add_argument("--vision-on-hardware", action="store_true",
-                    help="Run the vision encoder on FPGA. By default the vision "
-                         "encoder runs through Hugging Face on the host. "
-                         "Only meaningful with "
-                         "--vision-enable / --image.")
+                    help="[deprecated / now default] FPGA vision is the default when "
+                         "vision is enabled; kept for back-compat, no-op.")
+    ap.add_argument("--no-fpga-vision", action="store_true",
+                    help="Run the vision encoder through Hugging Face on the HOST instead "
+                         "of the FPGA. FPGA vision is the default with --vision-enable / "
+                         "--image.")
     args = ap.parse_args()
-    if args.vision_on_hardware and not (args.vision_enable or args.image):
-        ap.error("--vision-on-hardware requires --vision-enable or --image")
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
@@ -4683,7 +4683,9 @@ def main():
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
 
     # Hard-coded inference settings (formerly CLI flags, now defaults).
-    MAX_CONTEXT = 256
+    # 512 (not 256) so the default VLM run fits: an image adds ~144 vision tokens,
+    # pushing the prompt to ~166; with the default 128 new tokens that is 294 > 256.
+    MAX_CONTEXT = 512
     TEMPERATURE = 0.0
     TOP_K       = 0
 
@@ -4693,6 +4695,9 @@ def main():
     _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))
     DEFAULT_IMAGE = os.path.join(_TEST_SAMPLES, "yosemite.jpg")
     vision_on = bool(args.image) or args.vision_enable
+    # FPGA vision encoder is the DEFAULT when vision is enabled; --no-fpga-vision
+    # falls back to the host HF encoder. (--vision-on-hardware kept as a no-op.)
+    use_fpga_vision = vision_on and not args.no_fpga_vision
     image_path = args.image or (DEFAULT_IMAGE if args.vision_enable else None)
     if vision_on and image_path and not os.path.exists(image_path):
         raise SystemExit(f"Image file not found: {image_path}")
@@ -4707,7 +4712,7 @@ def main():
 
     print("=" * 78)
     if vision_on:
-        if args.vision_on_hardware:
+        if use_fpga_vision:
             print("  Qwen3.5-2B VLM inference on FPGA (vision + LM, full FPGA)")
         else:
             print("  Qwen3.5-2B VLM inference on FPGA (host-side vision, Phase 1)")
@@ -4814,7 +4819,7 @@ def main():
             _raw = f.read()
         with open(uni_meta_path) as f:
             _meta = json.load(f)
-    want_vision = bool(vision_on and args.vision_on_hardware)
+    want_vision = bool(use_fpga_vision)
     # Build when there is no bin yet, or when an on-FPGA VLM run finds a cached
     # bin that has no encoder section (e.g. an earlier LM-only build).
     need_build = (_meta is None) or (want_vision and _meta.get("encoder_size", 0) == 0)

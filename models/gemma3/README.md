@@ -2,9 +2,16 @@
 
 This folder contains the Gemma3 accelerator inference example and numeric verification.
 
+> [!WARNING]
+> `gemma3_test_IF8.py` is deprecated and IF8 is currently not working. It is
+> retained only for historical/debugging reference, excluded from
+> `model_auto_test.py`, and must not be treated as a supported inference path.
+> Use `gemma3_test.py` (IF4).
+
 ## Layout
 
 - **gemma3_test.py** – Prefill + decode loop on accelerator (single or dual engine).
+- **gemma3_test_IF8.py** – **Deprecated and currently non-working** IF8 experiment.
 - **gemma3_numeric.py** – Numeric verification with torch reference (prefill + decoder).
 - **gemma3_config.json** – Model and layout config.
 - **decoder_program.json** / **decoder_program_slave.json** – Decoder program metadata (written on first decoder compile).
