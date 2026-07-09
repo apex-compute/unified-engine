@@ -4,7 +4,7 @@
     "TMP_REG":           1,
     "GF_SEQ_LEN_REG":    2,
     "GF_Q_SEQ_LEN_REG":  3,
-    "GF_BUCKET_IDX_REG": 4
+    "GF_ALIGNED_SEQ_LEN_REG": 4
   },
   "file_info": {
     "layer_size": 40965632,

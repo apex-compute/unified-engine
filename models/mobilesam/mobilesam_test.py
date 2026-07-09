@@ -640,39 +640,6 @@ def multihead_merge_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
                            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR)
 
 
-def flash_attention_batched(ue: UnifiedEngine, num_batches: int, head_dim: int,
-                             seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
-                             V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                             SCRATCH_DRAM_ADDR: int,
-                             IDENTITY_DRAM_ADDR: int = None,
-                             BIAS_DRAM_ADDR: int = None,
-                             bias_shared: bool = False,
-                             gpr_bucket_idx: int = None,
-                             ATTN_P_DRAM_ADDR: int = None,
-                             num_buckets: int = 8) -> None:
-    identity_addr = IDENTITY_DRAM_ADDR if IDENTITY_DRAM_ADDR is not None else getattr(ue, "IDENTITY_DRAM", None)
-    stride = seq_len * head_dim * _BPE
-    scratch_stride = head_dim * seq_len * _BPE + seq_len * seq_len * _BPE
-    bias_stride = 0 if (BIAS_DRAM_ADDR is None or bias_shared) else seq_len * seq_len * _BPE
-    for b in range(num_batches):
-        bias_addr = (BIAS_DRAM_ADDR + b * bias_stride
-                     if (BIAS_DRAM_ADDR is not None and not bias_shared)
-                     else BIAS_DRAM_ADDR)
-        ue.flash_attention_core(
-            head_dim=head_dim, seq_len=seq_len,
-            Q_DRAM_ADDR=Q_DRAM_ADDR + b * stride,
-            K_DRAM_ADDR=K_DRAM_ADDR + b * stride,
-            V_DRAM_ADDR=V_DRAM_ADDR + b * stride,
-            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + b * stride,
-            SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR + b * scratch_stride,
-            IDENTITY_DRAM_ADDR=identity_addr,
-            BIAS_DRAM_ADDR=bias_addr,
-            gpr_bucket_idx=gpr_bucket_idx,
-            ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
-            num_buckets=num_buckets,
-        )
-
-
 def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
                                   q_len: int, kv_len: int,
                                   Q_DRAM_ADDR: int, K_DRAM_ADDR: int,
@@ -1130,13 +1097,11 @@ class MobileSAM_UE(UnifiedEngine):
         else:
             super().bf16_permute_core(dim_0, dim_1, dim_2, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR)
 
-    def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int,
-                            OUTPUT_DRAM_ADDR: int, use_pbi: bool = None,
-                            IDENTITY_DRAM_ADDR: int = None) -> None:
-        if use_pbi is None:
-            use_pbi = getattr(self, "_dec_pbi_reshape", True)
-        return super().bf16_transpose_core(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR,
-                                           use_pbi=use_pbi, IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR)
+    # bf16_transpose_core is inherited: the retired use_pbi=True fixed-shape PBI transpose was
+    # removed from the base (only the static legacy path and a runtime-dynamic PBI path remain).
+    # The legacy static transpose is bit-exact with the old PBI one, and it is the only safe choice
+    # for the V^T transpose now emitted inside the replayed flash subroutine (a PBI transpose there
+    # risks the back-to-back pointer-state wedge documented in flash_attention_batched_pbi).
 
     # ------------------------------------------------------------------
     # Weight init

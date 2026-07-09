@@ -23,10 +23,10 @@ from huggingface_hub import snapshot_download
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR,
-    UnifiedEngine, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES, UE_MODE,
+    UnifiedEngine, ue_35bit_addr_shifter, UE_MODE,
 )
 from nn_lib import (
     smart_bf16_permute_core,
@@ -157,10 +157,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     # Prefill PBI (seq-len-agnostic, gemma3-style): three runtime GPRs primed by run_prefill.
     #   gpr_seq_len    — token count S (matmul/norm/rope/eltwise/gather row loops)
     #   gpr_q_seq_len  — S * GROUP_SIZE (token-major stacked Q rope row loop)
-    #   gpr_bucket_idx — aligned(S*GROUP_SIZE)/64, 1-based flash bucket selector
+    #   gpr_aligned_seq_len — aligned attention K/V length for unified_attention_core
     GPR_SEQ_LEN_REG    = _cfg["fixed_isa_regs"]["GPR_SEQ_LEN_REG"]
     GPR_Q_SEQ_LEN_REG  = _cfg["fixed_isa_regs"]["GPR_Q_SEQ_LEN_REG"]
-    GPR_BUCKET_IDX_REG = _cfg["fixed_isa_regs"]["GPR_BUCKET_IDX_REG"]
+    GPR_ALIGNED_SEQ_LEN_REG = _cfg["fixed_isa_regs"]["GPR_ALIGNED_SEQ_LEN_REG"]
     # Max prompt length the compile-once prefill program supports (sets flash bucket count).
     PREFILL_MAX_SEQ_LEN = _cfg["model"]["prefill_max_seq_len"]
     def __init__(self, script_dir: str = None):
@@ -177,7 +177,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._isa_reg_counter = 1
         self.gpr_seq_len = self.GPR_SEQ_LEN_REG      # primed to S in run_prefill
         self.gpr_q_seq_len = self.GPR_Q_SEQ_LEN_REG  # primed to S*GROUP_SIZE in run_prefill
-        self.gpr_bucket_idx = self.GPR_BUCKET_IDX_REG  # primed to flash bucket in run_prefill
+        self.gpr_aligned_seq_len = self.GPR_ALIGNED_SEQ_LEN_REG
         # Unified single-bin assembly (compile_all): when active, the three compile_* methods stash
         # their (program_addr, bytes) into these instead of writing separate per-program bins.
         self._unified_active = False
@@ -189,8 +189,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     def _artifact_mode_suffix(self) -> str:
         # Only the decode linear kernel changes the compiled instruction stream (and, trivially, the
         # weight layout). The repetition penalty is a pure RUNTIME tensor-DRAM write (PENALTY_BIAS_DRAM,
-        # always wired as the LM-head C term with zeros = greedy), so it never affects weights.bin or
-        # instructions.bin and is deliberately NOT part of the artifact suffix/metadata.
+        # always wired as the LM-head C term with zeros = greedy), so it never affects params.bin or
+        # programs.bin and is deliberately NOT part of the artifact suffix/metadata.
         if bool(getattr(self, "decode_matmat_mul_core_enable", False)):
             return "_decode_matmat_mul_core"
         return ""
@@ -216,18 +216,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 f"[artifact-mode] {artifact_name} metadata mismatch: expected {exp}, got {got}"
             )
 
-    def reset_isa_reg_counter(self) -> None:
-        self._isa_reg_counter = 1
-    def alloc_isa_reg(self, reset: bool = False) -> int:
-        if reset:
-            self._isa_reg_counter = 1
-        if self._isa_reg_counter > 15:
-            raise ValueError("Exceeded available ISA registers (max 15)")
-        reg = self._isa_reg_counter
-        self._isa_reg_counter += 1
-        return reg
-    def clear_inst_id(self) -> None:
-        self._inst_id = 0
     def zero_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
         """Zero-fill the DRAM working range [DRAM_START_ADDR..0xFFFFFFFF].
 
@@ -253,8 +241,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             _original_print(f"\r  [{bar}] {pct*100:5.1f}%  {offset/1024**2:.0f}/{total/1024**2:.0f} MB",
                             end='', flush=True)
         _original_print()
-    def get_arg_max_index(self) -> int:
-        return self.read_reg32(UE_ARGMAX_INDEX)
     # --- Weight loading ---
     def weight_init(self) -> None:
         """Build ALL weights into params DRAM straight from the HF model — q4_64 LM (quantized on the
@@ -316,7 +302,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         _original_print(f"  Params DRAM: {params_used/1024/1024:.1f} MB used / {params_limit/1024/1024:.0f} MB available"
                         + (" OVERFLOW!" if params_used > params_limit else ""))
 
-        # --- Vision encoder weights (bf16) — always built so the instruction bin is the full VLM bin
+        # --- Vision encoder weights (bf16) — always built so the program bin is the full VLM bin
         # (one bin, robust + easy to maintain); whether vision RUNS is a runtime decision (--image). ---
         NPS = 32  # num_patches_per_side = 512 / 16
         boundaries = torch.arange(1.0 / NPS, 1.0, 1.0 / NPS, dtype=torch.float32)
@@ -394,23 +380,21 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self.LOGITS_DRAM = self.allocate_tensor_dram(1 * self.VOCAB_SIZE * bpe)
         # Causal mask for prefill (written by compile_prefill/load_prefill before use)
         self.CAUSAL_MASK_DRAM = self.allocate_tensor_dram(seq_len * seq_len * bpe)
-        # Decode bias: [GROUP_SIZE, max_seq_len] — written each decode step
+        # Decode bias: [GROUP_SIZE, max_seq_len] — written each decode step.
         self.DECODE_BIAS_DRAM = self.allocate_tensor_dram(self.GROUP_SIZE * seq_len * bpe)
-        # --- gemma3-style stacked-GQA flash buffers (seq-len-agnostic prefill) ---
-        # One bucket-dispatcher flash per kv-group operates on a square of aligned(S*GROUP_SIZE)
-        # rows. Buffers are sized for the largest bucket = aligned(PREFILL_MAX_SEQ_LEN*GROUP_SIZE).
+        # --- stacked-GQA unified-attention buffers (seq-len-agnostic prefill/decode) ---
+        # Prefill operates on aligned(S*GROUP_SIZE) stacked rows; decode reuses the same K/V buffers
+        # with batch=GROUP_SIZE and aligned_seq_len=aligned(current KV length).
         G = self.GROUP_SIZE
         qmax = ((self.PREFILL_MAX_SEQ_LEN * G + 63) // 64) * 64
         self.PREFILL_QMAX = qmax
-        self.FLASH_NUM_BUCKETS = qmax // UE_VECTOR_SIZE
         D = self.HEAD_DIM
         self.FLASH_Q_DRAM = self.allocate_tensor_dram(qmax * D * bpe)       # token-major stacked Q
         self.FLASH_K_DRAM = self.allocate_tensor_dram(qmax * D * bpe)       # K duplicated token-major
         self.FLASH_V_DRAM = self.allocate_tensor_dram(qmax * D * bpe)       # V duplicated token-major
         self.FLASH_OUT_DRAM = self.allocate_tensor_dram(qmax * D * bpe)     # attention output (stacked)
         self.FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(
-            UE_VECTOR_SIZE * qmax * bpe + D * qmax * bpe)                   # Vᵀ + softmax scratch
-        self.FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(qmax * qmax * bpe)  # fused QKᵀ+softmax probs
+            ((D + qmax) * qmax + qmax * D) * bpe)
         self.FLASH_BIAS_DRAM = self.allocate_tensor_dram(qmax * qmax * bpe)    # block-diagonal causal bias
         # RoPE cos/sin tables
         self._load_rope_tables()
@@ -429,7 +413,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self.VIS_K_PERM_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
         self.VIS_V_PERM_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
         self.VIS_ATTN_OUT_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
-        self.VIS_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram((64 * VS + 64 * VS) * bpe)
+        self.VIS_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram(((64 + VS) * VS + VS * 64) * bpe)
         self.VIS_ATTN_RESULT_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
         self.VIS_O_PROJ_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
         self.VIS_RESIDUAL_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
@@ -447,16 +431,14 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self.allocate_params_dram(permute_size)
         self.PERMUTE_TEMP_DRAM = self.get_tensor_dram_addr()
         self.allocate_tensor_dram(VS * VH * bpe * 2)  # temp space for permute decomposition
-        # §7 vision shared-subroutine flash: fixed single-head operand buffers ([VS, VD]) + the
-        # bucket-dispatcher's softmax-probs scratch ([VS, VS]). Each per-(layer,head) call site
-        # marshals its head's Q/K/V here, jumps into the one shared flash body, and copies VIS_FLASH_OUT
-        # back. Appended at the END of tensor_init so no earlier address shifts (run_from_bin mirrors).
+        # Vision unified-attention single-head operand buffers ([VS, VD]).
         VD = self.HEAD_DIM
         self.VIS_FLASH_Q_DRAM = self.allocate_tensor_dram(VS * VD * bpe)
         self.VIS_FLASH_K_DRAM = self.allocate_tensor_dram(VS * VD * bpe)
         self.VIS_FLASH_V_DRAM = self.allocate_tensor_dram(VS * VD * bpe)
         self.VIS_FLASH_OUT_DRAM = self.allocate_tensor_dram(VS * VD * bpe)
-        self.VIS_FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(VS * VS * bpe)
+        self.VIS_ATTN_BIAS_DRAM = self.allocate_tensor_dram(VS * VS * bpe)
+        self.dma_to_accelerator_memory(self.VIS_ATTN_BIAS_DRAM, torch.zeros(VS, VS, dtype=torch.bfloat16))
         # Fixed scratch for the SHARED vision layer body: the small per-layer params (biases ≤ 3072,
         # layer_norm gamma/beta = 768) are marshalled here from their register-driven source address
         # so the matmul/layernorm kernels read a static address. (Big weights go through gpr_B_reg.)
@@ -567,16 +549,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM,
             B_DRAM_ADDR=self.pos_embed_addr, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM)
 
-        # §7 shared-subroutine attention (vision): the per-head flash body is compiled ONCE after the
-        # encoder HALT; every per-(layer,head) call site marshals its head's [S, D] Q/K/V into the fixed
-        # VIS_FLASH buffers via a strided DMA (= the [S,768]→[12,S,64] head transpose), bakes ADD_SET
-        # gpr_bucket(=S/64=16)+gpr_ret, and jumps in. One-shot program; vis_prog_base == the bin load addr.
-        vis_prog_base = self.get_program_dram_addr()
-        vis_gpr_bucket = self.alloc_isa_reg()
-        vis_gpr_ret = self.alloc_isa_reg()
-        vis_call_sites: list[int] = []
-        vis_num_buckets = S // UE_VECTOR_SIZE   # 16 (single full-attention segment)
-
         def vis_matmul(M, K, N, A, la, proj, OUT, bias=None, **kw):
             self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_weight'],
                 OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N", gpr_M_reg=vis_S_reg, **kw)
@@ -603,13 +575,13 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                     self.accelerator_memory_to_sram(src, 0x00000, elems,
                         stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
                     self.sram_to_accelerator_memory(0x00000, dst, elems)
-                self.generate_instruction_add_set(vis_gpr_bucket, S // UE_VECTOR_SIZE)
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    vis_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
-                vis_call_sites.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                self.unified_attention_core(batch=S, aligned_seq_len=S, head_dim=D,
+                    Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM, K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.VIS_FLASH_V_DRAM, BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM, SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.identity_addr,
+                    gpr_batch_reg=vis_S_reg,
+                    gpr_aligned_seq_len_reg=vis_S_reg)
                 self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
                 self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
                     stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
@@ -638,19 +610,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             A_DRAM_ADDR=self.VIS_SHUFFLED_DRAM, B_DRAM_ADDR=self.connector_weight_addr,
             OUTPUT_DRAM_ADDR=self.VIS_CONNECTOR_DRAM)
 
-        self.generate_instruction_halt()   # encoder ends; shared flash body follows.
-
-        # ---- shared flash body (the §7 attention), after HALT; patch the attention jumps ----
-        vis_sub_start, _vis_flops = self.flash_attention_core(head_dim=D, seq_len=S,
-            Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM, K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.VIS_FLASH_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM, ATTN_P_DRAM_ADDR=self.VIS_FLASH_ATTN_P_DRAM,
-            IDENTITY_DRAM_ADDR=self.identity_addr,
-            gpr_bucket_idx=vis_gpr_bucket, num_buckets=vis_num_buckets, gpr_ret_id=vis_gpr_ret)
-        for _idx in vis_call_sites:
-            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(vis_sub_start))
-        self.release_isa_reg()  # vis_gpr_ret
-        self.release_isa_reg()  # vis_gpr_bucket
+        self.generate_instruction_halt()
         self.release_isa_reg()  # vis_ln_chunks
         self.release_isa_reg()  # vis_S_reg
         self.stop_capture()
@@ -674,17 +634,17 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
 
     def compile_prefill(self) -> None:
         """Seq-len-agnostic gemma3-style prefill. Compiled ONCE for PREFILL_MAX; the runtime length
-        is read by the bucket-dispatcher flash via gpr_bucket_idx. Permutes/matmuls/norms run static
+        is read by unified_attention_core via gpr_aligned_seq_len. Permutes/matmuls/norms run dynamic
         at PREFILL_MAX (shorter prompts padded with epsilon, masked by the block-diagonal bias);
         only the d64 RoPE (gpr) and the O(seq^2) flash (bucket) are runtime-sized.
 
         Per kv-group GQA into one flash: gather the 3 q-heads token-major [PM,G,D]; rope it (M=PM*G,
         token-major-duplicated table); rope the kv-head into the decoder KV cache then duplicate its
-        rows xG token-major; one flash_attention_core(gpr_bucket_idx); un-stack the output back into
+        rows xG token-major; run unified_attention_core; un-stack the output back into
         [PM,H]. Ends after the 32 layers with HALT (no final-norm/LM head — those depend on the
         runtime last-token offset and are emitted by run_prefill). Captured in place at a fixed
         program-DRAM address so the flash dispatcher's absolute jumps stay valid; run_prefill's
-        preamble primes gpr_bucket_idx and jump_abs-es into this program.
+        preamble primes runtime sequence GPRs and jump_abs-es into this program.
         """
         from user_dma_core import TYPE
         H, D, I = self.HIDDEN_SIZE, self.HEAD_DIM, self.INTERMEDIATE_SIZE
@@ -693,7 +653,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         bpe = 2
         PM = self.PREFILL_MAX_SEQ_LEN          # static row count for non-attention ops
         qmax = self.PREFILL_QMAX                # aligned(PM*G) — stacked flash rows
-        num_buckets = self.FLASH_NUM_BUCKETS
 
         def lm_matmul(M, K, N, A, proj, la, OUT, **kw):
             # PREFILL is M=PM (>1) → true GEMM via matmat_mul_core with gpr_M_reg (core_changes §3h):
@@ -736,15 +695,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._isa_reg_counter = max(self._cfg["fixed_isa_regs"].values()) + 1
         self.start_capture()
         prefill_addr = self.get_program_dram_addr()
-        # Constant runtime regs for the d64 RoPE loops (PM is compile-time fixed).
-        self.generate_instruction_add_set(self.gpr_seq_len, PM)
-        self.generate_instruction_add_set(self.gpr_q_seq_len, PM * G)
-        # §7 shared-subroutine attention: compile the bucket flash body ONCE after the HALT and have
-        # every per-(layer,kv-group) call site jump in (priming gpr_ret_id as the return address).
-        # gpr_bucket_idx is primed once at runtime by run_prefill's preamble (same seq_len for all
-        # groups/layers), so the call sites only set the return addr + jump.
-        gpr_ret_id = self.alloc_isa_reg()
-        flash_call_sites: list[int] = []
         for layer_idx in range(self.NUM_LAYERS):
             la = self.lm_layer_addrs[layer_idx]
             h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
@@ -796,15 +746,13 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 duplicate_gqa_rows(0x10000, self.FLASH_K_DRAM)
                 self.accelerator_memory_to_sram(v_cache, 0x20000, PM * D)
                 duplicate_gqa_rows(0x20000, self.FLASH_V_DRAM)
-                # §7 call site: jump into the shared flash subroutine (compiled after HALT). The
-                # group's Q/K/V are already marshalled into the fixed FLASH_Q/K/V buffers above, so
-                # this is a pure mechanical wrap (set return addr + jump; bucket primed by preamble).
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    prefill_addr + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                flash_call_sites.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                self.unified_attention_core(batch=PM * G, aligned_seq_len=qmax, head_dim=D,
+                    Q_DRAM_ADDR=self.FLASH_Q_DRAM, K_DRAM_ADDR=self.FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.FLASH_V_DRAM, BIAS_DRAM_ADDR=self.FLASH_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.FLASH_OUT_DRAM, SCRATCH_DRAM_ADDR=self.FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.identity_addr,
+                    gpr_batch_reg=self.gpr_q_seq_len,
+                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len)
                 # un-stack FLASH_OUT [PM,G,D] -> ATTN_RESULT [PM,H] at this group's head columns
                 for g in range(G):
                     strided_copy(self.FLASH_OUT_DRAM + g * D * bpe, G * D * bpe,
@@ -830,22 +778,11 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                     A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                     OUTPUT_DRAM_ADDR=h_out)
         self.generate_instruction_halt()
-        # §7: emit the shared flash subroutine AFTER the HALT (reachable only via the call-site jumps),
-        # then back-patch every recorded call site to its start.
-        flash_sub_start, flash_flops = self.flash_attention_core(head_dim=D, seq_len=qmax,
-            Q_DRAM_ADDR=self.FLASH_Q_DRAM, K_DRAM_ADDR=self.FLASH_K_DRAM,
-            V_DRAM_ADDR=self.FLASH_V_DRAM, OUTPUT_DRAM_ADDR=self.FLASH_OUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.FLASH_SCRATCH_DRAM, ATTN_P_DRAM_ADDR=self.FLASH_ATTN_P_DRAM,
-            IDENTITY_DRAM_ADDR=self.identity_addr, BIAS_DRAM_ADDR=self.FLASH_BIAS_DRAM,
-            gpr_bucket_idx=self.gpr_bucket_idx, num_buckets=num_buckets, gpr_ret_id=gpr_ret_id)
-        for _idx in flash_call_sites:
-            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(flash_sub_start))
-        self.release_isa_reg()  # gpr_ret_id
         self.stop_capture()
         self.write_captured_instructions_to_dram(prefill_addr)
         size_bytes = self.get_capture_instruction_size_bytes()
         # Cache the full program (gemma3 convention) so later runs load in ~1s instead of recompiling.
-        # Under compile_all, the bytes are stashed for the unified instructions.bin instead of a
+        # Under compile_all, the bytes are stashed for the unified programs.bin instead of a
         # separate prefill_program.bin.
         raw = bytearray()
         for inst in self.capture_buffer:
@@ -863,16 +800,13 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # Final hidden lands in the buffer matching the layer ping-pong parity.
         self._prefill_final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
         print(f"    Prefill compiled @0x{prefill_addr:X}: {size_bytes} bytes, "
-              f"{num_buckets} buckets, PM={PM}, qmax={qmax}")
+              f"unified_attention_core, PM={PM}, qmax={qmax}")
 
     def _restore_unified_addrs(self, meta: dict) -> None:
         """Set the program/preamble addresses the run_* methods read, from the unified-bin meta."""
         self._vis_program_addr = meta["encoder_addr"]
         self._decoder_program_addr = meta["decoder_addr"]
         self._decoder_preamble_addr = meta["decoder_preamble"]
-        self._decoder_num_buckets = meta["decoder_num_buckets"]
-        self._decoder_subroutine_start = meta.get("decoder_subroutine_start")
-        self._decoder_subroutine_call_sites = meta.get("decoder_subroutine_call_sites")
         self._decoder_attention_use_pbi = meta.get("decoder_attention_use_pbi")
         self._decoder_attention_impl = meta.get("decoder_attention_impl")
         self._decoder_attention_shared_subroutine = meta.get("decoder_attention_shared_subroutine")
@@ -882,33 +816,26 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._prefill_final_buf = meta["prefill_final_buf"]
         self._next_program_dram_addr = meta["end_addr"]
         if (self._decoder_attention_impl is None or self._decoder_attention_use_pbi is None or
-                self._decoder_attention_shared_subroutine is None or
-                self._decoder_subroutine_start is None or self._decoder_subroutine_call_sites is None):
+                self._decoder_attention_shared_subroutine is None):
             raise RuntimeError(
-                "[decoder-attn-path] cached instructions.json lacks decoder-attention branch metadata; "
+                "[decoder-attn-path] cached programs.json lacks decoder-attention branch metadata; "
                 "the artifact is stale/incompatible — delete smolvlm2_bin and rebuild")
-        if bool(self._decoder_attention_use_pbi) is not True or self._decoder_attention_impl != "pbi":
+        if bool(self._decoder_attention_use_pbi) is not False or self._decoder_attention_impl != "unified_attention_core":
             raise RuntimeError(
-                "[decoder-attn-path] loaded artifact is not the required SmolVLM2 PBI decoder-attention implementation")
+                "[decoder-attn-path] loaded artifact is not the required SmolVLM2 unified decoder-attention implementation")
 
     def _print_decoder_attn_path_banner(self, artifact_sha256: str) -> None:
-        """Required runtime banner: PBI is SmolVLM2's only decoder-attention implementation — shared
-        subroutine + 160 call sites (32 layers x 5 KV groups) are compile-time invariants, not
-        branch-dependent state, so they're hardcoded rather than read off self (valid right after a
-        fresh compile_decoder(), before _decoder_attention_shared_subroutine would be set).
-        Uses _original_print so the banner survives main()'s redirect_stdout around compile_all()."""
+        """Required runtime banner. Uses _original_print so it survives main()'s redirect_stdout."""
         _original_print(
             f"    [decoder-attn-path] model=smolvlm2 phase=lm_decode "
-            f"shared_subroutine=yes use_pbi=true implementation=pbi "
-            f"subroutine_start=0x{self._decoder_subroutine_start:X} "
-            f"call_sites={self._decoder_subroutine_call_sites} "
+            f"shared_subroutine=no use_pbi=false implementation=unified_attention_core "
             f"artifact_sha256={artifact_sha256} "
             f"metadata_validated=yes"
         )
 
     def compile_all(self) -> dict:
-        """Build (or load) the COMPLETE single instruction bin — encoder + decoder + prefill in ONE
-        instructions.bin. Mirrors qwen2.5_vl compile_all. The compile order (encoder, decoder,
+        """Build (or load) the COMPLETE single program bin — encoder + decoder + prefill in ONE
+        programs.bin. Mirrors qwen2.5_vl compile_all. The compile order (encoder, decoder,
         prefill) matches the validated 3-bin order, so every §7 JUMP_ABS bakes against the exact
         program-DRAM address it did before; the bin just bundles the three segments, each recorded with
         its absolute load address (see fpga_pbi_jump_target_bake). Cache key = layout signature."""
@@ -920,9 +847,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         sig = {"prefill_max_seq_len": self.PREFILL_MAX_SEQ_LEN, "num_layers": self.NUM_LAYERS,
                "num_vis_layers": len(self.vis_layer_addrs),
                "encoder_ln": "shared_zeros",
-               "decoder_attention_use_pbi": True,
-               "decoder_attention_impl": "pbi",
-               "decoder_attention_shared_subroutine": True,
+               "vision_attention_impl": "unified_attention_core_dynamic",
+               "decoder_attention_use_pbi": False,
+               "decoder_attention_impl": "unified_attention_core",
+               "decoder_attention_shared_subroutine": False,
                **self._artifact_mode_meta()}
 
         # ---- cache hit: replay the encoder LN params, DMA each program to its stored abs addr ----
@@ -968,9 +896,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 "encoder_addr": enc_addr,
                 "decoder_addr": self._decoder_program_addr,
                 "decoder_preamble": self._decoder_preamble_addr,
-                "decoder_num_buckets": self._decoder_num_buckets,
-                "decoder_subroutine_start": self._decoder_subroutine_start,
-                "decoder_subroutine_call_sites": self._decoder_subroutine_call_sites,
                 "prefill_addr": self._prefill_addr,
                 "prefill_preamble": self._prefill_preamble_addr,
                 "prefill_postamble": self._prefill_postamble_addr,
@@ -987,7 +912,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
 
     def run_prefill(self, token_ids, has_image: bool = False, total_flops: int = None) -> int:
         """Run the seq-len-agnostic prefill: host prep (epsilon pad + block bias), a preamble that
-        does on-device embed/merge + primes gpr_bucket_idx + jumps into the cached prefill, then a
+        does on-device embed/merge + primes dynamic sequence GPRs + jumps into the cached prefill, then a
         postamble that does final-norm + LM head on the runtime last token. Returns argmax."""
         from user_dma_core import TYPE
         seq_len = len(token_ids)
@@ -996,10 +921,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         H, D, G, bpe = self.HIDDEN_SIZE, self.HEAD_DIM, self.GROUP_SIZE, 2
         PM = self.PREFILL_MAX_SEQ_LEN
         assert seq_len <= PM, f"prompt {seq_len} exceeds PREFILL_MAX_SEQ_LEN={PM}"
-        qmax = self.PREFILL_QMAX
         qS = seq_len * G
         aligned_q = ((qS + 63) // 64) * 64
-        bucket_idx = aligned_q // UE_VECTOR_SIZE
         embed_row_bytes = H * bpe
 
         # Vision/connector execution is complete before run_prefill. Clear all
@@ -1017,7 +940,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         bias[torch.arange(aligned_q) >= qS, 0] = 0.0  # padded query rows attend row 0 (discarded)
         self.dma_to_accelerator_memory(self.FLASH_BIAS_DRAM, bias)
 
-        # 4. Preamble: on-device embed gather + vision merge + prime gpr_bucket_idx + jump into prefill
+        # 4. Preamble: on-device embed gather + vision merge + prime dynamic GPRs + jump into prefill
         self.clear_inst_id()
         self.start_capture()
         for t in range(seq_len):
@@ -1032,7 +955,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 for i, pos in enumerate(img_positions):
                     self.accelerator_memory_to_sram(self.VIS_CONNECTOR_DRAM + i * embed_row_bytes, 0x00000, H)
                     self.sram_to_accelerator_memory(0x00000, self.LAYER0_INPUT_DRAM + pos * embed_row_bytes, H)
-        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gpr_seq_len, seq_len)
+        self.generate_instruction_add_set(self.gpr_q_seq_len, qS)
+        self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_q)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(self._prefill_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(self._prefill_preamble_addr)
@@ -1076,13 +1001,11 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         return self.get_arg_max_index()
 
     def compile_decoder(self) -> None:
-        """Compile single decoder program with runtime kv_len dispatch via gpr_bucket_idx."""
+        """Compile single decoder program with runtime KV length via unified_attention_core."""
         from user_dma_core import TYPE
         H, D, I = self.HIDDEN_SIZE, self.HEAD_DIM, self.INTERMEDIATE_SIZE
         bpe = 2
         G = self.GROUP_SIZE
-        num_buckets = (self.max_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-
         def lm_matmul(M, K, N, A, proj, la, OUT, **kw):
             if bool(getattr(self, "decode_matmat_mul_core_enable", False)):
                 self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
@@ -1095,9 +1018,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # Guarantee counter starts at 1 regardless of prior compilations.
         self.reset_isa_reg_counter()
         # Reserve fixed ISA registers (1-6) so alloc_isa_reg() inside
-        # decoder_group_attention_core_pbi / matmat_mul_core never clobbers
+        # unified_attention_core / matmat_mul_core never clobbers
         # V_CACHE_SIZE_REG(1), ROPE_SIZE_REG(2), TMP_REG(3),
-        # gpr_seq_len(4), gpr_q_seq_len(5), gpr_bucket_idx(6) at runtime.
+        # gpr_seq_len(4), gpr_q_seq_len(5), gpr_aligned_seq_len(6) at runtime.
         _NUM_FIXED_REGS = 6
         for _ in range(_NUM_FIXED_REGS):
             self.alloc_isa_reg()
@@ -1106,15 +1029,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         _SILENT_MODE = True
         self.clear_inst_id()
         self.start_capture()
-        # §7 shared-subroutine decode attention: the bucketized decoder-group-attention body is
-        # compiled ONCE after the HALT; every per-(layer,kv-group) call site marshals its K/V history
-        # + Q into the fixed FLASH buffers and jumps in (priming gpr_ret_id as the return address).
-        # gpr_bucket_idx is primed once per step by run_decoder's preamble. dec_program_base equals
-        # _decoder_program_addr (no program-DRAM advances during capture).
-        dec_program_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-        dec_call_sites: list[int] = []
-
         for layer_idx in range(self.NUM_LAYERS):
             la = self.lm_layer_addrs[layer_idx]
             h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
@@ -1169,29 +1083,26 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 q_start = kv_b * G * D * bpe
                 k_cache_base = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
                 v_cache_base = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
-                # Gather the valid K/V history (gpr_bucket_idx buckets of UE_VECTOR_SIZE tokens) into the
-                # fixed FLASH_K/FLASH_V buffers — both are contiguous [seq, D] in the per-head cache, so
-                # one runtime PBI loop (trip = gpr_bucket_idx) copies them, leaving the bin seq-agnostic.
+                # Gather the valid K/V history into fixed FLASH_K/FLASH_V buffers.
                 self._emit_pbi_scatter_per_token(
-                    read_base=k_cache_base, read_stride_bytes=UE_VECTOR_SIZE * D * bpe,
-                    write_specs=[(self.FLASH_K_DRAM, UE_VECTOR_SIZE * D * bpe)],
-                    sram_byte_addr=0x50000, element_count=UE_VECTOR_SIZE * D,
-                    gpr_seq_len=self.gpr_bucket_idx, template_seq_len=num_buckets)
+                    read_base=k_cache_base, read_stride_bytes=D * bpe,
+                    write_specs=[(self.FLASH_K_DRAM, D * bpe)],
+                    sram_byte_addr=0x50000, element_count=D,
+                    gpr_seq_len=self.gpr_q_seq_len, template_seq_len=self.max_seq_len)
                 self._emit_pbi_scatter_per_token(
-                    read_base=v_cache_base, read_stride_bytes=UE_VECTOR_SIZE * D * bpe,
-                    write_specs=[(self.FLASH_V_DRAM, UE_VECTOR_SIZE * D * bpe)],
-                    sram_byte_addr=0x60000, element_count=UE_VECTOR_SIZE * D,
-                    gpr_seq_len=self.gpr_bucket_idx, template_seq_len=num_buckets)
+                    read_base=v_cache_base, read_stride_bytes=D * bpe,
+                    write_specs=[(self.FLASH_V_DRAM, D * bpe)],
+                    sram_byte_addr=0x60000, element_count=D,
+                    gpr_seq_len=self.gpr_q_seq_len, template_seq_len=self.max_seq_len)
                 # Scatter the group's Q [G, D] into the fixed FLASH_Q base (drop the per-group offset).
                 self.accelerator_memory_to_sram(self.LAYER0_Q_PERM_DRAM + q_start, 0x30000, G * D)
                 self.sram_to_accelerator_memory(0x30000, self.FLASH_Q_DRAM, G * D)
-                # §7 call site: prime return addr + jump into the shared decoder-attention subroutine.
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    dec_program_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                dec_call_sites.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                self.unified_attention_core(batch=G, aligned_seq_len=self.max_seq_len, head_dim=D,
+                    Q_DRAM_ADDR=self.FLASH_Q_DRAM, K_DRAM_ADDR=self.FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.FLASH_V_DRAM, BIAS_DRAM_ADDR=self.DECODE_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.FLASH_OUT_DRAM, SCRATCH_DRAM_ADDR=self.FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.identity_addr,
+                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len)
                 # Copy the group output [G, D] back to this group's columns in ATTN_OUT.
                 self.accelerator_memory_to_sram(self.FLASH_OUT_DRAM, 0x40000, G * D)
                 self.sram_to_accelerator_memory(0x40000, self.LAYER0_ATTN_OUT_DRAM + q_start, G * D)
@@ -1240,21 +1151,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # Advance token position on-device so next decode step writes to the right KV slot
         self.generate_instruction_add_inc(self.gpr_seq_len)
         self.generate_instruction_halt()
-        # §7: emit the shared decoder-attention subroutine AFTER the HALT (reachable only via the
-        # call-site jumps), then back-patch every recorded call site to its start. SmolVLM2 uses the
-        # maintained PBI body here; one copy replaces the prior per-layer/per-group inline expansion.
-        dec_sub_start, _dec_flops = self.decoder_group_attention_core_pbi(
-            group_size=G, head_dim=D,
-            Q_DRAM_ADDR=self.FLASH_Q_DRAM, K_DRAM_ADDR=self.FLASH_K_DRAM, V_DRAM_ADDR=self.FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.FLASH_OUT_DRAM, SCRATCH_DRAM_ADDR=self.LAYER0_ATTN_SCRATCH_DRAM,
-            BIAS_DRAM_ADDR=self.DECODE_BIAS_DRAM, IDENTITY_DRAM_ADDR=self.identity_addr,
-            gpr_bucket_idx=self.gpr_bucket_idx, num_buckets=num_buckets, use_pbi=True,
-            gpr_ret_id=gpr_ret_id)
-        self._decoder_sub_start = dec_sub_start
-        self._decoder_call_sites = list(dec_call_sites)
-        for _idx in dec_call_sites:
-            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(dec_sub_start))
-        self.release_isa_reg()  # gpr_ret_id
         self.stop_capture()
         for _ in range(_NUM_FIXED_REGS):
             self.release_isa_reg()
@@ -1272,9 +1168,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self.allocate_program_dram(len(raw))
         self._decoder_preamble_addr = self.get_program_dram_addr()
         self.allocate_program_dram(256)
-        self._decoder_num_buckets = num_buckets
-        self._decoder_subroutine_start = dec_sub_start
-        self._decoder_subroutine_call_sites = len(dec_call_sites)
+        self._decoder_attention_use_pbi = False
+        self._decoder_attention_impl = "unified_attention_core"
+        self._decoder_attention_shared_subroutine = False
         if self._unified_active:
             self._seg_decoder = (self._decoder_program_addr, bytes(raw))
         else:
@@ -1283,17 +1179,15 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             with open(os.path.join(bin_dir, "decoder_program.json"), "w") as f:
                 json.dump({
                     "decoder_program_size": len(raw),
-                    "num_buckets": num_buckets,
+                    "max_seq_len": self.max_seq_len,
                     "version": 2,
                     "decoder_attention_use_pbi": self._decoder_attention_use_pbi,
                     "decoder_attention_impl": self._decoder_attention_impl,
                     "decoder_attention_shared_subroutine": self._decoder_attention_shared_subroutine,
-                    "decoder_subroutine_start": self._decoder_subroutine_start,
-                    "decoder_subroutine_call_sites": self._decoder_subroutine_call_sites,
                 }, f)
         print(
             f"    Decoder compiled: single program {len(raw)} bytes at 0x{self._decoder_program_addr:X}, "
-            f"{num_buckets} attention buckets"
+            "unified_attention_core"
         )
         artifact_sha256 = hashlib.sha256(bytes(raw)).hexdigest()
 
@@ -1333,7 +1227,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             # Prefill (gemma3-style) RoPE tables + stacked-GQA flash buffers
             "ROPE_PACKED_DRAM", "ROPE_PACKED_GQA_DRAM",
             "FLASH_Q_DRAM", "FLASH_K_DRAM", "FLASH_V_DRAM", "FLASH_OUT_DRAM",
-            "FLASH_SCRATCH_DRAM", "FLASH_ATTN_P_DRAM", "FLASH_BIAS_DRAM",
+            "FLASH_SCRATCH_DRAM", "FLASH_BIAS_DRAM", "VIS_ATTN_BIAS_DRAM",
         ]
         meta = {
             "params_size": total,
@@ -1346,7 +1240,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             "vision_bf16": self.vision_bf16,
             "_num_vis_layers": len(self.vis_layer_addrs),
             "PREFILL_QMAX": self.PREFILL_QMAX,
-            "FLASH_NUM_BUCKETS": self.FLASH_NUM_BUCKETS,
             **self._artifact_mode_meta(),
             # LM weight addresses: run_prefill re-captures the decoder + LM postamble fresh
             # each run, so it needs the real per-layer/final/lm-head addresses (NOT just a count).
@@ -1421,7 +1314,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         enc_flops = (2 * VS * VH * VH + VS * VH + VS * VH
             + n_vis * per_layer + 7 * VS * VH
             + 2 * 64 * 12288 * self.HIDDEN_SIZE)
-        self.program_execute(encoder_addr, timeout=30.0, total_flops=enc_flops)
+        self.program_execute(encoder_addr, timeout=30.0, flops=enc_flops)
 
     def _structural_token_ids(self):
         """Token ids that must NEVER be repetition-penalized: punctuation, whitespace, and special
@@ -1501,7 +1394,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         H = self.HIDDEN_SIZE
         bpe = 2
         embed_row_bytes = H * bpe
-        num_buckets = self._decoder_num_buckets
         decoder_program_addr = self._decoder_program_addr
         preamble_addr = self._decoder_preamble_addr
         self._runtime_attention_zero_decode_calls = 0
@@ -1552,10 +1444,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             _SILENT_MODE = True
             self.seq_len += 1
             aligned_kv = ((self.seq_len + 63) // 64) * 64
-            bucket_idx = min(aligned_kv // UE_VECTOR_SIZE, num_buckets)
 
-            # Decode bias: [GROUP_SIZE, max_seq_len] with zeros at valid KV positions
-            bias = torch.full((self.GROUP_SIZE, self.max_seq_len), -1e38, dtype=torch.bfloat16)
+            # Decode bias is compact [GROUP_SIZE, aligned_kv]; unified_attention_core's full-matrix
+            # bias row stride is the dynamic aligned_seq_len, not max_seq_len.
+            bias = torch.full((self.GROUP_SIZE, aligned_kv), -1e38, dtype=torch.bfloat16)
             bias[:, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.DECODE_BIAS_DRAM, bias)
 
@@ -1564,11 +1456,12 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             embed_vec = self.dma_from_accelerator_memory(src_addr, torch.Size([H]))
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embed_vec)
 
-            # Preamble: prime gpr_seq_len + gpr_bucket_idx + jump into decoder
+            # Preamble: prime dynamic sequence GPRs + jump into decoder
             self.clear_inst_id()
             self.start_capture()
             self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len - 1)
-            self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            self.generate_instruction_add_set(self.gpr_q_seq_len, self.seq_len)
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_kv)
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
             self.write_captured_instructions_to_dram(preamble_addr)
@@ -1607,17 +1500,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             _original_print(f"\nStopped: {_reason} ({len(generated)} tokens).")
         _SILENT_MODE = False
         return generated
-    def program_execute(self, program_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR,
-                        timeout: float = 10.0, total_flops: int = None) -> None:
-        """Execute compiled program from DRAM."""
-        self.start_execute_from_dram(program_addr)
-        self.wait_queue(timeout)
-        if total_flops is not None:
-            self._last_hw_gflops = self.report_flop_rate_gflops(total_flops)
-            self._last_total_flops = total_flops
-        else:
-            self._last_hw_gflops = None
-            self._last_total_flops = None
 # =============================================================================
 # Image processing + input construction
 # =============================================================================
@@ -1714,6 +1596,13 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
+    # Software-reset the engine, then clear DRAM to 0 before anything else.
+    # SmolVLM2 has a read-before-write defect and depends on clean, zero-filled
+    # DRAM. The harness now poisons DRAM (0xFF) before SmolVLM2 like every other
+    # model, so the model must reset and zero it itself before loading weights /
+    # running. Remove once the gap is fixed.
+    ue.software_reset()
+    ue.zero_dram()
     ue.decode_matmat_mul_core_enable = bool(args.decode_matmat_mul_core_enable)
     ue.penalty_enable = not bool(args.greedy_enable)
     _original_print(f"decode_linear={ 'if4_matmat_mul_core' if ue.decode_matmat_mul_core_enable else 'quantized_matmat_core' }")
@@ -1728,8 +1617,6 @@ def main():
         args.image = _default_image   # VLM default with no --image → use the bundled sample image
     if args.prompt is None:           # mode-appropriate default prompt
         args.prompt = _d["lm_prompt"] if lm_only else _d["vlm_prompt"]
-    # No startup DRAM zeroing: each run already zero_dram()s at the END (below), so the next run starts
-    # clean; weights/instructions are DMA'd over their regions. (Avoids the slow 2 GB zero every launch.)
     init_hang_prevention(ue)
     _artifact_suffix = ue._artifact_mode_suffix()
     # Load the snapshot (params.bin) only when the single program bin also exists.
@@ -1844,7 +1731,6 @@ def main():
         f"SmolVLM2 test ends. prefill {round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0} tok/s, "
         f"decode {round(n_generated / decode_time, 2) if decode_time > 0 else 0.0} tok/s.")
 
-    ue.zero_dram()
     _SILENT_MODE = True
     ue.software_reset()
 

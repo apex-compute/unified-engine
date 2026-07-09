@@ -162,40 +162,6 @@ def bf16_patching_core(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR
     return total_flops
 
 
-def flash_attention_batched(ue: UnifiedEngine, num_batches: int, head_dim: int, seq_len: int,
-                            Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int,
-                            OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int,
-                            IDENTITY_DRAM_ADDR: int,
-                            BIAS_DRAM_ADDR: int = None) -> int:
-    """Batched flash attention: loop over num_batches calling flash_attention_core.
-
-    Each batch is one attention head. Q/K/V/OUTPUT are laid out contiguously
-    in DRAM with stride (seq_len * head_dim) per batch. BIAS stride is
-    (seq_len * seq_len) per batch if provided.
-
-    Returns total flops.
-    """
-    bytes_per_element = 2
-    qkv_batch_stride = seq_len * head_dim * bytes_per_element
-    output_batch_stride = seq_len * head_dim * bytes_per_element
-    scratch_batch_stride = head_dim * seq_len * bytes_per_element + seq_len * seq_len * bytes_per_element  # V^T + partial softmax
-    bias_batch_stride = seq_len * seq_len * bytes_per_element if BIAS_DRAM_ADDR is not None else 0
-
-    total_flops = 0
-    for b in range(num_batches):
-        bias_addr = BIAS_DRAM_ADDR + b * bias_batch_stride if BIAS_DRAM_ADDR is not None else None
-        total_flops += ue.flash_attention_core(
-            head_dim=head_dim,
-            seq_len=seq_len,
-            Q_DRAM_ADDR=Q_DRAM_ADDR + b * qkv_batch_stride,
-            K_DRAM_ADDR=K_DRAM_ADDR + b * qkv_batch_stride,
-            V_DRAM_ADDR=V_DRAM_ADDR + b * qkv_batch_stride,
-            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + b * output_batch_stride,
-            SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR + b * scratch_batch_stride,
-            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-            BIAS_DRAM_ADDR=bias_addr,
-        )
-    return total_flops
 def window_partition_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                           H: int, W: int, C: int, window_size: int) -> None:
     """Rearrange (H, W, C) -> (num_windows, window_size*window_size, C) in DRAM.
@@ -675,28 +641,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
             cs -= 1
         return M // cs
 
-    def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
-        """Chunked override to avoid segfault on large instruction DMA writes."""
-        if not self.capture_buffer or self.capture_count == 0:
-            return 0
-
-        total_bytes = self.capture_count * 32
-        all_bytes = bytearray()
-        for inst in self.capture_buffer:
-            all_bytes.extend(inst.get_bytes())
-        data = bytes(all_bytes)
-
-        if not _SILENT_MODE:
-            _original_print(f"Writing {self.capture_count:,} instructions ({total_bytes / 1024**2:.1f} MB) to DRAM at 0x{start_addr:x}...")
-        offset = 0
-        while offset < total_bytes:
-            chunk = min(self.DMA_CHUNK_BYTES, total_bytes - offset)
-            self.dma_write(DMA_DEVICE_H2C, start_addr + offset, data[offset:offset + chunk], chunk)
-            offset += chunk
-        if not _SILENT_MODE:
-            _original_print(f"Successfully wrote {total_bytes / 1024**2:.1f} MB ({self.capture_count:,} instructions) to DRAM")
-        return total_bytes
-
     def _alloc_param(self, tensor: torch.Tensor) -> int:
         """Allocate params DRAM, write bf16 tensor. Returns DRAM address."""
         t = tensor.to(torch.bfloat16).contiguous()
@@ -786,20 +730,21 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_before_beta'] = self._alloc_param(block.layernorm_before.bias.data)
 
                 # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages.
-                # transformers>=5 nests projections under SwinAttention.self (query/key/value).
-                attn = block.attention.self
-                for name, proj in [('q', attn.query), ('k', attn.key), ('v', attn.value)]:
+                # transformers>=5 flattens projections onto SwinAttention (q_proj/k_proj/v_proj).
+                attn = block.attention
+                for name, proj in [('q', attn.q_proj), ('k', attn.k_proj), ('v', attn.v_proj)]:
                     lw[f'{name}_weight'] = self._alloc_param(proj.weight.data)
                     lw[f'{name}_bias'] = self._alloc_param(proj.bias.data)
 
                 # Relative position bias: precompute (num_heads, window_area, window_area)
                 # then pad to (num_heads, window_area_pad, window_area_pad)
                 # Tile for all windows: (num_windows * num_heads, wa_pad, wa_pad)
-                # Layout matches flash_attention_batched: batch b = (w * num_heads + h)
+                # Layout matches flash_attention_batched_pbi: batch b = (w * num_heads + h)
                 # gets bias at offset b * wa_pad * wa_pad. Since all windows share
                 # the same per-head bias, we tile num_windows copies.
-                rel_pos_bias_table = attn.relative_position_bias_table  # (529, num_heads)
-                rel_pos_index = attn.relative_position_index  # flat (window_area*window_area,)
+                # transformers>=5 nests these under the SwinRelativePositionBias submodule.
+                rel_pos_bias_table = attn.relative_position_bias.relative_position_bias_table  # (529, num_heads)
+                rel_pos_index = attn.relative_position_bias.relative_position_index  # flat (window_area*window_area,)
                 rpb = rel_pos_bias_table[rel_pos_index.view(-1)].view(window_area, window_area, num_heads)
                 rpb = rpb.permute(2, 0, 1).contiguous().to(torch.bfloat16)  # (num_heads, 144, 144)
                 # Pad to (num_heads, 192, 192) with -100 in padding positions
@@ -812,8 +757,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     nw * num_heads, window_area_pad, window_area_pad).contiguous()
                 lw['rel_pos_bias'] = self._alloc_param(rpb_tiled)
 
-                # Output projection (attention) — transformers>=5: SwinAttention.output.dense
-                out_proj = block.attention.output.dense
+                # Output projection (attention) — transformers>=5: SwinAttention.o_proj
+                out_proj = block.attention.o_proj
                 lw['out_proj_weight'] = self._alloc_param(out_proj.weight.data)
                 lw['out_proj_bias'] = self._alloc_param(out_proj.bias.data)
 
@@ -821,13 +766,13 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_after_gamma'] = self._alloc_param(block.layernorm_after.weight.data)
                 lw['ln_after_beta'] = self._alloc_param(block.layernorm_after.bias.data)
 
-                # MLP expand: (mlp_dim, dim) — transformers>=5: SwinIntermediate.dense
-                lw['mlp_expand_weight'] = self._alloc_param(block.intermediate.dense.weight.data)
-                lw['mlp_expand_bias'] = self._alloc_param(block.intermediate.dense.bias.data)
+                # MLP expand: (mlp_dim, dim) — transformers>=5: SwinMLP.fc1
+                lw['mlp_expand_weight'] = self._alloc_param(block.mlp.fc1.weight.data)
+                lw['mlp_expand_bias'] = self._alloc_param(block.mlp.fc1.bias.data)
 
-                # MLP contract: (dim, mlp_dim) — transformers>=5: SwinOutput.dense
-                lw['mlp_contract_weight'] = self._alloc_param(block.output.dense.weight.data)
-                lw['mlp_contract_bias'] = self._alloc_param(block.output.dense.bias.data)
+                # MLP contract: (dim, mlp_dim) — transformers>=5: SwinMLP.fc2
+                lw['mlp_contract_weight'] = self._alloc_param(block.mlp.fc2.weight.data)
+                lw['mlp_contract_bias'] = self._alloc_param(block.mlp.fc2.bias.data)
 
                 stage_weights.append(lw)
             self.encoder_weights.append(stage_weights)
@@ -922,10 +867,10 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
             # Attention output: (total_batches, wa_pad, hd_pad)
             st['attn_output'] = self._alloc_tensor(total_batches * wa_pad * hd_pad)
-            # Shared scratch for the staged legacy flash subroutine: V^T (hd_pad*wa_pad) +
-            # partial-softmax region (UE_FMAX_CONTEXT_SIZE*wa_pad), reused per window.
-            from user_dma_core import UE_FMAX_CONTEXT_SIZE
-            scratch_shared = (hd_pad + UE_FMAX_CONTEXT_SIZE) * wa_pad
+            # Shared scratch for the staged unified_attention_core subroutine, reused per
+            # window. Its layout is V^T (hd_pad*wa_pad) + full score matrix (wa_pad*wa_pad) +
+            # scaled_q (wa_pad*hd_pad) = (2*hd_pad + wa_pad) * wa_pad elements.
+            scratch_shared = (2 * hd_pad + wa_pad) * wa_pad
             st['attn_scratch'] = self._alloc_tensor(scratch_shared)
             # Shared ATTN_P buffer (unused by legacy flash; kept for call compat)
             st['attn_p'] = self._alloc_tensor(wa_pad * wa_pad)
@@ -1110,7 +1055,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_halt()
             self.stop_capture()
             pa = self.get_program_dram_addr()
-            self.write_captured_instructions_to_dram(pa)
+            self.write_captured_instructions_to_dram(pa, chunk_bytes=self.DMA_CHUNK_BYTES)
             self.allocate_program_dram(self.get_capture_instruction_size_bytes())
             self.clear_capture_buffer()
             return pa
@@ -1181,7 +1126,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_halt()
             self.stop_capture()
             pa = self.get_program_dram_addr()
-            self.write_captured_instructions_to_dram(pa)
+            self.write_captured_instructions_to_dram(pa, chunk_bytes=self.DMA_CHUNK_BYTES)
             self.allocate_program_dram(self.get_capture_instruction_size_bytes())
             self.clear_capture_buffer()
             return pa
@@ -1584,7 +1529,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.stop_capture()
 
         prog_addr = self.get_program_dram_addr()
-        self.write_captured_instructions_to_dram(prog_addr)
+        self.write_captured_instructions_to_dram(prog_addr, chunk_bytes=self.DMA_CHUNK_BYTES)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
         self.clear_capture_buffer()
 
@@ -1596,11 +1541,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.IMAGE_DRAM, image_chw.contiguous().flatten())
         self.start_execute_from_dram(program_addr)
         self.wait_queue(timeout)
-        return self.get_arg_max_index1()
-
-    def get_arg_max_index1(self):
-        """Read hardware argmax1 register."""
-        return self.read_reg32(user_dma_core.UE_ARGMAX1_INDEX)
+        return self.get_arg_max_index()
 
 
 # ---------------------------------------------------------------------------

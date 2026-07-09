@@ -78,7 +78,14 @@ DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
 # Bumped any time the on-disk programs.bin layout / ISA semantics
 # change in an incompatible way. On version mismatch the bin is rebuilt from
 # scratch rather than incrementally extended.
-INSTRUCTION_BIN_COMPILE_VERSION = "v1"
+# v2-dynvis: vision attention uses andromeda's flash_attention_core_dynamic
+#            (dedicated VIS_ATTN_P scores buffer). Tensor layout unchanged, so
+#            replay only needs the matching version tag.
+# v3-uac:    vision attention uses the library unified_attention_core; scores +
+#            scaled_q fold into VIS_FLASH_SCRATCH (resized to aligned_S² +
+#            2·HD·aligned_S). Tensor layout CHANGED — this allocation must mirror
+#            test.py exactly or the replayed bin's baked addresses drift.
+INSTRUCTION_BIN_COMPILE_VERSION = "v3-uac"
 
 # We run on FPGA + CPU only; disable CUDA before importing torch so PyTorch
 # doesn't probe the GPU driver (avoids a noisy "Error 804: forward compatibility"
@@ -1871,11 +1878,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._vis_bias_guard_pre  = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
         self.VIS_FLASH_BIAS = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
         self._vis_bias_guard_post = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
+        # v3-uac: unified_attention_core fold layout — Vᵀ + scores + scaled_q in
+        # one SCRATCH = aligned_S² + 2·HD·aligned_S BF16 elements. MUST match
+        # test.py's vision_tensor_init exactly (same size + alloc order) so the
+        # baked bin's addresses land correctly. run_from_bin loads; it never re-emits.
         self.VIS_FLASH_SCRATCH = self.allocate_tensor_dram(
-            (HD + aligned_S) * aligned_S * 2)
-        # §7g shared-subroutine vision flash P-scratch — MUST mirror test.py's
-        # vision_tensor_init (same alloc order) so the baked bin's ATTN_P reads
-        # land on this buffer. run_from_bin loads the §7 bin; it does not re-emit.
+            (aligned_S * aligned_S + 2 * HD * aligned_S) * 2)
+        # VIS_ATTN_P is unused by unified_attention_core (scores fold into SCRATCH),
+        # but keep the allocation so the alloc ORDER — and thus every subsequent baked
+        # address — stays identical to test.py's vision_tensor_init.
         self.VIS_ATTN_P = self.allocate_tensor_dram(aligned_S * aligned_S * 2)
 
         # 64×64 BF16 identity matrix for FPGA clamp passes (used by
@@ -7732,16 +7743,7 @@ def main():
             print(f"[Mode] LM — default prompt")
             ue.set_prefill_seq()
     except BaseException:
-        # §8b: the VLM/audio encoder one-shot runs HERE (inside set_prefill_seq_*),
-        # BEFORE the prefill/decode try/finally below. It is the longest single
-        # execute (~10s) and writes scratch DRAM, so a Ctrl-C / crash here would
-        # otherwise escape the finally and leave stale scratch that poisons the
-        # next run or bit-exact compare (fpga_compare_clear_dram_oracle). Clear,
-        # then re-raise. Normal completion does NOT clear — prefill still needs
-        # the encoder's feature DRAM.
-        ue.clear_dram()
         raise
-
     if os.environ.get("GEMMA4_ENCODER_ONLY"):
         print("[Mode] GEMMA4_ENCODER_ONLY set — exiting after encoder, "
               "skipping prefill+decode.")
@@ -7798,20 +7800,22 @@ def main():
         print(f"  text: (decode failed: {_e})")
     print(f"--- Prompt end ---")
     timer=time.perf_counter()
-    try:
-        latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
-        latency_prefill = time.perf_counter() - timer
-        print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
+    latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
+    latency_prefill = time.perf_counter() - timer
+    print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
-        timer=time.perf_counter()
-        token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
-        latency_decoder = time.perf_counter() - timer
-        print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(ue.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
-        print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} Gflops")
-    finally:
-        # Clear DRAM on EVERY exit (normal, Ctrl-C, timeout, exception) — §8b.
-        ue.clear_dram()
+    timer=time.perf_counter()
+    token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
+    latency_decoder = time.perf_counter() - timer
+    print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f} seconds, speed: {(token_cnt_decoded - len(ue.prefill_seq) + 1) / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
+    print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} Gflops")
     print("Gemma4 E2B test ends.")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "DEPRECATED / OUTDATED: gemma4_e2b_run_from_bin.py is no longer runnable. It "
+        "still calls flash_attention_core / decoder_group_attention_core, which were "
+        "removed from user_dma_core.py during the unified_attention_core migration, so "
+        "its compile paths reference methods that no longer exist. Use the migrated "
+        "gemma4_e2b_test.py (unified_attention_core) instead."
+    )

@@ -3,7 +3,8 @@
     "TMP_REG":            1,
     "GPR_SEQ_LEN_REG":     2,
     "GPR_Q_SEQ_LEN_REG":   3,
-    "GPR_BUCKET_IDX_REG":  4
+    "GPR_BUCKET_IDX_REG":  4,
+    "GPR_ALIGNED_SEQ_LEN_REG": 5
   },
   "file_info": {
     "_comment": "E4B dims. Differences from E2B: hidden 1536->2560, num_layers 35->42, num_key_value_heads 1->2 (group_size 8->4), intermediate 6144->10240, use_double_wide_mlp=false (E2B had double-wide for layers 15-34). Vision and audio encoder dims unchanged.",

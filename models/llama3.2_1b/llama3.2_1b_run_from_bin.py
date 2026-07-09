@@ -615,7 +615,6 @@ def main():
         _original_print("Decode: plain greedy (deterministic) — no penalty (writeback-on bin)")
 
     ue.run_llama()
-    ue.clear_dram()
     _original_print("Llama-3.2-1B run_from_bin ends.")
 
 

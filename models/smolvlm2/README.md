@@ -5,7 +5,7 @@ language.** SigLIP vision encoder (12 layers) → pixel-shuffle connector → Sm
 
 ## Layout
 
-- **smolvlm2_test.py** – builds weights + compiles the single instruction bin + runs (prefill + decode).
+- **smolvlm2_test.py** – builds params + compiles the single program bin + runs (prefill + decode).
 - **smolvlm2_run_from_bin.py** – runtime-only: loads the bins and runs, no compilation (hard-errors if a
   required bin is missing or its metadata does not match the requested mode).
 - **smolvlm2_config.json** – model dims, fixed ISA regs, DRAM layout.
@@ -16,7 +16,7 @@ language.** SigLIP vision encoder (12 layers) → pixel-shuffle connector → Sm
   via `compile_all`, with a name->{offset,size,addr} manifest) and **`params.bin`** + **`params.json`**
   (the assembled params snapshot — q4 LM + bf16 vision).
 
-See `../../notes/notes_smolvlm2.md` for the optimization mechanisms (§7 shared attention, strided-DMA
+See `../../notes/notes_smolvlm2.md` for the optimization mechanisms (unified attention, strided-DMA
 permute elimination, single bin, encoder layer-body sharing, prefill GEMM kernel).
 
 ## Prerequisites
@@ -36,7 +36,7 @@ permute elimination, single bin, encoder layer-body sharing, prefill GEMM kernel
 The default run is **VLM** (vision): with no `--image` it uses the bundled sample image
 (`test_samples/vette.jpg`) and the prompt *"Describe this image."* Pass `--image PATH` for a different
 image, or `--lm-enable` (or `--image none`) for **pure LM** text-only mode (skips the vision encoder).
-The instruction bin is **always the full VLM bin** (encoder + decoder + prefill), built once and loaded;
+The program bin is **always the full VLM bin** (encoder + decoder + prefill), built once and loaded;
 the mode only decides whether the encoder runs.
 
 ## Artifacts (`smolvlm2_bin/`)
@@ -44,13 +44,13 @@ the mode only decides whether the encoder runs.
 The artifact name carries **only** the decode-kernel suffix (the penalty is runtime-only and never
 suffixes the name):
 
-| Mode | Weights | Instructions |
+| Mode | Params | Programs |
 |------|---------|--------------|
-| default (fused) | `weights.bin` / `weights.json` | `instructions.bin` / `instructions.json` |
-| `--decode-matmat_mul_core-enable` | `weights_decode_matmat_mul_core.bin` / `.json` | `instructions_decode_matmat_mul_core.bin` / `.json` |
+| default (fused) | `params.bin` / `params.json` | `programs.bin` / `programs.json` |
+| `--decode-matmat_mul_core-enable` | `params_decode_matmat_mul_core.bin` / `.json` | `programs_decode_matmat_mul_core.bin` / `.json` |
 
-The two `weights*.bin` files are byte-identical (the decode kernel changes only the instruction stream,
-not the weight layout); they are kept per-mode so `run_from_bin` can validate mode metadata uniformly.
+The two `params*.bin` files are byte-identical (the decode kernel changes only the program stream,
+not the params layout); they are kept per-mode so `run_from_bin` can validate mode metadata uniformly.
 
 ## Manual commands
 
@@ -60,7 +60,7 @@ compiles.
 
 ```bash
 # ---- Default: VLM (fused decode + on-FPGA repetition penalty), bundled sample image --------
-# builds weights.bin + instructions.bin on first run
+# builds params.bin + programs.bin on first run
 python models/smolvlm2/smolvlm2_test.py
 # run from the bin (no compile, fully offline)
 python models/smolvlm2/smolvlm2_run_from_bin.py
@@ -75,7 +75,7 @@ python models/smolvlm2/smolvlm2_run_from_bin.py --lm-enable --prompt "What is th
 python models/smolvlm2/smolvlm2_run_from_bin.py --greedy-enable --prompt "What is the capital of France?"
 
 # ---- Deterministic control path (per-layer IF4 matmat_mul_core; LM-head stays fused) -------
-# Builds weights_decode_matmat_mul_core.bin + instructions_decode_matmat_mul_core.bin on first run
+# Builds params_decode_matmat_mul_core.bin + programs_decode_matmat_mul_core.bin on first run
 python models/smolvlm2/smolvlm2_test.py --decode-matmat_mul_core-enable \
     --prompt "What is the capital of France?"
 python models/smolvlm2/smolvlm2_run_from_bin.py --decode-matmat_mul_core-enable \

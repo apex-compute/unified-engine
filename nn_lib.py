@@ -1230,7 +1230,7 @@ def flash_attention_batched_pbi(
 
     CONSTRUCTION
     ------------
-      1. Compile the flash body ONCE as ``flash_attention_core_legacy`` reading from FIXED
+      1. Compile the flash body ONCE as ``unified_attention_core`` reading from FIXED
          staging buffers FQ/FK/FV/FO (+ FBIAS). It ends in JUMP_REG_ABS(gpr_ret).
       2. Per window, a tiny CALL STUB: memcpy that window's Q/K/V (and its per-window bias slice,
          since rel-pos bias is tiled per batch with stride seq_len*seq_len) into the fixed
@@ -1282,16 +1282,20 @@ def flash_attention_batched_pbi(
 
     ue.pad_capture_to_64b_boundary()
     sub_start_inst_dram_addr = program_base + ue.capture_count * INSTRUCTION_SIZE_BYTES
-    ue.flash_attention_core_legacy(
+    # Full windowed self-attention: batch == seq_len query rows attend over seq_len keys.
+    # unified_attention_core scales Q by 1/sqrt(head_dim) internally (same as the retired
+    # flash_attention_core_legacy), so callers keep any existing padded-head prescale.
+    ue.unified_attention_core(
+        batch=seq_len,
+        aligned_seq_len=seq_len,
         head_dim=head_dim,
-        seq_len=seq_len,
         Q_DRAM_ADDR=FQ,
         K_DRAM_ADDR=FK,
         V_DRAM_ADDR=FV,
+        BIAS_DRAM_ADDR=FBIAS,
         OUTPUT_DRAM_ADDR=FO,
         SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
         IDENTITY_DRAM_ADDR=IDENTITY_TRANSPOSE_DRAM_ADDR,
-        BIAS_DRAM_ADDR=FBIAS,
     )
     ue.generate_instruction_jump_reg_abs(gpr_ret)
 

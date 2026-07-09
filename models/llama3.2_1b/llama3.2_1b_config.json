@@ -5,7 +5,9 @@
     "TMP_REG": 2,
     "ROPE_SIZE_REG": 3,
     "GPR_BUCKET_IDX_REG": 4,
-    "GPR_SEQ_LEN_REG": 5
+    "GPR_SEQ_LEN_REG": 5,
+    "GPR_Q_SEQ_LEN_REG": 6,
+    "GPR_ALIGNED_SEQ_LEN_REG": 7
   },
   "file_info": {
     "layer_size": 32327680,
