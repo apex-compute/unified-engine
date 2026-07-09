@@ -39,6 +39,8 @@ clean:
 	rm -fv models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/params*.json
 	rm -fv models/mobilenetv2/vette_detections_hw.jpg
 	rm -rfv models/mobilesam/mobilesam_bin/
+	rm -fv models/parakeet/parakeet_bin/params.bin
+	rm -fv models/parakeet/parakeet_bin/params.json
 	rm -fv models/parakeet/parakeet_bin/programs.bin
 	rm -fv models/parakeet/parakeet_bin/programs.json
 	rm -fv models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.bin

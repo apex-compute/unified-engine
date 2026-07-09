@@ -528,6 +528,7 @@ def run_test(test: dict, verbose: bool = False,
 def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> dict:
     result = {
         "name": test["name"],
+        "stdout": stdout,
         "returncode": returncode,
         "elapsed_s": elapsed,
         "prefill_text": test.get("prompt") or test.get("prompt_desc", "(default)"),
@@ -702,6 +703,19 @@ def main():
             results.append(result)
             status = "PASS" if result["passed"] else "FAIL"
             print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}\n")
+            if not result["passed"]:
+                if not args.verbose and result.get("stdout"):
+                    print(f"{'='*60}")
+                    print(f"Failing run log: {test['name']}")
+                    print(f"{'='*60}")
+                    print(result["stdout"], end="" if result["stdout"].endswith("\n") else "\n")
+                    print(f"{'='*60}")
+                    print("Stopping on first failure.")
+                elif args.verbose:
+                    print("Stopping on first failure.")
+                else:
+                    print("Stopping on first failure; no model run log was captured.")
+                break
     except KeyboardInterrupt:
         print("\n[interrupted] writing summary for completed tests so far ...")
     finally:
