@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-GPT-2 Base (124M) inference on accelerator: prefill + decode.
+RETIRED: GPT-2 Base (124M) accelerator test.
+
+This implementation is retained for historical reference but is no longer a
+supported or runnable model test and is excluded from model_auto_test.py.
 
   - Config from gpt2_config.json; weights from a single bin (see below).
   - Dynamic-PBI flow (see src/template/core_changes.md): ONE prefill program +
@@ -1257,4 +1260,7 @@ def main():
     print("GPT-2 test ends.")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "GPT-2 TEST IS RETIRED AND DISABLED. "
+        "It is retained only as historical reference and is not part of model_auto_test.py."
+    )

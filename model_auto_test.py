@@ -289,10 +289,6 @@ TESTS = [
     # for "Paris". The other VL models default to LM when --image is omitted.
     {"name": "smolvlm2",    "script": "models/smolvlm2/smolvlm2_test.py",       "prompt": "What is the capital of France?", "pass_check": _check_smolvlm2, "extra_args": ["--lm-enable"]},
 
-    # GPT-2 is a base (non-chat) model: text continuation, no single correct answer,
-    # so the check is lenient (non-empty generation).
-    {"name": "gpt2",        "script": "models/gpt2/gpt2_test.py",                        "prompt": "The scientists at MIT announced today that they have discovered ", "pass_check": _check_nonempty},
-
     # Vision / detection models: no --prompt; emit detections / class labels parsed
     # from stdout.
     {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},

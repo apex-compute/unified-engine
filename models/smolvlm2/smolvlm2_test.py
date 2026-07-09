@@ -1593,6 +1593,10 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
+    # SmolVLM2 has known read-before-write gaps in its attention scratch state.
+    # Start from zeroed DRAM before loading weights/programs; base clear_dram()
+    # uses 0xFF, which represents BF16 NaNs and causes immediate token-0/EOS.
+    ue.zero_dram()
     ue.decode_matmat_mul_core_enable = bool(args.decode_matmat_mul_core_enable)
     ue.penalty_enable = not bool(args.greedy_enable)
     _original_print(f"decode_linear={ 'if4_matmat_mul_core' if ue.decode_matmat_mul_core_enable else 'quantized_matmat_core' }")
@@ -1607,7 +1611,6 @@ def main():
         args.image = _default_image   # VLM default with no --image → use the bundled sample image
     if args.prompt is None:           # mode-appropriate default prompt
         args.prompt = _d["lm_prompt"] if lm_only else _d["vlm_prompt"]
-    # No startup DRAM zeroing; params/programs are DMA'd over their regions.
     init_hang_prevention(ue)
     _artifact_suffix = ue._artifact_mode_suffix()
     # Load the snapshot (params.bin) only when the single program bin also exists.
