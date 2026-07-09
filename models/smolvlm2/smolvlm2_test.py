@@ -579,7 +579,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                     Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM, K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
                     V_DRAM_ADDR=self.VIS_FLASH_V_DRAM, BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM,
                     OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM, SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.identity_addr)
+                    IDENTITY_DRAM_ADDR=self.identity_addr,
+                    gpr_batch_reg=vis_S_reg,
+                    gpr_aligned_seq_len_reg=vis_S_reg)
                 self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
                 self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
                     stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
@@ -845,6 +847,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         sig = {"prefill_max_seq_len": self.PREFILL_MAX_SEQ_LEN, "num_layers": self.NUM_LAYERS,
                "num_vis_layers": len(self.vis_layer_addrs),
                "encoder_ln": "shared_zeros",
+               "vision_attention_impl": "unified_attention_core_dynamic",
                "decoder_attention_use_pbi": False,
                "decoder_attention_impl": "unified_attention_core",
                "decoder_attention_shared_subroutine": False,
@@ -1593,9 +1596,12 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
-    # SmolVLM2 has known read-before-write gaps in its attention scratch state.
-    # Start from zeroed DRAM before loading weights/programs; base clear_dram()
-    # uses 0xFF, which represents BF16 NaNs and causes immediate token-0/EOS.
+    # Software-reset the engine, then clear DRAM to 0 before anything else.
+    # SmolVLM2 has a read-before-write defect and depends on clean, zero-filled
+    # DRAM. The harness now poisons DRAM (0xFF) before SmolVLM2 like every other
+    # model, so the model must reset and zero it itself before loading weights /
+    # running. Remove once the gap is fixed.
+    ue.software_reset()
     ue.zero_dram()
     ue.decode_matmat_mul_core_enable = bool(args.decode_matmat_mul_core_enable)
     ue.penalty_enable = not bool(args.greedy_enable)

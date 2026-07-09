@@ -51,6 +51,7 @@ clean:
 	rm -f models/smolvlm2/smolvlm2_bin/decoder_program.bin
 	rm -f models/smolvlm2/smolvlm2_bin/decoder_program.json
 	rm -rf models/swin/swin_bin/
+	rm -rf codebooks/
 
 load_drivers:
 	sudo insmod /lib/modules/$$(uname -r)/xdma/xdma.ko interrupt_mode=0 config_bar_num=0
