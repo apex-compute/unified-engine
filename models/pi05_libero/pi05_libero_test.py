@@ -35,7 +35,6 @@ from user_dma_core import (
     UnifiedEngine, ue_35bit_addr_shifter,
 )
 from nn_lib import (
-    prefill_flash_attention_core,
     smart_bf16_permute_core,
     store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
     eltwise_add_core_dram, eltwise_mul_core_dram,
@@ -489,7 +488,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.VIS_FLASH_V_DRAM = self.allocate_tensor_dram(S * DP * bpe)
         self.VIS_FLASH_OUT_DRAM = self.allocate_tensor_dram(S * DP * bpe)
         self.VIS_FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(S * S * bpe)
-        self.VIS_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram((DP * S + DP * S) * bpe)
+        # unified_attention_core_dynamic scratch: V.T[DP,S] + score/P[S,S] + scaled_q[S,DP].
+        self.VIS_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram((DP * S + S * S + S * DP) * bpe)
+        # Zero additive bias (batch=S, aligned=S): vision attention is bidirectional/unmasked,
+        # so a single (S, S) zeros buffer is reused for every (layer, head) call.
+        self.VIS_ZERO_BIAS_DRAM = self.allocate_tensor_dram(S * S * bpe)
+        self.dma_write(DMA_DEVICE_H2C, self.VIS_ZERO_BIAS_DRAM,
+                        torch.zeros(S * S, dtype=torch.bfloat16), S * S * bpe)
         zeros_dp = torch.zeros(S * DP, dtype=torch.bfloat16)
         for addr in (self.VIS_FLASH_Q_DRAM, self.VIS_FLASH_K_DRAM, self.VIS_FLASH_V_DRAM):
             self.dma_write(DMA_DEVICE_H2C, addr, zeros_dp, S * DP * bpe)
@@ -718,18 +723,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         prefix_S_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(prefix_S_reg, S)
 
-        # Shared-subroutine flash attention (see tensor_init's LAYER0_FLASH_*
-        # buffers): the flash body is compiled ONCE after the main per-layer loop
-        # ends (below a HALT) and jumped to from every (layer, head) call site,
-        # exactly like compile_encoder's vis_sub_start pattern. prefill_flash_
-        # attention_core (the non-PBI all-heads-at-once convenience wrapper) has
-        # no runtime-loop mode and was statically re-emitting a full seq_len=1024
-        # attention body per layer -- 18 of those never finished compiling.
-        prefix_prog_base = self.get_program_dram_addr()
-        prefix_gpr_bucket = self.alloc_isa_reg()
-        prefix_gpr_ret = self.alloc_isa_reg()
-        prefix_call_sites: list[int] = []
-        prefix_num_buckets = S // UE_VECTOR_SIZE
+        # Inline unified attention (unified_attention_core_dynamic) replaces the
+        # old shared-subroutine flash-attention API (flash_attention_core*, deleted
+        # in the rebase onto main). PREFIX is MQA self-attention (S x S): the 8
+        # query heads can't be head-batched (8*S > S), so attention is emitted
+        # INLINE once per head inside the per-layer loop. Each call auto-allocates
+        # and releases its own GPRs and emits inline (no jump / no return address),
+        # so all the per-head subroutine scaffolding (bucket/ret GPRs, call-site
+        # jump patching) is gone.
+        #
+        # Scratch sizing (bf16, *2): unified_attention_core_dynamic needs
+        # head_dim*aligned_seq_len + aligned_seq_len^2 + batch*head_dim elements.
+        # Here batch=aligned_seq_len=S, head_dim=D -> 2*D*S + S*S (S*S dominates).
+        # A dedicated buffer (the old LAYER0_ATTN_SCRATCH_DRAM was sized only for
+        # the deleted flash) so we stay in-scope of compile_prefix.
+        prefix_attn_scratch = self.allocate_tensor_dram((2 * D * S + S * S) * bpe)
 
         try:
             for layer_idx in range(self.NUM_LAYERS):
@@ -770,26 +778,29 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr)
                 self._debug_op(f"layer{layer_idx}_kv_cache", k_cache_addr, S * KV, shape=(S, KV))
 
-                # 5. MQA flash attention, bidirectional bias (no causal flag), per head
-                # via the shared subroutine: Q for this head is copied (contiguous,
-                # already separated by the step-3 permute) into the fixed
-                # LAYER0_FLASH_Q_DRAM scratch, then jump into the one compiled flash
-                # body, then the (fixed-address) output is copied into this head's
-                # slot of LAYER0_ATTN_OUT_DRAM. K/V need no marshalling -- MQA means
-                # the same LAYER0_K_PROJ_DRAM/LAYER0_V_PROJ_DRAM buffer (already
-                # current for this layer, see step 2) is valid for every head, and
-                # the subroutine's K/V addresses are fixed to those same buffers.
+                # 5. MQA self-attention, bidirectional bias (no causal flag), per
+                # head via INLINE unified_attention_core_dynamic. Q for head h is
+                # the (S, D) block at LAYER0_Q_PERM_DRAM + h*S*D*2 (step-3 permute
+                # already separated the heads). K/V need no marshalling -- MQA means
+                # the same LAYER0_K_PROJ_DRAM/LAYER0_V_PROJ_DRAM (S, D) buffer
+                # (current for this layer, see step 2) is passed for every head.
+                # BIAS is the full (batch=S, aligned_seq_len=S) prefix_bias_dram,
+                # identical for every head. Output = (batch=S, D) lands directly in
+                # this head's slot of LAYER0_ATTN_OUT_DRAM (stride S*D*2), matching
+                # the (heads, S, D) layout the step-6 permute expects.
+                # q_scale=None -> standard 1/sqrt(head_dim) SDPA scale (== old flash).
+                # aligned_seq_len=S=832 (%64==0) and batch=S<=aligned_seq_len hold.
                 head_bytes = S * D * bpe
                 for h in range(NH):
-                    self._dram_copy(head_bytes, self.LAYER0_Q_PERM_DRAM + h * head_bytes, self.LAYER0_FLASH_Q_DRAM)
-                    self.generate_instruction_add_set(prefix_gpr_bucket, prefix_num_buckets)
-                    self.pad_capture_to_64b_boundary()
-                    return_word_addr = ue_35bit_addr_shifter(
-                        prefix_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                    self.generate_instruction_add_set(prefix_gpr_ret, return_word_addr)
-                    prefix_call_sites.append(self.capture_count)
-                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-                    self._dram_copy(head_bytes, self.LAYER0_FLASH_OUT_DRAM, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes)
+                    self.unified_attention_core_dynamic(
+                        batch=S, aligned_seq_len=S, head_dim=D,
+                        Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + h * head_bytes,
+                        K_DRAM_ADDR=self.LAYER0_K_PROJ_DRAM,
+                        V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM,
+                        BIAS_DRAM_ADDR=self.prefix_bias_dram,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
+                        SCRATCH_DRAM_ADDR=prefix_attn_scratch,
+                        IDENTITY_DRAM_ADDR=self.identity_addr, q_scale=None)
                     self._debug_op(f"layer{layer_idx}_head{h}", self.LAYER0_ATTN_OUT_DRAM + h * head_bytes, S * D, shape=(S, D))
                     if layer_idx == 0 and self._prefix_snap:
                         self._dram_copy(head_bytes, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
@@ -857,25 +868,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 if self._prefix_snap:
                     self._dram_copy(S * H * bpe, self.LAYER0_LAYER_OUT_DRAM, self.PREFIX_LAYER_SNAPSHOT_DRAM[layer_idx])
 
-            # Main per-layer program ends here; the shared flash-attention subroutine
-            # (jumped to from every per-head call site above) is compiled once below,
-            # exactly like compile_encoder's vis_sub_start pattern.
+            # Attention is now inline (unified_attention_core_dynamic emitted per
+            # head inside the loop), so there is no shared subroutine to compile
+            # after the loop -- the program ends right after the final HALT.
             self.generate_instruction_halt()
         except _DebugStop:
-            pass   # halt already emitted by _debug_op; fall through to the subroutine compile below.
+            pass   # halt already emitted by _debug_op.
 
-        prefix_sub_start, _prefix_flops = self.flash_attention_core(
-            head_dim=D, seq_len=S,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM, K_DRAM_ADDR=self.LAYER0_K_PROJ_DRAM,
-            V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.LAYER0_ATTN_SCRATCH_DRAM, ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-            IDENTITY_DRAM_ADDR=self.identity_addr, BIAS_DRAM_ADDR=self.prefix_bias_dram,
-            gpr_bucket_idx=prefix_gpr_bucket, num_buckets=prefix_num_buckets, gpr_ret_id=prefix_gpr_ret)
-        for _idx in prefix_call_sites:
-            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(prefix_sub_start))
-
-        self.release_isa_reg()  # prefix_gpr_ret
-        self.release_isa_reg()  # prefix_gpr_bucket
         self.release_isa_reg()  # prefix_S_reg
         print(f"compile_prefix: {self.NUM_LAYERS} layers compiled, seq_len={S}, valid_len={valid_len}")
 
@@ -919,6 +918,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.prefix_bias_dram = store_weight(self, self.build_prefix_attn_bias(S, valid_len))
         self.LAYER0_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.LAYER0_LAYER_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        # Prefix unified-attention scratch (per-head batch=S, aligned=S, head_dim=D):
+        # V.T (D*S) + score/P (S*S) + scaled_q (S*D) elements, bf16 -- sized to the
+        # unified_attention_core_dynamic scratch contract (larger than the old flash
+        # scratch by the S*S score block).
+        self.PREFIX_UATTN_SCRATCH_DRAM = self.allocate_tensor_dram((D * S + S * S + S * D) * bpe)
 
         print(f"  [prefix-dual] {self.NUM_LAYERS} layers, seq_len={S}, valid_len={valid_len} "
               f"(attention single-engine, MLP two-core)")
@@ -934,12 +938,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self.reset_inst_ptr_counter()
                 prefix_S_reg = self.alloc_isa_reg()
                 self.generate_instruction_add_set(prefix_S_reg, S)
-                # MUST match where _glue_exec writes the program (== flash's base).
-                prog_base = self.get_program_dram_addr()
-                gpr_bucket = self.alloc_isa_reg()
-                gpr_ret = self.alloc_isa_reg()
-                call_sites = []
-                num_buckets = S // UE_VECTOR_SIZE
 
                 # 1. pre-attn RMSNorm
                 self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,
@@ -960,18 +958,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 v_cache_addr = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
                 self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, k_cache_addr)
                 self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr)
-                # 5. MQA flash attention (per head, shared subroutine below the halt)
+                # 5. MQA attention (per head, inline unified_attention_core_dynamic):
+                # batch=S queries x aligned_seq_len=S shared MQA K/V, (S,S) additive
+                # bias used directly, output written straight into this head's slot.
                 head_bytes = S * D * bpe
                 for h in range(NH):
-                    self._dram_copy(head_bytes, self.LAYER0_Q_PERM_DRAM + h * head_bytes, self.LAYER0_FLASH_Q_DRAM)
-                    self.generate_instruction_add_set(gpr_bucket, num_buckets)
-                    self.pad_capture_to_64b_boundary()
-                    return_word_addr = ue_35bit_addr_shifter(
-                        prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                    self.generate_instruction_add_set(gpr_ret, return_word_addr)
-                    call_sites.append(self.capture_count)
-                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-                    self._dram_copy(head_bytes, self.LAYER0_FLASH_OUT_DRAM, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes)
+                    self.unified_attention_core_dynamic(
+                        batch=S, aligned_seq_len=S, head_dim=D,
+                        Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + h * head_bytes,
+                        K_DRAM_ADDR=self.LAYER0_K_PROJ_DRAM, V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM,
+                        BIAS_DRAM_ADDR=self.prefix_bias_dram,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
+                        SCRATCH_DRAM_ADDR=self.PREFIX_UATTN_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.identity_addr)
                 # 6. permute attn output -> (seq, heads*head_dim)
                 smart_bf16_permute_core(self, (NH, S, D), [1, 0, 2],
                                          self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
@@ -983,19 +982,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.LAYER0_ATTN_RESIDUAL_DRAM,
                                          OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                                          GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=prefix_S_reg)
-                # main body ends -> HALT, then the shared flash subroutine
-                self.generate_instruction_halt()
-                sub_start, _ = self.flash_attention_core(
-                    head_dim=D, seq_len=S,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM, K_DRAM_ADDR=self.LAYER0_K_PROJ_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_ATTN_SCRATCH_DRAM, ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-                    IDENTITY_DRAM_ADDR=self.identity_addr, BIAS_DRAM_ADDR=self.prefix_bias_dram,
-                    gpr_bucket_idx=gpr_bucket, num_buckets=num_buckets, gpr_ret_id=gpr_ret)
-                for _idx in call_sites:
-                    self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(sub_start))
-                self.release_isa_reg()  # gpr_ret
-                self.release_isa_reg()  # gpr_bucket
+                # main body ends; _glue_exec appends the trailing HALT. Attention is
+                # now inline (unified_attention_core_dynamic) so there is no shared
+                # flash subroutine to compile/patch below.
                 self.release_isa_reg()  # prefix_S_reg
 
             self._glue_exec(_emit_attn, label=f"prefix-dual L{layer_idx} attn")
@@ -1092,14 +1081,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 SCALE_DRAM_ADDR=la[f'{proj}_scale'], C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                 gpr_M_reg=vis_S_reg, **kw)
 
-        # §7 shared-subroutine attention: the per-head flash body is compiled ONCE after the
-        # encoder HALT; every per-(layer,head) call site marshals its head's [S, D] Q/K/V
-        # (padded to [S, DP]) into the fixed VIS_FLASH buffers and jumps in.
-        vis_prog_base = self.get_program_dram_addr()
-        vis_gpr_bucket = self.alloc_isa_reg()
-        vis_gpr_ret = self.alloc_isa_reg()
-        vis_call_sites: list[int] = []
-        vis_num_buckets = S // UE_VECTOR_SIZE
+        # Per-(layer,head) attention: each call site marshals its head's [S, D] Q/K/V
+        # (padded to [S, DP]) into the fixed VIS_FLASH buffers and runs an INLINE
+        # unified_attention_core_dynamic (full MHA self-attention, batch=aligned=S).
 
         try:
             # === Patch embedding: patchified pixels [S, 588] -> [S, 1152] (+ pos_embedding) ===
@@ -1138,13 +1122,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                         self.accelerator_memory_to_sram(src, 0x00000, elems,
                             stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
                         self.sram_to_accelerator_memory(0x00000, dst, elems)
-                    self.generate_instruction_add_set(vis_gpr_bucket, S // UE_VECTOR_SIZE)
-                    self.pad_capture_to_64b_boundary()
-                    return_word_addr = ue_35bit_addr_shifter(
-                        vis_prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                    self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
-                    vis_call_sites.append(self.capture_count)
-                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                    # INLINE full-MHA self-attention for this head: batch==aligned==S,
+                    # head_dim=DP, zero (unmasked) bias, standard 1/sqrt(DP) scale.
+                    self.unified_attention_core_dynamic(
+                        batch=S, aligned_seq_len=S, head_dim=DP,
+                        Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM, K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
+                        V_DRAM_ADDR=self.VIS_FLASH_V_DRAM, BIAS_DRAM_ADDR=self.VIS_ZERO_BIAS_DRAM,
+                        OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
+                        SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.identity_addr, q_scale=None)
                     self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
                     self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
                         stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
@@ -1181,21 +1167,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self.VIS_HEAD_OUT_DRAM, bias=self.vis_head_bias)
             self._debug_op("head_out", self.VIS_HEAD_OUT_DRAM, S * self.VIS_HEAD_OUT, shape=(S, self.VIS_HEAD_OUT))
 
-            self.generate_instruction_halt()   # encoder ends; shared flash body follows.
+            self.generate_instruction_halt()   # encoder ends.
         except _DebugStop:
-            pass   # halt already emitted by _debug_op; fall through to the subroutine compile below.
+            pass   # halt already emitted by _debug_op.
 
-        vis_sub_start, _vis_flops = self.flash_attention_core(head_dim=DP, seq_len=S,
-            Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM, K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.VIS_FLASH_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM, ATTN_P_DRAM_ADDR=self.VIS_FLASH_ATTN_P_DRAM,
-            IDENTITY_DRAM_ADDR=self.identity_addr,
-            gpr_bucket_idx=vis_gpr_bucket, num_buckets=vis_num_buckets, gpr_ret_id=vis_gpr_ret)
-        for _idx in vis_call_sites:
-            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(vis_sub_start))
-
-        self.release_isa_reg()  # vis_gpr_ret
-        self.release_isa_reg()  # vis_gpr_bucket
         self.release_isa_reg()  # vis_ln_chunks
         self.release_isa_reg()  # vis_S_reg
         self.stop_capture()
@@ -1435,24 +1410,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.AE_ATTN_RESULT_DRAM = self.allocate_tensor_dram(S * H * bpe)  # un-headed (S,H) post-o-proj input
         self.AE_O_PROJ_DRAM = self.allocate_tensor_dram(S * H * bpe)
 
-        # Shared-subroutine flash attention (same fix as compile_prefix): one flash
-        # body compiled ONCE in compile_denoise_loop (after all 180 layer-step
-        # bodies) and jumped to from every (step, layer, head) call site -- 1440
-        # jumps into one body, instead of prefill_flash_attention_core statically
-        # re-emitting a full Tkv~1088 attention body 180 times, which blew the
-        # compiled denoise program up near the 4GB DRAM ceiling. K/V need per-layer
-        # (not per-head) marshalling here since each layer has its own
-        # ae_k_combined/ae_v_combined buffer (unlike prefix's one fixed buffer) --
-        # copied into this fixed scratch once per (step,layer), reused for all 8
-        # heads' jumps within that layer.
-        self.AE_FLASH_Q_DRAM = self.allocate_tensor_dram(Tkv * D * bpe)
-        zero_ae_flash_q = torch.zeros(Tkv, D, dtype=torch.bfloat16)
-        self.dma_write(DMA_DEVICE_H2C, self.AE_FLASH_Q_DRAM, zero_ae_flash_q.contiguous(), Tkv * D * bpe)
-        self.AE_FLASH_K_DRAM = self.allocate_tensor_dram(Tkv * D * bpe)
-        self.AE_FLASH_V_DRAM = self.allocate_tensor_dram(Tkv * D * bpe)
-        self.AE_FLASH_OUT_DRAM = self.allocate_tensor_dram(Tkv * D * bpe)
-        self.AE_FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(Tkv * Tkv * bpe)
-
         # Suffix attention bias: (Tkv, Tkv) additive bf16, 0 for valid prefix+suffix
         # cols (bidirectional per pi0.5 ar_mask all-False), large-negative for the
         # [S:Tkv] padding columns/rows (unused rows are never read back, but the
@@ -1587,6 +1544,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self.AE_P0_L0_NORM   = self.allocate_tensor_dram(S * H * bpe)   # layer0 pre-attn AdaRMSNorm out
             self.AE_P0_L0_ATTN   = self.allocate_tensor_dram(S * H * bpe)   # layer0 attention o-proj out
             self.AE_P0_L0_RESID  = self.allocate_tensor_dram(S * H * bpe)   # layer0 post-attn residual
+            self.AE_P0_L0_Q      = self.allocate_tensor_dram(2 * S * D * bpe)  # layer0 stacked Q, heads 0-1
+            self.AE_P0_L0_ATTNRAW = self.allocate_tensor_dram(2 * S * D * bpe) # layer0 raw attn out, heads 0-1
         print(f"tensor_init_action_expert done; tensor DRAM at 0x{self.get_tensor_dram_addr():X}")
 
     # ---- small helpers --------------------------------------------------
@@ -1809,6 +1768,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
                              self.AE_Q_DRAM + h * S * D * 2, gpr_M_reg=gpr_M_reg)
         self._debug_op(f"{_pfx}_q_proj", self.AE_Q_DRAM, S * D, shape=(S, D))
+        if getattr(self, "DENOISE_STEP0_PROBE", False) and step == 0 and layer_idx == 0:
+            self._dram_copy(2 * S * D * 2, self.AE_Q_DRAM, self.AE_P0_L0_Q)  # heads 0-1 stacked Q
 
         # 4. ONE rectangular attention: batch=AE_HEADS*S queries x Tkv keys, shared
         #    MQA K/V read directly from ae_k/v_combined (no per-layer staging), one
@@ -1821,6 +1782,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM, OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM,
             SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_DRAM, IDENTITY_DRAM_ADDR=self.identity_addr)
         self._debug_op(f"{_pfx}_flash_attn_out", self.AE_ATTN_OUT_DRAM, S * D, shape=(S, D))
+        if getattr(self, "DENOISE_STEP0_PROBE", False) and step == 0 and layer_idx == 0:
+            self._dram_copy(2 * S * D * 2, self.AE_ATTN_OUT_DRAM, self.AE_P0_L0_ATTNRAW)  # heads 0-1 raw attn
 
         # 5. un-stack heads' S rows -> (S, heads*D) token-major, o-proj. Output is
         #    now contiguous (batch=heads*S, D): head h's S rows at h*S*D.
@@ -1932,33 +1895,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(self.prefix_v_cache_addr[layer], 0x00000, P * D)
             self.sram_to_accelerator_memory(0x00000, self.ae_v_combined[layer], P * D)
 
-        # Shared-subroutine flash attention context, threaded into every
-        # compile_suffix_step call across all 10 steps x 18 layers; the actual
-        # subroutine body is compiled once, after the full loop below, and every
-        # accumulated call site gets its jump patched to it (see compile_suffix_step
-        # and tensor_init_action_expert's AE_FLASH_* buffers for the full rationale).
-        #
-        # REVERTED from a loop_start/loop_end runtime loop back to full static
-        # unrolling (10 steps x 18 layers = 180 static layer bodies), matching
-        # compile_prefix/compile_encoder's proven pattern exactly. The loop_start/
-        # loop_end version compiled to a single small body (144 jump sites instead
-        # of 1440) and a single Euler step ran clean standalone (loop_cnt=1, 12.4s),
-        # but hung the instant a real backward branch was taken (loop_cnt=2+, and
-        # the real loop_cnt=10) even after fixing a real found bug (loop_start()
-        # not 64B-aligning its re-entry point before generate_instruction_jump_rela_jnz,
-        # the only jump mode _generate_instruction_jump doesn't auto-align). That fix
-        # didn't resolve the hang, and nobody in this codebase has ever combined
-        # loop_start/loop_end with an internal shared-subroutine jump-and-return, so
-        # this is unproven territory not worth continuing to debug blind. Static
-        # unrolling only uses mechanisms already proven at scale this session.
-        Tkv = self.AE_TKV
-        flash_ctx = {
-            "prog_base": self.get_program_dram_addr(),
-            "gpr_bucket": self.alloc_isa_reg(),
-            "gpr_ret": self.alloc_isa_reg(),
-            "call_sites": [],
-            "num_buckets": Tkv // UE_VECTOR_SIZE,
-        }
+        # Attention runs inline per (step, layer) via unified_attention_core_dynamic
+        # inside compile_suffix_step -- no shared flash subroutine, no jump-site
+        # patching. Static unrolling (10 steps x 18 layers = 180 layer bodies) is
+        # retained (matching compile_prefix/compile_encoder's proven pattern; the
+        # loop_start/loop_end runtime-loop variant hung on real backward branches).
 
         # Precompute the (N,H) AdaRMSNorm conditioning table on the host (exact
         # constants; replaces the HW time-MLP + approximate fused-silu).
@@ -1991,7 +1932,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 x_cur = self.AE_ACTION_TOK_DRAM
                 for layer_idx in range(self.AE_LAYERS):
                     x_next = self.AE_X_DRAM if x_cur is not self.AE_X_DRAM else self.AE_ACTION_TOK_DRAM
-                    self.compile_suffix_step(layer_idx, x_cur, x_next, gpr_M_reg=ae_S_reg, flash_ctx=flash_ctx, step=step)
+                    self.compile_suffix_step(layer_idx, x_cur, x_next, gpr_M_reg=ae_S_reg, step=step)
                     self._debug_op(f"step{step}_suffix_layer{layer_idx}", x_next, S * H, shape=(S, H))
                     if self.DENOISE_STEP0_PROBE and step == 0 and layer_idx == 0:
                         self._dram_copy(S * H * 2, x_next, self.AE_P0_SUF_L0)
@@ -2036,30 +1977,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self._dram_copy(S * self.AE_XT_WIDTH * 2, self.AE_XT_DRAM, self.AE_STEP_SNAPSHOT_DRAM[step])
                 t += dt
 
-            # Main per-(step,layer) program ends here; the shared flash-attention
-            # subroutine (jumped to from every per-head call site inside
-            # compile_suffix_step, 1440 sites total) is compiled once below.
+            # Main per-(step,layer) program ends here. Attention is now inline
+            # (unified_attention_core_dynamic in compile_suffix_step) so there is no
+            # shared flash subroutine to compile/patch after the loop.
             self.generate_instruction_halt()
         except _DebugStop:
-            pass   # halt already emitted by _debug_op; fall through to the subroutine compile below.
+            pass   # halt already emitted by _debug_op.
 
-        ae_sub_start, _ae_flops = self.flash_attention_core(
-            head_dim=self.HEAD_DIM, seq_len=Tkv,
-            Q_DRAM_ADDR=self.AE_FLASH_Q_DRAM, K_DRAM_ADDR=self.AE_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.AE_FLASH_V_DRAM, OUTPUT_DRAM_ADDR=self.AE_FLASH_OUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.AE_ATTN_SCRATCH_DRAM, ATTN_P_DRAM_ADDR=self.AE_FLASH_ATTN_P_DRAM,
-            IDENTITY_DRAM_ADDR=self.identity_addr, BIAS_DRAM_ADDR=self.AE_BIAS_DRAM,
-            gpr_bucket_idx=flash_ctx["gpr_bucket"], num_buckets=flash_ctx["num_buckets"],
-            gpr_ret_id=flash_ctx["gpr_ret"])
-        for _idx in flash_ctx["call_sites"]:
-            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(ae_sub_start))
-
-        # LIFO release, matching alloc order (ae_S_reg, gpr_bucket, gpr_ret).
-        self.release_isa_reg()  # flash_ctx["gpr_ret"]
-        self.release_isa_reg()  # flash_ctx["gpr_bucket"]
         self.release_isa_reg()  # ae_S_reg
         print("compile_denoise_loop done: 10-step Euler action-expert flow-matching stack compiled "
-              "(statically unrolled, 1440 flash-attention jump sites)")
+              "(statically unrolled, inline unified attention)")
 
     # =========================================================================
     # End-to-end driver: real sample images -> vision (x3) -> prefix -> denoise
@@ -2468,6 +2395,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         fpga_l0norm  = _read(self.AE_P0_L0_NORM, S * H).reshape(S, H)[:AH]
         fpga_l0attn  = _read(self.AE_P0_L0_ATTN, S * H).reshape(S, H)[:AH]
         fpga_l0resid = _read(self.AE_P0_L0_RESID, S * H).reshape(S, H)[:AH]
+        # heads 0-1 stacked Q and raw attention output (pre o-proj), (2, S, D)
+        fpga_l0q    = _read(self.AE_P0_L0_Q, 2 * S * D).reshape(2, S, D)[:, :AH]
+        fpga_l0raw  = _read(self.AE_P0_L0_ATTNRAW, 2 * S * D).reshape(2, S, D)[:, :AH]
 
         # --- reference step-0 with FPGA's own K/V ---
         npz = np.load(kv_npz_path)
@@ -2503,6 +2433,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             _, attn_out, _ = _ref.joint_attention(None, h, suffix_bias, layer, W, kv_cache=kv_cache)
             if layer == 0:
                 ref_l0norm, ref_l0attn = h, attn_out
+                # per-head Q + raw attention (pre o-proj) for the Q-population / attn split
+                _qe = W["PaliGemma.llm.layers.attn.q_einsum_1.w"][0]
+                _kve = W["PaliGemma.llm.layers.attn.kv_einsum_1.w"][0]
+                _qs = torch.einsum("btd,hdk->bthk", h.to(dt_), _qe)          # (1,AH,8,D)
+                _ks = torch.einsum("btd,hdc->bthc", h.to(dt_), _kve[0])       # (1,AH,1,D)
+                _vs = torch.einsum("btd,hdc->bthc", h.to(dt_), _kve[1])
+                _kall = torch.cat([k_cache[0], _ks], dim=1).permute(0, 2, 1, 3).float().expand(-1, 8, -1, -1)
+                _vall = torch.cat([v_cache[0], _vs], dim=1).permute(0, 2, 1, 3).float().expand(-1, 8, -1, -1)
+                _qf = _qs.permute(0, 2, 1, 3).float()
+                _b = suffix_bias.float()
+                _b = _b[None, None] if _b.dim() == 2 else _b[:, None]
+                _raw = F.scaled_dot_product_attention(_qf, _kall, _vall, attn_mask=_b).permute(0, 2, 1, 3)  # (1,AH,8,D)
+                ref_l0q = _qs[0].permute(1, 0, 2)      # (8, AH, D)
+                ref_l0raw = _raw[0].permute(1, 0, 2)   # (8, AH, D)
             x = x + gate[:, None, :] * attn_out
             if layer == 0:
                 ref_l0resid = x
@@ -2538,7 +2482,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         print(f"  time_embed     : {_snr(fpga_time, time_emb):7.2f}dB")
         print(f"  -- layer0 internals --")
         print(f"    L0 preattn_norm : {_snr(fpga_l0norm,  ref_l0norm.squeeze(0)):7.2f}dB")
-        print(f"    L0 attn_out     : {_snr(fpga_l0attn,  ref_l0attn.squeeze(0)):7.2f}dB")
+        print(f"    L0 Q head0      : {_snr(fpga_l0q[0], ref_l0q[0]):7.2f}dB   (Q population)")
+        print(f"    L0 Q head1      : {_snr(fpga_l0q[1], ref_l0q[1]):7.2f}dB")
+        print(f"    L0 rawattn head0: {_snr(fpga_l0raw[0], ref_l0raw[0]):7.2f}dB   (attention, pre o-proj)")
+        print(f"    L0 rawattn head1: {_snr(fpga_l0raw[1], ref_l0raw[1]):7.2f}dB")
+        print(f"    L0 attn_out     : {_snr(fpga_l0attn,  ref_l0attn.squeeze(0)):7.2f}dB   (post o-proj)")
         print(f"    L0 attn_residual: {_snr(fpga_l0resid, ref_l0resid.squeeze(0)):7.2f}dB")
         print(f"  suffix_layer0  : {_snr(fpga_l0,   ref_layer_out[0].squeeze(0)):7.2f}dB")
         print(f"  suffix_layer17 : {_snr(fpga_l17,  ref_layer_out[self.NUM_LAYERS-1].squeeze(0)):7.2f}dB")
