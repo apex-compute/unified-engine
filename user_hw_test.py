@@ -5919,7 +5919,11 @@ def test_ue_int_reg_read():
     ue.reset_inst_ptr_counter()
     ue.start_capture()
     ue.generate_instruction_swi()
-    ue.generate_instruction_add_set(REGFILE_R1_LOOP, 500)
+    # Loop count must keep the queue busy longer than a host AXI-Lite
+    # round-trip (is_queue_busy + read_reg32), or the poll loop below can
+    # exit with saw_swi still False even though SWI genuinely fired -
+    # the delay loop can finish before the host's first poll iteration runs.
+    ue.generate_instruction_add_set(REGFILE_R1_LOOP, 500000)
     ue.generate_instruction_add_dec(REGFILE_R1_LOOP)
     ue.generate_instruction_jump_rela_jnz(2, REGFILE_R1_LOOP)
     ue.generate_instruction_halt()
