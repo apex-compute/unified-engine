@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="update_87eabea5.bin">&#9881;&#65039; Hardware Architecture Update v1.4(update_87eabea5.bin)</a>
+  <a href="update_2461830.bin">&#9881;&#65039; Hardware Architecture Update v1.2(update_2461830.bin)</a>
 </p>
 
 <p align="center">
@@ -128,11 +128,8 @@ python3 models/gemma3/gemma3_test.py --prompt "your prompt"
 ```
 
 ### 7. Updating HW bin file
-
-The current hardware release is **v1.4** (`update_87eabea5.bin`). At startup the software reads the FPGA version register and checks it against the expected release hash (`0x87eabea5`); on a mismatch it stops and tells you which bin to flash.
-
 ```
-python3 update_flash.py update_87eabea5.bin
+python3 update_flash.py update_xxxxxxxx.bin
 ```
 Cold reboot the PC.
 
