@@ -545,6 +545,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         bias = torch.zeros((seq_len, seq_len), dtype=torch.bfloat16)
         if valid_len < seq_len:
             bias[:, valid_len:] = NEG
+        # Mask skipped/zero image slots (openpi image_mask=False) -- their
+        # placeholder tokens must contribute nothing to any real token's softmax.
+        for a, b in getattr(self, "prefix_masked_cols", []):
+            bias[:, a:b] = NEG
         return bias
 
     def embed_and_concat_prefix(self, token_ids, vision_embeddings=None, seq_len=1024):
@@ -1044,6 +1048,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_KV_HEADS = 1
     AE_ACTION_DIM_PADDED = 32
     AE_XT_WIDTH = 64  # physical width of x_t/v_t buffers (action_dim 32 padded to 64-align)
+    # --- roofline / FLOP-util reporting -------------------------------------
+    CYCLE_NS = 5.63          # HW clock period (config defaults.cycle_ns) -> ~177.6 MHz
+    MACS_PER_CYCLE = 64      # ASSUMPTION: 64-ALU vector unit = 64 MACs/cycle. If the
+                             # matmul core is a 64xN systolic array this is higher --
+                             # set to the real MAC/cycle to get an accurate %-of-peak.
     AE_ACTION_HORIZON = 10
     AE_ACTION_HORIZON_PADDED = 64  # padded for 64-alignment (flash / matmul row tiling)
     AE_NUM_DENOISE_STEPS = 10
@@ -1267,6 +1276,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         bias[:, P + S:] = NEG_INF   # no such columns (P+S==Tkv) -- kept for clarity/symmetry
         if valid_len < P:
             bias[:, valid_len:P] = NEG_INF
+        # Mask skipped/zero image slots (same columns as the prefix bias) so the
+        # action expert's cross-attention ignores their placeholder K/V rows.
+        for a, b in getattr(self, "prefix_masked_cols", []):
+            bias[:, a:b] = NEG_INF
         bias[S:, :] = 0.0           # unused query rows; value irrelevant, never read back
         self.AE_BIAS_DRAM = self.get_params_dram_addr()
         self.dma_write(DMA_DEVICE_H2C, self.AE_BIAS_DRAM, bias.contiguous(), Tkv * Tkv * bpe)
@@ -1880,7 +1893,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             _SILENT_MODE = False
         _original_print(f"  [vision encoder] compiled in {time.perf_counter()-t_compile0:.1f}s" + " " * 20)
 
+        # Skip the encoder for any all-zero (padding) image slot -- e.g. LIBERO's
+        # 3rd camera, which openpi masks out (image_mask=False for pi0.5). Its 256
+        # tokens are emitted as a 1e-6 placeholder (NOT exact 0 -- rms_norm has no
+        # epsilon, 0-rows NaN) and their columns are masked in both the prefix and
+        # suffix attention bias (self.masked_vision_slots), so they contribute
+        # nothing. Saves one full 27-layer encoder pass per zero slot.
+        masked_slots = []
         for i, img in enumerate(images_hwc):
+            if not np.any(img):  # all-zero placeholder image -> skip, mask
+                outs.append(torch.full((S, HO), 1e-6, dtype=torch.bfloat16))
+                masked_slots.append(i)
+                print(f"  [vision] slot {i} SKIPPED (zero image, masked out)")
+                continue
             patches = self._patchify(img)  # (256, 588)
             patches_pad = np.zeros((S, PK), dtype=np.float32)
             patches_pad[:, :patches.shape[1]] = patches
@@ -1895,6 +1920,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, HO).clone()
             outs.append(out)
             print(f"  [vision] slot {i} done")
+        # masked prefix columns (vision-token space): slot i occupies [i*S:(i+1)*S]
+        self.masked_vision_slots = masked_slots
+        self.prefix_masked_cols = [(i * S, (i + 1) * S) for i in masked_slots]
         return torch.cat(outs, dim=0)  # (3*256, 2048)
 
     def _vision_snr_check(self, images_hwc, hw_vision_tokens):
@@ -2158,9 +2186,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         buf_v = bytearray(kv_total)
         self.dma_read(DMA_DEVICE_C2H, self.LAYER0_K_DRAM, buf_k, kv_total)
         self.dma_read(DMA_DEVICE_C2H, self.LAYER0_V_DRAM, buf_v, kv_total)
+        mcols = np.array(getattr(self, "prefix_masked_cols", []), dtype=np.int64).reshape(-1, 2)
         np.savez(path, k=np.frombuffer(bytes(buf_k), dtype=np.uint16),
                   v=np.frombuffer(bytes(buf_v), dtype=np.uint16),
-                  prefix_seq_len=self.PREFIX_SEQ_LEN, prefix_valid_len=self.prefix_valid_len)
+                  prefix_seq_len=self.PREFIX_SEQ_LEN, prefix_valid_len=self.prefix_valid_len,
+                  masked_cols=mcols)
         print(f"[dump_prefix_kv] wrote {path} ({kv_total*2/1024/1024:.1f} MB K + V, "
               f"seq_len={self.PREFIX_SEQ_LEN}, valid_len={self.prefix_valid_len})")
         # Keep an in-memory copy of exactly what was just read, so a later
@@ -2258,7 +2288,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         time_emb = F.silu((time_emb @ W["time_mlp_in.kernel"]) + W["time_mlp_in.bias"])
         time_emb = F.silu((time_emb @ W["time_mlp_out.kernel"]) + W["time_mlp_out.bias"])  # (1,H)
 
-        suffix_bias = _ref.build_suffix_attn_bias(vlen, AH, device, torch.float32)
+        suffix_bias = _ref.build_suffix_attn_bias(vlen, AH, device, torch.float32,
+                                                   masked_cols=getattr(self, "prefix_masked_cols", []))
         x = ref_in
         ref_layer_out = {}
         for layer in range(self.NUM_LAYERS):
@@ -2396,9 +2427,59 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self._dma_write_retry(DMA_DEVICE_H2C, self.LAYER0_V_DRAM, npz["v"].tobytes(), kv_total)
         self.PREFIX_SEQ_LEN = int(npz["prefix_seq_len"])
         self.prefix_valid_len = int(npz["prefix_valid_len"])
+        self.prefix_masked_cols = [(int(a), int(b)) for a, b in npz["masked_cols"]] if "masked_cols" in npz else []
         self.prefix_k_cache_addr = [self.LAYER0_K_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
         self.prefix_v_cache_addr = [self.LAYER0_V_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
         print(f"[load_prefix_kv] loaded {path}: seq_len={self.PREFIX_SEQ_LEN}, valid_len={self.prefix_valid_len}")
+
+    @staticmethod
+    def _xformer_flops(M, Mkv, hidden, inter, layers, nq, nkv, hd, gated):
+        """Total multiply-add FLOPs (2*MACs) for `layers` transformer layers,
+        M query tokens attending to Mkv keys. gated=True -> 3-matrix gated MLP
+        (Gemma), False -> 2-matrix MLP (SigLIP)."""
+        qd, kvd = nq * hd, nkv * hd
+        per = 0
+        per += 2 * M * hidden * qd          # Q proj
+        per += 2 * (2 * M * hidden * kvd)   # K, V proj
+        per += 2 * M * qd * hidden          # O proj
+        per += 2 * M * Mkv * qd             # QK^T scores
+        per += 2 * M * Mkv * qd             # scores @ V
+        per += 2 * (3 if gated else 2) * M * hidden * inter  # MLP
+        return per * layers
+
+    def _report_gflops(self, label, flops, seconds):
+        """Live achieved-throughput readout: GFLOP/s and % of the 64-ALU roofline."""
+        if seconds <= 0:
+            return
+        gfs = flops / seconds / 1e9
+        peak = self.MACS_PER_CYCLE * 2 / (self.CYCLE_NS * 1e-9) / 1e9  # GFLOP/s
+        print(f"  ⚡ {label:<18} {flops/1e9:7.0f} GFLOP  {seconds:6.1f}s  "
+              f"{gfs:6.1f} GFLOP/s  [{100*gfs/peak:4.0f}% peak]")
+
+    def _vision_flops(self):
+        v = _CFG["vision"]
+        n_slots = v["num_image_slots"] - len(getattr(self, "masked_vision_slots", []))
+        return n_slots * self._xformer_flops(  # only slots actually encoded
+            M=v["num_patches"], Mkv=v["num_patches"], hidden=v["hidden_size"],
+            inter=v["intermediate_size"], layers=27, nq=v["num_heads"], nkv=v["num_heads"],
+            hd=v["head_dim"], gated=False)
+
+    def _prefix_flops(self):
+        M = _CFG["model"]["prefill_max_seq_len"]
+        return self._xformer_flops(
+            M=M, Mkv=M, hidden=self.HIDDEN_SIZE, inter=self.INTERMEDIATE_SIZE,
+            layers=self.NUM_LAYERS, nq=self.NUM_HEADS, nkv=self.NUM_KV_HEADS,
+            hd=self.HEAD_DIM, gated=True)
+
+    def _denoise_flops(self):
+        S = self.AE_ACTION_HORIZON_PADDED
+        Mkv = getattr(self, "AE_TKV", self.PREFIX_SEQ_LEN + S)
+        H, W = self.AE_HIDDEN, self.AE_XT_WIDTH
+        layer = self._xformer_flops(
+            M=S, Mkv=Mkv, hidden=H, inter=self.AE_INTERMEDIATE, layers=self.AE_LAYERS,
+            nq=self.AE_HEADS, nkv=self.AE_KV_HEADS, hd=self.HEAD_DIM, gated=True)
+        io = 2 * (2 * S * W * H) + 2 * (2 * S * H * W)  # action_in + action_out proj
+        return (layer + io) * self.AE_NUM_DENOISE_STEPS
 
     def run_inference(self, images_hwc, prompt_tokens, noise32=None, skip_prefix=False, dump_prefix_path=None,
                        verify_prefix_kv=False, sanity_check=False):
@@ -2427,12 +2508,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         else:
             vision_tokens = self.run_vision(images_hwc)
             t_vision = time.perf_counter() - t0
+            n_enc = _CFG["vision"]["num_image_slots"] - len(getattr(self, "masked_vision_slots", []))
+            self._report_gflops(f"vision ({n_enc} slots)", self._vision_flops(), t_vision)
 
             t1 = time.perf_counter()
             seq_len = _CFG["model"]["prefill_max_seq_len"]
             valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
             prog_addr = self._compile_and_run(lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
             t_prefix = time.perf_counter() - t1
+            self._report_gflops("prefix (832 tok)", self._prefix_flops(), t_prefix)
 
             if getattr(self, "PREFIX_SNAPSHOTS", False):
                 self._prefix_layer0_op_snr_report(prompt_tokens, vision_tokens, valid_len)
@@ -2480,6 +2564,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # the ~120-150s predicted from a standalone single-step measurement).
         self._compile_and_run(self.compile_denoise_loop, label="denoise_loop", timeout=300.0)
         t_denoise = time.perf_counter() - t2
+        self._report_gflops("denoise (10 steps)", self._denoise_flops(), t_denoise)
 
         # DRAM-overlap check: adding PREFIX_LAYER_SNAPSHOT_DRAM/PREFIX_L0_SNAPSHOT_DRAM
         # shifted the tensor-DRAM allocator base by ~96MB (0xEE398AC0 -> 0xF3F68AC0)
@@ -2487,42 +2572,34 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # before (see LocateAnything's decode-NaN/DRAM-overlap postmortem), so check
         # ae_k_combined (seeded by compile_denoise_loop's own captured copy) directly
         # before trusting the final action output.
-        P_chk, D_chk = self.AE_PREFIX_SEQ_LEN, self.HEAD_DIM
-        Tkv = self.AE_TKV
-        for layer in (0, self.AE_LAYERS - 1):
-            # Check ae_k_combined (full buffer: prefix + suffix regions)
-            buf_k = bytearray(Tkv * D_chk * 2)
-            self.dma_read(DMA_DEVICE_C2H, self.ae_k_combined[layer], buf_k, len(buf_k))
-            k_full = torch.frombuffer(bytes(buf_k), dtype=torch.bfloat16).reshape(Tkv, D_chk).float()
-            k_prefix = k_full[:P_chk]
-            k_suffix = k_full[P_chk:]
-            print(f"  [ae_kv_check] layer{layer} ae_k_combined prefix[0:{P_chk}]: "
-                  f"nan={torch.isnan(k_prefix).sum().item()} inf={torch.isinf(k_prefix).sum().item()} "
-                  f"min={k_prefix.min():.4f} max={k_prefix.max():.4f}")
-            print(f"  [ae_kv_check] layer{layer} ae_k_combined suffix[{P_chk}:{Tkv}]: "
-                  f"nan={torch.isnan(k_suffix).sum().item()} inf={torch.isinf(k_suffix).sum().item()} "
-                  f"min={k_suffix.min():.4f} max={k_suffix.max():.4f}")
-
-            # Check ae_v_combined (full buffer: prefix + suffix regions)
-            buf_v = bytearray(Tkv * D_chk * 2)
-            self.dma_read(DMA_DEVICE_C2H, self.ae_v_combined[layer], buf_v, len(buf_v))
-            v_full = torch.frombuffer(bytes(buf_v), dtype=torch.bfloat16).reshape(Tkv, D_chk).float()
-            v_prefix = v_full[:P_chk]
-            v_suffix = v_full[P_chk:]
-            print(f"  [ae_kv_check] layer{layer} ae_v_combined prefix[0:{P_chk}]: "
-                  f"nan={torch.isnan(v_prefix).sum().item()} inf={torch.isinf(v_prefix).sum().item()} "
-                  f"min={v_prefix.min():.4f} max={v_prefix.max():.4f}")
-            print(f"  [ae_kv_check] layer{layer} ae_v_combined suffix[{P_chk}:{Tkv}]: "
-                  f"nan={torch.isnan(v_suffix).sum().item()} inf={torch.isinf(v_suffix).sum().item()} "
-                  f"min={v_suffix.min():.4f} max={v_suffix.max():.4f}")
+        if self.DENOISE_STEP0_PROBE:
+            P_chk, D_chk = self.AE_PREFIX_SEQ_LEN, self.HEAD_DIM
+            Tkv = self.AE_TKV
+            for layer in (0, self.AE_LAYERS - 1):
+                for name, addr in (("k", self.ae_k_combined[layer]), ("v", self.ae_v_combined[layer])):
+                    buf_kv = bytearray(Tkv * D_chk * 2)
+                    self.dma_read(DMA_DEVICE_C2H, addr, buf_kv, len(buf_kv))
+                    full = torch.frombuffer(bytes(buf_kv), dtype=torch.bfloat16).reshape(Tkv, D_chk).float()
+                    for tag, sl in (("prefix", full[:P_chk]), ("suffix", full[P_chk:])):
+                        print(f"  [ae_kv_check] layer{layer:2d} {name} {tag}: "
+                              f"nan={torch.isnan(sl).sum().item()} inf={torch.isinf(sl).sum().item()} "
+                              f"min={sl.min():.4f} max={sl.max():.4f}")
 
         buf = bytearray(S * AD * 2)
         self.dma_read(DMA_DEVICE_C2H, self.AE_XT_DRAM, buf, len(buf))
         out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, AD).float().numpy()
         actions = out[:10, :7]
 
-        print(f"timing: vision={t_vision:.2f}s prefix={t_prefix:.2f}s denoise={t_denoise:.2f}s "
-              f"total={t_vision+t_prefix+t_denoise:.2f}s")
+        total = t_vision + t_prefix + t_denoise
+        print("\n  " + "─" * 52)
+        print(f"  {'stage':<10}{'time':>10}{'  share':>10}")
+        print("  " + "─" * 52)
+        for name, t in (("vision", t_vision), ("prefix", t_prefix), ("denoise", t_denoise)):
+            share = (100 * t / total) if total else 0.0
+            print(f"  {name:<10}{t:>8.1f}s{share:>9.1f}%")
+        print("  " + "─" * 52)
+        print(f"  {'TOTAL':<10}{total:>8.1f}s{'100.0':>9}%")
+        print("  " + "─" * 52 + "\n")
         return actions
 
     # XDMA driver has a per-os.write() transfer size limit (~16-64MB, matching
@@ -2714,9 +2791,14 @@ def main():
         ue.load_prefix_kv(PREFIX_KV_DUMP_PATH)
         actions = ue.run_inference(None, None, skip_prefix=True)
     else:
-        sample_dir = Path.home() / "apex-compute-ML" / "simple-llm" / "src" / "models" / "pi0_5" / "sample_data"
-        img = np.load(sample_dir / "sample_0_image.npy").astype(np.float32) / 127.5 - 1.0
-        wrist = np.load(sample_dir / "sample_0_wrist_image.npy").astype(np.float32) / 127.5 - 1.0
+        # In-repo sample frames (LIBERO base + wrist camera, physical-intelligence/libero
+        # dataset). PNGs are pixel-identical to the original .npy arrays. Self-contained.
+        from PIL import Image
+        sample_dir = Path(__file__).parent / "sample_data"
+        def _load_png(name):
+            return np.asarray(Image.open(sample_dir / name).convert("RGB"), dtype=np.float32) / 127.5 - 1.0
+        img = _load_png("sample_0_image.png")
+        wrist = _load_png("sample_0_wrist_image.png")
         pad = np.zeros_like(img)
         import torch.nn.functional as _F
         def _resize(a):
@@ -2760,21 +2842,20 @@ def main():
         ue.verify_denoise_step0(PREFIX_KV_DUMP_PATH)
 
     np.set_printoptions(precision=4, suppress=True)
-    print("action_chunk shape (raw model output):", actions.shape)
-    print(actions)
-    print(f"nan={np.isnan(actions).any()} inf={np.isinf(actions).any()} "
-          f"min={actions.min():.4f} max={actions.max():.4f}")
-
     if not args.debug:
-        # Unnormalize to real action space (matches openpi's Unnormalize transform:
-        # (x+1)/2*(q99-q01)+q01) using the same actions norm_stats, so this is
-        # directly comparable to run_pi05.py's printed action_chunk. Skipped in
-        # --debug mode since norm_stats/tokenization aren't loaded there.
+        # Unnormalize to real robot action space (openpi Unnormalize transform:
+        # (x+1)/2*(q99-q01)+q01) using the actions norm_stats -- the deployable output.
         act_q01 = np.array(norm_stats["actions"]["q01"], dtype=np.float32)
         act_q99 = np.array(norm_stats["actions"]["q99"], dtype=np.float32)
         actions_unnorm = (actions + 1.0) / 2.0 * (act_q99 - act_q01 + 1e-6) + act_q01
-        print("action_chunk (unnormalized, comparable to run_pi05.py):")
+        print("action_chunk (real robot actions):", actions_unnorm.shape)
         print(actions_unnorm)
+    else:
+        # --debug has no norm_stats loaded; show the raw normalized [-1,1] output.
+        print("action_chunk (raw, normalized [-1,1] -- --debug, no norm_stats):", actions.shape)
+        print(actions)
+    print(f"nan={np.isnan(actions).any()} inf={np.isinf(actions).any()} "
+          f"min={actions.min():.4f} max={actions.max():.4f}")
 
     if args.verify_denoise and not args.debug:
         # CPU IF4 reference, matched apples-to-apples: same quant our model uses
@@ -2801,7 +2882,8 @@ def main():
         noise32[..., :7] = torch.from_numpy(noise7)
         noise32 = noise32.to(ref_device)
         ref_actions, ref_kv = _ref.run_pi05(ref_images, ref_prompt, ref_state, W,
-                                            noise=noise32, return_kv=True)
+                                            noise=noise32, return_kv=True,
+                                            masked_cols=getattr(ue, "prefix_masked_cols", []))
         ref_actions = ref_actions[..., :7]
         ref_np = ref_actions.squeeze(0).float().cpu().numpy()
 
@@ -2847,7 +2929,8 @@ def main():
         print("CPU-IF4 reference action_chunk (10,7):")
         print(ref_np)
 
-    ue.probe_nan_report()
+    if args.probe_step0:
+        ue.probe_nan_report()
 
 
 if __name__ == "__main__":

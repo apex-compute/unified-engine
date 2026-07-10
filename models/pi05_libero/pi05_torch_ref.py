@@ -434,22 +434,30 @@ def suffix_step(suf_tokens, adarms_cond, attn_bias, kv_cache, W, num_layers=18):
 # ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
-def build_prefix_attn_bias(n_prefix: int, device, dtype):
-    """Prefix tokens attend bidirectionally to each other (no padding here;
-    caller should pad+mask separately if seq < aligned length)."""
-    return torch.zeros(n_prefix, n_prefix, device=device, dtype=dtype)
+def build_prefix_attn_bias(n_prefix: int, device, dtype, masked_cols=None):
+    """Prefix tokens attend bidirectionally to each other. masked_cols: list of
+    (start,end) prefix-token ranges to exclude from attention (openpi
+    image_mask=False slots, e.g. LIBERO's zero 3rd camera for pi0.5)."""
+    bias = torch.zeros(n_prefix, n_prefix, device=device, dtype=dtype)
+    for a, b in (masked_cols or []):
+        bias[:, a:b] = -1e36
+    return bias
 
 
-def build_suffix_attn_bias(n_prefix: int, n_suffix: int, device, dtype):
+def build_suffix_attn_bias(n_prefix: int, n_suffix: int, device, dtype, masked_cols=None):
     """Suffix tokens attend to: all prefix tokens (bidirectional) + all suffix
     tokens (bidirectional within the action block, per pi0.5's ar_mask which
-    is all-False beyond the first action token)."""
-    return torch.zeros(n_suffix, n_prefix + n_suffix, device=device, dtype=dtype)
+    is all-False beyond the first action token). masked_cols: prefix-token
+    ranges to exclude (same masked image slots as the prefix bias)."""
+    bias = torch.zeros(n_suffix, n_prefix + n_suffix, device=device, dtype=dtype)
+    for a, b in (masked_cols or []):
+        bias[:, a:b] = -1e36
+    return bias
 
 
 def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Tensor,
              W: Weights, num_denoise_steps: int = 10, action_horizon: int = 10, action_dim: int = 7,
-             noise: torch.Tensor = None, return_kv: bool = False):
+             noise: torch.Tensor = None, return_kv: bool = False, masked_cols=None):
     device, dtype = W.device, W.dtype
     b = state.shape[0]
 
@@ -465,7 +473,7 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
     prefix_tokens = torch.cat([vision_tokens, text_tokens], dim=1)  # (b, P, 2048)
     n_prefix = prefix_tokens.shape[1]
 
-    prefix_bias = build_prefix_attn_bias(n_prefix, device, torch.float32)
+    prefix_bias = build_prefix_attn_bias(n_prefix, device, torch.float32, masked_cols=masked_cols)
     _, kv_cache = prefix_forward(prefix_tokens, prefix_bias, W)
 
     # --- Action-expert flow-matching denoising loop ---
@@ -481,7 +489,7 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
     action_out_k, action_out_b = W["action_out_proj.kernel"], W["action_out_proj.bias"]
 
     n_suffix = action_horizon
-    suffix_bias = build_suffix_attn_bias(n_prefix, n_suffix, device, torch.float32)
+    suffix_bias = build_suffix_attn_bias(n_prefix, n_suffix, device, torch.float32, masked_cols=masked_cols)
 
     for _ in range(num_denoise_steps):
         action_tokens = (x_t.to(dtype) @ action_in_k) + action_in_b  # (b, ah, 1024)
