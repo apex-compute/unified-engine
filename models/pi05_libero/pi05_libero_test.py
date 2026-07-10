@@ -1478,6 +1478,24 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, self.AE_BIAS_DRAM, bias.contiguous(), Tkv * Tkv * bpe)
         self.allocate_params_dram(Tkv * Tkv * bpe)
 
+        # --- Rectangular (batched) attention via unified_attention_core -----------
+        # MQA: all AE_HEADS query heads share one K/V head, so stack every head's S
+        # suffix queries into a single batch = AE_HEADS*S and run ONE rectangular
+        # attention (batch queries x Tkv keys) instead of AE_HEADS square Tkv x Tkv
+        # flash calls (which wasted ~93% on padding query rows + per-head DMA).
+        # bias is (batch, Tkv): every query row uses the same key-column mask
+        # (bidirectional; only key columns are masked), so replicate bias row 0.
+        self.AE_UATTN_BATCH = self.AE_HEADS * S
+        _keymask = bias[0].clone()                                 # (Tkv,) column mask
+        _ubias = _keymask.unsqueeze(0).repeat(self.AE_UATTN_BATCH, 1).contiguous()  # (batch, Tkv)
+        self.AE_UATTN_BIAS_DRAM = self.get_params_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, self.AE_UATTN_BIAS_DRAM, _ubias, self.AE_UATTN_BATCH * Tkv * bpe)
+        self.allocate_params_dram(self.AE_UATTN_BATCH * Tkv * bpe)
+        # scratch: V^T (D*Tkv) + score (Tkv*Tkv) + scaled_q (batch*D) -- see
+        # unified_attention_core_dynamic's layout contract.
+        _uscratch = D * Tkv + Tkv * Tkv + self.AE_UATTN_BATCH * D
+        self.AE_UATTN_SCRATCH_DRAM = self.allocate_tensor_dram(_uscratch * bpe)
+
         # x / norm / adarms scratch (S, H)
         self.AE_X_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.AE_NORM_DRAM = self.allocate_tensor_dram(S * H * bpe)
@@ -1784,37 +1802,30 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                          v_combined + P * D * 2, gpr_M_reg=gpr_M_reg)
         self._debug_op(f"{_pfx}_kv_proj", k_combined + P * D * 2, S * D, shape=(S, D))
 
-        # 3. Per-head Q projection into the (heads, Tkv, D) padded Q buffer (rows
-        #    [0:S] real, [S:Tkv] unused/garbage -- see tensor_init_action_expert).
-        head_bytes = Tkv * D * 2
+        # 3. Q projection, contiguous as (batch=AE_HEADS*S, D): head h's S queries
+        #    at h*S*D so the whole buffer is the (batch, D) input the unified
+        #    rectangular attention expects (each head's queries stacked in batch).
         for h in range(self.AE_HEADS):
             self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
-                             self.AE_Q_DRAM + h * head_bytes, gpr_M_reg=gpr_M_reg)
+                             self.AE_Q_DRAM + h * S * D * 2, gpr_M_reg=gpr_M_reg)
         self._debug_op(f"{_pfx}_q_proj", self.AE_Q_DRAM, S * D, shape=(S, D))
 
-        # 4. MQA flash attention: Q (heads, Tkv, D) vs shared K/V (Tkv, D), additive
-        #    bias (Tkv, Tkv). Only rows [0:S] of the output are meaningful.
-        #    Per head: copy this layer's K/V (same for all 8 heads) + this head's
-        #    Q into the fixed AE_FLASH_* scratch, jump into the shared subroutine,
-        #    copy the result out to this head's slot in AE_ATTN_OUT_DRAM.
-        self._dram_copy(Tkv * D * 2, k_combined, self.AE_FLASH_K_DRAM)
-        self._dram_copy(Tkv * D * 2, v_combined, self.AE_FLASH_V_DRAM)
-        self._debug_op(f"{_pfx}_flash_kv_staged", self.AE_FLASH_K_DRAM, Tkv * D, shape=(Tkv, D))
-        for h in range(self.AE_HEADS):
-            self._dram_copy(head_bytes, self.AE_Q_DRAM + h * head_bytes, self.AE_FLASH_Q_DRAM)
-            self.generate_instruction_add_set(flash_ctx["gpr_bucket"], flash_ctx["num_buckets"])
-            self.pad_capture_to_64b_boundary()
-            return_word_addr = ue_35bit_addr_shifter(
-                flash_ctx["prog_base"] + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-            self.generate_instruction_add_set(flash_ctx["gpr_ret"], return_word_addr)
-            flash_ctx["call_sites"].append(self.capture_count)
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
-            self._dram_copy(head_bytes, self.AE_FLASH_OUT_DRAM, self.AE_ATTN_OUT_DRAM + h * head_bytes)
+        # 4. ONE rectangular attention: batch=AE_HEADS*S queries x Tkv keys, shared
+        #    MQA K/V read directly from ae_k/v_combined (no per-layer staging), one
+        #    (batch, Tkv) bias. Replaces the AE_HEADS per-head square-flash calls +
+        #    all their per-head Q/out DMA. Dynamic (PBI) variant keeps the 180
+        #    statically-unrolled bodies compact. q_scale=None -> 1/sqrt(head_dim).
+        self.unified_attention_core_dynamic(
+            batch=self.AE_UATTN_BATCH, aligned_seq_len=Tkv, head_dim=D,
+            Q_DRAM_ADDR=self.AE_Q_DRAM, K_DRAM_ADDR=k_combined, V_DRAM_ADDR=v_combined,
+            BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM, OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM,
+            SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_DRAM, IDENTITY_DRAM_ADDR=self.identity_addr)
         self._debug_op(f"{_pfx}_flash_attn_out", self.AE_ATTN_OUT_DRAM, S * D, shape=(S, D))
 
-        # 5. un-stack heads' first S rows -> (S, heads*D) token-major, o-proj
+        # 5. un-stack heads' S rows -> (S, heads*D) token-major, o-proj. Output is
+        #    now contiguous (batch=heads*S, D): head h's S rows at h*S*D.
         for h in range(self.AE_HEADS):
-            self.accelerator_memory_to_sram(self.AE_ATTN_OUT_DRAM + h * head_bytes, 0x00000, S * D)
+            self.accelerator_memory_to_sram(self.AE_ATTN_OUT_DRAM + h * S * D * 2, 0x00000, S * D)
             # dest MUST start at this head's column block (h*D) in the (S, H)
             # token-major buffer -- without the +h*D*2 every head overwrites
             # cols [0:D] and o-proj reads stale/garbage for heads 1..7.
