@@ -3790,7 +3790,7 @@ def main():
     # image / query / prompt_kind now come from the CLI (--image/--query/--prompt-kind).
     # ==================================================================
     PROBE_PREFILL_NAN = False        # True: layer-by-layer prefill sweep. False: fast prefill+decode.
-    PROBE_DECODE_NAN  = True        # True: after prefill, sweep decode layers for the first NaN.
+    PROBE_DECODE_NAN  = False        # True: after prefill, sweep decode layers for the first NaN.
     PROBE_ADDR_MAP    = False        # fast: dump per-layer weight addrs + DRAM readback, then exit (no prefill)
     FORCE_DEBUG_LOGITS = True        # dump final_norm + lm_head NaN breakdown on first decode step
     # ==================================================================
