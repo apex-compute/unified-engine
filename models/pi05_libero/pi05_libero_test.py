@@ -1043,10 +1043,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_HEADS = 8
     AE_KV_HEADS = 1
     AE_ACTION_DIM_PADDED = 32
+    AE_XT_WIDTH = 64  # physical width of x_t/v_t buffers (action_dim 32 padded to 64-align)
     AE_ACTION_HORIZON = 10
     AE_ACTION_HORIZON_PADDED = 64  # padded for 64-alignment (flash / matmul row tiling)
     AE_NUM_DENOISE_STEPS = 10
     AE_LOOP_TRIP_OVERRIDE = None  # debug knob, see compile_denoise_loop's loop_start call
+    DENOISE_STEP0_PROBE = False  # if True, snapshot step-0 intermediates for reference diff
 
     # ---- action-expert weights ---------------------------------------------
     def weight_init_action_expert(self):
@@ -1087,6 +1089,26 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _store_bf16(name):
             return store_weight(self, _load(name).to(torch.bfloat16))
 
+        def _store_matmul_npad(name, n_pad):
+            """Like _store_matmul, but zero-pads the N (output) dim up to n_pad.
+            Used for action_out_proj: output action_dim=32 padded to 64 so v_t is
+            physically 64-wide, matching the 64-wide x_t buffer -- lets the euler
+            update and action_in_proj run as plain contiguous ops (no strided
+            32->64 staging, which was reading noise rows at 2x stride)."""
+            w = _load(name).transpose(-1, -2).contiguous()  # (N_real, K)
+            n_real = w.shape[-2]
+            if n_real < n_pad:
+                w = torch.nn.functional.pad(w, (0, 0, 0, n_pad - n_real))  # pad dim -2 (N)
+            w = w.to(torch.bfloat16)
+            data, _ = _mlc_quantize_q4_64(w)
+            return store_quantized_weight(self, data.tobytes())
+
+        def _store_bf16_npad(name, n_pad):
+            t = _load(name)  # (N_real,)
+            if t.shape[-1] < n_pad:
+                t = torch.nn.functional.pad(t, (0, n_pad - t.shape[-1]))
+            return store_weight(self, t.to(torch.bfloat16))
+
         def _store_matmul_kpad(name, k_pad):
             """Like _store_matmul, but zero-pads the K (reduction) dim up to
             k_pad. Needed for action_in_proj: real action_dim=32 < the
@@ -1110,8 +1132,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.ae_time_in_bias = _store_bf16("time_mlp_in.bias")
         self.ae_time_out_scale, self.ae_time_out_data = _store_matmul("time_mlp_out.kernel")
         self.ae_time_out_bias = _store_bf16("time_mlp_out.bias")
-        self.ae_action_out_scale, self.ae_action_out_data = _store_matmul("action_out_proj.kernel")
-        self.ae_action_out_bias = _store_bf16("action_out_proj.bias")
+        # action_out_proj output N padded 32->64 so v_t is physically 64-wide
+        # (matches the 64-wide x_t buffer -> plain contiguous euler + no staging).
+        self.ae_action_out_scale, self.ae_action_out_data = _store_matmul_npad("action_out_proj.kernel", 64)
+        self.ae_action_out_bias = _store_bf16_npad("action_out_proj.bias", 64)
 
         # --- per-layer action-expert transformer weights ---------------------
         self.ae_layer_addrs = []
@@ -1279,22 +1303,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, self.AE_ONES_DRAM, torch.ones(H, dtype=torch.bfloat16).contiguous(), H * bpe)
         self.allocate_params_dram(H * bpe)
 
-        # action tokens (x_t projected through action_in_proj) and the denoise state x_t (S, 32)
+        # action tokens (x_t projected through action_in_proj) and the denoise state.
+        # x_t/v_t are physically AE_XT_WIDTH(64)-wide (real action_dim 32 in cols
+        # [0:32], cols [32:64] held at 0). Storing x_t already 64-wide lets
+        # action_in_proj read it CONTIGUOUSLY (K=64) with no 32->64 strided
+        # staging -- that staging was reading noise rows at 2x stride (bug).
+        XW = self.AE_XT_WIDTH
         self.AE_ACTION_TOK_DRAM = self.allocate_tensor_dram(S * H * bpe)
-        self.AE_XT_DRAM = self.allocate_tensor_dram(S * self.AE_ACTION_DIM_PADDED * bpe)
-        self.AE_VT_DRAM = self.allocate_tensor_dram(S * self.AE_ACTION_DIM_PADDED * bpe)
+        self.AE_XT_DRAM = self.allocate_tensor_dram(S * XW * bpe)
+        self.AE_VT_DRAM = self.allocate_tensor_dram(S * XW * bpe)
         # Per-step x_t snapshots (probe_nan_report): AE_XT_DRAM is overwritten in
         # place every step, so only the LAST step's value survives a full run --
         # copy each step's post-euler-update x_t to its own dedicated slot too,
         # so one post-run readback can NaN-check every step at once.
-        self.AE_STEP_SNAPSHOT_DRAM = [self.allocate_tensor_dram(S * self.AE_ACTION_DIM_PADDED * bpe)
+        self.AE_STEP_SNAPSHOT_DRAM = [self.allocate_tensor_dram(S * XW * bpe)
                                        for _ in range(self.AE_NUM_DENOISE_STEPS)]
-        # K-padded (32 -> 64) copy of x_t for the action_in_proj matmul (K must be
-        # a multiple of UE_VECTOR_SIZE=64); zero-filled once, only cols [0:32] are
-        # ever overwritten (cols [32:64] stay zero for the lifetime of the loop).
-        self.AE_XT_PAD_DRAM = self.allocate_tensor_dram(S * 64 * bpe)
-        zero_pad = torch.zeros(S, 64, dtype=torch.bfloat16)
-        self.dma_write(DMA_DEVICE_H2C, self.AE_XT_PAD_DRAM, zero_pad.contiguous(), S * 64 * bpe)
 
         # Prefix KV cache placeholder, only used if the prefix agent hasn't wired
         # self.prefix_k/v_cache_addr yet (see ASSUMED PREFIX KV-CACHE INTERFACE).
@@ -1325,6 +1348,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # ae_v_combined's prefix rows never actually got written on hardware,
         # leaving stale/garbage DRAM content that fed straight into the first
         # suffix layer's attention and NaN'd immediately.
+        # Step-0 probe snapshot buffers (allocated LAST so they can't shift the
+        # addresses of any critical AE buffer -- address layout is load-bearing
+        # here, see the DRAM-layout NaN bug). Each holds one step-0 intermediate
+        # so a post-run readback can diff it against the torch reference and
+        # localize which action-expert op first diverges.
+        if self.DENOISE_STEP0_PROBE:
+            self.AE_P0_ACTION_IN = self.allocate_tensor_dram(S * H * bpe)   # action_in_proj out (S,H)
+            self.AE_P0_TIME_EMB  = self.allocate_tensor_dram(1 * H * bpe)   # time embed (1,H)
+            self.AE_P0_SUF_L0    = self.allocate_tensor_dram(S * H * bpe)   # suffix layer0 out (S,H)
+            self.AE_P0_SUF_L17   = self.allocate_tensor_dram(S * H * bpe)   # suffix layer17 out (S,H)
+            self.AE_P0_VT        = self.allocate_tensor_dram(S * self.AE_XT_WIDTH * bpe)  # v_t (S,64)
+            self.AE_P0_XT_PAD    = self.allocate_tensor_dram(S * self.AE_XT_WIDTH * bpe)  # x_t (S,64) fed to action_in_proj
+            self.AE_P0_L0_NORM   = self.allocate_tensor_dram(S * H * bpe)   # layer0 pre-attn AdaRMSNorm out
+            self.AE_P0_L0_ATTN   = self.allocate_tensor_dram(S * H * bpe)   # layer0 attention o-proj out
+            self.AE_P0_L0_RESID  = self.allocate_tensor_dram(S * H * bpe)   # layer0 post-attn residual
         print(f"tensor_init_action_expert done; tensor DRAM at 0x{self.get_tensor_dram_addr():X}")
 
     # ---- small helpers --------------------------------------------------
@@ -1449,6 +1487,41 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.allocate_params_dram(N * H * 2)
         return addr
 
+    def _ae_precompute_cond_table(self):
+        """The AdaRMSNorm conditioning vector is INPUT-INDEPENDENT -- it depends
+        only on t (fixed per Euler step). So sincos -> time_mlp_in -> silu ->
+        time_mlp_out -> silu is a compile-time constant for all N steps. Compute
+        the whole (N, H) cond table on the host (matching pi05_torch_ref exactly,
+        IF4 weights + F.silu) and DMA it in, instead of running the time MLP +
+        fused-silu on hardware (whose approximate silu was cratering time_embed
+        to -6dB). Zero accuracy loss -- it's exact constants. Returns table addr."""
+        import pi05_torch_ref as _ref
+        H, N = self.AE_HIDDEN, self.AE_NUM_DENOISE_STEPS
+        min_period, max_period = 4e-3, 4.0
+        frac = torch.linspace(0.0, 1.0, H // 2)
+        period = min_period * (max_period / min_period) ** frac
+        # IF4-fake-quantize the time-MLP kernels the same way the reference does
+        # (Weights.__getitem__ applies maybe_quantize to ".kernel" tensors).
+        Win  = _ref.maybe_quantize(self._npy("time_mlp_in.kernel").to(torch.bfloat16), "if4").float()
+        bin_ = self._npy("time_mlp_in.bias").float()
+        Wout = _ref.maybe_quantize(self._npy("time_mlp_out.kernel").to(torch.bfloat16), "if4").float()
+        bout = self._npy("time_mlp_out.bias").float()
+        dt = -1.0 / N
+        rows = []
+        t = 1.0
+        for _ in range(N):
+            sinusoid = t * (1.0 / period) * 2 * math.pi
+            emb = torch.cat([torch.sin(sinusoid), torch.cos(sinusoid)]).to(torch.bfloat16).float()  # (H,)
+            emb = torch.nn.functional.silu(emb @ Win + bin_)
+            emb = torch.nn.functional.silu(emb @ Wout + bout)  # (H,) = AdaRMSNorm cond
+            rows.append(emb)
+            t += dt
+        table = torch.stack(rows).to(torch.bfloat16).contiguous()  # (N, H)
+        addr = self.get_params_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, addr, table, N * H * 2)
+        self.allocate_params_dram(N * H * 2)
+        return addr
+
     def _ae_time_embed_from_table(self, addr_reg):
         """Runtime-loop-body version of _ae_sincos_time_embed: read the CURRENT
         row (address held in addr_reg, advanced by the caller each iteration)
@@ -1494,6 +1567,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                gpr_M_reg=gpr_M_reg)
         self._debug_op(f"{_pfx}_preattn_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
         self._debug_op(f"{_pfx}_attn_gate", self.AE_GATE_BCAST_DRAM, S * H, shape=(S, H))
+        _p0l0 = self.DENOISE_STEP0_PROBE and step == 0 and layer_idx == 0
+        if _p0l0:
+            self._dram_copy(S * H * 2, self.AE_NORM_DRAM, self.AE_P0_L0_NORM)
 
         # 2. K/V projection for the suffix rows only -> combined buffer rows [P:P+S]
         self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["k_scale"], la["k_data"],
@@ -1533,7 +1609,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # 5. un-stack heads' first S rows -> (S, heads*D) token-major, o-proj
         for h in range(self.AE_HEADS):
             self.accelerator_memory_to_sram(self.AE_ATTN_OUT_DRAM + h * head_bytes, 0x00000, S * D)
-            self.sram_to_accelerator_memory(0x00000, self.AE_ATTN_RESULT_DRAM, S * D,
+            # dest MUST start at this head's column block (h*D) in the (S, H)
+            # token-major buffer -- without the +h*D*2 every head overwrites
+            # cols [0:D] and o-proj reads stale/garbage for heads 1..7.
+            self.sram_to_accelerator_memory(0x00000, self.AE_ATTN_RESULT_DRAM + h * D * 2, S * D,
                                              stride_bytes_per_chunk=D * 2, stride_jump_bytes=H * 2)
         # o projection is per-head (256,1024) -> accumulate into AE_O_PROJ_DRAM
         # via C_DRAM_ADDR-chained adds (first head writes, rest accumulate).
@@ -1543,6 +1622,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                              self.AE_O_PROJ_DRAM, bias_addr=(self.AE_O_PROJ_DRAM if h > 0 else None),
                              gpr_M_reg=gpr_M_reg)
         self._debug_op(f"{_pfx}_o_proj", self.AE_O_PROJ_DRAM, S * H, shape=(S, H))
+        if _p0l0:
+            self._dram_copy(S * H * 2, self.AE_O_PROJ_DRAM, self.AE_P0_L0_ATTN)
 
         # 6. gated residual: x = x + gate * attn_out
         eltwise_mul_core_dram(self, size=S * H, A_DRAM_ADDR=self.AE_O_PROJ_DRAM,
@@ -1550,6 +1631,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=x_in_dram,
                                B_DRAM_ADDR=self.AE_ATTN_GATED_DRAM, OUTPUT_DRAM_ADDR=self.AE_RESIDUAL_DRAM)
         self._debug_op(f"{_pfx}_attn_residual", self.AE_RESIDUAL_DRAM, S * H, shape=(S, H))
+        if _p0l0:
+            self._dram_copy(S * H * 2, self.AE_RESIDUAL_DRAM, self.AE_P0_L0_RESID)
 
         # 7. AdaRMSNorm (mlp conditioning)
         self._ae_ada_rms_norm(S, self.AE_RESIDUAL_DRAM, la["pre_ffw_norm_dense_scale"],
@@ -1660,23 +1743,32 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             "num_buckets": Tkv // UE_VECTOR_SIZE,
         }
 
+        # Precompute the (N,H) AdaRMSNorm conditioning table on the host (exact
+        # constants; replaces the HW time-MLP + approximate fused-silu).
+        self.AE_COND_TABLE_DRAM = self._ae_precompute_cond_table()
+
         try:
             for step in range(self.AE_NUM_DENOISE_STEPS):
-                # action_in_proj: x_t (S,32) -> action_tokens (S,H). K must be a
-                # multiple of 64 (matmat_mul_core/IF4 block_size), so x_t is copied
-                # into the K-padded (S,64) scratch buffer's first 32 cols first.
-                self.accelerator_memory_to_sram(self.AE_XT_DRAM, 0x00000, S * self.AE_ACTION_DIM_PADDED)
-                self.sram_to_accelerator_memory(0x00000, self.AE_XT_PAD_DRAM, S * self.AE_ACTION_DIM_PADDED,
-                                                 stride_bytes_per_chunk=self.AE_ACTION_DIM_PADDED * 2,
-                                                 stride_jump_bytes=64 * 2)
-                self._ae_matmul(S, 64, H, self.AE_XT_PAD_DRAM,
+                # action_in_proj: x_t (S,64) -> action_tokens (S,H). x_t is already
+                # physically 64-wide (cols [0:32] real, [32:64] zero), so the matmul
+                # reads it CONTIGUOUSLY -- no 32->64 strided staging (which was
+                # reading noise rows at 2x stride). action_in weight is K-padded 64.
+                if self.DENOISE_STEP0_PROBE and step == 0:
+                    self._dram_copy(S * self.AE_XT_WIDTH * 2, self.AE_XT_DRAM, self.AE_P0_XT_PAD)
+                self._ae_matmul(S, self.AE_XT_WIDTH, H, self.AE_XT_DRAM,
                                  self.ae_action_in_scale, self.ae_action_in_data,
                                  self.AE_ACTION_TOK_DRAM, bias_addr=self.ae_action_in_bias, gpr_M_reg=ae_S_reg)
                 self._debug_op(f"step{step}_action_in_proj", self.AE_ACTION_TOK_DRAM, S * H, shape=(S, H))
+                if self.DENOISE_STEP0_PROBE and step == 0:
+                    self._dram_copy(S * H * 2, self.AE_ACTION_TOK_DRAM, self.AE_P0_ACTION_IN)
 
-                # timestep embedding -> AE_COND_DRAM (this step's AdaRMSNorm conditioning)
-                self._ae_sincos_time_embed(t)
+                # timestep embedding -> AE_COND_DRAM (this step's AdaRMSNorm
+                # conditioning): copy the precomputed constant row for this step
+                # (host-exact) instead of running the HW time-MLP + fused silu.
+                self._dram_copy(H * 2, self.AE_COND_TABLE_DRAM + step * H * 2, self.AE_COND_DRAM)
                 self._debug_op(f"step{step}_time_embed", self.AE_COND_DRAM, H, shape=(1, H))
+                if self.DENOISE_STEP0_PROBE and step == 0:
+                    self._dram_copy(1 * H * 2, self.AE_COND_DRAM, self.AE_P0_TIME_EMB)
 
                 # 18 action-expert layers
                 x_cur = self.AE_ACTION_TOK_DRAM
@@ -1684,6 +1776,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     x_next = self.AE_X_DRAM if x_cur is not self.AE_X_DRAM else self.AE_ACTION_TOK_DRAM
                     self.compile_suffix_step(layer_idx, x_cur, x_next, gpr_M_reg=ae_S_reg, flash_ctx=flash_ctx, step=step)
                     self._debug_op(f"step{step}_suffix_layer{layer_idx}", x_next, S * H, shape=(S, H))
+                    if self.DENOISE_STEP0_PROBE and step == 0 and layer_idx == 0:
+                        self._dram_copy(S * H * 2, x_next, self.AE_P0_SUF_L0)
+                    if self.DENOISE_STEP0_PROBE and step == 0 and layer_idx == self.AE_LAYERS - 1:
+                        self._dram_copy(S * H * 2, x_next, self.AE_P0_SUF_L17)
                     x_cur = x_next
 
                 # final AdaRMSNorm (no gate applied -- action_out_proj consumes the
@@ -1694,29 +1790,33 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                        gpr_M_reg=ae_S_reg)
                 self._debug_op(f"step{step}_final_ada_rms_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
 
-                # action_out_proj: (S,H) -> v_t (S,32)
-                self._ae_matmul(S, H, self.AE_ACTION_DIM_PADDED, self.AE_NORM_DRAM,
+                # action_out_proj: (S,H) -> v_t (S,64). Output N padded 32->64 (weight
+                # rows [32:64]=0) so v_t is physically 64-wide, matching x_t -> the
+                # euler update is a plain contiguous add (no strided 32-of-64 write).
+                self._ae_matmul(S, H, self.AE_XT_WIDTH, self.AE_NORM_DRAM,
                                  self.ae_action_out_scale, self.ae_action_out_data,
                                  self.AE_VT_DRAM, bias_addr=self.ae_action_out_bias, gpr_M_reg=ae_S_reg)
-                self._debug_op(f"step{step}_action_out_proj", self.AE_VT_DRAM, S * self.AE_ACTION_DIM_PADDED,
-                                shape=(S, self.AE_ACTION_DIM_PADDED))
+                self._debug_op(f"step{step}_action_out_proj", self.AE_VT_DRAM, S * self.AE_XT_WIDTH,
+                                shape=(S, self.AE_XT_WIDTH))
+                if self.DENOISE_STEP0_PROBE and step == 0:
+                    self._dram_copy(S * self.AE_XT_WIDTH * 2, self.AE_VT_DRAM, self.AE_P0_VT)
 
-                # Euler step: x_t = x_t + dt * v_t
+                # Euler step: x_t = x_t + dt * v_t  (both physically S*64-wide)
                 # NOTE: OUTPUT_DRAM_ADDR aliases A_DRAM_ADDR (both AE_XT_DRAM) here --
                 # same aliasing shape as the compile_prefix bug we fixed, but this
-                # buffer is tiny (S*32 elements, a single chunk) so it's mathematically
+                # buffer is tiny (S*64 elements, a single chunk) so it's mathematically
                 # safe by the same per-chunk read-before-write analysis. Left as-is
                 # (not the confirmed bug class) but flagging since we've been burned
                 # by this exact pattern before.
-                self.accelerator_memory_to_sram(self.AE_VT_DRAM, 0x00000, S * self.AE_ACTION_DIM_PADDED)
+                self.accelerator_memory_to_sram(self.AE_VT_DRAM, 0x00000, S * self.AE_XT_WIDTH)
                 self.broadcast_mul(scalar=dt, sram_start_addr=0x00000, sram_wb_addr=0x00000,
-                                    element_size=S * self.AE_ACTION_DIM_PADDED)
-                self.sram_to_accelerator_memory(0x00000, self.AE_VT_DRAM, S * self.AE_ACTION_DIM_PADDED)
-                eltwise_add_core_dram(self, size=S * self.AE_ACTION_DIM_PADDED, A_DRAM_ADDR=self.AE_XT_DRAM,
+                                    element_size=S * self.AE_XT_WIDTH)
+                self.sram_to_accelerator_memory(0x00000, self.AE_VT_DRAM, S * self.AE_XT_WIDTH)
+                eltwise_add_core_dram(self, size=S * self.AE_XT_WIDTH, A_DRAM_ADDR=self.AE_XT_DRAM,
                                        B_DRAM_ADDR=self.AE_VT_DRAM, OUTPUT_DRAM_ADDR=self.AE_XT_DRAM)
-                self._debug_op(f"step{step}_euler_update", self.AE_XT_DRAM, S * self.AE_ACTION_DIM_PADDED,
-                                shape=(S, self.AE_ACTION_DIM_PADDED))
-                self._dram_copy(S * self.AE_ACTION_DIM_PADDED * 2, self.AE_XT_DRAM, self.AE_STEP_SNAPSHOT_DRAM[step])
+                self._debug_op(f"step{step}_euler_update", self.AE_XT_DRAM, S * self.AE_XT_WIDTH,
+                                shape=(S, self.AE_XT_WIDTH))
+                self._dram_copy(S * self.AE_XT_WIDTH * 2, self.AE_XT_DRAM, self.AE_STEP_SNAPSHOT_DRAM[step])
                 t += dt
 
             # Main per-(step,layer) program ends here; the shared flash-attention
@@ -2033,7 +2133,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             print(f"  vision_layer{i}: nan={n_nan} inf={n_inf} min={out.min():.4f} max={out.max():.4f}{flag}")
 
         print("=== denoise step NaN report ===")
-        S_ae, AD = self.AE_ACTION_HORIZON_PADDED, self.AE_ACTION_DIM_PADDED
+        S_ae, AD = self.AE_ACTION_HORIZON_PADDED, self.AE_XT_WIDTH  # snapshots are 64-wide
         for i, addr in enumerate(getattr(self, "AE_STEP_SNAPSHOT_DRAM", [])):
             buf = bytearray(S_ae * AD * 2)
             self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
@@ -2104,6 +2204,111 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                   f"n_diff={int((k_diff > 0).sum().item())}/{k_diff.numel()} "
                   f"V: match={v_match} max_abs_diff={v_diff.max().item():.4f} "
                   f"n_diff={int((v_diff > 0).sum().item())}/{v_diff.numel()}")
+
+    def verify_denoise_step0(self, kv_npz_path, device="cuda"):
+        """Diff the FPGA's step-0 action-expert intermediates against a torch
+        reference computed with the SAME noise and the SAME prefix K/V (loaded
+        from kv_npz_path). Feeding the reference the FPGA's own K/V isolates the
+        action-expert forward -- any divergence here is a kernel bug, not a
+        prefix problem. Prints SNR per intermediate so the FIRST one that craters
+        pinpoints the broken op. Requires DENOISE_STEP0_PROBE=True during compile."""
+        import pi05_torch_ref as _ref
+        import torch.nn.functional as F
+        if not torch.cuda.is_available():
+            device = "cpu"
+        S, H, D = self.AE_ACTION_HORIZON_PADDED, self.AE_HIDDEN, self.HEAD_DIM
+        AH, AD = self.AE_ACTION_HORIZON, self.AE_ACTION_DIM_PADDED
+
+        def _read(addr, numel):
+            buf = bytearray(numel * 2)
+            self.dma_read(DMA_DEVICE_C2H, addr, buf, numel * 2)
+            return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).float()
+
+        fpga_in   = _read(self.AE_P0_ACTION_IN, S * H).reshape(S, H)[:AH]
+        fpga_time = _read(self.AE_P0_TIME_EMB, H).reshape(1, H)
+        fpga_l0   = _read(self.AE_P0_SUF_L0, S * H).reshape(S, H)[:AH]
+        fpga_l17  = _read(self.AE_P0_SUF_L17, S * H).reshape(S, H)[:AH]
+        XW = self.AE_XT_WIDTH
+        fpga_vt   = _read(self.AE_P0_VT, S * XW).reshape(S, XW)[:AH, :7]
+        fpga_xtpad = _read(self.AE_P0_XT_PAD, S * XW).reshape(S, XW)[:AH]  # 64-wide input to action_in_proj
+        fpga_l0norm  = _read(self.AE_P0_L0_NORM, S * H).reshape(S, H)[:AH]
+        fpga_l0attn  = _read(self.AE_P0_L0_ATTN, S * H).reshape(S, H)[:AH]
+        fpga_l0resid = _read(self.AE_P0_L0_RESID, S * H).reshape(S, H)[:AH]
+
+        # --- reference step-0 with FPGA's own K/V ---
+        npz = np.load(kv_npz_path)
+        vlen = int(npz["prefix_valid_len"])
+        stride = npz["k"].size // (self.NUM_LAYERS * D)
+        fk = torch.frombuffer(npz["k"].tobytes(), dtype=torch.bfloat16).float().reshape(self.NUM_LAYERS, stride, D)
+        fv = torch.frombuffer(npz["v"].tobytes(), dtype=torch.bfloat16).float().reshape(self.NUM_LAYERS, stride, D)
+        W = _ref.Weights(device=device, dtype=torch.bfloat16, quant="if4")
+        dt_ = W.dtype
+        # (b,P,1,D) kv cache from the FPGA's cached prefix rows [0:vlen]
+        k_cache = [fk[L, :vlen].to(device, dt_)[None, :, None, :] for L in range(self.NUM_LAYERS)]
+        v_cache = [fv[L, :vlen].to(device, dt_)[None, :, None, :] for L in range(self.NUM_LAYERS)]
+        kv_cache = (k_cache, v_cache)
+
+        noise = torch.zeros(1, AH, AD, device=device, dtype=torch.float32)
+        noise[..., :7] = torch.from_numpy(np.random.RandomState(0).randn(AH, 7).astype(np.float32)).to(device)
+        x_t = noise
+        t = torch.ones(1, device=device, dtype=torch.float32)
+
+        ref_in = (x_t.to(dt_) @ W["action_in_proj.kernel"]) + W["action_in_proj.bias"]  # (1,AH,H)
+        time_emb = _ref.sincos_pos_embed(t, dim=H).to(dt_)
+        time_emb = F.silu((time_emb @ W["time_mlp_in.kernel"]) + W["time_mlp_in.bias"])
+        time_emb = F.silu((time_emb @ W["time_mlp_out.kernel"]) + W["time_mlp_out.bias"])  # (1,H)
+
+        suffix_bias = _ref.build_suffix_attn_bias(vlen, AH, device, torch.float32)
+        x = ref_in
+        ref_layer_out = {}
+        for layer in range(self.NUM_LAYERS):
+            dw = W["PaliGemma.llm.layers.pre_attention_norm_1.Dense_0.kernel"][layer]
+            db = W["PaliGemma.llm.layers.pre_attention_norm_1.Dense_0.bias"][layer]
+            h, gate = _ref.ada_rms_norm(x, time_emb, dw, db)
+            _, attn_out, _ = _ref.joint_attention(None, h, suffix_bias, layer, W, kv_cache=kv_cache)
+            if layer == 0:
+                ref_l0norm, ref_l0attn = h, attn_out
+            x = x + gate[:, None, :] * attn_out
+            if layer == 0:
+                ref_l0resid = x
+            dw2 = W["PaliGemma.llm.layers.pre_ffw_norm_1.Dense_0.kernel"][layer]
+            db2 = W["PaliGemma.llm.layers.pre_ffw_norm_1.Dense_0.bias"][layer]
+            h2, gate2 = _ref.ada_rms_norm(x, time_emb, dw2, db2)
+            mlp_out = _ref.gated_mlp(h2, W["PaliGemma.llm.layers.mlp_1.gating_einsum"][layer],
+                                     W["PaliGemma.llm.layers.mlp_1.linear"][layer])
+            x = x + gate2[:, None, :] * mlp_out
+            ref_layer_out[layer] = x
+        fdw = W["PaliGemma.llm.final_norm_1.Dense_0.kernel"]
+        fdb = W["PaliGemma.llm.final_norm_1.Dense_0.bias"]
+        x_norm, _ = _ref.ada_rms_norm(x, time_emb, fdw, fdb)
+        ref_vt = ((x_norm.float() @ W["action_out_proj.kernel"].float()) + W["action_out_proj.bias"].float())[..., :7]
+
+        def _snr(a, b):
+            a, b = a.float().cpu(), b.float().cpu()
+            return 20 * torch.log10(b.norm() / (a - b).norm().clamp_min(1e-12)).item()
+
+        # staged x_t_pad check: expected (AH,64) = [noise(AH,32) | zeros(AH,32)]
+        exp_xtpad = torch.zeros(AH, 64)
+        exp_xtpad[:, :AD] = noise.squeeze(0).float().cpu()
+        print("=== Step-0 action-expert intermediate SNR: FPGA vs reference (same noise + FPGA K/V) ===")
+        print(f"  x_t_pad (staged input) : {_snr(fpga_xtpad, exp_xtpad):7.2f}dB   "
+              f"[cols0:7 {'OK' if torch.allclose(fpga_xtpad[:, :7], exp_xtpad[:, :7], atol=0.05) else 'MISMATCH'}, "
+              f"cols32:64 max={fpga_xtpad[:, 32:].abs().max().item():.3f} (expect ~0)]")
+        torch.set_printoptions(precision=4, sci_mode=False)
+        print(f"    [raw] FPGA x_t_pad rows0-2, cols0:8:\n{fpga_xtpad[:3, :8]}")
+        print(f"    [raw] EXPECTED       rows0-2, cols0:8:\n{exp_xtpad[:3, :8]}")
+        print(f"    [raw] FPGA x_t_pad col0 (all 10 rows): {fpga_xtpad[:, 0].tolist()}")
+        print(f"    [raw] EXPECTED       col0 (all 10 rows): {exp_xtpad[:, 0].tolist()}")
+        print(f"  action_in_proj : {_snr(fpga_in,   ref_in.squeeze(0)):7.2f}dB")
+        print(f"  time_embed     : {_snr(fpga_time, time_emb):7.2f}dB")
+        print(f"  -- layer0 internals --")
+        print(f"    L0 preattn_norm : {_snr(fpga_l0norm,  ref_l0norm.squeeze(0)):7.2f}dB")
+        print(f"    L0 attn_out     : {_snr(fpga_l0attn,  ref_l0attn.squeeze(0)):7.2f}dB")
+        print(f"    L0 attn_residual: {_snr(fpga_l0resid, ref_l0resid.squeeze(0)):7.2f}dB")
+        print(f"  suffix_layer0  : {_snr(fpga_l0,   ref_layer_out[0].squeeze(0)):7.2f}dB")
+        print(f"  suffix_layer17 : {_snr(fpga_l17,  ref_layer_out[self.NUM_LAYERS-1].squeeze(0)):7.2f}dB")
+        print(f"  v_t (out_proj) : {_snr(fpga_vt,   ref_vt.squeeze(0)):7.2f}dB")
+        print("  ^ first line that craters (<~10dB) = the op that breaks. All high = bug is downstream (euler/snapshot).")
 
     def _run_sanity_matmul(self, M, K, N, use_pbi):
         """Compile+run ONE plain bf16 A(M,K) @ B(K,N) matmul (A @ B^T) and
@@ -2243,7 +2448,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         t2 = time.perf_counter()
         self.tensor_init_action_expert()
-        S, AD = self.AE_ACTION_HORIZON_PADDED, self.AE_ACTION_DIM_PADDED
+        S, AD = self.AE_ACTION_HORIZON_PADDED, self.AE_XT_WIDTH  # x_t buffer is 64-wide
         if noise32 is None:
             # Padding rows/cols must NOT be exact zero: rms_norm_core has no
             # epsilon, so an all-zero row -> rsqrt(0)=inf -> NaN, which then
@@ -2457,6 +2662,20 @@ def main():
                           "special registers) and diff it against a CPU reference. Tests raw "
                           "post-vision+prefix hardware health with the simplest possible op, "
                           "independent of anything denoise-loop-specific.")
+    ap.add_argument("--verify-denoise", action="store_true",
+                     help="after the full FPGA run, run pi05_torch_ref.run_pi05 on CPU with the "
+                          "SAME quant (IF4, matching lm_quant/vision_quant=q4_64), SAME images, "
+                          "SAME prompt tokens, SAME state, and the SAME RandomState(0) noise -- so "
+                          "the only variable is HW-vs-CPU execution -- and report per-dim / "
+                          "per-timestep / overall SNR of the (10,7) action output.")
+    ap.add_argument("--probe-step0", action="store_true",
+                     help="snapshot step-0 action-expert intermediates and diff each against the "
+                          "torch reference (fed the FPGA's own K/V) to localize which op first "
+                          "diverges. Works with --debug for a fast ~75s iteration loop.")
+    ap.add_argument("--ref-device", default="auto", choices=["auto", "cuda", "cpu"],
+                     help="device for the --verify-denoise reference run. 'auto' (default) "
+                          "uses cuda if available (7Hz path, ~100x faster than CPU bf16), "
+                          "else cpu.")
     args, _ = ap.parse_known_args()
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
@@ -2464,6 +2683,10 @@ def main():
     if args.steps is not None:
         Pi05Libero_UnifiedEngine.AE_NUM_DENOISE_STEPS = args.steps
         print(f"[main] AE_NUM_DENOISE_STEPS overridden to {args.steps}")
+
+    if args.probe_step0:
+        Pi05Libero_UnifiedEngine.DENOISE_STEP0_PROBE = True
+        print("[main] DENOISE_STEP0_PROBE enabled -- will snapshot + diff step-0 intermediates")
 
     ue = Pi05Libero_UnifiedEngine()
     init_hang_prevention(ue)
@@ -2533,6 +2756,9 @@ def main():
         if args.sanity_check:
             return
 
+    if args.probe_step0:
+        ue.verify_denoise_step0(PREFIX_KV_DUMP_PATH)
+
     np.set_printoptions(precision=4, suppress=True)
     print("action_chunk shape (raw model output):", actions.shape)
     print(actions)
@@ -2549,6 +2775,77 @@ def main():
         actions_unnorm = (actions + 1.0) / 2.0 * (act_q99 - act_q01 + 1e-6) + act_q01
         print("action_chunk (unnormalized, comparable to run_pi05.py):")
         print(actions_unnorm)
+
+    if args.verify_denoise and not args.debug:
+        # CPU IF4 reference, matched apples-to-apples: same quant our model uses
+        # (q4_64 == if4), same images/prompt/state, and CRUCIALLY the same
+        # RandomState(0) noise the FPGA denoise seeds (run_inference uses
+        # noise32[:10,:7] = RandomState(0).randn(10,7); the reference's own
+        # main() uses torch.manual_seed(0) -- a DIFFERENT RNG -- so we must
+        # feed the exact numpy array here, not let it reseed). Isolates pure
+        # HW-vs-CPU execution error (no noise-seed, no quant-policy confound).
+        import pi05_torch_ref as _ref
+        ref_device = args.ref_device
+        if ref_device == "auto":
+            ref_device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[verify-denoise] running IF4 reference (pi05_torch_ref.run_pi05) on "
+              f"{ref_device}... vision+prefix+denoise"
+              + (" on GPU (fast)" if ref_device == "cuda"
+                 else " on CPU (bf16, slow -- pass --ref-device cuda if you have a GPU)"))
+        W = _ref.Weights(device=ref_device, dtype=torch.bfloat16, quant="if4")
+        ref_images = torch.stack([torch.from_numpy(im).to(torch.bfloat16) for im in images], dim=0).to(ref_device)
+        ref_prompt = torch.from_numpy(prompt_tokens).long().unsqueeze(0).to(ref_device)
+        ref_state = torch.tensor([meta["state_example"]], dtype=torch.float32).to(ref_device)
+        noise7 = np.random.RandomState(0).randn(10, 7).astype(np.float32)  # SAME as run_inference
+        noise32 = torch.zeros(1, 10, 32, dtype=torch.float32)
+        noise32[..., :7] = torch.from_numpy(noise7)
+        noise32 = noise32.to(ref_device)
+        ref_actions, ref_kv = _ref.run_pi05(ref_images, ref_prompt, ref_state, W,
+                                            noise=noise32, return_kv=True)
+        ref_actions = ref_actions[..., :7]
+        ref_np = ref_actions.squeeze(0).float().cpu().numpy()
+
+        # --- Prefix K/V comparison: FPGA dumped cache vs reference cache ---
+        # Splits the failure: if prefix K/V matches, the bug is in the action
+        # head; if it diverges, the break is at/inside prefix.
+        try:
+            kv_path = PREFIX_KV_DUMP_PATH
+            npz = np.load(kv_path)
+            NL, D = ue.NUM_LAYERS, ue.HEAD_DIM
+            vlen = int(npz["prefix_valid_len"])
+            # per-layer row stride is the ALLOCATED seq (max_seq_len, padded),
+            # not PREFIX_SEQ_LEN -- derive it from the buffer size so we don't
+            # assume. total_elems = NL * stride_rows * D.
+            stride_rows = npz["k"].size // (NL * D)
+            fpga_k = torch.frombuffer(npz["k"].tobytes(), dtype=torch.bfloat16).float().reshape(NL, stride_rows, D)
+            fpga_v = torch.frombuffer(npz["v"].tobytes(), dtype=torch.bfloat16).float().reshape(NL, stride_rows, D)
+            ref_k_list, ref_v_list = ref_kv  # each: list of 18 (b,P,1,256)
+            print(f"=== Prefix K/V SNR: FPGA cache vs CPU-IF4 reference (valid_len={vlen}) ===")
+            def _snr(a, b):
+                return 20 * torch.log10(b.norm() / (a - b).norm().clamp_min(1e-12)).item()
+            for L in range(NL):
+                rk = ref_k_list[L].squeeze(0).squeeze(1).float().cpu()  # (P,256)
+                rv = ref_v_list[L].squeeze(0).squeeze(1).float().cpu()
+                P = min(rk.shape[0], vlen)
+                fk = fpga_k[L, :P]
+                fv = fpga_v[L, :P]
+                print(f"  layer{L:2d}: K_SNR={_snr(fk, rk[:P]):6.2f}dB  V_SNR={_snr(fv, rv[:P]):6.2f}dB")
+        except Exception as e:
+            print(f"[prefix-kv-compare] skipped: {e}")
+
+        hw = torch.from_numpy(actions).float()      # (10,7) FPGA
+        cpu = torch.from_numpy(ref_np).float()      # (10,7) CPU IF4
+        def _snr(a, b):
+            return 20 * torch.log10(b.norm() / (a - b).norm().clamp_min(1e-12)).item()
+        print("=== FPGA vs CPU-IF4 denoise SNR (matched noise/inputs) ===")
+        print(f"  overall: SNR={_snr(hw, cpu):.2f}dB  MSE={((hw-cpu)**2).mean().item():.6f}")
+        for d in range(7):
+            print(f"  dim{d}: SNR={_snr(hw[:, d], cpu[:, d]):.2f}dB  "
+                  f"hw[{hw[:,d].min():.3f},{hw[:,d].max():.3f}] cpu[{cpu[:,d].min():.3f},{cpu[:,d].max():.3f}]")
+        for tstep in range(10):
+            print(f"  step{tstep}: SNR={_snr(hw[tstep], cpu[tstep]):.2f}dB")
+        print("CPU-IF4 reference action_chunk (10,7):")
+        print(ref_np)
 
     ue.probe_nan_report()
 
