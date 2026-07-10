@@ -124,3 +124,30 @@ no per-bucket ISA copies):
 Both knobs live in `gemma4_e2b_config.json`. Increasing
 `prefill_max_seq_len` linearly grows the prefill ISA in
 `gemma4_instruction.bin`; the decoder bin size is fixed.
+
+## OpenAI-compatible server — `serve_openai.py`
+
+Long-running chat server over the same execute-only runtime. Loads the
+bins once, then serves `POST /v1/chat/completions` (streaming SSE and
+non-streaming), `GET /v1/models`, `GET /health`. Works with any
+OpenAI-compatible client: curl, the `openai` SDK, chat UIs.
+
+```bash
+python3 models/gemma4_e2b/serve_openai.py --port 8080
+
+curl -sN http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 2+2?"}],"temperature":0,"stream":true,"max_tokens":64}'
+```
+
+Notes:
+
+- Decode is greedy by construction (the LM head ends in the hardware
+  argmax; logits never cross PCIe), so `temperature > 0` is rejected
+  with a clear error unless the server runs with `--force-greedy`.
+- Multi-turn conversations are templated with the model's chat template;
+  `system` text is folded into the first user turn. The templated prompt
+  must fit `prefill_max_seq_len`; generation caps at `max_context_size`.
+- One request at a time; concurrent requests get 503 while the engine
+  is busy. Text-only for now (vision/audio are natural follow-ups).
+- Same flags as the other scripts where relevant: `--dev`, `--cycle`,
+  `--local-weights`.
