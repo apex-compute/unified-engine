@@ -312,8 +312,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.lm_layer_addrs = []
         for l in range(self.NUM_LAYERS):
             la = {}
-            la["ln1"] = store_weight(self, ln1_all[l])
-            la["ln2"] = store_weight(self, ln2_all[l])
+            # rms_norm_core multiplies by GAMMA directly, no implicit +1 (confirmed
+            # by reading rms_norm_core's eltwise_mul_core call in user_dma_core.py --
+            # same gotcha already handled correctly for the action-expert's plain
+            # AdaRMSNorm via AE_ONES_DRAM). Gemma checkpoints store this weight as a
+            # DELTA from 1 (pi05_torch_ref.rms_norm applies `normed * (1.0 + scale)`),
+            # so the raw checkpoint value must be pre-offset by +1 here to match --
+            # this was a real bug: layer0's ln1 SNR was -3.17dB with the raw value.
+            la["ln1"] = store_weight(self, ln1_all[l] + 1.0)
+            la["ln2"] = store_weight(self, ln2_all[l] + 1.0)
 
             # q_einsum[l]: (heads, d_in=2048, head_dim=256) each head is (in,out) -> transpose
             # to (out,in) per head, stack heads along N (out) axis -> (heads*head_dim, d_in).
@@ -574,7 +581,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
     def compile_prefix(self, seq_len, valid_len=None):
         """18-layer Gemma-2B prefix stack: RMSNorm -> MQA flash-attn (bidirectional
-        bias) -> residual -> RMSNorm -> gated-SiLU MLP -> residual. Per-layer K/V
+        bias) -> residual -> RMSNorm -> gated-GELU MLP -> residual. Per-layer K/V
         projections are staged into the persistent LAYER0_K_DRAM/LAYER0_V_DRAM cache
         (see tensor_init's KV_LAYER_STRIDE/KV_HEAD_STRIDE) for later reuse by the
         action-expert suffix stack (out of scope here).
@@ -601,6 +608,46 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # both its inputs.
         self.LAYER0_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.LAYER0_LAYER_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        # Per-layer snapshots (LAYER0_LAYER_OUT_DRAM itself is reused/overwritten
+        # every layer) so a post-run readback can CPU-vs-HW SNR-check every
+        # layer's output at once -- same pattern as VIS_LAYER_SNAPSHOT_DRAM.
+        # layer0-only op-by-op snapshots (layer0's per-op scratch buffers, e.g.
+        # LAYER0_Q_DRAM, get overwritten by every later layer's same op -- these
+        # dedicated copies survive the full 18-layer run so a single post-run
+        # readback can op-by-op SNR-check exactly where within layer0 things
+        # first diverge from the CPU reference, without 19 separate debug-stop runs).
+        # DISABLED by default (self._prefix_snap) -- these ~98MB of buffers push
+        # the action-expert stack ~98MB higher, the only diff vs the clean --debug
+        # run. Allocated only when PREFIX_SNAPSHOTS=True.
+        if getattr(self, "PREFIX_SNAPSHOTS", False):
+            self.PREFIX_LAYER_SNAPSHOT_DRAM = [self.allocate_tensor_dram(S * H * bpe) for _ in range(self.NUM_LAYERS)]
+            self.PREFIX_L0_SNAPSHOT_DRAM = {
+                name: self.allocate_tensor_dram(size * bpe) for name, size in (
+                    ("ln1", S * H), ("q_proj", S * H), ("k_proj", S * KV), ("v_proj", S * KV),
+                    ("q_permute", S * H),
+                    ("head0", S * D), ("head1", S * D), ("head2", S * D), ("head3", S * D),
+                    ("head4", S * D), ("head5", S * D), ("head6", S * D), ("head7", S * D),
+                    ("attn_permute", S * H), ("o_proj_residual", S * H), ("ln2", S * H),
+                    ("mlp_lo", S * H), ("mlp_hi", S * H), ("mlp_down", S * H),
+                )
+            }
+        else:
+            self.PREFIX_LAYER_SNAPSHOT_DRAM = None
+            self.PREFIX_L0_SNAPSHOT_DRAM = None
+
+        # Fresh register/inst-pointer allocation per stage (start_capture does
+        # NOT reset these per-process counters; drift across stages hands out
+        # bad indices -- see compile_denoise_loop's reset for the full writeup).
+        self.reset_isa_reg_counter()
+        self.reset_inst_ptr_counter()
+
+        # PREFIX_SNAPSHOTS: debug-only per-layer/op SNR snapshot buffers. When
+        # OFF (default), skip both the ~98MB of snapshot DRAM allocations AND the
+        # per-op _dram_copy instructions -- this keeps compile_prefix from
+        # shoving the action-expert buffers ~98MB higher in tensor DRAM (the
+        # ONLY thing that differs between a clean --debug denoise run and the
+        # NaN'ing full run). Set True to re-enable the per-op SNR report.
+        self._prefix_snap = getattr(self, "PREFIX_SNAPSHOTS", False)
 
         # PBI dynamic-M loop (mirrors compile_encoder's vis_S_reg): without this,
         # every matmul/RMSNorm below compiles a fully-unrolled static instruction
@@ -634,12 +681,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                          OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln1"],
                                          gpr_M_reg=prefix_S_reg)
                 self._debug_op(f"layer{layer_idx}_ln1", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln1"])
 
                 # 2. Q/K/V projections (MQA: K/V project to a single head_dim, not NH*D)
                 self._matmul(M=S, K=H, N=H, A=self.LAYER0_PRE_NORM_DRAM, proj="q", la=la, OUT=self.LAYER0_Q_DRAM, gpr_M_reg=prefix_S_reg)
                 self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="k", la=la, OUT=self.LAYER0_K_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
                 self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="v", la=la, OUT=self.LAYER0_V_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
                 self._debug_op(f"layer{layer_idx}_qkv_proj", self.LAYER0_Q_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_Q_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_proj"])
+                    self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_proj"])
+                    self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["v_proj"])
 
                 # 3. permute Q from (seq, heads, head_dim) -> (heads, seq, head_dim); K/V
                 # already (seq, head_dim) since num_kv_heads=1 == the layout
@@ -647,6 +700,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 smart_bf16_permute_core(self, (S, NH, D), [1, 0, 2],
                                          self.LAYER0_Q_DRAM, self.LAYER0_Q_PERM_DRAM)
                 self._debug_op(f"layer{layer_idx}_q_permute", self.LAYER0_Q_PERM_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_Q_PERM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_permute"])
 
                 # 4. stage this layer's K/V into the persistent KV cache for downstream reuse.
                 k_cache_addr = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
@@ -666,7 +721,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # the subroutine's K/V addresses are fixed to those same buffers.
                 head_bytes = S * D * bpe
                 for h in range(NH):
-                    print(f"    [debug] layer{layer_idx} head{h}: capture_count before jump-site = {self.capture_count}")
                     self._dram_copy(head_bytes, self.LAYER0_Q_PERM_DRAM + h * head_bytes, self.LAYER0_FLASH_Q_DRAM)
                     self.generate_instruction_add_set(prefix_gpr_bucket, prefix_num_buckets)
                     self.pad_capture_to_64b_boundary()
@@ -677,24 +731,33 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     self.generate_instruction_jump_abs(target_instruction_word_addr=0)
                     self._dram_copy(head_bytes, self.LAYER0_FLASH_OUT_DRAM, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes)
                     self._debug_op(f"layer{layer_idx}_head{h}", self.LAYER0_ATTN_OUT_DRAM + h * head_bytes, S * D, shape=(S, D))
+                    if layer_idx == 0 and self._prefix_snap:
+                        self._dram_copy(head_bytes, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
+                                         self.PREFIX_L0_SNAPSHOT_DRAM[f"head{h}"])
 
                 # 6. permute attn output (heads, seq, head_dim) -> (seq, heads*head_dim)
                 smart_bf16_permute_core(self, (NH, S, D), [1, 0, 2],
                                          self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
                 self._debug_op(f"layer{layer_idx}_attn_permute", self.LAYER0_ATTN_RESULT_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_ATTN_RESULT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["attn_permute"])
 
                 # 7. output projection + residual (non-aliased: OUT distinct from both inputs)
                 self._matmul(M=S, K=H, N=H, A=self.LAYER0_ATTN_RESULT_DRAM, proj="o", la=la, OUT=self.LAYER0_O_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
                 eltwise_add_core_dram(self, S * H, h_in, self.LAYER0_O_PROJ_DRAM, self.LAYER0_ATTN_RESIDUAL_DRAM)
                 self._debug_op(f"layer{layer_idx}_o_proj_residual", self.LAYER0_ATTN_RESIDUAL_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_ATTN_RESIDUAL_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["o_proj_residual"])
 
                 # 8. pre-FFW RMSNorm
                 self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.LAYER0_ATTN_RESIDUAL_DRAM,
                                          OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln2"],
                                          gpr_M_reg=prefix_S_reg)
                 self._debug_op(f"layer{layer_idx}_ln2", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln2"])
 
-                # 9. gated-SiLU MLP + residual, FF_HALF-split (parakeet_test.py pattern,
+                # 9. gated-GELU MLP + residual, FF_HALF-split (parakeet_test.py pattern,
                 # adapted for the gated variant -- see _weight_init_lm_prefix's comment
                 # for why: matmat_mul_core_pbi can't do K=16384 in one call, and the
                 # strided-DMA extraction alternative (_dram_split_copy) was the
@@ -703,28 +766,36 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # moment it's written -- no slicing step exists to hang on.
                 FF_HALF = I // 2
                 self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="gate_lo", la=la,
-                             OUT=self.LAYER0_MLP_GATE_LO_DRAM, silu_enable=True, gpr_M_reg=prefix_S_reg)
+                             OUT=self.LAYER0_MLP_GATE_LO_DRAM, gelu_enable=True, gpr_M_reg=prefix_S_reg)
                 self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="up_lo", la=la,
                              OUT=self.LAYER0_MLP_UP_LO_DRAM, gpr_M_reg=prefix_S_reg)
                 eltwise_mul_core_dram(self, S * FF_HALF, self.LAYER0_MLP_GATE_LO_DRAM, self.LAYER0_MLP_UP_LO_DRAM, self.LAYER0_MLP_MULT_LO_DRAM)
                 self._matmul(M=S, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_LO_DRAM, proj="down_lo", la=la,
                              OUT=self.LAYER0_MLP_DOWN_LO_OUT_DRAM, gpr_M_reg=prefix_S_reg)
                 self._debug_op(f"layer{layer_idx}_mlp_lo", self.LAYER0_MLP_DOWN_LO_OUT_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_LO_OUT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_lo"])
 
                 self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="gate_hi", la=la,
-                             OUT=self.LAYER0_MLP_GATE_HI_DRAM, silu_enable=True, gpr_M_reg=prefix_S_reg)
+                             OUT=self.LAYER0_MLP_GATE_HI_DRAM, gelu_enable=True, gpr_M_reg=prefix_S_reg)
                 self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="up_hi", la=la,
                              OUT=self.LAYER0_MLP_UP_HI_DRAM, gpr_M_reg=prefix_S_reg)
                 eltwise_mul_core_dram(self, S * FF_HALF, self.LAYER0_MLP_GATE_HI_DRAM, self.LAYER0_MLP_UP_HI_DRAM, self.LAYER0_MLP_MULT_HI_DRAM)
                 self._matmul(M=S, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_HI_DRAM, proj="down_hi", la=la,
                              OUT=self.LAYER0_MLP_DOWN_HI_OUT_DRAM, gpr_M_reg=prefix_S_reg)
                 self._debug_op(f"layer{layer_idx}_mlp_hi", self.LAYER0_MLP_DOWN_HI_OUT_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_hi"])
 
                 eltwise_add_core_dram(self, S * H, self.LAYER0_MLP_DOWN_LO_OUT_DRAM, self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.LAYER0_MLP_DOWN_DRAM)
                 self._debug_op(f"layer{layer_idx}_mlp_down", self.LAYER0_MLP_DOWN_DRAM, S * H, shape=(S, H))
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_down"])
                 # non-aliased: OUT (LAYER0_LAYER_OUT_DRAM) distinct from both inputs
                 eltwise_add_core_dram(self, S * H, self.LAYER0_ATTN_RESIDUAL_DRAM, self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_LAYER_OUT_DRAM)
                 self._debug_op(f"layer{layer_idx}_residual2", self.LAYER0_LAYER_OUT_DRAM, S * H, shape=(S, H))
+                if self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_LAYER_OUT_DRAM, self.PREFIX_LAYER_SNAPSHOT_DRAM[layer_idx])
 
             # Main per-layer program ends here; the shared flash-attention subroutine
             # (jumped to from every per-head call site above) is compiled once below,
@@ -759,6 +830,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # real addresses so tensor_init_action_expert's placeholder fallback never
         # triggers.
         self.PREFIX_SEQ_LEN = S
+        self.prefix_valid_len = valid_len
         self.prefix_k_cache_addr = [self.LAYER0_K_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
         self.prefix_v_cache_addr = [self.LAYER0_V_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
 
@@ -808,6 +880,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.start_capture()
         self._debug_counter = 0
         self._debug_halt_info = None
+
+        # Fresh register/inst-pointer counters per stage (see compile_denoise_loop).
+        self.reset_isa_reg_counter()
+        self.reset_inst_ptr_counter()
 
         vis_S_reg = self.alloc_isa_reg()
         vis_ln_chunks = self.alloc_isa_reg()
@@ -1126,6 +1202,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # assumes Q/K share the same seq_len) can run Q against the full Tkv K/V.
         # Only the first S output rows are read back.
         self.AE_Q_DRAM = self.allocate_tensor_dram(self.AE_HEADS * Tkv * D * bpe)
+        zero_ae_q = torch.zeros(self.AE_HEADS * Tkv, D, dtype=torch.bfloat16)
+        self.dma_write(DMA_DEVICE_H2C, self.AE_Q_DRAM, zero_ae_q.contiguous(), self.AE_HEADS * Tkv * D * bpe)
         self.AE_ATTN_OUT_DRAM = self.allocate_tensor_dram(self.AE_HEADS * Tkv * D * bpe)
         self.AE_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram((D * Tkv + max(D, 64) * Tkv) * bpe)
         self.AE_ATTN_RESULT_DRAM = self.allocate_tensor_dram(S * H * bpe)  # un-headed (S,H) post-o-proj input
@@ -1142,6 +1220,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # copied into this fixed scratch once per (step,layer), reused for all 8
         # heads' jumps within that layer.
         self.AE_FLASH_Q_DRAM = self.allocate_tensor_dram(Tkv * D * bpe)
+        zero_ae_flash_q = torch.zeros(Tkv, D, dtype=torch.bfloat16)
+        self.dma_write(DMA_DEVICE_H2C, self.AE_FLASH_Q_DRAM, zero_ae_flash_q.contiguous(), Tkv * D * bpe)
         self.AE_FLASH_K_DRAM = self.allocate_tensor_dram(Tkv * D * bpe)
         self.AE_FLASH_V_DRAM = self.allocate_tensor_dram(Tkv * D * bpe)
         self.AE_FLASH_OUT_DRAM = self.allocate_tensor_dram(Tkv * D * bpe)
@@ -1151,10 +1231,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # cols (bidirectional per pi0.5 ar_mask all-False), large-negative for the
         # [S:Tkv] padding columns/rows (unused rows are never read back, but the
         # columns feeding real rows' softmax must be masked so padding K/V garbage
-        # doesn't pollute attention over rows [0:S]).
+        # doesn't pollute attention over rows [0:S]), AND large-negative for
+        # [valid_len:P] -- the prefix's OWN internal padding-token columns (compile_prefix
+        # pads seq_len=P=832 but only the first valid_len~784-813 rows are real tokens;
+        # rows [valid_len:P] hold finite-but-meaningless padding-token K/V that must not
+        # leak into the suffix's cross-attention softmax over the real S=64 action rows).
+        # Previously unmasked -- a real accuracy bug (not a NaN source), fixed here.
         NEG_INF = -1e9
+        valid_len = getattr(self, "prefix_valid_len", P)
         bias = torch.zeros(Tkv, Tkv, dtype=torch.bfloat16)
         bias[:, P + S:] = NEG_INF   # no such columns (P+S==Tkv) -- kept for clarity/symmetry
+        if valid_len < P:
+            bias[:, valid_len:P] = NEG_INF
         bias[S:, :] = 0.0           # unused query rows; value irrelevant, never read back
         self.AE_BIAS_DRAM = self.get_params_dram_addr()
         self.dma_write(DMA_DEVICE_H2C, self.AE_BIAS_DRAM, bias.contiguous(), Tkv * Tkv * bpe)
@@ -1164,6 +1252,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.AE_X_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.AE_NORM_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.AE_ATTN_GATED_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        self.AE_ADARMS_MUL_SCRATCH_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.AE_RESIDUAL_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.AE_MLP_GATE_DRAM = self.allocate_tensor_dram(S * I * bpe)
         self.AE_MLP_UP_DRAM = self.allocate_tensor_dram(S * I * bpe)
@@ -1290,10 +1379,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.accelerator_memory_to_sram(self.AE_SCALE_BCAST_DRAM, 0x00000, M * H)
         self.broadcast_add(scalar=1.0, sram_start_addr=0x00000, sram_wb_addr=0x00000, element_size=M * H)
         self.sram_to_accelerator_memory(0x00000, self.AE_SCALE_BCAST_DRAM, M * H)
-        # 5. out = normed * (1+scale) + shift
+        # 5. out = normed * (1+scale) + shift; route through dedicated scratch buffer
+        # to avoid the hardware read/write hazard from aliasing an input with the
+        # output in one DMA-backed elementwise op (same class as the confirmed hang
+        # trigger fixed in compile_prefix -- see that function's comment).
         eltwise_mul_core_dram(self, size=M * H, A_DRAM_ADDR=self.AE_NORM_DRAM,
-                               B_DRAM_ADDR=self.AE_SCALE_BCAST_DRAM, OUTPUT_DRAM_ADDR=norm_out_dram)
-        eltwise_add_core_dram(self, size=M * H, A_DRAM_ADDR=norm_out_dram,
+                               B_DRAM_ADDR=self.AE_SCALE_BCAST_DRAM, OUTPUT_DRAM_ADDR=self.AE_ADARMS_MUL_SCRATCH_DRAM)
+        eltwise_add_core_dram(self, size=M * H, A_DRAM_ADDR=self.AE_ADARMS_MUL_SCRATCH_DRAM,
                                B_DRAM_ADDR=self.AE_SHIFT_BCAST_DRAM, OUTPUT_DRAM_ADDR=norm_out_dram)
 
     def _ae_gated_mlp(self, M, x_dram, la, out_dram, gpr_M_reg=None):
@@ -1401,6 +1493,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                la["pre_attn_norm_dense_bias"], self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM,
                                gpr_M_reg=gpr_M_reg)
         self._debug_op(f"{_pfx}_preattn_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
+        self._debug_op(f"{_pfx}_attn_gate", self.AE_GATE_BCAST_DRAM, S * H, shape=(S, H))
 
         # 2. K/V projection for the suffix rows only -> combined buffer rows [P:P+S]
         self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["k_scale"], la["k_data"],
@@ -1509,6 +1602,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         self._debug_counter = 0
         self._debug_halt_info = None
+
+        # THE denoise-NaN fix. alloc_isa_reg/alloc_inst_ptr use per-PROCESS
+        # counters that start_capture() does NOT reset -- and any inner PBI op
+        # in vision (27 layers) or prefix (18 layers) that leaks an allocation
+        # drifts these counters upward. Without resetting them here, denoise's
+        # ae_S_reg / flash gpr_bucket / PBI inst-pointers get DIFFERENT physical
+        # indices in a full run (after vision+prefix) than in a --debug run
+        # (denoise first), landing on reserved/stale regs -> 100% NaN, not a
+        # crash. This is a PYTHON-allocator drift, which is why software_reset()
+        # (hardware-only) did NOT fix it. mobilesam resets these counters at the
+        # start of every stage for exactly this reason; pi05 never did.
+        self.reset_isa_reg_counter()
+        self.reset_inst_ptr_counter()
 
         ae_S_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(ae_S_reg, S)
@@ -1691,6 +1797,219 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             print(f"  [vision] slot {i} done")
         return torch.cat(outs, dim=0)  # (3*256, 2048)
 
+    def _vision_snr_check(self, images_hwc, hw_vision_tokens):
+        """CPU-vs-HW SNR check for the vision encoder output, using the SAME
+        IF4-quantized weights (pi05_torch_ref.py's Weights(quant='if4')) so
+        this isolates HW execution/precision drift, not a quantization-policy
+        mismatch. images_hwc: the same list of 3 (224,224,3) float32 arrays
+        [-1,1] passed to run_vision(). hw_vision_tokens: (768, 2048) bf16,
+        run_vision()'s return value. Prints per-slot and overall SNR in dB
+        (>=40dB is this codebase's usual correctness bar, see
+        feedback_mobilesam_snr_validation_contract)."""
+        import pi05_torch_ref as _ref
+        W = _ref.Weights(device="cpu", dtype=torch.bfloat16, quant="if4")
+        images_t = torch.stack([torch.from_numpy(im) for im in images_hwc], dim=0).to(torch.bfloat16)
+        cpu_tokens = _ref.vision_encode(images_t, W).reshape(-1, hw_vision_tokens.shape[-1])  # (768, 2048)
+
+        hw = hw_vision_tokens.float()
+        cpu = cpu_tokens.float()
+        print("=== vision encoder CPU-vs-HW SNR check ===")
+        S = self.VIS_S
+        for i, name in enumerate(("main", "wrist", "pad")):
+            h, c = hw[i * S:(i + 1) * S], cpu[i * S:(i + 1) * S]
+            noise = (h - c).pow(2).sum().sqrt()
+            signal = c.pow(2).sum().sqrt()
+            snr_db = 20 * torch.log10(signal / noise.clamp_min(1e-12))
+            print(f"  slot {i} ({name}): SNR={snr_db:.2f}dB  hw[min={h.min():.3f},max={h.max():.3f}] "
+                  f"cpu[min={c.min():.3f},max={c.max():.3f}]")
+        noise = (hw - cpu).pow(2).sum().sqrt()
+        signal = cpu.pow(2).sum().sqrt()
+        overall_snr_db = 20 * torch.log10(signal / noise.clamp_min(1e-12))
+        print(f"  overall: SNR={overall_snr_db:.2f}dB")
+
+    def _prefix_snr_check(self, prompt_tokens, vision_tokens, valid_len):
+        """CPU-vs-HW SNR check for the prefix's K/V cache (layer 0 and the
+        last layer), same IF4-quantized weights as _vision_snr_check. Runs
+        the CPU reference's prefix_forward on the UNPADDED (vision + real
+        text tokens only, valid_len rows) prefix -- our HW pads to seq_len
+        with epsilon-fill rows the CPU reference has no equivalent of, so
+        only the first valid_len rows of the HW K/V cache are comparable."""
+        import pi05_torch_ref as _ref
+        W = _ref.Weights(device="cpu", dtype=torch.bfloat16, quant="if4")
+
+        embed_table = W["PaliGemma.llm.embedder.input_embedding"]
+        tid = torch.tensor(prompt_tokens, dtype=torch.long)
+        text_tokens = embed_table[tid].to(torch.bfloat16)  # (n_text, 2048)
+        n_vis = vision_tokens.shape[0]
+        prefix_tokens = torch.cat([vision_tokens.to(torch.bfloat16), text_tokens], dim=0)[None]  # (1, valid_len, 2048)
+        assert prefix_tokens.shape[1] == valid_len
+
+        prefix_bias = _ref.build_prefix_attn_bias(valid_len, "cpu", torch.float32)
+        _, (k_cache, v_cache) = _ref.prefix_forward(prefix_tokens, prefix_bias, W)
+
+        P, D = self.PREFIX_SEQ_LEN, self.HEAD_DIM
+        print("=== prefix K/V CPU-vs-HW SNR check ===")
+        for layer in (0, self.NUM_LAYERS - 1):
+            for name, hw_addr, cpu_t in (
+                ("K", self.prefix_k_cache_addr[layer], k_cache[layer]),
+                ("V", self.prefix_v_cache_addr[layer], v_cache[layer]),
+            ):
+                buf = bytearray(P * D * 2)
+                self.dma_read(DMA_DEVICE_C2H, hw_addr, buf, len(buf))
+                hw = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(P, D).float()[:valid_len]
+                cpu = cpu_t.reshape(-1, D).float()[:valid_len]
+                noise = (hw - cpu).pow(2).sum().sqrt()
+                signal = cpu.pow(2).sum().sqrt()
+                snr_db = 20 * torch.log10(signal / noise.clamp_min(1e-12))
+                print(f"  layer{layer} {name}: SNR={snr_db:.2f}dB  hw[min={hw.min():.3f},max={hw.max():.3f}] "
+                      f"cpu[min={cpu.min():.3f},max={cpu.max():.3f}]")
+
+    def _prefix_layer_snr_report(self, prompt_tokens, vision_tokens, valid_len):
+        """Per-layer CPU-vs-HW SNR for the prefix's hidden-state output (post
+        residual2, every layer), using PREFIX_LAYER_SNAPSHOT_DRAM. Answers
+        'is the divergence already there in layer0, or does it accumulate?' --
+        reimplements pi05_torch_ref.prefix_forward's loop body layer-by-layer
+        (instead of calling it directly) so we can grab x after each layer,
+        not just the final K/V cache."""
+        import pi05_torch_ref as _ref
+        W = _ref.Weights(device="cpu", dtype=torch.bfloat16, quant="if4")
+
+        embed_table = W["PaliGemma.llm.embedder.input_embedding"]
+        tid = torch.tensor(prompt_tokens, dtype=torch.long)
+        text_tokens = embed_table[tid].to(torch.bfloat16)
+        prefix_tokens = torch.cat([vision_tokens.to(torch.bfloat16), text_tokens], dim=0)[None]
+        assert prefix_tokens.shape[1] == valid_len
+        prefix_bias = _ref.build_prefix_attn_bias(valid_len, "cpu", torch.float32)
+
+        x = prefix_tokens
+        print("=== prefix per-layer hidden-state CPU-vs-HW SNR report ===")
+        for layer in range(self.NUM_LAYERS):
+            norm_s = W["PaliGemma.llm.layers.pre_attention_norm.scale"][layer]
+            h = _ref.rms_norm(x, norm_s)
+            attn_out, _, _ = _ref.joint_attention(h, None, prefix_bias, layer, W)
+            x = x + attn_out
+
+            norm2_s = W["PaliGemma.llm.layers.pre_ffw_norm.scale"][layer]
+            h2 = _ref.rms_norm(x, norm2_s)
+            mlp_out = _ref.gated_mlp(h2, W["PaliGemma.llm.layers.mlp.gating_einsum"][layer],
+                                      W["PaliGemma.llm.layers.mlp.linear"][layer])
+            x = x + mlp_out
+            cpu_layer = x[0].float()  # (valid_len, H)
+
+            addr = self.PREFIX_LAYER_SNAPSHOT_DRAM[layer]
+            S, H = self.PREFIX_SEQ_LEN, self.HIDDEN_SIZE
+            buf = bytearray(S * H * 2)
+            self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+            hw_layer = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, H).float()[:valid_len]
+
+            noise = (hw_layer - cpu_layer).pow(2).sum().sqrt()
+            signal = cpu_layer.pow(2).sum().sqrt()
+            snr_db = 20 * torch.log10(signal / noise.clamp_min(1e-12))
+            print(f"  layer{layer}: SNR={snr_db:.2f}dB  hw[min={hw_layer.min():.3f},max={hw_layer.max():.3f}] "
+                  f"cpu[min={cpu_layer.min():.3f},max={cpu_layer.max():.3f}]")
+
+    def _prefix_layer0_op_snr_report(self, prompt_tokens, vision_tokens, valid_len):
+        """Op-by-op CPU-vs-HW SNR for layer0 ONLY, using PREFIX_L0_SNAPSHOT_DRAM
+        (layer0's scratch buffers snapshotted before layer1 overwrites them).
+        Reimplements joint_attention's internals manually (instead of calling
+        it as a black box) so every HW checkpoint (ln1, q/k/v proj, q_permute,
+        head0-7, attn_permute, o_proj_residual, ln2, mlp_lo/hi/down) has a
+        directly matching CPU intermediate to diff against -- pinpoints
+        exactly which op inside layer0 first diverges."""
+        import pi05_torch_ref as _ref
+        import torch.nn.functional as _F
+        W = _ref.Weights(device="cpu", dtype=torch.bfloat16, quant="if4")
+
+        embed_table = W["PaliGemma.llm.embedder.input_embedding"]
+        tid = torch.tensor(prompt_tokens, dtype=torch.long)
+        text_tokens = embed_table[tid].to(torch.bfloat16)
+        x_in = torch.cat([vision_tokens.to(torch.bfloat16), text_tokens], dim=0)[None]  # (1, valid_len, H)
+        assert x_in.shape[1] == valid_len
+
+        S, H, D = self.PREFIX_SEQ_LEN, self.HIDDEN_SIZE, self.HEAD_DIM
+        NH = self.NUM_HEADS
+        snap = self.PREFIX_L0_SNAPSHOT_DRAM
+
+        def _hw(name, numel, shape):
+            buf = bytearray(numel * 2)
+            self.dma_read(DMA_DEVICE_C2H, snap[name], buf, len(buf))
+            return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(shape).clone().float()
+
+        def _snr(hw_t, cpu_t):
+            hw_t, cpu_t = hw_t.float(), cpu_t.float()
+            noise = (hw_t - cpu_t).pow(2).sum().sqrt()
+            signal = cpu_t.pow(2).sum().sqrt()
+            return (20 * torch.log10(signal / noise.clamp_min(1e-12))).item(), hw_t, cpu_t
+
+        def _report(name, hw_t, cpu_t):
+            snr_db, hw_t, cpu_t = _snr(hw_t, cpu_t)
+            print(f"  {name}: SNR={snr_db:.2f}dB  hw[min={hw_t.min():.3f},max={hw_t.max():.3f}] "
+                  f"cpu[min={cpu_t.min():.3f},max={cpu_t.max():.3f}]")
+
+        print("=== prefix layer0 op-by-op CPU-vs-HW SNR report ===")
+
+        # 1. ln1
+        norm_s = W["PaliGemma.llm.layers.pre_attention_norm.scale"][0]
+        h = _ref.rms_norm(x_in, norm_s)
+        _report("ln1", _hw("ln1", S * H, (S, H))[:valid_len], h[0])
+
+        # 2. q/k/v proj
+        q_ein = W["PaliGemma.llm.layers.attn.q_einsum.w"][0]     # (8, 2048, 256)
+        kv_ein = W["PaliGemma.llm.layers.attn.kv_einsum.w"][0]   # (2, 1, 2048, 256)
+        q_pre = torch.einsum("btd,hdk->bthk", h, q_ein)          # (1, T, 8, 256)
+        k_pre = torch.einsum("btd,hdc->bthc", h, kv_ein[0])      # (1, T, 1, 256)
+        v_pre = torch.einsum("btd,hdc->bthc", h, kv_ein[1])
+        _report("q_proj", _hw("q_proj", S * H, (S, H))[:valid_len], q_pre[0].reshape(-1, NH * D))
+        _report("k_proj", _hw("k_proj", S * D, (S, D))[:valid_len], k_pre[0].reshape(-1, D))
+        _report("v_proj", _hw("v_proj", S * D, (S, D))[:valid_len], v_pre[0].reshape(-1, D))
+
+        # 3. q_permute: (seq,heads,D) -> (heads,seq,D); HW buffer's TRUE layout is
+        # (NH, S, D) flattened, NOT a plain (S,H) reshape despite the debug_op shape arg.
+        q_perm_cpu = q_pre[0].permute(1, 0, 2)  # (8, T, 256)
+        q_perm_hw = _hw("q_permute", S * H, (NH, S, D))[:, :valid_len, :]
+        _report("q_permute", q_perm_hw, q_perm_cpu)
+
+        # 4. per-head attention (bidirectional, no mask -- prefix_bias is all-zero)
+        qf = q_pre.permute(0, 2, 1, 3).float()                      # (1, 8, T, 256)
+        kf = k_pre.permute(0, 2, 1, 3).float().expand(-1, NH, -1, -1)
+        vf = v_pre.permute(0, 2, 1, 3).float().expand(-1, NH, -1, -1)
+        attn = _F.scaled_dot_product_attention(qf, kf, vf)         # (1, 8, T, 256)
+        for hd in range(NH):
+            hw_head = _hw(f"head{hd}", S * D, (S, D))[:valid_len]
+            _report(f"head{hd}", hw_head, attn[0, hd])
+
+        # 5. attn_permute: (heads,seq,D) -> (seq, heads*D), token-major again
+        attn_permuted_cpu = attn[0].permute(1, 0, 2).reshape(-1, NH * D)  # (T, 2048)
+        _report("attn_permute", _hw("attn_permute", S * H, (S, H))[:valid_len], attn_permuted_cpu)
+
+        # 6. o_proj + residual
+        o_ein = W["PaliGemma.llm.layers.attn.attn_vec_einsum.w"][0]  # (8, 256, 2048)
+        pre_attn_out = torch.einsum("thk,hkd->td", attn[0].permute(1, 0, 2).to(x_in.dtype), o_ein)
+        o_proj_residual_cpu = x_in[0] + pre_attn_out
+        _report("o_proj_residual", _hw("o_proj_residual", S * H, (S, H))[:valid_len], o_proj_residual_cpu)
+
+        # 7. ln2
+        norm2_s = W["PaliGemma.llm.layers.pre_ffw_norm.scale"][0]
+        h2 = _ref.rms_norm(o_proj_residual_cpu[None], norm2_s)
+        _report("ln2", _hw("ln2", S * H, (S, H))[:valid_len], h2[0])
+
+        # 8. gated-GELU MLP, FF_HALF split (matches HW's parakeet-style N-split)
+        gating = W["PaliGemma.llm.layers.mlp.gating_einsum"][0]  # (2, H, I)
+        linear = W["PaliGemma.llm.layers.mlp.linear"][0]         # (I, H)
+        I = gating.shape[-1]
+        FF_HALF = I // 2
+        gate_w, up_w = gating[0], gating[1]
+        mlp_halves = {}
+        for name, sl in (("mlp_lo", slice(0, FF_HALF)), ("mlp_hi", slice(FF_HALF, I))):
+            gate_act = _F.gelu(h2 @ gate_w[:, sl], approximate="none")
+            up = h2 @ up_w[:, sl]
+            mlp_half = (gate_act * up) @ linear[sl, :]
+            mlp_halves[name] = mlp_half
+            _report(name, _hw(name, S * H, (S, H))[:valid_len], mlp_half[0])
+
+        mlp_down_cpu = (mlp_halves["mlp_lo"] + mlp_halves["mlp_hi"])[0]
+        _report("mlp_down", _hw("mlp_down", S * H, (S, H))[:valid_len], mlp_down_cpu)
+
     def probe_nan_report(self):
         """Post-run bulk NaN/Inf scan of every vision layer + every denoise step,
         using the snapshot buffers compile_encoder/compile_denoise_loop copy
@@ -1728,36 +2047,199 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         print(f"first bad checkpoint: {first_bad or 'none -- all clean'}")
         return first_bad
 
-    def run_inference(self, images_hwc, prompt_tokens, noise32=None):
+    def dump_prefix_kv(self, path):
+        """Dump the persistent prefix K/V cache (LAYER0_K_DRAM/LAYER0_V_DRAM,
+        all NUM_LAYERS layers) + PREFIX_SEQ_LEN/prefix_valid_len to a single
+        .npz on disk, so a later --debug run can reload it and skip the ~185s
+        vision+prefix recompute entirely when only iterating on the denoise
+        loop. Call after compile_prefix has run (self.prefix_valid_len set)."""
+        kv_total = self.NUM_LAYERS * self.KV_LAYER_STRIDE
+        buf_k = bytearray(kv_total)
+        buf_v = bytearray(kv_total)
+        self.dma_read(DMA_DEVICE_C2H, self.LAYER0_K_DRAM, buf_k, kv_total)
+        self.dma_read(DMA_DEVICE_C2H, self.LAYER0_V_DRAM, buf_v, kv_total)
+        np.savez(path, k=np.frombuffer(bytes(buf_k), dtype=np.uint16),
+                  v=np.frombuffer(bytes(buf_v), dtype=np.uint16),
+                  prefix_seq_len=self.PREFIX_SEQ_LEN, prefix_valid_len=self.prefix_valid_len)
+        print(f"[dump_prefix_kv] wrote {path} ({kv_total*2/1024/1024:.1f} MB K + V, "
+              f"seq_len={self.PREFIX_SEQ_LEN}, valid_len={self.prefix_valid_len})")
+        # Keep an in-memory copy of exactly what was just read, so a later
+        # verify_prefix_kv() call in the SAME run/process can diff against it
+        # without a disk round-trip (rules out any save/load bug too).
+        self._prefix_kv_snapshot = (bytes(buf_k), bytes(buf_v))
+
+    def verify_prefix_kv(self, label=""):
+        """Re-read LAYER0_K_DRAM/LAYER0_V_DRAM right now and diff against the
+        snapshot dump_prefix_kv took earlier in this SAME run/process. Tests
+        whether anything between compile_prefix finishing and this call
+        clobbers the prefix K/V cache in place -- if this reports a mismatch,
+        the corruption happens between prefix and here (e.g. a DRAM-address
+        collision from a later allocation); if it reports clean, the K/V cache
+        itself is still intact at this point and the corruption (if any) must
+        happen later, inside compile_denoise_loop's own execution."""
+        assert hasattr(self, "_prefix_kv_snapshot"), \
+            "verify_prefix_kv() called with no prior dump_prefix_kv() snapshot in this run"
+        kv_total = self.NUM_LAYERS * self.KV_LAYER_STRIDE
+        buf_k = bytearray(kv_total)
+        buf_v = bytearray(kv_total)
+        self.dma_read(DMA_DEVICE_C2H, self.LAYER0_K_DRAM, buf_k, kv_total)
+        self.dma_read(DMA_DEVICE_C2H, self.LAYER0_V_DRAM, buf_v, kv_total)
+        snap_k, snap_v = self._prefix_kv_snapshot
+        now_k, now_v = bytes(buf_k), bytes(buf_v)
+        k_match = now_k == snap_k
+        v_match = now_v == snap_v
+        if k_match and v_match:
+            print(f"[verify_prefix_kv{f' {label}' if label else ''}] MATCH -- prefix K/V cache "
+                  f"is byte-identical to the post-compile_prefix snapshot")
+        else:
+            k_arr = torch.frombuffer(now_k, dtype=torch.bfloat16).float()
+            snap_k_arr = torch.frombuffer(snap_k, dtype=torch.bfloat16).float()
+            v_arr = torch.frombuffer(now_v, dtype=torch.bfloat16).float()
+            snap_v_arr = torch.frombuffer(snap_v, dtype=torch.bfloat16).float()
+            k_diff = (k_arr - snap_k_arr).abs()
+            v_diff = (v_arr - snap_v_arr).abs()
+            print(f"[verify_prefix_kv{f' {label}' if label else ''}] MISMATCH -- prefix K/V cache "
+                  f"changed since compile_prefix finished! "
+                  f"K: match={k_match} max_abs_diff={k_diff.max().item():.4f} "
+                  f"n_diff={int((k_diff > 0).sum().item())}/{k_diff.numel()} "
+                  f"V: match={v_match} max_abs_diff={v_diff.max().item():.4f} "
+                  f"n_diff={int((v_diff > 0).sum().item())}/{v_diff.numel()}")
+
+    def _run_sanity_matmul(self, M, K, N, use_pbi):
+        """Compile+run ONE plain bf16 A(M,K) @ B(K,N) matmul (A @ B^T) and
+        return (hw_out, cpu_out). If use_pbi, drive the M-loop through a
+        freshly-allocated gpr primed with ADD_SET(M) -- byte-for-byte the same
+        register-priming path compile_denoise_loop uses for ae_S_reg (which,
+        in a full run, reuses the exact physical GPR index prefix left dirty).
+        If not use_pbi, use the legacy static-M path (what the first passing
+        sanity check exercised)."""
+        torch.manual_seed(0)
+        A = torch.randn(M, K, dtype=torch.bfloat16)
+        B = torch.randn(N, K, dtype=torch.bfloat16)  # (N,K), matmat_mul_core computes A @ B^T
+        bpe = 2
+        a_addr = store_weight(self, A)
+        b_addr = store_weight(self, B)
+        out_addr = self.allocate_tensor_dram(M * N * bpe)
+
+        self.start_capture()
+        gpr_M_reg = None
+        if use_pbi:
+            gpr_M_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(gpr_M_reg, M)
+        self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=a_addr, B_DRAM_ADDR=b_addr,
+                              OUTPUT_DRAM_ADDR=out_addr, gpr_M_reg=gpr_M_reg)
+        self.generate_instruction_halt()
+        all_bytes = bytearray()
+        for inst in self.capture_buffer:
+            all_bytes.extend(inst.get_bytes())
+        prog_addr = self.get_program_dram_addr()
+        self._dma_write_retry(DMA_DEVICE_H2C, prog_addr, all_bytes, len(all_bytes))
+        self.allocate_program_dram(len(all_bytes))
+        self.clear_capture_buffer()
+        self.stop_capture()
+        if use_pbi:
+            self.release_isa_reg()
+
+        self.start_execute_from_dram(prog_addr)
+        self._wait_with_heartbeat(f"sanity_matmul_{'pbi' if use_pbi else 'legacy'}", timeout=30.0)
+
+        buf = bytearray(M * N * bpe)
+        self.dma_read(DMA_DEVICE_C2H, out_addr, buf, len(buf))
+        hw_out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(M, N).clone().float()
+        cpu_out = (A.float() @ B.float().T)
+        return hw_out, cpu_out
+
+    def sanity_matmul_check(self, M=64, K=64, N=64):
+        """Post-vision+prefix hardware-health check. Runs the SAME plain bf16
+        matmul twice: once via the legacy static-M path (which the first
+        passing sanity check used), once via the PBI runtime-M path (gpr_M_reg
+        primed with ADD_SET -- exactly what compile_denoise_loop's every op
+        uses, and which reuses the physical GPR index prefix left dirty). If
+        legacy PASSes but PBI FAILs, the bug is isolated to register/PBI state
+        carried over from prefix's execution, NOT the compute datapath and NOT
+        anything denoise-specific."""
+        results = {}
+        for use_pbi in (False, True):
+            hw_out, cpu_out = self._run_sanity_matmul(M, K, N, use_pbi)
+            n_nan = torch.isnan(hw_out).sum().item()
+            n_inf = torch.isinf(hw_out).sum().item()
+            snr_db = 20 * torch.log10(cpu_out.norm() / (hw_out - cpu_out).norm().clamp_min(1e-12)).item()
+            passed = n_nan == 0 and n_inf == 0 and snr_db >= 30.0
+            tag = "PBI (gpr_M_reg, like denoise)" if use_pbi else "legacy (static-M, like 1st sanity)"
+            print(f"[sanity_matmul_check] {tag} M={M} K={K} N={N}: nan={n_nan} inf={n_inf} "
+                  f"SNR={snr_db:.2f}dB hw[min={hw_out.min():.4f},max={hw_out.max():.4f}] "
+                  f"-- {'PASS' if passed else 'FAIL'}")
+            results[use_pbi] = passed
+        if results[False] and not results[True]:
+            print("[sanity_matmul_check] >>> LEGACY PASS + PBI FAIL: the NaN is a PBI/register "
+                  "state carryover from prefix, NOT the compute datapath. Prime/reset gpr_M_reg "
+                  "state before denoise. <<<")
+        return results
+
+    def load_prefix_kv(self, path):
+        """Inverse of dump_prefix_kv: DMA the saved K/V bytes back into
+        LAYER0_K_DRAM/LAYER0_V_DRAM (already allocated by tensor_init) and
+        restore PREFIX_SEQ_LEN/prefix_valid_len/prefix_k_cache_addr/
+        prefix_v_cache_addr -- the exact state compile_prefix normally leaves
+        behind -- so tensor_init_action_expert/compile_denoise_loop can run
+        with no vision/prefix stage at all."""
+        npz = np.load(path)
+        kv_total = self.NUM_LAYERS * self.KV_LAYER_STRIDE
+        assert npz["k"].nbytes == kv_total, \
+            f"dumped K size {npz['k'].nbytes} != current KV_LAYER_STRIDE*NUM_LAYERS {kv_total} (shape mismatch)"
+        self._dma_write_retry(DMA_DEVICE_H2C, self.LAYER0_K_DRAM, npz["k"].tobytes(), kv_total)
+        self._dma_write_retry(DMA_DEVICE_H2C, self.LAYER0_V_DRAM, npz["v"].tobytes(), kv_total)
+        self.PREFIX_SEQ_LEN = int(npz["prefix_seq_len"])
+        self.prefix_valid_len = int(npz["prefix_valid_len"])
+        self.prefix_k_cache_addr = [self.LAYER0_K_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
+        self.prefix_v_cache_addr = [self.LAYER0_V_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
+        print(f"[load_prefix_kv] loaded {path}: seq_len={self.PREFIX_SEQ_LEN}, valid_len={self.prefix_valid_len}")
+
+    def run_inference(self, images_hwc, prompt_tokens, noise32=None, skip_prefix=False, dump_prefix_path=None,
+                       verify_prefix_kv=False, sanity_check=False):
         """Full forward pass on real hardware. images_hwc: list of 3 (224,224,3)
         float32 arrays in [-1,1]. prompt_tokens: 1-D list/array of token ids.
-        Returns (10,32) numpy action array (caller slices [:, :7])."""
+        Returns (10,32) numpy action array (caller slices [:, :7]).
+
+        skip_prefix: if True, skip run_vision()/compile_prefix() entirely and
+        assume load_prefix_kv() was already called to populate LAYER0_K_DRAM/
+        LAYER0_V_DRAM/PREFIX_SEQ_LEN/prefix_valid_len -- for fast denoise-only
+        iteration (--debug flag in main()). images_hwc/prompt_tokens are
+        ignored in this mode.
+        dump_prefix_path: if set (and skip_prefix is False), dump the fresh
+        prefix K/V cache to this path right after compile_prefix, for a later
+        --debug run to reload.
+        sanity_check: (--sanity-check in main()) after vision+prefix run for
+        real, run sanity_matmul_check() instead of the action-expert/denoise
+        stage and return None -- tests raw hardware health with the simplest
+        possible op after vision+prefix's execution, independent of anything
+        denoise-loop-specific."""
         t0 = time.perf_counter()
-        vision_tokens = self.run_vision(images_hwc)
-        t_vision = time.perf_counter() - t0
+        if skip_prefix:
+            t_vision = 0.0
+            t1 = time.perf_counter()
+            t_prefix = time.perf_counter() - t1
+        else:
+            vision_tokens = self.run_vision(images_hwc)
+            t_vision = time.perf_counter() - t0
 
-        t1 = time.perf_counter()
-        seq_len = _CFG["model"]["prefill_max_seq_len"]
-        valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
-        prog_addr = self._compile_and_run(lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
-        t_prefix = time.perf_counter() - t1
+            t1 = time.perf_counter()
+            seq_len = _CFG["model"]["prefill_max_seq_len"]
+            valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
+            prog_addr = self._compile_and_run(lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
+            t_prefix = time.perf_counter() - t1
 
-        # K/V cache NaN check: denoise_step0 comes back 100% NaN with the real
-        # prefix K/V cache (the earlier standalone denoise test used a
-        # zero-filled placeholder and was clean) -- check whether the cache
-        # ITSELF already has NaN (real bug, corruption during prefix's own
-        # per-layer K/V write) vs is merely large-but-finite (would point at
-        # an attention-softmax overflow downstream instead). Layer 0 and the
-        # last layer (17), cheap: 2 small DMA reads, no recompiling anything.
-        P, D = self.PREFIX_SEQ_LEN, self.HEAD_DIM
-        for layer in (0, self.NUM_LAYERS - 1):
-            for name, addr in (("K", self.prefix_k_cache_addr[layer]), ("V", self.prefix_v_cache_addr[layer])):
-                buf = bytearray(P * D * 2)
-                self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
-                out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(P, D).float()
-                n_nan, n_inf = torch.isnan(out).sum().item(), torch.isinf(out).sum().item()
-                print(f"  [kv_check] layer{layer} {name}: nan={n_nan} inf={n_inf} "
-                      f"min={out.min():.4f} max={out.max():.4f}")
+            if getattr(self, "PREFIX_SNAPSHOTS", False):
+                self._prefix_layer0_op_snr_report(prompt_tokens, vision_tokens, valid_len)
+
+            if dump_prefix_path is not None:
+                self.dump_prefix_kv(dump_prefix_path)
+
+        if sanity_check:
+            print(f"timing: vision={t_vision:.2f}s prefix={t_prefix:.2f}s (sanity-check mode, "
+                  f"skipping action-expert/denoise)")
+            self.sanity_matmul_check()
+            return None
 
         t2 = time.perf_counter()
         self.tensor_init_action_expert()
@@ -1771,6 +2253,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             noise32[:10, :7] = np.random.RandomState(0).randn(10, 7)
         self.dma_write(DMA_DEVICE_H2C, self.AE_XT_DRAM,
                         torch.from_numpy(noise32).to(torch.bfloat16), S * AD * 2)
+        if verify_prefix_kv and not skip_prefix:
+            # Re-read LAYER0_K_DRAM/LAYER0_V_DRAM right here (after
+            # tensor_init_action_expert's own DRAM allocations, right before
+            # compile_denoise_loop's capture starts) and diff against the
+            # snapshot dump_prefix_kv took right after compile_prefix -- tests
+            # whether the prefix K/V cache is still intact at this exact point
+            # in the SAME run that reliably NaNs, vs. the --debug run which
+            # only ever re-loads a cache that was never live through this
+            # sequence of allocations/executions to begin with.
+            self.verify_prefix_kv("right before compile_denoise_loop")
         # compile_denoise_loop is statically unrolled (10 steps x 18 layers = 180
         # static layer bodies, 1440 flash-attention jump sites) -- same proven
         # pattern as compile_prefix/compile_encoder. A loop_start/loop_end runtime
@@ -1783,6 +2275,41 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # the ~120-150s predicted from a standalone single-step measurement).
         self._compile_and_run(self.compile_denoise_loop, label="denoise_loop", timeout=300.0)
         t_denoise = time.perf_counter() - t2
+
+        # DRAM-overlap check: adding PREFIX_LAYER_SNAPSHOT_DRAM/PREFIX_L0_SNAPSHOT_DRAM
+        # shifted the tensor-DRAM allocator base by ~96MB (0xEE398AC0 -> 0xF3F68AC0)
+        # vs the last known-clean run -- this codebase has hit exactly this bug class
+        # before (see LocateAnything's decode-NaN/DRAM-overlap postmortem), so check
+        # ae_k_combined (seeded by compile_denoise_loop's own captured copy) directly
+        # before trusting the final action output.
+        P_chk, D_chk = self.AE_PREFIX_SEQ_LEN, self.HEAD_DIM
+        Tkv = self.AE_TKV
+        for layer in (0, self.AE_LAYERS - 1):
+            # Check ae_k_combined (full buffer: prefix + suffix regions)
+            buf_k = bytearray(Tkv * D_chk * 2)
+            self.dma_read(DMA_DEVICE_C2H, self.ae_k_combined[layer], buf_k, len(buf_k))
+            k_full = torch.frombuffer(bytes(buf_k), dtype=torch.bfloat16).reshape(Tkv, D_chk).float()
+            k_prefix = k_full[:P_chk]
+            k_suffix = k_full[P_chk:]
+            print(f"  [ae_kv_check] layer{layer} ae_k_combined prefix[0:{P_chk}]: "
+                  f"nan={torch.isnan(k_prefix).sum().item()} inf={torch.isinf(k_prefix).sum().item()} "
+                  f"min={k_prefix.min():.4f} max={k_prefix.max():.4f}")
+            print(f"  [ae_kv_check] layer{layer} ae_k_combined suffix[{P_chk}:{Tkv}]: "
+                  f"nan={torch.isnan(k_suffix).sum().item()} inf={torch.isinf(k_suffix).sum().item()} "
+                  f"min={k_suffix.min():.4f} max={k_suffix.max():.4f}")
+
+            # Check ae_v_combined (full buffer: prefix + suffix regions)
+            buf_v = bytearray(Tkv * D_chk * 2)
+            self.dma_read(DMA_DEVICE_C2H, self.ae_v_combined[layer], buf_v, len(buf_v))
+            v_full = torch.frombuffer(bytes(buf_v), dtype=torch.bfloat16).reshape(Tkv, D_chk).float()
+            v_prefix = v_full[:P_chk]
+            v_suffix = v_full[P_chk:]
+            print(f"  [ae_kv_check] layer{layer} ae_v_combined prefix[0:{P_chk}]: "
+                  f"nan={torch.isnan(v_prefix).sum().item()} inf={torch.isinf(v_prefix).sum().item()} "
+                  f"min={v_prefix.min():.4f} max={v_prefix.max():.4f}")
+            print(f"  [ae_kv_check] layer{layer} ae_v_combined suffix[{P_chk}:{Tkv}]: "
+                  f"nan={torch.isnan(v_suffix).sum().item()} inf={torch.isinf(v_suffix).sum().item()} "
+                  f"min={v_suffix.min():.4f} max={v_suffix.max():.4f}")
 
         buf = bytearray(S * AD * 2)
         self.dma_read(DMA_DEVICE_C2H, self.AE_XT_DRAM, buf, len(buf))
@@ -1874,6 +2401,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         _original_print(f"  [{label}] compiling...", end="\r", flush=True)
         t_compile0 = time.perf_counter()
         _SILENT_MODE = True
+        prog_len = 0
         try:
             self.start_capture()
             prog_addr = compile_fn()
@@ -1885,12 +2413,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 for inst in self.capture_buffer:
                     all_bytes.extend(inst.get_bytes())
                 prog_addr = self.get_program_dram_addr()
-                self._dma_write_retry(DMA_DEVICE_H2C, prog_addr, all_bytes, len(all_bytes))
-                self.allocate_program_dram(len(all_bytes))
+                prog_len = len(all_bytes)
+                self._dma_write_retry(DMA_DEVICE_H2C, prog_addr, all_bytes, prog_len)
+                self.allocate_program_dram(prog_len)
                 self.clear_capture_buffer()
             self.stop_capture()
         finally:
             _SILENT_MODE = False
+        prog_end = prog_addr + prog_len
+        tensor_end = self.get_tensor_dram_addr()
+        FOURGB = 0x100000000
+        prog_base = getattr(self, "_program_dram_base", 0xF8000000)
+        _original_print(
+            f"  [{label}] ADDR: prog=[0x{prog_addr:X}..0x{prog_end:X}] len={prog_end-prog_addr}B "
+            f"tensor_end=0x{tensor_end:X} prog_base=0x{prog_base:X} 4GB=0x{FOURGB:X} | "
+            f"prog_crosses_4GB={prog_end > FOURGB} tensor_hits_prog={tensor_end > prog_base}")
         _original_print(f"  [{label}] compiled in {time.perf_counter()-t_compile0:.1f}s" + " " * 20)
         self.start_execute_from_dram(prog_addr)
         self._wait_with_heartbeat(label, timeout=timeout)
@@ -1898,6 +2435,36 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--debug", action="store_true",
+                     help="skip vision+prefix (~185s) and reload the last-dumped prefix K/V "
+                          "cache from PREFIX_KV_DUMP_PATH instead -- for fast denoise-loop-only "
+                          "iteration. Requires a prior non-debug run (which auto-dumps).")
+    ap.add_argument("--steps", type=int, default=None,
+                     help="override AE_NUM_DENOISE_STEPS (e.g. --steps 1 to stop after the first "
+                          "Euler step, since step0 already NaNs -- no point paying for all 10).")
+    ap.add_argument("--verify-prefix-tensor", action="store_true",
+                     help="in a full (non-debug) run, re-read the prefix K/V cache right before "
+                          "compile_denoise_loop starts and diff it byte-for-byte against the "
+                          "snapshot taken right after compile_prefix finished -- proves whether "
+                          "the SAME K/V tensor that fed a clean --debug denoise run is still "
+                          "intact at the point the full run's denoise starts, or gets clobbered "
+                          "somewhere in between.")
+    ap.add_argument("--sanity-check", action="store_true",
+                     help="isolation test: run vision + prefix for real, then instead of the full "
+                          "denoise loop, run a small basic bf16 matmul (no IF4 quant, no PBI, no "
+                          "special registers) and diff it against a CPU reference. Tests raw "
+                          "post-vision+prefix hardware health with the simplest possible op, "
+                          "independent of anything denoise-loop-specific.")
+    args, _ = ap.parse_known_args()
+
+    PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
+
+    if args.steps is not None:
+        Pi05Libero_UnifiedEngine.AE_NUM_DENOISE_STEPS = args.steps
+        print(f"[main] AE_NUM_DENOISE_STEPS overridden to {args.steps}")
+
     ue = Pi05Libero_UnifiedEngine()
     init_hang_prevention(ue)
     ue.weight_init()
@@ -1915,25 +2482,73 @@ def main():
     # the first time all three stages run back-to-back together with the REAL
     # prefix K/V cache feeding the action-expert -- genuinely uncharted, so
     # treat any failure here as new territory, not a regression.
-    sample_dir = Path.home() / "apex-compute-ML" / "simple-llm" / "src" / "models" / "pi0_5" / "sample_data"
-    img = np.load(sample_dir / "sample_0_image.npy").astype(np.float32) / 127.5 - 1.0
-    wrist = np.load(sample_dir / "sample_0_wrist_image.npy").astype(np.float32) / 127.5 - 1.0
-    pad = np.zeros_like(img)
-    import torch.nn.functional as _F
-    def _resize(a):
-        t = torch.from_numpy(a).permute(2, 0, 1).unsqueeze(0).float()
-        t = _F.interpolate(t, size=(224, 224), mode="bilinear", align_corners=False)
-        return t.squeeze(0).permute(1, 2, 0).numpy()
-    images = [_resize(img), _resize(wrist), _resize(pad)]
+    if args.debug:
+        # Fast path: skip vision+prefix (~185s), reload the prefix K/V cache
+        # dumped by a prior non-debug run. images/prompt_tokens are unused.
+        assert os.path.exists(PREFIX_KV_DUMP_PATH), (
+            f"--debug requires a prior non-debug run to have dumped {PREFIX_KV_DUMP_PATH} first "
+            f"(run without --debug once, then rerun with --debug for fast iteration).")
+        ue.load_prefix_kv(PREFIX_KV_DUMP_PATH)
+        actions = ue.run_inference(None, None, skip_prefix=True)
+    else:
+        sample_dir = Path.home() / "apex-compute-ML" / "simple-llm" / "src" / "models" / "pi0_5" / "sample_data"
+        img = np.load(sample_dir / "sample_0_image.npy").astype(np.float32) / 127.5 - 1.0
+        wrist = np.load(sample_dir / "sample_0_wrist_image.npy").astype(np.float32) / 127.5 - 1.0
+        pad = np.zeros_like(img)
+        import torch.nn.functional as _F
+        def _resize(a):
+            t = torch.from_numpy(a).permute(2, 0, 1).unsqueeze(0).float()
+            t = _F.interpolate(t, size=(224, 224), mode="bilinear", align_corners=False)
+            return t.squeeze(0).permute(1, 2, 0).numpy()
+        images = [_resize(img), _resize(wrist), _resize(pad)]
 
-    prompt_tokens = np.random.RandomState(1).randint(0, 257152, size=(16,))
+        # Real tokenization (matches openpi's PaligemmaTokenizer.tokenize, Pi05
+        # format -- state discretized into the language prompt text, NOT fed as a
+        # separate continuous input): "Task: {prompt}, State: {digitized state};\nAction: "
+        # tokenized with sentencepiece + BOS. Was a random-token placeholder before,
+        # which produced garbage language conditioning and a wildly out-of-range
+        # (+-2.4) output vs the real policy's near-[-1,1] result.
+        import sentencepiece
+        norm_stats = json.loads(
+            (Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"
+             / "assets" / "physical-intelligence" / "libero" / "norm_stats.json").read_text()
+        )["norm_stats"]
+        meta = json.loads((sample_dir / "meta.json").read_text())
+        state = np.array(meta["state_example"], dtype=np.float32)
+        state_q01 = np.array(norm_stats["state"]["q01"], dtype=np.float32)
+        state_q99 = np.array(norm_stats["state"]["q99"], dtype=np.float32)
+        state_norm = np.clip((state - state_q01) / (state_q99 - state_q01 + 1e-6) * 2.0 - 1.0, -1.0, 1.0)
+        digitized_state = np.digitize(state_norm, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+        state_str = " ".join(map(str, digitized_state))
+        full_prompt = f"Task: {_CFG['defaults'].get('prompt', 'pick up the object')}, State: {state_str};\nAction: "
 
-    actions = ue.run_inference(images, prompt_tokens)
+        sp = sentencepiece.SentencePieceProcessor(
+            model_file=str(Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model"))
+        prompt_tokens = np.array(sp.encode(full_prompt, add_bos=True), dtype=np.int64)
+
+        actions = ue.run_inference(
+            images, prompt_tokens, dump_prefix_path=PREFIX_KV_DUMP_PATH,
+            verify_prefix_kv=args.verify_prefix_tensor, sanity_check=args.sanity_check)
+
+        if args.sanity_check:
+            return
+
     np.set_printoptions(precision=4, suppress=True)
-    print("action_chunk shape:", actions.shape)
+    print("action_chunk shape (raw model output):", actions.shape)
     print(actions)
     print(f"nan={np.isnan(actions).any()} inf={np.isinf(actions).any()} "
           f"min={actions.min():.4f} max={actions.max():.4f}")
+
+    if not args.debug:
+        # Unnormalize to real action space (matches openpi's Unnormalize transform:
+        # (x+1)/2*(q99-q01)+q01) using the same actions norm_stats, so this is
+        # directly comparable to run_pi05.py's printed action_chunk. Skipped in
+        # --debug mode since norm_stats/tokenization aren't loaded there.
+        act_q01 = np.array(norm_stats["actions"]["q01"], dtype=np.float32)
+        act_q99 = np.array(norm_stats["actions"]["q99"], dtype=np.float32)
+        actions_unnorm = (actions + 1.0) / 2.0 * (act_q99 - act_q01 + 1e-6) + act_q01
+        print("action_chunk (unnormalized, comparable to run_pi05.py):")
+        print(actions_unnorm)
 
     ue.probe_nan_report()
 
