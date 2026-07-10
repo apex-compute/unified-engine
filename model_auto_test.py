@@ -514,12 +514,22 @@ def run_test(test: dict, verbose: bool = False,
         proc.wait()
         stdout, returncode = "".join(captured), proc.returncode
     else:
-        # concise: capture but do not echo the model's run log.
-        proc = subprocess.run(
+        # concise: capture but do not echo the model's run log. Still print a
+        # heartbeat so a long compile / prefill / decode does not look hung.
+        proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, cwd=SCRIPT_DIR,
         )
-        stdout, returncode = proc.stdout, proc.returncode
+        heartbeat_s = 10.0
+        while True:
+            try:
+                stdout, _ = proc.communicate(timeout=heartbeat_s)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed_now = time.perf_counter() - t_start
+                print(f"[running] {test['name']} still running ... {elapsed_now:.0f}s",
+                      flush=True)
+        returncode = proc.returncode
     elapsed = time.perf_counter() - t_start
 
     return _parse_output(test, stdout, returncode, elapsed)
