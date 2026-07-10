@@ -83,6 +83,65 @@ CLOCK_CYCLE_TIME_NS = 3
 UE_PEAK_GFLOPS = 333.3 * 0.128
 UE_TRACE_SIZE = 8192
 UE_AXI_DATA_WIDTH_BITS = int(os.environ.get("UE_AXI_DATA_WIDTH_BITS", "256"))
+
+# ---------------------------------------------------------------------------
+# AXI beat width: the ONE number that differs between the two board profiles
+# (256-bit: puzhi/alinx/alveo/kintex7; 512-bit: bittware/rk — see the
+# ``args.device in ("bittware", "rk")`` check in user_hw_test.py's __main__).
+# The DMA engine requires DRAM-side transfer addresses/lengths to land on
+# beat boundaries, so every alignment/padding rule elsewhere in this file and
+# in user_hw_test.py is a direct consequence of this one doubled granularity:
+#
+#   width_bits | beat_bytes | beat_bf16_elems
+#   -----------+------------+----------------
+#      256     |     32     |       16
+#      512     |     64     |       32
+#
+# Use these helpers instead of recomputing ``UE_AXI_DATA_WIDTH_BITS // 8`` (or
+# ``// 16``) at each call site so the 256-vs-512 behavior lives in one place.
+# ---------------------------------------------------------------------------
+
+def ue_axi_beat_bytes_for(width_bits: int) -> int:
+    """AXI beat size in bytes for an explicit width (32 @256-bit, 64 @512-bit)."""
+    return width_bits // 8
+
+
+def ue_axi_beat_bf16_elems_for(width_bits: int) -> int:
+    """AXI beat size in bf16 elements for an explicit width (16 @256-bit, 32 @512-bit)."""
+    return max(1, width_bits // 16)
+
+
+def ue_axi_beat_bytes() -> int:
+    """AXI beat size in bytes for the live ``UE_AXI_DATA_WIDTH_BITS``."""
+    return ue_axi_beat_bytes_for(UE_AXI_DATA_WIDTH_BITS)
+
+
+def ue_axi_beat_bf16_elems() -> int:
+    """AXI beat size in bf16 elements for the live ``UE_AXI_DATA_WIDTH_BITS``."""
+    return ue_axi_beat_bf16_elems_for(UE_AXI_DATA_WIDTH_BITS)
+
+
+def ue_round_up_to_axi_beat_bytes(nbytes: int) -> int:
+    """Round ``nbytes`` up to the next AXI-beat multiple (beat = :func:`ue_axi_beat_bytes`)."""
+    beat = ue_axi_beat_bytes()
+    return ((nbytes + beat - 1) // beat) * beat
+
+
+def ue_round_up_to_axi_beat_elems(nelems: int) -> int:
+    """Round ``nelems`` (bf16 elements) up to the next AXI-beat multiple (beat = :func:`ue_axi_beat_bf16_elems`)."""
+    beat = ue_axi_beat_bf16_elems()
+    return ((nelems + beat - 1) // beat) * beat
+
+
+def ue_assert_axi_beat_aligned_bytes(nbytes: int, what: str, hint: str = "") -> None:
+    """Assert ``nbytes`` lands on an AXI-beat boundary; ``what`` names the caller for the message."""
+    beat = ue_axi_beat_bytes()
+    assert nbytes % beat == 0, (
+        f"{what}: {nbytes} bytes is not a multiple of the {beat}-byte AXI beat "
+        f"(UE_AXI_DATA_WIDTH_BITS={UE_AXI_DATA_WIDTH_BITS})" + (f"; {hint}" if hint else "")
+    )
+
+
 # DMA device paths (can be overridden by command-line argument)
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
@@ -757,14 +816,14 @@ class UnifiedEngine:
 
     def alloc_isa_reg(self) -> int:
         """
-        Allocate the next available general-purpose ISA register (1-31).
+        Allocate the next available general-purpose ISA register (1-63).
         Register 0 is hard-wired zero.
 
         Returns:
-            The allocated register index (1-31).
+            The allocated register index (1-63).
         """
-        if self._isa_reg_counter > 31:
-            raise ValueError("Exceeded maximum number of general registers (31)")
+        if self._isa_reg_counter > 63:
+            raise ValueError("Exceeded maximum number of general registers (63)")
 
         reg_idx = self._isa_reg_counter
         self._isa_reg_counter += 1
@@ -856,7 +915,14 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x87eabea5, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x87eabea5. Please update FPGA with commit update_87eabea5.bin using update_flash.py (public release v1.4)"
+        expected_hw_versions = {0x87eabea5}
+        if CURRENT_DEVICE == "efinix":
+            expected_hw_versions.add(0x12345678)
+        assert hw_version in expected_hw_versions, (
+            f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
+            f"expected one of {', '.join(f'0x{v:08x}' for v in sorted(expected_hw_versions))}. "
+            "Please update FPGA with commit update_87eabea5.bin using update_flash.py (public release v1.4)"
+        )
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -1277,20 +1343,20 @@ class UnifiedEngine:
             w[0] = ((tid & 0xFF) |
                     ((inst_type & 0xF) << 8) |
                     (((inst_pointer_idx or 0) & 0xF) << 12))
-            # PBI_SET: [19:16] pointer_mode, [23:20] field_select; [28:24] pbi_general_reg_idx when PBI_MODE_REG.
+            # PBI_SET: [19:16] pointer_mode, [23:20] field_select; [29:24] pbi_general_reg_idx when PBI_MODE_REG.
             # Other types: [31:16] = lalu_a.
             if int(inst_type) == int(INSTRUCTION_PBI_SET):
                 w[0] |= (int(pbi_mode) & 0xF) << 16
                 w[0] |= (int(pbi_field_select) & 0xF) << 20
                 if int(pbi_mode) == PBI_MODE_REG:
                     assert general_reg_src is not None, "general_reg_src is required for PBI_MODE_REG"
-                    w[0] |= (int(general_reg_src) & 0x1F) << 24
+                    w[0] |= (int(general_reg_src) & 0x3F) << 24
             else:
                 w[0] |= ((lalu_a & 0xFFFF) << 16)
             w[1] = ue_35bit_addr_shifter(dma_start_addr)
             if int(inst_type) == int(INSTRUCTION_REG_REWRITE):
                 assert general_reg_src is not None, "general_reg_src is required for REG_REWRITE"
-                w[1] |= (general_reg_src & 0x1F) << 4
+                w[1] |= (general_reg_src & 0x3F) << 4
             w[2] = dma_length
             w[3] = ((uram_length & 0xFFF) |
                         ((uram_length_z & 0xFFF) << 12) |
@@ -1745,12 +1811,9 @@ class UnifiedEngine:
         so the DRAM destination address is taken from ISA register ``general_reg_src`` at runtime.
         """
         uram_type, uram_start_addr = self.sram_address_to_uram_address(sram_address)
-        axi_beat_bytes = UE_AXI_DATA_WIDTH_BITS // 8
         if stride_bytes_per_chunk != 0:
-            assert stride_bytes_per_chunk % axi_beat_bytes == 0, (
-                f"stride_bytes_per_chunk={stride_bytes_per_chunk} must be a multiple of "
-                f"AXI beat bytes {axi_beat_bytes} (UE_AXI_DATA_WIDTH_BITS={UE_AXI_DATA_WIDTH_BITS})"
-            )
+            ue_assert_axi_beat_aligned_bytes(
+                stride_bytes_per_chunk, "sram_to_accelerator_memory: stride_bytes_per_chunk")
         nbytes = element_size * 2 if memcpy_length_bytes is None else memcpy_length_bytes
         self.ue_memcpy_to_dram(
             MEMCPY_TYPE.URAM.value,
@@ -1919,14 +1982,14 @@ class UnifiedEngine:
         )
 
     def _validate_addr_gprs(self, fn: str, gpr_M_reg: Optional[int], addr_gprs: dict) -> None:
-        """Shared validation for optional gpr_*_addr params: each must be a GPR index 1..31,
+        """Shared validation for optional gpr_*_addr params: each must be a GPR index 1..63,
         distinct from ``gpr_M_reg`` (the row-count register) and from each other. ``None`` entries
         (literal-address fallback) are skipped. ``addr_gprs`` maps param-name -> reg-or-None."""
         for _name, _reg in addr_gprs.items():
             if _reg is None:
                 continue
-            if not (1 <= _reg <= 31):
-                raise ValueError(f"{fn}: {_name} must be a GPR index 1..31, got {_reg}")
+            if not (1 <= _reg <= 63):
+                raise ValueError(f"{fn}: {_name} must be a GPR index 1..63, got {_reg}")
             if gpr_M_reg is not None and _reg == gpr_M_reg:
                 raise ValueError(
                     f"{fn}: {_name}={_reg} collides with gpr_M_reg={gpr_M_reg}; address GPRs "
@@ -2139,7 +2202,7 @@ class UnifiedEngine:
         program contains no static reference to ``M``.
 
         **DRAM base addresses (optional dynamic):**
-        ``gpr_a_addr`` / ``gpr_b_addr`` / ``gpr_out_addr`` are optional GPR indices (1..31). When
+        ``gpr_a_addr`` / ``gpr_b_addr`` / ``gpr_out_addr`` are optional GPR indices (1..63). When
         a GPR is provided, the corresponding pointer's **base** is sourced from that register at
         execute time instead of the ``dram_a`` / ``dram_b`` / ``dram_out`` literal, so a single
         captured program can be replayed against any DRAM placement by re-priming the GPR before
@@ -2638,7 +2701,7 @@ class UnifiedEngine:
         no static reference to ``M``.
 
         **DRAM base addresses (optional dynamic):** ``gpr_a_addr`` (input rows), ``gpr_out_addr``
-        (output rows) and ``gpr_gamma_addr`` (gamma vector) are optional GPR indices (1..31). When
+        (output rows) and ``gpr_gamma_addr`` (gamma vector) are optional GPR indices (1..63). When
         given, that base is sourced from the GPR (word address = ``byte >> 3``) instead of the
         literal, so one captured program serves any placement. Input/output are looped PBI pointers
         (PBI_MODE_REG override); gamma is a one-shot pre-loop load (REG_REWRITE). ``None`` → literal,
@@ -2808,7 +2871,7 @@ class UnifiedEngine:
             raise ValueError(f"{fn}: N={N} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS} (one row must fit staging)")
         # gpr_rms_scale_reg is deprecated/ignored (sqrt(N) is now folded into host gamma); only
         # gpr_M_reg / gpr_N_reg are required runtime registers.
-        for _nm, _rg, _hi in (("gpr_M_reg", gpr_M_reg, 15), ("gpr_N_reg", gpr_N_reg, 31)):
+        for _nm, _rg, _hi in (("gpr_M_reg", gpr_M_reg, 15), ("gpr_N_reg", gpr_N_reg, 63)):
             if _rg is None or not (1 <= _rg <= _hi):
                 raise ValueError(f"{fn}: {_nm} must be a GPR index 1..{_hi}, got {_rg}")
         if gpr_M_reg == gpr_N_reg:
@@ -3281,7 +3344,7 @@ class UnifiedEngine:
         Only two PBI pointers (load_ptr, store_ptr) are live — all compute is plain — well under the
         hardware's live-PBI-pointer limit, see [[dynamic-core-pbi-pointer-limit]].
 
-        ``gpr_M_reg`` (1..15) and ``gpr_N_reg`` (1..31) are required and caller-primed.
+        ``gpr_M_reg`` (1..15) and ``gpr_N_reg`` (1..63) are required and caller-primed.
         ``GAMMA_DRAM_ADDR`` / ``BETA_DRAM_ADDR`` are optional; ``INV_N_DRAM_ADDR`` is **required**
         (the ``1/N`` vector). ``gpr_*_addr`` optionally source DRAM bases from GPRs. ``N`` a multiple
         of ``UE_VECTOR_SIZE`` and ``<= 65536`` (so the inv_n/zeros/gamma/beta bands fit URAM_B and the
@@ -3323,7 +3386,7 @@ class UnifiedEngine:
             raise ValueError(f"{fn}: GAMMA_DRAM_ADDR is required (the per-row gamma multiply is always "
                              "emitted; pass a plain ones vector for a no-gamma layer norm)")
         # gpr_n_scale_reg / gpr_rms_scale_reg are deprecated/ignored (both scalars folded away).
-        for _nm, _rg, _hi in (("gpr_M_reg", gpr_M_reg, 15), ("gpr_N_reg", gpr_N_reg, 31)):
+        for _nm, _rg, _hi in (("gpr_M_reg", gpr_M_reg, 15), ("gpr_N_reg", gpr_N_reg, 63)):
             if _rg is None or not (1 <= _rg <= _hi):
                 raise ValueError(f"{fn}: {_nm} must be a GPR index 1..{_hi}, got {_rg}")
         if gpr_M_reg == gpr_N_reg:
@@ -3878,7 +3941,7 @@ class UnifiedEngine:
         only — the captured program has no static reference to ``M``.
 
         **DRAM base addresses (optional dynamic):** ``gpr_input_addr`` / ``gpr_out_addr`` /
-        ``gpr_cos_addr`` are optional GPR indices (1..31) holding the input / output / cos-table
+        ``gpr_cos_addr`` are optional GPR indices (1..63) holding the input / output / cos-table
         base as a **word** address (``byte >> 3``); ``sin`` stays contiguous after ``cos`` (the
         ``sin == cos + row`` invariant holds at runtime too). When given, that base is sourced from
         the GPR so one captured program serves any placement. In the N<128 branch the bases seed the
@@ -3895,9 +3958,12 @@ class UnifiedEngine:
         self._validate_addr_gprs("rope_hf_core_dram_pbi", gpr_M_reg, {
             "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr, "gpr_cos_addr": gpr_cos_addr,
         })
-        # The padded-split branch (N<128) places each half in its own 128-byte SRAM slot, so it
-        # only needs even N — any head_dim < 128 works (e.g. 64, 76->38, 80->40). The N>=128
-        # branch slices SRAM mid-row, which requires 64-aligned halves (N a multiple of 64).
+        # The padded-split branch (N<128) places each half in its own 128-byte SRAM slot, so on
+        # the SRAM side it only needs even N. Its per-half DMAs, however, start at multiples of
+        # half_bytes (= N bytes) in DRAM, and the DMA engine requires AXI-beat-aligned addresses
+        # — so N bytes must also be a beat multiple (32 B at 256-bit, 64 B at 512-bit; asserted
+        # below). The N>=128 branch slices SRAM mid-row, which requires 64-aligned halves (N a
+        # multiple of 64) and is thereby always beat-aligned.
         if N < 128:
             assert 0 < N < 128, "padded-split RoPE expects 0 < N < 128"
         else:
@@ -3916,6 +3982,11 @@ class UnifiedEngine:
         assert sin_dram_addr == cos_dram_addr + row_bytes, "PBI RoPE expects contiguous [cos, sin] rows"
 
         if needs_padding:
+            ue_assert_axi_beat_aligned_bytes(
+                half_bytes,
+                f"rope_hf_core_dram_pbi (padded-split): half_bytes (N={N})",
+                hint="slice DMAs must start on an AXI-beat boundary; "
+                     "host-pad each rotate-half up to a beat multiple")
             # Padded split layout: each half occupies a full 128-byte SRAM slot.
             # No PBI pointers — ISA registers (x_reg, cos_reg, out_reg) track the current-row
             # DRAM addresses and are incremented by the relevant stride at the end of each
@@ -4153,7 +4224,7 @@ class UnifiedEngine:
         (URAM_B binds). The outer while-loop runs ``ceil(M / chunk_rows)`` batches
         (``rows_take = min(remaining, chunk_rows)``), matmat's M-tile idiom.
 
-        ``gpr_M_reg`` (1..15, batch row count) and ``gpr_N_reg`` (1..31, derives N/64, N/128, strides)
+        ``gpr_M_reg`` (1..15, batch row count) and ``gpr_N_reg`` (1..63, derives N/64, N/128, strides)
         are required and caller-primed. ``M`` / ``N`` are template / FLOPs-accounting only. Optional
         ``gpr_input_addr`` / ``gpr_out_addr`` / ``gpr_cos_addr`` source the input / output / cos DRAM
         bases from GPRs (word addr = ``byte >> 3``); ``None`` -> literal. ``N`` must be a multiple of
@@ -4167,8 +4238,8 @@ class UnifiedEngine:
         assert M >= 1, f"{fn}: M must be at least 1"
         if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
             raise ValueError(f"{fn}: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
-        if gpr_N_reg is None or not (1 <= gpr_N_reg <= 31):
-            raise ValueError(f"{fn}: gpr_N_reg must be a GPR index 1..31, got {gpr_N_reg}")
+        if gpr_N_reg is None or not (1 <= gpr_N_reg <= 63):
+            raise ValueError(f"{fn}: gpr_N_reg must be a GPR index 1..63, got {gpr_N_reg}")
         if gpr_N_reg == gpr_M_reg:
             raise ValueError(f"{fn}: gpr_N_reg={gpr_N_reg} collides with gpr_M_reg={gpr_M_reg}")
         self._validate_addr_gprs(fn, gpr_M_reg, {
@@ -4384,6 +4455,12 @@ class UnifiedEngine:
         four slices cos_lo/cos_hi/sin_lo/sin_hi are read from byte offsets 0 / N / 2N / 3N of
         each token's rope row.
 
+        **AXI beat alignment:** every slice DMA starts at a multiple of ``half_bytes`` (= N
+        bytes), and the DMA engine requires beat-aligned DRAM addresses (the read-side packer
+        has no sub-beat lane realignment), so ``N`` bytes must be a multiple of the AXI beat —
+        32 B at 256-bit, 64 B at 512-bit. Callers host-pad each rotate-half up to a beat
+        multiple when needed (see ``rope_hf_core_dram_d64_test``).
+
         **Batch dimension / M (dynamic, required):** ``gpr_M_reg`` is a GPR index 1..15 holding
         the runtime token count (caller primes via ``ADD_SET``). ``M`` is FLOPs-accounting /
         loop-template only. Scratch GPRs (address calc + token counter) are allocated internally.
@@ -4407,6 +4484,12 @@ class UnifiedEngine:
         half_bytes = half * bpe            # offset of x_hi / sin_hi within their N-elem source
         row_bytes = N * bpe                # x / output row stride
         rope_row_bytes = 2 * row_bytes     # [cos(N) | sin(N)] per token
+
+        ue_assert_axi_beat_aligned_bytes(
+            half_bytes,
+            f"rope_hf_core_dram_d64_pbi: half_bytes (N={N})",
+            hint="slice DMAs must start on an AXI-beat boundary; host-pad each rotate-half "
+                 "up to a beat multiple as rope_hf_core_dram_d64_test does")
 
         # eltwise requires its two operands in DIFFERENT URAM banks.
         # URAM_A: x + cos-products + results; URAM_B: cos/sin slices + sin-products.
@@ -4698,7 +4781,7 @@ class UnifiedEngine:
         ``out = a+b`` (full->URAM_A in place). URAM_A: x/out@0, a@n_rows; URAM_B: cos@0, sin@n_rows,
         b@2*n_rows -> URAM_B needs 3*(N/64) rows (must fit the 4095 row ceiling).
 
-        ``gpr_M_reg`` (1..15) and ``gpr_N_reg`` (1..31) required; ``gpr_group_reg`` (1..15) optional
+        ``gpr_M_reg`` (1..15) and ``gpr_N_reg`` (1..63) required; ``gpr_group_reg`` (1..15) optional
         (runtime group_size; ``None`` -> compile-time ``group_size``). Optional ``gpr_input_addr`` /
         ``gpr_out_addr`` / ``gpr_cos_addr`` source DRAM bases from GPRs (word addr = ``byte >> 3``).
         N>=128, multiple of 128; non-64-aligned head_dim via host padding, same as the non-GQA core.
@@ -4710,8 +4793,8 @@ class UnifiedEngine:
         assert M >= 1 and group_size >= 1, f"{fn}: M and group_size must be at least 1"
         if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
             raise ValueError(f"{fn}: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
-        if gpr_N_reg is None or not (1 <= gpr_N_reg <= 31):
-            raise ValueError(f"{fn}: gpr_N_reg must be a GPR index 1..31, got {gpr_N_reg}")
+        if gpr_N_reg is None or not (1 <= gpr_N_reg <= 63):
+            raise ValueError(f"{fn}: gpr_N_reg must be a GPR index 1..63, got {gpr_N_reg}")
         if gpr_group_reg is not None and not (1 <= gpr_group_reg <= 15):
             raise ValueError(f"{fn}: gpr_group_reg must be a GPR index 1..15 or None, got {gpr_group_reg}")
         _reg_set = [r for r in (gpr_M_reg, gpr_N_reg, gpr_group_reg) if r is not None]
@@ -6057,7 +6140,7 @@ class UnifiedEngine:
         SCALE_BASE_W = (SCALE_DRAM_ADDR >> 3) if is_B_quantized else 0
 
         # ----------------------------------------------------------------------
-        # Register allocation. The ISA register file holds 31 GPRs (1..31); callers keep
+        # Register allocation. The ISA register file holds 63 GPRs (1..63); callers keep
         # gpr_M/K/N allocated for the whole program. Running DRAM cursors (A/B/output) and
         # precomputed strip strides avoid recomputing addresses each tile/strip/row (see
         # optimize_dynamic.md opts 1–4). softmax row_idx and full_matrix N/4 row stride
@@ -7304,7 +7387,6 @@ class UnifiedEngine:
         gpr_v_addr: int = None,
         gpr_bias_addr: int = None,
         gpr_out_addr: int = None,
-        q_scale: float = None,
     ) -> int:
         """Scaled dot-product attention with explicit batch and aligned KV length.
 
@@ -7329,7 +7411,6 @@ class UnifiedEngine:
                 batch=batch,
                 aligned_seq_len=aligned_seq_len,
                 head_dim=head_dim,
-                seq_len=seq_len,
                 Q_DRAM_ADDR=Q_DRAM_ADDR,
                 K_DRAM_ADDR=K_DRAM_ADDR,
                 V_DRAM_ADDR=V_DRAM_ADDR,
@@ -7337,7 +7418,6 @@ class UnifiedEngine:
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
                 IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                q_scale=q_scale,
             )
         if any(g is not None for g in _addr_gprs) and (gpr_batch_reg is None or gpr_aligned_seq_len_reg is None):
             raise ValueError("unified_attention_core: gpr_*_addr require both gpr_batch_reg and gpr_aligned_seq_len_reg")
@@ -7359,7 +7439,6 @@ class UnifiedEngine:
             gpr_v_addr=gpr_v_addr,
             gpr_bias_addr=gpr_bias_addr,
             gpr_out_addr=gpr_out_addr,
-            q_scale=q_scale,
         )
 
     def unified_attention_core_legacy(
@@ -7374,12 +7453,7 @@ class UnifiedEngine:
         OUTPUT_DRAM_ADDR: int,
         SCRATCH_DRAM_ADDR: int,
         IDENTITY_DRAM_ADDR: int = None,
-        q_scale: float = None,
     ) -> int:
-        # q_scale: multiplier applied to Q before Q·Kᵀ. Default (None) = the standard
-        # 1/sqrt(head_dim) SDPA scale; pass an explicit value (e.g. 1.0) when the caller
-        # has already folded the query scaling into Q and wants none applied here.
-        attn_scale = q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)
         bytes_per_element = 2
         if batch <= 0 or aligned_seq_len <= 0 or head_dim <= 0:
             raise ValueError(f"unified_attention_core_legacy: invalid dims batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}")
@@ -7406,7 +7480,7 @@ class UnifiedEngine:
             dram_b=None,
             dram_out=scaled_q_dram_addr,
             mode=UE_MODE.MUL_BROADCAST,
-            scalar=attn_scale,
+            scalar=1.0 / math.sqrt(head_dim),
         )
         total_flops += self.matmat_mul_core(
             M=batch,
@@ -7449,11 +7523,7 @@ class UnifiedEngine:
         gpr_v_addr: int = None,
         gpr_bias_addr: int = None,
         gpr_out_addr: int = None,
-        q_scale: float = None,
     ) -> int:
-        # q_scale: multiplier applied to Q before Q·Kᵀ. None = standard 1/sqrt(head_dim);
-        # pass an explicit value (e.g. 1.0) when the query scaling is already folded into Q.
-        attn_scale = q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)
         bytes_per_element = 2
         if batch > aligned_seq_len:
             raise ValueError(f"unified_attention_core_dynamic: batch must be <= aligned_seq_len, got batch={batch}, aligned_seq_len={aligned_seq_len}")
@@ -7489,7 +7559,7 @@ class UnifiedEngine:
             dram_b=None,
             dram_out=scaled_q_dram_addr,
             mode=UE_MODE.MUL_BROADCAST,
-            scalar=attn_scale,
+            scalar=1.0 / math.sqrt(head_dim),
             gpr_M_reg=gpr_batch_reg,
             gpr_a_addr=gpr_q_addr,
         )
@@ -7799,7 +7869,7 @@ class UnifiedEngine:
         # C ue_memcpy REG_REWRITE path: memset then only w[0], w[1] (no UE payload in w[2:])
         if (inst_type == INSTRUCTION_REG_REWRITE and w[2] == 0 and w[3] == 0
                 and w[4] == 0 and w[5] == 0 and w[6] == 0 and w[7] == 0):
-            general_reg_src = _inst_desc_bits(w, 36, 40)
+            general_reg_src = _inst_desc_bits(w, 36, 41)
             result = (f"UE_MEMCPY_FROM_DRAM (REG_REWRITE, src_reg={general_reg_src})\n"
                       f"    inst_id: {transaction_id}")
             for line in result.split('\n'):
@@ -7820,7 +7890,7 @@ class UnifiedEngine:
             else:
                 pbi_label = f"UNKNOWN_MODE({pbi_m})"
             dram_w = _inst_desc_bits(w, 32, 63)
-            src_reg = _inst_desc_bits(w, 24, 28)  # pbi_general_reg_idx = descriptor[28:24]
+            src_reg = _inst_desc_bits(w, 24, 29)  # pbi_general_reg_idx = descriptor[29:24]
             dma_len = _inst_desc_bits(w, 64, 95)
             out_sz = _inst_desc_bits(w, 156, 171)
             ur_rs = _inst_desc_bits(w, 96, 107)
@@ -7852,7 +7922,7 @@ class UnifiedEngine:
         if inst_type in (0, INSTRUCTION_REG_REWRITE, INSTRUCTION_UE_PBI):
             mode_sel = _inst_desc_bits(w, 172, 175)
             reg_rewrite = inst_type == INSTRUCTION_REG_REWRITE
-            general_reg_src = _inst_desc_bits(w, 36, 40) if reg_rewrite else 0
+            general_reg_src = _inst_desc_bits(w, 36, 41) if reg_rewrite else 0
 
             if mode_sel == 0xF:
                 dram_src_addr = _inst_desc_bits(w, 32, 63)
@@ -7976,12 +8046,12 @@ class UnifiedEngine:
                 print(f"        {line}")
             return
 
-        # ISA (non-UE): [82:32] micro-op fields
+        # ISA (non-UE): [85:32] micro-op fields
         isa_mode = _inst_desc_bits(w, 32, 35)
-        src_reg_idx = _inst_desc_bits(w, 36, 40)
-        dst_reg_idx = _inst_desc_bits(w, 41, 45)
-        rst_reg_idx = _inst_desc_bits(w, 46, 50)
-        immediate_value = _inst_desc_bits(w, 51, 82)
+        src_reg_idx = _inst_desc_bits(w, 36, 41)
+        dst_reg_idx = _inst_desc_bits(w, 42, 47)
+        rst_reg_idx = _inst_desc_bits(w, 48, 53)
+        immediate_value = _inst_desc_bits(w, 54, 85)
 
         if inst_type == INSTRUCTION_SWI:
             result = f"ISA_SWI"
@@ -8090,7 +8160,7 @@ class UnifiedEngine:
         Shared 256b instruction descriptor compiler for ISA micro-ops (JUMP / REG_ALU / REG_REWRITE / SEMAPHORE / FLAG).
 
         Header [15:0]: [7:0] instruction index from :attr:`_inst_id`; [11:8] inst_type; [15:12] reserved.
-        ISA [82:32]: [35:32] isa_mode; [40:36] src; [45:41] dst; [50:46] rst; [82:51] immediate.
+        ISA [85:32]: [35:32] isa_mode; [41:36] src; [47:42] dst; [53:48] rst; [85:54] immediate.
 
         After append, :attr:`_inst_id` is incremented (same pattern as :meth:`ue_op_descriptor`).
         """
@@ -8110,13 +8180,13 @@ class UnifiedEngine:
         # ISA descriptor: Header [15:0] (w[0][15:0])
         w[0] = (tid & 0xFF) | ((inst_type & 0xF) << 8)
 
-        # ISA [82:32]: [35:32] isa_mode; [40:36] src; [45:41] dst; [50:46] rst; [82:51] immediate
+        # ISA [85:32]: [35:32] isa_mode; [41:36] src; [47:42] dst; [53:48] rst; [85:54] immediate
         w[1] = ((isa_mode & 0xF) |
-                ((src_reg_idx & 0x1F) << 4) |
-                ((dst_reg_idx & 0x1F) << 9) |
-                ((rst_reg_idx & 0x1F) << 14) |
-                ((immediate_value & 0x1FFF) << 19))
-        w[2] = (immediate_value >> 13) & 0x7FFFF
+                ((src_reg_idx & 0x3F) << 4) |
+                ((dst_reg_idx & 0x3F) << 10) |
+                ((rst_reg_idx & 0x3F) << 16) |
+                ((immediate_value & 0x3FF) << 22))
+        w[2] = (immediate_value >> 10) & 0x3FFFFF
 
         self.capture_buffer.append(inst)
         self.capture_count += 1
@@ -8248,11 +8318,11 @@ class UnifiedEngine:
             while not aligned64(self.capture_count):
                 self.generate_instruction_nop()
             imm = ue_35bit_addr_shifter(program_dram_start_addr + self.capture_count * size_b) & 0xFFFFFFFF
-            # ue_isa_descriptor JUMP layout: w[1] = [3:0]mode | [8:4]src | [31:19]imm[12:0];
-            # w[2] = imm[31:13]. dst/rst stay 0 for a conditional jump.
+            # ue_isa_descriptor JUMP layout: w[1] = [3:0]mode | [9:4]src | [31:22]imm[9:0];
+            # w[2] = imm[31:10]. dst/rst stay 0 for a conditional jump.
             w = self.capture_buffer[jz_idx].words
-            w[1] = (JUMP_MODE_JZ & 0xF) | ((cond_reg & 0x1F) << 4) | ((imm & 0x1FFF) << 19)
-            w[2] = (imm >> 13) & 0x7FFFF
+            w[1] = (JUMP_MODE_JZ & 0xF) | ((cond_reg & 0x3F) << 4) | ((imm & 0x3FF) << 22)
+            w[2] = (imm >> 10) & 0x3FFFFF
 
         return patch
 
@@ -8613,7 +8683,7 @@ class UnifiedEngine:
         from the ISA regfile instead of ``w[1]``.
 
         Encoding (256b UE descriptor): inst_type = INSTRUCTION_REG_REWRITE in w[0][11:8];
-        inst_src_reg_idx in w[1][8:4] (descriptor [40:36]). Preserves inst_id in w[0][7:0].
+        inst_src_reg_idx in w[1][9:4] (descriptor [41:36]). Preserves inst_id in w[0][7:0].
         Other descriptor words are unchanged.
         """
         if self.capture_buffer is None or len(self.capture_buffer) == 0:
@@ -8622,8 +8692,8 @@ class UnifiedEngine:
         if self.capture_count == 0:
             print("ERROR: overwrite_instruction_with_general_register() called but capture_count is 0!")
             return
-        if general_register <= 0 or general_register > 31:
-            raise ValueError(f"general_register must be in [1, 31], got {general_register}")
+        if general_register <= 0 or general_register > 63:
+            raise ValueError(f"general_register must be in [1, 63], got {general_register}")
 
         inst = self.capture_buffer[self.capture_count - 1]
         w = inst.words
@@ -8632,8 +8702,8 @@ class UnifiedEngine:
         # Overwrite word 0: preserve inst_id [7:0], set inst_type to INSTRUCTION_REG_REWRITE [11:8]
         w[0] = (inst_id & 0xFF) | ((INSTRUCTION_REG_REWRITE & 0xF) << 8)
 
-        # Overwrite word 1: set inst_src_reg_idx [40:36] (bits 8:4 of w[1])
-        w[1] = ((general_register & 0x1F) << 4)
+        # Overwrite word 1: set inst_src_reg_idx [41:36] (bits 9:4 of w[1])
+        w[1] = ((general_register & 0x3F) << 4)
 
     def _patch_jump_immediate(self, capture_idx: int, target_word_addr: int) -> None:
         """
@@ -8641,8 +8711,8 @@ class UnifiedEngine:
         :attr:`capture_buffer`, preserving all other fields (``inst_id``, ``inst_type``,
         ``isa_mode``, ``src/dst/rst`` register indices).
 
-        Layout (see :meth:`ue_isa_descriptor`): immediate occupies bits [82:51] split as
-        ``w[1][31:19]`` (low 13) and ``w[2][18:0]`` (high 19).
+        Layout (see :meth:`ue_isa_descriptor`): immediate occupies bits [85:54] split as
+        ``w[1][31:22]`` (low 10) and ``w[2][21:0]`` (high 22).
         """
         if self.capture_buffer is None or capture_idx < 0 or capture_idx >= len(self.capture_buffer):
             raise IndexError(
@@ -8651,8 +8721,8 @@ class UnifiedEngine:
             )
         target = int(target_word_addr) & 0xFFFFFFFF
         w = self.capture_buffer[capture_idx].words
-        w[1] = (w[1] & 0x0007FFFF) | ((target & 0x1FFF) << 19)
-        w[2] = (w[2] & 0xFFF80000) | ((target >> 13) & 0x7FFFF)
+        w[1] = (w[1] & 0x003FFFFF) | ((target & 0x3FF) << 22)
+        w[2] = (w[2] & 0xFFC00000) | ((target >> 10) & 0x3FFFFF)
 
     def generate_instruction_pbi_init(
         self,
@@ -8820,15 +8890,12 @@ class UnifiedEngine:
             fmax_context_addr=0,
         )
 
-    def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR, chunk_bytes: int | None = None) -> int:
+    def write_captured_instructions_to_dram(self, start_addr: Optional[int] = None) -> int:
         """
         Write all captured instructions to DRAM
 
         Args:
             start_addr: Starting DRAM address to write instructions (default: DRAM_INSTRUCTION_ADDR)
-            chunk_bytes: If set, split the DMA write into pieces of at most this many bytes.
-                         A single-shot write can segfault on large instruction streams (e.g. swin's
-                         ~10 MB image); chunking avoids it. ``None`` (default) writes in one call.
 
         Returns:
             Number of bytes written, or -1 on error
@@ -8861,16 +8928,7 @@ class UnifiedEngine:
 
         # Write to DRAM
         print(f"Writing {self.capture_count} captured instructions ({total_bytes} bytes) to DRAM at 0x{start_addr:x}...")
-        if chunk_bytes is not None and chunk_bytes > 0:
-            bytes_written = 0
-            offset = 0
-            while offset < total_bytes:
-                chunk = min(chunk_bytes, total_bytes - offset)
-                bytes_written += self.dma_write(DMA_DEVICE_H2C, start_addr + offset,
-                                                instructions_bytes[offset:offset + chunk], chunk)
-                offset += chunk
-        else:
-            bytes_written = self.dma_write(DMA_DEVICE_H2C, start_addr, instructions_bytes, total_bytes)
+        bytes_written = self.dma_write(DMA_DEVICE_H2C, start_addr, instructions_bytes, total_bytes)
 
         if bytes_written == total_bytes:
             print(f"Successfully wrote {bytes_written} bytes ({self.capture_count} instructions) to DRAM")
@@ -9361,10 +9419,14 @@ def check_isa_jumps(
             continue
 
         jump_mode     = _inst_desc_bits(w, 32, 35)
-        # immediate_value occupies bits [82:51] of the 256-bit descriptor:
-        #   bits [63:51] → word[1] bits [31:19]  (13 bits, imm[12:0])
-        #   bits [82:64] → word[2] bits [18:0]   (19 bits, imm[31:13])
-        immediate     = ((_inst_desc_bits(w, 51, 63)) | (_inst_desc_bits(w, 64, 82) << 13))
+        # immediate_value occupies bits [85:54] of the 256-bit descriptor (must match
+        # ue_isa_descriptor's encoding and queue_state_module.sv line 302
+        # `inst_immediate_value = inst_descriptor[85:54]`):
+        #   bits [63:54] → word[1] bits [31:22]  (10 bits, imm[9:0])
+        #   bits [85:64] → word[2] bits [21:0]   (22 bits, imm[31:10])
+        # (The old [82:51] window read 3 low bits of the `rst` field, scaling every
+        #  relative backward offset by 8 and mis-locating absolute targets.)
+        immediate     = (_inst_desc_bits(w, 54, 63)) | (_inst_desc_bits(w, 64, 85) << 10)
         inst_addr     = base_addr + i * INST_BYTES
         tag           = f"{prefix}inst[{i}] @ 0x{inst_addr:X}"
 

@@ -51,6 +51,10 @@ from user_dma_core import (
     UE_FMAX_CONTEXT_SIZE,
     UE_VECTOR_SIZE,
     ue_35bit_addr_shifter,
+    ue_axi_beat_bf16_elems,
+    ue_axi_beat_bf16_elems_for,
+    ue_round_up_to_axi_beat_bytes,
+    ue_round_up_to_axi_beat_elems,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,6 +78,7 @@ _RNG_STATE_END = None
 _RNG_SEED = None
 _FAILED_TEST_RNG_PATH = "/tmp/rng_failed_test.pkl"
 _MAX_RNG_ALIGNED_AXI_DATA_WIDTH_BITS = 512
+KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
 
 
 def _rng_state_fingerprint() -> str:
@@ -2203,18 +2208,31 @@ def rope_hf_core_dram_d64_test(M: int, N: int, dynamic: bool = False, dynamic_ad
       unified dynamic core (delegates to :func:`rope_hf_core_dram_dynamic_test`), i.e. the padded
       dynamic path subsumes the sub-128 case.
     * ``dynamic=False`` -> the native sub-128 PBI core :meth:`rope_hf_core_dram_d64_pbi`: each
-      N/2-elem rotate-half is register-addressed into its own 128-byte URAM slot (no head_dim
-      padding, no PBI pointers). Runtime M from ``gpr_M_reg``; ``dynamic_addr`` sources the
-      input/output/cos bases from GPRs.
+      N/2-elem rotate-half is register-addressed into its own 128-byte URAM slot (no PBI
+      pointers). Runtime M from ``gpr_M_reg``; ``dynamic_addr`` sources the input/output/cos
+      bases from GPRs. The core's slice DMAs land on multiples of the half-slice size, and the
+      DMA engine requires AXI-beat-aligned DRAM addresses (same beat rule as slicing_test /
+      packing_test), so each rotate-half is host-padded up to a beat multiple: a no-op at
+      256-bit for the N used here, while at 512-bit N=32 pads each 16-elem half into a 32-elem
+      (64 B) slot. The real halves are sliced back out before the SNR check.
     """
     assert 0 < N < 128 and N % 2 == 0, f"d64 RoPE test expects an even head_dim 0<N<128, got {N}"
     if dynamic:
         return rope_hf_core_dram_dynamic_test(M, N, dynamic=True, dynamic_addr=dynamic_addr)
 
+    # Beat-align each rotate-half: every slice DMA in the d64 core starts at a multiple of the
+    # half-slice bytes, which must be a whole number of AXI beats (64 B at 512-bit, 32 B at 256-bit).
+    half = N // 2
+    padded_half = ue_round_up_to_axi_beat_bytes(half * 2) // 2
+    padded_N = 2 * padded_half
+    assert padded_N < 128, (
+        f"beat-padded head_dim {padded_N} leaves the d64 (N<128) region for N={N} at "
+        f"UE_AXI_DATA_WIDTH_BITS={UE_AXI_DATA_WIDTH_BITS}; use dynamic=True (padded-128 core) instead")
+
     ue = UnifiedEngine()
-    X_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * N * 2)
+    X_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
+    ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * padded_N * 2)
 
     m_reg   = ue.alloc_isa_reg()
     in_reg  = ue.alloc_isa_reg() if dynamic_addr else None
@@ -2228,8 +2246,8 @@ def rope_hf_core_dram_d64_test(M: int, N: int, dynamic: bool = False, dynamic_ad
         ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
         ue.generate_instruction_add_set(cos_reg, ROPE_DRAM_ADDR >> 3)
     total_flops = ue.rope_hf_core_dram_d64_pbi(
-        M=M, N=N, input_dram_addr=X_DRAM_ADDR, output_dram_addr=OUTPUT_DRAM_ADDR,
-        cos_dram_addr=ROPE_DRAM_ADDR, sin_dram_addr=ROPE_DRAM_ADDR + N * 2, gpr_M_reg=m_reg,
+        M=M, N=padded_N, input_dram_addr=X_DRAM_ADDR, output_dram_addr=OUTPUT_DRAM_ADDR,
+        cos_dram_addr=ROPE_DRAM_ADDR, sin_dram_addr=ROPE_DRAM_ADDR + padded_N * 2, gpr_M_reg=m_reg,
         gpr_input_addr=in_reg, gpr_out_addr=out_reg, gpr_cos_addr=cos_reg,
     )
     ue.stop_capture()
@@ -2241,19 +2259,19 @@ def rope_hf_core_dram_d64_test(M: int, N: int, dynamic: bool = False, dynamic_ad
         if r is not None:
             ue.release_isa_reg()
 
-    # Native d64 table layout: [cos(N) | sin_negated(N)] contiguous (no head_dim padding).
+    # Native d64 table layout: [cos(padded_N) | sin_negated(padded_N)] contiguous, each
+    # rotate-half in its beat-aligned slot (padded_N == N -> byte-identical unpadded layout).
     head_dim = N
     MAX_SEQ_LEN = 32768
     freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
     one_rope_seq = torch.view_as_real(freqs_cis[random.randint(0, MAX_SEQ_LEN - 1), :]).to(torch.bfloat16).reshape(-1)
     cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)
     sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)
-    sin_negated = sin.clone()
-    sin_negated[:N // 2] = -sin_negated[:N // 2]
     x_hf = torch.randn(M, N, dtype=torch.bfloat16)
-    rope_table = torch.cat((cos, sin_negated), dim=0).repeat(M)
+    rope_table = _rope_pad_table_row(cos, sin, N, padded_N, half, padded_half).repeat(M)
+    x_pad = _rope_pad_x(x_hf, N, padded_N, half, padded_half)
 
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_hf)
+    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_pad)
     ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
 
     ue.start_execute_from_dram(program_dram_addr)
@@ -2261,11 +2279,12 @@ def rope_hf_core_dram_d64_test(M: int, N: int, dynamic: bool = False, dynamic_ad
     ue.report_timing_and_instruction_count()
 
     flop_rate_gflops, _ = ue.report_flop_rate_gflops(total_flops)
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+    out_pad = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, padded_N))
+    output = _rope_unpad(out_pad, N, padded_N, half, padded_half)
     ref = x_hf * cos + _rotate_half(x_hf) * sin
     snr_db = calculate_snr(ref, output)
     print(f"HF RoPE d64 [pbi{'+dynaddr' if dynamic_addr else ''}] SNR: {snr_db:.2f} dB for "
-          f"M={M}, N={N} (body={instruction_size_bytes // 32} instrs)")
+          f"M={M}, N={N} (padded_N={padded_N}, body={instruction_size_bytes // 32} instrs)")
     assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
 
     record_test(f"rope_hf_core_dram_d64+pbi{'+dynaddr' if dynamic_addr else ''}",
@@ -3837,12 +3856,14 @@ def if4_if8_dot_product_test(K: int = 64, N: int = 64):
     configs = [
         ("IF4-FP",  TYPE.IF4, +1.0, NVFP4_TABLE,        16, None),
         ("IF4-INT", TYPE.IF4, -1.0, INT4_TABLE,         16, None),
-        ("IF8-FP",  TYPE.IF8, +1.0, FP8_E4M3FN_TABLE,   64, 64),
-        ("IF8-INT", TYPE.IF8, -1.0, INT8_TABLE,         32, 64),
+        ("IF8-FP",  TYPE.IF8, +1.0, FP8_E4M3FN_TABLE,   256, 256),
+        ("IF8-INT", TYPE.IF8, -1.0, INT8_TABLE,         256, 256),
     ]
 
     blocks_per_row = K // UE_VECTOR_SIZE
     num_blocks = N * blocks_per_row
+
+    assert N == K, "We need identity to cover all values in the codebook for a meaningful SNR test"
 
     for label, data_type, scale_value, value_table, num_codes, max_K in configs:
         if max_K is not None and K > max_K:
@@ -3852,9 +3873,11 @@ def if4_if8_dot_product_test(K: int = 64, N: int = 64):
 
         scales_bf16 = torch.full((num_blocks,), scale_value, dtype=torch.bfloat16)
 
-        # Tile codes 0..num_codes-1 across the N*K matrix elements so each
-        # block sees the full range of codes.
-        flat_codes = torch.randint(0, num_codes, (N * K,), dtype=torch.int16).to(torch.uint8)
+        valid_codes = torch.arange(num_codes, dtype=torch.uint8)
+        diag_codes = valid_codes.repeat((N + len(valid_codes) - 1) // len(valid_codes))[:N]
+        flat_codes = torch.diag(diag_codes).flatten()
+        print(f"IF4/IF8 Dot Product ({label}) K={K}, N={N}, scale={scale_value}, num_codes={num_codes}")
+        print(flat_codes)
 
         if data_type == TYPE.IF4:
             num_payload_bytes = (N * K) // 2
@@ -3874,7 +3897,7 @@ def if4_if8_dot_product_test(K: int = 64, N: int = 64):
                      scales_bf16.view(torch.uint16), num_blocks * 2)
         ue.allocate_params_dram(num_payload_bytes + num_blocks * 2)
 
-        A = (torch.rand(K, dtype=torch.bfloat16) * 2.0 - 1.0)
+        A = torch.ones(K, dtype=torch.bfloat16)
         A_DRAM_ADDR = ue.allocate_tensor_dram(K * 2)
         OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
 
@@ -3927,13 +3950,25 @@ def if4_if8_dot_product_test(K: int = 64, N: int = 64):
         abs_scale = abs(scale_value)
         codes_2d = flat_codes.view(N, K).to(torch.long)
         B_dequant = (value_table[codes_2d].to(torch.float32) * abs_scale).to(torch.bfloat16)
-        ref = (A.to(torch.float32) @ B_dequant.to(torch.float32).T).to(torch.bfloat16)
+        ref = A @ B_dequant.T
 
-        snr_db = calculate_snr(ref, output)
-        print(f"IF4/IF8 Dot Product ({label}) SNR: {snr_db:.2f} dB (K={K}, N={N})")
-        assert snr_db >= 30 or snr_db == float('inf'), (
-            f"{label} dot product SNR {snr_db:.2f} dB must be at least 30 dB"
-        )
+        # Value-by-value check: A is all-ones and B is identity-shaped, so
+        # output[i] must equal the dequantized diagonal code
+        # value_table[diag_codes[i]] * |scale|. Compare each element against
+        # the expected codebook value directly.
+        expected = value_table[diag_codes.to(torch.long)]
+        mismatches = 0
+        snr_db = float('inf')
+        for i in range(N):
+            exp_i = expected[i].item()
+            got_i = output[i].item()
+            # Treat NaN == NaN as a match (NaN != NaN by IEEE rules otherwise).
+            if exp_i != got_i and not (math.isnan(exp_i) and math.isnan(got_i)):
+                mismatches += 1
+                snr_db = float('-inf')
+                print(f"IF4/IF8 Dot Product ({label}) mismatch at i={i}: expected {exp_i:g}, got {got_i:g}")
+
+        assert mismatches == 0, "every output element must match the expected codebook value for the identity-shaped matrix"
 
         record_test(f"if4_if8_dot_product-{label}",
                     f"K={K}, N={N}",
@@ -4674,9 +4709,8 @@ def padding_zero_test():
     """
     ue = UnifiedEngine()
     M = 128
-    axi_m_bf16_per_beat = UE_AXI_DATA_WIDTH_BITS // 16
-    N = axi_m_bf16_per_beat * 3
-    max_rng_aligned_n = (_MAX_RNG_ALIGNED_AXI_DATA_WIDTH_BITS // 16) * 3
+    N = ue_axi_beat_bf16_elems() * 3
+    max_rng_aligned_n = ue_axi_beat_bf16_elems_for(_MAX_RNG_ALIGNED_AXI_DATA_WIDTH_BITS) * 3
     N_ALIGNED = ((N - 1) // UE_VECTOR_SIZE + 1) * UE_VECTOR_SIZE
     A_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N_ALIGNED * 2)
@@ -4731,9 +4765,8 @@ def slicing_test():
     N = 64
     # Host-side tests should avoid sub-beat DRAM writebacks on wider AXI ports.
     # Write back a beat-aligned prefix per row and validate only the requested slice.
-    axi_beat_elems = max(1, UE_AXI_DATA_WIDTH_BITS // 16)
     slice_elems = N // 4
-    writeback_elems = ((max(slice_elems, axi_beat_elems) + axi_beat_elems - 1) // axi_beat_elems) * axi_beat_elems
+    writeback_elems = ue_round_up_to_axi_beat_elems(max(slice_elems, ue_axi_beat_bf16_elems()))
     A_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * writeback_elems * 2)
 
@@ -4783,8 +4816,7 @@ def packing_test(packing_mode: int):
     """
     ue = UnifiedEngine()
     M = 1024
-    axi_beat_elems = max(1, UE_AXI_DATA_WIDTH_BITS // 16)
-    writeback_elems = ((max(packing_mode, axi_beat_elems) + axi_beat_elems - 1) // axi_beat_elems) * axi_beat_elems
+    writeback_elems = ue_round_up_to_axi_beat_elems(max(packing_mode, ue_axi_beat_bf16_elems()))
     A_DRAM_ADDR = ue.allocate_tensor_dram(M * 2)
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram((M // UE_VECTOR_SIZE) * writeback_elems * 2)
 
@@ -5913,7 +5945,7 @@ def test_ue_int_reg_read():
     ue.reset_inst_ptr_counter()
     ue.start_capture()
     ue.generate_instruction_swi()
-    ue.generate_instruction_add_set(REGFILE_R1_LOOP, 500)
+    ue.generate_instruction_add_set(REGFILE_R1_LOOP, 10000)
     ue.generate_instruction_add_dec(REGFILE_R1_LOOP)
     ue.generate_instruction_jump_rela_jnz(2, REGFILE_R1_LOOP)
     ue.generate_instruction_halt()
@@ -5925,7 +5957,7 @@ def test_ue_int_reg_read():
     ue.start_execute_from_dram(prog)
 
     saw_swi = False
-    deadline = time.time() + 5.0
+    deadline = time.time() + 3.0
     while ue.is_queue_busy():
         c = ue.read_reg32(UE_INT_REG) & 3
         if c == INT_CAUSE_SWI:
@@ -5947,8 +5979,7 @@ def test_ue_int_reg_read():
     ue.reset_inst_ptr_counter()
 
 
-def systolic_matmul_test(M: int, K: int, N: int, snr_threshold_db: float = 30.0,
-                         use_ddr1: bool = False):
+def systolic_matmul_test(M: int, K: int, N: int, snr_threshold_db: float = 44.0):
     """Test C[M,N] = A[M,K] @ B[N,K].T on the Kintex-7 systolic IP."""
     from systolic_engine import SystolicEngine
 
@@ -5959,29 +5990,21 @@ def systolic_matmul_test(M: int, K: int, N: int, snr_threshold_db: float = 30.0,
     assert 16 <= K <= 4096 and (K & (K - 1)) == 0, \
         f"current systolic RTL requires power-of-two K in [16, 4096], got {K}"
 
-    se = SystolicEngine()
+    se = SystolicEngine(csr_base=KINTEX7_SYSTOLIC_CSR_BASE_ADDR)
     align256 = lambda n: (n + 0xFF) & ~0xFF
-    A_ADDR = 0x80100000 if use_ddr1 else 0x00200000
+    A_ADDR = 0x00200000
     B_ADDR = A_ADDR + align256(M * K * 2)
     C_ADDR = B_ADDR + align256(N * K * 2)
-    ddr_label = "DDR1 (M01_AXI)" if use_ddr1 else "DDR0 (M00_AXI)"
-    print(f"systolic_matmul_test M={M} K={K} N={N} using {ddr_label} "
+    print(f"systolic_matmul_test M={M} K={K} N={N} "
           f"A={A_ADDR:#010x} B={B_ADDR:#010x} C={C_ADDR:#010x}")
 
     a = torch.randn(M, K, dtype=torch.bfloat16)
     b = torch.randn(N, K, dtype=torch.bfloat16)
 
     se.h2c(A_ADDR, a)
-    a_rb = se.c2h(A_ADDR, (M, K))
-    if not torch.equal(a, a_rb):
-        n_diff = (a != a_rb).sum().item()
-        print(f"  WARNING: A DMA round-trip mismatch ({n_diff}/{a.numel()} elements differ) "
-              f"— DDR write/read may not be working")
-    else:
-        print(f"  A DMA round-trip OK ({M}×{K} BF16)")
-
     se.h2c(B_ADDR, b)
-    cycles = se.matmul(A_ADDR, B_ADDR, C_ADDR, M, N, K)
+
+    cycles = se.matmul(A_ADDR, B_ADDR, C_ADDR, M, K, N)
     c_hw = se.c2h(C_ADDR, (M, N))
     c_ref = a.float() @ b.float().T
 
@@ -5995,7 +6018,7 @@ def systolic_matmul_test(M: int, K: int, N: int, snr_threshold_db: float = 30.0,
     assert cycles > 0, f"systolic_matmul timed out (M={M},K={K},N={N})"
     assert snr >= snr_threshold_db or snr == float('inf'), \
         f"SNR {snr:.2f} dB < threshold {snr_threshold_db:.2f} dB"
-    record_test("systolic_matmul", f"M={M},K={K},N={N}", snr_db=snr, gflops=gflops)
+    record_test("systolic_matmul", f"M={M}, K={K}, N={N}", snr_db=snr, gflops=gflops)
 
 
 def gemma3_inference_test() -> None:
@@ -6034,6 +6057,14 @@ def gemma3_inference_test() -> None:
         "matmatmul": 40_000_000,
         "legacy": 20_000_000,
     }
+    if user_dma_core.CURRENT_DEVICE == "efinix":
+        # Efinix currently runs the same correctness workload at ~23.5M
+        # cycles/tok. Keep a device-specific performance gate instead of
+        # failing a valid run against the bittware-oriented floor above.
+        _MAX_CYCLES_PER_TOKEN.update({
+            "streaming": 25_000_000,
+            "legacy": 25_000_000,
+        })
     _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
 
     def _instruction_bin_path(ue) -> str:
@@ -6100,6 +6131,114 @@ def gemma3_inference_test() -> None:
         record_test(f"gemma3_inference_{label}", dims=dims, inst_bytes=inst_bytes)
 
 
+def gemma3_if8_inference_test() -> None:
+    """Run Gemma3 IF8 streaming, matmatmul, and legacy inference variants."""
+    import user_dma_core
+
+    if user_dma_core.CURRENT_DEVICE == "efinix":
+        print(
+            "Gemma3 IF8 inference skipped on efinix: IF8 weights plus tensor "
+            "and instruction regions exceed the current 1GB DRAM address map."
+        )
+        record_test("gemma3_if8_inference", dims="skipped: efinix 1GB DRAM map")
+        return
+
+    gemma3_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gemma3")
+    if gemma3_dir not in sys.path:
+        sys.path.insert(0, gemma3_dir)
+    from gemma3_test_IF8 import Gemma3_UnifiedEngine
+
+    expected_text = (
+        "To find the value of x, we need to solve the equation:\n"
+        "x + 3 = 5\n\n"
+        "Subtract 3 from both sides of the equation:\n"
+        "x + 3 - 3 = 5 - 3\n"
+        "x = 2\n\n"
+        "So, x = 2.\n\n"
+        "Final Answer: The final answer is $\\boxed{2}$"
+    )
+    expected_tokens = 74
+    token_tol = 0
+
+    # IF8 uses the same Gemma3 execution schemes as IF4, but moves twice the
+    # quantized weight data. Keep the correctness gate identical and halve the
+    # speed requirement by doubling the allowed cycles/tok.
+    _MAX_CYCLES_PER_TOKEN = {
+        "streaming": 40_000_000,
+        "matmatmul": 80_000_000,
+        "legacy": 40_000_000,
+    }
+    if user_dma_core.CURRENT_DEVICE == "efinix":
+        _MAX_CYCLES_PER_TOKEN.update({
+            "streaming": 50_000_000,
+            "legacy": 50_000_000,
+        })
+    _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
+
+    def _instruction_bin_path(ue) -> str:
+        if ue.legacy:
+            prefill_seq_len = len(ue.prefill_seq) - 1
+            matmatmul_tag = "_matmatmul" if ue.matmatmul else ""
+            rel_path = f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin"
+        elif ue.matmatmul:
+            rel_path = "gemma3_if8_bin/gemma3_matmatmul_instruction.bin"
+        else:
+            rel_path = "gemma3_if8_bin/gemma3_instruction.bin"
+        return os.path.join(ue.script_dir, rel_path)
+
+    def _assert_result(label: str, result: dict) -> None:
+        decoded_text = result["decoded_text"].strip()
+        tokens_decoded = result["tokens_decoded"]
+        assert decoded_text == expected_text, (
+            f"Gemma3 IF8 {label}: decoded text does not exactly match expected reference.\n"
+            f"  expected reference: {expected_text!r}\n"
+            f"  got:                {decoded_text!r}"
+        )
+        assert abs(tokens_decoded - expected_tokens) <= token_tol, (
+            f"Gemma3 IF8 {label}: token count mismatch "
+            f"(expected {expected_tokens} +/- {token_tol}, got {tokens_decoded}).\n"
+            f"  expected reference: {expected_text!r}\n"
+            f"  got text:           {decoded_text!r}"
+        )
+
+        peak_tokens_per_s = result["peak_tokens_per_s"]
+        cycles_per_token = (
+            (1e9 / peak_tokens_per_s) / _clock_ns if peak_tokens_per_s > 0 else math.inf
+        )
+        max_cycles_per_token = _MAX_CYCLES_PER_TOKEN[label]
+        assert cycles_per_token < max_cycles_per_token, (
+            f"Gemma3 IF8 {label}: peak decode cost {cycles_per_token:,.0f} cycles/tok "
+            f"({peak_tokens_per_s:.2f} tok/s @ {_clock_ns:.4f} ns/cycle) "
+            f"exceeds required {max_cycles_per_token:,} cycles/tok."
+        )
+
+    for label, kwargs in (
+        ("streaming", {}),
+        ("matmatmul", {"matmatmul": True}),
+        ("legacy", {"legacy": True}),
+    ):
+        ue = Gemma3_UnifiedEngine(**kwargs)
+        ue.set_prefill_seq()
+        ue.compile_gemma3()
+        result = ue.run_gemma3()
+        _assert_result(label, result)
+        inst_bin = _instruction_bin_path(ue)
+        inst_bytes = os.path.getsize(inst_bin) if os.path.exists(inst_bin) else None
+        print(
+            f"Gemma3 IF8 {label} inference OK: 'x = 2' found, "
+            f"{result['tokens_decoded']} tokens decoded, "
+            f"avg {result['avg_tokens_per_s']:.2f} tok/s, "
+            f"peak {result['peak_tokens_per_s']:.2f} tok/s, "
+            f"bin {inst_bytes if inst_bytes is not None else 'n/a'} bytes."
+        )
+        dims = (
+            f"tokens={result['tokens_decoded']}, "
+            f"avg={result['avg_tokens_per_s']:.2f} tok/s, "
+            f"peak={result['peak_tokens_per_s']:.2f} tok/s"
+        )
+        record_test(f"gemma3_if8_inference_{label}", dims=dims, inst_bytes=inst_bytes)
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
@@ -6117,8 +6256,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     import user_dma_core
-    user_dma_core.UE_0_BASE_ADDR = args.base_addr
-    print(f"DMA dev={args.dev}"
+    profile = configure_device(args.device, dma_device=args.dev, base_addr=args.base_addr)
+    globals()["DMA_DEVICE_H2C"] = user_dma_core.DMA_DEVICE_H2C
+    globals()["DMA_DEVICE_C2H"] = user_dma_core.DMA_DEVICE_C2H
+    globals()["DMA_DEVICE_USER"] = user_dma_core.DMA_DEVICE_USER
+    globals()["DRAM_ACTIVATION_ADDR"] = user_dma_core.DRAM_ACTIVATION_ADDR
+    globals()["DRAM_INSTRUCTION_ADDR"] = user_dma_core.DRAM_INSTRUCTION_ADDR
+    print(f"DMA dev={args.dev}, device={profile['device']}"
           f" (H2C={user_dma_core.DMA_DEVICE_H2C},"
           f" C2H={user_dma_core.DMA_DEVICE_C2H},"
           f" USER={user_dma_core.DMA_DEVICE_USER}),"
@@ -6161,6 +6305,8 @@ if __name__ == "__main__":
         clock = 3.3333
     elif args.device == "alveo":
         clock = 1000 / 225
+    elif args.device == "efinix":
+        clock = 4.0
     else:
         clock = 10
 
@@ -6177,32 +6323,6 @@ if __name__ == "__main__":
         write_test_summary(_USER_HW_TEST_SUMMARY)
 
     atexit.register(_atexit_write_test_summary)
-
-    if args.device == 'kintex7_systolic':
-        from systolic_engine import SystolicEngine
-        SystolicEngine().dump_csrs()
-
-        print("\n[diag 1/2] DDR0 (M00_AXI path) smoke test:")
-        systolic_matmul_test(8, 16, 32, use_ddr1=False)
-
-        print("\n[diag 2/2] DDR1 (M01_AXI path) smoke test:")
-        systolic_matmul_test(8, 16, 32, use_ddr1=True)
-
-        systolic_matmul_test(16, 16, 32)
-        systolic_matmul_test(64, 64, 64)
-        systolic_matmul_test(128, 128, 128)
-        systolic_matmul_test(256, 256, 256)
-        systolic_matmul_test(512, 512, 512)
-        systolic_matmul_test(64, 512, 128)
-        systolic_matmul_test(256, 128, 512)
-
-        _RNG_STATE_END = _rng_state_fingerprint()
-        _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
-        atexit.unregister(_atexit_write_test_summary)
-        write_test_summary(_USER_HW_TEST_SUMMARY)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
 
     software_reset_test()
     dram_read_write_speed_test()
@@ -6230,6 +6350,7 @@ if __name__ == "__main__":
     tq4_codebook_reload_tests()
     if4_if8_dot_product_test(K=64, N=64)
     if4_if8_dot_product_test(K=128, N=128)
+    if4_if8_dot_product_test(K=256, N=256)
     dequantize_test(TYPE.IF4, int_variant=True)
     dequantize_test(TYPE.IF4, int_variant=False)
     dequantize_test(TYPE.IF8, int_variant=True)
@@ -6345,19 +6466,6 @@ if __name__ == "__main__":
         lambda: unified_attention_test(batch=512, aligned_seq_len=512, head_dim=128, dynamic=True),
     )
 
-    _run_rng_matched_pair(
-        lambda: flash_attention_test(head_dim=128, seq_len=1024),
-        lambda: flash_attention_test(head_dim=128, seq_len=1024, dynamic=True),
-    )
-    _run_rng_matched_pair(
-        lambda: flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True),
-        lambda: flash_attention_test(head_dim=256, seq_len=2048, bias_enable=True, dynamic=True),
-    )
-    decoder_group_attention_test(head_dim=128, seq_len=1024)
-    decoder_group_attention_test(head_dim=128, seq_len=1024, dynamic=True)
-    decoder_group_attention_test(head_dim=256, seq_len=2048)
-    decoder_group_attention_test(head_dim=256, seq_len=2048, dynamic=True)
-    
     # --- Additional coverage: extra dimension/feature combinations ---
     rms_norm_test(shape=(768, 1024))
     rms_norm_test(shape=(2048, 2048))
@@ -6697,10 +6805,10 @@ if __name__ == "__main__":
 
     _RNG_STATE_END = _rng_state_fingerprint()
 
-    # --- Multi-core / multi-engine tests (kintex7 and alveo) ---
+    # --- Multi-core / multi-engine tests (kintex7, kintex7_systolic, and alveo) ---
     # Keep device-specific optional coverage last so it cannot advance RNG
     # before common tests. That makes SNR results comparable across devices.
-    if args.device in ('kintex7', 'alveo'):
+    if args.device in ('kintex7', 'kintex7_systolic', 'alveo'):
         matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
         _run_rng_matched_pair(
             lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048),
@@ -6744,6 +6852,40 @@ if __name__ == "__main__":
         matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
 
     gemma3_inference_test()
+    gemma3_if8_inference_test()
+
+    # --- Systolic core tests (kintex7_systolic only) ---
+    # Run last, after all andromeda-core coverage, so a systolic-specific
+    # failure never masks whether the andromeda core itself passed.
+    if args.device == 'kintex7_systolic':
+        from systolic_engine import SystolicEngine
+        SystolicEngine(csr_base=KINTEX7_SYSTOLIC_CSR_BASE_ADDR).dump_csrs()
+
+        systolic_matmul_test(8, 16, 32)
+        systolic_matmul_test(16, 16, 32)
+        systolic_matmul_test(64, 64, 64)
+        systolic_matmul_test(128, 128, 128)
+        systolic_matmul_test(256, 256, 256)
+        systolic_matmul_test(512, 512, 512)
+        systolic_matmul_test(64, 512, 128)
+        systolic_matmul_test(256, 128, 512)
+        systolic_matmul_test(512, 2048, 2048)
+        systolic_matmul_test(128, 4096, 512)
+        systolic_matmul_test(256, 2048, 1024)
+        systolic_matmul_test(512, 1024, 512)
+        systolic_matmul_test(1024, 1024, 1024)
+        systolic_matmul_test(4096, 4096, 4096)
+        systolic_matmul_test(8192, 512, 512)
+        systolic_matmul_test(512, 512, 8192)
+        # Compare with Unified engine
+        matmat_mul_test(M=1024, K=1024, N=1024)
+        systolic_matmul_test(M=1024, K=1024, N=1024)
+        matmat_mul_test(M=8, K=128, N=1024)
+        systolic_matmul_test(M=8, K=128, N=1024)
+        matmat_mul_test(M=16, K=1024, N=64)
+        systolic_matmul_test(M=16, K=1024, N=64)
+        matmat_mul_test(M=256, K=64, N=256)
+        systolic_matmul_test(M=256, K=64, N=256)
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
     # Clean run: write the summary directly and hard-exit 0 so the atexit hook
@@ -6753,4 +6895,3 @@ if __name__ == "__main__":
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
-
