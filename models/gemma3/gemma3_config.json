@@ -3,7 +3,7 @@
     "TMP_REG": 1,
     "GPR_SEQ_LEN_REG": 2,
     "GPR_Q_SEQ_LEN_REG": 3,
-    "GPR_BUCKET_IDX_REG": 4
+    "GPR_ALIGNED_SEQ_LEN_REG": 4
   },
   "file_info": {
     "layer_size": 14267392,
@@ -25,9 +25,7 @@
   "paths": {
     "weights_bin": "gemma3_bin/weights_gemma3_hf.bin",
     "hf_model_dir": "gemma3_bin/gemma-3-1b-it",
-    "hf_model_repo": "google/gemma-3-1b-it",
-    "instruction_bin": "gemma3_bin/gemma3_instruction.bin",
-    "instruction_meta": "gemma3_bin/gemma3_instruction.json"
+    "hf_model_repo": "google/gemma-3-1b-it"
   },
   "default_prefill_tokens": [2, 2, 105, 2364, 107, 236781, 236862, 236800, 236784, 236810, 236764, 1144, 563, 1123, 236881, 106, 107, 105, 4368, 107],
   "layers": {

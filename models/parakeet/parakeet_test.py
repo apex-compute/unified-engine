@@ -1574,7 +1574,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             json.dump({"L_pad": L_pad, "size": total, "extras": extras_meta}, f)
         _original_print(f"  Params dumped: {total / 1024**2:.1f} MB → {bin_path}")
     def load_params(self, L_pad):
-        """Load params DRAM from bin. Returns True if loaded, False if not found/mismatch."""
+        """Load params DRAM from bin. Returns True if loaded, False if the cache is incomplete/mismatched."""
         bin_dir = os.path.join(self.script_dir, "parakeet_bin")
         bin_path = os.path.join(bin_dir, "params.bin")
         meta_path = os.path.join(bin_dir, "params.json")
@@ -1584,6 +1584,26 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             meta = json.load(f)
         if meta.get("L_pad") != L_pad:
             _original_print(f"  Params bin L_pad={meta.get('L_pad')} != {L_pad}, reloading weights")
+            return False
+        # params.bin stores raw DRAM bytes, but not the Python-side self.w address
+        # map needed to compile programs. Therefore params and programs form one
+        # cache unit: an orphaned or incompatible params cache must be rebuilt.
+        programs_path = os.path.join(bin_dir, "programs.bin")
+        programs_meta_path = os.path.join(bin_dir, "programs.json")
+        if not os.path.exists(programs_path) or not os.path.exists(programs_meta_path):
+            _original_print("  Programs cache missing; rebuilding weights and programs together")
+            return False
+        try:
+            with open(programs_meta_path) as f:
+                programs_meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            _original_print("  Programs metadata is invalid; rebuilding weights and programs together")
+            return False
+        if programs_meta.get("L_pad") != L_pad:
+            _original_print(
+                f"  Programs bin L_pad={programs_meta.get('L_pad')} != {L_pad}; "
+                "rebuilding weights and programs together"
+            )
             return False
         total = meta["size"]
         CHUNK = 1 * 1024 * 1024

@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-GPT-2 Base (124M) inference on accelerator: prefill + decode.
+RETIRED: GPT-2 Base (124M) accelerator test.
+
+This implementation is retained for historical reference but is no longer a
+supported or runnable model test and is excluded from model_auto_test.py.
 
   - Config from gpt2_config.json; weights from a single bin (see below).
   - Dynamic-PBI flow (see src/template/core_changes.md): ONE prefill program +
     ONE decoder program compiled into a single instruction bin. Runtime row
     counts and attention bucket selection are driven by fixed-index GPRs
     (gpr_seq_len / gpr_bucket_idx) primed by a tiny per-call preamble program.
-  - Shared-subroutine attention (core_changes.md §7): flash_attention_core
-    (prefill) and decoder_group_attention_core (decode) are each compiled ONCE
-    after the program HALT; every per-head call site jumps in and the body
-    returns via JUMP_REG_ABS(gpr_ret_id).
+  - Inline attention: each per-head attention is emitted inline via
+    unified_attention_core, with dynamic query-row count (gpr_q_seq_len) and
+    64-aligned KV length (gpr_aligned_seq_len) primed by the per-call preamble.
   - If gpt2_bin/programs.bin + .json exist, compile is skipped and the
     cached image is reused (delete the bin to force recompile).
 
@@ -44,7 +46,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 import time
 
-GPT2_INSTRUCTION_CACHE_VERSION = 4
+GPT2_INSTRUCTION_CACHE_VERSION = 5
 
 # This file's folder; user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -294,6 +296,9 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         self.TMP_REG = fixed["TMP_REG"]
         self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
         self.gpr_seq_len = fixed["GPR_SEQ_LEN_REG"]
+        # unified_attention_core dynamic dims: batch (query rows) and 64-aligned KV length.
+        self.gpr_q_seq_len = fixed["GPR_Q_SEQ_LEN_REG"]
+        self.gpr_aligned_seq_len = fixed["GPR_ALIGNED_SEQ_LEN_REG"]
         self._isa_reg_counter = max(fixed.values()) + 1  # must start past all fixed ISA regs
         self.causal_mask_upper = False
         self._end_of_turn_token_id = model["end_of_turn_token_id"]  # 50256
@@ -475,7 +480,6 @@ class GPT2_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         _SILENT_MODE = True
-        num_bucket = (self.PREFILL_MAX_SEQ_LEN * self.group_size + 63) // 64
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         ahd = self.actual_head_dim   # 64
@@ -483,12 +487,8 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         bpe = self.bytes_per_element
         hd = self.head_dim           # 768
 
-        # flash_attention_core compiled once as a subroutine after the layer loop.
-        # Each call site sets gpr_ret_id to its return word address then jumps to the
-        # subroutine; flash_attention returns via JUMP_REG_ABS(gpr_ret_id).
-        program_dram_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-        call_site_jump_capture_indices: list[int] = []
+        # Attention is inlined per head via unified_attention_core (dynamic seq_len GPRs),
+        # so there is no shared subroutine or call-site patching in prefill.
 
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
@@ -573,15 +573,24 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                     template_seq_len=seq_len,
                 )
 
-                # Call flash attention subroutine (compiled after the layer loop).
-                # Pad so capture_count is even; return address = capture_count + 2
-                # (ADD_SET + JUMP_ABS), which is then also even = 512-bit aligned.
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                call_site_jump_capture_indices.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                # Inline scaled-dot-product attention for this head. Runtime query-row count
+                # (batch) and 64-aligned KV length come from gpr_q_seq_len / gpr_aligned_seq_len,
+                # so one emitted body serves any prompt length. Q scaled by 1/sqrt(head_dim)
+                # internally; the causal mask is supplied as the full-matrix BIAS.
+                total_flops += self.unified_attention_core(
+                    batch=q_seq_len,
+                    aligned_seq_len=aligned_seq_len,
+                    head_dim=ahd,
+                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    gpr_batch_reg=self.gpr_q_seq_len,
+                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                )
 
                 # Assemble output: head_h output rows → FLASH_OUTPUT at head's 64-dim slot
                 self._emit_pbi_scatter_per_token(
@@ -639,35 +648,10 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                 gpr_M_reg=self.gpr_seq_len,
             )
 
-        # HALT ends the normal execution path; the flash_attention subroutine follows and
-        # is only reachable via the JUMP_ABS call sites within the layer loop above.
+        # HALT ends the prefill program (attention is now inlined per head above, so there is
+        # no trailing shared subroutine to reach).
         self.generate_instruction_halt()
 
-        # Compile flash_attention subroutine after the HALT; bucket bodies return via
-        # JUMP_REG_ABS(gpr_ret_id), which each call site pre-loaded with its return address.
-        flash_sub_start_inst_dram_addr, flash_flops = self.flash_attention_core(
-            head_dim=ahd,
-            seq_len=aligned_seq_len,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_bucket,
-            gpr_ret_id=gpr_ret_id,
-        )
-        total_flops += flash_flops[num_bucket - 1] * layer_size * nkvh
-
-        # Patch all call-site JUMP_ABS placeholders to point at the flash subroutine.
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(
-                jump_idx, ue_35bit_addr_shifter(flash_sub_start_inst_dram_addr))
-
-        self.release_isa_reg()  # gpr_ret_id
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"size_bytes": prefill_program_size, "flops": total_flops}
@@ -687,9 +671,8 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         count_at_start = self.capture_count
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         total_flops = 0
-        program_dram_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-        call_site_jump_capture_indices: list[int] = []
+        # Attention is inlined per head via unified_attention_core (dynamic aligned KV length),
+        # so decode has no shared subroutine or call-site patching.
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -697,6 +680,9 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         nkvh = self.num_kv_heads     # 12
         bpe = self.bytes_per_element
         hd = self.head_dim           # 768
+        # Static template for the aligned KV length; the live value is primed into
+        # gpr_aligned_seq_len by each decode step's preamble.
+        decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
 
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
@@ -778,13 +764,23 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                     self.LAYER0_Q_DRAM + kv_h * ahd * bpe, 0x30000, ahd)
                 self.sram_to_accelerator_memory(0x30000, self.LAYER0_FLASH_Q_DRAM, ahd)
 
-                # Call decoder attention subroutine (compiled after the HALT below).
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                call_site_jump_capture_indices.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                # Inline single-query attention for this head. batch=1 (one decode token);
+                # the 64-aligned KV length is dynamic via gpr_aligned_seq_len. FLASH_K/V hold
+                # aligned_seq_len gathered history rows; the [1, aligned] FLASH_BIAS masks the
+                # padding positions (>= current length) to -inf.
+                total_flops += self.unified_attention_core(
+                    batch=1,
+                    aligned_seq_len=decoder_aligned_seq_len,
+                    head_dim=ahd,
+                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                )
 
                 # Copy per-head output to its slot in FLASH_OUTPUT_DRAM.
                 self.accelerator_memory_to_sram(
@@ -837,33 +833,9 @@ class GPT2_UnifiedEngine(UnifiedEngine):
             total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM)
 
+        # HALT ends the decoder program (attention is inlined per head above).
         self.generate_instruction_halt()
-        self.pad_capture_to_64b_boundary()
 
-        # Compile decoder_group_attention_core once as a subroutine after HALT.
-        num_buckets = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-        dec_sub_start_addr, dec_attn_flops = self.decoder_group_attention_core(
-            group_size=self.group_size,
-            head_dim=ahd,
-            seq_len=self.MAX_CONTEXT_SIZE,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_buckets,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            gpr_ret_id=gpr_ret_id,
-        )
-        total_flops += dec_attn_flops[-1] * layer_size * nkvh
-
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(
-                jump_idx, ue_35bit_addr_shifter(dec_sub_start_addr))
-
-        self.release_isa_reg()  # gpr_ret_id
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"program_size_bytes": decoder_program_size, "total_flops": total_flops}
@@ -1070,6 +1042,9 @@ class GPT2_UnifiedEngine(UnifiedEngine):
         self.start_capture()
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
         self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        # unified_attention_core dynamic dims: batch (query rows) and 64-aligned KV length.
+        self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
+        self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -1159,6 +1134,8 @@ class GPT2_UnifiedEngine(UnifiedEngine):
             self.clear_inst_id()
             self.start_capture()
             self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            # unified_attention_core reads the live 64-aligned KV length from this GPR.
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
             self.generate_instruction_add_set(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _kv_stride))
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
@@ -1283,4 +1260,7 @@ def main():
     print("GPT-2 test ends.")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "GPT-2 TEST IS RETIRED AND DISABLED. "
+        "It is retained only as historical reference and is not part of model_auto_test.py."
+    )

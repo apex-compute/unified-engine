@@ -2204,6 +2204,9 @@ def main():
     _SILENT_MODE = True
 
     set_dma_device(args.dev)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits

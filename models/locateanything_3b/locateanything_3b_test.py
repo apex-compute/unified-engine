@@ -31,12 +31,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 sys.path.insert(0, PROJECT_ROOT)
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX1_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, set_dma_device
 from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_dram_post_add
 from nn_lib import store_weight, store_quantized_weight, smart_bf16_permute_core, layer_norm_core_dram_post_add
 from quant_lib import quantize_q4_64
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
-from user_dma_core import ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
+from user_dma_core import ue_35bit_addr_shifter
 import quant_lib
 
 import builtins
@@ -762,17 +762,17 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.PREFILL_MAX_SEQ_LEN = int(model.get("prefill_max_seq_len", 64))
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
-        # Dynamic-PBI GPR layout (mirrors Dave's qwen3 conversion):
+        # Dynamic-PBI GPR layout:
         #   reg 1 = TMP_REG          — scratch for reg_mul_imm + add_imm address math
         #   reg 2 = GF_SEQ_LEN_REG   — runtime row count for matmul/norm ops (M=seq_len)
         #   reg 3 = GF_Q_SEQ_LEN_REG — for ops with M = seq_len * group_size
-        #   reg 4 = GF_BUCKET_IDX_REG— 1-based bucket selector for flash / decoder_group_attention
+        #   reg 4 = GF_ALIGNED_SEQ_LEN_REG — runtime KV length for unified_attention_core
         # Dynamic GPR allocation (via alloc_isa_reg) starts at 5.
         fixed = self._cfg["fixed_isa_regs"]
         self.TMP_REG       = fixed["TMP_REG"]
         self.gf_seq_len    = fixed["GF_SEQ_LEN_REG"]
         self.gf_q_seq_len  = fixed["GF_Q_SEQ_LEN_REG"]
-        self.gf_bucket_idx = fixed["GF_BUCKET_IDX_REG"]
+        self.gf_aligned_seq_len = fixed["GF_ALIGNED_SEQ_LEN_REG"]
         self._isa_reg_counter = 5
         self.causal_mask_upper = False
         self._rope_global_layers = set(model["rope_global_layers"])  # empty for Qwen2.5-VL
@@ -855,20 +855,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         for ptr in reversed(ptr_ws):
             self.release_inst_ptr(ptr)
 
-    def _flash_attention_core_cached(self, **kwargs) -> int:
-        """Wrap flash_attention_core so the identity-matrix slot is always reused.
-
-        The current legacy flash kernel requires IDENTITY_DRAM_ADDR as a kwarg; the
-        old `_next_params_dram_addr` mutation trick is preserved as a defensive
-        no-op for any code path that still expects it.
-        """
-        kwargs.setdefault("IDENTITY_DRAM_ADDR", self.IDENTITY_DRAM_ADDR)
-        saved = self._next_params_dram_addr
-        self._next_params_dram_addr = self._identity_dram_addr
-        result = self.flash_attention_core(**kwargs)
-        self._next_params_dram_addr = saved
-        return result
-
     def dma_write(self, device, addr, data, size):
         """Skip redundant identity-matrix DMA writes (already in DRAM from pre-allocation)."""
         if (self._identity_dram_written
@@ -883,12 +869,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._isa_reg_counter = 5
 
     def alloc_isa_reg(self, reset: bool = False) -> int:
-        """Allocate next ISA register (5-15). Regs 1-4 reserved (TMP/gf_seq_len/gf_q_seq_len/gf_bucket_idx)."""
+        """Allocate next ISA register (5-31). Regs 1-4 are fixed model preamble regs."""
         if reset:
             self._isa_reg_counter = 5
 
-        if self._isa_reg_counter > 15:
-            raise ValueError("Exceeded available ISA registers (max 15)")
+        if self._isa_reg_counter > 31:
+            raise ValueError("Exceeded available ISA registers (max 31)")
 
         reg_idx = self._isa_reg_counter
         self._isa_reg_counter += 1
@@ -940,14 +926,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         params_dram_addr = self._next_params_dram_addr
         self._next_params_dram_addr += size_bytes
         return params_dram_addr
-
-    def clear_inst_id(self) -> None:
-        """Reset instruction ID counter for the next capture."""
-        self._inst_id = 0
-
-    def get_arg_max_index(self) -> int:
-        """Get the arg max index from the Unified Engine"""
-        return self.read_reg32(UE_ARGMAX1_INDEX)
 
     def decoder_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
@@ -1520,13 +1498,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_OUT_HEAD_DRAM = self.allocate_tensor_dram(aligned_seq_len * ahd * bpe)
         # Final assembled flash output (seq_len, head_dim * group_size) = (seq_len, 2048)
         self.LAYER0_FLASH_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.head_dim * self.group_size * bpe)
-        self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(max(ahd, UE_FMAX_CONTEXT_SIZE) * aligned_seq_len * 2 + ahd * aligned_seq_len * 2)
-        # PBI prefill packs FLASH_Q with qpkv rows per token (q_seq_len = PREFILL_MAX_SEQ_LEN * qpkv),
-        # so BIAS and ATTN_P are sized to (prefill_aligned)^2 where prefill_aligned = PREFILL_MAX_SEQ_LEN*qpkv aligned to UE_VECTOR_SIZE.
         prefill_q_seq = self.PREFILL_MAX_SEQ_LEN * self.group_size
         prefill_aligned = ((prefill_q_seq + 63) // 64) * 64
+        max_batch = max(prefill_q_seq, self.group_size)
+        max_aligned_seq_len = max(prefill_aligned, self.MAX_CONTEXT_SIZE)
+        self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(
+            ((ahd + max_aligned_seq_len) * max_aligned_seq_len + max_batch * ahd) * bpe)
+        # PBI prefill packs FLASH_Q with qpkv rows per token (q_seq_len = PREFILL_MAX_SEQ_LEN * qpkv),
+        # so BIAS is sized to (prefill_aligned)^2 where prefill_aligned = PREFILL_MAX_SEQ_LEN*qpkv aligned to UE_VECTOR_SIZE.
         self.LAYER0_FLASH_BIAS_DRAM = self.allocate_tensor_dram(prefill_aligned * prefill_aligned * bpe)
-        self.LAYER0_FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(prefill_aligned * prefill_aligned * bpe)
 
         # Layer intermediate tensors
         self.LAYER0_INPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
@@ -1585,16 +1565,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.VIS_ATTN_OUT_DRAM = self.allocate_tensor_dram(VN * VS * VD_PAD * bpe)
         # Flash attention scratch
         self.VIS_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram(
-            (max(VD_PAD, UE_FMAX_CONTEXT_SIZE) * VS * 2 + VD_PAD * VS * 2))
-        # §7 shared-subroutine vision flash: fixed operand buffers the one flash
-        # body reads/writes; each per-(head,window) call site marshals its segment
-        # in/out. Sized for the largest segment (full attention = VS patches).
+            ((VD_PAD + VS) * VS + VS * VD_PAD) * bpe)
+        # Vision attention fixed buffers. Each per-(head,window) call site marshals
+        # its segment in/out. Sized for the largest segment (full attention = VS patches).
         self.VIS_FLASH_Q_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
         self.VIS_FLASH_K_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
         self.VIS_FLASH_V_DRAM   = self.allocate_tensor_dram(VS * VD_PAD * bpe)
         self.VIS_FLASH_OUT_DRAM = self.allocate_tensor_dram(VS * VD_PAD * bpe)
-        # Bucket dispatcher softmax-intermediate scratch (VS×VS for full attention)
-        self.VIS_ATTN_P_DRAM    = self.allocate_tensor_dram(VS * VS * bpe)
+        self.VIS_ATTN_BIAS_DRAM = self.allocate_tensor_dram(VS * VS * bpe)
+        self.dma_to_accelerator_memory(self.VIS_ATTN_BIAS_DRAM, torch.zeros(VS * VS, dtype=torch.bfloat16))
         # Attention result after inverse permute [1024, 1280]
         self.VIS_ATTN_RESULT_DRAM = self.allocate_tensor_dram(VS * VH * bpe)
         # Unpermuted attention output (trimmed from 128 back to 80) [16, 1024, 80]
@@ -1650,7 +1629,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                                        torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
-        # Pre-allocate the identity matrix used by flash_attention_core
+        # Pre-allocate the identity matrix used by attention cores.
         self._preallocate_identity_matrix()
 
     def _corrected_hw_latency_us(self, wall_time_s: float) -> float:
@@ -1745,7 +1724,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         cache_suffix = f"_{total_layers}L" if total_layers != vis_cfg["depth"] else ""
         if _bf16_mode:
             cache_suffix += "_bf16"
-        enc_prog_key = f"encoder{cache_suffix}"
+        enc_prog_key = f"encoder{cache_suffix}_unified_attention"
 
         _cached = programs_bin_load(self.script_dir, enc_prog_key)
         if _cached is not None:
@@ -1797,33 +1776,25 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         vis_rope_M_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(vis_rope_M_reg, VN * VS)
 
-        # §7 shared-subroutine attention: compile ONE bucketed flash body after the
-        # encoder HALT; every per-(head,window) call site marshals its segment into
-        # the FIXED VIS_FLASH_* buffers and jumps in. Collapses ~4096 inline flash
-        # bodies → 1 (~100 MB → ~6 MB).
-        from user_dma_core import INSTRUCTION_SIZE_BYTES as _INSTR_SZ
-        vis_prog_base = self.get_program_dram_addr()
-        vis_gpr_bucket = self.alloc_isa_reg()
-        vis_gpr_ret    = self.alloc_isa_reg()
-        vis_flash_call_sites: list[int] = []
-        vis_num_buckets = max(1, ((VS + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE))
-
         def _vis_flash_call(q_src, k_src, v_src, out_dst, seg_len):
-            """Marshal one segment's Q/K/V into the fixed flash buffers, jump into
-            the shared flash subroutine, scatter the result to out_dst."""
+            """Marshal one segment's Q/K/V into fixed buffers, run unified attention, scatter to out_dst."""
             elems = seg_len * VD_PAD
             for src, dst in ((q_src, self.VIS_FLASH_Q_DRAM),
                              (k_src, self.VIS_FLASH_K_DRAM),
                              (v_src, self.VIS_FLASH_V_DRAM)):
                 self.accelerator_memory_to_sram(src, 0x00000, elems)
                 self.sram_to_accelerator_memory(0x00000, dst, elems)
-            self.generate_instruction_add_set(vis_gpr_bucket, seg_len // UE_VECTOR_SIZE)
-            self.pad_capture_to_64b_boundary()
-            return_word_addr = ue_35bit_addr_shifter(
-                vis_prog_base + (self.capture_count + 2) * _INSTR_SZ)
-            self.generate_instruction_add_set(vis_gpr_ret, return_word_addr)
-            vis_flash_call_sites.append(self.capture_count)
-            self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+            self.unified_attention_core(
+                batch=seg_len,
+                aligned_seq_len=seg_len,
+                head_dim=VD_PAD,
+                Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM,
+                K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
+                V_DRAM_ADDR=self.VIS_FLASH_V_DRAM,
+                BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM,
+                OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
+                SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
+                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR)
             self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
             self.sram_to_accelerator_memory(0x00000, out_dst, elems)
 
@@ -1926,7 +1897,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     sin_dram_addr=self.VIS_ROPE_SIN_DRAM,
                     gpr_M_reg=vis_rope_M_reg)
 
-            # flash_attention_core scales by 1/sqrt(128) instead of 1/sqrt(80).
+            # Attention uses the padded head dim scale 1/sqrt(128) instead of 1/sqrt(80).
             # The softer attention (sqrt(128)) is more robust to INT4 quantization noise
             # and empirically gives better end-to-end results than correcting to sqrt(80).
             fullatt_indexes = set(vis_cfg.get("fullatt_block_indexes", [7, 15, 23, 31]))
@@ -2074,28 +2045,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         _original_print()  # newline after \r progress
 
-        # End of the normal execution path. The shared flash subroutine follows
-        # and is only reachable via the per-call-site JUMP_ABS placeholders above.
         self.generate_instruction_halt()
-
-        # §7: compile the bucketed flash body ONCE, then patch every call-site jump.
-        self.pad_capture_to_64b_boundary()
-        vis_sub_start, _vis_sub_flops = self.flash_attention_core(
-            head_dim=VD_PAD, seq_len=VS,
-            Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.VIS_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            ATTN_P_DRAM_ADDR=self.VIS_ATTN_P_DRAM,
-            gpr_bucket_idx=vis_gpr_bucket,
-            num_buckets=vis_num_buckets,
-            gpr_ret_id=vis_gpr_ret)
-        for _idx in vis_flash_call_sites:
-            self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(vis_sub_start))
-        self.release_isa_reg()  # vis_gpr_ret
-        self.release_isa_reg()  # vis_gpr_bucket
 
         # Finalize single program
         self.stop_capture()
@@ -2310,13 +2260,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         Caller wraps in start_capture()/stop_capture(). Program ends with a halt
         so it can be jumped to via a runtime preamble that primes
-        gf_seq_len / gf_q_seq_len / gf_bucket_idx.
+        gf_seq_len / gf_q_seq_len / gf_aligned_seq_len.
 
         ``seq_len`` is a compile-time template for FLOPS bookkeeping and
         static ``M=`` args. K/V/Q scatters and FLASH_OUTPUT assembly use PBI
         runtime loops keyed off gf_seq_len. rms_norm/matmat/rope use
-        ``gpr_M_reg=gf_seq_len`` (or TMP_REG holding gf_seq_len*mult for QK
-        heads). Flash dispatches on gf_bucket_idx.
+        ``gpr_M_reg=gf_seq_len``. Attention receives runtime batch and aligned
+        sequence length through the fixed GPRs.
 
         Qwen2.5-VL specifics vs Dave's qwen3:
           - Q/K/V have biases (C_DRAM_ADDR=la['*_bias']).
@@ -2327,7 +2277,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         """
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
-        num_buckets_prefill = max(1, aligned_seq_len // UE_VECTOR_SIZE)
 
         ahd  = self.actual_head_dim
         nkvh = self.num_kv_heads
@@ -2437,22 +2386,19 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     template_seq_len=seq_len,
                 )
 
-                # Bucketed flash attention; bucket_idx GPR selects body at runtime.
-                flash_result = self.flash_attention_core(
+                total_flops += (self.unified_attention_core(
+                    batch=q_seq_len,
+                    aligned_seq_len=aligned_seq_len,
                     head_dim=ahd,
-                    seq_len=aligned_seq_len,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
                     K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
                     V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-                    gpr_bucket_idx=self.gf_bucket_idx,
-                    num_buckets=num_buckets_prefill,
-                )
-                total_flops += (flash_result[num_buckets_prefill - 1]
-                                if isinstance(flash_result, (list, tuple)) else (flash_result or 0))
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    gpr_batch_reg=self.gf_q_seq_len,
+                    gpr_aligned_seq_len_reg=self.gf_aligned_seq_len) or 0)
 
                 # Assemble: per token, copy qpkv rows from FLASH_OUT_HEAD[t*qpkv:(t+1)*qpkv]
                 # to FLASH_OUTPUT[t][kv_h*qpkv:(kv_h+1)*qpkv].
@@ -2596,7 +2542,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     def run_prefill(self, prefill_program_addr: int, preamble_addr: int,
                     prefill_seq, gflops: int = None, has_image: bool = False) -> dict:
         """Run prefill via runtime preamble that primes gf_seq_len / gf_q_seq_len /
-        gf_bucket_idx and JUMP_ABS into the cached prefill program. Handles any
+        gf_aligned_seq_len and JUMP_ABS into the cached prefill program. Handles any
         actual_seq_len ≤ PREFILL_MAX_SEQ_LEN."""
         if prefill_seq is None:
             prefill_seq = tuple(self._cfg["default_prefill_tokens"])
@@ -2614,7 +2560,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         q_seq_len = actual_seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
-        bucket_idx = max(1, aligned_seq_len // UE_VECTOR_SIZE)
 
         # Gather text embeddings and merge vision tokens if present.
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
@@ -2651,9 +2596,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Emit runtime preamble: ADD_SETs for the 3 GPRs + JUMP_ABS into prefill.
         self.clear_inst_id()
         self.start_capture()
-        self.generate_instruction_add_set(self.gf_seq_len,    actual_seq_len)
-        self.generate_instruction_add_set(self.gf_q_seq_len,  q_seq_len)
-        self.generate_instruction_add_set(self.gf_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gf_seq_len, actual_seq_len)
+        self.generate_instruction_add_set(self.gf_q_seq_len, q_seq_len)
+        self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -2662,7 +2607,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.start_execute_from_dram(preamble_addr)
         wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(180.0), label="prefill")
         latency_us = self._corrected_hw_latency_us(wall_s)
-        print(f"    Prefill executed: actual_seq_len={actual_seq_len}, q_seq_len={q_seq_len}, bucket_idx={bucket_idx}")
+        print(f"    Prefill executed: actual_seq_len={actual_seq_len}, q_seq_len={q_seq_len}, aligned_seq_len={aligned_seq_len}")
 
         # Throughput: theoretical model FLOPs at the ACTUAL seq len / measured HW latency.
         total_flops = self.prefill_theoretical_flops(actual_seq_len)
@@ -2791,20 +2736,20 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.seq_len = seq_len_before + 1
         step_pos = self.seq_len - 1
         aligned_seq_len = ((self.seq_len + 63) // 64) * 64
-        bucket_idx = max(1, aligned_seq_len // UE_VECTOR_SIZE)
         rope_pos = step_pos + getattr(self, '_rope_offset', 0)
         cos_abs_addr = ROPE_BASE + rope_pos * rope_row_bytes
 
         emb = self.get_embedding_for_tokens([token_id])
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, emb)
-        bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
-        bias_host[0, :self.seq_len] = 0.0
+        bias_host = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+        bias_host[:, :self.seq_len] = 0.0
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
 
         self.clear_inst_id()
         self.start_capture()
         self.generate_instruction_add_set(self.gf_seq_len, step_pos)
-        self.generate_instruction_add_set(self.gf_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gf_q_seq_len, self.seq_len)
+        self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
         self.generate_instruction_add_set(self._gf_rope_cos_abs, ue_35bit_addr_shifter(cos_abs_addr))
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(program_addr))
         self.stop_capture()
@@ -2862,16 +2807,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         Caller wraps this in start_capture()/stop_capture(). The emitted program
         ends with ADD_INC gf_seq_len + halt so it can be jumped to via a runtime
-        preamble that primes gf_bucket_idx and gf_rope_cos_abs each step (and
-        on first decode, gf_seq_len too).
+        preamble that primes gf_q_seq_len, gf_aligned_seq_len, and gf_rope_cos_abs
+        each step.
 
         Address math: K/V cache write addresses are computed at runtime as
         ``base + gf_seq_len * (ahd*bpe)`` via reg_mul_imm + add_imm into TMP_REG,
         then passed as ``general_reg_src=TMP_REG`` to the scatter store.
 
-        Decoder attention uses ``decoder_group_attention_core`` with PBI bucket
-        dispatch on ``gf_bucket_idx``; one call per KV head processes all qpkv
-        Q heads. Each bucket body covers exactly the active KV range.
+        Decoder attention uses per-KV-head ``unified_attention_core``; each call
+        processes all qpkv Q heads against the active KV range.
 
         All bulk ops use ``gpr_M_reg=gf_one`` (M=1) for consistency.
         """
@@ -2882,25 +2826,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         hd   = self.head_dim
         rope_row_bytes = ahd * 2 * bpe   # 512 B per token
 
-        # Bucketing: each bucket body covers seq_len = i * UE_VECTOR_SIZE,
-        # i = 1..num_buckets_decoder. Must cover MAX_CONTEXT_SIZE.
-        num_buckets_decoder = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE
 
         # Reset dynamic GPR allocator.
-        # §7 shared-subroutine decode attention: decoder_group_attention_core compiled ONCE
-        # after HALT; every (layer, kv_head) call site sets gf_ret_id and jumps in.
-        # Three persistent regs survive the layer loop:
-        #   gf_ret_id       (5) — §7 subroutine return-address reg
-        #   gf_one          (6) — gpr_M_reg for M=1 matmul/norm ops
-        #   gf_rope_cos_abs (7) — absolute cos-base addr, primed per step by preamble
-        # Subroutine allocates from counter 8 to stay above all three.
+        # Two persistent regs survive the layer loop:
+        #   gf_one          — gpr_M_reg for M=1 matmul/norm ops
+        #   gf_rope_cos_abs — absolute cos-base addr, primed per step by preamble
         self._isa_reg_counter = 5
-        gf_ret_id          = self.alloc_isa_reg()
         gf_one             = self.alloc_isa_reg()
         gf_rope_cos_abs    = self.alloc_isa_reg()
-        program_dram_base  = self.get_program_dram_addr()
-        call_site_jump_capture_indices: list = []
         # Stash for run_decoder preamble to use the same indices.
         self._gf_one          = gf_one
         self._gf_rope_cos_abs = gf_rope_cos_abs
@@ -2958,7 +2892,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
                     gr_weight_dram=gf_rope_cos_abs) or 0)
 
-            # Per-KV-head: store new K/V to cache at gf_seq_len position, then decoder_group_attention.
+            # Per-KV-head: store new K/V to cache at gf_seq_len position, then unified attention.
             for kv_h in range(nkvh):
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
                                 + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
@@ -2977,16 +2911,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     sram_address=0x10000, accelerator_dram_address=0,
                     element_size=ahd, general_reg_src=self.TMP_REG)
 
-                # §7: gather valid K history (incl. just-written token) from cache → FLASH_K.
-                # PBI loop over gf_bucket_idx buckets, each UE_VECTOR_SIZE tokens.
+                # Gather valid K history (incl. just-written token) from cache → FLASH_K.
                 self._emit_pbi_scatter_per_token(
                     read_base=k_cache_base,
-                    read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
-                    write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    read_stride_bytes=ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_K_DRAM, ahd * bpe)],
                     sram_byte_addr=0x10000,
-                    element_count=UE_VECTOR_SIZE * ahd,
-                    gf_seq_len=self.gf_bucket_idx,
-                    template_seq_len=num_buckets_decoder,
+                    element_count=ahd,
+                    gf_seq_len=self.gf_q_seq_len,
+                    template_seq_len=self.MAX_CONTEXT_SIZE,
                 )
 
                 # V cache write
@@ -2999,15 +2932,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     sram_address=0x20000, accelerator_dram_address=0,
                     element_size=ahd, general_reg_src=self.TMP_REG)
 
-                # §7: gather valid V history from cache → FLASH_V.
+                # Gather valid V history from cache → FLASH_V.
                 self._emit_pbi_scatter_per_token(
                     read_base=v_cache_base,
-                    read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
-                    write_specs=[(self.LAYER0_FLASH_V_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
+                    read_stride_bytes=ahd * bpe,
+                    write_specs=[(self.LAYER0_FLASH_V_DRAM, ahd * bpe)],
                     sram_byte_addr=0x20000,
-                    element_count=UE_VECTOR_SIZE * ahd,
-                    gf_seq_len=self.gf_bucket_idx,
-                    template_seq_len=num_buckets_decoder,
+                    element_count=ahd,
+                    gf_seq_len=self.gf_q_seq_len,
+                    template_seq_len=self.MAX_CONTEXT_SIZE,
                 )
 
                 # Gather qpkv Q heads for this KV head into FLASH_Q (contiguous: 0, ahd*bpe, ...)
@@ -3017,15 +2950,20 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
                     self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
 
-                # §7 call-site jump into the shared decode-attention subroutine.
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(gf_ret_id, return_word_addr)
-                call_site_jump_capture_indices.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                total_flops += (self.unified_attention_core(
+                    batch=qpkv,
+                    aligned_seq_len=self.MAX_CONTEXT_SIZE,
+                    head_dim=ahd,
+                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    gpr_aligned_seq_len_reg=self.gf_aligned_seq_len) or 0)
 
-                # Copy subroutine output (FLASH_OUT_HEAD) → this head's slot in FLASH_OUTPUT.
+                # Copy attention output (FLASH_OUT_HEAD) → this head's slot in FLASH_OUTPUT.
                 self.accelerator_memory_to_sram(self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
                 self.sram_to_accelerator_memory(
                     0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
@@ -3091,29 +3029,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_inc(self.gf_seq_len)
         self.generate_instruction_halt()
 
-        # §7: compile decoder_group_attention_core ONCE as a subroutine after HALT.
-        # Do NOT lower _isa_reg_counter: the subroutine allocates from the current
-        # counter (8) so its scratch regs stay above gf_ret_id(5)/gf_one(6)/gf_rope_cos_abs(7),
-        # all of which are live when the subroutine is called mid-layer.
-        self.pad_capture_to_64b_boundary()
-        dec_sub_start, dec_attn_flops = self.decoder_group_attention_core(
-            group_size=qpkv,
-            head_dim=ahd,
-            seq_len=self.MAX_CONTEXT_SIZE,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            gpr_bucket_idx=self.gf_bucket_idx,
-            num_buckets=num_buckets_decoder,
-            gpr_ret_id=gf_ret_id,
-        )
-        total_flops += (dec_attn_flops[-1] if isinstance(dec_attn_flops, (list, tuple)) else (dec_attn_flops or 0)) * layer_size * nkvh
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(jump_idx, ue_35bit_addr_shifter(dec_sub_start))
         return total_flops
 
     def compile_decoder(self, layer_size: int | None = None) -> tuple[int, int]:
@@ -3132,7 +3047,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Cache key: "penalty_bias_argmax" identifies the on-FPGA penalty LM head
         # (C_DRAM_ADDR=PENALTY_BIAS_DRAM, write_back_disable=True). A stale bin from
         # the old host-side repetition-penalty build (missing or different key) is recompiled.
-        lm_head_sig = "penalty_bias_argmax_s7dec"
+        lm_head_sig = "penalty_bias_argmax_unified_attention"
         cache_hit = False
         prog_bytes = None
         meta = {}
@@ -3150,9 +3065,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.dma_write(DMA_DEVICE_H2C, decoder_program_addr, prog_bytes, len(prog_bytes))
             self.allocate_program_dram(len(prog_bytes))
             total_flops = meta["total_flops"]
-            # Restore the GPR indices _emit_decoder_program would have allocated (6, 7).
-            self._gf_one          = 6
-            self._gf_rope_cos_abs = 7
+            # Restore the GPR indices _emit_decoder_program would have allocated.
+            self._gf_one          = 5
+            self._gf_rope_cos_abs = 6
             print(f"  Decoder loaded from cache ({len(prog_bytes)} bytes) at 0x{decoder_program_addr:X}")
         else:
             global _SILENT_MODE
@@ -3227,8 +3142,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
     def run_decoder(self, decoder_program_addr: int, token_id: int,
                     gflops: int | None = None) -> int:
-        """Run PBI decode loop. Per-step preamble primes gf_seq_len / gf_bucket_idx /
-        gf_rope_cos_abs, then JUMP_ABS into the single cached decoder program. Breaks on EOS/EOT.
+        """Run PBI decode loop. Per-step preamble primes gf_seq_len / gf_q_seq_len /
+        gf_aligned_seq_len / gf_rope_cos_abs, then JUMP_ABS into the cached decoder program. Breaks on EOS/EOT.
         Token selection is always the HW argmax of (logits + PENALTY_BIAS_DRAM); no logit readback.
         """
         if token_id is None:
@@ -3288,23 +3203,23 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.seq_len += 1
             step_pos = self.seq_len - 1  # KV-fill index for THIS step
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
-            bucket_idx = max(1, aligned_seq_len // UE_VECTOR_SIZE)
             rope_pos = step_pos + getattr(self, '_rope_offset', 0)
             cos_abs_addr = ROPE_BASE + rope_pos * rope_row_bytes
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
 
-            bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
-            bias_host[0, :self.seq_len] = 0.0
+            bias_host = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+            bias_host[:, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
 
-            # Per-step preamble: prime 3 GPRs + JUMP_ABS into cached decoder program.
+            # Per-step preamble: prime runtime GPRs + JUMP_ABS into cached decoder program.
             self.clear_inst_id()
             self.start_capture()
-            self.generate_instruction_add_set(self.gf_seq_len,         step_pos)
-            self.generate_instruction_add_set(self.gf_bucket_idx,      bucket_idx)
-            self.generate_instruction_add_set(self._gf_rope_cos_abs,   ue_35bit_addr_shifter(cos_abs_addr))
+            self.generate_instruction_add_set(self.gf_seq_len, step_pos)
+            self.generate_instruction_add_set(self.gf_q_seq_len, self.seq_len)
+            self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
+            self.generate_instruction_add_set(self._gf_rope_cos_abs, ue_35bit_addr_shifter(cos_abs_addr))
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
             self.write_captured_instructions_to_dram(preamble_addr)
@@ -3349,7 +3264,7 @@ REPO_ROOT = PROJECT_ROOT
 # PLAIN 1D rope (never load_mrope_for_prefill). Vision section only sizes (unused)
 # DRAM buffers since MoonViT runs on GPU in stage 1.
 _FPGA_CFG = {
-    "fixed_isa_regs": {"TMP_REG": 1, "GF_SEQ_LEN_REG": 2, "GF_Q_SEQ_LEN_REG": 3, "GF_BUCKET_IDX_REG": 4},
+    "fixed_isa_regs": {"TMP_REG": 1, "GF_SEQ_LEN_REG": 2, "GF_Q_SEQ_LEN_REG": 3, "GF_ALIGNED_SEQ_LEN_REG": 4},
     "file_info": {"layer_size": 40965632, "num_layers": 36, "head_dim": 256, "actual_head_dim": 128,
                   "num_kv_heads": 2, "hidden_size": 2048, "embedding_vocab": 152704, "group_size": 8,
                   "mlp_elements": 11008, "bytes_per_element": 2},
@@ -3824,6 +3739,8 @@ def _run_decode_only():
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dev", type=str, default="xdma0",
+                    help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
     ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "vette.jpg"))
     ap.add_argument("--prompt-kind", default="detect",
                     choices=["detect", "ground_multi", "ground_one", "point"])
@@ -3864,6 +3781,9 @@ def main():
                     help="run the CPU reference decoder bf16 vs if4 vs tq4 on the same vision "
                          "output and print a quant-fidelity comparison at the very bottom")
     args = ap.parse_args()
+    set_dma_device(args.dev)
+    global DMA_DEVICE_H2C
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
 
     # ==================================================================
     # DEBUG CONFIG (no flags needed). Flip these in code.
@@ -4475,7 +4395,7 @@ def moonvit_setup_dram(ue, N, cfg):
     ue.MV_SM_DEBUG = ue.allocate_tensor_dram(N * N * bpe)
     ue.dma_to_accelerator_memory(ue.MV_SM_DEBUG, torch.zeros(N * N, dtype=torch.bfloat16))
     ue.MV_ATTN_SCRATCH = ue.allocate_tensor_dram(
-        (max(VD_PAD, UE_FMAX_CONTEXT_SIZE) * N * 2 + VD_PAD * N) * bpe)
+        ((VD_PAD + N) * N + N * VD_PAD) * bpe)
     # attention result kept in padded head layout [N, VN*VD_PAD]; o-proj weight zero-pads
     ue.MV_ATTN_RESULT = ue.allocate_tensor_dram(N * VN * VD_PAD * bpe)
     ue.MV_O_PROJ = ue.allocate_tensor_dram(N * VH * bpe)
@@ -4489,12 +4409,11 @@ def moonvit_setup_dram(ue, N, cfg):
     ue.MV_ROPE_COS = ue.MV_ROPE
     ue.MV_ROPE_SIN = ue.MV_ROPE + VD_PAD * bpe
     ue.MV_PERM_TEMP = ue.allocate_tensor_dram(VN * N * VD_PAD * bpe * 2)
-    # §7 shared-subroutine flash fixed operand buffers (one flash body for all heads/layers).
+    # MoonViT attention fixed operand buffers, one head at a time.
     ue.MV_FLASH_Q   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
     ue.MV_FLASH_K   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
     ue.MV_FLASH_V   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
     ue.MV_FLASH_OUT = ue.allocate_tensor_dram(N * VD_PAD * bpe)
-    ue.MV_ATTN_P    = ue.allocate_tensor_dram(N * N * bpe)
     # Flash BIAS [N, N] row-major (added to QK^T before softmax): mask padded KEY
     # columns (>= N_real) with a large negative so real queries ignore them. Same mask
     # for every head/layer (depends only on key index).
@@ -4595,7 +4514,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     # weight/tensor addresses + absolute jumps, so reload is valid only when load_weights/
     # setup_dram ran first and the program lands at the same addr (deterministic alloc order). ---
     os.makedirs(_BIN_DIR, exist_ok=True)
-    moonvit_key = f"moonvit_encoder_N{N}_{prec}_pbi"
+    moonvit_key = f"moonvit_encoder_N{N}_{prec}_unified_attention"
     _cached = programs_bin_load(os.path.dirname(_BIN_DIR), moonvit_key)
     if _cached is not None:
         prog, _ = _cached
@@ -4634,27 +4553,23 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     vis_M_reg = ue.alloc_isa_reg()
     ue.generate_instruction_add_set(vis_M_reg, N)
 
-    # §7 shared-subroutine flash: one body after HALT, all per-head call sites jump in.
-    from user_dma_core import INSTRUCTION_SIZE_BYTES as _INSTR_SZ
-    mv_prog_base = ue.get_program_dram_addr()
-    mv_gpr_bucket = ue.alloc_isa_reg()
-    mv_gpr_ret    = ue.alloc_isa_reg()
-    mv_flash_call_sites: list[int] = []
-    mv_num_buckets = max(1, ((N + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE))
-
     def _mv_flash_call(q_src, k_src, v_src, out_dst):
-        """Marshal one head's Q/K/V into fixed flash buffers, jump into shared subroutine."""
+        """Marshal one head's Q/K/V into fixed buffers and run unified attention."""
         elems = N * VD_PAD
         for src, dst in ((q_src, ue.MV_FLASH_Q), (k_src, ue.MV_FLASH_K), (v_src, ue.MV_FLASH_V)):
             ue.accelerator_memory_to_sram(src, 0x00000, elems)
             ue.sram_to_accelerator_memory(0x00000, dst, elems)
-        ue.generate_instruction_add_set(mv_gpr_bucket, N // UE_VECTOR_SIZE)
-        ue.pad_capture_to_64b_boundary()
-        return_word_addr = ue_35bit_addr_shifter(
-            mv_prog_base + (ue.capture_count + 2) * _INSTR_SZ)
-        ue.generate_instruction_add_set(mv_gpr_ret, return_word_addr)
-        mv_flash_call_sites.append(ue.capture_count)
-        ue.generate_instruction_jump_abs(target_instruction_word_addr=0)
+        ue.unified_attention_core(
+            batch=N,
+            aligned_seq_len=N,
+            head_dim=VD_PAD,
+            Q_DRAM_ADDR=ue.MV_FLASH_Q,
+            K_DRAM_ADDR=ue.MV_FLASH_K,
+            V_DRAM_ADDR=ue.MV_FLASH_V,
+            BIAS_DRAM_ADDR=ue.MV_ATTN_BIAS,
+            OUTPUT_DRAM_ADDR=ue.MV_FLASH_OUT,
+            SCRATCH_DRAM_ADDR=ue.MV_ATTN_SCRATCH,
+            IDENTITY_DRAM_ADDR=ue.IDENTITY_DRAM_ADDR)
         ue.accelerator_memory_to_sram(ue.MV_FLASH_OUT, 0x00000, elems)
         ue.sram_to_accelerator_memory(0x00000, out_dst, elems)
 
@@ -4687,7 +4602,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
                                  gpr_M_reg=vis_M_reg)
         ue.generate_instruction_add_set(vis_M_reg, N)
 
-        # --- per-head flash via shared subroutine (§7) ---
+        # --- per-head attention ---
         for h in range(VN):
             _mv_flash_call(ue.MV_Q_PAD + h * head_stride_pad,
                            ue.MV_K_PAD + h * head_stride_pad,
@@ -4725,29 +4640,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
                             params_dram_addr=ue.VIS_PERMUTE_PARAMS_DRAM,
                             temp_dram_start=ue.MV_PERM_TEMP)
 
-    # End of main execution path. Flash subroutine follows, reachable only via JUMP_ABS.
     ue.generate_instruction_halt()
-
-    # §7: compile ONE bucketed flash body, patch all call-site jumps to its entry.
-    # MV_ATTN_BIAS is constant (same padding mask for every head/layer) — baked in.
-    ue.pad_capture_to_64b_boundary()
-    mv_sub_start, _ = ue.flash_attention_core(
-        head_dim=VD_PAD, seq_len=N,
-        Q_DRAM_ADDR=ue.MV_FLASH_Q,
-        K_DRAM_ADDR=ue.MV_FLASH_K,
-        V_DRAM_ADDR=ue.MV_FLASH_V,
-        OUTPUT_DRAM_ADDR=ue.MV_FLASH_OUT,
-        SCRATCH_DRAM_ADDR=ue.MV_ATTN_SCRATCH,
-        IDENTITY_DRAM_ADDR=ue.IDENTITY_DRAM_ADDR,
-        ATTN_P_DRAM_ADDR=ue.MV_ATTN_P,
-        BIAS_DRAM_ADDR=ue.MV_ATTN_BIAS,
-        gpr_bucket_idx=mv_gpr_bucket,
-        num_buckets=mv_num_buckets,
-        gpr_ret_id=mv_gpr_ret)
-    for _idx in mv_flash_call_sites:
-        ue._patch_jump_immediate(_idx, ue_35bit_addr_shifter(mv_sub_start))
-    ue.release_isa_reg()  # mv_gpr_ret
-    ue.release_isa_reg()  # mv_gpr_bucket
 
     ue.stop_capture()
     _SILENT_MODE = False
@@ -4889,42 +4782,23 @@ def moonvit_run_staged(ue, cfg, grid_hw, stop_after=None, check=True, timeout_s=
                                          gpr_M_reg=r)
         step(f"{L}.rope", rope_emit, ue.MV_Q_PAD, (VN * N, VD_PAD))
 
-        # Flash PER HEAD, head 0 with the debug tap: dump softmax(QK^T) so we can see
-        # whether the NaN is born in QK^T/softmax (SM dump NaN) or in the ×V stage
-        # (SM finite, output NaN).
-        bias_addr = ue.MV_ATTN_BIAS if mask_pad else None
+        # Attention per head. Staged debug no longer has the legacy softmax dump tap.
+        bias_addr = ue.MV_ATTN_BIAS if mask_pad else ue.MV_SM_DEBUG
         for h in range(VN):
-            dbg = (h == 0)
-
-            def flash_emit(h=h, dbg=dbg):
-                ue._flash_attention_core_cached(
-                    head_dim=VD_PAD, seq_len=N,
+            def flash_emit(h=h):
+                ue.unified_attention_core(
+                    batch=N,
+                    aligned_seq_len=N,
+                    head_dim=VD_PAD,
                     Q_DRAM_ADDR=ue.MV_Q_PAD + h * head_stride_pad,
                     K_DRAM_ADDR=ue.MV_K_PAD + h * head_stride_pad,
                     V_DRAM_ADDR=ue.MV_V_PAD + h * head_stride_pad,
+                    BIAS_DRAM_ADDR=bias_addr,
                     OUTPUT_DRAM_ADDR=ue.MV_ATTN_OUT + h * head_stride_pad,
-                    SCRATCH_DRAM_ADDR=ue.MV_ATTN_SCRATCH, BIAS_DRAM_ADDR=bias_addr,
-                    debug_mode=dbg, SM_OUTPUT_DRAM_ADDR=(ue.MV_SM_DEBUG if dbg else None))
+                    SCRATCH_DRAM_ADDR=ue.MV_ATTN_SCRATCH,
+                    IDENTITY_DRAM_ADDR=ue.IDENTITY_DRAM_ADDR)
 
-            if dbg:
-                # run flash, then check the softmax dump BEFORE the output, no auto-assert,
-                # so we see both numbers regardless of which is NaN.
-                _step(ue, f"{L}.flash_h{h}", flash_emit, check=False, timeout_s=timeout_s)
-                sm = ue.dma_from_accelerator_memory(ue.MV_SM_DEBUG, (N, N)).float()[:N_real, :N_real]
-                out = ue.dma_from_accelerator_memory(ue.MV_ATTN_OUT, (N, VD_PAD)).float()[:N_real]
-                # V^T sits at the start of SCRATCH after the first (I@V^T) matmul: [head_dim, seq]
-                vt = ue.dma_from_accelerator_memory(ue.MV_ATTN_SCRATCH, (VD_PAD, N)).float()
-                print(f"  [V^T (scratch) ] {tuple(vt.shape)}  nan={int(torch.isnan(vt).sum())} "
-                      f"inf={int(torch.isinf(vt).sum())} absmax={float(vt.abs().max()):.4g}")
-                print(f"  [softmax(QK^T)] {tuple(sm.shape)}  nan={int(torch.isnan(sm).sum())} "
-                      f"inf={int(torch.isinf(sm).sum())} absmax={float(sm.abs().max()):.4g} "
-                      f"rowsum0={float(sm[0].sum()):.4g}")
-                print(f"  [attn ×V out  ] {tuple(out.shape)}  nan={int(torch.isnan(out).sum())} "
-                      f"inf={int(torch.isinf(out).sum())} absmax={float(out.abs().max()):.4g}")
-                assert not (torch.isnan(sm).any() or torch.isnan(out).any()), \
-                    "flash NaN — see which of softmax/×V above is bad"
-            else:
-                step(f"{L}.flash_h{h}", flash_emit, ue.MV_ATTN_OUT + h * head_stride_pad, (N, VD_PAD))
+            step(f"{L}.flash_h{h}", flash_emit, ue.MV_ATTN_OUT + h * head_stride_pad, (N, VD_PAD))
 
         step(f"{L}.inv_perm",
              lambda: smart_bf16_permute_core(

@@ -335,6 +335,10 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         self.ROPE_SIZE_REG = fixed["ROPE_SIZE_REG"]
         self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
         self.gpr_seq_len = fixed["GPR_SEQ_LEN_REG"]
+        # gpr_q_seq_len / gpr_aligned_seq_len feed unified_attention_core's dynamic
+        # batch / aligned_seq_len GPRs (see _compile_prefill_program / _compile_decoder_program).
+        self.gpr_q_seq_len = fixed["GPR_Q_SEQ_LEN_REG"]
+        self.gpr_aligned_seq_len = fixed["GPR_ALIGNED_SEQ_LEN_REG"]
         self._isa_reg_counter = max(fixed.values()) + 1  # must start past all fixed ISA regs
         self.causal_mask_upper = False
         self._rope_global_layers = set(model["rope_global_layers"])
@@ -541,21 +545,9 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         _SILENT_MODE = True
-        num_bucket = (self.PREFILL_CONTEXT_SIZE * self.group_size + 63) // 64
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
 
-        # Layer-invariant constants the flash subroutine needs after the layer loop.
-        ahd  = self.actual_head_dim   # 128
-        nkvh = self.num_kv_heads      # 8
-
-        # flash_attention_core is compiled once as a subroutine after the layer loop; each
-        # call site primes gpr_ret_id with its return word address then jumps to the
-        # subroutine, which returns via JUMP_REG_ABS(gpr_ret_id). All KV-head/layer attentions
-        # share one instruction body, shrinking the program image dramatically.
-        program_dram_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-        call_site_jump_capture_indices: list[int] = []
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             if layer_idx != 0:
@@ -676,15 +668,24 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                         template_seq_len=seq_len,
                     )
 
-                # Call the flash-attention subroutine (compiled once after the layer loop).
-                # Pad so capture_count is even; return address = capture_count + 2
-                # (ADD_SET + JUMP_ABS), which is then also even = 512-bit aligned.
-                self.pad_capture_to_64b_boundary()
-                return_word_addr = ue_35bit_addr_shifter(
-                    program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                call_site_jump_capture_indices.append(self.capture_count)
-                self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                # Scaled dot-product attention for this KV head's qpkv query heads,
+                # called inline per KV head (unified_attention_core replaces the old
+                # shared flash_attention_core subroutine + JUMP_ABS call-site pattern).
+                attn_result = self.unified_attention_core(
+                    batch=q_seq_len,
+                    aligned_seq_len=aligned_seq_len,
+                    head_dim=ahd,
+                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    gpr_batch_reg=self.gpr_q_seq_len,
+                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                )
+                total_flops += attn_result or 0
 
                 # Assemble output into LAYER0_FLASH_OUTPUT_DRAM
                 # Standard GQA layout per token: [kv0_q0(64), kv0_q1..q3, kv1_q0..q3, ...]
@@ -759,35 +760,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gpr_seq_len,
             )
-        # HALT ends the normal execution path; the flash_attention subroutine follows and
-        # is only reachable via the JUMP_ABS call sites within the layer loop above.
         self.generate_instruction_halt()
-
-        # Compile the flash_attention subroutine after the HALT; bucket bodies return via
-        # JUMP_REG_ABS(gpr_ret_id), which each call site pre-loaded with its return address.
-        flash_sub_start_inst_dram_addr, flash_flops = self.flash_attention_core(
-            head_dim=ahd,
-            seq_len=aligned_seq_len,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_bucket,
-            gpr_ret_id=gpr_ret_id,
-        )
-        total_flops += flash_flops[num_bucket - 1] * layer_size * nkvh
-
-        # Patch all call-site JUMP_ABS placeholders to point at the flash subroutine.
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(
-                jump_idx, ue_35bit_addr_shifter(flash_sub_start_inst_dram_addr))
-
-        self.release_isa_reg()  # gpr_ret_id
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"size_bytes": prefill_program_size, "flops": total_flops}
@@ -801,13 +774,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         count_at_start = self.capture_count
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         total_flops = 0
-
-        # decoder_group_attention_core compiled once as a subroutine after HALT; each call
-        # site primes gpr_ret_id then jumps in, and the bucket body returns via
-        # JUMP_REG_ABS(gpr_ret_id). One shared body for all KV-head/layer decode attentions.
-        program_dram_base = self.get_program_dram_addr()
-        gpr_ret_id = self.alloc_isa_reg()
-        call_site_jump_capture_indices: list[int] = []
+        decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -918,13 +885,23 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                             self.LAYER0_Q_DRAM + (kv_h * qpkv + q) * ahd * bpe, 0x30000, ahd)
                         self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
 
-                    # Call the decoder-attention subroutine (compiled once after HALT).
-                    self.pad_capture_to_64b_boundary()
-                    return_word_addr = ue_35bit_addr_shifter(
-                        program_dram_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
-                    self.generate_instruction_add_set(gpr_ret_id, return_word_addr)
-                    call_site_jump_capture_indices.append(self.capture_count)
-                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                    # Scaled dot-product attention for this KV head's qpkv query heads,
+                    # called inline per KV head (unified_attention_core replaces the old
+                    # shared decoder_group_attention_core subroutine + JUMP_ABS call-site).
+                    attn_result = self.unified_attention_core(
+                        batch=qpkv,
+                        aligned_seq_len=decoder_aligned_seq_len,
+                        head_dim=ahd,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
+                        V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM + self.k_size,
+                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                        gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                    )
+                    total_flops += attn_result or 0
 
                     # Copy this head's output (qpkv*ahd) to its slot in FLASH_OUTPUT_DRAM.
                     self.accelerator_memory_to_sram(
@@ -978,37 +955,6 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                 write_back_disable=True, **penalty_kwargs)
 
         self.generate_instruction_halt()
-        self.pad_capture_to_64b_boundary()
-
-        # Compile decoder_group_attention_core once as a subroutine after HALT; the bucket
-        # body returns via JUMP_REG_ABS(gpr_ret_id). Reads K/V from the fixed FLASH_K / FLASH_V
-        # buffers (gathered per call site) and Q from FLASH_Q base; writes FLASH_OUT_HEAD.
-        num_buckets = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-        ahd = self.actual_head_dim
-        bpe = self.bytes_per_element
-        qpkv = self.group_size
-        dec_sub_start_addr, dec_attn_flops = self.decoder_group_attention_core(
-            group_size=qpkv,
-            head_dim=ahd,
-            seq_len=self.MAX_CONTEXT_SIZE,
-            gpr_bucket_idx=self.gpr_bucket_idx,
-            num_buckets=num_buckets,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-            V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM + self.k_size,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            gpr_ret_id=gpr_ret_id,
-        )
-        total_flops += dec_attn_flops[-1] * layer_size * self.num_kv_heads
-
-        for jump_idx in call_site_jump_capture_indices:
-            self._patch_jump_immediate(
-                jump_idx, ue_35bit_addr_shifter(dec_sub_start_addr))
-
-        self.release_isa_reg()  # gpr_ret_id
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"program_size_bytes": decoder_program_size, "total_flops": total_flops}
@@ -1182,11 +1128,14 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
         flops_prefill = flops_prefill_template * prefill_seq_len // max(template_seq_len, 1)
 
-        # Prefill preamble: prime gpr_seq_len + gpr_bucket_idx, then jump into cached prefill.
+        # Prefill preamble: prime gpr_seq_len + gpr_bucket_idx (+ gpr_q_seq_len / gpr_aligned_seq_len
+        # for unified_attention_core's dynamic batch / aligned_seq_len), then jump into cached prefill.
         self.clear_inst_id()
         self.start_capture()
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
         self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
+        self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -1270,14 +1219,19 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+            # unified_attention_core's dynamic path always uses bias_mode="full_matrix" (one bias
+            # row per batch item); the decoder attention call's batch=qpkv query heads all share the
+            # same causal mask, so replicate the single mask row qpkv times (mirrors gemma3/1b).
             bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
             bias_host[0, :self.seq_len] = 0.0
-            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host.repeat(self.group_size, 1))
 
-            # Decoder preamble: prime 3 position GPRs + bucket, then jump into cached decoder.
+            # Decoder preamble: prime position GPRs (+ gpr_aligned_seq_len for
+            # unified_attention_core's dynamic aligned_seq_len), then jump into cached decoder.
             self.clear_inst_id()
             self.start_capture()
             self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
             self.generate_instruction_add_set(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _kv_stride))
             self.generate_instruction_add_set(self.ROPE_SIZE_REG,    ue_35bit_addr_shifter(decode_pos * _rope_row))
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
@@ -1429,7 +1383,6 @@ def main():
 
     print("\n--- Running ---")
     ue.run_llama()
-    ue.clear_dram()
     print("Llama-3.2-3B test ends.")
 
 if __name__ == "__main__":

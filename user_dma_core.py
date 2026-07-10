@@ -856,7 +856,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        # assert hw_version == 0x05f74c2d, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x05f74c2d. Please update FPGA with commit update_05f74c2d.bin using update_flash.py (public release v1.1)"
+        assert hw_version == 0x87eabea5, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x87eabea5. Please update FPGA with commit update_87eabea5.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -1918,15 +1918,63 @@ class UnifiedEngine:
             uram_wb_addr, uram_wb_type.value, row_size
         )
 
+    def _validate_addr_gprs(self, fn: str, gpr_M_reg: Optional[int], addr_gprs: dict) -> None:
+        """Shared validation for optional gpr_*_addr params: each must be a GPR index 1..31,
+        distinct from ``gpr_M_reg`` (the row-count register) and from each other. ``None`` entries
+        (literal-address fallback) are skipped. ``addr_gprs`` maps param-name -> reg-or-None."""
+        for _name, _reg in addr_gprs.items():
+            if _reg is None:
+                continue
+            if not (1 <= _reg <= 31):
+                raise ValueError(f"{fn}: {_name} must be a GPR index 1..31, got {_reg}")
+            if gpr_M_reg is not None and _reg == gpr_M_reg:
+                raise ValueError(
+                    f"{fn}: {_name}={_reg} collides with gpr_M_reg={gpr_M_reg}; address GPRs "
+                    "must be distinct from the row-count GPR"
+                )
+        _provided = [_r for _r in addr_gprs.values() if _r is not None]
+        if len(set(_provided)) != len(_provided):
+            raise ValueError(f"{fn}: address GPRs must be distinct from each other, got {addr_gprs}")
+
+    def _pbi_override_dram_base_from_gpr(self, inst_pointer_idx: int, gpr_addr_reg: int) -> None:
+        """Emit one PBI_MODE_REG override that replaces PBI pointer ``inst_pointer_idx``'s
+        DRAM_ADDR base with the **word** address (``byte_addr >> 3``) held in ISA GPR
+        ``gpr_addr_reg``.
+
+        Must be emitted once, AFTER the pointer's ``generate_instruction_pbi_init`` and BEFORE
+        the hardware loop, so the in-loop ``PBI_INC`` row strides still advance from the
+        GPR-sourced base. This is the shared mechanism that lets a single captured program serve
+        any DRAM placement (caller re-primes the GPR before each replay). The +0 INC deltas leave
+        every other pointer field untouched; only DRAM_ADDR is overridden.
+        """
+        self.generate_instruction_pbi_inc(
+            dram_shared_addr=0,
+            dma_length=0,
+            output_size=0,
+            uram_length=0,
+            uram_a_start_addr=0,
+            uram_b_start_addr=0,
+            uram_wb_addr=0,
+            uram_dst_addr=0,
+            fmax_context_addr=0,
+            inst_pointer_idx=inst_pointer_idx,
+            general_reg_src=gpr_addr_reg,
+            pbi_field_select=PBI_FIELD.DRAM_ADDR,
+        )
+
     def eltwise_core_dram(
         self,
         M: int,
         N: int,
         dram_a: int,
-        dram_b: int,
+        dram_b: Optional[int],
         dram_out: int,
         mode: UE_MODE,
         gpr_M_reg: Optional[int] = None,
+        scalar: float = None,
+        gpr_a_addr: Optional[int] = None,
+        gpr_b_addr: Optional[int] = None,
+        gpr_out_addr: Optional[int] = None,
     ) -> int:
         """Dispatches based on ``gpr_M_reg``:
 
@@ -1936,74 +1984,78 @@ class UnifiedEngine:
         - ``gpr_M_reg is None`` (default): :meth:`eltwise_core_dram_legacy` — compile-time
           ``m_chunk`` tiling, no GPR needed.
 
+        Vector modes (ELTWISE_ADD/MUL/SUB): ``dram_b`` required, ``scalar`` ignored.
+        Broadcast modes (MUL_BROADCAST/ADD_BROADCAST): ``scalar`` required, ``dram_b`` must be None.
+
+        ``gpr_a_addr`` / ``gpr_b_addr`` / ``gpr_out_addr`` (PBI path only) optionally source each
+        DRAM base from a GPR (word address, ``byte >> 3``) so one captured program serves any
+        placement — see :meth:`eltwise_core_dram_pbi`. They require ``gpr_M_reg`` to be set.
+
         Returns ``M * N`` (one flop per output BF16 element).
         """
         if gpr_M_reg is not None:
             return self.eltwise_core_dram_pbi(
                 M=M, N=N,
                 dram_a=dram_a, dram_b=dram_b, dram_out=dram_out,
-                mode=mode,
+                mode=mode, scalar=scalar,
                 gpr_M_reg=gpr_M_reg,
+                gpr_a_addr=gpr_a_addr,
+                gpr_b_addr=gpr_b_addr,
+                gpr_out_addr=gpr_out_addr,
+            )
+        if any(r is not None for r in (gpr_a_addr, gpr_b_addr, gpr_out_addr)):
+            raise ValueError(
+                "eltwise_core_dram: gpr_a_addr/gpr_b_addr/gpr_out_addr require the PBI path "
+                "(gpr_M_reg must be set); the legacy path uses literal addresses only"
             )
         return self.eltwise_core_dram_legacy(
             M=M, N=N,
             dram_a=dram_a, dram_b=dram_b, dram_out=dram_out,
-            mode=mode,
+            mode=mode, scalar=scalar,
         )
+
 
     def eltwise_core_dram_legacy(
         self,
         M: int,
         N: int,
         dram_a: int,
-        dram_b: int,
+        dram_b: Optional[int],
         dram_out: int,
         mode: UE_MODE,
+        scalar: float = None,
     ) -> int:
         """
-        Legacy BF16 element-wise ADD / MUL / SUB on ``[M, N]`` tensors in DRAM (row-major) with
-        compile-time vertical tiling.
+        Legacy BF16 element-wise op on ``[M, N]`` tensors in DRAM with compile-time vertical tiling.
 
-        Chooses ``m_chunk`` from ``URAM_NEAR_FULL_ELEMENTS // N`` (one UE vector of headroom vs
-        a full bank) so a single memcpy+eltwise never fills **every** BF16 slot in URAM.
+        Vector modes (ELTWISE_ADD/MUL/SUB): ``dram_b`` required. Tiles are Python-unrolled
+        (no ISA loop, no jumps).
+        Broadcast modes (MUL_BROADCAST/ADD_BROADCAST): ``scalar`` required, ``dram_b`` None.
+        Each row is loaded to URAM_A and the scalar broadcast is applied in-place.
 
-        Emits **ISA** ``loop_start`` / ``loop_end`` over ``M // m_chunk`` full tiles when that count
-        is positive: three **PBI** streams (A load, B load, out store) with fixed
-        ``dma_length = m_chunk * N * 2`` bytes per iteration and ``chunk_bytes`` as the per-iter
-        DRAM stride. Body: PBI memcpy → PBI memcpy → eltwise on ``m_chunk * N`` BF16 → PBI store.
-
-        If ``M % m_chunk`` is nonzero, one trailing **non-PBI** memcpy + eltwise + store covers the
-        remaining rows (PBI cannot change ``dma_length`` per iteration inside one loop).
-
-        For **dynamic seq_len / one row per loop iteration** (no ``m_chunk``), use
-        :meth:`eltwise_core_dram_pbi`.
-
-        **Staging (fixed):** A at ``0x00000`` (URAM_A), B at ``0x80000`` (URAM_B); output reuses the
-        A buffer.
-
-        Args:
-            M, N: Logical row/column counts (``N`` multiple of ``UE_VECTOR_SIZE``,
-                ``N <= URAM_NEAR_FULL_ELEMENTS`` so one row and every tile stay below a full bank).
-            dram_a, dram_b, dram_out: Byte base addresses of A, B, and output.
-            mode: ``UE_MODE.ELTWISE_ADD``, ``ELTWISE_MUL``, or ``ELTWISE_SUB``.
-
-        Returns:
-            ``M * N`` (one flop per logical output element).
+        **Staging (fixed):** A at ``0x00000`` (URAM_A), B at ``0x80000`` (URAM_B) for vector modes.
         """
-        if mode not in (UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_MUL, UE_MODE.ELTWISE_SUB):
-            raise ValueError(
-                f"eltwise_core_dram_legacy: mode must be ELTWISE_ADD, ELTWISE_MUL, or ELTWISE_SUB, got {mode!r}"
-            )
+        _VECTOR_MODES = (UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_MUL, UE_MODE.ELTWISE_SUB)
+        _BROADCAST_MODES = (UE_MODE.MUL_BROADCAST, UE_MODE.ADD_BROADCAST)
+        fn = "eltwise_core_dram_legacy"
+        if mode not in _VECTOR_MODES + _BROADCAST_MODES:
+            raise ValueError(f"{fn}: unsupported mode {mode!r}")
+        is_broadcast = mode in _BROADCAST_MODES
+        if is_broadcast:
+            if scalar is None:
+                raise ValueError(f"{fn}: scalar required for {mode!r}")
+            if dram_b is not None:
+                raise ValueError(f"{fn}: dram_b must be None for broadcast modes")
+        else:
+            if dram_b is None:
+                raise ValueError(f"{fn}: dram_b required for {mode!r}")
         if M < 1 or N < 1:
-            raise ValueError(f"eltwise_core_dram_legacy: require M>=1 and N>=1, got M={M}, N={N}")
+            raise ValueError(f"{fn}: require M>=1 and N>=1, got M={M}, N={N}")
         if N % UE_VECTOR_SIZE != 0:
-            raise ValueError(
-                f"eltwise_core_dram_legacy: N must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got N={N}"
-            )
+            raise ValueError(f"{fn}: N must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got N={N}")
         if N > URAM_NEAR_FULL_ELEMENTS:
             raise ValueError(
-                f"eltwise_core_dram_legacy: N={N} exceeds near-full URAM row ({URAM_NEAR_FULL_ELEMENTS} BF16 slots); "
-                "need N <= URAM_NEAR_FULL_ELEMENTS (full bank width is not supported here)."
+                f"{fn}: N={N} exceeds near-full URAM row ({URAM_NEAR_FULL_ELEMENTS} BF16 slots)."
             )
 
         def _emit_tile(elements: int) -> None:
@@ -2011,124 +2063,38 @@ class UnifiedEngine:
                 self.eltwise_add_core(0x00000, 0x80000, 0x00000, elements)
             elif mode == UE_MODE.ELTWISE_MUL:
                 self.eltwise_mul_core(0x00000, 0x80000, 0x00000, elements)
-            else:
+            elif mode == UE_MODE.ELTWISE_SUB:
                 self.eltwise_sub_core(0x00000, 0x80000, 0x00000, elements)
+            elif mode == UE_MODE.MUL_BROADCAST:
+                self.broadcast_mul(scalar=scalar, sram_start_addr=0x00000, sram_wb_addr=0x00000, element_size=elements)
+            else:  # ADD_BROADCAST
+                self.broadcast_add(scalar=scalar, sram_start_addr=0x00000, sram_wb_addr=0x00000, element_size=elements)
 
-        # Always tile with near-full capacity only (never URAM_FULL_ELEMENTS per op).
         m_chunk = URAM_NEAR_FULL_ELEMENTS // N
         if m_chunk < 1:
             raise ValueError(
-                f"eltwise_core_dram_legacy: N={N} too large; need at least one row of BF16 within "
-                f"URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}."
-            )
-        chunk_bytes = m_chunk * N * 2
-        tile_elements = m_chunk * N
-        num_full = M // m_chunk
-        rem_rows = M % m_chunk
-
-        _, a_uram_row = self.sram_address_to_uram_address(0x00000)
-        _, b_uram_row = self.sram_address_to_uram_address(0x80000)
-        _, out_uram_row = self.sram_address_to_uram_address(0x00000)
-
-        if num_full >= 1:
-            ptr_a = self.alloc_inst_ptr()
-            ptr_b = self.alloc_inst_ptr()
-            ptr_out = self.alloc_inst_ptr()
-
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=dram_a,
-                dma_length=chunk_bytes,
-                output_size=0,
-                uram_length=0,
-                uram_a_start_addr=0,
-                uram_b_start_addr=0,
-                uram_wb_addr=0,
-                uram_dst_addr=a_uram_row,
-                fmax_context_addr=0,
-                inst_pointer_idx=ptr_a,
-            )
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=dram_b,
-                dma_length=chunk_bytes,
-                output_size=0,
-                uram_length=0,
-                uram_a_start_addr=0,
-                uram_b_start_addr=0,
-                uram_wb_addr=0,
-                uram_dst_addr=b_uram_row,
-                fmax_context_addr=0,
-                inst_pointer_idx=ptr_b,
-            )
-            self.generate_instruction_pbi_init(
-                dram_shared_addr=dram_out,
-                dma_length=chunk_bytes,
-                output_size=0,
-                uram_length=0,
-                uram_a_start_addr=out_uram_row,
-                uram_b_start_addr=out_uram_row,
-                uram_wb_addr=0,
-                uram_dst_addr=0,
-                fmax_context_addr=0,
-                inst_pointer_idx=ptr_out,
+                f"{fn}: N={N} too large; need at least one row within URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}."
             )
 
-            program_dram_start_addr = self.get_program_dram_addr()
-            cur_inst_count = self.capture_count
-            self.generate_instruction_jump_abs(
-                ue_35bit_addr_shifter(
-                    program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
-                )
-            )
-            self.loop_start(num_full)
-
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=chunk_bytes,
-                sram_address=0x00000,
-                element_size=0,
-                inst_pointer_idx=ptr_a,
-            )
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=chunk_bytes,
-                sram_address=0x80000,
-                element_size=0,
-                inst_pointer_idx=ptr_b,
-            )
-            _emit_tile(tile_elements)
-            self.sram_to_accelerator_memory(
-                sram_address=0x00000,
-                accelerator_dram_address=chunk_bytes,
-                element_size=0,
-                inst_pointer_idx=ptr_out,
-            )
-
-            outer_loop_size = self.loop_end()
-            assert outer_loop_size <= 256, (
-                f"eltwise_core_dram_legacy: outer loop body {outer_loop_size} instructions exceeds "
-                "i-cache budget 256"
-            )
-
-            self.release_inst_ptr(ptr_out)
-            self.release_inst_ptr(ptr_b)
-            self.release_inst_ptr(ptr_a)
-
-        if rem_rows > 0:
-            byte_off = num_full * m_chunk * N * 2
-            elements_rem = rem_rows * N
+        for i, m_take in self.chunk_ranges(M, m_chunk):
+            byte_off = i * N * 2
+            elements = m_take * N
             self.accelerator_memory_to_sram(
                 accelerator_dram_address=dram_a + byte_off,
                 sram_address=0x00000,
-                element_size=elements_rem,
+                element_size=elements,
             )
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=dram_b + byte_off,
-                sram_address=0x80000,
-                element_size=elements_rem,
-            )
-            _emit_tile(elements_rem)
+            if not is_broadcast:
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=dram_b + byte_off,
+                    sram_address=0x80000,
+                    element_size=elements,
+                )
+            _emit_tile(elements)
             self.sram_to_accelerator_memory(
                 sram_address=0x00000,
                 accelerator_dram_address=dram_out + byte_off,
-                element_size=elements_rem,
+                element_size=elements,
             )
 
         return M * N
@@ -2138,17 +2104,28 @@ class UnifiedEngine:
         M: int,
         N: int,
         dram_a: int,
-        dram_b: int,
+        dram_b: Optional[int],
         dram_out: int,
         mode: UE_MODE,
         gpr_M_reg: int,
+        scalar: float = None,
+        gpr_a_addr: Optional[int] = None,
+        gpr_b_addr: Optional[int] = None,
+        gpr_out_addr: Optional[int] = None,
     ) -> int:
         """
-        PBI BF16 element-wise ADD / MUL / SUB on ``[M, N]`` DRAM tensors (**no vertical tiling**).
+        PBI BF16 element-wise op on ``[M, N]`` DRAM tensors (**no vertical tiling**).
+
+        Vector modes (ELTWISE_ADD/MUL/SUB): ``dram_b`` required. Loads A→URAM_A, B→URAM_B,
+        applies op, stores result.
+        Broadcast modes (MUL_BROADCAST/ADD_BROADCAST): ``scalar`` required, ``dram_b`` must be
+        None. Loads A→URAM_A, applies scalar broadcast in-place, stores result. No ptr_b allocated.
 
         Loads/processes/stores **one row per ISA iteration**: ``dma_length = N * 2`` bytes per PBI op,
         DRAM strides ``row_bytes`` each iteration via hardware loop counters (:meth:`loop_start` /
-        :meth:`loop_end`). No ``m_chunk`` / remnant tail path unlike :meth:`eltwise_core_dram`.
+        :meth:`loop_end`). An abs-jump anchor is emitted before the loop so the rel-JNZ from
+        ``loop_end`` always lands within the 512-instruction i-cache window.
+        No ``m_chunk`` / remnant tail path unlike :meth:`eltwise_core_dram`.
 
         Requires ``N <= URAM_NEAR_FULL_ELEMENTS`` so one row fits staging.
 
@@ -2161,16 +2138,40 @@ class UnifiedEngine:
         as a compile-time argument purely for FLOPs accounting / asserts — the captured
         program contains no static reference to ``M``.
 
+        **DRAM base addresses (optional dynamic):**
+        ``gpr_a_addr`` / ``gpr_b_addr`` / ``gpr_out_addr`` are optional GPR indices (1..31). When
+        a GPR is provided, the corresponding pointer's **base** is sourced from that register at
+        execute time instead of the ``dram_a`` / ``dram_b`` / ``dram_out`` literal, so a single
+        captured program can be replayed against any DRAM placement by re-priming the GPR before
+        each replay. The GPR must hold the **word** address (``byte_addr >> 3``, the PBI
+        DRAM_ADDR format — same convention as :meth:`matmat_mul_dynamic_core`). Mechanism: a
+        one-shot ``PBI_MODE_REG`` override (``PBI_FIELD.DRAM_ADDR``) emitted once after the
+        pointer init replaces the literal base with the GPR value; the in-loop ``PBI_INC`` row
+        strides still advance it. When a GPR is ``None`` the literal base is used and **no extra
+        instruction is emitted** (byte-for-byte identical to the legacy captured program). The
+        per-iteration row stride (``N*2``) stays a compile-time immediate; only the base moves.
+
         Returns:
             ``M * N`` (one flop per output BF16 element). Since ``M`` is FLOPs-accounting only,
             callers feeding this to :meth:`report_flop_rate_gflops` should pass the realized
             row count separately if it differs from the compile-time ``M``.
         """
         fn = "eltwise_core_dram_pbi"
-        if mode not in (UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_MUL, UE_MODE.ELTWISE_SUB):
+        _VECTOR_MODES = (UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_MUL, UE_MODE.ELTWISE_SUB)
+        _BROADCAST_MODES = (UE_MODE.MUL_BROADCAST, UE_MODE.ADD_BROADCAST)
+        if mode not in _VECTOR_MODES + _BROADCAST_MODES:
             raise ValueError(
-                f"{fn}: mode must be ELTWISE_ADD, ELTWISE_MUL, or ELTWISE_SUB, got {mode!r}"
+                f"{fn}: mode must be ELTWISE_ADD/MUL/SUB or MUL_BROADCAST/ADD_BROADCAST, got {mode!r}"
             )
+        is_broadcast = mode in _BROADCAST_MODES
+        if is_broadcast:
+            if scalar is None:
+                raise ValueError(f"{fn}: scalar required for {mode!r}")
+            if dram_b is not None:
+                raise ValueError(f"{fn}: dram_b must be None for broadcast modes, got {dram_b:#x}")
+        else:
+            if dram_b is None:
+                raise ValueError(f"{fn}: dram_b required for {mode!r}")
         if M < 1 or N < 1:
             raise ValueError(f"{fn}: require M>=1 and N>=1, got M={M}, N={N}")
         if N % UE_VECTOR_SIZE != 0:
@@ -2186,6 +2187,9 @@ class UnifiedEngine:
             raise ValueError(
                 f"{fn}: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}"
             )
+        self._validate_addr_gprs(fn, gpr_M_reg, {"gpr_a_addr": gpr_a_addr})
+        self._validate_addr_gprs(fn, gpr_M_reg, {"gpr_b_addr": gpr_b_addr})
+        self._validate_addr_gprs(fn, gpr_M_reg, {"gpr_out_addr": gpr_out_addr})
 
         row_bytes = N * 2
 
@@ -2194,15 +2198,19 @@ class UnifiedEngine:
                 self.eltwise_add_core(0x00000, 0x80000, 0x00000, N)
             elif mode == UE_MODE.ELTWISE_MUL:
                 self.eltwise_mul_core(0x00000, 0x80000, 0x00000, N)
-            else:
+            elif mode == UE_MODE.ELTWISE_SUB:
                 self.eltwise_sub_core(0x00000, 0x80000, 0x00000, N)
+            elif mode == UE_MODE.MUL_BROADCAST:
+                self.broadcast_mul(scalar=scalar, sram_start_addr=0x00000, sram_wb_addr=0x00000, element_size=N)
+            else:  # ADD_BROADCAST
+                self.broadcast_add(scalar=scalar, sram_start_addr=0x00000, sram_wb_addr=0x00000, element_size=N)
 
         _, a_uram_row = self.sram_address_to_uram_address(0x00000)
         _, b_uram_row = self.sram_address_to_uram_address(0x80000)
         _, out_uram_row = self.sram_address_to_uram_address(0x00000)
 
         ptr_a = self.alloc_inst_ptr()
-        ptr_b = self.alloc_inst_ptr()
+        ptr_b = self.alloc_inst_ptr() if not is_broadcast else None
         ptr_out = self.alloc_inst_ptr()
 
         self.generate_instruction_pbi_init(
@@ -2217,18 +2225,19 @@ class UnifiedEngine:
             fmax_context_addr=0,
             inst_pointer_idx=ptr_a,
         )
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=dram_b,
-            dma_length=row_bytes,
-            output_size=0,
-            uram_length=0,
-            uram_a_start_addr=0,
-            uram_b_start_addr=0,
-            uram_wb_addr=0,
-            uram_dst_addr=b_uram_row,
-            fmax_context_addr=0,
-            inst_pointer_idx=ptr_b,
-        )
+        if ptr_b is not None:
+            self.generate_instruction_pbi_init(
+                dram_shared_addr=dram_b,
+                dma_length=row_bytes,
+                output_size=0,
+                uram_length=0,
+                uram_a_start_addr=0,
+                uram_b_start_addr=0,
+                uram_wb_addr=0,
+                uram_dst_addr=b_uram_row,
+                fmax_context_addr=0,
+                inst_pointer_idx=ptr_b,
+            )
         self.generate_instruction_pbi_init(
             dram_shared_addr=dram_out,
             dma_length=row_bytes,
@@ -2242,6 +2251,20 @@ class UnifiedEngine:
             inst_pointer_idx=ptr_out,
         )
 
+        # Optional: override each pointer's BASE from an ISA GPR (word address = byte >> 3) so
+        # one captured program serves any DRAM placement. PBI_MODE_REG replaces the DRAM_ADDR
+        # field with the GPR value once here (before the loop); the in-loop PBI_INC row strides
+        # still advance the pointer. Emitted only for the GPRs the caller supplied, so the
+        # all-None case captures a byte-for-byte identical program to before.
+        _gpr_pairs = [(ptr_a, gpr_a_addr), (ptr_out, gpr_out_addr)]
+        if ptr_b is not None:
+            _gpr_pairs.append((ptr_b, gpr_b_addr))
+        for _ptr_idx, _gpr_addr in _gpr_pairs:
+            if _gpr_addr is not None:
+                self._pbi_override_dram_base_from_gpr(_ptr_idx, _gpr_addr)
+
+        # Abs-jump anchor: reloads i-cache so the RELA_JNZ from loop_end() lands within
+        # the 512-instruction window.
         program_dram_start_addr = self.get_program_dram_addr()
         cur_inst_count = self.capture_count
         self.generate_instruction_jump_abs(
@@ -2257,12 +2280,13 @@ class UnifiedEngine:
             element_size=0,
             inst_pointer_idx=ptr_a,
         )
-        self.accelerator_memory_to_sram(
-            accelerator_dram_address=row_bytes,
-            sram_address=0x80000,
-            element_size=0,
-            inst_pointer_idx=ptr_b,
-        )
+        if ptr_b is not None:
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=row_bytes,
+                sram_address=0x80000,
+                element_size=0,
+                inst_pointer_idx=ptr_b,
+            )
         _emit_row()
         self.sram_to_accelerator_memory(
             sram_address=0x00000,
@@ -2277,7 +2301,8 @@ class UnifiedEngine:
         )
 
         self.release_inst_ptr(ptr_out)
-        self.release_inst_ptr(ptr_b)
+        if ptr_b is not None:
+            self.release_inst_ptr(ptr_b)
         self.release_inst_ptr(ptr_a)
 
         return M * N
@@ -2595,7 +2620,8 @@ class UnifiedEngine:
             self.eltwise_mul_core(output_sram_wb_addr, gamma_sram_start_addr, output_sram_wb_addr, N)
 
 
-    def rms_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int, gpr_M_reg: int) -> int:
+    def rms_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int, gpr_M_reg: int,
+                               gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_gamma_addr: Optional[int] = None) -> int:
         """
         Core RMS norm: normalizes vector x -> x / rms(x).
 
@@ -2611,18 +2637,30 @@ class UnifiedEngine:
         compile-time argument purely for FLOPs accounting / asserts — the captured program contains
         no static reference to ``M``.
 
+        **DRAM base addresses (optional dynamic):** ``gpr_a_addr`` (input rows), ``gpr_out_addr``
+        (output rows) and ``gpr_gamma_addr`` (gamma vector) are optional GPR indices (1..31). When
+        given, that base is sourced from the GPR (word address = ``byte >> 3``) instead of the
+        literal, so one captured program serves any placement. Input/output are looped PBI pointers
+        (PBI_MODE_REG override); gamma is a one-shot pre-loop load (REG_REWRITE). ``None`` → literal,
+        no extra instruction. See :meth:`eltwise_core_dram_pbi`.
+
         Caller must have start_capture() active.
         """
         assert M >= 1, "rms_norm_core_dram_pbi() requires M >= 1"
         if not (1 <= gpr_M_reg <= 15):
             raise ValueError(f"rms_norm_core_dram_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
+        self._validate_addr_gprs("rms_norm_core_dram_pbi", gpr_M_reg, {
+            "gpr_a_addr": gpr_a_addr, "gpr_out_addr": gpr_out_addr, "gpr_gamma_addr": gpr_gamma_addr,
+        })
 
         vector_sram_addr = 0x00000
         gamma_sram_addr = 0x80000
 
+        # Gamma is loaded once before the loop; source its base from a GPR via REG_REWRITE when given.
         self.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
                                         sram_address=gamma_sram_addr,
-                                        element_size=N)
+                                        element_size=N,
+                                        general_reg_src=gpr_gamma_addr)
 
         assert self.is_capture_on, "rms_norm_core_dram_pbi() requires active capture"
         assert N % UE_VECTOR_SIZE == 0, f"rms_norm_core_dram_pbi() requires N to be a multiple of UE_VECTOR_SIZE, got N={N}"
@@ -2667,6 +2705,12 @@ class UnifiedEngine:
             fmax_context_addr=0,
             inst_pointer_idx=row_store_ptr,
         )
+
+        # Optional: source the input/output pointer bases from GPRs (word addr) once before the loop.
+        if gpr_a_addr is not None:
+            self._pbi_override_dram_base_from_gpr(row_load_ptr, gpr_a_addr)
+        if gpr_out_addr is not None:
+            self._pbi_override_dram_base_from_gpr(row_store_ptr, gpr_out_addr)
 
         program_dram_start_addr = self.get_program_dram_addr()
         cur_inst_count = self.capture_count
@@ -2713,6 +2757,192 @@ class UnifiedEngine:
         total_flops = 3 * M * N + M * N  # RMS + gamma mul
         return total_flops
 
+    def rms_norm_core_dram_dynamic(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int,
+                                   gpr_M_reg: int, gpr_N_reg: int, gpr_rms_scale_reg: Optional[int] = None,
+                                   gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
+                                   gpr_gamma_addr: Optional[int] = None, real_N: Optional[int] = None) -> int:
+        """RMS norm — runtime M (batch), N baked at capture (chunk-tiled).
+
+        Batches up to ``U = min(URAM_A capacity, 16)`` rows per DMA transfer and runs the per-row
+        compute (RMS-mean -> broadcast scale -> gamma multiply) as PLAIN (non-PBI) software-unrolled
+        ops at compile-time SRAM offsets; only the two DMA pointers (``row_load_ptr`` /
+        ``row_store_ptr``) are PBI. The outer loop is a ``reg_min``-clamped while(remaining) over
+        chunks of ``U`` rows; the last partial chunk computes all ``U`` rows but only stores
+        ``rows_take``, so tail waste is at most ``U-1`` rows once per call. Batching the DMA and
+        keeping compute plain (no per-row PBI overrides) are both required to match legacy throughput.
+
+        **N is baked at capture, not runtime:** ``gpr_N_reg`` is accepted and validated for signature
+        compatibility, but the runtime hidden_size at execute time must equal the capture-time ``N``.
+        Callers needing a different N must re-capture (norms are captured once per model config, so
+        this is free in practice). Non-64-aligned hidden_size is served by host-side zero padding (see
+        below); the padded length is what gets baked.
+
+        **``sqrt(N)`` is baked as the RSQRT scalar (matches legacy precision):**
+        RMS = ``x * sqrt(N) / sqrt(sum(x^2)) * gamma``. Because N is compile-time here (baked at
+        capture), the RSQRT scalar is baked as ``float_to_bf19(sqrt(real_N))`` — identical to the
+        legacy path's :meth:`start_queue_for_bf16_rms_mean` — and the caller uploads a **plain**
+        gamma. This avoids the extra bf16 re-rounding of a ``gamma*sqrt(N)`` product (which cost
+        ~0.5-1 dB SNR vs legacy). ``real_N`` is the *unpadded* hidden size (the ``sqrt`` factor must
+        use the real N, not the zero-padded ``N``); it defaults to ``N`` for 64-aligned callers with
+        no padding. ``gpr_rms_scale_reg`` is ignored (kept only for signature compatibility).
+
+        ``gpr_M_reg`` (1..15, loop count) is required and caller-primed. ``M`` / ``N`` are template /
+        FLOPs-accounting only. ``gpr_a_addr`` / ``gpr_out_addr`` / ``gpr_gamma_addr`` optionally
+        source the input / output / gamma DRAM bases from GPRs (word addr = ``byte >> 3``). Requires
+        ``N`` a multiple of ``UE_VECTOR_SIZE`` and one row to fit URAM staging.
+
+        **Non-64-aligned hidden_size** is served by host-side zero padding: the reduce is
+        ``sum(x^2)``, which doesn't depend on the reduce length, so the caller pads the row to a
+        multiple of 64 with zeros, captures with the padded length as ``N``, passes ``real_N`` (the
+        unpadded size, used for the ``sqrt(real_N)`` RSQRT scalar), and slices the real columns out of
+        the output. (LayerNorm can't do
+        this — its mean-centering makes pad lanes contaminate the variance, and its mean needs a true
+        runtime ``1/N`` scalar that can't be folded into gamma.) See
+        ``rms_norm_core_dram_dynamic_test`` in user_hw_test.py.
+        """
+        fn = "rms_norm_core_dram_dynamic"
+        assert M >= 1 and N >= 1, f"{fn}: require M>=1 and N>=1"
+        if N % UE_VECTOR_SIZE != 0:
+            raise ValueError(f"{fn}: N must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got N={N}")
+        if N > URAM_NEAR_FULL_ELEMENTS:
+            raise ValueError(f"{fn}: N={N} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS} (one row must fit staging)")
+        # gpr_rms_scale_reg is deprecated/ignored (sqrt(N) is now folded into host gamma); only
+        # gpr_M_reg / gpr_N_reg are required runtime registers.
+        for _nm, _rg, _hi in (("gpr_M_reg", gpr_M_reg, 15), ("gpr_N_reg", gpr_N_reg, 31)):
+            if _rg is None or not (1 <= _rg <= _hi):
+                raise ValueError(f"{fn}: {_nm} must be a GPR index 1..{_hi}, got {_rg}")
+        if gpr_M_reg == gpr_N_reg:
+            raise ValueError(f"{fn}: gpr_M_reg/gpr_N_reg must be distinct")
+        self._validate_addr_gprs(fn, gpr_M_reg, {
+            "gpr_a_addr": gpr_a_addr, "gpr_out_addr": gpr_out_addr, "gpr_gamma_addr": gpr_gamma_addr,
+        })
+        for _nm, _rg in (("gpr_a_addr", gpr_a_addr), ("gpr_out_addr", gpr_out_addr), ("gpr_gamma_addr", gpr_gamma_addr)):
+            if _rg is not None and _rg == gpr_N_reg:
+                raise ValueError(f"{fn}: {_nm}={_rg} collides with gpr_N_reg")
+        assert self.is_capture_on, f"{fn}() requires active capture"
+
+        vector_sram_addr = 0x00000   # URAM_A
+        gamma_sram_addr = 0x80000    # URAM_B
+        vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_addr)
+        gamma_uram_type, _gamma_uram_row = self.sram_address_to_uram_address(gamma_sram_addr)
+        assert vector_uram_type == URAM_SECTION.URAM_A, f"vector_sram_addr must be in URAM_A, got {hex(vector_sram_addr)}"
+        assert gamma_uram_type == URAM_SECTION.URAM_B, f"gamma_sram_addr must be in URAM_B, got {hex(gamma_sram_addr)}"
+
+        # N baked at capture (compile-time strides); M is runtime via the reg_min while-loop below.
+        bytes_per_element = 2
+        row_bytes = N * bytes_per_element            # compile-time
+        row_size = N // UE_VECTOR_SIZE               # compile-time URAM rows per token
+        # sqrt(N) baked as the RSQRT scalar (matches legacy, plain gamma). Uses the UNPADDED real_N:
+        # the reduce sums x^2 over the padded row but zero pad lanes add nothing, so the sqrt factor
+        # must be sqrt(real_N). Defaults to N for 64-aligned callers (no padding => real_N == N).
+        rms_sqrt_scalar = self.float_to_bf19(float(math.sqrt(real_N if real_N is not None else N)))
+
+        # Unroll factor U: rows processed per outer iteration, bounded by URAM_A staging capacity and
+        # capped at 16 so the unrolled body stays under the i-cache window (tail waste <= U-1 rows).
+        U = max(1, min(URAM_NEAR_FULL_ADDR // row_size, 16))
+
+        # Gamma one-shot pre-loop load into URAM_B; source its base from a GPR (REG_REWRITE) if given.
+        self.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
+                                        sram_address=gamma_sram_addr, element_size=N, general_reg_src=gpr_gamma_addr)
+
+        _alloc_list = []
+        def _alloc():
+            r = self.alloc_isa_reg(); _alloc_list.append(r); return r
+        remaining_reg = _alloc()   # rows not yet processed
+        rows_take_reg = _alloc()   # min(remaining, U) -- this chunk's row count
+        dma_len_reg   = _alloc()   # rows_take*row_bytes (chunk DMA length, load and store)
+        u_reg         = _alloc()   # U literal (reg_min clamp)
+        # dma_len = rows_take * row_bytes: a 1-cycle SHL when row_bytes is a power of two (the common
+        # case), else a mul32 (rare non-pow2 host-padded N).
+        row_bytes_is_pow2 = (row_bytes & (row_bytes - 1)) == 0
+        row_bytes_shift = (row_bytes.bit_length() - 1) if row_bytes_is_pow2 else 0
+        rowb_reg = None if row_bytes_is_pow2 else _alloc()
+        if rowb_reg is not None:
+            self.generate_instruction_add_set(rowb_reg, row_bytes)
+        self.generate_instruction_add_set(u_reg, U)
+
+        row_load_ptr = self.alloc_inst_ptr()
+        row_store_ptr = self.alloc_inst_ptr()
+        # Both pointers auto-increment their DRAM cursor by the full-chunk stride U*row_bytes each
+        # transfer, so no per-chunk DRAM_ADDR set is needed (the last partial chunk over-advances by
+        # the unused tail, harmlessly, since the loop exits right after). DMA_LENGTH is set per chunk.
+        chunk_stride = U * row_bytes
+        self.generate_instruction_pbi_init(dram_shared_addr=A_DRAM_ADDR, dma_length=chunk_stride,
+                                           uram_dst_addr=vector_uram_start_addr, inst_pointer_idx=row_load_ptr)
+        self.generate_instruction_pbi_init(dram_shared_addr=OUTPUT_DRAM_ADDR, dma_length=chunk_stride,
+                                           uram_a_start_addr=vector_uram_start_addr,
+                                           uram_b_start_addr=vector_uram_start_addr, inst_pointer_idx=row_store_ptr)
+        # Optional dynamic DRAM bases: override the pointer bases once (auto-inc then walks from there).
+        if gpr_a_addr is not None:
+            self._pbi_override_dram_base_from_gpr(row_load_ptr, gpr_a_addr)
+        if gpr_out_addr is not None:
+            self._pbi_override_dram_base_from_gpr(row_store_ptr, gpr_out_addr)
+
+        def _set(ptr, field, reg):
+            self.generate_instruction_pbi_inc(general_reg_src=reg, pbi_field_select=field, inst_pointer_idx=ptr)
+
+        def _dma_len():
+            if row_bytes_is_pow2:
+                self.generate_instruction_shl(dma_len_reg, rows_take_reg, row_bytes_shift)
+            else:
+                self.generate_instruction_mul32_reg(dma_len_reg, rows_take_reg, rowb_reg)
+
+        def _rms_row(sram):
+            # 3 PLAIN ops at a compile-time SRAM offset: RMS-mean (RSQRT scalar=sqrt(real_N) ->
+            # sqrt(real_N)/sqrt(sum(x^2)) = 1/rms), broadcast scale by that LALU result, gamma
+            # multiply. sqrt(N) rides the RSQRT scalar (like legacy start_queue_for_bf16_rms_mean),
+            # so the caller uploads a PLAIN gamma -- no gamma*sqrt(N) re-rounding.
+            _, urow = self.sram_address_to_uram_address(sram)
+            self.ue_arithmetic_op(
+                0, 0, 1, 0, 0, LALU_MODE.MODE_RSQRT.value, rms_sqrt_scalar,
+                URAM_SECTION.URAM_A.value, 0, 0, URAM_WRITE_SRC.URAM_WB_DISABLE.value,
+                UE_MODE.RMS, 0, urow, 0, row_size, 0, 0, 0)
+            self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, sram, sram, N)
+            self.eltwise_mul_core(sram, gamma_sram_addr, sram, N)
+
+        # ===== outer chunk loop (2 live PBI pointers: row_load_ptr, row_store_ptr) =====
+        program_dram_start_addr = self.get_program_dram_addr()
+        cur_inst_count = self.capture_count
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES))
+
+        self.generate_instruction_add_imm(src_reg_idx=gpr_M_reg, immediate_value=0, dst_reg_idx=remaining_reg)
+        self.generate_instruction_reg_min(rows_take_reg, remaining_reg, u_reg)
+        body_start_inst_cnt = self.capture_count
+
+        # Batched DMA load: rows_take rows in ONE transfer into SRAM rows [0, rows_take). The pointer
+        # auto-advances by chunk_stride (=U*row_bytes) for the next chunk.
+        _dma_len()
+        _set(row_load_ptr, PBI_FIELD.DMA_LENGTH, dma_len_reg)
+        self.accelerator_memory_to_sram(accelerator_dram_address=chunk_stride, sram_address=vector_sram_addr, element_size=0, inst_pointer_idx=row_load_ptr)
+
+        # Unrolled plain per-row compute over all U slots. Only rows [0, rows_take) hold real data
+        # and only they are stored below; slots [rows_take, U) compute on stale SRAM and are dropped.
+        for j in range(U):
+            _rms_row(vector_sram_addr + j * row_bytes)
+
+        # Batched DMA store: rows_take rows in ONE transfer (dma_len_reg unchanged since the load).
+        _set(row_store_ptr, PBI_FIELD.DMA_LENGTH, dma_len_reg)
+        self.sram_to_accelerator_memory(sram_address=vector_sram_addr, accelerator_dram_address=chunk_stride, element_size=0, inst_pointer_idx=row_store_ptr)
+
+        # Recompute the next chunk's row count (DRAM cursors auto-advanced via the DMA pointers).
+        self.generate_instruction_reg_sub(remaining_reg, remaining_reg, rows_take_reg)
+        self.generate_instruction_reg_min(rows_take_reg, remaining_reg, u_reg)
+
+        outer_loop_size = self.capture_count - body_start_inst_cnt + 2
+        self.generate_instruction_jump_rela_jnz(outer_loop_size, remaining_reg)
+
+        print(f"RMS norm dynamic (chunk-tiled) outer loop body size: {outer_loop_size} "
+              f"(U={U} rows/chunk × ceil(M/U) chunks, M=GPR[{gpr_M_reg}], N={N} compile-time, 2 PBI pointers)")
+        assert outer_loop_size <= 256, f"{fn}: outer loop body {outer_loop_size} exceeds i-cache budget 256"
+
+        self.release_inst_ptr(row_store_ptr)
+        self.release_inst_ptr(row_load_ptr)
+        for _ in range(len(_alloc_list)):
+            self.release_isa_reg()
+
+        return 3 * M * N + M * N  # RMS + gamma mul
+
     def rms_norm_core_dram_legacy(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int) -> None:
         """
         Legacy RMS-norm DRAM path that emits one software-unrolled row op sequence per row.
@@ -2745,15 +2975,34 @@ class UnifiedEngine:
 
     # rms_norm dram version of rms norm core
     def rms_norm_core_dram(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int,
-                           gpr_M_reg: Optional[int] = None) -> None:
-        """RMS norm DRAM entrypoint; dispatches based on ``gpr_M_reg``:
+                           gpr_M_reg: Optional[int] = None, gpr_N_reg: Optional[int] = None,
+                           gpr_rms_scale_reg: Optional[int] = None,
+                           gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
+                           gpr_gamma_addr: Optional[int] = None, real_N: Optional[int] = None) -> None:
+        """RMS norm DRAM entrypoint; dispatches based on ``gpr_N_reg`` / ``gpr_M_reg``:
 
+        - ``gpr_N_reg`` is a GPR index (with ``gpr_M_reg``): :meth:`rms_norm_core_dram_dynamic` —
+          runtime **M**, N baked at capture. ``sqrt(N)`` is baked as the RSQRT scalar (pass ``real_N``
+          = unpadded hidden size; defaults to ``N``), so the caller uploads a plain gamma.
+          ``gpr_rms_scale_reg`` is deprecated/ignored.
         - ``gpr_M_reg`` is a GPR index (1..15): :meth:`rms_norm_core_dram_pbi` — outer row loop trip
           count is taken from that register at runtime (caller must prime it via ``ADD_SET``). The
           captured program has no static reference to ``M``; ``M`` is FLOPs-accounting only.
         - ``gpr_M_reg is None`` (default): :meth:`rms_norm_core_dram_legacy` — compile-time
           ``chunk_size`` tiling, no GPR needed.
+
+        ``gpr_a_addr`` / ``gpr_out_addr`` / ``gpr_gamma_addr`` (PBI / dynamic paths) optionally source the
+        input / output / gamma DRAM bases from GPRs (word addr) — see :meth:`rms_norm_core_dram_pbi`.
         """
+        if gpr_N_reg is not None:
+            # gpr_rms_scale_reg is accepted for backward compatibility but ignored (sqrt(N) is folded
+            # into gamma host-side).
+            return self.rms_norm_core_dram_dynamic(
+                M=M, N=N, A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
+                gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg, gpr_rms_scale_reg=gpr_rms_scale_reg,
+                gpr_a_addr=gpr_a_addr, gpr_out_addr=gpr_out_addr, gpr_gamma_addr=gpr_gamma_addr,
+                real_N=real_N,
+            )
         if gpr_M_reg is not None:
             return self.rms_norm_core_dram_pbi(
                 M=M,
@@ -2762,7 +3011,12 @@ class UnifiedEngine:
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
                 gpr_M_reg=gpr_M_reg,
+                gpr_a_addr=gpr_a_addr,
+                gpr_out_addr=gpr_out_addr,
+                gpr_gamma_addr=gpr_gamma_addr,
             )
+        if any(r is not None for r in (gpr_a_addr, gpr_out_addr, gpr_gamma_addr)):
+            raise ValueError("rms_norm_core_dram: gpr_*_addr require the PBI path (set gpr_M_reg)")
 
         return self.rms_norm_core_dram_legacy(
             M=M,
@@ -2798,7 +3052,9 @@ class UnifiedEngine:
 
     def layer_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                                  GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
-                                 gpr_M_reg: int = None, ZEROS_DRAM_ADDR: int = None) -> int:
+                                 gpr_M_reg: int = None, ZEROS_DRAM_ADDR: int = None,
+                                 gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
+                                 gpr_gamma_addr: Optional[int] = None, gpr_beta_addr: Optional[int] = None) -> int:
         """PBI-backed layer norm.  Matches the legacy's chunk-tiled DMA granularity so performance
         is on par, while the captured program shrinks from ~M*6 instructions to ~chunk_size*6+4.
 
@@ -2820,6 +3076,14 @@ class UnifiedEngine:
         assert M >= 1, "layer_norm_core_dram_pbi() requires M >= 1"
         if not (1 <= gpr_M_reg <= 15):
             raise ValueError(f"layer_norm_core_dram_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
+        self._validate_addr_gprs("layer_norm_core_dram_pbi", gpr_M_reg, {
+            "gpr_a_addr": gpr_a_addr, "gpr_out_addr": gpr_out_addr,
+            "gpr_gamma_addr": gpr_gamma_addr, "gpr_beta_addr": gpr_beta_addr,
+        })
+        if gpr_gamma_addr is not None and GAMMA_DRAM_ADDR is None:
+            raise ValueError("layer_norm_core_dram_pbi: gpr_gamma_addr given but GAMMA_DRAM_ADDR is None")
+        if gpr_beta_addr is not None and BETA_DRAM_ADDR is None:
+            raise ValueError("layer_norm_core_dram_pbi: gpr_beta_addr given but BETA_DRAM_ADDR is None")
         assert self.is_capture_on, "layer_norm_core_dram_pbi() requires active capture"
         assert N % UE_VECTOR_SIZE == 0, f"layer_norm_core_dram_pbi() requires N to be a multiple of {UE_VECTOR_SIZE}, got N={N}"
         if N > URAM_NEAR_FULL_ELEMENTS:
@@ -2868,13 +3132,15 @@ class UnifiedEngine:
         if GAMMA_DRAM_ADDR is not None:
             gamma_sram_addr = params_sram_addr
             self.accelerator_memory_to_sram(accelerator_dram_address=GAMMA_DRAM_ADDR,
-                                            sram_address=gamma_sram_addr, element_size=N)
+                                            sram_address=gamma_sram_addr, element_size=N,
+                                            general_reg_src=gpr_gamma_addr)
             params_sram_addr += N * bpe
 
         if BETA_DRAM_ADDR is not None:
             beta_sram_addr = params_sram_addr
             self.accelerator_memory_to_sram(accelerator_dram_address=BETA_DRAM_ADDR,
-                                            sram_address=beta_sram_addr, element_size=N)
+                                            sram_address=beta_sram_addr, element_size=N,
+                                            general_reg_src=gpr_beta_addr)
             params_sram_addr += N * bpe
 
         _, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_addr)
@@ -2902,6 +3168,12 @@ class UnifiedEngine:
             uram_wb_addr=0, uram_dst_addr=0, fmax_context_addr=0,
             inst_pointer_idx=row_store_ptr,
         )
+
+        # Optional: source the input/output pointer bases from GPRs (word addr) once before the loop.
+        if gpr_a_addr is not None:
+            self._pbi_override_dram_base_from_gpr(row_load_ptr, gpr_a_addr)
+        if gpr_out_addr is not None:
+            self._pbi_override_dram_base_from_gpr(row_store_ptr, gpr_out_addr)
 
         program_dram_start_addr = self.get_program_dram_addr()
         cur_inst_count = self.capture_count
@@ -2956,6 +3228,295 @@ class UnifiedEngine:
         if gamma_sram_addr is not None:
             total_flops += M * N
         if beta_sram_addr is not None:
+            total_flops += M * N
+        return total_flops
+
+    def layer_norm_core_dram_dynamic(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                                     gpr_M_reg: int, gpr_N_reg: int, gpr_n_scale_reg: Optional[int] = None,
+                                     gpr_rms_scale_reg: Optional[int] = None,
+                                     GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None, ZEROS_DRAM_ADDR: int = None,
+                                     INV_N_DRAM_ADDR: int = None, MASK_DRAM_ADDR: Optional[int] = None,
+                                     gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
+                                     gpr_gamma_addr: Optional[int] = None, gpr_beta_addr: Optional[int] = None,
+                                     gpr_invn_addr: Optional[int] = None, gpr_mask_addr: Optional[int] = None,
+                                     real_N: Optional[int] = None) -> int:
+        """Layer norm with runtime M and N (hidden_size) — one captured body serves any (M, N).
+
+        Chunk-tiled, like :meth:`rms_norm_core_dram_dynamic`: batches up to
+        ``U = min(URAM_A capacity, 16)`` rows per DMA and runs the full per-row LayerNorm sequence
+        (mean prescale+reduce -> subtract -> optional mask -> rms -> scale -> optional gamma/beta) as
+        PLAIN (non-PBI) software-unrolled ops at compile-time SRAM offsets; only the two DMA pointers
+        (``load_ptr``/``store_ptr``) are PBI. Each unrolled row gets its own scratch row-group (past
+        the U staged vector rows) so the prescale/reduce pairs stay independent across rows.
+
+        **No runtime LALU scalars — both N-dependent scalars are folded away:**
+
+          * **mean** ``= sum(x)/N``: prescale ``xn = x*inv_n`` into a per-row scratch region (so
+            ``x`` survives at its slot for the subtract with no copy), then ``ADD_REDUCE(xn)`` +
+            ``RECIP(scalar=1.0)`` (``ADD_REDUCE`` swaps the LALU operands so reduce=numerator,
+            scalar=denominator -> mean/1). ``inv_n`` (every element = ``1/N``) is uploaded by the
+            caller (``INV_N_DRAM_ADDR``), like gamma. **Both instructions must be plain (non-PBI):**
+            ``ADD_REDUCE_MODE``'s LALU operand-swap mux in ``accelerator_wrapper.sv`` only works
+            through a plain ``INSTRUCTION_UE_OP`` — driving it through a PBI pointer produces garbage
+            (confirmed on HW). Correctness when a replay's runtime N is smaller than the compile-time
+            N depends on ``inv_n`` being zero out to the compile-time N, not just the nearest 64.
+          * **1/std** ``= sqrt(N)/sqrt(sum(centered^2))``: because N is compile-time, the ``RSQRT``
+            scalar is baked as ``float_to_bf19(sqrt(real_N))`` (like legacy) and the caller uploads a
+            **plain** gamma, exactly as in :meth:`rms_norm_core_dram_dynamic`. ``real_N`` is the
+            unpadded hidden size (defaults to ``N``). This avoids the extra bf16 re-rounding of a
+            ``gamma*sqrt(N)`` product that cost ~0.25-0.75 dB SNR vs legacy. The **mean** ``1/N`` is
+            still delivered as the ``inv_n`` vector (its bf16 rounding is second-order — the mean is
+            small — so it doesn't measurably move SNR).
+
+        ``gpr_n_scale_reg`` / ``gpr_rms_scale_reg`` are ignored (kept only for signature
+        compatibility).
+
+        Preloads (zeros/inv_n/gamma/beta/mask into URAM_B) are issued as plain non-PBI DMAs, not
+        chained ``pbi_init`` reconfigures of one pointer: ``pbi_init``'s ``PBI_SET`` is prefetchable
+        (gated only on compute-engine busy, not on a DMA still draining), so a later preload's
+        ``pbi_init`` can race ahead of an earlier preload's still-in-flight DMA and silently corrupt
+        it (confirmed on HW). ``gpr_*_addr`` overrides for the preloads use ``general_reg_src`` /
+        ``INSTRUCTION_REG_REWRITE`` instead, which isn't prefetchable.
+
+        Only two PBI pointers (load_ptr, store_ptr) are live — all compute is plain — well under the
+        hardware's live-PBI-pointer limit, see [[dynamic-core-pbi-pointer-limit]].
+
+        ``gpr_M_reg`` (1..15) and ``gpr_N_reg`` (1..31) are required and caller-primed.
+        ``GAMMA_DRAM_ADDR`` / ``BETA_DRAM_ADDR`` are optional; ``INV_N_DRAM_ADDR`` is **required**
+        (the ``1/N`` vector). ``gpr_*_addr`` optionally source DRAM bases from GPRs. ``N`` a multiple
+        of ``UE_VECTOR_SIZE`` and ``<= 65536`` (so the inv_n/zeros/gamma/beta bands fit URAM_B and the
+        vector fits URAM_A); ``<= 51200`` when ``MASK_DRAM_ADDR`` is given (the mask band needs
+        URAM_B room too).
+
+        **Non-64-aligned hidden_size** is served by host-side zero padding to ``padded_N`` (a
+        multiple of 64), same idea as :meth:`rms_norm_core_dram_dynamic`, plus one extra wrinkle:
+        mean-centering means plain zero-padding alone contaminates both the mean (pad lanes still get
+        counted by a naive ``1/padded_N``) and the variance (subtracting the mean turns pad lanes'
+        value from 0 into ``-mean``, leaking into the RMS reduce). Both are neutralized without any
+        RTL change:
+
+          * The mean contamination is fixed by also zero-padding ``inv_n`` itself: real lanes carry
+            ``1/N`` (the true, un-padded N), pad lanes carry ``0``, so ``xn = x*inv_n`` is already
+            exactly 0 in the pad lanes.
+          * The variance contamination is fixed by ``MASK_DRAM_ADDR``, a caller-uploaded 0/1 vector
+            (``1`` for the ``N`` real lanes, ``0`` for the pad lanes). After subtracting the mean
+            (which reintroduces ``-mean`` in the pad lanes), the body multiplies by this mask before
+            the RMS reduce, re-zeroing the pad lanes.
+
+        ``MASK_DRAM_ADDR`` is optional; omitting it reproduces the exact instruction sequence for
+        64-aligned callers. Gamma/beta pad lanes don't need special handling: after masking they're
+        exactly 0 through the gamma multiply, and the caller slices ``[:N]`` off the output anyway.
+        """
+        fn = "layer_norm_core_dram_dynamic"
+        assert M >= 1 and N >= 1, f"{fn}: require M>=1 and N>=1"
+        if N % UE_VECTOR_SIZE != 0:
+            raise ValueError(f"{fn}: N must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got N={N}")
+        BAND_ROWS = 800 if MASK_DRAM_ADDR is not None else 1024
+        max_N_for_bands = BAND_ROWS * UE_VECTOR_SIZE
+        if N > max_N_for_bands:
+            raise ValueError(f"{fn}: N={N} exceeds {max_N_for_bands} (inv_n/zeros/gamma/beta{'/mask' if MASK_DRAM_ADDR is not None else ''} URAM_B bands must fit)")
+        if N > URAM_NEAR_FULL_ELEMENTS:
+            raise ValueError(f"{fn}: N={N} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS} (vector must fit URAM_A staging)")
+        if INV_N_DRAM_ADDR is None:
+            raise ValueError(f"{fn}: INV_N_DRAM_ADDR is required (the 1/N vector; caller uploads a length-N tensor of value 1/N)")
+        if GAMMA_DRAM_ADDR is None:
+            raise ValueError(f"{fn}: GAMMA_DRAM_ADDR is required (the per-row gamma multiply is always "
+                             "emitted; pass a plain ones vector for a no-gamma layer norm)")
+        # gpr_n_scale_reg / gpr_rms_scale_reg are deprecated/ignored (both scalars folded away).
+        for _nm, _rg, _hi in (("gpr_M_reg", gpr_M_reg, 15), ("gpr_N_reg", gpr_N_reg, 31)):
+            if _rg is None or not (1 <= _rg <= _hi):
+                raise ValueError(f"{fn}: {_nm} must be a GPR index 1..{_hi}, got {_rg}")
+        if gpr_M_reg == gpr_N_reg:
+            raise ValueError(f"{fn}: gpr_M_reg/gpr_N_reg must be distinct")
+        if gpr_gamma_addr is not None and GAMMA_DRAM_ADDR is None:
+            raise ValueError(f"{fn}: gpr_gamma_addr given but GAMMA_DRAM_ADDR is None")
+        if gpr_beta_addr is not None and BETA_DRAM_ADDR is None:
+            raise ValueError(f"{fn}: gpr_beta_addr given but BETA_DRAM_ADDR is None")
+        if gpr_mask_addr is not None and MASK_DRAM_ADDR is None:
+            raise ValueError(f"{fn}: gpr_mask_addr given but MASK_DRAM_ADDR is None")
+        self._validate_addr_gprs(fn, gpr_M_reg, {
+            "gpr_a_addr": gpr_a_addr, "gpr_out_addr": gpr_out_addr,
+            "gpr_gamma_addr": gpr_gamma_addr, "gpr_beta_addr": gpr_beta_addr, "gpr_invn_addr": gpr_invn_addr,
+            "gpr_mask_addr": gpr_mask_addr,
+        })
+        for _nm, _rg in (("gpr_a_addr", gpr_a_addr), ("gpr_out_addr", gpr_out_addr),
+                         ("gpr_gamma_addr", gpr_gamma_addr), ("gpr_beta_addr", gpr_beta_addr),
+                         ("gpr_invn_addr", gpr_invn_addr), ("gpr_mask_addr", gpr_mask_addr)):
+            if _rg is not None and _rg == gpr_N_reg:
+                raise ValueError(f"{fn}: {_nm}={_rg} collides with gpr_N_reg")
+        assert self.is_capture_on, f"{fn}() requires active capture"
+
+        # N baked at capture, M runtime (see class docstring). The mean stays a plain ADD_REDUCE
+        # (broken via PBI — see [[pbi-hazards-add-reduce-and-preload-race]]).
+        #
+        # URAM_A: U vector row-groups [0, U*N/64) + one shared SCRATCH row-group (prescale output, so x
+        # survives for the subtract). URAM_B bands: zeros@0, gamma@1*BAND_ROWS, beta@2*BAND_ROWS,
+        # inv_n@3*BAND_ROWS, mask(optional)@4*BAND_ROWS.
+        Z_ZEROS, Z_GAMMA, Z_BETA, Z_INV_N = 0, BAND_ROWS, 2 * BAND_ROWS, 3 * BAND_ROWS
+        Z_MASK = 4 * BAND_ROWS if MASK_DRAM_ADDR is not None else None
+        vector_sram_addr = 0x00000
+        zeros_sram_addr  = 0x80000
+        gamma_sram_addr  = 0x80000 + Z_GAMMA * UE_VECTOR_SIZE * 2
+        beta_sram_addr   = 0x80000 + Z_BETA * UE_VECTOR_SIZE * 2
+        invn_sram_addr   = 0x80000 + Z_INV_N * UE_VECTOR_SIZE * 2
+        mask_sram_addr   = 0x80000 + Z_MASK * UE_VECTOR_SIZE * 2 if Z_MASK is not None else None
+        _, vector_uram_row = self.sram_address_to_uram_address(vector_sram_addr)
+
+        bytes_per_element = 2
+        row_bytes = N * bytes_per_element            # compile-time
+        MAX_ROWS = N // UE_VECTOR_SIZE               # compile-time URAM rows per token / mean row_size
+        # std's sqrt(N) baked as the RSQRT scalar (matches legacy, plain gamma). Uses the UNPADDED
+        # real_N: the RMS reduce sums centered^2 over the padded row but the mask zeroes pad lanes, so
+        # the sqrt factor must be sqrt(real_N). Defaults to N for 64-aligned callers (no padding).
+        ln_sqrt_scalar = self.float_to_bf19(float(math.sqrt(real_N if real_N is not None else N)))
+
+        # Unroll factor U: U vector row-groups + U per-row scratch row-groups must fit URAM_A; capped
+        # at 16 so the unrolled body stays under the i-cache window (tail waste <= U-1 rows). Each
+        # unrolled row gets its own scratch (SCRATCH_BASE + j*MAX_ROWS) rather than sharing one, since
+        # a shared scratch would be a WAR hazard between row j's reduce and row j+1's prescale (URAM
+        # addresses aren't hazard-tracked the way the single LALU register is).
+        U = max(1, min(URAM_NEAR_FULL_ADDR // MAX_ROWS // 2, 16))
+        SCRATCH_BASE = vector_uram_row + U * MAX_ROWS  # per-row prescale scratch, past all U vector rows
+
+        _alloc_list = []
+        def _alloc():
+            r = self.alloc_isa_reg(); _alloc_list.append(r); return r
+
+        remaining_reg = _alloc()   # rows not yet processed
+        rows_take_reg = _alloc()   # min(remaining, U) -- this chunk's row count
+        dma_len_reg   = _alloc()   # rows_take*row_bytes (chunk DMA length, load and store)
+        u_reg         = _alloc()   # U literal (reg_min clamp)
+        # dma_len = rows_take * row_bytes: a 1-cycle SHL when row_bytes is a power of two (the common
+        # case), else a mul32 (rare non-pow2 host-padded N).
+        row_bytes_is_pow2 = (row_bytes & (row_bytes - 1)) == 0
+        row_bytes_shift = (row_bytes.bit_length() - 1) if row_bytes_is_pow2 else 0
+        rowb_reg = None if row_bytes_is_pow2 else _alloc()
+        if rowb_reg is not None:
+            self.generate_instruction_add_set(rowb_reg, row_bytes)
+        self.generate_instruction_add_set(u_reg, U)
+
+        def _set(ptr, field, reg):
+            self.generate_instruction_pbi_inc(general_reg_src=reg, pbi_field_select=field, inst_pointer_idx=ptr)
+
+        def _dma_len():
+            if row_bytes_is_pow2:
+                self.generate_instruction_shl(dma_len_reg, rows_take_reg, row_bytes_shift)
+            else:
+                self.generate_instruction_mul32_reg(dma_len_reg, rows_take_reg, rowb_reg)
+
+        load_ptr  = self.alloc_inst_ptr()
+        store_ptr = self.alloc_inst_ptr()
+
+        # --- one-shot pre-loop loads of zeros / inv_n / gamma / beta / mask into URAM_B ---
+        if ZEROS_DRAM_ADDR is not None:
+            zeros_dram_addr = ZEROS_DRAM_ADDR
+        else:
+            zeros_dram_addr = self.get_params_dram_addr()
+            self.allocate_params_dram(N * 2)
+            self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * 2)
+
+        # Plain (non-PBI) DMA preloads — see [[pbi-hazards-add-reduce-and-preload-race]] (chained
+        # pbi_init reconfigures can race ahead of a still-draining DMA).
+        def _preload(dram_addr, sram_addr, gpr_base):
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=(0 if gpr_base is not None else dram_addr),
+                sram_address=sram_addr, element_size=N, general_reg_src=gpr_base)
+
+        _preload(zeros_dram_addr, zeros_sram_addr, None)
+        _preload(INV_N_DRAM_ADDR, invn_sram_addr, gpr_invn_addr)
+        if GAMMA_DRAM_ADDR is not None:
+            _preload(GAMMA_DRAM_ADDR, gamma_sram_addr, gpr_gamma_addr)
+        if BETA_DRAM_ADDR is not None:
+            _preload(BETA_DRAM_ADDR, beta_sram_addr, gpr_beta_addr)
+        if MASK_DRAM_ADDR is not None:
+            _preload(MASK_DRAM_ADDR, mask_sram_addr, gpr_mask_addr)
+
+        # load_ptr / store_ptr: ONE batched transfer of rows_take rows per chunk. Both auto-increment
+        # their DRAM cursor by the full-chunk stride U*row_bytes each transfer, so no per-chunk
+        # DRAM_ADDR set is needed. DMA_LENGTH (actual transfer size) is set per chunk.
+        chunk_stride = U * row_bytes
+        self.generate_instruction_pbi_init(dram_shared_addr=A_DRAM_ADDR, dma_length=chunk_stride,
+                                           uram_dst_addr=vector_uram_row, inst_pointer_idx=load_ptr)
+        self.generate_instruction_pbi_init(dram_shared_addr=OUTPUT_DRAM_ADDR, dma_length=chunk_stride,
+                                           uram_a_start_addr=vector_uram_row,
+                                           uram_b_start_addr=vector_uram_row, inst_pointer_idx=store_ptr)
+        # Optional dynamic DRAM bases: override the pointer bases once (auto-inc then walks from there).
+        if gpr_a_addr is not None:
+            self._pbi_override_dram_base_from_gpr(load_ptr, gpr_a_addr)
+        if gpr_out_addr is not None:
+            self._pbi_override_dram_base_from_gpr(store_ptr, gpr_out_addr)
+
+        def _ln_row(sram, scratch_row):
+            # Full per-row LayerNorm as PLAIN ops at a compile-time SRAM offset. mean via inv_n
+            # prescale into this row's SCRATCH (x survives at `sram`) + ADD_REDUCE(scratch) +
+            # RECIP(1.0); then subtract mean, optional mask, rms-of-centered (RSQRT scalar=sqrt(real_N),
+            # so sqrt(N) rides the scalar like legacy and gamma is plain), scale, optional gamma/beta.
+            _, urow = self.sram_address_to_uram_address(sram)
+            self.ue_arithmetic_op(
+                0, 0, 1, 0, 0, LALU_MODE.BYPASS.value, 0, URAM_SECTION.URAM_A.value,
+                0, scratch_row, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+                UE_MODE.ELTWISE_MUL, 0, urow, Z_INV_N, MAX_ROWS, 0, 0, 0)
+            self.ue_arithmetic_op(
+                0, 0, 1, 0, 0, LALU_MODE.MODE_RECIP.value, self.float_to_bf19(1.0), URAM_SECTION.URAM_A.value,
+                0, 0, URAM_WRITE_SRC.URAM_WB_DISABLE.value,
+                UE_MODE.ADD_REDUCE, 0, scratch_row, Z_ZEROS, MAX_ROWS, 0, 0, 0)
+            self.start_queue_broadcast(UE_MODE.ADD_BROADCAST, BROADCAST_MODE.LALU_RESULT_NEGATE, sram, sram, N)
+            if MASK_DRAM_ADDR is not None:
+                self.eltwise_mul_core(sram, mask_sram_addr, sram, N)
+            self.ue_arithmetic_op(
+                0, 0, 1, 0, 0, LALU_MODE.MODE_RSQRT.value, ln_sqrt_scalar, URAM_SECTION.URAM_A.value,
+                0, 0, URAM_WRITE_SRC.URAM_WB_DISABLE.value,
+                UE_MODE.RMS, 0, urow, 0, MAX_ROWS, 0, 0, 0)
+            self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, sram, sram, N)
+            if GAMMA_DRAM_ADDR is not None:
+                self.eltwise_mul_core(sram, gamma_sram_addr, sram, N)
+            if BETA_DRAM_ADDR is not None:
+                self.eltwise_add_core(sram, beta_sram_addr, sram, N)
+
+        # ===== outer chunk loop (2 live PBI pointers: load_ptr, store_ptr) =====
+        program_dram_start_addr = self.get_program_dram_addr()
+        cur_inst_count = self.capture_count
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES))
+
+        self.generate_instruction_add_imm(src_reg_idx=gpr_M_reg, immediate_value=0, dst_reg_idx=remaining_reg)
+        self.generate_instruction_reg_min(rows_take_reg, remaining_reg, u_reg)
+        body_start_inst_cnt = self.capture_count
+
+        # Batched DMA load: rows_take rows in ONE transfer into SRAM rows [0, rows_take). The pointer
+        # auto-advances by chunk_stride (=U*row_bytes) for the next chunk.
+        _dma_len()
+        _set(load_ptr, PBI_FIELD.DMA_LENGTH, dma_len_reg)
+        self.accelerator_memory_to_sram(accelerator_dram_address=chunk_stride, sram_address=vector_sram_addr, element_size=0, inst_pointer_idx=load_ptr)
+
+        # Unrolled plain per-row LayerNorm over all U slots; only rows [0, rows_take) are stored.
+        for j in range(U):
+            _ln_row(vector_sram_addr + j * row_bytes, SCRATCH_BASE + j * MAX_ROWS)
+
+        # Batched DMA store: rows_take rows in ONE transfer.
+        _set(store_ptr, PBI_FIELD.DMA_LENGTH, dma_len_reg)
+        self.sram_to_accelerator_memory(sram_address=vector_sram_addr, accelerator_dram_address=chunk_stride, element_size=0, inst_pointer_idx=store_ptr)
+
+        # Recompute the next chunk's row count (DRAM cursors auto-advanced via the DMA pointers).
+        self.generate_instruction_reg_sub(remaining_reg, remaining_reg, rows_take_reg)
+        self.generate_instruction_reg_min(rows_take_reg, remaining_reg, u_reg)
+
+        outer_loop_size = self.capture_count - body_start_inst_cnt + 2
+        self.generate_instruction_jump_rela_jnz(outer_loop_size, remaining_reg)
+
+        print(f"Layer norm dynamic (chunk-tiled) outer loop body size: {outer_loop_size} "
+              f"(U={U} rows/chunk × ceil(M/U) chunks, M=GPR[{gpr_M_reg}], N={N} compile-time, 2 PBI pointers)")
+        assert outer_loop_size <= 256, f"{fn}: outer loop body {outer_loop_size} exceeds i-cache budget 256"
+
+        self.release_inst_ptr(store_ptr)
+        self.release_inst_ptr(load_ptr)
+        for _ in range(len(_alloc_list)):
+            self.release_isa_reg()
+
+        total_flops = 5 * M * N
+        if GAMMA_DRAM_ADDR is not None:
+            total_flops += M * N
+        if BETA_DRAM_ADDR is not None:
             total_flops += M * N
         return total_flops
 
@@ -3025,22 +3586,59 @@ class UnifiedEngine:
 
     def layer_norm_core_dram(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                               GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
-                              gpr_M_reg: Optional[int] = None, ZEROS_DRAM_ADDR: int = None) -> int:
-        """Layer norm DRAM entrypoint; dispatches based on ``gpr_M_reg``:
+                              gpr_M_reg: Optional[int] = None, ZEROS_DRAM_ADDR: int = None,
+                              gpr_N_reg: Optional[int] = None, gpr_n_scale_reg: Optional[int] = None,
+                              gpr_rms_scale_reg: Optional[int] = None, INV_N_DRAM_ADDR: int = None,
+                              MASK_DRAM_ADDR: Optional[int] = None,
+                              gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
+                              gpr_gamma_addr: Optional[int] = None, gpr_beta_addr: Optional[int] = None,
+                              gpr_invn_addr: Optional[int] = None, gpr_mask_addr: Optional[int] = None,
+                              real_N: Optional[int] = None) -> int:
+        """Layer norm DRAM entrypoint; dispatches based on ``gpr_N_reg`` / ``gpr_M_reg`` (this is the
+        single call site — do not add a separate function for a new mode, extend the dispatch below):
 
+        - ``gpr_N_reg`` is a GPR index (with ``gpr_M_reg``): :meth:`layer_norm_core_dram_dynamic` —
+          runtime **M**, N baked at capture. The caller uploads ``INV_N_DRAM_ADDR`` (the ``1/N``
+          vector, for the mean) and a plain gamma; the std's ``sqrt(N)`` is baked as the RSQRT scalar
+          (pass ``real_N`` = unpadded hidden size; defaults to ``N``). ``gpr_n_scale_reg`` /
+          ``gpr_rms_scale_reg`` are deprecated/ignored. ``MASK_DRAM_ADDR`` (optional) additionally
+          enables non-64-aligned runtime ``N`` via host-side zero padding — see
+          :meth:`layer_norm_core_dram_dynamic`.
         - ``gpr_M_reg`` is a GPR index (1..15): :meth:`layer_norm_core_dram_pbi` — outer row loop
           trip count is taken from that register at runtime (caller must prime it via ``ADD_SET``).
           ``M`` is FLOPs-accounting only; the captured program has no static reference to it.
         - ``gpr_M_reg is None`` (default): :meth:`layer_norm_core_dram_legacy` — compile-time
           chunk-tiled, M-unrolled path.
+
+        ``gpr_a_addr`` / ``gpr_out_addr`` / ``gpr_gamma_addr`` / ``gpr_beta_addr`` (PBI / dynamic paths)
+        optionally source the input/output/gamma/beta DRAM bases from GPRs (word addr). The constant
+        zeros buffer stays a literal (it does not vary per layer). See :meth:`layer_norm_core_dram_pbi`.
         """
+        if gpr_N_reg is not None:
+            # gpr_n_scale_reg / gpr_rms_scale_reg are accepted for backward compat but ignored (both
+            # scalars are folded away: 1/N via INV_N_DRAM_ADDR, sqrt(N) into gamma).
+            return self.layer_norm_core_dram_dynamic(
+                M=M, N=N, A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg,
+                GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR, ZEROS_DRAM_ADDR=ZEROS_DRAM_ADDR,
+                INV_N_DRAM_ADDR=INV_N_DRAM_ADDR, MASK_DRAM_ADDR=MASK_DRAM_ADDR,
+                gpr_a_addr=gpr_a_addr, gpr_out_addr=gpr_out_addr,
+                gpr_gamma_addr=gpr_gamma_addr, gpr_beta_addr=gpr_beta_addr, gpr_invn_addr=gpr_invn_addr,
+                gpr_mask_addr=gpr_mask_addr, real_N=real_N,
+            )
+        if MASK_DRAM_ADDR is not None or gpr_mask_addr is not None:
+            raise ValueError("layer_norm_core_dram: MASK_DRAM_ADDR/gpr_mask_addr require the dynamic path (set gpr_N_reg)")
         if gpr_M_reg is not None:
             return self.layer_norm_core_dram_pbi(
                 M=M, N=N,
                 A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR,
                 gpr_M_reg=gpr_M_reg, ZEROS_DRAM_ADDR=ZEROS_DRAM_ADDR,
+                gpr_a_addr=gpr_a_addr, gpr_out_addr=gpr_out_addr,
+                gpr_gamma_addr=gpr_gamma_addr, gpr_beta_addr=gpr_beta_addr,
             )
+        if any(r is not None for r in (gpr_a_addr, gpr_out_addr, gpr_gamma_addr, gpr_beta_addr)):
+            raise ValueError("layer_norm_core_dram: gpr_*_addr require the PBI path (set gpr_M_reg)")
         return self.layer_norm_core_dram_legacy(
             M=M, N=N,
             A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
@@ -3201,9 +3799,14 @@ class UnifiedEngine:
                                             accelerator_dram_address=output_dram_addr + half_bytes, element_size=half)
         return 4 * N
 
-    def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
-        """HF RoPE DRAM entrypoint; dispatches based on ``N`` and ``gpr_M_reg``:
+    def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None,
+                          gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None,
+                          gpr_N_reg: Optional[int] = None) -> int:
+        """HF RoPE DRAM entrypoint; dispatches based on ``N``, ``gpr_M_reg`` and ``gpr_N_reg``:
 
+        - ``gpr_N_reg`` is a GPR index (N>=128 only): :meth:`rope_hf_core_dram_dynamic` — the
+          fast batched core with runtime (dynamic) M **and** N (head_dim); one captured body serves
+          any (M, head_dim). Requires ``gpr_M_reg``. Caller primes both registers via ``ADD_SET``.
         - ``N < 128``: :meth:`rope_hf_core_dram_d64_pbi` — padded-split path for head_dim<128,
           where each N/2-elem half is sub-128-byte and cannot be SRAM-sliced mid-row. Requires
           ``gpr_M_reg`` (PBI hardware loop). Same contiguous ``[cos(N) || sin(N)]`` table layout
@@ -3214,6 +3817,13 @@ class UnifiedEngine:
         - ``N >= 128`` and ``gpr_M_reg is None`` (default): :meth:`rope_hf_core_dram_legacy` —
           Python-unrolled rows.
         """
+        if gpr_N_reg is not None:
+            if N < 128:
+                raise ValueError("rope_hf_core_dram: dynamic N (gpr_N_reg) is only supported for N>=128; "
+                                 "head_dim<128 uses the compile-time-N d64 path")
+            return self.rope_hf_core_dram_dynamic(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr,
+                                                  gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg,
+                                                  gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr)
         if N < 128:
             # D<128 padded-split path: each half-vector is N/2 elems (< 128 bytes), so SRAM can't
             # slice it mid-row. The unified :meth:`rope_hf_core_dram_pbi` handles this via its
@@ -3221,9 +3831,13 @@ class UnifiedEngine:
             # pointers). PBI-only — requires gpr_M_reg.
             if gpr_M_reg is None:
                 raise ValueError("rope_hf_core_dram: N<128 requires gpr_M_reg (PBI padded-split path)")
-            return self.rope_hf_core_dram_pbi(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg)
+            return self.rope_hf_core_dram_pbi(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg,
+                                              gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr)
         if gpr_M_reg is not None:
-            return self.rope_hf_core_dram_pbi(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg)
+            return self.rope_hf_core_dram_pbi(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg,
+                                              gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr)
+        if any(r is not None for r in (gpr_input_addr, gpr_out_addr, gpr_cos_addr)):
+            raise ValueError("rope_hf_core_dram: gpr_*_addr require the PBI path (set gpr_M_reg)")
         return self.rope_hf_core_dram_legacy(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr)
 
     def rope_hf_core_dram_legacy(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int) -> int:
@@ -3253,7 +3867,8 @@ class UnifiedEngine:
             self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr + row_idx * row_bytes, element_size=N)
         return 4 * M * N
 
-    def rope_hf_core_dram_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None) -> int:
+    def rope_hf_core_dram_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None,
+                              gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None) -> int:
         """PBI-backed HF RoPE over M rows. Caller must have start_capture() before and stop_capture() after.
 
         **Batch dimension / M (dynamic, required):**
@@ -3262,12 +3877,24 @@ class UnifiedEngine:
         whatever value that register holds at execute time; ``M`` is FLOPs-accounting / template
         only — the captured program has no static reference to ``M``.
 
+        **DRAM base addresses (optional dynamic):** ``gpr_input_addr`` / ``gpr_out_addr`` /
+        ``gpr_cos_addr`` are optional GPR indices (1..31) holding the input / output / cos-table
+        base as a **word** address (``byte >> 3``); ``sin`` stays contiguous after ``cos`` (the
+        ``sin == cos + row`` invariant holds at runtime too). When given, that base is sourced from
+        the GPR so one captured program serves any placement. In the N<128 branch the bases seed the
+        internal per-row cursor registers (copied so the caller's GPR is preserved across the loop);
+        in the N>=128 branch they override the PBI pointer bases. ``None`` → literal. See
+        :meth:`eltwise_core_dram_pbi`.
+
         When N//2 * 2 < 128 (e.g. N=64, half=32), each half is placed in a padded 128-byte SRAM
         slot. Eight PBI pointers are used (2×x, 4×rope, 2×output), each transferring half_bytes
         per iteration with row-stride advances.
         """
         assert M >= 1, "M must be at least 1"
         assert N % 2 == 0, "N must be even for RoPE half layout"
+        self._validate_addr_gprs("rope_hf_core_dram_pbi", gpr_M_reg, {
+            "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr, "gpr_cos_addr": gpr_cos_addr,
+        })
         # The padded-split branch (N<128) places each half in its own 128-byte SRAM slot, so it
         # only needs even N — any head_dim < 128 works (e.g. 64, 76->38, 80->40). The N>=128
         # branch slices SRAM mid-row, which requires 64-aligned halves (N a multiple of 64).
@@ -3313,10 +3940,21 @@ class UnifiedEngine:
             out_reg = self.alloc_isa_reg()
             tmp_r   = self.alloc_isa_reg()
 
-            # Prime address registers with starting DRAM addresses (shifted format)
-            self.generate_instruction_add_set(x_reg,   ue_35bit_addr_shifter(input_dram_addr))
-            self.generate_instruction_add_set(cos_reg,  ue_35bit_addr_shifter(cos_dram_addr))
-            self.generate_instruction_add_set(out_reg,  ue_35bit_addr_shifter(output_dram_addr))
+            # Prime per-row cursor registers with the starting DRAM addresses (word/shifted format).
+            # When a base GPR is supplied, COPY it into the cursor (cursor += imm 0) so the caller's
+            # GPR is left intact for the next replay while the cursor is free to advance each row.
+            if gpr_input_addr is not None:
+                self.generate_instruction_add_imm(gpr_input_addr, 0, x_reg)
+            else:
+                self.generate_instruction_add_set(x_reg,   ue_35bit_addr_shifter(input_dram_addr))
+            if gpr_cos_addr is not None:
+                self.generate_instruction_add_imm(gpr_cos_addr, 0, cos_reg)
+            else:
+                self.generate_instruction_add_set(cos_reg,  ue_35bit_addr_shifter(cos_dram_addr))
+            if gpr_out_addr is not None:
+                self.generate_instruction_add_imm(gpr_out_addr, 0, out_reg)
+            else:
+                self.generate_instruction_add_set(out_reg,  ue_35bit_addr_shifter(output_dram_addr))
 
             program_dram_start_addr = self.get_program_dram_addr()
             cur_inst_count = self.capture_count
@@ -3426,6 +4064,15 @@ class UnifiedEngine:
                 inst_pointer_idx=out_ptr,
             )
 
+            # Optional: source pointer bases from GPRs (word addr) once before the loop. The rope
+            # pointer (cos base) reads [cos, sin] contiguously, so only the cos base is overridden.
+            if gpr_input_addr is not None:
+                self._pbi_override_dram_base_from_gpr(x_ptr, gpr_input_addr)
+            if gpr_cos_addr is not None:
+                self._pbi_override_dram_base_from_gpr(rope_ptr, gpr_cos_addr)
+            if gpr_out_addr is not None:
+                self._pbi_override_dram_base_from_gpr(out_ptr, gpr_out_addr)
+
             # Absolute jump keeps the ISA loop anchored at the current I-cache window.
             program_dram_start_addr = self.get_program_dram_addr()
             cur_inst_count = self.capture_count
@@ -3463,7 +4110,265 @@ class UnifiedEngine:
             self.release_inst_ptr(x_ptr)
         return 4 * M * N
 
-    def rope_hf_core_dram_d64_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None) -> int:
+    def rope_hf_core_dram_dynamic(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int,
+                                         cos_dram_addr: int, sin_dram_addr: int,
+                                         gpr_M_reg: int = None, gpr_N_reg: int = None,
+                                         gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
+                                         gpr_cos_addr: Optional[int] = None) -> int:
+        """Fast batched, 4-PBI-pointer HF RoPE with runtime M and N (head_dim>=128).
+
+        Follows the shape of the HW-confirmed :meth:`rms_norm_core_dram_dynamic` and
+        :meth:`matmat_mul_dynamic_core`: each eltwise op spans the whole head_dim (or half) in one
+        hardware op rather than 64 elements at a time, which requires a PBI pointer (only PBI field
+        overrides can set ``URAM_ROW_SIZE`` / ``DMA_LENGTH`` at execute time — the register-addressed
+        path can move only the DRAM address, not the length).
+
+        **Four PBI pointers** (matmat-style: A-load, B-load, compute, writeback):
+
+          * ``ptr_x``      — input x DMA (batched: ``rows_take`` rows in one transfer -> URAM_A row 0)
+          * ``ptr_rope``   — cos+sin table DMA (batched -> URAM_B row 0); table row is the contiguous
+                             ``[cos(N) | sin(N)]`` layout with sin's lower half pre-negated (HW add-only)
+          * ``ptr_wb``     — output DMA (batched, URAM_A row 0 -> DRAM)
+          * ``ptr_compute``— shared by the four row-spanning eltwise ops per row. The writeback bank
+                             (``uram_section``) and mode are per-instruction descriptor fields, not
+                             pointer-row fields, so one pointer serves ops writing to different banks;
+                             only the URAM addresses / row_size come from the pointer via ``_set``.
+
+        **Per-row compute** (mirrors :meth:`rope_hf_core_dram_legacy`'s 4 ops; sin pre-negated so the
+        rotate-half sign is folded into the table):
+
+            a         = x * cos                 (full row  -> URAM_A a-region)
+            b[:half]  = x[half:] * sin[:half]    (half row  -> URAM_B b-region)   # = x2 * (-s)
+            b[half:]  = x[:half] * sin[half:]    (half row  -> URAM_B b-region)   # = x1 *   s
+            out       = a + b                    (full row  -> URAM_A, in place over x)
+
+        Operand A is always read from URAM_A (``URAM_START_ADDR_Y``), operand B from URAM_B
+        (``URAM_START_ADDR_Z``), writeback row from ``URAM_WRITEB_ADDR``, span from ``URAM_ROW_SIZE`` —
+        all four overridden per op from the register file (RTL: queue_state_module.sv fields 4/5/6/3).
+
+        **Row batching.** DMAing one row at a time pays a fixed per-DMA setup cost on every row;
+        batching ``rows_take`` rows into one transfer amortizes it. ``chunk_rows`` is computed at
+        runtime from the URAM budget: URAM_A holds x/out + a = ``2*(N/64)`` rows/token, URAM_B holds
+        cos+sin + b = ``3*(N/64)`` rows/token, so ``chunk_rows = URAM_NEAR_FULL_ADDR // (3*N/64)``
+        (URAM_B binds). The outer while-loop runs ``ceil(M / chunk_rows)`` batches
+        (``rows_take = min(remaining, chunk_rows)``), matmat's M-tile idiom.
+
+        ``gpr_M_reg`` (1..15, batch row count) and ``gpr_N_reg`` (1..31, derives N/64, N/128, strides)
+        are required and caller-primed. ``M`` / ``N`` are template / FLOPs-accounting only. Optional
+        ``gpr_input_addr`` / ``gpr_out_addr`` / ``gpr_cos_addr`` source the input / output / cos DRAM
+        bases from GPRs (word addr = ``byte >> 3``); ``None`` -> literal. ``N`` must be a multiple of
+        128 (each rotate-half is 64-row aligned); non-64-aligned head_dim is served by host padding
+        (see ``_rope_padded_layout`` in user_hw_test.py). Consumes the identical table layout as
+        legacy so existing tests pass unchanged.
+
+        **Status: offline-validated only (HW-UNVALIDATED).**
+        """
+        fn = "rope_hf_core_dram_dynamic"
+        assert M >= 1, f"{fn}: M must be at least 1"
+        if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
+            raise ValueError(f"{fn}: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
+        if gpr_N_reg is None or not (1 <= gpr_N_reg <= 31):
+            raise ValueError(f"{fn}: gpr_N_reg must be a GPR index 1..31, got {gpr_N_reg}")
+        if gpr_N_reg == gpr_M_reg:
+            raise ValueError(f"{fn}: gpr_N_reg={gpr_N_reg} collides with gpr_M_reg={gpr_M_reg}")
+        self._validate_addr_gprs(fn, gpr_M_reg, {
+            "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr, "gpr_cos_addr": gpr_cos_addr,
+        })
+        for _nm, _rg in (("gpr_input_addr", gpr_input_addr), ("gpr_out_addr", gpr_out_addr), ("gpr_cos_addr", gpr_cos_addr)):
+            if _rg is not None and _rg == gpr_N_reg:
+                raise ValueError(f"{fn}: {_nm}={_rg} collides with gpr_N_reg={gpr_N_reg}")
+        assert N >= 128 and N % 128 == 0, (
+            f"{fn} handles the N>=128 path with 64-row-aligned halves; N must be a multiple of 128, "
+            f"got N={N}. Use the d64 path for head_dim < 128.")
+        assert sin_dram_addr == cos_dram_addr + N * 2, "RoPE expects contiguous [cos, sin] rows"
+        assert self.is_capture_on, f"{fn}() requires active capture"
+        # One token needs 3*(N/64) URAM_B rows (cos+sin + b); a single batch of >=1 row must fit the
+        # 12-bit (4095) URAM row-address ceiling. (URAM_A needs only 2*(N/64), so URAM_B always binds.)
+        assert 3 * (N // UE_VECTOR_SIZE) <= URAM_NEAR_FULL_ADDR, (
+            f"{fn}: N={N} too large — 3*(N/64)={3*(N//UE_VECTOR_SIZE)} rows exceeds "
+            f"URAM_NEAR_FULL_ADDR={URAM_NEAR_FULL_ADDR}; one token must fit URAM_B staging.")
+
+        # Fixed SRAM bank anchors (row 0 of each bank). Region *bases* within a bank are runtime
+        # (chunk_rows-scaled) so they live in registers, not here.
+        SRAM_A = 0x00000   # URAM_A row 0: x / out region base
+        SRAM_B = 0x80000   # URAM_B row 0: cos+sin region base
+        IN_BASE_W  = ue_35bit_addr_shifter(input_dram_addr)
+        COS_BASE_W = ue_35bit_addr_shifter(cos_dram_addr)
+        OUT_BASE_W = ue_35bit_addr_shifter(output_dram_addr)
+
+        _alloc_list = []
+        def _alloc():
+            r = self.alloc_isa_reg(); _alloc_list.append(r); return r
+
+        # --- N-derived counts / strides (words = byte >> 3) ---
+        n_rows_reg     = _alloc()  # N/64   (full-row URAM span & row stride)
+        half_rows_reg  = _alloc()  # N/128  (rotate-half URAM span & half offset)
+        rope_rows_reg  = _alloc()  # N/32   (cos+sin URAM rows/token = 2*n_rows)
+        row_words_reg  = _alloc()  # N/4    (x/out per-row DRAM word stride: N*2 bytes >> 3)
+        rope_row_words_reg = _alloc()  # N/2 (cos+sin per-row DRAM word stride: 2N*2 bytes >> 3)
+        # --- batch bookkeeping ---
+        chunk_rows_reg = _alloc()  # rows per DMA batch = URAM_NEAR_FULL_ADDR // (3*n_rows)
+        m_counter_reg  = _alloc()  # remaining M rows
+        rows_take_reg  = _alloc()  # min(remaining, chunk_rows)
+        dma_len_x_reg  = _alloc()  # rows_take*N*2   bytes (x / out batch DMA length)
+        dma_len_rope_reg = _alloc()  # rows_take*2N*2 bytes (cos+sin batch DMA length)
+        # --- URAM region bases (chunk_rows-scaled; fixed for whole program) ---
+        a_base_reg     = _alloc()  # URAM_A a-region base = chunk_rows * n_rows
+        b_base_reg     = _alloc()  # URAM_B b-region base = chunk_rows * rope_rows
+        # --- running DRAM word cursors (per batch) ---
+        x_cur_reg      = _alloc()
+        rope_cur_reg   = _alloc()
+        out_cur_reg    = _alloc()
+        # --- running URAM row cursors (per row, within a batch) ---
+        xr_reg         = _alloc()  # x/out row  (URAM_A)
+        ar_reg         = _alloc()  # a row      (URAM_A)
+        cosr_reg       = _alloc()  # cos row    (URAM_B); sin row = cosr + n_rows
+        br_reg         = _alloc()  # b row      (URAM_B)
+        # --- scratch ---
+        s1 = _alloc()
+        s2 = _alloc()
+
+        def _set(ptr, field, reg):
+            self.generate_instruction_pbi_inc(general_reg_src=reg, pbi_field_select=field, inst_pointer_idx=ptr)
+
+        def _seed(dst_reg, lit_base_w, gpr_base):
+            if gpr_base is not None:
+                self.generate_instruction_add_imm(src_reg_idx=gpr_base, immediate_value=0, dst_reg_idx=dst_reg)
+            else:
+                self.generate_instruction_add_set(dst_reg, lit_base_w)
+
+        # ===== Phase 1: derive N-dependent counts / strides =====
+        self.generate_instruction_shr(n_rows_reg, gpr_N_reg, 6)          # N/64
+        self.generate_instruction_shr(half_rows_reg, gpr_N_reg, 7)       # N/128
+        self.generate_instruction_shr(rope_rows_reg, gpr_N_reg, 5)       # N/32  (= 2*n_rows)
+        self.generate_instruction_shr(row_words_reg, gpr_N_reg, 2)       # N*2 bytes >> 3 = N/4 words
+        self.generate_instruction_shr(rope_row_words_reg, gpr_N_reg, 1)  # 2N*2 bytes >> 3 = N/2 words
+
+        # chunk_rows = floor(URAM_NEAR_FULL_ADDR / (3*n_rows)). 3*n_rows = n_rows + rope_rows.
+        self.generate_instruction_add_reg(s1, n_rows_reg, rope_rows_reg)   # 3*n_rows
+        self.generate_instruction_add_set(chunk_rows_reg, URAM_NEAR_FULL_ADDR)
+        self.generate_instruction_div_reg(chunk_rows_reg, chunk_rows_reg, s1)
+
+        # URAM region bases (max-batch scaled, like matmat's M_chunk*K_rows writeback base).
+        self.generate_instruction_mul32_reg(a_base_reg, chunk_rows_reg, n_rows_reg)
+        self.generate_instruction_mul32_reg(b_base_reg, chunk_rows_reg, rope_rows_reg)
+
+        # ===== Phase 2: PBI pointer inits (outside all loops) =====
+        ptr_x       = self.alloc_inst_ptr()
+        ptr_rope    = self.alloc_inst_ptr()
+        ptr_wb      = self.alloc_inst_ptr()
+        ptr_compute = self.alloc_inst_ptr()
+        # Loads write to bank row 0 (uram_dst); DMA_LENGTH set per batch. Store reads URAM_A row 0.
+        self.generate_instruction_pbi_init(dram_shared_addr=input_dram_addr, uram_dst_addr=0, inst_pointer_idx=ptr_x)
+        self.generate_instruction_pbi_init(dram_shared_addr=cos_dram_addr, uram_dst_addr=0, inst_pointer_idx=ptr_rope)
+        self.generate_instruction_pbi_init(dram_shared_addr=output_dram_addr, uram_a_start_addr=0,
+                                           uram_b_start_addr=0, inst_pointer_idx=ptr_wb)
+        self.generate_instruction_pbi_init(inst_pointer_idx=ptr_compute)
+
+        # ===== Phase 3: seed per-batch DRAM word cursors (from GPR base when supplied) =====
+        _seed(x_cur_reg,   IN_BASE_W,  gpr_input_addr)
+        _seed(rope_cur_reg, COS_BASE_W, gpr_cos_addr)
+        _seed(out_cur_reg, OUT_BASE_W, gpr_out_addr)
+
+        # ===== Phase 4: outer batch while-loop (4 live PBI pointers) =====
+        # Hand-rolled while(m_counter != 0): trip count is a reg_min-clamped remaining-rows counter
+        # (matmat / bf16_transpose M-tile idiom), not a monotonic decrement. Abs-jump anchor keeps the
+        # backward rel-JNZ within the i-cache window.
+        program_dram_start_addr = self.get_program_dram_addr()
+        cur_inst_count = self.capture_count
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES))
+
+        self.generate_instruction_add_imm(src_reg_idx=gpr_M_reg, immediate_value=0, dst_reg_idx=m_counter_reg)
+        self.generate_instruction_reg_min(rows_take_reg, m_counter_reg, chunk_rows_reg)
+        body_start_inst_cnt = self.capture_count
+
+        # --- batch DMA loads: rows_take rows of x -> URAM_A, rows_take rows of [cos|sin] -> URAM_B ---
+        self.generate_instruction_mul32_shl_reg(dma_len_x_reg, rows_take_reg, n_rows_reg, 7)     # rows_take*N*2 bytes
+        self.generate_instruction_mul32_shl_reg(dma_len_rope_reg, rows_take_reg, rope_rows_reg, 7)  # rows_take*2N*2 bytes
+        _set(ptr_x, PBI_FIELD.DRAM_ADDR, x_cur_reg)
+        _set(ptr_x, PBI_FIELD.DMA_LENGTH, dma_len_x_reg)
+        self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=SRAM_A, element_size=0, inst_pointer_idx=ptr_x)
+        _set(ptr_rope, PBI_FIELD.DRAM_ADDR, rope_cur_reg)
+        _set(ptr_rope, PBI_FIELD.DMA_LENGTH, dma_len_rope_reg)
+        self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=SRAM_B, element_size=0, inst_pointer_idx=ptr_rope)
+
+        # --- inner per-row compute loop (fixed trip count = rows_take for this batch) ---
+        self.generate_instruction_add_set(xr_reg, 0)                                  # x/out row 0
+        self.generate_instruction_add_imm(src_reg_idx=a_base_reg, immediate_value=0, dst_reg_idx=ar_reg)  # a-region base
+        self.generate_instruction_add_set(cosr_reg, 0)                                # cos row 0
+        self.generate_instruction_add_imm(src_reg_idx=b_base_reg, immediate_value=0, dst_reg_idx=br_reg)  # b-region base
+        self.loop_start(gpr_loop_cnt=rows_take_reg)
+
+        # op1: a = x * cos  (full row -> URAM_A a-region)
+        _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, n_rows_reg)
+        _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, xr_reg)      # A = x
+        _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, cosr_reg)    # B = cos
+        _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, ar_reg)       # -> a
+        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute)
+
+        # op2: b[:half] = x[half:] * sin[:half]  (half row -> URAM_B b-region).  sin row = cos + n_rows.
+        _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, half_rows_reg)
+        self.generate_instruction_add_reg(s1, xr_reg, half_rows_reg)   # x2 row = x + half_rows
+        _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, s1)
+        self.generate_instruction_add_reg(s2, cosr_reg, n_rows_reg)    # sin row = cos + n_rows
+        _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, s2)
+        _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, br_reg)          # -> b[:half]
+        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute)
+
+        # op3: b[half:] = x[:half] * sin[half:]  (half row -> URAM_B b-region).  row_size still half.
+        _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, xr_reg)         # A = x1 = x
+        self.generate_instruction_add_reg(s1, s2, half_rows_reg)       # sin[half:] row = sin + half_rows
+        _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, s1)
+        self.generate_instruction_add_reg(s2, br_reg, half_rows_reg)   # b[half:] row = b + half_rows
+        _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, s2)
+        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute)
+
+        # op4: out = a + b  (full row -> URAM_A, in place over x).  A = a (URAM_A), B = b (URAM_B).
+        _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, n_rows_reg)
+        _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, ar_reg)         # A = a
+        _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, br_reg)         # B = b
+        _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, xr_reg)          # -> out (over x)
+        self.start_queue_eltwise(UE_MODE.ELTWISE_ADD, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute)
+
+        # advance per-row URAM cursors
+        self.generate_instruction_add_reg(xr_reg, xr_reg, n_rows_reg)
+        self.generate_instruction_add_reg(ar_reg, ar_reg, n_rows_reg)
+        self.generate_instruction_add_reg(cosr_reg, cosr_reg, rope_rows_reg)
+        self.generate_instruction_add_reg(br_reg, br_reg, n_rows_reg)
+        self.loop_end()
+
+        # --- batch DMA store: rows_take rows URAM_A row 0 -> DRAM (dma_len_x unchanged since load) ---
+        _set(ptr_wb, PBI_FIELD.DRAM_ADDR, out_cur_reg)
+        _set(ptr_wb, PBI_FIELD.DMA_LENGTH, dma_len_x_reg)
+        self.sram_to_accelerator_memory(sram_address=SRAM_A, accelerator_dram_address=0, element_size=0, inst_pointer_idx=ptr_wb)
+
+        # advance per-batch DRAM cursors, recompute next batch's row count
+        self.generate_instruction_mul32_reg(s1, rows_take_reg, row_words_reg)          # x/out advance words
+        self.generate_instruction_add_reg(x_cur_reg, x_cur_reg, s1)
+        self.generate_instruction_add_reg(out_cur_reg, out_cur_reg, s1)
+        self.generate_instruction_mul32_reg(s2, rows_take_reg, rope_row_words_reg)      # cos+sin advance words
+        self.generate_instruction_add_reg(rope_cur_reg, rope_cur_reg, s2)
+        self.generate_instruction_reg_sub(m_counter_reg, m_counter_reg, rows_take_reg)
+        self.generate_instruction_reg_min(rows_take_reg, m_counter_reg, chunk_rows_reg)
+
+        outer_loop_size = self.capture_count - body_start_inst_cnt + 2
+        self.generate_instruction_jump_rela_jnz(outer_loop_size, m_counter_reg)
+        print(f"RoPE phased outer loop body size: {outer_loop_size} (M=GPR[{gpr_M_reg}], N=GPR[{gpr_N_reg}], batched, 4 PBI pointers)")
+        assert outer_loop_size <= 256, (
+            f"{fn}: outer loop body {outer_loop_size} exceeds i-cache budget 256")
+
+        self.release_inst_ptr(ptr_compute)
+        self.release_inst_ptr(ptr_wb)
+        self.release_inst_ptr(ptr_rope)
+        self.release_inst_ptr(ptr_x)
+        for _ in range(len(_alloc_list)):
+            self.release_isa_reg()
+
+        return 4 * M * N
+
+    def rope_hf_core_dram_d64_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None,
+                                  gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None) -> int:
         """PBI HF RoPE for head_dim ``N < 128`` (padded-split). Caller brackets with
         start_capture()/stop_capture().
 
@@ -3482,12 +4387,20 @@ class UnifiedEngine:
         **Batch dimension / M (dynamic, required):** ``gpr_M_reg`` is a GPR index 1..15 holding
         the runtime token count (caller primes via ``ADD_SET``). ``M`` is FLOPs-accounting /
         loop-template only. Scratch GPRs (address calc + token counter) are allocated internally.
+
+        This is the *native* (no head_dim padding) sub-128 path, exercised compile-time-N by
+        ``rope_hf_core_dram_d64_test(..., dynamic=False)``. The dynamic sub-128 case is instead
+        served by padding head_dim up to 128 and running :meth:`rope_hf_core_dram_dynamic`
+        (``rope_hf_core_dram_d64_test(..., dynamic=True)``).
         """
         assert N % 2 == 0, "N must be even for RoPE half layout"
         assert 0 < N < 128, "rope_hf_core_dram_d64_pbi is the N<128 path; use rope_hf_core_dram_pbi for N>=128"
         if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
             raise ValueError(f"rope_hf_core_dram_d64_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
         assert sin_dram_addr == cos_dram_addr + N * 2, "d64 RoPE expects contiguous [cos, sin] rows"
+        self._validate_addr_gprs("rope_hf_core_dram_d64_pbi", gpr_M_reg, {
+            "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr, "gpr_cos_addr": gpr_cos_addr,
+        })
 
         bpe = 2
         half = N // 2
@@ -3516,16 +4429,27 @@ class UnifiedEngine:
         tmp_reg = self.alloc_isa_reg()
         t_reg   = self.alloc_isa_reg()
 
-        def _read(base, stride, sram_addr):
-            # tmp_reg = shift(base) + t_reg * shift(stride) == shift(base + t*stride)
+        # Address = (gpr_base or lit_base) + offset_bytes + t*stride. When a base GPR is supplied
+        # the base comes from the register (word addr) so one captured program serves any placement;
+        # otherwise the literal base+offset is folded into a single add_imm (None-path byte-identical).
+        # sin is addressed as cos_base + row_bytes (the sin == cos + row invariant), so no separate
+        # sin GPR is needed.
+        def _emit_addr(lit_base, offset_bytes, gpr_base, stride):
             self.generate_instruction_reg_mul_imm(tmp_reg, t_reg, shift(stride))
-            self.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+            if gpr_base is not None:
+                self.generate_instruction_add_reg(tmp_reg, tmp_reg, gpr_base)
+                if offset_bytes:
+                    self.generate_instruction_add_imm(tmp_reg, shift(offset_bytes), tmp_reg)
+            else:
+                self.generate_instruction_add_imm(tmp_reg, shift(lit_base + offset_bytes), tmp_reg)
+
+        def _read(lit_base, offset_bytes, gpr_base, stride, sram_addr):
+            _emit_addr(lit_base, offset_bytes, gpr_base, stride)
             self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram_addr,
                                             element_size=half, general_reg_src=tmp_reg)
 
-        def _write(base, stride, sram_addr):
-            self.generate_instruction_reg_mul_imm(tmp_reg, t_reg, shift(stride))
-            self.generate_instruction_add_imm(tmp_reg, shift(base), tmp_reg)
+        def _write(lit_base, offset_bytes, gpr_base, stride, sram_addr):
+            _emit_addr(lit_base, offset_bytes, gpr_base, stride)
             self.sram_to_accelerator_memory(sram_address=sram_addr, accelerator_dram_address=0,
                                             element_size=half, general_reg_src=tmp_reg)
 
@@ -3533,12 +4457,12 @@ class UnifiedEngine:
         self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
 
         # Reads — each N/2-elem slice into its own aligned row (DRAM byte offsets are free).
-        _read(input_dram_addr,                 row_bytes,      uram_x_lo)   # x_lo
-        _read(input_dram_addr + half_bytes,    row_bytes,      uram_x_hi)   # x_hi
-        _read(cos_dram_addr,                   rope_row_bytes, uram_cos_lo) # cos[0:half]
-        _read(cos_dram_addr + half_bytes,      rope_row_bytes, uram_cos_hi) # cos[half:N]
-        _read(sin_dram_addr,                   rope_row_bytes, uram_sin_lo) # sin[0:half] (pre-negated)
-        _read(sin_dram_addr + half_bytes,      rope_row_bytes, uram_sin_hi) # sin[half:N]
+        _read(input_dram_addr, 0,                       gpr_input_addr, row_bytes,      uram_x_lo)   # x_lo
+        _read(input_dram_addr, half_bytes,              gpr_input_addr, row_bytes,      uram_x_hi)   # x_hi
+        _read(cos_dram_addr,   0,                       gpr_cos_addr,   rope_row_bytes, uram_cos_lo) # cos[0:half]
+        _read(cos_dram_addr,   half_bytes,              gpr_cos_addr,   rope_row_bytes, uram_cos_hi) # cos[half:N]
+        _read(cos_dram_addr,   row_bytes,               gpr_cos_addr,   rope_row_bytes, uram_sin_lo) # sin[0:half] (pre-negated)
+        _read(cos_dram_addr,   row_bytes + half_bytes,  gpr_cos_addr,   rope_row_bytes, uram_sin_hi) # sin[half:N]
 
         # Compute (operands span URAM_A/URAM_B; element_size=half from row starts).
         self.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half)      # a_lo = x_lo * cos_lo
@@ -3549,8 +4473,8 @@ class UnifiedEngine:
         self.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half)
 
         # Writes — two aligned halves back to the output row.
-        _write(output_dram_addr,              row_bytes, uram_result_lo)
-        _write(output_dram_addr + half_bytes, row_bytes, uram_result_hi)
+        _write(output_dram_addr, 0,          gpr_out_addr, row_bytes, uram_result_lo)
+        _write(output_dram_addr, half_bytes, gpr_out_addr, row_bytes, uram_result_hi)
 
         self.generate_instruction_add_inc(t_reg)
         self.loop_end()
@@ -3559,16 +4483,35 @@ class UnifiedEngine:
         self.release_isa_reg()  # tmp_reg
         return 4 * M * N
 
-    def rope_hf_core_dram_gqa(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None) -> int:
-        """HF GQA RoPE DRAM entrypoint; dispatches based on ``gpr_M_reg``:
+    def rope_hf_core_dram_gqa(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None,
+                              gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None,
+                              gpr_N_reg: Optional[int] = None, gpr_group_reg: Optional[int] = None) -> int:
+        """HF GQA RoPE DRAM entrypoint; dispatches based on ``gpr_N_reg`` / ``gpr_M_reg``:
 
+        - ``gpr_N_reg`` is a GPR index (N>=128 only): :meth:`rope_hf_core_dram_gqa_dynamic` —
+          the fast core with runtime M, N (head_dim) and (optionally, via ``gpr_group_reg``)
+          group_size. Requires ``gpr_M_reg``.
         - ``gpr_M_reg`` is a GPR index (1..15): :meth:`rope_hf_core_dram_gqa_pbi` — outer M loop uses
           runtime trip count from that register (caller must prime via ``ADD_SET``). Inner
           ``group_size`` loop remains compile-time. ``M`` is FLOPs-accounting only.
         - ``gpr_M_reg is None`` (default): :meth:`rope_hf_core_dram_gqa_legacy` — Python-unrolled rows.
+
+        ``gpr_input_addr`` / ``gpr_out_addr`` / ``gpr_cos_addr`` (PBI path only) optionally source the
+        Q/output/cos-table bases from GPRs (word addr). See :meth:`rope_hf_core_dram_gqa_pbi`.
         """
+        if gpr_N_reg is not None:
+            if N < 128:
+                raise ValueError("rope_hf_core_dram_gqa: dynamic N (gpr_N_reg) is only supported for N>=128")
+            return self.rope_hf_core_dram_gqa_dynamic(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr,
+                                                      gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg, gpr_group_reg=gpr_group_reg,
+                                                      gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr)
+        if gpr_group_reg is not None:
+            raise ValueError("rope_hf_core_dram_gqa: gpr_group_reg requires the dynamic path (set gpr_N_reg)")
         if gpr_M_reg is not None:
-            return self.rope_hf_core_dram_gqa_pbi(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg)
+            return self.rope_hf_core_dram_gqa_pbi(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, gpr_M_reg=gpr_M_reg,
+                                                  gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr)
+        if any(r is not None for r in (gpr_input_addr, gpr_out_addr, gpr_cos_addr)):
+            raise ValueError("rope_hf_core_dram_gqa: gpr_*_addr require the PBI path (set gpr_M_reg)")
         return self.rope_hf_core_dram_gqa_legacy(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr)
 
     def rope_hf_core_dram_gqa_legacy(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int) -> int:
@@ -3601,7 +4544,8 @@ class UnifiedEngine:
                 self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr + q_row_idx * row_bytes, element_size=N)
         return 4 * M * group_size * N
 
-    def rope_hf_core_dram_gqa_pbi(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None) -> int:
+    def rope_hf_core_dram_gqa_pbi(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None,
+                                  gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None) -> int:
         """PBI-backed grouped-query RoPE. Q rows are [M, group_size, N], RoPE rows are [M, N].
 
         **Batch dimension / M (dynamic, required):**
@@ -3609,6 +4553,10 @@ class UnifiedEngine:
         Caller must prime that register beforehand (typically with ``ADD_SET``). The inner
         ``group_size`` loop is still compile-time. ``M`` is FLOPs-accounting only — the captured
         program has no static reference to it.
+
+        ``gpr_input_addr`` / ``gpr_out_addr`` / ``gpr_cos_addr`` optionally source the Q / output /
+        cos-table bases from GPRs (word addr); sin stays contiguous after cos. See
+        :meth:`rope_hf_core_dram_pbi`.
         """
         assert M >= 1, "M must be at least 1"
         assert group_size >= 1, "group_size must be at least 1"
@@ -3617,6 +4565,9 @@ class UnifiedEngine:
         assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
         if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
             raise ValueError(f"rope_hf_core_dram_gqa_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
+        self._validate_addr_gprs("rope_hf_core_dram_gqa_pbi", gpr_M_reg, {
+            "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr, "gpr_cos_addr": gpr_cos_addr,
+        })
 
         half = N // 2
         bytes_per_elem = 2
@@ -3675,6 +4626,15 @@ class UnifiedEngine:
             inst_pointer_idx=out_ptr,
         )
 
+        # Optional: source pointer bases from GPRs (word addr) once before the loop. The rope
+        # pointer (cos base) reads [cos, sin] contiguously, so only the cos base is overridden.
+        if gpr_input_addr is not None:
+            self._pbi_override_dram_base_from_gpr(x_ptr, gpr_input_addr)
+        if gpr_cos_addr is not None:
+            self._pbi_override_dram_base_from_gpr(rope_ptr, gpr_cos_addr)
+        if gpr_out_addr is not None:
+            self._pbi_override_dram_base_from_gpr(out_ptr, gpr_out_addr)
+
         # Absolute jump keeps the ISA loop anchored at the current I-cache window.
         program_dram_start_addr = self.get_program_dram_addr()
         cur_inst_count = self.capture_count
@@ -3712,6 +4672,200 @@ class UnifiedEngine:
         self.release_inst_ptr(out_ptr)
         self.release_inst_ptr(rope_ptr)
         self.release_inst_ptr(x_ptr)
+        return 4 * M * group_size * N
+
+    def rope_hf_core_dram_gqa_dynamic(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int,
+                                             cos_dram_addr: int, sin_dram_addr: int,
+                                             gpr_M_reg: int = None, gpr_N_reg: int = None, gpr_group_reg: Optional[int] = None,
+                                             gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
+                                             gpr_cos_addr: Optional[int] = None) -> int:
+        """Fast 4-PBI-pointer grouped-query HF RoPE with runtime M / group_size / N (head_dim>=128).
+
+        The GQA analog of :meth:`rope_hf_core_dram_dynamic`. Q rows are
+        ``[M, group_size, N]``, RoPE rows ``[M, N]``; one cos/sin row is loaded once per group and
+        shared by all ``group_size`` Q rows (the group loop re-reads it from URAM_B, saving
+        ``group_size-1`` rope loads/token vs a per-Q-row reload). Each Q row is roped with full-row
+        runtime-length eltwise ops (one op spans the whole head_dim / half), not 64 elements at a time.
+
+        **Four PBI pointers**: ``ptr_rope`` (cos+sin load, once per outer M iter -> URAM_B row 0),
+        ``ptr_x`` (Q-row load, per group member -> URAM_A row 0), ``ptr_compute`` (shared by the 4
+        eltwise ops), ``ptr_wb`` (out store, per group member). Because one Q row is processed at a
+        time, every URAM address is a loop-invariant register (row 0 / n_rows / half etc.), not an
+        advancing cursor — simpler than the batched non-GQA core.
+
+        Per Q row (identical math to legacy; ``[cos|sin]`` table with sin lower half pre-negated):
+        ``a = x*cos`` (full->URAM_A), ``b[:h]=x[h:]*sin[:h]`` + ``b[h:]=x[:h]*sin[h:]`` (half->URAM_B),
+        ``out = a+b`` (full->URAM_A in place). URAM_A: x/out@0, a@n_rows; URAM_B: cos@0, sin@n_rows,
+        b@2*n_rows -> URAM_B needs 3*(N/64) rows (must fit the 4095 row ceiling).
+
+        ``gpr_M_reg`` (1..15) and ``gpr_N_reg`` (1..31) required; ``gpr_group_reg`` (1..15) optional
+        (runtime group_size; ``None`` -> compile-time ``group_size``). Optional ``gpr_input_addr`` /
+        ``gpr_out_addr`` / ``gpr_cos_addr`` source DRAM bases from GPRs (word addr = ``byte >> 3``).
+        N>=128, multiple of 128; non-64-aligned head_dim via host padding, same as the non-GQA core.
+        Caller brackets with start_capture() and primes the supplied registers.
+
+        **Status: offline-validated only (HW-UNVALIDATED)**.
+        """
+        fn = "rope_hf_core_dram_gqa_dynamic"
+        assert M >= 1 and group_size >= 1, f"{fn}: M and group_size must be at least 1"
+        if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
+            raise ValueError(f"{fn}: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
+        if gpr_N_reg is None or not (1 <= gpr_N_reg <= 31):
+            raise ValueError(f"{fn}: gpr_N_reg must be a GPR index 1..31, got {gpr_N_reg}")
+        if gpr_group_reg is not None and not (1 <= gpr_group_reg <= 15):
+            raise ValueError(f"{fn}: gpr_group_reg must be a GPR index 1..15 or None, got {gpr_group_reg}")
+        _reg_set = [r for r in (gpr_M_reg, gpr_N_reg, gpr_group_reg) if r is not None]
+        if len(set(_reg_set)) != len(_reg_set):
+            raise ValueError(f"{fn}: gpr_M_reg/gpr_N_reg/gpr_group_reg must be distinct, got {_reg_set}")
+        self._validate_addr_gprs(fn, gpr_M_reg, {
+            "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr, "gpr_cos_addr": gpr_cos_addr,
+        })
+        for _nm, _rg in (("gpr_input_addr", gpr_input_addr), ("gpr_out_addr", gpr_out_addr), ("gpr_cos_addr", gpr_cos_addr)):
+            if _rg is not None and _rg in (gpr_N_reg, gpr_group_reg):
+                raise ValueError(f"{fn}: {_nm}={_rg} collides with gpr_N_reg/gpr_group_reg")
+        assert N >= 128 and N % 128 == 0, (
+            f"{fn} handles the N>=128 path with 64-row-aligned halves; N must be a multiple of 128, got N={N}.")
+        assert sin_dram_addr == cos_dram_addr + N * 2, "GQA RoPE expects contiguous [cos, sin] rows"
+        assert self.is_capture_on, f"{fn}() requires active capture"
+        assert 3 * (N // UE_VECTOR_SIZE) <= URAM_NEAR_FULL_ADDR, (
+            f"{fn}: N={N} too large — 3*(N/64)={3*(N//UE_VECTOR_SIZE)} rows exceeds "
+            f"URAM_NEAR_FULL_ADDR={URAM_NEAR_FULL_ADDR}.")
+
+        SRAM_A = 0x00000   # URAM_A row 0: x / out
+        SRAM_B = 0x80000   # URAM_B row 0: cos (sin @ n_rows, b @ 2*n_rows)
+        IN_BASE_W  = ue_35bit_addr_shifter(input_dram_addr)
+        COS_BASE_W = ue_35bit_addr_shifter(cos_dram_addr)
+        OUT_BASE_W = ue_35bit_addr_shifter(output_dram_addr)
+
+        _alloc_list = []
+        def _alloc():
+            r = self.alloc_isa_reg(); _alloc_list.append(r); return r
+
+        n_rows_reg     = _alloc()  # N/64  (a-region base in URAM_A; sin base in URAM_B; full row_size)
+        half_rows_reg  = _alloc()  # N/128 (x2 row; rotate-half span)
+        rope_rows_reg  = _alloc()  # N/32  (b-region base in URAM_B = 2*n_rows)
+        row_words_reg  = _alloc()  # N/4   (x/out per-Q-row DRAM word stride)
+        rope_row_words_reg = _alloc()  # N/2 (cos+sin per-outer-row DRAM word stride)
+        x_row_bytes_reg  = _alloc()  # N*2   (x/out DMA length)
+        rope_row_bytes_reg = _alloc()  # 2N*2 (cos+sin DMA length)
+        sin_hi_row_reg = _alloc()  # n_rows + half_rows (sin[half:] URAM row)
+        b_hi_row_reg   = _alloc()  # rope_rows + half_rows (b[half:] URAM row)
+        za_reg         = _alloc()  # constant 0 (x/cos/out row 0; avoids relying on hard reg0 as PBI src)
+        x_q_reg        = _alloc()  # Q-input DRAM word cursor (per group member; contiguous across M)
+        out_q_reg      = _alloc()  # output DRAM word cursor
+        cos_row_reg    = _alloc()  # cos/sin DRAM word cursor (per outer M iter)
+
+        def _set(ptr, field, reg):
+            self.generate_instruction_pbi_inc(general_reg_src=reg, pbi_field_select=field, inst_pointer_idx=ptr)
+
+        def _seed(dst_reg, lit_base_w, gpr_base):
+            if gpr_base is not None:
+                self.generate_instruction_add_imm(src_reg_idx=gpr_base, immediate_value=0, dst_reg_idx=dst_reg)
+            else:
+                self.generate_instruction_add_set(dst_reg, lit_base_w)
+
+        # ===== Phase 1: derive N-dependent counts / strides =====
+        self.generate_instruction_shr(n_rows_reg, gpr_N_reg, 6)          # N/64
+        self.generate_instruction_shr(half_rows_reg, gpr_N_reg, 7)       # N/128
+        self.generate_instruction_shr(rope_rows_reg, gpr_N_reg, 5)       # N/32
+        self.generate_instruction_shr(row_words_reg, gpr_N_reg, 2)       # N/4 words
+        self.generate_instruction_shr(rope_row_words_reg, gpr_N_reg, 1)  # N/2 words
+        self.generate_instruction_shl(x_row_bytes_reg, gpr_N_reg, 1)     # N*2 bytes
+        self.generate_instruction_shl(rope_row_bytes_reg, gpr_N_reg, 2)  # 2N*2 bytes
+        self.generate_instruction_add_reg(sin_hi_row_reg, n_rows_reg, half_rows_reg)     # n_rows + half
+        self.generate_instruction_add_reg(b_hi_row_reg, rope_rows_reg, half_rows_reg)    # 2*n_rows + half
+        self.generate_instruction_add_set(za_reg, 0)
+
+        # ===== Phase 2: PBI pointer inits (outside all loops) =====
+        ptr_rope    = self.alloc_inst_ptr()
+        ptr_x       = self.alloc_inst_ptr()
+        ptr_wb      = self.alloc_inst_ptr()
+        ptr_compute = self.alloc_inst_ptr()
+        self.generate_instruction_pbi_init(dram_shared_addr=cos_dram_addr, uram_dst_addr=0, inst_pointer_idx=ptr_rope)
+        self.generate_instruction_pbi_init(dram_shared_addr=input_dram_addr, uram_dst_addr=0, inst_pointer_idx=ptr_x)
+        self.generate_instruction_pbi_init(dram_shared_addr=output_dram_addr, uram_a_start_addr=0,
+                                           uram_b_start_addr=0, inst_pointer_idx=ptr_wb)
+        self.generate_instruction_pbi_init(inst_pointer_idx=ptr_compute)
+        # DMA lengths are constant (one row / one rope row) -> set once here; only DRAM_ADDR moves.
+        _set(ptr_rope, PBI_FIELD.DMA_LENGTH, rope_row_bytes_reg)
+        _set(ptr_x, PBI_FIELD.DMA_LENGTH, x_row_bytes_reg)
+        _set(ptr_wb, PBI_FIELD.DMA_LENGTH, x_row_bytes_reg)
+
+        # ===== Phase 3: seed DRAM word cursors =====
+        _seed(x_q_reg,    IN_BASE_W,  gpr_input_addr)
+        _seed(cos_row_reg, COS_BASE_W, gpr_cos_addr)
+        _seed(out_q_reg,  OUT_BASE_W, gpr_out_addr)
+
+        def _compute_one_qrow():
+            # 4 full-row/half runtime-length eltwise ops on the shared compute_ptr (URAM addrs fixed:
+            # x@0, a@n_rows, cos@0, sin@n_rows, b@2*n_rows). Same op sequence as the non-GQA core.
+            # op1: a = x*cos (full -> URAM_A a-region)
+            _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, n_rows_reg)
+            _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, za_reg)         # A = x @ 0
+            _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, za_reg)         # B = cos @ 0
+            _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, n_rows_reg)      # -> a @ n_rows
+            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute)
+            # op2: b[:half] = x[half:] * sin[:half] (half -> URAM_B b-region). sin @ n_rows, b @ 2*n_rows.
+            _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, half_rows_reg)
+            _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, half_rows_reg)  # A = x2 @ half_rows
+            _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, n_rows_reg)     # B = sin_lo @ n_rows
+            _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, rope_rows_reg)   # -> b_lo @ 2*n_rows
+            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute)
+            # op3: b[half:] = x[:half] * sin[half:] (half -> URAM_B). row_size stays half.
+            _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, za_reg)         # A = x1 @ 0
+            _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, sin_hi_row_reg) # B = sin_hi @ n_rows+half
+            _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, b_hi_row_reg)    # -> b_hi @ 2*n_rows+half
+            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute)
+            # op4: out = a + b (full -> URAM_A in place over x). A = a @ n_rows, B = b @ 2*n_rows.
+            _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, n_rows_reg)
+            _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, n_rows_reg)     # A = a
+            _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, rope_rows_reg)  # B = b
+            _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, za_reg)          # -> out @ 0
+            self.start_queue_eltwise(UE_MODE.ELTWISE_ADD, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute)
+
+        # ===== Phase 4: outer M loop / inner group loop (4 live PBI pointers) =====
+        program_dram_start_addr = self.get_program_dram_addr()
+        cur_inst_count = self.capture_count
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(
+            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES))
+        self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
+
+        # Load this token's cos+sin once -> URAM_B row 0 (shared by all group members).
+        _set(ptr_rope, PBI_FIELD.DRAM_ADDR, cos_row_reg)
+        self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=SRAM_B, element_size=0, inst_pointer_idx=ptr_rope)
+
+        # Inner group loop: rope each of the group_size Q rows (all share URAM_B cos/sin).
+        if gpr_group_reg is not None:
+            self.loop_start(loop_cnt=group_size, gpr_loop_cnt=gpr_group_reg)
+        else:
+            self.loop_start(loop_cnt=group_size)
+        _set(ptr_x, PBI_FIELD.DRAM_ADDR, x_q_reg)
+        self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=SRAM_A, element_size=0, inst_pointer_idx=ptr_x)
+        _compute_one_qrow()
+        _set(ptr_wb, PBI_FIELD.DRAM_ADDR, out_q_reg)
+        self.sram_to_accelerator_memory(sram_address=SRAM_A, accelerator_dram_address=0, element_size=0, inst_pointer_idx=ptr_wb)
+        # Q-input / output cursors advance one row per group member (contiguous across the outer M).
+        self.generate_instruction_add_reg(x_q_reg, x_q_reg, row_words_reg)
+        self.generate_instruction_add_reg(out_q_reg, out_q_reg, row_words_reg)
+        inner_loop_size = self.loop_end()
+
+        # cos/sin cursor advances one rope row per outer iteration.
+        self.generate_instruction_add_reg(cos_row_reg, cos_row_reg, rope_row_words_reg)
+        outer_loop_size = self.loop_end()
+
+        print(f"RoPE GQA phased loop sizes: outer={outer_loop_size}, inner={inner_loop_size} "
+              f"(M=GPR[{gpr_M_reg}], group={'GPR[%d]' % gpr_group_reg if gpr_group_reg else group_size}, "
+              f"N=GPR[{gpr_N_reg}], 4 PBI pointers)")
+        assert outer_loop_size <= 256 and inner_loop_size <= 256, (
+            f"{fn}: loop body sizes outer={outer_loop_size}, inner={inner_loop_size} exceed i-cache 256")
+
+        self.release_inst_ptr(ptr_compute)
+        self.release_inst_ptr(ptr_wb)
+        self.release_inst_ptr(ptr_x)
+        self.release_inst_ptr(ptr_rope)
+        for _ in range(len(_alloc_list)):
+            self.release_isa_reg()
+
         return 4 * M * group_size * N
 
     def start_queue_for_bf16_dequantize_operation(self, VECTOR_INPUT_DRAM_ADDR: int, SCALE_INPUT_DRAM_ADDR: int, data_type: TYPE,
@@ -3843,36 +4997,54 @@ class UnifiedEngine:
                             clamp_min: float = 0.0, clamp_max: float = float("inf"),
                             debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
                             write_back_disable: bool = False, gpr_M_reg: int = None,
-                            gpr_K_reg: int = None, gpr_N_reg: int = None) -> None:
+                            gpr_K_reg: int = None, gpr_N_reg: int = None,
+                            gpr_a_addr: Optional[int] = None, gpr_b_addr: Optional[int] = None,
+                            gpr_out_addr: Optional[int] = None, gpr_c_addr: Optional[int] = None,
+                            gpr_scale_addr: Optional[int] = None) -> None:
         """Matrix multiply entrypoint; dispatches based on which dimensions are runtime registers:
 
-        - ``gpr_K_reg`` and/or ``gpr_N_reg`` provided: :meth:`matmat_mul_dynamic_core` — fully
-          dynamic M/K/N, all tiling constants computed in the ISA register file at runtime.
-        - only ``gpr_M_reg`` provided: :meth:`matmat_mul_core_dynamic` — dynamic M, compile-time K/N.
-          The captured program has no static reference to ``M``; ``M`` is FLOPs-accounting only.
+        - any of ``gpr_M_reg`` / ``gpr_K_reg`` / ``gpr_N_reg`` provided: :meth:`matmat_mul_dynamic_core` —
+          fully dynamic path. Missing dimension GPRs are auto-allocated, seeded from the compile-time
+          scalar, and released after the call.
         - none provided (default): :meth:`matmat_mul_core_legacy` — compile-time M/K/N tiling.
+
+        ``gpr_a_addr`` / ``gpr_b_addr`` / ``gpr_out_addr`` / ``gpr_c_addr`` / ``gpr_scale_addr``
+        (dynamic path only) optionally source the A/B/output/bias/scale DRAM bases from GPRs
+        (word addr) — see :meth:`matmat_mul_dynamic_core`.
 
         **Layout:** ``A`` is **M×K** (row-major). ``B`` is **N×K** (row-major); the accelerator uses ``B`` as above and
         applies an implicit transpose so the computed result is **A @ Bᵀ**, i.e. **M×N**, without a separate transpose pass.
         """
-        if gpr_K_reg is not None or gpr_N_reg is not None:
-            return self.matmat_mul_dynamic_core(
+        _addr_gprs = (gpr_a_addr, gpr_b_addr, gpr_out_addr, gpr_c_addr, gpr_scale_addr)
+        if gpr_M_reg is not None or gpr_K_reg is not None or gpr_N_reg is not None:
+            allocated = []
+            if gpr_K_reg is None:
+                gpr_K_reg = self.alloc_isa_reg()
+                self.generate_instruction_add_set(gpr_K_reg, K)
+                allocated.append('K')
+            if gpr_N_reg is None:
+                gpr_N_reg = self.alloc_isa_reg()
+                self.generate_instruction_add_set(gpr_N_reg, N)
+                allocated.append('N')
+            if gpr_M_reg is None:
+                gpr_M_reg = self.alloc_isa_reg()
+                self.generate_instruction_add_set(gpr_M_reg, M)
+                allocated.append('M')
+            flops = self.matmat_mul_dynamic_core(
                 M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
                 is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
                 clamp_enable, log_enable,
                 clamp_min=clamp_min, clamp_max=clamp_max,
                 write_back_disable=write_back_disable,
                 gpr_M_reg=gpr_M_reg, gpr_K_reg=gpr_K_reg, gpr_N_reg=gpr_N_reg,
+                gpr_a_addr=gpr_a_addr, gpr_b_addr=gpr_b_addr, gpr_out_addr=gpr_out_addr,
+                gpr_c_addr=gpr_c_addr, gpr_scale_addr=gpr_scale_addr,
             )
-        if gpr_M_reg is not None:
-            return self.matmat_mul_core_dynamic(
-                M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
-                is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
-                clamp_enable, log_enable,
-                clamp_min=clamp_min, clamp_max=clamp_max,
-                debug_fmax=debug_fmax, ZERO_DRAM_ADDR=ZERO_DRAM_ADDR, FMAX_DRAM_ADDR=FMAX_DRAM_ADDR,
-                write_back_disable=write_back_disable, gpr_M_reg=gpr_M_reg,
-            )
+            for _ in allocated:
+                self.release_isa_reg()
+            return flops
+        if any(r is not None for r in _addr_gprs):
+            raise ValueError("matmat_mul_core: gpr_*_addr require a dimension GPR (set gpr_M_reg, gpr_K_reg, or gpr_N_reg)")
         return self.matmat_mul_core_legacy(
             M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
             is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
@@ -4764,7 +5936,10 @@ class UnifiedEngine:
                                 clamp_enable: bool = False, log_enable: bool = False,
                                 clamp_min: float = 0.0, clamp_max: float = float("inf"),
                                 write_back_disable: bool = False,
-                                gpr_M_reg: int = None, gpr_K_reg: int = None, gpr_N_reg: int = None) -> int:
+                                gpr_M_reg: int = None, gpr_K_reg: int = None, gpr_N_reg: int = None,
+                                gpr_a_addr: Optional[int] = None, gpr_b_addr: Optional[int] = None,
+                                gpr_out_addr: Optional[int] = None, gpr_c_addr: Optional[int] = None,
+                                gpr_scale_addr: Optional[int] = None) -> int:
         """
         Fully dynamic M/K/N matmul captured as an ISA program (A @ Bᵀ -> M×N).
 
@@ -4783,6 +5958,13 @@ class UnifiedEngine:
             gpr_M_reg / gpr_K_reg / gpr_N_reg: optional ISA register indices already holding the
                 runtime M / K / N (caller primes them via ``ADD_SET`` before replay). When a GPR
                 is ``None``, the corresponding dimension is seeded from the compile-time literal.
+            gpr_a_addr / gpr_b_addr / gpr_out_addr / gpr_c_addr / gpr_scale_addr: optional ISA
+                register indices holding the A / B / output / bias-C / scale DRAM **base** as a
+                **word** address (``byte >> 3``). When given, the running cursor / per-tile address
+                is sourced from the GPR instead of the compile-time literal, so one captured program
+                serves any DRAM placement (re-prime the GPRs before each replay). ``gpr_c_addr``
+                requires a bias (``C_DRAM_ADDR``); ``gpr_scale_addr`` requires ``is_B_quantized``.
+                ``None`` -> literal (byte-for-byte identical program).
 
         Currently implements: LALU activations + softmax + broadcast_N bias + full_matrix bias
         (including softmax + full_matrix), and IF4/IF8 quantized-B (scale-BRAM + DEQUANTIZE).
@@ -4820,6 +6002,37 @@ class UnifiedEngine:
             lalu_mode, lalu_a, lalu_b = LALU_MODE.LOG, LALU_LOG_A, LALU_LOG_B
 
         assert (gpr_M_reg is not None and gpr_K_reg is not None and gpr_N_reg is not None), "Dynamic requires gpr inputs of m n k dims!"
+
+        # Optional GPR-sourced DRAM bases (word addr = byte>>3). A/B/scale seed their running cursors
+        # from the GPR; output/bias bases are register-added to the per-tile offset. None -> literal
+        # (byte-for-byte identical program). The GPRs are caller-owned for the whole program, so they
+        # must be distinct from the M/K/N dim GPRs and each other.
+        self._validate_addr_gprs("matmat_mul_dynamic_core", gpr_M_reg, {
+            "gpr_a_addr": gpr_a_addr, "gpr_b_addr": gpr_b_addr, "gpr_out_addr": gpr_out_addr,
+            "gpr_c_addr": gpr_c_addr, "gpr_scale_addr": gpr_scale_addr,
+        })
+        for _nm, _rg in (("gpr_a_addr", gpr_a_addr), ("gpr_b_addr", gpr_b_addr), ("gpr_out_addr", gpr_out_addr),
+                         ("gpr_c_addr", gpr_c_addr), ("gpr_scale_addr", gpr_scale_addr)):
+            if _rg is not None and _rg in (gpr_K_reg, gpr_N_reg):
+                raise ValueError(f"matmat_mul_dynamic_core: {_nm}={_rg} collides with gpr_K_reg/gpr_N_reg")
+        if gpr_c_addr is not None and not bias_enable:
+            raise ValueError("matmat_mul_dynamic_core: gpr_c_addr given but no bias (C_DRAM_ADDR is None)")
+        if gpr_scale_addr is not None and not is_B_quantized:
+            raise ValueError("matmat_mul_dynamic_core: gpr_scale_addr given but is_B_quantized=False")
+
+        def _seed_cursor(cursor_reg, lit_base_w, gpr_base):
+            # cursor = GPR base (copy, preserving the caller's reg) or the compile-time literal.
+            if gpr_base is not None:
+                self.generate_instruction_add_imm(src_reg_idx=gpr_base, immediate_value=0, dst_reg_idx=cursor_reg)
+            else:
+                self.generate_instruction_add_set(cursor_reg, lit_base_w)
+
+        def _off_plus_base(off_reg, lit_base_w, gpr_base, dst_reg):
+            # dst = off_reg + (GPR base or literal base). off_reg holds the per-tile word offset.
+            if gpr_base is not None:
+                self.generate_instruction_add_reg(dst_reg, off_reg, gpr_base)
+            else:
+                self.generate_instruction_add_imm(src_reg_idx=off_reg, immediate_value=lit_base_w, dst_reg_idx=dst_reg)
 
         # Strided writeback: one DMA per (M-tile, N-strip) whose DRAM row stride (N*2) is sourced from
         # a GPR at runtime (RTL stride-jump override), replacing the m_take per-row DMA loop. Requires
@@ -4972,11 +6185,11 @@ class UnifiedEngine:
         if use_strided_wb:
             self.generate_instruction_shl(n_stride_bytes_reg, N_reg, 1)        # N*2 bytes (strided wb DRAM row stride)
 
-        # Running DRAM cursors (word addresses).
-        self.generate_instruction_add_set(a_dram_reg, A_BASE_W)
-        self.generate_instruction_add_set(b_dram_reg, B_BASE_W)
+        # Running DRAM cursors (word addresses) — seeded from GPR base or literal.
+        _seed_cursor(a_dram_reg, A_BASE_W, gpr_a_addr)
+        _seed_cursor(b_dram_reg, B_BASE_W, gpr_b_addr)
         if is_B_quantized:
-            self.generate_instruction_add_set(scale_dram_reg, SCALE_BASE_W)
+            _seed_cursor(scale_dram_reg, SCALE_BASE_W, gpr_scale_addr)
 
         # ===== Phase 2: PBI pointer inits (outside all loops) ================
         ptr_A   = self.alloc_inst_ptr()
@@ -5016,6 +6229,12 @@ class UnifiedEngine:
             self.generate_instruction_pbi_init(dram_shared_addr=OUTPUT_DRAM_ADDR, inst_pointer_idx=ptr_sm_wb)
 
         # ===== Phase 3: M while-loop body ===================================
+        # Absolute jump re-anchors the i-cache so all relative backward jumps in the
+        # loop body are within 512 slots of a known unconditional anchor.
+        _prog_base = self.get_program_dram_addr()
+        self.generate_instruction_jump_abs(
+            ue_35bit_addr_shifter(_prog_base + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES)
+        )
         body_start_inst_cnt = self.capture_count
 
         # ---- rows_done and m_take for this M-tile ----
@@ -5039,9 +6258,9 @@ class UnifiedEngine:
         self.generate_instruction_pbi_inc(general_reg_src=K_rows_reg, pbi_field_select=PBI_FIELD.URAM_ROW_SIZE, inst_pointer_idx=ptr_dot)
 
         # ---- N while-loop init (reset each M tile) ----
-        self.generate_instruction_add_set(b_dram_reg, B_BASE_W)
+        _seed_cursor(b_dram_reg, B_BASE_W, gpr_b_addr)
         if is_B_quantized:
-            self.generate_instruction_add_set(scale_dram_reg, SCALE_BASE_W)
+            _seed_cursor(scale_dram_reg, SCALE_BASE_W, gpr_scale_addr)
         self.generate_instruction_add_imm(src_reg_idx=N_reg, immediate_value=0, dst_reg_idx=N_counter_reg)
         self.generate_instruction_reg_min(n_take_reg, N_counter_reg, N_chunk_reg)
 
@@ -5097,7 +6316,7 @@ class UnifiedEngine:
             # bias word addr = C_BASE_W + cols_done >> 2; cols_done = N - N_counter.
             self.generate_instruction_reg_sub(s1, N_reg, N_counter_reg)     # cols_done
             self.generate_instruction_shr(s1, s1, 2)                        # cols_done*2>>3 -> words
-            self.generate_instruction_add_imm(src_reg_idx=s1, immediate_value=C_BASE_W, dst_reg_idx=s1)
+            _off_plus_base(s1, C_BASE_W, gpr_c_addr, s1)
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DRAM_ADDR, inst_pointer_idx=ptr_bias)
             self.generate_instruction_shl(s1, n_take_reg, 1)                # n_take*2 bytes
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DMA_LENGTH, inst_pointer_idx=ptr_bias)
@@ -5108,7 +6327,7 @@ class UnifiedEngine:
             self.generate_instruction_reg_sub(s2, N_reg, N_counter_reg)         # cols_done
             self.generate_instruction_add_reg(s1, s1, s2)
             self.generate_instruction_shr(s1, s1, 2)
-            self.generate_instruction_add_imm(src_reg_idx=s1, immediate_value=C_BASE_W, dst_reg_idx=bias_full_row_reg)
+            _off_plus_base(s1, C_BASE_W, gpr_c_addr, bias_full_row_reg)
             # DMA_LENGTH is constant per strip (n_take*2 bytes); set once, reused each M-row.
             self.generate_instruction_shl(s1, n_take_reg, 1)                    # n_take*2 bytes
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DMA_LENGTH, inst_pointer_idx=ptr_bias_full)
@@ -5163,7 +6382,7 @@ class UnifiedEngine:
             self.generate_instruction_reg_sub(s2, N_reg, N_counter_reg)               # cols_done
             self.generate_instruction_add_reg(s1, s1, s2)
             self.generate_instruction_shr(s1, s1, 2)                                  # (rows_done*N+cols_done) words
-            self.generate_instruction_add_imm(src_reg_idx=s1, immediate_value=OUT_BASE_W, dst_reg_idx=s1)
+            _off_plus_base(s1, OUT_BASE_W, gpr_out_addr, s1)
             self.generate_instruction_mul32_reg(s2, M_chunk_reg, K_rows_reg)          # uram_wb base (tile row 0)
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DRAM_ADDR, inst_pointer_idx=ptr_wb)
             self.generate_instruction_pbi_inc(general_reg_src=s2, pbi_field_select=PBI_FIELD.URAM_START_ADDR_Y, inst_pointer_idx=ptr_wb)
@@ -5179,7 +6398,7 @@ class UnifiedEngine:
             self.generate_instruction_reg_sub(s2, N_reg, N_counter_reg)        # cols_done
             self.generate_instruction_add_reg(s1, s1, s2)
             self.generate_instruction_shr(s1, s1, 2)
-            self.generate_instruction_add_imm(src_reg_idx=s1, immediate_value=OUT_BASE_W, dst_reg_idx=s1)
+            _off_plus_base(s1, OUT_BASE_W, gpr_out_addr, s1)
             self.generate_instruction_mul32_reg(s2, M_chunk_reg, K_rows_reg)
             wb_body = self.capture_count
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DRAM_ADDR, inst_pointer_idx=ptr_wb)
@@ -5209,7 +6428,7 @@ class UnifiedEngine:
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DMA_LENGTH, inst_pointer_idx=ptr_sm_reload)
             # tile row-0 word addr = OUT_BASE_W + rows_done*N/4
             self.generate_instruction_mul32_shr_reg(s2, rows_done_reg, N_reg, 2)
-            self.generate_instruction_add_imm(src_reg_idx=s2, immediate_value=OUT_BASE_W, dst_reg_idx=s2)
+            _off_plus_base(s2, OUT_BASE_W, gpr_out_addr, s2)
             self.generate_instruction_pbi_inc(general_reg_src=s2, pbi_field_select=PBI_FIELD.DRAM_ADDR, inst_pointer_idx=ptr_sm_reload)
             self.ue_memcpy_from_dram(0, 0, MEMCPY_TYPE.URAM.value, 0, URAM_SECTION.URAM_A, inst_pointer_idx=ptr_sm_reload)
 
@@ -5256,7 +6475,7 @@ class UnifiedEngine:
             self.generate_instruction_mul32_shl_reg(s1, m_tile_rows_reg, N_reg, 1)   # m_take*N*2 bytes (length)
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DMA_LENGTH, inst_pointer_idx=ptr_sm_wb)
             self.generate_instruction_mul32_shr_reg(s1, rows_done_reg, N_reg, 2)     # tile row-0 word addr offset
-            self.generate_instruction_add_imm(src_reg_idx=s1, immediate_value=OUT_BASE_W, dst_reg_idx=s1)
+            _off_plus_base(s1, OUT_BASE_W, gpr_out_addr, s1)
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DRAM_ADDR, inst_pointer_idx=ptr_sm_wb)
             self.ue_memcpy_to_dram(memcpy_type=MEMCPY_TYPE.URAM.value, uram_type=URAM_SECTION.URAM_B.value,
                                    uram_src_addr=0, dram_dst_addr=0, memcpy_length_bytes=0, inst_pointer_idx=ptr_sm_wb)
@@ -5265,7 +6484,7 @@ class UnifiedEngine:
         self.generate_instruction_add_imm(src_reg_idx=m_tile_rows_reg, immediate_value=0, dst_reg_idx=m_take_reg)
         self.generate_instruction_reg_sub(gpr_M_counter, gpr_M_counter, m_take_reg)
         self.generate_instruction_reg_min(m_take_reg, gpr_M_counter, M_chunk_reg)
-        outer_loop_size = self.capture_count - body_start_inst_cnt + 2
+        outer_loop_size = self.capture_count - body_start_inst_cnt + 1
         self.generate_instruction_jump_rela_jnz(outer_loop_size, gpr_M_counter)
 
         print(f"matmat_mul_dynamic_core while-loop body size: {outer_loop_size}")
@@ -5499,10 +6718,18 @@ class UnifiedEngine:
             fmax_context_addr=fmax_context_addr
         )
 
-    def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, gpr_M_reg: int = None, gpr_N_reg: int = None) -> None:
-        """Transpose ``M×N`` → ``N×M``. Dispatches to :meth:`bf16_transpose_core_dynamic` when any ``gpr_*`` is set, else :meth:`bf16_transpose_core_legacy`."""
+    def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, gpr_M_reg: int = None, gpr_N_reg: int = None,
+                            gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None) -> None:
+        """Transpose ``M×N`` → ``N×M``. Dispatches to :meth:`bf16_transpose_core_dynamic` when any ``gpr_*`` is set, else :meth:`bf16_transpose_core_legacy`.
+
+        ``gpr_input_addr`` / ``gpr_out_addr`` (dynamic path only) optionally source the X/Y DRAM bases
+        from GPRs (word addr); the constant identity matrix stays literal. See
+        :meth:`bf16_transpose_core_dynamic`."""
         if gpr_M_reg is not None:
-            return self.bf16_transpose_core_dynamic(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR, gpr_M_reg, gpr_N_reg)
+            return self.bf16_transpose_core_dynamic(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR, gpr_M_reg, gpr_N_reg,
+                                                   gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr)
+        if any(r is not None for r in (gpr_input_addr, gpr_out_addr)):
+            raise ValueError("bf16_transpose_core: gpr_*_addr require the dynamic path (set gpr_M_reg)")
         return self.bf16_transpose_core_legacy(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR)
 
     def bf16_transpose_core_legacy(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None) -> None:
@@ -5599,7 +6826,8 @@ class UnifiedEngine:
     def bf16_transpose_core_dynamic(self, M: int, N: int,
                                     INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                                     IDENTITY_DRAM_ADDR: int = None,
-                                    gpr_M_reg: int = None, gpr_N_reg: int = None) -> None:
+                                    gpr_M_reg: int = None, gpr_N_reg: int = None,
+                                    gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None) -> None:
         """
         Transpose an (M x N) input matrix X into an (N x M) output Y = X^T, captured as a
         single replayable ISA program with **runtime (dynamic) M and N**.
@@ -5641,6 +6869,23 @@ class UnifiedEngine:
         bytes_per_element = 2
 
         assert gpr_M_reg is not None, "bf16_transpose_core_dynamic requires gpr_M_reg (dynamic M)."
+        # Optional GPR-sourced DRAM bases (word addr = byte>>3) for input X and output Y, so one
+        # captured program serves any placement. The identity matrix is a constant buffer and stays
+        # literal. None -> literal (byte-for-byte identical program).
+        self._validate_addr_gprs("bf16_transpose_core_dynamic", gpr_M_reg, {
+            "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr,
+        })
+        if gpr_N_reg is not None:
+            for _nm, _rg in (("gpr_input_addr", gpr_input_addr), ("gpr_out_addr", gpr_out_addr)):
+                if _rg is not None and _rg == gpr_N_reg:
+                    raise ValueError(f"bf16_transpose_core_dynamic: {_nm}={_rg} collides with gpr_N_reg={gpr_N_reg}")
+
+        def _off_plus_base(off_reg, lit_base_w, gpr_base, dst_reg):
+            # dst = off_reg + (GPR base or literal base). off_reg holds the per-tile word offset.
+            if gpr_base is not None:
+                self.generate_instruction_add_reg(dst_reg, off_reg, gpr_base)
+            else:
+                self.generate_instruction_add_imm(src_reg_idx=off_reg, immediate_value=lit_base_w, dst_reg_idx=dst_reg)
 
         # Dynamic N is enabled when the caller supplies gpr_N_reg. The column-gather matvec's
         # uram_row_stride_z (= N/64) is held in pointer-row field 10 (URAM_ROW_STRIDE_Z) and
@@ -5757,6 +7002,12 @@ class UnifiedEngine:
         # ===== Phase 3: outer M while-loop (counter seeded outside body, decremented at tail) =====
         self.generate_instruction_add_imm(src_reg_idx=gpr_M_reg, immediate_value=0, dst_reg_idx=M_counter)
 
+        # Absolute jump re-anchors the i-cache so all relative backward jumps in the
+        # loop body are within 512 slots of a known unconditional anchor.
+        _prog_base = self.get_program_dram_addr()
+        self.generate_instruction_jump_abs(
+            ue_35bit_addr_shifter(_prog_base + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES)
+        )
         m_body_start = self.capture_count
         self.generate_instruction_reg_sub(rows_done_reg, gpr_M_reg, M_counter)  # rows_done = M - remaining
         self.generate_instruction_reg_min(m_take_reg, M_counter, M_chunk_reg)   # m_take = min(remaining, M_chunk)
@@ -5769,7 +7020,7 @@ class UnifiedEngine:
         else:
             self.generate_instruction_mul32_imm(s1, rows_done_reg, N)
             self.generate_instruction_shr(s1, s1, 2)
-        self.generate_instruction_add_imm(src_reg_idx=s1, immediate_value=A_BASE_W, dst_reg_idx=s1)
+        _off_plus_base(s1, A_BASE_W, gpr_input_addr, s1)
         _set(ptr_in, PBI_FIELD.DRAM_ADDR, s1)
         if dynamic_N:
             self.generate_instruction_mul32_shl_reg(s2, m_take_reg, N_reg, 1)
@@ -5796,7 +7047,7 @@ class UnifiedEngine:
         self.generate_instruction_shl(s1, m_take_reg, 7)                         # 64*m_take*2 (total = DMA_LENGTH)
         _set(ptr_wb, PBI_FIELD.DMA_LENGTH, s1)
         self.generate_instruction_shr(s1, rows_done_reg, 2)                      # rows_done*2 bytes >> 3
-        self.generate_instruction_add_imm(src_reg_idx=s1, immediate_value=OUT_BASE_W, dst_reg_idx=out_dram_reg)  # block-0 DRAM word addr
+        _off_plus_base(s1, OUT_BASE_W, gpr_out_addr, out_dram_reg)               # block-0 DRAM word addr
         self.generate_instruction_shl(blk_adv_reg, out_stride_reg, 6)            # 64 * (M>>2) words = output advance per block
 
         # ===== Phase 4: block loop (N/64): gather 64 columns -> URAM buffer, ONE strided DMA out =====
@@ -6030,860 +7281,252 @@ class UnifiedEngine:
 
         # no FLOPS for this operation
 
-    def flash_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
-                            debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None, ATTN_P_DRAM_ADDR: int = None,
-                            gpr_seq_len: int = None):
-        """Flash attention entrypoint.
+    # =========================================================================
+    # Unified attention: Q(batch, head), K/V(aligned_seq_len, head)
+    # =========================================================================
 
-        - ``gpr_seq_len`` is a GPR index (1..15): :meth:`flash_attention_core_dynamic` — single dynamic
-          ISA body, seq_len read from the GPR at execute time. ``seq_len`` is a compile-time hint for
-          FLOPS accounting and address layout (pass the maximum expected seq_len). Requires
-          ``ATTN_P_DRAM_ADDR``. Returns ``int`` FLOPS.
-        - ``gpr_seq_len`` is ``None`` (default): :meth:`flash_attention_core_legacy` — static body
-          for the concrete ``seq_len``. Returns ``int`` FLOPS.
+    def unified_attention_core(
+        self,
+        batch: int,
+        aligned_seq_len: int,
+        head_dim: int,
+        Q_DRAM_ADDR: int,
+        K_DRAM_ADDR: int,
+        V_DRAM_ADDR: int,
+        BIAS_DRAM_ADDR: int,
+        OUTPUT_DRAM_ADDR: int,
+        SCRATCH_DRAM_ADDR: int,
+        IDENTITY_DRAM_ADDR: int = None,
+        gpr_batch_reg: int = None,
+        gpr_aligned_seq_len_reg: int = None,
+        gpr_q_addr: int = None,
+        gpr_k_addr: int = None,
+        gpr_v_addr: int = None,
+        gpr_bias_addr: int = None,
+        gpr_out_addr: int = None,
+        q_scale: float = None,
+    ) -> int:
+        """Scaled dot-product attention with explicit batch and aligned KV length.
+
+        Layout contract:
+          Q    = ``[batch, head_dim]``
+          K/V  = ``[aligned_seq_len, head_dim]``
+          bias = ``[batch, aligned_seq_len]`` (full-matrix bias)
+          out  = ``[batch, head_dim]``
+
+        Scratch layout:
+          ``SCRATCH + 0``                                      -> V.T      ``[head_dim, aligned_seq_len]``
+          ``SCRATCH + head_dim*aligned_seq_len*2``             -> score/P  ``[aligned_seq_len, aligned_seq_len]``
+          ``SCRATCH + (head_dim+aligned_seq_len)*aligned_seq_len*2``
+                                                                 -> scaled_q ``[batch, head_dim]``
+
+        When either dimension GPR is provided, the dynamic path is used. Optional address GPRs
+        source Q/K/V/bias/output base addresses and require the dynamic path.
         """
-        if gpr_seq_len is not None:
-            if ATTN_P_DRAM_ADDR is None:
-                raise ValueError(
-                    "flash_attention_core: gpr_seq_len dynamic path requires ATTN_P_DRAM_ADDR "
-                    f"(allocate seq_len*seq_len BF16s, i.e. {seq_len * seq_len * 2} bytes)"
-                )
-            return self.flash_attention_core_dynamic(
+        _addr_gprs = (gpr_q_addr, gpr_k_addr, gpr_v_addr, gpr_bias_addr, gpr_out_addr)
+        if gpr_batch_reg is None and gpr_aligned_seq_len_reg is None and not any(g is not None for g in _addr_gprs):
+            return self.unified_attention_core_legacy(
+                batch=batch,
+                aligned_seq_len=aligned_seq_len,
                 head_dim=head_dim,
                 seq_len=seq_len,
                 Q_DRAM_ADDR=Q_DRAM_ADDR,
                 K_DRAM_ADDR=K_DRAM_ADDR,
                 V_DRAM_ADDR=V_DRAM_ADDR,
+                BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-                ATTN_P_DRAM_ADDR=ATTN_P_DRAM_ADDR,
-                BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
                 IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                gpr_seq_len=gpr_seq_len,
+                q_scale=q_scale,
             )
-
-        return self.flash_attention_core_legacy(
+        if any(g is not None for g in _addr_gprs) and (gpr_batch_reg is None or gpr_aligned_seq_len_reg is None):
+            raise ValueError("unified_attention_core: gpr_*_addr require both gpr_batch_reg and gpr_aligned_seq_len_reg")
+        return self.unified_attention_core_dynamic(
+            batch=batch,
+            aligned_seq_len=aligned_seq_len,
             head_dim=head_dim,
-            seq_len=seq_len,
             Q_DRAM_ADDR=Q_DRAM_ADDR,
             K_DRAM_ADDR=K_DRAM_ADDR,
             V_DRAM_ADDR=V_DRAM_ADDR,
+            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
             SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
             IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
-            debug_mode=debug_mode,
-            SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
+            gpr_batch_reg=gpr_batch_reg,
+            gpr_aligned_seq_len_reg=gpr_aligned_seq_len_reg,
+            gpr_q_addr=gpr_q_addr,
+            gpr_k_addr=gpr_k_addr,
+            gpr_v_addr=gpr_v_addr,
+            gpr_bias_addr=gpr_bias_addr,
+            gpr_out_addr=gpr_out_addr,
+            q_scale=q_scale,
         )
 
-    def flash_attention_core_legacy(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int, BIAS_DRAM_ADDR: int = None,
-                            debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
-
+    def unified_attention_core_legacy(
+        self,
+        batch: int,
+        aligned_seq_len: int,
+        head_dim: int,
+        Q_DRAM_ADDR: int,
+        K_DRAM_ADDR: int,
+        V_DRAM_ADDR: int,
+        BIAS_DRAM_ADDR: int,
+        OUTPUT_DRAM_ADDR: int,
+        SCRATCH_DRAM_ADDR: int,
+        IDENTITY_DRAM_ADDR: int = None,
+        q_scale: float = None,
+    ) -> int:
+        # q_scale: multiplier applied to Q before Q·Kᵀ. Default (None) = the standard
+        # 1/sqrt(head_dim) SDPA scale; pass an explicit value (e.g. 1.0) when the caller
+        # has already folded the query scaling into Q and wants none applied here.
+        attn_scale = q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)
         bytes_per_element = 2
-        bias_enable = BIAS_DRAM_ADDR is not None
+        if batch <= 0 or aligned_seq_len <= 0 or head_dim <= 0:
+            raise ValueError(f"unified_attention_core_legacy: invalid dims batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}")
+        if batch > aligned_seq_len:
+            raise ValueError(f"unified_attention_core_legacy: batch must be <= aligned_seq_len, got batch={batch}, aligned_seq_len={aligned_seq_len}")
+        if aligned_seq_len % UE_VECTOR_SIZE != 0:
+            raise ValueError(f"unified_attention_core_legacy: aligned_seq_len must be a multiple of {UE_VECTOR_SIZE}, got {aligned_seq_len}")
 
-        if debug_mode: # DEBUG only, needs to be allocated in DRAM
-            assert SM_OUTPUT_DRAM_ADDR is not None, "SM_OUTPUT_DRAM_ADDR is not set for debug mode"
+        v_t_dram_addr = SCRATCH_DRAM_ADDR
+        score_dram_addr = v_t_dram_addr + head_dim * aligned_seq_len * bytes_per_element
+        scaled_q_dram_addr = score_dram_addr + aligned_seq_len * aligned_seq_len * bytes_per_element
 
-        # SCRATCH_DRAM_ADDR is used for V^T
-        SCRATCH_DRAM_PARTIAL_SM = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element # used for partial softmax output
-
-        # ----------------------------------------------------------------------------------------------------------------
-        # I @ V^T: (head_dim, head_dim) @ (seq_len, head_dim)^T -> (head_dim, seq_len)
-        # Convention: first matrix I is (M, K), second V^T is (K, N), output  (M, N)
-        M = head_dim   # identity length (rows of I)
-        K = head_dim  # identity dimension (inner product dim)
-        N = seq_len   # V length (columns of V^T)
-
-        # Load UE_VECTOR_SIZE x UE_VECTOR_SIZE identity block into URAM_A start
-        identity_matrix_sram_start_addr = 0x00000
-
-        # transfer identity matrix to URAM_A start
-        self.accelerator_memory_to_sram(accelerator_dram_address=IDENTITY_DRAM_ADDR,
-                                        sram_address=identity_matrix_sram_start_addr,
-                                        element_size=UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-
-        usable_uram_a_start_addr = identity_matrix_sram_start_addr + UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element
-
-        # URAM_B is used for V matrix, we need to chunk the V matrix into smaller chunks that can fit in URAM_B
-        usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
-        N_chunk = min(N, (usable_uram_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-        N_chunk_aligned = None
-        if N_chunk < UE_VECTOR_SIZE:
-            if (K * 32) <= usable_uram_b_elements:
-                N_chunk = 32
-            elif (K * 16) <= usable_uram_b_elements:
-                N_chunk = 16
-            else:
-                assert False, f"K={K} is too large to fit in usable URAM elements={usable_uram_b_elements}"
-            N_chunk_aligned = UE_VECTOR_SIZE
-
-        usable_uram_a_elements = URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE
-        output_N_size = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
-        M_chunk = min(M, usable_uram_a_elements // output_N_size)
-        assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
-
-        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
-        print(f"URAM_A usage: {100 * (UE_VECTOR_SIZE * UE_VECTOR_SIZE + M_chunk * output_N_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS")
-        print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-
-        output_sram_wb_addr = usable_uram_a_start_addr
-        uram_b_start_addr = 0x80000
-        for i, m_take in self.chunk_ranges(M, M_chunk):
-            for j, n_take in self.chunk_ranges(N, N_chunk):
-
-                self.accelerator_memory_to_sram(accelerator_dram_address=V_DRAM_ADDR + j * K * bytes_per_element,
-                                            sram_address=uram_b_start_addr,
-                                            element_size=n_take * K)
-
-                for output_row in range(m_take):
-                    if N_chunk_aligned is None:
-                        out_sram_offset = output_row * n_take * bytes_per_element
-                    else:
-                        out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
-
-                    row = output_row + i
-                    ones_idx = row // UE_VECTOR_SIZE
-                    vector_idx = row % UE_VECTOR_SIZE
-
-                    self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
-                                                            fmax_context_addr=0,
-                                                            vector_sram_start_addr=0x00000 + vector_idx * UE_VECTOR_SIZE * bytes_per_element,
-                                                            matrix_sram_start_addr=uram_b_start_addr + ones_idx * UE_VECTOR_SIZE * bytes_per_element,
-                                                            output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
-                                                            K=UE_VECTOR_SIZE,
-                                                            N=n_take,
-                                                            stride_z=m_take)
-
-                start_dram_address_of_partial_matrix = SCRATCH_DRAM_ADDR + i * N * bytes_per_element + j * bytes_per_element # the space needed is head_dim x seq_len
-
-                if N_chunk_aligned is None:
-                    self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                    accelerator_dram_address=start_dram_address_of_partial_matrix,
-                                                    element_size=m_take * n_take,
-                                                    stride_bytes_per_chunk=n_take * bytes_per_element,
-                                                    stride_jump_bytes=N * bytes_per_element)
-                else:
-                    for o_row_idx in range(m_take):
-                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
-                                                        accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
-                                                        element_size=n_take)
-
-        # ----------------------------------------------------------------------------------------------------------------
-        # Q @ K^T: (seq_len, head_dim) @ (head_dim, seq_len) -> (seq_len, seq_len)
-        # Convention: first matrix Q is (M, K), second K^T is (K, N), output scores (M, N)
-        M = seq_len   # query length (rows of Q)
-        K = head_dim  # head dimension (inner product dim)
-        N = seq_len   # key length (columns of K^T)
-        # Calculate N_chunk
-        usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
-        N_chunk = min(N, (usable_uram_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-        N_chunk_aligned = None
-        if N_chunk < UE_VECTOR_SIZE:
-            if (K * 32) <= usable_uram_b_elements:
-                N_chunk = 32
-            elif (K * 16) <= usable_uram_b_elements:
-                N_chunk = 16
-            else:
-                assert False, f"K={K} is too large to fit in usable URAM elements={usable_uram_b_elements}"
-            N_chunk_aligned = UE_VECTOR_SIZE
-
-        usable_uram_a_elements = URAM_FULL_ELEMENTS
-        output_N_size = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
-        M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, usable_uram_a_elements // (K + output_N_size))
-        assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
-
-        print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
-        print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * output_N_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS")
-        print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-
-        uram_a_start_addr = 0x00000
-        uram_b_start_addr = 0x80000
-        for i, m_take in self.chunk_ranges(M, M_chunk):
-            self.accelerator_memory_to_sram(accelerator_dram_address=Q_DRAM_ADDR + i * K * bytes_per_element,
-                                            sram_address=uram_a_start_addr,
-                                            element_size=m_take * K)
-
-            self.broadcast_mul(scalar=1 / math.sqrt(head_dim),
-                                    sram_start_addr=uram_a_start_addr,
-                                    sram_wb_addr=uram_a_start_addr,
-                                    element_size=m_take * K)
-
-            output_sram_wb_addr = uram_a_start_addr + m_take * K * bytes_per_element
-
-            assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} is greater than 0x80000, which is the size of URAM_B"
-
-            clear_en = 1
-            for j, n_take in self.chunk_ranges(N, N_chunk):
-                self.accelerator_memory_to_sram(accelerator_dram_address=K_DRAM_ADDR + j * K * bytes_per_element,
-                                            sram_address=uram_b_start_addr,
-                                            element_size=n_take * K)
-
-                assert m_take * K + n_take * m_take<= URAM_FULL_ELEMENTS
-
-                for output_row in range(m_take):
-                    if bias_enable:
-                        self.accelerator_memory_to_bias_sram(accelerator_dram_address=BIAS_DRAM_ADDR + ((i + output_row) * N + j) * bytes_per_element,
-                                                             element_size=n_take)
-
-                    if N_chunk_aligned is None:
-                        out_sram_offset = output_row * n_take * bytes_per_element
-                    else:
-                        out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
-
-                    self.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
-                                                            fmax_context_addr=output_row,
-                                                            vector_sram_start_addr=uram_a_start_addr + output_row * K * bytes_per_element,
-                                                            matrix_sram_start_addr=uram_b_start_addr,
-                                                            output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
-                                                            K=K,
-                                                            N=n_take,
-                                                            bias_enable=bias_enable)
-                    clear_en = 0
-
-                # TODO: if FMAX_CONTEXT_SIZE x seq_len can fit in URAM_A, then we can avoid copying to DRAM, create a special case for this
-                start_dram_address_of_partial_matrix = SCRATCH_DRAM_PARTIAL_SM + j * bytes_per_element # the space needed is FMAX_CONTEXT_SIZE x seq_len
-
-                if N_chunk_aligned is None:
-                    self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                    accelerator_dram_address=start_dram_address_of_partial_matrix,
-                                                    element_size=m_take * n_take,
-                                                    stride_bytes_per_chunk=n_take * bytes_per_element,
-                                                    stride_jump_bytes=N * bytes_per_element)
-                else:
-                    for o_row_idx in range(m_take):
-                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
-                                                        accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
-                                                        element_size=n_take)
-
-
-            # SOFTMAX CALCULATION
-            #print(f"softmax rows: {m_take * N} elements vs {URAM_FULL_ELEMENTS} elements")
-            # DEBUG to get seq_len x seq_len sm(QK^T) results are copied to DRAM
-            # start_dram_address_of_partial_row_complete_matrix = SM_OUTPUT_DRAM_ADDR + i * N * bytes_per_element #  make only FMAX_CONTEXT_SIZE x seq_len sm(QK^T) results are copied to DRAM
-
-            # if m_take * N is greater than the space available in URAM_A, copy the matrix to DRAM
-            max_m_take = min((URAM_FULL_ELEMENTS - UE_VECTOR_SIZE) // N, UE_FMAX_CONTEXT_SIZE) # worst case scenario, leave one row for output
-
-            for m_take_chunk_idx, m_take_chunk_size in self.chunk_ranges(m_take, max_m_take):
-                self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_PARTIAL_SM + m_take_chunk_idx * N * bytes_per_element,
-                                            sram_address=uram_a_start_addr,
-                                            element_size=m_take_chunk_size * N)
-
-                # Reuse input sram_wb_addr for softmax output
-                for row_idx in range(m_take_chunk_size):
-                    self.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
-                                                                vector_sram_start_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
-                                                                output_sram_wb_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
-                                                                N=N)
-
-
-                # softmax output tap point - DEBUG only
-                if debug_mode:
-                    self.sram_to_accelerator_memory(sram_address=uram_a_start_addr,
-                                    accelerator_dram_address=SM_OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * N * bytes_per_element,
-                                    element_size=m_take_chunk_size * N)
-
-                v_tr_row_chunk_size = min((URAM_NEAR_FULL_ELEMENTS // seq_len // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
-                                        ((URAM_FULL_ELEMENTS - m_take_chunk_size * seq_len) // m_take_chunk_size // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
-                                        head_dim)
-
-                v_tr_row_chunk_size_aligned = None
-                if v_tr_row_chunk_size < UE_VECTOR_SIZE:
-                    v_tr_row_chunk_size_aligned = UE_VECTOR_SIZE
-                    if seq_len * 32 <= URAM_NEAR_FULL_ELEMENTS:
-                        v_tr_row_chunk_size = 32
-                    elif seq_len * 16 <= URAM_NEAR_FULL_ELEMENTS:
-                        v_tr_row_chunk_size = 16
-                    else:
-                        assert False, f"v_tr_row_chunk_size={v_tr_row_chunk_size} is too large to fit in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
-
-                v_t_sram_start_addr = 0x80000 # URAM_B start
-                output_sram_wb_addr = uram_a_start_addr + m_take_chunk_size * seq_len * bytes_per_element
-
-                for v_tr_column_idx, v_tr_column_take in self.chunk_ranges(head_dim, v_tr_row_chunk_size):
-                    self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_ADDR + v_tr_column_idx * seq_len * bytes_per_element,
-                                                sram_address=v_t_sram_start_addr,
-                                                element_size=v_tr_column_take * seq_len)
-
-                    for p_row_idx in range(m_take_chunk_size):
-                        if v_tr_row_chunk_size_aligned is None:
-                            output_sram_wb_offset = p_row_idx * v_tr_column_take * bytes_per_element
-                        else:
-                            output_sram_wb_offset = 0
-
-                        self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
-                                                                fmax_context_addr=0,
-                                                                vector_sram_start_addr=uram_a_start_addr + p_row_idx * seq_len * bytes_per_element,
-                                                                matrix_sram_start_addr=v_t_sram_start_addr,
-                                                                output_sram_wb_addr=output_sram_wb_addr + output_sram_wb_offset,
-                                                                K=seq_len,
-                                                                N=v_tr_column_take)
-
-                        if v_tr_row_chunk_size_aligned is not None:
-                            self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + output_sram_wb_offset,
-                                                            accelerator_dram_address=OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * head_dim * bytes_per_element
-                                                                                                        + v_tr_column_idx * bytes_per_element
-                                                                                                        + p_row_idx * head_dim * bytes_per_element,
-                                                            element_size=v_tr_column_take)
-
-
-                    if v_tr_row_chunk_size_aligned is None:
-                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                        accelerator_dram_address=OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * head_dim * bytes_per_element + v_tr_column_idx * bytes_per_element,
-                                                        element_size=m_take_chunk_size * v_tr_column_take,
-                                                        stride_bytes_per_chunk=v_tr_column_take * bytes_per_element,
-                                                        stride_jump_bytes=head_dim * bytes_per_element)
-
-        # Total Theoretical FLOPS: seq_len * head_dim + 2 * seq_len * head_dim * seq_len + seq_len * seq_len + seq_len * seq_len * 5 + 2 * seq_len * seq_len * head_dim
-        total_flops = seq_len * head_dim # q_scale
-        total_flops += 2 * seq_len * head_dim * seq_len # Q @ K^T
-        if bias_enable:
-            total_flops += seq_len * seq_len # bias
-        total_flops += seq_len * seq_len * 5 # softmax
-        total_flops += 2 * seq_len * seq_len * head_dim # sm @ v
-        print(f"Total Theoretical FLOPS: {total_flops / 1e9:.6f} G")
-        return total_flops
-
-    def flash_attention_core_dynamic(self, head_dim: int, seq_len: int,
-                                 Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int,
-                                 OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, ATTN_P_DRAM_ADDR: int,
-                                 IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
-                                 gpr_seq_len: int = None) -> int:
-        """Dynamic flash attention body.
-
-        ``gpr_seq_len`` is a GPR index (1..15) holding seq_len at ISA execute time.
-        ``seq_len`` is a compile-time hint for FLOPS accounting; pass the maximum seq_len
-        so DRAM scratch regions are sized correctly.
-
-        Emits a single ISA body: Vᵀ transpose → Q-scale loop → Q@Kᵀ+softmax → P@Vᵀ.
-        """
-        if gpr_seq_len is None:
-            raise ValueError("flash_attention_core_dynamic requires gpr_seq_len; for static seq_len use flash_attention_core_legacy")
-
-        bytes_per_element = 2
-        bias_enable = BIAS_DRAM_ADDR is not None
-        M = seq_len
-        N = seq_len
-        qk_k = head_dim
-
-        if N % UE_VECTOR_SIZE != 0:
-            raise ValueError(
-                f"flash_attention_core_dynamic: fused softmax requires seq_len % UE_VECTOR_SIZE == 0, got seq_len={N}"
-            )
-
-        # V (seq_len × head_dim) → V^T at SCRATCH_DRAM_ADDR (head_dim × seq_len)
-        self.bf16_transpose_core_dynamic(
-            M=seq_len, N=head_dim,
-            INPUT_DRAM_ADDR=V_DRAM_ADDR, OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR, gpr_M_reg=gpr_seq_len,
+        self.bf16_transpose_core(
+            M=aligned_seq_len,
+            N=head_dim,
+            INPUT_DRAM_ADDR=V_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=v_t_dram_addr,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
         )
-
-        # Q-scale: multiply each row of Q by 1/sqrt(head_dim) in DRAM in place
-        attn_scale = 1.0 / math.sqrt(head_dim)
-        row_bytes = qk_k * bytes_per_element
-        vector_sram_addr = 0x00000
-        if qk_k > URAM_NEAR_FULL_ELEMENTS:
-            raise ValueError(
-                f"flash_attention_core_dynamic: head_dim={qk_k} exceeds URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS} "
-                "(ISA Q-scale loop stages one full row in URAM)"
-            )
-
-        vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_addr)
-        assert vector_uram_type == URAM_SECTION.URAM_A, "Q staging must be URAM_A"
-
-        row_load_ptr = self.alloc_inst_ptr()
-        row_store_ptr = self.alloc_inst_ptr()
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=Q_DRAM_ADDR, dma_length=row_bytes,
-            output_size=0, uram_length=0, uram_a_start_addr=0, uram_b_start_addr=0,
-            uram_wb_addr=0, uram_dst_addr=vector_uram_start_addr, fmax_context_addr=0,
-            inst_pointer_idx=row_load_ptr,
+        total_flops = self.eltwise_core_dram(
+            M=batch,
+            N=head_dim,
+            dram_a=Q_DRAM_ADDR,
+            dram_b=None,
+            dram_out=scaled_q_dram_addr,
+            mode=UE_MODE.MUL_BROADCAST,
+            scalar=attn_scale,
         )
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=Q_DRAM_ADDR, dma_length=row_bytes,
-            output_size=0, uram_length=0, uram_a_start_addr=vector_uram_start_addr,
-            uram_b_start_addr=vector_uram_start_addr, uram_wb_addr=0, uram_dst_addr=0,
-            fmax_context_addr=0, inst_pointer_idx=row_store_ptr,
-        )
-
-        body_program_dram_start_addr = self.get_program_dram_addr()
-        cur_inst_count = self.capture_count
-        self.generate_instruction_jump_abs(
-            ue_35bit_addr_shifter(body_program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES)
-        )
-        self.loop_start(M, gpr_loop_cnt=gpr_seq_len)
-        self.accelerator_memory_to_sram(
-            accelerator_dram_address=row_bytes, sram_address=vector_sram_addr,
-            element_size=0, inst_pointer_idx=row_load_ptr,
-        )
-        self.broadcast_mul(scalar=attn_scale, sram_start_addr=vector_sram_addr,
-                           sram_wb_addr=vector_sram_addr, element_size=qk_k)
-        self.sram_to_accelerator_memory(
-            sram_address=vector_sram_addr, accelerator_dram_address=row_bytes,
-            element_size=0, inst_pointer_idx=row_store_ptr,
-        )
-        q_scale_loop_size = self.loop_end()
-        print(f"flash_attention_core_dynamic Q-scale loop body: {q_scale_loop_size} instructions (M={M}, head_dim={qk_k})")
-        assert q_scale_loop_size <= 256, f"Q-scale ISA loop body {q_scale_loop_size} exceeds i-cache 256"
-        self.release_inst_ptr(row_store_ptr)
-        self.release_inst_ptr(row_load_ptr)
-
-        # Q @ K^T + softmax → ATTN_P; P @ V^T → OUTPUT
-        # matmat_mul_dynamic_core requires all three GPRs; allocate one for the static head_dim
-        head_dim_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(head_dim_reg, head_dim)
-        self.matmat_mul_core(
-            M=M, K=qk_k, N=N,
-            A_DRAM_ADDR=Q_DRAM_ADDR, B_DRAM_ADDR=K_DRAM_ADDR, OUTPUT_DRAM_ADDR=ATTN_P_DRAM_ADDR,
+        total_flops += self.matmat_mul_core(
+            M=batch,
+            K=head_dim,
+            N=aligned_seq_len,
+            A_DRAM_ADDR=scaled_q_dram_addr,
+            B_DRAM_ADDR=K_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=score_dram_addr,
             softmax_enable=True,
-            C_DRAM_ADDR=BIAS_DRAM_ADDR if bias_enable else None, bias_mode="full_matrix",
-            gpr_M_reg=gpr_seq_len, gpr_K_reg=head_dim_reg, gpr_N_reg=gpr_seq_len,
+            C_DRAM_ADDR=BIAS_DRAM_ADDR,
+            bias_mode="full_matrix",
         )
-        self.matmat_mul_core(
-            M=seq_len, K=seq_len, N=head_dim,
-            A_DRAM_ADDR=ATTN_P_DRAM_ADDR, B_DRAM_ADDR=SCRATCH_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            gpr_M_reg=gpr_seq_len, gpr_K_reg=gpr_seq_len, gpr_N_reg=head_dim_reg,
-        )
-        self.release_isa_reg()  # head_dim_reg
-
-        total_flops = seq_len * head_dim
-        total_flops += 2 * seq_len * head_dim * seq_len
-        if bias_enable:
-            total_flops += seq_len * seq_len
-        total_flops += seq_len * seq_len * 5
-        total_flops += 2 * seq_len * seq_len * head_dim
-        print(f"flash_attention_core_dynamic: seq_len ref={seq_len}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
-        return total_flops
-
-    # =========================================================================
-    # Decoder group attention (single-query GQA used by autoregressive decode)
-    # =========================================================================
-    def decoder_group_attention_core(
-        self,
-        group_size: int,
-        head_dim: int,
-        seq_len: int,
-        Q_DRAM_ADDR: int,
-        K_DRAM_ADDR: int,
-        V_DRAM_ADDR: int,
-        OUTPUT_DRAM_ADDR: int,
-        SCRATCH_DRAM_ADDR: int,
-        IDENTITY_DRAM_ADDR: int = None,
-        BIAS_DRAM_ADDR: int = None,
-        debug_mode: bool = False,
-        SM_OUTPUT_DRAM_ADDR: int = None,
-        gpr_seq_len: int = None,
-    ):
-        """Decoder group attention entrypoint.
-
-        - ``gpr_seq_len`` is a GPR index (1..15): :meth:`decoder_group_attention_core_dynamic` — single
-          dynamic ISA body, seq_len read from the GPR at execute time. ``seq_len`` must equal the
-          maximum seq_len so Python-level SCRATCH sub-address layout (Vᵀ / score / scaled_q) stays
-          within the allocation. Returns ``int`` FLOPS.
-        - ``gpr_seq_len`` is ``None`` (default): :meth:`decoder_group_attention_core_legacy` — static
-          single ``seq_len`` body.
-        """
-        if gpr_seq_len is not None:
-            return self.decoder_group_attention_core_dynamic(
-                group_size=group_size,
-                head_dim=head_dim,
-                seq_len=seq_len,
-                Q_DRAM_ADDR=Q_DRAM_ADDR,
-                K_DRAM_ADDR=K_DRAM_ADDR,
-                V_DRAM_ADDR=V_DRAM_ADDR,
-                OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-                IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
-                gpr_seq_len=gpr_seq_len,
-            )
-        return self.decoder_group_attention_core_legacy(
-            group_size=group_size,
-            head_dim=head_dim,
-            seq_len=seq_len,
-            Q_DRAM_ADDR=Q_DRAM_ADDR,
-            K_DRAM_ADDR=K_DRAM_ADDR,
-            V_DRAM_ADDR=V_DRAM_ADDR,
+        total_flops += self.matmat_mul_core(
+            M=batch,
+            K=aligned_seq_len,
+            N=head_dim,
+            A_DRAM_ADDR=score_dram_addr,
+            B_DRAM_ADDR=v_t_dram_addr,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
-            debug_mode=debug_mode,
-            SM_OUTPUT_DRAM_ADDR=SM_OUTPUT_DRAM_ADDR,
         )
-
-    def decoder_group_attention_core_legacy(
-        self,
-        group_size: int,
-        head_dim: int,
-        seq_len: int,
-        Q_DRAM_ADDR: int,
-        K_DRAM_ADDR: int,
-        V_DRAM_ADDR: int,
-        OUTPUT_DRAM_ADDR: int,
-        SCRATCH_DRAM_ADDR: int,
-        IDENTITY_DRAM_ADDR: int = None,
-        BIAS_DRAM_ADDR: int = None,
-        debug_mode: bool = False,
-        SM_OUTPUT_DRAM_ADDR: int = None,
-    ) -> int:
-        """Legacy GQA decode attention: Q is ``group_size × head_dim`` (one new token replicated
-        across the GQA query heads), K/V are ``seq_len × head_dim`` from the KV cache.
-
-        Conceptually a per-group ``softmax(q·Kᵀ/√d) · V`` with ``M=1`` per group. Compiled as
-        a Python ``for g in range(group_size)`` loop, each iteration emitting its own
-        chunked V^T materialization + Q@Kᵀ + softmax + P@V sequence.
-        """
-        total_flops = 0
-        group_stride_bytes = head_dim * self.bytes_per_element
-        bytes_per_element = 2
-        bias_enable = True if BIAS_DRAM_ADDR is not None else False
-
-        if debug_mode: # DEBUG only, needs to be allocated in DRAM
-            assert SM_OUTPUT_DRAM_ADDR is not None, "SM_OUTPUT_DRAM_ADDR is not set for debug mode"
-
-        identity_tensor = torch.eye(head_dim, dtype=torch.bfloat16)
-        for g in range(group_size):
-            group_q_dram_addr = Q_DRAM_ADDR + g * group_stride_bytes
-            group_output_dram_addr = OUTPUT_DRAM_ADDR + g * group_stride_bytes
-
-            # SCRATCH_DRAM_ADDR is used for V^T
-            SCRATCH_DRAM_PARTIAL_SM = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element # used for partial softmax output
-
-            # ----------------------------------------------------------------------------------------------------------------
-            # I @ V^T: (head_dim, head_dim) @ (seq_len, head_dim)^T -> (head_dim, seq_len)
-            # Convention: first matrix I is (M, K), second V^T is (K, N), output  (M, N)
-            M = head_dim   # identity length (rows of I)
-            K = head_dim  # identity dimension (inner product dim)
-            N = seq_len   # V length (columns of V^T)
-
-            # transfer identity matrix to URAM_A start
-            self.accelerator_memory_to_sram(accelerator_dram_address=IDENTITY_DRAM_ADDR,
-                                            sram_address=0,
-                                            element_size=UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-
-            usable_uram_a_start_addr = UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element
-
-            # URAM_B is used for V matrix, we need to chunk the V matrix into smaller chunks that can fit in URAM_B
-            usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
-            N_chunk = min(N, (usable_uram_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-            N_chunk_aligned = None
-            if N_chunk < UE_VECTOR_SIZE:
-                if (K * 32) <= usable_uram_b_elements:
-                    N_chunk = 32
-                elif (K * 16) <= usable_uram_b_elements:
-                    N_chunk = 16
-                else:
-                    assert False, f"K={K} is too large to fit in usable URAM elements={usable_uram_b_elements}"
-                N_chunk_aligned = UE_VECTOR_SIZE
-
-            usable_uram_a_elements = URAM_FULL_ELEMENTS - UE_VECTOR_SIZE * UE_VECTOR_SIZE
-            output_N_size = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
-            M_chunk = min(M, usable_uram_a_elements // output_N_size)
-            assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
-
-            print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
-            print(f"URAM_A usage: {100 * (UE_VECTOR_SIZE * UE_VECTOR_SIZE + M_chunk * output_N_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS")
-            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-
-            output_sram_wb_addr = usable_uram_a_start_addr
-            uram_b_start_addr = 0x80000
-            for i, m_take in self.chunk_ranges(M, M_chunk):
-                for j, n_take in self.chunk_ranges(N, N_chunk):
-
-                    self.accelerator_memory_to_sram(accelerator_dram_address=V_DRAM_ADDR + j * K * bytes_per_element,
-                                                sram_address=uram_b_start_addr,
-                                                element_size=n_take * K)
-
-                    for output_row in range(m_take):
-                        if N_chunk_aligned is None:
-                            out_sram_offset = output_row * n_take * bytes_per_element
-                        else:
-                            out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
-
-                        ones_idx = identity_tensor[output_row+i, :].reshape(-1, UE_VECTOR_SIZE).sum(axis=1).argmax(axis=0)
-                        vector_idx = identity_tensor[output_row+i, :].reshape(-1, UE_VECTOR_SIZE)[ones_idx, :].argmax(axis=0)
-
-                        self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
-                                                                fmax_context_addr=0,
-                                                                vector_sram_start_addr=0x00000 + vector_idx * UE_VECTOR_SIZE * bytes_per_element,
-                                                                matrix_sram_start_addr=uram_b_start_addr + ones_idx * UE_VECTOR_SIZE * bytes_per_element,
-                                                                output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
-                                                                K=UE_VECTOR_SIZE,
-                                                                N=n_take,
-                                                                stride_z=m_take)
-
-                    start_dram_address_of_partial_matrix = SCRATCH_DRAM_ADDR + i * N * bytes_per_element + j * bytes_per_element # the space needed is head_dim x seq_len
-
-                    if N_chunk_aligned is None:
-                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                        accelerator_dram_address=start_dram_address_of_partial_matrix,
-                                                        element_size=m_take * n_take,
-                                                        stride_bytes_per_chunk=n_take * bytes_per_element,
-                                                        stride_jump_bytes=N * bytes_per_element)
-                    else:
-                        for o_row_idx in range(m_take):
-                            self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
-                                                            accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
-                                                            element_size=n_take)
-
-            # ----------------------------------------------------------------------------------------------------------------
-            # Q @ K^T: (1, head_dim) @ (head_dim, seq_len) -> (1, seq_len)
-            # Convention: first matrix Q is (M, K), second K^T is (K, N), output scores (M, N)
-            M = 1         # query length (rows of Q)
-            K = head_dim  # head dimension (inner product dim)
-            N = seq_len   # key length (columns of K^T)
-            # Calculate N_chunk
-            usable_uram_b_elements = URAM_NEAR_FULL_ELEMENTS
-            N_chunk = min(N, (usable_uram_b_elements // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-            N_chunk_aligned = None
-            if N_chunk < UE_VECTOR_SIZE:
-                if (K * 32) <= usable_uram_b_elements:
-                    N_chunk = 32
-                elif (K * 16) <= usable_uram_b_elements:
-                    N_chunk = 16
-                else:
-                    assert False, f"K={K} is too large to fit in usable URAM elements={usable_uram_b_elements}"
-                N_chunk_aligned = UE_VECTOR_SIZE
-
-            usable_uram_a_elements = URAM_FULL_ELEMENTS
-            output_N_size = N_chunk_aligned if N_chunk_aligned is not None else N_chunk
-            M_chunk = min(UE_FMAX_CONTEXT_SIZE, M, usable_uram_a_elements // (K + output_N_size))
-            assert M_chunk >= 1 and M_chunk <= M, f"M_chunk={M_chunk} must be greater than 0 and less than M={M}"
-
-            print(f"M_chunk: {M_chunk}, N_chunk: {N_chunk}", f"N_chunk_aligned: {N_chunk_aligned}")
-            print(f"URAM_A usage: {100 * (M_chunk * K + M_chunk * output_N_size) / URAM_FULL_ELEMENTS:.2f}% of URAM_NEAR_FULL_ELEMENTS")
-            print(f"URAM_B usage: {100 * N_chunk * K / URAM_FULL_ELEMENTS:.2f}% of URAM_FULL_ELEMENTS")
-
-            uram_a_start_addr = 0x00000
-            uram_b_start_addr = 0x80000
-            for i, m_take in self.chunk_ranges(M, M_chunk):
-                self.accelerator_memory_to_sram(accelerator_dram_address=group_q_dram_addr + i * K * bytes_per_element,
-                                                sram_address=uram_a_start_addr,
-                                                element_size=m_take * K)
-
-                self.broadcast_mul(scalar=1 / math.sqrt(head_dim),
-                                        sram_start_addr=uram_a_start_addr,
-                                        sram_wb_addr=uram_a_start_addr,
-                                        element_size=m_take * K)
-
-                output_sram_wb_addr = uram_a_start_addr + m_take * K * bytes_per_element
-
-                assert output_sram_wb_addr < 0x80000, f"output_sram_wb_addr={output_sram_wb_addr} is greater than 0x80000, which is the size of URAM_B"
-
-                clear_en = 1
-                for j, n_take in self.chunk_ranges(N, N_chunk):
-                    self.accelerator_memory_to_sram(accelerator_dram_address=K_DRAM_ADDR + j * K * bytes_per_element,
-                                                sram_address=uram_b_start_addr,
-                                                element_size=n_take * K)
-
-                    if bias_enable:
-                        self.accelerator_memory_to_bias_sram(accelerator_dram_address=BIAS_DRAM_ADDR + j * bytes_per_element,
-                                                           element_size=n_take)
-
-                    assert m_take * K + n_take * m_take<= URAM_FULL_ELEMENTS
-
-                    for output_row in range(m_take):
-                        # removed bias_enable as per causal mask drop
-
-                        if N_chunk_aligned is None:
-                            out_sram_offset = output_row * n_take * bytes_per_element
-                        else:
-                            out_sram_offset = output_row * N_chunk_aligned * bytes_per_element
-
-                        self.start_queue_for_bf16_matvec_operation(max_clear_en=clear_en,
-                                                                fmax_context_addr=output_row,
-                                                                vector_sram_start_addr=uram_a_start_addr + output_row * K * bytes_per_element,
-                                                                matrix_sram_start_addr=uram_b_start_addr,
-                                                                output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
-                                                                K=K,
-                                                                N=n_take,
-                                                                bias_enable=bias_enable)
-                        clear_en = 0
-
-                    # TODO: if FMAX_CONTEXT_SIZE x seq_len can fit in URAM_A, then we can avoid copying to DRAM, create a special case for this
-                    start_dram_address_of_partial_matrix = SCRATCH_DRAM_PARTIAL_SM + j * bytes_per_element # the space needed is FMAX_CONTEXT_SIZE x seq_len
-
-                    if N_chunk_aligned is None:
-                        self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                        accelerator_dram_address=start_dram_address_of_partial_matrix,
-                                                        element_size=m_take * n_take,
-                                                        stride_bytes_per_chunk=n_take * bytes_per_element,
-                                                        stride_jump_bytes=N * bytes_per_element)
-                    else:
-                        for o_row_idx in range(m_take):
-                            self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + o_row_idx * N_chunk_aligned * bytes_per_element,
-                                                            accelerator_dram_address=start_dram_address_of_partial_matrix + o_row_idx * N * bytes_per_element,
-                                                            element_size=n_take)
-
-
-                # SOFTMAX CALCULATION
-                # if m_take * N is greater than the space available in URAM_A, copy the matrix to DRAM
-                max_m_take = min((URAM_FULL_ELEMENTS - UE_VECTOR_SIZE) // N, UE_FMAX_CONTEXT_SIZE) # worst case scenario, leave one row for output
-
-                for m_take_chunk_idx, m_take_chunk_size in self.chunk_ranges(m_take, max_m_take):
-                    self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_PARTIAL_SM + m_take_chunk_idx * N * bytes_per_element,
-                                                sram_address=uram_a_start_addr,
-                                                element_size=m_take_chunk_size * N)
-
-                    # Reuse input sram_wb_addr for softmax output
-                    for row_idx in range(m_take_chunk_size):
-                        self.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
-                                                                    vector_sram_start_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
-                                                                    output_sram_wb_addr=uram_a_start_addr + row_idx * N * bytes_per_element,
-                                                                    N=N)
-
-
-                    # softmax output tap point - DEBUG only
-                    if debug_mode:
-                        self.sram_to_accelerator_memory(sram_address=uram_a_start_addr,
-                                        accelerator_dram_address=SM_OUTPUT_DRAM_ADDR + (i + m_take_chunk_idx) * N * bytes_per_element,
-                                        element_size=m_take_chunk_size * N)
-
-                    v_tr_row_chunk_size = min((URAM_NEAR_FULL_ELEMENTS // seq_len // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
-                                            ((URAM_FULL_ELEMENTS - m_take_chunk_size * seq_len) // m_take_chunk_size // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
-                                            head_dim)
-
-                    v_tr_row_chunk_size_aligned = None
-                    if v_tr_row_chunk_size < UE_VECTOR_SIZE:
-                        v_tr_row_chunk_size_aligned = UE_VECTOR_SIZE
-                        if seq_len * 32 <= URAM_NEAR_FULL_ELEMENTS:
-                            v_tr_row_chunk_size = 32
-                        elif seq_len * 16 <= URAM_NEAR_FULL_ELEMENTS:
-                            v_tr_row_chunk_size = 16
-                        else:
-                            assert False, f"v_tr_row_chunk_size={v_tr_row_chunk_size} is too large to fit in URAM_NEAR_FULL_ELEMENTS={URAM_NEAR_FULL_ELEMENTS}"
-
-                    v_t_sram_start_addr = 0x80000 # URAM_B start
-                    output_sram_wb_addr = uram_a_start_addr + m_take_chunk_size * seq_len * bytes_per_element
-
-                    for v_tr_column_idx, v_tr_column_take in self.chunk_ranges(head_dim, v_tr_row_chunk_size):
-                        self.accelerator_memory_to_sram(accelerator_dram_address=SCRATCH_DRAM_ADDR + v_tr_column_idx * seq_len * bytes_per_element,
-                                                    sram_address=v_t_sram_start_addr,
-                                                    element_size=v_tr_column_take * seq_len)
-
-                        for p_row_idx in range(m_take_chunk_size):
-                            if v_tr_row_chunk_size_aligned is None:
-                                output_sram_wb_offset = p_row_idx * v_tr_column_take * bytes_per_element
-                            else:
-                                output_sram_wb_offset = 0
-
-                            self.start_queue_for_bf16_matvec_operation(max_clear_en=0,
-                                                                    fmax_context_addr=0,
-                                                                    vector_sram_start_addr=uram_a_start_addr + p_row_idx * seq_len * bytes_per_element,
-                                                                    matrix_sram_start_addr=v_t_sram_start_addr,
-                                                                    output_sram_wb_addr=output_sram_wb_addr + output_sram_wb_offset,
-                                                                    K=seq_len,
-                                                                    N=v_tr_column_take)
-
-                            if v_tr_row_chunk_size_aligned is not None:
-                                self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr + output_sram_wb_offset,
-                                                                accelerator_dram_address=group_output_dram_addr + (i + m_take_chunk_idx) * head_dim * bytes_per_element
-                                                                                                            + v_tr_column_idx * bytes_per_element
-                                                                                                            + p_row_idx * head_dim * bytes_per_element,
-                                                                element_size=v_tr_column_take)
-
-
-                        if v_tr_row_chunk_size_aligned is None:
-                            self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
-                                                            accelerator_dram_address=group_output_dram_addr + (i + m_take_chunk_idx) * head_dim * bytes_per_element + v_tr_column_idx * bytes_per_element,
-                                                            element_size=m_take_chunk_size * v_tr_column_take,
-                                                            stride_bytes_per_chunk=v_tr_column_take * bytes_per_element,
-                                                            stride_jump_bytes=head_dim * bytes_per_element)
-
-            # Total Theoretical FLOPS
-            group_flops = 1 * head_dim # q_scale
-            group_flops += 2 * 1 * head_dim * seq_len # Q @ K^T
-            group_flops += 1 * seq_len * 5 # softmax
-            group_flops += 2 * 1 * seq_len * head_dim # sm @ v
-            print(f"Total Theoretical FLOPS: {group_flops}")
-            total_flops += group_flops
+        print(f"unified_attention_core_legacy: batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
         return total_flops
 
-    def decoder_group_attention_core_dynamic(
+    def unified_attention_core_dynamic(
         self,
-        group_size: int,
+        batch: int,
+        aligned_seq_len: int,
         head_dim: int,
-        seq_len: int,
         Q_DRAM_ADDR: int,
         K_DRAM_ADDR: int,
         V_DRAM_ADDR: int,
+        BIAS_DRAM_ADDR: int,
         OUTPUT_DRAM_ADDR: int,
         SCRATCH_DRAM_ADDR: int,
         IDENTITY_DRAM_ADDR: int = None,
-        BIAS_DRAM_ADDR: int = None,
-        gpr_seq_len: int = None,
+        gpr_batch_reg: int = None,
+        gpr_aligned_seq_len_reg: int = None,
+        gpr_q_addr: int = None,
+        gpr_k_addr: int = None,
+        gpr_v_addr: int = None,
+        gpr_bias_addr: int = None,
+        gpr_out_addr: int = None,
+        q_scale: float = None,
     ) -> int:
-        """Dynamic decoder group attention body.
+        # q_scale: multiplier applied to Q before Q·Kᵀ. None = standard 1/sqrt(head_dim);
+        # pass an explicit value (e.g. 1.0) when the query scaling is already folded into Q.
+        attn_scale = q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)
+        bytes_per_element = 2
+        if batch > aligned_seq_len:
+            raise ValueError(f"unified_attention_core_dynamic: batch must be <= aligned_seq_len, got batch={batch}, aligned_seq_len={aligned_seq_len}")
+        if aligned_seq_len % UE_VECTOR_SIZE != 0:
+            raise ValueError(f"unified_attention_core_dynamic: aligned_seq_len must be a multiple of {UE_VECTOR_SIZE}, got {aligned_seq_len}")
+        allocated_regs = []
+        if gpr_batch_reg is None:
+            gpr_batch_reg = self.alloc_isa_reg()
+            allocated_regs.append(gpr_batch_reg)
+            self.generate_instruction_add_set(gpr_batch_reg, batch)
+        if gpr_aligned_seq_len_reg is None:
+            gpr_aligned_seq_len_reg = self.alloc_isa_reg()
+            allocated_regs.append(gpr_aligned_seq_len_reg)
+            self.generate_instruction_add_set(gpr_aligned_seq_len_reg, aligned_seq_len)
 
-        ``gpr_seq_len`` is a GPR index (1..15) holding seq_len at ISA execute time.
-        ``seq_len`` must equal the maximum seq_len the body will run with; it is used for
-        Python-level SCRATCH sub-address layout (Vᵀ / score / scaled_q) so regions don't overlap.
+        v_t_dram_addr = SCRATCH_DRAM_ADDR
+        score_dram_addr = v_t_dram_addr + head_dim * aligned_seq_len * bytes_per_element
+        scaled_q_dram_addr = score_dram_addr + aligned_seq_len * aligned_seq_len * bytes_per_element
 
-        SCRATCH layout:
-          [0 .. head_dim*seq_len*2)              → Vᵀ  (head_dim × seq_len)
-          [head_dim*seq_len*2 .. +group*seq*2)   → score (group_size × seq_len)
-          [.. +group_size*head_dim*2)             → scaled_q (group_size × head_dim)
-        """
-        if gpr_seq_len is None:
-            raise ValueError("decoder_group_attention_core_dynamic requires gpr_seq_len; for static seq_len use decoder_group_attention_core_legacy")
-
-        bytes_per_element = self.bytes_per_element
-        score_dram_addr = SCRATCH_DRAM_ADDR + head_dim * seq_len * bytes_per_element
-        scaled_q_dram_addr = score_dram_addr + group_size * seq_len * bytes_per_element
-
-        # V (seq_len × head_dim) → V^T at SCRATCH_DRAM_ADDR (head_dim × seq_len)
-        self.bf16_transpose_core_dynamic(
-            M=seq_len, N=head_dim,
-            INPUT_DRAM_ADDR=V_DRAM_ADDR, OUTPUT_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR, gpr_M_reg=gpr_seq_len,
+        self.bf16_transpose_core(
+            M=aligned_seq_len,
+            N=head_dim,
+            INPUT_DRAM_ADDR=V_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=v_t_dram_addr,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+            gpr_M_reg=gpr_aligned_seq_len_reg,
+            gpr_input_addr=gpr_v_addr,
         )
-
-        # Q-scale: load all query rows, multiply by 1/sqrt(head_dim), store to scaled_q scratch
-        self.accelerator_memory_to_sram(
-            accelerator_dram_address=Q_DRAM_ADDR,
-            sram_address=0x00000,
-            element_size=group_size * head_dim,
+        total_flops = self.eltwise_core_dram(
+            M=batch,
+            N=head_dim,
+            dram_a=Q_DRAM_ADDR,
+            dram_b=None,
+            dram_out=scaled_q_dram_addr,
+            mode=UE_MODE.MUL_BROADCAST,
+            scalar=attn_scale,
+            gpr_M_reg=gpr_batch_reg,
+            gpr_a_addr=gpr_q_addr,
         )
-        self.broadcast_mul(
-            scalar=1 / math.sqrt(head_dim),
-            sram_start_addr=0x00000,
-            sram_wb_addr=0x00000,
-            element_size=group_size * head_dim,
-        )
-        self.sram_to_accelerator_memory(
-            sram_address=0x00000,
-            accelerator_dram_address=scaled_q_dram_addr,
-            element_size=group_size * head_dim,
-        )
-
-        # Q @ K^T + softmax → score; score @ V^T → OUTPUT
-        # matmat_mul_dynamic_core requires all three GPRs; allocate static ones for group_size/head_dim
-        group_size_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(group_size_reg, group_size)
         head_dim_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(head_dim_reg, head_dim)
-        self.matmat_mul_core(
-            M=group_size, K=head_dim, N=seq_len,
-            A_DRAM_ADDR=scaled_q_dram_addr, B_DRAM_ADDR=K_DRAM_ADDR, OUTPUT_DRAM_ADDR=score_dram_addr,
-            softmax_enable=True, C_DRAM_ADDR=BIAS_DRAM_ADDR,
-            gpr_M_reg=group_size_reg, gpr_K_reg=head_dim_reg, gpr_N_reg=gpr_seq_len,
+        total_flops += self.matmat_mul_core(
+            M=batch,
+            K=head_dim,
+            N=aligned_seq_len,
+            A_DRAM_ADDR=scaled_q_dram_addr,
+            B_DRAM_ADDR=K_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=score_dram_addr,
+            softmax_enable=True,
+            C_DRAM_ADDR=BIAS_DRAM_ADDR,
+            bias_mode="full_matrix",
+            gpr_M_reg=gpr_batch_reg,
+            gpr_K_reg=head_dim_reg,
+            gpr_N_reg=gpr_aligned_seq_len_reg,
+            gpr_b_addr=gpr_k_addr,
+            gpr_c_addr=gpr_bias_addr,
         )
-        self.matmat_mul_core(
-            M=group_size, K=seq_len, N=head_dim,
-            A_DRAM_ADDR=score_dram_addr, B_DRAM_ADDR=SCRATCH_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            gpr_M_reg=group_size_reg, gpr_K_reg=gpr_seq_len, gpr_N_reg=head_dim_reg,
+        total_flops += self.matmat_mul_core(
+            M=batch,
+            K=aligned_seq_len,
+            N=head_dim,
+            A_DRAM_ADDR=score_dram_addr,
+            B_DRAM_ADDR=v_t_dram_addr,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            gpr_M_reg=gpr_batch_reg,
+            gpr_K_reg=gpr_aligned_seq_len_reg,
+            gpr_N_reg=head_dim_reg,
+            gpr_out_addr=gpr_out_addr,
         )
         self.release_isa_reg()  # head_dim_reg
-        self.release_isa_reg()  # group_size_reg
-
-        group_flops = 1 * head_dim
-        group_flops += 2 * 1 * head_dim * seq_len
-        group_flops += 1 * seq_len * 5
-        group_flops += 2 * 1 * seq_len * head_dim
-        total_flops = group_size * group_flops
-        print(f"decoder_group_attention_core_dynamic: seq_len ref={seq_len}, group_size={group_size}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
+        for _ in allocated_regs:
+            self.release_isa_reg()
+        print(f"unified_attention_core_dynamic: batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
         return total_flops
 
     def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, write_back_disable: bool = False) -> None:
@@ -7511,8 +8154,6 @@ class UnifiedEngine:
 
         - :meth:`generate_instruction_halt` (program-end alignment)
         - :meth:`write_captured_instructions_to_dram` (DRAM-flush alignment)
-        - bucket dispatchers (:meth:`flash_attention_core_dynamic`,
-          :meth:`decoder_group_attention_core_dynamic`) before each bucket body's entry point.
 
         :meth:`_generate_instruction_jump` has its own related logic that adjusts the **jump
         target** address (not the current capture position), which is a different concern.
@@ -8002,9 +8643,6 @@ class UnifiedEngine:
 
         Layout (see :meth:`ue_isa_descriptor`): immediate occupies bits [82:51] split as
         ``w[1][31:19]`` (low 13) and ``w[2][18:0]`` (high 19).
-
-        Used by :meth:`flash_attention_core_dynamic` bucketization to fill placeholder JZ /
-        JMP targets after forward bucket-entry and end-label addresses become known.
         """
         if self.capture_buffer is None or capture_idx < 0 or capture_idx >= len(self.capture_buffer):
             raise IndexError(
@@ -8182,12 +8820,15 @@ class UnifiedEngine:
             fmax_context_addr=0,
         )
 
-    def write_captured_instructions_to_dram(self, start_addr: Optional[int] = None) -> int:
+    def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR, chunk_bytes: int | None = None) -> int:
         """
         Write all captured instructions to DRAM
 
         Args:
             start_addr: Starting DRAM address to write instructions (default: DRAM_INSTRUCTION_ADDR)
+            chunk_bytes: If set, split the DMA write into pieces of at most this many bytes.
+                         A single-shot write can segfault on large instruction streams (e.g. swin's
+                         ~10 MB image); chunking avoids it. ``None`` (default) writes in one call.
 
         Returns:
             Number of bytes written, or -1 on error
@@ -8220,7 +8861,16 @@ class UnifiedEngine:
 
         # Write to DRAM
         print(f"Writing {self.capture_count} captured instructions ({total_bytes} bytes) to DRAM at 0x{start_addr:x}...")
-        bytes_written = self.dma_write(DMA_DEVICE_H2C, start_addr, instructions_bytes, total_bytes)
+        if chunk_bytes is not None and chunk_bytes > 0:
+            bytes_written = 0
+            offset = 0
+            while offset < total_bytes:
+                chunk = min(chunk_bytes, total_bytes - offset)
+                bytes_written += self.dma_write(DMA_DEVICE_H2C, start_addr + offset,
+                                                instructions_bytes[offset:offset + chunk], chunk)
+                offset += chunk
+        else:
+            bytes_written = self.dma_write(DMA_DEVICE_H2C, start_addr, instructions_bytes, total_bytes)
 
         if bytes_written == total_bytes:
             print(f"Successfully wrote {bytes_written} bytes ({self.capture_count} instructions) to DRAM")
@@ -8665,6 +9315,116 @@ class UnifiedEngine:
             # Approximate conversion (simplified)
             # In real implementation, this would properly reconstruct the float
             return float(exp) * (1.0 + frac / 1024.0) * (-1 if sign else 1)
+
+
+def check_isa_jumps(
+    instructions: list,
+    base_addr: int,
+    name: str = "",
+    icache_size: int = 512,
+) -> list:
+    """Static checker for ISA JUMP instructions in a captured instruction buffer.
+
+    Enforces two hardware constraints:
+      1. Absolute jump targets (ABSOLUTE / JNZ / JZ) must be 64-byte (2-instruction) aligned.
+      2. Relative backward jumps (RELATIVE / RELA_JNZ / RELA_JZ) must be within ``icache_size``
+         instructions of the most recent unconditional absolute jump anchor.  The i-cache is
+         reloaded when an unconditional absolute jump fires; any relative jump whose backward
+         offset exceeds that distance would under-run the cache and fetch stale instructions.
+
+    Args:
+        instructions: list of ``Instructions`` objects (the capture buffer).
+        base_addr:    DRAM byte address of ``instructions[0]``.  Must be 64-byte aligned.
+        name:         Label prepended to every issue string.
+        icache_size:  Hardware i-cache depth in instructions (default 512 = 16 KB / 32 B).
+
+    Returns:
+        List of issue strings.  Empty list means all checks passed.
+    """
+    INST_BYTES = 32
+    ALIGN_BYTES = 64          # 2 instructions per 512-bit DRAM fetch
+    ABS_MODES = {JUMP_MODE_ABSOLUTE, JUMP_MODE_JNZ, JUMP_MODE_JZ}
+    REL_MODES = {JUMP_MODE_RELATIVE, JUMP_MODE_RELA_JNZ, JUMP_MODE_RELA_JZ}
+
+    issues = []
+    prefix = f"[{name}] " if name else ""
+
+    # Index (in buffer) of the first instruction of the current i-cache window.
+    # Updated whenever an unconditional absolute jump fires; None means unknown
+    # (no anchor seen yet, or last anchor was outside this buffer).
+    anchor_target_idx = None
+
+    for i, inst in enumerate(instructions):
+        w = inst.words
+        inst_type = _inst_desc_bits(w, 8, 11)
+        if inst_type != INSTRUCTION_JUMP:
+            continue
+
+        jump_mode     = _inst_desc_bits(w, 32, 35)
+        # immediate_value occupies bits [82:51] of the 256-bit descriptor:
+        #   bits [63:51] → word[1] bits [31:19]  (13 bits, imm[12:0])
+        #   bits [82:64] → word[2] bits [18:0]   (19 bits, imm[31:13])
+        immediate     = ((_inst_desc_bits(w, 51, 63)) | (_inst_desc_bits(w, 64, 82) << 13))
+        inst_addr     = base_addr + i * INST_BYTES
+        tag           = f"{prefix}inst[{i}] @ 0x{inst_addr:X}"
+
+        if jump_mode in ABS_MODES:
+            target_byte = immediate << 3
+            # --- Concern 1: 64-byte alignment ---
+            if target_byte % ALIGN_BYTES != 0:
+                issues.append(
+                    f"{tag}: ABS JUMP (mode={jump_mode}) target 0x{target_byte:X} "
+                    f"is NOT 64-byte aligned (mod64={target_byte % ALIGN_BYTES})"
+                )
+            # Update i-cache anchor for unconditional absolute jumps only.
+            # Conditional jumps (JNZ/JZ) may or may not fire; tracking them as
+            # definitive anchors would give false safety for the non-firing path.
+            if jump_mode == JUMP_MODE_ABSOLUTE:
+                target_buf_idx = (target_byte - base_addr) // INST_BYTES
+                if 0 <= target_buf_idx < len(instructions):
+                    anchor_target_idx = target_buf_idx
+                else:
+                    # Jump exits this buffer (e.g. preamble → main binary).
+                    # Relative jumps after this point are in the new region.
+                    anchor_target_idx = None
+
+        elif jump_mode in REL_MODES:
+            backward = immediate  # instruction slots to step back
+            # --- Concern 2a: within hardware immediate field limit ---
+            if backward > icache_size:
+                issues.append(
+                    f"{tag}: REL JUMP (mode={jump_mode}) backward={backward} "
+                    f"exceeds i-cache size {icache_size}"
+                )
+            # --- Concern 2b: must have a known unconditional anchor ---
+            if anchor_target_idx is None:
+                issues.append(
+                    f"{tag}: REL JUMP (mode={jump_mode}) backward={backward} "
+                    f"with NO preceding unconditional absolute anchor in this buffer"
+                )
+            else:
+                # cache_pos: 0-based index of this instruction within the current window.
+                cache_pos = i - anchor_target_idx
+                # The RTL applies "ptr -= immediate" to the post-increment PC (already incremented
+                # in STATE_FETCH), so the landing position is: cache_pos + 1 - backward.
+                # Two constraints must hold:
+                #   (a) this instruction itself is within the loaded i-cache window
+                #   (b) the landing position is >= 0 (no under-run; hardware saturates at 0 but
+                #       we require the emitter to compute the exact offset, not rely on saturation)
+                if cache_pos >= icache_size:
+                    issues.append(
+                        f"{tag}: REL JUMP (mode={jump_mode}) backward={backward} "
+                        f"— instruction is {cache_pos} slots from anchor[{anchor_target_idx}], "
+                        f"OUTSIDE i-cache window ({icache_size} slots)"
+                    )
+                elif backward > cache_pos + 1:
+                    issues.append(
+                        f"{tag}: REL JUMP (mode={jump_mode}) backward={backward} "
+                        f"would under-run cache (cache_pos={cache_pos}, "
+                        f"landing at {cache_pos + 1 - backward}, expected >= 0)"
+                    )
+
+    return issues
 
 
 def calculate_snr(reference, result) -> float:

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """SmolVLM2-500M standalone inference from pre-compiled bin files.
 
-Self-contained and OFFLINE: it loads the deployable artifacts under ``smolvlm2_bin/`` (weights.bin,
-instructions.bin, and the shipped tokenizer dir) and runs prefill + decode with no compilation and no
+Self-contained and OFFLINE: it loads the deployable artifacts under ``smolvlm2_bin/`` (params.bin,
+programs.bin, and the shipped tokenizer dir) and runs prefill + decode with no compilation and no
 network access. It does not import the build script and never downloads anything, so it can be shipped
 to a customer on its own. Generate the bins once with smolvlm2_test.py (the build/offline-prep step)."""
 import builtins
@@ -34,7 +34,7 @@ from transformers import AutoTokenizer
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE,
     DRAM_INSTRUCTION_ADDR,
     UnifiedEngine, set_dma_device, ue_35bit_addr_shifter,
 )
@@ -162,7 +162,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     TMP_REG          = _cfg["fixed_isa_regs"]["TMP_REG"]
     GPR_SEQ_LEN_REG    = _cfg["fixed_isa_regs"]["GPR_SEQ_LEN_REG"]
     GPR_Q_SEQ_LEN_REG  = _cfg["fixed_isa_regs"]["GPR_Q_SEQ_LEN_REG"]
-    GPR_BUCKET_IDX_REG = _cfg["fixed_isa_regs"]["GPR_BUCKET_IDX_REG"]
+    GPR_ALIGNED_SEQ_LEN_REG = _cfg["fixed_isa_regs"]["GPR_ALIGNED_SEQ_LEN_REG"]
     PREFILL_MAX_SEQ_LEN = _cfg["model"]["prefill_max_seq_len"]
 
     def __init__(self, script_dir: str = None):
@@ -178,7 +178,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._isa_reg_counter = 1
         self.gpr_seq_len = self.GPR_SEQ_LEN_REG       # primed to S in run_prefill / seq pos in decode
         self.gpr_q_seq_len = self.GPR_Q_SEQ_LEN_REG   # primed to S*GROUP_SIZE in run_prefill
-        self.gpr_bucket_idx = self.GPR_BUCKET_IDX_REG  # primed to flash/decoder bucket selector
+        self.gpr_aligned_seq_len = self.GPR_ALIGNED_SEQ_LEN_REG
         self.vision_bf16 = True
         self.decode_matmat_mul_core_enable = False
         self.penalty_enable = False
@@ -186,7 +186,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     def _artifact_mode_suffix(self) -> str:
         # Only the decode linear kernel changes the compiled artifacts. The repetition penalty is a pure
         # RUNTIME tensor-DRAM write (PENALTY_BIAS_DRAM, always wired as the LM-head C term with zeros =
-        # greedy), so it never affects weights.bin or instructions.bin and is not part of the suffix.
+        # greedy), so it never affects params.bin or programs.bin and is not part of the suffix.
         if bool(getattr(self, "decode_matmat_mul_core_enable", False)):
             return "_decode_matmat_mul_core"
         return ""
@@ -212,25 +212,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 f"[artifact-mode] {artifact_name} metadata mismatch: expected {exp}, got {got}"
             )
 
-    # --- ISA register helpers ---
-    def reset_isa_reg_counter(self) -> None:
-        self._isa_reg_counter = 1
-
-    def alloc_isa_reg(self, reset: bool = False) -> int:
-        if reset:
-            self._isa_reg_counter = 1
-        if self._isa_reg_counter > 15:
-            raise ValueError("Exceeded available ISA registers (max 15)")
-        reg = self._isa_reg_counter
-        self._isa_reg_counter += 1
-        return reg
-
-    def clear_inst_id(self) -> None:
-        self._inst_id = 0
-
-    def get_arg_max_index(self) -> int:
-        return self.read_reg32(UE_ARGMAX_INDEX)
-
     def zero_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
         """Zero-fill the DRAM working range [DRAM_START_ADDR..0xFFFFFFFF] with 0x00 (mirror of
         smolvlm2_test.zero_dram). The base clear_dram() fills 0xFF (NaN in bf16), which poisons any
@@ -249,8 +230,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         """Load params DRAM from snapshot bin + restore all address metadata. Returns True if loaded."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         suffix = self._artifact_mode_suffix()
-        bin_path = os.path.join(bin_dir, f"weights{suffix}.bin")
-        meta_path = os.path.join(bin_dir, f"weights{suffix}.json")
+        bin_path = os.path.join(bin_dir, f"params{suffix}.bin")
+        meta_path = os.path.join(bin_dir, f"params{suffix}.json")
         if not os.path.exists(bin_path) or not os.path.exists(meta_path):
             raise RuntimeError(
                 f"[artifact-mode] missing snapshot artifact for current mode: "
@@ -286,22 +267,19 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         (which restores params, including the shared vis_zeros LN buffer — Trick 9, no replay needed)."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         suffix = self._artifact_mode_suffix()
-        meta_path = os.path.join(bin_dir, f"instructions{suffix}.json")
-        bin_path = os.path.join(bin_dir, f"instructions{suffix}.bin")
+        meta_path = os.path.join(bin_dir, f"programs{suffix}.json")
+        bin_path = os.path.join(bin_dir, f"programs{suffix}.bin")
         with open(meta_path) as f:
             meta = json.load(f)
         self._validate_artifact_mode(meta, os.path.basename(meta_path))
         with open(bin_path, "rb") as f:
             raw = f.read()
-        for name, entry in meta["programs"].items():
-            b = raw[entry["offset"]:entry["offset"] + entry["size"]]
+        for entry in meta["segments"]:
+            b = raw[entry["off"]:entry["off"] + entry["size"]]
             self.dma_write(DMA_DEVICE_H2C, entry["addr"], b, len(b))
         self._vis_program_addr = meta["encoder_addr"]
         self._decoder_program_addr = meta["decoder_addr"]
         self._decoder_preamble_addr = meta["decoder_preamble"]
-        self._decoder_num_buckets = meta["decoder_num_buckets"]
-        self._decoder_subroutine_start = meta.get("decoder_subroutine_start")
-        self._decoder_subroutine_call_sites = meta.get("decoder_subroutine_call_sites")
         self._decoder_attention_use_pbi = meta.get("decoder_attention_use_pbi")
         self._decoder_attention_impl = meta.get("decoder_attention_impl")
         self._decoder_attention_shared_subroutine = meta.get("decoder_attention_shared_subroutine")
@@ -311,23 +289,20 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._prefill_final_buf = meta["prefill_final_buf"]
         self._next_program_dram_addr = meta["end_addr"]
         if (self._decoder_attention_impl is None or self._decoder_attention_use_pbi is None or
-                self._decoder_attention_shared_subroutine is None or
-                self._decoder_subroutine_start is None or self._decoder_subroutine_call_sites is None):
+                self._decoder_attention_shared_subroutine is None):
             raise RuntimeError(
-                "[decoder-attn-path] loaded instructions.json lacks decoder-attention branch metadata; "
+                "[decoder-attn-path] loaded programs.json lacks decoder-attention branch metadata; "
                 "the artifact is stale/incompatible — rebuild it with smolvlm2_test.py")
-        if bool(self._decoder_attention_use_pbi) is not True or self._decoder_attention_impl != "pbi":
+        if bool(self._decoder_attention_use_pbi) is not False or self._decoder_attention_impl != "unified_attention_core":
             raise RuntimeError(
-                "[decoder-attn-path] loaded artifact is not the required SmolVLM2 PBI decoder-attention implementation")
+                "[decoder-attn-path] loaded artifact is not the required SmolVLM2 unified decoder-attention implementation")
         artifact_sha256 = hashlib.sha256(raw).hexdigest()
         self._loaded_artifact_sha256 = artifact_sha256
         # _original_print: this is a required runtime deliverable, so it must survive _SILENT_MODE
         # (load_all runs after _SILENT_MODE=True in main).
         _original_print(
             f"    [decoder-attn-path] model=smolvlm2 phase=lm_decode "
-            f"shared_subroutine=yes use_pbi=true implementation=pbi "
-            f"subroutine_start=0x{self._decoder_subroutine_start:X} "
-            f"call_sites={self._decoder_subroutine_call_sites} "
+            f"shared_subroutine=no use_pbi=false implementation=unified_attention_core "
             f"artifact_sha256={artifact_sha256} "
             f"metadata_validated=yes"
         )
@@ -351,11 +326,11 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         enc_flops = (2 * VS * VH * VH + VS * VH + VS * VH
             + n_vis * per_layer + 7 * VS * VH
             + 2 * 64 * 12288 * self.HIDDEN_SIZE)
-        self.program_execute(encoder_addr, timeout=30.0, total_flops=enc_flops)
+        self.program_execute(encoder_addr, timeout=30.0, flops=enc_flops)
 
     def run_prefill(self, token_ids, has_image: bool = False, total_flops: int = None) -> int:
         """Run the seq-len-agnostic prefill (dynamic-PBI / §7): host prep (epsilon pad + block bias),
-        a preamble that does on-device embed/merge + primes gpr_bucket_idx + jumps into the cached
+        a preamble that does on-device embed/merge + primes dynamic sequence GPRs + jumps into the cached
         prefill, then a postamble that does final-norm + LM head on the runtime last token. Mirrors
         smolvlm2_test.run_prefill exactly (runtime-only; no compilation). Returns argmax."""
         from user_dma_core import TYPE
@@ -368,7 +343,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         qmax = self.PREFILL_QMAX
         qS = seq_len * G
         aligned_q = ((qS + 63) // 64) * 64
-        bucket_idx = aligned_q // UE_VECTOR_SIZE
         embed_row_bytes = H * bpe
 
         # Vision/connector execution is complete before run_prefill. Clear all
@@ -386,7 +360,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         bias[torch.arange(aligned_q) >= qS, 0] = 0.0  # padded query rows attend row 0 (discarded)
         self.dma_to_accelerator_memory(self.FLASH_BIAS_DRAM, bias)
 
-        # 4. Preamble: on-device embed gather + vision merge + prime gpr_bucket_idx + jump into prefill
+        # 4. Preamble: on-device embed gather + vision merge + prime dynamic sequence GPRs + jump into prefill
         self.clear_inst_id()
         self.start_capture()
         for t in range(seq_len):
@@ -401,7 +375,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 for i, pos in enumerate(img_positions):
                     self.accelerator_memory_to_sram(self.VIS_CONNECTOR_DRAM + i * embed_row_bytes, 0x00000, H)
                     self.sram_to_accelerator_memory(0x00000, self.LAYER0_INPUT_DRAM + pos * embed_row_bytes, H)
-        self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gpr_seq_len, seq_len)
+        self.generate_instruction_add_set(self.gpr_q_seq_len, qS)
+        self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_q)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(self._prefill_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(self._prefill_preamble_addr)
@@ -507,14 +483,12 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         token_id: int,
         max_new_tokens: int = 512,
     ) -> list:
-        """Auto-regressive decode loop (dynamic-PBI / §7). Each step writes a tiny preamble that
-        primes gpr_seq_len + gpr_bucket_idx and jumps into the single cached decoder program."""
+        """Auto-regressive decode loop. Each step writes a tiny preamble that primes sequence GPRs."""
         global _SILENT_MODE
         generated = []
         H = self.HIDDEN_SIZE
         bpe = 2
         embed_row_bytes = H * bpe
-        num_buckets = self._decoder_num_buckets
         decoder_program_addr = self._decoder_program_addr
         preamble_addr = self._decoder_preamble_addr
 
@@ -533,10 +507,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             _SILENT_MODE = True
             self.seq_len += 1
             aligned_kv = ((self.seq_len + 63) // 64) * 64
-            bucket_idx = min(aligned_kv // UE_VECTOR_SIZE, num_buckets)
 
-            # Decode bias: [GROUP_SIZE, max_seq_len] with zeros at valid KV positions
-            bias = torch.full((self.GROUP_SIZE, self.max_seq_len), -1e38, dtype=torch.bfloat16)
+            # Decode bias is compact [GROUP_SIZE, aligned_kv]; unified_attention_core's full-matrix
+            # bias row stride is the dynamic aligned_seq_len, not max_seq_len.
+            bias = torch.full((self.GROUP_SIZE, aligned_kv), -1e38, dtype=torch.bfloat16)
             bias[:, :self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.DECODE_BIAS_DRAM, bias)
 
@@ -545,11 +519,12 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             embed_vec = self.dma_from_accelerator_memory(src_addr, torch.Size([H]))
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embed_vec)
 
-            # Preamble: prime gpr_seq_len + gpr_bucket_idx + jump into decoder
+            # Preamble: prime dynamic sequence GPRs + jump into decoder
             self.clear_inst_id()
             self.start_capture()
             self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len - 1)
-            self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            self.generate_instruction_add_set(self.gpr_q_seq_len, self.seq_len)
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_kv)
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
             self.write_captured_instructions_to_dram(preamble_addr)
@@ -577,18 +552,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             _original_print(f"\nStopped: {_reason} ({len(generated)} tokens).")
         _SILENT_MODE = False
         return generated
-
-    def program_execute(self, program_addr: int = user_dma_core.DRAM_INSTRUCTION_ADDR,
-                        timeout: float = 10.0, total_flops: int = None) -> None:
-        """Execute compiled program from DRAM."""
-        self.start_execute_from_dram(program_addr)
-        self.wait_queue(timeout)
-        if total_flops is not None:
-            self._last_hw_gflops = self.report_flop_rate_gflops(total_flops)
-            self._last_total_flops = total_flops
-        else:
-            self._last_hw_gflops = None
-            self._last_total_flops = None
 
 # =============================================================================
 # Image processing + input construction
@@ -676,12 +639,12 @@ def main():
     snapshot_suffix = "_decode_matmat_mul_core" if args.decode_matmat_mul_core_enable else ""
     instruction_suffix = snapshot_suffix
 
-    # Check all static bins before any hardware init. SmolVLM2 now uses one instruction artifact:
-    # instructions.bin / instructions.json.
+    # Check all static bins before any hardware init. SmolVLM2 uses one program artifact:
+    # programs.bin / programs.json.
     def _missing_static_bins():
         missing = []
-        for name in (f"weights{snapshot_suffix}.bin", f"weights{snapshot_suffix}.json",
-                     f"instructions{instruction_suffix}.bin", f"instructions{instruction_suffix}.json"):
+        for name in (f"params{snapshot_suffix}.bin", f"params{snapshot_suffix}.json",
+                     f"programs{instruction_suffix}.bin", f"programs{instruction_suffix}.json"):
             if not os.path.exists(os.path.join(bin_dir, name)):
                 missing.append(name)
         return missing
@@ -789,10 +752,7 @@ def main():
         f"prefill {round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0} tok/s, "
         f"decode {round(len(hw_tokens) / decode_time, 2) if decode_time > 0 else 0.0} tok/s.")
 
-    # Leave the FPGA DRAM clean for the next run (mirrors smolvlm2_test.py). Without this, consecutive
-    # load-only runs start on stale DRAM, which can corrupt the next run's output.
     _SILENT_MODE = True
-    ue.zero_dram()
     ue.software_reset()
 
 
