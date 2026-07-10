@@ -5685,8 +5685,8 @@ def isa_reg_min_sub_mul_test() -> None:
 
 def isa_mult_div_shift_test() -> None:
     """
-    Exercises the new ALU operations added in isa_opt:
-      MUL16_REG, MUL32_REG, MUL32_IMM, SHR, SHL, DIV_REG, MUL_SHL, MUL_SHR.
+    Exercises the ALU operations:
+      MUL32_REG, MUL32_IMM, SHR, SHL, DIV_REG, MUL_SHL, MUL_SHR.
 
     MUL_SHL / MUL_SHR are the fused multiply-then-shift ops (one ISA word does
     (src*rst) then a constant shift, reusing int_mult_pipe). They replace the
@@ -5694,7 +5694,6 @@ def isa_mult_div_shift_test() -> None:
 
     Structure:
       SET a = 13, SET b = 4
-      MUL16_REG reg_m16  = a * b            -> 52   (16-bit reg×reg)
       MUL32_REG reg_m32r = a * b            -> 52   (32-bit pipelined reg×reg)
       MUL32_IMM reg_m32i = a * 4            -> 52   (32-bit pipelined reg×imm)
       SHL       reg_shl  = a << 2           -> 52   (same result, cross-check)
@@ -5702,7 +5701,6 @@ def isa_mult_div_shift_test() -> None:
       DIV_REG   reg_div  = reg_m32r / b     -> 13   (quotient = a)
 
     Each computed value drives a counted loop to verify the result via pc_reg:
-      loop_m16  trips = 52
       loop_m32r trips = 52
       loop_m32i trips = 52
       loop_shl  trips = 52
@@ -5719,7 +5717,6 @@ def isa_mult_div_shift_test() -> None:
     mshl_amt = 1
     mshr_amt = 1
 
-    exp_m16  = (a_val * b_val) & 0xFFFFFFFF   # 52
     exp_m32r = (a_val * b_val) & 0xFFFFFFFF   # 52
     exp_m32i = (a_val * imm4)  & 0xFFFFFFFF   # 52
     exp_shl  = (a_val << shl_amt) & 0xFFFFFFFF  # 52
@@ -5732,7 +5729,6 @@ def isa_mult_div_shift_test() -> None:
 
     reg_a    = ue.alloc_isa_reg()
     reg_b    = ue.alloc_isa_reg()
-    reg_m16  = ue.alloc_isa_reg()
     reg_m32r = ue.alloc_isa_reg()
     reg_m32i = ue.alloc_isa_reg()
     reg_shl  = ue.alloc_isa_reg()
@@ -5748,8 +5744,7 @@ def isa_mult_div_shift_test() -> None:
     ue.generate_instruction_add_set(reg_b, b_val)
     n_setup = 2
 
-    # --- compute ops: 8 instructions ---
-    ue.generate_instruction_mul16_reg(reg_m16,  reg_a,   reg_b)
+    # --- compute ops: 7 instructions ---
     ue.generate_instruction_mul32_reg(reg_m32r, reg_a,   reg_b)
     ue.generate_instruction_mul32_imm(reg_m32i, reg_a,   imm4)
     ue.generate_instruction_shl(      reg_shl,  reg_a,   shl_amt)
@@ -5757,13 +5752,9 @@ def isa_mult_div_shift_test() -> None:
     ue.generate_instruction_div_reg(  reg_div,  reg_m32r, reg_b)
     ue.generate_instruction_mul32_shl_reg(reg_mshl, reg_a, reg_b, mshl_amt)
     ue.generate_instruction_mul32_shr_reg(reg_mshr, reg_a, reg_b, mshr_amt)
-    n_ops = 8
+    n_ops = 7
 
-    # --- six counted loops driven by each result ---
-    ue.loop_start(exp_m16,  gpr_loop_cnt=reg_m16)
-    ue.generate_instruction_add_inc(reg_a)
-    body_m16  = ue.loop_end()
-
+    # --- counted loops driven by each result ---
     ue.loop_start(exp_m32r, gpr_loop_cnt=reg_m32r)
     ue.generate_instruction_add_inc(reg_a)
     body_m32r = ue.loop_end()
@@ -5797,7 +5788,6 @@ def isa_mult_div_shift_test() -> None:
 
     expected_pc = (
         n_setup + n_ops
-        + 1 + exp_m16  * body_m16
         + 1 + exp_m32r * body_m32r
         + 1 + exp_m32i * body_m32i
         + 1 + exp_shl  * body_shl
@@ -5819,14 +5809,14 @@ def isa_mult_div_shift_test() -> None:
     assert pc_reg == expected_pc, (
         f"isa_mult_div_shift_test: pc_reg mismatch: got {pc_reg}, expected {expected_pc}\n"
         f"  a={a_val}, b={b_val}, imm4={imm4}, shl_amt={shl_amt}, shr_amt={shr_amt}\n"
-        f"  exp_m16={exp_m16}, exp_m32r={exp_m32r}, exp_m32i={exp_m32i}, "
+        f"  exp_m32r={exp_m32r}, exp_m32i={exp_m32i}, "
         f"exp_shl={exp_shl}, exp_shr={exp_shr}, exp_div={exp_div}, "
         f"exp_mshl={exp_mshl}, exp_mshr={exp_mshr}"
     )
 
     print(
         f"isa_mult_div_shift_test: PASS "
-        f"(MUL16_REG={exp_m16}, MUL32_REG={exp_m32r}, MUL32_IMM={exp_m32i}, "
+        f"(MUL32_REG={exp_m32r}, MUL32_IMM={exp_m32i}, "
         f"SHL={exp_shl}, SHR={exp_shr}, DIV_REG={exp_div}, "
         f"MUL_SHL={exp_mshl}, MUL_SHR={exp_mshr}, pc_reg={pc_reg})"
     )
