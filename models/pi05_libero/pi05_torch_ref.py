@@ -111,7 +111,9 @@ class Weights:
         if self.quant == "if4" and (name.endswith(".kernel") or name.endswith(".linear")
                                      or name.endswith(".w") or name.endswith("gating_einsum")):
             t = maybe_quantize(t, self.quant)
-        return t.to(self.device)
+        t = t.to(self.device)
+        self._cache[name] = t
+        return t
 
 
 def rms_norm(x: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -447,7 +449,7 @@ def build_suffix_attn_bias(n_prefix: int, n_suffix: int, device, dtype):
 
 def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Tensor,
              W: Weights, num_denoise_steps: int = 10, action_horizon: int = 10, action_dim: int = 7,
-             noise: torch.Tensor = None):
+             noise: torch.Tensor = None, return_kv: bool = False):
     device, dtype = W.device, W.dtype
     b = state.shape[0]
 
@@ -494,6 +496,8 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
         x_t = x_t + dt * v_t
         t = t + dt
 
+    if return_kv:
+        return x_t, kv_cache  # kv_cache = (k_cache, v_cache), each a list of 18 (b,P,1,256)
     return x_t  # (b, action_horizon, action_dim)
 
 
