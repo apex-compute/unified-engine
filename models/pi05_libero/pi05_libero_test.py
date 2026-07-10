@@ -506,6 +506,62 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
             SCALE_DRAM_ADDR=la[f"{proj}_scale"], **kw)
 
+    # ==================== dual-engine (--dual) ==============================
+    def _ensure_dual_engine(self):
+        """Lazily create the second engine (ue1) -- a bare UnifiedEngine bound to
+        the engine-1 register window (UE_0_BASE_ADDR + 0x10000). It SHARES all
+        DRAM with self (ue0): weights/activations are read/written at the same
+        physical addresses (matmat_mul_two_cores passes explicit addresses). Only
+        ue1's *program* stream needs its own region so the two instruction streams
+        don't collide. Also reserves a fixed scratch program region on ue0 for the
+        single-engine 'glue' segments so they don't fight the two-core allocator."""
+        if getattr(self, "_ue1", None) is not None:
+            return self._ue1
+        import user_dma_core as _udc
+        ue1 = _udc.UnifiedEngine(BASE_ADDR=_udc.UE_0_BASE_ADDR + 0x00010000)
+        # ue1 program region: 0xF0000000..0xF8000000 (below ue0's 0xF8000000 base,
+        # above the tensor arena ~0xEE000000). 128MB, plenty for compact PBI programs.
+        ue1._next_program_dram_addr = 0xF0000000
+        self._ue1 = ue1
+        return ue1
+
+    def _glue_exec(self, emit_fn, label="glue", timeout=120.0):
+        """Run a single-engine segment on ue0: capture emit_fn()'s ops + a halt,
+        DMA to the CURRENT program-allocator addr, execute, wait. The program MUST
+        be written to get_program_dram_addr() because flash_attention_core computes
+        its subroutine jump addresses relative to that base -- writing anywhere else
+        makes every flash jump land in garbage (hang). emit_fn must therefore also
+        use self.get_program_dram_addr() as its prog_base, and it stays constant
+        through emit (we allocate only after). Mirrors _compile_and_run."""
+        self.start_capture()
+        emit_fn()
+        self.generate_instruction_halt()
+        prog_addr = self.get_program_dram_addr()
+        all_bytes = bytearray()
+        for inst in self.capture_buffer:
+            all_bytes.extend(inst.get_bytes())
+        self._dma_write_retry(DMA_DEVICE_H2C, prog_addr, all_bytes, len(all_bytes))
+        self.allocate_program_dram(len(all_bytes))
+        self.clear_capture_buffer()
+        self.stop_capture()
+        self.start_execute_from_dram(prog_addr)
+        self._wait_with_heartbeat(label, timeout=timeout)
+
+    def _mm2(self, M, K, N, A, proj, la, OUT, bias=None, gelu=False, silu=False, m0=None):
+        """Two-core IF4 matmul: shard M rows across ue0+ue1. Mirrors _matmul's IF4
+        args. m0 = rows for engine0 (default M//2, rounded to a 64 boundary for
+        bucket alignment). Both engines read the same quantized B + scale."""
+        assert self.DUAL, "_mm2 (two-core) called outside --dual mode"
+        ue1 = self._ensure_dual_engine()
+        if m0 is None:
+            m0 = ((M // 2) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE or UE_VECTOR_SIZE
+        return type(self).matmat_mul_two_cores(
+            ue0=self, ue1=ue1, M=M, K=K, N=N,
+            A_DRAM_ADDR=A, B_DRAM_ADDR=la[f"{proj}_data"], OUTPUT_DRAM_ADDR=OUT,
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=la[f"{proj}_scale"],
+            C_DRAM_ADDR=bias, bias_mode=("broadcast_N" if bias is not None else "broadcast_N"),
+            gelu_enable=gelu, silu_enable=silu, m_engine0=m0, use_pbi=True)
+
     def _dram_copy(self, size_bytes, src, dst):
         """DRAM->DRAM copy via a SRAM roundtrip, chunked through URAM_A. Used to
         stage per-layer K/V projections into the persistent KV-cache region."""
@@ -840,6 +896,142 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         return self.LAYER0_LAYER_OUT_DRAM
 
+    def compile_prefix_dual(self, seq_len, valid_len=None):
+        """DUAL-engine prefix (mutually exclusive with compile_prefix; only reached
+        when self.DUAL). Same 18-layer Gemma-2B math, but segmented: each layer's
+        ATTENTION block (norm -> QKV -> flash -> O -> residual -> ln2) runs as one
+        single-engine glue segment on ue0 (attention couples all tokens -- not
+        worth sharding across engines for its ~11% of FLOPs), and the MLP matmuls
+        (the 88.7%) are sharded across BOTH engines via _mm2 (matmat_mul_two_cores).
+        All ops communicate through DRAM and every segment/two-core launch is
+        synchronous (wait), so DRAM state flows correctly between them.
+
+        v1 -- validate on hardware against the single-engine 29dB baseline."""
+        assert self.DUAL, "compile_prefix_dual reached without DUAL mode"
+        S, H, I, D = seq_len, self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE, self.HEAD_DIM
+        NH, NKV, KV = self.NUM_HEADS, self.NUM_KV_HEADS, self.NUM_KV_HEADS * self.HEAD_DIM
+        assert NKV == 1, "compile_prefix_dual assumes pure MQA (num_kv_heads=1)"
+        bpe = 2
+        FF_HALF = I // 2
+        valid_len = valid_len if valid_len is not None else S
+
+        self._ensure_dual_engine()
+        self.prefix_bias_dram = store_weight(self, self.build_prefix_attn_bias(S, valid_len))
+        self.LAYER0_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        self.LAYER0_LAYER_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
+
+        print(f"  [prefix-dual] {self.NUM_LAYERS} layers, seq_len={S}, valid_len={valid_len} "
+              f"(attention single-engine, MLP two-core)")
+        t0 = time.perf_counter()
+
+        for layer_idx in range(self.NUM_LAYERS):
+            la = self.lm_layer_addrs[layer_idx]
+            h_in = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_LAYER_OUT_DRAM
+
+            # ---------- ATTENTION: one single-engine segment on ue0 ----------
+            def _emit_attn(la=la, h_in=h_in):
+                self.reset_isa_reg_counter()
+                self.reset_inst_ptr_counter()
+                prefix_S_reg = self.alloc_isa_reg()
+                self.generate_instruction_add_set(prefix_S_reg, S)
+                # MUST match where _glue_exec writes the program (== flash's base).
+                prog_base = self.get_program_dram_addr()
+                gpr_bucket = self.alloc_isa_reg()
+                gpr_ret = self.alloc_isa_reg()
+                call_sites = []
+                num_buckets = S // UE_VECTOR_SIZE
+
+                # 1. pre-attn RMSNorm
+                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,
+                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                                         GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=prefix_S_reg)
+                # 2. Q/K/V (single-engine; MQA K/V project to one head_dim)
+                self._matmul(M=S, K=H, N=H, A=self.LAYER0_PRE_NORM_DRAM, proj="q", la=la,
+                             OUT=self.LAYER0_Q_DRAM, gpr_M_reg=prefix_S_reg)
+                self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="k", la=la,
+                             OUT=self.LAYER0_K_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
+                self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="v", la=la,
+                             OUT=self.LAYER0_V_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
+                # 3. permute Q -> (heads, seq, head_dim)
+                smart_bf16_permute_core(self, (S, NH, D), [1, 0, 2],
+                                         self.LAYER0_Q_DRAM, self.LAYER0_Q_PERM_DRAM)
+                # 4. stage K/V into persistent cache
+                k_cache_addr = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
+                v_cache_addr = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
+                self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, k_cache_addr)
+                self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr)
+                # 5. MQA flash attention (per head, shared subroutine below the halt)
+                head_bytes = S * D * bpe
+                for h in range(NH):
+                    self._dram_copy(head_bytes, self.LAYER0_Q_PERM_DRAM + h * head_bytes, self.LAYER0_FLASH_Q_DRAM)
+                    self.generate_instruction_add_set(gpr_bucket, num_buckets)
+                    self.pad_capture_to_64b_boundary()
+                    return_word_addr = ue_35bit_addr_shifter(
+                        prog_base + (self.capture_count + 2) * INSTRUCTION_SIZE_BYTES)
+                    self.generate_instruction_add_set(gpr_ret, return_word_addr)
+                    call_sites.append(self.capture_count)
+                    self.generate_instruction_jump_abs(target_instruction_word_addr=0)
+                    self._dram_copy(head_bytes, self.LAYER0_FLASH_OUT_DRAM, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes)
+                # 6. permute attn output -> (seq, heads*head_dim)
+                smart_bf16_permute_core(self, (NH, S, D), [1, 0, 2],
+                                         self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
+                # 7. O proj + residual
+                self._matmul(M=S, K=H, N=H, A=self.LAYER0_ATTN_RESULT_DRAM, proj="o", la=la,
+                             OUT=self.LAYER0_O_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
+                eltwise_add_core_dram(self, S * H, h_in, self.LAYER0_O_PROJ_DRAM, self.LAYER0_ATTN_RESIDUAL_DRAM)
+                # 8. pre-FFW RMSNorm (feeds the two-core MLP after this segment)
+                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.LAYER0_ATTN_RESIDUAL_DRAM,
+                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                                         GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=prefix_S_reg)
+                # main body ends -> HALT, then the shared flash subroutine
+                self.generate_instruction_halt()
+                sub_start, _ = self.flash_attention_core(
+                    head_dim=D, seq_len=S,
+                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM, K_DRAM_ADDR=self.LAYER0_K_PROJ_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_DRAM,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_ATTN_SCRATCH_DRAM, ATTN_P_DRAM_ADDR=self.LAYER0_FLASH_ATTN_P_DRAM,
+                    IDENTITY_DRAM_ADDR=self.identity_addr, BIAS_DRAM_ADDR=self.prefix_bias_dram,
+                    gpr_bucket_idx=gpr_bucket, num_buckets=num_buckets, gpr_ret_id=gpr_ret)
+                for _idx in call_sites:
+                    self._patch_jump_immediate(_idx, ue_35bit_addr_shifter(sub_start))
+                self.release_isa_reg()  # gpr_ret
+                self.release_isa_reg()  # gpr_bucket
+                self.release_isa_reg()  # prefix_S_reg
+
+            self._glue_exec(_emit_attn, label=f"prefix-dual L{layer_idx} attn")
+
+            # ---------- MLP: matmuls two-core, muls/adds single-engine ----------
+            pre = self.LAYER0_PRE_NORM_DRAM
+            # low half
+            self._mm2(S, H, FF_HALF, pre, "gate_lo", la, self.LAYER0_MLP_GATE_LO_DRAM, gelu=True)
+            self._mm2(S, H, FF_HALF, pre, "up_lo", la, self.LAYER0_MLP_UP_LO_DRAM)
+            self._glue_exec(lambda: eltwise_mul_core_dram(
+                self, S * FF_HALF, self.LAYER0_MLP_GATE_LO_DRAM, self.LAYER0_MLP_UP_LO_DRAM,
+                self.LAYER0_MLP_MULT_LO_DRAM), label=f"prefix-dual L{layer_idx} mul_lo")
+            self._mm2(S, FF_HALF, H, self.LAYER0_MLP_MULT_LO_DRAM, "down_lo", la, self.LAYER0_MLP_DOWN_LO_OUT_DRAM)
+            # high half
+            self._mm2(S, H, FF_HALF, pre, "gate_hi", la, self.LAYER0_MLP_GATE_HI_DRAM, gelu=True)
+            self._mm2(S, H, FF_HALF, pre, "up_hi", la, self.LAYER0_MLP_UP_HI_DRAM)
+            self._glue_exec(lambda: eltwise_mul_core_dram(
+                self, S * FF_HALF, self.LAYER0_MLP_GATE_HI_DRAM, self.LAYER0_MLP_UP_HI_DRAM,
+                self.LAYER0_MLP_MULT_HI_DRAM), label=f"prefix-dual L{layer_idx} mul_hi")
+            self._mm2(S, FF_HALF, H, self.LAYER0_MLP_MULT_HI_DRAM, "down_hi", la, self.LAYER0_MLP_DOWN_HI_OUT_DRAM)
+            # combine halves + MLP residual
+            self._glue_exec(lambda: (
+                eltwise_add_core_dram(self, S * H, self.LAYER0_MLP_DOWN_LO_OUT_DRAM,
+                                       self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.LAYER0_MLP_DOWN_DRAM),
+                eltwise_add_core_dram(self, S * H, self.LAYER0_ATTN_RESIDUAL_DRAM,
+                                       self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_LAYER_OUT_DRAM),
+            ), label=f"prefix-dual L{layer_idx} mlp_residual")
+
+        print(f"  [prefix-dual] done in {time.perf_counter()-t0:.1f}s")
+        # Reconcile the action-expert interface (same as compile_prefix's tail).
+        self.PREFIX_SEQ_LEN = S
+        self.prefix_valid_len = valid_len
+        self.prefix_k_cache_addr = [self.LAYER0_K_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
+        self.prefix_v_cache_addr = [self.LAYER0_V_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
+        return self.LAYER0_LAYER_OUT_DRAM
+
     # ---- prefill -----------------------------------------------------------
     def compile_prefill(self, seq_len):
         """Standard decoder loop driven by self.OPS. Fill _matmul/weight_init first.
@@ -1058,6 +1250,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_NUM_DENOISE_STEPS = 10
     AE_LOOP_TRIP_OVERRIDE = None  # debug knob, see compile_denoise_loop's loop_start call
     DENOISE_STEP0_PROBE = False  # if True, snapshot step-0 intermediates for reference diff
+    DUAL = False  # --dual: shard matmuls across both engines via matmat_mul_two_cores (~2x)
 
     # ---- action-expert weights ---------------------------------------------
     def weight_init_action_expert(self):
@@ -2514,7 +2707,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             t1 = time.perf_counter()
             seq_len = _CFG["model"]["prefill_max_seq_len"]
             valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
-            prog_addr = self._compile_and_run(lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
+            if self.DUAL:
+                self.compile_prefix_dual(seq_len, valid_len)   # dual-engine path only
+            else:
+                prog_addr = self._compile_and_run(lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
             t_prefix = time.perf_counter() - t1
             self._report_gflops("prefix (832 tok)", self._prefix_flops(), t_prefix)
 
@@ -2745,6 +2941,10 @@ def main():
                           "SAME prompt tokens, SAME state, and the SAME RandomState(0) noise -- so "
                           "the only variable is HW-vs-CPU execution -- and report per-dim / "
                           "per-timestep / overall SNR of the (10,7) action output.")
+    ap.add_argument("--dual", action="store_true",
+                     help="shard matmuls across BOTH engines via matmat_mul_two_cores (~2x on the "
+                          "matmul-bound sections). Selects a fully separate dual-engine execution "
+                          "path -- mutually exclusive with the default single-engine path.")
     ap.add_argument("--probe-step0", action="store_true",
                      help="snapshot step-0 action-expert intermediates and diff each against the "
                           "torch reference (fed the FPGA's own K/V) to localize which op first "
@@ -2764,6 +2964,10 @@ def main():
     if args.probe_step0:
         Pi05Libero_UnifiedEngine.DENOISE_STEP0_PROBE = True
         print("[main] DENOISE_STEP0_PROBE enabled -- will snapshot + diff step-0 intermediates")
+
+    if args.dual:
+        Pi05Libero_UnifiedEngine.DUAL = True
+        print("[main] DUAL enabled -- matmuls sharded across both engines (separate dual path)")
 
     ue = Pi05Libero_UnifiedEngine()
     init_hang_prevention(ue)
