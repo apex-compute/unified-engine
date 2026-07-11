@@ -36,12 +36,17 @@ DMA_DEV          = os.environ.get("DMA_DEV", "xdma0")
 def randomize_dram(seed: int = 0, dev: str = "xdma0",
                    chunk_bytes: int = 64 * 1024 * 1024,
                    total_bytes: int = 0x100000000) -> bool:
-    """DMA-write data across the full 4 GiB DRAM, then release the
+    """DMA-write random bf16 values across the full 4 GiB DRAM, then release the
     device, so the model launched next starts on poisoned DRAM.
 
     Covers the ENTIRE 4 GB DMA-mapped DRAM (0x00000000..0xFFFFFFFF): weight / ISA /
     scratch regions all start as garbage, so a model that still decodes correctly
     proves its run-from-bin path (re)writes every byte it reads.
+
+    Uses random bf16 values in [-8, 8] (same method as randomize_dram.py), NOT an
+    all-0xFF fill — 0xFF bytes decode to bf16 NaN, which corrupts any DRAM region
+    a model's cache-load path doesn't fully rewrite (masking real bugs instead of
+    just exercising the rewrite-every-byte guarantee).
 
     Returns True on success. On any failure it returns False; the caller must not
     run the model because that would not exercise the required poisoned-DRAM state.
@@ -49,24 +54,25 @@ def randomize_dram(seed: int = 0, dev: str = "xdma0",
     try:
         if chunk_bytes <= 0 or total_bytes <= 0:
             raise ValueError("chunk_bytes and total_bytes must be positive")
-        import random as _random
+        import torch
         import user_dma_core
         user_dma_core.set_dma_device(dev)
         ue = user_dma_core.UnifiedEngine()           # bare engine: opens device, self-tests
-        rng = _random.Random(seed)
-        fill_ff = b"\xff" * chunk_bytes
+        gen = torch.Generator().manual_seed(seed)
+        bpe = 2
+        chunk_elements = chunk_bytes // bpe
         offset = 0
         while offset < total_bytes:
             n = min(chunk_bytes, total_bytes - offset)
-            # data = rng.randbytes(n)  #!!! Original random-data test.
-            data = fill_ff[:n]        # Requested all-0xFF test.
-            wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, offset, data, n)
-            if wrote != n:
+            take = n // bpe
+            data = torch.empty(take, dtype=torch.bfloat16).uniform_(-8.0, 8.0, generator=gen)
+            wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, offset, data, take * bpe)
+            if wrote != take * bpe:
                 raise RuntimeError(
-                    f"dma_write wrote {wrote} of {n} bytes at offset {offset:#x}"
+                    f"dma_write wrote {wrote} of {take * bpe} bytes at offset {offset:#x}"
                 )
-            offset += n
-        print(f"[randomize_dram] wrote {total_bytes / 1024**3:.2f} GiB of poison data to "
+            offset += take * bpe
+        print(f"[randomize_dram] wrote {total_bytes / 1024**3:.2f} GiB of random bf16 poison data to "
               f"DRAM [0x00000000..{total_bytes - 1:#010x}]", flush=True)
         del ue                                       # release (dma ops already open/close per call)
         return True

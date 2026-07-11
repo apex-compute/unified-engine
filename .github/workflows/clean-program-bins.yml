@@ -1,0 +1,33 @@
+name: Clean Program Bins
+
+# Manually triggerable from the Actions tab. Deletes cached programs.bin/
+# programs.json for every model (or a chosen subset), leaving weights and HF
+# cache untouched. Forces the next CI/manual run to recompile from scratch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be deleted without actually deleting"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: model-hw-ci
+  cancel-in-progress: false  # never race with a live CI/HW run
+
+jobs:
+  clean:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean program bins
+        run: |
+          ARGS=()
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          ./clean_program_bins.sh "${ARGS[@]}"
