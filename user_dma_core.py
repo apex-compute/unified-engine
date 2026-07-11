@@ -437,7 +437,10 @@ PBI_MODE_REG  = 2
 
 class PBI_FIELD(IntEnum):
     """Field selector for PBI_MODE_REG (pbi_field_select, inst_descriptor[23:20]).
-    Matches the next_* assigns in queue_state_module.sv."""
+    The selected pointer-row field is replaced by the GPR value; all other fields
+    follow the normal increment path. Matches the fields documented in
+    ``readme_ISA_PBI.md`` and the ``next_*`` assignments in queue_state_module.sv.
+    """
     DRAM_ADDR            = 0  # next_dram_addr              [31:0]  — bits [31:0]   of pointer row
     DMA_LENGTH           = 1  # next_dma_length             [31:0]  — bits [63:32]
     OUTPUT_SIZE          = 2  # next_output_size            [15:0]  — bits [79:64]
@@ -474,16 +477,15 @@ ALU_MODE_ADD_IMM = 3   # dst = src + immediate
 ALU_MODE_SET     = 4   # dst = immediate
 ALU_MODE_MIN     = 5   # dst = min(src1, src2), unsigned
 ALU_MODE_SUB     = 6   # dst = src1 - src2
-ALU_MODE_MUL16_REG = 7  # dst = (src[15:0] * rst[15:0]) & 0xFFFFFFFF, unsigned, single-cycle
-ALU_MODE_MUL16_IMM = 8  # dst = (src[15:0] * imm[15:0]) & 0xFFFFFFFF, unsigned, single-cycle
-ALU_MODE_MUL_IMM   = ALU_MODE_MUL16_IMM  # backward-compat alias
+# 7, 8: reserved (former single-cycle MUL16_REG / MUL16_IMM; removed from RTL)
 ALU_MODE_SHR       = 9   # dst = src >> imm[4:0], logical right shift
 ALU_MODE_SHL       = 10  # dst = src << imm[4:0], logical left shift
 ALU_MODE_MUL32_REG = 11  # dst = (src * rst)[31:0], pipelined 3-cycle (int_mult_pipe)
-ALU_MODE_MUL32_IMM = 12  # dst = (src * imm)[31:0], pipelined 3-cycle (int_mult_pipe)
+ALU_MODE_MUL32_IMM = 12  # dst = (src * imm[15:0])[31:0], pipelined 3-cycle; imm zero-extended from 16 bits
 ALU_MODE_DIV_REG   = 13  # dst = src / rst, sequential 32-cycle (int_divider)
 ALU_MODE_MUL_SHL   = 14  # dst = ((src * rst)[31:0]) << imm[4:0], fused mul+shift (int_mult_pipe)
 ALU_MODE_MUL_SHR   = 15  # dst = ((src * rst)[31:0]) >> imm[4:0], fused mul+shift (int_mult_pipe)
+ALU_MODE_MUL_IMM   = ALU_MODE_MUL32_IMM  # alias: reg×imm multiply targets MUL32_IMM (matches queue_state_module.sv)
 
 # Register file indices
 REGFILE_R0_ZERO = 0       # Zero register (always 0)
@@ -1296,9 +1298,10 @@ class UnifiedEngine:
         For ``INSTRUCTION_PBI_SET``, ``inst_pointer_idx`` fills ``w[0][15:12]``, ``pbi_mode`` fills
         ``w[0][19:16]``, and ``pbi_field_select`` fills ``w[0][23:20]``.
         ``pbi_mode=PBI_MODE_REG`` is only valid with ``INSTRUCTION_PBI_SET`` (used by
-        :meth:`generate_instruction_pbi_inc` when a GPR override is requested). RTL first accumulates
-        the instruction delta (INC step), then overrides one field (selected by ``pbi_field_select``)
-        from general register ``general_reg_src`` (``w[0][28:24]``).
+        :meth:`generate_instruction_pbi_inc` when a GPR override is requested): the field
+        selected by ``pbi_field_select`` is written **directly** from general register
+        ``general_reg_src`` (``w[0][29:24]``) — its descriptor delta is discarded — while every
+        other field still takes the increment path (row + descriptor delta).
 
         reg rewrite:
         - if ``general_reg_src`` is set and ``inst_type != INSTRUCTION_PBI_SET``, ``inst_type`` = ``INSTRUCTION_REG_REWRITE``
@@ -1343,7 +1346,8 @@ class UnifiedEngine:
             w[0] = ((tid & 0xFF) |
                     ((inst_type & 0xF) << 8) |
                     (((inst_pointer_idx or 0) & 0xF) << 12))
-            # PBI_SET: [19:16] pointer_mode, [23:20] field_select; [29:24] pbi_general_reg_idx when PBI_MODE_REG.
+            # PBI_SET: [19:16] pointer_mode, [23:20] field_select;
+            # [29:24] pbi_general_reg_idx when PBI_MODE_REG.
             # Other types: [31:16] = lalu_a.
             if int(inst_type) == int(INSTRUCTION_PBI_SET):
                 w[0] |= (int(pbi_mode) & 0xF) << 16
@@ -7876,7 +7880,9 @@ class UnifiedEngine:
                 print(f"        {line}")
             return
 
-        # PBI pointer-row load / bump-only (inst_type 6/C). Same 256b payload layout as UE ops; do not decode as ISA.
+        # Prefetchable PBI pointer-row update (inst_type 0x6). It uses the UE payload
+        # layout and must not be decoded as an ISA micro-op. The non-prefetchable
+        # PBI_SET variant is type 0xB and is not emitted by the Python helpers.
         if inst_type == INSTRUCTION_PBI_SET:
             ptr_i = _inst_desc_bits(w, 12, 15)
             pbi_m = _inst_desc_bits(w, 16, 19)
@@ -8101,13 +8107,13 @@ class UnifiedEngine:
                 ALU_MODE_SET:     "SET",
                 ALU_MODE_MIN:     "MIN",
                 ALU_MODE_SUB:     "SUB",
-                ALU_MODE_MUL16_REG: "MUL16_REG",
-                ALU_MODE_MUL16_IMM: "MUL16_IMM",
                 ALU_MODE_SHR:       "SHR",
                 ALU_MODE_SHL:       "SHL",
                 ALU_MODE_MUL32_REG: "MUL32_REG",
                 ALU_MODE_MUL32_IMM: "MUL32_IMM",
                 ALU_MODE_DIV_REG:   "DIV_REG",
+                ALU_MODE_MUL_SHL:   "MUL_SHL",
+                ALU_MODE_MUL_SHR:   "MUL_SHR",
             }
             mode_name = isa_mode_names.get(isa_mode, f"UNKNOWN({isa_mode})")
             result = f"ISA_REG_ALU ({mode_name})"
@@ -8116,12 +8122,14 @@ class UnifiedEngine:
                 result += f"\n    dst_reg: {dst_reg_idx}, value: {_u32(immediate_value):#010X}"
             elif isa_mode in (ALU_MODE_INC, ALU_MODE_DEC):
                 result += f"\n    reg: {dst_reg_idx}"
-            elif isa_mode in (ALU_MODE_ADD_IMM, ALU_MODE_MUL16_IMM, ALU_MODE_MUL32_IMM,
+            elif isa_mode in (ALU_MODE_ADD_IMM, ALU_MODE_MUL32_IMM,
                               ALU_MODE_SHR, ALU_MODE_SHL):
                 result += f"\n    dst_reg: {dst_reg_idx}, src_reg: {src_reg_idx}, immediate: {_u32(immediate_value):#010X}"
             elif isa_mode in (ALU_MODE_ADD_REG, ALU_MODE_MIN, ALU_MODE_SUB,
-                              ALU_MODE_MUL16_REG, ALU_MODE_MUL32_REG, ALU_MODE_DIV_REG):
+                              ALU_MODE_MUL32_REG, ALU_MODE_DIV_REG):
                 result += f"\n    dst_reg: {dst_reg_idx}, src_reg: {src_reg_idx}, rst_reg: {rst_reg_idx}"
+            elif isa_mode in (ALU_MODE_MUL_SHL, ALU_MODE_MUL_SHR):
+                result += f"\n    dst_reg: {dst_reg_idx}, src_reg: {src_reg_idx}, rst_reg: {rst_reg_idx}, shift: {immediate_value & 0x1F}"
             for line in result.split('\n'):
                 print(f"        {line}")
             return
@@ -8544,11 +8552,9 @@ class UnifiedEngine:
     ):
         """Emit a reg*imm multiply: dst = (src * imm)[31:0], unsigned.
 
-        Routed to ALU_MODE_MUL32_IMM (3-cycle pipelined DSP) rather than the
-        legacy single-cycle MUL16_IMM: the immediate is still limited to 16 bits
-        (the RTL zero-extends imm[15:0]), but the full 32-bit src is used, so the
-        result is identical for the <=16-bit src operands used here and correct
-        if src ever exceeds 16 bits. Lets the combinational MUL16 path be dropped.
+        Uses ALU_MODE_MUL32_IMM (3-cycle pipelined DSP). The RTL zero-extends the
+        immediate from 16 bits, so ``immediate_value`` must fit in 16 bits; the full
+        32-bit ``src`` register is used for the product.
         """
         if dst_reg_idx == 0:
             print("ERROR: INSTRUCTION_REG_ALU overwriting reg_idx 0 (zero reg) not allowed")
@@ -8561,20 +8567,6 @@ class UnifiedEngine:
             src_reg_idx=src_reg_idx,
             dst_reg_idx=dst_reg_idx,
         )
-
-    def generate_instruction_mul16_reg(self, dst_reg_idx: int, src_reg_idx: int, rst_reg_idx: int):
-        """Reg*reg multiply: dst = (src * rst)[31:0], unsigned.
-
-        Routed to ALU_MODE_MUL32_REG (3-cycle pipelined DSP). MUL16_REG was only
-        ever exercised by the ALU self-test; production reg*reg products
-        (e.g. m_tile_rows*K_rows) need >16 bits and already use MUL32_REG.
-        """
-        if dst_reg_idx == 0:
-            print("ERROR: INSTRUCTION_REG_ALU overwriting reg_idx 0 (zero reg) not allowed")
-            return
-        self.ue_isa_descriptor(INSTRUCTION_REG_ALU, isa_mode=ALU_MODE_MUL32_REG,
-                               src_reg_idx=src_reg_idx, dst_reg_idx=dst_reg_idx,
-                               rst_reg_idx=rst_reg_idx)
 
     def generate_instruction_shr(self, dst_reg_idx: int, src_reg_idx: int, immediate_value: int):
         """Emit ALU_MODE_SHR: dst = src >> immediate_value[4:0], logical right shift."""
@@ -8740,8 +8732,9 @@ class UnifiedEngine:
         stride_jump: int = 0,
     ) -> None:
         """
-        PBI init via :meth:`ue_op_descriptor` with ``inst_type=INSTRUCTION_PBI_SET`` and
-        ``pbi_mode=PBI_MODE_INIT``. Sets all pointer-register fields from the literal arguments;
+        Immediate PBI set via :meth:`ue_op_descriptor` with
+        ``inst_type=INSTRUCTION_PBI_SET`` and ``pbi_mode=PBI_MODE_INIT``. It runs no UE op and
+        sets all pointer-register fields from the literal arguments;
         ``inst_pointer_idx`` (``w[0][15:12]``) selects which pointer row to write.
 
         ``uram_row_stride_z`` initialises pointer-row field 10 (URAM-B read stride, encoded in the
@@ -8806,13 +8799,15 @@ class UnifiedEngine:
         pbi_field_select: PBI_FIELD = PBI_FIELD.DRAM_ADDR,
     ) -> None:
         """
-        PBI increment update via :meth:`ue_op_descriptor` with ``inst_type=INSTRUCTION_PBI_SET``
-        and ``inst_pointer_idx`` in ``w[0][15:12]``.
+        Standalone PBI row update via :meth:`ue_op_descriptor` with
+        ``inst_type=INSTRUCTION_PBI_SET`` and ``inst_pointer_idx`` in ``w[0][15:12]``. It runs
+        no UE op; pointer-backed UE operations perform the same increment automatically after use.
 
-        When ``general_reg_src`` is ``None``: ``pbi_mode=PBI_MODE_INC`` (plain increment).
-        When ``general_reg_src`` is provided: ``pbi_mode=PBI_MODE_REG`` — RTL first accumulates
-        the instruction delta (INC step) then overrides the field selected by ``pbi_field_select``
-        with the value in GPR ``general_reg_src``.
+        When ``general_reg_src`` is ``None``: ``pbi_mode=PBI_MODE_INC`` (plain increment; every
+        field becomes row + descriptor delta).
+        When ``general_reg_src`` is provided: ``pbi_mode=PBI_MODE_REG`` — the field selected by
+        ``pbi_field_select`` is written directly from GPR ``general_reg_src`` (its delta is
+        discarded), while all other fields still take the increment path.
         """
         if self.capture_buffer is None:
             print("ERROR: generate_instruction_pbi_inc() called but capture_buffer is not initialized!")
@@ -8857,7 +8852,7 @@ class UnifiedEngine:
 
     def generate_instruction_clear_fmax(self) -> None:
         """
-        Generate an dummy pbi instruction using reserved register 0 to clear the fmax context
+        Generate a harmless pointer-backed operation on reserved row 0 to clear the fmax context.
         """
         if self.capture_buffer is None:
             print("ERROR: generate_instruction_pbi_init() called but capture_buffer is not initialized!")
