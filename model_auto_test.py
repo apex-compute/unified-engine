@@ -332,22 +332,6 @@ def _check_mbv2_ssd(text):
 MATH_PROMPT = "If x + 3 = 5, what is x?"
 
 TESTS = [
-    # Ordered so the previously-untested tail of the suite (everything from
-    # locateanything_3b on, which last run never reached because run_ci.sh
-    # stops on first failure) runs first this time.
-
-    # Vision / detection models: no --prompt; emit detections / class labels parsed
-    # from stdout.
-    {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},
-    {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
-    {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
-
-    # Encoder models take no --prompt and emit non-LM output (ASR transcription /
-    # segmentation).
-    {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet},
-    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
-    {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
-
     # The deprecated gemma3_test_IF8.py is deliberately excluded: IF8 is
     # currently not working.
     {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
@@ -371,6 +355,18 @@ TESTS = [
     # once the read-before-write gap is fixed.
     {"name": "smolvlm2", "script": "models/smolvlm2/smolvlm2_test.py", "pass_check": _check_smolvlm2, "mode": "VLM", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image. (default)"},
     # TODO: SMOLVLM2 LM PATH IS BUGGY — restore the smolvlm2_lm auto-test only after it is fixed.
+
+    # Vision / detection models: no --prompt; emit detections / class labels parsed
+    # from stdout.
+    {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},
+    {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
+    {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
+
+    # Encoder models take no --prompt and emit non-LM output (ASR transcription /
+    # segmentation).
+    {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet},
+    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
+    {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
 ]
 
 
