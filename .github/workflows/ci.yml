@@ -1,0 +1,63 @@
+name: Model HW CI
+
+# Runs the full local CI suite (run_ci.sh): generic hardware op tests, then
+# every model compiled from scratch + run from its cached bin, with DRAM
+# randomized (poisoned) before every single pass. Stops on first failure.
+# Requires the FPGA device, so this must run on a self-hosted runner with the
+# board attached.
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_bins:
+        description: "Wipe cached compiled programs (programs.bin/json) first, forcing every model to recompile from scratch"
+        required: false
+        type: boolean
+        default: false
+      only:
+        description: "Space-separated model names to restrict the run to (leave empty to run all models)"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: model-hw-ci
+  cancel-in-progress: false  # never cancel a run mid-flight on shared HW
+
+jobs:
+  hw-ci:
+    runs-on: self-hosted
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean workspace and program bins
+        run: |
+          git reset --hard HEAD
+          ./clean_program_bins.sh
+
+      - name: Run CI suite
+        run: |
+          ARGS=()
+          if [[ "${{ inputs.clean_bins }}" == "true" ]]; then
+            ARGS+=(--clean-bins)
+          fi
+          if [[ -n "${{ inputs.only }}" ]]; then
+            ARGS+=(--only ${{ inputs.only }})
+          fi
+          ./run_ci.sh "${ARGS[@]}"
+
+      - name: Upload result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-hw-ci-results
+          path: |
+            model_auto_test_results.txt
+            user_hw_test_summary.md
+          if-no-files-found: warn
