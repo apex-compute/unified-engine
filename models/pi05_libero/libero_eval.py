@@ -1,9 +1,16 @@
-"""LIBERO evaluation for the pi0.5 UnifiedEngine (FPGA) -- SINGLE PROCESS.
+"""LIBERO evaluation for pi0.5 -- SINGLE PROCESS, swappable backend.
 
-Builds the FPGA engine once, steps the real LIBERO simulator, drives the robot
-with the engine's action chunks, and reports the success rate. No socket, no
-server/client -- the engine (user_dma_core) and the simulator (robosuite/mujoco)
-live in the SAME merged env (see requirements.txt; numpy<2 lets them coexist).
+Steps the real LIBERO simulator, drives the robot with a pi0.5 action chunk, and
+reports the success rate. Two interchangeable backends produce that chunk:
+
+    --backend torch   pi05_torch_ref.run_pi05 on GPU/CPU  (the GOLDEN reference)
+    --backend fpga    the UnifiedEngine on real hardware
+
+Everything outside the backend -- sim, seeding, init states, preprocessing,
+replan cadence, denoise noise -- is shared, so the two paths are directly
+comparable EPISODE BY EPISODE. That pairing is the point: it turns
+"is my silicon faithful?" into a per-episode yes/no instead of a fight between
+two noisy success percentages with overlapping confidence intervals.
 
 Setup once:
     conda create -n pi05_libero python=3.11 -y && conda activate pi05_libero
@@ -11,14 +18,28 @@ Setup once:
     pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
 
 Run:
+    # golden reference on GPU -- start here
     MUJOCO_GL=egl python models/pi05_libero/libero_eval.py \
-        --task-suite libero_spatial --tasks 1 --trials 1 --max-steps 60   # smoke test
+        --backend torch --tasks 1 --trials 1 --max-steps 60          # smoke test
     MUJOCO_GL=egl python models/pi05_libero/libero_eval.py \
-        --task-suite libero_spatial --trials 10                            # real run
+        --backend torch --trials 5                                   # 10x5 = 50 episodes
 
-The engine predicts a 10x7 chunk; LIBERO replans every --replan-steps (5), so
-only the first 5 rows of each chunk are executed before re-querying. Success =
-the task's BDDL goal predicate fires (done=True) before max_steps.
+    # same 50 episodes on hardware, then diff the two result JSONs
+    MUJOCO_GL=egl python models/pi05_libero/libero_eval.py \
+        --backend fpga --trials 5
+
+Each run writes per-episode success bits to --results-out (JSON). Diff two of
+them to get the paired FPGA-vs-reference agreement.
+
+The backend predicts a 10x7 chunk; LIBERO executes --replan-steps of it before
+re-querying. Success = the task's BDDL goal predicate fires (done=True) before
+max_steps.
+
+DETERMINISM: the denoise noise is pinned (numpy RandomState(0)) in BOTH backends,
+so the policy is a deterministic function of the observation. Combined with fixed
+init_states, an episode is bit-reproducible and the two backends see identical
+inputs at every step. Note this is a deviation from real openpi, which samples
+fresh noise per call -- fine for verification, but say so before quoting a number.
 """
 import argparse
 import collections
@@ -97,6 +118,154 @@ def _quat2axisangle(quat):
     return (q[:3] * 2.0 * math.acos(q[3])) / den
 
 
+# ---------------------------------------------------------------------------
+# Backends: raw model inputs -> (10,7) NORMALIZED action chunk.
+# ---------------------------------------------------------------------------
+# The flow-matching denoise loop starts from noise. Both backends must start from
+# the SAME noise or their chunks differ for reasons that have nothing to do with
+# hardware fidelity. The FPGA seeds itself with numpy RandomState(0) (see
+# pi05_libero_test.run_inference), so that is the shared source of truth here --
+# NOT torch.manual_seed(0), which draws a completely different sequence.
+AE_ACTION_HORIZON, AE_ACTION_DIM_PADDED = 10, 32
+
+
+def _fixed_noise32():
+    """(10, 32) denoise seed, identical in both backends. Cols 7:32 are padding."""
+    n = np.zeros((AE_ACTION_HORIZON, AE_ACTION_DIM_PADDED), dtype=np.float32)
+    n[:, :7] = np.random.RandomState(0).randn(AE_ACTION_HORIZON, 7)
+    return n
+
+
+class _TorchBackend:
+    """Golden reference: pi05_torch_ref.run_pi05 on GPU (or CPU)."""
+
+    def __init__(self, device, quant):
+        import torch
+        import pi05_torch_ref as R
+        self.torch, self.R = torch, R
+        self.device = device
+        self.dtype = {"fp32": torch.float32, "bf16": torch.bfloat16,
+                      "if4": torch.bfloat16}[quant]
+        print(f"[eval] loading torch reference weights (device={device} quant={quant})...",
+              flush=True)
+        self.W = R.Weights(device=device, dtype=self.dtype, quant=quant)
+        self.noise32 = torch.from_numpy(_fixed_noise32()).to(device)[None]  # (1,10,32)
+
+    def infer(self, images, toks, state_8d):
+        torch = self.torch
+        # images: list of 3 (224,224,3) float32 in [-1,1], slot 2 all-zero.
+        imgs = torch.from_numpy(np.stack(images)).to(self.device, self.dtype)
+        # The FPGA skips all-zero image slots and records them in prefix_masked_cols
+        # as [(i*256, (i+1)*256)]. The reference must mask the SAME columns, else its
+        # RoPE positions (cumsum(mask)-1) diverge from the FPGA's for every text token
+        # AND for every suffix token -- a silent, total mismatch.
+        masked_cols = [(i * 256, (i + 1) * 256)
+                       for i, im in enumerate(images) if not np.any(im)]
+        out = self.R.run_pi05(
+            imgs,
+            torch.as_tensor(toks, device=self.device, dtype=torch.long)[None],
+            torch.as_tensor(state_8d, device=self.device, dtype=torch.float32)[None],
+            self.W, noise=self.noise32, masked_cols=masked_cols or None)
+        return out[0, :, :7].float().cpu().numpy()
+
+
+class _FpgaBackend:
+    """The UnifiedEngine on real hardware."""
+
+    def __init__(self):
+        import pi05_libero_test as M
+        print("[eval] building FPGA engine (weight_init + tensor_init)...", flush=True)
+        self.ue = M.Pi05Libero_UnifiedEngine()
+        M.init_hang_prevention(self.ue)
+        self.ue.weight_init()
+        self.ue.tensor_init(M._CFG["defaults"].get("max_seq", 512))
+
+    def infer(self, images, toks, state_8d):
+        # run_inference seeds its own noise from RandomState(0) when noise32 is None,
+        # which is exactly _fixed_noise32() -- but pass it explicitly so the two
+        # backends can never silently drift apart if that default ever changes.
+        S = self.ue.AE_ACTION_HORIZON_PADDED
+        noise32 = np.full((S, self.ue.AE_XT_WIDTH), 1e-6, dtype=np.float32)
+        noise32[:AE_ACTION_HORIZON, :7] = _fixed_noise32()[:, :7]
+        return self.ue.run_inference(images, toks, noise32=noise32)[:, :7]
+
+
+_DIM_NAMES = ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "GRIPPER"]
+
+
+def _diff_actions(path_a, path_b):
+    """Compare two --dump-actions dumps. Inference #0 sees a bit-identical observation
+    in both runs, so it is a CONTROLLED comparison: any difference there is the backend
+    and nothing else. Reports per-dimension, because a single pooled SNR happily hides
+    one inverted gripper behind six healthy dims."""
+    A, B = np.load(path_a), np.load(path_b)
+    na, nb = int(A["n"]), int(B["n"])
+    print(f"\n{'='*68}\n  {pathlib.Path(path_a).name}  vs  {pathlib.Path(path_b).name}")
+    print(f"  {na} vs {nb} inferences\n{'='*68}")
+
+    # Inputs must match on inference 0, or the whole comparison is meaningless.
+    print("\n--- inference #0 input check (must be identical) ---")
+    ok = True
+    for k in ("base_u8", "wrist_u8", "state", "tokens"):
+        a, b = A[f"{k}_0"], B[f"{k}_0"]
+        same = a.shape == b.shape and np.array_equal(a, b)
+        ok &= same
+        print(f"  {k:10s} {'identical' if same else '*** DIFFERS ***'}  shape={a.shape}")
+    if not ok:
+        print("\n  !! inputs differ -> the two runs did NOT see the same observation.")
+        print("     Any action mismatch below is meaningless. Check --seed/--tasks/--trials.")
+        return
+
+    a, b = A["unnorm_0"], B["unnorm_0"]                     # (10,7) real robot units
+    # A dim the robot is barely using (e.g. no rotation during a straight reach) has a
+    # near-zero signal, so its SNR is a ratio of two tiny numbers -- meaningless, and it
+    # reads as a scary low dB while the direction is perfect. Judge those on cosine only.
+    # (Same trap as the masked-rows-poison-SNR bug: never SNR a signal that isn't there.)
+    QUIET = 0.02   # RMS below this in robot units = dim is idle this chunk
+    print(f"\n--- inference #0 action chunk, per-dimension (A={pathlib.Path(path_a).name}, "
+          f"B={pathlib.Path(path_b).name}) ---")
+    print(f"  {'dim':>8s} {'RMS':>8s} {'SNR dB':>8s} {'cosine':>8s} {'A mean':>9s} {'B mean':>9s}  verdict")
+    for d in range(7):
+        x, y = a[:, d], b[:, d]
+        rms = float(np.sqrt(np.mean(x ** 2)))
+        sig, noise = np.linalg.norm(x), np.linalg.norm(x - y)
+        snr = 20 * np.log10(sig / max(noise, 1e-12)) if sig > 1e-12 else float("nan")
+        denom = np.linalg.norm(x) * np.linalg.norm(y)
+        cos = float(x @ y / denom) if denom > 1e-12 else float("nan")
+        # A sign-flipped dim is the classic silent killer: magnitudes look sane, the
+        # robot drives the wrong way. cosine < 0 catches it; SNR alone does not.
+        if cos < -0.5:
+            verdict = "*** SIGN FLIP ***"
+        elif rms < QUIET:
+            verdict = f"idle (|x|={rms:.4f}, SNR n/a)" if cos > 0.8 else "idle but UNCORRELATED"
+        elif abs(cos) < 0.5:
+            verdict = "*** UNCORRELATED ***"
+        elif snr > 20:
+            verdict = "ok"
+        else:
+            verdict = "drift"
+        print(f"  {_DIM_NAMES[d]:>8s} {rms:8.4f} {snr:8.1f} {cos:8.3f} "
+              f"{x.mean():9.4f} {y.mean():9.4f}  {verdict}")
+
+    sig, noise = np.linalg.norm(a), np.linalg.norm(a - b)
+    print(f"\n  overall SNR: {20*np.log10(sig/max(noise,1e-12)):.1f} dB   "
+          f"(~29 dB is the known-good FPGA-vs-CPU-IF4 level for this model)")
+    print("  READ THE COSINE COLUMN, NOT THE SNR. An idle dim's SNR is a ratio of two")
+    print("  tiny numbers and means nothing; cosine still tells you the direction is right.")
+
+    n = min(na, nb)
+    if n > 1:
+        print(f"\n--- divergence across the first {n} inferences (unnorm chunk) ---")
+        print("  chunk #0 is controlled; later chunks legitimately drift once the two")
+        print("  backends execute different actions and the sim state separates.")
+        for i in range(n):
+            x, y = A[f"unnorm_{i}"], B[f"unnorm_{i}"]
+            sig, noise = np.linalg.norm(x), np.linalg.norm(x - y)
+            snr = 20 * np.log10(sig / max(noise, 1e-12))
+            gsign = float(np.mean(np.sign(x[:, 6]) == np.sign(y[:, 6])))
+            print(f"    #{i}  SNR {snr:7.1f} dB   gripper sign agreement {gsign*100:5.1f}%")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task-suite", default="libero_spatial", choices=list(_SUITE_MAX_STEPS))
@@ -112,7 +281,26 @@ def main():
     ap.add_argument("--wait-steps", type=int, default=10)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--video-out", default=str(_HERE / "data" / "libero" / "videos"))
+    ap.add_argument("--backend", default="torch", choices=["torch", "fpga"],
+                    help="torch = pi05_torch_ref golden reference; fpga = real hardware")
+    ap.add_argument("--device", default="cuda", help="--backend torch only")
+    ap.add_argument("--quant", default="if4", choices=["fp32", "bf16", "if4"],
+                    help="--backend torch only; if4 matches what the FPGA actually runs")
+    ap.add_argument("--results-out", default=None,
+                    help="JSON of per-episode success bits (default: data/libero/"
+                         "results_<backend>_<suite>.json). Diff two of these for the "
+                         "paired backend comparison.")
+    ap.add_argument("--no-video", action="store_true", help="skip mp4 writing")
+    ap.add_argument("--dump-actions", action="store_true",
+                    help="save every inference's (images, state, tokens, chunk) to "
+                         "data/libero/actions_<backend>_<suite>.npz. Run once per backend, "
+                         "then: python libero_eval.py --diff-actions A.npz B.npz")
+    ap.add_argument("--diff-actions", nargs=2, metavar=("A.npz", "B.npz"), default=None,
+                    help="compare two --dump-actions files and exit (no sim, no model)")
     args = ap.parse_args()
+
+    if args.diff_actions:
+        return _diff_actions(*args.diff_actions)
 
     # torch.load: LIBERO's get_task_init_states() loads numpy-pickled files that
     # torch 2.x rejects under the weights_only=True default. These are trusted.
@@ -124,21 +312,35 @@ def main():
     from libero.libero.envs import OffScreenRenderEnv
     from openpi_client import image_tools
 
-    # --- build the FPGA engine ONCE (weight_init + tensor_init) ---
-    import pi05_libero_test as M
-    print("[eval] building FPGA engine (weight_init + tensor_init)...", flush=True)
-    ue = M.Pi05Libero_UnifiedEngine()
-    M.init_hang_prevention(ue)
-    ue.weight_init()
-    ue.tensor_init(M._CFG["defaults"].get("max_seq", 512))
+    # --- build the backend ONCE (weights stay resident across all episodes) ---
+    backend = (_TorchBackend(args.device, args.quant) if args.backend == "torch"
+               else _FpgaBackend())
     pre = _Pi05Pre()
-    print("[eval] engine ready.", flush=True)
+    print(f"[eval] backend '{args.backend}' ready.", flush=True)
+
+    # --dump-actions: record the exact (input, output) of every inference. Two runs
+    # with different backends are directly diffable -- and inference #0 of an episode
+    # is guaranteed to see a BIT-IDENTICAL observation in both (same init_state, same
+    # wait-steps, no model action executed yet). So chunk #0 is a controlled
+    # comparison; any mismatch there is purely the backend. Later chunks may diverge
+    # legitimately, because a different action changes the next observation.
+    dumps = []
 
     def infer(base_u8, wrist_u8, state_8d, language):
         images = pre.images(base_u8, wrist_u8)
         toks = pre.prompt_tokens(state_8d, language)
-        actions = ue.run_inference(images, toks)          # (10,7) normalized
-        return pre.unnormalize(actions[:, :7])
+        actions = backend.infer(images, toks, state_8d)   # (10,7) normalized
+        unnorm = pre.unnormalize(actions)
+        if args.dump_actions:
+            dumps.append({
+                "norm": np.asarray(actions, dtype=np.float32),
+                "unnorm": np.asarray(unnorm, dtype=np.float32),
+                "state": np.asarray(state_8d, dtype=np.float32),
+                "tokens": np.asarray(toks, dtype=np.int64),
+                "base_u8": np.asarray(base_u8, dtype=np.uint8),
+                "wrist_u8": np.asarray(wrist_u8, dtype=np.uint8),
+            })
+        return unnorm
 
     max_steps = args.max_steps or _SUITE_MAX_STEPS[args.task_suite]
     np.random.seed(args.seed)
@@ -148,6 +350,7 @@ def main():
     video_dir.mkdir(parents=True, exist_ok=True)
 
     total_ep, total_succ = 0, 0
+    episodes = []   # per-episode success bits -> the paired-comparison record
     for task_id in range(n_tasks):
         task = task_suite.get_task(task_id)
         init_states = task_suite.get_task_init_states(task_id)
@@ -187,20 +390,50 @@ def main():
                 t += 1
             task_ep += 1
             total_ep += 1
+            done = bool(done)
             if done:
                 task_succ += 1
                 total_succ += 1
+            episodes.append({"task_id": task_id, "trial": trial,
+                             "language": str(task.language), "steps": t, "success": done})
             suffix = "success" if done else "failure"
-            imageio.mimwrite(
-                video_dir / f"{args.task_suite}_t{task_id}_e{trial}_{suffix}.mp4",
-                [np.asarray(x) for x in replay], fps=10)
+            if not args.no_video:
+                imageio.mimwrite(
+                    video_dir / f"{args.backend}_{args.task_suite}_t{task_id}_e{trial}_{suffix}.mp4",
+                    [np.asarray(x) for x in replay], fps=10)
             print(f"[eval]   -> {'SUCCESS' if done else 'failure'}  "
                   f"(running {total_succ}/{total_ep} = {100*total_succ/total_ep:.1f}%)", flush=True)
         print(f"[eval] task {task_id} success rate: {task_succ}/{task_ep}", flush=True)
+        env.close()
+
+    if args.dump_actions and dumps:
+        flat = {"n": np.array(len(dumps))}
+        for i, d in enumerate(dumps):
+            for k, v in d.items():
+                flat[f"{k}_{i}"] = v
+        actions_path = video_dir.parent / f"actions_{args.backend}_{args.task_suite}.npz"
+        np.savez_compressed(actions_path, **flat)
+        print(f"[eval] dumped {len(dumps)} inferences -> {actions_path}", flush=True)
+
+    import json
+    results_path = pathlib.Path(args.results_out) if args.results_out else (
+        video_dir.parent / f"results_{args.backend}_{args.task_suite}.json")
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps({
+        "backend": args.backend, "task_suite": args.task_suite, "seed": args.seed,
+        "tasks": n_tasks, "trials": args.trials, "max_steps": max_steps,
+        "replan_steps": args.replan_steps,
+        "quant": args.quant if args.backend == "torch" else "if4-hw",
+        "successes": total_succ, "episodes_total": total_ep,
+        "success_rate": total_succ / max(1, total_ep),
+        "episodes": episodes,
+    }, indent=2))
 
     print("\n" + "=" * 56)
-    print(f"  LIBERO {args.task_suite}  |  trials/task={args.trials}  tasks={n_tasks}")
+    print(f"  LIBERO {args.task_suite}  |  backend={args.backend}  "
+          f"trials/task={args.trials}  tasks={n_tasks}")
     print(f"  SUCCESS RATE: {total_succ}/{total_ep} = {100*total_succ/max(1,total_ep):.1f}%")
+    print(f"  per-episode results -> {results_path}")
     print("=" * 56)
 
 
