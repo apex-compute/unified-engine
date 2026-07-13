@@ -1812,8 +1812,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
               f"{(torch.tensor(mm_types) == 0).sum().item()} text)")
 
     # reset_isa_reg_counter / alloc_isa_reg: use UnifiedEngine's base-class versions
-    # (31 GPRs, matching the real ISA register file — see user_dma_core.py's
-    # matmat_mul_dynamic_core comment: "The ISA register file holds 31 GPRs (1..31)").
+    # (63 GPRs, matching the real ISA register file — see user_dma_core.py's
+    # matmat_mul_dynamic_core comment: "The ISA register file holds 63 GPRs (1..63)").
     # This file previously overrode both with a 15-register cap and an unused
     # `reset` kwarg, identical to the same bug found and fixed in gemma4_e2b_test.py.
 

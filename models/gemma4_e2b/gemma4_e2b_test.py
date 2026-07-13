@@ -1031,7 +1031,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.gpr_scratch    = fixed["GPR_BUCKET_IDX_REG"]  # retired bucket reg → scratch
         self.gpr_aligned_seq_len = fixed["GPR_ALIGNED_SEQ_LEN_REG"]
         # Dynamic GPR allocation starts past the five reserved regs. The ISA
-        # register file holds 31 GPRs total (see user_dma_core.py's
+        # register file holds 63 GPRs total (see user_dma_core.py's
         # matmat_mul_dynamic_core), so this leaves ample headroom.
         self._isa_reg_counter = 6
         self._isa_reg_base = 6  # one-shot mode resets the allocator to this base per sub-op
@@ -1736,11 +1736,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
               f"{(torch.tensor(mm_types) == 0).sum().item()} text)")
 
     # reset_isa_reg_counter / alloc_isa_reg: use UnifiedEngine's base-class versions
-    # (31 GPRs, matching the real ISA register file — see user_dma_core.py's
-    # matmat_mul_dynamic_core comment: "The ISA register file holds 31 GPRs (1..31)").
+    # (63 GPRs, matching the real ISA register file — see user_dma_core.py's
+    # matmat_mul_dynamic_core comment: "The ISA register file holds 63 GPRs (1..63)").
     # This file previously overrode both with a 15-register cap and an unused
     # `reset` kwarg; that cap wasn't a real hardware limit (gemma3/llama don't have
-    # it and rely on the same 31-register base class), and it made
+    # it and rely on the same 63-register base class), and it made
     # matmat_mul_dynamic_core's dynamic-PBI path (which allocates well over 15
     # scratch registers for a single quantized matmul) exceed the register file
     # on the very first Q-projection call.

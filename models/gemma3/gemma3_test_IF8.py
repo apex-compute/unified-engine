@@ -47,6 +47,7 @@ Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, gemma3_bin/, and gemma3
   user_dma_core.py is two folders up (models/../..); that grandparent is added to sys.path.
 """
 
+import gc
 import json
 import math
 import os
@@ -476,14 +477,20 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         else:
             print(f"Weight bin not found, generating: {full_path}")
             weight_bin_generate(output_path=full_path)
+        # Local (not self.weight_bin) so the 1.1 GB buffer is freed when this
+        # function returns.
         with open(full_path, "rb") as f:
-            self.weight_bin = f.read()
+            weight_bin = f.read()
         model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
         embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
         embedding_scale = model.config.hidden_size ** 0.5
         self.embedding_weight = (embed.float() * embedding_scale).to(torch.bfloat16)
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        # Only the scaled embedding and tokenizer are needed from the HF model;
+        # release it before the DRAM upload below instead of holding ~2 GB through it.
+        del model, embed
+        gc.collect()
 
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         base_layer0 = self.weight_defs["BLK0_ATTN_NORM_WEIGHT"]
@@ -511,7 +518,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 off = self.weight_defs[off_key]
                 sz = self.weight_defs[sz_key]
                 bin_off = off + layer_idx * LAYER_WEIGHT_SIZE
-                raw = self.weight_bin[bin_off : bin_off + sz]
+                raw = weight_bin[bin_off : bin_off + sz]
                 offset_in_layer = off - base_layer0
                 dram_addr = layers_base_dram + layer_idx * LAYER_WEIGHT_SIZE + offset_in_layer
                 self.dma_write(DMA_DEVICE_H2C, dram_addr, raw, sz)
@@ -525,7 +532,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         for off_key, sz_key, attr in non_layer:
             off = self.weight_defs[off_key]
             sz = self.weight_defs[sz_key]
-            raw = self.weight_bin[off : off + sz]
+            raw = weight_bin[off : off + sz]
             addr = self.allocate_params_dram(sz)
             self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
             setattr(self, attr, addr)
