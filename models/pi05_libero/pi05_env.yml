@@ -1,0 +1,55 @@
+# Merged pi0.5 + LIBERO environment: GPU torch AND the robosuite/mujoco sim in ONE
+# process. libero_eval.py needs both simultaneously (no socket, no server/client),
+# which is the whole reason this file exists.
+#
+#   conda env create -f models/pi05_libero/environment.yml
+#   conda activate libero
+#   # the two local editable packages are NOT on PyPI -- install by path:
+#   pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
+#   pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/packages/openpi-client
+#
+# Verify:
+#   MUJOCO_GL=egl python models/pi05_libero/libero_eval.py --backend torch --tasks 1 --trials 3
+#   -> expect 3/3 SUCCESS in ~36s
+#
+# TWO PINS THAT ARE LOAD-BEARING -- do not "upgrade" either:
+#   numpy <2   robosuite/gym 0.25 break on numpy 2.x. This is what lets the sim and
+#              user_dma_core coexist in one interpreter.
+#   torch 2.8.0+cu128   the RTX 5070 is Blackwell (sm_120) and needs cu128. Stock
+#              PyPI torch is CPU-only here and silently gives you cuda=False.
+name: libero
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # --- GPU torch (Blackwell / sm_120 needs cu128; plain `torch` won't do) ---
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.8.0+cu128
+
+      # --- hard pin: robosuite + gym die on numpy 2.x ---
+      - numpy==1.26.4
+
+      # --- LIBERO sim stack ---
+      - robosuite==1.4.1
+      - mujoco==3.2.3
+      - bddl==1.0.1
+      - gym==0.25.2
+
+      # --- pi0.5 model side ---
+      - sentencepiece==0.2.2
+      - einops==0.8.2
+
+      # --- obs preprocessing / video out ---
+      - imageio==2.37.3
+      - imageio-ffmpeg==0.6.0
+      - opencv-python==4.11.0.86
+      - pillow==12.3.0
+
+      # --- transitive but pinned so a fresh solve reproduces the working env ---
+      - numba==0.66.0
+      - easydict==1.13
+      - matplotlib==3.11.0
+      - PyOpenGL==3.1.10
+      - future==1.0.0
