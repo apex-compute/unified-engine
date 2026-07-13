@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="update_87eabea5.bin">&#9881;&#65039; Hardware Architecture Update v1.4(update_87eabea5.bin)</a>
+  <a href="update_87eabea5.bin">&#9881;&#65039; Hardware Architecture Update v1.41(update_87eabea5.bin)</a>
 </p>
 
 <p align="center">
