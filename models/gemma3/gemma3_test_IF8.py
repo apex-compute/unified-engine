@@ -2,10 +2,6 @@
 """
 Gemma3 IF8 inference on accelerator: prefill + decode.
 
-DEPRECATED: IF8 IS CURRENTLY NOT WORKING. This file is retained only for
-historical/debugging reference and is not part of the supported test suite.
-Use gemma3_test.py (IF4) for working Gemma3 inference.
-
 This is the IF8 (8-bit adaptive block-scaled) variant of gemma3_test.py. It is a
 one-for-one mirror of that file except for the IF8-specific design points:
 
@@ -20,13 +16,13 @@ one-for-one mirror of that file except for the IF8-specific design points:
      matmul. Do NOT force pure INT8 -- MixMSE between INT8 and FP8 keeps activation
      outliers bounded across all 26 layers (pure INT8 -> NaN logits).
 
-Caches (weights + compiled instruction bins) are routed to a dedicated
+Caches (weights + compiled instruction bins) are routed to the dedicated
 ``gemma3_if8_bin/`` directory so IF4 and IF8 artifacts never collide.
 
   - Config from gemma3_config.json; weights from a single bin (see below).
   - A single prefill program plus a single decoder program are compiled into ONE combined
     instruction image plus a metadata sidecar (per-stage start addresses, sizes, FLOPs). Both are
-    runtime-generated tmp artifacts inside gemma3_bin/, with relative paths declared in
+    runtime-generated tmp artifacts inside gemma3_if8_bin/, with relative paths declared in
     gemma3_config.json (paths.instruction_bin / instruction_meta). The bin is tied to the prompt
     length used at compile time and is recompiled per run.
   - Run phase loads the combined bin once into program DRAM, executes the single prefill
@@ -47,7 +43,7 @@ Usage:
 ``--device`` matches ``user_hw_test.py`` (FPGA profile: ``UE_AXI_DATA_WIDTH_BITS`` and default clock).
 ``--dev`` is the XDMA device name (e.g. ``xdma0``). For Bittware use ``--device bittware``; override clock with ``--cycle`` if needed.
 
-Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in the same folder.
+Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, gemma3_bin/, and gemma3_if8_bin/ live in the same folder.
   user_dma_core.py is two folders up (models/../..); that grandparent is added to sys.path.
 """
 
@@ -56,7 +52,7 @@ import math
 import os
 import sys
 
-# This file's folder: gemma3_bin/, *.json live here. user_dma_core is two folders up (models/../..).
+# This file's folder: model scripts, *.json, and cache dirs live here. user_dma_core is two folders up (models/../..).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
@@ -1286,21 +1282,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             assert self.prefill_seq is not None, "--legacy requires set_prefill_seq() before compile_gemma3()"
             prefill_seq_len = len(self.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.json")
         elif profile:
             prefill_seq_len = UE_VECTOR_SIZE
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_instruction.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_instruction.json")
         elif self.matmatmul:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_instruction.bin")
+            instruction_meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_instruction.json")
         else:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_instruction.bin")
+            instruction_meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_instruction.json")
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
@@ -1377,7 +1373,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=use_pbi
             )
             slave_engine.stop_capture()
-            slave_bin_path = os.path.join(self.script_dir, "gemma3_bin", "prefill_program_slave.bin")
+            slave_bin_path = os.path.join(self.script_dir, "gemma3_if8_bin", "prefill_program_slave.bin")
             slave_program_bytes = bytearray()
             for inst in slave_engine.capture_buffer:
                 slave_program_bytes.extend(inst.get_bytes())
@@ -1419,7 +1415,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         and print a per-step latency breakdown for the decoder.
         """
         matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-        profile_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_instruction.json")
+        profile_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_instruction.json")
         with open(profile_meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1528,11 +1524,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if self.legacy:
             prefill_seq_len = len(self.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.json")
+            meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.json")
         elif self.matmatmul:
-            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_instruction.json")
+            meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_instruction.json")
         else:
-            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_instruction.json")
+            meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_instruction.json")
         with open(meta_path, "r") as f:
             meta = json.load(f)
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
@@ -2053,19 +2049,8 @@ def gemma3_decoder_quantized_matmat_compare_test(
 
 def main():
     import argparse
-    print(
-        "\n"
-        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-        "WARNING: gemma3_test_IF8.py IS DEPRECATED; IF8 IS NOT WORKING CURRENTLY.\n"
-        "Use gemma3_test.py (IF4) for supported Gemma3 inference.\n"
-        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
-        file=sys.stderr,
-    )
     parser = argparse.ArgumentParser(
-        description=(
-            "DEPRECATED, NON-WORKING Gemma3 IF8 experiment. "
-            "Use gemma3_test.py (IF4)."
-        )
+        description="Gemma3 IF8 inference on accelerator."
     )
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
     parser.add_argument("--local-weights", action="store_true", help="Use gemma3_if8_bin/full_model_weights.bin instead of generated weights_gemma3_hf.bin")
@@ -2093,7 +2078,7 @@ def main():
     parser.add_argument('--legacy', action='store_true',
                         help='Compile without PBI for non-attention ops (static M/K/N). '
                              'Attention (flash_attention, decoder_group_attention) stays dynamic. '
-                             'Uses a separate gemma3_legacy_instruction.bin cache.')
+                             'Uses a separate gemma3_if8_bin/gemma3_legacy_* instruction cache.')
     parser.add_argument('--matmatmul', action='store_true',
                         help='Use matmat_mul_core for Gemma3 decoder quantized matmats instead of the default quantized_matmat_core (streaming) path.')
     parser.add_argument('--numeric', action='store_true',

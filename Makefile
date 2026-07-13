@@ -15,8 +15,12 @@ clean:
 	rm -rfv andromeda_IP-* andromeda_wrapper-*
 	rm -fv models/gemma3/gemma3_bin/programs*.bin
 	rm -fv models/gemma3/gemma3_bin/programs*.json
+	rm -fv models/gemma3/gemma3_bin/*instruction.bin
+	rm -fv models/gemma3/gemma3_bin/*instruction.json
 	rm -fv models/gemma3/gemma3_if8_bin/programs*.bin
 	rm -fv models/gemma3/gemma3_if8_bin/programs*.json
+	rm -fv models/gemma3/gemma3_if8_bin/*instruction.bin
+	rm -fv models/gemma3/gemma3_if8_bin/*instruction.json
 	rm -fv models/gemma4_e2b/gemma4_e2b_bin/programs*.bin
 	rm -fv models/gemma4_e2b/gemma4_e2b_bin/programs*.json
 	rm -fv models/gemma4_e4b/gemma4_e4b_bin/programs*.bin
