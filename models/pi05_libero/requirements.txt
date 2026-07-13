@@ -1,0 +1,44 @@
+# Single merged env for pi05_libero: runs BOTH the FPGA model (run_inference)
+# AND the LIBERO simulator in ONE process -- no socket, no server/client.
+#
+#   conda create -n pi05_libero python=3.11 -y && conda activate pi05_libero
+#   pip install -r requirements.txt
+#   # LIBERO source itself (scenes/BDDL/benchmark API), editable:
+#   pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
+#   # one-time: seed LIBERO's config (answers its interactive first-run prompt with defaults)
+#   printf 'N\n' | python -c "import sys; sys.path.insert(0,'<...>/third_party/libero'); import libero.libero"
+#
+# Headless rendering needs EGL:  export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+#
+# NOTE: numpy<2 is required by BOTH the engine and robosuite/libero, so the two
+# worlds coexist. CPU torch is fine -- the model runs on the FPGA, not the GPU
+# (GPU torch is only needed for the optional --verify-denoise reference).
+
+# ---- unified-engine base (clone of ../../requirements.txt) ----
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.4
+torchvision>=0.23.0
+torchaudio>=2.4
+soundfile
+numpy<2
+transformers>=4.40.0
+huggingface-hub>=0.20.0
+pillow>=12.1.1
+sentencepiece
+
+# ---- LIBERO simulator (robosuite/mujoco) + its runtime deps ----
+robosuite==1.4.1
+mujoco==3.2.3
+bddl==1.0.1
+opencv-python
+imageio
+imageio-ffmpeg
+tyro
+numba
+scipy
+easydict
+future
+matplotlib
+einops
+cloudpickle
+gym==0.25.2

@@ -157,6 +157,25 @@ def sincos_pos_embed(t: torch.Tensor, dim: int, min_period=4e-3, max_period=4.0)
     return torch.cat([torch.sin(sinusoid), torch.cos(sinusoid)], dim=-1)
 
 
+def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: float = 10_000.0):
+    """RoPE, port of openpi gemma.py::_apply_rope (the pi0.5 LLM rotates BOTH q and
+    k in EVERY layer -- this was missing entirely, which is why our reference and the
+    FPGA agreed with each other while both disagreed with the real policy).
+
+    x: (b, T, H, D) ; positions: (b, T) integer token positions.
+    NOTE: half-split rotation (x1=first D/2, x2=second D/2), NOT interleaved.
+    """
+    D = x.shape[-1]
+    freq_exponents = (2.0 / D) * torch.arange(D // 2, dtype=torch.float32, device=x.device)
+    timescale = max_wavelength ** freq_exponents                      # (D/2,)
+    radians = positions[..., None].float() / timescale[None, None, :]  # (b, T, D/2)
+    radians = radians[..., None, :]                                    # (b, T, 1, D/2) -> broadcasts over heads
+    sin, cos = torch.sin(radians), torch.cos(radians)
+    x1, x2 = torch.split(x.float(), D // 2, dim=-1)                    # each (b, T, H, D/2)
+    res = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    return res.to(x.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Vision encoder: SigLIP So400m/14
 # ---------------------------------------------------------------------------
@@ -314,7 +333,7 @@ def vision_encode_checkpoints(images: torch.Tensor, W: Weights):
 # Joint prefix+suffix mixture-of-experts attention block (shared geometry:
 # head_dim=256, num_heads=8, num_kv_heads=1 for both streams)
 # ---------------------------------------------------------------------------
-def joint_attention(pre_tokens, suf_tokens, attn_bias, layer, W, kv_cache=None):
+def joint_attention(pre_tokens, suf_tokens, attn_bias, layer, W, kv_cache=None, positions=None):
     """pre_tokens: (b, P, 2048) or None (prefix already cached).
     suf_tokens: (b, S, 1024) or None.
     attn_bias: (b_or_1, Sq, Skv) additive mask (0 / -inf).
@@ -334,6 +353,11 @@ def joint_attention(pre_tokens, suf_tokens, attn_bias, layer, W, kv_cache=None):
         # kv_einsum.w shape is (2, kv_heads, d, head_dim): [0]=k proj, [1]=v proj
         k_pre = torch.einsum("btd,hdc->bthc", pre_tokens, kv_ein[0])
         v_pre = torch.einsum("btd,hdc->bthc", pre_tokens, kv_ein[1])
+        # RoPE on q and k (openpi gemma.py:203/206). The K/V cache stores the
+        # ROTATED k -- openpi rotates before caching.
+        if positions is not None:
+            q_pre = apply_rope(q_pre, positions)
+            k_pre = apply_rope(k_pre, positions)
         q_parts.append(q_pre)
         k_parts.append(k_pre)
         v_parts.append(v_pre)
@@ -347,6 +371,11 @@ def joint_attention(pre_tokens, suf_tokens, attn_bias, layer, W, kv_cache=None):
         q_suf = torch.einsum("btd,hdk->bthk", suf_tokens, q_ein1)
         k_suf = torch.einsum("btd,hdc->bthc", suf_tokens, kv_ein1[0])
         v_suf = torch.einsum("btd,hdc->bthc", suf_tokens, kv_ein1[1])
+        # RoPE on the suffix q/k, using SUFFIX positions (openpi pi0.py:259:
+        # sum(prefix_mask) + cumsum(suffix_mask) - 1).
+        if positions is not None:
+            q_suf = apply_rope(q_suf, positions)
+            k_suf = apply_rope(k_suf, positions)
 
     k_all = torch.cat(k_parts + ([k_suf] if suf_tokens is not None else []), dim=1)  # (b, T_kv, kv_heads, hd)
     v_all = torch.cat(v_parts + ([v_suf] if suf_tokens is not None else []), dim=1)
@@ -384,14 +413,15 @@ def joint_attention(pre_tokens, suf_tokens, attn_bias, layer, W, kv_cache=None):
     return pre_attn_out, suf_attn_out, new_cache
 
 
-def prefix_forward(prefix_tokens, attn_bias, W, num_layers=18):
+def prefix_forward(prefix_tokens, attn_bias, W, num_layers=18, positions=None):
     """Runs the prefix once through all 18 layers, returns per-layer KV cache."""
     x = prefix_tokens
     k_cache, v_cache = [], []
     for layer in range(num_layers):
         norm_s = W["PaliGemma.llm.layers.pre_attention_norm.scale"][layer]
         h = rms_norm(x, norm_s)
-        attn_out, _, (k_l, v_l) = joint_attention(h, None, attn_bias, layer, W)
+        attn_out, _, (k_l, v_l) = joint_attention(h, None, attn_bias, layer, W,
+                                                   positions=positions)
         k_cache.append(k_l)
         v_cache.append(v_l)
         x = x + attn_out
@@ -404,14 +434,15 @@ def prefix_forward(prefix_tokens, attn_bias, W, num_layers=18):
     return x, (k_cache, v_cache)
 
 
-def suffix_step(suf_tokens, adarms_cond, attn_bias, kv_cache, W, num_layers=18):
+def suffix_step(suf_tokens, adarms_cond, attn_bias, kv_cache, W, num_layers=18, positions=None):
     x = suf_tokens
     for layer in range(num_layers):
         dense_w = W["PaliGemma.llm.layers.pre_attention_norm_1.Dense_0.kernel"][layer]
         dense_b = W["PaliGemma.llm.layers.pre_attention_norm_1.Dense_0.bias"][layer]
         h, gate = ada_rms_norm(x, adarms_cond, dense_w, dense_b)
 
-        _, attn_out, _ = joint_attention(None, h, attn_bias, layer, W, kv_cache=kv_cache)
+        _, attn_out, _ = joint_attention(None, h, attn_bias, layer, W, kv_cache=kv_cache,
+                                          positions=positions)
         x = x + gate[:, None, :] * attn_out
 
         dense_w2 = W["PaliGemma.llm.layers.pre_ffw_norm_1.Dense_0.kernel"][layer]
@@ -474,7 +505,17 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
     n_prefix = prefix_tokens.shape[1]
 
     prefix_bias = build_prefix_attn_bias(n_prefix, device, torch.float32, masked_cols=masked_cols)
-    _, kv_cache = prefix_forward(prefix_tokens, prefix_bias, W)
+
+    # RoPE positions (openpi pi0.py:236): positions = cumsum(prefix_mask) - 1.
+    # Masked image slots (image_mask=False) have mask 0, so they do NOT advance the
+    # position counter -- the text tokens' positions are the same whether the dead
+    # slot is masked or absent.
+    prefix_mask = torch.ones(b, n_prefix, device=device, dtype=torch.float32)
+    for _a, _b in (masked_cols or []):
+        prefix_mask[:, _a:_b] = 0.0
+    prefix_positions = torch.cumsum(prefix_mask, dim=1) - 1.0          # (b, P)
+
+    _, kv_cache = prefix_forward(prefix_tokens, prefix_bias, W, positions=prefix_positions)
 
     # --- Action-expert flow-matching denoising loop ---
     dt = -1.0 / num_denoise_steps
@@ -491,6 +532,13 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
     n_suffix = action_horizon
     suffix_bias = build_suffix_attn_bias(n_prefix, n_suffix, device, torch.float32, masked_cols=masked_cols)
 
+    # Suffix RoPE positions (openpi pi0.py:259):
+    #   sum(prefix_mask) + cumsum(suffix_mask) - 1   (all suffix tokens are valid)
+    n_valid_prefix = prefix_mask.sum(dim=-1)                           # (b,)
+    suffix_positions = (n_valid_prefix[:, None]
+                        + torch.arange(1, n_suffix + 1, device=device, dtype=torch.float32)[None, :]
+                        - 1.0)                                          # (b, n_suffix)
+
     for _ in range(num_denoise_steps):
         action_tokens = (x_t.to(dtype) @ action_in_k) + action_in_b  # (b, ah, 1024)
 
@@ -498,7 +546,8 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
         time_emb = F.silu((time_emb @ time_in_k) + time_in_b)
         time_emb = F.silu((time_emb @ time_out_k) + time_out_b)  # (b, 1024) adarms_cond
 
-        suf_out = suffix_step(action_tokens, time_emb, suffix_bias, kv_cache, W)
+        suf_out = suffix_step(action_tokens, time_emb, suffix_bias, kv_cache, W,
+                              positions=suffix_positions)
         v_t = (suf_out.float() @ action_out_k.float()) + action_out_b.float()  # (b, ah, action_dim)
 
         x_t = x_t + dt * v_t
@@ -514,6 +563,8 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--quant", default="if4", choices=["fp32", "bf16", "if4"])
     ap.add_argument("--sample", type=int, default=0)
+    ap.add_argument("--prompt", default="pick up the object",
+                    help="task instruction (must match run_pi05.py to compare against the real policy)")
     args = ap.parse_args()
 
     compute_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "if4": torch.bfloat16}[args.quant]
@@ -534,9 +585,23 @@ def main():
     meta = json.loads((sample_dir / "meta.json").read_text())
     state = torch.tensor([meta["state_example"]], device=args.device, dtype=torch.float32)
 
-    # Placeholder prompt tokens (real SentencePiece tokenization would replace this;
-    # ids just need to be valid indices into the 257152-row embedding table).
-    prompt_tokens = torch.randint(0, 257152, (1, 16), device=args.device)
+    # REAL SentencePiece tokenization (was a random-token placeholder, which fed the
+    # model garbage language conditioning and made this reference incomparable to the
+    # real openpi policy). Pi05 format: state is discretized into the prompt TEXT.
+    import sentencepiece
+    ckpt = Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"
+    norm_stats = json.loads(
+        (ckpt / "assets" / "physical-intelligence" / "libero" / "norm_stats.json").read_text())["norm_stats"]
+    s_np = np.array(meta["state_example"], dtype=np.float32)
+    s_q01 = np.array(norm_stats["state"]["q01"], dtype=np.float32)
+    s_q99 = np.array(norm_stats["state"]["q99"], dtype=np.float32)
+    s_norm = np.clip((s_np - s_q01) / (s_q99 - s_q01 + 1e-6) * 2.0 - 1.0, -1.0, 1.0)
+    digitized = np.digitize(s_norm, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+    full_prompt = f"Task: {args.prompt}, State: {' '.join(map(str, digitized))};\nAction: "
+    sp = sentencepiece.SentencePieceProcessor(
+        model_file=str(Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model"))
+    prompt_tokens = torch.tensor(
+        [sp.encode(full_prompt, add_bos=True)], device=args.device, dtype=torch.long)
 
     torch.manual_seed(0)
     noise = torch.randn(1, 10, 7, device=args.device, dtype=torch.float32)
@@ -547,12 +612,19 @@ def main():
     noise32[..., :7] = noise
 
     actions = run_pi05(images, prompt_tokens, state, W, noise=noise32)
-    actions = actions[..., :7]
+    actions = actions[..., :7].float().cpu().numpy()[0]
 
-    torch.set_printoptions(precision=4, sci_mode=False)
-    print(f"device={args.device} quant={args.quant}")
-    print("action_chunk shape:", actions.shape)
-    print(actions)
+    # Un-normalize to real robot action space (openpi Unnormalize:
+    # (x+1)/2*(q99-q01)+q01). The real policy's output is un-normalized, so this is
+    # what must be compared against run_pi05.py / fed to the LIBERO sim.
+    a_q01 = np.array(norm_stats["actions"]["q01"], dtype=np.float32)[:7]
+    a_q99 = np.array(norm_stats["actions"]["q99"], dtype=np.float32)[:7]
+    actions_unnorm = (actions + 1.0) / 2.0 * (a_q99 - a_q01 + 1e-6) + a_q01
+
+    np.set_printoptions(precision=4, suppress=True)
+    print(f"device={args.device} quant={args.quant} prompt={args.prompt!r}")
+    print("action_chunk (real robot actions, 10x7):")
+    print(actions_unnorm)
 
 
 if __name__ == "__main__":
