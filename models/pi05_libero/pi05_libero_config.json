@@ -15,7 +15,7 @@
     "head_dim": 256,
     "intermediate_size": 16384,
     "vocab_size": 257152,
-    "rope_theta": null,
+    "rope_theta": 10000,
     "rms_norm_eps": 1e-06,
     "max_position_embeddings": 1024
   },
@@ -43,7 +43,7 @@
   },
   "ops": {
     "norm": "rms",
-    "rope": "none",
+    "rope": "hf",
     "mlp": "gated_silu",
     "attn": "prefill_flash",
     "causal": false,
