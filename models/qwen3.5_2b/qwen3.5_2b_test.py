@@ -2139,17 +2139,14 @@ def _emit_rope_split_64(
 
     if load_cos_sin:
         if getattr(ue, '_compile_mode', False):
-            # Register-patch each cos/sin load: TMP_REG = POS_ROPE_REG + base_addr,
-            # then overwrite the following DMA instruction's DRAM addr with TMP_REG.
+            # Register-addressed cos/sin loads: TMP_REG = POS_ROPE_REG + base_addr,
+            # DMA source DRAM addr taken from TMP_REG at runtime (PBI-override lowering).
             ue.generate_instruction_add_imm(ue._ISA_POS_ROPE_REG, ue_35bit_addr_shifter(cos_pad_dram),     ue._ISA_TMP_REG)
-            ue.accelerator_memory_to_sram(cos_pad_dram,     SB_COS,     rot_dim)
-            ue.overwrite_instruction_with_general_register(ue._ISA_TMP_REG)
+            ue.accelerator_memory_to_sram(cos_pad_dram,     SB_COS,     rot_dim, general_reg_src=ue._ISA_TMP_REG)
             ue.generate_instruction_add_imm(ue._ISA_POS_ROPE_REG, ue_35bit_addr_shifter(neg_sin_pad_dram), ue._ISA_TMP_REG)
-            ue.accelerator_memory_to_sram(neg_sin_pad_dram, SB_NEG_SIN, rot_dim)
-            ue.overwrite_instruction_with_general_register(ue._ISA_TMP_REG)
+            ue.accelerator_memory_to_sram(neg_sin_pad_dram, SB_NEG_SIN, rot_dim, general_reg_src=ue._ISA_TMP_REG)
             ue.generate_instruction_add_imm(ue._ISA_POS_ROPE_REG, ue_35bit_addr_shifter(sin_hi_pad_dram),  ue._ISA_TMP_REG)
-            ue.accelerator_memory_to_sram(sin_hi_pad_dram,  SB_SIN_HI,  rot_dim)
-            ue.overwrite_instruction_with_general_register(ue._ISA_TMP_REG)
+            ue.accelerator_memory_to_sram(sin_hi_pad_dram,  SB_SIN_HI,  rot_dim, general_reg_src=ue._ISA_TMP_REG)
         else:
             ue.accelerator_memory_to_sram(cos_pad_dram,     SB_COS,     rot_dim)
             ue.accelerator_memory_to_sram(neg_sin_pad_dram, SB_NEG_SIN, rot_dim)
@@ -3305,11 +3302,9 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                 dst_v_base = V_cache + qh * head_stride_bytes
                 if ue._compile_mode:
                     ue.generate_instruction_add_imm(ue._ISA_POS_K_REG, ue_35bit_addr_shifter(dst_k_base), ue._ISA_TMP_REG)
-                    ue.sram_to_accelerator_memory(SA_KV_K, dst_k_base, full_head_dim)
-                    ue.overwrite_instruction_with_general_register(ue._ISA_TMP_REG)
+                    ue.sram_to_accelerator_memory(SA_KV_K, dst_k_base, full_head_dim, general_reg_src=ue._ISA_TMP_REG)
                     ue.generate_instruction_add_imm(ue._ISA_POS_K_REG, ue_35bit_addr_shifter(dst_v_base), ue._ISA_TMP_REG)
-                    ue.sram_to_accelerator_memory(SA_KV_V, dst_v_base, full_head_dim)
-                    ue.overwrite_instruction_with_general_register(ue._ISA_TMP_REG)
+                    ue.sram_to_accelerator_memory(SA_KV_V, dst_v_base, full_head_dim, general_reg_src=ue._ISA_TMP_REG)
                 else:
                     ue.sram_to_accelerator_memory(SA_KV_K, dst_k_base + pos_start * row_bytes, full_head_dim)
                     ue.sram_to_accelerator_memory(SA_KV_V, dst_v_base + pos_start * row_bytes, full_head_dim)
@@ -3320,8 +3315,7 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
             ue.accelerator_memory_to_sram(src, SA_QTMP, full_head_dim)
             if ue._compile_mode:
                 ue.generate_instruction_add_imm(ue._ISA_POS_K_REG, ue_35bit_addr_shifter(dst_base), ue._ISA_TMP_REG)
-                ue.sram_to_accelerator_memory(SA_QTMP, dst_base, full_head_dim)
-                ue.overwrite_instruction_with_general_register(ue._ISA_TMP_REG)
+                ue.sram_to_accelerator_memory(SA_QTMP, dst_base, full_head_dim, general_reg_src=ue._ISA_TMP_REG)
             else:
                 ue.sram_to_accelerator_memory(SA_QTMP, dst_base + pos_start * row_bytes, full_head_dim)
         if getattr(ue, "_s7_full_attn_active", False):
@@ -3386,8 +3380,7 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
             out_h    = ATTN_CONCAT_DRAM + h * full_head_dim * BF16
             if ue._compile_mode:
                 ue.generate_instruction_add_imm(ue._ISA_POS_K_REG, ue_35bit_addr_shifter(attn_row_base), ue._ISA_TMP_REG)
-                ue.accelerator_memory_to_sram(attn_row_base, SA_ATTN, full_head_dim)
-                ue.overwrite_instruction_with_general_register(ue._ISA_TMP_REG)
+                ue.accelerator_memory_to_sram(attn_row_base, SA_ATTN, full_head_dim, general_reg_src=ue._ISA_TMP_REG)
             else:
                 ue.accelerator_memory_to_sram(attn_row_base + pos_start * row_bytes, SA_ATTN, full_head_dim)
             ue.accelerator_memory_to_sram(sig_h, SB_GATE, full_head_dim)

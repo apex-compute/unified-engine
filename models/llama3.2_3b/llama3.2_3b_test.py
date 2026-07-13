@@ -843,8 +843,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                         self.LAYER0_K_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
                     self.generate_instruction_add_imm(
                         self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x10000, 0, ahd)
-                    self.overwrite_instruction_with_general_register(self.TMP_REG)
+                    self.sram_to_accelerator_memory(0x10000, 0, ahd, general_reg_src=self.TMP_REG)
 
                     # Gather valid K history → LAYER0_FLASH_K_DRAM; loop count = gpr_bucket_idx
                     # so only current_seq_len tokens are copied, not the full MAX_CONTEXT_SIZE.
@@ -863,8 +862,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                         self.LAYER0_FLASH_V_DRAM + kv_h * ahd * bpe, 0x20000, ahd)
                     self.generate_instruction_add_imm(
                         self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x20000, 0, ahd)
-                    self.overwrite_instruction_with_general_register(self.TMP_REG)
+                    self.sram_to_accelerator_memory(0x20000, 0, ahd, general_reg_src=self.TMP_REG)
 
                     # Gather valid V history → LAYER0_FLASH_V_DRAM + k_size; same dynamic size.
                     # Offset by k_size to avoid the v_proj output living at [0..k_size-1].
