@@ -419,6 +419,26 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.LAYER0_MLP_DOWN_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.FINAL_NORM_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.LOGITS_DRAM     = self.allocate_tensor_dram(self.VOCAB_SIZE * bpe)
+
+        # Zero the K/V cache. NOT cosmetic: this DRAM cannot be READ until it has been
+        # WRITTEN at least once -- an untouched address returns EIO from dma_read, it does
+        # not return garbage. (Verified: a 4KB read at 0xE0068000 fails, the identical read
+        # after writing 4KB of zeros there succeeds.)
+        #
+        # The prefix only fills the first prefix_len rows of each (layer, head) slab, but
+        # these buffers are sized for max_seq_len, so the tail of every slab stays virgin.
+        # dump_prefix_kv reads the whole kv_total span and used to walk straight into it --
+        # that is the source of the two `dma_read error: [Errno 5]` lines, and the reason
+        # the failing offsets were spaced exactly KV_LAYER_STRIDE apart.
+        # Written in explicit 1MB chunks of one small buffer: _dma_write_retry's own
+        # chunking indexes a torch tensor by BYTE offset (data.flatten()[offset:...]),
+        # which desyncs past the first chunk for a multi-MB tensor.
+        _chunk = self.DMA_CHUNK_BYTES
+        zeros_kv = torch.zeros(_chunk // bpe, dtype=torch.bfloat16)
+        for _kv_base in (self.LAYER0_K_DRAM, self.LAYER0_V_DRAM):
+            for _off in range(0, kv_total, _chunk):
+                _n = min(_chunk, kv_total - _off)
+                self._dma_write_retry(DMA_DEVICE_H2C, _kv_base + _off, zeros_kv, _n)
         if IS_VLM:
             # NOT in params.bin — must be re-allocated here (see skill gotchas).
             # store_identity_matrix always produces a fixed UE_VECTOR_SIZE(64)x64 identity;
@@ -510,62 +530,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f"{proj}_data"],
             OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
             SCALE_DRAM_ADDR=la[f"{proj}_scale"], **kw)
-
-    # ==================== dual-engine (--dual) ==============================
-    def _ensure_dual_engine(self):
-        """Lazily create the second engine (ue1) -- a bare UnifiedEngine bound to
-        the engine-1 register window (UE_0_BASE_ADDR + 0x10000). It SHARES all
-        DRAM with self (ue0): weights/activations are read/written at the same
-        physical addresses (matmat_mul_two_cores passes explicit addresses). Only
-        ue1's *program* stream needs its own region so the two instruction streams
-        don't collide. Also reserves a fixed scratch program region on ue0 for the
-        single-engine 'glue' segments so they don't fight the two-core allocator."""
-        if getattr(self, "_ue1", None) is not None:
-            return self._ue1
-        import user_dma_core as _udc
-        ue1 = _udc.UnifiedEngine(BASE_ADDR=_udc.UE_0_BASE_ADDR + 0x00010000)
-        # ue1 program region: 0xF0000000..0xF8000000 (below ue0's 0xF8000000 base,
-        # above the tensor arena ~0xEE000000). 128MB, plenty for compact PBI programs.
-        ue1._next_program_dram_addr = 0xF0000000
-        self._ue1 = ue1
-        return ue1
-
-    def _glue_exec(self, emit_fn, label="glue", timeout=120.0):
-        """Run a single-engine segment on ue0: capture emit_fn()'s ops + a halt,
-        DMA to the CURRENT program-allocator addr, execute, wait. The program MUST
-        be written to get_program_dram_addr() because flash_attention_core computes
-        its subroutine jump addresses relative to that base -- writing anywhere else
-        makes every flash jump land in garbage (hang). emit_fn must therefore also
-        use self.get_program_dram_addr() as its prog_base, and it stays constant
-        through emit (we allocate only after). Mirrors _compile_and_run."""
-        self.start_capture()
-        emit_fn()
-        self.generate_instruction_halt()
-        prog_addr = self.get_program_dram_addr()
-        all_bytes = bytearray()
-        for inst in self.capture_buffer:
-            all_bytes.extend(inst.get_bytes())
-        self._dma_write_retry(DMA_DEVICE_H2C, prog_addr, all_bytes, len(all_bytes))
-        self.allocate_program_dram(len(all_bytes))
-        self.clear_capture_buffer()
-        self.stop_capture()
-        self.start_execute_from_dram(prog_addr)
-        self._wait_with_heartbeat(label, timeout=timeout)
-
-    def _mm2(self, M, K, N, A, proj, la, OUT, bias=None, gelu=False, silu=False, m0=None):
-        """Two-core IF4 matmul: shard M rows across ue0+ue1. Mirrors _matmul's IF4
-        args. m0 = rows for engine0 (default M//2, rounded to a 64 boundary for
-        bucket alignment). Both engines read the same quantized B + scale."""
-        assert self.DUAL, "_mm2 (two-core) called outside --dual mode"
-        ue1 = self._ensure_dual_engine()
-        if m0 is None:
-            m0 = ((M // 2) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE or UE_VECTOR_SIZE
-        return type(self).matmat_mul_two_cores(
-            ue0=self, ue1=ue1, M=M, K=K, N=N,
-            A_DRAM_ADDR=A, B_DRAM_ADDR=la[f"{proj}_data"], OUTPUT_DRAM_ADDR=OUT,
-            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=la[f"{proj}_scale"],
-            C_DRAM_ADDR=bias, bias_mode=("broadcast_N" if bias is not None else "broadcast_N"),
-            gelu_enable=gelu, silu_enable=silu, m_engine0=m0, use_pbi=True)
 
     def _dram_copy(self, size_bytes, src, dst):
         """DRAM->DRAM copy via a SRAM roundtrip, chunked through URAM_A. Used to
@@ -974,132 +938,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         return self.LAYER0_LAYER_OUT_DRAM
 
-    def compile_prefix_dual(self, seq_len, valid_len=None):
-        """DUAL-engine prefix (mutually exclusive with compile_prefix; only reached
-        when self.DUAL). Same 18-layer Gemma-2B math, but segmented: each layer's
-        ATTENTION block (norm -> QKV -> flash -> O -> residual -> ln2) runs as one
-        single-engine glue segment on ue0 (attention couples all tokens -- not
-        worth sharding across engines for its ~11% of FLOPs), and the MLP matmuls
-        (the 88.7%) are sharded across BOTH engines via _mm2 (matmat_mul_two_cores).
-        All ops communicate through DRAM and every segment/two-core launch is
-        synchronous (wait), so DRAM state flows correctly between them.
-
-        v1 -- validate on hardware against the single-engine 29dB baseline."""
-        assert self.DUAL, "compile_prefix_dual reached without DUAL mode"
-        S, H, I, D = seq_len, self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE, self.HEAD_DIM
-        NH, NKV, KV = self.NUM_HEADS, self.NUM_KV_HEADS, self.NUM_KV_HEADS * self.HEAD_DIM
-        assert NKV == 1, "compile_prefix_dual assumes pure MQA (num_kv_heads=1)"
-        bpe = 2
-        FF_HALF = I // 2
-        valid_len = valid_len if valid_len is not None else S
-
-        self._ensure_dual_engine()
-        self.prefix_bias_dram = store_weight(self, self.build_prefix_attn_bias(S, valid_len))
-        self.LAYER0_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(S * H * bpe)
-        self.LAYER0_LAYER_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
-        # Prefix unified-attention scratch (per-head batch=S, aligned=S, head_dim=D):
-        # V.T (D*S) + score/P (S*S) + scaled_q (S*D) elements, bf16 -- sized to the
-        # unified_attention_core_dynamic scratch contract (larger than the old flash
-        # scratch by the S*S score block).
-        self.PREFIX_UATTN_SCRATCH_DRAM = self.allocate_tensor_dram((D * S + S * S + S * D) * bpe)
-
-        print(f"  [prefix-dual] {self.NUM_LAYERS} layers, seq_len={S}, valid_len={valid_len} "
-              f"(attention single-engine, MLP two-core)")
-        t0 = time.perf_counter()
-
-        for layer_idx in range(self.NUM_LAYERS):
-            la = self.lm_layer_addrs[layer_idx]
-            h_in = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_LAYER_OUT_DRAM
-
-            # ---------- ATTENTION: one single-engine segment on ue0 ----------
-            def _emit_attn(la=la, h_in=h_in):
-                self.reset_isa_reg_counter()
-                self.reset_inst_ptr_counter()
-                prefix_S_reg = self.alloc_isa_reg()
-                self.generate_instruction_add_set(prefix_S_reg, S)
-
-                # 1. pre-attn RMSNorm
-                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,
-                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                                         GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=prefix_S_reg)
-                # 2. Q/K/V (single-engine; MQA K/V project to one head_dim)
-                self._matmul(M=S, K=H, N=H, A=self.LAYER0_PRE_NORM_DRAM, proj="q", la=la,
-                             OUT=self.LAYER0_Q_DRAM, gpr_M_reg=prefix_S_reg)
-                self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="k", la=la,
-                             OUT=self.LAYER0_K_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
-                self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="v", la=la,
-                             OUT=self.LAYER0_V_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
-                # 3. permute Q -> (heads, seq, head_dim)
-                smart_bf16_permute_core(self, (S, NH, D), [1, 0, 2],
-                                         self.LAYER0_Q_DRAM, self.LAYER0_Q_PERM_DRAM)
-                # 4. stage K/V into persistent cache
-                k_cache_addr = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
-                v_cache_addr = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
-                self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, k_cache_addr)
-                self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr)
-                # 5. MQA attention (per head, inline unified_attention_core_dynamic):
-                # batch=S queries x aligned_seq_len=S shared MQA K/V, (S,S) additive
-                # bias used directly, output written straight into this head's slot.
-                head_bytes = S * D * bpe
-                for h in range(NH):
-                    self.unified_attention_core_dynamic(
-                        batch=S, aligned_seq_len=S, head_dim=D,
-                        Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + h * head_bytes,
-                        K_DRAM_ADDR=self.LAYER0_K_PROJ_DRAM, V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM,
-                        BIAS_DRAM_ADDR=self.prefix_bias_dram,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
-                        SCRATCH_DRAM_ADDR=self.PREFIX_UATTN_SCRATCH_DRAM,
-                        IDENTITY_DRAM_ADDR=self.identity_addr)
-                # 6. permute attn output -> (seq, heads*head_dim)
-                smart_bf16_permute_core(self, (NH, S, D), [1, 0, 2],
-                                         self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
-                # 7. O proj + residual
-                self._matmul(M=S, K=H, N=H, A=self.LAYER0_ATTN_RESULT_DRAM, proj="o", la=la,
-                             OUT=self.LAYER0_O_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
-                eltwise_add_core_dram(self, S * H, h_in, self.LAYER0_O_PROJ_DRAM, self.LAYER0_ATTN_RESIDUAL_DRAM)
-                # 8. pre-FFW RMSNorm (feeds the two-core MLP after this segment)
-                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.LAYER0_ATTN_RESIDUAL_DRAM,
-                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                                         GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=prefix_S_reg)
-                # main body ends; _glue_exec appends the trailing HALT. Attention is
-                # now inline (unified_attention_core_dynamic) so there is no shared
-                # flash subroutine to compile/patch below.
-                self.release_isa_reg()  # prefix_S_reg
-
-            self._glue_exec(_emit_attn, label=f"prefix-dual L{layer_idx} attn")
-
-            # ---------- MLP: matmuls two-core, muls/adds single-engine ----------
-            pre = self.LAYER0_PRE_NORM_DRAM
-            # low half
-            self._mm2(S, H, FF_HALF, pre, "gate_lo", la, self.LAYER0_MLP_GATE_LO_DRAM, gelu=True)
-            self._mm2(S, H, FF_HALF, pre, "up_lo", la, self.LAYER0_MLP_UP_LO_DRAM)
-            self._glue_exec(lambda: eltwise_mul_core_dram(
-                self, S * FF_HALF, self.LAYER0_MLP_GATE_LO_DRAM, self.LAYER0_MLP_UP_LO_DRAM,
-                self.LAYER0_MLP_MULT_LO_DRAM), label=f"prefix-dual L{layer_idx} mul_lo")
-            self._mm2(S, FF_HALF, H, self.LAYER0_MLP_MULT_LO_DRAM, "down_lo", la, self.LAYER0_MLP_DOWN_LO_OUT_DRAM)
-            # high half
-            self._mm2(S, H, FF_HALF, pre, "gate_hi", la, self.LAYER0_MLP_GATE_HI_DRAM, gelu=True)
-            self._mm2(S, H, FF_HALF, pre, "up_hi", la, self.LAYER0_MLP_UP_HI_DRAM)
-            self._glue_exec(lambda: eltwise_mul_core_dram(
-                self, S * FF_HALF, self.LAYER0_MLP_GATE_HI_DRAM, self.LAYER0_MLP_UP_HI_DRAM,
-                self.LAYER0_MLP_MULT_HI_DRAM), label=f"prefix-dual L{layer_idx} mul_hi")
-            self._mm2(S, FF_HALF, H, self.LAYER0_MLP_MULT_HI_DRAM, "down_hi", la, self.LAYER0_MLP_DOWN_HI_OUT_DRAM)
-            # combine halves + MLP residual
-            self._glue_exec(lambda: (
-                eltwise_add_core_dram(self, S * H, self.LAYER0_MLP_DOWN_LO_OUT_DRAM,
-                                       self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.LAYER0_MLP_DOWN_DRAM),
-                eltwise_add_core_dram(self, S * H, self.LAYER0_ATTN_RESIDUAL_DRAM,
-                                       self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_LAYER_OUT_DRAM),
-            ), label=f"prefix-dual L{layer_idx} mlp_residual")
-
-        print(f"  [prefix-dual] done in {time.perf_counter()-t0:.1f}s")
-        # Reconcile the action-expert interface (same as compile_prefix's tail).
-        self.PREFIX_SEQ_LEN = S
-        self.prefix_valid_len = valid_len
-        self.prefix_k_cache_addr = [self.LAYER0_K_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
-        self.prefix_v_cache_addr = [self.LAYER0_V_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
-        return self.LAYER0_LAYER_OUT_DRAM
-
     # ---- prefill -----------------------------------------------------------
     def compile_prefill(self, seq_len):
         """Standard decoder loop driven by self.OPS. Fill _matmul/weight_init first.
@@ -1311,7 +1149,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_NUM_DENOISE_STEPS = 10
     AE_LOOP_TRIP_OVERRIDE = None  # debug knob, see compile_denoise_loop's loop_start call
     DENOISE_STEP0_PROBE = False  # if True, snapshot step-0 intermediates for reference diff
-    DUAL = False  # --dual: shard matmuls across both engines via matmat_mul_two_cores (~2x)
 
     # ---- action-expert weights ---------------------------------------------
     def weight_init_action_expert(self):
@@ -2153,31 +1990,26 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         PK = self.VIS_PATCH_K
         outs = []
 
-        # COMPILE PER SLOT -- do NOT compile once and re-execute.
-        # The encoder program is a pure function of (fixed weights, VIS_PIXEL_IN_DRAM),
-        # so re-executing one compiled program per slot LOOKS free... but it is not
-        # deterministic on this hardware: the encoder's inline PBI attention corrupts
-        # on any run after the FIRST run of a given program (same known PBI
-        # back-to-back behavior seen elsewhere). MEASURED: feeding the IDENTICAL image
-        # into slot0 and slot1 of a compile-once/execute-twice run returned
-        # exec#1 vs exec#2 SNR = 8.80dB, cos = 0.9396, max|diff| = 44.0 -- the second
-        # execution is simply wrong. In the real 3-camera LIBERO run that made the
-        # WRIST image (slot 1, the 2nd execution) come back at cos 0.66 / ~2dB, which
-        # then poisoned the whole prefix K/V and capped end-to-end action SNR.
-        # Recompiling per slot makes every execution the first execution of its own
-        # program. Compile is only ~0.5s, so this costs ~1s total.
-        global _SILENT_MODE
-        def _compile_fresh_encoder():
-            _original_print("  [vision encoder] compiling...", end="\r", flush=True)
-            t_compile0 = time.perf_counter()
-            global _SILENT_MODE
-            _SILENT_MODE = True
-            try:
-                addr = self.compile_encoder()
-            finally:
-                _SILENT_MODE = False
-            _original_print(f"  [vision encoder] compiled in {time.perf_counter()-t_compile0:.1f}s" + " " * 20)
-            return addr
+        # layer_norm_core_dram treats ZEROS_DRAM_ADDR as SCRATCH, not as a read-only
+        # constant: it WRITES into vis_zeros_addr. The encoder calls it 55x (2 per
+        # layer x 27 + the final encoder_norm), so after one execution the buffer no
+        # longer holds zeros and EVERY LayerNorm of the next execution starts from
+        # garbage, compounding over 27 layers.
+        #
+        # MEASURED (md5 of every constant the encoder reads, before vs after one
+        # execution): vis_zeros is the ONLY region that changes -- identity matrix,
+        # zero-bias, pos-embed and all IF4 weights come back clean. That single dirty
+        # buffer is what made the 2nd vision execution wrong: same image in slot0 and
+        # slot1 returned exec#1-vs-exec#2 SNR 9.31dB, cos 0.9396, output range
+        # compressed [-206,35] -> [-192,30] (structurally right, systematically shrunk
+        # -- a broken-LayerNorm signature, not corruption).
+        #
+        # So: re-zero it before every execution. This is also why the encoder can go
+        # back to COMPILE-ONCE -- the old per-slot recompile was chasing this bug and
+        # never fixed it (both slots stayed wrong), while burning ~106MB of program
+        # DRAM per slot.
+        zeros_n = max(self.VIS_H, self.VIS_I)
+        zeros_t = torch.zeros(zeros_n, dtype=torch.bfloat16)
 
         # Skip the encoder for any all-zero (padding) image slot -- e.g. LIBERO's
         # 3rd camera, which openpi masks out (image_mask=False for pi0.5). Its 256
@@ -2198,12 +2030,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             pixel_t = torch.from_numpy(patches_pad).to(torch.bfloat16)
             self.dma_write(DMA_DEVICE_H2C, self.VIS_PIXEL_IN_DRAM, pixel_t, S * PK * 2)
 
-            prog_addr = _compile_fresh_encoder()   # fresh program per slot -- see above
+            # Restore the LayerNorm zeros scratch -- the previous execution dirtied it.
+            self.dma_write(DMA_DEVICE_H2C, self.vis_zeros_addr, zeros_t, zeros_n * 2)
+
+            prog_addr = self._compile_once("encoder", self.compile_encoder, label="vision encoder")
             self.start_execute_from_dram(prog_addr)
             self._wait_with_heartbeat(f"vision slot {i}", timeout=180.0)
 
             buf = bytearray(S * HO * 2)
-            self.dma_read(DMA_DEVICE_C2H, self.VIS_HEAD_OUT_DRAM, buf, len(buf))
+            self._dma_read_checked(self.VIS_HEAD_OUT_DRAM, buf, len(buf))
             out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, HO).clone()
             outs.append(out)
             print(f"  [vision] slot {i} done")
@@ -2274,7 +2109,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 ("V", self.prefix_v_cache_addr[layer], v_cache[layer]),
             ):
                 buf = bytearray(P * D * 2)
-                self.dma_read(DMA_DEVICE_C2H, hw_addr, buf, len(buf))
+                self._dma_read_checked(hw_addr, buf, len(buf))
                 hw = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(P, D).float()[:valid_len]
                 cpu = cpu_t.reshape(-1, D).float()[:valid_len]
                 noise = (hw - cpu).pow(2).sum().sqrt()
@@ -2318,7 +2153,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             addr = self.PREFIX_LAYER_SNAPSHOT_DRAM[layer]
             S, H = self.PREFIX_SEQ_LEN, self.HIDDEN_SIZE
             buf = bytearray(S * H * 2)
-            self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+            self._dma_read_checked(addr, buf, len(buf))
             hw_layer = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, H).float()[:valid_len]
 
             noise = (hw_layer - cpu_layer).pow(2).sum().sqrt()
@@ -2351,7 +2186,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         def _hw(name, numel, shape):
             buf = bytearray(numel * 2)
-            self.dma_read(DMA_DEVICE_C2H, snap[name], buf, len(buf))
+            self._dma_read_checked(snap[name], buf, len(buf))
             return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(shape).clone().float()
 
         def _snr(hw_t, cpu_t):
@@ -2476,7 +2311,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         first_bad = None
         for i, addr in enumerate(getattr(self, "VIS_LAYER_SNAPSHOT_DRAM", [])):
             buf = bytearray(S_vis * H_vis * 2)
-            self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+            self._dma_read_checked(addr, buf, len(buf))
             out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S_vis, H_vis).float()
             n_nan, n_inf = torch.isnan(out).sum().item(), torch.isinf(out).sum().item()
             flag = " <-- FIRST BAD" if (n_nan or n_inf) and first_bad is None else ""
@@ -2488,7 +2323,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         S_ae, AD = self.AE_ACTION_HORIZON_PADDED, self.AE_XT_WIDTH  # snapshots are 64-wide
         for i, addr in enumerate(getattr(self, "AE_STEP_SNAPSHOT_DRAM", [])):
             buf = bytearray(S_ae * AD * 2)
-            self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
+            self._dma_read_checked(addr, buf, len(buf))
             out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S_ae, AD).float()
             n_nan, n_inf = torch.isnan(out).sum().item(), torch.isinf(out).sum().item()
             flag = " <-- FIRST BAD" if (n_nan or n_inf) and first_bad is None else ""
@@ -2508,8 +2343,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         kv_total = self.NUM_LAYERS * self.KV_LAYER_STRIDE
         buf_k = bytearray(kv_total)
         buf_v = bytearray(kv_total)
-        self.dma_read(DMA_DEVICE_C2H, self.LAYER0_K_DRAM, buf_k, kv_total)
-        self.dma_read(DMA_DEVICE_C2H, self.LAYER0_V_DRAM, buf_v, kv_total)
+        self._dma_read_checked(self.LAYER0_K_DRAM, buf_k, kv_total)
+        self._dma_read_checked(self.LAYER0_V_DRAM, buf_v, kv_total)
         mcols = np.array(getattr(self, "prefix_masked_cols", []), dtype=np.int64).reshape(-1, 2)
         np.savez(path, k=np.frombuffer(bytes(buf_k), dtype=np.uint16),
                   v=np.frombuffer(bytes(buf_v), dtype=np.uint16),
@@ -2517,48 +2352,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                   masked_cols=mcols)
         print(f"[dump_prefix_kv] wrote {path} ({kv_total*2/1024/1024:.1f} MB K + V, "
               f"seq_len={self.PREFIX_SEQ_LEN}, valid_len={self.prefix_valid_len})")
-        # Keep an in-memory copy of exactly what was just read, so a later
-        # verify_prefix_kv() call in the SAME run/process can diff against it
-        # without a disk round-trip (rules out any save/load bug too).
-        self._prefix_kv_snapshot = (bytes(buf_k), bytes(buf_v))
-
-    def verify_prefix_kv(self, label=""):
-        """Re-read LAYER0_K_DRAM/LAYER0_V_DRAM right now and diff against the
-        snapshot dump_prefix_kv took earlier in this SAME run/process. Tests
-        whether anything between compile_prefix finishing and this call
-        clobbers the prefix K/V cache in place -- if this reports a mismatch,
-        the corruption happens between prefix and here (e.g. a DRAM-address
-        collision from a later allocation); if it reports clean, the K/V cache
-        itself is still intact at this point and the corruption (if any) must
-        happen later, inside compile_denoise_loop's own execution."""
-        assert hasattr(self, "_prefix_kv_snapshot"), \
-            "verify_prefix_kv() called with no prior dump_prefix_kv() snapshot in this run"
-        kv_total = self.NUM_LAYERS * self.KV_LAYER_STRIDE
-        buf_k = bytearray(kv_total)
-        buf_v = bytearray(kv_total)
-        self.dma_read(DMA_DEVICE_C2H, self.LAYER0_K_DRAM, buf_k, kv_total)
-        self.dma_read(DMA_DEVICE_C2H, self.LAYER0_V_DRAM, buf_v, kv_total)
-        snap_k, snap_v = self._prefix_kv_snapshot
-        now_k, now_v = bytes(buf_k), bytes(buf_v)
-        k_match = now_k == snap_k
-        v_match = now_v == snap_v
-        if k_match and v_match:
-            print(f"[verify_prefix_kv{f' {label}' if label else ''}] MATCH -- prefix K/V cache "
-                  f"is byte-identical to the post-compile_prefix snapshot")
-        else:
-            k_arr = torch.frombuffer(now_k, dtype=torch.bfloat16).float()
-            snap_k_arr = torch.frombuffer(snap_k, dtype=torch.bfloat16).float()
-            v_arr = torch.frombuffer(now_v, dtype=torch.bfloat16).float()
-            snap_v_arr = torch.frombuffer(snap_v, dtype=torch.bfloat16).float()
-            k_diff = (k_arr - snap_k_arr).abs()
-            v_diff = (v_arr - snap_v_arr).abs()
-            print(f"[verify_prefix_kv{f' {label}' if label else ''}] MISMATCH -- prefix K/V cache "
-                  f"changed since compile_prefix finished! "
-                  f"K: match={k_match} max_abs_diff={k_diff.max().item():.4f} "
-                  f"n_diff={int((k_diff > 0).sum().item())}/{k_diff.numel()} "
-                  f"V: match={v_match} max_abs_diff={v_diff.max().item():.4f} "
-                  f"n_diff={int((v_diff > 0).sum().item())}/{v_diff.numel()}")
-
     def verify_denoise_step0(self, kv_npz_path, device="cuda"):
         """Diff the FPGA's step-0 action-expert intermediates against a torch
         reference computed with the SAME noise and the SAME prefix K/V (loaded
@@ -2575,7 +2368,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         def _read(addr, numel):
             buf = bytearray(numel * 2)
-            self.dma_read(DMA_DEVICE_C2H, addr, buf, numel * 2)
+            self._dma_read_checked(addr, buf, numel * 2)
             return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).float()
 
         fpga_in   = _read(self.AE_P0_ACTION_IN, S * H).reshape(S, H)[:AH]
@@ -2759,7 +2552,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self._wait_with_heartbeat(f"sanity_matmul_{'pbi' if use_pbi else 'legacy'}", timeout=30.0)
 
         buf = bytearray(M * N * bpe)
-        self.dma_read(DMA_DEVICE_C2H, out_addr, buf, len(buf))
+        self._dma_read_checked(out_addr, buf, len(buf))
         hw_out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(M, N).clone().float()
         cpu_out = (A.float() @ B.float().T)
         return hw_out, cpu_out
@@ -2861,7 +2654,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         return (layer + io) * self.AE_NUM_DENOISE_STEPS
 
     def run_inference(self, images_hwc, prompt_tokens, noise32=None, skip_prefix=False, dump_prefix_path=None,
-                       verify_prefix_kv=False, sanity_check=False):
+                       sanity_check=False):
         """Full forward pass on real hardware. images_hwc: list of 3 (224,224,3)
         float32 arrays in [-1,1]. prompt_tokens: 1-D list/array of token ids.
         Returns (10,32) numpy action array (caller slices [:, :7]).
@@ -2895,23 +2688,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             t1 = time.perf_counter()
             seq_len = _CFG["model"]["prefill_max_seq_len"]
             valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
-            if self.DUAL:
-                self.compile_prefix_dual(seq_len, valid_len)   # dual-engine path only
+            # COMPILE-ONCE: the prefix program is invariant to valid_len (M is
+            # always seq_len; valid_len only shapes the DMA'd bias DATA). Compile
+            # the first obs, then re-DMA just the fresh bias mask to the SAME
+            # baked bias addr and re-execute -- no re-alloc, no 4GB march.
+            if not getattr(self, "_prefix_compiled", False):
+                self._prefix_prog_addr = self._compile_once(
+                    "prefix", lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
+                self._prefix_bias_dram = self.prefix_bias_dram
+                self._prefix_compiled = True
             else:
-                # COMPILE-ONCE: the prefix program is invariant to valid_len (M is
-                # always seq_len; valid_len only shapes the DMA'd bias DATA). Compile
-                # the first obs, then re-DMA just the fresh bias mask to the SAME
-                # baked bias addr and re-execute -- no re-alloc, no 4GB march.
-                if not getattr(self, "_prefix_compiled", False):
-                    self._prefix_prog_addr = self._compile_once(
-                        "prefix", lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
-                    self._prefix_bias_dram = self.prefix_bias_dram
-                    self._prefix_compiled = True
-                else:
-                    bias = self.build_prefix_attn_bias(seq_len, valid_len).contiguous()
-                    self.dma_write(DMA_DEVICE_H2C, self._prefix_bias_dram,
-                                   bias.flatten(), bias.numel() * 2)
-                self._execute(self._prefix_prog_addr, label="prefix", timeout=250.0)
+                bias = self.build_prefix_attn_bias(seq_len, valid_len).contiguous()
+                self.dma_write(DMA_DEVICE_H2C, self._prefix_bias_dram,
+                               bias.flatten(), bias.numel() * 2)
+            self._execute(self._prefix_prog_addr, label="prefix", timeout=250.0)
             t_prefix = time.perf_counter() - t1
             self._report_gflops(f"prefix ({seq_len} tok)", self._prefix_flops(), t_prefix)
 
@@ -2939,16 +2729,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             noise32[:10, :7] = np.random.RandomState(0).randn(10, 7)
         self.dma_write(DMA_DEVICE_H2C, self.AE_XT_DRAM,
                         torch.from_numpy(noise32).to(torch.bfloat16), S * AD * 2)
-        if verify_prefix_kv and not skip_prefix:
-            # Re-read LAYER0_K_DRAM/LAYER0_V_DRAM right here (after
-            # tensor_init_action_expert's own DRAM allocations, right before
-            # compile_denoise_loop's capture starts) and diff against the
-            # snapshot dump_prefix_kv took right after compile_prefix -- tests
-            # whether the prefix K/V cache is still intact at this exact point
-            # in the SAME run that reliably NaNs, vs. the --debug run which
-            # only ever re-loads a cache that was never live through this
-            # sequence of allocations/executions to begin with.
-            self.verify_prefix_kv("right before compile_denoise_loop")
         # compile_denoise_loop is statically unrolled (10 steps x 18 layers = 180
         # static layer bodies, 1440 flash-attention jump sites) -- same proven
         # pattern as compile_prefix/compile_encoder. A loop_start/loop_end runtime
@@ -2983,7 +2763,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             for layer in (0, self.AE_LAYERS - 1):
                 for name, addr in (("k", self.ae_k_combined[layer]), ("v", self.ae_v_combined[layer])):
                     buf_kv = bytearray(Tkv * D_chk * 2)
-                    self.dma_read(DMA_DEVICE_C2H, addr, buf_kv, len(buf_kv))
+                    self._dma_read_checked(addr, buf_kv, len(buf_kv))
                     full = torch.frombuffer(bytes(buf_kv), dtype=torch.bfloat16).reshape(Tkv, D_chk).float()
                     for tag, sl in (("prefix", full[:P_chk]), ("suffix", full[P_chk:])):
                         print(f"  [ae_kv_check] layer{layer:2d} {name} {tag}: "
@@ -2991,7 +2771,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                               f"min={sl.min():.4f} max={sl.max():.4f}")
 
         buf = bytearray(S * AD * 2)
-        self.dma_read(DMA_DEVICE_C2H, self.AE_XT_DRAM, buf, len(buf))
+        self._dma_read_checked(self.AE_XT_DRAM, buf, len(buf))
         out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, AD).float().numpy()
         actions = out[:10, :7]
 
@@ -3016,7 +2796,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # coincidence: the small 745KB vision program always fit under the limit,
     # while the ~684MB prefix program never does, regardless of address).
     # Real fix: chunk large writes, exactly like parakeet/mobilenetv2 already do.
-    DMA_CHUNK_BYTES = 1 * 1024 * 1024  # 1 MB per chunk
+    DMA_CHUNK_BYTES = 1 * 1024 * 1024        # 1 MB per chunk (writes)
+    DMA_READ_CHUNK_BYTES = 256 * 1024        # 256 KB per chunk (reads -- see _dma_read_checked)
+    DMA_READ_MIN_CHUNK_BYTES = 4 * 1024      # floor for the bisect-on-EIO fallback
 
     def _dma_write_retry(self, device, address, buffer, size, attempts=5):
         """Chunked + retried DMA write. A failed/incomplete program-blob write
@@ -3039,6 +2821,63 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 else data.flatten()[offset:offset + chunk_size]
             self._dma_write_retry(device, address + offset, chunk, chunk_size, attempts=attempts)
             offset += chunk_size
+        return size
+
+    def _dma_read_checked(self, address, buffer, size, attempts=5, label=""):
+        """Chunked + retried + CHECKED DMA read -- the read-side mirror of
+        _dma_write_retry, and just as non-optional.
+
+        The raw dma_read() returns -1 on failure after merely PRINTING the errno;
+        it does not raise. Callers were passing a freshly-allocated bytearray (which
+        is zero-filled) and ignoring that -1, so a failed read looked exactly like
+        "the hardware computed all zeros" -- silently, with a success message.
+
+        This bit us for real: dump_prefix_kv issued two 9 MB reads, the driver
+        rejected both with EIO (transfer-size limit -- reads <=1MB succeed), and it
+        wrote an 18 MB .npz of pure zeros while printing "wrote 18.0 MB K + V".
+        Every downstream consumer then compared against zeros: the prefix K/V SNR
+        report read a flat 0.00dB on all 18 layers (K and V), which we very nearly
+        mis-diagnosed as a model bug. --debug and --probe-step0 would have denoised
+        against a zero K/V cache too.
+
+        The EIO itself is a driver-side limit, not a model bug: dma_read() lowers to a
+        single os.read(fd, size) with no chunking, and the XDMA C2H path rejects some
+        (address, size) combinations outright. MEASURED: at LAYER0_K_DRAM (0xE0000000)
+        reads of 128B/4KB/64KB/256KB succeed but 1MB EIOs, while the *same* 1MB read
+        succeeds at VIS_HEAD_OUT_DRAM -- so it is an address/size interaction, not a
+        flat transfer cap, and no single chunk size is safe everywhere (a 9MB sweep at
+        256KB still failed on 18 of 36 chunks).
+
+        So don't try to model the driver's bad windows -- bisect around them. Start at
+        DMA_READ_CHUNK_BYTES; if a chunk keeps failing, halve it and re-read that span,
+        down to DMA_READ_MIN_CHUNK_BYTES (4KB succeeded at every address we ever probed).
+        Only if even a 4KB read fails do we RAISE. Never return a partially-filled
+        buffer to a caller that can't tell it from real data.
+        """
+        mv = memoryview(buffer)
+        offset = 0
+        chunk_bytes = self.DMA_READ_CHUNK_BYTES
+        tag = f" {label}" if label else ""
+        while offset < size:
+            n = min(chunk_bytes, size - offset)
+            chunk = bytearray(n)
+            for i in range(attempts):
+                rc = self.dma_read(DMA_DEVICE_C2H, address + offset, chunk, n)
+                if rc == n:
+                    break
+            else:
+                if chunk_bytes > self.DMA_READ_MIN_CHUNK_BYTES:
+                    chunk_bytes //= 2
+                    print(f"  [dma_read_checked{tag}] EIO at 0x{address + offset:X} "
+                          f"(+{offset}/{size}B) -- halving chunk to {chunk_bytes >> 10}KB")
+                    continue      # retry this same offset with the smaller chunk
+                raise RuntimeError(
+                    f"dma_read{tag} FAILED at 0x{address + offset:X} (offset {offset}/{size}B) "
+                    f"even at the {self.DMA_READ_MIN_CHUNK_BYTES >> 10}KB floor after {attempts} "
+                    f"attempts -- refusing to return a zero-filled buffer that would silently "
+                    f"masquerade as real data")
+            mv[offset:offset + n] = chunk
+            offset += n
         return size
 
     def _wait_with_heartbeat(self, label, timeout=180.0, heartbeat_every=10.0):
@@ -3176,13 +3015,6 @@ def main():
     ap.add_argument("--steps", type=int, default=None,
                      help="override AE_NUM_DENOISE_STEPS (e.g. --steps 1 to stop after the first "
                           "Euler step, since step0 already NaNs -- no point paying for all 10).")
-    ap.add_argument("--verify-prefix-tensor", action="store_true",
-                     help="in a full (non-debug) run, re-read the prefix K/V cache right before "
-                          "compile_denoise_loop starts and diff it byte-for-byte against the "
-                          "snapshot taken right after compile_prefix finished -- proves whether "
-                          "the SAME K/V tensor that fed a clean --debug denoise run is still "
-                          "intact at the point the full run's denoise starts, or gets clobbered "
-                          "somewhere in between.")
     ap.add_argument("--sanity-check", action="store_true",
                      help="isolation test: run vision + prefix for real, then instead of the full "
                           "denoise loop, run a small basic bf16 matmul (no IF4 quant, no PBI, no "
@@ -3202,18 +3034,10 @@ def main():
                           "SAME prompt tokens, SAME state, and the SAME RandomState(0) noise -- so "
                           "the only variable is HW-vs-CPU execution -- and report per-dim / "
                           "per-timestep / overall SNR of the (10,7) action output.")
-    ap.add_argument("--dual", action="store_true",
-                     help="shard matmuls across BOTH engines via matmat_mul_two_cores (~2x on the "
-                          "matmul-bound sections). Selects a fully separate dual-engine execution "
-                          "path -- mutually exclusive with the default single-engine path.")
     ap.add_argument("--probe-step0", action="store_true",
                      help="snapshot step-0 action-expert intermediates and diff each against the "
                           "torch reference (fed the FPGA's own K/V) to localize which op first "
                           "diverges. Works with --debug for a fast ~75s iteration loop.")
-    ap.add_argument("--ref-device", default="auto", choices=["auto", "cuda", "cpu"],
-                     help="device for the --verify-denoise reference run. 'auto' (default) "
-                          "uses cuda if available (7Hz path, ~100x faster than CPU bf16), "
-                          "else cpu.")
     args, _ = ap.parse_known_args()
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
@@ -3233,10 +3057,6 @@ def main():
     if os.environ.get("PI05_L0_REPORT"):
         Pi05Libero_UnifiedEngine.PREFIX_SNAPSHOTS = True
         print("[main] PREFIX_SNAPSHOTS enabled -- layer0 op-by-op report")
-
-    if args.dual:
-        Pi05Libero_UnifiedEngine.DUAL = True
-        print("[main] DUAL enabled -- matmuls sharded across both engines (separate dual path)")
 
     ue = Pi05Libero_UnifiedEngine()
     init_hang_prevention(ue)
@@ -3306,7 +3126,7 @@ def main():
 
         actions = ue.run_inference(
             images, prompt_tokens, dump_prefix_path=PREFIX_KV_DUMP_PATH,
-            verify_prefix_kv=args.verify_prefix_tensor, sanity_check=args.sanity_check)
+            sanity_check=args.sanity_check)
 
         if args.sanity_check:
             return
@@ -3339,9 +3159,7 @@ def main():
         # feed the exact numpy array here, not let it reseed). Isolates pure
         # HW-vs-CPU execution error (no noise-seed, no quant-policy confound).
         import pi05_torch_ref as _ref
-        ref_device = args.ref_device
-        if ref_device == "auto":
-            ref_device = "cuda" if torch.cuda.is_available() else "cpu"
+        ref_device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[verify-denoise] running IF4 reference (pi05_torch_ref.run_pi05) on "
               f"{ref_device}... vision+prefix+denoise"
               + (" on GPU (fast)" if ref_device == "cuda"
