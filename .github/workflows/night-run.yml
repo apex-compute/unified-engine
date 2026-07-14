@@ -1,0 +1,137 @@
+name: Unified Engine Night Run
+
+on:
+  schedule:
+    - cron: "52 2 * * *"
+      timezone: "America/Los_Angeles"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  run-model-ci:
+    name: Run and collect full model CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      slack-message: ${{ steps.run.outputs.slack-message }}
+    steps:
+      - name: Dispatch full model CI and wait
+        id: run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflowId = 'ci.yml';
+            const branch = 'main';
+            const common = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            };
+            const sleep = milliseconds =>
+              new Promise(resolve => setTimeout(resolve, milliseconds));
+
+            const before = await github.rest.actions.listWorkflowRuns({
+              ...common,
+              workflow_id: workflowId,
+              branch,
+              event: 'workflow_dispatch',
+              per_page: 100,
+            });
+            const existingIds = new Set(
+              before.data.workflow_runs.map(run => run.id)
+            );
+
+            core.info(`Dispatching full ${workflowId} run on ${branch}`);
+            await github.rest.actions.createWorkflowDispatch({
+              ...common,
+              workflow_id: workflowId,
+              ref: branch,
+              inputs: {
+                full_run: 'true',
+                clean_bins: 'false',
+              },
+            });
+
+            let dispatchedRun;
+            for (let attempt = 1; attempt <= 30; attempt++) {
+              await sleep(2000);
+              const runs = await github.rest.actions.listWorkflowRuns({
+                ...common,
+                workflow_id: workflowId,
+                branch,
+                event: 'workflow_dispatch',
+                per_page: 20,
+              });
+              dispatchedRun = runs.data.workflow_runs.find(
+                run => !existingIds.has(run.id)
+              );
+              if (dispatchedRun) {
+                core.info(`Identified dispatched CI run ${dispatchedRun.id}`);
+                break;
+              }
+              core.info(`Waiting for dispatched run to appear (${attempt}/30)`);
+            }
+            if (!dispatchedRun) {
+              throw new Error('Could not identify the dispatched Model HW CI run');
+            }
+
+            let completedRun;
+            while (true) {
+              const response = await github.rest.actions.getWorkflowRun({
+                ...common,
+                run_id: dispatchedRun.id,
+              });
+              completedRun = response.data;
+              core.info(
+                `Model HW CI run ${completedRun.id}: ${completedRun.status}`
+              );
+              if (completedRun.status === 'completed') {
+                break;
+              }
+              await sleep(60000);
+            }
+
+            const icon = completedRun.conclusion === 'success'
+              ? ':white_check_mark:'
+              : completedRun.conclusion === 'failure'
+                ? ':x:'
+                : ':warning:';
+            const schedulerUrl =
+              `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}`
+              + `/actions/runs/${context.runId}`;
+            const message = [
+              `*Unified Engine Night Run: ${completedRun.conclusion === 'success' ? 'PASSED' : 'FAILED'}*`,
+              '',
+              `${icon} <${completedRun.html_url}|Full Model HW CI> — ${completedRun.conclusion}`,
+              '',
+              `Model scope: all registered models`,
+              `Branch: \`${branch}\``,
+              `Commit: \`${completedRun.head_sha.slice(0, 12)}\``,
+              `<${schedulerUrl}|View nightly scheduler run>`,
+            ].join('\n');
+
+            core.setOutput('slack-message', message);
+            await core.summary.addRaw(message).write();
+
+            if (completedRun.conclusion !== 'success') {
+              core.setFailed(
+                `Full Model HW CI concluded with ${completedRun.conclusion}`
+              );
+            }
+
+  notify-slack:
+    name: Send result to Slack
+    if: always()
+    needs: run-model-ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post nightly result
+        uses: slackapi/slack-github-action@v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            channel: ${{ secrets.SLACK_CHANNEL_ID }}
+            text: ${{ toJSON(needs.run-model-ci.outputs.slack-message || format('Unified Engine Night Run orchestration {0}. See {1}/{2}/actions/runs/{3}', needs.run-model-ci.result, github.server_url, github.repository, github.run_id)) }}

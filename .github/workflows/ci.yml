@@ -1,8 +1,9 @@
 name: Model HW CI
 
-# Runs the full local CI suite (run_ci.sh): generic hardware op tests, then
-# every model compiled from scratch + run from its cached bin, with DRAM
-# randomized (poisoned) before every single pass. Stops on first failure.
+# Runs the local CI suite (run_ci.sh): generic hardware op tests, then Gemma4
+# E2B by default. A manual full-run checkbox runs every registered model instead.
+# Models compile from scratch and run from their cached bins, with DRAM randomized
+# (poisoned) before every single pass. Stops on first failure.
 # Requires the FPGA device, so this must run on a self-hosted runner with the
 # board attached.
 
@@ -14,11 +15,11 @@ on:
         required: false
         type: boolean
         default: false
-      only:
-        description: "Space-separated model names to restrict the run to (leave empty to run all models)"
+      full_run:
+        description: "Run the full model_auto_test.py model registry instead of only gemma4_e2b"
         required: false
-        type: string
-        default: ""
+        type: boolean
+        default: false
   push:
     branches: [main]
   pull_request:
@@ -28,10 +29,17 @@ concurrency:
   group: model-hw-ci
   cancel-in-progress: false  # never cancel a run mid-flight on shared HW
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   hw-ci:
     runs-on: self-hosted
-    timeout-minutes: 180
+    # Leave the two-hour nightly scheduler five minutes to collect and report
+    # this job's terminal result if the hardware suite reaches its time limit.
+    timeout-minutes: 115
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,13 +50,14 @@ jobs:
           ./clean_program_bins.sh
 
       - name: Run CI suite
+        id: ci
         run: |
           ARGS=()
           if [[ "${{ inputs.clean_bins }}" == "true" ]]; then
             ARGS+=(--clean-bins)
           fi
-          if [[ -n "${{ inputs.only }}" ]]; then
-            ARGS+=(--only ${{ inputs.only }})
+          if [[ "${{ inputs.full_run }}" != "true" ]]; then
+            ARGS+=(--only gemma4_e2b)
           fi
           ./run_ci.sh "${ARGS[@]}"
 
@@ -61,3 +70,147 @@ jobs:
             model_auto_test_results.txt
             user_hw_test_summary.md
           if-no-files-found: warn
+
+      - name: Comment CI results on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const ws = process.env.GITHUB_WORKSPACE || '.';
+            const ciOutcome = `${{ steps.ci.outcome }}`;
+            const fullRun = `${{ inputs.full_run }}` === 'true';
+            const MAX_MODEL_CHARS = 40000;
+            const MAX_HW_CHARS = 15000;
+
+            function readResult(name) {
+              try {
+                return fs.readFileSync(path.join(ws, name), 'utf8');
+              } catch (error) {
+                return `_${name} was not produced; see the workflow log._`;
+              }
+            }
+
+            // Keep the head and the tail, drop the middle. Slicing off the head
+            // loses the markdown table header + separator, and without them
+            // GitHub renders the surviving rows as literal pipe-delimited text.
+            // The head carries that header, the tail carries the verdict
+            // (Status/RNG State for the HW summary, "Overall: N/M passed" for
+            // the model run). Only the intermediate rows are expendable.
+            function clipMiddle(text, maxChars) {
+              if (text.length <= maxChars) return text;
+              const lines = text.split('\n');
+
+              // A leading "| ... |" + "| --- |" pair means the file opens with a
+              // table; re-emit those two lines above the tail so the surviving
+              // tail rows still render as a table rather than as literal pipes.
+              const hasTable =
+                lines.length > 1
+                && lines[0].startsWith('|')
+                && /^\|[\s|:-]+\|$/.test(lines[1]);
+              const tableHead = hasTable ? lines.slice(0, 2) : [];
+
+              // Assumes maxChars >> NOTE_RESERVE; both callers pass >= 15000.
+              const NOTE_RESERVE = 400;  // elision note + re-emitted table header
+              const budget = Math.max(maxChars - NOTE_RESERVE, 0);
+              const headBudget = Math.floor(budget * 0.55);
+
+              const head = [];
+              let used = 0;
+              for (const line of lines) {
+                if (used + line.length + 1 > headBudget) break;
+                head.push(line);
+                used += line.length + 1;
+              }
+
+              const tail = [];
+              used = 0;
+              for (let i = lines.length - 1; i >= head.length; i--) {
+                if (used + lines[i].length + 1 > budget - headBudget) break;
+                tail.unshift(lines[i]);
+                used += lines[i].length + 1;
+              }
+
+              const omitted = lines.length - head.length - tail.length;
+              if (omitted <= 0) return text;
+
+              const bridge = [
+                '',
+                `_… ${omitted} intermediate line(s) omitted; the full file is in the model-hw-ci-results artifact …_`,
+                '',
+              ];
+              // Only re-open the table if the tail actually resumes mid-table.
+              if (tail.length > 0 && tail[0].startsWith('|')) {
+                bridge.push(...tableHead);
+              }
+              return [...head, ...bridge, ...tail].join('\n');
+            }
+
+            const modelResults = clipMiddle(
+              readResult('model_auto_test_results.txt'), MAX_MODEL_CHARS);
+            const hwResults = clipMiddle(
+              readResult('user_hw_test_summary.md'), MAX_HW_CHARS);
+
+            const status = ciOutcome === 'success'
+              ? '✅ PASSED'
+              : ciOutcome === 'failure'
+                ? '❌ FAILED'
+                : `⚠️ ${ciOutcome.toUpperCase()}`;
+            const modelScope = fullRun ? 'all registered models' : 'gemma4_e2b only';
+            const comment = [
+              '**Unified Engine HW CI Report**',
+              `- **Status:** ${status}`,
+              `- **Commit:** \`${{ github.sha }}\``,
+              `- **Run ID:** \`${{ github.run_id }}\``,
+              `- **Model scope:** ${modelScope}`,
+              '',
+              '**Generic HW Test Summary:**',
+              '',
+              hwResults,
+              '',
+              '**Model Test Results:**',
+              '',
+              modelResults,
+              '',
+              `[View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+            ].join('\n');
+
+            async function postComment(issueNumber) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: comment,
+              });
+              console.log(`Comment posted to PR #${issueNumber}`);
+            }
+
+            try {
+              if (context.payload.pull_request) {
+                await postComment(context.payload.pull_request.number);
+                return;
+              }
+
+              if (context.eventName === 'push' || context.eventName === 'workflow_dispatch') {
+                const branchName = context.ref.replace('refs/heads/', '');
+                if (branchName === 'main' || branchName === 'master') {
+                  console.log('Run is on the main branch; no PR comment needed.');
+                  return;
+                }
+                const { data: prs } = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  head: `${context.repo.owner}:${branchName}`,
+                });
+                if (prs.length > 0) {
+                  await postComment(prs[0].number);
+                } else {
+                  console.log(`No open PR found for branch ${branchName}.`);
+                }
+              }
+            } catch (error) {
+              console.log(`Unable to post PR comment: ${error.message}`);
+            }
