@@ -625,6 +625,62 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
     DMA_CHUNK_BYTES = 1 * 1024 * 1024  # 1 MB chunks for large DMA writes
 
+    def write_captured_instructions_to_dram(
+        self,
+        start_addr: int = DRAM_INSTRUCTION_ADDR,
+        chunk_bytes: int | None = None,
+    ) -> int:
+        """Write captured ISA to DRAM, optionally using bounded DMA writes.
+
+        This model-local override keeps Swin compatible with shared-library
+        versions whose base method does not yet accept ``chunk_bytes``. Swin's
+        fused program is large enough that a single DMA write can fail.
+        """
+        if not self.capture_buffer:
+            print("Warning: No captured instructions to write. Capture buffer is empty.")
+            return 0
+        if self.capture_count == 0:
+            print("Warning: No captured instructions to write. Capture count is 0.")
+            return 0
+
+        self.pad_capture_to_64b_boundary()
+        total_bytes = self.capture_count * INSTRUCTION_SIZE_BYTES
+        instructions_bytes = b"".join(
+            inst.get_bytes() for inst in self.capture_buffer)
+
+        print(
+            f"Writing {self.capture_count} captured instructions "
+            f"({total_bytes} bytes) to DRAM at 0x{start_addr:x}...")
+        if chunk_bytes is None or chunk_bytes <= 0:
+            bytes_written = self.dma_write(
+                DMA_DEVICE_H2C, start_addr, instructions_bytes, total_bytes)
+        else:
+            bytes_written = 0
+            offset = 0
+            while offset < total_bytes:
+                size = min(chunk_bytes, total_bytes - offset)
+                written = self.dma_write(
+                    DMA_DEVICE_H2C,
+                    start_addr + offset,
+                    instructions_bytes[offset:offset + size],
+                    size,
+                )
+                if written != size:
+                    bytes_written += written
+                    break
+                bytes_written += written
+                offset += size
+
+        if bytes_written == total_bytes:
+            print(
+                f"Successfully wrote {bytes_written} bytes "
+                f"({self.capture_count} instructions) to DRAM")
+        else:
+            print(
+                f"Warning: Expected to write {total_bytes} bytes, "
+                f"but only wrote {bytes_written} bytes")
+        return bytes_written
+
     def _pbi_set(self, gpr: int, val: int) -> None:
         """Prime GPR for a PBI core call (matmul or layer-norm)."""
         self._isa_reg_counter = gpr + 1

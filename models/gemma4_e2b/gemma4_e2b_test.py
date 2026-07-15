@@ -1031,7 +1031,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.gpr_scratch    = fixed["GPR_BUCKET_IDX_REG"]  # retired bucket reg → scratch
         self.gpr_aligned_seq_len = fixed["GPR_ALIGNED_SEQ_LEN_REG"]
         # Dynamic GPR allocation starts past the five reserved regs. The ISA
-        # register file holds 31 GPRs total (see user_dma_core.py's
+        # register file holds 63 GPRs total (see user_dma_core.py's
         # matmat_mul_dynamic_core), so this leaves ample headroom.
         self._isa_reg_counter = 6
         self._isa_reg_base = 6  # one-shot mode resets the allocator to this base per sub-op
@@ -1066,6 +1066,80 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._preallocate_identity_matrix()
 
     # ─── Identity matrix cache ──────────────────────────────────────────────
+    def unified_attention_core(self, *, q_scale=None, **kwargs) -> int:
+        """Accept Gemma4's explicit Q scale with old shared-library versions."""
+        if q_scale is None:
+            return super().unified_attention_core(**kwargs)
+        return self._unified_attention_core_dynamic_q_scale(q_scale=q_scale, **kwargs)
+
+    def _unified_attention_core_dynamic_q_scale(
+        self, *, batch, aligned_seq_len, head_dim, Q_DRAM_ADDR, K_DRAM_ADDR,
+        V_DRAM_ADDR, BIAS_DRAM_ADDR, OUTPUT_DRAM_ADDR, SCRATCH_DRAM_ADDR,
+        IDENTITY_DRAM_ADDR=None, gpr_batch_reg=None,
+        gpr_aligned_seq_len_reg=None, gpr_q_addr=None, gpr_k_addr=None,
+        gpr_v_addr=None, gpr_bias_addr=None, gpr_out_addr=None, q_scale=1.0,
+    ) -> int:
+        """Dynamic unified attention with an explicit multiplier applied to Q."""
+        if batch > aligned_seq_len:
+            raise ValueError(
+                "unified_attention_core_dynamic: batch must be <= aligned_seq_len, "
+                f"got batch={batch}, aligned_seq_len={aligned_seq_len}")
+        if aligned_seq_len % UE_VECTOR_SIZE != 0:
+            raise ValueError(
+                "unified_attention_core_dynamic: aligned_seq_len must be a multiple "
+                f"of {UE_VECTOR_SIZE}, got {aligned_seq_len}")
+
+        allocated_regs = []
+        if gpr_batch_reg is None:
+            gpr_batch_reg = self.alloc_isa_reg()
+            allocated_regs.append(gpr_batch_reg)
+            self.generate_instruction_add_set(gpr_batch_reg, batch)
+        if gpr_aligned_seq_len_reg is None:
+            gpr_aligned_seq_len_reg = self.alloc_isa_reg()
+            allocated_regs.append(gpr_aligned_seq_len_reg)
+            self.generate_instruction_add_set(gpr_aligned_seq_len_reg, aligned_seq_len)
+
+        bpe = 2
+        v_t_dram_addr = SCRATCH_DRAM_ADDR
+        score_dram_addr = v_t_dram_addr + head_dim * aligned_seq_len * bpe
+        scaled_q_dram_addr = score_dram_addr + aligned_seq_len * aligned_seq_len * bpe
+
+        self.bf16_transpose_core(
+            M=aligned_seq_len, N=head_dim, INPUT_DRAM_ADDR=V_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=v_t_dram_addr, IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+            gpr_M_reg=gpr_aligned_seq_len_reg, gpr_input_addr=gpr_v_addr)
+        total_flops = self.eltwise_core_dram(
+            M=batch, N=head_dim, dram_a=Q_DRAM_ADDR, dram_b=None,
+            dram_out=scaled_q_dram_addr, mode=UE_MODE.MUL_BROADCAST,
+            scalar=q_scale, gpr_M_reg=gpr_batch_reg, gpr_a_addr=gpr_q_addr)
+
+        head_dim_reg = self.alloc_isa_reg()
+        try:
+            self.generate_instruction_add_set(head_dim_reg, head_dim)
+            total_flops += self.matmat_mul_core(
+                M=batch, K=head_dim, N=aligned_seq_len,
+                A_DRAM_ADDR=scaled_q_dram_addr, B_DRAM_ADDR=K_DRAM_ADDR,
+                OUTPUT_DRAM_ADDR=score_dram_addr, softmax_enable=True,
+                C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="full_matrix",
+                gpr_M_reg=gpr_batch_reg, gpr_K_reg=head_dim_reg,
+                gpr_N_reg=gpr_aligned_seq_len_reg, gpr_b_addr=gpr_k_addr,
+                gpr_c_addr=gpr_bias_addr)
+            total_flops += self.matmat_mul_core(
+                M=batch, K=aligned_seq_len, N=head_dim,
+                A_DRAM_ADDR=score_dram_addr, B_DRAM_ADDR=v_t_dram_addr,
+                OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, gpr_M_reg=gpr_batch_reg,
+                gpr_K_reg=gpr_aligned_seq_len_reg, gpr_N_reg=head_dim_reg,
+                gpr_out_addr=gpr_out_addr)
+        finally:
+            self.release_isa_reg()
+            for _ in allocated_regs:
+                self.release_isa_reg()
+        print(
+            "unified_attention_core_dynamic: "
+            f"batch={batch}, aligned_seq_len={aligned_seq_len}, "
+            f"head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
+        return total_flops
+
     _IDENTITY_MAT_BYTES = UE_VECTOR_SIZE * UE_VECTOR_SIZE * 2  # 8192
 
     def _preallocate_identity_matrix(self) -> None:
@@ -1736,11 +1810,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
               f"{(torch.tensor(mm_types) == 0).sum().item()} text)")
 
     # reset_isa_reg_counter / alloc_isa_reg: use UnifiedEngine's base-class versions
-    # (31 GPRs, matching the real ISA register file — see user_dma_core.py's
-    # matmat_mul_dynamic_core comment: "The ISA register file holds 31 GPRs (1..31)").
+    # (63 GPRs, matching the real ISA register file — see user_dma_core.py's
+    # matmat_mul_dynamic_core comment: "The ISA register file holds 63 GPRs (1..63)").
     # This file previously overrode both with a 15-register cap and an unused
     # `reset` kwarg; that cap wasn't a real hardware limit (gemma3/llama don't have
-    # it and rely on the same 31-register base class), and it made
+    # it and rely on the same 63-register base class), and it made
     # matmat_mul_dynamic_core's dynamic-PBI path (which allocates well over 15
     # scratch registers for a single quantized matmul) exceed the register file
     # on the very first Q-projection call.

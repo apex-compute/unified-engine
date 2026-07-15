@@ -754,7 +754,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
     # NOTE: alloc_isa_reg / reset_isa_reg_counter are inherited from UnifiedEngine
-    # (base cap = 31 GPRs, the real hardware limit — see matmat_mul_dynamic_core).
+    # (base cap = 63 GPRs, the real hardware limit — see matmat_mul_dynamic_core).
     # This model reserves regs 1-4 (TMP/seq_len/q_seq_len/aligned_seq_len) by seeding
     # ``self._isa_reg_counter = 5`` in each emit function before dynamic allocation.
 

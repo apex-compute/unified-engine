@@ -22,7 +22,7 @@ sys.path.insert(0, PROJECT_ROOT)
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, set_dma_device
 from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_dram_post_add
-from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, INSTRUCTION_REG_REWRITE, MEMCPY_TYPE
+from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, MEMCPY_TYPE
 from user_dma_core import ue_35bit_addr_shifter
 import quant_lib
 
@@ -828,14 +828,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         if reset:
             self._isa_reg_counter = 5
 
-        if self._isa_reg_counter > 31:
-            raise ValueError("Exceeded available ISA registers (max 31)")
+        if self._isa_reg_counter > 63:
+            raise ValueError("Exceeded available ISA registers (max 63)")
 
         reg_idx = self._isa_reg_counter
         self._isa_reg_counter += 1
         return reg_idx
-
-    # overwrite_instruction_with_general_register: use base class (user_dma_core.py)
 
     def isa_add_set_core(self, dst_reg_idx: int, immediate_value: int, timeout_s: float = 10.0) -> None:
         """Set one ISA register to an immediate value via ADD SET + HALT program."""

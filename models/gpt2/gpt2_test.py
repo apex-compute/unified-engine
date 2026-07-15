@@ -727,8 +727,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                     self.LAYER0_K_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
                 self.generate_instruction_add_imm(
                     self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
-                self.sram_to_accelerator_memory(0x10000, 0, ahd)
-                self.overwrite_instruction_with_general_register(self.TMP_REG)
+                self.sram_to_accelerator_memory(0x10000, 0, ahd, general_reg_src=self.TMP_REG)
 
                 # Copy valid K history → FLASH_K; loop count = gpr_bucket_idx so only
                 # aligned_seq_len tokens are copied, not the full MAX_CONTEXT_SIZE.
@@ -746,8 +745,7 @@ class GPT2_UnifiedEngine(UnifiedEngine):
                     self.LAYER0_V_PROJ_DRAM + kv_h * ahd * bpe, 0x20000, ahd)
                 self.generate_instruction_add_imm(
                     self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
-                self.sram_to_accelerator_memory(0x20000, 0, ahd)
-                self.overwrite_instruction_with_general_register(self.TMP_REG)
+                self.sram_to_accelerator_memory(0x20000, 0, ahd, general_reg_src=self.TMP_REG)
 
                 # Copy valid V history → FLASH_V; same dynamic size.
                 self._emit_pbi_scatter_per_token(

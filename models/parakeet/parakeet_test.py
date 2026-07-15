@@ -1417,8 +1417,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             self.sram_to_accelerator_memory(URAM_A_BASE, dst, H)
         # 2. Embedding lookup: TMP_REG = TOKEN_REG + EMBED_base, DMA from TMP_REG
         self.generate_instruction_add_imm(self.TOKEN_REG, ue_35bit_addr_shifter(self.w["EMBED"]), self.TMP_REG)
-        self.accelerator_memory_to_sram(self.w["EMBED"], URAM_A_BASE, H)
-        self.overwrite_instruction_with_general_register(self.TMP_REG)
+        self.accelerator_memory_to_sram(self.w["EMBED"], URAM_A_BASE, H, general_reg_src=self.TMP_REG)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.PRED_EMB_DRAM, H)
         # 3. Predictor LSTM (2 layers)
         for i in range(2):
@@ -1465,8 +1464,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_flag_clear()
         # enc_out[t] copy: TMP_REG = ENC_T_REG + ENC_OUT_DRAM, DMA from TMP_REG
         self.generate_instruction_add_imm(self.ENC_T_REG, ue_35bit_addr_shifter(self.ENC_OUT_DRAM), self.TMP_REG)
-        self.accelerator_memory_to_sram(self.ENC_OUT_DRAM, URAM_A_BASE, D)
-        self.overwrite_instruction_with_general_register(self.TMP_REG)
+        self.accelerator_memory_to_sram(self.ENC_OUT_DRAM, URAM_A_BASE, D, general_reg_src=self.TMP_REG)
         self.sram_to_accelerator_memory(URAM_A_BASE, self.JOINT_ENC_DRAM, D)
         # pred_out copy (static addresses)
         self.accelerator_memory_to_sram(self.PRED_OUT_DRAM, URAM_A_BASE, H)
