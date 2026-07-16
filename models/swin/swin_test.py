@@ -566,6 +566,7 @@ SWIN_PROGRAM_BASE = 0x80000000   # 2.0 GB — 2 GB for compiled instruction prog
 
 
 class Swin_UnifiedEngine(UnifiedEngine):
+    ARTIFACT_VERSION = 2  # dynamic LayerNorm row-count + persistent zeros/1-N operands
     """Swin-Large on Unified Engine FPGA accelerator."""
 
     # --- Architecture constants (Swin-Large patch4-window12-384-in22k) ---
@@ -686,16 +687,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self._isa_reg_counter = gpr + 1
         self.reset_inst_ptr_counter()
         self.generate_instruction_add_set(dst_reg_idx=gpr, immediate_value=val)
-
-    @staticmethod
-    def _ln_chunks(M: int, N: int) -> int:
-        """Return the n_chunks value layer_norm_core_dram_pbi expects for (M, N)."""
-        ops_per_row = 6  # 4 core ops + GAMMA + BETA
-        ideal = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256 - 4) // ops_per_row)
-        cs = ideal
-        while M % cs != 0:
-            cs -= 1
-        return M // cs
 
     def _alloc_param(self, tensor: torch.Tensor) -> int:
         """Allocate params DRAM, write bf16 tensor. Returns DRAM address."""
@@ -855,6 +846,21 @@ class Swin_UnifiedEngine(UnifiedEngine):
         # Final LayerNorm weights → params DRAM
         self.POST_ENCODER_LN_GAMMA = self._alloc_param(swin.layernorm.weight.data)  # (1536,)
         self.POST_ENCODER_LN_BETA  = self._alloc_param(swin.layernorm.bias.data)    # (1536,)
+
+        # Persistent operands for every LayerNorm width used by the encoder.
+        # Dynamic LayerNorm consumes 1/N explicitly; zeros are also supplied
+        # explicitly so programs.bin never depends on compile-time allocations
+        # made after params.bin was dumped.
+        ln_widths = sorted({self.EMBED_DIM, *self.STAGE_DIMS,
+                            *(4 * d for d in self.STAGE_DIMS[:-1])})
+        self.LN_ZEROS_ADDRS = {
+            n: self._alloc_param(torch.zeros(n, dtype=torch.bfloat16))
+            for n in ln_widths
+        }
+        self.LN_INV_N_ADDRS = {
+            n: self._alloc_param(torch.full((n,), 1.0 / n, dtype=torch.bfloat16))
+            for n in ln_widths
+        }
 
         # Classifier weights → device DRAM
         # matmat_mul_core computes A @ B^T, so B is stored as (N, K) = (num_labels, 1536)
@@ -1030,7 +1036,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 f.write(buf)
                 offset += sz
         with open(meta_path, "w") as f:
-            json.dump({"size": total, "num_labels": self.NUM_LABELS}, f)
+            json.dump({"artifact_version": self.ARTIFACT_VERSION,
+                       "size": total, "num_labels": self.NUM_LABELS}, f)
         _original_print(f"  Params dumped: {total / 1024**2:.1f} MB → {bin_path}")
 
     def load_params(self) -> bool:
@@ -1042,6 +1049,9 @@ class Swin_UnifiedEngine(UnifiedEngine):
             return False
         with open(meta_path) as f:
             meta = json.load(f)
+        if meta.get("artifact_version") != self.ARTIFACT_VERSION:
+            _original_print("  Params artifact is stale; rebuilding.")
+            return False
         total = meta["size"]
         self.NUM_LABELS = meta["num_labels"]
         self.NUM_LABELS_PAD = self.pad_dim(self.NUM_LABELS)
@@ -1068,7 +1078,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
         with open(bin_path, "wb") as f:
             f.write(buf)
         with open(meta_path, "w") as f:
-            json.dump({"size": size}, f)
+            json.dump({"artifact_version": self.ARTIFACT_VERSION, "size": size}, f)
         _original_print(f"  Program dumped: {size / 1024**2:.1f} MB → {bin_path}")
 
     def load_programs(self) -> int | None:
@@ -1077,6 +1087,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
         bin_path = os.path.join(bin_dir, "programs.bin")
         meta_path = os.path.join(bin_dir, "programs.json")
         if not os.path.exists(bin_path) or not os.path.exists(meta_path):
+            return None
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if meta.get("artifact_version") != self.ARTIFACT_VERSION:
+            _original_print("  Program artifact is stale; rebuilding.")
             return None
         with open(bin_path, "rb") as f:
             data = f.read()
@@ -1117,7 +1132,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             return pa
 
         gpr_mm = self.alloc_isa_reg()   # matmul M (= spatial^2 per stage)
-        gpr_ln = self.alloc_isa_reg()   # LN n_chunks (= M // chunk_size per stage)
+        gpr_ln = self.alloc_isa_reg()   # LayerNorm runtime row count
         gpr_pbi = self.alloc_isa_reg()  # PBI strided-copy trip count (permute loops)
 
         # ================================================================
@@ -1173,6 +1188,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.EMBED_OUTPUT_DRAM,
             GAMMA_DRAM_ADDR=self.PATCH_EMBED_LN_GAMMA,
             BETA_DRAM_ADDR=self.PATCH_EMBED_LN_BETA,
+            ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[N_pre],
         )
 
         # ---- smoke-test finalizer: emit halt + write program early, for fast
@@ -1209,15 +1225,13 @@ class Swin_UnifiedEngine(UnifiedEngine):
             total_batches = num_windows * num_heads
             st = self.stage_tensors[s]
 
-            ln_nchunks = self._ln_chunks(M, dim)
-
             for l in range(self.DEPTHS[s]):
                 lw = self.encoder_weights[s][l]
                 shift_size = 0 if l % 2 == 0 else self.WINDOW_SIZE // 2
 
                 # --- 1. Pre-attention LayerNorm ---
                 layer_input_addr = self.EMBED_OUTPUT_DRAM if (s == 0 and l == 0) else st['layer_input']
-                self._pbi_set(gpr_ln, ln_nchunks)
+                self._pbi_set(gpr_ln, M)
                 self.layer_norm_core_dram(
                     M=M, N=dim,
                     A_DRAM_ADDR=layer_input_addr,
@@ -1225,6 +1239,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     GAMMA_DRAM_ADDR=lw['ln_before_gamma'],
                     BETA_DRAM_ADDR=lw['ln_before_beta'],
                     gpr_M_reg=gpr_ln,
+                    ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[dim],
+                    INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[dim],
                 )
 
                 # --- 2. Cyclic shift (odd layers only) ---
@@ -1409,7 +1425,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     )
 
                 # --- 13. Pre-MLP LayerNorm ---
-                self._pbi_set(gpr_ln, ln_nchunks)
+                self._pbi_set(gpr_ln, M)
                 self.layer_norm_core_dram(
                     M=M, N=dim,
                     A_DRAM_ADDR=st['residual1'],
@@ -1417,6 +1433,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     GAMMA_DRAM_ADDR=lw['ln_after_gamma'],
                     BETA_DRAM_ADDR=lw['ln_after_beta'],
                     gpr_M_reg=gpr_ln,
+                    ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[dim],
+                    INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[dim],
                 )
 
                 # --- 14. MLP expand ---
@@ -1488,8 +1506,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=st['merge_buf'],
                     H=spatial, W=spatial, C=dim)
 
-                pm_ln_chunks = self._ln_chunks(next_M, 4 * dim)
-                self._pbi_set(gpr_ln, pm_ln_chunks)
+                self._pbi_set(gpr_ln, next_M)
                 self.layer_norm_core_dram(
                     M=next_M, N=4 * dim,
                     A_DRAM_ADDR=st['merge_buf'],
@@ -1497,6 +1514,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     GAMMA_DRAM_ADDR=pmw['norm_gamma'],
                     BETA_DRAM_ADDR=pmw['norm_beta'],
                     gpr_M_reg=gpr_ln,
+                    ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[4 * dim],
+                    INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[4 * dim],
                 )
 
                 self._pbi_set(gpr_mm, next_M)
@@ -1519,6 +1538,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.FINAL_LN_OUTPUT_DRAM,
             GAMMA_DRAM_ADDR=self.POST_ENCODER_LN_GAMMA,
             BETA_DRAM_ADDR=self.POST_ENCODER_LN_BETA,
+            ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[final_C],
         )
 
         # Avg pool via eltwise accumulation: sum all 144 rows, then scale by 1/144

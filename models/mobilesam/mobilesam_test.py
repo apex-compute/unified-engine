@@ -925,6 +925,7 @@ def conv2d_3x3_stride2_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM
 
 BIN_DIR = os.path.join(SCRIPT_DIR, "mobilesam_bin")
 WEIGHTS = os.path.join(BIN_DIR, "mobile_sam.pt")
+MOBILESAM_ARTIFACT_VERSION = 2  # dynamic LayerNorm row-count + persistent operands
 
 # ---------------------------------------------------------------------------
 # Architecture constants
@@ -1067,6 +1068,18 @@ class MobileSAM_UE(UnifiedEngine):
         sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.weight_init(sd)
         self._enc_init(sd)
+        # Persistent operands for every dynamic encoder LayerNorm width. The
+        # synced core expects gpr_M_reg to hold the actual row count and consumes
+        # the mean's 1/N vector explicitly.
+        _ln_widths = (ENC_S1_C, ENC_S2_C_PAD, ENC_S3_C, 256)
+        self.LN_ZEROS_ADDRS = {
+            n: self._alloc_param(torch.zeros(n, dtype=torch.bfloat16))
+            for n in _ln_widths
+        }
+        self.LN_INV_N_ADDRS = {
+            n: self._alloc_param(torch.full((n,), 1.0 / n, dtype=torch.bfloat16))
+            for n in _ln_widths
+        }
         del sd
         self.tensor_init()
 
@@ -2843,17 +2856,13 @@ class MobileSAM_UE(UnifiedEngine):
 
         def _ln_hw(src, dst, g, b):
             _reg = gpr_hw if gpr_hw is not None else 14
-            _ops = 4 + (1 if g is not None else 0) + (1 if b is not None else 0)
-            _ideal = min(URAM_NEAR_FULL_ELEMENTS // ENC_S1_C, _HW, (256 - 4) // _ops)
-            _cs = _ideal
-            while _HW % _cs != 0:
-                _cs -= 1
             self._isa_reg_counter = _reg + 1
             self.reset_inst_ptr_counter()
-            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW // _cs)
+            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW)
             self.layer_norm_core_dram(M=_HW, N=ENC_S1_C, A_DRAM_ADDR=src,
                 OUTPUT_DRAM_ADDR=dst, GAMMA_DRAM_ADDR=g, BETA_DRAM_ADDR=b,
-                gpr_M_reg=_reg)
+                gpr_M_reg=_reg, ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[ENC_S1_C],
+                INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[ENC_S1_C])
 
         # attn norm
         _ln_hw(INPUT_DRAM, self.S1_LN_DRAM, w["an_g"], w["an_b"])
@@ -2968,17 +2977,13 @@ class MobileSAM_UE(UnifiedEngine):
 
         def _ln_hw(src, dst, g, b):
             _reg = gpr_hw if gpr_hw is not None else 14
-            _ops = 4 + (1 if g is not None else 0) + (1 if b is not None else 0)
-            _ideal = min(URAM_NEAR_FULL_ELEMENTS // _CP, _HW, (256 - 4) // _ops)
-            _cs = _ideal
-            while _HW % _cs != 0:
-                _cs -= 1
             self._isa_reg_counter = _reg + 1
             self.reset_inst_ptr_counter()
-            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW // _cs)
+            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW)
             self.layer_norm_core_dram(M=_HW, N=_CP, A_DRAM_ADDR=src,
                 OUTPUT_DRAM_ADDR=dst, GAMMA_DRAM_ADDR=g, BETA_DRAM_ADDR=b,
-                gpr_M_reg=_reg)
+                gpr_M_reg=_reg, ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[_CP],
+                INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[_CP])
 
         _ln_hw(INPUT_DRAM, self.S2_LN_DRAM, w["an_g"], w["an_b"])
 
@@ -3103,17 +3108,13 @@ class MobileSAM_UE(UnifiedEngine):
 
         def _ln_hw(src, dst, g, b):
             _reg = gpr_hw if gpr_hw is not None else 14
-            _ops = 4 + (1 if g is not None else 0) + (1 if b is not None else 0)
-            _ideal = min(URAM_NEAR_FULL_ELEMENTS // _C, _HW, (256 - 4) // _ops)
-            _cs = _ideal
-            while _HW % _cs != 0:
-                _cs -= 1
             self._isa_reg_counter = _reg + 1
             self.reset_inst_ptr_counter()
-            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW // _cs)
+            self.generate_instruction_add_set(dst_reg_idx=_reg, immediate_value=_HW)
             self.layer_norm_core_dram(M=_HW, N=_C, A_DRAM_ADDR=src,
                 OUTPUT_DRAM_ADDR=dst, GAMMA_DRAM_ADDR=g, BETA_DRAM_ADDR=b,
-                gpr_M_reg=_reg)
+                gpr_M_reg=_reg, ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[_C],
+                INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[_C])
 
         _ln_hw(INPUT_DRAM, self.S3_LN_DRAM, w["an_g"], w["an_b"])
 
@@ -3506,17 +3507,14 @@ class MobileSAM_UE(UnifiedEngine):
         _HP2 = ENC_S2_HEAD_PAD; _HD2 = ENC_S2_HEAD_DIM
 
         def _s2b0_ln():
-            _ops = 4 + 2  # gamma + beta
-            _ideal = min(URAM_NEAR_FULL_ELEMENTS // _CP, _HW2, (256 - 4) // _ops)
-            _cs = _ideal
-            while _HW2 % _cs != 0:
-                _cs -= 1
-            _original_print(f"  [DBG] _s2b0_ln: HW2={_HW2} CP={_CP} chunk_size={_cs} n_chunks={_HW2//_cs} GPR14={_HW2//_cs}")
+            _original_print(f"  [DBG] _s2b0_ln: HW2={_HW2} CP={_CP} GPR14={_HW2}")
             self._isa_reg_counter = 15; self.reset_inst_ptr_counter()
-            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_HW2 // _cs)
+            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_HW2)
             self.layer_norm_core_dram(M=_HW2, N=_CP, A_DRAM_ADDR=_in2,
                 OUTPUT_DRAM_ADDR=self.S2_LN_DRAM, GAMMA_DRAM_ADDR=_w2["an_g"],
-                BETA_DRAM_ADDR=_w2["an_b"], gpr_M_reg=14)
+                BETA_DRAM_ADDR=_w2["an_b"], gpr_M_reg=14,
+                ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[_CP],
+                INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[_CP])
         self._compile_run(_s2b0_ln)
         self._assert_no_nan("S2B0 attn_ln", self.S2_LN_DRAM, _HW2 * _CP, shape=(_HW2, _CP))
 
@@ -3670,22 +3668,18 @@ class MobileSAM_UE(UnifiedEngine):
         _NECK_W    = ENC_S3_W
         _NECK_HW    = _NECK_H * _NECK_W
         def _neck_matmul_ln():
-            _ops = 6
-            _ideal = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _ops)
-            _cs = _ideal
-            while _NECK_HW % _cs != 0:
-                _cs -= 1
             self.matmat_mul_core(
                 M=_NECK_HW, K=_NECK_C_IN, N=_NECK_C_OUT,
                 A_DRAM_ADDR=self.S3B1_OUT_DRAM, B_DRAM_ADDR=self.NECK_C1_W,
                 OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM)
             self._isa_reg_counter = 15; self.reset_inst_ptr_counter()
-            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_NECK_HW // _cs)
+            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_NECK_HW)
             self.layer_norm_core_dram(
                 M=_NECK_HW, N=_NECK_C_OUT,
                 A_DRAM_ADDR=self.NECK_BUF1_DRAM, OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
                 GAMMA_DRAM_ADDR=self.NECK_LN1_G, BETA_DRAM_ADDR=self.NECK_LN1_B,
-                gpr_M_reg=14)
+                gpr_M_reg=14, ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[_NECK_C_OUT],
+                INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[_NECK_C_OUT])
         self._compile_run(_neck_matmul_ln)
         self._assert_no_nan("neck_conv1+ln1", self.NECK_BUF1_DRAM, _NECK_HW * _NECK_C_OUT)
 
@@ -3700,17 +3694,14 @@ class MobileSAM_UE(UnifiedEngine):
                 ZERO_PAD_DRAM_ADDR=self.NECK_ZERO,
                 H=_NECK_H, W=_NECK_W, C_in=_NECK_C_OUT, C_out=_NECK_C_OUT,
             )
-            _neck_ln2_ops = 6
-            _cs = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _neck_ln2_ops)
-            while _NECK_HW % _cs != 0:
-                _cs -= 1
             self._isa_reg_counter = 15; self.reset_inst_ptr_counter()
-            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_NECK_HW // _cs)
+            self.generate_instruction_add_set(dst_reg_idx=14, immediate_value=_NECK_HW)
             self.layer_norm_core_dram(
                 M=_NECK_HW, N=_NECK_C_OUT,
                 A_DRAM_ADDR=self.NECK_OUT_DRAM, OUTPUT_DRAM_ADDR=self.NECK_OUT_DRAM,
                 GAMMA_DRAM_ADDR=self.NECK_LN2_G, BETA_DRAM_ADDR=self.NECK_LN2_B,
-                gpr_M_reg=14)
+                gpr_M_reg=14, ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[_NECK_C_OUT],
+                INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[_NECK_C_OUT])
         self._compile_run(_neck_conv_ln)
         self._assert_no_nan("neck_conv2+ln2", self.NECK_OUT_DRAM, _NECK_HW * _NECK_C_OUT)
 
@@ -3942,7 +3933,9 @@ class MobileSAM_UE(UnifiedEngine):
             "iou_out": 64 * BPE,
         }
         with open(meta_path, "w") as f:
-            json.dump({"size": total, "tensors": tensor_ofs, "tensor_sizes": tensor_sizes}, f)
+            json.dump({"artifact_version": MOBILESAM_ARTIFACT_VERSION,
+                       "size": total, "tensors": tensor_ofs,
+                       "tensor_sizes": tensor_sizes}, f)
         _original_print(f"  Params: {total / 1024**2:.1f} MB → {bin_path}")
 
     def dump_programs_to_file(self, enc_prog_addr: int, dec_prog_addr: int, bin_dir: str):
@@ -3961,7 +3954,7 @@ class MobileSAM_UE(UnifiedEngine):
             ("encoder", enc_prog_addr, enc_size),
             ("decoder", dec_prog_addr, dec_size),
         ]
-        manifest = {"programs": {}}
+        manifest = {"artifact_version": MOBILESAM_ARTIFACT_VERSION, "programs": {}}
         all_bytes = bytearray()
         CHUNK = 1 * 1024 * 1024
         for name, addr, size in programs:
@@ -4156,14 +4149,9 @@ class MobileSAM_UE(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.NECK_BUF1_DRAM,
         )
         # neck.1: LayerNorm2d(256) — normalizes over 256 channels per pixel
-        _neck_ln_ops = 6  # 4 + gamma + beta
-        _neck_ln_ideal = min(URAM_NEAR_FULL_ELEMENTS // _NECK_C_OUT, _NECK_HW, (256 - 4) // _neck_ln_ops)
-        _neck_ln_cs = _neck_ln_ideal
-        while _NECK_HW % _neck_ln_cs != 0:
-            _neck_ln_cs -= 1
         self._isa_reg_counter = gpr_hw + 1
         self.reset_inst_ptr_counter()
-        self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_NECK_HW // _neck_ln_cs)
+        self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_NECK_HW)
         self.layer_norm_core_dram(
             M=_NECK_HW, N=_NECK_C_OUT,
             A_DRAM_ADDR=self.NECK_BUF1_DRAM,
@@ -4171,6 +4159,8 @@ class MobileSAM_UE(UnifiedEngine):
             GAMMA_DRAM_ADDR=self.NECK_LN1_G,
             BETA_DRAM_ADDR=self.NECK_LN1_B,
             gpr_M_reg=gpr_hw,
+            ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[_NECK_C_OUT],
+            INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[_NECK_C_OUT],
         )
         flush()
 
@@ -4188,7 +4178,7 @@ class MobileSAM_UE(UnifiedEngine):
         # neck.3: LayerNorm2d(256)
         self._isa_reg_counter = gpr_hw + 1
         self.reset_inst_ptr_counter()
-        self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_NECK_HW // _neck_ln_cs)
+        self.generate_instruction_add_set(dst_reg_idx=gpr_hw, immediate_value=_NECK_HW)
         self.layer_norm_core_dram(
             M=_NECK_HW, N=_NECK_C_OUT,
             A_DRAM_ADDR=self.NECK_OUT_DRAM,
@@ -4196,6 +4186,8 @@ class MobileSAM_UE(UnifiedEngine):
             GAMMA_DRAM_ADDR=self.NECK_LN2_G,
             BETA_DRAM_ADDR=self.NECK_LN2_B,
             gpr_M_reg=gpr_hw,
+            ZEROS_DRAM_ADDR=self.LN_ZEROS_ADDRS[_NECK_C_OUT],
+            INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[_NECK_C_OUT],
         )
         flush()
 
@@ -4599,8 +4591,21 @@ def main():
     image_pe_t = _pe.permute(2, 0, 1)[None][0].permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
 
     # ---- Compile or load from bins ----
-    bins_exist = (os.path.exists(os.path.join(BIN_DIR, "params.bin"))
-                  and os.path.exists(os.path.join(BIN_DIR, "programs.bin")))
+    def _artifacts_current() -> bool:
+        required = ("params.bin", "params.json", "programs.bin", "programs.json")
+        if not all(os.path.exists(os.path.join(BIN_DIR, name)) for name in required):
+            return False
+        try:
+            with open(os.path.join(BIN_DIR, "params.json")) as f:
+                params_meta = json.load(f)
+            with open(os.path.join(BIN_DIR, "programs.json")) as f:
+                programs_meta = json.load(f)
+        except (OSError, ValueError):
+            return False
+        return (params_meta.get("artifact_version") == MOBILESAM_ARTIFACT_VERSION
+                and programs_meta.get("artifact_version") == MOBILESAM_ARTIFACT_VERSION)
+
+    bins_exist = _artifacts_current()
     if bins_exist:
         _original_print("\nLoading from pre-compiled bins …")
         from mobilesam_run_from_bin import MobileSAM_UE_Run

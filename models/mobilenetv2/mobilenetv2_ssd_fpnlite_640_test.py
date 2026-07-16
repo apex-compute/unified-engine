@@ -125,9 +125,10 @@ class InvertedResidual(nn.Module):
         return x + y if self.use_residual else y
 
 # ---------------------------------------------------------------------------
-# Inlined: LALU_BF16_SIX, ops, weight helpers
+# Inlined: ops, weight helpers
 # ---------------------------------------------------------------------------
-LALU_BF16_SIX = 0x40C0   # 6.0 in bf16 (float32 0x40C00000 truncated to top 16 bits)
+# ReLU6 is applied by passing clamp_max=6.0 to matmat_mul_core(clamp_enable=True);
+# the synced library takes the clamp bounds as kwargs (clamp_min=0.0/clamp_max).
 
 # ---------------------------------------------------------------------------
 # Helper ops (built on top of UnifiedEngine primitives)
@@ -162,9 +163,8 @@ def conv2d_1x1_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: i
                     H: int, W: int, C_in: int, C_out: int,
                     relu6_enable: bool = False) -> None:
     """Conv2d(kernel=1) = matmul. HWC layout. Weight (C_out, C_in).
-    relu6_enable -> clamp_enable on the matmul. The upper-bound bf16 value
-    (6.0 instead of +inf) is set via the LALU_CLAMP_RELU_B monkey-patch in
-    MobileNetV2_UnifiedEngine.__init__.
+    relu6_enable -> clamp_enable on the matmul, with clamp_max=6.0 passed so
+    the clamp is ReLU6 (upper bound 6.0) rather than plain ReLU (+inf).
 
     PBI: if ``ue._pbi_M_reg`` is set (a GPR index 1..15), the matmul's M-tile
     loop trip count is taken from that register at runtime instead of being
@@ -188,7 +188,7 @@ def conv2d_1x1_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: i
         A_DRAM_ADDR=INPUT_DRAM_ADDR, B_DRAM_ADDR=WEIGHT_DRAM_ADDR,
         OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
         C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="broadcast_N",
-        clamp_enable=relu6_enable,
+        clamp_enable=relu6_enable, clamp_max=6.0,
         gpr_M_reg=gpr_M_reg,
     )
 
@@ -232,7 +232,7 @@ def conv2d_3x3_stride2_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM
                 B_DRAM_ADDR=WEIGHT_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + (h_out * W_out + w_start) * C_out * _BPE,
                 C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="broadcast_N",
-                clamp_enable=relu6_enable)
+                clamp_enable=relu6_enable, clamp_max=6.0)
 
 
 def conv2d_3x3_dw_tapwise_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
@@ -364,8 +364,7 @@ def conv2d_3x3_dw_tapwise_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
         # (2) ReLU6: in-place clamp matmul (M=H_out*W_out, K=64, N=64). A @ I
         #     yields A bit-exactly (0.0 and 1.0 are both exact bf16), so the
         #     only real effect is the LALU CLAMP on the output, applying
-        #     ReLU6 with bounds (0, 6.0) from the LALU_CLAMP_RELU_B
-        #     monkey-patch in __init__.
+        #     ReLU6 with bounds (0, 6.0) via clamp_max=6.0.
         if relu6_enable:
             ue.matmat_mul_core(
                 M=H_out * W_out, K=BLK, N=BLK,
@@ -373,7 +372,7 @@ def conv2d_3x3_dw_tapwise_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
                 B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=ACC_DRAM_ADDR,
                 C_DRAM_ADDR=None, bias_mode="broadcast_N",
-                clamp_enable=True,
+                clamp_enable=True, clamp_max=6.0,
             )
 
         # (3) Strided scatter from contiguous scratch to OUTPUT_DRAM at the
@@ -1335,9 +1334,6 @@ class SSDFPNLite_UnifiedEngine(UnifiedEngine):
         super().__init__(params_dram_base=SSD_PARAMS_BASE,
                          tensor_dram_base=SSD_TENSOR_BASE,
                          program_dram_base=SSD_PROGRAM_BASE)
-
-        # Make matmat_mul_core's clamp_enable be ReLU6 instead of plain ReLU
-        user_dma_core.LALU_CLAMP_RELU_B = LALU_BF16_SIX
 
         self.script_dir = script_dir
         self.cfg = _load_config(script_dir=script_dir)

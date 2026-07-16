@@ -1266,30 +1266,35 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
                                            torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
 
-        # Live decode counter: stdout and stderr render to the SAME terminal row
-        # when no newline separates them, so any in-place ("\r" or cursor-restore)
-        # overwrite on either stream erases whatever the other stream just wrote
-        # to that row — that's what was clobbering the decoded token text before
-        # (both the original scroll-region version and a prior \r-on-stderr
-        # attempt). Fix: never overwrite in place. Print status as its own line,
-        # with a leading newline, throttled by elapsed time so it doesn't spam.
+        # Two-region live counter: pin the bottom terminal row as a status line via
+        # an ANSI scroll region; tokens stream in the area above it and the counter
+        # refreshes in place. All output is on stdout (tokens scroll inside rows
+        # 1..rows-1; the status writes row `rows` with cursor save/restore), so
+        # nothing clobbers the streamed token text. Only when stdout is a real TTY
+        # (skip when piped/redirected). Mirrors gemma3_test.py.
+        import shutil
         _use_status = sys.stdout.isatty()
-        _status_last_print = 0.0
         def _status_setup():
-            pass
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")   # scroll region = rows 1..rows-1
+            sys.stdout.write(f"\033[{rows - 1};1H")   # park cursor at bottom of region
+            sys.stdout.flush()
         def _status_update():
-            nonlocal _status_last_print
-            now = time.perf_counter()
-            if now - _status_last_print < 1.0:
-                return
-            _status_last_print = now
+            rows = shutil.get_terminal_size().lines
             n = self.seq_len - prefill_seq_len
-            elapsed = now - timer
+            elapsed = time.perf_counter() - timer
             rate = n / elapsed if elapsed > 0 else 0.0
-            print(f"\n[decoding… {n} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})  "
-                  f"{elapsed:.1f}s  {rate:.1f} tok/s]", flush=True)
+            sys.stdout.write("\0337")                 # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # bottom row, clear it
+            sys.stdout.write(f" decoding… {n} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})  "
+                             f"{elapsed:.1f}s  {rate:.1f} tok/s")
+            sys.stdout.write("\0338")                 # restore cursor
+            sys.stdout.flush()
         def _status_teardown():
-            pass
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")                # reset scroll region
+            sys.stdout.write(f"\033[{rows};1H\033[2K") # clear the status row
+            sys.stdout.flush()
         if _use_status:
             _status_setup()
 
