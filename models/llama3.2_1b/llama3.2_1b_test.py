@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, configure_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, configure_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
 # 1B uses pure FP4 (E2M1) — the best 4-bit scheme for this model by WikiText-2
@@ -325,10 +325,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         #   params : 0x00000000 .. 0x58000000  (1.375 GB)  weights + host RoPE
         #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
         #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
+        program_base = user_dma_core.DRAM_INSTRUCTION_ADDR
+        if user_dma_core.CURRENT_DEVICE == "efinix":
+            # Efinix exposes a 2 GiB DMA window. Llama-1B weights occupy about
+            # 674 MB; keep tensor scratch at 0x30000000 and reserve the upper
+            # 256 MB for ISA.
+            program_base = 0x70000000
         super().__init__(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
             params_dram_base=user_dma_core.DRAM_START_ADDR,
-            program_dram_base=user_dma_core.DRAM_INSTRUCTION_ADDR,
+            program_dram_base=program_base,
             tensor_dram_base=user_dma_core.DRAM_ACTIVATION_ADDR,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
@@ -351,6 +357,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.actual_head_dim = 64
         self.num_kv_heads = self.head_dim // self.actual_head_dim  # = 8
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
+        if user_dma_core.CURRENT_DEVICE == "efinix":
+            self.MAX_CONTEXT_SIZE = min(self.MAX_CONTEXT_SIZE, 2048)
         self.PREFILL_CONTEXT_SIZE = model["prefill_context_size"]
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
@@ -1387,6 +1395,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -1428,18 +1437,25 @@ def main():
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
-    configure_device(args.device, dma_device=args.dev)
+    profile = configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
+    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"Using DMA device: {effective_dma}")
+    print(f"  H2C: {DMA_DEVICE_H2C}")
+    print(f"  C2H: {DMA_DEVICE_C2H}")
+    print(f"  USER: {DMA_DEVICE_USER}")
+    print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
+    print(f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}")
 
     ue = UnifiedEngine()
     ue.software_reset()

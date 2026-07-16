@@ -115,7 +115,7 @@ from huggingface_hub import snapshot_download
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, URAM_NEAR_FULL_SIZE, URAM_START_ADDR, URAM_SECTION, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, URAM_NEAR_FULL_SIZE, URAM_START_ADDR, URAM_SECTION, configure_device
 from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 from user_dma_core import INSTRUCTION_SIZE_BYTES
@@ -966,26 +966,30 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
     def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False):
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
-        # Gemma4 FIXED DRAM layout (FULL 4 GB; see notes/notes_gemma4_e2b_vision.md
-        # "Master layout table"). All addresses below 0x100000000 (DMA-mapped DRAM
-        # is 0x00000000 – 0xFFFFFFFF — same as qwen2.5; old DRAM_START_ADDR=0x80000000
-        # only used the upper 2 GB and wasted the rest).
-        #   Weight LM     : 0x00000000 – 0x64000000  (1600 MB)
-        #   Weight Vision : 0x64000000 – 0x6c000000  (128 MB)
-        #   Weight Audio  : 0x6c000000 – 0x78000000  (192 MB)
-        #   Act. Scratch  : 0x78000000 – 0x88000000  (256 MB) ← tensor_base default
-        #   Act. KV cache : 0x88000000 – 0x98000000  (256 MB; tail of activation region)
-        #   ISA Audio     : 0x98000000 – 0xa0000000  (128 MB)
-        #   ISA Unified   : 0xa0000000 – 0x100000000 (1.5 GB) ← program_base default
-        #     (formerly split into vision/prefill/decoder regions; collapsed
-        #     into one contiguous region for the unified programs.bin
-        #     which holds LM prefill+decode + vision encoder ISA in
-        #     one contiguous blob. Total fits comfortably under 4 GB; the prior
-        #     base 0xC0000000 caused the bin to overflow 4 GB once vision
-        #     (~385 MB) was appended to LM (~661 MB).)
-        _params_base  = 0x00000000   # Weight region start
-        _tensor_base  = 0x78000000   # Activation region start (stage scratch)
-        _program_base = 0xa0000000   # unified bin base, gives 1.5 GB headroom
+        _script_dir = script_dir or SCRIPT_DIR
+        _cfg_for_layout = self.load_config(script_dir=_script_dir)
+        _params_base = user_dma_core.DRAM_START_ADDR
+        if user_dma_core.CURRENT_DEVICE == "efinix":
+            # Efinix host/DMA path exposes 0x00000000..0x7fffffff. Pack the
+            # FPGA-resident LM weights, tensor scratch, and ISA below 2 GiB.
+            _align = 0x100000
+            _wd = _cfg_for_layout["_weight_defs"]
+            _fi = _cfg_for_layout["file_info"]
+            _non_layer_sz = sum(
+                _wd[f"{s['key']}_SIZE"]
+                for s in _cfg_for_layout["layers"]["non_layer"]
+                if s["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")
+            )
+            _rope_sz = _wd["ROPE_LOCAL_SIZE"] + _wd["ROPE_GLOBAL_SIZE"]
+            _identity_sz = UE_VECTOR_SIZE * UE_VECTOR_SIZE * _fi["bytes_per_element"]
+            _params_est = _fi["num_layers"] * _wd["LAYER_WEIGHT_SIZE"] + _non_layer_sz + _rope_sz + _identity_sz
+            _tensor_base = ((_params_base + _params_est + _align - 1) // _align) * _align
+            _tensor_est = 0x12300000
+            _program_base = ((_tensor_base + _tensor_est + _align - 1) // _align) * _align
+        else:
+            _params_base  = 0x00000000
+            _tensor_base  = 0x78000000
+            _program_base = 0xa0000000
         if engine_slave:
             _program_base += 0x10000000
         super().__init__(BASE_ADDR=engine_base,
@@ -993,8 +997,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                           program_dram_base=_program_base,
                           tensor_dram_base=_tensor_base)
         self.dual_engine = dual_engine
-        self.script_dir = script_dir or SCRIPT_DIR
-        self._cfg = self.load_config(script_dir=self.script_dir)
+        self.script_dir = _script_dir
+        self._cfg = _cfg_for_layout
         self.weight_defs = self._cfg["_weight_defs"]
 
         fi = self._cfg["file_info"]
@@ -9206,26 +9210,36 @@ defaults (sample files in repo-root test_samples/):
                              "Ignored if --audio is also given.")
     parser.add_argument("--local-weights", action="store_true", help="Use gemma4_e2b_bin/params.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=5.62,
-                        help='Clock cycle time in nanoseconds (default: 3.0, use 2.5 for alveo)')
+                        help='DMA device name for non-Efinix profiles (e.g., xdma0, xdma1). Efinix uses /dev/pcie_dma0_* from its profile.')
+    parser.add_argument('--device', type=str, default='kintex7',
+                        help='FPGA board / bitstream profile. Use efinix for the Efinix 2GB DMA-window profile.')
+    parser.add_argument('--cycle', type=float, default=None,
+                        help='Clock cycle time in nanoseconds. Default: from --device.')
     args = parser.parse_args()
 
-    if args.device == "efinix":
-        print("ERROR: gemma4_e2b requires ~1920 MB of DRAM for weights alone (1600 MB LM + 320 MB vision/audio), exceeding the Efinix board's 1 GB limit.")
-        raise SystemExit(1)
-
-    set_dma_device(args.dev)
+    profile = configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Using DMA device: {args.dev}")
+    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or 5.62)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    axi_width_bits = profile.get("axi_data_width_bits")
+    if axi_width_bits is not None:
+        os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+        user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={user_dma_core.UE_AXI_DATA_WIDTH_BITS}")
+    effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
+    print(f"Using DMA device: {effective_dma}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
-    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
+    print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
+    print(
+        f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, "
+        f"act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, "
+        f"inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}"
+    )
 
     # --- Resolve modality and input path -----------------------------------
     # The script has three modes: LM (text only), VLM (image + text),
@@ -9245,6 +9259,8 @@ defaults (sample files in repo-root test_samples/):
         raise SystemExit(
             "Only one encoder modality per run. Choose either --image / --vision-enable "
             "OR --audio / --audio-enable, not both.")
+    if user_dma_core.CURRENT_DEVICE == "efinix" and (vision_on or audio_on):
+        raise SystemExit("Efinix 2GB Gemma4 E2B profile currently supports LM-only mode.")
 
     image_path = args.image or (DEFAULT_IMAGE if args.vision_enable else None)
     audio_path = args.audio or (DEFAULT_AUDIO if args.audio_enable else None)
@@ -9267,12 +9283,32 @@ defaults (sample files in repo-root test_samples/):
     bin_dir = os.path.join(SCRIPT_DIR, "gemma4_e2b_bin")
     instr_bin = os.path.join(bin_dir, "programs.bin")
     instr_meta = os.path.join(bin_dir, "programs.json")
-    if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
+    needs_compile = not (os.path.exists(instr_bin) and os.path.exists(instr_meta))
+    if not needs_compile:
+        with open(instr_meta, "r") as f:
+            cached_manifest = json.load(f)
+        cached_base = int(cached_manifest.get("instruction_base_addr", "-1"), 16)
+        current_base = ue.get_program_dram_addr()
+        if cached_base != current_base:
+            print(
+                f"[compile] cached programs.bin base 0x{cached_base:X} does not match "
+                f"current base 0x{current_base:X}; rebuilding."
+            )
+            needs_compile = True
+        cached_version = cached_manifest.get("compile_version")
+        if cached_version != INSTRUCTION_BIN_COMPILE_VERSION:
+            print(
+                f"[compile] cached programs.bin version {cached_version!r} does not match "
+                f"{INSTRUCTION_BIN_COMPILE_VERSION!r}; rebuilding."
+            )
+            needs_compile = True
+
+    if needs_compile:
         # By default build the COMPLETE LM + vision + audio bin: the bin holds
         # ISA only, so unused modes cost nothing at runtime, and any later run /
         # run_from_bin / mode can rely on every section being present.
         # GEMMA4_LM_ONLY_BIN=1 skips the vision/audio sections (see README).
-        lm_only_bin = os.environ.get("GEMMA4_LM_ONLY_BIN") == "1"
+        lm_only_bin = os.environ.get("GEMMA4_LM_ONLY_BIN") == "1" or user_dma_core.CURRENT_DEVICE == "efinix"
         _img = None if lm_only_bin else DEFAULT_IMAGE
         _aud = None if lm_only_bin else DEFAULT_AUDIO
         print(f"\n--- First-time compile: building {'LM-only' if lm_only_bin else 'LM + vision + audio'} into programs.bin ---")

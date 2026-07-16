@@ -32,7 +32,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, UE_FMAX_CONTEXT_SIZE,
-    set_dma_device, UnifiedEngine, calculate_snr,
+    configure_device, UnifiedEngine, calculate_snr,
     INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,
 )
 import warnings as _warnings
@@ -42,6 +42,53 @@ import torch.nn as _nn
 from nn_lib import flash_attention_batched_pbi
 
 COMPUTE_DTYPE = torch.bfloat16
+
+MSAM_PARAMS_BASE = 0x80000000
+MSAM_TENSOR_BASE = 0xB0000000
+MSAM_PROGRAM_BASE = 0xD8000000
+
+
+def _set_dram_layout_for_device(device: str) -> None:
+    global MSAM_PARAMS_BASE, MSAM_TENSOR_BASE, MSAM_PROGRAM_BASE
+    if device == "efinix":
+        MSAM_PARAMS_BASE = 0x01000000
+        MSAM_TENSOR_BASE = 0x10000000
+        MSAM_PROGRAM_BASE = 0x40000000
+    else:
+        MSAM_PARAMS_BASE = 0x80000000
+        MSAM_TENSOR_BASE = 0xB0000000
+        MSAM_PROGRAM_BASE = 0xD8000000
+
+
+def _profile_meta() -> dict:
+    return {
+        "format_version": 2,
+        "device": user_dma_core.CURRENT_DEVICE,
+        "axi_width_bits": user_dma_core.UE_AXI_DATA_WIDTH_BITS,
+        "params_dram_base": hex(MSAM_PARAMS_BASE),
+        "tensor_dram_base": hex(MSAM_TENSOR_BASE),
+        "program_dram_base": hex(MSAM_PROGRAM_BASE),
+        "dram_end_addr": hex(user_dma_core.DRAM_END_ADDR),
+    }
+
+
+def _profile_matches(meta: dict) -> bool:
+    profile = meta.get("profile") if isinstance(meta, dict) else None
+    if not isinstance(profile, dict):
+        return False
+    expected = _profile_meta()
+    return all(profile.get(k) == v for k, v in expected.items())
+
+
+def _bins_match_current_profile(bin_dir: str) -> bool:
+    try:
+        with open(os.path.join(bin_dir, "params.json")) as f:
+            params_meta = json.load(f)
+        with open(os.path.join(bin_dir, "programs.json")) as f:
+            programs_meta = json.load(f)
+    except Exception:
+        return False
+    return _profile_matches(params_meta) and _profile_matches(programs_meta)
 
 
 def nms(boxes: torch.Tensor, scores: torch.Tensor, threshold: float):
@@ -1062,7 +1109,11 @@ class MobileSAM_UE(UnifiedEngine):
         # corrupted instructions at execute time -> the decoder PC jumped into garbage, never
         # reached halt, and run_decoder timed out at 120 s with IOU=0. Push programs above the
         # true tensor end. Programs (~33 MB) then end ~0xDA035000, well within 4 GB.
-        super().__init__(program_dram_base=0xD8000000)
+        super().__init__(
+            params_dram_base=MSAM_PARAMS_BASE,
+            tensor_dram_base=MSAM_TENSOR_BASE,
+            program_dram_base=MSAM_PROGRAM_BASE,
+        )
         self.init_unified_engine()
         sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.weight_init(sd)
@@ -3942,7 +3993,12 @@ class MobileSAM_UE(UnifiedEngine):
             "iou_out": 64 * BPE,
         }
         with open(meta_path, "w") as f:
-            json.dump({"size": total, "tensors": tensor_ofs, "tensor_sizes": tensor_sizes}, f)
+            json.dump({
+                "profile": _profile_meta(),
+                "size": total,
+                "tensors": tensor_ofs,
+                "tensor_sizes": tensor_sizes,
+            }, f)
         _original_print(f"  Params: {total / 1024**2:.1f} MB → {bin_path}")
 
     def dump_programs_to_file(self, enc_prog_addr: int, dec_prog_addr: int, bin_dir: str):
@@ -3961,7 +4017,7 @@ class MobileSAM_UE(UnifiedEngine):
             ("encoder", enc_prog_addr, enc_size),
             ("decoder", dec_prog_addr, dec_size),
         ]
-        manifest = {"programs": {}}
+        manifest = {"profile": _profile_meta(), "programs": {}}
         all_bytes = bytearray()
         CHUNK = 1 * 1024 * 1024
         for name, addr, size in programs:
@@ -4534,6 +4590,7 @@ def _bn_fold(w_conv, bn_w, bn_b, bn_mean, bn_var, eps=1e-5):
     return w_fused.to(torch.bfloat16), b_fused.to(torch.bfloat16)
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "efinix":                         return 4.0
     if device == "kintex7":                       return 5.1594
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
@@ -4543,9 +4600,9 @@ def _clock_ns_default_for_device(device: str) -> float:
 
 def main():
     parser = argparse.ArgumentParser(description="MobileSAM mask decoder accelerator test")
-    parser.add_argument("--dev",   default="xdma0")
+    parser.add_argument("--dev",   default=None, help="DMA device override (default: board profile)")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"),
                         default=[512, 512],
                         help="Single-point inference: encode image, run decoder for this point, save best mask")
@@ -4555,14 +4612,21 @@ def main():
                         help="Step through decoder stage-by-stage, asserting no NaNs at each checkpoint")
     args = parser.parse_args()
 
-    set_dma_device(args.dev)
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    profile = configure_device(args.device, dma_device=args.dev)
+    _set_dram_layout_for_device(args.device)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
+    _original_print(f"DRAM layout: params=0x{MSAM_PARAMS_BASE:08X}, tensor=0x{MSAM_TENSOR_BASE:08X}, "
+                    f"program=0x{MSAM_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     if not os.path.exists(WEIGHTS):
         import urllib.request
@@ -4575,7 +4639,7 @@ def main():
         _original_print("  Download complete.")
 
     _original_print("MobileSAM — HW test")
-    _original_print(f"  Device: {args.dev}  clock={clock:.4f} ns")
+    _original_print(f"  Device: {user_dma_core.DMA_DEVICE_H2C}  clock={clock:.4f} ns")
 
     # ---- Inputs ----
     from PIL import Image as _PIL_Image
@@ -4599,11 +4663,15 @@ def main():
     image_pe_t = _pe.permute(2, 0, 1)[None][0].permute(1, 2, 0).reshape(GA, DEC_DIM).bfloat16()
 
     # ---- Compile or load from bins ----
-    bins_exist = (os.path.exists(os.path.join(BIN_DIR, "params.bin"))
-                  and os.path.exists(os.path.join(BIN_DIR, "programs.bin")))
+    bins_present = (os.path.exists(os.path.join(BIN_DIR, "params.bin"))
+                    and os.path.exists(os.path.join(BIN_DIR, "programs.bin")))
+    bins_exist = bins_present and _bins_match_current_profile(BIN_DIR)
+    if bins_present and not bins_exist:
+        _original_print("\nPre-compiled bins do not match this FPGA profile; regenerating …")
     if bins_exist:
         _original_print("\nLoading from pre-compiled bins …")
-        from mobilesam_run_from_bin import MobileSAM_UE_Run
+        from mobilesam_run_from_bin import MobileSAM_UE_Run, _set_dram_layout_for_device as _set_run_bin_layout
+        _set_run_bin_layout(args.device)
         ue = MobileSAM_UE_Run()
         ue.load_params()
         with open(os.path.join(BIN_DIR, "params.json")) as f:

@@ -22,16 +22,52 @@ from huggingface_hub import hf_hub_download
 _original_print = print
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS,
-    set_dma_device, UnifiedEngine,
+    configure_device, UnifiedEngine,
 )
 
 BIN_DIR = os.path.join(SCRIPT_DIR, "mobilesam_bin")
+
+MSAM_PARAMS_BASE = 0x80000000
+MSAM_TENSOR_BASE = 0xB0000000
+MSAM_PROGRAM_BASE = 0xD8000000
+
+
+def _set_dram_layout_for_device(device: str) -> None:
+    global MSAM_PARAMS_BASE, MSAM_TENSOR_BASE, MSAM_PROGRAM_BASE
+    if device == "efinix":
+        MSAM_PARAMS_BASE = 0x01000000
+        MSAM_TENSOR_BASE = 0x10000000
+        MSAM_PROGRAM_BASE = 0x40000000
+    else:
+        MSAM_PARAMS_BASE = 0x80000000
+        MSAM_TENSOR_BASE = 0xB0000000
+        MSAM_PROGRAM_BASE = 0xD8000000
+
+
+def _profile_meta() -> dict:
+    return {
+        "format_version": 2,
+        "device": user_dma_core.CURRENT_DEVICE,
+        "axi_width_bits": user_dma_core.UE_AXI_DATA_WIDTH_BITS,
+        "params_dram_base": hex(MSAM_PARAMS_BASE),
+        "tensor_dram_base": hex(MSAM_TENSOR_BASE),
+        "program_dram_base": hex(MSAM_PROGRAM_BASE),
+        "dram_end_addr": hex(user_dma_core.DRAM_END_ADDR),
+    }
+
+
+def _profile_matches(meta: dict) -> bool:
+    profile = meta.get("profile") if isinstance(meta, dict) else None
+    if not isinstance(profile, dict):
+        return False
+    expected = _profile_meta()
+    return all(profile.get(k) == v for k, v in expected.items())
 
 # ---------------------------------------------------------------------------
 # Architecture constants (match mobilesam_test.py)
@@ -61,7 +97,12 @@ class MobileSAM_UE_Run(UnifiedEngine):
         # jump addresses (flash subroutines) at compile time, and the tensor region runs to
         # ~0xD7602780, so the program must load+execute above it. A mismatched base sends every
         # jump to the wrong address -> hang/garbage.
-        super().__init__(program_dram_base=0xD8000000, clock_period_ns=clock_period_ns)
+        super().__init__(
+            params_dram_base=MSAM_PARAMS_BASE,
+            tensor_dram_base=MSAM_TENSOR_BASE,
+            program_dram_base=MSAM_PROGRAM_BASE,
+            clock_period_ns=clock_period_ns,
+        )
         self.script_dir = SCRIPT_DIR
         # Hang prevention
         self.start_capture()
@@ -205,6 +246,7 @@ class MobileSAM_UE_Run(UnifiedEngine):
 
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "efinix":                         return 4.0
     if device == "kintex7":                       return 5.1594
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
@@ -216,9 +258,10 @@ def main():
     parser = argparse.ArgumentParser(description="MobileSAM inference from pre-compiled bins")
     parser.add_argument("--point", type=int, nargs=2, metavar=("X", "Y"), default=[512, 512],
                         help="Single-point inference at (x, y) (default: 512 512)")
-    parser.add_argument("--dev", type=str, default="xdma0")
+    parser.add_argument("--dev", type=str, default=None,
+                        help="DMA device override (default: board profile)")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     args = parser.parse_args()
 
     # Check bins exist
@@ -238,14 +281,26 @@ def main():
     with open(os.path.join(BIN_DIR, "params.json")) as f:
         param_meta = json.load(f)
 
-    set_dma_device(args.dev)
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    profile = configure_device(args.device, dma_device=args.dev)
+    _set_dram_layout_for_device(args.device)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
+    _original_print(f"DRAM layout: params=0x{MSAM_PARAMS_BASE:08X}, tensor=0x{MSAM_TENSOR_BASE:08X}, "
+                    f"program=0x{MSAM_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
+
+    if not _profile_matches(param_meta) or not _profile_matches(prog_meta):
+        _original_print("Bin profile does not match this FPGA profile; regenerate with:")
+        _original_print(f"  python mobilesam_test.py --device {args.device}")
+        return
 
     # Load image
     img_path = os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
@@ -257,7 +312,7 @@ def main():
     img_arr = torch.from_numpy(np.array(img)).float().permute(2, 0, 1) / 255.0
     image_t = img_arr.unsqueeze(0).bfloat16()
 
-    _original_print(f"MobileSAM on {args.dev} (from pre-compiled bins)\n")
+    _original_print(f"MobileSAM on {user_dma_core.DMA_DEVICE_H2C} (from pre-compiled bins)\n")
 
     # Build engine
     engine = MobileSAM_UE_Run(clock_period_ns=clock)

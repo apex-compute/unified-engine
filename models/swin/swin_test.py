@@ -12,7 +12,7 @@ Weights:
 Usage:
   python swin_test.py
   python swin_test.py --image path/to/image.jpg
-  python swin_test.py --dev xdma0 [--device kintex7] [--cycle 5.15]
+  python swin_test.py --device efinix [--dev pcie_dma0] [--cycle 4.0]
 
 Fixed layout: swin_test.py, swin_config.json, and swin_bin/ live in the same folder.
   user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
@@ -50,10 +50,10 @@ builtins.print = quiet_print
 import nn_lib
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, TYPE,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,
-    set_dma_device, UnifiedEngine,
+    configure_device, UnifiedEngine,
 )
 
 # ---------------------------------------------------------------------------
@@ -557,12 +557,89 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# DRAM partition over 4 GB address space:
-#   2 GB params  /  1 GB activations  /  1 GB programs
+# DRAM partition.
+# Default historical layout targets >=4 GB boards. Efinix has 2 GB total, so
+# configure_swin_runtime() switches to a compact layout before engine creation.
 # ---------------------------------------------------------------------------
-SWIN_PARAMS_BASE  = 0x00000000   # 0.0 GB — 1 GB for weights, biases, norms, unpad/pool weights
-SWIN_TENSOR_BASE  = 0x40000000   # 1.0 GB — 1 GB for intermediate activations, scratch buffers
-SWIN_PROGRAM_BASE = 0x80000000   # 2.0 GB — 2 GB for compiled instruction programs
+SWIN_PARAMS_BASE_DEFAULT  = 0x00000000
+SWIN_TENSOR_BASE_DEFAULT  = 0x40000000
+SWIN_PROGRAM_BASE_DEFAULT = 0x80000000
+
+SWIN_PARAMS_BASE  = SWIN_PARAMS_BASE_DEFAULT
+SWIN_TENSOR_BASE  = SWIN_TENSOR_BASE_DEFAULT
+SWIN_PROGRAM_BASE = SWIN_PROGRAM_BASE_DEFAULT
+
+
+def _set_swin_dram_layout_for_device(device: str) -> None:
+    global SWIN_PARAMS_BASE, SWIN_TENSOR_BASE, SWIN_PROGRAM_BASE
+    if device == "efinix":
+        SWIN_PARAMS_BASE = 0x00000000
+        SWIN_TENSOR_BASE = 0x30000000
+        SWIN_PROGRAM_BASE = 0x70000000
+    else:
+        SWIN_PARAMS_BASE = SWIN_PARAMS_BASE_DEFAULT
+        SWIN_TENSOR_BASE = SWIN_TENSOR_BASE_DEFAULT
+        SWIN_PROGRAM_BASE = SWIN_PROGRAM_BASE_DEFAULT
+
+
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type."""
+    if device == "efinix":
+        return 4.0
+    if device == "kintex7":
+        return 5.1594
+    if device in ("rk", "puzhi"):
+        return 3.0
+    if device in ("bittware", "bittware_256"):
+        return 3.3333
+    if device == "alveo":
+        return 4.0
+    return 10.0
+
+
+def configure_swin_runtime(device: str, dma_device: str | None = None,
+                           cycle: float | None = None) -> dict:
+    profile = configure_device(device, dma_device=dma_device)
+    _set_swin_dram_layout_for_device(device)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if device in ("bittware", "rk") else 256)
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = cycle if cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(device))
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    profile["clock_period_ns"] = clock
+    profile["axi_data_width_bits"] = axi_width_bits
+    return profile
+
+
+def print_swin_profile(device: str, profile: dict) -> None:
+    _original_print(f"FPGA profile: device={device}, clock={profile['clock_period_ns']:.4f} ns, "
+                    f"UE_AXI_DATA_WIDTH_BITS={profile['axi_data_width_bits']}")
+    _original_print("Using DMA device:")
+    _original_print(f"  H2C: {DMA_DEVICE_H2C}")
+    _original_print(f"  C2H: {DMA_DEVICE_C2H}")
+    _original_print(f"  USER: {DMA_DEVICE_USER}")
+    _original_print(f"  BASE: 0x{profile['ue_0_base_addr']:08X}")
+    _original_print(f"  DRAM layout: params=0x{SWIN_PARAMS_BASE:08X}, tensor=0x{SWIN_TENSOR_BASE:08X}, "
+                    f"program=0x{SWIN_PROGRAM_BASE:08X}, end=0x{profile['dram_end_addr']:08X}")
+
+
+def _layout_meta() -> dict:
+    return {
+        "device": user_dma_core.CURRENT_DEVICE,
+        "params_dram_base": SWIN_PARAMS_BASE,
+        "tensor_dram_base": SWIN_TENSOR_BASE,
+        "program_dram_base": SWIN_PROGRAM_BASE,
+    }
+
+
+def _layout_meta_matches(meta: dict) -> bool:
+    expected = _layout_meta()
+    return all(meta.get(k) == v for k, v in expected.items())
 
 
 class Swin_UnifiedEngine(UnifiedEngine):
@@ -600,6 +677,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             self.weight_init()
             self.dump_params()
         self.tensor_init()
+        self._check_dram_layout()
 
     @staticmethod
     def load_config(config_path: str | None = None, script_dir: str | None = None) -> dict:
@@ -627,7 +705,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
     def write_captured_instructions_to_dram(
         self,
-        start_addr: int = DRAM_INSTRUCTION_ADDR,
+        start_addr: int | None = None,
         chunk_bytes: int | None = None,
     ) -> int:
         """Write captured ISA to DRAM, optionally using bounded DMA writes.
@@ -642,6 +720,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
         if self.capture_count == 0:
             print("Warning: No captured instructions to write. Capture count is 0.")
             return 0
+        if start_addr is None:
+            start_addr = self._program_dram_base
 
         self.pad_capture_to_64b_boundary()
         total_bytes = self.capture_count * INSTRUCTION_SIZE_BYTES
@@ -709,6 +789,54 @@ class Swin_UnifiedEngine(UnifiedEngine):
     def _alloc_tensor(self, num_elements: int) -> int:
         """Allocate tensor DRAM buffer. Returns DRAM address."""
         return self.allocate_tensor_dram(num_elements * 2)
+
+    @staticmethod
+    def _swin_attention_modules(attn):
+        """Return q/k/v projections, relative-position owner, and output projection across HF versions."""
+        if all(hasattr(attn, name) for name in ("q_proj", "k_proj", "v_proj")):
+            q_proj, k_proj, v_proj = attn.q_proj, attn.k_proj, attn.v_proj
+            rel_owner = getattr(attn, "relative_position_bias", attn)
+            out_proj = attn.o_proj
+        elif hasattr(attn, "self") and all(hasattr(attn.self, name) for name in ("query", "key", "value")):
+            q_proj, k_proj, v_proj = attn.self.query, attn.self.key, attn.self.value
+            rel_owner = attn.self
+            out_proj = attn.output.dense
+        else:
+            raise AttributeError(f"Unsupported SwinAttention layout: {type(attn)}")
+        return q_proj, k_proj, v_proj, rel_owner, out_proj
+
+    @staticmethod
+    def _swin_mlp_modules(block):
+        """Return MLP expand/contract Linear modules across HF versions."""
+        if hasattr(block, "mlp") and all(hasattr(block.mlp, name) for name in ("fc1", "fc2")):
+            return block.mlp.fc1, block.mlp.fc2
+        if hasattr(block, "intermediate") and hasattr(block.intermediate, "dense") \
+                and hasattr(block, "output") and hasattr(block.output, "dense"):
+            return block.intermediate.dense, block.output.dense
+        raise AttributeError(f"Unsupported SwinLayer MLP layout: {type(block)}")
+
+    def _check_dram_layout(self) -> None:
+        params_end = self._params_dram_base + self.get_params_dram_usage()
+        tensor_end = self._tensor_dram_base + self.get_tensor_dram_usage()
+        if params_end > self._tensor_dram_base:
+            raise RuntimeError(
+                f"Swin params overlap tensor DRAM: params_end=0x{params_end:X}, "
+                f"tensor_base=0x{self._tensor_dram_base:X}"
+            )
+        if tensor_end > self._program_dram_base:
+            raise RuntimeError(
+                f"Swin tensors overlap program DRAM: tensor_end=0x{tensor_end:X}, "
+                f"program_base=0x{self._program_dram_base:X}"
+            )
+        if self._program_dram_base > user_dma_core.DRAM_END_ADDR:
+            raise RuntimeError(
+                f"Swin program base 0x{self._program_dram_base:X} exceeds DRAM end "
+                f"0x{user_dma_core.DRAM_END_ADDR:X}"
+            )
+        _original_print(
+            f"  DRAM usage: params={self.get_params_dram_usage() / 1024**2:.1f} MB, "
+            f"tensors={self.get_tensor_dram_usage() / 1024**2:.1f} MB"
+        )
 
     # ------------------------------------------------------------------
     # Initialization
@@ -785,10 +913,10 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_before_gamma'] = self._alloc_param(block.layernorm_before.weight.data)
                 lw['ln_before_beta'] = self._alloc_param(block.layernorm_before.bias.data)
 
-                # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages.
-                # transformers>=5 flattens projections onto SwinAttention (q_proj/k_proj/v_proj).
                 attn = block.attention
-                for name, proj in [('q', attn.q_proj), ('k', attn.k_proj), ('v', attn.v_proj)]:
+                q_proj, k_proj, v_proj, rel_pos_owner, out_proj = self._swin_attention_modules(attn)
+                # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages.
+                for name, proj in [('q', q_proj), ('k', k_proj), ('v', v_proj)]:
                     lw[f'{name}_weight'] = self._alloc_param(proj.weight.data)
                     lw[f'{name}_bias'] = self._alloc_param(proj.bias.data)
 
@@ -798,9 +926,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # Layout matches flash_attention_batched_pbi: batch b = (w * num_heads + h)
                 # gets bias at offset b * wa_pad * wa_pad. Since all windows share
                 # the same per-head bias, we tile num_windows copies.
-                # transformers>=5 nests these under the SwinRelativePositionBias submodule.
-                rel_pos_bias_table = attn.relative_position_bias.relative_position_bias_table  # (529, num_heads)
-                rel_pos_index = attn.relative_position_bias.relative_position_index  # flat (window_area*window_area,)
+                rel_pos_bias_table = rel_pos_owner.relative_position_bias_table  # (529, num_heads)
+                rel_pos_index = rel_pos_owner.relative_position_index  # flat (window_area*window_area,)
                 rpb = rel_pos_bias_table[rel_pos_index.view(-1)].view(window_area, window_area, num_heads)
                 rpb = rpb.permute(2, 0, 1).contiguous().to(torch.bfloat16)  # (num_heads, 144, 144)
                 # Pad to (num_heads, 192, 192) with -100 in padding positions
@@ -813,8 +940,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     nw * num_heads, window_area_pad, window_area_pad).contiguous()
                 lw['rel_pos_bias'] = self._alloc_param(rpb_tiled)
 
-                # Output projection (attention) — transformers>=5: SwinAttention.o_proj
-                out_proj = block.attention.o_proj
                 lw['out_proj_weight'] = self._alloc_param(out_proj.weight.data)
                 lw['out_proj_bias'] = self._alloc_param(out_proj.bias.data)
 
@@ -822,13 +947,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_after_gamma'] = self._alloc_param(block.layernorm_after.weight.data)
                 lw['ln_after_beta'] = self._alloc_param(block.layernorm_after.bias.data)
 
-                # MLP expand: (mlp_dim, dim) — transformers>=5: SwinMLP.fc1
-                lw['mlp_expand_weight'] = self._alloc_param(block.mlp.fc1.weight.data)
-                lw['mlp_expand_bias'] = self._alloc_param(block.mlp.fc1.bias.data)
-
-                # MLP contract: (dim, mlp_dim) — transformers>=5: SwinMLP.fc2
-                lw['mlp_contract_weight'] = self._alloc_param(block.mlp.fc2.weight.data)
-                lw['mlp_contract_bias'] = self._alloc_param(block.mlp.fc2.bias.data)
+                mlp_expand, mlp_contract = self._swin_mlp_modules(block)
+                lw['mlp_expand_weight'] = self._alloc_param(mlp_expand.weight.data)
+                lw['mlp_expand_bias'] = self._alloc_param(mlp_expand.bias.data)
+                lw['mlp_contract_weight'] = self._alloc_param(mlp_contract.weight.data)
+                lw['mlp_contract_bias'] = self._alloc_param(mlp_contract.bias.data)
 
                 stage_weights.append(lw)
             self.encoder_weights.append(stage_weights)
@@ -1030,7 +1153,9 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 f.write(buf)
                 offset += sz
         with open(meta_path, "w") as f:
-            json.dump({"size": total, "num_labels": self.NUM_LABELS}, f)
+            json.dump({"size": total, "num_labels": self.NUM_LABELS,
+                       "dram_end_addr": user_dma_core.DRAM_END_ADDR,
+                       **_layout_meta()}, f)
         _original_print(f"  Params dumped: {total / 1024**2:.1f} MB → {bin_path}")
 
     def load_params(self) -> bool:
@@ -1042,6 +1167,9 @@ class Swin_UnifiedEngine(UnifiedEngine):
             return False
         with open(meta_path) as f:
             meta = json.load(f)
+        if not _layout_meta_matches(meta):
+            _original_print("  Params layout/profile mismatch — regenerating.")
+            return False
         total = meta["size"]
         self.NUM_LABELS = meta["num_labels"]
         self.NUM_LABELS_PAD = self.pad_dim(self.NUM_LABELS)
@@ -1068,7 +1196,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
         with open(bin_path, "wb") as f:
             f.write(buf)
         with open(meta_path, "w") as f:
-            json.dump({"size": size}, f)
+            json.dump({"size": size, "dram_end_addr": user_dma_core.DRAM_END_ADDR,
+                       **_layout_meta()}, f)
         _original_print(f"  Program dumped: {size / 1024**2:.1f} MB → {bin_path}")
 
     def load_programs(self) -> int | None:
@@ -1080,7 +1209,17 @@ class Swin_UnifiedEngine(UnifiedEngine):
             return None
         with open(bin_path, "rb") as f:
             data = f.read()
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if not _layout_meta_matches(meta):
+            _original_print("  Program layout/profile mismatch — recompiling.")
+            return None
         addr = self.get_program_dram_addr()
+        if addr + len(data) - 1 > user_dma_core.DRAM_END_ADDR:
+            raise RuntimeError(
+                f"Swin program bin exceeds DRAM: end=0x{addr + len(data) - 1:X}, "
+                f"dram_end=0x{user_dma_core.DRAM_END_ADDR:X}"
+            )
         self.dma_write(DMA_DEVICE_H2C, addr, data, len(data))
         self.allocate_program_dram(len(data))
         _original_print(f"  Program loaded: {len(data) / 1024**2:.1f} MB from bin")
@@ -1587,6 +1726,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
         prog_addr = self.get_program_dram_addr()
         self.write_captured_instructions_to_dram(prog_addr, chunk_bytes=self.DMA_CHUNK_BYTES)
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        if self.get_program_dram_addr() - 1 > user_dma_core.DRAM_END_ADDR:
+            raise RuntimeError(
+                f"Swin compiled program exceeds DRAM: end=0x{self.get_program_dram_addr() - 1:X}, "
+                f"dram_end=0x{user_dma_core.DRAM_END_ADDR:X}"
+            )
         self.clear_capture_buffer()
 
         return prog_addr
@@ -1617,41 +1761,28 @@ def preprocess_image(image_path: str) -> torch.Tensor:
 # Main
 # ---------------------------------------------------------------------------
 
-def _clock_ns_default_for_device(device: str) -> float:
-    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
-    if device in ("rk", "puzhi"):                 return 3.0
-    if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 4.0
-    return 10.0
-
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Swin-Large accelerator inference.")
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
-    parser.add_argument("--dev", type=str, default="xdma0", help="DMA device (default: xdma0)")
+    parser.add_argument("--dev", type=str, default=None, help="DMA device name")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default="efinix",
+                        choices=["kintex7", "rk", "puzhi", "bittware", "bittware_256", "alveo", "efinix"],
+                        help='FPGA board profile.')
     args = parser.parse_args()
 
     global _SILENT_MODE
     _SILENT_MODE = True
 
-    set_dma_device(args.dev)
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    profile = configure_swin_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
+    print_swin_profile(args.device, profile)
 
     # Load image
     image_path = args.image or os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     pixel_values = preprocess_image(image_path)
 
-    _original_print(f"Swin-Large-384 on {args.dev}")
+    _original_print(f"Swin-Large-384 on {DMA_DEVICE_H2C}")
 
     # Create engine (loads weights from bin or HF model)
     import time as _time

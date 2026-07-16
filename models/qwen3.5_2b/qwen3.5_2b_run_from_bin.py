@@ -46,15 +46,15 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.normpath(os.path.join(_HERE, "..", "..")))  # template root (kernel)
 sys.path.insert(0, _HERE)
 
+import user_dma_core  # noqa: E402
+
 # The test module's filename has dots, so import it via importlib.
 _spec = importlib.util.spec_from_file_location(
     "qwen3_5_2b_test", os.path.join(_HERE, "qwen3.5_2b_test.py"))
 T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)
 
-from user_dma_core import DMA_DEVICE_H2C  # noqa: E402
-
-MAX_CONTEXT = 256
+MAX_CONTEXT = 512
 TEMPERATURE = 0.0
 TOP_K = 0
 
@@ -64,7 +64,7 @@ def _load_program_section(ue, raw: bytes, off: int, size: int) -> int:
     load address.  The section's JUMP_ABS targets were baked for this base."""
     ue.reset_program_dram_addr()
     addr = ue.get_program_dram_addr()
-    ue.dma_write(DMA_DEVICE_H2C, addr, raw[off:off + size], size)
+    ue.dma_write(T.DMA_DEVICE_H2C, addr, raw[off:off + size], size)
     ue.allocate_program_dram(size)
     return addr
 
@@ -77,7 +77,17 @@ def main():
                     help="Image path → VLM mode (caption the image).")
     ap.add_argument("--vision-enable", action="store_true",
                     help="VLM mode using the bundled sample image.")
+    ap.add_argument("--device", type=str, default="bittware",
+                    choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
+                    help="FPGA board profile. Default: bittware.")
+    ap.add_argument("--dev", type=str, default=None,
+                    help="DMA device name. Efinix ignores this and uses pcie_dma0 paths.")
+    ap.add_argument("--cycle", type=float, default=None,
+                    help="Clock cycle time in ns. Defaults to board profile value.")
     args = ap.parse_args()
+
+    profile = T.configure_q35_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
+    T.print_q35_profile(args.device, profile)
 
     vision_on = bool(args.image) or args.vision_enable
     _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))
@@ -105,6 +115,18 @@ def main():
         raise SystemExit(f"Unified bin metadata not found: {uni_meta}")
     with open(uni_meta) as f:
         meta = json.load(f)
+    expected_meta = {
+        "device": user_dma_core.CURRENT_DEVICE,
+        "params_dram_base": f"0x{T.Q35_PARAMS_BASE:X}",
+        "tensor_dram_base": f"0x{T.Q35_TENSOR_BASE:X}",
+        "program_dram_base": f"0x{T.Q35_PROGRAM_BASE:X}",
+        "max_context": MAX_CONTEXT,
+    }
+    if not T._program_meta_matches(meta, expected_meta):
+        details = ", ".join(
+            f"{k}: bin={meta.get(k)!r}, expected={v!r}" for k, v in expected_meta.items()
+        )
+        raise SystemExit(f"Unified bin layout/profile mismatch ({details}). Rebuild with qwen3.5_2b_test.py.")
     with open(uni_bin, "rb") as f:
         raw = f.read()
     print("=" * 78)

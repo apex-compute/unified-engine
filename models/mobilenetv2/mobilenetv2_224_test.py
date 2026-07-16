@@ -56,7 +56,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
-    set_dma_device, UnifiedEngine,
+    configure_device, UnifiedEngine,
     UE_MODE, URAM_SECTION, URAM_WRITE_SRC, BROADCAST_MODE, LALU_MODE,
 )
 
@@ -466,11 +466,52 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
 # MobileNetV2 Unified Engine
 # ---------------------------------------------------------------------------
 
-# DRAM partition over 4 GB address space:
-#   2 GB params / 1 GB activations / 1 GB programs
+# Default DRAM partition over a 4 GB address space.
 MBV2_PARAMS_BASE  = 0x00000000
 MBV2_TENSOR_BASE  = 0x40000000
 MBV2_PROGRAM_BASE = 0x80000000
+
+
+def _set_dram_layout_for_device(device: str) -> None:
+    """Select MobileNetV2 arenas before constructing the engine."""
+    global MBV2_PARAMS_BASE, MBV2_TENSOR_BASE, MBV2_PROGRAM_BASE
+    if device == "efinix":
+        # Fits the 2 GB Efinix DMA aperture and matches existing efinix cache metadata.
+        MBV2_PARAMS_BASE = 0x01000000
+        MBV2_TENSOR_BASE = 0x10000000
+        MBV2_PROGRAM_BASE = 0x20000000
+    else:
+        MBV2_PARAMS_BASE = 0x00000000
+        MBV2_TENSOR_BASE = 0x40000000
+        MBV2_PROGRAM_BASE = 0x80000000
+
+
+def _cache_layout_meta(size: int, extra: dict | None = None) -> dict:
+    meta = {
+        "size": size,
+        "device": user_dma_core.CURRENT_DEVICE,
+        "params_dram_base": MBV2_PARAMS_BASE,
+        "tensor_dram_base": MBV2_TENSOR_BASE,
+        "program_dram_base": MBV2_PROGRAM_BASE,
+        "dram_end_addr": user_dma_core.DRAM_END_ADDR,
+        "graph_version": 1,
+    }
+    if extra:
+        meta.update(extra)
+    return meta
+
+
+def _cache_layout_matches(meta: dict) -> bool:
+    if not meta:
+        return False
+    expected = {
+        "device": user_dma_core.CURRENT_DEVICE,
+        "params_dram_base": MBV2_PARAMS_BASE,
+        "tensor_dram_base": MBV2_TENSOR_BASE,
+        "program_dram_base": MBV2_PROGRAM_BASE,
+        "graph_version": 1,
+    }
+    return all(meta.get(k) == v for k, v in expected.items())
 
 
 class MobileNetV2_UnifiedEngine(UnifiedEngine):
@@ -837,7 +878,7 @@ class MobileNetV2_UnifiedEngine(UnifiedEngine):
                 f.write(buf)
                 offset += sz
         with open(meta_path, "w") as f:
-            json.dump({"size": total, "num_labels": self.NUM_LABELS}, f)
+            json.dump(_cache_layout_meta(total, {"num_labels": self.NUM_LABELS}), f)
         _original_print(f"  Params dumped: {total / 1024**2:.1f} MB → {bin_path}")
         model, _ = _ensure_hf_model(self.script_dir, self.cfg)
         labels_path = os.path.join(bin_dir, "labels.json")
@@ -854,6 +895,9 @@ class MobileNetV2_UnifiedEngine(UnifiedEngine):
             return False
         with open(meta_path) as f:
             meta = json.load(f)
+        if "device" in meta and not _cache_layout_matches(meta):
+            _original_print("  Params cache layout mismatch; regenerating params")
+            return False
         total = meta["size"]
         self.NUM_LABELS = meta["num_labels"]
         self.NUM_LABELS_PAD = self.pad_dim(self.NUM_LABELS)
@@ -879,7 +923,7 @@ class MobileNetV2_UnifiedEngine(UnifiedEngine):
         with open(bin_path, "wb") as f:
             f.write(buf)
         with open(meta_path, "w") as f:
-            json.dump({"size": size}, f)
+            json.dump(_cache_layout_meta(size), f)
         _original_print(f"  Program dumped: {size / 1024**2:.1f} MB → {bin_path}")
 
     def load_programs(self) -> int | None:
@@ -887,6 +931,11 @@ class MobileNetV2_UnifiedEngine(UnifiedEngine):
         bin_path = os.path.join(bin_dir, "programs.bin")
         meta_path = os.path.join(bin_dir, "programs.json")
         if not os.path.exists(bin_path) or not os.path.exists(meta_path):
+            return None
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if "device" in meta and not _cache_layout_matches(meta):
+            _original_print("  Program cache layout mismatch; recompiling")
             return None
         with open(bin_path, "rb") as f:
             data = f.read()
@@ -1143,6 +1192,7 @@ def preprocess_image(image_path: str, size: int = 224) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "efinix":                         return 4.0
     if device == "kintex7":                       return 5.1594
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
@@ -1154,9 +1204,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="MobileNetV2-1.0 accelerator inference.")
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
-    parser.add_argument("--dev", type=str, default="xdma0", help="DMA device (default: xdma0)")
+    parser.add_argument("--dev", type=str, default=None, help="DMA device override (default: board profile)")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--cleanup", action="store_true",
                         help="Delete compile artifacts from mobilenetv2_bin/ before running. "
                              "Cached HF weights (hf_model/) are preserved.")
@@ -1177,22 +1227,26 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
 
-    set_dma_device(args.dev)
+    profile = configure_device(args.device, dma_device=args.dev)
+    _set_dram_layout_for_device(args.device)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
+    _original_print(f"DRAM layout: params=0x{MBV2_PARAMS_BASE:08X}, tensor=0x{MBV2_TENSOR_BASE:08X}, "
+                    f"program=0x{MBV2_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     image_path = args.image or os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     pixel_values = preprocess_image(image_path, size=MobileNetV2_UnifiedEngine.IMAGE_SIZE)
 
-    _original_print(f"MobileNetV2-1.0-{MobileNetV2_UnifiedEngine.IMAGE_SIZE} on {args.dev}")
+    _original_print(f"MobileNetV2-1.0-{MobileNetV2_UnifiedEngine.IMAGE_SIZE} on {user_dma_core.DMA_DEVICE_H2C}")
 
     import threading
     import time as _time
