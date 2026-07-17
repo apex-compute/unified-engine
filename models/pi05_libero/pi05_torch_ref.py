@@ -3,7 +3,7 @@ Pure PyTorch reimplementation of pi0.5 (LIBERO checkpoint) forward pass,
 independent of JAX/openpi, for CPU/CUDA testing at different quant formats
 (fp32/bf16/IF4) before FPGA bring-up.
 
-Weights are loaded from models/pi05_libero/weights_export/*.npy (already
+Weights are loaded from models/pi05_libero/pi05_libero_bin/weights_export/*.npy (already
 exported from the real gs://openpi-assets/checkpoints/pi05_libero checkpoint).
 
 Usage:
@@ -20,7 +20,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-WEIGHTS_DIR = Path(__file__).parent / "weights_export"
+# Generated artifacts (bins + the weight export) all live under the bin dir.
+WEIGHTS_DIR = Path(__file__).parent / "pi05_libero_bin" / "weights_export"
 
 # ---------------------------------------------------------------------------
 # IF4 quantization: block_size=64, 4-bit signed code in [-8,7], one fp32 scale
