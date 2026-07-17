@@ -36,6 +36,12 @@ permissions:
 
 jobs:
   hw-ci:
+    # Skip the sync PRs opened by andromeda's pcie-build workflow: that workflow
+    # already flashed this exact commit onto a board and ran the full suite green
+    # before opening the PR, so re-running it here just occupies the shared board.
+    # head_ref is empty outside pull_request events, so the push to main on merge
+    # still runs normally.
+    if: ${{ !startsWith(github.head_ref, 'sync_pcie_only_') }}
     runs-on: self-hosted
     # Leave the two-hour nightly scheduler five minutes to collect and report
     # this job's terminal result if the hardware suite reaches its time limit.
