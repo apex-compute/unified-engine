@@ -23,11 +23,19 @@ clean:
 	rm -fv models/gemma3/gemma3_if8_bin/*instruction.json
 	rm -fv models/gemma4_e2b/gemma4_e2b_bin/programs*.bin
 	rm -fv models/gemma4_e2b/gemma4_e2b_bin/programs*.json
+	rm -fv models/gemma4_e2b/gemma4_e2b_bin/*instruction*.bin
+	rm -fv models/gemma4_e2b/gemma4_e2b_bin/*instruction*.json
 	rm -fv models/gemma4_e4b/gemma4_e4b_bin/programs*.bin
 	rm -fv models/gemma4_e4b/gemma4_e4b_bin/programs*.json
+	rm -fv models/gemma4_e4b/gemma4_e4b_bin/*instruction*.bin
+	rm -fv models/gemma4_e4b/gemma4_e4b_bin/*instruction*.json
 	rm -rfv models/gpt2/gpt2_bin/
+	rm -fv models/llama3.2_1b/llama3.2_1b_bin/programs*.bin
+	rm -fv models/llama3.2_1b/llama3.2_1b_bin/programs*.json
 	rm -fv models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
 	rm -fv models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
+	rm -fv models/llama3.2_3b/llama3.2_3b_bin/programs*.bin
+	rm -fv models/llama3.2_3b/llama3.2_3b_bin/programs*.json
 	rm -fv models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin
 	rm -fv models/locateanything_3b/locateanything_3b_bin/programs*.bin
 	rm -fv models/locateanything_3b/locateanything_3b_bin/programs*.json
@@ -45,8 +53,8 @@ clean:
 	rm -rfv models/mobilesam/mobilesam_bin/
 	rm -fv models/parakeet/parakeet_bin/params.bin
 	rm -fv models/parakeet/parakeet_bin/params.json
-	rm -fv models/parakeet/parakeet_bin/programs.bin
-	rm -fv models/parakeet/parakeet_bin/programs.json
+	rm -fv models/parakeet/parakeet_bin/programs*.bin
+	rm -fv models/parakeet/parakeet_bin/programs*.json
 	rm -fv models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.bin
 	rm -fv models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.json
 	rm -fv models/qwen3_1.7b/qwen3_1.7b_bin/qwen3_1.7b_instruction*

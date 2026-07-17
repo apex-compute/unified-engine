@@ -32,6 +32,7 @@ from user_dma_core import (
 )
 
 BIN_DIR = os.path.join(SCRIPT_DIR, "mobilesam_bin")
+MOBILESAM_ARTIFACT_VERSION = 2
 
 MSAM_PARAMS_BASE = 0x80000000
 MSAM_TENSOR_BASE = 0xB0000000
@@ -126,6 +127,8 @@ class MobileSAM_UE_Run(UnifiedEngine):
             return False
         with open(meta_path) as f:
             meta = json.load(f)
+        if meta.get("artifact_version") != MOBILESAM_ARTIFACT_VERSION:
+            raise RuntimeError("MobileSAM params artifact is stale; rebuild it with mobilesam_test.py")
         total = meta["size"]
         CHUNK = 1 * 1024 * 1024
         with open(bin_path, "rb") as f:
@@ -146,6 +149,8 @@ class MobileSAM_UE_Run(UnifiedEngine):
             return None
         with open(meta_path) as f:
             manifest = json.load(f)
+        if manifest.get("artifact_version") != MOBILESAM_ARTIFACT_VERSION:
+            raise RuntimeError("MobileSAM program artifact is stale; rebuild it with mobilesam_test.py")
         with open(bin_path, "rb") as f:
             all_bytes = f.read()
         addrs = {}

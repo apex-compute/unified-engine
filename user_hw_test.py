@@ -78,6 +78,8 @@ _RNG_STATE_END = None
 _RNG_SEED = None
 _FAILED_TEST_RNG_PATH = "/tmp/rng_failed_test.pkl"
 _MAX_RNG_ALIGNED_AXI_DATA_WIDTH_BITS = 512
+# Allow a 0.5% decode-cost penalty for the dynamic Gemma3 hardware change.
+GEMMA3_HARDWARE_PENALTY_FACTOR = 1.005
 KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
 
 
@@ -510,424 +512,301 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
         ue.clear_capture_buffer()
 
 
-def matmat_mul_two_cores_test(M: int, K: int, N: int, softmax_enable: bool = False, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, dynamic: bool = False, input_scale: float = 1.0, snr_threshold_db: float = 40.0):
-    """
-    Run two-engine matmul via UnifiedEngine.matmat_mul_two_cores().
-    Uses balanced 1/2 + 1/2 row sharding.
-    """
+def matmat_mul_two_cores_unified_test(
+    runtime_list=None,
+    softmax_enable: bool = False,
+    gelu_enable: bool = False,
+    silu_enable: bool = False,
+    sigmoid_enable: bool = False,
+    clamp_enable: bool = False,
+    log_enable: bool = False,
+    input_scale: float = 1.0,
+    snr_threshold_db: float = 40.0,
+):
+    """Run RNG-matched legacy/dynamic two-core matmuls for each runtime shape."""
     import user_dma_core
 
-    assert M >= 2, f"M must be at least 2 for two-core test, got {M}"
+    if runtime_list is None:
+        runtime_list = [(1920, 768, 2048)]
+    assert runtime_list, "runtime_list must be non-empty"
 
-    engine0_base = user_dma_core.UE_0_BASE_ADDR
-    engine1_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000
-    tensor_region_stride = 0x04000000
+    def _run_case(M, K, N, dynamic):
+        engine0_base = user_dma_core.UE_0_BASE_ADDR
+        engine1_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000
+        tensor_region_stride = 0x04000000
 
-    ue0 = UnifiedEngine(BASE_ADDR=engine0_base)
-    ue1 = UnifiedEngine(BASE_ADDR=engine1_base)
-    ue0._tensor_dram_addr = DRAM_ACTIVATION_ADDR
-    ue1._tensor_dram_addr = DRAM_ACTIVATION_ADDR + tensor_region_stride
-    ue0._next_program_dram_addr = DRAM_INSTRUCTION_ADDR
-    ue1._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + 0x01000000
+        ue0 = UnifiedEngine(BASE_ADDR=engine0_base)
+        ue1 = UnifiedEngine(BASE_ADDR=engine1_base)
+        ue0._tensor_dram_addr = DRAM_ACTIVATION_ADDR
+        ue1._tensor_dram_addr = DRAM_ACTIVATION_ADDR + tensor_region_stride
+        ue0._next_program_dram_addr = DRAM_INSTRUCTION_ADDR
+        ue1._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + 0x01000000
 
-    A_DRAM_ADDR = ue0.allocate_tensor_dram(M * K * 2)
-    B_DRAM_ADDR = ue0.allocate_tensor_dram(N * K * 2)
-    OUTPUT_DRAM_ADDR = ue0.allocate_tensor_dram(M * N * 2)
+        A_DRAM_ADDR = ue0.allocate_tensor_dram(M * K * 2)
+        B_DRAM_ADDR = ue0.allocate_tensor_dram(N * K * 2)
+        OUTPUT_DRAM_ADDR = ue0.allocate_tensor_dram(M * N * 2)
 
-    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
-    # input_scale widens the post-matmul variance so softmax hits the
-    # exp + bf20 adder tree across a broader dynamic range (see matmat_mul_test).
-    if input_scale != 1.0:
-        a = (a.to(torch.float32) * float(input_scale)).to(torch.bfloat16)
-    b = torch.randn(N, K, dtype=torch.bfloat16)
+        a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+        if input_scale != 1.0:
+            a = (a.to(torch.float32) * float(input_scale)).to(torch.bfloat16)
+        b = torch.randn(N, K, dtype=torch.bfloat16)
 
-    ue0.dma_to_accelerator_memory(A_DRAM_ADDR, a)
-    ue0.dma_to_accelerator_memory(B_DRAM_ADDR, b)
+        ue0.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+        ue0.dma_to_accelerator_memory(B_DRAM_ADDR, b)
 
-    total_flops_from_matmat_mul = UnifiedEngine.matmat_mul_two_cores(ue0=ue0, ue1=ue1, M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, softmax_enable=softmax_enable, gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable, clamp_enable=clamp_enable, log_enable=log_enable, dynamic=dynamic)
-    ue0.report_timing_and_instruction_count()
-    ue1.report_timing_and_instruction_count()
+        total_flops = UnifiedEngine.matmat_mul_two_cores(
+            ue0=ue0,
+            ue1=ue1,
+            M=M,
+            K=K,
+            N=N,
+            A_DRAM_ADDR=A_DRAM_ADDR,
+            B_DRAM_ADDR=B_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            softmax_enable=softmax_enable,
+            gelu_enable=gelu_enable,
+            silu_enable=silu_enable,
+            sigmoid_enable=sigmoid_enable,
+            clamp_enable=clamp_enable,
+            log_enable=log_enable,
+            dynamic=dynamic,
+        )
+        ue0.report_timing_and_instruction_count()
+        ue1.report_timing_and_instruction_count()
 
-    # Parallel completion time is bounded by the slower engine.
-    latency_us = max(ue0.report_latency_in_us(), ue1.report_latency_in_us())
-    flop_rate_gflops = total_flops_from_matmat_mul / (latency_us * 1e3)
-    flops_ratio = flop_rate_gflops / user_dma_core.UE_PEAK_GFLOPS / 20
-    print(f"Report FLOPS for two-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, dynamic={dynamic}")
+        # Parallel completion time is bounded by the slower engine.
+        latency_us = max(ue0.report_latency_in_us(), ue1.report_latency_in_us())
+        flop_rate_gflops = total_flops / (latency_us * 1e3)
+        flops_ratio = flop_rate_gflops / user_dma_core.UE_PEAK_GFLOPS / 20
+        print(
+            f"Report FLOPS for two-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS, "
+            f"{flops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, "
+            f"softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, "
+            f"silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, dynamic={dynamic}"
+        )
 
-    generate_trace(ue0, f"matmat_mul_two_cores_trace_engine0_{M // 2}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
-    generate_trace(ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
+        trace_suffix = (
+            f"{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_"
+            f"{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_"
+            f"{'silu_enabled' if silu_enable else 'silu_disabled'}_"
+            f"{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}"
+        )
+        generate_trace(
+            ue0, f"matmat_mul_two_cores_trace_engine0_{M // 2}_{trace_suffix}.csv")
+        generate_trace(
+            ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{trace_suffix}.csv")
 
-    output = ue0.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-    ref = a @ b.T
+        output = ue0.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+        ref = a @ b.T
+        if gelu_enable:
+            ref = ref * torch.sigmoid(1.702 * ref)
+        elif silu_enable:
+            ref = ref * torch.sigmoid(ref)
+        elif sigmoid_enable:
+            ref = torch.sigmoid(ref)
+        elif clamp_enable:
+            ref = torch.clamp(ref, min=0.0)
+        elif log_enable:
+            ref = torch.log(torch.clamp(ref, min=1e-3))
+        if softmax_enable:
+            ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
 
-    def apply_gelu(x):
-        return x * torch.sigmoid(1.702 * x)
+        snr_combined = calculate_snr(ref, output)
+        print(f"Two-cores matmul SNR combined: {snr_combined:.2f} dB")
+        assert snr_combined >= snr_threshold_db or snr_combined == float("inf"), \
+            f"SNR {snr_combined:.2f} dB must be at least {snr_threshold_db:g} dB"
 
-    def apply_silu(x):
-        return x * torch.sigmoid(x)
+        flags = []
+        if softmax_enable: flags.append("softmax")
+        if gelu_enable:    flags.append("gelu")
+        if silu_enable:    flags.append("silu")
+        if sigmoid_enable: flags.append("sigmoid")
+        if clamp_enable:   flags.append("clamp")
+        if log_enable:     flags.append("log")
+        if dynamic:        flags.append("dynamic")
+        if input_scale != 1.0: flags.append(f"scale={input_scale:g}")
+        flag_str = ("+" + "+".join(flags)) if flags else ""
+        record_test(
+            f"matmat_mul_two_cores{flag_str}",
+            f"M={M}, K={K}, N={N}",
+            snr_db=snr_combined,
+            gflops=flop_rate_gflops,
+        )
 
-    def apply_sigmoid(x):
-        return torch.sigmoid(x)
+        ue0.reset_tensor_dram_addr()
+        ue0.clear_capture_buffer()
+        ue1.reset_tensor_dram_addr()
+        ue1.clear_capture_buffer()
 
-    if gelu_enable:
-        ref = apply_gelu(ref)
-    elif silu_enable:
-        ref = apply_silu(ref)
-    elif sigmoid_enable:
-        ref = apply_sigmoid(ref)
-    elif clamp_enable:
-        ref = torch.clamp(ref, min=0.0)
-    elif log_enable:
-        ref = torch.log(torch.clamp(ref, min=1e-3))
-
-    if softmax_enable:
-        ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
-
-    snr_combined = calculate_snr(ref, output)
-    print(f"Two-cores matmul SNR combined: {snr_combined:.2f} dB")
-    assert snr_combined >= snr_threshold_db or snr_combined == float('inf'), f"SNR {snr_combined:.2f} dB must be at least {snr_threshold_db:g} dB"
-
-    flags = []
-    if softmax_enable: flags.append("softmax")
-    if gelu_enable:    flags.append("gelu")
-    if silu_enable:    flags.append("silu")
-    if sigmoid_enable: flags.append("sigmoid")
-    if clamp_enable:   flags.append("clamp")
-    if log_enable:     flags.append("log")
-    if dynamic:        flags.append("dynamic")
-    if input_scale != 1.0: flags.append(f"scale={input_scale:g}")
-    flag_str = ("+" + "+".join(flags)) if flags else ""
-    record_test(f"matmat_mul_two_cores{flag_str}",
-                f"M={M}, K={K}, N={N}",
-                snr_db=snr_combined,
-                gflops=flop_rate_gflops)
-
-    ue0.reset_tensor_dram_addr()
-    ue0.clear_capture_buffer()
-    ue1.reset_tensor_dram_addr()
-    ue1.clear_capture_buffer()
+    for M, K, N in runtime_list:
+        assert M >= 2, f"M must be at least 2 for two-core execution, got M={M}"
+        assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, \
+            "runtime K and N must be multiples of 64"
+        _run_rng_matched_pair(
+            lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=False),
+            lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=True),
+        )
 
 
-def unified_attention_test(
-    batch: int = 256,
-    aligned_seq_len: int = 256,
-    head_dim: int = 128,
-    dynamic: bool = False,
-    dynamic_addr: bool = False,
-):
-    """
-    Tests unified attention core:
+def unified_attention_test(batch: int = 256, aligned_seq_len: int = 256, head_dim: int = 128):
+    """RNG-matched legacy vs. fully-dynamic unified-attention coverage — two scenarios per shape:
+
+      * legacy leg: everything compile-time (baked batch/aligned_seq_len/head_dim/scale, literal
+        DRAM bases).
+      * fully-dynamic leg: runtime batch/aligned_seq_len, GPR-sourced Q/K/V/bias/out bases, runtime
+        head_dim and runtime ``1/sqrt(head_dim)`` Q pre-scale (``dynamic_addr`` + ``dynamic_headdim``,
+        the latter implying ``dynamic_scale``).
+
+    Tests the unified attention core:
 
       Q    [batch, head_dim]
       K/V  [aligned_seq_len, head_dim]
       bias [batch, aligned_seq_len] full-matrix
       out  [batch, head_dim]
+
+    The inner ``_run_case`` also supports any partial dynamic subset (dynamic-only, dynamic+addr,
+    dynamic+scale, ...); those combos are core-supported but intentionally not exercised here — only
+    the two endpoints (fully static, fully dynamic) are tested.
     """
-    ue = UnifiedEngine()
-    if aligned_seq_len % UE_VECTOR_SIZE != 0:
-        raise ValueError(f"aligned_seq_len={aligned_seq_len} must be a multiple of {UE_VECTOR_SIZE}")
-    if dynamic_addr and not dynamic:
-        raise ValueError("unified_attention_test: dynamic_addr=True requires dynamic=True")
+    def _run_case(dynamic=False, dynamic_addr=False, dynamic_scale=False, dynamic_headdim=False):
+        ue = UnifiedEngine()
+        if aligned_seq_len % UE_VECTOR_SIZE != 0:
+            raise ValueError(f"aligned_seq_len={aligned_seq_len} must be a multiple of {UE_VECTOR_SIZE}")
+        if dynamic_addr and not dynamic:
+            raise ValueError("unified_attention_test: dynamic_addr=True requires dynamic=True")
+        if dynamic_headdim:
+            dynamic_scale = True
+        if (dynamic_scale or dynamic_headdim) and not dynamic:
+            raise ValueError("unified_attention_test: dynamic_scale/dynamic_headdim require dynamic=True")
 
-    bytes_per_element = 2
-    Q_DRAM_ADDR = ue.allocate_tensor_dram(batch * head_dim * bytes_per_element)
-    K_DRAM_ADDR = ue.allocate_tensor_dram(aligned_seq_len * head_dim * bytes_per_element)
-    V_DRAM_ADDR = ue.allocate_tensor_dram(aligned_seq_len * head_dim * bytes_per_element)
-    BIAS_DRAM_ADDR = ue.allocate_tensor_dram(batch * aligned_seq_len * bytes_per_element)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(batch * head_dim * bytes_per_element)
-    SCRATCH_DRAM_ADDR = ue.allocate_tensor_dram(
-        (
-            head_dim * aligned_seq_len
-            + aligned_seq_len * aligned_seq_len
-            + batch * head_dim
-        ) * bytes_per_element
+        bytes_per_element = 2
+        Q_DRAM_ADDR = ue.allocate_tensor_dram(batch * head_dim * bytes_per_element)
+        K_DRAM_ADDR = ue.allocate_tensor_dram(aligned_seq_len * head_dim * bytes_per_element)
+        V_DRAM_ADDR = ue.allocate_tensor_dram(aligned_seq_len * head_dim * bytes_per_element)
+        BIAS_DRAM_ADDR = ue.allocate_tensor_dram(batch * aligned_seq_len * bytes_per_element)
+        OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(batch * head_dim * bytes_per_element)
+        SCRATCH_DRAM_ADDR = ue.allocate_tensor_dram(
+            (
+                head_dim * aligned_seq_len
+                + aligned_seq_len * aligned_seq_len
+                + batch * head_dim
+            ) * bytes_per_element
+        )
+        IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+
+        batch_reg = ue.alloc_isa_reg() if dynamic else None
+        aligned_reg = ue.alloc_isa_reg() if dynamic else None
+        q_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        k_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        v_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        bias_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        out_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        scale_reg = ue.alloc_isa_reg() if dynamic_scale else None
+        head_dim_reg = ue.alloc_isa_reg() if dynamic_headdim else None
+
+        ue.start_capture()
+        if dynamic:
+            ue.generate_instruction_add_set(batch_reg, batch)
+            ue.generate_instruction_add_set(aligned_reg, aligned_seq_len)
+        if dynamic_addr:
+            ue.generate_instruction_add_set(q_addr_reg, Q_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(k_addr_reg, K_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(v_addr_reg, V_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(bias_addr_reg, BIAS_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(out_addr_reg, OUTPUT_DRAM_ADDR >> 3)
+        if dynamic_scale:
+            ue.generate_instruction_add_set(scale_reg, ue.float_to_bf16(1.0 / math.sqrt(head_dim)))
+        if dynamic_headdim:
+            ue.generate_instruction_add_set(head_dim_reg, head_dim)
+
+        total_flops = ue.unified_attention_core(
+            batch=batch,
+            aligned_seq_len=aligned_seq_len,
+            head_dim=head_dim,
+            Q_DRAM_ADDR=Q_DRAM_ADDR,
+            K_DRAM_ADDR=K_DRAM_ADDR,
+            V_DRAM_ADDR=V_DRAM_ADDR,
+            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
+            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+            gpr_batch_reg=batch_reg,
+            gpr_aligned_seq_len_reg=aligned_reg,
+            gpr_q_addr=q_addr_reg,
+            gpr_k_addr=k_addr_reg,
+            gpr_v_addr=v_addr_reg,
+            gpr_bias_addr=bias_addr_reg,
+            gpr_out_addr=out_addr_reg,
+            gpr_scale_reg=scale_reg,
+            gpr_head_dim_reg=head_dim_reg,
+        )
+        ue.stop_capture()
+        for reg in (head_dim_reg, scale_reg, out_addr_reg, bias_addr_reg, v_addr_reg, k_addr_reg, q_addr_reg, aligned_reg, batch_reg):
+            if reg is not None:
+                ue.release_isa_reg()
+        ue.generate_instruction_halt()
+        program_dram_addr = ue.get_program_dram_addr()
+        instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+        ue.write_captured_instructions_to_dram(program_dram_addr)
+        ue.allocate_program_dram(instruction_size_bytes)
+
+        q = torch.randn(batch, head_dim, dtype=torch.bfloat16)
+        k = torch.randn(aligned_seq_len, head_dim, dtype=torch.bfloat16)
+        v = torch.randn(aligned_seq_len, head_dim, dtype=torch.bfloat16)
+        bias = torch.randn(batch, aligned_seq_len, dtype=torch.bfloat16)
+        identity = torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16)
+
+        ue.dma_to_accelerator_memory(Q_DRAM_ADDR, q)
+        ue.dma_to_accelerator_memory(K_DRAM_ADDR, k)
+        ue.dma_to_accelerator_memory(V_DRAM_ADDR, v)
+        ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias)
+        ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, identity)
+
+        ue.start_execute_from_dram(program_dram_addr)
+        ue.wait_queue(50.0)
+        ue.report_timing_and_instruction_count()
+
+        output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (batch, head_dim))
+        report_flop_rate_gflops, report_gflops_ratio = ue.report_flop_rate_gflops(total_flops)
+        print(
+            f"Report FLOPS for Unified Attention: {report_flop_rate_gflops:.2f} GFLOPS, "
+            f"{report_gflops_ratio:.2f}% peak throughput for batch={batch}, "
+            f"aligned_seq_len={aligned_seq_len}, head_dim={head_dim}, dynamic={dynamic}, "
+            f"dynamic_addr={dynamic_addr}"
+        )
+
+        q_scaled = q * (1.0 / math.sqrt(head_dim))
+        scores = q_scaled @ k.t()
+        scores = scores + bias
+        probs = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+        ref = probs @ v
+
+        snr_db_ref = calculate_snr(ref, output)
+        print(f"Reference SNR Analysis for Unified Attention: {snr_db_ref:.2f} dB")
+        assert snr_db_ref >= 32 or snr_db_ref == float("inf"), f"SNR {snr_db_ref:.2f} dB must be at least 32 dB"
+
+        tag = ("+dynamic" if dynamic else "") + ("+dynaddr" if dynamic_addr else "") \
+            + ("+dynscale" if (dynamic_scale and not dynamic_headdim) else "") + ("+dynheaddim" if dynamic_headdim else "")
+        record_test(
+            f"unified_attention{tag}",
+            f"batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}",
+            snr_db=snr_db_ref,
+            gflops=report_flop_rate_gflops,
+            inst_bytes=instruction_size_bytes,
+        )
+
+        ue.clear_capture_buffer()
+        ue.reset_tensor_dram_addr()
+        ue.reset_program_dram_addr()
+
+    _run_rng_matched_pair(
+        lambda: _run_case(),
+        lambda: _run_case(dynamic=True, dynamic_addr=True, dynamic_headdim=True),
     )
-    IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-
-    batch_reg = ue.alloc_isa_reg() if dynamic else None
-    aligned_reg = ue.alloc_isa_reg() if dynamic else None
-    q_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    k_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    v_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    bias_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    out_addr_reg = ue.alloc_isa_reg() if dynamic_addr else None
-
-    ue.start_capture()
-    if dynamic:
-        ue.generate_instruction_add_set(batch_reg, batch)
-        ue.generate_instruction_add_set(aligned_reg, aligned_seq_len)
-    if dynamic_addr:
-        ue.generate_instruction_add_set(q_addr_reg, Q_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(k_addr_reg, K_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(v_addr_reg, V_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(bias_addr_reg, BIAS_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(out_addr_reg, OUTPUT_DRAM_ADDR >> 3)
-
-    total_flops = ue.unified_attention_core(
-        batch=batch,
-        aligned_seq_len=aligned_seq_len,
-        head_dim=head_dim,
-        Q_DRAM_ADDR=Q_DRAM_ADDR,
-        K_DRAM_ADDR=K_DRAM_ADDR,
-        V_DRAM_ADDR=V_DRAM_ADDR,
-        BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
-        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-        SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
-        IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-        gpr_batch_reg=batch_reg,
-        gpr_aligned_seq_len_reg=aligned_reg,
-        gpr_q_addr=q_addr_reg,
-        gpr_k_addr=k_addr_reg,
-        gpr_v_addr=v_addr_reg,
-        gpr_bias_addr=bias_addr_reg,
-        gpr_out_addr=out_addr_reg,
-    )
-    ue.stop_capture()
-    for reg in (out_addr_reg, bias_addr_reg, v_addr_reg, k_addr_reg, q_addr_reg, aligned_reg, batch_reg):
-        if reg is not None:
-            ue.release_isa_reg()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(instruction_size_bytes)
-
-    q = torch.randn(batch, head_dim, dtype=torch.bfloat16)
-    k = torch.randn(aligned_seq_len, head_dim, dtype=torch.bfloat16)
-    v = torch.randn(aligned_seq_len, head_dim, dtype=torch.bfloat16)
-    bias = torch.randn(batch, aligned_seq_len, dtype=torch.bfloat16)
-    identity = torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16)
-
-    ue.dma_to_accelerator_memory(Q_DRAM_ADDR, q)
-    ue.dma_to_accelerator_memory(K_DRAM_ADDR, k)
-    ue.dma_to_accelerator_memory(V_DRAM_ADDR, v)
-    ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias)
-    ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, identity)
-
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(50.0)
-    ue.report_timing_and_instruction_count()
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (batch, head_dim))
-    report_flop_rate_gflops, report_gflops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(
-        f"Report FLOPS for Unified Attention: {report_flop_rate_gflops:.2f} GFLOPS, "
-        f"{report_gflops_ratio:.2f}% peak throughput for batch={batch}, "
-        f"aligned_seq_len={aligned_seq_len}, head_dim={head_dim}, dynamic={dynamic}, "
-        f"dynamic_addr={dynamic_addr}"
-    )
-
-    q_scaled = q * (1.0 / math.sqrt(head_dim))
-    scores = q_scaled @ k.t()
-    scores = scores + bias
-    probs = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
-    ref = probs @ v
-
-    snr_db_ref = calculate_snr(ref, output)
-    print(f"Reference SNR Analysis for Unified Attention: {snr_db_ref:.2f} dB")
-    assert snr_db_ref >= 32 or snr_db_ref == float("inf"), f"SNR {snr_db_ref:.2f} dB must be at least 32 dB"
-
-    tag = ("+dynamic" if dynamic else "") + ("+dynaddr" if dynamic_addr else "")
-    record_test(
-        f"unified_attention{tag}",
-        f"batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}",
-        snr_db=snr_db_ref,
-        gflops=report_flop_rate_gflops,
-        inst_bytes=instruction_size_bytes,
-    )
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
 
 
-def matmat_mul_test(M: int, K: int, N: int, bias_enable: bool = False, softmax_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, debug_fmax: bool = False, dynamic: bool = False, input_scale: float = 1.0, snr_threshold_db: float = 40.0, fmax_snr_threshold_db: float = 40.0, clamp_min: float = 0.0, clamp_max: float = float("inf")):
-    """
-    Tests matmat_mul core.
-
-    dynamic=True routes through matmat_mul_dynamic_core (fully runtime M/K/N): three GPRs are
-    primed with M, K, N at capture start and passed as gpr_M_reg/gpr_K_reg/gpr_N_reg.
-    Supports both bias modes (broadcast_N, full_matrix), softmax, and debug_fmax.
-    """
-    ue = UnifiedEngine()
-
-    A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
-    B_DRAM_ADDR = ue.allocate_tensor_dram(N * K * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-
-    C_DRAM_ADDR = None
-    if bias_enable and bias_mode == "full_matrix":
-        C_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    elif bias_enable and bias_mode == "broadcast_N":
-        C_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
-
-    ZERO_DRAM_ADDR = None
-    FMAX_DRAM_ADDR = None
-    if softmax_enable:
-        if debug_fmax:
-            ZERO_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * 2)
-            FMAX_DRAM_ADDR = ue.allocate_tensor_dram(M * UE_VECTOR_SIZE * 2)
-
-    # Dynamic path primes three GPRs with M, K, N; allocate them before capture starts.
-    m_reg = k_reg = n_reg = None
-    if dynamic:
-        m_reg = ue.alloc_isa_reg()
-        k_reg = ue.alloc_isa_reg()
-        n_reg = ue.alloc_isa_reg()
-
-    ue.start_capture()
-    if dynamic:
-        ue.generate_instruction_add_set(m_reg, M)
-        ue.generate_instruction_add_set(k_reg, K)
-        ue.generate_instruction_add_set(n_reg, N)
-
-    total_flops_from_matmat_mul = ue.matmat_mul_core(M=M, K=K, N=N,
-                                                    A_DRAM_ADDR=A_DRAM_ADDR,
-                                                    B_DRAM_ADDR=B_DRAM_ADDR,
-                                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                                                    softmax_enable=softmax_enable,
-                                                    C_DRAM_ADDR=C_DRAM_ADDR,
-                                                    bias_mode=bias_mode,
-                                                    gelu_enable=gelu_enable,
-                                                    silu_enable=silu_enable,
-                                                    sigmoid_enable=sigmoid_enable,
-                                                    clamp_enable=clamp_enable,
-                                                    log_enable=log_enable,
-                                                    clamp_min=clamp_min,
-                                                    clamp_max=clamp_max,
-                                                    debug_fmax=debug_fmax,
-                                                    ZERO_DRAM_ADDR=ZERO_DRAM_ADDR,
-                                                    FMAX_DRAM_ADDR=FMAX_DRAM_ADDR,
-                                                    gpr_M_reg=m_reg,
-                                                    gpr_K_reg=k_reg,
-                                                    gpr_N_reg=n_reg,
-                                                    )
-
-    ue.stop_capture()
-    if dynamic:
-        ue.release_isa_reg()
-        ue.release_isa_reg()
-        ue.release_isa_reg()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size = ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-
-    # Test Time
-    a_logical = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K) # normalizing input helps with numerical stability of softmax
-    # input_scale amplifies the post-matmul dynamic range. Larger scales produce
-    # wider variance in (a @ b.T), which stresses the exp + bf20 adder tree
-    # denominator in softmax (and the bf19 adder tree in raw exp-mode sums).
-    if input_scale != 1.0:
-        a_logical = (a_logical.to(torch.float32) * float(input_scale)).to(torch.bfloat16)
-
-    a = a_logical
-
-    b = torch.randn(N, K, dtype=torch.bfloat16)
-
-    c_logical = None
-    c_broadcast_n = None
-    if bias_enable:
-        if bias_mode == "full_matrix":
-            c_logical = torch.randn(M, N, dtype=torch.bfloat16)
-            ue.dma_to_accelerator_memory(C_DRAM_ADDR, c_logical)
-        elif bias_mode == "broadcast_N":
-            c_broadcast_n = torch.randn(N, dtype=torch.bfloat16)
-            ue.dma_to_accelerator_memory(C_DRAM_ADDR, c_broadcast_n)
-
-    # DMA to accelerator memory -------------------------------------------------------------
-    ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
-    ue.dma_to_accelerator_memory(B_DRAM_ADDR, b)
-    if debug_fmax:
-        zero = torch.zeros(UE_VECTOR_SIZE, dtype=torch.bfloat16)
-        ue.dma_to_accelerator_memory(ZERO_DRAM_ADDR, zero)
-
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0) # 10 seconds timeout
-    ue.report_timing_and_instruction_count()
-
-    report_flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_matmat_mul)
-    print(f"Report FLOPS for MxKxN Matmul: {report_flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput, {instruction_size // 32} instructions, for M={M}, K={K}, N={N}, bias_enable={bias_enable}, softmax_enable={softmax_enable}, bias_mode={bias_mode}, dynamic={dynamic}")
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-    fmax = None
-    if softmax_enable:
-        if debug_fmax:
-            fmax = ue.dma_from_accelerator_memory(FMAX_DRAM_ADDR, (M, UE_VECTOR_SIZE))
-            fmax = -fmax[:, 0] # hardware negates the fmax, so we need to negate it again
-
-    if bias_enable and bias_mode == "full_matrix":
-        ref = a_logical @ b.T + c_logical
-    elif bias_enable and bias_mode == "broadcast_N":
-        ref = a_logical @ b.T + c_broadcast_n
-    else:
-        ref = a_logical @ b.T
-
-    def apply_gelu(x):
-        return x * torch.sigmoid(1.702 * x)
-
-    def apply_silu(x):
-        return x * torch.sigmoid(x)
-
-    def apply_sigmoid(x):
-        return torch.sigmoid(x)
-
-    if gelu_enable:
-        ref = apply_gelu(ref)
-    elif silu_enable:
-        ref = apply_silu(ref)
-    elif sigmoid_enable:
-        ref = apply_sigmoid(ref)
-    elif clamp_enable:
-        ref = torch.clamp(ref, min=clamp_min, max=clamp_max if clamp_max != float("inf") else None)
-    elif log_enable:
-        ref = torch.log(torch.clamp(ref, min=1e-3))
-
-    if softmax_enable:
-        if debug_fmax:
-            fmax_ref = torch.max(ref, dim=-1).values
-            snr_db_fmax = calculate_snr(fmax_ref, fmax)
-            print(f"FMAX SNR Analysis: {snr_db_fmax:.2f} dB")
-            assert snr_db_fmax >= fmax_snr_threshold_db or snr_db_fmax == float('inf'), f"FMAX SNR {snr_db_fmax:.2f} dB must be at least {fmax_snr_threshold_db:g} dB"
-        ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
-
-    snr_db_ref = calculate_snr(ref, output)
-    print(f"Reference SNR Analysis for MxKxN Matmul: {snr_db_ref:.2f} dB")
-    assert snr_db_ref >= snr_threshold_db or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least {snr_threshold_db:g} dB"
-
-    flags = []
-    if bias_enable:    flags.append(f"bias-{bias_mode}")
-    if softmax_enable: flags.append("softmax")
-    if gelu_enable:    flags.append("gelu")
-    if silu_enable:    flags.append("silu")
-    if sigmoid_enable: flags.append("sigmoid")
-    if clamp_enable:
-        clamp_str = f"clamp[{clamp_min:g},{'+inf' if clamp_max == float('inf') else f'{clamp_max:g}'}]"
-        flags.append(clamp_str)
-    if log_enable:     flags.append("log")
-    if dynamic:        flags.append("dynamic")
-    if input_scale != 1.0: flags.append(f"scale={input_scale:g}")
-    flag_str = ("+" + "+".join(flags)) if flags else ""
-    name_base = "matmat_mul"
-    record_test(f"{name_base}{flag_str}",
-                f"M={M}, K={K}, N={N}",
-                snr_db=snr_db_ref,
-                gflops=report_flop_rate_gflops,
-                inst_bytes=instruction_size)
-
-    bias_trace = f"bias_{bias_mode}" if bias_enable else "bias_disabled"
-    softmax_trace = "softmax_enabled" if softmax_enable else "softmax_disabled"
-    dynamic_suffix = "_dynamic" if dynamic else ""
-    # generate_trace(
-    #     ue,
-    #     f"matmat_mul_core_M{M}_K{K}_N{N}_{bias_trace}_{softmax_trace}{dynamic_suffix}.csv",
-    # )
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-
-def matmat_mul_dynamic_mkn_test(
-    runtime_list: list,
+def matmat_mul_unified_test(
+    runtime_list=None,
     bias_enable: bool = False,
     softmax_enable: bool = False,
     bias_mode: str = "broadcast_N",
@@ -942,20 +821,20 @@ def matmat_mul_dynamic_mkn_test(
     fmax_snr_threshold_db: float = 40.0,
     clamp_min: float = 0.0,
     clamp_max: float = float("inf"),
-    compare_legacy: bool = False,
-    dynamic_addr: bool = False,
+    dynamic_addr: bool = True,
 ):
     """Compile ``matmat_mul_core`` ONCE with template (M, K, N) + activation features + chosen
     dynamic-dimension register(s), then re-run it at every ``(m, k, n)`` in ``runtime_list``.
 
-    If compare_legacy is True, runs a second pass compiling and executing the legacy
-    (non-dynamic) path for each size configuration to ensure exact mathematical parity.
+    Every runtime shape is paired with an RNG-matched legacy capture.
 
     When ``dynamic_addr=True``, the A/B/output (and bias-C when enabled) DRAM bases are sourced
     from GPRs that are primed in the per-run **preamble** (not baked into the captured main body),
     so the same dynamic-M/K/N main body also serves any DRAM placement. Primed addresses equal the
     literals so results are identical — this exercises the dynamic-addressing path.
     """
+    if runtime_list is None:
+        runtime_list = [(512, 512, 512)]
     assert runtime_list, "runtime_list must be non-empty"
 
     tag = "MKN" + ("+dynaddr" if dynamic_addr else "")
@@ -983,6 +862,16 @@ def matmat_mul_dynamic_mkn_test(
         parts.append(path_tag)
         return "+" + "+".join(parts) if parts else ""
 
+    def _runtime_flops(m, k, n):
+        """Match the historical ``matmat_mul_core_legacy`` FLOP accounting."""
+        flops = 2 * m * k * n
+        if softmax_enable:             flops += m * n * 5
+        if bias_enable:                flops += m * n
+        if gelu_enable or silu_enable: flops += m * n * 4
+        if clamp_enable:               flops += m * n
+        if log_enable:                 flops += m * n * 2
+        return flops
+
     for (mm, kk, nn) in runtime_list:
         assert kk % UE_VECTOR_SIZE == 0 and nn % UE_VECTOR_SIZE == 0, "runtime K and N must be multiples of 64"
 
@@ -995,8 +884,7 @@ def matmat_mul_dynamic_mkn_test(
     # =========================================================================
     print(f"\n{'#'*64}")
     print(f"# Dynamic [{tag}] template M={M_template}, K={K_template}, N={N_template}")
-    if compare_legacy:
-        print(f"# (interleaved with legacy runs)")
+    print(f"# (interleaved with legacy runs)")
     print(f"{'#'*64}")
 
     def _run_dynamic(m, k, n):
@@ -1093,23 +981,26 @@ def matmat_mul_dynamic_mkn_test(
         ue.wait_queue(10.0)
         ue.report_timing_and_instruction_count()
 
-        iter_flops = 2 * m * k * n
-        if softmax_enable:                                  iter_flops += m * n * 5
-        if gelu_enable or silu_enable or sigmoid_enable:    iter_flops += m * n
-        if clamp_enable:                                    iter_flops += m * n
-        if log_enable:                                      iter_flops += 2 * m * n
+        iter_flops = _runtime_flops(m, k, n)
 
         report_gflops, flops_ratio = ue.report_flop_rate_gflops(iter_flops)
         print(f"[Dynamic] {report_gflops:.2f} GFLOPS ({flops_ratio:.2f}% peak), "
               f"{main_instruction_size // 32} instructions")
 
         output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (m, n))
+        fmax = None
+        if softmax_enable and debug_fmax:
+            fmax = -ue.dma_from_accelerator_memory(FMAX_DRAM_ADDR, (m, UE_VECTOR_SIZE))[:, 0]
 
         ref = a_logical @ b.T
         if bias_enable and bias_mode == "full_matrix":   ref = ref + c_logical
         elif bias_enable and bias_mode == "broadcast_N": ref = ref + c_broadcast_n
         ref = _apply_activations(ref)
         if softmax_enable:
+            if debug_fmax:
+                fmax_snr = calculate_snr(torch.max(ref, dim=-1).values, fmax)
+                assert fmax_snr >= fmax_snr_threshold_db or fmax_snr == float("inf"), \
+                    f"Dynamic FMAX SNR {fmax_snr:.2f} dB < {fmax_snr_threshold_db:g} dB"
             ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
 
         snr_db = calculate_snr(ref, output)
@@ -1124,9 +1015,10 @@ def matmat_mul_dynamic_mkn_test(
             snr_db=snr_db, gflops=report_gflops, inst_bytes=main_instruction_size,
         )
 
-        ue.release_isa_reg()
-        ue.release_isa_reg()
-        ue.release_isa_reg()
+        for r in (gpr_c_addr, gpr_out_addr, gpr_b_addr, gpr_a_addr,
+                  gpr_N_reg, gpr_K_reg, gpr_M_reg):
+            if r is not None:
+                ue.release_isa_reg()
         ue.clear_capture_buffer()
         ue.reset_tensor_dram_addr()
 
@@ -1192,23 +1084,26 @@ def matmat_mul_dynamic_mkn_test(
         ue.wait_queue(10.0)
         ue.report_timing_and_instruction_count()
 
-        iter_flops = 2 * m * k * n
-        if softmax_enable:                                  iter_flops += m * n * 5
-        if gelu_enable or silu_enable or sigmoid_enable:    iter_flops += m * n
-        if clamp_enable:                                    iter_flops += m * n
-        if log_enable:                                      iter_flops += 2 * m * n
+        iter_flops = _runtime_flops(m, k, n)
 
         report_gflops, flops_ratio = ue.report_flop_rate_gflops(iter_flops)
         print(f"[Legacy] {report_gflops:.2f} GFLOPS ({flops_ratio:.2f}% peak), "
               f"{instruction_size // 32} instructions")
 
         output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (m, n))
+        fmax = None
+        if softmax_enable and debug_fmax:
+            fmax = -ue.dma_from_accelerator_memory(FMAX_DRAM_ADDR, (m, UE_VECTOR_SIZE))[:, 0]
 
         ref = a_logical @ b.T
         if bias_enable and bias_mode == "full_matrix":   ref = ref + c_logical
         elif bias_enable and bias_mode == "broadcast_N": ref = ref + c_broadcast_n
         ref = _apply_activations(ref)
         if softmax_enable:
+            if debug_fmax:
+                fmax_snr = calculate_snr(torch.max(ref, dim=-1).values, fmax)
+                assert fmax_snr >= fmax_snr_threshold_db or fmax_snr == float("inf"), \
+                    f"Legacy FMAX SNR {fmax_snr:.2f} dB < {fmax_snr_threshold_db:g} dB"
             ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
 
         snr_db = calculate_snr(ref, output)
@@ -1227,219 +1122,11 @@ def matmat_mul_dynamic_mkn_test(
         ue.reset_tensor_dram_addr()
 
     for (m, k, n) in runtime_list:
-        rng_state = _capture_rng_state() if compare_legacy else None
-        _run_dynamic(m, k, n)
-        if compare_legacy:
-            _restore_rng_state(rng_state)
-            _run_legacy(m, k, n)
+        _run_rng_matched_pair(
+            lambda m=m, k=k, n=n: _run_legacy(m, k, n),
+            lambda m=m, k=k, n=n: _run_dynamic(m, k, n),
+        )
 
-def rms_norm_test(shape: tuple, use_pbi: bool = False, dynamic_addr: bool = False):
-    """
-    Tests rms norm core.
-
-    When ``use_pbi=True``, primes a fixed GPR with ``M`` before the kernel and passes that register
-    as ``gpr_M_reg`` so the wrapper routes to :meth:`rms_norm_core_dram_pbi` (outer row loop uses
-    runtime trip count). When ``use_pbi=False`` the wrapper routes to the legacy compile-time path.
-
-    When ``dynamic_addr=True`` (requires ``use_pbi``), the input/output/gamma DRAM bases are also
-    sourced from GPRs (primed with ``addr >> 3``) and passed as ``gpr_*_addr`` instead of being
-    baked into the captured program — so the kernel could be replayed at any placement by
-    re-priming those GPRs. The addresses primed here equal the literals, so the result is identical;
-    this just exercises the dynamic-addressing path. ``dynamic_addr=False`` is the legacy behavior.
-    """
-    ue = UnifiedEngine()
-
-    assert len(shape) == 2, f"shape must be a tuple of length 2, got {shape}"
-    if dynamic_addr and not use_pbi:
-        raise ValueError("rms_norm_test: dynamic_addr=True requires use_pbi=True (PBI path)")
-
-    M = shape[0]
-    N = shape[1]
-
-    A_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    GAMMA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
-
-    # Fixed GPRs — kept above aliasing with the loop counter from loop_start (~1–2 during capture).
-    _GPR_M_REG = 8
-    _GPR_A_ADDR, _GPR_OUT_ADDR, _GPR_GAMMA_ADDR = 9, 10, 11
-
-    ue.start_capture()
-    if use_pbi:
-        ue.generate_instruction_add_set(_GPR_M_REG, M)
-    if dynamic_addr:
-        ue.generate_instruction_add_set(_GPR_A_ADDR, A_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(_GPR_OUT_ADDR, OUTPUT_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(_GPR_GAMMA_ADDR, GAMMA_DRAM_ADDR >> 3)
-    total_flops_from_rms_norm = ue.rms_norm_core_dram(
-        M=M,
-        N=N,
-        A_DRAM_ADDR=A_DRAM_ADDR,
-        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-        GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
-        gpr_M_reg=_GPR_M_REG if use_pbi else None,
-        gpr_a_addr=_GPR_A_ADDR if dynamic_addr else None,
-        gpr_out_addr=_GPR_OUT_ADDR if dynamic_addr else None,
-        gpr_gamma_addr=_GPR_GAMMA_ADDR if dynamic_addr else None,
-    )
-
-    ue.stop_capture()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-    ue.clear_capture_buffer()
-
-    x = torch.randn(M, N, dtype=torch.bfloat16)
-    ue.dma_to_accelerator_memory(A_DRAM_ADDR, x)
-    gamma = torch.randn(N, dtype=torch.bfloat16)
-    ue.dma_to_accelerator_memory(GAMMA_DRAM_ADDR, gamma)
-
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0) # 10 seconds timeout
-    ue.report_timing_and_instruction_count()
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_rms_norm)
-    print(
-        f"Report FLOPS for RMS Norm: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput "
-        f"for M={M}, N={N}, use_pbi={use_pbi}"
-    )
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-
-    rms_norm = torch.nn.RMSNorm(N)
-    rms_norm.weight.data = gamma
-    ref = rms_norm(x)
-    snr_db_ref = calculate_snr(ref, output)
-    print(f"Reference SNR Analysis for RMS Norm: {snr_db_ref:.2f} dB")
-    assert snr_db_ref >= 40 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
-
-    test_name = "rms_norm_pbi" if use_pbi else "rms_norm"
-    if dynamic_addr:
-        test_name += "_dynaddr"
-    record_test(test_name,
-                f"M={M}, N={N}",
-                snr_db=snr_db_ref,
-                gflops=flop_rate_gflops)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-
-
-
-def layer_norm_test(shape: tuple, gamma_enable: bool = False, beta_enable: bool = False,
-                    use_pbi: bool = False, dynamic_addr: bool = False):
-    """Tests layer_norm_core_dram.
-
-    When ``use_pbi=True``, primes GPR 8 with the chunk count ``M // chunk_size`` (where
-    ``chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, M)``) and routes to
-    :meth:`layer_norm_core_dram_pbi`.  The PBI loop loads/stores ``chunk_size`` rows per DMA
-    call — identical granularity to the legacy path — so performance is on par while the
-    program shrinks from ~M*6 to ~chunk_size*6+4 instructions.
-    When ``use_pbi=False`` the wrapper routes to the legacy compile-time path.
-
-    When ``dynamic_addr=True`` (requires ``use_pbi``), the input/output (and gamma/beta when
-    enabled) DRAM bases are sourced from GPRs (primed with ``addr >> 3``) and passed as
-    ``gpr_*_addr`` instead of being baked in; the constant zeros buffer stays literal. Primed
-    addresses equal the literals so results are identical. ``dynamic_addr=False`` is legacy.
-    """
-    ue = UnifiedEngine()
-
-    assert len(shape) == 2, f"shape must be a tuple of length 2, got {shape}"
-    if dynamic_addr and not use_pbi:
-        raise ValueError("layer_norm_test: dynamic_addr=True requires use_pbi=True (PBI path)")
-
-    M = shape[0]
-    N = shape[1]
-
-    A_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    GAMMA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2) if gamma_enable else None
-    BETA_DRAM_ADDR = ue.allocate_tensor_dram(N * 2) if beta_enable else None
-
-    _GPR_M_REG = 8  # fixed GPR; stays clear of loop_start internal registers
-    _GPR_A_ADDR, _GPR_OUT_ADDR, _GPR_GAMMA_ADDR, _GPR_BETA_ADDR = 9, 10, 11, 12
-
-    ue.start_capture()
-    if use_pbi:
-        # Must mirror the chunk_size logic in layer_norm_core_dram_pbi exactly.
-        _ops = 4 + (1 if gamma_enable else 0) + (1 if beta_enable else 0)
-        _ideal = min(URAM_NEAR_FULL_ELEMENTS // N, M, (256 - 4) // _ops)
-        _chunk_size = _ideal
-        while M % _chunk_size != 0:
-            _chunk_size -= 1
-        ue.generate_instruction_add_set(_GPR_M_REG, M // _chunk_size)
-    if dynamic_addr:
-        ue.generate_instruction_add_set(_GPR_A_ADDR, A_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(_GPR_OUT_ADDR, OUTPUT_DRAM_ADDR >> 3)
-        if gamma_enable:
-            ue.generate_instruction_add_set(_GPR_GAMMA_ADDR, GAMMA_DRAM_ADDR >> 3)
-        if beta_enable:
-            ue.generate_instruction_add_set(_GPR_BETA_ADDR, BETA_DRAM_ADDR >> 3)
-    total_flops = ue.layer_norm_core_dram(
-        M=M, N=N,
-        A_DRAM_ADDR=A_DRAM_ADDR,
-        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-        GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
-        BETA_DRAM_ADDR=BETA_DRAM_ADDR,
-        gpr_M_reg=_GPR_M_REG if use_pbi else None,
-        gpr_a_addr=_GPR_A_ADDR if dynamic_addr else None,
-        gpr_out_addr=_GPR_OUT_ADDR if dynamic_addr else None,
-        gpr_gamma_addr=(_GPR_GAMMA_ADDR if (dynamic_addr and gamma_enable) else None),
-        gpr_beta_addr=(_GPR_BETA_ADDR if (dynamic_addr and beta_enable) else None),
-    )
-    ue.stop_capture()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(instruction_size_bytes)
-    ue.clear_capture_buffer()
-
-    x = torch.randn(M, N, dtype=torch.bfloat16)
-    ue.dma_to_accelerator_memory(A_DRAM_ADDR, x)
-    gamma = beta = None
-    if gamma_enable:
-        gamma = torch.randn(N, dtype=torch.bfloat16)
-        ue.dma_to_accelerator_memory(GAMMA_DRAM_ADDR, gamma)
-    if beta_enable:
-        beta = torch.randn(N, dtype=torch.bfloat16)
-        ue.dma_to_accelerator_memory(BETA_DRAM_ADDR, beta)
-
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(
-        f"Report FLOPS for Layer Norm{'(PBI)' if use_pbi else ''}: "
-        f"{flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for "
-        f"M={M}, N={N}, gamma={gamma_enable}, beta={beta_enable}"
-    )
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-
-    layer_norm = torch.nn.LayerNorm(N)
-    layer_norm.weight.data = gamma if gamma_enable else torch.ones(N, dtype=torch.bfloat16)
-    layer_norm.bias.data   = beta  if beta_enable  else torch.zeros(N, dtype=torch.bfloat16)
-
-    ref = layer_norm(x)
-    snr_db = calculate_snr(ref, output)
-    print(f"Layer Norm SNR Analysis: {snr_db:.2f} dB")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-
-    flags = []
-    if gamma_enable: flags.append("gamma")
-    if beta_enable:  flags.append("beta")
-    flag_str = ("+" + "+".join(flags)) if flags else ""
-    test_name = f"layer_norm{'_pbi' if use_pbi else ''}{flag_str}{'_dynaddr' if dynamic_addr else ''}"
-    record_test(test_name, f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops,
-                inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
-    
 def _round_up_vec(N: int) -> int:
     """Round N up to a multiple of UE_VECTOR_SIZE (the 64-wide HW vector)."""
     return ((N + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
@@ -1513,957 +1200,611 @@ def _rope_pad_table_row(cos: torch.Tensor, sin: torch.Tensor, N: int, padded_N: 
     return torch.cat((cos_pad, sin_pad), dim=0)
 
 
-def rope_hf_core_dram_test(M: int, N: int, use_pbi: bool = False, dynamic_addr: bool = False):
-    """
-    Tests rope_hf_core_dram by emitting one HF-style RoPE instruction sequence per row.
+def rope_hf_core_dram_unified_test(shapes=None):
+    """Run matched legacy/dynamic HF RoPE coverage, plus dynamic-only native small-N cases."""
 
-    When ``dynamic_addr=True`` (requires ``use_pbi``), the input/output/cos DRAM bases are sourced
-    from GPRs (primed with ``addr >> 3``) and passed as ``gpr_*_addr`` (sin stays contiguous after
-    cos) instead of being baked in. Primed addresses equal the literals so results are identical.
-    """
-    ue = UnifiedEngine()
-    if dynamic_addr and not use_pbi:
-        raise ValueError("rope_hf_core_dram_test: dynamic_addr=True requires use_pbi=True (PBI path)")
+    def _run_case(
+        M: int, N: int, dynamic: bool = False, dynamic_addr: bool = False,
+    ):
+        """Unified HF RoPE test for **any head_dim N** (64-aligned or not; an odd N is rounded up to
+        the next even head_dim, since rotate-half needs an even split).
 
-    X_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * N * 2)
+        One implementation covers legacy and dynamic execution:
 
-    # PBI path is driven by gpr_M_reg; allocate + prime a GPR with M when use_pbi is requested.
-    m_reg = ue.alloc_isa_reg() if use_pbi else None
-    # dynamic_addr: three more GPRs source input/output/cos bases (word addr = addr>>3).
-    in_reg  = ue.alloc_isa_reg() if dynamic_addr else None
-    out_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    cos_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        * ``dynamic=True``  -> :meth:`rope_hf_core_dram_dynamic_phased`: runtime M and N from GPRs. The body is
+          compiled ONCE with a template; a short preamble primes ``gpr_M``/``gpr_N`` (+ optional address
+          GPRs) and jumps in, so one captured kernel serves any (M, head_dim).
+        * ``dynamic=False`` -> :meth:`rope_hf_core_dram_legacy`: Python-unrolled rows.
+        * ``dynamic_addr=True`` (requires ``dynamic``): input/output/cos DRAM bases are
+          sourced from GPRs primed before the body, so it is placement-agnostic.
 
-    ue.start_capture()
-    if use_pbi:
-        ue.generate_instruction_add_set(m_reg, M)
-    if dynamic_addr:
-        ue.generate_instruction_add_set(in_reg, X_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(cos_reg, ROPE_DRAM_ADDR >> 3)
-    total_flops = ue.rope_hf_core_dram(
-        M=M,
-        N=N,
-        input_dram_addr=X_DRAM_ADDR,
-        output_dram_addr=OUTPUT_DRAM_ADDR,
-        cos_dram_addr=ROPE_DRAM_ADDR,
-        sin_dram_addr=ROPE_DRAM_ADDR + N * 2,
-        gpr_M_reg=m_reg,
-        gpr_input_addr=in_reg, gpr_out_addr=out_reg, gpr_cos_addr=cos_reg,
-    )
-    ue.stop_capture()
-    if dynamic_addr:
-        ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
-    if use_pbi:
-        ue.release_isa_reg()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        Non-64-aligned N (e.g. 80, 96, 160) is handled by **host-side padding** (see
+        :func:`_rope_padded_layout`): each rotate-half is padded to a multiple of UE_VECTOR_SIZE so the
+        cores run on a 128-multiple ``padded_N``; the real halves are sliced out of the padded output
+        before the SNR check.
+        """
+        if dynamic_addr and not dynamic:
+            raise ValueError("rope_hf_core_dram_unified_test: dynamic_addr requires a runtime mode")
+        if N % 2:
+            N += 1  # RoPE rotate-half needs an even head_dim; round an odd stress dim up (host zero-pad).
+        if N < 128:
+            half = N // 2
+            padded_half = ue_round_up_to_axi_beat_bytes(half * 2) // 2
+            padded_N = 2 * padded_half
+        else:
+            padded_N, half, padded_half = _rope_padded_layout(N)
+        mode_tag = "dynamic" if dynamic else "legacy"
 
-    head_dim = N
-    MAX_SEQ_LEN = 32768
-    freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
-    random_seq_index = random.randint(0, MAX_SEQ_LEN - 1)
-    one_rope_seq_params = freqs_cis[random_seq_index, :]
-    one_rope_seq = torch.view_as_real(one_rope_seq_params).to(torch.bfloat16).reshape(-1)
-    cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)
-    sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)
+        ue = UnifiedEngine()
+        X_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
+        OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
+        ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * padded_N * 2)
 
-    sin_negated = sin.clone()
-    sin_negated[:N // 2] = -sin_negated[:N // 2]
-    x_hf = torch.randn(M, N, dtype=torch.bfloat16)
-    rope_table = torch.cat((cos, sin_negated), dim=0).repeat(M)
+        need_m = dynamic
+        m_reg   = ue.alloc_isa_reg() if need_m else None
+        n_reg   = ue.alloc_isa_reg() if dynamic else None
+        in_reg  = ue.alloc_isa_reg() if dynamic_addr else None
+        out_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        cos_reg = ue.alloc_isa_reg() if dynamic_addr else None
 
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_hf)
-    ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
+        def _emit_core():
+            core = ue.rope_hf_core_dram_dynamic if dynamic else ue.rope_hf_core_dram
+            return core(
+                M=(64 if dynamic else M), N=padded_N,
+                input_dram_addr=X_DRAM_ADDR, output_dram_addr=OUTPUT_DRAM_ADDR,
+                cos_dram_addr=ROPE_DRAM_ADDR, sin_dram_addr=ROPE_DRAM_ADDR + padded_N * 2,
+                gpr_M_reg=m_reg, gpr_N_reg=n_reg,
+                gpr_input_addr=in_reg, gpr_out_addr=out_reg, gpr_cos_addr=cos_reg,
+            )
 
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
+        def _prime_runtime_regs():
+            if need_m:
+                ue.generate_instruction_add_set(m_reg, M)
+            if dynamic:
+                ue.generate_instruction_add_set(n_reg, padded_N)
+            if dynamic_addr:
+                ue.generate_instruction_add_set(in_reg, X_DRAM_ADDR >> 3)
+                ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
+                ue.generate_instruction_add_set(cos_reg, ROPE_DRAM_ADDR >> 3)
 
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(f"Report FLOPS for HF RoPE core DRAM: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}, use_pbi={use_pbi}")
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-
-    def rotate_half(x):
-        x1 = x[..., :x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
-    ref = x_hf * cos + rotate_half(x_hf) * sin
-    snr_db = calculate_snr(ref, output)
-    print(f"HF RoPE core DRAM SNR Analysis: {snr_db:.2f} dB for M={M}, N={N}")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-
-    record_test(f"rope_hf_core_dram{'+pbi' if use_pbi else ''}{'+dynaddr' if dynamic_addr else ''}",
-                f"M={M}, N={N}",
-                snr_db=snr_db,
-                gflops=flop_rate_gflops,
-                inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
-
-def rope_hf_core_dram_dynamic_test(M: int, N: int, dynamic: bool = False, use_pbi: bool = False,
-                                   dynamic_addr: bool = False):
-    """Unified HF RoPE test for **any head_dim N** (64-aligned or not; an odd N is rounded up to
-    the next even head_dim, since rotate-half needs an even split).
-
-    One implementation, three execution modes selected by flags:
-
-    * ``dynamic=True``  -> :meth:`rope_hf_core_dram_dynamic_phased`: runtime M and N from GPRs. The body is
-      compiled ONCE with a template; a short preamble primes ``gpr_M``/``gpr_N`` (+ optional address
-      GPRs) and jumps in, so one captured kernel serves any (M, head_dim).
-    * ``use_pbi=True`` (and not dynamic) -> :meth:`rope_hf_core_dram_pbi`: runtime M, compile-time N.
-    * neither -> :meth:`rope_hf_core_dram_legacy`: Python-unrolled rows.
-    * ``dynamic_addr=True`` (requires ``dynamic`` or ``use_pbi``): input/output/cos DRAM bases are
-      sourced from GPRs primed before the body, so it is placement-agnostic.
-
-    Non-64-aligned N (e.g. 80, 96, 160) is handled by **host-side padding** (see
-    :func:`_rope_padded_layout`): each rotate-half is padded to a multiple of UE_VECTOR_SIZE so the
-    cores run on a 128-multiple ``padded_N``; the real halves are sliced out of the padded output
-    before the SNR check.
-    """
-    if dynamic_addr and not (dynamic or use_pbi):
-        raise ValueError("rope_hf_core_dram_dynamic_test: dynamic_addr=True requires dynamic=True or use_pbi=True")
-    if N % 2:
-        N += 1  # RoPE rotate-half needs an even head_dim; round an odd stress dim up (host zero-pad).
-    padded_N, half, padded_half = _rope_padded_layout(N)
-    mode_tag = "dynamic" if dynamic else ("pbi" if use_pbi else "legacy")
-
-    ue = UnifiedEngine()
-    X_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
-    ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * padded_N * 2)
-
-    need_m = dynamic or use_pbi
-    m_reg   = ue.alloc_isa_reg() if need_m else None
-    n_reg   = ue.alloc_isa_reg() if dynamic else None
-    in_reg  = ue.alloc_isa_reg() if dynamic_addr else None
-    out_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    cos_reg = ue.alloc_isa_reg() if dynamic_addr else None
-
-    def _emit_core():
-        return ue.rope_hf_core_dram(
-            M=(64 if dynamic else M), N=padded_N,
-            input_dram_addr=X_DRAM_ADDR, output_dram_addr=OUTPUT_DRAM_ADDR,
-            cos_dram_addr=ROPE_DRAM_ADDR, sin_dram_addr=ROPE_DRAM_ADDR + padded_N * 2,
-            gpr_M_reg=m_reg, gpr_N_reg=n_reg,
-            gpr_input_addr=in_reg, gpr_out_addr=out_reg, gpr_cos_addr=cos_reg,
-        )
-
-    def _prime_runtime_regs():
-        if need_m:
-            ue.generate_instruction_add_set(m_reg, M)
         if dynamic:
-            ue.generate_instruction_add_set(n_reg, padded_N)
-        if dynamic_addr:
-            ue.generate_instruction_add_set(in_reg, X_DRAM_ADDR >> 3)
-            ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
-            ue.generate_instruction_add_set(cos_reg, ROPE_DRAM_ADDR >> 3)
+            # Compile body ONCE (template; runtime M/N come from GPRs), then a preamble primes the
+            # runtime regs and jumps into the shared body.
+            ue.start_capture()
+            total_flops = _emit_core()
+            # _emit_core() compiled with the M=64 template; rescale flops (linear in M) to the real M.
+            total_flops = total_flops * M // 64
+            ue.stop_capture()
+            ue.generate_instruction_halt()
+            main_program_dram_addr = ue.get_program_dram_addr()
+            instruction_size_bytes = ue.write_captured_instructions_to_dram(main_program_dram_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
 
-    if dynamic:
-        # Compile body ONCE (template; runtime M/N come from GPRs), then a preamble primes the
-        # runtime regs and jumps into the shared body.
+            preamble_dram_addr = ue.get_program_dram_addr()
+            ue.allocate_program_dram(8 * INSTRUCTION_SIZE_BYTES)
+            main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
+            ue.clear_capture_buffer()
+            ue.start_capture()
+            _prime_runtime_regs()
+            ue.generate_instruction_jump_abs(main_program_word_addr)
+            ue.stop_capture()
+            ue.write_captured_instructions_to_dram(preamble_dram_addr)
+            entry_dram_addr = preamble_dram_addr
+        else:
+            # Single capture: prime regs (gpr_M for PBI, address GPRs if dynamic_addr) then emit + halt.
+            ue.start_capture()
+            _prime_runtime_regs()
+            total_flops = _emit_core()
+            ue.stop_capture()
+            ue.generate_instruction_halt()
+            entry_dram_addr = ue.get_program_dram_addr()
+            instruction_size_bytes = ue.write_captured_instructions_to_dram(entry_dram_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+        for r in (cos_reg, out_reg, in_reg, n_reg, m_reg):  # LIFO release
+            if r is not None:
+                ue.release_isa_reg()
+
+        # Reference: same HF RoPE table, then host-padded to padded_N.
+        head_dim = N
+        MAX_SEQ_LEN = 32768
+        freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
+        random_seq_index = random.randint(0, MAX_SEQ_LEN - 1)
+        one_rope_seq = torch.view_as_real(freqs_cis[random_seq_index, :]).to(torch.bfloat16).reshape(-1)
+        cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)   # (N,)
+        sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)   # (N,)
+        x_hf = torch.randn(M, N, dtype=torch.bfloat16)
+
+        rope_table = _rope_pad_table_row(cos, sin, N, padded_N, half, padded_half).repeat(M)
+        x_pad = _rope_pad_x(x_hf, N, padded_N, half, padded_half)
+
+        ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_pad)
+        ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
+
+        ue.start_execute_from_dram(entry_dram_addr)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+
+        flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+        print(f"Report FLOPS for HF RoPE [{mode_tag}]: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% "
+              f"peak for M={M}, N={N} (padded_N={padded_N})")
+
+        out_pad = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, padded_N))
+        output = _rope_unpad(out_pad, N, padded_N, half, padded_half)
+
+        ref = x_hf * cos + _rotate_half(x_hf) * sin
+        snr_db = calculate_snr(ref, output)
+        print(f"HF RoPE [{mode_tag}{'+dynaddr' if dynamic_addr else ''}] SNR: {snr_db:.2f} dB for "
+              f"M={M}, N={N} (padded_N={padded_N}, body={instruction_size_bytes // 32} instrs)")
+        assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+
+        record_test(f"rope_hf_core_dram+{mode_tag}{'+dynaddr' if dynamic_addr else ''}",
+                    f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops, inst_bytes=instruction_size_bytes)
+
+        ue.clear_capture_buffer()
+        ue.reset_tensor_dram_addr()
+        ue.reset_program_dram_addr()
+
+
+
+    if shapes is None:
+        shapes = [(64, 512), (8, 128), (8, 64), (64, 80)]
+    for M, N in shapes:
+        if N < 128:
+            _run_case(M, N, dynamic=True, dynamic_addr=True)
+        else:
+            _run_rng_matched_pair(
+                lambda M=M, N=N: _run_case(M, N),
+                lambda M=M, N=N: _run_case(
+                    M, N, dynamic=True, dynamic_addr=True),
+            )
+
+
+def rms_norm_unified_test(shapes=None, snr_threshold_db: float = 40.0):
+    """Unified RMS-norm DRAM test: every ``(M, N)`` shape is a **paired dynamic-vs-legacy** run.
+
+    Supersedes the former separate legacy/PBI ``rms_norm_test`` and the dynamic
+    ``rms_norm_core_dram_dynamic_test``. For each shape it runs the **legacy** core (all dims baked)
+    and the **dynamic** core (runtime M, runtime N, and a runtime ``sqrt(N)`` RSQRT scalar, all via
+    GPRs) from an identical RNG state through :func:`_run_rng_matched_pair`, so the summary reports
+    the dynamic-vs-legacy SNR/GFLOPS delta. The dynamic side sources the input/output/gamma DRAM
+    bases from GPRs by default; gamma is uploaded **plain** to both tiers (``sqrt(N)`` rides the
+    RSQRT scalar, so there is no ``gamma*sqrt(N)`` bf16 re-rounding on either side).
+
+    **64-aligned N** shapes run **paired** (legacy first, then dynamic). **Non-64-aligned N** shapes
+    run **dynamic-only** (host zero-pad: the reduce sums ``x^2`` and the pad lanes add 0, ``sqrt(N)``
+    rides the RSQRT scalar so it uses the real N, and the real columns are sliced out) — the legacy
+    core rejects non-aligned N, so those cannot be paired.
+    """
+    if shapes is None:
+        shapes = [(768, 1024), (2048, 2048), (64, 512)]
+
+    def _finish(name, M, N, x, gamma, out, gflops, inst_bytes):
+        rms = torch.nn.RMSNorm(N)
+        rms.weight.data = gamma
+        snr_db = calculate_snr(rms(x), out)
+        print(f"[{name}] M={M} N={N} SNR={snr_db:.2f} dB GFLOPS={gflops:.2f}")
+        assert snr_db >= snr_threshold_db or snr_db == float("inf"), \
+            f"{name} M={M} N={N} SNR {snr_db:.2f} dB < {snr_threshold_db:g} dB"
+        record_test(name, f"M={M},N={N}", snr_db=snr_db, gflops=gflops, inst_bytes=inst_bytes)
+
+    def _run_legacy(M, N):
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(M * N * 2)
+        O = ue.allocate_tensor_dram(M * N * 2)
+        G = ue.allocate_tensor_dram(N * 2)
+
         ue.start_capture()
-        total_flops = _emit_core()
-        # _emit_core() compiled with the M=64 template; rescale flops (linear in M) to the real M.
+        total_flops = ue.rms_norm_core_dram(M=M, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O, GAMMA_DRAM_ADDR=G)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(prog)
+        inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(inst_bytes)
+        ue.clear_capture_buffer()
+
+        x = torch.randn(M, N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(A, x)
+        gamma = torch.randn(N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(G, gamma)
+
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+        gflops, _ = ue.report_flop_rate_gflops(total_flops)
+        out = ue.dma_from_accelerator_memory(O, (M, N))
+        _finish("rms_norm", M, N, x, gamma, out, gflops, inst_bytes)
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr()
+
+    def _run_dynamic(M, N):
+        padded_N = _round_up_vec(N)                                      # non-64-aligned N -> host zero-pad
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(M * padded_N * 2)
+        O = ue.allocate_tensor_dram(M * padded_N * 2)
+        G = ue.allocate_tensor_dram(padded_N * 2)
+
+        m_reg = ue.alloc_isa_reg()
+        n_reg = ue.alloc_isa_reg()
+        sqrt_reg = ue.alloc_isa_reg()
+        a_reg = ue.alloc_isa_reg()                                       # GPR-sourced DRAM bases are the default
+        out_reg = ue.alloc_isa_reg()
+        g_reg = ue.alloc_isa_reg()
+
+        # 1. Compile once at template M=64, N=padded_N (64-aligned); runtime M / N / sqrt(N) via GPRs.
+        ue.start_capture()
+        total_flops = ue.rms_norm_core_dram_dynamic(
+            M=64, N=padded_N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O, GAMMA_DRAM_ADDR=G,
+            gpr_M_reg=m_reg, gpr_N_reg=n_reg, gpr_sqrt_n_reg=sqrt_reg,
+            gpr_a_addr=a_reg, gpr_out_addr=out_reg, gpr_gamma_addr=g_reg,
+        )
         total_flops = total_flops * M // 64
         ue.stop_capture()
         ue.generate_instruction_halt()
-        main_program_dram_addr = ue.get_program_dram_addr()
-        instruction_size_bytes = ue.write_captured_instructions_to_dram(main_program_dram_addr)
-        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        main_prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(main_prog)
+        main_inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(main_inst_bytes)
 
-        preamble_dram_addr = ue.get_program_dram_addr()
+        # 2. Preamble: prime real M, padded_N (reduce/DMA), sqrt(real N) scalar + DRAM bases, then jump.
+        preamble = ue.get_program_dram_addr()
         ue.allocate_program_dram(8 * INSTRUCTION_SIZE_BYTES)
-        main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
+        main_word_addr = ue_35bit_addr_shifter(main_prog)
         ue.clear_capture_buffer()
         ue.start_capture()
-        _prime_runtime_regs()
-        ue.generate_instruction_jump_abs(main_program_word_addr)
-        ue.stop_capture()
-        ue.write_captured_instructions_to_dram(preamble_dram_addr)
-        entry_dram_addr = preamble_dram_addr
-    else:
-        # Single capture: prime regs (gpr_M for PBI, address GPRs if dynamic_addr) then emit + halt.
-        ue.start_capture()
-        _prime_runtime_regs()
-        total_flops = _emit_core()
-        ue.stop_capture()
-        ue.generate_instruction_halt()
-        entry_dram_addr = ue.get_program_dram_addr()
-        instruction_size_bytes = ue.write_captured_instructions_to_dram(entry_dram_addr)
-        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-
-    for r in (cos_reg, out_reg, in_reg, n_reg, m_reg):  # LIFO release
-        if r is not None:
-            ue.release_isa_reg()
-
-    # Reference: same HF RoPE table, then host-padded to padded_N.
-    head_dim = N
-    MAX_SEQ_LEN = 32768
-    freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
-    random_seq_index = random.randint(0, MAX_SEQ_LEN - 1)
-    one_rope_seq = torch.view_as_real(freqs_cis[random_seq_index, :]).to(torch.bfloat16).reshape(-1)
-    cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)   # (N,)
-    sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)   # (N,)
-    x_hf = torch.randn(M, N, dtype=torch.bfloat16)
-
-    rope_table = _rope_pad_table_row(cos, sin, N, padded_N, half, padded_half).repeat(M)
-    x_pad = _rope_pad_x(x_hf, N, padded_N, half, padded_half)
-
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_pad)
-    ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
-
-    ue.start_execute_from_dram(entry_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(f"Report FLOPS for HF RoPE [{mode_tag}]: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% "
-          f"peak for M={M}, N={N} (padded_N={padded_N})")
-
-    out_pad = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, padded_N))
-    output = _rope_unpad(out_pad, N, padded_N, half, padded_half)
-
-    ref = x_hf * cos + _rotate_half(x_hf) * sin
-    snr_db = calculate_snr(ref, output)
-    print(f"HF RoPE [{mode_tag}{'+dynaddr' if dynamic_addr else ''}] SNR: {snr_db:.2f} dB for "
-          f"M={M}, N={N} (padded_N={padded_N}, body={instruction_size_bytes // 32} instrs)")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-
-    record_test(f"rope_hf_core_dram+{mode_tag}{'+dynaddr' if dynamic_addr else ''}",
-                f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops, inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
-
-
-def rms_norm_core_dram_dynamic_test(M: int, N: int, dynamic_addr: bool = False):
-    """Tests rms_norm_core_dram_dynamic — RMS norm with runtime M and N (any hidden_size).
-
-    Compile-once body + preamble priming gpr_M/gpr_N. 2 PBI pointers (load/store); compute is plain.
-
-    **sqrt(N) is baked as the RSQRT scalar (matches legacy):** the core bakes
-    ``float_to_bf19(sqrt(real_N))`` as the RSQRT scalar (via ``real_N=N``) and the host uploads a
-    **plain** gamma. This is the same precision as the legacy ``rms_norm_test`` path, so the dynamic
-    and legacy SNRs match (the old ``gamma*sqrt(N)`` fold re-rounded through bf16 and cost ~0.5-1 dB).
-
-    **Non-64-aligned N** is handled by host-side zero padding: RMS reduces ``sum(x_i^2)`` and the
-    ``sqrt(N)`` factor rides the RSQRT scalar (not the reduce length), so padding the row up to
-    ``padded_N`` with zeros adds 0 to the sum and leaves the real lanes exact — ``gpr_N`` (reduce
-    length / DMA / row stride) = ``padded_N`` while the RSQRT scalar uses ``sqrt(real_N)``. The real N
-    columns are sliced back out. HW-confirmed.
-    """
-    padded_N = _round_up_vec(N)
-    ue = UnifiedEngine()
-    A_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
-    GAMMA_DRAM_ADDR = ue.allocate_tensor_dram(padded_N * 2)
-
-    m_reg = ue.alloc_isa_reg(); n_reg = ue.alloc_isa_reg()
-    a_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    out_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    g_reg = ue.alloc_isa_reg() if dynamic_addr else None
-
-    # 1. Compile body once (template N = padded_N so the core's 64-aligned assert holds; runtime
-    #    N comes from gpr_N_reg). sqrt(N) is folded into gamma host-side (no runtime scalar GPR).
-    ue.start_capture()
-    total_flops = ue.rms_norm_core_dram(
-        M=64, N=padded_N, A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
-        gpr_M_reg=m_reg, gpr_N_reg=n_reg, real_N=N,
-        gpr_a_addr=a_reg, gpr_out_addr=out_reg, gpr_gamma_addr=g_reg,
-    )
-    # Compiled with the M=64 template; rescale flops (linear in M) to the real M.
-    total_flops = total_flops * M // 64
-    ue.stop_capture()
-    ue.generate_instruction_halt()
-    main_program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.write_captured_instructions_to_dram(main_program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-
-    # 2. Preamble: prime M and padded_N (reduce length / DMA), + optional addresses, then jump into
-    #    the body. No sqrt(N) scalar GPR — sqrt(N) is folded into gamma below.
-    preamble_dram_addr = ue.get_program_dram_addr()
-    ue.allocate_program_dram(8 * INSTRUCTION_SIZE_BYTES)
-    main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
-    ue.clear_capture_buffer()
-    ue.start_capture()
-    ue.generate_instruction_add_set(m_reg, M)
-    ue.generate_instruction_add_set(n_reg, padded_N)
-    if dynamic_addr:
-        ue.generate_instruction_add_set(a_reg, A_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(g_reg, GAMMA_DRAM_ADDR >> 3)
-    ue.generate_instruction_jump_abs(main_program_word_addr)
-    ue.stop_capture()
-    ue.write_captured_instructions_to_dram(preamble_dram_addr)
-    if dynamic_addr:
-        ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
-    ue.release_isa_reg(); ue.release_isa_reg()  # n_reg, m_reg
-
-    x = torch.randn(M, N, dtype=torch.bfloat16)
-    gamma = torch.randn(N, dtype=torch.bfloat16)
-    # Plain gamma: sqrt(real_N) is baked as the RSQRT scalar in the core (real_N=N above), matching
-    # the legacy path exactly -- no gamma*sqrt(N) product to re-round through bf16.
-    ue.dma_to_accelerator_memory(A_DRAM_ADDR, _pad_last_dim_zeros(x, N, padded_N))
-    ue.dma_to_accelerator_memory(GAMMA_DRAM_ADDR, _pad_last_dim_zeros(gamma, N, padded_N))
-
-    ue.start_execute_from_dram(preamble_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
-    flop_rate_gflops, _ = ue.report_flop_rate_gflops(total_flops)
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, padded_N))[:, :N]
-    rms_norm = torch.nn.RMSNorm(N)
-    rms_norm.weight.data = gamma
-    ref = rms_norm(x)
-    snr_db = calculate_snr(ref, output)
-    print(f"[rms_norm+dynamic{'+dynaddr' if dynamic_addr else ''}] M={M} N={N} (padded_N={padded_N}) "
-          f"SNR={snr_db:.2f} dB body={instruction_size_bytes // 32} instrs")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-    record_test(f"rms_norm+dynamic{'+dynaddr' if dynamic_addr else ''}",
-                f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops, inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
-
-def layer_norm_core_dram_dynamic_test(M: int, N: int, gamma_enable: bool = True, beta_enable: bool = True,
-                                      dynamic_addr: bool = False):
-    """Tests layer_norm_core_dram_dynamic — layer norm with runtime M and any N (not just
-    64-aligned).
-
-    The mean's ``1/N`` is delivered as a host ``inv_n`` vector (every real element = ``1/N``) so
-    ``mean = reduce(x*inv_n)`` with a compile-time RECIP scalar of 1.0. The std's ``sqrt(N)`` is baked
-    as the RSQRT scalar (``real_N=N``) and the host uploads a **plain** gamma — same precision as
-    legacy, so the dynamic and legacy SNRs match (the old ``gamma*sqrt(N)`` fold cost ~0.25-0.75 dB).
-    Compile-once body + preamble priming gpr_M/gpr_N only. 2 PBI pointers (load/store); compute is
-    plain. The core requires gamma (a plain no-gamma layer norm uploads plain ``ones``). HW-confirmed.
-
-    **Non-64-aligned N** (e.g. 21, 53, 80) is served by host-side zero padding to ``padded_N`` (a
-    multiple of 64), same idea as ``rms_norm_core_dram_dynamic_test``, plus a ``MASK_DRAM_ADDR``
-    (1 for the real N lanes, 0 for the padding) that the core multiplies in right after the
-    mean-subtract so the padding can't leak into the variance reduce — see the docstring on
-    :meth:`UnifiedEngine.layer_norm_core_dram_dynamic` for why plain zero padding isn't enough here
-    (unlike RMS, which has no mean-subtraction step to contaminate). ``inv_n`` and ``gamma`` both use
-    the *real* N, not padded_N. For an already-64-aligned N this is all a no-op (padded_N == N, no
-    mask uploaded, byte-identical instruction stream to before this parameter existed).
-    """
-    padded_N = _round_up_vec(N)
-    needs_mask = padded_N != N
-    ue = UnifiedEngine()
-    A_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
-    GAMMA_DRAM_ADDR = ue.allocate_tensor_dram(padded_N * 2)   # required (carries sqrt(N))
-    BETA_DRAM_ADDR = ue.allocate_tensor_dram(padded_N * 2) if beta_enable else None
-    INV_N_DRAM_ADDR = ue.allocate_tensor_dram(padded_N * 2)   # the 1/N vector (0 in the pad lanes)
-    MASK_DRAM_ADDR = ue.allocate_tensor_dram(padded_N * 2) if needs_mask else None
-
-    m_reg = ue.alloc_isa_reg(); n_reg = ue.alloc_isa_reg()
-    a_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    out_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    g_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    b_reg = ue.alloc_isa_reg() if (dynamic_addr and beta_enable) else None
-    invn_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    mask_reg = ue.alloc_isa_reg() if (dynamic_addr and needs_mask) else None
-
-    # 1. Compile body once (template N = padded_N so the core's 64-aligned assert holds; runtime
-    #    N comes from gpr_N_reg).
-    ue.start_capture()
-    total_flops = ue.layer_norm_core_dram(
-        M=64, N=padded_N, A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-        GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR, INV_N_DRAM_ADDR=INV_N_DRAM_ADDR,
-        MASK_DRAM_ADDR=MASK_DRAM_ADDR,
-        gpr_M_reg=m_reg, gpr_N_reg=n_reg, real_N=N,
-        gpr_a_addr=a_reg, gpr_out_addr=out_reg, gpr_gamma_addr=g_reg, gpr_beta_addr=b_reg, gpr_invn_addr=invn_reg,
-        gpr_mask_addr=mask_reg,
-    )
-    # Compiled with the M=64 template; rescale flops (linear in M) to the real M.
-    total_flops = total_flops * M // 64
-    ue.stop_capture()
-    ue.generate_instruction_halt()
-    main_program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.write_captured_instructions_to_dram(main_program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-
-    # 2. Preamble: prime M/padded_N (+ addresses) then jump into the body. No scalar GPRs.
-    preamble_dram_addr = ue.get_program_dram_addr()
-    ue.allocate_program_dram(8 * INSTRUCTION_SIZE_BYTES)
-    main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
-    ue.clear_capture_buffer()
-    ue.start_capture()
-    ue.generate_instruction_add_set(m_reg, M)
-    ue.generate_instruction_add_set(n_reg, padded_N)
-    if dynamic_addr:
-        ue.generate_instruction_add_set(a_reg, A_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(g_reg, GAMMA_DRAM_ADDR >> 3)
-        if b_reg is not None:
-            ue.generate_instruction_add_set(b_reg, BETA_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(invn_reg, INV_N_DRAM_ADDR >> 3)
-        if mask_reg is not None:
-            ue.generate_instruction_add_set(mask_reg, MASK_DRAM_ADDR >> 3)
-    ue.generate_instruction_jump_abs(main_program_word_addr)
-    ue.stop_capture()
-    ue.write_captured_instructions_to_dram(preamble_dram_addr)
-    if dynamic_addr:
-        if mask_reg is not None: ue.release_isa_reg()     # mask_reg
-        ue.release_isa_reg()                              # invn_reg
-        if b_reg is not None: ue.release_isa_reg()        # b_reg
-        ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()  # g_reg, out_reg, a_reg
-    ue.release_isa_reg(); ue.release_isa_reg()            # n_reg, m_reg
-
-    x = torch.randn(M, N, dtype=torch.bfloat16)
-    gamma = torch.randn(N, dtype=torch.bfloat16) if gamma_enable else torch.ones(N, dtype=torch.bfloat16)
-    beta = torch.randn(N, dtype=torch.bfloat16)
-    # Plain gamma: sqrt(real N) is baked as the RSQRT scalar in the core (real_N=N above), matching
-    # legacy exactly. inv_n = 1/(real N) still carries the mean's 1/N (bf16 rounding here is
-    # second-order -- the mean is small -- so it doesn't measurably move SNR). Both zero-padded.
-    inv_n = torch.full((N,), 1.0 / N, dtype=torch.bfloat16)
-    ue.dma_to_accelerator_memory(A_DRAM_ADDR, _pad_last_dim_zeros(x, N, padded_N))
-    ue.dma_to_accelerator_memory(GAMMA_DRAM_ADDR, _pad_last_dim_zeros(gamma, N, padded_N))
-    ue.dma_to_accelerator_memory(INV_N_DRAM_ADDR, _pad_last_dim_zeros(inv_n, N, padded_N))
-    if beta_enable:
-        ue.dma_to_accelerator_memory(BETA_DRAM_ADDR, _pad_last_dim_zeros(beta, N, padded_N))
-    if needs_mask:
-        mask = torch.zeros(padded_N, dtype=torch.bfloat16)
-        mask[:N] = 1.0
-        ue.dma_to_accelerator_memory(MASK_DRAM_ADDR, mask)
-
-    ue.start_execute_from_dram(preamble_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
-    flop_rate_gflops, _ = ue.report_flop_rate_gflops(total_flops)
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, padded_N))[:, :N]
-    layer_norm = torch.nn.LayerNorm(N)
-    layer_norm.weight.data = gamma
-    layer_norm.bias.data = beta if beta_enable else torch.zeros(N, dtype=torch.bfloat16)
-    ref = layer_norm(x)
-    snr_db = calculate_snr(ref, output)
-    flag_str = ("+" + "+".join([s for s, e in (("gamma", gamma_enable), ("beta", beta_enable)) if e])) if (gamma_enable or beta_enable) else ""
-    print(f"[layer_norm+dynamic{flag_str}{'+dynaddr' if dynamic_addr else ''}] M={M} N={N} (padded_N={padded_N}) "
-          f"SNR={snr_db:.2f} dB body={instruction_size_bytes // 32} instrs")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-    record_test(f"layer_norm+dynamic{flag_str}{'+dynaddr' if dynamic_addr else ''}",
-                f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops, inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
-
-def rope_hf_core_dram_gqa_test(M: int, group_size: int, N: int, use_pbi: bool = False, dynamic_addr: bool = False):
-    """
-    Tests grouped-query RoPE with Q rows laid out as [M, group_size, N].
-
-    When ``dynamic_addr=True`` (requires ``use_pbi``), the Q/output/cos DRAM bases are sourced from
-    GPRs (primed with ``addr >> 3``) and passed as ``gpr_*_addr`` instead of being baked in. Primed
-    addresses equal the literals so results are identical.
-    """
-    ue = UnifiedEngine()
-    if dynamic_addr and not use_pbi:
-        raise ValueError("rope_hf_core_dram_gqa_test: dynamic_addr=True requires use_pbi=True (PBI path)")
-
-    X_DRAM_ADDR = ue.allocate_tensor_dram(M * group_size * N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * group_size * N * 2)
-    ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * N * 2)
-
-    # PBI path is driven by gpr_M_reg; allocate + prime a GPR with M when use_pbi is requested.
-    m_reg = ue.alloc_isa_reg() if use_pbi else None
-    in_reg  = ue.alloc_isa_reg() if dynamic_addr else None
-    out_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    cos_reg = ue.alloc_isa_reg() if dynamic_addr else None
-
-    ue.start_capture()
-    if use_pbi:
         ue.generate_instruction_add_set(m_reg, M)
-    if dynamic_addr:
-        ue.generate_instruction_add_set(in_reg, X_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(cos_reg, ROPE_DRAM_ADDR >> 3)
-    total_flops = ue.rope_hf_core_dram_gqa(
-        M=M,
-        group_size=group_size,
-        N=N,
-        input_dram_addr=X_DRAM_ADDR,
-        output_dram_addr=OUTPUT_DRAM_ADDR,
-        cos_dram_addr=ROPE_DRAM_ADDR,
-        sin_dram_addr=ROPE_DRAM_ADDR + N * 2,
-        gpr_M_reg=m_reg,
-        gpr_input_addr=in_reg, gpr_out_addr=out_reg, gpr_cos_addr=cos_reg,
-    )
-    ue.stop_capture()
-    if dynamic_addr:
-        ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
-    if use_pbi:
-        ue.release_isa_reg()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.generate_instruction_add_set(n_reg, padded_N)                 # reduce length / DMA / row stride
+        ue.generate_instruction_add_set(sqrt_reg, ue.float_to_bf19(float(N ** 0.5)))   # sqrt(real N)
+        ue.generate_instruction_add_set(a_reg, A >> 3)
+        ue.generate_instruction_add_set(out_reg, O >> 3)
+        ue.generate_instruction_add_set(g_reg, G >> 3)
+        ue.generate_instruction_jump_abs(main_word_addr)
+        ue.stop_capture()
+        ue.write_captured_instructions_to_dram(preamble)
 
-    head_dim = N
-    MAX_SEQ_LEN = 32768
-    freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
-    random_seq_index = random.randint(0, MAX_SEQ_LEN - M)
-    rope_rows = []
-    cos_rows = []
-    sin_rows = []
-    for row_idx in range(M):
-        one_rope_seq_params = freqs_cis[random_seq_index + row_idx, :]
-        one_rope_seq = torch.view_as_real(one_rope_seq_params).to(torch.bfloat16).reshape(-1)
-        cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)
-        sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)
-        sin_negated = sin.clone()
-        sin_negated[:N // 2] = -sin_negated[:N // 2]
-        rope_rows.append(torch.cat((cos, sin_negated), dim=0))
-        cos_rows.append(cos)
-        sin_rows.append(sin)
+        x = torch.randn(M, N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(A, _pad_last_dim_zeros(x, N, padded_N))
+        gamma = torch.randn(N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(G, _pad_last_dim_zeros(gamma, N, padded_N))
 
-    x_hf = torch.randn(M, group_size, N, dtype=torch.bfloat16)
-    rope_table = torch.cat(rope_rows, dim=0)
+        ue.start_execute_from_dram(preamble)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+        gflops, _ = ue.report_flop_rate_gflops(total_flops)
+        out = ue.dma_from_accelerator_memory(O, (M, padded_N))[:, :N]
+        _finish("rms_norm+dynamic", M, N, x, gamma, out, gflops, main_inst_bytes)
 
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_hf.reshape(M * group_size, N))
-    ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
+        for _ in range(6):
+            ue.release_isa_reg()
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
 
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(f"Report FLOPS for GQA HF RoPE core DRAM: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, group_size={group_size}, N={N}, use_pbi={use_pbi}")
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M * group_size, N)).reshape(M, group_size, N)
-
-    def rotate_half(x):
-        x1 = x[..., :x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
-    cos_ref = torch.stack(cos_rows, dim=0).unsqueeze(1)
-    sin_ref = torch.stack(sin_rows, dim=0).unsqueeze(1)
-    ref = x_hf * cos_ref + rotate_half(x_hf) * sin_ref
-    snr_db = calculate_snr(ref, output)
-    print(f"GQA HF RoPE core DRAM SNR Analysis: {snr_db:.2f} dB for M={M}, group_size={group_size}, N={N}")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-
-    record_test(f"rope_hf_core_dram_gqa{'+pbi' if use_pbi else ''}{'+dynaddr' if dynamic_addr else ''}",
-                f"M={M}, G={group_size}, N={N}",
-                snr_db=snr_db,
-                gflops=flop_rate_gflops,
-                inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
-
-def rope_hf_core_dram_gqa_dynamic_test(M: int, group_size: int, N: int, dynamic: bool = False,
-                                       use_pbi: bool = False, dynamic_addr: bool = False):
-    """Unified grouped-query HF RoPE test for **any head_dim N** (an odd N is rounded up to the next
-    even head_dim). Q rows are ``[M, group_size, N]``, rope rows ``[M, N]``. Modes via flags, exactly
-    like :func:`rope_hf_core_dram_dynamic_test`:
-
-    * ``dynamic=True`` -> :meth:`rope_hf_core_dram_gqa_dynamic_phased` (runtime M, group_size, N; the body
-      is compiled ONCE and a preamble primes the runtime registers and jumps in).
-    * ``use_pbi=True`` (and not dynamic) -> :meth:`rope_hf_core_dram_gqa_pbi` (runtime M only).
-    * neither -> :meth:`rope_hf_core_dram_gqa_legacy`.
-
-    Non-64-aligned N is handled by host-side padding (see :func:`_rope_padded_layout`).
-    """
-    if dynamic_addr and not (dynamic or use_pbi):
-        raise ValueError("rope_hf_core_dram_gqa_dynamic_test: dynamic_addr=True requires dynamic=True or use_pbi=True")
-    if N % 2:
-        N += 1  # RoPE rotate-half needs an even head_dim; round an odd stress dim up (host zero-pad).
-    padded_N, half, padded_half = _rope_padded_layout(N)
-    mode_tag = "dynamic" if dynamic else ("pbi" if use_pbi else "legacy")
-
-    ue = UnifiedEngine()
-    X_DRAM_ADDR = ue.allocate_tensor_dram(M * group_size * padded_N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * group_size * padded_N * 2)
-    ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * padded_N * 2)
-
-    need_m = dynamic or use_pbi
-    m_reg   = ue.alloc_isa_reg() if need_m else None
-    n_reg   = ue.alloc_isa_reg() if dynamic else None
-    g_reg   = ue.alloc_isa_reg() if dynamic else None
-    in_reg  = ue.alloc_isa_reg() if dynamic_addr else None
-    out_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    cos_reg = ue.alloc_isa_reg() if dynamic_addr else None
-
-    def _emit_core():
-        return ue.rope_hf_core_dram_gqa(
-            M=(64 if dynamic else M), group_size=group_size, N=padded_N,
-            input_dram_addr=X_DRAM_ADDR, output_dram_addr=OUTPUT_DRAM_ADDR,
-            cos_dram_addr=ROPE_DRAM_ADDR, sin_dram_addr=ROPE_DRAM_ADDR + padded_N * 2,
-            gpr_M_reg=m_reg, gpr_N_reg=n_reg, gpr_group_reg=g_reg,
-            gpr_input_addr=in_reg, gpr_out_addr=out_reg, gpr_cos_addr=cos_reg,
+    for (M, N) in shapes:
+        if N % UE_VECTOR_SIZE != 0:
+            # Non-64-aligned N: dynamic-only (host zero-pad); the legacy core can't take it.
+            _run_dynamic(M, N)
+            continue
+        # 64-aligned N: legacy first (baseline), then dynamic — the summary diffs dynamic vs legacy.
+        _run_rng_matched_pair(
+            lambda M=M, N=N: _run_legacy(M, N),
+            lambda M=M, N=N: _run_dynamic(M, N),
         )
 
-    def _prime_runtime_regs():
-        if need_m:
-            ue.generate_instruction_add_set(m_reg, M)
-        if dynamic:
-            ue.generate_instruction_add_set(n_reg, padded_N)
-            ue.generate_instruction_add_set(g_reg, group_size)
-        if dynamic_addr:
-            ue.generate_instruction_add_set(in_reg, X_DRAM_ADDR >> 3)
-            ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
-            ue.generate_instruction_add_set(cos_reg, ROPE_DRAM_ADDR >> 3)
 
-    if dynamic:
+def layer_norm_core_dram_unified_test(shapes=None, gamma_enable: bool = True, beta_enable: bool = True,
+                                      snr_threshold_db: float = 40.0):
+    """Unified LayerNorm DRAM test: every ``(M, N)`` shape is a **paired dynamic-vs-legacy** run.
+
+    Supersedes the former separate legacy/PBI ``layer_norm_test`` and the dynamic
+    ``layer_norm_core_dram_dynamic_test``. Built on the dynamic test with GPR-sourced DRAM bases on
+    by default: for each shape it runs the **legacy** core (all dims baked) and the **dynamic** core
+    (runtime M / N, runtime ``sqrt(N)`` RSQRT scalar, ``1/N`` via a host ``inv_n`` vector, all via
+    GPRs) from an identical RNG state through :func:`_run_rng_matched_pair`, so the summary reports
+    the dynamic-vs-legacy SNR/GFLOPS delta.
+
+    **64-aligned N** shapes run **paired**. **Non-64-aligned N** shapes run **dynamic-only**: host
+    zero-pad plus a ``mask`` that zeroes the pad lanes after the mean-subtract, since LayerNorm's
+    mean-centering would otherwise let the padding leak into the variance reduce (unlike RMS, which
+    has no mean step). The legacy core rejects non-aligned N, so those cannot be paired.
+    """
+    if shapes is None:
+        shapes = [(1024, 1024)]
+    _flag = ("+" + "+".join([s for s, e in (("gamma", gamma_enable), ("beta", beta_enable)) if e])) \
+        if (gamma_enable or beta_enable) else ""
+
+    def _finish(name, M, N, x, gamma, beta, out, gflops, inst_bytes):
+        ln = torch.nn.LayerNorm(N)
+        ln.weight.data = gamma
+        ln.bias.data = beta
+        snr_db = calculate_snr(ln(x), out)
+        print(f"[{name}] M={M} N={N} SNR={snr_db:.2f} dB GFLOPS={gflops:.2f}")
+        assert snr_db >= snr_threshold_db or snr_db == float("inf"), \
+            f"{name} M={M} N={N} SNR {snr_db:.2f} dB < {snr_threshold_db:g} dB"
+        record_test(name, f"M={M},N={N}", snr_db=snr_db, gflops=gflops, inst_bytes=inst_bytes)
+
+    def _draw(M, N):
+        # Identical RNG draw order on both tiers: x, then gamma (if enabled), then beta (if enabled).
+        x = torch.randn(M, N, dtype=torch.bfloat16)
+        gamma = torch.randn(N, dtype=torch.bfloat16) if gamma_enable else torch.ones(N, dtype=torch.bfloat16)
+        beta = torch.randn(N, dtype=torch.bfloat16) if beta_enable else torch.zeros(N, dtype=torch.bfloat16)
+        return x, gamma, beta
+
+    def _run_legacy(M, N):
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(M * N * 2)
+        O = ue.allocate_tensor_dram(M * N * 2)
+        G = ue.allocate_tensor_dram(N * 2) if gamma_enable else None
+        B = ue.allocate_tensor_dram(N * 2) if beta_enable else None
+
         ue.start_capture()
-        total_flops = _emit_core()
+        total_flops = ue.layer_norm_core_dram(M=M, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O,
+                                              GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=B)
         ue.stop_capture()
         ue.generate_instruction_halt()
-        main_program_dram_addr = ue.get_program_dram_addr()
-        instruction_size_bytes = ue.write_captured_instructions_to_dram(main_program_dram_addr)
-        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(prog)
+        inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(inst_bytes)
+        ue.clear_capture_buffer()
 
-        preamble_dram_addr = ue.get_program_dram_addr()
-        ue.allocate_program_dram(8 * INSTRUCTION_SIZE_BYTES)
-        main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
+        x, gamma, beta = _draw(M, N)
+        ue.dma_to_accelerator_memory(A, x)
+        if gamma_enable: ue.dma_to_accelerator_memory(G, gamma)
+        if beta_enable:  ue.dma_to_accelerator_memory(B, beta)
+
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+        gflops, _ = ue.report_flop_rate_gflops(total_flops)
+        out = ue.dma_from_accelerator_memory(O, (M, N))
+        _finish(f"layer_norm{_flag}", M, N, x, gamma, beta, out, gflops, inst_bytes)
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr()
+
+    def _run_dynamic(M, N):
+        padded_N = _round_up_vec(N)
+        needs_mask = padded_N != N
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(M * padded_N * 2)
+        O = ue.allocate_tensor_dram(M * padded_N * 2)
+        G = ue.allocate_tensor_dram(padded_N * 2)                    # required (plain gamma or ones)
+        B = ue.allocate_tensor_dram(padded_N * 2) if beta_enable else None
+        INV = ue.allocate_tensor_dram(padded_N * 2)                 # 1/N vector (0 in pad lanes)
+        MASK = ue.allocate_tensor_dram(padded_N * 2) if needs_mask else None
+
+        regs = []
+        def areg():
+            r = ue.alloc_isa_reg(); regs.append(r); return r
+        m_reg = areg(); n_reg = areg(); sqrt_reg = areg()
+        a_reg = areg(); out_reg = areg(); g_reg = areg()            # GPR-sourced DRAM bases: default on
+        b_reg = areg() if beta_enable else None
+        invn_reg = areg()
+        mask_reg = areg() if needs_mask else None
+
+        # 1. Compile once at template M=64, N=padded_N (64-aligned); runtime M / N / sqrt(N) via GPRs.
+        ue.start_capture()
+        total_flops = ue.layer_norm_core_dram_dynamic(
+            M=64, N=padded_N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O,
+            GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=B, INV_N_DRAM_ADDR=INV, MASK_DRAM_ADDR=MASK,
+            gpr_M_reg=m_reg, gpr_N_reg=n_reg, gpr_sqrt_n_reg=sqrt_reg,
+            gpr_a_addr=a_reg, gpr_out_addr=out_reg, gpr_gamma_addr=g_reg, gpr_beta_addr=b_reg,
+            gpr_invn_addr=invn_reg, gpr_mask_addr=mask_reg,
+        )
+        total_flops = total_flops * M // 64
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        main_prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(main_prog)
+        main_inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(main_inst_bytes)
+
+        # 2. Preamble: prime real M, padded_N, sqrt(real N) + all DRAM bases, then jump into the body.
+        preamble = ue.get_program_dram_addr()
+        ue.allocate_program_dram((len(regs) + 2) * INSTRUCTION_SIZE_BYTES)
+        main_word_addr = ue_35bit_addr_shifter(main_prog)
         ue.clear_capture_buffer()
         ue.start_capture()
-        _prime_runtime_regs()
-        ue.generate_instruction_jump_abs(main_program_word_addr)
+        ue.generate_instruction_add_set(m_reg, M)
+        ue.generate_instruction_add_set(n_reg, padded_N)
+        ue.generate_instruction_add_set(sqrt_reg, ue.float_to_bf19(float(N ** 0.5)))
+        ue.generate_instruction_add_set(a_reg, A >> 3)
+        ue.generate_instruction_add_set(out_reg, O >> 3)
+        ue.generate_instruction_add_set(g_reg, G >> 3)
+        if b_reg is not None:
+            ue.generate_instruction_add_set(b_reg, B >> 3)
+        ue.generate_instruction_add_set(invn_reg, INV >> 3)
+        if mask_reg is not None:
+            ue.generate_instruction_add_set(mask_reg, MASK >> 3)
+        ue.generate_instruction_jump_abs(main_word_addr)
         ue.stop_capture()
-        ue.write_captured_instructions_to_dram(preamble_dram_addr)
-        entry_dram_addr = preamble_dram_addr
-    else:
-        ue.start_capture()
-        _prime_runtime_regs()
-        total_flops = _emit_core()
-        ue.stop_capture()
-        ue.generate_instruction_halt()
-        entry_dram_addr = ue.get_program_dram_addr()
-        instruction_size_bytes = ue.write_captured_instructions_to_dram(entry_dram_addr)
-        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.write_captured_instructions_to_dram(preamble)
 
-    for r in (cos_reg, out_reg, in_reg, g_reg, n_reg, m_reg):  # LIFO release
-        if r is not None:
+        x, gamma, beta = _draw(M, N)
+        inv_n = torch.full((N,), 1.0 / N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(A, _pad_last_dim_zeros(x, N, padded_N))
+        ue.dma_to_accelerator_memory(G, _pad_last_dim_zeros(gamma, N, padded_N))
+        ue.dma_to_accelerator_memory(INV, _pad_last_dim_zeros(inv_n, N, padded_N))
+        if beta_enable:
+            ue.dma_to_accelerator_memory(B, _pad_last_dim_zeros(beta, N, padded_N))
+        if needs_mask:
+            mask = torch.zeros(padded_N, dtype=torch.bfloat16); mask[:N] = 1.0
+            ue.dma_to_accelerator_memory(MASK, mask)
+
+        ue.start_execute_from_dram(preamble)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+        gflops, _ = ue.report_flop_rate_gflops(total_flops)
+        out = ue.dma_from_accelerator_memory(O, (M, padded_N))[:, :N]
+        _finish(f"layer_norm+dynamic{_flag}", M, N, x, gamma, beta, out, gflops, main_inst_bytes)
+
+        for _ in regs:
             ue.release_isa_reg()
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
 
-    # Reference: per-row sequential rope rows, then host-padded to padded_N.
-    head_dim = N
-    MAX_SEQ_LEN = 32768
-    freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
-    random_seq_index = random.randint(0, MAX_SEQ_LEN - M)
-    cos_rows, sin_rows, rope_rows = [], [], []
-    for row_idx in range(M):
-        one_rope_seq = torch.view_as_real(freqs_cis[random_seq_index + row_idx, :]).to(torch.bfloat16).reshape(-1)
-        cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)
-        sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)
-        rope_rows.append(_rope_pad_table_row(cos, sin, N, padded_N, half, padded_half))
-        cos_rows.append(cos); sin_rows.append(sin)
-
-    x_hf = torch.randn(M, group_size, N, dtype=torch.bfloat16)
-    rope_table = torch.cat(rope_rows, dim=0)
-    x_pad = _rope_pad_x(x_hf, N, padded_N, half, padded_half).reshape(M * group_size, padded_N)
-
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_pad)
-    ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
-
-    ue.start_execute_from_dram(entry_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(f"Report FLOPS for GQA HF RoPE [{mode_tag}]: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% "
-          f"peak for M={M}, group_size={group_size}, N={N} (padded_N={padded_N})")
-
-    out_pad = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M * group_size, padded_N)).reshape(M, group_size, padded_N)
-    output = _rope_unpad(out_pad, N, padded_N, half, padded_half)
-
-    cos_ref = torch.stack(cos_rows, dim=0).unsqueeze(1)
-    sin_ref = torch.stack(sin_rows, dim=0).unsqueeze(1)
-    ref = x_hf * cos_ref + _rotate_half(x_hf) * sin_ref
-    snr_db = calculate_snr(ref, output)
-    print(f"GQA HF RoPE [{mode_tag}{'+dynaddr' if dynamic_addr else ''}] SNR: {snr_db:.2f} dB for "
-          f"M={M}, group_size={group_size}, N={N} (padded_N={padded_N}, body={instruction_size_bytes // 32} instrs)")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-
-    record_test(f"rope_hf_core_dram_gqa+{mode_tag}{'+dynaddr' if dynamic_addr else ''}",
-                f"M={M}, G={group_size}, N={N}",
-                snr_db=snr_db, gflops=flop_rate_gflops, inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
+    for (M, N) in shapes:
+        if N % UE_VECTOR_SIZE != 0:
+            # Non-64-aligned N: dynamic-only (host zero-pad + mask); the legacy core can't take it.
+            _run_dynamic(M, N)
+            continue
+        # 64-aligned N: legacy first (baseline), then dynamic — the summary diffs dynamic vs legacy.
+        _run_rng_matched_pair(
+            lambda M=M, N=N: _run_legacy(M, N),
+            lambda M=M, N=N: _run_dynamic(M, N),
+        )
 
 
-def rope_hf_core_dram_d64_test(M: int, N: int, dynamic: bool = False, dynamic_addr: bool = False):
-    """HF RoPE for head_dim ``N < 128`` (the sub-128 padded-split region).
+def rope_hf_core_dram_gqa_unified_test(shapes=None):
+    """Run matched legacy/dynamic grouped-query HF RoPE coverage."""
 
-    * ``dynamic=True``  -> the head_dim is promoted to 128 by host padding and run through the
-      unified dynamic core (delegates to :func:`rope_hf_core_dram_dynamic_test`), i.e. the padded
-      dynamic path subsumes the sub-128 case.
-    * ``dynamic=False`` -> the native sub-128 PBI core :meth:`rope_hf_core_dram_d64_pbi`: each
-      N/2-elem rotate-half is register-addressed into its own 128-byte URAM slot (no PBI
-      pointers). Runtime M from ``gpr_M_reg``; ``dynamic_addr`` sources the input/output/cos
-      bases from GPRs. The core's slice DMAs land on multiples of the half-slice size, and the
-      DMA engine requires AXI-beat-aligned DRAM addresses (same beat rule as slicing_test /
-      packing_test), so each rotate-half is host-padded up to a beat multiple: a no-op at
-      256-bit for the N used here, while at 512-bit N=32 pads each 16-elem half into a 32-elem
-      (64 B) slot. The real halves are sliced back out before the SNR check.
-    """
-    assert 0 < N < 128 and N % 2 == 0, f"d64 RoPE test expects an even head_dim 0<N<128, got {N}"
-    if dynamic:
-        return rope_hf_core_dram_dynamic_test(M, N, dynamic=True, dynamic_addr=dynamic_addr)
+    def _run_case(
+        M: int, group_size: int, N: int, dynamic: bool = False,
+        dynamic_addr: bool = False,
+    ):
+        """Unified grouped-query HF RoPE test for **any head_dim N** (an odd N is rounded up to the next
+        even head_dim). Q rows are ``[M, group_size, N]``, rope rows ``[M, N]``. Modes via flags, exactly
+        like :func:`rope_hf_core_dram_unified_test`:
 
-    # Beat-align each rotate-half: every slice DMA in the d64 core starts at a multiple of the
-    # half-slice bytes, which must be a whole number of AXI beats (64 B at 512-bit, 32 B at 256-bit).
-    half = N // 2
-    padded_half = ue_round_up_to_axi_beat_bytes(half * 2) // 2
-    padded_N = 2 * padded_half
-    assert padded_N < 128, (
-        f"beat-padded head_dim {padded_N} leaves the d64 (N<128) region for N={N} at "
-        f"UE_AXI_DATA_WIDTH_BITS={UE_AXI_DATA_WIDTH_BITS}; use dynamic=True (padded-128 core) instead")
+        * ``dynamic=True`` -> :meth:`rope_hf_core_dram_gqa_dynamic_phased` (runtime M, group_size, N; the body
+          is compiled ONCE and a preamble primes the runtime registers and jumps in).
+        * ``dynamic=False`` -> :meth:`rope_hf_core_dram_gqa_legacy`.
 
-    ue = UnifiedEngine()
-    X_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * padded_N * 2)
-    ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * padded_N * 2)
+        Non-64-aligned N is handled by host-side padding (see :func:`_rope_padded_layout`).
+        """
+        if dynamic_addr and not dynamic:
+            raise ValueError("rope_hf_core_dram_gqa_unified_test: dynamic_addr requires a runtime mode")
+        if N % 2:
+            N += 1  # RoPE rotate-half needs an even head_dim; round an odd stress dim up (host zero-pad).
+        padded_N, half, padded_half = _rope_padded_layout(N)
+        mode_tag = "dynamic" if dynamic else "legacy"
 
-    m_reg   = ue.alloc_isa_reg()
-    in_reg  = ue.alloc_isa_reg() if dynamic_addr else None
-    out_reg = ue.alloc_isa_reg() if dynamic_addr else None
-    cos_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        ue = UnifiedEngine()
+        X_DRAM_ADDR = ue.allocate_tensor_dram(M * group_size * padded_N * 2)
+        OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * group_size * padded_N * 2)
+        ROPE_DRAM_ADDR = ue.allocate_tensor_dram(M * 2 * padded_N * 2)
 
-    ue.start_capture()
-    ue.generate_instruction_add_set(m_reg, M)
-    if dynamic_addr:
-        ue.generate_instruction_add_set(in_reg, X_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
-        ue.generate_instruction_add_set(cos_reg, ROPE_DRAM_ADDR >> 3)
-    total_flops = ue.rope_hf_core_dram_d64_pbi(
-        M=M, N=padded_N, input_dram_addr=X_DRAM_ADDR, output_dram_addr=OUTPUT_DRAM_ADDR,
-        cos_dram_addr=ROPE_DRAM_ADDR, sin_dram_addr=ROPE_DRAM_ADDR + padded_N * 2, gpr_M_reg=m_reg,
-        gpr_input_addr=in_reg, gpr_out_addr=out_reg, gpr_cos_addr=cos_reg,
-    )
-    ue.stop_capture()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-    for r in (cos_reg, out_reg, in_reg, m_reg):  # LIFO release
-        if r is not None:
-            ue.release_isa_reg()
+        need_m = dynamic
+        m_reg   = ue.alloc_isa_reg() if need_m else None
+        n_reg   = ue.alloc_isa_reg() if dynamic else None
+        g_reg   = ue.alloc_isa_reg() if dynamic else None
+        in_reg  = ue.alloc_isa_reg() if dynamic_addr else None
+        out_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        cos_reg = ue.alloc_isa_reg() if dynamic_addr else None
 
-    # Native d64 table layout: [cos(padded_N) | sin_negated(padded_N)] contiguous, each
-    # rotate-half in its beat-aligned slot (padded_N == N -> byte-identical unpadded layout).
-    head_dim = N
-    MAX_SEQ_LEN = 32768
-    freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
-    one_rope_seq = torch.view_as_real(freqs_cis[random.randint(0, MAX_SEQ_LEN - 1), :]).to(torch.bfloat16).reshape(-1)
-    cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)
-    sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)
-    x_hf = torch.randn(M, N, dtype=torch.bfloat16)
-    rope_table = _rope_pad_table_row(cos, sin, N, padded_N, half, padded_half).repeat(M)
-    x_pad = _rope_pad_x(x_hf, N, padded_N, half, padded_half)
+        def _emit_core():
+            core = ue.rope_hf_core_dram_gqa_dynamic if dynamic else ue.rope_hf_core_dram_gqa
+            return core(
+                M=(64 if dynamic else M), group_size=group_size, N=padded_N,
+                input_dram_addr=X_DRAM_ADDR, output_dram_addr=OUTPUT_DRAM_ADDR,
+                cos_dram_addr=ROPE_DRAM_ADDR, sin_dram_addr=ROPE_DRAM_ADDR + padded_N * 2,
+                gpr_M_reg=m_reg, gpr_N_reg=n_reg, gpr_group_reg=g_reg,
+                gpr_input_addr=in_reg, gpr_out_addr=out_reg, gpr_cos_addr=cos_reg,
+            )
 
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_pad)
-    ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
+        def _prime_runtime_regs():
+            if need_m:
+                ue.generate_instruction_add_set(m_reg, M)
+            if dynamic:
+                ue.generate_instruction_add_set(n_reg, padded_N)
+                ue.generate_instruction_add_set(g_reg, group_size)
+            if dynamic_addr:
+                ue.generate_instruction_add_set(in_reg, X_DRAM_ADDR >> 3)
+                ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
+                ue.generate_instruction_add_set(cos_reg, ROPE_DRAM_ADDR >> 3)
 
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
+        if dynamic:
+            ue.start_capture()
+            total_flops = _emit_core()
+            # The body is captured with template M=64, but execution uses the runtime M register.
+            # Keep performance accounting tied to the real workload rather than the template.
+            total_flops = total_flops * M // 64
+            ue.stop_capture()
+            ue.generate_instruction_halt()
+            main_program_dram_addr = ue.get_program_dram_addr()
+            instruction_size_bytes = ue.write_captured_instructions_to_dram(main_program_dram_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
 
-    flop_rate_gflops, _ = ue.report_flop_rate_gflops(total_flops)
-    out_pad = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, padded_N))
-    output = _rope_unpad(out_pad, N, padded_N, half, padded_half)
-    ref = x_hf * cos + _rotate_half(x_hf) * sin
-    snr_db = calculate_snr(ref, output)
-    print(f"HF RoPE d64 [pbi{'+dynaddr' if dynamic_addr else ''}] SNR: {snr_db:.2f} dB for "
-          f"M={M}, N={N} (padded_N={padded_N}, body={instruction_size_bytes // 32} instrs)")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+            preamble_dram_addr = ue.get_program_dram_addr()
+            ue.allocate_program_dram(8 * INSTRUCTION_SIZE_BYTES)
+            main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
+            ue.clear_capture_buffer()
+            ue.start_capture()
+            _prime_runtime_regs()
+            ue.generate_instruction_jump_abs(main_program_word_addr)
+            ue.stop_capture()
+            ue.write_captured_instructions_to_dram(preamble_dram_addr)
+            entry_dram_addr = preamble_dram_addr
+        else:
+            ue.start_capture()
+            _prime_runtime_regs()
+            total_flops = _emit_core()
+            ue.stop_capture()
+            ue.generate_instruction_halt()
+            entry_dram_addr = ue.get_program_dram_addr()
+            instruction_size_bytes = ue.write_captured_instructions_to_dram(entry_dram_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
 
-    record_test(f"rope_hf_core_dram_d64+pbi{'+dynaddr' if dynamic_addr else ''}",
-                f"M={M}, N={N}", snr_db=snr_db, gflops=flop_rate_gflops, inst_bytes=instruction_size_bytes)
+        for r in (cos_reg, out_reg, in_reg, g_reg, n_reg, m_reg):  # LIFO release
+            if r is not None:
+                ue.release_isa_reg()
 
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
+        # Reference: per-row sequential rope rows, then host-padded to padded_N.
+        head_dim = N
+        MAX_SEQ_LEN = 32768
+        freqs_cis = precompute_freqs_cis(head_dim, MAX_SEQ_LEN * 2)
+        random_seq_index = random.randint(0, MAX_SEQ_LEN - M)
+        cos_rows, sin_rows, rope_rows = [], [], []
+        for row_idx in range(M):
+            one_rope_seq = torch.view_as_real(freqs_cis[random_seq_index + row_idx, :]).to(torch.bfloat16).reshape(-1)
+            cos = torch.cat((one_rope_seq[0::2], one_rope_seq[0::2]), dim=-1)
+            sin = torch.cat((one_rope_seq[1::2], one_rope_seq[1::2]), dim=-1)
+            rope_rows.append(_rope_pad_table_row(cos, sin, N, padded_N, half, padded_half))
+            cos_rows.append(cos); sin_rows.append(sin)
 
-def smolvlm_rope_hf_core_dram_pbi_test(M: int, N: int = 64, theta: float = 100000.0):
-    """
-    Exercises rope_hf_core_dram in PBI mode at SmolVLM2 dimensions (head_dim N=64).
+        x_hf = torch.randn(M, group_size, N, dtype=torch.bfloat16)
+        rope_table = torch.cat(rope_rows, dim=0)
+        x_pad = _rope_pad_x(x_hf, N, padded_N, half, padded_half).reshape(M * group_size, padded_N)
 
-    SmolVLM2's RoPE table convention (see _load_rope_tables): per position p,
-        cos_row = [cos(freqs_p) || cos(freqs_p)]            (N elements)
-        sin_row = [sin(freqs_p) || sin(freqs_p)]            (N elements, first half pre-negated)
-    laid out contiguously as [cos_row || sin_row] per token so the kernel reads one
-    2N-element rope row per token. Positions are sequential (0..M-1) as in real prefill.
+        ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_pad)
+        ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
 
-    head_dim=64 is below the shared PBI rope's N>=128 / 128-byte-half-alignment
-    requirement; this test is the concrete repro for that gap.
-    """
-    ue = UnifiedEngine()
+        ue.start_execute_from_dram(entry_dram_addr)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
 
-    X_DRAM_ADDR      = ue.allocate_tensor_dram(M * N * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    ROPE_DRAM_ADDR   = ue.allocate_tensor_dram(M * 2 * N * 2)
+        flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
+        print(f"Report FLOPS for GQA HF RoPE [{mode_tag}]: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% "
+              f"peak for M={M}, group_size={group_size}, N={N} (padded_N={padded_N})")
 
-    m_reg = ue.alloc_isa_reg()
+        out_pad = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M * group_size, padded_N)).reshape(M, group_size, padded_N)
+        output = _rope_unpad(out_pad, N, padded_N, half, padded_half)
 
-    ue.start_capture()
-    ue.generate_instruction_add_set(m_reg, M)
-    total_flops = ue.rope_hf_core_dram(
-        M=M, N=N,
-        input_dram_addr=X_DRAM_ADDR,
-        output_dram_addr=OUTPUT_DRAM_ADDR,
-        cos_dram_addr=ROPE_DRAM_ADDR,
-        sin_dram_addr=ROPE_DRAM_ADDR + N * 2,
-        gpr_M_reg=m_reg,
-    )
-    ue.stop_capture()
-    ue.release_isa_reg()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        cos_ref = torch.stack(cos_rows, dim=0).unsqueeze(1)
+        sin_ref = torch.stack(sin_rows, dim=0).unsqueeze(1)
+        ref = x_hf * cos_ref + _rotate_half(x_hf) * sin_ref
+        snr_db = calculate_snr(ref, output)
+        print(f"GQA HF RoPE [{mode_tag}{'+dynaddr' if dynamic_addr else ''}] SNR: {snr_db:.2f} dB for "
+              f"M={M}, group_size={group_size}, N={N} (padded_N={padded_N}, body={instruction_size_bytes // 32} instrs)")
+        assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
 
-    # Build SmolVLM-style cos/sin for sequential positions 0..M-1.
-    half = N // 2
-    inv_freq = 1.0 / (theta ** (torch.arange(0, N, 2, dtype=torch.float32) / N))
-    freqs = torch.outer(torch.arange(M, dtype=torch.float32), inv_freq)  # [M, N/2]
-    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=1).to(torch.bfloat16)  # [M, N]
-    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=1).to(torch.bfloat16)  # [M, N]
-    sin_negated = sin.clone()
-    sin_negated[:, :half] = -sin_negated[:, :half]
+        record_test(f"rope_hf_core_dram_gqa+{mode_tag}{'+dynaddr' if dynamic_addr else ''}",
+                    f"M={M}, G={group_size}, N={N}",
+                    snr_db=snr_db, gflops=flop_rate_gflops, inst_bytes=instruction_size_bytes)
 
-    x_hf = torch.randn(M, N, dtype=torch.bfloat16)
-    rope_table = torch.cat([cos, sin_negated], dim=1).reshape(-1)  # [M, 2N] -> flat
+        ue.clear_capture_buffer()
+        ue.reset_tensor_dram_addr()
+        ue.reset_program_dram_addr()
 
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x_hf)
-    ue.dma_to_accelerator_memory(ROPE_DRAM_ADDR, rope_table)
 
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
 
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(f"Report FLOPS for SmolVLM HF RoPE PBI: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for M={M}, N={N}")
+    if shapes is None:
+        shapes = [(64, 4, 512), (8, 4, 128), (64, 4, 80)]
+    for M, group_size, N in shapes:
+        _run_rng_matched_pair(
+            lambda M=M, group_size=group_size, N=N:
+                _run_case(M, group_size, N),
+            lambda M=M, group_size=group_size, N=N:
+                _run_case(
+                    M, group_size, N, dynamic=True, dynamic_addr=True),
+        )
 
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-
-    def rotate_half(x):
-        x1 = x[..., :x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
-    ref = x_hf * cos + rotate_half(x_hf) * sin
-    snr_db = calculate_snr(ref, output)
-    print(f"SmolVLM HF RoPE PBI SNR Analysis: {snr_db:.2f} dB for M={M}, N={N}")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-
-    record_test("smolvlm_rope_hf_core_dram+pbi",
-                f"M={M}, N={N}",
-                snr_db=snr_db,
-                gflops=flop_rate_gflops,
-                inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
-
-def smolvlm_rope_d64_pbi_test(M: int, D: int = 64, theta: float = 100000.0):
-    """
-    Tests nn_lib.rope_hf_core_dram_pbi: the D<128 padded-split RoPE wrapped in a PBI
-    hardware loop (register-addressed reads/writes, 0 PBI pointers). This is the kernel
-    SmolVLM2 prefill needs (head_dim=64).
-
-    Packed per-token rope table = [cos_lo | cos_hi | sin_lo | sin_hi], each 32-elem half
-    zero-padded to UE_VECTOR_SIZE (64) so it is one full 128-byte SRAM row. sin_lo is
-    pre-negated (HW add-only). Positions are sequential (real prefill).
-    """
-    from nn_lib import rope_hf_core_dram_pbi
-
-    ue = UnifiedEngine()
-    PAD = UE_VECTOR_SIZE  # 64
-    half = D // 2
-
-    X_DRAM_ADDR      = ue.allocate_tensor_dram(M * D * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * D * 2)
-    ROPE_PACKED_ADDR = ue.allocate_tensor_dram(M * 4 * PAD * 2)
-
-    gpr_M_reg = ue.alloc_isa_reg()
-    tmp_reg   = ue.alloc_isa_reg()
-    t_reg     = ue.alloc_isa_reg()
-
-    ue.start_capture()
-    ue.generate_instruction_add_set(gpr_M_reg, M)
-    total_flops = rope_hf_core_dram_pbi(
-        ue, M=M, D=D,
-        X_DRAM_ADDR=X_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-        ROPE_PACKED_ADDR=ROPE_PACKED_ADDR,
-        gpr_M_reg=gpr_M_reg, tmp_reg=tmp_reg, t_reg=t_reg,
-    )
-    ue.stop_capture()
-    ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(instruction_size_bytes)
-
-    # SmolVLM-style cos/sin, sequential positions 0..M-1 (only the 32 unique freqs).
-    inv_freq = 1.0 / (theta ** (torch.arange(0, D, 2, dtype=torch.float32) / D))  # [32]
-    freqs = torch.outer(torch.arange(M, dtype=torch.float32), inv_freq)           # [M, 32]
-    cos = torch.cos(freqs).to(torch.bfloat16)  # [M, 32]
-    sin = torch.sin(freqs).to(torch.bfloat16)  # [M, 32]
-
-    def _pad(t):
-        p = torch.zeros(M, PAD, dtype=torch.bfloat16)
-        p[:, :half] = t
-        return p
-    # [cos_lo | cos_hi | sin_lo(neg) | sin_hi], each padded to 64
-    packed = torch.cat([_pad(cos), _pad(cos), _pad(-sin), _pad(sin)], dim=1)  # [M, 256]
-
-    x = torch.randn(M, D, dtype=torch.bfloat16)
-
-    ue.dma_to_accelerator_memory(X_DRAM_ADDR, x)
-    ue.dma_to_accelerator_memory(ROPE_PACKED_ADDR, packed.reshape(-1))
-
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
-
-    flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-    print(f"Report FLOPS for SmolVLM D=64 RoPE PBI: {flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak for M={M}, D={D}")
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, D))
-
-    cos_full = torch.cat([cos, cos], dim=1)  # [M, 64]
-    sin_full = torch.cat([sin, sin], dim=1)  # [M, 64]
-    def rotate_half(t):
-        t1 = t[..., :t.shape[-1] // 2]
-        t2 = t[..., t.shape[-1] // 2:]
-        return torch.cat((-t2, t1), dim=-1)
-    ref = x * cos_full + rotate_half(x) * sin_full
-    snr_db = calculate_snr(ref, output)
-    print(f"SmolVLM D=64 RoPE PBI SNR Analysis: {snr_db:.2f} dB for M={M}, D={D}")
-    assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
-
-    record_test("smolvlm_rope_d64+pbi",
-                f"M={M}, D={D}",
-                snr_db=snr_db,
-                gflops=flop_rate_gflops,
-                inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
-    ue.reset_program_dram_addr()
 
 def bf16_permute_test(dim_0: int, dim_1: int, dim_2: int):
     """
@@ -4069,288 +3410,350 @@ def dequantize_test(data_type=TYPE.IF4, int_variant: bool = True):
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def matmat_mul_quantized_weights_test(M: int, K: int, N: int, bias_enable: bool = False, bias_mode: str = "broadcast_N", data_type: TYPE = TYPE.IF4, int_variant: bool = True, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, dynamic: bool = False):
-    """
-    Tests matrix-matrix multiplication with quantized weights.
-    Args:
-        M: batch dimension (number of input vectors)
-        K: inner dimension (vector length), must be a multiple of UE_VECTOR_SIZE
-        N: outer dimension (matrix height), must be a multiple of UE_VECTOR_SIZE
-        bias_enable: enable bias
-        bias_mode: bias mode
-        data_type: width of the quantized weights (TYPE.IF4 or TYPE.IF8).
-        int_variant: select INT vs FP variant within the chosen width. The
-            variant is communicated to the hardware via the sign of the bf16
-            scale (negative = INT, positive = FP).
-        gelu_enable: enable gelu activation
-        silu_enable: enable silu activation
-        clamp_enable: enable clamp activation (relu via clamp(x, 0, +inf))
-        log_enable: enable log activation (log(clamp(x, 1e-3, +inf)))
-        dynamic: emit matmul via matmat_mul_dynamic_core (fully runtime M/K/N) when True.
+def matmat_mul_quantized_weights_unified_test(
+    M: int, K: int, N: int, bias_enable: bool = False,
+    bias_mode: str = "broadcast_N", data_type: TYPE = TYPE.IF4,
+    int_variant: bool = True, gelu_enable: bool = False,
+    silu_enable: bool = False, sigmoid_enable: bool = False,
+    clamp_enable: bool = False, log_enable: bool = False,
+):
+    """RNG-matched legacy/dynamic matmul with quantized B weights."""
+    def _run_case(dynamic=False, dynamic_addr=False):
+        ue = UnifiedEngine()
 
-    Reference matmul uses :meth:`UnifiedEngine.quantize_weight_simulate` on ``x`` (same
-    ``data_type`` / ``int_variant`` as ``quantize_weight``) so the golden tensor matches the
-    effective BF16 weights implied by the packed weights + scales, not the raw pre-quant ``x``.
-    """
-    ue = UnifiedEngine()
+        x = torch.randn(N, K, dtype=torch.bfloat16)
+        x = x.reshape(-1, UE_VECTOR_SIZE)
 
-    x = torch.randn(N, K, dtype=torch.bfloat16)
-    x = x.reshape(-1, UE_VECTOR_SIZE)
+        out_dim = x.shape[1]
 
-    out_dim = x.shape[1]
+        for i in range(out_dim):
+            x[i, :] = torch.randn(UE_VECTOR_SIZE, dtype=torch.bfloat16) * ( i - (out_dim // 2))
 
-    for i in range(out_dim):
-        x[i, :] = torch.randn(UE_VECTOR_SIZE, dtype=torch.bfloat16) * ( i - (out_dim // 2))
+        x = x.reshape(N, K)
 
-    x = x.reshape(N, K)
+        QUANTIZED_MATRIX_DRAM_ADDR, SCALE_DRAM_ADDR = ue.quantize_weight(weight=x, N=N, K=K, data_type=data_type, int_variant=int_variant)
+        A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
+        OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
 
-    QUANTIZED_MATRIX_DRAM_ADDR, SCALE_DRAM_ADDR = ue.quantize_weight(weight=x, N=N, K=K, data_type=data_type, int_variant=int_variant)
-    A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+        BIAS_DRAM_ADDR = None
+        bias = None
+        if bias_enable:
+            if bias_mode == "broadcast_N":
+                BIAS_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
+                bias = torch.randn(N, dtype=torch.bfloat16)
+                ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias)
+            elif bias_mode == "full_matrix":
+                BIAS_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+                bias = torch.randn(M, N, dtype=torch.bfloat16)
+                ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias)
+            else:
+                assert False, f"bias_mode={bias_mode} is not supported"
 
-    BIAS_DRAM_ADDR = None
-    bias = None
-    if bias_enable:
-        if bias_mode == "broadcast_N":
-            BIAS_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
-            bias = torch.randn(N, dtype=torch.bfloat16)
-            ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias)
-        elif bias_mode == "full_matrix":
-            BIAS_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-            bias = torch.randn(M, N, dtype=torch.bfloat16)
-            ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias)
-        else:
-            assert False, f"bias_mode={bias_mode} is not supported"
+        # Dynamic path primes three GPRs with M, K, N; allocate them before capture starts.
+        dynamic = dynamic or dynamic_addr
+        m_reg = k_reg = n_reg = None
+        a_reg = b_reg = out_reg = scale_reg = c_reg = None
+        if dynamic:
+            m_reg = ue.alloc_isa_reg()
+            k_reg = ue.alloc_isa_reg()
+            n_reg = ue.alloc_isa_reg()
+        if dynamic_addr:
+            a_reg = ue.alloc_isa_reg()
+            b_reg = ue.alloc_isa_reg()
+            out_reg = ue.alloc_isa_reg()
+            scale_reg = ue.alloc_isa_reg()
+            c_reg = ue.alloc_isa_reg() if bias_enable else None
 
-    # Dynamic path primes three GPRs with M, K, N; allocate them before capture starts.
-    m_reg = k_reg = n_reg = None
-    if dynamic:
-        m_reg = ue.alloc_isa_reg()
-        k_reg = ue.alloc_isa_reg()
-        n_reg = ue.alloc_isa_reg()
+        ue.start_capture()
+        if dynamic:
+            ue.generate_instruction_add_set(m_reg, M)
+            ue.generate_instruction_add_set(k_reg, K)
+            ue.generate_instruction_add_set(n_reg, N)
+        if dynamic_addr:
+            ue.generate_instruction_add_set(a_reg, A_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(b_reg, QUANTIZED_MATRIX_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(scale_reg, SCALE_DRAM_ADDR >> 3)
+            if c_reg is not None:
+                ue.generate_instruction_add_set(c_reg, BIAS_DRAM_ADDR >> 3)
+        total_flops_from_dequantize = ue.matmat_mul_core(M=M, K=K, N=N,
+                                                        A_DRAM_ADDR=A_DRAM_ADDR,
+                                                        B_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
+                                                        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                                                        C_DRAM_ADDR=BIAS_DRAM_ADDR,
+                                                        bias_mode=bias_mode,
+                                                        is_B_quantized=True,
+                                                        data_type=data_type,
+                                                        SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
+                                                        gelu_enable=gelu_enable,
+                                                        silu_enable=silu_enable,
+                                                        sigmoid_enable=sigmoid_enable,
+                                                        clamp_enable=clamp_enable,
+                                                        log_enable=log_enable,
+                                                        gpr_M_reg=m_reg,
+                                                        gpr_K_reg=k_reg,
+                                                        gpr_N_reg=n_reg,
+                                                        gpr_a_addr=a_reg,
+                                                        gpr_b_addr=b_reg,
+                                                        gpr_out_addr=out_reg,
+                                                        gpr_scale_addr=scale_reg,
+                                                        gpr_c_addr=c_reg,
+                                                        )
 
-    ue.start_capture()
-    if dynamic:
-        ue.generate_instruction_add_set(m_reg, M)
-        ue.generate_instruction_add_set(k_reg, K)
-        ue.generate_instruction_add_set(n_reg, N)
-    total_flops_from_dequantize = ue.matmat_mul_core(M=M, K=K, N=N,
-                                                    A_DRAM_ADDR=A_DRAM_ADDR,
-                                                    B_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
-                                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                                                    C_DRAM_ADDR=BIAS_DRAM_ADDR,
-                                                    bias_mode=bias_mode,
-                                                    is_B_quantized=True,
-                                                    data_type=data_type,
-                                                    SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
-                                                    gelu_enable=gelu_enable,
-                                                    silu_enable=silu_enable,
-                                                    sigmoid_enable=sigmoid_enable,
-                                                    clamp_enable=clamp_enable,
-                                                    log_enable=log_enable,
-                                                    gpr_M_reg=m_reg,
-                                                    gpr_K_reg=k_reg,
-                                                    gpr_N_reg=n_reg,
-                                                    )
+        ue.stop_capture()
+        if dynamic_addr:
+            if c_reg is not None:
+                ue.release_isa_reg()
+            ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()  # scale, out, b, a
+        if dynamic:
+            ue.release_isa_reg()
+            ue.release_isa_reg()
+            ue.release_isa_reg()
+        ue.generate_instruction_halt()
+        program_dram_addr = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(program_dram_addr)
+        instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(instruction_size_bytes)
 
-    ue.stop_capture()
-    if dynamic:
-        ue.release_isa_reg()
-        ue.release_isa_reg()
-        ue.release_isa_reg()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.allocate_program_dram(instruction_size_bytes)
+        a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
+        ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
 
-    a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
-    ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+        ue.start_execute_from_dram(program_dram_addr)
+        ue.wait_queue(10.0) # 10 seconds timeout
+        ue.report_timing_and_instruction_count()
 
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0) # 10 seconds timeout
-    ue.report_timing_and_instruction_count()
+        #generate_trace(ue, f"matmat_mul_quantized_weights_core_trace_{M}_{K}_{N}_{data_type}.csv")
 
-    #generate_trace(ue, f"matmat_mul_quantized_weights_core_trace_{M}_{K}_{N}_{data_type}.csv")
+        report_flop_rate_gflops, report_gflops_ratio = ue.report_flop_rate_gflops(total_flops_from_dequantize)
+        print(f"Report FLOPS for Quantize Matrix-Matrix Multiply bf16: {report_flop_rate_gflops:.2f} GFLOPS, {report_gflops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, dynamic={dynamic}")
 
-    report_flop_rate_gflops, report_gflops_ratio = ue.report_flop_rate_gflops(total_flops_from_dequantize)
-    print(f"Report FLOPS for Quantize Matrix-Matrix Multiply bf16: {report_flop_rate_gflops:.2f} GFLOPS, {report_gflops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, dynamic={dynamic}")
+        output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
 
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+        def apply_gelu(x):
+            return x * torch.sigmoid(1.702 * x)
 
-    def apply_gelu(x):
-        return x * torch.sigmoid(1.702 * x)
+        def apply_silu(x):
+            return x * torch.sigmoid(x)
 
-    def apply_silu(x):
-        return x * torch.sigmoid(x)
+        def apply_sigmoid(x):
+            return torch.sigmoid(x)
 
-    def apply_sigmoid(x):
-        return torch.sigmoid(x)
+        # Reference uses the same effective BF16 weights as the accelerator (quantize + dequant),
+        # not the raw pre-quantization x — otherwise SNR is dominated by quantization error.
+        x_effective_bf16 = ue.quantize_weight_simulate(x, data_type, int_variant=int_variant)
+        ref = a @ x_effective_bf16.T
 
-    # Reference uses the same effective BF16 weights as the accelerator (quantize + dequant),
-    # not the raw pre-quantization x — otherwise SNR is dominated by quantization error.
-    x_effective_bf16 = ue.quantize_weight_simulate(x, data_type, int_variant=int_variant)
-    ref = a @ x_effective_bf16.T
+        if bias_enable:
+            ref = ref + bias
 
-    if bias_enable:
-        ref = ref + bias
+        if gelu_enable:
+            ref = apply_gelu(ref)
+        elif silu_enable:
+            ref = apply_silu(ref)
+        elif sigmoid_enable:
+            ref = apply_sigmoid(ref)
+        elif clamp_enable:
+            ref = torch.clamp(ref, min=0.0)
+        elif log_enable:
+            ref = torch.log(torch.clamp(ref, min=1e-3))
 
-    if gelu_enable:
-        ref = apply_gelu(ref)
-    elif silu_enable:
-        ref = apply_silu(ref)
-    elif sigmoid_enable:
-        ref = apply_sigmoid(ref)
-    elif clamp_enable:
-        ref = torch.clamp(ref, min=0.0)
-    elif log_enable:
-        ref = torch.log(torch.clamp(ref, min=1e-3))
+        snr_db_ref = calculate_snr(ref, output)
 
-    snr_db_ref = calculate_snr(ref, output)
+        print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
+        assert snr_db_ref >= 44 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 45 dB"
 
-    print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
-    assert snr_db_ref >= 44 or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least 45 dB"
+        width_str = "IF4" if data_type == TYPE.IF4 else "IF8"
+        variant_str = "INT" if int_variant else "FP"
+        type_str = f"{width_str}-{variant_str}"
+        flags = [f"qB-{type_str}"]
+        _bias_abbrev = {"full_matrix": "full", "broadcast_N": "bcastN"}
+        if bias_enable:    flags.append(f"bias-{_bias_abbrev.get(bias_mode, bias_mode)}")
+        if gelu_enable:    flags.append("gelu")
+        if silu_enable:    flags.append("silu")
+        if sigmoid_enable: flags.append("sigmoid")
+        if clamp_enable:   flags.append("clamp")
+        if log_enable:     flags.append("log")
+        if dynamic:        flags.append("dynamic")
+        if dynamic_addr:   flags.append("dynaddr")
+        record_test(f"matmat_mul_quantized_weights+{'+'.join(flags)}",
+                    f"M={M}, K={K}, N={N}",
+                    snr_db=snr_db_ref,
+                    gflops=report_flop_rate_gflops,
+                    inst_bytes=instruction_size_bytes)
 
-    width_str = "IF4" if data_type == TYPE.IF4 else "IF8"
-    variant_str = "INT" if int_variant else "FP"
-    type_str = f"{width_str}-{variant_str}"
-    flags = [f"qB-{type_str}"]
-    _bias_abbrev = {"full_matrix": "full", "broadcast_N": "bcastN"}
-    if bias_enable:    flags.append(f"bias-{_bias_abbrev.get(bias_mode, bias_mode)}")
-    if gelu_enable:    flags.append("gelu")
-    if silu_enable:    flags.append("silu")
-    if sigmoid_enable: flags.append("sigmoid")
-    if clamp_enable:   flags.append("clamp")
-    if log_enable:     flags.append("log")
-    if dynamic:        flags.append("dynamic")
-    record_test(f"matmat_mul_quantized_weights+{'+'.join(flags)}",
-                f"M={M}, K={K}, N={N}",
-                snr_db=snr_db_ref,
-                gflops=report_flop_rate_gflops,
-                inst_bytes=instruction_size_bytes)
+        ue.clear_capture_buffer()
+        ue.reset_tensor_dram_addr()
 
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
+    _run_rng_matched_pair(
+        lambda: _run_case(),
+        lambda: _run_case(dynamic=True, dynamic_addr=True),
+    )
+
 
 # Note: not very efficient for larger M (iterates M times over matvec; no batched path yet)
-def quantized_matmat_mul_test(M: int, K: int, N: int, data_type: TYPE = TYPE.IF4, int_variant: bool = True, bias_enable: bool = False, bias_mode: str = "broadcast_N", gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, snr_threshold_db: float = 40.0):
+def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = TYPE.IF4,
+                                      int_variant: bool = True, bias_enable: bool = False,
+                                      bias_mode: str = "broadcast_N", gelu_enable: bool = False,
+                                      silu_enable: bool = False, sigmoid_enable: bool = False,
+                                      clamp_enable: bool = False, log_enable: bool = False,
+                                      snr_threshold_db: float = 40.0):
+    """RNG-matched legacy/dynamic quantized matmat-mul (1-pass streaming quantized dot core).
+
+    Each shape runs the legacy path (compile-time M/K/N, literal DRAM addresses) paired with the
+    dynamic path (runtime M/K/N GPRs + GPR-sourced A/B/out/scale bases) on RNG-matched data,
+    mirroring :func:`matmat_mul_quantized_weights_unified_test`. The dynamic ``quantized_matmat_core``
+    does not support bias, so bias-enabled shapes run legacy-only.
     """
-    Tests quantized matrix-matrix multiplication core.
-    Args:
-        M: batch dimension (number of input vectors)
-        K: inner dimension (vector length), must be a multiple of UE_VECTOR_SIZE
-        N: outer dimension (matrix height), must be a multiple of UE_VECTOR_SIZE
-        bias_enable: enable bias
-        bias_mode: bias mode
-        gelu_enable: enable gelu
-        silu_enable: enable silu
-    """
-    ue = UnifiedEngine()
+    def _run_case(dynamic=False, dynamic_addr=False):
+        ue = UnifiedEngine()
 
-    x = torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1
+        dynamic = dynamic or dynamic_addr
 
-    QUANTIZED_MATRIX_DRAM_ADDR, SCALE_DRAM_ADDR = ue.quantize_weight(weight=x, N=N, K=K, data_type=data_type, int_variant=int_variant)
-    A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
-    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+        x = torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1
 
-    C_DRAM_ADDR = None
-    if bias_enable and bias_mode == "full_matrix":
-        C_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
-    elif bias_enable and bias_mode == "broadcast_N":
-        C_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
+        QUANTIZED_MATRIX_DRAM_ADDR, SCALE_DRAM_ADDR = ue.quantize_weight(weight=x, N=N, K=K, data_type=data_type, int_variant=int_variant)
+        A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
+        OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
 
-    print(f"Quantized Matrix-Matrix Multiply Test for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, clamp_enable={clamp_enable}, log_enable={log_enable}")
+        C_DRAM_ADDR = None
+        if bias_enable and bias_mode == "full_matrix":
+            C_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+        elif bias_enable and bias_mode == "broadcast_N":
+            C_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
 
-    ue.start_capture()
+        print(f"Quantized Matrix-Matrix Multiply Test for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, clamp_enable={clamp_enable}, log_enable={log_enable}")
 
-    total_flops_from_dequantize = ue.quantized_matmat_core(M=M, K=K, N=N,
-                                                    A_DRAM_ADDR=A_DRAM_ADDR,
-                                                    B_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
-                                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-                                                    SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
-                                                    C_DRAM_ADDR=C_DRAM_ADDR,
-                                                    bias_mode=bias_mode,
-                                                    data_type=data_type,
-                                                    gelu_enable=gelu_enable,
-                                                    silu_enable=silu_enable,
-                                                    sigmoid_enable=sigmoid_enable,
-                                                    clamp_enable=clamp_enable,
-                                                    log_enable=log_enable)
+        m_reg = k_reg = n_reg = None
+        a_reg = b_reg = out_reg = scale_reg = None
+        if dynamic:
+            m_reg = ue.alloc_isa_reg()
+            k_reg = ue.alloc_isa_reg()
+            n_reg = ue.alloc_isa_reg()
+        if dynamic_addr:
+            a_reg = ue.alloc_isa_reg()
+            b_reg = ue.alloc_isa_reg()
+            out_reg = ue.alloc_isa_reg()
+            scale_reg = ue.alloc_isa_reg()
 
-    ue.stop_capture()
-    ue.generate_instruction_halt()
-    program_dram_addr = ue.get_program_dram_addr()
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    instruction_size_bytes = ue.get_capture_instruction_size_bytes()
-    ue.allocate_program_dram(instruction_size_bytes)
+        ue.start_capture()
+        if dynamic:
+            ue.generate_instruction_add_set(m_reg, M)
+            ue.generate_instruction_add_set(k_reg, K)
+            ue.generate_instruction_add_set(n_reg, N)
+        if dynamic_addr:
+            ue.generate_instruction_add_set(a_reg, A_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(b_reg, QUANTIZED_MATRIX_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
+            ue.generate_instruction_add_set(scale_reg, SCALE_DRAM_ADDR >> 3)
 
-    a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
-    ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+        total_flops_from_dequantize = ue.quantized_matmat_core(M=M, K=K, N=N,
+                                                        A_DRAM_ADDR=A_DRAM_ADDR,
+                                                        B_DRAM_ADDR=QUANTIZED_MATRIX_DRAM_ADDR,
+                                                        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                                                        SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
+                                                        C_DRAM_ADDR=C_DRAM_ADDR,
+                                                        bias_mode=bias_mode,
+                                                        data_type=data_type,
+                                                        gelu_enable=gelu_enable,
+                                                        silu_enable=silu_enable,
+                                                        sigmoid_enable=sigmoid_enable,
+                                                        clamp_enable=clamp_enable,
+                                                        log_enable=log_enable,
+                                                        gpr_M_reg=m_reg,
+                                                        gpr_K_reg=k_reg,
+                                                        gpr_N_reg=n_reg,
+                                                        gpr_a_addr=a_reg,
+                                                        gpr_b_addr=b_reg,
+                                                        gpr_out_addr=out_reg,
+                                                        gpr_scale_addr=scale_reg)
+
+        ue.stop_capture()
+        if dynamic_addr:
+            ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
+        if dynamic:
+            ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
+        ue.generate_instruction_halt()
+        program_dram_addr = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(program_dram_addr)
+        instruction_size_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(instruction_size_bytes)
+
+        a = torch.randn(M, K, dtype=torch.bfloat16) # normalizing input helps with numerical stability of softmax
+        ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+
+        c = None
+        if bias_enable:
+            if bias_mode == "full_matrix":
+                c = torch.randn(M, N, dtype=torch.bfloat16)
+            elif bias_mode == "broadcast_N":
+                c = torch.randn(N, dtype=torch.bfloat16)
+            ue.dma_to_accelerator_memory(C_DRAM_ADDR, c)
+
+        ue.start_execute_from_dram(program_dram_addr)
+        ue.wait_queue(10.0) # 10 seconds timeout
+        ue.report_timing_and_instruction_count()
+
+        generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
+
+        report_flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_dequantize)
+        print(f"Report FLOPS for Quantize Matrix-Matrix Multiply dot-product: {report_flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}")
+
+        output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+
+        def apply_gelu(x):
+            return x * torch.sigmoid(1.702 * x)
+
+        def apply_silu(x):
+            return x * torch.sigmoid(x)
+
+        def apply_sigmoid(x):
+            return torch.sigmoid(x)
+
+        x_effective = ue.quantize_weight_simulate(x, data_type, int_variant=int_variant)
+        ref = (a @ x_effective.T + c) if bias_enable else (a @ x_effective.T)
+
+        if gelu_enable:
+            ref = apply_gelu(ref)
+        elif silu_enable:
+            ref = apply_silu(ref)
+        elif sigmoid_enable:
+            ref = apply_sigmoid(ref)
+        elif clamp_enable:
+            ref = torch.clamp(ref, min=0.0)
+        elif log_enable:
+            ref = torch.log(torch.clamp(ref, min=1e-3))
+
+        snr_db_ref = calculate_snr(ref, output)
+
+        print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
+        assert snr_db_ref >= snr_threshold_db or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least {snr_threshold_db} dB"
+
+        flags = []
+        if bias_enable:    flags.append(f"{bias_mode}")
+        if gelu_enable:    flags.append("gelu")
+        if silu_enable:    flags.append("silu")
+        if sigmoid_enable: flags.append("sigmoid")
+        if clamp_enable:   flags.append("clamp")
+        if log_enable:     flags.append("log")
+        if dynamic:        flags.append("dynamic")
+        if dynamic_addr:   flags.append("dynaddr")
+        record_test(f"quantized_matmat_mul+{'+'.join(flags)}",
+                    f"M={M}, K={K}, N={N}",
+                    snr_db=snr_db_ref,
+                    gflops=report_flop_rate_gflops,
+                    inst_bytes=instruction_size_bytes)
+
+        ue.clear_capture_buffer()
+        ue.reset_tensor_dram_addr()
 
     if bias_enable:
-        if bias_mode == "full_matrix":
-            c = torch.randn(M, N, dtype=torch.bfloat16)
-        elif bias_mode == "broadcast_N":
-            c = torch.randn(N, dtype=torch.bfloat16)
-        ue.dma_to_accelerator_memory(C_DRAM_ADDR, c)
-
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(10.0) # 10 seconds timeout
-    ue.report_timing_and_instruction_count()
-
-    generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
-
-    report_flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_dequantize)
-    print(f"Report FLOPS for Quantize Matrix-Matrix Multiply dot-product: {report_flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}")
-
-    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
-
-    def apply_gelu(x):
-        return x * torch.sigmoid(1.702 * x)
-
-    def apply_silu(x):
-        return x * torch.sigmoid(x)
-
-    def apply_sigmoid(x):
-        return torch.sigmoid(x)
-
-    x_effective = ue.quantize_weight_simulate(x, data_type, int_variant=int_variant)
-    ref = (a @ x_effective.T + c) if bias_enable else (a @ x_effective.T)
-
-    if gelu_enable:
-        ref = apply_gelu(ref)
-    elif silu_enable:
-        ref = apply_silu(ref)
-    elif sigmoid_enable:
-        ref = apply_sigmoid(ref)
-    elif clamp_enable:
-        ref = torch.clamp(ref, min=0.0)
-    elif log_enable:
-        ref = torch.log(torch.clamp(ref, min=1e-3))
-
-    snr_db_ref = calculate_snr(ref, output)
-
-    print(f"Reference SNR Analysis for Dequantize: {snr_db_ref:.2f} dB")
-    assert snr_db_ref >= snr_threshold_db or snr_db_ref == float('inf'), f"SNR {snr_db_ref:.2f} dB must be at least {snr_threshold_db} dB"
-
-    width_str = "IF4" if data_type == TYPE.IF4 else "IF8"
-    variant_str = "INT" if int_variant else "FP"
-    type_str = f"{width_str}-{variant_str}"
-    flags = [type_str]
-    if bias_enable:    flags.append(f"bias-{bias_mode}")
-    if gelu_enable:    flags.append("gelu")
-    if silu_enable:    flags.append("silu")
-    if sigmoid_enable: flags.append("sigmoid")
-    if clamp_enable:   flags.append("clamp")
-    if log_enable:     flags.append("log")
-    record_test(f"quantized_matmat_mul+{'+'.join(flags)}",
-                f"M={M}, K={K}, N={N}",
-                snr_db=snr_db_ref,
-                gflops=report_flop_rate_gflops,
-                inst_bytes=instruction_size_bytes)
-
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
+        # Dynamic quantized_matmat_core has no bias support — legacy-only.
+        _run_case()
+    else:
+        _run_rng_matched_pair(
+            lambda: _run_case(),
+            lambda: _run_case(dynamic=True, dynamic_addr=True),
+        )
 
 def matmat_mul_non_aligned_writeback_test():
     """
@@ -4501,138 +3904,167 @@ def mix_of_broadcast_eltwise_add_eltwise_mul_core_test():
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def eltwise_core_dram_test(M=None, N=None, use_pbi: bool = False, dynamic_addr: bool = False):
+def eltwise_core_dram_unified_test(shapes=None, snr_threshold_db: float = 40.0):
+    """Unified eltwise DRAM test: every ``(M, N, op)`` case is a **paired dynamic-vs-legacy** run.
+
+    Supersedes the former separate legacy/PBI and dynamic eltwise tests. For each shape and each of
+    the five ops (vector
+    ``mul`` / ``add`` / ``sub`` and broadcast ``mul_broadcast`` / ``add_broadcast``) it runs the
+    **legacy** core (all dims baked) and the **dynamic** core (runtime M and N via GPRs) from an
+    identical RNG state through :func:`_run_rng_matched_pair`, so the summary table reports the
+    dynamic-vs-legacy SNR/GFLOPS delta per case. Both tiers run the *same* op set — broadcast
+    through the legacy DRAM wrapper was previously untested.
+
+    Both eltwise tiers require ``N`` a multiple of ``UE_VECTOR_SIZE`` and ``N`` to fit URAM staging,
+    so every shape is pairable (eltwise has no host-padded odd-N path). The PBI tier is intentionally
+    not exercised: it has no production caller and the dynamic path subsumes its runtime-M capability.
+
+    The dynamic side always sources the A/B/out DRAM bases from GPRs (primed equal to the literals,
+    so results still match legacy) and always sources the ``mul_broadcast`` scalar from a GPR (PBI
+    field 11) — the runtime-address and runtime-scalar paths are the default dynamic behavior,
+    paired against the legacy baked-address / baked-scalar result.
     """
-    Exercise DRAM eltwise over M×N BF16 tensors (row-major flat).
+    if shapes is None:
+        shapes = [(64, 512), (1, 512), (512, 64)]
 
-    Captures via the :meth:`UnifiedEngine.eltwise_core_dram` wrapper:
-    - ``use_pbi=False`` (default): :meth:`eltwise_core_dram_legacy` — vertical ``m_chunk`` tiling
-      with PBI loop + optional non-PBI tail.
-    - ``use_pbi=True``: :meth:`eltwise_core_dram_pbi` — one logical row per ISA iteration with a
-      runtime row count carried in a GPR (allocated and primed with ``ADD_SET`` here).
-
-    When ``dynamic_addr=True`` (requires ``use_pbi``), the A/B/output DRAM bases are also sourced
-    from GPRs (primed with ``addr >> 3``) and passed as ``gpr_*_addr`` instead of being baked into
-    the program. Primed addresses equal the literals so results are identical; this just exercises
-    the dynamic-addressing path. ``dynamic_addr=False`` is the legacy behavior.
-
-    Default grid: ``M`` in ``(1, 32, 64, 512)``, ``N`` in ``(64, 512, 6912, 8192)``, ops
-    ``mul`` / ``add`` / ``sub``. Skips when ``N > URAM_NEAR_FULL_ELEMENTS`` or ``N`` is not a
-    multiple of ``UE_VECTOR_SIZE``.
-
-    Pass ``M`` and ``N`` together to run a single shape (all three ops still run).
-
-    SNR compares the flattened ``M * N`` DRAM output to torch.
-    """
-    if (M is None) ^ (N is None):
-        raise ValueError("eltwise_core_dram_test: pass both M and N, or neither (full grid).")
-    if dynamic_addr and not use_pbi:
-        raise ValueError("eltwise_core_dram_test: dynamic_addr=True requires use_pbi=True (PBI path)")
-
-    tag = "eltwise_core_dram" + ("_pbi" if use_pbi else "_legacy") + ("_dynaddr" if dynamic_addr else "")
-
-    m_list = [M] if M is not None else [1, 32, 64, 512]
-    n_list = [N] if N is not None else [64, 512, 6912, 8192]
-
+    SCALAR = 0.375  # exactly representable in bf16
+    scalar_bf16 = torch.tensor(SCALAR, dtype=torch.bfloat16).float().item()
     ops = (
-        ("mul", UE_MODE.ELTWISE_MUL),
-        ("add", UE_MODE.ELTWISE_ADD),
-        ("sub", UE_MODE.ELTWISE_SUB),
+        ("mul", UE_MODE.ELTWISE_MUL, False),
+        ("add", UE_MODE.ELTWISE_ADD, False),
+        ("sub", UE_MODE.ELTWISE_SUB, False),
+        ("mul_broadcast", UE_MODE.MUL_BROADCAST, True),
+        ("add_broadcast", UE_MODE.ADD_BROADCAST, True),
     )
 
-    ue = UnifiedEngine()
+    def _ref(op_name, a, b):
+        if op_name == "mul":           return (a * b).reshape(-1)
+        if op_name == "add":           return (a + b).reshape(-1)
+        if op_name == "sub":           return (a - b).reshape(-1)
+        if op_name == "mul_broadcast": return (a.float() * scalar_bf16).to(torch.bfloat16).reshape(-1)
+        return (a.float() + scalar_bf16).to(torch.bfloat16).reshape(-1)   # add_broadcast
 
-    for m in m_list:
-        for n in n_list:
-            elements = m * n
-            if n > URAM_NEAR_FULL_ELEMENTS or n % UE_VECTOR_SIZE != 0:
-                print(
-                    f"[{tag}] skip M={m} N={n} "
-                    f"(need N<={URAM_NEAR_FULL_ELEMENTS} and N%{UE_VECTOR_SIZE}==0)"
-                )
-                continue
+    def _finish(ue, out_dram, elements, total_flops, tag, name, M, N, op_name, a, b, inst_bytes):
+        gflops, _ = ue.report_flop_rate_gflops(total_flops)
+        out_flat = ue.dma_from_accelerator_memory(out_dram, (elements,))
+        snr_db = calculate_snr(_ref(op_name, a, b), out_flat)
+        print(f"[{tag}] M={M} N={N} op={op_name} elements={elements} SNR={snr_db:.2f} dB GFLOPS={gflops:.2f}")
+        assert snr_db >= snr_threshold_db or snr_db == float("inf"), \
+            f"{tag} M={M} N={N} op={op_name} SNR {snr_db:.2f} dB < {snr_threshold_db:g} dB"
+        record_test(name, f"M={M},N={N}",
+                    snr_db=snr_db, gflops=gflops, inst_bytes=inst_bytes)
 
-            for op_name, mode in ops:
-                ue.reset_tensor_dram_addr()
+    def _run_legacy(M, N, op_name, mode, is_broadcast):
+        ue = UnifiedEngine()
+        elements = M * N
+        a_dram = ue.allocate_tensor_dram(elements * 2)
+        b_dram = ue.allocate_tensor_dram(elements * 2) if not is_broadcast else None
+        out_dram = ue.allocate_tensor_dram(elements * 2)
 
-                a_dram = ue.allocate_tensor_dram(elements * 2)
-                b_dram = ue.allocate_tensor_dram(elements * 2)
-                out_dram = ue.allocate_tensor_dram(elements * 2)
+        ue.start_capture()
+        total_flops = ue.eltwise_core_dram(M, N, a_dram, b_dram, out_dram, mode,
+                                           scalar=(SCALAR if is_broadcast else None))
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(prog)
+        inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(inst_bytes)
 
-                # PBI path requires a GPR holding the runtime row count; legacy passes None.
-                m_reg = ue.alloc_isa_reg() if use_pbi else None
-                # dynamic_addr: three more GPRs source the A/B/output bases (word addr = addr>>3).
-                a_reg = ue.alloc_isa_reg() if dynamic_addr else None
-                b_reg = ue.alloc_isa_reg() if dynamic_addr else None
-                out_reg = ue.alloc_isa_reg() if dynamic_addr else None
+        a = torch.randn(M, N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(a_dram, a.reshape(-1).contiguous())
+        b = None
+        if not is_broadcast:
+            b = torch.randn(M, N, dtype=torch.bfloat16)
+            ue.dma_to_accelerator_memory(b_dram, b.reshape(-1).contiguous())
 
-                ue.start_capture()
-                if use_pbi:
-                    ue.generate_instruction_add_set(m_reg, m)
-                if dynamic_addr:
-                    ue.generate_instruction_add_set(a_reg, a_dram >> 3)
-                    ue.generate_instruction_add_set(b_reg, b_dram >> 3)
-                    ue.generate_instruction_add_set(out_reg, out_dram >> 3)
-                total_flops = ue.eltwise_core_dram(
-                    m, n, a_dram, b_dram, out_dram, mode,
-                    gpr_M_reg=m_reg,
-                    gpr_a_addr=a_reg, gpr_b_addr=b_reg, gpr_out_addr=out_reg,
-                )
-                ue.stop_capture()
-                if dynamic_addr:
-                    ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
-                if use_pbi:
-                    ue.release_isa_reg()
-                ue.generate_instruction_halt()
-                program_dram_addr = ue.get_program_dram_addr()
-                ue.write_captured_instructions_to_dram(program_dram_addr)
-                inst_bytes = ue.get_capture_instruction_size_bytes()
-                ue.allocate_program_dram(inst_bytes)
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+        _finish(ue, out_dram, elements, total_flops, "eltwise+legacy",
+                f"eltwise_core_dram_{op_name}", M, N, op_name, a, b, inst_bytes)
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
 
-                a = torch.randn(m, n, dtype=torch.bfloat16)
-                b = torch.randn(m, n, dtype=torch.bfloat16)
-                a_flat = a.reshape(-1).contiguous()
-                b_flat = b.reshape(-1).contiguous()
+    def _run_dynamic(M, N, op_name, mode, is_broadcast):
+        ue = UnifiedEngine()
+        elements = M * N
+        TEMPLATE_N = UE_VECTOR_SIZE
+        use_scalar_reg = mode == UE_MODE.MUL_BROADCAST   # runtime broadcast scalar is the default
 
-                ue.dma_to_accelerator_memory(a_dram, a_flat)
-                ue.dma_to_accelerator_memory(b_dram, b_flat)
+        a_dram = ue.allocate_tensor_dram(elements * 2)
+        b_dram = ue.allocate_tensor_dram(elements * 2) if not is_broadcast else None
+        out_dram = ue.allocate_tensor_dram(elements * 2)
 
-                ue.start_execute_from_dram(program_dram_addr)
-                ue.wait_queue(10.0)
-                ue.report_timing_and_instruction_count()
-                gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops)
-                print(
-                    f"[{tag}] GFLOPS={gflops:.2f}, {flops_ratio:.2f}% peak "
-                    f"(counted flops={total_flops})"
-                )
+        m_reg = ue.alloc_isa_reg()
+        n_reg = ue.alloc_isa_reg()
+        a_reg = ue.alloc_isa_reg()                                        # GPR-sourced DRAM bases are the default
+        b_reg = ue.alloc_isa_reg() if not is_broadcast else None
+        out_reg = ue.alloc_isa_reg()
+        s_reg = ue.alloc_isa_reg() if use_scalar_reg else None
 
-                out_flat = ue.dma_from_accelerator_memory(out_dram, (elements,))
-                if op_name == "mul":
-                    y_ref = (a * b).reshape(-1)
-                elif op_name == "add":
-                    y_ref = (a + b).reshape(-1)
-                else:
-                    y_ref = (a - b).reshape(-1)
+        # 1. Compile once at the tiny template N so the real N is never baked.
+        ue.start_capture()
+        ue.eltwise_core_dram_dynamic(
+            M=64, N=TEMPLATE_N, dram_a=a_dram, dram_b=b_dram, dram_out=out_dram, mode=mode,
+            scalar=(SCALAR if is_broadcast else None),
+            gpr_M_reg=m_reg, gpr_N_reg=n_reg,
+            gpr_a_addr=a_reg, gpr_b_addr=b_reg, gpr_out_addr=out_reg,
+            gpr_scalar_reg=s_reg,
+        )
+        total_flops = M * N
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        main_prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(main_prog)
+        main_inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(main_inst_bytes)
 
-                snr_db = calculate_snr(y_ref, out_flat)
-                print(
-                    f"[{tag}] M={m} N={n} op={op_name} elements={elements} "
-                    f"SNR={snr_db:.2f} dB inst_bytes={inst_bytes} GFLOPS={gflops:.2f}"
-                )
-                assert snr_db >= 40 or snr_db == float("inf"), (
-                    f"{tag} M={m} N={n} op={op_name} SNR {snr_db:.2f} dB < 40 dB"
-                )
+        # 2. Preamble: prime the real M / N (+ optional addresses / scalar) then jump into the body.
+        preamble = ue.get_program_dram_addr()
+        ue.allocate_program_dram(8 * INSTRUCTION_SIZE_BYTES)
+        main_word_addr = ue_35bit_addr_shifter(main_prog)
+        ue.clear_capture_buffer()
+        ue.start_capture()
+        ue.generate_instruction_add_set(m_reg, M)
+        ue.generate_instruction_add_set(n_reg, N)
+        ue.generate_instruction_add_set(a_reg, a_dram >> 3)
+        if b_reg is not None:
+            ue.generate_instruction_add_set(b_reg, b_dram >> 3)
+        ue.generate_instruction_add_set(out_reg, out_dram >> 3)
+        if s_reg is not None:
+            ue.generate_instruction_add_set(s_reg, ue.float_to_bf16(SCALAR))
+        ue.generate_instruction_jump_abs(main_word_addr)
+        ue.stop_capture()
+        ue.write_captured_instructions_to_dram(preamble)
 
-                record_test(
-                    f"{tag}_{op_name}",
-                    f"M={m},N={n},elements={elements}",
-                    snr_db=snr_db,
-                    gflops=gflops,
-                    inst_bytes=inst_bytes,
-                )
+        a = torch.randn(M, N, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(a_dram, a.reshape(-1).contiguous())
+        b = None
+        if not is_broadcast:
+            b = torch.randn(M, N, dtype=torch.bfloat16)
+            ue.dma_to_accelerator_memory(b_dram, b.reshape(-1).contiguous())
 
-                ue.clear_capture_buffer()
-                ue.reset_tensor_dram_addr()
+        ue.start_execute_from_dram(preamble)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+        tag = "eltwise+dynamic"
+        _finish(ue, out_dram, elements, total_flops, tag,
+                f"eltwise_core_dram+dynamic_{op_name}", M, N, op_name, a, b, main_inst_bytes)
+
+        for r in (s_reg, out_reg, b_reg, a_reg, n_reg, m_reg):
+            if r is not None:
+                ue.release_isa_reg()
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+
+    for (M, N) in shapes:
+        for (op_name, mode, is_broadcast) in ops:
+            # Legacy first (baseline), then dynamic — the summary diffs dynamic against legacy.
+            _run_rng_matched_pair(
+                lambda M=M, N=N, op_name=op_name, mode=mode, is_broadcast=is_broadcast:
+                    _run_legacy(M, N, op_name, mode, is_broadcast),
+                lambda M=M, N=N, op_name=op_name, mode=mode, is_broadcast=is_broadcast:
+                    _run_dynamic(M, N, op_name, mode, is_broadcast),
+            )
 
 
 def dram_read_write_speed_test():
@@ -4861,187 +4293,199 @@ def packing_test(packing_mode: int):
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
-def bf16_transpose_dynamic_test(
-    M_runtime_values: list,
-    N: int,
-    dyn_M: bool = False,
-    dyn_N: bool = False,
-    snr_threshold_db: float = 40.0,
-    dynamic_addr: bool = False,
-):
-    """Compile `bf16_transpose_core_dynamic` ONCE with template (M, N) + chosen
-    dynamic-dimension register(s), then re-run it for every `m` in `M_runtime_values`.
-    Each dynamic run is paired with a legacy compile-time run on the same random data so
-    the summary table can show SNR and GFLOPS diffs side-by-side.
+def bf16_transpose_core_unified_test(shapes=None, snr_threshold_db: float = 40.0):
+    """Paired legacy/dynamic transpose coverage with runtime dimensions and addresses."""
 
-    When ``dynamic_addr=True``, the input/output DRAM bases are also sourced from GPRs that are
-    primed in the per-run **preamble** (not baked into the captured main body), so the same main
-    body serves any placement. The identity matrix stays literal (constant). Primed addresses
-    equal the literals, so results are identical — this exercises the dynamic-addressing path.
-    """
-    assert M_runtime_values, "M_runtime_values must be non-empty"
+    def _run_cases(
+        M_runtime_values: list,
+        N: int,
+        dyn_M: bool = False,
+        dyn_N: bool = False,
+        snr_threshold_db: float = 40.0,
+        dynamic_addr: bool = False,
+    ):
+        """Compile `bf16_transpose_core_dynamic` ONCE with template (M, N) + chosen
+        dynamic-dimension register(s), then re-run it for every `m` in `M_runtime_values`.
+        Each dynamic run is paired with a legacy compile-time run on the same random data so
+        the summary table can show SNR and GFLOPS diffs side-by-side.
 
-    dims = [d for d, on in (("M", dyn_M), ("N", dyn_N)) if on]
-    tag = "+".join(dims) if dims else "static"
+        When ``dynamic_addr=True``, the input/output DRAM bases are also sourced from GPRs that are
+        primed in the per-run **preamble** (not baked into the captured main body), so the same main
+        body serves any placement. The identity matrix stays literal (constant). Primed addresses
+        equal the literals, so results are identical — this exercises the dynamic-addressing path.
+        """
+        assert M_runtime_values, "M_runtime_values must be non-empty"
 
-    m0 = M_runtime_values[0]
-    for mm in M_runtime_values:
-        if not dyn_M: 
-            assert mm == m0, f"static M must be constant across M_runtime_values, got {mm} vs {m0}"
-        assert mm % UE_VECTOR_SIZE == 0, f"M must be a multiple of {UE_VECTOR_SIZE}, got M={mm}"
+        dims = [d for d, on in (("M", dyn_M), ("N", dyn_N)) if on]
+        tag = "+".join(dims) if dims else "static"
 
-    assert N % UE_VECTOR_SIZE == 0, f"N must be a multiple of {UE_VECTOR_SIZE}, got N={N}"
+        m0 = M_runtime_values[0]
+        for mm in M_runtime_values:
+            if not dyn_M:
+                assert mm == m0, f"static M must be constant across M_runtime_values, got {mm} vs {m0}"
+            assert mm % UE_VECTOR_SIZE == 0, f"M must be a multiple of {UE_VECTOR_SIZE}, got M={mm}"
 
-    M_template = UE_VECTOR_SIZE if dyn_M else m0
-    N_template = UE_VECTOR_SIZE if dyn_N else N
+        assert N % UE_VECTOR_SIZE == 0, f"N must be a multiple of {UE_VECTOR_SIZE}, got N={N}"
 
-    # =========================================================================
-    # Interleaved loop — one fresh engine per run, PBI then legacy per (m, N)
-    # =========================================================================
-    print(f"\n{'#'*64}")
-    print(f"# Dynamic transpose [{tag}] template M={M_template}, N={N_template}")
-    print(f"# (interleaved with legacy runs)")
-    print(f"{'#'*64}")
+        M_template = UE_VECTOR_SIZE if dyn_M else m0
+        N_template = UE_VECTOR_SIZE if dyn_N else N
 
-    def _run_dynamic(m):
-        print(f"\n{'='*64}\n[Dynamic] m={m}, N={N}")
+        # =========================================================================
+        # Interleaved loop — one fresh engine per run, PBI then legacy per (m, N)
+        # =========================================================================
+        print(f"\n{'#'*64}")
+        print(f"# Dynamic transpose [{tag}] template M={M_template}, N={N_template}")
+        print(f"# (interleaved with legacy runs)")
+        print(f"{'#'*64}")
 
-        ue = UnifiedEngine()
+        def _run_dynamic(m):
+            print(f"\n{'='*64}\n[Dynamic] m={m}, N={N}")
 
-        # Allocate dynamic ISA registers
-        # bf16_transpose_dynamic_core is ALWAYS dynamic in both M and N, so both runtime
-        # registers must be supplied (we only *vary* M across runs — N stays fixed here).
-        gpr_M_reg = ue.alloc_isa_reg()
-        gpr_N_reg = ue.alloc_isa_reg()
-        # dynamic_addr: input/output base GPRs, primed in the preamble (main body stays placement-agnostic).
-        gpr_in_addr  = ue.alloc_isa_reg() if dynamic_addr else None
-        gpr_out_addr = ue.alloc_isa_reg() if dynamic_addr else None
+            ue = UnifiedEngine()
 
-        INPUT_DRAM_ADDR  = ue.allocate_tensor_dram(m * N * 2)
-        OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * m * 2, align_bytes=UE_VECTOR_SIZE * 2)
+            # Allocate dynamic ISA registers
+            # bf16_transpose_dynamic_core is ALWAYS dynamic in both M and N, so both runtime
+            # registers must be supplied (we only *vary* M across runs — N stays fixed here).
+            gpr_M_reg = ue.alloc_isa_reg()
+            gpr_N_reg = ue.alloc_isa_reg()
+            # dynamic_addr: input/output base GPRs, primed in the preamble (main body stays placement-agnostic).
+            gpr_in_addr  = ue.alloc_isa_reg() if dynamic_addr else None
+            gpr_out_addr = ue.alloc_isa_reg() if dynamic_addr else None
 
-        # 1. Compile Main Body ONCE
-        ue.start_capture()
-        ue.bf16_transpose_core_dynamic(
-            M=M_template, N=N_template,
-            INPUT_DRAM_ADDR=INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg,
-            gpr_input_addr=gpr_in_addr, gpr_out_addr=gpr_out_addr,
-        )
-        ue.stop_capture()
-        ue.generate_instruction_halt()
+            INPUT_DRAM_ADDR  = ue.allocate_tensor_dram(m * N * 2)
+            OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * m * 2, align_bytes=UE_VECTOR_SIZE * 2)
 
-        main_program_dram_addr = ue.get_program_dram_addr()
-        main_instruction_size  = ue.write_captured_instructions_to_dram(main_program_dram_addr)
-        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+            # 1. Compile Main Body ONCE
+            ue.start_capture()
+            ue.bf16_transpose_core_dynamic(
+                M=M_template, N=N_template,
+                INPUT_DRAM_ADDR=INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg,
+                gpr_input_addr=gpr_in_addr, gpr_out_addr=gpr_out_addr,
+            )
+            ue.stop_capture()
+            ue.generate_instruction_halt()
 
-        # 2. Setup Preamble for Runtime Injection
-        PREAMBLE_RESERVED_BYTES = 8 * INSTRUCTION_SIZE_BYTES
-        preamble_dram_addr = ue.get_program_dram_addr()
-        ue.allocate_program_dram(PREAMBLE_RESERVED_BYTES)
-        main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
+            main_program_dram_addr = ue.get_program_dram_addr()
+            main_instruction_size  = ue.write_captured_instructions_to_dram(main_program_dram_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
 
-        ue.clear_capture_buffer()
-        ue.start_capture()
-        ue.generate_instruction_add_set(gpr_M_reg, m)   # prime runtime M
-        ue.generate_instruction_add_set(gpr_N_reg, N)   # prime runtime N (core is always N-dynamic)
-        if dynamic_addr:
-            ue.generate_instruction_add_set(gpr_in_addr,  INPUT_DRAM_ADDR >> 3)   # prime input base (word addr)
-            ue.generate_instruction_add_set(gpr_out_addr, OUTPUT_DRAM_ADDR >> 3)  # prime output base (word addr)
-        ue.generate_instruction_jump_abs(main_program_word_addr)
-        ue.stop_capture()
-        ue.write_captured_instructions_to_dram(preamble_dram_addr)
+            # 2. Setup Preamble for Runtime Injection
+            PREAMBLE_RESERVED_BYTES = 8 * INSTRUCTION_SIZE_BYTES
+            preamble_dram_addr = ue.get_program_dram_addr()
+            ue.allocate_program_dram(PREAMBLE_RESERVED_BYTES)
+            main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
 
-        # 3. Data Setup & Execution
-        x = torch.randn(m, N, dtype=torch.bfloat16)
-        ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+            ue.clear_capture_buffer()
+            ue.start_capture()
+            ue.generate_instruction_add_set(gpr_M_reg, m)   # prime runtime M
+            ue.generate_instruction_add_set(gpr_N_reg, N)   # prime runtime N (core is always N-dynamic)
+            if dynamic_addr:
+                ue.generate_instruction_add_set(gpr_in_addr,  INPUT_DRAM_ADDR >> 3)   # prime input base (word addr)
+                ue.generate_instruction_add_set(gpr_out_addr, OUTPUT_DRAM_ADDR >> 3)  # prime output base (word addr)
+            ue.generate_instruction_jump_abs(main_program_word_addr)
+            ue.stop_capture()
+            ue.write_captured_instructions_to_dram(preamble_dram_addr)
 
-        ue.start_execute_from_dram(preamble_dram_addr)
-        ue.wait_queue(10.0)
-        ue.report_timing_and_instruction_count()
+            # 3. Data Setup & Execution
+            x = torch.randn(m, N, dtype=torch.bfloat16)
+            ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
 
-        # 4. Metrics & Verification
-        latency_us = ue.report_latency_in_us()
-        mb_per_s = (4 * m * N) / latency_us if latency_us > 0 else 0.0
-        gflops_rate, _ = ue.report_flop_rate_gflops(2 * m * N)
+            ue.start_execute_from_dram(preamble_dram_addr)
+            ue.wait_queue(10.0)
+            ue.report_timing_and_instruction_count()
 
-        output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (N, m))
-        snr_db = calculate_snr(x.T, output)
+            # 4. Metrics & Verification
+            latency_us = ue.report_latency_in_us()
+            mb_per_s = (4 * m * N) / latency_us if latency_us > 0 else 0.0
+            gflops_rate, _ = ue.report_flop_rate_gflops(2 * m * N)
 
-        print(f"[Dynamic] m={m}: SNR {snr_db:.2f} dB, {mb_per_s:.2f} MB/s, "
-              f"{main_instruction_size // 32} body instructions")
+            output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (N, m))
+            snr_db = calculate_snr(x.T, output)
 
-        assert snr_db >= snr_threshold_db or snr_db == float("inf"), (
-            f"[Dynamic] transpose m={m}, N={N}: SNR {snr_db:.2f} dB below {snr_threshold_db:g} dB"
-        )
+            print(f"[Dynamic] m={m}: SNR {snr_db:.2f} dB, {mb_per_s:.2f} MB/s, "
+                  f"{main_instruction_size // 32} body instructions")
 
-        record_test(
-            "bf16_transpose+dynamic",
-            f"M={m}, N={N}",
-            snr_db=snr_db, gflops=gflops_rate, mb_per_s=mb_per_s, inst_bytes=main_instruction_size,
-        )
+            assert snr_db >= snr_threshold_db or snr_db == float("inf"), (
+                f"[Dynamic] transpose m={m}, N={N}: SNR {snr_db:.2f} dB below {snr_threshold_db:g} dB"
+            )
 
-        # Cleanup (LIFO: release gpr_N_reg then gpr_M_reg)
-        ue.release_isa_reg()
-        ue.release_isa_reg()
-        ue.clear_capture_buffer()
-        ue.reset_tensor_dram_addr()
+            record_test(
+                "bf16_transpose+dynamic",
+                f"M={m}, N={N}",
+                snr_db=snr_db, gflops=gflops_rate, mb_per_s=mb_per_s, inst_bytes=main_instruction_size,
+            )
 
-    def _run_legacy(m):
-        print(f"\n{'='*64}\n[Legacy] transpose m={m}, N={N}")
+            for r in (gpr_out_addr, gpr_in_addr, gpr_N_reg, gpr_M_reg):
+                if r is not None:
+                    ue.release_isa_reg()
+            ue.clear_capture_buffer()
+            ue.reset_tensor_dram_addr()
 
-        ue = UnifiedEngine()
-        INPUT_DRAM_ADDR  = ue.allocate_tensor_dram(m * N * 2)
-        OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * m * 2)
+        def _run_legacy(m):
+            print(f"\n{'='*64}\n[Legacy] transpose m={m}, N={N}")
 
-        ue.start_capture()
-        ue.bf16_transpose_core(
-            M=m, N=N,
-            INPUT_DRAM_ADDR=INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-        )
-        ue.stop_capture()
-        ue.generate_instruction_halt()
+            ue = UnifiedEngine()
+            INPUT_DRAM_ADDR  = ue.allocate_tensor_dram(m * N * 2)
+            OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * m * 2)
 
-        program_dram_addr = ue.get_program_dram_addr()
-        instruction_size  = ue.write_captured_instructions_to_dram(program_dram_addr)
-        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+            ue.start_capture()
+            ue.bf16_transpose_core(
+                M=m, N=N,
+                INPUT_DRAM_ADDR=INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            )
+            ue.stop_capture()
+            ue.generate_instruction_halt()
 
-        x = torch.randn(m, N, dtype=torch.bfloat16)
-        ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+            program_dram_addr = ue.get_program_dram_addr()
+            instruction_size  = ue.write_captured_instructions_to_dram(program_dram_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
 
-        ue.start_execute_from_dram(program_dram_addr)
-        ue.wait_queue(10.0)
-        ue.report_timing_and_instruction_count()
+            x = torch.randn(m, N, dtype=torch.bfloat16)
+            ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
 
-        latency_us = ue.report_latency_in_us()
-        mb_per_s = (4 * m * N) / latency_us if latency_us > 0 else 0.0
-        gflops_rate, _ = ue.report_flop_rate_gflops(2 * m * N)
+            ue.start_execute_from_dram(program_dram_addr)
+            ue.wait_queue(10.0)
+            ue.report_timing_and_instruction_count()
 
-        output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (N, m))
-        snr_db = calculate_snr(x.T, output)
+            latency_us = ue.report_latency_in_us()
+            mb_per_s = (4 * m * N) / latency_us if latency_us > 0 else 0.0
+            gflops_rate, _ = ue.report_flop_rate_gflops(2 * m * N)
 
-        print(f"[Legacy] m={m}: SNR {snr_db:.2f} dB, {mb_per_s:.2f} MB/s, "
-              f"{instruction_size // 32} instructions")
-              
-        assert snr_db >= snr_threshold_db or snr_db == float("inf"), (
-            f"[Legacy] transpose m={m}, N={N}: SNR {snr_db:.2f} dB below {snr_threshold_db:g} dB"
-        )
+            output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (N, m))
+            snr_db = calculate_snr(x.T, output)
 
-        record_test(
-            "bf16_transpose+legacy",
-            f"M={m}, N={N}",
-            snr_db=snr_db, gflops=gflops_rate, mb_per_s=mb_per_s, inst_bytes=instruction_size,
-        )
+            print(f"[Legacy] m={m}: SNR {snr_db:.2f} dB, {mb_per_s:.2f} MB/s, "
+                  f"{instruction_size // 32} instructions")
 
-        ue.clear_capture_buffer()
-        ue.reset_tensor_dram_addr()
+            assert snr_db >= snr_threshold_db or snr_db == float("inf"), (
+                f"[Legacy] transpose m={m}, N={N}: SNR {snr_db:.2f} dB below {snr_threshold_db:g} dB"
+            )
 
-    # --- Run Interleaved Sweeps ---
-    for m in M_runtime_values:
-        _run_rng_matched_pair(
-            lambda m=m: _run_dynamic(m),
-            lambda m=m: _run_legacy(m),
-        )
+            record_test(
+                "bf16_transpose+legacy",
+                f"M={m}, N={N}",
+                snr_db=snr_db, gflops=gflops_rate, mb_per_s=mb_per_s, inst_bytes=instruction_size,
+            )
+
+            ue.clear_capture_buffer()
+            ue.reset_tensor_dram_addr()
+
+        # --- Run Interleaved Sweeps ---
+        for m in M_runtime_values:
+            _run_rng_matched_pair(
+                lambda m=m: _run_legacy(m),
+                lambda m=m: _run_dynamic(m),
+            )
+
+
+
+    if shapes is None:
+        shapes = [(64, 64), (256, 512), (512, 2048), (128, 4032)]
+    for M, N in shapes:
+        _run_cases(
+            M_runtime_values=[M], N=N, dyn_M=True, dyn_N=True,
+            dynamic_addr=True, snr_threshold_db=snr_threshold_db)
 
 
 def quantized_fp4_test():
@@ -5722,7 +5166,7 @@ def isa_mult_div_shift_test() -> None:
 
     MUL_SHL / MUL_SHR are the fused multiply-then-shift ops (one ISA word does
     (src*rst) then a constant shift, reusing int_mult_pipe). They replace the
-    mul32_reg + shl/shr pairs throughout matmat_mul_dynamic_core.
+    mul32_reg + shl/shr pairs throughout matmat_mul_core_dynamic.
 
     Structure:
       SET a = 13, SET b = 4
@@ -6043,9 +5487,9 @@ def gemma3_inference_test() -> None:
     # exceeded the prior 18,750,000 floor; matmatmul relaxed by the same
     # 16/15 ratio (37,500,000 -> 40,000,000) to keep the margins proportional.
     _MAX_CYCLES_PER_TOKEN = {
-        "streaming": 20_000_000,
-        "matmatmul": 40_000_000,
-        "legacy": 20_000_000,
+        "streaming": int(20_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "matmatmul": int(40_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "legacy": int(20_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
     }
     if user_dma_core.CURRENT_DEVICE == "efinix":
         # Efinix currently runs the same correctness workload at ~23.5M
@@ -6145,9 +5589,9 @@ def gemma3_if8_inference_test() -> None:
     # quantized weight data. Keep the correctness gate identical and halve the
     # speed requirement by doubling the allowed cycles/tok.
     _MAX_CYCLES_PER_TOKEN = {
-        "streaming": 40_000_000,
-        "matmatmul": 80_000_000,
-        "legacy": 40_000_000,
+        "streaming": int(40_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "matmatmul": int(80_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "legacy": int(40_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
     }
     _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
 
@@ -6332,62 +5776,34 @@ if __name__ == "__main__":
     dequantize_test(TYPE.IF8, int_variant=True)
     dequantize_test(TYPE.IF8, int_variant=False)
     matmat_mul_non_aligned_writeback_test()
-    rope_hf_core_dram_test(64, 512)
-    rope_hf_core_dram_test(64, 512, use_pbi=True)
+    rope_hf_core_dram_unified_test(shapes=[(64, 512)])
     bf16_permute_test(dim_0=144, dim_1=48, dim_2=64)
     patching_test()
     mix_of_broadcast_eltwise_add_eltwise_mul_core_test()
-    eltwise_core_dram_test(M=64, N=512)
-    bf16_transpose_dynamic_test(M_runtime_values=[64], N=64, dyn_M=True)
-    bf16_transpose_dynamic_test(M_runtime_values=[256], N=256, dyn_M=True)
-    bf16_transpose_dynamic_test(M_runtime_values=[512], N=2048, dyn_M=True)
-    bf16_transpose_dynamic_test(M_runtime_values=[1024], N=4032, dyn_M=True)
-    # Dynamic M+N: one compiled body reused across runtime N via the UE_PBI stride_z GPR
-    # override. The core always treats M dynamically (gpr_M_reg is mandatory), so dynamic-N
-    # is exercised together with dynamic-M; the primed N is still a runtime register value.
-    bf16_transpose_dynamic_test(M_runtime_values=[256], N=512, dyn_M=True, dyn_N=True)
-    bf16_transpose_dynamic_test(M_runtime_values=[64, 256, 512], N=768, dyn_M=True, dyn_N=True)
-    bf16_transpose_dynamic_test(M_runtime_values=[128, 512], N=4032, dyn_M=True, dyn_N=True)
+    eltwise_core_dram_unified_test(shapes=[(64, 512)])
+    # Each (M, N) is a paired legacy/dynamic run with dyn_M + dyn_N + GPR-sourced bases.
+    bf16_transpose_core_unified_test(shapes=[
+        (64, 64), (256, 256), (512, 2048), (1024, 4032),
+        (256, 512), (64, 768), (256, 768), (512, 768), (128, 4032), (512, 4032),
+    ])
     # Per-call snr_threshold_db tightens the floor where we have headroom
     # (observed ~50-55 dB on plain matmul, ~46-47 dB on softmax) so silent
     # SNR regressions trip the assert instead of slipping under the legacy
     # 40 dB floor.
-    matmat_mul_test(M=1024, K=768, N=512, clamp_enable=True, snr_threshold_db=52.0)
-    matmat_mul_test(M=1024, K=768, N=512, log_enable=True, snr_threshold_db=52.0)
-    matmat_mul_test(M=1984, K=1024, N=384, softmax_enable=True, debug_fmax=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
-
-    _run_rng_matched_pair(
-        lambda: matmat_mul_test(M=64, K=6912, N=64, snr_threshold_db=48.0),
-        lambda: matmat_mul_test(M=64, K=6912, N=64, dynamic=True, snr_threshold_db=48.0),
-    )
-    _run_rng_matched_pair(
-        lambda: matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True, snr_threshold_db=44.0),
-        lambda: matmat_mul_test(M=2048, K=512, N=384, softmax_enable=True, dynamic=True, snr_threshold_db=44.0),
-    )
-    _run_rng_matched_pair(
-        lambda: matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True, snr_threshold_db=52.0),
-        lambda: matmat_mul_test(M=1024, K=768, N=512, sigmoid_enable=True, dynamic=True, snr_threshold_db=52.0),
-    )
-    _run_rng_matched_pair(
-        lambda: matmat_mul_test(M=1024, K=768, N=512, clamp_enable=True, clamp_min=-11.125, clamp_max=11.0, snr_threshold_db=52.0),
-        lambda: matmat_mul_test(M=1024, K=768, N=512, clamp_enable=True, dynamic=True, clamp_min=-11.125, clamp_max=11.0, snr_threshold_db=52.0),
-    )
+    matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], clamp_enable=True, snr_threshold_db=52.0)
+    matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], log_enable=True, snr_threshold_db=52.0)
+    matmat_mul_unified_test(runtime_list=[(1984, 1024, 384)], softmax_enable=True, debug_fmax=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
+    matmat_mul_unified_test(runtime_list=[(64, 6912, 64)], snr_threshold_db=48.0)
+    matmat_mul_unified_test(runtime_list=[(2048, 512, 384)], softmax_enable=True, snr_threshold_db=44.0)
+    matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], sigmoid_enable=True, snr_threshold_db=52.0)
+    matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], clamp_enable=True, clamp_min=-11.125, clamp_max=11.0, snr_threshold_db=52.0)
     M = N = K = 512
     for bias_mode in ["broadcast_N", "full_matrix"]:
         for softmax_enable in [True, False]:
-            _run_rng_matched_pair(
-                lambda: matmat_mul_test(M=M, K=K, N=N, bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable),
-                lambda: matmat_mul_test(M=M, K=K, N=N, bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable, dynamic=True),
-            )
-    _run_rng_matched_pair(
-        lambda: matmat_mul_test(M=M, K=K, N=N, softmax_enable=True),
-        lambda: matmat_mul_test(M=M, K=K, N=N, softmax_enable=True, dynamic=True),
-    )
+            matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable)
+    matmat_mul_unified_test(runtime_list=[(M, K, N)], softmax_enable=True)
     M = N = K = 4096
-    _run_rng_matched_pair(
-        lambda: matmat_mul_test(M=M, K=K, N=N),
-        lambda: matmat_mul_test(M=M, K=K, N=N, dynamic=True),
-    )
+    matmat_mul_unified_test(runtime_list=[(M, K, N)])
 
     # --- Wide-variance softmax stress: exercises exp + bf20 adder tree ------
     # The post-matmul pre-softmax values span ~N(0, input_scale^2). Larger
@@ -6408,376 +5824,193 @@ if __name__ == "__main__":
         16.0: 18.0,  # adder tree near saturation
     }
     for scale, snr_floor in wide_variance_snr_floors.items():
-        matmat_mul_test(M=512, K=512, N=384, softmax_enable=True,
-                        input_scale=scale, snr_threshold_db=snr_floor)
+        matmat_mul_unified_test(runtime_list=[(512, 512, 384)], softmax_enable=True,
+                                input_scale=scale, snr_threshold_db=snr_floor)
     # Pair wide variance with debug_fmax so fmax SNR is also validated.
     # fmax itself is exact (a row max) so fmax SNR stays high even at
     # large scales — keep that floor tight at 44 dB.
-    matmat_mul_test(M=1024, K=1024, N=512, softmax_enable=True, debug_fmax=True,
-                    input_scale=8.0, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
+    matmat_mul_unified_test(runtime_list=[(1024, 1024, 512)], softmax_enable=True, debug_fmax=True,
+                            input_scale=8.0, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
     # Tall/narrow and short/wide variants to sweep different M/N tile shapes
     # through the wide-variance exp path.
-    matmat_mul_test(M=2048, K=256, N=128, softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
-    matmat_mul_test(M=128, K=256, N=2048, softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
-    matmat_mul_test(M=512, K=1024, N=1024, softmax_enable=True, input_scale=12.0, dynamic=True, snr_threshold_db=22.0)
+    matmat_mul_unified_test(runtime_list=[(2048, 256, 128)], softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
+    matmat_mul_unified_test(runtime_list=[(128, 256, 2048)], softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
+    matmat_mul_unified_test(runtime_list=[(512, 1024, 1024)], softmax_enable=True, input_scale=12.0, snr_threshold_db=22.0)
 
-    quantized_matmat_mul_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
-    quantized_matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
-    quantized_matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  silu_enable=True)
-    quantized_matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", sigmoid_enable=True)
-    quantized_matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  clamp_enable=True)
-    quantized_matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True, snr_threshold_db=37) # log activation in the quantized path is degraded.
+    quantized_matmat_mul_unified_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
+    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
+    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  silu_enable=True)
+    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", sigmoid_enable=True)
+    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  clamp_enable=True)
+    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True, snr_threshold_db=37) # log activation in the quantized path is degraded.
 
-    _run_rng_matched_pair(
-        lambda: matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix"),
-        lambda: matmat_mul_quantized_weights_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix", dynamic=True),
-    )
+    # No-bias shapes get a real legacy/dynamic + dynamic-addr matched pair (the dynamic
+    # quantized_matmat_core is a 1-pass, bias-free path); the biased shapes above run legacy-only.
+    quantized_matmat_mul_unified_test(M=1, K=512, N=512, data_type=TYPE.IF4, int_variant=True)
+    quantized_matmat_mul_unified_test(M=1, K=1280, N=1408, data_type=TYPE.IF4, int_variant=True, silu_enable=True)
+    quantized_matmat_mul_unified_test(M=1, K=512, N=512, data_type=TYPE.IF8, int_variant=True, gelu_enable=True)
+    quantized_matmat_mul_unified_test(M=2, K=128, N=128, data_type=TYPE.IF4, int_variant=True)
+    quantized_matmat_mul_unified_test(M=8, K=256, N=256, data_type=TYPE.IF4, int_variant=False)
+    quantized_matmat_mul_unified_test(M=65, K=512, N=512, data_type=TYPE.IF8, int_variant=True)
+    quantized_matmat_mul_unified_test(M=1024, K=768, N=512, data_type=TYPE.IF8, int_variant=False)
+    quantized_matmat_mul_unified_test(M=257, K=1280, N=1408, data_type=TYPE.IF4, int_variant=True)
 
-    _run_rng_matched_pair(
-        lambda: unified_attention_test(batch=256, aligned_seq_len=256, head_dim=128),
-        lambda: unified_attention_test(batch=256, aligned_seq_len=256, head_dim=128, dynamic=True),
-    )
-    _run_rng_matched_pair(
-        lambda: unified_attention_test(batch=512, aligned_seq_len=512, head_dim=128),
-        lambda: unified_attention_test(batch=512, aligned_seq_len=512, head_dim=128, dynamic=True),
-    )
+    matmat_mul_quantized_weights_unified_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix")
+
+    unified_attention_test(batch=256, aligned_seq_len=256, head_dim=128)
+    unified_attention_test(batch=512, aligned_seq_len=512, head_dim=128)
 
     # --- Additional coverage: extra dimension/feature combinations ---
-    rms_norm_test(shape=(768, 1024))
-    rms_norm_test(shape=(2048, 2048))
-    layer_norm_test(shape=(1024, 1024), gamma_enable=True)
-    layer_norm_test(shape=(1024, 1024), gamma_enable=True, use_pbi=True)
-    layer_norm_test(shape=(1024, 1024), beta_enable=True)
-    layer_norm_test(shape=(1024, 1024), beta_enable=True, use_pbi=True)
-    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True, use_pbi=True)
+    rms_norm_unified_test(shapes=[(768, 1024), (2048, 2048)])
+    layer_norm_core_dram_unified_test(shapes=[(1024, 1024)], gamma_enable=True, beta_enable=False)
+    layer_norm_core_dram_unified_test(shapes=[(1024, 1024)], gamma_enable=False, beta_enable=True)
+    layer_norm_core_dram_unified_test(shapes=[(192, 6912)], gamma_enable=True, beta_enable=True)
     bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
-    matmat_mul_test(M=512, K=2048, N=2048)
-    matmat_mul_test(M=128, K=4096, N=512, gelu_enable=True)
-    matmat_mul_test(M=256, K=2048, N=1024, silu_enable=True)
-    matmat_mul_test(M=512, K=1024, N=512, bias_enable=True, bias_mode="broadcast_N")
-    matmat_mul_test(M=512, K=1024, N=512, bias_enable=True, bias_mode="full_matrix")
-    matmat_mul_quantized_weights_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=True)
-    matmat_mul_quantized_weights_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=False)
-    quantized_matmat_mul_test(M=128, K=512, N=512, data_type=TYPE.IF4, int_variant=True, gelu_enable=True)
+    matmat_mul_unified_test(runtime_list=[(512, 2048, 2048)])
+    matmat_mul_unified_test(runtime_list=[(128, 4096, 512)], gelu_enable=True)
+    matmat_mul_unified_test(runtime_list=[(256, 2048, 1024)], silu_enable=True)
+    matmat_mul_unified_test(runtime_list=[(512, 1024, 512)], bias_enable=True, bias_mode="broadcast_N")
+    matmat_mul_unified_test(runtime_list=[(512, 1024, 512)], bias_enable=True, bias_mode="full_matrix")
+    matmat_mul_quantized_weights_unified_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=True)
+    matmat_mul_quantized_weights_unified_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=False)
+    quantized_matmat_mul_unified_test(M=128, K=512, N=512, data_type=TYPE.IF4, int_variant=True, gelu_enable=True)
 
-    # Existing tests re-run with dynamic_addr=True: the SAME kernels now source their DRAM bases
-    # from GPRs (primed with addr>>3, equal to the literals so results match) instead of baking
-    # them in. Backward-compatible: dynamic_addr defaults False everywhere. Kept at suite end so
-    # the extra ISA-only instructions (no new RNG draws) don't perturb earlier SNR gates.
-    eltwise_core_dram_test(M=64, N=512, use_pbi=True, dynamic_addr=True)
-    rms_norm_test(shape=(64, 512), use_pbi=True, dynamic_addr=True)
-    layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True, use_pbi=True, dynamic_addr=True)
-    rope_hf_core_dram_test(64, 512, use_pbi=True, dynamic_addr=True)
-    rope_hf_core_dram_dynamic_test(M=64, N=512, dynamic=True, dynamic_addr=True)
-    rope_hf_core_dram_gqa_test(64, 4, 512, use_pbi=True, dynamic_addr=True)
-    rope_hf_core_dram_gqa_dynamic_test(M=64, group_size=4, N=512, dynamic=True, dynamic_addr=True)
-    bf16_transpose_dynamic_test(M_runtime_values=[256], N=256, dyn_M=True, dynamic_addr=True)
-    matmat_mul_dynamic_mkn_test(runtime_list=[(256, 256, 256)], dynamic_addr=True)
-    matmat_mul_dynamic_mkn_test(runtime_list=[(256, 512, 512)], bias_enable=True, bias_mode="broadcast_N", dynamic_addr=True)
-    # Attention cores: Q/K/V/OUTPUT(/BIAS) bases sourced from GPRs (one captured body per op).
-    unified_attention_test(batch=512, aligned_seq_len=512, head_dim=128, dynamic=True, dynamic_addr=True)
+    # GPR-sourced-base (dynamic_addr) coverage unique to this section — the unified tests above
+    # already source DRAM bases from GPRs in their dynamic leg, so the former per-test dynamic_addr
+    # re-runs (eltwise/rms/layer_norm/rope/transpose/attention/qweights at shapes already covered)
+    # are redundant and dropped. Only shapes/variants NOT covered above are kept here.
+    rms_norm_unified_test(shapes=[(64, 512)])
+    rope_hf_core_dram_gqa_unified_test(shapes=[(64, 4, 512)])
+    matmat_mul_unified_test(runtime_list=[(256, 256, 256)])
+    matmat_mul_unified_test(runtime_list=[(256, 512, 512)], bias_enable=True, bias_mode="broadcast_N")
+    # head_dim=256 (the fully-dynamic leg covers runtime head_dim + pre-scale); head_dim=128
+    # fully-dynamic is already covered by the batch=512 attention call above.
+    unified_attention_test(batch=512, aligned_seq_len=512, head_dim=256)
+    # Quantized-B matmul at the gemma3 fold shape (broadcast_N bias).
+    matmat_mul_quantized_weights_unified_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="broadcast_N")
 
     if args.ext:
-        eltwise_core_dram_test(use_pbi=False)
-        eltwise_core_dram_test(use_pbi=True)
+        # --- Eltwise: paired dynamic-vs-legacy over a representative shape set (M ladder, N/dim-swap
+        #     ladder, gemma dims). GPR-sourced bases + runtime broadcast scalar are on by default. ---
+        eltwise_core_dram_unified_test(shapes=[
+            (1, 512), (512, 512), (8192, 512),      # M ladder (edge/tiny -> large)
+            (512, 64), (512, 1024), (512, 6912),    # N / dim-swap ladder
+            (64, 640), (256, 1024),                 # gemma vector_length + mixed
+        ])
 
-        # N=512  → M_chunk=448: sub-chunk, exact chunk, chunk+64, 2×chunk, multi-chunk
-        bf16_transpose_dynamic_test(M_runtime_values=[64, 448, 512, 896, 8192], N=64, dyn_M=True)
-        # N=1024 → M_chunk=192: sub-chunk, exact chunk, chunk+64, 2×chunk, multi-chunk
-        bf16_transpose_dynamic_test(M_runtime_values=[64, 192, 256, 384, 8192], N=256, dyn_M=True)
-        # N=2048 → M_chunk=64: every M is a multiple of M_chunk; sweep powers of 2 + non-trivial sizes
-        bf16_transpose_dynamic_test(M_runtime_values=[64, 128, 512, 1024, 8192], N=2048, dyn_M=True)
-        # N=4032 → M_chunk=64, eff_z=4032: max valid N (4096 overflows the 12-bit URAM_ROW_SIZE_Z field)
-        bf16_transpose_dynamic_test(M_runtime_values=[64, 128, 512, 1024, 8192], N=4032, dyn_M=True)
+        # --- RMS norm: paired dynamic-vs-legacy (64-aligned) + dynamic-only host-pad (odd N),
+        #     covering the existing rms_norm test scope. ---
+        rms_norm_unified_test(shapes=[
+            (1, 512), (512, 512), (8192, 512),        # M ladder (edge/tiny -> large)
+            (512, 64), (512, 1024), (512, 4096),      # N / dim-swap ladder
+            (512, 640), (256, 1024),                  # gemma vector_length + mixed
+            (95, 128), (411, 128),                    # odd M, aligned N (stress ladder)
+            (64, 78), (64, 411), (64, 1000),          # non-64-aligned N (dynamic-only host-pad)
+        ])
 
+        # --- LayerNorm: paired dynamic-vs-legacy (64-aligned) + dynamic-only host-pad + mask (odd N),
+        #     covering the existing layer_norm test scope (gamma/beta combos). ---
+        layer_norm_core_dram_unified_test(shapes=[
+            (1, 512), (512, 512), (8192, 512),        # M ladder (edge/tiny -> large)
+            (512, 64), (512, 1024), (512, 4096),      # N / dim-swap ladder
+            (256, 1024),                              # mixed
+            (95, 128), (411, 128),                    # odd M, aligned N
+            (64, 78), (64, 411), (64, 1000),          # non-64-aligned N (dynamic-only, host-pad + mask)
+        ])
+        # (gamma-only / beta-only combos are covered in the normal pass, which always runs first.)
+
+        rope_hf_core_dram_unified_test(shapes=[
+            (1, 64), (8, 128), (95, 138), (411, 512),
+        ])
+        rope_hf_core_dram_gqa_unified_test(shapes=[
+            (1, 4, 128), (64, 4, 138), (95, 4, 512),
+        ])
+        # bf16_transpose: per-N M-ladder hits M_chunk boundaries
+        # (sub-chunk / exact chunk / chunk+64 / 2×chunk / multi-chunk + 8192 stress).
+        # Every run is dyn_M + dyn_N + dynamic_addr, so this also subsumes the old
+        # dynamic_addr spot check (N ∈ {64, 256, 2048}).
+        _TRANSPOSE_M_LADDERS = {
+            64:   [64, 448, 512, 896, 8192],    # M_chunk=448
+            256:  [64, 192, 256, 384, 8192],    # M_chunk=192
+            2048: [64, 128, 512, 1024, 8192],   # M_chunk=64
+            4032: [64, 128, 512, 1024, 8192],   # M_chunk=64, max valid N (4096 overflows URAM_ROW_SIZE_Z)
+        }
+        bf16_transpose_core_unified_test(shapes=[
+            (M, N) for N, Ms in _TRANSPOSE_M_LADDERS.items() for M in Ms
+        ])
+        
+        # --- Quantized-B matmul: every shape traverses every format/option configuration. ---
         for M in [64, 384, 1024]:
             for N in [64, 576, 1024]:
                 for K in [64, 192, 1024]:
                     for bias_enable in [False, True]:
                         for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
-                            _run_rng_matched_pair(
-                                lambda: matmat_mul_quantized_weights_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode),
-                                lambda: matmat_mul_quantized_weights_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, dynamic=True),
-                            )
+                            matmat_mul_quantized_weights_unified_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
 
-        matmat_mul_quantized_weights_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
-        matmat_mul_quantized_weights_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", silu_enable=True, dynamic=True)
-        matmat_mul_quantized_weights_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix", sigmoid_enable=True)
-        matmat_mul_quantized_weights_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix", clamp_enable=True, dynamic=True)
-        matmat_mul_quantized_weights_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True)
+        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
+        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
+        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix", sigmoid_enable=True)
+        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix", clamp_enable=True)
+        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True)
 
+        # --- Matmul: comprehensive paired legacy/dynamic coverage. ---
         for M in [25, 64, 133, 384, 1024]:
             for N in [64, 576, 1024]:
                 for K in [64, 192, 1024]:
                     for bias_enable in [False, True]:
                         for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
                             for softmax_enable in [True, False]:
-                                matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode, softmax_enable=softmax_enable, snr_threshold_db=36 if M == 25 or 133 else 40)
+                                snr_floor = 36 if M in (25, 133) or (M, K, N) == (64, 64, 576) else 40
+                                matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=bias_enable, bias_mode=bias_mode, softmax_enable=softmax_enable, snr_threshold_db=snr_floor)
         # Representative activation coverage: one shape per activation, mirroring the quantized_weights pattern above.
-        matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True,    snr_threshold_db=40)
-        matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  silu_enable=True,   snr_threshold_db=40)
-        matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", sigmoid_enable=True, snr_threshold_db=40)
-        matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  clamp_enable=True,  snr_threshold_db=40)
-        matmat_mul_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True,     snr_threshold_db=40)
+        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", gelu_enable=True,    snr_threshold_db=40)
+        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="full_matrix",  silu_enable=True,   snr_threshold_db=40)
+        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", sigmoid_enable=True, snr_threshold_db=40)
+        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="full_matrix",  clamp_enable=True,  snr_threshold_db=40)
+        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", log_enable=True,     snr_threshold_db=40)
 
         # Large-dim stress: each axis at 8192 (others fixed at 512) + all-4096 square.
         for bias_enable in [False, True]:
             for softmax_enable in [False, True]:
                 for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
-                    _run_rng_matched_pair(
-                        lambda: matmat_mul_test(M=8192, K=512,  N=512,  bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode),
-                        lambda: matmat_mul_test(M=8192, K=512,  N=512,  bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode, dynamic=True),
-                    )
+                    matmat_mul_unified_test(runtime_list=[(8192, 512,  512)],  bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
                     # Reminder: k=8192 breaks on 512-b dram setup
-                    _run_rng_matched_pair(
-                        lambda: matmat_mul_test(M=512,  K=8192-64, N=512,  bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode),
-                        lambda: matmat_mul_test(M=512,  K=8192-64, N=512,  bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode, dynamic=True),
-                    )
-                    _run_rng_matched_pair(
-                        lambda: matmat_mul_test(M=512,  K=512,  N=8192, bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode),
-                        lambda: matmat_mul_test(M=512,  K=512,  N=8192, bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode, dynamic=True),
-                    )
-                    _run_rng_matched_pair(
-                        lambda: matmat_mul_test(M=4096, K=4032, N=4032, bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode),
-                        lambda: matmat_mul_test(M=4096, K=4032, N=4032, bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode, dynamic=True),
-                    )
+                    matmat_mul_unified_test(runtime_list=[(512,  8192-64, 512)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
+                    matmat_mul_unified_test(runtime_list=[(512,  512,  8192)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
+                    matmat_mul_unified_test(runtime_list=[(4096, 4032, 4032)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
 
         for M in [1, 64, 384, 1024]:
             for N in [64, 576, 1024]:
                 for K in [64, 192, 1024]:
-                    _run_rng_matched_pair(
-                        lambda: matmat_mul_test(M=M, K=K, N=N),
-                        lambda: matmat_mul_test(M=M, K=K, N=N, dynamic=True),
-                    )
+                    matmat_mul_unified_test(runtime_list=[(M, K, N)])
         M = N = K = 512
         for bias_mode in ["broadcast_N", "full_matrix"]:
             for softmax_enable in [True, False]:
-                _run_rng_matched_pair(
-                    lambda: matmat_mul_test(M=M, K=K, N=N, bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable),
-                    lambda: matmat_mul_test(M=M, K=K, N=N, bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable, dynamic=True),
-                )
-        _run_rng_matched_pair(
-            lambda: matmat_mul_test(M=M, K=K, N=N, softmax_enable=True),
-            lambda: matmat_mul_test(M=M, K=K, N=N, softmax_enable=True, dynamic=True),
-        )
+                matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable)
+        matmat_mul_unified_test(runtime_list=[(M, K, N)], softmax_enable=True)
+
         
+        # --- Quantized matmat-mul (1-pass streaming quantized dot core): full shape × bias sweep. ---
         for M in [64, 384, 1024]:
             for N in [64, 576, 1024]:
                 for K in [64, 192, 1024]:
                     for bias_enable in [False, True]:
                         for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
-                            quantized_matmat_mul_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
+                            quantized_matmat_mul_unified_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
 
-        # unified_attention: head_dim × seq_len coverage, no bias parameter.
+        # unified_attention: head_dim × seq_len coverage (paired legacy/dynamic; the dynamic leg
+        # sources all Q/K/V/bias/out DRAM bases from GPRs). Merges the former dynamic-only,
+        # matched-pair, and dynamic_addr (head_dim=128) sweeps into one.
         for head_dim in [64, 256, 512, 1024]:
             for seq_len in [64, 256, 512, 1024, 4096, 8192-64]: # Reminder: seq_len=8192 breaks on 512-b dram setup
-                unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim, dynamic=True)
+                unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim)
+        # head_dim=128 came only from the former dynamic_addr sweep (seq_len up to 1024).
+        for seq_len in [64, 256, 512, 1024]:
+            unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=128)
+        # Small-batch (batch=4) coverage.
         for head_dim in [64, 256, 512]:
             for seq_len in [64, 256, 512]:
-                unified_attention_test(batch=4, aligned_seq_len=seq_len, head_dim=head_dim, dynamic=True)
-
-        for head_dim in [64, 512, 1024]:
-            for seq_len in [64, 512, 1024, 8192-64]: # Reminder: seq_len=8192 breaks on 512-b dram setup
-                _run_rng_matched_pair(
-                    lambda: unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim),
-                    lambda: unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim, dynamic=True),
-                )
-
-        # Shared stress ladder (deliberately non-64-aligned, odd, and tiny) exercised by the dynamic
-        # RoPE and norm cores below. pbi/legacy cores can't take these raw dims; the dynamic cores
-        # host-pad them (RoPE: even head_dim + 64-aligned halves; norms: 64-aligned N).
-        _SPECIAL_M = [1, 8, 64, 95, 411, 4096, 8192]
-        _SPECIAL_N = [22, 5, 51, 78, 95, 138, 411, 1178, 5093]
-
-        # layer_norm / rms_norm: M and N sweep using the same dim ladder as unified_attention.
-        _NORM_DIMS = [64, 256, 512, 1024, 4096, 8192]
-        for dim in _NORM_DIMS:
-            layer_norm_test(shape=(dim, 512), gamma_enable=True, beta_enable=True)
-            layer_norm_test(shape=(512, dim), gamma_enable=True, beta_enable=True)
-        for gamma_enable in [True, False]:
-            for beta_enable in [True, False]:
-                layer_norm_test(shape=(1024, 1024), gamma_enable=gamma_enable, beta_enable=beta_enable)
-
-        for dim in _NORM_DIMS:
-            rms_norm_test(shape=(dim, 512))
-            rms_norm_test(shape=(dim, 512), use_pbi=True)
-            rms_norm_test(shape=(512, dim))
-            rms_norm_test(shape=(512, dim), use_pbi=True)
-
-        # layer_norm / rms_norm dynamic (runtime M and N, one compiled body per call): same dim ladder.
-        for dim in _NORM_DIMS:
-            layer_norm_core_dram_dynamic_test(M=dim, N=512, gamma_enable=True, beta_enable=True)
-            layer_norm_core_dram_dynamic_test(M=512, N=dim, gamma_enable=True, beta_enable=True)
-        for gamma_enable in [True, False]:
-            for beta_enable in [True, False]:
-                layer_norm_core_dram_dynamic_test(M=1024, N=1024, gamma_enable=gamma_enable, beta_enable=beta_enable)
-        # Non-64-aligned N (host zero-pad + mask, see the core's docstring).
-        for N in [21, 53, 80, 90, 1000]:
-            layer_norm_core_dram_dynamic_test(M=64, N=N, gamma_enable=True, beta_enable=True)
-
-        for dim in _NORM_DIMS:
-            rms_norm_core_dram_dynamic_test(M=dim, N=512)
-            rms_norm_core_dram_dynamic_test(M=512, N=dim)
-        # Non-64-aligned N (host zero-pad, sqrt(N) folded into gamma).
-        for N in [21, 53, 80, 90, 1000]:
-            rms_norm_core_dram_dynamic_test(M=64, N=N)
-
-        # dynamic vs legacy, RNG-matched pairs across the same dim ladder so the summary table's
-        # SNR/GFLOPS diff columns are populated for every size, not just a couple of spot checks.
-        for dim in _NORM_DIMS:
-            _run_rng_matched_pair(
-                lambda dim=dim: rms_norm_core_dram_dynamic_test(M=dim, N=512),
-                lambda dim=dim: rms_norm_test(shape=(dim, 512)),
-            )
-            _run_rng_matched_pair(
-                lambda dim=dim: layer_norm_core_dram_dynamic_test(M=dim, N=512, gamma_enable=True, beta_enable=True),
-                lambda dim=dim: layer_norm_test(shape=(dim, 512), gamma_enable=True, beta_enable=True),
-            )
-
-        # Same stress ladder (_SPECIAL_M/_SPECIAL_N) on the dynamic norms: pbi/legacy norms can't take
-        # non-64-aligned N, so the dynamic cores host-pad (RMS: zero-pad; LayerNorm: zero-pad + mask).
-        # N sweep at fixed M, M sweep at fixed N to keep the DRAM footprint bounded.
-        for N in _SPECIAL_N:
-            rms_norm_core_dram_dynamic_test(M=64, N=N)
-            layer_norm_core_dram_dynamic_test(M=64, N=N, gamma_enable=True, beta_enable=True)
-        for M in _SPECIAL_M:
-            rms_norm_core_dram_dynamic_test(M=M, N=128)
-            layer_norm_core_dram_dynamic_test(M=M, N=128, gamma_enable=True, beta_enable=True)
-
-        # RoPE: standard and GQA over the shared stress ladder (_SPECIAL_M/_SPECIAL_N, defined above). The
-        # raw dims are non-64-aligned / odd / tiny, which the pbi and legacy cores can't take, so every
-        # mode is driven through the host-padding wrappers (they run the pbi/legacy cores on the padded
-        # dims; see _rope_padded_layout).
-        for M in _SPECIAL_M:
-            for N in _SPECIAL_N:
-                rope_hf_core_dram_dynamic_test(M, N)                  # legacy core, host-padded
-                rope_hf_core_dram_dynamic_test(M, N, use_pbi=True)    # pbi core, host-padded
-        for M in _SPECIAL_M[:4]:  # GQA with M 8192 would fail the dram read buffer size
-            for N in _SPECIAL_N:
-                rope_hf_core_dram_gqa_dynamic_test(M, group_size=4, N=N)
-                rope_hf_core_dram_gqa_dynamic_test(M, group_size=4, N=N, use_pbi=True)
-
-        # RoPE dynamic (runtime M and head_dim N from GPRs, one compiled body per call), same ladder.
-        for M in _SPECIAL_M:
-            for N in _SPECIAL_N:
-                rope_hf_core_dram_dynamic_test(M=M, N=N, dynamic=True)
-        for M in _SPECIAL_M[:4]:  # GQA with M 8192 would fail the dram read buffer size
-            for N in _SPECIAL_N:
-                rope_hf_core_dram_gqa_dynamic_test(M=M, group_size=4, N=N, dynamic=True)
-        # Non-64-aligned head_dim (host-side padding, see _rope_padded_layout).
-        for N in [130, 192, 250, 384]:
-            rope_hf_core_dram_dynamic_test(M=64, N=N, dynamic=True)
-            rope_hf_core_dram_gqa_dynamic_test(M=64, group_size=4, N=N, dynamic=True)
-        # d64 (head_dim < 128): native sub-128 PBI core and the padded-dynamic path that subsumes it.
-        for N in [32, 64]:
-            rope_hf_core_dram_d64_test(M=64, N=N)
-            rope_hf_core_dram_d64_test(M=64, N=N, dynamic=True)
-
-        # dynamic vs legacy, RNG-matched pairs across the same ladder so the summary table's
-        # SNR/GFLOPS diff columns are populated for every size, not just a couple of spot checks.
-        for M in _SPECIAL_M:
-            for N in _SPECIAL_N:
-                _run_rng_matched_pair(
-                    lambda M=M, N=N: rope_hf_core_dram_dynamic_test(M=M, N=N, dynamic=True),
-                    lambda M=M, N=N: rope_hf_core_dram_dynamic_test(M=M, N=N),
-                )
-
-        # =========================================================================
-        # Dynamic M/K/N coverage — fully dynamic GEMM sequencer
-        # =========================================================================
-        _M = [64, 256, 1024]
-        _K = [64, 256, 1024]   # 4032 = hw max (URAM_NEAR_FULL/64 rounded to 64-multiple)
-        _N = [64, 256, 1024]
-        _runtime = [(m, k, n) for m in _M for k in _K for n in _N]
-        _baseline = [(512, 512, 512)]
-
-        matmat_mul_dynamic_mkn_test(runtime_list=_runtime, compare_legacy=True)
-        for bias_mode in ("broadcast_N", "full_matrix"):
-            matmat_mul_dynamic_mkn_test(bias_enable=True, bias_mode=bias_mode, runtime_list=_runtime, compare_legacy=True)
-        matmat_mul_dynamic_mkn_test(softmax_enable=True, runtime_list=_runtime, compare_legacy=True)
-        matmat_mul_dynamic_mkn_test(bias_enable=True, bias_mode="full_matrix", softmax_enable=True, runtime_list=_runtime, compare_legacy=True)
-
-        # Activations
-        matmat_mul_dynamic_mkn_test(gelu_enable=True,                                runtime_list=_baseline, compare_legacy=True)
-        matmat_mul_dynamic_mkn_test(silu_enable=True,                                runtime_list=_baseline, compare_legacy=True)
-        matmat_mul_dynamic_mkn_test(sigmoid_enable=True,                             runtime_list=_baseline, compare_legacy=True)
-        matmat_mul_dynamic_mkn_test(log_enable=True,                                 runtime_list=_baseline, compare_legacy=True)
-        matmat_mul_dynamic_mkn_test(clamp_enable=True, clamp_min=0.0, clamp_max=6.0, runtime_list=_baseline, compare_legacy=True)
-
-        # Large-dim stress: each axis at max, others moderate
-        matmat_mul_dynamic_mkn_test(runtime_list=[(4096, 4032, 4096)], compare_legacy=True)
-        matmat_mul_dynamic_mkn_test(runtime_list=[(8192, 64, 64), (64, 4032, 64), (64, 64, 4096)], compare_legacy=True)
-
-        # =========================================================================
-        # GPR-sourced DRAM base addresses (template-once-per-op) — extended sweep.
-        # Each core re-run with dynamic_addr=True across multiple shapes: the SAME
-        # captured kernel sources its DRAM bases from GPRs (primed with addr>>3,
-        # equal to the literals so numeric results match the legacy path). These
-        # add ISA-only instructions (no new RNG draws), so they sit at the END of
-        # the --ext block and cannot shift the matched-pair RNG fingerprint below.
-        # =========================================================================
-
-        # eltwise: all three ops (mul/add/sub) per call, through the all-PBI-pointer
-        # override path, over the norm dim ladder.
-        for M, N in [(64, 512), (256, 1024), (512, 2048)]:
-            eltwise_core_dram_test(M=M, N=N, use_pbi=True, dynamic_addr=True)
-
-        # rms_norm: M and N sweep, GPR-sourced input/output/gamma bases.
-        for dim in [64, 256, 1024, 4096]:
-            rms_norm_test(shape=(dim, 512), use_pbi=True, dynamic_addr=True)
-            rms_norm_test(shape=(512, dim), use_pbi=True, dynamic_addr=True)
-
-        # layer_norm dynamic-address coverage.
-        for gamma_enable in [True, False]:
-            for beta_enable in [True, False]:
-                layer_norm_test(shape=(1024, 1024), gamma_enable=gamma_enable,
-                                beta_enable=beta_enable, use_pbi=True, dynamic_addr=True)
-        layer_norm_test(shape=(192, 6912), gamma_enable=True, beta_enable=True,
-                        use_pbi=True, dynamic_addr=True)
-
-        # rms_norm / layer_norm dynamic: GPR-sourced input/output/gamma(/beta/inv_n/mask) bases.
-        for dim in [64, 256, 1024, 4096]:
-            rms_norm_core_dram_dynamic_test(M=dim, N=512, dynamic_addr=True)
-            rms_norm_core_dram_dynamic_test(M=512, N=dim, dynamic_addr=True)
-        for gamma_enable in [True, False]:
-            for beta_enable in [True, False]:
-                layer_norm_core_dram_dynamic_test(M=1024, N=1024, gamma_enable=gamma_enable,
-                                                  beta_enable=beta_enable, dynamic_addr=True)
-        layer_norm_core_dram_dynamic_test(M=192, N=6912, gamma_enable=True, beta_enable=True, dynamic_addr=True)
-
-        # RoPE: standard (N<128 cursor-seed + N>=128 PBI branches) and GQA.
-        for M in [8, 64, 512, 4096]:
-            for N in [256, 512, 1024]:
-                rope_hf_core_dram_test(M, N, use_pbi=True, dynamic_addr=True)
-        for M in [8, 64, 512]:
-            for N in [256, 512, 1024]:
-                rope_hf_core_dram_gqa_test(M, 4, N, use_pbi=True, dynamic_addr=True)
-
-        # RoPE dynamic: GPR-sourced input/output/cos bases, standard and GQA.
-        for M in [8, 64, 512, 4096]:
-            for N in [256, 512, 1024]:
-                rope_hf_core_dram_dynamic_test(M=M, N=N, dynamic=True, dynamic_addr=True)
-        for M in [8, 64, 512]:
-            for N in [256, 512, 1024]:
-                rope_hf_core_dram_gqa_dynamic_test(M=M, group_size=4, N=N, dynamic=True, dynamic_addr=True)
-
-        # bf16_transpose: dynamic-M with GPR-sourced input/out bases (primed in preamble).
-        for N in [64, 256, 2048]:
-            bf16_transpose_dynamic_test(M_runtime_values=[256], N=N, dyn_M=True, dynamic_addr=True)
-
-        # matmat_mul dynamic M/K/N with GPR-sourced A/B/out/C bases (primed in preamble).
-        _ADDR_MKN = [(64, 64, 64), (256, 256, 256), (1024, 1024, 1024)]
-        matmat_mul_dynamic_mkn_test(runtime_list=_ADDR_MKN, dynamic_addr=True)
-        for bias_mode in ("broadcast_N", "full_matrix"):
-            matmat_mul_dynamic_mkn_test(runtime_list=[(256, 512, 512)], bias_enable=True,
-                                        bias_mode=bias_mode, dynamic_addr=True)
-        matmat_mul_dynamic_mkn_test(runtime_list=[(256, 512, 512)], softmax_enable=True, dynamic_addr=True)
-
-        # unified attention: Q/K/V/OUTPUT(/BIAS) bases sourced from GPRs — one captured
-        # body per op across the head_dim × seq_len ladder.
-        for head_dim in [64, 128, 256]:
-            for seq_len in [64, 256, 512, 1024]:
-                unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim, dynamic=True, dynamic_addr=True)
+                unified_attention_test(batch=4, aligned_seq_len=seq_len, head_dim=head_dim)
 
     _RNG_STATE_END = _rng_state_fingerprint()
 
@@ -6785,44 +6018,31 @@ if __name__ == "__main__":
     # Keep device-specific optional coverage last so it cannot advance RNG
     # before common tests. That makes SNR results comparable across devices.
     if args.device in ('kintex7', 'kintex7_systolic', 'alveo'):
+        two_core_shapes = [(1920, 768, 2048)]
         matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
-        _run_rng_matched_pair(
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048),
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, dynamic=True),
-        )
-        _run_rng_matched_pair(
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True),
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True, dynamic=True),
-        )
-        _run_rng_matched_pair(
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True),
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, gelu_enable=True, dynamic=True),
-        )
-        _run_rng_matched_pair(
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True),
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, silu_enable=True, dynamic=True),
-        )
-        _run_rng_matched_pair(
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True),
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, sigmoid_enable=True, dynamic=True),
-        )
-        _run_rng_matched_pair(
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, clamp_enable=True),
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, clamp_enable=True, dynamic=True),
-        )
-        _run_rng_matched_pair(
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, log_enable=True),
-            lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, log_enable=True, dynamic=True),
-        )
+        matmat_mul_two_cores_unified_test(runtime_list=two_core_shapes)
+        matmat_mul_two_cores_unified_test(
+            runtime_list=two_core_shapes, softmax_enable=True)
+        matmat_mul_two_cores_unified_test(
+            runtime_list=two_core_shapes, gelu_enable=True)
+        matmat_mul_two_cores_unified_test(
+            runtime_list=two_core_shapes, silu_enable=True)
+        matmat_mul_two_cores_unified_test(
+            runtime_list=two_core_shapes, sigmoid_enable=True)
+        matmat_mul_two_cores_unified_test(
+            runtime_list=two_core_shapes, clamp_enable=True)
+        matmat_mul_two_cores_unified_test(
+            runtime_list=two_core_shapes, log_enable=True)
+
         # Wide-variance softmax across two engines exercises per-row exp +
         # bf20 adder tree reduction on both engines concurrently. Use scale-
         # specific SNR floors mirroring the single-engine wide-variance set.
         for scale, snr_floor in ((4.0, 38.0), (8.0, 28.0)):
-            _run_rng_matched_pair(
-                lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True,
-                                                  input_scale=scale, snr_threshold_db=snr_floor),
-                lambda: matmat_mul_two_cores_test(M=1920, K=768, N=2048, softmax_enable=True,
-                                                  input_scale=scale, dynamic=True, snr_threshold_db=snr_floor),
+            matmat_mul_two_cores_unified_test(
+                runtime_list=two_core_shapes,
+                softmax_enable=True,
+                input_scale=scale,
+                snr_threshold_db=snr_floor,
             )
     if args.device == 'alveo':
         matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
@@ -6853,14 +6073,9 @@ if __name__ == "__main__":
         systolic_matmul_test(4096, 4096, 4096)
         systolic_matmul_test(8192, 512, 512)
         systolic_matmul_test(512, 512, 8192)
-        # Compare with Unified engine
-        matmat_mul_test(M=1024, K=1024, N=1024)
         systolic_matmul_test(M=1024, K=1024, N=1024)
-        matmat_mul_test(M=8, K=128, N=1024)
         systolic_matmul_test(M=8, K=128, N=1024)
-        matmat_mul_test(M=16, K=1024, N=64)
         systolic_matmul_test(M=16, K=1024, N=64)
-        matmat_mul_test(M=256, K=64, N=256)
         systolic_matmul_test(M=256, K=64, N=256)
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True

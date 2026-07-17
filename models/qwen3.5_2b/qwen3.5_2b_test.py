@@ -192,6 +192,22 @@ class _NoiseFilterStdout:
         "FPGA DRAM read/write", "Dram read/write test",
         "Software reset complete", "address 0x", "HW version",
         "/dev/xdma0", "register access",
+        # Per-op core-function compile logs (DRAM-core-cleanup naming; keep in
+        # sync with user_dma_core.py so the compile phase stays quiet).
+        "unified_attention_core", "outer loop body size", "while-loop body size",
+        "phased loop sizes", "loop body=", "single-strip straight-line",
+        # Per-step program-execute / latency / DMA chatter (fires every decode
+        # step). Matches how the other models go quiet during compile+decode;
+        # errors, warnings and the progress dots still pass through.
+        "Execute program start", "Program started",
+        "Total program execution latency", "Report FLOPS",
+        "Instruction count:", "Latency in cycles",
+        "program instructions to DRAM", "[DMA cache hit]",
+        "Please consider using DeviceTensor",
+        "total_size:", "memcpy_length_bytes", "stride_bytes_per_chunk",
+        "stride_jump_bytes", "Using program DRAM address",
+        "Using provided program DRAM address", "flops:",
+        "scale bytes", "Quantized matrix and scales",
     )
 
     def __init__(self, dest):
@@ -3949,18 +3965,6 @@ def generate(ue: Qwen3_5_2b_UnifiedEngine, tokenizer,
 # falls back to the unrolled multi-capture cascade. See notes_qwen3.5_2b.md.
 # Reuses this module's _bf / _upload_fp4 / quantize_fp4_64.
 # ============================================================================
-def _ln_pbi_nchunks(M: int, N: int, has_gamma: bool = True, has_beta: bool = True) -> int:
-    """Replicate layer_norm_core_dram_pbi's chunk math. The PBI layernorm's
-    gpr_M_reg must be primed with the CHUNK COUNT (M // chunk_size), NOT M
-    (unlike matmat_mul_core whose gpr_M_reg is the row count). Getting this
-    wrong over-runs the row loop and produces garbage."""
-    ops_per_row = 4 + (1 if has_gamma else 0) + (1 if has_beta else 0)
-    max_chunk_from_icache = (256 - 4) // ops_per_row
-    chunk_size = min(URAM_NEAR_FULL_ELEMENTS // N, M, max_chunk_from_icache)
-    while M % chunk_size != 0:
-        chunk_size -= 1
-    return M // chunk_size
-
 def _read_dram_bf16(ue, dram_addr: int, shape) -> torch.Tensor:
     nelem = 1
     for d in shape:
@@ -4179,6 +4183,11 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     PATCH_W = _upload_bf16(ue, pe_w, HIDDEN * K_PIXEL)
     PATCH_B = _upload_bf16(ue, pe_b, HIDDEN)
     POS     = _upload_bf16(ue, pos_embeds, N_P * HIDDEN)
+    # The synced dynamic LayerNorm core consumes an explicit 1/N vector for
+    # its mean reduction. Keep one shared copy in the deterministic vision
+    # params layout so setup_only recreates it for a prebuilt encoder bin too.
+    VIS_INV_N = _upload_bf16(
+        ue, torch.full((HIDDEN,), 1.0 / HIDDEN, dtype=torch.bfloat16), HIDDEN)
     layer_addrs = []
     for li in range(DEPTH):
         bi = visual.blocks[li]
@@ -4241,19 +4250,15 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     ue.reset_program_dram_addr()       # encoder owns program DRAM (base 0xD0000000)
     prog_base = ue.get_program_dram_addr()
     ue.reset_isa_reg_counter()
-    vis_M      = ue.alloc_isa_reg()   # gpr_M_reg for matmul/norm row count
+    vis_M      = ue.alloc_isa_reg()   # runtime row count for matmul/norm/RoPE
 
     head_stride = head_bytes          # per-head block in Q_PERM/K_PERM/V_PERM/ATTN_OUT
     chunk_elems = 65536
     elems_total = N_P * HIDDEN
-    # PBI LayerNorm's gpr_M_reg = CHUNK COUNT (M//chunk_size), NOT M. All vision
-    # LNs are M=N_P, N=HIDDEN, gamma+beta → one constant n_chunks. Prime a
-    # dedicated reg (priming vis_M=N_P here would over-run the row loop → garbage).
-    vis_ln_chunks = ue.alloc_isa_reg()
-    ln_nchunks = _ln_pbi_nchunks(N_P, HIDDEN)
     # Fallback: Q35_VIS_LN_STATIC=1 → static (legacy) LayerNorm (no gpr_M_reg).
     ln_static = bool(os.environ.get("Q35_VIS_LN_STATIC"))
-    ln_reg = None if ln_static else vis_ln_chunks
+    ln_reg = None if ln_static else vis_M
+    ln_inv_n = None if ln_static else VIS_INV_N
 
     def _emit_residual_add(a_dram, b_dram, out_dram):
         done = 0
@@ -4281,8 +4286,6 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
 
     ue.start_capture()
     ue.generate_instruction_add_set(vis_M, N_P)
-    if not ln_static:
-        ue.generate_instruction_add_set(vis_ln_chunks, ln_nchunks)
 
     # Phase 2: patch_embed + pos.
     ue.matmat_mul_core(M=N_P, K=K_PIXEL, N=HIDDEN,
@@ -4296,7 +4299,8 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
         L = layer_addrs[li]
         ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=BLOCK_OUT,
             OUTPUT_DRAM_ADDR=LN1_OUT, GAMMA_DRAM_ADDR=L["LN1_W"],
-            BETA_DRAM_ADDR=L["LN1_B"], gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS)
+            BETA_DRAM_ADDR=L["LN1_B"], gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS,
+            INV_N_DRAM_ADDR=ln_inv_n)
         ue.matmat_mul_core(M=N_P, K=HIDDEN, N=QKV_DIM,
             A_DRAM_ADDR=LN1_OUT, B_DRAM_ADDR=L["QKV_W_DATA"], OUTPUT_DRAM_ADDR=QKV_OUT,
             C_DRAM_ADDR=L["QKV_B"], bias_mode="broadcast_N",
@@ -4343,7 +4347,8 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
         _emit_residual_add(BLOCK_OUT, ATTN_PROJ, POST_ATTN)
         ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=POST_ATTN,
             OUTPUT_DRAM_ADDR=LN2_OUT, GAMMA_DRAM_ADDR=L["LN2_W"],
-            BETA_DRAM_ADDR=L["LN2_B"], gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS)
+            BETA_DRAM_ADDR=L["LN2_B"], gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS,
+            INV_N_DRAM_ADDR=ln_inv_n)
         ue.matmat_mul_core(M=N_P, K=HIDDEN, N=MLP_INT,
             A_DRAM_ADDR=LN2_OUT, B_DRAM_ADDR=L["FC1_W_DATA"], OUTPUT_DRAM_ADDR=FC1_GELU_OUT,
             C_DRAM_ADDR=L["FC1_B"], bias_mode="broadcast_N",
@@ -4359,7 +4364,7 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     # Phase 4: merger (spatial-merge implicit via M=N_M, K=K_FC reshape).
     ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=BLOCK_OUT,
         OUTPUT_DRAM_ADDR=MG_LN_OUT, GAMMA_DRAM_ADDR=MG_LN_W, BETA_DRAM_ADDR=MG_LN_B,
-        gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS)
+        gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS, INV_N_DRAM_ADDR=ln_inv_n)
     ue.generate_instruction_add_set(vis_M, N_M)
     ue.matmat_mul_core(M=N_M, K=K_FC, N=K_FC,
         A_DRAM_ADDR=MG_LN_OUT, B_DRAM_ADDR=MG_FC1_D, OUTPUT_DRAM_ADDR=MG_FC1_OUT,

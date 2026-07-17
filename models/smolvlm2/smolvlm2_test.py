@@ -285,6 +285,14 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self.vis_zeros_addr = self.get_params_dram_addr()
         self.dma_write(DMA_DEVICE_H2C, self.vis_zeros_addr, torch.zeros(_vz, dtype=torch.bfloat16), _vz * 2)
         self.allocate_params_dram(_vz * 2)
+        # The synced dynamic LayerNorm core requires an explicit 1/N vector.
+        # Store one shared copy in params DRAM so params.bin restores the exact
+        # operand baked into the encoder program.
+        self.vis_inv_n_addr = self.get_params_dram_addr()
+        self.dma_write(
+            DMA_DEVICE_H2C, self.vis_inv_n_addr,
+            torch.full((_vz,), 1.0 / _vz, dtype=torch.bfloat16), _vz * 2)
+        self.allocate_params_dram(_vz * 2)
         # Shared zero page for diagnostic device-side clears inside the decoder instruction stream.
         # Keep it in params DRAM so load_snapshot() restores it and the clear mode does not depend on
         # runtime tensor_init() side effects.
@@ -511,31 +519,19 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
 
         12 structurally-identical SigLIP layers, UNROLLED, with every per-row op a PBI hardware loop so
         the captured bin is structure-bound, not M-bound. No ``gpr_B_reg`` / layer-body sharing (that
-        needed a non-released ``matmat_mul_core`` extension — reverted). The two PBI row counts have
-        DIFFERENT meaning so they need two primed registers: ``matmat``/``eltwise`` ``gpr_M_reg`` is the
-        row count (= S); ``layer_norm`` ``gpr_M_reg`` is the *chunk* count (= S // chunk_size). §7 shared
-        flash + the strided-DMA fused head transpose are kept as-is.
+        needed a non-released ``matmat_mul_core`` extension — reverted). The synced dynamic cores all
+        consume the actual runtime row count in ``gpr_M_reg``. §7 shared flash + the strided-DMA
+        fused head transpose are kept as-is.
         """
         from user_dma_core import TYPE
         S, H, D, N_HEADS, I = 1024, 768, 64, 12, 3072
         bpe = 2
 
-        # layer_norm_core_dram_pbi chunking (replicated from the engine so we prime n_chunks correctly):
-        # ops_per_row = 4 + gamma + beta = 6; max_chunk = (256-4)//6; ideal = min(URAM//N, S, max_chunk);
-        # then the largest divisor of S that is <= ideal. All encoder LNs share M=S, N=H, gamma+beta.
-        _ln_ops_per_row = 6
-        _ln_chunk = min(URAM_NEAR_FULL_ELEMENTS // H, S, (256 - 4) // _ln_ops_per_row)
-        while S % _ln_chunk != 0:
-            _ln_chunk -= 1
-        ln_n_chunks = S // _ln_chunk
-
         self.start_capture()
 
-        # PBI row counts, primed once. vis_S_reg = S rows (matmat/eltwise); vis_ln_chunks = S//chunk (LN).
+        # Shared runtime row count for matmul, LayerNorm, and attention.
         vis_S_reg = self.alloc_isa_reg()
-        vis_ln_chunks = self.alloc_isa_reg()
         self.generate_instruction_add_set(vis_S_reg, S)
-        self.generate_instruction_add_set(vis_ln_chunks, ln_n_chunks)
 
         # === Patch embedding: pixels → [1024, 768] ===
         P = 16
@@ -558,8 +554,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
             # LN1 (PBI)
             self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['ln1_weight'], BETA_DRAM_ADDR=la['ln1_bias'], gpr_M_reg=vis_ln_chunks,
-                ZEROS_DRAM_ADDR=self.vis_zeros_addr)
+                GAMMA_DRAM_ADDR=la['ln1_weight'], BETA_DRAM_ADDR=la['ln1_bias'], gpr_M_reg=vis_S_reg,
+                ZEROS_DRAM_ADDR=self.vis_zeros_addr, INV_N_DRAM_ADDR=self.vis_inv_n_addr)
             # Q/K/V projections (PBI)
             for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
                 vis_matmul(S, H, H, self.VIS_LN_OUT_DRAM, la, proj, dst, bias=la[f'{proj}_bias'])
@@ -590,8 +586,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
                 OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
             self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['ln2_weight'], BETA_DRAM_ADDR=la['ln2_bias'], gpr_M_reg=vis_ln_chunks,
-                ZEROS_DRAM_ADDR=self.vis_zeros_addr)
+                GAMMA_DRAM_ADDR=la['ln2_weight'], BETA_DRAM_ADDR=la['ln2_bias'], gpr_M_reg=vis_S_reg,
+                ZEROS_DRAM_ADDR=self.vis_zeros_addr, INV_N_DRAM_ADDR=self.vis_inv_n_addr)
             # MLP: fc1 + GELU, fc2, residual
             vis_matmul(S, H, I, self.VIS_LN_OUT_DRAM, la, 'fc1', self.VIS_MLP_INTER_DRAM, bias=la['fc1_bias'], gelu_enable=True)
             vis_matmul(S, I, H, self.VIS_MLP_INTER_DRAM, la, 'fc2', self.VIS_MLP_OUT_DRAM, bias=la['fc2_bias'])
@@ -601,8 +597,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # Post-layernorm (PBI), pixel shuffle, connector (M=64, static).
         final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
         self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
-            GAMMA_DRAM_ADDR=self.vis_post_ln_weight, BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=vis_ln_chunks,
-            ZEROS_DRAM_ADDR=self.vis_zeros_addr)
+            GAMMA_DRAM_ADDR=self.vis_post_ln_weight, BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=vis_S_reg,
+            ZEROS_DRAM_ADDR=self.vis_zeros_addr, INV_N_DRAM_ADDR=self.vis_inv_n_addr)
         smart_bf16_permute_core(self, dims=[8, 4, 8, 4, H], permute_indices=[0, 2, 1, 3, 4],
             input_dram_addr=self.VIS_POST_LN_DRAM, output_dram_addr=self.VIS_SHUFFLED_DRAM,
             params_dram_addr=self.PERMUTE_PARAMS_DRAM, temp_dram_start=self.PERMUTE_TEMP_DRAM)
@@ -611,7 +607,6 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.VIS_CONNECTOR_DRAM)
 
         self.generate_instruction_halt()
-        self.release_isa_reg()  # vis_ln_chunks
         self.release_isa_reg()  # vis_S_reg
         self.stop_capture()
         all_bytes = bytearray()
@@ -846,7 +841,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         uni_meta = os.path.join(bin_dir, f"programs{artifact_suffix}.json")
         sig = {"prefill_max_seq_len": self.PREFILL_MAX_SEQ_LEN, "num_layers": self.NUM_LAYERS,
                "num_vis_layers": len(self.vis_layer_addrs),
-               "encoder_ln": "shared_zeros",
+               "encoder_ln": "dynamic_rows_shared_zeros_inv_n_v2",
                "vision_attention_impl": "unified_attention_core_dynamic",
                "decoder_attention_use_pbi": False,
                "decoder_attention_impl": "unified_attention_core",
@@ -858,8 +853,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             with open(uni_meta) as f:
                 meta = json.load(f)
             if all(meta.get(k) == v for k, v in sig.items()) and "segments" in meta:
-                # No LN-zeros replay: the shared vis_zeros_addr buffer is part of the weights snapshot
-                # (seeded in weight_init), so load_snapshot already restored it (Trick 9).
+                # Shared LayerNorm zeros and 1/N are part of the weights snapshot,
+                # so load_snapshot already restored both operands.
                 with open(uni_bin, "rb") as f:
                     raw = f.read()
                 self._loaded_artifact_sha256 = hashlib.sha256(raw).hexdigest()
@@ -1216,6 +1211,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             "LAYER0_MLP_GATE_DRAM", "LAYER0_MLP_UP_DRAM", "LAYER0_MLP_MULT_DRAM",
             "LAYER0_MLP_DOWN_DRAM", "FINAL_NORM_DRAM", "LOGITS_DRAM", "PENALTY_BIAS_DRAM",
             "CAUSAL_MASK_DRAM", "DECODE_BIAS_DRAM",
+            "vis_zeros_addr", "vis_inv_n_addr",
             "device_attn_clear_zero_addr", "device_attn_clear_zero_bytes",
             "VIS_PIXEL_IN_DRAM", "VIS_PATCH_PERM_DRAM", "VIS_PATCH_PROJ_DRAM",
             "VIS_IO_A_DRAM", "VIS_IO_B_DRAM", "VIS_LN_OUT_DRAM",
@@ -1271,8 +1267,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             return False
         # Self-heal stale snapshots: ones dumped before LM weight addresses were saved lack
         # these keys and would crash run_prefill. Force a recompile + fresh dump instead.
-        if "lm_layer_addrs" not in meta or "final_norm_addr" not in meta:
-            _original_print("  Snapshot stale (missing LM addresses) — recompiling.")
+        if ("lm_layer_addrs" not in meta or "final_norm_addr" not in meta
+                or "vis_inv_n_addr" not in meta):
+            _original_print("  Snapshot stale (missing required model addresses) — recompiling.")
             return False
         total = meta["params_size"]
         CHUNK = 1 * 1024 * 1024

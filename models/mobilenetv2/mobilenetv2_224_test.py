@@ -64,13 +64,11 @@ _BPE = 2  # bf16 bytes per element
 
 # MobileNetV2 uses ReLU6 (clamp 0..6). The UE's LALU_MODE.CLAMP performs
 # max(a, min(x, b)) where a, b are bf16 fields baked into each instruction.
-# matmat_mul_core's `clamp_enable=True` does select LALU CLAMP, but reads its
-# bounds from module-level constants `LALU_CLAMP_RELU_A` (0.0) and
-# `LALU_CLAMP_RELU_B` (+inf) — i.e. plain ReLU. We override `LALU_CLAMP_RELU_B`
-# to 6.0 in MobileNetV2_UnifiedEngine.__init__ so `clamp_enable=True` becomes
-# ReLU6 for our matmuls. The override happens before compile_full_fused, so
-# every emitted matmul instruction carries lalu_b=6.0 (bf16 0x40C0).
-LALU_BF16_SIX = 0x40C0   # 6.0 in bf16 (float32 0x40C00000 truncated to top 16 bits)
+# matmat_mul_core's `clamp_enable=True` selects LALU CLAMP; the bounds come from
+# the `clamp_min` (default 0.0) and `clamp_max` (default +inf) kwargs. We pass
+# `clamp_max=6.0` at every ReLU6 matmul call so the clamp is ReLU6 rather than
+# plain ReLU. (Older library versions read these bounds from module constants
+# `LALU_CLAMP_RELU_A`/`LALU_CLAMP_RELU_B`; the synced core takes them as kwargs.)
 
 # ---------------------------------------------------------------------------
 # Helper ops (built on top of UnifiedEngine primitives)
@@ -105,9 +103,8 @@ def conv2d_1x1_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: i
                     H: int, W: int, C_in: int, C_out: int,
                     relu6_enable: bool = False) -> None:
     """Conv2d(kernel=1) = matmul. HWC layout. Weight (C_out, C_in).
-    relu6_enable -> clamp_enable on the matmul. The upper-bound bf16 value
-    (6.0 instead of +inf) is set via the LALU_CLAMP_RELU_B monkey-patch in
-    MobileNetV2_UnifiedEngine.__init__.
+    relu6_enable -> clamp_enable on the matmul, with clamp_max=6.0 passed so
+    the clamp is ReLU6 (upper bound 6.0) rather than plain ReLU (+inf).
 
     PBI: if ``ue._pbi_M_reg`` is set (a GPR index 1..15), the matmul's M-tile
     loop trip count is taken from that register at runtime instead of being
@@ -131,7 +128,7 @@ def conv2d_1x1_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: i
         A_DRAM_ADDR=INPUT_DRAM_ADDR, B_DRAM_ADDR=WEIGHT_DRAM_ADDR,
         OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
         C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="broadcast_N",
-        clamp_enable=relu6_enable,
+        clamp_enable=relu6_enable, clamp_max=6.0,
         gpr_M_reg=gpr_M_reg,
     )
 
@@ -175,7 +172,7 @@ def conv2d_3x3_stride2_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM
                 B_DRAM_ADDR=WEIGHT_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR + (h_out * W_out + w_start) * C_out * _BPE,
                 C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="broadcast_N",
-                clamp_enable=relu6_enable)
+                clamp_enable=relu6_enable, clamp_max=6.0)
 
 
 def conv2d_3x3_dw_tapwise_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
@@ -307,8 +304,7 @@ def conv2d_3x3_dw_tapwise_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
         # (2) ReLU6: in-place clamp matmul (M=H_out*W_out, K=64, N=64). A @ I
         #     yields A bit-exactly (0.0 and 1.0 are both exact bf16), so the
         #     only real effect is the LALU CLAMP on the output, applying
-        #     ReLU6 with bounds (0, 6.0) from the LALU_CLAMP_RELU_B
-        #     monkey-patch in __init__.
+        #     ReLU6 with bounds (0, 6.0) via clamp_max=6.0.
         if relu6_enable:
             ue.matmat_mul_core(
                 M=H_out * W_out, K=BLK, N=BLK,
@@ -316,7 +312,7 @@ def conv2d_3x3_dw_tapwise_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_D
                 B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=ACC_DRAM_ADDR,
                 C_DRAM_ADDR=None, bias_mode="broadcast_N",
-                clamp_enable=True,
+                clamp_enable=True, clamp_max=6.0,
             )
 
         # (3) Strided scatter from contiguous scratch to OUTPUT_DRAM at the
@@ -551,14 +547,6 @@ class MobileNetV2_UnifiedEngine(UnifiedEngine):
         super().__init__(params_dram_base=MBV2_PARAMS_BASE,
                          tensor_dram_base=MBV2_TENSOR_BASE,
                          program_dram_base=MBV2_PROGRAM_BASE)
-
-        # Monkey-patch the bf16 upper bound that matmat_mul_core's clamp_enable
-        # uses. The wrapper reads `LALU_CLAMP_RELU_B` from user_dma_core's
-        # module namespace at instruction-emit time, so updating it here
-        # (before compile_full_fused) makes every emitted matmul with
-        # clamp_enable=True carry lalu_b=6.0 — i.e. ReLU6 instead of ReLU.
-        # No edits to user_dma_core.py.
-        user_dma_core.LALU_CLAMP_RELU_B = LALU_BF16_SIX
 
         cfg = self.load_config(script_dir=script_dir)
         self.cfg = cfg
