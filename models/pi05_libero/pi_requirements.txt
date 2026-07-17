@@ -2,17 +2,26 @@
 # AND the LIBERO simulator in ONE process -- no socket, no server/client.
 #
 #   conda create -n pi05_libero python=3.11 -y && conda activate pi05_libero
-#   pip install -r requirements.txt
-#   # LIBERO source itself (scenes/BDDL/benchmark API), editable:
+#   pip install -r pi_requirements.txt
+#   python pi05_libero_test.py          # downloads + exports weights on first run
+#
+#   # LIBERO source itself (scenes/BDDL/benchmark API) -- only needed for
+#   # libero_eval.py, NOT for pi05_libero_test.py. Not on PyPI, install editable:
 #   pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
 #   # one-time: seed LIBERO's config (answers its interactive first-run prompt with defaults)
 #   printf 'N\n' | python -c "import sys; sys.path.insert(0,'<...>/third_party/libero'); import libero.libero"
 #
 # Headless rendering needs EGL:  export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 #
-# NOTE: numpy<2 is required by BOTH the engine and robosuite/libero, so the two
-# worlds coexist. CPU torch is fine -- the model runs on the FPGA, not the GPU
-# (GPU torch is only needed for the optional --verify-denoise reference).
+# TWO PINS THAT ARE LOAD-BEARING -- do not "upgrade" either:
+#   numpy<2   robosuite/gym 0.25 break on numpy 2.x. This is what lets the sim and
+#             user_dma_core coexist in ONE interpreter.
+#   torch     CPU torch is fine here -- the model runs on the FPGA, not the GPU.
+#             BUT the pi05_torch_ref GPU reference (--verify-denoise, and
+#             libero_eval.py --backend torch) needs CUDA. On Blackwell (sm_120,
+#             e.g. RTX 5070) that means cu128 specifically: swap the index below
+#             to https://download.pytorch.org/whl/cu128 and pin torch==2.8.0+cu128.
+#             Stock PyPI torch is CPU-only there and silently gives cuda=False.
 
 # ---- unified-engine base (clone of ../../requirements.txt) ----
 --extra-index-url https://download.pytorch.org/whl/cpu
@@ -26,28 +35,30 @@ huggingface-hub>=0.20.0
 pillow>=12.1.1
 sentencepiece
 
-# ---- weight export (prep phase only; see pi05_libero_export_weights.py) ----
+# ---- weight export (first run only; ensure_weights_export() in the test file) ----
 # openpi proper is NOT installable from PyPI: the name resolves, but only to a
 # 0.0.0 stub ("Reserved package name for future use by Physical Intelligence")
 # with no code in it, so a bare `openpi` line silently installs nothing and then
-# fails at import. It has to come from git. (openpi-client on PyPI is real but is
-# only the websocket policy client -- it has neither shared.download.maybe_download
-# nor models.model.restore_params, which is what the exporter calls.)
+# fails at import. It has to come from git. (openpi-client below is a DIFFERENT,
+# real package -- the websocket policy client. It has neither
+# shared.download.maybe_download nor models.model.restore_params, so it is NOT a
+# substitute for openpi proper.)
 #
 # This pulls jax/jaxlib/orbax/flax, and jax-cuda12-plugin brings its own nvidia-*
-# CUDA wheels that can collide with torch's cu128 set. It is only needed ONCE, to
-# turn the openpi JAX checkpoint into weights_export/*.npy: pi05_libero_test.py
-# calls ensure_weights_export() on first run, which imports the exporter and does
-# the download+export automatically. After that the FPGA + sim runtime never
-# imports jax (or openpi) again -- the export is detected and the step skipped.
-# It stays in this file so the documented two-command flow works unassisted:
-#   pip install -r requirements.txt && python pi05_libero_test.py
+# CUDA wheels that can collide with a cu128 torch set. It is only needed ONCE, to
+# turn the openpi JAX checkpoint into pi05_libero_bin/weights_export/*.npy:
+# pi05_libero_test.py calls ensure_weights_export() on first run and does the
+# download+export automatically. Every run after that detects the export and
+# skips the step -- jax is never imported again. It stays in this file so the
+# documented two-command flow works unassisted:
+#   pip install -r pi_requirements.txt && python pi05_libero_test.py
 openpi @ git+https://github.com/Physical-Intelligence/openpi
 
 # ---- LIBERO simulator (robosuite/mujoco) + its runtime deps ----
 robosuite==1.4.1
 mujoco==3.2.3
 bddl==1.0.1
+gym==0.25.2
 opencv-python
 imageio
 imageio-ffmpeg
@@ -59,4 +70,5 @@ future
 matplotlib
 einops
 cloudpickle
-gym==0.25.2
+PyOpenGL              # EGL headless rendering (PYOPENGL_PLATFORM=egl)
+openpi-client         # libero_eval.py: `from openpi_client import image_tools`
