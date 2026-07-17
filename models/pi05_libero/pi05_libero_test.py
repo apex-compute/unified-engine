@@ -89,11 +89,11 @@ pi05_libero needs the upstream openpi checkpoint to export its weights, but
 `openpi` is not importable in this environment.
 
 Install this model's dependencies:
-    cd models/pi05_libero && pip install -r requirements.txt
+    cd models/pi05_libero && pip install -r pi_requirements.txt
 
-That requirements.txt is the merged env spec for pi05_libero (engine + openpi +
+That pi_requirements.txt is the merged env spec for pi05_libero (engine + openpi +
 libero/robosuite, numpy<2 pinned for all three). openpi is NOT on PyPI under that
-name -- the PyPI `openpi` package is an empty 0.0.0 placeholder, so requirements.txt
+name -- the PyPI `openpi` package is an empty 0.0.0 placeholder, so pi_requirements.txt
 pulls the real one from git.
 
 Then re-run this script: the export runs once (~13 GB, from the openpi checkpoint
@@ -103,12 +103,100 @@ Underlying import error: {err}
 """
 
 
+def _import_openpi():
+    """Import openpi, or raise ImportError carrying ONLY the raw cause.
+
+    openpi is needed exactly once (the weight export) and is NOT importable in a
+    plain runtime env unless pi_requirements.txt was installed -- it pulls the real
+    package from git, since PyPI's `openpi` is an empty 0.0.0 placeholder stub.
+    """
+    try:
+        from openpi.models.model import restore_params
+        from openpi.shared.download import maybe_download
+    except ImportError as err:
+        raise ImportError(str(err)) from err
+    return maybe_download, restore_params
+
+
+def _flatten_params(tree, prefix=""):
+    """Flatten a params PyTree (nested dicts) to {dotted_name: np.ndarray}."""
+    flat = {}
+    for key, value in tree.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(_flatten_params(value, prefix=f"{name}."))
+        else:
+            flat[name] = np.asarray(value)
+    return flat
+
+
+def _canonical_name(name):
+    """Checkpoint leaf name -> manifest key.
+
+    Strips a trailing ``.value`` (orbax wraps every leaf) and a leading ``params.``:
+      params.PaliGemma.img.Transformer.encoder_norm.bias.value
+        -> PaliGemma.img.Transformer.encoder_norm.bias
+    Verified 1:1 against the checkpoint: 51 leaves <-> 51 manifest entries.
+    """
+    if name.endswith(".value"):
+        name = name[: -len(".value")]
+    if name.startswith("params."):
+        name = name[len("params.") :]
+    return name
+
+
+def _restore_flat_params(cfg):
+    """Resolve the checkpoint (downloading if needed) and return {name: np.ndarray}."""
+    maybe_download, restore_params = _import_openpi()
+    ckpt_url = cfg["paths"]["openpi_checkpoint"]
+    _original_print(f"[export] resolving checkpoint: {ckpt_url}")
+    ckpt_dir = maybe_download(ckpt_url)          # cached under ~/.cache/openpi, idempotent
+    params_path = Path(ckpt_dir) / "params"
+    _original_print(f"[export] restoring params from: {params_path}")
+    params = restore_params(params_path, restore_type=np.ndarray)
+
+    flat = {}
+    for raw_name, arr in _flatten_params(params).items():
+        name = _canonical_name(raw_name)
+        if name in flat:
+            raise RuntimeError(f"[export] duplicate name after canonicalization: {name}")
+        flat[name] = np.asarray(arr)
+    _original_print(f"[export] {len(flat)} leaves restored")
+    return flat
+
+
+def _do_export(cfg, out_dir):
+    """Write every checkpoint tensor to out_dir as .npy + a manifest.json.
+
+    Tensors are stored EXACTLY as the checkpoint has them (JAX-style (in, out)
+    layout); _npy()'s consumers transpose at load time. Do NOT transpose here.
+    """
+    flat = _restore_flat_params(cfg)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {}
+    total_bytes = 0
+    for name in sorted(flat):
+        arr = flat[name]
+        np.save(out_dir / f"{name}.npy", arr, allow_pickle=False)
+        manifest[name] = {"shape": list(arr.shape), "dtype": str(arr.dtype),
+                          "file": f"{name}.npy"}
+        total_bytes += arr.nbytes
+        _original_print(f"[export]   {name}  {tuple(arr.shape)}  {arr.dtype}")
+
+    with open(out_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+    _original_print(f"[export] wrote manifest.json ({len(manifest)} entries)")
+    _original_print(f"[export] done -> {out_dir}  ({total_bytes / 1e9:.2f} GB)")
+    return manifest
+
+
 def ensure_weights_export(script_dir=None):
     """Lazily materialize ``weights_export/`` on first run (mirrors nn_lib.ensure_hf_model).
 
     No-op -- and provably read-only -- when the export is already complete: it only
     stats manifest.json and the files it lists. Otherwise it downloads the openpi
-    checkpoint (cached in ~/.cache/openpi, idempotent) and runs the exporter.
+    checkpoint (cached in ~/.cache/openpi, idempotent) and exports it.
     """
     wdir = _weights_export_dir(script_dir)
     complete, manifest = _weights_export_complete(wdir)
@@ -128,22 +216,14 @@ def ensure_weights_export(script_dir=None):
         "\n              This happens ONCE. Subsequent runs detect the export and skip it."
         "\n" + "=" * 78 + "\n")
 
-    _here = os.path.dirname(os.path.abspath(__file__))
-    if _here not in sys.path:
-        sys.path.insert(0, _here)
+    # _import_openpi raises ImportError carrying ONLY the raw cause, so
+    # _OPENPI_MISSING_MSG renders exactly one set of install instructions.
     try:
-        import pi05_libero_export_weights as _exporter
-    except ImportError as err:  # pragma: no cover - defensive
-        raise RuntimeError(_OPENPI_MISSING_MSG.format(err=err)) from err
-    # _import_openpi raises ImportError carrying ONLY the raw cause (SystemExit kept for
-    # older exporter revisions), so _OPENPI_MISSING_MSG renders once instead of wrapping
-    # the exporter's own help text and printing two competing sets of instructions.
-    try:
-        _exporter._import_openpi()
-    except (ImportError, SystemExit) as err:
+        _import_openpi()
+    except ImportError as err:
         raise RuntimeError(_OPENPI_MISSING_MSG.format(err=err)) from err
 
-    _exporter.do_export(_exporter.load_config(), Path(wdir))
+    _do_export(_CFG, wdir)
 
     complete, _ = _weights_export_complete(wdir)
     if not complete:
@@ -183,7 +263,7 @@ class _DebugStop(Exception):
 
 
 def init_hang_prevention(ue):
-    """5-step hardware clear. MUST stay identical to run_from_bin.py (see skill gotchas)."""
+    """5-step hardware clear. MUST stay identical to Pi05Libero_Run's path (see skill gotchas)."""
     halt = bytes(64)
     ue.dma_write(DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, halt, len(halt))
     print("[Init] HALT written to instruction DRAM base")
@@ -589,7 +669,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     def _tensor_init_vision(self):
         """Allocate vision-encoder activation/scratch DRAM. Appended at the END of
         tensor_init (after all LM buffers) so no earlier LM buffer address shifts
-        (run_from_bin.py must mirror this ordering — see skill gotchas)."""
+        (Pi05Libero_Run must mirror this ordering — see skill gotchas)."""
         bpe = 2
         H, NH, D, DP, I, IP, S = (self.VIS_H, self.VIS_NH, self.VIS_D, self.VIS_DP,
                                    self.VIS_I, self.VIS_I_PAD, self.VIS_S)
@@ -3164,7 +3244,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         return prog_addr
 
     # ------------------------------------------------------------------
-    # Binary dump (for pi05_libero_run_from_bin.py)
+    # Binary dump (consumed by Pi05Libero_Run below)
     # ------------------------------------------------------------------
 
     def dump_params_to_file(self, bin_dir):
@@ -3354,6 +3434,293 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         return prog_addr
 
 
+# ======================================================================================
+# Bin-backed engine: inference from pre-compiled bins (no weight unpack, no compile).
+# ======================================================================================
+#
+# WHY THIS SUBCLASSES THE ENGINE (rather than re-implementing it, as qwen3's
+# fully-self-contained run_from_bin template does):
+#   * pi05's engine is ~3300 lines across three stacks (SigLIP vision encoder, Gemma-2B
+#     prefix LM, Gemma-300M action expert). A weight-free re-implementation is not
+#     realistic to keep in sync with the validated path.
+#   * pi05 CANNOT regenerate params.bin from HF: the weights come from the offline
+#     weights_export/*.npy tree, so params.bin is a DRAM snapshot (mobilesam's approach)
+#     rather than a re-derivable artifact.
+#
+# WHAT THE BINS BAKE (and why the sig guard refuses rather than adapts):
+# All three programs bake ABSOLUTE jump targets and ABSOLUTE tensor DRAM addresses --
+# the denoise program is statically unrolled to 10 steps x 18 layers = 180 layer bodies
+# with 1440 flash-attention jump sites. Nothing about a compiled program can be
+# retargeted after the fact. A bin set is valid for exactly ONE (prefix_seq_len,
+# denoise_steps, keep_masked_slots, dram-base) combination. On mismatch we REFUSE with
+# an actionable error -- we do NOT pad, do NOT silently recompile, do NOT ship multiple
+# bin sets.
+#
+# HOW EXECUTION IS REUSED (the trick that keeps this small): every compile routes through
+# _compile_once(key, fn), which returns a cached prog_addr and skips compilation on a hit.
+# load_programs() PRE-SEEDS _prog_cache with the bin-loaded addresses, so the stock,
+# validated run_vision()/run_inference() execute as they always do and never compile.
+# No inference logic is duplicated.
+
+# Program load order is load-bearing: program DRAM is a bump allocator, so replaying
+# encoder -> prefix -> denoise is what reproduces the absolute addresses the programs
+# were compiled against. MUST match dump_programs_to_file's write order.
+_PROGRAM_ORDER = ("encoder", "prefix", "denoise")
+
+
+class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
+    """Bin-backed pi05_libero engine. Inherits the entire validated inference path;
+    only weight loading and program provisioning are replaced."""
+
+    def __init__(self, bin_dir=None, **kw):
+        self.bin_dir = bin_dir or BIN_DIR
+        meta_path = os.path.join(self.bin_dir, "programs.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(
+                f"No compiled bins at {self.bin_dir} (missing programs.json).\n"
+                f"Generate them first with a full run of the golden path:\n"
+                f"    python {os.path.abspath(__file__)}")
+        with open(meta_path) as f:
+            self._manifest = json.load(f)
+        self.sig = self._manifest["sig"]
+        super().__init__(**kw)
+
+        # --- sig guard, part 1: everything knowable before the model sees an obs ---
+        # (part 2 -- prefix_seq_len -- can only be checked once vision has told us how
+        # many image rows this obs actually produced; see embed_and_concat_prefix.)
+        self._sig_check("denoise_steps", int(self.AE_NUM_DENOISE_STEPS),
+                        int(self.sig["denoise_steps"]),
+                        "pass --steps to match, or regenerate the bins")
+        self._sig_check("keep_masked_slots", bool(self.KEEP_MASKED_SLOTS),
+                        bool(self.sig["keep_masked_slots"]),
+                        "toggle --keep-masked-slots to match, or regenerate the bins")
+        for _name, _live in (("program_dram_base", self._program_dram_base),
+                             ("tensor_dram_base", self._tensor_dram_base),
+                             ("params_dram_base", self._params_dram_base)):
+            self._sig_check(_name, hex(_live), self.sig[_name],
+                            "pi05_libero_config.json's dram_layout changed since the bins "
+                            "were compiled -- regenerate the bins")
+
+        # PREFIX_SEQ_LEN is normally set by compile_prefix, which never runs here.
+        # tensor_init_action_expert reads it (P -> Tkv -> every AE buffer size), so it
+        # must be restored from the sig BEFORE that runs, or the AE buffers get sized
+        # for the getattr default of 1024 and land at addresses the denoise program
+        # does not reference.
+        self.PREFIX_SEQ_LEN = int(self.sig["prefix_seq_len"])
+
+        # Vision geometry that _weight_init_vision normally derives and publishes
+        # (see _BIN_DERIVED_ATTRS). weight_init() below replaces that whole path with a
+        # params.bin restore, so these would never exist -- yet tensor_init ->
+        # _tensor_init_vision reads them within milliseconds of construction. Restored
+        # verbatim from the dump (NOT recomputed from config) so they always match what
+        # the loaded programs were compiled against.
+        derived = self._manifest.get("derived")
+        if not derived:
+            raise RuntimeError(
+                f"\n*** Bin set at {self.bin_dir} predates the `derived` block ***\n"
+                f"  programs.json has no derived vision geometry, so this engine cannot\n"
+                f"  reconstruct VIS_* without the weights_export unpack.\n"
+                f"  Regenerate:  rm -f {os.path.join(self.bin_dir, '*.bin')} "
+                f"{os.path.join(self.bin_dir, '*.json')} && "
+                f"python {os.path.abspath(__file__)}\n"
+                f"  (Do NOT rm -rf the bin dir: weights_export/ lives inside it.)\n")
+        missing = [a for a in _BIN_DERIVED_ATTRS if a not in derived]
+        if missing:
+            raise RuntimeError(
+                f"bin set at {self.bin_dir} is missing derived attrs {missing} "
+                f"(stale bin set -- regenerate)")
+        for _a, _v in derived.items():
+            setattr(self, _a, _v)
+
+    # ------------------------------------------------------------------
+    # sig guard
+    # ------------------------------------------------------------------
+
+    def _sig_check(self, name, live, want, hint):
+        if live != want:
+            raise RuntimeError(
+                f"\n*** REFUSING TO RUN: pre-compiled bins do not match this run ***\n"
+                f"  {name}: bins were compiled for {want!r}, this run wants {live!r}\n"
+                f"  bins: {self.bin_dir}\n"
+                f"  The compiled programs bake absolute jump targets and absolute tensor\n"
+                f"  DRAM addresses; they CANNOT be adapted to a different {name}.\n"
+                f"  Fix: {hint}.\n"
+                f"  Regenerate with:  rm -f {os.path.join(self.bin_dir, '*.bin')} "
+                f"{os.path.join(self.bin_dir, '*.json')} && "
+                f"python {os.path.abspath(__file__)}\n"
+                f"  (Do NOT rm -rf the bin dir: weights_export/ lives inside it.)\n")
+
+    # ------------------------------------------------------------------
+    # Weights / params
+    # ------------------------------------------------------------------
+
+    def weight_init(self):
+        """Replaces the weights_export unpack with a params.bin DRAM restore.
+
+        The ONE thing still read from weights_export is the token embedding table: it is
+        a HOST-side gather table (embed_and_concat_prefix indexes it per obs), never a
+        params-DRAM resident, so it is not in params.bin and cannot be. Read-only.
+        """
+        self.embedding_table = self._npy(
+            "PaliGemma.llm.embedder.input_embedding").to(torch.bfloat16)
+        self.load_params()
+
+    def load_params(self):
+        """Restore the params DRAM snapshot and rewind the params allocator to the
+        post-weight_init boundary."""
+        bin_path = os.path.join(self.bin_dir, "params.bin")
+        meta_path = os.path.join(self.bin_dir, "params.json")
+        for p in (bin_path, meta_path):
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"missing {p} -- regenerate the bins")
+        with open(meta_path) as f:
+            total = json.load(f)["size"]
+        actual = os.path.getsize(bin_path)
+        assert actual == total, (
+            f"params.bin is {actual}B but params.json declares {total}B -- truncated or "
+            f"stale bin set; regenerate.")
+        CHUNK = self.DMA_CHUNK_BYTES
+        with open(bin_path, "rb") as f:
+            offset = 0
+            while offset < total:
+                data = f.read(min(CHUNK, total - offset))
+                self._dma_write_retry(DMA_DEVICE_H2C, self._params_dram_base + offset,
+                                      data, len(data))
+                offset += len(data)
+
+        # Rewind to the post-weight_init boundary, NOT to `total`. params.bin is dumped
+        # at the END of a full run, so it also contains what tensor_init (identity
+        # matrix), compile_prefix (attn bias, rope tables) and tensor_init_action_expert
+        # allocated afterwards. Those later allocations are replayed below by the very
+        # same methods the golden path uses; if the pointer started at `total` they would
+        # be re-allocated PAST every weight instead of landing back on the addresses the
+        # programs bake. The bytes are all already correct on-device either way -- this
+        # only fixes where the allocator thinks it is.
+        self._next_params_dram_addr = (self._params_dram_base
+                                       + int(self.sig["params_ofs_after_weight_init"]))
+        _original_print(
+            f"  Params: {total / 1024**2:.1f} MB from bin "
+            f"(allocator rewound to +{self.sig['params_ofs_after_weight_init']}B)")
+        return True
+
+    # ------------------------------------------------------------------
+    # Programs
+    # ------------------------------------------------------------------
+
+    def load_programs(self):
+        """DMA the three compiled programs back to DRAM and pre-seed the caches the
+        stock run_vision()/run_inference() consult, so neither ever compiles."""
+        bin_path = os.path.join(self.bin_dir, "programs.bin")
+        if not os.path.exists(bin_path):
+            raise FileNotFoundError(f"missing {bin_path} -- regenerate the bins")
+        with open(bin_path, "rb") as f:
+            blob = f.read()
+
+        cache = self.__dict__.setdefault("_prog_cache", {})
+        meta = self.__dict__.setdefault("_prog_meta", {})
+        for name in _PROGRAM_ORDER:
+            m = self._manifest["programs"][name]
+            data = blob[m["offset"]:m["offset"] + m["size"]]
+            assert len(data) == m["size"], (
+                f"programs.bin truncated: {name} wants {m['size']}B, got {len(data)}B")
+            addr = self.get_program_dram_addr()
+            self._dma_write_retry(DMA_DEVICE_H2C, addr, data, len(data))
+            self.allocate_program_dram(len(data))
+            cache[name] = addr
+            meta[name] = (addr, len(data))
+            _original_print(f"    {name:<8} {len(data):>10}B -> 0x{addr:X}")
+
+        # The first program must land exactly on the program base; if it does not, the
+        # allocator was already advanced and every baked jump target is off.
+        assert cache[_PROGRAM_ORDER[0]] == self._program_dram_base, (
+            f"program allocator was not at its base when load_programs ran "
+            f"(0x{cache[_PROGRAM_ORDER[0]]:X} != 0x{self._program_dram_base:X}) -- "
+            f"every baked absolute jump target would be wrong.")
+
+        # Pre-seed run_inference's compile-once latches so it takes its execute-only
+        # branches. _prefix_bias_dram is the one address that cannot be re-derived: the
+        # bias DATA depends on this obs's valid_len, so run_inference re-DMAs a fresh
+        # bias to the addr baked into the prefix program.
+        self._prefix_prog_addr = cache["prefix"]
+        self._prefix_bias_dram = self._params_dram_base + int(self.sig["prefix_bias_ofs"])
+        self._prefix_compiled = True
+        self._denoise_prog_addr = cache["denoise"]
+        self._denoise_compiled = True
+        _original_print(f"  Programs: {len(blob) / 1024**2:.1f} MB from bin")
+        return dict(cache)
+
+    # ------------------------------------------------------------------
+    # Allocator replay hooks
+    # ------------------------------------------------------------------
+
+    def tensor_init(self, max_seq_len=512):
+        """Run the REAL allocator unchanged, then restore the two prefix K/V cache
+        pointers that compile_prefix normally publishes.
+
+        Load-bearing, and silent if missed: tensor_init_action_expert falls back to
+        allocating a ZERO PLACEHOLDER prefix K/V (36 buffers out of the params arena) if
+        prefix_k_cache_addr is absent. In a bin run compile_prefix never executes, so
+        without this the action expert would (a) attend over zeros instead of the real
+        prefix cache and (b) drag both allocators off-layout, moving every AE buffer away
+        from the addresses the denoise program bakes. Same derivation compile_prefix and
+        load_prefix_kv use -- pure arithmetic over tensor_init's own buffers.
+        """
+        super().tensor_init(max_seq_len)
+        self.prefix_k_cache_addr = [self.LAYER0_K_DRAM + l * self.KV_LAYER_STRIDE
+                                    for l in range(self.NUM_LAYERS)]
+        self.prefix_v_cache_addr = [self.LAYER0_V_DRAM + l * self.KV_LAYER_STRIDE
+                                    for l in range(self.NUM_LAYERS)]
+
+    def tensor_init_action_expert(self):
+        """Restore both bump allocators to their pre-AE positions, then run the REAL
+        allocator unchanged.
+
+        Without this the AE buffers move. In the golden path compile_prefix runs before
+        this and allocates from BOTH the tensor arena (residual/rope buffers) and the
+        params arena (attn bias + rope tables). A bin run never compiles, so both
+        pointers are short by exactly that much, and every AE_* address -- including
+        AE_XT_DRAM, where the noise goes in and the action chunk comes out -- would be
+        computed at an address the denoise program never touches. The failure mode is a
+        finite-but-garbage action chunk, not a crash.
+        """
+        if not getattr(self, "_ae_tensors_inited", False):
+            self._tensor_dram_addr = (self._tensor_dram_base
+                                      + int(self.sig["tensor_ofs_before_ae"]))
+            self._next_params_dram_addr = (self._params_dram_base
+                                           + int(self.sig["params_ofs_before_ae"]))
+        return super().tensor_init_action_expert()
+
+    def embed_and_concat_prefix(self, token_ids, vision_embeddings=None, seq_len=1024):
+        """sig guard, part 2. This is the earliest point prefix_seq_len is known: it is
+        DERIVED from however many vision rows run_vision actually returned (dead camera
+        slots are dropped) plus PREFIX_TEXT_BUDGET. Checked here -- before the prefix or
+        denoise programs execute -- so a mismatched obs refuses instead of running a
+        program compiled for a different sequence length. (run_vision's encoder has
+        already executed by now, but the encoder program is per-image-slot and entirely
+        independent of prefix_seq_len, so that is harmless.)
+        """
+        self._sig_check(
+            "prefix_seq_len", int(seq_len), int(self.sig["prefix_seq_len"]),
+            f"this observation produced {seq_len - self.PREFIX_TEXT_BUDGET} vision rows "
+            f"+ {self.PREFIX_TEXT_BUDGET} text budget = {seq_len} prefix tokens, but the "
+            f"bins were compiled for {self.sig['prefix_seq_len']}. This usually means a "
+            f"different number of live camera slots (a dead/all-zero slot is dropped). "
+            f"Regenerate the bins from an observation with this camera configuration")
+        valid_len = super().embed_and_concat_prefix(token_ids, vision_embeddings, seq_len)
+        # Normally set by compile_prefix (which never runs here). dump_prefix_kv reads it,
+        # so a bin run would AttributeError on the --debug K/V dump without this. The
+        # prefix program is invariant to valid_len -- it only shapes the bias DATA that
+        # run_inference re-DMAs -- so tracking it per obs is correct, not just defensive.
+        self.prefix_valid_len = valid_len
+        return valid_len
+
+    def dump_bins(self, bin_dir):
+        raise RuntimeError(
+            "refusing to re-dump bins from a bin-backed run: this engine never compiled "
+            "anything, so it would only write back what it just loaded (and its allocator "
+            "checkpoints are restored, not measured). Dump from a fresh compile run.")
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -3429,7 +3796,6 @@ def main():
 
     if bins_exist:
         print(f"[main] loading pre-compiled bins from {BIN_DIR} (no weight unpack, no compile)")
-        from pi05_libero_run_from_bin import Pi05Libero_Run
         ue = Pi05Libero_Run(bin_dir=BIN_DIR)
     else:
         ue = Pi05Libero_UnifiedEngine()
