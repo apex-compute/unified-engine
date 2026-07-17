@@ -44,6 +44,7 @@ fresh noise per call -- fine for verification, but say so before quoting a numbe
 import argparse
 import collections
 import functools
+import gc
 import math
 import pathlib
 import sys
@@ -139,17 +140,30 @@ def _fixed_noise32():
 class _TorchBackend:
     """Golden reference: pi05_torch_ref.run_pi05 on GPU (or CPU)."""
 
-    def __init__(self, device, quant):
+    def __init__(self, device, quant, fresh_noise=False):
         import torch
         import pi05_torch_ref as R
         self.torch, self.R = torch, R
         self.device = device
+        self.fresh_noise = fresh_noise
         self.dtype = {"fp32": torch.float32, "bf16": torch.bfloat16,
                       "if4": torch.bfloat16}[quant]
-        print(f"[eval] loading torch reference weights (device={device} quant={quant})...",
-              flush=True)
+        print(f"[eval] loading torch reference weights (device={device} quant={quant} "
+              f"noise={'fresh' if fresh_noise else 'fixed'})...", flush=True)
         self.W = R.Weights(device=device, dtype=self.dtype, quant=quant)
         self.noise32 = torch.from_numpy(_fixed_noise32()).to(device)[None]  # (1,10,32)
+        self._rng = np.random.RandomState(12345)
+
+    def _noise(self):
+        # Real openpi samples FRESH noise per call; pinning it (our default, for
+        # FPGA-vs-ref determinism) makes the policy a deterministic function of the
+        # observation. That is great for paired verification but it is ONE fixed draw
+        # from a stochastic policy, so it is NOT the setting to quote a success rate from.
+        if not self.fresh_noise:
+            return self.noise32
+        n = np.zeros((AE_ACTION_HORIZON, AE_ACTION_DIM_PADDED), dtype=np.float32)
+        n[:, :7] = self._rng.randn(AE_ACTION_HORIZON, 7)
+        return self.torch.from_numpy(n).to(self.device)[None]
 
     def infer(self, images, toks, state_8d):
         torch = self.torch
@@ -165,7 +179,7 @@ class _TorchBackend:
             imgs,
             torch.as_tensor(toks, device=self.device, dtype=torch.long)[None],
             torch.as_tensor(state_8d, device=self.device, dtype=torch.float32)[None],
-            self.W, noise=self.noise32, masked_cols=masked_cols or None)
+            self.W, noise=self._noise(), masked_cols=masked_cols or None)
         return out[0, :, :7].float().cpu().numpy()
 
 
@@ -271,6 +285,12 @@ def main():
     ap.add_argument("--task-suite", default="libero_spatial", choices=list(_SUITE_MAX_STEPS))
     ap.add_argument("--tasks", type=int, default=None,
                     help="cap #tasks (default: None = all 10 tasks in the suite)")
+    ap.add_argument("--task-start", type=int, default=0,
+                    help="first task id to run. Lets you split a suite across processes: "
+                         "MuJoCo's EGL renderer segfaults after ~6 OffScreenRenderEnv "
+                         "creations when CUDA is also active (torch backend), so run the "
+                         "GPU eval in chunks of <=5 tasks. The FPGA backend does no CUDA "
+                         "compute and is not affected.")
     ap.add_argument("--trials", type=int, default=2,
                     help="rollouts per task (default 2 -> 20 total across 10 tasks, "
                          "a directional +/-20%% number; bump to 5 for a citable +/-13%%)")
@@ -291,6 +311,12 @@ def main():
                          "results_<backend>_<suite>.json). Diff two of these for the "
                          "paired backend comparison.")
     ap.add_argument("--no-video", action="store_true", help="skip mp4 writing")
+    ap.add_argument("--fresh-noise", action="store_true",
+                    help="--backend torch only: sample fresh denoise noise per inference, "
+                         "like real openpi. Default is FIXED noise (RandomState(0)) so the "
+                         "torch and fpga backends are bit-comparable -- but fixed noise is "
+                         "one draw from a stochastic policy, so use --fresh-noise when "
+                         "measuring a success rate, not when doing a paired FPGA diff.")
     ap.add_argument("--dump-actions", action="store_true",
                     help="save every inference's (images, state, tokens, chunk) to "
                          "data/libero/actions_<backend>_<suite>.npz. Run once per backend, "
@@ -313,8 +339,8 @@ def main():
     from openpi_client import image_tools
 
     # --- build the backend ONCE (weights stay resident across all episodes) ---
-    backend = (_TorchBackend(args.device, args.quant) if args.backend == "torch"
-               else _FpgaBackend())
+    backend = (_TorchBackend(args.device, args.quant, args.fresh_noise)
+               if args.backend == "torch" else _FpgaBackend())
     pre = _Pi05Pre()
     print(f"[eval] backend '{args.backend}' ready.", flush=True)
 
@@ -349,9 +375,29 @@ def main():
     video_dir = pathlib.Path(args.video_out)
     video_dir.mkdir(parents=True, exist_ok=True)
 
+    import json
+    results_path = pathlib.Path(args.results_out) if args.results_out else (
+        video_dir.parent / f"results_{args.backend}_{args.task_suite}.json")
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+
     total_ep, total_succ = 0, 0
     episodes = []   # per-episode success bits -> the paired-comparison record
-    for task_id in range(n_tasks):
+
+    def _save():
+        # Written after EVERY episode, not just at the end: an FPGA suite run is many
+        # hours, and a crash at task 5 must not throw away tasks 0-4.
+        results_path.write_text(json.dumps({
+            "backend": args.backend, "task_suite": args.task_suite, "seed": args.seed,
+            "task_start": args.task_start, "tasks": n_tasks, "trials": args.trials,
+            "max_steps": max_steps, "replan_steps": args.replan_steps,
+            "quant": args.quant if args.backend == "torch" else "if4-hw",
+            "noise": ("fresh" if (args.backend == "torch" and args.fresh_noise) else "fixed"),
+            "successes": total_succ, "episodes_total": total_ep,
+            "success_rate": total_succ / max(1, total_ep),
+            "episodes": episodes,
+        }, indent=2))
+
+    for task_id in range(args.task_start, args.task_start + n_tasks):
         task = task_suite.get_task(task_id)
         init_states = task_suite.get_task_init_states(task_id)
         bddl = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
@@ -396,6 +442,7 @@ def main():
                 total_succ += 1
             episodes.append({"task_id": task_id, "trial": trial,
                              "language": str(task.language), "steps": t, "success": done})
+            _save()   # checkpoint every episode -- a crash must not lose hours of work
             suffix = "success" if done else "failure"
             if not args.no_video:
                 imageio.mimwrite(
@@ -405,6 +452,8 @@ def main():
                   f"(running {total_succ}/{total_ep} = {100*total_succ/total_ep:.1f}%)", flush=True)
         print(f"[eval] task {task_id} success rate: {task_succ}/{task_ep}", flush=True)
         env.close()
+        del env
+        gc.collect()   # MuJoCo's EGL context is not freed by close() alone
 
     if args.dump_actions and dumps:
         flat = {"n": np.array(len(dumps))}
@@ -415,20 +464,7 @@ def main():
         np.savez_compressed(actions_path, **flat)
         print(f"[eval] dumped {len(dumps)} inferences -> {actions_path}", flush=True)
 
-    import json
-    results_path = pathlib.Path(args.results_out) if args.results_out else (
-        video_dir.parent / f"results_{args.backend}_{args.task_suite}.json")
-    results_path.parent.mkdir(parents=True, exist_ok=True)
-    results_path.write_text(json.dumps({
-        "backend": args.backend, "task_suite": args.task_suite, "seed": args.seed,
-        "tasks": n_tasks, "trials": args.trials, "max_steps": max_steps,
-        "replan_steps": args.replan_steps,
-        "quant": args.quant if args.backend == "torch" else "if4-hw",
-        "successes": total_succ, "episodes_total": total_ep,
-        "success_rate": total_succ / max(1, total_ep),
-        "episodes": episodes,
-    }, indent=2))
-
+    _save()
     print("\n" + "=" * 56)
     print(f"  LIBERO {args.task_suite}  |  backend={args.backend}  "
           f"trials/task={args.trials}  tasks={n_tasks}")

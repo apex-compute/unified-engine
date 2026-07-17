@@ -95,6 +95,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # op. Move N up one at a time as each checkpoint passes.
     DEBUG_STOP_AFTER = None
 
+    # A/B knob for the 832-vs-576 prefix experiment (--keep-masked-slots).
+    # False (default): all-zero image slots are DROPPED from the prefix -> 576 tokens.
+    # True: they are carried as -inf-masked placeholder rows -> 832 tokens, ~1050
+    # GFLOP/inference of provably-dead work. See run_vision.
+    KEEP_MASKED_SLOTS = False
+
+    # Text tokens reserved after the vision rows. The prefix length is DERIVED
+    # (n_vision_rows + this), not read from config.prefill_max_seq_len -- that key
+    # hardcoded "exactly 2 real cameras" and asserts out on a genuine 3-image obs.
+    # Worst real LIBERO prompt is 62 tokens (libero_spatial t4).
+    PREFIX_TEXT_BUDGET = 64
+
     def __init__(self, script_dir=None, **kw):
         layout = self._cfg["dram_layout"]
         kw.setdefault("params_dram_base", int(layout["params_dram_base"], 16))
@@ -2042,35 +2054,79 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, HO).clone()
             outs.append(out)
             print(f"  [vision] slot {i} done")
-        # Dead slots stay as MASKED placeholder tokens (never dropped): pi0.5 is
-        # trained with 3 image slots occupying 768 token positions (the unused slot
-        # masked, not absent), so deleting them shifts every text token's RoPE
-        # position and breaks language conditioning. Mask, don't drop.
-        # masked prefix columns (vision-token space): slot i occupies [i*S:(i+1)*S]
+        # DROP dead slots from the prefix entirely -- do not carry them as masked
+        # placeholder rows.
+        #
+        # An earlier comment here claimed dropping "shifts every text token's RoPE
+        # position and breaks language conditioning". That is WRONG, and it cost real
+        # FPGA time. It reasons about positions = arange(seq_len), under which deleting
+        # 256 rows would indeed shift everything after them. But _rope_positions_prefix
+        # computes openpi's actual formula:
+        #
+        #     positions = cumsum(attn_mask) - 1
+        #
+        # A masked row contributes 0 to the cumsum, so it NEVER advances the counter.
+        # Present-and-masked and physically-absent therefore give IDENTICAL positions
+        # to every surviving token (vision 0..511, text 512..512+n_text-1), and an
+        # identical n_valid (=512+n_text) for the action expert's suffix rope. The dead
+        # columns were also -inf-masked in attention, i.e. softmax weight exactly 0, so
+        # nothing ever read from them either.
+        #
+        # Masking killed their INFLUENCE but not their FLOPs: those 256 rows still ran
+        # every QKV/O projection and MLP of all 18 layers. Dropping them takes the
+        # prefix 832 -> 576 tokens (-31% FLOPs, 148s -> ~102s) and the whole inference
+        # ~196s -> ~150s, bit-for-bit equivalent.
+        #
+        # VERIFIED on pi05_torch_ref (identical rope/mask logic): 3-slots-masked vs
+        # 2-slots-dropped = 50.5 dB (bf16 noise floor). Control: keeping the slot but
+        # NOT masking it (a genuine rope shift) craters to 15.9 dB -- so the check is
+        # sensitive to exactly the failure the old comment feared, and it does not fire.
+        #
+        # NOTE: the text budget is unchanged. Before: 832-768=64 text tokens. After:
+        # 576-512=64. Worst real LIBERO prompt is 62 tokens (libero_spatial t4).
         self.masked_vision_slots = masked_slots
-        self.prefix_masked_cols = [(i * S, (i + 1) * S) for i in masked_slots]
-        return torch.cat(outs, dim=0)  # (3*256, 2048)
+        if self.KEEP_MASKED_SLOTS:
+            # A/B control path (--keep-masked-slots): carry the dead slots as masked
+            # placeholder rows -- the pre-2026-07-14 behaviour. Prefix goes back to 832
+            # tokens and burns ~1050 GFLOP on them. Output must be IDENTICAL to the
+            # drop path (measured 251 dB); that equality IS the experiment.
+            # NB: vision cost is unchanged either way -- the encoder still skips zero
+            # slots. This toggle only moves the PREFIX.
+            self.prefix_masked_cols = [(i * S, (i + 1) * S) for i in masked_slots]
+            return torch.cat(outs, dim=0)          # (3*256, 2048)
+        self.prefix_masked_cols = []   # nothing masked in-sequence: the rows are gone
+        kept = [o for i, o in enumerate(outs) if i not in masked_slots]
+        return torch.cat(kept, dim=0)  # (n_valid_slots*256, 2048), e.g. (512, 2048)
 
     def _vision_snr_check(self, images_hwc, hw_vision_tokens):
         """CPU-vs-HW SNR check for the vision encoder output, using the SAME
         IF4-quantized weights (pi05_torch_ref.py's Weights(quant='if4')) so
         this isolates HW execution/precision drift, not a quantization-policy
         mismatch. images_hwc: the same list of 3 (224,224,3) float32 arrays
-        [-1,1] passed to run_vision(). hw_vision_tokens: (768, 2048) bf16,
-        run_vision()'s return value. Prints per-slot and overall SNR in dB
-        (>=40dB is this codebase's usual correctness bar, see
+        [-1,1] passed to run_vision(). hw_vision_tokens: run_vision()'s return
+        value -- only the KEPT (non-zero) slots, e.g. (512, 2048) for LIBERO's
+        2 real cameras. Prints per-slot and overall SNR in dB (>=40dB is this
+        codebase's usual correctness bar, see
         feedback_mobilesam_snr_validation_contract)."""
         import pi05_torch_ref as _ref
         W = _ref.Weights(device="cpu", dtype=torch.bfloat16, quant="if4")
-        images_t = torch.stack([torch.from_numpy(im) for im in images_hwc], dim=0).to(torch.bfloat16)
-        cpu_tokens = _ref.vision_encode(images_t, W).reshape(-1, hw_vision_tokens.shape[-1])  # (768, 2048)
+        # Encode ONLY the slots run_vision kept -- it drops all-zero slots from the
+        # prefix entirely now, so a 3-image CPU encode would shape-mismatch the HW rows.
+        masked = set(getattr(self, "masked_vision_slots", []))
+        kept_idx = [i for i in range(len(images_hwc)) if i not in masked]
+        images_t = torch.stack([torch.from_numpy(images_hwc[i]) for i in kept_idx],
+                               dim=0).to(torch.bfloat16)
+        cpu_tokens = _ref.vision_encode(images_t, W).reshape(-1, hw_vision_tokens.shape[-1])
 
         hw = hw_vision_tokens.float()
         cpu = cpu_tokens.float()
+        assert hw.shape == cpu.shape, f"vision rows {hw.shape} != cpu {cpu.shape}"
         print("=== vision encoder CPU-vs-HW SNR check ===")
         S = self.VIS_S
-        for i, name in enumerate(("main", "wrist", "pad")):
-            h, c = hw[i * S:(i + 1) * S], cpu[i * S:(i + 1) * S]
+        _names = ("main", "wrist", "pad")
+        for j, i in enumerate(kept_idx):
+            name = _names[i] if i < len(_names) else f"slot{i}"
+            h, c = hw[j * S:(j + 1) * S], cpu[j * S:(j + 1) * S]
             noise = (h - c).pow(2).sum().sqrt()
             signal = c.pow(2).sum().sqrt()
             snr_db = 20 * torch.log10(signal / noise.clamp_min(1e-12))
@@ -2636,8 +2692,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             inter=v["intermediate_size"], layers=27, nq=v["num_heads"], nkv=v["num_heads"],
             hd=v["head_dim"], gated=False)
 
-    def _prefix_flops(self):
-        M = _CFG["model"]["prefill_max_seq_len"]
+    def _prefix_flops(self, M=None):
+        if M is None:
+            M = _CFG["model"]["prefill_max_seq_len"]
         return self._xformer_flops(
             M=M, Mkv=M, hidden=self.HIDDEN_SIZE, inter=self.INTERMEDIATE_SIZE,
             layers=self.NUM_LAYERS, nq=self.NUM_HEADS, nkv=self.NUM_KV_HEADS,
@@ -2686,7 +2743,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self._vision_snr_check(images_hwc, vision_tokens)
 
             t1 = time.perf_counter()
-            seq_len = _CFG["model"]["prefill_max_seq_len"]
+            # DERIVED, not read from config: however many vision rows run_vision
+            # actually returned (512 dropped / 768 kept / 768 on a real 3-camera
+            # robot) + the text budget.
+            seq_len = vision_tokens.shape[0] + self.PREFIX_TEXT_BUDGET
             valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
             # COMPILE-ONCE: the prefix program is invariant to valid_len (M is
             # always seq_len; valid_len only shapes the DMA'd bias DATA). Compile
@@ -2703,7 +2763,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                bias.flatten(), bias.numel() * 2)
             self._execute(self._prefix_prog_addr, label="prefix", timeout=250.0)
             t_prefix = time.perf_counter() - t1
-            self._report_gflops(f"prefix ({seq_len} tok)", self._prefix_flops(), t_prefix)
+            self._report_gflops(f"prefix ({seq_len} tok)", self._prefix_flops(seq_len), t_prefix)
 
             if getattr(self, "PREFIX_SNAPSHOTS", False):
                 self._prefix_layer0_op_snr_report(prompt_tokens, vision_tokens, valid_len)
@@ -3038,6 +3098,12 @@ def main():
                      help="snapshot step-0 action-expert intermediates and diff each against the "
                           "torch reference (fed the FPGA's own K/V) to localize which op first "
                           "diverges. Works with --debug for a fast ~75s iteration loop.")
+    ap.add_argument("--keep-masked-slots", action="store_true",
+                     help="A/B control for the 832-vs-576 prefix experiment: carry all-zero "
+                          "image slots as -inf-masked placeholder rows instead of dropping "
+                          "them. Prefix 576 -> 832 tokens (+1050 GFLOP, ~+47s). Output should "
+                          "be bit-identical to the default; that equality is the point. "
+                          "Vision cost is unaffected -- the encoder skips zero slots either way.")
     args, _ = ap.parse_known_args()
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
@@ -3053,6 +3119,11 @@ def main():
     if args.verify_vision:
         Pi05Libero_UnifiedEngine.VISION_SNR_CHECK = True
         print("[main] VISION_SNR_CHECK enabled -- will diff the vision encoder vs the IF4 reference")
+
+    if args.keep_masked_slots:
+        Pi05Libero_UnifiedEngine.KEEP_MASKED_SLOTS = True
+        print("[main] KEEP_MASKED_SLOTS enabled -- dead image slots carried as masked "
+              "placeholder rows (prefix 832 tok, the slow control arm)")
 
     if os.environ.get("PI05_L0_REPORT"):
         Pi05Libero_UnifiedEngine.PREFIX_SNAPSHOTS = True
