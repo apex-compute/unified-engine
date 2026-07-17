@@ -26,7 +26,7 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR,
-    UnifiedEngine, ue_35bit_addr_shifter, UE_MODE,
+    UnifiedEngine, configure_device, ue_35bit_addr_shifter, UE_MODE,
 )
 from nn_lib import (
     smart_bf16_permute_core,
@@ -225,12 +225,15 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         clean (zeroed) DRAM regardless of what the previous run left behind.
         Temporary mitigation until the read-before-write gap is found and fixed.
         """
-        start = user_dma_core.DRAM_START_ADDR
-        total = 0xFFFFFFFF - start + 1
+        start = self._params_dram_base
+        # Only clear the SmolVLM2 working layout. Avoid sweeping the whole 4GB
+        # Efinix aperture up to 0xffffffff, which can hang on top-of-DRAM DMA.
+        end = min(user_dma_core.DRAM_END_ADDR, self._program_dram_base + 0x10000000 - 1)
+        total = end - start + 1
         zeros = b"\x00" * chunk_size_bytes
         offset = 0
         bar_width = 40
-        _original_print(f"Zeroing DRAM [{hex(start)}..0xffffffff] ({total / 1024**3:.2f} GB)")
+        _original_print(f"Zeroing DRAM [{hex(start)}..{hex(end)}] ({total / 1024**3:.2f} GB)")
         while offset < total:
             n = min(chunk_size_bytes, total - offset)
             self.dma_write(DMA_DEVICE_H2C, start + offset, zeros[:n], n)
@@ -1538,12 +1541,12 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
 def main():
     import argparse
-    from user_dma_core import set_dma_device
 
     parser = argparse.ArgumentParser(description="SmolVLM2-500M on accelerator (bf16 vision + q4 LM)")
     _d = _SMOLVLM2_CFG["defaults"]
@@ -1557,7 +1560,7 @@ def main():
                         help="Pure language-model (text-only) mode — skip the vision encoder. Default is VLM (vision).")
     parser.add_argument("--dev", type=str, default=_d["dev"], help="DMA device name")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"], help="Max sequence length")
     parser.add_argument("--max-decode-tokens", type=int, default=None,
                         help="Cap the number of generated decode tokens.")
@@ -1582,17 +1585,26 @@ def main():
         snapshot_download(repo_id=HF_MODEL_REPO, local_dir=model_dir, local_dir_use_symlinks=False, ignore_patterns=["onnx/*"])
 
     # --- Hardware inference ---
-    set_dma_device(args.dev)
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    profile = configure_device(args.device, dma_device=args.dev)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(args.device))
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}")
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
+    _original_print(
+        f"DRAM layout: params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, "
+        f"program=0x{ue._program_dram_base:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}"
+    )
     # Software-reset the engine, then clear DRAM to 0 before anything else.
     # SmolVLM2 has a read-before-write defect and depends on clean, zero-filled
     # DRAM. The harness now poisons DRAM (0xFF) before SmolVLM2 like every other

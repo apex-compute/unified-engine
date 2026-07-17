@@ -968,28 +968,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
         _script_dir = script_dir or SCRIPT_DIR
         _cfg_for_layout = self.load_config(script_dir=_script_dir)
-        _params_base = user_dma_core.DRAM_START_ADDR
-        if user_dma_core.CURRENT_DEVICE == "efinix":
-            # Efinix host/DMA path exposes 0x00000000..0x7fffffff. Pack the
-            # FPGA-resident LM weights, tensor scratch, and ISA below 2 GiB.
-            _align = 0x100000
-            _wd = _cfg_for_layout["_weight_defs"]
-            _fi = _cfg_for_layout["file_info"]
-            _non_layer_sz = sum(
-                _wd[f"{s['key']}_SIZE"]
-                for s in _cfg_for_layout["layers"]["non_layer"]
-                if s["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")
-            )
-            _rope_sz = _wd["ROPE_LOCAL_SIZE"] + _wd["ROPE_GLOBAL_SIZE"]
-            _identity_sz = UE_VECTOR_SIZE * UE_VECTOR_SIZE * _fi["bytes_per_element"]
-            _params_est = _fi["num_layers"] * _wd["LAYER_WEIGHT_SIZE"] + _non_layer_sz + _rope_sz + _identity_sz
-            _tensor_base = ((_params_base + _params_est + _align - 1) // _align) * _align
-            _tensor_est = 0x12300000
-            _program_base = ((_tensor_base + _tensor_est + _align - 1) // _align) * _align
-        else:
-            _params_base  = 0x00000000
-            _tensor_base  = 0x78000000
-            _program_base = 0xa0000000
+        _params_base  = user_dma_core.DRAM_START_ADDR
+        _tensor_base  = 0x78000000
+        _program_base = 0xa0000000
         if engine_slave:
             _program_base += 0x10000000
         super().__init__(BASE_ADDR=engine_base,
@@ -7074,7 +7055,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # Uses max head_dim (512) = self.k_size for uniform sizing
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size)
-        zero_pad = torch.zeros(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size, dtype=torch.bfloat16)
+        zero_pad = torch.zeros(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.head_dim, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_pad)
         # Allocate memory for constant zero tensor, identity matrix, and bias:
@@ -7089,7 +7070,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        zero_pad = torch.zeros(attention_aligned_seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
+        zero_pad = torch.zeros(attention_aligned_seq_len * self.head_dim, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_pad)
@@ -7352,10 +7333,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         """
         # Template iteration counts come from PREFILL_MAX_SEQ_LEN so the captured
         # program is portable across all real seq_lens ≤ PREFILL_MAX.
-        template_seq_len = int(self._cfg["model"].get(
-            "prefill_max_seq_len",
-            self._cfg["model"].get("max_prefill_seq_len",
-                                    self._cfg["model"]["max_context_size"])))
+        template_seq_len = int(seq_len)
         seq_len = template_seq_len
         self.seq_len = seq_len
         q_seq_len = seq_len * self.group_size
@@ -7800,11 +7778,18 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         print(f"[Prefill] uploading embeddings to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
 
-        # Compute per-layer inputs on host and DMA to FPGA
+        # Compute per-layer inputs on host and DMA to FPGA. The compiled
+        # prefill uses the template length as the per-layer stride in
+        # PER_LAYER_INPUTS_DRAM, so upload a stride-padded [layer, template,
+        # dim] layout even when the actual prompt is shorter.
         print(f"[Prefill] [host] computing per-layer inputs ({seq_len} tokens x {self.LAYER_SIZE} layers)...", flush=True)
         per_layer_inputs = self._compute_per_layer_inputs(prefill_seq, embedding_tensor)  # [seq_len, 35, 256]
-        # Permute to [35, seq_len, 256] so each layer's data is contiguous in DRAM
-        per_layer_inputs_flat = per_layer_inputs.permute(1, 0, 2).contiguous()  # [35, seq_len, 256]
+        prefill_template_len = int(getattr(self, "_active_prefill_template_len", self.max_prefill_seq_len))
+        per_layer_inputs_flat = torch.zeros(
+            (self.LAYER_SIZE, prefill_template_len, self.per_layer_input_dim),
+            dtype=per_layer_inputs.dtype,
+        )
+        per_layer_inputs_flat[:, :seq_len, :] = per_layer_inputs.permute(1, 0, 2)
         print(f"[Prefill] uploading per-layer inputs to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(self.PER_LAYER_INPUTS_DRAM, per_layer_inputs_flat)
 
@@ -7827,15 +7812,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # from token space to q-position space by multiplying by group_size.
         full_bias = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
         # Q rows are laid out token*group_size + head, and K is GQA-duplicated
-        # to the same layout, so each attn head must attend ONLY its own head
-        # slot (its KV head), causal in tokens. A flat q-space causal tril
-        # (j<=i) additionally allows CROSS-HEAD attention (head h attending
-        # earlier heads 0..h within a token). For E2B (num_kv=1) this is one KV
-        # group so it doesn't corrupt the VALUE, but it still over-weights
-        # earlier tokens (each contributes group_size duplicate slots vs the
-        # current token's h+1), so the correct mask is same head AND
-        # token-causal. (For E4B num_kv=2 the flat tril was catastrophic — it
-        # let heads attend the WRONG KV group; see gemma4_e4b_test.py.)
+        # to the same layout, so each attn head must attend only its own head
+        # slot, causal in token space.
         _gs = self.group_size
         _i = torch.arange(aligned_seq_len).unsqueeze(1)
         _j = torch.arange(aligned_seq_len).unsqueeze(0)
@@ -8921,14 +8899,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     # Bucketed prefill dispatch (used with single instruction bin)
     # ------------------------------------------------------------------
     def run_prefill_bucketed(self, manifest: dict, prefill_seq=None) -> tuple[int, float]:
-        """Dynamic-PBI prefill with template-padded prompt.
+        """Dynamic-PBI prefill using a template-padded prompt.
 
-        Pads the prompt up to prefill_max_seq_len with the last real token,
-        runs the single captured prefill program (matmuls + per-token Python
-        loops emit at template size), then restores self.seq_len to the
-        actual prompt length for decode. Bias masking + the host's
-        per-layer-input padding ensure padded positions don't contaminate
-        valid outputs.
+        The cached prefill program is captured at ``prefill_max_seq_len`` and
+        still has static per-row work in the per-layer injection path, so the
+        host must provide valid padded rows. After prefill, padded KV rows are
+        cleared and ``self.seq_len`` is restored to the real prompt length so
+        decode advances from the correct position.
         """
         if prefill_seq is None:
             prefill_seq = self.prefill_seq
@@ -8946,9 +8923,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         prefill_program_addr = manifest["_prefill_addr_int"]
         flops = manifest["prefill_total_flops"]
 
-        # Pad to template_seq_len so static per-token loops see valid data.
-        pad_token = prefill_tokens[-1]
         pad_count = prefill_max - actual_seq_len
+        pad_token = prefill_tokens[-1]
         padded_tokens = list(prefill_tokens) + [pad_token] * pad_count
         padded_seq = tuple(padded_tokens) + (prefill_seq[-1],)
         if hasattr(self, "_mm_types") and self._mm_types is not None and pad_count > 0:
@@ -8966,7 +8942,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # produces the same DRAM state the LM ISA expects. Idempotent for
         # LM-only-bin runs (just a few small DMAs).
         # ------------------------------------------------------------------
-        self.software_reset()  # clear stuck queue state from any prior failing run
+        if os.environ.get("GEMMA4_PREFILL_SOFTWARE_RESET") == "1":
+            self.software_reset()  # opt-in: can clobber params DRAM on Efinix
         from user_dma_core import UE_VECTOR_SIZE as _UE_VS
         # Zero ENTIRE K/V cache (0..MAX_CONTEXT_SIZE). Prefill overwrites
         # positions 0..prefill_max-1 with K/V data; positions prefill_max..
@@ -9001,11 +8978,25 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                        torch.eye(_UE_VS, dtype=torch.bfloat16))
         print(f"[dyn-prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
 
+        self._active_prefill_template_len = prefill_max
         self.seq_len = prefill_max
         latency, flop_rate = self.run_prefill(prefill_program_addr,
                                               prefill_seq=padded_seq,
                                               flops=flops)
+        self._active_prefill_template_len = self.max_prefill_seq_len
         self.seq_len = actual_seq_len
+        if pad_count > 0:
+            k_per_pos_elems = self.k_size // self.bytes_per_element
+            zero_pad_kv = torch.zeros(pad_count * k_per_pos_elems, dtype=torch.bfloat16)
+            pad_byte_offset = actual_seq_len * self.k_size
+            for slot in range(self._num_kv_slots):
+                slot_byte_offset = slot * self.MAX_CONTEXT_SIZE * self.k_size
+                self.dma_to_accelerator_memory(
+                    self.LAYER0_K_ROPE_DRAM + slot_byte_offset + pad_byte_offset,
+                    zero_pad_kv)
+                self.dma_to_accelerator_memory(
+                    self.LAYER0_V_DRAM + slot_byte_offset + pad_byte_offset,
+                    zero_pad_kv)
         return latency, flop_rate
 
     def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> dict:
@@ -9217,7 +9208,7 @@ defaults (sample files in repo-root test_samples/):
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name for non-Efinix profiles (e.g., xdma0, xdma1). Efinix uses /dev/pcie_dma0_* from its profile.')
     parser.add_argument('--device', type=str, default='kintex7',
-                        help='FPGA board / bitstream profile. Use efinix for the Efinix 2GB DMA-window profile.')
+                        help='FPGA board / bitstream profile. Use efinix for the Efinix 4GB DMA-window profile.')
     parser.add_argument('--cycle', type=float, default=None,
                         help='Clock cycle time in nanoseconds. Default: from --device.')
     args = parser.parse_args()
@@ -9264,9 +9255,6 @@ defaults (sample files in repo-root test_samples/):
         raise SystemExit(
             "Only one encoder modality per run. Choose either --image / --vision-enable "
             "OR --audio / --audio-enable, not both.")
-    if user_dma_core.CURRENT_DEVICE == "efinix" and (vision_on or audio_on):
-        raise SystemExit("Efinix 2GB Gemma4 E2B profile currently supports LM-only mode.")
-
     image_path = args.image or (DEFAULT_IMAGE if args.vision_enable else None)
     audio_path = args.audio or (DEFAULT_AUDIO if args.audio_enable else None)
     if vision_on and image_path and not os.path.exists(image_path):
@@ -9313,7 +9301,7 @@ defaults (sample files in repo-root test_samples/):
         # ISA only, so unused modes cost nothing at runtime, and any later run /
         # run_from_bin / mode can rely on every section being present.
         # GEMMA4_LM_ONLY_BIN=1 skips the vision/audio sections (see README).
-        lm_only_bin = os.environ.get("GEMMA4_LM_ONLY_BIN") == "1" or user_dma_core.CURRENT_DEVICE == "efinix"
+        lm_only_bin = os.environ.get("GEMMA4_LM_ONLY_BIN") == "1"
         _img = None if lm_only_bin else DEFAULT_IMAGE
         _aud = None if lm_only_bin else DEFAULT_AUDIO
         print(f"\n--- First-time compile: building {'LM-only' if lm_only_bin else 'LM + vision + audio'} into programs.bin ---")

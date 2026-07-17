@@ -2204,10 +2204,40 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             prefill_seq_len = UE_VECTOR_SIZE
             instruction_bin_path  = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_instruction.bin")
             instruction_meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_instruction.json")
+        instruction_base_addr = self.get_program_dram_addr()
+        decoder_variant = "folded_pbi" if use_pbi else "unrolled_legacy"
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
-            print(f"Reusing existing instruction image at {instruction_bin_path}")
-            print(f"  delete {instruction_bin_path} to force recompile.")
-            return
+            cache_reason = None
+            try:
+                with open(instruction_meta_path, "r") as f:
+                    cached_meta = json.load(f)
+                cached_bin = os.path.join(self.script_dir, cached_meta.get("instruction_bin", ""))
+                expected = {
+                    "instruction_base_addr": instruction_base_addr,
+                    "matmatmul": self.matmatmul,
+                    "legacy": self.legacy,
+                    "prefill_template_seq_len": prefill_seq_len,
+                    "decoder_variant": decoder_variant,
+                }
+                for key, expected_value in expected.items():
+                    cached_value = cached_meta.get(key)
+                    if key == "instruction_base_addr":
+                        cached_value = _parse_offset(cached_value)
+                    if cached_value != expected_value:
+                        cache_reason = f"{key} cached={cached_value!r} expected={expected_value!r}"
+                        break
+                if cache_reason is None and os.path.abspath(cached_bin) != os.path.abspath(instruction_bin_path):
+                    cache_reason = f"instruction_bin cached={cached_bin!r} expected={instruction_bin_path!r}"
+                if cache_reason is None and os.path.getsize(instruction_bin_path) != cached_meta.get("instruction_total_size"):
+                    cache_reason = "instruction_total_size does not match bin size"
+            except Exception as exc:
+                cache_reason = f"metadata read/parse failed: {exc}"
+
+            if cache_reason is None:
+                print(f"Reusing existing instruction image at {instruction_bin_path}")
+                print(f"  delete {instruction_bin_path} to force recompile.")
+                return
+            print(f"Instruction cache mismatch ({cache_reason}); recompiling.")
 
         self.clear_inst_id()
         self.start_capture()
@@ -2222,7 +2252,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.stop_capture()
 
         # --- Static jump safety check on the full compiled binary ---
-        instruction_base_addr = self.get_program_dram_addr()
         jump_issues = user_dma_core.check_isa_jumps(
             self.capture_buffer, instruction_base_addr, name="compiled_binary"
         )
@@ -2261,6 +2290,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "instruction_total_size": len(instruction_bytes),
             "matmatmul": self.matmatmul,
             "legacy": self.legacy,
+            "decoder_variant": decoder_variant,
             "prefill_template_seq_len": prefill_seq_len,
             "prefill_program_start_addr": f"0x{prefill_program_addr:X}",
             "prefill_program_size": prefill_prog["size_bytes"],

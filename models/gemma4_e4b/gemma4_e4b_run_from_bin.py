@@ -5707,7 +5707,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # Uses max head_dim (512) = self.k_size for uniform sizing
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size)
-        zero_pad = torch.zeros(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size, dtype=torch.bfloat16)
+        zero_pad = torch.zeros(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.num_key_value_heads * self.head_dim, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_pad)
         # Allocate memory for constant zero tensor, identity matrix, and bias:
@@ -5720,7 +5720,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        zero_pad = torch.zeros(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
+        zero_pad = torch.zeros(prefill_aligned_seq_len * self.head_dim, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_pad)
@@ -5928,10 +5928,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         run_from_bin.compile_instruction_bin therefore raises — build the E4B bin
         with test.py. See memory: gemma4_e4b_gqa_sizing_test_vs_runfrombin.
         """
-        template_seq_len = int(self._cfg["model"].get(
-            "prefill_max_seq_len",
-            self._cfg["model"].get("max_prefill_seq_len",
-                                    self._cfg["model"]["max_context_size"])))
+        template_seq_len = int(seq_len)
         seq_len = template_seq_len
         self.seq_len = seq_len
         q_seq_len = seq_len * self.num_attention_heads
@@ -6376,11 +6373,18 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         print(f"[Prefill] uploading embeddings to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
 
-        # Compute per-layer inputs on host and DMA to FPGA
+        # Compute per-layer inputs on host and DMA to FPGA. The compiled
+        # prefill uses the template length as the per-layer stride in
+        # PER_LAYER_INPUTS_DRAM, so upload a stride-padded [layer, template,
+        # dim] layout even when the actual prompt is shorter.
         print(f"[Prefill] [host] computing per-layer inputs ({seq_len} tokens x {self.LAYER_SIZE} layers)...", flush=True)
         per_layer_inputs = self._compute_per_layer_inputs(prefill_seq, embedding_tensor)  # [seq_len, 35, 256]
-        # Permute to [35, seq_len, 256] so each layer's data is contiguous in DRAM
-        per_layer_inputs_flat = per_layer_inputs.permute(1, 0, 2).contiguous()  # [35, seq_len, 256]
+        prefill_template_len = int(getattr(self, "_active_prefill_template_len", self.max_prefill_seq_len))
+        per_layer_inputs_flat = torch.zeros(
+            (self.LAYER_SIZE, prefill_template_len, self.per_layer_input_dim),
+            dtype=per_layer_inputs.dtype,
+        )
+        per_layer_inputs_flat[:, :seq_len, :] = per_layer_inputs.permute(1, 0, 2)
         print(f"[Prefill] uploading per-layer inputs to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(self.PER_LAYER_INPUTS_DRAM, per_layer_inputs_flat)
 
@@ -6916,6 +6920,31 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
               + (" (+audio)"  if manifest.get("contains_audio") else ""))
         return manifest
 
+    def compile_actual_prefill_to_dram(self, actual_seq_len: int) -> tuple[int, int]:
+        """Compile a prompt-length prefill program into program DRAM."""
+        if actual_seq_len < 1:
+            raise ValueError(f"actual_seq_len must be positive, got {actual_seq_len}")
+        global _SILENT_MODE
+        old_silent = _SILENT_MODE
+        _SILENT_MODE = True
+        self.clear_inst_id()
+        self.clear_capture_buffer()
+        self.start_capture()
+        self.generate_instruction_flag_clear()
+        program_base = self.get_program_dram_addr()
+        prefill_count_at_start = self.capture_count
+        prefill_addr = program_base + prefill_count_at_start * user_dma_core.INSTRUCTION_SIZE_BYTES
+        _original_print(f"[dyn-prefill] compiling actual-length prefill: seq_len={actual_seq_len}, addr=0x{prefill_addr:X}")
+        try:
+            _, flops = self.compile_prefill(seq_len=actual_seq_len, layer_size=self.LAYER_SIZE)
+            self.stop_capture()
+            self.write_captured_instructions_to_dram(program_base)
+            self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        finally:
+            self.clear_capture_buffer()
+            _SILENT_MODE = old_silent
+        return prefill_addr, flops
+
     # ------------------------------------------------------------------
     # LEGACY (commented out 2026-05-21):
     # Incremental vision extension. Folded into single-pass
@@ -7163,7 +7192,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # produces the same DRAM state the LM ISA expects. Idempotent for
         # LM-only-bin runs (just a few small DMAs).
         # ------------------------------------------------------------------
-        self.software_reset()  # clear stuck queue state from any prior failing run
+        if os.environ.get("GEMMA4_PREFILL_SOFTWARE_RESET") == "1":
+            self.software_reset()  # opt-in: can clobber params DRAM on Efinix
         from user_dma_core import UE_VECTOR_SIZE as _UE_VS
         # Zero ENTIRE K/V cache (0..MAX_CONTEXT_SIZE). Prefill overwrites
         # positions 0..prefill_max-1 with K/V data; positions prefill_max..
@@ -7202,11 +7232,25 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                        torch.eye(_UE_VS, dtype=torch.bfloat16))
         print(f"[dyn-prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
 
+        self._active_prefill_template_len = prefill_max
         self.seq_len = prefill_max
         latency, flop_rate = self.run_prefill(prefill_program_addr,
                                               prefill_seq=padded_seq,
                                               flops=flops)
+        self._active_prefill_template_len = self.max_prefill_seq_len
         self.seq_len = actual_seq_len
+        if pad_count > 0:
+            k_per_pos_elems = self.num_key_value_heads * self.head_dim
+            zero_pad_kv = torch.zeros(pad_count * k_per_pos_elems, dtype=torch.bfloat16)
+            pad_byte_offset = actual_seq_len * self.k_size
+            for slot in range(self._num_kv_slots):
+                slot_byte_offset = slot * self.MAX_CONTEXT_SIZE * self.k_size
+                self.dma_to_accelerator_memory(
+                    self.LAYER0_K_ROPE_DRAM + slot_byte_offset + pad_byte_offset,
+                    zero_pad_kv)
+                self.dma_to_accelerator_memory(
+                    self.LAYER0_V_DRAM + slot_byte_offset + pad_byte_offset,
+                    zero_pad_kv)
         return latency, flop_rate
 
     def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> dict:
@@ -7533,6 +7577,14 @@ def main():
     except Exception as _e:
         print(f"  text: (decode failed: {_e})")
     print(f"--- Prompt end ---")
+    if user_dma_core.CURRENT_DEVICE == "efinix" and not vision_on and not audio_on:
+        actual_prefill_len = len(ue.prefill_seq) - 1
+        prefill_addr, prefill_flops = ue.compile_actual_prefill_to_dram(actual_prefill_len)
+        manifest = dict(manifest)
+        manifest["_prefill_addr_int"] = prefill_addr
+        manifest["prefill_program_start_addr"] = f"0x{prefill_addr:X}"
+        manifest["prefill_max_seq_len"] = actual_prefill_len
+        manifest["prefill_total_flops"] = prefill_flops
     timer=time.perf_counter()
     latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
     latency_prefill = time.perf_counter() - timer

@@ -325,16 +325,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         #   params : 0x00000000 .. 0x58000000  (1.375 GB)  weights + host RoPE
         #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
         #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
-        program_base = user_dma_core.DRAM_INSTRUCTION_ADDR
-        if user_dma_core.CURRENT_DEVICE == "efinix":
-            # Efinix exposes a 2 GiB DMA window. Llama-1B weights occupy about
-            # 674 MB; keep tensor scratch at 0x30000000 and reserve the upper
-            # 256 MB for ISA.
-            program_base = 0x70000000
         super().__init__(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
             params_dram_base=user_dma_core.DRAM_START_ADDR,
-            program_dram_base=program_base,
+            program_dram_base=user_dma_core.DRAM_INSTRUCTION_ADDR,
             tensor_dram_base=user_dma_core.DRAM_ACTIVATION_ADDR,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
@@ -357,8 +351,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.actual_head_dim = 64
         self.num_kv_heads = self.head_dim // self.actual_head_dim  # = 8
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
-        if user_dma_core.CURRENT_DEVICE == "efinix":
-            self.MAX_CONTEXT_SIZE = min(self.MAX_CONTEXT_SIZE, 2048)
         self.PREFILL_CONTEXT_SIZE = model["prefill_context_size"]
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]

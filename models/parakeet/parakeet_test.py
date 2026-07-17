@@ -40,7 +40,7 @@ builtins.print = quiet_print
 import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE, UE_VECTOR_SIZE,
-    URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, set_dma_device,
+    URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UnifiedEngine, configure_device,
     UE_MODE, BROADCAST_MODE, LALU_MODE, MEMCPY_TYPE, URAM_SECTION, UE_ARGMAX_INDEX,
     ue_35bit_addr_shifter, calculate_snr
 )
@@ -68,6 +68,23 @@ def _make_add_set_bytes(dst_reg, immediate_value):
 
 WEIGHTS_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "model_weights.ckpt")
 TOKENIZER_PATH = os.path.join(SCRIPT_DIR, "parakeet_bin", "tokenizer.model")
+
+def _resample_waveform(waveform: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
+    """Resample audio without importing torchaudio, whose binary may not match torch."""
+    if src_sr == dst_sr:
+        return waveform
+    try:
+        from scipy.signal import resample_poly
+        g = math.gcd(int(src_sr), int(dst_sr))
+        up = int(dst_sr) // g
+        down = int(src_sr) // g
+        arr = waveform.detach().cpu().numpy()
+        out = resample_poly(arr, up, down, axis=-1).astype(np.float32, copy=False)
+        return torch.from_numpy(out)
+    except Exception:
+        new_len = max(1, int(round(waveform.shape[-1] * float(dst_sr) / float(src_sr))))
+        return F.interpolate(waveform.unsqueeze(0), size=new_len, mode="linear", align_corners=False).squeeze(0)
+
 # ---------------------------------------------------------------------------
 # Core functions: custom ops for Parakeet Conformer
 # ---------------------------------------------------------------------------
@@ -374,16 +391,19 @@ def compute_mel_spectrogram(waveform, cfg, ckpt_sd=None):
 # Parakeet Unified Engine
 # ---------------------------------------------------------------------------
 # Parakeet DRAM partition over 4GB address space:
-#   2.5 GB params / 750 MB tensors / 750 MB programs
-PARAKEET_PARAMS_BASE  = 0x00000000   # 3 GB for weights + identities + Toeplitz DW conv matrices
-PARAKEET_TENSOR_BASE  = 0xC0000000   # 768 MB for intermediate activations + im2col temp buffers
-PARAKEET_PROGRAM_BASE = 0xF0000000   # 256 MB for compiled instruction programs
+#   2 GB params / 1 GB tensors / 1 GB programs.
+# Keep the program region below the top 1 GB because the Efinix DMA path can
+# hang on tiny transfers near 0xF0000000.
+PARAKEET_PARAMS_BASE  = 0x00000000
+PARAKEET_TENSOR_BASE  = 0x80000000
+PARAKEET_PROGRAM_BASE = 0xC0000000
 class Parakeet_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine subclass for Parakeet-TDT-0.6B."""
 
     def __init__(self, script_dir=None, clock_period_ns=None):
         super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR, params_dram_base=PARAKEET_PARAMS_BASE, tensor_dram_base=PARAKEET_TENSOR_BASE, program_dram_base=PARAKEET_PROGRAM_BASE, clock_period_ns=clock_period_ns)
         self.script_dir = script_dir or SCRIPT_DIR
+        _original_print("  Parakeet UE init done; writing HALT...", flush=True)
         # Hang prevention: stop stale execution, write HALT to program base
         self.start_capture()
         self.generate_instruction_halt()
@@ -393,6 +413,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             halt_bytes.extend(inst.get_bytes())
         self.dma_write(DMA_DEVICE_H2C, PARAKEET_PROGRAM_BASE, halt_bytes, len(halt_bytes))
         self.clear_capture_buffer()
+        _original_print("  HALT written", flush=True)
         self._cfg = load_config()
         enc = self._cfg["encoder"]
         pred = self._cfg["predictor"]
@@ -470,6 +491,27 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.allocate_params_dram(nbytes)
         self.dma_to_accelerator_memory(addr, t)
         return addr
+
+    def write_captured_instructions_to_dram(self, start_addr=DRAM_INSTRUCTION_ADDR):
+        """Write captured instructions and keep a host copy for programs.bin.
+
+        Efinix C2H reads from high program addresses are not a reliable cache
+        source, so dump_programs uses this captured host copy when available.
+        """
+        if start_addr is None:
+            start_addr = DRAM_INSTRUCTION_ADDR
+        if not self.capture_buffer or self.capture_count == 0:
+            return super().write_captured_instructions_to_dram(start_addr)
+        written = super().write_captured_instructions_to_dram(start_addr)
+        if written > 0:
+            data = bytearray()
+            for inst in self.capture_buffer:
+                data.extend(inst.get_bytes())
+            if not hasattr(self, "_program_bytes_by_addr"):
+                self._program_bytes_by_addr = {}
+            self._program_bytes_by_addr[start_addr] = bytes(data[:written])
+        return written
+
     def _stage_dw_conv1d(self, weight):
         """(C,1,K) -> (C,64) im2col padded."""
         C, _, K = weight.shape
@@ -1623,8 +1665,12 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         manifest = {"L_pad": L_pad, "programs": {}}
         all_bytes = bytearray()
         for name, (addr, size) in program_addrs.items():
-            buf = bytearray(size)
-            self.dma_read(DMA_DEVICE_C2H, addr, buf, size)
+            cached = getattr(self, "_program_bytes_by_addr", {}).get(addr)
+            if cached is not None and len(cached) >= size:
+                buf = cached[:size]
+            else:
+                buf = bytearray(size)
+                self.dma_read(DMA_DEVICE_C2H, addr, buf, size)
             manifest["programs"][name] = {"offset": len(all_bytes), "size": size}
             all_bytes.extend(buf)
         with open(bin_path, "wb") as f:
@@ -1733,6 +1779,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -1745,42 +1792,48 @@ def main():
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     args = parser.parse_args()
 
-    if args.device == "efinix":
-        print("ERROR: parakeet requires ~1199 MB of DRAM for weights, exceeding the Efinix board's 1 GB limit.")
-        raise SystemExit(1)
-
     global _SILENT_MODE
-    _SILENT_MODE = True
+    _SILENT_MODE = False
 
     cfg = load_config()
-    set_dma_device(args.dev)
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    profile = configure_device(args.device, dma_device=args.dev)
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(args.device))
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
+    _original_print(
+        f"DRAM layout: params=0x{PARAKEET_PARAMS_BASE:08X}, tensor=0x{PARAKEET_TENSOR_BASE:08X}, "
+        f"program=0x{PARAKEET_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}"
+    )
     audio_path = args.audio or os.path.join(SCRIPT_DIR, cfg["defaults"]["default_audio"])
 
-    import torchaudio
     import soundfile as sf
     assert os.path.exists(audio_path), f"Audio file not found: {audio_path}"
     data, sr = sf.read(audio_path, dtype="float32")
     waveform = torch.from_numpy(data).T if data.ndim > 1 else torch.from_numpy(data).unsqueeze(0)
     if sr != cfg["preprocessing"]["sample_rate"]:
-        waveform = torchaudio.functional.resample(waveform, sr, cfg["preprocessing"]["sample_rate"])
+        waveform = _resample_waveform(waveform, sr, cfg["preprocessing"]["sample_rate"])
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
     audio_dur = waveform.shape[1] / cfg["preprocessing"]["sample_rate"]
-    _original_print(f"Parakeet-TDT-0.6B on {args.dev} ({audio_dur:.1f}s audio)")
+    _original_print(f"Parakeet-TDT-0.6B on {DMA_DEVICE_H2C} ({audio_dur:.1f}s audio)")
 
     # --- Init engine ---
+    _original_print("  Initializing UnifiedEngine...", flush=True)
     engine = Parakeet_UnifiedEngine(clock_period_ns=clock)
+    _original_print("  UnifiedEngine ready", flush=True)
+    _SILENT_MODE = True
 
     # --- Mel spectrogram: power spec on CPU, matmul+log on accelerator, norm on CPU ---
+    _original_print("  Ensuring model files...", flush=True)
     Parakeet_UnifiedEngine.ensure_model_files()
+    _original_print("  Loading checkpoint...", flush=True)
     sd = torch.load(WEIGHTS_PATH, map_location="cpu", weights_only=True)
+    _original_print("  Checkpoint loaded", flush=True)
     pre = cfg["preprocessing"]
     window = sd["preprocessor.featurizer.window"].float()
     stft = torch.stft(waveform.float(), pre["n_fft"], pre["hop_length"], pre["win_length"],

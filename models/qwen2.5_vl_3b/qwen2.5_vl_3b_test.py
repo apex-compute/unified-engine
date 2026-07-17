@@ -21,7 +21,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 sys.path.insert(0, PROJECT_ROOT)
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, configure_device
 from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_dram_post_add
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, MEMCPY_TYPE
 from user_dma_core import ue_35bit_addr_shifter
@@ -3146,6 +3146,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -3185,26 +3186,27 @@ def main():
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     args = parser.parse_args()
 
-    if args.device == "efinix":
-        print("ERROR: qwen2.5_vl_3b requires ~1564 MB of DRAM for weights, exceeding the Efinix board's 1 GB limit.")
-        raise SystemExit(1)
-
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    set_dma_device(args.dev)
+    profile = configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(args.device))
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}")
 
     ue = Qwen25VL3B_UnifiedEngine(script_dir=script_dir)
+    print(
+        f"DRAM layout: params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, "
+        f"program=0x{ue._program_dram_base:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}"
+    )
 
     ue.start_capture()
     ue.generate_instruction_halt()
@@ -3212,7 +3214,7 @@ def main():
     halt_bytes = bytearray()
     for inst in ue.capture_buffer:
         halt_bytes.extend(inst.get_bytes())
-    ue.dma_write(DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, halt_bytes, len(halt_bytes))
+    ue.dma_write(DMA_DEVICE_H2C, ue._program_dram_base, halt_bytes, len(halt_bytes))
     ue.clear_capture_buffer()
 
     cfg = _load_config(script_dir)
