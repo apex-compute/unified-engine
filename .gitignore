@@ -1,8 +1,17 @@
 __pycache__/
 *.pyc
 
-# Exported/downloaded model weights are large, deterministic outputs of a
-# checkpoint-export script (e.g. models/pi05_libero/export_weights.py) --
-# regenerate locally rather than committing multi-GB binaries to git.
-weights_export/
+# Per-model generated artifacts: compiled bins, downloaded HF snapshots, and
+# exported weight trees (e.g. models/pi05_libero/pi05_libero_bin/weights_export/,
+# produced by models/pi05_libero/pi05_libero_export_weights.py). All large and
+# deterministic -- regenerate locally rather than committing multi-GB blobs to git.
 *_bin/
+
+# Run logs and tensor dumps from test/eval/debug scripts (debug_*.npz,
+# *_run.log, ...) -- per-run generated output, never source.
+*.log
+*.npz
+
+# LIBERO eval output: libero_eval.py writes rollout videos, per-episode results
+# JSON and action dumps here -- regenerate by re-running the eval.
+models/pi05_libero/data/
