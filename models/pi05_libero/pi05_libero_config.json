@@ -93,8 +93,13 @@
   "paths": {
     "hf_model_repo": null,
     "openpi_checkpoint": "gs://openpi-assets/checkpoints/pi05_libero",
-    "weights_export_dir": "models/pi05_libero/weights_export",
-    "weights_manifest": "models/pi05_libero/weights_export/manifest.json"
+    "weights_export_dir": "models/pi05_libero/pi05_libero_bin/weights_export",
+    "weights_manifest": "models/pi05_libero/pi05_libero_bin/weights_export/manifest.json",
+    "_bin_paths_note": "bin_dir/params_bin/instruction_bin/instruction_meta are relative to the SCRIPT dir (qwen3 convention, resolved at runtime). The weights_export_dir/weights_manifest keys above are repo-root-relative and documentation-only.",
+    "bin_dir": "pi05_libero_bin",
+    "params_bin": "pi05_libero_bin/params.bin",
+    "instruction_bin": "pi05_libero_bin/programs.bin",
+    "instruction_meta": "pi05_libero_bin/programs.json"
   },
   "defaults": {
     "prompt": "pick up the object",
