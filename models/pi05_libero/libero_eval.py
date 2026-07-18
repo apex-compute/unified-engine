@@ -280,6 +280,34 @@ def _diff_actions(path_a, path_b):
             print(f"    #{i}  SNR {snr:7.1f} dB   gripper sign agreement {gsign*100:5.1f}%")
 
 
+def _overlay_prompt(frames, text, tag):
+    """Return the mp4 frames with the task prompt drawn in the top-left corner
+    (2x-upscaled for legibility). `tag` labels the backend/precision, e.g.
+    'fpga/if4-hw' or 'torch/bf16'. Falls back to raw frames if PIL is missing.
+    Overlay is applied to COPIES at write time only -- never to the frames fed
+    to the model."""
+    try:
+        from PIL import Image, ImageDraw
+        import textwrap
+    except Exception:
+        return [np.asarray(f) for f in frames]
+    label = f"[{tag}] {text}"
+    out = []
+    for f in frames:
+        im = np.asarray(f)
+        H, W = im.shape[:2]
+        pim = Image.fromarray(im).convert("RGB").resize((W * 2, H * 2), Image.NEAREST)
+        WW, _ = pim.size
+        d = ImageDraw.Draw(pim, "RGBA")
+        lines = textwrap.wrap(label, width=max(24, WW // 7))
+        lh, pad = 12, 3
+        d.rectangle([0, 0, WW, lh * len(lines) + 2 * pad], fill=(0, 0, 0, 170))
+        for i, ln in enumerate(lines):
+            d.text((pad, pad + i * lh), ln, fill=(255, 255, 0))
+        out.append(np.asarray(pim.convert("RGB")))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task-suite", default="libero_spatial", choices=list(_SUITE_MAX_STEPS))
@@ -304,8 +332,10 @@ def main():
     ap.add_argument("--backend", default="torch", choices=["torch", "fpga"],
                     help="torch = pi05_torch_ref golden reference; fpga = real hardware")
     ap.add_argument("--device", default="cuda", help="--backend torch only")
-    ap.add_argument("--quant", default="if4", choices=["fp32", "bf16", "if4"],
-                    help="--backend torch only; if4 matches what the FPGA actually runs")
+    ap.add_argument("--quant", default="bf16", choices=["fp32", "bf16", "if4"],
+                    help="--backend torch only. DEFAULT bf16 (full-precision reference: "
+                         "FPGA-if4 vs CUDA-bf16 shows the practical cost of 4-bit). Pass "
+                         "--quant if4 to instead isolate hardware faithfulness at matched precision.")
     ap.add_argument("--results-out", default=None,
                     help="JSON of per-episode success bits (default: data/libero/"
                          "results_<backend>_<suite>.json). Diff two of these for the "
@@ -408,32 +438,42 @@ def main():
 
         task_ep, task_succ = 0, 0
         for trial in range(args.trials):
-            env.reset()
-            obs = env.set_init_state(init_states[trial])
             plan = collections.deque()
-            replay, done, t = [], False, 0
+            replay, done, t, errored = [], False, 0, False
             print(f"[eval] task {task_id} '{task.language}' trial {trial}", flush=True)
-            while t < max_steps + args.wait_steps:
-                if t < args.wait_steps:                    # let objects settle
-                    obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
+            # Isolate each episode: a single bad rollout (sim glitch, one-off
+            # error) is recorded as a failure and the run CONTINUES to the
+            # remaining episodes instead of aborting the whole job.
+            try:
+                env.reset()
+                obs = env.set_init_state(init_states[trial])
+                while t < max_steps + args.wait_steps:
+                    if t < args.wait_steps:                    # let objects settle
+                        obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
+                        t += 1
+                        continue
+                    # rotate 180 to match training, resize_with_pad -> 224 uint8
+                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                    wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                    img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, RESIZE, RESIZE))
+                    wrist = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist, RESIZE, RESIZE))
+                    replay.append(img)
+                    if not plan:
+                        state = np.concatenate((
+                            obs["robot0_eef_pos"], _quat2axisangle(obs["robot0_eef_quat"]),
+                            obs["robot0_gripper_qpos"]))
+                        chunk = infer(img, wrist, state, str(task.language))
+                        plan.extend(chunk[: args.replan_steps])
+                    obs, _, done, _ = env.step(np.asarray(plan.popleft()).tolist())
+                    if done:
+                        break
                     t += 1
-                    continue
-                # rotate 180 to match training, resize_with_pad -> 224 uint8
-                img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, RESIZE, RESIZE))
-                wrist = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist, RESIZE, RESIZE))
-                replay.append(img)
-                if not plan:
-                    state = np.concatenate((
-                        obs["robot0_eef_pos"], _quat2axisangle(obs["robot0_eef_quat"]),
-                        obs["robot0_gripper_qpos"]))
-                    chunk = infer(img, wrist, state, str(task.language))
-                    plan.extend(chunk[: args.replan_steps])
-                obs, _, done, _ = env.step(np.asarray(plan.popleft()).tolist())
-                if done:
-                    break
-                t += 1
+            except Exception as _e:
+                import traceback
+                errored, done = True, False
+                print(f"[eval] !! task {task_id} trial {trial} ERRORED at step {t}: "
+                      f"{_e!r} -- recording as failure, continuing", flush=True)
+                traceback.print_exc()
             task_ep += 1
             total_ep += 1
             done = bool(done)
@@ -441,15 +481,26 @@ def main():
                 task_succ += 1
                 total_succ += 1
             episodes.append({"task_id": task_id, "trial": trial,
-                             "language": str(task.language), "steps": t, "success": done})
+                             "language": str(task.language), "steps": t,
+                             "success": done, "errored": errored})
             _save()   # checkpoint every episode -- a crash must not lose hours of work
-            suffix = "success" if done else "failure"
-            if not args.no_video:
+            suffix = "error" if errored else ("success" if done else "failure")
+            if not args.no_video and replay:
+                _tag = f"{args.backend}/{args.quant if args.backend == 'torch' else 'if4-hw'}"
                 imageio.mimwrite(
                     video_dir / f"{args.backend}_{args.task_suite}_t{task_id}_e{trial}_{suffix}.mp4",
-                    [np.asarray(x) for x in replay], fps=10)
-            print(f"[eval]   -> {'SUCCESS' if done else 'failure'}  "
+                    _overlay_prompt(replay, str(task.language), _tag), fps=10)
+            print(f"[eval]   -> {suffix.upper()}  "
                   f"(running {total_succ}/{total_ep} = {100*total_succ/total_ep:.1f}%)", flush=True)
+            # Per-episode cleanup so nothing accumulates across a long run.
+            del replay, plan
+            gc.collect()
+            if args.backend == "torch":
+                try:
+                    import torch as _t
+                    _t.cuda.empty_cache()
+                except Exception:
+                    pass
         print(f"[eval] task {task_id} success rate: {task_succ}/{task_ep}", flush=True)
         env.close()
         del env
