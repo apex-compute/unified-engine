@@ -45,8 +45,9 @@ def run(device, quant, sample):
     W = _ref.Weights(device=device, dtype=compute_dtype, quant=quant)
     images, prompt, state, noise = build_inputs(device, compute_dtype, sample)
     with torch.no_grad():
-        actions, kv = _ref.run_pi05(images, prompt, state, W, noise=noise, return_kv=True)
-    return actions[..., :7].squeeze(0).float().cpu(), kv
+        actions, kv, stages = _ref.run_pi05(
+            images, prompt, state, W, noise=noise, return_kv=True, return_stages=True)
+    return actions[..., :7].squeeze(0).float().cpu(), kv, stages
 
 
 def main():
@@ -57,17 +58,31 @@ def main():
 
     print(f"[compare] device={args.device} sample={args.sample}")
     print("[compare] running bf16 reference...")
-    a_bf16, kv_bf16 = run(args.device, "bf16", args.sample)
+    a_bf16, kv_bf16, st_bf16 = run(args.device, "bf16", args.sample)
     print("[compare] running if4 reference...")
-    a_if4, kv_if4 = run(args.device, "if4", args.sample)
+    a_if4, kv_if4, st_if4 = run(args.device, "if4", args.sample)
 
     torch.set_printoptions(precision=4, sci_mode=False)
-    print("\n=== bf16 vs IF4 action SNR (pure quantization loss, no FPGA) ===")
-    print(f"  overall: SNR={snr(a_if4, a_bf16):.2f}dB  MSE={((a_if4-a_bf16)**2).mean().item():.6f}")
-    for d in range(7):
-        print(f"  dim{d}: SNR={snr(a_if4[:, d], a_bf16[:, d]):6.2f}dB")
 
-    print("\n=== bf16 vs IF4 prefix K/V SNR (per layer) ===")
+    # ================= SECTION 1: VISION encoder output =================
+    # vision_tokens: (n_img, 256, 2048). Slot layout from build_inputs is
+    # [image, wrist_image, pad] -- the 3rd slot is an all-zero pad camera and
+    # must be EXCLUDED (masked rows poison SNR). Report only the real cameras.
+    print("\n=== SECTION 1: VISION encoder output SNR (bf16 vs IF4) ===")
+    vt_bf = st_bf16["vision_tokens"].float().cpu()   # (n_img, 256, 2048)
+    vt_if = st_if4["vision_tokens"].float().cpu()
+    n_img = vt_bf.shape[0]
+    real_slots = [s for s in range(n_img) if vt_bf[s].abs().sum() > 0]  # drop all-zero pad
+    cam_names = {0: "image", 1: "wrist"}
+    vt_bf_real = vt_bf[real_slots].reshape(-1, vt_bf.shape[-1])
+    vt_if_real = vt_if[real_slots].reshape(-1, vt_if.shape[-1])
+    print(f"  overall (real cams {real_slots}): SNR={snr(vt_if_real, vt_bf_real):6.2f}dB")
+    for s in real_slots:
+        print(f"    slot{s} ({cam_names.get(s, 'cam')}): "
+              f"SNR={snr(vt_if[s], vt_bf[s]):6.2f}dB")
+
+    # ================= SECTION 2: PREFIX K/V =================
+    print("\n=== SECTION 2: PREFIX K/V SNR (per layer) ===")
     k_bf, v_bf = kv_bf16
     k_if, v_if = kv_if4
     for L in range(len(k_bf)):
@@ -76,6 +91,27 @@ def main():
         rv = v_bf[L].squeeze(0).squeeze(1).float().cpu()
         fv = v_if[L].squeeze(0).squeeze(1).float().cpu()
         print(f"  layer{L:2d}: K_SNR={snr(fk, rk):6.2f}dB  V_SNR={snr(fv, rv):6.2f}dB")
+
+    # ================= SECTION 3: SUFFIX / DENOISE =================
+    # Final action chunk is the denoise/suffix section's headline number. We
+    # also report the per-Euler-step intermediate SNR: the pre-unnormalize
+    # velocity v_t and the denoise state x_t at each of the 10 steps. All
+    # suffix tokens are valid (no masked rows here), so nothing is excluded.
+    print("\n=== SECTION 3: SUFFIX / DENOISE output SNR (action-expert) ===")
+    print(f"  FINAL action chunk (10x7): SNR={snr(a_if4, a_bf16):6.2f}dB  "
+          f"MSE={((a_if4-a_bf16)**2).mean().item():.6f}")
+    for d in range(7):
+        print(f"    dim{d}: SNR={snr(a_if4[:, d], a_bf16[:, d]):6.2f}dB")
+    print("  per Euler step (intermediate denoise state):")
+    vel_bf, vel_if = st_bf16["velocities"], st_if4["velocities"]
+    xs_bf, xs_if = st_bf16["denoise_states"], st_if4["denoise_states"]
+    for i in range(len(vel_bf)):
+        rvel = vel_bf[i][..., :7].squeeze(0).float().cpu()
+        fvel = vel_if[i][..., :7].squeeze(0).float().cpu()
+        rx = xs_bf[i][..., :7].squeeze(0).float().cpu()
+        fx = xs_if[i][..., :7].squeeze(0).float().cpu()
+        print(f"    step{i:2d}: v_t_SNR={snr(fvel, rvel):6.2f}dB  "
+              f"x_t_SNR={snr(fx, rx):6.2f}dB")
 
     print("\nbf16 actions (10,7):")
     print(a_bf16)
