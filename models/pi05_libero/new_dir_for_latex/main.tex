@@ -1,0 +1,279 @@
+%=============================================================================
+%  Physical Intelligence pi0.5 on the Unified Engine v1
+%  Single-column report -- 2-PAGE version (skeleton tables to fill in).
+%  Build: pdflatex main.tex   (article, amsmath, booktabs)
+%  Overleaf: paste as main.tex, compiler = pdfLaTeX.
+%=============================================================================
+\documentclass[11pt]{article}
+
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+% ---- macros -------------------------------------------------------------
+\newcommand{\pizero}{$\pi_{0.5}$}
+\newcommand{\ue}{Unified~Engine}
+\newcommand{\iffour}{IF4}
+\newcommand{\bfteen}{bf16}
+\newcommand{\numTBD}{{\color{red}--}}
+
+\setlength{\textfloatsep}{6pt}       % tighten space around floats
+\setlength{\floatsep}{6pt}
+\setlength{\intextsep}{6pt}
+\setlength{\parskip}{2pt}
+
+\title{\vspace{-2em}Physical Intelligence \pizero{} --- \ue{}~v1}
+\author{Apex Compute}
+\date{\vspace{-1em}}
+
+\begin{document}
+\maketitle
+
+%=============================================================================
+\section{The \pizero{} Model}
+\label{sec:model}
+%=============================================================================
+\pizero{} is a vision--language--action (VLA) policy of roughly three billion
+parameters that maps camera observations and a language instruction directly to
+robot actions. Each inference emits a $10{\times}7$ action chunk: ten future
+control steps, each a $7$-dimensional command giving the robot's degrees of
+freedom (arm motion plus gripper). The computation splits into three stages run
+in sequence---a vision encoder, a language prefix, and a flow-matching action
+expert.
+
+\subsection{Vision encoder}
+Each image is encoded independently by a SigLIP ViT; \pizero{} takes up to three
+slots (scene, wrist, one padded). Every $224{\times}224$ image becomes $256$
+patch tokens of width $1152$, run through $L_v{=}27$ bidirectional layers
+($16$ heads, head-dim $72$, MLP width $4304$). Re-run per image and never
+cached, it costs $\approx$656\,GFLOP.
+
+\subsection{Language prefix}
+The patch tokens are projected to $d{=}2048$, concatenated with the instruction
+tokens, and processed once by a Gemma-2B backbone: $L_p{=}18$ layers of
+grouped-query attention ($8$ query, $1$ KV head, head-dim $256$), RMSNorm, RoPE,
+and a gated SiLU MLP ($I{=}16384$). At prefill length $M_p{=}576$ one layer costs
+\begin{equation}
+2 M_p d\, d_{q} + 4 M_p d\, d_{kv} + 2 M_p d_{q} d
++ 4 M_p^2 d_{q} + 6 M_p d\, I ,
+\end{equation}
+($d_q{=}2048$, $d_{kv}{=}256$), dominated by the MLP; over $18$ layers the
+prefix is $\approx$2332\,GFLOP ($76\%$ of the model). Each layer's K/V is cached
+and reused by every denoise step.
+
+\subsection{Action expert}
+A second, smaller Gemma ($\sim$300\,M; $H{=}1024$, MLP $4096$, $18$ layers)
+turns noise into the action chunk by flow matching: from Gaussian noise it
+integrates a learned velocity field $v_\theta$ over $N{=}10$ Euler steps
+($\Delta t{=}-0.1$),
+\begin{equation}
+x_{t+\Delta t}=x_t+\Delta t\,v_\theta\!\left(x_t,\,t,\,\mathrm{KV}_{\text{prefix}}\right),
+\label{eq:euler}
+\end{equation}
+each step attending over the cached prefix K/V and reading out actions through a
+$(1024{\to}32)$ head. At only $\approx$71\,GFLOP ($2.3\%$) it is arithmetically
+small but the sole sequential stage, and its per-step error accumulates through
+the integrator.
+
+\begin{table}[t]
+\centering\small
+\caption{Per-stage parameter and FLOP budget (per inference). \emph{Effective}
+uses true model dims; \emph{FPGA} is the padded shape the 64-wide SIMD ALU
+actually issues. The prefix is already 64-aligned (no padding); the vision
+tower pads only its attention head ($72{\to}128$, $+2.9\%$); the action expert
+pads its query horizon $10{\to}64$ and action width $32{\to}64$, inflating its
+work $\sim$6.5$\times$ --- so overall the FPGA issues $\sim$13\% more FLOPs than
+the model nominally needs.}
+\label{tab:budget}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Stage} & \textbf{Params} & \textbf{Eff.\ GFLOP} & \textbf{FPGA GFLOP} \\
+\midrule
+Vision tower (SigLIP, 3 slots) & $\sim$0.41\,B & 655.9 & 674.9 \\
+Language prefix (Gemma-2B)     & $\sim$2.0\,B  & 2332.0 & 2332.0 \\
+Action expert (Gemma-300M)     & $\sim$0.31\,B & 71.0 & 459.4 \\
+\midrule
+\textbf{Total} & \textbf{$\sim$2.7\,B} & \textbf{3058.9} & \textbf{3466.3} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Porting}
+\label{sec:port}
+%=============================================================================
+The \ue{}~v1 is a soft accelerator IP block that can be deployed on any
+sufficiently large FPGA; it operates on $64$-element alignment. In this work it
+is targeted to a Xilinx Kintex-7 with $4$\,GB of attached DRAM. These two
+constraints---$64$-alignment and the $4$\,GB DRAM budget---drive the porting
+transformations below.
+
+
+\textbf{\iffour{} weights / DRAM budget.} The $\sim$13\,GB \bfteen{} checkpoint
+does not fit, and writes at/above the 4\,GB boundary fail on this board. All
+matmul weights use 4-bit block quantization (block 64, weight-only),
+shrinking the three stacks to $\sim$1.56\,GB. Weights are dequantized to
+\bfteen{} immediately before each multiply--accumulate, so \iffour{} is a
+\emph{footprint enabler, not a speedup} --- compute is \bfteen{} throughout.
+
+\textbf{Vision head-dim pad.} Head-dim $72$ is not $64$-/$128$-aligned, so the
+attention matmuls are padded $72{\to}128$ and contracted back via a precomputed
+$128{\times}72$ selection matrix; the $Q/K/V/O$ projections stay at $72$.
+
+\textbf{Prefix masking.} The masked image slot is dropped, compressing prefill
+$832{\to}576$ (bit-identical, $\sim$24\% faster). Rotary positions use
+cumulative-sum-of-mask indices, not \texttt{arange}, so dropping a slot does
+not shift phase. The non-causal/causal mixed attention mask is supplied as a
+static bias tensor in DRAM.
+
+\textbf{Denoise loop.} All $10{\times}18$ steps are unrolled into one program
+issued with a single execute call; AdaRMSNorm conditioning is a matmul to $3H$
+split into scale/shift/gate. Every strided SRAM$\to$DRAM copy needs an explicit
+per-index destination offset --- a missing one yields finite-but-scrambled
+output (not a NaN), and fixing these recovered the expert from $-10$ to
+$\sim$29\,dB.
+
+%=============================================================================
+\section{Quantization}
+\label{sec:quant}
+%=============================================================================
+We diff an identical torch reference run with \bfteen{} vs.\ fake-quantized
+\iffour{} weights (same inputs and noise), reporting SNR,
+$\mathrm{SNR}(a,b){=}20\log_{10}(\lVert b\rVert/\lVert a{-}b\rVert)$, per stage
+(Table~\ref{tab:quant}; masked rows excluded, sample~0). This is the
+\emph{theoretical} quantization floor---measured on the GPU reference itself, so
+it isolates \iffour{}'s numerical cost from any hardware effect. The pattern is
+clear: the vision encoder is nearly untouched (25.4\,dB), the prefix caches
+degrade with depth---values (V) markedly worse than keys (K), $10.7$ vs.\
+$16.0$\,dB mean---and the denoise stage carries the largest \emph{effective}
+loss. There, per-step velocity error accumulates through Eq.~\eqref{eq:euler}:
+the running state $x_t$ walks from $45$\,dB down to $16.3$\,dB over the ten Euler
+steps (Table~\ref{tab:quant-detail}), and the final error concentrates in
+low-magnitude action dimensions (dim\,1 at $1.5$\,dB) while the task-critical
+dimensions are preserved (primary axis dim\,0 at $24.9$\,dB, gripper dim\,6 at
+$40.7$\,dB). SNR is only a diagnostic; the acceptance gate is the closed-loop
+LIBERO agreement (last rows) between the FPGA \iffour{} policy and the CUDA
+\bfteen{} reference over 10 episodes, reserved below.
+
+\begin{table}[t]
+\centering\small
+\caption{\iffour{} vs.\ \bfteen{} per section (torch reference, sample~0), and
+reserved closed-loop FPGA/CUDA agreement.}
+\label{tab:quant}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model section} & \textbf{SNR (dB)} & \textbf{Range (dB)} \\
+\midrule
+Vision encoder (3 cameras)      & 25.37 & 24.3--26.6 \\
+Prefix K-cache (18 layers)      & 15.96 & 12.5--19.6 \\
+Prefix V-cache (18 layers)      & 10.65 & 7.0--15.4 \\
+Denoise velocity $v_t$ (10 steps) & 23.49 & 11.5--26.2 \\
+\midrule
+\textbf{End-to-end action (10$\times$7)} & \textbf{16.31} & MSE $4.05{\times}10^{-3}$ \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{LIBERO closed-loop, 10 episodes (reserved):}}\\
+FPGA \iffour{} success rate      & \multicolumn{2}{c}{\numTBD/10} \\
+CUDA \bfteen{} success rate      & \multicolumn{2}{c}{\numTBD/10} \\
+Action-chunk agreement (dB)      & \multicolumn{2}{c}{\numTBD} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{Final-action detail: per-dimension SNR (left) and error accumulation of
+the running state $x_t$ across Euler steps (right). Sample~0.}
+\label{tab:quant-detail}
+\begin{tabular}{@{}lc@{\hspace{1.5em}}lc@{}}
+\toprule
+\textbf{Action dim} & \textbf{SNR (dB)} & \textbf{Euler step} & \textbf{$x_t$ SNR (dB)} \\
+\midrule
+dim\,0 (primary) & 24.91 & step 0 & 44.95 \\
+dim\,1           & 1.50  & step 3 & 30.13 \\
+dim\,2           & 10.08 & step 5 & 24.15 \\
+dim\,3           & 6.73  & step 7 & 20.53 \\
+dim\,4           & 4.65  & step 8 & 19.26 \\
+dim\,5           & 17.61 & step 9 & 16.31 \\
+dim\,6 (gripper) & 40.73 & (final) & 16.31 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{center}
+\fbox{\parbox{0.92\columnwidth}{\small\itshape
+[TODO --- write the takeaway here: ``as we can see, \iffour{} is not that bad!''
+--- i.e.\ the quantization floor is benign; the task-critical action dimensions
+(primary axis, gripper) stay high-SNR and closed-loop behavior is preserved.]}}
+\end{center}
+
+%=============================================================================
+\section{Throughput: FPGA vs.\ CUDA}
+\label{sec:throughput}
+%=============================================================================
+We time each stage on both platforms and report it in the same form: per-section
+wall-clock and the achieved rate (section FLOPs $\div$ time). FPGA times come
+from the engine's own instrumentation. The
+GPU baseline is openpi's JAX/XLA \texttt{Pi0} --- the deployment path, sustaining
+$130.2$\,ms/inference ($7.68$\,Hz), batch~1 --- broken into the same three stages
+by jitting each separately and forcing device completion
+(\texttt{block\_until\_ready}) at the boundaries. Because these stages are
+dispatched separately rather than fused into the deployed \texttt{lax.while\_loop},
+their sum ($135.4$\,ms) slightly exceeds the fused end-to-end ($130.2$\,ms); the
+per-stage split is used for the breakdown, the fused number for the headline.
+
+\begin{table}[t]
+\centering\small
+\caption{FPGA (\iffour{}) per-section timing and achieved throughput.
+Batch~1, 10 denoise steps, sample~0. \emph{Skeleton.}}
+\label{tab:timing-fpga}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
+\midrule
+Vision encoder          & \numTBD & \numTBD \\
+Prefix (Gemma-2B)       & \numTBD & \numTBD \\
+Action expert (denoise) & \numTBD & \numTBD \\
+\midrule
+\textbf{End-to-end}     & \numTBD & \numTBD \\
+\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{\numTBD} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{RTX~5070 (\bfteen{}, openpi JAX/XLA) per-section timing and achieved
+throughput. Batch~1, 10 denoise steps, sample~0. Per-stage times are
+separately-jitted; End-to-end is the fused \texttt{policy.infer}.}
+\label{tab:timing-gpu}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
+\midrule
+Vision encoder          & 19.41  & 33\,793 \\
+Prefix (Gemma-2B)       & 79.29  & 29\,411 \\
+Action expert (denoise) & 36.70  & 1\,935  \\
+\midrule
+\textbf{End-to-end}     & 130.15 & 23\,502 \\
+\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{7.68} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{2pt}
+\noindent\textbf{Config.} FPGA: \ue{} v1 IP on Xilinx Kintex-7, \iffour{}
+weights / \bfteen{} compute, $4$\,GB DRAM. GPU: RTX~5070, \bfteen{}, $12$\,GB,
+openpi JAX/XLA. Both: batch~1, 10 denoise steps, sample~0.
+
+\vspace{4pt}
+The entire \pizero{} VLA --- vision, Gemma-2B prefix, and the 10-step
+flow-matching expert --- runs on the \ue{}~v1. The recurring theme is the split
+between where FLOPs concentrate (the compute-bound prefix) and where latency
+does (the sequential, FLOP-light denoise loop), and how \iffour{} trades a
+controlled, section-localized accuracy cost for fitting a $\sim$13\,GB model in
+a sub-4\,GB budget. Tables~\ref{tab:quant}--\ref{tab:timing-gpu} complete the
+characterization once populated.
+
+\end{document}

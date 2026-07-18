@@ -296,7 +296,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # False (default): all-zero image slots are DROPPED from the prefix -> 576 tokens.
     # True: they are carried as -inf-masked placeholder rows -> 832 tokens, ~1050
     # GFLOP/inference of provably-dead work. See run_vision.
-    KEEP_MASKED_SLOTS = False
+    KEEP_MASKED_SLOTS = True
+
+    # Whether the vision ENCODER skips all-zero (padding) image slots.
+    # False (default): every slot is encoded on-HW, incl. LIBERO's all-zero 3rd
+    # camera -- a full 3-slot vision pass, matching the GPU (which runs SigLIP on
+    # all slots). True: skip the encoder for zero slots (saves a 27-layer pass).
+    # Independent of masking: a zero slot is ALWAYS recorded in
+    # masked_vision_slots and masked out of attention either way; when encoded,
+    # its output is overwritten by a finite 1e-6 placeholder before the prefix.
+    SKIP_ZERO_VISION_SLOTS = False
 
     # Text tokens reserved after the vision rows. The prefix length is DERIVED
     # (n_vision_rows + this), not read from config.prefill_max_seq_len -- that key
@@ -960,6 +969,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         prefix_S_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(prefix_S_reg, S)
 
+        # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds the
+        # sqrt(N) RSQRT scale implicitly -- the dynamic core reads it from a runtime
+        # GPR (float_to_bf19(sqrt(N))) and takes N in its own GPR. Mirror gemma3:
+        # prime bf19(sqrt(N)) + N once here and thread them through every RMSNorm
+        # below (N = HIDDEN_SIZE for the prefix stack). Without this the norm is
+        # mis-scaled by ~sqrt(N).
+        prefix_N_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(prefix_N_reg, H)
+        prefix_sqrt_N_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(prefix_sqrt_N_reg, self.float_to_bf19(float(H ** 0.5)))
+
         # Inline unified attention (unified_attention_core_dynamic) replaces the
         # old shared-subroutine flash-attention API (flash_attention_core*, deleted
         # in the rebase onto main). PREFIX is MQA self-attention (S x S): the 8
@@ -984,7 +1004,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # 1. pre-attention RMSNorm
                 self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,
                                          OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln1"],
-                                         gpr_M_reg=prefix_S_reg)
+                                         gpr_M_reg=prefix_S_reg, gpr_N_reg=prefix_N_reg,
+                                         gpr_sqrt_n_reg=prefix_sqrt_N_reg)
                 self._debug_op(f"layer{layer_idx}_ln1", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H))
                 if layer_idx == 0 and self._prefix_snap:
                     self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln1"])
@@ -1062,7 +1083,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                         BIAS_DRAM_ADDR=self.prefix_bias_dram,
                         OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
                         SCRATCH_DRAM_ADDR=prefix_attn_scratch,
-                        IDENTITY_DRAM_ADDR=self.identity_addr, q_scale=None)
+                        IDENTITY_DRAM_ADDR=self.identity_addr)
                     self._debug_op(f"layer{layer_idx}_head{h}", self.LAYER0_ATTN_OUT_DRAM + h * head_bytes, S * D, shape=(S, D))
                     if layer_idx == 0 and self._prefix_snap:
                         self._dram_copy(head_bytes, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
@@ -1085,7 +1106,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # 8. pre-FFW RMSNorm
                 self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.LAYER0_ATTN_RESIDUAL_DRAM,
                                          OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln2"],
-                                         gpr_M_reg=prefix_S_reg)
+                                         gpr_M_reg=prefix_S_reg, gpr_N_reg=prefix_N_reg,
+                                         gpr_sqrt_n_reg=prefix_sqrt_N_reg)
                 self._debug_op(f"layer{layer_idx}_ln2", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H))
                 if layer_idx == 0 and self._prefix_snap:
                     self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln2"])
@@ -1137,6 +1159,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         except _DebugStop:
             pass   # halt already emitted by _debug_op.
 
+        self.release_isa_reg()  # prefix_sqrt_N_reg
+        self.release_isa_reg()  # prefix_N_reg
         self.release_isa_reg()  # prefix_S_reg
         print(f"compile_prefix: {self.NUM_LAYERS} layers compiled, seq_len={S}, valid_len={valid_len}")
 
@@ -1191,13 +1215,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                 self.VIS_I_PAD)
         bpe = 2
 
-        # layer_norm_core_dram_pbi chunking (replicated so we prime n_chunks correctly).
-        _ln_ops_per_row = 6
-        _ln_chunk = min(URAM_NEAR_FULL_ELEMENTS // H, S, (256 - 4) // _ln_ops_per_row)
-        while S % _ln_chunk != 0:
-            _ln_chunk -= 1
-        ln_n_chunks = S // _ln_chunk
-
         self.start_capture()
         self._debug_counter = 0
         self._debug_halt_info = None
@@ -1206,10 +1223,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.reset_isa_reg_counter()
         self.reset_inst_ptr_counter()
 
+        # Norm ABI (post pcie_only sync): layer_norm_core_dram now dispatches to the
+        # dynamic core, where gpr_M_reg is the runtime ROW COUNT (S), not the old PBI
+        # n_chunks, and the sqrt(N) RSQRT scale is a runtime GPR (float_to_bf19(sqrt(N)))
+        # rather than an implicit fold. The old code primed gpr_M_reg with n_chunks
+        # (correct only for the retired PBI ABI): under the new ABI that normalized only
+        # ~n_chunks of S rows, so the un-normalized rows compounded across the 27 encoder
+        # layers and overflowed bf16 -> NaN vision tokens. Prime rows=S plus N + bf19(sqrt(N))
+        # (vision LayerNorm N = VIS_H) and thread them through every layer_norm below.
         vis_S_reg = self.alloc_isa_reg()
-        vis_ln_chunks = self.alloc_isa_reg()
+        vis_N_reg = self.alloc_isa_reg()
+        vis_sqrt_N_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(vis_S_reg, S)
-        self.generate_instruction_add_set(vis_ln_chunks, ln_n_chunks)
+        self.generate_instruction_add_set(vis_N_reg, H)
+        self.generate_instruction_add_set(vis_sqrt_N_reg, self.float_to_bf19(float(H ** 0.5)))
 
         def vis_matmul(M, K, N, A, la, proj, OUT, bias=None, **kw):
             self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
@@ -1235,7 +1262,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
                 # LN0 (PBI)
                 self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                    GAMMA_DRAM_ADDR=la['ln0_w'], BETA_DRAM_ADDR=la['ln0_b'], gpr_M_reg=vis_ln_chunks,
+                    GAMMA_DRAM_ADDR=la['ln0_w'], BETA_DRAM_ADDR=la['ln0_b'], gpr_M_reg=vis_S_reg,
+                    gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
                     ZEROS_DRAM_ADDR=self.vis_zeros_addr)
                 self._debug_op(f"layer{layer_idx}_ln0", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H))
                 # Q/K/V projections (PBI, IF4). N=NH*DP: weights are pre-padded per-head
@@ -1273,7 +1301,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                         V_DRAM_ADDR=self.VIS_FLASH_V_DRAM, BIAS_DRAM_ADDR=self.VIS_ZERO_BIAS_DRAM,
                         OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
                         SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
-                        IDENTITY_DRAM_ADDR=self.identity_addr, q_scale=None)
+                        IDENTITY_DRAM_ADDR=self.identity_addr)
                     self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
                     self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
                         stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
@@ -1284,7 +1312,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
                 self._debug_op(f"layer{layer_idx}_residual1", self.VIS_RESIDUAL_DRAM, S * H, shape=(S, H))
                 self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                    GAMMA_DRAM_ADDR=la['ln1_w'], BETA_DRAM_ADDR=la['ln1_b'], gpr_M_reg=vis_ln_chunks,
+                    GAMMA_DRAM_ADDR=la['ln1_w'], BETA_DRAM_ADDR=la['ln1_b'], gpr_M_reg=vis_S_reg,
+                    gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
                     ZEROS_DRAM_ADDR=self.vis_zeros_addr)
                 self._debug_op(f"layer{layer_idx}_ln1", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H))
                 # MLP: Dense_0 + GELU (sigmoid-approx — the engine's only hardware GELU; the
@@ -1303,7 +1332,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
             self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
                 GAMMA_DRAM_ADDR=self.vis_encoder_norm_w, BETA_DRAM_ADDR=self.vis_encoder_norm_b,
-                gpr_M_reg=vis_ln_chunks, ZEROS_DRAM_ADDR=self.vis_zeros_addr)
+                gpr_M_reg=vis_S_reg, gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
+                ZEROS_DRAM_ADDR=self.vis_zeros_addr)
             self._debug_op("encoder_norm", self.VIS_POST_LN_DRAM, S * H, shape=(S, H))
             vis_matmul(S, H, self.VIS_HEAD_OUT, self.VIS_POST_LN_DRAM,
                 {'head_data': self.vis_head_data, 'head_scale': self.vis_head_scale}, 'head',
@@ -1314,7 +1344,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         except _DebugStop:
             pass   # halt already emitted by _debug_op.
 
-        self.release_isa_reg()  # vis_ln_chunks
+        self.release_isa_reg()  # vis_sqrt_N_reg
+        self.release_isa_reg()  # vis_N_reg
         self.release_isa_reg()  # vis_S_reg
         self.stop_capture()
 
@@ -1752,8 +1783,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         H = self.AE_HIDDEN
         bpe = 2
         # 1. RMSNorm (no gamma)
+        # sqrt(N)/N runtime scalars primed in compile_denoise_loop (post-sync norm ABI).
         self.rms_norm_core_dram(M=M, N=H, A_DRAM_ADDR=x_dram, OUTPUT_DRAM_ADDR=self.AE_NORM_DRAM,
-                                 GAMMA_DRAM_ADDR=self.AE_ONES_DRAM, gpr_M_reg=gpr_M_reg)
+                                 GAMMA_DRAM_ADDR=self.AE_ONES_DRAM, gpr_M_reg=gpr_M_reg,
+                                 gpr_N_reg=self._ae_rms_N_reg, gpr_sqrt_n_reg=self._ae_rms_sqrt_reg)
         # 2. conditioning matmul: cond (1,H) @ dense (H,3H) -> modulation (1,3H), +bias
         # (M=1 here always -- one conditioning vector regardless of the caller's M -- so
         # no gpr_M_reg needed, a single-row matmul is already minimal.)
@@ -2088,6 +2121,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         ae_S_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(ae_S_reg, S)
 
+        # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds sqrt(N)
+        # implicitly -- the dynamic core reads N and bf19(sqrt(N)) from runtime GPRs.
+        # Prime them once here (N = AE_HIDDEN) and thread them through the AdaRMSNorm
+        # helper via instance attrs so every suffix-layer + final norm is scaled right.
+        ae_N_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(ae_N_reg, H)
+        ae_sqrt_N_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(ae_sqrt_N_reg, self.float_to_bf19(float(H ** 0.5)))
+        self._ae_rms_N_reg = ae_N_reg
+        self._ae_rms_sqrt_reg = ae_sqrt_N_reg
+
         # Seed the combined K/V buffers' prefix rows [0:P] once (unchanged across
         # all 10 Euler steps / all layers' repeated suffix_step calls). MUST be
         # captured here (inside this function's own start_capture session) --
@@ -2190,6 +2234,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         except _DebugStop:
             pass   # halt already emitted by _debug_op.
 
+        self.release_isa_reg()  # ae_sqrt_N_reg
+        self.release_isa_reg()  # ae_N_reg
         self.release_isa_reg()  # ae_S_reg
         print("compile_denoise_loop done: 10-step Euler action-expert flow-matching stack compiled "
               "(statically unrolled, inline unified attention)")
@@ -2245,9 +2291,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # nothing. Saves one full 27-layer encoder pass per zero slot.
         masked_slots = []
         for i, img in enumerate(images_hwc):
-            if not np.any(img):  # all-zero placeholder image -> skip, mask
-                outs.append(torch.full((S, HO), 1e-6, dtype=torch.bfloat16))
+            is_zero = not np.any(img)  # all-zero placeholder image (e.g. LIBERO 3rd cam)
+            if is_zero:
+                # ALWAYS attention-mask a zero slot (openpi image_mask=False),
+                # whether or not we spend the encoder pass on it.
                 masked_slots.append(i)
+            if is_zero and self.SKIP_ZERO_VISION_SLOTS:
+                outs.append(torch.full((S, HO), 1e-6, dtype=torch.bfloat16))
                 print(f"  [vision] slot {i} SKIPPED (zero image, masked out)")
                 continue
             patches = self._patchify(img)  # (256, 588)
@@ -2268,6 +2318,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, HO).clone()
             outs.append(out)
             print(f"  [vision] slot {i} done")
+
+        # Overwrite any masked (all-zero) slot's encoded tokens with the finite
+        # 1e-6 placeholder before they enter the prefix. The slot is -inf-masked
+        # out of all attention anyway, so its encoded content is never used; this
+        # keeps the carried rows finite/clean (identical to the skip path) while
+        # still having run the encoder pass above for representative timing.
+        for i in masked_slots:
+            outs[i] = torch.full((S, HO), 1e-6, dtype=torch.bfloat16)
+
         # DROP dead slots from the prefix entirely -- do not carry them as masked
         # placeholder rows.
         #
@@ -2898,9 +2957,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         print(f"  ⚡ {label:<18} {flops/1e9:7.0f} GFLOP  {seconds:6.1f}s  "
               f"{gfs:6.1f} GFLOP/s  [{100*gfs/peak:4.0f}% peak]")
 
+    def _n_vision_slots_encoded(self):
+        """Image slots the encoder actually RAN: all of them unless zero slots are
+        skipped (SKIP_ZERO_VISION_SLOTS), matching the GPU which encodes all slots."""
+        n = _CFG["vision"]["num_image_slots"]
+        if self.SKIP_ZERO_VISION_SLOTS:
+            n -= len(getattr(self, "masked_vision_slots", []))
+        return n
+
     def _vision_flops(self):
         v = _CFG["vision"]
-        n_slots = v["num_image_slots"] - len(getattr(self, "masked_vision_slots", []))
+        n_slots = self._n_vision_slots_encoded()
         return n_slots * self._xformer_flops(  # only slots actually encoded
             M=v["num_patches"], Mkv=v["num_patches"], hidden=v["hidden_size"],
             inter=v["intermediate_size"], layers=27, nq=v["num_heads"], nkv=v["num_heads"],
@@ -2951,8 +3018,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         else:
             vision_tokens = self.run_vision(images_hwc)
             t_vision = time.perf_counter() - t0
-            n_enc = _CFG["vision"]["num_image_slots"] - len(getattr(self, "masked_vision_slots", []))
+            n_enc = self._n_vision_slots_encoded()
             self._report_gflops(f"vision ({n_enc} slots)", self._vision_flops(), t_vision)
+            _vf = vision_tokens.to(torch.float32)
+            print(f"  [nan-check] vision tokens : nan={bool(torch.isnan(_vf).any())} "
+                  f"({int(torch.isnan(_vf).sum())}/{_vf.numel()})  "
+                  f"finite|max|={float(_vf[torch.isfinite(_vf)].abs().max()) if torch.isfinite(_vf).any() else float('nan'):.4g}")
             if getattr(self, "VISION_SNR_CHECK", False):
                 self._vision_snr_check(images_hwc, vision_tokens)
 
@@ -2962,6 +3033,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # robot) + the text budget.
             seq_len = vision_tokens.shape[0] + self.PREFIX_TEXT_BUDGET
             valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
+            _inb = seq_len * self.HIDDEN_SIZE * 2
+            _buf = bytearray(_inb); self._dma_read_checked(self.LAYER0_INPUT_DRAM, _buf, _inb)
+            _in = torch.frombuffer(bytes(_buf), dtype=torch.bfloat16).to(torch.float32)
+            print(f"  [nan-check] prefix INPUT  : nan={bool(torch.isnan(_in).any())} "
+                  f"({int(torch.isnan(_in).sum())}/{_in.numel()})")
             # COMPILE-ONCE: the prefix program is invariant to valid_len (M is
             # always seq_len; valid_len only shapes the DMA'd bias DATA). Compile
             # the first obs, then re-DMA just the fresh bias mask to the SAME
@@ -2978,6 +3054,24 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self._execute(self._prefix_prog_addr, label="prefix", timeout=250.0)
             t_prefix = time.perf_counter() - t1
             self._report_gflops(f"prefix ({seq_len} tok)", self._prefix_flops(seq_len), t_prefix)
+            # Per-layer K/V NaN scan -> pinpoint the FIRST prefix layer that goes NaN.
+            _stride = self.KV_LAYER_STRIDE
+            _first_nan = None
+            for _l in range(self.NUM_LAYERS):
+                _cells = []
+                for _nm, _base in (("K", self.LAYER0_K_DRAM), ("V", self.LAYER0_V_DRAM)):
+                    _buf = bytearray(_stride)
+                    self._dma_read_checked(_base + _l * _stride, _buf, _stride)
+                    _kv = torch.frombuffer(bytes(_buf), dtype=torch.bfloat16).to(torch.float32)
+                    _nn = int(torch.isnan(_kv).sum())
+                    _mx = float(_kv[torch.isfinite(_kv)].abs().max()) if torch.isfinite(_kv).any() else float('nan')
+                    _cells.append((_nm, _nn, _kv.numel(), _mx))
+                    if _nn and _first_nan is None:
+                        _first_nan = (_l, _nm)
+                _tag = "  ".join(f"{n}: nan={c}/{t} |max|={m:.3g}" for n, c, t, m in _cells)
+                print(f"  [nan-check] prefix L{_l:02d} : {_tag}")
+            if _first_nan is not None:
+                print(f"  [nan-check] >>> FIRST NaN at prefix layer {_first_nan[0]} ({_first_nan[1]}-cache)")
 
             if getattr(self, "PREFIX_SNAPSHOTS", False):
                 self._prefix_layer0_op_snr_report(prompt_tokens, vision_tokens, valid_len)
@@ -3754,12 +3848,16 @@ def main():
                      help="snapshot step-0 action-expert intermediates and diff each against the "
                           "torch reference (fed the FPGA's own K/V) to localize which op first "
                           "diverges. Works with --debug for a fast ~75s iteration loop.")
-    ap.add_argument("--keep-masked-slots", action="store_true",
-                     help="A/B control for the 832-vs-576 prefix experiment: carry all-zero "
-                          "image slots as -inf-masked placeholder rows instead of dropping "
-                          "them. Prefix 576 -> 832 tokens (+1050 GFLOP, ~+47s). Output should "
-                          "be bit-identical to the default; that equality is the point. "
-                          "Vision cost is unaffected -- the encoder skips zero slots either way.")
+    ap.add_argument("--keep-masked-slots", action=argparse.BooleanOptionalAction, default=True,
+                     help="Carry all-zero image slots as -inf-masked placeholder rows -> prefix "
+                          "832 tokens (matches the GPU, which processes all image tokens). "
+                          "DEFAULT ON. Pass --no-keep-masked-slots to DROP them (prefix 576 "
+                          "tokens, -1050 GFLOP). Output is bit-identical either way.")
+    ap.add_argument("--skip-zero-vision-slots", action=argparse.BooleanOptionalAction, default=False,
+                     help="Skip the encoder for all-zero (padding) image slots. DEFAULT OFF -- "
+                          "every slot is encoded (full 3-slot vision pass, matches the GPU). "
+                          "Pass --skip-zero-vision-slots to skip the encoder for zero slots. "
+                          "Attention masking is unaffected either way.")
     args, _ = ap.parse_known_args()
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
@@ -3776,10 +3874,20 @@ def main():
         Pi05Libero_UnifiedEngine.VISION_SNR_CHECK = True
         print("[main] VISION_SNR_CHECK enabled -- will diff the vision encoder vs the IF4 reference")
 
+    Pi05Libero_UnifiedEngine.KEEP_MASKED_SLOTS = bool(args.keep_masked_slots)
     if args.keep_masked_slots:
-        Pi05Libero_UnifiedEngine.KEEP_MASKED_SLOTS = True
-        print("[main] KEEP_MASKED_SLOTS enabled -- dead image slots carried as masked "
-              "placeholder rows (prefix 832 tok, the slow control arm)")
+        print("[main] KEEP_MASKED_SLOTS enabled (default) -- dead image slots carried as "
+              "masked placeholder rows (prefix 832 tok)")
+    else:
+        print("[main] KEEP_MASKED_SLOTS disabled (--no-keep-masked-slots) -- dead slots "
+              "dropped (prefix 576 tok)")
+
+    Pi05Libero_UnifiedEngine.SKIP_ZERO_VISION_SLOTS = bool(args.skip_zero_vision_slots)
+    if args.skip_zero_vision_slots:
+        print("[main] SKIP_ZERO_VISION_SLOTS enabled -- encoder skips all-zero image slots")
+    else:
+        print("[main] SKIP_ZERO_VISION_SLOTS disabled (default) -- every image slot "
+              "encoded on-HW (full 3-slot vision pass)")
 
     if os.environ.get("PI05_L0_REPORT"):
         Pi05Libero_UnifiedEngine.PREFIX_SNAPSHOTS = True
