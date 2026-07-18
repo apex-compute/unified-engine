@@ -2948,14 +2948,24 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         per += 2 * (3 if gated else 2) * M * hidden * inter  # MLP
         return per * layers
 
+    # Real (unpadded) action_dim -- the x_t width the model semantically operates
+    # on; AE_XT_WIDTH (64) is the padded physical buffer the HW tiles.
+    AE_ACTION_DIM_REAL = 32
+
     def _report_gflops(self, label, flops, seconds):
-        """Live achieved-throughput readout: GFLOP/s and % of the 64-ALU roofline."""
+        """Live achieved-throughput readout. `flops` is an (effective, hw_issued)
+        tuple (or a scalar -> both equal): EFFECTIVE = model-dim FLOPs (real
+        head_dim / horizon / action_dim); HW-ISSUED = what the FPGA actually runs
+        on the padded dims (head_dim 72->128, horizon 10->64, action 32->64,
+        MLP 4304->4352). %-peak is computed off the hw-issued figure."""
         if seconds <= 0:
             return
-        gfs = flops / seconds / 1e9
+        eff, hw = flops if isinstance(flops, (tuple, list)) else (flops, flops)
         peak = self.MACS_PER_CYCLE * 2 / (self.CYCLE_NS * 1e-9) / 1e9  # GFLOP/s
-        print(f"  ⚡ {label:<18} {flops/1e9:7.0f} GFLOP  {seconds:6.1f}s  "
-              f"{gfs:6.1f} GFLOP/s  [{100*gfs/peak:4.0f}% peak]")
+        print(f"  ⚡ {label:<18} {seconds:6.1f}s")
+        print(f"       effective : {eff/1e9:8.1f} GFLOP  {eff/seconds/1e9:7.1f} GFLOP/s")
+        print(f"       hw-issued : {hw/1e9:8.1f} GFLOP  {hw/seconds/1e9:7.1f} GFLOP/s  "
+              f"[{100*(hw/seconds/1e9)/peak:4.0f}% peak]")
 
     def _n_vision_slots_encoded(self):
         """Image slots the encoder actually RAN: all of them unless zero slots are
@@ -2966,30 +2976,46 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         return n
 
     def _vision_flops(self):
+        """(effective, hw_issued). effective = real head_dim 72 / inter 4304;
+        hw_issued = the padded dims the FPGA actually runs -- Q/K/V/O projections
+        and attention at per-head DP=128 (weights pre-padded 72->128), MLP at
+        VIS_I_PAD=4352. That padding is real work, ~30% above effective."""
         v = _CFG["vision"]
-        n_slots = self._n_vision_slots_encoded()
-        return n_slots * self._xformer_flops(  # only slots actually encoded
-            M=v["num_patches"], Mkv=v["num_patches"], hidden=v["hidden_size"],
-            inter=v["intermediate_size"], layers=27, nq=v["num_heads"], nkv=v["num_heads"],
-            hd=v["head_dim"], gated=False)
+        n = self._n_vision_slots_encoded()
+        def one(hd, inter):
+            return n * self._xformer_flops(
+                M=v["num_patches"], Mkv=v["num_patches"], hidden=v["hidden_size"],
+                inter=inter, layers=27, nq=v["num_heads"], nkv=v["num_heads"],
+                hd=hd, gated=False)
+        eff = one(self.VIS_D, self.VIS_I)         # 72,  4304
+        hw = one(self.VIS_DP, self.VIS_I_PAD)     # 128, 4352 (what silicon runs)
+        return eff, hw
 
     def _prefix_flops(self, M=None):
+        """(effective, hw_issued) -- prefix dims are all 64-aligned, no padding,
+        so both columns are identical."""
         if M is None:
             M = _CFG["model"]["prefill_max_seq_len"]
-        return self._xformer_flops(
+        f = self._xformer_flops(
             M=M, Mkv=M, hidden=self.HIDDEN_SIZE, inter=self.INTERMEDIATE_SIZE,
             layers=self.NUM_LAYERS, nq=self.NUM_HEADS, nkv=self.NUM_KV_HEADS,
             hd=self.HEAD_DIM, gated=True)
+        return f, f
 
     def _denoise_flops(self):
-        S = self.AE_ACTION_HORIZON_PADDED
-        Mkv = getattr(self, "AE_TKV", self.PREFIX_SEQ_LEN + S)
-        H, W = self.AE_HIDDEN, self.AE_XT_WIDTH
-        layer = self._xformer_flops(
-            M=S, Mkv=Mkv, hidden=H, inter=self.AE_INTERMEDIATE, layers=self.AE_LAYERS,
-            nq=self.AE_HEADS, nkv=self.AE_KV_HEADS, hd=self.HEAD_DIM, gated=True)
-        io = 2 * (2 * S * W * H) + 2 * (2 * S * H * W)  # action_in + action_out proj
-        return (layer + io) * self.AE_NUM_DENOISE_STEPS
+        """(effective, hw_issued). effective uses the real action horizon (10) and
+        action_dim (32); hw_issued uses the padded 64/64 the FPGA tiles."""
+        P = self.PREFIX_SEQ_LEN
+        H = self.AE_HIDDEN
+        def one(S, W, Mkv):
+            layer = self._xformer_flops(
+                M=S, Mkv=Mkv, hidden=H, inter=self.AE_INTERMEDIATE, layers=self.AE_LAYERS,
+                nq=self.AE_HEADS, nkv=self.AE_KV_HEADS, hd=self.HEAD_DIM, gated=True)
+            io = 2 * (2 * S * W * H) + 2 * (2 * S * H * W)  # action_in + action_out proj
+            return (layer + io) * self.AE_NUM_DENOISE_STEPS
+        eff = one(self.AE_ACTION_HORIZON, self.AE_ACTION_DIM_REAL, P + self.AE_ACTION_HORIZON)
+        hw = one(self.AE_ACTION_HORIZON_PADDED, self.AE_XT_WIDTH, P + self.AE_ACTION_HORIZON_PADDED)
+        return eff, hw
 
     def run_inference(self, images_hwc, prompt_tokens, noise32=None, skip_prefix=False, dump_prefix_path=None,
                        sanity_check=False):
