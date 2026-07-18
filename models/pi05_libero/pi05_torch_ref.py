@@ -20,8 +20,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# Weight-export materializer (no engine/hardware dependency) -- shared with the
+# lazy first-run export the FPGA test.py uses, so the .npy tree is identical.
+import pi05_weight_export as _wexport
+
 # Generated artifacts (bins + the weight export) all live under the bin dir.
-WEIGHTS_DIR = Path(__file__).parent / "pi05_libero_bin" / "weights_export"
+WEIGHTS_DIR = Path(_wexport.weights_export_dir())
 
 # ---------------------------------------------------------------------------
 # IF4 quantization: block_size=64, 4-bit signed code in [-8,7], one fp32 scale
@@ -95,6 +99,9 @@ class Weights:
         self.device = device
         self.dtype = dtype
         self.quant = quant
+        # Materialize weights_export/ on first run (downloads openpi ckpt + dumps
+        # 51 .npy once, ~13GB; no-op once complete). Same step the FPGA test.py runs.
+        _wexport.ensure_weights_export()
         manifest = json.loads((WEIGHTS_DIR / "manifest.json").read_text())
         self._cache = {}
         self._manifest = manifest
@@ -489,13 +496,17 @@ def build_suffix_attn_bias(n_prefix: int, n_suffix: int, device, dtype, masked_c
 
 def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Tensor,
              W: Weights, num_denoise_steps: int = 10, action_horizon: int = 10, action_dim: int = 7,
-             noise: torch.Tensor = None, return_kv: bool = False, masked_cols=None):
+             noise: torch.Tensor = None, return_kv: bool = False, masked_cols=None,
+             return_stages: bool = False):
     device, dtype = W.device, W.dtype
     b = state.shape[0]
 
     # --- Vision ---
     vision_tokens = vision_encode(images, W)  # (n_img, 256, 2048)
     n_img = vision_tokens.shape[0]
+    # stages: per-section intermediates for the bf16-vs-IF4 accuracy comparison.
+    # Kept OFF by default so existing callers are unaffected.
+    stages = {"vision_tokens": vision_tokens.detach().clone()} if return_stages else None
     vision_tokens = vision_tokens.reshape(1, n_img * 256, 2048).expand(b, -1, -1)
 
     # --- Text embedding ---
@@ -554,6 +565,16 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
         x_t = x_t + dt * v_t
         t = t + dt
 
+        if return_stages:
+            # pre-unnormalize velocity + denoise state, one entry per Euler step.
+            stages.setdefault("velocities", []).append(v_t.detach().clone())
+            stages.setdefault("denoise_states", []).append(x_t.detach().clone())
+
+    if return_stages:
+        # tuple form so return_kv callers still get their (actions, kv) pair unchanged.
+        if return_kv:
+            return x_t, kv_cache, stages
+        return x_t, stages
     if return_kv:
         return x_t, kv_cache  # kv_cache = (k_cache, v_cache), each a list of 18 (b,P,1,256)
     return x_t  # (b, action_horizon, action_dim)
@@ -612,7 +633,29 @@ def main():
     noise32 = torch.zeros(1, 10, 32, device=args.device, dtype=torch.float32)
     noise32[..., :7] = noise
 
-    actions = run_pi05(images, prompt_tokens, state, W, noise=noise32)
+    # --- Timed throughput (matches openpi run_pi05.py: N_WARMUP + N_TIMED) ---
+    # sync around each call so we time real GPU work, not async dispatch.
+    import time
+    N_WARMUP, N_TIMED = 2, 10
+    _is_cuda = torch.device(args.device).type == "cuda"
+    with torch.no_grad():
+        for _ in range(N_WARMUP):
+            run_pi05(images, prompt_tokens, state, W, noise=noise32)
+        if _is_cuda:
+            torch.cuda.synchronize()
+        latencies = []
+        for _ in range(N_TIMED):
+            t0 = time.perf_counter()
+            actions = run_pi05(images, prompt_tokens, state, W, noise=noise32)
+            if _is_cuda:
+                torch.cuda.synchronize()
+            latencies.append(time.perf_counter() - t0)
+    latencies = np.array(latencies)
+    print(f"mean latency: {latencies.mean()*1000:.1f} ms")
+    print(f"p50 latency:  {np.median(latencies)*1000:.1f} ms")
+    print(f"p99 latency:  {np.percentile(latencies, 99)*1000:.1f} ms")
+    print(f"throughput:   {1.0 / latencies.mean():.2f} inferences/sec")
+
     actions = actions[..., :7].float().cpu().numpy()[0]
 
     # Un-normalize to real robot action space (openpi Unnormalize:
