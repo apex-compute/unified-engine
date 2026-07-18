@@ -3046,10 +3046,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             t_vision = time.perf_counter() - t0
             n_enc = self._n_vision_slots_encoded()
             self._report_gflops(f"vision ({n_enc} slots)", self._vision_flops(), t_vision)
-            _vf = vision_tokens.to(torch.float32)
-            print(f"  [nan-check] vision tokens : nan={bool(torch.isnan(_vf).any())} "
-                  f"({int(torch.isnan(_vf).sum())}/{_vf.numel()})  "
-                  f"finite|max|={float(_vf[torch.isfinite(_vf)].abs().max()) if torch.isfinite(_vf).any() else float('nan'):.4g}")
             if getattr(self, "VISION_SNR_CHECK", False):
                 self._vision_snr_check(images_hwc, vision_tokens)
 
@@ -3059,11 +3055,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # robot) + the text budget.
             seq_len = vision_tokens.shape[0] + self.PREFIX_TEXT_BUDGET
             valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
-            _inb = seq_len * self.HIDDEN_SIZE * 2
-            _buf = bytearray(_inb); self._dma_read_checked(self.LAYER0_INPUT_DRAM, _buf, _inb)
-            _in = torch.frombuffer(bytes(_buf), dtype=torch.bfloat16).to(torch.float32)
-            print(f"  [nan-check] prefix INPUT  : nan={bool(torch.isnan(_in).any())} "
-                  f"({int(torch.isnan(_in).sum())}/{_in.numel()})")
             # COMPILE-ONCE: the prefix program is invariant to valid_len (M is
             # always seq_len; valid_len only shapes the DMA'd bias DATA). Compile
             # the first obs, then re-DMA just the fresh bias mask to the SAME
@@ -3080,24 +3071,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self._execute(self._prefix_prog_addr, label="prefix", timeout=250.0)
             t_prefix = time.perf_counter() - t1
             self._report_gflops(f"prefix ({seq_len} tok)", self._prefix_flops(seq_len), t_prefix)
-            # Per-layer K/V NaN scan -> pinpoint the FIRST prefix layer that goes NaN.
-            _stride = self.KV_LAYER_STRIDE
-            _first_nan = None
-            for _l in range(self.NUM_LAYERS):
-                _cells = []
-                for _nm, _base in (("K", self.LAYER0_K_DRAM), ("V", self.LAYER0_V_DRAM)):
-                    _buf = bytearray(_stride)
-                    self._dma_read_checked(_base + _l * _stride, _buf, _stride)
-                    _kv = torch.frombuffer(bytes(_buf), dtype=torch.bfloat16).to(torch.float32)
-                    _nn = int(torch.isnan(_kv).sum())
-                    _mx = float(_kv[torch.isfinite(_kv)].abs().max()) if torch.isfinite(_kv).any() else float('nan')
-                    _cells.append((_nm, _nn, _kv.numel(), _mx))
-                    if _nn and _first_nan is None:
-                        _first_nan = (_l, _nm)
-                _tag = "  ".join(f"{n}: nan={c}/{t} |max|={m:.3g}" for n, c, t, m in _cells)
-                print(f"  [nan-check] prefix L{_l:02d} : {_tag}")
-            if _first_nan is not None:
-                print(f"  [nan-check] >>> FIRST NaN at prefix layer {_first_nan[0]} ({_first_nan[1]}-cache)")
 
             if getattr(self, "PREFIX_SNAPSHOTS", False):
                 self._prefix_layer0_op_snr_report(prompt_tokens, vision_tokens, valid_len)

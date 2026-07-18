@@ -9,6 +9,7 @@
 \usepackage[letterpaper,margin=1in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
+\usepackage{float}
 \usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
 
@@ -77,7 +78,7 @@ $(1024{\to}32)$ head. At only $\approx$71\,GFLOP ($2.3\%$) it is arithmetically
 small but the sole sequential stage, and its per-step error accumulates through
 the integrator.
 
-\begin{table}[t]
+\begin{table}[H]
 \centering\small
 \caption{Per-stage parameter and FLOP budget (per inference). \emph{Effective}
 uses true model dims; \emph{FPGA} is the padded shape the 64-wide SIMD ALU
@@ -139,28 +140,31 @@ $\sim$29\,dB.
 \section{Quantization}
 \label{sec:quant}
 %=============================================================================
-We diff an identical torch reference run with \bfteen{} vs.\ fake-quantized
-\iffour{} weights (same inputs and noise), reporting SNR,
-$\mathrm{SNR}(a,b){=}20\log_{10}(\lVert b\rVert/\lVert a{-}b\rVert)$, per stage
-(Table~\ref{tab:quant}; masked rows excluded, sample~0). This is the
-\emph{theoretical} quantization floor---measured on the GPU reference itself, so
-it isolates \iffour{}'s numerical cost from any hardware effect. The pattern is
-clear: the vision encoder is nearly untouched (25.4\,dB), the prefix caches
-degrade with depth---values (V) markedly worse than keys (K), $10.7$ vs.\
-$16.0$\,dB mean---and the denoise stage carries the largest \emph{effective}
-loss. There, per-step velocity error accumulates through Eq.~\eqref{eq:euler}:
-the running state $x_t$ walks from $45$\,dB down to $16.3$\,dB over the ten Euler
-steps (Table~\ref{tab:quant-detail}), and the final error concentrates in
-low-magnitude action dimensions (dim\,1 at $1.5$\,dB) while the task-critical
-dimensions are preserved (primary axis dim\,0 at $24.9$\,dB, gripper dim\,6 at
-$40.7$\,dB). SNR is only a diagnostic; the acceptance gate is the closed-loop
-LIBERO agreement (last rows) between the FPGA \iffour{} policy and the CUDA
-\bfteen{} reference over 10 episodes, reserved below.
+\subsection{The Quantization Floor}
+\iffour{} is the accelerator's 4-bit weight format: a per-64-block hybrid of
+signed INT4 (uniform grid $[-8,7]$) and FP4 E2M1 (non-uniform codebook
+$\{0,\pm0.5,\pm1,\pm1.5,\pm2,\pm3,\pm4,\pm6\}$, finer near zero). At pack time
+each block is quantized \emph{both} ways and the lower-MSE variant kept; the
+choice rides in the \emph{sign} of the block's scale (neg $\to$ INT4, pos $\to$
+FP4), so the on-chip dequantizer picks the decode path from one bit, inline
+before the MAC---no metadata. INT4 suits dense blocks, FP4 the peaky/outlier
+ones. (Results below use the INT4 variant, \texttt{q4\_64}.)
 
-\begin{table}[t]
+We measure the accuracy cost against a \bfteen{} reference (identical torch run,
+same inputs/noise, diffed per stage; Table~\ref{tab:quant},
+$\mathrm{SNR}{=}20\log_{10}(\lVert b\rVert/\lVert a{-}b\rVert)$, masked rows
+excluded, sample~0)---the theoretical quantization floor, isolated from any
+hardware effect. Vision is nearly untouched (25.4\,dB); the prefix caches degrade
+with depth, V worse than K ($10.7$ vs.\ $16.0$\,dB mean); and denoise carries the
+largest loss as per-step error accumulates through Eq.~\eqref{eq:euler}---$x_t$
+walks $45\!\to\!16.3$\,dB (Table~\ref{tab:quant-detail}), concentrating in
+low-magnitude action dims (dim\,1, $1.5$\,dB) while task-critical dims hold
+(dim\,0 $24.9$, gripper $40.7$\,dB). SNR is a diagnostic; the acceptance gate is
+the closed-loop LIBERO agreement (Sec.~\ref{sec:libero}).
+
+\begin{table}[H]
 \centering\small
-\caption{\iffour{} vs.\ \bfteen{} per section (torch reference, sample~0), and
-reserved closed-loop FPGA/CUDA agreement.}
+\caption{\iffour{} vs.\ \bfteen{} per section (torch reference, sample~0).}
 \label{tab:quant}
 \begin{tabular}{@{}lcc@{}}
 \toprule
@@ -172,16 +176,11 @@ Prefix V-cache (18 layers)      & 10.65 & 7.0--15.4 \\
 Denoise velocity $v_t$ (10 steps) & 23.49 & 11.5--26.2 \\
 \midrule
 \textbf{End-to-end action (10$\times$7)} & \textbf{16.31} & MSE $4.05{\times}10^{-3}$ \\
-\midrule
-\multicolumn{3}{@{}l}{\textit{LIBERO closed-loop, 10 episodes (reserved):}}\\
-FPGA \iffour{} success rate      & \multicolumn{2}{c}{\numTBD/10} \\
-CUDA \bfteen{} success rate      & \multicolumn{2}{c}{\numTBD/10} \\
-Action-chunk agreement (dB)      & \multicolumn{2}{c}{\numTBD} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\begin{table}[t]
+\begin{table}[H]
 \centering\small
 \caption{Final-action detail: per-dimension SNR (left) and error accumulation of
 the running state $x_t$ across Euler steps (right). Sample~0.}
@@ -197,6 +196,41 @@ dim\,3           & 6.73  & step 7 & 20.53 \\
 dim\,4           & 4.65  & step 8 & 19.26 \\
 dim\,5           & 17.61 & step 9 & 16.31 \\
 dim\,6 (gripper) & 40.73 & (final) & 16.31 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{LIBERO}
+\label{sec:libero}
+LIBERO is a standard tabletop manipulation benchmark for evaluating
+language-conditioned robot policies: a suite of pick-and-place and articulated
+tasks in simulation, scored by closed-loop task success over many episodes. Its
+observation uses \textbf{two} camera views---a fixed scene camera and a
+wrist-mounted camera. \pizero{}, however, exposes \textbf{three} image slots, and
+we process all three: the two real LIBERO cameras plus a third all-zero
+(attention-masked) slot. Encoding the empty slot is intentional---other
+embodiments and benchmarks drive the policy with a genuine third camera for their
+robot actions, so keeping the full 3-slot path exercised on hardware makes the
+port drop-in for those settings at no correctness cost (the masked slot
+contributes nothing to the output).
+
+Per-tensor SNR is only a diagnostic; the real acceptance test is whether the
+quantized policy \emph{acts} the same. Table~\ref{tab:libero} is the closed-loop
+LIBERO comparison---the FPGA \iffour{} policy vs.\ the CUDA \bfteen{} reference
+over 10 episodes, by task success and action-chunk agreement.
+
+\begin{table}[H]
+\centering\small
+\caption{LIBERO closed-loop agreement: FPGA (\iffour{}) vs.\ CUDA (\bfteen{}),
+10 episodes. \emph{Reserved --- fill from the paired eval run.}}
+\label{tab:libero}
+\begin{tabular}{@{}lc@{}}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+FPGA \iffour{} success rate      & \numTBD/10 \\
+CUDA \bfteen{} success rate      & \numTBD/10 \\
+Action-chunk agreement (dB)      & \numTBD \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -223,26 +257,7 @@ dispatched separately rather than fused into the deployed \texttt{lax.while\_loo
 their sum ($135.4$\,ms) slightly exceeds the fused end-to-end ($130.2$\,ms); the
 per-stage split is used for the breakdown, the fused number for the headline.
 
-\begin{table}[t]
-\centering\small
-\caption{FPGA (\iffour{}) per-section timing and achieved throughput.
-Batch~1, 10 denoise steps, sample~0. \emph{Skeleton.}}
-\label{tab:timing-fpga}
-\begin{tabular}{@{}lcc@{}}
-\toprule
-\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
-\midrule
-Vision encoder          & \numTBD & \numTBD \\
-Prefix (Gemma-2B)       & \numTBD & \numTBD \\
-Action expert (denoise) & \numTBD & \numTBD \\
-\midrule
-\textbf{End-to-end}     & \numTBD & \numTBD \\
-\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{\numTBD} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[t]
+\begin{table}[H]
 \centering\small
 \caption{RTX~5070 (\bfteen{}, openpi JAX/XLA) per-section timing and achieved
 throughput. Batch~1, 10 denoise steps, sample~0. Per-stage times are
@@ -258,6 +273,46 @@ Action expert (denoise) & 36.70  & 1\,935  \\
 \midrule
 \textbf{End-to-end}     & 130.15 & 23\,502 \\
 \textbf{Throughput (inf/s)} & \multicolumn{2}{c}{7.68} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering\small
+\caption{FPGA (\iffour{}) per-section timing and achieved throughput
+(\ue{} v1 on Xilinx Kintex-7). Batch~1, 10 denoise steps, sample~0, 3-slot
+vision, 832-token prefix. GFLOP/s is on the hardware-issued (padded) FLOPs.}
+\label{tab:timing-fpga}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
+\midrule
+Vision encoder          & 38.0  & 22.4 \\
+Prefix (Gemma-2B)       & 147.6 & 23.0 \\
+Action expert (denoise) & 22.1  & 21.9 \\
+\midrule
+\textbf{End-to-end}     & 207.7 & 22.8 \\
+\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.0048} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering\small
+\caption{Silicon (\iffour{}, \emph{estimated}) per-section timing and achieved
+throughput --- projected ASIC implementation of the \ue{} v1 IP. Batch~1, 10
+denoise steps. \emph{Skeleton --- fill in.}}
+\label{tab:timing-silicon}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
+\midrule
+Vision encoder          & \numTBD & \numTBD \\
+Prefix (Gemma-2B)       & \numTBD & \numTBD \\
+Action expert (denoise) & \numTBD & \numTBD \\
+\midrule
+\textbf{End-to-end}     & \numTBD & \numTBD \\
+\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{\numTBD} \\
 \bottomrule
 \end{tabular}
 \end{table}
