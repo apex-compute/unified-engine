@@ -48,11 +48,21 @@ jobs:
     timeout-minutes: 115
     steps:
       - name: Checkout
+        # Do NOT let checkout run `git clean -ffdx`: its default wipe deletes the
+        # untracked models/*/*_bin caches (model weights + HF snapshots), forcing
+        # every model to re-fetch multi-GB weights every run. We clean the tree
+        # ourselves below and preserve those caches.
         uses: actions/checkout@v4
+        with:
+          clean: false
 
       - name: Clean workspace and program bins
         run: |
+          # Restore tracked files, then wipe untracked cruft everywhere EXCEPT
+          # models/ (keeps weights + HF cache). clean_program_bins.sh then removes
+          # only the runtime-generated programs.bin/json inside models/*/*_bin.
           git reset --hard HEAD
+          git clean -ffdx -e models
           ./clean_program_bins.sh
 
       - name: Run CI suite

@@ -899,7 +899,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        expected_hw_version = 0x12345678 if CURRENT_DEVICE == "efinix" else 0x93ffa0c8
+        expected_hw_version = 0x006e0d2f if CURRENT_DEVICE == "efinix" else 0x93ffa0c8
         assert hw_version == expected_hw_version, (
             f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
             f"expected 0x{expected_hw_version:08x}."

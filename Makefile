@@ -6,71 +6,8 @@ all: user_dma_core
 user_dma_core: user_dma_core.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.SILENT: clean
 clean:
-	rm -fv user_dma_core
-	rm -fv *.mcs *.prm *.jou *.log *.json *.csv
-	rm -fv mask_point.png
-	rm -fv model_auto_test_results.txt
-	rm -rfv andromeda_IP-* andromeda_wrapper-*
-	rm -fv models/gemma3/gemma3_bin/programs*.bin
-	rm -fv models/gemma3/gemma3_bin/programs*.json
-	rm -fv models/gemma3/gemma3_bin/*instruction.bin
-	rm -fv models/gemma3/gemma3_bin/*instruction.json
-	rm -fv models/gemma3/gemma3_if8_bin/programs*.bin
-	rm -fv models/gemma3/gemma3_if8_bin/programs*.json
-	rm -fv models/gemma3/gemma3_if8_bin/*instruction.bin
-	rm -fv models/gemma3/gemma3_if8_bin/*instruction.json
-	rm -fv models/gemma4_e2b/gemma4_e2b_bin/programs*.bin
-	rm -fv models/gemma4_e2b/gemma4_e2b_bin/programs*.json
-	rm -fv models/gemma4_e2b/gemma4_e2b_bin/*instruction*.bin
-	rm -fv models/gemma4_e2b/gemma4_e2b_bin/*instruction*.json
-	rm -fv models/gemma4_e4b/gemma4_e4b_bin/programs*.bin
-	rm -fv models/gemma4_e4b/gemma4_e4b_bin/programs*.json
-	rm -fv models/gemma4_e4b/gemma4_e4b_bin/*instruction*.bin
-	rm -fv models/gemma4_e4b/gemma4_e4b_bin/*instruction*.json
-	rm -rfv models/gpt2/gpt2_bin/
-	rm -fv models/llama3.2_1b/llama3.2_1b_bin/programs*.bin
-	rm -fv models/llama3.2_1b/llama3.2_1b_bin/programs*.json
-	rm -fv models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
-	rm -fv models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
-	rm -fv models/llama3.2_3b/llama3.2_3b_bin/programs*.bin
-	rm -fv models/llama3.2_3b/llama3.2_3b_bin/programs*.json
-	rm -fv models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin
-	rm -fv models/locateanything_3b/locateanything_3b_bin/programs*.bin
-	rm -fv models/locateanything_3b/locateanything_3b_bin/programs*.json
-	rm -fv models/locateanything_3b/*_boxes_fpga.jpg
-	rm -fv models/mobilenetv2/mobilenetv2_bin/programs*.bin
-	rm -fv models/mobilenetv2/mobilenetv2_bin/programs*.json
-	rm -fv models/mobilenetv2/mobilenetv2_bin/params*.bin
-	rm -fv models/mobilenetv2/mobilenetv2_bin/params*.json
-	rm -fv models/mobilenetv2/mobilenetv2_bin/labels.json
-	rm -fv models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/programs*.bin
-	rm -fv models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/programs*.json
-	rm -fv models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/params*.bin
-	rm -fv models/mobilenetv2/mobilenetv2_ssd_fpnlite_bin/params*.json
-	rm -fv models/mobilenetv2/vette_detections_hw.jpg
-	rm -rfv models/mobilesam/mobilesam_bin/
-	rm -fv models/parakeet/parakeet_bin/params.bin
-	rm -fv models/parakeet/parakeet_bin/params.json
-	rm -fv models/parakeet/parakeet_bin/programs*.bin
-	rm -fv models/parakeet/parakeet_bin/programs*.json
-	rm -fv models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.bin
-	rm -fv models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.json
-	rm -fv models/qwen3_1.7b/qwen3_1.7b_bin/qwen3_1.7b_instruction*
-	rm -fv models/qwen3_1.7b/qwen3_1.7b_bin/programs.bin
-	rm -fv models/qwen3_1.7b/qwen3_1.7b_bin/programs.json
-	rm -fv models/qwen3_4b/qwen3_4b_bin/qwen3_4b_instruction*
-	rm -fv models/qwen3_4b/qwen3_4b_bin/programs.bin
-	rm -fv models/qwen3_4b/qwen3_4b_bin/programs.json
-	rm -fv models/qwen3.5_2b/qwen3.5_2b_bin/programs.bin
-	rm -fv models/qwen3.5_2b/qwen3.5_2b_bin/programs.json
-	rm -fv models/smolvlm2/smolvlm2_bin/programs*.bin
-	rm -fv models/smolvlm2/smolvlm2_bin/programs*.json
-	rm -fv models/smolvlm2/smolvlm2_bin/decoder_program.bin
-	rm -fv models/smolvlm2/smolvlm2_bin/decoder_program.json
-	rm -rfv models/swin/swin_bin/
-	rm -rfv codebooks/
+	./clean_program_bins.sh
 
 load_drivers:
 	sudo insmod /lib/modules/$$(uname -r)/xdma/xdma.ko interrupt_mode=0 config_bar_num=0
