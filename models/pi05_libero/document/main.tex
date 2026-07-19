@@ -214,13 +214,27 @@ robot actions, so keeping the full 3-slot path exercised on hardware makes the
 port drop-in for those settings at no correctness cost (the masked slot
 contributes nothing to the output).
 
+\paragraph{An episode is many inferences.} Each model call in
+Sec.~\ref{sec:model} predicts a $10{\times}7$ chunk---ten future control
+steps. LIBERO runs \emph{closed-loop}: the simulator executes the first
+$k{=}10$ steps of that chunk, then feeds the resulting new observation back to
+the policy for a fresh chunk, and repeats. So a single task \emph{episode} is a
+\emph{sequence} of inferences---one every $k$ sim steps---not a one-shot
+prediction, and the episode runs until the task's goal predicate fires (success)
+or a per-suite step cap is hit (failure). An episode therefore takes
+$\lceil \text{steps}/k \rceil$ inferences: the successful runs in
+Table~\ref{tab:libero} are $\sim$$10$--$16$ inferences, the capped failures
+$\sim$$23$--$29$. This is what makes the closed-loop test meaningful and also
+much heavier than a single forward pass---every one of those inferences runs the
+full vision\,+\,prefix\,+\,10-step denoise pipeline on hardware.
+
 Per-tensor SNR is only a diagnostic; the real acceptance test is whether the
-quantized policy \emph{acts} the same. Table~\ref{tab:libero} is the closed-loop
-comparison---the FPGA \iffour{} policy vs.\ the CUDA \bfteen{} reference over
-10 prompts (9 \texttt{libero\_spatial} + 1 \texttt{libero\_object}), one episode
-each, with identical seed and fixed denoise noise so both platforms see
-byte-identical observations. We score each by task success and by the
-per-episode step count.
+quantized policy \emph{acts} the same across that whole loop.
+Table~\ref{tab:libero} is the closed-loop comparison---the FPGA \iffour{} policy
+vs.\ the CUDA \bfteen{} reference over 10 prompts (9 \texttt{libero\_spatial}
++ 1 \texttt{libero\_object}), one episode each, with identical seed and fixed
+denoise noise so both platforms see byte-identical observations. We score each by
+task success and by the per-episode step count.
 
 \begin{table}[H]
 \centering\small
