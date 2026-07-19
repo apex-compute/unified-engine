@@ -129,12 +129,24 @@ python3 models/gemma3/gemma3_test.py --prompt "your prompt"
 
 ### 7. Updating HW bin file
 
-The current hardware release is **v1.4** (`update_87eabea5.bin`). At startup the software reads the FPGA version register and checks it against the expected release hash (`0x87eabea5`); on a mismatch it stops and tells you which bin to flash.
+The current hardware release is **v1.4** (`update_006e0d2f.bin`). At startup the software reads the FPGA version register and checks it against the expected release hash (`0x006e0d2f`); on a mismatch it stops and tells you which bin to flash.
 
 ```
-python3 update_flash.py update_87eabea5.bin
+./update_fpga.sh
 ```
-Cold reboot the PC.
+
+One command does the whole update, no PC reboot or power cycle. With no arguments it picks up the `update_*.bin` in the repo root, checks the running version first and exits immediately if the FPGA is already up to date; otherwise it programs and verifies the flash, warm-boots the FPGA from the new image (ICAPE2 IPROG) via `update_flash.py`, hot-rescans the PCIe bus (`sudo ./rescan_xilinx.sh` — the one step that needs root), then reads the FPGA version back and prints `UPDATE SUCCESSFUL` when it matches the bin.
+
+If the image currently running predates the warm-boot block, the flash is still written but there is nothing to warm boot into: the script says so, tells you to cold reboot once, and stops before the PCIe rescan (exit code 3). After that one cold boot every update is reboot-free.
+
+Options:
+
+```
+./update_fpga.sh --bin update_006e0d2f.bin   # explicit image (or pass it positionally)
+./update_fpga.sh --check                     # device ID + running FPGA hash vs the repo bin
+./update_fpga.sh --boot                      # no reflash: warm boot from flash, rescan
+./update_fpga.sh --force                     # reflash even if already up to date
+```
 
 ---
 
