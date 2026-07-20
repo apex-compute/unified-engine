@@ -18,7 +18,7 @@ Weights:
 Usage:
   python gemma3_test.py
   python gemma3_test.py --prompt "your prompt"
-  python gemma3_test.py --dev xdma0 [--device kintex7] [--cycle 5.15]
+  python gemma3_test.py --dev xdma0 [--device kintex7] [--cycle 4.8077]
   python gemma3_test.py --dev xdma0 --device bittware
   python gemma3_test.py --local-weights
   python gemma3_test.py --dual-engine
@@ -2713,7 +2713,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
+    if device == "kintex7":                       return 1000 / 208
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
@@ -2949,7 +2949,7 @@ def main():
         '--cycle',
         type=float,
         default=None,
-        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=5.1594ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
+        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=4.8077ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')

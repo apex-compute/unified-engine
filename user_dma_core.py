@@ -80,6 +80,9 @@ INT_CAUSE_HALT = 2
 
 # CLOCK_CYCLE_TIME_NS will be set based on target argument (default: 3 ns)
 CLOCK_CYCLE_TIME_NS = 3
+# HW prescales PIPELINE_COUNTER (0x30): one count = 16 aclk cycles
+# (pipeline_counter_module.sv CLK_DIV). Multiply readouts by this to get cycles.
+UE_PIPELINE_COUNTER_CLK_DIV = 16
 UE_PEAK_GFLOPS = 333.3 * 0.128
 UE_TRACE_SIZE = 8192
 UE_AXI_DATA_WIDTH_BITS = int(os.environ.get("UE_AXI_DATA_WIDTH_BITS", "256"))
@@ -899,7 +902,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        expected_hw_version = 0x006e0d2f if CURRENT_DEVICE == "efinix" else 0x93ffa0c8
+        expected_hw_version = 0xf2e8d12b if CURRENT_DEVICE == "efinix" else 0x93ffa0c8
         assert hw_version == expected_hw_version, (
             f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
             f"expected 0x{expected_hw_version:08x}."
@@ -9289,7 +9292,7 @@ class UnifiedEngine:
         """
         Report timing and instruction count
         """
-        latency = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        latency = self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV
         instruction_count = self.read_reg32(UE_INSTRUCTION_CTL_ADDR)
         print(f"Latency: {latency * self._clock_period_ns / 1e3:.3f} us, Instruction count: {instruction_count}")
         print(f"Latency in cycles: {latency}")
@@ -9299,14 +9302,15 @@ class UnifiedEngine:
         """
         Report latency
         """
-        return self.read_reg32(UE_LATENCY_COUNT_ADDR) * self._clock_period_ns / 1e3
+        return self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV * self._clock_period_ns / 1e3
 
     def report_flop_rate_gflops(self, num_flops: int):
         """
         Report flop rate and gflops ratio of peak throughput
         """
-        gflops_ratio = num_flops / 1.28 / self.read_reg32(UE_LATENCY_COUNT_ADDR)
-        return num_flops / (self.read_reg32(UE_LATENCY_COUNT_ADDR) * self._clock_period_ns), gflops_ratio
+        cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV
+        gflops_ratio = num_flops / 1.28 / cycles
+        return num_flops / (cycles * self._clock_period_ns), gflops_ratio
 
     # Fixed FP8 E4M3FN lookup, indexed by byte code 0x00..0xFF. All 254
     # finite values listed exactly (powers-of-two and 1/8-step fractions

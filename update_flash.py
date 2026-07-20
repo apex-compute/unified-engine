@@ -1,5 +1,6 @@
 import os
 import struct
+import subprocess
 import sys
 import time
 
@@ -258,7 +259,7 @@ def verify_flash_with_bit(bitfile_path):
             bin_data = f.read()
     except Exception as e:
         print(f"Cannot open {bitfile_path}: {e}")
-        return
+        return False
 
     filesize = len(bin_data)
     print(f"\n=== VERIFYING {filesize:,} bytes ({filesize/1024/1024:.1f} MB) from {bitfile_path} ===\n")
@@ -310,6 +311,7 @@ def verify_flash_with_bit(bitfile_path):
         print(f"\n=== VERIFICATION FAILED in {duration:.1f} seconds ===\n")
     else:
         print(f"\n=== VERIFICATION SUCCESSFUL in {duration:.1f} seconds ===\n")
+    return not mismatch
 
 # ==========================================
 # READ DUMP (your latest robust version)
@@ -376,6 +378,118 @@ def read_flash_array_dump():
 
 
 # ==========================================
+# ICAPE2 WARM BOOT (IPROG - reboot from flash, no JTAG / power cycle)
+# ==========================================
+# Talks to the icap_warmboot block instantiated by build_kintex7.tcl and
+# build_kintex7_systolic.tcl (same address on both). Writing WBSTAR + the
+# trigger key pushes the UG470 IPROG sequence through ICAPE2: the PCIe link
+# drops, the FPGA reloads itself from BPI flash at the WBSTAR address, and a
+# PCIe hot-rescan brings the freshly flashed image up.
+WARMBOOT_BASE_ADDR   = 0x02030000
+WARMBOOT_REG_ID      = WARMBOOT_BASE_ADDR + 0x0   # RO: WARMBOOT_ID_VALUE probe
+WARMBOOT_REG_WBSTAR  = WARMBOOT_BASE_ADDR + 0x4   # RW: flash start address
+WARMBOOT_REG_CTRL    = WARMBOOT_BASE_ADDR + 0x8   # WO: trigger key / RO: status
+WARMBOOT_ID_VALUE    = 0xB0071CA2
+WARMBOOT_TRIGGER_KEY = 0x49505247                 # ASCII "IPRG"
+RECONFIG_WAIT_S      = 8   # BPI16 async full reconfigure is ~3-4 s; add margin
+
+# Exit code reserved for "the running image has no warm-boot block". Callers
+# (update_fpga.sh) treat it as "flash is fine, the user just owes us one cold
+# boot" and stop there instead of running the PCIe rescan.
+EXIT_NO_WARMBOOT = 3
+
+
+def warmboot_block_present():
+    """True when the running bitstream exposes the icap_warmboot block."""
+    probe = user_read32(WARMBOOT_REG_ID)
+    if probe == WARMBOOT_ID_VALUE:
+        return True
+    print(f"Warm-boot block not found @ 0x{WARMBOOT_REG_ID:08X} "
+          f"(read 0x{probe:08X}, expected 0x{WARMBOOT_ID_VALUE:08X}).")
+    return False
+
+
+def report_missing_warmboot():
+    """Explain the one-time cold boot needed to get onto the warm-boot flow."""
+    print("")
+    print("ERROR: your current image doesn't have the warm reboot block.")
+    print("Cold reboot the system one last time (full power cycle, not a warm")
+    print("reboot); after this update you will have the warm reboot block and")
+    print("further updates will not need a reboot at all.")
+    print("")
+    print("Stopping here - not probing the PCIe bus via rescan_xilinx.sh.")
+
+
+def warm_boot(boot_addr=0x0):
+    """Reboot the FPGA from flash via the icap_warmboot block (ICAPE2 IPROG).
+
+    Returns "ok" once the IPROG is fired, "absent" when the running bitstream
+    has no warm-boot block, or "error" on any other failure."""
+    print(f"\n=== WARM BOOT (ICAPE2 IPROG, WBSTAR=0x{boot_addr:08X}) ===")
+
+    if not warmboot_block_present():
+        print("Either this is the wrong card, or the running bitstream predates icap_warmboot:")
+        print("  - multi-card hosts: kintex7 is usually xdma1 (rk owns xdma0) -> retry with --dev xdma1")
+        return "absent"
+
+    user_write32(WARMBOOT_REG_WBSTAR, boot_addr)
+    readback = user_read32(WARMBOOT_REG_WBSTAR)
+    if readback != boot_addr:
+        print(f"WBSTAR readback mismatch (wrote 0x{boot_addr:08X}, "
+              f"read 0x{readback:08X}) - aborting warm boot.")
+        return "error"
+
+    print("Triggering IPROG. The PCIe link drops now while the FPGA reconfigures from flash...")
+    user_write32(WARMBOOT_REG_CTRL, WARMBOOT_TRIGGER_KEY)
+    return "ok"
+
+
+def rescan_after_warm_boot():
+    """Wait out the reconfiguration, then hot-rescan the PCIe bus."""
+    print(f"Waiting {RECONFIG_WAIT_S}s for the FPGA to reconfigure...")
+    time.sleep(RECONFIG_WAIT_S)
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rescan_xilinx.sh")
+    try:
+        subprocess.run([script], check=True)
+        return True
+    except Exception as e:
+        print(f"PCIe rescan failed ({e}).")
+        print("Rescan manually: sudo ./rescan_xilinx.sh")
+        return False
+
+
+def bin_hash(bitfile_path):
+    """Short git hash encoded in an update_<hash>.bin filename, else None."""
+    filename = os.path.basename(bitfile_path)
+    if not (filename.startswith("update_") and filename.endswith(".bin")):
+        print(f"'{filename}' does not follow update_<hash>.bin naming.")
+        return None
+    try:
+        return int(filename[len("update_"):-len(".bin")][:7], 16)
+    except ValueError:
+        print(f"No hex hash found in '{filename}'.")
+        return None
+
+
+def confirm_new_image(bitfile_path):
+    """Read the FPGA git hash back and compare it to update_<hash>.bin.
+
+    Returns True on match, False on mismatch, None when the filename carries
+    no hash to compare against."""
+    device_hash = read_device_hash()
+    expected = bin_hash(bitfile_path)
+    if expected is None:
+        return None
+    device7 = (device_hash >> 4) & 0xFFFFFFF
+    if device7 == expected:
+        print(f"Device is now running 0x{expected:07x}.")
+        return True
+    print(f"WARNING: device hash 0x{device7:07x} does not match "
+          f"flashed image 0x{expected:07x}.")
+    return False
+
+
+# ==========================================
 # MAIN
 # ==========================================
 DEVICE_HASH_ADDR = 0x02000000
@@ -385,7 +499,7 @@ def read_device_hash():
     print(f"=== Reading Device Hash @ 0x{DEVICE_HASH_ADDR:08X} ===")
     data = user_read32(DEVICE_HASH_ADDR)
     print(f"Hardware hash: {data >> 4 & 0xFFFFFFF:07x}")
-    return (data >> 4) & 0xFFFFFFF
+    return data
 
 
 def find_repo_bin_hash():
@@ -413,7 +527,7 @@ def check_update_required(device_hash):
         return
 
     repo_hash_int = int(repo_hash, 16)
-    device_hash_short = device_hash & 0x0FFFFFFF  # mask to 28 bits (7 hex digits)
+    device_hash_short = (device_hash >> 4) & 0xFFFFFFF  # top 28 bits = first 7 hex digits
 
     print(f"\n=== Update Check ===")
     print(f"  Device hash : 0x{device_hash_short:07x}")
@@ -435,6 +549,26 @@ if __name__ == "__main__":
                         help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
     parser.add_argument("--check", action="store_true",
                         help="check device ID, flash status, read FPGA git hash, and compare against repo .bin")
+    parser.add_argument("--no-boot", action="store_true",
+                        help="skip the automatic ICAPE2 warm boot after flashing")
+    parser.add_argument("--boot-only", action="store_true",
+                        help="do not program; just warm-boot the FPGA from flash (ICAPE2 IPROG)")
+    parser.add_argument("--boot-addr", type=lambda v: int(v, 0), default=0x0,
+                        help="WBSTAR flash start address for the warm boot "
+                             "(BPI16: flash word address; default 0x0)")
+    parser.add_argument("--no-rescan", action="store_true",
+                        help="fire the IPROG and exit immediately - no wait, PCIe "
+                             "rescan, or hash readback (for external orchestration "
+                             "such as update.mk, where rescan is its own step)")
+    parser.add_argument("--verify-image", metavar="BINFILE",
+                        help="read the FPGA git hash and compare it against "
+                             "update_<hash>.bin; exit 0 on match, 1 otherwise")
+    parser.add_argument("--is-current", metavar="BINFILE",
+                        help="quiet version check: exit 0 if the FPGA already "
+                             "runs update_<hash>.bin, 1 if it needs the update")
+    parser.add_argument("--check-warmboot", action="store_true",
+                        help="probe for the icap_warmboot block; exit 0 if "
+                             f"present, {EXIT_NO_WARMBOOT} if the running image predates it")
     args = parser.parse_args()
 
     DMA_DEVICE_USER = f"/dev/{args.dev}_user"
@@ -452,8 +586,57 @@ if __name__ == "__main__":
         print("\nCheck complete.")
         sys.exit(0)
 
+    if args.check_warmboot:
+        if args.bitfile:
+            parser.error("--check-warmboot takes no bitfile argument")
+        if warmboot_block_present():
+            print("Warm-boot block present.")
+            sys.exit(0)
+        report_missing_warmboot()
+        sys.exit(EXIT_NO_WARMBOOT)
+
+    if args.is_current:
+        if args.bitfile:
+            parser.error("--is-current takes no positional bitfile argument")
+        expected = bin_hash(args.is_current)
+        if expected is None:
+            sys.exit(1)
+        device7 = (user_read32(DEVICE_HASH_ADDR) >> 4) & 0xFFFFFFF
+        if device7 == expected:
+            print(f"Device already runs 0x{expected:07x} - up to date.")
+            sys.exit(0)
+        print(f"Device runs 0x{device7:07x}, image is 0x{expected:07x} - update required.")
+        sys.exit(1)
+
+    if args.verify_image:
+        if args.bitfile:
+            parser.error("--verify-image takes no positional bitfile argument")
+        if confirm_new_image(args.verify_image):
+            print("UPDATE SUCCESSFUL")
+            sys.exit(0)
+        print("UPDATE VERIFICATION FAILED")
+        sys.exit(1)
+
+    if args.boot_only:
+        if args.bitfile:
+            parser.error("--boot-only takes no bitfile argument")
+        status = warm_boot(args.boot_addr)
+        if status == "absent":
+            report_missing_warmboot()
+            sys.exit(EXIT_NO_WARMBOOT)
+        if status != "ok":
+            sys.exit(1)
+        if args.no_rescan:
+            print("IPROG triggered. Rescan the PCIe bus after ~8s "
+                  "(./rescan_xilinx.sh), then check with --verify-image / --check.")
+            sys.exit(0)
+        rescan_after_warm_boot()
+        read_device_hash()
+        print("Warm boot complete.")
+        sys.exit(0)
+
     if not args.bitfile:
-        parser.error("bitfile required (or use --check)")
+        parser.error("bitfile required (or use --check / --boot-only / --verify-image)")
         sys.exit(0)
 
     print("=== MT28GU512AAA1EGC-0SIT BPI Flash Programmer (Buffered Mode) ===\n")
@@ -462,7 +645,34 @@ if __name__ == "__main__":
     check_rcr_status(FLASH_BASE_ADDR)
     check_lock_status(FLASH_BASE_ADDR)
     program_flash_from_bit(args.bitfile)
-    verify_flash_with_bit(args.bitfile)
+    verified = verify_flash_with_bit(args.bitfile)
     read_flash_array_dump()
 
-    print("All done. You can now reboot or reconfigure the FPGA.")
+    if not verified:
+        # Fail regardless of --no-boot: a caller chaining separate boot/rescan
+        # steps (update.mk) must see a non-zero exit before rebooting.
+        print("Flash verification FAILED - not rebooting into a bad image.")
+        sys.exit(1)
+
+    if args.no_boot:
+        print("All done. You can now reboot or reconfigure the FPGA.")
+        print("(warm boot skipped; trigger it later with: python3 update_flash.py --boot-only)")
+        sys.exit(0)
+
+    status = warm_boot(args.boot_addr)
+    if status == "absent":
+        # The flash now holds the new image, which does have the block - so one
+        # cold boot gets the user onto the reboot-free flow for good.
+        report_missing_warmboot()
+        sys.exit(EXIT_NO_WARMBOOT)
+    if status != "ok":
+        print("All done. Flash is programmed; reboot or reconfigure the FPGA manually.")
+        sys.exit(1)
+
+    if args.no_rescan:
+        print("IPROG triggered. Rescan the PCIe bus after ~8s "
+              "(./rescan_xilinx.sh), then check with --verify-image.")
+    else:
+        rescan_after_warm_boot()
+        confirm_new_image(args.bitfile)
+        print("All done. The FPGA is now running the freshly flashed image.")
