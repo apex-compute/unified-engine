@@ -5697,14 +5697,14 @@ if __name__ == "__main__":
     _seed_probe = torch.randn(4, dtype=torch.bfloat16)
     _RNG_STATE_START = _rng_state_fingerprint()
 
-    # kintex7 operates at 194 Mhz = 5.1594 ns
+    # kintex7 operates at 208 Mhz = 4.8077 ns
     # kintex7_systolic operates at 149.614035 MHz = 6683 ps.
     # alveo operates at 180 Mhz = 5.5556 ns
     # kintex ultrascale+ operates at 333 Mhz = 3.0 ns
     # bittware board operates at 300 Mhz = 3.3333 ns
     clock = None
     if args.device == "kintex7":
-        clock = 5.1594
+        clock = 1000 / 208
     elif args.device == "kintex7_systolic":
         clock = 1000 / 149.61403
     elif args.device == "rk" or args.device == "puzhi":
