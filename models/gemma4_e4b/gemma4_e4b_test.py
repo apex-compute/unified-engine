@@ -105,7 +105,7 @@ DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
 #            LALU_CLAMP_RELU_A/B globals, which the matmul path no longer reads —
 #            a silent no-op that left every vision clamp at ReLU(0,+inf). Real
 #            clamp bounds now emitted → different LALU config bytes, rebuild.
-INSTRUCTION_BIN_COMPILE_VERSION = "v3-clampfix"
+INSTRUCTION_BIN_COMPILE_VERSION = "v6-prefill-kv-norm"
 
 # We run on FPGA + CPU only; disable CUDA before importing torch so PyTorch
 # doesn't probe the GPU driver (avoids a noisy "Error 804: forward compatibility"
@@ -7298,7 +7298,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     # K norm covers all num_kv heads per token (M = seq*num_kv).
                     total_flops += self.rms_norm_core_dram(M=seq_len * num_kv, N=cur_head_dim, A_DRAM_ADDR=self.LAYER0_K_DRAM,
                                     OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off,
-                                    gpr_M_reg=self.gpr_seq_len)
+                                    gpr_M_reg=self.gpr_kv_nvec)
                 if rope_n == cur_head_dim:
                     if non_shared:
                         total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=num_kv, N=rope_n,
@@ -7356,7 +7356,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 # back-to-back-call degradation noted for the legacy subroutine
                 # doesn't apply here).
                 attn_result = self.unified_attention_core(
-                    batch=q_seq_len,
+                    batch=aligned_seq_len,
                     aligned_seq_len=aligned_seq_len,
                     head_dim=cur_head_dim,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
@@ -7799,6 +7799,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # in run_decoder).
         self._isa_add_set_core(self.gpr_seq_len,    seq_len)
         self._isa_add_set_core(self.gpr_q_seq_len,  q_seq_len)
+        self._isa_add_set_core(self.gpr_kv_nvec,    seq_len * self.num_key_value_heads)
         self._isa_add_set_core(self.gpr_aligned_seq_len, aligned_seq_len)
 
         print(f"[Prefill] [exec] launching prefill program on FPGA ({seq_len} tokens, {self.LAYER_SIZE} layers)...", flush=True)

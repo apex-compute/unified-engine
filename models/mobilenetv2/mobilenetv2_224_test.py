@@ -1195,8 +1195,9 @@ def main():
             _original_print(f"\r  {label} ({elapsed:.0f}s)", end="", flush=True)
 
     t0 = _time.perf_counter()
+    _boot = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
+    _boot.software_reset()
     ue = MobileNetV2_UnifiedEngine(script_dir=SCRIPT_DIR)
-    ue.software_reset()
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
 

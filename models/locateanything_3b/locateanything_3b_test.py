@@ -3749,10 +3749,10 @@ def main():
                     help="FPGA board / bitstream profile. Use efinix for the Efinix 4GB DMA profile.")
     ap.add_argument("--cycle", type=float, default=None,
                     help="Clock cycle time in ns. Default: from --device, or existing runtime default.")
-    ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "vette.jpg"))
+    ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "people.jpg"))
     ap.add_argument("--prompt-kind", default="detect",
                     choices=["detect", "ground_multi", "ground_one", "point"])
-    ap.add_argument("--query", default="sports car")
+    ap.add_argument("--query", default="face")
     ap.add_argument("--square", type=int, default=224, choices=[0, 224, 384],
                     help="letterbox every image to square×square (aspect-preserving, gray pad) "
                          "before patchifying -> ONE compiled encoder program for any image. "
