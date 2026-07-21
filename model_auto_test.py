@@ -327,6 +327,18 @@ def _check_mbv2_ssd(text):
         else "no detections above threshold"
     )
 
+def _check_pi05_libero(text):
+    # pi05_libero is a robot policy: no text output, no labels. It emits a (10,7) action
+    # chunk plus a summary line "nan=False inf=False min=-0.1234 max=0.5678".
+    # Pass signal: the run reached the denoise output and the chunk is finite.
+    m = re.search(r"nan=(True|False)\s+inf=(True|False)\s+min=(-?[\d.]+)\s+max=(-?[\d.]+)", text)
+    if not m:
+        return False, "no action-chunk summary line found (run did not reach the denoise output)"
+    nan, inf, lo, hi = m.group(1) == "True", m.group(2) == "True", float(m.group(3)), float(m.group(4))
+    if nan or inf:
+        return False, f"action chunk has nan={nan} inf={inf}"
+    return True, f"finite action chunk (min={lo}, max={hi})"
+
 # Shared algebra prompt: a single-answer math question whose correct result is
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
 MATH_PROMPT = "If x + 3 = 5, what is x?"
@@ -367,6 +379,10 @@ TESTS = [
     {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet},
     {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
+
+    # Robot policy (VLA): no --prompt, no text output -- emits a (10,7) action chunk from
+    # its in-repo LIBERO sample frames. Uses its own sample_data/, not test_samples/.
+    {"name": "pi05_libero", "script": "models/pi05_libero/pi05_libero_test.py", "pass_check": _check_pi05_libero},
 ]
 
 
