@@ -114,8 +114,12 @@ transformations below.
 
 \textbf{\iffour{} weights / DRAM budget.} The $\sim$13\,GB \bfteen{} checkpoint
 does not fit, and writes at/above the 4\,GB boundary fail on this board. All
-matmul weights use 4-bit block quantization (block 64, weight-only),
-shrinking the three stacks to $\sim$1.56\,GB. Weights are dequantized to
+matmul weights use 4-bit block quantization (block 64, weight-only): every
+64-element block stores 64 INT4/FP4 codes plus \emph{one} \bfteen{} scale, so
+a quantized matrix costs $4.25$\,bits/weight ($4+16/64$, i.e.\ $3.76\times$
+smaller than \bfteen{} rather than $4\times$), while norm gains and biases
+stay \bfteen{} outright. That shrinks the three stacks to $\sim$1.56\,GB.
+Weights are dequantized to
 \bfteen{} immediately before each multiply--accumulate, so \iffour{} is a
 \emph{footprint enabler, not a speedup} --- compute is \bfteen{} throughout.
 
@@ -279,7 +283,11 @@ percent, $+34$ on one longer reach). The $16.3$\,dB end-to-end SNR floor of
 Sec.~\ref{sec:quant} sounds alarming in isolation, but the low-SNR components
 are small-magnitude action dimensions that do not change what the robot
 \emph{does}---the task-critical axes and gripper are preserved, and the
-closed-loop behavior confirms it.
+closed-loop behavior confirms it. Put as a benchmark number: quantization
+\emph{did not regress task performance at all} --- same $6/10$ success rate,
+same outcome on every prompt, successful trajectories within a few control
+steps --- so the $\sim$8$\times$ checkpoint compression is free at the task
+level on this suite.
 
 %=============================================================================
 \section{Throughput: FPGA vs.\ CUDA}
@@ -342,22 +350,25 @@ Action expert (denoise) & 20.6  & 10.6\% & 74.7   & 483.5  & 23.5 & 88\% \\
 \begin{table}[H]
 \centering\small
 \caption{Silicon (\iffour{}, \emph{estimated}) per-section timing and achieved
-throughput --- projected ASIC implementation of the \ue{} v1 IP: 8~engines at
-$1.6$\,GHz ($64$~MACs each; $1638.4$\,GFLOP/s aggregate peak), $100$\,GB/s
-DRAM. Batch~1, 10 denoise steps. Linear $61.5\times$ compute scaling of the
-measured FPGA run at its achieved \%-of-peak; no section is bandwidth-bound
-(see below).}
+throughput --- projected ASIC implementation of the \ue{} v1 IP at
+$1.6$\,GHz with $100$\,GB/s DRAM, in a base 8-engine and a doubled 16-engine
+option ($64$~MACs per engine; $1638.4$ / $3276.8$\,GFLOP/s aggregate peak).
+Batch~1, 10 denoise steps. Linear $61.5\times$ / $123\times$ compute scaling
+of the measured FPGA run at its achieved \%-of-peak; neither option is
+bandwidth-bound (see below).}
 \label{tab:timing-silicon}
-\begin{tabular}{@{}lcc@{}}
+\begin{tabular}{@{}lcccc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
+& \multicolumn{2}{c}{\textbf{8 engines}} & \multicolumn{2}{c}{\textbf{16 engines}} \\
+\cmidrule(lr){2-3}\cmidrule(l){4-5}
+\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
 \midrule
-Vision encoder          & 575 & 1\,479 \\
-Prefix (Gemma-2B)       & 2\,236 & 1\,520 \\
-Action expert (denoise) & 335 & 1\,444 \\
+Vision encoder          & 575 & 1\,479 & 288 & 2\,958 \\
+Prefix (Gemma-2B)       & 2\,236 & 1\,520 & 1\,118 & 3\,041 \\
+Action expert (denoise) & 335 & 1\,444 & 167 & 2\,889 \\
 \midrule
-\textbf{End-to-end}     & 3\,146 & 1\,505 \\
-\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.32} \\
+\textbf{End-to-end}     & 3\,146 & 1\,505 & 1\,573 & 3\,010 \\
+\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.32} & \multicolumn{2}{c}{0.64} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -369,23 +380,41 @@ $208$\,MHz to 8 engines at $1.6$\,GHz multiplies compute by $61.5\times$
 ($\sim$6\,$\to$\,$100$\,GB/s), so each section survives as compute-bound only
 if its arithmetic intensity clears the ASIC ridge point of
 $1638.4/100\approx16$\,FLOP/byte. Traffic here is dominated by streaming the
-\iffour{} weights ($\sim$0.53\,B/param): the prefix reads $\sim$1.1\,GB once
+\iffour{} weights ($4.25$\,bits/weight, Sec.~\ref{sec:port}): the prefix
+reads $\sim$1.1\,GB once
 for its 3399.8\,GFLOP ($\sim$3200\,FLOP/byte), the vision tower $\sim$0.65\,GB
 over three slots ($\sim$1300\,FLOP/byte), and the worst case --- the action
 expert, whose $\sim$0.16\,GB are re-streamed on \emph{every} denoise step
 against just $\sim$48\,GFLOP of padded work per step --- still lands at
 $\gtrsim$200\,FLOP/byte with activation and KV-cache traffic included. All
 three sections sit an order of magnitude above the ridge (worst-section
-demand $<$10\,GB/s of the $100$ available), so no stage becomes
-bandwidth-bound and times extrapolate linearly at the FPGA's measured
-$88$--$93\%$ of peak, assuming ideal 8-way engine scaling: $3.15$\,s per
-inference ($0.32$\,inf/s), $61.5\times$ the FPGA, within $24\times$ of the
-RTX~5070's $7.68$\,inf/s.
+demand $<$10\,GB/s of the $100$ available), and doubling to 16 engines only
+lifts the ridge to $\approx$33\,FLOP/byte --- still $\geq$6$\times$ clear. So
+neither option is bandwidth-bound, and times extrapolate linearly at the
+FPGA's measured $88$--$93\%$ of peak, assuming ideal engine scaling:
+$3.15$\,s per inference ($0.32$\,inf/s) with 8 engines and $1.57$\,s
+($0.64$\,inf/s) with 16 --- $61.5\times$ / $123\times$ the FPGA, within
+$24\times$ / $12\times$ of the RTX~5070's $7.68$\,inf/s. Either way the
+engine executes the whole vision--prefix--denoise pipeline autonomously:
+host work per action chunk is an embedding gather on the way in and a
+$10{\times}7$ readback on the way out, so the platform's CPU stays free for
+the robot stack.
+
+\vspace{2pt}
+\noindent\textbf{Power.} The RTX~5070 is a $250$\,W-TGP board (6144 CUDA
+cores, boost $\sim$2.5\,GHz, $12$\,GB GDDR7 at $672$\,GB/s); at $130.2$\,ms
+per inference that is $\approx$33\,J per action chunk at TGP. The \ue{} FPGA
+instance draws $\sim$5\,W --- $\sim$970\,J per (much slower) inference.
+Holding the same $\sim$5\,W-class envelope in silicon, the projections land
+at $\approx$16\,J (8 engines) and $\approx$8\,J (16 engines) per action
+chunk: $2.1\times$ and $4.1\times$ less energy per inference than the GPU
+($0.064$ and $0.127$ vs.\ $0.031$\,inf/s/W).
 
 \vspace{2pt}
 \noindent\textbf{Config.} FPGA: \ue{} v1 IP on Xilinx Kintex-7 at $208$\,MHz
-($26.6$\,GFLOP/s theoretical peak), \iffour{}
-weights / \bfteen{} compute, $4$\,GB DRAM. GPU: RTX~5070, \bfteen{}, $12$\,GB,
+($26.6$\,GFLOP/s theoretical peak, $\sim$5\,W), \iffour{}
+weights / \bfteen{} compute, $4$\,GB DRAM at $\sim$6\,GB/s. GPU: RTX~5070
+(6144 CUDA cores, $250$\,W TGP), \bfteen{}, $12$\,GB GDDR7 at $672$\,GB/s,
 openpi JAX/XLA. Both: batch~1, 10 denoise steps, sample~0.
 
 \vspace{4pt}
@@ -393,8 +422,9 @@ The entire \pizero{} VLA --- vision, Gemma-2B prefix, and the 10-step
 flow-matching expert --- runs on the \ue{}~v1. The recurring theme is the split
 between where FLOPs concentrate (the compute-bound prefix) and where latency
 does (the sequential, FLOP-light denoise loop), and how \iffour{} trades a
-controlled, section-localized accuracy cost for fitting a $\sim$13\,GB model in
-a sub-4\,GB budget. Tables~\ref{tab:budget}--\ref{tab:timing-silicon} complete
+controlled, section-localized accuracy cost --- one with no measured
+closed-loop task regression (Sec.~\ref{sec:libero}) --- for fitting a
+$\sim$13\,GB model in a sub-4\,GB budget. Tables~\ref{tab:budget}--\ref{tab:timing-silicon} complete
 the characterization.
 
 \end{document}
