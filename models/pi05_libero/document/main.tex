@@ -429,7 +429,9 @@ TBD. Table~\ref{tab:platforms} collects the platform comparison.
 the two projected chip variations. Achieved GFLOP/s counts effective FLOPs
 on the GPU and hardware-issued FLOPs on the \ue{} platforms
 (Tables~\ref{tab:timing-gpu}--\ref{tab:timing-silicon}); peaks are \bfteen{}
-rates.}
+rates. The GPU peak is the whitepaper dense \bfteen{} tensor rate with FP32
+accumulation; measured GPU rates above it reflect XLA matmuls dispatched with
+reduced-precision accumulation, whose dense ceiling is $2\times$ higher.}
 \label{tab:platforms}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}lcccc@{}}
