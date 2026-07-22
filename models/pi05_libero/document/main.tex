@@ -20,6 +20,7 @@
 \newcommand{\bfteen}{bf16}
 \newcommand{\numTBD}{{\color{red}--}}
 
+\emergencystretch=1.5em              % absorb marginal overfulls in justification
 \setlength{\textfloatsep}{6pt}       % tighten space around floats
 \setlength{\floatsep}{6pt}
 \setlength{\intextsep}{6pt}
@@ -81,7 +82,7 @@ the integrator.
 \begin{table}[H]
 \centering\small
 \caption{Per-stage parameter and FLOP budget (per inference). \emph{Effective}
-uses true model dims; \emph{FPGA} is the padded shape the 64-wide SIMD ALU
+uses true model dims; \emph{FPGA} is the padded shape the transformer engine
 actually issues. The prefix is already 64-aligned (no padding); the vision
 tower pads only its attention head ($72{\to}128$, $+2.9\%$); the action expert
 pads its query horizon $10{\to}64$ and action width $32{\to}64$, inflating its
@@ -105,9 +106,11 @@ Action expert (Gemma-300M)     & $\sim$0.31\,B & 71.0 & 459.4 \\
 \section{Porting}
 \label{sec:port}
 %=============================================================================
-The \ue{}~v1 is a soft accelerator IP block that can be deployed on any
-sufficiently large FPGA; it operates on $64$-element alignment. In this work it
-is targeted to a Xilinx Kintex-7 with $4$\,GB of attached DRAM. These two
+The \ue{}~v1 is a soft accelerator IP block whose compute core is the Apex
+Compute Transformer Engine; it can be deployed on any
+sufficiently large FPGA and operates on $64$-element alignment. In this work a
+single transformer engine is targeted to a Xilinx Kintex-7 with $4$\,GB of
+attached DRAM. These two
 constraints---$64$-alignment and the $4$\,GB DRAM budget---drive the porting
 transformations below.
 
@@ -329,8 +332,8 @@ Action expert (denoise) & 36.70  & 1\,935  \\
 \caption{FPGA (\iffour{}) per-section timing and achieved throughput
 (\ue{} v1 on Xilinx Kintex-7). Batch~1, 10 denoise steps, sample~0, 3-slot
 vision, 832-token prefix. GFLOP/s and \%~peak are on the hardware-issued
-(padded) FLOPs; theoretical peak is $26.6$\,GFLOP/s ($64$~MACs
-${\times}\,2\,{\times}\,208$\,MHz).}
+(padded) FLOPs; theoretical peak is $26.6$\,GFLOP/s (one Apex Compute
+Transformer Engine at $208$\,MHz).}
 \label{tab:timing-fpga}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}lcccccc@{}}
@@ -351,9 +354,10 @@ Action expert (denoise) & 20.6  & 10.6\% & 74.7   & 483.5  & 23.5 & 88\% \\
 \centering\small
 \caption{Silicon (\iffour{}, \emph{estimated}) per-section timing and achieved
 throughput --- projected ASIC implementation of the \ue{} v1 IP at
-$1.6$\,GHz with $100$\,GB/s DRAM, in two chip variations ---
+$1.6$\,GHz with $100$\,GB/s DRAM, scaling the Apex Compute Transformer
+Engine count in two chip variations ---
 \textbf{Chip Variation~1} (8~engines, $\sim$5\,W) and \textbf{Chip
-Variation~2} (16~engines, wattage TBD) --- $64$~MACs per engine, $1638.4$ /
+Variation~2} (16~engines, wattage TBD) --- $1638.4$ /
 $3276.8$\,GFLOP/s aggregate peak.
 Batch~1, 10 denoise steps. Linear $61.5\times$ / $123\times$ compute scaling
 of the measured FPGA run at its achieved \%-of-peak; neither variation is
@@ -377,7 +381,8 @@ Action expert (denoise) & 335 & 1\,444 & 167 & 2\,889 \\
 \end{table}
 
 \vspace{2pt}
-\noindent\textbf{Why the projection is linear.} Going from one engine at
+\noindent\textbf{Why the projection is linear.} Going from one Apex Compute
+Transformer Engine at
 $208$\,MHz to 8 engines at $1.6$\,GHz multiplies compute by $61.5\times$
 ($26.6\!\to\!1638.4$\,GFLOP/s peak) but DRAM bandwidth by only $16.7\times$
 ($\sim$6\,$\to$\,$100$\,GB/s), so each section survives as compute-bound only
@@ -421,7 +426,7 @@ on the GPU and hardware-issued FLOPs on the \ue{} platforms
 \toprule
 & \textbf{RTX 5070} & \textbf{FPGA (Kintex-7)} & \textbf{Chip Var.~1} & \textbf{Chip Var.~2} \\
 \midrule
-Compute            & 6144 CUDA cores & 1 engine (64 MACs) & 8 engines & 16 engines \\
+Compute            & 6144 CUDA cores & 1 transformer engine & 8 engines & 16 engines \\
 Clock              & $\sim$2.5\,GHz & 208\,MHz & 1.6\,GHz & 1.6\,GHz \\
 Peak GFLOP/s       & --- & 26.6 & 1\,638 & 3\,277 \\
 DRAM bandwidth     & 672\,GB/s & $\sim$6\,GB/s & 100\,GB/s & 100\,GB/s \\
@@ -434,7 +439,8 @@ Throughput         & 7.68\,inf/s & 0.0052\,inf/s & 0.32\,inf/s & 0.64\,inf/s \\
 \end{table}
 
 \vspace{2pt}
-\noindent\textbf{Config.} FPGA: \ue{} v1 IP on Xilinx Kintex-7 at $208$\,MHz
+\noindent\textbf{Config.} FPGA: \ue{} v1 IP (one Apex Compute Transformer
+Engine) on Xilinx Kintex-7 at $208$\,MHz
 ($26.6$\,GFLOP/s theoretical peak), \iffour{}
 weights / \bfteen{} compute, $4$\,GB DRAM at $\sim$6\,GB/s. GPU: RTX~5070
 (6144 CUDA cores, $250$\,W TGP), \bfteen{}, $12$\,GB GDDR7 at $672$\,GB/s,
