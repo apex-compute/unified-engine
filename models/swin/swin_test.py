@@ -558,8 +558,8 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
 # ---------------------------------------------------------------------------
 # DRAM partition.
-# Default historical layout targets >=4 GB boards. Efinix has 2 GB total, so
-# configure_swin_runtime() switches to a compact layout before engine creation.
+# Default historical layout targets >=4 GB boards. Efinix now exposes the same
+# 4 GB DDR window, so configure_swin_runtime() keeps this layout.
 # ---------------------------------------------------------------------------
 SWIN_PARAMS_BASE_DEFAULT  = 0x00000000
 SWIN_TENSOR_BASE_DEFAULT  = 0x40000000
@@ -573,9 +573,9 @@ SWIN_PROGRAM_BASE = SWIN_PROGRAM_BASE_DEFAULT
 def _set_swin_dram_layout_for_device(device: str) -> None:
     global SWIN_PARAMS_BASE, SWIN_TENSOR_BASE, SWIN_PROGRAM_BASE
     if device == "efinix":
-        SWIN_PARAMS_BASE = 0x00000000
-        SWIN_TENSOR_BASE = 0x30000000
-        SWIN_PROGRAM_BASE = 0x70000000
+        SWIN_PARAMS_BASE = SWIN_PARAMS_BASE_DEFAULT
+        SWIN_TENSOR_BASE = SWIN_TENSOR_BASE_DEFAULT
+        SWIN_PROGRAM_BASE = SWIN_PROGRAM_BASE_DEFAULT
     else:
         SWIN_PARAMS_BASE = SWIN_PARAMS_BASE_DEFAULT
         SWIN_TENSOR_BASE = SWIN_TENSOR_BASE_DEFAULT

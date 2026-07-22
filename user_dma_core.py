@@ -41,16 +41,13 @@ UE_DRAM_ADDR = 0x00000008  # Unified DMA address (bits [63:32])
 UE_DMA_LENGTH_ADDR = 0x0000000C
 UE_CONTROL_ADDR = 0x00000010
 UE_STATUS_ADDR = 0x00000014
-UE_OUTPUT_VALID_DELAY_ADDR = 0x0000001C
 UE_URAM_LENGTH_ADDR = 0x00000020
 UE_URAM_WRITEBACK_ADDR = 0x00000024
 UE_LATENCY_COUNT_ADDR = 0x00000030
 UE_DRAM_URAM_CTRL_ADDR = 0x00000034
 UE_LALU_HYPERPARAMETERS_ADDR = 0x00000038  # bf16_lalu_a [15:0], bf16_lalu_b [31:16] (axi_reg_map_pkg.sv)
 UE_URAM_ROW_SIZE_ADDR = 0x00000040
-UE_VALID_DELAY_EXTRA_ADDR = 0x00000044
 UE_LALU_INST_ADDR = 0x00000048
-UE_LALU_DELAY_ADDR = 0x0000004C
 UE_SCALAR_ADDR = 0x00000050
 UE_QUEUE_CTRL_ADDR = 0x00000054
 UE_URAM_LENGTH_ADDR_Z = 0x0000005C
@@ -211,9 +208,9 @@ def configure_device(device_name: str, dma_device: Optional[str] = None, base_ad
     if device_name == "efinix":
         UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
         DRAM_START_ADDR = 0x00000000
-        DRAM_ACTIVATION_ADDR = 0x30000000
-        DRAM_INSTRUCTION_ADDR = 0x3F000000
-        DRAM_END_ADDR = 0x7FFFFFFF
+        DRAM_ACTIVATION_ADDR = 0xB0000000
+        DRAM_INSTRUCTION_ADDR = 0xD0000000
+        DRAM_END_ADDR = 0xFFFFFFFF
         old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
         DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
         DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
@@ -362,41 +359,6 @@ class BROADCAST_MODE(IntEnum):
 # Writeback padding constants
 WB_PADDING_ZERO = 0     # 0x0000
 WB_PADDING_NEG_INF = 1  # 0xFF80
-
-# Legacy delay-register timing constants required by the current Efinix
-# 0x12345678 bitstream. Newer Andromeda RTL derives these internally; keep the
-# writes Efinix-only in init_unified_engine().
-UE_PIPELINE_BF19_MULT = 2
-UE_PIPELINE_BF19_ADD = 3
-UE_PIPELINE_CUSTOM_EXP = 5
-UE_PIPELINE_ADDER_TREE = 12
-BF20_ADDER_3_CYCLE = True
-UE_LATENCY_BF20_ITR2, UE_LATENCY_BF20_ITR3, UE_LATENCY_BF20_ITRGT3 = (
-    (3, 11, 11) if BF20_ADDER_3_CYCLE else (2, 5, 7)
-)
-UE_PIPELINE_STAGES_INPUT_REG = 1
-UE_PIPELINE_STAGES_DOT_P = 4
-UE_PIPELINE_STAGES_RMS = 4
-UE_PIPELINE_STAGES_EXP = 4
-UE_PIPELINE_STAGES_MULT = 4
-UE_PIPELINE_STAGES_ADD = 3
-UE_LATENCY_DOT_PRODUCT = UE_PIPELINE_STAGES_INPUT_REG + UE_PIPELINE_STAGES_DOT_P + UE_PIPELINE_BF19_MULT + UE_PIPELINE_ADDER_TREE - 1
-UE_LATENCY_RMS = UE_PIPELINE_STAGES_RMS + UE_PIPELINE_BF19_MULT + UE_PIPELINE_ADDER_TREE - 1
-UE_LATENCY_EXP = UE_PIPELINE_STAGES_EXP + UE_PIPELINE_BF19_ADD + UE_PIPELINE_CUSTOM_EXP + UE_PIPELINE_ADDER_TREE - 1
-UE_LATENCY_ADD_REDUCE = UE_PIPELINE_STAGES_ADD + UE_PIPELINE_BF19_ADD + UE_PIPELINE_ADDER_TREE - 1
-UE_LATENCY_ELTWISE_MUL = UE_PIPELINE_STAGES_MULT + UE_PIPELINE_BF19_MULT - 1
-UE_LATENCY_ELTWISE_ADD = UE_PIPELINE_STAGES_ADD + UE_PIPELINE_BF19_ADD - 1
-UE_LATENCY_ADD_EXP = UE_PIPELINE_STAGES_EXP + UE_PIPELINE_BF19_ADD + UE_PIPELINE_CUSTOM_EXP - 1
-UE_LALU_PIPELINE_FPDIV = 3
-UE_LALU_PIPELINE_FPSQRT = 3
-UE_LALU_PIPELINE_FACT = 8
-UE_LALU_LATENCY_SOFTMAX = 1 + UE_LALU_PIPELINE_FPDIV
-UE_LALU_LATENCY_RMS = 1 + UE_LALU_PIPELINE_FPSQRT + 1 + UE_LALU_PIPELINE_FPDIV
-UE_LALU_LATENCY_ACT = 1 + UE_LALU_PIPELINE_FACT + 1 + UE_LALU_PIPELINE_FPDIV
-UE_QUANTIZE_FMAX_PIPELINE = 8
-UE_LATENCY_QSCALE = UE_LALU_PIPELINE_FPDIV + UE_QUANTIZE_FMAX_PIPELINE + 2
-UE_QINPUT_DELAY = UE_LATENCY_QSCALE + 1
-UE_LATENCY_QUANTIZATION = UE_LATENCY_QSCALE + UE_PIPELINE_BF19_MULT + 5
 
 # ISA instruction type constants (matching queue_state_module.sv / andromeda.c)
 INSTRUCTION_UE_OP = 0x0
@@ -902,10 +864,10 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        expected_hw_version = 0xf2e8d12b if CURRENT_DEVICE == "efinix" else 0x93ffa0c8
-        assert hw_version == expected_hw_version, (
+        expected_hw_versions = {0x12345678, 0xf2e8d12b} if CURRENT_DEVICE == "efinix" else {0x93ffa0c8}
+        assert hw_version in expected_hw_versions, (
             f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
-            f"expected 0x{expected_hw_version:08x}."
+            f"expected one of {', '.join(f'0x{v:08x}' for v in sorted(expected_hw_versions))}."
         )
 
         addr = UE_START_ADDR # first reg address offset
@@ -927,37 +889,9 @@ class UnifiedEngine:
         else:
             print("Dram read/write test failed")
 
-        # Initialize Unified Engine hardware.
-        # Newer Andromeda RTL derives delay controls internally. The current
-        # Efinix 0x12345678 bitstream still exposes these registers.
-        if CURRENT_DEVICE == "efinix":
-            ue_output_valid_delay = (
-                (UE_LATENCY_ADD_EXP << 27) +
-                (UE_LATENCY_RMS << 22) +
-                (UE_LATENCY_DOT_PRODUCT << 17) +
-                (UE_LATENCY_ELTWISE_ADD << 13) +
-                (UE_LATENCY_ELTWISE_MUL << 5) +
-                (UE_LATENCY_EXP << 0)
-            )
-            self.write_reg32(UE_OUTPUT_VALID_DELAY_ADDR, ue_output_valid_delay)
-            ue_valid_delay_extra = (
-                (UE_LATENCY_BF20_ITRGT3 << 23) +
-                (UE_LATENCY_BF20_ITR3 << 19) +
-                (UE_LATENCY_BF20_ITR2 << 15) +
-                ((UE_PIPELINE_BF19_MULT - 1) << 10) +
-                ((UE_PIPELINE_BF19_ADD - 1) << 5) +
-                (UE_LATENCY_ADD_REDUCE << 0)
-            )
-            self.write_reg32(UE_VALID_DELAY_EXTRA_ADDR, ue_valid_delay_extra)
-            ue_lalu_delay = (
-                ((UE_QINPUT_DELAY & 0x1F) << 21) +
-                (UE_LATENCY_QUANTIZATION << 16) +
-                (UE_LATENCY_QSCALE << 12) +
-                (UE_LALU_LATENCY_ACT << 8) +
-                (UE_LALU_LATENCY_RMS << 4) +
-                (UE_LALU_LATENCY_SOFTMAX << 0)
-            )
-            self.write_reg32(UE_LALU_DELAY_ADDR, ue_lalu_delay)
+        # Initialize Unified Engine hardware
+        # Pipeline latency delays are now derived internally by the hardware
+        # (delay ctrl regs removed at 0x1C/0x44/0x4C, andromeda commit ff8543ade)
         print("init_unified_engine()")
         print("Unified Engine initialization completed successfully!")
 

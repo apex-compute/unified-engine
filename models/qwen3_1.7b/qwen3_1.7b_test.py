@@ -65,8 +65,8 @@ def _set_dram_layout_for_device(device: str) -> None:
     global QWEN3_PARAMS_BASE, QWEN3_TENSOR_BASE, QWEN3_PROGRAM_BASE
     if device == "efinix":
         QWEN3_PARAMS_BASE = 0x00000000
-        QWEN3_TENSOR_BASE = 0x45000000
-        QWEN3_PROGRAM_BASE = 0x70000000
+        QWEN3_TENSOR_BASE = 0x58000000
+        QWEN3_PROGRAM_BASE = 0xE0000000
     else:
         QWEN3_PARAMS_BASE = 0x00000000
         QWEN3_TENSOR_BASE = 0x58000000

@@ -42,9 +42,9 @@ MSAM_PROGRAM_BASE = 0xD8000000
 def _set_dram_layout_for_device(device: str) -> None:
     global MSAM_PARAMS_BASE, MSAM_TENSOR_BASE, MSAM_PROGRAM_BASE
     if device == "efinix":
-        MSAM_PARAMS_BASE = 0x01000000
-        MSAM_TENSOR_BASE = 0x10000000
-        MSAM_PROGRAM_BASE = 0x40000000
+        MSAM_PARAMS_BASE = 0x80000000
+        MSAM_TENSOR_BASE = 0xB0000000
+        MSAM_PROGRAM_BASE = 0xD8000000
     else:
         MSAM_PARAMS_BASE = 0x80000000
         MSAM_TENSOR_BASE = 0xB0000000
