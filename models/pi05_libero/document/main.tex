@@ -420,9 +420,8 @@ TBD. Table~\ref{tab:platforms} collects the platform comparison.
 \caption{Platform comparison: measured RTX~5070 and \ue{}~v1 FPGA runs, and
 the two projected chip variations. Achieved GFLOP/s counts effective FLOPs
 on the GPU and hardware-issued FLOPs on the \ue{} platforms
-(Tables~\ref{tab:timing-gpu}--\ref{tab:timing-silicon}). GPU peaks are the
-FP32 shader rate and the dense-tensor \bfteen{} rate; the \ue{} computes in
-\bfteen{} natively.}
+(Tables~\ref{tab:timing-gpu}--\ref{tab:timing-silicon}); peaks are \bfteen{}
+rates.}
 \label{tab:platforms}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}lcccc@{}}
@@ -431,8 +430,7 @@ FP32 shader rate and the dense-tensor \bfteen{} rate; the \ue{} computes in
 \midrule
 Compute            & 6144 CUDA cores & 1 engine & 8 engines & 16 engines \\
 Clock              & $\sim$2.5\,GHz & 208\,MHz & 1.6\,GHz & 1.6\,GHz \\
-Peak GFLOP/s (fp32) & 30\,900 & --- & --- & --- \\
-Peak GFLOP/s (\bfteen{}) & 61\,800 & 26.6 & 1\,638 & 3\,277 \\
+Peak GFLOP/s (\bfteen{}) & 30\,870 & 26.6 & 1\,638 & 3\,277 \\
 DRAM bandwidth     & 672\,GB/s & $\sim$6\,GB/s & 100\,GB/s & 100\,GB/s \\
 Power              & 250\,W (TGP) & --- & $\sim$5\,W & TBD \\
 Achieved GFLOP/s   & 31\,736 & 24.5 & 1\,505 & 3\,010 \\
