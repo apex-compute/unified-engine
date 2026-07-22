@@ -18,7 +18,10 @@
 \AddToHook{shipout/background}{%
   \put(0.5\paperwidth,-0.5\paperheight){%
     \makebox(0,0){\rotatebox{45}{%
-      \textcolor{gray!25}{\fontsize{68}{68}\selectfont\bfseries CONFIDENTIAL}}}}%
+      \begin{tabular}{@{}c@{}}
+        \textcolor{gray!25}{\fontsize{68}{68}\selectfont\bfseries CONFIDENTIAL}\\[10pt]
+        \textcolor{gray!25}{\fontsize{22}{26}\selectfont\bfseries Prepared for The Bot Company}
+      \end{tabular}}}}%
 }
 
 % ---- macros -------------------------------------------------------------
@@ -35,7 +38,7 @@
 \setlength{\parskip}{2pt}
 
 \title{\vspace{-2em}Deploying Physical Intelligence \pizero{} on the \ue{}}
-\author{Apex Compute}
+\author{Apex Compute\\[1pt]\texttt{hunlu@apexcompute.com}}
 \date{\vspace{-1em}}
 
 \begin{document}
@@ -124,7 +127,8 @@ constraints---$64$-alignment and the $4$\,GB DRAM budget---drive the porting
 transformations below.
 
 
-\textbf{\iffour{} weights / DRAM budget.} The $\sim$13\,GB \bfteen{} checkpoint
+\textbf{\iffour{} weights / DRAM budget.} The $\sim$13\,GB full-precision
+checkpoint
 does not fit the $4$\,GB DRAM budget. All
 matmul weights use 4-bit block quantization (block 64, weight-only): every
 64-element block stores 64 INT4/FP4 codes plus \emph{one} \bfteen{} scale, so
