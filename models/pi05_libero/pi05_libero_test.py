@@ -1397,7 +1397,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_ACTION_DIM_PADDED = 32
     AE_XT_WIDTH = 64  # physical width of x_t/v_t buffers (action_dim 32 padded to 64-align)
     # --- roofline / FLOP-util reporting -------------------------------------
-    CYCLE_NS = 5.63          # HW clock period (config defaults.cycle_ns) -> ~177.6 MHz
+    CYCLE_NS = 1000 / 208    # HW clock period (config defaults.cycle_ns) -> kintex7
+                             # at 208 MHz = 4.8077 ns; peak = 64 MACs * 2 * 208 MHz
+                             # = 26.624 GFLOP/s
     MACS_PER_CYCLE = 64      # ASSUMPTION: 64-ALU vector unit = 64 MACs/cycle. If the
                              # matmul core is a 64xN systolic array this is higher --
                              # set to the real MAC/cycle to get an accurate %-of-peak.

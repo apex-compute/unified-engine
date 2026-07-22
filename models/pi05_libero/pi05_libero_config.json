@@ -105,7 +105,7 @@
     "prompt": "pick up the object",
     "image": "models/pi05_libero/sample_data_placeholder",
     "dev": "xdma0",
-    "cycle_ns": 5.63,
+    "cycle_ns": 4.8077,
     "max_seq": 1024
   },
   "hw_notes": [

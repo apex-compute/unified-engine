@@ -320,18 +320,20 @@ Action expert (denoise) & 36.70  & 1\,935  \\
 \centering\small
 \caption{FPGA (\iffour{}) per-section timing and achieved throughput
 (\ue{} v1 on Xilinx Kintex-7). Batch~1, 10 denoise steps, sample~0, 3-slot
-vision, 832-token prefix. GFLOP/s is on the hardware-issued (padded) FLOPs.}
+vision, 832-token prefix. GFLOP/s and \%~peak are on the hardware-issued
+(padded) FLOPs; theoretical peak is $26.6$\,GFLOP/s ($64$~MACs
+${\times}\,2\,{\times}\,208$\,MHz).}
 \label{tab:timing-fpga}
-\begin{tabular}{@{}lcc@{}}
+\begin{tabular}{@{}lcccccc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
+\textbf{Model section} & \textbf{Time (s)} & \textbf{Share} & \textbf{Eff.\ GFLOP} & \textbf{HW-issued GFLOP} & \textbf{GFLOP/s (hw)} & \textbf{\% peak} \\
 \midrule
-Vision encoder          & 38.0  & 22.4 \\
-Prefix (Gemma-2B)       & 147.6 & 23.0 \\
-Action expert (denoise) & 22.1  & 21.9 \\
+Vision encoder          & 35.4  & 18.3\% & 655.9  & 850.7  & 24.0 & 90\% \\
+Prefix (Gemma-2B)       & 137.6 & 71.1\% & 3399.8 & 3399.8 & 24.7 & 93\% \\
+Action expert (denoise) & 20.6  & 10.6\% & 74.7   & 483.5  & 23.5 & 88\% \\
 \midrule
-\textbf{End-to-end}     & 207.7 & 22.8 \\
-\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.0048} \\
+\textbf{End-to-end}     & \textbf{193.6} & 100\% & \textbf{4130.4} & \textbf{4734.0} & \textbf{24.5} & \textbf{92\%} \\
+\textbf{Throughput (inf/s)} & \multicolumn{6}{c}{0.0052} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -357,7 +359,8 @@ Action expert (denoise) & \numTBD & \numTBD \\
 \end{table}
 
 \vspace{2pt}
-\noindent\textbf{Config.} FPGA: \ue{} v1 IP on Xilinx Kintex-7, \iffour{}
+\noindent\textbf{Config.} FPGA: \ue{} v1 IP on Xilinx Kintex-7 at $208$\,MHz
+($26.6$\,GFLOP/s theoretical peak), \iffour{}
 weights / \bfteen{} compute, $4$\,GB DRAM. GPU: RTX~5070, \bfteen{}, $12$\,GB,
 openpi JAX/XLA. Both: batch~1, 10 denoise steps, sample~0.
 
