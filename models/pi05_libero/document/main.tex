@@ -11,7 +11,15 @@
 \usepackage{booktabs}
 \usepackage{float}
 \usepackage{xcolor}
+\usepackage{graphicx}
 \usepackage[hidelinks]{hyperref}
+
+% ---- CONFIDENTIAL watermark on every page -------------------------------
+\AddToHook{shipout/background}{%
+  \put(0.5\paperwidth,-0.5\paperheight){%
+    \makebox(0,0){\rotatebox{45}{%
+      \textcolor{gray!25}{\fontsize{68}{68}\selectfont\bfseries CONFIDENTIAL}}}}%
+}
 
 % ---- macros -------------------------------------------------------------
 \newcommand{\pizero}{$\pi_{0.5}$}
@@ -26,7 +34,7 @@
 \setlength{\intextsep}{6pt}
 \setlength{\parskip}{2pt}
 
-\title{\vspace{-2em}Physical Intelligence \pizero{} --- \ue{}~v1}
+\title{\vspace{-2em}Deploying Physical Intelligence \pizero{} on the \ue{}}
 \author{Apex Compute}
 \date{\vspace{-1em}}
 
