@@ -324,9 +324,10 @@ vision, 832-token prefix. GFLOP/s and \%~peak are on the hardware-issued
 (padded) FLOPs; theoretical peak is $26.6$\,GFLOP/s ($64$~MACs
 ${\times}\,2\,{\times}\,208$\,MHz).}
 \label{tab:timing-fpga}
+\setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}lcccccc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (s)} & \textbf{Share} & \textbf{Eff.\ GFLOP} & \textbf{HW-issued GFLOP} & \textbf{GFLOP/s (hw)} & \textbf{\% peak} \\
+\textbf{Model section} & \textbf{Time (s)} & \textbf{Share} & \textbf{Eff.\ GFLOP} & \textbf{HW GFLOP} & \textbf{GFLOP/s (hw)} & \textbf{\% peak} \\
 \midrule
 Vision encoder          & 35.4  & 18.3\% & 655.9  & 850.7  & 24.0 & 90\% \\
 Prefix (Gemma-2B)       & 137.6 & 71.1\% & 3399.8 & 3399.8 & 24.7 & 93\% \\
