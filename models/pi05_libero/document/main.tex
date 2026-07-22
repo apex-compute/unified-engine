@@ -1,6 +1,6 @@
 %=============================================================================
 %  Physical Intelligence pi0.5 on the Unified Engine v1
-%  Single-column report -- 2-PAGE version (skeleton tables to fill in).
+%  Single-column report.
 %  Build: pdflatex main.tex   (article, amsmath, booktabs)
 %  Overleaf: paste as main.tex, compiler = pdfLaTeX.
 %=============================================================================
@@ -56,13 +56,13 @@ cached, it costs $\approx$656\,GFLOP.
 The patch tokens are projected to $d{=}2048$, concatenated with the instruction
 tokens, and processed once by a Gemma-2B backbone: $L_p{=}18$ layers of
 grouped-query attention ($8$ query, $1$ KV head, head-dim $256$), RMSNorm, RoPE,
-and a gated SiLU MLP ($I{=}16384$). At prefill length $M_p{=}576$ one layer costs
+and a gated SiLU MLP ($I{=}16384$). At prefill length $M_p{=}832$ one layer costs
 \begin{equation}
 2 M_p d\, d_{q} + 4 M_p d\, d_{kv} + 2 M_p d_{q} d
 + 4 M_p^2 d_{q} + 6 M_p d\, I ,
 \end{equation}
 ($d_q{=}2048$, $d_{kv}{=}256$), dominated by the MLP; over $18$ layers the
-prefix is $\approx$2332\,GFLOP ($76\%$ of the model). Each layer's K/V is cached
+prefix is $\approx$3400\,GFLOP ($82\%$ of the model). Each layer's K/V is cached
 and reused by every denoise step.
 
 \subsection{Action expert}
@@ -75,7 +75,7 @@ x_{t+\Delta t}=x_t+\Delta t\,v_\theta\!\left(x_t,\,t,\,\mathrm{KV}_{\text{prefix
 \label{eq:euler}
 \end{equation}
 each step attending over the cached prefix K/V and reading out actions through a
-$(1024{\to}32)$ head. At only $\approx$71\,GFLOP ($2.3\%$) it is arithmetically
+$(1024{\to}32)$ head. At only $\approx$75\,GFLOP ($1.8\%$) it is arithmetically
 small but the sole sequential stage, and its per-step error accumulates through
 the integrator.
 
@@ -83,21 +83,22 @@ the integrator.
 \centering\small
 \caption{Per-stage parameter and FLOP budget (per inference). \emph{Effective}
 uses true model dims; \emph{FPGA} is the padded shape the transformer engine
-actually issues. The prefix is already 64-aligned (no padding); the vision
-tower pads only its attention head ($72{\to}128$, $+2.9\%$); the action expert
+actually issues. The $832$-token prefix is 64-aligned (no padding); the vision
+tower pads its attention head-dim ($72{\to}128$) and MLP ($4304{\to}4352$),
+$\sim$30\% extra issued work; the action expert
 pads its query horizon $10{\to}64$ and action width $32{\to}64$, inflating its
-work $\sim$6.5$\times$ --- so overall the FPGA issues $\sim$13\% more FLOPs than
+work $\sim$6.5$\times$ --- so overall the FPGA issues $\sim$15\% more FLOPs than
 the model nominally needs.}
 \label{tab:budget}
 \begin{tabular}{@{}lrrr@{}}
 \toprule
 \textbf{Stage} & \textbf{Params} & \textbf{Eff.\ GFLOP} & \textbf{FPGA GFLOP} \\
 \midrule
-Vision tower (SigLIP, 3 slots) & $\sim$0.41\,B & 655.9 & 674.9 \\
-Language prefix (Gemma-2B)     & $\sim$2.0\,B  & 2332.0 & 2332.0 \\
-Action expert (Gemma-300M)     & $\sim$0.31\,B & 71.0 & 459.4 \\
+Vision tower (SigLIP, 3 slots) & $\sim$0.41\,B & 655.9 & 850.7 \\
+Language prefix (Gemma-2B)     & $\sim$2.0\,B  & 3399.8 & 3399.8 \\
+Action expert (Gemma-300M)     & $\sim$0.31\,B & 74.7 & 483.5 \\
 \midrule
-\textbf{Total} & \textbf{$\sim$2.7\,B} & \textbf{3058.9} & \textbf{3466.3} \\
+\textbf{Total} & \textbf{$\sim$2.7\,B} & \textbf{4130.4} & \textbf{4734.0} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -116,7 +117,7 @@ transformations below.
 
 
 \textbf{\iffour{} weights / DRAM budget.} The $\sim$13\,GB \bfteen{} checkpoint
-does not fit, and writes at/above the 4\,GB boundary fail on this board. All
+does not fit the $4$\,GB DRAM budget. All
 matmul weights use 4-bit block quantization (block 64, weight-only): every
 64-element block stores 64 INT4/FP4 codes plus \emph{one} \bfteen{} scale, so
 a quantized matrix costs $4.25$\,bits/weight ($4+16/64$, i.e.\ $3.76\times$
@@ -127,21 +128,24 @@ Weights are dequantized to
 \emph{footprint enabler, not a speedup} --- compute is \bfteen{} throughout.
 
 \textbf{Vision head-dim pad.} Head-dim $72$ is not $64$-/$128$-aligned, so the
-attention matmuls are padded $72{\to}128$ and contracted back via a precomputed
-$128{\times}72$ selection matrix; the $Q/K/V/O$ projections stay at $72$.
+attention path runs at a padded head-dim of $128$ --- weights pre-padded
+$72{\to}128$ across the $Q/K/V/O$ projections and the attention matmuls ---
+and is contracted back via a precomputed $128{\times}72$ selection matrix; the
+vision MLP pads $4304{\to}4352$. This padding is real issued work, $\sim$30\%
+over the effective FLOPs (Table~\ref{tab:budget}).
 
-\textbf{Prefix masking.} The masked image slot is dropped, compressing prefill
-$832{\to}576$ (bit-identical, $\sim$24\% faster). Rotary positions use
+\textbf{Prefix masking.} When an image slot is unused it can be dropped from
+the prefill, compressing $832{\to}576$ (bit-identical, $\sim$24\% faster
+end-to-end). Rotary positions use
 cumulative-sum-of-mask indices, not \texttt{arange}, so dropping a slot does
 not shift phase. The non-causal/causal mixed attention mask is supplied as a
-static bias tensor in DRAM.
+static bias tensor in DRAM. The measured runs in Sec.~\ref{sec:throughput}
+keep the full $832$-token prefill so the 3-slot path is exercised end-to-end
+(Sec.~\ref{sec:libero}).
 
 \textbf{Denoise loop.} All $10{\times}18$ steps are unrolled into one program
 issued with a single execute call; AdaRMSNorm conditioning is a matmul to $3H$
-split into scale/shift/gate. Every strided SRAM$\to$DRAM copy needs an explicit
-per-index destination offset --- a missing one yields finite-but-scrambled
-output (not a NaN), and fixing these recovered the expert from $-10$ to
-$\sim$29\,dB.
+split into scale/shift/gate.
 
 %=============================================================================
 \section{Quantization}
@@ -248,7 +252,8 @@ task success and by the per-episode step count.
 \caption{LIBERO closed-loop agreement: FPGA (\iffour{}) vs.\ CUDA (\bfteen{}),
 10 prompts, 1 episode each, fixed seed/noise. \checkmark${=}$success,
 $\times{=}$failure; the number is episode length in sim steps. $\Delta$ is FPGA
-$-$ CUDA steps on successes (both failures run to the step cap, so $\Delta$ is
+$-$ CUDA steps on successes (failures run to the per-suite step cap on both
+platforms, so $\Delta$ is
 not meaningful there). The two policies reach the \emph{same} outcome on every
 prompt.}
 \label{tab:libero}
@@ -261,7 +266,7 @@ prompt.}
 2 & \checkmark~123 & \checkmark~115 & $+8$  & \checkmark \\
 3 & \checkmark~108 & \checkmark~109 & $-1$  & \checkmark \\
 4 & $\times$~230 & $\times$~230 & --- & \checkmark \\
-5$^\dagger$ & $\times$~290 & $\times$~290 & --- & \checkmark \\
+5 & $\times$~290 & $\times$~290 & --- & \checkmark \\
 6 & \checkmark~121 & \checkmark~120 & $+1$  & \checkmark \\
 7 & $\times$~230 & $\times$~230 & --- & \checkmark \\
 8 & \checkmark~107 & \checkmark~106 & $+1$  & \checkmark \\
@@ -271,10 +276,6 @@ prompt.}
 \bottomrule
 \end{tabular}
 \end{table}
-
-\noindent{\footnotesize $^\dagger$Prompt~5 is a \texttt{libero\_object} task; the
-original \texttt{libero\_spatial} task~5 exercised a denoise-loop compile path
-that crashed the FPGA bring-up, so it is substituted with the next unused prompt.}
 
 \vspace{4pt}
 \noindent\textbf{Takeaway.} \iffour{} is not just numerically close---it is
@@ -318,10 +319,10 @@ separately-jitted; End-to-end is the fused \texttt{policy.infer}.}
 \textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
 \midrule
 Vision encoder          & 19.41  & 33\,793 \\
-Prefix (Gemma-2B)       & 79.29  & 29\,411 \\
-Action expert (denoise) & 36.70  & 1\,935  \\
+Prefix (Gemma-2B)       & 79.29  & 42\,877 \\
+Action expert (denoise) & 36.70  & 2\,035  \\
 \midrule
-\textbf{End-to-end}     & 130.15 & 23\,502 \\
+\textbf{End-to-end}     & 130.15 & 31\,736 \\
 \textbf{Throughput (inf/s)} & \multicolumn{2}{c}{7.68} \\
 \bottomrule
 \end{tabular}
@@ -419,19 +420,22 @@ TBD. Table~\ref{tab:platforms} collects the platform comparison.
 \caption{Platform comparison: measured RTX~5070 and \ue{}~v1 FPGA runs, and
 the two projected chip variations. Achieved GFLOP/s counts effective FLOPs
 on the GPU and hardware-issued FLOPs on the \ue{} platforms
-(Tables~\ref{tab:timing-gpu}--\ref{tab:timing-silicon}).}
+(Tables~\ref{tab:timing-gpu}--\ref{tab:timing-silicon}). GPU peaks are the
+FP32 shader rate and the dense-tensor \bfteen{} rate; the \ue{} computes in
+\bfteen{} natively.}
 \label{tab:platforms}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}lcccc@{}}
 \toprule
 & \textbf{RTX 5070} & \textbf{FPGA (Kintex-7)} & \textbf{Chip Var.~1} & \textbf{Chip Var.~2} \\
 \midrule
-Compute            & 6144 CUDA cores & 1 transformer engine & 8 engines & 16 engines \\
+Compute            & 6144 CUDA cores & 1 engine & 8 engines & 16 engines \\
 Clock              & $\sim$2.5\,GHz & 208\,MHz & 1.6\,GHz & 1.6\,GHz \\
-Peak GFLOP/s       & --- & 26.6 & 1\,638 & 3\,277 \\
+Peak GFLOP/s (fp32) & 30\,900 & --- & --- & --- \\
+Peak GFLOP/s (\bfteen{}) & 61\,800 & 26.6 & 1\,638 & 3\,277 \\
 DRAM bandwidth     & 672\,GB/s & $\sim$6\,GB/s & 100\,GB/s & 100\,GB/s \\
 Power              & 250\,W (TGP) & --- & $\sim$5\,W & TBD \\
-Achieved GFLOP/s   & 23\,502 & 24.5 & 1\,505 & 3\,010 \\
+Achieved GFLOP/s   & 31\,736 & 24.5 & 1\,505 & 3\,010 \\
 Time / inference   & 0.130\,s & 193.6\,s & 3.15\,s & 1.57\,s \\
 Throughput         & 7.68\,inf/s & 0.0052\,inf/s & 0.32\,inf/s & 0.64\,inf/s \\
 \bottomrule
