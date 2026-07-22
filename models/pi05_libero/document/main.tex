@@ -342,22 +342,45 @@ Action expert (denoise) & 20.6  & 10.6\% & 74.7   & 483.5  & 23.5 & 88\% \\
 \begin{table}[H]
 \centering\small
 \caption{Silicon (\iffour{}, \emph{estimated}) per-section timing and achieved
-throughput --- projected ASIC implementation of the \ue{} v1 IP. Batch~1, 10
-denoise steps. \emph{Skeleton --- fill in.}}
+throughput --- projected ASIC implementation of the \ue{} v1 IP: 8~engines at
+$1.6$\,GHz ($64$~MACs each; $1638.4$\,GFLOP/s aggregate peak), $100$\,GB/s
+DRAM. Batch~1, 10 denoise steps. Linear $61.5\times$ compute scaling of the
+measured FPGA run at its achieved \%-of-peak; no section is bandwidth-bound
+(see below).}
 \label{tab:timing-silicon}
 \begin{tabular}{@{}lcc@{}}
 \toprule
 \textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
 \midrule
-Vision encoder          & \numTBD & \numTBD \\
-Prefix (Gemma-2B)       & \numTBD & \numTBD \\
-Action expert (denoise) & \numTBD & \numTBD \\
+Vision encoder          & 575 & 1\,479 \\
+Prefix (Gemma-2B)       & 2\,236 & 1\,520 \\
+Action expert (denoise) & 335 & 1\,444 \\
 \midrule
-\textbf{End-to-end}     & \numTBD & \numTBD \\
-\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{\numTBD} \\
+\textbf{End-to-end}     & 3\,146 & 1\,505 \\
+\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.32} \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\vspace{2pt}
+\noindent\textbf{Why the projection is linear.} Going from one engine at
+$208$\,MHz to 8 engines at $1.6$\,GHz multiplies compute by $61.5\times$
+($26.6\!\to\!1638.4$\,GFLOP/s peak) but DRAM bandwidth by only $16.7\times$
+($\sim$6\,$\to$\,$100$\,GB/s), so each section survives as compute-bound only
+if its arithmetic intensity clears the ASIC ridge point of
+$1638.4/100\approx16$\,FLOP/byte. Traffic here is dominated by streaming the
+\iffour{} weights ($\sim$0.53\,B/param): the prefix reads $\sim$1.1\,GB once
+for its 3399.8\,GFLOP ($\sim$3200\,FLOP/byte), the vision tower $\sim$0.65\,GB
+over three slots ($\sim$1300\,FLOP/byte), and the worst case --- the action
+expert, whose $\sim$0.16\,GB are re-streamed on \emph{every} denoise step
+against just $\sim$48\,GFLOP of padded work per step --- still lands at
+$\gtrsim$200\,FLOP/byte with activation and KV-cache traffic included. All
+three sections sit an order of magnitude above the ridge (worst-section
+demand $<$10\,GB/s of the $100$ available), so no stage becomes
+bandwidth-bound and times extrapolate linearly at the FPGA's measured
+$88$--$93\%$ of peak, assuming ideal 8-way engine scaling: $3.15$\,s per
+inference ($0.32$\,inf/s), $61.5\times$ the FPGA, within $24\times$ of the
+RTX~5070's $7.68$\,inf/s.
 
 \vspace{2pt}
 \noindent\textbf{Config.} FPGA: \ue{} v1 IP on Xilinx Kintex-7 at $208$\,MHz
@@ -371,7 +394,7 @@ flow-matching expert --- runs on the \ue{}~v1. The recurring theme is the split
 between where FLOPs concentrate (the compute-bound prefix) and where latency
 does (the sequential, FLOP-light denoise loop), and how \iffour{} trades a
 controlled, section-localized accuracy cost for fitting a $\sim$13\,GB model in
-a sub-4\,GB budget. Tables~\ref{tab:quant}--\ref{tab:timing-gpu} complete the
-characterization once populated.
+a sub-4\,GB budget. Tables~\ref{tab:budget}--\ref{tab:timing-silicon} complete
+the characterization.
 
 \end{document}
