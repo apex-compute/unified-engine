@@ -351,15 +351,18 @@ Action expert (denoise) & 20.6  & 10.6\% & 74.7   & 483.5  & 23.5 & 88\% \\
 \centering\small
 \caption{Silicon (\iffour{}, \emph{estimated}) per-section timing and achieved
 throughput --- projected ASIC implementation of the \ue{} v1 IP at
-$1.6$\,GHz with $100$\,GB/s DRAM, in a base 8-engine and a doubled 16-engine
-option ($64$~MACs per engine; $1638.4$ / $3276.8$\,GFLOP/s aggregate peak).
+$1.6$\,GHz with $100$\,GB/s DRAM, in two chip variations ---
+\textbf{Chip Variation~1} (8~engines, $\sim$5\,W) and \textbf{Chip
+Variation~2} (16~engines, wattage TBD) --- $64$~MACs per engine, $1638.4$ /
+$3276.8$\,GFLOP/s aggregate peak.
 Batch~1, 10 denoise steps. Linear $61.5\times$ / $123\times$ compute scaling
-of the measured FPGA run at its achieved \%-of-peak; neither option is
+of the measured FPGA run at its achieved \%-of-peak; neither variation is
 bandwidth-bound (see below).}
 \label{tab:timing-silicon}
 \begin{tabular}{@{}lcccc@{}}
 \toprule
-& \multicolumn{2}{c}{\textbf{8 engines}} & \multicolumn{2}{c}{\textbf{16 engines}} \\
+& \multicolumn{2}{c}{\textbf{Chip Variation 1}} & \multicolumn{2}{c}{\textbf{Chip Variation 2}} \\
+& \multicolumn{2}{c}{\footnotesize (8 engines, $\sim$5\,W)} & \multicolumn{2}{c}{\footnotesize (16 engines, wattage TBD)} \\
 \cmidrule(lr){2-3}\cmidrule(l){4-5}
 \textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
 \midrule
@@ -388,12 +391,13 @@ expert, whose $\sim$0.16\,GB are re-streamed on \emph{every} denoise step
 against just $\sim$48\,GFLOP of padded work per step --- still lands at
 $\gtrsim$200\,FLOP/byte with activation and KV-cache traffic included. All
 three sections sit an order of magnitude above the ridge (worst-section
-demand $<$10\,GB/s of the $100$ available), and doubling to 16 engines only
+demand $<$10\,GB/s of the $100$ available), and doubling to 16 engines
+(Chip Variation~2) only
 lifts the ridge to $\approx$33\,FLOP/byte --- still $\geq$6$\times$ clear. So
-neither option is bandwidth-bound, and times extrapolate linearly at the
+neither variation is bandwidth-bound, and times extrapolate linearly at the
 FPGA's measured $88$--$93\%$ of peak, assuming ideal engine scaling:
-$3.15$\,s per inference ($0.32$\,inf/s) with 8 engines and $1.57$\,s
-($0.64$\,inf/s) with 16 --- $61.5\times$ / $123\times$ the FPGA, within
+$3.15$\,s per inference ($0.32$\,inf/s) for Chip Variation~1 and $1.57$\,s
+($0.64$\,inf/s) for Chip Variation~2 --- $61.5\times$ / $123\times$ the FPGA, within
 $24\times$ / $12\times$ of the RTX~5070's $7.68$\,inf/s. Either way the
 engine executes the whole vision--prefix--denoise pipeline autonomously:
 host work per action chunk is an embedding gather on the way in and a
@@ -403,19 +407,50 @@ the robot stack.
 \vspace{2pt}
 \noindent\textbf{Power.} The RTX~5070 is a $250$\,W-TGP board (6144 CUDA
 cores, boost $\sim$2.5\,GHz, $12$\,GB GDDR7 at $672$\,GB/s); at $130.2$\,ms
-per inference that is $\approx$33\,J per action chunk at TGP. The \ue{} FPGA
-instance draws $\sim$5\,W --- $\sim$970\,J per (much slower) inference.
-Holding the same $\sim$5\,W-class envelope in silicon, the projections land
-at $\approx$16\,J (8 engines) and $\approx$8\,J (16 engines) per action
-chunk: $2.1\times$ and $4.1\times$ less energy per inference than the GPU
-($0.064$ and $0.127$ vs.\ $0.031$\,inf/s/W).
+per inference that is $\approx$33\,J per action chunk at TGP. Chip
+Variation~1 is specified at $\sim$5\,W: $\approx$16\,J per action chunk ---
+$2.1\times$ less energy per inference than the GPU ($0.064$ vs.\
+$0.031$\,inf/s/W) at $1/50$th the board power. Chip Variation~2's wattage is
+still TBD; at $1.57$\,s per inference it undercuts the GPU's energy per
+chunk at any draw below $\approx$21\,W, and matches Variation~1's
+$\approx$16\,J at $10$\,W. Table~\ref{tab:platforms} collects the
+comparison.
+
+\begin{table}[H]
+\centering\small
+\caption{Platform comparison: measured RTX~5070 and \ue{}~v1 FPGA runs, and
+the two projected chip variations. Achieved GFLOP/s counts effective FLOPs
+on the GPU and hardware-issued FLOPs on the \ue{} platforms
+(Tables~\ref{tab:timing-gpu}--\ref{tab:timing-silicon}); GPU energy is at
+TGP.}
+\label{tab:platforms}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+& \textbf{RTX 5070} & \textbf{FPGA (Kintex-7)} & \textbf{Chip Var.~1} & \textbf{Chip Var.~2} \\
+\midrule
+Compute            & 6144 CUDA cores & 1 engine (64 MACs) & 8 engines & 16 engines \\
+Clock              & $\sim$2.5\,GHz & 208\,MHz & 1.6\,GHz & 1.6\,GHz \\
+Peak GFLOP/s       & --- & 26.6 & 1\,638 & 3\,277 \\
+DRAM bandwidth     & 672\,GB/s & $\sim$6\,GB/s & 100\,GB/s & 100\,GB/s \\
+Power              & 250\,W (TGP) & --- & $\sim$5\,W & TBD \\
+Achieved GFLOP/s   & 23\,502 & 24.5 & 1\,505 & 3\,010 \\
+Time / inference   & 0.130\,s & 193.6\,s & 3.15\,s & 1.57\,s \\
+Throughput         & 7.68\,inf/s & 0.0052\,inf/s & 0.32\,inf/s & 0.64\,inf/s \\
+Energy / chunk     & $\approx$33\,J & --- & $\approx$16\,J & TBD \\
+Efficiency         & 0.031\,inf/s/W & --- & 0.064\,inf/s/W & TBD \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \vspace{2pt}
 \noindent\textbf{Config.} FPGA: \ue{} v1 IP on Xilinx Kintex-7 at $208$\,MHz
-($26.6$\,GFLOP/s theoretical peak, $\sim$5\,W), \iffour{}
+($26.6$\,GFLOP/s theoretical peak), \iffour{}
 weights / \bfteen{} compute, $4$\,GB DRAM at $\sim$6\,GB/s. GPU: RTX~5070
 (6144 CUDA cores, $250$\,W TGP), \bfteen{}, $12$\,GB GDDR7 at $672$\,GB/s,
-openpi JAX/XLA. Both: batch~1, 10 denoise steps, sample~0.
+openpi JAX/XLA. Silicon: Chip Variation~1 --- 8 engines at $1.6$\,GHz,
+$\sim$5\,W; Chip Variation~2 --- 16 engines at $1.6$\,GHz, wattage TBD; both
+$100$\,GB/s DRAM. All: batch~1, 10 denoise steps, sample~0.
 
 \vspace{4pt}
 The entire \pizero{} VLA --- vision, Gemma-2B prefix, and the 10-step
@@ -424,7 +459,7 @@ between where FLOPs concentrate (the compute-bound prefix) and where latency
 does (the sequential, FLOP-light denoise loop), and how \iffour{} trades a
 controlled, section-localized accuracy cost --- one with no measured
 closed-loop task regression (Sec.~\ref{sec:libero}) --- for fitting a
-$\sim$13\,GB model in a sub-4\,GB budget. Tables~\ref{tab:budget}--\ref{tab:timing-silicon} complete
+$\sim$13\,GB model in a sub-4\,GB budget. Tables~\ref{tab:budget}--\ref{tab:platforms} complete
 the characterization.
 
 \end{document}
