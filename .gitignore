@@ -15,3 +15,8 @@ __pycache__/
 # LIBERO eval output: libero_eval.py writes rollout videos, per-episode results
 # JSON and action dumps here -- regenerate by re-running the eval.
 models/pi05_libero/data/
+
+# LaTeX build byproducts (models/pi05_libero/document/main.tex); the compiled
+# main.pdf IS committed, aux/out/log are per-build state.
+*.aux
+*.out
