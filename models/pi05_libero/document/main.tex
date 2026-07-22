@@ -405,24 +405,16 @@ $10{\times}7$ readback on the way out, so the platform's CPU stays free for
 the robot stack.
 
 \vspace{2pt}
-\noindent\textbf{Power.} The RTX~5070 is a $250$\,W-TGP board (6144 CUDA
-cores, boost $\sim$2.5\,GHz, $12$\,GB GDDR7 at $672$\,GB/s); at $130.2$\,ms
-per inference that is $\approx$33\,J per action chunk at TGP. Chip
-Variation~1 is specified at $\sim$5\,W: $\approx$16\,J per action chunk ---
-$2.1\times$ less energy per inference than the GPU ($0.064$ vs.\
-$0.031$\,inf/s/W) at $1/50$th the board power. Chip Variation~2's wattage is
-still TBD; at $1.57$\,s per inference it undercuts the GPU's energy per
-chunk at any draw below $\approx$21\,W, and matches Variation~1's
-$\approx$16\,J at $10$\,W. Table~\ref{tab:platforms} collects the
-comparison.
+\noindent\textbf{Power.} The RTX~5070 is a $250$\,W-TGP board; Chip
+Variation~1 is specified at $\sim$5\,W, and Chip Variation~2's wattage is
+TBD. Table~\ref{tab:platforms} collects the platform comparison.
 
 \begin{table}[H]
 \centering\small
 \caption{Platform comparison: measured RTX~5070 and \ue{}~v1 FPGA runs, and
 the two projected chip variations. Achieved GFLOP/s counts effective FLOPs
 on the GPU and hardware-issued FLOPs on the \ue{} platforms
-(Tables~\ref{tab:timing-gpu}--\ref{tab:timing-silicon}); GPU energy is at
-TGP.}
+(Tables~\ref{tab:timing-gpu}--\ref{tab:timing-silicon}).}
 \label{tab:platforms}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}lcccc@{}}
@@ -437,8 +429,6 @@ Power              & 250\,W (TGP) & --- & $\sim$5\,W & TBD \\
 Achieved GFLOP/s   & 23\,502 & 24.5 & 1\,505 & 3\,010 \\
 Time / inference   & 0.130\,s & 193.6\,s & 3.15\,s & 1.57\,s \\
 Throughput         & 7.68\,inf/s & 0.0052\,inf/s & 0.32\,inf/s & 0.64\,inf/s \\
-Energy / chunk     & $\approx$33\,J & --- & $\approx$16\,J & TBD \\
-Efficiency         & 0.031\,inf/s/W & --- & 0.064\,inf/s/W & TBD \\
 \bottomrule
 \end{tabular}
 \end{table}
