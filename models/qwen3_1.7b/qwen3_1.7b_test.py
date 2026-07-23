@@ -1379,26 +1379,19 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         # builds (which lack the bias / had writeback on) is detected and recompiled.
         lm_head_sig = "penalty_bias_argmax"
 
-        cache_sig = {
-            "lm_head_sig": lm_head_sig,
-            "device": user_dma_core.CURRENT_DEVICE,
-            "params_dram_base": f"0x{self._params_dram_base:X}",
-            "tensor_dram_base": f"0x{self._tensor_dram_base:X}",
-            "program_dram_base": f"0x{self._program_dram_base:X}",
-            "max_context_size": self.MAX_CONTEXT_SIZE,
-            "prefill_max_seq_len": self.PREFILL_MAX_SEQ_LEN,
-        }
-
         # Cache short-circuit: reuse the on-disk bin only if it exists AND was compiled
-        # with the same device/layout-dependent signature.
+        # with the same LM-head signature. Identity-matrix DMAs happen in weight_init at
+        # fixed addresses every invocation, so loading the bin off disk is otherwise
+        # sufficient. A bin from an older build (missing/different key) is recompiled.
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
         if bin_cached:
             with open(meta_path, "r") as f:
                 meta = json.load(f)
-            if all(meta.get(k) == v for k, v in cache_sig.items()):
+            if meta.get("lm_head_sig") == lm_head_sig:
                 print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
                 return meta
-            print("compile_instructions: cached bin signature/layout differs; recompiling.")
+            print(f"compile_instructions: cached bin LM-head sig "
+                  f"({meta.get('lm_head_sig')}) != this run ({lm_head_sig}); recompiling.")
 
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         # Template seq_len: drives static M= args (overridden at runtime by gpr_M_reg),
@@ -1456,7 +1449,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             "decoder_program_start_addr":   f"0x{decoder_program_start_addr:X}",
             "decoder_program_size":         decoder_program_size,
             "decoder_total_flops":          decoder_flops,
-            **cache_sig,
+            "lm_head_sig":                  lm_head_sig,
         }
         with open(bin_path, "wb") as f:
             f.write(all_bytes)

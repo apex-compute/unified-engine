@@ -1430,10 +1430,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         if os.path.exists(bin_path) and os.path.exists(meta_path):
             with open(meta_path) as f:
                 meta = json.load(f)
-            if _program_meta_matches(meta, _program_layout_signature(self, self.max_context)):
-                return bin_path, meta["program_sizes"], meta["total_flops"]
-            print("  compile_decoder: cached decoder layout/profile differs; recompiling.",
-                  flush=True)
+            return bin_path, meta["program_sizes"], meta["total_flops"]
 
         print("  compile_decoder: emitting single-binary decoder (Option B) ...",
               flush=True)
@@ -1516,7 +1513,6 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             "instruction_counts": [n_insts],
             "program_sizes":      [len(bin_bytes)],
             "total_flops":        [int(flops)],
-            **_program_layout_signature(self, self.max_context),
         }
         with open(bin_path, "wb") as f:
             f.write(bin_bytes)
@@ -3994,22 +3990,6 @@ UNIFIED_BIN_NAME  = "programs.bin"
 UNIFIED_META_NAME = "programs.json"
 
 
-def _program_layout_signature(ue, max_context: int | None = None) -> dict:
-    return {
-        "device": user_dma_core.CURRENT_DEVICE,
-        "params_dram_base": f"0x{ue._params_dram_base:X}",
-        "tensor_dram_base": f"0x{ue._q35_tensor_region_base:X}",
-        "program_dram_base": f"0x{ue._program_dram_base:X}",
-        "max_context": int(max_context if max_context is not None else getattr(ue, "max_context", 0)),
-    }
-
-
-def _program_meta_matches(meta: dict | None, expected: dict) -> bool:
-    if not meta:
-        return False
-    return all(meta.get(k) == v for k, v in expected.items())
-
-
 def write_unified_bin(ue, bin_dir: str, encoder_bytes: bytes, vis_meta: dict,
                       decoder_bin_path: str, flops) -> dict:
     """Assemble the UNIFIED programs bin + manifest = ``[encoder][decoder]``,
@@ -4048,7 +4028,6 @@ def write_unified_bin(ue, bin_dir: str, encoder_bytes: bytes, vis_meta: dict,
         "decoder_x_dram": ue._decoder_X_dram,
         "decoder_final_norm_dram": ue._decoder_final_norm_dram,
         "max_context": ue.max_context,
-        **_program_layout_signature(ue, ue.max_context),
         "n_patches": vis_meta.get("n_patches"),
         "mg_out":    vis_meta.get("mg_out"),
         "n_merged":  vis_meta.get("n_merged"),
@@ -4887,10 +4866,6 @@ def main():
             _raw = f.read()
         with open(uni_meta_path) as f:
             _meta = json.load(f)
-        expected_sig = _program_layout_signature(ue, MAX_CONTEXT)
-        if not _program_meta_matches(_meta, expected_sig):
-            print("  Cached unified bin layout/profile differs; rebuilding.")
-            _raw = _meta = None
     want_vision = bool(use_fpga_vision)
     # Build when there is no bin yet, or when an on-FPGA VLM run finds a cached
     # bin that has no encoder section (e.g. an earlier LM-only build).

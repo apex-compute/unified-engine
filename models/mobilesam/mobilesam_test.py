@@ -60,37 +60,6 @@ def _set_dram_layout_for_device(device: str) -> None:
         MSAM_PROGRAM_BASE = 0xD8000000
 
 
-def _profile_meta() -> dict:
-    return {
-        "format_version": 2,
-        "device": user_dma_core.CURRENT_DEVICE,
-        "axi_width_bits": user_dma_core.UE_AXI_DATA_WIDTH_BITS,
-        "params_dram_base": hex(MSAM_PARAMS_BASE),
-        "tensor_dram_base": hex(MSAM_TENSOR_BASE),
-        "program_dram_base": hex(MSAM_PROGRAM_BASE),
-        "dram_end_addr": hex(user_dma_core.DRAM_END_ADDR),
-    }
-
-
-def _profile_matches(meta: dict) -> bool:
-    profile = meta.get("profile") if isinstance(meta, dict) else None
-    if not isinstance(profile, dict):
-        return False
-    expected = _profile_meta()
-    return all(profile.get(k) == v for k, v in expected.items())
-
-
-def _bins_match_current_profile(bin_dir: str) -> bool:
-    try:
-        with open(os.path.join(bin_dir, "params.json")) as f:
-            params_meta = json.load(f)
-        with open(os.path.join(bin_dir, "programs.json")) as f:
-            programs_meta = json.load(f)
-    except Exception:
-        return False
-    return _profile_matches(params_meta) and _profile_matches(programs_meta)
-
-
 def nms(boxes: torch.Tensor, scores: torch.Tensor, threshold: float):
     """Non-maximum suppression. Returns list of kept indices."""
     if boxes.numel() == 0:

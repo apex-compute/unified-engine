@@ -51,25 +51,6 @@ def _set_dram_layout_for_device(device: str) -> None:
         MSAM_PROGRAM_BASE = 0xD8000000
 
 
-def _profile_meta() -> dict:
-    return {
-        "format_version": 2,
-        "device": user_dma_core.CURRENT_DEVICE,
-        "axi_width_bits": user_dma_core.UE_AXI_DATA_WIDTH_BITS,
-        "params_dram_base": hex(MSAM_PARAMS_BASE),
-        "tensor_dram_base": hex(MSAM_TENSOR_BASE),
-        "program_dram_base": hex(MSAM_PROGRAM_BASE),
-        "dram_end_addr": hex(user_dma_core.DRAM_END_ADDR),
-    }
-
-
-def _profile_matches(meta: dict) -> bool:
-    profile = meta.get("profile") if isinstance(meta, dict) else None
-    if not isinstance(profile, dict):
-        return False
-    expected = _profile_meta()
-    return all(profile.get(k) == v for k, v in expected.items())
-
 # ---------------------------------------------------------------------------
 # Architecture constants (match mobilesam_test.py)
 # ---------------------------------------------------------------------------
@@ -301,11 +282,6 @@ def main():
     _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
     _original_print(f"DRAM layout: params=0x{MSAM_PARAMS_BASE:08X}, tensor=0x{MSAM_TENSOR_BASE:08X}, "
                     f"program=0x{MSAM_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
-
-    if not _profile_matches(param_meta) or not _profile_matches(prog_meta):
-        _original_print("Bin profile does not match this FPGA profile; regenerate with:")
-        _original_print(f"  python mobilesam_test.py --device {args.device}")
-        return
 
     # Load image
     img_path = os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")

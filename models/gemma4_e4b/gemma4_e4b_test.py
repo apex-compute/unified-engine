@@ -1050,7 +1050,13 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
     hf_repo = cfg["paths"]["hf_model_repo"]
     config_path = os.path.join(model_dir, "config.json")
-    if not os.path.exists(config_path):
+    has_weights = os.path.isdir(model_dir) and any(
+        name.endswith(".safetensors")
+        or name == "pytorch_model.bin"
+        or (name.startswith("pytorch_model-") and name.endswith(".bin"))
+        for name in os.listdir(model_dir)
+    )
+    if not os.path.exists(config_path) or not has_weights:
         _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
         snapshot_download(repo_id=hf_repo, local_dir=model_dir)
         _original_print("Download complete.")

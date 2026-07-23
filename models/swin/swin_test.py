@@ -628,20 +628,6 @@ def print_swin_profile(device: str, profile: dict) -> None:
                     f"program=0x{SWIN_PROGRAM_BASE:08X}, end=0x{profile['dram_end_addr']:08X}")
 
 
-def _layout_meta() -> dict:
-    return {
-        "device": user_dma_core.CURRENT_DEVICE,
-        "params_dram_base": SWIN_PARAMS_BASE,
-        "tensor_dram_base": SWIN_TENSOR_BASE,
-        "program_dram_base": SWIN_PROGRAM_BASE,
-    }
-
-
-def _layout_meta_matches(meta: dict) -> bool:
-    expected = _layout_meta()
-    return all(meta.get(k) == v for k, v in expected.items())
-
-
 class Swin_UnifiedEngine(UnifiedEngine):
     ARTIFACT_VERSION = 2  # dynamic LayerNorm row-count + persistent zeros/1-N operands
     """Swin-Large on Unified Engine FPGA accelerator."""
@@ -1218,11 +1204,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
             return None
         with open(bin_path, "rb") as f:
             data = f.read()
-        with open(meta_path) as f:
-            meta = json.load(f)
-        if not _layout_meta_matches(meta):
-            _original_print("  Program layout/profile mismatch — recompiling.")
-            return None
         addr = self.get_program_dram_addr()
         if addr + len(data) - 1 > user_dma_core.DRAM_END_ADDR:
             raise RuntimeError(

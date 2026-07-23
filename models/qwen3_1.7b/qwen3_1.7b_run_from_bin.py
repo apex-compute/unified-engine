@@ -1062,18 +1062,6 @@ def main():
             f"Instruction bin lm_head_sig={inst_meta.get('lm_head_sig')!r} != 'penalty_bias_argmax'. "
             "Recompile the bin via qwen3_1.7b_test.py (it now folds the repetition penalty into "
             "the LM-head matmul bias).")
-    expected_meta = {
-        "device": user_dma_core.CURRENT_DEVICE,
-        "params_dram_base": f"0x{ue._params_dram_base:X}",
-        "tensor_dram_base": f"0x{ue._tensor_dram_base:X}",
-        "program_dram_base": f"0x{ue._program_dram_base:X}",
-        "max_context_size": ue.MAX_CONTEXT_SIZE,
-        "prefill_max_seq_len": ue.PREFILL_MAX_SEQ_LEN,
-    }
-    mismatches = {k: (inst_meta.get(k), v) for k, v in expected_meta.items() if inst_meta.get(k) != v}
-    if mismatches:
-        details = ", ".join(f"{k}: bin={old!r}, expected={new!r}" for k, (old, new) in mismatches.items())
-        raise SystemExit(f"Instruction bin layout/profile mismatch ({details}). Recompile with qwen3_1.7b_test.py.")
 
     _original_print(f"\n--- Loading unified instruction bin ---")
     timer = time.perf_counter()

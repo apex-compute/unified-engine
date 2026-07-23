@@ -46,8 +46,6 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.normpath(os.path.join(_HERE, "..", "..")))  # template root (kernel)
 sys.path.insert(0, _HERE)
 
-import user_dma_core  # noqa: E402
-
 # The test module's filename has dots, so import it via importlib.
 _spec = importlib.util.spec_from_file_location(
     "qwen3_5_2b_test", os.path.join(_HERE, "qwen3.5_2b_test.py"))
@@ -115,18 +113,6 @@ def main():
         raise SystemExit(f"Unified bin metadata not found: {uni_meta}")
     with open(uni_meta) as f:
         meta = json.load(f)
-    expected_meta = {
-        "device": user_dma_core.CURRENT_DEVICE,
-        "params_dram_base": f"0x{T.Q35_PARAMS_BASE:X}",
-        "tensor_dram_base": f"0x{T.Q35_TENSOR_BASE:X}",
-        "program_dram_base": f"0x{T.Q35_PROGRAM_BASE:X}",
-        "max_context": MAX_CONTEXT,
-    }
-    if not T._program_meta_matches(meta, expected_meta):
-        details = ", ".join(
-            f"{k}: bin={meta.get(k)!r}, expected={v!r}" for k, v in expected_meta.items()
-        )
-        raise SystemExit(f"Unified bin layout/profile mismatch ({details}). Rebuild with qwen3.5_2b_test.py.")
     with open(uni_bin, "rb") as f:
         raw = f.read()
     print("=" * 78)

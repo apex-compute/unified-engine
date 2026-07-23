@@ -36,6 +36,7 @@ import json
 import math
 import os
 import sys
+import gc
 
 # This file's folder: gemma4_e2b_bin/, *.json, decoder_program.json live here. user_dma_core is two levels up (repo root).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -500,28 +501,31 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
     write_at(weight_defs["LM_HEAD_WEIGHT_DATA"], data_padded)
 
-    # Build vision + host side-cache bytes in memory (no separate files).
+    # Build vision/audio side-cache bytes in memory (small), then stream the
+    # multi-GiB host side-cache directly into the output file.
     # We concatenate everything below into ONE weights bin:
-    #   [LM | vision | host]
+    #   [LM | vision | audio | host]
     # plus a single master manifest JSON that holds section offsets and the
     # sub-manifests (per-tensor offsets relative to each section's start).
     # Two binary files total — programs.bin and params.bin —
     # matching the "one instruction bin, one weight bin" design.
     vision_bytes, vision_manifest = _build_vision_section_bytes(model)
     audio_bytes,  audio_manifest  = _build_audio_section_bytes(model)
-    host_bytes,   host_manifest   = _build_host_section_bytes(text_model, cfg)
 
     lm_size     = len(buf)
     vision_size = len(vision_bytes)
     audio_size  = len(audio_bytes)
-    host_size   = len(host_bytes)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(buf)
+        del buf
+        gc.collect()
         f.write(vision_bytes)
+        del vision_bytes
         f.write(audio_bytes)
-        f.write(host_bytes)
+        del audio_bytes
+        host_size, host_manifest = _write_host_section_stream(f, text_model, cfg)
     total = lm_size + vision_size + audio_size + host_size
     print(f"Generated weights bin: {out_path} ({total/1024**3:.2f} GiB total; "
           f"LM {lm_size/1024**3:.2f} GiB + vision {vision_size/1024**2:.1f} MiB + "
@@ -944,12 +948,81 @@ def _build_host_section_bytes(text_model, cfg) -> tuple[bytes, dict]:
     return out, manifest
 
 
+def _write_host_section_stream(f, text_model, cfg) -> tuple[int, dict]:
+    """Stream host-side tensors directly to params.bin.
+
+    The embed_tokens_per_layer section is several GiB. Returning it as a bytes
+    object doubles peak RSS during first-run weight generation and can trigger
+    the OOM killer. Keep the manifest layout identical to
+    _build_host_section_bytes, but only hold one chunk at a time.
+    """
+    file_info = cfg["file_info"]
+    num_layers = file_info["num_layers"]
+    per_layer_input_dim = file_info["per_layer_input_dim"]
+
+    src = text_model.embed_tokens_per_layer.weight.detach().cpu().to(torch.bfloat16)
+    per_layer_embed_scale = per_layer_input_dim ** 0.5
+    embed_off = 0
+    chunk = 8192
+    for i in range(0, src.shape[0], chunk):
+        chunk_bf16 = (src[i:i+chunk].float() * per_layer_embed_scale).to(torch.bfloat16).contiguous()
+        f.write(chunk_bf16.view(torch.uint8).numpy().tobytes())
+        del chunk_bf16
+    embed_size = src.numel() * 2
+    embed_shape = list(src.shape)
+    del src
+    gc.collect()
+
+    proj_off = embed_off + embed_size
+    proj_bf16 = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16).contiguous()
+    f.write(proj_bf16.view(torch.uint8).numpy().tobytes())
+    proj_size = proj_bf16.numel() * 2
+    proj_shape = list(proj_bf16.shape)
+
+    norm_off = proj_off + proj_size
+    norm_bf16 = text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).contiguous()
+    f.write(norm_bf16.view(torch.uint8).numpy().tobytes())
+    norm_size = norm_bf16.numel() * 2
+    norm_shape = list(norm_bf16.shape)
+
+    layer_scalars = []
+    kv_shared_map: dict[int, int] = {}
+    last_layer_by_type: dict[str, int] = {}
+    for layer_idx in range(num_layers):
+        layer = text_model.layers[layer_idx]
+        layer_scalars.append(float(layer.layer_scalar.item()))
+        attn = layer.self_attn
+        if attn.is_kv_shared_layer:
+            kv_shared_map[layer_idx] = last_layer_by_type[attn.layer_type]
+        else:
+            last_layer_by_type[attn.layer_type] = layer_idx
+
+    total = norm_off + norm_size
+    manifest = {
+        "embed_tokens_per_layer": {"offset": embed_off, "size": embed_size, "shape": embed_shape},
+        "per_layer_model_proj":   {"offset": proj_off,  "size": proj_size,  "shape": proj_shape},
+        "per_layer_proj_norm":    {"offset": norm_off,  "size": norm_size,  "shape": norm_shape},
+        "layer_scalars": layer_scalars,
+        "kv_shared_map": {str(k): v for k, v in kv_shared_map.items()},
+    }
+    del proj_bf16, norm_bf16
+    gc.collect()
+    print(f"  Host section: {total/1024**3:.2f} GiB, 3 tensors + scalars + kv_shared_map")
+    return total, manifest
+
+
 def _ensure_hf_model(script_dir: str, cfg: dict):
     """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
     hf_repo = cfg["paths"]["hf_model_repo"]
     config_path = os.path.join(model_dir, "config.json")
-    if not os.path.exists(config_path):
+    has_weights = os.path.isdir(model_dir) and any(
+        name.endswith(".safetensors")
+        or name == "pytorch_model.bin"
+        or (name.startswith("pytorch_model-") and name.endswith(".bin"))
+        for name in os.listdir(model_dir)
+    )
+    if not os.path.exists(config_path) or not has_weights:
         _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
         snapshot_download(repo_id=hf_repo, local_dir=model_dir)
         _original_print("Download complete.")
