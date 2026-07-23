@@ -46,7 +46,7 @@ from user_dma_core import (
     URAM_WRITE_SRC,
     WB_PADDING_ZERO,
     calculate_snr,
-    set_dma_device,
+    configure_device,
     UnifiedEngine,
     UE_FMAX_CONTEXT_SIZE,
     UE_VECTOR_SIZE,
@@ -5491,6 +5491,14 @@ def gemma3_inference_test() -> None:
         "matmatmul": int(40_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
         "legacy": int(20_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
     }
+    if user_dma_core.CURRENT_DEVICE == "efinix":
+        # Efinix currently runs the same correctness workload at ~23.5M
+        # cycles/tok. Keep a device-specific performance gate instead of
+        # failing a valid run against the bittware-oriented floor above.
+        _MAX_CYCLES_PER_TOKEN.update({
+            "streaming": 25_000_000,
+            "legacy": 25_000_000,
+        })
     _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
 
     def _instruction_bin_path(ue) -> str:
@@ -5658,9 +5666,8 @@ if __name__ == "__main__":
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--device', type=str, default='kintex7',
                         help='FPGA type')
-    parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=0x02000000,
-                        help='AXI-Lite register base address (default: 0x02000000). '
-                             'Try 0x0 if register read hangs after bitstream update.')
+    parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
+                        help='AXI-Lite register base address. Default is device-specific.')
     parser.add_argument(
         '--ext',
         action='store_true',
@@ -5668,16 +5675,21 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Set DMA device paths based on device name and force-sync every module
-    # that may hold a copied device-path global.
-    set_dma_device(args.dev)
     import user_dma_core
-    user_dma_core.UE_0_BASE_ADDR = args.base_addr
-    print(f"DMA dev={args.dev}"
+    profile = configure_device(args.device, dma_device=args.dev, base_addr=args.base_addr)
+    globals()["DMA_DEVICE_H2C"] = user_dma_core.DMA_DEVICE_H2C
+    globals()["DMA_DEVICE_C2H"] = user_dma_core.DMA_DEVICE_C2H
+    globals()["DMA_DEVICE_USER"] = user_dma_core.DMA_DEVICE_USER
+    globals()["DRAM_ACTIVATION_ADDR"] = user_dma_core.DRAM_ACTIVATION_ADDR
+    globals()["DRAM_INSTRUCTION_ADDR"] = user_dma_core.DRAM_INSTRUCTION_ADDR
+    print(f"DMA dev={args.dev}, device={profile['device']}"
           f" (H2C={user_dma_core.DMA_DEVICE_H2C},"
           f" C2H={user_dma_core.DMA_DEVICE_C2H},"
           f" USER={user_dma_core.DMA_DEVICE_USER}),"
-          f" base=0x{args.base_addr:08x}")
+          f" base=0x{user_dma_core.UE_0_BASE_ADDR:08x},"
+          f" dram=[0x{user_dma_core.DRAM_START_ADDR:08x},"
+          f" act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x},"
+          f" inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}]")
 
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
@@ -5713,6 +5725,8 @@ if __name__ == "__main__":
         clock = 3.3333
     elif args.device == "alveo":
         clock = 1000 / 225
+    elif args.device == "efinix":
+        clock = 4.0
     else:
         clock = 10
 

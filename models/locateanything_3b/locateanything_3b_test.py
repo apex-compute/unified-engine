@@ -31,7 +31,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 sys.path.insert(0, PROJECT_ROOT)
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, set_dma_device
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, configure_device
 from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_dram_post_add
 from nn_lib import store_weight, store_quantized_weight, smart_bf16_permute_core, layer_norm_core_dram_post_add
 from quant_lib import quantize_q4_64
@@ -56,6 +56,16 @@ def _parse_offset(val) -> int:
     if isinstance(val, str):
         return int(val, 0)
     return int(val)
+
+
+def _load_tokenizer(model_dir: str):
+    """Load LocateAnything/Qwen tokenizer with the corrected Mistral regex when supported."""
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(
+            model_dir, trust_remote_code=True, fix_mistral_regex=True)
+    except TypeError:
+        return AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
 
 def load_weight_cache(bin_path):
@@ -736,7 +746,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         #   program: 0xDC000000   .. <0x100000000 (576MB: encoder 377MB + prefill/decode)
         # Invariant: params_end < tensor_dram_base < program_dram_base < 0x100000000.
         super().__init__(
-            params_dram_base=0x00000000,
+            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
+            params_dram_base=user_dma_core.DRAM_START_ADDR,
             tensor_dram_base=0xB0000000,
             program_dram_base=0xDC000000,
         )
@@ -1315,7 +1326,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
     def weight_init(self) -> None:
         """Load LM + vision weights from bin files to DRAM."""
-        from transformers import AutoTokenizer
         model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
         hf_repo = self._cfg["paths"]["hf_model_repo"]
         config_path = os.path.join(model_dir, "config.json")
@@ -1340,7 +1350,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         embed_bf16 = torch.from_numpy(embed_raw.copy()).view(torch.bfloat16).reshape(self.EMBEDDING_ELEMENTS, self.vector_length)
         self.embedding_weight = embed_bf16.clone()  # host copy for token lookup
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        self.tokenizer = _load_tokenizer(model_dir)
 
         # Per-layer weights — config-driven precision (precision.lm) for
         # Q/K/gate/up/down, BF16 for V/O (all from binary). Default 'if4'
@@ -2093,7 +2103,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             if image_grid_thw is not None:
                 pixel_values_hf = pixel_values.to(torch.bfloat16)
             else:
-                from transformers import AutoTokenizer, Qwen2VLImageProcessor
+                from transformers import Qwen2VLImageProcessor
                 from PIL import Image
                 img_np = pixel_values.float().permute(1, 2, 0).numpy()
                 img_cfg = self._cfg.get("image_processing", {})
@@ -2109,7 +2119,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     {"type": "image", "image": pil_img},
                     {"type": "text", "text": "Describe this image."},
                 ]}]
-                tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+                tokenizer = _load_tokenizer(model_dir)
                 text_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 image_processor = Qwen2VLImageProcessor.from_pretrained(model_dir, trust_remote_code=True)
                 img_inputs = image_processor(images=[pil_img], return_tensors="pt")
@@ -3433,8 +3443,7 @@ def _gpu_vision(query, prompt_kind, image_path, device="cpu", compute_vit=True,
             conn_ref = model.mlp1(vit).to(torch.bfloat16).cpu()                        # [N,2048]
             vit = vit.to(torch.bfloat16).cpu()
 
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(la.MODEL_DIR, trust_remote_code=True)
+    tok = _load_tokenizer(la.MODEL_DIR)
     text = la.build_prompt_text(la.PROMPTS[prompt_kind].format(q=query), n_img)
     ids = tok([text], return_tensors="pt").input_ids[0].tolist()
     # remap our <IMG_CONTEXT> onto the placeholder run_prefill replaces with vision
@@ -3456,13 +3465,12 @@ def _cpu_bf16_compare(args, hw_answer, prep):
     vision tower is NOT recomputed. Greedy decode on both sides => deterministic,
     so the honest metric is token-sequence agreement + per-box coordinate delta."""
     import locateanything_3b_cpu_test as la
-    from transformers import AutoTokenizer
     import torch, re
     device = "cpu"
     cfg = prep["cfg"]
     model = la.LocateAnything(cfg).eval()
     la.load_weights(model, la.MODEL_DIR, device, torch.bfloat16)
-    tok = AutoTokenizer.from_pretrained(la.MODEL_DIR, trust_remote_code=True)
+    tok = _load_tokenizer(la.MODEL_DIR)
     text = la.build_prompt_text(la.PROMPTS[args.prompt_kind].format(q=args.query), prep["n_img"])
     input_ids = tok([text], return_tensors="pt").input_ids
     conn = prep["conn_ref"]
@@ -3549,7 +3557,6 @@ def _quant_compare(args, prep):
     return a metrics dict. Teacher-forced logits (aligned to the bf16 sequence) give
     clean logit MSE/cos/argmax; free greedy runs give exact-match + box deltas."""
     import locateanything_3b_cpu_test as la
-    from transformers import AutoTokenizer
     import torch, re
     import torch.nn.functional as F
 
@@ -3567,7 +3574,7 @@ def _quant_compare(args, prep):
     device = torch.device("cpu")
     dtype = torch.bfloat16
 
-    tok = AutoTokenizer.from_pretrained(la.MODEL_DIR, trust_remote_code=True)
+    tok = _load_tokenizer(la.MODEL_DIR)
     text = la.build_prompt_text(la.PROMPTS[args.prompt_kind].format(q=args.query), prep["n_img"])
     input_ids = tok([text], return_tensors="pt").input_ids.to(device)
     n_prompt = input_ids.shape[1]
@@ -3697,9 +3704,8 @@ def _run_decode_only():
     ue._rope_offset = 0
 
     # Use tokenizer from HF dir
-    from transformers import AutoTokenizer
     tok_dir = os.path.join(LA_DIR, "locateanything_3b_bin", "LocateAnything-3B")
-    tokenizer = AutoTokenizer.from_pretrained(tok_dir, trust_remote_code=True)
+    tokenizer = _load_tokenizer(tok_dir)
     ue.tokenizer = tokenizer
 
     prompt = "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
@@ -3738,11 +3744,15 @@ def _run_decode_only():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", type=str, default="xdma0",
-                    help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
-    ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "vette.jpg"))
+                    help="DMA device name for non-Efinix profiles (e.g., xdma0, xdma1). Efinix uses /dev/pcie_dma0_* from its profile.")
+    ap.add_argument("--device", type=str, default="kintex7",
+                    help="FPGA board / bitstream profile. Use efinix for the Efinix 4GB DMA profile.")
+    ap.add_argument("--cycle", type=float, default=None,
+                    help="Clock cycle time in ns. Default: from --device, or existing runtime default.")
+    ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "people.jpg"))
     ap.add_argument("--prompt-kind", default="detect",
                     choices=["detect", "ground_multi", "ground_one", "point"])
-    ap.add_argument("--query", default="sports car")
+    ap.add_argument("--query", default="face")
     ap.add_argument("--square", type=int, default=224, choices=[0, 224, 384],
                     help="letterbox every image to square×square (aspect-preserving, gray pad) "
                          "before patchifying -> ONE compiled encoder program for any image. "
@@ -3779,9 +3789,31 @@ def main():
                     help="run the CPU reference decoder bf16 vs if4 vs tq4 on the same vision "
                          "output and print a quant-fidelity comparison at the very bottom")
     args = ap.parse_args()
-    set_dma_device(args.dev)
+
+    profile = configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    axi_width_bits = profile.get("axi_data_width_bits")
+    if axi_width_bits is not None:
+        os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+        user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else profile.get("clock_period_ns")
+    if clock is not None:
+        user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+        user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
+    print(f"FPGA profile: device={profile['device']}, clock={user_dma_core.CLOCK_CYCLE_TIME_NS:.4f} ns, UE_AXI_DATA_WIDTH_BITS={user_dma_core.UE_AXI_DATA_WIDTH_BITS}")
+    print(f"Using DMA device: {effective_dma}")
+    print(f"  H2C: {user_dma_core.DMA_DEVICE_H2C}")
+    print(f"  C2H: {user_dma_core.DMA_DEVICE_C2H}")
+    print(f"  USER: {user_dma_core.DMA_DEVICE_USER}")
+    print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
+    print(
+        f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, "
+        f"act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, "
+        f"inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}, "
+        f"end=0x{user_dma_core.DRAM_END_ADDR:08x}"
+    )
 
     # ==================================================================
     # DEBUG CONFIG (no flags needed). Flip these in code.

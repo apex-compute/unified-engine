@@ -146,23 +146,11 @@ def ue_assert_axi_beat_aligned_bytes(nbytes: int, what: str, hint: str = "") -> 
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
+CURRENT_DEVICE = "default"
 
-def set_dma_device(device_name: str):
-    """Set DMA device paths based on device name (e.g., 'xdma0' -> '/dev/xdma0_*').
-
-    Also rebinds the names in any module that imported them by value
-    (``from user_dma_core import DMA_DEVICE_H2C``), so callers that took the
-    pre-set_dma_device snapshot still see the right device. Without this,
-    models split across xdma0/xdma1 — methods on UnifiedEngine read the live
-    module global (correct), while bare references in the model file read the
-    stale import snapshot (wrong).
-    """
+def _sync_imported_dma_device_paths(old_h2c: str, old_c2h: str, old_user: str):
+    """Rebind modules that imported DMA path constants by value."""
     import sys as _sys
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
-    DMA_DEVICE_C2H = f"/dev/{device_name}_c2h_0"
-    DMA_DEVICE_USER = f"/dev/{device_name}_user"
     for _mod in list(_sys.modules.values()):
         if _mod is None or _mod is _sys.modules[__name__]:
             continue
@@ -180,6 +168,23 @@ def set_dma_device(device_name: str):
                 except Exception:
                     pass
 
+def set_dma_device(device_name: str):
+    """Set DMA device paths based on device name (e.g., 'xdma0' -> '/dev/xdma0_*').
+
+    Also rebinds the names in any module that imported them by value
+    (``from user_dma_core import DMA_DEVICE_H2C``), so callers that took the
+    pre-set_dma_device snapshot still see the right device. Without this,
+    models split across xdma0/xdma1 — methods on UnifiedEngine read the live
+    module global (correct), while bare references in the model file read the
+    stale import snapshot (wrong).
+    """
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
+    DMA_DEVICE_C2H = f"/dev/{device_name}_c2h_0"
+    DMA_DEVICE_USER = f"/dev/{device_name}_user"
+    _sync_imported_dma_device_paths(old_h2c, old_c2h, old_user)
+
 # Constants
 UE_VECTOR_SIZE = 64
 # Captured decoder instruction line size (matches Vitis ``decoder_inst_t`` / ``INSTRUCTION_SIZE_BYTES``).
@@ -192,6 +197,53 @@ BIAS_BRAM_SIZE_BYTES = BIAS_BRAM_ELEMENTS * 2
 DRAM_START_ADDR = 0x80000000 # 0 GB
 DRAM_ACTIVATION_ADDR = 0xB0000000 # 512 MB reserved for intermediate results
 DRAM_INSTRUCTION_ADDR = 0xD0000000  # 256*3 MB reserved for instructions
+DRAM_END_ADDR = 0xFFFFFFFF
+
+def configure_device(device_name: str, dma_device: Optional[str] = None, base_addr: Optional[int] = None) -> dict:
+    """Apply board-specific DMA, AXI-Lite base, and DRAM layout constants."""
+    global CURRENT_DEVICE, UE_0_BASE_ADDR, DRAM_START_ADDR, DRAM_ACTIVATION_ADDR, DRAM_INSTRUCTION_ADDR, DRAM_END_ADDR
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+
+    CURRENT_DEVICE = device_name
+    if device_name == "efinix":
+        UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
+        DRAM_START_ADDR = 0x00000000
+        DRAM_ACTIVATION_ADDR = 0xB0000000
+        DRAM_INSTRUCTION_ADDR = 0xD0000000
+        DRAM_END_ADDR = 0xFFFFFFFF
+        old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+        DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
+        DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
+        DMA_DEVICE_USER = "/dev/pcie_dma0_user"
+        _sync_imported_dma_device_paths(old_h2c, old_c2h, old_user)
+    else:
+        UE_0_BASE_ADDR = 0x02000000 if base_addr is None else int(base_addr)
+        DRAM_START_ADDR = 0x80000000
+        DRAM_ACTIVATION_ADDR = 0xB0000000
+        DRAM_INSTRUCTION_ADDR = 0xD0000000
+        DRAM_END_ADDR = 0xFFFFFFFF
+        set_dma_device(dma_device or "xdma0")
+
+    for name, addr in (
+        ("DRAM_START_ADDR", DRAM_START_ADDR),
+        ("DRAM_ACTIVATION_ADDR", DRAM_ACTIVATION_ADDR),
+        ("DRAM_INSTRUCTION_ADDR", DRAM_INSTRUCTION_ADDR),
+    ):
+        assert addr % 64 == 0, f"{name}=0x{addr:x} must be 64-byte aligned"
+
+    return {
+        "device": CURRENT_DEVICE,
+        "ue_0_base_addr": UE_0_BASE_ADDR,
+        "dram_start_addr": DRAM_START_ADDR,
+        "dram_activation_addr": DRAM_ACTIVATION_ADDR,
+        "dram_instruction_addr": DRAM_INSTRUCTION_ADDR,
+        "dram_end_addr": DRAM_END_ADDR,
+        "dma_h2c": DMA_DEVICE_H2C,
+        "dma_c2h": DMA_DEVICE_C2H,
+        "dma_user": DMA_DEVICE_USER,
+        "clock_period_ns": 4.0 if device_name == "efinix" else None,
+        "axi_data_width_bits": 256 if device_name == "efinix" else None,
+    }
 
 # UE DRAM / instruction fields use a 35-bit word address = byte address >> 3 (see andromeda.c, decoder inst words).
 UE_WORD_ADDR_BITS = 35
@@ -532,9 +584,9 @@ class UnifiedEngine:
     def __init__(self,
                  BASE_ADDR: Optional[int] = None,
                  device: str = 'cpu',
-                 params_dram_base: int = DRAM_START_ADDR,
-                 program_dram_base: int = DRAM_INSTRUCTION_ADDR,
-                 tensor_dram_base: int = DRAM_ACTIVATION_ADDR,
+                 params_dram_base: Optional[int] = None,
+                 program_dram_base: Optional[int] = None,
+                 tensor_dram_base: Optional[int] = None,
                  clock_period_ns: float = None,
                  device_name: Optional[str] = None):
         self.device = device
@@ -548,6 +600,12 @@ class UnifiedEngine:
         self.user_device = DMA_DEVICE_USER
         if BASE_ADDR is None:
             BASE_ADDR = UE_0_BASE_ADDR
+        if params_dram_base is None:
+            params_dram_base = DRAM_START_ADDR
+        if program_dram_base is None:
+            program_dram_base = DRAM_INSTRUCTION_ADDR
+        if tensor_dram_base is None:
+            tensor_dram_base = DRAM_ACTIVATION_ADDR
 
         # Hardware state (no simulation - uses actual DMA)
         # Note: DRAM/URAM/BRAM are accessed via DMA, not stored locally
@@ -806,7 +864,11 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xf2e8d12b, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xf2e8d12b. Please update FPGA with commit update_f2e8d12b.bin using update_flash.py (public release v1.4)"
+        expected_hw_versions = {0x12345678, 0xf2e8d12b} if CURRENT_DEVICE == "efinix" else {0x93ffa0c8}
+        assert hw_version in expected_hw_versions, (
+            f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
+            f"expected one of {', '.join(f'0x{v:08x}' for v in sorted(expected_hw_versions))}."
+        )
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -8032,11 +8094,11 @@ class UnifiedEngine:
         print(f"Capture stopped. Total instructions captured: {self.capture_count}, size: {self.capture_count * 32} bytes")
 
     def clear_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
-        dram_total_bytes = 0xffffffff - DRAM_START_ADDR + 1
+        dram_total_bytes = DRAM_END_ADDR - DRAM_START_ADDR + 1
         fill = b'\xff' * chunk_size_bytes
         offset = 0
         bar_width = 40
-        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..0xffffffff] ({dram_total_bytes / 1024**3:.2f} GB)")
+        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..{hex(DRAM_END_ADDR)}] ({dram_total_bytes / 1024**3:.2f} GB)")
         while offset < dram_total_bytes:
             write_size = min(chunk_size_bytes, dram_total_bytes - offset)
             self.dma_write(DMA_DEVICE_H2C, DRAM_START_ADDR + offset, fill[:write_size], write_size)
@@ -9071,6 +9133,9 @@ class UnifiedEngine:
         Returns:
             Number of bytes written, or -1 on error
         """
+        if start_addr is None:
+            start_addr = DRAM_INSTRUCTION_ADDR
+
         if not self.capture_buffer:
             print("Warning: No captured instructions to write. Capture buffer is empty.")
             return 0
@@ -9105,7 +9170,7 @@ class UnifiedEngine:
 
         return bytes_written
 
-    def start_execute_from_dram(self, instruction_addr: int = DRAM_INSTRUCTION_ADDR):
+    def start_execute_from_dram(self, instruction_addr: Optional[int] = None):
         """
         Start executing instructions from DRAM
 
@@ -9117,11 +9182,15 @@ class UnifiedEngine:
             instruction_addr: DRAM address where instructions are stored
                             (default: DRAM_INSTRUCTION_ADDR)
         """
+        if instruction_addr is None:
+            instruction_addr = DRAM_INSTRUCTION_ADDR
         self.write_reg32(UE_INSTRUCTION_ADDR, ue_35bit_addr_shifter(instruction_addr))
 
-    def program_execute(self, program_start_addr: int = DRAM_INSTRUCTION_ADDR, timeout: float = 50.0, flops: float = None) -> None:
+    def program_execute(self, program_start_addr: Optional[int] = None, timeout: float = 50.0, flops: float = None) -> None:
         """Execute compiled program from DRAM instruction memory.
         """
+        if program_start_addr is None:
+            program_start_addr = DRAM_INSTRUCTION_ADDR
         print(f"Execute program start at 0x{program_start_addr:X}")
         self.start_execute_from_dram(program_start_addr)
         latency, flop_rate_program = 0, 0

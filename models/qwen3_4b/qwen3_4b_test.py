@@ -48,7 +48,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, configure_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -74,6 +74,15 @@ def _parse_offset(val) -> int:
     if isinstance(val, str):
         return int(val, 0)
     return int(val)
+
+def _clock_ns_default_for_device(device: str) -> float:
+    """Qwen3-4B board defaults; preserve the existing kintex7 5.62 ns default."""
+    if device == "efinix":                         return 4.0
+    if device == "kintex7":                        return 5.62
+    if device in ("rk", "puzhi"):                  return 3.0
+    if device in ("bittware", "bittware_256"):      return 3.3333
+    if device == "alveo":                          return 4.0
+    return 5.62
 
 def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 64) -> tuple[bytes, bytes]:
     """Quantize bf16 weight (N_w, K_w) to INT4 packed + scale per block of 64 along K. Returns (data_bytes, scale_bytes).
@@ -1530,8 +1539,12 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use qwen3_4b_bin/full_model_weights.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=5.62,
-                        help='Clock cycle time in nanoseconds (default: 5.62ns ≈ peak 22.8 GFLOPS)')
+    parser.add_argument('--cycle', type=float, default=None,
+                        help='Clock cycle time in nanoseconds. Overrides --device default.')
+    parser.add_argument('--device', type=str, default='kintex7',
+                        help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
+    parser.add_argument('--thinking', action='store_true',
+                        help='Enable Qwen3 thinking mode. Default is non-thinking because this runner uses greedy HW decode.')
     # Decode is deterministic, on-FPGA only: token selection is always the HW argmax of
     # (logits + penalty bias). No host sampling (temperature/top-k/top-p/multinomial) — the
     # repetition penalty is folded into the LM-head matmul bias (notes_repetition_penalty_fpga_bias.md).
@@ -1561,20 +1574,28 @@ def main():
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
-    set_dma_device(args.dev)
+    profile = configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
-    print(f"Using DMA device: {args.dev}")
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(args.device))
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
     ue = Qwen3_4b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    print(
+        f"DRAM layout: params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, "
+        f"program=0x{ue._program_dram_base:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}"
+    )
     cfg = _load_config(script_dir)
     # Always tokenize via apply_chat_template — no hardcoded ids in the config.
     user_prompt = args.prompt if args.prompt is not None else cfg.get("default_prompt", "What is 3 + 5?")
@@ -1584,7 +1605,8 @@ def main():
         {"role": "user",   "content": user_prompt},
     ]
     prompt_with_template = ue.tokenizer.apply_chat_template(
-        conversation, tokenize=False, add_generation_prompt=True
+        conversation, tokenize=False, add_generation_prompt=True,
+        enable_thinking=bool(args.thinking),
     )
     prefill_seq = tuple(ue.tokenizer.encode(prompt_with_template, add_special_tokens=False))
     print(f"User prompt ({len(prefill_seq)} tokens): {user_prompt!r}")

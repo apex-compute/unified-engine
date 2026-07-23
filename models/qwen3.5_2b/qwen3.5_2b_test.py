@@ -63,18 +63,71 @@ import user_dma_core                                  # noqa: E402
 user_dma_core.CLOCK_CYCLE_TIME_NS = 5.62
 
 from user_dma_core import (                          # noqa: E402
-    UnifiedEngine, DMA_DEVICE_H2C, DMA_DEVICE_C2H,
+    UnifiedEngine, DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER,
     UE_VECTOR_SIZE, TYPE,
     LALU_MODE, UE_MODE, URAM_SECTION, URAM_WRITE_SRC, BROADCAST_MODE,
     MEMCPY_TYPE, URAM_START_ADDR, URAM_NEAR_FULL_ELEMENTS,
-    DRAM_ACTIVATION_ADDR,
     LALU_CLAMP_RELU_A, LALU_CLAMP_RELU_B,
-    ue_35bit_addr_shifter, set_dma_device,
+    ue_35bit_addr_shifter, configure_device,
 )
 
 BF16 = 2
 MODEL_PATH = "/srv/model_files/Qwen3.5-2B-ModelFiles/Qwen3.5-2B"
 CONFIG_PATH = _THIS.parent / "qwen3.5_2b_config.json"
+
+Q35_PARAMS_BASE = 0x00000000
+Q35_TENSOR_BASE = 0xB0000000
+Q35_PROGRAM_BASE = 0xD0000000
+
+
+def _set_dram_layout_for_device(device: str) -> None:
+    global Q35_PARAMS_BASE, Q35_TENSOR_BASE, Q35_PROGRAM_BASE
+    if device == "efinix":
+        Q35_PARAMS_BASE = 0x00000000
+        Q35_TENSOR_BASE = 0xB0000000
+        Q35_PROGRAM_BASE = 0xD0000000
+    else:
+        Q35_PARAMS_BASE = 0x00000000
+        Q35_TENSOR_BASE = 0xB0000000
+        Q35_PROGRAM_BASE = 0xD0000000
+
+
+def _clock_ns_default_for_device(device: str) -> float:
+    if device == "efinix":
+        return 4.0
+    return 5.62
+
+
+def configure_q35_runtime(device: str, dma_device: str | None = None,
+                          cycle: float | None = None) -> dict:
+    """Configure board profile and this model's DRAM layout."""
+    profile = configure_device(device, dma_device=dma_device)
+    _set_dram_layout_for_device(device)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if device in ("bittware", "rk") else 256)
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = cycle if cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(device))
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    profile["clock_period_ns"] = clock
+    profile["axi_data_width_bits"] = axi_width_bits
+    return profile
+
+
+def print_q35_profile(device: str, profile: dict) -> None:
+    print(f"FPGA profile: device={device}, clock={profile['clock_period_ns']:.4f} ns, "
+          f"UE_AXI_DATA_WIDTH_BITS={profile['axi_data_width_bits']}", flush=True)
+    print("Using DMA device:")
+    print(f"  H2C: {DMA_DEVICE_H2C}")
+    print(f"  C2H: {DMA_DEVICE_C2H}")
+    print(f"  USER: {DMA_DEVICE_USER}")
+    print(f"  BASE: 0x{profile['ue_0_base_addr']:08X}")
+    print(f"  DRAM layout: params=0x{Q35_PARAMS_BASE:08X}, tensor=0x{Q35_TENSOR_BASE:08X}, "
+          f"program=0x{Q35_PROGRAM_BASE:08X}, end=0x{profile['dram_end_addr']:08X}", flush=True)
 
 
 # ============================================================================
@@ -246,14 +299,12 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self._decoder_prog_size: int = 0
         self._decoder_X_dram: int = 0
         self._decoder_final_norm_dram: int = 0
-        # Full-4 GB DRAM layout (like gemma4): params 0x0–0xB0000000 = 2.75 GB.
-        # The kernel default base (0x80000000) gives only 768 MB of params, which
-        # the layer weights (~706 MB) + the on-chip FP4 LM head (~258 MB) = ~964 MB
-        # overflow into tensor DRAM (0xB0000000) — corrupting the KV/S caches →
-        # NaN.  Tensor/program bases stay at the kernel defaults (0xB0000000 /
-        # 0xD0000000); the small unified bin lives at 0xD0000000.
-        kwargs.setdefault("params_dram_base", 0x00000000)
+        # Board-specific DRAM layout is selected before construction.
+        kwargs.setdefault("params_dram_base", Q35_PARAMS_BASE)
+        kwargs.setdefault("tensor_dram_base", Q35_TENSOR_BASE)
+        kwargs.setdefault("program_dram_base", Q35_PROGRAM_BASE)
         super().__init__(*args, **kwargs)
+        self._q35_tensor_region_base = self._tensor_dram_base
         with open(config_path or CONFIG_PATH) as f:
             self._cfg = json.load(f)
         fi = self._cfg["file_info"]
@@ -1279,7 +1330,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         # permanent; reset_tensor_dram_addr() will only reclaim allocations
         # made above this point.
         self._tensor_dram_base = self._tensor_dram_addr
-        reserved_mb = (self._tensor_dram_base - DRAM_ACTIVATION_ADDR) / (1024 * 1024)
+        reserved_mb = (self._tensor_dram_base - self._q35_tensor_region_base) / (1024 * 1024)
         print(f"  Tensor DRAM reserved for caches: {reserved_mb:.0f} MB")
 
         # Final norm gamma (Qwen3_5RMSNorm: (1+w) already folded in by extractor).
@@ -4648,8 +4699,13 @@ def main():
                     help="max tokens to generate (default: 128). "
                          "Pass 0 to run until EOT or the KV cache is full "
                          "(`max_context - prompt_len`).")
-    ap.add_argument("--dev", type=str, default="xdma0",
-                    help="DMA device name (default: xdma0).")
+    ap.add_argument("--device", type=str, default="bittware",
+                    choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
+                    help="FPGA board profile. Default: bittware.")
+    ap.add_argument("--dev", type=str, default=None,
+                    help="DMA device name. Efinix ignores this and uses pcie_dma0 paths.")
+    ap.add_argument("--cycle", type=float, default=None,
+                    help="Clock cycle time in ns. Defaults to board profile value.")
     # VLM opt-in (gemma4 pattern). Default mode is pure LM; vision activates
     # only when --image PATH or --vision-enable is given.  Vision encoder
     # runs on FPGA (Phase 4) by default; the host-side HF path (Phase 1) is
@@ -4670,10 +4726,8 @@ def main():
                          "--image.")
     args = ap.parse_args()
 
-    set_dma_device(args.dev)
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H
-    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    profile = configure_q35_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
+    print_q35_profile(args.device, profile)
 
     # Hard-coded inference settings (formerly CLI flags, now defaults).
     # 512 (not 256) so the default VLM run fits: an image adds ~144 vision tokens,

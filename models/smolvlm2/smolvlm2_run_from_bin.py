@@ -36,7 +36,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE,
     DRAM_INSTRUCTION_ADDR,
-    UnifiedEngine, set_dma_device, ue_35bit_addr_shifter,
+    UnifiedEngine, configure_device, ue_35bit_addr_shifter,
 )
 
 # =============================================================================
@@ -217,8 +217,11 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         smolvlm2_test.zero_dram). The base clear_dram() fills 0xFF (NaN in bf16), which poisons any
         region read-before-write on the NEXT run — back-to-back runs then emit garbage / endoftext.
         run_from_bin calls this at the END of main() so consecutive load-only runs each start clean."""
-        start = user_dma_core.DRAM_START_ADDR
-        total = 0xFFFFFFFF - start + 1
+        start = self._params_dram_base
+        # Only clear the SmolVLM2 working layout. Avoid sweeping the whole 4GB
+        # Efinix aperture up to 0xffffffff, which can hang on top-of-DRAM DMA.
+        end = min(user_dma_core.DRAM_END_ADDR, self._program_dram_base + 0x10000000 - 1)
+        total = end - start + 1
         zeros = b"\x00" * chunk_size_bytes
         offset = 0
         while offset < total:
@@ -597,6 +600,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -615,7 +619,7 @@ def main():
                         help="Pure language-model (text-only) mode — skip the vision encoder. Default is VLM (vision).")
     parser.add_argument("--dev", type=str, default=_d["dev"])
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"])
     parser.add_argument("--max-decode-tokens", type=int, default=None,
                         help="Cap the number of generated decode tokens.")
@@ -667,17 +671,26 @@ def main():
         args.prompt = _d["lm_prompt"] if lm_only else _d["vlm_prompt"]
     has_image = vision_on
 
-    set_dma_device(args.dev)
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    profile = configure_device(args.device, dma_device=args.dev)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(args.device))
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}")
     _SILENT_MODE = True
 
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
+    _original_print(
+        f"DRAM layout: params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, "
+        f"program=0x{ue._program_dram_base:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}"
+    )
     ue.decode_matmat_mul_core_enable = bool(args.decode_matmat_mul_core_enable)
     ue.penalty_enable = not bool(args.greedy_enable)
     _original_print(f"decode_linear={ 'if4_matmat_mul_core' if ue.decode_matmat_mul_core_enable else 'quantized_matmat_core' }")

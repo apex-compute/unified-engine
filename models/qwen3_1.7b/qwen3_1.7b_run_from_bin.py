@@ -50,7 +50,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, SCALE_BRAM_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, SCALE_BRAM_ELEMENTS, configure_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -58,6 +58,28 @@ import builtins
 
 _original_print = builtins.print
 _SILENT_MODE = False
+
+QWEN3_PARAMS_BASE = 0x00000000
+QWEN3_TENSOR_BASE = 0x58000000
+QWEN3_PROGRAM_BASE = 0xE0000000
+
+
+def _set_dram_layout_for_device(device: str) -> None:
+    global QWEN3_PARAMS_BASE, QWEN3_TENSOR_BASE, QWEN3_PROGRAM_BASE
+    if device == "efinix":
+        QWEN3_PARAMS_BASE = 0x00000000
+        QWEN3_TENSOR_BASE = 0x58000000
+        QWEN3_PROGRAM_BASE = 0xE0000000
+    else:
+        QWEN3_PARAMS_BASE = 0x00000000
+        QWEN3_TENSOR_BASE = 0x58000000
+        QWEN3_PROGRAM_BASE = 0xE0000000
+
+
+def _clock_ns_default_for_device(device: str) -> float:
+    if device == "efinix":
+        return 4.0
+    return 5.62
 
 def quiet_print(*args, **kwargs):
     """Suppress prints when _SILENT_MODE is True; otherwise print normally."""
@@ -288,14 +310,11 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        # Qwen3 DRAM layout starting from 0x00000000 (4 GB DRAM):
-        #   params: 0x00000000 – 0x58000000 (~1.4 GB, covers layers + LM_HEAD + ROPE)
-        #   tensors: 0x58000000 – 0x98000000 (~1 GB, intermediates + KV cache)
-        #   instructions: 0x98000000 – 0xA0000000 (128 MB)
+        # Qwen3 DRAM layout is selected in main() before construction.
         super().__init__(
-            params_dram_base=0x00000000,
-            tensor_dram_base=0x58000000,
-            program_dram_base=0xE0000000,
+            params_dram_base=QWEN3_PARAMS_BASE,
+            tensor_dram_base=QWEN3_TENSOR_BASE,
+            program_dram_base=QWEN3_PROGRAM_BASE,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
@@ -318,6 +337,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self.k_size = self.head_dim * self.bytes_per_element                     # 1024*2 = 2048
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
         self.PREFILL_MAX_SEQ_LEN = int(model.get("prefill_max_seq_len", 256))
+        if user_dma_core.CURRENT_DEVICE == "efinix":
+            self.MAX_CONTEXT_SIZE = min(self.MAX_CONTEXT_SIZE, 1024)
+            self.PREFILL_MAX_SEQ_LEN = min(self.PREFILL_MAX_SEQ_LEN, 512)
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
         # Dynamic-PBI GPR layout (see core_changes.md §3a):
@@ -925,10 +947,13 @@ def main():
                         help="Text prompt (default: from qwen3_1.7b_config.json default_prompt)")
     parser.add_argument("--local-weights", action="store_true",
                         help="Use qwen3_1.7b_bin/full_model_weights.bin instead of params.bin")
-    parser.add_argument("--dev", type=str, default="xdma0",
-                        help="DMA device name (default: xdma0)")
-    parser.add_argument("--cycle", type=float, default=5.62,
-                        help="Clock cycle time in ns (default: 5.62ns ≈ peak 22.8 GFLOPS)")
+    parser.add_argument("--device", type=str, default="bittware",
+                        choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
+                        help="FPGA board profile. Default: bittware")
+    parser.add_argument("--dev", type=str, default=None,
+                        help="DMA device name. Efinix ignores this and uses pcie_dma0 paths.")
+    parser.add_argument("--cycle", type=float, default=None,
+                        help="Clock cycle time in ns. Defaults to board profile value.")
     # Deterministic on-FPGA decode: token selection is always the HW argmax of
     # (logits + penalty bias). No host sampling — the repetition penalty is folded into
     # the LM-head matmul bias (notes_repetition_penalty_fpga_bias.md).
@@ -948,6 +973,27 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     bin_dir = os.path.join(script_dir, "qwen3_1.7b_bin")
+
+    profile = configure_device(args.device, dma_device=args.dev)
+    _set_dram_layout_for_device(args.device)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(args.device))
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"Using DMA device:")
+    _original_print(f"  H2C: {DMA_DEVICE_H2C}")
+    _original_print(f"  C2H: {DMA_DEVICE_C2H}")
+    _original_print(f"  USER: {DMA_DEVICE_USER}")
+    _original_print(f"  BASE: 0x{profile['ue_0_base_addr']:08X}")
+    _original_print(f"  DRAM layout: params=0x{QWEN3_PARAMS_BASE:08X}, tensor=0x{QWEN3_TENSOR_BASE:08X}, "
+                    f"program=0x{QWEN3_PROGRAM_BASE:08X}, end=0x{profile['dram_end_addr']:08X}")
 
     weights_bin_rel = ("qwen3_1.7b_bin/full_model_weights.bin" if args.local_weights
                        else "qwen3_1.7b_bin/params.bin")
@@ -969,18 +1015,6 @@ def main():
         for f in missing:
             _original_print(f"  {f}")
         sys.exit(1)
-
-    set_dma_device(args.dev)
-    # Mirror test.py: rebind the device-name module globals after set_dma_device
-    # so any dma_read/dma_write resolves DMA_DEVICE_* (and tracks the chosen --dev).
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
-    _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
-                    f"UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
     global _SILENT_MODE
     _SILENT_MODE = True

@@ -62,7 +62,7 @@ import torch
 import time
 # pcie_utils imports (run from andromeda/pcie_utils or with PYTHONPATH)
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, calculate_snr
+from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, configure_device, ue_35bit_addr_shifter, calculate_snr
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -2745,6 +2745,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -2992,7 +2993,7 @@ def main():
                         help='After prefill and after the first decoded token, compare HW KV cache against host reference and print SNR for K and V.')
     args = parser.parse_args()
 
-    set_dma_device(args.dev)
+    profile = configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
@@ -3002,17 +3003,20 @@ def main():
     _boot.software_reset()
     _boot.clear_dram()
 
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    print(f"Using DMA device: {args.dev}")
+    effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
+    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"Using DMA device: {effective_dma}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
+    print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
+    print(f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}")
 
     dual_engine = args.dual_engine
     assert dual_engine == False, (

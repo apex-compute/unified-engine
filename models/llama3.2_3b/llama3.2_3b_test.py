@@ -43,7 +43,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, configure_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
 from quant_lib import quantize_if4
@@ -276,6 +276,22 @@ def _load_config(script_dir: str) -> dict:
     cfg["_weight_defs"] = weight_defs
     return cfg
 
+
+def _params_image_size(cfg: dict) -> int:
+    """Return the generated params.bin size implied by the model config."""
+    weight_defs = cfg["_weight_defs"]
+    file_info = cfg["file_info"]
+    layer_size = weight_defs["LAYER_WEIGHT_SIZE"]
+    num_layers = file_info["num_layers"]
+    max_end = 0
+    for key, region in cfg.get("regions", {}).items():
+        max_end = max(max_end, weight_defs[key] + (num_layers - 1) * layer_size + region["size"])
+    for key, region in cfg.get("non_layer_regions", {}).items():
+        max_end = max(max_end, weight_defs[key] + region["size"])
+    emb_cfg = cfg["special"]["embedding"]
+    max_end = max(max_end, _parse_offset(emb_cfg["token_embd_offset"]) + _parse_offset(emb_cfg["token_embd_size"]))
+    return max_end
+
 # -----------------------------------------------------------------------------
 # Llama-3.2-3B unified engine
 # -----------------------------------------------------------------------------
@@ -292,6 +308,19 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
+        self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+        self._cfg = _load_config(self.script_dir)
+        self.weight_defs = self._cfg["_weight_defs"]
+
+        if user_dma_core.CURRENT_DEVICE == "efinix" and user_dma_core.DRAM_END_ADDR < 0xFFFFFFFF:
+            required = _params_image_size(self._cfg)
+            available = user_dma_core.DRAM_END_ADDR - user_dma_core.DRAM_START_ADDR + 1
+            raise MemoryError(
+                "Llama-3.2-3B requires the full 4 GiB Efinix DRAM profile: "
+                f"params image alone is 0x{required:X} bytes ({required / 1024**3:.2f} GiB), "
+                f"but current Efinix profile exposes 0x{available:X} bytes ({available / 1024**3:.2f} GiB)."
+            )
+
         # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
         # 512 MB for the tensor region, which overflows at max_context_size=4096
         # (attention + activation buffers in tensor_init scale with context). The
@@ -300,13 +329,11 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
         #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
         super().__init__(
-            params_dram_base=0x00000000,
+            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
+            params_dram_base=user_dma_core.DRAM_START_ADDR,
             tensor_dram_base=0x70000000,
             program_dram_base=0xE0000000,
         )
-        self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        self._cfg = _load_config(self.script_dir)
-        self.weight_defs = self._cfg["_weight_defs"]
 
         fi = self._cfg["file_info"]
         model = self._cfg["model"]
@@ -1279,6 +1306,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -1289,7 +1317,7 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_3b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly (no logit readback), fully
     # deterministic (separate _fpgapenalty bin). --pure-greedy disables it entirely.
@@ -1315,6 +1343,37 @@ def main():
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    profile = configure_device(args.device, dma_device=args.dev)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
+    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"Using DMA device: {effective_dma}")
+    print(f"  H2C: {DMA_DEVICE_H2C}")
+    print(f"  C2H: {DMA_DEVICE_C2H}")
+    print(f"  USER: {DMA_DEVICE_USER}")
+    print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
+    print(f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}, end=0x{user_dma_core.DRAM_END_ADDR:08x}")
+
+    if profile["device"] == "efinix" and user_dma_core.DRAM_END_ADDR < 0xFFFFFFFF:
+        cfg = _load_config(script_dir)
+        required = _params_image_size(cfg)
+        available = user_dma_core.DRAM_END_ADDR - user_dma_core.DRAM_START_ADDR + 1
+        raise MemoryError(
+            "Llama-3.2-3B cannot fit in the current Efinix DRAM profile: "
+            f"params image alone is 0x{required:X} bytes ({required / 1024**3:.2f} GiB), "
+            f"available window is 0x{available:X} bytes ({available / 1024**3:.2f} GiB). "
+            "Use a 4 GiB Efinix profile before running this model."
+        )
+
     if args.local_weights:
         weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
     else:
@@ -1322,19 +1381,6 @@ def main():
         weights_bin_full = os.path.join(script_dir, weights_bin_rel)
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
-
-    set_dma_device(args.dev)
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)

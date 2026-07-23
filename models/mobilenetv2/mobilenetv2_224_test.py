@@ -56,7 +56,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR, TYPE,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
-    set_dma_device, UnifiedEngine,
+    configure_device, UnifiedEngine,
     UE_MODE, URAM_SECTION, URAM_WRITE_SRC, BROADCAST_MODE, LALU_MODE,
 )
 
@@ -1131,6 +1131,7 @@ def preprocess_image(image_path: str, size: int = 224) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "efinix":                         return 4.0
     if device == "kintex7":                       return 5.1594
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
@@ -1142,9 +1143,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="MobileNetV2-1.0 accelerator inference.")
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
-    parser.add_argument("--dev", type=str, default="xdma0", help="DMA device (default: xdma0)")
+    parser.add_argument("--dev", type=str, default=None, help="DMA device override (default: board profile)")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--cleanup", action="store_true",
                         help="Delete compile artifacts from mobilenetv2_bin/ before running. "
                              "Cached HF weights (hf_model/) are preserved.")
@@ -1165,22 +1166,25 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
 
-    set_dma_device(args.dev)
+    profile = configure_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    axi_width_bits = profile.get("axi_data_width_bits") or (512 if args.device in ("bittware", "rk") else 256)
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(args.device))
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
+    _original_print(f"DRAM layout: params=0x{MBV2_PARAMS_BASE:08X}, tensor=0x{MBV2_TENSOR_BASE:08X}, "
+                    f"program=0x{MBV2_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     image_path = args.image or os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     pixel_values = preprocess_image(image_path, size=MobileNetV2_UnifiedEngine.IMAGE_SIZE)
 
-    _original_print(f"MobileNetV2-1.0-{MobileNetV2_UnifiedEngine.IMAGE_SIZE} on {args.dev}")
+    _original_print(f"MobileNetV2-1.0-{MobileNetV2_UnifiedEngine.IMAGE_SIZE} on {DMA_DEVICE_H2C}")
 
     import threading
     import time as _time
@@ -1191,8 +1195,9 @@ def main():
             _original_print(f"\r  {label} ({elapsed:.0f}s)", end="", flush=True)
 
     t0 = _time.perf_counter()
+    _boot = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
+    _boot.software_reset()
     ue = MobileNetV2_UnifiedEngine(script_dir=SCRIPT_DIR)
-    ue.software_reset()
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
 
