@@ -148,9 +148,42 @@ DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
 CURRENT_DEVICE = "default"
 
-def _sync_imported_dma_device_paths(old_h2c: str, old_c2h: str, old_user: str):
-    """Rebind modules that imported DMA path constants by value."""
+def set_dma_device(device_name: str, dma_device: Optional[str] = None,
+                   base_addr: Optional[int] = None) -> dict:
+    """Set DMA device paths and an optional AXI-Lite base address.
+
+    Also rebinds the names in any module that imported them by value
+    (``from user_dma_core import DMA_DEVICE_H2C``), so callers that took the
+    pre-set_dma_device snapshot still see the right device. Without this,
+    models split across xdma0/xdma1 — methods on UnifiedEngine read the live
+    module global (correct), while bare references in the model file read the
+    stale import snapshot (wrong).
+    """
     import sys as _sys
+    global CURRENT_DEVICE, DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
+    global DRAM_START_ADDR, DRAM_ACTIVATION_ADDR, DRAM_INSTRUCTION_ADDR, DRAM_END_ADDR
+    old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    CURRENT_DEVICE = device_name
+    if device_name == "efinix":
+        DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
+        DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
+        DMA_DEVICE_USER = "/dev/pcie_dma0_user"
+        UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
+        DRAM_START_ADDR = 0x00000000
+        DRAM_ACTIVATION_ADDR = 0xB0000000
+        DRAM_INSTRUCTION_ADDR = 0xD0000000
+        DRAM_END_ADDR = 0xFFFFFFFF
+    else:
+        dma_device = dma_device or device_name
+        DMA_DEVICE_H2C = f"/dev/{dma_device}_h2c_0"
+        DMA_DEVICE_C2H = f"/dev/{dma_device}_c2h_0"
+        DMA_DEVICE_USER = f"/dev/{dma_device}_user"
+        if base_addr is not None:
+            UE_0_BASE_ADDR = int(base_addr)
+        DRAM_START_ADDR = 0x80000000
+        DRAM_ACTIVATION_ADDR = 0xB0000000
+        DRAM_INSTRUCTION_ADDR = 0xD0000000
+        DRAM_END_ADDR = 0xFFFFFFFF
     for _mod in list(_sys.modules.values()):
         if _mod is None or _mod is _sys.modules[__name__]:
             continue
@@ -168,22 +201,19 @@ def _sync_imported_dma_device_paths(old_h2c: str, old_c2h: str, old_user: str):
                 except Exception:
                     pass
 
-def set_dma_device(device_name: str):
-    """Set DMA device paths based on device name (e.g., 'xdma0' -> '/dev/xdma0_*').
-
-    Also rebinds the names in any module that imported them by value
-    (``from user_dma_core import DMA_DEVICE_H2C``), so callers that took the
-    pre-set_dma_device snapshot still see the right device. Without this,
-    models split across xdma0/xdma1 — methods on UnifiedEngine read the live
-    module global (correct), while bare references in the model file read the
-    stale import snapshot (wrong).
-    """
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
-    DMA_DEVICE_C2H = f"/dev/{device_name}_c2h_0"
-    DMA_DEVICE_USER = f"/dev/{device_name}_user"
-    _sync_imported_dma_device_paths(old_h2c, old_c2h, old_user)
+    return {
+        "device": CURRENT_DEVICE,
+        "ue_0_base_addr": UE_0_BASE_ADDR,
+        "dram_start_addr": DRAM_START_ADDR,
+        "dram_activation_addr": DRAM_ACTIVATION_ADDR,
+        "dram_instruction_addr": DRAM_INSTRUCTION_ADDR,
+        "dram_end_addr": DRAM_END_ADDR,
+        "dma_h2c": DMA_DEVICE_H2C,
+        "dma_c2h": DMA_DEVICE_C2H,
+        "dma_user": DMA_DEVICE_USER,
+        "clock_period_ns": 4.0 if device_name == "efinix" else None,
+        "axi_data_width_bits": 256 if device_name == "efinix" else None,
+    }
 
 # Constants
 UE_VECTOR_SIZE = 64
@@ -198,52 +228,6 @@ DRAM_START_ADDR = 0x80000000 # 0 GB
 DRAM_ACTIVATION_ADDR = 0xB0000000 # 512 MB reserved for intermediate results
 DRAM_INSTRUCTION_ADDR = 0xD0000000  # 256*3 MB reserved for instructions
 DRAM_END_ADDR = 0xFFFFFFFF
-
-def configure_device(device_name: str, dma_device: Optional[str] = None, base_addr: Optional[int] = None) -> dict:
-    """Apply board-specific DMA, AXI-Lite base, and DRAM layout constants."""
-    global CURRENT_DEVICE, UE_0_BASE_ADDR, DRAM_START_ADDR, DRAM_ACTIVATION_ADDR, DRAM_INSTRUCTION_ADDR, DRAM_END_ADDR
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-
-    CURRENT_DEVICE = device_name
-    if device_name == "efinix":
-        UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
-        DRAM_START_ADDR = 0x00000000
-        DRAM_ACTIVATION_ADDR = 0xB0000000
-        DRAM_INSTRUCTION_ADDR = 0xD0000000
-        DRAM_END_ADDR = 0xFFFFFFFF
-        old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-        DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
-        DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
-        DMA_DEVICE_USER = "/dev/pcie_dma0_user"
-        _sync_imported_dma_device_paths(old_h2c, old_c2h, old_user)
-    else:
-        UE_0_BASE_ADDR = 0x02000000 if base_addr is None else int(base_addr)
-        DRAM_START_ADDR = 0x80000000
-        DRAM_ACTIVATION_ADDR = 0xB0000000
-        DRAM_INSTRUCTION_ADDR = 0xD0000000
-        DRAM_END_ADDR = 0xFFFFFFFF
-        set_dma_device(dma_device or "xdma0")
-
-    for name, addr in (
-        ("DRAM_START_ADDR", DRAM_START_ADDR),
-        ("DRAM_ACTIVATION_ADDR", DRAM_ACTIVATION_ADDR),
-        ("DRAM_INSTRUCTION_ADDR", DRAM_INSTRUCTION_ADDR),
-    ):
-        assert addr % 64 == 0, f"{name}=0x{addr:x} must be 64-byte aligned"
-
-    return {
-        "device": CURRENT_DEVICE,
-        "ue_0_base_addr": UE_0_BASE_ADDR,
-        "dram_start_addr": DRAM_START_ADDR,
-        "dram_activation_addr": DRAM_ACTIVATION_ADDR,
-        "dram_instruction_addr": DRAM_INSTRUCTION_ADDR,
-        "dram_end_addr": DRAM_END_ADDR,
-        "dma_h2c": DMA_DEVICE_H2C,
-        "dma_c2h": DMA_DEVICE_C2H,
-        "dma_user": DMA_DEVICE_USER,
-        "clock_period_ns": 4.0 if device_name == "efinix" else None,
-        "axi_data_width_bits": 256 if device_name == "efinix" else None,
-    }
 
 # UE DRAM / instruction fields use a 35-bit word address = byte address >> 3 (see andromeda.c, decoder inst words).
 UE_WORD_ADDR_BITS = 35
@@ -864,8 +848,8 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        expected_hw_versions = {0x12345678, 0xf2e8d12b} if CURRENT_DEVICE == "efinix" else {0x93ffa0c8}
-        assert hw_version in expected_hw_versions, (
+        expected_hw_versions = {0xf2e8d12b, 0x12345678}
+        assert (hw_version & 0xFFFFFFFF) in expected_hw_versions, (
             f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
             f"expected one of {', '.join(f'0x{v:08x}' for v in sorted(expected_hw_versions))}."
         )
@@ -9123,7 +9107,7 @@ class UnifiedEngine:
             fmax_context_addr=0,
         )
 
-    def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
+    def write_captured_instructions_to_dram(self, start_addr: Optional[int] = None) -> int:
         """
         Write all captured instructions to DRAM
 

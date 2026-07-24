@@ -28,7 +28,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS,
-    configure_device, UnifiedEngine,
+    set_dma_device, UnifiedEngine,
 )
 
 BIN_DIR = os.path.join(SCRIPT_DIR, "mobilesam_bin")
@@ -267,7 +267,7 @@ def main():
     with open(os.path.join(BIN_DIR, "params.json")) as f:
         param_meta = json.load(f)
 
-    profile = configure_device(args.device, dma_device=args.dev)
+    profile = set_dma_device(args.device, dma_device=args.dev)
     _set_dram_layout_for_device(args.device)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C

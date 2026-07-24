@@ -68,7 +68,7 @@ from user_dma_core import (                          # noqa: E402
     LALU_MODE, UE_MODE, URAM_SECTION, URAM_WRITE_SRC, BROADCAST_MODE,
     MEMCPY_TYPE, URAM_START_ADDR, URAM_NEAR_FULL_ELEMENTS,
     LALU_CLAMP_RELU_A, LALU_CLAMP_RELU_B,
-    ue_35bit_addr_shifter, configure_device,
+    ue_35bit_addr_shifter, set_dma_device,
 )
 
 BF16 = 2
@@ -101,7 +101,7 @@ def _clock_ns_default_for_device(device: str) -> float:
 def configure_q35_runtime(device: str, dma_device: str | None = None,
                           cycle: float | None = None) -> dict:
     """Configure board profile and this model's DRAM layout."""
-    profile = configure_device(device, dma_device=dma_device)
+    profile = set_dma_device(device, dma_device=dma_device)
     _set_dram_layout_for_device(device)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C

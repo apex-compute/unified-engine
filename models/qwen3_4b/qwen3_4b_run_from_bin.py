@@ -47,7 +47,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, configure_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -921,8 +921,8 @@ def main():
             _original_print(f"  {f}")
         sys.exit(1)
 
-    profile = configure_device(args.device, dma_device=args.dev)
-    # Mirror test.py: rebind the device-name module globals after configure_device
+    profile = set_dma_device(args.device, dma_device=args.dev)
+    # Mirror test.py: rebind the device-name module globals after selecting DMA
     # so sample_next_token's dma_read(DMA_DEVICE_C2H, ...) resolves (and tracks
     # the chosen --dev). Without this, DMA_DEVICE_C2H is undefined in this module.
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER

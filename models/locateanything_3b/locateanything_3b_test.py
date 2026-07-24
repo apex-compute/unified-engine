@@ -31,7 +31,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 sys.path.insert(0, PROJECT_ROOT)
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, configure_device
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, set_dma_device
 from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_dram_post_add
 from nn_lib import store_weight, store_quantized_weight, smart_bf16_permute_core, layer_norm_core_dram_post_add
 from quant_lib import quantize_q4_64
@@ -3790,7 +3790,7 @@ def main():
                          "output and print a quant-fidelity comparison at the very bottom")
     args = ap.parse_args()
 
-    profile = configure_device(args.device, dma_device=args.dev)
+    profile = set_dma_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     axi_width_bits = profile.get("axi_data_width_bits")

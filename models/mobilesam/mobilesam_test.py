@@ -32,7 +32,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, UE_FMAX_CONTEXT_SIZE,
-    configure_device, UnifiedEngine, calculate_snr,
+    set_dma_device, UnifiedEngine, calculate_snr,
     INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,
 )
 import warnings as _warnings
@@ -4568,7 +4568,7 @@ def main():
                         help="Step through decoder stage-by-stage, asserting no NaNs at each checkpoint")
     args = parser.parse_args()
 
-    profile = configure_device(args.device, dma_device=args.dev)
+    profile = set_dma_device(args.device, dma_device=args.dev)
     _set_dram_layout_for_device(args.device)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C

@@ -64,7 +64,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     URAM_NEAR_FULL_ELEMENTS,
-    configure_device, UnifiedEngine,
+    set_dma_device, UnifiedEngine,
 )
 
 # ---------------------------------------------------------------------------
@@ -2199,7 +2199,7 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
 
-    profile = configure_device(args.device, dma_device=args.dev)
+    profile = set_dma_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H

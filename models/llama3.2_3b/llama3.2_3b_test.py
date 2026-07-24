@@ -43,7 +43,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, configure_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
 from quant_lib import quantize_if4
@@ -312,22 +312,10 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
-        if user_dma_core.CURRENT_DEVICE == "efinix" and user_dma_core.DRAM_END_ADDR < 0xFFFFFFFF:
-            required = _params_image_size(self._cfg)
-            available = user_dma_core.DRAM_END_ADDR - user_dma_core.DRAM_START_ADDR + 1
-            raise MemoryError(
-                "Llama-3.2-3B requires the full 4 GiB Efinix DRAM profile: "
-                f"params image alone is 0x{required:X} bytes ({required / 1024**3:.2f} GiB), "
-                f"but current Efinix profile exposes 0x{available:X} bytes ({available / 1024**3:.2f} GiB)."
-            )
-
-        # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
-        # 512 MB for the tensor region, which overflows at max_context_size=4096
-        # (attention + activation buffers in tensor_init scale with context). The
-        # tensor region here is 0x58000000..0xE0000000 = 2.25 GB.
-        #   params : 0x00000000 .. 0x58000000  (1.375 GB)  weights + host RoPE
-        #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
-        #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
+        # Full 4 GB DRAM layout for the 3B footprint.
+        #   params : 0x00000000 .. 0x70000000  weights + host RoPE
+        #   tensor : 0x70000000 .. 0xE0000000  activations + KV cache
+        #   program: 0xE0000000 .. 0x100000000 unified instruction bin
         super().__init__(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
             params_dram_base=user_dma_core.DRAM_START_ADDR,
@@ -1343,7 +1331,7 @@ def main():
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    profile = configure_device(args.device, dma_device=args.dev)
+    profile = set_dma_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
@@ -1361,19 +1349,6 @@ def main():
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
-    print(f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}, end=0x{user_dma_core.DRAM_END_ADDR:08x}")
-
-    if profile["device"] == "efinix" and user_dma_core.DRAM_END_ADDR < 0xFFFFFFFF:
-        cfg = _load_config(script_dir)
-        required = _params_image_size(cfg)
-        available = user_dma_core.DRAM_END_ADDR - user_dma_core.DRAM_START_ADDR + 1
-        raise MemoryError(
-            "Llama-3.2-3B cannot fit in the current Efinix DRAM profile: "
-            f"params image alone is 0x{required:X} bytes ({required / 1024**3:.2f} GiB), "
-            f"available window is 0x{available:X} bytes ({available / 1024**3:.2f} GiB). "
-            "Use a 4 GiB Efinix profile before running this model."
-        )
-
     if args.local_weights:
         weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
     else:

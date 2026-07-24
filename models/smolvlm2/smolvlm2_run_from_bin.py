@@ -36,7 +36,7 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE,
     DRAM_INSTRUCTION_ADDR,
-    UnifiedEngine, configure_device, ue_35bit_addr_shifter,
+    UnifiedEngine, set_dma_device, ue_35bit_addr_shifter,
 )
 
 # =============================================================================
@@ -671,7 +671,7 @@ def main():
         args.prompt = _d["lm_prompt"] if lm_only else _d["vlm_prompt"]
     has_image = vision_on
 
-    profile = configure_device(args.device, dma_device=args.dev)
+    profile = set_dma_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H

@@ -26,7 +26,7 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR,
-    UnifiedEngine, configure_device, ue_35bit_addr_shifter, UE_MODE,
+    UnifiedEngine, set_dma_device, ue_35bit_addr_shifter, UE_MODE,
 )
 from nn_lib import (
     smart_bf16_permute_core,
@@ -1585,7 +1585,7 @@ def main():
         snapshot_download(repo_id=HF_MODEL_REPO, local_dir=model_dir, local_dir_use_symlinks=False, ignore_patterns=["onnx/*"])
 
     # --- Hardware inference ---
-    profile = configure_device(args.device, dma_device=args.dev)
+    profile = set_dma_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H

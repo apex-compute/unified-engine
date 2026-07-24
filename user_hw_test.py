@@ -46,7 +46,7 @@ from user_dma_core import (
     URAM_WRITE_SRC,
     WB_PADDING_ZERO,
     calculate_snr,
-    configure_device,
+    set_dma_device,
     UnifiedEngine,
     UE_FMAX_CONTEXT_SIZE,
     UE_VECTOR_SIZE,
@@ -5491,14 +5491,6 @@ def gemma3_inference_test() -> None:
         "matmatmul": int(40_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
         "legacy": int(20_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
     }
-    if user_dma_core.CURRENT_DEVICE == "efinix":
-        # Efinix currently runs the same correctness workload at ~23.5M
-        # cycles/tok. Keep a device-specific performance gate instead of
-        # failing a valid run against the bittware-oriented floor above.
-        _MAX_CYCLES_PER_TOKEN.update({
-            "streaming": 25_000_000,
-            "legacy": 25_000_000,
-        })
     _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
 
     def _instruction_bin_path(ue) -> str:
@@ -5676,7 +5668,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     import user_dma_core
-    profile = configure_device(args.device, dma_device=args.dev, base_addr=args.base_addr)
+    profile = set_dma_device(args.device, dma_device=args.dev, base_addr=args.base_addr)
     globals()["DMA_DEVICE_H2C"] = user_dma_core.DMA_DEVICE_H2C
     globals()["DMA_DEVICE_C2H"] = user_dma_core.DMA_DEVICE_C2H
     globals()["DMA_DEVICE_USER"] = user_dma_core.DMA_DEVICE_USER

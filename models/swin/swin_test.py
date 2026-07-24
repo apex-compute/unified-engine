@@ -53,7 +53,7 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, TYPE,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,
-    configure_device, UnifiedEngine,
+    set_dma_device, UnifiedEngine,
 )
 
 # ---------------------------------------------------------------------------
@@ -599,7 +599,7 @@ def _clock_ns_default_for_device(device: str) -> float:
 
 def configure_swin_runtime(device: str, dma_device: str | None = None,
                            cycle: float | None = None) -> dict:
-    profile = configure_device(device, dma_device=dma_device)
+    profile = set_dma_device(device, dma_device=dma_device)
     _set_swin_dram_layout_for_device(device)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C

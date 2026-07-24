@@ -48,7 +48,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, configure_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -361,6 +361,30 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         self.weight_init()
         self.tensor_init()
 
+    def _dma_write_bytes_chunked(self, addr: int, data, size: int, chunk_size: int = 4 * 1024 * 1024) -> None:
+        view = memoryview(data)
+        done = 0
+        while done < size:
+            n = min(chunk_size, size - done)
+            written = self.dma_write(DMA_DEVICE_H2C, addr + done, view[done : done + n], n)
+            if written != n:
+                raise RuntimeError(
+                    f"DMA write failed at 0x{addr + done:X}: wrote {written}, expected {n}"
+                )
+            done += n
+
+    def _dma_zero_bytes_chunked(self, addr: int, size: int, chunk_size: int = 4 * 1024 * 1024) -> None:
+        zero = b"\x00" * min(chunk_size, size)
+        done = 0
+        while done < size:
+            n = min(len(zero), size - done)
+            written = self.dma_write(DMA_DEVICE_H2C, addr + done, zero[:n], n)
+            if written != n:
+                raise RuntimeError(
+                    f"DMA zero failed at 0x{addr + done:X}: wrote {written}, expected {n}"
+                )
+            done += n
+
     # ---- On-FPGA repetition penalty (the sole decode path; no host sampling) ----
     # The penalty is folded into the LM-head matmul as its per-vocab additive C bias
     # (bias_mode="broadcast_N"): logits = W·h + bias, argmaxed ON CHIP, so the HW
@@ -591,15 +615,17 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         layers_total = self.LAYER_SIZE * LAYER_WEIGHT_SIZE
         layers_base_dram = self.allocate_params_dram(layers_total)
 
-        # Single large DMA for all layer weights: the bin file stores layers at base_layer0
-        # with the same LAYER_WEIGHT_SIZE stride as DRAM, so data maps directly.
-        # This avoids 28*20=560 small DMA calls (each with PCIe round-trip overhead).
+        # The bin file stores layers at base_layer0 with the same LAYER_WEIGHT_SIZE
+        # stride as DRAM, so data maps directly. Chunk the transfer to avoid the
+        # kernel/driver allocation failure seen with a single multi-GB write.
         bin_layers_start = base_layer0
         print(f"  DMA layers: {layers_total // 1024 // 1024} MB → DRAM 0x{layers_base_dram:X}...", flush=True)
         _t0 = _time.perf_counter()
-        self.dma_write(DMA_DEVICE_H2C, layers_base_dram,
-                       self.weight_bin[bin_layers_start : bin_layers_start + layers_total],
-                       layers_total)
+        self._dma_write_bytes_chunked(
+            layers_base_dram,
+            memoryview(self.weight_bin)[bin_layers_start : bin_layers_start + layers_total],
+            layers_total,
+        )
         print(f"  DMA layers done in {_time.perf_counter() - _t0:.1f}s")
         # Set layer-0 DRAM attribute addresses from known offsets (same for all layers)
         for off_key, sz_key, attr in blk0_regions:
@@ -615,7 +641,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         print(f"  DMA non-layer weights: {len(nl_buf) // 1024 // 1024} MB...", flush=True)
         _t0 = _time.perf_counter()
         nl_base_dram = self.allocate_params_dram(len(nl_buf))
-        self.dma_write(DMA_DEVICE_H2C, nl_base_dram, nl_buf, len(nl_buf))
+        self._dma_write_bytes_chunked(nl_base_dram, nl_buf, len(nl_buf))
         print(f"  DMA non-layer done in {_time.perf_counter() - _t0:.1f}s")
         nl_offset = 0
         for off_key, sz_key, attr in non_layer:
@@ -653,9 +679,9 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
 
         # --- Fixed tensors (reused per layer, do not grow with KV cache) ---
         # Constant zero and identity buffers
-        zero_add = torch.zeros(seq_len * self.head_dim * bpe, dtype=torch.bfloat16)
-        self.ZERO_DRAM_ADDR = self.allocate_tensor_dram(seq_len * self.head_dim * bpe)
-        self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
+        zero_add_bytes = seq_len * self.head_dim * bpe
+        self.ZERO_DRAM_ADDR = self.allocate_tensor_dram(zero_add_bytes)
+        self._dma_zero_bytes_chunked(self.ZERO_DRAM_ADDR, zero_add_bytes)
         # Single UE_VECTOR_SIZE × UE_VECTOR_SIZE identity matrix reused by
         # unified_attention_core's V^T transpose. Passed as IDENTITY_DRAM_ADDR= at
         # every call site; bin bakes one address.
@@ -672,10 +698,10 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(aligned_seq_len * ahd * bpe)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(aligned_seq_len * ahd * bpe)
         self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(aligned_seq_len * ahd * bpe)
-        zero_pad = torch.zeros(aligned_seq_len * ahd * bpe, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_pad)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_pad)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_pad)
+        zero_pad_bytes = aligned_seq_len * ahd * bpe
+        self._dma_zero_bytes_chunked(self.LAYER0_FLASH_Q_DRAM, zero_pad_bytes)
+        self._dma_zero_bytes_chunked(self.LAYER0_FLASH_K_DRAM, zero_pad_bytes)
+        self._dma_zero_bytes_chunked(self.LAYER0_FLASH_V_DRAM, zero_pad_bytes)
 
         # Per-head flash output (seq_len * group_size, ahd); reused across KV heads
         self.LAYER0_FLASH_OUT_HEAD_DRAM = self.allocate_tensor_dram(aligned_seq_len * ahd * bpe)
@@ -724,9 +750,8 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         kv_cache_total = self.LAYER_SIZE * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(kv_cache_total)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(kv_cache_total)
-        zero_kv = torch.zeros(kv_cache_total, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_kv)
-        self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_kv)
+        self._dma_zero_bytes_chunked(self.LAYER0_V_DRAM, kv_cache_total)
+        self._dma_zero_bytes_chunked(self.LAYER0_K_ROPE_DRAM, kv_cache_total)
 
         # On-FPGA repetition penalty: per-vocab additive bias (the LM-head matmul's C term,
         # bias_mode="broadcast_N"). Allocated LAST so adding it never shifts the addresses
@@ -1574,7 +1599,7 @@ def main():
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
-    profile = configure_device(args.device, dma_device=args.dev)
+    profile = set_dma_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
