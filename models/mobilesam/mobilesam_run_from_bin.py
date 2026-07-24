@@ -26,30 +26,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS,
     set_dma_device, UnifiedEngine,
 )
 
 BIN_DIR = os.path.join(SCRIPT_DIR, "mobilesam_bin")
 MOBILESAM_ARTIFACT_VERSION = 2
-
-MSAM_PARAMS_BASE = 0x80000000
-MSAM_TENSOR_BASE = 0xB0000000
-MSAM_PROGRAM_BASE = 0xD8000000
-
-
-def _set_dram_layout_for_device(device: str) -> None:
-    global MSAM_PARAMS_BASE, MSAM_TENSOR_BASE, MSAM_PROGRAM_BASE
-    if device == "efinix":
-        MSAM_PARAMS_BASE = 0x80000000
-        MSAM_TENSOR_BASE = 0xB0000000
-        MSAM_PROGRAM_BASE = 0xD8000000
-    else:
-        MSAM_PARAMS_BASE = 0x80000000
-        MSAM_TENSOR_BASE = 0xB0000000
-        MSAM_PROGRAM_BASE = 0xD8000000
-
 
 # ---------------------------------------------------------------------------
 # Architecture constants (match mobilesam_test.py)
@@ -79,12 +62,7 @@ class MobileSAM_UE_Run(UnifiedEngine):
         # jump addresses (flash subroutines) at compile time, and the tensor region runs to
         # ~0xD7602780, so the program must load+execute above it. A mismatched base sends every
         # jump to the wrong address -> hang/garbage.
-        super().__init__(
-            params_dram_base=MSAM_PARAMS_BASE,
-            tensor_dram_base=MSAM_TENSOR_BASE,
-            program_dram_base=MSAM_PROGRAM_BASE,
-            clock_period_ns=clock_period_ns,
-        )
+        super().__init__(program_dram_base=0xD8000000, clock_period_ns=clock_period_ns)
         self.script_dir = SCRIPT_DIR
         # Hang prevention
         self.start_capture()
@@ -268,7 +246,6 @@ def main():
         param_meta = json.load(f)
 
     profile = set_dma_device(args.device, dma_device=args.dev)
-    _set_dram_layout_for_device(args.device)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
@@ -280,8 +257,6 @@ def main():
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
-    _original_print(f"DRAM layout: params=0x{MSAM_PARAMS_BASE:08X}, tensor=0x{MSAM_TENSOR_BASE:08X}, "
-                    f"program=0x{MSAM_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     # Load image
     img_path = os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")

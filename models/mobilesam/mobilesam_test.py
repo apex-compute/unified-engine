@@ -30,7 +30,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, UE_FMAX_CONTEXT_SIZE,
     set_dma_device, UnifiedEngine, calculate_snr,
     INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,
@@ -42,22 +42,6 @@ import torch.nn as _nn
 from nn_lib import flash_attention_batched_pbi
 
 COMPUTE_DTYPE = torch.bfloat16
-
-MSAM_PARAMS_BASE = 0x80000000
-MSAM_TENSOR_BASE = 0xB0000000
-MSAM_PROGRAM_BASE = 0xD8000000
-
-
-def _set_dram_layout_for_device(device: str) -> None:
-    global MSAM_PARAMS_BASE, MSAM_TENSOR_BASE, MSAM_PROGRAM_BASE
-    if device == "efinix":
-        MSAM_PARAMS_BASE = 0x80000000
-        MSAM_TENSOR_BASE = 0xB0000000
-        MSAM_PROGRAM_BASE = 0xD8000000
-    else:
-        MSAM_PARAMS_BASE = 0x80000000
-        MSAM_TENSOR_BASE = 0xB0000000
-        MSAM_PROGRAM_BASE = 0xD8000000
 
 
 def nms(boxes: torch.Tensor, scores: torch.Tensor, threshold: float):
@@ -1079,11 +1063,7 @@ class MobileSAM_UE(UnifiedEngine):
         # corrupted instructions at execute time -> the decoder PC jumped into garbage, never
         # reached halt, and run_decoder timed out at 120 s with IOU=0. Push programs above the
         # true tensor end. Programs (~33 MB) then end ~0xDA035000, well within 4 GB.
-        super().__init__(
-            params_dram_base=MSAM_PARAMS_BASE,
-            tensor_dram_base=MSAM_TENSOR_BASE,
-            program_dram_base=MSAM_PROGRAM_BASE,
-        )
+        super().__init__(program_dram_base=0xD8000000)
         self.init_unified_engine()
         sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.weight_init(sd)
@@ -4569,7 +4549,6 @@ def main():
     args = parser.parse_args()
 
     profile = set_dma_device(args.device, dma_device=args.dev)
-    _set_dram_layout_for_device(args.device)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
@@ -4581,8 +4560,6 @@ def main():
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
-    _original_print(f"DRAM layout: params=0x{MSAM_PARAMS_BASE:08X}, tensor=0x{MSAM_TENSOR_BASE:08X}, "
-                    f"program=0x{MSAM_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     if not os.path.exists(WEIGHTS):
         import urllib.request
@@ -4636,8 +4613,7 @@ def main():
     bins_exist = _artifacts_current()
     if bins_exist:
         _original_print("\nLoading from pre-compiled bins …")
-        from mobilesam_run_from_bin import MobileSAM_UE_Run, _set_dram_layout_for_device as _set_run_bin_layout
-        _set_run_bin_layout(args.device)
+        from mobilesam_run_from_bin import MobileSAM_UE_Run
         ue = MobileSAM_UE_Run()
         ue.load_params()
         with open(os.path.join(BIN_DIR, "params.json")) as f:
