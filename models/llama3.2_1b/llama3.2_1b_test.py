@@ -326,10 +326,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
         #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
         super().__init__(
-            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
-            params_dram_base=user_dma_core.DRAM_START_ADDR,
-            program_dram_base=user_dma_core.DRAM_INSTRUCTION_ADDR,
-            tensor_dram_base=user_dma_core.DRAM_ACTIVATION_ADDR,
+            params_dram_base=0x00000000,
+            tensor_dram_base=0x58000000,
+            program_dram_base=0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)

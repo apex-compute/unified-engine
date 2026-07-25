@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, DMA_DEVICE_C2H,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS,
     set_dma_device, UnifiedEngine,
 )

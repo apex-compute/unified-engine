@@ -30,7 +30,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, DMA_DEVICE_C2H,
+    DMA_DEVICE_H2C, DMA_DEVICE_C2H, DRAM_INSTRUCTION_ADDR,
     UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, UE_FMAX_CONTEXT_SIZE,
     set_dma_device, UnifiedEngine, calculate_snr,
     INSTRUCTION_SIZE_BYTES, ue_35bit_addr_shifter,

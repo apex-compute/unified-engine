@@ -276,22 +276,6 @@ def _load_config(script_dir: str) -> dict:
     cfg["_weight_defs"] = weight_defs
     return cfg
 
-
-def _params_image_size(cfg: dict) -> int:
-    """Return the generated params.bin size implied by the model config."""
-    weight_defs = cfg["_weight_defs"]
-    file_info = cfg["file_info"]
-    layer_size = weight_defs["LAYER_WEIGHT_SIZE"]
-    num_layers = file_info["num_layers"]
-    max_end = 0
-    for key, region in cfg.get("regions", {}).items():
-        max_end = max(max_end, weight_defs[key] + (num_layers - 1) * layer_size + region["size"])
-    for key, region in cfg.get("non_layer_regions", {}).items():
-        max_end = max(max_end, weight_defs[key] + region["size"])
-    emb_cfg = cfg["special"]["embedding"]
-    max_end = max(max_end, _parse_offset(emb_cfg["token_embd_offset"]) + _parse_offset(emb_cfg["token_embd_size"]))
-    return max_end
-
 # -----------------------------------------------------------------------------
 # Llama-3.2-3B unified engine
 # -----------------------------------------------------------------------------
@@ -308,20 +292,15 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        self._cfg = _load_config(self.script_dir)
-        self.weight_defs = self._cfg["_weight_defs"]
-
-        # Full 4 GB DRAM layout for the 3B footprint.
-        #   params : 0x00000000 .. 0x70000000  weights + host RoPE
-        #   tensor : 0x70000000 .. 0xE0000000  activations + KV cache
-        #   program: 0xE0000000 .. 0x100000000 unified instruction bin
+        # 3B params extend past the original 0x58000000 tensor base.
         super().__init__(
-            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
-            params_dram_base=user_dma_core.DRAM_START_ADDR,
+            params_dram_base=0x00000000,
             tensor_dram_base=0x70000000,
             program_dram_base=0xE0000000,
         )
+        self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+        self._cfg = _load_config(self.script_dir)
+        self.weight_defs = self._cfg["_weight_defs"]
 
         fi = self._cfg["file_info"]
         model = self._cfg["model"]
@@ -1331,6 +1310,14 @@ def main():
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    if args.local_weights:
+        weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
+    else:
+        weights_bin_rel = "llama3.2_3b_bin/params.bin"
+        weights_bin_full = os.path.join(script_dir, weights_bin_rel)
+        if not os.path.exists(weights_bin_full):
+            weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
+
     profile = set_dma_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
@@ -1349,13 +1336,6 @@ def main():
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
-    if args.local_weights:
-        weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
-    else:
-        weights_bin_rel = "llama3.2_3b_bin/params.bin"
-        weights_bin_full = os.path.join(script_dir, weights_bin_rel)
-        if not os.path.exists(weights_bin_full):
-            weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
     ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)
