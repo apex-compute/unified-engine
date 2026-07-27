@@ -2190,9 +2190,9 @@ def main():
     parser = argparse.ArgumentParser(description="MBV2-SSD-FPNLite (640) on accelerator.")
     parser.add_argument("--image", type=str, default=None,
                         help="Input image (default: ../../test_samples/vette.jpg)")
-    parser.add_argument("--dev", type=str, default=None, help="DMA device override (default: board profile)")
+    parser.add_argument("--dev", type=str, default="xdma0")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--score-thresh", type=float, default=0.3)
     parser.add_argument("--iou-thresh", type=float, default=0.6)
     args = parser.parse_args()
@@ -2200,24 +2200,23 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
 
-    set_dma_device("efinix" if args.device == "efinix" else (args.dev or args.device))
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    axi_width_bits = int(512 if args.device in ("bittware", "rk") else 256)
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    _original_print(f"Using DMA: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}")
 
     image_path = args.image or os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     _image_size = _load_config(SCRIPT_DIR)["model"]["image_size"]
     pixel_values, img, W0, H0 = preprocess_image(image_path, size=_image_size)
 
-    _original_print(f"MBV2-SSD-FPNLite-640 on {DMA_DEVICE_H2C}")
+    _original_print(f"MBV2-SSD-FPNLite-640 on {args.dev}")
 
     import threading
     def _progress(label, t_start, stop_event):

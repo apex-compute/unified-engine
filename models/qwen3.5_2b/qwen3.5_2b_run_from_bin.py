@@ -78,14 +78,13 @@ def main():
     ap.add_argument("--device", type=str, default="bittware",
                     choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
                     help="FPGA board profile. Default: bittware.")
-    ap.add_argument("--dev", type=str, default=None,
-                    help="DMA device name. Efinix ignores this and uses pcie_dma0 paths.")
+    ap.add_argument("--dev", type=str, default="xdma0",
+                    help="DMA device name. Default: xdma0.")
     ap.add_argument("--cycle", type=float, default=None,
                     help="Clock cycle time in ns. Defaults to board profile value.")
     args = ap.parse_args()
 
     T.configure_q35_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
-    T.print_q35_profile(args.device)
 
     vision_on = bool(args.image) or args.vision_enable
     _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))

@@ -56,28 +56,6 @@ import builtins
 _original_print = builtins.print
 _SILENT_MODE = False
 
-QWEN3_PARAMS_BASE = 0x00000000
-QWEN3_TENSOR_BASE = 0x58000000
-QWEN3_PROGRAM_BASE = 0xE0000000
-
-
-def _set_dram_layout_for_device(device: str) -> None:
-    global QWEN3_PARAMS_BASE, QWEN3_TENSOR_BASE, QWEN3_PROGRAM_BASE
-    if device == "efinix":
-        QWEN3_PARAMS_BASE = 0x00000000
-        QWEN3_TENSOR_BASE = 0x58000000
-        QWEN3_PROGRAM_BASE = 0xE0000000
-    else:
-        QWEN3_PARAMS_BASE = 0x00000000
-        QWEN3_TENSOR_BASE = 0x58000000
-        QWEN3_PROGRAM_BASE = 0xE0000000
-
-
-def _clock_ns_default_for_device(device: str) -> float:
-    if device == "efinix":
-        return 4.0
-    return 5.62
-
 def quiet_print(*args, **kwargs):
     """Suppress prints when _SILENT_MODE is True; otherwise print normally."""
     if _SILENT_MODE:
@@ -307,11 +285,11 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        # Qwen3 DRAM layout is selected in main() before construction.
+        # Qwen3 needs a dedicated 4 GB layout for parameters, tensors, and ISA.
         super().__init__(
-            params_dram_base=QWEN3_PARAMS_BASE,
-            tensor_dram_base=QWEN3_TENSOR_BASE,
-            program_dram_base=QWEN3_PROGRAM_BASE,
+            params_dram_base=0x00000000,
+            tensor_dram_base=0x58000000,
+            program_dram_base=0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
@@ -1603,8 +1581,8 @@ def main():
     parser.add_argument("--device", type=str, default="bittware",
                         choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
                         help="FPGA board profile. Default: bittware")
-    parser.add_argument('--dev', type=str, default=None,
-                        help='DMA device name (e.g., xdma0, xdma1). Efinix ignores this and uses pcie_dma0 paths.')
+    parser.add_argument('--dev', type=str, default='xdma0',
+                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=None,
                         help='Clock cycle time in nanoseconds. Defaults to board profile value.')
     # Decode is deterministic, on-FPGA only: token selection is always the HW argmax of
@@ -1627,8 +1605,7 @@ def main():
                              'special tokens). Default 256.')
     args = parser.parse_args()
 
-    set_dma_device("efinix" if args.device == "efinix" else (args.dev or args.device))
-    _set_dram_layout_for_device(args.device)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
@@ -1636,11 +1613,9 @@ def main():
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, BASE=0x{user_dma_core.UE_0_BASE_ADDR:08X}, params=0x{QWEN3_PARAMS_BASE:08X}, tensor=0x{QWEN3_TENSOR_BASE:08X}, program=0x{QWEN3_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:

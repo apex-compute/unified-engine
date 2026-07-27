@@ -4536,7 +4536,7 @@ def _clock_ns_default_for_device(device: str) -> float:
 
 def main():
     parser = argparse.ArgumentParser(description="MobileSAM mask decoder accelerator test")
-    parser.add_argument("--dev",   default=None, help="DMA device override (default: board profile)")
+    parser.add_argument("--dev",   default="xdma0", help="DMA device name (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"),
@@ -4548,7 +4548,7 @@ def main():
                         help="Step through decoder stage-by-stage, asserting no NaNs at each checkpoint")
     args = parser.parse_args()
 
-    set_dma_device("efinix" if args.device == "efinix" else (args.dev or args.device))
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H

@@ -292,7 +292,13 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        # 3B params extend past the original 0x58000000 tensor base.
+        # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
+        # 512 MB for the tensor region, which overflows at max_context_size=4096
+        # (attention + activation buffers in tensor_init scale with context). The
+        # tensor region here is 0x58000000..0xE0000000 = 2.25 GB.
+        #   params : 0x00000000 .. 0x58000000  (1.375 GB)  weights + host RoPE
+        #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
+        #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
         super().__init__(
             params_dram_base=0x00000000,
             tensor_dram_base=0x70000000,
@@ -1310,6 +1316,14 @@ def main():
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    if args.local_weights:
+        weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
+    else:
+        weights_bin_rel = "llama3.2_3b_bin/params.bin"
+        weights_bin_full = os.path.join(script_dir, weights_bin_rel)
+        if not os.path.exists(weights_bin_full):
+            weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
+
     set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
@@ -1324,13 +1338,6 @@ def main():
     effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
     print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     print(f"DMA: device={effective_dma}, H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, BASE=0x{user_dma_core.UE_0_BASE_ADDR:08x}")
-    if args.local_weights:
-        weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
-    else:
-        weights_bin_rel = "llama3.2_3b_bin/params.bin"
-        weights_bin_full = os.path.join(script_dir, weights_bin_rel)
-        if not os.path.exists(weights_bin_full):
-            weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
     ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)

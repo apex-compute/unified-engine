@@ -1143,7 +1143,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="MobileNetV2-1.0 accelerator inference.")
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
-    parser.add_argument("--dev", type=str, default=None, help="DMA device override (default: board profile)")
+    parser.add_argument("--dev", type=str, default="xdma0", help="DMA device (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--cleanup", action="store_true",
@@ -1166,7 +1166,7 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
 
-    set_dma_device("efinix" if args.device == "efinix" else (args.dev or args.device))
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
@@ -1177,12 +1177,11 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    _original_print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}, params=0x{MBV2_PARAMS_BASE:08X}, tensor=0x{MBV2_TENSOR_BASE:08X}, program=0x{MBV2_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     image_path = args.image or os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")
     pixel_values = preprocess_image(image_path, size=MobileNetV2_UnifiedEngine.IMAGE_SIZE)
 
-    _original_print(f"MobileNetV2-1.0-{MobileNetV2_UnifiedEngine.IMAGE_SIZE} on {DMA_DEVICE_H2C}")
+    _original_print(f"MobileNetV2-1.0-{MobileNetV2_UnifiedEngine.IMAGE_SIZE} on {args.dev}")
 
     import threading
     import time as _time
@@ -1193,9 +1192,8 @@ def main():
             _original_print(f"\r  {label} ({elapsed:.0f}s)", end="", flush=True)
 
     t0 = _time.perf_counter()
-    _boot = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
-    _boot.software_reset()
     ue = MobileNetV2_UnifiedEngine(script_dir=SCRIPT_DIR)
+    ue.software_reset()
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
 

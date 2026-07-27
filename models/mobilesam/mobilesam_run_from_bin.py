@@ -222,8 +222,8 @@ def main():
     parser = argparse.ArgumentParser(description="MobileSAM inference from pre-compiled bins")
     parser.add_argument("--point", type=int, nargs=2, metavar=("X", "Y"), default=[512, 512],
                         help="Single-point inference at (x, y) (default: 512 512)")
-    parser.add_argument("--dev", type=str, default=None,
-                        help="DMA device override (default: board profile)")
+    parser.add_argument("--dev", type=str, default="xdma0",
+                        help="DMA device name (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     args = parser.parse_args()
@@ -245,7 +245,7 @@ def main():
     with open(os.path.join(BIN_DIR, "params.json")) as f:
         param_meta = json.load(f)
 
-    set_dma_device("efinix" if args.device == "efinix" else (args.dev or args.device))
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H

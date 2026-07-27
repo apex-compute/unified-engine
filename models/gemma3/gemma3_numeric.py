@@ -1,36 +1,42 @@
 #!/usr/bin/env python3
 """
-Gemma3 pure-host checkpoint reference generator.
+Gemma3 numeric verification: torch reference vs hardware prefill.
 
-Computes Gemma3 prefill and one decoder step on the host, then stores each
-checkpoint tensor as a separate .pt file for comparison against hardware runs.
-This script does not reset hardware, allocate accelerator DRAM, compile ISA,
-execute queues, or use DMA.
+Inherits Gemma3_UnifiedEngine, runs prefill with FIXED_PREFILL, then
+torch_ref_check_prefill() computes torch ref (same as compile_prefill),
+reads intermediate tensors from hardware DRAM (LAYER0_PRE_NORM_DRAM to
+LAYER0_OUTPUT_DRAM), and checks using calculate_snr.
 
 Usage:
-  python gemma3_numeric.py [--layer-size 26] [--prompt "..."]
+  source venv/bin/activate  # if using venv
+  python gemma3_numeric.py --dev xdma0 [--device kintex7] [--cycle 5.15] [--layer-size 1]
 
-Same layout as gemma3_test: this file lives next to gemma3_bin/ and *.json.
+Same layout as gemma3_test: this file lives next to gemma3_bin/, *.json; user_dma_core two folders up.
 """
 
 import json
 import math
 import os
 import sys
+import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# Ensure pcie_utils is on path so shared host modules import from any cwd.
-_pcie_utils_dir = os.path.dirname(os.path.dirname(_THIS_DIR))
-if _pcie_utils_dir not in sys.path:
-    sys.path.insert(0, _pcie_utils_dir)
+# Ensure repo root is on path so "import user_dma_core" works when run from models/gemma3.
+_root = os.path.dirname(os.path.dirname(_THIS_DIR))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
+import numpy as np
 import torch
 
-from quant_lib import dequant
+import user_dma_core
+from user_dma_core import DMA_DEVICE_C2H, TYPE, set_dma_device, calculate_snr
+from read_trace import generate_trace
 
 import gemma3_test
 from gemma3_test import (
     Gemma3_UnifiedEngine,
+    _parse_offset,
     SCRIPT_DIR,
 )
 
@@ -44,10 +50,37 @@ def _dequantize_int4_from_bin(
     K: int,
     block_size: int = 64,
 ) -> torch.Tensor:
-    """Dequantize current Gemma3 IF4 weight format from the packed weight bin."""
+    """
+    Dequantize INT4 packed weight from bin. Scale per block of 64 along K.
+    Same format as _quantize_bf16_to_int4_packed in gemma3_test.
+    Returns (N, K) bfloat16 tensor.
+    """
+    assert K % block_size == 0
+    num_blocks_k = K // block_size
+
+    # Scale: (N, K/64) bf16
     scale_bytes = weight_bin[scale_off : scale_off + scale_sz]
+    scale_elems = len(scale_bytes) // 2
+    scale = torch.frombuffer(
+        bytearray(scale_bytes), dtype=torch.bfloat16
+    ).clone().reshape(N, num_blocks_k)
+
+    # Data: packed (N, K/2) bytes, low nibble = even idx, high = odd
     data_bytes = weight_bin[data_off : data_off + data_sz]
-    return dequant(gemma3_test.QUANT_PRECISION, data_bytes, scale_bytes, N, K, block_size)
+    packed = np.frombuffer(data_bytes, dtype=np.uint8)
+    packed = packed[: N * (K // 2)].reshape(N, K // 2)
+
+    # Unpack: each byte -> two int4 values (signed: 0-7 -> 0-7, 8-15 -> -8 to -1)
+    low = (packed & 0x0F).astype(np.int16)
+    high = ((packed >> 4) & 0x0F).astype(np.int16)
+    low = np.where(low >= 8, low - 16, low)
+    high = np.where(high >= 8, high - 16, high)
+    w_int8 = np.stack([low, high], axis=-1).reshape(N, K)
+
+    # Dequantize: w_int8 * scale (scale broadcast per block)
+    scale_expanded = scale.float().repeat_interleave(block_size, dim=1).to(torch.bfloat16)
+    w_bf16 = torch.from_numpy(w_int8.astype(np.float32)).to(torch.bfloat16) * scale_expanded
+    return w_bf16
 
 
 def _rms_norm_torch(x: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
@@ -133,53 +166,8 @@ def _gelu_torch(x: torch.Tensor) -> torch.Tensor:
 
 class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
     """
-    Pure host Gemma3 reference computation. This intentionally does not call
-    UnifiedEngine.__init__(), reset hardware, allocate DRAM, compile, or DMA.
+    Gemma3_UnifiedEngine with torch reference computation for numeric verification.
     """
-
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False):
-        self.script_dir = script_dir or SCRIPT_DIR
-        self._cfg = self.load_config(script_dir=self.script_dir)
-        self.weight_defs = self._cfg["_weight_defs"]
-
-        fi = self._cfg["file_info"]
-        model = self._cfg["model"]
-        paths = self._cfg["paths"]
-
-        self.vector_length = fi["hidden_size"]
-        self.head_dim = fi["head_dim"]
-        self.bytes_per_element = fi["bytes_per_element"]
-        self.group_size = fi["group_size"]
-        self.mlp_elements = fi["mlp_elements"]
-        self.q_size = self.head_dim * self.group_size * self.bytes_per_element
-        self.k_size = self.head_dim * self.bytes_per_element
-        self.MAX_CONTEXT_SIZE = model["max_context_size"]
-        self.PREFILL_CONTEXT_SIZE = model["prefill_context_size"]
-        self.PREFILL_MAX_SEQ_LEN = int(model["prefill_max_seq_len"])
-        self.LAYER_SIZE = fi["num_layers"]
-        self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
-        self.causal_mask_upper = False
-        self._rope_global_layers = set(model["rope_global_layers"])
-        self._end_of_turn_token_id = model["end_of_turn_token_id"]
-        self.prefill_seq = None
-
-        self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
-        self._load_host_weights()
-
-    def _load_host_weights(self) -> None:
-        full_path = os.path.join(self.script_dir, self._weights_bin_rel)
-        if not os.path.exists(full_path):
-            print(f"Weight bin not found, generating: {full_path}")
-            gemma3_test.weight_bin_generate(output_path=full_path)
-        with open(full_path, "rb") as f:
-            self.weight_bin = f.read()
-
-        model, model_dir = gemma3_test._ensure_hf_model(self.script_dir, self._cfg)
-        embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
-        embedding_scale = model.config.hidden_size ** 0.5
-        self.embedding_weight = (embed.float() * embedding_scale).to(torch.bfloat16)
-        from transformers import AutoTokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
     def _load_layer_weights_torch(self, layer_idx: int) -> dict:
         """Load layer weights from weight_bin for torch ref (bf16, int4 dequantized)."""
@@ -466,7 +454,6 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
 
         x = self.get_embedding_for_tokens([last_token_id]).clone()  # (1, vector_length)
         ref = {}
-        new_kv_all_layers: dict[int, dict] = {}
 
         for layer_idx in range(layer_size):
             w = self._load_layer_weights_torch(layer_idx)
@@ -493,8 +480,6 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
                 [_rope_hf_torch(q_norm[g], cos_t, sin_t) for g in range(self.group_size)],
                 dim=0,
             )
-
-            new_kv_all_layers[layer_idx] = {"k_rope": k_rope_new.clone(), "v": v_proj.clone()}
 
             cache_k = kv_cache[layer_idx]["k_rope"]
             cache_v = kv_cache[layer_idx]["v"]
@@ -552,63 +537,221 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
         ref["OUTPUT_NORM_DRAM"] = out_norm
         ref["LOGITS_DRAM"] = logits
 
-        return ref, new_kv_all_layers
+        return ref
 
-def _save_checkpoint_tensors(root: str, stage: str, tensors: dict[str, torch.Tensor]) -> dict:
-    stage_dir = os.path.join(root, stage)
-    os.makedirs(stage_dir, exist_ok=True)
-    manifest = {}
-    for name, tensor in tensors.items():
-        path = os.path.join(stage_dir, f"{name}.pt")
-        t = tensor.detach().cpu().contiguous()
-        torch.save(t, path)
-        manifest[name] = {
-            "path": os.path.relpath(path, root),
-            "shape": list(t.shape),
-            "dtype": str(t.dtype),
-        }
-    return manifest
+    def torch_ref_check_prefill(self, layer_size: int) -> dict:
+        """
+        Compute torch ref for prefill (prefill_seq[:-1] tokens), read intermediates from HW DRAM,
+        compare with calculate_snr. Returns kv_cache for decoder ref.
+        Uses self.prefill_seq so torch ref matches the same sequence as the HW run.
+        """
+        assert self.prefill_seq is not None, "prefill_seq is not set"
+        prefill_seq = self.prefill_seq
+        ref, kv_cache = self._compute_torch_prefill(prefill_seq[:-1], layer_size)
+        seq_len = len(prefill_seq) - 1
+
+        tensor_specs = [
+            ("LAYER0_PRE_NORM_DRAM", (seq_len, self.vector_length)),
+            ("LAYER0_Q_DRAM", (seq_len * self.group_size, self.head_dim)),
+            ("LAYER0_K_DRAM", (seq_len, self.head_dim)),
+            ("LAYER0_V_DRAM", (seq_len, self.head_dim)),  # per-layer offset applied when reading
+            ("LAYER0_K_NORM_DRAM", (seq_len, self.head_dim)),
+            ("LAYER0_Q_NORM_DRAM", (seq_len * self.group_size, self.head_dim)),
+            ("LAYER0_K_ROPE_DRAM", (seq_len, self.head_dim)),  # layer offset applied when reading
+            ("LAYER0_FLASH_Q_DRAM", (seq_len * self.group_size, self.head_dim)),  # Q after RoPE, layout t*group_size+g
+            ("LAYER0_FLASH_OUTPUT_DRAM", (seq_len * self.group_size, self.head_dim)),
+            ("LAYER0_ATTN_PROJ_OUTPUT_DRAM", (seq_len, self.vector_length)),
+            ("LAYER0_POST_ATTN_NORM_DRAM", (seq_len, self.vector_length)),
+            ("LAYER0_POST_ATTN_RESIDUAL_DRAM", (seq_len, self.vector_length)),
+            ("LAYER0_PRE_MLP_NORM_DRAM", (seq_len, self.vector_length)),
+            ("LAYER0_MLP_GATE_DRAM", (seq_len, self.mlp_elements)),
+            ("LAYER0_MLP_UP_DRAM", (seq_len, self.mlp_elements)),
+            ("LAYER0_MLP_MULT_DRAM", (seq_len, self.mlp_elements)),
+            ("LAYER0_MLP_DOWN_DRAM", (seq_len, self.vector_length)),
+            ("LAYER0_POST_MLP_NORM_DRAM", (seq_len, self.vector_length)),
+            ("LAYER0_OUTPUT_DRAM", (seq_len, self.vector_length)),
+        ]
+
+        print("\n--- Torch ref vs hardware SNR check ---")
+        all_pass = True
+        # Same offset as gemma3_test: K_DRAM_ADDR/V_DRAM_ADDR use layer_idx * MAX_CONTEXT_SIZE * k_size
+        layer_idx = layer_size - 1
+        layer_kv_offset = layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
+        for name, shape in tensor_specs:
+            if name not in ref:
+                continue
+            addr = getattr(self, name, None)
+            if addr is None:
+                continue
+            if name == "LAYER0_V_DRAM":
+                addr = self.LAYER0_V_DRAM + layer_kv_offset
+            if name == "LAYER0_K_ROPE_DRAM":
+                addr = self.LAYER0_K_ROPE_DRAM + layer_kv_offset
+            hw = self.dma_from_accelerator_memory(addr, shape)
+            r = ref[name]
+            assert hw.shape == r.shape, f"name: {name}, Shape mismatch: hw {hw.shape} != torch ref {r.shape}"
+            # if name == "LAYER0_PRE_NORM_DRAM":
+            #     print(f"hw result for {name} (bf16 from accelerator): {hw} dtype={hw.dtype}")
+            #     print(f"ref result for {name} (torch ref, bf16): {r} dtype={r.dtype}")
+            snr = calculate_snr(r, hw)
+            status = "PASS" if snr >= 19 else "FAIL"
+            if snr < 19:
+                all_pass = False
+            print(f"  {name}: SNR = {snr:.2f} dB [{status}]")
+        if all_pass:
+            print("All checks passed.")
+        else:
+            print("Some checks failed (SNR < 19 dB).")
+        return kv_cache
+
+    def torch_ref_check_decoder(self, layer_size: int, kv_cache: dict) -> None:
+        """
+        Torch ref for decoder: one step using kv_cache from prefill; consumes cache in flash
+        attention, then LM norm + LM head. Compares all layer-0 intermediates and outputs
+        with HW at same DRAM addrs (decoder writes 1 token to each buffer).
+        Uses self.prefill_seq so torch ref matches the same sequence as the HW run.
+        """
+        assert self.prefill_seq is not None, "prefill_seq is not set"
+        prefill_seq = self.prefill_seq
+        last_token_id = prefill_seq[-1]
+        ref = self._compute_torch_decoder(last_token_id, kv_cache, layer_size)
+
+        # HW decoder writes 1 token to base of each buffer; same names as prefill, 1-token shapes
+        tensor_specs = [
+            ("LAYER0_PRE_NORM_DRAM", (1, self.vector_length)),
+            ("LAYER0_Q_DRAM", (self.group_size, self.head_dim)),
+            ("LAYER0_K_DRAM", (1, self.head_dim)),
+            ("LAYER0_V_DRAM", (1, self.head_dim)),
+            ("LAYER0_K_NORM_DRAM", (1, self.head_dim)),
+            ("LAYER0_Q_NORM_DRAM", (self.group_size, self.head_dim)),
+            ("LAYER0_K_ROPE_DRAM", (1, self.head_dim)),
+            ("LAYER0_FLASH_Q_DRAM", (self.group_size, self.head_dim)),
+            ("LAYER0_FLASH_OUTPUT_DRAM", (self.group_size, self.head_dim)),
+            ("LAYER0_ATTN_PROJ_OUTPUT_DRAM", (1, self.vector_length)),
+            ("LAYER0_POST_ATTN_NORM_DRAM", (1, self.vector_length)),
+            ("LAYER0_POST_ATTN_RESIDUAL_DRAM", (1, self.vector_length)),
+            ("LAYER0_PRE_MLP_NORM_DRAM", (1, self.vector_length)),
+            ("LAYER0_MLP_GATE_DRAM", (1, self.mlp_elements)),
+            ("LAYER0_MLP_UP_DRAM", (1, self.mlp_elements)),
+            ("LAYER0_MLP_MULT_DRAM", (1, self.mlp_elements)),
+            ("LAYER0_MLP_DOWN_DRAM", (1, self.vector_length)),
+            ("LAYER0_POST_MLP_NORM_DRAM", (1, self.vector_length)),
+            ("LAYER0_OUTPUT_DRAM", (1, self.vector_length)),
+            ("OUTPUT_NORM_DRAM", (1, self.vector_length)),
+            ("LOGITS_DRAM", (1, self.EMBEDDING_ELEMENTS)),
+        ]
+
+        print("\n--- Torch ref vs hardware SNR check (decoder, 1 token, all tensors) ---")
+        all_pass = True        
+        for name, shape in tensor_specs:
+            if name not in ref:
+                continue
+            if name in ("OUTPUT_NORM_DRAM", "LOGITS_DRAM") and layer_size != self.LAYER_SIZE:
+                continue
+            addr = getattr(self, name, None)
+            if addr is None:
+                continue
+            if name == "LAYER0_V_DRAM":
+                addr = self.LAYER0_FLASH_V_DRAM
+            if name == "LAYER0_K_ROPE_DRAM":
+                addr = self.LAYER0_K_ROPE_DRAM + (layer_size - 1) * 512 * self.k_size + (self.seq_len - 1) * self.k_size
+            hw = self.dma_from_accelerator_memory(addr, shape)
+            r = ref[name]
+            assert hw.shape == r.shape, f"{name}: shape mismatch hw {hw.shape} != ref {r.shape}"
+            snr = calculate_snr(r, hw)
+            status = "PASS" if snr >= 19 else "FAIL"
+            if snr < 19:
+                all_pass = False
+            print(f"  {name}: SNR = {snr:.2f} dB [{status}]")
+        if all_pass:
+            print("All decoder checks passed.")
+        else:
+            print("Some decoder checks failed (SNR < 19 dB).")
+
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "kintex7":                       return 5.1594
+    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
+    return 10.0
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Generate pure-host Gemma3 checkpoint references.")
-    parser.add_argument("--layer-size", type=int, default=26, help="Number of layers to reference.")
-    parser.add_argument("--prompt", type=str, default=None, help="Prompt for prefill; default uses config tokens.")
-    parser.add_argument("--local-weights", action="store_true", help="Use gemma3_bin/full_model_weights.bin.")
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=os.path.join(SCRIPT_DIR, "gemma3_bin", "host_ref_checkpoints"),
-        help="Directory for host reference checkpoint .pt files.",
-    )
+    parser = argparse.ArgumentParser(description="Gemma3 layer-0 prefill: run on accelerator, verify with torch ref.")
+    parser.add_argument("--layer-size",type=int,default=26,help="Number of layers to compile and verify (default: 1)")
+    parser.add_argument("--prompt", type=str, default=None, help="User prompt for prefill; if not set, use config default_prefill_tokens")
+    parser.add_argument("--local-weights", action="store_true", help="Require existing gemma3_bin/params.bin (skip HF regeneration)")
+    parser.add_argument("--dual-engine", action="store_true", help="Use dual engine")
+    parser.add_argument('--dev', type=str, default='xdma0',help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
+    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     args = parser.parse_args()
 
-    ue = Gemma3_NumericEngine(local_weights=args.local_weights)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    gemma3_test.DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    gemma3_test.DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    gemma3_test.DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
+    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"Using DMA device: {effective_dma}")
+    print(f"  H2C: {gemma3_test.DMA_DEVICE_H2C}")
+    print(f"  C2H: {gemma3_test.DMA_DEVICE_C2H}")
+    print(f"  USER: {gemma3_test.DMA_DEVICE_USER}")
+
+    dual_engine = args.dual_engine
+    ue = Gemma3_NumericEngine(local_weights=args.local_weights, dual_engine=dual_engine)
     ue.set_prefill_seq(args.prompt)
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    print(f"Generating pure-host Gemma3 refs: layer_size={args.layer_size}")
-    print(f"Output dir: {args.output_dir}")
+    if dual_engine:
+        ue2 = Gemma3_NumericEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True)
+        ue2.set_prefill_seq(args.prompt)
 
-    prefill_ref, kv_cache = ue._compute_torch_prefill(ue.prefill_seq[:-1], args.layer_size)
-    decoder_ref, _ = ue._compute_torch_decoder(ue.prefill_seq[-1], kv_cache, args.layer_size)
+    print(f"\n--- Compiling prefill (layer_size={args.layer_size}) ---")
+    prefill_program_addr, flops_prefill = ue.compile_prefill(seq_len=len(ue.prefill_seq), layer_size=args.layer_size)
+    
+    if dual_engine:
+        print(f"\n--- Compiling prefill for dual engine (layer_size={args.layer_size}) ---")
+        prefill_program_addr2, flops_prefill2 = ue2.compile_prefill(seq_len=len(ue2.prefill_seq), layer_size=args.layer_size)
+        ue2.program_execute(prefill_program_addr2, timeout=0, flops=flops_prefill2)
 
-    manifest = {
-        "prompt_tokens": list(ue.prefill_seq),
-        "prefill_tokens": list(ue.prefill_seq[:-1]),
-        "decoder_token": int(ue.prefill_seq[-1]),
-        "layer_size": args.layer_size,
-        "weights_bin": ue._weights_bin_rel,
-        "prefill": _save_checkpoint_tensors(args.output_dir, "prefill", prefill_ref),
-        "decoder": _save_checkpoint_tensors(args.output_dir, "decoder", decoder_ref),
-    }
-    meta_path = os.path.join(args.output_dir, "metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(manifest, f, indent=2)
+    print(f"\n--- Running prefill ---")
+    timer=time.perf_counter()
+    latency_prefill, _ = ue.run_prefill(prefill_program_addr, flops=flops_prefill)
+    print(f"Prefill done in {(time.perf_counter() - timer):.2f} seconds.")
+    if dual_engine:
+        print(f"Dual engine prefill gflops: {((flops_prefill + flops_prefill2) / (latency_prefill * 1e3)):.2f} GFLOPS")
 
-    print(f"Saved {len(prefill_ref)} prefill checkpoints and {len(decoder_ref)} decoder checkpoints.")
-    print(f"Metadata: {meta_path}")
+    print(f"\n--- Torch ref check ---")
+    kv_cache = ue.torch_ref_check_prefill(layer_size=args.layer_size)
+
+    # generate_trace(ue, f"gemma3_prefill_trace.csv", clock_period_ns=args.cycle)
+
+    print(f"\n--- Compiling decoder (.bin file)---")
+    timer_dec = time.perf_counter()
+    decoder_bin_path, decoder_program_sizes, flops_per_token = ue.compile_decoder(layer_size=args.layer_size)
+    print(f"Decoder compile done in {time.perf_counter() - timer_dec:.2f} seconds.")
+    decoder_base_addr, _ = ue.load_program_instructions_from_file(decoder_bin_path)
+
+    print(f"\n--- Running decoder ---")
+    ue.MAX_CONTEXT_SIZE = len(ue.prefill_seq)
+    timer=time.perf_counter()
+    token_cnt_decoded, latency_hw_decoder, flop_rate_hw_decoder = ue.run_decoder(decoder_program_sizes, decoder_base_addr, token_id=ue.prefill_seq[-1], flops_per_token=flops_per_token)
+    print(f"\nDecoder done in {(time.perf_counter() - timer):.2f} seconds.")
+    print(f"hw decoder latency: {latency_hw_decoder / 1e6:.2f} seconds, gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} GFLOPS, token/s: {(token_cnt_decoded - len(ue.prefill_seq) + 1) / (time.perf_counter() - timer):.2f}, total {token_cnt_decoded} tokens")
+
+    print(f"\n--- Torch ref check decoder ---")
+    ue.torch_ref_check_decoder(layer_size=args.layer_size, kv_cache=kv_cache)
+
+    print("Gemma3 numeric verification done.")
 
 
 if __name__ == "__main__":
