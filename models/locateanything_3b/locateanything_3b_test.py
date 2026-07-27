@@ -3790,19 +3790,15 @@ def main():
                          "output and print a quant-fidelity comparison at the very bottom")
     args = ap.parse_args()
 
-    profile = set_dma_device(args.device, dma_device=args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-    axi_width_bits = profile.get("axi_data_width_bits")
-    if axi_width_bits is not None:
-        os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-        user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else profile.get("clock_period_ns")
+    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else None)
     if clock is not None:
         user_dma_core.CLOCK_CYCLE_TIME_NS = clock
         user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
-    print(f"FPGA profile: device={profile['device']}, clock={user_dma_core.CLOCK_CYCLE_TIME_NS:.4f} ns, UE_AXI_DATA_WIDTH_BITS={user_dma_core.UE_AXI_DATA_WIDTH_BITS}")
+    effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
+    print(f"FPGA profile: device={args.device}, clock={user_dma_core.CLOCK_CYCLE_TIME_NS:.4f} ns, UE_AXI_DATA_WIDTH_BITS={user_dma_core.UE_AXI_DATA_WIDTH_BITS}")
     print(f"DMA/DRAM: device={effective_dma}, H2C={user_dma_core.DMA_DEVICE_H2C}, C2H={user_dma_core.DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}, BASE=0x{user_dma_core.UE_0_BASE_ADDR:08x}, start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}, end=0x{user_dma_core.DRAM_END_ADDR:08x}")
 
     # ==================================================================

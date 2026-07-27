@@ -9287,20 +9287,19 @@ defaults (sample files in repo-root test_samples/):
     if args.fpga_encoder:
         os.environ["GEMMA4_FPGA_AUDIO_FEATURES"] = "1"
 
-    profile = set_dma_device(args.device, dma_device=args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    clock = args.cycle if args.cycle is not None else (profile.get("clock_period_ns") or 5.62)
+    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    axi_width_bits = profile.get("axi_data_width_bits")
-    if axi_width_bits is not None:
-        os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-        user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={user_dma_core.UE_AXI_DATA_WIDTH_BITS}")
-    effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
-    print(f"DMA/DRAM: device={effective_dma}, H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, BASE=0x{user_dma_core.UE_0_BASE_ADDR:08x}, start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}")
+    effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
+    print(f"Using DMA device: {effective_dma}")
+    print(f"  H2C: {DMA_DEVICE_H2C}")
+    print(f"  C2H: {DMA_DEVICE_C2H}")
+    print(f"  USER: {DMA_DEVICE_USER}")
+    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     # --- Resolve modality and input path -----------------------------------
     # The script has three modes: LM (text only), VLM (image + text),

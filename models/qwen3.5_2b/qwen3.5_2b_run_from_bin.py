@@ -84,8 +84,8 @@ def main():
                     help="Clock cycle time in ns. Defaults to board profile value.")
     args = ap.parse_args()
 
-    profile = T.configure_q35_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
-    T.print_q35_profile(args.device, profile)
+    T.configure_q35_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
+    T.print_q35_profile(args.device)
 
     vision_on = bool(args.image) or args.vision_enable
     _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))

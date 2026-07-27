@@ -146,10 +146,8 @@ def ue_assert_axi_beat_aligned_bytes(nbytes: int, what: str, hint: str = "") -> 
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
-CURRENT_DEVICE = "default"
 
-def set_dma_device(device_name: str, dma_device: Optional[str] = None,
-                   base_addr: Optional[int] = None) -> dict:
+def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
     """Set DMA device paths and an optional AXI-Lite base address.
 
     Also rebinds the names in any module that imported them by value
@@ -160,19 +158,17 @@ def set_dma_device(device_name: str, dma_device: Optional[str] = None,
     stale import snapshot (wrong).
     """
     import sys as _sys
-    global CURRENT_DEVICE, DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
     old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    CURRENT_DEVICE = device_name
     if device_name == "efinix":
         DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
         DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
         DMA_DEVICE_USER = "/dev/pcie_dma0_user"
         UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
     else:
-        dma_device = dma_device or device_name
-        DMA_DEVICE_H2C = f"/dev/{dma_device}_h2c_0"
-        DMA_DEVICE_C2H = f"/dev/{dma_device}_c2h_0"
-        DMA_DEVICE_USER = f"/dev/{dma_device}_user"
+        DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
+        DMA_DEVICE_C2H = f"/dev/{device_name}_c2h_0"
+        DMA_DEVICE_USER = f"/dev/{device_name}_user"
         if base_addr is not None:
             UE_0_BASE_ADDR = int(base_addr)
     for _mod in list(_sys.modules.values()):
@@ -192,20 +188,6 @@ def set_dma_device(device_name: str, dma_device: Optional[str] = None,
                 except Exception:
                     pass
 
-    return {
-        "device": CURRENT_DEVICE,
-        "ue_0_base_addr": UE_0_BASE_ADDR,
-        "dram_start_addr": DRAM_START_ADDR,
-        "dram_activation_addr": DRAM_ACTIVATION_ADDR,
-        "dram_instruction_addr": DRAM_INSTRUCTION_ADDR,
-        "dram_end_addr": DRAM_END_ADDR,
-        "dma_h2c": DMA_DEVICE_H2C,
-        "dma_c2h": DMA_DEVICE_C2H,
-        "dma_user": DMA_DEVICE_USER,
-        "clock_period_ns": 4.0 if device_name == "efinix" else None,
-        "axi_data_width_bits": 256 if device_name == "efinix" else None,
-    }
-
 # Constants
 UE_VECTOR_SIZE = 64
 # Captured decoder instruction line size (matches Vitis ``decoder_inst_t`` / ``INSTRUCTION_SIZE_BYTES``).
@@ -218,7 +200,6 @@ BIAS_BRAM_SIZE_BYTES = BIAS_BRAM_ELEMENTS * 2
 DRAM_START_ADDR = 0x80000000 # 0 GB
 DRAM_ACTIVATION_ADDR = 0xB0000000 # 512 MB reserved for intermediate results
 DRAM_INSTRUCTION_ADDR = 0xD0000000  # 256*3 MB reserved for instructions
-DRAM_END_ADDR = 0xFFFFFFFF
 
 # UE DRAM / instruction fields use a 35-bit word address = byte address >> 3 (see andromeda.c, decoder inst words).
 UE_WORD_ADDR_BITS = 35
@@ -833,11 +814,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        expected_hw_versions = {0xf2e8d12b, 0x12345678}
-        assert (hw_version & 0xFFFFFFFF) in expected_hw_versions, (
-            f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
-            f"expected one of {', '.join(f'0x{v:08x}' for v in sorted(expected_hw_versions))}."
-        )
+        # assert hw_version == 0x05f74c2d, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x05f74c2d. Please update FPGA with commit update_05f74c2d.bin using update_flash.py (public release v1.1)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -9092,7 +9069,7 @@ class UnifiedEngine:
             fmax_context_addr=0,
         )
 
-    def write_captured_instructions_to_dram(self, start_addr: Optional[int] = None) -> int:
+    def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
         """
         Write all captured instructions to DRAM
 

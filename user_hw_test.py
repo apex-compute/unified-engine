@@ -5659,7 +5659,7 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='kintex7',
                         help='FPGA type')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
-                        help='AXI-Lite register base address. Default is device-specific.')
+                        help='AXI-Lite register base address (default: device-specific).')
     parser.add_argument(
         '--ext',
         action='store_true',
@@ -5668,20 +5668,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     import user_dma_core
-    profile = set_dma_device(args.device, dma_device=args.dev, base_addr=args.base_addr)
-    globals()["DMA_DEVICE_H2C"] = user_dma_core.DMA_DEVICE_H2C
-    globals()["DMA_DEVICE_C2H"] = user_dma_core.DMA_DEVICE_C2H
-    globals()["DMA_DEVICE_USER"] = user_dma_core.DMA_DEVICE_USER
-    globals()["DRAM_ACTIVATION_ADDR"] = user_dma_core.DRAM_ACTIVATION_ADDR
-    globals()["DRAM_INSTRUCTION_ADDR"] = user_dma_core.DRAM_INSTRUCTION_ADDR
-    print(f"DMA dev={args.dev}, device={profile['device']}"
+    set_dma_device("efinix" if args.device == "efinix" else args.dev, base_addr=args.base_addr)
+    print(f"DMA dev={args.dev}"
           f" (H2C={user_dma_core.DMA_DEVICE_H2C},"
           f" C2H={user_dma_core.DMA_DEVICE_C2H},"
           f" USER={user_dma_core.DMA_DEVICE_USER}),"
-          f" base=0x{user_dma_core.UE_0_BASE_ADDR:08x},"
-          f" dram=[0x{user_dma_core.DRAM_START_ADDR:08x},"
-          f" act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x},"
-          f" inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}]")
+          f" base=0x{user_dma_core.UE_0_BASE_ADDR:08x}")
 
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)

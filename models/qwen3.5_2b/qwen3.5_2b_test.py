@@ -99,29 +99,26 @@ def _clock_ns_default_for_device(device: str) -> float:
 
 
 def configure_q35_runtime(device: str, dma_device: str | None = None,
-                          cycle: float | None = None) -> dict:
+                          cycle: float | None = None) -> None:
     """Configure board profile and this model's DRAM layout."""
-    profile = set_dma_device(device, dma_device=dma_device)
+    set_dma_device("efinix" if device == "efinix" else (dma_device or device))
     _set_dram_layout_for_device(device)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = profile.get("axi_data_width_bits") or (512 if device in ("bittware", "rk") else 256)
+    axi_width_bits = 512 if device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = cycle if cycle is not None else (profile.get("clock_period_ns") or _clock_ns_default_for_device(device))
+    clock = cycle if cycle is not None else _clock_ns_default_for_device(device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    profile["clock_period_ns"] = clock
-    profile["axi_data_width_bits"] = axi_width_bits
-    return profile
 
 
-def print_q35_profile(device: str, profile: dict) -> None:
-    print(f"FPGA profile: device={device}, clock={profile['clock_period_ns']:.4f} ns, "
-          f"UE_AXI_DATA_WIDTH_BITS={profile['axi_data_width_bits']}", flush=True)
-    print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, BASE=0x{profile['ue_0_base_addr']:08X}, params=0x{Q35_PARAMS_BASE:08X}, tensor=0x{Q35_TENSOR_BASE:08X}, program=0x{Q35_PROGRAM_BASE:08X}, end=0x{profile['dram_end_addr']:08X}", flush=True)
+def print_q35_profile(device: str) -> None:
+    print(f"FPGA profile: device={device}, clock={user_dma_core.CLOCK_CYCLE_TIME_NS:.4f} ns, "
+          f"UE_AXI_DATA_WIDTH_BITS={user_dma_core.UE_AXI_DATA_WIDTH_BITS}", flush=True)
+    print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, BASE=0x{user_dma_core.UE_0_BASE_ADDR:08X}, params=0x{Q35_PARAMS_BASE:08X}, tensor=0x{Q35_TENSOR_BASE:08X}, program=0x{Q35_PROGRAM_BASE:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}", flush=True)
 
 
 # ============================================================================
@@ -4720,8 +4717,8 @@ def main():
                          "--image.")
     args = ap.parse_args()
 
-    profile = configure_q35_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
-    print_q35_profile(args.device, profile)
+    configure_q35_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
+    print_q35_profile(args.device)
 
     # Hard-coded inference settings (formerly CLI flags, now defaults).
     # 512 (not 256) so the default VLM run fits: an image adds ~144 vision tokens,
