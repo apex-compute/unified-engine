@@ -5658,9 +5658,8 @@ if __name__ == "__main__":
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--device', type=str, default='kintex7',
                         help='FPGA type')
-    parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=0x02000000,
-                        help='AXI-Lite register base address (default: 0x02000000). '
-                             'Try 0x0 if register read hangs after bitstream update.')
+    parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
+                        help='AXI-Lite register base address (default: device-specific).')
     parser.add_argument(
         '--ext',
         action='store_true',
@@ -5668,16 +5667,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Set DMA device paths based on device name and force-sync every module
-    # that may hold a copied device-path global.
-    set_dma_device(args.dev)
     import user_dma_core
-    user_dma_core.UE_0_BASE_ADDR = args.base_addr
+    set_dma_device("efinix" if args.device == "efinix" else args.dev, base_addr=args.base_addr)
     print(f"DMA dev={args.dev}"
           f" (H2C={user_dma_core.DMA_DEVICE_H2C},"
           f" C2H={user_dma_core.DMA_DEVICE_C2H},"
           f" USER={user_dma_core.DMA_DEVICE_USER}),"
-          f" base=0x{args.base_addr:08x}")
+          f" base=0x{user_dma_core.UE_0_BASE_ADDR:08x}")
 
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
@@ -5713,6 +5709,8 @@ if __name__ == "__main__":
         clock = 3.3333
     elif args.device == "alveo":
         clock = 1000 / 225
+    elif args.device == "efinix":
+        clock = 4.0
     else:
         clock = 10
 
