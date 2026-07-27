@@ -225,15 +225,12 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         clean (zeroed) DRAM regardless of what the previous run left behind.
         Temporary mitigation until the read-before-write gap is found and fixed.
         """
-        start = self._params_dram_base
-        # Only clear the SmolVLM2 working layout. Avoid sweeping the whole 4GB
-        # Efinix aperture up to 0xffffffff, which can hang on top-of-DRAM DMA.
-        end = min(user_dma_core.DRAM_END_ADDR, self._program_dram_base + 0x10000000 - 1)
-        total = end - start + 1
+        start = user_dma_core.DRAM_START_ADDR
+        total = 0xFFFFFFFF - start + 1
         zeros = b"\x00" * chunk_size_bytes
         offset = 0
         bar_width = 40
-        _original_print(f"Zeroing DRAM [{hex(start)}..{hex(end)}] ({total / 1024**3:.2f} GB)")
+        _original_print(f"Zeroing DRAM [{hex(start)}..0xffffffff] ({total / 1024**3:.2f} GB)")
         while offset < total:
             n = min(chunk_size_bytes, total - offset)
             self.dma_write(DMA_DEVICE_H2C, start + offset, zeros[:n], n)

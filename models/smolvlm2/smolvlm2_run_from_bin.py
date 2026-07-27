@@ -217,11 +217,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         smolvlm2_test.zero_dram). The base clear_dram() fills 0xFF (NaN in bf16), which poisons any
         region read-before-write on the NEXT run — back-to-back runs then emit garbage / endoftext.
         run_from_bin calls this at the END of main() so consecutive load-only runs each start clean."""
-        start = self._params_dram_base
-        # Only clear the SmolVLM2 working layout. Avoid sweeping the whole 4GB
-        # Efinix aperture up to 0xffffffff, which can hang on top-of-DRAM DMA.
-        end = min(user_dma_core.DRAM_END_ADDR, self._program_dram_base + 0x10000000 - 1)
-        total = end - start + 1
+        start = user_dma_core.DRAM_START_ADDR
+        total = 0xFFFFFFFF - start + 1
         zeros = b"\x00" * chunk_size_bytes
         offset = 0
         while offset < total:

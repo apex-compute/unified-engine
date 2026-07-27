@@ -161,7 +161,10 @@ def set_dma_device(device_name: str, dma_device: Optional[str] = None,
     """
     import sys as _sys
     global CURRENT_DEVICE, DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
+<<<<<<< HEAD
     global DRAM_START_ADDR, DRAM_ACTIVATION_ADDR, DRAM_INSTRUCTION_ADDR, DRAM_END_ADDR
+=======
+>>>>>>> eee14a0 (More clean-ups)
     old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     CURRENT_DEVICE = device_name
     if device_name == "efinix":
@@ -169,10 +172,13 @@ def set_dma_device(device_name: str, dma_device: Optional[str] = None,
         DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
         DMA_DEVICE_USER = "/dev/pcie_dma0_user"
         UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
+<<<<<<< HEAD
         DRAM_START_ADDR = 0x00000000
         DRAM_ACTIVATION_ADDR = 0xB0000000
         DRAM_INSTRUCTION_ADDR = 0xD0000000
         DRAM_END_ADDR = 0xFFFFFFFF
+=======
+>>>>>>> eee14a0 (More clean-ups)
     else:
         dma_device = dma_device or device_name
         DMA_DEVICE_H2C = f"/dev/{dma_device}_h2c_0"
@@ -180,10 +186,13 @@ def set_dma_device(device_name: str, dma_device: Optional[str] = None,
         DMA_DEVICE_USER = f"/dev/{dma_device}_user"
         if base_addr is not None:
             UE_0_BASE_ADDR = int(base_addr)
+<<<<<<< HEAD
         DRAM_START_ADDR = 0x80000000
         DRAM_ACTIVATION_ADDR = 0xB0000000
         DRAM_INSTRUCTION_ADDR = 0xD0000000
         DRAM_END_ADDR = 0xFFFFFFFF
+=======
+>>>>>>> eee14a0 (More clean-ups)
     for _mod in list(_sys.modules.values()):
         if _mod is None or _mod is _sys.modules[__name__]:
             continue
@@ -568,9 +577,9 @@ class UnifiedEngine:
     def __init__(self,
                  BASE_ADDR: Optional[int] = None,
                  device: str = 'cpu',
-                 params_dram_base: Optional[int] = None,
-                 program_dram_base: Optional[int] = None,
-                 tensor_dram_base: Optional[int] = None,
+                 params_dram_base: int = DRAM_START_ADDR,
+                 program_dram_base: int = DRAM_INSTRUCTION_ADDR,
+                 tensor_dram_base: int = DRAM_ACTIVATION_ADDR,
                  clock_period_ns: float = None,
                  device_name: Optional[str] = None):
         self.device = device
@@ -584,12 +593,6 @@ class UnifiedEngine:
         self.user_device = DMA_DEVICE_USER
         if BASE_ADDR is None:
             BASE_ADDR = UE_0_BASE_ADDR
-        if params_dram_base is None:
-            params_dram_base = DRAM_START_ADDR
-        if program_dram_base is None:
-            program_dram_base = DRAM_INSTRUCTION_ADDR
-        if tensor_dram_base is None:
-            tensor_dram_base = DRAM_ACTIVATION_ADDR
 
         # Hardware state (no simulation - uses actual DMA)
         # Note: DRAM/URAM/BRAM are accessed via DMA, not stored locally
@@ -8078,11 +8081,11 @@ class UnifiedEngine:
         print(f"Capture stopped. Total instructions captured: {self.capture_count}, size: {self.capture_count * 32} bytes")
 
     def clear_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
-        dram_total_bytes = DRAM_END_ADDR - DRAM_START_ADDR + 1
+        dram_total_bytes = 0xffffffff - DRAM_START_ADDR + 1
         fill = b'\xff' * chunk_size_bytes
         offset = 0
         bar_width = 40
-        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..{hex(DRAM_END_ADDR)}] ({dram_total_bytes / 1024**3:.2f} GB)")
+        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..0xffffffff] ({dram_total_bytes / 1024**3:.2f} GB)")
         while offset < dram_total_bytes:
             write_size = min(chunk_size_bytes, dram_total_bytes - offset)
             self.dma_write(DMA_DEVICE_H2C, DRAM_START_ADDR + offset, fill[:write_size], write_size)
@@ -9117,9 +9120,6 @@ class UnifiedEngine:
         Returns:
             Number of bytes written, or -1 on error
         """
-        if start_addr is None:
-            start_addr = DRAM_INSTRUCTION_ADDR
-
         if not self.capture_buffer:
             print("Warning: No captured instructions to write. Capture buffer is empty.")
             return 0
@@ -9154,7 +9154,7 @@ class UnifiedEngine:
 
         return bytes_written
 
-    def start_execute_from_dram(self, instruction_addr: Optional[int] = None):
+    def start_execute_from_dram(self, instruction_addr: int = DRAM_INSTRUCTION_ADDR):
         """
         Start executing instructions from DRAM
 
@@ -9166,15 +9166,11 @@ class UnifiedEngine:
             instruction_addr: DRAM address where instructions are stored
                             (default: DRAM_INSTRUCTION_ADDR)
         """
-        if instruction_addr is None:
-            instruction_addr = DRAM_INSTRUCTION_ADDR
         self.write_reg32(UE_INSTRUCTION_ADDR, ue_35bit_addr_shifter(instruction_addr))
 
-    def program_execute(self, program_start_addr: Optional[int] = None, timeout: float = 50.0, flops: float = None) -> None:
+    def program_execute(self, program_start_addr: int = DRAM_INSTRUCTION_ADDR, timeout: float = 50.0, flops: float = None) -> None:
         """Execute compiled program from DRAM instruction memory.
         """
-        if program_start_addr is None:
-            program_start_addr = DRAM_INSTRUCTION_ADDR
         print(f"Execute program start at 0x{program_start_addr:X}")
         self.start_execute_from_dram(program_start_addr)
         latency, flop_rate_program = 0, 0

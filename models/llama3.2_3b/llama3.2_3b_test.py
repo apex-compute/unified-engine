@@ -1310,6 +1310,7 @@ def main():
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+<<<<<<< HEAD
     if args.local_weights:
         weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
     else:
@@ -1318,6 +1319,8 @@ def main():
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
+=======
+>>>>>>> eee14a0 (More clean-ups)
     profile = set_dma_device(args.device, dma_device=args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
@@ -1336,6 +1339,16 @@ def main():
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
+<<<<<<< HEAD
+=======
+    if args.local_weights:
+        weights_bin_rel = "llama3.2_3b_bin/full_model_weights.bin"
+    else:
+        weights_bin_rel = "llama3.2_3b_bin/params.bin"
+        weights_bin_full = os.path.join(script_dir, weights_bin_rel)
+        if not os.path.exists(weights_bin_full):
+            weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
+>>>>>>> eee14a0 (More clean-ups)
 
     ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)

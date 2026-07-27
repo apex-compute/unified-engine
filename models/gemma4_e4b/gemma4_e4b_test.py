@@ -43,7 +43,6 @@ import json
 import math
 import os
 import sys
-import gc
 
 # This file's folder: gemma4_e4b_bin/, *.json, decoder_program.json live here. user_dma_core is two levels up (repo root).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,7 +104,7 @@ DEFAULT_AUDIO = os.path.join(_TEST_SAMPLES, "apex.wav")
 #            LALU_CLAMP_RELU_A/B globals, which the matmul path no longer reads —
 #            a silent no-op that left every vision clamp at ReLU(0,+inf). Real
 #            clamp bounds now emitted → different LALU config bytes, rebuild.
-INSTRUCTION_BIN_COMPILE_VERSION = "v6-prefill-kv-norm"
+INSTRUCTION_BIN_COMPILE_VERSION = "v3-clampfix"
 
 # We run on FPGA + CPU only; disable CUDA before importing torch so PyTorch
 # doesn't probe the GPU driver (avoids a noisy "Error 804: forward compatibility"
@@ -525,38 +524,28 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
     write_at(weight_defs["LM_HEAD_WEIGHT_DATA"], data_padded)
 
-    # Build vision/audio only when explicitly disabled. Keeping the full bin is
-    # now valid for Efinix too because the profile exposes the full 4 GB window.
-    lm_only_weights = os.environ.get("GEMMA4_LM_ONLY_WEIGHTS") == "1"
-
-    # Build vision/audio + host side-cache bytes in memory (no separate files).
+    # Build vision + host side-cache bytes in memory (no separate files).
     # We concatenate everything below into ONE weights bin:
-    #   [LM | vision | audio | host]
+    #   [LM | vision | host]
     # plus a single master manifest JSON that holds section offsets and the
     # sub-manifests (per-tensor offsets relative to each section's start).
     # Two binary files total — programs.bin and params.bin —
     # matching the "one instruction bin, one weight bin" design.
-    if lm_only_weights:
-        vision_bytes, vision_manifest = b"", {"sections": {}, "lm_only_omitted": True}
-        audio_bytes,  audio_manifest  = b"", {"sections": {}, "lm_only_omitted": True}
-    else:
-        vision_bytes, vision_manifest = _build_vision_section_bytes(model)
-        audio_bytes,  audio_manifest  = _build_audio_section_bytes(model)
+    vision_bytes, vision_manifest = _build_vision_section_bytes(model)
+    audio_bytes,  audio_manifest  = _build_audio_section_bytes(model)
+    host_bytes,   host_manifest   = _build_host_section_bytes(text_model, cfg)
 
     lm_size     = len(buf)
     vision_size = len(vision_bytes)
     audio_size  = len(audio_bytes)
+    host_size   = len(host_bytes)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(buf)
-        del buf
-        gc.collect()
         f.write(vision_bytes)
-        del vision_bytes
         f.write(audio_bytes)
-        del audio_bytes
-        host_size, host_manifest = _write_host_section_stream(f, text_model, cfg)
+        f.write(host_bytes)
     total = lm_size + vision_size + audio_size + host_size
     print(f"Generated weights bin: {out_path} ({total/1024**3:.2f} GiB total; "
           f"LM {lm_size/1024**3:.2f} GiB + vision {vision_size/1024**2:.1f} MiB + "
@@ -982,81 +971,12 @@ def _build_host_section_bytes(text_model, cfg) -> tuple[bytes, dict]:
     return out, manifest
 
 
-def _write_host_section_stream(f, text_model, cfg) -> tuple[int, dict]:
-    """Stream host-side tensors directly to params.bin.
-
-    E4B's embed_tokens_per_layer section is larger than 5 GiB. Returning it
-    as a bytes object doubles peak RSS during first-run weight generation and
-    can trigger the OOM killer. Keep the manifest layout identical to
-    _build_host_section_bytes, but only hold one chunk at a time.
-    """
-    file_info = cfg["file_info"]
-    num_layers = file_info["num_layers"]
-    per_layer_input_dim = file_info["per_layer_input_dim"]
-
-    src = text_model.embed_tokens_per_layer.weight.detach().cpu().to(torch.bfloat16)
-    per_layer_embed_scale = per_layer_input_dim ** 0.5
-    embed_off = 0
-    chunk = 8192
-    for i in range(0, src.shape[0], chunk):
-        chunk_bf16 = (src[i:i+chunk].float() * per_layer_embed_scale).to(torch.bfloat16).contiguous()
-        f.write(chunk_bf16.view(torch.uint8).numpy().tobytes())
-        del chunk_bf16
-    embed_size = src.numel() * 2
-    embed_shape = list(src.shape)
-    del src
-    gc.collect()
-
-    proj_off = embed_off + embed_size
-    proj_bf16 = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16).contiguous()
-    f.write(proj_bf16.view(torch.uint8).numpy().tobytes())
-    proj_size = proj_bf16.numel() * 2
-    proj_shape = list(proj_bf16.shape)
-
-    norm_off = proj_off + proj_size
-    norm_bf16 = text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).contiguous()
-    f.write(norm_bf16.view(torch.uint8).numpy().tobytes())
-    norm_size = norm_bf16.numel() * 2
-    norm_shape = list(norm_bf16.shape)
-
-    layer_scalars = []
-    kv_shared_map: dict[int, int] = {}
-    last_layer_by_type: dict[str, int] = {}
-    for layer_idx in range(num_layers):
-        layer = text_model.layers[layer_idx]
-        layer_scalars.append(float(layer.layer_scalar.item()))
-        attn = layer.self_attn
-        if attn.is_kv_shared_layer:
-            kv_shared_map[layer_idx] = last_layer_by_type[attn.layer_type]
-        else:
-            last_layer_by_type[attn.layer_type] = layer_idx
-
-    total = norm_off + norm_size
-    manifest = {
-        "embed_tokens_per_layer": {"offset": embed_off, "size": embed_size, "shape": embed_shape},
-        "per_layer_model_proj":   {"offset": proj_off,  "size": proj_size,  "shape": proj_shape},
-        "per_layer_proj_norm":    {"offset": norm_off,  "size": norm_size,  "shape": norm_shape},
-        "layer_scalars": layer_scalars,
-        "kv_shared_map": {str(k): v for k, v in kv_shared_map.items()},
-    }
-    del proj_bf16, norm_bf16
-    gc.collect()
-    print(f"  Host section: {total/1024**3:.2f} GiB, 3 tensors + scalars + kv_shared_map")
-    return total, manifest
-
-
 def _ensure_hf_model(script_dir: str, cfg: dict):
     """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
     hf_repo = cfg["paths"]["hf_model_repo"]
     config_path = os.path.join(model_dir, "config.json")
-    has_weights = os.path.isdir(model_dir) and any(
-        name.endswith(".safetensors")
-        or name == "pytorch_model.bin"
-        or (name.startswith("pytorch_model-") and name.endswith(".bin"))
-        for name in os.listdir(model_dir)
-    )
-    if not os.path.exists(config_path) or not has_weights:
+    if not os.path.exists(config_path):
         _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
         snapshot_download(repo_id=hf_repo, local_dir=model_dir)
         _original_print("Download complete.")
@@ -6820,7 +6740,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # Uses max head_dim (512) = self.k_size for uniform sizing
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size)
-        zero_pad = torch.zeros(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.num_key_value_heads * self.head_dim, dtype=torch.bfloat16)
+        zero_pad = torch.zeros(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_pad)
         # Allocate memory for constant zero tensor, identity matrix, and bias:
@@ -6833,7 +6753,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        zero_pad = torch.zeros(prefill_aligned_seq_len * self.head_dim, dtype=torch.bfloat16)
+        zero_pad = torch.zeros(prefill_aligned_seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_pad)
@@ -7155,7 +7075,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         E4B GQA: num_attn=8, num_kv=2, gs_per_kv = num_attn // num_kv = 4.
         """
-        template_seq_len = int(seq_len)
+        template_seq_len = int(self._cfg["model"].get(
+            "prefill_max_seq_len",
+            self._cfg["model"].get("max_prefill_seq_len",
+                                    self._cfg["model"]["max_context_size"])))
         seq_len = template_seq_len
         self.seq_len = seq_len
         num_attn  = self.num_attention_heads
@@ -7304,7 +7227,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     # K norm covers all num_kv heads per token (M = seq*num_kv).
                     total_flops += self.rms_norm_core_dram(M=seq_len * num_kv, N=cur_head_dim, A_DRAM_ADDR=self.LAYER0_K_DRAM,
                                     OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off,
-                                    gpr_M_reg=self.gpr_kv_nvec)
+                                    gpr_M_reg=self.gpr_seq_len)
                 if rope_n == cur_head_dim:
                     if non_shared:
                         total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=num_kv, N=rope_n,
@@ -7362,7 +7285,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 # back-to-back-call degradation noted for the legacy subroutine
                 # doesn't apply here).
                 attn_result = self.unified_attention_core(
-                    batch=aligned_seq_len,
+                    batch=q_seq_len,
                     aligned_seq_len=aligned_seq_len,
                     head_dim=cur_head_dim,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
@@ -7665,18 +7588,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         print(f"[Prefill] uploading embeddings to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
 
-        # Compute per-layer inputs on host and DMA to FPGA. The compiled
-        # prefill uses the template length as the per-layer stride in
-        # PER_LAYER_INPUTS_DRAM, so upload a stride-padded [layer, template,
-        # dim] layout even when the actual prompt is shorter.
+        # Compute per-layer inputs on host and DMA to FPGA
         print(f"[Prefill] [host] computing per-layer inputs ({seq_len} tokens x {self.LAYER_SIZE} layers)...", flush=True)
         per_layer_inputs = self._compute_per_layer_inputs(prefill_seq, embedding_tensor)  # [seq_len, 35, 256]
-        prefill_template_len = int(getattr(self, "_active_prefill_template_len", self.max_prefill_seq_len))
-        per_layer_inputs_flat = torch.zeros(
-            (self.LAYER_SIZE, prefill_template_len, self.per_layer_input_dim),
-            dtype=per_layer_inputs.dtype,
-        )
-        per_layer_inputs_flat[:, :seq_len, :] = per_layer_inputs.permute(1, 0, 2)
+        # Permute to [35, seq_len, 256] so each layer's data is contiguous in DRAM
+        per_layer_inputs_flat = per_layer_inputs.permute(1, 0, 2).contiguous()  # [35, seq_len, 256]
         print(f"[Prefill] uploading per-layer inputs to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(self.PER_LAYER_INPUTS_DRAM, per_layer_inputs_flat)
 
@@ -7805,7 +7721,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # in run_decoder).
         self._isa_add_set_core(self.gpr_seq_len,    seq_len)
         self._isa_add_set_core(self.gpr_q_seq_len,  q_seq_len)
-        self._isa_add_set_core(self.gpr_kv_nvec,    seq_len * self.num_key_value_heads)
         self._isa_add_set_core(self.gpr_aligned_seq_len, aligned_seq_len)
 
         print(f"[Prefill] [exec] launching prefill program on FPGA ({seq_len} tokens, {self.LAYER_SIZE} layers)...", flush=True)
@@ -8676,37 +8591,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
               + (" (+audio)"  if manifest.get("contains_audio") else ""))
         return manifest
 
-    def compile_actual_prefill_to_dram(self, actual_seq_len: int) -> tuple[int, int]:
-        """Compile a prompt-length prefill program into program DRAM.
-
-        E4B's template-padded prefill is useful for reusable bins, but long
-        padding can drift the 42-layer hidden state. For LM-only Efinix runs,
-        compile the small actual-length prefill after tokenization and reuse
-        the cached decoder from programs.bin.
-        """
-        if actual_seq_len < 1:
-            raise ValueError(f"actual_seq_len must be positive, got {actual_seq_len}")
-        global _SILENT_MODE
-        old_silent = _SILENT_MODE
-        _SILENT_MODE = True
-        self.clear_inst_id()
-        self.clear_capture_buffer()
-        self.start_capture()
-        self.generate_instruction_flag_clear()
-        program_base = self.get_program_dram_addr()
-        prefill_count_at_start = self.capture_count
-        prefill_addr = program_base + prefill_count_at_start * user_dma_core.INSTRUCTION_SIZE_BYTES
-        _original_print(f"[dyn-prefill] compiling actual-length prefill: seq_len={actual_seq_len}, addr=0x{prefill_addr:X}")
-        try:
-            _, flops = self.compile_prefill(seq_len=actual_seq_len, layer_size=self.LAYER_SIZE)
-            self.stop_capture()
-            self.write_captured_instructions_to_dram(program_base)
-            self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        finally:
-            self.clear_capture_buffer()
-            _SILENT_MODE = old_silent
-        return prefill_addr, flops
-
     # ------------------------------------------------------------------
     # LEGACY (commented out 2026-05-21):
     # Incremental vision extension. Folded into single-pass
@@ -8974,8 +8858,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # produces the same DRAM state the LM ISA expects. Idempotent for
         # LM-only-bin runs (just a few small DMAs).
         # ------------------------------------------------------------------
-        if os.environ.get("GEMMA4_PREFILL_SOFTWARE_RESET") == "1":
-            self.software_reset()  # opt-in: can clobber params DRAM on Efinix
+        self.software_reset()  # clear stuck queue state from any prior failing run
         from user_dma_core import UE_VECTOR_SIZE as _UE_VS
         # Zero ENTIRE K/V cache (0..MAX_CONTEXT_SIZE). Prefill overwrites
         # positions 0..prefill_max-1 with K/V data; positions prefill_max..
@@ -9016,25 +8899,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                        torch.eye(_UE_VS, dtype=torch.bfloat16))
         print(f"[dyn-prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
 
-        self._active_prefill_template_len = prefill_max
         self.seq_len = run_seq_len
         latency, flop_rate = self.run_prefill(prefill_program_addr,
                                               prefill_seq=padded_seq,
                                               flops=flops)
-        self._active_prefill_template_len = self.max_prefill_seq_len
         self.seq_len = actual_seq_len
-        if pad_count > 0:
-            k_per_pos_elems = self.num_key_value_heads * self.head_dim
-            zero_pad_kv = torch.zeros(pad_count * k_per_pos_elems, dtype=torch.bfloat16)
-            pad_byte_offset = actual_seq_len * self.k_size
-            for slot in range(self._num_kv_slots):
-                slot_byte_offset = slot * self.MAX_CONTEXT_SIZE * self.k_size
-                self.dma_to_accelerator_memory(
-                    self.LAYER0_K_ROPE_DRAM + slot_byte_offset + pad_byte_offset,
-                    zero_pad_kv)
-                self.dma_to_accelerator_memory(
-                    self.LAYER0_V_DRAM + slot_byte_offset + pad_byte_offset,
-                    zero_pad_kv)
 
         # DIAGNOSTIC: dump FPGA prefill's final hidden state per position to
         # disk for offline HF-comparison (Strategy B). Covers ALL real positions
@@ -9410,7 +9279,7 @@ defaults (sample files in repo-root test_samples/):
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name for non-Efinix profiles (e.g., xdma0, xdma1). Efinix uses /dev/pcie_dma0_* from its profile.')
     parser.add_argument('--device', type=str, default='kintex7',
-                        help='FPGA board / bitstream profile. Use efinix for the Efinix DMA profile.')
+                        help='FPGA board / bitstream profile. Use efinix for the Efinix profile.')
     parser.add_argument('--cycle', type=float, default=None,
                         help='Clock cycle time in nanoseconds. Default: from --device.')
     args = parser.parse_args()
@@ -9460,6 +9329,10 @@ defaults (sample files in repo-root test_samples/):
         raise SystemExit(
             "Only one encoder modality per run. Choose either --image / --vision-enable "
             "OR --audio / --audio-enable, not both.")
+    # All three modes (LM / VLM / audio) ship in the one bin — post bin-minimization
+    # the full E4B bin is ~15 MiB and every mode is FPGA-validated, so there is no
+    # LM-only restriction and no encoder gate.
+
     image_path = args.image or (DEFAULT_IMAGE if args.vision_enable else None)
     audio_path = args.audio or (DEFAULT_AUDIO if args.audio_enable else None)
     if vision_on and image_path and not os.path.exists(image_path):
@@ -9602,14 +9475,6 @@ defaults (sample files in repo-root test_samples/):
     except Exception as _e:
         print(f"  text: (decode failed: {_e})")
     print(f"--- Prompt end ---")
-    if user_dma_core.CURRENT_DEVICE == "efinix" and not vision_on and not audio_on:
-        actual_prefill_len = len(ue.prefill_seq) - 1
-        prefill_addr, prefill_flops = ue.compile_actual_prefill_to_dram(actual_prefill_len)
-        manifest = dict(manifest)
-        manifest["_prefill_addr_int"] = prefill_addr
-        manifest["prefill_program_start_addr"] = f"0x{prefill_addr:X}"
-        manifest["prefill_max_seq_len"] = actual_prefill_len
-        manifest["prefill_total_flops"] = prefill_flops
     timer=time.perf_counter()
     latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
     latency_prefill = time.perf_counter() - timer
