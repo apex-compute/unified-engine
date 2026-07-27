@@ -146,6 +146,7 @@ def ue_assert_axi_beat_aligned_bytes(nbytes: int, what: str, hint: str = "") -> 
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
+CURRENT_DEVICE = "xdma0"
 
 def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
     """Set DMA device paths and an optional AXI-Lite base address.
@@ -158,8 +159,9 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
     stale import snapshot (wrong).
     """
     import sys as _sys
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
+    global CURRENT_DEVICE, DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
     old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    CURRENT_DEVICE = device_name
     if device_name == "efinix":
         DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
         DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
@@ -200,6 +202,7 @@ BIAS_BRAM_SIZE_BYTES = BIAS_BRAM_ELEMENTS * 2
 DRAM_START_ADDR = 0x80000000 # 0 GB
 DRAM_ACTIVATION_ADDR = 0xB0000000 # 512 MB reserved for intermediate results
 DRAM_INSTRUCTION_ADDR = 0xD0000000  # 256*3 MB reserved for instructions
+DRAM_END_ADDR = 0xFFFFFFFF
 
 # UE DRAM / instruction fields use a 35-bit word address = byte address >> 3 (see andromeda.c, decoder inst words).
 UE_WORD_ADDR_BITS = 35
