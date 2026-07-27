@@ -9300,16 +9300,7 @@ defaults (sample files in repo-root test_samples/):
         user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={user_dma_core.UE_AXI_DATA_WIDTH_BITS}")
     effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
-    print(f"Using DMA device: {effective_dma}")
-    print(f"  H2C: {DMA_DEVICE_H2C}")
-    print(f"  C2H: {DMA_DEVICE_C2H}")
-    print(f"  USER: {DMA_DEVICE_USER}")
-    print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
-    print(
-        f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, "
-        f"act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, "
-        f"inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}"
-    )
+    print(f"DMA/DRAM: device={effective_dma}, H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, BASE=0x{user_dma_core.UE_0_BASE_ADDR:08x}, start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}")
 
     # --- Resolve modality and input path -----------------------------------
     # The script has three modes: LM (text only), VLM (image + text),

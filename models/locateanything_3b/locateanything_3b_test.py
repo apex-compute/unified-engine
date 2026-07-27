@@ -3803,17 +3803,7 @@ def main():
         user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     effective_dma = "pcie_dma0" if profile["device"] == "efinix" else args.dev
     print(f"FPGA profile: device={profile['device']}, clock={user_dma_core.CLOCK_CYCLE_TIME_NS:.4f} ns, UE_AXI_DATA_WIDTH_BITS={user_dma_core.UE_AXI_DATA_WIDTH_BITS}")
-    print(f"Using DMA device: {effective_dma}")
-    print(f"  H2C: {user_dma_core.DMA_DEVICE_H2C}")
-    print(f"  C2H: {user_dma_core.DMA_DEVICE_C2H}")
-    print(f"  USER: {user_dma_core.DMA_DEVICE_USER}")
-    print(f"  BASE: 0x{user_dma_core.UE_0_BASE_ADDR:08x}")
-    print(
-        f"  DRAM: start=0x{user_dma_core.DRAM_START_ADDR:08x}, "
-        f"act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, "
-        f"inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}, "
-        f"end=0x{user_dma_core.DRAM_END_ADDR:08x}"
-    )
+    print(f"DMA/DRAM: device={effective_dma}, H2C={user_dma_core.DMA_DEVICE_H2C}, C2H={user_dma_core.DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}, BASE=0x{user_dma_core.UE_0_BASE_ADDR:08x}, start=0x{user_dma_core.DRAM_START_ADDR:08x}, act=0x{user_dma_core.DRAM_ACTIVATION_ADDR:08x}, inst=0x{user_dma_core.DRAM_INSTRUCTION_ADDR:08x}, end=0x{user_dma_core.DRAM_END_ADDR:08x}")
 
     # ==================================================================
     # DEBUG CONFIG (no flags needed). Flip these in code.

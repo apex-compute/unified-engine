@@ -936,20 +936,12 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={profile['device']}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    _original_print(f"  H2C: {DMA_DEVICE_H2C}")
-    _original_print(f"  C2H: {DMA_DEVICE_C2H}")
-    _original_print(f"  USER: {DMA_DEVICE_USER}")
-    _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
-                    f"UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = Qwen3_4b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     _SILENT_MODE = False
-    _original_print(
-        f"DRAM layout: params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, "
-        f"program=0x{ue._program_dram_base:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}"
-    )
+    _original_print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, program=0x{ue._program_dram_base:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     cfg = ue._cfg
     user_prompt = args.prompt if args.prompt is not None else cfg.get("default_prompt", "What is 3 + 5?")

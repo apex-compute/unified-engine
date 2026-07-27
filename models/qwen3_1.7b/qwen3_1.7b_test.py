@@ -1640,13 +1640,7 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    print(f"Using DMA device:")
-    print(f"  H2C: {DMA_DEVICE_H2C}")
-    print(f"  C2H: {DMA_DEVICE_C2H}")
-    print(f"  USER: {DMA_DEVICE_USER}")
-    print(f"  BASE: 0x{profile['ue_0_base_addr']:08X}")
-    print(f"  DRAM layout: params=0x{QWEN3_PARAMS_BASE:08X}, tensor=0x{QWEN3_TENSOR_BASE:08X}, "
-          f"program=0x{QWEN3_PROGRAM_BASE:08X}, end=0x{profile['dram_end_addr']:08X}")
+    print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, BASE=0x{profile['ue_0_base_addr']:08X}, params=0x{QWEN3_PARAMS_BASE:08X}, tensor=0x{QWEN3_TENSOR_BASE:08X}, program=0x{QWEN3_PROGRAM_BASE:08X}, end=0x{profile['dram_end_addr']:08X}")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:

@@ -161,10 +161,6 @@ def set_dma_device(device_name: str, dma_device: Optional[str] = None,
     """
     import sys as _sys
     global CURRENT_DEVICE, DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
-<<<<<<< HEAD
-    global DRAM_START_ADDR, DRAM_ACTIVATION_ADDR, DRAM_INSTRUCTION_ADDR, DRAM_END_ADDR
-=======
->>>>>>> eee14a0 (More clean-ups)
     old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     CURRENT_DEVICE = device_name
     if device_name == "efinix":
@@ -172,13 +168,6 @@ def set_dma_device(device_name: str, dma_device: Optional[str] = None,
         DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
         DMA_DEVICE_USER = "/dev/pcie_dma0_user"
         UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
-<<<<<<< HEAD
-        DRAM_START_ADDR = 0x00000000
-        DRAM_ACTIVATION_ADDR = 0xB0000000
-        DRAM_INSTRUCTION_ADDR = 0xD0000000
-        DRAM_END_ADDR = 0xFFFFFFFF
-=======
->>>>>>> eee14a0 (More clean-ups)
     else:
         dma_device = dma_device or device_name
         DMA_DEVICE_H2C = f"/dev/{dma_device}_h2c_0"
@@ -186,13 +175,6 @@ def set_dma_device(device_name: str, dma_device: Optional[str] = None,
         DMA_DEVICE_USER = f"/dev/{dma_device}_user"
         if base_addr is not None:
             UE_0_BASE_ADDR = int(base_addr)
-<<<<<<< HEAD
-        DRAM_START_ADDR = 0x80000000
-        DRAM_ACTIVATION_ADDR = 0xB0000000
-        DRAM_INSTRUCTION_ADDR = 0xD0000000
-        DRAM_END_ADDR = 0xFFFFFFFF
-=======
->>>>>>> eee14a0 (More clean-ups)
     for _mod in list(_sys.modules.values()):
         if _mod is None or _mod is _sys.modules[__name__]:
             continue
