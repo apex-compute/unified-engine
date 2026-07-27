@@ -7029,8 +7029,15 @@ class UnifiedEngine:
         gpr_scale_reg: int = None,
         gpr_scratch_addr: int = None,
         gpr_identity_addr: int = None,
+        q_scale: float = None,
     ) -> int:
         """Scaled dot-product attention with explicit batch and aligned KV length.
+
+        ``q_scale`` overrides the Q pre-scale multiplier. ``None`` (default) keeps
+        the standard ``1/sqrt(head_dim)``; pass an explicit value when the model
+        folds the query scaling elsewhere (e.g. Gemma folds it into ``q_norm`` and
+        passes ``q_scale=1.0`` for no additional rescale). A runtime
+        ``gpr_scale_reg`` still overrides this baked scalar on the dynamic path.
 
         Runtime-``head_dim`` extension (all optional, dynamic path only):
           * ``gpr_head_dim_reg`` — head_dim as a runtime register (drives the score/PV matmul K/N and,
@@ -7071,6 +7078,7 @@ class UnifiedEngine:
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
                 SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
                 IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+                q_scale=q_scale,
             )
         if any(g is not None for g in _addr_gprs) and (gpr_batch_reg is None or gpr_aligned_seq_len_reg is None):
             raise ValueError("unified_attention_core: gpr_*_addr require both gpr_batch_reg and gpr_aligned_seq_len_reg")
@@ -7096,6 +7104,7 @@ class UnifiedEngine:
             gpr_scale_reg=gpr_scale_reg,
             gpr_scratch_addr=gpr_scratch_addr,
             gpr_identity_addr=gpr_identity_addr,
+            q_scale=q_scale,
         )
 
     def unified_attention_core_legacy(
@@ -7110,6 +7119,7 @@ class UnifiedEngine:
         OUTPUT_DRAM_ADDR: int,
         SCRATCH_DRAM_ADDR: int,
         IDENTITY_DRAM_ADDR: int = None,
+        q_scale: float = None,
     ) -> int:
         bytes_per_element = 2
         if batch <= 0 or aligned_seq_len <= 0 or head_dim <= 0:
@@ -7137,7 +7147,7 @@ class UnifiedEngine:
             dram_b=None,
             dram_out=scaled_q_dram_addr,
             mode=UE_MODE.MUL_BROADCAST,
-            scalar=1.0 / math.sqrt(head_dim),
+            scalar=(q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)),
         )
         total_flops += self.matmat_mul_core(
             M=batch,
@@ -7184,6 +7194,7 @@ class UnifiedEngine:
         gpr_scale_reg: int = None,
         gpr_scratch_addr: int = None,
         gpr_identity_addr: int = None,
+        q_scale: float = None,
     ) -> int:
         bytes_per_element = 2
         if batch > aligned_seq_len:
@@ -7251,12 +7262,12 @@ class UnifiedEngine:
             dram_b=None,
             dram_out=scaled_q_dram_addr,
             mode=UE_MODE.MUL_BROADCAST,
-            scalar=1.0 / math.sqrt(head_dim),
+            scalar=(q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)),
             gpr_M_reg=gpr_batch_reg,
             gpr_N_reg=sub_hd_n_reg,   # runtime head_dim -> dynamic eltwise; else N-baked PBI broadcast
             gpr_a_addr=gpr_q_addr,
             gpr_out_addr=scaled_q_reg,
-            gpr_scalar_reg=gpr_scale_reg,   # runtime 1/sqrt(head_dim) (host-primed); None -> baked
+            gpr_scalar_reg=gpr_scale_reg,   # runtime scale override (host-primed); None -> baked scalar
         )
         total_flops += self.matmat_mul_core(
             M=batch,
