@@ -287,7 +287,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
       - Per-KV-head flash attention (8 KV heads x 128 dim); group_size=2.
     """
 
-    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
+    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None, is_efinix: bool = False):
         # Qwen3 DRAM layout starting from 0x00000000 (4 GB DRAM):
         #   params: 0x00000000 – 0x58000000 (~1.4 GB, covers layers + LM_HEAD + ROPE)
         #   tensors: 0x58000000 – 0x98000000 (~1 GB, intermediates + KV cache)
@@ -318,6 +318,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self.k_size = self.head_dim * self.bytes_per_element                     # 1024*2 = 2048
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
         self.PREFILL_MAX_SEQ_LEN = int(model.get("prefill_max_seq_len", 256))
+        if is_efinix:
+            self.MAX_CONTEXT_SIZE = min(self.MAX_CONTEXT_SIZE, 1024)
+            self.PREFILL_MAX_SEQ_LEN = min(self.PREFILL_MAX_SEQ_LEN, 512)
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
         # Dynamic-PBI GPR layout (see core_changes.md §3a):
@@ -925,6 +928,9 @@ def main():
                         help="Text prompt (default: from qwen3_1.7b_config.json default_prompt)")
     parser.add_argument("--local-weights", action="store_true",
                         help="Use qwen3_1.7b_bin/full_model_weights.bin instead of params.bin")
+    parser.add_argument("--device", type=str, default="bittware",
+                        choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
+                        help="FPGA board profile. Default: bittware")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=5.62,
@@ -970,21 +976,22 @@ def main():
             _original_print(f"  {f}")
         sys.exit(1)
 
-    set_dma_device(args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     # Mirror test.py: rebind the device-name module globals after set_dma_device
     # so any dma_read/dma_write resolves DMA_DEVICE_* (and tracks the chosen --dev).
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
+    clock = 4.0 if args.device == "efinix" and args.cycle == 5.62 else args.cycle
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
                     f"UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
     global _SILENT_MODE
     _SILENT_MODE = True
-    ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel, is_efinix=(args.device == "efinix"))
     _SILENT_MODE = False
 
     cfg = ue._cfg

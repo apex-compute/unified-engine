@@ -529,6 +529,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -540,7 +541,7 @@ def main():
                         help="Text prompt (tokenized via the local chat template). Overrides the config default.")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device name. Default: xdma0.")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly (no logit readback); loads the
     # the unified programs.bin. --pure-greedy disables it entirely.
@@ -567,7 +568,7 @@ def main():
     # Hard-fail BEFORE touching the FPGA if any artifact is missing.
     _verify_artifacts(script_dir, cfg, fpga_penalty=not bool(args.pure_greedy))
 
-    set_dma_device(args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
@@ -575,7 +576,7 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    _original_print(f"Llama-3.2-1B on {args.dev} (run from pre-compiled bins)")
+    _original_print(f"Llama-3.2-1B on {user_dma_core.DMA_DEVICE_H2C} (run from pre-compiled bins)")
 
     t0 = time.perf_counter()
     _original_print("Loading weights + tokenizer ...")

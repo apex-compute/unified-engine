@@ -9277,21 +9277,25 @@ defaults (sample files in repo-root test_samples/):
                              "removed) and is currently BUGGY due to the unfixed vision-QKV clamp. "
                              "LM prefill/decode always runs on the FPGA.")
     parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=5.62,
-                        help='Clock cycle time in nanoseconds (default: 3.0, use 2.5 for alveo)')
+                        help='DMA device name for non-Efinix profiles (e.g., xdma0, xdma1). Efinix uses /dev/pcie_dma0_* from its profile.')
+    parser.add_argument('--device', type=str, default='kintex7',
+                        help='FPGA board / bitstream profile. Use efinix for the Efinix profile.')
+    parser.add_argument('--cycle', type=float, default=None,
+                        help='Clock cycle time in nanoseconds. Default: from --device.')
     args = parser.parse_args()
 
     if args.fpga_encoder:
         os.environ["GEMMA4_FPGA_AUDIO_FEATURES"] = "1"
 
-    set_dma_device(args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Using DMA device: {args.dev}")
+    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
+    print(f"Using DMA device: {effective_dma}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")

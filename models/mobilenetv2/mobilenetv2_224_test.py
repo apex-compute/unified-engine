@@ -1131,6 +1131,7 @@ def preprocess_image(image_path: str, size: int = 224) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
+    if device == "efinix":                         return 4.0
     if device == "kintex7":                       return 5.1594
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
@@ -1144,7 +1145,7 @@ def main():
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--cleanup", action="store_true",
                         help="Delete compile artifacts from mobilenetv2_bin/ before running. "
                              "Cached HF weights (hf_model/) are preserved.")
@@ -1165,7 +1166,7 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
 
-    set_dma_device(args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H

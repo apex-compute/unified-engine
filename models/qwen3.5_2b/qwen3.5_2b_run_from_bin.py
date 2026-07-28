@@ -77,7 +77,21 @@ def main():
                     help="Image path → VLM mode (caption the image).")
     ap.add_argument("--vision-enable", action="store_true",
                     help="VLM mode using the bundled sample image.")
+    ap.add_argument("--device", type=str, default="bittware",
+                    choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
+                    help="FPGA board profile. Default: bittware.")
+    ap.add_argument("--dev", type=str, default="xdma0",
+                    help="DMA device name. Default: xdma0.")
+    ap.add_argument("--cycle", type=float, default=None,
+                    help="Clock cycle time in ns. Defaults to board profile value.")
     args = ap.parse_args()
+
+    T.set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    global DMA_DEVICE_H2C
+    DMA_DEVICE_H2C = T.user_dma_core.DMA_DEVICE_H2C
+    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
+    T.user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    T.user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
 
     vision_on = bool(args.image) or args.vision_enable
     _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))

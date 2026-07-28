@@ -26,7 +26,7 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR,
-    UnifiedEngine, ue_35bit_addr_shifter, UE_MODE,
+    UnifiedEngine, set_dma_device, ue_35bit_addr_shifter, UE_MODE,
 )
 from nn_lib import (
     smart_bf16_permute_core,
@@ -1538,12 +1538,12 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
+    if device == "efinix":                         return 4.0
     return 10.0
 
 
 def main():
     import argparse
-    from user_dma_core import set_dma_device
 
     parser = argparse.ArgumentParser(description="SmolVLM2-500M on accelerator (bf16 vision + q4 LM)")
     _d = _SMOLVLM2_CFG["defaults"]
@@ -1557,7 +1557,7 @@ def main():
                         help="Pure language-model (text-only) mode — skip the vision encoder. Default is VLM (vision).")
     parser.add_argument("--dev", type=str, default=_d["dev"], help="DMA device name")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument("--device", type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--max-seq", type=int, default=_d["max_seq"], help="Max sequence length")
     parser.add_argument("--max-decode-tokens", type=int, default=None,
                         help="Cap the number of generated decode tokens.")
@@ -1582,7 +1582,11 @@ def main():
         snapshot_download(repo_id=HF_MODEL_REPO, local_dir=model_dir, local_dir_use_symlinks=False, ignore_patterns=["onnx/*"])
 
     # --- Hardware inference ---
-    set_dma_device(args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits

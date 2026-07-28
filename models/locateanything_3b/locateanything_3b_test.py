@@ -3739,6 +3739,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", type=str, default="xdma0",
                     help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
+    ap.add_argument("--device", type=str, default="kintex7",
+                    help="FPGA board / bitstream profile")
     ap.add_argument("--image", default=os.path.join(REPO_ROOT, "test_samples", "vette.jpg"))
     ap.add_argument("--prompt-kind", default="detect",
                     choices=["detect", "ground_multi", "ground_one", "point"])
@@ -3779,9 +3781,13 @@ def main():
                     help="run the CPU reference decoder bf16 vs if4 vs tq4 on the same vision "
                          "output and print a quant-fidelity comparison at the very bottom")
     args = ap.parse_args()
-    set_dma_device(args.dev)
+
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    if args.device == "efinix":
+        user_dma_core.CLOCK_CYCLE_TIME_NS = 4.0
+        user_dma_core.UE_PEAK_GFLOPS = 0.128 / 4.0
 
     # ==================================================================
     # DEBUG CONFIG (no flags needed). Flip these in code.

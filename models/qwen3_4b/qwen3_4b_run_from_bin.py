@@ -867,6 +867,8 @@ def main():
                         help="DMA device name (default: xdma0)")
     parser.add_argument("--cycle", type=float, default=5.62,
                         help="Clock cycle time in ns (default: 5.62ns ≈ peak 22.8 GFLOPS)")
+    parser.add_argument("--device", type=str, default="kintex7",
+                        help="FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).")
     # Deterministic on-FPGA decode: token selection is always the HW argmax of
     # (logits + penalty bias). No host sampling — the repetition penalty is folded into
     # the LM-head matmul bias (notes_repetition_penalty_fpga_bias.md).
@@ -908,7 +910,7 @@ def main():
             _original_print(f"  {f}")
         sys.exit(1)
 
-    set_dma_device(args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     # Mirror test.py: rebind the device-name module globals after set_dma_device
     # so sample_next_token's dma_read(DMA_DEVICE_C2H, ...) resolves (and tracks
     # the chosen --dev). Without this, DMA_DEVICE_C2H is undefined in this module.
@@ -916,8 +918,9 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
+    clock = 4.0 if args.device == "efinix" and args.cycle == 5.62 else args.cycle
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
                     f"UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 

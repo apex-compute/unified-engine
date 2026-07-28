@@ -4648,8 +4648,13 @@ def main():
                     help="max tokens to generate (default: 128). "
                          "Pass 0 to run until EOT or the KV cache is full "
                          "(`max_context - prompt_len`).")
+    ap.add_argument("--device", type=str, default="bittware",
+                    choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
+                    help="FPGA board profile. Default: bittware.")
     ap.add_argument("--dev", type=str, default="xdma0",
                     help="DMA device name (default: xdma0).")
+    ap.add_argument("--cycle", type=float, default=None,
+                    help="Clock cycle time in ns. Defaults to board profile value.")
     # VLM opt-in (gemma4 pattern). Default mode is pure LM; vision activates
     # only when --image PATH or --vision-enable is given.  Vision encoder
     # runs on FPGA (Phase 4) by default; the host-side HF path (Phase 1) is
@@ -4670,10 +4675,13 @@ def main():
                          "--image.")
     args = ap.parse_args()
 
-    set_dma_device(args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
 
     # Hard-coded inference settings (formerly CLI flags, now defaults).
     # 512 (not 256) so the default VLM run fits: an image adds ~144 vision tokens,
