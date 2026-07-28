@@ -911,7 +911,7 @@ def main():
         sys.exit(1)
 
     set_dma_device("efinix" if args.device == "efinix" else args.dev)
-    # Mirror test.py: rebind the device-name module globals after selecting DMA
+    # Mirror test.py: rebind the device-name module globals after set_dma_device
     # so sample_next_token's dma_read(DMA_DEVICE_C2H, ...) resolves (and tracks
     # the chosen --dev). Without this, DMA_DEVICE_C2H is undefined in this module.
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
