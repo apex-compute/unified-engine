@@ -1337,7 +1337,6 @@ def main():
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
     print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    print(f"DMA: device={effective_dma}, H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, BASE=0x{user_dma_core.UE_0_BASE_ADDR:08x}")
 
     ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)

@@ -3202,7 +3202,6 @@ def main():
     print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     ue = Qwen25VL3B_UnifiedEngine(script_dir=script_dir)
-    print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, program=0x{ue._program_dram_base:08X}, end=0x{user_dma_core.DRAM_END_ADDR:08X}")
 
     ue.start_capture()
     ue.generate_instruction_halt()
@@ -3210,7 +3209,7 @@ def main():
     halt_bytes = bytearray()
     for inst in ue.capture_buffer:
         halt_bytes.extend(inst.get_bytes())
-    ue.dma_write(DMA_DEVICE_H2C, ue._program_dram_base, halt_bytes, len(halt_bytes))
+    ue.dma_write(DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, halt_bytes, len(halt_bytes))
     ue.clear_capture_buffer()
 
     cfg = _load_config(script_dir)

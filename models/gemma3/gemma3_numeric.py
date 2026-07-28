@@ -11,7 +11,7 @@ Usage:
   source venv/bin/activate  # if using venv
   python gemma3_numeric.py --dev xdma0 [--device kintex7] [--cycle 5.15] [--layer-size 1]
 
-Same layout as gemma3_test: this file lives next to gemma3_bin/, *.json; user_dma_core two folders up.
+Same layout as gemma3_test: this file lives next to gemma3_bin/, *.json; user_dma_core one level up.
 """
 
 import json
@@ -21,10 +21,10 @@ import sys
 import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# Ensure repo root is on path so "import user_dma_core" works when run from models/gemma3.
-_root = os.path.dirname(os.path.dirname(_THIS_DIR))
-if _root not in sys.path:
-    sys.path.insert(0, _root)
+# Ensure parent (pcie_utils) is on path so "import user_dma_core" works when run as python gemma3_example/gemma3_numeric.py
+_parent = os.path.dirname(_THIS_DIR)
+if _parent not in sys.path:
+    sys.path.insert(0, _parent)
 
 import numpy as np
 import torch
@@ -674,7 +674,6 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
-    if device == "efinix":                         return 4.0
     return 10.0
 
 
@@ -687,10 +686,10 @@ def main():
     parser.add_argument("--dual-engine", action="store_true", help="Use dual engine")
     parser.add_argument('--dev', type=str, default='xdma0',help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
+    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
     args = parser.parse_args()
 
-    set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    set_dma_device(args.dev)
     gemma3_test.DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     gemma3_test.DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     gemma3_test.DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
@@ -700,9 +699,8 @@ def main():
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
     print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    print(f"Using DMA device: {effective_dma}")
+    print(f"Using DMA device: {args.dev}")
     print(f"  H2C: {gemma3_test.DMA_DEVICE_H2C}")
     print(f"  C2H: {gemma3_test.DMA_DEVICE_C2H}")
     print(f"  USER: {gemma3_test.DMA_DEVICE_USER}")

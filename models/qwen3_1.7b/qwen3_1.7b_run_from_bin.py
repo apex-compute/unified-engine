@@ -287,8 +287,11 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
       - Per-KV-head flash attention (8 KV heads x 128 dim); group_size=2.
     """
 
-    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
-        # Qwen3 needs a dedicated 4 GB layout for parameters, tensors, and ISA.
+    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None, is_efinix: bool = False):
+        # Qwen3 DRAM layout starting from 0x00000000 (4 GB DRAM):
+        #   params: 0x00000000 – 0x58000000 (~1.4 GB, covers layers + LM_HEAD + ROPE)
+        #   tensors: 0x58000000 – 0x98000000 (~1 GB, intermediates + KV cache)
+        #   instructions: 0x98000000 – 0xA0000000 (128 MB)
         super().__init__(
             params_dram_base=0x00000000,
             tensor_dram_base=0x58000000,
@@ -315,7 +318,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self.k_size = self.head_dim * self.bytes_per_element                     # 1024*2 = 2048
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
         self.PREFILL_MAX_SEQ_LEN = int(model.get("prefill_max_seq_len", 256))
-        if user_dma_core.CURRENT_DEVICE == "efinix":
+        if is_efinix:
             self.MAX_CONTEXT_SIZE = min(self.MAX_CONTEXT_SIZE, 1024)
             self.PREFILL_MAX_SEQ_LEN = min(self.PREFILL_MAX_SEQ_LEN, 512)
         self.LAYER_SIZE = fi["num_layers"]
@@ -929,9 +932,9 @@ def main():
                         choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
                         help="FPGA board profile. Default: bittware")
     parser.add_argument("--dev", type=str, default="xdma0",
-                        help="DMA device name. Default: xdma0.")
-    parser.add_argument("--cycle", type=float, default=None,
-                        help="Clock cycle time in ns. Defaults to board profile value.")
+                        help="DMA device name (default: xdma0)")
+    parser.add_argument("--cycle", type=float, default=5.62,
+                        help="Clock cycle time in ns (default: 5.62ns ≈ peak 22.8 GFLOPS)")
     # Deterministic on-FPGA decode: token selection is always the HW argmax of
     # (logits + penalty bias). No host sampling — the repetition penalty is folded into
     # the LM-head matmul bias (notes_repetition_penalty_fpga_bias.md).
@@ -951,18 +954,6 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     bin_dir = os.path.join(script_dir, "qwen3_1.7b_bin")
-
-    set_dma_device("efinix" if args.device == "efinix" else args.dev)
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
 
     weights_bin_rel = ("qwen3_1.7b_bin/full_model_weights.bin" if args.local_weights
                        else "qwen3_1.7b_bin/params.bin")
@@ -985,9 +976,25 @@ def main():
             _original_print(f"  {f}")
         sys.exit(1)
 
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    # Mirror test.py: rebind the device-name module globals after set_dma_device
+    # so any dma_read/dma_write resolves DMA_DEVICE_* (and tracks the chosen --dev).
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = 4.0 if args.device == "efinix" and args.cycle == 5.62 else args.cycle
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    _original_print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, "
+                    f"UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
+
     global _SILENT_MODE
     _SILENT_MODE = True
-    ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel, is_efinix=(args.device == "efinix"))
     _SILENT_MODE = False
 
     cfg = ue._cfg
