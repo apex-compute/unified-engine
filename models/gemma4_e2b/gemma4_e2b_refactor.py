@@ -1327,7 +1327,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.loop_end()
         self.release_isa_reg()       # i_reg
 
-    def compile_prefill(self, seq_len: int, layer_size: int = 35) -> tuple[None, int]:
+    def compile_prefill(self, seq_len: int, layer_size: int = 35, profile: bool = False) -> tuple[None, int]:
         """Emit ISA for prefill into the currently open capture buffer, sized
         for the ACTUAL prompt ``seq_len`` — no fixed template, no padding.
 
@@ -1337,6 +1337,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         (matmat / rms_norm / eltwise) still read M from gpr_seq_len at execute
         time; run_prefill primes gpr_seq_len / gpr_q_seq_len / gpr_aligned_seq_len
         with this same ``seq_len`` before launching.
+
+        ``profile``: mirror compile_decoder — emit a HALT at each per-layer phase
+        boundary and record the resume address (the next instruction), so
+        run_gemma4_profile can time each phase's HW latency. Checkpoints are
+        placed only at UNCONDITIONAL points (never inside a loop_start/loop_end
+        or a per-layer kv-shared branch), so every layer contributes one sample
+        per phase. Stored in self._prefill_checkpoints (empty when not profiling).
+        A profile-compiled prefill can only be run segment-by-segment (each HALT
+        stops the FPGA), never in one shot.
         """
         self.seq_len = seq_len
         q_seq_len = seq_len * self.group_size
@@ -1345,7 +1354,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = True
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
-        _original_print(f"  Emitting prefill: {layer_size} layers, seq_len={seq_len}, attention=unified-inline")
+        _original_print(f"  Emitting prefill: {layer_size} layers, seq_len={seq_len}, attention=unified-inline"
+                        + (" (+profile checkpoints)" if profile else ""))
+        checkpoints: list[list] = []
+        def _checkpoint(name: str) -> None:
+            if not profile:
+                return
+            self.generate_instruction_halt()
+            resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+            checkpoints.append([name, f"0x{resume:X}"])
         prefill_t0 = time.perf_counter()
         for layer_idx in range(layer_size):
             if layer_idx > 0 and layer_idx % 10 == 0:
@@ -1423,6 +1440,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             total_flops += self.rms_norm_core_dram(M=seq_len * self.group_size, N=cur_head_dim, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
                             OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off,
                                             gpr_M_reg=self.gpr_q_seq_len)
+            _checkpoint(f"L{layer_idx}_qkv_vproj")
 
             ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
 
@@ -1475,9 +1493,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             # Spread the contiguous K rope result into the k_size-strided KV cache.
             if non_shared:
                 self._emit_strided_copy_pbi(K_TMP, k_cache_base, cur_head_dim, head_bytes, self.k_size, seq_len, self.gpr_seq_len)
+            _checkpoint(f"L{layer_idx}_rope")
             # GQA dup: read KV cache (k_size stride) → scatter group_size copies to FLASH (cur_head_dim stride).
             self._emit_gqa_duplicate_pbi(k_cache_base, self.LAYER0_FLASH_K_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=self.k_size)
             self._emit_gqa_duplicate_pbi(v_cache_base, self.LAYER0_FLASH_V_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=self.k_size)
+            _checkpoint(f"L{layer_idx}_kv_gather")
 
             # Gemma4 uses scaling=1.0 (no 1/sqrt(d) in attention scores), so pass
             # q_scale=1.0 below; no Q pre-scale needed.
@@ -1506,6 +1526,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
                 q_scale=1.0,
             )
+            _checkpoint(f"L{layer_idx}_attention")
             # O projection: INT4, K=cur_q_size
             total_flops += self.matmat_mul_core(M=seq_len, K=cur_q_size, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
@@ -1524,6 +1545,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 dram_a=layer_input_addr, dram_b=self.LAYER0_POST_ATTN_NORM_DRAM,
                 dram_out=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                 mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self.gpr_seq_len)
+            _checkpoint(f"L{layer_idx}_o_proj")
             total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                             OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                                             gpr_M_reg=self.gpr_seq_len)
@@ -1570,12 +1592,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, dram_b=self.LAYER0_POST_MLP_NORM_DRAM,
                 dram_out=self.LAYER0_OUTPUT_DRAM,
                 mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self.gpr_seq_len)
+            _checkpoint(f"L{layer_idx}_mlp")
 
             # Per-layer input injection (NEW for Gemma4 E2B) — seq_len-agnostic
             # (gpr_seq_len-driven) prefill variant; decode uses the seq_len=1 one.
             total_flops += self._compile_per_layer_injection_prefill(layer_idx, layer_off)
+            _checkpoint(f"L{layer_idx}_inject")
 
         self.generate_instruction_halt()
+        self._prefill_checkpoints = checkpoints
         _SILENT_MODE = False
         return None, total_flops
 
@@ -1628,7 +1653,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         return per_layer_inputs  # [seq_len, 35, 256]
 
-    def run_prefill(self, prefill_program_addr: int, prefill_seq=None, flops: int = None) -> dict:
+    def run_prefill(self, prefill_program_addr: int, prefill_seq=None, flops: int = None,
+                    profile_checkpoints: list | None = None):
         """
         Run prefill for the actual prompt — single entry, no bucket/padding.
 
@@ -1643,9 +1669,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             prefill_seq: Full prompt token tuple (incl. the final token, which
                 is NOT processed by prefill); if None, uses self.prefill_seq.
             flops: FLOP count for the HW rate counter.
+            profile_checkpoints: when given (from a profile-compiled image), run
+                the prefill segment-by-segment through its HALT checkpoints and
+                return the per-segment [(name, ms)] HW latencies INSTEAD of a
+                one-shot execute. The KV cache is still fully populated. Used by
+                run_gemma4_profile.
 
         Returns:
-            (latency, flop_rate) from the accelerator.
+            (latency, flop_rate) from the accelerator, or — when
+            ``profile_checkpoints`` is given — the per-segment latency list.
         """
         if prefill_seq is None:
             prefill_seq = self.prefill_seq
@@ -1783,6 +1815,19 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # the FPGA); everything below is the accelerator run.
         host_prepare_s = time.perf_counter() - _host_prepare_w0
 
+        # Profiling path: run the prefill through its per-phase HALT checkpoints
+        # and return per-segment HW latencies. Populates the KV cache exactly
+        # like a straight run (segments tile the whole program). The dynamic-PBI
+        # preamble primes the same three GPRs as the one-shot dispatch below.
+        if profile_checkpoints is not None:
+            print(f"[Prefill] [profile] running {len(profile_checkpoints)} segments "
+                  f"(host prep {host_prepare_s:.2f}s)...", flush=True)
+            return self._profile_execute(
+                [(self.gpr_seq_len,         seq_len),
+                 (self.gpr_q_seq_len,       q_seq_len),
+                 (self.gpr_aligned_seq_len, aligned_seq_len)],
+                prefill_program_addr, profile_checkpoints, tail_name="tail_halt")
+
         print(f"[Prefill] [exec] launching prefill program on FPGA ({seq_len} tokens, {self.LAYER_SIZE} layers)...", flush=True)
         # Heartbeat thread: program_execute blocks until the FPGA halts, with no
         # intermediate visibility. Print elapsed seconds every 10s so the user
@@ -1822,7 +1867,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             print(f"[Prefill] [profile]   TOTAL         {total_s:8.3f}s", flush=True)
         return latency, flop_rate_program
 
-    def compile_decoder(self, layer_size: int = 35) -> tuple[None, list[int], list[int]]:
+    def compile_decoder(self, layer_size: int = 35, profile: bool = False) -> tuple[None, list[int], list[int]]:
         """Compile a single decoder program with dynamic PBI.
 
         DYNAMIC PBI (see notes_gemma4_e2b.md): one captured
@@ -1844,6 +1889,20 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         seg_t0 = time.perf_counter()
         count_at_start = self.capture_count
         total_flops = 0
+
+        # Optional per-phase profiling (see run_gemma4_profile / --profile).
+        # _checkpoint emits a HALT at a phase boundary and records the resume
+        # address (the next instruction). At runtime the profiler runs each
+        # segment to its HALT, reads the HW latency counter, then resumes. Only
+        # placed at UNCONDITIONAL points so every layer contributes one sample
+        # per phase (never inside a loop_start/loop_end or a per-layer branch).
+        checkpoints: list[list] = []
+        def _checkpoint(name: str) -> None:
+            if not profile:
+                return
+            self.generate_instruction_halt()
+            resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+            checkpoints.append([name, f"0x{resume:X}"])
         # gpr_one holds the constant 1 — used as gpr_M_reg for all M=1 ops.
         gpr_one = self.alloc_isa_reg()
         self.generate_instruction_add_set(gpr_one, 1)
@@ -1913,6 +1972,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                   OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off,
                                   gpr_M_reg=gpr_one)
 
+                _checkpoint(f"L{layer_idx}_qkv_vproj")
+
                 # Q norm: M = group_size (compile-time constant). Use legacy
                 # static-M path (no gpr_M_reg) since group_size doesn't vary.
                 total_flops += self.rms_norm_core_dram(M=self.group_size, N=cur_head_dim, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
@@ -1972,6 +2033,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 # Gemma4 uses scaling=1.0; q_scale=1.0 on the attention call means no
                 # Q pre-scale is needed here.
 
+                _checkpoint(f"L{layer_idx}_rope")
+
                 # K/V cache reads — KV-shared layers point at the source layer's cache.
                 kv_slot_off_read = self._kv_slot_for_layer[kv_layer_for_attn] * self.MAX_CONTEXT_SIZE * self.k_size
                 kv_k_base = self.LAYER0_K_ROPE_DRAM + kv_slot_off_read
@@ -1987,6 +2050,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 self._emit_strided_copy_pbi(
                     kv_v_base, self.LAYER0_FLASH_V_DRAM, cur_head_dim,
                     self.k_size, _dhb, self.MAX_CONTEXT_SIZE, self.gpr_aligned_seq_len, sram_addr=0x20000)
+
+                _checkpoint(f"L{layer_idx}_kv_gather")
 
                 # unified_attention_core uses bias_mode="full_matrix"; run_decoder
                 # uploads group_size identical bias rows for this call.
@@ -2008,6 +2073,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
                     q_scale=1.0,
                 )
+                _checkpoint(f"L{layer_idx}_attention")
+
                 # O projection: INT4, K=cur_q_size (actual per-layer attention output dim)
                 total_flops += self.quantized_matmat_core(M=1, K=cur_q_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
@@ -2028,6 +2095,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
                 self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
+
+                _checkpoint(f"L{layer_idx}_o_proj")
 
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
@@ -2072,8 +2141,12 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
 
+                _checkpoint(f"L{layer_idx}_mlp")
+
                 # Per-layer input injection (NEW for Gemma4 E2B) - decoder uses seq_len=1
                 total_flops += self._compile_per_layer_injection(layer_idx, layer_off, 1)
+
+                _checkpoint(f"L{layer_idx}_inject")
 
             if layer_size == self.LAYER_SIZE:
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
@@ -2094,6 +2167,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     bias_mode="broadcast_N",
                     gpr_M_reg=gpr_one,
                     )
+                _checkpoint("lm_head")
 
             # Advance decode_pos for next token. The host's preamble only
             # sets gpr_seq_len once at the very first decode step; each
@@ -2106,6 +2180,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             _original_print(f"    decoder segment ({instr_count} instr) done in {time.perf_counter()-seg_t0:.1f}s")
         program_sizes = [instr_count * 32]
         total_flops_list = [total_flops]
+        self._decoder_checkpoints = checkpoints
         _SILENT_MODE = False
         return None, program_sizes, total_flops_list
 
@@ -2303,30 +2378,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
               f"average {_avg:.2f} tok/s  ({_decoded_n} tokens in {_elapsed:.2f}s)")
         return self.seq_len, total_latency, total_flop_rate
 
-
-    # ------------------------------------------------------------------
-    # gemma3-style top-level workflow: compile (disk) → run (load + dispatch).
-    #
-    # Mirrors gemma3_test.py's set_prefill_seq() → compile_gemma3() →
-    # run_gemma3() shape:
-    #   * compile_gemma4() captures ONE combined [prefill][decoder] image and
-    #     writes it to disk (programs.bin + programs.json). It does NOT touch
-    #     program DRAM — exactly like compile_gemma3.
-    #   * run_gemma4() loads that .bin into program DRAM at its baked base,
-    #     parks a single dispatch preamble past the whole image, and runs
-    #     prefill then decode through that preamble (see _dispatch_program).
-    #
-    # gemma4 twist: the prefill is compiled at the REAL prompt seq_len (not
-    # seq_len-agnostic like gemma3), so the combined image is prompt-length
-    # specific and cached per seq_len. Once prefill becomes seq_len-agnostic
-    # this collapses to a single permanently-cached image, i.e. exactly gemma3.
-    # ------------------------------------------------------------------
-    def _program_image_paths(self) -> tuple[str, str]:
+    def _program_image_paths(self, profile: bool = False) -> tuple[str, str]:
         bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
-        return (os.path.join(bin_dir, "programs.bin"),
-                os.path.join(bin_dir, "programs.json"))
+        stem = "programs_profile" if profile else "programs"
+        return (os.path.join(bin_dir, stem + ".bin"),
+                os.path.join(bin_dir, stem + ".json"))
 
-    def compile_gemma4(self, layer_size: int = 35) -> None:
+    def compile_gemma4(self, layer_size: int = 35, profile: bool = False) -> None:
         """Capture [prefill][decoder] into one combined image and write it to
         disk (gemma4_e2b_bin/programs.bin + programs.json). No DRAM is touched —
         run_gemma4() loads it.
@@ -2341,10 +2399,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         assert self.prefill_seq is not None, (
             "call set_prefill_seq() before compile_gemma4()")
         prefill_seq_len = len(self.prefill_seq) - 1
-        bin_path, meta_path = self._program_image_paths()
+        bin_path, meta_path = self._program_image_paths(profile)
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         if os.path.exists(bin_path) and os.path.exists(meta_path):
-            print(f"[compile] reusing cached programs.bin "
+            print(f"[compile] reusing cached {os.path.basename(bin_path)} "
                   f"(seq_len-agnostic; delete to force recompile).")
             return
 
@@ -2364,12 +2422,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
             prefill_count_at_start = self.capture_count          # 1 (after flag-clear)
             _, prefill_total_flops = self.compile_prefill(seq_len=prefill_seq_len,
-                                                          layer_size=layer_size)
+                                                          layer_size=layer_size,
+                                                          profile=profile)
             prefill_program_addr = instruction_base_addr + prefill_count_at_start * INSTRUCTION_SIZE_BYTES
             prefill_size_bytes = (self.capture_count - prefill_count_at_start) * INSTRUCTION_SIZE_BYTES
 
             decoder_count_at_start = self.capture_count
-            _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(layer_size=layer_size)
+            _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
+                layer_size=layer_size, profile=profile)
             decoder_program_addr = instruction_base_addr + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
             decoder_size_bytes = decoder_program_sizes[0]
 
@@ -2398,6 +2458,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             "decoder_total_flops": decoder_total_flops[0],
             "layer_size": layer_size,
         }
+        if profile:
+            manifest["prefill_profile_checkpoints"] = self._prefill_checkpoints
+            manifest["decoder_profile_checkpoints"] = self._decoder_checkpoints
         bin_tmp, meta_tmp = bin_path + ".tmp", meta_path + ".tmp"
         with open(bin_tmp, "wb") as f:
             f.write(bytes(image_bytes)); f.flush(); os.fsync(f.fileno())
@@ -2460,6 +2523,127 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         return (token_cnt_decoded, latency_hw_prefill, latency_hw_decoder,
                 flop_rate_hw_decoder, latency_prefill, latency_decoder)
 
+    def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
+                         checkpoints: list, tail_name: str, timeout: float = 120.0) -> list:
+        """Run a checkpointed program segment-by-segment, returning [(name, ms)]
+        HW latency per segment. A preamble at self._preamble_addr primes each
+        (reg, value) in ``gpr_sets`` then jumps into ``target_addr``; each
+        checkpoint HALT stops the FPGA so the per-segment latency counter can be
+        read before resuming from the recorded address. The final ``tail_name``
+        segment covers everything after the last checkpoint up to the program's
+        terminal HALT. Because the resume addresses are the instruction right
+        after each HALT, the segments tile the whole program with no gaps, so the
+        summed latencies cover all FPGA execution (see run_gemma4_profile)."""
+        self.clear_inst_id()
+        self.start_capture()
+        for reg, val in gpr_sets:
+            self.generate_instruction_add_set(reg, val)
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(target_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(self._preamble_addr)
+        self.clear_capture_buffer()
+
+        results = []
+        self.start_execute_from_dram(self._preamble_addr)
+        for name, resume_hex in checkpoints:
+            self.wait_queue(timeout)
+            results.append((name, self.report_latency_in_us() / 1e3))   # ms
+            self.start_execute_from_dram(int(resume_hex, 16))
+        self.wait_queue(timeout)   # tail segment: everything up to the terminal HALT
+        results.append((tail_name, self.report_latency_in_us() / 1e3))
+        return results
+
+    def _decode_profile_execute(self, decoder_addr: int, aligned_seq_len: int,
+                                checkpoints: list, timeout: float = 120.0) -> list:
+        """One decode step through the profile-bin's HALT checkpoints. Preamble
+        primes gpr_seq_len (=decode_pos) / gpr_aligned_seq_len; the tail segment
+        is the add_inc(gpr_seq_len) + terminal HALT."""
+        return self._profile_execute(
+            [(self.gpr_seq_len, self.seq_len - 1),
+             (self.gpr_aligned_seq_len, aligned_seq_len)],
+            decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout)
+
+    def _print_phase_breakdown(self, title: str, results: list, per_token: bool) -> None:
+        """Aggregate per-layer checkpoints ("L<idx>_<phase>") into phase totals
+        and print a table. ``per_token`` adds a decode throughput line."""
+        import re
+        from collections import defaultdict
+        phase_ms: dict = defaultdict(float)
+        phase_n: dict = defaultdict(int)
+        for name, ms in results:
+            m = re.match(r"L\d+_(.+)", name)
+            phase = m.group(1) if m else name
+            phase_ms[phase] += ms
+            phase_n[phase] += 1
+        total_ms = sum(phase_ms.values())
+
+        print(f"\n=== {title} per-phase HW latency ===")
+        print(f"{'phase':<16}{'total ms':>10}{'%':>7}{'n':>5}{'ms/layer':>10}")
+        print("-" * 48)
+        for phase, ms in sorted(phase_ms.items(), key=lambda kv: -kv[1]):
+            n = phase_n[phase]
+            pct = ms / total_ms * 100 if total_ms else 0.0
+            print(f"{phase:<16}{ms:>10.3f}{pct:>6.1f}%{n:>5}{ms/n:>10.4f}")
+        print("-" * 48)
+        print(f"{'TOTAL':<16}{total_ms:>10.3f}{100.0:>6.1f}%")
+        if per_token and total_ms:
+            print(f"Decode HW throughput: {1000.0/total_ms:.2f} tok/s ({total_ms:.1f} ms/token)")
+
+    def run_gemma4_profile(self) -> None:
+        """Load the profile image (programs_profile.bin, built with per-phase
+        HALT checkpoints), run a profiled prefill and one profiled decode step,
+        and print per-phase HW-latency breakdowns aggregated across all layers.
+        Use to find where prefill / decode time goes. Requires
+        compile_gemma4(profile=True)."""
+        bin_path, meta_path = self._program_image_paths(profile=True)
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        base_addr = int(meta["instruction_base_addr"], 16)
+        prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
+        decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
+        prefill_checkpoints = meta.get("prefill_profile_checkpoints", [])
+        decoder_checkpoints = meta["decoder_profile_checkpoints"]
+
+        self._next_program_dram_addr = base_addr
+        _, prog_size = self.load_program_instructions_from_file(bin_path)
+        self._preamble_addr = self.get_program_dram_addr()
+        print(f"[profile] loaded profile image at 0x{base_addr:X} ({prog_size/1024:.1f} KB), "
+              f"{len(prefill_checkpoints)} prefill + {len(decoder_checkpoints)} decode checkpoints")
+
+        # --- Profiled prefill (segmented). Populates the KV cache AND sets
+        # self.seq_len exactly like a straight run, and returns per-phase HW
+        # latencies for the whole prefill. ---
+        print(f"\n--- Profiling prefill (seq_len={len(self.prefill_seq) - 1}) ---", flush=True)
+        prefill_results = self.run_prefill(
+            prefill_program_addr, flops=meta["prefill_total_flops"],
+            profile_checkpoints=prefill_checkpoints)
+        self._print_phase_breakdown("PREFILL", prefill_results, per_token=False)
+
+        # Host prep for ONE decode step (mirrors run_decoder's per-step work).
+        token_id = self.prefill_seq[-1]
+        self.dma_to_accelerator_memory(
+            self.PENALTY_BIAS_DRAM,
+            torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
+        self.seq_len += 1
+        aligned_seq_len = ((self.seq_len + 63) // 64) * 64
+        emb = self.get_embedding_for_tokens([token_id])
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, emb)
+        pli = self._compute_per_layer_inputs([token_id], emb)
+        self.dma_to_accelerator_memory(self.PER_LAYER_INPUTS_DRAM, pli.permute(1, 0, 2).contiguous())
+        full_bias = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+        full_bias[:, :self.seq_len] = 0.0
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, full_bias)
+        if self.seq_len <= self.sliding_window:
+            sliding_bias = full_bias
+        else:
+            sliding_bias = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+            sliding_bias[:, self.seq_len - self.sliding_window:self.seq_len] = 0.0
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias)
+
+        print(f"\n--- Profiling one decode step (pos {self.seq_len - 1}) ---", flush=True)
+        decode_results = self._decode_profile_execute(decoder_program_addr, aligned_seq_len, decoder_checkpoints)
+        self._print_phase_breakdown("DECODE (1 token)", decode_results, per_token=True)
+
 
 
 def main():
@@ -2482,6 +2666,9 @@ default prompt: "x+3=5, what is x?"
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=5.62,
                         help='Clock cycle time in nanoseconds (default: 5.62)')
+    parser.add_argument('--profile', action='store_true',
+                        help='Compile a profile bin with per-phase HALT checkpoints and run one '
+                             'profiled decode step; print a per-phase HW-latency breakdown.')
     args = parser.parse_args()
 
     set_dma_device(args.dev)
@@ -2505,6 +2692,17 @@ default prompt: "x+3=5, what is x?"
     else:
         print(f"[Mode] LM -- default prompt")
         ue.set_prefill_seq()
+
+    # --profile: build the instrumented bin and print a per-phase decode
+    # breakdown instead of the normal generation run.
+    if args.profile:
+        print(f"\n--- Compiling profile bin (per-phase checkpoints) ---")
+        timer = time.perf_counter()
+        ue.compile_gemma4(profile=True)
+        print(f"Profile compile done in {time.perf_counter() - timer:.2f} seconds")
+        ue.run_gemma4_profile()
+        print("Gemma4 E2B decode profile ends.")
+        return
 
     # gemma3-style workflow: compile (decoder + real-seq_len prefill) then run
     # (prefill + decode). See Gemma4_UnifiedEngine.compile_gemma4 / run_gemma4.
