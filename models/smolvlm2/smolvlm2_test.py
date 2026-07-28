@@ -1597,7 +1597,6 @@ def main():
     global _SILENT_MODE
     _SILENT_MODE = True
     ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
-    _original_print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, program=0x{ue._program_dram_base:08X}, end=0x{0xFFFFFFFF:08X}")
     # Software-reset the engine, then clear DRAM to 0 before anything else.
     # SmolVLM2 has a read-before-write defect and depends on clean, zero-filled
     # DRAM. The harness now poisons DRAM (0xFF) before SmolVLM2 like every other

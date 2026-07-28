@@ -52,6 +52,8 @@ _spec = importlib.util.spec_from_file_location(
 T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)
 
+from user_dma_core import DMA_DEVICE_H2C  # noqa: E402
+
 MAX_CONTEXT = 256
 TEMPERATURE = 0.0
 TOP_K = 0
@@ -62,7 +64,7 @@ def _load_program_section(ue, raw: bytes, off: int, size: int) -> int:
     load address.  The section's JUMP_ABS targets were baked for this base."""
     ue.reset_program_dram_addr()
     addr = ue.get_program_dram_addr()
-    ue.dma_write(T.DMA_DEVICE_H2C, addr, raw[off:off + size], size)
+    ue.dma_write(DMA_DEVICE_H2C, addr, raw[off:off + size], size)
     ue.allocate_program_dram(size)
     return addr
 
@@ -85,8 +87,8 @@ def main():
     args = ap.parse_args()
 
     T.set_dma_device("efinix" if args.device == "efinix" else args.dev)
-    T.DMA_DEVICE_H2C = T.user_dma_core.DMA_DEVICE_H2C
-    T.DMA_DEVICE_C2H = T.user_dma_core.DMA_DEVICE_C2H
+    global DMA_DEVICE_H2C
+    DMA_DEVICE_H2C = T.user_dma_core.DMA_DEVICE_H2C
     clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
     T.user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     T.user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock

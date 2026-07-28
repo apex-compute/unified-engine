@@ -736,7 +736,6 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         #   program: 0xDC000000   .. <0x100000000 (576MB: encoder 377MB + prefill/decode)
         # Invariant: params_end < tensor_dram_base < program_dram_base < 0x100000000.
         super().__init__(
-            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
             params_dram_base=0x00000000,
             tensor_dram_base=0xB0000000,
             program_dram_base=0xDC000000,
