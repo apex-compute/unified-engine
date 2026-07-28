@@ -17,7 +17,7 @@ current combined LM + vision + audio implementation see gemma4_e2b_test.py.
 Usage:
   python gemma4_e2b_refactor.py
   python gemma4_e2b_refactor.py --prompt "your prompt"
-  python gemma4_e2b_refactor.py --dev xdma0 [--cycle 5.62]
+  python gemma4_e2b_refactor.py --dev xdma0 [--cycle 5.042]
   python gemma4_e2b_refactor.py --local-weights
 
 Fixed layout: this script, gemma4_e2b_config.json, and gemma4_e2b_bin/ live in
@@ -1721,10 +1721,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                        torch.eye(_UE_VS, dtype=torch.bfloat16))
         print(f"[Prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
 
-        # --- prefill profiler: two parts, wall-clock only. host_prepare covers
-        # all host-side work (embedding lookup, per-layer inputs, bias build)
-        # plus the DMAs that feed the FPGA; fpga_execute is the accelerator run.
-        # Summary printed at the end; set GEMMA4_PROFILE=0 to silence it.
+        # Time host-side prep (embedding lookup, per-layer inputs, bias build,
+        # DMAs) — reported only in the segmented-profile path's status line.
         _host_prepare_w0 = time.perf_counter()
 
         print(f"[Prefill] [host] looking up token embeddings for {seq_len} tokens...", flush=True)
@@ -1811,8 +1809,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             sliding_bias[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias)
 
-        # End of host prep — everything above ran on the host (CPU + DMA to feed
-        # the FPGA); everything below is the accelerator run.
         host_prepare_s = time.perf_counter() - _host_prepare_w0
 
         # Profiling path: run the prefill through its per-phase HALT checkpoints
@@ -1854,17 +1850,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         finally:
             _pf_stop.set()
             _pf_th.join(timeout=1.0)
-        fpga_execute_s = time.perf_counter() - _pf_t0
-
-        # Profile summary: two parts, wall-clock only. host_prepare is host-side
-        # work (torch compute + DMA); fpga_execute is the accelerator run.
-        # Set GEMMA4_PROFILE=0 to silence.
-        if os.environ.get("GEMMA4_PROFILE", "1") == "1":
-            total_s = host_prepare_s + fpga_execute_s
-            print("[Prefill] [profile] wall-clock time:", flush=True)
-            print(f"[Prefill] [profile]   host_prepare  {host_prepare_s:8.3f}s")
-            print(f"[Prefill] [profile]   fpga_execute  {fpga_execute_s:8.3f}s")
-            print(f"[Prefill] [profile]   TOTAL         {total_s:8.3f}s", flush=True)
         return latency, flop_rate_program
 
     def compile_decoder(self, layer_size: int = 35, profile: bool = False) -> tuple[None, list[int], list[int]]:
@@ -2654,7 +2639,7 @@ def main():
         epilog="""examples:
   python gemma4_e2b_refactor.py                          # default prompt
   python gemma4_e2b_refactor.py --prompt "your prompt"   # custom prompt
-  python gemma4_e2b_refactor.py --dev xdma1 --cycle 5.62
+  python gemma4_e2b_refactor.py --dev xdma1 --cycle 5.042
 
 default prompt: "x+3=5, what is x?"
                 (pre-tokenized as default_prefill_tokens in gemma4_e2b_config.json)""")
@@ -2664,8 +2649,9 @@ default prompt: "x+3=5, what is x?"
                         help="Use gemma4_e2b_bin/params.bin instead of the configured weights bin.")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=5.62,
-                        help='Clock cycle time in nanoseconds (default: 5.62)')
+    parser.add_argument('--cycle', type=float, default=1000 / 198.3256,
+                        help='Clock cycle time in nanoseconds '
+                             '(default: 1000/198.3256 ≈ 5.042, i.e. 198.3256 MHz)')
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
