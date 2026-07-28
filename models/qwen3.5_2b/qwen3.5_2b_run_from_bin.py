@@ -52,7 +52,7 @@ _spec = importlib.util.spec_from_file_location(
 T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)
 
-MAX_CONTEXT = 512
+MAX_CONTEXT = 256
 TEMPERATURE = 0.0
 TOP_K = 0
 
@@ -84,7 +84,12 @@ def main():
                     help="Clock cycle time in ns. Defaults to board profile value.")
     args = ap.parse_args()
 
-    T.configure_q35_runtime(args.device, dma_device=args.dev, cycle=args.cycle)
+    T.set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    T.DMA_DEVICE_H2C = T.user_dma_core.DMA_DEVICE_H2C
+    T.DMA_DEVICE_C2H = T.user_dma_core.DMA_DEVICE_C2H
+    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
+    T.user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    T.user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
 
     vision_on = bool(args.image) or args.vision_enable
     _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))

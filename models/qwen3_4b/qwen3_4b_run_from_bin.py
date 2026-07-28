@@ -930,7 +930,6 @@ def main():
     _SILENT_MODE = True
     ue = Qwen3_4b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     _SILENT_MODE = False
-    _original_print(f"DMA/DRAM: H2C={DMA_DEVICE_H2C}, C2H={DMA_DEVICE_C2H}, USER={DMA_DEVICE_USER}, params=0x{ue._params_dram_base:08X}, tensor=0x{ue._tensor_dram_base:08X}, program=0x{ue._program_dram_base:08X}, end=0x{0xFFFFFFFF:08X}")
 
     cfg = ue._cfg
     user_prompt = args.prompt if args.prompt is not None else cfg.get("default_prompt", "What is 3 + 5?")

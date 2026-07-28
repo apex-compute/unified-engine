@@ -4652,7 +4652,7 @@ def main():
                     choices=["bittware", "rk", "puzhi", "alinx", "alveo", "kintex7", "efinix"],
                     help="FPGA board profile. Default: bittware.")
     ap.add_argument("--dev", type=str, default="xdma0",
-                    help="DMA device name. Default: xdma0.")
+                    help="DMA device name. (default: xdma0).")
     ap.add_argument("--cycle", type=float, default=None,
                     help="Clock cycle time in ns. Defaults to board profile value.")
     # VLM opt-in (gemma4 pattern). Default mode is pure LM; vision activates
