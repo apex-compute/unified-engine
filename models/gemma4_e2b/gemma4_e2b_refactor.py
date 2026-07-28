@@ -1217,27 +1217,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.release_isa_reg()       # i_reg
 
     def compile_prefill(self, seq_len: int, layer_size: int = 35) -> tuple[None, int]:
-        """Emit ISA for prefill into the currently open capture buffer.
+        """Emit ISA for prefill into the currently open capture buffer, sized
+        for the ACTUAL prompt ``seq_len`` — no fixed template, no padding.
 
-        DYNAMIC PBI (see notes_gemma4_e2b.md): seq_len-agnostic
-        captured program. Bulk PBI ops (matmat / rms_norm / eltwise) read M
-        from self.gpr_seq_len at execute time. Attention calls the library
-        unified_attention_core inline with dynamic batch/aligned dimensions.
-        Per-token Python loops (V-norm, RoPE, K/V dup, partial-rotary copies,
-        broadcast_mul) iterate at PREFILL_MAX_SEQ_LEN; runtime ops beyond
-        actual seq_len consume stale K cache rows that attention bias masks out.
-
-        ``seq_len`` arg is FLOPs/template only — host preamble primes
-        gpr_seq_len / gpr_q_seq_len / gpr_aligned_seq_len with actual runtime
-        values before each program execute.
+        The prefill program is compiled per prompt (see compile_and_load_prefill),
+        so the per-token Python loops (V-norm, RoPE, K/V dup, partial-rotary
+        copies, broadcast_mul) iterate exactly ``seq_len`` times. Bulk PBI ops
+        (matmat / rms_norm / eltwise) still read M from gpr_seq_len at execute
+        time; run_prefill primes gpr_seq_len / gpr_q_seq_len / gpr_aligned_seq_len
+        with this same ``seq_len`` before launching.
         """
-        # Template iteration counts come from PREFILL_MAX_SEQ_LEN so the captured
-        # program is portable across all real seq_lens ≤ PREFILL_MAX.
-        template_seq_len = int(self._cfg["model"].get(
-            "prefill_max_seq_len",
-            self._cfg["model"].get("max_prefill_seq_len",
-                                    self._cfg["model"]["max_context_size"])))
-        seq_len = template_seq_len
         self.seq_len = seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
@@ -1247,7 +1236,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = True
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
-        _original_print(f"  Emitting dynamic-PBI prefill: {layer_size} layers, template={template_seq_len}, attention=unified-inline")
+        _original_print(f"  Emitting prefill: {layer_size} layers, seq_len={seq_len}, attention=unified-inline")
         prefill_t0 = time.perf_counter()
         for layer_idx in range(layer_size):
             if layer_idx > 0 and layer_idx % 10 == 0:
@@ -1639,35 +1628,71 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
     def run_prefill(self, prefill_program_addr: int, prefill_seq=None, flops: int = None) -> dict:
         """
-        Run prefill. Uses prefill_seq if provided, otherwise self.prefill_seq (set by set_prefill_seq()).
+        Run prefill for the actual prompt — single entry, no bucket/padding.
+
+        The prefill program at ``prefill_program_addr`` must have been compiled
+        for this exact prompt length via compile_and_load_prefill (self.seq_len
+        is set there). This method restores clean FPGA state, uploads the
+        prompt's embeddings / per-layer inputs / attention bias, primes the
+        dynamic gpr registers, and launches the program.
 
         Args:
-            prefill_program_addr: The address of the prefill program in DRAM.
-            prefill_seq: Optional sequence; if None, uses self.prefill_seq.
-            flops: The number of FLOPS to use for the prefill.
+            prefill_program_addr: DRAM address of the compiled prefill program.
+            prefill_seq: Full prompt token tuple (incl. the final token, which
+                is NOT processed by prefill); if None, uses self.prefill_seq.
+            flops: FLOP count for the HW rate counter.
 
         Returns:
-            A tuple containing the latency and flop rate.
+            (latency, flop_rate) from the accelerator.
         """
         if prefill_seq is None:
             prefill_seq = self.prefill_seq
         if prefill_seq is None:
             prefill_seq = tuple(self._cfg["default_prefill_tokens"])
-        # Prefill processes all but the last token
-        if len(prefill_seq) > 1:
-            prefill_seq = prefill_seq[:-1]
-            assert len(prefill_seq) == self.seq_len, f"Expected seq_len {self.seq_len}, but got {len(prefill_seq)}"
-        else:
+        if len(prefill_seq) < 2:
             raise ValueError("Prefill sequence must have at least 2 tokens.")
-
+        # Prefill processes all but the last token.
+        prefill_seq = tuple(prefill_seq[:-1])
         seq_len = len(prefill_seq)
         assert seq_len <= self.max_prefill_seq_len, (
             f"Prefill length {seq_len} exceeds max_prefill_seq_len {self.max_prefill_seq_len}. "
             f"Bump 'max_prefill_seq_len' in gemma4_e2b_config.json (and raise _tensor_estimate "
             f"in __init__ accordingly) to support longer prompts."
         )
+        # The compiled program's static per-token loops were emitted at this
+        # seq_len; keep self.seq_len consistent for the dynamic-gpr preamble and
+        # for run_decoder, which resumes from this position.
+        self.seq_len = seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+
+        # Restore clean FPGA state before this prefill (formerly in
+        # run_prefill_bucketed): clear stuck queue state, zero the entire K/V
+        # cache so decode's bias-masked reads past seq_len see clean zeros, zero
+        # the attention Q/K/V gather buffers, and re-upload the IDENTITY matrix
+        # (read by the attention I @ V^T step). Idempotent for LM-only runs.
+        self.software_reset()
+        from user_dma_core import UE_VECTOR_SIZE as _UE_VS
+        num_slots = getattr(self, "_num_kv_slots", self.LAYER_SIZE)
+        kv_slot_elems = num_slots * self.MAX_CONTEXT_SIZE * self.head_dim
+        kv_zero_pad = torch.zeros(kv_slot_elems, dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
+        self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
+        _pre_align = ((self.max_prefill_seq_len * self.group_size + 63) // 64) * 64
+        flash_qkv_elems = _pre_align * self.head_dim
+        _flash_zero = torch.zeros(flash_qkv_elems, dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, _flash_zero)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, _flash_zero)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, _flash_zero)
+        self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR,
+                                       torch.eye(_UE_VS, dtype=torch.bfloat16))
+        print(f"[Prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
+
+        # --- prefill profiler: two parts, wall-clock only. host_prepare covers
+        # all host-side work (embedding lookup, per-layer inputs, bias build)
+        # plus the DMAs that feed the FPGA; fpga_execute is the accelerator run.
+        # Summary printed at the end; set GEMMA4_PROFILE=0 to silence it.
+        _host_prepare_w0 = time.perf_counter()
 
         print(f"[Prefill] [host] looking up token embeddings for {seq_len} tokens...", flush=True)
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
@@ -1760,6 +1785,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.isa_add_set_core(self.gpr_q_seq_len,  q_seq_len)
         self.isa_add_set_core(self.gpr_aligned_seq_len, aligned_seq_len)
 
+        # End of host prep — everything above ran on the host (CPU + DMA to feed
+        # the FPGA); everything below is the accelerator run.
+        host_prepare_s = time.perf_counter() - _host_prepare_w0
+
         print(f"[Prefill] [exec] launching prefill program on FPGA ({seq_len} tokens, {self.LAYER_SIZE} layers)...", flush=True)
         # Heartbeat thread: program_execute blocks until the FPGA halts, with no
         # intermediate visibility. Print elapsed seconds every 10s so the user
@@ -1777,6 +1806,17 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         finally:
             _pf_stop.set()
             _pf_th.join(timeout=1.0)
+        fpga_execute_s = time.perf_counter() - _pf_t0
+
+        # Profile summary: two parts, wall-clock only. host_prepare is host-side
+        # work (torch compute + DMA); fpga_execute is the accelerator run.
+        # Set GEMMA4_PROFILE=0 to silence.
+        if os.environ.get("GEMMA4_PROFILE", "1") == "1":
+            total_s = host_prepare_s + fpga_execute_s
+            print("[Prefill] [profile] wall-clock time:", flush=True)
+            print(f"[Prefill] [profile]   host_prepare  {host_prepare_s:8.3f}s")
+            print(f"[Prefill] [profile]   fpga_execute  {fpga_execute_s:8.3f}s")
+            print(f"[Prefill] [profile]   TOTAL         {total_s:8.3f}s", flush=True)
         return latency, flop_rate_program
 
     def compile_decoder(self, layer_size: int = 35) -> tuple[None, list[int], list[int]]:
@@ -2105,10 +2145,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 bytes_written += sz
                 del chunk
         self.allocate_program_dram(prog_size)
+        # The cursor now sits just past the decoder region; that is where
+        # compile_and_load_prefill will place each per-prompt prefill program.
 
-        # Resolve addr strings → ints for caller convenience.
-        # Dynamic PBI: single prefill / decoder program (no buckets).
-        manifest["_prefill_addr_int"] = int(manifest["prefill_program_start_addr"], 16)
+        # Resolve addr strings → ints for caller convenience. Only the decoder
+        # lives in the bin now — the prefill program is compiled per prompt.
         manifest["_decoder_addr_int"] = int(manifest["decoder_program_start_addr"], 16)
         manifest["_base_addr_int"]     = base_addr
         if manifest.get("contains_vision") and "vision_program_start_addr" in manifest:
@@ -2120,93 +2161,70 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
               + (" (+audio)"  if manifest.get("contains_audio") else ""))
         return manifest
 
-    def run_prefill_bucketed(self, manifest: dict, prefill_seq=None) -> tuple[int, float]:
-        """Dynamic-PBI prefill with template-padded prompt.
+    def compile_and_load_prefill(self, seq_len: int, layer_size: int = 35) -> tuple[int, int]:
+        """Compile the prefill program for the ACTUAL prompt ``seq_len`` and DMA
+        it straight into program DRAM — no file, no template, no padding.
 
-        Pads the prompt up to prefill_max_seq_len with the last real token,
-        runs the single captured prefill program (matmuls + per-token Python
-        loops emit at template size), then restores self.seq_len to the
-        actual prompt length for decode. Bias masking + the host's
-        per-layer-input padding ensure padded positions don't contaminate
-        valid outputs.
+        The program is placed at the current program-DRAM cursor, which sits
+        just past the decoder region loaded by load_instruction_bin. The cursor
+        is NOT advanced, so calling this again with a different prompt simply
+        overwrites the same region. Jump/loop targets baked by the emitters
+        resolve against get_program_dram_addr() (held constant across the
+        capture), so DMA'ing the serialized bytes back to that same base makes
+        them valid.
+
+        Returns (prefill_program_addr, prefill_total_flops).
         """
-        if prefill_seq is None:
-            prefill_seq = self.prefill_seq
-        if prefill_seq is None or len(prefill_seq) < 2:
-            raise ValueError("Prefill sequence must have at least 2 tokens.")
+        prefill_base = self.get_program_dram_addr()
 
-        prefill_tokens = tuple(prefill_seq[:-1])
-        actual_seq_len = len(prefill_tokens)
-        prefill_max = manifest["prefill_max_seq_len"]
-        if actual_seq_len > prefill_max:
-            raise ValueError(
-                f"prefill length {actual_seq_len} exceeds compiled "
-                f"prefill_max_seq_len={prefill_max}. Recompile with a larger value.")
-
-        prefill_program_addr = manifest["_prefill_addr_int"]
-        flops = manifest["prefill_total_flops"]
-
-        # Pad to template_seq_len so static per-token loops see valid data.
-        pad_token = prefill_tokens[-1]
-        pad_count = prefill_max - actual_seq_len
-        padded_tokens = list(prefill_tokens) + [pad_token] * pad_count
-        padded_seq = tuple(padded_tokens) + (prefill_seq[-1],)
-        if hasattr(self, "_mm_types") and self._mm_types is not None and pad_count > 0:
-            self._mm_types = list(self._mm_types[:actual_seq_len]) + [0] * pad_count
-
-        print(f"[dyn-prefill] actual={actual_seq_len}, template_buffer={prefill_max}, "
-              f"gpr_seq_len={prefill_max}, addr=0x{prefill_program_addr:X}")
-
-        # ------------------------------------------------------------------
-        # LM-state restore (post vision/audio compile). vision_tensor_init
-        # deliberately reuses LM tensor DRAM (resets the allocator cursor)
-        # so any compile_instruction_bin call that included image_path /
-        # audio_path leaves vision encoder data in LM tensor regions.
-        # Mirrors set_prefill_seq_vlm's restoration so the pure-LM path
-        # produces the same DRAM state the LM ISA expects. Idempotent for
-        # LM-only-bin runs (just a few small DMAs).
-        # ------------------------------------------------------------------
-        self.software_reset()  # clear stuck queue state from any prior failing run
-        from user_dma_core import UE_VECTOR_SIZE as _UE_VS
-        # Zero ENTIRE K/V cache (0..MAX_CONTEXT_SIZE). Prefill overwrites
-        # positions 0..prefill_max-1 with K/V data; positions prefill_max..
-        # MAX stay zero so decoder's gather + bias-masked softmax sees clean
-        # zeros (not NaN-prone vision floats). NOTE: tensor size is in
-        # element count (bfloat16), not bytes — self.head_dim, not self.k_size.
-        num_slots = getattr(self, "_num_kv_slots", self.LAYER_SIZE)
-        kv_slot_elems = num_slots * self.MAX_CONTEXT_SIZE * self.head_dim
-        kv_zero_pad = torch.zeros(kv_slot_elems, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
-        self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
-        # Re-DMA the identity matrix used by transpose/matmul helper kernels.
-        # Done AFTER the K/V zeros so accidental adjacent buffer overflow from
-        # those big DMAs cannot clobber IDENTITY.
-        # Re-zero the attention Q/K/V gather buffers (tensor_init does this).
-        # Decoder writes them per gather but LM prefill's per-token loops at
-        # template_seq_len assume zero-padding for rows past actual_seq_len.
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        _orig_builtin_print = builtins.print
+        builtins.print = lambda *a, **kw: None
         try:
-            from user_dma_core import UE_FMAX_CONTEXT_SIZE  # noqa: F401
-            _pre_align = ((self.max_prefill_seq_len * self.group_size + 63) // 64) * 64
-        except Exception:
-            _pre_align = self.max_prefill_seq_len * self.group_size
-        flash_qkv_elems = _pre_align * self.head_dim
-        _flash_zero = torch.zeros(flash_qkv_elems, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, _flash_zero)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, _flash_zero)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, _flash_zero)
-        # Re-DMA the identity matrix (decoder_attention_core reads it for
-        # the I @ V^T step). Done AFTER the K/V + FLASH zeros so accidental
-        # adjacent-buffer overflow from those big DMAs cannot clobber IDENTITY.
-        self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR,
-                                       torch.eye(_UE_VS, dtype=torch.bfloat16))
-        print(f"[dyn-prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
+            self.clear_inst_id()
+            self.clear_capture_buffer()
+            self.start_capture()
+            # Leading flag-clear (instruction 0); prefill body starts at
+            # instruction 1, mirroring compile_instruction_bin's layout so the
+            # exec address lands past the flag-clear.
+            self.generate_instruction_flag_clear()
+            count_at_start = self.capture_count
+            _, prefill_total_flops = self.compile_prefill(seq_len=seq_len, layer_size=layer_size)
+            self.stop_capture()
+            prefill_program_addr = prefill_base + count_at_start * INSTRUCTION_SIZE_BYTES
+            pf_bytes = bytearray()
+            for inst in self.capture_buffer:
+                pf_bytes.extend(inst.get_bytes())
+            self.clear_capture_buffer()
+        finally:
+            _SILENT_MODE = False
+            builtins.print = _orig_builtin_print
 
-        self.seq_len = prefill_max
-        latency, flop_rate = self.run_prefill(prefill_program_addr,
-                                              prefill_seq=padded_seq,
-                                              flops=flops)
-        self.seq_len = actual_seq_len
-        return latency, flop_rate
+        # DMA the freshly compiled program to its base (chunked so a long
+        # prompt's program never spikes host RSS).
+        prog_size = len(pf_bytes)
+        CHUNK = 64 * 1024 * 1024
+        buf = bytes(pf_bytes)
+        for off in range(0, prog_size, CHUNK):
+            sz = min(CHUNK, prog_size - off)
+            self.dma_write(DMA_DEVICE_H2C, prefill_base + off, buf[off:off + sz], sz)
+
+        # Reserve the prefill program region by advancing the program-DRAM
+        # cursor past it. run_prefill / run_decoder prime the dynamic gpr
+        # registers via isa_add_set_core, which writes a one-shot program at
+        # the CURRENT program cursor and advances it. If the cursor still sat
+        # at prefill_base (the region is NOT advanced during capture), that
+        # first micro-op would overwrite the prefill program's body — prefill
+        # would then execute a stray HALT and never populate the KV cache,
+        # cascading into a 0-cycle decode. Rewind to prefill_base first so a
+        # re-compile for a new prompt reuses this region instead of leaking.
+        self._next_program_dram_addr = prefill_base
+        self.allocate_program_dram(prog_size)
+
+        _original_print(f"[prefill-compile] seq_len={seq_len}: {prog_size/1024:.1f} KB "
+                        f"-> 0x{prefill_base:X} (exec addr 0x{prefill_program_addr:X})")
+        return prefill_program_addr, prefill_total_flops
 
     def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> dict:
         """Run decode loop with dynamic PBI.
@@ -2370,8 +2388,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
 
     def compile_instruction_bin(self, layer_size: int = 35) -> tuple[str, dict]:
-        """Compile the LM core (one dynamic-PBI prefill program + one dynamic-PBI
-        decoder program) into gemma4_e2b_bin/programs.bin plus a manifest sidecar.
+        """Compile the DECODER program (one dynamic-PBI decoder) into
+        gemma4_e2b_bin/programs.bin plus a manifest sidecar.
+
+        Only the decoder is cached: it is prompt-length independent (one
+        dynamic-PBI program handles every decode position via gpr_seq_len), so
+        it is compiled once. The prefill program is NOT in this bin — it is
+        compiled per prompt at the real seq_len by compile_and_load_prefill and
+        DMA'd straight into program DRAM just past this decoder region.
 
         Absolute addresses baked into the manifest are tied to the program-DRAM
         address captured at start_capture time, so the loader
@@ -2382,10 +2406,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         os.makedirs(bin_dir, exist_ok=True)
         bin_path  = os.path.join(bin_dir, "programs.bin")
         meta_path = os.path.join(bin_dir, "programs.json")
-
-        # Dynamic PBI: single prefill program (template = prefill_max_seq_len) +
-        # single decoder program.
-        prefill_max_seq_len = self._cfg["model"].get("prefill_max_seq_len", 512)
 
         # Belt-and-suspenders silencing: _SILENT_MODE only mutes prints routed
         # through our quiet_print wrapper; some library prints reach the
@@ -2403,17 +2423,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
             instruction_base_addr = self.get_program_dram_addr()
 
-            _original_print(f"[instr-bin] Compiling 1 prefill program "
-                            f"(template seq_len={prefill_max_seq_len})...")
-            prefill_count_at_start = self.capture_count
-            t0 = time.perf_counter()
-            _, prefill_total_flops_scalar = self.compile_prefill(
-                seq_len=prefill_max_seq_len, layer_size=layer_size)
-            prefill_size_bytes = (self.capture_count - prefill_count_at_start) * 32
-            prefill_program_addr = instruction_base_addr + prefill_count_at_start * 32
-            _original_print(f"  [prefill] {prefill_size_bytes/1024:.1f} KB "
-                            f"({time.perf_counter()-t0:.1f}s)")
-
             decoder_count_at_start = self.capture_count
             _original_print(f"[instr-bin] Compiling 1 decoder program (dynamic PBI)...")
             _t_dec = time.perf_counter()
@@ -2425,7 +2434,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                             f"({time.perf_counter()-_t_dec:.1f}s)")
 
             _t_serialize = time.perf_counter()
-            _original_print(f"[instr-bin] Serializing LM instruction stream "
+            _original_print(f"[instr-bin] Serializing decoder instruction stream "
                             f"({self.capture_count:,} insts)...", flush=True)
             self.stop_capture()
             lm_bytes = bytearray()
@@ -2433,7 +2442,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 lm_bytes.extend(inst.get_bytes())
             self.clear_capture_buffer()
             lm_size_bytes = len(lm_bytes)
-            _original_print(f"[instr-bin] LM section: {lm_size_bytes/1024/1024:.1f} MB "
+            _original_print(f"[instr-bin] Decoder section: {lm_size_bytes/1024/1024:.1f} MB "
                             f"(serialize {time.perf_counter()-_t_serialize:.1f}s)")
         finally:
             _SILENT_MODE = False
@@ -2451,10 +2460,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             "instruction_bin": os.path.relpath(bin_path, self.script_dir),
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "instruction_total_size": program_size,
-            "prefill_max_seq_len": prefill_max_seq_len,
-            "prefill_program_start_addr": f"0x{prefill_program_addr:X}",
-            "prefill_program_size": prefill_size_bytes,
-            "prefill_total_flops": prefill_total_flops_scalar,
             "decoder_max_seq_len": self.MAX_CONTEXT_SIZE,
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_size_bytes,
@@ -2478,7 +2483,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._program_dram_base = instruction_base_addr
 
         print(f"[instr-bin] Wrote {program_size/1024/1024:.2f} MB -> {bin_path}")
-        print(f"[instr-bin]   LM: {lm_size_bytes/1024/1024:.1f} MB")
+        print(f"[instr-bin]   Decoder: {lm_size_bytes/1024/1024:.1f} MB")
         print(f"[instr-bin] Manifest: {meta_path}")
         return bin_path, manifest
 
@@ -2520,21 +2525,22 @@ default prompt: "x+3=5, what is x?"
 
     ue = Gemma4_UnifiedEngine(local_weights=args.local_weights)
 
-    # Cold-start build: if the LM bin is missing, compile it ONCE. Subsequent
-    # runs just load the bin and execute.
+    # Cold-start build: the DECODER bin is prompt-independent, so compile it
+    # ONCE and cache. The prefill program is compiled per prompt below.
     bin_dir = os.path.join(SCRIPT_DIR, "gemma4_e2b_bin")
     instr_bin = os.path.join(bin_dir, "programs.bin")
     instr_meta = os.path.join(bin_dir, "programs.json")
     if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
-        print(f"\n--- First-time compile: building LM programs.bin ---")
+        print(f"\n--- First-time compile: building decoder programs.bin ---")
         timer = time.perf_counter()
         ue.compile_instruction_bin()
-        print(f"[compile] LM bin built in {time.perf_counter() - timer:.2f} seconds")
+        print(f"[compile] decoder bin built in {time.perf_counter() - timer:.2f} seconds")
     else:
-        print(f"[compile] programs.bin already present, skipping ISA emission.")
+        print(f"[compile] programs.bin already present, skipping decoder ISA emission.")
 
     manifest = ue.load_instruction_bin()
 
+    # Prompt first — the prefill program is compiled for its exact length.
     if args.prompt:
         print(f"[Mode] LM -- prompt: {args.prompt!r}")
         ue.set_prefill_seq(args.prompt)
@@ -2548,6 +2554,14 @@ default prompt: "x+3=5, what is x?"
     flops_per_token = [manifest["decoder_total_flops"]]
     decoder_base_addr = manifest["_decoder_addr_int"]
 
+    # Compile the prefill program for the ACTUAL prompt length (prefill
+    # processes all but the last token) and DMA it into program DRAM.
+    prefill_seq_len = len(ue.prefill_seq) - 1
+    print(f"\n--- Compiling prefill for seq_len={prefill_seq_len} ---")
+    timer = time.perf_counter()
+    prefill_program_addr, prefill_flops = ue.compile_and_load_prefill(prefill_seq_len)
+    print(f"[compile] prefill compiled + loaded in {time.perf_counter() - timer:.2f} seconds")
+
     print(f"\n--- Starting prefill ---")
     print(f"--- Prompt begin ({len(ue.prefill_seq)} tokens) ---")
     print(f"  [{', '.join(str(t) for t in ue.prefill_seq)}]")
@@ -2558,7 +2572,8 @@ default prompt: "x+3=5, what is x?"
         print(f"  text: (decode failed: {_e})")
     print(f"--- Prompt end ---")
     timer = time.perf_counter()
-    latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill_bucketed(manifest)
+    latency_hw_prefill, flop_rate_hw_prefill = ue.run_prefill(
+        prefill_program_addr, flops=prefill_flops)
     latency_prefill = time.perf_counter() - timer
     print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
