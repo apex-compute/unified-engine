@@ -69,6 +69,22 @@ def quiet_print(*args, **kwargs):
 builtins.print = quiet_print
 # ---------------------------------------------
 
+# Vision encoder matmuls (Q/K/V/O proj, MLP gate/up/down, patch/embed proj) are
+# IF4-quantized, same codec as the LM path. Norms stay BF16. Kept module-level so
+# a numeric harness (gemma4_e2b_numeric-style) can import it for HW-mimicking refs.
+VISION_QUANT_PRECISION = "if4"
+
+# Fixed canonical vision input: every image is resized to VISION_CANONICAL_SIZE
+# before the HF processor so num_patches is always VISION_FIXED_NUM_PATCHES, which
+# lets the vision encoder bin be compiled once for a fixed shape.
+VISION_CANONICAL_SIZE = (896, 896)   # (width, height) for PIL.Image.resize
+VISION_FIXED_NUM_PATCHES = 2520
+
+# Shipped sample image for VLM mode (same as gemma4_e2b_test.py's DEFAULT_IMAGE):
+# repo test_samples/yosemite.jpg, two folders up from this script.
+DEFAULT_IMAGE = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samples", "yosemite.jpg"))
+
+
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
     if isinstance(val, str):
@@ -183,6 +199,118 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
         }
         print(f"  Host section: {total/1024**3:.2f} GiB, 3 tensors + scalars + kv_shared_map")
         return out, manifest
+
+    def _build_vision_section_bytes(hf_model) -> tuple[bytes, dict]:
+        """Pre-quantize the Gemma4 vision-tower weights once and return
+        (section_bytes, section_manifest). Ported from gemma4_e2b_test.py.
+
+        The manifest holds tensor offsets RELATIVE to the vision section start
+        (vision_weight_init adds the section's absolute file offset) plus the
+        scalars the loader needs (VIS_* dims, VIS_ROPE_PERM, clip ranges). Q/K/V
+        output rows and O input columns are permuted by VIS_ROPE_PERM (the
+        interleaved→head-major 2D-RoPE layout the FPGA attention expects); the
+        Q/K norms get the same permutation. Projection matmuls are IF4; norms and
+        the position-embedding table stay BF16.
+        """
+        vt = hf_model.model.vision_tower
+        ev = hf_model.model.embed_vision
+        H, MLP, HD, NH = 768, 3072, 64, 12
+        L_count = 16
+
+        VIS_ROPE_PERM = torch.cat([
+            torch.arange(0, 16), torch.arange(32, 48),
+            torch.arange(16, 32), torch.arange(48, 64),
+        ])
+
+        def _perm_qkv(w: torch.Tensor) -> torch.Tensor:
+            return w.reshape(NH, HD, -1)[:, VIS_ROPE_PERM, :].reshape(NH * HD, -1).contiguous()
+        def _perm_o(w: torch.Tensor) -> torch.Tensor:
+            return w.reshape(-1, NH, HD)[:, :, VIS_ROPE_PERM].reshape(-1, NH * HD).contiguous()
+
+        sections: list[tuple[str, bytes, list[int], str]] = []
+
+        def _add_bf16(key: str, w: torch.Tensor) -> None:
+            wc = w.contiguous()
+            sections.append((key, wc.view(torch.uint8).numpy().tobytes(), list(wc.shape), "bf16"))
+
+        # Per-layer weights.
+        for li in range(L_count):
+            L = vt.encoder.layers[li]
+            pre = f"layer{li}"
+            for n in ["input_layernorm", "post_attention_layernorm",
+                      "pre_feedforward_layernorm", "post_feedforward_layernorm"]:
+                _add_bf16(f"{pre}.{n}", getattr(L, n).weight.detach().cpu().to(torch.bfloat16))
+            for n in ["q_norm", "k_norm"]:
+                w = getattr(L.self_attn, n).weight.detach().cpu().to(torch.bfloat16)
+                _add_bf16(f"{pre}.{n}", w[VIS_ROPE_PERM])
+            q4_names = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+            q4_tensors: list[torch.Tensor] = []
+            for proj in ["q_proj", "k_proj", "v_proj"]:
+                w = getattr(L.self_attn, proj).linear.weight.detach().cpu().to(torch.bfloat16)
+                q4_tensors.append(_perm_qkv(w))
+            q4_tensors.append(_perm_o(L.self_attn.o_proj.linear.weight.detach().cpu().to(torch.bfloat16)))
+            for mlp in ["gate_proj", "up_proj", "down_proj"]:
+                q4_tensors.append(getattr(L.mlp, mlp).linear.weight.detach().cpu().to(torch.bfloat16))
+            qs = _parallel_quantize(VISION_QUANT_PRECISION, [t.contiguous() for t in q4_tensors])
+            for name, w, (data_b, scale_b) in zip(q4_names, q4_tensors, qs):
+                sections.append((f"{pre}.{name}.scale", scale_b, list(w.shape), f"{VISION_QUANT_PRECISION}_scale"))
+                sections.append((f"{pre}.{name}.data",  data_b,  list(w.shape), f"{VISION_QUANT_PRECISION}_data"))
+
+        # Non-layer weights.
+        pe = vt.patch_embedder
+        _add_bf16("pos_embedding_table",
+                  pe.position_embedding_table.detach().cpu().to(torch.bfloat16))
+        _add_bf16("embed_norm_gamma", torch.ones(H, dtype=torch.bfloat16))
+        _add_bf16("v_norm_ones_gamma", torch.ones(HD, dtype=torch.bfloat16))
+
+        w_patch = pe.input_proj.weight.detach().cpu().to(torch.bfloat16).contiguous()
+        w_embed = ev.embedding_projection.weight.detach().cpu().to(torch.bfloat16).contiguous()
+        pq = _parallel_quantize(VISION_QUANT_PRECISION, [w_patch, w_embed])
+        for name, w, (d, s) in zip(["patch_proj", "embed_proj"], [w_patch, w_embed], pq):
+            sections.append((f"{name}.scale", s, list(w.shape), f"{VISION_QUANT_PRECISION}_scale"))
+            sections.append((f"{name}.data",  d, list(w.shape), f"{VISION_QUANT_PRECISION}_data"))
+
+        # Clip ranges from the Gemma4ClippableLinear wrappers (JSON can't hold inf).
+        def _finite(x):
+            if x == float("inf"):  return "inf"
+            if x == -float("inf"): return "-inf"
+            return float(x)
+        clip_ranges = []
+        for li in range(L_count):
+            L = vt.encoder.layers[li]
+            cr: dict = {}
+            for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj",
+                              "gate_proj", "up_proj", "down_proj"]:
+                proj = (getattr(L.self_attn, proj_name) if proj_name in
+                        ("q_proj", "k_proj", "v_proj", "o_proj") else getattr(L.mlp, proj_name))
+                if proj.use_clipped_linears:
+                    cr[proj_name] = {
+                        "input":  [_finite(proj.input_min.item()),  _finite(proj.input_max.item())],
+                        "output": [_finite(proj.output_min.item()), _finite(proj.output_max.item())],
+                    }
+                else:
+                    cr[proj_name] = {"input": ["-inf", "inf"], "output": ["-inf", "inf"]}
+            clip_ranges.append(cr)
+
+        out = bytearray()
+        section_meta: dict = {}
+        cur = 0
+        for key, b, shape, dtype in sections:
+            section_meta[key] = {"offset": cur, "size": len(b), "shape": shape, "dtype": dtype}
+            out.extend(b)
+            cur += len(b)
+        manifest = {
+            "vision_quant_precision": VISION_QUANT_PRECISION,
+            "num_layers": L_count,
+            "VIS_H": H, "VIS_MLP": MLP, "VIS_HEAD_DIM": HD, "VIS_HEADS": NH,
+            "VIS_POOL_K": int(vt.config.pooling_kernel_size),
+            "VIS_TEXT_H": int(ev.embedding_projection.weight.shape[0]),
+            "VIS_ROPE_PERM": VIS_ROPE_PERM.tolist(),
+            "sections": section_meta,
+            "clip_ranges": clip_ranges,
+        }
+        print(f"  Vision section: {cur/1024**2:.1f} MiB, {len(section_meta)} tensors")
+        return bytes(out), manifest
 
     def tokenizer_subset_extract(bin_dir: str, cfg: dict) -> str:
         """Copy the minimal tokenizer / processor files needed by
@@ -447,35 +575,38 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
     write_at(weight_defs["LM_HEAD_WEIGHT_DATA"], data_padded)
 
-    # Build the host side-cache bytes in memory (no separate files) and
-    # concatenate into ONE weights bin: [LM | host]. A single master manifest
-    # JSON holds each section's offset + its per-tensor sub-manifest.
-    #
-    # NOTE (LM-only refactor): the vision and audio sections are intentionally
-    # omitted here. weight_init reads section offsets from this manifest, so an
-    # existing combined [LM | vision | audio | host] params.bin still loads
-    # correctly for the LM path; only a from-scratch regeneration produces the
-    # slimmer [LM | host] layout. Add the vision/audio sections back when those
-    # encoders land in this module.
+    # Build the vision + host sections in memory (no separate files) and
+    # concatenate into ONE weights bin: [LM | vision | host]. A single master
+    # manifest JSON holds each section's offset + its per-tensor sub-manifest.
+    # (Audio is still omitted — add an audio_section between vision and host when
+    # that encoder lands.) weight_init reads section offsets from this manifest,
+    # so a combined [LM | vision | audio | host] bin also loads for the LM path.
+    vision_bytes, vision_manifest = _build_vision_section_bytes(model)
     host_bytes, host_manifest = _build_host_section_bytes(text_model, cfg)
 
-    lm_size   = len(buf)
-    host_size = len(host_bytes)
+    lm_size     = len(buf)
+    vision_size = len(vision_bytes)
+    host_size   = len(host_bytes)
+    vision_off  = lm_size
+    host_off    = lm_size + vision_size
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(buf)
+        f.write(vision_bytes)
         f.write(host_bytes)
-    total = lm_size + host_size
+    total = lm_size + vision_size + host_size
     print(f"Generated weights bin: {out_path} ({total/1024**3:.2f} GiB total; "
-          f"LM {lm_size/1024**3:.2f} GiB + host {host_size/1024**3:.2f} GiB)")
+          f"LM {lm_size/1024**3:.2f} GiB + vision {vision_size/1024**2:.1f} MiB + "
+          f"host {host_size/1024**3:.2f} GiB)")
 
     master_meta_path = out_path.rsplit(".", 1)[0] + ".json"
     master = {
         "compile_version": "v1",
         "total_size": total,
-        "lm_section":   {"offset": 0,       "size": lm_size},
-        "host_section": {"offset": lm_size, "size": host_size, "manifest": host_manifest},
+        "lm_section":     {"offset": 0,          "size": lm_size},
+        "vision_section": {"offset": vision_off, "size": vision_size, "manifest": vision_manifest},
+        "host_section":   {"offset": host_off,   "size": host_size,   "manifest": host_manifest},
     }
     with open(master_meta_path, "w") as f:
         json.dump(master, f, indent=2)
@@ -498,12 +629,34 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     return out_path
 
 
+def _ensure_hf_model(script_dir: str, cfg: dict):
+    """Module-level HF VLM loader for the runtime vision path (processor +
+    2D-RoPE tables + vision-tower config). Downloads on first use. Returns
+    (model, model_dir)."""
+    model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
+    hf_repo = cfg["paths"]["hf_model_repo"]
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
+        snapshot_download(repo_id=hf_repo, local_dir=model_dir)
+        _original_print("Download complete.")
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_dir, dtype=torch.bfloat16, device_map=None, trust_remote_code=True)
+    return model, model_dir
 
 
 class Gemma4_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine specialized to Gemma4 E2B (LM path): loads config + weight
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
+
+    # Vision encoder (SigLIP-style tower) constants — Gemma4 E2B.
+    VIS_H = 768          # hidden size
+    VIS_HEADS = 12       # attention heads
+    VIS_HEAD_DIM = 64    # head_dim = 768 / 12
+    VIS_MLP = 3072       # intermediate size
+    VIS_LAYERS = 16      # num_hidden_layers
+    VIS_ROPE_DIM = 32    # half of head_dim for 2D RoPE (64 / 2)
 
     def __init__(self, script_dir: str | None = None, local_weights: bool = False):
         engine_base = user_dma_core.UE_0_BASE_ADDR
@@ -517,16 +670,17 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         #   Act. Scratch  : 0x78000000 – 0x88000000  (256 MB) ← tensor_base default
         #   Act. KV cache : 0x88000000 – 0x98000000  (256 MB; tail of activation region)
         #   ISA Audio     : 0x98000000 – 0xa0000000  (128 MB)
-        #   ISA Unified   : 0xa0000000 – 0x100000000 (1.5 GB) ← program_base default
-        #     (formerly split into vision/prefill/decoder regions; collapsed
-        #     into one contiguous region for the combined program image
-        #     (LM prefill+decode ISA) plus the dispatch preamble past it.
-        #     Total fits comfortably under 4 GB; the prior base 0xC0000000
-        #     caused the image to overflow 4 GB once vision (~385 MB) was
-        #     appended to LM (~661 MB) in the full test.py build.)
+        #   ISA Vision    : 0xa0000000 – 0xc0000000  (512 MB) ← vision_tensor_init
+        #   ISA LM        : 0xc0000000 – 0x100000000 (1 GB)   ← program_base default
+        #     Vision (a separate encoder bin) and the LM combined image live in
+        #     DISJOINT program regions so both stay resident: vision runs first
+        #     and produces soft-token features, then LM prefill+decode runs.
+        #     The refactor's LM image is small (~7 MB, seq_len-agnostic dynamic
+        #     PBI), so 0xc0000000 has ~1 GB headroom — no overflow (that only bit
+        #     test.py's old monolithic LM+vision image).
         _params_base  = 0x00000000   # Weight region start
         _tensor_base  = 0x78000000   # Activation region start (stage scratch)
-        _program_base = 0xa0000000   # unified bin base, gives 1.5 GB headroom
+        _program_base = 0xc0000000   # LM ISA base; vision ISA sits at 0xa0000000
         super().__init__(BASE_ADDR=engine_base,
                           params_dram_base=_params_base,
                           program_dram_base=_program_base,
@@ -597,6 +751,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._weights_bin_rel = "gemma4_e2b_bin/params.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
+
+        # Vision-attention IDENTITY: unified_attention_core needs a
+        # UE_VECTOR_SIZE² bf16 identity for its V-transpose. The LM one
+        # (IDENTITY_DRAM_ADDR) lives in the tensor region that vision scratch
+        # overwrites, so keep a copy in the PARAMS region (untouched by vision
+        # scratch @ tensor DRAM and vision ISA @ 0xa0000000).
+        self._vis_identity_dram = self.allocate_params_dram(
+            UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
+        self.dma_to_accelerator_memory(
+            self._vis_identity_dram, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
 
     def _emit_sram_copy_chunked(self, src_addr: int, dst_addr: int,
                                  num_elements: int, chunk: int = 131072) -> None:
@@ -1009,6 +1173,1080 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.LAYER0_PER_LAYER_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * self.bytes_per_element)
 
         print(f"    Tensor DRAM usage: {self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
+
+    # ------------------------------------------------------------------
+    # Vision encoder (S1): weight + tensor init. Ported from
+    # gemma4_e2b_test.py. Vision runs before LM prefill and produces soft-token
+    # features that run_prefill merges into the prompt embeddings.
+    # ------------------------------------------------------------------
+    def _vision_weight_init_from_combined_bin(self, weights_bin_path: str, vision_section: dict) -> None:
+        """Load pre-quantized vision weights from the combined weights bin and
+        DMA to FPGA (no HF model, no quantization). ``vision_section['manifest']
+        ['sections']`` gives tensor offsets RELATIVE to the vision section start;
+        we add ``vision_section['offset']`` (absolute file offset) when seeking.
+        Allocation order MUST match _build_vision_section_bytes so DRAM addresses
+        line up with the addresses baked into the vision ISA."""
+        base_offset = int(vision_section["offset"])
+        meta = vision_section["manifest"]
+        if meta.get("vision_quant_precision") != VISION_QUANT_PRECISION:
+            raise RuntimeError(
+                f"vision section quant precision mismatch (disk: {meta.get('vision_quant_precision')!r}, "
+                f"expected {VISION_QUANT_PRECISION!r}). Regenerate the weights bin.")
+        self.VIS_ROPE_PERM = torch.tensor(meta["VIS_ROPE_PERM"], dtype=torch.long)
+        self.VIS_POOL_K    = int(meta["VIS_POOL_K"])
+        self.VIS_TEXT_H    = int(meta["VIS_TEXT_H"])
+        L_count = int(meta["num_layers"])
+        sections = meta["sections"]
+
+        def _str_to_float(v):
+            if v == "inf":  return float("inf")
+            if v == "-inf": return -float("inf")
+            return float(v)
+        self._vis_clip_ranges = []
+        for cr in meta["clip_ranges"]:
+            row = {}
+            for k, v in cr.items():
+                row[k] = {
+                    "input":  (_str_to_float(v["input"][0]),  _str_to_float(v["input"][1])),
+                    "output": (_str_to_float(v["output"][0]), _str_to_float(v["output"][1])),
+                }
+            self._vis_clip_ranges.append(row)
+
+        print(f"\n[Vision] Loading pre-quantized vision weights from combined bin "
+              f"({VISION_QUANT_PRECISION.upper()} block=64 + BF16 norms) ...")
+        with open(weights_bin_path, "rb") as f:
+            def _dma_section(key: str) -> int:
+                s = sections[key]
+                f.seek(base_offset + s["offset"])
+                bts = f.read(s["size"])
+                if len(bts) != s["size"]:
+                    raise RuntimeError(f"truncated section read {key} at offset {base_offset + s['offset']}")
+                addr = self.allocate_tensor_dram(s["size"])
+                self.dma_write(DMA_DEVICE_H2C, addr, bts, s["size"])
+                return addr
+
+            layer_weight_addrs = []
+            for li in range(L_count):
+                pre = f"layer{li}"
+                addrs = {}
+                for n in ["input_layernorm", "post_attention_layernorm",
+                          "pre_feedforward_layernorm", "post_feedforward_layernorm",
+                          "q_norm", "k_norm"]:
+                    addrs[n] = _dma_section(f"{pre}.{n}")
+                for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj",
+                                  "gate_proj", "up_proj", "down_proj"]:
+                    scale_addr = _dma_section(f"{pre}.{proj_name}.scale")
+                    data_addr  = _dma_section(f"{pre}.{proj_name}.data")
+                    addrs[proj_name] = {
+                        "data": data_addr, "scale": scale_addr,
+                        "shape": tuple(sections[f"{pre}.{proj_name}.data"]["shape"]),
+                    }
+                layer_weight_addrs.append(addrs)
+            self._vis_weight_addrs = layer_weight_addrs
+
+            # Position embedding table stays on host (one-time gather in
+            # vision_patch_embed). Allocation order below mirrors the bin builder.
+            s = sections["pos_embedding_table"]
+            f.seek(base_offset + s["offset"])
+            bts = f.read(s["size"])
+            self._vis_pos_embed_table = torch.frombuffer(
+                bytearray(bts), dtype=torch.bfloat16).reshape(*s["shape"]).clone()
+
+            self.VIS_EMBED_NORM_HAS_SCALE = False
+            self.VIS_EMBED_NORM_GAMMA = _dma_section("embed_norm_gamma")
+
+            for nm in ("patch_proj", "embed_proj"):
+                scale_addr = _dma_section(f"{nm}.scale")
+                data_addr  = _dma_section(f"{nm}.data")
+                info = {"data": data_addr, "scale": scale_addr,
+                        "shape": tuple(sections[f"{nm}.data"]["shape"])}
+                if nm == "patch_proj":
+                    self.VIS_PATCH_PROJ_INFO = info
+                else:
+                    self.VIS_EMBED_PROJ_INFO = info
+
+            self.VIS_V_NORM_ONES_GAMMA = _dma_section("v_norm_ones_gamma")
+        self._vis_weight_end = self.get_tensor_dram_addr()
+        print(f"  Vision weights loaded. Tensor DRAM usage: "
+              f"{self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
+
+    def vision_weight_init(self, hf_model=None) -> None:
+        """Upload vision encoder weights to FPGA DRAM from the combined bin's
+        pre-quantized vision section. Idempotent. Unlike test.py there is no
+        HF-model fallback — the refactor's weight bin always carries the vision
+        section (regenerate params.bin if this raises)."""
+        if getattr(self, "_vision_weight_init_done", False):
+            return
+        master = getattr(self, "_weights_master", None)
+        if not (master and "vision_section" in master
+                and "manifest" in master["vision_section"]):
+            raise RuntimeError(
+                "vision section missing from the weights bin. Delete "
+                "gemma4_e2b_bin/params.bin and re-run so weight_bin_generate "
+                "emits the [LM | vision | host] layout.")
+        weights_bin_path = os.path.join(self.script_dir, self._weights_bin_rel)
+        self._vision_weight_init_from_combined_bin(weights_bin_path, master["vision_section"])
+        self._vision_weight_init_done = True
+
+    def vision_tensor_init(self, num_patches: int, *, program_base: int | None = None) -> None:
+        """Allocate DRAM for vision encoder intermediate tensors. Reuses the LM
+        tensor DRAM region (vision and LM never run simultaneously). Vision ISA
+        goes to VISION_ISA_BASE unless ``program_base`` overrides it."""
+        bpe = self.bytes_per_element
+        H, HD, NH, MLP = self.VIS_H, self.VIS_HEAD_DIM, self.VIS_HEADS, self.VIS_MLP
+        S = num_patches
+
+        self.reset_tensor_dram_addr()
+        VISION_ISA_BASE = 0xa0000000
+        base = VISION_ISA_BASE if program_base is None else program_base
+        self._next_program_dram_addr = base
+        self._program_dram_base = base
+        print(f"\n[Vision] Allocating vision tensor DRAM for {S} patches ...")
+
+        # Layer I/O (double-buffered).
+        self.VIS_IO_A = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_IO_B = self.allocate_tensor_dram(S * H * bpe)
+
+        # Layer-0 checkpoint snapshot buffers (GEMMA4_VIS_L0_CKPT=1): the layer-0
+        # ISA copies before-attn / per-stage / end-of-layer tensors here so the
+        # numeric harness can read them back after the run.
+        if os.environ.get("GEMMA4_VIS_L0_CKPT") == "1":
+            aS = ((S + 63) // 64) * 64
+            self.VIS_L0_BEFORE_ATTN = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_QPROJ       = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_KPROJ       = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_VPROJ       = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_QPRE        = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_KPRE        = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_VNORM       = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_ROPE_Q      = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_ROPE_K      = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_Q_HM        = self.allocate_tensor_dram(NH * aS * HD * bpe)
+            self.VIS_L0_K_HM        = self.allocate_tensor_dram(NH * aS * HD * bpe)
+            self.VIS_L0_V_HM        = self.allocate_tensor_dram(NH * aS * HD * bpe)
+            self.VIS_L0_ATTN_OUT_HM = self.allocate_tensor_dram(NH * aS * HD * bpe)
+            self.VIS_L0_ATTN_CORE   = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_AFTER_ATTN  = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0_END         = self.allocate_tensor_dram(S * H * bpe)
+            self.VIS_L0H0_Q   = self.allocate_tensor_dram(aS * HD * bpe)
+            self.VIS_L0H0_K   = self.allocate_tensor_dram(aS * HD * bpe)
+            self.VIS_L0H0_V   = self.allocate_tensor_dram(aS * HD * bpe)
+            self.VIS_L0H0_OUT = self.allocate_tensor_dram(aS * HD * bpe)
+
+        # Intermediates.
+        self.VIS_NORM_OUT = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_Q_DRAM = self.allocate_tensor_dram(S * NH * HD * bpe)
+        self.VIS_K_DRAM = self.allocate_tensor_dram(S * NH * HD * bpe)
+        self.VIS_V_DRAM = self.allocate_tensor_dram(S * NH * HD * bpe)
+        self.VIS_Q_NORM = self.allocate_tensor_dram(S * NH * HD * bpe)
+        self.VIS_K_NORM = self.allocate_tensor_dram(S * NH * HD * bpe)
+        self.VIS_ATTN_OUT = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_POST_ATTN_NORM = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_POST_ATTN_RES = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_PRE_FFN_NORM = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_MLP_GATE = self.allocate_tensor_dram(S * MLP * bpe)
+        self.VIS_MLP_UP = self.allocate_tensor_dram(S * MLP * bpe)
+        self.VIS_MLP_MULT = self.allocate_tensor_dram(S * MLP * bpe)
+        self.VIS_MLP_DOWN = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_POST_FFN_NORM = self.allocate_tensor_dram(S * H * bpe)
+
+        # Per-head unified-attention buffers (heads processed sequentially).
+        aligned_S = ((S + 63) // 64) * 64
+        self.VIS_FLASH_Q = self.allocate_tensor_dram(aligned_S * HD * bpe)
+        self.VIS_FLASH_K = self.allocate_tensor_dram(aligned_S * HD * bpe)
+        self.VIS_FLASH_V = self.allocate_tensor_dram(aligned_S * HD * bpe)
+        self.VIS_FLASH_OUT = self.allocate_tensor_dram(aligned_S * HD * bpe)
+        # BIAS before SCRATCH, guard-padded both sides (see test.py note re: PBI
+        # flash scratch sizing / adjacent-buffer corruption).
+        BIAS_GUARD_BYTES = 4 * 1024 * 1024
+        self._vis_bias_guard_pre  = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
+        self.VIS_FLASH_BIAS = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
+        self._vis_bias_guard_post = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
+        self.VIS_FLASH_SCRATCH = self.allocate_tensor_dram(
+            (aligned_S * aligned_S + 2 * HD * aligned_S) * 2)
+        # Unused by unified_attention_core but kept to keep the allocation order
+        # (and every baked address after it) stable.
+        self.VIS_ATTN_P = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
+
+        # 64×64 identity for FPGA clamp passes.
+        self.VIS_IDENTITY_64 = self.allocate_tensor_dram(64 * 64 * bpe)
+        self.dma_to_accelerator_memory(self.VIS_IDENTITY_64, torch.eye(64, dtype=torch.bfloat16))
+        self.VIS_INPUT_CLIP_H_SCRATCH   = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_INPUT_CLIP_MLP_SCRATCH = self.allocate_tensor_dram(S * MLP * bpe)
+
+        # Head-major Q/K/V/OUT buffers (NH, aligned_S, HD) — FPGA transposes fill
+        # these; the per-head attention loop reads offsets within them. Pre-zero
+        # so padding rows [S, aligned_S) stay zero.
+        hm_bytes = NH * aligned_S * HD * bpe
+        self.VIS_FLASH_Q_HM   = self.allocate_tensor_dram(hm_bytes)
+        self.VIS_FLASH_K_HM   = self.allocate_tensor_dram(hm_bytes)
+        self.VIS_FLASH_V_HM   = self.allocate_tensor_dram(hm_bytes)
+        self.VIS_FLASH_OUT_HM = self.allocate_tensor_dram(hm_bytes)
+        zeros_hm = torch.zeros(NH * aligned_S * HD, dtype=torch.bfloat16)
+        for a in (self.VIS_FLASH_Q_HM, self.VIS_FLASH_K_HM,
+                  self.VIS_FLASH_V_HM, self.VIS_FLASH_OUT_HM):
+            self.dma_to_accelerator_memory(a, zeros_hm)
+
+        # Bidirectional bias: zeros with alignment-padding columns masked. Real
+        # image padding patches (position_ids == -1) are masked later by
+        # set_vision_attention_bias.
+        bias = torch.zeros(aligned_S, aligned_S, dtype=torch.bfloat16)
+        bias[:, S:] = float("-inf")
+        self.dma_to_accelerator_memory(self.VIS_FLASH_BIAS, bias)
+
+        # Legacy RoPE tables (kept for address stability).
+        self.VIS_ROPE_COS = self.allocate_tensor_dram(S * HD * bpe)
+        self.VIS_ROPE_SIN = self.allocate_tensor_dram(S * HD * bpe)
+        # Three 32-wide (HD//2) RoPE tables for the FPGA 2D-RoPE split-64 path.
+        self.VIS_ROPE_COS_PAD_TILED     = self.allocate_tensor_dram(S * (HD // 2) * bpe)
+        self.VIS_ROPE_NEG_SIN_PAD_TILED = self.allocate_tensor_dram(S * (HD // 2) * bpe)
+        self.VIS_ROPE_SIN_HI_PAD_TILED  = self.allocate_tensor_dram(S * (HD // 2) * bpe)
+
+        # HD×HD identity for transpose/matmul helpers.
+        self.VIS_IDENTITY = self.allocate_tensor_dram(HD * HD * bpe)
+        self.dma_to_accelerator_memory(self.VIS_IDENTITY, torch.eye(HD, dtype=torch.bfloat16))
+
+        # Embed-vision (pooler tail) scratch. N_soft is image-dependent but
+        # bounded by S; size at S to be safe.
+        text_h = getattr(self, "VIS_TEXT_H", 1536)
+        self.VIS_EMBED_POOL = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_EMBED_NORMED = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_EMBED_OUT = self.allocate_tensor_dram(S * text_h * bpe)
+
+        self._vis_num_patches = S
+        self._vis_aligned_S = aligned_S
+        self._vis_padding_mask = None
+        print(f"  Vision tensor DRAM allocated. Total usage: {self.get_tensor_dram_usage()} bytes")
+
+    # ------------------------------------------------------------------
+    # Vision execution infra (S2): single-op compile/run, chunked eltwise,
+    # matmul M-priming. The non-encoder vision ops (patch embed, projection,
+    # clamps, eltwise) each run as their own tiny FPGA program; the 16-layer
+    # encoder is captured as ONE program via _oneshot_mode (see S3).
+    # ------------------------------------------------------------------
+    def _prime_M(self, M: int) -> int:
+        """Emit ADD_SET gpr_seq_len <- M and return that register index, for use
+        as gpr_M_reg on a vision matmul / rms_norm. Folds the compile-time M
+        tiling into one runtime ISA loop (bit-exact to the legacy static unroll).
+        gpr_seq_len is LM-only, free in the vision program. Emits an instruction,
+        so it must be evaluated inside the active capture."""
+        self.generate_instruction_add_set(self.gpr_seq_len, M)
+        return self.gpr_seq_len
+
+    def _vis_mm_gpr(self, M: int):
+        """gpr_M_reg for a vision matmul/norm: PBI M-loop by default (one-shot bin
+        shrink), VIS_MATMUL_LEGACY=1 forces the static unroll. Returns None when
+        emission is suppressed (no active capture)."""
+        if os.environ.get("VIS_MATMUL_LEGACY") == "1":
+            return None
+        if self.capture_buffer is None:
+            return None
+        return self._prime_M(M)
+
+    def _vis_flops_add(self, v) -> None:
+        """Accumulate an op's returned FLOP count into self._vis_flops (matmuls,
+        rms-norm, and attention return numeric FLOPs; other ops return None).
+        No-op unless a caller (compile_vision_encoder_bin) is accumulating."""
+        if isinstance(v, (int, float)) and getattr(self, "_vis_flops", None) is not None:
+            self._vis_flops += v
+
+    def _compile_and_run_single(self, label: str, compile_fn) -> None:
+        """Capture ONE vision op's ISA, DMA it to program DRAM, execute, wait.
+        Reuses the same program slot each call (reset_program_dram_addr).
+
+        Oneshot mode (self._oneshot_mode=True): emit into the caller's already-open
+        capture instead — used to build the 16-layer encoder as one program.
+        Resets the inst-pointer + ISA-register allocators to their base first, so
+        the per-op PBI cores (which alloc pointers/regs and never release them)
+        can't climb across sub-ops and exhaust the pool."""
+        if getattr(self, "_oneshot_mode", False):
+            self.reset_inst_ptr_counter()
+            self._isa_reg_counter = self._isa_reg_base
+            self._vis_flops_add(compile_fn())
+            return
+        if os.environ.get("TRACE_SUBOP"):
+            _original_print(f"      [subop] {label} ...", flush=True)
+        global _SILENT_MODE
+        _prev_silent = _SILENT_MODE
+        _SILENT_MODE = True
+        try:
+            self.reset_program_dram_addr()
+            self.start_capture()
+            self._vis_flops_add(compile_fn())
+            self.stop_capture()
+            self.generate_instruction_halt()
+            prog_addr = self.get_program_dram_addr()
+            self.write_captured_instructions_to_dram(prog_addr)
+            self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+            self.clear_capture_buffer()
+        finally:
+            _SILENT_MODE = _prev_silent
+        self.start_execute_from_dram(prog_addr)
+        self.wait_queue(120.0)
+
+    def _run_eltwise_add_chunked(self, a_addr: int, b_addr: int, out_addr: int, num_elements: int) -> None:
+        """Element-wise add two DRAM tensors, one SRAM-sized chunk per program."""
+        CHUNK = 65536  # 128 KB/buffer — fits the SRAM gap 0x10000..0x90000
+        bpe = self.bytes_per_element
+        for off in range(0, num_elements, CHUNK):
+            n = min(CHUNK, num_elements - off)
+            def _fn(a=a_addr + off * bpe, b=b_addr + off * bpe, o=out_addr + off * bpe, sz=n):
+                self.accelerator_memory_to_sram(a, 0x10000, sz)
+                self.accelerator_memory_to_sram(b, 0x90000, sz)
+                self.eltwise_add_core(0x10000, 0x90000, 0x10000, sz)
+                self.sram_to_accelerator_memory(0x10000, o, sz)
+            self._compile_and_run_single("eltwise_add_chunk", _fn)
+
+    def _run_eltwise_mul_chunked(self, a_addr: int, b_addr: int, out_addr: int, num_elements: int) -> None:
+        """Element-wise multiply two DRAM tensors, one SRAM-sized chunk per program."""
+        CHUNK = 65536
+        bpe = self.bytes_per_element
+        for off in range(0, num_elements, CHUNK):
+            n = min(CHUNK, num_elements - off)
+            def _fn(a=a_addr + off * bpe, b=b_addr + off * bpe, o=out_addr + off * bpe, sz=n):
+                self.accelerator_memory_to_sram(a, 0x10000, sz)
+                self.accelerator_memory_to_sram(b, 0x90000, sz)
+                self.eltwise_mul_core(0x10000, 0x90000, 0x10000, sz)
+                self.sram_to_accelerator_memory(0x10000, o, sz)
+            self._compile_and_run_single("eltwise_mul_chunk", _fn)
+
+    def vision_patch_embed(self, pixel_values: torch.Tensor,
+                           pixel_position_ids: torch.Tensor,
+                           padding_positions: torch.Tensor) -> torch.Tensor:
+        """Gemma4 vision patch embedder on FPGA. Mirrors
+        Gemma4VisionPatchEmbedder.forward:
+          scaled = 2*(pixel_values - 0.5)
+          hidden = input_proj(scaled)                 # FPGA, IF4
+          pos    = pos_table[0,x] + pos_table[1,y]    # host gather
+          pos[padding] = 0
+          return hidden + pos                          # FPGA, chunked eltwise add
+        Uses VIS_IO_B (pixel scratch) + VIS_NORM_OUT (pos staging); output lands
+        in VIS_IO_A. Returns the [S, H] patch embeddings (read back for numeric)."""
+        S, H = self._vis_num_patches, self.VIS_H
+        pv = pixel_values.squeeze(0) if (pixel_values.dim() == 3 and pixel_values.shape[0] == 1) else pixel_values
+        assert pv.shape == (S, H), f"pixels shape {pv.shape}, expected ({S}, {H})"
+        pids = pixel_position_ids.squeeze(0) if pixel_position_ids.dim() == 3 else pixel_position_ids
+        pad = padding_positions.squeeze(0) if padding_positions.dim() == 2 else padding_positions
+
+        scaled = (2.0 * (pv.float() - 0.5)).to(torch.bfloat16).contiguous()
+        self.dma_to_accelerator_memory(self.VIS_IO_B, scaled)
+
+        w = self.VIS_PATCH_PROJ_INFO
+        self._compile_and_run_single("patch_input_proj", lambda: self.matmat_mul_core(
+            M=S, K=H, N=H,
+            A_DRAM_ADDR=self.VIS_IO_B, B_DRAM_ADDR=w["data"], OUTPUT_DRAM_ADDR=self.VIS_IO_A,
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w["scale"],
+            gpr_M_reg=self._vis_mm_gpr(M=S)))
+
+        table = self._vis_pos_embed_table.float()             # [2, P, H]
+        clamped = pids.clamp(min=0).long().cpu()              # [S, 2]
+        pe_sum = table[0, clamped[:, 0]] + table[1, clamped[:, 1]]
+        pe_sum[pad.cpu()] = 0.0
+        self.dma_to_accelerator_memory(self.VIS_NORM_OUT, pe_sum.to(torch.bfloat16).contiguous())
+        self._run_eltwise_add_chunked(self.VIS_IO_A, self.VIS_NORM_OUT, self.VIS_IO_A, S * H)
+
+        return self.dma_from_accelerator_memory(self.VIS_IO_A, (S, H)).cpu()
+
+    # ------------------------------------------------------------------
+    # Vision encoder ISA primitives (S2b/S3): 2-D RoPE, Q/K/V head-major
+    # transposes, PBI rms-norm, FPGA clamp. Ported from gemma4_e2b_test.py —
+    # these are validated standalone (see test.py's test_vision_* helpers).
+    # ------------------------------------------------------------------
+    def _load_or_build_vision_rope_pads(self, hf_model, pixel_position_ids, num_patches):
+        """Compute the three FPGA-ready 2D-RoPE tables (cos / neg_sin / sin_hi),
+        each (num_patches, HD//2) bf16, for the canonical image grid. One row per
+        PATCH (2D-RoPE is head-independent) and 32-wide (only half_rot is read)."""
+        HD = self.VIS_HEAD_DIM
+        print(f"  [Vision] [host] computing 2D-RoPE pads...", flush=True)
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            vt = hf_model.model.vision_tower
+            patch_embeds_dummy = torch.zeros(
+                1, num_patches, vt.config.hidden_size,
+                dtype=torch.bfloat16, device=pixel_position_ids.device)
+            cos_table, sin_table = vt.encoder.rotary_emb(patch_embeds_dummy, pixel_position_ids)
+        cos_2d = cos_table.squeeze(0).cpu().to(torch.bfloat16)
+        sin_2d = sin_table.squeeze(0).cpu().to(torch.bfloat16)
+        first_half_idx = self.VIS_ROPE_PERM[:HD // 2]
+        cos_tbl     = cos_2d[:, first_half_idx].contiguous()
+        neg_sin_tbl = (-sin_2d[:, first_half_idx]).contiguous()
+        sin_hi_tbl  = sin_2d[:, first_half_idx].contiguous()
+        print(f"  [Vision] [host] 2D-RoPE pads computed in {time.perf_counter()-t0:.2f}s "
+              f"(per-patch 32-wide)", flush=True)
+        return cos_tbl, neg_sin_tbl, sin_hi_tbl
+
+    def _emit_vision_rope_2d(self, src_dram: int, out_dram: int,
+                             cos_pad_dram: int, neg_sin_pad_dram: int,
+                             sin_hi_pad_dram: int, M: int) -> None:
+        """Apply vision 2D RoPE to M consecutive HD=64 rows via the split-64
+        permuted layout. cos/neg_sin/sin_hi hold ONE 32-wide row per PATCH,
+        shared by that patch's VIS_HEADS heads (patch-outer / head-inner loop).
+        Only the 32 valid cols are touched (SRAM [32:64] is never read)."""
+        rot_dim = 64
+        half_rot = rot_dim // 2
+        BF16 = 2
+        row_bytes = rot_dim * BF16
+        half_bytes = half_rot * BF16
+
+        SA_X_LO, SA_X_HI = 0x40000, 0x40080
+        SA_OUT_LO, SA_OUT_HI = 0x40100, 0x40180
+        SA_TMP_A = 0x40200
+        SB_COS, SB_NEG_SIN, SB_SIN_HI, SB_TMP_B = 0x80000, 0x80080, 0x80100, 0x80180
+
+        rope_reads = [(cos_pad_dram, SB_COS, half_rot),
+                      (neg_sin_pad_dram, SB_NEG_SIN, half_rot),
+                      (sin_hi_pad_dram, SB_SIN_HI, half_rot)]
+        src_reads = [(src_dram, SA_X_LO, half_rot),
+                     (src_dram + half_bytes, SA_X_HI, half_rot)]
+        writes = [(SA_OUT_LO, out_dram, half_rot),
+                  (SA_OUT_HI, out_dram + half_bytes, half_rot)]
+
+        t_reg = self.gpr_seq_len      # flat per-row Q/K address
+        off_reg = self.gpr_q_seq_len  # scratch for reg_mul_imm + add_imm address math
+        patch_reg = self.gpr_scratch  # per-patch rope address
+        S = M // self.VIS_HEADS
+        self.generate_instruction_add_set(t_reg, 0)
+        self.generate_instruction_add_set(patch_reg, 0)
+        self.loop_start(loop_cnt=S)                              # OUTER: patches
+        self.generate_instruction_reg_mul_imm(off_reg, patch_reg, ue_35bit_addr_shifter(half_bytes))
+        for base, sram, elems in rope_reads:
+            self.generate_instruction_add_imm(off_reg, ue_35bit_addr_shifter(base), self.TMP_REG)
+            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram,
+                                            element_size=elems, general_reg_src=self.TMP_REG)
+        self.loop_start(loop_cnt=self.VIS_HEADS)                 # INNER: heads
+        self.generate_instruction_reg_mul_imm(off_reg, t_reg, ue_35bit_addr_shifter(row_bytes))
+        for base, sram, elems in src_reads:
+            self.generate_instruction_add_imm(off_reg, ue_35bit_addr_shifter(base), self.TMP_REG)
+            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram,
+                                            element_size=elems, general_reg_src=self.TMP_REG)
+        self.eltwise_mul_core(SA_X_LO, SB_COS, SB_TMP_B, half_rot)
+        self.eltwise_mul_core(SA_X_HI, SB_NEG_SIN, SA_TMP_A, half_rot)
+        self.eltwise_add_core(SA_TMP_A, SB_TMP_B, SA_OUT_LO, half_rot)
+        self.eltwise_mul_core(SA_X_HI, SB_COS, SB_TMP_B, half_rot)
+        self.eltwise_mul_core(SA_X_LO, SB_SIN_HI, SA_TMP_A, half_rot)
+        self.eltwise_add_core(SA_TMP_A, SB_TMP_B, SA_OUT_HI, half_rot)
+        for sram, base, elems in writes:
+            self.generate_instruction_add_imm(off_reg, ue_35bit_addr_shifter(base), self.TMP_REG)
+            self.sram_to_accelerator_memory(sram_address=sram, accelerator_dram_address=0,
+                                            element_size=elems, general_reg_src=self.TMP_REG)
+        self.generate_instruction_add_inc(t_reg)
+        self.loop_end()                                          # end INNER
+        self.generate_instruction_add_inc(patch_reg)
+        self.loop_end()                                          # end OUTER
+
+    def _emit_qkv_transpose_to_hm(self, src_dram: int, dst_dram: int,
+                                  S: int, dst_aligned_S: int) -> None:
+        """Transpose vision Q/K/V (S*NH, HD) interleaved → (NH, aligned_S, HD)
+        head-major. Only the first S rows of each head are written."""
+        NH, HD, BF16 = self.VIS_HEADS, self.VIS_HEAD_DIM, 2
+        row_bytes = HD * BF16
+        src_jump_bytes = NH * row_bytes
+        dst_head_bytes = dst_aligned_S * row_bytes
+        chunk_S = max(1, URAM_NEAR_FULL_ELEMENTS // HD)
+        SA_BUF = 0x00000
+        for h in range(NH):
+            src_base = src_dram + h * row_bytes
+            dst_base = dst_dram + h * dst_head_bytes
+            s = 0
+            while s < S:
+                this_chunk = min(chunk_S, S - s)
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=src_base + s * src_jump_bytes, sram_address=SA_BUF,
+                    element_size=this_chunk * HD, stride_bytes_per_chunk=row_bytes,
+                    stride_jump_bytes=src_jump_bytes)
+                self.sram_to_accelerator_memory(
+                    sram_address=SA_BUF, accelerator_dram_address=dst_base + s * row_bytes,
+                    element_size=this_chunk * HD)
+                s += this_chunk
+
+    def _emit_attn_out_transpose_to_interleaved(self, src_dram: int, dst_dram: int,
+                                                S: int, src_aligned_S: int) -> None:
+        """Inverse transpose attn output (NH, aligned_S, HD) head-major →
+        (S, NH*HD) interleaved. Reads only the first S rows of each head."""
+        NH, HD, BF16 = self.VIS_HEADS, self.VIS_HEAD_DIM, 2
+        row_bytes = HD * BF16
+        dst_jump_bytes = NH * row_bytes
+        src_head_bytes = src_aligned_S * row_bytes
+        chunk_S = max(1, URAM_NEAR_FULL_ELEMENTS // HD)
+        SA_BUF = 0x00000
+        for h in range(NH):
+            src_base = src_dram + h * src_head_bytes
+            dst_base = dst_dram + h * row_bytes
+            s = 0
+            while s < S:
+                this_chunk = min(chunk_S, S - s)
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=src_base + s * row_bytes, sram_address=SA_BUF,
+                    element_size=this_chunk * HD)
+                self.sram_to_accelerator_memory(
+                    sram_address=SA_BUF, accelerator_dram_address=dst_base + s * dst_jump_bytes,
+                    element_size=this_chunk * HD, stride_bytes_per_chunk=row_bytes,
+                    stride_jump_bytes=dst_jump_bytes)
+                s += this_chunk
+
+    def _rms_norm_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int,
+                           OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int) -> None:
+        """rms_norm_core_dram via the runtime ISA loop (gpr_M_reg) to shrink the
+        captured bin — captures one single-row body regardless of M. Bit-exact to
+        the static unroll (VIS_RMS_LEGACY=1 forces the unroll)."""
+        if os.environ.get("VIS_RMS_LEGACY") == "1":
+            return self.rms_norm_core_dram(M=M, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
+                                    OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR)
+        self.generate_instruction_add_set(self.gpr_seq_len, M)
+        return self.rms_norm_core_dram(M=M, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
+                                OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
+                                gpr_M_reg=self.gpr_seq_len)
+
+    def _emit_clamp_dram_to_dram(self, src_dram: int, dst_dram: int, num_elements: int,
+                                 clamp_min: float, clamp_max: float,
+                                 *, identity_addr: int | None = None, use_pbi: bool = True) -> None:
+        """FPGA DRAM→DRAM clamp via matmul-with-identity + fused clamp (HW routes
+        CLAMP through LALU only during DOT_PRODUCT). A=src (M=N/64, K=64) × a bf16
+        64×64 identity = passthrough, then the fused clamp applies."""
+        assert num_elements % 64 == 0, f"num_elements ({num_elements}) must be a multiple of 64"
+        if identity_addr is None:
+            identity_addr = self.VIS_IDENTITY_64
+        _mm_kw = {}
+        if use_pbi and os.environ.get("CLAMP_NO_GPRM") != "1":
+            _mm_kw["gpr_M_reg"] = self._prime_M(num_elements // 64)
+        self.matmat_mul_core(
+            M=num_elements // 64, K=64, N=64,
+            A_DRAM_ADDR=src_dram, B_DRAM_ADDR=identity_addr, OUTPUT_DRAM_ADDR=dst_dram,
+            is_B_quantized=False, clamp_enable=True, clamp_min=clamp_min, clamp_max=clamp_max, **_mm_kw)
+
+    def _matmul_with_output_clamp(self, *, clamp_min: float, clamp_max: float, **mm_kwargs) -> None:
+        """matmat_mul_core with fused output-clamp bounds."""
+        return self.matmat_mul_core(clamp_enable=True, clamp_min=clamp_min,
+                                    clamp_max=clamp_max, **mm_kwargs)
+
+    # ------------------------------------------------------------------
+    # Vision encoder layers (S3): one SigLIP layer = pre_norm + Q/K/V proj +
+    # Q/K norm (part A) → V-norm + 2D RoPE + head-major transpose → per-head
+    # attention (_vis_s7) → O proj + post-attn norm + residual + MLP (part C).
+    # Every Gemma4ClippableLinear clips input (FPGA clamp into scratch) and
+    # output (fused clamp). Captured one-shot into the vision encoder bin.
+    # ------------------------------------------------------------------
+    def set_vision_attention_bias(self, padding_positions: torch.Tensor) -> None:
+        """Rebuild VIS_FLASH_BIAS so attention masks BOTH real padding patches
+        (position_ids == -1) and the alignment padding at the end. Call after
+        vision_tensor_init and before running attention."""
+        S, aligned_S = self._vis_num_patches, self._vis_aligned_S
+        pad = (padding_positions[0] if padding_positions.dim() == 2 else padding_positions).cpu().bool()
+        assert pad.shape[0] == S, f"padding mask has {pad.shape[0]} entries, expected {S}"
+        self._vis_padding_mask = pad
+        col_mask = torch.zeros(aligned_S, dtype=torch.bool)
+        col_mask[:S] = pad
+        col_mask[S:] = True
+        bias = torch.zeros(aligned_S, aligned_S, dtype=torch.bfloat16)
+        bias[:, col_mask] = float("-inf")
+        self.dma_to_accelerator_memory(self.VIS_FLASH_BIAS, bias)
+
+    def compile_vision_layer(self, layer_idx: int) -> int:
+        """Layer part A: pre_norm + Q/K/V projections (clipped) + Q/K norms."""
+        S, H, HD, NH = self._vis_num_patches, self.VIS_H, self.VIS_HEAD_DIM, self.VIS_HEADS
+        w = self._vis_weight_addrs[layer_idx]
+        clips = self._vis_clip_ranges[layer_idx]
+        INPUT_DRAM = self.VIS_IO_A if layer_idx % 2 == 0 else self.VIS_IO_B
+
+        self._compile_and_run_single("pre_norm", lambda: self._rms_norm_dram_pbi(
+            M=S, N=H, A_DRAM_ADDR=INPUT_DRAM,
+            OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT, GAMMA_DRAM_ADDR=w["input_layernorm"]))
+
+        for proj, out_dram in (("q_proj", self.VIS_Q_DRAM), ("k_proj", self.VIS_K_DRAM),
+                               ("v_proj", self.VIS_V_DRAM)):
+            c = clips[proj]
+            self._compile_and_run_single(f"clip_in_{proj}", lambda c=c: self._emit_clamp_dram_to_dram(
+                src_dram=self.VIS_NORM_OUT, dst_dram=self.VIS_INPUT_CLIP_H_SCRATCH,
+                num_elements=S * H, clamp_min=c["input"][0], clamp_max=c["input"][1]))
+            self._compile_and_run_single(proj, lambda proj=proj, out_dram=out_dram, c=c:
+                self._matmul_with_output_clamp(
+                    M=S, K=H, N=NH * HD,
+                    A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH,
+                    B_DRAM_ADDR=w[proj]["data"], OUTPUT_DRAM_ADDR=out_dram,
+                    is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w[proj]["scale"],
+                    clamp_min=c["output"][0], clamp_max=c["output"][1],
+                    gpr_M_reg=self._vis_mm_gpr(M=S)))
+
+        for norm, src, dst in (("q_norm", self.VIS_Q_DRAM, self.VIS_Q_NORM),
+                               ("k_norm", self.VIS_K_DRAM, self.VIS_K_NORM)):
+            self._compile_and_run_single(norm, lambda norm=norm, src=src, dst=dst:
+                self._rms_norm_dram_pbi(M=S * NH, N=HD, A_DRAM_ADDR=src,
+                                        OUTPUT_DRAM_ADDR=dst, GAMMA_DRAM_ADDR=w[norm]))
+        return 0
+
+    def host_vision_v_norm_rope_gather(self, layer_idx: int) -> None:
+        """V-norm (FPGA) + 2D RoPE on Q/K (FPGA) + per-head transpose of Q/K/V
+        into head-major VIS_FLASH_*_HM (FPGA). No Q pre-scale (attention passes
+        q_scale=1.0 — Gemma vision folds the scaling into q_norm)."""
+        S, HD, NH = self._vis_num_patches, self.VIS_HEAD_DIM, self.VIS_HEADS
+        aligned_S = self._vis_aligned_S
+
+        self._compile_and_run_single("v_norm", lambda: self._rms_norm_dram_pbi(
+            M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_V_DRAM,
+            OUTPUT_DRAM_ADDR=self.VIS_V_DRAM, GAMMA_DRAM_ADDR=self.VIS_V_NORM_ONES_GAMMA))
+
+        for label, dram in (("rope_q", self.VIS_Q_NORM), ("rope_k", self.VIS_K_NORM)):
+            self._compile_and_run_single(label, lambda dram=dram: self._emit_vision_rope_2d(
+                src_dram=dram, out_dram=dram,
+                cos_pad_dram=self.VIS_ROPE_COS_PAD_TILED,
+                neg_sin_pad_dram=self.VIS_ROPE_NEG_SIN_PAD_TILED,
+                sin_hi_pad_dram=self.VIS_ROPE_SIN_HI_PAD_TILED, M=S * NH))
+
+        for label, src, dst in (("transpose_q", self.VIS_Q_NORM, self.VIS_FLASH_Q_HM),
+                                ("transpose_k", self.VIS_K_NORM, self.VIS_FLASH_K_HM),
+                                ("transpose_v", self.VIS_V_DRAM, self.VIS_FLASH_V_HM)):
+            self._compile_and_run_single(label, lambda src=src, dst=dst:
+                self._emit_qkv_transpose_to_hm(src_dram=src, dst_dram=dst,
+                                               S=S, dst_aligned_S=aligned_S))
+
+    def _vis_emit_attn(self, Q: int, K: int, V: int, O: int, HD: int, aligned_S: int) -> int:
+        """Emit one head's vision attention via unified_attention_core. batch =
+        aligned_seq_len = aligned_S (every patch is a query), full-matrix bias
+        (VIS_FLASH_BIAS), Vᵀ/score/scaled_q folded into VIS_FLASH_SCRATCH.
+        q_scale=1.0 → no QKᵀ scaling (folded into q_norm)."""
+        _batch_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(_batch_reg, aligned_S)
+        _aligned_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(_aligned_reg, aligned_S)
+        total = self.unified_attention_core(
+            batch=aligned_S, aligned_seq_len=aligned_S, head_dim=HD,
+            Q_DRAM_ADDR=Q, K_DRAM_ADDR=K, V_DRAM_ADDR=V,
+            BIAS_DRAM_ADDR=self.VIS_FLASH_BIAS, OUTPUT_DRAM_ADDR=O,
+            SCRATCH_DRAM_ADDR=self.VIS_FLASH_SCRATCH,
+            IDENTITY_DRAM_ADDR=self._vis_identity_dram,
+            gpr_batch_reg=_batch_reg, gpr_aligned_seq_len_reg=_aligned_reg, q_scale=1.0)
+        self.release_isa_reg()  # _aligned_reg
+        self.release_isa_reg()  # _batch_reg
+        return total
+
+    def run_vision_attention_all_heads(self, layer_idx: int) -> None:
+        """Per-head attention (_vis_s7 path): marshal each head's head-major
+        Q/K/V slice into the FIXED VIS_FLASH_Q/K/V via an SRAM bounce, run
+        _vis_emit_attn, bounce OUT back to head-major OUT_HM; then inverse-
+        transpose OUT_HM → interleaved VIS_Q_DRAM for o_proj."""
+        bpe = self.bytes_per_element
+        S, HD, NH = self._vis_num_patches, self.VIS_HEAD_DIM, self.VIS_HEADS
+        aligned_S = self._vis_aligned_S
+        head_stride_bytes = aligned_S * HD * bpe
+        _elems = aligned_S * HD
+        _l0h0 = (layer_idx == 0 and os.environ.get("GEMMA4_VIS_L0_CKPT") == "1")
+
+        def _bounce(_src, _dst):
+            for _o in range(0, _elems, 131072):
+                _n = min(131072, _elems - _o)
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=_src + _o * bpe, sram_address=0x10000, element_size=_n)
+                self.sram_to_accelerator_memory(
+                    sram_address=0x10000, accelerator_dram_address=_dst + _o * bpe, element_size=_n)
+
+        for h in range(NH):
+            base = h * head_stride_bytes
+            _bounce(self.VIS_FLASH_Q_HM + base, self.VIS_FLASH_Q)
+            _bounce(self.VIS_FLASH_K_HM + base, self.VIS_FLASH_K)
+            _bounce(self.VIS_FLASH_V_HM + base, self.VIS_FLASH_V)
+            if _l0h0 and h == 0:
+                self._emit_sram_copy_chunked(self.VIS_FLASH_Q, self.VIS_L0H0_Q, _elems)
+                self._emit_sram_copy_chunked(self.VIS_FLASH_K, self.VIS_L0H0_K, _elems)
+                self._emit_sram_copy_chunked(self.VIS_FLASH_V, self.VIS_L0H0_V, _elems)
+            self._vis_flops_add(self._vis_emit_attn(
+                self.VIS_FLASH_Q, self.VIS_FLASH_K,
+                self.VIS_FLASH_V, self.VIS_FLASH_OUT, HD, aligned_S))
+            if _l0h0 and h == 0:
+                self._emit_sram_copy_chunked(self.VIS_FLASH_OUT, self.VIS_L0H0_OUT, _elems)
+            _bounce(self.VIS_FLASH_OUT, self.VIS_FLASH_OUT_HM + base)
+
+        self._compile_and_run_single("transpose_attn_out", lambda:
+            self._emit_attn_out_transpose_to_interleaved(
+                src_dram=self.VIS_FLASH_OUT_HM, dst_dram=self.VIS_Q_DRAM,
+                S=S, src_aligned_S=aligned_S))
+
+    def compile_vision_layer_post_attn(self, layer_idx: int) -> int:
+        """Layer part C: O proj (clipped) + post_attn norm + residual + pre-FFN
+        norm + MLP (gate/GELU + up, clipped; gate*up; down, clipped) + post-FFN
+        norm + residual → OUTPUT buffer."""
+        S, H, HD, NH, MLP = (self._vis_num_patches, self.VIS_H, self.VIS_HEAD_DIM,
+                             self.VIS_HEADS, self.VIS_MLP)
+        w = self._vis_weight_addrs[layer_idx]
+        clips = self._vis_clip_ranges[layer_idx]
+        INPUT_DRAM = self.VIS_IO_A if layer_idx % 2 == 0 else self.VIS_IO_B
+        OUTPUT_DRAM = self.VIS_IO_B if layer_idx % 2 == 0 else self.VIS_IO_A
+        sz_h = S * H
+
+        co = clips["o_proj"]
+        self._compile_and_run_single("clip_in_o", lambda: self._emit_clamp_dram_to_dram(
+            src_dram=self.VIS_Q_DRAM, dst_dram=self.VIS_INPUT_CLIP_H_SCRATCH,
+            num_elements=S * NH * HD, clamp_min=co["input"][0], clamp_max=co["input"][1]))
+        self._compile_and_run_single("o_proj", lambda: self._matmul_with_output_clamp(
+            M=S, K=NH * HD, N=H,
+            A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH,
+            B_DRAM_ADDR=w["o_proj"]["data"], OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT,
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w["o_proj"]["scale"],
+            clamp_min=co["output"][0], clamp_max=co["output"][1], gpr_M_reg=self._vis_mm_gpr(M=S)))
+
+        self._compile_and_run_single("post_attn_norm", lambda: self._rms_norm_dram_pbi(
+            M=S, N=H, A_DRAM_ADDR=self.VIS_ATTN_OUT,
+            OUTPUT_DRAM_ADDR=self.VIS_POST_ATTN_NORM, GAMMA_DRAM_ADDR=w["post_attention_layernorm"]))
+        self._run_eltwise_add_chunked(INPUT_DRAM, self.VIS_POST_ATTN_NORM, self.VIS_POST_ATTN_RES, sz_h)
+        self._compile_and_run_single("pre_ffn_norm", lambda: self._rms_norm_dram_pbi(
+            M=S, N=H, A_DRAM_ADDR=self.VIS_POST_ATTN_RES,
+            OUTPUT_DRAM_ADDR=self.VIS_PRE_FFN_NORM, GAMMA_DRAM_ADDR=w["pre_feedforward_layernorm"]))
+
+        cg = clips["gate_proj"]
+        self._compile_and_run_single("clip_in_gate", lambda: self._emit_clamp_dram_to_dram(
+            src_dram=self.VIS_PRE_FFN_NORM, dst_dram=self.VIS_INPUT_CLIP_H_SCRATCH,
+            num_elements=S * H, clamp_min=cg["input"][0], clamp_max=cg["input"][1]))
+        self._compile_and_run_single("gate_proj", lambda: self.matmat_mul_core(
+            M=S, K=H, N=MLP, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH,
+            B_DRAM_ADDR=w["gate_proj"]["data"], OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE,
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w["gate_proj"]["scale"],
+            gelu_enable=True, gpr_M_reg=self._vis_mm_gpr(M=S)))
+        self._compile_and_run_single("clip_out_gate", lambda: self._emit_clamp_dram_to_dram(
+            src_dram=self.VIS_MLP_GATE, dst_dram=self.VIS_MLP_GATE,
+            num_elements=S * MLP, clamp_min=cg["output"][0], clamp_max=cg["output"][1]))
+
+        cu = clips["up_proj"]
+        self._compile_and_run_single("clip_in_up", lambda: self._emit_clamp_dram_to_dram(
+            src_dram=self.VIS_PRE_FFN_NORM, dst_dram=self.VIS_INPUT_CLIP_H_SCRATCH,
+            num_elements=S * H, clamp_min=cu["input"][0], clamp_max=cu["input"][1]))
+        self._compile_and_run_single("up_proj", lambda: self._matmul_with_output_clamp(
+            M=S, K=H, N=MLP, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH,
+            B_DRAM_ADDR=w["up_proj"]["data"], OUTPUT_DRAM_ADDR=self.VIS_MLP_UP,
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w["up_proj"]["scale"],
+            clamp_min=cu["output"][0], clamp_max=cu["output"][1], gpr_M_reg=self._vis_mm_gpr(M=S)))
+
+        self._run_eltwise_mul_chunked(self.VIS_MLP_GATE, self.VIS_MLP_UP, self.VIS_MLP_MULT, S * MLP)
+
+        cd = clips["down_proj"]
+        self._compile_and_run_single("clip_in_down", lambda: self._emit_clamp_dram_to_dram(
+            src_dram=self.VIS_MLP_MULT, dst_dram=self.VIS_INPUT_CLIP_MLP_SCRATCH,
+            num_elements=S * MLP, clamp_min=cd["input"][0], clamp_max=cd["input"][1]))
+        self._compile_and_run_single("down_proj", lambda: self._matmul_with_output_clamp(
+            M=S, K=MLP, N=H, A_DRAM_ADDR=self.VIS_INPUT_CLIP_MLP_SCRATCH,
+            B_DRAM_ADDR=w["down_proj"]["data"], OUTPUT_DRAM_ADDR=self.VIS_MLP_DOWN,
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w["down_proj"]["scale"],
+            clamp_min=cd["output"][0], clamp_max=cd["output"][1], gpr_M_reg=self._vis_mm_gpr(M=S)))
+
+        self._compile_and_run_single("post_ffn_norm", lambda: self._rms_norm_dram_pbi(
+            M=S, N=H, A_DRAM_ADDR=self.VIS_MLP_DOWN,
+            OUTPUT_DRAM_ADDR=self.VIS_POST_FFN_NORM, GAMMA_DRAM_ADDR=w["post_feedforward_layernorm"]))
+        self._run_eltwise_add_chunked(self.VIS_POST_ATTN_RES, self.VIS_POST_FFN_NORM, OUTPUT_DRAM, sz_h)
+        return 0
+
+    def run_vision_layer(self, layer_idx: int) -> int:
+        """Run one full vision encoder layer: part A → V-norm/RoPE/transpose →
+        per-head attention → part C. Input in VIS_IO_A (even layer) / VIS_IO_B
+        (odd); output lands in the other buffer (address returned)."""
+        self.compile_vision_layer(layer_idx)
+        self.host_vision_v_norm_rope_gather(layer_idx)
+        self.run_vision_attention_all_heads(layer_idx)
+        self.compile_vision_layer_post_attn(layer_idx)
+        return self.VIS_IO_B if layer_idx % 2 == 0 else self.VIS_IO_A
+
+    def compile_vision_encoder_bin(self, num_patches: int, profile: bool = False) -> None:
+        """Capture the 16-layer vision encoder ISA one-shot into a bin at
+        VISION_ISA_BASE (0xa0000000). Pure host emission, no FPGA activity.
+        Skips if cached. Optional layer-0 checkpoint snapshots (GEMMA4_VIS_L0_CKPT=1)
+        for the numeric harness.
+
+        ``profile``: emit a HALT at each major per-layer boundary (proj /
+        rope_gather / attention / post_attn) and record the resume address, so
+        execute_vision_encoder_bin can time each phase's FPGA latency (like the
+        LM per-phase profile). The checkpoints go in the meta; a profile-compiled
+        bin can only be run segment-by-segment."""
+        L = self.VIS_LAYERS
+        _vmeta, _ = self._get_program_section("vision", profile)
+        if _vmeta is not None and _vmeta.get("num_patches") == num_patches:
+            print(f"  [Vision] encoder section cached (num_patches={num_patches}).", flush=True)
+            return
+        print(f"  [Vision] compiling {L} vision layers one-shot"
+              f"{' (+profile checkpoints)' if profile else ''} ...", flush=True)
+        t0 = time.perf_counter()
+        _l0_ckpt = os.environ.get("GEMMA4_VIS_L0_CKPT") == "1"
+        enc_checkpoints: list[list] = []
+        def _checkpoint(name: str) -> None:
+            if not profile:
+                return
+            self.generate_instruction_halt()
+            resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+            enc_checkpoints.append([name, f"0x{resume:X}"])
+        _l0_elems = self._vis_num_patches * self.VIS_H
+        global _SILENT_MODE
+        _prev_silent = _SILENT_MODE
+        self.reset_program_dram_addr()
+        base_addr = self.get_program_dram_addr()
+        self.clear_inst_id()
+        self.clear_capture_buffer()
+        self.start_capture()
+        self._oneshot_mode = True
+        self._vis_s7 = True
+        self._vis_flops = 0    # accumulated via _vis_flops_add during emission
+        _SILENT_MODE = True
+        try:
+            for li in range(L):
+                self.compile_vision_layer(li)
+                _checkpoint(f"L{li}_proj")
+                if li == 0 and _l0_ckpt:
+                    self._emit_sram_copy_chunked(self.VIS_NORM_OUT, self.VIS_L0_BEFORE_ATTN, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_Q_DRAM, self.VIS_L0_QPROJ, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_K_DRAM, self.VIS_L0_KPROJ, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_V_DRAM, self.VIS_L0_VPROJ, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_Q_NORM, self.VIS_L0_QPRE, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_K_NORM, self.VIS_L0_KPRE, _l0_elems)
+                self.host_vision_v_norm_rope_gather(li)
+                _checkpoint(f"L{li}_rope_gather")
+                if li == 0 and _l0_ckpt:
+                    _hm = self.VIS_HEADS * self._vis_aligned_S * self.VIS_HEAD_DIM
+                    self._emit_sram_copy_chunked(self.VIS_V_DRAM, self.VIS_L0_VNORM, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_Q_NORM, self.VIS_L0_ROPE_Q, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_K_NORM, self.VIS_L0_ROPE_K, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_FLASH_Q_HM, self.VIS_L0_Q_HM, _hm)
+                    self._emit_sram_copy_chunked(self.VIS_FLASH_K_HM, self.VIS_L0_K_HM, _hm)
+                    self._emit_sram_copy_chunked(self.VIS_FLASH_V_HM, self.VIS_L0_V_HM, _hm)
+                self.run_vision_attention_all_heads(li)
+                _checkpoint(f"L{li}_attention")
+                if li == 0 and _l0_ckpt:
+                    _hm = self.VIS_HEADS * self._vis_aligned_S * self.VIS_HEAD_DIM
+                    self._emit_sram_copy_chunked(self.VIS_FLASH_OUT_HM, self.VIS_L0_ATTN_OUT_HM, _hm)
+                    self._emit_sram_copy_chunked(self.VIS_Q_DRAM, self.VIS_L0_ATTN_CORE, _l0_elems)
+                self.compile_vision_layer_post_attn(li)
+                _checkpoint(f"L{li}_post_attn")
+                if li == 0 and _l0_ckpt:
+                    self._emit_sram_copy_chunked(self.VIS_ATTN_OUT, self.VIS_L0_AFTER_ATTN, _l0_elems)
+                    self._emit_sram_copy_chunked(self.VIS_IO_B, self.VIS_L0_END, _l0_elems)
+            self.generate_instruction_halt()
+        finally:
+            self._oneshot_mode = False
+            self._vis_s7 = False
+            _SILENT_MODE = _prev_silent
+        self.stop_capture()
+        enc_bytes = bytearray()
+        for inst in self.capture_buffer:
+            enc_bytes.extend(inst.get_bytes())
+        self.clear_capture_buffer()
+        total_flops = int(self._vis_flops)
+        self._vis_flops = None    # stop accumulating outside the encoder capture
+
+        _vis_meta = {"num_patches": num_patches, "vis_layers": L, "total_flops": total_flops}
+        if profile:
+            _vis_meta["profile_checkpoints"] = enc_checkpoints
+        # Merge the vision section into the combined programs bin (LM stays intact).
+        self._store_program_section("vision", base_addr, enc_bytes, _vis_meta, profile=profile)
+        print(f"  [Vision] encoder section stored ({len(enc_bytes)/1024/1024:.1f} MB @ 0x{base_addr:X}, "
+              f"{time.perf_counter()-t0:.1f}s)", flush=True)
+
+    def execute_vision_encoder_bin(self, num_patches: int, profile: bool = False):
+        """Load the cached encoder bin, DMA it to program DRAM at its baked base,
+        and execute. Returns elapsed seconds.
+
+        ``profile``: run the profile-compiled bin **segment-by-segment** through
+        its per-phase HALT checkpoints, timing each with the HW latency counter,
+        and return the per-segment [(name, ms)] list instead. The encoder still
+        computes its full output (segments tile the whole program). No preamble
+        is needed — the vision ops prime their own GPRs inline."""
+        import threading
+        meta, enc_bytes = self._get_program_section("vision", profile)
+        if meta is None:
+            raise FileNotFoundError("vision section not found in combined programs bin")
+        program_addr = int(meta["dram_base"], 16)
+        self._next_program_dram_addr = program_addr
+        self.dma_write(DMA_DEVICE_H2C, program_addr, enc_bytes, len(enc_bytes))
+        self.allocate_program_dram(len(enc_bytes))
+        print(f"  [Vision] launching encoder ({len(enc_bytes)/1024/1024:.1f} MB) at 0x{program_addr:X}"
+              f"{' [profiled]' if profile else ''} ...", flush=True)
+        t0 = time.perf_counter()
+
+        if profile:
+            checkpoints = meta.get("profile_checkpoints", [])
+            results = []
+            self.start_execute_from_dram(program_addr)
+            for name, resume_hex in checkpoints:
+                self.wait_queue(180.0)
+                results.append((name, self.report_latency_in_us() / 1e3))   # ms
+                self.start_execute_from_dram(int(resume_hex, 16))
+            self.wait_queue(180.0)   # tail: final HALT after the last checkpoint
+            results.append(("tail", self.report_latency_in_us() / 1e3))
+            return results
+
+        _anchor = getattr(self, "_vis_fpga_t0", t0)
+        _stop = threading.Event()
+        def _hb():
+            while not _stop.wait(10):
+                _original_print(f"  [Vision] ... running on FPGA ({time.perf_counter()-_anchor:.0f}s)", flush=True)
+        _th = threading.Thread(target=_hb, daemon=True); _th.start()
+        try:
+            self.start_execute_from_dram(program_addr)
+            self.wait_queue(180.0)
+        finally:
+            _stop.set(); _th.join(timeout=1.0)
+        elapsed = time.perf_counter() - t0
+        # Report like the LM's program_execute: HW latency + FLOP rate.
+        latency_us = self.report_latency_in_us()
+        print(f"    Total program execution latency = {latency_us} us")
+        _flops = meta.get("total_flops")
+        if _flops:
+            gflops, _ = self.report_flop_rate_gflops(_flops)
+            print(f"Report FLOPS for program execution: {gflops:.2f} GFLOPS")
+        print(f"Vision encoder execute done in {elapsed:.2f} seconds.", flush=True)
+        return elapsed
+
+    # ------------------------------------------------------------------
+    # Vision projection + driver (S4): pooler tail, full encoder run, and the
+    # set_prefill_seq_vlm entry that feeds image soft-tokens into run_prefill's
+    # existing merge hooks.
+    # ------------------------------------------------------------------
+    def vision_embed_project(self, hidden_states: torch.Tensor,
+                             pixel_position_ids: torch.Tensor,
+                             padding_positions: torch.Tensor) -> torch.Tensor:
+        """Gemma4 vision pooler + embed_vision tail. Host: mask padding, spatial
+        avg-pool by position, scale by sqrt(H), strip masked rows. FPGA: RMSNorm
+        (gamma=ones) + embedding_projection (IF4). Returns image_features
+        [N_final, VIS_TEXT_H]."""
+        H, text_h, pool_k = self.VIS_H, self.VIS_TEXT_H, self.VIS_POOL_K
+        hidden_states = hidden_states.detach().cpu()
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)
+        S = hidden_states.shape[1]
+        output_length = S // (pool_k * pool_k)
+        pids = pixel_position_ids.detach().cpu()
+        if pids.dim() == 2:
+            pids = pids.unsqueeze(0)
+        pad = padding_positions.detach().cpu()
+        if pad.dim() == 1:
+            pad = pad.unsqueeze(0)
+
+        with torch.no_grad():
+            h = hidden_states.float().clone()
+            h.masked_fill_(pad.unsqueeze(-1), 0.0)
+            input_seq_len = h.shape[1]
+            k = int((input_seq_len // output_length) ** 0.5)
+            k_squared = k * k
+            if k_squared * output_length != input_seq_len:
+                raise ValueError(
+                    f"Cannot pool {h.shape} to {output_length}: k={k}^2 × {output_length} "
+                    f"must equal {input_seq_len}.")
+            clamped = pids.clamp(min=0)
+            max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
+            kernel_idxs = torch.div(clamped, k, rounding_mode="floor")
+            kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
+            weights = F.one_hot(kernel_idxs.long(), output_length).float() / k_squared
+            pooled = weights.transpose(1, 2) @ h
+            pooler_mask = torch.logical_not((weights == 0).all(dim=1))
+            pooled = (pooled * (H ** 0.5))[pooler_mask]
+        N_final = int(pooled.shape[0])
+        assert N_final <= S, f"pooler produced {N_final} rows, scratch sized for {S}"
+        self.dma_to_accelerator_memory(self.VIS_EMBED_POOL, pooled.to(torch.bfloat16).contiguous())
+
+        self._compile_and_run_single("embed_pre_norm", lambda: self.rms_norm_core_dram(
+            M=N_final, N=H, A_DRAM_ADDR=self.VIS_EMBED_POOL,
+            OUTPUT_DRAM_ADDR=self.VIS_EMBED_NORMED, GAMMA_DRAM_ADDR=self.VIS_EMBED_NORM_GAMMA))
+        w = self.VIS_EMBED_PROJ_INFO
+        self._compile_and_run_single("embed_projection", lambda: self.matmat_mul_core(
+            M=N_final, K=H, N=text_h, A_DRAM_ADDR=self.VIS_EMBED_NORMED,
+            B_DRAM_ADDR=w["data"], OUTPUT_DRAM_ADDR=self.VIS_EMBED_OUT,
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w["scale"],
+            gpr_M_reg=self._vis_mm_gpr(M=N_final)))
+        return self.dma_from_accelerator_memory(self.VIS_EMBED_OUT, (N_final, text_h)).cpu()
+
+    def _run_vision_encoder_fpga(self, image_path: str, prompt: str, profile: bool = False):
+        """Full vision encoder on FPGA (separate bin @ 0xa0000000): preprocess →
+        patch embed → 16-layer encoder → pooler + projection. Returns
+        (image_features, token_ids, mm_types). Stashes FPGA readbacks in
+        self._vis_ckpt for the numeric harness. Restores the LM allocator state
+        on exit so LM prefill/decode still work.
+
+        ``profile``: run the encoder through per-phase HALT checkpoints and print
+        a major-step FPGA-latency breakdown (proj / rope_gather / attention /
+        post_attn, aggregated across layers), same style as the LM profile."""
+        from PIL import Image
+        from transformers import AutoProcessor
+
+        hf_model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
+        processor = AutoProcessor.from_pretrained(model_dir)
+        hf_model.eval()
+
+        image = Image.open(image_path).convert("RGB").resize(VISION_CANONICAL_SIZE, Image.BICUBIC)
+        conversation = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": prompt}]}]
+        text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+        inputs = processor(text=[text_prompt], images=[[image]], return_tensors="pt")
+        pixel_values = inputs['pixel_values']                       # [1, S, 768]
+        pixel_position_ids = inputs['image_position_ids']            # [1, S, 2]
+        padding_positions = (pixel_position_ids == -1).all(dim=-1)   # [1, S]
+        num_patches = pixel_values.shape[1]
+        token_ids = inputs['input_ids'][0].tolist()
+        mm_types = inputs['mm_token_type_ids'][0].tolist()
+        assert num_patches == VISION_FIXED_NUM_PATCHES, (
+            f"Vision shape contract broken: num_patches={num_patches}, expected "
+            f"{VISION_FIXED_NUM_PATCHES}. Check the {VISION_CANONICAL_SIZE} → patches mapping.")
+
+        # Save LM allocator state to restore after vision clobbers the shared
+        # tensor DRAM region.
+        _tensor_save = self._tensor_dram_addr
+        _prog_addr_save = self._next_program_dram_addr
+        _prog_base_save = self._program_dram_base
+
+        global _SILENT_MODE
+        _prev_silent = _SILENT_MODE
+        _SILENT_MODE = True
+        try:
+            self.vision_weight_init(hf_model)        # weights ABOVE LM tensors (no reset)
+            self.vision_tensor_init(num_patches)     # scratch reuses LM tensor region; ISA base 0xa0
+            self.set_vision_attention_bias(padding_positions)
+            cos_p, neg_sin_p, sin_hi_p = self._load_or_build_vision_rope_pads(
+                hf_model, pixel_position_ids, num_patches)
+            self.dma_to_accelerator_memory(self.VIS_ROPE_COS_PAD_TILED, cos_p)
+            self.dma_to_accelerator_memory(self.VIS_ROPE_NEG_SIN_PAD_TILED, neg_sin_p)
+            self.dma_to_accelerator_memory(self.VIS_ROPE_SIN_HI_PAD_TILED, sin_hi_p)
+        finally:
+            _SILENT_MODE = _prev_silent
+
+        self._vis_fpga_t0 = time.perf_counter()
+        patch_embeds = self.vision_patch_embed(
+            pixel_values.cpu(), pixel_position_ids.cpu(), padding_positions.cpu())
+        self.compile_vision_encoder_bin(num_patches, profile=profile)
+        enc_result = self.execute_vision_encoder_bin(num_patches, profile=profile)
+
+        # 16 layers (even) → final output in VIS_IO_A (patch embed → IO_A → IO_B
+        # → ... → IO_A). Odd layer counts would land in VIS_IO_B.
+        final_buf = self.VIS_IO_A if self.VIS_LAYERS % 2 == 0 else self.VIS_IO_B
+        encoder_out = self.dma_from_accelerator_memory(final_buf, (num_patches, self.VIS_H)).cpu()
+        image_features = self.vision_embed_project(
+            encoder_out, pixel_position_ids.cpu(), padding_positions.cpu())
+
+        # Numeric-harness checkpoints (SNR-compared vs HF in the numeric script).
+        self._vis_ckpt = {
+            "patch_embed": patch_embeds,
+            "encoder_out": encoder_out,
+            "image_features": image_features,
+        }
+
+        # Restore LM allocator state (vision scratch overwrote LM tensor DATA;
+        # run_prefill re-uploads/zeros it, so only the cursors need restoring).
+        self._tensor_dram_addr = _tensor_save
+        self._next_program_dram_addr = _prog_addr_save
+        self._program_dram_base = _prog_base_save
+
+        # Major-step FPGA-latency breakdown of the encoder (profile mode only).
+        if profile and isinstance(enc_result, list):
+            self._print_phase_breakdown("VISION ENCODER", enc_result, per_token=False)
+        print(f"[Vision] encoder done: {image_features.shape[0]} soft tokens.", flush=True)
+        return image_features, token_ids, mm_types
+
+    def set_prefill_seq_vlm(self, image_path: str, prompt: str | None = None,
+                            profile: bool = False) -> None:
+        """VLM entry: run the vision encoder on FPGA, then stash the prompt token
+        ids + image soft-token features so run_prefill's merge hooks splice them
+        into the prompt embeddings (mm_token_type_ids == 1 → image positions).
+        ``profile`` forwards to the encoder's per-phase FPGA-latency breakdown."""
+        if prompt is None:
+            prompt = "Describe this image in detail."
+        image_features, token_ids, mm_types = self._run_vision_encoder_fpga(
+            image_path, prompt, profile=profile)
+        self.prefill_seq = tuple(token_ids)
+        self._image_features = image_features   # [N_soft, VIS_TEXT_H]
+        self._mm_types = mm_types
+        _n_img = int((torch.tensor(mm_types) == 1).sum().item())
+        print(f"VLM prefill: {len(token_ids)} tokens ({_n_img} image, {len(token_ids) - _n_img} text)")
 
     # Per-layer dim resolution for Gemma4's heterogeneous stack. Two independent
     # axes → 4 layer buckets. Values below are for the current config (35 layers,
@@ -2369,6 +3607,75 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         return (os.path.join(bin_dir, stem + ".bin"),
                 os.path.join(bin_dir, stem + ".json"))
 
+    # ------------------------------------------------------------------
+    # Combined program image: ONE programs.bin holds every ISA section (vision
+    # @ 0xa0000000, LM @ 0xc0000000, ...), each at its own baked DRAM base. The
+    # bytes and addresses of each section are identical to a standalone build —
+    # only the on-disk packaging is shared. programs.json carries a `sections`
+    # map {name: {file_offset, size, dram_base, ...extra}}. Compiles merge their
+    # section in (preserving others); loaders DMA a section to its dram_base.
+    # ------------------------------------------------------------------
+    def _read_program_sections(self, profile: bool = False) -> tuple[dict, bytes]:
+        """Return ({name: section_meta}, whole_bin_bytes). Empty dict if none."""
+        bin_path, meta_path = self._program_image_paths(profile)
+        if not (os.path.exists(bin_path) and os.path.exists(meta_path)):
+            return {}, b""
+        with open(meta_path) as f:
+            sections = json.load(f).get("sections", {})
+        with open(bin_path, "rb") as f:
+            data = f.read()
+        return sections, data
+
+    def _get_program_section(self, name: str, profile: bool = False):
+        """Return (section_meta, section_bytes) for `name`, or (None, None)."""
+        sections, data = self._read_program_sections(profile)
+        s = sections.get(name)
+        if s is None:
+            return None, None
+        return s, data[s["file_offset"]: s["file_offset"] + s["size"]]
+
+    def _store_program_section(self, name: str, dram_base: int, section_bytes: bytes,
+                               extra_meta: dict, profile: bool = False) -> None:
+        """Merge one section into the combined programs bin, preserving every
+        other section. Rewrites the file so offsets stay contiguous; sections are
+        ordered by dram_base (vision 0xa0 before LM 0xc0)."""
+        bin_path, meta_path = self._program_image_paths(profile)
+        sections, data = self._read_program_sections(profile)
+        blobs = {k: data[s["file_offset"]: s["file_offset"] + s["size"]] for k, s in sections.items()}
+        metas = {k: {kk: vv for kk, vv in s.items() if kk not in ("file_offset", "size")}
+                 for k, s in sections.items()}
+        blobs[name] = bytes(section_bytes)
+        metas[name] = {"dram_base": f"0x{dram_base:X}", **extra_meta}
+        order = sorted(blobs, key=lambda k: int(metas[k]["dram_base"], 16))
+        out = bytearray()
+        new_sections = {}
+        for k in order:
+            b = blobs[k]
+            new_sections[k] = {"file_offset": len(out), "size": len(b), **metas[k]}
+            out.extend(b)
+        os.makedirs(os.path.dirname(bin_path), exist_ok=True)
+        bin_tmp, meta_tmp = bin_path + ".tmp", meta_path + ".tmp"
+        with open(bin_tmp, "wb") as f:
+            f.write(bytes(out)); f.flush(); os.fsync(f.fileno())
+        with open(meta_tmp, "w") as f:
+            json.dump({"sections": new_sections}, f, indent=2); f.flush(); os.fsync(f.fileno())
+        os.rename(bin_tmp, bin_path); os.rename(meta_tmp, meta_path)
+
+    def _load_program_section(self, name: str, profile: bool = False) -> dict:
+        """DMA the named section's bytes to its baked DRAM base and advance the
+        program cursor past it. Returns the section meta (with int dram_base).
+        Raises if the section is absent."""
+        meta, sect_bytes = self._get_program_section(name, profile)
+        if meta is None:
+            raise FileNotFoundError(f"program section {name!r} not found in combined programs bin")
+        base = int(meta["dram_base"], 16)
+        self._next_program_dram_addr = base
+        written = self.dma_write(DMA_DEVICE_H2C, base, sect_bytes, len(sect_bytes))
+        if written != len(sect_bytes):
+            raise RuntimeError(f"section {name}: DMA wrote {written} of {len(sect_bytes)} bytes")
+        self.allocate_program_dram(len(sect_bytes))
+        return {**meta, "_dram_base_int": base}
+
     def compile_gemma4(self, layer_size: int = 35, profile: bool = False) -> None:
         """Capture [prefill][decoder] into one combined image and write it to
         disk (gemma4_e2b_bin/programs.bin + programs.json). No DRAM is touched —
@@ -2384,12 +3691,18 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         assert self.prefill_seq is not None, (
             "call set_prefill_seq() before compile_gemma4()")
         prefill_seq_len = len(self.prefill_seq) - 1
-        bin_path, meta_path = self._program_image_paths(profile)
-        os.makedirs(os.path.dirname(bin_path), exist_ok=True)
-        if os.path.exists(bin_path) and os.path.exists(meta_path):
-            print(f"[compile] reusing cached {os.path.basename(bin_path)} "
-                  f"(seq_len-agnostic; delete to force recompile).")
-            return
+        # Reuse the cached LM section only if it was baked at the current program
+        # base — jump/scratch addresses are absolute, so a base change (e.g. the
+        # LM 0xa0→0xc0 relocation for vision coexistence) forces a rebuild.
+        _lm_meta, _ = self._get_program_section("lm", profile)
+        if _lm_meta is not None:
+            _cached_base = int(_lm_meta["dram_base"], 16)
+            if _cached_base == self._program_dram_base:
+                print("[compile] reusing cached LM section "
+                      "(seq_len-agnostic; delete programs.bin to force recompile).")
+                return
+            print(f"[compile] cached LM section baked at 0x{_cached_base:X} != current "
+                  f"base 0x{self._program_dram_base:X} — rebuilding.")
 
         print(f"[compile] building combined [prefill@{prefill_seq_len}][decoder] image...")
         global _SILENT_MODE
@@ -2430,10 +3743,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             # subsequent load lands the image where its jumps were baked.
             self._next_program_dram_addr = instruction_base_addr
 
-        manifest = {
-            "instruction_bin": os.path.relpath(bin_path, self.script_dir),
+        lm_meta = {
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
-            "instruction_total_size": len(image_bytes),
             "prefill_seq_len": prefill_seq_len,
             "prefill_program_start_addr": f"0x{prefill_program_addr:X}",
             "prefill_program_size": prefill_size_bytes,
@@ -2444,17 +3755,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             "layer_size": layer_size,
         }
         if profile:
-            manifest["prefill_profile_checkpoints"] = self._prefill_checkpoints
-            manifest["decoder_profile_checkpoints"] = self._decoder_checkpoints
-        bin_tmp, meta_tmp = bin_path + ".tmp", meta_path + ".tmp"
-        with open(bin_tmp, "wb") as f:
-            f.write(bytes(image_bytes)); f.flush(); os.fsync(f.fileno())
-        with open(meta_tmp, "w") as f:
-            json.dump(manifest, f, indent=2); f.flush(); os.fsync(f.fileno())
-        os.rename(bin_tmp, bin_path); os.rename(meta_tmp, meta_path)
+            lm_meta["prefill_profile_checkpoints"] = self._prefill_checkpoints
+            lm_meta["decoder_profile_checkpoints"] = self._decoder_checkpoints
+        # Merge the LM section into the combined programs bin (vision stays intact).
+        self._store_program_section("lm", instruction_base_addr, image_bytes, lm_meta, profile=profile)
 
-        print(f"[compile] wrote {len(image_bytes)/1024:.1f} KB -> {os.path.basename(bin_path)}")
-        print(f"[compile]   prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
+        print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
+              f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
               f"decoder @ 0x{decoder_program_addr:X} ({decoder_size_bytes/1024:.1f} KB)")
 
     def run_gemma4(self) -> tuple[int, float, float, float, float, float]:
@@ -2466,23 +3773,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         Returns (token_cnt_decoded, latency_hw_prefill, latency_hw_decoder,
         flop_rate_hw_decoder, wallclock_prefill_s, wallclock_decoder_s).
         """
-        bin_path, meta_path = self._program_image_paths()
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-        base_addr = int(meta["instruction_base_addr"], 16)
+        # Load the LM section ([prefill][decoder]) from the combined programs bin
+        # into program DRAM at its baked base (PBI jump targets resolve against
+        # it), then park the single dispatch preamble just past it.
+        meta = self._load_program_section("lm")
+        base_addr = meta["_dram_base_int"]
         prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
-
-        # Load the combined [prefill][decoder] image into program DRAM at the
-        # baked base (PBI jump targets resolve against it), then park the single
-        # dispatch preamble just past the whole image.
-        self._next_program_dram_addr = base_addr
-        start_addr, prog_size = self.load_program_instructions_from_file(bin_path)
-        assert start_addr == base_addr, (
-            f"combined image loaded at 0x{start_addr:X}, expected baked base 0x{base_addr:X}")
         self._preamble_addr = self.get_program_dram_addr()
-        print(f"[run] loaded combined image at 0x{base_addr:X} ({prog_size/1024:.1f} KB); "
-              f"dispatch preamble @ 0x{self._preamble_addr:X}")
+        print(f"[run] loaded LM section at 0x{base_addr:X} ({meta['prefill_program_size']/1024:.1f} + "
+              f"{meta['decoder_program_size']/1024:.1f} KB); dispatch preamble @ 0x{self._preamble_addr:X}")
 
         print(f"\n--- Starting prefill ---")
         print(f"--- Prompt begin ({len(self.prefill_seq)} tokens) ---")
@@ -2580,19 +3880,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         and print per-phase HW-latency breakdowns aggregated across all layers.
         Use to find where prefill / decode time goes. Requires
         compile_gemma4(profile=True)."""
-        bin_path, meta_path = self._program_image_paths(profile=True)
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-        base_addr = int(meta["instruction_base_addr"], 16)
+        meta = self._load_program_section("lm", profile=True)
+        base_addr = meta["_dram_base_int"]
         prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
         prefill_checkpoints = meta.get("prefill_profile_checkpoints", [])
         decoder_checkpoints = meta["decoder_profile_checkpoints"]
 
-        self._next_program_dram_addr = base_addr
-        _, prog_size = self.load_program_instructions_from_file(bin_path)
         self._preamble_addr = self.get_program_dram_addr()
-        print(f"[profile] loaded profile image at 0x{base_addr:X} ({prog_size/1024:.1f} KB), "
+        print(f"[profile] loaded LM profile section at 0x{base_addr:X}, "
               f"{len(prefill_checkpoints)} prefill + {len(decoder_checkpoints)} decode checkpoints")
 
         # --- Profiled prefill (segmented). Populates the KV cache AND sets
@@ -2645,6 +3941,10 @@ default prompt: "x+3=5, what is x?"
                 (pre-tokenized as default_prefill_tokens in gemma4_e2b_config.json)""")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt. Default is the built-in test question.")
+    parser.add_argument("--image", type=str, nargs="?", const=DEFAULT_IMAGE, default=None,
+                        help="VLM mode: run the vision encoder on the FPGA and merge image "
+                             f"soft-tokens into the prompt. Bare --image uses the default "
+                             f"({os.path.basename(DEFAULT_IMAGE)}); omit it for LM-only mode.")
     parser.add_argument("--local-weights", action="store_true",
                         help="Use gemma4_e2b_bin/params.bin instead of the configured weights bin.")
     parser.add_argument('--dev', type=str, default='xdma0',
@@ -2672,7 +3972,23 @@ default prompt: "x+3=5, what is x?"
     ue = Gemma4_UnifiedEngine(local_weights=args.local_weights)
 
     # Prompt first — the prefill program is compiled for its exact length.
-    if args.prompt:
+    # VLM mode (--image): run the vision encoder on the FPGA now (separate bin
+    # @ 0xa0000000); it sets prefill_seq + image soft-tokens that run_prefill
+    # merges. The LM prefill/decoder then compiles at 0xc0000000 as usual.
+    if args.image:
+        # Resolve a bare filename (e.g. --image people.jpg) against the shipped
+        # test_samples dir where the default lives; existing/absolute paths pass
+        # through unchanged.
+        if not os.path.isfile(args.image):
+            _cand = os.path.join(os.path.dirname(DEFAULT_IMAGE), os.path.basename(args.image))
+            if os.path.isfile(_cand):
+                args.image = _cand
+        if not os.path.isfile(args.image):
+            raise SystemExit(f"--image: file not found: {args.image!r} "
+                             f"(also tried {os.path.dirname(DEFAULT_IMAGE)}/)")
+        print(f"[Mode] VLM -- image: {args.image!r} prompt: {args.prompt!r}")
+        ue.set_prefill_seq_vlm(args.image, args.prompt, profile=args.profile)
+    elif args.prompt:
         print(f"[Mode] LM -- prompt: {args.prompt!r}")
         ue.set_prefill_seq(args.prompt)
     else:
