@@ -1140,6 +1140,119 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 element_size=m_take * N)
         return total_flops
 
+    def _compile_per_layer_injection_prefill(self, layer_idx: int, layer_off: int) -> int:
+        """Seq_len-agnostic per-layer input injection for PREFILL.
+
+        Same math as _compile_per_layer_injection (which decode still uses with
+        seq_len=1), but the row count is applied indirectly through gpr_seq_len
+        at runtime, so a single captured program is valid for any prompt length:
+          * gate / projection matmuls read M from gpr_seq_len (M= is template);
+          * per_layer_input is packed [layer, token, dim] with a seq_len row
+            stride, so its per-layer base is computed from gpr_seq_len and the
+            gate*per_layer_input multiply runs as a per-row ISA loop;
+          * the fused rms_norm + residual + layer_scalar step is a plain per-row
+            ISA loop — one row resident at a time, no chunking / SRAM reuse.
+        """
+        total_flops = 0
+        bpe = self.bytes_per_element
+        dim = self.per_layer_input_dim   # 256
+        N   = self.vector_length         # 1536
+        M_tmpl = self.seq_len            # compile-time template (FLOPs / loop_cnt only)
+
+        # gate = gelu(hidden @ per_layer_input_gate): [S,1536] @ [1536,256] -> [S,256]
+        total_flops += self.matmat_mul_core(M=M_tmpl, K=N, N=dim,
+            A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
+            B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PER_LAYER_GATE + layer_off,
+            OUTPUT_DRAM_ADDR=self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM,
+            gelu_enable=True, gpr_M_reg=self.gpr_seq_len)
+
+        # gated = gate * per_layer_input[layer_idx], per-row (runtime trip count).
+        # per_layer_input[layer] base = PER_LAYER_INPUTS_DRAM + layer*seq_len*dim*bpe,
+        # computed from gpr_seq_len; a running pointer walks one row per iteration.
+        gate_dram = self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM
+        # eltwise operands must live in different URAM banks (split at 0x80000):
+        # A in URAM_A (<0x80000), B in URAM_B (>=0x80000).
+        sram_a, sram_b = 0x10000, 0x80000
+        _pli = self.alloc_isa_reg()
+        self.generate_instruction_reg_mul_imm(_pli, self.gpr_seq_len,
+            ue_35bit_addr_shifter(layer_idx * dim * bpe))
+        self.generate_instruction_add_imm(_pli,
+            ue_35bit_addr_shifter(self.PER_LAYER_INPUTS_DRAM), _pli)
+        _r = self.alloc_isa_reg()
+        self.generate_instruction_add_set(_r, 0)
+        self.loop_start(loop_cnt=M_tmpl, gpr_loop_cnt=self.gpr_seq_len)
+        # gate row -> SRAM_A
+        self.generate_instruction_reg_mul_imm(self.TMP_REG, _r, ue_35bit_addr_shifter(dim * bpe))
+        self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(gate_dram), self.TMP_REG)
+        self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram_a,
+                                        element_size=dim, general_reg_src=self.TMP_REG)
+        # per_layer_input row -> SRAM_B (running pointer)
+        self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram_b,
+                                        element_size=dim, general_reg_src=_pli)
+        # gated = gate * per_layer_input -> SRAM_A
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_b,
+                              vector_C_sram_wb_addr=sram_a, element_size=dim)
+        # SRAM_A -> gate row (in place)
+        self.generate_instruction_reg_mul_imm(self.TMP_REG, _r, ue_35bit_addr_shifter(dim * bpe))
+        self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(gate_dram), self.TMP_REG)
+        self.sram_to_accelerator_memory(sram_address=sram_a, accelerator_dram_address=0,
+                                        element_size=dim, general_reg_src=self.TMP_REG)
+        # advance per_layer_input pointer by one row
+        self.generate_instruction_add_imm(_pli, ue_35bit_addr_shifter(dim * bpe), _pli)
+        self.generate_instruction_add_inc(_r)
+        self.loop_end()
+        self.release_isa_reg()  # _r
+        self.release_isa_reg()  # _pli
+
+        # projected = gated @ per_layer_projection: [S,256] @ [256,1536] -> [S,1536]
+        total_flops += self.matmat_mul_core(M=M_tmpl, K=dim, N=N,
+            A_DRAM_ADDR=self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM,
+            B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PER_LAYER_PROJ + layer_off,
+            OUTPUT_DRAM_ADDR=self.LAYER0_PER_LAYER_PROJ_OUTPUT_DRAM,
+            gpr_M_reg=self.gpr_seq_len)
+
+        # FUSED per-row loop: for each of gpr_seq_len rows,
+        #   normed = rms_norm(projected_row, gamma)
+        #   LAYER0_OUTPUT_row = (hidden_row + normed) * layer_scalar
+        # One row resident per iteration; no chunking, no cross-op SRAM reuse.
+        proj_dram   = self.LAYER0_PER_LAYER_PROJ_OUTPUT_DRAM
+        hidden_dram = self.LAYER0_OUTPUT_DRAM
+        gamma_addr  = self.DRAM_ADDR_LAYER0_POST_PER_LAYER_NORM_GAMMA + layer_off
+        proj_sram, gamma_sram, hidden_sram = 0x10000, 0x80000, 0x90000
+        # gamma resident across all rows
+        self.accelerator_memory_to_sram(accelerator_dram_address=gamma_addr,
+                                        sram_address=gamma_sram, element_size=N)
+        _r = self.alloc_isa_reg()
+        self.generate_instruction_add_set(_r, 0)
+        self.loop_start(loop_cnt=M_tmpl, gpr_loop_cnt=self.gpr_seq_len)
+        # projected row -> proj_sram
+        self.generate_instruction_reg_mul_imm(self.TMP_REG, _r, ue_35bit_addr_shifter(N * bpe))
+        self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(proj_dram), self.TMP_REG)
+        self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=proj_sram,
+                                        element_size=N, general_reg_src=self.TMP_REG)
+        # rms_norm(projected) in place with resident gamma
+        self.rms_norm_core(proj_sram, proj_sram, N, gamma_sram)
+        # hidden row -> hidden_sram
+        self.generate_instruction_reg_mul_imm(self.TMP_REG, _r, ue_35bit_addr_shifter(N * bpe))
+        self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(hidden_dram), self.TMP_REG)
+        self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=hidden_sram,
+                                        element_size=N, general_reg_src=self.TMP_REG)
+        # residual add: normed + hidden -> proj_sram
+        self.eltwise_add_core(vector_A_sram_start_addr=proj_sram, vector_B_sram_start_addr=hidden_sram,
+                              vector_C_sram_wb_addr=proj_sram, element_size=N)
+        # * layer_scalar
+        self.broadcast_mul(scalar=self._layer_scalars[layer_idx],
+                           sram_start_addr=proj_sram, sram_wb_addr=proj_sram, element_size=N)
+        # store -> LAYER0_OUTPUT row
+        self.generate_instruction_reg_mul_imm(self.TMP_REG, _r, ue_35bit_addr_shifter(N * bpe))
+        self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(self.LAYER0_OUTPUT_DRAM), self.TMP_REG)
+        self.sram_to_accelerator_memory(sram_address=proj_sram, accelerator_dram_address=0,
+                                        element_size=N, general_reg_src=self.TMP_REG)
+        self.generate_instruction_add_inc(_r)
+        self.loop_end()
+        self.release_isa_reg()  # _r
+        return total_flops
+
     def _emit_gqa_duplicate_pbi(self, src_dram_base: int, dst_dram_base: int,
                                 cur_head_dim: int, template_seq_len: int,
                                 gpr_seq_len: int, sram_addr: int = 0x10000,
@@ -1242,11 +1355,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             cur_mlp = self._get_mlp_elements(layer_idx)
             rope_n = self._get_rope_dims(layer_idx)
 
-            if layer_idx != 0:
-                self._emit_sram_copy_chunked(
-                    self.LAYER0_OUTPUT_DRAM, self.LAYER0_INPUT_DRAM,
-                    seq_len * self.vector_length)
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+            # Layer-input source (mirrors compile_decoder): layer 0 reads the
+            # uploaded LAYER0_INPUT; layer i>0 reads the previous layer's
+            # LAYER0_OUTPUT directly — no seq_len-sized copy. LAYER0_OUTPUT is
+            # overwritten only at this layer's final MLP+injection residual,
+            # AFTER it is consumed here and as the attention-residual source.
+            layer_input_addr = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_OUTPUT_DRAM
+            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=layer_input_addr,
                                 OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                                                 gpr_M_reg=self.gpr_seq_len)
             # Q projection: N = cur_q_size (actual per-layer Q output dim)
@@ -1406,9 +1521,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                             gpr_M_reg=self.gpr_seq_len)
             self.eltwise_core_dram(
                 M=seq_len, N=self.vector_length,
-                dram_a=self.LAYER0_INPUT_DRAM, dram_b=self.LAYER0_POST_ATTN_NORM_DRAM,
+                dram_a=layer_input_addr, dram_b=self.LAYER0_POST_ATTN_NORM_DRAM,
                 dram_out=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                mode=UE_MODE.ELTWISE_ADD)
+                mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self.gpr_seq_len)
             total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                             OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                                             gpr_M_reg=self.gpr_seq_len)
@@ -1436,7 +1551,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 M=seq_len, N=cur_mlp,
                 dram_a=self.LAYER0_MLP_GATE_DRAM, dram_b=self.LAYER0_MLP_UP_DRAM,
                 dram_out=self.LAYER0_MLP_MULT_DRAM,
-                mode=UE_MODE.ELTWISE_MUL)
+                mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=self.gpr_seq_len)
             # MLP down projection.
             total_flops += self.matmat_mul_core(M=seq_len, K=cur_mlp, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
@@ -1454,10 +1569,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 M=seq_len, N=self.vector_length,
                 dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, dram_b=self.LAYER0_POST_MLP_NORM_DRAM,
                 dram_out=self.LAYER0_OUTPUT_DRAM,
-                mode=UE_MODE.ELTWISE_ADD)
+                mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self.gpr_seq_len)
 
-            # Per-layer input injection (NEW for Gemma4 E2B)
-            total_flops += self._compile_per_layer_injection(layer_idx, layer_off, seq_len)
+            # Per-layer input injection (NEW for Gemma4 E2B) — seq_len-agnostic
+            # (gpr_seq_len-driven) prefill variant; decode uses the seq_len=1 one.
+            total_flops += self._compile_per_layer_injection_prefill(layer_idx, layer_off)
 
         self.generate_instruction_halt()
         _SILENT_MODE = False
@@ -2211,11 +2327,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 os.path.join(bin_dir, "programs.json"))
 
     def compile_gemma4(self, layer_size: int = 35) -> None:
-        """Capture [prefill @ real seq_len][decoder] into one combined image and
-        write it to disk (gemma4_e2b_bin/programs.bin + programs.json). No DRAM
-        is touched — run_gemma4() loads it. No-op if a cached image for THIS
-        prompt length already exists (the prefill is seq_len-specific, so a
-        cached image built for a different length is stale and recompiled).
+        """Capture [prefill][decoder] into one combined image and write it to
+        disk (gemma4_e2b_bin/programs.bin + programs.json). No DRAM is touched —
+        run_gemma4() loads it.
+
+        Both programs are seq_len-agnostic (dynamic-PBI: row counts come from
+        gpr_seq_len / gpr_q_seq_len / gpr_aligned_seq_len at runtime), so the
+        cached image is valid for ANY prompt length up to max_prefill_seq_len.
+        Reused as-is whenever programs.bin exists — delete it to force a rebuild.
 
         set_prefill_seq() MUST have been called first (prefill needs the prompt).
         """
@@ -2225,17 +2344,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         bin_path, meta_path = self._program_image_paths()
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         if os.path.exists(bin_path) and os.path.exists(meta_path):
-            try:
-                with open(meta_path, "r") as f:
-                    _cached_seq_len = json.load(f).get("prefill_seq_len")
-            except (OSError, ValueError):
-                _cached_seq_len = None
-            if _cached_seq_len == prefill_seq_len:
-                print(f"[compile] reusing cached programs.bin (seq_len={prefill_seq_len}; "
-                      f"delete to force recompile).")
-                return
-            print(f"[compile] cached programs.bin is for seq_len={_cached_seq_len}, "
-                  f"need {prefill_seq_len} — recompiling.")
+            print(f"[compile] reusing cached programs.bin "
+                  f"(seq_len-agnostic; delete to force recompile).")
+            return
 
         print(f"[compile] building combined [prefill@{prefill_seq_len}][decoder] image...")
         global _SILENT_MODE
