@@ -18,7 +18,7 @@ Weights:
 Usage:
   python gemma3_test.py
   python gemma3_test.py --prompt "your prompt"
-  python gemma3_test.py --dev xdma0 [--device kintex7] [--cycle 4.8077]
+  python gemma3_test.py --dev xdma0 [--device kintex7] [--cycle 5.0422]
   python gemma3_test.py --dev xdma0 --device bittware
   python gemma3_test.py --local-weights
   python gemma3_test.py --dual-engine
@@ -2418,7 +2418,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         print(f"\n--- Starting prefill (seq_len={prefill_seq_len}) ---")
         print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
-        timer = time.perf_counter()
         if slave_prefill_addr is not None:
             slave_engine.program_execute(slave_prefill_addr, timeout=0)
 
@@ -2454,6 +2453,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         bias_one_group[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
         # Execute from the preamble; preamble jumps into cached prefill, which HALTs on completion.
+        timer = time.perf_counter()
         latency_hw_prefill, flop_rate_hw_prefill = self.program_execute(preamble_addr, flops=flops_prefill)
         latency_prefill = time.perf_counter() - timer
         if slave_prefill_flops is not None:
@@ -2659,10 +2659,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         peak_tokens_per_s = 1000.0 / hw_decode_first_ms if hw_decode_first_ms > 0 else 0.0
         avg_tokens_per_s = tokens_decoded / latency_decoder if latency_decoder > 0 else 0.0
         return {
+            "prefill_tokens": prefill_seq_len,
             "decoded_text": decoded_text,
+            "decoded_tokens": tokens_decoded,
             "tokens_decoded": tokens_decoded,
             "avg_tokens_per_s": avg_tokens_per_s,
             "peak_tokens_per_s": peak_tokens_per_s,
+            "prefill_speed_tok_s": prefill_seq_len / latency_prefill if latency_prefill > 0 else 0.0,
+            "decode_speed_tok_s": avg_tokens_per_s,
+            "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
+            "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
+            "prefill_hw_ms": latency_hw_prefill / 1e3,
+            "prefill_cpu_ms": latency_prefill * 1e3,
+            "decode_first_hw_ms": hw_decode_first_ms,
+            "decode_avg_hw_ms": hw_decode_avg_ms,
+            "decode_avg_cpu_ms": cpu_decode_avg_ms,
             "snr_k_pre": snr_k_pre,
             "snr_v_pre": snr_v_pre,
             "snr_k_new": snr_k_new,
@@ -2683,7 +2694,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 1000 / 208
+    if device == "kintex7":                       return 1000 / (1066 / 5.375)
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
@@ -2919,7 +2930,7 @@ def main():
         '--cycle',
         type=float,
         default=None,
-        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=4.8077ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
+        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=5.0422ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
@@ -2987,6 +2998,7 @@ def main():
 
     run_result = ue.run_gemma3(slave_engine=ue2 if dual_engine else None, numeric=args.numeric)
     print("Gemma3 test ends.")
+    _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
 if __name__ == "__main__":
     main()

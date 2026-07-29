@@ -28,6 +28,7 @@ Usage:
   python llama3.2_1b_test.py --local-weights
 """
 
+import hashlib
 import json
 import math
 import os
@@ -317,7 +318,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
       - LM head weight tied to input embedding.
     """
 
-    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
+    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
+                 matmatmul: bool = False):
         # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
         # 512 MB for the tensor region, which overflows at max_context_size=4096
         # (attention + activation buffers in tensor_init scale with context). The
@@ -331,6 +333,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             program_dram_base=0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+        # Decode matmul kernel select (mirrors gemma3's --matmatmul):
+        #   False (default) -> quantized_matmat_core: 1-pass streaming IF4 dot.
+        #   True            -> matmat_mul_core(is_B_quantized=True): dequantize B to bf16
+        #                      in URAM, then bf16 dot (2 passes over the weight bytes).
+        self.matmatmul = matmatmul
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
@@ -848,24 +855,44 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         total_flops = 0
         decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
 
+        def decoder_matmat_mul_core(K: int, N: int, force_stream: bool = False, **kwargs) -> int:
+            """Decode matmul dispatch — the llama mirror of gemma3's ``decoder_matmat_mul_core``.
+
+            Both paths read the SAME IF4 weight; they differ in how the dot is computed:
+
+            - default (``--matmatmul`` off) -> :meth:`quantized_matmat_core`: 1-pass streaming
+              quantized dot (inline fp4->bf19 unpack straight through the DOT_PRODUCT unit).
+            - ``--matmatmul`` -> :meth:`matmat_mul_core` with ``is_B_quantized=True``:
+              DEQUANTIZES B to bf16 in URAM, then a bf16 dot — two passes over the weight
+              bytes, so ~2x the DRAM traffic (and ~2x slower) for higher-precision accumulate.
+
+            ``force_stream`` pins an individual call to the streaming path regardless of the flag.
+            """
+            if not self.matmatmul or force_stream:
+                kwargs.pop("is_B_quantized", None)
+                return self.quantized_matmat_core(M=1, K=K, N=N, **kwargs)
+            m_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(m_reg, 1)
+            flops = self.matmat_mul_core(M=1, K=K, N=N, gpr_M_reg=m_reg, **kwargs)
+            self.release_isa_reg()
+            return flops
+
         global _SILENT_MODE
         _SILENT_MODE = True
         for layer_idx in range(layer_size):
                 layer_off = layer_idx * LAYER_WEIGHT_SIZE
-                if layer_idx != 0:
-                    self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-                    self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
-                total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+                layer_input_addr = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_OUTPUT_DRAM
+                total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=layer_input_addr,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
+                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.head_dim * self.group_size,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
+                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.head_dim,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
+                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.head_dim,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
 
                 # LLaMA 8-head GQA decoder: rope_hf_core(N=512) on [lo|hi]-permuted K and Q
                 # in-place, then scatter 64-dim per-head slices to KV cache (via
@@ -900,6 +927,14 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         rope_size_reg=self.ROPE_SIZE_REG,
                         tmp_reg=self.TMP_REG)
 
+                # Apply 1/sqrt(head_dim) once to the contiguous post-RoPE Q vector.
+                # Each of the eight per-KV-head attention calls can then consume its
+                # gathered query group directly instead of repeating this multiply.
+                total_flops += self.eltwise_core_dram(
+                    M=1, N=total_q_dim, dram_a=self.LAYER0_Q_DRAM, dram_b=None,
+                    dram_out=self.LAYER0_Q_DRAM, mode=UE_MODE.MUL_BROADCAST,
+                    scalar=1.0 / math.sqrt(ahd))
+
                 # Step 3: Per-KV-head scatter K/V to cache + scatter Q → decoder_attention
                 for kv_h in range(nkvh):
                     k_cache_base = (self.LAYER0_K_ROPE_DRAM
@@ -923,17 +958,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base + half_ahd * bpe), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x10080, 0, half_ahd, general_reg_src=self.TMP_REG)
 
-                    # Copy valid K history → LAYER0_FLASH_K_DRAM; loop count = gpr_bucket_idx
-                    # so only current_seq_len tokens are copied, not the full MAX_CONTEXT_SIZE.
-                    self._emit_pbi_scatter_per_token(
-                        read_base=k_cache_base,
-                        read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
-                        write_specs=[(self.LAYER0_FLASH_K_DRAM, UE_VECTOR_SIZE * ahd * bpe)],
-                        sram_byte_addr=0,
-                        element_count=UE_VECTOR_SIZE * ahd,
-                        gpr_seq_len=self.gpr_bucket_idx,
-                    )
-
                     # Scatter V_h (64-dim, standard layout) → V cache at decode position
                     # v_proj output at LAYER0_FLASH_V_DRAM: [V_KV0(64)..V_KV7(64)] = 512-dim
                     self.accelerator_memory_to_sram(
@@ -941,17 +965,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self.generate_instruction_add_imm(
                         self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x20000, 0, ahd, general_reg_src=self.TMP_REG)
-
-                    # Copy valid V history → LAYER0_FLASH_V_DRAM + k_size; same dynamic size.
-                    # Offset by k_size to avoid the v_proj output at [0..k_size-1].
-                    self._emit_pbi_scatter_per_token(
-                        read_base=v_cache_base,
-                        read_stride_bytes=UE_VECTOR_SIZE * ahd * bpe,
-                        write_specs=[(self.LAYER0_FLASH_V_DRAM + self.k_size, UE_VECTOR_SIZE * ahd * bpe)],
-                        sram_byte_addr=0,
-                        element_count=UE_VECTOR_SIZE * ahd,
-                        gpr_seq_len=self.gpr_bucket_idx,
-                    )
 
                     # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q base (no kv_h offset)
                     # KV head kv_h → Q group g = kv_h//2; sub_idx = (kv_h%2)*qpkv + q
@@ -968,34 +981,33 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                             0x30080, half_ahd)
                         self.sram_to_accelerator_memory(0x30000, flash_q_addr, half_ahd)
                         self.sram_to_accelerator_memory(0x30080, flash_q_addr + half_ahd * bpe, half_ahd)
-                    # Scaled dot-product attention for this KV head's qpkv query heads,
-                    # called inline per KV head (unified_attention_core replaces the old
-                    # shared decoder_group_attention_core subroutine + JUMP_ABS call-site).
+                    # Each head's K/V cache is already laid out as
+                    # [MAX_CONTEXT_SIZE, actual_head_dim]. Pass its base straight
+                    # to the read-only attention core; staging the aligned prefix
+                    # copied the same contiguous history twice per KV head, per
+                    # layer, per token.
                     attn_result = self.unified_attention_core(
                         batch=qpkv,
                         aligned_seq_len=decoder_aligned_seq_len,
                         head_dim=ahd,
                         Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                        K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                        V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM + self.k_size,
+                        K_DRAM_ADDR=k_cache_base,
+                        V_DRAM_ADDR=v_cache_base,
                         BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                        OUTPUT_DRAM_ADDR=(self.LAYER0_FLASH_OUTPUT_DRAM
+                                          + kv_h * qpkv * ahd * bpe),
                         SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                         IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                         gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                        q_pre_scaled=True,
                     )
                     total_flops += attn_result or 0
-                    # Copy per-head output to its slot in FLASH_OUTPUT_DRAM.
-                    self.accelerator_memory_to_sram(
-                        self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
-                    self.sram_to_accelerator_memory(
-                        0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
-                total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
+                total_flops += decoder_matmat_mul_core(K=self.head_dim * self.group_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
 
                 # LLaMA: no post-attention norm; residual directly on o_proj output
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=layer_input_addr, sram_address=0x10000, element_size=self.vector_length)
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.vector_length)
                 self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
@@ -1004,21 +1016,21 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True, is_B_quantized=True)
+                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
 
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
                 self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.mlp_elements, N=self.vector_length,
+                total_flops += decoder_matmat_mul_core(K=self.mlp_elements, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4)
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
 
                 # LLaMA: no post-FFN norm; residual directly on down_proj output
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
@@ -1031,15 +1043,51 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
             penalty_kwargs = dict(C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N") \
                 if bool(getattr(self, "fpga_penalty", False)) else {}
-            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            # LM head uses the same dual-kernel dispatch as the layer matmuls (mirrors gemma3):
+            # streaming IF4 by default, dequantize-to-bf16 dot under --matmatmul. Both kernels
+            # honor the folded repetition-penalty bias (broadcast_N) and the argmax-only
+            # write_back_disable, so the HW argmax still returns the penalized token id.
+            total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4, is_B_quantized=True,
                 write_back_disable=True, **penalty_kwargs)
 
         self.generate_instruction_halt()
         decoder_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
         return {"program_size_bytes": decoder_program_size, "total_flops": total_flops}
+
+    def _instruction_paths(self) -> tuple[str, str]:
+        """(bin, meta) cache paths for the current compile mode (mirrors gemma3's tagging).
+
+        The captured image depends on BOTH the decode matmul kernel (``--matmatmul`` folds a
+        dequantize-to-bf16 dot in place of the streaming IF4 dot) and the on-FPGA penalty
+        (which folds a bias term into the LM-head matmul), so each combination gets its own
+        cache entry — otherwise switching modes silently reuses a stale bin compiled for the
+        other one.
+        """
+        paths_cfg = self._cfg.get("paths", {})
+        bin_rel = paths_cfg.get("instruction_bin", "llama3.2_1b_bin/programs.bin")
+        meta_rel = paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json")
+        tag = ("_matmatmul" if self.matmatmul else "")
+        tag += ("" if bool(getattr(self, "fpga_penalty", False)) else "_puregreedy")
+        if tag:
+            b_root, b_ext = os.path.splitext(bin_rel)
+            m_root, m_ext = os.path.splitext(meta_rel)
+            bin_rel, meta_rel = f"{b_root}{tag}{b_ext}", f"{m_root}{tag}{m_ext}"
+        return (os.path.join(self.script_dir, bin_rel), os.path.join(self.script_dir, meta_rel))
+
+    def _instruction_compiler_fingerprint(self, layer_size: int) -> str:
+        """Hash every local input that can change the captured instruction stream."""
+        digest = hashlib.sha256()
+        config_path = os.path.join(self.script_dir, "llama3.2_1b_config.json")
+        for source_path in (__file__, user_dma_core.__file__, config_path):
+            digest.update(os.path.abspath(source_path).encode())
+            with open(source_path, "rb") as source_file:
+                digest.update(source_file.read())
+        digest.update(
+            f"layers={layer_size};matmatmul={self.matmatmul};penalty={getattr(self, 'fpga_penalty', False)}".encode())
+        return digest.hexdigest()
 
     def compile_llama(self, layer_size: int | None = None) -> None:
         """Compile prefill + decoder into a single combined instruction image.
@@ -1048,7 +1096,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         Prefill is compiled with a fixed template (UE_VECTOR_SIZE) — all runtime
         loop counts are driven by GPRs primed by the preamble, so the same bin
-        works for any seq_len. If both bin and meta already exist, this is a no-op.
+        works for any seq_len. A matching compiler fingerprint makes this a no-op.
 
         Writes:
           - paths.instruction_bin  : combined raw instruction stream
@@ -1056,15 +1104,24 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
-        paths_cfg = self._cfg.get("paths", {})
-        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_1b_bin/programs.bin"))
-        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
+        instruction_bin_path, instruction_meta_path = self._instruction_paths()
         self._instruction_bin_path = instruction_bin_path
         self._instruction_meta_path = instruction_meta_path
+        compiler_fingerprint = self._instruction_compiler_fingerprint(layer_size)
+        print(f"Decode matmul kernel: {'matmat_mul_core (dequantize->bf16 dot, 2-pass)' if self.matmatmul else 'quantized_matmat_core (streaming IF4, 1-pass)'}")
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
-            print(f"Reusing existing instruction image at {instruction_bin_path}")
-            print(f"  delete {instruction_bin_path} to force recompile.")
-            return
+            try:
+                with open(instruction_meta_path, "r") as meta_file:
+                    cached_meta = json.load(meta_file)
+                cached_bin_size = os.path.getsize(instruction_bin_path)
+            except (OSError, ValueError, TypeError):
+                cached_meta = {}
+                cached_bin_size = -1
+            if (cached_meta.get("compiler_fingerprint") == compiler_fingerprint
+                    and cached_meta.get("instruction_total_size") == cached_bin_size):
+                print(f"Reusing validated instruction image at {instruction_bin_path}")
+                return
+            print(f"Rebuilding stale instruction image at {instruction_bin_path}")
 
         # Compile the prefill template at PREFILL_CONTEXT_SIZE (the max prompt length).
         # All loop counts are GPR-driven (gpr_seq_len), so the single cached program
@@ -1101,6 +1158,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         metadata = {
             "instruction_bin": os.path.relpath(instruction_bin_path, self.script_dir),
+            "compiler_fingerprint": compiler_fingerprint,
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "instruction_total_size": len(instruction_bytes),
             "prefill_template_seq_len": template_seq_len,
@@ -1176,10 +1234,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         Primes GPRs via a small captured preamble that jumps into the cached
         prefill or decoder program at runtime.
         """
-        paths_cfg = self._cfg.get("paths", {})
-        # With the on-FPGA penalty (default) use the penalty-specific bin/meta compile_llama produced.
-        meta_path = getattr(self, "_instruction_meta_path", None) or \
-            os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json"))
+        # Mode-specific bin/meta (decode matmul kernel + penalty) that compile_llama produced.
+        meta_path = getattr(self, "_instruction_meta_path", None) or self._instruction_paths()[1]
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1223,6 +1279,37 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.allocate_program_dram(self.get_capture_instruction_size_bytes())
         self.clear_capture_buffer()
 
+        # Build every position-dependent decoder preamble once. Each 64-byte-aligned
+        # entry is six instructions (four register sets, jump, unreachable padding NOP),
+        # so the hot loop only selects an address instead of compiling and DMA-writing it.
+        decoder_dispatch_addr = self.get_program_dram_addr()
+        decoder_dispatch_stride = 6 * INSTRUCTION_SIZE_BYTES
+        self.clear_inst_id()
+        self.start_capture()
+        for decode_pos in range(prefill_seq_len, self.MAX_CONTEXT_SIZE):
+            runtime_seq_len = decode_pos + 1
+            runtime_aligned_seq_len = ((runtime_seq_len + 63) // 64) * 64
+            runtime_bucket_idx = min((runtime_seq_len + 63) // 64, _max_gpr_bucket)
+            entry_start = self.capture_count
+            self.clear_inst_id()
+            self.generate_instruction_add_set(self.gpr_bucket_idx, runtime_bucket_idx)
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, runtime_aligned_seq_len)
+            self.generate_instruction_add_set(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _kv_stride))
+            self.generate_instruction_add_set(self.ROPE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _rope_row))
+            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+            self.generate_instruction_nop()
+            entry_size = self.capture_count - entry_start
+            assert entry_size == 6, (
+                f"decoder dispatch entry at position {decode_pos} has {entry_size} instructions"
+            )
+        self.stop_capture()
+        decoder_dispatch_size = self.get_capture_instruction_size_bytes()
+        dispatch_bytes_written = self.write_captured_instructions_to_dram(decoder_dispatch_addr)
+        if dispatch_bytes_written != decoder_dispatch_size:
+            raise RuntimeError("Failed to write the complete decoder dispatch table")
+        self.allocate_program_dram(decoder_dispatch_size)
+        self.clear_capture_buffer()
+
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
         bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
@@ -1243,6 +1330,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         print("--- Starting decoder ---")
         hw_decode_lats_us: list[float] = []
         decoded_chars: list[str] = []
+        decode_bias_host: torch.Tensor | None = None
+        decode_bias_aligned_seq_len = 0
         timer = time.perf_counter()
         token_id = self.prefill_seq[-1]
         _llama_stop_tokens = {128001, 128008, self._end_of_turn_token_id}
@@ -1302,30 +1391,28 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             _SILENT_MODE = True
             self.seq_len += 1
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
-            bucket_idx = min((self.seq_len + 63) // 64, _max_gpr_bucket)
             decode_pos = self.seq_len - 1
 
-            embedding_tensor = self.get_embedding_for_tokens([token_id])
+            if 0 <= token_id < self.embedding_weight.shape[0]:
+                embedding_tensor = self.embedding_weight[token_id:token_id + 1]
+            else:
+                embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
             # unified_attention_core's dynamic path always uses bias_mode="full_matrix" (one bias
             # row per batch item); the decoder attention call's batch=qpkv query heads all share the
-            # same causal mask, so replicate the single mask row qpkv times (mirrors gemma3_test.py).
-            bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
-            bias_host[0, :self.seq_len] = 0.0
-            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host.repeat(self.group_size, 1))
+            # same causal mask. Reuse one contiguous buffer within each 64-token bucket.
+            if aligned_seq_len != decode_bias_aligned_seq_len:
+                decode_bias_host = torch.full(
+                    (self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
+                decode_bias_host[:, :self.seq_len] = 0.0
+                decode_bias_aligned_seq_len = aligned_seq_len
+            else:
+                decode_bias_host[:, self.seq_len - 1] = 0.0
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, decode_bias_host)
 
-            # Decoder preamble: prime position GPRs (+ gpr_aligned_seq_len for
-            # unified_attention_core's dynamic aligned_seq_len), then jump into cached decoder.
-            self.clear_inst_id()
-            self.start_capture()
-            self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
-            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
-            self.generate_instruction_add_set(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _kv_stride))
-            self.generate_instruction_add_set(self.ROPE_SIZE_REG,    ue_35bit_addr_shifter(decode_pos * _rope_row))
-            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
-            self.stop_capture()
-            self.write_captured_instructions_to_dram(preamble_addr)
-            self.clear_capture_buffer()
+            # Select the prebuilt register setup + jump for this absolute position.
+            decoder_step_addr = decoder_dispatch_addr + (
+                decode_pos - prefill_seq_len) * decoder_dispatch_stride
 
             # On-FPGA penalty: refresh the per-vocab bias (this step's LM-head matmul C term) from the
             # windowed token frequency once past the gate, so the HW argmax of (logits + bias) returns
@@ -1335,7 +1422,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             if _fpga_penalty and (self.seq_len - prefill_seq_len) > _greedy_until:
                 self._write_penalty_bias(self._generated_tokens)
 
-            hw_lat_dec_us, _ = self.program_execute(preamble_addr, flops=decoder_flops_per_token)
+            hw_lat_dec_us, _ = self.program_execute(decoder_step_addr, flops=decoder_flops_per_token)
             hw_decode_lats_us.append(hw_lat_dec_us)
             # Token selection: read the HW argmax register. In penalty mode the LM-head matmul
             # already added the bias, so the register holds the penalized token; in plain mode it's
@@ -1366,6 +1453,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         hw_decode_avg_ms = sum(hw_decode_lats_us) / len(hw_decode_lats_us) / 1e3 if hw_decode_lats_us else 0.0
         hw_decode_first_ms = hw_decode_lats_us[0] / 1e3 if hw_decode_lats_us else 0.0
         cpu_decode_avg_ms = latency_decoder * 1e3 / tokens_decoded if tokens_decoded else 0.0
+        peak_tokens_per_s = 1000.0 / hw_decode_first_ms if hw_decode_first_ms > 0 else 0.0
+        avg_tokens_per_s = tokens_decoded / latency_decoder if latency_decoder > 0 else 0.0
         _original_print("\n=== Performance Summary ===")
         _original_print(f"Instruction size  : prefill={meta['prefill_program_size']/1024:.1f} kB  decoder={meta['decoder_program_size']/1024:.1f} kB  total={(meta['prefill_program_size']+meta['decoder_program_size'])/1024:.1f} kB")
         _original_print(f"Prefill ({prefill_seq_len} tokens): HW={hw_lat_prefill_us/1e3:,.1f} ms  CPU={latency_prefill*1e3:,.1f} ms")
@@ -1376,10 +1465,19 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "prefill_tokens": prefill_seq_len,
             "decoded_text": "".join(decoded_chars),
             "decoded_tokens": tokens_decoded,
+            # Compatibility aliases shared with Gemma3 and user_hw_test.py.
+            "tokens_decoded": tokens_decoded,
+            "avg_tokens_per_s": avg_tokens_per_s,
+            "peak_tokens_per_s": peak_tokens_per_s,
             "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
-            "decode_speed_tok_s": round(tokens_decoded / latency_decoder, 2),
+            "decode_speed_tok_s": round(avg_tokens_per_s, 2),
             "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
             "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
+            "prefill_hw_ms": hw_lat_prefill_us / 1e3,
+            "prefill_cpu_ms": latency_prefill * 1e3,
+            "decode_first_hw_ms": hw_decode_first_ms,
+            "decode_avg_hw_ms": hw_decode_avg_ms,
+            "decode_avg_cpu_ms": cpu_decode_avg_ms,
         }
 
 # -----------------------------------------------------------------------------
@@ -1387,7 +1485,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
+    if device == "kintex7":                       return 1000 / (1066 / 5.375)
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
@@ -1403,6 +1501,12 @@ def main():
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
+    parser.add_argument('--matmatmul', action='store_true',
+                        help='Use matmat_mul_core for the decoder quantized matmats (incl. the LM head) '
+                             'instead of the default quantized_matmat_core (streaming) path. Same IF4 '
+                             'weights either way: matmat_mul_core dequantizes B to bf16 in URAM and does '
+                             'a bf16 dot (2 passes over the weight bytes, ~2x slower, higher-precision '
+                             'accumulate); the default streams IF4 through the dot unit in 1 pass.')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
     # fully deterministic. --pure-greedy disables it entirely.
@@ -1450,7 +1554,7 @@ def main():
     ue = UnifiedEngine()
     ue.software_reset()
     
-    ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel, matmatmul=args.matmatmul)
     cfg = _load_config(script_dir)
 
     if args.prompt is not None:
