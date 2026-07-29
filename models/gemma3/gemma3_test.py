@@ -18,7 +18,7 @@ Weights:
 Usage:
   python gemma3_test.py
   python gemma3_test.py --prompt "your prompt"
-  python gemma3_test.py --dev xdma0 [--device kintex7] [--cycle 4.8077]
+  python gemma3_test.py --dev xdma0 [--device kintex7] [--cycle 5.0422]
   python gemma3_test.py --dev xdma0 --device bittware
   python gemma3_test.py --local-weights
   python gemma3_test.py --dual-engine
@@ -2650,6 +2650,19 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         hw_decode_avg_ms  = sum(hw_decode_lats_us) / len(hw_decode_lats_us) / 1e3 if hw_decode_lats_us else 0.0
         hw_decode_first_ms = hw_decode_lats_us[0] / 1e3 if hw_decode_lats_us else 0.0
+        hw_decode_total_us = sum(hw_decode_lats_us)
+        decoder_gflops = (
+            decoder_flops_per_token * len(hw_decode_lats_us)
+            / (hw_decode_total_us * 1e3)
+            if (
+                hw_decode_total_us > 0
+                and isinstance(decoder_flops_per_token, (int, float))
+            )
+            else 0.0
+        )
+        _original_print(
+            f"Report FLOPS for decoder execution: {decoder_gflops:.2f} GFLOPS"
+        )
         cpu_decode_avg_ms = latency_decoder * 1e3 / tokens_decoded if tokens_decoded else 0.0
         _original_print("\n=== Performance Summary ===")
         _original_print(f"Instruction size  : prefill={meta['prefill_program_size']/1024:.1f} kB  decoder={meta['decoder_program_size']/1024:.1f} kB  total={(meta['prefill_program_size']+meta['decoder_program_size'])/1024:.1f} kB")
@@ -2663,6 +2676,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "tokens_decoded": tokens_decoded,
             "avg_tokens_per_s": avg_tokens_per_s,
             "peak_tokens_per_s": peak_tokens_per_s,
+            "decoder_gflops": round(decoder_gflops, 2),
             "snr_k_pre": snr_k_pre,
             "snr_v_pre": snr_v_pre,
             "snr_k_new": snr_k_new,
@@ -2683,7 +2697,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 1000 / 208
+    if device == "kintex7":                       return 1000 / 198.3256
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
@@ -2919,7 +2933,7 @@ def main():
         '--cycle',
         type=float,
         default=None,
-        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=4.8077ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
+        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=1000/198.3256≈5.0422ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
