@@ -5456,7 +5456,7 @@ def systolic_matmul_test(M: int, K: int, N: int, snr_threshold_db: float = 44.0)
 
 
 def gemma3_inference_test() -> None:
-    """Run Gemma3 streaming, matmatmul, and legacy inference variants."""
+    """Run Gemma3 streaming, two-pass-decoder, and legacy inference variants."""
     gemma3_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gemma3")
     if gemma3_dir not in sys.path:
         sys.path.insert(0, gemma3_dir)
@@ -5497,9 +5497,11 @@ def gemma3_inference_test() -> None:
         if ue.legacy:
             prefill_seq_len = len(ue.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if ue.matmatmul else ""
+            matmatmul_tag += "_prefill_twopass" if ue.two_pass_prefill else ""
             rel_path = f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin"
-        elif ue.matmatmul:
-            rel_path = "gemma3_bin/gemma3_matmatmul_program.bin"
+        elif ue.matmatmul or ue.two_pass_prefill:
+            mode_tag = ("_matmatmul" if ue.matmatmul else "") + ("_prefill_twopass" if ue.two_pass_prefill else "")
+            rel_path = f"gemma3_bin/gemma3{mode_tag}_program.bin"
         else:
             rel_path = "gemma3_bin/gemma3_program.bin"
         return os.path.join(ue.script_dir, rel_path)
@@ -5558,7 +5560,7 @@ def gemma3_inference_test() -> None:
 
 
 def gemma3_if8_inference_test() -> None:
-    """Run Gemma3 IF8 streaming, matmatmul, and legacy inference variants."""
+    """Run Gemma3 IF8 streaming, two-pass-decoder, and legacy inference variants."""
     gemma3_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gemma3")
     if gemma3_dir not in sys.path:
         sys.path.insert(0, gemma3_dir)
@@ -5591,9 +5593,11 @@ def gemma3_if8_inference_test() -> None:
         if ue.legacy:
             prefill_seq_len = len(ue.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if ue.matmatmul else ""
+            matmatmul_tag += "_prefill_twopass" if ue.two_pass_prefill else ""
             rel_path = f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin"
-        elif ue.matmatmul:
-            rel_path = "gemma3_if8_bin/gemma3_matmatmul_program.bin"
+        elif ue.matmatmul or ue.two_pass_prefill:
+            mode_tag = ("_matmatmul" if ue.matmatmul else "") + ("_prefill_twopass" if ue.two_pass_prefill else "")
+            rel_path = f"gemma3_if8_bin/gemma3{mode_tag}_program.bin"
         else:
             rel_path = "gemma3_if8_bin/gemma3_program.bin"
         return os.path.join(ue.script_dir, rel_path)
