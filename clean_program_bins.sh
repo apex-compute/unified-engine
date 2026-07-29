@@ -43,12 +43,12 @@ del() {
 }
 
 # # --- repo-root build artifacts ---------------------------------------------
-# del user_dma_core                       # compiled C binary from `make all` (NOT user_dma_core.py)
-# del *.mcs *.prm *.jou *.log *.json *.csv
-# del mask_point.png
-# del model_auto_test_results.txt
-# del andromeda_IP-* andromeda_wrapper-*
-# del codebooks/
+del user_dma_core                       # compiled C binary from `make all` (NOT user_dma_core.py)
+del *.mcs *.prm *.jou *.log *.json *.csv
+del mask_point.png
+del model_auto_test_results.txt
+del andromeda_IP-* andromeda_wrapper-*
+del codebooks/
 
 # --- gemma3 (IF4 + IF8): keep params.* ; drop programs/instruction ----------
 del models/gemma3/gemma3_bin/programs*.bin
