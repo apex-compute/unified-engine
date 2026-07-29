@@ -566,7 +566,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._zero_dram_bf16(self.LAYER0_FLASH_K_DRAM, elements)
         self._zero_dram_bf16(self.LAYER0_FLASH_V_DRAM, elements)
 
-    def _compile_prefill_program(self, prefill_seq_len: int, layer_size: int = 26, use_pbi: bool = False) -> dict:
+    def _compile_prefill_program(self, prefill_seq_len: int, layer_size: int = 26, use_pbi: bool = False, profile: bool = False) -> dict:
         """
         Compile a single prefill program and return its metadata (start_addr, size_bytes, flops).
 
@@ -607,6 +607,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         seq_len = prefill_seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
+        checkpoints: list[list] = []
+
+        def _checkpoint(name: str) -> None:
+            # HALT + 64B pad inside the folded body; the resume address is the next instruction.
+            # The body is hardware-looped layer_size×, so each checkpoint fires once per layer at
+            # runtime — run_gemma3_profile walks all iterations and sums per step (no per-layer rows).
+            self.generate_instruction_halt()
+            self.pad_capture_to_64b_boundary()
+            resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+            checkpoints.append([name, f"0x{resume:X}"])
         engine_master = not self.engine_slave
         row_offset = 0 if engine_master else seq_len // 2
         # Dual-engine: halve per-engine ``seq_len`` and offset DRAM views. Not validated with PBI
@@ -892,6 +902,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_b),
                     layer_addr(self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA, gpr_scratch_c),
                 )
+            if profile:
+                _checkpoint("pre_norm")
             total_flops += self.matmat_mul_core(
                 M=seq_len,
                 K=self.vector_length,
@@ -946,6 +958,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_V_PROJ_SCALE, gpr_scratch_d),
                 gpr_out_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
             )
+            if profile:
+                _checkpoint("qkv_proj_vcache")
             if engine_master:
                 total_flops += fold_rms(
                     seq_len, self.head_dim,
@@ -993,6 +1007,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     gpr_out_addr=const_addr(self.LAYER0_FLASH_Q_DRAM, gpr_scratch_b),
                     gpr_cos_addr=gpr_rope_base,
                 )
+                if profile:
+                    _checkpoint("qk_norm_rope")
 
                 # Pre-flash-attn layout:
                 # Q: [seq_len, group_size, head_dim], [seq_len:max_seq_len, :] has been padded 0
@@ -1043,6 +1059,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     gpr_scale_reg=gpr_attn_scale,
                 )
                 total_flops += flash_attention_result or 0
+                if profile:
+                    _checkpoint("attention")
             total_flops += self.matmat_mul_core(
                 M=seq_len,
                 K=self.head_dim * self.group_size,
@@ -1083,6 +1101,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     gpr_b_addr=const_addr(self.LAYER0_POST_ATTN_NORM_DRAM, gpr_scratch_b),
                     gpr_out_addr=const_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, gpr_scratch_c),
                 )
+                if profile:
+                    _checkpoint("o_proj_post_attn_norm_residual")
                 total_flops += fold_rms(
                     seq_len, self.vector_length,
                     self.LAYER0_POST_ATTN_RESIDUAL_DRAM, self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA,
@@ -1091,6 +1111,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     const_addr(self.LAYER0_PRE_MLP_NORM_DRAM, gpr_scratch_b),
                     layer_addr(self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA, gpr_scratch_c),
                 )
+                if profile:
+                    _checkpoint("pre_ffn_norm")
             total_flops += self.matmat_mul_core(
                 M=seq_len,
                 K=self.vector_length,
@@ -1145,6 +1167,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     gpr_b_addr=const_addr(self.LAYER0_MLP_UP_DRAM, gpr_scratch_b),
                     gpr_out_addr=const_addr(self.LAYER0_MLP_MULT_DRAM, gpr_scratch_c),
                 )
+                if profile:
+                    _checkpoint("mlp_gateup_gelu_mul")
             total_flops += self.matmat_mul_core(
                 M=seq_len,
                 K=self.mlp_elements,
@@ -1185,6 +1209,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     gpr_b_addr=const_addr(self.LAYER0_POST_MLP_NORM_DRAM, gpr_scratch_b),
                     gpr_out_addr=const_addr(self.LAYER0_INPUT_DRAM, gpr_scratch_c),
                 )
+                if profile:
+                    _checkpoint("mlp_down_post_ffn_norm_residual")
 
             # Advance the running per-layer offsets by one layer stride for the NEXT iteration.
             # Done here at the end (not the top) so iteration i reads layer i: the offsets hold
@@ -1460,6 +1486,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "start_addr": prefill_program_addr,
             "size_bytes": prefill_program_size,
             "flops": total_flops,
+            "checkpoints": checkpoints,
         }
         
     def _compile_decoder_programs(self, layer_size: int = 26, use_pbi: bool = False, profile: bool = False) -> dict:
@@ -2131,21 +2158,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             assert self.prefill_seq is not None, "--legacy requires set_prefill_seq() before compile_gemma3()"
             prefill_seq_len = len(self.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.json")
         elif profile:
             prefill_seq_len = UE_VECTOR_SIZE
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.json")
         elif self.matmatmul:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_program.json")
         else:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.json")
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
@@ -2156,7 +2183,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         print(f"Compiling prefill (prefill_seq_len={prefill_seq_len}; use_pbi={use_pbi})...")
         compile_t0 = time.perf_counter()
         prefill_prog = self._compile_prefill_program(
-            prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=use_pbi
+            prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=use_pbi, profile=profile
         )
         print(f"  prefill compiled, size={prefill_prog['size_bytes']} bytes, "
               f"elapsed={time.perf_counter() - compile_t0:.1f}s")
@@ -2212,6 +2239,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_total_flops": decoder_program["total_flops"],
         }
         if profile:
+            # Both prefill and decoder are FOLDED (one body hardware-looped `layer_size`×), so each
+            # checkpoint fires once per layer at runtime. run_gemma3_profile walks all iterations and
+            # sums per step. Store the fold count so the profiler knows how many times to loop.
+            metadata["profile_folded_layers"] = layer_size
+            metadata["prefill_profile_checkpoints"] = prefill_prog["checkpoints"]
             metadata["decoder_profile_checkpoints"] = decoder_program["checkpoints"]
 
         if slave_engine is not None:
@@ -2247,35 +2279,70 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         print(f"  decoder: {decoder_program['program_size_bytes']} bytes")
         print(f"Metadata written to {instruction_meta_path}")
 
-    def _decode_profile_execute(self, preamble_addr: int, checkpoints: list, timeout: float = 30.0) -> list:
-        """Execute one decoder step through profile checkpoints; return per-step HW latencies."""
-        results = []
+    def _profile_execute_folded(self, preamble_addr: int, checkpoints: list, folded_layers: int,
+                                tail_label: str | None = None, timeout: float = 30.0) -> tuple[list, dict]:
+        """Walk a FOLDED program (one body hardware-looped ``folded_layers``×) through its per-step
+        HALT checkpoints for *every* loop iteration, summing each step's HW latency across all layers.
+
+        Prefill and decoder are both a single captured layer body that the hardware repeats
+        ``folded_layers`` times, so each checkpoint fires once per layer at runtime. Entering at
+        ``preamble_addr`` runs the register-seeding preamble and stops at the first checkpoint; the
+        host then walks ``folded_layers × len(checkpoints)`` HALTs, resuming each at its captured
+        address. The post-loop fall-through segment (the once-per-token final norm + LM head for
+        decode; just the terminating HALT for prefill) is always drained, and recorded under
+        ``tail_label`` when one is given. Returns ``(ordered_step_names, {step: summed_ms})``.
+        """
+        from collections import OrderedDict
+        step_ms = OrderedDict((name, 0.0) for name, _ in checkpoints)
+        order = [name for name, _ in checkpoints]
         self.start_execute_from_dram(preamble_addr)
-        for name, resume_addr_hex in checkpoints:
-            self.wait_queue(timeout)
-            results.append((name, self.report_latency_in_us() / 1e3))
-            self.start_execute_from_dram(int(resume_addr_hex, 16))
+        for _ in range(folded_layers):
+            for name, resume_addr_hex in checkpoints:
+                self.wait_queue(timeout)
+                step_ms[name] += self.report_latency_in_us() / 1e3
+                self.start_execute_from_dram(int(resume_addr_hex, 16))
+        # Drain the post-loop fall-through (final norm + LM head for decode; bare HALT for prefill).
         self.wait_queue(timeout)
-        results.append(("output_norm_lm_head", self.report_latency_in_us() / 1e3))
-        return results
+        tail_ms = self.report_latency_in_us() / 1e3
+        if tail_label is not None:
+            step_ms[tail_label] = tail_ms
+            order.append(tail_label)
+        return order, step_ms
+
+    @staticmethod
+    def _print_profile_table(title: str, order: list, step_ms: dict) -> float:
+        """Print one per-step HW-latency table (summed over all layers) and return the total ms."""
+        total_ms = sum(step_ms.values())
+        print(f"\n=== {title} (HW latency, summed over all layers) ===")
+        print(f"{'Step':<38} {'ms':>9}  {'%':>6}")
+        print("-" * 57)
+        for name in order:
+            ms = step_ms[name]
+            pct = ms / total_ms * 100 if total_ms > 0 else 0.0
+            print(f"{name:<38} {ms:>9.3f}  {pct:>5.1f}%")
+        print("-" * 57)
+        print(f"{'Total':<38} {total_ms:>9.3f}  100.0%")
+        return total_ms
 
     def run_gemma3_profile(self) -> None:
-        """Load the profile instruction image, run prefill + one profiled decoder step,
-        and print a per-step latency breakdown for the decoder.
+        """Load the profile instruction image and print ONE per-step table for prefill and ONE for
+        the first decoded token. Both programs are folded (one body hardware-looped ``layer_size``×),
+        so :meth:`_profile_execute_folded` walks every iteration and sums each step across all layers
+        — the tables are per-step totals for the whole phase, with no per-layer breakdown.
         """
         matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-        profile_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_instruction.json")
+        profile_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.json")
         with open(profile_meta_path, "r") as f:
             meta = json.load(f)
 
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
 
-        prefill_program_addr   = _parse_offset(meta["prefill_program_start_addr"])
-        decoder_program_addr   = _parse_offset(meta["decoder_program_start_addr"])
-        flops_prefill_template = meta["prefill_template_flops"]
-        template_prefill_seq_len = int(meta["prefill_template_seq_len"])
-        checkpoints            = meta["decoder_profile_checkpoints"]
+        prefill_program_addr = _parse_offset(meta["prefill_program_start_addr"])
+        decoder_program_addr = _parse_offset(meta["decoder_program_start_addr"])
+        folded_layers        = int(meta.get("profile_folded_layers", self.LAYER_SIZE))
+        prefill_checkpoints  = meta.get("prefill_profile_checkpoints", [])
+        decoder_checkpoints  = meta["decoder_profile_checkpoints"]
 
         prefill_seq = self.prefill_seq or tuple(self._cfg["default_prefill_tokens"])
         prefill_seq = prefill_seq[:-1]
@@ -2284,10 +2351,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         q_seq_len = prefill_seq_len * self.group_size
         aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
-        flops_prefill = flops_prefill_template * prefill_seq_len // max(template_prefill_seq_len, 1)
         self._zero_kv_cache()
         self._zero_flash_attention_inputs()
 
+        # --- Prefill preamble + inputs ---
         self.clear_inst_id()
         self.start_capture()
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
@@ -2308,11 +2375,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
 
         print(f"\n--- Profiling: prefill (seq_len={prefill_seq_len}) ---")
-        timer = time.perf_counter()
-        self.program_execute(preamble_addr, flops=flops_prefill)
-        print(f"Prefill done in {time.perf_counter() - timer:.2f}s")
+        if prefill_checkpoints:
+            order, step_ms = self._profile_execute_folded(preamble_addr, prefill_checkpoints, folded_layers)
+            prefill_total_ms = self._print_profile_table(f"Prefill  (seq_len={prefill_seq_len})", order, step_ms)
+        else:
+            prefill_total_ms = 0.0
+            print("  (no prefill checkpoints in meta — recompile with --profile to enable)")
 
-        # Decoder preamble for the first decode token
+        # --- Decoder preamble + inputs for the first decoded token ---
         token_id = prefill_seq[-1]
         self._zero_kv_cache(start_token=prefill_seq_len)
         self._zero_flash_attention_inputs()
@@ -2334,33 +2404,19 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(preamble_addr)
         self.clear_capture_buffer()
 
-        print("\n--- Profiling: decoder step breakdown ---")
-        results = self._decode_profile_execute(preamble_addr, checkpoints)
+        print("\n--- Profiling: decoder (first decoded token) ---")
+        order, step_ms = self._profile_execute_folded(
+            preamble_addr, decoder_checkpoints, folded_layers, tail_label="output_norm_lm_head")
+        decoder_total_ms = self._print_profile_table("Decoder  (first token)", order, step_ms)
 
-        total_ms = sum(ms for _, ms in results)
-        from collections import defaultdict
-        step_totals: dict = defaultdict(float)
-        for name, ms in results:
-            step = name.split("_", 1)[1] if "_" in name else name
-            step_totals[step] += ms
-
-        print(f"\n{'Step (all layers)':<35} {'ms':>9}  {'%':>6}")
-        print("-" * 54)
-        for step, ms in step_totals.items():
-            print(f"{step:<35} {ms:>9.2f}  {ms/total_ms*100:>5.1f}%")
-        print("-" * 54)
-        print(f"{'Total':<35} {total_ms:>9.2f}  100.0%")
-        print(f"\nDecode speed (HW): {1000/total_ms:.2f} tok/s  ({total_ms:.1f} ms/tok)")
-
-        print(f"\n{'Step':<40} {'ms':>8}")
-        print("-" * 50)
-        for name, ms in results:
-            print(f"{name:<40} {ms:>8.2f}")
+        if prefill_total_ms > 0:
+            print(f"\nPrefill (HW): {prefill_total_ms:.2f} ms  ({prefill_seq_len} tokens)")
+        print(f"Decode  (HW): {decoder_total_ms:.2f} ms/tok  ({1000/decoder_total_ms:.2f} tok/s)")
 
     def run_gemma3_prefill(self, slave_engine = None, numeric: bool = False) -> dict:
         """Load the unified instruction image once and run prefill only.
 
-        The cached gemma3_instruction.bin is seq_len-agnostic; the runtime prefill_seq_len is
+        The cached gemma3_program.bin is seq_len-agnostic; the runtime prefill_seq_len is
         applied via a small preamble program compiled fresh per run that primes three GPRs
         (gpr_seq_len, gpr_q_seq_len, gpr_aligned_seq_len) and then unconditional-jumps into the cached
         prefill program.
@@ -2373,11 +2429,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if self.legacy:
             prefill_seq_len = len(self.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.json")
+            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.json")
         elif self.matmatmul:
-            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_instruction.json")
+            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_program.json")
         else:
-            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_instruction.json")
+            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.json")
         with open(meta_path, "r") as f:
             meta = json.load(f)
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
@@ -2940,7 +2996,7 @@ def main():
     parser.add_argument('--legacy', action='store_true',
                         help='Compile without PBI for non-attention ops (static M/K/N). '
                              'Attention (flash_attention, decoder_group_attention) stays dynamic. '
-                             'Uses a separate gemma3_legacy_instruction.bin cache. '
+                             'Uses a separate gemma3_legacy_program.bin cache. '
                              'Without --legacy (the usual path), prefill compiles as a single '
                              'hardware-looped layer body where rope, flash attention, and every '
                              'matmul use fully dynamic (runtime GPR-sourced) addressing.')
