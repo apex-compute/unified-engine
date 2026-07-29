@@ -78,6 +78,8 @@ del models/llama3.2_1b/llama3.2_1b_bin/programs*.bin
 del models/llama3.2_1b/llama3.2_1b_bin/programs*.json
 del models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
 del models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
+del models/llama3.2_1b/llama3.2_1b_if8_bin/programs*.bin
+del models/llama3.2_1b/llama3.2_1b_if8_bin/programs*.json
 del models/llama3.2_3b/llama3.2_3b_bin/programs*.bin
 del models/llama3.2_3b/llama3.2_3b_bin/programs*.json
 del models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin

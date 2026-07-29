@@ -1365,6 +1365,15 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         hw_decode_avg_ms = sum(hw_decode_lats_us) / len(hw_decode_lats_us) / 1e3 if hw_decode_lats_us else 0.0
         hw_decode_first_ms = hw_decode_lats_us[0] / 1e3 if hw_decode_lats_us else 0.0
+        hw_decode_total_us = sum(hw_decode_lats_us)
+        decoder_gflops = (
+            decoder_flops_per_token * len(hw_decode_lats_us)
+            / (hw_decode_total_us * 1e3)
+            if hw_decode_total_us > 0 else 0.0
+        )
+        _original_print(
+            f"Report FLOPS for decoder execution: {decoder_gflops:.2f} GFLOPS"
+        )
         cpu_decode_avg_ms = latency_decoder * 1e3 / tokens_decoded if tokens_decoded else 0.0
         _original_print("\n=== Performance Summary ===")
         _original_print(f"Instruction size  : prefill={meta['prefill_program_size']/1024:.1f} kB  decoder={meta['decoder_program_size']/1024:.1f} kB  total={(meta['prefill_program_size']+meta['decoder_program_size'])/1024:.1f} kB")
@@ -1378,6 +1387,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "decoded_tokens": tokens_decoded,
             "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
             "decode_speed_tok_s": round(tokens_decoded / latency_decoder, 2),
+            "decoder_gflops": round(decoder_gflops, 2),
             "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
             "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
         }
@@ -1387,7 +1397,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
+    if device == "kintex7":                       return 1000 / 198.3256
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
