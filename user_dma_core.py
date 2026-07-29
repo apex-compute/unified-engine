@@ -554,6 +554,7 @@ class UnifiedEngine:
         self.h2c_device = DMA_DEVICE_H2C
         self.c2h_device = DMA_DEVICE_C2H
         self.user_device = DMA_DEVICE_USER
+        self._user_fd: Optional[int] = None
         if BASE_ADDR is None:
             BASE_ADDR = UE_0_BASE_ADDR
 
@@ -849,6 +850,20 @@ class UnifiedEngine:
         """Read 32-bit register using AXI-Lite user interface"""
         return self.user_read_reg32(address)
 
+    def _get_user_fd(self) -> int:
+        """Return one lazily opened AXI-Lite descriptor for this engine."""
+        if self._user_fd is None:
+            self._user_fd = os.open(self.user_device, os.O_RDWR)
+        return self._user_fd
+
+    def __del__(self):
+        fd = getattr(self, "_user_fd", None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     def user_write_reg32(self, address: int, value: int):
         """
         Write 32-bit register via /dev/xdma0_user (AXI-Lite interface)
@@ -858,21 +873,18 @@ class UnifiedEngine:
             value: 32-bit value to write
         """
         try:
-            fd = os.open(DMA_DEVICE_USER, os.O_RDWR)
-            try:
-                # Subtract base address to get offset within the BAR
-                offset = address + self._base_addr - AXI_LITE_TRANSLATION_OFFSET
-                data_bytes = struct.pack('I', value & 0xFFFFFFFF)
-                # Use pwrite to write at offset (device doesn't support lseek)
-                os.pwrite(fd, data_bytes, offset)
-            finally:
-                os.close(fd)
+            fd = self._get_user_fd()
+            # Subtract base address to get offset within the BAR
+            offset = address + self._base_addr - AXI_LITE_TRANSLATION_OFFSET
+            data_bytes = struct.pack('I', value & 0xFFFFFFFF)
+            # Use pwrite to write at offset (device doesn't support lseek)
+            os.pwrite(fd, data_bytes, offset)
         except PermissionError as e:
-            print(f"Permission denied: {DMA_DEVICE_USER}")
+            print(f"Permission denied: {self.user_device}")
             print(f"  Error: {e}")
-            print(f"  Run with sudo or: sudo chmod 666 {DMA_DEVICE_USER}")
+            print(f"  Run with sudo or: sudo chmod 666 {self.user_device}")
         except FileNotFoundError as e:
-            print(f"Device not found: {DMA_DEVICE_USER}")
+            print(f"Device not found: {self.user_device}")
             print(f"  Error: {e}")
             print(f"  Ensure XDMA driver is loaded")
         except OSError as e:
@@ -889,24 +901,21 @@ class UnifiedEngine:
             32-bit register value, or 0 on error
         """
         try:
-            fd = os.open(DMA_DEVICE_USER, os.O_RDONLY)
-            try:
-                # Subtract base address to get offset within the BAR
-                offset = address + self._base_addr - AXI_LITE_TRANSLATION_OFFSET
-                # Use pread to read at offset (device doesn't support lseek)
-                data_bytes = os.pread(fd, 4, offset)
-                if len(data_bytes) == 4:
-                    return struct.unpack('I', data_bytes)[0]
-                return 0
-            finally:
-                os.close(fd)
+            fd = self._get_user_fd()
+            # Subtract base address to get offset within the BAR
+            offset = address + self._base_addr - AXI_LITE_TRANSLATION_OFFSET
+            # Use pread to read at offset (device doesn't support lseek)
+            data_bytes = os.pread(fd, 4, offset)
+            if len(data_bytes) == 4:
+                return struct.unpack('I', data_bytes)[0]
+            return 0
         except PermissionError as e:
-            print(f"Permission denied: {DMA_DEVICE_USER}")
+            print(f"Permission denied: {self.user_device}")
             print(f"  Error: {e}")
-            print(f"  Run with sudo or: sudo chmod 666 {DMA_DEVICE_USER}")
+            print(f"  Run with sudo or: sudo chmod 666 {self.user_device}")
             return 0
         except FileNotFoundError as e:
-            print(f"Device not found: {DMA_DEVICE_USER}")
+            print(f"Device not found: {self.user_device}")
             print(f"  Error: {e}")
             print(f"  Ensure XDMA driver is loaded")
             return 0
@@ -922,22 +931,24 @@ class UnifiedEngine:
         # axi_top.sv UE_QUEUE_FIFO_DATA: queue_busy is bit [8].
         return ((queue_reg >> 8) & 0x1) == 1
 
-    def wait_queue(self, timeout_seconds: float = 5.0):
+    def wait_queue(self, timeout_seconds: float = 5.0, poll_interval_seconds: float = 0.001):
         """
         Wait for queue to finish
 
         Args:
-            timeout_seconds: Maximum time to wait in seconds (default: 10.0)
+            timeout_seconds: Maximum time to wait in seconds.
+            poll_interval_seconds: Delay between status reads. The 1 ms default avoids
+                adding up to 10 ms of completion-detection latency to every decoded token.
         """
-        start_time = time.time()
+        start_time = time.monotonic()
         iteration = 0
 
         while self.is_queue_busy():
-            time.sleep(0.01)  # 0.01s sleep
+            time.sleep(poll_interval_seconds)
             iteration += 1
 
             # Check timeout
-            elapsed = time.time() - start_time
+            elapsed = time.monotonic() - start_time
             if elapsed >= timeout_seconds:
                 print(f"Error: wait_queue() timed out after {timeout_seconds:.1f} seconds ({iteration} iterations)")
                 return
@@ -7030,6 +7041,7 @@ class UnifiedEngine:
         gpr_scratch_addr: int = None,
         gpr_identity_addr: int = None,
         q_scale: float = None,
+        q_pre_scaled: bool = False,
     ) -> int:
         """Scaled dot-product attention with explicit batch and aligned KV length.
 
@@ -7038,6 +7050,8 @@ class UnifiedEngine:
         folds the query scaling elsewhere (e.g. Gemma folds it into ``q_norm`` and
         passes ``q_scale=1.0`` for no additional rescale). A runtime
         ``gpr_scale_reg`` still overrides this baked scalar on the dynamic path.
+        ``q_pre_scaled=True`` skips the Q multiply entirely when the caller has
+        already applied the same scalar after RoPE.
 
         Runtime-``head_dim`` extension (all optional, dynamic path only):
           * ``gpr_head_dim_reg`` — head_dim as a runtime register (drives the score/PV matmul K/N and,
@@ -7079,6 +7093,7 @@ class UnifiedEngine:
                 SCRATCH_DRAM_ADDR=SCRATCH_DRAM_ADDR,
                 IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 q_scale=q_scale,
+                q_pre_scaled=q_pre_scaled,
             )
         if any(g is not None for g in _addr_gprs) and (gpr_batch_reg is None or gpr_aligned_seq_len_reg is None):
             raise ValueError("unified_attention_core: gpr_*_addr require both gpr_batch_reg and gpr_aligned_seq_len_reg")
@@ -7105,6 +7120,7 @@ class UnifiedEngine:
             gpr_scratch_addr=gpr_scratch_addr,
             gpr_identity_addr=gpr_identity_addr,
             q_scale=q_scale,
+            q_pre_scaled=q_pre_scaled,
         )
 
     def unified_attention_core_legacy(
@@ -7120,6 +7136,7 @@ class UnifiedEngine:
         SCRATCH_DRAM_ADDR: int,
         IDENTITY_DRAM_ADDR: int = None,
         q_scale: float = None,
+        q_pre_scaled: bool = False,
     ) -> int:
         bytes_per_element = 2
         if batch <= 0 or aligned_seq_len <= 0 or head_dim <= 0:
@@ -7140,20 +7157,24 @@ class UnifiedEngine:
             OUTPUT_DRAM_ADDR=v_t_dram_addr,
             IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
         )
-        total_flops = self.eltwise_core_dram(
-            M=batch,
-            N=head_dim,
-            dram_a=Q_DRAM_ADDR,
-            dram_b=None,
-            dram_out=scaled_q_dram_addr,
-            mode=UE_MODE.MUL_BROADCAST,
-            scalar=(q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)),
-        )
+        if q_pre_scaled:
+            total_flops = 0
+        else:
+            total_flops = self.eltwise_core_dram(
+                M=batch,
+                N=head_dim,
+                dram_a=Q_DRAM_ADDR,
+                dram_b=None,
+                dram_out=scaled_q_dram_addr,
+                mode=UE_MODE.MUL_BROADCAST,
+                scalar=(q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)),
+            )
+        score_q_dram_addr = Q_DRAM_ADDR if q_pre_scaled else scaled_q_dram_addr
         total_flops += self.matmat_mul_core(
             M=batch,
             K=head_dim,
             N=aligned_seq_len,
-            A_DRAM_ADDR=scaled_q_dram_addr,
+            A_DRAM_ADDR=score_q_dram_addr,
             B_DRAM_ADDR=K_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=score_dram_addr,
             softmax_enable=True,
@@ -7195,6 +7216,7 @@ class UnifiedEngine:
         gpr_scratch_addr: int = None,
         gpr_identity_addr: int = None,
         q_scale: float = None,
+        q_pre_scaled: bool = False,
     ) -> int:
         bytes_per_element = 2
         if batch > aligned_seq_len:
@@ -7255,25 +7277,30 @@ class UnifiedEngine:
             gpr_out_addr=v_t_reg,
             gpr_identity_addr=gpr_identity_addr,
         )
-        total_flops = self.eltwise_core_dram(
-            M=batch,
-            N=head_dim,
-            dram_a=Q_DRAM_ADDR,
-            dram_b=None,
-            dram_out=scaled_q_dram_addr,
-            mode=UE_MODE.MUL_BROADCAST,
-            scalar=(q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)),
-            gpr_M_reg=gpr_batch_reg,
-            gpr_N_reg=sub_hd_n_reg,   # runtime head_dim -> dynamic eltwise; else N-baked PBI broadcast
-            gpr_a_addr=gpr_q_addr,
-            gpr_out_addr=scaled_q_reg,
-            gpr_scalar_reg=gpr_scale_reg,   # runtime scale override (host-primed); None -> baked scalar
-        )
+        if q_pre_scaled:
+            total_flops = 0
+        else:
+            total_flops = self.eltwise_core_dram(
+                M=batch,
+                N=head_dim,
+                dram_a=Q_DRAM_ADDR,
+                dram_b=None,
+                dram_out=scaled_q_dram_addr,
+                mode=UE_MODE.MUL_BROADCAST,
+                scalar=(q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)),
+                gpr_M_reg=gpr_batch_reg,
+                gpr_N_reg=sub_hd_n_reg,   # runtime head_dim -> dynamic eltwise; else N-baked PBI broadcast
+                gpr_a_addr=gpr_q_addr,
+                gpr_out_addr=scaled_q_reg,
+                gpr_scalar_reg=gpr_scale_reg,   # runtime scale override (host-primed); None -> baked scalar
+            )
+        score_q_dram_addr = Q_DRAM_ADDR if q_pre_scaled else scaled_q_dram_addr
+        score_q_reg = gpr_q_addr if q_pre_scaled else scaled_q_reg
         total_flops += self.matmat_mul_core(
             M=batch,
             K=head_dim,
             N=aligned_seq_len,
-            A_DRAM_ADDR=scaled_q_dram_addr,
+            A_DRAM_ADDR=score_q_dram_addr,
             B_DRAM_ADDR=K_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=score_dram_addr,
             softmax_enable=True,
@@ -7282,7 +7309,7 @@ class UnifiedEngine:
             gpr_M_reg=gpr_batch_reg,
             gpr_K_reg=head_dim_reg,
             gpr_N_reg=gpr_aligned_seq_len_reg,
-            gpr_a_addr=scaled_q_reg,
+            gpr_a_addr=score_q_reg,
             gpr_b_addr=gpr_k_addr,
             gpr_out_addr=score_reg,
             gpr_c_addr=gpr_bias_addr,

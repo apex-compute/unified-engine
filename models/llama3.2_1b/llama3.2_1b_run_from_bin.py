@@ -65,6 +65,14 @@ def _parse_offset(val) -> int:
     return int(val)
 
 
+def _minimal_chat_prompt(prompt: str) -> str:
+    """Render the canonical Llama user/assistant headers without the dated system block."""
+    return (
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+
 def _load_config(script_dir: str) -> dict:
     config_path = os.path.join(script_dir, "llama3.2_1b_config.json")
     with open(config_path, "r") as f:
@@ -126,6 +134,8 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         self.ROPE_SIZE_REG = fixed["ROPE_SIZE_REG"]
         self.gpr_bucket_idx = fixed["GPR_BUCKET_IDX_REG"]
         self.gpr_seq_len = fixed["GPR_SEQ_LEN_REG"]
+        self.gpr_q_seq_len = fixed["GPR_Q_SEQ_LEN_REG"]
+        self.gpr_aligned_seq_len = fixed["GPR_ALIGNED_SEQ_LEN_REG"]
         self._isa_reg_counter = max(fixed.values()) + 1
         self._rope_global_layers = set(model["rope_global_layers"])
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
@@ -379,6 +389,8 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         self.start_capture()
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
         self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+        self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
+        self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -386,7 +398,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         self.clear_capture_buffer()
 
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
-        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+        self.dma_to_accelerator_memory(self.LAYER0_OUTPUT_DRAM, embedding_tensor)
         bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
         rows = torch.arange(aligned_seq_len).unsqueeze(1)
         cols = torch.arange(aligned_seq_len).unsqueeze(0)
@@ -447,16 +459,20 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
             bucket_idx = min((self.seq_len + 63) // 64, _max_gpr_bucket)
             decode_pos = self.seq_len - 1
 
-            embedding_tensor = self.get_embedding_for_tokens([token_id])
+            if 0 <= token_id < self.embedding_weight.shape[0]:
+                embedding_tensor = self.embedding_weight[token_id:token_id + 1]
+            else:
+                embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
             bias_host = torch.full((1, aligned_seq_len), -1e36, dtype=torch.bfloat16)
             bias_host[0, :self.seq_len] = 0.0
-            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host)
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_host.repeat(self.group_size, 1))
 
             # Decoder preamble: prime bucket + 2 position GPRs, jump into cached decoder.
             self.clear_inst_id()
             self.start_capture()
             self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
             self.generate_instruction_add_set(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _kv_stride))
             self.generate_instruction_add_set(self.ROPE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _rope_row))
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
@@ -525,7 +541,7 @@ def _verify_artifacts(script_dir: str, cfg: dict, fpga_penalty: bool = False) ->
 
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
+    if device == "kintex7":                       return 1000 / (1066 / 5.375)
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
@@ -539,6 +555,12 @@ def main():
         description="Llama-3.2-1B inference from pre-compiled bins (no HF, no internet, no test-script import).")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt (tokenized via the local chat template). Overrides the config default.")
+    parser.add_argument(
+        "--standard-chat-template",
+        action="store_true",
+        help="Use the tokenizer's full dated system prompt. Default: canonical user/assistant "
+             "headers without the system/date block.",
+    )
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device name. Default: xdma0.")
     parser.add_argument("--cycle", type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
@@ -584,11 +606,16 @@ def main():
     _original_print(f"  Weights + tensors: {time.perf_counter() - t0:.2f}s")
 
     if args.prompt is not None:
-        conversation = [{"role": "user", "content": args.prompt}]
-        prompt_with_template = ue.tokenizer.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True)
+        if args.standard_chat_template:
+            conversation = [{"role": "user", "content": args.prompt}]
+            prompt_with_template = ue.tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True)
+            template_name = "standard dated"
+        else:
+            prompt_with_template = _minimal_chat_prompt(args.prompt)
+            template_name = "minimal"
         prefill_seq = tuple(ue.tokenizer.encode(prompt_with_template, add_special_tokens=False))
-        _original_print(f"Prompt ({len(prefill_seq)} tokens): {args.prompt!r}")
+        _original_print(f"Prompt ({len(prefill_seq)} tokens, {template_name} template): {args.prompt!r}")
     else:
         prefill_seq = tuple(cfg["default_prefill_tokens"])
         _original_print(f"Default prompt ({len(prefill_seq)} tokens)")

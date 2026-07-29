@@ -5497,11 +5497,11 @@ def gemma3_inference_test() -> None:
         if ue.legacy:
             prefill_seq_len = len(ue.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if ue.matmatmul else ""
-            rel_path = f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin"
+            rel_path = f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin"
         elif ue.matmatmul:
-            rel_path = "gemma3_bin/gemma3_matmatmul_instruction.bin"
+            rel_path = "gemma3_bin/gemma3_matmatmul_program.bin"
         else:
-            rel_path = "gemma3_bin/gemma3_instruction.bin"
+            rel_path = "gemma3_bin/gemma3_program.bin"
         return os.path.join(ue.script_dir, rel_path)
 
     def _assert_result(label: str, result: dict) -> None:
@@ -5591,11 +5591,11 @@ def gemma3_if8_inference_test() -> None:
         if ue.legacy:
             prefill_seq_len = len(ue.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if ue.matmatmul else ""
-            rel_path = f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin"
+            rel_path = f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin"
         elif ue.matmatmul:
-            rel_path = "gemma3_if8_bin/gemma3_matmatmul_instruction.bin"
+            rel_path = "gemma3_if8_bin/gemma3_matmatmul_program.bin"
         else:
-            rel_path = "gemma3_if8_bin/gemma3_instruction.bin"
+            rel_path = "gemma3_if8_bin/gemma3_program.bin"
         return os.path.join(ue.script_dir, rel_path)
 
     def _assert_result(label: str, result: dict) -> None:
@@ -5693,14 +5693,14 @@ if __name__ == "__main__":
     _seed_probe = torch.randn(4, dtype=torch.bfloat16)
     _RNG_STATE_START = _rng_state_fingerprint()
 
-    # kintex7 operates at 208 Mhz = 4.8077 ns
+    # kintex7 operates at 1066 / 5.375 MHz = 198.33 MHz = 5.0422 ns
     # kintex7_systolic operates at 149.614035 MHz = 6683 ps.
     # alveo operates at 180 Mhz = 5.5556 ns
     # kintex ultrascale+ operates at 333 Mhz = 3.0 ns
     # bittware board operates at 300 Mhz = 3.3333 ns
     clock = None
     if args.device == "kintex7":
-        clock = 1000 / 208
+        clock = 1000 / (1066 / 5.375)
     elif args.device == "kintex7_systolic":
         clock = 1000 / 149.61403
     elif args.device == "rk" or args.device == "puzhi":

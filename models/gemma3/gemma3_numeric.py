@@ -670,7 +670,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
 
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 5.1594
+    if device == "kintex7":                       return 1000 / (1066 / 5.375)
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0

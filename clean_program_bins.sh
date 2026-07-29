@@ -51,22 +51,18 @@ del andromeda_IP-* andromeda_wrapper-*
 del codebooks/
 
 # --- gemma3 (IF4 + IF8): keep params.* ; drop programs/instruction ----------
-del models/gemma3/gemma3_bin/programs*.bin
-del models/gemma3/gemma3_bin/programs*.json
-del models/gemma3/gemma3_bin/*instruction.bin
-del models/gemma3/gemma3_bin/*instruction.json
-del models/gemma3/gemma3_if8_bin/programs*.bin
-del models/gemma3/gemma3_if8_bin/programs*.json
-del models/gemma3/gemma3_if8_bin/*instruction.bin
-del models/gemma3/gemma3_if8_bin/*instruction.json
+del models/gemma3/gemma3_bin/*program*.bin
+del models/gemma3/gemma3_bin/*program*.json
+del models/gemma3/gemma3_if8_bin/*program*.bin
+del models/gemma3/gemma3_if8_bin/*program*.json
 
 # --- gemma4 e2b / e4b: keep params.* ; drop programs/instruction ------------
-del models/gemma4_e2b/gemma4_e2b_bin/programs*.bin
-del models/gemma4_e2b/gemma4_e2b_bin/programs*.json
+del models/gemma4_e2b/gemma4_e2b_bin/*program*.bin
+del models/gemma4_e2b/gemma4_e2b_bin/*program*.json
 del models/gemma4_e2b/gemma4_e2b_bin/*instruction*.bin
 del models/gemma4_e2b/gemma4_e2b_bin/*instruction*.json
-del models/gemma4_e4b/gemma4_e4b_bin/programs*.bin
-del models/gemma4_e4b/gemma4_e4b_bin/programs*.json
+del models/gemma4_e4b/gemma4_e4b_bin/*program*.bin
+del models/gemma4_e4b/gemma4_e4b_bin/*program*.json
 del models/gemma4_e4b/gemma4_e4b_bin/*instruction*.bin
 del models/gemma4_e4b/gemma4_e4b_bin/*instruction*.json
 
@@ -74,12 +70,12 @@ del models/gemma4_e4b/gemma4_e4b_bin/*instruction*.json
 del models/gpt2/gpt2_bin/
 
 # --- llama3.2 1b / 3b: keep params.* ; drop programs/instruction ------------
-del models/llama3.2_1b/llama3.2_1b_bin/programs*.bin
-del models/llama3.2_1b/llama3.2_1b_bin/programs*.json
-del models/llama3.2_1b/llama3.2_1b_bin/llama_instruction*
-del models/llama3.2_1b/llama3.2_1b_bin/llama_profile_instruction*
-del models/llama3.2_3b/llama3.2_3b_bin/programs*.bin
-del models/llama3.2_3b/llama3.2_3b_bin/programs*.json
+del models/llama3.2_1b/llama3.2_1b_bin/*program*.bin
+del models/llama3.2_1b/llama3.2_1b_bin/*program*.json
+del models/llama3.2_1b/llama3.2_1b_if8_bin/*program*.bin
+del models/llama3.2_1b/llama3.2_1b_if8_bin/*program*.json
+del models/llama3.2_3b/llama3.2_3b_bin/*program*.bin
+del models/llama3.2_3b/llama3.2_3b_bin/*program*.json
 del models/llama3.2_3b/llama3.2_3b_bin/llama3.2_3b_instruction_fpgapenalty.bin
 
 # --- locateanything_3b: keep params.* ; drop programs + output boxes --------

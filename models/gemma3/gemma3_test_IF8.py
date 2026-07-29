@@ -35,7 +35,7 @@ Weights:
 Usage:
   python gemma3_test_IF8.py
   python gemma3_test_IF8.py --prompt "your prompt"
-  python gemma3_test_IF8.py --dev xdma0 [--device kintex7] [--cycle 4.8077]
+  python gemma3_test_IF8.py --dev xdma0 [--device kintex7] [--cycle 5.0422]
   python gemma3_test_IF8.py --dev xdma0 --device bittware
   python gemma3_test_IF8.py --local-weights
   python gemma3_test_IF8.py --dual-engine
@@ -2189,21 +2189,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             assert self.prefill_seq is not None, "--legacy requires set_prefill_seq() before compile_gemma3()"
             prefill_seq_len = len(self.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.json")
         elif profile:
             prefill_seq_len = UE_VECTOR_SIZE
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_program.json")
         elif self.matmatmul:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_program.json")
         else:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_instruction.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_instruction.json")
+            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_program.json")
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
@@ -2322,7 +2322,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         and print a per-step latency breakdown for the decoder.
         """
         matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-        profile_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_instruction.json")
+        profile_meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3{matmatmul_tag}_profile_program.json")
         with open(profile_meta_path, "r") as f:
             meta = json.load(f)
 
@@ -2418,7 +2418,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     def run_gemma3_prefill(self, slave_engine = None, numeric: bool = False) -> dict:
         """Load the unified instruction image once and run prefill only.
 
-        The cached gemma3_instruction.bin is seq_len-agnostic; the runtime prefill_seq_len is
+        The cached gemma3_program.bin is seq_len-agnostic; the runtime prefill_seq_len is
         applied via a small preamble program compiled fresh per run that primes three GPRs
         (gpr_seq_len, gpr_q_seq_len, gpr_aligned_seq_len) and then unconditional-jumps into the cached
         prefill program.
@@ -2431,11 +2431,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if self.legacy:
             prefill_seq_len = len(self.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
-            meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.json")
+            meta_path = os.path.join(self.script_dir, f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.json")
         elif self.matmatmul:
-            meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_instruction.json")
+            meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_matmatmul_program.json")
         else:
-            meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_instruction.json")
+            meta_path = os.path.join(self.script_dir, "gemma3_if8_bin/gemma3_program.json")
         with open(meta_path, "r") as f:
             meta = json.load(f)
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
@@ -2741,7 +2741,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 1000 / 208
+    if device == "kintex7":                       return 1000 / (1066 / 5.375)
     if device in ("rk", "puzhi"):                 return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
@@ -2979,7 +2979,7 @@ def main():
         '--cycle',
         type=float,
         default=None,
-        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=4.8077ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
+        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=5.0422ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
