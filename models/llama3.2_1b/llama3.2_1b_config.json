@@ -20,7 +20,7 @@
     "bytes_per_element": 2
   },
   "model": {
-    "max_context_size": 1024,
+    "max_context_size": 4096,
     "prefill_context_size": 128,
     "end_of_turn_token_id": 128009,
     "rope_global_layers": []
@@ -339,7 +339,7 @@
     },
     "rope": {
       "head_dim": 512,
-      "num_positions": 1024,
+      "num_positions": 4096,
       "theta": 500000.0,
       "local_base": 500000.0
     },
