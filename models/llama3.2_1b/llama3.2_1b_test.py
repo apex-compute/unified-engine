@@ -75,6 +75,15 @@ def _parse_offset(val) -> int:
         return int(val, 0)
     return int(val)
 
+
+def _minimal_chat_prompt(prompt: str) -> str:
+    """Render the canonical Llama user/assistant headers without the dated system block."""
+    return (
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+
 def _rope_kv_perm(num_kv_heads: int, actual_head_dim: int) -> torch.Tensor:
     """Return the 1-D index permutation that reorders a combined KV-head vector from
     standard layout  [h0[lo,hi], h1[lo,hi], ..., h_{N-1}[lo,hi]]
@@ -319,7 +328,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
-                 matmatmul: bool = False):
+                 matmatmul: bool = False, stream_prefill: bool = True):
         # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
         # 512 MB for the tensor region, which overflows at max_context_size=4096
         # (attention + activation buffers in tensor_init scale with context). The
@@ -338,6 +347,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         #   True            -> matmat_mul_core(is_B_quantized=True): dequantize B to bf16
         #                      in URAM, then bf16 dot (2 passes over the weight bytes).
         self.matmatmul = matmatmul
+        self.stream_prefill = stream_prefill
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
@@ -589,36 +599,34 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         half_ahd    = ahd // 2              # 32
         rope_row    = hd * 2 * bpe          # bytes per rope table row
 
+        # The host uploads prompt embeddings to OUTPUT_DRAM. Each layer consumes
+        # that recurrent buffer and writes its final residual back to the same
+        # buffer, eliminating the old OUTPUT->INPUT inter-layer copy.
+        layer_input_addr = self.LAYER0_OUTPUT_DRAM
+
+        def prefill_matmat_mul_core(M: int, K: int, N: int, **kwargs) -> int:
+            """Select the one-pass streaming prefill kernel or compatibility fallback."""
+            if self.stream_prefill:
+                kwargs.pop("is_B_quantized", None)
+                return self.quantized_matmat_core(M=M, K=K, N=N, **kwargs)
+            return self.matmat_mul_core(M=M, K=K, N=N, **kwargs)
+
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
-            if layer_idx != 0:
-                # Inter-layer copy: previous layer's OUTPUT → next layer's INPUT.
-                # Per-token PBI loop (one row of vector_length per iter, gpr_seq_len trips)
-                # so it never exceeds URAM-A; a single seq_len*vector_length SRAM stage
-                # would overflow URAM once PREFILL_CONTEXT_SIZE > 64 (see notes).
-                self._emit_pbi_scatter_per_token(
-                    read_base=self.LAYER0_OUTPUT_DRAM,
-                    read_stride_bytes=self.vector_length * self.bytes_per_element,
-                    write_specs=[(self.LAYER0_INPUT_DRAM, self.vector_length * self.bytes_per_element)],
-                    sram_byte_addr=0x10000,
-                    element_count=self.vector_length,
-                    gpr_seq_len=self.gpr_seq_len,
-                    template_seq_len=seq_len,
-                )
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=layer_input_addr,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                               gpr_M_reg=self.gpr_seq_len)
 
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim * self.group_size,
+            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim * self.group_size,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim,
+            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
             # v_proj writes to interleaved temp (T, 512); per-head KV cache populated below.
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim,
+            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
@@ -658,6 +666,19 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 output_dram_addr=self.LAYER0_Q_DRAM,
                 cos_dram_addr=ROPE_WEIGHT_ADDR,
                 sin_dram_addr=ROPE_WEIGHT_ADDR + hd * bpe,
+                gpr_M_reg=self.gpr_seq_len,
+            )
+
+            # Scale the full post-RoPE query tensor once. Otherwise each of the
+            # eight per-KV-head attention calls launches its own scaling kernel.
+            total_flops += self.eltwise_core_dram(
+                M=seq_len,
+                N=total_q_dim,
+                dram_a=self.LAYER0_Q_DRAM,
+                dram_b=None,
+                dram_out=self.LAYER0_Q_DRAM,
+                mode=UE_MODE.MUL_BROADCAST,
+                scalar=1.0 / math.sqrt(ahd),
                 gpr_M_reg=self.gpr_seq_len,
             )
 
@@ -763,6 +784,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     gpr_batch_reg=self.gpr_q_seq_len,
                     gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                    q_pre_scaled=True,
                 )
                 total_flops += attn_result or 0
 
@@ -787,7 +809,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 self.release_isa_reg()  # src_off_reg
                 self.release_isa_reg()  # t_reg
 
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.head_dim * self.group_size, N=self.vector_length,
+            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.head_dim * self.group_size, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
@@ -796,7 +818,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             # Per-row PBI loop (gpr_seq_len trips) — no URAM cap on prefill length.
             self.eltwise_core_dram(
                 M=seq_len, N=self.vector_length,
-                dram_a=self.LAYER0_INPUT_DRAM,
+                dram_a=layer_input_addr,
                 dram_b=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 dram_out=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                 mode=UE_MODE.ELTWISE_ADD,
@@ -807,11 +829,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                               gpr_M_reg=self.gpr_seq_len)
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True,
                 gpr_M_reg=self.gpr_seq_len)
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
@@ -824,7 +846,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_MUL,
                 gpr_M_reg=self.gpr_seq_len,
             )
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
+            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
@@ -1070,6 +1092,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         bin_rel = paths_cfg.get("instruction_bin", "llama3.2_1b_bin/programs.bin")
         meta_rel = paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json")
         tag = ("_matmatmul" if self.matmatmul else "")
+        tag += ("" if self.stream_prefill else "_twopassprefill")
         tag += ("" if bool(getattr(self, "fpga_penalty", False)) else "_puregreedy")
         if tag:
             b_root, b_ext = os.path.splitext(bin_rel)
@@ -1086,7 +1109,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             with open(source_path, "rb") as source_file:
                 digest.update(source_file.read())
         digest.update(
-            f"layers={layer_size};matmatmul={self.matmatmul};penalty={getattr(self, 'fpga_penalty', False)}".encode())
+            f"layers={layer_size};matmatmul={self.matmatmul};stream_prefill={self.stream_prefill};"
+            f"penalty={getattr(self, 'fpga_penalty', False)}".encode())
         return digest.hexdigest()
 
     def compile_llama(self, layer_size: int | None = None) -> None:
@@ -1311,7 +1335,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
 
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
-        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+        self.dma_to_accelerator_memory(self.LAYER0_OUTPUT_DRAM, embedding_tensor)
         bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
         rows = torch.arange(aligned_seq_len).unsqueeze(1)
         cols = torch.arange(aligned_seq_len).unsqueeze(0)
@@ -1497,6 +1521,12 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
+    parser.add_argument(
+        "--standard-chat-template",
+        action="store_true",
+        help="Use the tokenizer's full dated system prompt. Default: canonical user/assistant "
+             "headers without the system/date block.",
+    )
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")  # legacy dev path; not in standard bin set
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
@@ -1507,6 +1537,12 @@ def main():
                              'weights either way: matmat_mul_core dequantizes B to bf16 in URAM and does '
                              'a bf16 dot (2 passes over the weight bytes, ~2x slower, higher-precision '
                              'accumulate); the default streams IF4 through the dot unit in 1 pass.')
+    parser.add_argument(
+        '--two-pass-prefill',
+        action='store_true',
+        help='Use the compatibility prefill matmul that dequantizes weights before the BF16 dot. '
+             'Default: faster one-pass streaming IF4 dot.',
+    )
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
     # fully deterministic. --pure-greedy disables it entirely.
@@ -1554,16 +1590,23 @@ def main():
     ue = UnifiedEngine()
     ue.software_reset()
     
-    ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel, matmatmul=args.matmatmul)
+    ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel,
+                                  matmatmul=args.matmatmul, stream_prefill=not args.two_pass_prefill)
     cfg = _load_config(script_dir)
 
     if args.prompt is not None:
         tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
         tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
-        conversation = [{"role": "user", "content": args.prompt}]
-        prompt_with_template = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+        if args.standard_chat_template:
+            conversation = [{"role": "user", "content": args.prompt}]
+            prompt_with_template = tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True)
+            template_name = "standard dated"
+        else:
+            prompt_with_template = _minimal_chat_prompt(args.prompt)
+            template_name = "minimal"
         prefill_seq = tuple(tokenizer.encode(prompt_with_template, add_special_tokens=False))
-        print(f"Prefill from prompt ({len(prefill_seq)} tokens): {args.prompt!r}")
+        print(f"Prefill from prompt ({len(prefill_seq)} tokens, {template_name} template): {args.prompt!r}")
     else:
         prefill_seq = tuple(cfg["default_prefill_tokens"])
 
