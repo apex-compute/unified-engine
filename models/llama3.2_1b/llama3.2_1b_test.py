@@ -348,7 +348,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # ambiguous name leak into the execution logic.
         if matmatmul is not None:
             decoder_matmatmul = bool(matmatmul)
-        # Decode matmul kernel select (mirrors gemma3's --decoder-matmatmul):
+        # Decode matmul kernel select (CLI: --two-pass-decoder):
         #   False (default) -> quantized_matmat_core: 1-pass streaming IF4 dot.
         #   True            -> matmat_mul_core(is_B_quantized=True): dequantize B to bf16
         #                      in URAM, then bf16 dot (2 passes over the weight bytes).
@@ -940,9 +940,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
             Both paths read the SAME IF4 weight; they differ in how the dot is computed:
 
-            - default (``--decoder-matmatmul`` off) -> :meth:`quantized_matmat_core`: 1-pass streaming
+            - default (``--two-pass-decoder`` off) -> :meth:`quantized_matmat_core`: 1-pass streaming
               quantized dot (inline fp4->bf19 unpack straight through the DOT_PRODUCT unit).
-            - ``--decoder-matmatmul`` -> :meth:`matmat_mul_core` with ``is_B_quantized=True``:
+            - ``--two-pass-decoder`` -> :meth:`matmat_mul_core` with ``is_B_quantized=True``:
               DEQUANTIZES B to bf16 in URAM, then a bf16 dot — two passes over the weight
               bytes, so ~2x the DRAM traffic (and ~2x slower) for higher-precision accumulate.
 
@@ -1141,7 +1141,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 if bool(getattr(self, "fpga_penalty", False)) else {}
             # LM head uses the same dual-kernel dispatch as the layer matmuls (mirrors gemma3):
             # streaming IF4 by default, dequantize-to-bf16 dot under
-            # --decoder-matmatmul. Both kernels
+            # --two-pass-decoder. Both kernels
             # honor the folded repetition-penalty bias (broadcast_N) and the argmax-only
             # write_back_disable, so the HW argmax still returns the penalized token id.
             total_flops += decoder_projection_core(K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
@@ -1787,18 +1787,20 @@ def main():
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
-    parser.add_argument('--decoder-matmatmul', '--matmatmul',
+    parser.add_argument('--two-pass-decoder',
                         dest='decoder_matmatmul', action='store_true',
                         help='Use matmat_mul_core for the decoder quantized matmats (incl. the LM head) '
                              'instead of the default quantized_matmat_core (streaming) path. Same IF4 '
                              'weights either way: matmat_mul_core dequantizes B to bf16 in URAM and does '
                              'a bf16 dot (2 passes over the weight bytes, ~2x slower, higher-precision '
-                             'accumulate); the default streams IF4 through the dot unit in 1 pass.')
+                             'accumulate); the default streams IF4 through the dot unit in 1 pass. '
+                             'Unsupported on 512-bit AXI devices.')
     parser.add_argument(
         '--two-pass-prefill',
         action='store_true',
         help='Use the compatibility prefill matmul that dequantizes weights before the BF16 dot. '
-             'Default: faster one-pass streaming IF4 dot.',
+             'Default: faster one-pass streaming IF4 dot. '
+             'Unsupported on 512-bit AXI devices.',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and print one '
@@ -1840,6 +1842,16 @@ def main():
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    if axi_width_bits == 512 and (args.two_pass_prefill or args.decoder_matmatmul):
+        requested = []
+        if args.two_pass_prefill:
+            requested.append("--two-pass-prefill")
+        if args.decoder_matmatmul:
+            requested.append("--two-pass-decoder")
+        parser.error(
+            f"{' and '.join(requested)} unsupported: two-pass matmul is not "
+            "supported on the 512-bit AXI data path; use the default streaming kernels."
+        )
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)

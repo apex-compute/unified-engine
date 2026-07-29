@@ -20,7 +20,7 @@
     "bytes_per_element": 2
   },
   "model": {
-    "max_context_size": 4096,
+    "max_context_size": 1024,
     "prefill_context_size": 128,
     "end_of_turn_token_id": 128009,
     "rope_global_layers": []

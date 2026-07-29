@@ -265,12 +265,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     can build on the same structure; runtime enablement remains gated until validated.
     """
 
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False, legacy: bool = False, matmatmul: bool = False):
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False):
         program_dram_base = DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else DRAM_INSTRUCTION_ADDR
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
         super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
         self.dual_engine = dual_engine
         self.legacy = legacy
+        self.two_pass_prefill = two_pass_prefill
         self.matmatmul = matmatmul
         self.local_weights = local_weights
         self.script_dir = script_dir or SCRIPT_DIR
@@ -645,6 +646,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             else:
                 self.generate_instruction_flag_check(target_engine_idx=1)
 
+        def prefill_projection_core(**kwargs) -> int:
+            """Select the default one-pass streaming kernel or two-pass compatibility path."""
+            if self.two_pass_prefill:
+                return self.matmat_mul_core(**kwargs)
+            kwargs.pop("is_B_quantized", None)
+            return self.quantized_matmat_core(**kwargs)
+
         def partitioned_matmat_mul_core(
             input_dram_addr: int,
             k_dim: int,
@@ -655,7 +663,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             **kwargs,
         ) -> int:
             begin_parallel_stage()
-            flops = self.matmat_mul_core(
+            projection_kwargs = dict(
                 M=seq_len,
                 K=k_dim,
                 N=n_dim,
@@ -668,6 +676,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 SCALE_DRAM_ADDR=scale_dram_addr,
                 **kwargs,
             )
+            flops = prefill_projection_core(**projection_kwargs)
             end_parallel_stage()
             return flops
 
@@ -904,7 +913,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 )
             if profile:
                 _checkpoint("pre_norm")
-            total_flops += self.matmat_mul_core(
+            total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.head_dim * self.group_size,
@@ -922,7 +931,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_out_addr=const_addr(self.LAYER0_Q_DRAM, gpr_scratch_c),
                 gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE, gpr_scratch_d),
             )
-            total_flops += self.matmat_mul_core(
+            total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.head_dim,
@@ -940,7 +949,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_out_addr=const_addr(self.LAYER0_K_DRAM, gpr_scratch_c),
                 gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_K_PROJ_SCALE, gpr_scratch_d),
             )
-            total_flops += self.matmat_mul_core(
+            total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.head_dim,
@@ -1061,7 +1070,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 total_flops += flash_attention_result or 0
                 if profile:
                     _checkpoint("attention")
-            total_flops += self.matmat_mul_core(
+            total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.head_dim * self.group_size,
                 N=self.vector_length,
@@ -1113,7 +1122,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 )
                 if profile:
                     _checkpoint("pre_ffn_norm")
-            total_flops += self.matmat_mul_core(
+            total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.mlp_elements,
@@ -1132,7 +1141,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_out_addr=const_addr(self.LAYER0_MLP_GATE_DRAM, gpr_scratch_c),
                 gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE, gpr_scratch_d),
             )
-            total_flops += self.matmat_mul_core(
+            total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.vector_length,
                 N=self.mlp_elements,
@@ -1169,7 +1178,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 )
                 if profile:
                     _checkpoint("mlp_gateup_gelu_mul")
-            total_flops += self.matmat_mul_core(
+            total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.mlp_elements,
                 N=self.vector_length,
@@ -1257,7 +1266,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                         gpr_M_reg=None,
                     )
                 # Dual-engine PBI matmul sharding is only partially wired; full validation is TBD.
-                total_flops += self.matmat_mul_core(
+                total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.vector_length,
                     N=self.head_dim * self.group_size,
@@ -1269,7 +1278,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
                 )
-                total_flops += self.matmat_mul_core(
+                total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.vector_length,
                     N=self.head_dim,
@@ -1281,7 +1290,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
                 )
-                total_flops += self.matmat_mul_core(
+                total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.vector_length,
                     N=self.head_dim,
@@ -1368,7 +1377,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                         gpr_aligned_seq_len_reg=None,
                     )
                     total_flops += flash_attention_result or 0
-                total_flops += self.matmat_mul_core(
+                total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.head_dim * self.group_size,
                     N=self.vector_length,
@@ -1406,7 +1415,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                         GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                         gpr_M_reg=None,
                     )
-                total_flops += self.matmat_mul_core(
+                total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.vector_length,
                     N=self.mlp_elements,
@@ -1419,7 +1428,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
                     gelu_enable=True,
                 )
-                total_flops += self.matmat_mul_core(
+                total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.vector_length,
                     N=self.mlp_elements,
@@ -1444,7 +1453,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                         UE_MODE.ELTWISE_MUL,
                         gpr_M_reg=None,
                     )
-                total_flops += self.matmat_mul_core(
+                total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.mlp_elements,
                     N=self.vector_length,
@@ -2158,21 +2167,26 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             assert self.prefill_seq is not None, "--legacy requires set_prefill_seq() before compile_gemma3()"
             prefill_seq_len = len(self.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
+            matmatmul_tag += "_prefill_twopass" if self.two_pass_prefill else ""
             instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin")
             instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.json")
         elif profile:
             prefill_seq_len = UE_VECTOR_SIZE
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
+            matmatmul_tag += "_prefill_twopass" if self.two_pass_prefill else ""
             instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.bin")
             instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.json")
-        elif self.matmatmul:
+        elif self.matmatmul or self.two_pass_prefill:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_program.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_program.json")
+            mode_tag = ("_matmatmul" if self.matmatmul else "") + ("_prefill_twopass" if self.two_pass_prefill else "")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.json")
         else:
             prefill_seq_len = UE_VECTOR_SIZE
             instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.bin")
             instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.json")
+        print(f"Decode kernel: {'matmat_mul_core (two-pass)' if self.matmatmul else 'quantized_matmat_core (streaming)'}")
+        print(f"Prefill kernel: {'two-pass (matmat_mul_core)' if self.two_pass_prefill else 'streaming (quantized_matmat_core)'}")
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
@@ -2228,6 +2242,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "instruction_bin": os.path.relpath(instruction_bin_path, self.script_dir),
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "instruction_total_size": len(instruction_bytes),
+            "two_pass_prefill": self.two_pass_prefill,
             "matmatmul": self.matmatmul,
             "legacy": self.legacy,
             "prefill_template_seq_len": prefill_seq_len,
@@ -2331,6 +2346,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         — the tables are per-step totals for the whole phase, with no per-layer breakdown.
         """
         matmatmul_tag = "_matmatmul" if self.matmatmul else ""
+        matmatmul_tag += "_prefill_twopass" if self.two_pass_prefill else ""
         profile_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.json")
         with open(profile_meta_path, "r") as f:
             meta = json.load(f)
@@ -2429,9 +2445,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if self.legacy:
             prefill_seq_len = len(self.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
+            matmatmul_tag += "_prefill_twopass" if self.two_pass_prefill else ""
             meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.json")
-        elif self.matmatmul:
-            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_matmatmul_program.json")
+        elif self.matmatmul or self.two_pass_prefill:
+            mode_tag = ("_matmatmul" if self.matmatmul else "") + ("_prefill_twopass" if self.two_pass_prefill else "")
+            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.json")
         else:
             meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.json")
         with open(meta_path, "r") as f:
@@ -3011,8 +3029,10 @@ def main():
                              'Without --legacy (the usual path), prefill compiles as a single '
                              'hardware-looped layer body where rope, flash attention, and every '
                              'matmul use fully dynamic (runtime GPR-sourced) addressing.')
-    parser.add_argument('--matmatmul', action='store_true',
-                        help='Use matmat_mul_core for Gemma3 decoder quantized matmats instead of the default quantized_matmat_core (streaming) path.')
+    parser.add_argument('--two-pass-prefill', action='store_true',
+                        help='Use two-pass matmat_mul_core for prefill projections. Default: one-pass streaming quantized_matmat_core.')
+    parser.add_argument('--two-pass-decoder', dest='matmatmul', action='store_true',
+                        help='Use matmat_mul_core for decoder projections. Default: streaming quantized_matmat_core.')
     parser.add_argument('--numeric', action='store_true',
                         help='After prefill and after the first decoded token, compare HW KV cache against host reference and print SNR for K and V.')
     args = parser.parse_args()
@@ -3044,11 +3064,13 @@ def main():
         "Dual-engine Gemma3 PBI is not verified end-to-end yet; compile preserves sharding hooks for "
         "future work. Re-run without --dual-engine until validation lands."
     )
-    ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine, legacy=args.legacy, matmatmul=args.matmatmul)
+    ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine, legacy=args.legacy,
+                              matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill)
     ue.set_prefill_seq(args.prompt)
 
     if dual_engine:
-        ue2 = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True, legacy=args.legacy, matmatmul=args.matmatmul)
+        ue2 = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True, legacy=args.legacy,
+                                   matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill)
         ue2.set_prefill_seq(args.prompt)
 
     print(f"\n--- Compiling ---")
