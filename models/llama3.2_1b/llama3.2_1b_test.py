@@ -330,17 +330,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
                  decoder_matmatmul: bool = False, stream_prefill: bool = True,
                  matmatmul: bool | None = None):
-        # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
-        # 512 MB for the tensor region, which overflows at max_context_size=4096
-        # (attention + activation buffers in tensor_init scale with context). The
-        # tensor region here is 0x58000000..0xE0000000 = 2.25 GB.
-        #   params : 0x00000000 .. 0x58000000  (1.375 GB)  weights + host RoPE
-        #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
-        #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
+        # IF4 layout inside the 2 GB window 0x80000000..0xFFFFFFFF.
+        # At max_context_size=1024 the loaded params use ~642 MiB and tensors/KV
+        # use ~212 MiB. Keep simple aligned boundaries and reserve the final
+        # 10 MiB exclusively for the captured instruction image + preamble.
+        #   params : 0x80000000 .. 0xB0000000  (768 MiB)
+        #   tensor : 0xB0000000 .. 0xFF600000  (1270 MiB)
+        #   program: 0xFF600000 .. 0x100000000 (10 MiB)
         super().__init__(
-            params_dram_base=0x00000000,
-            tensor_dram_base=0x58000000,
-            program_dram_base=0xE0000000,
+            params_dram_base=0x80000000,
+            tensor_dram_base=0xB0000000,
+            program_dram_base=0xFF600000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         # ``matmatmul`` is the legacy constructor keyword. It has always selected
@@ -1256,6 +1256,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         instruction_bytes = bytearray()
         for inst in self.capture_buffer:
             instruction_bytes.extend(inst.get_bytes())
+        if len(instruction_bytes) > 10 * 1024 * 1024 - 64 * 1024:
+            raise MemoryError(
+                f"Instruction image exceeds 10 MiB program region: "
+                f"{len(instruction_bytes)} bytes"
+            )
         with open(instruction_bin_path, "wb") as f:
             f.write(instruction_bytes)
         self.clear_capture_buffer()
@@ -1352,6 +1357,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
+        if preamble_addr + 64 * 1024 > 0x100000000:
+            raise MemoryError(
+                f"Instruction image exceeds 10 MiB program region: preamble=0x{preamble_addr:X}"
+            )
 
         prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
@@ -1656,6 +1665,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
+        if preamble_addr + 64 * 1024 > 0x100000000:
+            raise MemoryError(
+                f"Instruction image exceeds 10 MiB program region: preamble=0x{preamble_addr:X}"
+            )
 
         prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
