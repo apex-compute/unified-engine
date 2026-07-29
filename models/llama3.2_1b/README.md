@@ -32,20 +32,23 @@ python models/llama3.2_1b/llama3.2_1b_IF8.py --prompt "What is 2+2?"
 # Restore Meta's full dated system block (the default is the lower-latency minimal chat wrapper)
 python models/llama3.2_1b/llama3.2_1b_test.py --prompt "What is 2+2?" --standard-chat-template
 
-# Compatibility A/B: restore the slower dequantize-then-BF16 prefill matmuls
-python models/llama3.2_1b/llama3.2_1b_test.py --prompt "What is 2+2?" --two-pass-prefill
+# Select prefill and decode independently (streaming or matmatmul)
+python models/llama3.2_1b/llama3.2_1b_test.py --prompt "What is 2+2?" \
+  --prefill-kernel matmatmul --decode-kernel streaming
 
-# IF8 A/B: test one-pass streaming instead of its measured-faster dequantize/BF16 default
-python models/llama3.2_1b/llama3.2_1b_IF8.py --prompt "What is 2+2?" --stream-prefill
+# Use matmatmul for both stages (256-bit AXI devices only)
+python models/llama3.2_1b/llama3.2_1b_IF8.py --prompt "What is 2+2?" \
+  --prefill-kernel matmatmul --decode-kernel matmatmul
 
-# Decoder-only A/B: use dequantize/BF16 matmuls instead of the faster streaming decoder
-python models/llama3.2_1b/llama3.2_1b_test.py --prompt "What is 2+2?" --decoder-matmatmul
+# Use streaming for both stages (the default)
+python models/llama3.2_1b/llama3.2_1b_IF8.py --prompt "What is 2+2?" \
+  --prefill-kernel streaming --decode-kernel streaming
 
 # Override the board clock when needed (Kintex-7 default: 5.0422 ns / 198.33 MHz)
 python models/llama3.2_1b/llama3.2_1b_test.py --cycle 5.0422
 ```
 
-Both precision variants use a 4096-token decode context and 4096-position RoPE
+Both precision variants use a 1024-token decode context and 4096-position RoPE
 tables. The prompt/prefill limit remains 128 tokens.
 
 ## Measured prefill performance
@@ -62,10 +65,13 @@ Kintex-7 at 198.3256 MHz, hardware `0x884c96b9`, prompt `"x^2=-1"`:
 
 The default minimal wrapper removes the tokenizer's automatically injected 25-token
 system/date block. The prefill compiler keeps layer state in one recurrent DRAM
-buffer and scales the full query tensor once. IF4 uses the one-pass streaming
-matmul; IF8 follows Gemma IF8 and uses the measured-faster dequantize/BF16
-matmul. `--decoder-matmatmul` affects only decoder projections; the legacy
-`--matmatmul` spelling remains accepted as an alias. Use
+buffer and scales the full query tensor once. Both variants accept the same
+independent selectors: `--prefill-kernel {streaming,matmatmul}` and
+`--decode-kernel {streaming,matmatmul}`. Streaming is the default for both
+stages. Matmatmul remains available on 256-bit AXI devices, but is rejected on
+the unsupported 512-bit path. The older `--two-pass-prefill`,
+`--two-pass-decoder`, `--decoder-matmatmul`, and `--matmatmul` spellings remain
+accepted as compatibility aliases; IF8 also retains `--stream-prefill`. Use
 `--standard-chat-template` when the dated system metadata is required.
 
 ## Measured decode performance

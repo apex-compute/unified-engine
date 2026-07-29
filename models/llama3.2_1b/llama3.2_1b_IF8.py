@@ -393,9 +393,14 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
       - LM head weight tied to input embedding.
     """
 
+    DEFAULT_PREFILL_KERNEL = "streaming"
+    DEFAULT_DECODE_KERNEL = "streaming"
+    VALID_KERNELS = ("streaming", "matmatmul")
+
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
-                 decoder_matmatmul: bool = False, stream_prefill: bool = True,
-                 matmatmul: bool | None = None):
+                 decoder_matmatmul: bool | None = None, stream_prefill: bool | None = None,
+                 matmatmul: bool | None = None, prefill_kernel: str | None = None,
+                 decode_kernel: str | None = None):
         # IF8 layout inside the 2 GB window 0x80000000..0xFFFFFFFF.
         # At max_context_size=1024 the loaded IF8 params use ~1.20 GiB and
         # tensors/KV use ~212 MiB. Reserve the final 10 MiB for instructions.
@@ -408,18 +413,44 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
             program_dram_base=0xFF600000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        # ``matmatmul`` is the legacy constructor keyword. It has always selected
-        # only the decoder kernel; retain it as an alias without letting the old
-        # ambiguous name leak into the execution logic.
+        # Unified kernel selection. The boolean inputs are legacy constructor
+        # aliases retained for callers outside this script.
+        legacy_decode = decoder_matmatmul
         if matmatmul is not None:
-            decoder_matmatmul = bool(matmatmul)
-        # Decode matmul kernel select (CLI: --two-pass-decoder):
-        #   False (default) -> quantized_matmat_core: 1-pass streaming IF8 dot.
-        #   True            -> matmat_mul_core(is_B_quantized=True): dequantize B to bf16
-        #                      in URAM, then bf16 dot (2 passes over the weight bytes).
-        self.decoder_matmatmul = decoder_matmatmul
-        # Prefill defaults to the one-pass streaming quantized kernel.
-        self.stream_prefill = stream_prefill
+            if legacy_decode is not None and bool(legacy_decode) != bool(matmatmul):
+                raise ValueError("Conflicting decoder_matmatmul and matmatmul values")
+            legacy_decode = bool(matmatmul)
+        if decode_kernel is None:
+            decode_kernel = "matmatmul" if legacy_decode else self.DEFAULT_DECODE_KERNEL
+        elif legacy_decode is not None:
+            expected = "matmatmul" if legacy_decode else "streaming"
+            if decode_kernel != expected:
+                raise ValueError(
+                    f"Conflicting decode_kernel={decode_kernel!r} and legacy decoder selection"
+                )
+
+        if prefill_kernel is None:
+            if stream_prefill is None:
+                prefill_kernel = self.DEFAULT_PREFILL_KERNEL
+            else:
+                prefill_kernel = "streaming" if stream_prefill else "matmatmul"
+        elif stream_prefill is not None:
+            expected = "streaming" if stream_prefill else "matmatmul"
+            if prefill_kernel != expected:
+                raise ValueError(
+                    f"Conflicting prefill_kernel={prefill_kernel!r} and stream_prefill"
+                )
+
+        if prefill_kernel not in self.VALID_KERNELS:
+            raise ValueError(
+                f"prefill_kernel must be one of {self.VALID_KERNELS}, got {prefill_kernel!r}"
+            )
+        if decode_kernel not in self.VALID_KERNELS:
+            raise ValueError(
+                f"decode_kernel must be one of {self.VALID_KERNELS}, got {decode_kernel!r}"
+            )
+        self.prefill_kernel = prefill_kernel
+        self.decode_kernel = decode_kernel
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
@@ -700,11 +731,9 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
         # buffer, eliminating the old OUTPUT->INPUT inter-layer copy.
         layer_input_addr = self.LAYER0_OUTPUT_DRAM
 
-        def prefill_projection_core(
-            M: int, K: int, N: int, force_stream: bool = False, **kwargs
-        ) -> int:
-            """Select the measured-fast IF8 prefill kernel or streaming A/B path."""
-            if self.stream_prefill or force_stream:
+        def prefill_projection_core(M: int, K: int, N: int, **kwargs) -> int:
+            """Dispatch every prefill projection through the selected kernel."""
+            if self.prefill_kernel == "streaming":
                 kwargs.pop("is_B_quantized", None)
                 return self.quantized_matmat_core(M=M, K=K, N=N, **kwargs)
             return self.matmat_mul_core(M=M, K=K, N=N, **kwargs)
@@ -1003,20 +1032,19 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
 
-        def decoder_projection_core(K: int, N: int, force_stream: bool = False, **kwargs) -> int:
-            """Select the streaming or compatibility decoder projection kernel.
+        def decoder_projection_core(K: int, N: int, **kwargs) -> int:
+            """Dispatch every decoder projection through the selected kernel.
 
             Both paths read the SAME IF8 weight; they differ in how the dot is computed:
 
-            - default (``--two-pass-decoder`` off) -> :meth:`quantized_matmat_core`: 1-pass streaming
+            - ``--decode-kernel streaming`` -> :meth:`quantized_matmat_core`: 1-pass streaming
               quantized dot (inline if8->bf19 unpack straight through the DOT_PRODUCT unit).
-            - ``--two-pass-decoder`` -> :meth:`matmat_mul_core` with ``is_B_quantized=True``:
+            - ``--decode-kernel matmatmul`` -> :meth:`matmat_mul_core` with ``is_B_quantized=True``:
               DEQUANTIZES B to bf16 in URAM, then a bf16 dot — two passes over the weight
               bytes, so ~2x the DRAM traffic (and ~2x slower) for higher-precision accumulate.
 
-            ``force_stream`` pins an individual call to the streaming path regardless of the flag.
             """
-            if not self.decoder_matmatmul or force_stream:
+            if self.decode_kernel == "streaming":
                 kwargs.pop("is_B_quantized", None)
                 return self.quantized_matmat_core(M=1, K=K, N=N, **kwargs)
             m_reg = self.alloc_isa_reg()
@@ -1209,7 +1237,7 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
                 if bool(getattr(self, "fpga_penalty", False)) else {}
             # LM head uses the same dual-kernel dispatch as the layer matmuls (mirrors gemma3):
             # streaming IF8 by default, dequantize-to-bf16 dot under
-            # --two-pass-decoder. Both kernels
+            # --decode-kernel matmatmul. Both kernels
             # honor the folded repetition-penalty bias (broadcast_N) and the argmax-only
             # write_back_disable, so the HW argmax still returns the penalized token id.
             total_flops += decoder_projection_core(K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
@@ -1232,8 +1260,11 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
         paths_cfg = self._cfg.get("paths", {})
         bin_rel = paths_cfg.get("instruction_bin", "llama3.2_1b_if8_bin/programs.bin")
         meta_rel = paths_cfg.get("instruction_meta", "llama3.2_1b_if8_bin/programs.json")
-        tag = ("_decoder_matmatmul" if self.decoder_matmatmul else "")
-        tag += ("_streamprefill" if self.stream_prefill else "")
+        tag = ""
+        if self.decode_kernel != self.DEFAULT_DECODE_KERNEL:
+            tag += f"_decode_{self.decode_kernel}"
+        if self.prefill_kernel != self.DEFAULT_PREFILL_KERNEL:
+            tag += f"_prefill_{self.prefill_kernel}"
         tag += ("" if bool(getattr(self, "fpga_penalty", False)) else "_puregreedy")
         if tag:
             b_root, b_ext = os.path.splitext(bin_rel)
@@ -1250,8 +1281,8 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
             with open(source_path, "rb") as source_file:
                 digest.update(source_file.read())
         digest.update(
-            f"layers={layer_size};decoder_matmatmul={self.decoder_matmatmul};"
-            f"stream_prefill={self.stream_prefill};"
+            f"layers={layer_size};decode_kernel={self.decode_kernel};"
+            f"prefill_kernel={self.prefill_kernel};"
             f"penalty={getattr(self, 'fpga_penalty', False)}".encode())
         return digest.hexdigest()
 
@@ -1283,8 +1314,18 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
         self._instruction_bin_path = instruction_bin_path
         self._instruction_meta_path = instruction_meta_path
         compiler_fingerprint = self._instruction_compiler_fingerprint(layer_size)
-        print(f"Decode matmul kernel: {'matmat_mul_core (dequantize->bf16 dot, 2-pass)' if self.decoder_matmatmul else 'quantized_matmat_core (streaming IF8, 1-pass)'}")
-        print(f"Prefill matmul kernel: {'quantized_matmat_core (streaming IF8, 1-pass A/B)' if self.stream_prefill else 'matmat_mul_core (dequantize->bf16 dot, 2-pass)'}")
+        decode_description = (
+            "matmat_mul_core (dequantize->bf16 dot, 2-pass)"
+            if self.decode_kernel == "matmatmul"
+            else "quantized_matmat_core (streaming IF8, 1-pass)"
+        )
+        prefill_description = (
+            "matmat_mul_core (dequantize->bf16 dot, 2-pass)"
+            if self.prefill_kernel == "matmatmul"
+            else "quantized_matmat_core (streaming IF8, 1-pass default)"
+        )
+        print(f"Decode kernel: {self.decode_kernel} — {decode_description}")
+        print(f"Prefill kernel: {self.prefill_kernel} — {prefill_description}")
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             try:
                 with open(instruction_meta_path, "r") as meta_file:
@@ -1340,6 +1381,8 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
         metadata = {
             "instruction_bin": os.path.relpath(instruction_bin_path, self.script_dir),
             "compiler_fingerprint": compiler_fingerprint,
+            "prefill_kernel": self.prefill_kernel,
+            "decode_kernel": self.decode_kernel,
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "instruction_total_size": len(instruction_bytes),
             "prefill_template_seq_len": template_seq_len,
@@ -1659,6 +1702,8 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
         _original_print(f"Decode  ({tokens_decoded} tokens): HW={hw_decode_avg_ms:,.1f} ms/tok  CPU={cpu_decode_avg_ms:,.1f} ms/tok  ({tokens_decoded/latency_decoder:.2f} tok/s)")
 
         return {
+            "prefill_kernel": self.prefill_kernel,
+            "decode_kernel": self.decode_kernel,
             "prefill_tokens": prefill_seq_len,
             "decoded_text": "".join(decoded_chars),
             "decoded_tokens": tokens_decoded,
@@ -1855,20 +1900,37 @@ def main():
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
-    parser.add_argument('--two-pass-decoder',
-                        dest='decoder_matmatmul', action='store_true',
-                        help='Use matmat_mul_core for the decoder quantized matmats (incl. the LM head) '
-                             'instead of the default quantized_matmat_core (streaming) path. Same IF8 '
-                             'weights either way: matmat_mul_core dequantizes B to bf16 in URAM and does '
-                             'a bf16 dot (2 passes over the weight bytes, ~2x slower, higher-precision '
-                             'accumulate); the default streams IF8 through the dot unit in 1 pass. '
-                             'Unsupported on 512-bit AXI devices.')
+    parser.add_argument(
+        '--prefill-kernel',
+        choices=Llama32_1b_IF8_UnifiedEngine.VALID_KERNELS,
+        default=None,
+        help='Projection kernel for prefill: streaming or matmatmul. Default: streaming. '
+             'matmatmul is unsupported on 512-bit AXI devices.',
+    )
+    parser.add_argument(
+        '--decode-kernel',
+        choices=Llama32_1b_IF8_UnifiedEngine.VALID_KERNELS,
+        default=None,
+        help='Projection kernel for decode, including the LM head: streaming or matmatmul. '
+             'Default: streaming. matmatmul is unsupported on 512-bit AXI devices.',
+    )
+    parser.add_argument(
+        '--two-pass-decoder', '--decoder-matmatmul', '--matmatmul',
+        dest='legacy_decoder_matmatmul',
+        action='store_true',
+        help='Compatibility alias for --decode-kernel matmatmul.',
+    )
     parser.add_argument(
         '--two-pass-prefill',
+        dest='legacy_prefill_matmatmul',
         action='store_true',
-        help='Use the two-pass prefill matmul that dequantizes weights before the BF16 dot. '
-             'Default: one-pass streaming IF8 dot. '
-             'Unsupported on 512-bit AXI devices.',
+        help='Compatibility alias for --prefill-kernel matmatmul.',
+    )
+    parser.add_argument(
+        '--stream-prefill',
+        dest='legacy_prefill_streaming',
+        action='store_true',
+        help='Compatibility alias for --prefill-kernel streaming.',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and print one '
@@ -1894,6 +1956,40 @@ def main():
                         help='count tokens over the last N (never penalizes punctuation/whitespace/'
                              'special tokens). Default 256.')
     args = parser.parse_args()
+
+    if args.legacy_prefill_matmatmul and args.legacy_prefill_streaming:
+        parser.error("--two-pass-prefill conflicts with --stream-prefill")
+    prefill_kernel = args.prefill_kernel or Llama32_1b_IF8_UnifiedEngine.DEFAULT_PREFILL_KERNEL
+    if args.legacy_prefill_matmatmul:
+        if args.prefill_kernel not in (None, "matmatmul"):
+            parser.error("--two-pass-prefill conflicts with --prefill-kernel streaming")
+        prefill_kernel = "matmatmul"
+    if args.legacy_prefill_streaming:
+        if args.prefill_kernel not in (None, "streaming"):
+            parser.error("--stream-prefill conflicts with --prefill-kernel matmatmul")
+        prefill_kernel = "streaming"
+    decode_kernel = args.decode_kernel or Llama32_1b_IF8_UnifiedEngine.DEFAULT_DECODE_KERNEL
+    if args.legacy_decoder_matmatmul:
+        if args.decode_kernel not in (None, "matmatmul"):
+            parser.error(
+                "--two-pass-decoder/--decoder-matmatmul/--matmatmul conflicts "
+                "with --decode-kernel streaming"
+            )
+        decode_kernel = "matmatmul"
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    if axi_width_bits == 512 and (
+        prefill_kernel == "matmatmul" or decode_kernel == "matmatmul"
+    ):
+        requested = []
+        if prefill_kernel == "matmatmul":
+            requested.append("--prefill-kernel matmatmul")
+        if decode_kernel == "matmatmul":
+            requested.append("--decode-kernel matmatmul")
+        parser.error(
+            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
+            "on the 512-bit AXI data path; use streaming."
+        )
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:
         weights_bin_rel = "llama3.2_1b_if8_bin/full_model_weights.bin"
@@ -1908,17 +2004,6 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    if axi_width_bits == 512 and (args.two_pass_prefill or args.decoder_matmatmul):
-        requested = []
-        if args.two_pass_prefill:
-            requested.append("--two-pass-prefill")
-        if args.decoder_matmatmul:
-            requested.append("--two-pass-decoder")
-        parser.error(
-            f"{' and '.join(requested)} unsupported: two-pass matmul is not "
-            "supported on the 512-bit AXI data path; use the default streaming kernels."
-        )
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
@@ -1933,8 +2018,8 @@ def main():
     ue = Llama32_1b_IF8_UnifiedEngine(
         script_dir=script_dir,
         weights_bin=weights_bin_rel,
-        decoder_matmatmul=args.decoder_matmatmul,
-        stream_prefill=not args.two_pass_prefill,
+        prefill_kernel=prefill_kernel,
+        decode_kernel=decode_kernel,
     )
     cfg = _load_config(script_dir)
 
