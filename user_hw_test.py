@@ -5497,11 +5497,11 @@ def gemma3_inference_test() -> None:
         if ue.legacy:
             prefill_seq_len = len(ue.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if ue.matmatmul else ""
-            rel_path = f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin"
+            rel_path = f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin"
         elif ue.matmatmul:
-            rel_path = "gemma3_bin/gemma3_matmatmul_instruction.bin"
+            rel_path = "gemma3_bin/gemma3_matmatmul_program.bin"
         else:
-            rel_path = "gemma3_bin/gemma3_instruction.bin"
+            rel_path = "gemma3_bin/gemma3_program.bin"
         return os.path.join(ue.script_dir, rel_path)
 
     def _assert_result(label: str, result: dict) -> None:
@@ -5591,11 +5591,11 @@ def gemma3_if8_inference_test() -> None:
         if ue.legacy:
             prefill_seq_len = len(ue.prefill_seq) - 1
             matmatmul_tag = "_matmatmul" if ue.matmatmul else ""
-            rel_path = f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_instruction.bin"
+            rel_path = f"gemma3_if8_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.bin"
         elif ue.matmatmul:
-            rel_path = "gemma3_if8_bin/gemma3_matmatmul_instruction.bin"
+            rel_path = "gemma3_if8_bin/gemma3_matmatmul_program.bin"
         else:
-            rel_path = "gemma3_if8_bin/gemma3_instruction.bin"
+            rel_path = "gemma3_if8_bin/gemma3_program.bin"
         return os.path.join(ue.script_dir, rel_path)
 
     def _assert_result(label: str, result: dict) -> None:
