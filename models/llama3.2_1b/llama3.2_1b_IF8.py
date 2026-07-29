@@ -702,9 +702,11 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
         # buffer, eliminating the old OUTPUT->INPUT inter-layer copy.
         layer_input_addr = self.LAYER0_OUTPUT_DRAM
 
-        def prefill_projection_core(M: int, K: int, N: int, **kwargs) -> int:
+        def prefill_projection_core(
+            M: int, K: int, N: int, force_stream: bool = False, **kwargs
+        ) -> int:
             """Select the measured-fast IF8 prefill kernel or streaming A/B path."""
-            if self.stream_prefill:
+            if self.stream_prefill or force_stream:
                 kwargs.pop("is_B_quantized", None)
                 return self.quantized_matmat_core(M=M, K=K, N=N, **kwargs)
             return self.matmat_mul_core(M=M, K=K, N=N, **kwargs)
@@ -958,11 +960,15 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
             )
             if profile:
                 _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
+            # The two-pass IF8 kernel is incorrect for this K=8192, N=2048
+            # shape on the RK 512-bit AXI profile. Force the one-pass streaming
+            # kernel here while preserving the optional dispatcher elsewhere.
             total_flops += prefill_projection_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
+                force_stream=True,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF8,
+                is_B_quantized=True,
+                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF8,
                 gpr_M_reg=self.gpr_seq_len)
-
             # LLaMA: no post-FFN norm; add residual directly to down_proj output.
             # Per-row PBI loop (gpr_seq_len trips) — layer_output = POST_ATTN_RESIDUAL + MLP_DOWN.
             self.eltwise_core_dram(
