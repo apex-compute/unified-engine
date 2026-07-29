@@ -149,7 +149,19 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         with open(weights_path, "rb") as f:
             self.weight_bin = f.read()
         self.weight_init()
+        if self.get_params_dram_addr() > self._tensor_dram_base:
+            raise MemoryError(
+                f"Parameter DRAM overlaps tensor DRAM: "
+                f"params_end=0x{self.get_params_dram_addr():X}, "
+                f"tensor_start=0x{self._tensor_dram_base:X}"
+            )
         self.tensor_init()
+        if self.get_tensor_dram_addr() > self._program_dram_base:
+            raise MemoryError(
+                f"Tensor DRAM overlaps program DRAM: "
+                f"tensor_end=0x{self.get_tensor_dram_addr():X}, "
+                f"program_start=0x{self._program_dram_base:X}"
+            )
 
     # ---- embedding + RoPE (from bin / config — no HF model) -----------------
     def get_embedding_for_tokens(self, token_ids) -> torch.Tensor:

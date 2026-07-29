@@ -398,7 +398,19 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         with open(full_path, "rb") as f:
             self.weight_bin = f.read()
         self.weight_init()
+        if self.get_params_dram_addr() > self._tensor_dram_base:
+            raise MemoryError(
+                f"Parameter DRAM overlaps tensor DRAM: "
+                f"params_end=0x{self.get_params_dram_addr():X}, "
+                f"tensor_start=0x{self._tensor_dram_base:X}"
+            )
         self.tensor_init()
+        if self.get_tensor_dram_addr() > self._program_dram_base:
+            raise MemoryError(
+                f"Tensor DRAM overlaps program DRAM: "
+                f"tensor_end=0x{self.get_tensor_dram_addr():X}, "
+                f"program_start=0x{self._program_dram_base:X}"
+            )
 
     def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
         """Return (len(token_ids), vector_length) bfloat16 tensor from self.embedding_weight (HF, scale applied)."""
@@ -1138,11 +1150,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     def _instruction_paths(self) -> tuple[str, str]:
         """(bin, meta) cache paths for the current compile mode (mirrors gemma3's tagging).
 
-        The captured image depends on BOTH the decode matmul kernel (``--matmatmul`` folds a
-        dequantize-to-bf16 dot in place of the streaming IF4 dot) and the on-FPGA penalty
-        (which folds a bias term into the LM-head matmul), so each combination gets its own
-        cache entry — otherwise switching modes silently reuses a stale bin compiled for the
-        other one.
+        The captured image depends on the decode matmul kernel, prefill matmul
+        kernel, and on-FPGA penalty mode, so every combination gets its own cache
+        entry instead of silently reusing a binary compiled for another mode.
         """
         paths_cfg = self._cfg.get("paths", {})
         bin_rel = paths_cfg.get("instruction_bin", "llama3.2_1b_bin/programs.bin")
@@ -1675,7 +1685,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
 
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
-        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+        self.dma_to_accelerator_memory(self.LAYER0_OUTPUT_DRAM, embedding_tensor)
         bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
         rows = torch.arange(aligned_seq_len).unsqueeze(1)
         cols = torch.arange(aligned_seq_len).unsqueeze(0)
