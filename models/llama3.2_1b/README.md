@@ -38,6 +38,9 @@ python models/llama3.2_1b/llama3.2_1b_test.py --prompt "What is 2+2?" --two-pass
 # IF8 A/B: test one-pass streaming instead of its measured-faster dequantize/BF16 default
 python models/llama3.2_1b/llama3.2_1b_IF8.py --prompt "What is 2+2?" --stream-prefill
 
+# Decoder-only A/B: use dequantize/BF16 matmuls instead of the faster streaming decoder
+python models/llama3.2_1b/llama3.2_1b_test.py --prompt "What is 2+2?" --decoder-matmatmul
+
 # Override the board clock when needed (Kintex-7 default: 5.0422 ns / 198.33 MHz)
 python models/llama3.2_1b/llama3.2_1b_test.py --cycle 5.0422
 ```
@@ -61,7 +64,9 @@ The default minimal wrapper removes the tokenizer's automatically injected 25-to
 system/date block. The prefill compiler keeps layer state in one recurrent DRAM
 buffer and scales the full query tensor once. IF4 uses the one-pass streaming
 matmul; IF8 follows Gemma IF8 and uses the measured-faster dequantize/BF16
-matmul. Use `--standard-chat-template` when the dated system metadata is required.
+matmul. `--decoder-matmatmul` affects only decoder projections; the legacy
+`--matmatmul` spelling remains accepted as an alias. Use
+`--standard-chat-template` when the dated system metadata is required.
 
 ## Measured decode performance
 

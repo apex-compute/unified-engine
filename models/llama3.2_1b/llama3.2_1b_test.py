@@ -328,7 +328,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
-                 matmatmul: bool = False, stream_prefill: bool = True):
+                 decoder_matmatmul: bool = False, stream_prefill: bool = True,
+                 matmatmul: bool | None = None):
         # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
         # 512 MB for the tensor region, which overflows at max_context_size=4096
         # (attention + activation buffers in tensor_init scale with context). The
@@ -342,11 +343,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             program_dram_base=0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-        # Decode matmul kernel select (mirrors gemma3's --matmatmul):
+        # ``matmatmul`` is the legacy constructor keyword. It has always selected
+        # only the decoder kernel; retain it as an alias without letting the old
+        # ambiguous name leak into the execution logic.
+        if matmatmul is not None:
+            decoder_matmatmul = bool(matmatmul)
+        # Decode matmul kernel select (mirrors gemma3's --decoder-matmatmul):
         #   False (default) -> quantized_matmat_core: 1-pass streaming IF4 dot.
         #   True            -> matmat_mul_core(is_B_quantized=True): dequantize B to bf16
         #                      in URAM, then bf16 dot (2 passes over the weight bytes).
-        self.matmatmul = matmatmul
+        self.decoder_matmatmul = decoder_matmatmul
         self.stream_prefill = stream_prefill
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
@@ -628,7 +634,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # buffer, eliminating the old OUTPUT->INPUT inter-layer copy.
         layer_input_addr = self.LAYER0_OUTPUT_DRAM
 
-        def prefill_matmat_mul_core(M: int, K: int, N: int, **kwargs) -> int:
+        def prefill_projection_core(M: int, K: int, N: int, **kwargs) -> int:
             """Select the one-pass streaming prefill kernel or compatibility fallback."""
             if self.stream_prefill:
                 kwargs.pop("is_B_quantized", None)
@@ -643,16 +649,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             if profile:
                 _checkpoint(f"L{layer_idx}_pre_norm")
 
-            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim * self.group_size,
+            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.head_dim * self.group_size,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
-            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim,
+            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.head_dim,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
             # v_proj writes to interleaved temp (T, 512); per-head KV cache populated below.
-            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.head_dim,
+            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.head_dim,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
@@ -841,7 +847,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             if profile:
                 _checkpoint(f"L{layer_idx}_attention")
 
-            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.head_dim * self.group_size, N=self.vector_length,
+            total_flops += prefill_projection_core(M=seq_len, K=self.head_dim * self.group_size, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
@@ -865,11 +871,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                               gpr_M_reg=self.gpr_seq_len)
             if profile:
                 _checkpoint(f"L{layer_idx}_pre_ffn_norm")
-            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True,
                 gpr_M_reg=self.gpr_seq_len)
-            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
@@ -884,7 +890,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             )
             if profile:
                 _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
-            total_flops += prefill_matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
+            total_flops += prefill_projection_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4,
                 gpr_M_reg=self.gpr_seq_len)
@@ -929,20 +935,20 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
 
-        def decoder_matmat_mul_core(K: int, N: int, force_stream: bool = False, **kwargs) -> int:
-            """Decode matmul dispatch — the llama mirror of gemma3's ``decoder_matmat_mul_core``.
+        def decoder_projection_core(K: int, N: int, force_stream: bool = False, **kwargs) -> int:
+            """Select the streaming or compatibility decoder projection kernel.
 
             Both paths read the SAME IF4 weight; they differ in how the dot is computed:
 
-            - default (``--matmatmul`` off) -> :meth:`quantized_matmat_core`: 1-pass streaming
+            - default (``--decoder-matmatmul`` off) -> :meth:`quantized_matmat_core`: 1-pass streaming
               quantized dot (inline fp4->bf19 unpack straight through the DOT_PRODUCT unit).
-            - ``--matmatmul`` -> :meth:`matmat_mul_core` with ``is_B_quantized=True``:
+            - ``--decoder-matmatmul`` -> :meth:`matmat_mul_core` with ``is_B_quantized=True``:
               DEQUANTIZES B to bf16 in URAM, then a bf16 dot — two passes over the weight
               bytes, so ~2x the DRAM traffic (and ~2x slower) for higher-precision accumulate.
 
             ``force_stream`` pins an individual call to the streaming path regardless of the flag.
             """
-            if not self.matmatmul or force_stream:
+            if not self.decoder_matmatmul or force_stream:
                 kwargs.pop("is_B_quantized", None)
                 return self.quantized_matmat_core(M=1, K=K, N=N, **kwargs)
             m_reg = self.alloc_isa_reg()
@@ -960,13 +966,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
                 if profile:
                     _checkpoint(f"L{layer_idx}_pre_norm")
-                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.head_dim * self.group_size,
+                total_flops += decoder_projection_core(K=self.vector_length, N=self.head_dim * self.group_size,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
-                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.head_dim,
+                total_flops += decoder_projection_core(K=self.vector_length, N=self.head_dim,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
-                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.head_dim,
+                total_flops += decoder_projection_core(K=self.vector_length, N=self.head_dim,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
                 if profile:
@@ -1084,7 +1090,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     total_flops += attn_result or 0
                 if profile:
                     _checkpoint(f"L{layer_idx}_attention")
-                total_flops += decoder_matmat_mul_core(K=self.head_dim * self.group_size, N=self.vector_length,
+                total_flops += decoder_projection_core(K=self.head_dim * self.group_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
 
@@ -1102,10 +1108,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 if profile:
                     _checkpoint(f"L{layer_idx}_pre_ffn_norm")
 
-                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.mlp_elements,
+                total_flops += decoder_projection_core(K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True, is_B_quantized=True)
-                total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.mlp_elements,
+                total_flops += decoder_projection_core(K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
 
@@ -1116,7 +1122,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 if profile:
                     _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
 
-                total_flops += decoder_matmat_mul_core(K=self.mlp_elements, N=self.vector_length,
+                total_flops += decoder_projection_core(K=self.mlp_elements, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
 
@@ -1134,10 +1140,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             penalty_kwargs = dict(C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N") \
                 if bool(getattr(self, "fpga_penalty", False)) else {}
             # LM head uses the same dual-kernel dispatch as the layer matmuls (mirrors gemma3):
-            # streaming IF4 by default, dequantize-to-bf16 dot under --matmatmul. Both kernels
+            # streaming IF4 by default, dequantize-to-bf16 dot under
+            # --decoder-matmatmul. Both kernels
             # honor the folded repetition-penalty bias (broadcast_N) and the argmax-only
             # write_back_disable, so the HW argmax still returns the penalized token id.
-            total_flops += decoder_matmat_mul_core(K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            total_flops += decoder_projection_core(K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4, is_B_quantized=True,
                 write_back_disable=True, **penalty_kwargs)
@@ -1157,7 +1164,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         paths_cfg = self._cfg.get("paths", {})
         bin_rel = paths_cfg.get("instruction_bin", "llama3.2_1b_bin/programs.bin")
         meta_rel = paths_cfg.get("instruction_meta", "llama3.2_1b_bin/programs.json")
-        tag = ("_matmatmul" if self.matmatmul else "")
+        tag = ("_decoder_matmatmul" if self.decoder_matmatmul else "")
         tag += ("" if self.stream_prefill else "_twopassprefill")
         tag += ("" if bool(getattr(self, "fpga_penalty", False)) else "_puregreedy")
         if tag:
@@ -1175,7 +1182,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             with open(source_path, "rb") as source_file:
                 digest.update(source_file.read())
         digest.update(
-            f"layers={layer_size};matmatmul={self.matmatmul};stream_prefill={self.stream_prefill};"
+            f"layers={layer_size};decoder_matmatmul={self.decoder_matmatmul};"
+            f"stream_prefill={self.stream_prefill};"
             f"penalty={getattr(self, 'fpga_penalty', False)}".encode())
         return digest.hexdigest()
 
@@ -1207,7 +1215,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self._instruction_bin_path = instruction_bin_path
         self._instruction_meta_path = instruction_meta_path
         compiler_fingerprint = self._instruction_compiler_fingerprint(layer_size)
-        print(f"Decode matmul kernel: {'matmat_mul_core (dequantize->bf16 dot, 2-pass)' if self.matmatmul else 'quantized_matmat_core (streaming IF4, 1-pass)'}")
+        print(f"Decode matmul kernel: {'matmat_mul_core (dequantize->bf16 dot, 2-pass)' if self.decoder_matmatmul else 'quantized_matmat_core (streaming IF4, 1-pass)'}")
+        print(f"Prefill matmul kernel: {'quantized_matmat_core (streaming IF4, measured-fast default)' if self.stream_prefill else 'matmat_mul_core (dequantize->bf16 dot, compatibility A/B)'}")
         if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             try:
                 with open(instruction_meta_path, "r") as meta_file:
@@ -1765,7 +1774,8 @@ def main():
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
-    parser.add_argument('--matmatmul', action='store_true',
+    parser.add_argument('--decoder-matmatmul', '--matmatmul',
+                        dest='decoder_matmatmul', action='store_true',
                         help='Use matmat_mul_core for the decoder quantized matmats (incl. the LM head) '
                              'instead of the default quantized_matmat_core (streaming) path. Same IF4 '
                              'weights either way: matmat_mul_core dequantizes B to bf16 in URAM and does '
@@ -1828,8 +1838,12 @@ def main():
     ue = UnifiedEngine()
     ue.software_reset()
     
-    ue = Llama32_1b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel,
-                                  matmatmul=args.matmatmul, stream_prefill=not args.two_pass_prefill)
+    ue = Llama32_1b_UnifiedEngine(
+        script_dir=script_dir,
+        weights_bin=weights_bin_rel,
+        decoder_matmatmul=args.decoder_matmatmul,
+        stream_prefill=not args.two_pass_prefill,
+    )
     cfg = _load_config(script_dir)
 
     if args.prompt is not None:
