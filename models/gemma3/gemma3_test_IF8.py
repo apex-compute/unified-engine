@@ -3023,7 +3023,7 @@ def main():
     _boot.software_reset()
     _boot.clear_dram()
 
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    axi_width_bits = 512 if args.device == "bittware" else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
     clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)

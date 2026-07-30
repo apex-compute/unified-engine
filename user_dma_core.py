@@ -86,8 +86,8 @@ UE_AXI_DATA_WIDTH_BITS = int(os.environ.get("UE_AXI_DATA_WIDTH_BITS", "256"))
 
 # ---------------------------------------------------------------------------
 # AXI beat width: the ONE number that differs between the two board profiles
-# (256-bit: puzhi/alinx/alveo/kintex7; 512-bit: bittware/rk — see the
-# ``args.device in ("bittware", "rk")`` check in user_hw_test.py's __main__).
+# (256-bit: rk/puzhi/alinx/alveo/kintex7; 512-bit: bittware — see the
+# ``args.device == "bittware"`` check in user_hw_test.py's __main__).
 # The DMA engine requires DRAM-side transfer addresses/lengths to land on
 # beat boundaries, so every alignment/padding rule elsewhere in this file and
 # in user_hw_test.py is a direct consequence of this one doubled granularity:

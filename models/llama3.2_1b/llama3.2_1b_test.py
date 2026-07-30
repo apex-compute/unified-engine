@@ -1899,7 +1899,7 @@ def main():
                 "with --decode-kernel streaming"
             )
         decode_kernel = "matmatmul"
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    axi_width_bits = 512 if args.device == "bittware" else 256
     if axi_width_bits == 512 and (
         prefill_kernel == "matmatmul" or decode_kernel == "matmatmul"
     ):
