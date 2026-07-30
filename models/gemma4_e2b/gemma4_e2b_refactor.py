@@ -2147,6 +2147,49 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             gpr_M_reg=self._vis_mm_gpr(M=N_final)))
         return self.dma_from_accelerator_memory(self.VIS_EMBED_OUT, (N_final, text_h)).cpu()
 
+    def _run_vision_encoder_host(self, image_path: str, prompt: str):
+        """Run the HF vision tower on the host and return the same image soft
+        tokens and prompt metadata consumed by the FPGA LM prefill path."""
+        from PIL import Image
+        from transformers import AutoProcessor
+
+        host_t0 = time.perf_counter()
+        hf_model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
+        processor = AutoProcessor.from_pretrained(model_dir)
+        hf_model.eval()
+
+        image = Image.open(image_path).convert("RGB").resize(
+            VISION_CANONICAL_SIZE, Image.BICUBIC)
+        conversation = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": prompt}]}]
+        text_prompt = processor.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=False)
+        inputs = processor(text=[text_prompt], images=[[image]], return_tensors="pt")
+        pixel_values = inputs["pixel_values"]
+        pixel_position_ids = inputs["image_position_ids"]
+        token_ids = inputs["input_ids"][0].tolist()
+        mm_types = inputs["mm_token_type_ids"][0].tolist()
+
+        forward_t0 = time.perf_counter()
+        with torch.no_grad():
+            out = hf_model.model.get_image_features(
+                pixel_values=pixel_values.to(torch.bfloat16),
+                image_position_ids=pixel_position_ids)
+        forward_s = time.perf_counter() - forward_t0
+        image_features = getattr(out, "pooler_output", out).detach().cpu()
+        if image_features.dim() == 3 and image_features.shape[0] == 1:
+            image_features = image_features.squeeze(0)
+
+        n_image_tokens = sum(t == 1 for t in mm_types)
+        if image_features.shape[0] != n_image_tokens:
+            raise RuntimeError(
+                f"Host vision produced {image_features.shape[0]} embeddings, "
+                f"but the prompt contains {n_image_tokens} image-token positions.")
+        total_s = time.perf_counter() - host_t0
+        print(f"[Vision] host encoder done: {image_features.shape[0]} soft tokens "
+              f"in {total_s:.2f}s (model forward {forward_s:.2f}s).", flush=True)
+        return image_features, token_ids, mm_types
+
     def _run_vision_encoder_fpga(self, image_path: str, prompt: str, profile: bool = False):
         """Full vision encoder on FPGA (separate bin @ 0xa0000000): preprocess →
         patch embed → 16-layer encoder → pooler + projection. Returns
@@ -2160,6 +2203,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         from PIL import Image
         from transformers import AutoProcessor
 
+        fpga_total_t0 = time.perf_counter()
         hf_model, model_dir = _ensure_hf_model(self.script_dir, self._cfg)
         processor = AutoProcessor.from_pretrained(model_dir)
         hf_model.eval()
@@ -2229,19 +2273,25 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # Major-step FPGA-latency breakdown of the encoder (profile mode only).
         if profile and isinstance(enc_result, list):
             self._print_phase_breakdown("VISION ENCODER", enc_result, per_token=False)
-        print(f"[Vision] encoder done: {image_features.shape[0]} soft tokens.", flush=True)
+        fpga_total_s = time.perf_counter() - fpga_total_t0
+        print(f"[Vision] FPGA encoder done: {image_features.shape[0]} soft tokens "
+              f"in {fpga_total_s:.2f}s total.", flush=True)
         return image_features, token_ids, mm_types
 
     def set_prefill_seq_vlm(self, image_path: str, prompt: str | None = None,
-                            profile: bool = False) -> None:
-        """VLM entry: run the vision encoder on FPGA, then stash the prompt token
+                            profile: bool = False, vision_host: bool = False) -> None:
+        """VLM entry: run the vision encoder on FPGA or host, then stash the prompt token
         ids + image soft-token features so run_prefill's merge hooks splice them
         into the prompt embeddings (mm_token_type_ids == 1 → image positions).
         ``profile`` forwards to the encoder's per-phase FPGA-latency breakdown."""
         if prompt is None:
             prompt = "Describe this image in detail."
-        image_features, token_ids, mm_types = self._run_vision_encoder_fpga(
-            image_path, prompt, profile=profile)
+        if vision_host:
+            image_features, token_ids, mm_types = self._run_vision_encoder_host(
+                image_path, prompt)
+        else:
+            image_features, token_ids, mm_types = self._run_vision_encoder_fpga(
+                image_path, prompt, profile=profile)
         self.prefill_seq = tuple(token_ids)
         self._image_features = image_features   # [N_soft, VIS_TEXT_H]
         self._mm_types = mm_types
@@ -3945,6 +3995,9 @@ default prompt: "x+3=5, what is x?"
                         help="VLM mode: run the vision encoder on the FPGA and merge image "
                              f"soft-tokens into the prompt. Bare --image uses the default "
                              f"({os.path.basename(DEFAULT_IMAGE)}); omit it for LM-only mode.")
+    parser.add_argument("--vision-host", action="store_true",
+                        help="With --image, generate image soft-token embeddings on the host "
+                             "with the HF vision tower; FPGA prefill/decode are unchanged.")
     parser.add_argument("--local-weights", action="store_true",
                         help="Use gemma4_e2b_bin/params.bin instead of the configured weights bin.")
     parser.add_argument('--dev', type=str, default='xdma0',
@@ -3956,6 +4009,8 @@ default prompt: "x+3=5, what is x?"
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
     args = parser.parse_args()
+    if args.vision_host and not args.image:
+        parser.error("--vision-host requires --image")
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
@@ -3986,8 +4041,11 @@ default prompt: "x+3=5, what is x?"
         if not os.path.isfile(args.image):
             raise SystemExit(f"--image: file not found: {args.image!r} "
                              f"(also tried {os.path.dirname(DEFAULT_IMAGE)}/)")
-        print(f"[Mode] VLM -- image: {args.image!r} prompt: {args.prompt!r}")
-        ue.set_prefill_seq_vlm(args.image, args.prompt, profile=args.profile)
+        _vision_device = "host" if args.vision_host else "FPGA"
+        print(f"[Mode] VLM ({_vision_device} vision) -- image: {args.image!r} "
+              f"prompt: {args.prompt!r}")
+        ue.set_prefill_seq_vlm(
+            args.image, args.prompt, profile=args.profile, vision_host=args.vision_host)
     elif args.prompt:
         print(f"[Mode] LM -- prompt: {args.prompt!r}")
         ue.set_prefill_seq(args.prompt)
@@ -4026,4 +4084,3 @@ default prompt: "x+3=5, what is x?"
 
 if __name__ == "__main__":
     main()
-
