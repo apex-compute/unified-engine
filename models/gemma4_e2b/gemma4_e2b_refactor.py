@@ -79,6 +79,7 @@ VISION_QUANT_PRECISION = "if4"
 # lets the vision encoder bin be compiled once for a fixed shape.
 VISION_CANONICAL_SIZE = (896, 896)   # (width, height) for PIL.Image.resize
 VISION_FIXED_NUM_PATCHES = 2520
+LM_PROGRAM_CACHE_VERSION = 2
 
 # Shipped sample image for VLM mode (same as gemma4_e2b_test.py's DEFAULT_IMAGE):
 # repo test_samples/yosemite.jpg, two folders up from this script.
@@ -658,7 +659,19 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
     VIS_LAYERS = 16      # num_hidden_layers
     VIS_ROPE_DIM = 32    # half of head_dim for 2D RoPE (64 / 2)
 
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False):
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False,
+                 prefill_kernel: str = "streaming", decode_kernel: str = "streaming"):
+        if prefill_kernel not in ("streaming", "matmatmul"):
+            raise ValueError(f"unsupported prefill kernel: {prefill_kernel}")
+        if decode_kernel not in ("streaming", "matmatmul"):
+            raise ValueError(f"unsupported decode kernel: {decode_kernel}")
+        if os.environ.get("GEMMA4_PENALTY", "0") == "1":
+            raise RuntimeError(
+                "GEMMA4_PENALTY=1 is temporarily unsupported: the dynamic streaming "
+                "quantized_matmat_core must gain broadcast-bias support before the "
+                "on-FPGA penalty can be re-enabled.")
+        self.prefill_kernel = prefill_kernel
+        self.decode_kernel = decode_kernel
         engine_base = user_dma_core.UE_0_BASE_ADDR
         # Gemma4 FIXED DRAM layout (FULL 4 GB; see notes/notes_gemma4_e2b_vision.md
         # "Master layout table"). All addresses below 0x100000000 (DMA-mapped DRAM
@@ -1156,13 +1169,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.LAYER0_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.OUTPUT_NORM_DRAM = self.allocate_tensor_dram(1 * self.vector_length * self.bytes_per_element)
         self.LOGITS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
-        # On-FPGA repetition-penalty bias: the LM-head matmul's C term
-        # (bias_mode="broadcast_N"). Allocated immediately after LOGITS_DRAM (and at
-        # the SAME point in gemma4_e2b_run_from_bin.py) so its baked address matches.
-        # All-zero == no penalty (pure greedy); _write_penalty_bias() fills it only
-        # when GEMMA4_PENALTY=1. The HW argmax of (logits + bias) then returns the
-        # penalized token with NO logit readback — identical mechanism to
-        # llama3.2_1b (notes_repetition_penalty_fpga_bias.md).
+        # Reserved for a future streaming LM-head penalty implementation.
+        # GEMMA4_PENALTY is temporarily rejected.
         self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
 
         # Per-layer input injection buffers
@@ -2651,6 +2659,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_halt()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
+        def _projection_core(**kwargs) -> int:
+            # The streaming core cannot hold a 64-column strip's scales when
+            # K=12,288. Gemma4's wide MLP-down projection therefore retains the
+            # two-pass compatibility core even in streaming mode.
+            if (self.prefill_kernel == "matmatmul"
+                    or kwargs["K"] == self.mlp_elements_wide):
+                return self.matmat_mul_core(**kwargs)
+            kwargs.pop("is_B_quantized", None)
+            return self.quantized_matmat_core(**kwargs)
         prefill_t0 = time.perf_counter()
         for layer_idx in range(layer_size):
             if layer_idx > 0 and layer_idx % 10 == 0:
@@ -2670,7 +2687,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                 OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                                                 gpr_M_reg=self.gpr_seq_len)
             # Q projection: N = cur_q_size (actual per-layer Q output dim)
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=cur_q_size,
+            total_flops += _projection_core(M=seq_len, K=self.vector_length, N=cur_q_size,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
@@ -2684,7 +2701,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 # Shared layers skip entirely — their attention reads K/V directly
                 # from the reference layer's slot via _kv_slot_for_layer.
                 # K projection: N = cur_k_size (actual per-layer K output dim)
-                total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=cur_k_size,
+                total_flops += _projection_core(M=seq_len, K=self.vector_length, N=cur_k_size,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
@@ -2694,7 +2711,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     gpr_M_reg=self.gpr_seq_len,
                     )
                 # V projection: write to temp buffer first, then scatter to KV cache at k_size stride
-                total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=cur_k_size,
+                total_flops += _projection_core(M=seq_len, K=self.vector_length, N=cur_k_size,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,  # temp buffer
@@ -2816,7 +2833,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             )
             _checkpoint(f"L{layer_idx}_attention")
             # O projection: INT4, K=cur_q_size
-            total_flops += self.matmat_mul_core(M=seq_len, K=cur_q_size, N=self.vector_length,
+            total_flops += _projection_core(M=seq_len, K=cur_q_size, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
@@ -2838,7 +2855,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                             OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                                             gpr_M_reg=self.gpr_seq_len)
             # MLP gate (fused GELU) + up projections.
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=cur_mlp,
+            total_flops += _projection_core(M=seq_len, K=self.vector_length, N=cur_mlp,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
@@ -2848,7 +2865,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 gelu_enable=True,
                 gpr_M_reg=self.gpr_seq_len,
                 )
-            total_flops += self.matmat_mul_core(M=seq_len, K=self.vector_length, N=cur_mlp,
+            total_flops += _projection_core(M=seq_len, K=self.vector_length, N=cur_mlp,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
@@ -2863,7 +2880,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 dram_out=self.LAYER0_MLP_MULT_DRAM,
                 mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=self.gpr_seq_len)
             # MLP down projection.
-            total_flops += self.matmat_mul_core(M=seq_len, K=cur_mlp, N=self.vector_length,
+            total_flops += _projection_core(M=seq_len, K=cur_mlp, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
                 B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
                 OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
@@ -3176,6 +3193,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_halt()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
+        def _projection_core(**kwargs) -> int:
+            # Same K=12,288 scale-BRAM limit as prefill: only the wide
+            # MLP-down projection falls back to the two-pass core.
+            if (self.decode_kernel == "matmatmul"
+                    or kwargs["K"] == self.mlp_elements_wide):
+                kwargs.setdefault("is_B_quantized", True)
+                return self.matmat_mul_core(**kwargs)
+            kwargs.pop("is_B_quantized", None)
+            return self.quantized_matmat_core(**kwargs)
         # gpr_one holds the constant 1 — used as gpr_M_reg for all M=1 ops.
         gpr_one = self.alloc_isa_reg()
         self.generate_instruction_add_set(gpr_one, 1)
@@ -3203,7 +3229,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                               gpr_M_reg=gpr_one)
                 # Q/K/V projections: use per-layer dims
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_q_size,
+                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_q_size,
                                                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                                                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
                                                     OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
@@ -3216,7 +3242,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 else:
                     kv_layer_for_attn = layer_idx  # read from own KV cache
                     # K projection
-                    total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_k_size,
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
                         A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                         B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
                         OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
@@ -3224,7 +3250,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                         SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
                         )
                     # V projection
-                    total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_k_size,
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
                         A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                         B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
                         OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
@@ -3349,7 +3375,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 _checkpoint(f"L{layer_idx}_attention")
 
                 # O projection: INT4, K=cur_q_size (actual per-layer attention output dim)
-                total_flops += self.quantized_matmat_core(M=1, K=cur_q_size, N=self.vector_length,
+                total_flops += _projection_core(M=1, K=cur_q_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
@@ -3375,7 +3401,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                               gpr_M_reg=gpr_one)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_mlp,
+                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
@@ -3383,7 +3409,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
                     gelu_enable=True,
                     )
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_mlp,
+                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
@@ -3396,7 +3422,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=cur_mlp)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=cur_mlp)
 
-                total_flops += self.matmat_mul_core(M=1, K=cur_mlp, N=self.vector_length,
+                total_flops += _projection_core(M=1, K=cur_mlp, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
@@ -3425,20 +3451,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                     OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA,
                     gpr_M_reg=gpr_one)
-                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                total_flops += _projection_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                     A_DRAM_ADDR=self.OUTPUT_NORM_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
                     OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                     is_B_quantized=True,
                     data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
-                    # On-FPGA repetition penalty (llama3.2-style): add the per-vocab
-                    # bias as the matmul C term so the HW argmax already returns the
-                    # penalized token. PENALTY_BIAS_DRAM is all-zero unless
-                    # GEMMA4_PENALTY=1, so greedy decode is bit-identical.
-                    C_DRAM_ADDR=self.PENALTY_BIAS_DRAM,
-                    bias_mode="broadcast_N",
-                    gpr_M_reg=gpr_one,
                     )
                 _checkpoint("lm_head")
 
@@ -3511,30 +3530,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         prog_addr = decoder_base_addr
         flops_per_token_scalar = flops_per_token[0] if flops_per_token else None
 
-        # On-FPGA repetition penalty (llama3.2_1b mechanism), DEFAULT OFF. Gemma4
-        # decodes greedily by default — the HW argmax of the LM-head logits (no
-        # readback). When GEMMA4_PENALTY=1, each decode step refreshes a per-vocab
-        # additive bias (PENALTY_BIAS_DRAM, the LM-head matmul C term) so the HW
-        # argmax of (logits + bias) returns the penalized token. Bias all-zero
-        # (penalty off) makes greedy decode bit-identical. Same on-FPGA penalty as
-        # llama3.2_1b / qwen2.5-vl / qwen3 (kept as an opt-in loop-breaker backup).
-        _pen_off        = os.environ.get("GEMMA4_PENALTY", "0") != "1"
-        self.pen_alpha  = float(os.environ.get("GEMMA4_PEN_ALPHA", "1.0"))
-        self.pen_cap    = float(os.environ.get("GEMMA4_PEN_CAP", "20.0"))
-        self.rep_window = int(os.environ.get("GEMMA4_REP_WINDOW", "256"))
-        _greedy_until   = int(os.environ.get("GEMMA4_GREEDY_UNTIL", "0"))
-        self.pen_loop_recent = int(os.environ.get("GEMMA4_PEN_LOOP_RECENT", "24"))  # anti-loop window (0=off)
-        self.pen_loop_thr    = int(os.environ.get("GEMMA4_PEN_LOOP_THR", "8"))       # ban tok at >= thr of last RECENT
-        _gen_tokens: list[int] = []
-        _n_generated = 0
-        self.dma_to_accelerator_memory(
-            self.PENALTY_BIAS_DRAM,
-            torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
-        if not _pen_off:
-            print(f"[decode] on-FPGA repetition penalty ON "
-                  f"(alpha={self.pen_alpha} cap={self.pen_cap} window={self.rep_window} "
-                  f"greedy_until={_greedy_until} loop={self.pen_loop_recent}/{self.pen_loop_thr}); "
-                  f"unset GEMMA4_PENALTY for pure greedy")
+        # Pure greedy decode. GEMMA4_PENALTY=1 is rejected in __init__ until
+        # dynamic streaming quantized_matmat_core supports broadcast bias.
 
         # Prime gpr_seq_len to the current decode_pos (= prompt length, since
         # self.seq_len reflects the prompt at this point). Subsequent steps
@@ -3604,12 +3601,6 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 sliding_bias_row[:, window_start:self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias_row)
 
-            # On-FPGA penalty: refresh THIS step's per-vocab bias (the LM-head
-            # matmul's C term) once past the greedy gate, so the HW argmax of
-            # (logits + bias) returns the penalized token. No logit readback.
-            if not _pen_off and _n_generated >= _greedy_until:
-                self._write_penalty_bias(_gen_tokens)
-
             # Dynamic-PBI dispatch: re-set the attention length (K context grows
             # each step, may cross a 64-align boundary), then jump into the
             # cached decoder program. gpr_seq_len was primed once above and is
@@ -3619,11 +3610,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 prog_addr, timeout=300.0, flops=flops_per_token_scalar)
             total_latency += latency
             total_flop_rate += flop_rate_program
-            # HW argmax of (logits + penalty bias): greedy when the bias is zero;
-            # penalized token when GEMMA4_PENALTY=1 (bias added in the LM-head).
+            # HW argmax of the streaming LM-head logits.
             token_id = self.get_arg_max_index()
-            _gen_tokens.append(int(token_id))
-            _n_generated += 1
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
 
@@ -3747,14 +3735,23 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _lm_meta, _ = self._get_program_section("lm", profile)
         if _lm_meta is not None:
             _cached_base = int(_lm_meta["dram_base"], 16)
-            if _cached_base == self._program_dram_base:
+            _cached_prefill_kernel = _lm_meta.get("prefill_kernel")
+            _cached_decode_kernel = _lm_meta.get("decode_kernel")
+            _cached_version = _lm_meta.get("kernel_cache_version")
+            if (_cached_base == self._program_dram_base
+                    and _cached_prefill_kernel == self.prefill_kernel
+                    and _cached_decode_kernel == self.decode_kernel
+                    and _cached_version == LM_PROGRAM_CACHE_VERSION):
                 print("[compile] reusing cached LM section "
-                      "(seq_len-agnostic; delete programs.bin to force recompile).")
+                      f"(prefill={self.prefill_kernel}, decode={self.decode_kernel}; "
+                      "seq_len-agnostic).")
                 return
-            print(f"[compile] cached LM section baked at 0x{_cached_base:X} != current "
-                  f"base 0x{self._program_dram_base:X} — rebuilding.")
+            print("[compile] cached LM section does not match requested configuration "
+                  f"(base=0x{_cached_base:X}, prefill={_cached_prefill_kernel}, "
+                  f"decode={_cached_decode_kernel}, version={_cached_version}) — rebuilding.")
 
-        print(f"[compile] building combined [prefill@{prefill_seq_len}][decoder] image...")
+        print(f"[compile] building combined [prefill@{prefill_seq_len}, "
+              f"kernel={self.prefill_kernel}][decoder, kernel={self.decode_kernel}] image...")
         global _SILENT_MODE
         _SILENT_MODE = True
         _orig_builtin_print = builtins.print
@@ -3803,6 +3800,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             "decoder_program_size": decoder_size_bytes,
             "decoder_total_flops": decoder_total_flops[0],
             "layer_size": layer_size,
+            "prefill_kernel": self.prefill_kernel,
+            "decode_kernel": self.decode_kernel,
+            "kernel_cache_version": LM_PROGRAM_CACHE_VERSION,
         }
         if profile:
             lm_meta["prefill_profile_checkpoints"] = self._prefill_checkpoints
@@ -3998,6 +3998,13 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument("--vision-host", action="store_true",
                         help="With --image, generate image soft-token embeddings on the host "
                              "with the HF vision tower; FPGA prefill/decode are unchanged.")
+    parser.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
+                        default="streaming",
+                        help="Quantized projection kernel for LM prefill (default: streaming).")
+    parser.add_argument("--decode-kernel", choices=("streaming", "matmatmul"),
+                        default="streaming",
+                        help="Quantized projection kernel for LM decode, including LM head "
+                             "(default: streaming).")
     parser.add_argument("--local-weights", action="store_true",
                         help="Use gemma4_e2b_bin/params.bin instead of the configured weights bin.")
     parser.add_argument('--dev', type=str, default='xdma0',
@@ -4011,6 +4018,10 @@ default prompt: "x+3=5, what is x?"
     args = parser.parse_args()
     if args.vision_host and not args.image:
         parser.error("--vision-host requires --image")
+    if os.environ.get("GEMMA4_PENALTY", "0") == "1":
+        parser.error(
+            "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
+            "quantized_matmat_core needs broadcast-bias support first")
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
@@ -4024,7 +4035,11 @@ default prompt: "x+3=5, what is x?"
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
-    ue = Gemma4_UnifiedEngine(local_weights=args.local_weights)
+    print(f"LM kernels: prefill={args.prefill_kernel}, decode={args.decode_kernel}")
+    ue = Gemma4_UnifiedEngine(
+        local_weights=args.local_weights,
+        prefill_kernel=args.prefill_kernel,
+        decode_kernel=args.decode_kernel)
 
     # Prompt first — the prefill program is compiled for its exact length.
     # VLM mode (--image): run the vision encoder on the FPGA now (separate bin
