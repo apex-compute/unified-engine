@@ -3600,9 +3600,10 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
     """RNG-matched legacy/dynamic quantized matmat-mul (1-pass streaming quantized dot core).
 
     Each shape runs the legacy path (compile-time M/K/N, literal DRAM addresses) paired with the
-    dynamic path (runtime M/K/N GPRs + GPR-sourced A/B/out/scale bases) on RNG-matched data,
+    dynamic path (runtime M/K/N GPRs + GPR-sourced A/B/out/scale/bias bases) on RNG-matched data,
     mirroring :func:`matmat_mul_quantized_weights_unified_test`. The dynamic ``quantized_matmat_core``
-    does not support bias, so bias-enabled shapes run legacy-only.
+    now supports bias (broadcast_N / full_matrix) and the sub-64 large-K column-strip fallback, so
+    bias-enabled and large-K shapes run the matched legacy/dynamic pair too.
     """
     def _run_case(dynamic=False, dynamic_addr=False):
         ue = UnifiedEngine()
@@ -3624,7 +3625,7 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
         print(f"Quantized Matrix-Matrix Multiply Test for M={M}, K={K}, N={N}, bias_enable={bias_enable}, bias_mode={bias_mode}, gelu_enable={gelu_enable}, silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, clamp_enable={clamp_enable}, log_enable={log_enable}")
 
         m_reg = k_reg = n_reg = None
-        a_reg = b_reg = out_reg = scale_reg = None
+        a_reg = b_reg = out_reg = scale_reg = c_reg = None
         if dynamic:
             m_reg = ue.alloc_isa_reg()
             k_reg = ue.alloc_isa_reg()
@@ -3634,6 +3635,8 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
             b_reg = ue.alloc_isa_reg()
             out_reg = ue.alloc_isa_reg()
             scale_reg = ue.alloc_isa_reg()
+            if bias_enable:
+                c_reg = ue.alloc_isa_reg()
 
         ue.start_capture()
         if dynamic:
@@ -3645,6 +3648,8 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
             ue.generate_instruction_add_set(b_reg, QUANTIZED_MATRIX_DRAM_ADDR >> 3)
             ue.generate_instruction_add_set(out_reg, OUTPUT_DRAM_ADDR >> 3)
             ue.generate_instruction_add_set(scale_reg, SCALE_DRAM_ADDR >> 3)
+            if bias_enable:
+                ue.generate_instruction_add_set(c_reg, C_DRAM_ADDR >> 3)
 
         total_flops_from_dequantize = ue.quantized_matmat_core(M=M, K=K, N=N,
                                                         A_DRAM_ADDR=A_DRAM_ADDR,
@@ -3665,10 +3670,13 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
                                                         gpr_a_addr=a_reg,
                                                         gpr_b_addr=b_reg,
                                                         gpr_out_addr=out_reg,
-                                                        gpr_scale_addr=scale_reg)
+                                                        gpr_scale_addr=scale_reg,
+                                                        gpr_c_addr=c_reg)
 
         ue.stop_capture()
         if dynamic_addr:
+            if bias_enable:
+                ue.release_isa_reg()  # c_reg (allocated last)
             ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
         if dynamic:
             ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()
@@ -3746,14 +3754,12 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
         ue.clear_capture_buffer()
         ue.reset_tensor_dram_addr()
 
-    if bias_enable:
-        # Dynamic quantized_matmat_core has no bias support — legacy-only.
-        _run_case()
-    else:
-        _run_rng_matched_pair(
-            lambda: _run_case(),
-            lambda: _run_case(dynamic=True, dynamic_addr=True),
-        )
+    # Dynamic quantized_matmat_core now supports bias + large-K, so every shape runs the matched
+    # legacy/dynamic (GPR-sourced-base) pair on RNG-matched data.
+    _run_rng_matched_pair(
+        lambda: _run_case(),
+        lambda: _run_case(dynamic=True, dynamic_addr=True),
+    )
 
 def matmat_mul_non_aligned_writeback_test():
     """
@@ -5661,7 +5667,7 @@ if __name__ == "__main__":
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--device', type=str, default='kintex7',
-                        help='FPGA type')
+                        help='FPGA profile (for example: rk, rk_256, kintex7, bittware).')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
                         help='AXI-Lite register base address (default: device-specific).')
     parser.add_argument(
@@ -5707,7 +5713,7 @@ if __name__ == "__main__":
         clock = 1000 / (1066 / 5.375)
     elif args.device == "kintex7_systolic":
         clock = 1000 / 149.61403
-    elif args.device == "rk" or args.device == "puzhi":
+    elif args.device in ("rk", "rk_256", "puzhi"):
         clock = 3
     elif args.device in ("bittware", "bittware_256"):
         clock = 3.3333
@@ -5825,6 +5831,14 @@ if __name__ == "__main__":
     matmat_mul_unified_test(runtime_list=[(128, 256, 2048)], softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
     matmat_mul_unified_test(runtime_list=[(512, 1024, 1024)], softmax_enable=True, input_scale=12.0, snr_threshold_db=22.0)
 
+    # Every shape now runs the legacy/dynamic + dynamic-addr matched pair (the dynamic
+    # quantized_matmat_core supports bias and the sub-64 large-K fallback), so the biased shapes
+    # above already exercise the dynamic bias path.
+    #
+    # Large-K sub-64 column-strip fallback (K>8192): a 64-wide strip's scales overflow the scale
+    # BRAM, so strip_w falls back to 32 (K<=16384) or 16 (K<=32768). M==1 (production decode path)
+    # with and without bias; higher accumulation depth lowers the SNR floor.
+    
     quantized_matmat_mul_unified_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
     quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
     quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  silu_enable=True)
@@ -5832,8 +5846,6 @@ if __name__ == "__main__":
     quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  clamp_enable=True)
     quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True, snr_threshold_db=37) # log activation in the quantized path is degraded.
 
-    # No-bias shapes get a real legacy/dynamic + dynamic-addr matched pair (the dynamic
-    # quantized_matmat_core is a 1-pass, bias-free path); the biased shapes above run legacy-only.
     quantized_matmat_mul_unified_test(M=1, K=512, N=512, data_type=TYPE.IF4, int_variant=True)
     quantized_matmat_mul_unified_test(M=1, K=1280, N=1408, data_type=TYPE.IF4, int_variant=True, silu_enable=True)
     quantized_matmat_mul_unified_test(M=1, K=512, N=512, data_type=TYPE.IF8, int_variant=True, gelu_enable=True)
@@ -5999,6 +6011,13 @@ if __name__ == "__main__":
         for head_dim in [64, 256, 512]:
             for seq_len in [64, 256, 512]:
                 unified_attention_test(batch=4, aligned_seq_len=seq_len, head_dim=head_dim)
+
+        # Large-K sub-64 column-strip fallback (K>8192 -> strip_w 32/16) across M>1 (the EXPERIMENTAL
+        # general path) and both bias modes. Deeper accumulation lowers the SNR floor.
+        quantized_matmat_mul_unified_test(M=1, K=8256,  N=512, data_type=TYPE.IF4, int_variant=True)
+        quantized_matmat_mul_unified_test(M=256, K=8192, N=512, data_type=TYPE.IF4, int_variant=True)
+        quantized_matmat_mul_unified_test(M=1, K=8256,  N=512, bias_enable=True, bias_mode="broadcast_N")
+        quantized_matmat_mul_unified_test(M=256, K=8192,  N=512, bias_enable=True, bias_mode="full_matrix")
 
     _RNG_STATE_END = _rng_state_fingerprint()
 

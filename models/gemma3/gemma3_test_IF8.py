@@ -2760,7 +2760,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
     if device == "kintex7":                       return 1000 / (1066 / 5.375)
-    if device in ("rk", "puzhi"):                 return 3.0
+    if device in ("rk", "rk_256", "puzhi"):       return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
     if device == "alveo":                          return 4.0
     if device == "efinix":                         return 4.0
@@ -2997,7 +2997,7 @@ def main():
         '--cycle',
         type=float,
         default=None,
-        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=5.0422ns, bittware=3.3333ns, rk/puzhi=3.0ns, alveo=4.0ns).',
+        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=5.0422ns, bittware=3.3333ns, rk/rk_256/puzhi=3.0ns, alveo=4.0ns).',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
