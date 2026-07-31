@@ -79,7 +79,7 @@ VISION_QUANT_PRECISION = "if4"
 # lets the vision encoder bin be compiled once for a fixed shape.
 VISION_CANONICAL_SIZE = (896, 896)   # (width, height) for PIL.Image.resize
 VISION_FIXED_NUM_PATCHES = 2520
-LM_PROGRAM_CACHE_VERSION = 2
+LM_PROGRAM_CACHE_VERSION = 8
 
 # Shipped sample image for VLM mode (same as gemma4_e2b_test.py's DEFAULT_IMAGE):
 # repo test_samples/yosemite.jpg, two folders up from this script.
@@ -3194,12 +3194,17 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
         def _projection_core(**kwargs) -> int:
-            # Same K=12,288 scale-BRAM limit as prefill: only the wide
-            # MLP-down projection falls back to the two-pass core.
-            if (self.decode_kernel == "matmatmul"
-                    or kwargs["K"] == self.mlp_elements_wide):
+            if self.decode_kernel == "matmatmul":
                 kwargs.setdefault("is_B_quantized", True)
                 return self.matmat_mul_core(**kwargs)
+            if kwargs["K"] == self.mlp_elements_wide:
+                # K=12,288 wide MLP-down uses the legacy streaming core's
+                # verified N=32 partial-width scale-BRAM tiling. Drop the
+                # dimension GPR so quantized_matmat_core dispatches legacy;
+                # the dynamic core still supports only K <= 8,192.
+                kwargs.pop("gpr_M_reg", None)
+                kwargs.pop("gpr_K_reg", None)
+                kwargs.pop("gpr_N_reg", None)
             kwargs.pop("is_B_quantized", None)
             return self.quantized_matmat_core(**kwargs)
         # gpr_one holds the constant 1 — used as gpr_M_reg for all M=1 ops.
@@ -3429,7 +3434,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     is_B_quantized=True,
                     data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
-                        gpr_M_reg=gpr_one,
+                    gpr_M_reg=gpr_one,
                     )
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off,

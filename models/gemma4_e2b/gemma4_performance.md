@@ -18,20 +18,20 @@ python models/gemma4_e2b/gemma4_e2b_refactor.py --image --vision-host \
 The VLM prompt contains 273 tokens: 256 image soft tokens and 17 text/special
 tokens. Prefill executes 272 tokens.
 
-| Measurement | Baseline | Matmatmul prefill + streaming decode | Streaming prefill + streaming decode |
-|---|---:|---:|---:|
-| Host vision, complete path | 6.90 s | 6.94 s | 6.89 s |
-| Host vision, model forward | 4.38 s | 4.37 s | 4.38 s |
-| LM profile compile | 0.60 s | 0.61 s | 0.60 s |
-| Prefill host preparation | 0.08 s | — | — |
-| Prefill FPGA execution | 51.948 s | 51.947 s | 51.332 s |
-| Prefill wall time | 52.11 s | 52.11 s | 51.49 s |
-| Prefill throughput | 5.22 tok/s | 5.22 tok/s | 5.28 tok/s |
-| Prefill FPGA throughput | 23.46 GFLOPS | 23.46 GFLOPS | 23.75 GFLOPS |
-| Decode first-token wall speed | 2.84 tok/s | 3.27 tok/s | 3.27 tok/s |
-| Decode first-token FPGA speed | 2.95 tok/s | — | — |
-| Decode average wall speed | 2.59 tok/s | 2.96 tok/s | 2.93 tok/s |
-| Decode average FPGA throughput | 13.29 GFLOPS | 15.32 GFLOPS | 15.13 GFLOPS |
+| Measurement | Baseline | Matmatmul prefill + streaming decode | Streaming prefill + streaming decode | Streaming MLP down |
+|---|---:|---:|---:|---:|
+| Host vision, complete path | 6.90 s | 6.94 s | 6.89 s | 6.89 s |
+| Host vision, model forward | 4.38 s | 4.37 s | 4.38 s | 4.38 s |
+| LM profile compile | 0.60 s | 0.61 s | 0.60 s | 0.60 s |
+| Prefill host preparation | 0.08 s | — | — | — |
+| Prefill FPGA execution | 51.948 s | 51.947 s | 51.332 s | 51.332 s |
+| Prefill wall time | 52.11 s | 52.11 s | 51.49 s | 51.49 s |
+| Prefill throughput | 5.22 tok/s | 5.22 tok/s | 5.28 tok/s | 5.28 tok/s |
+| Prefill FPGA throughput | 23.46 GFLOPS | 23.46 GFLOPS | 23.75 GFLOPS | 23.75 GFLOPS |
+| Decode first-token wall speed | 2.84 tok/s | 3.27 tok/s | 3.27 tok/s | 3.67 tok/s |
+| Decode first-token FPGA speed | 2.95 tok/s | — | — | — |
+| Decode average wall speed | 2.59 tok/s | 2.96 tok/s | 2.93 tok/s | 3.29 tok/s |
+| Decode average FPGA throughput | 13.29 GFLOPS | 15.32 GFLOPS | 15.13 GFLOPS | 17.10 GFLOPS |
 
 Baseline kernel setup:
 
@@ -46,6 +46,9 @@ for wide MLP-down operations with `K=12,288`, which retain the two-pass core.
 The **Streaming prefill + streaming decode** run additionally converts all
 supported prefill projections to the one-pass streaming core while retaining
 the same `K=12,288` wide MLP-down fallback in both phases.
+
+The **Streaming MLP down** run moves the decoder's wide `K=12,288` MLP-down
+projection from the two-pass core to the streaming core.
 
 Profiled FPGA phase breakdown:
 
