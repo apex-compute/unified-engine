@@ -79,7 +79,7 @@ VISION_QUANT_PRECISION = "if4"
 # lets the vision encoder bin be compiled once for a fixed shape.
 VISION_CANONICAL_SIZE = (896, 896)   # (width, height) for PIL.Image.resize
 VISION_FIXED_NUM_PATCHES = 2520
-LM_PROGRAM_CACHE_VERSION = 8
+LM_PROGRAM_CACHE_VERSION = 10
 
 # Shipped sample image for VLM mode (same as gemma4_e2b_test.py's DEFAULT_IMAGE):
 # repo test_samples/yosemite.jpg, two folders up from this script.
@@ -1085,8 +1085,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         print("Tokenizer loaded.")
 
     def tensor_init(self) -> None:
-        """Initialize hardware DRAM for gemma4 E2B model (layer-wise overlap except for kv cache).
-        KV cache uses max head_dim (512) for uniform sizing."""
+        """Initialize hardware DRAM for Gemma4 E2B model.
+
+        Unique KV slots are packed using their owning layer's actual head
+        dimension. Sliding-attention rows therefore use 256 elements and
+        global-attention rows use 512 elements, matching unified attention's
+        contiguous K/V layout directly.
+        """
         seq_len = self.MAX_CONTEXT_SIZE
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
@@ -1104,18 +1109,36 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # consume cache space (saves ~40 MB at MAX_CONTEXT_SIZE=1024).
         non_shared_layers = [l for l in range(self.LAYER_SIZE) if l not in self._kv_shared_map]
         self._kv_slot_for_layer = {}
+        self._kv_offset_for_layer = {}
+        self._kv_row_bytes_for_layer = {}
+        _kv_offset = 0
         for slot, l in enumerate(non_shared_layers):
             self._kv_slot_for_layer[l] = slot
+            _head_dim, _, _ = self._get_layer_attention_dims(l)
+            _row_bytes = _head_dim * self.bytes_per_element
+            self._kv_offset_for_layer[l] = _kv_offset
+            self._kv_row_bytes_for_layer[l] = _row_bytes
+            _kv_offset += self.MAX_CONTEXT_SIZE * _row_bytes
         for shared_l, ref_l in self._kv_shared_map.items():
             self._kv_slot_for_layer[shared_l] = self._kv_slot_for_layer[ref_l]
+            self._kv_offset_for_layer[shared_l] = self._kv_offset_for_layer[ref_l]
+            self._kv_row_bytes_for_layer[shared_l] = self._kv_row_bytes_for_layer[ref_l]
+            _shared_dim, _, _ = self._get_layer_attention_dims(shared_l)
+            if _shared_dim * self.bytes_per_element != self._kv_row_bytes_for_layer[ref_l]:
+                raise ValueError(
+                    f"KV-shared layer {shared_l} head_dim={_shared_dim} does not match "
+                    f"reference layer {ref_l} row size")
         self._num_kv_slots = len(non_shared_layers)
-        _kv_saved = (self.LAYER_SIZE - self._num_kv_slots) * self.MAX_CONTEXT_SIZE * self.k_size * 2  # K+V
-        print(f"KV cache: {self._num_kv_slots} unique slots (of {self.LAYER_SIZE} layers), saved {_kv_saved / (1024*1024):.1f} MB via KV sharing")
-        # Allocate shared memory for k v cache (k rope and v projection) and zero pad for decoder use:
-        # Uses max head_dim (512) = self.k_size for uniform sizing
-        self.LAYER0_V_DRAM = self.allocate_tensor_dram(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size)
-        self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size)
-        zero_pad = torch.zeros(self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size, dtype=torch.bfloat16)
+        self._kv_cache_bytes = _kv_offset
+        _uniform_bytes = self._num_kv_slots * self.MAX_CONTEXT_SIZE * self.k_size
+        _compact_saved = 2 * (_uniform_bytes - self._kv_cache_bytes)
+        print(
+            f"KV cache: {self._num_kv_slots} unique compact slots "
+            f"({self._kv_cache_bytes * 2 / (1024*1024):.1f} MB K+V, "
+            f"saved {_compact_saved / (1024*1024):.1f} MB vs padded slots)")
+        self.LAYER0_V_DRAM = self.allocate_tensor_dram(self._kv_cache_bytes)
+        self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self._kv_cache_bytes)
+        zero_pad = torch.zeros(self._kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_pad)
         # Allocate memory for constant zero tensor, identity matrix, and bias:
@@ -2725,7 +2748,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 # SRAM slot; the per-token read (FLASH_V, cur_k_size stride) and
                 # write (KV cache, k_size stride) addrs are register-computed, so
                 # the body is emitted once and hardware-looped over gpr_seq_len.
-                v_cache_base = self.LAYER0_V_DRAM + self._kv_slot_for_layer[layer_idx] * self.MAX_CONTEXT_SIZE * self.k_size
+                kv_row_bytes = self._kv_row_bytes_for_layer[layer_idx]
+                v_cache_base = self.LAYER0_V_DRAM + self._kv_offset_for_layer[layer_idx]
                 _vi = self.alloc_isa_reg()
                 self.generate_instruction_add_set(_vi, 0)
                 self.loop_start(loop_cnt=seq_len, gpr_loop_cnt=self.gpr_seq_len)
@@ -2733,7 +2757,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(self.LAYER0_FLASH_V_DRAM), self.TMP_REG)
                 self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=0x10000, element_size=cur_k_size, general_reg_src=self.TMP_REG)
                 self.rms_norm_core(0x10000, 0x10000, cur_k_size)  # no gamma
-                self.generate_instruction_reg_mul_imm(self.TMP_REG, _vi, ue_35bit_addr_shifter(self.k_size))
+                self.generate_instruction_reg_mul_imm(self.TMP_REG, _vi, ue_35bit_addr_shifter(kv_row_bytes))
                 self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=0, element_size=cur_k_size, general_reg_src=self.TMP_REG)
                 self.generate_instruction_add_inc(_vi)
@@ -2762,7 +2786,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             rope_bytes = rope_n * bpe
             sin_addr = ROPE_WEIGHT_ADDR + rope_n * bpe
             q_rows = seq_len * self.group_size
-            kv_slot_off = self._kv_slot_for_layer[layer_idx] * self.MAX_CONTEXT_SIZE * self.k_size
+            kv_slot_off = self._kv_offset_for_layer[layer_idx]
             k_cache_base = self.LAYER0_K_ROPE_DRAM + kv_slot_off
             v_cache_base = self.LAYER0_V_DRAM + kv_slot_off
             K_TMP = self.LAYER0_MLP_MULT_DRAM     # contiguous K rope scratch
@@ -2797,11 +2821,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM + rope_bytes, self.LAYER0_FLASH_Q_DRAM + rope_bytes, non_rot, head_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
             # Spread the contiguous K rope result into the k_size-strided KV cache.
             if non_shared:
-                self._emit_strided_copy_pbi(K_TMP, k_cache_base, cur_head_dim, head_bytes, self.k_size, seq_len, self.gpr_seq_len)
+                self._emit_strided_copy_pbi(K_TMP, k_cache_base, cur_head_dim, head_bytes, head_bytes, seq_len, self.gpr_seq_len)
             _checkpoint(f"L{layer_idx}_rope")
             # GQA dup: read KV cache (k_size stride) → scatter group_size copies to FLASH (cur_head_dim stride).
-            self._emit_gqa_duplicate_pbi(k_cache_base, self.LAYER0_FLASH_K_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=self.k_size)
-            self._emit_gqa_duplicate_pbi(v_cache_base, self.LAYER0_FLASH_V_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=self.k_size)
+            self._emit_gqa_duplicate_pbi(k_cache_base, self.LAYER0_FLASH_K_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=head_bytes)
+            self._emit_gqa_duplicate_pbi(v_cache_base, self.LAYER0_FLASH_V_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=head_bytes)
             _checkpoint(f"L{layer_idx}_kv_gather")
 
             # Gemma4 uses scaling=1.0 (no 1/sqrt(d) in attention scores), so pass
@@ -3012,8 +3036,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # attention I @ V^T step). Idempotent for LM-only runs.
         from user_dma_core import UE_VECTOR_SIZE as _UE_VS
         num_slots = getattr(self, "_num_kv_slots", self.LAYER_SIZE)
-        kv_slot_elems = num_slots * self.MAX_CONTEXT_SIZE * self.head_dim
-        kv_zero_pad = torch.zeros(kv_slot_elems, dtype=torch.bfloat16)
+        kv_cache_bytes = getattr(
+            self, "_kv_cache_bytes",
+            num_slots * self.MAX_CONTEXT_SIZE * self.head_dim * self.bytes_per_element)
+        kv_zero_pad = torch.zeros(
+            kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
         _pre_align = ((self.max_prefill_seq_len * self.group_size + 63) // 64) * 64
@@ -3266,9 +3293,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     # V norm (Gemma4: normalize V without learnable scale)
                     self.rms_norm_core(0x10000, 0x10000, cur_k_size)  # no gamma
                     # V scatter to V cache at decode_pos via reg_mul_imm + add_imm.
-                    # Address = LAYER0_V_DRAM + slot * MAX_CTX * k_size + gpr_seq_len * k_size.
-                    _v_slot_base = self.LAYER0_V_DRAM + self._kv_slot_for_layer[layer_idx] * self.MAX_CONTEXT_SIZE * self.k_size
-                    self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size))
+                    # Compact cache row stride equals this layer's head dimension.
+                    _kv_row_bytes = self._kv_row_bytes_for_layer[layer_idx]
+                    _v_slot_base = self.LAYER0_V_DRAM + self._kv_offset_for_layer[layer_idx]
+                    self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(_kv_row_bytes))
                     self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(_v_slot_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=0, element_size=cur_k_size, general_reg_src=self.TMP_REG)
                     # RMS norm on K
@@ -3286,7 +3314,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
                 rope_row = 2 * rope_n * self.bytes_per_element  # full cos+sin pair stride per token (rope_n*2 values * 2 bytes)
 
-                kv_slot_off_local = self._kv_slot_for_layer[layer_idx] * self.MAX_CONTEXT_SIZE * self.k_size
+                kv_slot_off_local = self._kv_offset_for_layer[layer_idx]
                 k_rope_base = self.LAYER0_K_ROPE_DRAM + kv_slot_off_local
 
                 if layer_idx not in self._kv_shared_map:
@@ -3302,7 +3330,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                         output_dram_addr=self.LAYER0_K_DRAM,         # scratch, not cache
                         gr_weight_dram=self.TMP_REG)
                     # Copy rotated dims from scratch into K cache at decode_pos.
-                    self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size))
+                    self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self._kv_row_bytes_for_layer[layer_idx]))
                     self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(k_rope_base), self.TMP_REG)
                     self.accelerator_memcpy(self.LAYER0_K_DRAM, 0, rope_n * self.bytes_per_element, gr_dst_addr=self.TMP_REG)
 
@@ -3330,7 +3358,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                         src = self.LAYER0_K_NORM_DRAM + rope_n * self.bytes_per_element
                         k_cache_nrot_base = k_rope_base + rope_n * self.bytes_per_element
                         self.accelerator_memory_to_sram(src, 0x10000, remaining)
-                        self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self.k_size))
+                        self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len, ue_35bit_addr_shifter(self._kv_row_bytes_for_layer[layer_idx]))
                         self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(k_cache_nrot_base), self.TMP_REG)
                         self.sram_to_accelerator_memory(0x10000, 0, remaining, general_reg_src=self.TMP_REG)
 
@@ -3340,21 +3368,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 _checkpoint(f"L{layer_idx}_rope")
 
                 # K/V cache reads — KV-shared layers point at the source layer's cache.
-                kv_slot_off_read = self._kv_slot_for_layer[kv_layer_for_attn] * self.MAX_CONTEXT_SIZE * self.k_size
+                kv_slot_off_read = self._kv_offset_for_layer[kv_layer_for_attn]
                 kv_k_base = self.LAYER0_K_ROPE_DRAM + kv_slot_off_read
                 kv_v_base = self.LAYER0_V_DRAM + kv_slot_off_read
 
-                # Gather this layer's K/V into the FIXED FLASH_K/V buffers. Runtime
-                # trip count is the aligned decode context length; cache rows past
-                # decode_pos are zero and the full-matrix bias masks them.
-                _dhb = cur_head_dim * self.bytes_per_element
-                self._emit_strided_copy_pbi(
-                    kv_k_base, self.LAYER0_FLASH_K_DRAM, cur_head_dim,
-                    self.k_size, _dhb, self.MAX_CONTEXT_SIZE, self.gpr_aligned_seq_len, sram_addr=0x10000)
-                self._emit_strided_copy_pbi(
-                    kv_v_base, self.LAYER0_FLASH_V_DRAM, cur_head_dim,
-                    self.k_size, _dhb, self.MAX_CONTEXT_SIZE, self.gpr_aligned_seq_len, sram_addr=0x20000)
-
+                # Compact per-slot rows already satisfy unified attention's
+                # [aligned_seq_len, head_dim] contract. Read the cache directly;
+                # zero-initialized future rows cover alignment padding.
                 _checkpoint(f"L{layer_idx}_kv_gather")
 
                 # unified_attention_core uses bias_mode="full_matrix"; run_decoder
@@ -3367,8 +3387,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     aligned_seq_len=seq_len,
                     head_dim=cur_head_dim,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    K_DRAM_ADDR=kv_k_base,
+                    V_DRAM_ADDR=kv_v_base,
                     BIAS_DRAM_ADDR=bias_addr_layer,
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                     SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
@@ -3387,24 +3407,37 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
                     )
-                total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off,
-                              gpr_M_reg=gpr_one)
+                # Decode-only fused attention residual and FFN pre-normalization.
+                _vec_a = 0x10000
+                _vec_b = 0x90000
+                self.accelerator_memory_to_sram(
+                    self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, _vec_a, self.vector_length)
+                self.accelerator_memory_to_sram(
+                    self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off,
+                    _vec_b, self.vector_length)
+                self.rms_norm_core(_vec_a, _vec_a, self.vector_length, _vec_b)
+                total_flops += 4 * self.vector_length
 
                 # Attention residual: use layer_input_addr (LAYER0_OUTPUT_DRAM
                 # for layers > 0, LAYER0_INPUT_DRAM for layer 0) — same source
                 # as the pre-norm above. This avoids the LAYER0_OUTPUT → LAYER0_INPUT
                 # copy that used to run at the top of every layer.
-                self.accelerator_memory_to_sram(accelerator_dram_address=layer_input_addr, sram_address=0x10000, element_size=self.vector_length)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
-                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
+                self.accelerator_memory_to_sram(
+                    layer_input_addr, _vec_b, self.vector_length)
+                self.eltwise_add_core(_vec_a, _vec_b, _vec_a, self.vector_length)
+                self.sram_to_accelerator_memory(
+                    _vec_a, self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                    self.vector_length)
+                self.accelerator_memory_to_sram(
+                    self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
+                    _vec_b, self.vector_length)
+                self.rms_norm_core(_vec_a, _vec_a, self.vector_length, _vec_b)
+                total_flops += 4 * self.vector_length
+                self.sram_to_accelerator_memory(
+                    _vec_a, self.LAYER0_PRE_MLP_NORM_DRAM,
+                    self.vector_length)
 
                 _checkpoint(f"L{layer_idx}_o_proj")
-
-                total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
-                              gpr_M_reg=gpr_one)
 
                 total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
@@ -3436,14 +3469,22 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
                     gpr_M_reg=gpr_one,
                     )
-                total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off,
-                              gpr_M_reg=gpr_one)
-
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
-                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
+                # Decode-only fused MLP post-normalization + residual. Keep the
+                # normalized MLP-down vector in SRAM through the residual add,
+                # removing the post-MLP-norm DRAM write/read pair.
+                self.accelerator_memory_to_sram(
+                    self.LAYER0_MLP_DOWN_DRAM, _vec_a, self.vector_length)
+                self.accelerator_memory_to_sram(
+                    self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off,
+                    _vec_b, self.vector_length)
+                self.rms_norm_core(_vec_a, _vec_a, self.vector_length, _vec_b)
+                total_flops += 4 * self.vector_length
+                self.accelerator_memory_to_sram(
+                    self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                    _vec_b, self.vector_length)
+                self.eltwise_add_core(_vec_a, _vec_b, _vec_a, self.vector_length)
+                self.sram_to_accelerator_memory(
+                    _vec_a, self.LAYER0_OUTPUT_DRAM, self.vector_length)
 
                 _checkpoint(f"L{layer_idx}_mlp")
 
