@@ -7456,15 +7456,37 @@ class UnifiedEngine:
 
         # We put entire input matrix into URAM_A, and entire output matrix into URAM_B
 
-        M_chunk = min(M, (URAM_FULL_ELEMENTS // K))
-        N_chunk = min((SCALE_BRAM_ELEMENTS // K) * UE_VECTOR_SIZE,
-                       N,
-                     ((URAM_FULL_ELEMENTS // M_chunk) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
-                     BIAS_BRAM_ELEMENTS)
+        N_chunk = min(
+            (SCALE_BRAM_ELEMENTS // K) * UE_VECTOR_SIZE,
+            N,
+            BIAS_BRAM_ELEMENTS,
+        )
+        N_chunk_aligned = None
+        if N_chunk < UE_VECTOR_SIZE:
+            # DOT_PRODUCT supports a partial 64-lane output. Mirror
+            # matmat_mul_core_legacy's small-N fallback so one strip's scales
+            # still fit when K > SCALE_BRAM_ELEMENTS.
+            if N >= 32 and (32 * K) // UE_VECTOR_SIZE <= SCALE_BRAM_ELEMENTS:
+                N_chunk = 32
+            elif N >= 16 and (16 * K) // UE_VECTOR_SIZE <= SCALE_BRAM_ELEMENTS:
+                N_chunk = 16
+            else:
+                raise ValueError(
+                    "quantized_matmat_core_legacy: no 16/32/64-wide "
+                    f"column strip fits scale BRAM for K={K}")
+            N_chunk_aligned = UE_VECTOR_SIZE
+
+        output_row_width = N_chunk if N_chunk_aligned is None else N_chunk_aligned
+        M_chunk = min(M, URAM_FULL_ELEMENTS // (K + output_row_width))
+        if M_chunk < 1:
+            raise ValueError(
+                f"quantized_matmat_core_legacy: K={K} leaves no URAM "
+                "space for an output row")
 
         assert (N * K) % UE_VECTOR_SIZE == 0, f"(N * K={N * K}) must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
 
-        print(f"M_chunk={M_chunk}, N_chunk={N_chunk}")
+        print(f"M_chunk={M_chunk}, N_chunk={N_chunk}, "
+              f"N_chunk_aligned={N_chunk_aligned}")
 
 
         max_clear_en = 1
@@ -7501,10 +7523,12 @@ class UnifiedEngine:
                         self.accelerator_memory_to_bias_sram(accelerator_dram_address=C_DRAM_ADDR + ((M_chunk_idx + vector_idx) * N + N_chunk_idx) * bytes_per_element,
                                                             element_size=N_take_size)
 
+                    output_row_stride = (N_take_size if N_chunk_aligned is None
+                                         else N_chunk_aligned)
                     self.start_queue_for_dot_product_operation(max_clear_en=max_clear_en,
                                                                 fmax_context_addr=0,
                                                                 vector_sram_start_addr=0x00000 + vector_idx * K * bytes_per_element,
-                                                                output_sram_wb_addr=0x80000 + vector_idx * N_take_size * bytes_per_element,
+                                                                output_sram_wb_addr=0x80000 + vector_idx * output_row_stride * bytes_per_element,
                                                                 K=K,
                                                                 N=N_take_size,
                                                                 dma_start_addr=B_DRAM_ADDR + dma_offset,
@@ -7515,12 +7539,26 @@ class UnifiedEngine:
                                                                 lalu_b=lalu_b)
                     max_clear_en = 0
 
-                if not write_back_disable:
+                if not write_back_disable and N_chunk_aligned is None:
                     self.sram_to_accelerator_memory(sram_address=0x80000,
                                                     accelerator_dram_address=OUTPUT_DRAM_ADDR + (M_chunk_idx * N + N_chunk_idx) * bytes_per_element,
                                                     element_size=M_chunk_size * N_take_size,
                                                     stride_bytes_per_chunk=N_take_size * bytes_per_element,
                                                     stride_jump_bytes=N * bytes_per_element)
+                elif not write_back_disable:
+                    # Partial DOT_PRODUCT outputs occupy padded 64-wide SRAM
+                    # rows. Copy only the valid 16/32 elements from each row.
+                    for vector_idx in range(M_chunk_size):
+                        self.sram_to_accelerator_memory(
+                            sram_address=(0x80000
+                                          + vector_idx * N_chunk_aligned
+                                          * bytes_per_element),
+                            accelerator_dram_address=(
+                                OUTPUT_DRAM_ADDR
+                                + ((M_chunk_idx + vector_idx) * N
+                                   + N_chunk_idx) * bytes_per_element),
+                            element_size=N_take_size,
+                        )
 
         total_flops = 2 * M * N * K
         if bias_enable:
