@@ -86,8 +86,8 @@ UE_AXI_DATA_WIDTH_BITS = int(os.environ.get("UE_AXI_DATA_WIDTH_BITS", "256"))
 
 # ---------------------------------------------------------------------------
 # AXI beat width: the ONE number that differs between the two board profiles
-# (256-bit: puzhi/alinx/alveo/kintex7; 512-bit: bittware/rk — see the
-# ``args.device in ("bittware", "rk")`` check in user_hw_test.py's __main__).
+# (256-bit: rk_256/puzhi/alinx/alveo/kintex7; 512-bit: rk/bittware — see the
+# device-profile selection in user_hw_test.py's __main__).
 # The DMA engine requires DRAM-side transfer addresses/lengths to land on
 # beat boundaries, so every alignment/padding rule elsewhere in this file and
 # in user_hw_test.py is a direct consequence of this one doubled granularity:
@@ -815,7 +815,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x884c96b9, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x884c96b9. Please update FPGA with commit update_884c96b9.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0x52a71442, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x52a71442. Please update FPGA with commit update_52a71442.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -7336,7 +7336,8 @@ class UnifiedEngine:
     def quantized_matmat_core(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCALE_DRAM_ADDR: int, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N", data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False, write_back_disable: bool = False,
                               gpr_M_reg: Optional[int] = None, gpr_K_reg: Optional[int] = None, gpr_N_reg: Optional[int] = None,
                               gpr_a_addr: Optional[int] = None, gpr_b_addr: Optional[int] = None,
-                              gpr_out_addr: Optional[int] = None, gpr_scale_addr: Optional[int] = None) -> None:
+                              gpr_out_addr: Optional[int] = None, gpr_scale_addr: Optional[int] = None,
+                              gpr_c_addr: Optional[int] = None) -> None:
         """Quantized matrix-matrix multiplication core (1-pass streaming quantized dot).
 
         Dispatches on whether runtime-dimension GPRs are supplied:
@@ -7347,8 +7348,15 @@ class UnifiedEngine:
           1-pass streaming dot keeps it at legacy throughput (vs the 2-pass dequantize path of
           :meth:`matmat_mul_core_dynamic`); this M==1 path is HW-validated. M>1 uses a newer general
           M-tiling path (see :meth:`quantized_matmat_core_dynamic`) that is EXPERIMENTAL /
-          HW-UNVALIDATED. Missing dimension GPRs are auto-allocated + seeded.
+          HW-UNVALIDATED. Missing dimension GPRs are auto-allocated + seeded. The M>1 loop nest is
+          sized entirely from ``gpr_M_reg`` (no compile-time M is emitted), so **one M>1 build serves
+          every prefill length** ``M >= 1`` at run time; the compile-time ``M`` only selects the path.
+          N and K are likewise runtime; only the large-K strip-width regime is fixed at capture time
+          (see :meth:`quantized_matmat_core_dynamic` — "What is runtime-dynamic vs baked").
         - none given (default): :meth:`quantized_matmat_core_legacy` — the compile-time-tiled static path.
+
+        Both paths now support bias (``C_DRAM_ADDR`` set), in ``broadcast_N`` and ``full_matrix``
+        modes; ``gpr_c_addr`` sources the bias DRAM base from a GPR on the dynamic path.
 
         Args:
             M: batch dimension (number of input vectors)
@@ -7357,9 +7365,9 @@ class UnifiedEngine:
             A_DRAM_ADDR: DRAM address of input matrix
             B_DRAM_ADDR: DRAM address of weight matrix
             OUTPUT_DRAM_ADDR: DRAM address of output matrix
-            C_DRAM_ADDR: DRAM address of bias matrix
-            bias_enable: enable bias
-            bias_mode: bias mode
+            C_DRAM_ADDR: DRAM address of bias matrix (None disables bias)
+            bias_mode: "broadcast_N" (length-N vector, shared across rows) or
+                "full_matrix" (M×N, per-row slice)
             data_type: data type
             SCALE_DRAM_ADDR: DRAM address of scale matrix
             gelu_enable: enable gelu
@@ -7367,12 +7375,11 @@ class UnifiedEngine:
             clamp_enable: enable clamp (relu via clamp(x, 0, +inf))
             log_enable: enable log (log(clamp(x, 1e-3, +inf)))
             gpr_*_reg / gpr_*_addr: runtime dims / DRAM bases (dynamic path); see
-                :meth:`quantized_matmat_core_dynamic`.
+                :meth:`quantized_matmat_core_dynamic`. ``gpr_c_addr`` requires a bias
+                (``C_DRAM_ADDR``) and a dimension GPR.
         """
-        _addr_gprs = (gpr_a_addr, gpr_b_addr, gpr_out_addr, gpr_scale_addr)
+        _addr_gprs = (gpr_a_addr, gpr_b_addr, gpr_out_addr, gpr_scale_addr, gpr_c_addr)
         if gpr_M_reg is not None or gpr_K_reg is not None or gpr_N_reg is not None:
-            if C_DRAM_ADDR is not None:
-                raise ValueError("quantized_matmat_core: bias (C_DRAM_ADDR) not supported on the dynamic path")
             allocated = []
             if gpr_K_reg is None:
                 gpr_K_reg = self.alloc_isa_reg(); self.generate_instruction_add_set(gpr_K_reg, K); allocated.append('K')
@@ -7383,8 +7390,10 @@ class UnifiedEngine:
             flops = self.quantized_matmat_core_dynamic(
                 M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR,
                 OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
+                C_DRAM_ADDR=C_DRAM_ADDR, bias_mode=bias_mode,
                 gpr_M_reg=gpr_M_reg, gpr_K_reg=gpr_K_reg, gpr_N_reg=gpr_N_reg,
-                gpr_a_addr=gpr_a_addr, gpr_b_addr=gpr_b_addr, gpr_out_addr=gpr_out_addr, gpr_scale_addr=gpr_scale_addr,
+                gpr_a_addr=gpr_a_addr, gpr_b_addr=gpr_b_addr, gpr_out_addr=gpr_out_addr,
+                gpr_scale_addr=gpr_scale_addr, gpr_c_addr=gpr_c_addr,
                 data_type=data_type, gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable,
                 clamp_enable=clamp_enable, log_enable=log_enable, write_back_disable=write_back_disable,
             )
@@ -7576,51 +7585,37 @@ class UnifiedEngine:
                                       gpr_M_reg: int, gpr_K_reg: int, gpr_N_reg: int,
                                       gpr_a_addr: Optional[int] = None, gpr_b_addr: Optional[int] = None,
                                       gpr_out_addr: Optional[int] = None, gpr_scale_addr: Optional[int] = None,
+                                      C_DRAM_ADDR: Optional[int] = None, bias_mode: str = "broadcast_N",
+                                      gpr_c_addr: Optional[int] = None,
                                       data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False,
                                       sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False,
                                       clamp_min: float = 0.0, clamp_max: float = float("inf"),
                                       write_back_disable: bool = False) -> int:
-        """Fully-dynamic (runtime M/K/N + GPR DRAM addresses) **1-pass** quantized matmul: A @ Bᵀ.
+        """1-pass streaming quantized matmul (A @ Bᵀ), IF4/IF8/TQ4 weights straight through DOT_PRODUCT.
 
-        Unlike :meth:`matmat_mul_core_dynamic` — which DEQUANTIZES B to bf16 in URAM and then does a
-        bf16 dot (**two passes** over the weight bytes) — this streams the quantized IF4/IF8 weights
-        straight through the DOT_PRODUCT unit (inline fp4→bf19 unpack), **one pass**, exactly like the
-        fast static :meth:`quantized_matmat_core`.
+        Runtime-dynamic vs baked-at-capture:
+          - M / N / K: fully runtime (``gpr_M_reg`` / ``gpr_N_reg`` / ``gpr_K_reg``); no dimension is
+            emitted into an instruction. The M>1 loop nest is sized entirely from ``gpr_M_reg``, so ONE
+            M>1 capture serves every prefill length M >= 1. Compile-time ``M`` only selects the path.
+          - DRAM bases (A/B/out/scale/bias): runtime via ``gpr_*_addr`` (omit -> baked literal).
+          - Fixed at capture time (Python ``if``): the code path (M==1 vs M>1, from ``M``) and the
+            large-K strip regime + its writeback structure (from ``K``, see Large K below).
 
-        Two internal code paths, selected on the **compile-time** ``M`` value (the runtime ``gpr_M_reg``
-        is still what the captured program actually uses to size the loop):
+        Two paths, chosen by compile-time ``M``:
+          - ``M == 1``: decode path. Per N-strip: load scales, one streaming DOT_PRODUCT vs the single
+            A vector, outputs accumulate in URAM_B; one batched final DMA. ``single_strip`` (whole N in
+            one strip) drops the loop + entry abs-jump. 2 loop-live PBI pointers. HW-validated.
+          - ``M > 1``: M-tile / N-strip / per-row loop nest (URAM-capacity tiling, strided writeback);
+            B re-streamed per row. 4 PBI pointers.
 
-        - ``M == 1``: the decode single-token path for the folded gemma decoder. Because every DRAM
-          base (A / B / output / scale) *and* the K/N dims are runtime GPRs, one captured body serves
-          all 26 layers, and the 1-pass dot restores legacy throughput (the 2-pass dynamic core is the
-          ~2x "streaming regression" root cause). Per N-strip (column tile that fits the scale BRAM):
-          load the strip's per-block scales, emit one streaming ``UE_MODE.DOT_PRODUCT`` op whose DMA
-          streams the quantized B strip from DRAM and dots it against the single A vector in URAM_A ->
-          ``n_take`` outputs accumulated into a running URAM_B row cursor. One final DMA writes all
-          ``N`` outputs back to DRAM (batched writeback). Only **two** loop-live PBI pointers
-          (scale / dot); the A-load and final-writeback pointers live outside the loop. When the whole
-          ``N`` fits one column tile (``single_strip``) the strip loop and its entry abs-jump (i-cache
-          refill) are dropped entirely for a straight-line body. HW-validated (production decode path).
+        Bias (``C_DRAM_ADDR`` set, ``gpr_c_addr`` for a runtime base): HW bias adder + a bias-BRAM load.
+        ``broadcast_N`` loads once per N-strip; ``full_matrix`` loads per row. For M==1 both are
+        identical (one row). One activation (gelu/silu/sigmoid/clamp/log) may fuse into the LALU.
 
-        - ``M > 1``: general runtime-M path, mirroring :meth:`matmat_mul_core_dynamic`'s M-tile /
-          N-strip / per-row nested while-loop skeleton (URAM-capacity tiling, strided writeback via
-          ``PBI_FIELD.STRIDE_JUMP``), but keeping the 1-pass streaming quantized dot instead of the
-          2-pass dequantize-then-bf16-dot body — so it needs only **four** distinct PBI pointers
-          (A-load / scale / dot / writeback) instead of matmat's five (no dequantize-to-URAM_B step).
-          Per (M-tile, N-strip): the strip's scale block is loaded once (not once per row — a
-          deliberate efficiency improvement over :meth:`quantized_matmat_core`'s per-row reload, safe
-          since the dot never mutates scale BRAM), then each of the tile's rows issues its own
-          streaming DOT_PRODUCT call (B is re-streamed from DRAM per row, matching the static core's
-          per-row behavior — the 1-pass design has no on-chip B cache to reuse across rows). Output
-          rows land contiguously in URAM_B for the tile/strip and are flushed with one strided DMA.
-          No single-tile/single-strip fast path in this first cut (always the full loop nest).
-          **Experimental / HW-unvalidated** — new as of this addition; start with small M on real HW.
-
-        ``gpr_M_reg`` / ``gpr_K_reg`` / ``gpr_N_reg`` are the runtime M / inner / outer dims.
-        ``gpr_a_addr`` / ``gpr_b_addr`` / ``gpr_out_addr`` / ``gpr_scale_addr`` source the DRAM bases
-        from GPRs (word addr = byte>>3); omit any to bake its literal base. One activation
-        (gelu/silu/sigmoid/clamp/log) may be fused into the dot's LALU, identical to
-        :meth:`quantized_matmat_core`. Bias is not supported on either path.
+        Large K (sub-64 strips): when a 64-wide strip's scales exceed the scale BRAM (compile-time
+        K > 8192), strip width falls back to 32 (K <= 16384) or 16 (K <= 32768); sub-64 strips use a
+        per-strip/per-row writeback of the valid ``strip_w`` elements. Regime is fixed by compile-time
+        K (runtime K must match it), so one capture is valid within one K regime only.
         """
         fn = "quantized_matmat_core_dynamic"
         assert self.is_capture_on, f"{fn}() requires active capture"
@@ -7635,19 +7630,42 @@ class UnifiedEngine:
                 raise ValueError(f"{fn}: {_nm} must be a GPR index 1..63, got {_rg}")
         if len({gpr_M_reg, gpr_K_reg, gpr_N_reg}) != 3:
             raise ValueError(f"{fn}: gpr_M_reg/gpr_K_reg/gpr_N_reg must be distinct")
+        bias_enable = C_DRAM_ADDR is not None
+        if bias_enable and bias_mode not in ("broadcast_N", "full_matrix"):
+            raise ValueError(f"{fn}: bias_mode={bias_mode!r} must be 'broadcast_N' or 'full_matrix'")
+        if gpr_c_addr is not None and not bias_enable:
+            raise ValueError(f"{fn}: gpr_c_addr given but no bias (C_DRAM_ADDR is None)")
         self._validate_addr_gprs(fn, gpr_M_reg, {
             "gpr_a_addr": gpr_a_addr, "gpr_b_addr": gpr_b_addr,
-            "gpr_out_addr": gpr_out_addr, "gpr_scale_addr": gpr_scale_addr})
+            "gpr_out_addr": gpr_out_addr, "gpr_scale_addr": gpr_scale_addr,
+            "gpr_c_addr": gpr_c_addr})
         for _nm, _rg in (("gpr_a_addr", gpr_a_addr), ("gpr_b_addr", gpr_b_addr),
-                         ("gpr_out_addr", gpr_out_addr), ("gpr_scale_addr", gpr_scale_addr)):
+                         ("gpr_out_addr", gpr_out_addr), ("gpr_scale_addr", gpr_scale_addr),
+                         ("gpr_c_addr", gpr_c_addr)):
             if _rg is not None and _rg in (gpr_K_reg, gpr_N_reg):
                 raise ValueError(f"{fn}: {_nm}={_rg} collides with gpr_K_reg/gpr_N_reg")
         if sum([gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable]) > 1:
             raise ValueError(f"{fn}: at most one activation may be enabled")
-        # Template feasibility: one 64-wide column strip's scales (K_rows blocks) must fit the scale BRAM.
+        # Template feasibility + column-strip width. One column strip's per-block scales
+        # (strip_w * K_rows blocks) must fit the scale BRAM. Prefer a 64-wide strip; when compile-time
+        # K is large enough that a 64-wide strip overflows the scale BRAM (K > 8192), fall back to a
+        # 32- (K <= 16384) or 16-wide (K <= 32768) strip, mirroring quantized_matmat_core_legacy. The
+        # regime is fixed by compile-time K (the gemma constant-dim contract makes runtime K == the
+        # template K), so this is a compile-time decision with no mid-program branch. sub-64 strips
+        # write a padded 64-wide URAM output row and take a per-strip (not batched/strided) writeback.
         K_rows_ct = K // UE_VECTOR_SIZE
-        if K_rows_ct == 0 or (SCALE_BRAM_ELEMENTS // K_rows_ct) < UE_VECTOR_SIZE:
-            raise ValueError(f"{fn}: K={K} too large — a 64-wide column strip's scales exceed the scale BRAM")
+        if K_rows_ct == 0:
+            raise ValueError(f"{fn}: K={K} must be a positive multiple of {UE_VECTOR_SIZE}")
+        if (SCALE_BRAM_ELEMENTS // K_rows_ct) >= UE_VECTOR_SIZE:
+            strip_w = None          # main path: runtime 64-aligned N_chunk
+            strip_w_log2 = None
+        elif K_rows_ct * 32 <= SCALE_BRAM_ELEMENTS:
+            strip_w, strip_w_log2 = 32, 5
+        elif K_rows_ct * 16 <= SCALE_BRAM_ELEMENTS:
+            strip_w, strip_w_log2 = 16, 4
+        else:
+            raise ValueError(
+                f"{fn}: K={K} too large — no 16/32/64-wide column strip's scales fit the scale BRAM")
 
         # Activation -> LALU (baked into the dot descriptor; identical mapping to quantized_matmat_core).
         lalu_mode, lalu_a, lalu_b = LALU_MODE.BYPASS, 0, 0
@@ -7670,6 +7688,8 @@ class UnifiedEngine:
         B_BASE_W = ue_35bit_addr_shifter(B_DRAM_ADDR)
         OUT_BASE_W = ue_35bit_addr_shifter(OUTPUT_DRAM_ADDR)
         SCALE_BASE_W = ue_35bit_addr_shifter(SCALE_DRAM_ADDR)
+        C_BASE_W = ue_35bit_addr_shifter(C_DRAM_ADDR) if bias_enable else 0  # bias vector/matrix base (word addr)
+        bias_adder = 1 if bias_enable else 0
         # Quantized B stream bytes per (col, block): IF4/TQ4 -> 32 (= K/2 per col over K_rows blocks); IF8 -> 64.
         b_dma_shift = 5 if data_type in (TYPE.IF4, TYPE.TQ4) else 6   # n_take*K_rows << b_dma_shift bytes
         b_word_shift = b_dma_shift - 3                                 # bytes>>3 -> words (IF4:2, IF8:3)
@@ -7678,15 +7698,6 @@ class UnifiedEngine:
             _alloc_list = []
             def _alloc():
                 r = self.alloc_isa_reg(); _alloc_list.append(r); return r
-            K_rows_reg    = _alloc()   # K/64 (dot depth)
-            N_chunk_reg   = _alloc()   # column strip width (scale-BRAM bound, 64-aligned)
-            N_counter_reg = _alloc()   # remaining columns
-            n_take_reg    = _alloc()   # min(remaining, N_chunk)
-            b_dram_reg    = _alloc()   # running quantized-B strip DRAM word cursor
-            scale_dram_reg = _alloc()  # running scale strip DRAM word cursor
-            out_urow_reg  = _alloc()   # running URAM_B output-row cursor (batched writeback)
-            s1 = _alloc()
-            s2 = _alloc()
 
             def _set(ptr, field, reg):
                 self.generate_instruction_pbi_inc(general_reg_src=reg, pbi_field_select=field, inst_pointer_idx=ptr)
@@ -7696,126 +7707,282 @@ class UnifiedEngine:
                 else:
                     self.generate_instruction_add_set(dst, lit_w)
 
-            # Compile-time N_chunk (the runtime tiling reproduces this from gpr_K_reg). ``single_strip``
-            # collapses to one straight-line strip when the whole N fits one column tile — no entry
-            # abs-jump / i-cache refill and no strip loop. Correct while runtime N <= this N_chunk, which
-            # holds when runtime N == the compile-time template (the gemma constant-dim decode contract;
-            # every dim it passes is a model constant equal to the baked value).
-            ct_N_chunk = min(N, (SCALE_BRAM_ELEMENTS // K_rows_ct // UE_VECTOR_SIZE) * UE_VECTOR_SIZE)
-            single_strip = (N <= ct_N_chunk)
+            # For M==1 broadcast_N and full_matrix bias are byte-identical (one output row, rows_done==0):
+            # both reduce to loading bias[cols_done .. cols_done+n_take) into bias BRAM per strip and
+            # enabling the dot's bias adder. The bias DRAM cursor advances exactly like the scale cursor.
 
-            # ----- Phase 1: runtime tiling. K_rows is always needed; N_chunk (3 startup divides) only
-            # for the multi-strip loop, so single_strip skips it. -----
-            self.generate_instruction_shr(K_rows_reg, gpr_K_reg, 6)        # K_rows = K/64 (dot depth)
-            if not single_strip:
-                self.generate_instruction_add_set(s1, SCALE_BRAM_ELEMENTS)
-                self.generate_instruction_div_reg(s1, s1, K_rows_reg)      # max cols such that cols*K_rows <= scale BRAM
-                self.generate_instruction_shr(N_chunk_reg, s1, 6)
-                self.generate_instruction_shl(N_chunk_reg, N_chunk_reg, 6) # align down to a multiple of 64
-                self.generate_instruction_reg_min(N_chunk_reg, N_chunk_reg, gpr_N_reg)
+            if strip_w is None:
+                # =============================== main path (64-aligned N_chunk) ===============================
+                K_rows_reg    = _alloc()   # K/64 (dot depth)
+                N_chunk_reg   = _alloc()   # column strip width (scale-BRAM bound, 64-aligned)
+                N_counter_reg = _alloc()   # remaining columns
+                n_take_reg    = _alloc()   # min(remaining, N_chunk)
+                b_dram_reg    = _alloc()   # running quantized-B strip DRAM word cursor
+                scale_dram_reg = _alloc()  # running scale strip DRAM word cursor
+                out_urow_reg  = _alloc()   # running URAM_B output-row cursor (batched writeback)
+                bias_dram_reg = _alloc() if bias_enable else None  # running bias DRAM word cursor
+                s1 = _alloc()
+                s2 = _alloc()
 
-            # ----- Phase 2: one-shot A vector (1xK) load into URAM_A (temp pointer, released before loop) -----
-            ptr_A = self.alloc_inst_ptr()
-            self.generate_instruction_pbi_init(dram_shared_addr=A_DRAM_ADDR, uram_dst_addr=a_urow, inst_pointer_idx=ptr_A)
-            if gpr_a_addr is not None:
-                self._pbi_override_dram_base_from_gpr(ptr_A, gpr_a_addr)
-            self.generate_instruction_shl(s1, gpr_K_reg, 1)               # K*2 bytes (M==1)
-            _set(ptr_A, PBI_FIELD.DMA_LENGTH, s1)
-            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=SRAM_A, element_size=0, inst_pointer_idx=ptr_A)
-            self.release_inst_ptr(ptr_A)
+                # Compile-time N_chunk (the runtime tiling reproduces this from gpr_K_reg). ``single_strip``
+                # collapses to one straight-line strip when the whole N fits one column tile — no entry
+                # abs-jump / i-cache refill and no strip loop. Correct while runtime N <= this N_chunk, which
+                # holds when runtime N == the compile-time template (the gemma constant-dim decode contract;
+                # every dim it passes is a model constant equal to the baked value).
+                ct_N_chunk = min(N, (SCALE_BRAM_ELEMENTS // K_rows_ct // UE_VECTOR_SIZE) * UE_VECTOR_SIZE)
+                single_strip = (N <= ct_N_chunk)
 
-            # ----- Phase 3: loop-live pointers (scale + dot only; the writeback is a single DMA after
-            # the loop, so its pointer is allocated later). Each strip's dot accumulates into a running
-            # URAM_B row cursor; ONE final DMA writes all N outputs back to DRAM. Batching the writeback
-            # replaces up to ~18 tiny per-strip DMAs with one large one — the small-transfer overhead is
-            # invisible on a 256b AXI bus but decisive on a 512b bus (wide-AXI boards underutilise the
-            # bus on sub-beat transfers). Loop body now touches 2 PBI pointers (was 3). -----
-            ptr_scale = self.alloc_inst_ptr()
-            ptr_dot   = self.alloc_inst_ptr()
-            self.generate_instruction_pbi_init(dram_shared_addr=SCALE_DRAM_ADDR, inst_pointer_idx=ptr_scale)
-            # dot descriptor baked once (A vector row 0 -> URAM_B at the out-row cursor, activation via
-            # LALU); DRAM_ADDR / DMA_LENGTH / OUTPUT_SIZE / URAM_ROW_SIZE / URAM_WRITEB_ADDR come from the
-            # pointer each strip.
-            self.generate_instruction_pbi_init(dram_shared_addr=B_DRAM_ADDR, uram_a_start_addr=a_urow,
-                                               uram_wb_addr=out_urow, inst_pointer_idx=ptr_dot)
-            _seed(b_dram_reg, B_BASE_W, gpr_b_addr)
-            _seed(scale_dram_reg, SCALE_BASE_W, gpr_scale_addr)
-            self.generate_instruction_add_set(out_urow_reg, out_urow)     # running URAM_B output row
+                # ----- Phase 1: runtime tiling. K_rows is always needed; N_chunk (3 startup divides) only
+                # for the multi-strip loop, so single_strip skips it. -----
+                self.generate_instruction_shr(K_rows_reg, gpr_K_reg, 6)        # K_rows = K/64 (dot depth)
+                if not single_strip:
+                    self.generate_instruction_add_set(s1, SCALE_BRAM_ELEMENTS)
+                    self.generate_instruction_div_reg(s1, s1, K_rows_reg)      # max cols such that cols*K_rows <= scale BRAM
+                    self.generate_instruction_shr(N_chunk_reg, s1, 6)
+                    self.generate_instruction_shl(N_chunk_reg, N_chunk_reg, 6) # align down to a multiple of 64
+                    self.generate_instruction_reg_min(N_chunk_reg, N_chunk_reg, gpr_N_reg)
 
-            def _emit_strip(nt_reg, advance):
-                """One column strip: load its per-block scales, stream-dot the B strip vs A into the
-                URAM_B out-row cursor. When ``advance`` (multi-strip loop), also bump the B/scale DRAM
-                cursors and the URAM out-row for the next strip."""
-                # (1) scale strip -> quant/scale BRAM (nt * K_rows blocks, 2 bytes each)
-                self.generate_instruction_mul32_shl_reg(s1, nt_reg, K_rows_reg, 1)
-                _set(ptr_scale, PBI_FIELD.DRAM_ADDR, scale_dram_reg)
-                _set(ptr_scale, PBI_FIELD.DMA_LENGTH, s1)
-                self.ue_memcpy_from_dram(0, 0, MEMCPY_TYPE.BRAM.value, 0, 0, inst_pointer_idx=ptr_scale)
-                # (2) 1-pass streaming dot: DMA streams the B strip (nt*K/2 bytes) vs A -> URAM_B out-row
-                self.generate_instruction_mul32_shl_reg(s1, nt_reg, K_rows_reg, b_dma_shift)
-                _set(ptr_dot, PBI_FIELD.DRAM_ADDR, b_dram_reg)
-                _set(ptr_dot, PBI_FIELD.DMA_LENGTH, s1)
-                _set(ptr_dot, PBI_FIELD.OUTPUT_SIZE, nt_reg)
-                _set(ptr_dot, PBI_FIELD.URAM_ROW_SIZE, K_rows_reg)
-                _set(ptr_dot, PBI_FIELD.URAM_WRITEB_ADDR, out_urow_reg)
-                self.ue_arithmetic_op(
-                    0, 1, 1, lalu_a, lalu_b, lalu_mode.value, 0,
-                    out_type.value, 0, out_urow, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
-                    UE_MODE.DOT_PRODUCT, data_type.value,
-                    a_urow, 0, 0, 0, 0, 0, inst_pointer_idx=ptr_dot)
-                if advance:
-                    # B += nt*K/2 words ; scale += nt*K_rows*2 words ; out-row += nt/64 rows
-                    self.generate_instruction_mul32_shl_reg(s1, nt_reg, K_rows_reg, b_word_shift)
-                    self.generate_instruction_add_reg(b_dram_reg, b_dram_reg, s1)
-                    self.generate_instruction_mul32_shr_reg(s1, nt_reg, K_rows_reg, 2)   # nt*K_rows*2>>3
-                    self.generate_instruction_add_reg(scale_dram_reg, scale_dram_reg, s1)
-                    self.generate_instruction_shr(s1, nt_reg, 6)                          # nt/64 rows
-                    self.generate_instruction_add_reg(out_urow_reg, out_urow_reg, s1)
+                # ----- Phase 2: one-shot A vector (1xK) load into URAM_A (temp pointer, released before loop) -----
+                ptr_A = self.alloc_inst_ptr()
+                self.generate_instruction_pbi_init(dram_shared_addr=A_DRAM_ADDR, uram_dst_addr=a_urow, inst_pointer_idx=ptr_A)
+                if gpr_a_addr is not None:
+                    self._pbi_override_dram_base_from_gpr(ptr_A, gpr_a_addr)
+                self.generate_instruction_shl(s1, gpr_K_reg, 1)               # K*2 bytes (M==1)
+                _set(ptr_A, PBI_FIELD.DMA_LENGTH, s1)
+                self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=SRAM_A, element_size=0, inst_pointer_idx=ptr_A)
+                self.release_inst_ptr(ptr_A)
 
-            def _emit_final_wb():
-                """Single DMA: all N outputs (URAM_B base row) -> OUTPUT DRAM base (N*2 bytes)."""
-                if write_back_disable:
-                    return
-                ptr_wb = self.alloc_inst_ptr()
-                self.generate_instruction_pbi_init(dram_shared_addr=OUTPUT_DRAM_ADDR, inst_pointer_idx=ptr_wb)
-                if gpr_out_addr is not None:
-                    self._pbi_override_dram_base_from_gpr(ptr_wb, gpr_out_addr)
-                self.generate_instruction_shl(s1, gpr_N_reg, 1)                           # N*2 bytes
-                _set(ptr_wb, PBI_FIELD.DMA_LENGTH, s1)
-                self.ue_memcpy_to_dram(memcpy_type=MEMCPY_TYPE.URAM.value, uram_type=out_type.value,
-                                       uram_src_addr=out_urow, dram_dst_addr=0, memcpy_length_bytes=0,
-                                       inst_pointer_idx=ptr_wb)
-                self.release_inst_ptr(ptr_wb)
+                # ----- Phase 3: loop-live pointers (scale + dot [+ bias]; the writeback is a single DMA after
+                # the loop, so its pointer is allocated later). Each strip's dot accumulates into a running
+                # URAM_B row cursor; ONE final DMA writes all N outputs back to DRAM. Batching the writeback
+                # replaces up to ~18 tiny per-strip DMAs with one large one — the small-transfer overhead is
+                # invisible on a 256b AXI bus but decisive on a 512b bus (wide-AXI boards underutilise the
+                # bus on sub-beat transfers). Loop body touches 2 PBI pointers (3 with bias). -----
+                ptr_scale = self.alloc_inst_ptr()
+                ptr_dot   = self.alloc_inst_ptr()
+                ptr_bias  = self.alloc_inst_ptr() if bias_enable else None
+                self.generate_instruction_pbi_init(dram_shared_addr=SCALE_DRAM_ADDR, inst_pointer_idx=ptr_scale)
+                # dot descriptor baked once (A vector row 0 -> URAM_B at the out-row cursor, activation via
+                # LALU); DRAM_ADDR / DMA_LENGTH / OUTPUT_SIZE / URAM_ROW_SIZE / URAM_WRITEB_ADDR come from the
+                # pointer each strip.
+                self.generate_instruction_pbi_init(dram_shared_addr=B_DRAM_ADDR, uram_a_start_addr=a_urow,
+                                                   uram_wb_addr=out_urow, inst_pointer_idx=ptr_dot)
+                if bias_enable:
+                    self.generate_instruction_pbi_init(dram_shared_addr=C_DRAM_ADDR, inst_pointer_idx=ptr_bias)
+                _seed(b_dram_reg, B_BASE_W, gpr_b_addr)
+                _seed(scale_dram_reg, SCALE_BASE_W, gpr_scale_addr)
+                if bias_enable:
+                    _seed(bias_dram_reg, C_BASE_W, gpr_c_addr)
+                self.generate_instruction_add_set(out_urow_reg, out_urow)     # running URAM_B output row
 
-            if single_strip:
-                # ----- Single-strip straight-line: no loop, no entry abs-jump (i-cache refill). -----
-                _emit_strip(gpr_N_reg, advance=False)
-                _emit_final_wb()
-                print(f"{fn}: single-strip straight-line (M=1, K=GPR[{gpr_K_reg}], N=GPR[{gpr_N_reg}] "
-                      f"<= N_chunk={ct_N_chunk}; no abs-jump, batched writeback, 2 loop PBI pointers)")
+                def _emit_strip(nt_reg, advance):
+                    """One column strip: load its per-block scales (and bias slice), stream-dot the B strip
+                    vs A into the URAM_B out-row cursor. When ``advance`` (multi-strip loop), also bump the
+                    B/scale/bias DRAM cursors and the URAM out-row for the next strip."""
+                    # (1) scale strip -> quant/scale BRAM (nt * K_rows blocks, 2 bytes each)
+                    self.generate_instruction_mul32_shl_reg(s1, nt_reg, K_rows_reg, 1)
+                    _set(ptr_scale, PBI_FIELD.DRAM_ADDR, scale_dram_reg)
+                    _set(ptr_scale, PBI_FIELD.DMA_LENGTH, s1)
+                    self.ue_memcpy_from_dram(0, 0, MEMCPY_TYPE.BRAM.value, 0, 0, inst_pointer_idx=ptr_scale)
+                    # (1b) bias slice -> bias BRAM (nt elements, 2 bytes each), added by the dot's bias adder
+                    if bias_enable:
+                        self.generate_instruction_shl(s2, nt_reg, 1)                # nt*2 bytes
+                        _set(ptr_bias, PBI_FIELD.DRAM_ADDR, bias_dram_reg)
+                        _set(ptr_bias, PBI_FIELD.DMA_LENGTH, s2)
+                        self.ue_memcpy_from_dram(0, 0, MEMCPY_TYPE.BIAS_BRAM.value, 0, 0, inst_pointer_idx=ptr_bias)
+                    # (2) 1-pass streaming dot: DMA streams the B strip (nt*K/2 bytes) vs A -> URAM_B out-row
+                    self.generate_instruction_mul32_shl_reg(s1, nt_reg, K_rows_reg, b_dma_shift)
+                    _set(ptr_dot, PBI_FIELD.DRAM_ADDR, b_dram_reg)
+                    _set(ptr_dot, PBI_FIELD.DMA_LENGTH, s1)
+                    _set(ptr_dot, PBI_FIELD.OUTPUT_SIZE, nt_reg)
+                    _set(ptr_dot, PBI_FIELD.URAM_ROW_SIZE, K_rows_reg)
+                    _set(ptr_dot, PBI_FIELD.URAM_WRITEB_ADDR, out_urow_reg)
+                    self.ue_arithmetic_op(
+                        0, 1, 1, lalu_a, lalu_b, lalu_mode.value, 0,
+                        out_type.value, 0, out_urow, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+                        UE_MODE.DOT_PRODUCT, data_type.value,
+                        a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot)
+                    if advance:
+                        # B += nt*K/2 words ; scale += nt*K_rows*2>>3 words ; bias += nt*2>>3 words ; out-row += nt/64 rows
+                        self.generate_instruction_mul32_shl_reg(s1, nt_reg, K_rows_reg, b_word_shift)
+                        self.generate_instruction_add_reg(b_dram_reg, b_dram_reg, s1)
+                        self.generate_instruction_mul32_shr_reg(s1, nt_reg, K_rows_reg, 2)   # nt*K_rows*2>>3
+                        self.generate_instruction_add_reg(scale_dram_reg, scale_dram_reg, s1)
+                        if bias_enable:
+                            self.generate_instruction_shr(s1, nt_reg, 2)                     # nt*2>>3 = nt/4 words
+                            self.generate_instruction_add_reg(bias_dram_reg, bias_dram_reg, s1)
+                        self.generate_instruction_shr(s1, nt_reg, 6)                          # nt/64 rows
+                        self.generate_instruction_add_reg(out_urow_reg, out_urow_reg, s1)
+
+                def _emit_final_wb():
+                    """Single DMA: all N outputs (URAM_B base row) -> OUTPUT DRAM base (N*2 bytes)."""
+                    if write_back_disable:
+                        return
+                    ptr_wb = self.alloc_inst_ptr()
+                    self.generate_instruction_pbi_init(dram_shared_addr=OUTPUT_DRAM_ADDR, inst_pointer_idx=ptr_wb)
+                    if gpr_out_addr is not None:
+                        self._pbi_override_dram_base_from_gpr(ptr_wb, gpr_out_addr)
+                    self.generate_instruction_shl(s1, gpr_N_reg, 1)                           # N*2 bytes
+                    _set(ptr_wb, PBI_FIELD.DMA_LENGTH, s1)
+                    self.ue_memcpy_to_dram(memcpy_type=MEMCPY_TYPE.URAM.value, uram_type=out_type.value,
+                                           uram_src_addr=out_urow, dram_dst_addr=0, memcpy_length_bytes=0,
+                                           inst_pointer_idx=ptr_wb)
+                    self.release_inst_ptr(ptr_wb)
+
+                _bias_tag = f", bias={bias_mode}" if bias_enable else ""
+                if single_strip:
+                    # ----- Single-strip straight-line: no loop, no entry abs-jump (i-cache refill). -----
+                    _emit_strip(gpr_N_reg, advance=False)
+                    _emit_final_wb()
+                    print(f"{fn}: single-strip straight-line (M=1, K=GPR[{gpr_K_reg}], N=GPR[{gpr_N_reg}] "
+                          f"<= N_chunk={ct_N_chunk}{_bias_tag}; no abs-jump, batched writeback)")
+                else:
+                    # ----- Phase 4: N-strip while-loop (entry abs-jump anchors the resident backward
+                    # loop-back); the batched writeback fires ONCE after the loop. -----
+                    program_dram_start_addr = self.get_program_dram_addr()
+                    cur = self.capture_count
+                    self.generate_instruction_jump_abs(ue_35bit_addr_shifter(
+                        program_dram_start_addr + (cur + 1) * INSTRUCTION_SIZE_BYTES))
+                    self.generate_instruction_add_imm(src_reg_idx=gpr_N_reg, immediate_value=0, dst_reg_idx=N_counter_reg)
+                    self.generate_instruction_reg_min(n_take_reg, N_counter_reg, N_chunk_reg)
+                    body_start = self.capture_count
+                    _emit_strip(n_take_reg, advance=True)
+                    # N-counter update / loop back
+                    self.generate_instruction_reg_sub(N_counter_reg, N_counter_reg, n_take_reg)
+                    self.generate_instruction_reg_min(n_take_reg, N_counter_reg, N_chunk_reg)
+                    loop_sz = self.capture_count - body_start + 2
+                    self.generate_instruction_jump_rela_jnz(loop_sz, N_counter_reg)
+                    assert loop_sz <= 256, f"{fn}: N-loop body {loop_sz} exceeds i-cache budget 256"
+                    _emit_final_wb()
+                    print(f"{fn}: N-loop body={loop_sz} (M=1, K=GPR[{gpr_K_reg}], N=GPR[{gpr_N_reg}] runtime{_bias_tag}, "
+                          f"1-pass streaming quantized dot, batched writeback)")
+
+                if bias_enable:
+                    self.release_inst_ptr(ptr_bias)
+                self.release_inst_ptr(ptr_dot)
+                self.release_inst_ptr(ptr_scale)
+
             else:
-                # ----- Phase 4: N-strip while-loop (entry abs-jump anchors the resident backward
-                # loop-back); the batched writeback fires ONCE after the loop. -----
+                # ======================= sub-64 large-K fallback (strip_w in {16, 32}) =======================
+                # A 64-wide strip's scales overflow the scale BRAM, so each strip is strip_w (16/32) columns.
+                # N is a multiple of 64 and strip_w divides 64, so every strip is exactly strip_w wide (no
+                # remainder) and there are N/strip_w strips. Each partial dot writes strip_w valid outputs
+                # into a padded 64-wide URAM_B row (row 0, reused every strip), so the batched writeback is
+                # replaced by a per-strip DMA of strip_w elements. strip_w*K_rows / K_rows / strip_w are the
+                # only runtime quantities; the per-strip byte/word strides are precomputed once.
+                out_words = strip_w // 4         # strip_w*2 bytes >> 3 (output/bias DRAM word advance per strip)
+                out_bytes = strip_w * 2          # per-strip writeback / bias DMA length (bytes)
+
+                K_rows_reg     = _alloc()   # K/64 (dot depth)
+                N_counter_reg  = _alloc()   # remaining columns
+                b_dram_reg     = _alloc()   # running quantized-B strip DRAM word cursor
+                scale_dram_reg = _alloc()   # running scale strip DRAM word cursor
+                out_dram_reg   = _alloc()   # running OUTPUT DRAM word cursor (per-strip writeback)
+                strip_blocks_reg = _alloc() # strip_w * K_rows (scale blocks per strip) — constant
+                strip_w_reg    = _alloc()   # strip_w constant (for the N counter decrement)
+                dot_bytes_reg  = _alloc()   # strip_blocks << b_dma_shift (B stream bytes) — constant
+                scale_bytes_reg = _alloc()  # strip_blocks << 1 (scale bytes) — constant
+                b_adv_reg      = _alloc()   # strip_blocks << b_word_shift (B word advance) — constant
+                scale_adv_reg  = _alloc()   # strip_blocks >> 2 (scale word advance) — constant
+                bias_dram_reg  = _alloc() if bias_enable else None
+                s1 = _alloc()
+
+                # ----- Phase 1: precompute the constant per-strip strides -----
+                self.generate_instruction_shr(K_rows_reg, gpr_K_reg, 6)               # K_rows = K/64
+                self.generate_instruction_shl(strip_blocks_reg, K_rows_reg, strip_w_log2)  # strip_w*K_rows
+                self.generate_instruction_add_set(strip_w_reg, strip_w)
+                self.generate_instruction_shl(dot_bytes_reg, strip_blocks_reg, b_dma_shift)
+                self.generate_instruction_shl(scale_bytes_reg, strip_blocks_reg, 1)
+                self.generate_instruction_shl(b_adv_reg, strip_blocks_reg, b_word_shift)
+                self.generate_instruction_shr(scale_adv_reg, strip_blocks_reg, 2)
+
+                # ----- Phase 2: one-shot A vector (1xK) load into URAM_A -----
+                ptr_A = self.alloc_inst_ptr()
+                self.generate_instruction_pbi_init(dram_shared_addr=A_DRAM_ADDR, uram_dst_addr=a_urow, inst_pointer_idx=ptr_A)
+                if gpr_a_addr is not None:
+                    self._pbi_override_dram_base_from_gpr(ptr_A, gpr_a_addr)
+                self.generate_instruction_shl(s1, gpr_K_reg, 1)                        # K*2 bytes
+                _set(ptr_A, PBI_FIELD.DMA_LENGTH, s1)
+                self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=SRAM_A, element_size=0, inst_pointer_idx=ptr_A)
+                self.release_inst_ptr(ptr_A)
+
+                # ----- Phase 3: loop-live pointers. The dot's OUTPUT_SIZE=strip_w, DMA_LENGTH and
+                # URAM_ROW_SIZE, plus the scale/bias/writeback DMA lengths, are all constant across strips
+                # and set ONCE here; only the DRAM_ADDR fields advance in the loop. -----
+                ptr_scale = self.alloc_inst_ptr()
+                ptr_dot   = self.alloc_inst_ptr()
+                ptr_wb    = self.alloc_inst_ptr()
+                ptr_bias  = self.alloc_inst_ptr() if bias_enable else None
+                self.generate_instruction_pbi_init(dram_shared_addr=SCALE_DRAM_ADDR, inst_pointer_idx=ptr_scale)
+                self.generate_instruction_pbi_init(dram_shared_addr=B_DRAM_ADDR, uram_a_start_addr=a_urow,
+                                                   uram_wb_addr=out_urow, output_size=strip_w, inst_pointer_idx=ptr_dot)
+                self.generate_instruction_pbi_init(dram_shared_addr=OUTPUT_DRAM_ADDR, inst_pointer_idx=ptr_wb)
+                if bias_enable:
+                    self.generate_instruction_pbi_init(dram_shared_addr=C_DRAM_ADDR, inst_pointer_idx=ptr_bias)
+                # constant fields (set once)
+                _set(ptr_dot, PBI_FIELD.URAM_ROW_SIZE, K_rows_reg)
+                _set(ptr_dot, PBI_FIELD.DMA_LENGTH, dot_bytes_reg)
+                _set(ptr_scale, PBI_FIELD.DMA_LENGTH, scale_bytes_reg)
+                self.generate_instruction_add_set(s1, out_bytes)
+                _set(ptr_wb, PBI_FIELD.DMA_LENGTH, s1)
+                if bias_enable:
+                    _set(ptr_bias, PBI_FIELD.DMA_LENGTH, s1)
+
+                _seed(b_dram_reg, B_BASE_W, gpr_b_addr)
+                _seed(scale_dram_reg, SCALE_BASE_W, gpr_scale_addr)
+                _seed(out_dram_reg, OUT_BASE_W, gpr_out_addr)
+                if bias_enable:
+                    _seed(bias_dram_reg, C_BASE_W, gpr_c_addr)
+                self.generate_instruction_add_imm(src_reg_idx=gpr_N_reg, immediate_value=0, dst_reg_idx=N_counter_reg)
+
+                # ----- Phase 4: N-strip while-loop (entry abs-jump anchors the backward loop-back) -----
                 program_dram_start_addr = self.get_program_dram_addr()
                 cur = self.capture_count
                 self.generate_instruction_jump_abs(ue_35bit_addr_shifter(
                     program_dram_start_addr + (cur + 1) * INSTRUCTION_SIZE_BYTES))
-                self.generate_instruction_add_imm(src_reg_idx=gpr_N_reg, immediate_value=0, dst_reg_idx=N_counter_reg)
-                self.generate_instruction_reg_min(n_take_reg, N_counter_reg, N_chunk_reg)
                 body_start = self.capture_count
-                _emit_strip(n_take_reg, advance=True)
-                # N-counter update / loop back
-                self.generate_instruction_reg_sub(N_counter_reg, N_counter_reg, n_take_reg)
-                self.generate_instruction_reg_min(n_take_reg, N_counter_reg, N_chunk_reg)
-                loop_sz = self.capture_count - body_start + 2
-                self.generate_instruction_jump_rela_jnz(loop_sz, N_counter_reg)
-                assert loop_sz <= 256, f"{fn}: N-loop body {loop_sz} exceeds i-cache budget 256"
-                _emit_final_wb()
-                print(f"{fn}: N-loop body={loop_sz} (M=1, K=GPR[{gpr_K_reg}], N=GPR[{gpr_N_reg}] runtime, "
-                      f"1-pass streaming quantized dot, batched writeback, 2 loop PBI pointers)")
 
-            self.release_inst_ptr(ptr_dot)
-            self.release_inst_ptr(ptr_scale)
+                # (1) scale strip -> scale BRAM
+                _set(ptr_scale, PBI_FIELD.DRAM_ADDR, scale_dram_reg)
+                self.ue_memcpy_from_dram(0, 0, MEMCPY_TYPE.BRAM.value, 0, 0, inst_pointer_idx=ptr_scale)
+                # (1b) bias slice -> bias BRAM
+                if bias_enable:
+                    _set(ptr_bias, PBI_FIELD.DRAM_ADDR, bias_dram_reg)
+                    self.ue_memcpy_from_dram(0, 0, MEMCPY_TYPE.BIAS_BRAM.value, 0, 0, inst_pointer_idx=ptr_bias)
+                # (2) 1-pass streaming dot -> URAM_B row 0 (padded, strip_w valid outputs)
+                _set(ptr_dot, PBI_FIELD.DRAM_ADDR, b_dram_reg)
+                self.ue_arithmetic_op(
+                    0, 1, 1, lalu_a, lalu_b, lalu_mode.value, 0,
+                    out_type.value, 0, out_urow, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+                    UE_MODE.DOT_PRODUCT, data_type.value,
+                    a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot)
+                # (3) per-strip writeback: strip_w valid elements URAM_B row 0 -> OUTPUT DRAM cursor
+                if not write_back_disable:
+                    _set(ptr_wb, PBI_FIELD.DRAM_ADDR, out_dram_reg)
+                    self.ue_memcpy_to_dram(memcpy_type=MEMCPY_TYPE.URAM.value, uram_type=out_type.value,
+                                           uram_src_addr=out_urow, dram_dst_addr=0, memcpy_length_bytes=0,
+                                           inst_pointer_idx=ptr_wb)
+                # (4) advance cursors + N counter
+                self.generate_instruction_add_reg(b_dram_reg, b_dram_reg, b_adv_reg)
+                self.generate_instruction_add_reg(scale_dram_reg, scale_dram_reg, scale_adv_reg)
+                self.generate_instruction_add_imm(src_reg_idx=out_dram_reg, immediate_value=out_words, dst_reg_idx=out_dram_reg)
+                if bias_enable:
+                    self.generate_instruction_add_imm(src_reg_idx=bias_dram_reg, immediate_value=out_words, dst_reg_idx=bias_dram_reg)
+                self.generate_instruction_reg_sub(N_counter_reg, N_counter_reg, strip_w_reg)
+                # body_start == the abs-jump anchor (no setup instrs between), so the backward jump lands
+                # exactly on body_start with a +1 offset (mirrors the M>1 outer M-tile loop convention).
+                loop_sz = self.capture_count - body_start + 1
+                self.generate_instruction_jump_rela_jnz(loop_sz, N_counter_reg)
+                assert loop_sz <= 256, f"{fn}: sub-64 N-loop body {loop_sz} exceeds i-cache budget 256"
+
+                if bias_enable:
+                    self.release_inst_ptr(ptr_bias)
+                for ptr in (ptr_wb, ptr_dot, ptr_scale):
+                    self.release_inst_ptr(ptr)
+                _bias_tag = f", bias={bias_mode}" if bias_enable else ""
+                print(f"{fn}: sub-64 large-K fallback strip_w={strip_w} N-loop body={loop_sz} "
+                      f"(M=1, K=GPR[{gpr_K_reg}], N=GPR[{gpr_N_reg}] runtime{_bias_tag}, per-strip writeback)")
+
             for _ in range(len(_alloc_list)):
                 self.release_isa_reg()
 
@@ -7824,32 +7991,40 @@ class UnifiedEngine:
             # General M>1 path: M-tile / N-strip / per-row nested runtime while-loop, mirroring
             # matmat_mul_core_dynamic's tiling skeleton (URAM-capacity tiling + strided writeback
             # via PBI_FIELD.STRIDE_JUMP), but keeping the 1-pass streaming quantized dot instead of
-            # matmat's 2-pass dequantize-then-bf16-dot body. Needs only 4 distinct PBI pointers
-            # (A-load / scale / dot / writeback) since there is no dequantize-to-URAM_B step.
-            # EXPERIMENTAL / HW-UNVALIDATED (see class docstring for the M==1 path, which is
-            # untouched and remains the HW-validated production decode path).
+            # matmat's 2-pass dequantize-then-bf16-dot body. Supports bias (broadcast_N once per
+            # strip / full_matrix per row) and the sub-64 large-K column-strip fallback (strip_w in
+            # {16,32}, per-row writeback of the padded output rows). EXPERIMENTAL / HW-UNVALIDATED
+            # (see class docstring for the M==1 path, which remains the HW-validated production path).
             # ================================================================================
+            sub64 = strip_w is not None
+            bcast_bias = bias_enable and bias_mode == "broadcast_N"
+            full_bias  = bias_enable and bias_mode == "full_matrix"
+
             _alloc_list = []
             def _alloc():
                 r = self.alloc_isa_reg(); _alloc_list.append(r); return r
 
             K_rows_reg      = _alloc()   # K/64 (dot depth)
             M_chunk_reg     = _alloc()   # rows per M-tile (URAM_A capacity bound)
-            N_chunk_reg     = _alloc()   # column strip width (scale-BRAM + output-capacity bound, 64-aligned)
+            N_chunk_reg     = _alloc()   # column strip width (scale-BRAM + output-capacity bound; 64-aligned, or strip_w)
             gpr_M_counter   = _alloc()   # remaining M rows
             m_take_reg      = _alloc()   # min(remaining, M_chunk); reused as the row-loop counter
             m_tile_rows_reg = _alloc()   # m_take snapshot that survives the N-strip/row loops
             rows_done_reg   = _alloc()   # M rows completed before the current M-tile
             N_counter_reg   = _alloc()   # remaining N columns within this M-tile
             n_take_reg      = _alloc()   # min(remaining, N_chunk)
-            n_take_rows_reg = _alloc()   # n_take/64 (N is always 64-aligned; see feasibility check above)
+            n_take_rows_reg = _alloc()   # n_take/64 (main path) or 1 (sub-64 padded output rows)
             a_row_reg       = _alloc()   # URAM_A row cursor for the current row within the tile
             out_row_reg     = _alloc()   # URAM_B row cursor for the current row's output
             a_dram_reg      = _alloc()   # running A DRAM word cursor
             b_dram_reg      = _alloc()   # running quantized-B strip DRAM word cursor (reset per tile)
             scale_dram_reg  = _alloc()   # running scale strip DRAM word cursor (reset per tile)
             k_row_word_stride_reg = _alloc()  # K_rows << 4 (A-matrix row word-stride)
-            n_stride_bytes_reg    = _alloc()  # N*2 bytes (DRAM row stride for the strided writeback)
+            n_row_words_reg = _alloc()        # N/4 (output DRAM row word stride; full_matrix bias row stride)
+            n_stride_bytes_reg = _alloc() if not sub64 else None  # N*2 bytes (strided writeback DRAM row stride)
+            bias_full_row_reg  = _alloc() if full_bias else None  # running full_matrix bias DRAM word cursor
+            wb_row_reg     = _alloc() if sub64 else None          # sub-64 per-row writeback DRAM word cursor
+            wb_out_row_reg = _alloc() if sub64 else None          # sub-64 per-row writeback URAM_B row cursor
             s1 = _alloc()
             s2 = _alloc()
             s3 = _alloc()
@@ -7869,42 +8044,53 @@ class UnifiedEngine:
 
             # ----- Phase 1: tiling arithmetic (mirrors quantized_matmat_core's static formula:
             # M_chunk bound by URAM_A capacity, N_chunk bound by scale BRAM AND by the output tile
-            # (M_chunk x N_chunk) fitting URAM_B) -----
+            # (M_chunk x N_chunk) fitting URAM_B). sub-64 bakes N_chunk = strip_w. -----
             self.generate_instruction_shr(K_rows_reg, gpr_K_reg, 6)                    # K_rows = K/64
             self.generate_instruction_add_set(s1, URAM_FULL_ELEMENTS)
             self.generate_instruction_div_reg(M_chunk_reg, s1, gpr_K_reg)              # URAM_FULL // K
             self.generate_instruction_reg_min(M_chunk_reg, M_chunk_reg, gpr_M_reg)
 
-            self.generate_instruction_add_set(s1, SCALE_BRAM_ELEMENTS)
-            self.generate_instruction_div_reg(s1, s1, K_rows_reg)                      # scale-BRAM bound (elements)
-            self.generate_instruction_shr(N_chunk_reg, s1, 6)
-            self.generate_instruction_shl(N_chunk_reg, N_chunk_reg, 6)                 # aligned down to 64
+            if not sub64:
+                self.generate_instruction_add_set(s1, SCALE_BRAM_ELEMENTS)
+                self.generate_instruction_div_reg(s1, s1, K_rows_reg)                  # scale-BRAM bound (elements)
+                self.generate_instruction_shr(N_chunk_reg, s1, 6)
+                self.generate_instruction_shl(N_chunk_reg, N_chunk_reg, 6)             # aligned down to 64
 
-            self.generate_instruction_add_set(s2, URAM_FULL_ELEMENTS)
-            self.generate_instruction_div_reg(s2, s2, M_chunk_reg)                     # URAM_FULL // M_chunk
-            self.generate_instruction_shr(s2, s2, 6)
-            self.generate_instruction_shl(s2, s2, 6)
-            self.generate_instruction_reg_min(N_chunk_reg, N_chunk_reg, s2)
-            self.generate_instruction_reg_min(N_chunk_reg, N_chunk_reg, gpr_N_reg)
+                self.generate_instruction_add_set(s2, URAM_FULL_ELEMENTS)
+                self.generate_instruction_div_reg(s2, s2, M_chunk_reg)                 # URAM_FULL // M_chunk
+                self.generate_instruction_shr(s2, s2, 6)
+                self.generate_instruction_shl(s2, s2, 6)
+                self.generate_instruction_reg_min(N_chunk_reg, N_chunk_reg, s2)
+                self.generate_instruction_reg_min(N_chunk_reg, N_chunk_reg, gpr_N_reg)
+            else:
+                # A 64-wide strip's scales overflow the scale BRAM; fixed strip_w columns per strip
+                # (N is a multiple of 64 and strip_w divides 64, so every strip is exactly strip_w wide).
+                self.generate_instruction_add_set(N_chunk_reg, strip_w)
 
             self.generate_instruction_add_imm(src_reg_idx=gpr_M_reg, immediate_value=0, dst_reg_idx=gpr_M_counter)
             self.generate_instruction_reg_min(m_take_reg, gpr_M_counter, M_chunk_reg)
 
             self.generate_instruction_shl(k_row_word_stride_reg, K_rows_reg, 4)        # K_rows*16 words/A-row
-            self.generate_instruction_shl(n_stride_bytes_reg, gpr_N_reg, 1)            # N*2 bytes
+            self.generate_instruction_shr(n_row_words_reg, gpr_N_reg, 2)               # N/4 words/output row
+            if not sub64:
+                self.generate_instruction_shl(n_stride_bytes_reg, gpr_N_reg, 1)        # N*2 bytes
 
             _seed_cursor(a_dram_reg, A_BASE_W, gpr_a_addr)
 
-            # ----- Phase 2: PBI pointer inits (outside all loops; 4 distinct pointers total) -----
+            # ----- Phase 2: PBI pointer inits (outside all loops; 4 pointers, +1 for bias) -----
             ptr_A     = self.alloc_inst_ptr()
             ptr_scale = self.alloc_inst_ptr()
             ptr_dot   = self.alloc_inst_ptr()
             ptr_wb    = self.alloc_inst_ptr()
+            ptr_bias  = self.alloc_inst_ptr() if bias_enable else None
             self.generate_instruction_pbi_init(dram_shared_addr=A_DRAM_ADDR, uram_dst_addr=a_urow, inst_pointer_idx=ptr_A)
             self.generate_instruction_pbi_init(dram_shared_addr=SCALE_DRAM_ADDR, inst_pointer_idx=ptr_scale)
             self.generate_instruction_pbi_init(dram_shared_addr=B_DRAM_ADDR, inst_pointer_idx=ptr_dot)
             self.generate_instruction_pbi_init(dram_shared_addr=OUTPUT_DRAM_ADDR, inst_pointer_idx=ptr_wb)
-            _set(ptr_wb, PBI_FIELD.STRIDE_JUMP, n_stride_bytes_reg)
+            if bias_enable:
+                self.generate_instruction_pbi_init(dram_shared_addr=C_DRAM_ADDR, inst_pointer_idx=ptr_bias)
+            if not sub64:
+                _set(ptr_wb, PBI_FIELD.STRIDE_JUMP, n_stride_bytes_reg)
 
             # ----- Phase 3: M-tile while-loop (abs-jump anchors the resident backward loop-back) -----
             program_dram_start_addr = self.get_program_dram_addr()
@@ -7946,7 +8132,29 @@ class UnifiedEngine:
             _set(ptr_dot, PBI_FIELD.DMA_LENGTH, s1)
             _set(ptr_dot, PBI_FIELD.OUTPUT_SIZE, n_take_reg)
             _set(ptr_dot, PBI_FIELD.URAM_ROW_SIZE, K_rows_reg)
-            self.generate_instruction_shr(n_take_rows_reg, n_take_reg, 6)   # exact: n_take always 64-aligned
+            if not sub64:
+                self.generate_instruction_shr(n_take_rows_reg, n_take_reg, 6)   # n_take/64 (64-aligned strips)
+            else:
+                self.generate_instruction_add_set(n_take_rows_reg, 1)           # each row -> one padded URAM_B row
+
+            # ----- bias: broadcast_N loads bias[cols_done .. +n_take) ONCE per strip (shared by all rows);
+            # full_matrix seeds a per-row DRAM cursor + constant DMA length here and reloads inside the row loop. -----
+            if bcast_bias:
+                self.generate_instruction_reg_sub(s1, gpr_N_reg, N_counter_reg)          # cols_done
+                self.generate_instruction_shr(s1, s1, 2)                                 # cols_done*2>>3 -> words
+                _off_plus_base(s1, C_BASE_W, gpr_c_addr, s1)
+                _set(ptr_bias, PBI_FIELD.DRAM_ADDR, s1)
+                self.generate_instruction_shl(s1, n_take_reg, 1)                         # n_take*2 bytes
+                _set(ptr_bias, PBI_FIELD.DMA_LENGTH, s1)
+                self.ue_memcpy_from_dram(0, 0, MEMCPY_TYPE.BIAS_BRAM.value, 0, 0, inst_pointer_idx=ptr_bias)
+            elif full_bias:
+                self.generate_instruction_mul32_reg(s1, rows_done_reg, gpr_N_reg)        # rows_done*N
+                self.generate_instruction_reg_sub(s2, gpr_N_reg, N_counter_reg)          # cols_done
+                self.generate_instruction_add_reg(s1, s1, s2)
+                self.generate_instruction_shr(s1, s1, 2)                                 # (rows_done*N+cols_done) words
+                _off_plus_base(s1, C_BASE_W, gpr_c_addr, bias_full_row_reg)
+                self.generate_instruction_shl(s1, n_take_reg, 1)                         # n_take*2 bytes (constant per strip)
+                _set(ptr_bias, PBI_FIELD.DMA_LENGTH, s1)
 
             # ----- M-row dot loop (inner) -----
             self.generate_instruction_add_set(a_row_reg, a_urow)
@@ -7954,13 +8162,18 @@ class UnifiedEngine:
             row_body = self.capture_count
             _set(ptr_dot, PBI_FIELD.URAM_START_ADDR_Y, a_row_reg)
             _set(ptr_dot, PBI_FIELD.URAM_WRITEB_ADDR, out_row_reg)
+            if full_bias:
+                _set(ptr_bias, PBI_FIELD.DRAM_ADDR, bias_full_row_reg)
+                self.ue_memcpy_from_dram(0, 0, MEMCPY_TYPE.BIAS_BRAM.value, 0, 0, inst_pointer_idx=ptr_bias)
             self.ue_arithmetic_op(
                 0, 1, 1, lalu_a, lalu_b, lalu_mode.value, 0,
                 out_type.value, 0, out_urow, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
                 UE_MODE.DOT_PRODUCT, data_type.value,
-                a_urow, 0, 0, 0, 0, 0, inst_pointer_idx=ptr_dot)
+                a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot)
             self.generate_instruction_add_reg(a_row_reg, a_row_reg, K_rows_reg)
             self.generate_instruction_add_reg(out_row_reg, out_row_reg, n_take_rows_reg)
+            if full_bias:
+                self.generate_instruction_add_reg(bias_full_row_reg, bias_full_row_reg, n_row_words_reg)
             row_loop_sz = self.capture_count - row_body + 2
             self.generate_instruction_add_dec(m_take_reg)
             self.generate_instruction_jump_rela_jnz(row_loop_sz, m_take_reg)
@@ -7973,8 +8186,9 @@ class UnifiedEngine:
             self.generate_instruction_mul32_shr_reg(s1, n_take_reg, K_rows_reg, 2)
             self.generate_instruction_add_reg(scale_dram_reg, scale_dram_reg, s1)
 
-            # ----- strided writeback for this (M-tile, N-strip) -----
-            if not write_back_disable:
+            # ----- writeback for this (M-tile, N-strip) -----
+            if not write_back_disable and not sub64:
+                # One strided DMA for the whole m_take x n_take tile (n_take 64-aligned -> contiguous URAM).
                 self.generate_instruction_mul32_shl_reg(s1, m_tile_rows_reg, n_take_reg, 1)   # m_take*n_take*2 (total)
                 _set(ptr_wb, PBI_FIELD.DMA_LENGTH, s1)
                 self.generate_instruction_shl(s2, n_take_reg, 1)                               # n_take*2 (chunk)
@@ -7991,6 +8205,32 @@ class UnifiedEngine:
                 self.ue_memcpy_to_dram(memcpy_type=MEMCPY_TYPE.URAM.value, uram_type=out_type.value,
                                        uram_src_addr=0, dram_dst_addr=0, memcpy_length_bytes=0,
                                        inst_pointer_idx=ptr_wb, pbi_stride_en=True)
+            elif not write_back_disable:
+                # sub-64 per-row writeback: each row's strip_w padded outputs (URAM_B row cursor) -> DRAM
+                # row [global_row, cols_done .. +strip_w). URAM rows are padded to 64, so copy only the
+                # valid strip_w=n_take elements per row (no strided DMA).
+                self.generate_instruction_shl(s1, n_take_reg, 1)                               # n_take*2 bytes
+                _set(ptr_wb, PBI_FIELD.DMA_LENGTH, s1)
+                self.generate_instruction_mul32_reg(s1, rows_done_reg, gpr_N_reg)
+                self.generate_instruction_reg_sub(s2, gpr_N_reg, N_counter_reg)                # cols_done
+                self.generate_instruction_add_reg(s1, s1, s2)
+                self.generate_instruction_shr(s1, s1, 2)                                       # (rows_done*N+cols_done) words
+                _off_plus_base(s1, OUT_BASE_W, gpr_out_addr, wb_row_reg)
+                self.generate_instruction_add_set(wb_out_row_reg, out_urow)                    # URAM_B row 0
+                wb_body = self.capture_count
+                _set(ptr_wb, PBI_FIELD.DRAM_ADDR, wb_row_reg)
+                _set(ptr_wb, PBI_FIELD.URAM_START_ADDR_Y, wb_out_row_reg)
+                _set(ptr_wb, PBI_FIELD.URAM_START_ADDR_Z, wb_out_row_reg)
+                self.ue_memcpy_to_dram(memcpy_type=MEMCPY_TYPE.URAM.value, uram_type=out_type.value,
+                                       uram_src_addr=0, dram_dst_addr=0, memcpy_length_bytes=0,
+                                       inst_pointer_idx=ptr_wb)
+                self.generate_instruction_add_reg(wb_row_reg, wb_row_reg, n_row_words_reg)      # += N/4 (next DRAM row)
+                self.generate_instruction_add_imm(src_reg_idx=wb_out_row_reg, immediate_value=1, dst_reg_idx=wb_out_row_reg)
+                wb_loop_sz = self.capture_count - wb_body + 2
+                self.generate_instruction_add_dec(m_take_reg)
+                self.generate_instruction_jump_rela_jnz(wb_loop_sz, m_take_reg)
+                assert wb_loop_sz <= 256, f"{fn}: sub-64 writeback loop body {wb_loop_sz} exceeds i-cache budget 256"
+                self.generate_instruction_add_imm(src_reg_idx=m_tile_rows_reg, immediate_value=0, dst_reg_idx=m_take_reg)
 
             # ----- N-counter update / loop back -----
             self.generate_instruction_reg_sub(N_counter_reg, N_counter_reg, n_take_reg)
@@ -8007,17 +8247,22 @@ class UnifiedEngine:
             self.generate_instruction_jump_rela_jnz(m_loop_sz, gpr_M_counter)
             assert m_loop_sz <= 512, f"{fn}: M-tile loop body {m_loop_sz} exceeds i-cache budget 512"
 
+            _bias_tag = f", bias={bias_mode}" if bias_enable else ""
+            _strip_tag = f", sub-64 strip_w={strip_w}" if sub64 else ", strided writeback"
             print(f"{fn}: general M>1 path, M-tile/N-strip/row loop body={m_loop_sz} "
-                  f"(M=GPR[{gpr_M_reg}], K=GPR[{gpr_K_reg}], N=GPR[{gpr_N_reg}] runtime, "
-                  f"1-pass streaming quantized dot, strided writeback, 4 PBI pointers) "
-                  f"[EXPERIMENTAL / HW-UNVALIDATED]")
+                  f"(M=GPR[{gpr_M_reg}], K=GPR[{gpr_K_reg}], N=GPR[{gpr_N_reg}] runtime{_bias_tag}{_strip_tag}, "
+                  f"1-pass streaming quantized dot) [EXPERIMENTAL / HW-UNVALIDATED]")
 
+            if bias_enable:
+                self.release_inst_ptr(ptr_bias)
             for ptr in (ptr_wb, ptr_dot, ptr_scale, ptr_A):
                 self.release_inst_ptr(ptr)
             for _ in range(len(_alloc_list)):
                 self.release_isa_reg()
 
         total_flops = 2 * M * N * K
+        if bias_enable:
+            total_flops += M * N
         if gelu_enable or silu_enable or sigmoid_enable:
             total_flops += 4 * M * N
         elif clamp_enable:
