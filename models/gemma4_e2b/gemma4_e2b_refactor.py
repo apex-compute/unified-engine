@@ -79,7 +79,7 @@ VISION_QUANT_PRECISION = "if4"
 # lets the vision encoder bin be compiled once for a fixed shape.
 VISION_CANONICAL_SIZE = (896, 896)   # (width, height) for PIL.Image.resize
 VISION_FIXED_NUM_PATCHES = 2520
-LM_PROGRAM_CACHE_VERSION = 10
+LM_PROGRAM_CACHE_VERSION = 16
 
 # Shipped sample image for VLM mode (same as gemma4_e2b_test.py's DEFAULT_IMAGE):
 # repo test_samples/yosemite.jpg, two folders up from this script.
@@ -1040,7 +1040,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         non_layer = [
             (s["key"], f"{s['key']}_SIZE", s["attr"])
             for s in self._cfg["layers"]["non_layer"]
-            if s["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")  # RoPE loaded via _load_rope_host()
+            if s["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")  # loaded via _load_rope_host()
         ]
 
         last_structure_key = self._cfg["layers"]["structure"][-1]["key"]
@@ -1196,8 +1196,15 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # GEMMA4_PENALTY is temporarily rejected.
         self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
 
-        # Per-layer input injection buffers
-        # PER_LAYER_INPUTS_DRAM: holds per_layer_inputs for all layers: MAX_CONTEXT_SIZE x 35 x 256 x 2 bytes
+        # Per-layer input preparation + injection buffers.  The host uploads
+        # only token-indexed rows from embed_tokens_per_layer; FPGA performs
+        # model projection, RMSNorm, add and scaling into PER_LAYER_INPUTS_DRAM.
+        pli_elements = self.MAX_CONTEXT_SIZE * self.LAYER_SIZE * self.per_layer_input_dim
+        self.PER_LAYER_EMBED_DRAM = self.allocate_tensor_dram(
+            pli_elements * self.bytes_per_element)
+        self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(
+            pli_elements * self.bytes_per_element)
+        # Final layout is [token, layer, dim], consumed by injection blocks.
         self.PER_LAYER_INPUTS_DRAM = self.allocate_tensor_dram(self.MAX_CONTEXT_SIZE * self.LAYER_SIZE * self.per_layer_input_dim * self.bytes_per_element)
         # Intermediate DRAMs for per-layer injection
         self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.per_layer_input_dim * self.bytes_per_element)
@@ -2466,9 +2473,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         seq_len=1), but the row count is applied indirectly through gpr_seq_len
         at runtime, so a single captured program is valid for any prompt length:
           * gate / projection matmuls read M from gpr_seq_len (M= is template);
-          * per_layer_input is packed [layer, token, dim] with a seq_len row
-            stride, so its per-layer base is computed from gpr_seq_len and the
-            gate*per_layer_input multiply runs as a per-row ISA loop;
+          * per_layer_input is packed [token, layer, dim], so a layer slice
+            starts at its offset within token 0 and advances by one complete
+            token stride in the gate*per_layer_input ISA loop;
           * the fused rms_norm + residual + layer_scalar step is a plain per-row
             ISA loop — one row resident at a time, no chunking / SRAM reuse.
         """
@@ -2485,18 +2492,17 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM,
             gelu_enable=True, gpr_M_reg=self.gpr_seq_len)
 
-        # gated = gate * per_layer_input[layer_idx], per-row (runtime trip count).
-        # per_layer_input[layer] base = PER_LAYER_INPUTS_DRAM + layer*seq_len*dim*bpe,
-        # computed from gpr_seq_len; a running pointer walks one row per iteration.
+        # gated = gate * per_layer_input[token, layer_idx], per row. Prepared
+        # inputs stay token-major, so the pointer starts at the layer slice and
+        # advances by the full 35*dim token stride.
         gate_dram = self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM
         # eltwise operands must live in different URAM banks (split at 0x80000):
         # A in URAM_A (<0x80000), B in URAM_B (>=0x80000).
         sram_a, sram_b = 0x10000, 0x80000
         _pli = self.alloc_isa_reg()
-        self.generate_instruction_reg_mul_imm(_pli, self.gpr_seq_len,
-            ue_35bit_addr_shifter(layer_idx * dim * bpe))
-        self.generate_instruction_add_imm(_pli,
-            ue_35bit_addr_shifter(self.PER_LAYER_INPUTS_DRAM), _pli)
+        self.generate_instruction_add_set(
+            _pli, ue_35bit_addr_shifter(
+                self.PER_LAYER_INPUTS_DRAM + layer_idx * dim * bpe))
         _r = self.alloc_isa_reg()
         self.generate_instruction_add_set(_r, 0)
         self.loop_start(loop_cnt=M_tmpl, gpr_loop_cnt=self.gpr_seq_len)
@@ -2517,7 +2523,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.sram_to_accelerator_memory(sram_address=sram_a, accelerator_dram_address=0,
                                         element_size=dim, general_reg_src=self.TMP_REG)
         # advance per_layer_input pointer by one row
-        self.generate_instruction_add_imm(_pli, ue_35bit_addr_shifter(dim * bpe), _pli)
+        self.generate_instruction_add_imm(
+            _pli, ue_35bit_addr_shifter(self.LAYER_SIZE * dim * bpe), _pli)
         self.generate_instruction_add_inc(_r)
         self.loop_end()
         self.release_isa_reg()  # _r
@@ -2692,6 +2699,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             kwargs.pop("is_B_quantized", None)
             return self.quantized_matmat_core(**kwargs)
         prefill_t0 = time.perf_counter()
+        total_flops += self._compile_per_layer_input_prepare(M=seq_len)
+        _checkpoint("per_layer_prepare")
         for layer_idx in range(layer_size):
             if layer_idx > 0 and layer_idx % 10 == 0:
                 _original_print(f"    prefill layer {layer_idx}/{layer_size} ({time.perf_counter()-prefill_t0:.1f}s)")
@@ -2933,6 +2942,75 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = False
         return None, total_flops
 
+    def _lookup_per_layer_embeddings(self, token_ids) -> torch.Tensor:
+        """Return lightweight token-indexed rows as [token, layer, dim]."""
+        tid_t = torch.tensor(token_ids, dtype=torch.long)
+        if hasattr(self, '_mm_types') and self._mm_types is not None:
+            mm_mask = torch.tensor(self._mm_types[:len(token_ids)])
+            tid_t = tid_t.clone()
+            tid_t[(mm_mask == 1) | (mm_mask == 3)] = 0
+        return self.embed_tokens_per_layer_weight[tid_t].reshape(
+            len(token_ids), self.LAYER_SIZE, self.per_layer_input_dim).contiguous()
+
+    def _compile_per_layer_input_prepare(self, M: int,
+                                         layer_count: int | None = None) -> int:
+        """Prepare Gemma4 per-layer inputs entirely on FPGA.
+
+        Computes embedding @ model_projection, then for every token/layer
+        applies projection scale, 256-wide RMSNorm, adds the host-uploaded
+        token-indexed embedding row, applies input scale, and stores the final
+        [token, layer, dim] layout consumed by the injection blocks.
+        """
+        # The exact M is known at compile time (prefill is prompt-length keyed;
+        # decode is M=1), so use the proven fixed-shape BF16 core.  Do not feed
+        # gpr_seq_len into the post-processing loop: that unnecessary dynamic
+        # loop was the source of the non-terminating full-model program.
+        total_flops = self.matmat_mul_core_legacy(
+            M=M, K=self.vector_length,
+            N=self.LAYER_SIZE * self.per_layer_input_dim,
+            A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+            B_DRAM_ADDR=self.DRAM_ADDR_PER_LAYER_MODEL_PROJ,
+            OUTPUT_DRAM_ADDR=self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM)
+        bpe = self.bytes_per_element
+        dim = self.per_layer_input_dim
+        if layer_count is None:
+            layer_count = self.LAYER_SIZE
+        if not 1 <= layer_count <= self.LAYER_SIZE:
+            raise ValueError(f"layer_count must be 1..{self.LAYER_SIZE}, got {layer_count}")
+        if layer_count != self.LAYER_SIZE:
+            # The projection is complete by design; the diagnostic layer_count
+            # only limits comparison, not the bulk preparation itself.
+            layer_count = self.LAYER_SIZE
+        rows = M * self.LAYER_SIZE
+        elements = rows * dim
+
+        # Projection scale is positive and cancels exactly in RMSNorm. Applying
+        # it before a BF16 cast changes only rounding noise, while omitting it
+        # lets the complete [M,35,256] tensor use one proven bulk norm kernel.
+        total_flops += self.rms_norm_core_dram(
+            M=rows, N=dim,
+            A_DRAM_ADDR=self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM,
+            OUTPUT_DRAM_ADDR=self.PER_LAYER_INPUTS_DRAM,
+            GAMMA_DRAM_ADDR=self.DRAM_ADDR_PER_LAYER_PROJ_NORM)
+        self.eltwise_core_dram(
+            M=rows, N=dim,
+            dram_a=self.PER_LAYER_INPUTS_DRAM,
+            dram_b=self.PER_LAYER_EMBED_DRAM,
+            dram_out=self.PER_LAYER_INPUTS_DRAM,
+            mode=UE_MODE.ELTWISE_ADD)
+
+        # Scale in SRAM-sized contiguous chunks; no nested PBI loops.
+        chunk_elements = (0x80000 - 0x10000) // bpe
+        for off in range(0, elements, chunk_elements):
+            take = min(chunk_elements, elements - off)
+            addr = self.PER_LAYER_INPUTS_DRAM + off * bpe
+            self.accelerator_memory_to_sram(addr, 0x10000, take)
+            self.broadcast_mul(self._per_layer_input_scale,
+                               0x10000, 0x10000, take)
+            self.sram_to_accelerator_memory(0x10000, addr, take)
+        total_flops += M * layer_count * dim * 10
+        return total_flops
+
     def _compute_per_layer_inputs(self, token_ids, embedding_tensor: torch.Tensor) -> torch.Tensor:
         """Compute per-layer inputs on host side.
         Args:
@@ -2981,6 +3059,116 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         per_layer_inputs = ((per_layer_proj.float() + per_layer_embed.float()) * self._per_layer_input_scale).to(torch.bfloat16)
 
         return per_layer_inputs  # [seq_len, 35, 256]
+
+    def run_per_layer_prepare_test(self, M: int = 1, layer_count: int = 1) -> None:
+        """Isolate FPGA per-layer preparation and compare against host BF16."""
+        if M < 1:
+            raise ValueError(f"M must be positive, got {M}")
+        token_ids = tuple(self._cfg["default_prefill_tokens"][:M])
+        if len(token_ids) < M:
+            token_ids = token_ids + (token_ids[-1],) * (M - len(token_ids))
+        embedding = self.get_embedding_for_tokens(token_ids)
+        embed_rows = self._lookup_per_layer_embeddings(token_ids)
+        reference = self._compute_per_layer_inputs(token_ids, embedding)
+        reference = reference[:, :layer_count].permute(1, 0, 2).contiguous().float()
+
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding)
+        self.dma_to_accelerator_memory(
+            self.PER_LAYER_EMBED_DRAM,
+            embed_rows)
+
+        self.reset_program_dram_addr()
+        self.clear_inst_id()
+        self.clear_capture_buffer()
+        self.start_capture()
+        flops = self._compile_per_layer_input_prepare(
+            M=M, layer_count=layer_count)
+        self.generate_instruction_halt()
+        self.stop_capture()
+        program_addr = self.get_program_dram_addr()
+        program_bytes = self.get_capture_instruction_size_bytes()
+        self.write_captured_instructions_to_dram(program_addr)
+        self.allocate_program_dram(program_bytes)
+        self.clear_capture_buffer()
+        latency, flop_rate = self.program_execute(
+            program_addr, timeout=20.0, flops=flops)
+
+        actual_token_major = self.dma_from_accelerator_memory(
+            self.PER_LAYER_INPUTS_DRAM,
+            torch.Size([M, self.LAYER_SIZE, self.per_layer_input_dim])).float()
+        actual = actual_token_major[:, :layer_count].permute(1, 0, 2).contiguous()
+        diff = (actual - reference).abs()
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.flatten(), reference.flatten(), dim=0).item()
+        print("\n=== Per-layer preparation isolated test ===")
+        print(f"shape: M={M}, layers={layer_count}, projection=BF16 1536->256/layer")
+        print(f"program: {program_bytes} bytes")
+        print(f"FPGA: {latency/1e3:.3f} ms, {flop_rate:.2f} GFLOPS")
+        print(f"error: max_abs={diff.max().item():.6g}, "
+              f"mean_abs={diff.mean().item():.6g}, cosine={cosine:.8f}")
+        if not torch.isfinite(actual).all() or cosine < 0.99:
+            raise AssertionError("FPGA per-layer preparation does not match host reference")
+        print("PASS")
+
+    def run_per_layer_projection_test(self, M: int = 1, dynamic: bool = False) -> None:
+        """Isolate the complete BF16 1536->8960 projection."""
+        if M < 1:
+            raise ValueError(f"M must be positive, got {M}")
+        token_ids = tuple(self._cfg["default_prefill_tokens"][:M])
+        if len(token_ids) < M:
+            token_ids = token_ids + (token_ids[-1],) * (M - len(token_ids))
+        embedding = self.get_embedding_for_tokens(token_ids)
+        reference = (embedding.float() @ self.per_layer_model_proj_weight.float().T).to(
+            torch.bfloat16).float()
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding)
+
+        self.reset_program_dram_addr()
+        self.clear_inst_id()
+        self.clear_capture_buffer()
+        self.start_capture()
+        if dynamic:
+            gpr_m = self.alloc_isa_reg()
+            self.generate_instruction_add_set(gpr_m, M)
+            flops = self.matmat_mul_core(
+                M=M, K=self.vector_length,
+                N=self.LAYER_SIZE * self.per_layer_input_dim,
+                A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+                B_DRAM_ADDR=self.DRAM_ADDR_PER_LAYER_MODEL_PROJ,
+                OUTPUT_DRAM_ADDR=self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM,
+                gpr_M_reg=gpr_m)
+            self.release_isa_reg()
+        else:
+            flops = self.matmat_mul_core_legacy(
+                M=M, K=self.vector_length,
+                N=self.LAYER_SIZE * self.per_layer_input_dim,
+                A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+                B_DRAM_ADDR=self.DRAM_ADDR_PER_LAYER_MODEL_PROJ,
+                OUTPUT_DRAM_ADDR=self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM)
+        self.generate_instruction_halt()
+        self.stop_capture()
+        program_addr = self.get_program_dram_addr()
+        program_bytes = self.get_capture_instruction_size_bytes()
+        self.write_captured_instructions_to_dram(program_addr)
+        self.allocate_program_dram(program_bytes)
+        self.clear_capture_buffer()
+        latency, flop_rate = self.program_execute(
+            program_addr, timeout=20.0, flops=flops)
+        actual = self.dma_from_accelerator_memory(
+            self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM,
+            torch.Size([M, self.LAYER_SIZE * self.per_layer_input_dim])).float()
+        diff = (actual - reference).abs()
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.flatten(), reference.flatten(), dim=0).item()
+        mode = "dynamic" if dynamic else "legacy"
+        print("\n=== Complete per-layer projection isolated test ===")
+        print(f"shape: M={M}, K={self.vector_length}, N={self.LAYER_SIZE * self.per_layer_input_dim}, core={mode}")
+        print(f"program: {program_bytes} bytes")
+        print(f"FPGA: {latency/1e3:.3f} ms, {flop_rate:.2f} GFLOPS")
+        print(f"error: max_abs={diff.max().item():.6g}, "
+              f"mean_abs={diff.mean().item():.6g}, cosine={cosine:.8f}")
+        if not torch.isfinite(actual).all() or cosine < 0.99:
+            raise AssertionError("complete FPGA per-layer projection does not match host")
+        print("PASS")
 
     def run_prefill(self, prefill_program_addr: int, prefill_seq=None, flops: int = None,
                     profile_checkpoints: list | None = None):
@@ -3078,13 +3266,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         print(f"[Prefill] uploading embeddings to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
 
-        # Compute per-layer inputs on host and DMA to FPGA
-        print(f"[Prefill] [host] computing per-layer inputs ({seq_len} tokens x {self.LAYER_SIZE} layers)...", flush=True)
-        per_layer_inputs = self._compute_per_layer_inputs(prefill_seq, embedding_tensor)  # [seq_len, 35, 256]
-        # Permute to [35, seq_len, 256] so each layer's data is contiguous in DRAM
-        per_layer_inputs_flat = per_layer_inputs.permute(1, 0, 2).contiguous()  # [35, seq_len, 256]
-        print(f"[Prefill] uploading per-layer inputs to FPGA DRAM...", flush=True)
-        self.dma_to_accelerator_memory(self.PER_LAYER_INPUTS_DRAM, per_layer_inputs_flat)
+        # Host performs only the runtime token-indexed lookup. Projection,
+        # normalization, add and scaling run on FPGA.
+        print(f"[Prefill] [host] looking up per-layer embedding rows...", flush=True)
+        per_layer_embed = self._lookup_per_layer_embeddings(prefill_seq)
+        print(f"[Prefill] uploading per-layer embedding rows to FPGA DRAM...", flush=True)
+        self.dma_to_accelerator_memory(
+            self.PER_LAYER_EMBED_DRAM,
+            per_layer_embed)
 
         # Clear multimodal state now that prefill's per-layer-inputs have been computed.
         # Decode reuses _compute_per_layer_inputs with seq_len=1, and if _mm_types
@@ -3239,6 +3428,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_set(gpr_one, 1)
         gpr_group_size = self.alloc_isa_reg()
         self.generate_instruction_add_set(gpr_group_size, self.group_size)
+        total_flops += self._compile_per_layer_input_prepare(M=1)
+        _checkpoint("per_layer_prepare")
         # Iterate once (no bucket loop)
         for _bi_unused in [0]:
             seq_len = self.MAX_CONTEXT_SIZE  # template only — for FLOPs
@@ -3631,8 +3822,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
-            per_layer_inputs = self._compute_per_layer_inputs([token_id], embedding_tensor)
-            self.dma_to_accelerator_memory(self.PER_LAYER_INPUTS_DRAM, per_layer_inputs.permute(1, 0, 2).contiguous())
+            per_layer_embed = self._lookup_per_layer_embeddings([token_id])
+            self.dma_to_accelerator_memory(
+                self.PER_LAYER_EMBED_DRAM,
+                per_layer_embed)
 
             # Build BOTH decode bias matrices. unified_attention_core uses
             # bias_mode="full_matrix", and decoder batch is group_size Q heads.
@@ -3765,10 +3958,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         disk (gemma4_e2b_bin/programs.bin + programs.json). No DRAM is touched —
         run_gemma4() loads it.
 
-        Both programs are seq_len-agnostic (dynamic-PBI: row counts come from
-        gpr_seq_len / gpr_q_seq_len / gpr_aligned_seq_len at runtime), so the
-        cached image is valid for ANY prompt length up to max_prefill_seq_len.
-        Reused as-is whenever programs.bin exists — delete it to force a rebuild.
+        Decoder is seq_len-agnostic. Prefill contains one fixed-shape BF16
+        per-layer model projection, so its cached image is keyed by prompt
+        length; the remainder still uses dynamic-PBI row counts.
 
         set_prefill_seq() MUST have been called first (prefill needs the prompt).
         """
@@ -3787,10 +3979,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             if (_cached_base == self._program_dram_base
                     and _cached_prefill_kernel == self.prefill_kernel
                     and _cached_decode_kernel == self.decode_kernel
+                    and _lm_meta.get("prefill_seq_len") == prefill_seq_len
                     and _cached_version == LM_PROGRAM_CACHE_VERSION):
                 print("[compile] reusing cached LM section "
                       f"(prefill={self.prefill_kernel}, decode={self.decode_kernel}; "
-                      "seq_len-agnostic).")
+                      f"seq_len={prefill_seq_len}).")
                 return
             print("[compile] cached LM section does not match requested configuration "
                   f"(base=0x{_cached_base:X}, prefill={_cached_prefill_kernel}, "
@@ -4005,8 +4198,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         aligned_seq_len = ((self.seq_len + 63) // 64) * 64
         emb = self.get_embedding_for_tokens([token_id])
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, emb)
-        pli = self._compute_per_layer_inputs([token_id], emb)
-        self.dma_to_accelerator_memory(self.PER_LAYER_INPUTS_DRAM, pli.permute(1, 0, 2).contiguous())
+        pli_embed = self._lookup_per_layer_embeddings([token_id])
+        self.dma_to_accelerator_memory(
+            self.PER_LAYER_EMBED_DRAM,
+            pli_embed)
         full_bias = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
         full_bias[:, :self.seq_len] = 0.0
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, full_bias)
@@ -4061,6 +4256,14 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
+    parser.add_argument('--per-layer-prepare-test', type=int, metavar='M', default=None,
+                        help='Run only the isolated FPGA per-layer preparation for M tokens.')
+    parser.add_argument('--per-layer-prepare-layers', type=int, default=1,
+                        help='Number of 256-wide layer slices in the isolated test (default: 1).')
+    parser.add_argument('--per-layer-projection-test', type=int, metavar='M', default=None,
+                        help='Run only the complete BF16 1536->8960 FPGA projection for M tokens.')
+    parser.add_argument('--per-layer-projection-dynamic', action='store_true',
+                        help='Use dynamic matmat_mul_core in --per-layer-projection-test.')
     args = parser.parse_args()
     if args.vision_host and not args.image:
         parser.error("--vision-host requires --image")
@@ -4086,6 +4289,17 @@ default prompt: "x+3=5, what is x?"
         local_weights=args.local_weights,
         prefill_kernel=args.prefill_kernel,
         decode_kernel=args.decode_kernel)
+
+    if args.per_layer_prepare_test is not None:
+        ue.run_per_layer_prepare_test(
+            M=args.per_layer_prepare_test,
+            layer_count=args.per_layer_prepare_layers)
+        return
+    if args.per_layer_projection_test is not None:
+        ue.run_per_layer_projection_test(
+            M=args.per_layer_projection_test,
+            dynamic=args.per_layer_projection_dynamic)
+        return
 
     # Prompt first — the prefill program is compiled for its exact length.
     # VLM mode (--image): run the vision encoder on the FPGA now (separate bin
