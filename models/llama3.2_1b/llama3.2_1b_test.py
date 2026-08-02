@@ -26,6 +26,7 @@ Usage:
   python llama3.2_1b_test.py --prompt "your prompt"
   python llama3.2_1b_test.py --dev xdma0 [--cycle 5.15]
   python llama3.2_1b_test.py --local-weights
+  python llama3.2_1b_test.py --prompt "your prompt" --max-new-tokens 128
 """
 
 import hashlib
@@ -1390,12 +1391,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         bias = (-alpha * count).clamp(min=-cap).to(torch.bfloat16).view(1, vocab)  # bias[t] = clamp(−α · count[t], min = −cap)
         self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM, bias)  # push to buffer
 
-    def run_llama(self) -> None:
+    def run_llama(self, max_new_tokens: int | None = None) -> None:
         """Load the unified instruction image and run prefill + decoder loop.
 
         Primes GPRs via a small captured preamble that jumps into the cached
         prefill or decoder program at runtime.
+
+        ``max_new_tokens`` caps the number of decoded tokens; None or <= 0 decodes
+        until a stop token or MAX_CONTEXT_SIZE.
         """
+        if max_new_tokens is not None and max_new_tokens <= 0:
+            max_new_tokens = None
         # Mode-specific bin/meta (decode matmul kernel + penalty) that compile_llama produced.
         meta_path = getattr(self, "_instruction_meta_path", None) or self._instruction_paths()[1]
         with open(meta_path, "r") as f:
@@ -1554,6 +1560,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             _status_setup()
 
         while self.seq_len < self.MAX_CONTEXT_SIZE:
+            if max_new_tokens is not None and (self.seq_len - prefill_seq_len) >= max_new_tokens:
+                if _use_status:
+                    _status_teardown()
+                print(f"\nDecode token limit reached ({max_new_tokens}).")
+                break
             _SILENT_MODE = True
             self.seq_len += 1
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
@@ -1861,6 +1872,10 @@ def main():
         action='store_true',
         help='Compatibility alias for --prefill-kernel matmatmul.',
     )
+    parser.add_argument('--max-new-tokens', '--max-decode-tokens', dest='max_new_tokens',
+                        type=int, default=None,
+                        help='Cap the number of decoded tokens. Default: decode until a stop token '
+                             'or the context limit.')
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and print one '
                              'per-step HW-latency table (summed over all layers) for prefill and for '
@@ -2003,7 +2018,7 @@ def main():
     print(f"Compile done in {time.perf_counter() - timer:.2f}s")
 
     print("\n--- Running ---")
-    run_result = ue.run_llama()
+    run_result = ue.run_llama(max_new_tokens=args.max_new_tokens)
     print("Llama-3.2-1B test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
