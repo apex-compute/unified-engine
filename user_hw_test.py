@@ -76,7 +76,6 @@ _ALL_TESTS_PASSED_BEFORE_SUMMARY = False
 _RNG_STATE_START = None
 _RNG_STATE_END = None
 _RNG_SEED = None
-_FAILED_TEST_RNG_PATH = "/tmp/rng_failed_test.pkl"
 _MAX_RNG_ALIGNED_AXI_DATA_WIDTH_BITS = 512
 # Allow a 0.5% decode-cost penalty for the dynamic Gemma3 hardware change.
 GEMMA3_HARDWARE_PENALTY_FACTOR = 1.005
@@ -97,7 +96,8 @@ def _rng_aligned_randn_2d(rows: int, active_cols: int, max_cols: int, *, dtype=t
     return torch.randn(rows, max_cols, dtype=dtype)[:, :active_cols].contiguous()
 
 
-def record_test(name: str, dims: str = "", snr_db=None, gflops=None, mb_per_s=None, inst_bytes=None) -> None:
+def record_test(name: str, dims: str = "", snr_db=None, gflops=None, mb_per_s=None, inst_bytes=None,
+                merge_metric_cols: bool = False) -> None:
     TEST_RESULTS.append({
         "name": name,
         "dims": dims,
@@ -106,6 +106,9 @@ def record_test(name: str, dims: str = "", snr_db=None, gflops=None, mb_per_s=No
         "mb_per_s": mb_per_s,
         "inst_bytes": inst_bytes,
         "pair_id": _CURRENT_PAIR_ID,
+        # End-to-end model rows: fold the (n/a) SNR/GFLOPS/MB-s columns into the
+        # Dimensions cell in the summary table (see write_test_summary).
+        "merge_metric_cols": merge_metric_cols,
     })
 
 
@@ -117,59 +120,6 @@ def _restore_rng_state(state) -> None:
     py_state, torch_state = state
     random.setstate(py_state)
     torch.random.set_rng_state(torch_state)
-
-
-def _cache_rng_state(path: str, rng_state) -> None:
-    import pickle
-
-    with open(path, "wb") as f:
-        pickle.dump(rng_state, f)
-    print(f"Cached RNG state for repro: {path}")
-
-
-def _cache_failed_test_rng_state(rng_state) -> None:
-    fallback_path = f"/tmp/rng_failed_test_{os.getuid()}.pkl"
-    for path in (_FAILED_TEST_RNG_PATH, fallback_path):
-        try:
-            _cache_rng_state(path, rng_state)
-            return
-        except OSError as exc:
-            print(f"Could not cache RNG state at {path}: {exc}")
-    print("Could not cache RNG state for repro")
-
-
-def restore_failed_test_rng(path: str = _FAILED_TEST_RNG_PATH) -> None:
-    """Restore the RNG state saved at the start of the last failing test."""
-    import pickle
-
-    with open(path, "rb") as f:
-        rng_state = pickle.load(f)
-    _restore_rng_state(rng_state)
-    print(f"Restored failed-test RNG state from {path}")
-
-
-def _install_failed_test_rng_cache() -> None:
-    def _wrap_test(fn):
-        def _wrapped(*args, **kwargs):
-            rng_state = _capture_rng_state()
-            try:
-                return fn(*args, **kwargs)
-            except Exception:
-                _cache_failed_test_rng_state(rng_state)
-                raise
-        return _wrapped
-
-    for name, value in list(globals().items()):
-        if not callable(value) or name.startswith("_"):
-            continue
-        is_test = (
-            name.endswith("_test")
-            or name.endswith("_tests")
-            or name.startswith("test_")
-            or name == "run_turboquant_mse"
-        )
-        if is_test:
-            globals()[name] = _wrap_test(value)
 
 
 def _run_rng_matched_pair(first, second) -> None:
@@ -241,10 +191,16 @@ def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
         "SNR diff",
         "GFLOPS diff",
     ]
+    # End-to-end model/inference rows (merge_metric_cols) fold the SNR / GFLOPS /
+    # MB-s columns — all n/a for them — into a single wide Dimensions cell, so the
+    # long "prefill_toks=.., decoded_toks=.., TTFT=.., decode_peak=.." string has
+    # room without inflating the Dimensions column for every other (matmul) row.
+    MERGE_COLS = (1, 2, 3, 4)  # Dimensions + SNR (dB) + GFLOPS + MB/s
     rows = []
     for r in TEST_RESULTS:
         leg = dynamic_to_legacy.get(id(r))  # non-None only for dynamic rows with a pair
-        rows.append([
+        merge = bool(r.get("merge_metric_cols"))
+        cells = [
             r["name"],
             r["dims"],
             _fmt_metric(r["snr_db"], "{:.2f}"),
@@ -253,18 +209,36 @@ def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
             _fmt_metric(r["inst_bytes"], "{:.0f}"),
             _snr_delta(leg["snr_db"], r["snr_db"])    if leg is not None else "",
             _gflops_delta(leg["gflops"], r["gflops"]) if leg is not None else "",
-        ])
+        ]
+        if merge:
+            cells[2] = cells[3] = cells[4] = ""  # folded into the Dimensions span
+        rows.append((cells, merge))
 
-    widths = [
-        max(len(h), max((len(row[i]) for row in rows), default=0))
-        for i, h in enumerate(headers)
-    ]
-    def fmt_row(cols):
-        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cols)) + " |"
+    # Merged rows don't size the Dimensions/SNR/GFLOPS/MB-s columns — their text
+    # spans all four instead of widening any single one.
+    def _col_width(i):
+        vals = [len(cells[i]) for cells, merge in rows if not (merge and i in MERGE_COLS)]
+        return max([len(headers[i])] + vals)
+    widths = [_col_width(i) for i in range(len(headers))]
+
+    sep = " | "
+    span = sum(widths[i] for i in MERGE_COLS) + len(sep) * (len(MERGE_COLS) - 1)
+    max_merged = max((len(cells[1]) for cells, merge in rows if merge), default=0)
+    if max_merged > span:
+        widths[MERGE_COLS[-1]] += max_merged - span  # grow the last spanned col to fit
+        span = max_merged
+
+    def fmt_row(cells, merge=False):
+        if merge:
+            parts = [cells[0].ljust(widths[0]), cells[1].ljust(span)]
+            parts += [cells[i].ljust(widths[i]) for i in range(5, len(headers))]
+        else:
+            parts = [c.ljust(widths[i]) for i, c in enumerate(cells)]
+        return "| " + sep.join(parts) + " |"
     lines = [
         fmt_row(headers),
         "| " + " | ".join("-" * w for w in widths) + " |",
-        *[fmt_row(row) for row in rows],
+        *[fmt_row(cells, merge) for cells, merge in rows],
     ]
     text = "\n".join(lines) + "\n"
 
@@ -5550,19 +5524,22 @@ def gemma3_inference_test() -> None:
         _assert_result(label, result)
         inst_bin = _instruction_bin_path(ue)
         inst_bytes = os.path.getsize(inst_bin) if os.path.exists(inst_bin) else None
+        prefill_toks = result["prefill_tokens"]
+        decoded_toks = result["tokens_decoded"]
+        ttft_s = result["prefill_hw_ms"] / 1000.0
+        decode_peak = result["peak_tokens_per_s"]
         print(
             f"Gemma3 {label} inference OK: 'x = 2' found, "
-            f"{result['tokens_decoded']} tokens decoded, "
-            f"avg {result['avg_tokens_per_s']:.2f} tok/s, "
-            f"peak {result['peak_tokens_per_s']:.2f} tok/s, "
+            f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
+            f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s, "
             f"bin {inst_bytes if inst_bytes is not None else 'n/a'} bytes."
         )
         dims = (
-            f"tokens={result['tokens_decoded']}, "
-            f"avg={result['avg_tokens_per_s']:.2f} tok/s, "
-            f"peak={result['peak_tokens_per_s']:.2f} tok/s"
+            f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
+            f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s"
         )
-        record_test(f"gemma3_inference_{label}", dims=dims, inst_bytes=inst_bytes)
+        record_test(f"gemma3_inference_{label}", dims=dims, inst_bytes=inst_bytes,
+                    merge_metric_cols=True)
 
 
 def gemma3_if8_inference_test() -> None:
@@ -5646,19 +5623,202 @@ def gemma3_if8_inference_test() -> None:
         _assert_result(label, result)
         inst_bin = _instruction_bin_path(ue)
         inst_bytes = os.path.getsize(inst_bin) if os.path.exists(inst_bin) else None
+        prefill_toks = result["prefill_tokens"]
+        decoded_toks = result["tokens_decoded"]
+        ttft_s = result["prefill_hw_ms"] / 1000.0
+        decode_peak = result["peak_tokens_per_s"]
         print(
             f"Gemma3 IF8 {label} inference OK: 'x = 2' found, "
-            f"{result['tokens_decoded']} tokens decoded, "
-            f"avg {result['avg_tokens_per_s']:.2f} tok/s, "
-            f"peak {result['peak_tokens_per_s']:.2f} tok/s, "
+            f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
+            f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s, "
             f"bin {inst_bytes if inst_bytes is not None else 'n/a'} bytes."
         )
         dims = (
-            f"tokens={result['tokens_decoded']}, "
-            f"avg={result['avg_tokens_per_s']:.2f} tok/s, "
-            f"peak={result['peak_tokens_per_s']:.2f} tok/s"
+            f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
+            f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s"
         )
-        record_test(f"gemma3_if8_inference_{label}", dims=dims, inst_bytes=inst_bytes)
+        record_test(f"gemma3_if8_inference_{label}", dims=dims, inst_bytes=inst_bytes,
+                    merge_metric_cols=True)
+
+
+def _llama32_1b_inference_test(module_filename: str, class_name: str, label_prefix: str,
+                               model_subdir: str,
+                               expected_text: str, expected_tokens,
+                               expected_prefill_tokens=None) -> None:
+    """Shared driver for the Llama-3.2-1B IF4 / IF8 inference regressions.
+
+    Runs the same two kernel configurations the CLI exposes via
+    ``--prefill-kernel`` / ``--decode-kernel`` (Llama has no ``legacy`` mode,
+    unlike Gemma3):
+
+      * ``streaming`` : prefill=streaming, decode=streaming (class defaults).
+      * ``matmatmul`` : prefill=matmatmul, decode=streaming. matmatmul is
+                        unsupported on the 512-bit AXI path, so this run is
+                        skipped on bittware / rk (512-bit) devices.
+
+    Decode is pure greedy (``fpga_penalty=False``) so the output is deterministic,
+    matching how the Gemma3 regressions gate on an exact decoded string.
+
+    ``expected_text``/``expected_tokens`` are the correctness gate. Until they are
+    captured from a real hardware run they may be left empty/None: the run still
+    executes and prints the decoded text (so it can be captured), but the exact
+    match is skipped instead of failing. Once filled in, the assertion enforces
+    an exact match exactly like ``gemma3_inference_test``.
+    """
+    import importlib.util
+    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", model_subdir)
+    if model_dir not in sys.path:
+        sys.path.insert(0, model_dir)
+    # The model file name contains dots (e.g. "llama3.2_1b_test.py"), so it can't
+    # be imported by module name — load it from its file path instead.
+    module_path = os.path.join(model_dir, module_filename)
+    safe_name = os.path.splitext(module_filename)[0].replace(".", "_")
+    spec = importlib.util.spec_from_file_location(safe_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[safe_name] = module
+    spec.loader.exec_module(module)
+    Engine = getattr(module, class_name)
+    import user_dma_core
+
+    # The Engine __init__ REQUIRES the quantized weight bin and raises if it is
+    # missing — unlike gemma3 it does not auto-generate. Mirror the CLI main():
+    # build params.bin from the HF model on a from-scratch run. weight_bin_generate
+    # always rebuilds, so guard on existence. The path resolves per variant via the
+    # module's config (IF4 -> llama3.2_1b_bin/, IF8 -> llama3.2_1b_if8_bin/).
+    _cfg = module._load_config(model_dir)
+    weights_bin_full = os.path.join(model_dir, _cfg["paths"]["weights_bin"])
+    if not os.path.exists(weights_bin_full):
+        print(f"{label_prefix}: weight bin {weights_bin_full} missing — generating from HF model (one-time)...")
+        module.weight_bin_generate(script_dir=model_dir)
+
+    def _instruction_bin_path(ue) -> str:
+        return getattr(ue, "_instruction_bin_path", None) or ue._instruction_paths()[0]
+
+    def _assert_result(label: str, result: dict) -> None:
+        decoded_text = result["decoded_text"].strip()
+        tokens_decoded = result["tokens_decoded"]
+        # Prefill token count is a deterministic function of the prompt/config,
+        # so gate it independently of the decoded-text ground truth.
+        if expected_prefill_tokens is not None:
+            prefill_tokens = result["prefill_tokens"]
+            assert prefill_tokens == expected_prefill_tokens, (
+                f"{label_prefix} {label}: prefill token count mismatch "
+                f"(expected {expected_prefill_tokens}, got {prefill_tokens})."
+            )
+        if expected_text:
+            assert decoded_text == expected_text, (
+                f"{label_prefix} {label}: decoded text does not exactly match expected reference.\n"
+                f"  expected reference: {expected_text!r}\n"
+                f"  got:                {decoded_text!r}"
+            )
+            if expected_tokens is not None:
+                assert tokens_decoded == expected_tokens, (
+                    f"{label_prefix} {label}: token count mismatch "
+                    f"(expected {expected_tokens}, got {tokens_decoded}).\n"
+                    f"  got text: {decoded_text!r}"
+                )
+        else:
+            # No ground-truth captured yet — print the decoded output so a hardware
+            # run can be pasted into `expected_text` to arm the exact-match gate.
+            print(
+                f"{label_prefix} {label}: no expected_text set — correctness gate SKIPPED. "
+                f"Capture the following for the regression:\n"
+                f"  tokens_decoded = {tokens_decoded}\n"
+                f"  decoded_text   = {decoded_text!r}"
+            )
+
+    # (label, constructor kwargs, requires 256-bit AXI). Run 1 is the class
+    # default (streaming/streaming); run 2 switches prefill to the two-pass
+    # matmatmul kernel while decode stays streaming.
+    runs = (
+        ("streaming", {}, False),
+        ("matmatmul", {"prefill_kernel": "matmatmul"}, True),
+    )
+    axi_width_bits = getattr(user_dma_core, "UE_AXI_DATA_WIDTH_BITS", 256)
+    for label, kwargs, needs_256b in runs:
+        if needs_256b and axi_width_bits != 256:
+            print(
+                f"{label_prefix} {label}: skipped — matmatmul is unsupported on the "
+                f"{axi_width_bits}-bit AXI data path."
+            )
+            continue
+
+        ue = Engine(**kwargs)
+        ue.prefill_seq = tuple(ue._cfg["default_prefill_tokens"])
+        ue.fpga_penalty = False  # deterministic pure-greedy decode
+        ue._generated_tokens = list(ue.prefill_seq)
+        ue.compile_llama()
+        result = ue.run_llama()
+        _assert_result(label, result)
+
+        inst_bin = _instruction_bin_path(ue)
+        inst_bytes = os.path.getsize(inst_bin) if inst_bin and os.path.exists(inst_bin) else None
+        # HW-counter metrics for the summary: TTFT is the prefill hardware latency
+        # (time to the first token), decode_peak is the first decoded token's HW rate.
+        prefill_toks = result["prefill_tokens"]
+        decoded_toks = result["tokens_decoded"]
+        ttft_s = result["prefill_hw_ms"] / 1000.0
+        decode_peak = result["peak_tokens_per_s"]
+        print(
+            f"{label_prefix} {label} inference OK: "
+            f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
+            f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s, "
+            f"bin {inst_bytes if inst_bytes is not None else 'n/a'} bytes."
+        )
+        # Combine the dimensions / SNR / GFLOPS / MB/s columns into one info string
+        # (those numeric columns don't apply to an end-to-end inference run).
+        dims = (
+            f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
+            f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s"
+        )
+        record_test(f"{label_prefix.lower().replace(' ', '_')}_inference_{label}",
+                    dims=dims, inst_bytes=inst_bytes, merge_metric_cols=True)
+
+
+def llama32_1b_inference_test() -> None:
+    """Run Llama-3.2-1B IF4 default (streaming) and prefill-matmatmul inference variants."""
+    # TODO: capture the exact decoded text from a hardware run and paste it here to
+    # arm the exact-match text gate (see helper docstring). The token counts below
+    # are already captured: prefill is asserted now; the decoded-token count stays
+    # gated behind expected_text until the text is filled in.
+    expected_text = ""
+    expected_tokens = 62
+    expected_prefill_tokens = 44
+    _llama32_1b_inference_test(
+        module_filename="llama3.2_1b_test.py",
+        class_name="Llama32_1b_UnifiedEngine",
+        label_prefix="Llama3.2-1B",
+        model_subdir="llama3.2_1b",
+        expected_text=expected_text,
+        expected_tokens=expected_tokens,
+        expected_prefill_tokens=expected_prefill_tokens,
+    )
+
+
+def llama32_1b_if8_inference_test() -> None:
+    """Run Llama-3.2-1B IF8 default (streaming) and prefill-matmatmul inference variants."""
+    # Captured from a hardware run to arm the exact-match correctness gate.
+    # expected_tokens is left None until a token count is captured, so only the
+    # decoded text is gated for now (see helper docstring).
+    expected_text = (
+        "To find the value of x, we need to isolate x on one side of the equation.\n\n"
+        "Given equation: x + 3 = 5\n\n"
+        "Subtract 3 from both sides:\n"
+        "x + 3 - 3 = 5 - 3\n"
+        "x = 2\n\n"
+        "So, the value of x is 2."
+    )
+    expected_tokens = 68
+    expected_prefill_tokens = 44
+    _llama32_1b_inference_test(
+        module_filename="llama3.2_1b_IF8.py",
+        class_name="Llama32_1b_IF8_UnifiedEngine",
+        label_prefix="Llama3.2-1B IF8",
+        model_subdir="llama3.2_1b",
+        expected_text=expected_text,
+        expected_tokens=expected_tokens,
+        expected_prefill_tokens=expected_prefill_tokens,
+    )
 
 
 if __name__ == "__main__":
@@ -5696,7 +5856,6 @@ if __name__ == "__main__":
     _RNG_SEED = 0
     random.seed(_RNG_SEED)
     torch.manual_seed(_RNG_SEED)
-    _install_failed_test_rng_cache()
 
     # Keep this probe to preserve the historical RNG stream, then capture the
     # actual state fingerprint that subsequent tests start from.
@@ -6056,6 +6215,9 @@ if __name__ == "__main__":
 
     gemma3_inference_test()
     gemma3_if8_inference_test()
+
+    llama32_1b_inference_test()
+    llama32_1b_if8_inference_test()
 
     # --- Systolic core tests (kintex7_systolic only) ---
     # Run last, after all andromeda-core coverage, so a systolic-specific
