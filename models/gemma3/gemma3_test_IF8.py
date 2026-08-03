@@ -2737,8 +2737,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         return {
             "decoded_text": decoded_text,
             "tokens_decoded": tokens_decoded,
+            "prefill_tokens": prefill_seq_len,
             "avg_tokens_per_s": avg_tokens_per_s,
             "peak_tokens_per_s": peak_tokens_per_s,
+            "prefill_hw_ms": latency_hw_prefill / 1e3,
             "snr_k_pre": snr_k_pre,
             "snr_v_pre": snr_v_pre,
             "snr_k_new": snr_k_new,
