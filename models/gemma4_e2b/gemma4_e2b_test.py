@@ -167,7 +167,7 @@ from quant_lib import quantize as _qs_quantize
 # many tensor quants concurrently via a thread pool — torch ops release the
 # GIL and ThreadPool avoids the multi-GB pickle cost of a process pool.
 from concurrent.futures import ThreadPoolExecutor as _QuantPool
-_QUANT_WORKERS = max(1, (os.cpu_count() or 4) - 1)
+_QUANT_WORKERS = max(1, int(os.environ.get("GEMMA4_QUANT_WORKERS", "2")))
 
 
 import json as _json
@@ -441,6 +441,10 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
             write_at(scale_off, scale_padded)
             write_at(data_off, data_padded)
+        del quant_results, quant_jobs, region_writes
+        del q_w, k_w, v_w, gate_w, up_w
+        del data_bytes, scale_bytes, scale_padded, data_padded, _t
+        gc.collect()
 
     # ROPE: two tables with different dimensions
     rope_cfg = cfg["special"]["rope"]
@@ -491,9 +495,9 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     raw = (per_layer_proj_norm_w.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
     write_at(weight_defs["PER_LAYER_PROJ_NORM_WEIGHT"], raw)
 
-    # LM_HEAD: tied with embed_tokens, so clone. Quantized via the canonical
-    # wrapper alongside the rest of the LM matmuls.
-    lm_head_w = model.lm_head.weight.detach().clone().cpu().to(torch.bfloat16)
+    # LM_HEAD is tied with embed_tokens. Quantization is read-only, so avoid a
+    # full clone of this large matrix.
+    lm_head_w = model.lm_head.weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
     data_bytes, scale_bytes = _qs_quantize(LM_QUANT_PRECISION, lm_head_w)
@@ -501,6 +505,8 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
     write_at(weight_defs["LM_HEAD_WEIGHT_DATA"], data_padded)
+    del lm_head_w, data_bytes, scale_bytes, scale_padded, data_padded
+    gc.collect()
 
     # Build vision + host side-cache bytes in memory (no separate files).
     # We concatenate everything below into ONE weights bin:
