@@ -314,18 +314,34 @@ def dequantize_int4(
 def quantize_fp4(weight: torch.Tensor, block_size: int = 64) -> tuple[bytes, bytes]:
     """Pack a 2D weight as FP4 E2M1 per K-block. The bf16 scale is stored
     positive so HW dispatches as FP4."""
-    N, K, _ = _check_2d_blocked(weight, block_size)
-    blocks = weight.detach().cpu().to(torch.bfloat16).flatten().view(-1, block_size)
+    N, K, num_blocks_k = _check_2d_blocked(weight, block_size)
+    w_bf = weight.detach().cpu().to(torch.bfloat16)
 
     # Clamp must be applied AFTER the /6 division so the stored scale matches
     # the HW-released convention -- bf16(1e-8) for all-zero blocks.
     fp4_max = torch.tensor(6.0, dtype=torch.bfloat16)
-    scales = (blocks.abs().max(dim=1).values / fp4_max).clamp(min=1e-8).to(torch.bfloat16)
-    scaled = (blocks / scales[:, None]).to(torch.bfloat16)
-    # argmin against neg-to-pos value table, then remap index -> HW nibble.
-    idx = torch.argmin(torch.abs(scaled.unsqueeze(-1) - _FP4_VALUES_BF16), dim=-1)
-    nibbles = _FP4_NIBBLES[idx.numpy()].reshape(N, K)
-    return _pack_nibbles(nibbles), _scale_bytes(scales)
+
+    # Bound the 16-entry codebook-search temporary using the same row-chunking
+    # strategy as quantize_if4(). Joining row-major chunks preserves the exact
+    # wire layout produced by the former unchunked implementation.
+    elems_per_row = num_blocks_k * block_size * len(_FP4_VALUES_BF16)
+    chunk_n = max(1, min(N, (256 * 1024 * 1024) // max(1, elems_per_row)))
+
+    data_parts: list[bytes] = []
+    scale_parts: list[bytes] = []
+    for start in range(0, N, chunk_n):
+        end = min(start + chunk_n, N)
+        n = end - start
+        blocks = w_bf[start:end].reshape(-1, block_size)
+        scales = (blocks.abs().max(dim=1).values / fp4_max).clamp(min=1e-8).to(torch.bfloat16)
+        scaled = (blocks / scales[:, None]).to(torch.bfloat16)
+        # argmin against neg-to-pos value table, then remap index -> HW nibble.
+        idx = torch.argmin(torch.abs(scaled.unsqueeze(-1) - _FP4_VALUES_BF16), dim=-1)
+        nibbles = _FP4_NIBBLES[idx.numpy()].reshape(n, K)
+        data_parts.append(_pack_nibbles(nibbles))
+        scale_parts.append(_scale_bytes(scales))
+
+    return b"".join(data_parts), b"".join(scale_parts)
 
 
 def dequantize_fp4(
