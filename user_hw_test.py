@@ -3735,6 +3735,135 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
         lambda: _run_case(dynamic=True, dynamic_addr=True),
     )
 
+def gemma4_vision_profile():
+    """Micro-profile each Gemma4 E2B vision-encoder matmul step in isolation.
+
+    Drives ``matmat_mul_core`` with the EXACT config the encoder emits (see
+    ``models/gemma4_e2b/gemma4_e2b_refactor.py``: ``vision_patch_embed`` /
+    ``compile_vision_layer`` / ``compile_vision_layer_post_attn`` /
+    ``vision_embed_project``): IF4-quantized B, per-group scale, dynamic-M only
+    (``gpr_M_reg`` set, K/N static -- the encoder never uses the legacy
+    compile-time-tiled path), fused output clamp on q/k/v/o/up/down, fused GELU on
+    gate, none on patch/embed. Dummy data; a soft SNR check reports correctness
+    without aborting. Mirrors the on-device ``--image --profile`` per-step
+    breakdown so each projection's standalone HW latency + GFLOPS is directly
+    readable. Self-attention (unified_attention core, not a matmat mul) is
+    profiled at the end for completeness.
+
+    Shapes: S=2520 patches, H=768, MLP=3072, pooled N_soft=256 -> VIS_TEXT_H=1536,
+    12 heads x head_dim 64 over aligned seq 2560.
+    """
+    S, H, MLP = 2520, 768, 3072
+    N_SOFT, TEXT_H = 256, 1536
+    CLAMP_MIN, CLAMP_MAX = -11.0, 11.0   # representative vision clip bounds (timing only)
+    # (label, M, K, N, gelu_enable, clamp_enable) -- config as emitted per step.
+    # gate fuses GELU (its output clamp is a separate op in the encoder); q/k/v/o/
+    # up/down fuse the output clamp; patch/embed fuse nothing.
+    steps = [
+        ("patch_proj",        S,      H,   H,      False, False),
+        ("q_proj",            S,      H,   H,      False, True),
+        ("k_proj",            S,      H,   H,      False, True),
+        ("v_proj",            S,      H,   H,      False, True),
+        ("attn_proj(o_proj)", S,      H,   H,      False, True),
+        ("gate_proj",         S,      H,   MLP,    True,  False),
+        ("up_proj",           S,      H,   MLP,    False, True),
+        ("down_proj",         S,      MLP, H,      False, True),
+        ("embed_proj",        N_SOFT, H,   TEXT_H, False, False),
+    ]
+    print("\n" + "=" * 82)
+    print("Gemma4 E2B vision encoder -- per-step matmul profile "
+          "(matmat_mul_core, IF4, dynamic-M)")
+    print("=" * 82)
+
+    results = []
+    for label, M, K, N, gelu, clamp in steps:
+        ue = UnifiedEngine()
+        # IF4-quantized weight B (N,K) -- same layout/precision as the pre-quantized
+        # tower weights the encoder loads.
+        x = torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1
+        B_DRAM, SCALE_DRAM = ue.quantize_weight(weight=x, N=N, K=K,
+                                                data_type=TYPE.IF4, int_variant=True)
+        A_DRAM = ue.allocate_tensor_dram(M * K * 2)
+        OUT_DRAM = ue.allocate_tensor_dram(M * N * 2)
+
+        # matmat_mul_core dynamic path with M/K/N runtime GPRs (same core + IF4
+        # config the encoder uses; the encoder happens to leave K/N static as a
+        # bin-size optimization, but a standalone single-op program needs the
+        # matched-pair dynamic form -- see matmat_mul_quantized_weights_unified_test).
+        m_reg = ue.alloc_isa_reg()
+        k_reg = ue.alloc_isa_reg()
+        n_reg = ue.alloc_isa_reg()
+        ue.start_capture()
+        ue.generate_instruction_add_set(m_reg, M)
+        ue.generate_instruction_add_set(k_reg, K)
+        ue.generate_instruction_add_set(n_reg, N)
+        flops = ue.matmat_mul_core(
+            M=M, K=K, N=N,
+            A_DRAM_ADDR=A_DRAM, B_DRAM_ADDR=B_DRAM, OUTPUT_DRAM_ADDR=OUT_DRAM,
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=SCALE_DRAM,
+            gelu_enable=gelu, clamp_enable=clamp,
+            clamp_min=CLAMP_MIN, clamp_max=CLAMP_MAX,
+            gpr_M_reg=m_reg, gpr_K_reg=k_reg, gpr_N_reg=n_reg)
+        ue.stop_capture()
+        ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()  # n, k, m
+        ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(prog)
+        inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(inst_bytes)
+
+        a = torch.randn(M, K, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(A_DRAM, a)
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(30.0)
+
+        latency_us = ue.report_latency_in_us()
+        total_flops = flops if isinstance(flops, (int, float)) else 2 * M * K * N
+        gflops, _ratio = ue.report_flop_rate_gflops(total_flops)
+
+        # Soft correctness check against the dequantized reference (no assert).
+        out = ue.dma_from_accelerator_memory(OUT_DRAM, (M, N))
+        x_eff = ue.quantize_weight_simulate(x, TYPE.IF4, int_variant=True)
+        ref = a @ x_eff.T
+        if gelu:
+            ref = ref * torch.sigmoid(1.702 * ref)
+        elif clamp:
+            ref = torch.clamp(ref, CLAMP_MIN, CLAMP_MAX)
+        snr = calculate_snr(ref, out)
+
+        gflop = (2 * M * K * N) / 1e9
+        print(f"  [{label:18s}] M={M:5d} K={K:5d} N={N:5d}  "
+              f"{gflop:7.2f} GFLOP  {latency_us / 1e3:8.3f} ms  "
+              f"{gflops:6.2f} GFLOPS  SNR {snr:6.1f} dB", flush=True)
+        record_test(f"gemma4_vision:{label}", f"M={M}, K={K}, N={N}",
+                    snr_db=snr, gflops=gflops, inst_bytes=inst_bytes)
+        results.append((label, gflop, latency_us / 1e3, gflops, snr))
+        ue.clear_capture_buffer()
+
+    # Per-step summary table.
+    print("\n" + "-" * 82)
+    print(f"  {'step':18s}{'GFLOP':>10}{'ms':>10}{'GFLOPS':>10}{'SNR dB':>10}")
+    print("  " + "-" * 60)
+    sum_gflop = sum_ms = 0.0
+    for label, gflop, ms, gflops, snr in results:
+        print(f"  {label:18s}{gflop:>10.2f}{ms:>10.3f}{gflops:>10.2f}{snr:>10.1f}")
+        sum_gflop += gflop
+        sum_ms += ms
+    print("  " + "-" * 60)
+    print(f"  {'per-layer sum':18s}{sum_gflop:>10.2f}{sum_ms:>10.3f}"
+          f"{sum_gflop / (sum_ms / 1e3):>10.2f}")
+    print("  (q/k/v/o + gate/up/down are one layer's projections; x16 layers for "
+          "the full encoder; embed_proj + patch_proj run once each.)")
+
+    # Self-attention (unified_attention core, not matmat_mul) -- best-effort.
+    print("\n----- vision step: self_attn  (per head: batch=2560, "
+          "aligned_seq_len=2560, head_dim=64; x12 heads/layer) -----")
+    try:
+        unified_attention_test(batch=2560, aligned_seq_len=2560, head_dim=64)
+    except Exception as e:
+        print(f"  [self_attn] skipped: {type(e).__name__}: {e}")
+
+
 def matmat_mul_non_aligned_writeback_test():
     """
     Tests matmat mul non aligned writeback core.
@@ -5835,6 +5964,11 @@ if __name__ == "__main__":
         action='store_true',
         help='Run the large nested-loop sweeps at the end of the suite (slow).',
     )
+    parser.add_argument(
+        '--gemma4-vision',
+        action='store_true',
+        help='Run only gemma4_vision_profile() (per-step IF4 vision matmul micro-profile) and exit.',
+    )
     args = parser.parse_args()
 
     import user_dma_core
@@ -5896,6 +6030,17 @@ if __name__ == "__main__":
         write_test_summary(_USER_HW_TEST_SUMMARY)
 
     atexit.register(_atexit_write_test_summary)
+
+    # --gemma4-vision: run only the vision per-step matmul micro-profile and exit
+    # cleanly (mirrors the end-of-suite clean-exit path).
+    if args.gemma4_vision:
+        gemma4_vision_profile()
+        _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
+        atexit.unregister(_atexit_write_test_summary)
+        write_test_summary(_USER_HW_TEST_SUMMARY)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
     software_reset_test()
     dram_read_write_speed_test()
