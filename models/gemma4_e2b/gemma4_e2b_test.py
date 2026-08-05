@@ -36,6 +36,7 @@ import json
 import math
 import os
 import sys
+import gc
 
 # This file's folder: gemma4_e2b_bin/, *.json, decoder_program.json live here. user_dma_core is two levels up (repo root).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -97,6 +98,7 @@ INSTRUCTION_BIN_COMPILE_VERSION = "v6-uac-cleanup"
 # warning on hosts whose CUDA driver/runtime doesn't match the installed GPU).
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "0")
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 # Embedding table is read zero-copy from the read-only mmap'd weight bin via
 # torch.frombuffer (avoids a 770 MB host allocation). We never write to it,
@@ -165,7 +167,7 @@ from quant_lib import quantize as _qs_quantize
 # many tensor quants concurrently via a thread pool — torch ops release the
 # GIL and ThreadPool avoids the multi-GB pickle cost of a process pool.
 from concurrent.futures import ThreadPoolExecutor as _QuantPool
-_QUANT_WORKERS = max(1, (os.cpu_count() or 4) - 1)
+_QUANT_WORKERS = max(1, int(os.environ.get("GEMMA4_QUANT_WORKERS", "2")))
 
 
 import json as _json
@@ -439,6 +441,10 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
             write_at(scale_off, scale_padded)
             write_at(data_off, data_padded)
+        del quant_results, quant_jobs, region_writes
+        del q_w, k_w, v_w, gate_w, up_w
+        del data_bytes, scale_bytes, scale_padded, data_padded, _t
+        gc.collect()
 
     # ROPE: two tables with different dimensions
     rope_cfg = cfg["special"]["rope"]
@@ -489,9 +495,9 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     raw = (per_layer_proj_norm_w.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
     write_at(weight_defs["PER_LAYER_PROJ_NORM_WEIGHT"], raw)
 
-    # LM_HEAD: tied with embed_tokens, so clone. Quantized via the canonical
-    # wrapper alongside the rest of the LM matmuls.
-    lm_head_w = model.lm_head.weight.detach().clone().cpu().to(torch.bfloat16)
+    # LM_HEAD is tied with embed_tokens. Quantization is read-only, so avoid a
+    # full clone of this large matrix.
+    lm_head_w = model.lm_head.weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
     data_bytes, scale_bytes = _qs_quantize(LM_QUANT_PRECISION, lm_head_w)
@@ -499,6 +505,8 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
     write_at(weight_defs["LM_HEAD_WEIGHT_DATA"], data_padded)
+    del lm_head_w, data_bytes, scale_bytes, scale_padded, data_padded
+    gc.collect()
 
     # Build vision + host side-cache bytes in memory (no separate files).
     # We concatenate everything below into ONE weights bin:
@@ -509,19 +517,25 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     # matching the "one instruction bin, one weight bin" design.
     vision_bytes, vision_manifest = _build_vision_section_bytes(model)
     audio_bytes,  audio_manifest  = _build_audio_section_bytes(model)
-    host_bytes,   host_manifest   = _build_host_section_bytes(text_model, cfg)
 
     lm_size     = len(buf)
     vision_size = len(vision_bytes)
     audio_size  = len(audio_bytes)
-    host_size   = len(host_bytes)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "wb") as f:
+    tmp_out_path = out_path + ".tmp"
+    with open(tmp_out_path, "wb") as f:
         f.write(buf)
+        del buf
+        gc.collect()
         f.write(vision_bytes)
+        del vision_bytes
+        gc.collect()
         f.write(audio_bytes)
-        f.write(host_bytes)
+        del audio_bytes
+        gc.collect()
+        host_size, host_manifest = _write_host_section(f, text_model, cfg)
+    os.replace(tmp_out_path, out_path)
     total = lm_size + vision_size + audio_size + host_size
     print(f"Generated weights bin: {out_path} ({total/1024**3:.2f} GiB total; "
           f"LM {lm_size/1024**3:.2f} GiB + vision {vision_size/1024**2:.1f} MiB + "
@@ -873,43 +887,46 @@ def tokenizer_subset_extract(bin_dir: str, cfg: dict) -> str:
     return dst
 
 
-def _build_host_section_bytes(text_model, cfg) -> tuple[bytes, dict]:
-    """Build host-side tensor section bytes + manifest. The few tensors
-    `_compute_per_layer_inputs` needs (per-layer embedding table, projection,
-    projection norm) are concatenated as bf16 bytes; per-layer scalars and
-    the KV-shared-layer map travel in the manifest dict.
+def _write_host_section(f, text_model, cfg) -> tuple[int, dict]:
+    """Stream host-side tensors into the combined params bin.
 
-    The big tensor (`embed_tokens_per_layer`, ~4.5 GB bf16) is laid down
-    first so the run-time loader can mmap exactly its offset and pull rows
-    on demand — RSS stays low even on a 16 GB Pi.
+    The manifest layout matches the old `_build_host_section_bytes()` result,
+    but the huge `embed_tokens_per_layer` table is written in chunks instead of
+    materializing a multi-GiB Python bytes object.
     """
     file_info = cfg["file_info"]
     num_layers = file_info["num_layers"]
     per_layer_input_dim = file_info["per_layer_input_dim"]
+    section_start = f.tell()
 
-    # 1. per_layer_embed_tokens, pre-scaled by sqrt(per_layer_input_dim).
-    # Chunked scale-and-cast so we don't materialize the full fp32 tensor
-    # (would be 9.4 GB for vocab=262144, dim=8960 — blows past 16 GB).
-    src = text_model.embed_tokens_per_layer.weight.detach().cpu().to(torch.bfloat16)
+    src = text_model.embed_tokens_per_layer.weight.detach().cpu()
     per_layer_embed_scale = per_layer_input_dim ** 0.5
-    embed_bf16 = torch.empty_like(src)
-    chunk = 8192
+    embed_off = 0
+    embed_shape = list(src.shape)
+    embed_size = src.numel() * torch.tensor([], dtype=torch.bfloat16).element_size()
+    chunk = 1024
     for i in range(0, src.shape[0], chunk):
-        embed_bf16[i:i+chunk] = (src[i:i+chunk].float() * per_layer_embed_scale).to(torch.bfloat16)
+        scaled = (src[i:i+chunk].float() * per_layer_embed_scale).to(torch.bfloat16).contiguous()
+        f.write(scaled.view(torch.uint8).numpy().tobytes())
     del src
 
-    # 2. per_layer_model_proj_weight  [8960, 1536]
+    proj_off = embed_off + embed_size
     proj_bf16 = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16).contiguous()
-    # 3. per_layer_proj_norm_weight   [256]  (raw, no gamma_offset — host-side norm wants raw w)
-    norm_bf16 = text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).contiguous()
+    proj_b = proj_bf16.view(torch.uint8).numpy().tobytes()
+    f.write(proj_b)
+    proj_size = len(proj_b)
+    proj_shape = list(proj_bf16.shape)
+    del proj_b, proj_bf16
 
-    # 4. Scalars + KV-shared map.
-    # transformers' Gemma4TextAttention has no `kv_shared_layer_index` attribute
-    # (only `layer_type` and `is_kv_shared_layer`) — at runtime a shared layer
-    # reads `shared_kv_states[self.layer_type]`, populated by whichever earlier
-    # (non-shared) layer is the LAST occurrence of that layer_type. Reproduce
-    # that mapping here: for each shared layer, the reference is the last
-    # non-shared layer with the same layer_type.
+    norm_off = proj_off + proj_size
+    norm_bf16 = text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).contiguous()
+    norm_b = norm_bf16.view(torch.uint8).numpy().tobytes()
+    f.write(norm_b)
+    norm_size = len(norm_b)
+    norm_shape = list(norm_bf16.shape)
+    del norm_b, norm_bf16
+    total = f.tell() - section_start
+
     layer_scalars = []
     kv_shared_map: dict[int, int] = {}
     last_layer_by_type: dict[str, int] = {}
@@ -922,26 +939,16 @@ def _build_host_section_bytes(text_model, cfg) -> tuple[bytes, dict]:
         else:
             last_layer_by_type[attn.layer_type] = layer_idx
 
-    embed_b = embed_bf16.contiguous().view(torch.uint8).numpy().tobytes()
-    proj_b  = proj_bf16.view(torch.uint8).numpy().tobytes()
-    norm_b  = norm_bf16.view(torch.uint8).numpy().tobytes()
-
-    embed_off = 0
-    proj_off  = embed_off + len(embed_b)
-    norm_off  = proj_off  + len(proj_b)
-    total     = norm_off  + len(norm_b)
-
-    out = embed_b + proj_b + norm_b
     manifest = {
-        "embed_tokens_per_layer": {"offset": embed_off, "size": len(embed_b), "shape": list(embed_bf16.shape)},
-        "per_layer_model_proj":   {"offset": proj_off,  "size": len(proj_b),  "shape": list(proj_bf16.shape)},
-        "per_layer_proj_norm":    {"offset": norm_off,  "size": len(norm_b),  "shape": list(norm_bf16.shape)},
+        "embed_tokens_per_layer": {"offset": embed_off, "size": embed_size, "shape": embed_shape},
+        "per_layer_model_proj":   {"offset": proj_off,  "size": proj_size,  "shape": proj_shape},
+        "per_layer_proj_norm":    {"offset": norm_off,  "size": norm_size,  "shape": norm_shape},
         "layer_scalars": layer_scalars,
         # JSON keys must be strings — convert int → str.
         "kv_shared_map": {str(k): v for k, v in kv_shared_map.items()},
     }
     print(f"  Host section: {total/1024**3:.2f} GiB, 3 tensors + scalars + kv_shared_map")
-    return out, manifest
+    return total, manifest
 
 
 def _ensure_hf_model(script_dir: str, cfg: dict):
@@ -949,7 +956,17 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
     hf_repo = cfg["paths"]["hf_model_repo"]
     config_path = os.path.join(model_dir, "config.json")
-    if not os.path.exists(config_path):
+    has_checkpoint = False
+    if os.path.isdir(model_dir):
+        for _root, _dirs, _files in os.walk(model_dir):
+            if any(
+                name.endswith(".safetensors")
+                or name in ("pytorch_model.bin", "model.safetensors.index.json", "pytorch_model.bin.index.json")
+                for name in _files
+            ):
+                has_checkpoint = True
+                break
+    if not os.path.exists(config_path) or not has_checkpoint:
         _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
         snapshot_download(repo_id=hf_repo, local_dir=model_dir)
         _original_print("Download complete.")
