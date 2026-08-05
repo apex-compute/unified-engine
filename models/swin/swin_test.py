@@ -779,7 +779,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages.
                 # transformers>=5 flattens projections onto SwinAttention (q_proj/k_proj/v_proj).
                 attn = block.attention
-                for name, proj in [('q', attn.q_proj), ('k', attn.k_proj), ('v', attn.v_proj)]:
+                for name, proj in [('q', attn.self.query), ('k', attn.self.key), ('v', attn.self.value)]:
                     lw[f'{name}_weight'] = self._alloc_param(proj.weight.data)
                     lw[f'{name}_bias'] = self._alloc_param(proj.bias.data)
 
@@ -790,8 +790,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # gets bias at offset b * wa_pad * wa_pad. Since all windows share
                 # the same per-head bias, we tile num_windows copies.
                 # transformers>=5 nests these under the SwinRelativePositionBias submodule.
-                rel_pos_bias_table = attn.relative_position_bias.relative_position_bias_table  # (529, num_heads)
-                rel_pos_index = attn.relative_position_bias.relative_position_index  # flat (window_area*window_area,)
+                rel_pos_bias_table = attn.self.relative_position_bias_table  # (529, num_heads)
+                rel_pos_index = attn.self.relative_position_index  # flat (window_area*window_area,)
                 rpb = rel_pos_bias_table[rel_pos_index.view(-1)].view(window_area, window_area, num_heads)
                 rpb = rpb.permute(2, 0, 1).contiguous().to(torch.bfloat16)  # (num_heads, 144, 144)
                 # Pad to (num_heads, 192, 192) with -100 in padding positions
@@ -805,7 +805,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['rel_pos_bias'] = self._alloc_param(rpb_tiled)
 
                 # Output projection (attention) — transformers>=5: SwinAttention.o_proj
-                out_proj = block.attention.o_proj
+                out_proj = block.attention.output.dense
                 lw['out_proj_weight'] = self._alloc_param(out_proj.weight.data)
                 lw['out_proj_bias'] = self._alloc_param(out_proj.bias.data)
 
@@ -814,12 +814,12 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_after_beta'] = self._alloc_param(block.layernorm_after.bias.data)
 
                 # MLP expand: (mlp_dim, dim) — transformers>=5: SwinMLP.fc1
-                lw['mlp_expand_weight'] = self._alloc_param(block.mlp.fc1.weight.data)
-                lw['mlp_expand_bias'] = self._alloc_param(block.mlp.fc1.bias.data)
+                lw['mlp_expand_weight'] = self._alloc_param(block.intermediate.dense.weight.data)
+                lw['mlp_expand_bias'] = self._alloc_param(block.intermediate.dense.bias.data)
 
                 # MLP contract: (dim, mlp_dim) — transformers>=5: SwinMLP.fc2
-                lw['mlp_contract_weight'] = self._alloc_param(block.mlp.fc2.weight.data)
-                lw['mlp_contract_bias'] = self._alloc_param(block.mlp.fc2.bias.data)
+                lw['mlp_contract_weight'] = self._alloc_param(block.output.dense.weight.data)
+                lw['mlp_contract_bias'] = self._alloc_param(block.output.dense.bias.data)
 
                 stage_weights.append(lw)
             self.encoder_weights.append(stage_weights)
