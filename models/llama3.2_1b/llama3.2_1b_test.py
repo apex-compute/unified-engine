@@ -48,11 +48,11 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
-# 1B uses pure FP4 (E2M1) — the best 4-bit scheme for this model by WikiText-2
-# perplexity; see src/models/llama3.2_1b/compare/summary.md. FP4 blocks are stored
-# in the HW 4-bit container with a positive scale, so the FPGA's IF4 dispatch reads
-# them as FP4. (3B uses MixMSE IF4 instead — the scheme is chosen per model.)
-from quant_lib import quantize_fp4
+from quant_lib import quantize_if4
+
+# Map the config's quantization variant string to quantize_if4's int_variant arg.
+# "int" -> pure INT4, "fp" -> pure FP4, "mix"/"mixmse" -> per-block min-MSE.
+_IF4_VARIANT = {"int": True, "fp": False, "mix": None, "mixmse": None}
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -118,6 +118,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
     _q = cfg["special"]["quantization"]
     block_size = _q.get("block_size", 64)
+    if4_variant = _IF4_VARIANT[_q.get("if4_variant", "mix")]
 
     model, model_dir = _ensure_hf_model(script_dir, cfg)
     gamma_offset = cfg["special"]["rms_norm"]["gamma_offset"]  # 0.0 for LLaMA
@@ -215,7 +216,8 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
             if kind == "if4":
                 next_key = blk0_structure[i + 1]["key"]
                 data_sz = weight_defs[f"{next_key}_SIZE"]
-                data_bytes, scale_bytes = quantize_fp4(tensor, block_size=block_size)
+                data_bytes, scale_bytes = quantize_if4(
+                    tensor, block_size=block_size, int_variant=if4_variant)
                 scale_padded = (scale_bytes + b"\x00" * sz)[:sz]
                 data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
                 write_at(file_off, scale_padded)
@@ -267,7 +269,8 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     lm_head_w = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
     scale_sz = weight_defs["LM_HEAD_WEIGHT_SCALE_SIZE"]
     data_sz = weight_defs["LM_HEAD_WEIGHT_DATA_SIZE"]
-    data_bytes, scale_bytes = quantize_fp4(lm_head_w, block_size=block_size)
+    data_bytes, scale_bytes = quantize_if4(
+        lm_head_w, block_size=block_size, int_variant=if4_variant)
     scale_padded = (scale_bytes + b"\x00" * scale_sz)[:scale_sz]
     data_padded = (data_bytes + b"\x00" * data_sz)[:data_sz]
     write_at(weight_defs["LM_HEAD_WEIGHT_SCALE"], scale_padded)
@@ -288,7 +291,18 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
     hf_repo = cfg["paths"]["hf_model_repo"]
     config_path = os.path.join(model_dir, "config.json")
-    if not os.path.exists(config_path):
+    has_checkpoint = False
+    if os.path.isdir(model_dir):
+        for _root, _dirs, files in os.walk(model_dir):
+            if any(
+                name.endswith(".safetensors")
+                or name in ("pytorch_model.bin", "model.safetensors.index.json",
+                            "pytorch_model.bin.index.json")
+                for name in files
+            ):
+                has_checkpoint = True
+                break
+    if not os.path.exists(config_path) or not has_checkpoint:
         _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
         snapshot_download(repo_id=hf_repo, local_dir=model_dir, local_dir_use_symlinks=False)
         _original_print("Download complete.")
@@ -973,7 +987,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             Both paths read the SAME IF4 weight; they differ in how the dot is computed:
 
             - ``--decode-kernel streaming`` -> :meth:`quantized_matmat_core`: 1-pass streaming
-              quantized dot (inline fp4->bf19 unpack straight through the DOT_PRODUCT unit).
+              quantized dot (inline IF4->bf19 unpack straight through the DOT_PRODUCT unit).
             - ``--decode-kernel matmatmul`` -> :meth:`matmat_mul_core` with ``is_B_quantized=True``:
               DEQUANTIZES B to bf16 in URAM, then a bf16 dot — two passes over the weight
               bytes, so ~2x the DRAM traffic (and ~2x slower) for higher-precision accumulate.

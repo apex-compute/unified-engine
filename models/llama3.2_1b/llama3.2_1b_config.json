@@ -345,7 +345,8 @@
     },
     "quantization": {
       "block_size": 64,
-      "_note": "1B = pure FP4 (quantize_fp4, E2M1 per 64-block) — best 4-bit scheme for 1B by WikiText-2 PPL; see src/models/llama3.2_1b/compare/summary.md. Packed in the HW 4-bit container with positive scale, so the FPGA IF4 dispatch reads it as FP4. (3B uses MixMSE IF4 — scheme chosen per model.)"
+      "if4_variant": "mix",
+      "_note": "4-bit IF4 container (per-block scale sign selects INT4 vs FP4). if4_variant picks the packing policy: int=pure INT4, fp=pure FP4, mix=per-block MixMSE."
     },
     "rms_norm": {
       "gamma_offset": 0.0
