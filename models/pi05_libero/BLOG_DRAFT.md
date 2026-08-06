@@ -1,0 +1,61 @@
+# pi0.5 on the FPGA: closed-loop LIBERO benchmarking (draft)
+
+## 1. Dependencies & Setup
+
+pi0.5 runs in a single merged Python process that hosts both the LIBERO/robosuite
+simulator and the FPGA inference path — no client/server split. LIBERO itself isn't
+vendored; it's an editable install from a separate `openpi` checkout (`openpi` is
+git-only — the PyPI package is an empty placeholder). The stack is
+`libero -> robosuite -> mujoco`, plus `bddl` for task/goal definitions. One pin is
+load-bearing: `numpy<2`, without which `robosuite`/`gym==0.25.2` break — and it's
+specifically what lets the simulator and the hardware DMA core share one interpreter.
+Model weights come from the upstream openpi JAX checkpoint (not HuggingFace), exported
+once to a 13GB bf16 tensor dump that the FPGA build compiles from.
+
+## 2. Model Architecture Walkthrough
+
+pi0.5 is ~2.7B parameters across three stacks:
+
+- **Vision tower — SigLIP So400m/14** (~0.41B params): 27-layer bidirectional
+  transformer, hidden=1152, 16 heads (head_dim=72), 14x14 patches over three 224x224
+  camera slots (base, wrist, and an unused third slot LIBERO doesn't populate),
+  256 patch tokens per image, learned absolute position embeddings — no RoPE.
+- **Language prefix — Gemma-2B** (~2.0B params): 18 layers, hidden=2048, 8 query
+  heads / 1 shared KV head (MQA), head_dim=256, gated-SiLU MLP (16384 intermediate).
+  Vision tokens are linearly projected 1152->2048 and concatenated with instruction
+  tokens into one prefix sequence (~968 tokens, padded to 1024) that's processed once
+  per inference and cached as KV.
+- **Action expert — Gemma-300M** (~0.31B params): a *separate* 18-layer transformer
+  (hidden=1024, 8 heads / 1 KV head) that cross-attends into the cached prefix KV and
+  runs 10 Euler flow-matching steps to denoise a 10-step x 7-dim action chunk from
+  noise, conditioned on the timestep via AdaRMSNorm.
+
+Per-inference compute is dominated by the language prefix: ~2332 GFLOP of the ~3059
+GFLOP effective total (vision ~656, action expert ~71). On the FPGA, hardware padding
+(vision head_dim 72->128, action horizon 10->64 and width 7->64 for tiling) inflates
+issued FLOPs to ~3466 GFLOP — about 13% overhead, concentrated almost entirely in the
+action expert, whose padded FLOPs are ~6.5x its effective FLOPs.
+
+## 3. Closed-Loop Policy Behavior
+
+*(placeholder — needs the in-the-loop reaction narrative: replan cadence, how the
+policy recovers/fails to recover mid-chunk, qualitative behaviors seen across
+episodes/tasks)*
+
+## 4. Divergent Behavior Under Quantization (bf16 vs IF4)
+
+IF4 is a **DRAM-footprint enabler, not a speedup**: weights are dequantized to bf16
+immediately before every multiply-accumulate, so compute is bf16 throughout regardless
+of storage format. IF4 shrinks the checkpoint from ~13GB to ~1.56GB but was never
+expected — and never observed — to run faster than bf16; no same-platform bf16-vs-IF4
+timing anomaly turned up in the codebase or logs.
+
+Where IF4 *does* diverge is accuracy, and unevenly across the pipeline: vision encoder
+~25dB SNR, prefix K-cache ~16dB, prefix V-cache ~10.6dB (the weak point), denoise
+velocity ~23dB, end-to-end action ~16.3dB. Per-dimension, this is lumpy — one action
+dimension drops to ~1.5dB while the gripper dimension holds ~40dB — and SNR degrades
+across the 10 denoise steps as errors compound (~45dB at step 0 down to ~16dB at the
+final step). Separately, one IF4 matmul kernel was observed passing ~53dB in isolation
+but failing catastrophically (-2.97dB) when chained after other quantized-weight
+allocations in the same process — suspected DRAM allocator overlap in test sequencing,
+not a model or op correctness issue.
