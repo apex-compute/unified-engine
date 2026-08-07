@@ -6838,6 +6838,11 @@ class UnifiedEngine:
     def bf16_permute_core(self, dim_0: int, dim_1: int, dim_2: int,
                           INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int) -> int:
         """
+        DEPRECATED: use bf16_permute_dram_core(), which performs the same
+        permute(1, 0, 2) with strided-DMA bursts (a few DMAs per group instead of
+        one memcpy per row) and supports padded per-group strides. This per-row
+        gather version is kept only for existing callers.
+
         Permutes a (dim_0, dim_1, dim_2) matrix to (dim_1, dim_0, dim_2) by
         gathering rows in permuted order from DRAM into URAM, then writing back.
 
@@ -6851,6 +6856,10 @@ class UnifiedEngine:
         Returns:
             total_flops (= total elements, 1 op per element for gather)
         """
+        import warnings
+        warnings.warn(
+            "bf16_permute_core is deprecated; use bf16_permute_dram_core (strided DMA).",
+            DeprecationWarning, stacklevel=2)
         bytes_per_element = 2
         assert dim_2 % UE_VECTOR_SIZE == 0, f"dim_2={dim_2} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
 
@@ -6883,6 +6892,67 @@ class UnifiedEngine:
             row_idx += chunk_rows
 
         # No FLOPS for this operation
+
+    def bf16_permute_dram_core(self, num_groups: int, group_rows: int, row_width: int,
+                               in_dram: int, out_dram: int, *,
+                               write_grouped: bool = True,
+                               group_stride_rows: Optional[int] = None) -> None:
+        """Permute [group_rows, num_groups, row_width] <-> [num_groups, group_rows,
+        row_width] (permute(1, 0, 2) — the row_width-vector is the atomic element,
+        NOT a matrix transpose of it) via strided DMA. Loops the (small) num_groups
+        axis and moves group_rows rows of row_width per group in large URAM-sized
+        chunks — ONE strided DMA per chunk (vs bf16_permute_core's one memcpy per row).
+
+        Layouts:
+          interleaved side = [group_rows, num_groups, row_width] token-major (a
+            group's consecutive rows are num_groups*row_width apart).
+          grouped side     = [num_groups, group_stride_rows, row_width] per-group
+            contiguous (groups group_stride_rows*row_width apart). group_stride_rows
+            defaults to group_rows (tight); set it larger to leave alignment-padding
+            rows [group_rows, group_stride_rows) untouched.
+
+        write_grouped=True  — in=interleaved -> out=grouped:  strided gather (read)
+            + contiguous write.
+        write_grouped=False — in=grouped -> out=interleaved:  contiguous read +
+            strided scatter (write).
+
+        row_width must be a multiple of UE_VECTOR_SIZE.
+        """
+        assert row_width % UE_VECTOR_SIZE == 0, \
+            f"row_width={row_width} must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
+        bpe = 2
+        if group_stride_rows is None:
+            group_stride_rows = group_rows
+        row_bytes = row_width * bpe
+        inter_row_jump = num_groups * row_bytes       # interleaved per-row stride within a group
+        group_bytes = group_stride_rows * row_bytes   # grouped per-group stride
+        chunk_rows = max(1, URAM_NEAR_FULL_ELEMENTS // row_width)
+        SA = 0x00000
+        inter_dram = in_dram if write_grouped else out_dram
+        grouped_dram = out_dram if write_grouped else in_dram
+        for g in range(num_groups):
+            inter_base = inter_dram + g * row_bytes       # group g's slice at row 0
+            group_base = grouped_dram + g * group_bytes   # group g, contiguous
+            r = 0
+            while r < group_rows:
+                n = min(chunk_rows, group_rows - r)
+                if write_grouped:
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=inter_base + r * inter_row_jump, sram_address=SA,
+                        element_size=n * row_width, stride_bytes_per_chunk=row_bytes,
+                        stride_jump_bytes=inter_row_jump)
+                    self.sram_to_accelerator_memory(
+                        sram_address=SA, accelerator_dram_address=group_base + r * row_bytes,
+                        element_size=n * row_width)
+                else:
+                    self.accelerator_memory_to_sram(
+                        accelerator_dram_address=group_base + r * row_bytes, sram_address=SA,
+                        element_size=n * row_width)
+                    self.sram_to_accelerator_memory(
+                        sram_address=SA, accelerator_dram_address=inter_base + r * inter_row_jump,
+                        element_size=n * row_width, stride_bytes_per_chunk=row_bytes,
+                        stride_jump_bytes=inter_row_jump)
+                r += n
 
     def patching_core(self, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                       matrix_dram_addrs: list, scale_dram_addrs: list,
