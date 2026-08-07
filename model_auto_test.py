@@ -255,7 +255,22 @@ QWEN_VLM_KEYWORDS = (
 )
 
 def _check_gemma4_e2b_vlm(text):
-    return _check_vlm(text, "E2B", GEMMA4_VLM_KEYWORDS)
+    return _score_coherence(_extract_decode_text(text))
+
+def _check_gemma4_e2b_vette(text):
+    decoded = _extract_decode_text(text)
+    coherent, reason = _score_coherence(decoded)
+    if not coherent:
+        return False, reason
+    vehicle_words = ("car", "vehicle", "automobile", "convertible", "corvette")
+    hits = [word for word in vehicle_words if re.search(
+        rf"\b{re.escape(word)}\b", decoded, re.IGNORECASE
+    )]
+    return bool(hits), (
+        f"{reason}; vehicle keywords: {', '.join(hits)}"
+        if hits
+        else f"coherent response did not identify the vehicle: {decoded[:120]!r}"
+    )
 
 def _check_gemma4_e4b_vlm(text):
     return _check_vlm(text, "E4B", GEMMA4_VLM_KEYWORDS)
@@ -335,9 +350,11 @@ TESTS = [
     # The deprecated gemma3_test_IF8.py is deliberately excluded: IF8 is
     # currently not working.
     {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    # Run Gemma4 in VLM mode with its built-in default image/prompt and check
-    # that the generated decode is coherent text.
-    {"name": "gemma4_e2b",  "script": "models/gemma4_e2b/gemma4_e2b_test.py",           "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
+    # Gemma4 E2B FPGA vision: the normal entry uses the default yosemite.jpg;
+    # the run-from-bin entry uses vette.jpg and a custom prompt. Bin reuse is
+    # implemented by gemma4_e2b_test.py itself.
+    {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
+    {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "prompt": "Give a detailed description of the picture", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg"},
     {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
