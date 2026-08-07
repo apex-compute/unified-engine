@@ -5573,18 +5573,17 @@ def activation_core_test(shapes=None, snr_threshold_db: float = 40.0):
     identity (``A @ I == A``) and letting the epilogue do the work. This verifies
     every supported activation against its exact hardware reference formula (the
     same references :func:`matmat_mul_two_cores_unified_test` uses) for a few
-    ``(M, N)`` tile shapes, on both the legacy (baked ``M``) and dynamic (runtime
-    ``M`` sourced from a primed GPR) paths, plus one in-place case
-    (``OUTPUT_DRAM == A_DRAM``). ``M`` is the tile-row count
-    (``total_elements // N``); ``N`` is the identity/vector width and, here, the
-    softmax row width.
+    ``(M, N)`` tile shapes on the dynamic path (runtime ``M`` sourced from a primed
+    GPR — the production path), plus one in-place case (``OUTPUT_DRAM == A_DRAM``).
+    ``M`` is the tile-row count (``total_elements // N``); ``N`` is the
+    identity/vector width and, here, the softmax row width.
 
     Inputs are scaled up (``randn * 4``) so clamp bounds are actually crossed and
     the activations span a meaningful range (an unclamped passthrough would pass
     the clamp cases trivially). Clamp bounds are bf16-exact.
     """
     if shapes is None:
-        shapes = [(64, 64), (4, 64)]
+        shapes = [(4, 64), (64, 64), (512, 512)]
 
     # (label, activation, clamp_min, clamp_max, reference-fn on a float (M,N) tensor).
     # References mirror the hardware epilogues exactly (see matmat_mul ref block).
@@ -5600,7 +5599,7 @@ def activation_core_test(shapes=None, snr_threshold_db: float = 40.0):
         ("softmax",         "softmax",  0.0,  INF, lambda a: torch.softmax(a, dim=-1)),
     ]
 
-    def _run(M, N, spec, dynamic, inplace):
+    def _run(M, N, spec, inplace):
         label, activation, lo, hi, ref_fn = spec
         ue = UnifiedEngine()
         elements = M * N
@@ -5609,11 +5608,9 @@ def activation_core_test(shapes=None, snr_threshold_db: float = 40.0):
         out_dram = a_dram if inplace else ue.allocate_tensor_dram(elements * 2)
 
         ue.start_capture()
-        m_reg = None
-        if dynamic:
-            # Prime the runtime row register in-stream (mirrors production _prime_M).
-            m_reg = ue.alloc_isa_reg()
-            ue.generate_instruction_add_set(m_reg, M)
+        # Prime the runtime row register in-stream (mirrors production _prime_M).
+        m_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(m_reg, M)
         total_flops = ue.activation_core(
             M=M, N=N, A_DRAM_ADDR=a_dram, OUTPUT_DRAM_ADDR=out_dram,
             IDENTITY_DRAM_ADDR=ident_dram, activation=activation,
@@ -5638,28 +5635,24 @@ def activation_core_test(shapes=None, snr_threshold_db: float = 40.0):
         out_flat = ue.dma_from_accelerator_memory(out_dram, (elements,))
         ref = ref_fn(a.float()).to(torch.bfloat16).reshape(-1)
         snr_db = calculate_snr(ref, out_flat)
-        tier = "dynamic" if dynamic else "legacy"
         place = "+inplace" if inplace else ""
-        print(f"[activation+{tier}{place}] M={M} N={N} act={label} "
+        print(f"[activation{place}] M={M} N={N} act={label} "
               f"elements={elements} SNR={snr_db:.2f} dB GFLOPS={gflops:.2f}")
         assert snr_db >= snr_threshold_db or snr_db == float("inf"), \
-            f"activation {tier}{place} M={M} N={N} act={label} " \
+            f"activation{place} M={M} N={N} act={label} " \
             f"SNR {snr_db:.2f} dB < {snr_threshold_db:g} dB"
-        name = "activation_core" + ("+dynamic" if dynamic else "") + \
-               ("+inplace" if inplace else "") + f"_{label}"
+        name = "activation_core" + ("+inplace" if inplace else "") + f"_{label}"
         record_test(name, f"M={M},N={N}",
                     snr_db=snr_db, gflops=gflops, inst_bytes=inst_bytes)
 
-        if m_reg is not None:
-            ue.release_isa_reg()
+        ue.release_isa_reg()
         ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
 
     for (M, N) in shapes:
         for spec in specs:
-            _run(M, N, spec, dynamic=False, inplace=False)
-            _run(M, N, spec, dynamic=True,  inplace=False)
-        # One in-place sanity case per shape (legacy path, clamp_relu6).
-        _run(M, N, specs[1], dynamic=False, inplace=True)
+            _run(M, N, spec, inplace=False)
+        # One in-place sanity case per shape (clamp_relu6).
+        _run(M, N, specs[1], inplace=True)
 
 
 def gemma3_inference_test() -> None:
@@ -6457,7 +6450,7 @@ if __name__ == "__main__":
         matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
 
     activation_core_test()
-    
+
     gemma3_inference_test()
     gemma3_if8_inference_test()
 
