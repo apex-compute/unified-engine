@@ -27,6 +27,7 @@ python models/gemma4_e2b/gemma4_e2b_test.py --image --profile --dev xdma0
 | LM prefill FPGA latency | 113.571 s | 51.932 s |
 | LM prefill useful-work throughput | 23.20 GFLOPS | 23.75 GFLOPS |
 | Decode average throughput | 2.68 tok/s | 3.88 tok/s |
+| Decode peak first-token throughput | 2.86 tok/s | 4.07 tok/s |
 | Decode average hardware throughput | 13.42 GFLOPS | 19.22 GFLOPS |
 | Decode wall time | 147.50 s / 396 tokens | 80.91 s / 314 tokens |
 | Vision program section | 3.58 MiB | 3.03 MiB |
