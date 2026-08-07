@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vision + LM numeric checks for the REFACTOR engine.
+"""LM and optional vision numeric checks for the REFACTOR engine.
 
 Reuses gemma4_e2b_numeric's host oracle — build_references (full-precision "hf"
 and IF4-quantized "hostref" HF vision towers) and report (SNR / rel_L2 / max|Δ|)
@@ -21,7 +21,8 @@ Interpretation (same as numeric.py):
 Requires params.bin regenerated with the [LM | vision | host] layout.
 
 Usage:
-  python models/gemma4_e2b/gemma4_e2b_numeric_refactor.py            # yosemite, default prompt
+  python models/gemma4_e2b/gemma4_e2b_numeric_refactor.py            # LM-only, default prompt
+  python models/gemma4_e2b/gemma4_e2b_numeric_refactor.py --image    # yosemite + VLM
   python models/gemma4_e2b/gemma4_e2b_numeric_refactor.py --image people.jpg
   python models/gemma4_e2b/gemma4_e2b_numeric_refactor.py --dev xdma0 --cycle 5.042
 """
@@ -164,19 +165,36 @@ def _if4_region(ue, scale_key, data_key, n, k, layer_idx=None):
 
 
 def _hw_rms(x, gamma=None):
-    """FPGA RMS convention: no epsilon; every core result lands in BF16."""
-    rms = torch.sqrt(torch.mean(x.float().square(), dim=-1, keepdim=True))
-    out = x.float() / rms
+    """FPGA RMS convention, including its SRAM BF16 stage boundaries."""
+    x = x.to(torch.bfloat16)
+    # rms_norm_core broadcasts the LALU's reciprocal-RMS result into a BF16
+    # SRAM vector, then performs gamma as a second BF16 elementwise operation.
+    inv_rms = torch.rsqrt(
+        torch.mean(x.float().square(), dim=-1, keepdim=True)).to(torch.bfloat16)
+    out = (x * inv_rms).to(torch.bfloat16)
     if gamma is not None:
-        out = out * gamma.float()
-    return out.to(torch.bfloat16)
+        out = (out * gamma.to(torch.bfloat16)).to(torch.bfloat16)
+    return out
 
 
 def _hw_linear(x, weight, gelu=False):
-    out = (x.float() @ weight.float().T).to(torch.bfloat16)
+    """Matmul with one BF16 writeback; GELU stays fused before writeback."""
+    out = x.to(torch.bfloat16).float() @ weight.to(torch.bfloat16).float().T
     if gelu:
-        out = (out.float() * torch.sigmoid(1.702 * out.float())).to(torch.bfloat16)
-    return out
+        # LALU_ACT_GELU_B=0xbfd9 encodes -1.6953125; the fused datapath
+        # computes x*sigmoid(1.6953125*x) directly from the matmul accumulator.
+        out = out * torch.sigmoid(1.6953125 * out)
+    return out.to(torch.bfloat16)
+
+
+def _hw_add(a, b):
+    """One FPGA BF16 elementwise-add writeback."""
+    return (a.to(torch.bfloat16) + b.to(torch.bfloat16)).to(torch.bfloat16)
+
+
+def _hw_mul(a, b):
+    """One FPGA BF16 elementwise-multiply writeback."""
+    return (a.to(torch.bfloat16) * b.to(torch.bfloat16)).to(torch.bfloat16)
 
 
 def _hw_rope(x, rope_row, rotary_dim):
@@ -198,15 +216,21 @@ def _hw_rope(x, rope_row, rotary_dim):
 def _hw_attention(q, k, v, sliding_window=None):
     """Token-space equivalent of GQA duplication + unified_attention_core."""
     seq_len, groups, _ = q.shape
-    scores = torch.einsum("tgd,sd->tgs", q.float(), k.float())
+    # QK matmul writes BF16 scores before the bias/softmax phase.
+    scores = torch.einsum(
+        "tgd,sd->tgs",
+        q.to(torch.bfloat16).float(),
+        k.to(torch.bfloat16).float()).to(torch.bfloat16)
     qi = torch.arange(seq_len).view(seq_len, 1)
     ki = torch.arange(seq_len).view(1, seq_len)
     valid = ki <= qi
     if sliding_window is not None:
         valid &= ki > (qi - sliding_window)
     scores.masked_fill_(~valid[:, None, :], float("-inf"))
-    probs = torch.softmax(scores, dim=-1).to(torch.bfloat16)
-    return torch.einsum("tgs,sd->tgd", probs.float(), v.float()).to(torch.bfloat16)
+    probs = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+    return torch.einsum(
+        "tgs,sd->tgd", probs.float(),
+        v.to(torch.bfloat16).float()).to(torch.bfloat16)
 
 
 def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
@@ -277,7 +301,7 @@ def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
         attn_out = _hw_linear(attn, o_w)
         gamma = _bf16_region(
             ue, "BLK0_POST_ATTENTION_NORM_WEIGHT", (ue.vector_length,), layer_idx)
-        x = (residual.float() + _hw_rms(attn_out, gamma).float()).to(torch.bfloat16)
+        x = _hw_add(residual, _hw_rms(attn_out, gamma))
 
         gamma = _bf16_region(
             ue, "BLK0_FFN_NORM_WEIGHT", (ue.vector_length,), layer_idx)
@@ -290,7 +314,7 @@ def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
                            ue.vector_length, layer_idx)
         gate = _hw_linear(pre_mlp, gate_w, gelu=True)
         up = _hw_linear(pre_mlp, up_w)
-        mlp_product = (gate.float() * up.float()).to(torch.bfloat16)
+        mlp_product = _hw_mul(gate, up)
         del gate_w, up_w, gate, up
         down_w = _if4_region(ue, "BLK0_FFN_DOWN_WEIGHT_SCALE",
                              "BLK0_FFN_DOWN_WEIGHT_DATA", ue.vector_length,
@@ -298,13 +322,13 @@ def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
         down = _hw_linear(mlp_product, down_w)
         gamma = _bf16_region(
             ue, "BLK0_POST_FFW_NORM_WEIGHT", (ue.vector_length,), layer_idx)
-        x = (x.float() + _hw_rms(down, gamma).float()).to(torch.bfloat16)
+        x = _hw_add(x, _hw_rms(down, gamma))
 
         gate_w = _bf16_region(
             ue, "BLK0_PER_LAYER_INPUT_GATE_WEIGHT",
             (ue.per_layer_input_dim, ue.vector_length), layer_idx)
         inj_gate = _hw_linear(x, gate_w, gelu=True)
-        inj_gate = (inj_gate.float() * pli[:, layer_idx].float()).to(torch.bfloat16)
+        inj_gate = _hw_mul(inj_gate, pli[:, layer_idx])
         proj_w = _bf16_region(
             ue, "BLK0_PER_LAYER_PROJECTION_WEIGHT",
             (ue.vector_length, ue.per_layer_input_dim), layer_idx)
@@ -313,8 +337,10 @@ def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
             ue, "BLK0_POST_PER_LAYER_INPUT_NORM_WEIGHT",
             (ue.vector_length,), layer_idx)
         injection = _hw_rms(injection, gamma)
-        x = ((x.float() + injection.float())
-             * float(ue._layer_scalars[layer_idx])).to(torch.bfloat16)
+        x = _hw_add(x, injection)
+        layer_scale = torch.as_tensor(
+            ue._layer_scalars[layer_idx]).to(torch.bfloat16)
+        x = _hw_mul(x, layer_scale)
 
     hidden = x.float().cpu()
     out_gamma = _bf16_region(ue, "OUTPUT_NORM_WEIGHT", (ue.vector_length,))
@@ -330,11 +356,12 @@ def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Gemma4 E2B refactor numeric check: vision, LM prefill and first decoder token.")
-    p.add_argument("--image", type=str, default=None,
-                   help="Image path or bare name in test_samples/ (default: yosemite.jpg).")
-    p.add_argument("--prompt", type=str, default="Describe this image in detail.",
-                   help="Vision output is prompt-independent; only affects tokenization.")
+        description="Gemma4 E2B numeric check: LM prefill/decode, optionally vision.")
+    p.add_argument("--image", type=str, nargs="?", const=g4r.DEFAULT_IMAGE, default=None,
+                   help="Enable VLM checks. Bare --image uses the default image; an optional "
+                        "path or filename selects another image.")
+    p.add_argument("--prompt", type=str, default=None,
+                   help="Text prompt. Without --image, default is the built-in LM test question.")
     p.add_argument("--dev", type=str, default="xdma0")
     p.add_argument("--cycle", type=float, default=1000 / 198.3256)
     args = p.parse_args()
@@ -349,38 +376,46 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
     print(f"Using DMA device: {args.dev}  (cycle {args.cycle:.4f} ns)")
 
-    # Resolve a bare filename against test_samples/, like the refactor's main().
-    image_path = args.image or g4r.DEFAULT_IMAGE
-    if not os.path.isfile(image_path):
-        _cand = os.path.join(os.path.dirname(g4r.DEFAULT_IMAGE), os.path.basename(image_path))
-        if os.path.isfile(_cand):
-            image_path = _cand
-    if not os.path.isfile(image_path):
-        raise SystemExit(f"Image not found: {image_path}")
-
-    # --- FPGA side: the refactor engine runs the vision encoder, stashing _vis_ckpt. ---
-    print(f"\n[numeric] running REFACTOR FPGA vision encoder on {image_path} ...")
     ue = g4r.Gemma4_UnifiedEngine()
-    ue.set_prefill_seq_vlm(image_path, args.prompt)
-    ckpt = getattr(ue, "_vis_ckpt", None)
-    if not ckpt:
-        raise SystemExit("FPGA checkpoints missing (self._vis_ckpt not set).")
 
-    # --- Host side: HF references (hf = ground truth, hostref = IF4/HW-mimicking). ---
-    print("\n[numeric] building references ...")
-    refs, meta = build_vision_references(ue, image_path, args.prompt)
-    real = ~meta["padding"]   # non-padding patches (B is per-patch; C is pooled)
+    if args.image:
+        # Resolve a bare filename against test_samples/, like test.py.
+        image_path = args.image
+        if not os.path.isfile(image_path):
+            candidate = os.path.join(
+                os.path.dirname(g4r.DEFAULT_IMAGE), os.path.basename(image_path))
+            if os.path.isfile(candidate):
+                image_path = candidate
+        if not os.path.isfile(image_path):
+            raise SystemExit(f"Image not found: {image_path}")
 
-    stages = [("B encoder_out", "B", "encoder_out", real),
-              ("C image_features", "C", "image_features", None)]
+        # FPGA vision encoder plus the existing vision numeric comparisons.
+        print(f"\n[numeric] running REFACTOR FPGA vision encoder on {image_path} ...")
+        ue.set_prefill_seq_vlm(image_path, args.prompt)
+        ckpt = getattr(ue, "_vis_ckpt", None)
+        if not ckpt:
+            raise SystemExit("FPGA checkpoints missing (self._vis_ckpt not set).")
 
-    print("\n[numeric] ===== FPGA (refactor) vs references — SNR dB (real patches) =====")
-    print("  FPGA vs HOSTREF (IF4 — mimics hardware; high = kernel correct):")
-    for name, rkey, ckey, mask in stages:
-        num.report(name, refs["hostref"][rkey], ckpt[ckey], row_mask=mask)
-    print("  FPGA vs HF (full-precision ground truth; gap = IF4 quant loss):")
-    for name, rkey, ckey, mask in stages:
-        num.report(name, refs["hf"][rkey], ckpt[ckey], row_mask=mask)
+        print("\n[numeric] building vision references ...")
+        vision_prompt = args.prompt or "Describe this image in detail."
+        refs, meta = build_vision_references(ue, image_path, vision_prompt)
+        real = ~meta["padding"]
+        stages = [("B encoder_out", "B", "encoder_out", real),
+                  ("C image_features", "C", "image_features", None)]
+
+        print("\n[numeric] ===== FPGA (refactor) vs references — SNR dB (real patches) =====")
+        print("  FPGA vs HOSTREF (IF4 — mimics hardware; high = kernel correct):")
+        for name, rkey, ckey, mask in stages:
+            num.report(name, refs["hostref"][rkey], ckpt[ckey], row_mask=mask)
+        print("  FPGA vs HF (full-precision ground truth; gap = IF4 quant loss):")
+        for name, rkey, ckey, mask in stages:
+            num.report(name, refs["hf"][rkey], ckpt[ckey], row_mask=mask)
+    elif args.prompt:
+        print(f"[numeric] LM-only mode, prompt: {args.prompt!r}")
+        ue.set_prefill_seq(args.prompt)
+    else:
+        print("[numeric] LM-only mode, built-in default prompt")
+        ue.set_prefill_seq()
 
     ue.compile_gemma4()
     lm_meta = ue._load_program_section("lm")

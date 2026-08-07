@@ -5414,6 +5414,64 @@ class UnifiedEngine:
             write_back_disable=write_back_disable,
         )
 
+    # Activation name -> the matmat_mul_core epilogue flag it maps to. These are
+    # the LALU activations the accelerator exposes only as fused matmul epilogues.
+    _ACTIVATION_FLAGS = {
+        "gelu":    "gelu_enable",
+        "silu":    "silu_enable",
+        "sigmoid": "sigmoid_enable",
+        "clamp":   "clamp_enable",
+        "log":     "log_enable",
+        "softmax": "softmax_enable",
+    }
+
+    def activation_core(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                        IDENTITY_DRAM_ADDR: int, activation: str,
+                        clamp_min: float = 0.0, clamp_max: float = float("inf"),
+                        gpr_M_reg: int = None) -> None:
+        """Standalone activation over a bf16 buffer via the identity-matmul trick.
+
+        The accelerator exposes its LALU activations (``gelu`` / ``silu`` /
+        ``sigmoid`` / ``clamp`` / ``log`` / ``softmax``) only as fused epilogues on
+        :meth:`matmat_mul_core`; there is no standalone activation instruction.
+        This applies the chosen activation on its own by multiplying the input by
+        an N×N identity (an algebraic no-op, ``A @ I == A``) and letting the
+        matmul's activation epilogue do the work. Use it anywhere an activation is
+        needed between ops the hardware can't fuse it onto — e.g. quantization-input
+        clamping between projections, or a bare sigmoid/gelu on an intermediate
+        buffer.
+
+        ``activation`` is one of the names in :attr:`_ACTIVATION_FLAGS`: ``"clamp"``,
+        ``"gelu"``, ``"silu"``, ``"sigmoid"``, ``"log"``, ``"softmax"``.
+        ``clamp_min`` / ``clamp_max`` apply only to ``"clamp"`` (ignored otherwise).
+
+        The buffer is viewed as ``M × N`` identity tiles: ``M`` is the compile-time
+        tile-row count (``total_elements // N``) / legacy-path fallback, with the
+        real runtime row count sourced from ``gpr_M_reg`` when supplied; ``N`` is
+        the tile/vector width and **must equal the identity matrix's dimension**
+        (typically ``UE_VECTOR_SIZE``), so ``IDENTITY_DRAM_ADDR`` must point at an
+        N×N bf16 identity in DRAM. In-place is fine (``OUTPUT_DRAM_ADDR`` may equal
+        ``A_DRAM_ADDR``). Returns the matmul FLOP count.
+
+        Note on tiling: the pointwise activations (``clamp`` / ``gelu`` / ``silu`` /
+        ``sigmoid`` / ``log``) are correct for any tiling, so ``N`` may be the
+        vector width. ``"softmax"`` is **row-reductive** — it normalizes across the
+        N dimension — so it is only correct when ``N`` spans a full logical row, not
+        a sub-row vector tile.
+        """
+        try:
+            flag = self._ACTIVATION_FLAGS[activation]
+        except KeyError:
+            raise ValueError(
+                f"activation_core: unknown activation {activation!r}; "
+                f"expected one of {sorted(self._ACTIVATION_FLAGS)}")
+        return self.matmat_mul_core(
+            M=M, K=N, N=N,
+            A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, is_B_quantized=False,
+            clamp_min=clamp_min, clamp_max=clamp_max, gpr_M_reg=gpr_M_reg,
+            **{flag: True})
+
     def matmat_mul_core_legacy(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
                              is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
                              clamp_enable: bool = False, log_enable: bool = False,

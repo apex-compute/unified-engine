@@ -5564,6 +5564,104 @@ def systolic_matmul_test(M: int, K: int, N: int, snr_threshold_db: float = 44.0)
     record_test("systolic_matmul", f"M={M}, K={K}, N={N}", snr_db=snr, gflops=gflops)
 
 
+def activation_core_test(shapes=None, snr_threshold_db: float = 40.0):
+    """Basic functional check for :meth:`UnifiedEngine.activation_core`.
+
+    ``activation_core`` is the identity-matmul activation workaround: the
+    accelerator exposes its LALU activations only as fused ``matmat_mul_core``
+    epilogues, so each is applied standalone by multiplying the input by an N×N
+    identity (``A @ I == A``) and letting the epilogue do the work. This verifies
+    every supported activation against its exact hardware reference formula (the
+    same references :func:`matmat_mul_two_cores_unified_test` uses) for a few
+    ``(M, N)`` tile shapes, on both the legacy (baked ``M``) and dynamic (runtime
+    ``M`` sourced from a primed GPR) paths, plus one in-place case
+    (``OUTPUT_DRAM == A_DRAM``). ``M`` is the tile-row count
+    (``total_elements // N``); ``N`` is the identity/vector width and, here, the
+    softmax row width.
+
+    Inputs are scaled up (``randn * 4``) so clamp bounds are actually crossed and
+    the activations span a meaningful range (an unclamped passthrough would pass
+    the clamp cases trivially). Clamp bounds are bf16-exact.
+    """
+    if shapes is None:
+        shapes = [(64, 64), (4, 64)]
+
+    # (label, activation, clamp_min, clamp_max, reference-fn on a float (M,N) tensor).
+    # References mirror the hardware epilogues exactly (see matmat_mul ref block).
+    INF = float("inf")
+    specs = [
+        ("clamp_relu",      "clamp",    0.0,  INF, lambda a: torch.clamp(a, min=0.0, max=INF)),
+        ("clamp_relu6",     "clamp",    0.0,  6.0, lambda a: torch.clamp(a, min=0.0, max=6.0)),
+        ("clamp_symmetric", "clamp",   -2.0,  2.0, lambda a: torch.clamp(a, min=-2.0, max=2.0)),
+        ("gelu",            "gelu",     0.0,  INF, lambda a: a * torch.sigmoid(1.702 * a)),
+        ("silu",            "silu",     0.0,  INF, lambda a: a * torch.sigmoid(a)),
+        ("sigmoid",         "sigmoid",  0.0,  INF, lambda a: torch.sigmoid(a)),
+        ("log",             "log",      0.0,  INF, lambda a: torch.log(torch.clamp(a, min=1e-3))),
+        ("softmax",         "softmax",  0.0,  INF, lambda a: torch.softmax(a, dim=-1)),
+    ]
+
+    def _run(M, N, spec, dynamic, inplace):
+        label, activation, lo, hi, ref_fn = spec
+        ue = UnifiedEngine()
+        elements = M * N
+        a_dram = ue.allocate_tensor_dram(elements * 2)
+        ident_dram = ue.allocate_tensor_dram(N * N * 2)
+        out_dram = a_dram if inplace else ue.allocate_tensor_dram(elements * 2)
+
+        ue.start_capture()
+        m_reg = None
+        if dynamic:
+            # Prime the runtime row register in-stream (mirrors production _prime_M).
+            m_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(m_reg, M)
+        total_flops = ue.activation_core(
+            M=M, N=N, A_DRAM_ADDR=a_dram, OUTPUT_DRAM_ADDR=out_dram,
+            IDENTITY_DRAM_ADDR=ident_dram, activation=activation,
+            clamp_min=lo, clamp_max=hi, gpr_M_reg=m_reg)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(prog)
+        inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(inst_bytes)
+
+        a = (torch.randn(M, N) * 4.0).to(torch.bfloat16)
+        ue.dma_to_accelerator_memory(a_dram, a.reshape(-1).contiguous())
+        ue.dma_to_accelerator_memory(
+            ident_dram, torch.eye(N, dtype=torch.bfloat16).reshape(-1).contiguous())
+
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+
+        gflops, _ = ue.report_flop_rate_gflops(total_flops)
+        out_flat = ue.dma_from_accelerator_memory(out_dram, (elements,))
+        ref = ref_fn(a.float()).to(torch.bfloat16).reshape(-1)
+        snr_db = calculate_snr(ref, out_flat)
+        tier = "dynamic" if dynamic else "legacy"
+        place = "+inplace" if inplace else ""
+        print(f"[activation+{tier}{place}] M={M} N={N} act={label} "
+              f"elements={elements} SNR={snr_db:.2f} dB GFLOPS={gflops:.2f}")
+        assert snr_db >= snr_threshold_db or snr_db == float("inf"), \
+            f"activation {tier}{place} M={M} N={N} act={label} " \
+            f"SNR {snr_db:.2f} dB < {snr_threshold_db:g} dB"
+        name = "activation_core" + ("+dynamic" if dynamic else "") + \
+               ("+inplace" if inplace else "") + f"_{label}"
+        record_test(name, f"M={M},N={N}",
+                    snr_db=snr_db, gflops=gflops, inst_bytes=inst_bytes)
+
+        if m_reg is not None:
+            ue.release_isa_reg()
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+
+    for (M, N) in shapes:
+        for spec in specs:
+            _run(M, N, spec, dynamic=False, inplace=False)
+            _run(M, N, spec, dynamic=True,  inplace=False)
+        # One in-place sanity case per shape (legacy path, clamp_relu6).
+        _run(M, N, specs[1], dynamic=False, inplace=True)
+
+
 def gemma3_inference_test() -> None:
     """Run Gemma3 streaming, two-pass-decoder, and legacy inference variants."""
     gemma3_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gemma3")
@@ -6358,6 +6456,8 @@ if __name__ == "__main__":
     if args.device == 'alveo':
         matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
 
+    activation_core_test()
+    
     gemma3_inference_test()
     gemma3_if8_inference_test()
 
