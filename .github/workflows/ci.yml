@@ -1,7 +1,8 @@
 name: Model HW CI
 
-# Runs the local CI suite (run_ci.sh): generic hardware op tests, then Gemma4
-# E2B by default. A manual full-run checkbox runs every registered model instead.
+# Runs the local CI suite (run_ci.sh): generic hardware op tests, then the two
+# Gemma4 E2B image cases by default. A manual full-run checkbox runs every
+# registered model instead.
 # Models compile from scratch and run from their cached bins, with DRAM randomized
 # (poisoned) before every single pass. Stops on first failure.
 # Requires the FPGA device, so this must run on a self-hosted runner with the
@@ -16,7 +17,7 @@ on:
         type: boolean
         default: false
       full_run:
-        description: "Run the full model_auto_test.py model registry instead of only gemma4_e2b"
+        description: "Run the full model_auto_test.py registry instead of the two Gemma4 E2B image cases"
         required: false
         type: boolean
         default: false
@@ -73,7 +74,10 @@ jobs:
             ARGS+=(--clean-bins)
           fi
           if [[ "${{ inputs.full_run }}" != "true" ]]; then
-            ARGS+=(--only gemma4_e2b)
+            # Keep both cases in one model_auto_test.py invocation. The first
+            # run creates/loads programs.bin; no clean or bin removal occurs
+            # before the run-from-bin Vette case.
+            ARGS+=(--only gemma4_e2b gemma4_e2b_run_from_bin)
           fi
           ./run_ci.sh "${ARGS[@]}"
 
@@ -174,7 +178,9 @@ jobs:
               : ciOutcome === 'failure'
                 ? '❌ FAILED'
                 : `⚠️ ${ciOutcome.toUpperCase()}`;
-            const modelScope = fullRun ? 'all registered models' : 'gemma4_e2b only';
+            const modelScope = fullRun
+              ? 'all registered models'
+              : 'gemma4_e2b + gemma4_e2b_run_from_bin';
             const comment = [
               '**Unified Engine HW CI Report**',
               `- **Status:** ${status}`,
