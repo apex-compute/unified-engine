@@ -590,11 +590,10 @@ class Gemma4LMMixin:
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
         def _projection_core(**kwargs) -> int:
-            # The streaming core cannot hold a 64-column strip's scales when
-            # K=12,288. Gemma4's wide MLP-down projection therefore retains the
-            # two-pass compatibility core even in streaming mode.
-            if (self.prefill_kernel == "matmatmul"
-                    or kwargs["K"] == self.mlp_elements_wide):
+            """Dynamic quantized projection selected for the whole prefill stage."""
+            kwargs.setdefault("gpr_M_reg", self.gpr_seq_len)
+            if self.prefill_kernel == "matmatmul":
+                kwargs.setdefault("is_B_quantized", True)
                 return self.matmat_mul_core(**kwargs)
             kwargs.pop("is_B_quantized", None)
             return self.quantized_matmat_core(**kwargs)
@@ -1177,17 +1176,18 @@ class Gemma4LMMixin:
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
         def _projection_core(**kwargs) -> int:
+            """Uniform kernel selection for configurable decode IF4 projections."""
             if self.decode_kernel == "matmatmul":
                 kwargs.setdefault("is_B_quantized", True)
+                kwargs.setdefault("gpr_M_reg", gpr_one)
                 return self.matmat_mul_core(**kwargs)
-            if kwargs["K"] == self.mlp_elements_wide:
-                # K=12,288 wide MLP-down uses the legacy streaming core's
-                # verified N=32 partial-width scale-BRAM tiling. Drop the
-                # dimension GPR so quantized_matmat_core dispatches legacy;
-                # the dynamic core still supports only K <= 8,192.
-                kwargs.pop("gpr_M_reg", None)
-                kwargs.pop("gpr_K_reg", None)
-                kwargs.pop("gpr_N_reg", None)
+            # TODO: Resolve the decoder quantized_matmat_core dynamic-path
+            # numerical bug, then stop removing the dimension GPRs here. All
+            # configurable IF4 projection callsites (Q/K/V, O, MLP gate/up/down,
+            # and LM head) are temporarily forced through the legacy path.
+            kwargs.pop("gpr_M_reg", None)
+            kwargs.pop("gpr_K_reg", None)
+            kwargs.pop("gpr_N_reg", None)
             kwargs.pop("is_B_quantized", None)
             return self.quantized_matmat_core(**kwargs)
         # gpr_one holds the constant 1 — used as gpr_M_reg for all M=1 ops.

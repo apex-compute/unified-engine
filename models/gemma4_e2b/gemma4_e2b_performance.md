@@ -17,23 +17,22 @@ python models/gemma4_e2b/gemma4_e2b_test.py --image --profile --dev xdma0
 
 ## Performance comparison
 
-| Metric | Legacy | Refactored |
-|---|---:|---:|
-| Vision FPGA execution | 55.54 s | 54.60 s |
-| Vision end-to-end path | not reported | 55.81 s |
-| Vision throughput | not reported | 20.86 GFLOPS |
-| Vision soft tokens | 256 | 256 |
-| LM prefill sequence executed | 512-token template | 272 actual tokens |
-| LM prefill FPGA latency | 113.571 s | 51.932 s |
-| LM prefill useful-work throughput | 23.20 GFLOPS | 23.75 GFLOPS |
-| Decode average throughput | 2.68 tok/s | 3.88 tok/s |
-| Decode peak first-token throughput | 2.86 tok/s | 4.07 tok/s |
-| Decode average hardware throughput | 13.42 GFLOPS | 19.22 GFLOPS |
-| Decode wall time | 147.50 s / 396 tokens | 80.91 s / 314 tokens |
-| Vision program section | 3.58 MiB | 3.03 MiB |
-| Prefill program section | 5.71 MiB | 3.10 MiB |
-| Combined program image | 10.37 MiB | 7.54 MiB |
-| Weight image (`params.bin`) | 6.91 GiB | same |
+| Metric | Legacy | Refactored streaming prefill | Refactored matmatmul prefill |
+|---|---:|---:|---:|
+| Vision FPGA execution | 55.54 s | 54.60 s | 54.85 s |
+| Vision end-to-end path | not reported | 55.81 s | 56.10 s |
+| Vision throughput | not reported | 20.86 GFLOPS | 20.76 GFLOPS |
+| Vision soft tokens | 256 | 256 | 256 |
+| LM prefill sequence executed | 512-token template | 272 actual tokens | 272 actual tokens |
+| LM prefill FPGA latency | 113.571 s | 51.63 s | 52.578 s |
+| LM prefill useful-work throughput | 23.20 GFLOPS | 23.94 GFLOPS | 23.45 GFLOPS |
+| Decode average throughput | 2.68 tok/s | 3.82 tok/s | 3.85 tok/s |
+| Decode peak first-token throughput | 2.86 tok/s | 4.07 tok/s | 4.01 tok/s |
+| Decode average hardware throughput | 13.42 GFLOPS | 19.11 GFLOPS | 19.20 GFLOPS |
+| Vision program section | 3.58 MiB | 3.03 MiB | 3.03 MiB |
+| Prefill program section | 5.71 MiB | 3.10 MiB | 3.21 MiB |
+| Combined program image | 10.37 MiB | 7.54 MiB | 7.67 MiB |
+| Weight image (`params.bin`) | 6.91 GiB | same | same |
 
 ## Refactor optimizations
 

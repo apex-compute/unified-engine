@@ -172,7 +172,7 @@ class Gemma4VisionMixin:
     def vision_tensor_init(self, *, program_base: int | None = None) -> None:
         """Allocate DRAM for vision encoder intermediate tensors. Reuses the LM
         tensor DRAM region (vision and LM never run simultaneously). Vision ISA
-        goes to VISION_ISA_BASE unless ``program_base`` overrides it."""
+        goes to the engine's vision ISA base unless ``program_base`` overrides it."""
         bpe = self.bytes_per_element
         H, HD, NH, MLP = self.VIS_H, self.VIS_HEAD_DIM, self.VIS_HEADS, self.VIS_MLP
         S = self.vision_num_patches
@@ -185,8 +185,7 @@ class Gemma4VisionMixin:
         # actual uploads are queued here and flushed at run time by
         # execute_vision_encoder_bin (right before the encoder launches).
         self._vis_pending_dmas: list[tuple[int, torch.Tensor]] = []
-        VISION_ISA_BASE = 0xa0000000
-        base = VISION_ISA_BASE if program_base is None else program_base
+        base = self.VISION_ISA_BASE if program_base is None else program_base
         self._next_program_dram_addr = base
         self._program_dram_base = base
         print(f"\n[Vision] Allocating vision tensor DRAM for {S} patches ...")
@@ -325,6 +324,12 @@ class Gemma4VisionMixin:
         self.VIS_EMBED_NORMED = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_EMBED_OUT = self.allocate_tensor_dram(S * text_h * bpe)
 
+        if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
+            raise MemoryError(
+                f"Gemma4 vision tensors overflow the 2-GB layout: "
+                f"end=0x{self.get_tensor_dram_addr():X}, "
+                f"vision_program_start=0x{self.VISION_ISA_BASE:X}")
+
         self._vis_num_patches = S
         self._vis_aligned_S = aligned_S
         print(f"  Vision tensor DRAM allocated. Total usage: {self.get_tensor_dram_usage()} bytes")
@@ -415,8 +420,7 @@ class Gemma4VisionMixin:
     # ------------------------------------------------------------------
     def compile_vision_encoder_bin(self, num_patches: int, profile: bool = False) -> None:
         """Capture patch embedding plus the 16-layer vision encoder as one
-        FPGA program at
-        VISION_ISA_BASE (0xa0000000). Pure host emission, no FPGA activity.
+        FPGA program at the engine's VISION_ISA_BASE. Pure host emission, no FPGA activity.
         Skips if the cached vision section exists — delete
         gemma4_e2b_bin/programs*.bin (make clean) after changing the FPGA compile
         so it recaptures fresh.
@@ -428,7 +432,8 @@ class Gemma4VisionMixin:
         bin can only be run segment-by-segment."""
         L = self.VIS_LAYERS
         _vmeta, _ = self._get_program_section("vision", profile)
-        if _vmeta is not None:
+        if (_vmeta is not None
+                and _vmeta.get("vision_kernel") == self.vision_kernel):
             bin_path, _ = self._program_image_paths(profile)
             print(f"  [Vision] reusing existing instruction image at {bin_path}", flush=True)
             print(f"    delete {bin_path} (or make clean) to force recompile.", flush=True)
@@ -458,31 +463,39 @@ class Gemma4VisionMixin:
                              self.VIS_HEADS, self.VIS_MLP)
         aligned_S, bpe = self._vis_aligned_S, self.bytes_per_element
 
+        def _projection_core(**kwargs) -> int:
+            """Dynamic IF4 projection selected for the entire vision stage."""
+            if self.vision_kernel == "matmatmul":
+                kwargs.setdefault("is_B_quantized", True)
+                return self.matmat_mul_core(**kwargs)
+            kwargs.pop("is_B_quantized", None)
+            return self.quantized_matmat_core(**kwargs)
+
         # Patch embedder: IF4 input projection followed by the gathered 2D
         # positional embedding add. Both runtime inputs were queued by
         # vision_tensor_init; no separate FPGA launch is needed.
-        self._vis_flops += self.matmat_mul_core(M=S, K=H, N=H, A_DRAM_ADDR=self.VIS_IO_B, B_DRAM_ADDR=self.VIS_PATCH_PROJ_INFO['data'], OUTPUT_DRAM_ADDR=self.VIS_IO_A, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.VIS_PATCH_PROJ_INFO['scale'], gelu_enable=False, clamp_enable=(None is not None), clamp_min=(0.0 if None is None else None), clamp_max=(float('inf') if None is None else None), gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-        self._vis_flops += self.eltwise_core_dram(M=S, N=S * H // S, dram_a=self.VIS_IO_A, dram_b=self.VIS_NORM_OUT, dram_out=self.VIS_IO_A, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=(None if self.legacy else self._prime_M(S)))
+        self._vis_flops += _projection_core(M=S, K=H, N=H, A_DRAM_ADDR=self.VIS_IO_B, B_DRAM_ADDR=self.VIS_PATCH_PROJ_INFO['data'], OUTPUT_DRAM_ADDR=self.VIS_IO_A, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.VIS_PATCH_PROJ_INFO['scale'], gelu_enable=False, clamp_enable=(None is not None), clamp_min=(0.0 if None is None else None), clamp_max=(float('inf') if None is None else None), gpr_M_reg=self._prime_M(S))
+        self._vis_flops += self.eltwise_core_dram(M=S, N=S * H // S, dram_a=self.VIS_IO_A, dram_b=self.VIS_NORM_OUT, dram_out=self.VIS_IO_A, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S))
         _checkpoint("patch_embed")
         for li in range(L):
             w, clips = self._vis_weight_addrs[li], self._vis_clip_ranges[li]
             IN = self.VIS_IO_A if li % 2 == 0 else self.VIS_IO_B
-            self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT, GAMMA_DRAM_ADDR=w['input_layernorm'], gpr_M_reg=(None if self.legacy else self._prime_M(S)))
+            self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT, GAMMA_DRAM_ADDR=w['input_layernorm'], gpr_M_reg=self._prime_M(S))
             # q/k/v share one input clip range -> clamp VIS_NORM_OUT once.
             qkv_in = [clips[p]["input"] for p in ("q_proj", "k_proj", "v_proj")]
             share = all(x == qkv_in[0] for x in qkv_in)
             if share:
-                self._vis_flops += self.activation_core(M=S * H // 64, N=64, A_DRAM_ADDR=self.VIS_NORM_OUT, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=qkv_in[0][0], clamp_max=qkv_in[0][1], gpr_M_reg=(None if self.legacy else self._prime_M(S * H // 64)))
+                self._vis_flops += self.activation_core(M=S * H // 64, N=64, A_DRAM_ADDR=self.VIS_NORM_OUT, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=qkv_in[0][0], clamp_max=qkv_in[0][1], gpr_M_reg=self._prime_M(S * H // 64))
             for proj, out in (("q_proj", self.VIS_Q_DRAM), ("k_proj", self.VIS_K_DRAM),
                               ("v_proj", self.VIS_V_DRAM)):
                 c = clips[proj]
                 if not share:
-                    self._vis_flops += self.activation_core(M=S * H // 64, N=64, A_DRAM_ADDR=self.VIS_NORM_OUT, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=c['input'][0], clamp_max=c['input'][1], gpr_M_reg=(None if self.legacy else self._prime_M(S * H // 64)))
-                self._vis_flops += self.matmat_mul_core(M=S, K=H, N=NH * HD, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, B_DRAM_ADDR=w[proj]['data'], OUTPUT_DRAM_ADDR=out, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w[proj]['scale'], gelu_enable=False, clamp_enable=(c['output'][0] is not None), clamp_min=(0.0 if c['output'][0] is None else c['output'][0]), clamp_max=(float('inf') if c['output'][1] is None else c['output'][1]), gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_Q_DRAM, OUTPUT_DRAM_ADDR=self.VIS_Q_NORM, GAMMA_DRAM_ADDR=w['q_norm'], gpr_M_reg=(None if self.legacy else self._prime_M(S * NH)))
-            self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_K_DRAM, OUTPUT_DRAM_ADDR=self.VIS_K_NORM, GAMMA_DRAM_ADDR=w['k_norm'], gpr_M_reg=(None if self.legacy else self._prime_M(S * NH)))
+                    self._vis_flops += self.activation_core(M=S * H // 64, N=64, A_DRAM_ADDR=self.VIS_NORM_OUT, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=c['input'][0], clamp_max=c['input'][1], gpr_M_reg=self._prime_M(S * H // 64))
+                self._vis_flops += _projection_core(M=S, K=H, N=NH * HD, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, B_DRAM_ADDR=w[proj]['data'], OUTPUT_DRAM_ADDR=out, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w[proj]['scale'], gelu_enable=False, clamp_enable=(c['output'][0] is not None), clamp_min=(0.0 if c['output'][0] is None else c['output'][0]), clamp_max=(float('inf') if c['output'][1] is None else c['output'][1]), gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_Q_DRAM, OUTPUT_DRAM_ADDR=self.VIS_Q_NORM, GAMMA_DRAM_ADDR=w['q_norm'], gpr_M_reg=self._prime_M(S * NH))
+            self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_K_DRAM, OUTPUT_DRAM_ADDR=self.VIS_K_NORM, GAMMA_DRAM_ADDR=w['k_norm'], gpr_M_reg=self._prime_M(S * NH))
             _checkpoint(f"L{li}_proj")
-            self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_V_DRAM, GAMMA_DRAM_ADDR=self.VIS_V_NORM_ONES_GAMMA, gpr_M_reg=(None if self.legacy else self._prime_M(S * NH)))
+            self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_V_DRAM, GAMMA_DRAM_ADDR=self.VIS_V_NORM_ONES_GAMMA, gpr_M_reg=self._prime_M(S * NH))
             for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
                 self._emit_vision_rope_2d(src_dram=dram, out_dram=dram, cos_pad_dram=self.VIS_ROPE_COS_PAD_TILED, neg_sin_pad_dram=self.VIS_ROPE_NEG_SIN_PAD_TILED, sin_hi_pad_dram=self.VIS_ROPE_SIN_HI_PAD_TILED, M=S * NH)
             for src, dst in ((self.VIS_Q_NORM, self.VIS_FLASH_Q_HM),
@@ -521,24 +534,24 @@ class Gemma4VisionMixin:
             _checkpoint(f"L{li}_attention")
             OUT = self.VIS_IO_B if li % 2 == 0 else self.VIS_IO_A
             co = clips["o_proj"]
-            self._vis_flops += self.activation_core(M=S * NH * HD // 64, N=64, A_DRAM_ADDR=self.VIS_Q_DRAM, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=co['input'][0], clamp_max=co['input'][1], gpr_M_reg=(None if self.legacy else self._prime_M(S * NH * HD // 64)))
-            self._vis_flops += self.matmat_mul_core(M=S, K=NH * HD, N=H, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, B_DRAM_ADDR=w['o_proj']['data'], OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w['o_proj']['scale'], gelu_enable=False, clamp_enable=(co['output'][0] is not None), clamp_min=(0.0 if co['output'][0] is None else co['output'][0]), clamp_max=(float('inf') if co['output'][1] is None else co['output'][1]), gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_ATTN_OUT, OUTPUT_DRAM_ADDR=self.VIS_POST_ATTN_NORM, GAMMA_DRAM_ADDR=w['post_attention_layernorm'], gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.eltwise_core_dram(M=S, N=S * H // S, dram_a=IN, dram_b=self.VIS_POST_ATTN_NORM, dram_out=self.VIS_POST_ATTN_RES, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_POST_ATTN_RES, OUTPUT_DRAM_ADDR=self.VIS_PRE_FFN_NORM, GAMMA_DRAM_ADDR=w['pre_feedforward_layernorm'], gpr_M_reg=(None if self.legacy else self._prime_M(S)))
+            self._vis_flops += self.activation_core(M=S * NH * HD // 64, N=64, A_DRAM_ADDR=self.VIS_Q_DRAM, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=co['input'][0], clamp_max=co['input'][1], gpr_M_reg=self._prime_M(S * NH * HD // 64))
+            self._vis_flops += _projection_core(M=S, K=NH * HD, N=H, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, B_DRAM_ADDR=w['o_proj']['data'], OUTPUT_DRAM_ADDR=self.VIS_ATTN_OUT, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w['o_proj']['scale'], gelu_enable=False, clamp_enable=(co['output'][0] is not None), clamp_min=(0.0 if co['output'][0] is None else co['output'][0]), clamp_max=(float('inf') if co['output'][1] is None else co['output'][1]), gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_ATTN_OUT, OUTPUT_DRAM_ADDR=self.VIS_POST_ATTN_NORM, GAMMA_DRAM_ADDR=w['post_attention_layernorm'], gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.eltwise_core_dram(M=S, N=S * H // S, dram_a=IN, dram_b=self.VIS_POST_ATTN_NORM, dram_out=self.VIS_POST_ATTN_RES, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_POST_ATTN_RES, OUTPUT_DRAM_ADDR=self.VIS_PRE_FFN_NORM, GAMMA_DRAM_ADDR=w['pre_feedforward_layernorm'], gpr_M_reg=self._prime_M(S))
             cg, cu, cd = clips["gate_proj"], clips["up_proj"], clips["down_proj"]
-            self._vis_flops += self.activation_core(M=S * H // 64, N=64, A_DRAM_ADDR=self.VIS_PRE_FFN_NORM, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=cg['input'][0], clamp_max=cg['input'][1], gpr_M_reg=(None if self.legacy else self._prime_M(S * H // 64)))
-            self._vis_flops += self.matmat_mul_core(M=S, K=H, N=MLP, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, B_DRAM_ADDR=w['gate_proj']['data'], OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w['gate_proj']['scale'], gelu_enable=True, clamp_enable=(None is not None), clamp_min=(0.0 if None is None else None), clamp_max=(float('inf') if None is None else None), gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.activation_core(M=S * MLP // 64, N=64, A_DRAM_ADDR=self.VIS_MLP_GATE, OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=cg['output'][0], clamp_max=cg['output'][1], gpr_M_reg=(None if self.legacy else self._prime_M(S * MLP // 64)))
+            self._vis_flops += self.activation_core(M=S * H // 64, N=64, A_DRAM_ADDR=self.VIS_PRE_FFN_NORM, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=cg['input'][0], clamp_max=cg['input'][1], gpr_M_reg=self._prime_M(S * H // 64))
+            self._vis_flops += _projection_core(M=S, K=H, N=MLP, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, B_DRAM_ADDR=w['gate_proj']['data'], OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w['gate_proj']['scale'], gelu_enable=True, clamp_enable=(None is not None), clamp_min=(0.0 if None is None else None), clamp_max=(float('inf') if None is None else None), gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.activation_core(M=S * MLP // 64, N=64, A_DRAM_ADDR=self.VIS_MLP_GATE, OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=cg['output'][0], clamp_max=cg['output'][1], gpr_M_reg=self._prime_M(S * MLP // 64))
             # up shares gate's input clamp (VIS_INPUT_CLIP_H_SCRATCH still valid).
             if cu["input"] != cg["input"]:
-                self._vis_flops += self.activation_core(M=S * H // 64, N=64, A_DRAM_ADDR=self.VIS_PRE_FFN_NORM, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=cu['input'][0], clamp_max=cu['input'][1], gpr_M_reg=(None if self.legacy else self._prime_M(S * H // 64)))
-            self._vis_flops += self.matmat_mul_core(M=S, K=H, N=MLP, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, B_DRAM_ADDR=w['up_proj']['data'], OUTPUT_DRAM_ADDR=self.VIS_MLP_UP, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w['up_proj']['scale'], gelu_enable=False, clamp_enable=(cu['output'][0] is not None), clamp_min=(0.0 if cu['output'][0] is None else cu['output'][0]), clamp_max=(float('inf') if cu['output'][1] is None else cu['output'][1]), gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.eltwise_core_dram(M=S, N=S * MLP // S, dram_a=self.VIS_MLP_GATE, dram_b=self.VIS_MLP_UP, dram_out=self.VIS_MLP_MULT, mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.activation_core(M=S * MLP // 64, N=64, A_DRAM_ADDR=self.VIS_MLP_MULT, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_MLP_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=cd['input'][0], clamp_max=cd['input'][1], gpr_M_reg=(None if self.legacy else self._prime_M(S * MLP // 64)))
-            self._vis_flops += self.matmat_mul_core(M=S, K=MLP, N=H, A_DRAM_ADDR=self.VIS_INPUT_CLIP_MLP_SCRATCH, B_DRAM_ADDR=w['down_proj']['data'], OUTPUT_DRAM_ADDR=self.VIS_MLP_DOWN, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w['down_proj']['scale'], gelu_enable=False, clamp_enable=(cd['output'][0] is not None), clamp_min=(0.0 if cd['output'][0] is None else cd['output'][0]), clamp_max=(float('inf') if cd['output'][1] is None else cd['output'][1]), gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_MLP_DOWN, OUTPUT_DRAM_ADDR=self.VIS_POST_FFN_NORM, GAMMA_DRAM_ADDR=w['post_feedforward_layernorm'], gpr_M_reg=(None if self.legacy else self._prime_M(S)))
-            self._vis_flops += self.eltwise_core_dram(M=S, N=S * H // S, dram_a=self.VIS_POST_ATTN_RES, dram_b=self.VIS_POST_FFN_NORM, dram_out=OUT, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=(None if self.legacy else self._prime_M(S)))
+                self._vis_flops += self.activation_core(M=S * H // 64, N=64, A_DRAM_ADDR=self.VIS_PRE_FFN_NORM, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=cu['input'][0], clamp_max=cu['input'][1], gpr_M_reg=self._prime_M(S * H // 64))
+            self._vis_flops += _projection_core(M=S, K=H, N=MLP, A_DRAM_ADDR=self.VIS_INPUT_CLIP_H_SCRATCH, B_DRAM_ADDR=w['up_proj']['data'], OUTPUT_DRAM_ADDR=self.VIS_MLP_UP, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w['up_proj']['scale'], gelu_enable=False, clamp_enable=(cu['output'][0] is not None), clamp_min=(0.0 if cu['output'][0] is None else cu['output'][0]), clamp_max=(float('inf') if cu['output'][1] is None else cu['output'][1]), gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.eltwise_core_dram(M=S, N=S * MLP // S, dram_a=self.VIS_MLP_GATE, dram_b=self.VIS_MLP_UP, dram_out=self.VIS_MLP_MULT, mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.activation_core(M=S * MLP // 64, N=64, A_DRAM_ADDR=self.VIS_MLP_MULT, OUTPUT_DRAM_ADDR=self.VIS_INPUT_CLIP_MLP_SCRATCH, IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, activation="clamp", clamp_min=cd['input'][0], clamp_max=cd['input'][1], gpr_M_reg=self._prime_M(S * MLP // 64))
+            self._vis_flops += _projection_core(M=S, K=MLP, N=H, A_DRAM_ADDR=self.VIS_INPUT_CLIP_MLP_SCRATCH, B_DRAM_ADDR=w['down_proj']['data'], OUTPUT_DRAM_ADDR=self.VIS_MLP_DOWN, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=w['down_proj']['scale'], gelu_enable=False, clamp_enable=(cd['output'][0] is not None), clamp_min=(0.0 if cd['output'][0] is None else cd['output'][0]), clamp_max=(float('inf') if cd['output'][1] is None else cd['output'][1]), gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_MLP_DOWN, OUTPUT_DRAM_ADDR=self.VIS_POST_FFN_NORM, GAMMA_DRAM_ADDR=w['post_feedforward_layernorm'], gpr_M_reg=self._prime_M(S))
+            self._vis_flops += self.eltwise_core_dram(M=S, N=S * H // S, dram_a=self.VIS_POST_ATTN_RES, dram_b=self.VIS_POST_FFN_NORM, dram_out=OUT, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S))
             _checkpoint(f"L{li}_post_attn")
         self.generate_instruction_halt()
         self._set_silent(_prev_silent)
@@ -552,7 +565,7 @@ class Gemma4VisionMixin:
 
         _vis_meta = {"num_patches": num_patches, "vis_layers": L,
                      "includes_patch_embed": True,
-                     "legacy": self.legacy,
+                     "vision_kernel": self.vision_kernel,
                      "total_flops": total_flops}
         if profile:
             _vis_meta["profile_checkpoints"] = enc_checkpoints

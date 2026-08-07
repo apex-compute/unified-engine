@@ -698,42 +698,34 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     checks live in gemma4_e2b_numeric.py."""
 
     def __init__(self, script_dir: str | None = None,
-                 prefill_kernel: str = "streaming", decode_kernel: str = "streaming",
-                 legacy: bool = False):
-        if prefill_kernel not in ("streaming", "matmatmul"):
-            raise ValueError(f"unsupported prefill kernel: {prefill_kernel}")
-        if decode_kernel not in ("streaming", "matmatmul"):
-            raise ValueError(f"unsupported decode kernel: {decode_kernel}")
+                 vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
+                 decode_kernel: str = "streaming"):
+        for stage, kernel in (("vision", vision_kernel), ("prefill", prefill_kernel),
+                              ("decode", decode_kernel)):
+            if kernel not in ("streaming", "matmatmul"):
+                raise ValueError(f"unsupported {stage} kernel: {kernel}")
         if os.environ.get("GEMMA4_PENALTY", "0") == "1":
             raise RuntimeError(
                 "GEMMA4_PENALTY=1 is temporarily unsupported: the dynamic streaming "
                 "quantized_matmat_core must gain broadcast-bias support before the "
                 "on-FPGA penalty can be re-enabled.")
+        self.vision_kernel = vision_kernel
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
-        self.legacy = legacy
         engine_base = user_dma_core.UE_0_BASE_ADDR
-        # Gemma4 FIXED DRAM layout (FULL 4 GB; see notes/notes_gemma4_e2b_vision.md
-        # "Master layout table"). All addresses below 0x100000000 (DMA-mapped DRAM
-        # is 0x00000000 – 0xFFFFFFFF — same as qwen2.5; old DRAM_START_ADDR=0x80000000
-        # only used the upper 2 GB and wasted the rest).
-        #   Weight LM     : 0x00000000 – 0x64000000  (1600 MB)
-        #   Weight Vision : 0x64000000 – 0x6c000000  (128 MB)
-        #   Weight Audio  : 0x6c000000 – 0x78000000  (192 MB)
-        #   Act. Scratch  : 0x78000000 – 0x88000000  (256 MB) ← tensor_base default
-        #   Act. KV cache : 0x88000000 – 0x98000000  (256 MB; tail of activation region)
-        #   ISA Audio     : 0x98000000 – 0xa0000000  (128 MB)
-        #   ISA Vision    : 0xa0000000 – 0xc0000000  (512 MB) ← vision_tensor_init
-        #   ISA LM        : 0xc0000000 – 0x100000000 (1 GB)   ← program_base default
-        #     Vision (a separate encoder bin) and the LM combined image live in
-        #     DISJOINT program regions so both stay resident: vision runs first
-        #     and produces soft-token features, then LM prefill+decode runs.
-        #     The refactor's LM image is small (~7 MB, seq_len-agnostic dynamic
-        #     PBI), so 0xc0000000 has ~1 GB headroom — no overflow (that only bit
-        #     test.py's old monolithic LM+vision image).
-        _params_base  = 0x00000000   # Weight region start
-        _tensor_base  = 0x78000000   # Activation region start (stage scratch)
-        _program_base = 0xc0000000   # LM ISA base; vision ISA sits at 0xa0000000
+        # Gemma4 fixed DRAM layout within the upper 2 GB window, matching the
+        # addressable range used by the Llama-3.2-1B path.
+        #   LM weights       : 0x80000000 – 0xE1000000  (1552 MiB)
+        #   LM/vision tensor : 0xE1000000 – 0xFF000000  (480 MiB, reused by stage)
+        #   Vision ISA       : 0xFF000000 – 0xFF600000  (6 MiB)
+        #   LM ISA           : 0xFF600000 – 0x100000000 (10 MiB)
+        # Vision and LM programs remain resident at disjoint addresses.
+        self.DRAM_END = 0x100000000
+        self.VISION_ISA_BASE = 0xFF000000
+        self.LM_ISA_BASE = 0xFF600000
+        _params_base  = 0x80000000
+        _tensor_base  = 0xE1000000
+        _program_base = self.LM_ISA_BASE
         super().__init__(BASE_ADDR=engine_base,
                           params_dram_base=_params_base,
                           program_dram_base=_program_base,
@@ -814,6 +806,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
         self.dma_to_accelerator_memory(
             self._vis_identity_dram, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
+        if self.get_params_dram_addr() > self._tensor_dram_base:
+            raise MemoryError(
+                f"Gemma4 weights overflow the 2-GB layout: "
+                f"end=0x{self.get_params_dram_addr():X}, "
+                f"tensor_start=0x{self._tensor_dram_base:X}")
+        if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
+            raise MemoryError(
+                f"Gemma4 tensors overflow the 2-GB layout: "
+                f"end=0x{self.get_tensor_dram_addr():X}, "
+                f"vision_program_start=0x{self.VISION_ISA_BASE:X}")
 
     @staticmethod
     def load_config(config_path: str | None = None, script_dir: str | None = None) -> dict:
@@ -985,7 +987,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         prefill_flops_seq_len = len(self.prefill_seq) - 1
         _lm_meta, _ = self._get_program_section("lm", profile)
         if (_lm_meta is not None
-                and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len):
+                and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len
+                and _lm_meta.get("prefill_kernel") == self.prefill_kernel
+                and _lm_meta.get("decode_kernel") == self.decode_kernel):
             bin_path, _ = self._program_image_paths(profile)
             print(f"[compile] reusing existing instruction image at {bin_path}")
             print(f"  delete {bin_path} (or make clean) to force recompile.")
@@ -1229,6 +1233,19 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return weight_bin_generate(**kwargs)
 
 
+def _clock_ns_default_for_device(device: str) -> float:
+    """Return the board-profile clock period, matching user_hw_test/Llama."""
+    if device == "kintex7":
+        return 1000 / (1066 / 5.375)
+    if device in ("rk", "puzhi"):
+        return 3.0
+    if device in ("bittware", "bittware_256"):
+        return 3.3333
+    if device in ("alveo", "efinix"):
+        return 4.0
+    return 10.0
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
@@ -1253,6 +1270,9 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument("--vision-host", action="store_true",
                         help="With --image, generate image soft-token embeddings on the host "
                              "with the HF vision tower; FPGA prefill/decode are unchanged.")
+    parser.add_argument("--vision-kernel", choices=("streaming", "matmatmul"),
+                        default="matmatmul",
+                        help="Quantized projection kernel for FPGA vision (default: matmatmul).")
     parser.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
                         default="streaming",
                         help="Quantized projection kernel for LM prefill (default: streaming).")
@@ -1260,15 +1280,13 @@ default prompt: "x+3=5, what is x?"
                         default="streaming",
                         help="Quantized projection kernel for LM decode, including LM head "
                              "(default: streaming).")
-    parser.add_argument("--legacy", action="store_true",
-                        help="Use statically unrolled vision kernels instead of PBI loops.")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--device', type=str, default='kintex7',
-                        help='FPGA board profile (kintex7, efinix).')
+                        help='FPGA board profile (kintex7, rk, puzhi, bittware, '
+                             'bittware_256, alveo, efinix).')
     parser.add_argument('--cycle', type=float, default=None,
-                        help='Clock cycle time in nanoseconds '
-                             '(default: 4.0 for efinix, otherwise 1000/198.3256)')
+                        help='Clock cycle time in nanoseconds. Overrides --device default.')
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
@@ -1277,6 +1295,20 @@ default prompt: "x+3=5, what is x?"
         parser.error("--vision-host requires --image")
     if args.image and args.audio:
         parser.error("--image and --audio are mutually exclusive")
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    # Gemma4 vision has K <= 3072, so its two-pass kernel remains valid on
+    # 512-bit AXI. LM prefill and decode include wide MLP-down K=12288 and
+    # therefore cannot select matmatmul on that hardware profile.
+    if axi_width_bits == 512 and (
+            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
+        requested = []
+        if args.prefill_kernel == "matmatmul":
+            requested.append("--prefill-kernel matmatmul")
+        if args.decode_kernel == "matmatmul":
+            requested.append("--decode-kernel matmatmul")
+        parser.error(
+            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
+            "on the 512-bit AXI data path; use streaming.")
     if os.environ.get("GEMMA4_PENALTY", "0") == "1":
         parser.error(
             "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
@@ -1287,24 +1319,30 @@ default prompt: "x+3=5, what is x?"
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 1000 / 198.3256)
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, "
+          f"UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     print(f"Using DMA device: {'efinix' if args.device == 'efinix' else args.dev}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
-    print(f"LM kernels: prefill={args.prefill_kernel}, decode={args.decode_kernel}")
+    print(f"Kernels: vision={args.vision_kernel}, prefill={args.prefill_kernel}, "
+          f"decode={args.decode_kernel}")
     ue = Gemma4_UnifiedEngine(
+        vision_kernel=args.vision_kernel,
         prefill_kernel=args.prefill_kernel,
-        decode_kernel=args.decode_kernel,
-        legacy=args.legacy)
+        decode_kernel=args.decode_kernel)
 
     # Prompt first — the prefill program is compiled for its exact length.
     # VLM mode (--image): run the vision encoder on the FPGA now (separate bin
-    # @ 0xa0000000); it sets prefill_seq + image soft-tokens that run_prefill
-    # merges. The LM prefill/decoder then compiles at 0xc0000000 as usual.
+    # @ VISION_ISA_BASE); it sets prefill_seq + image soft-tokens that run_prefill
+    # merges. The LM prefill/decoder then compiles at LM_ISA_BASE.
     if args.audio:
         if not os.path.isfile(args.audio):
             candidate = os.path.join(
