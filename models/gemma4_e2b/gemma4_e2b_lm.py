@@ -123,7 +123,10 @@ class Gemma4LMMixin:
         rope_cfg = self._cfg["special"]["rope"]
         theta = rope_theta if rope_theta is not None else rope_cfg["theta"]
         local_base = rope_local_base if rope_local_base is not None else rope_cfg["local_base"]
-        num_rope_positions = rope_cfg["num_positions"]
+        # RoPE must cover every position up to the context limit. Derive the
+        # count from MAX_CONTEXT_SIZE (falling back to the config value when it is
+        # larger) so raising the context never silently runs past the table.
+        num_rope_positions = max(int(rope_cfg["num_positions"]), int(self.MAX_CONTEXT_SIZE))
         partial_rotary_factor = rope_cfg["partial_rotary_factor_global"]
 
         # LOCAL RoPE: head_dim_sliding=256, full rotation, D=128
@@ -134,9 +137,11 @@ class Gemma4LMMixin:
         cos_local = freqs_local.cos().to(torch.bfloat16)
         sin_local = freqs_local.sin().to(torch.bfloat16)
         rope_local = torch.cat([cos_local, cos_local, -sin_local, sin_local], dim=1)
-        sz = self.weight_defs["ROPE_LOCAL_SIZE"]
+        # Size the table to the actual data (num_rope_positions x head_dim_sliding*2
+        # bf16); the baked ROPE_LOCAL_SIZE region only fits 1024 positions and would
+        # truncate anything larger.
         raw = rope_local.contiguous().view(torch.uint8).numpy().tobytes()
-        raw = (raw + b"\x00" * sz)[:sz]
+        sz = len(raw)
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
         self.DRAM_ADDR_ROPE_LOCAL = addr
@@ -149,9 +154,10 @@ class Gemma4LMMixin:
         cos_global = freqs_global.cos().to(torch.bfloat16)
         sin_global = freqs_global.sin().to(torch.bfloat16)
         rope_global = torch.cat([cos_global, cos_global, -sin_global, sin_global], dim=1)
-        sz = self.weight_defs["ROPE_GLOBAL_SIZE"]
+        # Size to the actual data (num_rope_positions x rotary_dims*2 bf16); see the
+        # ROPE_LOCAL note above on why the baked region size would truncate.
         raw = rope_global.contiguous().view(torch.uint8).numpy().tobytes()
-        raw = (raw + b"\x00" * sz)[:sz]
+        sz = len(raw)
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
         self.DRAM_ADDR_ROPE_GLOBAL = addr
@@ -317,13 +323,21 @@ class Gemma4LMMixin:
         global-attention rows use 512 elements, matching unified attention's
         contiguous K/V layout directly.
         """
-        seq_len = self.MAX_CONTEXT_SIZE
+        # Per-token work length. Every LM intermediate (norms, projections, MLP,
+        # attention staging, per-layer input prep) only ever holds up to
+        # `prefill_seq_len` rows: prefill processes at most `max_prefill_seq_len`
+        # tokens per pass (run_prefill asserts this) and decode processes one.
+        # Sizing these buffers by the work length instead of MAX_CONTEXT_SIZE keeps
+        # the tensor-DRAM footprint flat as the context grows (e.g. 1024 -> 4096);
+        # only the KV cache (below) genuinely scales with MAX_CONTEXT_SIZE, and the
+        # attention scratch/bias buffers scale with `attention_aligned_seq_len`.
+        prefill_seq_len = min(self.max_prefill_seq_len, self.MAX_CONTEXT_SIZE)
+        seq_len = prefill_seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
-        # Unified attention scratch/bias buffers are largest during prefill,
-        # but decode can still require MAX_CONTEXT_SIZE KV rows. Size the
-        # shared attention buffers for the larger aligned dimension.
-        prefill_seq_len = min(self.max_prefill_seq_len, self.MAX_CONTEXT_SIZE)
+        # Unified attention scratch/bias buffers are largest during prefill, but
+        # decode can still require MAX_CONTEXT_SIZE KV rows. Size the shared
+        # attention buffers for the larger aligned dimension.
         prefill_q_seq_len = prefill_seq_len * self.group_size
         prefill_aligned_seq_len = ((prefill_q_seq_len + 63) // 64) * 64
         decode_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
@@ -424,13 +438,18 @@ class Gemma4LMMixin:
         # Per-layer input preparation + injection buffers.  The host uploads
         # only token-indexed rows from embed_tokens_per_layer; FPGA performs
         # model projection, RMSNorm, add and scaling into PER_LAYER_INPUTS_DRAM.
-        pli_elements = self.MAX_CONTEXT_SIZE * self.LAYER_SIZE * self.per_layer_input_dim
+        # All three are per-pass work buffers: prefill fills up to prefill_seq_len
+        # tokens ([token, layer, dim]); decode recomputes the single current token
+        # at the base each step (see the decode per-layer prep, which writes with
+        # OUTPUT_DRAM_ADDR=PER_LAYER_INPUTS_DRAM). So size by the work length, not
+        # MAX_CONTEXT_SIZE.
+        pli_elements = seq_len * self.LAYER_SIZE * self.per_layer_input_dim
         self.PER_LAYER_EMBED_DRAM = self.allocate_tensor_dram(
             pli_elements * self.bytes_per_element)
         self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(
             pli_elements * self.bytes_per_element)
         # Final layout is [token, layer, dim], consumed by injection blocks.
-        self.PER_LAYER_INPUTS_DRAM = self.allocate_tensor_dram(self.MAX_CONTEXT_SIZE * self.LAYER_SIZE * self.per_layer_input_dim * self.bytes_per_element)
+        self.PER_LAYER_INPUTS_DRAM = self.allocate_tensor_dram(pli_elements * self.bytes_per_element)
         # Intermediate DRAMs for per-layer injection
         self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.per_layer_input_dim * self.bytes_per_element)
         self.LAYER0_PER_LAYER_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * self.bytes_per_element)
