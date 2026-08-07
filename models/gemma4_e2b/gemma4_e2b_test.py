@@ -1264,9 +1264,11 @@ default prompt: "x+3=5, what is x?"
                         help="Use statically unrolled vision kernels instead of PBI loops.")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=1000 / 198.3256,
+    parser.add_argument('--device', type=str, default='kintex7',
+                        help='FPGA board profile (kintex7, efinix).')
+    parser.add_argument('--cycle', type=float, default=None,
                         help='Clock cycle time in nanoseconds '
-                             '(default: 1000/198.3256 ≈ 5.042, i.e. 198.3256 MHz)')
+                             '(default: 4.0 for efinix, otherwise 1000/198.3256)')
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
@@ -1280,13 +1282,14 @@ default prompt: "x+3=5, what is x?"
             "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
             "quantized_matmat_core needs broadcast-bias support first")
 
-    set_dma_device(args.dev)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Using DMA device: {args.dev}")
+    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 1000 / 198.3256)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    print(f"Using DMA device: {'efinix' if args.device == 'efinix' else args.dev}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
