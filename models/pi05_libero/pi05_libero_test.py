@@ -7,6 +7,7 @@ The standard decoder loop is driven by the config `ops` block. Hand-edit ONLY:
   - The padding obligations recorded in the manifest hw_notes (64-ALU / 128B rows).
 """
 import builtins
+import contextlib
 import json
 import math
 import os
@@ -37,7 +38,7 @@ from user_dma_core import (
 from nn_lib import (
     smart_bf16_permute_core,
     store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
-    eltwise_add_core_dram, eltwise_mul_core_dram,
+    eltwise_add_core_dram, eltwise_mul_core_dram, silu_core_dram,
     rms_norm_core_dram_post_add, layer_norm_core_dram_post_add,
 )
 from quant_lib import (
@@ -292,6 +293,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # op. Move N up one at a time as each checkpoint passes.
     DEBUG_STOP_AFTER = None
 
+    # Multi-engine-safe prefix early stop: None = compile all NUM_LAYERS. Set to an
+    # int L to halt the prefix program right after layer L's residual2, on EVERY
+    # engine (a layer boundary is the only lockstep point across shards -- see
+    # _emit_prefix_body). Used by dual_engine_gates' prefix ladder; DEBUG_STOP_AFTER
+    # is refused when the prefix is sharded.
+    PREFIX_STOP_AFTER_LAYER = None
+
     # A/B knob for the 832-vs-576 prefix experiment (--keep-masked-slots).
     # False (default): all-zero image slots are DROPPED from the prefix -> 576 tokens.
     # True: they are carried as -inf-masked placeholder rows -> 832 tokens, ~1050
@@ -326,16 +334,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self._debug_counter = 0
         self._debug_halt_info = None
 
-    def _debug_op(self, name, dram_addr, numel, shape=None):
+    def _debug_op(self, name, dram_addr, numel, shape=None, ue=None):
         """Call after emitting each op worth independently verifying. Assigns
         the next checkpoint index; if it matches DEBUG_STOP_AFTER, halts the
         program right here and raises _DebugStop so the caller's compile_*
         method unwinds early (catch it around the main body, then fall through
-        to whatever finalization/subroutine-compile code normally follows)."""
+        to whatever finalization/subroutine-compile code normally follows).
+
+        ``ue`` selects which engine's instruction stream the halt is emitted
+        into (multi-engine encoder: every engine must halt at the SAME
+        checkpoint index, else the un-halted engine keeps running and
+        overwrites shared buffers). Defaults to self (engine 0)."""
         idx = self._debug_counter
         self._debug_counter += 1
         if self.DEBUG_STOP_AFTER is not None and idx == self.DEBUG_STOP_AFTER:
-            self.generate_instruction_halt()
+            (ue or self).generate_instruction_halt()
             self._debug_halt_info = {"idx": idx, "name": name, "addr": dram_addr,
                                       "numel": numel, "shape": shape}
             raise _DebugStop()
@@ -674,6 +687,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self.identity_addr = store_identity_matrix(self)
             self._tensor_init_vision()
         print(f"tensor_init done; tensor DRAM at 0x{self.get_tensor_dram_addr():X}")
+        self.dram_region_map("after tensor_init")
 
     def _tensor_init_vision(self):
         """Allocate vision-encoder activation/scratch DRAM. Appended at the END of
@@ -749,27 +763,33 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         print(f"    _tensor_init_vision done; tensor DRAM at 0x{self.get_tensor_dram_addr():X}")
 
     # ---- matmul dispatch ---------------------------------------------------
-    def _matmul(self, M, K, N, A, proj, la, OUT, **kw):
+    def _matmul(self, M, K, N, A, proj, la, OUT, ue=None, **kw):
         """Dispatch a (M,K)@(N,K)^T matmul against per-layer weight dict `la`, keyed by
         `proj` (e.g. 'q', 'k', 'v', 'o', 'gate', 'up', 'down'). All LM prefix weights are
-        IF4 q4_64 per quant policy."""
+        IF4 q4_64 per quant policy.
+
+        ``ue`` selects the emitting engine (row-sharded multi-engine prefix);
+        defaults to self (engine 0). Weights/scales are SHARED_FULL -- every
+        engine reads the same params DRAM, nothing is duplicated."""
         assert self.LM_QUANT == "q4_64", f"unsupported LM_QUANT={self.LM_QUANT}"
-        return self.matmat_mul_core(
+        return (ue or self).matmat_mul_core(
             M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f"{proj}_data"],
             OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
             SCALE_DRAM_ADDR=la[f"{proj}_scale"], **kw)
 
-    def _dram_copy(self, size_bytes, src, dst):
+    def _dram_copy(self, size_bytes, src, dst, ue=None):
         """DRAM->DRAM copy via a SRAM roundtrip, chunked through URAM_A. Used to
-        stage per-layer K/V projections into the persistent KV-cache region."""
+        stage per-layer K/V projections into the persistent KV-cache region.
+        ``ue`` selects the emitting engine (multi-engine encoder); defaults to self."""
         bpe = 2
+        eng = ue or self
         elems = size_bytes // bpe
         chunk = min(URAM_NEAR_FULL_ELEMENTS, elems)
         sram = 0x00000
-        for start, take in self.chunk_ranges(elems, chunk):
+        for start, take in eng.chunk_ranges(elems, chunk):
             off = start * bpe
-            self.accelerator_memory_to_sram(src + off, sram, take)
-            self.sram_to_accelerator_memory(sram, dst + off, take)
+            eng.accelerator_memory_to_sram(src + off, sram, take)
+            eng.sram_to_accelerator_memory(sram, dst + off, take)
 
     def _dram_split_copy(self, rows, row_elems, col_offset, col_take, src, dst):
         """Extract a column slice [col_offset : col_offset+col_take) from a (rows,
@@ -960,209 +980,78 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # NaN'ing full run). Set True to re-enable the per-op SNR report.
         self._prefix_snap = getattr(self, "PREFIX_SNAPSHOTS", False)
 
-        # PBI dynamic-M loop (mirrors compile_encoder's vis_S_reg): without this,
-        # every matmul/RMSNorm below compiles a fully-unrolled static instruction
-        # stream per M=1024 row-chunk, which for 18 layers blew the compiled
-        # program up to ~684MB (vs. vision's 745KB for 27 layers) and triggered a
-        # DMA transfer-size failure. gpr_M_reg makes the outer row loop a runtime
-        # trip count instead of static unrolling.
-        prefix_S_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(prefix_S_reg, S)
-
-        # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds the
-        # sqrt(N) RSQRT scale implicitly -- the dynamic core reads it from a runtime
-        # GPR (float_to_bf19(sqrt(N))) and takes N in its own GPR. Mirror gemma3:
-        # prime bf19(sqrt(N)) + N once here and thread them through every RMSNorm
-        # below (N = HIDDEN_SIZE for the prefix stack). Without this the norm is
-        # mis-scaled by ~sqrt(N).
-        prefix_N_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(prefix_N_reg, H)
-        prefix_sqrt_N_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(prefix_sqrt_N_reg, self.float_to_bf19(float(H ** 0.5)))
-
         # Inline unified attention (unified_attention_core_dynamic) replaces the
         # old shared-subroutine flash-attention API (flash_attention_core*, deleted
         # in the rebase onto main). PREFIX is MQA self-attention (S x S): the 8
         # query heads can't be head-batched (8*S > S), so attention is emitted
-        # INLINE once per head inside the per-layer loop. Each call auto-allocates
-        # and releases its own GPRs and emits inline (no jump / no return address),
-        # so all the per-head subroutine scaffolding (bucket/ret GPRs, call-site
-        # jump patching) is gone.
+        # INLINE once per head inside the per-layer loop.
         #
         # Scratch sizing (bf16, *2): unified_attention_core_dynamic needs
         # head_dim*aligned_seq_len + aligned_seq_len^2 + batch*head_dim elements.
         # Here batch=aligned_seq_len=S, head_dim=D -> 2*D*S + S*S (S*S dominates).
-        # A dedicated buffer (the old LAYER0_ATTN_SCRATCH_DRAM was sized only for
-        # the deleted flash) so we stay in-scope of compile_prefix.
+        # SHARED_FULL even when sharded: attention stays on the primary.
         prefix_attn_scratch = self.allocate_tensor_dram((2 * D * S + S * S) * bpe)
 
-        try:
-            for layer_idx in range(self.NUM_LAYERS):
-                la = self.lm_layer_addrs[layer_idx]
-                h_in = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_LAYER_OUT_DRAM
+        # ---- ROW SHARDING ACROSS ENGINES ------------------------------------
+        # --engines N shards the ROW-INDEPENDENT part of every layer (both
+        # RMSNorms, all 10 matmuls, the 3 eltwise ops) over 64-row blocks of the
+        # S prefix tokens. RoPE, the two smart_bf16_permute_core calls, the KV
+        # cache staging and the 8 attention calls stay SINGLE-ENGINE on the
+        # primary at full S -- attention is 2.1% of layer FLOPs and sharding it
+        # would need per-engine scratch plus a strided scatter with a
+        # destination row offset, the highest-risk change in the space.
+        #
+        # Two rendezvous per layer (36) + one before the halt:
+        #   #1 after the Q/K/V projections -- RoPE reads ALL S rows of buffers
+        #      that were written sharded (RAW).
+        #   #2 after the attention permute -- the sharded o-projection reads the
+        #      primary-written ATTN_RESULT (RAW), and it is also the WAR fence
+        #      that stops a worker re-entering layer i+1's Q/K/V projections
+        #      while the primary still reads layer i's Q/K/V.
+        # No barrier is needed at the layer boundary: layer i writes
+        # LAYER_OUT + RH for its OWN rows and layer i+1 reads the same rows.
+        # (The prefix does NOT alternate A/B buffers the way the encoder does --
+        # LAYER_OUT is read-then-written in place across layers. That is safe
+        # only because each engine owns disjoint rows AND rendezvous #2 already
+        # fenced the primary's full-S readers.)
+        ne = self._prefix_num_engines(S)
+        sched = self._prefix_make_scheduler(ne) if ne > 1 else None
+        self._prefix_sched = sched
+        if ne > 1:
+            # _debug_op halts the PRIMARY only; under multi-engine a debug stop
+            # would leave the workers spinning at a rendezvous forever.
+            assert self.DEBUG_STOP_AFTER is None, (
+                "PI05_DEBUG_STOP_AFTER is not supported with a row-sharded prefix "
+                f"(engines={ne}): the halt is emitted on the primary only and the "
+                "workers would spin at the next rendezvous. Re-run with --engines 1.")
+            # The layer0 per-op snapshots at ln1/q/k/v read those buffers BEFORE
+            # rendezvous #1, i.e. they would capture the peer's rows half-written.
+            assert not self._prefix_snap, (
+                "PREFIX_SNAPSHOTS is not supported with a row-sharded prefix "
+                f"(engines={ne}): the layer0 op snapshots run before rendezvous #1 "
+                "and would capture partial data. Re-run with --engines 1.")
+            splits = sched.split_rows(S, mode="blocks")
+            engines = sched.engines
+            print(f"    [prefix] row-sharded over {ne} engine(s): "
+                  f"{[c for _, c in splits]} of {S} rows (64-row blocks)")
+        else:
+            splits, engines = [(0, S)], [self]
 
-                # 1. pre-attention RMSNorm
-                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in,
-                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln1"],
-                                         gpr_M_reg=prefix_S_reg, gpr_N_reg=prefix_N_reg,
-                                         gpr_sqrt_n_reg=prefix_sqrt_N_reg)
-                self._debug_op(f"layer{layer_idx}_ln1", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln1"])
+        if sched is not None:
+            sched.begin_program()
+        for _e, _ue in enumerate(engines):
+            _off, _rows = splits[_e]
+            self._emit_prefix_body(_ue, _e, ne, _off, _rows, S, prefix_attn_scratch)
+        if sched is not None:
+            # KEEP the addresses: sched is shared with the encoder and finalize()
+            # overwrites sched._worker_prog_addrs.
+            self._prefix_worker_prog_addrs = sched.finalize()
+            print(f"    [prefix] worker program(s): "
+                  f"{[w.get_capture_instruction_size_bytes() for w in sched.workers]} bytes")
+            self._assert_worker_programs_fit(sched)
 
-                # 2. Q/K/V projections (MQA: K/V project to a single head_dim, not NH*D)
-                self._matmul(M=S, K=H, N=H, A=self.LAYER0_PRE_NORM_DRAM, proj="q", la=la, OUT=self.LAYER0_Q_DRAM, gpr_M_reg=prefix_S_reg)
-                self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="k", la=la, OUT=self.LAYER0_K_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
-                self._matmul(M=S, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM, proj="v", la=la, OUT=self.LAYER0_V_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
-                self._debug_op(f"layer{layer_idx}_qkv_proj", self.LAYER0_Q_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_Q_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_proj"])
-                    self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_proj"])
-                    self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["v_proj"])
-
-                # 2b. RoPE on Q and K (Gemma rotates BOTH, every layer -- openpi
-                # gemma.py:203/206). Positions come from cumsum(mask)-1, so the
-                # masked image slot freezes the counter (see _rope_init). Q is
-                # (S, NH*D) -> gqa variant (one rope row broadcast over NH heads);
-                # K is a single MQA head, (S, D) -> plain variant.
-                self.rope_hf_core_dram_gqa(
-                    M=S, group_size=NH, N=D,
-                    input_dram_addr=self.LAYER0_Q_DRAM, output_dram_addr=self.LAYER0_Q_ROPE_DRAM,
-                    cos_dram_addr=self.PREFIX_ROPE_ADDR,
-                    sin_dram_addr=self.PREFIX_ROPE_ADDR + self.ROPE_SIN_OFFSET,
-                    gpr_M_reg=prefix_S_reg)
-                self.rope_hf_core_dram(
-                    M=S, N=D,
-                    input_dram_addr=self.LAYER0_K_PROJ_DRAM, output_dram_addr=self.LAYER0_K_ROPE_DRAM,
-                    cos_dram_addr=self.PREFIX_ROPE_ADDR,
-                    sin_dram_addr=self.PREFIX_ROPE_ADDR + self.ROPE_SIN_OFFSET,
-                    gpr_M_reg=prefix_S_reg)
-                self._debug_op(f"layer{layer_idx}_q_rope", self.LAYER0_Q_ROPE_DRAM, S * H, shape=(S, H))
-                self._debug_op(f"layer{layer_idx}_k_rope", self.LAYER0_K_ROPE_DRAM, S * KV, shape=(S, KV))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_Q_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_rope"])
-                    self._dram_copy(S * KV * bpe, self.LAYER0_K_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_rope"])
-
-                # 3. permute Q from (seq, heads, head_dim) -> (heads, seq, head_dim); K/V
-                # already (seq, head_dim) since num_kv_heads=1 == the layout
-                # prefill_flash_attention_core expects for a single KV head.
-                smart_bf16_permute_core(self, (S, NH, D), [1, 0, 2],
-                                         self.LAYER0_Q_ROPE_DRAM, self.LAYER0_Q_PERM_DRAM)
-                self._debug_op(f"layer{layer_idx}_q_permute", self.LAYER0_Q_PERM_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_Q_PERM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_permute"])
-
-                # 4. stage this layer's K/V into the persistent KV cache for downstream reuse.
-                k_cache_addr = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
-                v_cache_addr = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
-                # NOTE: the cached K is the ROTATED k (openpi applies rope before
-                # the kv cache write); V is never rotated.
-                self._dram_copy(S * KV * bpe, self.LAYER0_K_ROPE_DRAM, k_cache_addr)
-                self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr)
-                self._debug_op(f"layer{layer_idx}_kv_cache", k_cache_addr, S * KV, shape=(S, KV))
-
-                # 5. MQA self-attention, bidirectional bias (no causal flag), per
-                # head via INLINE unified_attention_core_dynamic. Q for head h is
-                # the (S, D) block at LAYER0_Q_PERM_DRAM + h*S*D*2 (step-3 permute
-                # already separated the heads). K/V need no marshalling -- MQA means
-                # the same LAYER0_K_PROJ_DRAM/LAYER0_V_PROJ_DRAM (S, D) buffer
-                # (current for this layer, see step 2) is passed for every head.
-                # BIAS is the full (batch=S, aligned_seq_len=S) prefix_bias_dram,
-                # identical for every head. Output = (batch=S, D) lands directly in
-                # this head's slot of LAYER0_ATTN_OUT_DRAM (stride S*D*2), matching
-                # the (heads, S, D) layout the step-6 permute expects.
-                # q_scale=None -> standard 1/sqrt(head_dim) SDPA scale (== old flash).
-                # aligned_seq_len=S=832 (%64==0) and batch=S<=aligned_seq_len hold.
-                head_bytes = S * D * bpe
-                for h in range(NH):
-                    self.unified_attention_core_dynamic(
-                        batch=S, aligned_seq_len=S, head_dim=D,
-                        Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + h * head_bytes,
-                        K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
-                        V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM,
-                        BIAS_DRAM_ADDR=self.prefix_bias_dram,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
-                        SCRATCH_DRAM_ADDR=prefix_attn_scratch,
-                        IDENTITY_DRAM_ADDR=self.identity_addr)
-                    self._debug_op(f"layer{layer_idx}_head{h}", self.LAYER0_ATTN_OUT_DRAM + h * head_bytes, S * D, shape=(S, D))
-                    if layer_idx == 0 and self._prefix_snap:
-                        self._dram_copy(head_bytes, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
-                                         self.PREFIX_L0_SNAPSHOT_DRAM[f"head{h}"])
-
-                # 6. permute attn output (heads, seq, head_dim) -> (seq, heads*head_dim)
-                smart_bf16_permute_core(self, (NH, S, D), [1, 0, 2],
-                                         self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
-                self._debug_op(f"layer{layer_idx}_attn_permute", self.LAYER0_ATTN_RESULT_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_ATTN_RESULT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["attn_permute"])
-
-                # 7. output projection + residual (non-aliased: OUT distinct from both inputs)
-                self._matmul(M=S, K=H, N=H, A=self.LAYER0_ATTN_RESULT_DRAM, proj="o", la=la, OUT=self.LAYER0_O_PROJ_DRAM, gpr_M_reg=prefix_S_reg)
-                eltwise_add_core_dram(self, S * H, h_in, self.LAYER0_O_PROJ_DRAM, self.LAYER0_ATTN_RESIDUAL_DRAM)
-                self._debug_op(f"layer{layer_idx}_o_proj_residual", self.LAYER0_ATTN_RESIDUAL_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_ATTN_RESIDUAL_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["o_proj_residual"])
-
-                # 8. pre-FFW RMSNorm
-                self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.LAYER0_ATTN_RESIDUAL_DRAM,
-                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la["ln2"],
-                                         gpr_M_reg=prefix_S_reg, gpr_N_reg=prefix_N_reg,
-                                         gpr_sqrt_n_reg=prefix_sqrt_N_reg)
-                self._debug_op(f"layer{layer_idx}_ln2", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln2"])
-
-                # 9. gated-GELU MLP + residual, FF_HALF-split (parakeet_test.py pattern,
-                # adapted for the gated variant -- see _weight_init_lm_prefix's comment
-                # for why: matmat_mul_core_pbi can't do K=16384 in one call, and the
-                # strided-DMA extraction alternative (_dram_split_copy) was the
-                # confirmed hang trigger). Each half computed/multiplied/down-projected
-                # independently so down_proj's K-input is naturally contiguous from the
-                # moment it's written -- no slicing step exists to hang on.
-                FF_HALF = I // 2
-                self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="gate_lo", la=la,
-                             OUT=self.LAYER0_MLP_GATE_LO_DRAM, gelu_enable=True, gpr_M_reg=prefix_S_reg)
-                self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="up_lo", la=la,
-                             OUT=self.LAYER0_MLP_UP_LO_DRAM, gpr_M_reg=prefix_S_reg)
-                eltwise_mul_core_dram(self, S * FF_HALF, self.LAYER0_MLP_GATE_LO_DRAM, self.LAYER0_MLP_UP_LO_DRAM, self.LAYER0_MLP_MULT_LO_DRAM)
-                self._matmul(M=S, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_LO_DRAM, proj="down_lo", la=la,
-                             OUT=self.LAYER0_MLP_DOWN_LO_OUT_DRAM, gpr_M_reg=prefix_S_reg)
-                self._debug_op(f"layer{layer_idx}_mlp_lo", self.LAYER0_MLP_DOWN_LO_OUT_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_LO_OUT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_lo"])
-
-                self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="gate_hi", la=la,
-                             OUT=self.LAYER0_MLP_GATE_HI_DRAM, gelu_enable=True, gpr_M_reg=prefix_S_reg)
-                self._matmul(M=S, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM, proj="up_hi", la=la,
-                             OUT=self.LAYER0_MLP_UP_HI_DRAM, gpr_M_reg=prefix_S_reg)
-                eltwise_mul_core_dram(self, S * FF_HALF, self.LAYER0_MLP_GATE_HI_DRAM, self.LAYER0_MLP_UP_HI_DRAM, self.LAYER0_MLP_MULT_HI_DRAM)
-                self._matmul(M=S, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_HI_DRAM, proj="down_hi", la=la,
-                             OUT=self.LAYER0_MLP_DOWN_HI_OUT_DRAM, gpr_M_reg=prefix_S_reg)
-                self._debug_op(f"layer{layer_idx}_mlp_hi", self.LAYER0_MLP_DOWN_HI_OUT_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_hi"])
-
-                eltwise_add_core_dram(self, S * H, self.LAYER0_MLP_DOWN_LO_OUT_DRAM, self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.LAYER0_MLP_DOWN_DRAM)
-                self._debug_op(f"layer{layer_idx}_mlp_down", self.LAYER0_MLP_DOWN_DRAM, S * H, shape=(S, H))
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_down"])
-                # non-aliased: OUT (LAYER0_LAYER_OUT_DRAM) distinct from both inputs
-                eltwise_add_core_dram(self, S * H, self.LAYER0_ATTN_RESIDUAL_DRAM, self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_LAYER_OUT_DRAM)
-                self._debug_op(f"layer{layer_idx}_residual2", self.LAYER0_LAYER_OUT_DRAM, S * H, shape=(S, H))
-                if self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_LAYER_OUT_DRAM, self.PREFIX_LAYER_SNAPSHOT_DRAM[layer_idx])
-
-            # Attention is now inline (unified_attention_core_dynamic emitted per
-            # head inside the loop), so there is no shared subroutine to compile
-            # after the loop -- the program ends right after the final HALT.
-            self.generate_instruction_halt()
-        except _DebugStop:
-            pass   # halt already emitted by _debug_op.
-
-        self.release_isa_reg()  # prefix_sqrt_N_reg
-        self.release_isa_reg()  # prefix_N_reg
-        self.release_isa_reg()  # prefix_S_reg
-        print(f"compile_prefix: {self.NUM_LAYERS} layers compiled, seq_len={S}, valid_len={valid_len}")
+        print(f"compile_prefix: {self.NUM_LAYERS} layers compiled, seq_len={S}, "
+              f"valid_len={valid_len}, engines={ne}")
 
         # ---- BUGFIX (interface reconciliation): the action-expert stack
         # (compile_suffix_step / tensor_init_action_expert) expects
@@ -1180,6 +1069,282 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.prefix_v_cache_addr = [self.LAYER0_V_DRAM + l * self.KV_LAYER_STRIDE for l in range(self.NUM_LAYERS)]
 
         return self.LAYER0_LAYER_OUT_DRAM
+
+    def _emit_prefix_body(self, ue, engine_idx, ne, row_offset, rows, S, prefix_attn_scratch):
+        """Emit ONE engine's complete prefix program over rows
+        [row_offset, row_offset+rows) of the S prefix tokens.
+
+        With ne == 1 this is (row_offset, rows) == (0, S), every byte offset is 0,
+        every M is S and _vis_barrier emits nothing -- i.e. byte-for-byte the
+        historical single-engine stream.
+
+        ADDRESSING CONTRACT
+          SHARED_FULL (no offset)  every IF4 weight/scale pair, ln1/ln2 gamma,
+                                   identity_addr, prefix_attn_scratch,
+                                   prefix_bias_dram, PREFIX_ROPE_ADDR, and the
+                                   LAYER0_K/V_DRAM cache slabs (primary-only).
+          SHARED_ROWS              three distinct pitches -- this is where an
+                                   offset bug would hide:
+              RH = row_offset*H*2      INPUT, LAYER_OUT, PRE_NORM, Q, ATTN_RESULT,
+                                       O_PROJ, ATTN_RESIDUAL, MLP_DOWN*
+              RK = row_offset*KV*2     K_PROJ, V_PROJ            (KV = 256 -> 512B)
+              RF = row_offset*FF_HALF*2  MLP_{GATE,UP,MULT}_{LO,HI} (-> 16KB)
+          PER_ENGINE               EMPTY. rms_norm_core_dram dispatches to the
+                                   dynamic core, which allocates NO DRAM scratch
+                                   (no analogue of the encoder's vis_zeros), and
+                                   eltwise is pure SRAM streaming.
+        """
+        H, I, D = self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE, self.HEAD_DIM
+        NH, KV = self.NUM_HEADS, self.NUM_KV_HEADS * self.HEAD_DIM
+        FF_HALF = I // 2
+        bpe = 2
+        is_primary = engine_idx == 0
+
+        # Per-engine byte offsets. COMPILE-TIME CONSTANTS folded into the emitted
+        # literal -- never a runtime GPR (the ue_selector _addr_tmp clobber class).
+        RH = row_offset * H * bpe
+        RK = row_offset * KV * bpe
+        RF = row_offset * FF_HALF * bpe
+        assert rows % 64 == 0, f"shard row count {rows} must be 64-aligned"
+
+        self._debug_counter = 0
+        if is_primary:
+            self._debug_halt_info = None
+
+        # PBI dynamic-M loop (mirrors compile_encoder's vis_S_reg): without this,
+        # every matmul/RMSNorm below compiles a fully-unrolled static instruction
+        # stream per M row-chunk, which for 18 layers blew the compiled program up
+        # to ~684MB (vs. vision's 745KB for 27 layers) and triggered a DMA
+        # transfer-size failure. gpr_M_reg makes the outer row loop a runtime trip
+        # count instead of static unrolling.
+        prefix_S_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(prefix_S_reg, S)
+
+        # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds the
+        # sqrt(N) RSQRT scale implicitly -- the dynamic core reads it from a runtime
+        # GPR (float_to_bf19(sqrt(N))) and takes N in its own GPR. N / sqrt(N)
+        # describe the WITHIN-ROW normalization width and are unchanged by the row
+        # split. Without this the norm is mis-scaled by ~sqrt(N).
+        prefix_N_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(prefix_N_reg, H)
+        prefix_sqrt_N_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(prefix_sqrt_N_reg, ue.float_to_bf19(float(H ** 0.5)))
+        # THIS engine's row count, for every sharded matmul/RMSNorm. prefix_S_reg
+        # must SURVIVE alongside it: the two RoPE calls below run on the primary at
+        # full S, so on engine 0 both registers are live simultaneously. At ne == 1
+        # they are literally the same register, so not one extra instruction is
+        # emitted and the stream stays byte-identical to the pre-sharding code.
+        if ne > 1:
+            prefix_R_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(prefix_R_reg, rows)
+        else:
+            prefix_R_reg = prefix_S_reg
+
+        try:
+            for layer_idx in range(self.NUM_LAYERS):
+                la = self.lm_layer_addrs[layer_idx]
+                h_in = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_LAYER_OUT_DRAM
+
+                # 1. pre-attention RMSNorm  [SHARDED]
+                ue.rms_norm_core_dram(M=rows, N=H, A_DRAM_ADDR=h_in + RH,
+                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM + RH,
+                                         GAMMA_DRAM_ADDR=la["ln1"],
+                                         gpr_M_reg=prefix_R_reg, gpr_N_reg=prefix_N_reg,
+                                         gpr_sqrt_n_reg=prefix_sqrt_N_reg)
+                self._debug_op(f"layer{layer_idx}_ln1", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H), ue=ue)
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln1"])
+
+                # 2. Q/K/V projections (MQA: K/V project to a single head_dim, not NH*D)
+                #    [SHARDED] -- note K/V use the RK (=KV*2) pitch, not RH.
+                self._matmul(M=rows, K=H, N=H, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="q", la=la, OUT=self.LAYER0_Q_DRAM + RH, gpr_M_reg=prefix_R_reg, ue=ue)
+                self._matmul(M=rows, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="k", la=la, OUT=self.LAYER0_K_PROJ_DRAM + RK, gpr_M_reg=prefix_R_reg, ue=ue)
+                self._matmul(M=rows, K=H, N=KV, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="v", la=la, OUT=self.LAYER0_V_PROJ_DRAM + RK, gpr_M_reg=prefix_R_reg, ue=ue)
+                self._debug_op(f"layer{layer_idx}_qkv_proj", self.LAYER0_Q_DRAM, S * H, shape=(S, H), ue=ue)
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_Q_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_proj"])
+                    self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_proj"])
+                    self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["v_proj"])
+
+                # ---- RENDEZVOUS #1: everything below reads ALL S rows of Q /
+                # K_PROJ / V_PROJ, which were just written SHARDED.
+                self._vis_barrier(ue, engine_idx, ne)
+
+                # ---- SINGLE-ENGINE REGION (primary, full S) ------------------
+                # RoPE, both permutes, the KV-cache staging and the 8 attention
+                # calls. Deliberately NOT sharded (see compile_prefix).
+                if is_primary:
+                    # 2b. RoPE on Q and K (Gemma rotates BOTH, every layer -- openpi
+                    # gemma.py:203/206). Positions come from cumsum(mask)-1, so the
+                    # masked image slot freezes the counter (see _rope_init). Q is
+                    # (S, NH*D) -> gqa variant (one rope row broadcast over NH heads);
+                    # K is a single MQA head, (S, D) -> plain variant.
+                    ue.rope_hf_core_dram_gqa(
+                        M=S, group_size=NH, N=D,
+                        input_dram_addr=self.LAYER0_Q_DRAM, output_dram_addr=self.LAYER0_Q_ROPE_DRAM,
+                        cos_dram_addr=self.PREFIX_ROPE_ADDR,
+                        sin_dram_addr=self.PREFIX_ROPE_ADDR + self.ROPE_SIN_OFFSET,
+                        gpr_M_reg=prefix_S_reg)
+                    ue.rope_hf_core_dram(
+                        M=S, N=D,
+                        input_dram_addr=self.LAYER0_K_PROJ_DRAM, output_dram_addr=self.LAYER0_K_ROPE_DRAM,
+                        cos_dram_addr=self.PREFIX_ROPE_ADDR,
+                        sin_dram_addr=self.PREFIX_ROPE_ADDR + self.ROPE_SIN_OFFSET,
+                        gpr_M_reg=prefix_S_reg)
+                    self._debug_op(f"layer{layer_idx}_q_rope", self.LAYER0_Q_ROPE_DRAM, S * H, shape=(S, H), ue=ue)
+                    self._debug_op(f"layer{layer_idx}_k_rope", self.LAYER0_K_ROPE_DRAM, S * KV, shape=(S, KV), ue=ue)
+                    if layer_idx == 0 and self._prefix_snap:
+                        self._dram_copy(S * H * bpe, self.LAYER0_Q_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_rope"])
+                        self._dram_copy(S * KV * bpe, self.LAYER0_K_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_rope"])
+
+                    # 3. permute Q from (seq, heads, head_dim) -> (heads, seq, head_dim); K/V
+                    # already (seq, head_dim) since num_kv_heads=1 == the layout
+                    # prefill_flash_attention_core expects for a single KV head.
+                    smart_bf16_permute_core(ue, (S, NH, D), [1, 0, 2],
+                                             self.LAYER0_Q_ROPE_DRAM, self.LAYER0_Q_PERM_DRAM)
+                    self._debug_op(f"layer{layer_idx}_q_permute", self.LAYER0_Q_PERM_DRAM, S * H, shape=(S, H), ue=ue)
+                    if layer_idx == 0 and self._prefix_snap:
+                        self._dram_copy(S * H * bpe, self.LAYER0_Q_PERM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_permute"])
+
+                    # 4. stage this layer's K/V into the persistent KV cache for downstream
+                    # reuse. Full S on the primary, so the cache layout is byte-identical to
+                    # the single-engine build and prefix_k/v_cache_addr + PREFIX_SEQ_LEN are
+                    # unchanged for the action-expert suffix stack. The V copy reads
+                    # LAYER0_V_PROJ_DRAM, which is written SHARDED -- it MUST stay after
+                    # rendezvous #1. Do not hoist it.
+                    k_cache_addr = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
+                    v_cache_addr = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
+                    # NOTE: the cached K is the ROTATED k (openpi applies rope before
+                    # the kv cache write); V is never rotated.
+                    self._dram_copy(S * KV * bpe, self.LAYER0_K_ROPE_DRAM, k_cache_addr, ue=ue)
+                    self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr, ue=ue)
+                    self._debug_op(f"layer{layer_idx}_kv_cache", k_cache_addr, S * KV, shape=(S, KV), ue=ue)
+
+                    # 5. MQA self-attention, bidirectional bias (no causal flag), per
+                    # head via INLINE unified_attention_core_dynamic. Q for head h is
+                    # the (S, D) block at LAYER0_Q_PERM_DRAM + h*S*D*2 (step-3 permute
+                    # already separated the heads). K/V need no marshalling -- MQA means
+                    # the same (S, D) buffer is passed for every head. BIAS is the full
+                    # (batch=S, aligned_seq_len=S) prefix_bias_dram, identical per head.
+                    # q_scale=None -> standard 1/sqrt(head_dim) SDPA scale.
+                    head_bytes = S * D * bpe
+                    for h in range(NH):
+                        ue.unified_attention_core_dynamic(
+                            batch=S, aligned_seq_len=S, head_dim=D,
+                            Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + h * head_bytes,
+                            K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
+                            V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM,
+                            BIAS_DRAM_ADDR=self.prefix_bias_dram,
+                            OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
+                            SCRATCH_DRAM_ADDR=prefix_attn_scratch,
+                            IDENTITY_DRAM_ADDR=self.identity_addr)
+                        self._debug_op(f"layer{layer_idx}_head{h}", self.LAYER0_ATTN_OUT_DRAM + h * head_bytes, S * D, shape=(S, D), ue=ue)
+                        if layer_idx == 0 and self._prefix_snap:
+                            self._dram_copy(head_bytes, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
+                                             self.PREFIX_L0_SNAPSHOT_DRAM[f"head{h}"])
+
+                    # 6. permute attn output (heads, seq, head_dim) -> (seq, heads*head_dim)
+                    smart_bf16_permute_core(ue, (NH, S, D), [1, 0, 2],
+                                             self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
+                    self._debug_op(f"layer{layer_idx}_attn_permute", self.LAYER0_ATTN_RESULT_DRAM, S * H, shape=(S, H), ue=ue)
+                    if layer_idx == 0 and self._prefix_snap:
+                        self._dram_copy(S * H * bpe, self.LAYER0_ATTN_RESULT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["attn_permute"])
+
+                # ---- RENDEZVOUS #2: the sharded o-projection below reads
+                # ATTN_RESULT, written by the primary above (RAW); it is also the
+                # WAR fence keeping a worker out of layer i+1's Q/K/V projections
+                # while the primary is still reading layer i's.
+                self._vis_barrier(ue, engine_idx, ne)
+
+                # 7. output projection + residual  [SHARDED]
+                # (non-aliased: OUT distinct from both inputs -- in-place eltwise is a
+                # confirmed HANG trigger, and the same +RH on all three operands
+                # preserves that distinctness.)
+                self._matmul(M=rows, K=H, N=H, A=self.LAYER0_ATTN_RESULT_DRAM + RH, proj="o", la=la, OUT=self.LAYER0_O_PROJ_DRAM + RH, gpr_M_reg=prefix_R_reg, ue=ue)
+                eltwise_add_core_dram(ue, rows * H, h_in + RH, self.LAYER0_O_PROJ_DRAM + RH, self.LAYER0_ATTN_RESIDUAL_DRAM + RH)
+                self._debug_op(f"layer{layer_idx}_o_proj_residual", self.LAYER0_ATTN_RESIDUAL_DRAM, S * H, shape=(S, H), ue=ue)
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_ATTN_RESIDUAL_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["o_proj_residual"])
+
+                # 8. pre-FFW RMSNorm  [SHARDED]
+                ue.rms_norm_core_dram(M=rows, N=H, A_DRAM_ADDR=self.LAYER0_ATTN_RESIDUAL_DRAM + RH,
+                                         OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM + RH,
+                                         GAMMA_DRAM_ADDR=la["ln2"],
+                                         gpr_M_reg=prefix_R_reg, gpr_N_reg=prefix_N_reg,
+                                         gpr_sqrt_n_reg=prefix_sqrt_N_reg)
+                self._debug_op(f"layer{layer_idx}_ln2", self.LAYER0_PRE_NORM_DRAM, S * H, shape=(S, H), ue=ue)
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln2"])
+
+                # 9. gated-GELU MLP + residual, FF_HALF-split (parakeet_test.py pattern,
+                # adapted for the gated variant -- see _weight_init_lm_prefix's comment
+                # for why: matmat_mul_core_pbi can't do K=16384 in one call, and the
+                # strided-DMA extraction alternative (_dram_split_copy) was the
+                # confirmed hang trigger). Each half computed/multiplied/down-projected
+                # independently so down_proj's K-input is naturally contiguous from the
+                # moment it's written -- no slicing step exists to hang on.
+                # [SHARDED] -- the FF_HALF-wide buffers use the RF pitch.
+                self._matmul(M=rows, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="gate_lo", la=la,
+                             OUT=self.LAYER0_MLP_GATE_LO_DRAM + RF, gelu_enable=True, gpr_M_reg=prefix_R_reg, ue=ue)
+                self._matmul(M=rows, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="up_lo", la=la,
+                             OUT=self.LAYER0_MLP_UP_LO_DRAM + RF, gpr_M_reg=prefix_R_reg, ue=ue)
+                eltwise_mul_core_dram(ue, rows * FF_HALF, self.LAYER0_MLP_GATE_LO_DRAM + RF, self.LAYER0_MLP_UP_LO_DRAM + RF, self.LAYER0_MLP_MULT_LO_DRAM + RF)
+                self._matmul(M=rows, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_LO_DRAM + RF, proj="down_lo", la=la,
+                             OUT=self.LAYER0_MLP_DOWN_LO_OUT_DRAM + RH, gpr_M_reg=prefix_R_reg, ue=ue)
+                self._debug_op(f"layer{layer_idx}_mlp_lo", self.LAYER0_MLP_DOWN_LO_OUT_DRAM, S * H, shape=(S, H), ue=ue)
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_LO_OUT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_lo"])
+
+                self._matmul(M=rows, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="gate_hi", la=la,
+                             OUT=self.LAYER0_MLP_GATE_HI_DRAM + RF, gelu_enable=True, gpr_M_reg=prefix_R_reg, ue=ue)
+                self._matmul(M=rows, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="up_hi", la=la,
+                             OUT=self.LAYER0_MLP_UP_HI_DRAM + RF, gpr_M_reg=prefix_R_reg, ue=ue)
+                eltwise_mul_core_dram(ue, rows * FF_HALF, self.LAYER0_MLP_GATE_HI_DRAM + RF, self.LAYER0_MLP_UP_HI_DRAM + RF, self.LAYER0_MLP_MULT_HI_DRAM + RF)
+                self._matmul(M=rows, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_HI_DRAM + RF, proj="down_hi", la=la,
+                             OUT=self.LAYER0_MLP_DOWN_HI_OUT_DRAM + RH, gpr_M_reg=prefix_R_reg, ue=ue)
+                self._debug_op(f"layer{layer_idx}_mlp_hi", self.LAYER0_MLP_DOWN_HI_OUT_DRAM, S * H, shape=(S, H), ue=ue)
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_hi"])
+
+                eltwise_add_core_dram(ue, rows * H, self.LAYER0_MLP_DOWN_LO_OUT_DRAM + RH, self.LAYER0_MLP_DOWN_HI_OUT_DRAM + RH, self.LAYER0_MLP_DOWN_DRAM + RH)
+                self._debug_op(f"layer{layer_idx}_mlp_down", self.LAYER0_MLP_DOWN_DRAM, S * H, shape=(S, H), ue=ue)
+                if layer_idx == 0 and self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_down"])
+                # non-aliased: OUT (LAYER0_LAYER_OUT_DRAM) distinct from both inputs
+                eltwise_add_core_dram(ue, rows * H, self.LAYER0_ATTN_RESIDUAL_DRAM + RH, self.LAYER0_MLP_DOWN_DRAM + RH, self.LAYER0_LAYER_OUT_DRAM + RH)
+                self._debug_op(f"layer{layer_idx}_residual2", self.LAYER0_LAYER_OUT_DRAM, S * H, shape=(S, H), ue=ue)
+                if self._prefix_snap:
+                    self._dram_copy(S * H * bpe, self.LAYER0_LAYER_OUT_DRAM, self.PREFIX_LAYER_SNAPSHOT_DRAM[layer_idx])
+
+                # Multi-engine-SAFE early stop (dual_engine_gates' prefix ladder).
+                # _debug_op / PI05_DEBUG_STOP_AFTER cannot be used when sharded: it
+                # halts mid-layer on the PRIMARY only, and the workers -- which skip
+                # the primary-only RoPE/permute/attention region entirely -- do not
+                # even agree on what checkpoint index N means. A LAYER BOUNDARY is
+                # the one point where every engine's stream is in lockstep, so
+                # stopping there is expressible in all of them at once: break out,
+                # and the shared exit rendezvous + halt below runs as usual.
+                if (self.PREFIX_STOP_AFTER_LAYER is not None
+                        and layer_idx >= self.PREFIX_STOP_AFTER_LAYER):
+                    break
+
+            # Attention is inline (unified_attention_core_dynamic emitted per head
+            # inside the loop), so there is no shared subroutine to compile after the
+            # loop -- the program ends right after the final HALT. The final
+            # rendezvous makes the primary's halt (the only thing the HOST waits on)
+            # unreachable until every worker has written its last rows.
+            self._vis_barrier(ue, engine_idx, ne)
+            if is_primary:
+                self.generate_instruction_halt()
+        except _DebugStop:
+            pass   # halt already emitted by _debug_op.
+
+        if ne > 1:
+            ue.release_isa_reg()  # prefix_R_reg
+        ue.release_isa_reg()  # prefix_sqrt_N_reg
+        ue.release_isa_reg()  # prefix_N_reg
+        ue.release_isa_reg()  # prefix_S_reg
+
 
     # ---- prefill -----------------------------------------------------------
     def compile_prefill(self, seq_len):
@@ -1201,6 +1366,351 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         raise NotImplementedError("wire the decode op chain")
 
     # ---- VLM hook ----------------------------------------------------------
+    #
+    # MULTI-ENGINE ROW SHARDING (--engines N, N > 1)
+    # ----------------------------------------------
+    # The encoder is a pure row-parallel stack over S=256 patch tokens: every op
+    # except attention is row-independent, and attention only mixes rows through
+    # K/V. So each engine owns a contiguous 128-row block (S/2), reads the FULL
+    # K/V of both blocks for its own queries, and never needs an online-softmax
+    # merge (the QUERY axis is what is split).
+    #
+    # DRAM is ONE FLAT SHARED SPACE: weights are NOT duplicated, buffers stay
+    # single full-size allocations, and each engine simply addresses its own row
+    # block (byte offset = row_offset * row_pitch). Only scratch that a kernel
+    # WRITES is duplicated (see _vis_register_per_engine).
+    #
+    # Set the engine count to 1 (the default) and every address offset is 0, every
+    # M is S, and the scheduler emits zero extra instructions -- the stream is
+    # byte-identical to the single-engine encoder (asserted by
+    # dual_engine_gates.py's G0 digest check).
+    # Generic engine count, set by --engines. Defaults to 1 = today's exact
+    # single-engine behaviour. The mechanism is intended to extend to the prefix
+    # LM and the action-expert denoise loop, so the knob is deliberately NOT
+    # vision-specific; a stage may still pin its own count by setting
+    # <STAGE>_NUM_ENGINES (e.g. VIS_NUM_ENGINES) to a non-None value.
+    NUM_ENGINES = 1
+    VIS_NUM_ENGINES = None       # per-stage override; None -> NUM_ENGINES
+    # The prefix LM is row-sharded too (projections / RMSNorms / MLP; RoPE, the
+    # two permutes and attention stay on the primary), so it follows --engines.
+    # Set to an int to pin the stage independently of the encoder.
+    PREFIX_NUM_ENGINES = None
+
+    def _num_engines(self, stage="VIS"):
+        override = getattr(self, f"{stage}_NUM_ENGINES", None)
+        return int(override if override is not None else self.NUM_ENGINES)
+
+    # Emit a SECOND rendezvous immediately after the per-head attention loop.
+    # The audit's minimum is one barrier per layer (before head marshalling, the
+    # only point an engine READS rows it did not write -- the peer's K/V). That
+    # closes the RAW hazard but not the WAR one: without a second barrier,
+    # nothing stops engine0 from finishing layer i's attention+MLP and
+    # overwriting VIS_K rows 0..127 for layer i+1 while engine1 is still
+    # gathering layer i's K. That requires engine0 to lap engine1 by a whole
+    # layer body, which is very unlikely but not architecturally excluded.
+    # A rendezvous is ~35 instructions against ~1e5 per layer, so the insurance
+    # is free. Set False to A/B the single-barrier variant.
+    VIS_BARRIER_AFTER_ATTN = True
+
+    @staticmethod
+    def _vis_barrier(ue, engine_idx, num_engines, margin_nops=32):
+        """Emit ONE engine's slice of the symmetric all-engine rendezvous.
+
+        MultiEngineScheduler.barrier() emits into every engine at once, which is
+        wrong here: the encoder body is emitted one COMPLETE engine stream at a
+        time (each engine's program is independent; only the per-stream order
+        matters), so the barrier has to be emitted per stream at the right point
+        in that stream. The shape is exactly scheduler.barrier()'s per-engine
+        slice -- SET / CHECK(every peer) / margin NOPs / CLEAR -- the form proven
+        to RE-ARM by user_hw_test.flag_rendezvous_repeat_test.
+        """
+        if num_engines == 1:
+            return   # exact passthrough: not one extra instruction
+        ue.generate_instruction_flag_set()
+        for j in range(num_engines):
+            if j != engine_idx:
+                ue.generate_instruction_flag_check(target_engine_idx=j)
+        for _ in range(margin_nops):
+            ue.generate_instruction_nop()
+        ue.generate_instruction_flag_clear()
+
+    # Per-worker DRAM arena carved out of the PRIMARY's own tensor allocator.
+    # Carving it from the model's allocator is the only placement that cannot
+    # collide with anything: pi05's weight blob runs to ~0xDD400000 and the
+    # tensor/program cursors keep moving, so any hand-picked absolute base is a
+    # future silent-corruption bug. Layout inside one arena:
+    #   +0x00000000  worker params  (layer_norm's auto-allocated INV_N vectors)
+    #   +0x00100000  worker tensor  (its PER_ENGINE scratch, ~0.8 MB)
+    #   +0x01000000  worker program (the encoder is ~6 MB)
+    # Sized for BOTH stages: the encoder worker program is ~5.7MB and the prefix
+    # worker program is ~8-10MB (the prefix is PBI'd but still 18 layers of
+    # matmul/norm/eltwise), and they share one arena because they share one
+    # scheduler. 16MB of program room (the original 32MB arena) left too little
+    # headroom, so the arena is 48MB -> 32MB of program space above the offset.
+    VIS_WORKER_ARENA_BYTES   = 0x03000000   # 48 MB
+    VIS_WORKER_TENSOR_OFFSET = 0x00100000
+    VIS_WORKER_PROGRAM_OFFSET = 0x01000000
+
+    def _assert_worker_programs_fit(self, sched):
+        """Both stages' worker programs share ONE arena; overflowing it would march
+        the worker program allocator straight into the model's tensor DRAM (silent
+        corruption, not a hang). Check after every finalize()."""
+        limit = self.VIS_WORKER_ARENA_BYTES - self.VIS_WORKER_PROGRAM_OFFSET
+        for i, w in enumerate(sched.workers):
+            used = w.get_program_dram_addr() - (
+                self._vis_worker_arena + i * self.VIS_WORKER_ARENA_BYTES
+                + self.VIS_WORKER_PROGRAM_OFFSET)
+            assert used <= limit, (
+                f"worker {i + 1} program arena overflow: {used} B used of {limit} B "
+                f"(VIS_WORKER_ARENA_BYTES=0x{self.VIS_WORKER_ARENA_BYTES:X}, "
+                f"program offset 0x{self.VIS_WORKER_PROGRAM_OFFSET:X}). Grow the arena.")
+
+    def dram_region_map(self, label="", fatal=True):
+        """Print the live DRAM region map and HARD-ASSERT that no region overlaps.
+
+        All three of params/tensor/program are unchecked bump allocators in
+        user_dma_core (no bounds test whatsoever), and the worker arenas are carved
+        out of the *tensor* allocator. Overrunning tensor into program DRAM does not
+        raise -- it silently rewrites compiled instructions, and the run dies later
+        as a segfault or an impossible TypeError deep in the DMA layer. Call this
+        after every allocation phase so that failure is loud and at startup.
+        """
+        FOURGB = 0x100000000
+        regions = []
+        p0, p1 = self._params_dram_base, self._next_params_dram_addr
+        t0, t1 = self._tensor_dram_base, self._tensor_dram_addr
+        g0, g1 = self._program_dram_base, self._next_program_dram_addr
+        regions.append(("params", p0, p1))
+        arena = getattr(self, "_vis_worker_arena", None)
+        if arena is not None:
+            n = getattr(self, "_vis_worker_arena_count", 1)
+            # The arenas live INSIDE the tensor region, so split tensor around them
+            # rather than double-reporting the same bytes as an overlap.
+            a1 = arena + n * self.VIS_WORKER_ARENA_BYTES
+            regions.append(("tensor(pre-arena)", t0, arena))
+            for i in range(n):
+                b = arena + i * self.VIS_WORKER_ARENA_BYTES
+                regions.append((f"worker{i+1}_arena", b, b + self.VIS_WORKER_ARENA_BYTES))
+            if t1 > a1:
+                regions.append(("tensor(post-arena)", a1, t1))
+        else:
+            regions.append(("tensor", t0, t1))
+        regions.append(("program", g0, g1))
+
+        lines = [f"  ---- DRAM region map [{label}] ----"]
+        for name, a, b in regions:
+            lines.append(f"    {name:<20s} 0x{a:08X}..0x{b:08X}  {(b - a) / (1 << 20):9.2f} MB")
+        lines.append(f"    {'(program base)':<20s} 0x{g0:08X}   headroom below it: "
+                     f"{(g0 - t1) / (1 << 20):.2f} MB")
+        print("\n".join(lines))
+
+        errs = []
+        srt = sorted(regions, key=lambda r: r[1])
+        for (n0, a0, b0), (n1_, a1_, b1_) in zip(srt, srt[1:]):
+            if b0 > a1_:
+                errs.append(f"{n0} [0x{a0:X}..0x{b0:X}] OVERLAPS {n1_} [0x{a1_:X}..0x{b1_:X}] "
+                            f"by {b0 - a1_} B ({(b0 - a1_) / (1 << 20):.2f} MB)")
+        for name, a, b in regions:
+            if b > FOURGB:
+                errs.append(f"{name} ends at 0x{b:X}, past the 4GB DMA limit 0x{FOURGB:X}")
+        if errs and fatal:
+            raise AssertionError("DRAM region overlap [" + label + "]:\n  " + "\n  ".join(errs))
+        return errs
+
+    def _vis_worker_arena_base(self, num_engines):
+        """Allocate (once) the worker arenas and return the base of the first."""
+        if num_engines == 1:
+            return None
+        if getattr(self, "_vis_worker_arena", None) is None:
+            self._vis_worker_arena = self.allocate_tensor_dram(
+                (num_engines - 1) * self.VIS_WORKER_ARENA_BYTES,
+                label="vis_worker_arena")
+            self._vis_worker_arena_count = num_engines - 1
+            self.dram_region_map(f"worker arenas x{num_engines - 1}")
+        return self._vis_worker_arena
+
+    @contextlib.contextmanager
+    def _vis_dram_selftest_guard(self, num_engines):
+        """Protect the head of the weight blob from UnifiedEngine.__init__.
+
+        THE BUG THIS EXISTS FOR (cost half a bring-up day, symptom is NOT a hang):
+        constructing ANY UnifiedEngine runs init_unified_engine(), whose "FPGA DRAM
+        read/write test" writes 8192 random uint16 -- 16 KB -- to DRAM_START_ADDR.
+        For pi05 params_dram_base IS DRAM_START_ADDR (0x80000000), and the first
+        thing _weight_init_vision stores there is the SigLIP patch-embed kernel.
+        So merely CONSTRUCTING the worker engine after weight_init silently
+        shreds the patch-embed weights: the encoder's very first matmul returns
+        ~1e38 and everything downstream is NaN. It looks exactly like a sharding
+        bug and is not one.
+
+        user_dma_core.py is off-limits, so we snapshot the clobbered window,
+        let the constructor run, and put it back.
+        """
+        n_bytes = 8192 * 2   # must match init_unified_engine's DRAM self-test
+        if num_engines == 1:
+            yield                      # no engine is constructed: nothing to guard
+            return
+        base = user_dma_core.DRAM_START_ADDR
+        buf = bytearray(n_bytes)
+        self._dma_read_checked(base, buf, n_bytes, label="dram_selftest_guard")
+        try:
+            yield
+        finally:
+            # Write the raw bytearray back DIRECTLY. Do NOT wrap it in
+            # torch.frombuffer(bytes(buf), ...): frombuffer over an immutable
+            # `bytes` builds a tensor aliasing a read-only, temporary buffer
+            # (PyTorch warns "the given buffer is not writable ... does not
+            # support non-writable tensors"). That aliasing smashed the CPython
+            # heap and the process then segfaulted at an arbitrary LATER point --
+            # observed as a SIGSEGV inside Instructions.get_bytes() (a pure-Python
+            # `bytearray(32)`) during compile_encoder or compile_prefix, and once
+            # as an impossible "TypeError: string argument without an encoding"
+            # on the same line. dma_write/_dma_write_retry already accept
+            # bytes/bytearray, so no tensor is needed at all.
+            self._dma_write_retry(DMA_DEVICE_H2C, base, bytes(buf), n_bytes)
+
+    def _vis_make_scheduler(self, num_engines):
+        """Build the MultiEngineScheduler and duplicate the PER_ENGINE scratch."""
+        from multi_engine_shard import MultiEngineScheduler
+        bpe = 2
+        S, DP = self.VIS_S, self.VIS_DP
+        H, I = self.VIS_H, self.VIS_I
+
+        worker_base = self._vis_worker_arena_base(num_engines)
+        with self._vis_dram_selftest_guard(num_engines):
+            sched = MultiEngineScheduler(
+                self, num_engines=num_engines,
+                worker_dram_base=worker_base,
+                worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
+                worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
+                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET)
+
+        # --- PER_ENGINE: scratch a kernel WRITES, therefore must be duplicated ---
+        zeros_n = max(H, I)
+        sched.register_per_engine(
+            "vis_zeros", self.vis_zeros_addr, zeros_n * bpe,
+            init_tensor=torch.zeros(zeros_n, dtype=torch.bfloat16))
+        zeros_dp = torch.zeros(S * DP, dtype=torch.bfloat16)
+        for name, addr in (("flash_q", self.VIS_FLASH_Q_DRAM),
+                           ("flash_k", self.VIS_FLASH_K_DRAM),
+                           ("flash_v", self.VIS_FLASH_V_DRAM),
+                           ("flash_out", self.VIS_FLASH_OUT_DRAM)):
+            sched.register_per_engine(name, addr, S * DP * bpe, init_tensor=zeros_dp)
+        # Keep the scratch SIZE unchanged: unified_attention_core_dynamic derives
+        # its sub-buffer offsets from the compile-time head_dim/aligned_seq_len,
+        # which are still DP/S even though batch drops to the shard row count.
+        attn_scratch_n = DP * S + S * S + S * DP
+        sched.register_per_engine(
+            "attn_scratch", self.VIS_ATTN_SCRATCH_DRAM, attn_scratch_n * bpe,
+            init_tensor=torch.zeros(attn_scratch_n, dtype=torch.bfloat16))
+        if sched.workers:
+            print(f"    [vis] worker arena base 0x{self._vis_worker_arena:X} "
+                  f"({num_engines - 1} worker(s) x "
+                  f"{self.VIS_WORKER_ARENA_BYTES >> 20}MB)")
+        return sched
+
+    # ---- prefix stage sharding -------------------------------------------
+    def _prefix_num_engines(self, S):
+        """Resolve the PREFIX engine count, falling back to 1 when S cannot be
+        block-split.
+
+        THE SPLIT IS BY 64-ROW BLOCKS, NOT EVENLY. Real prefix lengths are
+        320/576/832 (= 256*kept_slots + 64); halving them gives 160/288/416,
+        NONE of which is 64-aligned, and every matmul/RMSNorm here assumes
+        64-aligned row blocks. Block-splitting gives 832 -> 448/384,
+        576 -> 320/256, 320 -> 192/128: uneven (hence a few % off the ideal
+        2.0x) but always aligned. Relaxing the alignment instead
+        (allow_unaligned_rows) is NOT an option -- see multi_engine_shard."""
+        ne = self._num_engines("PREFIX")
+        if ne <= 1:
+            return 1
+        if S % 64 != 0 or S // 64 < ne:
+            print(f"    [prefix] seq_len={S} cannot be 64-block-split across {ne} engine(s) "
+                  f"(blocks={S // 64}); FALLING BACK TO SINGLE-ENGINE PREFIX")
+            return 1
+        return ne
+
+    def _prefix_make_scheduler(self, num_engines):
+        """Scheduler for the sharded prefix. REUSES the encoder's whenever the
+        engine count matches: constructing a second MultiEngineScheduler builds
+        fresh UnifiedEngines, and UnifiedEngine.__init__ runs an FPGA DRAM
+        self-test that writes 16 KB over params_dram_base == the head of the
+        weight blob (see _vis_dram_selftest_guard). Reuse also keeps ONE worker
+        arena and one flag-preclear."""
+        from multi_engine_shard import MultiEngineScheduler
+        sched = getattr(self, "_vis_sched", None)
+        if sched is not None and sched.num_engines == num_engines:
+            return sched
+        if num_engines == 1:
+            return None
+        worker_base = self._vis_worker_arena_base(num_engines)
+        with self._vis_dram_selftest_guard(num_engines):
+            return MultiEngineScheduler(
+                self, num_engines=num_engines,
+                worker_dram_base=worker_base,
+                worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
+                worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
+                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET)
+
+    def _denoise_make_scheduler(self, num_engines):
+        """Scheduler for the N-sharded denoise stage. REUSES the encoder/prefix one
+        whenever the engine count matches -- constructing a second
+        MultiEngineScheduler builds fresh UnifiedEngines, and UnifiedEngine.__init__
+        runs a DRAM self-test that writes 16 KB over the head of the weight blob
+        (see _vis_dram_selftest_guard). Reuse also keeps ONE worker arena and one
+        flag preclear across all three stages."""
+        from multi_engine_shard import MultiEngineScheduler
+        sched = getattr(self, "_vis_sched", None)
+        if sched is not None and sched.num_engines == num_engines:
+            return sched
+        if num_engines == 1:
+            return None
+        worker_base = self._vis_worker_arena_base(num_engines)
+        with self._vis_dram_selftest_guard(num_engines):
+            return MultiEngineScheduler(
+                self, num_engines=num_engines,
+                worker_dram_base=worker_base,
+                worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
+                worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
+                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET)
+
+    def _execute_denoise(self, timeout=300.0):
+        """EXECUTE the compiled denoise program, launching + joining the column-shard
+        workers when the stage is sharded. Workers HALT at the end of every run, so
+        they are relaunched on EVERY execution (compile-once/execute-many)."""
+        sched = getattr(self, "_denoise_sched", None)
+        multi = sched is not None and sched.num_engines > 1
+        if multi:
+            if not getattr(self, "_vis_flags_precleared", False):
+                sched.preclear_flags()
+                self._vis_flags_precleared = True
+            sched.start_workers(self._denoise_worker_prog_addrs)
+        self._execute(self._denoise_prog_addr, label="denoise_loop", timeout=timeout)
+        if multi:
+            # The primary retires its halt as soon as the last rendezvous clears; a
+            # worker may still be draining its (write-free) margin NOPs.
+            for w in sched.workers:
+                w.wait_queue(60.0)
+
+    def _execute_prefix(self, timeout=250.0):
+        """EXECUTE the compiled prefix program, launching + joining the row-shard
+        workers when the stage is sharded. Workers HALT at the end of every run,
+        so they are relaunched on EVERY execution (compile-once/execute-many)."""
+        sched = getattr(self, "_prefix_sched", None)
+        multi = sched is not None and sched.num_engines > 1
+        if multi:
+            if not getattr(self, "_vis_flags_precleared", False):
+                sched.preclear_flags()
+                self._vis_flags_precleared = True
+            sched.start_workers(self._prefix_worker_prog_addrs)
+        self._execute(self._prefix_prog_addr, label="prefix", timeout=timeout)
+        if multi:
+            # The primary retires its halt as soon as the exit rendezvous clears;
+            # a worker may still be draining its (write-free) margin NOPs. Wait
+            # rather than assert-not-busy, which would be flaky.
+            for w in sched.workers:
+                w.wait_queue(60.0)
+
     def compile_encoder(self):
         """Compile the 27-layer SigLIP So400m/14 vision encoder (bidirectional, no RoPE,
         no causal mask — see hw_notes). Structure follows the proven smolvlm2_test.py §7
@@ -1209,144 +1719,28 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         strided-DMA head marshalling, head_dim padded 72->128 for the flash kernel (see
         _tensor_init_vision for why no explicit unpad selection-matrix is needed). All
         matmul weights are IF4 q4_64 (quant policy) -> quantized_matmul dispatch.
+
+        With --engines N (N > 1) the same body is emitted once per engine over a
+        128-row shard of the 256 patch tokens (see the class-level comment).
         """
-        from user_dma_core import TYPE
-        S, H, NH, D, DP, IP = (self.VIS_S, self.VIS_H, self.VIS_NH, self.VIS_D, self.VIS_DP,
-                                self.VIS_I_PAD)
-        bpe = 2
+        S = self.VIS_S
+        ne = self._num_engines("VIS")
+        sched = self._vis_make_scheduler(ne)
+        self._vis_sched = sched
+        splits = sched.split_rows(S)
 
         self.start_capture()
-        self._debug_counter = 0
-        self._debug_halt_info = None
-
-        # Fresh register/inst-pointer counters per stage (see compile_denoise_loop).
         self.reset_isa_reg_counter()
         self.reset_inst_ptr_counter()
-
-        # Norm ABI (post pcie_only sync): layer_norm_core_dram now dispatches to the
-        # dynamic core, where gpr_M_reg is the runtime ROW COUNT (S), not the old PBI
-        # n_chunks, and the sqrt(N) RSQRT scale is a runtime GPR (float_to_bf19(sqrt(N)))
-        # rather than an implicit fold. The old code primed gpr_M_reg with n_chunks
-        # (correct only for the retired PBI ABI): under the new ABI that normalized only
-        # ~n_chunks of S rows, so the un-normalized rows compounded across the 27 encoder
-        # layers and overflowed bf16 -> NaN vision tokens. Prime rows=S plus N + bf19(sqrt(N))
-        # (vision LayerNorm N = VIS_H) and thread them through every layer_norm below.
-        vis_S_reg = self.alloc_isa_reg()
-        vis_N_reg = self.alloc_isa_reg()
-        vis_sqrt_N_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(vis_S_reg, S)
-        self.generate_instruction_add_set(vis_N_reg, H)
-        self.generate_instruction_add_set(vis_sqrt_N_reg, self.float_to_bf19(float(H ** 0.5)))
-
-        def vis_matmul(M, K, N, A, la, proj, OUT, bias=None, **kw):
-            self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
-                OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=la[f'{proj}_scale'], C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                gpr_M_reg=vis_S_reg, **kw)
-
-        # Per-(layer,head) attention: each call site marshals its head's [S, D] Q/K/V
-        # (padded to [S, DP]) into the fixed VIS_FLASH buffers and runs an INLINE
-        # unified_attention_core_dynamic (full MHA self-attention, batch=aligned=S).
-
-        try:
-            # === Patch embedding: patchified pixels [S, 588] -> [S, 1152] (+ pos_embedding) ===
-            vis_matmul(S, self.VIS_PATCH_K, H, self.VIS_PIXEL_IN_DRAM,
-                {'embed_data': self.vis_embed_data, 'embed_scale': self.vis_embed_scale}, 'embed',
-                self.VIS_PATCH_PROJ_DRAM, bias=self.vis_embed_bias)
-            eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM,
-                B_DRAM_ADDR=self.vis_pos_embed, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM)
-            self._debug_op("patch_embed_pos", self.VIS_IO_A_DRAM, S * H, shape=(S, H))
-
-            for layer_idx, la in enumerate(self.vis_layer_addrs):
-                h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
-                h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
-                # LN0 (PBI)
-                self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                    GAMMA_DRAM_ADDR=la['ln0_w'], BETA_DRAM_ADDR=la['ln0_b'], gpr_M_reg=vis_S_reg,
-                    gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
-                    ZEROS_DRAM_ADDR=self.vis_zeros_addr)
-                self._debug_op(f"layer{layer_idx}_ln0", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H))
-                # Q/K/V projections (PBI, IF4). N=NH*DP: weights are pre-padded per-head
-                # D->DP=128 (see _weight_init_vision's _pad_proj) so the buffers below are
-                # already head-block-aligned at DP=128, no separate real/padded copy needed.
-                HP = NH * DP
-                for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
-                    vis_matmul(S, H, HP, self.VIS_LN_OUT_DRAM, la, proj, dst, bias=la[f'{proj}_bias'])
-                # Per-head bidirectional flash attention (no mask, no RoPE). Each head's block is
-                # a full DP=128-wide (256B) column slice -> every DMA stride below is AXI-beat
-                # (32B) aligned, unlike a bare D=72 (144B) slice.
-                elems = S * DP
-                col_stride = DP * bpe   # one head's column block width (aligned)
-                row_jump = HP * bpe     # full [S, HP] row stride
-                for h in range(NH):
-                    col = h * col_stride
-                    for src, dst in ((self.VIS_Q_DRAM + col, self.VIS_FLASH_Q_DRAM),
-                                     (self.VIS_K_DRAM + col, self.VIS_FLASH_K_DRAM),
-                                     (self.VIS_V_DRAM + col, self.VIS_FLASH_V_DRAM)):
-                        self.accelerator_memory_to_sram(src, 0x00000, elems,
-                            stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
-                        self.sram_to_accelerator_memory(0x00000, dst, elems)
-                    # INLINE full-MHA self-attention for this head: batch==aligned==S,
-                    # head_dim=DP, zero (unmasked) bias, standard 1/sqrt(DP) scale.
-                    #
-                    # NOT a PBI-flash problem: swapping this to
-                    # unified_attention_core_legacy produced BIT-IDENTICAL output
-                    # (slot0 23.18dB / slot1 8.53dB either way, only slower), so the
-                    # encoder's error is deterministic math, not PBI back-to-back
-                    # corruption. Don't re-litigate this -- bisect the encoder body
-                    # against pi05_torch_ref.vision_encode_checkpoints instead.
-                    self.unified_attention_core_dynamic(
-                        batch=S, aligned_seq_len=S, head_dim=DP,
-                        Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM, K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
-                        V_DRAM_ADDR=self.VIS_FLASH_V_DRAM, BIAS_DRAM_ADDR=self.VIS_ZERO_BIAS_DRAM,
-                        OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
-                        SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
-                        IDENTITY_DRAM_ADDR=self.identity_addr)
-                    self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
-                    self.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
-                        stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
-                # O projection + residual + LN1 (PBI)
-                vis_matmul(S, HP, H, self.VIS_ATTN_RESULT_DRAM, la, 'o', self.VIS_O_PROJ_DRAM, bias=la['o_bias'])
-                self._debug_op(f"layer{layer_idx}_o_proj", self.VIS_O_PROJ_DRAM, S * H, shape=(S, H))
-                eltwise_add_core_dram(self, size=S * H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
-                    OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
-                self._debug_op(f"layer{layer_idx}_residual1", self.VIS_RESIDUAL_DRAM, S * H, shape=(S, H))
-                self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                    GAMMA_DRAM_ADDR=la['ln1_w'], BETA_DRAM_ADDR=la['ln1_b'], gpr_M_reg=vis_S_reg,
-                    gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
-                    ZEROS_DRAM_ADDR=self.vis_zeros_addr)
-                self._debug_op(f"layer{layer_idx}_ln1", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H))
-                # MLP: Dense_0 + GELU (sigmoid-approx — the engine's only hardware GELU; the
-                # reference uses tanh-approx GELU, a small documented numeric deviation),
-                # Dense_1, residual.
-                vis_matmul(S, H, IP, self.VIS_LN_OUT_DRAM, la, 'fc1', self.VIS_MLP_INTER_DRAM,
-                    bias=la['fc1_bias'], gelu_enable=True)
-                vis_matmul(S, IP, H, self.VIS_MLP_INTER_DRAM, la, 'fc2', self.VIS_MLP_OUT_DRAM, bias=la['fc2_bias'])
-                self._debug_op(f"layer{layer_idx}_mlp_out", self.VIS_MLP_OUT_DRAM, S * H, shape=(S, H))
-                eltwise_add_core_dram(self, size=S * H,
-                    A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM, OUTPUT_DRAM_ADDR=h_out)
-                self._debug_op(f"layer{layer_idx}_residual2", h_out, S * H, shape=(S, H))
-                self._dram_copy(S * H * bpe, h_out, self.VIS_LAYER_SNAPSHOT_DRAM[layer_idx])
-
-            # Final encoder_norm (PBI) + head projection (IF4).
-            final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
-            self.layer_norm_core_dram(M=S, N=H, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
-                GAMMA_DRAM_ADDR=self.vis_encoder_norm_w, BETA_DRAM_ADDR=self.vis_encoder_norm_b,
-                gpr_M_reg=vis_S_reg, gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
-                ZEROS_DRAM_ADDR=self.vis_zeros_addr)
-            self._debug_op("encoder_norm", self.VIS_POST_LN_DRAM, S * H, shape=(S, H))
-            vis_matmul(S, H, self.VIS_HEAD_OUT, self.VIS_POST_LN_DRAM,
-                {'head_data': self.vis_head_data, 'head_scale': self.vis_head_scale}, 'head',
-                self.VIS_HEAD_OUT_DRAM, bias=self.vis_head_bias)
-            self._debug_op("head_out", self.VIS_HEAD_OUT_DRAM, S * self.VIS_HEAD_OUT, shape=(S, self.VIS_HEAD_OUT))
-
-            self.generate_instruction_halt()   # encoder ends.
-        except _DebugStop:
-            pass   # halt already emitted by _debug_op.
-
-        self.release_isa_reg()  # vis_sqrt_N_reg
-        self.release_isa_reg()  # vis_N_reg
-        self.release_isa_reg()  # vis_S_reg
+        sched.begin_program()
+        for e, ue in enumerate(sched.engines):
+            row_offset, rows = splits[e]
+            self._emit_encoder_body(ue, e, sched, row_offset, rows)
+        # KEEP the returned addresses: compile_prefix reuses THIS scheduler and its
+        # finalize() overwrites sched._worker_prog_addrs, so a bare start_workers()
+        # in run_vision would relaunch the PREFIX worker program on the next slot.
+        self._vis_worker_prog_addrs = sched.finalize()   # halts + writes every WORKER program
+        self._assert_worker_programs_fit(sched)
         self.stop_capture()
 
         all_bytes = bytearray()
@@ -1364,8 +1758,237 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # would record 0 -> a zero-length entry in programs.json and a silently broken
         # run_from_bin. Stash the real length here for _compile_once to pick up.
         self._encoder_prog_len = len(all_bytes)
-        print(f"    Vision encoder compiled: {len(all_bytes)} bytes at 0x{program_addr:X}")
+        # Worker program lengths are NOT part of programs.json (which describes the
+        # primary's program allocator only). run_from_bin therefore cannot reproduce a
+        # multi-engine encoder -- dump_programs_to_file refuses rather than dumping a
+        # bin set that would silently execute half an image.
+        self._encoder_worker_prog_lens = [w.get_capture_instruction_size_bytes()
+                                          for w in sched.workers]
+        extra = (f" + {len(sched.workers)} worker program(s) "
+                 f"{self._encoder_worker_prog_lens} bytes") if sched.workers else ""
+        print(f"    Vision encoder compiled: {len(all_bytes)} bytes at 0x{program_addr:X}"
+              f"{extra} (num_engines={ne})")
         return program_addr
+
+    def _emit_encoder_body(self, ue, engine_idx, sched, row_offset, rows):
+        """Emit ONE engine's complete encoder program over rows
+        [row_offset, row_offset+rows) of the S=256 patch tokens.
+
+        With num_engines==1 this is (row_offset, rows) == (0, S), every byte
+        offset below is 0 and every M is S -- i.e. exactly the historical
+        single-engine stream.
+
+        ADDRESSING CONTRACT (per the audit):
+          SHARED_FULL  weights / scales / biases / identity / zero-bias  -> no offset
+          SHARED_ROWS  every [S, *] activation buffer AND vis_pos_embed   -> +row_offset*pitch
+          PER_ENGINE   vis_zeros, VIS_FLASH_{Q,K,V,OUT}, attn scratch     -> ctx-resolved
+        K and V are read in FULL by both engines (that is the whole point of the
+        rendezvous); only the QUERY rows are split.
+        """
+        from user_dma_core import TYPE
+        S, H, NH, D, DP, IP = (self.VIS_S, self.VIS_H, self.VIS_NH, self.VIS_D, self.VIS_DP,
+                                self.VIS_I_PAD)
+        bpe = 2
+        HP = NH * DP
+        HO = self.VIS_HEAD_OUT
+        ne = sched.num_engines
+        is_primary = engine_idx == 0
+
+        # Per-engine byte offsets into the SHARED_ROWS buffers. COMPILE-TIME
+        # CONSTANTS, folded here at capture time -- never computed at runtime via a
+        # GPR (that is the ue_selector _addr_tmp clobber class of bug).
+        RH = row_offset * H * bpe                    # [S, H]  buffers
+        RP = row_offset * HP * bpe                   # [S, HP] buffers (Q/K/V/attn result)
+        RI = row_offset * IP * bpe                   # [S, IP] MLP intermediate
+        RK = row_offset * self.VIS_PATCH_K * bpe     # [S, PK] patchified pixels
+        RO = row_offset * HO * bpe                   # [S, HO] head output
+        assert rows % 64 == 0, f"shard row count {rows} must be 64-aligned"
+
+        zeros_addr = sched.per_engine_addr("vis_zeros", engine_idx)
+        FQ = sched.per_engine_addr("flash_q", engine_idx)
+        FK = sched.per_engine_addr("flash_k", engine_idx)
+        FV = sched.per_engine_addr("flash_v", engine_idx)
+        FO = sched.per_engine_addr("flash_out", engine_idx)
+        ATTN_SCRATCH = sched.per_engine_addr("attn_scratch", engine_idx)
+
+        self._debug_counter = 0
+        if is_primary:
+            self._debug_halt_info = None
+
+        # Fresh register/inst-pointer counters per stage (see compile_denoise_loop).
+        # (begin_program() already did this for the workers.)
+
+        # Norm ABI (post pcie_only sync): layer_norm_core_dram now dispatches to the
+        # dynamic core, where gpr_M_reg is the runtime ROW COUNT, not the old PBI
+        # n_chunks, and the sqrt(N) RSQRT scale is a runtime GPR (float_to_bf19(sqrt(N)))
+        # rather than an implicit fold. The old code primed gpr_M_reg with n_chunks
+        # (correct only for the retired PBI ABI): under the new ABI that normalized only
+        # ~n_chunks of S rows, so the un-normalized rows compounded across the 27 encoder
+        # layers and overflowed bf16 -> NaN vision tokens. Prime rows=THIS ENGINE'S row
+        # count plus N + bf19(sqrt(N)) (vision LayerNorm N = VIS_H) and thread them
+        # through every layer_norm below. N / sqrt(N) describe the WITHIN-ROW
+        # normalization width and are therefore unchanged by the row split.
+        vis_S_reg = ue.alloc_isa_reg()
+        vis_N_reg = ue.alloc_isa_reg()
+        vis_sqrt_N_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(vis_S_reg, rows)
+        ue.generate_instruction_add_set(vis_N_reg, H)
+        ue.generate_instruction_add_set(vis_sqrt_N_reg, ue.float_to_bf19(float(H ** 0.5)))
+
+        def vis_matmul(M, K, N, A, la, proj, OUT, bias=None, **kw):
+            ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
+                OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=la[f'{proj}_scale'], C_DRAM_ADDR=bias, bias_mode="broadcast_N",
+                gpr_M_reg=vis_S_reg, **kw)
+
+        # Per-(layer,head) attention: each call site marshals its head's [rows, D] Q
+        # and the FULL [S, D] K/V (padded to DP) into the per-engine VIS_FLASH buffers
+        # and runs an INLINE unified_attention_core_dynamic.
+
+        try:
+            # === Patch embedding: patchified pixels [rows, 588] -> [rows, 1152] (+ pos) ===
+            vis_matmul(rows, self.VIS_PATCH_K, H, self.VIS_PIXEL_IN_DRAM + RK,
+                {'embed_data': self.vis_embed_data, 'embed_scale': self.vis_embed_scale}, 'embed',
+                self.VIS_PATCH_PROJ_DRAM + RH, bias=self.vis_embed_bias)
+            # TRAP: vis_pos_embed is SHARED_ROWS, NOT SHARED_FULL. It is (S, H) -- one
+            # row per patch -- and this is a FLAT eltwise add, so element i of B pairs
+            # with element i of A. A sharded A REQUIRES the matching B slice; without
+            # +RH engine1 would add pos rows 0..127 to patch rows 128..255 (silent
+            # half-image corruption, no NaN).
+            eltwise_add_core_dram(ue, size=rows * H, A_DRAM_ADDR=self.VIS_PATCH_PROJ_DRAM + RH,
+                B_DRAM_ADDR=self.vis_pos_embed + RH, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM + RH)
+            self._debug_op("patch_embed_pos", self.VIS_IO_A_DRAM, S * H, shape=(S, H), ue=ue)
+
+            for layer_idx, la in enumerate(self.vis_layer_addrs):
+                h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
+                h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
+                # NOTE: no barrier at the layer boundary. Layer i writes h_out+RH for
+                # its OWN rows and layer i+1 reads h_in+RH -- the same rows. The only
+                # cross-shard read in the whole encoder is the peer's K/V below.
+                # LN0 (PBI)
+                ue.layer_norm_core_dram(M=rows, N=H, A_DRAM_ADDR=h_in + RH,
+                    OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM + RH,
+                    GAMMA_DRAM_ADDR=la['ln0_w'], BETA_DRAM_ADDR=la['ln0_b'], gpr_M_reg=vis_S_reg,
+                    gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
+                    ZEROS_DRAM_ADDR=zeros_addr)
+                self._debug_op(f"layer{layer_idx}_ln0", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H), ue=ue)
+                # Q/K/V projections (PBI, IF4). N=NH*DP: weights are pre-padded per-head
+                # D->DP=128 (see _weight_init_vision's _pad_proj) so the buffers below are
+                # already head-block-aligned at DP=128, no separate real/padded copy needed.
+                for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
+                    vis_matmul(rows, H, HP, self.VIS_LN_OUT_DRAM + RH, la, proj, dst + RP,
+                               bias=la[f'{proj}_bias'])
+
+                # ---- RENDEZVOUS: the ONE point an engine reads rows it did not write.
+                # Below, K/V are gathered in FULL (both shards) while Q is this shard
+                # only, so every engine's K/V projection must have landed first.
+                self._vis_barrier(ue, engine_idx, ne)
+
+                # Per-head bidirectional flash attention (no mask, no RoPE). Each head's
+                # block is a full DP=128-wide (256B) column slice -> every DMA stride
+                # below is AXI-beat (32B) aligned, unlike a bare D=72 (144B) slice.
+                elems_q  = rows * DP    # THIS engine's query rows
+                elems_kv = S * DP       # FULL K/V -- both shards, on every engine
+                col_stride = DP * bpe   # one head's column block width (aligned)
+                row_jump = HP * bpe     # full [S, HP] row stride
+                for h in range(NH):
+                    col = h * col_stride
+                    # TRAP: the Q gather and the result scatter carry +RP; the K/V
+                    # gathers must NOT. Omitting RP on the scatter makes both engines
+                    # write rows 0..127 -> finite, NaN-free, structurally plausible
+                    # SCRAMBLED output (project_pi05_denoise_strided_copy_bugs).
+                    assert (RP + col) % 32 == 0, "strided DMA base must be AXI-beat aligned"
+                    for src, dst, n in ((self.VIS_Q_DRAM + RP + col, FQ, elems_q),
+                                        (self.VIS_K_DRAM + col,      FK, elems_kv),
+                                        (self.VIS_V_DRAM + col,      FV, elems_kv)):
+                        ue.accelerator_memory_to_sram(src, 0x00000, n,
+                            stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+                        ue.sram_to_accelerator_memory(0x00000, dst, n)
+                    # INLINE full-MHA self-attention for this head: batch=THIS engine's
+                    # query rows, aligned_seq_len=S (the full K/V), head_dim=DP, zero
+                    # (unmasked) bias, standard 1/sqrt(DP) scale. Splitting the QUERY
+                    # axis needs no online-softmax merge -- each query row's softmax is
+                    # already over the full key set.
+                    #
+                    # NOT a PBI-flash problem: swapping this to
+                    # unified_attention_core_legacy produced BIT-IDENTICAL output
+                    # (only slower), so the encoder's error is deterministic math, not
+                    # PBI back-to-back corruption. Don't re-litigate this -- bisect the
+                    # encoder body against pi05_torch_ref.vision_encode_checkpoints.
+                    ue.unified_attention_core_dynamic(
+                        batch=rows, aligned_seq_len=S, head_dim=DP,
+                        Q_DRAM_ADDR=FQ, K_DRAM_ADDR=FK, V_DRAM_ADDR=FV,
+                        BIAS_DRAM_ADDR=self.VIS_ZERO_BIAS_DRAM,
+                        OUTPUT_DRAM_ADDR=FO,
+                        SCRATCH_DRAM_ADDR=ATTN_SCRATCH,
+                        IDENTITY_DRAM_ADDR=self.identity_addr)
+                    ue.accelerator_memory_to_sram(FO, 0x00000, elems_q)
+                    ue.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + RP + col,
+                        elems_q, stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+
+                # WAR rendezvous: nothing else stops this engine from racing ahead into
+                # layer i+1's K/V projection and overwriting VIS_K/VIS_V rows the peer is
+                # still gathering above. See VIS_BARRIER_AFTER_ATTN.
+                if self.VIS_BARRIER_AFTER_ATTN:
+                    self._vis_barrier(ue, engine_idx, ne)
+
+                # O projection + residual + LN1 (PBI)
+                vis_matmul(rows, HP, H, self.VIS_ATTN_RESULT_DRAM + RP, la, 'o',
+                           self.VIS_O_PROJ_DRAM + RH, bias=la['o_bias'])
+                self._debug_op(f"layer{layer_idx}_o_proj", self.VIS_O_PROJ_DRAM, S * H, shape=(S, H), ue=ue)
+                eltwise_add_core_dram(ue, size=rows * H, A_DRAM_ADDR=h_in + RH,
+                    B_DRAM_ADDR=self.VIS_O_PROJ_DRAM + RH,
+                    OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM + RH)
+                self._debug_op(f"layer{layer_idx}_residual1", self.VIS_RESIDUAL_DRAM, S * H, shape=(S, H), ue=ue)
+                ue.layer_norm_core_dram(M=rows, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM + RH,
+                    OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM + RH,
+                    GAMMA_DRAM_ADDR=la['ln1_w'], BETA_DRAM_ADDR=la['ln1_b'], gpr_M_reg=vis_S_reg,
+                    gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
+                    ZEROS_DRAM_ADDR=zeros_addr)
+                self._debug_op(f"layer{layer_idx}_ln1", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H), ue=ue)
+                # MLP: Dense_0 + GELU (sigmoid-approx — the engine's only hardware GELU; the
+                # reference uses tanh-approx GELU, a small documented numeric deviation),
+                # Dense_1, residual.
+                vis_matmul(rows, H, IP, self.VIS_LN_OUT_DRAM + RH, la, 'fc1',
+                           self.VIS_MLP_INTER_DRAM + RI, bias=la['fc1_bias'], gelu_enable=True)
+                vis_matmul(rows, IP, H, self.VIS_MLP_INTER_DRAM + RI, la, 'fc2',
+                           self.VIS_MLP_OUT_DRAM + RH, bias=la['fc2_bias'])
+                self._debug_op(f"layer{layer_idx}_mlp_out", self.VIS_MLP_OUT_DRAM, S * H, shape=(S, H), ue=ue)
+                eltwise_add_core_dram(ue, size=rows * H,
+                    A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM + RH, B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM + RH,
+                    OUTPUT_DRAM_ADDR=h_out + RH)
+                self._debug_op(f"layer{layer_idx}_residual2", h_out, S * H, shape=(S, H), ue=ue)
+                self._dram_copy(rows * H * bpe, h_out + RH,
+                                self.VIS_LAYER_SNAPSHOT_DRAM[layer_idx] + RH, ue=ue)
+
+            # Final encoder_norm (PBI) + head projection (IF4). Both row-independent:
+            # no barrier needed before them.
+            final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
+            ue.layer_norm_core_dram(M=rows, N=H, A_DRAM_ADDR=final_vis + RH,
+                OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM + RH,
+                GAMMA_DRAM_ADDR=self.vis_encoder_norm_w, BETA_DRAM_ADDR=self.vis_encoder_norm_b,
+                gpr_M_reg=vis_S_reg, gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
+                ZEROS_DRAM_ADDR=zeros_addr)
+            self._debug_op("encoder_norm", self.VIS_POST_LN_DRAM, S * H, shape=(S, H), ue=ue)
+            vis_matmul(rows, H, HO, self.VIS_POST_LN_DRAM + RH,
+                {'head_data': self.vis_head_data, 'head_scale': self.vis_head_scale}, 'head',
+                self.VIS_HEAD_OUT_DRAM + RO, bias=self.vis_head_bias)
+            self._debug_op("head_out", self.VIS_HEAD_OUT_DRAM, S * HO, shape=(S, HO), ue=ue)
+
+            # Final rendezvous, then halt. The workers' halt is emitted by
+            # sched.finalize(); only the primary halts here, so the HOST still waits on
+            # engine0's queue alone (run_vision's _wait_with_heartbeat + the full
+            # (S, HO) DMA readback are unchanged) -- and engine0 cannot report done
+            # until every worker has reached this point and written its rows.
+            self._vis_barrier(ue, engine_idx, ne)
+            if is_primary:
+                ue.generate_instruction_halt()   # encoder ends.
+        except _DebugStop:
+            pass   # halt already emitted by _debug_op (on THIS engine).
+
+        ue.release_isa_reg()  # vis_sqrt_N_reg
+        ue.release_isa_reg()  # vis_N_reg
+        ue.release_isa_reg()  # vis_S_reg
 
     # =========================================================================
     # Action-expert (Gemma-300M) flow-matching denoising stack.
@@ -1406,6 +2029,37 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_NUM_DENOISE_STEPS = 10
     AE_LOOP_TRIP_OVERRIDE = None  # debug knob, see compile_denoise_loop's loop_start call
     DENOISE_STEP0_PROBE = False  # if True, snapshot step-0 intermediates for reference diff
+    # Run the action-expert timestep-embedding MLP (2x 1024x1024 IF4 matmul + 2x
+    # SiLU) ON DEVICE instead of constant-folding it on the host. Only the sincos
+    # table (transcendental, no HW primitive, input-independent) stays a host
+    # constant -- same treatment as the RoPE tables. See _ae_compile_cond_table.
+    AE_COND_TABLE_ON_DEVICE = True
+    AE_COND_TABLE_CHECK = False  # readback + SNR vs the host oracle after the run
+
+    # The denoise/action-expert stage is N-sharded (output columns), not M-sharded:
+    # every op in it has M = AE_ACTION_HORIZON_PADDED = 64, ONE row block, which
+    # cannot be split at all. Follows --engines unless pinned to an int.
+    DENOISE_NUM_ENGINES = None
+
+    @staticmethod
+    def _col_split(N, num_engines, align=64):
+        """[(offset, count)] whole-``align``-block column split -- the SAME rule as
+        MultiEngineScheduler.split_cols.
+
+        Duplicated here on purpose: the down-projection's K-sliced weight blobs are
+        cut at WEIGHT-INIT time, long before any scheduler exists, and a silent
+        disagreement between the host slice and the runtime shard is exactly the
+        finite-but-wrong failure mode this project keeps paying for. compile time
+        asserts the two agree (see _ae_gated_mlp_sharded)."""
+        if num_engines == 1:
+            return [(0, N)]
+        assert N % align == 0, f"_col_split: N={N} not a multiple of {align}"
+        blocks = N // align
+        assert blocks >= num_engines, f"_col_split: N={N} too few {align}-blocks"
+        base, rem = divmod(blocks, num_engines)
+        counts = [align * (base + (1 if i < rem else 0)) for i in range(num_engines)]
+        offsets = [sum(counts[:i]) for i in range(num_engines)]
+        return list(zip(offsets, counts))
 
     # ---- action-expert weights ---------------------------------------------
     def weight_init_action_expert(self):
@@ -1426,6 +2080,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         computes ``A @ B^T`` with B stored (N, K) = (out, in). Every matmul
         weight is therefore transposed (last two dims) before quantizing/storing.
         """
+        # Resolved once here: the mlp-down K-slice blobs below are only stored when
+        # the denoise stage will actually run sharded, so --engines 1 pays no DRAM
+        # for them and its weight blob is byte-identical to the pre-sharding one.
+        _ne_denoise = self._num_engines("DENOISE")
         wdir = _weights_export_dir(self.script_dir)
         manifest_path = os.path.join(wdir, "manifest.json")
         with open(manifest_path) as f:
@@ -1545,8 +2203,35 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             up_w = gating[1].transpose(-1, -2).contiguous().to(torch.bfloat16)
             data, _ = _mlc_quantize_q4_64(up_w)
             la["mlp_up_scale"], la["mlp_up_data"] = store_quantized_weight(self, data.tobytes())
-            la["mlp_down_scale"], la["mlp_down_data"] = \
-                _store_matmul_layer("PaliGemma.llm.layers.mlp_1.linear", layer)
+            # mlp down: (I=4096 -> H=1024). The ONLY op in the action expert whose
+            # fat dimension is K, not N, so it is the one that cannot be sharded by
+            # pointer arithmetic: B is stored N x K row-major, so B[:, k0:k0+Kc] is
+            # strided (one gap per row) and unreachable by shifting B_DRAM_ADDR.
+            # It gets host-side pre-sliced blobs, one per engine, cut here at load.
+            # WHY K-SPLIT AND NOT AN N-SPLIT WITH A JOIN: the gate/up/gelu-mult
+            # chain above it is already N-sharded, so engine i ALREADY HOLDS,
+            # contiguously, exactly the K-slice [k0, k0+Kc) of the (S, I)
+            # intermediate that this K-shard needs. The K-split is therefore free on
+            # the activation side and costs one eltwise add of the two (64, 1024)
+            # partials. N-splitting `down` instead would need every engine to hold
+            # the FULL 4096-wide intermediate, which means gathering two disjoint
+            # per-engine [64, 2048] buffers into a shared [64, 4096] -- a strided
+            # DRAM round-trip of 256Ki elements, per layer, per step, 180 times.
+            # The reduction is ~64Ki adds against 256 MFLOP; the gather is not.
+            dn_w = _load("PaliGemma.llm.layers.mlp_1.linear")[layer] \
+                .transpose(-1, -2).contiguous().to(torch.bfloat16)   # (H, I) = (N, K)
+            data, _ = _mlc_quantize_q4_64(dn_w)
+            la["mlp_down_scale"], la["mlp_down_data"] = store_quantized_weight(self, data.tobytes())
+            if _ne_denoise > 1:
+                # The IF4 scale blob is one bf16 per 64-element block of the
+                # FLATTENED (N, K) weight. Kc is a multiple of 64, so the slice's
+                # blocks coincide exactly with a subset of the full weight's blocks
+                # and re-quantizing the slice reproduces those scales bit-for-bit.
+                la["mlp_down_k"] = []
+                for k0, kc in self._col_split(self.AE_INTERMEDIATE, _ne_denoise):
+                    sl = dn_w[:, k0:k0 + kc].contiguous()
+                    sdata, _ = _mlc_quantize_q4_64(sl)
+                    la["mlp_down_k"].append(store_quantized_weight(self, sdata.tobytes()))
 
             self.ae_layer_addrs.append(la)
 
@@ -1676,6 +2361,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.AE_SINCOS_DRAM = self.allocate_tensor_dram(1 * H * bpe)
         self.AE_TIME_HIDDEN_DRAM = self.allocate_tensor_dram(1 * H * bpe)
 
+        # ON-DEVICE time-MLP working set. The whole (N_steps, H) conditioning table
+        # is produced in ONE batched pass (M = AE_NUM_DENOISE_STEPS) rather than 10
+        # separate M=1 ops: same kernels, 1/10th the instruction count, and the
+        # composed-SiLU staging (a single SRAM load of N*H elements) only has to
+        # happen twice instead of twenty times. See _ae_compile_cond_table.
+        _NST = self.AE_NUM_DENOISE_STEPS
+        self.AE_TIME_HID_TABLE_DRAM  = self.allocate_tensor_dram(_NST * H * bpe)  # time_mlp_in out (pre-silu)
+        self.AE_TIME_HID_SILU_DRAM   = self.allocate_tensor_dram(_NST * H * bpe)  # silu(time_mlp_in)
+        self.AE_COND_TABLE_RAW_DRAM  = self.allocate_tensor_dram(_NST * H * bpe)  # time_mlp_out out (pre-silu)
+        self.AE_COND_TABLE_DRAM      = self.allocate_tensor_dram(_NST * H * bpe)  # silu(...) = cond table
+
         # all-ones gamma constant: rms_norm_core multiplies by gamma directly (no
         # implicit +1, unlike gemma3's pre-offset convention), so AdaRMSNorm's
         # plain (no learned scale) RMSNorm needs gamma=1 rather than gamma=None
@@ -1749,6 +2445,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self.AE_P0_L0_QROPE  = self.allocate_tensor_dram(2 * S * D * bpe)  # layer0 ROPED Q, heads 0-1
             self.AE_P0_L0_KSUF   = self.allocate_tensor_dram(S * D * bpe)      # layer0 ROPED suffix K rows
         print(f"tensor_init_action_expert done; tensor DRAM at 0x{self.get_tensor_dram_addr():X}")
+        self.dram_region_map("after tensor_init_action_expert")
 
     # ---- small helpers --------------------------------------------------
     def _ae_broadcast_row(self, src_dram, dst_dram, rows, width):
@@ -1825,6 +2522,79 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                B_DRAM_ADDR=self.AE_MLP_UP_DRAM, OUTPUT_DRAM_ADDR=self.AE_MLP_MULT_DRAM)
         self._ae_matmul(M, I, H, self.AE_MLP_MULT_DRAM, la["mlp_down_scale"], la["mlp_down_data"], out_dram, gpr_M_reg=gpr_M_reg)
 
+    # ---- N-sharded gated MLP (the denoise stage's whole multi-engine win) -----
+    #
+    # Per action-expert layer the matmul work at M=64 is roughly:
+    #     k/v proj    2 x 64x1024x256   =  34 MMAC   ( 3%)
+    #     q proj      8 x 64x1024x256   = 134 MMAC   (13%)
+    #     o proj      8 x 64x256x1024   = 134 MMAC   (13%)
+    #     mlp gate/up 2 x 64x1024x4096  = 537 MMAC   (51%)
+    #     mlp down    1 x 64x4096x1024  = 268 MMAC   (26%)
+    # so the gated MLP alone is ~77% of it, in exactly three ops, with no strided
+    # marshalling anywhere -- which is why it is the whole of v1. gate and up are
+    # N-split (1024 -> 4096 becomes 1024 -> 2048 per engine), the GELU-multiply is
+    # per-element and never leaves its lane, and `down` consumes the lane it is
+    # already sitting in as a K-shard. Two rendezvous per layer.
+    def _ae_gated_mlp_sharded(self, sched, M, x_dram, la, out_dram, gpr_M_regs, partial_name):
+        H, I = self.AE_HIDDEN, self.AE_INTERMEDIATE
+        ne = sched.num_engines
+        k_split = self._col_split(I, ne)
+
+        def _body(ctx):
+            i = ctx.engine_idx
+            # The host cut the down-projection blobs at weight-init time using
+            # _col_split; if the scheduler ever partitions differently the result is
+            # finite garbage, not a crash. Assert they agree.
+            assert (ctx.col_offset, ctx.cols) == k_split[i], (
+                f"mlp shard mismatch on engine {i}: scheduler gives "
+                f"{(ctx.col_offset, ctx.cols)}, weight blobs were cut for {k_split[i]}")
+            raw = ctx.unsafe_ue
+            mreg = gpr_M_regs[i]
+            Nc = ctx.cols
+            # gate (fused gelu) and up: N-split. A (the normed x) is read in FULL by
+            # every engine -- it is the same M x K activation; only B/scale move.
+            raw.matmat_mul_core(
+                M=M, K=H, N=Nc, A_DRAM_ADDR=x_dram,
+                B_DRAM_ADDR=ctx.b_addr(la["mlp_gate_data"], H, TYPE.IF4),
+                SCALE_DRAM_ADDR=ctx.scale_addr(la["mlp_gate_scale"], H),
+                OUTPUT_DRAM_ADDR=ctx.col_out("ae_mlp_gate"),
+                is_B_quantized=True, data_type=TYPE.IF4, gelu_enable=True, gpr_M_reg=mreg)
+            raw.matmat_mul_core(
+                M=M, K=H, N=Nc, A_DRAM_ADDR=x_dram,
+                B_DRAM_ADDR=ctx.b_addr(la["mlp_up_data"], H, TYPE.IF4),
+                SCALE_DRAM_ADDR=ctx.scale_addr(la["mlp_up_scale"], H),
+                OUTPUT_DRAM_ADDR=ctx.col_out("ae_mlp_up"),
+                is_B_quantized=True, data_type=TYPE.IF4, gpr_M_reg=mreg)
+            # gelu(gate) * up -- purely per-element, so a column shard of the inputs
+            # is a column shard of the output and no engine needs a peer's columns.
+            # unsafe_ue because nn_lib's wrapper drives the SRAM staging directly
+            # (accelerator_memory_to_sram/eltwise_mul_core) rather than the single
+            # allowlisted eltwise_core_dram entry point; the op itself is exactly the
+            # row/column-independent kind the allowlist exists to admit.
+            eltwise_mul_core_dram(raw, size=ctx.elems(M),
+                                   A_DRAM_ADDR=ctx.col_out("ae_mlp_gate"),
+                                   B_DRAM_ADDR=ctx.col_out("ae_mlp_up"),
+                                   OUTPUT_DRAM_ADDR=ctx.col_out("ae_mlp_mult"))
+            # down: K-SHARD, not a column shard. This engine's [M, Nc] lane IS the
+            # contiguous K-slice [col_offset, col_offset+Nc) of the (M, I)
+            # intermediate, so no gather is needed -- only the pre-sliced weight.
+            # Result is a FULL [M, H] PARTIAL SUM; reduce_add below combines them.
+            b_scale, b_data = la["mlp_down_k"][i]
+            raw.matmat_mul_core(
+                M=M, K=Nc, N=H, A_DRAM_ADDR=ctx.col_out("ae_mlp_mult"),
+                B_DRAM_ADDR=b_data, SCALE_DRAM_ADDR=b_scale,
+                OUTPUT_DRAM_ADDR=sched.per_engine_addr(partial_name, i),
+                is_B_quantized=True, data_type=TYPE.IF4, gpr_M_reg=mreg)
+
+        # join=False: reduce_add opens with its own rendezvous, and the partials are
+        # meaningless until it runs, so a join here would just be a second barrier.
+        sched.col_sharded_region(I, _body, join=False)
+        # join=False again: the ONLY thing a worker can do after this is block on the
+        # NEXT region's opening rendezvous, so the exit barrier is redundant. That
+        # halves the barrier count over 180 layer executions (360 instead of 540).
+        sched.reduce_add([sched.per_engine_addr(partial_name, i) for i in range(ne)],
+                         out_dram, M, H, join=False)
+
     def _ae_sincos_time_embed(self, t_scalar):
         """Host-computed sincos timestep embedding (dim=AE_HIDDEN, matches
         sincos_pos_embed in pi05_torch_ref.py) DMA'd to AE_SINCOS_DRAM, then
@@ -1873,6 +2643,110 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, addr, table, N * H * 2)
         self.allocate_params_dram(N * H * 2)
         return addr
+
+    def _ae_compile_cond_table(self):
+        """ON-DEVICE AdaRMSNorm conditioning table.
+
+        Emits, into the denoise program, the FULL time-embedding MLP for all
+        AE_NUM_DENOISE_STEPS Euler steps at once:
+
+            sincos table (N,H)   [host constant, see below]
+              -> time_mlp_in  (H,H) IF4 + bias      ON DEVICE  (matmat_mul_core)
+              -> SiLU                                ON DEVICE  (composed)
+              -> time_mlp_out (H,H) IF4 + bias      ON DEVICE  (matmat_mul_core)
+              -> SiLU                                ON DEVICE  (composed)
+              -> AE_COND_TABLE_DRAM (N,H)
+
+        WHY THE SINCOS TABLE STAYS ON THE HOST: sincos_pos_embed is sin/cos over
+        512 geometrically-spaced periods -- transcendental. The LALU exposes
+        exp/sigmoid/silu/gelu/tanh, but no sine or cosine primitive anywhere in
+        the ISA, so there is nothing to lower it onto. It is also purely a
+        function of the fixed Euler schedule (t = 1.0, 0.9, ... 0.1) with no
+        dependence on any input, i.e. a CONSTANT. It is therefore handled exactly
+        the way this repo already handles the RoPE cos/sin tables (_rope_init,
+        PREFIX_ROPE_ADDR / AE_ROPE_ADDR): computed once on the host and DMA'd in
+        as a read-only constant. Every MATMUL and every ACTIVATION runs on device.
+
+        WHY COMPOSED SiLU: matmat_mul_core's fused silu_enable=True uses the LALU's
+        piecewise-approximate SILU, which measured -6dB on this tensor (see the
+        history in _ae_precompute_cond_table). silu_core_dram computes a true
+        x*sigmoid(x) -- identity-matmul sigmoid then an elementwise multiply.
+        The SiLU is elementwise, so the (N,H) tensor is reshaped to
+        (N*H/64, 64) and run against the shared 64x64 identity matrix rather than
+        needing an HxH one.
+
+        Emitted on the PRIMARY engine only, outside every sharded region: it is
+        ~0.02 GFLOP of the denoise stage's ~200, so sharding it would buy nothing
+        and cost two rendezvous. --engines 1 and --engines 2 execute identical
+        instructions here.
+        """
+        H, NST = self.AE_HIDDEN, self.AE_NUM_DENOISE_STEPS
+        V = UE_VECTOR_SIZE
+        assert (NST * H) % V == 0
+        sincos_addr = self._ae_build_sincos_table()      # host constant (N,H)
+        self.AE_SINCOS_TABLE_DRAM = sincos_addr
+
+        self._ae_matmul(NST, H, H, sincos_addr, self.ae_time_in_scale, self.ae_time_in_data,
+                         self.AE_TIME_HID_TABLE_DRAM, bias_addr=self.ae_time_in_bias)
+        silu_core_dram(self, M=(NST * H) // V, N=V,
+                       A_DRAM_ADDR=self.AE_TIME_HID_TABLE_DRAM,
+                       OUTPUT_DRAM_ADDR=self.AE_TIME_HID_SILU_DRAM,
+                       IDENTITY_DRAM_ADDR=self.identity_addr)
+        self._ae_matmul(NST, H, H, self.AE_TIME_HID_SILU_DRAM, self.ae_time_out_scale,
+                         self.ae_time_out_data, self.AE_COND_TABLE_RAW_DRAM,
+                         bias_addr=self.ae_time_out_bias)
+        silu_core_dram(self, M=(NST * H) // V, N=V,
+                       A_DRAM_ADDR=self.AE_COND_TABLE_RAW_DRAM,
+                       OUTPUT_DRAM_ADDR=self.AE_COND_TABLE_DRAM,
+                       IDENTITY_DRAM_ADDR=self.identity_addr)
+        return self.AE_COND_TABLE_DRAM
+
+    def _ae_host_cond_table(self):
+        """Host ORACLE for the conditioning table (exact, matches pi05_torch_ref:
+        IF4-quantized time-MLP kernels + F.silu). Returns an (N,H) float tensor.
+        Used to score the on-device path and, when AE_COND_TABLE_ON_DEVICE is
+        False, as the shipped constant (see _ae_precompute_cond_table)."""
+        import pi05_torch_ref as _ref
+        H, N = self.AE_HIDDEN, self.AE_NUM_DENOISE_STEPS
+        min_period, max_period = 4e-3, 4.0
+        frac = torch.linspace(0.0, 1.0, H // 2)
+        period = min_period * (max_period / min_period) ** frac
+        Win  = _ref.maybe_quantize(self._npy("time_mlp_in.kernel").to(torch.bfloat16), "if4").float()
+        bin_ = self._npy("time_mlp_in.bias").float()
+        Wout = _ref.maybe_quantize(self._npy("time_mlp_out.kernel").to(torch.bfloat16), "if4").float()
+        bout = self._npy("time_mlp_out.bias").float()
+        dt = -1.0 / N
+        rows, t = [], 1.0
+        for _ in range(N):
+            sinusoid = t * (1.0 / period) * 2 * math.pi
+            emb = torch.cat([torch.sin(sinusoid), torch.cos(sinusoid)]).to(torch.bfloat16).float()
+            emb = torch.nn.functional.silu(emb @ Win + bin_)
+            emb = torch.nn.functional.silu(emb @ Wout + bout)
+            rows.append(emb)
+            t += dt
+        return torch.stack(rows)
+
+    def _ae_check_cond_table(self):
+        """Read back the DEVICE-computed (N,H) conditioning table and score it
+        against the host oracle. Called once after the denoise execution."""
+        H, N = self.AE_HIDDEN, self.AE_NUM_DENOISE_STEPS
+        buf = bytearray(N * H * 2)
+        self._dma_read_checked(self.AE_COND_TABLE_DRAM, buf, len(buf))
+        got = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(N, H).float()
+        ref = self._ae_host_cond_table()
+
+        def _snr(a, b):
+            noise = (a - b).pow(2).sum().item()
+            return 10 * math.log10(b.pow(2).sum().item() / noise) if noise > 0 else float("inf")
+        print("  [cond_table] on-device time-MLP vs host oracle:")
+        for i in range(N):
+            print(f"    step {i}: SNR {_snr(got[i], ref[i]):7.2f} dB   "
+                  f"cos {torch.nn.functional.cosine_similarity(got[i], ref[i], dim=0).item():.6f}")
+        overall = _snr(got, ref)
+        print(f"    OVERALL: SNR {overall:.2f} dB  "
+              f"max|abs err| {(got - ref).abs().max().item():.5f}  "
+              f"nan={torch.isnan(got).sum().item()}")
+        return overall
 
     def _ae_precompute_cond_table(self):
         """The AdaRMSNorm conditioning vector is INPUT-INDEPENDENT -- it depends
@@ -1927,7 +2801,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_imm(addr_reg, H * 2)
 
     # ---- one action-expert transformer layer (attention + gated MLP) --------
-    def compile_suffix_step(self, layer_idx, x_in_dram, x_out_dram, gpr_M_reg=None, flash_ctx=None, step=None):
+    def compile_suffix_step(self, layer_idx, x_in_dram, x_out_dram, gpr_M_reg=None, flash_ctx=None, step=None,
+                             sched=None, gpr_M_regs=None):
         """One action-expert layer body: AdaRMSNorm -> MQA attention (suffix Q vs
         combined prefix+suffix K/V) -> gated residual -> AdaRMSNorm -> gated MLP
         -> gated residual. Mirrors suffix_step()'s per-layer loop body in
@@ -2056,7 +2931,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self._debug_op(f"{_pfx}_preffw_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
 
         # 8. gated MLP + gated residual
-        self._ae_gated_mlp(S, self.AE_NORM_DRAM, la, self.AE_MLP_DOWN_DRAM, gpr_M_reg=gpr_M_reg)
+        if sched is not None and sched.num_engines > 1:
+            # AE_NORM_DRAM was just written by the primary and is read in full by
+            # every engine; the region's OPENING rendezvous is that RAW fence.
+            self._ae_gated_mlp_sharded(sched, S, self.AE_NORM_DRAM, la, self.AE_MLP_DOWN_DRAM,
+                                        gpr_M_regs, "ae_mlp_down_partial")
+        else:
+            self._ae_gated_mlp(S, self.AE_NORM_DRAM, la, self.AE_MLP_DOWN_DRAM, gpr_M_reg=gpr_M_reg)
         self._debug_op(f"{_pfx}_mlp_out", self.AE_MLP_DOWN_DRAM, S * H, shape=(S, H))
         eltwise_mul_core_dram(self, size=S * H, A_DRAM_ADDR=self.AE_MLP_DOWN_DRAM,
                                B_DRAM_ADDR=self.AE_GATE_BCAST_DRAM, OUTPUT_DRAM_ADDR=self.AE_MLP_GATED_DRAM)
@@ -2114,12 +2995,53 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.reset_isa_reg_counter()
         self.reset_inst_ptr_counter()
 
+        # ---- N-axis (output-column) sharding of the gated MLP -----------------
+        # M is AE_ACTION_HORIZON_PADDED = 64 EVERYWHERE in this stage: one row
+        # block, so the M-split that shards vision and prefix is not merely
+        # inefficient here, it is inexpressible. N is the axis with room
+        # (1024 -> 4096), and the gated MLP is ~77% of the per-layer matmul work.
+        ne = self._num_engines("DENOISE")
+        sched = self._denoise_make_scheduler(ne) if ne > 1 else None
+        self._denoise_sched = sched
+        if sched is not None:
+            # _debug_op / DEBUG_STOP halt the PRIMARY only; under multi-engine the
+            # workers would spin forever at the next rendezvous.
+            assert self.DEBUG_STOP_AFTER is None, (
+                "PI05_DEBUG_STOP_AFTER is not supported with a sharded denoise stage "
+                f"(engines={ne}): the halt is emitted on the primary only. Use --engines 1.")
+            for la in self.ae_layer_addrs:
+                assert "mlp_down_k" in la, (
+                    "the denoise stage is sharded but weight_init_action_expert did not "
+                    "store the K-sliced mlp-down blobs -- DENOISE_NUM_ENGINES must be "
+                    "resolvable to the same value at weight-init time as it is here.")
+            # Per-engine [S, I/ne] lanes for gate / up / gelu-mult. matmat_mul_core's
+            # writeback stride is N*bpe for the N IT WAS GIVEN, so calling it with
+            # N=cols writes a DENSE [S, cols] block -- each engine owns its own
+            # buffer and nothing is strided.
+            for nm in ("ae_mlp_gate", "ae_mlp_up", "ae_mlp_mult"):
+                sched.alloc_col_output(nm, S, self.AE_INTERMEDIATE)
+            # The K-split partial sums are FULL [S, H] per engine (a reduction does
+            # not partition its output). The primary accumulates in place into the
+            # existing AE_MLP_DOWN_DRAM, so downstream code is untouched.
+            sched.register_per_engine("ae_mlp_down_partial", self.AE_MLP_DOWN_DRAM, S * H * 2,
+                                      init_tensor=torch.zeros(S * H, dtype=torch.bfloat16))
+            self.dram_region_map(f"denoise sharded x{ne}")
+            sched.begin_program()
+
         # rope tables (idempotent -- normally already built by compile_prefix, but
         # a skip_prefix run never calls it)
         self._rope_init()
 
         ae_S_reg = self.alloc_isa_reg()
         self.generate_instruction_add_set(ae_S_reg, S)
+        # One M=S GPR PER ENGINE: gpr_M_reg indices are per-engine ISA registers and
+        # a worker's allocator was just reset by begin_program(), so the primary's
+        # index is meaningless on a worker. Primed here, once, outside every region.
+        ae_S_regs = [ae_S_reg]
+        for w in (sched.workers if sched is not None else []):
+            r = w.alloc_isa_reg()
+            w.generate_instruction_add_set(r, S)
+            ae_S_regs.append(r)
 
         # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds sqrt(N)
         # implicitly -- the dynamic core reads N and bf19(sqrt(N)) from runtime GPRs.
@@ -2151,9 +3073,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # retained (matching compile_prefix/compile_encoder's proven pattern; the
         # loop_start/loop_end runtime-loop variant hung on real backward branches).
 
-        # Precompute the (N,H) AdaRMSNorm conditioning table on the host (exact
-        # constants; replaces the HW time-MLP + approximate fused-silu).
-        self.AE_COND_TABLE_DRAM = self._ae_precompute_cond_table()
+        # (N,H) AdaRMSNorm conditioning table. Default: computed ON DEVICE (two
+        # IF4 matmuls + two composed SiLUs, batched over all N Euler steps) from a
+        # host-constant sincos table -- see _ae_compile_cond_table. Set
+        # AE_COND_TABLE_ON_DEVICE=False to fall back to the host constant-fold.
+        if self.AE_COND_TABLE_ON_DEVICE:
+            self._ae_compile_cond_table()
+        else:
+            self.AE_COND_TABLE_DRAM = self._ae_precompute_cond_table()
 
         try:
             for step in range(self.AE_NUM_DENOISE_STEPS):
@@ -2182,7 +3109,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 x_cur = self.AE_ACTION_TOK_DRAM
                 for layer_idx in range(self.AE_LAYERS):
                     x_next = self.AE_X_DRAM if x_cur is not self.AE_X_DRAM else self.AE_ACTION_TOK_DRAM
-                    self.compile_suffix_step(layer_idx, x_cur, x_next, gpr_M_reg=ae_S_reg, step=step)
+                    self.compile_suffix_step(layer_idx, x_cur, x_next, gpr_M_reg=ae_S_reg, step=step,
+                                              sched=sched, gpr_M_regs=ae_S_regs)
                     self._debug_op(f"step{step}_suffix_layer{layer_idx}", x_next, S * H, shape=(S, H))
                     if self.DENOISE_STEP0_PROBE and step == 0 and layer_idx == 0:
                         self._dram_copy(S * H * 2, x_next, self.AE_P0_SUF_L0)
@@ -2233,6 +3161,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_halt()
         except _DebugStop:
             pass   # halt already emitted by _debug_op.
+
+        if sched is not None:
+            # KEEP the addresses: this scheduler is SHARED with the encoder and the
+            # prefix, and finalize() overwrites sched._worker_prog_addrs -- a bare
+            # start_workers() later would relaunch the wrong stage's worker program.
+            self._denoise_worker_prog_addrs = sched.finalize()
+            print(f"    [denoise] worker program(s): "
+                  f"{[w.get_capture_instruction_size_bytes() for w in sched.workers]} bytes")
+            self._assert_worker_programs_fit(sched)
 
         self.release_isa_reg()  # ae_sqrt_N_reg
         self.release_isa_reg()  # ae_N_reg
@@ -2310,8 +3247,32 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self.dma_write(DMA_DEVICE_H2C, self.vis_zeros_addr, zeros_t, zeros_n * 2)
 
             prog_addr = self._compile_once("encoder", self.compile_encoder, label="vision encoder")
+            sched = getattr(self, "_vis_sched", None)
+            if sched is not None and sched.num_engines > 1:
+                # A flag left SET by an earlier program would make the first CHECK of
+                # the first rendezvous pass spuriously. Once, before the first launch.
+                if not getattr(self, "_vis_flags_precleared", False):
+                    sched.preclear_flags()
+                    self._vis_flags_precleared = True
+                # The zeros restore above only re-zeroed the PRIMARY's copy; every
+                # engine has its own (layer_norm_core_dram writes it as scratch).
+                sched.refresh_per_engine("vis_zeros", zeros_t)
+                # Workers HALT at the end of every run, so they must be relaunched
+                # before EVERY primary launch -- this collides with compile-once/
+                # execute-many, hence the explicit call here rather than at compile time.
+                # Workers first, then the primary (proven order; primary-first also
+                # works since it blocks at its first CHECK).
+                sched.start_workers(self._vis_worker_prog_addrs)
             self.start_execute_from_dram(prog_addr)
             self._wait_with_heartbeat(f"vision slot {i}", timeout=180.0)
+            if sched is not None and sched.num_engines > 1:
+                # The primary can retire its halt while a worker is still draining
+                # the ~33 no-op instructions of the exit rendezvous (they write
+                # nothing, so the data is already there) -- so WAIT rather than
+                # assert-not-busy, which would be flaky. A worker genuinely stuck
+                # at a rendezvous trips the timeout.
+                for widx, w in enumerate(sched.workers):
+                    w.wait_queue(60.0)
 
             buf = bytearray(S * HO * 2)
             self._dma_read_checked(self.VIS_HEAD_OUT_DRAM, buf, len(buf))
@@ -2370,6 +3331,332 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.prefix_masked_cols = []   # nothing masked in-sequence: the rows are gone
         kept = [o for i, o in enumerate(outs) if i not in masked_slots]
         return torch.cat(kept, dim=0)  # (n_valid_slots*256, 2048), e.g. (512, 2048)
+
+    def run_encoder_only(self, images_hwc, dump_prefix=None):
+        """--encoderend: compile + run ONLY the vision encoder, over ALL image slots.
+
+        A/B harness for the row-sharded encoder. Deliberately does no prefix and no
+        denoise, but it walks the SAME slot set run_vision() walks (LIBERO's base
+        camera, wrist camera, and the all-zero 3rd camera), with the same
+        SKIP_ZERO_VISION_SLOTS / masked-slot semantics -- so the reported total is
+        the full encoder cost of one real inference, not one third of it.
+
+        `--encoderend --engines 1` and `--encoderend --engines 2` print a
+        format-identical ENC_ONLY block (same lines, same order, same count) and
+        dump one .npy per slot, so the two runs can be scored against EACH OTHER
+        per slot. That cross-run comparison is the real gate -- sharding is a pure
+        work partition, so the two runs must be bit-identical -- and it does not
+        depend on the (independently weak) CPU-oracle number.
+
+        Composes with PI05_DEBUG_STOP_AFTER: when a debug halt is armed, the
+        checkpoint's buffer is read back instead of head_out, on every slot.
+        """
+        S, HO, PK = self.VIS_S, self.VIS_HEAD_OUT, self.VIS_PATCH_K
+        ne = self._num_engines("VIS")
+        if isinstance(images_hwc, np.ndarray):     # tolerate a single image
+            images_hwc = [images_hwc]
+
+        t0 = time.perf_counter()
+        prog_addr = self._compile_once("encoder", self.compile_encoder, label="vision encoder")
+        compile_s = time.perf_counter() - t0
+        sched = getattr(self, "_vis_sched", None)
+        multi = sched is not None and sched.num_engines > 1
+        if multi:
+            sched.preclear_flags()
+
+        # A debug halt fires wherever the checkpoint is, so read THAT buffer.
+        info = self._debug_halt_info
+        if info is not None:
+            name, addr, shape = info["name"], info["addr"], info["shape"]
+        else:
+            name, addr, shape = "head_out", self.VIS_HEAD_OUT_DRAM, (S, HO)
+
+        zeros_n = max(self.VIS_H, self.VIS_I)
+        zeros_t = torch.zeros(zeros_n, dtype=torch.bfloat16)
+
+        import pi05_torch_ref as _ref
+        W = _ref.Weights(device="cpu", dtype=torch.bfloat16, quant="if4")
+
+        def _snr(hw, cpu):
+            n = (hw.float() - cpu.float()).pow(2).sum().sqrt()
+            g = cpu.float().pow(2).sum().sqrt()
+            return float("inf") if n == 0 else float(20 * torch.log10(g / n.clamp_min(1e-12)))
+
+        rows = []
+        masked_slots = []
+        total_wall = 0.0
+        for i, img in enumerate(images_hwc):
+            # Mirror run_vision's slot semantics EXACTLY so the timing is
+            # representative: an all-zero slot is ALWAYS attention-masked (openpi
+            # image_mask=False), and is only SKIPPED when SKIP_ZERO_VISION_SLOTS
+            # is on -- which defaults to False, i.e. every slot is really encoded.
+            is_zero = not np.any(img)
+            if is_zero:
+                masked_slots.append(i)
+            if is_zero and self.SKIP_ZERO_VISION_SLOTS:
+                rows.append({"slot": i, "masked": 1, "skipped": 1, "wall": 0.0,
+                             "snr": float("nan"), "lo": float("nan"), "hi": float("nan"),
+                             "mn": 1e-6, "mx": 1e-6, "nan": 0, "dump": "-"})
+                print(f"  [encoderend] slot {i} SKIPPED (zero image, masked out)")
+                continue
+
+            patches = self._patchify(img)
+            patches_pad = np.zeros((S, PK), dtype=np.float32)
+            patches_pad[:, :patches.shape[1]] = patches
+            pixel_t = torch.from_numpy(patches_pad).to(torch.bfloat16)
+            self.dma_write(DMA_DEVICE_H2C, self.VIS_PIXEL_IN_DRAM, pixel_t, S * PK * 2)
+            # Restore the LayerNorm zeros scratch on EVERY engine -- the previous
+            # slot's execution dirtied it (layer_norm_core_dram writes it).
+            self.dma_write(DMA_DEVICE_H2C, self.vis_zeros_addr, zeros_t, zeros_n * 2)
+            if multi:
+                sched.refresh_per_engine("vis_zeros", zeros_t)
+                sched.start_workers()   # workers halt after every run
+            t1 = time.perf_counter()
+            self.start_execute_from_dram(prog_addr)
+            self._wait_with_heartbeat(f"encoder slot {i}", timeout=300.0)
+            if multi:
+                for w in sched.workers:
+                    w.wait_queue(300.0)
+            wall = time.perf_counter() - t1
+            total_wall += wall
+
+            buf = bytearray(shape[0] * shape[1] * 2)
+            self._dma_read_checked(addr, buf, len(buf))
+            out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(*shape).clone()
+
+            # CPU oracle at the SAME checkpoint, same IF4 weights. An all-zero image
+            # is NOT a degenerate case here: the patch-embed bias makes every row
+            # non-zero before the first LayerNorm, so the oracle is well defined and
+            # the HW must not produce NaN either (nan_count below is the check).
+            images_t = torch.from_numpy(img)[None].to(torch.bfloat16)
+            cpu = None
+            for ck_name, ck in _ref.vision_encode_checkpoints(images_t, W):
+                if ck_name == name:
+                    cpu = ck.detach().clone()
+                    break
+            if cpu is None:
+                cpu = _ref.vision_encode(images_t, W).reshape(S, HO)
+
+            half = shape[0] // 2
+            dump = (dump_prefix or os.path.join(self.script_dir, f"enc_only_ne{ne}")) \
+                + f"_slot{i}_{name}.npy"
+            np.save(dump, out.float().numpy())
+            rows.append({"slot": i, "masked": int(is_zero), "skipped": 0, "wall": wall,
+                         "snr": _snr(out, cpu),
+                         "lo": _snr(out[:half], cpu[:half]),
+                         "hi": _snr(out[half:], cpu[half:]),
+                         "mn": float(out.float().min()), "mx": float(out.float().max()),
+                         "nan": int(out.float().isnan().sum()), "dump": dump})
+            print(f"  [encoderend] slot {i} done in {wall:.3f}s")
+
+        # Downstream, run_vision replaces a masked slot's tokens with the finite 1e-6
+        # placeholder and records prefix_masked_cols. --encoderend stops at the encoder,
+        # so it reports the RAW encoder output (that is the thing being A/B'd) and
+        # just flags the slot; nothing in that path is changed or bypassed here.
+        self.masked_vision_slots = masked_slots
+
+        worker_lens = getattr(self, "_encoder_worker_prog_lens", []) or []
+        half = shape[0] // 2
+        encoded = [r for r in rows if not r["skipped"]]
+        nan_total = sum(r["nan"] for r in encoded)
+
+        # ---- greppable, format-identical summary (diff the two runs by eye) ----
+        print("")
+        print("=== ENC-ONLY SUMMARY ===")
+        print(f"ENC_ONLY vis_num_engines   : {ne}")
+        print(f"ENC_ONLY checkpoint        : {name} shape={tuple(shape)}")
+        print(f"ENC_ONLY num_slots         : {len(rows)} (encoded={len(encoded)}, "
+              f"masked={sorted(masked_slots)}, skip_zero_slots={self.SKIP_ZERO_VISION_SLOTS})")
+        print(f"ENC_ONLY compile_seconds   : {compile_s:.3f}")
+        print(f"ENC_ONLY primary_prog_bytes: {getattr(self, '_encoder_prog_len', 0)}")
+        print(f"ENC_ONLY worker_prog_bytes : {worker_lens}")
+        for r in rows:
+            print(f"ENC_ONLY slot{r['slot']} masked={r['masked']} skipped={r['skipped']} "
+                  f"wall_s={r['wall']:.3f} snr_db={r['snr']:.2f} "
+                  f"snr_rows0_{half}_db={r['lo']:.2f} snr_rows{half}_{shape[0]}_db={r['hi']:.2f} "
+                  f"min={r['mn']:.4f} max={r['mx']:.4f} nan={r['nan']}")
+        print(f"ENC_ONLY total_wall_seconds: {total_wall:.3f}")
+        print(f"ENC_ONLY mean_wall_seconds : "
+              f"{(total_wall / len(encoded) if encoded else float('nan')):.3f}")
+        print(f"ENC_ONLY nan_count_total   : {nan_total}")
+        for r in rows:
+            print(f"ENC_ONLY dump_slot{r['slot']}       : {r['dump']}")
+        print("=== END ENC-ONLY SUMMARY ===")
+        print("")
+        assert nan_total == 0, (
+            f"--encoderend produced {nan_total} NaN(s) in the encoder output -- an "
+            f"all-zero (masked) slot must still encode to finite values.")
+        base = os.path.join(self.script_dir, "enc_only_ne%d")
+        print("[encoderend] compare the ne=1 and ne=2 runs per slot with:")
+        for r in rows:
+            if r["skipped"]:
+                continue
+            a = (base % 1) + f"_slot{r['slot']}_{name}.npy"
+            b = (base % 2) + f"_slot{r['slot']}_{name}.npy"
+            print(f"    python -c \"import numpy as np,sys;a=np.load(sys.argv[1]);"
+                  f"b=np.load(sys.argv[2]);d=a-b;print(sys.argv[1].split('/')[-1],"
+                  f"'bit-exact' if not d.any() else 'SNR %.2f dB'%"
+                  f"(20*np.log10(np.linalg.norm(a)/np.linalg.norm(d))))\" {a} {b}")
+        return [r["dump"] for r in rows]
+
+    def run_prefix_end(self, images_hwc, prompt_tokens, dump_path=None):
+        """--prefixend: encoder -> prefix (Gemma-2B KV-cache build) -> STOP.
+
+        The next rung of the same ladder as --encoderend: identical greppable
+        summary style, per-stage + cumulative wall-clock, oracle SNR, and a .npy
+        dump so an --engines 1 run and an --engines 2 run can be scored against
+        EACH OTHER (the real gate). No action-expert, no denoise loop, no actions.
+
+        STAGE SHARDING: --engines N shards BOTH stages -- the vision encoder over
+        its 256 patch tokens and the prefix over 64-row blocks of its S tokens
+        (RoPE / permutes / attention stay on the primary). The summary prints the
+        per-stage engine counts and the prefix's actual block split.
+
+        Composes with --engines and PI05_DEBUG_STOP_AFTER (the latter halts the
+        ENCODER program at its checkpoint; the prefix is then meaningless, so it
+        is skipped and the summary says so).
+        """
+        ne_vis, ne_pre = self._num_engines("VIS"), self._num_engines("PREFIX")
+
+        # ---- stage 1: vision encoder (sharded iff --engines > 1) ----
+        t0 = time.perf_counter()
+        vision_tokens = self.run_vision(images_hwc)
+        t_vision = time.perf_counter() - t0
+        n_enc = self._n_vision_slots_encoded()
+        self._report_gflops(f"vision ({n_enc} slots)", self._vision_flops(), t_vision)
+
+        if self._debug_halt_info is not None:
+            print("")
+            print("=== PREFIX-END SUMMARY ===")
+            print(f"PREFIX_END engines_vision  : {ne_vis}")
+            print(f"PREFIX_END engines_prefix  : {ne_pre}"
+                  f"{' (row-sharded)' if ne_pre > 1 else ' (single-engine)'}")
+            print(f"PREFIX_END aborted         : PI05_DEBUG_STOP_AFTER halted the encoder at "
+                  f"checkpoint {self._debug_halt_info['idx']} "
+                  f"({self._debug_halt_info['name']}); prefix skipped")
+            print("=== END PREFIX-END SUMMARY ===")
+            return None
+
+        # ---- stage 2: prefix LM (row-sharded iff --engines > 1) ----
+        t1 = time.perf_counter()
+        seq_len = vision_tokens.shape[0] + self.PREFIX_TEXT_BUDGET
+        valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
+        if not getattr(self, "_prefix_compiled", False):
+            self._prefix_prog_addr = self._compile_once(
+                "prefix", lambda: self.compile_prefix(seq_len, valid_len), label="prefix")
+            self._prefix_bias_dram = self.prefix_bias_dram
+            self._prefix_compiled = True
+        else:
+            bias = self.build_prefix_attn_bias(seq_len, valid_len).contiguous()
+            self.dma_write(DMA_DEVICE_H2C, self._prefix_bias_dram, bias.flatten(), bias.numel() * 2)
+        self._execute_prefix(timeout=250.0)
+        t_prefix = time.perf_counter() - t1
+        self._report_gflops(f"prefix ({seq_len} tok)", self._prefix_flops(seq_len), t_prefix)
+
+        # ---- read back the prefix stage's OUTPUT: the K/V cache ----
+        # (2, n_layers, valid_len, HEAD_DIM) -- the only thing the prefix produces
+        # and the only thing the action expert consumes.
+        P, D, L = self.PREFIX_SEQ_LEN, self.HEAD_DIM, self.NUM_LAYERS
+        hw = torch.empty(2, L, valid_len, D, dtype=torch.float32)
+        for layer in range(L):
+            for j, addr in enumerate((self.prefix_k_cache_addr[layer],
+                                      self.prefix_v_cache_addr[layer])):
+                buf = bytearray(P * D * 2)
+                self._dma_read_checked(addr, buf, len(buf))
+                t = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(P, D).float()
+                hw[j, layer] = t[:valid_len]
+
+        # ---- CPU oracle: pi05_torch_ref.prefix_forward, same IF4 weights ----
+        # Fed the HW's OWN vision tokens, so this isolates the PREFIX stage's
+        # execution rather than re-measuring the encoder's (already-known) drift.
+        import pi05_torch_ref as _ref
+        W = _ref.Weights(device="cpu", dtype=torch.bfloat16, quant="if4")
+        embed_table = W["PaliGemma.llm.embedder.input_embedding"]
+        text_tokens = embed_table[torch.tensor(prompt_tokens, dtype=torch.long)].to(torch.bfloat16)
+        prefix_tokens = torch.cat([vision_tokens.to(torch.bfloat16), text_tokens], dim=0)[None]
+        assert prefix_tokens.shape[1] == valid_len, \
+            f"prefix rows {prefix_tokens.shape[1]} != valid_len {valid_len}"
+        # MUST mirror the HW bias and rope positions or the comparison is
+        # meaningless: build_prefix_attn_bias() masks the dead image slots
+        # (prefix_masked_cols), and _rope_positions_prefix uses openpi's
+        # positions = cumsum(mask) - 1, under which a masked slot FREEZES the
+        # counter. Feeding the oracle an unmasked bias + arange positions scores
+        # ~3 dB on a correct cache -- the same latent flaw the older
+        # _prefix_snr_check has.
+        masked_cols = getattr(self, "prefix_masked_cols", []) or None
+        prefix_bias = _ref.build_prefix_attn_bias(valid_len, "cpu", torch.float32,
+                                                  masked_cols=masked_cols)
+        pmask = torch.ones(1, valid_len, dtype=torch.float32)
+        for _a, _b in (masked_cols or []):
+            pmask[:, int(_a):int(_b)] = 0.0
+        prefix_positions = torch.cumsum(pmask, dim=1) - 1.0
+        _, (k_cache, v_cache) = _ref.prefix_forward(prefix_tokens, prefix_bias, W,
+                                                     positions=prefix_positions)
+        cpu = torch.empty_like(hw)
+        for layer in range(L):
+            cpu[0, layer] = k_cache[layer].reshape(-1, D).float()[:valid_len]
+            cpu[1, layer] = v_cache[layer].reshape(-1, D).float()[:valid_len]
+
+        def _snr(a, b):
+            n = (a - b).pow(2).sum().sqrt()
+            g = b.pow(2).sum().sqrt()
+            return float("inf") if n == 0 else float(20 * torch.log10(g / n.clamp_min(1e-12)))
+
+        if dump_path is None:
+            dump_path = os.path.join(self.script_dir, f"prefix_end_ne{ne_vis}_kv.npy")
+        np.save(dump_path, hw.numpy())
+
+        nan_total = int(hw.isnan().sum())
+        # ---- greppable, format-identical summary ----
+        print("")
+        print("=== PREFIX-END SUMMARY ===")
+        print(f"PREFIX_END engines_vision  : {ne_vis}"
+              f"{' (row-sharded)' if ne_vis > 1 else ' (single-engine)'}")
+        # Report what the prefix ACTUALLY ran on: _prefix_num_engines falls back to
+        # 1 when seq_len cannot be 64-block-split, so the requested count can lie.
+        _psplit = getattr(self, "_prefix_sched", None)
+        ne_pre = _psplit.num_engines if _psplit is not None else 1
+        print(f"PREFIX_END engines_prefix  : {ne_pre}"
+              f"{' (row-sharded)' if ne_pre > 1 else ' (single-engine: prefix not sharded)'}")
+        if _psplit is not None and _psplit.num_engines > 1:
+            print(f"PREFIX_END prefix_split    : "
+                  f"{[c for _, c in _psplit.split_rows(seq_len, mode='blocks')]} rows "
+                  f"(64-row blocks of {seq_len})")
+        print(f"PREFIX_END vision_slots    : {n_enc} encoded, "
+              f"masked={sorted(getattr(self, 'masked_vision_slots', []))}")
+        print(f"PREFIX_END seq_len         : {seq_len} (valid={valid_len}, "
+              f"keep_masked_slots={self.KEEP_MASKED_SLOTS})")
+        print(f"PREFIX_END kv_shape        : {tuple(hw.shape)} (K/V, layers, rows, head_dim)")
+        # Masked (dead image slot) rows are -1e36'd out of every softmax, so their
+        # K/V is never read by anything -- scoring them would poison the number
+        # (feedback_masked_rows_poison_snr). Report the LIVE rows as the headline.
+        live = torch.ones(valid_len, dtype=torch.bool)
+        for _a, _b in (masked_cols or []):
+            live[int(_a):int(_b)] = False
+        print(f"PREFIX_END live_rows       : {int(live.sum())}/{valid_len} "
+              f"(masked_cols={masked_cols or []})")
+        print(f"PREFIX_END snr_kv_db       : {_snr(hw[:, :, live], cpu[:, :, live]):.2f}")
+        print(f"PREFIX_END snr_kv_allrows_db: {_snr(hw, cpu):.2f}")
+        print(f"PREFIX_END snr_k_db        : {_snr(hw[0][:, live], cpu[0][:, live]):.2f}")
+        print(f"PREFIX_END snr_v_db        : {_snr(hw[1][:, live], cpu[1][:, live]):.2f}")
+        print(f"PREFIX_END snr_layer0_db   : {_snr(hw[:, 0][:, live], cpu[:, 0][:, live]):.2f}")
+        print(f"PREFIX_END snr_layer{L - 1}_db  : {_snr(hw[:, L - 1][:, live], cpu[:, L - 1][:, live]):.2f}")
+        print(f"PREFIX_END wall_vision_s   : {t_vision:.3f}")
+        print(f"PREFIX_END wall_prefix_s   : {t_prefix:.3f}")
+        print(f"PREFIX_END wall_cumulative_s: {t_vision + t_prefix:.3f}")
+        print(f"PREFIX_END out_min_max     : {float(hw.min()):.4f} {float(hw.max()):.4f}")
+        print(f"PREFIX_END nan_count       : {nan_total}")
+        print(f"PREFIX_END dump_npy        : {dump_path}")
+        print("=== END PREFIX-END SUMMARY ===")
+        print("")
+        assert nan_total == 0, f"--prefixend produced {nan_total} NaN(s) in the prefix K/V cache"
+        a = os.path.join(self.script_dir, "prefix_end_ne1_kv.npy")
+        b = os.path.join(self.script_dir, "prefix_end_ne2_kv.npy")
+        print(f"[prefixend] compare the ne=1 and ne=2 runs directly with:\n"
+              f"    python -c \"import numpy as np,sys;a=np.load(sys.argv[1]);"
+              f"b=np.load(sys.argv[2]);d=a-b;print('bit-exact' if not d.any() else "
+              f"'SNR %.2f dB'%(20*np.log10(np.linalg.norm(a)/np.linalg.norm(d))))\" {a} {b}")
+        return hw
 
     def _vision_snr_check(self, images_hwc, hw_vision_tokens):
         """CPU-vs-HW SNR check for the vision encoder output, using the SAME
@@ -3068,7 +4355,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 bias = self.build_prefix_attn_bias(seq_len, valid_len).contiguous()
                 self.dma_write(DMA_DEVICE_H2C, self._prefix_bias_dram,
                                bias.flatten(), bias.numel() * 2)
-            self._execute(self._prefix_prog_addr, label="prefix", timeout=250.0)
+            self._execute_prefix(timeout=250.0)
             t_prefix = time.perf_counter() - t1
             self._report_gflops(f"prefix ({seq_len} tok)", self._prefix_flops(seq_len), t_prefix)
 
@@ -3121,8 +4408,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self._denoise_prog_addr = self._compile_once(
                 "denoise", self.compile_denoise_loop, label="denoise_loop")
             self._denoise_compiled = True
-        self._execute(self._denoise_prog_addr, label="denoise_loop", timeout=300.0)
+        self._execute_denoise(timeout=300.0)
         t_denoise = time.perf_counter() - t2
+        if self.AE_COND_TABLE_ON_DEVICE and self.AE_COND_TABLE_CHECK:
+            self._ae_check_cond_table()
         self._report_gflops("denoise (10 steps)", self._denoise_flops(), t_denoise)
 
         # DRAM-overlap check: adding PREFIX_LAYER_SNAPSHOT_DRAM/PREFIX_L0_SNAPSHOT_DRAM
@@ -3191,12 +4480,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 print(f"  [dma_write_retry] attempt {i+1}/{attempts} failed (wrote {n}, wanted {size}), retrying...")
             raise RuntimeError(f"dma_write to 0x{address:X} failed after {attempts} attempts")
 
+        # Tensors must be flattened to BYTES once up front. Slicing a tensor with
+        # byte offsets ([offset:offset+chunk_size]) indexes ELEMENTS, so for any
+        # >1MB bf16 tensor every chunk after the first started at the wrong place
+        # and the tail chunks sliced past the end -> a short buffer handed to
+        # dma_write with a full-size length.
+        if not isinstance(data, (bytes, bytearray)):
+            t = data.flatten().contiguous()
+            data = (t.view(torch.uint16) if t.dtype == torch.bfloat16 else t).numpy().tobytes()
+            assert len(data) >= size, f"buffer has {len(data)} B, asked to write {size} B"
         offset = 0
         while offset < size:
             chunk_size = min(self.DMA_CHUNK_BYTES, size - offset)
-            chunk = data[offset:offset + chunk_size] if isinstance(data, (bytes, bytearray)) \
-                else data.flatten()[offset:offset + chunk_size]
-            self._dma_write_retry(device, address + offset, chunk, chunk_size, attempts=attempts)
+            self._dma_write_retry(device, address + offset, data[offset:offset + chunk_size],
+                                  chunk_size, attempts=attempts)
             offset += chunk_size
         return size
 
@@ -3332,6 +4629,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             f"tensor_end=0x{tensor_end:X} prog_base=0x{prog_base:X} 4GB=0x{FOURGB:X} | "
             f"prog_crosses_4GB={prog_end > FOURGB} tensor_hits_prog={tensor_end > prog_base}")
         _original_print(f"  [{label}] compiled in {time.perf_counter()-t_compile0:.1f}s" + " " * 20)
+        self.dram_region_map(f"after compile {label}")
         self.start_execute_from_dram(prog_addr)
         self._wait_with_heartbeat(label, timeout=timeout)
         return prog_addr
@@ -3378,6 +4676,26 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         statically unrolled: 10 steps x 18 layers = 180 bodies, 1440 flash-attn jump
         sites), so a bin set is only valid for the exact config it was compiled under.
         """
+        # programs.json describes the PRIMARY's program allocator only. A multi-engine
+        # encoder also compiles one worker program per extra engine, into a separate
+        # scheduler-owned allocator arena that the bin format has no slot for -- a bin
+        # set dumped from such a run would execute engine0's half of the image and
+        # leave rows 128..255 as stale garbage. Refuse rather than dump it.
+        assert self._num_engines("VIS") == 1, (
+            f"dump_programs_to_file: vision engines={self._num_engines('VIS')} -- the bin "
+            f"format only carries the primary engine's programs, so a multi-engine "
+            f"encoder cannot be dumped. Re-run with --engines 1 to produce bins.")
+        _pre_sched = getattr(self, "_prefix_sched", None)
+        _dn_sched = getattr(self, "_denoise_sched", None)
+        assert _dn_sched is None or _dn_sched.num_engines == 1, (
+            f"dump_programs_to_file: denoise engines={_dn_sched.num_engines} -- the bin "
+            "format carries ONE program stream per stage and cannot express the worker "
+            "programs. Re-run with --engines 1 to produce a bin.")
+        assert _pre_sched is None or _pre_sched.num_engines == 1, (
+            f"dump_programs_to_file: prefix engines={_pre_sched.num_engines} -- same"
+            f"reason as the encoder above: the worker programs live in a scheduler-owned "
+            f"arena the bin format has no slot for, and a bin set dumped from a sharded "
+            f"prefix would run only the primary's row block. Re-run with --engines 1.")
         os.makedirs(bin_dir, exist_ok=True)
         bin_path = os.path.join(bin_dir, "programs.bin")
         meta_path = os.path.join(bin_dir, "programs.json")
@@ -3814,6 +5132,73 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
             "checkpoints are restored, not measured). Dump from a fresh compile run.")
 
 
+def _load_sample_images():
+    """The 3 LIBERO image slots: base camera, wrist camera, all-zero 3rd camera.
+
+    In-repo sample frames (physical-intelligence/libero dataset); the PNGs are
+    pixel-identical to the original .npy arrays. SINGLE source of truth -- both the
+    normal inference path and --encoderend call this, so --encoderend's timing is the
+    real encoder cost of one inference rather than a differently-built slot set.
+    The 3rd slot is all-zero on purpose: that is LIBERO's masked camera, and
+    SKIP_ZERO_VISION_SLOTS (default False) decides whether it is still encoded.
+    """
+    from PIL import Image
+    import torch.nn.functional as _F
+    sample_dir = Path(__file__).parent / "sample_data"
+
+    def _load_png(name):
+        return np.asarray(Image.open(sample_dir / name).convert("RGB"),
+                          dtype=np.float32) / 127.5 - 1.0
+
+    def _resize(a):
+        t = torch.from_numpy(a).permute(2, 0, 1).unsqueeze(0).float()
+        t = _F.interpolate(t, size=(224, 224), mode="bilinear", align_corners=False)
+        return t.squeeze(0).permute(1, 2, 0).numpy()
+
+    img = _load_png("sample_0_image.png")
+    wrist = _load_png("sample_0_wrist_image.png")
+    pad = np.zeros_like(img)
+    return [_resize(img), _resize(wrist), _resize(pad)]
+
+
+def _load_norm_stats():
+    """openpi's LIBERO norm_stats (state + actions quantiles). Shared by the
+    prompt-token builder (state discretization) and main's action unnormalize --
+    main used to read a `norm_stats` that only existed inside
+    _load_sample_prompt_tokens's scope, which NameError'd after a full run."""
+    return json.loads(
+        (Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"
+         / "assets" / "physical-intelligence" / "libero" / "norm_stats.json").read_text()
+    )["norm_stats"]
+
+
+def _load_sample_prompt_tokens():
+    """Real tokenization of the sample observation (matches openpi's
+    PaligemmaTokenizer.tokenize, Pi05 format -- the state is discretized INTO the
+    language prompt text, not fed as a separate continuous input):
+    "Task: {prompt}, State: {digitized state};\nAction: ", sentencepiece + BOS.
+
+    SINGLE source of truth, shared by the normal path and --prefixend, so the
+    prefix stage sees identical tokens in both (a random-token placeholder used to
+    live here and produced garbage language conditioning).
+    """
+    import sentencepiece
+    sample_dir = Path(__file__).parent / "sample_data"
+    norm_stats = _load_norm_stats()
+    meta = json.loads((sample_dir / "meta.json").read_text())
+    state = np.array(meta["state_example"], dtype=np.float32)
+    state_q01 = np.array(norm_stats["state"]["q01"], dtype=np.float32)
+    state_q99 = np.array(norm_stats["state"]["q99"], dtype=np.float32)
+    state_norm = np.clip((state - state_q01) / (state_q99 - state_q01 + 1e-6) * 2.0 - 1.0, -1.0, 1.0)
+    digitized_state = np.digitize(state_norm, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+    state_str = " ".join(map(str, digitized_state))
+    full_prompt = (f"Task: {_CFG['defaults'].get('prompt', 'pick up the object')}, "
+                   f"State: {state_str};\nAction: ")
+    sp = sentencepiece.SentencePieceProcessor(
+        model_file=str(Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model"))
+    return np.array(sp.encode(full_prompt, add_bos=True), dtype=np.int64)
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -3857,7 +5242,58 @@ def main():
                           "every slot is encoded (full 3-slot vision pass, matches the GPU). "
                           "Pass --skip-zero-vision-slots to skip the encoder for zero slots. "
                           "Attention masking is unaffected either way.")
+    ap.add_argument("--encoderend", action="store_true",
+                     help="Run ONLY the vision encoder, over ALL 3 image slots (the same "
+                          "slot set the real pipeline feeds through run_vision), and stop: "
+                          "no prefix, no denoise loop, no action output. Prints a "
+                          "format-identical ENC_ONLY summary block and dumps head_out to .npy "
+                          "so a --engines 1 run and a --engines 2 run can be "
+                          "diffed directly against each other.")
+    ap.add_argument("--encdump", default=None,
+                     help="--encoderend: PREFIX for the per-slot .npy dumps; each slot is "
+                          "written to <prefix>_slot<i>_<checkpoint>.npy (default prefix: "
+                          "models/pi05_libero/enc_only_ne<N>).")
+    ap.add_argument("--prefixend", action="store_true",
+                     help="Run the pipeline through the END OF THE PREFIX stage and stop: "
+                          "vision encoder, then the Gemma-2B prefix pass that builds the "
+                          "K/V cache, then stop. No action-expert denoise loop, no action "
+                          "output. Next rung of the same ladder as --encoderend. --engines N "
+                          "shards BOTH stages; the summary prints the per-stage engine "
+                          "counts and the prefix's 64-row block split.")
+    ap.add_argument("--prefixdump", default=None,
+                     help="--prefixend: path for the prefix K/V .npy dump (default: "
+                          "models/pi05_libero/prefix_end_ne<N>_kv.npy).")
+    ap.add_argument("--engines", type=int, default=1,
+                     help="Number of accelerator engines to row-shard across. DEFAULT 1 = "
+                          "the single-engine path, byte-identical to before; only an "
+                          "explicit --engines N>1 enables sharding. Applies to the vision "
+                          "encoder (M=256 -> N blocks of 256/N rows) AND the prefix LM "
+                          "(S rows -> N uneven-but-64-aligned block groups); the denoise "
+                          "stage will adopt the same knob. 2 is the device max.")
+    ap.add_argument("--cond-table-on-device", action=argparse.BooleanOptionalAction, default=True,
+                     help="Run the action-expert timestep-embedding MLP (2x 1024x1024 IF4 "
+                          "matmul + 2x composed SiLU) on the accelerator (default). "
+                          "--no-cond-table-on-device falls back to the host constant-fold.")
+    ap.add_argument("--check-cond-table", action="store_true",
+                     help="After the denoise run, read back the device-computed (N,1024) "
+                          "AdaRMSNorm conditioning table and report per-step + overall SNR "
+                          "against the exact host oracle.")
     args, _ = ap.parse_known_args()
+
+    Pi05Libero_UnifiedEngine.AE_COND_TABLE_ON_DEVICE = bool(args.cond_table_on_device)
+    Pi05Libero_UnifiedEngine.AE_COND_TABLE_CHECK = bool(args.check_cond_table)
+    if not args.cond_table_on_device:
+        print("[main] cond table: HOST constant-fold (on-device time-MLP disabled)")
+
+    assert not (args.encoderend and args.prefixend), (
+        "--encoderend and --prefixend are mutually exclusive: they are two different "
+        "stopping points on the same ladder (encoder -> prefix -> full). Pick one.")
+
+    Pi05Libero_UnifiedEngine.NUM_ENGINES = int(args.engines)
+    if args.engines > 1:
+        print(f"[main] NUM_ENGINES={args.engines} -- vision encoder AND prefix LM "
+              f"row-sharded (M) and the denoise gated MLP column-sharded (N) across "
+              f"{args.engines} engines (bins cannot be dumped in this mode)")
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
 
@@ -3896,7 +5332,9 @@ def main():
     # Bins are only usable for a full non-debug run: --debug/--sanity-check/--probe-step0
     # take paths that compile extra probe programs or skip prefix entirely, which would
     # desync the program allocator from the dumped layout.
-    _bin_ok = not (args.debug or args.sanity_check or args.probe_step0)
+    # ... and --engines>1 must COMPILE (the bins only hold engine0's encoder).
+    _bin_ok = not (args.debug or args.sanity_check or args.probe_step0
+                   or args.engines > 1 or args.encoderend or args.prefixend)
     bins_exist = _bin_ok and os.path.exists(os.path.join(BIN_DIR, "params.bin")) \
                           and os.path.exists(os.path.join(BIN_DIR, "programs.bin")) \
                           and os.path.exists(os.path.join(BIN_DIR, "programs.json"))
@@ -3913,6 +5351,21 @@ def main():
         # Must follow tensor_init: load_programs only touches the program allocator, but
         # keeping the order identical to the compile path keeps the two flows comparable.
         ue.load_programs()
+
+    # --- --encoderend: vision encoder A/B over ALL slots, nothing else -----------
+    if args.encoderend:
+        # EXACTLY the slot construction the normal path uses below (base camera,
+        # wrist camera, all-zero 3rd camera) so the total wall-clock is the real
+        # encoder cost of one inference. Do not invent a third image.
+        images = _load_sample_images()
+        ue.run_encoder_only(images, dump_prefix=args.encdump)
+        return
+
+    # --- --prefixend: encoder + prefix, then stop -----------------------------
+    if args.prefixend:
+        ue.run_prefix_end(_load_sample_images(), _load_sample_prompt_tokens(),
+                          dump_path=args.prefixdump)
+        return
 
     # Full end-to-end: vision -> prefix -> action-expert denoise loop.
     # Vision: confirmed hang-free (all 3 slots, 432 head-jumps).
@@ -3937,43 +5390,9 @@ def main():
     else:
         # In-repo sample frames (LIBERO base + wrist camera, physical-intelligence/libero
         # dataset). PNGs are pixel-identical to the original .npy arrays. Self-contained.
-        from PIL import Image
-        sample_dir = Path(__file__).parent / "sample_data"
-        def _load_png(name):
-            return np.asarray(Image.open(sample_dir / name).convert("RGB"), dtype=np.float32) / 127.5 - 1.0
-        img = _load_png("sample_0_image.png")
-        wrist = _load_png("sample_0_wrist_image.png")
-        pad = np.zeros_like(img)
-        import torch.nn.functional as _F
-        def _resize(a):
-            t = torch.from_numpy(a).permute(2, 0, 1).unsqueeze(0).float()
-            t = _F.interpolate(t, size=(224, 224), mode="bilinear", align_corners=False)
-            return t.squeeze(0).permute(1, 2, 0).numpy()
-        images = [_resize(img), _resize(wrist), _resize(pad)]
+        images = _load_sample_images()
 
-        # Real tokenization (matches openpi's PaligemmaTokenizer.tokenize, Pi05
-        # format -- state discretized into the language prompt text, NOT fed as a
-        # separate continuous input): "Task: {prompt}, State: {digitized state};\nAction: "
-        # tokenized with sentencepiece + BOS. Was a random-token placeholder before,
-        # which produced garbage language conditioning and a wildly out-of-range
-        # (+-2.4) output vs the real policy's near-[-1,1] result.
-        import sentencepiece
-        norm_stats = json.loads(
-            (Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"
-             / "assets" / "physical-intelligence" / "libero" / "norm_stats.json").read_text()
-        )["norm_stats"]
-        meta = json.loads((sample_dir / "meta.json").read_text())
-        state = np.array(meta["state_example"], dtype=np.float32)
-        state_q01 = np.array(norm_stats["state"]["q01"], dtype=np.float32)
-        state_q99 = np.array(norm_stats["state"]["q99"], dtype=np.float32)
-        state_norm = np.clip((state - state_q01) / (state_q99 - state_q01 + 1e-6) * 2.0 - 1.0, -1.0, 1.0)
-        digitized_state = np.digitize(state_norm, bins=np.linspace(-1, 1, 257)[:-1]) - 1
-        state_str = " ".join(map(str, digitized_state))
-        full_prompt = f"Task: {_CFG['defaults'].get('prompt', 'pick up the object')}, State: {state_str};\nAction: "
-
-        sp = sentencepiece.SentencePieceProcessor(
-            model_file=str(Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model"))
-        prompt_tokens = np.array(sp.encode(full_prompt, add_bos=True), dtype=np.int64)
+        prompt_tokens = _load_sample_prompt_tokens()
 
         actions = ue.run_inference(
             images, prompt_tokens, dump_prefix_path=PREFIX_KV_DUMP_PATH,
@@ -3987,9 +5406,15 @@ def main():
         # bin-backed run has nothing new to dump, and re-dumping would just read back
         # what it loaded). Everything the dump needs -- _prog_meta, prefix_bias_dram,
         # _ae_alloc_ckpt -- only exists after a real vision->prefix->denoise pass.
-        if not bins_exist:
+        # Multi-engine runs cannot be dumped (the bin format carries only the primary's
+        # programs -- dump_programs_to_file refuses). Skip rather than assert, so a
+        # successful --engines N inference does not exit non-zero after the fact.
+        if not bins_exist and ue._num_engines("VIS") == 1:
             print(f"\n[main] dumping pre-compiled bins to {BIN_DIR} ...")
             ue.dump_bins(BIN_DIR)
+        elif not bins_exist:
+            print("\n[main] skipping bin dump: multi-engine run "
+                  "(bins carry only the primary engine's programs). Use --engines 1.")
 
     if args.probe_step0:
         ue.verify_denoise_step0(PREFIX_KV_DUMP_PATH)
@@ -3998,6 +5423,7 @@ def main():
     if not args.debug:
         # Unnormalize to real robot action space (openpi Unnormalize transform:
         # (x+1)/2*(q99-q01)+q01) using the actions norm_stats -- the deployable output.
+        norm_stats = _load_norm_stats()
         act_q01 = np.array(norm_stats["actions"]["q01"], dtype=np.float32)
         act_q99 = np.array(norm_stats["actions"]["q99"], dtype=np.float32)
         actions_unnorm = (actions + 1.0) / 2.0 * (act_q99 - act_q01 + 1e-6) + act_q01
