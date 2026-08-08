@@ -1,4 +1,34 @@
+pi0.5 libero all performance metrics and unified engine throughput results.
+With setup, concise walkthrough.
+
+# Setup:
+
+Create a new environment:
+```
+python -m venv pi
+source ./pi/bin/activate
+```
+
+```
+pip install -r models/pi05_libero/pi_requirements.txt
+pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
+```
+Check:
+```
+printf 'N\n' | python -c "import sys; sys.path.insert(0,'~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero'); import libero.libero"
+```
+
+# Closed Loop Benchmark Modes
+
+
+
+
 # pi0.5 on the FPGA: closed-loop LIBERO benchmarking (draft)
+
+
+
+
+
 
 ## 1. Dependencies & Setup
 
@@ -11,6 +41,57 @@ load-bearing: `numpy<2`, without which `robosuite`/`gym==0.25.2` break — and i
 specifically what lets the simulator and the hardware DMA core share one interpreter.
 Model weights come from the upstream openpi JAX checkpoint (not HuggingFace), exported
 once to a 13GB bf16 tensor dump that the FPGA build compiles from.
+
+### Environment
+
+One merged pip env runs both the sim and the FPGA driver:
+
+```bash
+conda create -n pi05_libero python=3.11 -y && conda activate pi05_libero
+pip install -r models/pi05_libero/pi_requirements.txt
+
+# LIBERO itself is not on PyPI -- editable install from the openpi checkout:
+pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
+
+# one-time: seed LIBERO's config (answers its interactive first-run prompt)
+printf 'N\n' | python -c "import sys; sys.path.insert(0,'~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero'); import libero.libero"
+```
+
+Two pins in `pi_requirements.txt` are load-bearing and must not be "upgraded":
+
+- **`numpy<2`** — `robosuite`/`gym==0.25.2` break on numpy 2.x; this is what lets the
+  simulator and `user_dma_core` coexist in one interpreter.
+- **CPU `torch`** for the runtime env (the model runs on the FPGA, not the GPU). The
+  GPU reference path (`--verify-denoise`, and `libero_eval.py --backend torch`) needs
+  CUDA separately — on Blackwell (sm_120, e.g. RTX 5070) that means `torch==2.8.0+cu128`
+  from `https://download.pytorch.org/whl/cu128`; stock PyPI torch is CPU-only there and
+  silently reports `cuda=False`.
+
+Headless rendering needs EGL: `export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl`.
+
+Weight export is a one-time prep step, run in a separate env that has `openpi`/jax
+(kept out of the runtime env on purpose — jax-cuda12-plugin's nvidia-* wheels collide
+with the cu128 torch set):
+
+```bash
+/home/rohit/miniconda3/envs/pi05/bin/python models/pi05_libero/pi05_libero_export_weights.py \
+    --out pi05_libero_bin/weights_export_new
+```
+
+This pulls the checkpoint from `gs://openpi-assets/checkpoints/pi05_libero` and writes
+51 tensors (~13GB of `.npy` + `manifest.json`) that every backend loads from thereafter
+— `openpi` is never imported again after export.
+
+Verify the install:
+
+```bash
+MUJOCO_GL=egl python models/pi05_libero/libero_eval.py --backend torch --tasks 1 --trials 3
+# expect: 3/3 SUCCESS in ~36s, mp4s written to data/libero/videos/
+```
+
+Swapping the policy backend between CUDA and the FPGA accelerator is a single flag on
+`libero_eval.py` (`--backend torch` vs `--backend fpga`), so the same closed-loop
+episode can be replayed against either backend for direct comparison.
 
 ## 2. Model Architecture Walkthrough
 
