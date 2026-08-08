@@ -20,14 +20,16 @@
 #             BUT the pi05_torch_ref GPU reference (--verify-denoise, and
 #             libero_eval.py --backend torch) needs CUDA. On Blackwell (sm_120,
 #             e.g. RTX 5070) that means cu128 specifically: swap the index below
-#             to https://download.pytorch.org/whl/cu128 and pin torch==2.8.0+cu128.
+#             to https://download.pytorch.org/whl/cu128 and pin torch==2.7.1+cu128
+#             (must match openpi's torch==2.7.1 pin below, or you're back to
+#             this same resolution conflict).
 #             Stock PyPI torch is CPU-only there and silently gives cuda=False.
 
 # ---- unified-engine base (clone of ../../requirements.txt) ----
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.4
-torchvision>=0.23.0
-torchaudio>=2.4
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
 soundfile
 numpy<2
 transformers>=4.40.0
