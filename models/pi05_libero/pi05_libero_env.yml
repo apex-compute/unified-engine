@@ -1,0 +1,102 @@
+# Single conda env for pi05_libero: runs the FPGA model AND the LIBERO simulator in
+# ONE process -- no socket, no server/client. CPU-only; no CUDA device required.
+#
+#   conda env create -f pi05_libero_env.yml
+#   conda activate pi05_libero
+#   # one-time: answer LIBERO's interactive first-run config prompt with defaults
+#   printf 'N\n' | python -c "import libero.libero" >/dev/null 2>&1 || true
+#   python pi05_libero_test.py       # downloads + exports weights on first run
+#
+# Headless rendering (libero_eval.py only):
+#   export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
+#
+# -----------------------------------------------------------------------------
+# WHY THESE PINS -- all four are load-bearing, do not "upgrade" them casually:
+#
+#  numpy<2      robosuite/gym 0.25 break on numpy 2.x. This is what lets the sim and
+#               user_dma_core coexist in ONE interpreter. It also constrains the jax
+#               stack below, which is why those are pinned to openpi's own versions.
+#
+#  jax 0.5.3 +  Needed ONLY for the one-time weight export (orbax checkpoint ->
+#  orbax        weights_export/*.npy). This exact set is what upstream openpi pins,
+#  0.11.13      so it is known-good together AND known-good with numpy<2. CPU jax is
+#               correct here: the export just reads arrays off disk. ml-dtypes and
+#               tensorstore are openpi's own resolution overrides -- orbax is picky
+#               about both, so they are pinned rather than left to the resolver.
+#
+#  torch CPU    The model runs on the FPGA, not a GPU, so CPU torch is the right
+#               build. The pure-torch reference (pi05_torch_ref.py, --verify-denoise,
+#               libero_eval.py --backend torch) still works, just slowly. If you ever
+#               DO have a CUDA box, swap the index-url to the matching cuXXX and keep
+#               torch at 2.7.1 so nothing else in here has to move.
+#
+#  mesalib      Software OpenGL (OSMesa) for headless MuJoCo. EGL is the usual
+#               headless path but needs a GPU; with no GPU present, OSMesa is the
+#               one that works. Comes from conda, not pip.
+#
+# openpi is deliberately ABSENT. It is only ever needed for the one-time weight
+# export, and pi05_ckpt_noopenpi.py reproduces the only two things the export used
+# it for (a public-bucket download + an orbax restore) using the jax/orbax below.
+# That avoids openpi's jax[cuda12] + lerobot + wandb tree entirely. Nothing here
+# imports openpi; `openpi-client` below is a DIFFERENT, real package (the websocket
+# policy client) that libero_eval.py uses for `image_tools`.
+# -----------------------------------------------------------------------------
+
+name: pi05_libero
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip
+  # Headless software rendering for MuJoCo (no GPU -> OSMesa, not EGL).
+  - mesalib
+  - libglu
+
+  - pip:
+      # ---- unified-engine base (mirrors ../../requirements.txt, CPU wheels) ----
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch==2.7.1
+      - torchvision==0.22.1
+      - torchaudio==2.7.1
+      - soundfile
+      - numpy<2
+      - transformers>=4.40,<5
+      - huggingface-hub>=0.20.0
+      - pillow>=12.1.1
+      - sentencepiece
+
+      # ---- one-time weight export (openpi-free path) ----
+      - jax==0.5.3
+      - jaxlib==0.5.3
+      - flax==0.10.2
+      - orbax-checkpoint==0.11.13
+      - ml-dtypes==0.4.1
+      - tensorstore==0.1.74
+
+      # ---- LIBERO simulator (robosuite/mujoco) + runtime deps ----
+      - robosuite==1.4.1
+      - mujoco==3.2.3
+      - bddl==1.0.1
+      - gym==0.25.2
+      - opencv-python
+      - imageio
+      - imageio-ffmpeg
+      - tyro
+      - numba
+      - scipy
+      - easydict
+      - future
+      - matplotlib
+      - einops
+      - cloudpickle
+      - PyOpenGL
+      - openpi-client          # libero_eval.py: `from openpi_client import image_tools`
+
+      # LIBERO itself (scenes/BDDL/benchmark API) -- not on PyPI. Its setup.py has
+      # install_requires=[], so this pulls NO transitive deps and cannot fight the
+      # pins above. (Its requirements.txt asks for numpy==1.22.4 / robosuite==1.4.0 /
+      # transformers==4.21.1, but setup.py ignores that file -- and so do we, the
+      # same way openpi does.)
+      - libero @ git+https://github.com/Lifelong-Robot-Learning/LIBERO.git

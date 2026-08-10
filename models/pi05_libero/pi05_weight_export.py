@@ -36,6 +36,48 @@ def weights_export_dir(script_dir=None):
     return os.path.join(script_dir, _BIN_SUBDIR, "weights_export")
 
 
+# Kept in lockstep with pi05_libero_test.py -- see the docstrings there.
+_OPENPI_DATA_HOME = "OPENPI_DATA_HOME"
+_LEGACY_CKPT_CACHE = "~/.cache/openpi"
+
+
+def _ckpt_cache_root(script_dir=None):
+    """Root the raw upstream checkpoint into <model>_bin/ (nn_lib.ensure_hf_model
+    convention), instead of openpi's machine-global ~/.cache/openpi default."""
+    env = os.environ.get(_OPENPI_DATA_HOME)
+    if env:
+        return env
+    if script_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, _BIN_SUBDIR)
+
+
+def _ckpt_local_dir(script_dir=None):
+    """Where the checkpoint lands: <cache root>/<netloc>/<path>, openpi's own layout."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(_CFG["paths"]["openpi_checkpoint"])
+    return os.path.join(_ckpt_cache_root(script_dir), parsed.netloc, parsed.path.strip("/"))
+
+
+def _prepare_ckpt_cache(script_dir=None):
+    """Point openpi's cache at the bin dir, adopting any pre-existing ~/.cache copy."""
+    import shutil
+    import urllib.parse
+    root = _ckpt_cache_root(script_dir)
+    os.environ[_OPENPI_DATA_HOME] = root          # openpi reads this at call time
+    local = _ckpt_local_dir(script_dir)
+
+    if not os.path.exists(os.path.join(local, "params")):
+        parsed = urllib.parse.urlparse(_CFG["paths"]["openpi_checkpoint"])
+        legacy = os.path.join(os.path.expanduser(_LEGACY_CKPT_CACHE),
+                              parsed.netloc, parsed.path.strip("/"))
+        if os.path.exists(os.path.join(legacy, "params")):
+            print(f"[export] adopting existing checkpoint {legacy} -> {local}")
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            shutil.move(legacy, local)
+    return local
+
+
 def _weights_export_complete(wdir):
     """True iff wdir has a manifest.json and every .npy file it lists. Read-only."""
     manifest_path = os.path.join(wdir, "manifest.json")
@@ -52,29 +94,54 @@ def _weights_export_complete(wdir):
 
 
 _OPENPI_MISSING_MSG = """\
-pi05_libero needs the upstream openpi checkpoint to export its weights, but
-`openpi` is not importable in this environment.
+pi05_libero needs the upstream pi05 checkpoint to export its weights, and NEITHER
+source for it is usable here: `openpi` is not importable, and the openpi-free
+fallback (pi05_ckpt_noopenpi.py) could not load either.
 
-Install this model's dependencies:
+The fallback is the normal path and needs only jax + orbax-checkpoint + flax:
+    pip install "orbax-checkpoint" "flax" "jax"
+
+Installing openpi proper also works but is far heavier and NOT required:
     cd models/pi05_libero && pip install -r pi_requirements.txt
+(openpi is NOT on PyPI under that name -- the PyPI `openpi` is an empty 0.0.0
+placeholder -- so that file pulls the real one from git.)
 
-openpi is NOT on PyPI under that name -- the PyPI `openpi` package is an empty 0.0.0
-placeholder, so pi_requirements.txt pulls the real one from git.
-
-Then re-run: the export runs once (~13 GB, from the openpi checkpoint cached under
-~/.cache/openpi) and every later run detects it and skips the step.
+Then re-run: the export runs once (~13 GB, from the pi05 checkpoint cached under
+<model>_bin/) and every later run detects it and skips the step.
 
 Underlying import error: {err}
 """
 
+_FALLBACK_ANNOUNCED = False
+
 
 def _import_openpi():
+    """Return (maybe_download, restore_params) from openpi, else the openpi-free path.
+
+    See pi05_ckpt_noopenpi for why the fallback is exact: maybe_download is an
+    anonymous HTTPS pull of a PUBLIC GCS bucket into the same bin-dir cache
+    location, and restore_params is a plain orbax restore -- neither needs any of
+    openpi's model code, and the resulting export is byte-identical.
+    """
     try:
         from openpi.models.model import restore_params
         from openpi.shared.download import maybe_download
-    except ImportError as err:
-        raise ImportError(str(err)) from err
-    return maybe_download, restore_params
+        return maybe_download, restore_params
+    except ImportError as openpi_err:
+        import sys
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        try:
+            from pi05_ckpt_noopenpi import import_openpi_fallback
+        except ImportError as err:
+            raise ImportError(f"{openpi_err} (fallback unavailable too: {err})") from err
+        global _FALLBACK_ANNOUNCED
+        if not _FALLBACK_ANNOUNCED:      # called twice per export; say it once
+            _FALLBACK_ANNOUNCED = True
+            print(f"[export] openpi not importable ({openpi_err}) -- using the openpi-free "
+                  f"checkpoint path (anonymous GCS download + orbax restore)")
+        return import_openpi_fallback()
 
 
 def _flatten_params(tree, prefix=""):
@@ -102,8 +169,9 @@ def _restore_flat_params(cfg):
     """Resolve the checkpoint (downloading if needed) and return {name: np.ndarray}."""
     maybe_download, restore_params = _import_openpi()
     ckpt_url = cfg["paths"]["openpi_checkpoint"]
+    _prepare_ckpt_cache()                        # download into <model>_bin/, not ~/.cache
     print(f"[export] resolving checkpoint: {ckpt_url}")
-    ckpt_dir = maybe_download(ckpt_url)          # cached under ~/.cache/openpi, idempotent
+    ckpt_dir = maybe_download(ckpt_url)          # cached under the bin dir, idempotent
     params_path = Path(ckpt_dir) / "params"
     print(f"[export] restoring params from: {params_path}")
     params = restore_params(params_path, restore_type=np.ndarray)
@@ -157,7 +225,7 @@ def ensure_weights_export(script_dir=None):
         "\n              one-time weight download + export step."
         f"\n              target : {os.path.abspath(wdir)}"
         "\n              size   : ~13 GB on disk (plus the openpi checkpoint cached"
-        "\n                       under ~/.cache/openpi)"
+        "\n                       under pi05_libero_bin/)"
         "\n              This happens ONCE; later runs detect it and skip it."
         "\n" + "=" * 78 + "\n")
 

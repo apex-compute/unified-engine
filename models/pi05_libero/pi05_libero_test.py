@@ -70,6 +70,81 @@ def _weights_export_dir(script_dir=None):
     return os.path.join(script_dir, _BIN_SUBDIR, "weights_export")
 
 
+# openpi's own env override for its cache root. Pointing it at the model's bin dir is
+# what keeps the real-openpi path and the openpi-free path writing to the SAME place.
+_OPENPI_DATA_HOME = "OPENPI_DATA_HOME"
+_LEGACY_CKPT_CACHE = "~/.cache/openpi"
+
+
+def _ckpt_cache_root(script_dir=None):
+    """Root the raw upstream checkpoint downloads into <model>_bin/.
+
+    Model convention (nn_lib.ensure_hf_model): a model's upstream weights live under
+    its own ``<model>_bin/`` inside the model dir -- self-contained and deletable with
+    the model, never a machine-global cache. pi05 was the outlier here: openpi's
+    maybe_download defaults to ~/.cache/openpi. It honors OPENPI_DATA_HOME though, so
+    setting that to the bin dir fixes BOTH the real-openpi path and the openpi-free
+    one with a single mechanism (and an explicitly-set OPENPI_DATA_HOME still wins).
+    """
+    env = os.environ.get(_OPENPI_DATA_HOME)
+    if env:
+        return env
+    if script_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, _BIN_SUBDIR)
+
+
+def _ckpt_local_dir(script_dir=None):
+    """Where the checkpoint lands: <cache root>/<netloc>/<path>, openpi's own layout."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(_CFG["paths"]["openpi_checkpoint"])
+    return os.path.join(_ckpt_cache_root(script_dir), parsed.netloc, parsed.path.strip("/"))
+
+
+def ensure_tokenizer(script_dir=None):
+    """Lazily materialize the PaliGemma SentencePiece tokenizer; return its path.
+
+    Note this comes from a DIFFERENT bucket than the checkpoint
+    (gs://big_vision, also public), which is why the pi05 checkpoint download
+    alone never produces it -- openpi fetches it separately at tokenizer
+    construction. Same cache root as everything else, so it lands in <model>_bin/.
+    Idempotent and network-free once present (4 MB).
+    """
+    path = os.path.join(_ckpt_cache_root(script_dir),
+                        *_CFG["paths"]["paligemma_tokenizer"].split("//")[1].split("/"))
+    if os.path.exists(path):
+        return path
+    maybe_download, _ = _import_openpi()
+    _prepare_ckpt_cache(script_dir)
+    _original_print(f"[pi05_libero] fetching PaliGemma tokenizer -> {path}")
+    # openpi needs gs={"token": "anon"} for this bucket; the fallback is anonymous
+    # already and ignores the kwarg.
+    return str(maybe_download(_CFG["paths"]["paligemma_tokenizer"], gs={"token": "anon"}))
+
+
+def _prepare_ckpt_cache(script_dir=None):
+    """Point openpi's cache at the bin dir, adopting any pre-existing ~/.cache copy.
+
+    Returns the local checkpoint dir. The adopt step means an existing 12 GB download
+    is moved rather than re-fetched (a rename when both sit on one filesystem).
+    """
+    import shutil
+    root = _ckpt_cache_root(script_dir)
+    os.environ[_OPENPI_DATA_HOME] = root          # openpi reads this at call time
+    local = _ckpt_local_dir(script_dir)
+
+    if not os.path.exists(os.path.join(local, "params")):
+        import urllib.parse
+        parsed = urllib.parse.urlparse(_CFG["paths"]["openpi_checkpoint"])
+        legacy = os.path.join(os.path.expanduser(_LEGACY_CKPT_CACHE),
+                              parsed.netloc, parsed.path.strip("/"))
+        if os.path.exists(os.path.join(legacy, "params")):
+            _original_print(f"[export] adopting existing checkpoint {legacy} -> {local}")
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            shutil.move(legacy, local)
+    return local
+
+
 def _weights_export_complete(wdir):
     """True iff wdir has a manifest.json and every .npy file it lists. Read-only."""
     manifest_path = os.path.join(wdir, "manifest.json")
@@ -86,37 +161,64 @@ def _weights_export_complete(wdir):
 
 
 _OPENPI_MISSING_MSG = """\
-pi05_libero needs the upstream openpi checkpoint to export its weights, but
-`openpi` is not importable in this environment.
+pi05_libero needs the upstream pi05 checkpoint to export its weights, and NEITHER
+source for it is usable in this environment: `openpi` is not importable, and the
+openpi-free fallback (pi05_ckpt_noopenpi.py) could not load either.
 
-Install this model's dependencies:
+The fallback is the normal path and needs only jax + orbax-checkpoint + flax,
+which the engine env already has. So this almost always means one of those is
+missing or broken:
+    pip install "orbax-checkpoint" "flax" "jax"
+
+Installing openpi proper also works, but is far heavier and NOT required:
     cd models/pi05_libero && pip install -r pi_requirements.txt
+(openpi is not on PyPI under that name -- the PyPI `openpi` is an empty 0.0.0
+placeholder -- so that file pulls the real one from git.)
 
-That pi_requirements.txt is the merged env spec for pi05_libero (engine + openpi +
-libero/robosuite, numpy<2 pinned for all three). openpi is NOT on PyPI under that
-name -- the PyPI `openpi` package is an empty 0.0.0 placeholder, so pi_requirements.txt
-pulls the real one from git.
-
-Then re-run this script: the export runs once (~13 GB, from the openpi checkpoint
-cached under ~/.cache/openpi) and every later run detects it and skips the step.
+Either way, re-run this script: the export runs once (~13 GB, from the pi05
+checkpoint cached under <model>_bin/) and every later run detects the export
+and skips the step.
 
 Underlying import error: {err}
 """
 
+_FALLBACK_ANNOUNCED = False
+
 
 def _import_openpi():
-    """Import openpi, or raise ImportError carrying ONLY the raw cause.
+    """Return (maybe_download, restore_params), or raise ImportError with the raw cause.
 
-    openpi is needed exactly once (the weight export) and is NOT importable in a
-    plain runtime env unless pi_requirements.txt was installed -- it pulls the real
-    package from git, since PyPI's `openpi` is an empty 0.0.0 placeholder stub.
+    The checkpoint source is needed exactly once (the weight export) and never for
+    inference, which runs from params.bin on the FPGA. Two ways to get it:
+
+      1. openpi proper, if it happens to be installed (pi_requirements.txt pulls it
+         from git; PyPI's `openpi` is an empty 0.0.0 placeholder stub).
+      2. pi05_ckpt_noopenpi -- the default path. Both symbols the export needs turn
+         out to need none of openpi's model code: maybe_download is an anonymous
+         HTTPS pull of a PUBLIC GCS bucket into the same bin-dir cache path, and
+         restore_params is a plain orbax restore. Same cache, byte-identical export,
+         without openpi's jax[cuda12]/lerobot/wandb dependency tree.
     """
     try:
         from openpi.models.model import restore_params
         from openpi.shared.download import maybe_download
-    except ImportError as err:
-        raise ImportError(str(err)) from err
-    return maybe_download, restore_params
+        return maybe_download, restore_params
+    except ImportError as openpi_err:
+        # sys.path[0] is the script dir when run directly, but not when imported.
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
+        try:
+            from pi05_ckpt_noopenpi import import_openpi_fallback
+        except ImportError as err:
+            raise ImportError(f"{openpi_err} (fallback unavailable too: {err})") from err
+        global _FALLBACK_ANNOUNCED
+        if not _FALLBACK_ANNOUNCED:      # called twice per export; say it once
+            _FALLBACK_ANNOUNCED = True
+            _original_print(
+                f"[export] openpi not importable ({openpi_err}) -- using the openpi-free "
+                f"checkpoint path (pi05_ckpt_noopenpi: anonymous GCS download + orbax restore)")
+        return import_openpi_fallback()
 
 
 def _flatten_params(tree, prefix=""):
@@ -150,8 +252,9 @@ def _restore_flat_params(cfg):
     """Resolve the checkpoint (downloading if needed) and return {name: np.ndarray}."""
     maybe_download, restore_params = _import_openpi()
     ckpt_url = cfg["paths"]["openpi_checkpoint"]
+    _prepare_ckpt_cache()                        # download into <model>_bin/, not ~/.cache
     _original_print(f"[export] resolving checkpoint: {ckpt_url}")
-    ckpt_dir = maybe_download(ckpt_url)          # cached under ~/.cache/openpi, idempotent
+    ckpt_dir = maybe_download(ckpt_url)          # cached under the bin dir, idempotent
     params_path = Path(ckpt_dir) / "params"
     _original_print(f"[export] restoring params from: {params_path}")
     params = restore_params(params_path, restore_type=np.ndarray)
@@ -197,7 +300,7 @@ def ensure_weights_export(script_dir=None):
 
     No-op -- and provably read-only -- when the export is already complete: it only
     stats manifest.json and the files it lists. Otherwise it downloads the openpi
-    checkpoint (cached in ~/.cache/openpi, idempotent) and exports it.
+    checkpoint (cached in <model>_bin/, idempotent) and exports it.
     """
     wdir = _weights_export_dir(script_dir)
     complete, manifest = _weights_export_complete(wdir)
@@ -211,7 +314,7 @@ def ensure_weights_export(script_dir=None):
         "\n"
         f"\n              target : {os.path.abspath(wdir)}"
         "\n              size   : ~13 GB on disk (plus the openpi checkpoint cached"
-        "\n                       under ~/.cache/openpi)"
+        "\n                       under pi05_libero_bin/)"
         "\n              time   : expect this to take a while (download-bound)."
         "\n"
         "\n              This happens ONCE. Subsequent runs detect the export and skip it."
@@ -1390,6 +1493,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # vision-specific; a stage may still pin its own count by setting
     # <STAGE>_NUM_ENGINES (e.g. VIS_NUM_ENGINES) to a non-None value.
     NUM_ENGINES = 1
+
+    # What `--engines max` resolves to. These are CEILINGS SET BY THE ARCHITECTURE,
+    # not preferences, and each is a different limit:
+    #   VIS      4 -- HARD. Shards S=VIS_S=256 patch tokens PER IMAGE SLOT, which is
+    #                 exactly 4 blocks of 64, and split_rows asserts on 64-alignment.
+    #                 8 is impossible without batching the 3 slots into one 768-row
+    #                 pass, which would change the per-slot attention semantics.
+    #   PREFIX   8 -- device cap. S=832 is 13 blocks and 13 is prime, so 8 is uneven
+    #                 (5x128 + 3x64) at ~81% efficiency. Shorter prefixes degrade:
+    #                 S=576 is 56%, S=320 falls back to 1 engine (_prefix_num_engines).
+    #   DENOISE  8 -- device cap. M=64 is ONE row block so this is a COLUMN (N) split;
+    #                 the binding dim is o proj N=1024 = 16 blocks, comfortably >8.
+    STAGE_MAX_ENGINES = {"VIS": 4, "PREFIX": 8, "DENOISE": 8}
+
     VIS_NUM_ENGINES = None       # per-stage override; None -> NUM_ENGINES
     # The prefix LM is row-sharded too (projections / RMSNorms / MLP; RoPE, the
     # two permutes and attention stay on the primary), so it follows --engines.
@@ -1450,6 +1567,85 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     VIS_WORKER_ARENA_BYTES   = 0x03000000   # 48 MB
     VIS_WORKER_TENSOR_OFFSET = 0x00100000
     VIS_WORKER_PROGRAM_OFFSET = 0x01000000
+
+    # ---- MANY-ENGINE ARENA PROFILE (>4 engines, i.e. --pref_8) ----------------
+    # The arena is PER ENGINE and holds EVERY stage's worker program, so all of
+    # them are resident simultaneously -- the count is max(stage engine counts),
+    # not per stage. At 48 MB that is 7 * 48 = 336 MB for --pref_8, against only
+    # ~192 MB of free tensor DRAM (384 MB region, ~191 MB of model tensors), so
+    # the 48 MB layout simply cannot host 8 engines.
+    #
+    # It does not need to. The sizes quoted above are real: ~5.7 MB encoder +
+    # ~8-10 MB prefix worker program, i.e. ~16 MB of program room, and 48 MB was
+    # picked for headroom rather than need. Dropping to 24 MB (22 MB of program
+    # space above a 2 MB offset) still clears the measured requirement with ~35%
+    # spare and brings 7 arenas to 168 MB, which fits. Worker PER_ENGINE scratch
+    # is ~0.8 MB, so the 1 MB tensor window is untouched by this.
+    #
+    # If a worker program ever does outgrow it, _assert_worker_programs_fit fires
+    # at compile time with an exact byte count -- this trades unused headroom for
+    # a loud, early failure, never a silent one.
+    VIS_WORKER_PROGRAM_OFFSET_MANY = 0x00200000   #  2 MB (params 1 MB + tensor 1 MB)
+
+    # Tensor DRAM allocated AFTER the arenas, by tensor_init_action_expert
+    # (measured 44.97 MB). Reserved up front because the arenas are allocated at
+    # encoder-compile time, long before the action expert asks -- see
+    # _resolve_worker_arena_profile.
+    VIS_WORKER_AE_TENSOR_RESERVE = 0x03000000     # 48 MB
+    # Floor for the computed arena: 2 MB offset + 16 MB program space. A worker's
+    # encoder+prefix program measured 15.11 MB (5.48 + 9.64), so anything under
+    # this cannot hold both stages and would only fail later, deeper in.
+    VIS_WORKER_ARENA_BYTES_MIN   = 0x01200000     # 18 MB
+    # Cap for the computed multi-engine arena. 64 MB (62 MB of program space above
+    # the 2 MB offset) clears the worst case -- a worker carrying encoder + prefix
+    # + denoise, measured 5.48 + 9.64 + 22.44 = 37.55 MB. The old 48 MB arena could
+    # NOT: its 16 MB offset left only 32 MB, which --dns_8 overflows. On 4 GB DRAM
+    # the tensor region has ~1.8 GB spare, so 7 * 64 MB = 448 MB is not a constraint.
+    VIS_WORKER_ARENA_BYTES_MAX   = 0x04000000     # 64 MB
+
+    def _resolve_worker_arena_profile(self, workers):
+        """Size the per-engine arena for `workers` worker engines. Idempotent.
+
+        <=3 workers (--engines 4 and below) keeps the historical 48 MB layout
+        byte-for-byte; only 5+ engines resizes, so nothing that works today
+        changes shape.
+
+        THE ARENAS ARE NOT THE LAST TENSOR ALLOCATION. tensor_init_action_expert
+        runs AFTER the encoder/prefix compile and takes another ~45 MB, so sizing
+        against the free space that exists at arena-allocation time overcommits by
+        exactly that much -- and the failure does not surface here, it surfaces
+        later as a dram_region_map overlap between tensor(post-arena) and the
+        program region. Hence VIS_WORKER_AE_TENSOR_RESERVE: the arena gets what is
+        left AFTER the action expert is accounted for.
+
+        Sizing is computed, not tabulated, so it tracks the real cursor rather
+        than a constant that silently rots when model tensors change size.
+        """
+        # Resize for >3 workers, and ALSO whenever denoise is sharded at any count:
+        # the denoise program is 22.44 MB, so an all-three worker needs 37.55 MB and
+        # overflows the default layout's 32 MB of program space even at --engines 4.
+        if getattr(self, "_arena_profile_many", False):
+            return
+        if workers <= 3 and self._num_engines("DENOISE") <= 1:
+            return
+        self._arena_profile_many = True
+        avail = (self._program_dram_base - self._tensor_dram_addr
+                 - self.VIS_WORKER_AE_TENSOR_RESERVE)
+        per = (avail // workers) & ~0xFFFFF               # floor to a whole MB
+        per = min(per, self.VIS_WORKER_ARENA_BYTES_MAX)
+        assert per >= self.VIS_WORKER_ARENA_BYTES_MIN, (
+            f"cannot fit {workers} worker arenas: {avail / (1 << 20):.1f} MB available "
+            f"after reserving {self.VIS_WORKER_AE_TENSOR_RESERVE >> 20} MB for the action "
+            f"expert -> {per / (1 << 20):.1f} MB each, below the "
+            f"{self.VIS_WORKER_ARENA_BYTES_MIN >> 20} MB floor (a worker's encoder+prefix "
+            f"program is ~15.1 MB). Use fewer engines for this stage.")
+        self.VIS_WORKER_ARENA_BYTES = per
+        self.VIS_WORKER_PROGRAM_OFFSET = self.VIS_WORKER_PROGRAM_OFFSET_MANY
+        _original_print(
+            f"    [engines] {workers} workers -> arena sized to {per >> 20} MB each "
+            f"({(per - self.VIS_WORKER_PROGRAM_OFFSET) >> 20} MB program space); "
+            f"{workers} * {per >> 20} MB = {(workers * per) >> 20} MB of tensor DRAM, "
+            f"{self.VIS_WORKER_AE_TENSOR_RESERVE >> 20} MB reserved for the action expert")
 
     def _assert_worker_programs_fit(self, sched):
         """Both stages' worker programs share ONE arena; overflowing it would march
@@ -1518,15 +1714,51 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         return errs
 
     def _vis_worker_arena_base(self, num_engines):
-        """Allocate (once) the worker arenas and return the base of the first."""
-        if num_engines == 1:
+        """Allocate (once) the worker arenas and return the base of the first.
+
+        SIZED BY THE PEAK ENGINE COUNT ACROSS ALL STAGES, not this caller's.
+        The arena is allocated once, by whichever stage compiles first, and every
+        later caller gets that same base back. So with mixed per-stage counts
+        (--vis_4 --pref_8: vision compiles first at 4, prefix then wants 8) sizing
+        by the caller would allocate 3 arenas and then hand the prefix's workers
+        4..7 slot addresses past the end of the allocation -- straight into the
+        model's tensor DRAM. That is silent corruption, not a hang, and
+        _assert_worker_programs_fit does NOT catch it: it validates each worker's
+        program against its own slot, never that the slot was allocated.
+        """
+        peak = max([int(num_engines)]
+                   + [self._num_engines(s) for s in ("VIS", "PREFIX", "DENOISE")])
+        if peak <= 1:
+            return None
+        workers = peak - 1
+        self._resolve_worker_arena_profile(workers)
+        if num_engines == 1 and getattr(self, "_vis_worker_arena", None) is None:
+            # A single-engine stage needs no arena of its own, but must not
+            # pre-empt the sizing decision for a later multi-engine stage.
             return None
         if getattr(self, "_vis_worker_arena", None) is None:
+            need = workers * self.VIS_WORKER_ARENA_BYTES
+            # Reserve what tensor_init_action_expert will take LATER; the raw gap to
+            # the program base overstates what the arenas may actually consume.
+            free = (self._program_dram_base - self._tensor_dram_addr
+                    - self.VIS_WORKER_AE_TENSOR_RESERVE)
+            assert need <= free, (
+                f"worker arenas do not fit: {workers} worker(s) x "
+                f"{self.VIS_WORKER_ARENA_BYTES >> 20} MB = {need >> 20} MB needed, "
+                f"{free >> 20} MB usable (region 0x{self._tensor_dram_base:X}.."
+                f"0x{self._program_dram_base:X}, "
+                f"{(self._tensor_dram_addr - self._tensor_dram_base) >> 20} MB already used by "
+                f"model tensors, {self.VIS_WORKER_AE_TENSOR_RESERVE >> 20} MB reserved for the "
+                f"action expert). Lower the engine count for this stage.")
             self._vis_worker_arena = self.allocate_tensor_dram(
-                (num_engines - 1) * self.VIS_WORKER_ARENA_BYTES,
-                label="vis_worker_arena")
-            self._vis_worker_arena_count = num_engines - 1
-            self.dram_region_map(f"worker arenas x{num_engines - 1}")
+                need, label="vis_worker_arena")
+            self._vis_worker_arena_count = workers
+            self.dram_region_map(f"worker arenas x{workers}")
+        assert self._vis_worker_arena_count >= num_engines - 1, (
+            f"worker arena underflow: {num_engines - 1} worker(s) requested but only "
+            f"{self._vis_worker_arena_count} arena(s) allocated. The arena is sized "
+            f"from the peak stage engine count at first allocation; a stage raising "
+            f"its count afterwards is not supported.")
         return self._vis_worker_arena
 
     @contextlib.contextmanager
@@ -1583,7 +1815,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 worker_dram_base=worker_base,
                 worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
                 worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
-                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET)
+                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET,
+                # This board has more than the 2 engines multi_engine_shard's
+                # default guard assumes (that cap is per-device, and its assert
+                # text is written for the 2-engine board). The opt-in is explicit
+                # at the CLI: --engines N / --vis_4 / --pref_8 all name a count.
+                allow_more_than_two_engines=True)
 
         # --- PER_ENGINE: scratch a kernel WRITES, therefore must be duplicated ---
         zeros_n = max(H, I)
@@ -1650,7 +1887,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 worker_dram_base=worker_base,
                 worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
                 worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
-                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET)
+                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET,
+                # This board has more than the 2 engines multi_engine_shard's
+                # default guard assumes (that cap is per-device, and its assert
+                # text is written for the 2-engine board). The opt-in is explicit
+                # at the CLI: --engines N / --vis_4 / --pref_8 all name a count.
+                allow_more_than_two_engines=True)
 
     def _denoise_make_scheduler(self, num_engines):
         """Scheduler for the N-sharded denoise stage. REUSES the encoder/prefix one
@@ -1672,7 +1914,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 worker_dram_base=worker_base,
                 worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
                 worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
-                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET)
+                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET,
+                # This board has more than the 2 engines multi_engine_shard's
+                # default guard assumes (that cap is per-device, and its assert
+                # text is written for the 2-engine board). The opt-in is explicit
+                # at the CLI: --engines N / --vis_4 / --pref_8 all name a count.
+                allow_more_than_two_engines=True)
 
     def _execute_denoise(self, timeout=300.0):
         """EXECUTE the compiled denoise program, launching + joining the column-shard
@@ -2457,17 +2704,25 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         for r in range(rows):
             self.sram_to_accelerator_memory(0x00000, dst_dram + r * width * bpe, width)
 
-    def _ae_matmul(self, M, K, N, A, scale_addr, data_addr, OUT, bias_addr=None, gpr_M_reg=None, **kw):
+    def _ae_matmul(self, M, K, N, A, scale_addr, data_addr, OUT, bias_addr=None, gpr_M_reg=None,
+                   ue=None, **kw):
         """IF4 (q4_64) quantized matmul, per the quantization policy in
         weight_init_action_expert. Pass gpr_M_reg (primed with M via ADD_SET by
         the caller) to compile a compact PBI runtime loop instead of static-M
         unrolling -- required here because this body is itself repeated 180x
         (10 Euler steps x 18 layers); static-M was blowing the compiled program
         up to the point compilation didn't finish in 900s (see compile_prefix's
-        identical fix for the root-cause writeup)."""
-        self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=data_addr,
-                              OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
-                              SCALE_DRAM_ADDR=scale_addr, C_DRAM_ADDR=bias_addr, gpr_M_reg=gpr_M_reg, **kw)
+        identical fix for the root-cause writeup).
+
+        ``ue`` selects the EMITTING engine (head-sharded denoise attention block).
+        Defaults to the primary, so every existing call site is unchanged -- but a
+        sharded region MUST pass ctx.unsafe_ue or the op lands on the primary while
+        the workers idle, which looks like "sharding did nothing" rather than an
+        error."""
+        (ue or self).matmat_mul_core(
+            M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=data_addr,
+            OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=scale_addr, C_DRAM_ADDR=bias_addr, gpr_M_reg=gpr_M_reg, **kw)
 
     def _ae_ada_rms_norm(self, M, x_dram, dense_scale, dense_data, dense_bias,
                           norm_out_dram, gate_bcast_dram, apply_gate=True, gpr_M_reg=None):
@@ -2535,6 +2790,139 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # N-split (1024 -> 4096 becomes 1024 -> 2048 per engine), the GELU-multiply is
     # per-element and never leaves its lane, and `down` consumes the lane it is
     # already sitting in as a K-shard. Two rendezvous per layer.
+    def _ae_attn_shardable(self, sched):
+        """True iff the head-parallel attention block can run on this engine count.
+
+        The block partitions AE_HEADS=8 whole heads, so it needs ne | 8 (1/2/4/8).
+        Other counts (3, 5, 6, 7) keep the SERIAL attention path and shard only the
+        gated MLP -- degrade rather than assert, so --engines 6 still works exactly
+        as it did before this block existed.
+        """
+        return (sched is not None and sched.num_engines > 1
+                and self.AE_HEADS % sched.num_engines == 0)
+
+    def _ae_head_split(self, ne):
+        """Per-engine [first_head, head_count] over AE_HEADS. Requires ne | AE_HEADS.
+
+        The attention block is parallel over HEADS, not rows or columns of one
+        matmul: q/o weights are already stored per head (la["q_data"][h]), every
+        head's attention is independent (MQA -- they share one K/V), and there are
+        exactly AE_HEADS=8 of them, which is the device engine count. So the natural
+        unit here is the head, and the split must land on head boundaries.
+        """
+        NH = self.AE_HEADS
+        assert NH % ne == 0, (
+            f"denoise attention is HEAD-parallel: engines={ne} must divide "
+            f"AE_HEADS={NH} (use 1, 2, 4 or 8) so each engine owns whole heads")
+        per = NH // ne
+        return [(e * per, per) for e in range(ne)]
+
+    # ATTENTION ITSELF STAYS SINGLE-ENGINE -- ONLY THE PROJECTIONS SHARD.
+    #
+    # The two helpers below deliberately bracket ``unified_attention_core_dynamic``
+    # rather than swallowing it. Sharding the attention op itself was tried and
+    # backed out, for two independent reasons:
+    #
+    #   1. It is not the parallel win it looks like. The core's FIRST step is
+    #      bf16_transpose_core(M=aligned_seq_len, N=head_dim) on V -- sized by Tkv,
+    #      NOT by ``batch``. Splitting the batch across engines therefore leaves
+    #      every engine transposing the WHOLE V redundantly. At Tkv=896/D=256 that
+    #      transpose is ~117 MFLOP against ~59 MFLOP of actual per-engine score+
+    #      context work at batch=64: two thirds of each engine's attention becomes
+    #      duplicated overhead, and the stage gets SLOWER, not faster.
+    #   2. The attention marshalling is exactly the strided-copy class that
+    #      multi_engine_shard's docstring calls out as needing per-index
+    #      destination row offsets -- "attention marshalling stays single-engine
+    #      in v1". Debugging that is its own project.
+    #
+    # So: q/o projections are head-parallel, attention is serial on the primary in
+    # between them. Coverage is ~80% instead of ~97%, which is the right trade for
+    # not owning a sharded-attention bug.
+
+    def _ae_q_proj_sharded(self, sched, M, la, gpr_M_regs):
+        """HEAD-PARALLEL q projection + RoPE. Joins: the primary's attention reads
+        every head's Q.
+
+        q proj IS a column shard of the combined (H -> NH*D) projection, and each
+        256-column block is exactly one head -- an N-split whose blocks happen to be
+        head-aligned. The per-head weight blobs already exist
+        (weight_init_action_expert slices them), so unlike the mlp-down K-split
+        there is NOTHING to pre-slice on the host.
+
+        AE_Q_DRAM / AE_Q_ROPE_DRAM are indexed by head (h*M*D*bpe), so engines write
+        DISJOINT slices of the shared buffers -- no per-engine copies needed.
+        """
+        H, D, NH = self.AE_HIDDEN, self.HEAD_DIM, self.AE_HEADS
+        bpe = 2
+        heads = self._ae_head_split(sched.num_engines)
+
+        def _body(ctx):
+            i = ctx.engine_idx
+            h0, nh = heads[i]
+            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                f"head shard mismatch on engine {i}: scheduler gives "
+                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                f"{(h0 * D, nh * D)}")
+            raw, mreg = ctx.unsafe_ue, gpr_M_regs[i]
+            for h in range(h0, h0 + nh):
+                self._ae_matmul(M, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
+                                 self.AE_Q_DRAM + h * M * D * bpe, gpr_M_reg=mreg, ue=raw)
+                raw.rope_hf_core_dram(
+                    M=M, N=D,
+                    input_dram_addr=self.AE_Q_DRAM + h * M * D * bpe,
+                    output_dram_addr=self.AE_Q_ROPE_DRAM + h * M * D * bpe,
+                    cos_dram_addr=self.AE_ROPE_ADDR,
+                    sin_dram_addr=self.AE_ROPE_ADDR + self.ROPE_SIN_OFFSET,
+                    gpr_M_reg=mreg)
+
+        # join=True, and it is load-bearing: the very next op is the primary's
+        # attention over the FULL NH*M batch, which reads rows every worker wrote.
+        sched.col_sharded_region(NH * D, _body, join=True)
+
+    def _ae_o_proj_sharded(self, sched, M, la, gpr_M_regs, partial_name):
+        """HEAD-PARALLEL o projection + cross-engine reduction.
+
+        o proj is the reduction: head h contributes a FULL [M, H] term, summed over
+        heads. Serially that is the C_DRAM_ADDR accumulate chain; sharded, each
+        engine accumulates ITS heads into a private partial and reduce_add combines
+        them. Identical arithmetic, different association order (bf16 addition is
+        not associative, so expect small numeric deltas vs --engines 1, not
+        bit-identity).
+
+        The region's OPENING rendezvous is the RAW fence for AE_ATTN_OUT_DRAM, which
+        the primary just wrote in full and every engine now reads its heads from.
+        """
+        H, D, NH = self.AE_HIDDEN, self.HEAD_DIM, self.AE_HEADS
+        bpe = 2
+        ne = sched.num_engines
+        heads = self._ae_head_split(ne)
+
+        def _body(ctx):
+            i = ctx.engine_idx
+            h0, nh = heads[i]
+            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                f"head shard mismatch on engine {i}: scheduler gives "
+                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                f"{(h0 * D, nh * D)}")
+            raw, mreg = ctx.unsafe_ue, gpr_M_regs[i]
+            part = sched.per_engine_addr(partial_name, i)
+            # Same C_DRAM_ADDR chain as the serial path, over a subset of heads.
+            # First head WRITES (no bias), the rest accumulate with bias_mode
+            # full_matrix -- the (M,H) running sum is a MATRIX, not a broadcast row
+            # vector, and the default broadcast_N would add only row 0 to every row.
+            for j, h in enumerate(range(h0, h0 + nh)):
+                head_slice = self.AE_ATTN_OUT_DRAM + h * M * D * bpe
+                self._ae_matmul(M, D, H, head_slice, la["o_scale"][h], la["o_data"][h],
+                                 part, bias_addr=(part if j > 0 else None),
+                                 gpr_M_reg=mreg, ue=raw,
+                                 **({"bias_mode": "full_matrix"} if j > 0 else {}))
+
+        # join=False: reduce_add opens with its own rendezvous and the partials are
+        # meaningless until it runs, so joining here would just add a barrier.
+        sched.col_sharded_region(NH * D, _body, join=False)
+        sched.reduce_add([sched.per_engine_addr(partial_name, i) for i in range(ne)],
+                         self.AE_O_PROJ_DRAM, M, H, join=False)
+
     def _ae_gated_mlp_sharded(self, sched, M, x_dram, la, out_dram, gpr_M_regs, partial_name):
         H, I = self.AE_HIDDEN, self.AE_INTERMEDIATE
         ne = sched.num_engines
@@ -2858,7 +3246,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         #    RoPE per head: each head's block is already a plain (S, D) row-major
         #    tile, so the non-GQA core applies (the GQA variant expects the
         #    interleaved (S, heads*D) layout, which is NOT what this buffer is).
-        for h in range(self.AE_HEADS):
+        # HEAD-SHARDED q PROJECTION. Only the MATMULS shard -- the attention op in
+        # step 4 stays on the primary, same convention as the gated MLP and the
+        # vision encoder. See the note above _ae_q_proj_sharded for why attention
+        # is deliberately excluded.
+        _proj_sharded = self._ae_attn_shardable(sched)
+        if _proj_sharded:
+            self._ae_q_proj_sharded(sched, S, la, gpr_M_regs)
+        for h in range(self.AE_HEADS if not _proj_sharded else 0):
             self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
                              self.AE_Q_DRAM + h * S * D * 2, gpr_M_reg=gpr_M_reg)
             self.rope_hf_core_dram(
@@ -2879,6 +3274,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         #    (batch, Tkv) bias. Replaces the AE_HEADS per-head square-flash calls +
         #    all their per-head Q/out DMA. Dynamic (PBI) variant keeps the 180
         #    statically-unrolled bodies compact. q_scale=None -> 1/sqrt(head_dim).
+        # ALWAYS on the primary, sharded or not: the V transpose inside this core is
+        # sized by Tkv, not by batch, so splitting the batch just duplicates it on
+        # every engine. Unchanged from the single-engine path.
         self.unified_attention_core_dynamic(
             batch=self.AE_UATTN_BATCH, aligned_seq_len=Tkv, head_dim=D,
             Q_DRAM_ADDR=self.AE_Q_ROPE_DRAM, K_DRAM_ADDR=k_combined, V_DRAM_ADDR=v_combined,
@@ -2900,7 +3298,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         #    walked one row of (S,H) as four rows of (S,D): every row m>0 of every
         #    head read the WRONG head's columns. That un-stack step is also simply
         #    unnecessary -- nothing else consumes AE_ATTN_RESULT_DRAM.
-        for h in range(self.AE_HEADS):
+        if _proj_sharded:
+            self._ae_o_proj_sharded(sched, S, la, gpr_M_regs, "ae_o_proj_partial")
+        for h in range(self.AE_HEADS if not _proj_sharded else 0):
             head_slice = self.AE_ATTN_OUT_DRAM + h * S * D * 2
             # bias_mode MUST be "full_matrix": C here is the running (S,H) partial
             # sum, not a (1,H) bias vector. matmat_mul_core defaults to
@@ -3025,6 +3425,25 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # existing AE_MLP_DOWN_DRAM, so downstream code is untouched.
             sched.register_per_engine("ae_mlp_down_partial", self.AE_MLP_DOWN_DRAM, S * H * 2,
                                       init_tensor=torch.zeros(S * H, dtype=torch.bfloat16))
+            # ---- head-parallel attention block (q proj / attention / o proj) ----
+            if self._ae_attn_shardable(sched):
+                self._ae_head_split(ne)      # validate the split at compile entry,
+                                             # not 180 layer-bodies deep
+                # o-proj partials: a reduction does not partition its output, so each
+                # is a FULL [S, H]. The primary accumulates in place into the existing
+                # AE_O_PROJ_DRAM, leaving step 6 (the gated residual) untouched.
+                sched.register_per_engine("ae_o_proj_partial", self.AE_O_PROJ_DRAM, S * H * 2,
+                                          init_tensor=torch.zeros(S * H, dtype=torch.bfloat16))
+                # NOTE: no per-engine attention scratch. The attention op itself is
+                # NOT sharded -- only the q/o PROJECTIONS are -- so it keeps using
+                # the primary's full-batch AE_UATTN_SCRATCH_DRAM exactly as before.
+                print(f"    [denoise] head-parallel projections: {self.AE_HEADS} heads over "
+                      f"{ne} engine(s), {self.AE_HEADS // ne} head(s) each "
+                      f"(q proj + o proj; attention stays on the primary)")
+            else:
+                print(f"    [denoise] engines={ne} does not divide AE_HEADS="
+                      f"{self.AE_HEADS}; attention stays SERIAL, only the gated MLP is "
+                      f"sharded (~60% coverage). Use 2, 4 or 8 for the full ~97%.")
             self.dram_region_map(f"denoise sharded x{ne}")
             sched.begin_program()
 
@@ -5165,11 +5584,21 @@ def _load_norm_stats():
     """openpi's LIBERO norm_stats (state + actions quantiles). Shared by the
     prompt-token builder (state discretization) and main's action unnormalize --
     main used to read a `norm_stats` that only existed inside
-    _load_sample_prompt_tokens's scope, which NameError'd after a full run."""
-    return json.loads(
-        (Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"
-         / "assets" / "physical-intelligence" / "libero" / "norm_stats.json").read_text()
-    )["norm_stats"]
+    _load_sample_prompt_tokens's scope, which NameError'd after a full run.
+
+    Read from the checkpoint inside <model>_bin/ (the model convention). The legacy
+    ~/.cache/openpi location is still accepted so an existing machine keeps working
+    if only assets/ was left behind there."""
+    rel = Path("assets") / "physical-intelligence" / "libero" / "norm_stats.json"
+    candidates = [Path(_ckpt_local_dir()) / rel,
+                  Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints"
+                  / "pi05_libero" / rel]
+    for path in candidates:
+        if path.exists():
+            return json.loads(path.read_text())["norm_stats"]
+    raise FileNotFoundError(
+        "norm_stats.json not found. Looked in:\n  " + "\n  ".join(str(p) for p in candidates)
+        + "\nIt ships with the pi05 checkpoint -- re-run the export to fetch it.")
 
 
 def _load_sample_prompt_tokens():
@@ -5194,8 +5623,7 @@ def _load_sample_prompt_tokens():
     state_str = " ".join(map(str, digitized_state))
     full_prompt = (f"Task: {_CFG['defaults'].get('prompt', 'pick up the object')}, "
                    f"State: {state_str};\nAction: ")
-    sp = sentencepiece.SentencePieceProcessor(
-        model_file=str(Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model"))
+    sp = sentencepiece.SentencePieceProcessor(model_file=ensure_tokenizer())
     return np.array(sp.encode(full_prompt, add_bos=True), dtype=np.int64)
 
 
@@ -5263,13 +5691,64 @@ def main():
     ap.add_argument("--prefixdump", default=None,
                      help="--prefixend: path for the prefix K/V .npy dump (default: "
                           "models/pi05_libero/prefix_end_ne<N>_kv.npy).")
-    ap.add_argument("--engines", type=int, default=1,
+    def _engines_arg(value):
+        """--engines N | max.  'max' == each stage's own ceiling, not a flat 8."""
+        if str(value).strip().lower() == "max":
+            return "max"
+        try:
+            n = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--engines takes an integer 1-8 or 'max', got {value!r}")
+        if not 1 <= n <= 8:
+            raise argparse.ArgumentTypeError(
+                f"--engines must be 1-8 (the ISA's flag-check addresses engines 0-7), "
+                f"got {n}")
+        return n
+
+    ap.add_argument("--engines", type=_engines_arg, default=1, metavar="N|max",
                      help="Number of accelerator engines to row-shard across. DEFAULT 1 = "
                           "the single-engine path, byte-identical to before; only an "
                           "explicit --engines N>1 enables sharding. Applies to the vision "
                           "encoder (M=256 -> N blocks of 256/N rows) AND the prefix LM "
                           "(S rows -> N uneven-but-64-aligned block groups); the denoise "
-                          "stage will adopt the same knob. 2 is the device max.")
+                          "stage will adopt the same knob. 8 is the device max (the ISA's "
+                          "flag-check addresses engine 0-7).\n"
+                          "--engines max applies EACH STAGE'S OWN CEILING rather than one "
+                          "number: vision 4, prefix 8, denoise 8 (STAGE_MAX_ENGINES). A flat "
+                          "--engines 8 is NOT the same thing and is wrong for vision, which "
+                          "asserts above 4 -- S=256/slot is only 4 blocks of 64. This is the "
+                          "recommended way to run fully sharded; it is exactly equivalent to "
+                          "--vis_4 --pref_8 --dns_8. Those three still exist for isolating one "
+                          "stage at a time (e.g. --vis_4 alone gives a single-engine prefix "
+                          "baseline) and take precedence over this flag.")
+    ap.add_argument("--pref_8", action="store_true",
+                     help="Row-shard the PREFIX LM across 8 engines (PREFIX_NUM_ENGINES=8), "
+                          "independently of --engines. The prefix is ~73%% of total FLOPs, so "
+                          "it is where engine count pays. S=832 (3 image slots) is 13 blocks "
+                          "of 64 rows and 13 is prime, so the split is uneven -- 5 engines get "
+                          "128 rows, 3 get 64 -> 81%% efficiency, ~6.4x. NOTE the shorter "
+                          "prefixes: S=576 is only 56%% efficient and S=320 (5 blocks) cannot "
+                          "be split 8 ways at all and falls back to a single engine "
+                          "(_prefix_num_engines). Forces the 24 MB worker-arena profile.")
+    ap.add_argument("--dns_8", action="store_true",
+                     help="COLUMN-shard (N) the DENOISE stage across 8 engines "
+                          "(DENOISE_NUM_ENGINES=8), independently of --engines. Denoise is "
+                          "M=AE_ACTION_HORIZON_PADDED=64 -- ONE 64-row block at every op -- so "
+                          "it cannot be row-sharded at any count; the fat OUTPUT dims are split "
+                          "instead: mlp gate/up 4096->512, adaRMS 3072->384, q 2048->256 "
+                          "(exactly one head per engine), o 1024->128. k/v proj (N=256, 4 "
+                          "blocks) stays unsharded, and mlp down is K-fat (4096->1024) so it "
+                          "goes through split_k + reduce_add -- 7 serialized adds and two "
+                          "rendezvous per layer per step. Must be set before weight_init: the "
+                          "K-sliced mlp-down blobs are built there for THIS engine count.")
+    ap.add_argument("--vis_4", action="store_true",
+                     help="Row-shard the VISION encoder across 4 engines "
+                          "(VIS_NUM_ENGINES=4), independently of --engines. 4 is the HARD "
+                          "maximum for this stage: it shards S=VIS_S=256 patch tokens PER "
+                          "IMAGE SLOT, which is exactly 4 blocks of 64, so 64-row alignment "
+                          "makes 8 impossible (split_rows asserts). At 4 it is a perfect even "
+                          "split -- 64 rows each, 100%% balanced.")
     ap.add_argument("--cond-table-on-device", action=argparse.BooleanOptionalAction, default=True,
                      help="Run the action-expert timestep-embedding MLP (2x 1024x1024 IF4 "
                           "matmul + 2x composed SiLU) on the accelerator (default). "
@@ -5278,7 +5757,12 @@ def main():
                      help="After the denoise run, read back the device-computed (N,1024) "
                           "AdaRMSNorm conditioning table and report per-step + overall SNR "
                           "against the exact host oracle.")
-    args, _ = ap.parse_known_args()
+    # parse_known_args (not parse_args) because libero_eval.py imports this module and
+    # passes its own flags through. That tolerance silently swallows TYPOS too --
+    # `--pref_9` parsed fine and did nothing -- so say what was dropped.
+    args, _unknown = ap.parse_known_args()
+    if _unknown:
+        print(f"[main] WARNING: ignoring unrecognized argument(s): {' '.join(_unknown)}")
 
     Pi05Libero_UnifiedEngine.AE_COND_TABLE_ON_DEVICE = bool(args.cond_table_on_device)
     Pi05Libero_UnifiedEngine.AE_COND_TABLE_CHECK = bool(args.check_cond_table)
@@ -5289,11 +5773,52 @@ def main():
         "--encoderend and --prefixend are mutually exclusive: they are two different "
         "stopping points on the same ladder (encoder -> prefix -> full). Pick one.")
 
-    Pi05Libero_UnifiedEngine.NUM_ENGINES = int(args.engines)
-    if args.engines > 1:
-        print(f"[main] NUM_ENGINES={args.engines} -- vision encoder AND prefix LM "
-              f"row-sharded (M) and the denoise gated MLP column-sharded (N) across "
-              f"{args.engines} engines (bins cannot be dumped in this mode)")
+    # --engines is either an int or the literal "max"; normalize ONCE here so no
+    # downstream comparison has to know which it got.
+    _eng_max = (args.engines == "max")
+    _eng_n = max(Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.values()) if _eng_max \
+        else int(args.engines)
+    _multi = _eng_max or _eng_n > 1
+
+    if _eng_max:
+        # Per-stage ceilings, NOT a flat 8: vision asserts above 4. Applied as the
+        # same <STAGE>_NUM_ENGINES overrides --vis_4/--pref_8/--dns_8 use, so the
+        # explicit flags below can still override any single stage.
+        for _stage, _n in Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.items():
+            setattr(Pi05Libero_UnifiedEngine, f"{_stage}_NUM_ENGINES", _n)
+        Pi05Libero_UnifiedEngine.NUM_ENGINES = _eng_n
+        print("[main] --engines max: per-stage ceilings -- "
+              + ", ".join(f"{s.lower()}={n}"
+                          for s, n in Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.items())
+              + " (vision caps at 4: S=256/slot is only 4 blocks of 64)")
+    else:
+        Pi05Libero_UnifiedEngine.NUM_ENGINES = _eng_n
+        if _eng_n > 1:
+            print(f"[main] NUM_ENGINES={_eng_n} -- vision encoder AND prefix LM "
+                  f"row-sharded (M) and the denoise gated MLP column-sharded (N) across "
+                  f"{_eng_n} engines (bins cannot be dumped in this mode)")
+
+    # Per-stage engine overrides. These set <STAGE>_NUM_ENGINES, which
+    # _num_engines() prefers over NUM_ENGINES, so they compose with --engines and
+    # with each other: `--vis_4 --pref_8` runs vision on 4 and the prefix on 8
+    # while denoise stays on --engines. Sharding a stage is not free in DRAM --
+    # see _vis_worker_arena_base, which sizes ONE arena set from the PEAK count.
+    if args.vis_4:
+        Pi05Libero_UnifiedEngine.VIS_NUM_ENGINES = 4
+        print("[main] --vis_4: vision encoder row-sharded across 4 engines "
+              "(S=256/slot = 4 blocks of 64 -> perfect even split; 4 is this stage's max)")
+    if args.pref_8:
+        Pi05Libero_UnifiedEngine.PREFIX_NUM_ENGINES = 8
+        print("[main] --pref_8: prefix LM row-sharded across 8 engines "
+              "(S=832 -> 13 blocks of 64, uneven 5x128 + 3x64, ~81% efficient; "
+              "shorter prefixes degrade or fall back -- see _prefix_num_engines)")
+    if args.dns_8:
+        Pi05Libero_UnifiedEngine.DENOISE_NUM_ENGINES = 8
+        print("[main] --dns_8: denoise stage column-sharded (N) across 8 engines "
+              "(M=64 is one row block -> row-sharding impossible; mlp down uses "
+              "split_k + reduce_add)")
+    if _multi or args.vis_4 or args.pref_8 or args.dns_8:
+        print("[main] multi-engine: bins cannot be dumped in this mode")
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
 
@@ -5333,8 +5858,14 @@ def main():
     # take paths that compile extra probe programs or skip prefix entirely, which would
     # desync the program allocator from the dumped layout.
     # ... and --engines>1 must COMPILE (the bins only hold engine0's encoder).
+    # --vis_4/--pref_8 must invalidate the bins for the same reason --engines>1 does:
+    # the bins hold ONLY engine0's single-engine programs, so replaying them would
+    # run the unsharded model while printing that sharding is on -- the flags would
+    # silently do nothing. Any knob that changes the compiled program must be listed
+    # here, or it is quietly ignored whenever a bin set happens to be present.
     _bin_ok = not (args.debug or args.sanity_check or args.probe_step0
-                   or args.engines > 1 or args.encoderend or args.prefixend)
+                   or _multi or args.vis_4 or args.pref_8 or args.dns_8
+                   or args.encoderend or args.prefixend)
     bins_exist = _bin_ok and os.path.exists(os.path.join(BIN_DIR, "params.bin")) \
                           and os.path.exists(os.path.join(BIN_DIR, "programs.bin")) \
                           and os.path.exists(os.path.join(BIN_DIR, "programs.json"))
