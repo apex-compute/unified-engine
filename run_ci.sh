@@ -13,12 +13,6 @@
 #                                  # "start completely clean" run)
 #   ./run_ci.sh --only gpt2 swin  # restrict the model round to these names
 #   ./run_ci.sh --clean-bins --only gpt2 swin
-#   ./run_ci.sh --skip-hw-test --only swin
-#                                  # skip the generic HW op round and go straight
-#                                  # to the model(s) — for fast single-model
-#                                  # iteration only, never for a merge gate
-#
-# --only must come last (it consumes the rest of the argv).
 
 set -uo pipefail
 
@@ -26,20 +20,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 CLEAN_BINS=0
-SKIP_HW_TEST=0
-ONLY_ARGS=()
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --clean-bins)   CLEAN_BINS=1; shift ;;
-        --skip-hw-test) SKIP_HW_TEST=1; shift ;;
-        --only)         shift; ONLY_ARGS=(--only "$@"); break ;;
-        *) echo "!!! unknown argument: $1" >&2; exit 2 ;;
-    esac
-done
+if [[ "${1:-}" == "--clean-bins" ]]; then
+    CLEAN_BINS=1
+    shift
+fi
 
-STEP_TOTAL=1
-[[ $CLEAN_BINS -eq 1 ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
-[[ $SKIP_HW_TEST -eq 0 ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
+ONLY_ARGS=()
+if [[ "${1:-}" == "--only" ]]; then
+    shift
+    ONLY_ARGS=(--only "$@")
+fi
+
+STEP_TOTAL=2
+[[ $CLEAN_BINS -eq 1 ]] && STEP_TOTAL=3
 STEP=1
 
 if [[ $CLEAN_BINS -eq 1 ]]; then
@@ -55,19 +48,15 @@ if [[ $CLEAN_BINS -eq 1 ]]; then
     echo
 fi
 
-if [[ $SKIP_HW_TEST -eq 1 ]]; then
-    echo "### --skip-hw-test: skipping user_hw_test.py (generic hardware op tests)"
-else
-    echo "############################################################"
-    echo "# $STEP/$STEP_TOTAL  user_hw_test.py — generic hardware op tests"
-    echo "############################################################"
-    python user_hw_test.py
-    if [[ $? -ne 0 ]]; then
-        echo "!!! user_hw_test.py failed — stopping before any model is run."
-        exit 1
-    fi
-    STEP=$((STEP + 1))
+echo "############################################################"
+echo "# $STEP/$STEP_TOTAL  user_hw_test.py — generic hardware op tests"
+echo "############################################################"
+python user_hw_test.py
+if [[ $? -ne 0 ]]; then
+    echo "!!! user_hw_test.py failed — stopping before any model is run."
+    exit 1
 fi
+STEP=$((STEP + 1))
 
 echo
 echo "############################################################"

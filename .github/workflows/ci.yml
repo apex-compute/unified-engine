@@ -1,13 +1,8 @@
 name: Model HW CI
 
-# Runs the local CI suite (run_ci.sh): generic hardware op tests, then a
-# default set of model cases. A manual full-run checkbox runs every registered
-# model instead.
-#
-# TEMPORARY (swin bring-up branch): the automatic push/PR default is
-# swin-only with the generic HW round skipped, so pushes to this branch get a
-# fast signal. Revert DEFAULT_ONLY_MODELS / DEFAULT_SKIP_HW_TEST below to
-# "gemma4_e2b gemma4_e2b_run_from_bin" / "false" before merging to main.
+# Runs the local CI suite (run_ci.sh): generic hardware op tests, then the two
+# Gemma4 E2B image cases by default. A manual full-run checkbox runs every
+# registered model instead.
 # Models compile from scratch and run from their cached bins, with DRAM randomized
 # (poisoned) before every single pass. Stops on first failure.
 # Requires the FPGA device, so this must run on a self-hosted runner with the
@@ -23,16 +18,6 @@ on:
         default: false
       full_run:
         description: "Run the full model_auto_test.py registry instead of the two Gemma4 E2B image cases"
-        required: false
-        type: boolean
-        default: false
-      only_models:
-        description: "Space-separated model_auto_test.py names to run. Blank uses the branch default (swin). Ignored when full_run is checked."
-        required: false
-        type: string
-        default: ""
-      skip_hw_test:
-        description: "Skip the generic user_hw_test.py round and go straight to the model tests (fast iteration only — not a merge gate)"
         required: false
         type: boolean
         default: false
@@ -84,28 +69,16 @@ jobs:
       - name: Run CI suite
         id: ci
         run: |
-          # TEMPORARY branch defaults — used on push/pull_request, where the
-          # workflow_dispatch inputs are empty. Restore to
-          # "gemma4_e2b gemma4_e2b_run_from_bin" / "false" before merging.
-          DEFAULT_ONLY_MODELS="swin"
-          DEFAULT_SKIP_HW_TEST="true"
-
           ARGS=()
           if [[ "${{ inputs.clean_bins }}" == "true" ]]; then
             ARGS+=(--clean-bins)
           fi
-          SKIP_HW="${{ inputs.skip_hw_test }}"
-          [[ -z "$SKIP_HW" ]] && SKIP_HW="$DEFAULT_SKIP_HW_TEST"
-          if [[ "$SKIP_HW" == "true" ]]; then
-            ARGS+=(--skip-hw-test)
-          fi
-          # --only consumes the rest of run_ci.sh's argv, so it must come last.
           if [[ "${{ inputs.full_run }}" != "true" ]]; then
-            ONLY="${{ inputs.only_models }}"
-            [[ -z "$ONLY" ]] && ONLY="$DEFAULT_ONLY_MODELS"
-            ARGS+=(--only $ONLY)
+            # Keep both cases in one model_auto_test.py invocation. The first
+            # run creates/loads programs.bin; no clean or bin removal occurs
+            # before the run-from-bin Vette case.
+            ARGS+=(--only gemma4_e2b gemma4_e2b_run_from_bin)
           fi
-          echo "run_ci.sh ${ARGS[*]}"
           ./run_ci.sh "${ARGS[@]}"
 
       - name: Upload result artifacts
@@ -205,11 +178,9 @@ jobs:
               : ciOutcome === 'failure'
                 ? '❌ FAILED'
                 : `⚠️ ${ciOutcome.toUpperCase()}`;
-            // Keep in sync with DEFAULT_ONLY_MODELS in the "Run CI suite" step.
-            const onlyModels = (`${{ inputs.only_models }}`.trim() || 'swin');
             const modelScope = fullRun
               ? 'all registered models'
-              : onlyModels.split(/\s+/).join(' + ');
+              : 'gemma4_e2b + gemma4_e2b_run_from_bin';
             const comment = [
               '**Unified Engine HW CI Report**',
               `- **Status:** ${status}`,
