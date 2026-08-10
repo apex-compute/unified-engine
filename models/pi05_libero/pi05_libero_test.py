@@ -1633,6 +1633,30 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                  - self.VIS_WORKER_AE_TENSOR_RESERVE)
         per = (avail // workers) & ~0xFFFFF               # floor to a whole MB
         per = min(per, self.VIS_WORKER_ARENA_BYTES_MAX)
+        # Worker programs now ACCUMULATE across stages (one shared allocator per
+        # engine), so the arena must hold every sharded stage's worker program at
+        # once. Measured on this model: encoder 5.48 MB, prefix 9.64 MB, denoise
+        # 12.15 MB. Check it HERE, where the fix is "drop a flag", rather than
+        # letting _assert_worker_programs_fit fire mid-compile.
+        # WORKER program sizes, which are NOT the primary's. Vision and prefix are
+        # ROW-sharded: a worker runs the same op sequence over fewer rows, so its
+        # program tracks the primary's (5.48 / 9.64 MB measured). Denoise is
+        # COLUMN/head-sharded: a worker only carries the sharded REGIONS (q proj,
+        # o proj, gated MLP) -- not attention, adaRMS, or the eltwise residuals --
+        # so it is a small fraction of the primary's 12.15 MB. Estimated, and
+        # _assert_worker_programs_fit is the exact check at compile time.
+        est = {"VIS": 6 << 20, "PREFIX": 10 << 20, "DENOISE": 4 << 20}
+        sharded = [s for s in ("VIS", "PREFIX", "DENOISE") if self._num_engines(s) > 1]
+        need = self.VIS_WORKER_PROGRAM_OFFSET + sum(est[s] for s in sharded)
+        assert per >= need, (
+            f"worker arena too small for the sharded stages: {per / (1 << 20):.0f} MB "
+            f"available per engine, ~{need / (1 << 20):.0f} MB needed "
+            f"({' + '.join(s.lower() for s in sharded)} worker programs share ONE "
+            f"allocator per engine, plus a "
+            f"{self.VIS_WORKER_PROGRAM_OFFSET >> 20} MB params/tensor window). "
+            f"{workers} arenas x {need / (1 << 20):.0f} MB exceeds the "
+            f"{avail / (1 << 20):.0f} MB of tensor DRAM left after the action-expert "
+            f"reserve. Drop a stage: --vis_4 --pref_8 (without --dns_8) fits.")
         assert per >= self.VIS_WORKER_ARENA_BYTES_MIN, (
             f"cannot fit {workers} worker arenas: {avail / (1 << 20):.1f} MB available "
             f"after reserving {self.VIS_WORKER_AE_TENSOR_RESERVE >> 20} MB for the action "
@@ -1761,6 +1785,81 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             f"its count afterwards is not supported.")
         return self._vis_worker_arena
 
+    def _worker_engine_pool(self, num_engines):
+        """The run's ONE set of worker UnifiedEngines, indices 1..peak-1.
+
+        Built once, for the PEAK stage engine count, and handed to every
+        scheduler. The allocators live inside these objects, so sharing them is
+        what keeps each stage's worker programs landing AFTER the previous
+        stage's instead of on top of it -- see the long note at
+        MultiEngineScheduler's ``workers`` parameter for the failure mode
+        (stage 2 overwrites stage 1's program, stage 1's next launch desyncs the
+        barrier, engines spin forever).
+
+        Construction is guarded: UnifiedEngine.__init__ runs a DRAM self-test
+        that writes 16 KB at DRAM_START_ADDR == the head of the weight blob.
+        """
+        from user_dma_core import UnifiedEngine
+
+        pool = getattr(self, "_worker_pool", None)
+        peak = max([int(num_engines)]
+                   + [self._num_engines(s) for s in ("VIS", "PREFIX", "DENOISE")])
+        if pool is not None:
+            assert len(pool) >= num_engines - 1, (
+                f"worker pool holds {len(pool)} engine(s) but {num_engines - 1} are "
+                f"needed; the pool is sized from the peak stage count at first use, "
+                f"so a stage raising its count afterwards is not supported.")
+            return pool
+        if peak <= 1:
+            return []
+
+        base0 = self._vis_worker_arena_base(peak)
+        stride = self.VIS_WORKER_ARENA_BYTES
+        pool = []
+        with self._vis_dram_selftest_guard(peak):
+            for i in range(1, peak):
+                base = base0 + (i - 1) * stride
+                pool.append(UnifiedEngine(
+                    BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * 0x00010000,
+                    params_dram_base=base,
+                    tensor_dram_base=base + self.VIS_WORKER_TENSOR_OFFSET,
+                    program_dram_base=base + self.VIS_WORKER_PROGRAM_OFFSET,
+                ))
+        self._worker_pool = pool
+        _original_print(f"    [engines] worker pool: {len(pool)} shared engine(s) "
+                        f"(one allocator each, reused by every stage)")
+        return pool
+
+    def _make_stage_scheduler(self, num_engines):
+        """Scheduler for ANY stage, over the shared worker pool.
+
+        Reuses an existing scheduler with the same engine count -- including one
+        built for a DIFFERENT stage, which the old per-stage helpers did not do:
+        _denoise_make_scheduler only ever compared against _vis_sched, so with
+        vis=4/prefix=8/denoise=8 the denoise stage built a THIRD scheduler and
+        overwrote prefix's worker programs even though prefix's was identical.
+        """
+        from multi_engine_shard import MultiEngineScheduler
+
+        if num_engines <= 1:
+            return None
+        cache = self.__dict__.setdefault("_sched_by_ne", {})
+        if num_engines in cache:
+            return cache[num_engines]
+        sched = MultiEngineScheduler(
+            self, num_engines=num_engines,
+            worker_dram_base=self._vis_worker_arena_base(num_engines),
+            worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
+            worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
+            worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET,
+            # This board has more than the 2 engines multi_engine_shard's default
+            # guard assumes; the opt-in is explicit at the CLI (--engines/--vis_4/
+            # --pref_8/--dns_8 all name a count).
+            allow_more_than_two_engines=True,
+            workers=self._worker_engine_pool(num_engines))
+        cache[num_engines] = sched
+        return sched
+
     @contextlib.contextmanager
     def _vis_dram_selftest_guard(self, num_engines):
         """Protect the head of the weight blob from UnifiedEngine.__init__.
@@ -1808,19 +1907,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         S, DP = self.VIS_S, self.VIS_DP
         H, I = self.VIS_H, self.VIS_I
 
-        worker_base = self._vis_worker_arena_base(num_engines)
-        with self._vis_dram_selftest_guard(num_engines):
-            sched = MultiEngineScheduler(
-                self, num_engines=num_engines,
-                worker_dram_base=worker_base,
-                worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
-                worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
-                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET,
-                # This board has more than the 2 engines multi_engine_shard's
-                # default guard assumes (that cap is per-device, and its assert
-                # text is written for the 2-engine board). The opt-in is explicit
-                # at the CLI: --engines N / --vis_4 / --pref_8 all name a count.
-                allow_more_than_two_engines=True)
+        sched = self._make_stage_scheduler(num_engines)
+        if sched is None:
+            return None
+        # PER_ENGINE registration is idempotent-by-name and must happen ONCE per
+        # scheduler; _make_stage_scheduler caches, so a second call for the same
+        # engine count returns the already-populated scheduler.
+        if getattr(sched, "_pi05_vis_registered", False):
+            return sched
+        sched._pi05_vis_registered = True
 
         # --- PER_ENGINE: scratch a kernel WRITES, therefore must be duplicated ---
         zeros_n = max(H, I)
@@ -1868,58 +1963,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         return ne
 
     def _prefix_make_scheduler(self, num_engines):
-        """Scheduler for the sharded prefix. REUSES the encoder's whenever the
-        engine count matches: constructing a second MultiEngineScheduler builds
-        fresh UnifiedEngines, and UnifiedEngine.__init__ runs an FPGA DRAM
-        self-test that writes 16 KB over params_dram_base == the head of the
-        weight blob (see _vis_dram_selftest_guard). Reuse also keeps ONE worker
-        arena and one flag-preclear."""
-        from multi_engine_shard import MultiEngineScheduler
-        sched = getattr(self, "_vis_sched", None)
-        if sched is not None and sched.num_engines == num_engines:
-            return sched
-        if num_engines == 1:
-            return None
-        worker_base = self._vis_worker_arena_base(num_engines)
-        with self._vis_dram_selftest_guard(num_engines):
-            return MultiEngineScheduler(
-                self, num_engines=num_engines,
-                worker_dram_base=worker_base,
-                worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
-                worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
-                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET,
-                # This board has more than the 2 engines multi_engine_shard's
-                # default guard assumes (that cap is per-device, and its assert
-                # text is written for the 2-engine board). The opt-in is explicit
-                # at the CLI: --engines N / --vis_4 / --pref_8 all name a count.
-                allow_more_than_two_engines=True)
+        """Scheduler for the row-sharded prefix. Shares the run's worker pool and
+        the per-engine-count scheduler cache -- see _make_stage_scheduler."""
+        return self._make_stage_scheduler(num_engines)
 
     def _denoise_make_scheduler(self, num_engines):
-        """Scheduler for the N-sharded denoise stage. REUSES the encoder/prefix one
-        whenever the engine count matches -- constructing a second
-        MultiEngineScheduler builds fresh UnifiedEngines, and UnifiedEngine.__init__
-        runs a DRAM self-test that writes 16 KB over the head of the weight blob
-        (see _vis_dram_selftest_guard). Reuse also keeps ONE worker arena and one
-        flag preclear across all three stages."""
-        from multi_engine_shard import MultiEngineScheduler
-        sched = getattr(self, "_vis_sched", None)
-        if sched is not None and sched.num_engines == num_engines:
-            return sched
-        if num_engines == 1:
-            return None
-        worker_base = self._vis_worker_arena_base(num_engines)
-        with self._vis_dram_selftest_guard(num_engines):
-            return MultiEngineScheduler(
-                self, num_engines=num_engines,
-                worker_dram_base=worker_base,
-                worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
-                worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
-                worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET,
-                # This board has more than the 2 engines multi_engine_shard's
-                # default guard assumes (that cap is per-device, and its assert
-                # text is written for the 2-engine board). The opt-in is explicit
-                # at the CLI: --engines N / --vis_4 / --pref_8 all name a count.
-                allow_more_than_two_engines=True)
+        """Scheduler for the N-sharded denoise stage. Shares the run's worker pool
+        and the per-engine-count scheduler cache -- see _make_stage_scheduler.
+
+        This used to compare only against _vis_sched, so vis=4/prefix=8/denoise=8
+        built a THIRD scheduler whose fresh allocators rewrote prefix's worker
+        programs at identical addresses. Now an existing 8-engine scheduler is
+        reused whichever stage created it.
+        """
+        return self._make_stage_scheduler(num_engines)
 
     def _execute_denoise(self, timeout=300.0):
         """EXECUTE the compiled denoise program, launching + joining the column-shard
@@ -2740,10 +2797,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                  GAMMA_DRAM_ADDR=self.AE_ONES_DRAM, gpr_M_reg=gpr_M_reg,
                                  gpr_N_reg=self._ae_rms_N_reg, gpr_sqrt_n_reg=self._ae_rms_sqrt_reg)
         # 2. conditioning matmul: cond (1,H) @ dense (H,3H) -> modulation (1,3H), +bias
-        # (M=1 here always -- one conditioning vector regardless of the caller's M -- so
-        # no gpr_M_reg needed, a single-row matmul is already minimal.)
+        # M=1 always -- one conditioning vector regardless of the caller's M. That is
+        # NOT the same as "already minimal": M=1 only collapses the M loop, while the
+        # legacy core still unrolls the N axis into ceil(3H / N_chunk) = 16 tiles
+        # (N_chunk = (URAM_NEAR_FULL_ELEMENTS // K) // 64 * 64 = 192 at K=H). Passing
+        # a GPR-primed M routes to the DYNAMIC (PBI) core, which walks N from a
+        # pointer row instead. See _ae_cond_M_reg in compile_denoise_loop.
+        # Falls back to the legacy path when the reg is absent, so the standalone
+        # callers (_ae_sincos_time_embed, the torch-ref harness) still work.
         self._ae_matmul(1, H, 3 * H, self.AE_COND_DRAM, dense_scale, dense_data,
-                         self.AE_MODULATION_DRAM, bias_addr=dense_bias)
+                         self.AE_MODULATION_DRAM, bias_addr=dense_bias,
+                         gpr_M_reg=getattr(self, "_ae_cond_M_reg", None))
         # 3. split scale/shift/gate (each H wide) and broadcast each to M rows
         scale_addr = self.AE_MODULATION_DRAM
         shift_addr = self.AE_MODULATION_DRAM + H * bpe
@@ -3472,6 +3536,24 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_set(ae_sqrt_N_reg, self.float_to_bf19(float(H ** 0.5)))
         self._ae_rms_N_reg = ae_N_reg
         self._ae_rms_sqrt_reg = ae_sqrt_N_reg
+
+        # PBI DISPATCH FOR THE AdaRMSNorm CONDITIONING MATMUL.
+        # matmat_mul_core routes to the DYNAMIC (PBI) core as soon as any dimension
+        # GPR is supplied, and to matmat_mul_core_legacy -- compile-time M/K/N
+        # tiling, fully unrolled -- when none is. The conditioning matmul is
+        # (1, H) @ (3H, H)^T, and its M=1 made "a single-row matmul is already
+        # minimal" look true. It is not: legacy tiles the N axis, and with K=H the
+        # budget gives
+        #     N_chunk = (URAM_NEAR_FULL_ELEMENTS // K) // 64 * 64 = 192
+        # so N=3H=3072 unrolls into 16 tiles. That happens TWICE per layer body and
+        # the body is emitted 180x (18 layers x 10 Euler steps) = 5760 unrolled
+        # tiles in the denoise program. Handing it a GPR-primed M collapses each
+        # call to one PBI loop.
+        # One SHARED register, primed once: allocating per call would burn two ISA
+        # registers on every one of the 360 invocations.
+        ae_one_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(ae_one_reg, 1)
+        self._ae_cond_M_reg = ae_one_reg
 
         # Seed the combined K/V buffers' prefix rows [0:P] once (unchanged across
         # all 10 Euler steps / all layers' repeated suffix_step calls). MUST be

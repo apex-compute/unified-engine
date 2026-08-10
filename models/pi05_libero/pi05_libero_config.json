@@ -86,9 +86,9 @@
   },
   "dram_layout": {
     "selected": "q4_default",
-    "_note_4gb": "4 GB flat DDR (0x00000000..0xFFFFFFFF). params starts at 1 MB, NOT 0: constructing any UnifiedEngine runs a DRAM self-test that writes 16 KB at DRAM_START_ADDR, which used to be params_dram_base and silently shredded the SigLIP patch-embed weights (see _vis_dram_selftest_guard). The 1 MB gap makes that clobber land on nothing.",
-    "params_dram_base": "0x00100000",
-    "tensor_dram_base": "0x60000000",
+    "_note_layout": "FULL 4 GB map, matching what the other large models already do: qwen3_4b (~2.15 GB of weights) uses params 0x00000000 / tensor 0x90000000 / program 0xE0000000, and gemma4_e4b uses 0x00000000 / 0xC0000000 / 0xDA000000. pi05 was the only model still squeezed into the top 2 GB, which is why its params sat at 1534.6/1536 MB (99.9% full) and its worker arenas were being rationed to 20 MB. Only bound that matters: stay inside 0x00000000..0xFFFFFFFF. Bonus: params no longer starts at DRAM_START_ADDR, so init_unified_engine's 16 KB DRAM self-test can no longer land on the SigLIP patch-embed weights (the bug _vis_dram_selftest_guard exists for).",
+    "params_dram_base": "0x00000000",
+    "tensor_dram_base": "0x80000000",
     "program_dram_base": "0xE0000000"
   },
   "paths": {

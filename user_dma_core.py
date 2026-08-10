@@ -197,14 +197,21 @@ SCALE_BRAM_ELEMENTS = 8192
 SCALE_BRAM_SIZE_BYTES = SCALE_BRAM_ELEMENTS * 2
 BIAS_BRAM_ELEMENTS = 8192
 BIAS_BRAM_SIZE_BYTES = BIAS_BRAM_ELEMENTS * 2
-# The board carries 4 GB of DDR mapped flat over 0x00000000..0xFFFFFFFF. This used
-# to start at 0x80000000, which addressed only the TOP HALF and left the low 2 GB
-# unused -- the AXI-Lite register space that lives at low addresses is a SEPARATE
-# BAR (/dev/xdma0_user), not this DMA address space, so there was never a conflict
-# to avoid. Starting at 0 doubles usable DRAM to 4 GB.
-# Encoding is not a limit: UE_WORD_ADDR_BITS below is a 35-bit WORD address
-# (byte >> 3) = 256 GiB of reach, and UE_DRAM_ADDR carries bits [63:32].
-DRAM_START_ADDR = 0x00000000 # 0 GB
+# Default params base for models that do not override it -- NOT a hardware floor.
+#
+# The board has 4 GB of DDR usable over 0x00000000..0xFFFFFFFF, and the engine can
+# address all of it: qwen3_4b (~2.15 GB of weights) runs with
+# params_dram_base=0x00000000 / tensor 0x90000000 / program 0xE0000000, and
+# gemma4_e4b with 0x00000000 / 0xC0000000 / 0xDA000000. Any model whose weights do
+# not fit in the 768 MB this default leaves below DRAM_ACTIVATION_ADDR should pass
+# its own bases to UnifiedEngine (or set dram_layout in its config), the way those
+# two and pi05_libero do -- do not move this constant, other models depend on it.
+#
+# The only real bound is 0x100000000: dram_region_map asserts nothing ends past it,
+# and no DMA address today drives UE_DRAM_ADDR (bits [63:32]), which is defined but
+# never written. The ISA itself reaches far further -- UE_WORD_ADDR_BITS below is a
+# 35-bit WORD address (byte >> 3) = 256 GiB.
+DRAM_START_ADDR = 0x80000000 # 0 GB
 DRAM_ACTIVATION_ADDR = 0xB0000000 # 512 MB reserved for intermediate results
 DRAM_INSTRUCTION_ADDR = 0xD0000000  # 256*3 MB reserved for instructions
 
