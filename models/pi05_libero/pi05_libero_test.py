@@ -4805,6 +4805,65 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         hw = one(self.AE_ACTION_HORIZON_PADDED, self.AE_XT_WIDTH, P + self.AE_ACTION_HORIZON_PADDED)
         return eff, hw
 
+    def precompile_all(self):
+        """Compile encoder + prefix + denoise UP FRONT, so run_inference executes
+        all three back-to-back with no compilation in between.
+
+        Nothing here needs a previous stage's RESULTS -- only its addresses and
+        shapes, all of which are known before any hardware runs:
+
+          * seq_len is DERIVED, not measured: run_vision returns
+            slots_encoded * VIS_S rows, and the prefix adds PREFIX_TEXT_BUDGET.
+            (Asserted against the real value in run_inference, so a config change
+            that breaks the derivation is caught rather than mis-compiled.)
+          * valid_len does NOT shape the prefix PROGRAM, only the bias DATA that
+            run_inference re-DMAs to the same baked address on every obs -- which
+            is exactly what the existing compile-once path already relies on. A
+            placeholder is therefore safe.
+          * tensor_init_action_expert needs prefix_k/v_cache_addr, which
+            compile_prefix publishes at the END OF COMPILATION, not execution.
+
+        Leaves _prefix_compiled/_denoise_compiled set, so run_inference takes its
+        cached branches. Idempotent.
+        """
+        if getattr(self, "_precompiled", False):
+            return
+        t0 = time.perf_counter()
+        _original_print("\n[precompile] compiling all three stages before execution "
+                        "(one-time; keeps the inference loop compile-free)")
+
+        self._compile_once("encoder", self.compile_encoder, label="vision encoder")
+
+        seq_len = self._n_vision_slots_encoded() * self.VIS_S + self.PREFIX_TEXT_BUDGET
+        self._precompiled_seq_len = seq_len
+        if not getattr(self, "_prefix_compiled", False):
+            # valid_len only sizes the bias mask DATA; pass the full length as the
+            # placeholder so anything that does read it sees a legal value.
+            self._prefix_prog_addr = self._compile_once(
+                "prefix", lambda: self.compile_prefix(seq_len, seq_len), label="prefix")
+            self._prefix_bias_dram = self.prefix_bias_dram
+            self._prefix_compiled = True
+
+        if not getattr(self, "_ae_tensors_inited", False):
+            self._ae_alloc_ckpt = (self.get_tensor_dram_addr() - self._tensor_dram_base,
+                                   self.get_params_dram_usage())
+        self.tensor_init_action_expert()
+        if not getattr(self, "_denoise_compiled", False):
+            self._denoise_prog_addr = self._compile_once(
+                "denoise", self.compile_denoise_loop, label="denoise_loop")
+            self._denoise_compiled = True
+
+        self._precompiled = True
+        self._precompile_secs = time.perf_counter() - t0
+        # The run summary subtracts _compile_times from the stage timers to separate
+        # compile from exec. That is only correct when compilation happened INSIDE
+        # the timed region. It no longer does, so clear the map (the total is kept
+        # in _precompile_secs and reported on its own line) -- otherwise every stage
+        # would be credited a compile cost it did not pay and read too fast.
+        self.__dict__.setdefault("_compile_times", {}).clear()
+        _original_print(f"[precompile] all stages ready in {self._precompile_secs:.1f}s "
+                        f"(seq_len={seq_len}); inference is now execute-only\n")
+
     def run_inference(self, images_hwc, prompt_tokens, noise32=None, skip_prefix=False, dump_prefix_path=None,
                        sanity_check=False):
         """Full forward pass on real hardware. images_hwc: list of 3 (224,224,3)
@@ -4842,6 +4901,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # actually returned (512 dropped / 768 kept / 768 on a real 3-camera
             # robot) + the text budget.
             seq_len = vision_tokens.shape[0] + self.PREFIX_TEXT_BUDGET
+            # precompile_all() DERIVED this same number before anything ran. If the
+            # derivation is ever wrong the prefix program was compiled for the wrong
+            # M, which would be silent corruption -- so check, do not hope.
+            _pre = getattr(self, "_precompiled_seq_len", None)
+            assert _pre is None or _pre == seq_len, (
+                f"precompile_all() compiled the prefix for seq_len={_pre} but the "
+                f"encoder produced {seq_len} ({vision_tokens.shape[0]} vision rows + "
+                f"{self.PREFIX_TEXT_BUDGET} text). The derivation in precompile_all "
+                f"is stale -- fix it there rather than compiling per-obs.")
             valid_len = self.embed_and_concat_prefix(prompt_tokens, vision_tokens, seq_len=seq_len)
             # COMPILE-ONCE: the prefix program is invariant to valid_len (M is
             # always seq_len; valid_len only shapes the DMA'd bias DATA). Compile
@@ -4940,15 +5008,31 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         actions = out[:10, :7]
 
         total = t_vision + t_prefix + t_denoise
-        print("\n  " + "─" * 52)
-        print(f"  {'stage':<10}{'time':>10}{'  share':>10}")
-        print("  " + "─" * 52)
+        # Split ONE-TIME compilation out of the wall clock. The stage timers wrap
+        # compile+execute, but _compile_once caches, so every inference after the
+        # first pays only the exec column -- which is the number that matters for
+        # a LIBERO rollout, and the one to compare across changes.
+        ct = getattr(self, "_compile_times", {})
+        comp = {"vision": ct.get("encoder", 0.0), "prefix": ct.get("prefix", 0.0),
+                "denoise": ct.get("denoise", 0.0)}
+        t_comp = sum(comp.values())
+        t_exec = total - t_comp
+        print("\n  " + "─" * 62)
+        print(f"  {'stage':<10}{'total':>9}{'compile':>10}{'exec':>9}{'  share(exec)':>14}")
+        print("  " + "─" * 62)
         for name, t in (("vision", t_vision), ("prefix", t_prefix), ("denoise", t_denoise)):
-            share = (100 * t / total) if total else 0.0
-            print(f"  {name:<10}{t:>8.1f}s{share:>9.1f}%")
-        print("  " + "─" * 52)
-        print(f"  {'TOTAL':<10}{total:>8.1f}s{'100.0':>9}%")
-        print("  " + "─" * 52 + "\n")
+            e = t - comp[name]
+            share = (100 * e / t_exec) if t_exec else 0.0
+            print(f"  {name:<10}{t:>7.1f}s{comp[name]:>9.1f}s{e:>8.1f}s{share:>13.1f}%")
+        print("  " + "─" * 62)
+        print(f"  {'TOTAL':<10}{total:>7.1f}s{t_comp:>9.1f}s{t_exec:>8.1f}s{'100.0':>13}%")
+        print("  " + "─" * 62)
+        pre = getattr(self, "_precompile_secs", None)
+        if pre is not None:
+            print(f"  all 3 stages pre-compiled up front in {pre:.1f}s (not in the times "
+                  f"above); this {t_exec:.1f}s is pure back-to-back execution\n")
+        else:
+            print(f"  compile is ONE-TIME (cached): steady-state inference is {t_exec:.1f}s\n")
         return actions
 
     # XDMA driver has a per-os.write() transfer size limit (~16-64MB, matching
@@ -5332,7 +5416,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             f"its own capture buffer, it must stash its byte length like compile_encoder does.")
         cache[key] = prog_addr
         meta[key] = (prog_addr, prog_len)
-        _original_print(f"  [{label}] compiled ONCE in {time.perf_counter()-t0:.1f}s "
+        elapsed = time.perf_counter() - t0
+        # Record per-key compile cost so the run summary can separate ONE-TIME
+        # compilation from steady-state execution. The stage timers wrap
+        # compile+execute together, so a first-run "denoise 10.7s" is really
+        # 4.2s of compile plus 6.5s of hardware -- and every later inference in
+        # the same process pays only the 6.5s, because _compile_once is cached.
+        # Reporting them merged makes the model look ~20% slower than it is and
+        # hides which half a change actually moved.
+        self.__dict__.setdefault("_compile_times", {})[key] = elapsed
+        _original_print(f"  [{label}] compiled ONCE in {elapsed:.1f}s "
                         f"prog=0x{prog_addr:X} len={prog_len}B (cached)" + " " * 8)
         return prog_addr
 
@@ -5813,6 +5906,16 @@ def main():
                           "prefixes: S=576 is only 56%% efficient and S=320 (5 blocks) cannot "
                           "be split 8 ways at all and falls back to a single engine "
                           "(_prefix_num_engines). Forces the 24 MB worker-arena profile.")
+    ap.add_argument("--precompile", action=argparse.BooleanOptionalAction, default=True,
+                     help="Compile all three stages (encoder, prefix, denoise) BEFORE any "
+                          "of them executes, so the inference runs back-to-back with no "
+                          "compilation in between. DEFAULT ON. Nothing in a compile depends "
+                          "on an earlier stage's RESULTS -- only its addresses and shapes -- "
+                          "so seq_len is derived (slots*VIS_S + PREFIX_TEXT_BUDGET, asserted "
+                          "against the real value later) and valid_len is a placeholder, "
+                          "since it shapes only the bias DATA that is re-DMA'd per obs. "
+                          "--no-precompile restores the old lazy compile-on-first-use, where "
+                          "the first inference carries ~8s of compile inside its stage times.")
     ap.add_argument("--dns_8", action="store_true",
                      help="COLUMN-shard (N) the DENOISE stage across 8 engines "
                           "(DENOISE_NUM_ENGINES=8), independently of --engines. Denoise is "
@@ -6006,6 +6109,13 @@ def main():
         images = _load_sample_images()
 
         prompt_tokens = _load_sample_prompt_tokens()
+
+        # Compile encoder + prefix + denoise BEFORE any of them executes, so the
+        # inference itself is three back-to-back hardware runs with no compilation
+        # interleaved. Skipped for --sanity-check, which deliberately stops after
+        # prefix and never builds the action expert.
+        if args.precompile and not args.sanity_check:
+            ue.precompile_all()
 
         actions = ue.run_inference(
             images, prompt_tokens, dump_prefix_path=PREFIX_KV_DUMP_PATH,
