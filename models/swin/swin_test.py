@@ -57,6 +57,34 @@ from user_dma_core import (
 )
 
 # ---------------------------------------------------------------------------
+# HF module-layout compatibility (transformers renamed/reshaped Swin submodules
+# between versions: nested SwinAttention.self.query vs flattened q_proj, etc.)
+# ---------------------------------------------------------------------------
+
+def _first_attr(obj, names):
+    """Return the first attribute of `obj` present among `names`."""
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    raise AttributeError(
+        f"{type(obj).__name__} has none of {names}; "
+        f"available: {[n for n, _ in obj.named_children()]}"
+    )
+
+
+def _find_module_with(root, attr):
+    """Find `root` or the first descendant module owning attribute `attr`."""
+    if hasattr(root, attr):
+        return root
+    for _, m in root.named_modules():
+        if hasattr(m, attr):
+            return m
+    raise AttributeError(
+        f"No submodule of {type(root).__name__} defines '{attr}'"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helper ops (built on top of UnifiedEngine primitives)
 # ---------------------------------------------------------------------------
 
@@ -777,9 +805,16 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_before_beta'] = self._alloc_param(block.layernorm_before.bias.data)
 
                 # Q/K/V weights + biases (dim, dim) — already 64-aligned for all stages.
-                # transformers>=5 flattens projections onto SwinAttention (q_proj/k_proj/v_proj).
+                # HF layout varies by transformers version: older/classic nests the
+                # projections under SwinAttention.self (query/key/value); newer flattens
+                # them onto SwinAttention (q_proj/k_proj/v_proj). Support both.
                 attn = block.attention
-                for name, proj in [('q', attn.self.query), ('k', attn.self.key), ('v', attn.self.value)]:
+                attn_self = getattr(attn, 'self', attn)
+                qkv = [(n, _first_attr(attn_self, cands)) for n, cands in
+                       (('q', ('query', 'q_proj')),
+                        ('k', ('key', 'k_proj')),
+                        ('v', ('value', 'v_proj')))]
+                for name, proj in qkv:
                     lw[f'{name}_weight'] = self._alloc_param(proj.weight.data)
                     lw[f'{name}_bias'] = self._alloc_param(proj.bias.data)
 
@@ -790,8 +825,9 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # gets bias at offset b * wa_pad * wa_pad. Since all windows share
                 # the same per-head bias, we tile num_windows copies.
                 # transformers>=5 nests these under the SwinRelativePositionBias submodule.
-                rel_pos_bias_table = attn.self.relative_position_bias_table  # (529, num_heads)
-                rel_pos_index = attn.self.relative_position_index  # flat (window_area*window_area,)
+                rpb_owner = _find_module_with(attn, 'relative_position_bias_table')
+                rel_pos_bias_table = rpb_owner.relative_position_bias_table  # (529, num_heads)
+                rel_pos_index = rpb_owner.relative_position_index  # flat (window_area*window_area,)
                 rpb = rel_pos_bias_table[rel_pos_index.view(-1)].view(window_area, window_area, num_heads)
                 rpb = rpb.permute(2, 0, 1).contiguous().to(torch.bfloat16)  # (num_heads, 144, 144)
                 # Pad to (num_heads, 192, 192) with -100 in padding positions
@@ -805,7 +841,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['rel_pos_bias'] = self._alloc_param(rpb_tiled)
 
                 # Output projection (attention) — transformers>=5: SwinAttention.o_proj
-                out_proj = block.attention.output.dense
+                out_proj = (attn.o_proj if hasattr(attn, 'o_proj')
+                            else attn.output.dense)
                 lw['out_proj_weight'] = self._alloc_param(out_proj.weight.data)
                 lw['out_proj_bias'] = self._alloc_param(out_proj.bias.data)
 
@@ -814,12 +851,16 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 lw['ln_after_beta'] = self._alloc_param(block.layernorm_after.bias.data)
 
                 # MLP expand: (mlp_dim, dim) — transformers>=5: SwinMLP.fc1
-                lw['mlp_expand_weight'] = self._alloc_param(block.intermediate.dense.weight.data)
-                lw['mlp_expand_bias'] = self._alloc_param(block.intermediate.dense.bias.data)
+                fc1 = (block.mlp.fc1 if hasattr(block, 'mlp')
+                       else block.intermediate.dense)
+                lw['mlp_expand_weight'] = self._alloc_param(fc1.weight.data)
+                lw['mlp_expand_bias'] = self._alloc_param(fc1.bias.data)
 
                 # MLP contract: (dim, mlp_dim) — transformers>=5: SwinMLP.fc2
-                lw['mlp_contract_weight'] = self._alloc_param(block.output.dense.weight.data)
-                lw['mlp_contract_bias'] = self._alloc_param(block.output.dense.bias.data)
+                fc2 = (block.mlp.fc2 if hasattr(block, 'mlp')
+                       else block.output.dense)
+                lw['mlp_contract_weight'] = self._alloc_param(fc2.weight.data)
+                lw['mlp_contract_bias'] = self._alloc_param(fc2.bias.data)
 
                 stage_weights.append(lw)
             self.encoder_weights.append(stage_weights)
