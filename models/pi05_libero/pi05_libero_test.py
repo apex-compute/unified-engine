@@ -540,6 +540,50 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.vis_embed_bias = store_weight(self, b)
         self.vis_pos_embed = store_weight(self, _load("PaliGemma.img.pos_embedding").reshape(NP, H))
 
+        # ---- K-SLICED PROJECTION WEIGHTS (2D vision shard: rows x K) ----------
+        # Cut here, at weight-init, because B is stored N x K: a K-slice is a
+        # COLUMN slice of B's rows -- strided, one gap per row -- so unlike an
+        # N-shard it CANNOT be reached by shifting B_DRAM_ADDR. It has to be
+        # materialized and re-quantized on the host, exactly like the denoise
+        # mlp_down_k blobs.
+        #
+        # Re-quantizing a slice is exact, not approximate: quantize_q4_64 blocks
+        # along K in groups of 64 and _col_split cuts on whole 64-blocks, so a
+        # slice's blocks are BIT-IDENTICAL to the corresponding blocks of the
+        # full-matrix quantization. The only numeric difference from the unsplit
+        # matmul is bf16 accumulation ORDER across the partial sums.
+        #
+        # ONLY fc2 IS SLICED, and the reason is the matmul ABI, not preference:
+        # matmat_mul_core reads A as M x K row-major with row stride K*bpe -- there
+        # is no separate A-stride/lda. So a K-split is only expressible where A is
+        # ALREADY a dense [M, Kc] buffer. That holds for fc2, whose A is fc1's
+        # per-engine N-split output. It does NOT hold for q/k/v (A = the shared
+        # [S, H] LayerNorm output) or for out-proj (A = the shared [S, HP]
+        # attention output): a K-slice of those is strided, and slicing their
+        # weights would produce blobs nothing can consume. They stay row-parallel.
+        #
+        # fc1 needs no host slicing at all -- it is N-split, and B is stored N x K,
+        # so an N-slice is a contiguous ROW BLOCK reachable by address arithmetic.
+        #
+        # The full-width fc2 blob is kept alongside the slices (the 1-K-group path,
+        # the SNR checks and the torch reference read it); ~68 MB of the params
+        # region's ~513 MB of headroom.
+        _vis_nk = self._vis_grid(self._num_engines("VIS"))[1]
+
+        def _store_q4_k(mat_nk):
+            """mat_nk (N,K) -> [(scale, data)] per K-slice, in engine order."""
+            K = mat_nk.shape[1]
+            sl = self._col_split(K, _vis_nk)
+            assert all(kc % UE_VECTOR_SIZE == 0 for _, kc in sl), (
+                f"vision K-slice of K={K} into {_vis_nk} is not 64-aligned ({sl}); "
+                f"the q4_64 scale blocking would not line up with the full matrix")
+            return [_store_q4(mat_nk[:, k0:k0 + kc].contiguous()) for k0, kc in sl]
+
+        if _vis_nk > 1:
+            print(f"    [vis] K-slicing fc2 weights {_vis_nk} ways x 27 layers for the 2D "
+                  f"vision shard (fc1 is N-split by address arithmetic; q/k/v/out stay "
+                  f"row-parallel -- no A-stride in the matmul ABI)")
+
         pfx = "PaliGemma.img.Transformer.encoderblock"
         ln0_w, ln0_b = _load(f"{pfx}.LayerNorm_0.scale"), _load(f"{pfx}.LayerNorm_0.bias")
         ln1_w, ln1_b = _load(f"{pfx}.LayerNorm_1.scale"), _load(f"{pfx}.LayerNorm_1.bias")
@@ -607,6 +651,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             d1k_pad[:I] = d1_k[l]
             la['fc2_scale'], la['fc2_data'] = _store_q4(d1k_pad.T)          # [1152,4352] (N,K)
             la['fc2_bias'] = store_weight(self, d1_b[l])
+            if _vis_nk > 1:
+                la['fc2_k'] = _store_q4_k(d1k_pad.T.contiguous())
 
             self.vis_layer_addrs.append(la)
 
@@ -1496,16 +1542,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
     # What `--engines max` resolves to. These are CEILINGS SET BY THE ARCHITECTURE,
     # not preferences, and each is a different limit:
-    #   VIS      4 -- HARD. Shards S=VIS_S=256 patch tokens PER IMAGE SLOT, which is
-    #                 exactly 4 blocks of 64, and split_rows asserts on 64-alignment.
-    #                 8 is impossible without batching the 3 slots into one 768-row
-    #                 pass, which would change the per-slot attention semantics.
+    #   VIS      8 -- 2D: 4 row groups x 2 K lanes (_vis_grid). Rows alone still cap
+    #                 at 4 (S=VIS_S=256 is exactly 4 blocks of 64), so the 5th-8th
+    #                 engines split the MLP's K instead: fc1 N-split -> GELU in lane
+    #                 -> fc2 K-split -> 2-way reduce. The attention block stays
+    #                 row-parallel and redundant across lanes, because its A operands
+    #                 are shared row-major buffers and matmat_mul_core has no
+    #                 A-stride, so a K-split of those is not expressible.
     #   PREFIX   8 -- device cap. S=832 is 13 blocks and 13 is prime, so 8 is uneven
     #                 (5x128 + 3x64) at ~81% efficiency. Shorter prefixes degrade:
     #                 S=576 is 56%, S=320 falls back to 1 engine (_prefix_num_engines).
     #   DENOISE  8 -- device cap. M=64 is ONE row block so this is a COLUMN (N) split;
     #                 the binding dim is o proj N=1024 = 16 blocks, comfortably >8.
-    STAGE_MAX_ENGINES = {"VIS": 4, "PREFIX": 8, "DENOISE": 8}
+    STAGE_MAX_ENGINES = {"VIS": 8, "PREFIX": 8, "DENOISE": 8}
 
     VIS_NUM_ENGINES = None       # per-stage override; None -> NUM_ENGINES
     # The prefix LM is row-sharded too (projections / RMSNorms / MLP; RoPE, the
@@ -1585,7 +1634,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # If a worker program ever does outgrow it, _assert_worker_programs_fit fires
     # at compile time with an exact byte count -- this trades unused headroom for
     # a loud, early failure, never a silent one.
-    VIS_WORKER_PROGRAM_OFFSET_MANY = 0x00200000   #  2 MB (params 1 MB + tensor 1 MB)
+    # 4 MB: params 1 MB + tensor 3 MB. The 2D vision shard adds per-engine lane
+    # buffers (fc1 [64,2176] = 272 KB + fc2 partial [64,1152] = 144 KB) on top of
+    # the ~520 KB of flash/zeros scratch, which does not fit a 1 MB tensor window.
+    # Free at 64 MB arenas -- program space only drops 62 -> 60 MB.
+    VIS_WORKER_PROGRAM_OFFSET_MANY = 0x00400000   #  4 MB
 
     # Tensor DRAM allocated AFTER the arenas, by tensor_init_action_expert
     # (measured 44.97 MB). Reserved up front because the arenas are allocated at
@@ -1841,8 +1894,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         from multi_engine_shard import MultiEngineScheduler
 
-        if num_engines <= 1:
-            return None
+        # Builds a scheduler for num_engines == 1 too, and that is REQUIRED, not
+        # incidental: compile_encoder calls sched.split_rows(S) unconditionally and
+        # _emit_encoder_body is written so a 1-engine split is (0, S) -- i.e. the
+        # historical single-engine stream. Returning None here broke the default
+        # no-flags run with 'NoneType has no attribute split_rows'. A 1-engine
+        # scheduler has no workers and emits no barriers, so it costs nothing.
+        # The prefix/denoise wrappers still hand back None below 2 engines, which
+        # is what their call sites expect.
         cache = self.__dict__.setdefault("_sched_by_ne", {})
         if num_engines in cache:
             return cache[num_engines]
@@ -1908,8 +1967,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         H, I = self.VIS_H, self.VIS_I
 
         sched = self._make_stage_scheduler(num_engines)
-        if sched is None:
-            return None
         # PER_ENGINE registration is idempotent-by-name and must happen ONCE per
         # scheduler; _make_stage_scheduler caches, so a second call for the same
         # engine count returns the already-populated scheduler.
@@ -1935,6 +1992,31 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         sched.register_per_engine(
             "attn_scratch", self.VIS_ATTN_SCRATCH_DRAM, attn_scratch_n * bpe,
             init_tensor=torch.zeros(attn_scratch_n, dtype=torch.bfloat16))
+
+        # ---- 2D (rows x K) lane buffers -------------------------------------
+        # Both are written scratch, so PER_ENGINE. Sized for the widest row group
+        # (S // nr rows) -- a smaller group just uses a prefix of the buffer.
+        _, _nk = self._vis_grid(num_engines)
+        if _nk > 1:
+            _nr = num_engines // _nk
+            _rows_max = max(c for _, c in self._col_split(S, _nr))
+            _IP = self.VIS_I_PAD                       # padded 4352, NOT VIS_I=4304
+            _lane_n = _rows_max * (_IP // _nk)         # fc1 out: [rows, IP/nk] dense
+            _part_n = _rows_max * H                    # fc2 out: FULL [rows, H] partial
+            sched.register_per_engine("vis_mlp_lane", self.VIS_MLP_INTER_DRAM, _lane_n * bpe,
+                                      init_tensor=torch.zeros(_lane_n, dtype=torch.bfloat16))
+            # The partial gets its OWN primary buffer rather than reusing
+            # VIS_MLP_OUT_DRAM: lane 0's partial would then alias the reduce's
+            # OUTPUT (VIS_MLP_OUT_DRAM + RH is +0 for engine 0), and an
+            # eltwise_add whose A aliases its OUT is the DMA read/write hazard
+            # that is a confirmed hang trigger in this codebase (see
+            # _ae_ada_rms_norm's AE_ADARMS_MUL_SCRATCH_DRAM comment).
+            self.VIS_MLP_PARTIAL_DRAM = self.allocate_tensor_dram(
+                _part_n * bpe, label="vis_mlp_partial")
+            sched.register_per_engine("vis_mlp_partial", self.VIS_MLP_PARTIAL_DRAM, _part_n * bpe,
+                                      init_tensor=torch.zeros(_part_n, dtype=torch.bfloat16))
+            print(f"    [vis] lane buffers/engine: fc1 [{_rows_max},{_IP // _nk}] "
+                  f"{_lane_n * bpe >> 10} KB + partial [{_rows_max},{H}] {_part_n * bpe >> 10} KB")
         if sched.workers:
             print(f"    [vis] worker arena base 0x{self._vis_worker_arena:X} "
                   f"({num_engines - 1} worker(s) x "
@@ -1965,6 +2047,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     def _prefix_make_scheduler(self, num_engines):
         """Scheduler for the row-sharded prefix. Shares the run's worker pool and
         the per-engine-count scheduler cache -- see _make_stage_scheduler."""
+        if num_engines <= 1:
+            return None
         return self._make_stage_scheduler(num_engines)
 
     def _denoise_make_scheduler(self, num_engines):
@@ -1976,6 +2060,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         programs at identical addresses. Now an existing 8-engine scheduler is
         reused whichever stage created it.
         """
+        if num_engines <= 1:
+            return None
         return self._make_stage_scheduler(num_engines)
 
     def _execute_denoise(self, timeout=300.0):
@@ -2029,17 +2115,28 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         S = self.VIS_S
         ne = self._num_engines("VIS")
+        # 2D GRID: rows x K. M is only S//64 = 4 blocks, so rows alone cap at 4
+        # engines; the extra engines split the MLP's K instead. engine e owns
+        # (row group e // nk, K lane e % nk) -- consecutive engines share a row
+        # block, which keeps each reduce pair adjacent.
+        nr, nk = self._vis_grid(ne)
         sched = self._vis_make_scheduler(ne)
         self._vis_sched = sched
-        splits = sched.split_rows(S)
+        # _col_split is the same whole-64-block rule split_rows uses in "blocks"
+        # mode; used directly here because the row split is over nr GROUPS, not
+        # over all ne engines.
+        splits = self._col_split(S, nr) if nk > 1 else sched.split_rows(S)
+        if nk > 1:
+            print(f"    [vis] 2D shard: {nr} row group(s) x {nk} K lane(s) = {ne} engines "
+                  f"(rows {[c for _, c in splits]}; MLP K-split, rest row-parallel)")
 
         self.start_capture()
         self.reset_isa_reg_counter()
         self.reset_inst_ptr_counter()
         sched.begin_program()
         for e, ue in enumerate(sched.engines):
-            row_offset, rows = splits[e]
-            self._emit_encoder_body(ue, e, sched, row_offset, rows)
+            row_offset, rows = splits[e // nk]
+            self._emit_encoder_body(ue, e, sched, row_offset, rows, kgrp=e % nk, nk=nk)
         # KEEP the returned addresses: compile_prefix reuses THIS scheduler and its
         # finalize() overwrites sched._worker_prog_addrs, so a bare start_workers()
         # in run_vision would relaunch the PREFIX worker program on the next slot.
@@ -2074,9 +2171,34 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
               f"{extra} (num_engines={ne})")
         return program_addr
 
-    def _emit_encoder_body(self, ue, engine_idx, sched, row_offset, rows):
+    def _emit_encoder_body(self, ue, engine_idx, sched, row_offset, rows, kgrp=0, nk=1):
         """Emit ONE engine's complete encoder program over rows
         [row_offset, row_offset+rows) of the S=256 patch tokens.
+
+        ``kgrp``/``nk`` add the SECOND grid axis (see _vis_grid). With nk == 1
+        this is the historical row-only stream, unchanged. With nk > 1 the engines
+        sharing a row block are K lanes: they run the whole layer REDUNDANTLY --
+        same inputs, same weights, same addresses, so the writes are identical and
+        benign -- except the MLP, which is the one place they divide the work:
+
+            fc1  N-split  : lane owns columns [n0, n0+nc) of the IP-wide
+                            intermediate. B is stored N x K so the slice is a
+                            contiguous row block -> pure address arithmetic, no
+                            host-sliced weights. Writes its own dense [rows, nc]
+                            lane buffer (matmat_mul_core's writeback stride is the
+                            N it was GIVEN, so this is dense, not strided).
+            GELU          : elementwise -> stays in lane, no exchange.
+            fc2  K-split  : the lane's [rows, nc] IS the contiguous K-slice of the
+                            intermediate, so its A operand is already dense -- the
+                            only reason this op can be K-split at all (there is no
+                            A-stride in the matmul ABI). Uses the host-sliced
+                            fc2_k[kgrp] blob and produces a FULL [rows, H] PARTIAL.
+            reduce        : lane 0 sums the partials into VIS_MLP_OUT.
+
+        Redundant execution of the non-MLP ops is deliberate: it costs the extra
+        engines nothing that could be used elsewhere (their row block is already
+        the minimum 64) and it keeps every barrier count and instruction sequence
+        identical across lanes, which a skip-the-work variant would not.
 
         With num_engines==1 this is (row_offset, rows) == (0, S), every byte
         offset below is 0 and every M is S -- i.e. exactly the historical
@@ -2109,6 +2231,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         assert rows % 64 == 0, f"shard row count {rows} must be 64-aligned"
 
         zeros_addr = sched.per_engine_addr("vis_zeros", engine_idx)
+        # 2D-only lane buffers (see the MLP block). Resolved here so the nk == 1
+        # stream never touches them and stays byte-identical.
+        lane_inter = sched.per_engine_addr("vis_mlp_lane", engine_idx) if nk > 1 else None
+        lane_partial = sched.per_engine_addr("vis_mlp_partial", engine_idx) if nk > 1 else None
         FQ = sched.per_engine_addr("flash_q", engine_idx)
         FK = sched.per_engine_addr("flash_k", engine_idx)
         FV = sched.per_engine_addr("flash_v", engine_idx)
@@ -2253,10 +2379,53 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # MLP: Dense_0 + GELU (sigmoid-approx — the engine's only hardware GELU; the
                 # reference uses tanh-approx GELU, a small documented numeric deviation),
                 # Dense_1, residual.
-                vis_matmul(rows, H, IP, self.VIS_LN_OUT_DRAM + RH, la, 'fc1',
-                           self.VIS_MLP_INTER_DRAM + RI, bias=la['fc1_bias'], gelu_enable=True)
-                vis_matmul(rows, IP, H, self.VIS_MLP_INTER_DRAM + RI, la, 'fc2',
-                           self.VIS_MLP_OUT_DRAM + RH, bias=la['fc2_bias'])
+                if nk == 1:
+                    vis_matmul(rows, H, IP, self.VIS_LN_OUT_DRAM + RH, la, 'fc1',
+                               self.VIS_MLP_INTER_DRAM + RI, bias=la['fc1_bias'], gelu_enable=True)
+                    vis_matmul(rows, IP, H, self.VIS_MLP_INTER_DRAM + RI, la, 'fc2',
+                               self.VIS_MLP_OUT_DRAM + RH, bias=la['fc2_bias'])
+                else:
+                    n0, nc = self._col_split(IP, nk)[kgrp]
+                    # --- fc1: N-split. All four per-column offsets, and every one
+                    # of them silently corrupts if wrong (see multi_engine_shard's
+                    # "THE FOUR PER-COLUMN OFFSETS"). Verified bit-exact against a
+                    # direct quantization of rows [n0, n0+nc) of the fc1 weight.
+                    #   B (IF4) : + (n0*K)//2        two nibbles per byte
+                    #   scale   : + ((n0*K)//64)*2   one bf16 per 64-block
+                    #   bias    : + n0*2             broadcast_N is INDEXED by N
+                    ue.matmat_mul_core(
+                        M=rows, K=H, N=nc, A_DRAM_ADDR=self.VIS_LN_OUT_DRAM + RH,
+                        B_DRAM_ADDR=la['fc1_data'] + (n0 * H) // 2,
+                        SCALE_DRAM_ADDR=la['fc1_scale'] + ((n0 * H) // UE_VECTOR_SIZE) * bpe,
+                        C_DRAM_ADDR=la['fc1_bias'] + n0 * bpe, bias_mode="broadcast_N",
+                        OUTPUT_DRAM_ADDR=lane_inter, is_B_quantized=True,
+                        data_type=TYPE.IF4, gelu_enable=True, gpr_M_reg=vis_S_reg)
+                    # --- fc2: K-split over the SAME columns. A is this lane's dense
+                    # [rows, nc] buffer, which is why the K-split is expressible at
+                    # all. Bias on lane 0 ONLY -- the partials are summed, so a bias
+                    # on every lane would be added nk times.
+                    fc2_s, fc2_d = la['fc2_k'][kgrp]
+                    ue.matmat_mul_core(
+                        M=rows, K=nc, N=H, A_DRAM_ADDR=lane_inter,
+                        B_DRAM_ADDR=fc2_d, SCALE_DRAM_ADDR=fc2_s,
+                        C_DRAM_ADDR=(la['fc2_bias'] if kgrp == 0 else None),
+                        bias_mode="broadcast_N",
+                        OUTPUT_DRAM_ADDR=lane_partial, is_B_quantized=True,
+                        data_type=TYPE.IF4, gpr_M_reg=vis_S_reg)
+                    # --- reduce: every lane's partial must have landed first.
+                    self._vis_barrier(ue, engine_idx, ne)
+                    if kgrp == 0:
+                        acc = lane_partial
+                        for j in range(1, nk):
+                            eltwise_add_core_dram(
+                                ue, size=rows * H, A_DRAM_ADDR=acc,
+                                B_DRAM_ADDR=sched.per_engine_addr("vis_mlp_partial",
+                                                                  engine_idx + j),
+                                OUTPUT_DRAM_ADDR=self.VIS_MLP_OUT_DRAM + RH)
+                            acc = self.VIS_MLP_OUT_DRAM + RH
+                    # --- lane 0's sum must be visible before the residual below,
+                    # which every lane recomputes redundantly.
+                    self._vis_barrier(ue, engine_idx, ne)
                 self._debug_op(f"layer{layer_idx}_mlp_out", self.VIS_MLP_OUT_DRAM, S * H, shape=(S, H), ue=ue)
                 eltwise_add_core_dram(ue, size=rows * H,
                     A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM + RH, B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM + RH,
@@ -2344,6 +2513,32 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # every op in it has M = AE_ACTION_HORIZON_PADDED = 64, ONE row block, which
     # cannot be split at all. Follows --engines unless pinned to an int.
     DENOISE_NUM_ENGINES = None
+
+    def _vis_grid(self, ne, s=None):
+        """(row_groups, k_groups) for `ne` vision engines -- the 2D vision shard.
+
+        The vision encoder's M is only S//64 = 4 blocks of 64 rows, so a pure
+        M-split caps at 4 engines. The PROJECTIONS, however, are 94.9% of the
+        stage and every one of them has a fat K:
+
+            q/k/v  K=H=1152   (18 blocks)     out  K=NH*DP=2048 (32 blocks)
+            fc1    K=H=1152   (18 blocks)     fc2  K=IP=4352    (68 blocks)
+
+        So the grid is rows x K: 8 engines = 4 row groups x 2 K groups. K, not N,
+        because a K-split output is FULL-WIDTH -- it lands at exactly the address
+        the unsplit matmul wrote, so every downstream buffer, LayerNorm, residual
+        and (critically) the flash-attention marshalling are untouched. An N-split
+        would force per-engine [rows, cols] buffers, because matmat_mul_core writes
+        back with stride cols*bpe, and that WOULD drag in the marshalling.
+
+        The attention op itself (5.1%) is not split; it stays row-parallel.
+
+        Row groups are the largest divisor of `ne` that still fits in S//64, so
+        ne=4 -> (4,1) is byte-identical to today and ne=8 -> (4,2).
+        """
+        max_rows = (s or self.VIS_S) // 64
+        nr = max(d for d in range(1, max_rows + 1) if ne % d == 0)
+        return nr, ne // nr
 
     @staticmethod
     def _col_split(N, num_engines, align=64):
@@ -5975,7 +6170,7 @@ def main():
         print("[main] --engines max: per-stage ceilings -- "
               + ", ".join(f"{s.lower()}={n}"
                           for s, n in Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.items())
-              + " (vision caps at 4: S=256/slot is only 4 blocks of 64)")
+              + " (vision is 2D: 4 row groups x 2 K lanes -- S=256/slot is only 4 blocks)")
     else:
         Pi05Libero_UnifiedEngine.NUM_ENGINES = _eng_n
         if _eng_n > 1:
