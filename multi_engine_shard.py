@@ -165,6 +165,7 @@ programs are therefore supported directly -- see
 from __future__ import annotations
 
 import hashlib
+import time
 from enum import Enum
 from typing import Callable, Optional
 
@@ -538,7 +539,8 @@ class MultiEngineScheduler:
                  split_mode: str = "even",
                  allow_unaligned_rows: bool = False,
                  barrier_margin_nops: int = 32,
-                 allow_more_than_two_engines: bool = False):
+                 allow_more_than_two_engines: bool = False,
+                 workers: Optional[list] = None):
         assert num_engines >= 1, f"num_engines must be >= 1, got {num_engines}"
         if num_engines > 2:
             # The device caps at 2 engines; N>2 is code-complete but unverified.
@@ -582,19 +584,43 @@ class MultiEngineScheduler:
         # We cannot fix init_unified_engine(), so we make it a no-op: snapshot
         # the region, build the workers, put it back. Idempotent, and it makes
         # scheduler-construction order irrelevant.
-        guard = self._save_dram_selftest_region() if num_engines > 1 else None
-        for i in range(1, num_engines):
-            base = worker_dram_base + (i - 1) * worker_dram_stride
-            assert base != getattr(primary_ue, "_params_dram_base", None), \
-                "worker DRAM base collides with the primary's params base"
-            self.workers.append(UnifiedEngine(
-                BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
-                params_dram_base=base,
-                tensor_dram_base=base + worker_tensor_offset,
-                program_dram_base=base + worker_program_offset,
-            ))
-        if guard is not None:
-            self._restore_dram_selftest_region(guard)
+        # ``workers`` lets the CALLER own the worker engines and share them across
+        # schedulers. This is not an optimization -- it is a correctness fix.
+        #
+        # Each worker's DRAM allocators live IN the UnifiedEngine object. Build a
+        # second scheduler over the same arena and its fresh objects restart those
+        # allocators at offset 0, so stage 2's worker programs are written on top of
+        # stage 1's, byte for byte, at the same addresses. Stage 1 has already
+        # cached those addresses, so its next execution launches stage 2's code on
+        # the workers: different program, different barrier count, instant desync,
+        # and the engines spin on FLAG_CHECK forever (which has no timeout). The
+        # host sees a hang, kills the run, and every later process inherits engines
+        # that are still busy.
+        #
+        # It only bites when stages disagree on the engine count -- with a single
+        # --engines N the scheduler is reused and there is one allocator. Per-stage
+        # counts (--vis_4 --pref_8) are exactly the case that breaks it. Passing a
+        # shared pool keeps ONE allocator per engine for the whole run, so each
+        # stage's programs land AFTER the previous stage's.
+        if workers is not None:
+            assert len(workers) >= num_engines - 1, (
+                f"shared worker pool has {len(workers)} engine(s), need "
+                f"{num_engines - 1} for num_engines={num_engines}")
+            self.workers = list(workers[: num_engines - 1])
+        else:
+            guard = self._save_dram_selftest_region() if num_engines > 1 else None
+            for i in range(1, num_engines):
+                base = worker_dram_base + (i - 1) * worker_dram_stride
+                assert base != getattr(primary_ue, "_params_dram_base", None), \
+                    "worker DRAM base collides with the primary's params base"
+                self.workers.append(UnifiedEngine(
+                    BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
+                    params_dram_base=base,
+                    tensor_dram_base=base + worker_tensor_offset,
+                    program_dram_base=base + worker_program_offset,
+                ))
+            if guard is not None:
+                self._restore_dram_selftest_region(guard)
         self.engines: list[UnifiedEngine] = [primary_ue] + self.workers
 
         self._per_engine: dict[str, list[int]] = {}
@@ -1013,6 +1039,37 @@ class MultiEngineScheduler:
         Call once before the first execution: a flag left set by an earlier
         program would make the first CHECK pass spuriously.
         """
+        # STALE-BUSY RECOVERY. The FPGA is not reset between processes, so a run
+        # that died mid-execution leaves its workers spin-waiting at a FLAG_CHECK
+        # (which has no timeout) with queue_busy still asserted. The next process
+        # then issues this preclear program to an engine that never accepts it:
+        # every worker times out here while the primary -- which the dying process
+        # usually did halt -- succeeds. Observed directly: engines 1-3 reading
+        # queue_ctrl=0x010E01B0 (busy) while 0 and 4-7 read 0x000E00B0 (idle).
+        #
+        # A bare SW_RESET register write clears it (verified: busy 1 -> 0 on all
+        # three). Deliberately NOT UnifiedEngine.software_reset(), which follows the
+        # write with wait_queue() -- guaranteed to time out and print an error on an
+        # engine that is still draining -- and then init_unified_engine(), whose
+        # 16 KB DRAM self-test at DRAM_START_ADDR would land on live model memory
+        # this late in the run. The register write alone has no DRAM side effects.
+        SW_RESET_CMD = 0x80008000
+        for i, ue in enumerate(self.engines):
+            if not ue.is_queue_busy():
+                continue
+            print(f"    [engines] engine {i} is stuck busy from a previous run; "
+                  f"issuing SW_RESET")
+            ue.write_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR, SW_RESET_CMD)
+            for _ in range(50):                      # ~0.5 s, 10 ms granularity
+                if not ue.is_queue_busy():
+                    break
+                time.sleep(0.01)
+            assert not ue.is_queue_busy(), (
+                f"engine {i} still reports queue_busy after SW_RESET. It cannot run "
+                f"this stage, and continuing would let the primary pass every "
+                f"rendezvous on stale flags -- producing fast, WRONG results rather "
+                f"than a hang. Power-cycle or reload the bitstream.")
+
         for ue in self.engines:
             assert not ue.is_capture_on, "preclear_flags() must run outside capture"
             ue.start_capture()
