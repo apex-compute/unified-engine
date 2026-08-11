@@ -815,7 +815,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x52a71442, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x52a71442. Please update FPGA with commit update_52a71442.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0xf7cc1772, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xf7cc1772. Please update FPGA with commit update_f7cc1772.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -6450,6 +6450,128 @@ class UnifiedEngine:
 
         total_flops = flops_engine0 + flops_engine1
         print(f"Total Theoretical FLOPS (two cores): {total_flops / 1e9:.6f} G")
+        return total_flops
+
+    @staticmethod
+    def matmat_mul_multi_cores(ues,
+                               M: int,
+                               K: int,
+                               N: int,
+                               A_DRAM_ADDR: int,
+                               B_DRAM_ADDR: int,
+                               OUTPUT_DRAM_ADDR: int,
+                               softmax_enable: bool = False,
+                               C_DRAM_ADDR: int = None,
+                               bias_mode: str = "broadcast_N",
+                               is_B_quantized: bool = False,
+                               data_type: TYPE = None,
+                               SCALE_DRAM_ADDR: int = None,
+                               gelu_enable: bool = False,
+                               silu_enable: bool = False,
+                               sigmoid_enable: bool = False,
+                               clamp_enable: bool = False,
+                               log_enable: bool = False,
+                               m_shards=None,
+                               wait_timeout_seconds: float = 10.0,
+                               dynamic: bool = False) -> int:
+        """
+        Run one matmul on len(ues) engines in parallel by sharding rows of A
+        along M. Generalization of matmat_mul_two_cores to any engine count.
+
+        ues[i] must be the engine at hardware index i (flag_check targets are
+        the list positions). Engine i computes m_shards[i] contiguous rows
+        against the shared B matrix; output is written contiguously to
+        OUTPUT_DRAM_ADDR. Engines 0..n-2 flag_set when done; the last engine
+        flag_checks every other engine after its own matmul, so waiting on the
+        last engine's queue guarantees all shards have completed.
+
+        Returns:
+            Total theoretical FLOPs of the combined multi-engine workload.
+        """
+        bytes_per_element = 2
+        num_engines = len(ues)
+
+        assert num_engines >= 1, "ues must be non-empty"
+        assert M >= num_engines, \
+            f"M must be at least num_engines for multi-core execution, got M={M}, num_engines={num_engines}"
+        if m_shards is None:
+            m_base, m_rem = divmod(M, num_engines)
+            m_shards = [m_base + (1 if i < m_rem else 0) for i in range(num_engines)]
+        assert len(m_shards) == num_engines and sum(m_shards) == M and all(m >= 1 for m in m_shards), \
+            f"m_shards must be {num_engines} positive counts summing to M={M}, got {m_shards}"
+
+        total_flops = 0
+        program_addrs = []
+        row_offset = 0
+        for i, (ue, m_engine) in enumerate(zip(ues, m_shards)):
+            is_last = (i == num_engines - 1)
+            Ai_DRAM_ADDR = A_DRAM_ADDR + row_offset * K * bytes_per_element
+            OUTi_DRAM_ADDR = OUTPUT_DRAM_ADDR + row_offset * N * bytes_per_element
+            Ci_DRAM_ADDR = C_DRAM_ADDR
+            if C_DRAM_ADDR is not None and bias_mode == "full_matrix":
+                Ci_DRAM_ADDR = C_DRAM_ADDR + row_offset * N * bytes_per_element
+            row_offset += m_engine
+
+            # Dynamic path primes M/K/N GPRs on each engine before capture.
+            m_reg = k_reg = n_reg = None
+            if dynamic:
+                m_reg = ue.alloc_isa_reg()
+                k_reg = ue.alloc_isa_reg()
+                n_reg = ue.alloc_isa_reg()
+
+            ue.start_capture()
+            if not is_last:
+                ue.generate_instruction_flag_clear()
+            if dynamic:
+                ue.generate_instruction_add_set(m_reg, m_engine)
+                ue.generate_instruction_add_set(k_reg, K)
+                ue.generate_instruction_add_set(n_reg, N)
+            total_flops += ue.matmat_mul_core(
+                M=m_engine,
+                K=K,
+                N=N,
+                A_DRAM_ADDR=Ai_DRAM_ADDR,
+                B_DRAM_ADDR=B_DRAM_ADDR,
+                OUTPUT_DRAM_ADDR=OUTi_DRAM_ADDR,
+                softmax_enable=softmax_enable,
+                C_DRAM_ADDR=Ci_DRAM_ADDR,
+                bias_mode=bias_mode,
+                is_B_quantized=is_B_quantized,
+                data_type=data_type,
+                SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
+                gelu_enable=gelu_enable,
+                silu_enable=silu_enable,
+                sigmoid_enable=sigmoid_enable,
+                clamp_enable=clamp_enable,
+                log_enable=log_enable,
+                gpr_M_reg=m_reg,
+                gpr_K_reg=k_reg,
+                gpr_N_reg=n_reg,
+            )
+            if not is_last:
+                ue.generate_instruction_flag_set()
+            else:
+                for j in range(num_engines - 1):
+                    ue.generate_instruction_flag_check(target_engine_idx=j)
+            ue.generate_instruction_halt()
+            ue.stop_capture()
+            if dynamic:
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+
+            program_dram_addr = ue.get_program_dram_addr()
+            ue.write_captured_instructions_to_dram(program_dram_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+            program_addrs.append(program_dram_addr)
+
+        # Launch the flag-setting engines first so each one's flag_clear runs
+        # before the last engine can start polling their flags.
+        for ue, program_dram_addr in zip(ues, program_addrs):
+            ue.start_execute_from_dram(program_dram_addr)
+        ues[-1].wait_queue(wait_timeout_seconds)
+
+        print(f"Total Theoretical FLOPS ({num_engines} cores): {total_flops / 1e9:.6f} G")
         return total_flops
 
     def fmax_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, fmax_context_addr: int = 0) -> None:
