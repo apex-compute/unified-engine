@@ -324,6 +324,48 @@ class Gemma4VisionMixin:
         self.VIS_EMBED_NORMED = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_EMBED_OUT = self.allocate_tensor_dram(S * text_h * bpe)
 
+        # ---- Pooler tail on FPGA (spatial average-pool + embed_vision) ----
+        # The host used to average-pool the [S, H] encoder output down to
+        # OL soft tokens, scale by sqrt(H), then run embed_vision (RMSNorm +
+        # 768->text_h projection). We now do all of that on FPGA.
+        #
+        # The k x k average is done as pure element-wise adds. For the fixed
+        # canonical input the valid patches form a Wg x Wg raster grid (row =
+        # grid_row*Wg + col) followed by trailing zero-padding, so cell (cy,cx)
+        # averages the 9 rows {b, b+1, b+2, b+Wg, b+Wg+1, b+Wg+2, b+2Wg,
+        # b+2Wg+1, b+2Wg+2} where b = k*cx + k*Wg*cy. That factors into:
+        #   horizontal  s2[i] = h[i] + h[i+1]   + h[i+2]        (+1/+2 row adds)
+        #   vertical    v2[i] = s2[i] + s2[i+Wg] + s2[i+2*Wg]   (+Wg/+2Wg adds)
+        # then a strided pick of the cell-base rows {k*Wg*cy + k*cx} and a 1/k^2
+        # scale. No transpose, no weight matmul.
+        pool_k = self.VIS_POOL_K
+        pool_pids = (pixel_position_ids.squeeze(0)
+                     if pixel_position_ids.dim() == 3 else pixel_position_ids)
+        pool_pad = (padding_positions.squeeze(0)
+                    if padding_positions.dim() == 2 else padding_positions).cpu().bool()
+        clamped = pool_pids.clamp(min=0).long().cpu()
+        Wg = int(clamped[:, 0].max()) + 1                 # valid grid width (48)
+        Hg = int(clamped[:, 1].max()) + 1                 # valid grid height (48)
+        n_valid = Wg * Hg
+        # This element-wise factoring assumes the canonical raster layout: the
+        # first n_valid rows are the grid in row-major order, the rest are pad.
+        raster = torch.arange(n_valid)
+        layout_ok = (not bool(pool_pad[:n_valid].any())
+                     and bool(pool_pad[n_valid:].all())
+                     and bool((clamped[:n_valid, 1] * Wg + clamped[:n_valid, 0]
+                               == raster).all()))
+        assert layout_ok, ("vision pooler element-wise path expects a raster grid "
+                           "+ trailing padding; got a different patch layout.")
+        self.VIS_POOL_WG = Wg
+        self.VIS_POOL_OUT_W = Wg // pool_k                # 16 output cols
+        self.VIS_POOL_OUT_H = Hg // pool_k                # 16 output cell-rows
+        self.VIS_POOL_N_SOFT = self.VIS_POOL_OUT_W * self.VIS_POOL_OUT_H   # 256
+        # s2 / v2 hold the horizontal / vertical partial sums; VIS_POOL_OUT the
+        # compacted soft tokens.
+        self.VIS_POOL_S   = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_POOL_V   = self.allocate_tensor_dram(S * H * bpe)
+        self.VIS_POOL_OUT = self.allocate_tensor_dram(self.VIS_POOL_N_SOFT * H * bpe)
+
         if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
             raise MemoryError(
                 f"Gemma4 vision tensors overflow the 2-GB layout: "
@@ -553,6 +595,44 @@ class Gemma4VisionMixin:
             self._vis_flops += self.rms_norm_core_dram(M=S, N=H, A_DRAM_ADDR=self.VIS_MLP_DOWN, OUTPUT_DRAM_ADDR=self.VIS_POST_FFN_NORM, GAMMA_DRAM_ADDR=w['post_feedforward_layernorm'], gpr_M_reg=self._prime_M(S))
             self._vis_flops += self.eltwise_core_dram(M=S, N=S * H // S, dram_a=self.VIS_POST_ATTN_RES, dram_b=self.VIS_POST_FFN_NORM, dram_out=OUT, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S))
             _checkpoint(f"L{li}_post_attn")
+
+        # ---- Pooler tail: element-wise average-pool + embed_vision (was host) ----
+        # final_buf holds the [S, H] encoder output. Pool k x k patches into
+        # VIS_POOL_N_SOFT soft tokens via pure element-wise adds (see the factoring
+        # in vision_tensor_init), then the Gemma4MultimodalEmbedder tail: RMSNorm
+        # (ones gamma) -> IF4 projection. The host sqrt(H) pre-scale is dropped: it
+        # feeds straight into the RMSNorm and cancels to within eps (1e-6).
+        final_buf = self.VIS_IO_A if self.VIS_LAYERS % 2 == 0 else self.VIS_IO_B
+        k, Wg = self.VIS_POOL_K, self.VIS_POOL_WG
+        oW, oH, N_SOFT = self.VIS_POOL_OUT_W, self.VIS_POOL_OUT_H, self.VIS_POOL_N_SOFT
+        rb = H * bpe                                    # bytes per patch row
+        # Horizontal: s2[i] = h[i] + h[i+1] + h[i+2]  (offset-row adds; dram_b
+        # is the same buffer shifted by whole patch rows, all contiguous).
+        self._vis_flops += self.eltwise_core_dram(M=S - 1, N=H, dram_a=final_buf, dram_b=final_buf + rb, dram_out=self.VIS_POOL_S, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S - 1))
+        self._vis_flops += self.eltwise_core_dram(M=S - 2, N=H, dram_a=self.VIS_POOL_S, dram_b=final_buf + 2 * rb, dram_out=self.VIS_POOL_S, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S - 2))
+        # Vertical: v2[i] = s2[i] + s2[i+Wg] + s2[i+2*Wg].
+        self._vis_flops += self.eltwise_core_dram(M=S - Wg, N=H, dram_a=self.VIS_POOL_S, dram_b=self.VIS_POOL_S + Wg * rb, dram_out=self.VIS_POOL_V, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S - Wg))
+        self._vis_flops += self.eltwise_core_dram(M=S - 2 * Wg, N=H, dram_a=self.VIS_POOL_V, dram_b=self.VIS_POOL_S + 2 * Wg * rb, dram_out=self.VIS_POOL_V, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S - 2 * Wg))
+        # Compact the cell-base rows {k*Wg*cy + k*cx} into VIS_POOL_OUT. eltwise
+        # reads/writes with one shared stride, so the k:1 pick is a strided DMA:
+        # per cell-row, read oW rows at stride k (different read increment) and
+        # write them contiguously (compact write increment) -> no gather core.
+        for cy in range(oH):
+            src = self.VIS_POOL_V + (k * Wg * cy) * rb
+            dst = self.VIS_POOL_OUT + (oW * cy) * rb
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=src, sram_address=0x00000,
+                element_size=oW * H, stride_bytes_per_chunk=rb, stride_jump_bytes=k * rb)
+            self.sram_to_accelerator_memory(
+                sram_address=0x00000, accelerator_dram_address=dst, element_size=oW * H)
+        # Average scale 1/k^2 over the N_SOFT compacted rows.
+        self._vis_flops += self.eltwise_core_dram(M=N_SOFT, N=H, dram_a=self.VIS_POOL_OUT, dram_b=None, dram_out=self.VIS_POOL_OUT, mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / (k * k), gpr_M_reg=self._prime_M(N_SOFT))
+        # embed_vision pre-projection RMSNorm (with_scale=False -> ones gamma).
+        self._vis_flops += self.rms_norm_core_dram(M=N_SOFT, N=H, A_DRAM_ADDR=self.VIS_POOL_OUT, OUTPUT_DRAM_ADDR=self.VIS_EMBED_NORMED, GAMMA_DRAM_ADDR=self.VIS_EMBED_NORM_GAMMA, gpr_M_reg=self._prime_M(N_SOFT))
+        # embed_vision projection: IF4 768 -> text_h.
+        self._vis_flops += self.matmat_mul_core(M=N_SOFT, K=H, N=self.VIS_TEXT_H, A_DRAM_ADDR=self.VIS_EMBED_NORMED, B_DRAM_ADDR=self.VIS_EMBED_PROJ_INFO['data'], OUTPUT_DRAM_ADDR=self.VIS_EMBED_OUT, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.VIS_EMBED_PROJ_INFO['scale'], gpr_M_reg=self._prime_M(N_SOFT))
+        _checkpoint("pooler_tail")
+
         self.generate_instruction_halt()
         self._set_silent(_prev_silent)
         self.stop_capture()
@@ -751,51 +831,20 @@ class Gemma4VisionMixin:
         enc_result = self.execute_vision_encoder_bin(num_patches, profile=profile)
         _mark("patch+encoder execute (FPGA)")
 
-        # Host post processing: read the encoder output, mask padding, spatially
-        # average-pool by image position, then run the HF embed_vision RMSNorm +
-        # projection tail. Hardware has no spatial pooling primitive.
+        # The pooler tail (spatial average-pool + embed_vision) now runs on FPGA
+        # as part of the one-shot encoder program (see compile_vision_encoder_bin).
+        # Host only reads back the results — no pooling/projection compute here.
         final_buf = self.VIS_IO_A if self.VIS_LAYERS % 2 == 0 else self.VIS_IO_B
-        encoder_out = self.dma_from_accelerator_memory(final_buf, (num_patches, self.VIS_H)).cpu()
-        _mark("encoder readback (DMA)")
-
-        H, pool_k = self.VIS_H, self.VIS_POOL_K
-        hidden_states = encoder_out.detach().cpu()
-        if hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(0)
-        S = hidden_states.shape[1]
-        output_length = S // (pool_k * pool_k)
-        pids = pixel_position_ids.detach().cpu()
-        if pids.dim() == 2:
-            pids = pids.unsqueeze(0)
-        pad = padding_positions.detach().cpu()
-        if pad.dim() == 1:
-            pad = pad.unsqueeze(0)
-
-        with torch.no_grad():
-            h = hidden_states.float().clone()
-            h.masked_fill_(pad.unsqueeze(-1), 0.0)
-            input_seq_len = h.shape[1]
-            k = int((input_seq_len // output_length) ** 0.5)
-            k_squared = k * k
-            if k_squared * output_length != input_seq_len:
-                raise ValueError(
-                    f"Cannot pool {h.shape} to {output_length}: "
-                    f"k={k}^2 × {output_length} must equal {input_seq_len}.")
-            clamped = pids.clamp(min=0)
-            max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
-            kernel_idxs = torch.div(clamped, k, rounding_mode="floor")
-            kernel_idxs = (kernel_idxs[..., 0]
-                           + (max_x // k) * kernel_idxs[..., 1])
-            weights = F.one_hot(
-                kernel_idxs.long(), output_length).float() / k_squared
-            pooled = weights.transpose(1, 2) @ h
-            pooler_mask = torch.logical_not((weights == 0).all(dim=1))
-            pooled = (pooled * (H ** 0.5))[pooler_mask]
-            image_features = hf_model.model.embed_vision(
-                pooled.to(torch.bfloat16)).float().cpu()
-        assert image_features.shape[0] <= S, (
-            f"pooler produced {image_features.shape[0]} rows, scratch sized for {S}")
-        _mark("pool + project (host)")
+        # image_features: FPGA emitted exactly N_SOFT non-empty soft tokens (the
+        # strided compaction already dropped the all-padding cells), in cell order.
+        N_SOFT = self.VIS_POOL_N_SOFT
+        image_features = self.dma_from_accelerator_memory(
+            self.VIS_EMBED_OUT, (N_SOFT, self.VIS_TEXT_H)).float().cpu()
+        # encoder_out: readback (not host compute) kept for the numeric harness'
+        # pre-pool checkpoint (reference B).
+        encoder_out = self.dma_from_accelerator_memory(
+            final_buf, (num_patches, self.VIS_H)).cpu()
+        _mark("pooler tail readback (DMA)")
 
         # Numeric-harness checkpoints (SNR-compared vs HF in the numeric script).
         self._vis_ckpt = {
