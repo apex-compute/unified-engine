@@ -4366,10 +4366,25 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         feedback_mobilesam_snr_validation_contract)."""
         import pi05_torch_ref as _ref
         W = _ref.Weights(device="cpu", dtype=torch.bfloat16, quant="if4")
-        # Encode ONLY the slots run_vision kept -- it drops all-zero slots from the
-        # prefix entirely now, so a 3-image CPU encode would shape-mismatch the HW rows.
+        # Encode exactly the slots run_vision ACTUALLY returned, derived from the HW
+        # row count -- do not assume a policy. Both are reachable from the CLI:
+        #   --keep-masked-slots (DEFAULT ON): every slot is encoded and masked slots
+        #     ride along as -inf-masked placeholder rows -> 3 slots, 768 rows.
+        #   --no-keep-masked-slots / --skip-zero-vision-slots: all-zero slots are
+        #     dropped from the prefix entirely -> 2 slots, 512 rows.
+        # This check hardcoded the second one ("it drops all-zero slots from the
+        # prefix entirely now"), which stopped being true when keep-masked-slots
+        # became the default, so it asserted 768 != 512 before printing a number.
         masked = set(getattr(self, "masked_vision_slots", []))
-        kept_idx = [i for i in range(len(images_hwc)) if i not in masked]
+        n_hw_slots = hw_vision_tokens.shape[0] // self.VIS_S
+        if n_hw_slots == len(images_hwc):
+            kept_idx = list(range(len(images_hwc)))          # masked slots carried
+        else:
+            kept_idx = [i for i in range(len(images_hwc)) if i not in masked]
+        assert len(kept_idx) == n_hw_slots, (
+            f"run_vision returned {n_hw_slots} slot(s) ({hw_vision_tokens.shape[0]} rows "
+            f"/ VIS_S={self.VIS_S}) but the CPU side selected {len(kept_idx)} of "
+            f"{len(images_hwc)} images (masked_vision_slots={sorted(masked)})")
         images_t = torch.stack([torch.from_numpy(images_hwc[i]) for i in kept_idx],
                                dim=0).to(torch.bfloat16)
         cpu_tokens = _ref.vision_encode(images_t, W).reshape(-1, hw_vision_tokens.shape[-1])
@@ -4380,18 +4395,36 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         print("=== vision encoder CPU-vs-HW SNR check ===")
         S = self.VIS_S
         _names = ("main", "wrist", "pad")
+        # A masked slot's HW rows are NOT an encode: run_vision overwrites them with
+        # the finite 1e-6 placeholder (see the "Overwrite any masked slot" step),
+        # because the slot is -inf-masked out of all attention and its content is
+        # never read. The CPU oracle still encodes that image for real, so the two
+        # are structurally incomparable and score ~0 dB by construction. Folding
+        # them into `overall` buried 512 good rows under 256 meaningless ones and
+        # reported 5.95 dB for an encoder whose real slots were at ~22-24 dB --
+        # the masked-rows-poison-SNR trap the README warns about. Score the real
+        # slots, and report the masked ones as the placeholders they are.
+        live = []
         for j, i in enumerate(kept_idx):
             name = _names[i] if i < len(_names) else f"slot{i}"
             h, c = hw[j * S:(j + 1) * S], cpu[j * S:(j + 1) * S]
+            if i in masked:
+                print(f"  slot {i} ({name}): MASKED placeholder (1e-6 rows, -inf-masked "
+                      f"in attention) -- not scored, excluded from overall")
+                continue
+            live.append((h, c))
             noise = (h - c).pow(2).sum().sqrt()
             signal = c.pow(2).sum().sqrt()
             snr_db = 20 * torch.log10(signal / noise.clamp_min(1e-12))
             print(f"  slot {i} ({name}): SNR={snr_db:.2f}dB  hw[min={h.min():.3f},max={h.max():.3f}] "
                   f"cpu[min={c.min():.3f},max={c.max():.3f}]")
-        noise = (hw - cpu).pow(2).sum().sqrt()
-        signal = cpu.pow(2).sum().sqrt()
-        overall_snr_db = 20 * torch.log10(signal / noise.clamp_min(1e-12))
-        print(f"  overall: SNR={overall_snr_db:.2f}dB")
+        if live:
+            hw_live = torch.cat([h for h, _ in live], dim=0)
+            cpu_live = torch.cat([c for _, c in live], dim=0)
+            noise = (hw_live - cpu_live).pow(2).sum().sqrt()
+            signal = cpu_live.pow(2).sum().sqrt()
+            overall_snr_db = 20 * torch.log10(signal / noise.clamp_min(1e-12))
+            print(f"  overall (unmasked slots only): SNR={overall_snr_db:.2f}dB")
 
     def _prefix_snr_check(self, prompt_tokens, vision_tokens, valid_len):
         """CPU-vs-HW SNR check for the prefix's K/V cache (layer 0 and the
@@ -5078,6 +5111,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         stage and return None -- tests raw hardware health with the simplest
         possible op after vision+prefix's execution, independent of anything
         denoise-loop-specific."""
+        # Reset the per-inference compile ledger at the START of the timed region.
+        # The summary computes exec = total - compile, which is only right when the
+        # compile it subtracts happened INSIDE this inference. _compile_once caches,
+        # so compilation happens at most once per process -- but _compile_times kept
+        # its entries forever, and precompile_all() was the only thing that ever
+        # cleared them. Callers that skip precompile (libero_eval.py builds the
+        # engine and goes straight to run_inference) therefore compiled inline on
+        # inference #0, then subtracted that same 11.9s from EVERY later inference:
+        # a 36.9s pass reported "vision 1.6s exec" while the slot lines right above
+        # it plainly showed 3 x 2.3s = 6.9s, and claimed a 24.9s steady state that
+        # was really 36.9s. Clearing here keeps #0 honest (its compile IS inside the
+        # region and is still reported) and makes #1+ show compile 0.0s / exec = total.
+        self.__dict__.setdefault("_compile_times", {}).clear()
         t0 = time.perf_counter()
         if skip_prefix:
             t_vision = 0.0
@@ -5226,8 +5272,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         if pre is not None:
             print(f"  all 3 stages pre-compiled up front in {pre:.1f}s (not in the times "
                   f"above); this {t_exec:.1f}s is pure back-to-back execution\n")
-        else:
+        elif t_comp > 0:
+            # Compile ran INSIDE this inference (no precompile_all()), so this pass
+            # is the slow one and t_exec is what every later pass will cost.
             print(f"  compile is ONE-TIME (cached): steady-state inference is {t_exec:.1f}s\n")
+        else:
+            # Nothing compiled this pass -- the whole wall clock was execution.
+            print(f"  this {t_exec:.1f}s is pure execution (all programs already cached)\n")
         return actions
 
     # XDMA driver has a per-os.write() transfer size limit (~16-64MB, matching
@@ -5971,6 +6022,20 @@ def _load_norm_stats():
         + "\nIt ships with the pi05 checkpoint -- re-run the export to fetch it.")
 
 
+def _load_sample_state():
+    """The sample observation's raw (un-normalized) proprioceptive state.
+
+    Same reason _load_norm_stats exists: `meta` was a local of
+    _load_sample_prompt_tokens, and main's --verify-denoise branch read a
+    `meta["state_example"]` that was never in its scope -- so --verify-denoise
+    NameError'd after every full run and has never actually produced a number.
+    One loader, both callers.
+    """
+    sample_dir = Path(__file__).parent / "sample_data"
+    meta = json.loads((sample_dir / "meta.json").read_text())
+    return np.array(meta["state_example"], dtype=np.float32)
+
+
 def _load_sample_prompt_tokens():
     """Real tokenization of the sample observation (matches openpi's
     PaligemmaTokenizer.tokenize, Pi05 format -- the state is discretized INTO the
@@ -5982,10 +6047,8 @@ def _load_sample_prompt_tokens():
     live here and produced garbage language conditioning).
     """
     import sentencepiece
-    sample_dir = Path(__file__).parent / "sample_data"
     norm_stats = _load_norm_stats()
-    meta = json.loads((sample_dir / "meta.json").read_text())
-    state = np.array(meta["state_example"], dtype=np.float32)
+    state = _load_sample_state()
     state_q01 = np.array(norm_stats["state"]["q01"], dtype=np.float32)
     state_q99 = np.array(norm_stats["state"]["q99"], dtype=np.float32)
     state_norm = np.clip((state - state_q01) / (state_q99 - state_q01 + 1e-6) * 2.0 - 1.0, -1.0, 1.0)
@@ -5995,6 +6058,71 @@ def _load_sample_prompt_tokens():
                    f"State: {state_str};\nAction: ")
     sp = sentencepiece.SentencePieceProcessor(model_file=ensure_tokenizer())
     return np.array(sp.encode(full_prompt, add_bos=True), dtype=np.int64)
+
+
+def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, tag="main"):
+    """Set the engine-count class attributes. Returns True if this is multi-engine.
+
+    SHARED by pi05_libero_test.main() and libero_eval.py. It lives here as a
+    function rather than inline in main() because libero_eval constructs
+    Pi05Libero_UnifiedEngine() directly and never calls main() -- so before this
+    existed, every closed-loop LIBERO episode silently ran SINGLE-ENGINE no matter
+    what the caller thought, because the knobs are class attributes that only
+    main()'s argument parsing ever wrote.
+
+    `engines` is an int 1-8 or the literal "max"; normalize ONCE here so no
+    downstream comparison has to know which it got.
+    """
+    eng_max = (engines == "max")
+    eng_n = max(Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.values()) if eng_max \
+        else int(engines)
+    multi = eng_max or eng_n > 1
+
+    if eng_max:
+        # Each stage's OWN ceiling, read from STAGE_MAX_ENGINES rather than assumed.
+        # Those ceilings are all 8 today (vision reached 8 once it became 2D: 4 row
+        # groups x 2 K lanes -- it capped at 4 while it was row-sharded only, since
+        # S=256/slot is just 4 blocks of 64), so "max" and a flat 8 currently agree.
+        # They are NOT guaranteed to: any stage whose ceiling drops below 8 makes
+        # them diverge again, which is the whole reason this reads the dict.
+        # Applied as the same <STAGE>_NUM_ENGINES overrides --vis_4/--pref_8/--dns_8
+        # use, so the explicit flags below can still override any single stage.
+        for stage, n in Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.items():
+            setattr(Pi05Libero_UnifiedEngine, f"{stage}_NUM_ENGINES", n)
+        Pi05Libero_UnifiedEngine.NUM_ENGINES = eng_n
+        print(f"[{tag}] --engines max: per-stage ceilings -- "
+              + ", ".join(f"{s.lower()}={n}"
+                          for s, n in Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.items())
+              + " (vision is 2D: 4 row groups x 2 K lanes -- S=256/slot is only 4 blocks)")
+    else:
+        Pi05Libero_UnifiedEngine.NUM_ENGINES = eng_n
+        if eng_n > 1:
+            print(f"[{tag}] NUM_ENGINES={eng_n} -- vision encoder AND prefix LM "
+                  f"row-sharded (M) and the denoise gated MLP column-sharded (N) across "
+                  f"{eng_n} engines (bins cannot be dumped in this mode)")
+
+    # Per-stage engine overrides. These set <STAGE>_NUM_ENGINES, which
+    # _num_engines() prefers over NUM_ENGINES, so they compose with --engines and
+    # with each other: `--vis_4 --pref_8` runs vision on 4 and the prefix on 8
+    # while denoise stays on --engines. Sharding a stage is not free in DRAM --
+    # see _vis_worker_arena_base, which sizes ONE arena set from the PEAK count.
+    if vis_4:
+        Pi05Libero_UnifiedEngine.VIS_NUM_ENGINES = 4
+        print(f"[{tag}] --vis_4: vision encoder row-sharded across 4 engines "
+              "(S=256/slot = 4 blocks of 64 -> perfect even split; 4 is this stage's max)")
+    if pref_8:
+        Pi05Libero_UnifiedEngine.PREFIX_NUM_ENGINES = 8
+        print(f"[{tag}] --pref_8: prefix LM row-sharded across 8 engines "
+              "(S=832 -> 13 blocks of 64, uneven 5x128 + 3x64, ~81% efficient; "
+              "shorter prefixes degrade or fall back -- see _prefix_num_engines)")
+    if dns_8:
+        Pi05Libero_UnifiedEngine.DENOISE_NUM_ENGINES = 8
+        print(f"[{tag}] --dns_8: denoise stage column-sharded (N) across 8 engines "
+              "(M=64 is one row block -> row-sharding impossible; mlp down uses "
+              "split_k + reduce_add)")
+    if multi or vis_4 or pref_8 or dns_8:
+        print(f"[{tag}] multi-engine: bins cannot be dumped in this mode")
+    return multi or vis_4 or pref_8 or dns_8
 
 
 def main():
@@ -6153,52 +6281,8 @@ def main():
         "--encoderend and --prefixend are mutually exclusive: they are two different "
         "stopping points on the same ladder (encoder -> prefix -> full). Pick one.")
 
-    # --engines is either an int or the literal "max"; normalize ONCE here so no
-    # downstream comparison has to know which it got.
-    _eng_max = (args.engines == "max")
-    _eng_n = max(Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.values()) if _eng_max \
-        else int(args.engines)
-    _multi = _eng_max or _eng_n > 1
-
-    if _eng_max:
-        # Per-stage ceilings, NOT a flat 8: vision asserts above 4. Applied as the
-        # same <STAGE>_NUM_ENGINES overrides --vis_4/--pref_8/--dns_8 use, so the
-        # explicit flags below can still override any single stage.
-        for _stage, _n in Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.items():
-            setattr(Pi05Libero_UnifiedEngine, f"{_stage}_NUM_ENGINES", _n)
-        Pi05Libero_UnifiedEngine.NUM_ENGINES = _eng_n
-        print("[main] --engines max: per-stage ceilings -- "
-              + ", ".join(f"{s.lower()}={n}"
-                          for s, n in Pi05Libero_UnifiedEngine.STAGE_MAX_ENGINES.items())
-              + " (vision is 2D: 4 row groups x 2 K lanes -- S=256/slot is only 4 blocks)")
-    else:
-        Pi05Libero_UnifiedEngine.NUM_ENGINES = _eng_n
-        if _eng_n > 1:
-            print(f"[main] NUM_ENGINES={_eng_n} -- vision encoder AND prefix LM "
-                  f"row-sharded (M) and the denoise gated MLP column-sharded (N) across "
-                  f"{_eng_n} engines (bins cannot be dumped in this mode)")
-
-    # Per-stage engine overrides. These set <STAGE>_NUM_ENGINES, which
-    # _num_engines() prefers over NUM_ENGINES, so they compose with --engines and
-    # with each other: `--vis_4 --pref_8` runs vision on 4 and the prefix on 8
-    # while denoise stays on --engines. Sharding a stage is not free in DRAM --
-    # see _vis_worker_arena_base, which sizes ONE arena set from the PEAK count.
-    if args.vis_4:
-        Pi05Libero_UnifiedEngine.VIS_NUM_ENGINES = 4
-        print("[main] --vis_4: vision encoder row-sharded across 4 engines "
-              "(S=256/slot = 4 blocks of 64 -> perfect even split; 4 is this stage's max)")
-    if args.pref_8:
-        Pi05Libero_UnifiedEngine.PREFIX_NUM_ENGINES = 8
-        print("[main] --pref_8: prefix LM row-sharded across 8 engines "
-              "(S=832 -> 13 blocks of 64, uneven 5x128 + 3x64, ~81% efficient; "
-              "shorter prefixes degrade or fall back -- see _prefix_num_engines)")
-    if args.dns_8:
-        Pi05Libero_UnifiedEngine.DENOISE_NUM_ENGINES = 8
-        print("[main] --dns_8: denoise stage column-sharded (N) across 8 engines "
-              "(M=64 is one row block -> row-sharding impossible; mlp down uses "
-              "split_k + reduce_add)")
-    if _multi or args.vis_4 or args.pref_8 or args.dns_8:
-        print("[main] multi-engine: bins cannot be dumped in this mode")
+    _multi = configure_engines(args.engines, vis_4=args.vis_4, pref_8=args.pref_8,
+                               dns_8=args.dns_8, tag="main")
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
 
@@ -6371,7 +6455,11 @@ def main():
         W = _ref.Weights(device=ref_device, dtype=torch.bfloat16, quant="if4")
         ref_images = torch.stack([torch.from_numpy(im).to(torch.bfloat16) for im in images], dim=0).to(ref_device)
         ref_prompt = torch.from_numpy(prompt_tokens).long().unsqueeze(0).to(ref_device)
-        ref_state = torch.tensor([meta["state_example"]], dtype=torch.float32).to(ref_device)
+        # run_pi05 reads `state` ONLY for b = state.shape[0] -- Pi05 feeds the
+        # state through the prompt TEXT (see _load_sample_prompt_tokens), not as a
+        # continuous input. Shape is what matters; we still pass the real sample
+        # state so this matches pi05_torch_ref.main() exactly.
+        ref_state = torch.from_numpy(_load_sample_state()).unsqueeze(0).to(ref_device)
         noise7 = np.random.RandomState(0).randn(10, 7).astype(np.float32)  # SAME as run_inference
         noise32 = torch.zeros(1, 10, 32, dtype=torch.float32)
         noise32[..., :7] = torch.from_numpy(noise7)
@@ -6433,8 +6521,20 @@ def main():
                   f"hw[{hw[:,d].min():.3f},{hw[:,d].max():.3f}] cpu[{cpu[:,d].min():.3f},{cpu[:,d].max():.3f}]")
         for tstep in range(10):
             print(f"  step{tstep}: SNR={_snr(hw[tstep], cpu[tstep]):.2f}dB")
-        print("CPU-IF4 reference action_chunk (10,7):")
+        # Print the reference in BOTH spaces. The SNR block above is computed in
+        # NORMALIZED space, but main prints the FPGA chunk UNNORMALIZED ("real
+        # robot actions"). Printing ref_np raw next to it invited a false
+        # side-by-side: e.g. the gripper's q01/q99 are +/-1 so dim6 is identity
+        # and looks comparable, while dim0 is scaled by a different factor
+        # entirely and is not.
+        print("CPU-IF4 reference action_chunk (10,7) [normalized, matches SNR block]:")
         print(ref_np)
+        _ns = _load_norm_stats()
+        _q01 = np.array(_ns["actions"]["q01"], dtype=np.float32)
+        _q99 = np.array(_ns["actions"]["q99"], dtype=np.float32)
+        print("CPU-IF4 reference action_chunk (10,7) [real robot actions, "
+              "directly comparable to the FPGA chunk above]:")
+        print((ref_np + 1.0) / 2.0 * (_q99 - _q01 + 1e-6) + _q01)
 
     if args.probe_step0:
         ue.probe_nan_report()

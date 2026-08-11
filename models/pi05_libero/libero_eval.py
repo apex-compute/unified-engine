@@ -57,10 +57,16 @@ sys.path.insert(0, str(_OPENPI / "packages" / "openpi-client" / "src"))   # imag
 sys.path.insert(0, str(_OPENPI / "third_party" / "libero"))              # libero package
 sys.path.insert(0, str(_HERE))                                           # engine module
 
-# pi0.5 checkpoint assets (norm_stats + tokenizer) -- same paths as _test.py main().
-_CKPT = pathlib.Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"
-_NORM_STATS_PATH = _CKPT / "assets" / "physical-intelligence" / "libero" / "norm_stats.json"
-_TOKENIZER_PATH = pathlib.Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model"
+# pi0.5 checkpoint assets (norm_stats + tokenizer).
+#
+# These used to be hardcoded ~/.cache/openpi paths with a comment claiming they were
+# "the same paths as _test.py main()". They stopped being that: the checkpoint now
+# lands inside <model>_bin/ (the model convention), and _test.py's _load_norm_stats()
+# / ensure_tokenizer() search there FIRST, falling back to ~/.cache only so an older
+# machine keeps working. This file kept looking solely at the legacy location and died
+# with FileNotFoundError on norm_stats.json after a full engine build -- ~2 minutes in.
+# Resolve through _test.py's helpers so there is one source of truth for both entry
+# points and this cannot drift again.
 
 LIBERO_ENV_RESOLUTION = 256   # sim render resolution
 RESIZE = 224                  # model input resolution
@@ -80,10 +86,10 @@ class _Pi05Pre:
     the (10,7) output back to robot action space."""
 
     def __init__(self):
-        import json
         import sentencepiece
-        self.norm = json.loads(_NORM_STATS_PATH.read_text())["norm_stats"]
-        self.sp = sentencepiece.SentencePieceProcessor(model_file=str(_TOKENIZER_PATH))
+        import pi05_libero_test as M
+        self.norm = M._load_norm_stats()
+        self.sp = sentencepiece.SentencePieceProcessor(model_file=M.ensure_tokenizer())
         self.s_q01 = np.array(self.norm["state"]["q01"], dtype=np.float32)
         self.s_q99 = np.array(self.norm["state"]["q99"], dtype=np.float32)
         self.a_q01 = np.array(self.norm["actions"]["q01"], dtype=np.float32)
@@ -186,8 +192,15 @@ class _TorchBackend:
 class _FpgaBackend:
     """The UnifiedEngine on real hardware."""
 
-    def __init__(self):
+    def __init__(self, engines="max", vis_4=False, pref_8=False, dns_8=False):
         import pi05_libero_test as M
+        # MUST run before Pi05Libero_UnifiedEngine() -- the engine counts are class
+        # attributes read during construction/compile, and this module never calls
+        # pi05_libero_test.main(), which is the only other place that sets them.
+        # Without this every closed-loop episode ran single-engine regardless of
+        # what the caller asked for, at ~195s/inference instead of ~37s.
+        M.configure_engines(engines, vis_4=vis_4, pref_8=pref_8, dns_8=dns_8,
+                            tag="eval")
         print("[eval] building FPGA engine (weight_init + tensor_init)...", flush=True)
         self.ue = M.Pi05Libero_UnifiedEngine()
         M.init_hang_prevention(self.ue)
@@ -329,6 +342,40 @@ def main():
     ap.add_argument("--wait-steps", type=int, default=10)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--video-out", default=str(_HERE / "data" / "libero" / "videos"))
+    def _engines_arg(value):
+        """--engines N | max.  'max' == each stage's own ceiling, not a flat 8."""
+        if str(value).strip().lower() == "max":
+            return "max"
+        try:
+            n = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--engines takes an integer 1-8 or 'max', got {value!r}")
+        if not 1 <= n <= 8:
+            raise argparse.ArgumentTypeError(
+                f"--engines must be 1-8 (the ISA's flag-check addresses engines 0-7), "
+                f"got {n}")
+        return n
+
+    # DEFAULT "max", unlike pi05_libero_test.py's default of 1. A closed-loop
+    # episode is 9-22 inferences; at single-engine ~195s each that is 30-70 min,
+    # versus ~37s each fully sharded. Nobody wants the slow one by accident, and
+    # before these flags existed this script had NO way to ask for anything else.
+    ap.add_argument("--engines", type=_engines_arg, default="max", metavar="N|max",
+                    help="--backend fpga only. Engines to shard across: 1-8, or 'max' "
+                         "(DEFAULT) for each stage's own ceiling -- vision 4, prefix 8, "
+                         "denoise 8. A flat 8 is NOT the same and asserts in vision "
+                         "(S=256/slot is only 4 blocks of 64). Pass --engines 1 for the "
+                         "single-engine control.")
+    ap.add_argument("--vis_4", action="store_true",
+                    help="--backend fpga only. Force vision onto 4 engines, independently "
+                         "of --engines (takes precedence for that stage).")
+    ap.add_argument("--pref_8", action="store_true",
+                    help="--backend fpga only. Force the prefix LM onto 8 engines, "
+                         "independently of --engines.")
+    ap.add_argument("--dns_8", action="store_true",
+                    help="--backend fpga only. Force the denoise stage onto 8 engines "
+                         "(column/N-sharded), independently of --engines.")
     ap.add_argument("--backend", default="torch", choices=["torch", "fpga"],
                     help="torch = pi05_torch_ref golden reference; fpga = real hardware")
     ap.add_argument("--device", default="cuda", help="--backend torch only")
@@ -364,13 +411,33 @@ def main():
     torch.load = functools.partial(torch.load, weights_only=False)
 
     import imageio
+    # LIBERO's benchmark.get_task_init_states() (LIBERO/libero/libero/benchmark/
+    # __init__.py:164) torch.load()s .init files holding PICKLED NUMPY arrays.
+    # torch >= 2.6 flipped weights_only to True by default, which refuses numpy's
+    # reconstruction globals -- so every task fails at init-state load with an
+    # UnpicklingError before the sim ever starts. Allowlisting the numpy globals
+    # one by one does not converge (the dtype/scalar machinery pulls in more), and
+    # these files are plain data from the LIBERO clone, so restore the pre-2.6
+    # default for them. Scoped to this import site, not installed process-wide at
+    # module import, so nothing else in the repo inherits it.
+    import torch as _torch
+    if not getattr(_torch.load, "_libero_weights_only_shim", False):
+        _orig_torch_load = _torch.load
+        def _torch_load_compat(*a, **kw):
+            kw.setdefault("weights_only", False)
+            return _orig_torch_load(*a, **kw)
+        _torch_load_compat._libero_weights_only_shim = True
+        _torch.load = _torch_load_compat
+
     from libero.libero import benchmark, get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
     from openpi_client import image_tools
 
     # --- build the backend ONCE (weights stay resident across all episodes) ---
     backend = (_TorchBackend(args.device, args.quant, args.fresh_noise)
-               if args.backend == "torch" else _FpgaBackend())
+               if args.backend == "torch"
+               else _FpgaBackend(engines=args.engines, vis_4=args.vis_4,
+                                 pref_8=args.pref_8, dns_8=args.dns_8))
     pre = _Pi05Pre()
     print(f"[eval] backend '{args.backend}' ready.", flush=True)
 
