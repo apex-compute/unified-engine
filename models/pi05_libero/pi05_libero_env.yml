@@ -1,17 +1,24 @@
 # Single conda env for pi05_libero: runs the FPGA model AND the LIBERO simulator in
 # ONE process -- no socket, no server/client. CPU-only; no CUDA device required.
 #
-#   conda env create -f pi05_libero_env.yml
-#   conda activate pi05_libero
-#   # one-time: answer LIBERO's interactive first-run config prompt with defaults
-#   printf 'N\n' | python -c "import libero.libero" >/dev/null 2>&1 || true
-#   python pi05_libero_test.py       # downloads + exports weights on first run
+# ONE COMMAND does everything, including the two steps conda cannot express:
 #
-# Headless rendering (libero_eval.py only):
+#   bash models/pi05_libero/setup_env.sh
+#
+# Or by hand, from the REPO ROOT (the LIBERO clone lands in ./src/libero):
+#
+#   conda env create -f models/pi05_libero/pi05_libero_env.yml
+#   conda activate pi05_libero
+#   bash models/pi05_libero/setup_env.sh --osmesa-only   # see "OSMesa" below
+#   printf 'N\n' | python -c "import libero.libero"      # seed LIBERO's config prompt
+#   python models/pi05_libero/pi05_libero_test.py        # downloads+exports weights once
+#
+# Headless rendering (libero_eval.py only) -- ALL THREE are required:
 #   export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
+#   export LD_LIBRARY_PATH=$CONDA_PREFIX/lib
 #
 # -----------------------------------------------------------------------------
-# WHY THESE PINS -- all four are load-bearing, do not "upgrade" them casually:
+# WHY THESE PINS -- all load-bearing, do not "upgrade" them casually:
 #
 #  numpy<2      robosuite/gym 0.25 break on numpy 2.x. This is what lets the sim and
 #               user_dma_core coexist in ONE interpreter. It also constrains the jax
@@ -29,10 +36,25 @@
 #               libero_eval.py --backend torch) still works, just slowly. If you ever
 #               DO have a CUDA box, swap the index-url to the matching cuXXX and keep
 #               torch at 2.7.1 so nothing else in here has to move.
+#               NOTE torch >= 2.6 defaults torch.load(weights_only=True), which
+#               REJECTS LIBERO's pickled-numpy init-state files. libero_eval.py
+#               installs a scoped shim for that; standalone scripts need their own.
 #
-#  mesalib      Software OpenGL (OSMesa) for headless MuJoCo. EGL is the usual
-#               headless path but needs a GPU; with no GPU present, OSMesa is the
-#               one that works. Comes from conda, not pip.
+#  mesalib      GL/GLX/EGL userspace + llvmpipe software rasterizer. It does NOT
+#               ship libOSMesa (dropped by conda-forge; verified absent in both
+#               25.2.8 and 26.1.6, and there is no standalone `osmesa` package).
+#               See "OSMesa" below -- that library has to come from elsewhere.
+#
+# OSMesa -- THE ONE THING CONDA CANNOT INSTALL
+#   MuJoCo's own Renderer can do surfaceless EGL, but robosuite goes through
+#   EGLGLContext, which needs the EGL PLATFORM_DEVICE extension and therefore
+#   /dev/dri. On a box where you are not in the `render`/`video` groups that is
+#   denied, and no amount of LIBGL_ALWAYS_SOFTWARE helps -- so OSMesa is the only
+#   working headless path, and libOSMesa is not on conda-forge. setup_env.sh pulls
+#   Ubuntu's libosmesa6 with `apt-get download` (NO sudo, it is a plain download),
+#   extracts it, and drops libOSMesa.so.8 into $CONDA_PREFIX/lib. It has no missing
+#   transitive deps.
+#   If you DO have a usable render node, skip it and use MUJOCO_GL=egl instead.
 #
 # openpi is deliberately ABSENT. It is only ever needed for the one-time weight
 # export, and pi05_ckpt_noopenpi.py reproduces the only two things the export used
@@ -50,7 +72,7 @@ channels:
 dependencies:
   - python=3.11
   - pip
-  # Headless software rendering for MuJoCo (no GPU -> OSMesa, not EGL).
+  # GL userspace + software rasterizer. NOT a source of libOSMesa -- see above.
   - mesalib
   - libglu
 
@@ -94,9 +116,27 @@ dependencies:
       - PyOpenGL
       - openpi-client          # libero_eval.py: `from openpi_client import image_tools`
 
-      # LIBERO itself (scenes/BDDL/benchmark API) -- not on PyPI. Its setup.py has
-      # install_requires=[], so this pulls NO transitive deps and cannot fight the
-      # pins above. (Its requirements.txt asks for numpy==1.22.4 / robosuite==1.4.0 /
-      # transformers==4.21.1, but setup.py ignores that file -- and so do we, the
-      # same way openpi does.)
-      - libero @ git+https://github.com/Lifelong-Robot-Learning/LIBERO.git
+      # ---- LIBERO itself (scenes/BDDL/benchmark API) ----
+      # MUST be `-e` WITH `editable_mode=compat`. Both halves are load-bearing:
+      #
+      #   plain `libero @ git+...`  -> pip reports success and installs a ~5.5 KB
+      #     METADATA-ONLY wheel. LIBERO has no libero/__init__.py (it is a PEP 420
+      #     namespace package), so its setup.py's find_packages() returns []. The
+      #     failure surfaces much later as `ModuleNotFoundError: No module named
+      #     'libero'`. This is what this line used to be.
+      #
+      #   plain `-e` (PEP 660)      -> ALSO broken, same root cause: the generated
+      #     __editable___libero_finder.py has `MAPPING = {}`, so it resolves nothing.
+      #
+      #   `editable_mode=compat`    -> falls back to the legacy .pth mechanism, which
+      #     puts the PROJECT ROOT on sys.path, and the namespace package then resolves.
+      #
+      # Verify with `python -c "import libero.libero"` -- never trust pip's message here.
+      # setup.py has install_requires=[], so this pulls NO transitive deps and cannot
+      # fight the pins above. (Its requirements.txt asks for numpy==1.22.4 /
+      # robosuite==1.4.0 / transformers==4.21.1, but setup.py ignores that file -- and
+      # so do we, the same way openpi does.)
+      #
+      # Clones to ./src/libero relative to your CWD, so run conda env create from the
+      # repo root. ~405 MB of scene assets, plain files, no git-lfs.
+      - -e git+https://github.com/Lifelong-Robot-Learning/LIBERO.git#egg=libero --config-settings editable_mode=compat
