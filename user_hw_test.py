@@ -401,7 +401,8 @@ def matmat_mul_two_engine_flag_check_test(
     ue1.clear_capture_buffer()
 
 
-def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines: int = 8):
+def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines: int = 8,
+                                            shared_read: bool = False):
     """
     Shard A along the M dimension into num_engines parts and run each part on
     engine0..engine(num_engines-1) in parallel, each multiplied by the same B.
@@ -410,6 +411,11 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
     Same test purpose as matmat_mul_two_engine_flag_check_test when num_engines=2
     (equivalent, not identical: equal M-split and ue0-waits-for-workers sync).
     When num_engines=1, no flag_check or worker engines; reset loop is unchanged.
+
+    shared_read=False: each engine DMA-reads its own private DRAM buffer
+    (different memory locations, no read contention on one address range).
+    shared_read=True: every engine DMA-reads the SAME DRAM buffer (engine 0's),
+    stressing concurrent reads to a single memory location.
     """
     import user_dma_core
 
@@ -427,7 +433,11 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
 
     a_addrs = []
     for i, ue in enumerate(ues):
+        ue.software_reset()
         a_addrs.append(ue.allocate_tensor_dram(1 * 1024 * 1024))
+    if shared_read:
+        # All engines read the same DRAM buffer (engine 0's allocation).
+        a_addrs = [a_addrs[0]] * num_engines
 
     prog_addrs = []
     ues[0].start_capture()
@@ -472,10 +482,11 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
     speed_mb_per_s = total_bytes_transferred / latency_us
     print(f"Total latency: {latency_us} us")
     print(f"speed {speed_mb_per_s:.2f} MB/s")
+    read_mode = "shared" if shared_read else "private"
     for i in range(num_engines):
-        generate_trace(ues[i], f"multi_engine_read_test_engine_{num_engines}_{i}.csv")
+        generate_trace(ues[i], f"multi_engine_read_test_{read_mode}_engine_{num_engines}_{i}.csv")
 
-    record_test("matmat_mul_multi_engine_flag_check",
+    record_test(f"matmat_mul_multi_engine_flag_check+{read_mode}_read",
                 f"M={M}, K={K}, N={N}, num_engines={num_engines}",
                 mb_per_s=speed_mb_per_s)
 
@@ -614,6 +625,145 @@ def matmat_mul_two_cores_unified_test(
 
     for M, K, N in runtime_list:
         assert M >= 2, f"M must be at least 2 for two-core execution, got M={M}"
+        assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, \
+            "runtime K and N must be multiples of 64"
+        _run_rng_matched_pair(
+            lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=False),
+            lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=True),
+        )
+
+
+def matmat_mul_multi_cores_unified_test(
+    runtime_list=None,
+    num_engines: int = 8,
+    softmax_enable: bool = False,
+    gelu_enable: bool = False,
+    silu_enable: bool = False,
+    sigmoid_enable: bool = False,
+    clamp_enable: bool = False,
+    log_enable: bool = False,
+    input_scale: float = 1.0,
+    snr_threshold_db: float = 40.0,
+):
+    """Run RNG-matched legacy/dynamic multi-core matmuls (M sharded across num_engines)."""
+    import user_dma_core
+
+    if runtime_list is None:
+        runtime_list = [(4096, 4096, 4096)]
+    assert runtime_list, "runtime_list must be non-empty"
+
+    def _run_case(M, K, N, dynamic):
+        engine_base_stride = 0x00010000
+        tensor_region_stride = 0x04000000
+        program_region_stride = 0x01000000
+        assert num_engines * tensor_region_stride <= DRAM_INSTRUCTION_ADDR - DRAM_ACTIVATION_ADDR, \
+            "per-engine tensor regions overflow the activation window"
+
+        ues = []
+        for i in range(num_engines):
+            ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride)
+            ue._tensor_dram_addr = DRAM_ACTIVATION_ADDR + i * tensor_region_stride
+            ue._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + i * program_region_stride
+            ues.append(ue)
+
+        A_DRAM_ADDR = ues[0].allocate_tensor_dram(M * K * 2)
+        B_DRAM_ADDR = ues[0].allocate_tensor_dram(N * K * 2)
+        OUTPUT_DRAM_ADDR = ues[0].allocate_tensor_dram(M * N * 2)
+
+        a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+        if input_scale != 1.0:
+            a = (a.to(torch.float32) * float(input_scale)).to(torch.bfloat16)
+        b = torch.randn(N, K, dtype=torch.bfloat16)
+
+        ues[0].dma_to_accelerator_memory(A_DRAM_ADDR, a)
+        ues[0].dma_to_accelerator_memory(B_DRAM_ADDR, b)
+
+        total_flops = UnifiedEngine.matmat_mul_multi_cores(
+            ues=ues,
+            M=M,
+            K=K,
+            N=N,
+            A_DRAM_ADDR=A_DRAM_ADDR,
+            B_DRAM_ADDR=B_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            softmax_enable=softmax_enable,
+            gelu_enable=gelu_enable,
+            silu_enable=silu_enable,
+            sigmoid_enable=sigmoid_enable,
+            clamp_enable=clamp_enable,
+            log_enable=log_enable,
+            dynamic=dynamic,
+        )
+        for ue in ues:
+            ue.report_timing_and_instruction_count()
+
+        # Parallel completion time is bounded by the slowest engine.
+        latency_us = max(ue.report_latency_in_us() for ue in ues)
+        flop_rate_gflops = total_flops / (latency_us * 1e3)
+        flops_ratio = flop_rate_gflops / user_dma_core.UE_PEAK_GFLOPS / (10 * num_engines)
+        print(
+            f"Report FLOPS for {num_engines}-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS, "
+            f"{flops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, "
+            f"softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, "
+            f"silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, dynamic={dynamic}"
+        )
+
+        trace_suffix = (
+            f"{K}_{N}_{'softmax_enabled' if softmax_enable else 'softmax_disabled'}_"
+            f"{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_"
+            f"{'silu_enabled' if silu_enable else 'silu_disabled'}_"
+            f"{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}"
+        )
+        m_base, m_rem = divmod(M, num_engines)
+        m_shards = [m_base + (1 if i < m_rem else 0) for i in range(num_engines)]
+        for i, ue in enumerate(ues):
+            generate_trace(
+                ue, f"matmat_mul_multi_cores_trace_engine{i}_{m_shards[i]}_{trace_suffix}.csv")
+
+        output = ues[0].dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+        ref = a @ b.T
+        if gelu_enable:
+            ref = ref * torch.sigmoid(1.702 * ref)
+        elif silu_enable:
+            ref = ref * torch.sigmoid(ref)
+        elif sigmoid_enable:
+            ref = torch.sigmoid(ref)
+        elif clamp_enable:
+            ref = torch.clamp(ref, min=0.0)
+        elif log_enable:
+            ref = torch.log(torch.clamp(ref, min=1e-3))
+        if softmax_enable:
+            ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
+
+        snr_combined = calculate_snr(ref, output)
+        print(f"{num_engines}-cores matmul SNR combined: {snr_combined:.2f} dB")
+        assert snr_combined >= snr_threshold_db or snr_combined == float("inf"), \
+            f"SNR {snr_combined:.2f} dB must be at least {snr_threshold_db:g} dB"
+
+        flags = []
+        if softmax_enable: flags.append("softmax")
+        if gelu_enable:    flags.append("gelu")
+        if silu_enable:    flags.append("silu")
+        if sigmoid_enable: flags.append("sigmoid")
+        if clamp_enable:   flags.append("clamp")
+        if log_enable:     flags.append("log")
+        if dynamic:        flags.append("dynamic")
+        if input_scale != 1.0: flags.append(f"scale={input_scale:g}")
+        flag_str = ("+" + "+".join(flags)) if flags else ""
+        record_test(
+            f"matmat_mul_multi_cores{flag_str}",
+            f"M={M}, K={K}, N={N}, num_engines={num_engines}",
+            snr_db=snr_combined,
+            gflops=flop_rate_gflops,
+        )
+
+        for ue in ues:
+            ue.reset_tensor_dram_addr()
+            ue.clear_capture_buffer()
+
+    for M, K, N in runtime_list:
+        assert M >= num_engines, \
+            f"M must be at least num_engines for multi-core execution, got M={M}, num_engines={num_engines}"
         assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, \
             "runtime K and N must be multiples of 64"
         _run_rng_matched_pair(
@@ -1782,7 +1932,7 @@ def rope_hf_core_dram_gqa_unified_test(shapes=None):
 
 def bf16_permute_test(dim_0: int, dim_1: int, dim_2: int):
     """
-    Tests bf16_permute_core: permutes (dim_0, dim_1, dim_2) -> (dim_1, dim_0, dim_2).
+    Tests bf16_permute_dram_core: permutes (dim_0, dim_1, dim_2) -> (dim_1, dim_0, dim_2).
     """
     ue = UnifiedEngine()
 
@@ -1790,9 +1940,13 @@ def bf16_permute_test(dim_0: int, dim_1: int, dim_2: int):
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(dim_1 * dim_0 * dim_2 * 2)
 
     ue.start_capture()
-    ue.bf16_permute_core(dim_0=dim_0, dim_1=dim_1, dim_2=dim_2,
-                                       INPUT_DRAM_ADDR=INPUT_DRAM_ADDR,
-                                       OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR)
+    ue.bf16_permute_dram_core(
+        num_groups=dim_1,
+        group_rows=dim_0,
+        row_width=dim_2,
+        in_dram=INPUT_DRAM_ADDR,
+        out_dram=OUTPUT_DRAM_ADDR,
+    )
     ue.stop_capture()
     ue.generate_instruction_halt()
     program_dram_addr = ue.get_program_dram_addr()
@@ -3734,135 +3888,6 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
         lambda: _run_case(),
         lambda: _run_case(dynamic=True, dynamic_addr=True),
     )
-
-def gemma4_vision_profile():
-    """Micro-profile each Gemma4 E2B vision-encoder matmul step in isolation.
-
-    Drives ``matmat_mul_core`` with the EXACT config the encoder emits (see
-    ``models/gemma4_e2b/gemma4_e2b_refactor.py``: ``vision_patch_embed`` /
-    ``compile_vision_layer`` / ``compile_vision_layer_post_attn`` /
-    ``vision_embed_project``): IF4-quantized B, per-group scale, dynamic-M only
-    (``gpr_M_reg`` set, K/N static -- the encoder never uses the legacy
-    compile-time-tiled path), fused output clamp on q/k/v/o/up/down, fused GELU on
-    gate, none on patch/embed. Dummy data; a soft SNR check reports correctness
-    without aborting. Mirrors the on-device ``--image --profile`` per-step
-    breakdown so each projection's standalone HW latency + GFLOPS is directly
-    readable. Self-attention (unified_attention core, not a matmat mul) is
-    profiled at the end for completeness.
-
-    Shapes: S=2520 patches, H=768, MLP=3072, pooled N_soft=256 -> VIS_TEXT_H=1536,
-    12 heads x head_dim 64 over aligned seq 2560.
-    """
-    S, H, MLP = 2520, 768, 3072
-    N_SOFT, TEXT_H = 256, 1536
-    CLAMP_MIN, CLAMP_MAX = -11.0, 11.0   # representative vision clip bounds (timing only)
-    # (label, M, K, N, gelu_enable, clamp_enable) -- config as emitted per step.
-    # gate fuses GELU (its output clamp is a separate op in the encoder); q/k/v/o/
-    # up/down fuse the output clamp; patch/embed fuse nothing.
-    steps = [
-        ("patch_proj",        S,      H,   H,      False, False),
-        ("q_proj",            S,      H,   H,      False, True),
-        ("k_proj",            S,      H,   H,      False, True),
-        ("v_proj",            S,      H,   H,      False, True),
-        ("attn_proj(o_proj)", S,      H,   H,      False, True),
-        ("gate_proj",         S,      H,   MLP,    True,  False),
-        ("up_proj",           S,      H,   MLP,    False, True),
-        ("down_proj",         S,      MLP, H,      False, True),
-        ("embed_proj",        N_SOFT, H,   TEXT_H, False, False),
-    ]
-    print("\n" + "=" * 82)
-    print("Gemma4 E2B vision encoder -- per-step matmul profile "
-          "(matmat_mul_core, IF4, dynamic-M)")
-    print("=" * 82)
-
-    results = []
-    for label, M, K, N, gelu, clamp in steps:
-        ue = UnifiedEngine()
-        # IF4-quantized weight B (N,K) -- same layout/precision as the pre-quantized
-        # tower weights the encoder loads.
-        x = torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1
-        B_DRAM, SCALE_DRAM = ue.quantize_weight(weight=x, N=N, K=K,
-                                                data_type=TYPE.IF4, int_variant=True)
-        A_DRAM = ue.allocate_tensor_dram(M * K * 2)
-        OUT_DRAM = ue.allocate_tensor_dram(M * N * 2)
-
-        # matmat_mul_core dynamic path with M/K/N runtime GPRs (same core + IF4
-        # config the encoder uses; the encoder happens to leave K/N static as a
-        # bin-size optimization, but a standalone single-op program needs the
-        # matched-pair dynamic form -- see matmat_mul_quantized_weights_unified_test).
-        m_reg = ue.alloc_isa_reg()
-        k_reg = ue.alloc_isa_reg()
-        n_reg = ue.alloc_isa_reg()
-        ue.start_capture()
-        ue.generate_instruction_add_set(m_reg, M)
-        ue.generate_instruction_add_set(k_reg, K)
-        ue.generate_instruction_add_set(n_reg, N)
-        flops = ue.matmat_mul_core(
-            M=M, K=K, N=N,
-            A_DRAM_ADDR=A_DRAM, B_DRAM_ADDR=B_DRAM, OUTPUT_DRAM_ADDR=OUT_DRAM,
-            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=SCALE_DRAM,
-            gelu_enable=gelu, clamp_enable=clamp,
-            clamp_min=CLAMP_MIN, clamp_max=CLAMP_MAX,
-            gpr_M_reg=m_reg, gpr_K_reg=k_reg, gpr_N_reg=n_reg)
-        ue.stop_capture()
-        ue.release_isa_reg(); ue.release_isa_reg(); ue.release_isa_reg()  # n, k, m
-        ue.generate_instruction_halt()
-        prog = ue.get_program_dram_addr()
-        ue.write_captured_instructions_to_dram(prog)
-        inst_bytes = ue.get_capture_instruction_size_bytes()
-        ue.allocate_program_dram(inst_bytes)
-
-        a = torch.randn(M, K, dtype=torch.bfloat16)
-        ue.dma_to_accelerator_memory(A_DRAM, a)
-        ue.start_execute_from_dram(prog)
-        ue.wait_queue(30.0)
-
-        latency_us = ue.report_latency_in_us()
-        total_flops = flops if isinstance(flops, (int, float)) else 2 * M * K * N
-        gflops, _ratio = ue.report_flop_rate_gflops(total_flops)
-
-        # Soft correctness check against the dequantized reference (no assert).
-        out = ue.dma_from_accelerator_memory(OUT_DRAM, (M, N))
-        x_eff = ue.quantize_weight_simulate(x, TYPE.IF4, int_variant=True)
-        ref = a @ x_eff.T
-        if gelu:
-            ref = ref * torch.sigmoid(1.702 * ref)
-        elif clamp:
-            ref = torch.clamp(ref, CLAMP_MIN, CLAMP_MAX)
-        snr = calculate_snr(ref, out)
-
-        gflop = (2 * M * K * N) / 1e9
-        print(f"  [{label:18s}] M={M:5d} K={K:5d} N={N:5d}  "
-              f"{gflop:7.2f} GFLOP  {latency_us / 1e3:8.3f} ms  "
-              f"{gflops:6.2f} GFLOPS  SNR {snr:6.1f} dB", flush=True)
-        record_test(f"gemma4_vision:{label}", f"M={M}, K={K}, N={N}",
-                    snr_db=snr, gflops=gflops, inst_bytes=inst_bytes)
-        results.append((label, gflop, latency_us / 1e3, gflops, snr))
-        ue.clear_capture_buffer()
-
-    # Per-step summary table.
-    print("\n" + "-" * 82)
-    print(f"  {'step':18s}{'GFLOP':>10}{'ms':>10}{'GFLOPS':>10}{'SNR dB':>10}")
-    print("  " + "-" * 60)
-    sum_gflop = sum_ms = 0.0
-    for label, gflop, ms, gflops, snr in results:
-        print(f"  {label:18s}{gflop:>10.2f}{ms:>10.3f}{gflops:>10.2f}{snr:>10.1f}")
-        sum_gflop += gflop
-        sum_ms += ms
-    print("  " + "-" * 60)
-    print(f"  {'per-layer sum':18s}{sum_gflop:>10.2f}{sum_ms:>10.3f}"
-          f"{sum_gflop / (sum_ms / 1e3):>10.2f}")
-    print("  (q/k/v/o + gate/up/down are one layer's projections; x16 layers for "
-          "the full encoder; embed_proj + patch_proj run once each.)")
-
-    # Self-attention (unified_attention core, not matmat_mul) -- best-effort.
-    print("\n----- vision step: self_attn  (per head: batch=2560, "
-          "aligned_seq_len=2560, head_dim=64; x12 heads/layer) -----")
-    try:
-        unified_attention_test(batch=2560, aligned_seq_len=2560, head_dim=64)
-    except Exception as e:
-        print(f"  [self_attn] skipped: {type(e).__name__}: {e}")
-
 
 def matmat_mul_non_aligned_writeback_test():
     """
@@ -6055,11 +6080,6 @@ if __name__ == "__main__":
         action='store_true',
         help='Run the large nested-loop sweeps at the end of the suite (slow).',
     )
-    parser.add_argument(
-        '--gemma4-vision',
-        action='store_true',
-        help='Run only gemma4_vision_profile() (per-step IF4 vision matmul micro-profile) and exit.',
-    )
     args = parser.parse_args()
 
     import user_dma_core
@@ -6089,7 +6109,7 @@ if __name__ == "__main__":
 
     # kintex7 operates at 1066 / 5.375 MHz = 198.33 MHz = 5.0422 ns
     # kintex7_systolic operates at 149.614035 MHz = 6683 ps.
-    # alveo operates at 180 Mhz = 5.5556 ns
+    # alveo operates at 225 Mhz = 4.4444 ns
     # kintex ultrascale+ operates at 333 Mhz = 3.0 ns
     # bittware board operates at 300 Mhz = 3.3333 ns
     clock = None
@@ -6121,17 +6141,6 @@ if __name__ == "__main__":
         write_test_summary(_USER_HW_TEST_SUMMARY)
 
     atexit.register(_atexit_write_test_summary)
-
-    # --gemma4-vision: run only the vision per-step matmul micro-profile and exit
-    # cleanly (mirrors the end-of-suite clean-exit path).
-    if args.gemma4_vision:
-        gemma4_vision_profile()
-        _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
-        atexit.unregister(_atexit_write_test_summary)
-        write_test_summary(_USER_HW_TEST_SUMMARY)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
 
     software_reset_test()
     dram_read_write_speed_test()
@@ -6193,7 +6202,6 @@ if __name__ == "__main__":
     matmat_mul_unified_test(runtime_list=[(M, K, N)], softmax_enable=True)
     M = N = K = 4096
     matmat_mul_unified_test(runtime_list=[(M, K, N)])
-
     # --- Wide-variance softmax stress: exercises exp + bf20 adder tree ------
     # The post-matmul pre-softmax values span ~N(0, input_scale^2). Larger
     # scales push exp() outputs across many orders of magnitude, which stresses
@@ -6233,7 +6241,7 @@ if __name__ == "__main__":
     # Large-K sub-64 column-strip fallback (K>8192): a 64-wide strip's scales overflow the scale
     # BRAM, so strip_w falls back to 32 (K<=16384) or 16 (K<=32768). M==1 (production decode path)
     # with and without bias; higher accumulation depth lowers the SNR floor.
-    
+
     quantized_matmat_mul_unified_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
     quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
     quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  silu_enable=True)
@@ -6333,7 +6341,7 @@ if __name__ == "__main__":
         bf16_transpose_core_unified_test(shapes=[
             (M, N) for N, Ms in _TRANSPOSE_M_LADDERS.items() for M in Ms
         ])
-        
+
         # --- Quantized-B matmul: every shape traverses every format/option configuration. ---
         for M in [64, 384, 1024]:
             for N in [64, 576, 1024]:
@@ -6384,7 +6392,7 @@ if __name__ == "__main__":
                 matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable)
         matmat_mul_unified_test(runtime_list=[(M, K, N)], softmax_enable=True)
 
-        
+
         # --- Quantized matmat-mul (1-pass streaming quantized dot core): full shape × bias sweep. ---
         for M in [64, 384, 1024]:
             for N in [64, 576, 1024]:
@@ -6447,10 +6455,15 @@ if __name__ == "__main__":
                 snr_threshold_db=snr_floor,
             )
     if args.device == 'alveo':
-        matmat_mul_multi_engine_flag_check_test(M=2048, K=1024, N=1024, num_engines=8)
+        # Each engine reads its own DRAM buffer, then all engines hammer the
+        # same DRAM buffer (concurrent reads to a single memory location).
+        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=8)
+        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=8,
+                                                shared_read=True)
+        matmat_mul_multi_cores_unified_test(num_engines=8)
 
     activation_core_test()
-
+    
     gemma3_inference_test()
     gemma3_if8_inference_test()
 
