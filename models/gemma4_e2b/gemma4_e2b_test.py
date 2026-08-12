@@ -1345,11 +1345,11 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
                         default="streaming",
                         help="Quantized projection kernel for LM prefill (default: streaming).")
-    parser.add_argument("--multi-core", action="store_const", const=2, default=None,
+    parser.add_argument("--multi-core", action="store_const", const=2, default=1,
                         help="Enable two-engine execution for multicore-enabled stages. "
-                             "Kintex7 enables two engines by default; other devices default "
-                             "to one engine. Applied to FPGA vision and LM prefill; multicore "
-                             "prefill always uses matmatmul.")
+                             "Off by default (single engine); passing --multi-core selects "
+                             "two engines (kintex7 goes to 2 directly). Applied to FPGA "
+                             "vision and LM prefill; multicore prefill always uses matmatmul.")
     parser.add_argument("--decode-kernel", choices=("streaming", "matmatmul"),
                         default="streaming",
                         help="Quantized projection kernel for LM decode, including LM head "
@@ -1365,8 +1365,6 @@ default prompt: "x+3=5, what is x?"
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
     args = parser.parse_args()
-    if args.multi_core is None:
-        args.multi_core = 2 if args.device == "kintex7" else 1
     if args.multi_core == 2:
         args.prefill_kernel = "matmatmul"
     if args.vision_host and not args.image:
