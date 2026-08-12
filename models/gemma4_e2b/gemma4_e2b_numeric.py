@@ -25,7 +25,6 @@ Usage:
   python models/gemma4_e2b/gemma4_e2b_numeric.py --image people.jpg
   python models/gemma4_e2b/gemma4_e2b_numeric.py --dev xdma0 --cycle 5.042
 """
-import argparse
 import os
 import sys
 
@@ -38,10 +37,8 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from transformers import AutoProcessor
-from user_dma_core import calculate_snr, set_dma_device
+from user_dma_core import calculate_snr
 import gemma4_e2b_test as g4r
-import gemma4_e2b_lm as g4_lm_module
-import gemma4_e2b_vision as g4_vision_module
 import quant_lib
 
 
@@ -408,39 +405,13 @@ def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Gemma4 E2B numeric check: LM prefill/decode, optionally vision.")
-    p.add_argument("--image", type=str, nargs="?", const=g4r.DEFAULT_IMAGE, default=None,
-                   help="Enable VLM checks. Bare --image uses the default image; an optional "
-                        "path or filename selects another image.")
-    p.add_argument("--prompt", type=str, default=None,
-                   help="Text prompt. Without --image, default is the built-in LM test question.")
-    p.add_argument("--dev", type=str, default="xdma0")
-    p.add_argument("--cycle", type=float, default=1000 / 198.3256)
-    p.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
-                   default="streaming",
-                   help="Quantized projection kernel for LM prefill.")
-    p.add_argument("--prefill-rows", type=int, default=None,
-                   help="Numeric-debug override: pad the LM prompt to exactly this many "
-                        "prefill rows.")
-    p.add_argument("--multi-core", action="store_const", const=2, default=1,
-                   help="Run FPGA vision and LM prefill with two engines; multicore "
-                        "prefill uses matmatmul.")
+    # Take the full gemma4_e2b CLI verbatim from test.py — numeric is just a
+    # numeric check over the same engine, so it never defines its own flags.
+    p = g4r.build_arg_parser()
     args = p.parse_args()
 
-    set_dma_device(args.dev)
-    # The split mixin modules import DMA_DEVICE_* by value, so keep all three
-    # module namespaces synchronized with set_dma_device().
-    for module in (g4r, g4_lm_module, g4_vision_module):
-        module.DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-        module.DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-        module.DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Using DMA device: {args.dev}  (cycle {args.cycle:.4f} ns)")
-
-    ue = g4r.Gemma4_UnifiedEngine(
-        prefill_kernel=args.prefill_kernel,
-        multi_core=args.multi_core)
+    engine_kwargs = g4r.resolve_engine_config(p, args)
+    ue = g4r.Gemma4_UnifiedEngine(**engine_kwargs)
 
     if args.image:
         # Resolve a bare filename against test_samples/, like test.py.
@@ -480,16 +451,6 @@ def main():
     else:
         print("[numeric] LM-only mode, built-in default prompt")
         ue.set_prefill_seq()
-
-    if args.prefill_rows is not None:
-        tokens = list(ue.prefill_seq)
-        current_rows = len(tokens) - 1
-        if args.prefill_rows < current_rows:
-            raise SystemExit(
-                f"--prefill-rows={args.prefill_rows} is below current rows={current_rows}")
-        tokens[-1:-1] = [tokens[-2]] * (args.prefill_rows - current_rows)
-        ue.prefill_seq = tuple(tokens)
-        print(f"[numeric] padded prompt to {args.prefill_rows} prefill rows")
 
     ue.compile_gemma4()
     lm_meta = ue._load_program_section("lm")

@@ -1315,7 +1315,112 @@ def _clock_ns_default_for_device(device: str) -> float:
     return 10.0
 
 
-def main():
+# --- Shared engine CLI/config -------------------------------------------------
+# add_engine_args + resolve_engine_config are the SINGLE source of truth for the
+# kernel/device knobs, their validation, and the device->AXI->clock wiring.
+# gemma4_e2b_numeric.py imports this module and calls both, so anything changed
+# here is reflected there automatically (no second arg-parser to keep in sync).
+def add_engine_args(parser) -> None:
+    """Register the kernel + device knobs shared by every gemma4_e2b entrypoint."""
+    parser.add_argument("--vision-kernel", choices=("streaming", "matmatmul"),
+                        default="matmatmul",
+                        help="Quantized projection kernel for FPGA vision (default: matmatmul).")
+    parser.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
+                        default="streaming",
+                        help="Quantized projection kernel for LM prefill (default: streaming).")
+    parser.add_argument("--decode-kernel", choices=("streaming", "matmatmul"),
+                        default="streaming",
+                        help="Quantized projection kernel for LM decode, including LM head "
+                             "(default: streaming).")
+    parser.add_argument("--multi-core", action="store_const", const=2, default=1,
+                        help="Enable two-engine execution for multicore-enabled stages. "
+                             "Off by default (single engine); passing --multi-core selects "
+                             "two engines (kintex7 goes to 2 directly). Applied to FPGA "
+                             "vision and LM prefill; multicore prefill always uses matmatmul.")
+    parser.add_argument("--dev", type=str, default="xdma0",
+                        help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
+    parser.add_argument("--device", type=str, default="kintex7",
+                        help="FPGA board profile (kintex7, rk, puzhi, bittware, "
+                             "bittware_256, alveo, efinix).")
+    parser.add_argument("--cycle", type=float, default=None,
+                        help="Clock cycle time in nanoseconds. Overrides --device default.")
+
+
+def resolve_engine_config(parser, args) -> dict:
+    """Validate the shared knobs, wire device->AXI->clock, sync DMA globals, and
+    return the kwargs dict for ``Gemma4_UnifiedEngine(...)``.
+
+    Entrypoint-only cross-checks (``--profile`` vs ``--multi-core``,
+    ``--vision-host`` requires ``--image``, etc.) stay in each ``main()``, before
+    this runs. Every loaded ``gemma4_e2b_*`` module binds ``DMA_DEVICE_*`` by
+    value at import, so all of them are refreshed after ``set_dma_device()``.
+    """
+    if args.multi_core == 2:
+        # Multicore prefill only has a matmatmul (two-pass) shard path.
+        args.prefill_kernel = "matmatmul"
+    if args.multi_core == 2 and args.vision_kernel != "matmatmul":
+        parser.error("--multi-core 2 currently requires --vision-kernel matmatmul")
+
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    # Gemma4 vision has K <= 3072, so its two-pass kernel remains valid on
+    # 512-bit AXI. LM prefill and decode include wide MLP-down K=12288 and
+    # therefore cannot select matmatmul on that hardware profile.
+    if axi_width_bits == 512 and (
+            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
+        requested = []
+        if args.prefill_kernel == "matmatmul":
+            requested.append("--prefill-kernel matmatmul")
+        if args.decode_kernel == "matmatmul":
+            requested.append("--decode-kernel matmatmul")
+        parser.error(
+            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
+            "on the 512-bit AXI data path; use streaming.")
+    if os.environ.get("GEMMA4_PENALTY", "0") == "1":
+        parser.error(
+            "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
+            "quantized_matmat_core needs broadcast-bias support first")
+
+    dma_name = "efinix" if args.device == "efinix" else args.dev
+    set_dma_device(dma_name)
+    # Refresh DMA_DEVICE_* on every loaded gemma4_e2b_* module (they import the
+    # names by value). Covers test/lm/vision/audio without a hand-kept list.
+    for _name, _mod in list(sys.modules.items()):
+        if _name.startswith("gemma4_e2b_") and _mod is not None:
+            for _attr in ("DMA_DEVICE_H2C", "DMA_DEVICE_C2H", "DMA_DEVICE_USER"):
+                if hasattr(_mod, _attr):
+                    setattr(_mod, _attr, getattr(user_dma_core, _attr))
+
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+
+    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, "
+          f"UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"Using DMA device: {dma_name}")
+    print(f"  H2C: {user_dma_core.DMA_DEVICE_H2C}")
+    print(f"  C2H: {user_dma_core.DMA_DEVICE_C2H}")
+    print(f"  USER: {user_dma_core.DMA_DEVICE_USER}")
+    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
+    print(f"Kernels: vision={args.vision_kernel}, prefill={args.prefill_kernel}, "
+          f"engines={args.multi_core}, decode={args.decode_kernel}")
+
+    return dict(
+        vision_kernel=args.vision_kernel,
+        prefill_kernel=args.prefill_kernel,
+        decode_kernel=args.decode_kernel,
+        multi_core=args.multi_core,
+    )
+
+
+def build_arg_parser():
+    """The full gemma4_e2b CLI parser, shared as the SINGLE source of truth.
+
+    gemma4_e2b_numeric.py takes the exact same args by calling this — it just
+    runs a numeric SNR check instead of a decode, so any flag added here is
+    available there automatically.
+    """
     import argparse
     parser = argparse.ArgumentParser(
         description="Gemma4 E2B LM prefill + decode on the accelerator.",
@@ -1339,87 +1444,26 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument("--vision-host", action="store_true",
                         help="With --image, generate image soft-token embeddings on the host "
                              "with the HF vision tower; FPGA prefill/decode are unchanged.")
-    parser.add_argument("--vision-kernel", choices=("streaming", "matmatmul"),
-                        default="matmatmul",
-                        help="Quantized projection kernel for FPGA vision (default: matmatmul).")
-    parser.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
-                        default="streaming",
-                        help="Quantized projection kernel for LM prefill (default: streaming).")
-    parser.add_argument("--multi-core", action="store_const", const=2, default=1,
-                        help="Enable two-engine execution for multicore-enabled stages. "
-                             "Off by default (single engine); passing --multi-core selects "
-                             "two engines (kintex7 goes to 2 directly). Applied to FPGA "
-                             "vision and LM prefill; multicore prefill always uses matmatmul.")
-    parser.add_argument("--decode-kernel", choices=("streaming", "matmatmul"),
-                        default="streaming",
-                        help="Quantized projection kernel for LM decode, including LM head "
-                             "(default: streaming).")
-    parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--device', type=str, default='kintex7',
-                        help='FPGA board profile (kintex7, rk, puzhi, bittware, '
-                             'bittware_256, alveo, efinix).')
-    parser.add_argument('--cycle', type=float, default=None,
-                        help='Clock cycle time in nanoseconds. Overrides --device default.')
+    add_engine_args(parser)   # --vision-kernel/--prefill-kernel/--decode-kernel/--multi-core/--dev/--device/--cycle
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
-    if args.multi_core == 2:
-        args.prefill_kernel = "matmatmul"
+    # Entrypoint-only cross-checks (reference test.py-specific flags); the shared
+    # kernel/device validation + wiring lives in resolve_engine_config().
     if args.vision_host and not args.image:
         parser.error("--vision-host requires --image")
     if args.image and args.audio:
         parser.error("--image and --audio are mutually exclusive")
-    if args.multi_core == 2 and args.vision_kernel != "matmatmul":
-        parser.error("--multi-core 2 currently requires --vision-kernel matmatmul")
     if args.profile and args.multi_core == 2:
         parser.error("--profile is not currently supported with --multi-core")
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    # Gemma4 vision has K <= 3072, so its two-pass kernel remains valid on
-    # 512-bit AXI. LM prefill and decode include wide MLP-down K=12288 and
-    # therefore cannot select matmatmul on that hardware profile.
-    if axi_width_bits == 512 and (
-            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
-        requested = []
-        if args.prefill_kernel == "matmatmul":
-            requested.append("--prefill-kernel matmatmul")
-        if args.decode_kernel == "matmatmul":
-            requested.append("--decode-kernel matmatmul")
-        parser.error(
-            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
-            "on the 512-bit AXI data path; use streaming.")
-    if os.environ.get("GEMMA4_PENALTY", "0") == "1":
-        parser.error(
-            "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
-            "quantized_matmat_core needs broadcast-bias support first")
-
-    set_dma_device("efinix" if args.device == "efinix" else args.dev)
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, "
-          f"UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    print(f"Using DMA device: {'efinix' if args.device == 'efinix' else args.dev}")
-    print(f"  H2C: {DMA_DEVICE_H2C}")
-    print(f"  C2H: {DMA_DEVICE_C2H}")
-    print(f"  USER: {DMA_DEVICE_USER}")
-    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
-
-    print(f"Kernels: vision={args.vision_kernel}, "
-          f"prefill={args.prefill_kernel}, engines={args.multi_core}, "
-          f"decode={args.decode_kernel}")
-    ue = Gemma4_UnifiedEngine(
-        vision_kernel=args.vision_kernel,
-        prefill_kernel=args.prefill_kernel,
-        decode_kernel=args.decode_kernel,
-        multi_core=args.multi_core)
+    engine_kwargs = resolve_engine_config(parser, args)
+    ue = Gemma4_UnifiedEngine(**engine_kwargs)
 
     # Prompt first — the prefill program is compiled for its exact length.
     # VLM mode (--image): run the vision encoder on the FPGA now (separate bin
