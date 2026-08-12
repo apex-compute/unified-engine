@@ -417,6 +417,15 @@ def main():
                    help="Text prompt. Without --image, default is the built-in LM test question.")
     p.add_argument("--dev", type=str, default="xdma0")
     p.add_argument("--cycle", type=float, default=1000 / 198.3256)
+    p.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
+                   default="streaming",
+                   help="Quantized projection kernel for LM prefill.")
+    p.add_argument("--prefill-rows", type=int, default=None,
+                   help="Numeric-debug override: pad the LM prompt to exactly this many "
+                        "prefill rows.")
+    p.add_argument("--multi-core", action="store_const", const=2, default=1,
+                   help="Run FPGA vision and LM prefill with two engines; multicore "
+                        "prefill uses matmatmul.")
     args = p.parse_args()
 
     set_dma_device(args.dev)
@@ -429,7 +438,9 @@ def main():
     user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
     print(f"Using DMA device: {args.dev}  (cycle {args.cycle:.4f} ns)")
 
-    ue = g4r.Gemma4_UnifiedEngine()
+    ue = g4r.Gemma4_UnifiedEngine(
+        prefill_kernel=args.prefill_kernel,
+        multi_core=args.multi_core)
 
     if args.image:
         # Resolve a bare filename against test_samples/, like test.py.
@@ -469,6 +480,16 @@ def main():
     else:
         print("[numeric] LM-only mode, built-in default prompt")
         ue.set_prefill_seq()
+
+    if args.prefill_rows is not None:
+        tokens = list(ue.prefill_seq)
+        current_rows = len(tokens) - 1
+        if args.prefill_rows < current_rows:
+            raise SystemExit(
+                f"--prefill-rows={args.prefill_rows} is below current rows={current_rows}")
+        tokens[-1:-1] = [tokens[-2]] * (args.prefill_rows - current_rows)
+        ue.prefill_seq = tuple(tokens)
+        print(f"[numeric] padded prompt to {args.prefill_rows} prefill rows")
 
     ue.compile_gemma4()
     lm_meta = ue._load_program_section("lm")
@@ -531,6 +552,16 @@ def main():
     print("\n[numeric] ===== LM PREFILL (exact FPGA inputs) =====")
     print("  FPGA vs HOSTREF (operation-level params.bin oracle):")
     report("prefill hidden", mimic_prefill_hidden, hw_prefill_hidden)
+    if args.multi_core == 2:
+        ref_rows, hw_rows = _align(mimic_prefill_hidden, hw_prefill_hidden)
+        split = ue._ensure_prefill_scheduler().split_rows(prefill_len)
+        for engine_idx, (row_start, row_count) in enumerate(split):
+            report(f"  engine{engine_idx} rows", ref_rows[row_start:row_start + row_count],
+                   hw_rows[row_start:row_start + row_count])
+        row_rel = (torch.linalg.vector_norm(hw_rows - ref_rows, dim=1) /
+                   torch.linalg.vector_norm(ref_rows, dim=1).clamp_min(1e-12))
+        print("  [numeric] per-row rel_L2: " +
+              ", ".join(f"{value:.4f}" for value in row_rel.tolist()))
     print("  FPGA vs HF (full-precision projections):")
     report("prefill hidden", hf_prefill["hidden"], hw_prefill_hidden)
 

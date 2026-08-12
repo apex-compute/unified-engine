@@ -50,6 +50,7 @@ from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
+from multi_engine_shard import MultiEngineScheduler
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -697,9 +698,26 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
+    def _ensure_stage_scheduler(self, stage: str, worker_dram_base: int):
+        """Return the shared two-engine scheduler configuration for one stage."""
+        if self.multi_core == 1:
+            return None
+        scheduler = self._multi_core_schedulers.get(stage)
+        if scheduler is None:
+            scheduler = MultiEngineScheduler(
+                self, num_engines=self.multi_core,
+                engine_base_stride=0x00010000,
+                worker_dram_base=worker_dram_base,
+                worker_tensor_offset=0,
+                worker_program_offset=0,
+                barrier_margin_nops=32,
+                allow_unaligned_rows=True)
+            self._multi_core_schedulers[stage] = scheduler
+        return scheduler
+
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
-                 decode_kernel: str = "streaming"):
+                 decode_kernel: str = "streaming", multi_core: int = 1):
         for stage, kernel in (("vision", vision_kernel), ("prefill", prefill_kernel),
                               ("decode", decode_kernel)):
             if kernel not in ("streaming", "matmatmul"):
@@ -709,19 +727,30 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 "GEMMA4_PENALTY=1 is temporarily unsupported: the dynamic streaming "
                 "quantized_matmat_core must gain broadcast-bias support before the "
                 "on-FPGA penalty can be re-enabled.")
+        if multi_core not in (1, 2):
+            raise ValueError(f"multi_core must be 1 or 2, got {multi_core}")
+        if multi_core == 2 and vision_kernel != "matmatmul":
+            raise ValueError("two-engine vision projection sharding requires --vision-kernel matmatmul")
+        if multi_core == 2:
+            prefill_kernel = "matmatmul"
         self.vision_kernel = vision_kernel
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
+        self.multi_core = multi_core
+        self._multi_core_schedulers = {}
+        self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
         # Gemma4 fixed DRAM layout within the upper 2 GB window, matching the
         # addressable range used by the Llama-3.2-1B path.
         #   LM weights       : 0x80000000 – 0xE1000000  (1552 MiB)
         #   LM/vision tensor : 0xE1000000 – 0xFF000000  (480 MiB, reused by stage)
-        #   Vision ISA       : 0xFF000000 – 0xFF600000  (6 MiB)
+        #   Vision ISA/core0 : 0xFF000000 – 0xFF400000  (4 MiB, two-core mode)
+        #   Vision ISA/core1 : 0xFF400000 – 0xFF600000  (2 MiB, sharded phases)
         #   LM ISA           : 0xFF600000 – 0x100000000 (10 MiB)
         # Vision and LM programs remain resident at disjoint addresses.
         self.DRAM_END = 0x100000000
         self.VISION_ISA_BASE = 0xFF000000
+        self.VISION_WORKER_ISA_BASE = 0xFF400000
         self.LM_ISA_BASE = 0xFF600000
         _params_base  = 0x80000000
         _tensor_base  = 0xE1000000
@@ -985,11 +1014,20 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         prefill_template_seq_len = int(self._cfg["model"].get(
             "prefill_max_seq_len", self.max_prefill_seq_len))
         prefill_flops_seq_len = len(self.prefill_seq) - 1
+        if self.multi_core == 2 and prefill_flops_seq_len < 2:
+            raise ValueError("two-engine fixed prefill requires at least two prefill rows")
+        prefill_scheduler = self._ensure_prefill_scheduler()
         _lm_meta, _ = self._get_program_section("lm", profile)
+        _prefill_worker_meta, _ = self._get_program_section("prefill_worker1", profile)
         if (_lm_meta is not None
                 and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len
                 and _lm_meta.get("prefill_kernel") == self.prefill_kernel
-                and _lm_meta.get("decode_kernel") == self.decode_kernel):
+                and _lm_meta.get("decode_kernel") == self.decode_kernel
+                and _lm_meta.get("multi_core", 1) == self.multi_core
+                and (self.multi_core == 1
+                     or (_prefill_worker_meta is not None
+                         and _prefill_worker_meta.get("prefill_seq_len") == prefill_flops_seq_len
+                         and _prefill_worker_meta.get("prefill_kernel") == self.prefill_kernel))):
             bin_path, _ = self._program_image_paths(profile)
             print(f"[compile] reusing existing instruction image at {bin_path}")
             print(f"  delete {bin_path} (or make clean) to force recompile.")
@@ -1010,11 +1048,25 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             instruction_base_addr = self.get_program_dram_addr()
 
             prefill_count_at_start = self.capture_count          # 1 (after flag-clear)
+            if prefill_scheduler is not None:
+                prefill_scheduler.begin_program()
+                self._prefill_shard_m_regs = [self.alloc_isa_reg()]
+                self._prefill_shard_m_regs.extend(
+                    worker.alloc_isa_reg() for worker in prefill_scheduler.workers)
+                self._active_prefill_scheduler = prefill_scheduler
             _, prefill_total_flops = self.compile_prefill(seq_len=prefill_flops_seq_len,
                                                           layer_size=layer_size,
                                                           profile=profile)
             prefill_program_addr = instruction_base_addr + prefill_count_at_start * INSTRUCTION_SIZE_BYTES
             prefill_size_bytes = (self.capture_count - prefill_count_at_start) * INSTRUCTION_SIZE_BYTES
+            prefill_worker_addrs = (prefill_scheduler.finalize()
+                                    if prefill_scheduler is not None else [])
+            self._active_prefill_scheduler = None
+            if prefill_scheduler is not None:
+                for worker in reversed(prefill_scheduler.workers):
+                    worker.release_isa_reg()
+                self.release_isa_reg()
+                self._prefill_shard_m_regs = None
 
             decoder_count_at_start = self.capture_count
             _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
@@ -1046,6 +1098,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "decoder_total_flops": decoder_total_flops[0],
             "layer_size": layer_size,
             "prefill_kernel": self.prefill_kernel,
+            "multi_core": self.multi_core,
             "decode_kernel": self.decode_kernel,
         }
         if profile:
@@ -1053,6 +1106,22 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             lm_meta["decoder_profile_checkpoints"] = self._decoder_checkpoints
         # Merge the LM section into the combined programs bin (vision stays intact).
         self._store_program_section("lm", instruction_base_addr, image_bytes, lm_meta, profile=profile)
+        if prefill_scheduler is not None:
+            worker = prefill_scheduler.workers[0]
+            worker_bytes = bytearray()
+            for inst in worker.capture_buffer:
+                worker_bytes.extend(inst.get_bytes())
+            worker_addr = prefill_worker_addrs[0]
+            if worker_addr + len(worker_bytes) > self.LM_ISA_BASE:
+                raise RuntimeError(
+                    f"prefill core1 ISA overflow: 0x{worker_addr + len(worker_bytes):X} > "
+                    f"0x{self.LM_ISA_BASE:X}")
+            self._store_program_section(
+                "prefill_worker1", worker_addr, worker_bytes,
+                {"parent": "lm", "engine_idx": 1,
+                 "multi_core": self.multi_core,
+                 "prefill_seq_len": prefill_flops_seq_len,
+                 "prefill_kernel": self.prefill_kernel}, profile=profile)
 
         print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
@@ -1276,6 +1345,11 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
                         default="streaming",
                         help="Quantized projection kernel for LM prefill (default: streaming).")
+    parser.add_argument("--multi-core", action="store_const", const=2, default=None,
+                        help="Enable two-engine execution for multicore-enabled stages. "
+                             "Kintex7 enables two engines by default; other devices default "
+                             "to one engine. Applied to FPGA vision and LM prefill; multicore "
+                             "prefill always uses matmatmul.")
     parser.add_argument("--decode-kernel", choices=("streaming", "matmatmul"),
                         default="streaming",
                         help="Quantized projection kernel for LM decode, including LM head "
@@ -1291,10 +1365,18 @@ default prompt: "x+3=5, what is x?"
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
     args = parser.parse_args()
+    if args.multi_core is None:
+        args.multi_core = 2 if args.device == "kintex7" else 1
+    if args.multi_core == 2:
+        args.prefill_kernel = "matmatmul"
     if args.vision_host and not args.image:
         parser.error("--vision-host requires --image")
     if args.image and args.audio:
         parser.error("--image and --audio are mutually exclusive")
+    if args.multi_core == 2 and args.vision_kernel != "matmatmul":
+        parser.error("--multi-core 2 currently requires --vision-kernel matmatmul")
+    if args.profile and args.multi_core == 2:
+        parser.error("--profile is not currently supported with --multi-core")
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     # Gemma4 vision has K <= 3072, so its two-pass kernel remains valid on
     # 512-bit AXI. LM prefill and decode include wide MLP-down K=12288 and
@@ -1332,12 +1414,14 @@ default prompt: "x+3=5, what is x?"
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
-    print(f"Kernels: vision={args.vision_kernel}, prefill={args.prefill_kernel}, "
+    print(f"Kernels: vision={args.vision_kernel}, "
+          f"prefill={args.prefill_kernel}, engines={args.multi_core}, "
           f"decode={args.decode_kernel}")
     ue = Gemma4_UnifiedEngine(
         vision_kernel=args.vision_kernel,
         prefill_kernel=args.prefill_kernel,
-        decode_kernel=args.decode_kernel)
+        decode_kernel=args.decode_kernel,
+        multi_core=args.multi_core)
 
     # Prompt first — the prefill program is compiled for its exact length.
     # VLM mode (--image): run the vision encoder on the FPGA now (separate bin

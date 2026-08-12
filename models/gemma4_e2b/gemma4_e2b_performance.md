@@ -14,26 +14,27 @@ Commands:
 python models/gemma4_e2b/gemma4_e2b_test.py --image 
 python models/gemma4_e2b/gemma4_e2b_test.py --image --profile
 python models/gemma4_e2b/gemma4_e2b_test.py --image --prefill-kernel matmatmul
+python models/gemma4_e2b/gemma4_e2b_test.py --image --multi-core
 ```
 
 ## Performance comparison
 
-| Metric | Legacy | Refactored streaming prefill | Refactored matmatmul prefill | rk |
-|---|---:|---:|---:|---:|
-| Vision FPGA execution | 55.54 s | 54.60 s | 54.85 s | 32.56 s |
-| Vision end-to-end path | not reported | 55.81 s | 56.10 s | 33.03 s |
-| Vision throughput | not reported | 20.86 GFLOPS | 20.76 GFLOPS | 35.00 GFLOPS |
-| Vision soft tokens | 256 | 256 | 256 | 256 |
-| LM prefill sequence executed | 512-token template | 272 actual tokens | 272 actual tokens | 273 actual tokens |
-| LM prefill FPGA latency | 113.571 s | 51.63 s | 52.578 s | 32.544 s |
-| LM prefill useful-work throughput | 23.20 GFLOPS | 23.94 GFLOPS | 23.45 GFLOPS | 37.89 GFLOPS |
-| Decode average throughput | 2.68 tok/s | 3.82 tok/s | 3.85 tok/s | 6.00 tok/s |
-| Decode peak first-token throughput | 2.86 tok/s | 4.07 tok/s | 4.01 tok/s | 6.23 tok/s |
-| Decode average hardware throughput | 13.42 GFLOPS | 19.11 GFLOPS | 19.20 GFLOPS | 30.45 GFLOPS |
-| Vision program section | 3.58 MiB | 3.03 MiB | 3.03 MiB | / |
-| Prefill program section | 5.71 MiB | 3.10 MiB | 3.21 MiB | / |
-| Combined program image | 10.37 MiB | 7.54 MiB | 7.67 MiB | / |
-| Weight image (`params.bin`) | 6.91 GiB | same | same | / |
+| Metric | Legacy | Refactored streaming prefill | Refactored matmatmul prefill | Multicore (2 engines) | rk |
+|---|---:|---:|---:|---:|---:|
+| Vision FPGA execution | 55.54 s | 54.60 s | 54.85 s | 37.20 s | 32.56 s |
+| Vision end-to-end path | not reported | 55.81 s | 56.10 s | 38.77 s | 33.03 s |
+| Vision throughput | not reported | 20.86 GFLOPS | 20.76 GFLOPS | 30.63 GFLOPS | 35.00 GFLOPS |
+| Vision soft tokens | 256 | 256 | 256 | 256 | 256 |
+| LM prefill sequence executed | 512-token template | 272 actual tokens | 272 actual tokens | 272 actual tokens | 273 actual tokens |
+| LM prefill FPGA latency | 113.571 s | 51.63 s | 52.578 s | 31.93 s | 32.544 s |
+| LM prefill useful-work throughput | 23.20 GFLOPS | 23.94 GFLOPS | 23.45 GFLOPS | 38.80 GFLOPS | 37.89 GFLOPS |
+| Decode average throughput | 2.68 tok/s | 3.82 tok/s | 3.85 tok/s | 3.60 tok/s | 6.00 tok/s |
+| Decode peak first-token throughput | 2.86 tok/s | 4.07 tok/s | 4.01 tok/s | 4.02 tok/s | 6.23 tok/s |
+| Decode average hardware throughput | 13.42 GFLOPS | 19.11 GFLOPS | 19.20 GFLOPS | 17.96 GFLOPS | 30.45 GFLOPS |
+| Vision program section | 3.58 MiB | 3.03 MiB | 3.03 MiB | 4.09 MiB incl. worker | / |
+| Prefill program section | 5.71 MiB | 3.10 MiB | 3.21 MiB | 3.44 MiB incl. worker | / |
+| Combined program image | 10.37 MiB | 7.54 MiB | 7.67 MiB | 8.95 MiB | / |
+| Weight image (`params.bin`) | 6.91 GiB | same | same | same | / |
 
 ## Refactor optimizations
 
