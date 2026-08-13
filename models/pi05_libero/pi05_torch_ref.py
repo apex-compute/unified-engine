@@ -511,7 +511,11 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
 
     # --- Text embedding ---
     embed_table = W["PaliGemma.llm.embedder.input_embedding"]  # (257152, 2048)
-    text_tokens = embed_table[prompt_tokens]  # (b, T_text, 2048)
+    # openpi scales token embeddings by sqrt(width) in Embedder.encode
+    # (gemma.py:149-150). Image tokens are NOT scaled. Omitting this made text
+    # enter the prefix 45.25x too small -- and because pi05_libero_test.py had the
+    # same omission, this reference AGREED with the hardware and hid the bug.
+    text_tokens = embed_table[prompt_tokens] * math.sqrt(embed_table.shape[-1])
 
     prefix_tokens = torch.cat([vision_tokens, text_tokens], dim=1)  # (b, P, 2048)
     n_prefix = prefix_tokens.shape[1]
