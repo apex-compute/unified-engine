@@ -254,6 +254,11 @@ class Gemma4VisionMixin:
         self._vis_bias_guard_post = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
         self.VIS_FLASH_SCRATCH = self.allocate_tensor_dram(
             (aligned_S * aligned_S + 2 * HD * aligned_S) * 2)
+        # Head-sharded attention needs one private scratch region per engine.
+        # Allocate the worker copy from the model tensor arena; the worker's own
+        # allocator is its vision ISA arena and must not be used for data.
+        self.VIS_FLASH_SCRATCH_WORKER = self.allocate_tensor_dram(
+            (aligned_S * aligned_S + 2 * HD * aligned_S) * 2)
         # Unused by unified_attention_core but kept to keep the allocation order
         # (and every baked address after it) stable.
         self.VIS_ATTN_P = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
@@ -524,6 +529,9 @@ class Gemma4VisionMixin:
         gate_scheduler = self._ensure_vision_gate_scheduler()
         gate_m_regs = None
         if gate_scheduler is not None:
+            gate_scheduler.register_per_engine_addrs(
+                "vision_attn_scratch",
+                [self.VIS_FLASH_SCRATCH, self.VIS_FLASH_SCRATCH_WORKER])
             gate_scheduler.begin_program()
             # Engine 0 uses Gemma's reserved sequence-length GPR. Plain
             # UnifiedEngine workers do not have that model-level attribute, so
@@ -613,26 +621,56 @@ class Gemma4VisionMixin:
             # Per-head attention reads Q/K/V and writes OUT DIRECTLY at each head's
             # offset in the head-major buffers (no per-head staging copy — the core
             # takes arbitrary DRAM addresses).
-            head_stride = aligned_S * HD * bpe
-            for h in range(NH):
-                base = h * head_stride
-                batch_reg = self.alloc_isa_reg()
-                self.generate_instruction_add_set(batch_reg, aligned_S)
-                aligned_seq_reg = self.alloc_isa_reg()
-                self.generate_instruction_add_set(aligned_seq_reg, aligned_S)
-                flops = self.unified_attention_core(
-                    batch=aligned_S, aligned_seq_len=aligned_S, head_dim=HD,
-                    Q_DRAM_ADDR=self.VIS_FLASH_Q_HM + base, K_DRAM_ADDR=self.VIS_FLASH_K_HM + base,
-                    V_DRAM_ADDR=self.VIS_FLASH_V_HM + base, BIAS_DRAM_ADDR=self.VIS_FLASH_BIAS,
-                    OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_HM + base,
-                    SCRATCH_DRAM_ADDR=self.VIS_FLASH_SCRATCH,
-                    IDENTITY_DRAM_ADDR=self._vis_identity_dram,
-                    gpr_batch_reg=batch_reg,
-                    gpr_aligned_seq_len_reg=aligned_seq_reg, q_scale=1.0)
-                self.release_isa_reg()
-                self.release_isa_reg()
-                if isinstance(flops, (int, float)):
-                    self._vis_flops += flops
+            if gate_scheduler is None:
+                head_stride = aligned_S * HD * bpe
+                for h in range(NH):
+                    base = h * head_stride
+                    batch_reg = self.alloc_isa_reg()
+                    self.generate_instruction_add_set(batch_reg, aligned_S)
+                    aligned_seq_reg = self.alloc_isa_reg()
+                    self.generate_instruction_add_set(aligned_seq_reg, aligned_S)
+                    flops = self.unified_attention_core(
+                        batch=aligned_S, aligned_seq_len=aligned_S, head_dim=HD,
+                        Q_DRAM_ADDR=self.VIS_FLASH_Q_HM + base, K_DRAM_ADDR=self.VIS_FLASH_K_HM + base,
+                        V_DRAM_ADDR=self.VIS_FLASH_V_HM + base, BIAS_DRAM_ADDR=self.VIS_FLASH_BIAS,
+                        OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_HM + base,
+                        SCRATCH_DRAM_ADDR=self.VIS_FLASH_SCRATCH,
+                        IDENTITY_DRAM_ADDR=self._vis_identity_dram,
+                        gpr_batch_reg=batch_reg,
+                        gpr_aligned_seq_len_reg=aligned_seq_reg, q_scale=1.0)
+                    self.release_isa_reg()
+                    self.release_isa_reg()
+                    if isinstance(flops, (int, float)):
+                        self._vis_flops += flops
+            else:
+                attn_flops = [0]
+                def _vision_attention_kernel(ue, head_dim, seq_len, **kwargs):
+                    kwargs.pop("num_q_heads", None)  # vision is MHA: one call/head
+                    batch_reg = ue.alloc_isa_reg()
+                    ue.generate_instruction_add_set(batch_reg, seq_len)
+                    aligned_seq_reg = ue.alloc_isa_reg()
+                    ue.generate_instruction_add_set(aligned_seq_reg, seq_len)
+                    flops = ue.unified_attention_core(
+                        batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim,
+                        gpr_batch_reg=batch_reg,
+                        gpr_aligned_seq_len_reg=aligned_seq_reg,
+                        q_scale=1.0, **kwargs)
+                    ue.release_isa_reg()
+                    ue.release_isa_reg()
+                    if isinstance(flops, (int, float)):
+                        attn_flops[0] += flops
+
+                gate_scheduler.head_sharded_attention(
+                    NH, aligned_S, HD,
+                    Q_addr=self.VIS_FLASH_Q_HM,
+                    K_addr=self.VIS_FLASH_K_HM,
+                    V_addr=self.VIS_FLASH_V_HM,
+                    OUT_addr=self.VIS_FLASH_OUT_HM,
+                    IDENTITY_addr=self._vis_identity_dram,
+                    bias_addr=self.VIS_FLASH_BIAS,
+                    scratch_name="vision_attn_scratch",
+                    kernel=_vision_attention_kernel)
+                self._vis_flops += attn_flops[0]
             # head-major attn output [NH, aligned_S, HD] -> interleaved VIS_Q_DRAM [S, NH, HD]
             self.bf16_permute_dram_core(NH, S, HD, self.VIS_FLASH_OUT_HM, self.VIS_Q_DRAM,
                                         write_grouped=False, group_stride_rows=aligned_S)

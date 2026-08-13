@@ -1185,6 +1185,29 @@ class MultiEngineScheduler:
             addrs.append(a)
         self._per_engine[name] = addrs
 
+    def register_per_engine_addrs(self, name: str, addrs: list[int]) -> None:
+        """Register caller-allocated private scratch addresses.
+
+        Use this when a model owns one shared DRAM allocator and the worker's
+        scheduler allocator is reserved for ISA. Addresses must be distinct and
+        supplied in engine order (primary first).
+        """
+        assert len(addrs) == self.num_engines, (
+            f"per-engine buffer {name!r} needs {self.num_engines} addresses, "
+            f"got {len(addrs)}")
+        assert len(set(addrs)) == len(addrs), (
+            f"per-engine buffer {name!r} addresses must be distinct")
+        for addr in addrs:
+            assert addr % AXI_BEAT_BYTES == 0, (
+                f"per-engine buffer {name!r} address 0x{addr:x} is not "
+                f"{AXI_BEAT_BYTES} B AXI-beat aligned")
+        normalized = list(addrs)
+        if name in self._per_engine:
+            assert self._per_engine[name] == normalized, (
+                f"per-engine buffer {name!r} already registered with different addresses")
+            return
+        self._per_engine[name] = normalized
+
     def per_engine_addr(self, name: str, engine_idx: int) -> int:
         assert name in self._per_engine, (
             f"unknown PER_ENGINE buffer {name!r}; register it with "

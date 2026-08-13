@@ -751,13 +751,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         #   LM weights       : 0x80000000 – 0xE1000000  (1552 MiB)
         #   LM/vision tensor : 0xE1000000 – 0xFF000000  (480 MiB, reused by stage)
         #   Vision ISA/core0 : 0xFF000000 – 0xFF400000  (4 MiB, two-core mode)
-        #   Vision ISA/core1 : 0xFF400000 – 0xFF600000  (2 MiB, sharded phases)
-        #   LM ISA           : 0xFF600000 – 0x100000000 (10 MiB)
+        #   Vision ISA/core1 : 0xFF400000 – 0xFF620000  (2.125 MiB, incl. head-sharded attention)
+        #   LM ISA           : 0xFF620000 – 0x100000000 (9.875 MiB)
         # Vision and LM programs remain resident at disjoint addresses.
         self.DRAM_END = 0x100000000
         self.VISION_ISA_BASE = 0xFF000000
         self.VISION_WORKER_ISA_BASE = 0xFF400000
-        self.LM_ISA_BASE = 0xFF600000
+        self.LM_ISA_BASE = 0xFF620000
         _params_base  = 0x80000000
         _tensor_base  = 0xE1000000
         _program_base = self.LM_ISA_BASE
