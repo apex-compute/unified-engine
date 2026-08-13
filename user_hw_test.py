@@ -6109,7 +6109,7 @@ if __name__ == "__main__":
 
     # kintex7 operates at 1066 / 5.375 MHz = 198.33 MHz = 5.0422 ns
     # kintex7_systolic operates at 149.614035 MHz = 6683 ps.
-    # alveo operates at 225 Mhz = 4.4444 ns
+    # alveo operates at 300 MHz = 3.3333333 ns
     # kintex ultrascale+ operates at 333 Mhz = 3.0 ns
     # bittware board operates at 300 Mhz = 3.3333 ns
     clock = None
@@ -6122,7 +6122,7 @@ if __name__ == "__main__":
     elif args.device in ("bittware", "bittware_256"):
         clock = 3.3333
     elif args.device == "alveo":
-        clock = 1000 / 225
+        clock = 3.3333333
     elif args.device == "efinix":
         clock = 4.0
     else:
