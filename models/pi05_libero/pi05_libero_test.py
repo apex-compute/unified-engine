@@ -983,7 +983,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         n_vis = vis.shape[0]
 
         tid = torch.tensor(token_ids, dtype=torch.long)
-        text_embed = self.embedding_table[tid].to(torch.bfloat16)   # (n_text, H) host-side gather
+        # openpi scales token embeddings by sqrt(width) inside Embedder.encode
+        # (gemma.py:149-150 `x *= jnp.sqrt(self.embed_dim)`; the PyTorch port does
+        # the same at pi0_pytorch.py `lang_emb * math.sqrt(lang_emb_dim)`). Image
+        # embeddings are NOT scaled -- only the text embedder. We loaded the table
+        # raw and gathered it raw, so text entered the prefix sqrt(2048)=45.25x too
+        # small: measured RMS 0.146 against vision tokens' 5.25 in the same
+        # sequence, where openpi puts them at 6.62 vs 5.25. pi05_torch_ref.py had
+        # the identical omission, so the CPU oracle agreed with the hardware and
+        # the ~29dB action-expert SNR read as "matches CPU-IF4" rather than as a
+        # bug in both.
+        text_embed = (self.embedding_table[tid].float()
+                      * math.sqrt(H)).to(torch.bfloat16)   # (n_text, H) host-side gather
 
         valid_len = n_vis + text_embed.shape[0]
         assert valid_len <= seq_len, f"prefix valid_len={valid_len} exceeds seq_len={seq_len}"
@@ -1051,6 +1062,121 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         pos_suffix = n_valid + torch.arange(self.AE_ACTION_HORIZON_PADDED, dtype=torch.float32)
         self.AE_ROPE_ADDR = store_weight(self, self._rope_table(pos_suffix))
         self.ROPE_SIN_OFFSET = self.HEAD_DIM * 2  # bytes; cos at base, sin at base+offset
+
+    def _build_ae_suffix_bias(self, P, Tkv, S, valid_len=None):
+        """The action expert's (Tkv, Tkv) additive suffix attention bias.
+
+        Extracted from tensor_init_action_expert so run_inference can REBUILD it
+        per observation: it depends on prefix_valid_len, which is data-dependent
+        (it moves with the prompt's token count) while the compiled program is
+        not. See _refresh_valid_len_tables.
+        """
+        NEG_INF = -1e9
+        if valid_len is None:
+            valid_len = getattr(self, "prefix_valid_len", P)
+        bias = torch.zeros(Tkv, Tkv, dtype=torch.bfloat16)
+        # Suffix PADDING key columns. S=AE_ACTION_HORIZON_PADDED=64 but only the
+        # first AE_ACTION_HORIZON=10 suffix rows are real action tokens; rows
+        # [10:64] are 1e-6 filler. Their K/V are NOT small: AdaRMSNorm divides by
+        # the row's own RMS, so a 1e-6 row comes out at FULL magnitude and those
+        # 54 keys land in every real row's softmax. The old `bias[:, P+S:]` was an
+        # EMPTY slice (P+S == Tkv) and masked nothing -- this was the attention
+        # corruption (roped Q/K measured clean at ~46dB while rawattn craterd).
+        bias[:, P + self.AE_ACTION_HORIZON:] = NEG_INF
+        if valid_len < P:
+            bias[:, valid_len:P] = NEG_INF
+        # Mask skipped/zero image slots (same columns as the prefix bias) so the
+        # action expert's cross-attention ignores their placeholder K/V rows.
+        for a, b in getattr(self, "prefix_masked_cols", []):
+            bias[:, a:b] = NEG_INF
+        bias[S:, :] = 0.0           # unused query rows; value irrelevant, never read back
+        return bias
+
+    def _refresh_valid_len_tables(self, valid_len):
+        """Re-point every valid_len-dependent buffer at THIS observation's value.
+
+        prefix_valid_len is data-dependent and moves EVERY OBSERVATION, not just
+        every task: pi0.5 discretizes the robot state into the prompt TEXT, so the
+        token count shifts with the state's digit widths (measured 43-47 tokens ->
+        valid_len 811-815 over 12 perturbed states). Recompiling per observation is
+        therefore not an option -- but the compiled PROGRAM does not depend on
+        valid_len at all (geometry is P=PREFIX_SEQ_LEN=832, Tkv=P+64), only these
+        host-built constant TABLES do, and re-uploading them is ~2.5MB of DMA:
+
+          * the PREFIX rope table (PREFIX_ROPE_ADDR): positions = cumsum(mask)-1,
+            where mask is zeroed on prefix_masked_cols AND on [valid_len:S]. It is
+            NOT immune to a stale value -- an earlier version of this docstring
+            claimed it was. precompile_all runs before run_vision, which is the only
+            place prefix_masked_cols is assigned, so at precompile time it is [] and
+            positions degenerate to arange(S): every TEXT token is rotated +256
+            positions off (768..812 instead of 512..556).
+          * the SUFFIX rope table (AE_ROPE_ADDR): pos_suffix = n_valid + arange(),
+            so a wrong valid_len rotates every action token at the wrong position.
+          * the suffix attention bias (AE_BIAS_DRAM): masks prefix columns
+            [valid_len:P]. When valid_len == P that slice is EMPTY, so the prefix's
+            own padding-token K/V leak into every action row's cross-attention.
+
+        (prefix_bias_dram is the fourth, already re-DMA'd by run_inference.)
+
+        precompile_all() called compile_prefix(seq_len, seq_len) with seq_len as a
+        placeholder for valid_len on the assumption that "valid_len only shapes the
+        bias DATA". It does not -- compile_prefix stores it to self.prefix_valid_len,
+        which both consumers above read later. With the placeholder, valid_len was
+        832 instead of 813: n_valid became 576 rather than the 557 openpi computes,
+        and the padding mask covered nothing.
+
+        Both buffers are plain DRAM the host wrote, so refreshing them is a DMA --
+        no recompile, which keeps compile-once intact. Idempotent and cheap.
+        """
+        prev = getattr(self, "_valid_len_tables_for", None)
+        self.prefix_valid_len = valid_len
+        if prev == valid_len:
+            return
+        S_pre = getattr(self, "PREFIX_SEQ_LEN", None)
+        if S_pre is not None:
+            pos_prefix, n_valid = self._rope_positions_prefix(S_pre, valid_len)
+            # BOTH tables or NEITHER. RoPE attention scores depend on the
+            # DIFFERENCE of positions, so refreshing one side while the other keeps
+            # a stale offset is WORSE than leaving both stale: a uniform shift
+            # largely cancels in q.k, a one-sided shift does not. Measured, with
+            # precompile baking masked_cols=[] and valid_len=832:
+            #   both stale     -> prefix text +256, suffix +275, relative err  19  -> -0.80 grip
+            #   suffix only    -> prefix text +256, suffix   +0, relative err 256  -> -0.47 grip
+            #   both correct   ->                                relative err   0  -> -1.00 grip
+            # The middle row was this function's first version, which refreshed
+            # AE_ROPE_ADDR and left PREFIX_ROPE_ADDR frozen (_rope_init early-returns
+            # on PREFIX_ROPE_ADDR, so nothing else ever rebuilds it).
+            if getattr(self, "PREFIX_ROPE_ADDR", None) is not None:
+                tbl_p = self._rope_table(pos_prefix).contiguous()
+                self.dma_write(DMA_DEVICE_H2C, self.PREFIX_ROPE_ADDR,
+                               tbl_p, tbl_p.numel() * 2)
+            if getattr(self, "AE_ROPE_ADDR", None) is not None:
+                pos_suffix = n_valid + torch.arange(self.AE_ACTION_HORIZON_PADDED,
+                                                    dtype=torch.float32)
+                tbl_s = self._rope_table(pos_suffix).contiguous()
+                self.dma_write(DMA_DEVICE_H2C, self.AE_ROPE_ADDR, tbl_s, tbl_s.numel() * 2)
+            print(f"  [valid_len] rope tables refreshed: valid_len={valid_len} "
+                  f"-> n_valid={n_valid} (was {prev})")
+        # The LIVE suffix mask is AE_UATTN_BIAS_DRAM, not AE_BIAS_DRAM. The action
+        # expert runs ONE rectangular attention (batch=AE_HEADS*S queries x Tkv keys,
+        # unified_attention_core_dynamic's BIAS_DRAM_ADDR), whose (batch, Tkv) bias is
+        # built at tensor_init time by replicating row 0 of the square bias. The
+        # square AE_BIAS_DRAM buffer it was derived from is vestigial -- left over
+        # from the per-head square-flash implementation that the rectangular call
+        # replaced -- and is WRITTEN but never READ. Refreshing it (this function's
+        # first two versions did) therefore masks nothing: with precompile the live
+        # keymask was copied while prefix_masked_cols was still [] and valid_len 832,
+        # so the dead camera's 256 columns and the 19 prefix padding columns stayed
+        # unmasked in every action row's softmax. Worth ~15dB.
+        if getattr(self, "AE_UATTN_BIAS_DRAM", None) is not None:
+            P, Tkv, S = (self.AE_PREFIX_SEQ_LEN, self.AE_TKV,
+                         self.AE_ACTION_HORIZON_PADDED)
+            bias = self._build_ae_suffix_bias(P, Tkv, S, valid_len)
+            keymask = bias[0].clone()                       # (Tkv,) column mask
+            ubias = keymask.unsqueeze(0).repeat(self.AE_UATTN_BATCH, 1).contiguous()
+            self.dma_write(DMA_DEVICE_H2C, self.AE_UATTN_BIAS_DRAM, ubias,
+                           self.AE_UATTN_BATCH * Tkv * 2)
+        self._valid_len_tables_for = valid_len
 
     def compile_prefix(self, seq_len, valid_len=None):
         """18-layer Gemma-2B prefix stack: RMSNorm -> MQA flash-attn (bidirectional
@@ -2797,24 +2923,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # rows [valid_len:P] hold finite-but-meaningless padding-token K/V that must not
         # leak into the suffix's cross-attention softmax over the real S=64 action rows).
         # Previously unmasked -- a real accuracy bug (not a NaN source), fixed here.
-        NEG_INF = -1e9
-        valid_len = getattr(self, "prefix_valid_len", P)
-        bias = torch.zeros(Tkv, Tkv, dtype=torch.bfloat16)
-        # Suffix PADDING key columns. S=AE_ACTION_HORIZON_PADDED=64 but only the
-        # first AE_ACTION_HORIZON=10 suffix rows are real action tokens; rows
-        # [10:64] are 1e-6 filler. Their K/V are NOT small: AdaRMSNorm divides by
-        # the row's own RMS, so a 1e-6 row comes out at FULL magnitude and those
-        # 54 keys land in every real row's softmax. The old `bias[:, P+S:]` was an
-        # EMPTY slice (P+S == Tkv) and masked nothing -- this was the attention
-        # corruption (roped Q/K measured clean at ~46dB while rawattn craterd).
-        bias[:, P + self.AE_ACTION_HORIZON:] = NEG_INF
-        if valid_len < P:
-            bias[:, valid_len:P] = NEG_INF
-        # Mask skipped/zero image slots (same columns as the prefix bias) so the
-        # action expert's cross-attention ignores their placeholder K/V rows.
-        for a, b in getattr(self, "prefix_masked_cols", []):
-            bias[:, a:b] = NEG_INF
-        bias[S:, :] = 0.0           # unused query rows; value irrelevant, never read back
+        bias = self._build_ae_suffix_bias(P, Tkv, S)
         self.AE_BIAS_DRAM = self.get_params_dram_addr()
         self.dma_write(DMA_DEVICE_H2C, self.AE_BIAS_DRAM, bias.contiguous(), Tkv * Tkv * bpe)
         self.allocate_params_dram(Tkv * Tkv * bpe)
@@ -5044,10 +5153,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             slots_encoded * VIS_S rows, and the prefix adds PREFIX_TEXT_BUDGET.
             (Asserted against the real value in run_inference, so a config change
             that breaks the derivation is caught rather than mis-compiled.)
-          * valid_len does NOT shape the prefix PROGRAM, only the bias DATA that
-            run_inference re-DMAs to the same baked address on every obs -- which
-            is exactly what the existing compile-once path already relies on. A
-            placeholder is therefore safe.
+          * valid_len does NOT shape the prefix PROGRAM, so a placeholder is safe
+            FOR COMPILATION. It is NOT safe as a stored value: compile_prefix
+            assigns it to self.prefix_valid_len, and the action expert later reads
+            that for the suffix rope offset (pos_suffix = n_valid + arange) and the
+            suffix bias's [valid_len:P] padding mask. Passing seq_len here left
+            valid_len=832 instead of 813 -- n_valid 576 vs openpi's 557, and a mask
+            slice [832:832] that covered nothing. Cost: 13dB vs the oracle where
+            29.5dB was available. run_inference now calls
+            _refresh_valid_len_tables(valid_len) per observation to re-DMA both
+            buffers with the REAL value; this placeholder only has to be legal
+            enough to compile.
           * tensor_init_action_expert needs prefix_k/v_cache_addr, which
             compile_prefix publishes at the END OF COMPILATION, not execution.
 
@@ -5165,6 +5281,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 bias = self.build_prefix_attn_bias(seq_len, valid_len).contiguous()
                 self.dma_write(DMA_DEVICE_H2C, self._prefix_bias_dram,
                                bias.flatten(), bias.numel() * 2)
+            # THIS observation's valid_len -- not the one the program was compiled
+            # with. Must run on BOTH branches: the compile branch because
+            # precompile_all() may have baked a placeholder, and the cached branch
+            # because valid_len moves with the prompt's token count across tasks.
+            self._refresh_valid_len_tables(valid_len)
             self._execute_prefix(timeout=250.0)
             t_prefix = time.perf_counter() - t1
             self._report_gflops(f"prefix ({seq_len} tok)", self._prefix_flops(seq_len), t_prefix)
@@ -6265,12 +6386,36 @@ def main():
                      help="After the denoise run, read back the device-computed (N,1024) "
                           "AdaRMSNorm conditioning table and report per-step + overall SNR "
                           "against the exact host oracle.")
+    # Every other entry point in the repo (user_hw_test.py:6047, multi_engine_hw_test.py,
+    # randomize_dram.py, the *_run_from_bin.py set) takes --dev/--base-addr and calls
+    # set_dma_device; this file did not, so it silently inherited the user_dma_core
+    # module defaults (/dev/xdma0_*, UE_0_BASE_ADDR=0x02000000). That matters most under
+    # model_auto_test.py, which calls set_dma_device(dev) for the DRAM-poison step and
+    # then launches this script as a SUBPROCESS -- a fresh interpreter where that call
+    # never happened, so a non-default --dev was honored for the poison and dropped here.
+    ap.add_argument("--dev", type=str, default="xdma0",
+                     help="DMA device name (e.g. xdma0, xdma1). Default: xdma0.")
+    ap.add_argument("--device", type=str, default="kintex7",
+                     help="FPGA profile (e.g. rk, rk_256, kintex7, bittware, efinix).")
+    ap.add_argument("--base-addr", type=lambda x: int(x, 0), default=None,
+                     help="AXI-Lite register base address (default: device-specific).")
+
     # parse_known_args (not parse_args) because libero_eval.py imports this module and
     # passes its own flags through. That tolerance silently swallows TYPOS too --
     # `--pref_9` parsed fine and did nothing -- so say what was dropped.
     args, _unknown = ap.parse_known_args()
     if _unknown:
         print(f"[main] WARNING: ignoring unrecognized argument(s): {' '.join(_unknown)}")
+
+    # Before ANY UnifiedEngine is constructed: __init__ snapshots the live
+    # DMA_DEVICE_* globals into the instance (user_dma_core.py:566), so an engine
+    # built before this call stays bound to the default device for its lifetime --
+    # including every worker in _worker_engine_pool.
+    user_dma_core.set_dma_device(
+        "efinix" if args.device == "efinix" else args.dev, base_addr=args.base_addr)
+    print(f"[main] DMA dev={args.dev} (H2C={user_dma_core.DMA_DEVICE_H2C}, "
+          f"C2H={user_dma_core.DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}), "
+          f"UE_0_BASE_ADDR={user_dma_core.UE_0_BASE_ADDR:#010x}")
 
     Pi05Libero_UnifiedEngine.AE_COND_TABLE_ON_DEVICE = bool(args.cond_table_on_device)
     Pi05Libero_UnifiedEngine.AE_COND_TABLE_CHECK = bool(args.check_cond_table)

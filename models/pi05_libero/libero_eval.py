@@ -206,6 +206,15 @@ class _FpgaBackend:
         M.init_hang_prevention(self.ue)
         self.ue.weight_init()
         self.ue.tensor_init(M._CFG["defaults"].get("max_seq", 512))
+        # Compile encoder + prefix + denoise BEFORE the first observation executes.
+        # pi05_libero_test.main() does this via --precompile (default True), but this
+        # module never calls main(), so without it inference #0 of an episode compiled
+        # INLINE -- interleaved compile/execute/compile/execute/compile/execute -- while
+        # #1..N were execute-only. That made run 0 structurally different from every
+        # later run (different timing, different DRAM allocator ordering). Precompiling
+        # here makes every inference in the rollout identical: three back-to-back
+        # hardware runs, no compilation in the forward pass.
+        self.ue.precompile_all()
 
     def infer(self, images, toks, state_8d):
         # run_inference seeds its own noise from RandomState(0) when noise32 is None,
