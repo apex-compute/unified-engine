@@ -902,7 +902,11 @@ def sharded_scheduler_passthrough_identity_test(M: int = 256, K1: int = 512, N1:
     """num_engines==1 must emit a BYTE-IDENTICAL stream to hand-written
     single-engine emission (requirement 4). Compile-only, no hardware run."""
     import user_dma_core
-    from multi_engine_shard import MultiEngineScheduler, capture_digest
+    from multi_engine_shard import (
+        MultiEngineScheduler,
+        SHARDED_OP_ALLOWLIST,
+        capture_digest,
+    )
 
     bpe = 2
     dram = user_dma_core.DRAM_START_ADDR
@@ -973,6 +977,12 @@ def sharded_scheduler_passthrough_identity_test(M: int = 256, K1: int = 512, N1:
         ue.clear_capture_buffer()
     assert rejected, "sharded region must refuse unified_attention_core_dynamic"
     print("MultiEngineScheduler op allowlist: attention correctly refused inside a sharded region")
+
+    # activation_core is an identity matmul plus a pointwise epilogue, so it is
+    # row-independent and must remain available to model sharded regions.
+    assert "activation_core" in SHARDED_OP_ALLOWLIST, (
+        "sharded region must allow row-independent activation_core")
+    print("MultiEngineScheduler op allowlist: activation_core correctly allowed")
 
     record_test("sharded_scheduler_passthrough_identity",
                 f"M={M}, K1={K1}, N1={N1}, N2={N2}, num_engines=1",
@@ -1403,6 +1413,114 @@ def sharded_scheduler_col_passthrough_identity_test(M: int = 64, K: int = 1024, 
     ue.reset_tensor_dram_addr()
 
 
+def _head_attn_ref(q, k, v, gqa_ratio: int):
+    """[H, S, D] reference attention; K/V carry H//gqa_ratio KV heads."""
+    H, S, D = q.shape
+    out = torch.empty(H, S, D, dtype=torch.bfloat16)
+    for h in range(H):
+        kv = h // gqa_ratio
+        scores = (q[h].float() / math.sqrt(D)) @ k[kv].float().t()
+        out[h] = (torch.softmax(scores, dim=-1) @ v[kv].float()).to(torch.bfloat16)
+    return out
+
+
+def sharded_scheduler_head_attn_test(H: int = 8, seq_len: int = 256, head_dim: int = 64,
+                                     gqa_ratio: int = 1, num_engines: int = 2,
+                                     snr_threshold_db: float = 30.0):
+    """MultiEngineScheduler HEAD-sharded prefill flash attention.
+
+    The axis every other scheduler test avoids. Attention cannot be row-sharded
+    (``prefill_flash_attention_core`` builds ONE ``V^T`` per call into
+    ``SCRATCH_VT``, so two engines splitting a head's rows collide there) nor
+    column-sharded. Heads are independent, so each engine runs the stock kernel
+    over its own head range with a PRIVATE scratch, and the only synchronization
+    is the exit barrier before anything reads the concatenated [H, S, D].
+
+    Q/K/V/OUT are ONE full-size allocation each at the primary's addresses --
+    engines address the same flat DRAM at head offsets, the shape a real model
+    already has. Scratch is the sole PER_ENGINE buffer, and it is the point of
+    the test: point every engine at one scratch and this test is what fails.
+    """
+    import user_dma_core
+    from multi_engine_shard import MultiEngineScheduler
+
+    bpe = 2
+    kv_heads = H // gqa_ratio
+    dram = user_dma_core.DRAM_START_ADDR
+    primary = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
+                            params_dram_base=dram,
+                            tensor_dram_base=dram + 0x08000000,
+                            program_dram_base=dram + 0x0F000000)
+
+    addrs = {
+        'Q':   primary.allocate_tensor_dram(H * seq_len * head_dim * bpe),
+        'K':   primary.allocate_tensor_dram(kv_heads * seq_len * head_dim * bpe),
+        'V':   primary.allocate_tensor_dram(kv_heads * seq_len * head_dim * bpe),
+        'OUT': primary.allocate_tensor_dram(H * seq_len * head_dim * bpe),
+        'IDENTITY': primary.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe),
+    }
+    scratch_bytes = MultiEngineScheduler.attn_scratch_bytes(seq_len, head_dim, bpe)
+    scratch_primary = primary.allocate_tensor_dram(scratch_bytes)
+
+    q = torch.randn(H, seq_len, head_dim, dtype=torch.bfloat16)
+    k = torch.randn(kv_heads, seq_len, head_dim, dtype=torch.bfloat16)
+    v = torch.randn(kv_heads, seq_len, head_dim, dtype=torch.bfloat16)
+    identity = torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16)
+
+    primary.dma_to_accelerator_memory(addrs['Q'], q)
+    primary.dma_to_accelerator_memory(addrs['K'], k)
+    primary.dma_to_accelerator_memory(addrs['V'], v)
+    primary.dma_to_accelerator_memory(addrs['IDENTITY'], identity)
+
+    sched = MultiEngineScheduler(primary, num_engines=num_engines)
+    sched.alloc_attn_scratch('attn_scratch', seq_len, head_dim, scratch_primary, bpe)
+    sched.preclear_flags()
+
+    primary.start_capture()
+    primary.reset_isa_reg_counter()
+    primary.reset_inst_ptr_counter()
+    sched.begin_program()
+    sched.head_sharded_attention(
+        H, seq_len, head_dim,
+        Q_addr=addrs['Q'], K_addr=addrs['K'], V_addr=addrs['V'],
+        OUT_addr=addrs['OUT'], IDENTITY_addr=addrs['IDENTITY'],
+        gqa_ratio=gqa_ratio)
+    sched.finalize()
+    primary.generate_instruction_halt()
+    primary.stop_capture()
+    prog_addr = primary.get_program_dram_addr()
+    primary.write_captured_instructions_to_dram(prog_addr)
+    primary.allocate_program_dram(primary.get_capture_instruction_size_bytes())
+    inst_bytes = primary.get_capture_instruction_size_bytes() + sched.worker_program_bytes()
+
+    sched.start_workers()
+    primary.start_execute_from_dram(prog_addr)
+    primary.wait_queue(120.0)
+
+    out = primary.dma_from_accelerator_memory(addrs['OUT'], (H, seq_len, head_dim))
+    ref = _head_attn_ref(q, k, v, gqa_ratio)
+    snr = calculate_snr(ref, out)
+    print(f"MultiEngineScheduler head-sharded attention "
+          f"(H={H}, S={seq_len}, D={head_dim}, gqa={gqa_ratio}, "
+          f"num_engines={num_engines}) SNR: {snr:.2f} dB")
+    # Per-engine SNR is what localizes a scratch collision: a shared scratch
+    # typically leaves engine 0's heads clean and wrecks the rest.
+    for idx, (off, cnt) in enumerate(sched.split_heads(H, gqa_ratio)):
+        snr_i = calculate_snr(ref[off:off + cnt], out[off:off + cnt])
+        print(f"  engine{idx} heads {off}:{off + cnt} SNR: {snr_i:.2f} dB")
+    assert snr >= snr_threshold_db or snr == float("inf"), \
+        f"SNR {snr:.2f} dB must be at least {snr_threshold_db:g} dB"
+
+    record_test("sharded_scheduler_head_attn",
+                f"H={H}, seq_len={seq_len}, head_dim={head_dim}, "
+                f"gqa_ratio={gqa_ratio}, num_engines={num_engines}",
+                snr_db=snr, inst_bytes=inst_bytes)
+
+    primary.reset_tensor_dram_addr()
+    primary.clear_capture_buffer()
+    return snr
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-engine hardware tests")
     parser.add_argument('--dev', type=str, default='xdma0')
@@ -1453,6 +1571,14 @@ if __name__ == "__main__":
     # Negative control: stub the cross-engine reduction, the same test must FAIL.
     sharded_scheduler_k_split_reduce_test(M=64, K=4096, N=1024, num_engines=2,
                                           stub_reduction=True)
+
+    # --- MultiEngineScheduler, HEAD-axis (attention) sharding ---
+    # num_engines=1 first: exact passthrough, so a failure here is the kernel
+    # or the address math, not the sharding.
+    sharded_scheduler_head_attn_test(H=8, seq_len=256, head_dim=64, num_engines=1)
+    sharded_scheduler_head_attn_test(H=8, seq_len=256, head_dim=64, num_engines=2)
+    sharded_scheduler_head_attn_test(H=8, seq_len=256, head_dim=64, gqa_ratio=2,
+                                     num_engines=2)
 
     write_test_summary("multi_engine_hw_test_summary.md")
     print("Status: ALL MULTI-ENGINE TESTS PASSED")
