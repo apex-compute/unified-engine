@@ -367,6 +367,7 @@ class Gemma4VisionMixin:
         assert layout_ok, ("vision pooler element-wise path expects a raster grid "
                            "+ trailing padding; got a different patch layout.")
         self.VIS_POOL_WG = Wg
+        self.VIS_POOL_NVALID = n_valid                    # valid grid patches (48*48=2304)
         self.VIS_POOL_OUT_W = Wg // pool_k                # 16 output cols
         self.VIS_POOL_OUT_H = Hg // pool_k                # 16 output cell-rows
         self.VIS_POOL_N_SOFT = self.VIS_POOL_OUT_W * self.VIS_POOL_OUT_H   # 256
@@ -375,6 +376,25 @@ class Gemma4VisionMixin:
         self.VIS_POOL_S   = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_POOL_V   = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_POOL_OUT = self.allocate_tensor_dram(self.VIS_POOL_N_SOFT * H * bpe)
+        if not getattr(self, "debug", False):
+            # Default wide-accumulator matmul pool (see compile_vision_encoder_bin):
+            # P is the sparse pooling matrix [N_SOFT, nV] with 1/k^2 at each cell's
+            # k*k patch positions; VIS_HIDDEN_T holds the transposed valid grid
+            # [H, nV] the matmul contracts against. (--debug uses the element-wise
+            # path instead and needs neither buffer.)
+            N_SOFT = self.VIS_POOL_N_SOFT
+            self.VIS_POOL_P    = self.allocate_tensor_dram(N_SOFT * n_valid * bpe)
+            self.VIS_HIDDEN_T  = self.allocate_tensor_dram(H * n_valid * bpe)
+            Pm = torch.zeros(N_SOFT, n_valid, dtype=torch.bfloat16)
+            wj = torch.tensor(1.0 / (pool_k * pool_k), dtype=torch.bfloat16)
+            for cy in range(self.VIS_POOL_OUT_H):
+                for cx in range(self.VIS_POOL_OUT_W):
+                    base = pool_k * (Wg * cy + cx)
+                    cell = self.VIS_POOL_OUT_W * cy + cx
+                    for ky in range(pool_k):
+                        for kx in range(pool_k):
+                            Pm[cell, base + ky * Wg + kx] = wj
+            self._vis_pending_dmas.append((self.VIS_POOL_P, Pm))
 
         if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
             raise MemoryError(
@@ -488,6 +508,7 @@ class Gemma4VisionMixin:
         if (_vmeta is not None
                 and _vmeta.get("vision_kernel") == self.vision_kernel
                 and _vmeta.get("multi_core", 1) == self.multi_core
+                and _vmeta.get("debug", False) == bool(getattr(self, "debug", False))
                 and (self.multi_core == 1 or _worker_meta is not None)):
             self._ensure_vision_gate_scheduler()
             bin_path, _ = self._program_image_paths(profile)
@@ -702,34 +723,53 @@ class Gemma4VisionMixin:
         k, Wg = self.VIS_POOL_K, self.VIS_POOL_WG
         oW, oH, N_SOFT = self.VIS_POOL_OUT_W, self.VIS_POOL_OUT_H, self.VIS_POOL_N_SOFT
         rb = H * bpe                                    # bytes per patch row
-        # Compute every k x k cell independently.  This deliberately avoids
-        # global shifted ranges and DMA compaction: each add has disjoint input
-        # and output buffers, and the final add writes the cell's output row.
-        one_row_m = self._prime_M(1)
-        for cy in range(oH):
-            for cx in range(oW):
-                base = k * (Wg * cy + cx)
-                dst = self.VIS_POOL_OUT + (oW * cy + cx) * rb
-                rows = [final_buf + (base + ky * Wg + kx) * rb
-                        for ky in range(k) for kx in range(k)]
-                self._vis_flops += self.eltwise_core_dram(
-                    M=1, N=H, dram_a=rows[0], dram_b=rows[1],
-                    dram_out=self.VIS_POOL_S, mode=UE_MODE.ELTWISE_ADD,
-                    gpr_M_reg=one_row_m)
-                accum = self.VIS_POOL_S
-                scratch = self.VIS_POOL_V
-                for row in rows[2:-1]:
+        if not getattr(self, "debug", False):
+            # Default pool: express the k x k spatial average as a matmul
+            # P[N_SOFT, nV] @ hidden[nV, H] so the MAC array accumulates each cell
+            # sum in its bf20-wide accumulator. The element-wise bf16 add path
+            # (--debug) loses enough precision (~41-47 dB SNR vs host) to tip greedy
+            # decode into a repetition loop; the bf20-acc matmul reaches ~52 dB and
+            # decodes coherently. The matmul core computes A @ Bᵀ with A=P[N_SOFT,nV]
+            # and B=hiddenᵀ[H,nV], so the valid grid is transposed [nV,H] -> [H,nV]
+            # first. P carries the 1/k^2 weight (uniform bf16 scale, cancelled by
+            # the RMSNorm next).
+            nV = self.VIS_POOL_NVALID
+            self.bf16_transpose_core(
+                M=nV, N=H, INPUT_DRAM_ADDR=final_buf,
+                OUTPUT_DRAM_ADDR=self.VIS_HIDDEN_T,
+                IDENTITY_DRAM_ADDR=self.VIS_IDENTITY_64, gpr_M_reg=self._prime_M(nV))
+            self._vis_flops += self.matmat_mul_core(
+                M=N_SOFT, K=nV, N=H, A_DRAM_ADDR=self.VIS_POOL_P,
+                B_DRAM_ADDR=self.VIS_HIDDEN_T, OUTPUT_DRAM_ADDR=self.VIS_POOL_OUT,
+                is_B_quantized=False, gpr_M_reg=self._prime_M(N_SOFT))
+        else:
+            # --debug element-wise pool: compute every k x k cell independently
+            # with disjoint input/output buffers (flat chain-sum of the k*k rows),
+            # then one batched 1/k^2 average. Kept to reproduce the bf16-
+            # accumulation degradation (SNR printed in _run_vision_encoder_fpga).
+            one_row_m = self._prime_M(1)
+            for cy in range(oH):
+                for cx in range(oW):
+                    base = k * (Wg * cy + cx)
+                    dst = self.VIS_POOL_OUT + (oW * cy + cx) * rb
+                    rows = [final_buf + (base + ky * Wg + kx) * rb
+                            for ky in range(k) for kx in range(k)]
                     self._vis_flops += self.eltwise_core_dram(
-                        M=1, N=H, dram_a=accum, dram_b=row,
-                        dram_out=scratch, mode=UE_MODE.ELTWISE_ADD,
+                        M=1, N=H, dram_a=rows[0], dram_b=rows[1],
+                        dram_out=self.VIS_POOL_S, mode=UE_MODE.ELTWISE_ADD,
                         gpr_M_reg=one_row_m)
-                    accum, scratch = scratch, accum
-                self._vis_flops += self.eltwise_core_dram(
-                    M=1, N=H, dram_a=accum, dram_b=rows[-1],
-                    dram_out=dst, mode=UE_MODE.ELTWISE_ADD,
-                    gpr_M_reg=one_row_m)
-        # Average scale 1/k^2 over the N_SOFT compacted rows.
-        self._vis_flops += self.eltwise_core_dram(M=N_SOFT, N=H, dram_a=self.VIS_POOL_OUT, dram_b=None, dram_out=self.VIS_POOL_OUT, mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / (k * k), gpr_M_reg=self._prime_M(N_SOFT))
+                    accum, scratch = self.VIS_POOL_S, self.VIS_POOL_V
+                    for row in rows[2:-1]:
+                        self._vis_flops += self.eltwise_core_dram(
+                            M=1, N=H, dram_a=accum, dram_b=row,
+                            dram_out=scratch, mode=UE_MODE.ELTWISE_ADD,
+                            gpr_M_reg=one_row_m)
+                        accum, scratch = scratch, accum
+                    self._vis_flops += self.eltwise_core_dram(
+                        M=1, N=H, dram_a=accum, dram_b=rows[-1],
+                        dram_out=dst, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=one_row_m)
+            # Average scale 1/k^2 over the N_SOFT compacted rows.
+            self._vis_flops += self.eltwise_core_dram(M=N_SOFT, N=H, dram_a=self.VIS_POOL_OUT, dram_b=None, dram_out=self.VIS_POOL_OUT, mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / (k * k), gpr_M_reg=self._prime_M(N_SOFT))
         # embed_vision pre-projection RMSNorm (with_scale=False -> ones gamma).
         self._vis_flops += self.rms_norm_core_dram(M=N_SOFT, N=H, A_DRAM_ADDR=self.VIS_POOL_OUT, OUTPUT_DRAM_ADDR=self.VIS_EMBED_NORMED, GAMMA_DRAM_ADDR=self.VIS_EMBED_NORM_GAMMA, gpr_M_reg=self._prime_M(N_SOFT))
         # embed_vision projection: IF4 768 -> text_h.
@@ -754,6 +794,7 @@ class Gemma4VisionMixin:
                      "includes_patch_embed": True,
                      "vision_kernel": self.vision_kernel,
                      "multi_core": self.multi_core,
+                     "debug": bool(getattr(self, "debug", False)),
                      "total_flops": total_flops}
         if profile:
             _vis_meta["profile_checkpoints"] = enc_checkpoints
@@ -864,6 +905,24 @@ class Gemma4VisionMixin:
             print(f"Report FLOPS for program execution: {gflops:.2f} GFLOPS")
         print(f"Vision encoder execute done in {elapsed:.2f} seconds.", flush=True)
         return elapsed
+
+    def _host_pool_ref(self, pool_in: torch.Tensor) -> torch.Tensor:
+        """Host fp32 reference for the k x k spatial average pool (--debug SNR
+        check). ``pool_in`` is the pre-pool encoder output [S, H] read back from
+        final_buf; returns the pooled soft tokens [N_SOFT, H] as the fp32 average
+        of each cell's k*k patches -- the ideal the FPGA bf16 pool is compared to."""
+        k = self.VIS_POOL_K
+        Wg = self.VIS_POOL_WG
+        oW, oH = self.VIS_POOL_OUT_W, self.VIS_POOL_OUT_H
+        H = pool_in.shape[1]
+        x = pool_in.to(torch.float32)
+        out = torch.zeros(oH * oW, H, dtype=torch.float32)
+        for cy in range(oH):
+            for cx in range(oW):
+                base = k * (Wg * cy + cx)
+                idx = [base + ky * Wg + kx for ky in range(k) for kx in range(k)]
+                out[oW * cy + cx] = x[idx].mean(0)
+        return out
 
     # ------------------------------------------------------------------
     # Vision driver (S4): pooler tail, full encoder run, and the
@@ -1004,6 +1063,20 @@ class Gemma4VisionMixin:
                 self.VIS_EMBED_NORMED, (N_SOFT, self.VIS_H)).cpu(),
             "image_features": image_features,
         }
+
+        # --debug: SNR of the element-wise bf16 FPGA pool vs the host fp32 average
+        # of the same input. Reproduces the bf16-accumulation degradation that the
+        # default matmul pool avoids. Decode proceeds on the element-wise pool.
+        if getattr(self, "debug", False):
+            from user_dma_core import calculate_snr
+            host_pool = self._host_pool_ref(encoder_out)
+            fpga_pool = self._vis_ckpt["pool_out"].float()
+            snr = float(calculate_snr(host_pool, fpga_pool))
+            err = host_pool - fpga_pool
+            rel_l2 = (err.norm() / host_pool.norm().clamp_min(1e-12)).item()
+            print(f"  [debug] element-wise FPGA pool vs host ref over "
+                  f"[{N_SOFT},{self.VIS_H}]: SNR={snr:.2f} dB  rel_L2={rel_l2:.4g}  "
+                  f"max|Δ|={err.abs().max().item():.4g}", flush=True)
 
         # Restore LM allocator state (vision scratch overwrote LM tensor DATA;
         # run_prefill re-uploads/zeros it, so only the cursors need restoring).

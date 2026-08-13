@@ -717,7 +717,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
-                 decode_kernel: str = "streaming", multi_core: int = 1):
+                 decode_kernel: str = "streaming", multi_core: int = 1,
+                 debug: bool = False):
         for stage, kernel in (("vision", vision_kernel), ("prefill", prefill_kernel),
                               ("decode", decode_kernel)):
             if kernel not in ("streaming", "matmatmul"):
@@ -733,10 +734,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             raise ValueError("two-engine vision projection sharding requires --vision-kernel matmatmul")
         if multi_core == 2:
             prefill_kernel = "matmatmul"
+        if debug and multi_core == 2:
+            raise ValueError("--debug vision pool is single-core only (no --multi-core)")
         self.vision_kernel = vision_kernel
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
         self.multi_core = multi_core
+        # debug: run the FPGA vision pool with the element-wise bf16 path and print
+        # its SNR vs a host reference (reproduces the bf16-accumulation degradation).
+        # Default (False) uses the wide-accumulator matmul pool for correct decode.
+        self.debug = debug
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
@@ -1344,6 +1351,12 @@ def add_engine_args(parser) -> None:
                              "bittware_256, alveo, efinix).")
     parser.add_argument("--cycle", type=float, default=None,
                         help="Clock cycle time in nanoseconds. Overrides --device default.")
+    parser.add_argument("--debug", action="store_true",
+                        help="Run the FPGA vision spatial pool with the element-wise "
+                             "bf16 path (instead of the default wide-accumulator matmul "
+                             "pool) and print its SNR vs a host reference. Reproduces the "
+                             "bf16-accumulation degradation that breaks decode; "
+                             "single-core only.")
 
 
 def resolve_engine_config(parser, args) -> dict:
@@ -1411,6 +1424,7 @@ def resolve_engine_config(parser, args) -> dict:
         prefill_kernel=args.prefill_kernel,
         decode_kernel=args.decode_kernel,
         multi_core=args.multi_core,
+        debug=getattr(args, "debug", False),
     )
 
 
