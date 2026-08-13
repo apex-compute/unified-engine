@@ -1178,7 +1178,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 flop_rate_hw_decoder, latency_prefill, latency_decoder)
 
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
-                         checkpoints: list, tail_name: str, timeout: float = 120.0) -> list:
+                         checkpoints: list, tail_name: str, timeout: float = 120.0,
+                         worker_scheduler=None, worker_addrs=None) -> list:
         """Run a checkpointed program segment-by-segment, returning [(name, ms)]
         HW latency per segment. A preamble at self._preamble_addr primes each
         (reg, value) in ``gpr_sets`` then jumps into ``target_addr``; each
@@ -1187,7 +1188,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         segment covers everything after the last checkpoint up to the program's
         terminal HALT. Because the resume addresses are the instruction right
         after each HALT, the segments tile the whole program with no gaps, so the
-        summed latencies cover all FPGA execution (see run_gemma4_profile)."""
+        summed latencies cover all FPGA execution (see run_gemma4_profile).
+
+        Two-engine (``worker_scheduler``/``worker_addrs``): the worker runs its
+        own continuous shard stream once. Master checkpoints sit at the sharded-
+        region boundaries, so a master HALT lands while the worker is parked at the
+        next region's entry flag — the master's per-segment counter then measures
+        each region's fork-to-join wall-time and the master-only phases directly."""
         self.clear_inst_id()
         self.start_capture()
         for reg, val in gpr_sets:
@@ -1198,6 +1205,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.clear_capture_buffer()
 
         results = []
+        if worker_scheduler is not None:
+            worker_scheduler.preclear_flags()
+            worker_scheduler.start_workers(worker_addrs or [])
         self.start_execute_from_dram(self._preamble_addr)
         for name, resume_hex in checkpoints:
             self.wait_queue(timeout)
@@ -1205,6 +1215,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.start_execute_from_dram(int(resume_hex, 16))
         self.wait_queue(timeout)   # tail segment: everything up to the terminal HALT
         results.append((tail_name, self.report_latency_in_us() / 1e3))
+        for worker in (worker_scheduler.workers if worker_scheduler is not None else []):
+            worker.wait_queue(timeout)
         return results
 
     def _decode_profile_execute(self, decoder_addr: int, aligned_seq_len: int,
@@ -1466,8 +1478,6 @@ def main():
         parser.error("--vision-host requires --image")
     if args.image and args.audio:
         parser.error("--image and --audio are mutually exclusive")
-    if args.profile and args.multi_core == 2:
-        parser.error("--profile is not currently supported with --multi-core")
     engine_kwargs = resolve_engine_config(parser, args)
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
 

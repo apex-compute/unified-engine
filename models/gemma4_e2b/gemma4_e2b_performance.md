@@ -15,6 +15,7 @@ python models/gemma4_e2b/gemma4_e2b_test.py --image
 python models/gemma4_e2b/gemma4_e2b_test.py --image --profile
 python models/gemma4_e2b/gemma4_e2b_test.py --image --prefill-kernel matmatmul
 python models/gemma4_e2b/gemma4_e2b_test.py --image --multi-core
+python models/gemma4_e2b/gemma4_e2b_test.py --image --multi-core --profile
 ```
 
 ## Performance comparison
@@ -64,53 +65,79 @@ python models/gemma4_e2b/gemma4_e2b_test.py --image --multi-core
 - Add checkpointed profile images for vision, prefill, and decode without
   changing the normal execution image.
 
+Profile tables below are fresh `--profile` runs (`--dev xdma1`), rows in
+**compile order**. `--multi-core 2` uses per-phase multi-core profiling: the
+master's per-segment HW latency counter, with checkpoints at the sharded-region
+boundaries so each region's segment measures its fork-to-join wall-time. Each stage
+row-shards its **two matmul-heavy projection regions** across the two engines
+(vision: Projection + Post-attention; prefill: QKV/V + MLP) — these ~halve; the
+norm/RoPE/attention phases are master-only and engine-invariant. Decode is
+single-engine (never sharded), so its multi-core breakdown equals single-core.
+
 ## Profile backup: vision encoder
 
-| Phase | Total latency | Share | Count | Per layer |
-|---|---:|---:|---:|---:|
-| Post-attention | 28,860.249 ms | 52.8% | 16 | 1,803.7656 ms |
-| Attention | 16,616.577 ms | 30.4% | 16 | 1,038.5361 ms |
-| Projection | 6,674.010 ms | 12.2% | 16 | 417.1256 ms |
-| RoPE gather | 2,358.445 ms | 4.3% | 16 | 147.4028 ms |
-| Patch embedding | 123.501 ms | 0.2% | 1 | 123.5009 ms |
-| Tail | 0.003 ms | 0.0% | 1 | 0.0029 ms |
-| **Total** | **54,632.785 ms** | **100%** | | |
+Vision multi-core segments tile cleanly (they sum to the single-shot master total),
+so the per-phase `--multi-core 2` numbers are exact.
 
-Vision host wall-clock was 58.22 s: 54.73 s FPGA execution (94.0%), 2.38 s
-HF model load (4.1%), 0.52 s host instruction emission (0.9%), 0.26 s setup,
-0.21 s readback, 0.11 s preprocessing, and 0.01 s pool/project.
+| Phase | Single-core | --multi-core 2 |
+|---|---:|---:|
+| Patch embedding | 123.6 ms | 123.6 ms |
+| Projection (Q/K/V) † | 6,682.5 ms | **3,359.2 ms** |
+| RoPE gather | 2,520.5 ms | 2,520.5 ms |
+| Attention | 16,642.2 ms | 16,642.3 ms |
+| Post-attention (O + MLP) † | 28,911.9 ms | **14,540.7 ms** |
+| Pooler tail | 75.3 ms | 75.3 ms |
+| Tail | 0.0 ms | 0.0 ms |
+| **Total** | **54,956.0 ms** | **37,261.6 ms** |
+
+† row-sharded across 2 engines (the two fork-join regions); these ~halve. The
+master-only phases are unchanged, as expected.
 
 ## Profile backup: LM prefill
 
-| Phase | Total latency | Share | Count | Per layer |
-|---|---:|---:|---:|---:|
-| MLP | 34,935.889 ms | 67.2% | 35 | 998.1683 ms |
-| Attention | 9,345.133 ms | 18.0% | 35 | 267.0038 ms |
-| QKV/V projection | 3,298.324 ms | 6.3% | 35 | 94.2378 ms |
-| O projection | 2,930.012 ms | 5.6% | 35 | 83.7146 ms |
-| Injection | 694.165 ms | 1.3% | 35 | 19.8333 ms |
-| Per-layer preparation | 595.937 ms | 1.1% | 1 | 595.9371 ms |
-| RoPE | 156.245 ms | 0.3% | 35 | 4.4641 ms |
-| KV gather | 64.567 ms | 0.1% | 35 | 1.8448 ms |
-| Tail halt | 0.003 ms | 0.0% | 1 | 0.0029 ms |
-| **Total** | **52,020.275 ms** | **100%** | | |
+Prefill folds O projection into the MLP phase so single-core matches the multi-core
+O+MLP sharded region. Only **QKV/V projection** and **MLP (incl. O)** are sharded
+(†) — the rest are master-only and engine-invariant. Under two-engine the master's
+per-segment counter mis-times the two *long* master-only phases (per-layer prep,
+attention), so those rows show their single-core value (which is the true
+multi-core value — they run identically on the master). The reconstructed
+multi-core total (31,782 ms) matches the single-shot master counter (31,781.9 ms),
+confirming it.
+
+| Phase | Single-core | --multi-core 2 |
+|---|---:|---:|
+| Per-layer preparation ‡ | 596.0 ms | 596.0 ms |
+| QKV/V projection † | 3,302.5 ms | **1,681.8 ms** |
+| RoPE | 162.6 ms | 162.6 ms |
+| KV gather | 70.0 ms | 70.0 ms |
+| Attention ‡ | 9,268.7 ms | 9,268.7 ms |
+| MLP (incl. O projection) † | 37,426.6 ms | **19,309.3 ms** |
+| Injection | 694.2 ms | 694.2 ms |
+| Tail halt | 0.0 ms | 0.0 ms |
+| **Total** | **51,520.6 ms** | **31,782.4 ms** |
+
+† row-sharded across 2 engines (these ~halve). ‡ master-only; the profiler's
+per-segment counter mis-times these two under two-engine, so the (identical)
+single-core value is shown.
 
 ## Profile backup: one decode token at position 272
 
-| Phase | Total latency | Share | Count | Per layer |
-|---|---:|---:|---:|---:|
-| MLP | 135.547 ms | 55.4% | 35 | 3.8728 ms |
-| LM head | 34.761 ms | 14.2% | 1 | 34.7609 ms |
-| Attention | 30.397 ms | 12.4% | 35 | 0.8685 ms |
-| QKV/V projection | 13.111 ms | 5.4% | 35 | 0.3746 ms |
-| Injection | 12.604 ms | 5.1% | 35 | 0.3601 ms |
-| O projection | 11.746 ms | 4.8% | 35 | 0.3356 ms |
-| Per-layer preparation | 5.548 ms | 2.3% | 1 | 5.5482 ms |
-| RoPE | 0.970 ms | 0.4% | 35 | 0.0277 ms |
-| KV gather | 0.102 ms | 0.0% | 35 | 0.0029 ms |
-| Tail increment | 0.003 ms | 0.0% | 1 | 0.0029 ms |
-| **Total** | **244.788 ms** | **100%** | | |
+Decode is single-engine; `--multi-core 2` is identical (245.3 ms total).
 
-The profiled single-token throughput is 4.09 tok/s. Checkpoint HALTs add
-instrumentation control flow, so the normal-run 3.88 tok/s average remains the
+| Phase | Single-core |
+|---|---:|
+| Per-layer preparation | 5.6 ms |
+| QKV/V projection | 13.2 ms |
+| RoPE | 1.0 ms |
+| KV gather | 0.1 ms |
+| Attention | 30.5 ms |
+| O projection | 11.8 ms |
+| MLP | 135.8 ms |
+| Injection | 12.6 ms |
+| LM head | 34.8 ms |
+| Tail increment | 0.0 ms |
+| **Total** | **245.3 ms** |
+
+The profiled single-token throughput is ~4.08 tok/s. Checkpoint HALTs add
+instrumentation control flow, so the normal-run ~3.7 tok/s average remains the
 end-to-end decode result to use for user-visible throughput.

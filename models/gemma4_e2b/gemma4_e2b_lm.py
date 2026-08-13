@@ -822,7 +822,8 @@ class Gemma4LMMixin:
                 total_flops += _projection_core(M=seq_len, K=cur_q_size, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, gpr_M_reg=self.gpr_seq_len)
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off, gpr_M_reg=self.gpr_seq_len)
                 self.eltwise_core_dram(M=seq_len, N=self.vector_length, dram_a=layer_input_addr, dram_b=self.LAYER0_POST_ATTN_NORM_DRAM, dram_out=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self.gpr_seq_len)
-                _checkpoint(f"L{layer_idx}_o_proj")
+                # No o_proj checkpoint: fold O projection into the "mlp" phase so the
+                # single-core profile matches the multi-core O+MLP sharded region.
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off, gpr_M_reg=self.gpr_seq_len)
                 total_flops += _projection_core(M=seq_len, K=self.vector_length, N=cur_mlp, A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, gelu_enable=True, gpr_M_reg=self.gpr_seq_len)
                 total_flops += _projection_core(M=seq_len, K=self.vector_length, N=cur_mlp, A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, gpr_M_reg=self.gpr_seq_len)
@@ -1117,15 +1118,19 @@ class Gemma4LMMixin:
         # like a straight run (segments tile the whole program). The dynamic-PBI
         # preamble primes the same three GPRs as the one-shot dispatch below.
         if profile_checkpoints is not None:
-            if prefill_scheduler is not None:
-                raise RuntimeError("--profile is not supported with fixed two-engine prefill")
-            print(f"[Prefill] [profile] running {len(profile_checkpoints)} segments "
+            print(f"[Prefill] [profile] running {len(profile_checkpoints)} segments"
+                  f"{' (2-engine)' if prefill_scheduler is not None else ''} "
                   f"(host prep {host_prepare_s:.2f}s)...", flush=True)
+            # Two-engine: the master checkpoints bound the sharded regions, so each
+            # region's segment measures its fork-to-join wall-time; the worker runs
+            # its continuous shard stream and parks at region entry flags between.
             return self._profile_execute(
                 [(self.gpr_seq_len,         seq_len),
                  (self.gpr_q_seq_len,       q_seq_len),
                  (self.gpr_aligned_seq_len, aligned_seq_len)],
-                prefill_program_addr, profile_checkpoints, tail_name="tail_halt")
+                prefill_program_addr, profile_checkpoints, tail_name="tail_halt",
+                worker_scheduler=prefill_scheduler,
+                worker_addrs=worker_program_addrs)
 
         print(f"[Prefill] [exec] launching prefill program on FPGA ({seq_len} tokens, {self.LAYER_SIZE} layers)...", flush=True)
         # Heartbeat thread: program_execute blocks until the FPGA halts, with no
