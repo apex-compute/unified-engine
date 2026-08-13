@@ -505,6 +505,141 @@ class KShardContext:
         return self._k_reg
 
 
+class HeadShardContext:
+    """Per-engine view handed to an ATTENTION-HEAD-sharded region body.
+
+    Attention is the one stage that cannot be row- or column-sharded. Row
+    sharding splits M (tokens), but a row of the softmax needs the WHOLE key
+    axis, and -- decisively -- ``prefill_flash_attention_core`` builds ``V^T``
+    into a single ``SCRATCH_VT`` per call, so two engines row-splitting one head
+    would write the same scratch address. Heads, by contrast, are completely
+    independent: disjoint Q slice in, disjoint output slice out, K/V read-only.
+
+    THE ``ue`` HERE IS RAW, NOT THE ALLOWLIST PROXY. Every other context hands
+    out ``_ShardedEngineProxy`` because its region body emits a handful of
+    high-level ops (``matmat_mul_core``, ``eltwise_core_dram``, ...) that can be
+    enumerated and policed. The flash kernels are NOT built from those: they
+    emit ``start_queue_for_bf16_matvec_operation``,
+    ``start_queue_for_bf16_softmax_operation``, ``broadcast_mul`` and bare
+    SRAM/DRAM DMAs directly (``nn_lib.py:1012``). Allowlisting that set would
+    permit essentially every method on the engine, which is not a guard rail at
+    all -- so this region is deliberately less policed than the others, and the
+    invariant it owns is address discipline instead: use the accessors below and
+    never derive an attention address by hand.
+
+    GQA: ``q_addr`` is indexed by Q head, ``kv_addr`` by KV head
+    (``head_off // gqa_ratio``). Splitting on a KV-head boundary is enforced by
+    :meth:`MultiEngineScheduler.split_heads`, so an engine never owns a partial
+    KV group.
+
+    Attributes:
+        ue:         RAW UnifiedEngine (see above -- no allowlist here)
+        engine_idx: 0 == primary
+        H:          full Q-head count of the region
+        heads:      THIS engine's Q-head count
+        head_off:   THIS engine's first Q head within H
+        gqa_ratio:  Q heads per KV head (1 == MHA)
+        is_primary: engine_idx == 0
+    """
+
+    def __init__(self, scheduler, engine_idx: int, ue, H: int, head_off: int,
+                 heads: int, gqa_ratio: int, seq_len: int, head_dim: int,
+                 elem_bytes: int = 2):
+        self._sched = scheduler
+        self.engine_idx = engine_idx
+        self.ue = ue                 # RAW: flash is raw primitives, not ops
+        self.unsafe_ue = ue          # alias, so bodies read like the others
+        self.H = H
+        self.heads = heads
+        self.head_off = head_off
+        self.gqa_ratio = gqa_ratio
+        self.seq_len = seq_len
+        self.head_dim = head_dim
+        self.elem_bytes = elem_bytes
+        self.is_primary = engine_idx == 0
+
+    @property
+    def head_bytes(self) -> int:
+        """Bytes of one [seq_len, head_dim] head plane."""
+        return self.seq_len * self.head_dim * self.elem_bytes
+
+    @property
+    def groups(self) -> int:
+        """KV groups THIS engine owns -- one flash kernel call each.
+
+        :meth:`MultiEngineScheduler.split_heads` splits on group boundaries, so
+        this is always exact.
+        """
+        return self.heads // self.gqa_ratio
+
+    # -- Q / K / V / output slicing -----------------------------------------
+    # ``group`` indexes THIS ENGINE's KV groups (0 .. self.groups-1), not the
+    # model's. Each one is a separate kernel call; see the body in
+    # MultiEngineScheduler.head_sharded_attention for why.
+    def q_addr(self, base_addr: int, group: int = 0) -> int:
+        """First Q head of ``group``, in a [H, seq_len, head_dim] blob.
+
+        The kernel walks the following ``gqa_ratio`` heads itself, which is
+        correct only because Q heads of one KV group are contiguous in H.
+        """
+        head = self.head_off + group * self.gqa_ratio
+        return _shifted(base_addr, head * self.head_bytes,
+                        f"Q head shard (engine {self.engine_idx}, group {group})")
+
+    def kv_addr(self, base_addr: int, group: int = 0) -> int:
+        """KV head of ``group``, in a [H/gqa_ratio, seq_len, head_dim] blob.
+
+        Indexed by KV head, NOT Q head -- passing ``q_addr`` for K/V is the
+        single most likely GQA mistake and reads out of bounds on the last
+        engine rather than failing loudly.
+        """
+        kv_head = self.head_off // self.gqa_ratio + group
+        return _shifted(base_addr, kv_head * self.head_bytes,
+                        f"KV head shard (engine {self.engine_idx}, group {group})")
+
+    def out_addr(self, base_addr: int, group: int = 0) -> int:
+        """Output slice for ``group``. Disjoint per engine AND per group, so the
+        concatenated [H, seq_len, head_dim] is complete after one exit barrier."""
+        head = self.head_off + group * self.gqa_ratio
+        return _shifted(base_addr, head * self.head_bytes,
+                        f"attn out shard (engine {self.engine_idx}, group {group})")
+
+    def bias_addr(self, base_addr: int, per_head: bool = False,
+                  group: int = 0) -> int:
+        """Attention bias / mask base.
+
+        ``prefill_flash_attention_core`` indexes its bias ``((i+r) * N_q + j)``
+        with NO head term (``nn_lib.py:1114``), i.e. it assumes ONE
+        [seq_len, seq_len] plane shared by every head -- so the default here is
+        to pass the base through unshifted. Pass ``per_head=True`` only for a
+        model that really does upload [H, seq_len, seq_len]; note the kernel
+        will still read only the plane at the address it is given, which is
+        correct precisely because each engine gets its own head's plane.
+        """
+        if base_addr is None:
+            return None
+        if not per_head:
+            return base_addr
+        plane = self.seq_len * self.seq_len * self.elem_bytes
+        head = self.head_off + group * self.gqa_ratio
+        return _shifted(base_addr, head * plane,
+                        f"attn bias shard (engine {self.engine_idx}, group {group})")
+
+    # -- scratch -------------------------------------------------------------
+    def scratch(self, name: str = "attn_scratch") -> int:
+        """THIS engine's PRIVATE flash scratch base.
+
+        One pointer covers both buffers the kernel derives from it --
+        ``SCRATCH_VT`` at +0 and ``SCRATCH_SM`` at ``+head_dim*seq_len*bpe``
+        (``nn_lib.py:1024``) -- so registering one region of
+        :meth:`MultiEngineScheduler.attn_scratch_bytes` is sufficient.
+        Sharing this across engines is the failure mode this whole class exists
+        to prevent: ``SCRATCH_SM`` is written per head and read back per head,
+        so two engines on one base interleave and silently corrupt.
+        """
+        return self._sched.per_engine_addr(name, self.engine_idx)
+
+
 class MultiEngineScheduler:
     """Emits row-sharded regions of an existing model's program onto N engines.
 
@@ -752,6 +887,160 @@ class MultiEngineScheduler:
         """
         return self.split_cols(K)
 
+    # --------------------------------------------------------------- heads --
+    def split_heads(self, H: int, gqa_ratio: int = 1) -> list[tuple[int, int]]:
+        """Return [(head_offset, head_count)] per engine for H attention heads.
+
+        Split on KV-GROUP boundaries, not Q-head boundaries: with ``gqa_ratio``
+        Q heads per KV head, an engine that owned a partial group would need a
+        K/V slice starting mid-plane, which ``HeadShardContext.kv_addr`` cannot
+        express (and which would make ``V^T`` wrong, not merely redundant).
+        Engines that land on DIFFERENT groups each rebuild their own ``V^T``
+        from their own K/V -- there is no duplicated work to eliminate.
+
+        Uneven-but-aligned, like :meth:`split_cols`: trailing engines get one
+        group less rather than any engine getting a partial one.
+        """
+        n = self.num_engines
+        assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
+        assert H % gqa_ratio == 0, (
+            f"split_heads: H={H} is not a multiple of gqa_ratio={gqa_ratio}")
+        if n == 1:
+            return [(0, H)]
+        groups = H // gqa_ratio
+        assert groups >= n, (
+            f"split_heads: H={H} is only {groups} KV group(s) of {gqa_ratio} "
+            f"head(s), too few for num_engines={n}. Shard a different axis, or "
+            f"run attention on the primary alone.")
+        base, rem = divmod(groups, n)
+        counts = [gqa_ratio * (base + (1 if i < rem else 0)) for i in range(n)]
+        offsets = [sum(counts[:i]) for i in range(n)]
+        return list(zip(offsets, counts))
+
+    @staticmethod
+    def attn_scratch_bytes(seq_len: int, head_dim: int, elem_bytes: int = 2) -> int:
+        """Per-engine flash scratch: ``SCRATCH_VT`` then ``SCRATCH_SM``.
+
+        ``V^T`` is [head_dim, seq_len] and the attention-probability matrix is
+        [seq_len, seq_len] (``nn_lib.py:1024``), so this grows as seq_len**2 and
+        is the binding constraint on head sharding -- NOT program size. At
+        seq_len 2048 it is ~8 MB per engine; at 4096, ~32 MB. Budget it against
+        the 4 GB map before committing to an engine count.
+        """
+        return (head_dim + seq_len) * seq_len * elem_bytes
+
+    def alloc_attn_scratch(self, name: str, seq_len: int, head_dim: int,
+                           primary_addr: int, elem_bytes: int = 2) -> None:
+        """Register the per-engine flash scratch for a head-sharded region.
+
+        ``primary_addr`` is the scratch the MODEL already owns (engine 0 keeps
+        using it); the workers get their own from the scheduler allocator. Thin
+        wrapper over :meth:`register_per_engine` that computes the size, so a
+        caller cannot under-allocate and have engine 1 write into whatever
+        follows.
+        """
+        self.register_per_engine(
+            name, primary_addr,
+            self.attn_scratch_bytes(seq_len, head_dim, elem_bytes))
+
+    def begin_head_sharded(self, H: int, seq_len: int, head_dim: int,
+                           gqa_ratio: int = 1,
+                           elem_bytes: int = 2) -> list[HeadShardContext]:
+        """Rendezvous, then open a head-sharded region, one context per engine."""
+        assert self._program_open, "begin_head_sharded() without begin_program()"
+        assert not self._in_region, "nested sharded regions are not supported"
+        split = self.split_heads(H, gqa_ratio)
+        self.barrier()
+        self._in_region = True
+        self._region_count += 1
+        return [HeadShardContext(self, i, ue, H, split[i][0], split[i][1],
+                                 gqa_ratio, seq_len, head_dim, elem_bytes)
+                for i, ue in enumerate(self.engines)]
+
+    def head_sharded_region(self, H: int, seq_len: int, head_dim: int,
+                            body: Callable[[HeadShardContext], None],
+                            gqa_ratio: int = 1, elem_bytes: int = 2,
+                            join: bool = True) -> None:
+        """Replay ``body(ctx)`` once per engine over a head split.
+
+        ``join`` defaults to True and should almost always stay there: the next
+        thing after attention is o_proj, which reads the CONCATENATED
+        [seq_len, H*head_dim] across every engine's slice -- the textbook
+        cross-shard read the exit barrier exists for.
+        """
+        contexts = self.begin_head_sharded(H, seq_len, head_dim, gqa_ratio,
+                                           elem_bytes)
+        for ctx in contexts:
+            body(ctx)
+        self.end_sharded(join=join)
+
+    def head_sharded_attention(self, H: int, seq_len: int, head_dim: int,
+                               Q_addr: int, K_addr: int, V_addr: int,
+                               OUT_addr: int, IDENTITY_addr: int,
+                               *,
+                               gqa_ratio: int = 1,
+                               bias_addr: Optional[int] = None,
+                               bias_per_head: bool = False,
+                               scratch_name: str = "attn_scratch",
+                               kernel: Optional[Callable] = None,
+                               elem_bytes: int = 2,
+                               join: bool = True) -> None:
+        """Head-sharded prefill attention -- the whole stage in one call.
+
+        ``kernel`` defaults to ``nn_lib.prefill_flash_attention_core``; pass a
+        different one (the decode variant, a PBI batched flash) with the same
+        keyword signature. Register the scratch with :meth:`alloc_attn_scratch`
+        first.
+
+        Per ``project_pbi_flash_back_to_back_bug``, flash stays on the LEGACY
+        (non-PBI) path -- head sharding is static per engine, so each engine
+        carries its own full unroll and the total program bytes are merely
+        redistributed, not multiplied. Check :meth:`worker_program_bytes`.
+        """
+        if kernel is None:
+            import nn_lib
+            kernel = nn_lib.prefill_flash_attention_core
+
+        # head_dim 72 (MoonViT) fails the 128 B assertion inside _shifted; pad
+        # to 128 first, exactly as the single-engine path already must.
+        assert (seq_len * head_dim * elem_bytes) % SRAM_ROW_BYTES == 0, (
+            f"head plane {seq_len}x{head_dim} is not a whole number of "
+            f"{SRAM_ROW_BYTES} B SRAM rows; pad head_dim before sharding")
+
+        def body(ctx: HeadShardContext) -> None:
+            # ONE KERNEL CALL PER KV GROUP, num_q_heads=gqa_ratio.
+            #
+            # ``num_q_heads`` is NOT "how many heads to process" -- it is "how
+            # many Q heads share this ONE K/V head". Inside the kernel only
+            # ``q_base``/``out_base`` advance with the head index; ``K_DRAM_ADDR``
+            # is re-read unshifted every iteration and ``SCRATCH_VT`` is built
+            # ONCE before the loop (nn_lib.py:1054, :1110). Passing the engine's
+            # full head count therefore computes every head against KV head 0 --
+            # finite, plausible, and wrong (-2.4 dB, caught by the num_engines=1
+            # passthrough case).
+            #
+            # So the engine iterates its own KV groups and hands each call the
+            # gqa_ratio Q heads that genuinely share that group. With
+            # gqa_ratio == 1 (MHA) this is one call per head, which is simply
+            # what the kernel's batching means for MHA -- there is nothing to
+            # batch when no two Q heads share a K/V.
+            for g in range(ctx.groups):
+                kernel(ctx.ue, head_dim, seq_len,
+                       Q_DRAM_ADDR=ctx.q_addr(Q_addr, group=g),
+                       K_DRAM_ADDR=ctx.kv_addr(K_addr, group=g),
+                       V_DRAM_ADDR=ctx.kv_addr(V_addr, group=g),
+                       OUTPUT_DRAM_ADDR=ctx.out_addr(OUT_addr, group=g),
+                       SCRATCH_DRAM_ADDR=ctx.scratch(scratch_name),
+                       IDENTITY_DRAM_ADDR=IDENTITY_addr,   # shared, read-only
+                       BIAS_DRAM_ADDR=ctx.bias_addr(bias_addr,
+                                                    per_head=bias_per_head,
+                                                    group=g),
+                       num_q_heads=ctx.gqa_ratio)
+
+        self.head_sharded_region(H, seq_len, head_dim, body,
+                                 gqa_ratio=gqa_ratio, elem_bytes=elem_bytes,
+                                 join=join)
+
     def alloc_col_output(self, name: str, M: int, N: int, elem_bytes: int = 2) -> list[int]:
         """Allocate one contiguous ``[M, cols]`` output buffer PER ENGINE.
 
@@ -966,11 +1255,37 @@ class MultiEngineScheduler:
         assert self._program_open, "finalize() without begin_program()"
         assert not self._in_region, "finalize() inside an open sharded region"
         self._worker_prog_addrs = []
-        for w in self.workers:
+        for wi, w in enumerate(self.workers):
             w.generate_instruction_halt()
             w.stop_capture()
             addr = w.get_program_dram_addr()
-            w.write_captured_instructions_to_dram(addr)
+            try:
+                w.write_captured_instructions_to_dram(addr)
+            except TypeError:
+                # DIAGNOSTIC (temporary): Instructions.get_bytes() has been seen
+                # failing with "cannot convert '_struct.Struct' object to
+                # bytearray", which means a non-int landed in inst.words. Report
+                # WHICH worker/instruction and what the bad word actually is --
+                # the bare traceback names neither.
+                import struct as _s
+                print(f"    [finalize] worker {wi} FAILED flushing "
+                      f"{w.capture_count} instructions to 0x{addr:x}")
+                print(f"    [finalize] struct.pack is {_s.pack!r} -> "
+                      f"{type(_s.pack('<I', 1))}")
+                for k, inst in enumerate(w.capture_buffer):
+                    bad = [(j, type(x).__name__, repr(x))
+                           for j, x in enumerate(inst.words)
+                           if not isinstance(x, int)]
+                    if bad:
+                        print(f"    [finalize] inst #{k} has non-int words: {bad}")
+                        # NOT inst!r -- Instructions.__repr__ formats every word
+                        # with 0x{w:08X} and would raise on the non-int itself.
+                        print(f"    [finalize] inst #{k} words = {inst.words}")
+                        break
+                else:
+                    print("    [finalize] every word is an int -- the failure is "
+                          "in struct.pack itself, not the instruction stream")
+                raise
             w.allocate_program_dram(w.get_capture_instruction_size_bytes())
             self._worker_prog_addrs.append(addr)
         self._program_open = False
