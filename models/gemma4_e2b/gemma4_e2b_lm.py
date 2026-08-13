@@ -365,20 +365,48 @@ class Gemma4LMMixin:
             f"KV cache: {self._num_kv_slots} unique compact slots "
             f"({self._kv_cache_bytes * 2 / (1024*1024):.1f} MB K+V, "
             f"saved {_compact_saved / (1024*1024):.1f} MB vs padded slots)")
+        # ================= PERSISTENT tensors =================
+        # Allocated once at the bottom of the tensor region and NEVER overwritten
+        # by the vision stage (which now resets only to self._scratch_dram_base).
+        # These must stay intact across vision -> prefill -> decode: KV cache,
+        # constants, attention bias, and per-layer injection inputs.
+        pli_elements = self.MAX_CONTEXT_SIZE * self.LAYER_SIZE * self.per_layer_input_dim
+        # KV cache (reused throughout prefill + decode).
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(self._kv_cache_bytes)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self._kv_cache_bytes)
         zero_pad = torch.zeros(self._kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_pad)
-        # Allocate memory for constant zero tensor, identity matrix, and bias:
+        # Constant zero tensor + identity matrix (read by many ops).
         zero_add = torch.zeros(seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
         self.ZERO_DRAM_ADDR = self.allocate_tensor_dram(seq_len * self.head_dim * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
         self.IDENTITY_DRAM_ADDR = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
-        # Allocate memory for attention and zero pad. Prefill uses
-        # seq_len*group_size rows; decode uses MAX_CONTEXT_SIZE KV rows, so size
-        # the shared buffers for the larger aligned dimension.
+        # Two full-matrix bias buffers, reused across every decode token:
+        # full-attention layers attend to the whole causal window, sliding
+        # layers to `sliding_window`. compile_* pick the right address per layer;
+        # run_prefill / run_decoder upload both.
+        self.LAYER0_FLASH_BIAS_FULL_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * attention_aligned_seq_len * self.bytes_per_element)
+        self.LAYER0_FLASH_BIAS_SLIDING_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * attention_aligned_seq_len * self.bytes_per_element)
+        # Backwards-compat alias (older callers use the singular name).
+        self.LAYER0_FLASH_BIAS_DRAM = self.LAYER0_FLASH_BIAS_FULL_DRAM
+        # Reserved streaming LM-head penalty bias.
+        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
+        # Per-layer injection: host uploads token-indexed embed rows; FPGA fills
+        # PER_LAYER_INPUTS_DRAM ([token, layer, dim]) in prefill, read by the
+        # injection blocks every decode token.
+        self.PER_LAYER_EMBED_DRAM = self.allocate_tensor_dram(pli_elements * self.bytes_per_element)
+        self.PER_LAYER_INPUTS_DRAM = self.allocate_tensor_dram(pli_elements * self.bytes_per_element)
+
+        # Persistent region ends here; everything below is reusable scratch that
+        # the vision stage (and each LM op) may freely overwrite.
+        self._scratch_dram_base = self.get_tensor_dram_addr()
+        _persistent_bytes = self._scratch_dram_base - self._tensor_dram_base
+
+        # ================= SCRATCH tensors =================
+        # Transient per-op / per-stage buffers. Sized for the larger of prefill
+        # (seq_len*group_size rows) and decode (MAX_CONTEXT_SIZE KV rows).
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
@@ -386,7 +414,7 @@ class Gemma4LMMixin:
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_pad)
-        # Allocate memory for layer intermediate tensors:
+        # Layer intermediate tensors:
         self.LAYER0_INPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.LAYER0_PRE_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.LAYER0_Q_DRAM = self.allocate_tensor_dram(seq_len * self.q_size)
@@ -400,14 +428,6 @@ class Gemma4LMMixin:
         self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(
             (attention_aligned_seq_len * attention_aligned_seq_len
              + 2 * self.head_dim * attention_aligned_seq_len) * self.bytes_per_element)
-        # Two full-matrix bias buffers: full-attention layers attend to
-        # the entire causal window, sliding-attention layers are limited to
-        # `sliding_window` tokens. compile_prefill / compile_decoder pick the
-        # right address per layer; run_prefill / run_decoder upload both.
-        self.LAYER0_FLASH_BIAS_FULL_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * attention_aligned_seq_len * self.bytes_per_element)
-        self.LAYER0_FLASH_BIAS_SLIDING_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * attention_aligned_seq_len * self.bytes_per_element)
-        # Backwards-compat alias (older callers use the singular name).
-        self.LAYER0_FLASH_BIAS_DRAM = self.LAYER0_FLASH_BIAS_FULL_DRAM
         self.LAYER0_ATTN_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.LAYER0_POST_ATTN_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.LAYER0_POST_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
@@ -421,25 +441,18 @@ class Gemma4LMMixin:
         self.LAYER0_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
         self.OUTPUT_NORM_DRAM = self.allocate_tensor_dram(1 * self.vector_length * self.bytes_per_element)
         self.LOGITS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
-        # Reserved for a future streaming LM-head penalty implementation.
-        # GEMMA4_PENALTY is temporarily rejected.
-        self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
-
-        # Per-layer input preparation + injection buffers.  The host uploads
-        # only token-indexed rows from embed_tokens_per_layer; FPGA performs
-        # model projection, RMSNorm, add and scaling into PER_LAYER_INPUTS_DRAM.
-        pli_elements = self.MAX_CONTEXT_SIZE * self.LAYER_SIZE * self.per_layer_input_dim
-        self.PER_LAYER_EMBED_DRAM = self.allocate_tensor_dram(
-            pli_elements * self.bytes_per_element)
-        self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(
-            pli_elements * self.bytes_per_element)
-        # Final layout is [token, layer, dim], consumed by injection blocks.
-        self.PER_LAYER_INPUTS_DRAM = self.allocate_tensor_dram(self.MAX_CONTEXT_SIZE * self.LAYER_SIZE * self.per_layer_input_dim * self.bytes_per_element)
-        # Intermediate DRAMs for per-layer injection
+        # Per-layer injection intermediates (scratch).
+        self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(pli_elements * self.bytes_per_element)
         self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.per_layer_input_dim * self.bytes_per_element)
         self.LAYER0_PER_LAYER_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * self.bytes_per_element)
 
-        print(f"    Tensor DRAM usage: {self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
+        if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
+            raise RuntimeError(
+                f"LM tensor region overflow: end=0x{self.get_tensor_dram_addr():X} > "
+                f"vision_program_start=0x{self.VISION_ISA_BASE:X}")
+        print(f"    Tensor DRAM: persistent {_persistent_bytes/(1024*1024):.1f} MB @ "
+              f"0x{self._tensor_dram_base:X}, scratch base 0x{self._scratch_dram_base:X}, "
+              f"total high-water {self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
 
     # Per-layer dim resolution for Gemma4's heterogeneous stack. Two independent
     # axes → 4 layer buckets. Values below are for the current config (35 layers,

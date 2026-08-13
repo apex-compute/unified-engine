@@ -185,7 +185,12 @@ class Gemma4VisionMixin:
         pixel_position_ids = self.vision_pixel_position_ids
         padding_positions = self.vision_padding_positions
 
-        self.reset_tensor_dram_addr()
+        # Reuse only the SCRATCH sub-region of the tensor space. Persistent LM
+        # tensors (KV cache, constants, attention bias, per-layer injection) live
+        # below _scratch_dram_base and must NOT be clobbered by vision scratch
+        # (incl. the pooler's VIS_POOL_S/V/OUT). Falls back to _tensor_base if the
+        # LM tensor_init has not run (should never happen in practice).
+        self._tensor_dram_addr = getattr(self, "_scratch_dram_base", self._tensor_dram_base)
         # Deferred DMAs: this method only ALLOCATES + builds host tensors; the
         # actual uploads are queued here and flushed at run time by
         # execute_vision_encoder_bin (right before the encoder launches).
@@ -697,25 +702,32 @@ class Gemma4VisionMixin:
         k, Wg = self.VIS_POOL_K, self.VIS_POOL_WG
         oW, oH, N_SOFT = self.VIS_POOL_OUT_W, self.VIS_POOL_OUT_H, self.VIS_POOL_N_SOFT
         rb = H * bpe                                    # bytes per patch row
-        # Horizontal: s2[i] = h[i] + h[i+1] + h[i+2]  (offset-row adds; dram_b
-        # is the same buffer shifted by whole patch rows, all contiguous).
-        self._vis_flops += self.eltwise_core_dram(M=S - 1, N=H, dram_a=final_buf, dram_b=final_buf + rb, dram_out=self.VIS_POOL_S, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S - 1))
-        self._vis_flops += self.eltwise_core_dram(M=S - 2, N=H, dram_a=self.VIS_POOL_S, dram_b=final_buf + 2 * rb, dram_out=self.VIS_POOL_S, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S - 2))
-        # Vertical: v2[i] = s2[i] + s2[i+Wg] + s2[i+2*Wg].
-        self._vis_flops += self.eltwise_core_dram(M=S - Wg, N=H, dram_a=self.VIS_POOL_S, dram_b=self.VIS_POOL_S + Wg * rb, dram_out=self.VIS_POOL_V, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S - Wg))
-        self._vis_flops += self.eltwise_core_dram(M=S - 2 * Wg, N=H, dram_a=self.VIS_POOL_V, dram_b=self.VIS_POOL_S + 2 * Wg * rb, dram_out=self.VIS_POOL_V, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(S - 2 * Wg))
-        # Compact the cell-base rows {k*Wg*cy + k*cx} into VIS_POOL_OUT. eltwise
-        # reads/writes with one shared stride, so the k:1 pick is a strided DMA:
-        # per cell-row, read oW rows at stride k (different read increment) and
-        # write them contiguously (compact write increment) -> no gather core.
+        # Compute every k x k cell independently.  This deliberately avoids
+        # global shifted ranges and DMA compaction: each add has disjoint input
+        # and output buffers, and the final add writes the cell's output row.
+        one_row_m = self._prime_M(1)
         for cy in range(oH):
-            src = self.VIS_POOL_V + (k * Wg * cy) * rb
-            dst = self.VIS_POOL_OUT + (oW * cy) * rb
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=src, sram_address=0x00000,
-                element_size=oW * H, stride_bytes_per_chunk=rb, stride_jump_bytes=k * rb)
-            self.sram_to_accelerator_memory(
-                sram_address=0x00000, accelerator_dram_address=dst, element_size=oW * H)
+            for cx in range(oW):
+                base = k * (Wg * cy + cx)
+                dst = self.VIS_POOL_OUT + (oW * cy + cx) * rb
+                rows = [final_buf + (base + ky * Wg + kx) * rb
+                        for ky in range(k) for kx in range(k)]
+                self._vis_flops += self.eltwise_core_dram(
+                    M=1, N=H, dram_a=rows[0], dram_b=rows[1],
+                    dram_out=self.VIS_POOL_S, mode=UE_MODE.ELTWISE_ADD,
+                    gpr_M_reg=one_row_m)
+                accum = self.VIS_POOL_S
+                scratch = self.VIS_POOL_V
+                for row in rows[2:-1]:
+                    self._vis_flops += self.eltwise_core_dram(
+                        M=1, N=H, dram_a=accum, dram_b=row,
+                        dram_out=scratch, mode=UE_MODE.ELTWISE_ADD,
+                        gpr_M_reg=one_row_m)
+                    accum, scratch = scratch, accum
+                self._vis_flops += self.eltwise_core_dram(
+                    M=1, N=H, dram_a=accum, dram_b=rows[-1],
+                    dram_out=dst, mode=UE_MODE.ELTWISE_ADD,
+                    gpr_M_reg=one_row_m)
         # Average scale 1/k^2 over the N_SOFT compacted rows.
         self._vis_flops += self.eltwise_core_dram(M=N_SOFT, N=H, dram_a=self.VIS_POOL_OUT, dram_b=None, dram_out=self.VIS_POOL_OUT, mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / (k * k), gpr_M_reg=self._prime_M(N_SOFT))
         # embed_vision pre-projection RMSNorm (with_scale=False -> ones gamma).
@@ -986,6 +998,10 @@ class Gemma4VisionMixin:
         # Numeric-harness checkpoints (SNR-compared vs HF in the numeric script).
         self._vis_ckpt = {
             "encoder_out": encoder_out,
+            "pool_out": self.dma_from_accelerator_memory(
+                self.VIS_POOL_OUT, (N_SOFT, self.VIS_H)).cpu(),
+            "embed_normed": self.dma_from_accelerator_memory(
+                self.VIS_EMBED_NORMED, (N_SOFT, self.VIS_H)).cpu(),
             "image_features": image_features,
         }
 

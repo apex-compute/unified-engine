@@ -105,7 +105,30 @@ def _output_tensor(output):
     return output
 
 
-def build_vision_references(ue, image_path, prompt):
+def _pool_vision_hidden(hidden, position_ids, padding, pool_k):
+    """Reproduce the HF spatial average pool and return unscaled soft tokens."""
+    if hidden.dim() == 2:
+        hidden = hidden.unsqueeze(0)
+    if position_ids.dim() == 2:
+        position_ids = position_ids.unsqueeze(0)
+    if padding.dim() == 1:
+        padding = padding.unsqueeze(0)
+    h = hidden.float().clone()
+    h.masked_fill_(padding.unsqueeze(-1), 0.0)
+    output_length = h.shape[1] // (pool_k * pool_k)
+    clamped = position_ids.clamp(min=0)
+    max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
+    kernel_idxs = torch.div(clamped, pool_k, rounding_mode="floor")
+    kernel_idxs = (kernel_idxs[..., 0]
+                   + (max_x // pool_k) * kernel_idxs[..., 1])
+    weights = torch.nn.functional.one_hot(
+        kernel_idxs.long(), output_length).float() / (pool_k * pool_k)
+    pooled = weights.transpose(1, 2) @ h
+    pooler_mask = torch.logical_not((weights == 0).all(dim=1))
+    return pooled[pooler_mask]
+
+
+def build_vision_references(ue, image_path, prompt, fpga_encoder_out=None):
     """Build only B/C references; no patch-embed or layer-0 checkpoints."""
     hf_model, model_dir = g4r._ensure_hf_model(ue.script_dir, ue._cfg)
     hf_model.eval()
@@ -121,6 +144,7 @@ def build_vision_references(ue, image_path, prompt):
     position_ids = inputs["image_position_ids"]
     padding = (position_ids == -1).all(dim=-1).squeeze(0)
     vision_tower = hf_model.model.vision_tower
+    embed_vision = hf_model.model.embed_vision
 
     def _capture():
         checkpoint = {}
@@ -136,15 +160,34 @@ def build_vision_references(ue, image_path, prompt):
             hook.remove()
         checkpoint["C"] = getattr(
             output, "pooler_output", output).detach().float().cpu()
+        checkpoint["P"] = _pool_vision_hidden(
+            checkpoint["B"], position_ids, padding, ue.VIS_POOL_K).cpu()
+        checkpoint["N"] = embed_vision.embedding_pre_projection_norm(
+            checkpoint["P"].to(torch.bfloat16)).detach().float().cpu()
         return checkpoint
 
     print("  [numeric] vision reference 1/2: full-precision HF")
     hf_ref = _capture()
     count = quantize_vision_tower_(
         vision_tower, g4r.VISION_QUANT_PRECISION)
-    print(f"  [numeric] vision reference 2/2: {count} IF4 Linear weights")
+    count += quantize_vision_tower_(
+        embed_vision, g4r.VISION_QUANT_PRECISION)
+    print(f"  [numeric] vision reference 2/2: {count} IF4 Linear weights "
+          "(including embed_vision projection)")
     host_ref = _capture()
-    return {"hf": hf_ref, "hostref": host_ref}, {"padding": padding}
+    refs = {"hf": hf_ref, "hostref": host_ref}
+    if fpga_encoder_out is not None:
+        pool = _pool_vision_hidden(
+            fpga_encoder_out, position_ids, padding, ue.VIS_POOL_K)
+        norm = embed_vision.embedding_pre_projection_norm(
+            pool.to(torch.bfloat16))
+        projected = embed_vision.embedding_projection(norm)
+        refs["fpga_input_oracle"] = {
+            "P": pool.detach().float().cpu(),
+            "N": norm.detach().float().cpu(),
+            "C": projected.detach().float().cpu(),
+        }
+    return refs, {"padding": padding}
 
 
 def build_hf_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
@@ -433,9 +476,12 @@ def main():
 
         print("\n[numeric] building vision references ...")
         vision_prompt = args.prompt or "Describe this image in detail."
-        refs, meta = build_vision_references(ue, image_path, vision_prompt)
+        refs, meta = build_vision_references(
+            ue, image_path, vision_prompt, ckpt["encoder_out"])
         real = ~meta["padding"]
         stages = [("B encoder_out", "B", "encoder_out", real),
+                  ("P pool_out", "P", "pool_out", None),
+                  ("N embed_normed", "N", "embed_normed", None),
                   ("C image_features", "C", "image_features", None)]
 
         print("\n[numeric] ===== FPGA (refactor) vs references — SNR dB (real patches) =====")
@@ -445,6 +491,10 @@ def main():
         print("  FPGA vs HF (full-precision ground truth; gap = IF4 quant loss):")
         for name, rkey, ckey, mask in stages:
             report(name, refs["hf"][rkey], ckpt[ckey], row_mask=mask)
+        print("  FPGA vs HOSTREF fed the exact FPGA encoder output "
+              "(isolates pool/norm/projection):")
+        for name, rkey, ckey, _mask in stages[1:]:
+            report(name, refs["fpga_input_oracle"][rkey], ckpt[ckey])
     elif args.prompt:
         print(f"[numeric] LM-only mode, prompt: {args.prompt!r}")
         ue.set_prefill_seq(args.prompt)
