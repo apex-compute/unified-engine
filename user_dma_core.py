@@ -831,14 +831,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        # REBASE NOTE: main re-enabled this assert and bumped the expected version
-        # 0x52a71442 -> 0xcf133b89; this branch had it commented out. Kept DISABLED
-        # (the branch's behaviour) but carrying main's newer constant, so re-enabling
-        # is a one-character edit rather than a hunt for the current value. The board
-        # this branch runs on reports a version that matches neither, so turning the
-        # assert back on would block every run -- re-enable only after confirming the
-        # FPGA image, not as part of this rebase.
-        # assert hw_version == 0xcf133b89, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xcf133b89. Please update FPGA with commit update_cf133b89.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0xcf133b89, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xcf133b89. Please update FPGA with commit update_cf133b89.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
