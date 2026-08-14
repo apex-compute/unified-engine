@@ -16,26 +16,39 @@ python models/gemma4_e2b/gemma4_e2b_test.py --image --profile
 python models/gemma4_e2b/gemma4_e2b_test.py --image --prefill-kernel matmatmul
 python models/gemma4_e2b/gemma4_e2b_test.py --image --multi-core
 python models/gemma4_e2b/gemma4_e2b_test.py --image --multi-core --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image --multi-core
 ```
 
 ## Performance comparison
 
-| Metric | Legacy | Refactored streaming prefill | Refactored matmatmul prefill | Multicore (2 engines) | rk |
-|---|---:|---:|---:|---:|---:|
-| Vision FPGA execution | 55.54 s | 54.60 s | 54.85 s | 37.20 s | 32.56 s |
-| Vision end-to-end path | not reported | 55.81 s | 56.10 s | 38.77 s | 33.03 s |
-| Vision throughput | not reported | 20.86 GFLOPS | 20.76 GFLOPS | 30.63 GFLOPS | 35.00 GFLOPS |
-| Vision soft tokens | 256 | 256 | 256 | 256 | 256 |
-| LM prefill sequence executed | 512-token template | 272 actual tokens | 272 actual tokens | 272 actual tokens | 273 actual tokens |
-| LM prefill FPGA latency | 113.571 s | 51.63 s | 52.578 s | 31.93 s | 32.544 s |
-| LM prefill useful-work throughput | 23.20 GFLOPS | 23.94 GFLOPS | 23.45 GFLOPS | 38.80 GFLOPS | 37.89 GFLOPS |
-| Decode average throughput | 2.68 tok/s | 3.82 tok/s | 3.85 tok/s | 3.60 tok/s | 6.00 tok/s |
-| Decode peak first-token throughput | 2.86 tok/s | 4.07 tok/s | 4.01 tok/s | 4.02 tok/s | 6.23 tok/s |
-| Decode average hardware throughput | 13.42 GFLOPS | 19.11 GFLOPS | 19.20 GFLOPS | 17.96 GFLOPS | 30.45 GFLOPS |
-| Vision program section | 3.58 MiB | 3.03 MiB | 3.03 MiB | 4.09 MiB incl. worker | / |
-| Prefill program section | 5.71 MiB | 3.10 MiB | 3.21 MiB | 3.44 MiB incl. worker | / |
-| Combined program image | 10.37 MiB | 7.54 MiB | 7.67 MiB | 8.95 MiB | / |
-| Weight image (`params.bin`) | 6.91 GiB | same | same | same | / |
+| Metric | Legacy | Kintex | Refactored matmatmul prefill | Kintex 2-core | rk | Alveo | Alveo 2-core | Alveo 4-core (unvalidated) | Alveo 8-core (unvalidated) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Vision FPGA execution | 55.54 s | 54.60 s | 54.85 s | **29.24 s** | 32.56 s | 36.15 s | **19.89 s** | **10.96 s** | **7.19 s** |
+| Vision end-to-end path | not reported | 55.81 s | 56.10 s | **29.96 s** | 33.03 s | 36.66 s | **20.56 s** | **12.00 s** | **8.86 s** |
+| Vision throughput | not reported | 20.86 GFLOPS | 20.76 GFLOPS | **38.99 GFLOPS** | 35.00 GFLOPS | 26.30 GFLOPS | **47.82 GFLOPS** | **86.78 GFLOPS** | **132.27 GFLOPS** |
+| Vision soft tokens | 256 | 256 | 256 | 256 | 256 | 256 | 256 | 256 | 256 |
+| LM prefill sequence executed | 512-token template | 272 actual tokens | 272 actual tokens | 272 actual tokens | 273 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens |
+| LM prefill FPGA latency | 113.571 s | 51.63 s | 52.578 s | **31.83 s** | 32.544 s | 34.54 s | **21.09 s** | **14.27 s** | **10.88 s** |
+| LM prefill useful-work throughput | 23.20 GFLOPS | 23.94 GFLOPS | 23.45 GFLOPS | 38.80 GFLOPS | 37.89 GFLOPS | 29.79 GFLOPS | **48.84 GFLOPS** | **72.31 GFLOPS** | **95.23 GFLOPS** |
+| Decode average throughput | 2.68 tok/s | 3.82 tok/s | 3.85 tok/s | **3.80 tok/s** | 6.00 tok/s | 5.60 tok/s | 5.62 tok/s | 5.68 tok/s | 5.46 tok/s |
+| Decode peak first-token throughput | 2.86 tok/s | 4.07 tok/s | 4.01 tok/s | **4.00 tok/s** | 6.23 tok/s | 5.91 tok/s | 5.90 tok/s | 5.79 tok/s | 5.75 tok/s |
+| Decode average hardware throughput | 13.42 GFLOPS | 19.11 GFLOPS | 19.20 GFLOPS | **19.05 GFLOPS** | 30.45 GFLOPS | 23.61 GFLOPS | 23.68 GFLOPS | 23.91 GFLOPS | 23.05 GFLOPS |
+| Vision program section | 3.58 MiB | 3.03 MiB | 3.03 MiB | **4.15 MiB incl. worker** | / | 3.05 MiB | 4.15 MiB incl. worker | 6.18 MiB incl. workers | not reported |
+| Prefill program section | 5.71 MiB | 3.10 MiB | 3.21 MiB | **4.70 MiB incl. worker** | / | 3.08 MiB | 4.70 MiB incl. worker | 7.37 MiB incl. workers | not reported |
+| Combined program image | 10.37 MiB | 7.54 MiB | 7.67 MiB | **10.27 MiB** | / | 7.55 MiB | 10.27 MiB | 14.98 MiB | not reported |
+| Weight image (`params.bin`) | 6.91 GiB | same | same | same | / | same | same | same | same |
+| Correctness | legacy baseline | coherent | coherent | coherent | not recorded | coherent; stop token | coherent; stop token | **failed: unrelated description** | **failed: unrelated description** |
+
+The Alveo one- and two-core runs produced coherent Yosemite descriptions and
+reached the stop token. The experimental four- and eight-core columns record
+measured execution numbers, but both decoded unrelated image descriptions and
+are therefore explicitly marked unvalidated. See `gemma4_e2b_alveo_4core.log`
+and `gemma4_e2b_alveo_8core.log` for those correctness failures.
+
+The Kintex 2-core column is from the latest normal run with vision attention
+heads sharded across both engines (`gemma4_e2b_multicore_attention.log`), replacing
+the older projection-only multicore measurements.
 
 ## Refactor optimizations
 

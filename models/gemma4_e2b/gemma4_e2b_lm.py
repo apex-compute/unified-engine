@@ -983,21 +983,22 @@ class Gemma4LMMixin:
         prefill_scheduler = self._ensure_prefill_scheduler()
         worker_program_addrs = []
         if prefill_scheduler is not None:
-            worker_meta, worker_bytes = self._get_program_section(
-                "prefill_worker1", profile_checkpoints is not None)
-            if worker_meta is None:
-                raise FileNotFoundError(
-                    "prefill_worker1 section not found in combined programs bin")
-            if worker_meta.get("prefill_seq_len") != seq_len:
-                raise RuntimeError(
-                    f"fixed prefill worker was compiled for M={worker_meta.get('prefill_seq_len')}, "
-                    f"but this prompt requires M={seq_len}; recompile the program image")
-            worker = prefill_scheduler.workers[0]
-            worker_addr = int(worker_meta["dram_base"], 16)
-            worker._next_program_dram_addr = worker_addr
-            worker.dma_write(DMA_DEVICE_H2C, worker_addr, worker_bytes, len(worker_bytes))
-            worker.allocate_program_dram(len(worker_bytes))
-            worker_program_addrs = [worker_addr]
+            for engine_idx, worker in enumerate(prefill_scheduler.workers, start=1):
+                worker_meta, worker_bytes = self._get_program_section(
+                    f"prefill_worker{engine_idx}", profile_checkpoints is not None)
+                if worker_meta is None:
+                    raise FileNotFoundError(
+                        f"prefill_worker{engine_idx} section not found in combined programs bin")
+                if worker_meta.get("prefill_seq_len") != seq_len:
+                    raise RuntimeError(
+                        f"fixed prefill worker {engine_idx} was compiled for "
+                        f"M={worker_meta.get('prefill_seq_len')}, but this prompt "
+                        f"requires M={seq_len}; recompile the program image")
+                worker_addr = int(worker_meta["dram_base"], 16)
+                worker._next_program_dram_addr = worker_addr
+                worker.dma_write(DMA_DEVICE_H2C, worker_addr, worker_bytes, len(worker_bytes))
+                worker.allocate_program_dram(len(worker_bytes))
+                worker_program_addrs.append(worker_addr)
             prefill_scheduler.preclear_flags()
 
         # Restore clean FPGA state before this prefill (formerly in

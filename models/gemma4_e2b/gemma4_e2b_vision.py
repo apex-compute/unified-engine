@@ -252,13 +252,19 @@ class Gemma4VisionMixin:
         self._vis_bias_guard_pre  = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
         self.VIS_FLASH_BIAS = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
         self._vis_bias_guard_post = self.allocate_tensor_dram(BIAS_GUARD_BYTES)
-        self.VIS_FLASH_SCRATCH = self.allocate_tensor_dram(
-            (aligned_S * aligned_S + 2 * HD * aligned_S) * 2)
+        attn_scratch_bytes = (aligned_S * aligned_S + 2 * HD * aligned_S) * 2
+        self.VIS_FLASH_SCRATCH = self.allocate_tensor_dram(attn_scratch_bytes)
         # Head-sharded attention needs one private scratch region per engine.
-        # Allocate the worker copy from the model tensor arena; the worker's own
-        # allocator is its vision ISA arena and must not be used for data.
-        self.VIS_FLASH_SCRATCH_WORKER = self.allocate_tensor_dram(
-            (aligned_S * aligned_S + 2 * HD * aligned_S) * 2)
+        # Allocate every copy from the model tensor arena; worker allocators are
+        # reserved for ISA. Keep the primary address first, in engine order.
+        self.VIS_FLASH_SCRATCH_PER_ENGINE = [self.VIS_FLASH_SCRATCH]
+        for _ in range(1, self.multi_core):
+            self.VIS_FLASH_SCRATCH_PER_ENGINE.append(
+                self.allocate_tensor_dram(attn_scratch_bytes))
+        # Compatibility name for code/debuggers that expect the 2-core field.
+        self.VIS_FLASH_SCRATCH_WORKER = (
+            self.VIS_FLASH_SCRATCH_PER_ENGINE[1]
+            if self.multi_core > 1 else None)
         # Unused by unified_attention_core but kept to keep the allocation order
         # (and every baked address after it) stable.
         self.VIS_ATTN_P = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
@@ -391,11 +397,12 @@ class Gemma4VisionMixin:
                         Pm[cell, base + ky * Wg + kx] = 1.0
         self._vis_pending_dmas.append((self.VIS_POOL_P, Pm))
 
-        if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
+        tensor_limit = 0xFC000000 if self.multi_core > 2 else self.VISION_ISA_BASE
+        if self.get_tensor_dram_addr() > tensor_limit:
             raise MemoryError(
                 f"Gemma4 vision tensors overflow the 2-GB layout: "
                 f"end=0x{self.get_tensor_dram_addr():X}, "
-                f"vision_program_start=0x{self.VISION_ISA_BASE:X}")
+                f"worker_program_start=0x{tensor_limit:X}")
 
         self._vis_num_patches = S
         self._vis_aligned_S = aligned_S
@@ -499,11 +506,14 @@ class Gemma4VisionMixin:
         bin can only be run segment-by-segment."""
         L = self.VIS_LAYERS
         _vmeta, _ = self._get_program_section("vision", profile)
-        _worker_meta, _ = self._get_program_section("vision_worker1", profile)
+        _worker_metas = [
+            self._get_program_section(f"vision_worker{i}", profile)[0]
+            for i in range(1, self.multi_core)
+        ]
         if (_vmeta is not None
                 and _vmeta.get("vision_kernel") == self.vision_kernel
                 and _vmeta.get("multi_core", 1) == self.multi_core
-                and (self.multi_core == 1 or _worker_meta is not None)):
+                and all(meta is not None for meta in _worker_metas)):
             self._ensure_vision_gate_scheduler()
             bin_path, _ = self._program_image_paths(profile)
             print(f"  [Vision] reusing existing instruction image at {bin_path}", flush=True)
@@ -531,7 +541,7 @@ class Gemma4VisionMixin:
         if gate_scheduler is not None:
             gate_scheduler.register_per_engine_addrs(
                 "vision_attn_scratch",
-                [self.VIS_FLASH_SCRATCH, self.VIS_FLASH_SCRATCH_WORKER])
+                self.VIS_FLASH_SCRATCH_PER_ENGINE)
             gate_scheduler.begin_program()
             # Engine 0 uses Gemma's reserved sequence-length GPR. Plain
             # UnifiedEngine workers do not have that model-level attribute, so
@@ -796,19 +806,21 @@ class Gemma4VisionMixin:
                 f"0x{primary_limit:X}")
         self._store_program_section("vision", base_addr, enc_bytes, _vis_meta, profile=profile)
         if gate_scheduler is not None:
-            worker = gate_scheduler.workers[0]
-            worker_bytes = bytearray()
-            for inst in worker.capture_buffer:
-                worker_bytes.extend(inst.get_bytes())
-            worker_addr = worker_addrs[0]
-            if worker_addr + len(worker_bytes) > self.LM_ISA_BASE:
-                raise RuntimeError(
-                    f"vision core1 ISA overflow: 0x{worker_addr + len(worker_bytes):X} > "
-                    f"0x{self.LM_ISA_BASE:X}")
-            self._store_program_section(
-                "vision_worker1", worker_addr, worker_bytes,
-                {"parent": "vision", "engine_idx": 1,
-                 "multi_core": self.multi_core}, profile=profile)
+            for engine_idx, (worker, worker_addr) in enumerate(
+                    zip(gate_scheduler.workers, worker_addrs), start=1):
+                worker_bytes = bytearray()
+                for inst in worker.capture_buffer:
+                    worker_bytes.extend(inst.get_bytes())
+                worker_limit = (worker_addr + 0x00240000
+                                if self.multi_core > 2 else self.LM_ISA_BASE)
+                if worker_addr + len(worker_bytes) > worker_limit:
+                    raise RuntimeError(
+                        f"vision core{engine_idx} ISA overflow: "
+                        f"0x{worker_addr + len(worker_bytes):X} > 0x{worker_limit:X}")
+                self._store_program_section(
+                    f"vision_worker{engine_idx}", worker_addr, worker_bytes,
+                    {"parent": "vision", "engine_idx": engine_idx,
+                     "multi_core": self.multi_core}, profile=profile)
         print(f"  [Vision] encoder section stored ({len(enc_bytes)/1024/1024:.1f} MB @ 0x{base_addr:X}, "
               f"{time.perf_counter()-t0:.1f}s)", flush=True)
 
@@ -839,15 +851,17 @@ class Gemma4VisionMixin:
         gate_scheduler = self._ensure_vision_gate_scheduler()
         worker_addrs = []
         if gate_scheduler is not None:
-            worker_meta, worker_bytes = self._get_program_section("vision_worker1", profile)
-            if worker_meta is None:
-                raise FileNotFoundError("vision_worker1 section not found in combined programs bin")
-            worker = gate_scheduler.workers[0]
-            worker_addr = int(worker_meta["dram_base"], 16)
-            worker._next_program_dram_addr = worker_addr
-            worker.dma_write(DMA_DEVICE_H2C, worker_addr, worker_bytes, len(worker_bytes))
-            worker.allocate_program_dram(len(worker_bytes))
-            worker_addrs = [worker_addr]
+            for engine_idx, worker in enumerate(gate_scheduler.workers, start=1):
+                worker_meta, worker_bytes = self._get_program_section(
+                    f"vision_worker{engine_idx}", profile)
+                if worker_meta is None:
+                    raise FileNotFoundError(
+                        f"vision_worker{engine_idx} section not found in combined programs bin")
+                worker_addr = int(worker_meta["dram_base"], 16)
+                worker._next_program_dram_addr = worker_addr
+                worker.dma_write(DMA_DEVICE_H2C, worker_addr, worker_bytes, len(worker_bytes))
+                worker.allocate_program_dram(len(worker_bytes))
+                worker_addrs.append(worker_addr)
             gate_scheduler.preclear_flags()
         print(f"  [Vision] launching patch+encoder ({len(enc_bytes)/1024/1024:.1f} MB) at 0x{program_addr:X}"
               f"{' [profiled]' if profile else ''} ...", flush=True)
