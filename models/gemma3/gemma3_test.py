@@ -2785,7 +2785,7 @@ def _clock_ns_default_for_device(device: str) -> float:
     if device == "kintex7":                       return 1000 / (1066 / 5.375)
     if device in ("rk", "rk_256", "puzhi"):       return 3.0
     if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 3.3333333
+    if device in ("alveo", "alveo_u55c"):          return 3.3333333
     if device == "efinix":                         return 4.0
     return 10.0
 
