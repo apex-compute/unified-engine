@@ -1416,6 +1416,7 @@ def _head_attn_ref(q, k, v, gqa_ratio: int):
 
 def sharded_scheduler_head_attn_test(H: int = 8, seq_len: int = 256, head_dim: int = 64,
                                      gqa_ratio: int = 1, num_engines: int = 2,
+                                     mode: str = "groups",
                                      snr_threshold_db: float = 30.0):
     """MultiEngineScheduler HEAD-sharded prefill flash attention.
 
@@ -1474,7 +1475,7 @@ def sharded_scheduler_head_attn_test(H: int = 8, seq_len: int = 256, head_dim: i
         H, seq_len, head_dim,
         Q_addr=addrs['Q'], K_addr=addrs['K'], V_addr=addrs['V'],
         OUT_addr=addrs['OUT'], IDENTITY_addr=addrs['IDENTITY'],
-        gqa_ratio=gqa_ratio)
+        gqa_ratio=gqa_ratio, mode=mode)
     sched.finalize()
     primary.generate_instruction_halt()
     primary.stop_capture()
@@ -1492,10 +1493,10 @@ def sharded_scheduler_head_attn_test(H: int = 8, seq_len: int = 256, head_dim: i
     snr = calculate_snr(ref, out)
     print(f"MultiEngineScheduler head-sharded attention "
           f"(H={H}, S={seq_len}, D={head_dim}, gqa={gqa_ratio}, "
-          f"num_engines={num_engines}) SNR: {snr:.2f} dB")
+          f"mode={mode}, num_engines={num_engines}) SNR: {snr:.2f} dB")
     # Per-engine SNR is what localizes a scratch collision: a shared scratch
     # typically leaves engine 0's heads clean and wrecks the rest.
-    for idx, (off, cnt) in enumerate(sched.split_heads(H, gqa_ratio)):
+    for idx, (off, cnt) in enumerate(sched.split_heads(H, gqa_ratio, mode=mode)):
         snr_i = calculate_snr(ref[off:off + cnt], out[off:off + cnt])
         print(f"  engine{idx} heads {off}:{off + cnt} SNR: {snr_i:.2f} dB")
     assert snr >= snr_threshold_db or snr == float("inf"), \
@@ -1503,7 +1504,8 @@ def sharded_scheduler_head_attn_test(H: int = 8, seq_len: int = 256, head_dim: i
 
     record_test("sharded_scheduler_head_attn",
                 f"H={H}, seq_len={seq_len}, head_dim={head_dim}, "
-                f"gqa_ratio={gqa_ratio}, num_engines={num_engines}",
+                f"gqa_ratio={gqa_ratio}, mode={mode}, "
+                f"num_engines={num_engines}",
                 snr_db=snr, inst_bytes=inst_bytes)
 
     primary.reset_tensor_dram_addr()
@@ -1569,6 +1571,11 @@ if __name__ == "__main__":
     sharded_scheduler_head_attn_test(H=8, seq_len=256, head_dim=64, num_engines=2)
     sharded_scheduler_head_attn_test(H=8, seq_len=256, head_dim=64, gqa_ratio=2,
                                      num_engines=2)
+    # Q-head split: gqa_ratio=8 gives ONE KV group, which mode='groups' refuses
+    # to shard at all. Both engines read that single KV plane and each builds
+    # its own V^T.
+    sharded_scheduler_head_attn_test(H=8, seq_len=256, head_dim=64, gqa_ratio=8,
+                                     num_engines=2, mode='qheads')
 
     write_test_summary("multi_engine_hw_test_summary.md")
     print("Status: ALL MULTI-ENGINE TESTS PASSED")

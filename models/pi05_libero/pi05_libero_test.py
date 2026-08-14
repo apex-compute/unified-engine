@@ -1264,32 +1264,55 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # Scratch sizing (bf16, *2): unified_attention_core_dynamic needs
         # head_dim*aligned_seq_len + aligned_seq_len^2 + batch*head_dim elements.
         # Here batch=aligned_seq_len=S, head_dim=D -> 2*D*S + S*S (S*S dominates).
-        # SHARED_FULL even when sharded: attention stays on the primary.
-        prefix_attn_scratch = self.allocate_tensor_dram((2 * D * S + S * S) * bpe)
-
-        # ---- ROW SHARDING ACROSS ENGINES ------------------------------------
-        # --engines N shards the ROW-INDEPENDENT part of every layer (both
-        # RMSNorms, all 10 matmuls, the 3 eltwise ops) over 64-row blocks of the
-        # S prefix tokens. RoPE, the two smart_bf16_permute_core calls, the KV
-        # cache staging and the 8 attention calls stay SINGLE-ENGINE on the
-        # primary at full S -- attention is 2.1% of layer FLOPs and sharding it
-        # would need per-engine scratch plus a strided scatter with a
-        # destination row offset, the highest-risk change in the space.
         #
-        # Two rendezvous per layer (36) + one before the halt:
+        # PER_ENGINE, NOT SHARED_FULL: attention is HEAD-SHARDED (see
+        # _emit_prefix_attention), and the core WRITES this buffer (V^T, the
+        # score/P plane, scaled Q). One shared scratch would have every engine
+        # stomping every other engine's score plane mid-flight -- the classic
+        # finite-but-scrambled failure, not a hang. One buffer per engine, indexed
+        # by engine_idx. At ne == 1 this is a single allocation, i.e. the exact
+        # historical tensor-DRAM layout (which the action-expert buffers sit on
+        # top of, so any extra allocation here shifts them -- see PREFIX_SNAPSHOTS).
+        #
+        # ne is resolved HERE rather than at the sharding block below because the
+        # scratch count depends on it. _prefix_num_engines is pure but PRINTS on
+        # fallback, so it must be called exactly once.
+        ne = self._prefix_num_engines(S)
+        prefix_attn_scratch = [self.allocate_tensor_dram((2 * D * S + S * S) * bpe)
+                               for _ in range(ne)]
+
+        # ---- SHARDING ACROSS ENGINES ----------------------------------------
+        # --engines N shards TWO different axes of every layer:
+        #   ROWS  the row-independent bulk (both RMSNorms, all 10 matmuls, the 3
+        #         eltwise ops) over 64-row blocks of the S prefix tokens.
+        #   HEADS the 8 attention calls (see _emit_prefix_attention). Rows are the
+        #         wrong axis for attention -- a row block of Q needs ALL S rows of
+        #         K/V -- but heads are perfectly independent here, and because the
+        #         step-3 permute has already laid Q out as (heads, seq, head_dim),
+        #         a head slice is a CONTIGUOUS block, not the strided scatter that
+        #         made this look risky.
+        # RoPE, the two smart_bf16_permute_core calls and the KV cache staging
+        # stay SINGLE-ENGINE on the primary at full S.
+        #
+        # Four rendezvous per layer (72) + one before the halt:
         #   #1 after the Q/K/V projections -- RoPE reads ALL S rows of buffers
         #      that were written sharded (RAW).
+        #   #A after the primary's RoPE/permute/KV-staging -- every engine's
+        #      attention reads Q_PERM / K_ROPE / V_PROJ in full (RAW).
+        #   #B after the head-sharded attention -- the primary's attention permute
+        #      reads ALL NH heads of ATTN_OUT, written by every engine (RAW).
         #   #2 after the attention permute -- the sharded o-projection reads the
         #      primary-written ATTN_RESULT (RAW), and it is also the WAR fence
         #      that stops a worker re-entering layer i+1's Q/K/V projections
         #      while the primary still reads layer i's Q/K/V.
+        # #A and #B are the price of head-sharding: two extra rendezvous of ~35
+        # instructions each against ~1e5 per layer.
         # No barrier is needed at the layer boundary: layer i writes
         # LAYER_OUT + RH for its OWN rows and layer i+1 reads the same rows.
         # (The prefix does NOT alternate A/B buffers the way the encoder does --
         # LAYER_OUT is read-then-written in place across layers. That is safe
         # only because each engine owns disjoint rows AND rendezvous #2 already
         # fenced the primary's full-S readers.)
-        ne = self._prefix_num_engines(S)
         sched = self._prefix_make_scheduler(ne) if ne > 1 else None
         self._prefix_sched = sched
         if ne > 1:
@@ -1309,6 +1332,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             engines = sched.engines
             print(f"    [prefix] row-sharded over {ne} engine(s): "
                   f"{[c for _, c in splits]} of {S} rows (64-row blocks)")
+            print(f"    [prefix] attention head-sharded: "
+                  f"{[c for _, c in self._prefix_head_split(ne)]} of {NH} heads")
         else:
             splits, engines = [(0, S)], [self]
 
@@ -1345,6 +1370,54 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         return self.LAYER0_LAYER_OUT_DRAM
 
+    def _emit_prefix_attention(self, ue, engine_idx, ne, layer_idx, S, scratch):
+        """Emit THIS engine's share of one layer's MQA self-attention.
+
+        Bidirectional bias (no causal flag), one INLINE
+        unified_attention_core_dynamic call per head. Q for head h is the (S, D)
+        block at LAYER0_Q_PERM_DRAM + h*S*D*2 -- the step-3 permute already
+        separated the heads, so a head slice is a contiguous read and the output
+        slice is a contiguous write. K/V need no marshalling at all: MQA means the
+        SAME (S, D) buffer is passed for every head. BIAS is the full
+        (batch=S, aligned_seq_len=S) prefix_bias_dram, identical per head.
+        q_scale=None -> standard 1/sqrt(head_dim) SDPA scale.
+
+        WHY THIS SHARDS CLEANLY, when batch-sharding the same core does not:
+        the core's first step is bf16_transpose_core on V, sized by
+        aligned_seq_len rather than by batch. Splitting BATCH leaves every engine
+        redoing the whole V^T -- the reason the action expert's attention stayed
+        serial (see _ae_q_proj_sharded). Splitting HEADS does not change that
+        arithmetic at all: this loop already rebuilds V^T once per head, NH times
+        per layer, and after sharding it still runs exactly NH times, just spread
+        across engines. There is no duplicated work introduced, so the speedup is
+        the head count ratio less the two rendezvous.
+
+        ``scratch`` is THIS ENGINE's private buffer. The core writes V^T, the
+        S x S score/P plane and scaled Q into it, so sharing one across engines
+        would corrupt heads in flight -- finite garbage, not a hang.
+
+        Every engine covers ALL NH heads when ne == 1, so the emitted stream is
+        byte-identical to the historical single-engine build.
+        """
+        D, NH = self.HEAD_DIM, self.NUM_HEADS
+        bpe = 2
+        head_bytes = S * D * bpe
+        h0, nh = self._prefix_head_split(ne)[engine_idx]
+        for h in range(h0, h0 + nh):
+            ue.unified_attention_core_dynamic(
+                batch=S, aligned_seq_len=S, head_dim=D,
+                Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + h * head_bytes,
+                K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
+                V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM,
+                BIAS_DRAM_ADDR=self.prefix_bias_dram,
+                OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
+                SCRATCH_DRAM_ADDR=scratch,
+                IDENTITY_DRAM_ADDR=self.identity_addr)
+            self._debug_op(f"layer{layer_idx}_head{h}", self.LAYER0_ATTN_OUT_DRAM + h * head_bytes, S * D, shape=(S, D), ue=ue)
+            if layer_idx == 0 and self._prefix_snap:
+                self._dram_copy(head_bytes, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
+                                 self.PREFIX_L0_SNAPSHOT_DRAM[f"head{h}"])
+
     def _emit_prefix_body(self, ue, engine_idx, ne, row_offset, rows, S, prefix_attn_scratch):
         """Emit ONE engine's complete prefix program over rows
         [row_offset, row_offset+rows) of the S prefix tokens.
@@ -1355,19 +1428,26 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         ADDRESSING CONTRACT
           SHARED_FULL (no offset)  every IF4 weight/scale pair, ln1/ln2 gamma,
-                                   identity_addr, prefix_attn_scratch,
-                                   prefix_bias_dram, PREFIX_ROPE_ADDR, and the
-                                   LAYER0_K/V_DRAM cache slabs (primary-only).
+                                   identity_addr, prefix_bias_dram,
+                                   PREFIX_ROPE_ADDR, and the LAYER0_K/V_DRAM
+                                   cache slabs (primary-only).
           SHARED_ROWS              three distinct pitches -- this is where an
                                    offset bug would hide:
               RH = row_offset*H*2      INPUT, LAYER_OUT, PRE_NORM, Q, ATTN_RESULT,
                                        O_PROJ, ATTN_RESIDUAL, MLP_DOWN*
               RK = row_offset*KV*2     K_PROJ, V_PROJ            (KV = 256 -> 512B)
               RF = row_offset*FF_HALF*2  MLP_{GATE,UP,MULT}_{LO,HI} (-> 16KB)
-          PER_ENGINE               EMPTY. rms_norm_core_dram dispatches to the
-                                   dynamic core, which allocates NO DRAM scratch
-                                   (no analogue of the encoder's vis_zeros), and
-                                   eltwise is pure SRAM streaming.
+          PER_ENGINE               ``prefix_attn_scratch``, a LIST indexed by
+                                   engine_idx: the head-sharded attention core
+                                   WRITES its scratch, so one shared buffer would
+                                   let engines stomp each other's score planes.
+                                   Nothing else -- rms_norm_core_dram dispatches
+                                   to the dynamic core, which allocates NO DRAM
+                                   scratch (no analogue of the encoder's
+                                   vis_zeros), and eltwise is pure SRAM streaming.
+
+        HEADS, NOT ROWS, for attention: a row block of Q needs ALL S rows of K/V,
+        so the row split does not apply. See _emit_prefix_attention.
         """
         H, I, D = self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE, self.HEAD_DIM
         NH, KV = self.NUM_HEADS, self.NUM_KV_HEADS * self.HEAD_DIM
@@ -1446,8 +1526,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self._vis_barrier(ue, engine_idx, ne)
 
                 # ---- SINGLE-ENGINE REGION (primary, full S) ------------------
-                # RoPE, both permutes, the KV-cache staging and the 8 attention
-                # calls. Deliberately NOT sharded (see compile_prefix).
+                # RoPE, the Q permute and the KV-cache staging. Attention itself
+                # is head-sharded below (rendezvous #A/#B); the attn-output
+                # permute after it returns to the primary.
                 if is_primary:
                     # 2b. RoPE on Q and K (Gemma rotates BOTH, every layer -- openpi
                     # gemma.py:203/206). Positions come from cumsum(mask)-1, so the
@@ -1495,29 +1576,24 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr, ue=ue)
                     self._debug_op(f"layer{layer_idx}_kv_cache", k_cache_addr, S * KV, shape=(S, KV), ue=ue)
 
-                    # 5. MQA self-attention, bidirectional bias (no causal flag), per
-                    # head via INLINE unified_attention_core_dynamic. Q for head h is
-                    # the (S, D) block at LAYER0_Q_PERM_DRAM + h*S*D*2 (step-3 permute
-                    # already separated the heads). K/V need no marshalling -- MQA means
-                    # the same (S, D) buffer is passed for every head. BIAS is the full
-                    # (batch=S, aligned_seq_len=S) prefix_bias_dram, identical per head.
-                    # q_scale=None -> standard 1/sqrt(head_dim) SDPA scale.
-                    head_bytes = S * D * bpe
-                    for h in range(NH):
-                        ue.unified_attention_core_dynamic(
-                            batch=S, aligned_seq_len=S, head_dim=D,
-                            Q_DRAM_ADDR=self.LAYER0_Q_PERM_DRAM + h * head_bytes,
-                            K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
-                            V_DRAM_ADDR=self.LAYER0_V_PROJ_DRAM,
-                            BIAS_DRAM_ADDR=self.prefix_bias_dram,
-                            OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
-                            SCRATCH_DRAM_ADDR=prefix_attn_scratch,
-                            IDENTITY_DRAM_ADDR=self.identity_addr)
-                        self._debug_op(f"layer{layer_idx}_head{h}", self.LAYER0_ATTN_OUT_DRAM + h * head_bytes, S * D, shape=(S, D), ue=ue)
-                        if layer_idx == 0 and self._prefix_snap:
-                            self._dram_copy(head_bytes, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
-                                             self.PREFIX_L0_SNAPSHOT_DRAM[f"head{h}"])
+                # ---- RENDEZVOUS #A: the head-sharded attention below reads
+                # LAYER0_Q_PERM_DRAM / LAYER0_K_ROPE_DRAM in full, both written by
+                # the primary just above (RAW). LAYER0_V_PROJ_DRAM was written
+                # sharded and already fenced by #1, but the workers must wait here
+                # regardless -- without #A a worker would run layer i's attention
+                # against layer i-1's Q permute.
+                self._vis_barrier(ue, engine_idx, ne)
 
+                # 5. MQA self-attention  [HEAD-SHARDED]
+                self._emit_prefix_attention(ue, engine_idx, ne, layer_idx, S,
+                                            prefix_attn_scratch[engine_idx])
+
+                # ---- RENDEZVOUS #B: the attention permute below reads ALL NH
+                # heads of LAYER0_ATTN_OUT_DRAM, which every engine just wrote a
+                # disjoint slice of (RAW).
+                self._vis_barrier(ue, engine_idx, ne)
+
+                if is_primary:
                     # 6. permute attn output (heads, seq, head_dim) -> (seq, heads*head_dim)
                     smart_bf16_permute_core(ue, (NH, S, D), [1, 0, 2],
                                              self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
@@ -1819,12 +1895,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # letting _assert_worker_programs_fit fire mid-compile.
         # WORKER program sizes, which are NOT the primary's. Vision and prefix are
         # ROW-sharded: a worker runs the same op sequence over fewer rows, so its
-        # program tracks the primary's (5.48 / 9.64 MB measured). Denoise is
+        # program tracks the primary's (5.48 / 9.64 MB measured). The prefix
+        # estimate is raised above that 9.64 MB because head-sharded attention
+        # moved NH/ne inline unified_attention bodies per layer OFF the primary
+        # and ONTO every worker -- the primary shrinks by what the workers gain.
+        # This is an estimate; _assert_worker_programs_fit is the exact check. Denoise is
         # COLUMN/head-sharded: a worker only carries the sharded REGIONS (q proj,
         # o proj, gated MLP) -- not attention, adaRMS, or the eltwise residuals --
         # so it is a small fraction of the primary's 12.15 MB. Estimated, and
         # _assert_worker_programs_fit is the exact check at compile time.
-        est = {"VIS": 6 << 20, "PREFIX": 10 << 20, "DENOISE": 4 << 20}
+        est = {"VIS": 6 << 20, "PREFIX": 14 << 20, "DENOISE": 4 << 20}
         sharded = [s for s in ("VIS", "PREFIX", "DENOISE") if self._num_engines(s) > 1]
         need = self.VIS_WORKER_PROGRAM_OFFSET + sum(est[s] for s in sharded)
         assert per >= need, (
@@ -2169,6 +2249,40 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                   f"(blocks={S // 64}); FALLING BACK TO SINGLE-ENGINE PREFIX")
             return 1
         return ne
+
+    def _prefix_head_split(self, ne):
+        """[(head_offset, head_count)] per engine for the prefix's NH attention
+        heads. Deliberately routed through MultiEngineScheduler.split_heads so the
+        one head-splitting rule in the codebase is the one validated on hardware
+        by sharded_scheduler_head_attn_test.
+
+        ``gqa_ratio=NH`` is not a fudge -- it is the literal geometry. The prefix
+        is pure MQA (NUM_KV_HEADS == 1, asserted in compile_prefix), so all NH Q
+        heads share ONE KV head, i.e. exactly one KV group. ``mode="groups"``
+        would therefore refuse to shard at all (one group cannot be split N ways);
+        ``mode="qheads"`` splits within that group, which is what this case needs
+        and what the mode was added for.
+
+        The usual cost of ``qheads`` -- a duplicated V^T per straddled group --
+        is ZERO here, because the per-head loop below already rebuilds V^T on
+        every one of its NH calls today. Sharding changes who does those rebuilds,
+        not how many there are.
+
+        Uneven splits are fine (NH=8 over 3 engines -> 3/3/2): heads are
+        independent whole units with no 64-row alignment rule.
+        """
+        NH = self.NUM_HEADS
+        if ne <= 1:
+            return [(0, NH)]
+        assert ne <= NH, (
+            f"_prefix_head_split: {ne} engines for only {NH} attention head(s). "
+            f"Row sharding scales past NH but head sharding cannot; give the "
+            f"surplus engines a different axis or lower --engines.")
+        # split_heads is a pure function of (H, gqa_ratio, num_engines) -- no
+        # emission, no allocator touch -- so calling it on the stage scheduler
+        # here (and again inside the body) is free and side-effect-free.
+        return self._make_stage_scheduler(ne).split_heads(NH, gqa_ratio=NH,
+                                                          mode="qheads")
 
     def _prefix_make_scheduler(self, num_engines):
         """Scheduler for the row-sharded prefix. Shares the run's worker pool and
@@ -3185,27 +3299,42 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         per = NH // ne
         return [(e * per, per) for e in range(ne)]
 
-    # ATTENTION ITSELF STAYS SINGLE-ENGINE -- ONLY THE PROJECTIONS SHARD.
+    # ATTENTION IS HEAD-PARALLEL TOO, alongside the q/o projections.
     #
-    # The two helpers below deliberately bracket ``unified_attention_core_dynamic``
-    # rather than swallowing it. Sharding the attention op itself was tried and
-    # backed out, for two independent reasons:
+    # This REVERSES an earlier decision, and the reversal is the interesting part.
+    # The original argument for keeping attention serial was:
     #
-    #   1. It is not the parallel win it looks like. The core's FIRST step is
-    #      bf16_transpose_core(M=aligned_seq_len, N=head_dim) on V -- sized by Tkv,
-    #      NOT by ``batch``. Splitting the batch across engines therefore leaves
-    #      every engine transposing the WHOLE V redundantly. At Tkv=896/D=256 that
-    #      transpose is ~117 MFLOP against ~59 MFLOP of actual per-engine score+
-    #      context work at batch=64: two thirds of each engine's attention becomes
-    #      duplicated overhead, and the stage gets SLOWER, not faster.
-    #   2. The attention marshalling is exactly the strided-copy class that
-    #      multi_engine_shard's docstring calls out as needing per-index
-    #      destination row offsets -- "attention marshalling stays single-engine
-    #      in v1". Debugging that is its own project.
+    #   "The core's FIRST step is bf16_transpose_core(M=aligned_seq_len,
+    #    N=head_dim) on V -- sized by Tkv, NOT by batch. Splitting the batch
+    #    across engines leaves every engine transposing the WHOLE V redundantly.
+    #    At Tkv=896/D=256 that transpose is ~117 MFLOP against ~59 MFLOP of
+    #    per-engine score+context work at batch=64: two thirds of each engine's
+    #    attention becomes duplicated overhead, and the stage gets SLOWER."
     #
-    # So: q/o projections are head-parallel, attention is serial on the primary in
-    # between them. Coverage is ~80% instead of ~97%, which is the right trade for
-    # not owning a sharded-attention bug.
+    # The 117-vs-59 arithmetic is correct. The conclusion does not follow, because
+    # the eight V^T builds happen CONCURRENTLY, one per engine -- the duplicated
+    # work costs wall-clock ONCE, not eight times:
+    #
+    #     per engine (8-way):  V^T 117 + real  59 = 176 MFLOP
+    #     unsharded 1 call:    V^T 117 + real 470 = 587 MFLOP   -> 3.3x
+    #
+    # A high duplicated-overhead FRACTION per engine is not the same thing as
+    # being slower than serial. It caps the speedup at 3.3x instead of 8x; it does
+    # not invert the sign. And attention is 17.5% of this stage's FLOPs (M=64 is
+    # one row block, so the projections are small while Tkv=896 keeps attention
+    # full-size) -- the largest attention share of the three stages, and ~6x the
+    # prefix's 3.0%.
+    #
+    # The second objection -- "attention marshalling is the strided-copy class
+    # that needs per-index destination row offsets" -- simply does not apply here.
+    # There IS no marshalling: step 3 already writes head h's queries as a
+    # contiguous (S, D) block at h*S*D, and the core emits head h's output the
+    # same way (see step 5's comment). So consecutive heads are CONTIGUOUS ROW
+    # RANGES of one batch, and an engine owning heads [h0, h0+nh) covers them in
+    # ONE call at batch=nh*S -- pure address arithmetic, exactly like the prefix
+    # head shard. That is the vision encoder's problem, not this one.
+    #
+    # Coverage is now ~97% of the stage instead of ~80%.
 
     def _ae_q_proj_sharded(self, sched, M, la, gpr_M_regs):
         """HEAD-PARALLEL q projection + RoPE. Joins: the primary's attention reads
@@ -3246,6 +3375,68 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # join=True, and it is load-bearing: the very next op is the primary's
         # attention over the FULL NH*M batch, which reads rows every worker wrote.
         sched.col_sharded_region(NH * D, _body, join=True)
+
+    def _ae_attention_sharded(self, sched, S, Tkv, k_combined, v_combined):
+        """HEAD-PARALLEL rectangular attention -- the middle of the q/attn/o block.
+
+        The serial path issues ONE call at batch=AE_HEADS*S over the whole Q blob.
+        This issues one call PER ENGINE at batch=nh*S, because head h's S queries
+        live at h*S*D and head h's output comes back the same way, so the nh heads
+        an engine owns are one CONTIGUOUS row range [h0*S, (h0+nh)*S) of that same
+        batch. Engine i therefore shifts three addresses by h0*S rows and shrinks
+        batch -- no marshalling, no strided writeback, no gather.
+
+        THE FOUR PER-HEAD OFFSETS (row0 = h0 * S):
+            Q       AE_Q_ROPE_DRAM  + row0 * D * bpe
+            OUT     AE_ATTN_OUT_DRAM+ row0 * D * bpe
+            BIAS    AE_UATTN_BIAS   + row0 * Tkv * bpe     # (batch, Tkv), row-indexed
+            SCRATCH per-engine buffer, NOT an offset (see below)
+
+        The bias offset is the one that looks droppable and is not. Today every row
+        of AE_UATTN_BIAS_DRAM is the same key mask (`keymask.repeat(batch, 1)`), so
+        passing the unshifted base would happen to work -- and would silently break
+        the day the mask becomes per-query (causal suffix, per-head bias). Offset it
+        properly and the shard stays correct by construction rather than by luck.
+
+        SCRATCH MUST BE PER ENGINE. The core writes V^T, the score/P plane and
+        scaled Q into it; one shared buffer would have eight engines interleaving
+        writes into the same score plane. That is the finite-but-scrambled failure,
+        not a hang -- it would show up as a quietly wrong action, which is exactly
+        the class of bug worth spending 8 x ~2 MB of DRAM to make impossible.
+
+        K/V are read-only and shared: MQA (AE_KV_HEADS == 1) means every head reads
+        the same k_combined/v_combined, so there is nothing to slice and no
+        cross-engine write hazard on them.
+        """
+        D = self.HEAD_DIM
+        bpe = 2
+        ne = sched.num_engines
+        heads = self._ae_head_split(ne)
+
+        def _body(ctx):
+            i = ctx.engine_idx
+            h0, nh = heads[i]
+            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                f"head shard mismatch on engine {i}: scheduler gives "
+                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                f"{(h0 * D, nh * D)}")
+            row0 = h0 * S
+            ctx.unsafe_ue.unified_attention_core_dynamic(
+                batch=nh * S, aligned_seq_len=Tkv, head_dim=D,
+                Q_DRAM_ADDR=self.AE_Q_ROPE_DRAM + row0 * D * bpe,
+                K_DRAM_ADDR=k_combined,          # MQA: shared, read-only
+                V_DRAM_ADDR=v_combined,
+                BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM + row0 * Tkv * bpe,
+                OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM + row0 * D * bpe,
+                SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_SHARDED[i],
+                IDENTITY_DRAM_ADDR=self.identity_addr)
+
+        # join=True: _ae_o_proj_sharded's own opening rendezvous already fences
+        # AE_ATTN_OUT_DRAM, but the o-proj is only ONE of this buffer's readers --
+        # the DENOISE_STEP0_PROBE dump and the serial fallback read it too. Paying
+        # one rendezvous here keeps the buffer's contract "complete after this
+        # call" rather than "complete once the next region happens to fence it".
+        sched.col_sharded_region(self.AE_HEADS * D, _body, join=True)
 
     def _ae_o_proj_sharded(self, sched, M, la, gpr_M_regs, partial_name):
         """HEAD-PARALLEL o projection + cross-engine reduction.
@@ -3637,19 +3828,23 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self._dram_copy(2 * S * D * 2, self.AE_Q_DRAM, self.AE_P0_L0_Q)  # heads 0-1 stacked Q
             self._dram_copy(2 * S * D * 2, self.AE_Q_ROPE_DRAM, self.AE_P0_L0_QROPE)  # heads 0-1 ROPED Q
 
-        # 4. ONE rectangular attention: batch=AE_HEADS*S queries x Tkv keys, shared
+        # 4. Rectangular attention: batch=AE_HEADS*S queries x Tkv keys, shared
         #    MQA K/V read directly from ae_k/v_combined (no per-layer staging), one
         #    (batch, Tkv) bias. Replaces the AE_HEADS per-head square-flash calls +
         #    all their per-head Q/out DMA. Dynamic (PBI) variant keeps the 180
         #    statically-unrolled bodies compact. q_scale=None -> 1/sqrt(head_dim).
-        # ALWAYS on the primary, sharded or not: the V transpose inside this core is
-        # sized by Tkv, not by batch, so splitting the batch just duplicates it on
-        # every engine. Unchanged from the single-engine path.
-        self.unified_attention_core_dynamic(
-            batch=self.AE_UATTN_BATCH, aligned_seq_len=Tkv, head_dim=D,
-            Q_DRAM_ADDR=self.AE_Q_ROPE_DRAM, K_DRAM_ADDR=k_combined, V_DRAM_ADDR=v_combined,
-            BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM, OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_DRAM, IDENTITY_DRAM_ADDR=self.identity_addr)
+        #    HEAD-SHARDED when the engine count divides AE_HEADS: consecutive heads
+        #    are consecutive row ranges of this one batch, so each engine runs the
+        #    same call over its own slice (see _ae_attention_sharded). Otherwise the
+        #    single full-batch call below, byte-identical to the serial path.
+        if _proj_sharded:
+            self._ae_attention_sharded(sched, S, Tkv, k_combined, v_combined)
+        else:
+            self.unified_attention_core_dynamic(
+                batch=self.AE_UATTN_BATCH, aligned_seq_len=Tkv, head_dim=D,
+                Q_DRAM_ADDR=self.AE_Q_ROPE_DRAM, K_DRAM_ADDR=k_combined, V_DRAM_ADDR=v_combined,
+                BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM, OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM,
+                SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_DRAM, IDENTITY_DRAM_ADDR=self.identity_addr)
         self._debug_op(f"{_pfx}_flash_attn_out", self.AE_ATTN_OUT_DRAM, S * D, shape=(S, D))
         if getattr(self, "DENOISE_STEP0_PROBE", False) and step == 0 and layer_idx == 0:
             self._dram_copy(self.AE_HEADS * S * D * 2, self.AE_ATTN_OUT_DRAM, self.AE_P0_L0_ATTNRAW)  # all heads raw attn
@@ -3802,12 +3997,24 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # AE_O_PROJ_DRAM, leaving step 6 (the gated residual) untouched.
                 sched.register_per_engine("ae_o_proj_partial", self.AE_O_PROJ_DRAM, S * H * 2,
                                           init_tensor=torch.zeros(S * H, dtype=torch.bfloat16))
-                # NOTE: no per-engine attention scratch. The attention op itself is
-                # NOT sharded -- only the q/o PROJECTIONS are -- so it keeps using
-                # the primary's full-batch AE_UATTN_SCRATCH_DRAM exactly as before.
-                print(f"    [denoise] head-parallel projections: {self.AE_HEADS} heads over "
-                      f"{ne} engine(s), {self.AE_HEADS // ne} head(s) each "
-                      f"(q proj + o proj; attention stays on the primary)")
+                # PER-ENGINE ATTENTION SCRATCH. unified_attention_core_dynamic WRITES
+                # its scratch (V^T, the score/P plane, scaled Q), so the head-sharded
+                # calls cannot share one -- see _ae_attention_sharded. Sized by the
+                # SHARDED batch (nh*S), not AE_UATTN_BATCH, using the same formula as
+                # the serial buffer; the Tkv*Tkv score term dominates and is
+                # unchanged, so this is ~2 MB per engine rather than a full copy.
+                # Plain allocate_tensor_dram (not register_per_engine): these are
+                # pure scratch that no engine reads across a barrier and that never
+                # needs a primary-address alias or an init tensor.
+                _nh = self.AE_HEADS // ne
+                _D, _Tkv = self.HEAD_DIM, self.AE_TKV
+                _ushard = _D * _Tkv + _Tkv * _Tkv + _nh * S * _D
+                self.AE_UATTN_SCRATCH_SHARDED = [
+                    self.allocate_tensor_dram(_ushard * 2) for _ in range(ne)]
+                print(f"    [denoise] head-parallel attention block: {self.AE_HEADS} heads "
+                      f"over {ne} engine(s), {_nh} head(s) each "
+                      f"(q proj + ATTENTION + o proj), "
+                      f"{_ushard * 2 * ne / (1 << 20):.1f} MB of per-engine attn scratch")
             else:
                 print(f"    [denoise] engines={ne} does not divide AE_HEADS="
                       f"{self.AE_HEADS}; attention stays SERIAL, only the gated MLP is "
