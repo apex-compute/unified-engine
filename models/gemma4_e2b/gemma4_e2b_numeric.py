@@ -25,7 +25,6 @@ Usage:
   python models/gemma4_e2b/gemma4_e2b_numeric.py --image people.jpg
   python models/gemma4_e2b/gemma4_e2b_numeric.py --dev xdma0 --cycle 5.042
 """
-import argparse
 import os
 import sys
 
@@ -38,10 +37,8 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from transformers import AutoProcessor
-from user_dma_core import calculate_snr, set_dma_device
+from user_dma_core import calculate_snr
 import gemma4_e2b_test as g4r
-import gemma4_e2b_lm as g4_lm_module
-import gemma4_e2b_vision as g4_vision_module
 import quant_lib
 
 
@@ -108,7 +105,30 @@ def _output_tensor(output):
     return output
 
 
-def build_vision_references(ue, image_path, prompt):
+def _pool_vision_hidden(hidden, position_ids, padding, pool_k):
+    """Reproduce the HF spatial average pool and return unscaled soft tokens."""
+    if hidden.dim() == 2:
+        hidden = hidden.unsqueeze(0)
+    if position_ids.dim() == 2:
+        position_ids = position_ids.unsqueeze(0)
+    if padding.dim() == 1:
+        padding = padding.unsqueeze(0)
+    h = hidden.float().clone()
+    h.masked_fill_(padding.unsqueeze(-1), 0.0)
+    output_length = h.shape[1] // (pool_k * pool_k)
+    clamped = position_ids.clamp(min=0)
+    max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
+    kernel_idxs = torch.div(clamped, pool_k, rounding_mode="floor")
+    kernel_idxs = (kernel_idxs[..., 0]
+                   + (max_x // pool_k) * kernel_idxs[..., 1])
+    weights = torch.nn.functional.one_hot(
+        kernel_idxs.long(), output_length).float() / (pool_k * pool_k)
+    pooled = weights.transpose(1, 2) @ h
+    pooler_mask = torch.logical_not((weights == 0).all(dim=1))
+    return pooled[pooler_mask]
+
+
+def build_vision_references(ue, image_path, prompt, fpga_encoder_out=None):
     """Build only B/C references; no patch-embed or layer-0 checkpoints."""
     hf_model, model_dir = g4r._ensure_hf_model(ue.script_dir, ue._cfg)
     hf_model.eval()
@@ -124,6 +144,7 @@ def build_vision_references(ue, image_path, prompt):
     position_ids = inputs["image_position_ids"]
     padding = (position_ids == -1).all(dim=-1).squeeze(0)
     vision_tower = hf_model.model.vision_tower
+    embed_vision = hf_model.model.embed_vision
 
     def _capture():
         checkpoint = {}
@@ -139,15 +160,34 @@ def build_vision_references(ue, image_path, prompt):
             hook.remove()
         checkpoint["C"] = getattr(
             output, "pooler_output", output).detach().float().cpu()
+        checkpoint["P"] = _pool_vision_hidden(
+            checkpoint["B"], position_ids, padding, ue.VIS_POOL_K).cpu()
+        checkpoint["N"] = embed_vision.embedding_pre_projection_norm(
+            checkpoint["P"].to(torch.bfloat16)).detach().float().cpu()
         return checkpoint
 
     print("  [numeric] vision reference 1/2: full-precision HF")
     hf_ref = _capture()
     count = quantize_vision_tower_(
         vision_tower, g4r.VISION_QUANT_PRECISION)
-    print(f"  [numeric] vision reference 2/2: {count} IF4 Linear weights")
+    count += quantize_vision_tower_(
+        embed_vision, g4r.VISION_QUANT_PRECISION)
+    print(f"  [numeric] vision reference 2/2: {count} IF4 Linear weights "
+          "(including embed_vision projection)")
     host_ref = _capture()
-    return {"hf": hf_ref, "hostref": host_ref}, {"padding": padding}
+    refs = {"hf": hf_ref, "hostref": host_ref}
+    if fpga_encoder_out is not None:
+        pool = _pool_vision_hidden(
+            fpga_encoder_out, position_ids, padding, ue.VIS_POOL_K)
+        norm = embed_vision.embedding_pre_projection_norm(
+            pool.to(torch.bfloat16))
+        projected = embed_vision.embedding_projection(norm)
+        refs["fpga_input_oracle"] = {
+            "P": pool.detach().float().cpu(),
+            "N": norm.detach().float().cpu(),
+            "C": projected.detach().float().cpu(),
+        }
+    return refs, {"padding": padding}
 
 
 def build_hf_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
@@ -408,28 +448,13 @@ def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Gemma4 E2B numeric check: LM prefill/decode, optionally vision.")
-    p.add_argument("--image", type=str, nargs="?", const=g4r.DEFAULT_IMAGE, default=None,
-                   help="Enable VLM checks. Bare --image uses the default image; an optional "
-                        "path or filename selects another image.")
-    p.add_argument("--prompt", type=str, default=None,
-                   help="Text prompt. Without --image, default is the built-in LM test question.")
-    p.add_argument("--dev", type=str, default="xdma0")
-    p.add_argument("--cycle", type=float, default=1000 / 198.3256)
+    # Take the full gemma4_e2b CLI verbatim from test.py — numeric is just a
+    # numeric check over the same engine, so it never defines its own flags.
+    p = g4r.build_arg_parser()
     args = p.parse_args()
 
-    set_dma_device(args.dev)
-    # The split mixin modules import DMA_DEVICE_* by value, so keep all three
-    # module namespaces synchronized with set_dma_device().
-    for module in (g4r, g4_lm_module, g4_vision_module):
-        module.DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-        module.DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-        module.DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
-    print(f"Using DMA device: {args.dev}  (cycle {args.cycle:.4f} ns)")
-
-    ue = g4r.Gemma4_UnifiedEngine()
+    engine_kwargs = g4r.resolve_engine_config(p, args)
+    ue = g4r.Gemma4_UnifiedEngine(**engine_kwargs)
 
     if args.image:
         # Resolve a bare filename against test_samples/, like test.py.
@@ -451,9 +476,12 @@ def main():
 
         print("\n[numeric] building vision references ...")
         vision_prompt = args.prompt or "Describe this image in detail."
-        refs, meta = build_vision_references(ue, image_path, vision_prompt)
+        refs, meta = build_vision_references(
+            ue, image_path, vision_prompt, ckpt["encoder_out"])
         real = ~meta["padding"]
         stages = [("B encoder_out", "B", "encoder_out", real),
+                  ("P pool_out", "P", "pool_out", None),
+                  ("N embed_normed", "N", "embed_normed", None),
                   ("C image_features", "C", "image_features", None)]
 
         print("\n[numeric] ===== FPGA (refactor) vs references — SNR dB (real patches) =====")
@@ -463,6 +491,10 @@ def main():
         print("  FPGA vs HF (full-precision ground truth; gap = IF4 quant loss):")
         for name, rkey, ckey, mask in stages:
             report(name, refs["hf"][rkey], ckpt[ckey], row_mask=mask)
+        print("  FPGA vs HOSTREF fed the exact FPGA encoder output "
+              "(isolates pool/norm/projection):")
+        for name, rkey, ckey, _mask in stages[1:]:
+            report(name, refs["fpga_input_oracle"][rkey], ckpt[ckey])
     elif args.prompt:
         print(f"[numeric] LM-only mode, prompt: {args.prompt!r}")
         ue.set_prefill_seq(args.prompt)
@@ -531,6 +563,16 @@ def main():
     print("\n[numeric] ===== LM PREFILL (exact FPGA inputs) =====")
     print("  FPGA vs HOSTREF (operation-level params.bin oracle):")
     report("prefill hidden", mimic_prefill_hidden, hw_prefill_hidden)
+    if args.multi_core == 2:
+        ref_rows, hw_rows = _align(mimic_prefill_hidden, hw_prefill_hidden)
+        split = ue._ensure_prefill_scheduler().split_rows(prefill_len)
+        for engine_idx, (row_start, row_count) in enumerate(split):
+            report(f"  engine{engine_idx} rows", ref_rows[row_start:row_start + row_count],
+                   hw_rows[row_start:row_start + row_count])
+        row_rel = (torch.linalg.vector_norm(hw_rows - ref_rows, dim=1) /
+                   torch.linalg.vector_norm(ref_rows, dim=1).clamp_min(1e-12))
+        print("  [numeric] per-row rel_L2: " +
+              ", ".join(f"{value:.4f}" for value in row_rel.tolist()))
     print("  FPGA vs HF (full-precision projections):")
     report("prefill hidden", hf_prefill["hidden"], hw_prefill_hidden)
 

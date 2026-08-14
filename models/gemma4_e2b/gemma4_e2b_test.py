@@ -50,6 +50,7 @@ from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
+from multi_engine_shard import MultiEngineScheduler
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -697,32 +698,77 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
+    def _ensure_stage_scheduler(self, stage: str, worker_dram_base: int):
+        """Return the shared two-engine scheduler configuration for one stage."""
+        if self.multi_core == 1:
+            return None
+        scheduler = self._multi_core_schedulers.get(stage)
+        if scheduler is None:
+            # Gemma4's legacy two-core layout keeps its worker at the supplied
+            # stage address.  Alveo's 8-core layout needs seven compact worker
+            # ISA slots; reserve them below the model ISA arena, above the
+            # measured tensor high-water mark. Vision and prefill are
+            # sequential, so both stages may reuse this worker-ISA arena.
+            worker_stride = 0x10000000
+            if self.multi_core > 2:
+                worker_dram_base = 0xFC000000
+                worker_stride = 0x00240000  # 2.25 MiB per worker
+            scheduler = MultiEngineScheduler(
+                self, num_engines=self.multi_core,
+                engine_base_stride=0x00010000,
+                worker_dram_base=worker_dram_base,
+                worker_dram_stride=worker_stride,
+                worker_tensor_offset=0,
+                worker_program_offset=0,
+                barrier_margin_nops=32,
+                allow_unaligned_rows=True,
+                allow_more_than_two_engines=self.multi_core > 2)
+            self._multi_core_schedulers[stage] = scheduler
+        return scheduler
+
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
-                 decode_kernel: str = "streaming"):
+                 decode_kernel: str = "streaming", multi_core: int = 1):
         for stage, kernel in (("vision", vision_kernel), ("prefill", prefill_kernel),
                               ("decode", decode_kernel)):
             if kernel not in ("streaming", "matmatmul"):
                 raise ValueError(f"unsupported {stage} kernel: {kernel}")
+        if vision_kernel == "streaming":
+            raise NotImplementedError(
+                "--vision-kernel streaming is not supported: the vision patch-embed "
+                "projection passes clamp_min/clamp_max, but quantized_matmat_core "
+                "(the streaming path) lacks clamp support. Use --vision-kernel "
+                "matmatmul (the default) until clamp is added to quantized_matmat_core.")
         if os.environ.get("GEMMA4_PENALTY", "0") == "1":
             raise RuntimeError(
                 "GEMMA4_PENALTY=1 is temporarily unsupported: the dynamic streaming "
                 "quantized_matmat_core must gain broadcast-bias support before the "
                 "on-FPGA penalty can be re-enabled.")
+        if not 1 <= multi_core <= 8:
+            raise ValueError(f"multi_core must be between 1 and 8, got {multi_core}")
+        if multi_core > 1 and vision_kernel != "matmatmul":
+            raise ValueError("multi-engine vision projection sharding requires --vision-kernel matmatmul")
+        if multi_core > 1:
+            prefill_kernel = "matmatmul"
         self.vision_kernel = vision_kernel
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
+        self.multi_core = multi_core
+        self._multi_core_schedulers = {}
+        self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
         # Gemma4 fixed DRAM layout within the upper 2 GB window, matching the
         # addressable range used by the Llama-3.2-1B path.
         #   LM weights       : 0x80000000 – 0xE1000000  (1552 MiB)
         #   LM/vision tensor : 0xE1000000 – 0xFF000000  (480 MiB, reused by stage)
-        #   Vision ISA       : 0xFF000000 – 0xFF600000  (6 MiB)
-        #   LM ISA           : 0xFF600000 – 0x100000000 (10 MiB)
+        #   Vision ISA/core0 : 0xFF000000 – 0xFF400000  (4 MiB, two-core mode)
+        #   Vision ISA/core1 : 0xFF400000 – 0xFF620000  (2.125 MiB, incl. head-sharded attention)
+        #   LM ISA           : 0xFF620000 – 0x100000000 (9.875 MiB)
         # Vision and LM programs remain resident at disjoint addresses.
         self.DRAM_END = 0x100000000
         self.VISION_ISA_BASE = 0xFF000000
-        self.LM_ISA_BASE = 0xFF600000
+        self.VISION_WORKER_ISA_BASE = 0xFF400000
+        self.LM_ISA_BASE = 0xFF620000
         _params_base  = 0x80000000
         _tensor_base  = 0xE1000000
         _program_base = self.LM_ISA_BASE
@@ -985,11 +1031,25 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         prefill_template_seq_len = int(self._cfg["model"].get(
             "prefill_max_seq_len", self.max_prefill_seq_len))
         prefill_flops_seq_len = len(self.prefill_seq) - 1
+        if self.multi_core > 1 and prefill_flops_seq_len < self.multi_core:
+            raise ValueError(
+                f"{self.multi_core}-engine fixed prefill requires at least "
+                f"{self.multi_core} prefill rows")
+        prefill_scheduler = self._ensure_prefill_scheduler()
         _lm_meta, _ = self._get_program_section("lm", profile)
+        _prefill_worker_metas = [
+            self._get_program_section(f"prefill_worker{i}", profile)[0]
+            for i in range(1, self.multi_core)
+        ]
         if (_lm_meta is not None
                 and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len
                 and _lm_meta.get("prefill_kernel") == self.prefill_kernel
-                and _lm_meta.get("decode_kernel") == self.decode_kernel):
+                and _lm_meta.get("decode_kernel") == self.decode_kernel
+                and _lm_meta.get("multi_core", 1) == self.multi_core
+                and all(meta is not None
+                        and meta.get("prefill_seq_len") == prefill_flops_seq_len
+                        and meta.get("prefill_kernel") == self.prefill_kernel
+                        for meta in _prefill_worker_metas)):
             bin_path, _ = self._program_image_paths(profile)
             print(f"[compile] reusing existing instruction image at {bin_path}")
             print(f"  delete {bin_path} (or make clean) to force recompile.")
@@ -1010,11 +1070,25 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             instruction_base_addr = self.get_program_dram_addr()
 
             prefill_count_at_start = self.capture_count          # 1 (after flag-clear)
+            if prefill_scheduler is not None:
+                prefill_scheduler.begin_program()
+                self._prefill_shard_m_regs = [self.alloc_isa_reg()]
+                self._prefill_shard_m_regs.extend(
+                    worker.alloc_isa_reg() for worker in prefill_scheduler.workers)
+                self._active_prefill_scheduler = prefill_scheduler
             _, prefill_total_flops = self.compile_prefill(seq_len=prefill_flops_seq_len,
                                                           layer_size=layer_size,
                                                           profile=profile)
             prefill_program_addr = instruction_base_addr + prefill_count_at_start * INSTRUCTION_SIZE_BYTES
             prefill_size_bytes = (self.capture_count - prefill_count_at_start) * INSTRUCTION_SIZE_BYTES
+            prefill_worker_addrs = (prefill_scheduler.finalize()
+                                    if prefill_scheduler is not None else [])
+            self._active_prefill_scheduler = None
+            if prefill_scheduler is not None:
+                for worker in reversed(prefill_scheduler.workers):
+                    worker.release_isa_reg()
+                self.release_isa_reg()
+                self._prefill_shard_m_regs = None
 
             decoder_count_at_start = self.capture_count
             _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
@@ -1046,6 +1120,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "decoder_total_flops": decoder_total_flops[0],
             "layer_size": layer_size,
             "prefill_kernel": self.prefill_kernel,
+            "multi_core": self.multi_core,
             "decode_kernel": self.decode_kernel,
         }
         if profile:
@@ -1053,6 +1128,24 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             lm_meta["decoder_profile_checkpoints"] = self._decoder_checkpoints
         # Merge the LM section into the combined programs bin (vision stays intact).
         self._store_program_section("lm", instruction_base_addr, image_bytes, lm_meta, profile=profile)
+        if prefill_scheduler is not None:
+            for engine_idx, (worker, worker_addr) in enumerate(
+                    zip(prefill_scheduler.workers, prefill_worker_addrs), start=1):
+                worker_bytes = bytearray()
+                for inst in worker.capture_buffer:
+                    worker_bytes.extend(inst.get_bytes())
+                worker_limit = (worker_addr + 0x00240000
+                                if self.multi_core > 2 else self.LM_ISA_BASE)
+                if worker_addr + len(worker_bytes) > worker_limit:
+                    raise RuntimeError(
+                        f"prefill core{engine_idx} ISA overflow: "
+                        f"0x{worker_addr + len(worker_bytes):X} > 0x{worker_limit:X}")
+                self._store_program_section(
+                    f"prefill_worker{engine_idx}", worker_addr, worker_bytes,
+                    {"parent": "lm", "engine_idx": engine_idx,
+                     "multi_core": self.multi_core,
+                     "prefill_seq_len": prefill_flops_seq_len,
+                     "prefill_kernel": self.prefill_kernel}, profile=profile)
 
         print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
@@ -1103,7 +1196,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 flop_rate_hw_decoder, latency_prefill, latency_decoder)
 
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
-                         checkpoints: list, tail_name: str, timeout: float = 120.0) -> list:
+                         checkpoints: list, tail_name: str, timeout: float = 120.0,
+                         worker_scheduler=None, worker_addrs=None) -> list:
         """Run a checkpointed program segment-by-segment, returning [(name, ms)]
         HW latency per segment. A preamble at self._preamble_addr primes each
         (reg, value) in ``gpr_sets`` then jumps into ``target_addr``; each
@@ -1112,7 +1206,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         segment covers everything after the last checkpoint up to the program's
         terminal HALT. Because the resume addresses are the instruction right
         after each HALT, the segments tile the whole program with no gaps, so the
-        summed latencies cover all FPGA execution (see run_gemma4_profile)."""
+        summed latencies cover all FPGA execution (see run_gemma4_profile).
+
+        Two-engine (``worker_scheduler``/``worker_addrs``): the worker runs its
+        own continuous shard stream once. Master checkpoints sit at the sharded-
+        region boundaries, so a master HALT lands while the worker is parked at the
+        next region's entry flag — the master's per-segment counter then measures
+        each region's fork-to-join wall-time and the master-only phases directly."""
         self.clear_inst_id()
         self.start_capture()
         for reg, val in gpr_sets:
@@ -1123,6 +1223,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.clear_capture_buffer()
 
         results = []
+        if worker_scheduler is not None:
+            worker_scheduler.preclear_flags()
+            worker_scheduler.start_workers(worker_addrs or [])
         self.start_execute_from_dram(self._preamble_addr)
         for name, resume_hex in checkpoints:
             self.wait_queue(timeout)
@@ -1130,6 +1233,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.start_execute_from_dram(int(resume_hex, 16))
         self.wait_queue(timeout)   # tail segment: everything up to the terminal HALT
         results.append((tail_name, self.report_latency_in_us() / 1e3))
+        for worker in (worker_scheduler.workers if worker_scheduler is not None else []):
+            worker.wait_queue(timeout)
         return results
 
     def _decode_profile_execute(self, decoder_addr: int, aligned_seq_len: int,
@@ -1246,7 +1351,115 @@ def _clock_ns_default_for_device(device: str) -> float:
     return 10.0
 
 
-def main():
+# --- Shared engine CLI/config -------------------------------------------------
+# add_engine_args + resolve_engine_config are the SINGLE source of truth for the
+# kernel/device knobs, their validation, and the device->AXI->clock wiring.
+# gemma4_e2b_numeric.py imports this module and calls both, so anything changed
+# here is reflected there automatically (no second arg-parser to keep in sync).
+def add_engine_args(parser) -> None:
+    """Register the kernel + device knobs shared by every gemma4_e2b entrypoint."""
+    parser.add_argument("--vision-kernel", choices=("streaming", "matmatmul"),
+                        default="matmatmul",
+                        help="Quantized projection kernel for FPGA vision (default: matmatmul).")
+    parser.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
+                        default="streaming",
+                        help="Quantized projection kernel for LM prefill (default: streaming).")
+    parser.add_argument("--decode-kernel", choices=("streaming", "matmatmul"),
+                        default="streaming",
+                        help="Quantized projection kernel for LM decode, including LM head "
+                             "(default: streaming).")
+    parser.add_argument("--multi-core", nargs="?", const=2, default=1, type=int,
+                        help="Enable multi-engine vision and LM prefill. Bare --multi-core "
+                             "selects 2 engines; --multi-core 8 selects 8 (Alveo only). "
+                             "Multicore prefill always uses matmatmul.")
+    parser.add_argument("--dev", type=str, default="xdma0",
+                        help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
+    parser.add_argument("--device", type=str, default="kintex7",
+                        help="FPGA board profile (kintex7, rk, puzhi, bittware, "
+                             "bittware_256, alveo, efinix).")
+    parser.add_argument("--cycle", type=float, default=None,
+                        help="Clock cycle time in nanoseconds. Overrides --device default.")
+
+
+def resolve_engine_config(parser, args) -> dict:
+    """Validate the shared knobs, wire device->AXI->clock, sync DMA globals, and
+    return the kwargs dict for ``Gemma4_UnifiedEngine(...)``.
+
+    Entrypoint-only cross-checks (``--profile`` vs ``--multi-core``,
+    ``--vision-host`` requires ``--image``, etc.) stay in each ``main()``, before
+    this runs. Every loaded ``gemma4_e2b_*`` module binds ``DMA_DEVICE_*`` by
+    value at import, so all of them are refreshed after ``set_dma_device()``.
+    """
+    if args.multi_core not in range(1, 9):
+        parser.error("--multi-core must be between 1 and 8")
+    if args.multi_core > 2 and args.device != "alveo":
+        parser.error("--multi-core values above 2 are currently supported only on Alveo")
+    if args.multi_core > 1:
+        # Multicore prefill only has a matmatmul (two-pass) shard path.
+        args.prefill_kernel = "matmatmul"
+    if args.multi_core > 1 and args.vision_kernel != "matmatmul":
+        parser.error("--multi-core currently requires --vision-kernel matmatmul")
+
+    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    # Gemma4 vision has K <= 3072, so its two-pass kernel remains valid on
+    # 512-bit AXI. LM prefill and decode include wide MLP-down K=12288 and
+    # therefore cannot select matmatmul on that hardware profile.
+    if axi_width_bits == 512 and (
+            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
+        requested = []
+        if args.prefill_kernel == "matmatmul":
+            requested.append("--prefill-kernel matmatmul")
+        if args.decode_kernel == "matmatmul":
+            requested.append("--decode-kernel matmatmul")
+        parser.error(
+            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
+            "on the 512-bit AXI data path; use streaming.")
+    if os.environ.get("GEMMA4_PENALTY", "0") == "1":
+        parser.error(
+            "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
+            "quantized_matmat_core needs broadcast-bias support first")
+
+    dma_name = "efinix" if args.device == "efinix" else args.dev
+    set_dma_device(dma_name)
+    # Refresh DMA_DEVICE_* on every loaded gemma4_e2b_* module (they import the
+    # names by value). Covers test/lm/vision/audio without a hand-kept list.
+    for _name, _mod in list(sys.modules.items()):
+        if _name.startswith("gemma4_e2b_") and _mod is not None:
+            for _attr in ("DMA_DEVICE_H2C", "DMA_DEVICE_C2H", "DMA_DEVICE_USER"):
+                if hasattr(_mod, _attr):
+                    setattr(_mod, _attr, getattr(user_dma_core, _attr))
+
+    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
+    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+
+    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, "
+          f"UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"Using DMA device: {dma_name}")
+    print(f"  H2C: {user_dma_core.DMA_DEVICE_H2C}")
+    print(f"  C2H: {user_dma_core.DMA_DEVICE_C2H}")
+    print(f"  USER: {user_dma_core.DMA_DEVICE_USER}")
+    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
+    print(f"Kernels: vision={args.vision_kernel}, prefill={args.prefill_kernel}, "
+          f"engines={args.multi_core}, decode={args.decode_kernel}")
+
+    return dict(
+        vision_kernel=args.vision_kernel,
+        prefill_kernel=args.prefill_kernel,
+        decode_kernel=args.decode_kernel,
+        multi_core=args.multi_core,
+    )
+
+
+def build_arg_parser():
+    """The full gemma4_e2b CLI parser, shared as the SINGLE source of truth.
+
+    gemma4_e2b_numeric.py takes the exact same args by calling this — it just
+    runs a numeric SNR check instead of a decode, so any flag added here is
+    available there automatically.
+    """
     import argparse
     parser = argparse.ArgumentParser(
         description="Gemma4 E2B LM prefill + decode on the accelerator.",
@@ -1270,74 +1483,24 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument("--vision-host", action="store_true",
                         help="With --image, generate image soft-token embeddings on the host "
                              "with the HF vision tower; FPGA prefill/decode are unchanged.")
-    parser.add_argument("--vision-kernel", choices=("streaming", "matmatmul"),
-                        default="matmatmul",
-                        help="Quantized projection kernel for FPGA vision (default: matmatmul).")
-    parser.add_argument("--prefill-kernel", choices=("streaming", "matmatmul"),
-                        default="streaming",
-                        help="Quantized projection kernel for LM prefill (default: streaming).")
-    parser.add_argument("--decode-kernel", choices=("streaming", "matmatmul"),
-                        default="streaming",
-                        help="Quantized projection kernel for LM decode, including LM head "
-                             "(default: streaming).")
-    parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--device', type=str, default='kintex7',
-                        help='FPGA board profile (kintex7, rk, puzhi, bittware, '
-                             'bittware_256, alveo, efinix).')
-    parser.add_argument('--cycle', type=float, default=None,
-                        help='Clock cycle time in nanoseconds. Overrides --device default.')
+    add_engine_args(parser)   # --vision-kernel/--prefill-kernel/--decode-kernel/--multi-core/--dev/--device/--cycle
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
+    # Entrypoint-only cross-checks (reference test.py-specific flags); the shared
+    # kernel/device validation + wiring lives in resolve_engine_config().
     if args.vision_host and not args.image:
         parser.error("--vision-host requires --image")
     if args.image and args.audio:
         parser.error("--image and --audio are mutually exclusive")
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    # Gemma4 vision has K <= 3072, so its two-pass kernel remains valid on
-    # 512-bit AXI. LM prefill and decode include wide MLP-down K=12288 and
-    # therefore cannot select matmatmul on that hardware profile.
-    if axi_width_bits == 512 and (
-            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
-        requested = []
-        if args.prefill_kernel == "matmatmul":
-            requested.append("--prefill-kernel matmatmul")
-        if args.decode_kernel == "matmatmul":
-            requested.append("--decode-kernel matmatmul")
-        parser.error(
-            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
-            "on the 512-bit AXI data path; use streaming.")
-    if os.environ.get("GEMMA4_PENALTY", "0") == "1":
-        parser.error(
-            "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
-            "quantized_matmat_core needs broadcast-bias support first")
-
-    set_dma_device("efinix" if args.device == "efinix" else args.dev)
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, "
-          f"UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
-    print(f"Using DMA device: {'efinix' if args.device == 'efinix' else args.dev}")
-    print(f"  H2C: {DMA_DEVICE_H2C}")
-    print(f"  C2H: {DMA_DEVICE_C2H}")
-    print(f"  USER: {DMA_DEVICE_USER}")
-    print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
-
-    print(f"Kernels: vision={args.vision_kernel}, prefill={args.prefill_kernel}, "
-          f"decode={args.decode_kernel}")
-    ue = Gemma4_UnifiedEngine(
-        vision_kernel=args.vision_kernel,
-        prefill_kernel=args.prefill_kernel,
-        decode_kernel=args.decode_kernel)
+    engine_kwargs = resolve_engine_config(parser, args)
+    ue = Gemma4_UnifiedEngine(**engine_kwargs)
 
     # Prompt first — the prefill program is compiled for its exact length.
     # VLM mode (--image): run the vision encoder on the FPGA now (separate bin
