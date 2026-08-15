@@ -302,18 +302,19 @@ class Gemma4VisionMixin:
         bias[:, col_mask] = float("-inf")
         self._vis_pending_dmas.append((self.VIS_FLASH_BIAS, bias))
 
-        # Legacy RoPE tables (kept for address stability).
-        self.VIS_ROPE_COS = self.allocate_tensor_dram(S * HD * bpe)
-        self.VIS_ROPE_SIN = self.allocate_tensor_dram(S * HD * bpe)
-        # Three 32-wide (HD//2) RoPE tables for the FPGA 2D-RoPE split-64 path.
-        self.VIS_ROPE_COS_PAD_TILED     = self.allocate_tensor_dram(S * (HD // 2) * bpe)
-        self.VIS_ROPE_NEG_SIN_PAD_TILED = self.allocate_tensor_dram(S * (HD // 2) * bpe)
-        self.VIS_ROPE_SIN_HI_PAD_TILED  = self.allocate_tensor_dram(S * (HD // 2) * bpe)
+        # Matmul-RoPE buffers (rope_hf_matmul_core): rotate-half is a batched
+        # [M,HD]@[HD,HD] matmul against a static swap permutation; cos/sin are
+        # tiled to [M,HD] (M=S*NH) so the elementwise passes need no broadcast.
+        NHv = self.VIS_HEADS
+        self.VIS_ROPE_P_SWAP    = self.allocate_tensor_dram(HD * HD * bpe)
+        self.VIS_ROPE_COS_TILED = self.allocate_tensor_dram(S * NHv * HD * bpe)
+        self.VIS_ROPE_SIN_TILED = self.allocate_tensor_dram(S * NHv * HD * bpe)
+        self.VIS_ROPE_ROT       = self.allocate_tensor_dram(S * NHv * HD * bpe)
 
-        # Build the image-specific FPGA-ready 2D-RoPE tables now that their
-        # tensor addresses exist. One 32-wide row per patch is shared by all
-        # vision heads.
-        print("  [Vision] [host] computing 2D-RoPE pads...", flush=True)
+        # Build the image-specific FPGA-ready RoPE tables now that their tensor
+        # addresses exist. cos/sin come from the HF rotary_emb, permuted by
+        # VIS_ROPE_PERM (split-64 pairing) and tiled across the NH heads.
+        print("  [Vision] [host] computing matmul-RoPE tables...", flush=True)
         rope_t0 = time.perf_counter()
         with torch.no_grad():
             vision_tower = hf_model.model.vision_tower
@@ -328,11 +329,23 @@ class Gemma4VisionMixin:
         cos_p = cos_2d[:, first_half_idx].contiguous()
         neg_sin_p = (-sin_2d[:, first_half_idx]).contiguous()
         sin_hi_p = sin_2d[:, first_half_idx].contiguous()
-        self._vis_pending_dmas.append((self.VIS_ROPE_COS_PAD_TILED, cos_p))
-        self._vis_pending_dmas.append((self.VIS_ROPE_NEG_SIN_PAD_TILED, neg_sin_p))
-        self._vis_pending_dmas.append((self.VIS_ROPE_SIN_HI_PAD_TILED, sin_hi_p))
-        print(f"  [Vision] [host] 2D-RoPE pads computed in "
-              f"{time.perf_counter()-rope_t0:.2f}s (per-patch 32-wide)", flush=True)
+        # Standard split-half HF RoPE: out = X ⊙ cos + rotate_half(X) ⊙ sin,
+        # with sin's lower half pre-negated so the two eltwise passes are add-only.
+        # cos duplicated over both 32-wide halves; sin = [-sin_lo | +sin_hi].
+        cos64 = torch.cat([cos_p, cos_p], dim=-1).contiguous()          # [S, HD]
+        sin64 = torch.cat([neg_sin_p, sin_hi_p], dim=-1).contiguous()   # [S, HD]
+        # Static swap permutation P[n,(n+HD/2)%HD]=1 so X@P = rotate_half(X)=[x_hi,x_lo].
+        halfHD = HD // 2
+        p_swap = torch.zeros(HD, HD, dtype=torch.bfloat16)
+        for n in range(HD):
+            p_swap[n, (n + halfHD) % HD] = 1.0
+        cos_tiled = cos64.unsqueeze(1).expand(S, NHv, HD).reshape(S * NHv, HD).contiguous()
+        sin_tiled = sin64.unsqueeze(1).expand(S, NHv, HD).reshape(S * NHv, HD).contiguous()
+        self._vis_pending_dmas.append((self.VIS_ROPE_P_SWAP, p_swap))
+        self._vis_pending_dmas.append((self.VIS_ROPE_COS_TILED, cos_tiled))
+        self._vis_pending_dmas.append((self.VIS_ROPE_SIN_TILED, sin_tiled))
+        print(f"  [Vision] [host] matmul-RoPE tables computed in "
+              f"{time.perf_counter()-rope_t0:.2f}s", flush=True)
 
         # HD×HD identity for transpose/matmul helpers.
         self.VIS_IDENTITY = self.allocate_tensor_dram(HD * HD * bpe)
@@ -422,68 +435,19 @@ class Gemma4VisionMixin:
         return self.gpr_seq_len
 
     # ------------------------------------------------------------------
-    # Vision encoder ISA primitives (S2b/S3): 2-D RoPE, Q/K/V head-major
-    # transposes, PBI rms-norm, FPGA clamp. Ported from gemma4_e2b_test.py —
-    # these are validated standalone (see test.py's test_vision_* helpers).
+    # Vision encoder RoPE (S3): rotate-half as a batched matmul against a
+    # static swap permutation + tiled elementwise. HW-verified on alveo.
     # ------------------------------------------------------------------
-    def _emit_vision_rope_2d(self, src_dram: int, out_dram: int,
-                             cos_pad_dram: int, neg_sin_pad_dram: int,
-                             sin_hi_pad_dram: int, M: int) -> None:
-        """Apply vision 2D RoPE to M consecutive HD=64 rows via the split-64
-        permuted layout. cos/neg_sin/sin_hi hold ONE 32-wide row per PATCH,
-        shared by that patch's VIS_HEADS heads (patch-outer / head-inner loop).
-        Only the 32 valid cols are touched (SRAM [32:64] is never read)."""
-        rot_dim = 64
-        half_rot = rot_dim // 2
-        BF16 = 2
-        row_bytes = rot_dim * BF16
-        half_bytes = half_rot * BF16
-
-        SA_X_LO, SA_X_HI = 0x40000, 0x40080
-        SA_OUT_LO, SA_OUT_HI = 0x40100, 0x40180
-        SA_TMP_A = 0x40200
-        SB_COS, SB_NEG_SIN, SB_SIN_HI, SB_TMP_B = 0x80000, 0x80080, 0x80100, 0x80180
-
-        rope_reads = [(cos_pad_dram, SB_COS, half_rot),
-                      (neg_sin_pad_dram, SB_NEG_SIN, half_rot),
-                      (sin_hi_pad_dram, SB_SIN_HI, half_rot)]
-        src_reads = [(src_dram, SA_X_LO, half_rot),
-                     (src_dram + half_bytes, SA_X_HI, half_rot)]
-        writes = [(SA_OUT_LO, out_dram, half_rot),
-                  (SA_OUT_HI, out_dram + half_bytes, half_rot)]
-
-        t_reg = self.gpr_seq_len      # flat per-row Q/K address
-        off_reg = self.gpr_q_seq_len  # scratch for reg_mul_imm + add_imm address math
-        patch_reg = self.gpr_scratch  # per-patch rope address
-        S = M // self.VIS_HEADS
-        self.generate_instruction_add_set(t_reg, 0)
-        self.generate_instruction_add_set(patch_reg, 0)
-        self.loop_start(loop_cnt=S)                              # OUTER: patches
-        self.generate_instruction_reg_mul_imm(off_reg, patch_reg, ue_35bit_addr_shifter(half_bytes))
-        for base, sram, elems in rope_reads:
-            self.generate_instruction_add_imm(off_reg, ue_35bit_addr_shifter(base), self.TMP_REG)
-            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram,
-                                            element_size=elems, general_reg_src=self.TMP_REG)
-        self.loop_start(loop_cnt=self.VIS_HEADS)                 # INNER: heads
-        self.generate_instruction_reg_mul_imm(off_reg, t_reg, ue_35bit_addr_shifter(row_bytes))
-        for base, sram, elems in src_reads:
-            self.generate_instruction_add_imm(off_reg, ue_35bit_addr_shifter(base), self.TMP_REG)
-            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram,
-                                            element_size=elems, general_reg_src=self.TMP_REG)
-        self.eltwise_mul_core(SA_X_LO, SB_COS, SB_TMP_B, half_rot)
-        self.eltwise_mul_core(SA_X_HI, SB_NEG_SIN, SA_TMP_A, half_rot)
-        self.eltwise_add_core(SA_TMP_A, SB_TMP_B, SA_OUT_LO, half_rot)
-        self.eltwise_mul_core(SA_X_HI, SB_COS, SB_TMP_B, half_rot)
-        self.eltwise_mul_core(SA_X_LO, SB_SIN_HI, SA_TMP_A, half_rot)
-        self.eltwise_add_core(SA_TMP_A, SB_TMP_B, SA_OUT_HI, half_rot)
-        for sram, base, elems in writes:
-            self.generate_instruction_add_imm(off_reg, ue_35bit_addr_shifter(base), self.TMP_REG)
-            self.sram_to_accelerator_memory(sram_address=sram, accelerator_dram_address=0,
-                                            element_size=elems, general_reg_src=self.TMP_REG)
-        self.generate_instruction_add_inc(t_reg)
-        self.loop_end()                                          # end INNER
-        self.generate_instruction_add_inc(patch_reg)
-        self.loop_end()                                          # end OUTER
+    def rope_hf_matmul_core(self, src_dram: int, M: int, N: int) -> int:
+        """Vision-encoder RoPE (in place on ``src_dram``, head_dim N=64): thin adapter over the
+        library :meth:`UnifiedEngine.rope_hf_matmul_core`, wiring the model-owned swap matrix, rot
+        scratch, and host-tiled cos/sin. The library core does ``rot = X @ P_swap`` then
+        ``rot*=sin; out = X*cos; out += rot`` via three batched eltwise passes."""
+        return user_dma_core.UnifiedEngine.rope_hf_matmul_core(
+            self, M=M, N=N, input_dram_addr=src_dram, output_dram_addr=src_dram,
+            cos_dram_addr=self.VIS_ROPE_COS_TILED, sin_dram_addr=self.VIS_ROPE_SIN_TILED,
+            identity_swap_dram_addr=self.VIS_ROPE_P_SWAP, scratch_dram_addr=self.VIS_ROPE_ROT,
+            gpr_M_reg=self._prime_M(M))
 
     # ------------------------------------------------------------------
     # Vision encoder layers (S3): one SigLIP layer = pre_norm + Q/K/V proj +
@@ -500,7 +464,7 @@ class Gemma4VisionMixin:
         so it recaptures fresh.
 
         ``profile``: emit a HALT at each major per-layer boundary (proj /
-        rope_gather / attention / post_attn) and record the resume address, so
+        rope / permute / attention / post_attn) and record the resume address, so
         execute_vision_encoder_bin can time each phase's FPGA latency (like the
         LM per-phase profile). The checkpoints go in the meta; a profile-compiled
         bin can only be run segment-by-segment."""
@@ -620,14 +584,15 @@ class Gemma4VisionMixin:
             _checkpoint(f"L{li}_proj")
             self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_V_DRAM, GAMMA_DRAM_ADDR=self.VIS_V_NORM_ONES_GAMMA, gpr_M_reg=self._prime_M(S * NH))
             for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
-                self._emit_vision_rope_2d(src_dram=dram, out_dram=dram, cos_pad_dram=self.VIS_ROPE_COS_PAD_TILED, neg_sin_pad_dram=self.VIS_ROPE_NEG_SIN_PAD_TILED, sin_hi_pad_dram=self.VIS_ROPE_SIN_HI_PAD_TILED, M=S * NH)
+                self._vis_flops += self.rope_hf_matmul_core(src_dram=dram, M=S * NH, N=HD)
+            _checkpoint(f"L{li}_rope")
             for src, dst in ((self.VIS_Q_NORM, self.VIS_FLASH_Q_HM),
                              (self.VIS_K_NORM, self.VIS_FLASH_K_HM),
                              (self.VIS_V_DRAM, self.VIS_FLASH_V_HM)):
                 # interleaved [S, NH, HD] -> head-major [NH, aligned_S, HD]
                 self.bf16_permute_dram_core(NH, S, HD, src, dst,
                                             write_grouped=True, group_stride_rows=aligned_S)
-            _checkpoint(f"L{li}_rope_gather")
+            _checkpoint(f"L{li}_permute")
             # Per-head attention reads Q/K/V and writes OUT DIRECTLY at each head's
             # offset in the head-major buffers (no per-head staging copy — the core
             # takes arbitrary DRAM addresses).
@@ -964,7 +929,7 @@ class Gemma4VisionMixin:
         on exit so LM prefill/decode still work.
 
         ``profile``: run the encoder through per-phase HALT checkpoints and print
-        a major-step FPGA-latency breakdown (proj / rope_gather / attention /
+        a major-step FPGA-latency breakdown (proj / rope / permute / attention /
         post_attn, aggregated across layers), same style as the LM profile."""
         from PIL import Image
         from transformers import AutoProcessor

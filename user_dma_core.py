@@ -4201,12 +4201,6 @@ class UnifiedEngine:
 
         return 4 * M * N
 
-    def rope_hf_core_dram_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int,
-                              cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None,
-                              gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None) -> int:
-        # DEPRECATED REFERENCE ONLY: deliberately unreachable, even under ``python -O``.
-        raise RuntimeError("rope_hf_core_dram_pbi is deprecated; use rope_hf_core_dram_dynamic")
-
     def _rope_hf_core_dram_dynamic_small_n(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None,
                               gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None) -> int:
         """PBI-backed HF RoPE over M rows. Caller must have start_capture() before and stop_capture() after.
@@ -4711,136 +4705,6 @@ class UnifiedEngine:
 
         return 4 * M * N
 
-    def rope_hf_core_dram_d64_pbi(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None,
-                                  gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None) -> int:
-        # DEPRECATED REFERENCE ONLY: deliberately unreachable, even under ``python -O``.
-        raise RuntimeError("rope_hf_core_dram_d64_pbi is deprecated; use rope_hf_core_dram_dynamic")
-        """PBI HF RoPE for head_dim ``N < 128`` (padded-split). Caller brackets with
-        start_capture()/stop_capture().
-
-        For ``N < 128`` each rotate-half operand is N/2 elems = N bytes < 128, i.e. half a
-        URAM row, and SRAM cannot be addressed mid-row. We sidestep this by issuing
-        **PBI register-addressed DMAs** so each
-        N/2-elem slice lands at the start of its own 128-byte-aligned URAM row. Reads AND
-        writes are register-addressed, so **no PBI pointers** are used (clear of the
-        >=4-advancing-pointer failure mode).
-
-        Table layout is identical to the N>=128 path: contiguous ``[cos(N) || sin(N)]`` rows,
-        ``sin_dram_addr == cos_dram_addr + N*2``, sin first half pre-negated on the host. The
-        four slices cos_lo/cos_hi/sin_lo/sin_hi are read from byte offsets 0 / N / 2N / 3N of
-        each token's rope row.
-
-        **AXI beat alignment:** every slice DMA starts at a multiple of ``half_bytes`` (= N
-        bytes), and the DMA engine requires beat-aligned DRAM addresses (the read-side packer
-        has no sub-beat lane realignment), so ``N`` bytes must be a multiple of the AXI beat —
-        32 B at 256-bit, 64 B at 512-bit. Callers host-pad each rotate-half up to a beat
-        multiple when needed (see ``rope_hf_core_dram_d64_test``).
-
-        **Batch dimension / M (dynamic, required):** ``gpr_M_reg`` is a GPR index 1..15 holding
-        the runtime token count (caller primes via ``ADD_SET``). ``M`` is FLOPs-accounting /
-        loop-template only. Scratch GPRs (address calc + token counter) are allocated internally.
-
-        This is the *native* (no head_dim padding) sub-128 path, exercised compile-time-N by
-        ``rope_hf_core_dram_d64_test(..., dynamic=False)``. The dynamic sub-128 case is instead
-        served by padding head_dim up to 128 and running :meth:`rope_hf_core_dram_dynamic`
-        (``rope_hf_core_dram_d64_test(..., dynamic=True)``).
-        """
-        assert N % 2 == 0, "N must be even for RoPE half layout"
-        assert 0 < N < 128, "rope_hf_core_dram_d64_pbi is the N<128 path; use rope_hf_core_dram_pbi for N>=128"
-        if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
-            raise ValueError(f"rope_hf_core_dram_d64_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
-        assert sin_dram_addr == cos_dram_addr + N * 2, "d64 RoPE expects contiguous [cos, sin] rows"
-        self._validate_addr_gprs("rope_hf_core_dram_d64_pbi", gpr_M_reg, {
-            "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr, "gpr_cos_addr": gpr_cos_addr,
-        })
-
-        bpe = 2
-        half = N // 2
-        half_bytes = half * bpe            # offset of x_hi / sin_hi within their N-elem source
-        row_bytes = N * bpe                # x / output row stride
-        rope_row_bytes = 2 * row_bytes     # [cos(N) | sin(N)] per token
-
-        ue_assert_axi_beat_aligned_bytes(
-            half_bytes,
-            f"rope_hf_core_dram_d64_pbi: half_bytes (N={N})",
-            hint="slice DMAs must start on an AXI-beat boundary; host-pad each rotate-half "
-                 "up to a beat multiple as rope_hf_core_dram_d64_test does")
-
-        # eltwise requires its two operands in DIFFERENT URAM banks.
-        # URAM_A: x + cos-products + results; URAM_B: cos/sin slices + sin-products.
-        SLOT = 128
-        uram_x_lo      = 0x00000           # URAM_A
-        uram_x_hi      = 0x00080
-        uram_a_lo      = 0x00100
-        uram_a_hi      = 0x00180
-        uram_result_lo = 0x00200
-        uram_result_hi = 0x00280
-
-        uram_cos_lo    = 0x80000           # URAM_B
-        uram_cos_hi    = uram_cos_lo + SLOT
-        uram_sin_lo    = uram_cos_hi + SLOT
-        uram_sin_hi    = uram_sin_lo + SLOT
-        uram_b_lo      = uram_sin_hi + SLOT
-        uram_b_hi      = uram_b_lo   + SLOT
-
-        shift = ue_35bit_addr_shifter
-        tmp_reg = self.alloc_isa_reg()
-        t_reg   = self.alloc_isa_reg()
-
-        # Address = (gpr_base or lit_base) + offset_bytes + t*stride. When a base GPR is supplied
-        # the base comes from the register (word addr) so one captured program serves any placement;
-        # otherwise the literal base+offset is folded into a single add_imm (None-path byte-identical).
-        # sin is addressed as cos_base + row_bytes (the sin == cos + row invariant), so no separate
-        # sin GPR is needed.
-        def _emit_addr(lit_base, offset_bytes, gpr_base, stride):
-            self.generate_instruction_reg_mul_imm(tmp_reg, t_reg, shift(stride))
-            if gpr_base is not None:
-                self.generate_instruction_add_reg(tmp_reg, tmp_reg, gpr_base)
-                if offset_bytes:
-                    self.generate_instruction_add_imm(tmp_reg, shift(offset_bytes), tmp_reg)
-            else:
-                self.generate_instruction_add_imm(tmp_reg, shift(lit_base + offset_bytes), tmp_reg)
-
-        def _read(lit_base, offset_bytes, gpr_base, stride, sram_addr):
-            _emit_addr(lit_base, offset_bytes, gpr_base, stride)
-            self.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=sram_addr,
-                                            element_size=half, general_reg_src=tmp_reg)
-
-        def _write(lit_base, offset_bytes, gpr_base, stride, sram_addr):
-            _emit_addr(lit_base, offset_bytes, gpr_base, stride)
-            self.sram_to_accelerator_memory(sram_address=sram_addr, accelerator_dram_address=0,
-                                            element_size=half, general_reg_src=tmp_reg)
-
-        self.generate_instruction_add_set(t_reg, 0)
-        self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
-
-        # Reads — each N/2-elem slice into its own aligned row (DRAM byte offsets are free).
-        _read(input_dram_addr, 0,                       gpr_input_addr, row_bytes,      uram_x_lo)   # x_lo
-        _read(input_dram_addr, half_bytes,              gpr_input_addr, row_bytes,      uram_x_hi)   # x_hi
-        _read(cos_dram_addr,   0,                       gpr_cos_addr,   rope_row_bytes, uram_cos_lo) # cos[0:half]
-        _read(cos_dram_addr,   half_bytes,              gpr_cos_addr,   rope_row_bytes, uram_cos_hi) # cos[half:N]
-        _read(cos_dram_addr,   row_bytes,               gpr_cos_addr,   rope_row_bytes, uram_sin_lo) # sin[0:half] (pre-negated)
-        _read(cos_dram_addr,   row_bytes + half_bytes,  gpr_cos_addr,   rope_row_bytes, uram_sin_hi) # sin[half:N]
-
-        # Compute (operands span URAM_A/URAM_B; element_size=half from row starts).
-        self.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half)      # a_lo = x_lo * cos_lo
-        self.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half)      # a_hi = x_hi * cos_hi
-        self.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half)      # b_lo = x_hi * (-sin)
-        self.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half)      # b_hi = x_lo * sin
-        self.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half)
-        self.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half)
-
-        # Writes — two aligned halves back to the output row.
-        _write(output_dram_addr, 0,          gpr_out_addr, row_bytes, uram_result_lo)
-        _write(output_dram_addr, half_bytes, gpr_out_addr, row_bytes, uram_result_hi)
-
-        self.generate_instruction_add_inc(t_reg)
-        self.loop_end()
-
-        self.release_isa_reg()  # t_reg
-        self.release_isa_reg()  # tmp_reg
-        return 4 * M * N
-
     def rope_hf_core_dram_gqa(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None,
                               gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None,
                               gpr_N_reg: Optional[int] = None, gpr_group_reg: Optional[int] = None) -> int:
@@ -4900,138 +4764,6 @@ class UnifiedEngine:
                 self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
                 self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_x, element_size=N)
                 self.sram_to_accelerator_memory(sram_address=sram_x, accelerator_dram_address=output_dram_addr + q_row_idx * row_bytes, element_size=N)
-        return 4 * M * group_size * N
-
-    def rope_hf_core_dram_gqa_pbi(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None,
-                                  gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None) -> int:
-        # DEPRECATED REFERENCE ONLY: deliberately unreachable, even under ``python -O``.
-        raise RuntimeError("rope_hf_core_dram_gqa_pbi is deprecated; use rope_hf_core_dram_gqa_dynamic")
-        """PBI-backed grouped-query RoPE. Q rows are [M, group_size, N], RoPE rows are [M, N].
-
-        **Batch dimension / M (dynamic, required):**
-        ``gpr_M_reg`` is a **required** GPR index 1..15 holding the runtime outer-loop trip count.
-        Caller must prime that register beforehand (typically with ``ADD_SET``). The inner
-        ``group_size`` loop is still compile-time. ``M`` is FLOPs-accounting only — the captured
-        program has no static reference to it.
-
-        ``gpr_input_addr`` / ``gpr_out_addr`` / ``gpr_cos_addr`` optionally source the Q / output /
-        cos-table bases from GPRs (word addr); sin stays contiguous after cos. See
-        :meth:`rope_hf_core_dram_pbi`.
-        """
-        assert M >= 1, "M must be at least 1"
-        assert group_size >= 1, "group_size must be at least 1"
-        assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
-        assert N % 2 == 0, "N must be even for RoPE half layout"
-        assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
-        if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
-            raise ValueError(f"rope_hf_core_dram_gqa_pbi: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
-        self._validate_addr_gprs("rope_hf_core_dram_gqa_pbi", gpr_M_reg, {
-            "gpr_input_addr": gpr_input_addr, "gpr_out_addr": gpr_out_addr, "gpr_cos_addr": gpr_cos_addr,
-        })
-
-        half = N // 2
-        bytes_per_elem = 2
-        row_bytes = N * bytes_per_elem
-        rope_row_bytes = 2 * row_bytes
-        sram_x = 0x00000
-        sram_a = 0x20000
-        sram_d = 0x40000
-        sram_cos = 0x80000
-        sram_sin = 0x80000 + N * bytes_per_elem
-        sram_bc = 0x80000 + N * bytes_per_elem * 2
-
-        assert sin_dram_addr == cos_dram_addr + row_bytes, "PBI GQA RoPE expects contiguous [cos, sin] rows"
-        x_uram_type, x_uram_addr = self.sram_address_to_uram_address(sram_x)
-        rope_uram_type, rope_uram_addr = self.sram_address_to_uram_address(sram_cos)
-        d_uram_type, d_uram_addr = self.sram_address_to_uram_address(sram_d)
-
-        x_ptr = self.alloc_inst_ptr()
-        rope_ptr = self.alloc_inst_ptr()
-        out_ptr = self.alloc_inst_ptr()
-
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=input_dram_addr,
-            dma_length=row_bytes,
-            output_size=0,
-            uram_length=0,
-            uram_a_start_addr=0,
-            uram_b_start_addr=0,
-            uram_wb_addr=0,
-            uram_dst_addr=x_uram_addr,
-            fmax_context_addr=0,
-            inst_pointer_idx=x_ptr,
-        )
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=cos_dram_addr,
-            dma_length=rope_row_bytes,
-            output_size=0,
-            uram_length=0,
-            uram_a_start_addr=0,
-            uram_b_start_addr=0,
-            uram_wb_addr=0,
-            uram_dst_addr=rope_uram_addr,
-            fmax_context_addr=0,
-            inst_pointer_idx=rope_ptr,
-        )
-        self.generate_instruction_pbi_init(
-            dram_shared_addr=output_dram_addr,
-            dma_length=row_bytes,
-            output_size=0,
-            uram_length=0,
-            uram_a_start_addr=d_uram_addr,
-            uram_b_start_addr=d_uram_addr,
-            uram_wb_addr=0,
-            uram_dst_addr=0,
-            fmax_context_addr=0,
-            inst_pointer_idx=out_ptr,
-        )
-
-        # Optional: source pointer bases from GPRs (word addr) once before the loop. The rope
-        # pointer (cos base) reads [cos, sin] contiguously, so only the cos base is overridden.
-        if gpr_input_addr is not None:
-            self._pbi_override_dram_base_from_gpr(x_ptr, gpr_input_addr)
-        if gpr_cos_addr is not None:
-            self._pbi_override_dram_base_from_gpr(rope_ptr, gpr_cos_addr)
-        if gpr_out_addr is not None:
-            self._pbi_override_dram_base_from_gpr(out_ptr, gpr_out_addr)
-
-        # Absolute jump keeps the ISA loop anchored at the current I-cache window.
-        program_dram_start_addr = self.get_program_dram_addr()
-        cur_inst_count = self.capture_count
-        jump_target_word_addr = ue_35bit_addr_shifter(
-            program_dram_start_addr + (cur_inst_count + 1) * INSTRUCTION_SIZE_BYTES
-        )
-        self.generate_instruction_jump_abs(jump_target_word_addr)
-        self.loop_start(loop_cnt=M, gpr_loop_cnt=gpr_M_reg)
-        self.accelerator_memory_to_sram(
-            accelerator_dram_address=rope_row_bytes,
-            sram_address=sram_cos,
-            element_size=0,
-            inst_pointer_idx=rope_ptr,
-        )
-        self.loop_start(group_size)
-        self.accelerator_memory_to_sram(
-            accelerator_dram_address=row_bytes,
-            sram_address=sram_x,
-            element_size=0,
-            inst_pointer_idx=x_ptr,
-        )
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
-        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
-        self.sram_to_accelerator_memory(
-            sram_address=0,
-            accelerator_dram_address=row_bytes,
-            element_size=0,
-            inst_pointer_idx=out_ptr,
-        )
-        self.loop_end()
-        self.loop_end()
-
-        self.release_inst_ptr(out_ptr)
-        self.release_inst_ptr(rope_ptr)
-        self.release_inst_ptr(x_ptr)
         return 4 * M * group_size * N
 
     def rope_hf_core_dram_gqa_dynamic(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int,
@@ -5227,6 +4959,61 @@ class UnifiedEngine:
             self.release_isa_reg()
 
         return 4 * M * group_size * N
+
+    def rope_hf_matmul_core(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int,
+                            cos_dram_addr: int, sin_dram_addr: int,
+                            identity_swap_dram_addr: int, scratch_dram_addr: int,
+                            gpr_M_reg: int = None,
+                            gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
+                            gpr_cos_addr: Optional[int] = None, gpr_sin_addr: Optional[int] = None) -> int:
+        """HF RoPE via a swap-matmul rotate-half, for **small head_dim (N=64)** where each ``N/2``-wide
+        rotate-half is a *sub-URAM-row* slice (< 64 elements) and so cannot be addressed in URAM the way
+        :meth:`rope_hf_core_dram_dynamic` does for N>=128. Rotate-half is a batched matmul against a
+        static swap permutation, then the elementwise finish runs full-width::
+
+            rot = X @ P_swap                 # [M,N]@[N,N], P[n,(n+N/2)%N]=1 -> rot = [x_hi, x_lo]
+            rot = rot (.) sin                # signed sin (lower half host-pre-negated)
+            out = X   (.) cos                # cos duplicated over both halves
+            out = out + rot                  # final RoPE
+
+        Layout (host-tiled, all ``[M, N]``): ``cos`` duplicated over both halves; ``sin = [-sin_lo |
+        +sin_hi]``; ``identity_swap_dram_addr`` is the ``[N, N]`` swap permutation (symmetric, so the
+        matmul's A@B vs A@Bᵀ convention is immaterial); ``scratch_dram_addr`` is an ``[M, N]`` scratch
+        (holds ``rot``). Interface mirrors the dynamic rope cores: M runtime via ``gpr_M_reg``, N
+        compile-time, optional ``gpr_*_addr`` source the DRAM bases from GPRs (word addr = ``byte >>
+        3``). In-place safe (``output_dram_addr == input_dram_addr``). Returns ``4 * M * N`` FLOPs.
+        """
+        fn = "rope_hf_matmul_core"
+        assert self.is_capture_on, f"{fn}() requires active capture"
+        assert N % UE_VECTOR_SIZE == 0, f"{fn}: N must be a multiple of {UE_VECTOR_SIZE}, got N={N}"
+        if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
+            raise ValueError(f"{fn}: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
+
+        def _pm():
+            # (Re)prime the row count into gpr_M_reg before each op (matches the per-op priming the
+            # gemma4 vision path used); keeps each batched op independent of the previous one's reg use.
+            self.generate_instruction_add_set(gpr_M_reg, M)
+            return gpr_M_reg
+
+        flops = 0
+        # rot = X @ P_swap  (rotate_half without the sign; P symmetric so A@P == A@Pᵀ)
+        flops += self.matmat_mul_core(M=M, K=N, N=N, A_DRAM_ADDR=input_dram_addr,
+                                      B_DRAM_ADDR=identity_swap_dram_addr, OUTPUT_DRAM_ADDR=scratch_dram_addr,
+                                      is_B_quantized=False, gpr_M_reg=_pm(), gpr_a_addr=gpr_input_addr) or 0
+        # rot = rot (.) sin
+        flops += self.eltwise_core_dram(M=M, N=N, dram_a=scratch_dram_addr, dram_b=sin_dram_addr,
+                                        dram_out=scratch_dram_addr, mode=UE_MODE.ELTWISE_MUL,
+                                        gpr_M_reg=_pm(), gpr_b_addr=gpr_sin_addr)
+        # out = X (.) cos  (reads input, writes output; in-place safe when output == input)
+        flops += self.eltwise_core_dram(M=M, N=N, dram_a=input_dram_addr, dram_b=cos_dram_addr,
+                                        dram_out=output_dram_addr, mode=UE_MODE.ELTWISE_MUL,
+                                        gpr_M_reg=_pm(), gpr_a_addr=gpr_input_addr,
+                                        gpr_b_addr=gpr_cos_addr, gpr_out_addr=gpr_out_addr)
+        # out = out + rot
+        flops += self.eltwise_core_dram(M=M, N=N, dram_a=output_dram_addr, dram_b=scratch_dram_addr,
+                                        dram_out=output_dram_addr, mode=UE_MODE.ELTWISE_ADD,
+                                        gpr_M_reg=_pm(), gpr_a_addr=gpr_out_addr, gpr_out_addr=gpr_out_addr)
+        return flops
 
     def start_queue_for_bf16_dequantize_operation(self, VECTOR_INPUT_DRAM_ADDR: int, SCALE_INPUT_DRAM_ADDR: int, data_type: TYPE,
                                                   output_sram_wb_addr: int, element_size: int) -> None:
