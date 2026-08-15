@@ -439,35 +439,15 @@ class Gemma4VisionMixin:
     # static swap permutation + tiled elementwise. HW-verified on alveo.
     # ------------------------------------------------------------------
     def rope_hf_matmul_core(self, src_dram: int, M: int, N: int) -> int:
-        """RoPE reformulated as batched matmul + elementwise (no per-head DMAs).
-
-        The per-head, half-width RoPE is DMA-latency-bound (tiny 64 B transfers).
-        This expresses it as three large batched passes over all ``M`` rows:
-
-            rot = X @ P_swap        # rotate_half via static [N,N] permutation matmul
-            rot = rot ⊙ sin_tiled   # signed sin (lower half pre-negated)
-            X   = X   ⊙ cos_tiled   # in place
-            X   = X   + rot         # in place -> final RoPE output
-
-        cos/sin are pre-tiled to [M, N] on the host, so the elementwise passes
-        are plain full-size vector ops (the HW broadcast is single-scalar only).
-        Runs in place (output overwrites ``src_dram``)."""
-        flops = 0
-        # rot = X @ P_swap  (A@Bᵀ with symmetric swap B -> rotate_half)
-        flops += self.matmat_mul_core(M=M, K=N, N=N, A_DRAM_ADDR=src_dram,
-                                      B_DRAM_ADDR=self.VIS_ROPE_P_SWAP,
-                                      OUTPUT_DRAM_ADDR=self.VIS_ROPE_ROT,
-                                      is_B_quantized=False, gpr_M_reg=self._prime_M(M)) or 0
-        flops += self.eltwise_core_dram(M=M, N=N, dram_a=self.VIS_ROPE_ROT,
-                                        dram_b=self.VIS_ROPE_SIN_TILED, dram_out=self.VIS_ROPE_ROT,
-                                        mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=self._prime_M(M))
-        flops += self.eltwise_core_dram(M=M, N=N, dram_a=src_dram,
-                                        dram_b=self.VIS_ROPE_COS_TILED, dram_out=src_dram,
-                                        mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=self._prime_M(M))
-        flops += self.eltwise_core_dram(M=M, N=N, dram_a=src_dram,
-                                        dram_b=self.VIS_ROPE_ROT, dram_out=src_dram,
-                                        mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self._prime_M(M))
-        return flops
+        """Vision-encoder RoPE (in place on ``src_dram``, head_dim N=64): thin adapter over the
+        library :meth:`UnifiedEngine.rope_hf_matmul_core`, wiring the model-owned swap matrix, rot
+        scratch, and host-tiled cos/sin. The library core does ``rot = X @ P_swap`` then
+        ``rot*=sin; out = X*cos; out += rot`` via three batched eltwise passes."""
+        return user_dma_core.UnifiedEngine.rope_hf_matmul_core(
+            self, M=M, N=N, input_dram_addr=src_dram, output_dram_addr=src_dram,
+            cos_dram_addr=self.VIS_ROPE_COS_TILED, sin_dram_addr=self.VIS_ROPE_SIN_TILED,
+            identity_swap_dram_addr=self.VIS_ROPE_P_SWAP, scratch_dram_addr=self.VIS_ROPE_ROT,
+            gpr_M_reg=self._prime_M(M))
 
     # ------------------------------------------------------------------
     # Vision encoder layers (S3): one SigLIP layer = pre_norm + Q/K/V proj +
