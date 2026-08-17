@@ -1,0 +1,241 @@
+{
+  "_source": "https://huggingface.co/verapulse/pulsevla-libero-0.5b/blob/main/config.json (SmolVLA-family: SmolVLM2-500M-Instruct VLM + 0.5x-width flow-matching action expert)",
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "ROPE_SIZE_REG": 2,
+    "TMP_REG": 3,
+    "GPR_SEQ_LEN_REG": 4,
+    "GPR_Q_SEQ_LEN_REG": 5,
+    "GPR_BUCKET_IDX_REG": 6,
+    "V_M_REG": 7,
+    "LM_M_REG": 8,
+    "AE_M_REG": 9,
+    "_budget": "15 GPRs total; 1-9 fixed here, 10-15 free for rope/flash scratch. The M regs are the gpr_M_reg handles for the vision/lm/expert PBI matmul loops -- declared so the budget stays visible."
+  },
+
+  "vision": {
+    "_stack": "SigLIP v1 vision tower (SiglipVisionTransformer, exported as SmolVLMVisionTransformer, model_type smolvlm_vision), derived from google/siglip-base-patch16-512. Weights under vis.*. Identified by tensor signature: no CLS token (pos_embed 1024 == 32x32 exactly), post_layernorm but no pre_layrnorm (rules out CLIP), out_proj naming, fc1/fc2 non-gated MLP. No attention-pooling head (vision_use_head=False) -- the connector needs all 1024 patch tokens.",
+    "_image_splitting": "Upstream SmolVLM2 sets do_image_splitting=true (tile a <=2048px image into up to 16 512x512 tiles + a thumbnail, up to 1088 image tokens). Verapulse does NOT exercise it: predict_example passes (B,3,512,512) per camera, already one tile at native tower resolution. So 1 image -> 1024 patches -> 64 tokens per camera, fixed shape, no variable tile count. Confirm the preprocessing does not prepend a per-camera thumbnail.",
+    "activation": "gelu_pytorch_tanh",
+    "hidden_size": 768,
+    "intermediate_size": 3072,
+    "num_layers": 12,
+    "num_heads": 12,
+    "num_kv_heads": 12,
+    "attn_kind": "mha",
+    "head_dim": 64,
+    "num_channels": 3,
+    "image_size": 512,
+    "patch_size": 16,
+    "num_patches_per_side": 32,
+    "num_patches": 1024,
+    "layer_norm_eps": 1e-06,
+    "pos_embed": "learned_absolute",
+    "norm": "layer_norm_bias",
+    "mlp": "gelu_bias",
+    "attn": "prefill_flash_bidirectional",
+    "num_image_slots": 2,
+    "_num_image_slots_note": "LIBERO observation = agentview + wrist. Confirm against eval_libero.py; 3 cams => prefix grows by 64 tokens."
+  },
+
+  "connector": {
+    "_stack": "pixel-shuffle x4 then one linear, weights under conn.*",
+    "pixel_shuffle_scale_factor": 4,
+    "input_size": 12288,
+    "output_size": 960,
+    "tokens_in": 1024,
+    "tokens_out": 64,
+    "_note": "shuffle folds a 4x4 patch block into channels: 768*16 = 12288 -> 960. Emit it as smart_bf16_permute_core(dims=[8,4,8,4,768], permute_indices=[0,2,1,3,4]) then a plain M=64 K=12288 N=960 matmul -- exactly smolvlm2_test.py:597-607. Natively supported, DMA-gather path, no weight pre-permute needed."
+  },
+
+  "lm": {
+    "_stack": "SmolLM2-360M-class VLM decoder, weights under lm.*",
+    "hidden_size": 960,
+    "intermediate_size": 2560,
+    "num_layers": 32,
+    "num_heads": 15,
+    "num_kv_heads": 5,
+    "head_dim": 64,
+    "vocab_size": 49280,
+    "attn_kind": "gqa",
+    "group_size": 3,
+    "rope_theta": 10000.0,
+    "_rope_theta_note": "10000.0 is the verapulse checkpoint's OWN config.json value and is what this bring-up uses -- we reproduce THEIR model, not the pretraining base. Note it differs from upstream SmolVLM2-500M and from models/smolvlm2/smolvlm2_config.json, which both say 100000.0 (the SmolLM2 pretraining value). Consequence when lifting _load_rope_tables from smolvlm2: rebuild the table values at 10000, do not copy them. Theta silently rescales every table entry, so a copy-paste here degrades gracefully-but-wrongly.",
+    "rms_norm_eps": 1e-05,
+    "attention_bias": false,
+    "image_token_id": 49190,
+    "tokenizer_max_length": 48
+  },
+
+  "expert": {
+    "_stack": "action expert, 0.5x VLM width, weights under ae.*",
+    "hidden_size": 480,
+    "hidden_size_padded": 512,
+    "intermediate_size": 1280,
+    "num_layers": 32,
+    "num_heads": 15,
+    "num_kv_heads": 5,
+    "head_dim": 64,
+    "q_out": 960,
+    "kv_out": 320,
+    "attn_kind": "gqa",
+    "group_size": 3,
+    "_kv_match": "expert kv_out 320 == lm kv_out 320 by construction (same 5 kv heads x hd 64), which is exactly what lets the cross-attention layers read the frozen VLM prefix KV cache with no reprojection.",
+    "rms_norm_eps": 1e-05,
+    "attention_mode": "cross_attn",
+    "self_attn_every_n_layers": 2,
+    "_layer_mode_note": "layer i does SELF attention when i % self_attn_every_n_layers == 0, else CROSS attention onto the frozen VLM prefix K/V (dims match: kv_out 320 both stacks). VERIFY against the lerobot SmolVLA reference before compiling.",
+    "num_expert_layers": -1,
+    "num_vlm_layers": 0,
+    "_layer_count_note": "-1/0 in upstream config mean 'use all'; the checkpoint has 32 layers in both stacks."
+  },
+
+  "action_head": {
+    "state_dim": 32,
+    "action_dim": 7,
+    "max_action_dim": 32,
+    "chunk_size": 50,
+    "n_action_steps": 10,
+    "num_denoise_steps": 10,
+    "time_embed": {
+      "kind": "sinusoidal",
+      "dim": 480,
+      "min_period": 0.004,
+      "max_period": 4.0
+    },
+    "_flow": "x_t = t*noise + (1-t)*a; expert predicts v; Euler with dt = -1/num_steps. action_in_proj(32->480) || time_emb(480) -> concat 960 -> action_time_mlp_in(960->480) -> silu -> action_time_mlp_out(480->480) -> expert 32 layers -> ae.final_norm(480) -> action_out_proj(480->32), take [:, :7].",
+    "_precompute_limit": "Only the RAW sinusoid [10,480] is precomputable on the host. pi05's trick of precomputing the WHOLE conditioning table does NOT transfer: there the time MLP was standalone and input-independent, whereas action_time_mlp_in here consumes concat(action_in_proj(x_t), time_emb) and x_t changes every Euler step. Everything from action_time_mlp_in onward runs on device, per step.",
+    "_n_action_steps_note": "n_action_steps (10, execution horizon) and num_steps (10, Euler denoise steps) are different quantities that coincidentally match. The model predicts a chunk of 50 actions; only the first n_action_steps are executed before re-planning. Do not conflate them."
+  },
+
+  "model": {
+    "prefix_layout": ["state(1)", "image_slots * 64", "text(48)"],
+    "prefix_len": 177,
+    "prefix_len_padded": 192,
+    "suffix_len": 50,
+    "suffix_len_padded": 64,
+    "vision_seq_len": 1024,
+    "_prefix_note": "1 state token + 2*64 image tokens + 48 text = 177 -> pad to 192 (3*64). Pad rows must be masked via the attention bias tensor AND excluded from every SNR probe. 3 cameras would give 1+192+48 = 241 -> 256, so num_image_slots MUST be in the bin signature.",
+    "_OPEN_prefix_layout": "BLOCKING, resolve from the reference before compiling the prefix. (a) image_token_id 49190 exists, which implies image embeddings are SCATTERED into placeholder positions inside the tokenized text sequence (the SmolVLM/SmolVLA pattern), NOT concatenated in front of it. If so the prefix is not state||images||text at all, and both the length and every RoPE position change. (b) The state token is assumed at row 0, but pi0/pi0.5 and SmolVLA put state LAST (images -> language -> state). (c) Upstream config says prefix_length: 0, unexplained and contradicting prefix_len 177.",
+    "_OPEN_valid_len": "valid prefix length is NOT the constant 177: tokenizer_max_length 48 means text is PADDED to 48, so the real count is 1 + 128 + n_real_text and varies per prompt. Masking only rows 177..191 would treat the padded text tokens inside rows 129..176 as valid, corrupting attention and -- via cumsum -- every downstream RoPE position. RoPE positions must be cumsum(attention_mask), not arange (the pi05 lesson).",
+    "_OPEN_expert_rope": "(a) suffix RoPE positions: SmolVLA continues them from the prefix (prefix_len .. prefix_len+49), not 0..49. (b) on cross-attn layers, is Q rotated at all, and against which base, given K comes from the prefix cache already rotated with prefix positions? (c) does cross layer i read LM layer i's KV or the final-layer KV? All three are undefined and all three read as generic drift if wrong.",
+    "_OPEN_layer_parity": "self-attn assumed on i % 2 == 0. If inverted, all 32 expert layers are wrong in a way that looks like drift, not a structural bug."
+  },
+
+  "ops": {
+    "vision_norm": "layer_norm",
+    "vision_mlp": "gelu",
+    "lm_norm": "rms",
+    "lm_rope": "hf",
+    "lm_mlp": "gated_silu",
+    "attn": "prefill_flash",
+    "_causal_removed": "there is no single causal flag for this model: vision is bidirectional, the prefix is a BLOCK mask (not uniformly bidirectional -- image+state block vs language follow different rules), and the expert mixes bidirectional-within-chunk self-attn with full cross-attn. Every mask is an explicit precomputed bias tensor derived from the reference.",
+    "mlp_bias": false,
+    "lm_quant": "bf16",
+    "vision_quant": "bf16",
+    "expert_quant": "bf16",
+    "_quant_note": "bring up every stack in bf16 first (pi05 lesson: chained IF4 allocations gave -2.97 dB). Flip to q4_64 per-stack only after that stack passes >=40 dB."
+  },
+
+  "quantization": {
+    "q4_64": {
+      "block_size": 64,
+      "bits": 4,
+      "scale_divisor": 7.0,
+      "range": [-8, 7]
+    }
+  },
+
+  "dram_layout": {
+    "selected": "bf16_default",
+    "_note_layout": "Bases are OFFSETS from DRAM_START_ADDR=0x80000000. Scratch and programs ABOVE the weight blob (LocateAnything golden pattern). Invariant: params_end < tensor_dram_base < program_dram_base < 0x100000000. Sizes: 559.26M params = 2.237 GB fp32 = 1.118 GB bf16, INCLUDING the 49280x960 embed table (94.6 MB bf16 -- it is inside the 559M, do NOT add it again; the first draft double-counted it). With the 480->512 / 32->64 / 960->1024 pads, ~566M -> ~1.132 GB, so params_end ~ 0x44000000. Bases moved down from the first draft (0xC0000000/0xCE000000), which left a 1.94 GB unused hole under the weights while starving the program arena to 839 MB -- and the program arena, not the weights, is what overflows on this model (320 expert flash calls + 64 static post_add norms). This layout keeps a 234 MB tensor region (peak activation ~70 MB) and gives the program arena 2.85 GB. After moving tensor_dram_base, rm the cached bins -- they bake in tensor addresses.",
+    "params_dram_base": "0x00000000",
+    "tensor_dram_base": "0x48000000",
+    "program_dram_base": "0x56000000",
+    "_peak_activation_mib": {
+      "vision_working_set_2_slots": 30,
+      "flash_scratch_seq_1024": 24,
+      "vision_out_plus_connector_view": 5,
+      "prefix_hidden_and_bias": 1,
+      "prefix_kv_cache_32x2x192x320": 8,
+      "expert_per_step": 1,
+      "peak_total": 70,
+      "region_size": 234
+    }
+  },
+
+  "reference": {
+    "_note": "The whole VLM half of this model is ALREADY brought up and HW-validated in this repo. Reuse it; do not re-derive.",
+    "vlm_bringup": "models/smolvlm2/smolvlm2_test.py",
+    "vlm_config": "models/smolvlm2/smolvlm2_config.json",
+    "structure_template": "models/pi05_libero/pi05_libero_test.py",
+    "vision_port_plan": "TAKE pi05's ENCODER STRUCTURE + smolvlm2's CONSTANTS AND PERMUTES. pi05's compile_encoder is itself descended from smolvlm2 (its docstring: 'Structure follows the proven smolvlm2_test.py section 7 shared-subroutine-flash pattern') and adds what smolvlm2 lacks: multi-engine sharding over rows AND a K-axis grid (_emit_encoder_body(ue, engine_idx, sched, row_offset, rows, kgrp, nk); 202 multi-engine refs vs smolvlm2's 0). smolvlm2 supplies what pi05 cannot: the exact dims (768/12x64/3072/1024 patches/patch16) and both permutes (patch-embed reorder + scale-4 pixel shuffle, which pi05 has no equivalent of -- its connector is scale 1 = identity). Retarget pi05's loop bounds 27->12 layers, S 256->1024, H 1152->768, NH 16->12, I 4304->3072.",
+    "hd72_deletes_cleanly": "pi05's head_dim 72->128 pad is NOT a stage to unpick: it lives in the WEIGHT STORE (_pad_proj, pi05_libero_test.py:605-624) with every downstream buffer DP=128 wide. At head_dim 64, D == DP == 64, so _pad_proj collapses to identity and the buffers become 64-wide. A 64-element slice is 128 B, still AXI-beat (32 B) aligned. Pure simplification -- and it removes the known-broken hd=72 flash path rather than importing it.",
+    "patch_embed_permute": "smolvlm2_test.py:536-543 does the patch-embed channel-major reorder ON DEVICE: smart_bf16_permute_core(dims=[3,32,16,32,16], permute_indices=[1,3,0,2,4]) then matmat_mul_core(M=1024,K=768,N=768, bias_mode='broadcast_N', gpr_M_reg=vis_S_reg). Taking this path makes the 'host patchify must emit (c,kh,kw) order or it is finite-but-scrambled' hazard moot.",
+    "swin_is_wrong_shape": "swin's patch merging is a scale-2 2x2 spatial->channel fold. This model needs scale 4. Use smolvlm2's, not swin's.",
+    "reusable_verbatim": [
+      "SmolVLM2_UnifiedEngine.compile_encoder  -- identical ViT (12x768, 12 heads, hd 64, MHA) + pixel-shuffle x4 connector (12288->960)",
+      "SmolVLM2_UnifiedEngine._load_rope_tables -- same theta/head_dim; note it uses 100000.0",
+      "SmolVLM2_UnifiedEngine.weight_init q4_64 path for the vision + lm stacks",
+      "compile_prefill's duplicate_gqa_rows -- the 5->15 K/V row replication flash needs for GQA group 3"
+    ],
+    "must_change_from_smolvlm2": [
+      "prefix attention is BIDIRECTIONAL over the observation, not causal decode",
+      "no LM head / sampling / stop tokens -- output is continuous actions",
+      "the prefix must PERSIST per-layer K/V [192,320] x32 as the expert's cross-attn source",
+      "prefix rows now include a state token and 2 camera slots (128 image tokens), not 1"
+    ],
+    "take_from_pi05": [
+      "file/stage structure, compile-once + bins, prefix-KV dump for oracle isolation",
+      "action-expert + flow-matching denoise loop shape, precomputed timestep table",
+      "per-stage SNR gating with masked rows excluded"
+    ]
+  },
+
+  "paths": {
+    "hf_model_repo": "verapulse/pulsevla-libero-0.5b",
+    "hf_files": ["config.json", "model.safetensors", "norm_stats.safetensors", "tokenizer.json"],
+    "bin_dir": "verapulse_bin",
+    "weights_export_dir": "models/verapulse/verapulse_bin/weights_export",
+    "weights_manifest": "models/verapulse/verapulse_bin/weights_export/manifest.json",
+    "tokenizer_file": "verapulse_bin/verapulse__pulsevla-libero-0.5b/tokenizer.json",
+    "norm_stats": "verapulse_bin/verapulse__pulsevla-libero-0.5b/norm_stats.safetensors",
+    "params_bin": "verapulse_bin/params.bin",
+    "instruction_bin": "verapulse_bin/programs.bin",
+    "instruction_meta": "verapulse_bin/programs.json"
+  },
+
+  "defaults": {
+    "prompt": "pick up the black bowl and place it on the plate",
+    "dev": "xdma0",
+    "cycle_ns": 5.63
+  },
+
+  "hw_notes": [
+    "ATTENTION KINDS (settled against the SmolVLM2-500M reference, not just the checkpoint shapes): vision = MHA, 12 q heads / 12 kv heads, hd 64. lm = GQA, 15 q / 5 kv, group 3, hd 64. expert = GQA, 15 q / 5 kv, group 3, hd 64. NOTHING here is MQA (that is pi05, num_kv_heads=1) -- do not reuse pi05's MQA attention emitters.",
+    "GQA on this HW: flash wants matching q/kv head counts, so the 5 kv heads must be row-replicated to 15 before the flash call. models/smolvlm2/smolvlm2_test.py::compile_prefill already has this as duplicate_gqa_rows -- reuse it rather than re-deriving. The alternative (rope_hf_core_dram_gqa) applies to the rope step, where hd 64 -> half 32 is exactly 32-aligned, so it is usable directly at N=64.",
+    "The observation is 2 cameras, CONFIRMED from the upstream predict_example.py (obs keys 'image' and 'image2', each (B,3,512,512)) -- not an assumption.",
+    "GOOD NEWS vs pi05/MoonViT: every attention head_dim here is 64 -- vision 768/12=64, lm 960/15=64, expert 960/15=64. No 72->128 pad, no unpad selection matrix, no pre-scale. The known-broken hd=72 flash path is NOT on this model's critical path.",
+    "THE 480 PROBLEM: expert hidden_size 480 is NOT a multiple of 64 (480/64 = 7.5), so it violates both the 64-ALU floor and the 128B SRAM row quantum. Pad the expert hidden dim to 512 everywhere: K-pad (zero rows) on q/k/v/gate/up weights, N-pad (zero cols) on o_proj/down_proj/action_in_proj/action_time_mlp_* outputs. Bake the pad into the STORED weights (the reformat is a weight), never into a runtime staging copy.",
+    "RMSNorm over the padded 512 is NOT the same as over 480: the mean-square denominator changes. Because RMS has no mean subtraction, zero pad lanes leave the numerator untouched and only rescale the denominator by a known constant, so folding it into the stored gamma works. THE CONSTANT IS gamma' = gamma * sqrt(480/512) = gamma * 0.968246 -- normalizing over 512 instead of 480 makes the denominator SMALLER, so the kernel's output is LARGER by sqrt(512/480) and gamma must scale DOWN. The reciprocal is a silent +6.7% gain per norm compounding over 65 expert norms (~1e9x). Exact only up to eps: with eps=1e-5 inside the sqrt the ideal factor is data-dependent, but the deviation is ~1e-6 relative, three orders below the bf16 quantum. A true LayerNorm could NOT be fixed this way (zero padding shifts the mean, data-dependently). Assert the pad lanes are still zero after every expert op.",
+    "The 480->512 pad BREAKS the action_time_mlp_in concat. That weight is [480,960] with K=960 = concat(action_in_proj_out[480], time_emb[480]). Once both halves are 512-padded the second half starts at column 512, not 480, so a K=960 matmul reads the wrong columns for the entire time half. Keeping the concat contiguous at 960 is ILLEGAL: the time half would start at byte 960, not a multiple of 128. FIX: K-pad action_time_mlp_in 960 -> 1024, permuting its input columns so source [0:480] sits at [0:480] and source [480:960] sits at [512:992], zeros elsewhere. Combined with the N-pad, the stored weight is [512, 1024].",
+    "Head BIASES need the same padding as their weights: state_proj.bias[960] is clean, but action_in_proj.bias[480], action_time_mlp_in.bias[480], action_time_mlp_out.bias[480] must be zero-padded to 512 and action_out_proj.bias[32] to 64. A bias write into the pad lanes poisons the zero-pad invariant the RMSNorm fold depends on. The expert stack itself is bias-free.",
+    "The precomputed timestep table must be [10, 512], not [10, 480] -- innermost dim must be %64 so a row DMAs into the padded slot without a sub-row copy.",
+    "Expert q_out=960, kv_out=320, intermediate=1280 are all multiples of 64 -- only the 480 residual stream needs padding. head_dim 64 means GQA rope halves are 32 elements = exactly 32-aligned, so rope_hf_core_dram_gqa is usable directly at N=64.",
+    "Vision is the compute hog: image 512 / patch 16 = 32x32 = 1024 tokens PER IMAGE, x2 cameras, x12 layers, bidirectional flash at seq 1024 hd 64. This dominates latency, and it is the natural first multi-engine target (row-split over the 1024 tokens, shard once at chain entry, single barrier before attention needs joined K/V).",
+    "Vision MLP activation is gelu_pytorch_tanh: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))), the SigLIP default, within ~1e-3 of exact erf-GELU. The HW GELU is the SIGMOID approximation x*sigmoid(1.702*x) (user_dma_core.py:299, LALU_ACT_GELU_B=0xbfd9=-1.702), which deviates from true GELU by up to ~0.02 absolute around |x| in [2,3]. TWO CONSEQUENCES: (1) the CPU oracle must use the SIGMOID form when scoring HW-vs-oracle, or every vision MLP stage falsely reads ~28 dB low; (2) the substitution is a real model-vs-reality approximation that belongs in the vision error budget -- it is not exact. models/smolvlm2/smolvlm2_test.py:592 already ships this substitution (gelu_enable=True) and passed its gate, so it is empirically tolerable at this depth. (Near-miss trivia: x*sigmoid(1.702x) IS exactly CLIP's quick_gelu -- if this tower were CLIP the HW would be bit-right.)",
+    "Vision attention has bias on q/k/v/out_proj and the LayerNorms have bias; the LM/expert stacks are bias-free RMSNorm. Do not copy pi05's bias-free vision assumptions.",
+    "The connector pixel-shuffle is NATIVELY SUPPORTED -- do not hand-roll it and do not pre-permute the weight. models/smolvlm2/smolvlm2_test.py:597-607 does this exact op in one call: smart_bf16_permute_core(dims=[8,4,8,4,768], permute_indices=[0,2,1,3,4], in=VIS_POST_LN_DRAM, out=VIS_SHUFFLED_DRAM), then matmat_mul_core(M=64, K=12288, N=960) reads the shuffled buffer directly (reshape is free in a flat address space). dims views the 1024 tokens as (by,dy,bx,dx); the perm reorders to (by,bx,dy,dx), whose row-major flattening IS 64x12288. It is CHEAP because the last dim 768 stays put and is 64-aligned, so nn_lib.py:168-205 takes Case 1, a pure DMA GATHER: per-output-row memcpy with the source offset from a precomputed index table, destination written sequentially. The moving unit is a whole 768-element row = 1536 B = 12 full SRAM rows, so no sub-row addressing and NO per-index destination offset -- the strided-copy footgun does not apply here. Cost: 1024 small memcpys + 8 bulk writes of static program. Precedent at scale 2: locateanything_3b_test.py:4642 (Qwen2.5-VL merger), same [0,2,1,3,4] family. The known smart_bf16_permute_core bug (transpose path, N_transpose > 64) is Case 2 and does not touch this. A host round-trip is possible but wrong: 3 MB each way per camera, and it splits the encoder's single captured program, forfeiting compile-once.",
+    "NO SITE IN THIS MODEL NEEDS ONLINE TRIG, and the ISA could not provide it anyway: the LALU exposes exp/sigmoid/silu/gelu/tanh but has NO sine or cosine primitive to lower onto (pi05 _ae_compile_cond_table). Vision pos-embed is a learned lookup with no interpolation (SmolVLM buckets patch coords to integer ids; at fixed 512px it collapses to arange(1024)). LM RoPE, expert RoPE (positions arange(50)), and the 10-step timestep sinusoid are all host-precomputed tables baked into params.bin. Data-dependent prefix positions do NOT break this: the table is indexed BY POSITION VALUE, so one static [S_max,64] table serves every prompt and only the gather indices vary. Flow matching is linear/optimal-transport (x_t = t*noise + (1-t)*a) -- no beta or cosine noise schedule exists to worry about.",
+    "SILU TRAP on the time MLP: pi05 measured -6 dB on exactly this tensor using fused silu_enable=True (the LALU's piecewise-approximate SiLU). The fix was composed silu_core_dram -- true x*sigmoid(x) via identity-matmul sigmoid + elementwise multiply. verapulse CANNOT dodge it by precomputing (action_time_mlp_in consumes x_t, which changes every Euler step), so the action_time_mlp_in -> silu -> action_time_mlp_out chain must run on device per step: use the composed SiLU there and score it against a host oracle.",
+    "PROGRAM SIZE is the real budget risk, not weights. A naive unroll emits 24 vision flashes (12 layers x 2 slots at seq 1024) + 32 prefix flashes + 32 expert layers x 10 denoise steps = 320 expert flashes. Swin's static flash alone was 103 MB before staging. Use the proven in-tree fix: compile flash ONCE as a subroutine (gpr_ret_id + jump_abs, return via JUMP_REG_ABS) and memcpy-stage each call's Q/K/V into its fixed buffers -- memcpy-style PBI injection DOES re-execute correctly (swin 103MB -> 9.4MB; gemma3 re-executes static flash thousands of times). Separately, roll the 10 Euler steps into ONE compiled body (gpr_M_reg + an advancing pointer into the timestep table) instead of a Python for-loop: the loop is static, but unrolling it is a 10x program multiplier.",
+    "RoPE at N=64 is legal but PBI-ONLY (verified in user_dma_core.py): rope_hf_core_dram dispatches to rope_hf_core_dram_dynamic when gpr_M_reg is passed, and that path's padded-split branch asserts only 0 < N < 128 (N bytes = 128 is beat-aligned). A BARE call with no GPR falls through to rope_hf_core_dram_legacy, which asserts N >= 128 (line 4169); rope_hf_core_dram_gqa and the decode core assert N >= 128 AND N % 128 == 0. smolvlm2's compile_prefill already runs N=64 in production. So: always pass gpr_M_reg, never use the _gqa variant at this head_dim -- do the group broadcast with duplicate_gqa_rows instead.",
+    "Post-residual norms (twice per layer, 64 of them across lm+expert) map to layer_norm_core_dram_post_add, which has NO PBI and is a proven dead end (4 advancing pointers vs the <=3 limit; wiring it broke qwen-vl and saved 2 MB). They stay STATIC -- budget that program cost. Note also that the LM/expert use rms_norm_core_dram whose gpr_M_reg is M, while layer_norm_core_dram's is M//chunk_size (chunk COUNT); crossing the two is silent. The vision stack needs true LayerNorm WITH bias -- confirm layer_norm_core_dram accepts a beta operand before planning on it.",
+    "Cross-attention layers reuse the FROZEN VLM prefix K/V, so the prefix runs once per observation and the 10 denoise steps only re-run the expert. Cache prefix K/V in DRAM exactly like pi05 does; self-attention layers (i%2==0) additionally build the expert's own K/V over the 50-token action chunk each step.",
+    "The 10-step Euler loop is a fixed schedule (dt = -1/10, t known at compile time), so the whole denoise loop can be compiled once with all 10 timestep embeddings precomputed on the host (input-independent subcomputation -- do NOT run the sinusoid through fused kernels).",
+    "PBI: use gpr_M_reg on matmat_mul_core for the 32 expert layers x 10 steps (M=64) to keep the program bin small; layer_norm_core_dram's reg is chunk COUNT not M; keep flash static/legacy (PBI flash address injection corrupts on the 2nd execution).",
+    "Suffix length 50 pads to 64 = exactly one 64-row tile: convenient, but the 14 pad rows must be masked in the attention bias and excluded from every SNR.",
+    "Engine-construction hazard: any UnifiedEngine built after weight_init DMA-writes 16KB of noise to 0x80000000. Build the scheduler/workers BEFORE weight_init, or snapshot 0x80000000..+64KB into a bfloat16 buffer and restore.",
+    "Correctness gate: >=40 dB SNR vs the pure-torch reference, per stage (vision layer 0 -> vision out -> connector -> prefix layer 0 -> prefix out -> expert step 0 -> actions). Masked/pad rows excluded. 'No NaN' is not correctness."
+  ]
+}
