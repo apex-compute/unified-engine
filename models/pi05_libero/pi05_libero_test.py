@@ -463,8 +463,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         concurrently-edited helper (_weight_init_vision); LM prefix-stack weights
         (embedder + 18 Gemma layers) are owned by _weight_init_lm_prefix below."""
         # First run on a fresh machine: materialize weights_export/ before any .npy read.
-        # No-op (stat-only) once the export is present.
-        ensure_weights_export(self.script_dir)
+        # No-op (stat-only) once the export is present. DUMMY_WEIGHTS reads no .npy
+        # at all, so it must NOT trigger the (very expensive, download-backed)
+        # export -- it only needs manifest.json, which it opens on demand.
+        if self.DUMMY_WEIGHTS:
+            print("[weights] DUMMY TENSORS -- shapes from manifest.json, no .npy read. "
+                  "Timing/plumbing only; the action output is NOT meaningful.")
+        else:
+            ensure_weights_export(self.script_dir)
         if hasattr(self, "_weight_init_vision"):
             self._weight_init_vision()
         self._weight_init_lm_prefix()
@@ -500,6 +506,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         def _load(name):
             info = manifest[name]
+            if self.DUMMY_WEIGHTS:
+                return self._dummy_weight(name, info["shape"])
             return torch.from_numpy(np.load(os.path.join(wdir, info["file"])))
 
         def _store_q4(mat_nk):
@@ -667,9 +675,47 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         print(f"_weight_init_vision done; params DRAM usage: {self.get_params_dram_usage()} bytes")
 
+    # -- dummy-tensor weight source -----------------------------------------
+    # DUMMY_WEIGHTS runs the ENTIRE pipeline on the FPGA exactly as a real run
+    # does -- same shapes, same quantization, same programs, same instruction
+    # streams, same DMA volume -- but synthesizes every weight from the export
+    # MANIFEST's recorded shape/dtype instead of reading the 13 GB of .npy. It is
+    # a TIMING/PLUMBING harness, not a correctness one: the (10,7) action chunk it
+    # prints is numerically meaningless. Use it to measure exec time without
+    # depending on weights_export/ being materialized (see the weight-provenance
+    # note: that export is un-regenerable, so not touching it is the point).
+    DUMMY_WEIGHTS = False
+
+    def _weights_manifest(self):
+        """Cached weights_export manifest -- {name: {shape, dtype, file}}. This is
+        the only part of the export DUMMY_WEIGHTS still needs (~100 KB of JSON),
+        because it is what records each tensor's shape."""
+        if getattr(self, "_wman_cache", None) is None:
+            with open(os.path.join(_weights_export_dir(self.script_dir),
+                                   "manifest.json")) as f:
+                self._wman_cache = json.load(f)
+        return self._wman_cache
+
+    def _dummy_weight(self, name, shape):
+        """Deterministic synthetic tensor for ``name``. Seeded off the name's hash so
+        a given weight is identical across runs and across engine counts -- two
+        dummy runs are therefore comparable to each other, not just to themselves.
+
+        Norm SCALES get ~1.0 and everything else a small-variance normal: an
+        all-random gamma would drive the RMSNorms toward zero and the run would
+        print zeros/NaN rather than finite garbage, which makes it harder to tell
+        a plumbing failure from expected nonsense.
+        """
+        g = torch.Generator().manual_seed(abs(hash(name)) % (2 ** 31))
+        if "norm" in name and "scale" in name:
+            return torch.ones(*shape) + 0.02 * torch.randn(*shape, generator=g)
+        return 0.02 * torch.randn(*shape, generator=g)
+
     # -- LM prefix stack weights (Gemma-2B: embedder + 18 layers) ------------
     def _npy(self, name):
         """Load one exported weight array (float32) from weights_export/<name>.npy."""
+        if self.DUMMY_WEIGHTS:
+            return self._dummy_weight(name, self._weights_manifest()[name]["shape"])
         path = os.path.join(_weights_export_dir(self.script_dir), f"{name}.npy")
         return torch.from_numpy(np.load(path).astype(np.float32))
 
@@ -2956,6 +3002,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         def _load(name):
             info = wman[name]
+            if self.DUMMY_WEIGHTS:
+                return self._dummy_weight(name, info["shape"])
             arr = np.load(os.path.join(wdir, info["file"]))
             return torch.from_numpy(arr.astype(np.float32))
 
@@ -6771,6 +6819,13 @@ def main():
     # model_auto_test.py, which calls set_dma_device(dev) for the DRAM-poison step and
     # then launches this script as a SUBPROCESS -- a fresh interpreter where that call
     # never happened, so a non-default --dev was honored for the poison and dropped here.
+    ap.add_argument("--dummy-weights", action="store_true",
+                     help="Run the full FPGA pipeline with SYNTHETIC weights, shaped from "
+                          "weights_export/manifest.json, without reading any .npy. Same "
+                          "programs, same shapes, same quantization, same DMA volume -- so "
+                          "stage timings are directly comparable to a real-weight run -- but "
+                          "the (10,7) action chunk is numerically MEANINGLESS. For timing "
+                          "and plumbing only; never for correctness.")
     ap.add_argument("--dev", type=str, default="xdma0",
                      help="DMA device name (e.g. xdma0, xdma1). Default: xdma0.")
     ap.add_argument("--device", type=str, default="kintex7",
@@ -6795,6 +6850,7 @@ def main():
           f"C2H={user_dma_core.DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}), "
           f"UE_0_BASE_ADDR={user_dma_core.UE_0_BASE_ADDR:#010x}")
 
+    Pi05Libero_UnifiedEngine.DUMMY_WEIGHTS = bool(args.dummy_weights)
     Pi05Libero_UnifiedEngine.AE_COND_TABLE_ON_DEVICE = bool(args.cond_table_on_device)
     Pi05Libero_UnifiedEngine.AE_COND_TABLE_CHECK = bool(args.check_cond_table)
     if not args.cond_table_on_device:
