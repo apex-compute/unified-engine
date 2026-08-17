@@ -203,6 +203,49 @@ class Gemma4LMMixin:
         a 16 GB Raspberry Pi. The first run on a beefier machine should
         generate the side-cache so subsequent runs anywhere can skip the
         HF model entirely.
+
+        ==================================================================
+        FULL DRAM ADDRESS MAP (upper 2 GB window; 3 arenas, each its own bump
+        allocator: allocate_params_dram / allocate_tensor_dram / program DRAM).
+        Fixed bases are set in Gemma4_UnifiedEngine.__init__; `~` marks a
+        run-time high-water (values shown are the 2-core VLM example).
+
+          0x80000000 ┌ PARAMS  (weights, allocate_params_dram) ~1552 MiB ┐
+                     │  LM weights ...................... ~1540.4 MB      │
+                     │   35 layers x LAYER_WEIGHT_SIZE (IF4 q/k/v/o +     │
+                     │     gate/up/down data+scale, all RMS gammas,       │
+                     │     per-layer-input gate/proj, layer_scalar)       │
+                     │   + non-layer: ROPE_LOCAL/ROPE_GLOBAL (the *LM*    │
+                     │     rope tables, fixed here), OUTPUT_NORM,          │
+                     │     PER_LAYER_MODEL_PROJ, PER_LAYER_PROJ_NORM,      │
+                     │     LM_HEAD (IF4, tied to embed)                    │
+              ~end   │  _vis_identity_dram (8 KiB, __init__)  128x128 eye │
+                     │     kept in PARAMS so vision scratch can't clobber │
+          0xE1000000 ├ TENSOR  (activations+scratch, allocate_tensor_dram)┤ 480 MiB
+                     │  time-shared LM <-> vision; see tensor_init() for  │
+                     │  the detailed sub-layout. LM persistent tensors,   │
+                     │  then LM/vision scratch, then (top) vision weights.│
+          0xFF000000 ├ PROGRAM / ISA (compiled programs.bin sections) ────┤ 16 MiB
+                     │  Vision core0 (master) ISA .......... 0xFF000000  │ 4 MiB
+                     │     VISION_ISA_BASE; encoder ~2.3 MB              │
+                     │  Vision core1 (worker) ISA .......... 0xFF400000  │ 2.125 MiB
+                     │     VISION_WORKER_ISA_BASE (2-core head-sharded) │
+                     │  LM ISA ............................. 0xFF620000  │ 9.875 MiB
+                     │     LM_ISA_BASE: preamble + prefill(@+0x20)      │
+                     │     + decoder; uses ~4.9 of 9.875 MiB           │
+         0x100000000 └───────────────────────────────────────────────────┘
+
+        MULTI-CORE PROGRAM DRAM (MultiEngineScheduler via _ensure_stage_scheduler):
+          * 2-core (kintex7, --multi-core): worker base = VISION_WORKER_ISA_BASE.
+              vision:  core0 @0xFF000000 (4 MiB) | core1 @0xFF400000 (2.125 MiB).
+              LM prefill: master @LM_ISA_BASE | worker @VISION_ISA_BASE
+                          (reuses the vision core0 region — vision has finished).
+          * 8-core (Alveo, --multi-core 8): worker base = 0xFC000000,
+              stride 0x00240000 (2.25 MiB/worker) -> 7 slots 0xFC000000,
+              0xFC240000, ...  The vision weight/scratch arena top then drops
+              to 0xFC000000 (see tensor_init() / vision_weight_init()).
+        Single-core (--multi-core 1) uses only core0/master; no worker ISA.
+        ==================================================================
         """
         import mmap as _mmap
 
@@ -320,6 +363,51 @@ class Gemma4LMMixin:
         dimension. Sliding-attention rows therefore use 256 elements and
         global-attention rows use 512 elements, matching unified attention's
         contiguous K/V layout directly.
+
+        ==================================================================
+        TENSOR REGION MAP  (0xE1000000 .. 0xFF000000, 480 MiB).
+        Time-shared: LM uses it at run time; the vision stage borrows it while
+        LM is idle (vision runs first, emits soft tokens, finishes before LM
+        prefill). `~` = run-time high-water (2-core VLM example).
+
+          0xE1000000 ┌ LM PERSISTENT (never clobbered by vision) ~120 MiB ┐
+                     │  LAYER0_V_DRAM / LAYER0_K_ROPE_DRAM  (KV cache)      │
+                     │  ZERO_DRAM_ADDR, IDENTITY_DRAM_ADDR (128x128 eye)   │
+                     │  FLASH_BIAS_FULL / FLASH_BIAS_SLIDING               │
+                     │  PENALTY_BIAS, PER_LAYER_EMBED, PER_LAYER_INPUTS    │
+         ~0xE8682000 ├ _scratch_dram_base  (vision resets its cursor here) ┤
+                     │  Below = persistent, above = disposable scratch.    │
+                     │                                                     │
+                     │  LM view (allocate_tensor_dram, grows up):          │
+                     │    FLASH_Q/K/V, INPUT, Q/K(+NORM), FLASH_OUTPUT,    │
+                     │    FLASH_SCRATCH (V.T+scores+scaled_q), MLP_GATE/   │
+                     │    UP/MULT/DOWN, LOGITS, per-layer-inject scratch   │
+                     │    (high-water < 0xFF000000; asserted)              │
+                     │                                                     │
+                     │  Vision view (vision_tensor_init, same base):       │
+                     │    IO_A/B, NORM_OUT, Q/K/V_DRAM, Q/K_NORM, ATTN,   │
+                     │    MLP_*, FLASH_BIAS, Q/K/V/OUT_HM (head-major),    │
+                     │    VIS_ROPE_P_SWAP/COS_TILED/SIN_TILED/ROT (the     │
+                     │      *vision* rope tables — per-run, NOT params),   │
+                     │    pooler (EMBED/POOL/HIDDEN_T), + per-engine attn  │
+                     │      scratch VIS_FLASH_SCRATCH_PER_ENGINE[i]        │
+         ~0xF61EE000 │    ~ vision scratch high-water                      │
+                     │      ........... free gap ...........               │
+         ~0xFA881180 ├ VISION WEIGHTS (vision_weight_init, top-placed) ~78MiB
+                     │    16 layers x (norms + q/k/v/o/gate/up/down IF4)   │
+                     │    + patch_proj, embed_proj, gammas.  Placed flush  │
+                     │    against the arena top so scratch can't reach it. │
+          0xFF000000 └ VISION_ISA_BASE (program region begins) ───────────┘
+
+        MULTI-CORE: each engine gets its OWN private attention scratch
+        VIS_FLASH_SCRATCH_PER_ENGINE[i] (~13.4 MiB each), so 2-core adds
+        ~13 MiB of scratch vs single-core and pushes the vision scratch
+        high-water up (single ~0xF54CE000 -> 2-core ~0xF61EE000). Vision
+        weights are top-placed to stay clear of it; the arena TOP is
+        VISION_ISA_BASE for <=2-core, or 0xFC000000 for >2-core (Alveo),
+        because the 8-core worker ISA arena starts at 0xFC000000 (the LM
+        persistent region below _scratch_dram_base is untouched either way).
+        ==================================================================
         """
         seq_len = self.MAX_CONTEXT_SIZE
         q_seq_len = seq_len * self.group_size

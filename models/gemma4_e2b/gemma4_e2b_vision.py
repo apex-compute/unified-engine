@@ -97,8 +97,36 @@ class Gemma4VisionMixin:
                 }
             self._vis_clip_ranges.append(row)
 
+        # Place the vision weights at the TOP of the tensor arena (ending flush
+        # against the vision ISA base), DISJOINT from the vision scratch that
+        # vision_tensor_init lays down from _scratch_dram_base upward. Previously
+        # weights were allocated at the current cursor (the LM tensor high-water,
+        # ~0xF4900000), which sits IN the scratch growth path: once the matmul-
+        # RoPE buffers (bigger than the old SRAM RoPE) and the per-engine
+        # attention scratch grew vision scratch past that address, scratch DMAs
+        # clobbered the weights — mild single-core, severe multi-core (the extra
+        # worker scratch shifts scratch ~13 MB higher). Reserving the exact
+        # aligned weight span at the top makes scratch physically unable to reach
+        # it. `_dma_section` (below) allocates every key except pos_embedding_table
+        # (host-only), each 64-byte aligned, so the span is summed the same way.
+        # Arena top = first address the vision ISA claims: the master vision ISA
+        # base (2-core), or the compact worker-ISA arena at 0xFC000000 (>2-core /
+        # Alveo). vision_tensor_init uses the same split for its scratch limit.
+        _arena_top = 0xFC000000 if self.multi_core > 2 else self.VISION_ISA_BASE
+        _alloc_span = sum(self._align_up(s["size"], 64)
+                          for k, s in sections.items() if k != "pos_embedding_table")
+        _weight_base = ((_arena_top - _alloc_span) // 64) * 64
+        if _weight_base <= self._scratch_dram_base:
+            raise MemoryError(
+                f"Vision weights ({_alloc_span/1024/1024:.1f} MiB) do not fit below the "
+                f"vision ISA arena 0x{_arena_top:X}: base 0x{_weight_base:X} "
+                f"<= scratch base 0x{self._scratch_dram_base:X}")
+        self._tensor_dram_addr = _weight_base
+        self._vis_weight_start = _weight_base
+
         print(f"\n[Vision] Loading pre-quantized vision weights from combined bin "
-              f"({VISION_QUANT_PRECISION.upper()} block=64 + BF16 norms) ...")
+              f"({VISION_QUANT_PRECISION.upper()} block=64 + BF16 norms) "
+              f"at 0x{_weight_base:X} (top of tensor arena) ...")
         with open(weights_bin_path, "rb") as f:
             def _dma_section(key: str) -> int:
                 s = sections[key]
@@ -410,12 +438,18 @@ class Gemma4VisionMixin:
                         Pm[cell, base + ky * Wg + kx] = 1.0
         self._vis_pending_dmas.append((self.VIS_POOL_P, Pm))
 
-        tensor_limit = 0xFC000000 if self.multi_core > 2 else self.VISION_ISA_BASE
+        # Scratch must stay below the vision WEIGHTS (placed at the top of the
+        # tensor arena by vision_weight_init). The old guard used the ISA base and
+        # so silently allowed scratch to grow through the weights — the multi-core
+        # "barcode" corruption. Guard the weight base instead.
+        tensor_limit = getattr(self, "_vis_weight_start",
+                               0xFC000000 if self.multi_core > 2 else self.VISION_ISA_BASE)
         if self.get_tensor_dram_addr() > tensor_limit:
             raise MemoryError(
-                f"Gemma4 vision tensors overflow the 2-GB layout: "
-                f"end=0x{self.get_tensor_dram_addr():X}, "
-                f"worker_program_start=0x{tensor_limit:X}")
+                f"Gemma4 vision scratch overflows into the vision weights: "
+                f"scratch_end=0x{self.get_tensor_dram_addr():X}, "
+                f"weight_base=0x{tensor_limit:X}. Reduce vision scratch or raise the "
+                f"tensor arena.")
 
         self._vis_num_patches = S
         self._vis_aligned_S = aligned_S
