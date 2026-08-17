@@ -565,47 +565,69 @@ class HeadShardContext:
 
     @property
     def groups(self) -> int:
-        """KV groups THIS engine owns -- one flash kernel call each.
+        """KV groups THIS engine touches (the last may be partial under
+        ``mode="qheads"``). Prefer :meth:`call_runs`, which is exact."""
+        first_kv = self.head_off // self.gqa_ratio
+        last_kv = (self.head_off + self.heads - 1) // self.gqa_ratio
+        return last_kv - first_kv + 1
 
-        :meth:`MultiEngineScheduler.split_heads` splits on group boundaries, so
-        this is always exact.
+    def call_runs(self) -> list[tuple[int, int, int]]:
+        """Decompose this engine's head range into ``(q_head, kv_head, n_q)``
+        kernel calls -- THE contract between the split and the kernel.
+
+        Each run is a MAXIMAL span of consecutive Q heads sharing one KV head,
+        which is exactly what one flash call can process (it re-reads
+        ``K_DRAM_ADDR`` unshifted per head and builds ``V^T`` once). Whole-group
+        ownership yields one run per group; a straddling range yields a short
+        run at each ragged end and full runs in between. Both are correct, and
+        the caller never has to know which case it is in.
+
+        Head indices are ABSOLUTE (model-wide), so they feed the ``*_addr``
+        accessors directly.
         """
-        return self.heads // self.gqa_ratio
+        runs = []
+        h = self.head_off
+        end = self.head_off + self.heads
+        while h < end:
+            kv = h // self.gqa_ratio
+            # Stop at whichever comes first: the end of this KV group, or the
+            # end of what this engine owns.
+            run_end = min((kv + 1) * self.gqa_ratio, end)
+            runs.append((h, kv, run_end - h))
+            h = run_end
+        return runs
 
     # -- Q / K / V / output slicing -----------------------------------------
-    # ``group`` indexes THIS ENGINE's KV groups (0 .. self.groups-1), not the
-    # model's. Each one is a separate kernel call; see the body in
-    # MultiEngineScheduler.head_sharded_attention for why.
-    def q_addr(self, base_addr: int, group: int = 0) -> int:
-        """First Q head of ``group``, in a [H, seq_len, head_dim] blob.
-
-        The kernel walks the following ``gqa_ratio`` heads itself, which is
-        correct only because Q heads of one KV group are contiguous in H.
-        """
-        head = self.head_off + group * self.gqa_ratio
+    # ``head``/``kv_head`` are ABSOLUTE indices, as produced by call_runs().
+    def q_addr(self, base_addr: int, head: Optional[int] = None) -> int:
+        """Q head ``head`` in a [H, seq_len, head_dim] blob (default: this
+        engine's first). The kernel walks the run's remaining heads itself,
+        which is correct only because Q heads of one KV group are contiguous."""
+        head = self.head_off if head is None else head
         return _shifted(base_addr, head * self.head_bytes,
-                        f"Q head shard (engine {self.engine_idx}, group {group})")
+                        f"Q head {head} (engine {self.engine_idx})")
 
-    def kv_addr(self, base_addr: int, group: int = 0) -> int:
-        """KV head of ``group``, in a [H/gqa_ratio, seq_len, head_dim] blob.
+    def kv_addr(self, base_addr: int, kv_head: Optional[int] = None) -> int:
+        """KV head ``kv_head`` in a [H/gqa_ratio, seq_len, head_dim] blob.
 
-        Indexed by KV head, NOT Q head -- passing ``q_addr`` for K/V is the
-        single most likely GQA mistake and reads out of bounds on the last
-        engine rather than failing loudly.
+        Indexed by KV head, NOT Q head -- passing a Q index here is the single
+        most likely GQA mistake and reads out of bounds on the last engine
+        rather than failing loudly.
         """
-        kv_head = self.head_off // self.gqa_ratio + group
+        kv_head = (self.head_off // self.gqa_ratio) if kv_head is None else kv_head
         return _shifted(base_addr, kv_head * self.head_bytes,
-                        f"KV head shard (engine {self.engine_idx}, group {group})")
+                        f"KV head {kv_head} (engine {self.engine_idx})")
 
-    def out_addr(self, base_addr: int, group: int = 0) -> int:
-        """Output slice for ``group``. Disjoint per engine AND per group, so the
-        concatenated [H, seq_len, head_dim] is complete after one exit barrier."""
-        head = self.head_off + group * self.gqa_ratio
+    def out_addr(self, base_addr: int, head: Optional[int] = None) -> int:
+        """Output slice for Q head ``head``. Disjoint across engines AND runs,
+        so the concatenated [H, seq_len, head_dim] is complete after one exit
+        barrier."""
+        head = self.head_off if head is None else head
         return _shifted(base_addr, head * self.head_bytes,
-                        f"attn out shard (engine {self.engine_idx}, group {group})")
+                        f"attn out head {head} (engine {self.engine_idx})")
 
     def bias_addr(self, base_addr: int, per_head: bool = False,
-                  group: int = 0) -> int:
+                  head: Optional[int] = None) -> int:
         """Attention bias / mask base.
 
         ``prefill_flash_attention_core`` indexes its bias ``((i+r) * N_q + j)``
@@ -621,9 +643,9 @@ class HeadShardContext:
         if not per_head:
             return base_addr
         plane = self.seq_len * self.seq_len * self.elem_bytes
-        head = self.head_off + group * self.gqa_ratio
+        head = self.head_off if head is None else head
         return _shifted(base_addr, head * plane,
-                        f"attn bias shard (engine {self.engine_idx}, group {group})")
+                        f"attn bias head {head} (engine {self.engine_idx})")
 
     # -- scratch -------------------------------------------------------------
     def scratch(self, name: str = "attn_scratch") -> int:
@@ -888,30 +910,53 @@ class MultiEngineScheduler:
         return self.split_cols(K)
 
     # --------------------------------------------------------------- heads --
-    def split_heads(self, H: int, gqa_ratio: int = 1) -> list[tuple[int, int]]:
+    def split_heads(self, H: int, gqa_ratio: int = 1,
+                    mode: str = "groups") -> list[tuple[int, int]]:
         """Return [(head_offset, head_count)] per engine for H attention heads.
 
-        Split on KV-GROUP boundaries, not Q-head boundaries: with ``gqa_ratio``
-        Q heads per KV head, an engine that owned a partial group would need a
-        K/V slice starting mid-plane, which ``HeadShardContext.kv_addr`` cannot
-        express (and which would make ``V^T`` wrong, not merely redundant).
-        Engines that land on DIFFERENT groups each rebuild their own ``V^T``
-        from their own K/V -- there is no duplicated work to eliminate.
+        ``mode="groups"`` (default) splits on KV-GROUP boundaries, so every
+        engine owns whole groups and each KV plane is transposed to ``V^T``
+        exactly once across the machine. Parallelism caps at ``H // gqa_ratio``.
 
-        Uneven-but-aligned, like :meth:`split_cols`: trailing engines get one
-        group less rather than any engine getting a partial one.
+        ``mode="qheads"`` splits on Q-HEAD boundaries, letting a group straddle
+        engines. This is CORRECT, not a relaxation of a correctness rule: the
+        constraint the kernel imposes is per CALL (one call re-reads
+        ``K_DRAM_ADDR`` unshifted and builds ``V^T`` once, so its heads must
+        share a KV head), and an engine owning a partial group simply issues
+        more, smaller calls -- see :meth:`HeadShardContext.call_runs`. K/V are
+        read-only, so two engines reading one KV plane never conflict.
+
+        The cost is a duplicated ``V^T`` per straddled group: a
+        [head_dim, seq_len] transpose against a head whose real work is two
+        seq_len**2 * head_dim matmuls, i.e. sub-1% at typical shapes. Use
+        ``"qheads"`` when ``H // gqa_ratio < num_engines`` would otherwise
+        refuse to shard at all (heavily-GQA models: 16 Q heads over 2 KV heads
+        gives only 2 groups), and ``"groups"`` -- the tidier default -- when
+        there are enough groups to go around.
         """
         n = self.num_engines
         assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
         assert H % gqa_ratio == 0, (
             f"split_heads: H={H} is not a multiple of gqa_ratio={gqa_ratio}")
+        assert mode in ("groups", "qheads"), f"unknown head split mode {mode!r}"
         if n == 1:
             return [(0, H)]
+
+        if mode == "qheads":
+            assert H >= n, (
+                f"split_heads(mode='qheads'): H={H} head(s) is fewer than "
+                f"num_engines={n}; there is nothing left to split.")
+            base, rem = divmod(H, n)
+            counts = [base + (1 if i < rem else 0) for i in range(n)]
+            offsets = [sum(counts[:i]) for i in range(n)]
+            return list(zip(offsets, counts))
+
         groups = H // gqa_ratio
         assert groups >= n, (
             f"split_heads: H={H} is only {groups} KV group(s) of {gqa_ratio} "
-            f"head(s), too few for num_engines={n}. Shard a different axis, or "
-            f"run attention on the primary alone.")
+            f"head(s), too few for num_engines={n}. Pass mode='qheads' to split "
+            f"within groups (costs a duplicated V^T per straddled group), shard "
+            f"a different axis, or run attention on the primary alone.")
         base, rem = divmod(groups, n)
         counts = [gqa_ratio * (base + (1 if i < rem else 0)) for i in range(n)]
         offsets = [sum(counts[:i]) for i in range(n)]
@@ -945,11 +990,12 @@ class MultiEngineScheduler:
 
     def begin_head_sharded(self, H: int, seq_len: int, head_dim: int,
                            gqa_ratio: int = 1,
-                           elem_bytes: int = 2) -> list[HeadShardContext]:
+                           elem_bytes: int = 2,
+                           mode: str = "groups") -> list[HeadShardContext]:
         """Rendezvous, then open a head-sharded region, one context per engine."""
         assert self._program_open, "begin_head_sharded() without begin_program()"
         assert not self._in_region, "nested sharded regions are not supported"
-        split = self.split_heads(H, gqa_ratio)
+        split = self.split_heads(H, gqa_ratio, mode=mode)
         self.barrier()
         self._in_region = True
         self._region_count += 1
@@ -960,7 +1006,7 @@ class MultiEngineScheduler:
     def head_sharded_region(self, H: int, seq_len: int, head_dim: int,
                             body: Callable[[HeadShardContext], None],
                             gqa_ratio: int = 1, elem_bytes: int = 2,
-                            join: bool = True) -> None:
+                            mode: str = "groups", join: bool = True) -> None:
         """Replay ``body(ctx)`` once per engine over a head split.
 
         ``join`` defaults to True and should almost always stay there: the next
@@ -969,7 +1015,7 @@ class MultiEngineScheduler:
         cross-shard read the exit barrier exists for.
         """
         contexts = self.begin_head_sharded(H, seq_len, head_dim, gqa_ratio,
-                                           elem_bytes)
+                                           elem_bytes, mode=mode)
         for ctx in contexts:
             body(ctx)
         self.end_sharded(join=join)
@@ -982,6 +1028,7 @@ class MultiEngineScheduler:
                                bias_addr: Optional[int] = None,
                                bias_per_head: bool = False,
                                scratch_name: str = "attn_scratch",
+                               mode: str = "groups",
                                kernel: Optional[Callable] = None,
                                elem_bytes: int = 2,
                                join: bool = True) -> None:
@@ -1024,22 +1071,25 @@ class MultiEngineScheduler:
             # gqa_ratio == 1 (MHA) this is one call per head, which is simply
             # what the kernel's batching means for MHA -- there is nothing to
             # batch when no two Q heads share a K/V.
-            for g in range(ctx.groups):
+            # call_runs() yields maximal spans of Q heads sharing one KV head --
+            # one group per run when the engine owns whole groups, ragged short
+            # runs at the ends when a group straddles engines (mode="qheads").
+            for q_head, kv_head, n_q in ctx.call_runs():
                 kernel(ctx.ue, head_dim, seq_len,
-                       Q_DRAM_ADDR=ctx.q_addr(Q_addr, group=g),
-                       K_DRAM_ADDR=ctx.kv_addr(K_addr, group=g),
-                       V_DRAM_ADDR=ctx.kv_addr(V_addr, group=g),
-                       OUTPUT_DRAM_ADDR=ctx.out_addr(OUT_addr, group=g),
+                       Q_DRAM_ADDR=ctx.q_addr(Q_addr, head=q_head),
+                       K_DRAM_ADDR=ctx.kv_addr(K_addr, kv_head=kv_head),
+                       V_DRAM_ADDR=ctx.kv_addr(V_addr, kv_head=kv_head),
+                       OUTPUT_DRAM_ADDR=ctx.out_addr(OUT_addr, head=q_head),
                        SCRATCH_DRAM_ADDR=ctx.scratch(scratch_name),
                        IDENTITY_DRAM_ADDR=IDENTITY_addr,   # shared, read-only
                        BIAS_DRAM_ADDR=ctx.bias_addr(bias_addr,
                                                     per_head=bias_per_head,
-                                                    group=g),
-                       num_q_heads=ctx.gqa_ratio)
+                                                    head=q_head),
+                       num_q_heads=n_q)
 
         self.head_sharded_region(H, seq_len, head_dim, body,
                                  gqa_ratio=gqa_ratio, elem_bytes=elem_bytes,
-                                 join=join)
+                                 mode=mode, join=join)
 
     def alloc_col_output(self, name: str, M: int, N: int, elem_bytes: int = 2) -> list[int]:
         """Allocate one contiguous ``[M, cols]`` output buffer PER ENGINE.
