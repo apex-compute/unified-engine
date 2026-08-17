@@ -33,7 +33,7 @@ from user_dma_core import (
     DMA_DEVICE_H2C, DMA_DEVICE_C2H, TYPE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, UE_ARGMAX1_INDEX,
     URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     DRAM_INSTRUCTION_ADDR, MEMCPY_TYPE, INSTRUCTION_SIZE_BYTES,
-    UnifiedEngine, ue_35bit_addr_shifter,
+    UnifiedEngine, ue_35bit_addr_shifter, UE_MODE,
 )
 from nn_lib import (
     smart_bf16_permute_core,
@@ -1045,6 +1045,80 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         sin_ = freqs.sin().to(torch.bfloat16)
         return torch.cat([cos_, cos_, -sin_, sin_], dim=1)
 
+    def _rope_tiled_tables(self, positions, n_tiles):
+        """Head-major (n_tiles*npos, head_dim) cos/sin operands for the MATMUL RoPE.
+
+        The packed table above is (npos, 2*Dh) with a 4*Dh-byte row pitch, which
+        ``eltwise_core_dram`` cannot consume -- it wants a dense (M, Dh) operand
+        with a 2*Dh-byte pitch. So split the packed table's two halves into their
+        own dense buffers and TILE each ``n_tiles`` times, because every RoPE'd
+        buffer in this model is head-major: row ``h*npos + p`` is head ``h`` at
+        position ``p``, so the position table repeats once per head.
+
+        No new host math: the packed table's first half is already [cos|cos] and
+        its second half is already [-sin|sin], which is exactly the signed operand
+        the swap-permutation formulation wants (see :meth:`_rope_matmul`).
+        """
+        Dh = self.HEAD_DIM
+        packed = self._rope_table(positions)
+        cos_tiled = packed[:, :Dh].repeat(n_tiles, 1).contiguous()
+        sin_tiled = packed[:, Dh:].repeat(n_tiles, 1).contiguous()
+        return cos_tiled, sin_tiled
+
+    def _rope_swap_matrix(self):
+        """Static (Dh, Dh) swap permutation P with P[n, (n+Dh/2) % Dh] = 1, so
+        ``X @ P == rotate_half'(X) == [x_hi | x_lo]`` (the UNSIGNED swap -- the
+        sign lives in the pre-negated sin table). P is symmetric, so the
+        accelerator's implicit A@Bᵀ needs no separate transpose."""
+        Dh = self.HEAD_DIM
+        half = Dh // 2
+        P = torch.zeros(Dh, Dh, dtype=torch.bfloat16)
+        for n in range(Dh):
+            P[n, (n + half) % Dh] = 1.0
+        return P
+
+    def _rope_matmul(self, M, src_dram, out_dram, cos_tiled, sin_tiled, rot_dram,
+                     gpr_M_reg=None, ue=None):
+        """RoPE as one batched matmul + three full-width elementwise passes.
+
+        The per-row cores (``rope_hf_core_dram`` / ``_gqa``) are DMA-LATENCY bound:
+        every token costs a handful of 512-byte transfers, and this model calls them
+        18x in the prefix and 18x10 in the denoise loop. This reformulation issues
+        four large ops over all ``M`` rows instead::
+
+            rot = X @ P_swap        # rotate_half via the static swap permutation
+            rot = rot * sin_tiled   # signed sin (lower half pre-negated on host)
+            out = X   * cos_tiled
+            out = out + rot         # == X*cos + rotate_half(X)*sin
+
+        The matmul costs M*Dh*Dh MACs, ~0.5% of a prefix layer -- the trade is
+        deliberate: FLOPs are free here, DMA round-trips are not.
+
+        Stays OUT-OF-PLACE (``src_dram`` is never written) both because in==out is a
+        known DMA hazard on this hardware and because the debug snapshots downstream
+        read the un-rotated projection. Every operand is row-indexed, so this is
+        row-independent over M and legal inside a sharded region -- pass an ``ue``
+        and pre-offset addresses to give an engine its own row range.
+        """
+        D = self.HEAD_DIM
+        eng = ue or self
+        flops = 0
+        eng.matmat_mul_core(M=M, K=D, N=D, A_DRAM_ADDR=src_dram,
+                            B_DRAM_ADDR=self.ROPE_P_SWAP_ADDR,
+                            OUTPUT_DRAM_ADDR=rot_dram,
+                            is_B_quantized=False, gpr_M_reg=gpr_M_reg)
+        flops += M * D * D * 2
+        flops += eng.eltwise_core_dram(M=M, N=D, dram_a=rot_dram, dram_b=sin_tiled,
+                                       dram_out=rot_dram, mode=UE_MODE.ELTWISE_MUL,
+                                       gpr_M_reg=gpr_M_reg)
+        flops += eng.eltwise_core_dram(M=M, N=D, dram_a=src_dram, dram_b=cos_tiled,
+                                       dram_out=out_dram, mode=UE_MODE.ELTWISE_MUL,
+                                       gpr_M_reg=gpr_M_reg)
+        flops += eng.eltwise_core_dram(M=M, N=D, dram_a=out_dram, dram_b=rot_dram,
+                                       dram_out=out_dram, mode=UE_MODE.ELTWISE_ADD,
+                                       gpr_M_reg=gpr_M_reg)
+        return flops
+
     def _rope_init(self, seq_len=None, valid_len=None):
         """Build BOTH rope tables (prefix + action-expert suffix) once and cache
         their DRAM addrs. Idempotent -- callable from compile_prefix and
@@ -1062,6 +1136,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         pos_suffix = n_valid + torch.arange(self.AE_ACTION_HORIZON_PADDED, dtype=torch.float32)
         self.AE_ROPE_ADDR = store_weight(self, self._rope_table(pos_suffix))
         self.ROPE_SIN_OFFSET = self.HEAD_DIM * 2  # bytes; cos at base, sin at base+offset
+
+        # ---- matmul-RoPE operands (see _rope_matmul) --------------------------
+        # Both tiled tables are head-major and sized for the WIDEST consumer of
+        # their position set; the narrower consumers are a PREFIX of the same
+        # buffer, because tiling repeats the whole position block per head:
+        #   rows [0, npos)  == exactly one head's worth == the single-head MQA K.
+        # So prefix K reuses PREFIX_ROPE_*_TILED at offset 0, and the AE's suffix
+        # K reuses AE_ROPE_*_TILED at offset 0. No separate untiled buffers.
+        self.ROPE_P_SWAP_ADDR = store_weight(self, self._rope_swap_matrix())
+        cos_p, sin_p = self._rope_tiled_tables(pos_prefix, self.NUM_HEADS)
+        self.PREFIX_ROPE_COS_TILED = store_weight(self, cos_p)
+        self.PREFIX_ROPE_SIN_TILED = store_weight(self, sin_p)
+        cos_s, sin_s = self._rope_tiled_tables(pos_suffix, self.AE_HEADS)
+        self.AE_ROPE_COS_TILED = store_weight(self, cos_s)
+        self.AE_ROPE_SIN_TILED = store_weight(self, sin_s)
 
     def _build_ae_suffix_bias(self, P, Tkv, S, valid_len=None):
         """The action expert's (Tkv, Tkv) additive suffix attention bias.
@@ -1146,15 +1235,25 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # The middle row was this function's first version, which refreshed
             # AE_ROPE_ADDR and left PREFIX_ROPE_ADDR frozen (_rope_init early-returns
             # on PREFIX_ROPE_ADDR, so nothing else ever rebuilds it).
+            # The TILED cos/sin operands (matmul RoPE) are derived from the exact
+            # same positions and must be refreshed in lockstep -- they are what the
+            # layer loops actually read now, so a stale tile is the same one-sided
+            # position shift catalogued above, just in a different buffer.
             if getattr(self, "PREFIX_ROPE_ADDR", None) is not None:
                 tbl_p = self._rope_table(pos_prefix).contiguous()
                 self.dma_write(DMA_DEVICE_H2C, self.PREFIX_ROPE_ADDR,
                                tbl_p, tbl_p.numel() * 2)
+                cos_p, sin_p = self._rope_tiled_tables(pos_prefix, self.NUM_HEADS)
+                self.dma_write(DMA_DEVICE_H2C, self.PREFIX_ROPE_COS_TILED, cos_p, cos_p.numel() * 2)
+                self.dma_write(DMA_DEVICE_H2C, self.PREFIX_ROPE_SIN_TILED, sin_p, sin_p.numel() * 2)
             if getattr(self, "AE_ROPE_ADDR", None) is not None:
                 pos_suffix = n_valid + torch.arange(self.AE_ACTION_HORIZON_PADDED,
                                                     dtype=torch.float32)
                 tbl_s = self._rope_table(pos_suffix).contiguous()
                 self.dma_write(DMA_DEVICE_H2C, self.AE_ROPE_ADDR, tbl_s, tbl_s.numel() * 2)
+                cos_s, sin_s = self._rope_tiled_tables(pos_suffix, self.AE_HEADS)
+                self.dma_write(DMA_DEVICE_H2C, self.AE_ROPE_COS_TILED, cos_s, cos_s.numel() * 2)
+                self.dma_write(DMA_DEVICE_H2C, self.AE_ROPE_SIN_TILED, sin_s, sin_s.numel() * 2)
             print(f"  [valid_len] rope tables refreshed: valid_len={valid_len} "
                   f"-> n_valid={n_valid} (was {prev})")
         # The LIVE suffix mask is AE_UATTN_BIAS_DRAM, not AE_BIAS_DRAM. The action
@@ -1211,8 +1310,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # valid_len MUST be passed: it excludes the padded prompt rows from the
         # position count, which is what the suffix rope table is offset by.
         self._rope_init(S, valid_len)
+        # NOTE: LAYER0_Q_ROPE_DRAM now holds the HEAD-MAJOR, PRE-rotation Q --
+        # see the RoPE block in the layer loop for why permute moved ahead of RoPE.
         self.LAYER0_Q_ROPE_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(S * KV * bpe)
+        # rotate_half scratch for the matmul RoPE (_rope_matmul). Sized for the
+        # widest consumer (all NH heads of Q, head-major); the single-head MQA K
+        # rope reuses its first S*D elements, and the two never overlap in time.
+        self.PREFIX_ROPE_ROT_DRAM = self.allocate_tensor_dram(S * H * bpe)
         # Per-layer snapshots (LAYER0_LAYER_OUT_DRAM itself is reused/overwritten
         # every layer) so a post-run readback can CPU-vs-HW SNR-check every
         # layer's output at once -- same pattern as VIS_LAYER_SNAPSHOT_DRAM.
@@ -1474,6 +1579,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # count instead of static unrolling.
         prefix_S_reg = ue.alloc_isa_reg()
         ue.generate_instruction_add_set(prefix_S_reg, S)
+        # Head-major Q row count for the matmul RoPE: after the permute, Q is one
+        # (NH*S, D) batch rather than S rows of NH*D, so its runtime M differs from
+        # every other op in the layer and needs its own register.
+        prefix_NHS_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(prefix_NHS_reg, self.NUM_HEADS * S)
 
         # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds the
         # sqrt(N) RSQRT scale implicitly -- the dynamic core reads it from a runtime
@@ -1530,34 +1640,49 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # is head-sharded below (rendezvous #A/#B); the attn-output
                 # permute after it returns to the primary.
                 if is_primary:
-                    # 2b. RoPE on Q and K (Gemma rotates BOTH, every layer -- openpi
-                    # gemma.py:203/206). Positions come from cumsum(mask)-1, so the
-                    # masked image slot freezes the counter (see _rope_init). Q is
-                    # (S, NH*D) -> gqa variant (one rope row broadcast over NH heads);
-                    # K is a single MQA head, (S, D) -> plain variant.
-                    ue.rope_hf_core_dram_gqa(
-                        M=S, group_size=NH, N=D,
-                        input_dram_addr=self.LAYER0_Q_DRAM, output_dram_addr=self.LAYER0_Q_ROPE_DRAM,
-                        cos_dram_addr=self.PREFIX_ROPE_ADDR,
-                        sin_dram_addr=self.PREFIX_ROPE_ADDR + self.ROPE_SIN_OFFSET,
-                        gpr_M_reg=prefix_S_reg)
-                    ue.rope_hf_core_dram(
-                        M=S, N=D,
-                        input_dram_addr=self.LAYER0_K_PROJ_DRAM, output_dram_addr=self.LAYER0_K_ROPE_DRAM,
-                        cos_dram_addr=self.PREFIX_ROPE_ADDR,
-                        sin_dram_addr=self.PREFIX_ROPE_ADDR + self.ROPE_SIN_OFFSET,
-                        gpr_M_reg=prefix_S_reg)
+                    # 2b/3. PERMUTE-THEN-RoPE on Q, and RoPE on K (Gemma rotates
+                    # BOTH, every layer -- openpi gemma.py:203/206). Positions come
+                    # from cumsum(mask)-1, so the masked image slot freezes the
+                    # counter (see _rope_init).
+                    #
+                    # THE ORDER SWAP: this used to be gqa-RoPE on the interleaved
+                    # (S, NH*D) Q, then permute to (NH, S, D). RoPE is applied
+                    # per (token, head) independently and the permute is a pure
+                    # gather, so the two COMMUTE -- LAYER0_Q_PERM_DRAM ends up
+                    # bit-identical either way. Permuting first is what makes the
+                    # matmul RoPE usable: head-major Q is a plain (NH*S, D) batch
+                    # whose row h*S+s matches the head-major tiled cos/sin table,
+                    # whereas the interleaved layout would need a block-diagonal
+                    # (NH*D, NH*D) swap matrix at NH times the MACs. It also
+                    # retires the gqa RoPE variant and the separate permute pass.
+                    #
+                    # Consequence: LAYER0_Q_ROPE_DRAM now holds head-major
+                    # PRE-rotation Q, and is snapshotted under the "q_rope" key as
+                    # such (the golden compare knows -- see compare_prefix_golden).
+                    smart_bf16_permute_core(ue, (S, NH, D), [1, 0, 2],
+                                             self.LAYER0_Q_DRAM, self.LAYER0_Q_ROPE_DRAM)
+                    self._rope_matmul(M=NH * S,
+                                      src_dram=self.LAYER0_Q_ROPE_DRAM,
+                                      out_dram=self.LAYER0_Q_PERM_DRAM,
+                                      cos_tiled=self.PREFIX_ROPE_COS_TILED,
+                                      sin_tiled=self.PREFIX_ROPE_SIN_TILED,
+                                      rot_dram=self.PREFIX_ROPE_ROT_DRAM,
+                                      gpr_M_reg=prefix_NHS_reg, ue=ue)
+                    # K is a single MQA head, already (S, D) head-major -- so it is
+                    # the FIRST head-tile of the same tiled table, at offset 0.
+                    self._rope_matmul(M=S,
+                                      src_dram=self.LAYER0_K_PROJ_DRAM,
+                                      out_dram=self.LAYER0_K_ROPE_DRAM,
+                                      cos_tiled=self.PREFIX_ROPE_COS_TILED,
+                                      sin_tiled=self.PREFIX_ROPE_SIN_TILED,
+                                      rot_dram=self.PREFIX_ROPE_ROT_DRAM,
+                                      gpr_M_reg=prefix_S_reg, ue=ue)
                     self._debug_op(f"layer{layer_idx}_q_rope", self.LAYER0_Q_ROPE_DRAM, S * H, shape=(S, H), ue=ue)
                     self._debug_op(f"layer{layer_idx}_k_rope", self.LAYER0_K_ROPE_DRAM, S * KV, shape=(S, KV), ue=ue)
                     if layer_idx == 0 and self._prefix_snap:
                         self._dram_copy(S * H * bpe, self.LAYER0_Q_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_rope"])
                         self._dram_copy(S * KV * bpe, self.LAYER0_K_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_rope"])
 
-                    # 3. permute Q from (seq, heads, head_dim) -> (heads, seq, head_dim); K/V
-                    # already (seq, head_dim) since num_kv_heads=1 == the layout
-                    # prefill_flash_attention_core expects for a single KV head.
-                    smart_bf16_permute_core(ue, (S, NH, D), [1, 0, 2],
-                                             self.LAYER0_Q_ROPE_DRAM, self.LAYER0_Q_PERM_DRAM)
                     self._debug_op(f"layer{layer_idx}_q_permute", self.LAYER0_Q_PERM_DRAM, S * H, shape=(S, H), ue=ue)
                     if layer_idx == 0 and self._prefix_snap:
                         self._dram_copy(S * H * bpe, self.LAYER0_Q_PERM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_permute"])
@@ -1694,6 +1819,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             ue.release_isa_reg()  # prefix_R_reg
         ue.release_isa_reg()  # prefix_sqrt_N_reg
         ue.release_isa_reg()  # prefix_N_reg
+        ue.release_isa_reg()  # prefix_NHS_reg
         ue.release_isa_reg()  # prefix_S_reg
 
 
@@ -3022,6 +3148,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, self.AE_Q_ROPE_DRAM, zero_ae_q.contiguous(),
                        self.AE_HEADS * Tkv * D * bpe)
         self.AE_K_SUF_DRAM = self.allocate_tensor_dram(S * D * bpe)
+        # rotate_half scratch for the matmul RoPE (_rope_matmul), head-major over
+        # all AE_HEADS so each engine writes its own head range's disjoint slice.
+        # The single-head suffix K rope reuses its first S*D elements: K is rotated
+        # before Q in every layer body, so the two never overlap in time.
+        self.AE_ROPE_ROT_DRAM = self.allocate_tensor_dram(self.AE_HEADS * S * D * bpe)
         self.AE_ATTN_OUT_DRAM = self.allocate_tensor_dram(self.AE_HEADS * Tkv * D * bpe)
         self.AE_ATTN_SCRATCH_DRAM = self.allocate_tensor_dram((D * Tkv + max(D, 64) * Tkv) * bpe)
         self.AE_ATTN_RESULT_DRAM = self.allocate_tensor_dram(S * H * bpe)  # un-headed (S,H) post-o-proj input
@@ -3364,13 +3495,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             for h in range(h0, h0 + nh):
                 self._ae_matmul(M, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
                                  self.AE_Q_DRAM + h * M * D * bpe, gpr_M_reg=mreg, ue=raw)
-                raw.rope_hf_core_dram(
-                    M=M, N=D,
-                    input_dram_addr=self.AE_Q_DRAM + h * M * D * bpe,
-                    output_dram_addr=self.AE_Q_ROPE_DRAM + h * M * D * bpe,
-                    cos_dram_addr=self.AE_ROPE_ADDR,
-                    sin_dram_addr=self.AE_ROPE_ADDR + self.ROPE_SIN_OFFSET,
-                    gpr_M_reg=mreg)
+            # ONE matmul RoPE for this engine's whole head range instead of nh
+            # per-head calls: heads are contiguous (M, D) blocks at h*M*D, so
+            # heads [h0, h0+nh) are the row range [h0*M, (h0+nh)*M) of one
+            # (NH*M, D) batch -- the same address arithmetic the attention shard
+            # below uses. The tiled cos/sin tables are head-major over exactly
+            # this layout, so engine i just offsets them by h0*M rows too, and
+            # every engine writes a disjoint slice of the shared ROT scratch.
+            row0 = h0 * M
+            self._rope_matmul(M=nh * M,
+                              src_dram=self.AE_Q_DRAM + row0 * D * bpe,
+                              out_dram=self.AE_Q_ROPE_DRAM + row0 * D * bpe,
+                              cos_tiled=self.AE_ROPE_COS_TILED + row0 * D * bpe,
+                              sin_tiled=self.AE_ROPE_SIN_TILED + row0 * D * bpe,
+                              rot_dram=self.AE_ROPE_ROT_DRAM + row0 * D * bpe,
+                              gpr_M_reg=self._ae_rope_M_regs[i], ue=raw)
 
         # join=True, and it is load-bearing: the very next op is the primary's
         # attention over the FULL NH*M batch, which reads rows every worker wrote.
@@ -3787,12 +3926,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         #    as the prefix. V is never rotated, so it projects in directly.
         self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["k_scale"], la["k_data"],
                          self.AE_K_SUF_DRAM, gpr_M_reg=gpr_M_reg)
-        self.rope_hf_core_dram(
-            M=S, N=D,
-            input_dram_addr=self.AE_K_SUF_DRAM, output_dram_addr=k_combined + P * D * 2,
-            cos_dram_addr=self.AE_ROPE_ADDR,
-            sin_dram_addr=self.AE_ROPE_ADDR + self.ROPE_SIN_OFFSET,
-            gpr_M_reg=gpr_M_reg)
+        # Single MQA head, already (S, D) head-major -- the FIRST head-tile of the
+        # tiled suffix table, at offset 0. Writes straight into the combined
+        # buffer's suffix rows, so the RoPE stays out-of-place and costs no copy.
+        self._rope_matmul(M=S,
+                          src_dram=self.AE_K_SUF_DRAM,
+                          out_dram=k_combined + P * D * 2,
+                          cos_tiled=self.AE_ROPE_COS_TILED,
+                          sin_tiled=self.AE_ROPE_SIN_TILED,
+                          rot_dram=self.AE_ROPE_ROT_DRAM,
+                          gpr_M_reg=gpr_M_reg)
         self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["v_scale"], la["v_data"],
                          v_combined + P * D * 2, gpr_M_reg=gpr_M_reg)
         self._debug_op(f"{_pfx}_kv_proj", k_combined + P * D * 2, S * D, shape=(S, D))
@@ -3815,13 +3958,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         for h in range(self.AE_HEADS if not _proj_sharded else 0):
             self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
                              self.AE_Q_DRAM + h * S * D * 2, gpr_M_reg=gpr_M_reg)
-            self.rope_hf_core_dram(
-                M=S, N=D,
-                input_dram_addr=self.AE_Q_DRAM + h * S * D * 2,
-                output_dram_addr=self.AE_Q_ROPE_DRAM + h * S * D * 2,
-                cos_dram_addr=self.AE_ROPE_ADDR,
-                sin_dram_addr=self.AE_ROPE_ADDR + self.ROPE_SIN_OFFSET,
-                gpr_M_reg=gpr_M_reg)
+        if not _proj_sharded:
+            # All AE_HEADS at once: head h's queries are the contiguous (S, D)
+            # block at h*S*D, so the whole buffer is one (AE_HEADS*S, D) batch and
+            # the tiled cos/sin tables are laid out over exactly that. One RoPE
+            # call per layer instead of AE_HEADS of them.
+            self._rope_matmul(M=self.AE_HEADS * S,
+                              src_dram=self.AE_Q_DRAM,
+                              out_dram=self.AE_Q_ROPE_DRAM,
+                              cos_tiled=self.AE_ROPE_COS_TILED,
+                              sin_tiled=self.AE_ROPE_SIN_TILED,
+                              rot_dram=self.AE_ROPE_ROT_DRAM,
+                              gpr_M_reg=self._ae_rope_M_regs[0])
         self._debug_op(f"{_pfx}_q_proj", self.AE_Q_DRAM, S * D, shape=(S, D))
         self._debug_op(f"{_pfx}_q_rope", self.AE_Q_ROPE_DRAM, S * D, shape=(S, D))
         if getattr(self, "DENOISE_STEP0_PROBE", False) and step == 0 and layer_idx == 0:
@@ -4037,6 +4185,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             w.generate_instruction_add_set(r, S)
             ae_S_regs.append(r)
 
+        # M = nh*S for the matmul RoPE, which covers an engine's WHOLE head range
+        # in one call rather than S rows at a time -- a different trip count from
+        # ae_S_regs, so it needs its own per-engine register (same reasoning: a
+        # worker's register indices are its own).
+        ne_ae = sched.num_engines if sched is not None else 1
+        nh_per = (self.AE_HEADS // ne_ae) if self._ae_attn_shardable(sched) else self.AE_HEADS
+        self._ae_rope_M_regs = []
+        for eng in ([self] + list(sched.workers if sched is not None else [])):
+            r = eng.alloc_isa_reg()
+            eng.generate_instruction_add_set(r, nh_per * S)
+            self._ae_rope_M_regs.append(r)
+
         # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds sqrt(N)
         # implicitly -- the dynamic core reads N and bf19(sqrt(N)) from runtime GPRs.
         # Prime them once here (N = AE_HIDDEN) and thread them through the AdaRMSNorm
@@ -4185,6 +4345,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         self.release_isa_reg()  # ae_sqrt_N_reg
         self.release_isa_reg()  # ae_N_reg
+        self.release_isa_reg()  # _ae_rope_M_regs[0]
         self.release_isa_reg()  # ae_S_reg
         print("compile_denoise_loop done: 10-step Euler action-expert flow-matching stack compiled "
               "(statically unrolled, inline unified attention)")
@@ -4887,8 +5048,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         q_rope = _ref.apply_rope(q_pre, pos)                          # (1, T, 8, 256)
         k_rope = _ref.apply_rope(k_pre, pos)                          # (1, T, 1, 256)
         if "q_rope" in snap:
-            _report("q_rope", _hw("q_rope", S * H, (S, H))[:valid_len],
-                    q_rope[0].reshape(-1, NH * D))
+            # The "q_rope" SNAPSHOT is no longer roped Q. compile_prefix permutes
+            # BEFORE rotating (the matmul RoPE wants a head-major (NH*S, D) batch),
+            # so LAYER0_Q_ROPE_DRAM is the head-major PRE-rotation Q and its true
+            # layout is (NH, S, D), not (S, H). Roped Q is still fully checked one
+            # step below, as q_permute. Compare this against the permuted q_pre so
+            # the checkpoint still isolates the permute from the rotation.
+            _report("q_perm_preroped",
+                    _hw("q_rope", S * H, (NH, S, D))[:, :valid_len, :],
+                    q_pre[0].permute(1, 0, 2))
             _report("k_rope", _hw("k_rope", S * D, (S, D))[:valid_len],
                     k_rope[0].reshape(-1, D))
         if os.environ.get("PI05_DUMP_L0"):
@@ -4902,7 +5070,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                      cpu_k=k_pre[0].reshape(-1, D).float().numpy(),
                      hw_v=_hw("v_proj", S * D, (S, D))[:valid_len].numpy(),
                      cpu_v=v_pre[0].reshape(-1, D).float().numpy(),
-                     hw_qrope=_hw("q_rope", S * H, (S, H))[:valid_len].numpy(),
+                     # hw_qrope is head-major PRE-rotation Q now (see above); the
+                     # roped comparison lives in hw/cpu q_permute.
+                     hw_qperm_preroped=_hw("q_rope", S * H, (NH, S, D))[:, :valid_len, :].numpy(),
+                     cpu_qperm_preroped=q_pre[0].permute(1, 0, 2).float().numpy(),
                      hw_krope=_hw("k_rope", S * D, (S, D))[:valid_len].numpy(),
                      cpu_qrope=q_rope[0].reshape(-1, NH * D).float().numpy(),
                      cpu_krope=k_rope[0].reshape(-1, D).float().numpy(),
