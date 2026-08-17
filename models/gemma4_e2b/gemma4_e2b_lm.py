@@ -1653,6 +1653,7 @@ class Gemma4LMMixin:
         _dec_timer = time.perf_counter()
         _first_tok_dt = None   # wall-clock of the 1st decoded token → peak tok/s
         _decoded_n = 0         # number of decode steps (for average tok/s)
+        _decoded_ids = []      # generated token ids (for the run-summary decoded text)
         _use_status = sys.stdout.isatty()
         def _status_setup():
             rows = shutil.get_terminal_size().lines
@@ -1729,6 +1730,7 @@ class Gemma4LMMixin:
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
+            _decoded_ids.append(token_id)
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
@@ -1741,4 +1743,15 @@ class Gemma4LMMixin:
         _avg = (_decoded_n / _elapsed) if _elapsed > 0 else 0.0
         print(f"\nDecode speed: peak (1st token) {_peak:.2f} tok/s, "
               f"average {_avg:.2f} tok/s  ({_decoded_n} tokens in {_elapsed:.2f}s)")
+        # Stash decode metrics for the run-summary writer (write_run_summary).
+        self._decode_peak_toks = _peak
+        self._decode_avg_toks = _avg
+        self._decode_generated_n = _decoded_n
+        self._decode_total_flop_rate = total_flop_rate
+        self._decode_hw_latency_us = total_latency
+        self._decoded_token_ids = list(_decoded_ids)
+        try:
+            self._decoded_text = self.tokenizer.decode(_decoded_ids, skip_special_tokens=False)
+        except Exception:
+            self._decoded_text = None
         return self.seq_len, total_latency, total_flop_rate

@@ -474,7 +474,8 @@ class Gemma4VisionMixin:
             self._get_program_section(f"vision_worker{i}", profile)[0]
             for i in range(1, self.multi_core)
         ]
-        if (_vmeta is not None
+        if (getattr(self, "bin_reuse", False)
+                and _vmeta is not None
                 and _vmeta.get("vision_kernel") == self.vision_kernel
                 and _vmeta.get("multi_core", 1) == self.multi_core
                 and all(meta is not None for meta in _worker_metas)):
@@ -482,7 +483,9 @@ class Gemma4VisionMixin:
             bin_path, _ = self._program_image_paths(profile)
             print(f"  [Vision] reusing existing instruction image at {bin_path}", flush=True)
             print(f"    delete {bin_path} (or make clean) to force recompile.", flush=True)
+            self._vision_compile_reused = True
             return
+        self._vision_compile_reused = False
         print(f"  [Vision] compiling patch embed + {L} vision layers one-shot"
               f" ({self.multi_core} engine(s); projection phases row-sharded)"
               f"{' (+profile checkpoints)' if profile else ''} ...", flush=True)
@@ -867,9 +870,14 @@ class Gemma4VisionMixin:
         # Report like the LM's program_execute: HW latency + FLOP rate.
         latency_us = self.report_latency_in_us()
         print(f"    Total program execution latency = {latency_us} us")
+        # Stash for the run-summary writer (write_run_summary).
+        self._vis_last_latency_us = latency_us
+        self._vis_last_total_flops = meta.get("total_flops")
+        self._vis_last_gflops = None
         _flops = meta.get("total_flops")
         if _flops:
             gflops, _ = self.report_flop_rate_gflops(_flops)
+            self._vis_last_gflops = gflops
             print(f"Report FLOPS for program execution: {gflops:.2f} GFLOPS")
         print(f"Vision encoder execute done in {elapsed:.2f} seconds.", flush=True)
         return elapsed
@@ -919,6 +927,14 @@ class Gemma4VisionMixin:
         total_s = time.perf_counter() - host_t0
         print(f"[Vision] host encoder done: {image_features.shape[0]} soft tokens "
               f"in {total_s:.2f}s (model forward {forward_s:.2f}s).", flush=True)
+        # Stash for the run-summary writer (write_run_summary). Host vision runs
+        # no FPGA program, so there is no HW latency / GFLOPS to report.
+        self._vis_num_soft_tokens = int(image_features.shape[0])
+        self._vis_e2e_s = total_s
+        self._vis_device = "host"
+        self._vis_last_latency_us = None
+        self._vis_last_gflops = None
+        self._vis_last_total_flops = None
         return image_features, token_ids, mm_types
 
     def _run_vision_encoder_fpga(self, image_path: str, prompt: str, profile: bool = False):
@@ -1032,4 +1048,8 @@ class Gemma4VisionMixin:
             print(f"{'TOTAL':<38}{_tot:>9.2f}{100.0:>6.1f}%")
         print(f"[Vision] FPGA encoder done: {image_features.shape[0]} soft tokens "
               f"in {fpga_total_s:.2f}s total.", flush=True)
+        # Stash for the run-summary writer (write_run_summary).
+        self._vis_num_soft_tokens = int(image_features.shape[0])
+        self._vis_e2e_s = fpga_total_s
+        self._vis_device = "FPGA"
         return image_features, token_ids, mm_types

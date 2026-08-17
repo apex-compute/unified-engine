@@ -728,7 +728,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
-                 decode_kernel: str = "streaming", multi_core: int = 1):
+                 decode_kernel: str = "streaming", multi_core: int = 1,
+                 bin_reuse: bool = False):
         for stage, kernel in (("vision", vision_kernel), ("prefill", prefill_kernel),
                               ("decode", decode_kernel)):
             if kernel not in ("streaming", "matmatmul"):
@@ -754,6 +755,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
         self.multi_core = multi_core
+        # Program-image reuse: OFF by default (recompile programs.bin fresh every
+        # run). --bin-reuse opts into reusing a matching cached section instead.
+        self.bin_reuse = bin_reuse
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
@@ -852,6 +856,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
         self.dma_to_accelerator_memory(
             self._vis_identity_dram, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
+        # Snapshot the LM weight-DRAM high-water mark now, before any vision run
+        # advances the params cursor (its cursor isn't restored). Used by
+        # write_run_summary as the "total weight DRAM" figure (~1540.4 MB).
+        self._lm_weight_dram_bytes = self.get_params_dram_usage()
         if self.get_params_dram_addr() > self._tensor_dram_base:
             raise MemoryError(
                 f"Gemma4 weights overflow the 2-GB layout: "
@@ -1041,7 +1049,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self._get_program_section(f"prefill_worker{i}", profile)[0]
             for i in range(1, self.multi_core)
         ]
-        if (_lm_meta is not None
+        if (self.bin_reuse
+                and _lm_meta is not None
                 and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len
                 and _lm_meta.get("prefill_kernel") == self.prefill_kernel
                 and _lm_meta.get("decode_kernel") == self.decode_kernel
@@ -1053,7 +1062,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             bin_path, _ = self._program_image_paths(profile)
             print(f"[compile] reusing existing instruction image at {bin_path}")
             print(f"  delete {bin_path} (or make clean) to force recompile.")
+            self._lm_compile_reused = True
             return
+        self._lm_compile_reused = False
 
         print(f"[compile] building combined [prefill-template@{prefill_template_seq_len}, "
               f"kernel={self.prefill_kernel}][decoder, kernel={self.decode_kernel}] image...")
@@ -1185,6 +1196,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         latency_hw_prefill, _flop_rate_hw_prefill = self.run_prefill(
             prefill_program_addr, flops=meta["prefill_total_flops"])
         latency_prefill = time.perf_counter() - timer
+        # Stash prefill metrics for the run-summary writer (write_run_summary).
+        self._prefill_seq_len = self.seq_len
+        self._prefill_latency_hw_us = latency_hw_prefill
+        self._prefill_flop_rate_gflops = _flop_rate_hw_prefill
+        self._prefill_total_flops = meta["prefill_total_flops"]
+        self._prefill_e2e_s = latency_prefill
         print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
         timer = time.perf_counter()
@@ -1194,6 +1211,171 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         latency_decoder = time.perf_counter() - timer
         return (token_cnt_decoded, latency_hw_prefill, latency_hw_decoder,
                 flop_rate_hw_decoder, latency_prefill, latency_decoder)
+
+    def write_run_summary(self, out_path: str, args) -> str:
+        """Write a per-run Markdown summary (weights/program sizes, per-stage HW
+        latency + FLOPS, decode throughput, and the prompt/decoded text) built
+        from the metrics stashed on ``self`` during compile_gemma4 / run_gemma4
+        (and the vision encoder in --image mode). ``args`` is the parsed CLI
+        namespace. Returns the written path.
+
+        Everything read here is either an already-computed attribute or cheap
+        host-side bookkeeping (file sizes, program-section metadata, a register
+        read) — no FPGA program is launched, so calling this after a run is free.
+        """
+        clock_ns = self._clock_period_ns
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        cores = self.multi_core
+        peak_gflops = freq_mhz * 0.128 * cores   # freq(MHz) * 128 MAC/cyc/1000 * cores
+        try:
+            hw_version = self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF
+            hw_version_str = f"0x{hw_version:08x}"
+        except Exception as e:
+            hw_version_str = f"(read failed: {e})"
+
+        # Weights.
+        weight_bin_path = os.path.join(self.script_dir, self._weights_bin_rel)
+        weight_bin_size = os.path.getsize(weight_bin_path) if os.path.exists(weight_bin_path) else 0
+        total_weight_dram_mb = getattr(
+            self, "_lm_weight_dram_bytes", self.get_params_dram_usage()) / (1024 * 1024)
+
+        # Program image + per-section sizes.
+        sections, prog_data = self._read_program_sections()
+        prog_bin_path, _ = self._program_image_paths()
+        prog_bin_size = os.path.getsize(prog_bin_path) if os.path.exists(prog_bin_path) else 0
+        vision_sect = sections.get("vision")
+        lm_sect = sections.get("lm")
+        vision_prog_size = vision_sect["size"] if vision_sect else None
+        prefill_prog_size = lm_sect.get("prefill_program_size") if lm_sect else None
+        decoder_prog_size = lm_sect.get("decoder_program_size") if lm_sect else None
+
+        def _mb(n):
+            return f"{n / (1024 * 1024):.2f} MB" if n is not None else "n/a"
+        def _kb(n):
+            return f"{n / 1024:.1f} KB" if n is not None else "n/a"
+
+        is_image = bool(getattr(args, "image", None))
+        is_audio = bool(getattr(args, "audio", None))
+
+        lines = []
+        lines.append(f"# gemma4_e2b_test run summary")
+        lines.append("")
+        lines.append(f"- **HW version:** {hw_version_str}")
+        lines.append(f"- **--dev:** {args.dev}")
+        lines.append(f"- **--device:** {args.device}")
+        lines.append(f"- **Clock / frequency:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)")
+        lines.append(f"- **Cores (--multi-core):** {cores}")
+        lines.append(f"- **Peak throughput:** {peak_gflops:.2f} GFLOPS "
+                     f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))")
+        lines.append("")
+
+        # --- Weights ---------------------------------------------------------
+        lines.append(f"## Weights")
+        lines.append("")
+        lines.append(f"- **Weight bin:** `{os.path.basename(weight_bin_path)}` — {_mb(weight_bin_size)}")
+        lines.append(f"- **Total weight DRAM (quantized, on FPGA):** {total_weight_dram_mb:.1f} MB")
+        lines.append("")
+
+        # --- Program image ---------------------------------------------------
+        lines.append(f"## Program image (`{os.path.basename(prog_bin_path)}`)")
+        lines.append("")
+        lines.append(f"- **Total programs.bin size:** {_mb(prog_bin_size)}")
+        if is_image:
+            lines.append(f"- **Vision section:** {_mb(vision_prog_size)}")
+        lines.append(f"- **Prefill program:** {_kb(prefill_prog_size)}")
+        lines.append(f"- **Decoder program:** {_kb(decoder_prog_size)}")
+        reuse_bits = []
+        if is_image and getattr(self, "_vision_compile_reused", None) is not None:
+            reuse_bits.append(f"vision {'reused' if self._vision_compile_reused else 'fresh'}")
+        if getattr(self, "_lm_compile_reused", None) is not None:
+            reuse_bits.append(f"prefill/decode {'reused' if self._lm_compile_reused else 'fresh'}")
+        lines.append(f"- **Program image:** {', '.join(reuse_bits) if reuse_bits else 'n/a'}")
+        lines.append("")
+
+        # --- Vision ----------------------------------------------------------
+        if is_image:
+            vis_kernel = "host" if getattr(args, "vision_host", False) else self.vision_kernel
+            vis_lat_us = getattr(self, "_vis_last_latency_us", None)
+            vis_gflops = getattr(self, "_vis_last_gflops", None)
+            lines.append(f"## Vision")
+            lines.append("")
+            lines.append(f"- **Vision kernel:** {vis_kernel}")
+            lines.append(f"- **Vision tokens (soft tokens):** {getattr(self, '_vis_num_soft_tokens', 'n/a')}")
+            if vis_lat_us is not None:
+                lines.append(f"- **Vision FPGA run time (HW latency):** {vis_lat_us / 1e3:.2f} ms "
+                             f"({vis_lat_us:.0f} us)")
+            else:
+                lines.append(f"- **Vision FPGA run time (HW latency):** n/a (host vision)")
+            if vis_gflops is not None:
+                lines.append(f"- **Vision reported FLOPS:** {vis_gflops:.2f} GFLOPS")
+            else:
+                lines.append(f"- **Vision reported FLOPS:** n/a (host vision)")
+            _vis_e2e = getattr(self, "_vis_e2e_s", None)
+            lines.append(f"- **Vision end-to-end (CPU timer):** "
+                         f"{_vis_e2e:.2f} s" if _vis_e2e is not None else
+                         "- **Vision end-to-end (CPU timer):** n/a")
+            lines.append("")
+
+        # --- Prefill ---------------------------------------------------------
+        pf_seq = getattr(self, "_prefill_seq_len", None)
+        pf_lat_us = getattr(self, "_prefill_latency_hw_us", None)
+        pf_gflops = getattr(self, "_prefill_flop_rate_gflops", None)
+        pf_e2e = getattr(self, "_prefill_e2e_s", None)
+        lines.append(f"## Prefill")
+        lines.append("")
+        lines.append(f"- **Prefill seq_len:** {pf_seq if pf_seq is not None else 'n/a'}")
+        if pf_lat_us is not None:
+            lines.append(f"- **Prefill FPGA run time (HW latency):** {pf_lat_us / 1e3:.2f} ms "
+                         f"({pf_lat_us:.0f} us)")
+        if pf_gflops is not None:
+            lines.append(f"- **Prefill reported FLOPS:** {pf_gflops:.2f} GFLOPS")
+        if pf_e2e is not None:
+            lines.append(f"- **Prefill end-to-end (CPU timer):** {pf_e2e:.2f} s")
+        lines.append("")
+
+        # --- Decode ----------------------------------------------------------
+        gen_n = getattr(self, "_decode_generated_n", None)
+        total_tok = self.seq_len
+        peak_toks = getattr(self, "_decode_peak_toks", None)
+        avg_toks = getattr(self, "_decode_avg_toks", None)
+        dec_flop_rate = getattr(self, "_decode_total_flop_rate", None)
+        avg_gflops = (dec_flop_rate / gen_n) if (dec_flop_rate is not None and gen_n) else None
+        lines.append(f"## Decode")
+        lines.append("")
+        lines.append(f"- **Decoded tokens:** {gen_n if gen_n is not None else 'n/a'} generated "
+                     f"(sequence total {total_tok})")
+        if peak_toks is not None:
+            lines.append(f"- **First-token speed (peak):** {peak_toks:.2f} tok/s")
+        if avg_toks is not None:
+            lines.append(f"- **Average speed:** {avg_toks:.2f} tok/s")
+        if avg_gflops is not None:
+            lines.append(f"- **Average FLOPS:** {avg_gflops:.2f} GFLOPS")
+        lines.append("")
+
+        # --- Text ------------------------------------------------------------
+        try:
+            prompt_text = self.tokenizer.decode(list(self.prefill_seq), skip_special_tokens=False)
+        except Exception:
+            prompt_text = "(decode failed)"
+        decoded_text = getattr(self, "_decoded_text", None) or "(none)"
+        lines.append(f"## Prompt & output")
+        lines.append("")
+        lines.append(f"### Full prefill prompt")
+        lines.append("")
+        lines.append("```")
+        lines.append(prompt_text)
+        lines.append("```")
+        lines.append("")
+        lines.append(f"### Decoded text")
+        lines.append("")
+        lines.append("```")
+        lines.append(decoded_text)
+        lines.append("```")
+        lines.append("")
+
+        with open(out_path, "w") as f:
+            f.write("\n".join(lines))
+        return out_path
 
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
                          checkpoints: list, tail_name: str, timeout: float = 120.0,
@@ -1379,6 +1561,10 @@ def add_engine_args(parser) -> None:
                              "bittware_256, alveo, efinix).")
     parser.add_argument("--cycle", type=float, default=None,
                         help="Clock cycle time in nanoseconds. Overrides --device default.")
+    parser.add_argument("--bin-reuse", action="store_true",
+                        help="Reuse a matching cached program image (programs.bin) if it "
+                             "exists instead of recompiling. Default: OFF (fresh compile "
+                             "every run).")
 
 
 def resolve_engine_config(parser, args) -> dict:
@@ -1444,12 +1630,15 @@ def resolve_engine_config(parser, args) -> dict:
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
     print(f"Kernels: vision={args.vision_kernel}, prefill={args.prefill_kernel}, "
           f"engines={args.multi_core}, decode={args.decode_kernel}")
+    print(f"Program image: {'reuse cached if present' if args.bin_reuse else 'fresh compile every run'}"
+          f" (--bin-reuse {'on' if args.bin_reuse else 'off'})")
 
     return dict(
         vision_kernel=args.vision_kernel,
         prefill_kernel=args.prefill_kernel,
         decode_kernel=args.decode_kernel,
         multi_core=args.multi_core,
+        bin_reuse=args.bin_reuse,
     )
 
 
@@ -1490,6 +1679,41 @@ default prompt: "x+3=5, what is x?"
     return parser
 
 
+def run_summary_filename(args) -> str:
+    """Build the per-run summary .md filename encoding the full CLI config, e.g.
+    ``--dev xdma0 --device alveo --image --multi-core 2`` ->
+    ``gemma4_e2b_test_xdma0_alveo_image_multi-core_2.md``.
+
+    dev / device / mode are always present (in that order); every other engine
+    knob is appended only when it differs from its default, so a plain LM run
+    stays short. Call this BEFORE resolve_engine_config(), which mutates
+    args.prefill_kernel for multi-core — otherwise an auto-forced kernel would
+    leak into the name.
+    """
+    if args.audio:
+        mode = "audio"
+    elif args.image:
+        mode = "image"
+    else:
+        mode = "lm"
+    tokens = [args.dev, args.device, mode]
+    if args.image and args.vision_host:
+        tokens.append("vision-host")
+    if args.multi_core != 1:
+        tokens.append(f"multi-core_{args.multi_core}")
+    if args.vision_kernel != "matmatmul":
+        tokens.append(f"vision-kernel_{args.vision_kernel}")
+    if args.prefill_kernel != "streaming":
+        tokens.append(f"prefill-kernel_{args.prefill_kernel}")
+    if args.decode_kernel != "streaming":
+        tokens.append(f"decode-kernel_{args.decode_kernel}")
+    if args.bin_reuse:
+        tokens.append("bin-reuse")
+    if args.cycle is not None:
+        tokens.append(f"cycle_{args.cycle}")
+    return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + ".md"
+
+
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -1499,6 +1723,10 @@ def main():
         parser.error("--vision-host requires --image")
     if args.image and args.audio:
         parser.error("--image and --audio are mutually exclusive")
+    # Capture the summary filename now, before resolve_engine_config() mutates
+    # args.prefill_kernel (multi-core forces matmatmul) — keeps auto-forced
+    # kernels out of the name.
+    _summary_name = run_summary_filename(args)
     engine_kwargs = resolve_engine_config(parser, args)
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
 
@@ -1565,6 +1793,15 @@ def main():
           f"total {token_cnt_decoded} tokens.")
     print(f"HW counter: Latency: {(latency_hw_prefill + latency_hw_decoder) / 1e6:.2f} seconds, "
           f"decoder average Gflops: {flop_rate_hw_decoder / (token_cnt_decoded - len(ue.prefill_seq) + 1):.2f} Gflops")
+
+    # Per-run Markdown summary, named for the full CLI config (see
+    # run_summary_filename), written next to this script.
+    _summary_path = os.path.join(SCRIPT_DIR, _summary_name)
+    try:
+        ue.write_run_summary(_summary_path, args)
+        print(f"Wrote run summary: {_summary_path}")
+    except Exception as _e:
+        print(f"[warn] failed to write run summary: {_e}")
     print("Gemma4 E2B LM test ends.")
 
 
