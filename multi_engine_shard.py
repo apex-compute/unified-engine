@@ -188,9 +188,6 @@ SHARDED_OP_ALLOWLIST = frozenset({
     "matmat_mul_core_dynamic",
     "matmat_mul_core_legacy",
     "quantized_matmat_mul_core",
-    # Composite small-head RoPE: matmul + row-wise eltwise operations. The
-    # caller must row-slice input/output, tiled cos/sin, and scratch together.
-    "rope_hf_matmul_core",
     # Standalone pointwise activation implemented through matmat_mul_core with
     # a shared read-only identity matrix. Each M row remains independent.
     "activation_core",
@@ -290,18 +287,12 @@ class _ShardedEngineProxy:
 
     def __getattr__(self, name):
         ue = object.__getattribute__(self, "_ue")
-        if name == "rope_hf_matmul_core":
-            # Model mixins may provide a convenience adapter with this same
-            # name but a narrower signature (Gemma4 wires its own buffers).
-            # A sharded call supplies explicitly sliced addresses, so dispatch
-            # to the library kernel rather than normal MRO lookup on ``ue``.
-            return UnifiedEngine.rope_hf_matmul_core.__get__(ue, type(ue))
         if name in SHARDED_OP_ALLOWLIST or name in _SCALAR_HELPER_ALLOWLIST:
             return getattr(ue, name)
         raise AssertionError(
             f"{name!r} is not allowed inside a sharded region. Only row-independent "
             f"ops are sharded in v1: {sorted(SHARDED_OP_ALLOWLIST)}. "
-            f"Attention, strided SRAM<->DRAM marshalling, permutes and non-row-wise RoPE must run "
+            f"Attention, strided SRAM<->DRAM marshalling, permutes and RoPE must run "
             f"single-engine: close the region (end_sharded()/leave sharded_region()), "
             f"emit them on the primary engine, then open a new region. "
             f"If you really mean it, use ctx.unsafe_ue."

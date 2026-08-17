@@ -513,21 +513,6 @@ class Gemma4VisionMixin:
         return self.gpr_seq_len
 
     # ------------------------------------------------------------------
-    # Vision encoder RoPE (S3): rotate-half as a batched matmul against a
-    # static swap permutation + tiled elementwise. HW-verified on alveo.
-    # ------------------------------------------------------------------
-    def rope_hf_matmul_core(self, src_dram: int, M: int, N: int) -> int:
-        """Vision-encoder RoPE (in place on ``src_dram``, head_dim N=64): thin adapter over the
-        library :meth:`UnifiedEngine.rope_hf_matmul_core`, wiring the model-owned swap matrix, rot
-        scratch, and host-tiled cos/sin. The library core does ``rot = X @ P_swap`` then
-        ``rot*=sin; out = X*cos; out += rot`` via three batched eltwise passes."""
-        return user_dma_core.UnifiedEngine.rope_hf_matmul_core(
-            self, M=M, N=N, input_dram_addr=src_dram, output_dram_addr=src_dram,
-            cos_dram_addr=self.VIS_ROPE_COS_TILED, sin_dram_addr=self.VIS_ROPE_SIN_TILED,
-            identity_swap_dram_addr=self.VIS_ROPE_P_SWAP, scratch_dram_addr=self.VIS_ROPE_ROT,
-            gpr_M_reg=self._prime_M(M))
-
-    # ------------------------------------------------------------------
     # Vision encoder layers (S3): one SigLIP layer = pre_norm + Q/K/V proj +
     # Q/K norm (part A) → V-norm + 2D RoPE + head-major transpose → per-head
     # attention → O proj + post-attn norm + residual + MLP (part C).
@@ -664,22 +649,34 @@ class Gemma4VisionMixin:
                 self._vis_flops += shard_flops[0]
             _checkpoint(f"L{li}_proj")
             self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_V_DRAM, GAMMA_DRAM_ADDR=self.VIS_V_NORM_ONES_GAMMA, gpr_M_reg=self._prime_M(S * NH))
+            # RoPE (rotate-half via a swap matmul + tiled cos/sin eltwise) uses
+            # the library UnifiedEngine.rope_hf_matmul_core directly, wiring the
+            # model-owned swap matrix / rot scratch / host-tiled cos/sin here.
             if gate_scheduler is None:
                 for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
                     self._vis_flops += self.rope_hf_matmul_core(
-                        src_dram=dram, M=S * NH, N=HD)
+                        M=S * NH, N=HD, input_dram_addr=dram, output_dram_addr=dram,
+                        cos_dram_addr=self.VIS_ROPE_COS_TILED,
+                        sin_dram_addr=self.VIS_ROPE_SIN_TILED,
+                        identity_swap_dram_addr=self.VIS_ROPE_P_SWAP,
+                        scratch_dram_addr=self.VIS_ROPE_ROT,
+                        gpr_M_reg=self._prime_M(S * NH))
             else:
                 # rope_hf_matmul_core is row-independent over its flattened
                 # M=S*NH dimension. Slice every [M, HD] tensor by the same rows;
                 # the HDxHD swap permutation is shared and read-only. The
                 # existing VIS_ROPE_ROT allocation is likewise row-sliced, so
                 # multicore RoPE needs no per-engine scratch allocation.
+                # The composite core is not in the shard proxy's row-independent
+                # allowlist (it wraps a matmul + 3 eltwise), so emit it through
+                # ctx.unsafe_ue — the deliberate escape hatch — with explicitly
+                # sliced addresses. Keeps multi_engine_shard.py unmodified.
                 rope_flops = [0]
                 def _emit_rope_shard(ctx, src_dram):
                     m_reg = gate_m_regs[ctx.engine_idx]
                     row_bytes = HD * bpe
                     shard_src = ctx.rows_addr(src_dram, row_bytes)
-                    rope_flops[0] += ctx.ue.rope_hf_matmul_core(
+                    rope_flops[0] += ctx.unsafe_ue.rope_hf_matmul_core(
                         M=ctx.rows,
                         N=HD,
                         input_dram_addr=shard_src,
