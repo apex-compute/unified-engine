@@ -112,7 +112,7 @@ class Gemma4VisionMixin:
         # Arena top = first address the vision ISA claims: the master vision ISA
         # base (2-core), or the compact worker-ISA arena at 0xFC000000 (>2-core /
         # Alveo). vision_tensor_init uses the same split for its scratch limit.
-        _arena_top = 0xFC000000 if self.multi_core > 2 else self.VISION_ISA_BASE
+        _arena_top = self.VISION_ARENA_TOP
         _alloc_span = sum(self._align_up(s["size"], 64)
                           for k, s in sections.items() if k != "pos_embedding_table")
         _weight_base = ((_arena_top - _alloc_span) // 64) * 64
@@ -487,8 +487,7 @@ class Gemma4VisionMixin:
         # tensor arena by vision_weight_init). The old guard used the ISA base and
         # so silently allowed scratch to grow through the weights — the multi-core
         # "barcode" corruption. Guard the weight base instead.
-        tensor_limit = getattr(self, "_vis_weight_start",
-                               0xFC000000 if self.multi_core > 2 else self.VISION_ISA_BASE)
+        tensor_limit = getattr(self, "_vis_weight_start", self.VISION_ARENA_TOP)
         if self.get_tensor_dram_addr() > tensor_limit:
             raise MemoryError(
                 f"Gemma4 vision scratch overflows into the vision weights: "
@@ -665,8 +664,40 @@ class Gemma4VisionMixin:
                 self._vis_flops += shard_flops[0]
             _checkpoint(f"L{li}_proj")
             self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_V_DRAM, GAMMA_DRAM_ADDR=self.VIS_V_NORM_ONES_GAMMA, gpr_M_reg=self._prime_M(S * NH))
-            for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
-                self._vis_flops += self.rope_hf_matmul_core(src_dram=dram, M=S * NH, N=HD)
+            if gate_scheduler is None:
+                for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
+                    self._vis_flops += self.rope_hf_matmul_core(
+                        src_dram=dram, M=S * NH, N=HD)
+            else:
+                # rope_hf_matmul_core is row-independent over its flattened
+                # M=S*NH dimension. Slice every [M, HD] tensor by the same rows;
+                # the HDxHD swap permutation is shared and read-only. The
+                # existing VIS_ROPE_ROT allocation is likewise row-sliced, so
+                # multicore RoPE needs no per-engine scratch allocation.
+                rope_flops = [0]
+                def _emit_rope_shard(ctx, src_dram):
+                    m_reg = gate_m_regs[ctx.engine_idx]
+                    row_bytes = HD * bpe
+                    shard_src = ctx.rows_addr(src_dram, row_bytes)
+                    rope_flops[0] += ctx.ue.rope_hf_matmul_core(
+                        M=ctx.rows,
+                        N=HD,
+                        input_dram_addr=shard_src,
+                        output_dram_addr=shard_src,
+                        cos_dram_addr=ctx.rows_addr(
+                            self.VIS_ROPE_COS_TILED, row_bytes),
+                        sin_dram_addr=ctx.rows_addr(
+                            self.VIS_ROPE_SIN_TILED, row_bytes),
+                        identity_swap_dram_addr=self.VIS_ROPE_P_SWAP,
+                        scratch_dram_addr=ctx.rows_addr(
+                            self.VIS_ROPE_ROT, row_bytes),
+                        gpr_M_reg=m_reg)
+                for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
+                    gate_scheduler.sharded_region(
+                        S * NH,
+                        lambda ctx, src_dram=dram: _emit_rope_shard(
+                            ctx, src_dram))
+                self._vis_flops += rope_flops[0]
             _checkpoint(f"L{li}_rope")
             for src, dst in ((self.VIS_Q_NORM, self.VIS_FLASH_Q_HM),
                              (self.VIS_K_NORM, self.VIS_FLASH_K_HM),
@@ -858,7 +889,7 @@ class Gemma4VisionMixin:
                 worker_bytes = bytearray()
                 for inst in worker.capture_buffer:
                     worker_bytes.extend(inst.get_bytes())
-                worker_limit = (worker_addr + 0x00240000
+                worker_limit = (worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
                                 if self.multi_core > 2 else self.LM_ISA_BASE)
                 if worker_addr + len(worker_bytes) > worker_limit:
                     raise RuntimeError(

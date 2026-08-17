@@ -704,15 +704,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             return None
         scheduler = self._multi_core_schedulers.get(stage)
         if scheduler is None:
-            # Gemma4's legacy two-core layout keeps its worker at the supplied
-            # stage address.  Alveo's 8-core layout needs seven compact worker
-            # ISA slots; reserve them below the model ISA arena, above the
-            # measured tensor high-water mark. Vision and prefill are
-            # sequential, so both stages may reuse this worker-ISA arena.
+            # Two-core keeps its single worker at the supplied stage address
+            # (huge stride; only the base is used). >2-core packs the extra
+            # workers into the dedicated MULTICORE_WORKER_ISA arena. Vision and
+            # prefill are sequential, so both stages reuse this worker-ISA arena.
             worker_stride = 0x10000000
             if self.multi_core > 2:
-                worker_dram_base = 0xFC000000
-                worker_stride = 0x00240000  # 2.25 MiB per worker
+                worker_dram_base = self.MULTICORE_WORKER_ISA_BASE
+                worker_stride = self.MULTICORE_WORKER_ISA_STRIDE
             scheduler = MultiEngineScheduler(
                 self, num_engines=self.multi_core,
                 engine_base_stride=0x00010000,
@@ -761,20 +760,51 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
-        # Gemma4 fixed DRAM layout within the upper 2 GB window, matching the
-        # addressable range used by the Llama-3.2-1B path.
-        #   LM weights       : 0x80000000 – 0xE1000000  (1552 MiB)
-        #   LM/vision tensor : 0xE1000000 – 0xFF000000  (480 MiB, reused by stage)
-        #   Vision ISA/core0 : 0xFF000000 – 0xFF400000  (4 MiB, two-core mode)
-        #   Vision ISA/core1 : 0xFF400000 – 0xFF620000  (2.125 MiB, incl. head-sharded attention)
-        #   LM ISA           : 0xFF620000 – 0x100000000 (9.875 MiB)
+        # Gemma4 DRAM layout. SINGLE-CORE keeps the original upper-2 GB window
+        # (matching the Llama-3.2-1B path); its 16 MiB ISA region is tight but
+        # sufficient for one engine. MULTI-CORE re-bases to 0x0 with the full
+        # 4 GB budget so the per-engine worker programs (incl. sharded vision
+        # RoPE) and future parallelism add-ons have room, and so the vision
+        # tensor arena is large enough for N-engine scratch.
+        #
+        # SINGLE-CORE (upper 2 GB):
+        #   PARAMS  weights   : 0x80000000 – 0xE1000000  (1552 MiB)
+        #   TENSOR  acts/scr  : 0xE1000000 – 0xFF000000  (480 MiB, LM<->vision)
+        #   ISA vision core0  : 0xFF000000 – 0xFF400000  (4 MiB)
+        #   ISA vision core1  : 0xFF400000 – 0xFF620000  (2.125 MiB, unused 1-core)
+        #   ISA LM            : 0xFF620000 – 0x100000000 (9.875 MiB)
+        #
+        # MULTI-CORE (full 4 GB, base 0x0):
+        #   PARAMS  weights   : 0x00000000 – 0x80000000  (2 GiB;  LM ~1540 MB)
+        #   TENSOR  acts/scr  : 0x80000000 – 0xC0000000  (1 GiB;  LM + vision,
+        #                        incl. up-to-8-engine vision scratch + top wts)
+        #   ISA vision core0  : 0xC0000000 – 0xC8000000  (128 MiB, master)
+        #   ISA vision core1  : 0xC8000000 – 0xE0000000  (384 MiB, 2-core worker)
+        #   ISA LM            : 0xE0000000 – 0xF0000000  (256 MiB)
+        #   ISA >2-core workrs: 0xF0000000 – 0x100000000 (256 MiB, 32 MiB/worker)
         # Vision and LM programs remain resident at disjoint addresses.
         self.DRAM_END = 0x100000000
-        self.VISION_ISA_BASE = 0xFF000000
-        self.VISION_WORKER_ISA_BASE = 0xFF400000
-        self.LM_ISA_BASE = 0xFF620000
-        _params_base  = 0x80000000
-        _tensor_base  = 0xE1000000
+        if self.multi_core == 1:
+            _params_base  = 0x80000000
+            _tensor_base  = 0xE1000000
+            self.VISION_ISA_BASE             = 0xFF000000
+            self.VISION_WORKER_ISA_BASE      = 0xFF400000
+            self.LM_ISA_BASE                 = 0xFF620000
+            self.MULTICORE_WORKER_ISA_BASE   = 0xFC000000    # unused (1-core)
+            self.MULTICORE_WORKER_ISA_STRIDE = 0x00240000    # unused (1-core)
+        else:
+            _params_base  = 0x00000000
+            _tensor_base  = 0x80000000
+            self.VISION_ISA_BASE             = 0xC0000000
+            self.VISION_WORKER_ISA_BASE      = 0xC8000000
+            self.LM_ISA_BASE                 = 0xE0000000
+            self.MULTICORE_WORKER_ISA_BASE   = 0xF0000000    # >2-core worker arena
+            self.MULTICORE_WORKER_ISA_STRIDE = 0x02000000    # 32 MiB / worker
+        # Top of the vision tensor arena (vision weights are top-placed against
+        # it; scratch stays below). In the multi-core layout every worker ISA
+        # lives in the dedicated ISA region, so the tensor arena simply runs up
+        # to VISION_ISA_BASE for any engine count.
+        self.VISION_ARENA_TOP = self.VISION_ISA_BASE
         _program_base = self.LM_ISA_BASE
         super().__init__(BASE_ADDR=engine_base,
                           params_dram_base=_params_base,
@@ -1145,7 +1175,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 worker_bytes = bytearray()
                 for inst in worker.capture_buffer:
                     worker_bytes.extend(inst.get_bytes())
-                worker_limit = (worker_addr + 0x00240000
+                worker_limit = (worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
                                 if self.multi_core > 2 else self.LM_ISA_BASE)
                 if worker_addr + len(worker_bytes) > worker_limit:
                     raise RuntimeError(
@@ -1524,11 +1554,17 @@ def _clock_ns_default_for_device(device: str) -> float:
     """Return the board-profile clock period, matching user_hw_test/Llama."""
     if device == "kintex7":
         return 1000 / (1066 / 5.375)
-    if device in ("rk", "puzhi"):
+    if device == "kintex7_systolic":
+        return 1000 / 149.61403
+    if device in ("rk", "rk_256", "puzhi"):
         return 3.0
     if device in ("bittware", "bittware_256"):
         return 3.3333
-    if device in ("alveo", "efinix"):
+    if device == "alveo":
+        return 1000 / 366.666666
+    if device == "alveo_u55c":
+        return 3.3333333
+    if device == "efinix":
         return 4.0
     return 10.0
 
@@ -1557,8 +1593,9 @@ def add_engine_args(parser) -> None:
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
     parser.add_argument("--device", type=str, default="kintex7",
-                        help="FPGA board profile (kintex7, rk, puzhi, bittware, "
-                             "bittware_256, alveo, efinix).")
+                        help="FPGA board profile (kintex7, kintex7_systolic, rk, "
+                             "rk_256, puzhi, bittware, bittware_256, alveo, "
+                             "alveo_u55c, efinix).")
     parser.add_argument("--cycle", type=float, default=None,
                         help="Clock cycle time in nanoseconds. Overrides --device default.")
     parser.add_argument("--bin-reuse", action="store_true",
@@ -1578,8 +1615,8 @@ def resolve_engine_config(parser, args) -> dict:
     """
     if args.multi_core not in range(1, 9):
         parser.error("--multi-core must be between 1 and 8")
-    if args.multi_core > 2 and args.device != "alveo":
-        parser.error("--multi-core values above 2 are currently supported only on Alveo")
+    if args.multi_core > 2 and args.device != "alveo" and args.device != "alveo_u55c":
+        parser.error("--multi-core values above 2 are currently supported only on Alveo and Alveo U55C")
     if args.multi_core > 1:
         # Multicore prefill only has a matmatmul (two-pass) shard path.
         args.prefill_kernel = "matmatmul"

@@ -32,21 +32,22 @@ python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image --multi-core 
 
 | Metric | Legacy | Kintex | matmatmul prefill | Kintex 2-core | rk | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Vision FPGA execution | 55.54 s | 53.78 s | 54.85 s | **28.09 s** | 32.56 s | **42.51 s** | **22.95 s** | **12.13 s** | **7.53 s** |
-| Vision end-to-end path | not reported | 54.33 s | 56.10 s | **28.85 s** | 33.03 s | **35.96 s** | **20.14 s** | **11.49 s** | **8.40 s** |
-| Vision throughput | not reported | 21.37 GFLOPS | 20.76 GFLOPS | **40.91 GFLOPS** | 35.00 GFLOPS | **27.03 GFLOPS** | **50.07 GFLOPS** | **94.76 GFLOPS** | **152.66 GFLOPS** |
+| Vision FPGA execution | 55.54 s | 53.78 s | 54.85 s | 27.77s | 32.56 s | **42.51 s** | **15.4 s** | **12.13 s** | **7.53 s** |
+| Vision end-to-end path | not reported | 54.33 s | 56.10 s | 28.58s | 33.03 s | **35.96 s** | **19.6 s** | **11.49 s** | **8.40 s** |
+| Vision throughput | not reported | 21.37 GFLOPS | 20.76 GFLOPS | 41.38 GFLOPS | 35.00 GFLOPS | **27.03 GFLOPS** | **74.4 GFLOPS** | **94.76 GFLOPS** | **152.66 GFLOPS** |
 | Vision soft tokens | 256 | 256 | 256 | 256 | 256 | 256 | 256 | 256 | 256 |
 | LM prefill sequence executed | 512-token template | 272 actual tokens | 272 actual tokens | 272 actual tokens | 273 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens |
-| LM prefill FPGA latency | 113.571 s | 51.52 s | 52.578 s | **31.78 s** | 32.544 s | **41.40 s** | **25.26 s** | **17.02 s** | **12.91 s** |
-| LM prefill useful-work throughput | 23.20 GFLOPS | 23.94 GFLOPS | 23.45 GFLOPS | 38.80 GFLOPS | 37.89 GFLOPS | **29.79 GFLOPS** | **48.82 GFLOPS** | **72.46 GFLOPS** | **95.52 GFLOPS** |
-| Decode average throughput | 2.68 tok/s | 3.74 tok/s | 3.85 tok/s | **3.75 tok/s** | 6.00 tok/s | **5.49 tok/s** | **5.42 tok/s** | **5.42 tok/s** | **5.43 tok/s** |
-| Decode peak first-token throughput | 2.86 tok/s | 4.00 tok/s | 4.01 tok/s | **3.99 tok/s** | 6.23 tok/s | **5.91 tok/s** | **5.78 tok/s** | **5.70 tok/s** | **5.70 tok/s** |
-| Decode average hardware throughput | 13.42 GFLOPS | 18.78 GFLOPS | 19.20 GFLOPS | **18.82 GFLOPS** | 30.45 GFLOPS | **23.13 GFLOPS** | **23.40 GFLOPS** | **23.40 GFLOPS** | **23.40 GFLOPS** |
-| Vision program section | 3.58 MiB | 3.22 MiB | 3.03 MiB | **2.32 MiB (master)** | / | **3.22 MiB (master)** | **2.32 MiB (master)** | **1.83 MiB (master)** | **1.67 MiB (master)** |
-| Prefill program section | 5.71 MiB | 3.08 MiB | 3.21 MiB | **3.38 MiB (master)** | / | **3.08 MiB (master)** | **3.38 MiB (master)** | **3.39 MiB (master)** | **3.41 MiB (master)** |
-| Combined program image | 10.37 MiB | 7.73 MiB | 7.67 MiB | **10.45 MiB** | / | **7.73 MiB** | **10.45 MiB** | **15.15 MiB** | **24.73 MiB** |
+| LM prefill FPGA latency | 113.571 s | 51.52 s | 52.578 s | 31.87s | 32.544 s | **41.40 s** | **17.3 s** | **17.02 s** | **12.91 s** |
+| LM prefill throughput | 23.20 GFLOPS | 23.94 GFLOPS | 23.45 GFLOPS | 38.76 GFLOPS | 37.89 GFLOPS | **29.79 GFLOPS** | **71.22 GFLOPS** | **72.46 GFLOPS** | **95.52 GFLOPS** |
+| Decode average throughput | 2.68 tok/s | 3.74 tok/s | 3.85 tok/s | 3.76 tok/s | 6.00 tok/s | **5.49 tok/s** | **5.49 tok/s** | **5.42 tok/s** | **5.43 tok/s** |
+| Decode peak first-token throughput | 2.86 tok/s | 4.00 tok/s | 4.01 tok/s | 4.0 tok/s | 6.23 tok/s | **5.91 tok/s** | **5.88 tok/s** | **5.70 tok/s** | **5.70 tok/s** |
+| Decode average hardware throughput | 13.42 GFLOPS | 18.78 GFLOPS | 19.20 GFLOPS | 18.85 GFLOPS | 30.45 GFLOPS | **23.13 GFLOPS** | **33.97 GFLOPS** | **23.40 GFLOPS** | **23.40 GFLOPS** |
+| Vision program section | 3.58 MiB | 3.22 MiB | 3.03 MiB | 2.39 MiB | / | **3.22 MiB (master)** | 2.39 MiB | **1.83 MiB (master)** | **1.67 MiB (master)** |
+| Prefill program section | 5.71 MiB | 3.08 MiB | 3.21 MiB | 3.46 MiB | / | **3.08 MiB (master)** | 3.46 MiB | **3.39 MiB (master)** | **3.41 MiB (master)** |
+| Decode program section | | | | 1.46 MiB | | |1.46 MiB| | |
+| Combined program image | 10.37 MiB | 7.73 MiB | 7.67 MiB | 10.81 MiB | / | **7.73 MiB** | 10.81 MiB | **15.15 MiB** | **24.73 MiB** |
 | Weight image (`params.bin`) | 6.91 GiB | same | same | same | / | same | same | same | same |
-| Correctness | legacy baseline | **coherent; stop token** | coherent | **coherent; stop token** | not recorded | **coherent; stop token** | **coherent; stop token** | **coherent; stop token** | **coherent; stop token** |
+| Correctness |  | **coherent; stop token** | coherent | coherent, total 709 | not recorded | **coherent; stop token** | coherent, total 709 | **coherent; stop token** | **coherent; stop token** |
 
 The four Alveo columns were refreshed on 2026-08-17 against HW version
 `0x6bb5d25d`, with `make clean` before every run. All four produced coherent
@@ -111,19 +112,16 @@ so the per-phase `--multi-core 2` numbers are exact.
 | Phase | Single-core | --multi-core 2 |
 |---|---:|---:|
 | Patch embedding | 123.6 ms | 123.6 ms |
-| Projection (Q/K/V) † | 6,682.4 ms | **3,360.0 ms** |
-| RoPE | 1,072.8 ms | 1,072.8 ms |
+| Projection (Q/K/V) † | 6,682.4 ms | **3,361.0 ms** |
+| RoPE | 1,072.8 ms | **740.0 ms** |
 | Permute | 269.6 ms | 269.6 ms |
-| Attention † | 16,642.2 ms | **8,645.1 ms** |
-| Post-attention (O + MLP) † | 28,911.4 ms | **14,539.1 ms** |
+| Attention † | 16,642.2 ms | **8,664.7 ms** |
+| Post-attention (O + MLP) † | 28,911.4 ms | **14,541.1 ms** |
 | Pooler tail | 75.3 ms | 75.3 ms |
 | Tail | 0.0 ms | 0.0 ms |
-| **Total** | **53,777.3 ms** | **28,085.5 ms** |
+| **Total** | **53,777.3 ms** | **27,775 ms** |
 
-† row-sharded across 2 engines (Projection, Attention head-sharded, and
-Post-attention); these ~halve. The master-only phases (patch embed, RoPE,
-permute, pooler tail) are unchanged, as expected. The multi-core total
-(28,085.5 ms) matches the Kintex 2-core vision FPGA execution (28.09 s) above.
+† row-sharded across 2 engines
 
 ## Profile backup: LM prefill
 
@@ -148,9 +146,7 @@ from the Kintex 2-core prefill run), confirming it.
 | Tail halt | 0.0 ms | 0.0 ms |
 | **Total** | **51,520.6 ms** | **31,782.4 ms** |
 
-† row-sharded across 2 engines (these ~halve). ‡ master-only; the profiler's
-per-segment counter mis-times these two under two-engine, so the (identical)
-single-core value is shown.
+† row-sharded across 2 engines (these ~halve).
 
 ## Profile backup: one decode token at position 272
 
