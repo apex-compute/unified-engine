@@ -815,7 +815,16 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x3d04c689, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x3d04c689. Please update FPGA with commit update_3d04c689.bin using update_flash.py (public release v1.4)"
+        # 0x3d04c689 is the public v1.4 image used by Kintex.  The current
+        # eight-engine Alveo image reports 0x6bb5d25d and implements the same
+        # host-visible register/ISA contract. Keep this an explicit allowlist:
+        # accepting arbitrary versions would turn ABI mismatches into silent
+        # memory corruption.
+        supported_hw_versions = {0x3d04c689, 0x6bb5d25d}
+        assert hw_version in supported_hw_versions, (
+            f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, "
+            f"expected one of {[f'0x{v:08x}' for v in sorted(supported_hw_versions)]}. "
+            "Please program a supported FPGA image.")
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
