@@ -26,7 +26,9 @@ Architecture (checkpoint header + SmolVLM2-500M reference):
 
   No stack is MQA. GQA group 3 -> the 5 kv heads are row-replicated to 15 token-major
   before flash (duplicate_gqa_rows). expert kv_out 320 == lm kv_out 320, which is what
-  lets cross-attention consume the prefix KV cache unmodified.
+  lets cross-attention consume the prefix KV cache without any reshaping -- it is still
+  RE-PROJECTED through the cross layer's own k_proj/v_proj, which are (320,320) in the
+  checkpoint (self layers' are (320,480)).
 
   RoPE theta = 10000.0, the value in the verapulse checkpoint's own config.json. Note
   this DIFFERS from upstream SmolVLM2 (100000.0) and therefore from
@@ -347,10 +349,9 @@ def assert_bf16_only(cfg):
 
 @dataclass
 class OpenChoices:
-    prefix_order: str = "state_images_text"
-    """state_images_text | images_text_state | scatter_into_text. image_token_id 49190
-    hints the real layout is scatter_into_text (image embeddings overwrite placeholder
-    positions inside the tokenized sequence); pi0/SmolVLA put state LAST."""
+    prefix_order: str = "images_text_state"
+    """SETTLED against upstream's smolvla/modeling.py::embed_prefix, which appends
+    images, then language, then state. Not an open question any more."""
 
     self_attn_on_even: bool = True
     """expert layer i self-attends when (i % self_attn_every_n_layers == 0)."""
@@ -727,10 +728,40 @@ class VeraPulseRef:
         self.cfg = cfg or _CFG
         self.ch = choices or OpenChoices()
         self.gelu = gelu_hw if hw_gelu else gelu_tanh
+        # Both default TRUE = upstream's actual expert. Flip to False only to attribute
+        # error between the two faults; the device does neither today.
+        self.expert_kv_concat = True        # fault 4: prefix K/V into self-attn layers
+        self.expert_cross_reproject = True  # fault 5: (320,320) reprojection on cross
+        self.expert_causal_suffix = True    # fault 6: causal mask over the action chunk
         V, L, E = self.cfg["vision"], self.cfg["lm"], self.cfg["expert"]
         self.n_vis = 2 if tiny else V["num_layers"]
         self.n_lm = 2 if tiny else L["num_layers"]
         self.n_ae = 2 if tiny else E["num_layers"]
+
+    def mirror_device_expert(self):
+        """Turn all three expert fixes OFF, so this reference computes what the EMITTER
+        computes today. Use with hw_gelu=True to ask the one question the upstream gate
+        cannot: is the accelerator faithfully executing the (wrong) model we gave it?
+
+        If device-vs-mirror is high, the only thing wrong is the model, and landing
+        faults 4/5/6 in the emitter will fix it. If it is low, there is a SECOND,
+        device-side fault and the emitter work alone will not be enough. Those two
+        outcomes call for completely different next moves, which is why the distinction
+        is worth a dedicated comparison rather than an assumption.
+
+        THIS MUST TRACK THE EMITTER. As each fault lands on device, flip it back on here,
+        or the mirror silently stops mirroring and its number becomes meaningless in a way
+        that looks like a hardware regression.
+        Current emitter state: ALL FIVE (4,5,6,7,8) landed. So the mirror no longer models
+        a deliberately-wrong model -- it is now the CORRECT model, and device-vs-mirror is
+        a pure EXECUTION gate: it asks whether the accelerator computes what we asked,
+        with the model faults out of the picture and GELU common-mode. It is therefore the
+        CEILING on the sharp upstream gate: no model fix can push actions-vs-upstream
+        above whatever this reads."""
+        self.expert_kv_concat = True         # fault 4: landed
+        self.expert_cross_reproject = True   # fault 5: landed
+        self.expert_causal_suffix = True     # fault 6: landed
+        return self
 
     def astype(self, dtype):
         """Same weights, different precision. Running an identical forward in fp32 and in
@@ -803,6 +834,10 @@ class VeraPulseRef:
         st = (mm(state, self.w("head.state_proj.weight").T)
               + self.w("head.state_proj.bias")).unsqueeze(0)
         txt = self.w("lm.embed_tokens.weight")[token_ids]
+        # sqrt(hidden) on images and language, NOT on state -- upstream embed_prefix.
+        emb_scale = math.sqrt(vision_tokens.shape[-1])
+        vision_tokens = vision_tokens * emb_scale
+        txt = txt * emb_scale
         order = self.ch.prefix_order
         if order == "state_images_text":
             x = torch.cat([st, vision_tokens, txt], 0)
@@ -822,7 +857,32 @@ class VeraPulseRef:
                else torch.arange(x.shape[0]))
         return x, valid, pos
 
-    def forward_prefix(self, x, positions, bias=None, trace=None):
+    def prefix_bias(self, n):
+        """Block-causal additive mask over n UNPADDED prefix rows.
+
+        Upstream's att_masks are [0]*images + [0]*language + [1]*state, and
+        make_att_2d_masks turns that into `cumsum[j] <= cumsum[i]`: images and language
+        attend among themselves but NOT to the state row; the state row attends to all.
+        With order images->text->state the state row is the last one, so this is a single
+        masked column. Returns None for orders where state is not last."""
+        if self.ch.prefix_order != "images_text_state" or n < 2:
+            return None
+        b = torch.zeros(n, n, dtype=torch.float32)
+        b[:n - 1, n - 1] = float("-inf")
+        return b
+
+    def forward_prefix(self, x, positions, bias="auto", trace=None):
+        """bias defaults to "auto" = the block-causal mask this model actually uses.
+
+        IT DEFAULTS ON DELIBERATELY. When the mask was opt-in, forward_full passed it and
+        _CpuBackend -- the path LIBERO actually runs -- did not, so the closed-loop
+        policy silently ran a fully-bidirectional prefix while the gate that was supposed
+        to catch that ran the correct one. A correctness detail that every call site has
+        to remember is a correctness detail that will be forgotten. Pass bias=None to
+        opt OUT explicitly, or an explicit tensor to override."""
+        if isinstance(bias, str):
+            assert bias == "auto", f"bias must be a tensor, None, or 'auto'; got {bias!r}"
+            bias = self.prefix_bias(x.shape[0])
         """Returns (hidden, kv_cache). kv_cache[i] = (k,v) at [5,S,64] -- the expert's
         cross-attention source, and on HW the thing that must survive all 10 steps.
 
@@ -886,11 +946,37 @@ class VeraPulseRef:
                 k = (mm(h, self.w(f"ae.{i}.k_proj.weight").T)).view(s, nkv, hd).transpose(0, 1)
                 v = (mm(h, self.w(f"ae.{i}.v_proj.weight").T)).view(s, nkv, hd).transpose(0, 1)
                 q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+                if self.expert_kv_concat:
+                    # FAULT 4. Upstream's self-attn layers PREPEND the cached prefix K/V:
+                    #     k = torch.cat([kv[idx]["key_states"], k], dim=1)
+                    # so the expert attends over prefix_len+chunk keys, not chunk. The
+                    # cached K is already roped with PREFIX positions and the expert's
+                    # own K with suffix positions, which is consistent because the suffix
+                    # positions continue from the prefix. Without this the expert's
+                    # self-attention layers never see the observation at all.
+                    pk, pv = prefix_kv[i]
+                    k = torch.cat([pk, k], dim=1)
+                    v = torch.cat([pv, v], dim=1)
                 a = attend(q, k, v, bias_self)
             else:
-                k, v = prefix_kv[i % len(prefix_kv)]      # layer mapping UNVERIFIED
+                pk, pv = prefix_kv[i]
+                if self.expert_cross_reproject:
+                    # FAULT 5. Upstream RE-PROJECTS the cached VLM K/V through the
+                    # expert's own k_proj/v_proj before attending. The checkpoint proves
+                    # it: odd-layer k_proj is (320,320) -- it reads the VLM kv width --
+                    # while even-layer k_proj is (320,480), the expert hidden width.
+                    S = pk.shape[1]
+                    kf = pk.transpose(0, 1).reshape(S, nkv * hd)     # [S, 320]
+                    vf = pv.transpose(0, 1).reshape(S, nkv * hd)
+                    k = mm(kf, self.w(f"ae.{i}.k_proj.weight").T).view(S, nkv, hd).transpose(0, 1)
+                    v = mm(vf, self.w(f"ae.{i}.v_proj.weight").T).view(S, nkv, hd).transpose(0, 1)
+                else:
+                    k, v = pk, pv
                 if self.ch.rope_q_on_cross:
-                    q = apply_rope(q, cos, sin)
+                    # Upstream rebases the query positions to 0..chunk-1 on cross layers
+                    # (exp_pos - exp_pos.min()) and does NOT rope the reprojected K.
+                    cq, sq = rope_tables(torch.arange(s), hd, self.cfg["lm"]["rope_theta"])
+                    q = apply_rope(q, cq, sq)
                 a = attend(q, k, v, bias_cross)
             x = x + mm(a, self.w(f"ae.{i}.o_proj.weight").T)
             h = rms_norm(x, self.w(f"ae.{i}.post_attention_layernorm.weight"), eps)
@@ -924,7 +1010,25 @@ class VeraPulseRef:
         # mask, so masked-64 and unpadded-50 compute the SAME thing. `pad_to` is accepted
         # for symmetry and to document the asymmetry, not used -- passing a [50,64] mask
         # onto [15,50,50] scores is a shape error, which is how this was caught.
-        b_self = None
+        # FAULT 6: the suffix self-attention is CAUSAL, not bidirectional.
+        # embed_suffix returns att_masks = ones(chunk), and make_att_2d_masks turns that
+        # into cumsum = [1..50] and att_2d[i,j] = (cumsum[j] <= cumsum[i]) = (j <= i).
+        # So action token i attends to prefix (all of it) plus actions 0..i only. The
+        # prefix block stays fully visible: denoise_step builds
+        #     full_2d = cat([prefix_pad expanded, make_att_2d_masks(suffix)], dim=2)
+        # Getting this wrong does not NaN -- it just lets each action peek at later ones,
+        # which inflates nothing and quietly changes the whole chunk.
+        if self.expert_causal_suffix:
+            causal = torch.zeros(rows, rows)
+            causal[torch.triu(torch.ones(rows, rows, dtype=torch.bool),
+                              diagonal=1)] = float("-inf")
+        else:
+            causal = torch.zeros(rows, rows)         # device-mirror: bidirectional
+        if self.expert_kv_concat:
+            b_self = torch.zeros(rows, prefix_len + rows)
+            b_self[:, prefix_len:] = causal          # prefix cols all visible
+        else:
+            b_self = causal
         assert pad_to is None or rows <= pad_to, f"rows {rows} > pad_to {pad_to}"
         b_cross = None
         if prefix_pad_to is not None and prefix_len < prefix_pad_to:
@@ -949,7 +1053,7 @@ class VeraPulseRef:
         out["connector"] = toks
         x, valid, pos = self.build_prefix(toks, token_ids, state)
         out["prefix_in"], out["valid_mask"], out["positions"] = x, valid, pos
-        hidden, kv = self.forward_prefix(x, pos)
+        hidden, kv = self.forward_prefix(x, pos)   # bias="auto" -> block-causal
         out["prefix_hidden"], out["prefix_kv"] = hidden, kv
         acts = self.denoise(kv, x.shape[0], noise=noise)
         out["actions_padded"] = acts
@@ -1407,8 +1511,38 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # K=480 operands: the activation stream is 512 wide, so the weight needs 32
             # zero in-columns that multiply the (zero) pad lanes.
             la["q_weight"] = store_weight(self, kpad(sd[f"ae.{i}.q_proj.weight"], HP))
-            la["k_weight"] = store_weight(self, kpad(sd[f"ae.{i}.k_proj.weight"], HP))
-            la["v_weight"] = store_weight(self, kpad(sd[f"ae.{i}.v_proj.weight"], HP))
+            # FAULT 5 -- K/V PROJECTIONS ARE NOT THE SAME SHAPE ON EVERY LAYER.
+            # The checkpoint is the evidence, not any code reading:
+            #     expert.layers.0.self_attn.k_proj.weight -> (320, 480)
+            #     expert.layers.1.self_attn.k_proj.weight -> (320, 320)
+            # SELF layers read the expert hidden width (480 -> padded 512, like q/gate/up).
+            # CROSS layers read the VLM KV width (320): upstream
+            # SmolVLMWithExpert.forward_cross_attn_layer flattens the cached prefix K/V to
+            # [B, S, 320] and RE-PROJECTS it through this layer's own k_proj/v_proj before
+            # attending. A (320,320) weight cannot consume a 480/512-wide activation, so
+            # this shape difference alone proves the reprojection.
+            # q_proj stays (960,480) on BOTH kinds -- the query always comes from the
+            # expert's own residual stream.
+            kv_is_self = self._ae_is_self_attn(i)
+            kw_t, vw_t = sd[f"ae.{i}.k_proj.weight"], sd[f"ae.{i}.v_proj.weight"]
+            exp_in = H if kv_is_self else KV
+            assert tuple(kw_t.shape) == (KV, exp_in) and tuple(vw_t.shape) == (KV, exp_in), (
+                f"ae.{i} k/v_proj are {tuple(kw_t.shape)}/{tuple(vw_t.shape)}, expected "
+                f"{(KV, exp_in)} for a {'self' if kv_is_self else 'cross'} layer -- if this "
+                f"fires, EXPERT_SELF_ON_EVEN (self_attn_on_even) is inverted")
+            if kv_is_self:
+                # 480 -> 512, zero in-columns against the padded residual stream.
+                la["k_weight"] = store_weight(self, kpad(kw_t, HP))
+                la["v_weight"] = store_weight(self, kpad(vw_t, HP))
+            else:
+                # NO K-PAD. The A operand on cross layers is the flattened prefix KV
+                # cache, exactly 320 wide -- never the 512-padded expert stream. 320 is
+                # 5*64 elements = 640 bytes = 5*128B rows, so it already satisfies both
+                # the 64-element ALU floor and the 128-byte SRAM row rule; padding it to
+                # 512 would make the operand widths disagree with the activation.
+                assert (KV % UE_VECTOR_SIZE) == 0 and (KV * 2) % 128 == 0
+                la["k_weight"] = store_weight(self, kw_t)
+                la["v_weight"] = store_weight(self, vw_t)
             la["gate_weight"] = store_weight(self, kpad(sd[f"ae.{i}.gate_proj.weight"], HP))
             la["up_weight"] = store_weight(self, kpad(sd[f"ae.{i}.up_proj.weight"], HP))
             # N=480 outputs: 32 zero out-rows, which is what KEEPS lanes [480:512] of the
@@ -1720,6 +1854,16 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             bias[:, valid:] = float("-inf")       # nothing may attend TO a pad column
             bias[valid:, :] = float("-inf")       # pad rows attend nowhere ...
             bias[valid:, valid:] = 0.0            # ... but keep their own diagonal block
+        # BLOCK-CAUSAL, not fully bidirectional. Upstream builds att_masks as
+        # [0]*images + [0]*language + [1]*state and then
+        #     cumsum = att_masks.cumsum(1);  att_2d = cumsum[:,None,:] <= cumsum[:,:,None]
+        # With images+language in block 0 and state alone in block 1, that means images
+        # and language attend bidirectionally among THEMSELVES but cannot see the state
+        # row, while the state row sees everything. The state row is the last valid row
+        # (layout is images -> text -> state), so exactly one column needs masking off
+        # for every row above it.
+        if valid >= 2:
+            bias[:valid - 1, valid - 1] = float("-inf")
         # [PM,PM] -> [PM*G, PM*G]: stacked_bias[i,j] = bias[i//G, j//G]
         bias = bias.repeat_interleave(G, dim=0).repeat_interleave(G, dim=1)
         if bias.shape[0] < QB:
@@ -2052,13 +2196,14 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         exactly as run_denoise does for its x_t padding. pi05 hit this bug class twice."""
         PM, H = self.PREFILL_MAX_SEQ_LEN, self.HIDDEN_SIZE
         order = getattr(self, "prefix_order", None) or OpenChoices.prefix_order
-        if order != "state_images_text":
+        if order != "images_text_state":
             raise NotImplementedError(
-                f"prefix_order={order!r}: only 'state_images_text' is implemented on HW. "
-                f"The other two orders move the state row and/or scatter the image "
-                f"embeddings into the token stream, which changes every RoPE position "
-                f"and the bias's valid-row block -- resolve the layout against the "
-                f"upstream reference and update BOTH this method and build_attn_bias.")
+                f"prefix_order={order!r}: only 'images_text_state' is implemented on HW. "
+                f"That order is not a guess -- it is read off upstream's shipped "
+                f"embed_prefix (smolvla/modeling.py), which appends images, then "
+                f"language, then state. The other orders move the state row and/or "
+                f"scatter the image embeddings into the token stream, which changes "
+                f"every RoPE position and the bias's valid-row block.")
 
         vision_tokens = torch.as_tensor(vision_tokens, dtype=torch.float32)
         n_vision = vision_tokens.shape[0]
@@ -2090,12 +2235,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # token -- here the prefix text is known once per observation).
         txt = self.embedding_weight[ids].float()
 
-        x = torch.full((PM, H), 1e-6, dtype=torch.float32)   # pad rows: 1e-6, never 0
-        x[0] = st
-        x[1:1 + n_vision] = vision_tokens
-        x[1 + n_vision:1 + n_vision + ids.numel()] = txt
-
-        # ---- valid length ------------------------------------------------------------
+        # ---- valid text length (needed BEFORE layout: state is packed after it) -------
         if text_mask is None:
             n_text = int(ids.numel())
         else:
@@ -2106,7 +2246,30 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 "text_mask must be RIGHT-padded (all real slots first) -- an interior "
                 "hole shifts every later RoPE position, and the device rotates by "
                 "row index")
-        valid_len = 1 + n_vision + n_text
+
+        # ---- the sqrt(hidden) embedding scale ----------------------------------------
+        # Upstream scales image AND language embeddings by sqrt(hidden) (= sqrt(960),
+        # ~30.98) and does NOT scale the state embedding:
+        #     emb  = emb  * (emb.shape[-1] ** 0.5)      # images
+        #     lang = lang * math.sqrt(lang.shape[-1])   # language
+        # Omitting it does not blow up or NaN -- every downstream RMSNorm renormalizes,
+        # so the prefix stays well-scaled and merely encodes the wrong thing. That is
+        # precisely why no SNR gate here ever caught it.
+        emb_scale = math.sqrt(H)
+        vision_tokens = vision_tokens * emb_scale
+        txt = txt * emb_scale
+
+        # ---- layout: images -> real text -> state ------------------------------------
+        # State is packed immediately after the REAL text tokens, not after the padded
+        # 48-slot block. The device rotates row r by RoPE table entry r, while upstream
+        # uses positions = cumsum(pad_mask) - 1; those two agree only when every valid
+        # row is contiguous from 0. Leaving the text pad slots before the state row would
+        # give state row index n_vision+TEXT_LEN but position n_vision+n_text.
+        x = torch.full((PM, H), 1e-6, dtype=torch.float32)   # pad rows: 1e-6, never 0
+        x[0:n_vision] = vision_tokens
+        x[n_vision:n_vision + n_text] = txt[:n_text]
+        x[n_vision + n_text] = st
+        valid_len = n_vision + n_text + 1
 
         # Any exactly-zero row is a NaN factory in the epsilon-free RMSNorm. A real
         # embedding row can legitimately be zero-ish; check rather than assume.
@@ -2118,6 +2281,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(
             self.LM_INPUT_DRAM, x.reshape(-1).to(torch.bfloat16).contiguous())
         self._prefix_in, self._prefix_valid_len = x, valid_len
+        # kept for --gate-upstream: the gate must feed upstream the SAME state vector the
+        # device consumed (unpadded), not re-derive it and inherit a normalization diff.
+        self._prefix_state_used = torch.as_tensor(state, dtype=torch.float32).reshape(-1)
         return x, valid_len
 
     def _state_proj_cpu(self):
@@ -2461,7 +2627,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             return self.NUM_LAYERS - 1
         raise ValueError(f"unknown cross_prefix_layer_map {m!r}")
 
-    def _ae_rope_positions(self):
+    def _ae_rope_positions(self, valid_prefix_len=None):
         """Suffix RoPE positions [SUFFIX_LEN_PAD]. Continuing from the prefix means
         starting at the VALID prefix length, not the padded one: prefix positions are
         cumsum(attention_mask)-1, so the last real prefix token sits at valid_len-1 and
@@ -2469,9 +2635,45 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         shift every action token by the pad count -- small, smooth, and wrong.
 
         The 14 suffix pad rows (50..63) get positions like any other row: they are
-        COMPUTED, never skipped, and masked out by the attention bias instead."""
-        base = self.PREFIX_LEN if self.EXPERT_ROPE_CONTINUES else 0
+        COMPUTED, never skipped, and masked out by the attention bias instead.
+
+        FAULT 8. The base is the VALID prefix length, NOT the nominal PREFIX_LEN=177
+        (= 1 state + 128 image + 48 PADDED text slots). Upstream (smolvla/modeling.py,
+        denoise_step):
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)
+            position_ids   = prefix_offsets[:, None] + torch.cumsum(suffix_pad, 1) - 1
+        i.e. the first action token continues from the last REAL prefix token, so the
+        base is 1 + n_image_tokens + n_REAL_text_tokens (e.g. 141 for a 12-token prompt),
+        which is DATA-DEPENDENT. Using 177 shifted every action token's RoPE phase by
+        (177 - valid_len), e.g. 36 positions.
+
+        `valid_prefix_len=None` falls back to the nominal PREFIX_LEN so the table can be
+        built at allocation time, before any prefix has run; run_denoise re-DMAs it with
+        the real value (see _ae_refresh_runtime_constants)."""
+        if not self.EXPERT_ROPE_CONTINUES:
+            base = 0
+        elif valid_prefix_len is None:
+            base = self.PREFIX_LEN
+        else:
+            base = int(valid_prefix_len)
+            assert 0 < base <= self.PREFILL_MAX_SEQ_LEN, (
+                f"valid_prefix_len {base} outside [1,{self.PREFILL_MAX_SEQ_LEN}]")
         return torch.arange(base, base + self.SUFFIX_LEN_PAD, dtype=torch.float32)
+
+    def _ae_rope_positions_cross(self):
+        """FAULT 7. CROSS-attention query positions: REBASED to 0..chunk-1.
+
+        forward_cross_attn_layer (smolvla/modeling.py):
+            exp_pos = exp_pos - torch.min(exp_pos, dim=1, keepdim=True).values
+            eq = apply_rope(eq, exp_pos)
+        so on cross layers the expert's query is rotated at positions 0.., NOT at the
+        prefix-continued positions. (The reprojected key is not roped at all -- the
+        cached K already carries the prefix rotation.) VeraPulseRef.forward_expert does
+        the same thing: `rope_tables(torch.arange(s), ...)` on the cross branch.
+
+        Independent of the valid prefix length, so this table is a true compile-time
+        constant and never needs re-DMA'ing."""
+        return torch.arange(self.SUFFIX_LEN_PAD, dtype=torch.float32)
 
     def _ae_packed_rope_table(self, positions):
         """[S, 2*D] bf16 rows of [cos(D) | sin(D)] with sin's LOWER half pre-negated.
@@ -2515,7 +2717,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # THE COINCIDENCE THAT REMOVES A WHOLE COPY. unified_attention_core's contract is
         # Q[batch,D], K/V[aligned_seq_len,D], bias[batch,aligned_seq_len]. The stacked-Q
         # batch is 64*3 = 192, which is exactly the padded prefix length -- so a
-        # cross-attn layer can point flash straight at the frozen [192,64] cache slice
+        # cross-attn layer can point flash straight at a [192,64] reprojected-cache slice
         # with no replication at all, while a self-attn layer replicates its own 64 kv
         # rows x3 to 192 (that replication is mathematically free: softmax over G exact
         # copies of each key splits each weight G ways and the duplicated V sums it back).
@@ -2554,6 +2756,58 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self.AE_KV_HEAD_STRIDE = M * D * bpe
         self.AE_K_HEADS_DRAM = a(self.NUM_KV_HEADS * M * D)
         self.AE_V_HEADS_DRAM = a(self.NUM_KV_HEADS * M * D)
+        # ---- self-attention COMBINED [prefix ; suffix] K/V staging (FAULT 4) --------
+        # SmolVLMWithExpert.forward_attn_layer, use_cache=True / fill_kv_cache=False:
+        #     k = torch.cat([kv[idx]["key_states"], k], dim=1)
+        #     v = torch.cat([kv[idx]["value_states"], v], dim=1)
+        # i.e. a SELF layer attends over prefix_len + chunk keys, NOT over its own 50
+        # action tokens alone. Without this half the expert stack never sees the
+        # observation at all (CPU: cos 0.413 -> 0.784 from this fault alone).
+        #
+        # Padded geometry: the cached prefix occupies PM=192 rows (valid rows first,
+        # pad rows after, masked by the bias) and the suffix occupies SUFFIX_LEN_PAD=64,
+        # so the combined key/value length is PM + M = 256 -- a multiple of
+        # UE_VECTOR_SIZE, which unified_attention_core requires of aligned_seq_len.
+        # batch stays QB=192 (the stacked-Q rows) and batch <= aligned_seq_len is the
+        # kernel's only ordering constraint, so the old x G key replication is NOT
+        # needed on the combined path: it only ever existed to lift the 64-row suffix
+        # K/V up to the 192-row batch floor.
+        #
+        # ONE buffer pair, not five: the combined block is consumed by the flash call
+        # of the kv-group that just built it, so the 5 groups reuse it in turn. Rebuilt
+        # per layer per step (16 self layers x 10 Euler steps) out of the untouched
+        # cache plus this layer's freshly roped suffix K/V.
+        self.AE_COMBINED_LEN = PM + M                # 256 = prefix pad + suffix pad
+        self.AE_CK_DRAM = a(self.AE_COMBINED_LEN * D)
+        self.AE_CV_DRAM = a(self.AE_COMBINED_LEN * D)
+        # ---- cross-attention K/V reprojection staging (FAULT 5) ---------------------
+        # Cross layers do NOT feed the raw cached VLM K/V to flash. Upstream
+        # (SmolVLMWithExpert.forward_cross_attn_layer) does:
+        #     _k = k.reshape(*k.shape[:2], -1)                 # [B, S, 320] token-major
+        #     ek = exp_layer.self_attn.k_proj(_k).view(..., nkv, head_dim)
+        # and the checkpoint proves it independently: odd-layer k_proj is (320,320) --
+        # the VLM kv width -- while even-layer k_proj is (320,480), the expert hidden
+        # width. A (320,320) weight is only usable against a 320-wide activation.
+        #
+        # The cache is HEAD-MAJOR ([layer][kv_head][pos][D] blocks), but the matmul needs
+        # a TOKEN-MAJOR [PM, 320] matrix, so the 5 head blocks are interleaved per token
+        # by 5 strided copies (the exact inverse of the self-attn de-interleave above).
+        # Then the reprojected [PM,320] is de-interleaved back into 5 contiguous [PM,D]
+        # head blocks for flash.
+        #
+        # All four are SCRATCH, rebuilt from the (untouched) cache at every cross layer
+        # of every Euler step, so one set is shared by all 16 cross layers x 10 steps.
+        self.AE_XKV_HEAD_STRIDE = PM * D * bpe
+        self.AE_XK_TOK_DRAM  = a(PM * KV)   # cached K interleaved token-major [192,320]
+        self.AE_XV_TOK_DRAM  = a(PM * KV)
+        self.AE_XK_PROJ_DRAM = a(PM * KV)   # k_proj(cached K), still token-major
+        self.AE_XV_PROJ_DRAM = a(PM * KV)
+        # de-interleaved [5,192,64] flash operands. Same byte size as the *_TOK buffers;
+        # kept SEPARATE rather than aliased so the gather -> matmul -> scatter chain has
+        # no read/write overlap to reason about.
+        self.AE_XK_HEADS_DRAM = a(self.NUM_KV_HEADS * PM * D)
+        self.AE_XV_HEADS_DRAM = a(self.NUM_KV_HEADS * PM * D)
+
         self.AE_ATTN_RESULT_DRAM = a(M * Q)
         self.AE_O_PROJ_DRAM  = a(M * HP)
         self.AE_MLP_GATE_DRAM = a(M * I)
@@ -2572,8 +2826,14 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self.AE_FLASH_K_DRAM   = a(QB * D)
         self.AE_FLASH_V_DRAM   = a(QB * D)
         self.AE_FLASH_OUT_DRAM = a(QB * D)
-        # scratch layout is the kernel's: V.T[D,S] + score[S,S] + scaled_q[batch,D]
-        self.AE_FLASH_SCRATCH_DRAM = a((D + QB) * QB + QB * D)
+        # scratch layout is the kernel's: V.T[D,S] + score[S,S] + scaled_q[batch,D],
+        # with S = aligned_seq_len. Sized for the LARGEST S any flash call here uses --
+        # the self path's combined PM+M=256 (FAULT 4), not the cross path's 192. The
+        # dynamic path re-bases the three sub-buffers off the runtime aligned_seq_len,
+        # so one over-sized allocation serves both widths; under-sizing it would let the
+        # score block run off the end of the buffer into the next tensor.
+        CW = self.AE_COMBINED_LEN
+        self.AE_FLASH_SCRATCH_DRAM = a((D + CW) * CW + QB * D)
 
         # ---- constants: RoPE tables ----
         pos = self._ae_rope_positions()
@@ -2585,30 +2845,32 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         gqa = packed.repeat_interleave(G, dim=0)                  # [192, 128]
         self.AE_ROPE_GQA_DRAM = a(QB * 2 * D)
         self.dma_to_accelerator_memory(self.AE_ROPE_GQA_DRAM, gqa.flatten())
+        # FAULT 7: a SECOND table, identical in layout (packed [cos|sin] with sin's lower
+        # half pre-negated, then x G token-major replication), but at REBASED positions
+        # 0..SUFFIX_LEN_PAD-1. forward_cross_attn_layer ropes its query at
+        #     exp_pos - exp_pos.min()      (i.e. 0..chunk-1)
+        # and does NOT rope the reprojected key, so CROSS layers must use this table and
+        # SELF layers must keep the prefix-continued one above. Position-only constant --
+        # independent of the valid prefix length, so it is never re-DMA'd.
+        gqa_x = self._ae_packed_rope_table(
+            self._ae_rope_positions_cross()).repeat_interleave(G, dim=0)
+        self.AE_ROPE_GQA_CROSS_DRAM = a(QB * 2 * D)
+        self.dma_to_accelerator_memory(self.AE_ROPE_GQA_CROSS_DRAM, gqa_x.flatten())
 
         # ---- constants: attention biases -------------------------------------------
-        # -inf, not a large negative: softmax must zero those columns EXACTLY, and a
-        # -1e4 leaks a small but systematic contribution from every pad column.
-        neg = float("-inf")
-        # self: bidirectional within the 50 real action tokens. Column c of the stacked
-        # buffer is token c//G, so the mask is the token mask expanded x G. Rows are all
-        # computed, pad rows included -- they just produce output nobody reads.
-        col_tok = torch.arange(QB) // G
-        self_mask = torch.where(col_tok < self.SUFFIX_LEN, 0.0, neg)
-        self.AE_BIAS_SELF_DRAM = a(QB * QB)
+        # Built by _ae_attn_biases at the NOMINAL prefix length so the buffers exist
+        # before any prefix has run; run_denoise re-DMAs both with the data-dependent
+        # valid length (fault 8 / _ae_refresh_runtime_constants). Both are DATA, not
+        # program, so the refresh needs no recompile.
+        self_mask, cross_mask = self._ae_attn_biases(self.PREFIX_LEN)
+        self.AE_BIAS_SELF_DRAM = a(QB * self.AE_COMBINED_LEN)
         self.dma_to_accelerator_memory(
             self.AE_BIAS_SELF_DRAM,
-            self_mask.expand(QB, QB).to(torch.bfloat16).contiguous().flatten())
-        # cross: every action row attends every VALID prefix column. PREFIX_LEN is the
-        # nominal 177; the real valid length is prompt-dependent (1 + images + real text),
-        # so build_attn_bias must own this tensor once the prefix stage lands -- until
-        # then this is the documented placeholder, and it is re-DMA-able at runtime
-        # without recompiling because it is data, not program.
-        cross_mask = torch.where(torch.arange(PM) < self.PREFIX_LEN, 0.0, neg)
+            self_mask.to(torch.bfloat16).contiguous().flatten())
         self.AE_BIAS_CROSS_DRAM = a(QB * PM)
         self.dma_to_accelerator_memory(
             self.AE_BIAS_CROSS_DRAM,
-            cross_mask.expand(QB, PM).to(torch.bfloat16).contiguous().flatten())
+            cross_mask.to(torch.bfloat16).contiguous().flatten())
 
         # x_t is host-written per inference, but an address DRAM never saw returns EIO on
         # dma_read (it never entered the ECC-initialized set), so a probe before the first
@@ -2617,7 +2879,125 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             self.AE_XT_DRAM, torch.zeros(M * ADP, dtype=torch.bfloat16))
         self._ae_tensors_ready = True
 
-    def _ae_matmul(self, ue, M, K, N, A, W, OUT, bias=None, **kw):
+    def _ae_attn_biases(self, valid_prefix_len):
+        """Build (self_bias [QB, PM+M], cross_bias [QB, PM]) for a given VALID prefix
+        length. Pure host tensors -- no DRAM, no side effects -- so the same code builds
+        the placeholders at allocation time and the real ones per inference.
+
+        FAULT 8 / follow-up: the valid cutoff is 1 + n_images + n_REAL_text, NOT the
+        nominal PREFIX_LEN. Both biases MUST use the same cutoff; if they disagreed,
+        self and cross layers would mask different prefix widths."""
+        PM, M, G = self.PREFILL_MAX_SEQ_LEN, self.SUFFIX_LEN_PAD, self.GROUP_SIZE
+        QB = M * G
+        valid = int(valid_prefix_len)
+        assert 0 < valid <= PM, f"valid_prefix_len {valid} outside [1,{PM}]"
+        # -inf, not a large negative: softmax must zero those columns EXACTLY, and a
+        # -1e4 leaks a small but systematic contribution from every pad column.
+        neg = float("-inf")
+        # self: CAUSAL within the 50 real action tokens -- NOT bidirectional. It is
+        # tempting to assume the observation-encoder's bidirectional rule here; that was
+        # the bug. embed_suffix (smolvla/modeling.py) returns
+        #     att = torch.ones(bsz, x.shape[1], dtype=torch.bool)
+        # and make_att_2d_masks does
+        #     cumsum = att_masks.cumsum(1); att_2d = cumsum[:,None,:] <= cumsum[:,:,None]
+        # With all-ones att_masks cumsum = [1..50], so att_2d[i,j] = (j <= i): strictly
+        # lower-triangular INCLUDING the diagonal. Action token i sees actions 0..i only.
+        # (Mirrors VeraPulseRef.denoise's self.expert_causal_suffix block; on CPU adding
+        # it moved the action chunk from cos 0.919 to ~119 dB vs upstream.)
+        #
+        # Stacked-Q layout: row r is token r//G, column c is token c//G, so the [QB,QB]
+        # mask is the [tok,tok] causal mask expanded x G on both axes -- it is a real 2-D
+        # tensor now, no longer one broadcast row.
+        # Stacked-Q layout: flash row r is action token r//G. COLUMNS are plain suffix
+        # token indices (0..M-1): FAULT 4 removed the x G key replication -- it only
+        # existed to lift the 64-row suffix K/V to the 192-row batch floor, and the
+        # combined [prefix ; suffix] sequence is 256 rows, comfortably above it. So the
+        # suffix column block is [QB, M], not [QB, QB].
+        row_tok = torch.arange(QB) // G                            # [QB] row -> token
+        col_tok = torch.arange(M)                                  # [M]  col -> token
+        pad_col = (col_tok >= self.SUFFIX_LEN)[None, :]            # [1,M] pad columns
+        future  = col_tok[None, :] > row_tok[:, None]              # [QB,M] causal
+        self_mask = torch.where(pad_col | future,
+                                torch.tensor(neg), torch.tensor(0.0))
+        # Pad rows (row_tok >= SUFFIX_LEN) keep every real column visible -- col_tok <=
+        # row_tok holds there -- so no row is all -inf and softmax never NaNs. Those rows
+        # are still computed; their output is simply never read.
+        #
+        # FAULT 4 widens this from [QB, QB] to [QB, PM + SUFFIX_LEN_PAD]. denoise_step:
+        #     prefix_2d = prefix_pad[:, None, :].expand(bsz, suffix_len, prefix_len)
+        #     suffix_2d = make_att_2d_masks(suffix_pad, suffix_att)      # causal
+        #     full_2d   = torch.cat([prefix_2d, suffix_2d], dim=2)
+        # so every action row sees ALL VALID prefix columns plus actions 0..i. The
+        # prefix half is therefore a ROW-CONSTANT 0/-inf pattern -- exactly the cross
+        # bias -- and the suffix half is the causal block built above. Column order
+        # matches the combined K/V staging: prefix rows first, suffix rows after.
+        #
+        # VALID PREFIX LENGTH: `valid`, the data-dependent 1 + images + REAL text (e.g.
+        # 141), NOT the nominal PREFIX_LEN=177. Both biases share it by construction.
+        prefix_cols = torch.where(torch.arange(PM) < valid, 0.0, neg)
+        self_mask = torch.cat([prefix_cols.expand(QB, PM), self_mask], dim=1)
+        # ROW STRIDE IS PM + M = AE_COMBINED_LEN = 256, and the PREFIX block is only the
+        # FIRST PM = 192 columns of each row; columns [192:256) are the suffix causal +
+        # pad block built above and must never be touched by the valid-length cutoff.
+        # No row is all -inf: valid >= 1 always leaves prefix column 0 visible on every
+        # row, pad rows included, so softmax cannot produce NaN.
+        assert self_mask.shape == (QB, self.AE_COMBINED_LEN), self_mask.shape
+        assert bool((~torch.isinf(self_mask)).any(dim=1).all()), "all -inf row -> NaN"
+        # cross: every action row attends every VALID prefix column, and nothing else.
+        cross_mask = torch.where(torch.arange(PM) < valid, 0.0, neg).expand(QB, PM)
+        return self_mask.contiguous(), cross_mask.contiguous()
+
+    def _ae_refresh_runtime_constants(self, valid_prefix_len=None):
+        """FAULT 8 (+ the two bias placeholders). Re-DMA every expert constant that
+        depends on the DATA-DEPENDENT valid prefix length:
+            AE_ROPE_PACKED_DRAM / AE_ROPE_GQA_DRAM   (self-branch Q/K rope base)
+            AE_BIAS_SELF_DRAM   / AE_BIAS_CROSS_DRAM (valid-prefix cutoff)
+        All four are DRAM DATA, not program, so this needs no recompile -- exactly the
+        property AE_BIAS_CROSS_DRAM was already documented to have. AE_ROPE_GQA_CROSS_DRAM
+        is NOT refreshed: its positions are rebased to 0 and carry no prefix dependence.
+
+        Source of truth is embed_and_concat_prefix's valid_len, stashed as
+        self._prefix_valid_len. If run_denoise is called before run_prefix there is no
+        real prefix in the KV cache at all, so the fallback to the nominal PREFIX_LEN is
+        cosmetic -- it only keeps the buffers self-consistent; it is warned about, once."""
+        if valid_prefix_len is None:
+            valid_prefix_len = getattr(self, "_prefix_valid_len", None)
+        if valid_prefix_len is None:
+            valid_prefix_len = self.PREFIX_LEN
+            if not getattr(self, "_ae_valid_len_warned", False):
+                print(f"  WARNING: no prefix has run (_prefix_valid_len unset); expert "
+                      f"rope/bias fall back to the NOMINAL PREFIX_LEN="
+                      f"{self.PREFIX_LEN}. Results are only meaningful once run_prefix "
+                      f"has populated the KV cache.")
+                self._ae_valid_len_warned = True
+        valid = int(valid_prefix_len)
+        if getattr(self, "_ae_constants_valid_len", None) == valid:
+            return valid                       # already staged for this prefix
+        G, M = self.GROUP_SIZE, self.SUFFIX_LEN_PAD
+
+        packed = self._ae_packed_rope_table(self._ae_rope_positions(valid))
+        self.dma_to_accelerator_memory(self.AE_ROPE_PACKED_DRAM, packed.flatten())
+        self.dma_to_accelerator_memory(
+            self.AE_ROPE_GQA_DRAM, packed.repeat_interleave(G, dim=0).flatten())
+
+        self_mask, cross_mask = self._ae_attn_biases(valid)
+        self.dma_to_accelerator_memory(
+            self.AE_BIAS_SELF_DRAM, self_mask.to(torch.bfloat16).contiguous().flatten())
+        self.dma_to_accelerator_memory(
+            self.AE_BIAS_CROSS_DRAM, cross_mask.to(torch.bfloat16).contiguous().flatten())
+        self._ae_constants_valid_len = valid
+        print(f"  expert constants re-staged for valid_prefix_len={valid} "
+              f"(rope base {valid}..{valid + M - 1}, bias cutoff col {valid})")
+        return valid
+
+        # x_t is host-written per inference, but an address DRAM never saw returns EIO on
+        # dma_read (it never entered the ECC-initialized set), so a probe before the first
+        # write would fail rather than read zeros. Seed it.
+        self.dma_to_accelerator_memory(
+            self.AE_XT_DRAM, torch.zeros(M * ADP, dtype=torch.bfloat16))
+        self._ae_tensors_ready = True
+
+    def _ae_matmul(self, ue, M, K, N, A, W, OUT, bias=None, m_reg=None, **kw):
         """One expert/head projection. BF16 B-OPERAND ONLY: no is_B_quantized, no
         data_type, no SCALE_DRAM_ADDR -- the multipliers are 16-bit and there is no
         quantized path in this file (assert_bf16_only enforces the config side).
@@ -2628,7 +3008,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         ue.matmat_mul_core(
             M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=W, OUTPUT_DRAM_ADDR=OUT,
             C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-            gpr_M_reg=self._ae_regs["m"], **kw)
+            gpr_M_reg=self._ae_regs["m"] if m_reg is None else m_reg, **kw)
 
     def _ae_strided_copy(self, ue, src, src_jump, dst, dst_jump, rows, width):
         """Static [rows, width] strided gather -> contiguous SRAM -> strided scatter.
@@ -2795,15 +3175,19 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self.ae_layer_addrs.
 
         layer_idx % E_SELF_EVERY == 0 -> SELF attention:
-            q/k/v from the expert stream, rope over the 50 action positions,
-            duplicate its own kv 5->15, flash with the [64,64] self bias.
+            q/k/v from the expert stream, rope over the 50 action positions, CONCATENATE
+            the cached prefix K/V in front of its own suffix K/V (FAULT 4; upstream
+            forward_attn_layer's torch.cat), flash over the combined 192+64=256 keys
+            with the [192, 256] self bias.
         otherwise                     -> CROSS attention:
             q from the expert stream only (q_proj [960,480]); K/V read from the FROZEN
             prefix cache at k_cache/v_cache(layer?) -- CONFIRM the layer mapping: the
             expert has 32 layers and so does the LM, but whether cross layer i reads LM
             layer i's KV or the final-layer KV must come from the reference, not a guess.
-            Duplicate on read (the cache is stored un-replicated [192,320]), flash with
-            the [64,192] cross bias. No expert k/v/rope work on these layers.
+            the cached K/V is RE-PROJECTED through this layer's own k_proj/v_proj --
+            which on cross layers are (320,320), reading the VLM kv width, not (320,480)
+            -- and only then fed to flash with the [64,192] cross bias. No RoPE on that
+            K (it already carries the prefix rotation); the query is roped.
 
         Then o_proj -> residual -> rms_norm -> gated SiLU (1280) -> residual.
         M=64 x 32 layers x 10 steps: route matmuls through gpr_M_reg PBI or the program
@@ -2841,8 +3225,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # Note the asymmetry that defines this model: the residual is HALF the LM's
         # width, but attention is not -- q_proj projects UP, 480 -> 960, and kv_out stays
         # 320. That is what makes the expert's attention geometry bit-identical to the
-        # LM's and lets cross-attention consume the frozen prefix cache with no
-        # reprojection at all.
+        # LM's, so the frozen prefix cache DROPS IN as a [192,64]-per-head operand --
+        # but it is still re-projected first (cross k_proj is (320,320)); matching
+        # geometry is not the same thing as skipping the projection.
         if self.EXPERT_BISECT and layer_idx == (self.EXPERT_LAYERS or self.E_LAYERS) - 1:
             self._probe_copy(self.AE_PRE_NORM_DRAM, self.AE_P_NORM1_DRAM, M * HP)
         self._ae_matmul(ue, M, HP, Q, self.AE_PRE_NORM_DRAM, la["q_weight"], self.AE_Q_DRAM)
@@ -2870,12 +3255,66 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                      cos_dram_addr=self.AE_ROPE_PACKED_DRAM,
                                      sin_dram_addr=self.AE_ROPE_PACKED_DRAM + D * bpe,
                                      gpr_M_reg=regs["m"])
-        # CROSS layers do NO expert k/v/rope work at all: K and V come from the frozen
-        # prefix cache, already rotated with the prefix's own positions.
+        else:
+            # ---- CROSS layers: RE-PROJECT the frozen prefix K/V (FAULT 5) ------------
+            # This layer's k_proj/v_proj are (320,320), NOT (320,480) like a self layer's
+            # -- the checkpoint shape is the proof that the cached VLM K/V is not fed to
+            # flash raw but pushed through the expert's own projections first:
+            #     _k = k.reshape(*k.shape[:2], -1)                    # [S, 320]
+            #     ek = exp_layer.self_attn.k_proj(_k).view(S, nkv, D)
+            # (SmolVLMWithExpert.forward_cross_attn_layer; mirrored by
+            # VeraPulseRef.forward_expert under self.expert_cross_reproject.)
+            #
+            # LAYOUT. The cache is HEAD-MAJOR: head h of prefix layer `pl` is a
+            # contiguous [PM, D] block at LAYER0_K_DRAM + pl*KV_LAYER_STRIDE
+            # + h*KV_HEAD_STRIDE. k_proj needs the TOKEN-MAJOR [PM, 320] view, i.e. row t
+            # = concat over h of head h's row t. That is exactly one strided copy per
+            # head -- contiguous gather (src jump D*bpe), strided scatter into column
+            # block h (dst base + h*D*bpe, dst jump KV*bpe) -- the mirror image of the
+            # self path's de-interleave a few lines up. Deliberately NOT
+            # smart_bf16_permute_core: its last dim here would be D=64... and the
+            # documented hazard is last_dim < 64 racing ~100k memcpys through one URAM
+            # slot, so the strided-copy form is used for both directions to stay on the
+            # proven path.
+            pl = self._ae_cross_prefix_layer(layer_idx)
+            k_base = self.LAYER0_K_DRAM + pl * self.KV_LAYER_STRIDE
+            v_base = self.LAYER0_V_DRAM + pl * self.KV_LAYER_STRIDE
+            for h in range(self.NUM_KV_HEADS):
+                self._ae_strided_copy(ue, k_base + h * self.KV_HEAD_STRIDE, D * bpe,
+                                      self.AE_XK_TOK_DRAM + h * D * bpe, KV * bpe, PM, D)
+                self._ae_strided_copy(ue, v_base + h * self.KV_HEAD_STRIDE, D * bpe,
+                                      self.AE_XV_TOK_DRAM + h * D * bpe, KV * bpe, PM, D)
+            # [PM,320] @ (320,320).T -> [PM,320]. M is PM=192 rows here, not the suffix's
+            # 64, so the PBI row-loop must run off regs["qb"] (192) -- AE_FLASH_ROWS ==
+            # PM is asserted in _ae_tensor_init, which is what makes that reuse legal.
+            self._ae_matmul(ue, PM, KV, KV, self.AE_XK_TOK_DRAM, la["k_weight"],
+                            self.AE_XK_PROJ_DRAM, m_reg=regs["qb"])
+            self._ae_matmul(ue, PM, KV, KV, self.AE_XV_TOK_DRAM, la["v_weight"],
+                            self.AE_XV_PROJ_DRAM, m_reg=regs["qb"])
+            # back to head-major [5, PM, D] so flash can take a contiguous K/V per group.
+            for h in range(self.NUM_KV_HEADS):
+                self._ae_strided_copy(ue, self.AE_XK_PROJ_DRAM + h * D * bpe, KV * bpe,
+                                      self.AE_XK_HEADS_DRAM + h * self.AE_XKV_HEAD_STRIDE,
+                                      D * bpe, PM, D)
+                self._ae_strided_copy(ue, self.AE_XV_PROJ_DRAM + h * D * bpe, KV * bpe,
+                                      self.AE_XV_HEADS_DRAM + h * self.AE_XKV_HEAD_STRIDE,
+                                      D * bpe, PM, D)
+            # NO RoPE on the reprojected K: the cached K was already rotated with the
+            # PREFIX positions during prefill, and upstream does not rotate `ek`. Only
+            # the expert's query is roped on cross layers (below), with positions
+            # rebased to 0..chunk-1 (exp_pos - exp_pos.min()).
 
         # ---- per-kv-group stacked-Q flash -------------------------------------------
-        seq_len = QB if is_self else PM
+        # SELF layers now attend over the COMBINED [prefix ; suffix] key/value sequence
+        # (FAULT 4), so their aligned_seq_len is PM + M = 256, not QB. batch stays QB.
+        CW = self.AE_COMBINED_LEN
+        seq_len = CW if is_self else PM
+        seq_reg = regs["cw"] if is_self else regs["qb"]
         bias_addr = self.AE_BIAS_SELF_DRAM if is_self else self.AE_BIAS_CROSS_DRAM
+        # Which prefix layer's cache a SELF layer concatenates: the reference uses
+        # prefix_kv[i] on BOTH branches (VeraPulseRef.forward_expert), so reuse the same
+        # mapping helper the cross path uses rather than hardcoding the index.
+        self_pl = self._ae_cross_prefix_layer(layer_idx) if is_self else None
         for kv_b in range(self.NUM_KV_HEADS):
             # gather this group's 3 q-heads TOKEN-MAJOR: flash row t*G+g is q-head
             # kv_b*G+g of token t, so one flash call serves the whole group.
@@ -2885,35 +3324,78 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                       G * D * bpe, M, D)
             if is_self or self.EXPERT_ROPE_Q_ON_CROSS:
                 # rope the stacked buffer in one call at M=QB against the x G duplicated
-                # table (row r uses token r//G). On cross layers this rotates Q with the
-                # SUFFIX positions while K carries the PREFIX rotation -- which is the
-                # documented default and one of the unverified OpenChoices.
+                # table (row r uses token r//G).
+                #
+                # FAULT 7: WHICH table depends on the branch.
+                #   SELF  -> AE_ROPE_GQA_DRAM, positions valid_prefix_len.. , matching
+                #            the cached prefix K it now concatenates with (fault 4).
+                #   CROSS -> AE_ROPE_GQA_CROSS_DRAM, positions REBASED to 0..chunk-1.
+                #            forward_cross_attn_layer does
+                #                exp_pos = exp_pos - exp_pos.min(dim=1, keepdim=True)
+                #                eq = apply_rope(eq, exp_pos)
+                #            and leaves the reprojected key unroped, so the query must be
+                #            rotated from 0 here. Using the prefix-continued table (what
+                #            this emitter did before) put every cross query at a phase
+                #            offset of valid_prefix_len against a key that carries the
+                #            prefix rotation -- a silent, smooth, entirely wrong result.
+                rope_tbl = self.AE_ROPE_GQA_DRAM if is_self \
+                    else self.AE_ROPE_GQA_CROSS_DRAM
                 ue.rope_hf_core_dram(M=QB, N=D, input_dram_addr=self.AE_FLASH_Q_DRAM,
                                      output_dram_addr=self.AE_FLASH_Q_DRAM,
-                                     cos_dram_addr=self.AE_ROPE_GQA_DRAM,
-                                     sin_dram_addr=self.AE_ROPE_GQA_DRAM + D * bpe,
+                                     cos_dram_addr=rope_tbl,
+                                     sin_dram_addr=rope_tbl + D * bpe,
                                      gpr_M_reg=regs["qb"])
 
             if is_self:
-                # replicate this step's own 64 kv rows x G so K/V length == Q batch.
-                # Exact, not approximate: softmax over G identical copies of each key
-                # splits that key's weight G ways, and the equally duplicated V sums it
-                # straight back to the un-replicated result.
-                k_src = self.AE_K_HEADS_DRAM + kv_b * self.AE_KV_HEAD_STRIDE
-                v_src = self.AE_V_HEADS_DRAM + kv_b * self.AE_KV_HEAD_STRIDE
-                ue.accelerator_memory_to_sram(k_src, 0x10000, M * D)
-                self._ae_duplicate_gqa_rows(ue, M, 0x10000, self.AE_FLASH_K_DRAM)
-                ue.accelerator_memory_to_sram(v_src, 0x20000, M * D)
-                self._ae_duplicate_gqa_rows(ue, M, 0x20000, self.AE_FLASH_V_DRAM)
-                k_addr, v_addr = self.AE_FLASH_K_DRAM, self.AE_FLASH_V_DRAM
+                # ---- FAULT 4: build [prefix ; suffix] K/V for THIS kv-head -----------
+                # forward_attn_layer (use_cache=True, fill_kv_cache=False):
+                #     k = torch.cat([kv[idx]["key_states"], k], dim=1)
+                #     v = torch.cat([kv[idx]["value_states"], v], dim=1)
+                # Rows [0:PM) are the RAW cached prefix K/V for this head -- raw, not
+                # reprojected: the reprojection is a CROSS-layer behaviour (odd-layer
+                # k_proj is (320,320)); a self layer's own k_proj already produced its
+                # suffix K from the expert stream. The cache is already head-major
+                # [PM, D] per head, so this is a straight contiguous block copy, and the
+                # cache itself is only READ (it must survive all 10 Euler steps).
+                # Rows [PM:PM+M) are this layer's own roped suffix K/V, likewise a
+                # contiguous [M, D] block. Deliberately _ae_strided_copy (contiguous
+                # jumps) and NOT smart_bf16_permute_core -- last_dim D=64 sits on the
+                # documented sub-64/URAM-slot hazard boundary, and the strided-copy form
+                # is the proven path used everywhere else in this emitter.
+                #
+                # RoPE consistency: the cached K was rotated with PREFIX positions at
+                # prefill and the suffix K with SUFFIX positions here, and the suffix
+                # positions continue from the prefix -- which is exactly why upstream can
+                # concatenate the two without re-rotating either.
+                #
+                # GQA: no x G replication any more. The old duplicate_gqa_rows pair only
+                # existed to lift 64 kv rows to the 192-row batch floor
+                # (batch <= aligned_seq_len); at 256 combined rows the constraint is met
+                # outright. Correctness is unaffected -- all G q-heads of this group read
+                # the SAME K/V head, which is what GQA means, and the stacked-Q batch
+                # dimension is independent of the key length.
+                k_pre = (self.LAYER0_K_DRAM + self_pl * self.KV_LAYER_STRIDE
+                         + kv_b * self.KV_HEAD_STRIDE)
+                v_pre = (self.LAYER0_V_DRAM + self_pl * self.KV_LAYER_STRIDE
+                         + kv_b * self.KV_HEAD_STRIDE)
+                k_suf = self.AE_K_HEADS_DRAM + kv_b * self.AE_KV_HEAD_STRIDE
+                v_suf = self.AE_V_HEADS_DRAM + kv_b * self.AE_KV_HEAD_STRIDE
+                self._ae_strided_copy(ue, k_pre, D * bpe, self.AE_CK_DRAM, D * bpe, PM, D)
+                self._ae_strided_copy(ue, v_pre, D * bpe, self.AE_CV_DRAM, D * bpe, PM, D)
+                self._ae_strided_copy(ue, k_suf, D * bpe,
+                                      self.AE_CK_DRAM + PM * D * bpe, D * bpe, M, D)
+                self._ae_strided_copy(ue, v_suf, D * bpe,
+                                      self.AE_CV_DRAM + PM * D * bpe, D * bpe, M, D)
+                k_addr, v_addr = self.AE_CK_DRAM, self.AE_CV_DRAM
             else:
-                # THE FROZEN PREFIX CACHE, READ IN PLACE. [layer, kv_head, seq, dim] is
-                # already contiguous [192,64] per (layer, head), and 192 == the stacked-Q
-                # batch, so there is nothing to copy and nothing to replicate. Nothing
-                # else may ever write this region -- it must survive all 10 steps.
-                pl = self._ae_cross_prefix_layer(layer_idx)
-                off = pl * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
-                k_addr, v_addr = self.LAYER0_K_DRAM + off, self.LAYER0_V_DRAM + off
+                # THE REPROJECTED PREFIX K/V (FAULT 5), not the raw cache. Built once
+                # above for all 5 groups as contiguous [PM=192, 64] blocks -- the same
+                # geometry the raw cache had, so nothing downstream changes. Still no
+                # x G replication: 192 == the stacked-Q batch. The raw cache itself is
+                # only READ here and must survive all 10 steps untouched.
+                off = kv_b * self.AE_XKV_HEAD_STRIDE
+                k_addr = self.AE_XK_HEADS_DRAM + off
+                v_addr = self.AE_XV_HEADS_DRAM + off
 
             # FLASH STAYS ADDRESS-STATIC. Only the two dimension GPRs are runtime (the
             # same thing compile_encoder does); PBI address injection into flash corrupts
@@ -2924,7 +3406,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 BIAS_DRAM_ADDR=bias_addr, OUTPUT_DRAM_ADDR=self.AE_FLASH_OUT_DRAM,
                 SCRATCH_DRAM_ADDR=self.AE_FLASH_SCRATCH_DRAM,
                 IDENTITY_DRAM_ADDR=self.identity_addr,
-                gpr_batch_reg=regs["qb"], gpr_aligned_seq_len_reg=regs["qb"])
+                gpr_batch_reg=regs["qb"], gpr_aligned_seq_len_reg=seq_reg)
 
             # un-stack [64,G,D] -> [64,960] at THIS group's head columns. The + head*D*2
             # in the destination base is trap #8: without it every head writes columns
@@ -3007,10 +3489,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         ue.reset_inst_ptr_counter()
         regs = {"m": ue.alloc_isa_reg(),       # 64  -- rows of the suffix stream
                 "qb": ue.alloc_isa_reg(),      # 192 -- stacked-Q flash rows / kv length
+                "cw": ue.alloc_isa_reg(),      # 256 -- combined prefix+suffix kv length
+                                               #        on SELF layers (FAULT 4)
                 "silu": ue.alloc_isa_reg(),    # 512 -- the elementwise-reshaped SiLU
                 "time": ue.alloc_isa_reg()}    # advancing timestep-table row pointer
         ue.generate_instruction_add_set(regs["m"], M)
         ue.generate_instruction_add_set(regs["qb"], self.AE_FLASH_ROWS)
+        ue.generate_instruction_add_set(regs["cw"], self.AE_COMBINED_LEN)
         ue.generate_instruction_add_set(regs["silu"], (M * HP) // UE_VECTOR_SIZE)
         ue.generate_instruction_add_set(
             regs["time"], ue_35bit_addr_shifter(self.AE_TIME_TABLE_DRAM))
@@ -3368,6 +3853,14 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # _ae_tensor_init is idempotent (_ae_tensors_ready), so the later call inside
         # compile_denoise_loop is a no-op rather than a double allocation.
         self._ae_tensor_init()
+
+        # FAULT 8: the expert's RoPE base and both attention biases depend on the VALID
+        # prefix length, which is prompt-dependent and only known after run_prefix. They
+        # are DRAM data, not program, so re-staging them here costs four DMAs and NO
+        # recompile -- the compiled denoise program reads whatever those addresses hold.
+        # Must happen before _execute_denoise; doing it before _compile_once as well is
+        # harmless and keeps any compile-time probe reading consistent constants.
+        self._ae_refresh_runtime_constants()
 
         M, ADP = self.SUFFIX_LEN_PAD, self.ACTION_DIM_PAD
         chunk, adim = self.CHUNK, self.ACTION_DIM
@@ -4208,9 +4701,16 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         hw_embed = self._read_bf16(self.AE_P_EMBED_DRAM, (M, HP), label="p_embed")
         h = hw_embed.clone()          # start from the DEVICE's own suffix embedding so
                                       # this isolates the LAYER, not the embed path
-        pos = (torch.arange(self.PREFIX_LEN, self.PREFIX_LEN + M)
+        # FAULT 8: the device's self-branch rope base is the VALID prefix length, not the
+        # nominal PREFIX_LEN (_ae_refresh_runtime_constants re-DMAs the table per
+        # inference). Mirror it or this oracle scores a phase-shifted model.
+        vlen_p = int(getattr(self, "_last_prefix", {}).get(
+            "valid_len", getattr(self, "_prefix_valid_len", self.PREFIX_LEN)))
+        pos = (torch.arange(vlen_p, vlen_p + M)
                if self.EXPERT_ROPE_CONTINUES else torch.arange(M))
         cos_t, sin_t = rope_tables(pos, D, self._cfg["lm"]["rope_theta"])
+        # FAULT 7: cross layers rope Q at REBASED positions 0..M-1 (AE_ROPE_GQA_CROSS).
+        cos_x, sin_x = rope_tables(torch.arange(M), D, self._cfg["lm"]["rope_theta"])
 
         # THE MASKS THE DEVICE USES. The suffix is CHUNK=50 real rows padded to
         # SUFFIX_LEN_PAD=64, and _emit_expert_layer passes AE_BIAS_SELF_DRAM (self) /
@@ -4227,9 +4727,19 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # because they were also being SCORED, dragged attn from 18.9 dB down to 13.8 --
         # the mask "fix" was worse than no mask. Mirror the device, do not improve on it.
         chunk = self.CHUNK
-        bias_self = torch.zeros(M, M)
-        bias_self[:, chunk:] = float("-inf")
-        vlen_p = int(getattr(self, "_last_prefix", {}).get("valid_len", self.PREFIX_LEN))
+        # FAULT 4: the device's self bias is now [QB, PM+M] over the COMBINED
+        # [prefix ; suffix] key sequence. Per TOKEN (this oracle is token-major, the
+        # device's stacked-Q rows are token r//G) that is:
+        #   prefix cols : 0 for col < valid_len, -inf beyond -- FAULT 8 moved the device
+        #                 off the nominal PREFIX_LEN onto the data-dependent valid
+        #                 length, and both biases are re-DMA'd per inference.
+        #   suffix cols : causal (fault 6) + pad-column masking.
+        bias_self = torch.zeros(M, self.PREFILL_MAX_SEQ_LEN)
+        bias_self[:, vlen_p:] = float("-inf")
+        suf_b = torch.zeros(M, M)
+        suf_b[:, chunk:] = float("-inf")
+        suf_b[torch.triu(torch.ones(M, M, dtype=torch.bool), diagonal=1)] = float("-inf")
+        bias_self = torch.cat([bias_self, suf_b], dim=1)           # [M, PM+M]
         PMp = self.PREFILL_MAX_SEQ_LEN
         bias_cross = torch.zeros(M, PMp)
         bias_cross[:, vlen_p:] = float("-inf")
@@ -4239,15 +4749,35 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             n1 = rms_norm(hh[:, :HR], g_("input_layernorm.weight"), eps)
             q = n1 @ g_("q_proj.weight").T
             is_self = self._ae_is_self_attn(li)
-            qh = apply_rope(q.view(M, NH, D).transpose(0, 1), cos_t, sin_t)
+            # FAULT 7: SELF ropes Q at the prefix-continued positions, CROSS at the
+            # rebased 0..M-1 ones (device: AE_ROPE_GQA_DRAM vs AE_ROPE_GQA_CROSS_DRAM).
+            qh = apply_rope(q.view(M, NH, D).transpose(0, 1),
+                            *( (cos_t, sin_t) if is_self else (cos_x, sin_x) ))
             if is_self:
                 k = n1 @ g_("k_proj.weight").T
                 v = n1 @ g_("v_proj.weight").T
                 kh = apply_rope(k.view(M, NKV, D).transpose(0, 1), cos_t, sin_t)
                 vh = v.view(M, NKV, D).transpose(0, 1)
+                # FAULT 4: prepend the RAW cached prefix K/V, exactly as
+                # forward_attn_layer's torch.cat does and as _emit_expert_layer now
+                # stages into AE_CK_DRAM/AE_CV_DRAM. Raw, not reprojected -- the
+                # reprojection is a cross-layer behaviour.
+                ppl = self._ae_cross_prefix_layer(li)
+                ppk, ppv = self._bisect_prefix_kv[ppl]
+                kh = torch.cat([ppk, kh], dim=1)
+                vh = torch.cat([ppv, vh], dim=1)
             else:
                 pl = self._ae_cross_prefix_layer(li)
-                kh, vh = self._bisect_prefix_kv[pl]
+                pk, pv = self._bisect_prefix_kv[pl]
+                # FAULT 5: the device re-projects the cached K/V through THIS layer's
+                # k_proj/v_proj (which are (320,320) here, not (320,480)) before flash,
+                # so this oracle must too or it scores the device against the wrong math.
+                S = pk.shape[1]
+                kf = pk.transpose(0, 1).reshape(S, NKV * D)          # [S, 320]
+                vf = pv.transpose(0, 1).reshape(S, NKV * D)
+                kh = (kf @ g_("k_proj.weight").T).view(S, NKV, D).transpose(0, 1)
+                vh = (vf @ g_("v_proj.weight").T).view(S, NKV, D).transpose(0, 1)
+                # no RoPE on kh: the cache already carries the prefix rotation.
             a = attend(qh, kh, vh, bias_self if is_self else bias_cross)
             o = a @ g_("o_proj.weight").T
             r1 = hh[:, :HR] + o
@@ -4511,7 +5041,12 @@ def tokenize(prompt, max_len=None, return_mask=False):
             ensure_checkpoint()          # tokenizer.json ships with the checkpoint
         _TOKENIZER = Tokenizer.from_file(path)
 
-    text = str(prompt).strip().lower()
+    # NO strip(), NO lower(). Upstream's Tokenizer.encode does exactly
+    #     s = (t + "\n") if add_newline else t
+    # and nothing else. Case-folding is not a harmless normalization here: it changes
+    # byte-level BPE token ids, and every shifted id shifts the language block the model
+    # was trained on.
+    text = str(prompt)
     if not text.endswith("\n"):
         text += "\n"
     ids = _TOKENIZER.encode(text).ids[:max_len]     # truncate, never wrap
@@ -4569,6 +5104,259 @@ def load_norm_stats():
 # ======================================================================================
 # main
 # ======================================================================================
+
+def _patch_upstream_quick_gelu(up):
+    """Swap upstream's vision activation to the one the SILICON computes.
+
+    The accelerator's fused activation is x*sigmoid(1.702x) (quick_gelu, confirmed at
+    three hardware test sites in user_hw_test.py); the model specifies
+    gelu_pytorch_tanh. That substitution alone costs 8.4 dB at the vision output, which
+    swamps every other error and makes a gate against exact upstream far too blunt to
+    catch a real fault -- a cos floor loose enough to admit the activation tax is loose
+    enough to admit genuine bugs.
+
+    Patching upstream's OWN module keeps the oracle honest: this is still the
+    checkpoint's forward pass, not our reconstruction, so the failure mode that hid the
+    activation substitution for months (bending the reference toward the hardware)
+    cannot recur. GELU simply becomes common-mode and cancels, and the gate goes back to
+    measuring arithmetic.
+    """
+    import types
+    qg = lambda t: t * torch.sigmoid(1.702 * t)
+
+    def fwd(self, x):
+        return self.fc2(qg(self.fc1(x)))
+
+    for layer in up.model.vlm_with_expert.vision.encoder.layers:
+        layer.mlp.forward = types.MethodType(fwd, layer.mlp)
+    return up
+
+
+def _upstream_load(quiet=False, hw_gelu=False):
+    """The checkpoint's OWN shipped forward pass, as the gate oracle.
+
+    hw_gelu=True patches the vision activation to the accelerator's quick_gelu, giving
+    a SHARP gate (GELU cancels). hw_gelu=False is the honest fidelity number: distance
+    from the model as published. Report both -- they answer different questions."""
+    import os as _os
+    bundle = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                           "verapulse_bin", "verapulse__pulsevla-libero-0.5b")
+    if not _os.path.isdir(bundle):
+        raise FileNotFoundError(
+            f"upstream bundle not found at {bundle} -- it ships alongside the weights; "
+            f"the downloader must not filter the .py files out")
+    sys.path.insert(0, bundle)
+    from safetensors.torch import load_file
+    from smolvla import SmolVLA, load_smolvla_config
+    cfg_u = load_smolvla_config(_os.path.join(bundle, "config.json"))
+    up = SmolVLA(cfg_u).float().eval()
+    up.load_state_dict(load_file(_os.path.join(bundle, "model.safetensors")))
+    if hw_gelu:
+        _patch_upstream_quick_gelu(up)
+    if not quiet:
+        print(f"  upstream oracle loaded "
+              f"({sum(p.numel() for p in up.parameters())/1e6:.1f}M"
+              f"{', vision GELU -> quick_gelu' if hw_gelu else ''})")
+    return up
+
+
+_UP_CACHE = {}
+
+
+def _upstream_cached(hw_gelu):
+    """Loading 2.23 GB twice per gate is pure latency; the gates want both variants."""
+    if hw_gelu not in _UP_CACHE:
+        _UP_CACHE[hw_gelu] = _upstream_load(hw_gelu=hw_gelu)
+    return _UP_CACHE[hw_gelu]
+
+
+def _upstream_prefix_gate(ue, images, token_ids, text_mask, hidden, kv):
+    """Score the DEVICE's prefix hidden state and KV cache against upstream.
+
+    Runs upstream's OWN embed_prefix + interleaved forward with fill_kv_cache=True, so
+    the prefix ordering, the sqrt(hidden) embedding scale and the block-causal mask all
+    come from the checkpoint's code rather than from our reading of it.
+
+    The KV cache matters more than the hidden state: the hidden state is thrown away,
+    while the cache is the action expert's ONLY view of the observation.
+    """
+    import math as _m
+    up = _upstream_load()
+    vwe = up.model.vlm_with_expert
+    m = torch.as_tensor(text_mask).reshape(-1).bool()
+    ids = torch.as_tensor(token_ids, dtype=torch.long).reshape(-1)
+    with torch.no_grad():
+        imgs = [images[s].permute(2, 0, 1).unsqueeze(0).contiguous().float()
+                for s in range(images.shape[0])]
+        # state: the device already has it K-padded; rebuild the same vector here
+        st = torch.as_tensor(ue._prefix_state_used, dtype=torch.float32).reshape(1, -1)
+        embs, pad, att = up.model.embed_prefix(
+            imgs, [torch.ones(1, dtype=torch.bool)] * len(imgs),
+            ids[None, :], m[None, :], st)
+        att2d = make_att_2d_masks_local(pad, att)
+        pos = torch.cumsum(pad, dim=1) - 1
+        outs, kvu = vwe.forward(attention_mask=att2d, position_ids=pos,
+                                past_key_values=None, inputs_embeds=[embs, None],
+                                use_cache=True, fill_kv_cache=True)
+    up_hidden = outs[0][0]                      # [S, 960]
+    valid = int(pad[0].sum())
+    print("\n  == DEVICE vs UPSTREAM: prefix ==")
+    print(f"  upstream prefix rows={up_hidden.shape[0]} valid={valid}; "
+          f"device valid_len={ue._prefix_valid_len}")
+    if up_hidden.shape[0] != ue._prefix_valid_len:
+        print(f"  !! ROW COUNT DISAGREES -- upstream keeps the {ids.numel()-int(m.sum())} "
+              f"padded text slots as real rows, the device packs them out. Compare only "
+              f"the valid rows.")
+    n = min(valid, int(ue._prefix_valid_len))
+    hw = torch.as_tensor(hidden).float()[:n]
+    report("prefix hidden", hw, up_hidden[:n], threshold=20.0)
+    # KV: upstream stores [B, S, n_kv, D]; device gives [n_kv, S, D] per layer
+    worst = 1.0
+    for li in (0, 1, 15, 31):
+        ku = kvu[li]["key_states"][0][:n].permute(1, 0, 2)     # [5, n, 64]
+        vu = kvu[li]["value_states"][0][:n].permute(1, 0, 2)
+        kh, vh = torch.as_tensor(kv[li][0])[:, :n], torch.as_tensor(kv[li][1])[:, :n]
+        ck, cv = cos_sim(kh, ku), cos_sim(vh, vu)
+        worst = min(worst, ck, cv)
+        print(f"    L{li:<2} K cos={ck:.6f}  V cos={cv:.6f}")
+    print(f"  worst KV cos across sampled layers: {worst:.6f}")
+    return worst
+
+
+def _upstream_denoise_gate(ue, images, token_ids, text_mask, state, noise, hw_actions,
+                           device_kv=None):
+    """Score the DEVICE's denoised action chunk against upstream's sample_actions.
+
+    Both sides integrate the SAME noise, so this is a deterministic comparison, not a
+    sampling one -- any difference is the model, not the flow.
+
+    EXPECT THIS TO FAIL until the two expert faults are fixed. Upstream's expert
+    (smolvla/modeling.py):
+      * EVEN (self-attn) layers concatenate the cached prefix K/V onto the suffix's own
+        K/V, so the expert attends over prefix_len+50 keys. The device attends over 50.
+      * ODD (cross-attn) layers REPROJECT the cached VLM K/V through the expert's own
+        k_proj/v_proj -- which the checkpoint proves are (320,320) on odd layers versus
+        (320,480) on even ones. The device feeds the raw cache straight in.
+    The number here is the size of that gap, and it is the thing that has to move.
+    """
+    up = _upstream_cached(True)          # sharp variant: GELU cancels
+    m = torch.as_tensor(text_mask).reshape(-1).bool()
+    ids = torch.as_tensor(token_ids, dtype=torch.long).reshape(-1)
+    st = torch.as_tensor(state, dtype=torch.float32).reshape(1, -1)
+    with torch.no_grad():
+        imgs = [images[s].permute(2, 0, 1).unsqueeze(0).contiguous().float()
+                for s in range(images.shape[0])]
+        up_act = up.model.sample_actions(
+            imgs, [torch.ones(1, dtype=torch.bool)] * len(imgs),
+            ids[None, :], m[None, :], st,
+            torch.as_tensor(noise, dtype=torch.float32)[None])[0]
+    hw = torch.as_tensor(hw_actions).float()
+    n = min(hw.shape[0], up_act.shape[0])
+    d = min(hw.shape[1], up_act.shape[1])
+    print("\n  == DEVICE vs UPSTREAM: denoise (same noise, deterministic) ==")
+    # NOT a row mismatch: both sides are `chunk_size` rows. The column counts differ
+    # because the model's action space is max_action_dim=32 of which only action_dim=7
+    # are real DoF -- the other 25 are the multi-embodiment zero padding, which upstream
+    # itself slices off before computing loss. The device already returns the 7.
+    print(f"  device {tuple(hw.shape)}  upstream {tuple(up_act.shape)} "
+          f"-> comparing {n} rows x {d} real DoF "
+          f"(upstream cols {d}..{up_act.shape[1]-1} are action-dim padding)")
+    report("actions vs upstream", hw[:n, :d], up_act[:n, :d], threshold=30.0)
+    c = cos_sim(hw[:n, :d], up_act[:n, :d])
+    print(f"  actions cos {c:.6f}")
+
+    # THE DEVICE-MIRROR CHECK. "Expected to be bad" is not the same as "bad in the way we
+    # predicted": a low upstream score is consistent BOTH with the three known model
+    # faults AND with an additional device-side wiring bug sitting on top of them. This
+    # scores the device against a reference deliberately configured to be just as wrong
+    # (faults off, quick_gelu), which separates the two.
+    if device_kv is not None:
+        try:
+            mirror = VeraPulseRef.from_checkpoint(hw_gelu=True).mirror_device_expert()
+            # The cache is read back at the PADDED PM rows, but the reference works in
+            # UNPADDED rows and sizes its own masks from prefix_len. Passing the padded
+            # cache with the valid length made a [50,191] mask meet 242 keys. Slice here.
+            vlen = int(ue._prefix_valid_len)
+            device_kv = [(k[:, :vlen], v[:, :vlen]) for (k, v) in device_kv]
+            with torch.no_grad():
+                # Fed the DEVICE'S OWN KV cache, so vision and prefix differences cancel
+                # and this isolates the EXPERT. Anything left is the expert alone.
+                mr = mirror.denoise(device_kv, int(ue._prefix_valid_len),
+                                    noise=torch.as_tensor(noise).float().clone())
+            mrt = torch.as_tensor(mr).float()[:n, :d]
+            report("actions vs device-mirror", hw[:n, :d], mrt, threshold=25.0)
+            print("  ^ HIGH = the accelerator faithfully executes the wrong model, so "
+                  "landing faults 4/5/6 in the emitter is sufficient.\n"
+                  "    LOW  = a SECOND device-side fault on top; the emitter work alone "
+                  "will not close it.")
+        except Exception as _e:
+            import traceback
+            print(f"  (device-mirror check failed: {_e!r})")
+            traceback.print_exc()
+    print("  NOTE: expert faults 4,5,6,7,8 are ALL LANDED. This line is the SHARP gate "
+          "(quick_gelu on both sides, so the activation substitution cancels) -- it "
+          "grades arithmetic, not fidelity. The device-mirror line below is the ceiling: "
+          "no model fix can push this above it.")
+    return c
+
+
+def make_att_2d_masks_local(pad_masks, att_masks):
+    """Upstream's make_att_2d_masks, inlined so the gate does not depend on import order."""
+    cumsum = torch.cumsum(att_masks, dim=1)
+    att_2d = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_2d = pad_masks[:, None, :] * pad_masks[:, :, None]
+    return att_2d & pad_2d
+
+
+def _upstream_vision_gate(ue, images, tokens):
+    """Score the DEVICE's vision+connector output against upstream's shipped forward.
+
+    Returns True if the device is within the GELU-explained budget.
+
+    The expected number here is NOT 40 dB and NOT 0.999. The accelerator's fused
+    activation is x*sigmoid(1.702x) (quick_gelu) while the model specifies
+    gelu_pytorch_tanh; measured on CPU with real weights, that substitution alone puts
+    the 12-layer vision output at cos 0.9268 / 8.42 dB and the connector output at
+    cos 0.9697 / 12.13 dB, with EXACT gelu scoring 113 dB. So a device reading near
+    those numbers is behaving as designed. A device reading materially WORSE has a
+    second fault that the reconstruction-based gate cannot see -- which is the entire
+    reason this function exists.
+    """
+    hw = torch.as_tensor(tokens).float()
+    print("\n  == DEVICE vs UPSTREAM: vision + connector ==")
+    out = {}
+    for hw_gelu in (False, True):
+        try:
+            up = _upstream_cached(hw_gelu)
+        except FileNotFoundError as e:
+            print(f"  --gate-upstream: {e}")
+            return False
+        vwe = up.model.vlm_with_expert
+        # Feed upstream the IDENTICAL tensor the device consumed -- never re-derive it
+        # from raw pixels, or a preprocessing difference gets blamed on the accelerator.
+        with torch.no_grad():
+            con = []
+            for s in range(images.shape[0]):
+                px = images[s].permute(2, 0, 1).unsqueeze(0).contiguous().float()
+                con.append(vwe.connector(vwe.vision(px))[0])
+            up_con = torch.cat(con, 0)
+        assert hw.shape == up_con.shape, (
+            f"device produced {tuple(hw.shape)}, upstream {tuple(up_con.shape)} -- a "
+            f"shape disagreement is a layout bug, not a numerics one; do not score it")
+        tag = "vs quick_gelu (SHARP)" if hw_gelu else "vs exact  (fidelity)"
+        report(f"vision {tag}", hw, up_con, threshold=(30.0 if hw_gelu else 11.0))
+        out[hw_gelu] = cos_sim(hw, up_con)
+    print(f"  fidelity: cos {out[False]:.6f} -- distance from the model AS PUBLISHED; "
+          f"floor set by quick_gelu, not by the accelerator")
+    print(f"  sharp   : cos {out[True]:.6f} -- GELU cancels, so this one grades the "
+          f"ARITHMETIC. Expect ~40 dB.")
+    ok = out[True] >= 0.999 and out[False] >= 0.955
+    print(f"  vision vs upstream: {'PASS' if ok else 'FAIL'}")
+    if out[True] < 0.999:
+        print("  the SHARP gate is what failed -- that is a real execution fault, not "
+              "the activation tax. Bisect vision against upstream.")
+    return ok
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -4632,6 +5420,13 @@ def main():
                          "the reference, and they never apply to the same stage.")
     ap.add_argument("--engines", type=int, default=1)
     ap.add_argument("--quant", default="bf16", choices=["bf16", "q4_64"])
+    ap.add_argument("--gate-upstream", action=argparse.BooleanOptionalAction, default=True,
+                    help="DEFAULT ON. Score the device against the checkpoint's OWN "
+                         "shipped forward pass rather than VeraPulseRef. Gating against "
+                         "our own reconstruction is what hid six model faults -- twice "
+                         "the reference had been bent toward the hardware, so the gate "
+                         "could only ever find hardware bugs, never model bugs. "
+                         "--no-gate-upstream falls back to the reference gate.")
     ap.add_argument("--snr", action=argparse.BooleanOptionalAction, default=True,
                     help="per-stage >=40 dB gate; --no-snr to disable")
     ap.add_argument("--dump-bins", action="store_true")
@@ -5075,8 +5870,10 @@ def main():
         # positions honest and the run reproducible, but the SEMANTICS of the prompt are
         # NOT in this run -- say so rather than let a plausible action table imply the
         # robot was told anything.
+        text_mask = None
         try:
-            token_ids = tokenize(args.prompt, L["tokenizer_max_length"])
+            token_ids, text_mask = tokenize(args.prompt, L["tokenizer_max_length"],
+                                            return_mask=True)
         except NotImplementedError:
             token_ids = torch.randint(0, L["vocab_size"], (L["tokenizer_max_length"],),
                                       generator=g)
@@ -5123,6 +5920,50 @@ def main():
             PHASES.summary("hardware timing")
             return
 
+        if args.gate_upstream:
+            # vision -> prefix, then score BOTH against the checkpoint's own forward.
+            ue.tensor_init()
+            toks = ue.run_vision(images)
+            ok_v = _upstream_vision_gate(ue, images, toks)
+            tm = text_mask if text_mask is not None else torch.ones(
+                token_ids.numel(), dtype=torch.bool)
+            hidden = ue.run_prefix(toks, token_ids, state, text_mask=tm)
+            PM, D, NKV = ue.PREFILL_MAX_SEQ_LEN, ue.HEAD_DIM, ue.NUM_KV_HEADS
+            kv = [(torch.stack([ue._read_bf16(ue.LAYER0_K_DRAM + li * ue.KV_LAYER_STRIDE
+                                              + h * ue.KV_HEAD_STRIDE, (PM, D),
+                                              label=f"gk{li}{h}") for h in range(NKV)]),
+                   torch.stack([ue._read_bf16(ue.LAYER0_V_DRAM + li * ue.KV_LAYER_STRIDE
+                                              + h * ue.KV_HEAD_STRIDE, (PM, D),
+                                              label=f"gv{li}{h}") for h in range(NKV)]))
+                  for li in range(ue.NUM_LAYERS)]
+            worst = _upstream_prefix_gate(ue, images, token_ids, tm, hidden, kv)
+            acts = ue.run_denoise(noise=noise)
+            c_act = _upstream_denoise_gate(ue, images, token_ids, tm, state, noise, acts,
+                                           device_kv=kv)
+
+            # Same action table the non-gated path prints, so this is a strict superset
+            # of the old default behaviour and nothing was lost by turning the gate on.
+            a = torch.as_tensor(acts).float()
+            n_exec, adim = HEADC["n_action_steps"], HEADC["action_dim"]
+            print(f"\n  MODEL OUTPUT -- first {n_exec} of {HEADC['chunk_size']} actions, "
+                  f"{adim} dof (normalized):")
+            for i in range(min(n_exec, a.shape[0])):
+                print(f"  {i:>4}  " + "".join(f"{float(v):9.4f}" for v in a[i, :adim]))
+            PHASES.summary("hardware timing")
+
+            # EXIT CODE POLICY. Non-zero means "the accelerator computed something
+            # wrong", which is the SHARP vision gate. The prefix and denoise numbers are
+            # currently limited by KNOWN, catalogued model faults that live in the
+            # emitter (causal suffix mask, (320,320) cross reprojection, prefix-K/V
+            # concat) -- reporting those loudly is useful, failing the run over them
+            # every time until they land is not.
+            print(f"\n  gate summary: vision {'ok' if ok_v else 'FAULT'} | "
+                  f"prefix worst-KV cos {worst:.4f} | actions cos {c_act:.4f}")
+            if c_act < 0.99:
+                print("  actions are limited by the 3 known expert faults (4/5/6), which "
+                      "are fixed in VeraPulseRef but NOT in the emitter.")
+            sys.exit(0 if ok_v else 1)
+
         executed = ue.run_inference(images, token_ids, state, noise=noise,
                                     snr=args.snr, stop_after=args.stop_after,
                                     strict_gates=args.strict_gates)
@@ -5146,6 +5987,16 @@ def main():
         return
 
     tokens = ue.run_vision(images)
+
+    if args.gate_upstream:
+        # THE ONLY GATE THAT DOES NOT ROUTE THROUGH OUR OWN RECONSTRUCTION.
+        # Every other vision number here scores the device against VeraPulseRef, which
+        # is built with hw_gelu=True -- i.e. bent to match the hardware. That is how an
+        # 8.4 dB activation substitution scored 0.999 for months. This scores the device
+        # against the checkpoint's OWN shipped forward pass, so nothing can hide in the
+        # agreement between two things we wrote.
+        ok = _upstream_vision_gate(ue, images, tokens)
+        sys.exit(0 if ok else 1)
 
     if not args.snr:
         print("  (SNR gate disabled -- 'finite' is NOT correctness; a clamped Inf is a "

@@ -80,7 +80,7 @@
     "kv_out": 320,
     "attn_kind": "gqa",
     "group_size": 3,
-    "_kv_match": "expert kv_out 320 == lm kv_out 320 by construction (same 5 kv heads x hd 64), which is exactly what lets the cross-attention layers read the frozen VLM prefix KV cache with no reprojection.",
+    "_kv_match": "expert kv_out 320 == lm kv_out 320 by construction (same 5 kv heads x hd 64), so the frozen VLM prefix KV cache drops into the expert's attention geometry with no reshaping. It does NOT mean the cache is used unprojected: cross-attention layers RE-PROJECT it through their own k_proj/v_proj first. The checkpoint proves it -- expert.layers.0.self_attn.k_proj.weight is (320,480) (self: expert hidden width) while expert.layers.1.self_attn.k_proj.weight is (320,320) (cross: the VLM kv width). No RoPE is applied to the reprojected K (the cache already carries the prefix rotation); the expert query is roped with positions rebased to 0..chunk-1.",
     "rms_norm_eps": 1e-05,
     "attention_mode": "cross_attn",
     "self_attn_every_n_layers": 2,

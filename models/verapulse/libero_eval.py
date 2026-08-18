@@ -60,6 +60,7 @@ import sys
 import time
 
 import numpy as np
+import torch
 
 _HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(_HERE))          # verapulse_test
@@ -83,15 +84,25 @@ _SUITE_MAX_STEPS = {
 }
 
 _POLICY_WARNING = (
-    "  !! THE POLICY IS NOT NUMERICALLY VALIDATED. The action expert is ~17 dB below\n"
-    "     its bf16 floor and the executed actions are at cos 0.97 vs the CPU oracle.\n"
-    "     Any success rate below measures a KNOWN-BUGGY model. Do not quote it.")
+    "  !! FPGA BACKEND ONLY: the action expert on the DEVICE is missing three known\n"
+    "     model faults (prefix-K/V concat on even layers, (320,320) cross reprojection,\n"
+    "     causal suffix mask). They are fixed in VeraPulseRef and NOT in the emitter, so\n"
+    "     the device reads cos 0.64 vs upstream. --backend cpu and --backend oracle both\n"
+    "     reproduce upstream exactly (114.9 dB / 1/1 on libero_object) and are sound.")
 
 
 # ---------------------------------------------------------------------------
 # observation -> model inputs, and model output -> robot action
 # ---------------------------------------------------------------------------
-def _resize_with_pad(img_u8, size):
+def _resize_with_pad_UNUSED(img_u8, size):
+    """DEAD -- kept only as a record of what NOT to do.
+
+    This resamples with PIL bilinear on uint8 and centre-pads. Upstream resamples with
+    F.interpolate bilinear on float [0,1] and pads left/top. Those are different images,
+    not different paddings, and at LIBERO's 256->512 the resample is real. The live path
+    calls upstream's own resize_with_pad from _VeraPulsePre. Delete once nothing in the
+    tree references it.
+    """
     """(H,W,3) uint8 -> (size,size,3) uint8, ASPECT PRESERVED with zero padding.
 
     LIBERO renders 256x256 (square) so the padding is inert today, but a
@@ -135,6 +146,22 @@ class _VeraPulsePre:
         import verapulse_test as M
         self.M = M
         cfg = M._CFG
+        # DELEGATE to the checkpoint's own preprocessing rather than reimplementing it.
+        # Matching upstream by inspection is how we ended up with PIL-bilinear-on-uint8
+        # standing in for F.interpolate-bilinear-on-float (a real resample difference at
+        # 256->512, not the inert padding difference it was first written down as), plus
+        # a lowercase() upstream does not do and a different normalization epsilon.
+        # Importing their functions makes those classes of bug impossible.
+        _b = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "verapulse_bin", "verapulse__pulsevla-libero-0.5b")
+        if _b not in sys.path:
+            sys.path.insert(0, _b)
+        from smolvla.images import resize_with_pad, to_siglip_range
+        from smolvla.normalize import normalize_meanstd, pad_to
+        self._resize_with_pad = resize_with_pad
+        self._to_siglip_range = to_siglip_range
+        self._normalize_meanstd = normalize_meanstd
+        self._pad_to = pad_to
         self.text_len = cfg["lm"]["tokenizer_max_length"]         # 48
         self.state_dim = cfg["action_head"]["state_dim"]          # 32 (padded)
         self.action_dim = cfg["action_head"]["action_dim"]        # 7
@@ -147,20 +174,28 @@ class _VeraPulsePre:
 
     # -- images -------------------------------------------------------------------
     def images(self, base_u8, wrist_u8):
-        """[2,512,512,3] float32. Slot 0 = agentview ('image'), slot 1 = wrist
-        ('image2') -- the two obs keys upstream's predict_example.py uses, in that order.
+        """RAW (H,W,3) uint8 x2 -> [2,512,512,3] float32 in SigLIP range, via UPSTREAM.
 
-        ASSUMPTION (--image-norm): SigLIP/SmolVLM2 preprocessing is mean=std=0.5, i.e.
-        pixels land in [-1,1]. verapulse_test.main() feeds /255 ([0,1]) for its synthetic
-        smoke images, which is fine for an SNR gate (hardware and oracle see the same
-        pixels either way) but is NOT the training distribution. Real rollouts use [-1,1];
-        --image-norm unit switches back if the checkpoint turns out to disagree.
+        Slot 0 = agentview ('image'), slot 1 = wrist ('image2') -- the key order
+        upstream's predict_example.py uses, and the order the oracle scored 1/1 with.
+
+        Takes the images UNRESIZED: upstream's resize_with_pad is the resampler, so the
+        caller must NOT pre-resize (doing so would apply a second, different resample).
+        Their pipeline is exactly: [0,1] -> resize_with_pad(512,512) -> *2-1.
+
+        Returns HWC because that is what the device's patchify consumes; upstream works
+        in CHW, so the permute happens here and nowhere else.
         """
-        stack = np.stack([np.asarray(base_u8, dtype=np.float32),
-                          np.asarray(wrist_u8, dtype=np.float32)])
-        if self.image_norm == "pm1":
-            return stack / 127.5 - 1.0
-        return stack / 255.0
+        import torch as _t
+        out = []
+        for a in (base_u8, wrist_u8):
+            x = _t.as_tensor(np.ascontiguousarray(a), dtype=_t.float32)
+            x = (x.permute(2, 0, 1) / 255.0).unsqueeze(0)          # (1,3,H,W) in [0,1]
+            x = self._resize_with_pad(x, 512, 512, pad_value=0.0)
+            if self.image_norm == "pm1":
+                x = self._to_siglip_range(x)
+            out.append(x[0].permute(1, 2, 0))                      # -> (512,512,3)
+        return _t.stack(out).numpy().astype(np.float32)
 
     # -- language -----------------------------------------------------------------
     def tokens(self, language):
@@ -179,15 +214,17 @@ class _VeraPulsePre:
         the 1e-6 the prefix/x_t rows need) because this vector goes through state_proj, a
         plain matmul whose K-padded columns are zero weights: zeros in, zeros contributed.
         The epsilon-free RMSNorm never sees this vector directly."""
+        import torch as _t
         s = np.asarray(state_raw, dtype=np.float32).reshape(-1)
         n = self.s_mean.shape[0]
         assert s.shape[0] == n, (
             f"norm_stats expects a {n}-dim robot state, got {s.shape[0]} -- do not "
             f"silently truncate; the mean/std would apply to the wrong joints")
-        s = (s - self.s_mean) / np.maximum(self.s_std, 1e-6)
-        out = np.zeros(self.state_dim, dtype=np.float32)
-        out[:n] = s
-        return out
+        # upstream's normalize_meanstd: (x-mean)/(std+1e-8). NOT max(std,1e-6) -- those
+        # differ wherever a joint's std is small, which is exactly the gripper.
+        x = self._normalize_meanstd(_t.as_tensor(s), _t.as_tensor(self.s_mean),
+                                    _t.as_tensor(self.s_std))
+        return self._pad_to(x, self.state_dim).numpy().astype(np.float32)
 
     # -- output -------------------------------------------------------------------
     def unnormalize(self, actions):
@@ -258,6 +295,156 @@ class _FpgaBackend:
         self._first = False
         n_exec = self.M._CFG["action_head"]["n_action_steps"]
         return np.asarray(chunk[:n_exec], dtype=np.float32)
+
+
+class _CpuBackend:
+    """THE CONTROL. Runs the pure-torch oracle (VeraPulseRef) in the closed loop, with
+    no FPGA involved at all.
+
+    This is the experiment that separates two completely different failure worlds:
+      * CPU SUCCEEDS, FPGA fails  -> the accelerator's numerics are the problem.
+      * CPU ALSO FAILS            -> the accelerator is exonerated and the fault is in
+                                     the MODEL ASSEMBLY or preprocessing -- and note the
+                                     assembly is still built on unverified OpenChoices
+                                     (prefix_order, the RoPE position base, the
+                                     cross-attn layer mapping). Each stage is verified
+                                     in isolation (vision 112 dB vs transformers'
+                                     SmolVLMVisionTransformer, prefix 122.8 dB vs
+                                     LlamaModel, connector bit-exact) but the way they
+                                     are wired together is not.
+
+    Cheap enough to be the default first move: ~1 s per inference on CPU versus ~19 s
+    per inference on hardware, so a full episode is about a minute instead of nine.
+    """
+
+    def __init__(self, weights="real", seed=0, tiny=False, hw_gelu=False):
+        """hw_gelu=False (DEFAULT) = the model as published; the backend answers
+        'is our implementation correct?'. hw_gelu=True substitutes the accelerator's
+        quick_gelu, so the backend instead PREDICTS THE HARDWARE.
+
+        These are different questions and the default used to be the second one, which
+        made the CPU control unable to tell us whether our model was right -- it carried
+        an 8.4 dB activation substitution by construction. Measured: hw_gelu=True reads
+        cos 0.958 vs upstream on the action chunk; hw_gelu=False reads ~119 dB."""
+        import torch
+        import verapulse_test as M
+        self.M, self.torch = M, torch
+        print(f"[eval] building CPU oracle ({weights} weights, "
+              f"{'quick_gelu (hardware-mimic)' if hw_gelu else 'exact gelu'})"
+              f"{' [tiny]' if tiny else ''}...", flush=True)
+        t0 = time.perf_counter()
+        self.ref = (M.VeraPulseRef.from_checkpoint(hw_gelu=hw_gelu) if weights == "real"
+                    else M.VeraPulseRef.from_fake(seed=seed, hw_gelu=hw_gelu))
+        if tiny:
+            self.ref.n_vis = self.ref.n_lm = self.ref.n_ae = 2
+        cfg = M._CFG
+        self.V, self.C = cfg["vision"], cfg["connector"]
+        self.n_exec = cfg["action_head"]["n_action_steps"]
+        self.adim = cfg["action_head"]["action_dim"]
+        self.rng = np.random.RandomState(seed)
+        print(f"[eval] oracle ready in {time.perf_counter() - t0:.1f}s", flush=True)
+
+    def infer(self, images, ids, mask, state32, noise=None):
+        torch, M = self.torch, self.M
+        V = self.V
+        P, NPS, CH = V["patch_size"], V["num_patches_per_side"], V["num_channels"]
+        imgs = torch.as_tensor(np.asarray(images), dtype=torch.float32)
+        ids_t = torch.as_tensor(np.asarray(ids), dtype=torch.long)
+        mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool)
+        st = torch.as_tensor(np.asarray(state32), dtype=torch.float32)
+        with torch.no_grad():
+            vis = []
+            for s in range(imgs.shape[0]):
+                planes = imgs[s].permute(2, 0, 1).contiguous()
+                patches = planes.reshape(CH, NPS, P, NPS, P).permute(1, 3, 0, 2, 4) \
+                                .reshape(V["num_patches"], CH * P * P)
+                vis.append(self.ref.forward_vision(patches))
+            toks = torch.cat([self.ref.forward_connector(v) for v in vis], 0)
+            # Only the REAL text tokens, mirroring what run_prefix does with the mask.
+            x, valid, pos = self.ref.build_prefix(toks, ids_t[mask_t], st)
+            _, kv = self.ref.forward_prefix(x, pos)
+            acts = self.ref.denoise(kv, x.shape[0], noise=noise)
+        return np.asarray(acts[:self.n_exec, :self.adim], dtype=np.float32)
+
+
+class _OracleBackend:
+    """UPSTREAM'S OWN reference implementation, driven by our env loop.
+
+    This is the ground truth, not another reconstruction: the `smolvla/` package that
+    ships with the checkpoint, loaded with a STRICT state_dict (it would throw on any
+    architecture mismatch -- which is itself the proof that the expert's odd-layer
+    k_proj really is (320,320) and reprojects the cached VLM K/V).
+
+    It deliberately bypasses _VeraPulsePre and consumes RAW observations, so their
+    processor does the resize/pad, the [-1,1] map, the tokenization and the state
+    normalization. That takes OUR preprocessing out of the comparison too -- which
+    matters, because that is exactly where the lowercase-tokenizer and centre-pad
+    differences live. `takes_raw_obs` is the flag the infer() closure switches on.
+
+    Needs only torch + safetensors + tokenizers. NOT lerobot and NOT libero: upstream's
+    own eval_libero.py wants those, but we drive the simulator ourselves, so the model
+    is the only thing we borrow. ~1-2 s per inference on CPU.
+    """
+
+    takes_raw_obs = True
+
+    def __init__(self, bundle=None, device="cpu", n_exec=10, seed=0):
+        bundle = bundle or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "verapulse_bin", "verapulse__pulsevla-libero-0.5b")
+        if not os.path.isdir(bundle):
+            raise FileNotFoundError(
+                f"upstream bundle not found at {bundle} -- it ships with the checkpoint; "
+                f"run the downloader (it must NOT filter the .py files out)")
+        # Prepend so `import smolvla` resolves to the bundle, never to a stray install.
+        sys.path.insert(0, bundle)
+        from safetensors.torch import load_file
+        from smolvla import (SmolVLA, SmolVLAProcessor, Tokenizer,
+                             load_lerobot_norm_stats, load_smolvla_config)
+        from smolvla.types import Obs
+
+        self.Obs, self.device, self.n_exec = Obs, device, n_exec
+        print(f"[eval] building UPSTREAM oracle from {bundle} on {device}...", flush=True)
+        t0 = time.perf_counter()
+        cfg = load_smolvla_config(os.path.join(bundle, "config.json"),
+                                  n_action_steps=n_exec)
+        self.model = SmolVLA(cfg).float().to(device).eval()
+        self.model.load_state_dict(load_file(os.path.join(bundle, "model.safetensors")))
+        stats = load_lerobot_norm_stats(os.path.join(bundle, "norm_stats.safetensors"))
+        tok = Tokenizer(os.path.join(bundle, "tokenizer.json"),
+                        max_length=cfg.tokenizer_max_length)
+        self.proc = SmolVLAProcessor(cfg, tok, stats, device=device)
+        torch.manual_seed(seed)          # the policy samples flow-matching noise
+        n_par = sum(p.numel() for p in self.model.parameters()) / 1e6
+        print(f"[eval] oracle ready in {time.perf_counter() - t0:.1f}s "
+              f"({n_par:.1f}M params)", flush=True)
+
+    def infer_raw(self, base_u8, wrist_u8, state_raw, language):
+        """RAW obs -> (n_exec, 7) in ROBOT UNITS.
+
+        Returns DE-NORMALIZED actions, unlike every other backend here, because their
+        postprocess_action already applies a*std+mean. The caller must therefore skip
+        pre.unnormalize -- denormalizing twice does not crash, it just makes a correct
+        policy look broken, which is the exact failure mode we are trying to rule out.
+
+        Images arrive already 180-flipped and resized to 512 by the loop; their
+        resize_with_pad on a 512 square is a no-op, so there is no second resample.
+        """
+        def _img(a):
+            t = torch.as_tensor(np.ascontiguousarray(a), dtype=torch.float32)
+            return (t.permute(2, 0, 1) / 255.0).unsqueeze(0).to(self.device)
+
+        obs = self.Obs(
+            images={"image": _img(base_u8), "image2": _img(wrist_u8)},
+            state=torch.as_tensor(
+                np.asarray(state_raw, dtype=np.float32))[None].to(self.device),
+            task=[str(language)],
+        )
+        model_input = self.proc.to_model_input(obs)
+        with torch.inference_mode():
+            chunk = self.model.predict_action_chunk(model_input)
+        acts = self.proc.postprocess_action(chunk[:, : self.n_exec])
+        return np.asarray(acts[0], dtype=np.float32)
 
 
 class _FakeBackend:
@@ -351,6 +538,63 @@ def _load_previous(path):
     return eps, {(int(e["task_id"]), int(e["trial"])) for e in eps}
 
 
+def compare_trace(path):
+    """CPU-ONLY replay: recompute every recorded inference with the torch oracle and
+    report per-inference divergence.
+
+    The episode summary tells you the policy failed; it cannot tell you WHETHER the
+    hardware drifted uniformly or blew up at one observation. This does -- same idea as
+    the per-layer KV curve and the per-Euler-step curve in verapulse_test.py, applied
+    across the rollout.
+
+    The oracle is fed the trace's PREPROCESSED images, so preprocessing differences
+    cannot masquerade as model error. Touches no hardware.
+    """
+    import verapulse_test as M
+    tr = np.load(path)
+    n = tr["images"].shape[0]
+    print(f"[compare] {n} inferences from {path}")
+    print("[compare] loading the real checkpoint into the torch oracle "
+          "(2.23 GB, CPU -- this is the slow part)...", flush=True)
+    ref = M.VeraPulseRef.from_checkpoint(hw_gelu=True)
+    cfg = M._CFG
+    V, C, HEAD = cfg["vision"], cfg["connector"], cfg["action_head"]
+    n_exec, adim = HEAD["n_action_steps"], HEAD["action_dim"]
+    P, NPS, CH = V["patch_size"], V["num_patches_per_side"], V["num_channels"]
+
+    print(f"\n{'inf':>4} {'cos':>10} {'snr(dB)':>9} {'rms hw/ref':>18}  {'|dev|max':>9}")
+    rows = []
+    for i in range(n):
+        imgs = torch.as_tensor(tr["images"][i])            # [2,512,512,3] preprocessed
+        ids = torch.as_tensor(tr["ids"][i])
+        mask = torch.as_tensor(tr["mask"][i])
+        state = torch.as_tensor(tr["state"][i])
+        with torch.no_grad():
+            vis = []
+            for s in range(imgs.shape[0]):
+                planes = imgs[s].permute(2, 0, 1).contiguous().float()
+                patches = planes.reshape(CH, NPS, P, NPS, P).permute(1, 3, 0, 2, 4) \
+                                .reshape(V["num_patches"], CH * P * P)
+                vis.append(ref.forward_vision(patches))
+            toks = torch.cat([ref.forward_connector(v) for v in vis], 0)
+            x, valid, pos = ref.build_prefix(toks, ids[mask], state)
+            _, kv = ref.forward_prefix(x, pos)
+            acts = ref.denoise(kv, int(mask.sum()) + toks.shape[0] + 1, noise=None)
+        r = acts[:n_exec, :adim]
+        h = torch.as_tensor(tr["hw"][i])[:n_exec, :adim]
+        m = torch.ones(h.shape[0], dtype=torch.bool)
+        c, s_, dev = M.cos_sim(h, r, m), M.snr_db(h, r, m), float((h - r).abs().max())
+        rows.append((i, c, s_, dev))
+        print(f"{i:>4} {c:>10.6f} {s_:>9.2f} {M.rms(h, m):>8.4f}/{M.rms(r, m):<8.4f} {dev:>9.4f}")
+    worst = min(rows, key=lambda t: t[1])
+    print(f"\n  worst inference: #{worst[0]}  cos={worst[1]:.6f}  snr={worst[2]:.2f} dB")
+    print(f"  mean cos: {sum(r[1] for r in rows) / len(rows):.6f}")
+    print("  UNIFORM cos across inferences => a constant numerical gap;")
+    print("  ONE bad inference => that observation drove the arm off-policy.")
+    print("  NOTE: the oracle redraws its own noise, so some spread is expected;")
+    print("  judge the SHAPE across inferences, not the absolute level.")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Closed-loop LIBERO evaluation for VeraPulse on the FPGA.")
@@ -383,6 +627,21 @@ def main():
     ap.add_argument("--dry-succeed-every", type=int, default=3,
                     help="--dry-run only: make every Nth episode 'succeed' so the "
                          "success/failure bookkeeping is exercised in both directions")
+    ap.add_argument("--backend", default="fpga", choices=["fpga", "cpu", "oracle"],
+                    help="fpga = the accelerator; cpu = OUR torch reconstruction in the "
+                         "loop; oracle = UPSTREAM'S OWN implementation from the shipped "
+                         "bundle. cpu is the control that exonerates the accelerator; "
+                         "oracle is the control that tells you whether the harness and "
+                         "the env are sound, because it is known-good by construction.")
+    ap.add_argument("--cpu-hw-gelu", action="store_true",
+                    help="--backend cpu only: build the reference with the "
+                         "accelerator's quick_gelu so the CPU run PREDICTS THE HARDWARE "
+                         "instead of testing the model. Default off: the CPU backend "
+                         "should answer 'is our implementation right?', and carrying an "
+                         "8.4 dB activation substitution by default made it unable to.")
+    ap.add_argument("--oracle-device", default="cpu",
+                    help="--backend oracle only: torch device for the reference model. "
+                         "cpu is ~1-2 s/inference and touches no FPGA.")
     ap.add_argument("--weights", default="real", choices=["real", "dummy"],
                     help="which weights weight_init stores. dummy = shape-exact synthetic "
                          "(plumbing on hardware without the 2.23 GB checkpoint); it is NOT "
@@ -402,9 +661,22 @@ def main():
     ap.add_argument("--image-norm", default="pm1", choices=["pm1", "unit"],
                     help="pixel range fed to the ViT: pm1 = [-1,1] (SigLIP/SmolVLM2 "
                          "mean=std=0.5, the training preprocessing) or unit = [0,1]")
+    ap.add_argument("--trace-out", default=None, metavar="PATH",
+                    help="record EVERY inference (preprocessed images, token ids, mask, "
+                         "state, and the hardware's normalized action chunk) to an .npz. "
+                         "Replay it against the CPU oracle with --compare-trace to see "
+                         "WHICH inference diverged, which the episode summary cannot.")
+    ap.add_argument("--compare-trace", default=None, metavar="PATH",
+                    help="offline, CPU-only: load a --trace-out file, recompute every "
+                         "inference with the torch oracle and print the per-inference "
+                         "divergence. Touches no hardware.")
     ap.add_argument("--video-out", default=str(_HERE / "data" / "libero" / "videos"))
     ap.add_argument("--no-video", action="store_true", help="skip mp4 writing")
     args = ap.parse_args()
+
+    if args.compare_trace:
+        compare_trace(args.compare_trace)
+        return
 
     print("=" * 74)
     print("  VeraPulse PulseVLA-LIBERO-0.5B  |  LIBERO closed-loop eval")
@@ -480,10 +752,22 @@ def main():
         backend = _FakeBackend(seed=args.seed)
     else:
         pre = _VeraPulsePre(args.image_norm)
-        backend = _FpgaBackend(weights=args.weights, seed=args.seed,
-                               use_run_inference=args.use_run_inference,
-                               snr=args.snr, strict_gates=args.strict_gates,
-                               fused_silu=args.fused_silu)
+        if args.backend == "oracle":
+            if args.trace_out:
+                ap.error("--trace-out is not supported with --backend oracle: it logs "
+                         "the tensors OUR preprocessing produced, but the oracle runs "
+                         "its own. The saved trace would look like a valid baseline and "
+                         "would not be one.")
+            backend = _OracleBackend(device=args.oracle_device, seed=args.seed,
+                                     n_exec=pre.n_exec)
+        elif args.backend == "cpu":
+            backend = _CpuBackend(weights=args.weights, seed=args.seed,
+                                  hw_gelu=args.cpu_hw_gelu)
+        else:
+            backend = _FpgaBackend(weights=args.weights, seed=args.seed,
+                                   use_run_inference=args.use_run_inference,
+                                   snr=args.snr, strict_gates=args.strict_gates,
+                                   fused_silu=args.fused_silu)
     print("[eval] backend ready.", flush=True)
 
     total_ep = sum(1 for _ in episodes)
@@ -499,7 +783,7 @@ def main():
             "warning": ("action expert ~17 dB below its bf16 floor, executed actions at "
                         "cos 0.97 vs the CPU oracle -- this success rate does NOT "
                         "characterize the model or the accelerator"),
-            "backend": "dry-run" if args.dry_run else "fpga",
+            "backend": "dry-run" if args.dry_run else args.backend,
             "weights": args.weights, "task_suite": args.task_suite, "seed": args.seed,
             "task_start": args.task_start, "tasks": n_tasks, "trials": args.trials,
             "max_steps": max_steps, "replan_steps": args.replan_steps,
@@ -512,11 +796,26 @@ def main():
 
     def infer(base_u8, wrist_u8, state_raw, language):
         """One inference: preprocess -> backend -> de-normalize to robot units."""
+        if getattr(backend, "takes_raw_obs", False):
+            # The oracle owns its whole input pipeline AND returns robot units, so it
+            # skips both _VeraPulsePre and pre.unnormalize. Tracing it against the
+            # hardware would be comparing two different preprocessings, so --trace-out
+            # is refused for this backend rather than silently logging a bad baseline.
+            return backend.infer_raw(base_u8, wrist_u8, state_raw, language)
         if pre is not None:
             images = pre.images(base_u8, wrist_u8)
             ids, mask = pre.tokens(language)
             state32 = pre.state(state_raw)
             chunk = backend.infer(images, ids, mask, state32)
+            if _trace is not None:
+                # Store the PREPROCESSED images -- exactly what run_vision consumed --
+                # so the oracle replays the same input rather than re-deriving it and
+                # inheriting any preprocessing difference.
+                _trace["images"].append(np.asarray(images, dtype=np.float32))
+                _trace["ids"].append(np.asarray(ids, dtype=np.int64))
+                _trace["mask"].append(np.asarray(mask, dtype=bool))
+                _trace["state"].append(np.asarray(state32, dtype=np.float32))
+                _trace["hw"].append(np.asarray(chunk, dtype=np.float32))
             return pre.unnormalize(chunk)
         # dry-run without a checkpoint: shapes only, same contract.
         images = np.stack([base_u8, wrist_u8]).astype(np.float32) / 127.5 - 1.0
@@ -524,6 +823,9 @@ def main():
         mask = np.zeros(48, dtype=bool)
         mask[:12] = True
         return backend.infer(images, ids, mask, np.zeros(32, dtype=np.float32))
+
+    _trace = ({"images": [], "ids": [], "mask": [], "state": [], "hw": []}
+              if args.trace_out else None)
 
     t_run0 = time.perf_counter()
     for task_id in range(args.task_start, args.task_start + n_tasks):
@@ -568,11 +870,12 @@ def main():
                         continue
                     # Rotate 180 to match the training-time camera convention, then
                     # resize 256 -> 512 (this model's ViT is 512, unlike pi05's 224).
+                    # 180-degree rotation only. The RESIZE now happens inside
+                    # _VeraPulsePre.images via upstream's own resize_with_pad -- doing it
+                    # here as well would apply two different resamplers in series.
                     base = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
                     wrist = np.ascontiguousarray(
                         obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                    base = _resize_with_pad(base, MODEL_IMAGE_SIZE)
-                    wrist = _resize_with_pad(wrist, MODEL_IMAGE_SIZE)
                     if not args.no_video:
                         replay.append(base)
                     if not plan:
@@ -645,7 +948,7 @@ def main():
         per_task[e["task_id"]][0] += int(bool(e.get("success")))
     print("\n" + "=" * 74)
     print(f"  LIBERO {args.task_suite}  |  backend="
-          f"{'dry-run' if args.dry_run else 'fpga'}  tasks={n_tasks}  "
+          f"{'dry-run' if args.dry_run else args.backend}  tasks={n_tasks}  "
           f"trials/task={args.trials}")
     for tid in sorted(per_task):
         s, n = per_task[tid]
@@ -655,6 +958,13 @@ def main():
           f"({time.perf_counter() - t_run0:.0f}s)")
     print(f"  per-episode results -> {results_path}")
     print(_POLICY_WARNING)
+    if _trace is not None and _trace["images"]:
+        tp = pathlib.Path(args.trace_out)
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(tp, **{k: np.stack(v) for k, v in _trace.items()})
+        print(f"  inference trace ({len(_trace['images'])} inferences) -> {tp}")
+        print(f"  replay on CPU:  python {pathlib.Path(__file__).name} "
+              f"--compare-trace {tp}")
     print("=" * 74)
 
 
