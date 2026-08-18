@@ -3006,25 +3006,25 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         never limits below 15 engines."""
         return min(self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE) // UE_VECTOR_SIZE
 
-    def _prefix_attention_block(self, ue, i, m_reg, qb_reg):
-        """KV-cache write + K rope + per-kv-group stacked-Q GQA flash + un-stack for
-        prefix layer ``i``. Lifted VERBATIM out of compile_prefix so the single-engine
-        and multi-engine emitters share one copy; the instruction order is unchanged,
-        which is what keeps the num_engines==1 program byte-identical.
+    def _prefix_kv_cache_stage(self, ue, i, m_reg):
+        """PHASE A of prefix attention for layer ``i``: de-interleave K/V into the
+        persistent cache and rope K in place.
 
-        PRIMARY-ONLY, ALWAYS. LAYER0_K/V_DRAM is the frozen input to all 10 denoise
-        steps and must have exactly ONE writer -- N engines running these strided
-        copies into the same addresses is a real race, not redundant work. Flash also
-        stages through fixed SRAM (0x10000/0x20000) and a single shared scratch."""
-        PM, H = self.PREFILL_MAX_SEQ_LEN, self.HIDDEN_SIZE
-        D, G = self.HEAD_DIM, self.GROUP_SIZE
+        PRIMARY-ONLY, ALWAYS, at every engine count. LAYER0_K/V_DRAM is the frozen
+        input to all 10 denoise steps and must have exactly ONE writer -- N engines
+        running these strided copies into the same addresses is a real race, not
+        redundant work. This is the stage's product, and it is non-negotiable.
+
+        The + h*KV_HEAD_STRIDE in the destination is the per-index offset rule: without
+        it every head lands on head 0's block and the expert cross-attends to garbage --
+        finite and scrambled, never NaN. KV_HEAD_STRIDE is PM*D*2 = 24576 B, a multiple
+        of the 32 B AXI beat and of the 128 B SRAM row (asserted below).
+        """
+        PM, D, bpe = self.PREFILL_MAX_SEQ_LEN, self.HEAD_DIM, 2
         KV = self.NUM_KV_HEADS * D
-        QB, bpe = self.LM_QB, 2
-
-        # K/V -> the PERSISTENT cache, one contiguous [PM,D] block per kv-head, then
-        # rope K in place. The + h*KV_HEAD_STRIDE in the destination is the per-index
-        # offset rule: without it every head lands on head 0's block and the expert
-        # cross-attends to garbage -- finite and scrambled, never NaN.
+        assert self.KV_HEAD_STRIDE % 128 == 0 and self.KV_LAYER_STRIDE % 128 == 0, (
+            "KV cache strides must stay 128 B (hence 32 B beat) aligned: "
+            f"head={self.KV_HEAD_STRIDE} layer={self.KV_LAYER_STRIDE}")
         for h in range(self.NUM_KV_HEADS):
             k_dst = self.LAYER0_K_DRAM + i * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
             v_dst = self.LAYER0_V_DRAM + i * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
@@ -3039,39 +3039,176 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                  sin_dram_addr=self.ROPE_PACKED_DRAM + D * bpe,
                                  gpr_M_reg=m_reg)
 
-        # per kv-group GQA: stack this group's G q-heads token-major, rope them with
-        # the x G duplicated table, replicate K/V x G, one flash, un-stack.
-        for kv_b in range(self.NUM_KV_HEADS):
-            k_src = self.LAYER0_K_DRAM + i * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
-            v_src = self.LAYER0_V_DRAM + i * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
-            for g in range(G):
-                self._ae_strided_copy(ue, self.LM_Q_DRAM + (kv_b * G + g) * D * bpe,
-                                      H * bpe, self.LM_FLASH_Q_DRAM + g * D * bpe,
-                                      G * D * bpe, PM, D)
-            ue.rope_hf_core_dram(M=QB, N=D, input_dram_addr=self.LM_FLASH_Q_DRAM,
-                                 output_dram_addr=self.LM_FLASH_Q_DRAM,
-                                 cos_dram_addr=self.ROPE_PACKED_GQA_DRAM,
-                                 sin_dram_addr=self.ROPE_PACKED_GQA_DRAM + D * bpe,
-                                 gpr_M_reg=qb_reg)
-            ue.accelerator_memory_to_sram(k_src, 0x10000, PM * D)
-            self._ae_duplicate_gqa_rows(ue, PM, 0x10000, self.LM_FLASH_K_DRAM)
-            ue.accelerator_memory_to_sram(v_src, 0x20000, PM * D)
-            self._ae_duplicate_gqa_rows(ue, PM, 0x20000, self.LM_FLASH_V_DRAM)
-            ue.unified_attention_core(
-                batch=QB, aligned_seq_len=QB, head_dim=D,
-                Q_DRAM_ADDR=self.LM_FLASH_Q_DRAM, K_DRAM_ADDR=self.LM_FLASH_K_DRAM,
-                V_DRAM_ADDR=self.LM_FLASH_V_DRAM,
-                BIAS_DRAM_ADDR=self.PREFIX_BIAS_DRAM,
-                OUTPUT_DRAM_ADDR=self.LM_FLASH_OUT_DRAM,
-                SCRATCH_DRAM_ADDR=self.LM_FLASH_SCRATCH_DRAM,
-                IDENTITY_DRAM_ADDR=self.identity_addr,
-                gpr_batch_reg=qb_reg, gpr_aligned_seq_len_reg=qb_reg)
-            for g in range(G):
-                self._ae_strided_copy(ue, self.LM_FLASH_OUT_DRAM + g * D * bpe,
-                                      G * D * bpe,
-                                      self.LM_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe,
-                                      H * bpe, PM, D)
+    def _prefix_group_q_prep(self, x_ue, kv_b, qb_reg, F_Q):
+        """PHASE B1 for one kv group: stack the group's G q-heads token-major into
+        ``F_Q`` and rope them in one M=QB call against the x G duplicated table.
 
+        Reads LM_Q_DRAM only (published by region 1's join) and writes only this
+        engine's private stacked-Q buffer, so it depends on NOTHING the KV-cache stage
+        produces and may run on the workers WHILE the primary is still staging the
+        cache. That overlap is the whole reason this is a separate method.
+        """
+        H, D, G, bpe = self.HIDDEN_SIZE, self.HEAD_DIM, self.GROUP_SIZE, 2
+        PM = self.PREFILL_MAX_SEQ_LEN
+        for g in range(G):
+            self._ae_strided_copy(x_ue, self.LM_Q_DRAM + (kv_b * G + g) * D * bpe,
+                                  H * bpe, F_Q + g * D * bpe,
+                                  G * D * bpe, PM, D)
+        x_ue.rope_hf_core_dram(M=self.LM_QB, N=D, input_dram_addr=F_Q,
+                               output_dram_addr=F_Q,
+                               cos_dram_addr=self.ROPE_PACKED_GQA_DRAM,
+                               sin_dram_addr=self.ROPE_PACKED_GQA_DRAM + D * bpe,
+                               gpr_M_reg=qb_reg)
+
+    def _prefix_group_flash(self, x_ue, i, kv_b, qb_reg, seq_reg,
+                            F_Q, F_K, F_V, F_O, F_S):
+        """PHASE B2 for one kv group: replicate this group's cached K/V x G, one flash
+        call over the whole stacked group, then un-stack into the result tensor.
+
+        MUST run after the KV-cache stage (it READS the cache the primary wrote), i.e.
+        after a barrier when sharded.
+
+        ``qb_reg`` (batch) and ``seq_reg`` (aligned_seq_len) are handed in SEPARATELY.
+        Both hold QB here -- a kv-group split changes neither dimension -- but they are
+        distinct GPRs on the sharded path on purpose: passing one register for both is
+        the bug that made vision's primary attend over 128 of 1024 rows (finite output,
+        plausible magnitudes, 23 dB gone, and a FAKE speedup because attention is
+        quadratic in the sequence it actually runs).
+
+        F_Q/F_K/F_V/F_O/F_S are the CALLING ENGINE's private flash buffers -- every one
+        of them is WRITTEN as scratch. LM_ATTN_RESULT_DRAM stays SHARED because the
+        un-stack destination already carries the group's column offset,
+        (kv_b*G+g)*D*2, so the five groups write five disjoint 384 B-aligned column
+        bands of the same [PM, H] tensor and never touch each other's bytes.
+        """
+        PM, H, D, G, bpe = (self.PREFILL_MAX_SEQ_LEN, self.HIDDEN_SIZE,
+                            self.HEAD_DIM, self.GROUP_SIZE, 2)
+        QB = self.LM_QB
+        k_src = self.LAYER0_K_DRAM + i * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
+        v_src = self.LAYER0_V_DRAM + i * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
+        # column band of the un-stack destination: 384 B per group, 32 B beat aligned.
+        assert (kv_b * G * D * bpe) % 128 == 0
+        x_ue.accelerator_memory_to_sram(k_src, 0x10000, PM * D)
+        self._ae_duplicate_gqa_rows(x_ue, PM, 0x10000, F_K)
+        x_ue.accelerator_memory_to_sram(v_src, 0x20000, PM * D)
+        self._ae_duplicate_gqa_rows(x_ue, PM, 0x20000, F_V)
+        x_ue.unified_attention_core(
+            batch=QB, aligned_seq_len=QB, head_dim=D,
+            Q_DRAM_ADDR=F_Q, K_DRAM_ADDR=F_K, V_DRAM_ADDR=F_V,
+            BIAS_DRAM_ADDR=self.PREFIX_BIAS_DRAM,
+            OUTPUT_DRAM_ADDR=F_O,
+            SCRATCH_DRAM_ADDR=F_S,
+            IDENTITY_DRAM_ADDR=self.identity_addr,
+            gpr_batch_reg=qb_reg, gpr_aligned_seq_len_reg=seq_reg)
+        for g in range(G):
+            self._ae_strided_copy(x_ue, F_O + g * D * bpe, G * D * bpe,
+                                  self.LM_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe,
+                                  H * bpe, PM, D)
+
+    def _prefix_attn_groups(self, sched):
+        """kv group -> engine index for the sharded prefix attention.
+
+        THE AXIS (see _prefix_attention_sharded for the arithmetic). NUM_KV_HEADS = 5
+        does not divide 8, so at most 5 engines carry a group.
+
+        WHEN ne > 5 THE PRIMARY TAKES NO GROUP. The primary is the only engine that may
+        write the KV cache, so it is busy with phase A while the workers run their
+        groups' Q prep; handing it a group as well would put phase A and a whole group
+        back on the same critical path. With ne <= 5 there are not enough workers to
+        cover 5 groups and the primary carries its share (kv_b % ne), exactly as
+        _ae_attn_groups does.
+        """
+        ne = sched.num_engines
+        off = 1 if ne > self.NUM_KV_HEADS else 0
+        span = ne - off
+        return [(kv_b, off + kv_b % span) for kv_b in range(self.NUM_KV_HEADS)]
+
+    def _prefix_attention_sharded(self, sched, ue, i, m_regs, qb_regs, seq_regs):
+        """Prefix attention for layer ``i``, kv-group sharded over the engines.
+
+        THE AXIS, WITH THE ARITHMETIC.
+
+          kv-group split (CHOSEN). 5 groups. Shards the flash AND each group's Q prep
+          and un-stack together, and needs no reduction of any kind: group g owns q
+          heads [g*G, g*G+G) and writes only its own column band. Caps at 5x on phase B;
+          engines 6..8 idle. Phase A (the KV cache write) is unshardable by contract.
+
+          Q-axis split of the stacked buffer. QB = 576 = 9 blocks of 64 over 8 engines
+          is (2,1,1,1,1,1,1,1), so the critical path is 2/9 of the flash -> 4.5x on the
+          flash ALONE, and it shards NEITHER the per-group prep (the x G K/V duplication
+          must be done in full on every engine that touches the group) NOR, cleanly, the
+          Q gather: the stacked buffer\'s row r is (token r//G, head r%G), so a 64-row
+          block boundary falls mid-token (64/3 is not an integer) and the gather would
+          need per-engine partial-token index math. Strictly worse than 5x, on a much
+          more delicate index derivation, plus a bias row offset and the two-GPR flash
+          fix. Rejected.
+
+          2-D (group x Q-block). 45 units over 8 engines looks like 7.5x, and it is
+          exactly 0% better than the plain group split. Re-derived for prefix rather
+          than inherited from the denoise analysis: let P be the per-group work that
+          CANNOT be split by Q rows (the x G K/V duplication -- a Q-row shard keeps K/V
+          FULL on every engine, which is precisely why it needs no softmax merge -- plus
+          the group\'s SRAM staging) and R the Q-splittable work (flash + gather +
+          un-stack). Giving group g exactly n_g engines costs P + R/n_g on each of them,
+          so the region costs max_g (P + R/n_g). With 8 engines over 5 groups,
+          sum_g n_g <= 8 < 10, so some group has n_g = 1 and the max is at least P + R
+          -- the cost of the plain 5-way split. The conclusion does not depend on P/R at
+          all, only on 8 < 2*5, so prefix\'s 9 Q-blocks (vs denoise\'s 1) do not rescue
+          it. It would only pay at ne >= 10. Rejected.
+
+        NO REDUCTION IS INTRODUCED. Every group\'s output is a disjoint set of output
+        columns, and every flash call sees the same full K/V it sees single-engine, so
+        this shard is bit-for-bit the same arithmetic in a different order across
+        engines -- numerically identical, not merely within tolerance. There is no
+        reduce_add anywhere in this path.
+
+        ONE extra barrier per layer (6 -> 7): the fence between the primary\'s cache
+        write and the workers\' reads of it. The exit fence is region 2\'s own opening
+        barrier, so no join is emitted here. sched.barrier() emits into every engine at
+        once, so the counts stay symmetric by construction.
+        """
+        assert sched.num_engines > 1, (
+            "single-engine prefix attention must go through _prefix_attention_block, "
+            "which is the byte-identical path")
+        assert sched.engines[0] is ue, "engine 0 must be the primary"
+        PE = sched.per_engine_addr
+        # PHASE A: primary only, and everyone else\'s Q prep runs concurrently with it,
+        # because the Q prep reads LM_Q_DRAM (fenced by region 1\'s join) and the cache
+        # not at all.
+        self._prefix_kv_cache_stage(ue, i, m_regs[0])
+        groups = self._prefix_attn_groups(sched)
+        for kv_b, e in groups:
+            self._prefix_group_q_prep(sched.engines[e], kv_b, qb_regs[e],
+                                      PE("lm_fq", e))
+        # THE fence: the flash reads LAYER0_K/V which the primary has just written.
+        sched.barrier()
+        for kv_b, e in groups:
+            self._prefix_group_flash(
+                sched.engines[e], i, kv_b, qb_regs[e], seq_regs[e],
+                PE("lm_fq", e), PE("lm_fk", e), PE("lm_fv", e),
+                PE("lm_fo", e), PE("lm_fscr", e))
+
+    def _prefix_attention_block(self, ue, i, m_reg, qb_reg):
+        """SINGLE-ENGINE prefix attention for layer ``i``: KV-cache write + K rope +
+        per-kv-group stacked-Q GQA flash + un-stack.
+
+        Kept as ONE method with ONE loop, in the original instruction order, so the
+        num_engines == 1 program stays byte-identical: the phase helpers it calls are
+        verbatim lifts and are invoked prep-then-flash per group exactly as the inlined
+        code ran. The multi-engine path is _prefix_attention_sharded, which calls the
+        SAME helpers with the groups spread over engines.
+
+        ``qb_reg`` is passed for BOTH flash dimensions here, which is what the
+        single-engine program has always emitted; the sharded path uses two distinct
+        GPRs (see _prefix_group_flash).
+        """
+        self._prefix_kv_cache_stage(ue, i, m_reg)
+        for kv_b in range(self.NUM_KV_HEADS):
+            self._prefix_group_q_prep(ue, kv_b, qb_reg, self.LM_FLASH_Q_DRAM)
+            self._prefix_group_flash(ue, i, kv_b, qb_reg, qb_reg,
+                                     self.LM_FLASH_Q_DRAM, self.LM_FLASH_K_DRAM,
+                                     self.LM_FLASH_V_DRAM, self.LM_FLASH_OUT_DRAM,
+                                     self.LM_FLASH_SCRATCH_DRAM)
     def compile_prefix(self):
         """The prefix instruction stream: 32 SmolLM2 layers over [PM=192, 960], compiled
         ONCE as a single captured program. Returns its DRAM address.
@@ -3279,9 +3416,14 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
           RMSNorm reduces over the full 960, so it is not column-splittable. It runs
           redundantly on every engine into private buffers -- cheaper than a barrier.
           The residual adds likewise (they feed a norm on every engine).
-          KV-cache write + RoPE + GQA duplication + flash + un-stack: PRIMARY ONLY.
-          LAYER0_K/V_DRAM is the frozen input to all 10 denoise steps and must have
-          exactly ONE writer.
+
+        ATTENTION IS NOW KV-GROUP SHARDED -- see _prefix_attention_sharded for the axis
+        arithmetic and why the Q-axis and 2-D splits lose. Only phase A of it, the
+        KV-cache write + K RoPE, stays PRIMARY ONLY: LAYER0_K/V_DRAM is the frozen input
+        to all 10 denoise steps and must have exactly ONE writer. Everything after it
+        (the stacked-Q gather, the GQA Q-RoPE, the x G K/V duplication, the flash and
+        the un-stack) runs on the engine that owns the group, and the workers' Q prep
+        overlaps the primary's phase A.
         """
         ue = self
         PM, H, I = self.PREFILL_MAX_SEQ_LEN, self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE
@@ -3327,6 +3469,38 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # down's partial sums: full [PM, H] per engine, summed by reduce_add.
             # partial[0] aliases LM_MLP_DOWN_DRAM so the reduction accumulates in place.
             sched.register_per_engine("lm_down",  self.LM_MLP_DOWN_DRAM, PM * H * bpe)
+            # ---- attention shard: every flash buffer is WRITTEN as scratch ----------
+            # Q/K/V/OUT are per-group staging, SCRATCH is the core's own workspace, and
+            # five groups run concurrently, so all five MUST be private. The scratch
+            # keeps its FULL single-engine size: unified_attention_core derives its
+            # sub-offsets from the compile-time QB/seq, so a "right-sized" copy would be
+            # read past its end rather than refused.
+            #
+            # NOT made per-engine, and verified buffer by buffer:
+            #   LM_Q_DRAM, LAYER0_K/V_DRAM, PREFIX_BIAS_DRAM, ROPE_PACKED*_DRAM,
+            #   identity      -- READ-ONLY in this region.
+            #   LM_ATTN_RESULT_DRAM -- written, but each group's destination already
+            #      carries its (kv_b*G+g)*D*2 column offset, so the five writers own
+            #      five disjoint 384 B-aligned column bands. Byte-disjoint, no race.
+            #   LM_K/V_PROJ_DRAM -- the cache stage reads only the PRIMARY's copies.
+            flash_scr_elems = (D + QB) * QB + QB * D
+            for nm, primary, elems in (("lm_fq", self.LM_FLASH_Q_DRAM,   QB * D),
+                                       ("lm_fk", self.LM_FLASH_K_DRAM,   QB * D),
+                                       ("lm_fv", self.LM_FLASH_V_DRAM,   QB * D),
+                                       ("lm_fo", self.LM_FLASH_OUT_DRAM, QB * D),
+                                       ("lm_fscr", self.LM_FLASH_SCRATCH_DRAM,
+                                        flash_scr_elems)):
+                addrs = [primary]
+                for w in sched.workers:
+                    addrs.append(w.allocate_tensor_dram(elems * bpe, label=f"prefix_{nm}",
+                                                        align_bytes=128))
+                # The worker copies are forced to 128 B (an SRAM row, hence the 32 B
+                # beat). The primary keeps its historic, already-proven address and is
+                # only checked for the beat.
+                assert addrs[0] % 32 == 0, f"{nm} primary 0x{addrs[0]:X} off-beat"
+                for a in addrs[1:]:
+                    assert a % 128 == 0, f"{nm} copy 0x{a:X} is not 128 B aligned"
+                sched.register_per_engine_addrs(nm, addrs)
             self._lm_shard_bufs_done = True
         PE = lambda name, e: sched.per_engine_addr(name, e)
         DOWN_PARTIALS = [PE("lm_down", e) for e in range(ne)]
@@ -3355,14 +3529,25 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         prog_addr = ue.get_program_dram_addr()
         sched.begin_program()
 
-        # Dimension GPRs, one set per engine. The PBI M register collapses the M-unroll
-        # exactly as it does single-engine; only the primary needs qb_reg (flash and the
-        # q-stack are primary-only).
-        m_regs = []
+        # Dimension GPRs, THREE PER ENGINE. The PBI M register collapses the M-unroll
+        # exactly as it does single-engine. qb/seq are needed on EVERY engine now that
+        # the kv groups are spread out (each engine ropes and flashes its own group),
+        # and begin_program() resets each worker's isa counter, so the primary's GPR
+        # index is meaningless on a worker -- hence one set per engine, not one shared.
+        #
+        # qb_reg (batch) and seq_reg (aligned_seq_len) are DISTINCT REGISTERS even
+        # though both hold QB. unified_attention_core must never be handed one register
+        # for both: that is the bug that silently shrank vision's attended sequence to
+        # 128 of 1024 rows, cost 23 dB, and reported a fake speedup.
+        m_regs, qb_regs, seq_regs = [], [], []
         for e, eng in enumerate(sched.engines):
             r = eng.alloc_isa_reg(); eng.generate_instruction_add_set(r, PM)
             m_regs.append(r)
-        qb_reg = ue.alloc_isa_reg(); ue.generate_instruction_add_set(qb_reg, QB)
+            rq = eng.alloc_isa_reg(); eng.generate_instruction_add_set(rq, QB)
+            qb_regs.append(rq)
+            rs = eng.alloc_isa_reg(); eng.generate_instruction_add_set(rs, QB)
+            seq_regs.append(rs)
+        assert qb_regs[0] != seq_regs[0]
 
         def emit_matmul(ctx, M, K, N, A, la, proj, OUT, split=False, **kw):
             """bf16 B operand throughout (16-bit multipliers) -- no is_B_quantized,
@@ -3401,7 +3586,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             sched.col_sharded_region(H, qkv_body, join=True)
 
             # ---- attention: PRIMARY ONLY, verbatim ------------------------------------
-            self._prefix_attention_block(ue, i, m_regs[0], qb_reg)
+            self._prefix_attention_sharded(sched, ue, i, m_regs, qb_regs, seq_regs)
 
             # ---- region 2: o_proj (N-split, gathered) ---------------------------------
             # The opening barrier fences the primary's un-stack writes to
@@ -3482,9 +3667,10 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self.PREFIX_HIDDEN_DRAM = self.LM_PRE_NORM_DRAM
 
         # LIFO, and before finalize() closes the worker captures.
-        ue.release_isa_reg()                       # qb_reg (primary only)
         for eng in sched.engines:
-            eng.release_isa_reg()                  # m_reg (every engine)
+            eng.release_isa_reg()                  # seq_reg  } LIFO, mirroring the
+            eng.release_isa_reg()                  # qb_reg   } m/qb/seq alloc order
+            eng.release_isa_reg()                  # m_reg    } on every engine
         self._prefix_worker_progs = sched.finalize()
         self._prefix_sched = sched
 
