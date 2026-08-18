@@ -2219,6 +2219,26 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         cache[key] = sched
         return sched
 
+    def _preclear_flags_once(self, sched):
+        """Clear every engine's flag register ONCE PER PROCESS, before the first launch.
+
+        The guard is process-wide, NOT per stage: preclear_flags() acts on the SHARED
+        engine pool, so a second call from a later stage is not a no-op -- it re-scans
+        every engine and issues a SW_RESET to any that reads queue_busy. A worker still
+        draining its margin NOPs from the previous stage reads exactly that, and
+        resetting it mid-flight means it never answers the next stage's first
+        rendezvous: FLAG_CHECK has no timeout, so the run hangs rather than failing.
+        (Symptom: vision at ne=8 correct, prefix hung; --pref_8 alone fine, because
+        vision at ne=1 never launched a worker to leave busy.)
+
+        Stages must ALSO join their workers after every execution; this guard stops the
+        damage, joining is what prevents it.
+        """
+        if self.__dict__.get("_vp_flags_precleared"):
+            return
+        sched.preclear_flags()
+        self.__dict__["_vp_flags_precleared"] = True
+
     def _assert_worker_programs_fit(self, sched=None, label=""):
         """Every sharded stage's worker programs share ONE allocator per worker engine.
         Overflowing an arena marches that allocator into the NEXT worker's arena --
@@ -4729,9 +4749,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 # execution. preclear_flags is the opposite: exactly once per process,
                 # before the first launch, or a stale SET from a previous run makes the
                 # first rendezvous fall straight through.
-                if not getattr(self, "_vp_flags_precleared", False):
-                    sched.preclear_flags()
-                    self._vp_flags_precleared = True
+                self._preclear_flags_once(sched)
                 sched.start_workers(self._vis_worker_prog_addrs)
 
             with PHASES.track(f"exec vision[slot{i}]", "exec"):
@@ -4771,15 +4789,18 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 # first barrier when the primary reaches it deadlocks the whole program
                 # (FLAG_CHECK has no timeout). Pass this stage's saved address list --
                 # sched._worker_prog_addrs is overwritten by any later finalize().
-                if not getattr(self, "_prefix_flags_precleared", False):
-                    # ONCE, before the first launch: a flag left set by an earlier
-                    # program (or a run that died mid-execution) makes the first
-                    # FLAG_CHECK pass spuriously.
-                    sched.preclear_flags()
-                    self._prefix_flags_precleared = True
+                self._preclear_flags_once(sched)
                 sched.start_workers(self._prefix_worker_progs)
             self.start_execute_from_dram(self._prefix_program_addr)
             self._wait_with_heartbeat("prefix", timeout=timeout)
+            if sched is not None:
+                # JOIN. The primary retires its halt as soon as the last rendezvous
+                # clears, while a worker may still be draining its (write-free) margin
+                # NOPs. Leaving them unjoined hands the NEXT stage engines that read
+                # queue_busy -- and _preclear_flags_once SW_RESETs a busy engine, which
+                # is how an unjoined worker becomes a deadlock one stage later.
+                for w in sched.workers:
+                    w.wait_queue(60.0)
         _original_print(f"  [prefix] executed in {PHASES.rows[-1][2]:.2f}s")
 
     def run_prefix(self, vision_tokens, token_ids, state, text_mask=None, timeout=300.0):
@@ -4918,9 +4939,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 # Once per process: a flag left SET by a program that died mid-run would
                 # make the first CHECK of this run pass spuriously. Guarded by
                 # is_queue_busy inside, so it is a no-op on a clean device.
-                if not self.__dict__.get("_denoise_flags_precleared"):
-                    sched.preclear_flags()
-                    self.__dict__["_denoise_flags_precleared"] = True
+                self._preclear_flags_once(sched)
                 # Workers BEFORE the primary, on EVERY execution: each run ends with the
                 # workers halted, and they must already be parked on the first
                 # rendezvous when the primary reaches it.
