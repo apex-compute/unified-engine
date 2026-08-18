@@ -1328,8 +1328,18 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     #     program 0x0D6000000 .. 0x100000000   <- primary at the bottom, arenas at 0xE0000000
     VIS_WORKER_ARENA_BASE    = 0xE0000000        # absolute, inside the program region
     VIS_WORKER_ARENA_BYTES   = 0x04000000        #  64 MB per worker (7 -> ends 0xFC000000)
-    VIS_WORKER_TENSOR_OFFSET = 0x00400000        #   4 MB in: per-engine scratch
-    VIS_WORKER_PROGRAM_OFFSET = 0x00800000       #   8 MB in: the worker's own programs
+    #
+    # THE TENSOR WINDOW MUST HOLD EVERY STAGE'S PER-ENGINE BUFFERS AT ONCE. They share
+    # one allocator per worker and are never freed, so the window has to fit the SUM,
+    # not the largest. Measured per worker: vision 2.75 MB (attn_scratch alone is 2.25,
+    # kept at full size because the core derives sub-offsets from compile-time S/D),
+    # prefix 1.76 MB, denoise 0.53 MB -- 5.04 MB total. The old 4 MB window (tensor at
+    # +4 MB, program at +8 MB) fit any ONE stage, which is why --vis_8 and --pref_8 both
+    # worked, and overflowed into the worker's own PROGRAM area at --engines 8:
+    # corrupted instruction stream -> the worker never reaches its barrier -> FLAG_CHECK
+    # spins forever. 28 MB leaves room for the attention sharding still to come.
+    VIS_WORKER_TENSOR_OFFSET = 0x00400000        #   4 MB in: per-engine scratch (28 MB)
+    VIS_WORKER_PROGRAM_OFFSET = 0x02000000       #  32 MB in: the worker's own programs
     VIS_WORKER_ARENA_TOP     = 0x100000000       # hard DRAM ceiling
 
     @staticmethod
@@ -2303,8 +2313,23 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         total = 0
         for sc in scheds:
             for i, w in enumerate(sc.workers):
-                base = (self.VIS_WORKER_ARENA_BASE + i * self.VIS_WORKER_ARENA_BYTES
-                        + self.VIS_WORKER_PROGRAM_OFFSET)
+                arena = self.VIS_WORKER_ARENA_BASE + i * self.VIS_WORKER_ARENA_BYTES
+                # THE PER-ENGINE TENSOR WINDOW. Every stage's per-engine buffers share
+                # one allocator per worker and are never freed, so this is the SUM over
+                # stages. Overflowing it runs into the worker's own program area below,
+                # which corrupts its instruction stream -- and a worker executing
+                # corrupted code hangs on FLAG_CHECK instead of failing. This assert is
+                # what was missing when --engines 8 deadlocked.
+                t_cur = w.get_tensor_dram_addr()
+                t_lim = arena + self.VIS_WORKER_PROGRAM_OFFSET
+                assert t_cur <= t_lim, (
+                    f"{label}worker {i + 1} per-engine buffers reached 0x{t_cur:X}, past "
+                    f"the 0x{t_lim:X} start of its program area "
+                    f"({(t_cur - arena - self.VIS_WORKER_TENSOR_OFFSET) / 2**20:.2f} MB "
+                    f"used of "
+                    f"{(self.VIS_WORKER_PROGRAM_OFFSET - self.VIS_WORKER_TENSOR_OFFSET) / 2**20:.0f} "
+                    f"MB). Raise VIS_WORKER_PROGRAM_OFFSET.")
+                base = arena + self.VIS_WORKER_PROGRAM_OFFSET
                 used = w.get_program_dram_addr() - base
                 assert 0 <= used <= limit, (
                     f"{label}worker {i + 1} program arena overflow: {used} B used of "
