@@ -1,0 +1,61 @@
+{
+  "model": "verapulse/pulsevla-libero-0.5b",
+  "policy_validated": false,
+  "warning": "action expert ~17 dB below its bf16 floor, executed actions at cos 0.97 vs the CPU oracle -- this success rate does NOT characterize the model or the accelerator",
+  "backend": "dry-run",
+  "weights": "real",
+  "task_suite": "libero_spatial",
+  "seed": 7,
+  "task_start": 0,
+  "tasks": 2,
+  "trials": 2,
+  "max_steps": 20,
+  "replan_steps": 10,
+  "image_norm": "pm1",
+  "entry": "vision+prefix+denoise",
+  "successes": 0,
+  "episodes_total": 4,
+  "success_rate": 0.0,
+  "episodes": [
+    {
+      "task_id": 0,
+      "trial": 0,
+      "language": "fake task 0: pick up the black bowl and place it on the plate",
+      "steps": 30,
+      "inferences": 2,
+      "seconds": 0.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 0,
+      "trial": 1,
+      "language": "fake task 0: pick up the black bowl and place it on the plate",
+      "steps": 30,
+      "inferences": 2,
+      "seconds": 0.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 1,
+      "trial": 0,
+      "language": "fake task 1: pick up the black bowl and place it on the plate",
+      "steps": 30,
+      "inferences": 2,
+      "seconds": 0.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 1,
+      "trial": 1,
+      "language": "fake task 1: pick up the black bowl and place it on the plate",
+      "steps": 30,
+      "inferences": 2,
+      "seconds": 0.1,
+      "success": false,
+      "errored": false
+    }
+  ]
+}

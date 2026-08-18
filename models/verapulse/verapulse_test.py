@@ -899,14 +899,41 @@ class VeraPulseRef:
             x = x + mm((g * u), self.w(f"ae.{i}.down_proj.weight").T)
         return rms_norm(x, self.w("ae.final_norm.weight"), eps)
 
-    def denoise(self, prefix_kv, prefix_len, noise=None, trace=False):
+    def denoise(self, prefix_kv, prefix_len, noise=None, trace=False,
+                pad_to=None, prefix_pad_to=None):
+        """Euler integration of the flow.
+
+        MASKS. On hardware the suffix is CHUNK real rows padded to SUFFIX_LEN_PAD and the
+        prefix is padded to PREFILL_MAX_SEQ_LEN, and _emit_expert_layer passes a
+        COLUMN-ONLY mask to every flash call (pad rows are computed and simply unread).
+        This reference is the oracle the hardware gate scores against, so it must carry
+        the same masks -- running it unmasked lets pad columns into the softmax on ONE
+        side of the comparison and the error compounds over 10 Euler steps.
+
+        pad_to / prefix_pad_to are the PADDED widths. When they are None the caller is
+        working with unpadded tensors (the pure-CPU reference stages), and no mask is
+        needed because there is no padding to mask.
+        """
         HEAD = self.cfg["action_head"]
         n, chunk, dim = HEAD["num_denoise_steps"], HEAD["chunk_size"], HEAD["max_action_dim"]
         x_t = noise if noise is not None else torch.randn(chunk, dim)
         dt, steps = -1.0 / n, []
+        rows = x_t.shape[0]
+        # NO SELF MASK. The device runs SUFFIX_LEN_PAD=64 rows and masks the 14 pad
+        # columns; this reference runs exactly CHUNK=50 real rows and has no padding to
+        # mask, so masked-64 and unpadded-50 compute the SAME thing. `pad_to` is accepted
+        # for symmetry and to document the asymmetry, not used -- passing a [50,64] mask
+        # onto [15,50,50] scores is a shape error, which is how this was caught.
+        b_self = None
+        assert pad_to is None or rows <= pad_to, f"rows {rows} > pad_to {pad_to}"
+        b_cross = None
+        if prefix_pad_to is not None and prefix_len < prefix_pad_to:
+            b_cross = torch.zeros(rows, prefix_pad_to)
+            b_cross[:, prefix_len:] = float("-inf")
         for i in range(n):
             h = self._suffix_embed(x_t, 1.0 + i * dt)
-            v = self.forward_expert(h, prefix_kv, prefix_len)
+            v = self.forward_expert(h, prefix_kv, prefix_len,
+                                    bias_self=b_self, bias_cross=b_cross)
             v = mm(v, self.w("head.action_out_proj.weight").T) + self.w("head.action_out_proj.bias")
             x_t = x_t + dt * v
             if trace:
@@ -1049,6 +1076,12 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     # is reused WITHIN a layer (LM_PRE_NORM, written by both norms) needs a copy.
     PREFIX_LAYERS = None
     PREFIX_BISECT = False
+
+    # Compile only the first N expert layers of ONE Euler step, and probe layer N-1.
+    # Same truncation trick as the prefix bisect: the layer under test becomes the last,
+    # so its intermediates survive and only buffers reused WITHIN a layer need a copy.
+    EXPERT_LAYERS = None
+    EXPERT_BISECT = False
 
     PREFIX_FUSED_SILU = True
 
@@ -2503,6 +2536,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self.AE_VT_DRAM      = a(M * ADP)        # dt * action_out_proj(v)
         self.AE_AIN_DRAM     = a(M * HP)         # action_in_proj(x_t)
         self.AE_TIME_ROW_DRAM = a(HP)            # one timestep row, before broadcast
+        # per-step x_t snapshots: [N_STEPS, 64, 64]
+        self.AE_STEP_SNAP_DRAM = a(self.N_STEPS * self.SUFFIX_LEN_PAD * self.ACTION_DIM_PAD)
         self.AE_TMLP_IN_DRAM = a(M * 2 * HP)     # the [64,1024] SPLIT-COLUMN buffer
         self.AE_TMLP_HID_DRAM = a(M * HP)
         self.AE_TMLP_SILU_DRAM = a(M * HP)
@@ -2526,6 +2561,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self.AE_MLP_MULT_DRAM = a(M * I)
         self.AE_MLP_DOWN_DRAM = a(M * HP)
         self.AE_FINAL_DRAM   = a(M * HP)
+        # bisect probes: AE_PRE_NORM is written by BOTH norms in a layer, and the suffix
+        # embed's output (layer-0 input) is overwritten by the ping-pong.
+        self.AE_P_NORM1_DRAM = a(M * HP)
+        self.AE_P_NORM2_DRAM = a(M * HP)
+        self.AE_P_EMBED_DRAM = a(M * HP)
 
         # ---- flash staging (fixed operands; flash itself stays address-static) ----
         self.AE_FLASH_Q_DRAM   = a(QB * D)
@@ -2647,7 +2687,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         ue.accelerator_memory_to_sram(src, 0x00000, elems)
         ue.sram_to_accelerator_memory(0x00000, dst, elems)
 
-    def _emit_suffix_embed(self, addr_reg):
+    def _emit_suffix_embed(self, addr_reg, step=None):
         """One Euler step's suffix embedding -- the block that sits BETWEEN the prefix and
         the expert's 32 layers, and runs once per denoise step.
 
@@ -2686,7 +2726,20 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # so every op consuming a computed address must be emitted BEFORE any
         # append_row() in the same body -- this op is placed first for that reason, not
         # for dataflow reasons (nothing below depends on its ordering).
-        self._emit_time_embed_from_table(addr_reg, self.AE_TIME_ROW_DRAM)
+        if step is None:
+            # ROLLED form: the row address must live in a GPR the body advances, since
+            # there is no host in the middle of a hardware loop.
+            self._emit_time_embed_from_table(addr_reg, self.AE_TIME_ROW_DRAM)
+        else:
+            # UNROLLED form (the default -- see DENOISE_ROLLED): address the row
+            # STATICALLY, exactly as pi05 does
+            #     _dram_copy(H*2, AE_COND_TABLE_DRAM + step*H*2, AE_COND_DRAM)
+            # No GPR, no add_imm, no 35-bit word/byte conversion -- that pointer already
+            # produced one bug here (advancing in BYTES where the PBI DRAM_ADDR field is
+            # a word address, striding 8 rows per step). With the loop unrolled the
+            # pointer buys nothing, so drop the whole class.
+            self._probe_copy(self.AE_TIME_TABLE_DRAM + step * self.E_HIDDEN_PAD * 2,
+                             self.AE_TIME_ROW_DRAM, self.E_HIDDEN_PAD)
 
         # 2. action_in_proj: [64,64] x [512,64]^T -> [64,512]. K=64 is the 32->64 pad
         # slot; lanes [480:512] of the output are zero because the weight's out-rows
@@ -2790,6 +2843,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # 320. That is what makes the expert's attention geometry bit-identical to the
         # LM's and lets cross-attention consume the frozen prefix cache with no
         # reprojection at all.
+        if self.EXPERT_BISECT and layer_idx == (self.EXPERT_LAYERS or self.E_LAYERS) - 1:
+            self._probe_copy(self.AE_PRE_NORM_DRAM, self.AE_P_NORM1_DRAM, M * HP)
         self._ae_matmul(ue, M, HP, Q, self.AE_PRE_NORM_DRAM, la["q_weight"], self.AE_Q_DRAM)
 
         if is_self:
@@ -2900,6 +2955,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # ---- gated MLP --------------------------------------------------------------
         # The FUSED silu_enable is fine HERE and is what smolvlm2 ships; only the time
         # MLP needs the composed form (pi05 measured -6 dB there specifically).
+        if self.EXPERT_BISECT and layer_idx == (self.EXPERT_LAYERS or self.E_LAYERS) - 1:
+            self._probe_copy(self.AE_PRE_NORM_DRAM, self.AE_P_NORM2_DRAM, M * HP)
         self._ae_matmul(ue, M, HP, I, self.AE_PRE_NORM_DRAM, la["gate_weight"],
                         self.AE_MLP_GATE_DRAM, silu_enable=True)
         self._ae_matmul(ue, M, HP, I, self.AE_PRE_NORM_DRAM, la["up_weight"],
@@ -2967,17 +3024,20 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # embedding per step (there is no host in the middle of a hardware loop).
         # The seeds above are inside the captured program, so every re-execution of the
         # whole program restarts the schedule at t = 1.0.
-        def _emit_one_euler_step():
+        def _emit_one_euler_step(step=None):
             """One Euler step. Identical bytes every time it is emitted -- the only
             per-step input is the timestep row, reached through the GPR pointer
             _emit_suffix_embed advances itself. That is what makes the rolled and
             unrolled forms numerically identical."""
-            self._emit_suffix_embed(regs["time"])          # -> AE_IO_A
-            for layer_idx in range(self.E_LAYERS):
+            self._emit_suffix_embed(regs["time"], step=step)   # -> AE_IO_A
+            n_ae = self.E_LAYERS if self.EXPERT_LAYERS is None else int(self.EXPERT_LAYERS)
+            if self.EXPERT_BISECT:
+                self._probe_copy(self.AE_IO_A_DRAM, self.AE_P_EMBED_DRAM, M * HP)
+            for layer_idx in range(n_ae):
                 self._emit_expert_layer(ue, layer_idx, None)
             # 32 layers of ping-pong end in A for an even layer count; derive it rather
             # than assume it, so a tiny/partial expert still reads the right buffer.
-            final_h = (self.AE_IO_A_DRAM if self.E_LAYERS % 2 == 0
+            final_h = (self.AE_IO_A_DRAM if n_ae % 2 == 0
                        else self.AE_IO_B_DRAM)
             ue.rms_norm_core_dram(M=M, N=HP, A_DRAM_ADDR=final_h,
                                   OUTPUT_DRAM_ADDR=self.AE_FINAL_DRAM,
@@ -2995,6 +3055,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # retire through a copy rather than an in-place eltwise: A == OUT would have
             # the kernel writing back over an operand it is still streaming.
             self._ae_dram_copy(ue, self.AE_XT_NEXT_DRAM, self.AE_XT_DRAM, M * ADP)
+            # Snapshot x_t after this step (pi05's AE_STEP_SNAPSHOT_DRAM). Gives a
+            # per-step divergence curve -- the Euler-step analogue of the per-layer KV
+            # curve that separated "one broken layer" from "uniform drift" in the prefix.
+            # Cheap: 10 x [64,64] = 80 KB total.
+            if step is not None:
+                self._ae_dram_copy(ue, self.AE_XT_DRAM,
+                                   self.AE_STEP_SNAP_DRAM + step * M * ADP * 2, M * ADP)
 
         if self.DENOISE_ROLLED:
             # One body inside a hardware loop. SMALL but UNPROVEN: _ae_duplicate_gqa_rows
@@ -3002,7 +3069,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # prefix runs the same helper at depth 2 and completes; the rolled denoise
             # hangs. pi05 reverted this exact arrangement for the same reason.
             ue.loop_start(loop_cnt=self.N_STEPS)
-            _emit_one_euler_step()
+            _emit_one_euler_step()      # rolled: GPR-addressed row, no snapshots
             ue.loop_end()
         else:
             # STATIC UNROLL (default): 10 copies of the body, max loop depth 2 -- the
@@ -3012,7 +3079,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # pointer advances inside each one, so the schedule still walks t = 1.0 ->
             # 0.1 exactly as the rolled form would.
             for _step in range(self.N_STEPS):
-                _emit_one_euler_step()
+                _emit_one_euler_step(step=_step)
 
         ue.generate_instruction_halt()
         ue.stop_capture()
@@ -4091,6 +4158,153 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             print("    offset (+h*KV_HEAD_STRIDE) in compile_prefix's strided copy.")
         return ok and kv_ok
 
+    def bisect_expert(self):
+        """Walk ONE expert layer op by op at Euler step 0. Mirrors bisect_prefix.
+
+        WHY step 0 and one layer: the per-step curve showed the hardware already 17 dB
+        BELOW the strict-16 simulated floor at step 0 (34.92 vs 52.19 dB), i.e. a single
+        pass through the expert is defective and the integrator merely amplifies it. So
+        the target is one layer of one pass, not the loop.
+
+        Also checks the 480->512 PAD LANES, which have never been verified on hardware
+        and are the precondition for the sqrt(480/512) RMSNorm gamma fold being exact.
+        """
+        E = self._cfg["expert"]
+        M, HP, I = self.SUFFIX_LEN_PAD, self.E_HIDDEN_PAD, self.E_INTER
+        HR = E["hidden_size"]                      # 480 real lanes
+        NH, NKV, D = E["num_heads"], E["num_kv_heads"], E["head_dim"]
+        eps, Q, KV = E["rms_norm_eps"], self.E_Q_OUT, self.E_KV_OUT
+        n_ae = int(self.EXPERT_LAYERS or self.E_LAYERS)
+        tgt = n_ae - 1
+        ref = self._ref_oracle()
+        w = lambda n: ref.sd[n].float()
+
+        # ---- PAD LANES: the invariant the gamma fold rests on ---------------------
+        print("\n=== EXPERT PAD-LANE CHECK (lanes [480:512] must be exactly zero) ===")
+        worst = 0.0
+        for nm, addr, wide in (("suffix embed", self.AE_P_EMBED_DRAM, HP),
+                               ("norm1", self.AE_P_NORM1_DRAM, HP),
+                               ("norm2", self.AE_P_NORM2_DRAM, HP),
+                               ("residual", self.AE_RESIDUAL_DRAM, HP),
+                               ("o_proj", self.AE_O_PROJ_DRAM, HP),
+                               ("mlp_down", self.AE_MLP_DOWN_DRAM, HP)):
+            t = self._read_bf16(addr, (M, wide), label=f"pad_{nm}")
+            pad = t[:, HR:]
+            mx = float(pad.abs().max())
+            worst = max(worst, mx)
+            # bf16's smallest NORMAL is ~1.2e-38; anything at 1e-37 is a denormal that
+            # contributes ~1e-74 to a mean-square whose real lanes are O(1). "Exactly
+            # zero" was the wrong test -- it flagged harmless denormals as dirt. What
+            # would actually break the sqrt(480/512) fold is a lane at O(1e-3) or above,
+            # where 32 of them start moving the mean-square.
+            tag = "OK" if mx < 1e-30 else "<== DIRTY (would perturb the gamma fold)"
+            print(f"  {nm:14s} pad |max|={mx:.3e}  {tag}")
+        if worst >= 1e-30:
+            print(f"  PAD LANES DIRTY (max {worst:.3e}). The expert RMSNorm folds")
+            print(f"  sqrt(480/512) into gamma on the assumption these are zero; nonzero")
+            print(f"  lanes enter the mean-square and every expert norm is mis-scaled.")
+
+        # ---- host reference, layer tgt, longhand ---------------------------------
+        hw_embed = self._read_bf16(self.AE_P_EMBED_DRAM, (M, HP), label="p_embed")
+        h = hw_embed.clone()          # start from the DEVICE's own suffix embedding so
+                                      # this isolates the LAYER, not the embed path
+        pos = (torch.arange(self.PREFIX_LEN, self.PREFIX_LEN + M)
+               if self.EXPERT_ROPE_CONTINUES else torch.arange(M))
+        cos_t, sin_t = rope_tables(pos, D, self._cfg["lm"]["rope_theta"])
+
+        # THE MASKS THE DEVICE USES. The suffix is CHUNK=50 real rows padded to
+        # SUFFIX_LEN_PAD=64, and _emit_expert_layer passes AE_BIAS_SELF_DRAM (self) /
+        # AE_BIAS_CROSS_DRAM (cross) to every flash call. Scoring against an unmasked
+        # reference makes `attn` look broken while its inputs are clean -- the EXACT
+        # artifact that made the prefix look like a 32-layer structural failure for
+        # several runs. Same bug, written twice; hence the explicit construction here
+        # rather than a None default.
+        # COLUMN-ONLY, matching the device exactly. _ae_tensor_init builds
+        #     col_tok = arange(QB) // G ; mask = where(col_tok < SUFFIX_LEN, 0, -inf)
+        # i.e. it masks pad COLUMNS and leaves pad ROWS to compute normally ("rows are
+        # all computed, pad rows included -- they just produce output nobody reads").
+        # Masking rows here too made those 14 rows diverge wildly from the device and,
+        # because they were also being SCORED, dragged attn from 18.9 dB down to 13.8 --
+        # the mask "fix" was worse than no mask. Mirror the device, do not improve on it.
+        chunk = self.CHUNK
+        bias_self = torch.zeros(M, M)
+        bias_self[:, chunk:] = float("-inf")
+        vlen_p = int(getattr(self, "_last_prefix", {}).get("valid_len", self.PREFIX_LEN))
+        PMp = self.PREFILL_MAX_SEQ_LEN
+        bias_cross = torch.zeros(M, PMp)
+        bias_cross[:, vlen_p:] = float("-inf")
+
+        def one_layer(hh, li, capture=None):
+            g_ = lambda nm: w(f"ae.{li}.{nm}")
+            n1 = rms_norm(hh[:, :HR], g_("input_layernorm.weight"), eps)
+            q = n1 @ g_("q_proj.weight").T
+            is_self = self._ae_is_self_attn(li)
+            qh = apply_rope(q.view(M, NH, D).transpose(0, 1), cos_t, sin_t)
+            if is_self:
+                k = n1 @ g_("k_proj.weight").T
+                v = n1 @ g_("v_proj.weight").T
+                kh = apply_rope(k.view(M, NKV, D).transpose(0, 1), cos_t, sin_t)
+                vh = v.view(M, NKV, D).transpose(0, 1)
+            else:
+                pl = self._ae_cross_prefix_layer(li)
+                kh, vh = self._bisect_prefix_kv[pl]
+            a = attend(qh, kh, vh, bias_self if is_self else bias_cross)
+            o = a @ g_("o_proj.weight").T
+            r1 = hh[:, :HR] + o
+            n2 = rms_norm(r1, g_("post_attention_layernorm.weight"), eps)
+            gg = F.silu(n2 @ g_("gate_proj.weight").T)
+            uu = n2 @ g_("up_proj.weight").T
+            dn = (gg * uu) @ g_("down_proj.weight").T
+            out = r1 + dn
+            if capture is not None:
+                capture.update(norm1=n1, q_proj=q, attn=a, o_proj=o, resid1=r1,
+                               norm2=n2, gate=gg, up=uu, down=dn, hidden=out,
+                               is_self=is_self)
+            return out
+
+        with torch.no_grad():
+            hh = h[:, :HR]
+            for li in range(tgt):
+                hh = one_layer(torch.cat([hh, torch.zeros(M, HP - HR)], 1), li)
+            r = {}
+            one_layer(torch.cat([hh, torch.zeros(M, HP - HR)], 1), tgt, capture=r)
+
+        h_out = self.AE_IO_B_DRAM if tgt % 2 == 0 else self.AE_IO_A_DRAM
+        cut = lambda t: t[:, :HR]
+        hw = {
+            "norm1":  cut(self._read_bf16(self.AE_P_NORM1_DRAM, (M, HP), label="n1")),
+            "q_proj": self._read_bf16(self.AE_Q_DRAM, (M, Q), label="q"),
+            "attn":   self._read_bf16(self.AE_ATTN_RESULT_DRAM, (M, Q), label="attn"),
+            "o_proj": cut(self._read_bf16(self.AE_O_PROJ_DRAM, (M, HP), label="o")),
+            "resid1": cut(self._read_bf16(self.AE_RESIDUAL_DRAM, (M, HP), label="r1")),
+            "norm2":  cut(self._read_bf16(self.AE_P_NORM2_DRAM, (M, HP), label="n2")),
+            "gate":   self._read_bf16(self.AE_MLP_GATE_DRAM, (M, I), label="gate"),
+            "up":     self._read_bf16(self.AE_MLP_UP_DRAM, (M, I), label="up"),
+            "down":   cut(self._read_bf16(self.AE_MLP_DOWN_DRAM, (M, HP), label="down")),
+            "hidden": cut(self._read_bf16(h_out, (M, HP), label="hidden")),
+        }
+        # SCORE ONLY THE 50 REAL ACTION ROWS. The 14 pad rows are computed on both
+        # sides but nobody reads them, and they hold unrelated garbage -- including them
+        # is the pi05 trap (same op: -3.4 dB with pad rows, +50 dB without).
+        rows = torch.zeros(M, dtype=torch.bool)
+        rows[: self.CHUNK] = True
+        print(f"\n=== EXPERT LAYER-{tgt} OP BISECT "
+              f"({'SELF' if r['is_self'] else 'CROSS'}-attn, {n_ae} layers) ===")
+        first_bad = None
+        for name in ("norm1", "q_proj", "attn", "o_proj", "resid1", "norm2",
+                     "gate", "up", "down", "hidden"):
+            a, b = hw[name], r[name]
+            s, c = snr_db(a, b, rows), cos_sim(a, b, rows)
+            flag = ""
+            if c < COS_FLOOR and first_bad is None:
+                first_bad, flag = name, "   <== FIRST DIVERGENCE"
+            elif c < COS_FLOOR:
+                flag = "   (inherited)"
+            print(f"  {name:7s} {str(tuple(a.shape)):11s} snr={s:8.2f}dB cos={c:.6f} "
+                  f"rms={rms(a, rows):8.4f}/{rms(b, rows):8.4f}{flag}")
+        print(f"\n  {'FIRST DIVERGENCE AT: ' + first_bad if first_bad else 'layer clean'}")
+        return first_bad
+
     def _expert_step_snr_check(self):
         """Gate the action expert + 10-step denoise against the torch oracle.
 
@@ -4135,7 +4349,38 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         valid_len = int(getattr(self, "_last_prefix", {}).get("valid_len",
                                                              self.PREFIX_LEN))
         with torch.no_grad():
-            r_actions = ref.denoise(kv, valid_len, noise=x0)
+            # PADDED WIDTHS: the KV read back from DRAM is PREFILL_MAX_SEQ_LEN wide and
+            # the suffix runs SUFFIX_LEN_PAD rows, so the oracle needs the same
+            # column masks the device applies. Omitting them let pad columns into the
+            # softmax on the reference side only, compounding across 10 Euler steps.
+            r_actions = ref.denoise(kv, valid_len, noise=x0,
+                                    pad_to=self.SUFFIX_LEN_PAD,
+                                    prefix_pad_to=self.PREFILL_MAX_SEQ_LEN)
+
+        # ---- PER-STEP EULER CURVE (pi05's AE_STEP_SNAPSHOT_DRAM) ------------------
+        # Same idea that cracked the prefix: one number at the end cannot distinguish
+        # "step 3 broke" from "every step drifts a little". The oracle is re-integrated
+        # step by step from the SAME KV and the SAME noise, so each row is honest.
+        M, ADP = self.SUFFIX_LEN_PAD, self.ACTION_DIM_PAD
+        if hasattr(self, "AE_STEP_SNAP_DRAM"):
+            with torch.no_grad():
+                _, ref_steps = ref.denoise(kv, valid_len, noise=x0, trace=True,
+                                           pad_to=self.SUFFIX_LEN_PAD,
+                                           prefix_pad_to=self.PREFILL_MAX_SEQ_LEN)
+            print("    per-Euler-step x_t curve:")
+            prev = None
+            for si in range(self.N_STEPS):
+                snap = self._read_bf16(self.AE_STEP_SNAP_DRAM + si * M * ADP * 2,
+                                       (M, ADP), label=f"step{si}")[:chunk, :adim]
+                rs = ref_steps[si][:, :adim]
+                m = torch.ones(chunk, dtype=torch.bool)
+                s, c = snr_db(snap, rs, m), cos_sim(snap, rs, m)
+                d = "" if prev is None else f"  d={s - prev:+6.2f}dB"
+                prev = s
+                print(f"      step{si:2d} t={1.0 - si / self.N_STEPS:4.2f} "
+                      f"snr={s:7.2f}dB cos={c:.6f} rms={rms(snap, m):.4f}/{rms(rs, m):.4f}{d}")
+            print("      a CLIFF at one step => that step's emission; UNIFORM decay => "
+                  "integration drift")
 
         hw_padded = dn["x_t_padded"][:chunk, :adim]
         rows = torch.ones(chunk, dtype=torch.bool)
@@ -4218,19 +4463,107 @@ class VeraPulse_Run(VeraPulse_UnifiedEngine):
 # ======================================================================================
 
 def load_sample_observation():
-    """[2,512,512,3] uint8 images ('image' + 'image2' upstream) + state[32] + prompt."""
+    """[2,512,512,3] uint8 images ('image' + 'image2' upstream) + state[32] + prompt.
+
+    There is no sample observation shipped with this checkpoint (the HF repo carries
+    config/model/norm_stats/tokenizer only), so this stays NotImplementedError on
+    purpose: main() catches it and falls back to deterministic synthetic cameras, and
+    a fabricated "sample" here would look like real robot data in every log it touched.
+    The real observations come from the LIBERO simulator via libero_eval.py."""
     raise NotImplementedError
 
 
-def tokenize(prompt, max_len=None):
-    """tokenizer.json via `tokenizers` (no transformers dependency); pad/truncate to
-    tokenizer_max_length = 48."""
-    raise NotImplementedError
+_TOKENIZER = None
+
+
+def tokenize(prompt, max_len=None, return_mask=False):
+    """LIBERO task string -> [max_len] int64 token ids, RIGHT-padded.
+
+    Uses `tokenizers` (the checkpoint's own tokenizer.json) rather than transformers:
+    the only thing needed is a byte-level BPE encode, and transformers would drag a
+    version-sensitive AutoProcessor into a hardware bring-up that does not need one.
+
+    Two details are load-bearing and both come from the SmolVLA input pipeline this
+    checkpoint was trained with:
+
+      * the task string is lowercased/stripped and gets a TRAILING NEWLINE. lerobot's
+        SmolVLA policy does exactly `task if task.endswith("\\n") else task + "\\n"`
+        before tokenizing, so omitting it shifts every token id the model ever saw.
+      * padding is on the RIGHT with pad id 2 (<|im_end|>, this tokenizer's pad token).
+        RIGHT-padding is not cosmetic: embed_and_concat_prefix rotates row r with rope
+        table entry r, which only agrees with the reference's positions = cumsum(mask)-1
+        when every pad slot sits after every real one. Left-padding silently shifts
+        every RoPE position -- the pi05 lesson.
+
+    Returns ids by default so main()'s single-argument call keeps working; pass
+    return_mask=True (libero_eval.py does) to also get the [max_len] bool mask of REAL
+    slots. That mask is what build_attn_bias needs: the valid prefix length is
+    1 + n_vision + n_real_text and is DATA-DEPENDENT -- it is not the constant 177,
+    which would let 48-n_real pad rows attend as if they were language.
+    """
+    global _TOKENIZER
+    from tokenizers import Tokenizer
+    max_len = max_len or _CFG["lm"]["tokenizer_max_length"]
+    if _TOKENIZER is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            _CFG["paths"]["tokenizer_file"])
+        if not os.path.exists(path):
+            ensure_checkpoint()          # tokenizer.json ships with the checkpoint
+        _TOKENIZER = Tokenizer.from_file(path)
+
+    text = str(prompt).strip().lower()
+    if not text.endswith("\n"):
+        text += "\n"
+    ids = _TOKENIZER.encode(text).ids[:max_len]     # truncate, never wrap
+    n_real = len(ids)
+    PAD_ID = 2                                      # <|im_end|>, SmolVLM2's pad token
+    out = torch.full((max_len,), PAD_ID, dtype=torch.long)
+    out[:n_real] = torch.as_tensor(ids, dtype=torch.long)
+    if not return_mask:
+        return out
+    mask = torch.zeros(max_len, dtype=torch.bool)
+    mask[:n_real] = True
+    return out, mask
+
+
+_NORM_STATS = None
 
 
 def load_norm_stats():
-    """norm_stats.safetensors -> state/action mean+std for (de)normalization."""
-    raise NotImplementedError
+    """norm_stats.safetensors -> {'state': (mean[8], std[8]), 'action': (mean[7], std[7])}.
+
+    MEAN/STD, not pi05's q01/q99 quantiles -- this checkpoint is a lerobot-family model
+    and its norm_stats file carries observation.state.mean/std and action.mean/std.
+    Getting the transform family wrong (or its direction) does not crash: it produces a
+    policy that moves smoothly in the wrong units, which reads as "the model is bad"
+    rather than "the harness is wrong". So both directions live here, next to the data:
+
+        state fed to the model :  (state - mean) / std
+        action out of the model:  a * std + mean          <- the env needs this one
+
+    Cached: the file is small but this is called once per inference otherwise."""
+    global _NORM_STATS
+    if _NORM_STATS is not None:
+        return _NORM_STATS
+    from safetensors.torch import load_file
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        _CFG["paths"]["norm_stats"])
+    if not os.path.exists(path):
+        ensure_checkpoint()
+    raw = load_file(path)
+    need = ["observation.state.mean", "observation.state.std",
+            "action.mean", "action.std"]
+    missing = [k for k in need if k not in raw]
+    if missing:
+        raise KeyError(
+            f"norm_stats.safetensors is missing {missing} (has {sorted(raw)}) -- refusing "
+            f"to guess a normalization; a wrong one looks like a broken policy, not a bug")
+    _NORM_STATS = {
+        "state": (raw["observation.state.mean"].float(),
+                  raw["observation.state.std"].float()),
+        "action": (raw["action.mean"].float(), raw["action.std"].float()),
+    }
+    return _NORM_STATS
 
 
 # ======================================================================================
@@ -4255,6 +4588,11 @@ def main():
                          "tokens, no ViT run) + a cross-check against transformers "
                          "LlamaModel; prefix = reference through the prefix, then a FORCED "
                          "STOP. expert/denoise are not implemented on device yet.")
+    ap.add_argument("--bisect-expert", type=int, default=None, metavar="N",
+                    help="compile N expert layers of ONE Euler step and walk layer N-1 "
+                         "op by op, plus verify the 480->512 pad lanes. The per-step "
+                         "curve puts the hardware 17 dB below the bf16 floor at step 0, "
+                         "so one pass is defective -- start with --bisect-expert 1.")
     ap.add_argument("--bisect-prefix", type=int, default=None, metavar="N",
                     help="compile N prefix layers and walk layer N-1 op by op "
                          "(norm1/q/k/v/attn/o/resid1/norm2/gate/up/mult/down/hidden) "
@@ -4715,6 +5053,9 @@ def main():
         args.vis_layers = args.vis_layers or 1
         args.stop_after = "vision"
         ue.VIS_BISECT = True
+    if args.bisect_expert is not None:
+        ue.EXPERT_LAYERS = args.bisect_expert
+        ue.EXPERT_BISECT = True
     if args.bisect_prefix is not None:
         ue.PREFIX_LAYERS = args.bisect_prefix
         ue.PREFIX_BISECT = True
@@ -4746,6 +5087,26 @@ def main():
         # proprioception vector, and norm_stats normalization is not applied (stub).
         state = torch.randn(HEADC["state_dim"], generator=g)
         noise = torch.randn(HEADC["chunk_size"], HEADC["max_action_dim"], generator=g)
+
+        if args.bisect_expert is not None:
+            ue.tensor_init()
+            toks = ue.run_vision(images)
+            ue.run_prefix(toks, token_ids, state)
+            # Give the reference the DEVICE's own prefix KV so cross-attn layers are
+            # scored against what the hardware actually read, not an oracle re-derivation.
+            PM, D, NKV = ue.PREFILL_MAX_SEQ_LEN, ue.HEAD_DIM, ue.NUM_KV_HEADS
+            ue._bisect_prefix_kv = [
+                (torch.stack([ue._read_bf16(ue.LAYER0_K_DRAM + li * ue.KV_LAYER_STRIDE
+                                            + h * ue.KV_HEAD_STRIDE, (PM, D),
+                                            label=f"bk{li}{h}") for h in range(NKV)]),
+                 torch.stack([ue._read_bf16(ue.LAYER0_V_DRAM + li * ue.KV_LAYER_STRIDE
+                                            + h * ue.KV_HEAD_STRIDE, (PM, D),
+                                            label=f"bv{li}{h}") for h in range(NKV)]))
+                for li in range(ue.NUM_LAYERS)]
+            ue.run_denoise()
+            ue.bisect_expert()
+            PHASES.summary("hardware timing")
+            return
 
         if args.bisect_prefix is not None:
             ue.tensor_init()
