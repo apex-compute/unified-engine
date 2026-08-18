@@ -189,6 +189,8 @@ from nn_lib import (  # noqa: E402
     smart_bf16_permute_core, store_weight, eltwise_add_core_dram,
     eltwise_mul_core_dram, silu_core_dram, store_identity_matrix,
 )
+import user_dma_core  # noqa: E402  (module handle: DRAM_START_ADDR / UE_0_BASE_ADDR)
+import multi_engine_shard as mes  # noqa: E402
 
 
 # ======================================================================================
@@ -1999,6 +2001,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         n = int(override if override is not None else self.NUM_ENGINES)
         cap = self.STAGE_MAX_ENGINES.get(stage, n)
         assert n >= 1, f"{stage}_NUM_ENGINES={n} must be >= 1"
+        if stage == "PREFIX":
+            # The prefix shards on the COLUMN axis, so its ceiling is the column-block
+            # count, not the row-block count. Row-splitting PM=192 would cap it at 3,
+            # which is exactly why this stage moved to columns.
+            cap = min(cap, self._prefix_column_blocks())
         return min(n, cap)
 
     def _peak_engines(self):
@@ -2783,6 +2790,81 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             self.PREFIX_BIAS_DRAM = self.allocate_tensor_dram(QB_ALIGNED * QB_ALIGNED * bpe)
         self._lm_tensors_done = True
 
+    def _prefix_column_blocks(self):
+        """Column-block ceiling for PREFIX sharding: min over the two N axes we split.
+
+        This REPLACES the row-block fallback (PM=192 -> 3 blocks of 64), which capped
+        the prefix at 3 engines and is the whole reason this stage moved to columns.
+        H=960 -> 15 blocks, I=2560 -> 40 blocks, so the binding number is 15 and it
+        never limits below 15 engines."""
+        return min(self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE) // UE_VECTOR_SIZE
+
+    def _prefix_attention_block(self, ue, i, m_reg, qb_reg):
+        """KV-cache write + K rope + per-kv-group stacked-Q GQA flash + un-stack for
+        prefix layer ``i``. Lifted VERBATIM out of compile_prefix so the single-engine
+        and multi-engine emitters share one copy; the instruction order is unchanged,
+        which is what keeps the num_engines==1 program byte-identical.
+
+        PRIMARY-ONLY, ALWAYS. LAYER0_K/V_DRAM is the frozen input to all 10 denoise
+        steps and must have exactly ONE writer -- N engines running these strided
+        copies into the same addresses is a real race, not redundant work. Flash also
+        stages through fixed SRAM (0x10000/0x20000) and a single shared scratch."""
+        PM, H = self.PREFILL_MAX_SEQ_LEN, self.HIDDEN_SIZE
+        D, G = self.HEAD_DIM, self.GROUP_SIZE
+        KV = self.NUM_KV_HEADS * D
+        QB, bpe = self.LM_QB, 2
+
+        # K/V -> the PERSISTENT cache, one contiguous [PM,D] block per kv-head, then
+        # rope K in place. The + h*KV_HEAD_STRIDE in the destination is the per-index
+        # offset rule: without it every head lands on head 0's block and the expert
+        # cross-attends to garbage -- finite and scrambled, never NaN.
+        for h in range(self.NUM_KV_HEADS):
+            k_dst = self.LAYER0_K_DRAM + i * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
+            v_dst = self.LAYER0_V_DRAM + i * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
+            self._ae_strided_copy(ue, self.LM_K_PROJ_DRAM + h * D * bpe, KV * bpe,
+                                  k_dst, D * bpe, PM, D)
+            self._ae_strided_copy(ue, self.LM_V_PROJ_DRAM + h * D * bpe, KV * bpe,
+                                  v_dst, D * bpe, PM, D)
+            # d64 rope is PBI-only; a bare call asserts N>=128 on the legacy path.
+            ue.rope_hf_core_dram(M=PM, N=D, input_dram_addr=k_dst,
+                                 output_dram_addr=k_dst,
+                                 cos_dram_addr=self.ROPE_PACKED_DRAM,
+                                 sin_dram_addr=self.ROPE_PACKED_DRAM + D * bpe,
+                                 gpr_M_reg=m_reg)
+
+        # per kv-group GQA: stack this group's G q-heads token-major, rope them with
+        # the x G duplicated table, replicate K/V x G, one flash, un-stack.
+        for kv_b in range(self.NUM_KV_HEADS):
+            k_src = self.LAYER0_K_DRAM + i * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
+            v_src = self.LAYER0_V_DRAM + i * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
+            for g in range(G):
+                self._ae_strided_copy(ue, self.LM_Q_DRAM + (kv_b * G + g) * D * bpe,
+                                      H * bpe, self.LM_FLASH_Q_DRAM + g * D * bpe,
+                                      G * D * bpe, PM, D)
+            ue.rope_hf_core_dram(M=QB, N=D, input_dram_addr=self.LM_FLASH_Q_DRAM,
+                                 output_dram_addr=self.LM_FLASH_Q_DRAM,
+                                 cos_dram_addr=self.ROPE_PACKED_GQA_DRAM,
+                                 sin_dram_addr=self.ROPE_PACKED_GQA_DRAM + D * bpe,
+                                 gpr_M_reg=qb_reg)
+            ue.accelerator_memory_to_sram(k_src, 0x10000, PM * D)
+            self._ae_duplicate_gqa_rows(ue, PM, 0x10000, self.LM_FLASH_K_DRAM)
+            ue.accelerator_memory_to_sram(v_src, 0x20000, PM * D)
+            self._ae_duplicate_gqa_rows(ue, PM, 0x20000, self.LM_FLASH_V_DRAM)
+            ue.unified_attention_core(
+                batch=QB, aligned_seq_len=QB, head_dim=D,
+                Q_DRAM_ADDR=self.LM_FLASH_Q_DRAM, K_DRAM_ADDR=self.LM_FLASH_K_DRAM,
+                V_DRAM_ADDR=self.LM_FLASH_V_DRAM,
+                BIAS_DRAM_ADDR=self.PREFIX_BIAS_DRAM,
+                OUTPUT_DRAM_ADDR=self.LM_FLASH_OUT_DRAM,
+                SCRATCH_DRAM_ADDR=self.LM_FLASH_SCRATCH_DRAM,
+                IDENTITY_DRAM_ADDR=self.identity_addr,
+                gpr_batch_reg=qb_reg, gpr_aligned_seq_len_reg=qb_reg)
+            for g in range(G):
+                self._ae_strided_copy(ue, self.LM_FLASH_OUT_DRAM + g * D * bpe,
+                                      G * D * bpe,
+                                      self.LM_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe,
+                                      H * bpe, PM, D)
+
     def compile_prefix(self):
         """The prefix instruction stream: 32 SmolLM2 layers over [PM=192, 960], compiled
         ONCE as a single captured program. Returns its DRAM address.
@@ -2812,13 +2894,19 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         KV = self.NUM_KV_HEADS * D
         bpe = 2
 
-        # _lm_tensor_init BEFORE reading LM_QB: it is what defines LM_QB (and the flash
-        # staging addresses). The lazy path got away with the reverse order only because
-        # _execute_prefix called _lm_tensor_init ahead of _compile_once; precompile_all
-        # compiles with no execution in front of it, so compile_prefix must be
-        # self-sufficient.
+        # _lm_tensor_init() BEFORE self.LM_QB is read -- it is what DEFINES LM_QB, so
+        # reading it first is an AttributeError on the first compile. It also has to
+        # come before the engine-count dispatch, so precompile_all (which compiles with
+        # no execution in front of it) is self-sufficient on either path.
         self._lm_tensor_init()
         QB = self.LM_QB
+
+        # MULTI-ENGINE DISPATCH. ne == 1 falls through to the code below UNCHANGED, so
+        # the single-engine program is byte-identical by construction, not by review.
+        ne = self._num_engines("PREFIX")
+        if ne > 1:
+            return self._compile_prefix_sharded(ne)
+
         ue.start_capture()
         prog_addr = ue.get_program_dram_addr()
         m_reg = ue.alloc_isa_reg(); ue.generate_instruction_add_set(m_reg, PM)
@@ -2848,56 +2936,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             lm_matmul(PM, H, KV, self.LM_PRE_NORM_DRAM, la, "k", self.LM_K_PROJ_DRAM)
             lm_matmul(PM, H, KV, self.LM_PRE_NORM_DRAM, la, "v", self.LM_V_PROJ_DRAM)
 
-            # K/V -> the PERSISTENT cache, one contiguous [PM,D] block per kv-head, then
-            # rope K in place. The + h*KV_HEAD_STRIDE in the destination is the per-index
-            # offset rule: without it every head lands on head 0's block and the expert
-            # cross-attends to garbage -- finite and scrambled, never NaN.
-            for h in range(self.NUM_KV_HEADS):
-                k_dst = self.LAYER0_K_DRAM + i * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                v_dst = self.LAYER0_V_DRAM + i * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                self._ae_strided_copy(ue, self.LM_K_PROJ_DRAM + h * D * bpe, KV * bpe,
-                                      k_dst, D * bpe, PM, D)
-                self._ae_strided_copy(ue, self.LM_V_PROJ_DRAM + h * D * bpe, KV * bpe,
-                                      v_dst, D * bpe, PM, D)
-                # d64 rope is PBI-only; a bare call asserts N>=128 on the legacy path.
-                ue.rope_hf_core_dram(M=PM, N=D, input_dram_addr=k_dst,
-                                     output_dram_addr=k_dst,
-                                     cos_dram_addr=self.ROPE_PACKED_DRAM,
-                                     sin_dram_addr=self.ROPE_PACKED_DRAM + D * bpe,
-                                     gpr_M_reg=m_reg)
-
-            # per kv-group GQA: stack this group's G q-heads token-major, rope them with
-            # the x G duplicated table, replicate K/V x G, one flash, un-stack.
-            for kv_b in range(self.NUM_KV_HEADS):
-                k_src = self.LAYER0_K_DRAM + i * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
-                v_src = self.LAYER0_V_DRAM + i * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
-                for g in range(G):
-                    self._ae_strided_copy(ue, self.LM_Q_DRAM + (kv_b * G + g) * D * bpe,
-                                          H * bpe, self.LM_FLASH_Q_DRAM + g * D * bpe,
-                                          G * D * bpe, PM, D)
-                ue.rope_hf_core_dram(M=QB, N=D, input_dram_addr=self.LM_FLASH_Q_DRAM,
-                                     output_dram_addr=self.LM_FLASH_Q_DRAM,
-                                     cos_dram_addr=self.ROPE_PACKED_GQA_DRAM,
-                                     sin_dram_addr=self.ROPE_PACKED_GQA_DRAM + D * bpe,
-                                     gpr_M_reg=qb_reg)
-                ue.accelerator_memory_to_sram(k_src, 0x10000, PM * D)
-                self._ae_duplicate_gqa_rows(ue, PM, 0x10000, self.LM_FLASH_K_DRAM)
-                ue.accelerator_memory_to_sram(v_src, 0x20000, PM * D)
-                self._ae_duplicate_gqa_rows(ue, PM, 0x20000, self.LM_FLASH_V_DRAM)
-                ue.unified_attention_core(
-                    batch=QB, aligned_seq_len=QB, head_dim=D,
-                    Q_DRAM_ADDR=self.LM_FLASH_Q_DRAM, K_DRAM_ADDR=self.LM_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LM_FLASH_V_DRAM,
-                    BIAS_DRAM_ADDR=self.PREFIX_BIAS_DRAM,
-                    OUTPUT_DRAM_ADDR=self.LM_FLASH_OUT_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LM_FLASH_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.identity_addr,
-                    gpr_batch_reg=qb_reg, gpr_aligned_seq_len_reg=qb_reg)
-                for g in range(G):
-                    self._ae_strided_copy(ue, self.LM_FLASH_OUT_DRAM + g * D * bpe,
-                                          G * D * bpe,
-                                          self.LM_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe,
-                                          H * bpe, PM, D)
+            self._prefix_attention_block(ue, i, m_reg, qb_reg)
 
             lm_matmul(PM, H, H, self.LM_ATTN_RESULT_DRAM, la, "o", self.LM_O_PROJ_DRAM)
             ue.eltwise_core_dram(M=PM, N=H, dram_a=h_in, dram_b=self.LM_O_PROJ_DRAM,
@@ -2963,6 +3002,297 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self._prefix_program_addr = prog_addr
         print(f"    prefix ({self.NUM_LAYERS} layers, PM={PM}, GQA g{G}): "
               f"{len(raw) / 1e6:.2f} MB @0x{prog_addr:X}")
+        return prog_addr
+
+    # ==================================================================================
+    # PREFIX -- COLUMN-SHARDED PROJECTIONS
+    # ==================================================================================
+    def _lm_repack_down_weights(self, k_split):
+        """Re-lay the 32 down_proj weights so each engine's K-slice is CONTIGUOUS.
+
+        down_proj B is N x K = [960, 2560] row-major, so ``B[:, k0:k0+Kc]`` -- the slice
+        a K-split engine needs -- is strided (one gap per row) and is NOT reachable by
+        shifting B_DRAM_ADDR. split_k()'s docstring says the sliced weight must be
+        HOST-PREPARED; the obvious reading of that is "upload 8 extra blobs", which for
+        32 layers is 157 MB of duplicated weights against a 224 MB tensor arena.
+
+        It is not necessary. The concatenation of the per-engine slices is a PERMUTATION
+        of the same 4.9 MB, so we rewrite the blob IN PLACE at its existing address and
+        engine e simply reads ``down_weight + N * k0 * bpe``. Zero extra DRAM.
+
+        Only ever done when ne > 1, and guarded so a second compile cannot re-permute an
+        already-permuted blob (which would silently scramble every MLP output).
+        """
+        prev = getattr(self, "_lm_down_repacked", None)
+        if prev is not None:
+            assert prev == k_split, (
+                "down_proj weights are already repacked for a DIFFERENT K split "
+                f"({prev} vs {k_split}); the blob cannot be re-permuted in place")
+            return
+        H, I = self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE
+        with PHASES.track("prefix down-weight repack", "host"), silenced():
+            for la in self.lm_layer_addrs:
+                w = self._read_bf16(la["down_weight"], (H, I), label="down_weight")
+                packed = torch.cat([w[:, k0:k0 + kc].contiguous().reshape(-1)
+                                    for k0, kc in k_split])
+                assert packed.numel() == H * I
+                self.dma_to_accelerator_memory(la["down_weight"],
+                                               packed.to(torch.bfloat16))
+        self._lm_down_repacked = list(k_split)
+        _original_print(f"    [prefix] repacked {len(self.lm_layer_addrs)} down_proj "
+                        f"weights into {len(k_split)} contiguous K-slices (in place)")
+
+    def _compile_prefix_sharded(self, ne):
+        """compile_prefix over ``ne`` engines, sharding the PROJECTION MATMULS ONLY.
+
+        WHY COLUMNS. Row sharding caps at PM/64 = 3 blocks, so a 192-token prefix can
+        never use more than 3 engines on M. Every projection's N (or K) is fat instead:
+        H=960 -> 15 blocks, I=2560 -> 40. That is the whole argument for this stage.
+
+        Per projection:
+          q      N-split (N=960, 15 blocks).  Each engine writes a dense [PM, Nc] lane
+                 and then scatters it into the shared LM_Q_DRAM at its own column
+                 offset -- disjoint, 128 B-aligned, so no race. The gather is what keeps
+                 the q-stack / GQA / flash code below completely untouched.
+          k, v   NOT SHARDED. N=320 is only 5 blocks of 64, which cannot serve 8
+                 engines. Computed REDUNDANTLY into per-engine private buffers: ~6% of
+                 the layer's MACs, zero barriers, no write race, and it is already the
+                 shape phase 2 (head-split attention) needs, where every engine wants
+                 the full K/V for its own head slice. Mirrors pi05 vision.
+          o      N-split + gather, NOT the K-split the plan called for. See the note on
+                 _prefix_o_proj_note below -- the K-split's A operand is strided.
+          gate/up  N-split (N=2560, 40 blocks) and they STAY sharded: SiLU and the
+                 gate*up multiply are elementwise, so the whole gate -> up -> mul chain
+                 runs in one barrier-free lane.
+          down   TRUE K-split (K=2560) + reduce_add. Its A operand is already the dense
+                 per-engine lane produced by the multiply, so no re-gather is needed;
+                 only the weight has to be re-laid (see _lm_repack_down_weights).
+
+        NOT sharded, deliberately:
+          RMSNorm reduces over the full 960, so it is not column-splittable. It runs
+          redundantly on every engine into private buffers -- cheaper than a barrier.
+          The residual adds likewise (they feed a norm on every engine).
+          KV-cache write + RoPE + GQA duplication + flash + un-stack: PRIMARY ONLY.
+          LAYER0_K/V_DRAM is the frozen input to all 10 denoise steps and must have
+          exactly ONE writer.
+        """
+        ue = self
+        PM, H, I = self.PREFILL_MAX_SEQ_LEN, self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE
+        D, G = self.HEAD_DIM, self.GROUP_SIZE
+        KV = self.NUM_KV_HEADS * D
+        QB, bpe = self.LM_QB, 2
+
+        # Probes snapshot ONE engine and _probe_copy halts the stream; neither means
+        # anything once the work is spread over 8 programs. pi05 refuses the same combo.
+        assert not self.PREFIX_BISECT, (
+            "PREFIX_BISECT probes a single engine's buffers and cannot be interpreted "
+            f"under num_engines={ne}; run the bisect at --engines 1")
+        assert self.PREFIX_LAYERS is None, (
+            "PREFIX_LAYERS is a bisect handle; it is only meaningful single-engine")
+
+        sched = self._make_stage_scheduler("PREFIX", ne)
+        n_split = sched.split_cols(H)          # q, o        : 15 blocks over ne
+        i_split = sched.split_cols(I)          # gate, up    : 40 blocks over ne
+        k_split = sched.split_k(I)             # down        : == i_split, by definition
+        assert k_split == i_split, "down's K-slice MUST equal the lane gate/up produced"
+        self._lm_repack_down_weights(k_split)
+
+        # --- per-engine buffers ------------------------------------------------------
+        # Column lanes: matmat writes back with stride N*bpe for the N IT WAS GIVEN, so
+        # calling it with N=Nc yields a DENSE [PM, Nc] block. Nothing is ever strided on
+        # the write side.
+        if not getattr(self, "_lm_shard_bufs_done", False):
+            sched.alloc_col_output("lm_q",    PM, H)
+            sched.alloc_col_output("lm_o",    PM, H)
+            sched.alloc_col_output("lm_gate", PM, I)
+            sched.alloc_col_output("lm_up",   PM, I)
+            sched.alloc_col_output("lm_mult", PM, I)
+            # Redundantly-computed full-width tensors. The PRIMARY keeps the model's own
+            # address (so its half of the program is unchanged and the bisect buffers
+            # still line up); each worker gets a private copy, which is what makes
+            # "redundant" safe instead of a multi-writer race.
+            #   lm_norm is ONE buffer used by BOTH norms in a layer, exactly as the
+            #   single-engine path reuses LM_PRE_NORM_DRAM.
+            sched.register_per_engine("lm_norm",  self.LM_PRE_NORM_DRAM, PM * H * bpe)
+            sched.register_per_engine("lm_resid", self.LM_RESIDUAL_DRAM, PM * H * bpe)
+            sched.register_per_engine("lm_k",     self.LM_K_PROJ_DRAM,   PM * KV * bpe)
+            sched.register_per_engine("lm_v",     self.LM_V_PROJ_DRAM,   PM * KV * bpe)
+            # down's partial sums: full [PM, H] per engine, summed by reduce_add.
+            # partial[0] aliases LM_MLP_DOWN_DRAM so the reduction accumulates in place.
+            sched.register_per_engine("lm_down",  self.LM_MLP_DOWN_DRAM, PM * H * bpe)
+            self._lm_shard_bufs_done = True
+        PE = lambda name, e: sched.per_engine_addr(name, e)
+        DOWN_PARTIALS = [PE("lm_down", e) for e in range(ne)]
+
+        # THE GATHER. matmat writes back dense [PM, Nc]; the full-width tensor the
+        # untouched attention/q-stack code reads is [PM, N], so each engine scatters its
+        # own lane into its own disjoint, 128 B-aligned column range. No two engines
+        # touch the same bytes, so this needs no lock and no extra barrier -- the
+        # region's exit join is the only fence.
+        #
+        # Emitted in 64-COLUMN CHUNKS, not one 128-wide copy: _ae_strided_copy stages
+        # through SRAM 0x00000 and the [192, 64] shape is the one already running in
+        # production here (the KV-cache and attention un-stack copies). A 128-wide copy
+        # would stage 48 KB against a flash window that starts at 0x10000, which is
+        # inside the margin rather than comfortably clear of it.
+        assert PM * UE_VECTOR_SIZE * bpe * 2 <= 0x10000, "SRAM staging window shrank"
+
+        def scatter_lane(x_ue, src, dst_base, n0, cols, full_n):
+            assert cols % UE_VECTOR_SIZE == 0
+            for c0 in range(0, cols, UE_VECTOR_SIZE):
+                self._ae_strided_copy(x_ue, src + c0 * bpe, cols * bpe,
+                                      dst_base + (n0 + c0) * bpe, full_n * bpe,
+                                      PM, UE_VECTOR_SIZE)
+
+        ue.start_capture()
+        prog_addr = ue.get_program_dram_addr()
+        sched.begin_program()
+
+        # Dimension GPRs, one set per engine. The PBI M register collapses the M-unroll
+        # exactly as it does single-engine; only the primary needs qb_reg (flash and the
+        # q-stack are primary-only).
+        m_regs = []
+        for e, eng in enumerate(sched.engines):
+            r = eng.alloc_isa_reg(); eng.generate_instruction_add_set(r, PM)
+            m_regs.append(r)
+        qb_reg = ue.alloc_isa_reg(); ue.generate_instruction_add_set(qb_reg, QB)
+
+        def emit_matmul(ctx, M, K, N, A, la, proj, OUT, split=False, **kw):
+            """bf16 B operand throughout (16-bit multipliers) -- no is_B_quantized,
+            no SCALE_DRAM_ADDR, and with attention_bias/mlp_bias both false there is no
+            broadcast_N bias either. THE ONLY per-column offset that exists on this
+            model is therefore B += n0*K*bpe, which ctx.b_addr() computes."""
+            e = ctx.engine_idx
+            B = la[f"{proj}_weight"]
+            ctx.unsafe_ue.matmat_mul_core(
+                M=M, K=K, N=N, A_DRAM_ADDR=A,
+                B_DRAM_ADDR=ctx.b_addr(B, K) if split else B,
+                OUTPUT_DRAM_ADDR=OUT, gpr_M_reg=m_regs[e], **kw)
+
+        n_lm = len(self.lm_layer_addrs)
+        for i, la in enumerate(self.lm_layer_addrs):
+            h_in = self.LM_INPUT_DRAM if i % 2 == 0 else self.LM_OUTPUT_DRAM
+            h_out = self.LM_OUTPUT_DRAM if i % 2 == 0 else self.LM_INPUT_DRAM
+
+            # ---- region 1: ln1 (redundant) + q (N-split, gathered) + k/v (redundant) --
+            # Opens with a barrier, which is also the fence that makes h_in -- written by
+            # the previous layer's residual add on the primary -- visible everywhere.
+            def qkv_body(ctx, la=la, h_in=h_in):
+                e = ctx.engine_idx
+                x = ctx.unsafe_ue
+                nrm = PE("lm_norm", e)
+                x.rms_norm_core_dram(M=PM, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=nrm,
+                                     GAMMA_DRAM_ADDR=la["ln1_gamma"], gpr_M_reg=m_regs[e])
+                emit_matmul(ctx, PM, H, ctx.cols, nrm, la, "q", ctx.col_out("lm_q"),
+                            split=True)
+                scatter_lane(x, ctx.col_out("lm_q"), self.LM_Q_DRAM,
+                             ctx.col_offset, ctx.cols, H)
+                # k/v: N=320 is 5 blocks, unshardable at 8. Redundant, private, free --
+                # the primary computes them anyway, so no engine's critical path grows.
+                emit_matmul(ctx, PM, H, KV, nrm, la, "k", PE("lm_k", e))
+                emit_matmul(ctx, PM, H, KV, nrm, la, "v", PE("lm_v", e))
+            sched.col_sharded_region(H, qkv_body, join=True)
+
+            # ---- attention: PRIMARY ONLY, verbatim ------------------------------------
+            self._prefix_attention_block(ue, i, m_regs[0], qb_reg)
+
+            # ---- region 2: o_proj (N-split, gathered) ---------------------------------
+            # The opening barrier fences the primary's un-stack writes to
+            # LM_ATTN_RESULT_DRAM before the workers read them.
+            def o_body(ctx, la=la):
+                e = ctx.engine_idx
+                x = ctx.unsafe_ue
+                emit_matmul(ctx, PM, H, ctx.cols, self.LM_ATTN_RESULT_DRAM, la, "o",
+                            ctx.col_out("lm_o"), split=True)
+                scatter_lane(x, ctx.col_out("lm_o"), self.LM_O_PROJ_DRAM,
+                             ctx.col_offset, ctx.cols, H)
+            # join=False: region 3 opens with its own barrier and that is the fence the
+            # full-width LM_O_PROJ_DRAM read needs. Two back-to-back rendezvous would
+            # cost 32 extra round trips over the layer stack for nothing.
+            sched.col_sharded_region(H, o_body, join=False)
+
+            # ---- region 3: residual + ln2 (redundant) + gate/up/mul (N-split lane) ----
+            def mlp_body(ctx, la=la, h_in=h_in):
+                e = ctx.engine_idx
+                x = ctx.unsafe_ue
+                resid, nrm = PE("lm_resid", e), PE("lm_norm", e)
+                x.eltwise_core_dram(M=PM, N=H, dram_a=h_in, dram_b=self.LM_O_PROJ_DRAM,
+                                    dram_out=resid, mode=UE_MODE.ELTWISE_ADD,
+                                    gpr_M_reg=m_regs[e])
+                # split residual+norm: the fused post_add norm needs 4 advancing PBI
+                # pointers against a limit of 3.
+                x.rms_norm_core_dram(M=PM, N=H, A_DRAM_ADDR=resid, OUTPUT_DRAM_ADDR=nrm,
+                                     GAMMA_DRAM_ADDR=la["ln2_gamma"], gpr_M_reg=m_regs[e])
+                gate, up, mult = (ctx.col_out("lm_gate"), ctx.col_out("lm_up"),
+                                  ctx.col_out("lm_mult"))
+                if self.PREFIX_FUSED_SILU:
+                    emit_matmul(ctx, PM, H, ctx.cols, nrm, la, "gate", gate,
+                                split=True, silu_enable=True)
+                else:
+                    emit_matmul(ctx, PM, H, ctx.cols, nrm, la, "gate", gate, split=True)
+                    # SiLU is elementwise, so view [PM, Nc] as [PM*Nc/64, 64] and the
+                    # stored 64x64 identity applies. Nc is a multiple of 64 by
+                    # construction, so the view is exact on every engine.
+                    silu_core_dram(x, M=(PM * ctx.cols) // UE_VECTOR_SIZE,
+                                   N=UE_VECTOR_SIZE, A_DRAM_ADDR=gate,
+                                   OUTPUT_DRAM_ADDR=gate,
+                                   IDENTITY_DRAM_ADDR=self.identity_addr)
+                emit_matmul(ctx, PM, H, ctx.cols, nrm, la, "up", up, split=True)
+                eltwise_mul_core_dram(x, size=ctx.elems(PM), A_DRAM_ADDR=gate,
+                                      B_DRAM_ADDR=up, OUTPUT_DRAM_ADDR=mult)
+            # join=False: nothing leaves the lane. The K-split region below opens with
+            # its own barrier, and that is the only fence the partials need.
+            sched.col_sharded_region(I, mlp_body, join=False)
+
+            # ---- region 4: down (K-split) + reduce_add --------------------------------
+            def down_body(ctx, la=la):
+                e = ctx.engine_idx
+                # A is ALREADY the dense [PM, Kc] lane the multiply produced -- the
+                # single reason a K-split is affordable here. B is the repacked slice at
+                # a contiguous offset. OUT is this engine's full-width PARTIAL SUM.
+                ctx.unsafe_ue.matmat_mul_core(
+                    M=PM, K=ctx.k_cols, N=H,
+                    A_DRAM_ADDR=sched.col_output_addr("lm_mult", e),
+                    B_DRAM_ADDR=la["down_weight"] + H * ctx.k_offset * bpe,
+                    OUTPUT_DRAM_ADDR=PE("lm_down", e), gpr_M_reg=m_regs[e])
+            sched.k_sharded_region(I, down_body, join=False)
+            # join=False: the only consumer of the reduced sum is the PRIMARY's own
+            # residual add on the very next line, and the workers' next stop is the next
+            # layer's region-1 barrier, which is also what publishes h_out to them.
+            sched.reduce_add(DOWN_PARTIALS, self.LM_MLP_DOWN_DRAM, PM, H, join=False)
+
+            # ---- layer output: primary only. The next region's opening barrier is what
+            # publishes it. Note the residual read is the PRIMARY's private copy, which
+            # every engine computed identically.
+            ue.eltwise_core_dram(M=PM, N=H, dram_a=self.LM_RESIDUAL_DRAM,
+                                 dram_b=self.LM_MLP_DOWN_DRAM, dram_out=h_out,
+                                 mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m_regs[0])
+
+        final = self.LM_INPUT_DRAM if n_lm % 2 == 0 else self.LM_OUTPUT_DRAM
+        ue.rms_norm_core_dram(M=PM, N=H, A_DRAM_ADDR=final,
+                              OUTPUT_DRAM_ADDR=self.LM_PRE_NORM_DRAM,
+                              GAMMA_DRAM_ADDR=self.final_norm_addr, gpr_M_reg=m_regs[0])
+        self.PREFIX_HIDDEN_DRAM = self.LM_PRE_NORM_DRAM
+
+        # LIFO, and before finalize() closes the worker captures.
+        ue.release_isa_reg()                       # qb_reg (primary only)
+        for eng in sched.engines:
+            eng.release_isa_reg()                  # m_reg (every engine)
+        self._prefix_worker_progs = sched.finalize()
+        self._prefix_sched = sched
+
+        ue.generate_instruction_halt()
+        ue.stop_capture()
+        raw = bytearray()
+        for inst in ue.capture_buffer:
+            raw.extend(inst.get_bytes())
+        ue.dma_write(DMA_DEVICE_H2C, prog_addr, raw, len(raw))
+        ue.allocate_program_dram(len(raw))
+        ue.clear_capture_buffer()
+        self._prefix_program_addr = prog_addr
+        print(f"    prefix x{ne} ({self.NUM_LAYERS} layers, PM={PM}, GQA g{G}): "
+              f"primary {len(raw) / 1e6:.2f} MB @0x{prog_addr:X}, workers "
+              f"{sched.worker_program_bytes() / 1e6:.2f} MB")
         return prog_addr
 
     def _precompute_time_embeddings(self):
@@ -4161,7 +4491,21 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         """EXECUTE the compiled prefix program. Mirrors _execute_denoise: the program is
         address-static, so re-execution just re-reads LM_INPUT_DRAM and PREFIX_BIAS_DRAM
         (both refreshed by run_prefix) and re-writes the KV cache in place."""
+        sched = getattr(self, "_prefix_sched", None)
         with PHASES.track("exec prefix", "exec"), silenced():
+            if sched is not None:
+                # EVERY execution, and BEFORE the primary launches: each run ends with
+                # the workers halted, and a worker that is not already spinning on the
+                # first barrier when the primary reaches it deadlocks the whole program
+                # (FLAG_CHECK has no timeout). Pass this stage's saved address list --
+                # sched._worker_prog_addrs is overwritten by any later finalize().
+                if not getattr(self, "_prefix_flags_precleared", False):
+                    # ONCE, before the first launch: a flag left set by an earlier
+                    # program (or a run that died mid-execution) makes the first
+                    # FLAG_CHECK pass spuriously.
+                    sched.preclear_flags()
+                    self._prefix_flags_precleared = True
+                sched.start_workers(self._prefix_worker_progs)
             self.start_execute_from_dram(self._prefix_program_addr)
             self._wait_with_heartbeat("prefix", timeout=timeout)
         _original_print(f"  [prefix] executed in {PHASES.rows[-1][2]:.2f}s")
@@ -5944,6 +6288,10 @@ def configure_engines(ue, spec=1, *, vis=None, prefix=None, denoise=None, tag="m
     multi = max([n] + [int(getattr(ue, f"{st}_NUM_ENGINES", None) or n)
                        for st in caps]) > 1
     if multi:
+        # Multi-engine programs live in N separate capture buffers; a bin holds only
+        # engine 0's, so loading it back would run a primary that barriers against
+        # workers that were never launched -- a deadlock with no timeout, not a wrong
+        # answer. Refused at the source rather than warned about.
         print(f"[{tag}] multi-engine: bins cannot be dumped in this mode")
     return multi
 
@@ -6026,6 +6374,12 @@ def main():
                          "--engines (S=1024 = 16 blocks of 64 -> an even 128-row split). "
                          "The projection matmuls are sharded; norms, attention and the "
                          "eltwise adds still run on the primary.")
+    ap.add_argument("--pref_8", action="store_true",
+                    help="stage isolation: prefix projections on 8 engines (column "
+                         "axis -- q/gate/up N-split, down K-split + reduce_add, k/v "
+                         "redundant at 5 blocks). Shorthand for --prefix-engines 8.")
+    ap.add_argument("--prefix-engines", type=int, default=None,
+                    help="engines for the PREFIX stage only")
     ap.add_argument("--quant", default="bf16", choices=["bf16", "q4_64"])
     ap.add_argument("--gate-upstream", action=argparse.BooleanOptionalAction, default=True,
                     help="DEFAULT ON. Score the device against the checkpoint's OWN "
@@ -6457,7 +6811,10 @@ def main():
     # BEFORE weight_init: this sets the engine counts, and weight_init's first act is to
     # build the worker pool from them. Every UnifiedEngine ctor DMA-writes 16 KB of noise
     # to a hardcoded 0x80000000, so no engine may be constructed after the weights land.
-    configure_engines(ue, args.engines, vis=8 if args.vis_8 else None)
+    configure_engines(ue, args.engines,
+                      vis=8 if args.vis_8 else None,
+                      prefix=8 if args.pref_8 else args.prefix_engines,
+                      denoise=8 if getattr(args, "dns_8", False) else None)
     # weight_init LAST among engine constructions: every UnifiedEngine ctor DMA-writes
     # 16KB of noise to a hardcoded 0x80000000, which is this model's first stored weight.
     # SiLU variant must be set BEFORE compile_prefix runs (it is read at emit time).
