@@ -4104,6 +4104,17 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                    pe("ae_flash_q", e), pe("ae_flash_out", e), pe("ae_flash_scr", e),
                    pe("ae_ck", e), pe("ae_cv", e))
 
+    def _ae_prep_engines(self, sched, ue, regs):
+        """(head, engine, regs) with the SAME head -> engine map as _ae_attn_groups.
+
+        For the one prep loop that cannot live inside the group body: the cross layers'
+        token-major gather, which feeds a full-width matmul and therefore has to finish
+        on every engine before the primary re-projects. Derived from _ae_attn_groups so
+        the two mappings can never drift apart. At ne == 1 this is the primary, five
+        times, in head order -- the original loop exactly."""
+        for tup in self._ae_attn_groups(sched, ue, regs):
+            yield (tup[0], tup[1], tup[2])
+
     def _ae_flash_scratch_elems(self):
         """Element count of the expert's flash scratch, in ONE place.
 
@@ -4130,6 +4141,68 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         ue.sram_to_accelerator_memory(0x00000, dst, rows * width,
                                       stride_bytes_per_chunk=width * bpe,
                                       stride_jump_bytes=dst_jump)
+
+    # ---- per-kv-head preparation ------------------------------------------------
+    # These three helpers are VERBATIM lifts of the three `for h in range(NUM_KV_HEADS)`
+    # bodies that used to sit inline in _emit_expert_layer, primary-only, ahead of the
+    # kv-group loop. Hoisting them into helpers is what lets the SAME instruction
+    # sequence be emitted either (a) five times on the primary, in head order, exactly
+    # as before -- the ne == 1 path, byte-identical -- or (b) once per engine inside the
+    # group region, so head h's prep runs on the engine that owns group h.
+    #
+    # SHARED-BUT-DISJOINT destinations. None of the *_HEADS/_TOK buffers is made
+    # per-engine, because every write lands at a head-indexed offset that no other head
+    # touches:
+    #   AE_K/V_HEADS  + h * AE_KV_HEAD_STRIDE  (= M*D*2 = 8192 B)   contiguous block
+    #   AE_XK/XV_HEADS+ h * AE_XKV_HEAD_STRIDE (= PM*D*2 = 24576 B) contiguous block
+    #   AE_XK/XV_TOK  + h * D * 2 (= 128 B), chunk width D*2 = 128 B, jump KV*2 = 640 B
+    #                                            -> column band h, never overlapping
+    # Every one of those offsets is a multiple of 128 B, hence of the 32 B beat, and the
+    # smallest strided chunk written is a full 128 B row. Asserted below rather than
+    # assumed. Contrast the flash staging (ae_flash_q/out/scr, ae_ck/cv), which IS
+    # per-engine: those are single reused buffers with no head index in the address, so
+    # two engines would collide on byte 0.
+    def _ae_prep_self_kv_head(self, x_ue, r_, h, M, KV, D, bpe):
+        """SELF layers: de-interleave head h out of the [64,320] k/v projections into
+        its contiguous [64,64] slice, then rope K in place. V is never rotated."""
+        k_head = self.AE_K_HEADS_DRAM + h * self.AE_KV_HEAD_STRIDE
+        v_head = self.AE_V_HEADS_DRAM + h * self.AE_KV_HEAD_STRIDE
+        assert (h * self.AE_KV_HEAD_STRIDE) % 32 == 0 and (h * D * bpe) % 32 == 0, (
+            f"kv head {h} prep offsets are not 32 B beat aligned")
+        self._ae_strided_copy(x_ue, self.AE_K_PROJ_DRAM + h * D * bpe, KV * bpe,
+                              k_head, D * bpe, M, D)
+        self._ae_strided_copy(x_ue, self.AE_V_PROJ_DRAM + h * D * bpe, KV * bpe,
+                              v_head, D * bpe, M, D)
+        # d64 RoPE is PBI-ONLY: bare rope_hf_core_dram falls through to the
+        # legacy core, which asserts N >= 128. Always pass gpr_M_reg. Never the
+        # _gqa variant either -- it asserts N >= 128 too; the group broadcast is
+        # done by duplicate_gqa_rows instead.
+        x_ue.rope_hf_core_dram(M=M, N=D, input_dram_addr=k_head,
+                               output_dram_addr=k_head,
+                               cos_dram_addr=self.AE_ROPE_PACKED_DRAM,
+                               sin_dram_addr=self.AE_ROPE_PACKED_DRAM + D * bpe,
+                               gpr_M_reg=r_["m"])
+
+    def _ae_prep_cross_tok_head(self, x_ue, h, k_base, v_base, PM, KV, D, bpe):
+        """CROSS layers: head-major cached K/V -> token-major [PM,320] column band h,
+        the operand the (320,320) re-projection needs. READ-ONLY on the cache."""
+        assert (h * D * bpe) % 32 == 0, f"cross tok head {h} offset not 32 B aligned"
+        self._ae_strided_copy(x_ue, k_base + h * self.KV_HEAD_STRIDE, D * bpe,
+                              self.AE_XK_TOK_DRAM + h * D * bpe, KV * bpe, PM, D)
+        self._ae_strided_copy(x_ue, v_base + h * self.KV_HEAD_STRIDE, D * bpe,
+                              self.AE_XV_TOK_DRAM + h * D * bpe, KV * bpe, PM, D)
+
+    def _ae_prep_cross_head_major(self, x_ue, h, PM, KV, D, bpe):
+        """CROSS layers: reprojected [PM,320] -> head-major [5,PM,64], so flash takes a
+        contiguous K/V per group."""
+        assert (h * self.AE_XKV_HEAD_STRIDE) % 32 == 0, (
+            f"cross head-major offset {h} not 32 B beat aligned")
+        self._ae_strided_copy(x_ue, self.AE_XK_PROJ_DRAM + h * D * bpe, KV * bpe,
+                              self.AE_XK_HEADS_DRAM + h * self.AE_XKV_HEAD_STRIDE,
+                              D * bpe, PM, D)
+        self._ae_strided_copy(x_ue, self.AE_XV_PROJ_DRAM + h * D * bpe, KV * bpe,
+                              self.AE_XV_HEADS_DRAM + h * self.AE_XKV_HEAD_STRIDE,
+                              D * bpe, PM, D)
 
     def _ae_duplicate_gqa_rows(self, ue, rows, src_sram_addr, dst_dram_addr):
         """Token-major GQA broadcast: dst row t*G+g = src row t, for t in [0,rows).
@@ -4310,6 +4383,12 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         QB = self.AE_FLASH_ROWS                   # 64 tokens x 3 q-heads = 192
         regs = self._ae_regs
         is_self = self._ae_is_self_attn(layer_idx)
+        # ONE predicate for the whole body. Every barrier and every fold branches on it,
+        # so the barrier count per layer is a function of (sharded, is_self) alone --
+        # never of anything an individual engine sees. All engines walk the same Python
+        # loop over layer_idx, so their barrier counts are symmetric by construction,
+        # which is what keeps a FLAG_CHECK from blocking forever.
+        sharded = sched is not None and sched.num_engines > 1
 
         # Ping-pong on layer parity. Layer 0 reads AE_IO_A, which is exactly where
         # _emit_suffix_embed left the embedded suffix.
@@ -4343,23 +4422,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             self._ae_matmul(ue, M, HP, KV, self.AE_PRE_NORM_DRAM, la["v_weight"],
                             self.AE_V_PROJ_DRAM)
             # de-interleave [64,320] into 5 contiguous [64,64] head slices, then rope K
-            # in place. V is never rotated.
-            for h in range(self.NUM_KV_HEADS):
-                k_head = self.AE_K_HEADS_DRAM + h * self.AE_KV_HEAD_STRIDE
-                v_head = self.AE_V_HEADS_DRAM + h * self.AE_KV_HEAD_STRIDE
-                self._ae_strided_copy(ue, self.AE_K_PROJ_DRAM + h * D * bpe, KV * bpe,
-                                      k_head, D * bpe, M, D)
-                self._ae_strided_copy(ue, self.AE_V_PROJ_DRAM + h * D * bpe, KV * bpe,
-                                      v_head, D * bpe, M, D)
-                # d64 RoPE is PBI-ONLY: bare rope_hf_core_dram falls through to the
-                # legacy core, which asserts N >= 128. Always pass gpr_M_reg. Never the
-                # _gqa variant either -- it asserts N >= 128 too; the group broadcast is
-                # done by duplicate_gqa_rows instead.
-                ue.rope_hf_core_dram(M=M, N=D, input_dram_addr=k_head,
-                                     output_dram_addr=k_head,
-                                     cos_dram_addr=self.AE_ROPE_PACKED_DRAM,
-                                     sin_dram_addr=self.AE_ROPE_PACKED_DRAM + D * bpe,
-                                     gpr_M_reg=regs["m"])
+            # in place. V is never rotated. SHARDED: head h's prep is emitted inside the
+            # kv-group loop below, on the engine that owns group h. Only the unsharded
+            # build still runs all five here, in head order -- identical bytes to the
+            # pre-shard emitter.
+            if not sharded:
+                for h in range(self.NUM_KV_HEADS):
+                    self._ae_prep_self_kv_head(ue, regs, h, M, KV, D, bpe)
         else:
             # ---- CROSS layers: RE-PROJECT the frozen prefix K/V (FAULT 5) ------------
             # This layer's k_proj/v_proj are (320,320), NOT (320,480) like a self layer's
@@ -4384,11 +4453,15 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             pl = self._ae_cross_prefix_layer(layer_idx)
             k_base = self.LAYER0_K_DRAM + pl * self.KV_LAYER_STRIDE
             v_base = self.LAYER0_V_DRAM + pl * self.KV_LAYER_STRIDE
-            for h in range(self.NUM_KV_HEADS):
-                self._ae_strided_copy(ue, k_base + h * self.KV_HEAD_STRIDE, D * bpe,
-                                      self.AE_XK_TOK_DRAM + h * D * bpe, KV * bpe, PM, D)
-                self._ae_strided_copy(ue, v_base + h * self.KV_HEAD_STRIDE, D * bpe,
-                                      self.AE_XV_TOK_DRAM + h * D * bpe, KV * bpe, PM, D)
+            # SHARDED: the gather is per-head and its destination bands are disjoint,
+            # so it splits head -> engine exactly like the group loop -- but the
+            # (320,320) re-projection right below reads the buffer at FULL width, so it
+            # needs a JOIN before it can run. That is the one barrier this change adds,
+            # and only on cross layers.
+            for (h, x_ue, _r) in self._ae_prep_engines(sched, ue, regs):
+                self._ae_prep_cross_tok_head(x_ue, h, k_base, v_base, PM, KV, D, bpe)
+            if sharded:
+                sched.barrier()
             # [PM,320] @ (320,320).T -> [PM,320]. M is PM=192 rows here, not the suffix's
             # 64, so the PBI row-loop must run off regs["qb"] (192) -- AE_FLASH_ROWS ==
             # PM is asserted in _ae_tensor_init, which is what makes that reuse legal.
@@ -4397,13 +4470,10 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             self._ae_matmul(ue, PM, KV, KV, self.AE_XV_TOK_DRAM, la["v_weight"],
                             self.AE_XV_PROJ_DRAM, m_reg=regs["qb"])
             # back to head-major [5, PM, D] so flash can take a contiguous K/V per group.
-            for h in range(self.NUM_KV_HEADS):
-                self._ae_strided_copy(ue, self.AE_XK_PROJ_DRAM + h * D * bpe, KV * bpe,
-                                      self.AE_XK_HEADS_DRAM + h * self.AE_XKV_HEAD_STRIDE,
-                                      D * bpe, PM, D)
-                self._ae_strided_copy(ue, self.AE_XV_PROJ_DRAM + h * D * bpe, KV * bpe,
-                                      self.AE_XV_HEADS_DRAM + h * self.AE_XKV_HEAD_STRIDE,
-                                      D * bpe, PM, D)
+            # SHARDED: folded into the group loop below (head h on group h's engine).
+            if not sharded:
+                for h in range(self.NUM_KV_HEADS):
+                    self._ae_prep_cross_head_major(ue, h, PM, KV, D, bpe)
             # NO RoPE on the reprojected K: the cached K was already rotated with the
             # PREFIX positions during prefill, and upstream does not rotate `ek`. Only
             # the expert's query is roped on cross layers (below), with positions
@@ -4419,14 +4489,28 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # prefix_kv[i] on BOTH branches (VeraPulseRef.forward_expert), so reuse the same
         # mapping helper the cross path uses rather than hardcoding the index.
         self_pl = self._ae_cross_prefix_layer(layer_idx) if is_self else None
-        # BARRIER IN: everything the groups read -- q_proj, k/v_proj, the per-head
-        # staging and the K RoPE -- is emitted PRIMARY-ONLY above, so no worker may
-        # enter its group until the primary has landed all of it.
-        if sched is not None and sched.num_engines > 1:
+        # BARRIER IN: what the groups read that is still emitted PRIMARY-ONLY above --
+        # q_proj on both branches, k/v_proj on self layers, the (320,320)
+        # re-projection on cross layers. The per-head staging and the K RoPE are no
+        # longer in that list: they moved INTO the group bodies, which is the point of
+        # the fold. No worker may enter its group until the primary has landed the
+        # full-width matmuls.
+        if sharded:
             sched.barrier()
         for (kv_b, x_ue, r_, F_Q, F_O, F_S, CK, CV) in self._ae_attn_groups(
                 sched, ue, regs):
             seq_reg_e = r_["cw"] if is_self else r_["qb"]
+            # ---- THE FOLD: this group's OWN kv-head prep, on this group's engine -----
+            # Used to be a primary-only `for h in range(NUM_KV_HEADS)` ahead of the
+            # barrier. It is the same five iterations the group loop already splits, so
+            # head kv_b belongs to whoever owns group kv_b -- and running it here means
+            # the prep needs no barrier of its own: the only reader of head kv_b's
+            # staging is the flash call a few lines down, on this very engine.
+            if sharded:
+                if is_self:
+                    self._ae_prep_self_kv_head(x_ue, r_, kv_b, M, KV, D, bpe)
+                else:
+                    self._ae_prep_cross_head_major(x_ue, kv_b, PM, KV, D, bpe)
             # gather this group's 3 q-heads TOKEN-MAJOR: flash row t*G+g is q-head
             # kv_b*G+g of token t, so one flash call serves the whole group.
             for g in range(G):
@@ -4531,7 +4615,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
         # BARRIER OUT: o_proj below is primary-only and reads AE_ATTN_RESULT at FULL
         # width, which the groups wrote into disjoint 64-column bands.
-        if sched is not None and sched.num_engines > 1:
+        if sharded:
             sched.barrier()
         # ---- o_proj + residual ------------------------------------------------------
         # o_weight is [512,960]: the N-pad puts zeros in out-rows 480..511, which is what
