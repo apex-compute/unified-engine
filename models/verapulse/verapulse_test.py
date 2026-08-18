@@ -3763,8 +3763,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # Then the reprojected [PM,320] is de-interleaved back into 5 contiguous [PM,D]
         # head blocks for flash.
         #
-        # All four are SCRATCH, rebuilt from the (untouched) cache at every cross layer
-        # of every Euler step, so one set is shared by all 16 cross layers x 10 steps.
+        # All four are SCRATCH, and are now produced and consumed WITHIN ONE ITERATION
+        # of the hoisted _emit_cross_reproject_all pass -- sequentially, on the primary
+        # -- so one set is still shared by all 16 cross layers. Only the head-major
+        # RESULT below needs per-layer storage, because it must stay live across the
+        # whole 10-step unroll.
         self.AE_XKV_HEAD_STRIDE = PM * D * bpe
         self.AE_XK_TOK_DRAM  = a(PM * KV)   # cached K interleaved token-major [192,320]
         self.AE_XV_TOK_DRAM  = a(PM * KV)
@@ -3773,8 +3776,23 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # de-interleaved [5,192,64] flash operands. Same byte size as the *_TOK buffers;
         # kept SEPARATE rather than aliased so the gather -> matmul -> scatter chain has
         # no read/write overlap to reason about.
-        self.AE_XK_HEADS_DRAM = a(self.NUM_KV_HEADS * PM * D)
-        self.AE_XV_HEADS_DRAM = a(self.NUM_KV_HEADS * PM * D)
+        #
+        # PER-LAYER, NOT SHARED. The reprojection reads only (a) the FROZEN prefix
+        # cache and (b) this layer's static k_weight/v_weight -- neither varies with
+        # the Euler step -- so it is hoisted OUT of the 10-step unroll and computed
+        # once per layer (see _emit_cross_reproject_all). That turns the destination
+        # from one reused buffer into E_LAYERS slots: every cross layer keeps its own
+        # head-major [5, PM, D] K and V alive for the whole denoise program.
+        # Keyed by layer_idx (not by a cross-layer ordinal) on purpose -- an ordinal
+        # is one off-by-one away from a layer reading another layer's projection,
+        # which is finite-but-scrambled, never NaN. E_LAYERS slots so the
+        # --bisect-expert truncation (EXPERT_LAYERS < E_LAYERS) needs no re-sizing.
+        # 32 x 5 x 192 x 64 x 2 B = 3.93 MB each, 7.86 MB for the pair.
+        self.AE_XKV_LAYER_STRIDE = self.NUM_KV_HEADS * PM * D * bpe
+        assert self.AE_XKV_LAYER_STRIDE % 32 == 0, (
+            "cross reprojection layer stride must be 32 B beat aligned")
+        self.AE_XK_HEADS_DRAM = a(self.E_LAYERS * self.NUM_KV_HEADS * PM * D)
+        self.AE_XV_HEADS_DRAM = a(self.E_LAYERS * self.NUM_KV_HEADS * PM * D)
 
         self.AE_ATTN_RESULT_DRAM = a(M * Q)
         self.AE_O_PROJ_DRAM  = a(M * HP)
@@ -4177,11 +4195,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     def _ae_prep_engines(self, sched, ue, regs):
         """(head, engine, regs) with the SAME head -> engine map as _ae_attn_groups.
 
-        For the one prep loop that cannot live inside the group body: the cross layers'
-        token-major gather, which feeds a full-width matmul and therefore has to finish
-        on every engine before the primary re-projects. Derived from _ae_attn_groups so
-        the two mappings can never drift apart. At ne == 1 this is the primary, five
-        times, in head order -- the original loop exactly."""
+        CURRENTLY UNUSED. Its one caller was the cross layers' token-major gather, which
+        had to finish on every engine before the primary re-projected -- and that whole
+        chain has since been hoisted out of the Euler loop onto the primary
+        (_emit_cross_reproject_all), taking its barrier with it. Kept because it is the
+        ready-made split for any future prep loop that must run ahead of a full-width
+        op: derived from _ae_attn_groups so the two mappings can never drift apart, and
+        at ne == 1 it is the primary, five times, in head order."""
         for tup in self._ae_attn_groups(sched, ue, regs):
             yield (tup[0], tup[1], tup[2])
 
@@ -4262,16 +4282,28 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self._ae_strided_copy(x_ue, v_base + h * self.KV_HEAD_STRIDE, D * bpe,
                               self.AE_XV_TOK_DRAM + h * D * bpe, KV * bpe, PM, D)
 
-    def _ae_prep_cross_head_major(self, x_ue, h, PM, KV, D, bpe):
+    def _ae_xkv_layer_base(self, layer_idx):
+        """(K, V) base of the hoisted head-major reprojection slot for `layer_idx`.
+
+        One slot per expert layer. Only cross layers ever write or read one, but the
+        keying is the raw layer index so the write in _emit_cross_reproject_all and
+        the read in _emit_expert_layer's group loop cannot drift."""
+        assert 0 <= layer_idx < self.E_LAYERS, f"expert layer {layer_idx} out of range"
+        off = layer_idx * self.AE_XKV_LAYER_STRIDE
+        return (self.AE_XK_HEADS_DRAM + off, self.AE_XV_HEADS_DRAM + off)
+
+    def _ae_prep_cross_head_major(self, x_ue, h, PM, KV, D, bpe, k_dst, v_dst):
         """CROSS layers: reprojected [PM,320] -> head-major [5,PM,64], so flash takes a
-        contiguous K/V per group."""
+        contiguous K/V per group. `k_dst`/`v_dst` are THIS LAYER's hoisted slot."""
         assert (h * self.AE_XKV_HEAD_STRIDE) % 32 == 0, (
             f"cross head-major offset {h} not 32 B beat aligned")
+        assert k_dst % 32 == 0 and v_dst % 32 == 0, (
+            "hoisted cross reprojection slot base not 32 B beat aligned")
         self._ae_strided_copy(x_ue, self.AE_XK_PROJ_DRAM + h * D * bpe, KV * bpe,
-                              self.AE_XK_HEADS_DRAM + h * self.AE_XKV_HEAD_STRIDE,
+                              k_dst + h * self.AE_XKV_HEAD_STRIDE,
                               D * bpe, PM, D)
         self._ae_strided_copy(x_ue, self.AE_XV_PROJ_DRAM + h * D * bpe, KV * bpe,
-                              self.AE_XV_HEADS_DRAM + h * self.AE_XKV_HEAD_STRIDE,
+                              v_dst + h * self.AE_XKV_HEAD_STRIDE,
                               D * bpe, PM, D)
 
     def _ae_duplicate_gqa_rows(self, ue, rows, src_sram_addr, dst_dram_addr):
@@ -4417,6 +4449,81 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                         bias=self.time_mlp_out_bias)
         return self.AE_IO_A_DRAM
 
+    def _emit_cross_reproject_all(self, ue, n_ae):
+        """HOISTED, ONCE PER PROGRAM: every cross layer's reprojected prefix K/V.
+
+        WHY THIS IS STEP-INVARIANT (checked, not assumed). The chain is
+
+            LAYER0_K/V_DRAM[pl]  --gather-->  AE_XK/XV_TOK
+                                 --matmul-->  AE_XK/XV_PROJ   (k/v_weight, 320x320)
+                                 --scatter->  AE_XK/XV_HEADS[layer]
+
+        and it has exactly two inputs:
+          * LAYER0_K/V_DRAM, the prefix KV cache. Written in precisely one place --
+            compile_prefix's per-layer cache store -- and that program has finished
+            before the denoise program is even launched. Nothing in the denoise body
+            writes it (it is only ever a strided-copy SOURCE, on both the cross path
+            here and the self layers' [prefix ; suffix] concat), which is also the
+            standing requirement that it survive all 10 Euler steps.
+          * la["k_weight"] / la["v_weight"], static weight blobs in DRAM.
+        Neither is touched by the Euler update, whose only mutable state is
+        AE_XT_DRAM (plus the per-layer ping-pong stream and the timestep pointer).
+        The old emission produced bit-identical bytes on all 10 passes; the DATA it
+        produced was therefore identical on all 10 too. Hoisting changes when it runs,
+        not what it computes.
+
+        The mapping is preserved exactly: layer `i` reads the same
+        _ae_cross_prefix_layer(i) cache it read inline, and writes the slot the group
+        loop reads back through the same _ae_xkv_layer_base(i).
+
+        PRIMARY-ONLY, DELIBERATELY, AND WITH NO BARRIER OF ITS OWN. The whole pass is
+        1/10 of what it used to cost, so sharding it would buy microseconds while
+        adding rendezvous outside any region. Workers stay symmetric because they emit
+        NOTHING here: the first thing in every worker's program is the opening
+        rendezvous of layer 0's q-projection region, and the primary reaches that
+        rendezvous only after this pass has landed -- so the hoisted writes are fenced
+        against every worker read by a barrier that already existed.
+
+        AE_XK/XV_TOK and AE_XK/XV_PROJ stay SINGLE shared scratch: they are produced
+        and consumed within one layer's iteration of this loop, sequentially, on one
+        engine. Only the head-major result needs per-layer storage.
+
+        Unconditional -- emitted the same way at ne == 1 and ne == 8, so there is one
+        behaviour to verify rather than two."""
+        HP, KV = self.E_HIDDEN_PAD, self.E_KV_OUT
+        D, PM, bpe = self.HEAD_DIM, self.PREFILL_MAX_SEQ_LEN, 2
+        regs = self._ae_regs
+        n_cross = 0
+        for layer_idx in range(n_ae):
+            if self._ae_is_self_attn(layer_idx):
+                continue
+            n_cross += 1
+            la = self.ae_layer_addrs[layer_idx]
+            pl = self._ae_cross_prefix_layer(layer_idx)
+            k_base = self.LAYER0_K_DRAM + pl * self.KV_LAYER_STRIDE
+            v_base = self.LAYER0_V_DRAM + pl * self.KV_LAYER_STRIDE
+            xk_dst, xv_dst = self._ae_xkv_layer_base(layer_idx)
+            # head-major cache -> token-major [PM, 320], one strided copy per head.
+            for h in range(self.NUM_KV_HEADS):
+                self._ae_prep_cross_tok_head(ue, h, k_base, v_base, PM, KV, D, bpe)
+            # [PM,320] @ (320,320).T -> [PM,320]. m_reg is regs["qb"] because the row
+            # count here is PM=192, not the suffix's 64 (AE_FLASH_ROWS == PM is
+            # asserted in _ae_tensor_init, which is what makes that reuse legal).
+            self._ae_matmul(ue, PM, KV, KV, self.AE_XK_TOK_DRAM, la["k_weight"],
+                            self.AE_XK_PROJ_DRAM, m_reg=regs["qb"])
+            self._ae_matmul(ue, PM, KV, KV, self.AE_XV_TOK_DRAM, la["v_weight"],
+                            self.AE_XV_PROJ_DRAM, m_reg=regs["qb"])
+            # back to head-major [5, PM, D] in THIS layer's slot.
+            for h in range(self.NUM_KV_HEADS):
+                self._ae_prep_cross_head_major(ue, h, PM, KV, D, bpe, xk_dst, xv_dst)
+        # NO RoPE on the reprojected K: the cached K already carries the PREFIX
+        # rotation and upstream does not rotate `ek`. Only the expert's query is roped
+        # on cross layers, and that IS step-dependent-shaped work that stays in the
+        # loop body (it reads AE_Q_DRAM, which the step recomputes).
+        print(f"    [denoise] hoisted cross K/V reprojection for {n_cross} layer(s) "
+              f"out of the {self.N_STEPS}-step unroll "
+              f"({n_cross * 2 * self.AE_XKV_LAYER_STRIDE / 1e6:.2f} MB of slots)")
+
     def _emit_expert_layer(self, ue, layer_idx, step, sched=None):
         """Same body shape as one compile_prefix layer at M=SUFFIX_LEN_PAD=64 on the
         512-padded stream, reusing lm_matmul/strided_copy/duplicate_gqa_rows against
@@ -4511,54 +4618,20 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 for h in range(self.NUM_KV_HEADS):
                     self._ae_prep_self_kv_head(ue, regs, h, M, KV, D, bpe)
         else:
-            # ---- CROSS layers: RE-PROJECT the frozen prefix K/V (FAULT 5) ------------
-            # This layer's k_proj/v_proj are (320,320), NOT (320,480) like a self layer's
-            # -- the checkpoint shape is the proof that the cached VLM K/V is not fed to
-            # flash raw but pushed through the expert's own projections first:
-            #     _k = k.reshape(*k.shape[:2], -1)                    # [S, 320]
-            #     ek = exp_layer.self_attn.k_proj(_k).view(S, nkv, D)
-            # (SmolVLMWithExpert.forward_cross_attn_layer; mirrored by
-            # VeraPulseRef.forward_expert under self.expert_cross_reproject.)
+            # ---- CROSS layers: the reprojected prefix K/V is ALREADY BUILT ----------
+            # It used to be built right here, 10 times per layer with identical inputs.
+            # Its only inputs are the FROZEN prefix cache (LAYER0_K/V_DRAM, written by
+            # the prefix program and read-only for the whole denoise) and this layer's
+            # static k_weight/v_weight -- nothing that varies with the Euler step -- so
+            # the gather -> (320,320) matmul -> head-major scatter chain is emitted ONCE
+            # per layer by _emit_cross_reproject_all, ahead of the step unroll, into
+            # this layer's own slot. See that method for the invariance argument.
             #
-            # LAYOUT. The cache is HEAD-MAJOR: head h of prefix layer `pl` is a
-            # contiguous [PM, D] block at LAYER0_K_DRAM + pl*KV_LAYER_STRIDE
-            # + h*KV_HEAD_STRIDE. k_proj needs the TOKEN-MAJOR [PM, 320] view, i.e. row t
-            # = concat over h of head h's row t. That is exactly one strided copy per
-            # head -- contiguous gather (src jump D*bpe), strided scatter into column
-            # block h (dst base + h*D*bpe, dst jump KV*bpe) -- the mirror image of the
-            # self path's de-interleave a few lines up. Deliberately NOT
-            # smart_bf16_permute_core: its last dim here would be D=64... and the
-            # documented hazard is last_dim < 64 racing ~100k memcpys through one URAM
-            # slot, so the strided-copy form is used for both directions to stay on the
-            # proven path.
-            pl = self._ae_cross_prefix_layer(layer_idx)
-            k_base = self.LAYER0_K_DRAM + pl * self.KV_LAYER_STRIDE
-            v_base = self.LAYER0_V_DRAM + pl * self.KV_LAYER_STRIDE
-            # SHARDED: the gather is per-head and its destination bands are disjoint,
-            # so it splits head -> engine exactly like the group loop -- but the
-            # (320,320) re-projection right below reads the buffer at FULL width, so it
-            # needs a JOIN before it can run. That is the one barrier this change adds,
-            # and only on cross layers.
-            for (h, x_ue, _r) in self._ae_prep_engines(sched, ue, regs):
-                self._ae_prep_cross_tok_head(x_ue, h, k_base, v_base, PM, KV, D, bpe)
-            if sharded:
-                sched.barrier()
-            # [PM,320] @ (320,320).T -> [PM,320]. M is PM=192 rows here, not the suffix's
-            # 64, so the PBI row-loop must run off regs["qb"] (192) -- AE_FLASH_ROWS ==
-            # PM is asserted in _ae_tensor_init, which is what makes that reuse legal.
-            self._ae_matmul(ue, PM, KV, KV, self.AE_XK_TOK_DRAM, la["k_weight"],
-                            self.AE_XK_PROJ_DRAM, m_reg=regs["qb"])
-            self._ae_matmul(ue, PM, KV, KV, self.AE_XV_TOK_DRAM, la["v_weight"],
-                            self.AE_XV_PROJ_DRAM, m_reg=regs["qb"])
-            # back to head-major [5, PM, D] so flash can take a contiguous K/V per group.
-            # SHARDED: folded into the group loop below (head h on group h's engine).
-            if not sharded:
-                for h in range(self.NUM_KV_HEADS):
-                    self._ae_prep_cross_head_major(ue, h, PM, KV, D, bpe)
-            # NO RoPE on the reprojected K: the cached K was already rotated with the
-            # PREFIX positions during prefill, and upstream does not rotate `ek`. Only
-            # the expert's query is roped on cross layers (below), with positions
-            # rebased to 0..chunk-1 (exp_pos - exp_pos.min()).
+            # Two things left with it: the (320,320) re-projection (16 cross layers x 10
+            # steps of PM=192 x 320 x 320 on the UNSHARDED primary -> 1/10 of that), and
+            # the barrier that fenced the token-major gather against it. Cross layers now
+            # carry exactly ONE barrier, the attention region's, same as self layers.
+            pass
 
         # ---- per-kv-group stacked-Q flash -------------------------------------------
         # SELF layers now attend over the COMBINED [prefix ; suffix] key/value sequence
@@ -4587,11 +4660,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # head kv_b belongs to whoever owns group kv_b -- and running it here means
             # the prep needs no barrier of its own: the only reader of head kv_b's
             # staging is the flash call a few lines down, on this very engine.
-            if sharded:
-                if is_self:
-                    self._ae_prep_self_kv_head(x_ue, r_, kv_b, M, KV, D, bpe)
-                else:
-                    self._ae_prep_cross_head_major(x_ue, kv_b, PM, KV, D, bpe)
+            if sharded and is_self:
+                self._ae_prep_self_kv_head(x_ue, r_, kv_b, M, KV, D, bpe)
             # gather this group's 3 q-heads TOKEN-MAJOR: flash row t*G+g is q-head
             # kv_b*G+g of token t, so one flash call serves the whole group.
             for g in range(G):
@@ -4664,14 +4734,16 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                       CV + PM * D * bpe, D * bpe, M, D)
                 k_addr, v_addr = CK, CV
             else:
-                # THE REPROJECTED PREFIX K/V (FAULT 5), not the raw cache. Built once
-                # above for all 5 groups as contiguous [PM=192, 64] blocks -- the same
+                # THE REPROJECTED PREFIX K/V (FAULT 5), not the raw cache. Built ONCE
+                # PER LAYER by _emit_cross_reproject_all, before the Euler unroll, as
+                # contiguous [PM=192, 64] blocks in this layer's own slot -- the same
                 # geometry the raw cache had, so nothing downstream changes. Still no
                 # x G replication: 192 == the stacked-Q batch. The raw cache itself is
                 # only READ here and must survive all 10 steps untouched.
+                xk_base, xv_base = self._ae_xkv_layer_base(layer_idx)
                 off = kv_b * self.AE_XKV_HEAD_STRIDE
-                k_addr = self.AE_XK_HEADS_DRAM + off
-                v_addr = self.AE_XV_HEADS_DRAM + off
+                k_addr = xk_base + off
+                v_addr = xv_base + off
 
             # FLASH STAYS ADDRESS-STATIC. Only the two dimension GPRs are runtime (the
             # same thing compile_encoder does); PBI address injection into flash corrupts
@@ -4950,6 +5022,14 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             if step is not None:
                 self._ae_dram_copy(ue, self.AE_XT_DRAM,
                                    self.AE_STEP_SNAP_DRAM + step * M * ADP * 2, M * ADP)
+
+        # ---- STEP-INVARIANT WORK, HOISTED OUT OF THE UNROLL -------------------------
+        # Emitted ONCE, here, ahead of every Euler step and after the whole runtime
+        # constant/register setup above (the prefix cache and PREFIX_LEN are settled
+        # before this program is launched at all). Inside the program, so every
+        # re-execution rebuilds it from whatever the current prefix left in the cache.
+        n_ae_hoist = self.E_LAYERS if self.EXPERT_LAYERS is None else int(self.EXPERT_LAYERS)
+        self._emit_cross_reproject_all(ue, n_ae_hoist)
 
         if self.DENOISE_ROLLED:
             # One body inside a hardware loop. SMALL but UNPROVEN: _ae_duplicate_gqa_rows
