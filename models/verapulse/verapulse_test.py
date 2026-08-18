@@ -3344,10 +3344,10 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # inside the margin rather than comfortably clear of it.
         assert PM * UE_VECTOR_SIZE * bpe * 2 <= 0x10000, "SRAM staging window shrank"
 
-        def scatter_lane(x_ue, src, dst_base, n0, cols, full_n):
+        def scatter_lane(ue, src, dst_base, n0, cols, full_n):
             assert cols % UE_VECTOR_SIZE == 0
             for c0 in range(0, cols, UE_VECTOR_SIZE):
-                self._ae_strided_copy(x_ue, src + c0 * bpe, cols * bpe,
+                self._ae_strided_copy(ue, src + c0 * bpe, cols * bpe,
                                       dst_base + (n0 + c0) * bpe, full_n * bpe,
                                       PM, UE_VECTOR_SIZE)
 
@@ -3801,7 +3801,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # so one over-sized allocation serves both widths; under-sizing it would let the
         # score block run off the end of the buffer into the next tensor.
         CW = self.AE_COMBINED_LEN
-        self.AE_FLASH_SCRATCH_DRAM = a((D + CW) * CW + QB * D)
+        self.AE_FLASH_SCRATCH_DRAM = a(self._ae_flash_scratch_elems())
 
         # ---- constants: RoPE tables ----
         pos = self._ae_rope_positions()
@@ -4072,6 +4072,48 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         sched.reduce_add([sched.per_engine_addr("ae_mlp_down_partial", i)
                           for i in range(ne)],
                          self.AE_MLP_DOWN_DRAM, M, HP, join=False)
+
+    def _ae_attn_groups(self, sched, ue, regs):
+        """Assign the 5 kv groups to engines, yielding one tuple per group.
+
+        THE AXIS. M = SUFFIX_LEN_PAD = 64 is a single 64-row block, so the query-row
+        split that shards vision's attention is inexpressible here. What IS divisible is
+        the per-kv-group loop: each group gathers its own 3 q-heads, runs its own flash
+        call and scatters into its own disjoint 64-column band of AE_ATTN_RESULT_DRAM.
+        Groups never read each other's output, so the region needs no mid-loop sync.
+
+        NUM_KV_HEADS = 5 does NOT divide 8: engines 5..7 sit idle through this region.
+        That is deliberate. Splitting a group's 3 q-heads across engines would break the
+        token-major stacking the whole emitter is built on (flash row t*G+g is q-head
+        kv_b*G+g of token t), and 5-way is already the largest clean cut available.
+
+        Yields (kv_b, engine, regs, F_Q, F_OUT, F_SCRATCH, CK, CV). At ne == 1 every
+        tuple is the primary with its original addresses, so the emitted body is
+        byte-identical to the single-engine program.
+        """
+        n_grp = 1 if sched is None else min(sched.num_engines, self.NUM_KV_HEADS)
+        if n_grp <= 1:
+            for kv_b in range(self.NUM_KV_HEADS):
+                yield (kv_b, ue, regs, self.AE_FLASH_Q_DRAM, self.AE_FLASH_OUT_DRAM,
+                       self.AE_FLASH_SCRATCH_DRAM, self.AE_CK_DRAM, self.AE_CV_DRAM)
+            return
+        pe = sched.per_engine_addr
+        for kv_b in range(self.NUM_KV_HEADS):
+            e = kv_b % n_grp
+            yield (kv_b, sched.engines[e], self._ae_reg_sets[e],
+                   pe("ae_flash_q", e), pe("ae_flash_out", e), pe("ae_flash_scr", e),
+                   pe("ae_ck", e), pe("ae_cv", e))
+
+    def _ae_flash_scratch_elems(self):
+        """Element count of the expert's flash scratch, in ONE place.
+
+        Sized for the WORST case the body emits: aligned_seq_len = AE_COMBINED_LEN (the
+        self layers' prefix+suffix concat), not the cross layers' PM. The per-engine
+        copies registered for the attention shard must match it exactly -- the core
+        derives its sub-offsets from the compile-time QB/seq, so a short copy is read
+        past its end rather than refused."""
+        D, CW, QB = self.HEAD_DIM, self.AE_COMBINED_LEN, self.AE_FLASH_ROWS
+        return (D + CW) * CW + QB * D
 
     def _ae_strided_copy(self, ue, src, src_jump, dst, dst_jump, rows, width):
         """Static [rows, width] strided gather -> contiguous SRAM -> strided scatter.
@@ -4372,18 +4414,24 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # (FAULT 4), so their aligned_seq_len is PM + M = 256, not QB. batch stays QB.
         CW = self.AE_COMBINED_LEN
         seq_len = CW if is_self else PM
-        seq_reg = regs["cw"] if is_self else regs["qb"]
         bias_addr = self.AE_BIAS_SELF_DRAM if is_self else self.AE_BIAS_CROSS_DRAM
         # Which prefix layer's cache a SELF layer concatenates: the reference uses
         # prefix_kv[i] on BOTH branches (VeraPulseRef.forward_expert), so reuse the same
         # mapping helper the cross path uses rather than hardcoding the index.
         self_pl = self._ae_cross_prefix_layer(layer_idx) if is_self else None
-        for kv_b in range(self.NUM_KV_HEADS):
+        # BARRIER IN: everything the groups read -- q_proj, k/v_proj, the per-head
+        # staging and the K RoPE -- is emitted PRIMARY-ONLY above, so no worker may
+        # enter its group until the primary has landed all of it.
+        if sched is not None and sched.num_engines > 1:
+            sched.barrier()
+        for (kv_b, x_ue, r_, F_Q, F_O, F_S, CK, CV) in self._ae_attn_groups(
+                sched, ue, regs):
+            seq_reg_e = r_["cw"] if is_self else r_["qb"]
             # gather this group's 3 q-heads TOKEN-MAJOR: flash row t*G+g is q-head
             # kv_b*G+g of token t, so one flash call serves the whole group.
             for g in range(G):
-                self._ae_strided_copy(ue, self.AE_Q_DRAM + (kv_b * G + g) * D * bpe,
-                                      Q * bpe, self.AE_FLASH_Q_DRAM + g * D * bpe,
+                self._ae_strided_copy(x_ue, self.AE_Q_DRAM + (kv_b * G + g) * D * bpe,
+                                      Q * bpe, F_Q + g * D * bpe,
                                       G * D * bpe, M, D)
             if is_self or self.EXPERT_ROPE_Q_ON_CROSS:
                 # rope the stacked buffer in one call at M=QB against the x G duplicated
@@ -4403,11 +4451,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 #            prefix rotation -- a silent, smooth, entirely wrong result.
                 rope_tbl = self.AE_ROPE_GQA_DRAM if is_self \
                     else self.AE_ROPE_GQA_CROSS_DRAM
-                ue.rope_hf_core_dram(M=QB, N=D, input_dram_addr=self.AE_FLASH_Q_DRAM,
-                                     output_dram_addr=self.AE_FLASH_Q_DRAM,
+                x_ue.rope_hf_core_dram(M=QB, N=D, input_dram_addr=F_Q,
+                                     output_dram_addr=F_Q,
                                      cos_dram_addr=rope_tbl,
                                      sin_dram_addr=rope_tbl + D * bpe,
-                                     gpr_M_reg=regs["qb"])
+                                     gpr_M_reg=r_["qb"])
 
             if is_self:
                 # ---- FAULT 4: build [prefix ; suffix] K/V for THIS kv-head -----------
@@ -4443,13 +4491,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                          + kv_b * self.KV_HEAD_STRIDE)
                 k_suf = self.AE_K_HEADS_DRAM + kv_b * self.AE_KV_HEAD_STRIDE
                 v_suf = self.AE_V_HEADS_DRAM + kv_b * self.AE_KV_HEAD_STRIDE
-                self._ae_strided_copy(ue, k_pre, D * bpe, self.AE_CK_DRAM, D * bpe, PM, D)
-                self._ae_strided_copy(ue, v_pre, D * bpe, self.AE_CV_DRAM, D * bpe, PM, D)
-                self._ae_strided_copy(ue, k_suf, D * bpe,
-                                      self.AE_CK_DRAM + PM * D * bpe, D * bpe, M, D)
-                self._ae_strided_copy(ue, v_suf, D * bpe,
-                                      self.AE_CV_DRAM + PM * D * bpe, D * bpe, M, D)
-                k_addr, v_addr = self.AE_CK_DRAM, self.AE_CV_DRAM
+                self._ae_strided_copy(x_ue, k_pre, D * bpe, CK, D * bpe, PM, D)
+                self._ae_strided_copy(x_ue, v_pre, D * bpe, CV, D * bpe, PM, D)
+                self._ae_strided_copy(x_ue, k_suf, D * bpe,
+                                      CK + PM * D * bpe, D * bpe, M, D)
+                self._ae_strided_copy(x_ue, v_suf, D * bpe,
+                                      CV + PM * D * bpe, D * bpe, M, D)
+                k_addr, v_addr = CK, CV
             else:
                 # THE REPROJECTED PREFIX K/V (FAULT 5), not the raw cache. Built once
                 # above for all 5 groups as contiguous [PM=192, 64] blocks -- the same
@@ -4463,24 +4511,28 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # FLASH STAYS ADDRESS-STATIC. Only the two dimension GPRs are runtime (the
             # same thing compile_encoder does); PBI address injection into flash corrupts
             # on the 2nd execution and this body runs 10 times per inference.
-            ue.unified_attention_core(
+            x_ue.unified_attention_core(
                 batch=QB, aligned_seq_len=seq_len, head_dim=D,
-                Q_DRAM_ADDR=self.AE_FLASH_Q_DRAM, K_DRAM_ADDR=k_addr, V_DRAM_ADDR=v_addr,
-                BIAS_DRAM_ADDR=bias_addr, OUTPUT_DRAM_ADDR=self.AE_FLASH_OUT_DRAM,
-                SCRATCH_DRAM_ADDR=self.AE_FLASH_SCRATCH_DRAM,
+                Q_DRAM_ADDR=F_Q, K_DRAM_ADDR=k_addr, V_DRAM_ADDR=v_addr,
+                BIAS_DRAM_ADDR=bias_addr, OUTPUT_DRAM_ADDR=F_O,
+                SCRATCH_DRAM_ADDR=F_S,
                 IDENTITY_DRAM_ADDR=self.identity_addr,
-                gpr_batch_reg=regs["qb"], gpr_aligned_seq_len_reg=seq_reg)
+                gpr_batch_reg=r_["qb"], gpr_aligned_seq_len_reg=seq_reg_e)
 
             # un-stack [64,G,D] -> [64,960] at THIS group's head columns. The + head*D*2
             # in the destination base is trap #8: without it every head writes columns
             # [0:64], o_proj reads garbage for 14 of the 15 heads, and the output is
             # finite and scrambled rather than NaN.
             for g in range(G):
-                self._ae_strided_copy(ue, self.AE_FLASH_OUT_DRAM + g * D * bpe,
+                self._ae_strided_copy(x_ue, F_O + g * D * bpe,
                                       G * D * bpe,
                                       self.AE_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe,
                                       Q * bpe, M, D)
 
+        # BARRIER OUT: o_proj below is primary-only and reads AE_ATTN_RESULT at FULL
+        # width, which the groups wrote into disjoint 64-column bands.
+        if sched is not None and sched.num_engines > 1:
+            sched.barrier()
         # ---- o_proj + residual ------------------------------------------------------
         # o_weight is [512,960]: the N-pad puts zeros in out-rows 480..511, which is what
         # re-zeroes the residual stream's pad lanes after every attention write.
@@ -4575,9 +4627,32 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             sched.register_per_engine(
                 "ae_mlp_down_partial", self.AE_MLP_DOWN_DRAM, M * HP * 2,
                 init_tensor=torch.zeros(M * HP, dtype=torch.bfloat16))
+            # ATTENTION SHARD: per-engine flash staging. The kv-group loop is split
+            # across engines, so AE_FLASH_Q/OUT/SCRATCH cannot be shared -- two engines
+            # staging different groups through one buffer is silent corruption. SCRATCH
+            # keeps its FULL size: unified_attention_core derives its sub-offsets from
+            # the compile-time QB/seq, which do not shrink when the GROUP count does.
+            QBr, Dh = self.AE_FLASH_ROWS, self.HEAD_DIM
+            CWl = self.AE_COMBINED_LEN
+            for nm, addr, elems in (
+                    ("ae_flash_q",   self.AE_FLASH_Q_DRAM,       QBr * Dh),
+                    ("ae_flash_out", self.AE_FLASH_OUT_DRAM,     QBr * Dh),
+                    ("ae_flash_scr", self.AE_FLASH_SCRATCH_DRAM, self._ae_flash_scratch_elems()),
+                    # SELF layers stage [prefix ; suffix] K/V through these, ONE buffer
+                    # reused per group -- so a group shard makes them per-engine too.
+                    ("ae_ck",        self.AE_CK_DRAM,            CWl * Dh),
+                    ("ae_cv",        self.AE_CV_DRAM,            CWl * Dh)):
+                sched.register_per_engine(
+                    nm, addr, elems * 2,
+                    init_tensor=torch.zeros(elems, dtype=torch.bfloat16))
+            n_grp = min(ne, self.NUM_KV_HEADS)
             print(f"    [denoise] gated MLP sharded over {ne} engine(s): "
                   f"gate/up N={self.E_INTER} -> {[c for _, c in self._col_split(self.E_INTER, ne)]}"
                   f", down K-split + reduce_add. q/k/v/o/action_out stay on the primary.")
+            print(f"    [denoise] attention sharded over {n_grp} engine(s): "
+                  f"{self.NUM_KV_HEADS} kv groups, 1 per engine"
+                  + (f" ({ne - n_grp} idle in this region -- {self.NUM_KV_HEADS} groups "
+                     f"do not divide {ne})" if ne > n_grp else ""))
         self._denoise_sched = sched
 
         # THE TIMESTEP POINTER IS A **WORD** ADDRESS. accelerator_memory_to_sram's
@@ -4621,6 +4696,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # begin_program() must come AFTER the primary's start_capture (it asserts the
         # primary is already capturing) and after the primary's own counter reset.
         self._ae_m_regs = [regs["m"]]
+        # The attention shard needs "qb"/"cw" per engine too, not just "m".
+        self._ae_reg_sets = [regs]
         if sched is not None:
             sched.begin_program()
             for w in sched.workers:
@@ -4637,6 +4714,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 w.generate_instruction_add_set(
                     wr["time"], ue_35bit_addr_shifter(self.AE_TIME_TABLE_DRAM))
                 self._ae_m_regs.append(wr["m"])
+                self._ae_reg_sets.append(wr)
 
         # ONE BODY, TEN EXECUTIONS. A Python for-loop here would be a 10x multiplier on
         # top of 32 layers x 5 flash calls; the schedule being known at compile time does
