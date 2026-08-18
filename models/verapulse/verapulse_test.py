@@ -2219,20 +2219,31 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         cache[key] = sched
         return sched
 
-    def _assert_worker_programs_fit(self):
+    def _assert_worker_programs_fit(self, sched=None, label=""):
         """Every sharded stage's worker programs share ONE allocator per worker engine.
         Overflowing an arena marches that allocator into the NEXT worker's arena --
-        silent corruption, not a hang. Call after every finalize()."""
+        silent corruption, not a hang. Call after every finalize().
+
+        `sched=None` checks EVERY cached stage scheduler, which is the meaningful test:
+        the arenas are cumulative across stages, so vision+prefix+denoise together are
+        what can overflow, not any one of them. Passing a single scheduler checks just
+        that stage. Returns total worker program bytes so a caller can report them."""
         limit = self.VIS_WORKER_ARENA_BYTES - self.VIS_WORKER_PROGRAM_OFFSET
-        for sched in self.__dict__.get("_sched_by_stage", {}).values():
-            for i, w in enumerate(sched.workers):
+        scheds = ([sched] if sched is not None
+                  else list(self.__dict__.get("_sched_by_stage", {}).values()))
+        total = 0
+        for sc in scheds:
+            for i, w in enumerate(sc.workers):
                 base = (self.VIS_WORKER_ARENA_BASE + i * self.VIS_WORKER_ARENA_BYTES
                         + self.VIS_WORKER_PROGRAM_OFFSET)
                 used = w.get_program_dram_addr() - base
                 assert 0 <= used <= limit, (
-                    f"worker {i + 1} program arena overflow: {used} B used of {limit} B "
-                    f"(VIS_WORKER_ARENA_BYTES=0x{self.VIS_WORKER_ARENA_BYTES:X}). "
+                    f"{label}worker {i + 1} program arena overflow: {used} B used of "
+                    f"{limit} B (VIS_WORKER_ARENA_BYTES="
+                    f"0x{self.VIS_WORKER_ARENA_BYTES:X}). "
                     f"Grow the arena or shard fewer stages.")
+                total += max(0, used)
+        return total
 
     def _vis_register_per_engine(self, sched):
         """Duplicate every vision buffer a kernel WRITES as scratch.
