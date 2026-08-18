@@ -705,6 +705,35 @@ class Gemma4LMMixin:
         prefill_scheduler = getattr(self, "_active_prefill_scheduler", None)
         shard_m_regs = getattr(self, "_prefill_shard_m_regs", None)
 
+        # Multi-core attention shards the group heads across engines; each engine
+        # needs PRIVATE flash scratch. Carve one slot per engine out of the big
+        # LAYER0_FLASH_SCRATCH_DRAM arena (sized for per_head_rows=max, head_dim
+        # max). register_per_engine_addrs is idempotent across recompiles.
+        if prefill_scheduler is not None:
+            _ph_rows = ((self.max_prefill_seq_len + 63) // 64) * 64
+            # unified_attention_core needs THREE scratch buffers (V^T + score +
+            # scaled_q), NOT the two the flash kernel's attn_scratch_bytes sizes.
+            # Match the core's own layout (user_dma_core: v_t=head_dim*aligned,
+            # score=aligned*aligned, scaled_q=batch*head_dim; aligned=batch=
+            # per_head_rows, head_dim=max). Undersizing overlaps adjacent engines'
+            # scaled_q onto the next engine's V^T and corrupts the worker heads.
+            _attn_scr_stride = (self.head_dim * _ph_rows + _ph_rows * _ph_rows
+                                + _ph_rows * self.head_dim) * self.bytes_per_element
+            _n_eng = prefill_scheduler.num_engines
+            _scr_end = self.LAYER0_FLASH_SCRATCH_DRAM + _n_eng * _attn_scr_stride
+            print(f"[prefill attn scratch] base=0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} "
+                  f"stride=0x{_attn_scr_stride:X} engines={_n_eng} "
+                  f"end=0x{_scr_end:X} next_tensor=0x{self.LAYER0_ATTN_PROJ_OUTPUT_DRAM:X} "
+                  f"slack={ (self.LAYER0_ATTN_PROJ_OUTPUT_DRAM - _scr_end)/(1024*1024):.2f} MiB")
+            assert _scr_end <= self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, (
+                f"prefill per-engine attn scratch overruns FLASH_SCRATCH: "
+                f"{_n_eng} engines × 0x{_attn_scr_stride:X} ends at 0x{_scr_end:X} > "
+                f"next tensor 0x{self.LAYER0_ATTN_PROJ_OUTPUT_DRAM:X}")
+            prefill_scheduler.register_per_engine_addrs(
+                "prefill_attn_scratch",
+                [self.LAYER0_FLASH_SCRATCH_DRAM + e * _attn_scr_stride
+                 for e in range(_n_eng)])
+
         def _shard_projection_core(ctx, **kwargs) -> int:
             """Emit one fixed row shard through the two-pass matmatmul core."""
             m_reg = shard_m_regs[ctx.engine_idx]
@@ -873,38 +902,121 @@ class Gemma4LMMixin:
                 self._emit_strided_copy_pbi(tmp_out, self.LAYER0_FLASH_Q_DRAM, rope_n, rope_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
                 self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM + rope_bytes, self.LAYER0_FLASH_Q_DRAM + rope_bytes, non_rot, head_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
             _checkpoint(f"L{layer_idx}_rope")
-            # GQA dup: read KV cache (k_size stride) → scatter group_size copies to FLASH (cur_head_dim stride).
-            self._emit_gqa_duplicate_pbi(k_cache_base, self.LAYER0_FLASH_K_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=head_bytes)
-            self._emit_gqa_duplicate_pbi(v_cache_base, self.LAYER0_FLASH_V_DRAM, cur_head_dim, seq_len, self.gpr_seq_len, src_row_bytes=head_bytes)
             _checkpoint(f"L{layer_idx}_kv_gather")
 
-            # Gemma4 uses scaling=1.0 (no 1/sqrt(d) in attention scores), so pass
-            # q_scale=1.0 below; no Q pre-scale needed.
+            # ---- GQA = an outer loop over the group's query heads ----
+            # Standard GQA: the group_size query heads all attend the SAME K/V
+            # head (num_kv=1), so K/V are read straight from the compact per-layer
+            # cache — no duplication. unified_attention_core reads Q and writes OUT
+            # as contiguous [batch, head_dim], but the projection/RoPE produce Q
+            # token-major (row = token*group + head), so head g's rows are strided.
+            # Permute Q to head-major [group, per_head_rows, head_dim] (each head's
+            # rows contiguous), run one SDPA per head reusing the shared K/V, then
+            # permute the head-major output back to token-major [seq, group*head_dim]
+            # for the O projection. Both permutes are runtime-length (gpr_seq_len)
+            # strided copies (bf16_permute_dram_core bakes its row count, so it
+            # cannot be used on the dynamic-length prefill program).
+            #
+            # per_head_rows is the compile-time MAX aligned KV length; it (a) sizes
+            # the head-major per-head slot and (b) is the static aligned_seq_len the
+            # core uses to reserve its SCRATCH sub-buffers (the live length comes
+            # from gpr_aligned_seq_len = align64(seq_len) at runtime).
+            #
+            # FLASH_K (freed by dropping the GQA duplication) holds head-major Q;
+            # each head's attention output is written back into the SAME per-head
+            # slot — safe because the core copies Q into its scaled-Q scratch before
+            # writing OUT — then permuted into FLASH_OUTPUT. FLASH_V still holds the
+            # V-projection output, so it is not reused here.
+            per_head_rows = ((self.max_prefill_seq_len + 63) // 64) * 64
+            qhm_head_bytes = per_head_rows * cur_head_dim * self.bytes_per_element
+            # Compile-time runtime dims for multi-core workers (prefill compiles
+            # per prompt, so seq_len is a constant here): batch=seq_len,
+            # aligned=align64(seq_len). Master's single-core path uses the primed
+            # GPRs instead.
+            attn_aligned_ct = ((seq_len + 63) // 64) * 64
+            for g in range(self.group_size):
+                self._emit_strided_copy_pbi(
+                    self.LAYER0_FLASH_Q_DRAM + g * head_bytes,       # token-major head g
+                    self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,   # head-major head g
+                    cur_head_dim,
+                    self.group_size * head_bytes,                    # token-major row stride
+                    head_bytes,                                      # head-major contiguous
+                    seq_len, self.gpr_seq_len)
+            _checkpoint(f"L{layer_idx}_q_permute")
 
-            # Pick the per-layer bias: full attention layers see the
-            # entire causal window; sliding-attention layers are limited
-            # to `sliding_window` tokens (run_prefill builds both biases).
+            # Gemma4 uses scaling=1.0 (no 1/sqrt(d) in attention scores) → q_scale=1.0.
+            # Per-layer bias: full-attention layers see the whole causal window,
+            # sliding layers only `sliding_window` tokens (run_prefill builds both).
+            # Bias is ONE [aligned_kv, aligned_kv] plane shared by every head; the
+            # dynamic batch/aligned GPRs limit live rows/cols to seq_len /
+            # align64(seq_len).
             bias_addr_layer = (self.LAYER0_FLASH_BIAS_FULL_DRAM
                                if layer_idx in self._full_attention_layers
                                else self.LAYER0_FLASH_BIAS_SLIDING_DRAM)
-            # unified_attention_core uses bias_mode="full_matrix" internally.
-            # Prefill bias is [aligned_q, aligned_q], while the dynamic batch
-            # GPR limits the live rows to q_seq_len.
-            total_flops += self.unified_attention_core(
-                batch=aligned_seq_len,
-                aligned_seq_len=aligned_seq_len,
-                head_dim=cur_head_dim,
-                Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                BIAS_DRAM_ADDR=bias_addr_layer,
-                OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                gpr_batch_reg=self.gpr_q_seq_len,
-                gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
-                q_scale=1.0,
-            )
+
+            def _emit_prefill_head(ue, h, scratch_addr, batch_reg, aligned_reg):
+                head_slot = self.LAYER0_FLASH_K_DRAM + h * qhm_head_bytes
+                # Static batch/aligned = the ACTUAL per-prompt dims (seq_len,
+                # align64(seq_len)), NOT per_head_rows. Prefill compiles per
+                # prompt so these are the true max the runtime GPRs take, which
+                # (a) makes the returned FLOP count accurate — per_head_rows=512
+                # over-counted the 272/320 attention ~3x, nudging reported
+                # prefill throughput above the MAC-array peak — and (b) reserves
+                # exactly the scratch the core uses. The head-major slot stride
+                # (qhm_head_bytes) stays at per_head_rows so buffer layout is
+                # seq-independent.
+                f = ue.unified_attention_core(
+                    batch=seq_len, aligned_seq_len=attn_aligned_ct,
+                    head_dim=cur_head_dim,
+                    Q_DRAM_ADDR=head_slot, K_DRAM_ADDR=k_cache_base,
+                    V_DRAM_ADDR=v_cache_base, BIAS_DRAM_ADDR=bias_addr_layer,
+                    OUTPUT_DRAM_ADDR=head_slot, SCRATCH_DRAM_ADDR=scratch_addr,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    gpr_batch_reg=batch_reg, gpr_aligned_seq_len_reg=aligned_reg,
+                    q_scale=1.0)
+                return f if isinstance(f, (int, float)) else 0
+
+            if prefill_scheduler is None:
+                # Single core: loop all group heads on the master, reusing the
+                # runtime seq/aligned GPRs and the shared scratch.
+                for g in range(self.group_size):
+                    total_flops += _emit_prefill_head(
+                        self, g, self.LAYER0_FLASH_SCRATCH_DRAM,
+                        self.gpr_seq_len, self.gpr_aligned_seq_len)
+            else:
+                # Multi core: shard the group heads across engines; each engine
+                # LOOPS its own heads (batch=seq per head — prefill can't stack
+                # heads into one batch, that would break batch<=aligned and the
+                # [aligned,aligned] score scratch). seq/aligned are compile-time
+                # constants (prefill compiles per prompt), so each engine
+                # add_sets its own batch/aligned regs — no worker dispatch
+                # priming needed. Private per-engine scratch via
+                # 'prefill_attn_scratch'. Master permutes Q in / OUT out around
+                # the region (workers park at the entry/exit barriers).
+                _attn_flops = [0]
+                def _emit_prefill_attn_shard(ctx):
+                    b_reg = ctx.ue.alloc_isa_reg()
+                    ctx.ue.generate_instruction_add_set(b_reg, seq_len)
+                    a_reg = ctx.ue.alloc_isa_reg()
+                    ctx.ue.generate_instruction_add_set(a_reg, attn_aligned_ct)
+                    scr = ctx.scratch("prefill_attn_scratch")
+                    for h in range(ctx.head_off, ctx.head_off + ctx.heads):
+                        _attn_flops[0] += _emit_prefill_head(ctx.ue, h, scr, b_reg, a_reg)
+                    ctx.ue.release_isa_reg()
+                    ctx.ue.release_isa_reg()
+                prefill_scheduler.head_sharded_region(
+                    self.group_size, per_head_rows, cur_head_dim,
+                    _emit_prefill_attn_shard, gqa_ratio=1)
+                total_flops += _attn_flops[0]
+            # Permute the head-major attention output back to token-major for O-proj.
+            for g in range(self.group_size):
+                self._emit_strided_copy_pbi(
+                    self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,   # head-major head g
+                    self.LAYER0_FLASH_OUTPUT_DRAM + g * head_bytes,  # token-major head g
+                    cur_head_dim,
+                    head_bytes,                                      # head-major contiguous
+                    self.group_size * head_bytes,                    # token-major row stride
+                    seq_len, self.gpr_seq_len)
             _checkpoint(f"L{layer_idx}_attention")
             if prefill_scheduler is None:
                 total_flops += _projection_core(M=seq_len, K=cur_q_size, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, gpr_M_reg=self.gpr_seq_len)
@@ -1068,6 +1180,11 @@ class Gemma4LMMixin:
         self.seq_len = seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        # Per-head aligned KV length: with GQA run as an outer loop over query
+        # heads reusing one K/V, attention is per-token (not per q-position), so
+        # the live aligned length is align64(seq_len), primed into
+        # gpr_aligned_seq_len below (replaces the old align64(q_seq_len)).
+        attn_aligned = ((seq_len + 63) // 64) * 64
         prefill_scheduler = self._ensure_prefill_scheduler()
         worker_program_addrs = []
         if prefill_scheduler is not None:
@@ -1159,45 +1276,31 @@ class Gemma4LMMixin:
         # Build BOTH prefill bias matrices: full (causal) for full-attention
         # layers, and sliding (causal AND within `sliding_window` tokens) for
         # sliding-attention layers. compile_prefill picks per-layer.
-        # Both biases are in q_seq_len space (each token has group_size query
-        # heads, K is GQA-duplicated to match), so the window is converted
-        # from token space to q-position space by multiplying by group_size.
-        full_bias = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
-        # Q rows are laid out token*group_size + head, and K is GQA-duplicated
-        # to the same layout, so each attn head must attend ONLY its own head
-        # slot (its KV head), causal in tokens. A flat q-space causal tril
-        # (j<=i) additionally allows CROSS-HEAD attention (head h attending
-        # earlier heads 0..h within a token). For E2B (num_kv=1) this is one KV
-        # group so it doesn't corrupt the VALUE, but it still over-weights
-        # earlier tokens (each contributes group_size duplicate slots vs the
-        # current token's h+1), so the correct mask is same head AND
-        # token-causal. (For E4B num_kv=2 the flat tril was catastrophic — it
-        # let heads attend the WRONG KV group; see gemma4_e4b_test.py.)
-        _gs = self.group_size
-        _i = torch.arange(aligned_seq_len).unsqueeze(1)
-        _j = torch.arange(aligned_seq_len).unsqueeze(0)
-        _same_head = (_i % _gs) == (_j % _gs)
-        _tok_causal = ((_j // _gs) <= (_i // _gs)) if not self.causal_mask_upper else ((_j // _gs) >= (_i // _gs))
-        valid_mask = _same_head & _tok_causal
-        full_bias.masked_fill_(valid_mask, 0.0)
-        full_bias[:, q_seq_len:] = float("-inf")
+        #
+        # GQA now runs as an outer loop over query heads reusing one K/V, so a
+        # head attends the shared K/V over TOKEN positions: the bias is a single
+        # [attn_aligned, attn_aligned] causal plane in TOKEN space, reused by
+        # every head. No group_size expansion and no same-head term (the old
+        # q_seq×q_seq "same head AND token-causal" mask is gone). Columns past
+        # seq_len are the alignment padding and stay masked to -inf, which is
+        # what zeroes the stale K/V padding rows after softmax.
+        _i = torch.arange(attn_aligned).unsqueeze(1)
+        _j = torch.arange(attn_aligned).unsqueeze(0)
+        _tok_causal = (_j <= _i) if not self.causal_mask_upper else (_j >= _i)
+        full_bias = torch.full((attn_aligned, attn_aligned), float("-inf"), dtype=torch.bfloat16)
+        full_bias.masked_fill_(_tok_causal, 0.0)
+        full_bias[:, seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, full_bias)
 
         # Sliding bias is identical to full when seq_len ≤ sliding_window;
-        # otherwise it additionally masks anything older than the window.
+        # otherwise it additionally masks tokens older than the window.
         if seq_len <= self.sliding_window:
             sliding_bias = full_bias
         else:
-            window_q = self.sliding_window * self.group_size
-            sliding_bias = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
-            i_idx = torch.arange(aligned_seq_len).unsqueeze(1)
-            j_idx = torch.arange(aligned_seq_len).unsqueeze(0)
-            i_token = i_idx // self.group_size
-            j_token = j_idx // self.group_size
-            in_window = (i_token - j_token) < self.sliding_window
-            sliding_mask = valid_mask & in_window
-            sliding_bias.masked_fill_(sliding_mask, 0.0)
-            sliding_bias[:, q_seq_len:] = float("-inf")
+            in_window = (_i - _j) < self.sliding_window
+            sliding_bias = torch.full((attn_aligned, attn_aligned), float("-inf"), dtype=torch.bfloat16)
+            sliding_bias.masked_fill_(_tok_causal & in_window, 0.0)
+            sliding_bias[:, seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias)
 
         host_prepare_s = time.perf_counter() - _host_prepare_w0
@@ -1216,7 +1319,7 @@ class Gemma4LMMixin:
             return self._profile_execute(
                 [(self.gpr_seq_len,         seq_len),
                  (self.gpr_q_seq_len,       q_seq_len),
-                 (self.gpr_aligned_seq_len, aligned_seq_len)],
+                 (self.gpr_aligned_seq_len, attn_aligned)],
                 prefill_program_addr, profile_checkpoints, tail_name="tail_halt",
                 worker_scheduler=prefill_scheduler,
                 worker_addrs=worker_program_addrs)
@@ -1244,7 +1347,7 @@ class Gemma4LMMixin:
             latency, flop_rate_program = self._dispatch_program(
                 [(self.gpr_seq_len,         seq_len),
                  (self.gpr_q_seq_len,       q_seq_len),
-                 (self.gpr_aligned_seq_len, aligned_seq_len)],
+                 (self.gpr_aligned_seq_len, attn_aligned)],
                 prefill_program_addr, timeout=300.0, flops=flops)
             for worker in prefill_scheduler.workers if prefill_scheduler is not None else []:
                 worker.wait_queue(300.0)
@@ -1489,6 +1592,16 @@ class Gemma4LMMixin:
                 bias_addr_layer = (self.LAYER0_FLASH_BIAS_FULL_DRAM
                                    if layer_idx in self._full_attention_layers
                                    else self.LAYER0_FLASH_BIAS_SLIDING_DRAM)
+                # GQA for decode (num_kv=1): all group_size query heads attend
+                # the SAME K/V, so they stack as the batch rows of ONE call —
+                # Q is [group_size, cur_head_dim] (decode RoPE laid the heads out
+                # contiguously), and the [group_size, cur_head_dim] output is
+                # exactly the row the O projection consumes. batch=group_size
+                # shares one Vᵀ transpose across all heads (a per-head batch=1
+                # loop would recompute that identical transpose group_size times).
+                # Multi-core will shard these group rows across engines
+                # (batch=shard_size per engine); this is the single-core (shard=
+                # group_size) case.
                 total_flops += self.unified_attention_core(
                     batch=self.group_size,
                     aligned_seq_len=seq_len,
