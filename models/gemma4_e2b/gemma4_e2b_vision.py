@@ -97,8 +97,36 @@ class Gemma4VisionMixin:
                 }
             self._vis_clip_ranges.append(row)
 
+        # Place the vision weights at the TOP of the tensor arena (ending flush
+        # against the vision ISA base), DISJOINT from the vision scratch that
+        # vision_tensor_init lays down from _scratch_dram_base upward. Previously
+        # weights were allocated at the current cursor (the LM tensor high-water,
+        # ~0xF4900000), which sits IN the scratch growth path: once the matmul-
+        # RoPE buffers (bigger than the old SRAM RoPE) and the per-engine
+        # attention scratch grew vision scratch past that address, scratch DMAs
+        # clobbered the weights — mild single-core, severe multi-core (the extra
+        # worker scratch shifts scratch ~13 MB higher). Reserving the exact
+        # aligned weight span at the top makes scratch physically unable to reach
+        # it. `_dma_section` (below) allocates every key except pos_embedding_table
+        # (host-only), each 64-byte aligned, so the span is summed the same way.
+        # Arena top = first address the vision ISA claims: the master vision ISA
+        # base (2-core), or the compact worker-ISA arena at 0xFC000000 (>2-core /
+        # Alveo). vision_tensor_init uses the same split for its scratch limit.
+        _arena_top = self.VISION_ARENA_TOP
+        _alloc_span = sum(self._align_up(s["size"], 64)
+                          for k, s in sections.items() if k != "pos_embedding_table")
+        _weight_base = ((_arena_top - _alloc_span) // 64) * 64
+        if _weight_base <= self._scratch_dram_base:
+            raise MemoryError(
+                f"Vision weights ({_alloc_span/1024/1024:.1f} MiB) do not fit below the "
+                f"vision ISA arena 0x{_arena_top:X}: base 0x{_weight_base:X} "
+                f"<= scratch base 0x{self._scratch_dram_base:X}")
+        self._tensor_dram_addr = _weight_base
+        self._vis_weight_start = _weight_base
+
         print(f"\n[Vision] Loading pre-quantized vision weights from combined bin "
-              f"({VISION_QUANT_PRECISION.upper()} block=64 + BF16 norms) ...")
+              f"({VISION_QUANT_PRECISION.upper()} block=64 + BF16 norms) "
+              f"at 0x{_weight_base:X} (top of tensor arena) ...")
         with open(weights_bin_path, "rb") as f:
             def _dma_section(key: str) -> int:
                 s = sections[key]
@@ -255,19 +283,18 @@ class Gemma4VisionMixin:
         attn_scratch_bytes = (aligned_S * aligned_S + 2 * HD * aligned_S) * 2
         self.VIS_FLASH_SCRATCH = self.allocate_tensor_dram(attn_scratch_bytes)
         # Head-sharded attention needs one private scratch region per engine.
-        # Allocate every copy from the model tensor arena; worker allocators are
-        # reserved for ISA. Keep the primary address first, in engine order.
+        # Keep the primary copy dedicated. Worker copies are assigned after all
+        # tensor allocations, by aliasing output-only regions that are dead
+        # during attention and fully overwritten before their later reads.
         self.VIS_FLASH_SCRATCH_PER_ENGINE = [self.VIS_FLASH_SCRATCH]
-        for _ in range(1, self.multi_core):
-            self.VIS_FLASH_SCRATCH_PER_ENGINE.append(
-                self.allocate_tensor_dram(attn_scratch_bytes))
-        # Compatibility name for code/debuggers that expect the 2-core field.
-        self.VIS_FLASH_SCRATCH_WORKER = (
-            self.VIS_FLASH_SCRATCH_PER_ENGINE[1]
-            if self.multi_core > 1 else None)
         # Unused by unified_attention_core but kept to keep the allocation order
         # (and every baked address after it) stable.
-        self.VIS_ATTN_P = self.allocate_tensor_dram(aligned_S * aligned_S * bpe)
+        attn_p_bytes = aligned_S * aligned_S * bpe
+        self.VIS_ATTN_P = self.allocate_tensor_dram(attn_p_bytes)
+        # Make VIS_ATTN_P itself a full-size alias candidate without spilling
+        # into the identity matrix that follows it.
+        self._vis_attn_p_alias_pad = self.allocate_tensor_dram(
+            attn_scratch_bytes - attn_p_bytes)
 
         # 64×64 identity for FPGA clamp passes.
         self.VIS_IDENTITY_64 = self.allocate_tensor_dram(64 * 64 * bpe)
@@ -410,12 +437,63 @@ class Gemma4VisionMixin:
                         Pm[cell, base + ky * Wg + kx] = 1.0
         self._vis_pending_dmas.append((self.VIS_POOL_P, Pm))
 
-        tensor_limit = 0xFC000000 if self.multi_core > 2 else self.VISION_ISA_BASE
+        # Worker attention scratch aliases. Every region below is dead while
+        # attention runs and is completely produced again before consumption:
+        # post-attention/MLP intermediates, the QKV/MLP clip workspaces, the
+        # unused VIS_ATTN_P buffer plus explicit pad, and embed-pool outputs.
+        # Carve fixed-size, non-overlapping blocks and use only as many as the
+        # selected engine count needs (maximum seven workers).
+        alias_regions = [
+            (self.VIS_POST_ATTN_NORM,
+             self.VIS_POST_FFN_NORM + S * H * bpe,
+             "post_attn_mlp"),
+            (self.VIS_INPUT_CLIP_H_SCRATCH,
+             self.VIS_INPUT_CLIP_MLP_SCRATCH + S * MLP * bpe,
+             "clip_workspaces"),
+            (self.VIS_ATTN_P,
+             self._vis_attn_p_alias_pad + (attn_scratch_bytes - attn_p_bytes),
+             "unused_attn_p"),
+            (self.VIS_EMBED_POOL,
+             self.VIS_EMBED_OUT + S * text_h * bpe,
+             "embed_outputs"),
+        ]
+        alias_candidates = []
+        for region_start, region_end, region_name in alias_regions:
+            addr = self._align_up(region_start, 64)
+            while addr + attn_scratch_bytes <= region_end:
+                alias_candidates.append((addr, region_name))
+                addr = self._align_up(addr + attn_scratch_bytes, 64)
+        workers_needed = self.multi_core - 1
+        if len(alias_candidates) < workers_needed:
+            raise MemoryError(
+                f"Gemma4 needs {workers_needed} worker attention scratch buffers "
+                f"but only {len(alias_candidates)} safe alias region(s) fit")
+        chosen_aliases = alias_candidates[:workers_needed]
+        self.VIS_FLASH_SCRATCH_PER_ENGINE.extend(
+            addr for addr, _ in chosen_aliases)
+        self.VIS_FLASH_SCRATCH_WORKER = (
+            self.VIS_FLASH_SCRATCH_PER_ENGINE[1]
+            if self.multi_core > 1 else None)
+        scratch_ranges = sorted(
+            (addr, addr + attn_scratch_bytes)
+            for addr in self.VIS_FLASH_SCRATCH_PER_ENGINE)
+        for (_, prev_end), (next_start, _) in zip(scratch_ranges, scratch_ranges[1:]):
+            assert prev_end <= next_start, "per-engine attention scratch aliases overlap"
+        print(f"  Vision attention scratch: {self.multi_core} private buffer(s); "
+              f"{workers_needed} worker alias(es): "
+              f"{[name for _, name in chosen_aliases]}")
+
+        # Scratch must stay below the vision WEIGHTS (placed at the top of the
+        # tensor arena by vision_weight_init). The old guard used the ISA base and
+        # so silently allowed scratch to grow through the weights — the multi-core
+        # "barcode" corruption. Guard the weight base instead.
+        tensor_limit = getattr(self, "_vis_weight_start", self.VISION_ARENA_TOP)
         if self.get_tensor_dram_addr() > tensor_limit:
             raise MemoryError(
-                f"Gemma4 vision tensors overflow the 2-GB layout: "
-                f"end=0x{self.get_tensor_dram_addr():X}, "
-                f"worker_program_start=0x{tensor_limit:X}")
+                f"Gemma4 vision scratch overflows into the vision weights: "
+                f"scratch_end=0x{self.get_tensor_dram_addr():X}, "
+                f"weight_base=0x{tensor_limit:X}. Reduce vision scratch or raise the "
+                f"tensor arena.")
 
         self._vis_num_patches = S
         self._vis_aligned_S = aligned_S
@@ -433,21 +511,6 @@ class Gemma4VisionMixin:
         so it must be evaluated inside the active capture."""
         self.generate_instruction_add_set(self.gpr_seq_len, M)
         return self.gpr_seq_len
-
-    # ------------------------------------------------------------------
-    # Vision encoder RoPE (S3): rotate-half as a batched matmul against a
-    # static swap permutation + tiled elementwise. HW-verified on alveo.
-    # ------------------------------------------------------------------
-    def rope_hf_matmul_core(self, src_dram: int, M: int, N: int) -> int:
-        """Vision-encoder RoPE (in place on ``src_dram``, head_dim N=64): thin adapter over the
-        library :meth:`UnifiedEngine.rope_hf_matmul_core`, wiring the model-owned swap matrix, rot
-        scratch, and host-tiled cos/sin. The library core does ``rot = X @ P_swap`` then
-        ``rot*=sin; out = X*cos; out += rot`` via three batched eltwise passes."""
-        return user_dma_core.UnifiedEngine.rope_hf_matmul_core(
-            self, M=M, N=N, input_dram_addr=src_dram, output_dram_addr=src_dram,
-            cos_dram_addr=self.VIS_ROPE_COS_TILED, sin_dram_addr=self.VIS_ROPE_SIN_TILED,
-            identity_swap_dram_addr=self.VIS_ROPE_P_SWAP, scratch_dram_addr=self.VIS_ROPE_ROT,
-            gpr_M_reg=self._prime_M(M))
 
     # ------------------------------------------------------------------
     # Vision encoder layers (S3): one SigLIP layer = pre_norm + Q/K/V proj +
@@ -474,7 +537,8 @@ class Gemma4VisionMixin:
             self._get_program_section(f"vision_worker{i}", profile)[0]
             for i in range(1, self.multi_core)
         ]
-        if (_vmeta is not None
+        if (getattr(self, "bin_reuse", False)
+                and _vmeta is not None
                 and _vmeta.get("vision_kernel") == self.vision_kernel
                 and _vmeta.get("multi_core", 1) == self.multi_core
                 and all(meta is not None for meta in _worker_metas)):
@@ -482,7 +546,9 @@ class Gemma4VisionMixin:
             bin_path, _ = self._program_image_paths(profile)
             print(f"  [Vision] reusing existing instruction image at {bin_path}", flush=True)
             print(f"    delete {bin_path} (or make clean) to force recompile.", flush=True)
+            self._vision_compile_reused = True
             return
+        self._vision_compile_reused = False
         print(f"  [Vision] compiling patch embed + {L} vision layers one-shot"
               f" ({self.multi_core} engine(s); projection phases row-sharded)"
               f"{' (+profile checkpoints)' if profile else ''} ...", flush=True)
@@ -583,8 +649,52 @@ class Gemma4VisionMixin:
                 self._vis_flops += shard_flops[0]
             _checkpoint(f"L{li}_proj")
             self._vis_flops += self.rms_norm_core_dram(M=S * NH, N=HD, A_DRAM_ADDR=self.VIS_V_DRAM, OUTPUT_DRAM_ADDR=self.VIS_V_DRAM, GAMMA_DRAM_ADDR=self.VIS_V_NORM_ONES_GAMMA, gpr_M_reg=self._prime_M(S * NH))
-            for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
-                self._vis_flops += self.rope_hf_matmul_core(src_dram=dram, M=S * NH, N=HD)
+            # RoPE (rotate-half via a swap matmul + tiled cos/sin eltwise) uses
+            # the library UnifiedEngine.rope_hf_matmul_core directly, wiring the
+            # model-owned swap matrix / rot scratch / host-tiled cos/sin here.
+            if gate_scheduler is None:
+                for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
+                    self._vis_flops += self.rope_hf_matmul_core(
+                        M=S * NH, N=HD, input_dram_addr=dram, output_dram_addr=dram,
+                        cos_dram_addr=self.VIS_ROPE_COS_TILED,
+                        sin_dram_addr=self.VIS_ROPE_SIN_TILED,
+                        identity_swap_dram_addr=self.VIS_ROPE_P_SWAP,
+                        scratch_dram_addr=self.VIS_ROPE_ROT,
+                        gpr_M_reg=self._prime_M(S * NH))
+            else:
+                # rope_hf_matmul_core is row-independent over its flattened
+                # M=S*NH dimension. Slice every [M, HD] tensor by the same rows;
+                # the HDxHD swap permutation is shared and read-only. The
+                # existing VIS_ROPE_ROT allocation is likewise row-sliced, so
+                # multicore RoPE needs no per-engine scratch allocation.
+                # The composite core is not in the shard proxy's row-independent
+                # allowlist (it wraps a matmul + 3 eltwise), so emit it through
+                # ctx.unsafe_ue — the deliberate escape hatch — with explicitly
+                # sliced addresses. Keeps multi_engine_shard.py unmodified.
+                rope_flops = [0]
+                def _emit_rope_shard(ctx, src_dram):
+                    m_reg = gate_m_regs[ctx.engine_idx]
+                    row_bytes = HD * bpe
+                    shard_src = ctx.rows_addr(src_dram, row_bytes)
+                    rope_flops[0] += ctx.unsafe_ue.rope_hf_matmul_core(
+                        M=ctx.rows,
+                        N=HD,
+                        input_dram_addr=shard_src,
+                        output_dram_addr=shard_src,
+                        cos_dram_addr=ctx.rows_addr(
+                            self.VIS_ROPE_COS_TILED, row_bytes),
+                        sin_dram_addr=ctx.rows_addr(
+                            self.VIS_ROPE_SIN_TILED, row_bytes),
+                        identity_swap_dram_addr=self.VIS_ROPE_P_SWAP,
+                        scratch_dram_addr=ctx.rows_addr(
+                            self.VIS_ROPE_ROT, row_bytes),
+                        gpr_M_reg=m_reg)
+                for dram in (self.VIS_Q_NORM, self.VIS_K_NORM):
+                    gate_scheduler.sharded_region(
+                        S * NH,
+                        lambda ctx, src_dram=dram: _emit_rope_shard(
+                            ctx, src_dram))
+                self._vis_flops += rope_flops[0]
             _checkpoint(f"L{li}_rope")
             for src, dst in ((self.VIS_Q_NORM, self.VIS_FLASH_Q_HM),
                              (self.VIS_K_NORM, self.VIS_FLASH_K_HM),
@@ -776,7 +886,7 @@ class Gemma4VisionMixin:
                 worker_bytes = bytearray()
                 for inst in worker.capture_buffer:
                     worker_bytes.extend(inst.get_bytes())
-                worker_limit = (worker_addr + 0x00240000
+                worker_limit = (worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
                                 if self.multi_core > 2 else self.LM_ISA_BASE)
                 if worker_addr + len(worker_bytes) > worker_limit:
                     raise RuntimeError(
@@ -867,9 +977,14 @@ class Gemma4VisionMixin:
         # Report like the LM's program_execute: HW latency + FLOP rate.
         latency_us = self.report_latency_in_us()
         print(f"    Total program execution latency = {latency_us} us")
+        # Stash for the run-summary writer (write_run_summary).
+        self._vis_last_latency_us = latency_us
+        self._vis_last_total_flops = meta.get("total_flops")
+        self._vis_last_gflops = None
         _flops = meta.get("total_flops")
         if _flops:
             gflops, _ = self.report_flop_rate_gflops(_flops)
+            self._vis_last_gflops = gflops
             print(f"Report FLOPS for program execution: {gflops:.2f} GFLOPS")
         print(f"Vision encoder execute done in {elapsed:.2f} seconds.", flush=True)
         return elapsed
@@ -919,6 +1034,14 @@ class Gemma4VisionMixin:
         total_s = time.perf_counter() - host_t0
         print(f"[Vision] host encoder done: {image_features.shape[0]} soft tokens "
               f"in {total_s:.2f}s (model forward {forward_s:.2f}s).", flush=True)
+        # Stash for the run-summary writer (write_run_summary). Host vision runs
+        # no FPGA program, so there is no HW latency / GFLOPS to report.
+        self._vis_num_soft_tokens = int(image_features.shape[0])
+        self._vis_e2e_s = total_s
+        self._vis_device = "host"
+        self._vis_last_latency_us = None
+        self._vis_last_gflops = None
+        self._vis_last_total_flops = None
         return image_features, token_ids, mm_types
 
     def _run_vision_encoder_fpga(self, image_path: str, prompt: str, profile: bool = False):
@@ -1032,4 +1155,8 @@ class Gemma4VisionMixin:
             print(f"{'TOTAL':<38}{_tot:>9.2f}{100.0:>6.1f}%")
         print(f"[Vision] FPGA encoder done: {image_features.shape[0]} soft tokens "
               f"in {fpga_total_s:.2f}s total.", flush=True)
+        # Stash for the run-summary writer (write_run_summary).
+        self._vis_num_soft_tokens = int(image_features.shape[0])
+        self._vis_e2e_s = fpga_total_s
+        self._vis_device = "FPGA"
         return image_features, token_ids, mm_types
