@@ -1310,11 +1310,27 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     # at 0xF8000000 -- below the 4 GB boundary (dma_write at/above it fails with
     # [Errno 512]) and above every primary program. _assert_worker_programs_fit checks
     # the far end; _assert_arenas_clear_primary checks the near end.
-    VIS_WORKER_ARENA_BASE    = 0xC0000000
-    VIS_WORKER_ARENA_BYTES   = 0x08000000        # 128 MB per worker
-    VIS_WORKER_TENSOR_OFFSET = 0x00400000        #   4 MB params window
-    VIS_WORKER_PROGRAM_OFFSET = 0x00800000       #   8 MB before the program space
-    VIS_WORKER_ARENA_TOP     = 0xF8000000        # hard ceiling for base + n*stride
+    # THESE ARE ABSOLUTE ADDRESSES, not config-style offsets. The model's own bases are
+    # OFFSETS from DRAM_START_ADDR (params 0x0, tensor 0x48000000, program 0x56000000 ->
+    # absolute 0x80000000 / 0xC8000000 / 0xD6000000), but UnifiedEngine's constructor
+    # takes absolute bases, and _worker_engine_pool passes these straight through.
+    # Mixing the two conventions put the arenas at 0xC0000000, which is INSIDE the
+    # weights (params end 0xC340A600) and INSIDE the activation/KV region
+    # (0xC8000000..0xD6000000): workers 1-3 wrote their programs and per-engine buffers
+    # on top of live model memory, and vision's activation writes then corrupted those
+    # workers' instruction streams. A worker executing corrupted code never reaches its
+    # barrier, and FLAG_CHECK has no timeout -- the run HANGS instead of failing.
+    #
+    # The arenas now live in the free tail of the PROGRAM region, above everything the
+    # primary uses (its three programs total ~38 MB from 0xD6000000):
+    #     params  0x080000000 .. 0x0C340A600
+    #     tensor  0x0C8000000 .. 0x0D6000000
+    #     program 0x0D6000000 .. 0x100000000   <- primary at the bottom, arenas at 0xE0000000
+    VIS_WORKER_ARENA_BASE    = 0xE0000000        # absolute, inside the program region
+    VIS_WORKER_ARENA_BYTES   = 0x04000000        #  64 MB per worker (7 -> ends 0xFC000000)
+    VIS_WORKER_TENSOR_OFFSET = 0x00400000        #   4 MB in: per-engine scratch
+    VIS_WORKER_PROGRAM_OFFSET = 0x00800000       #   8 MB in: the worker's own programs
+    VIS_WORKER_ARENA_TOP     = 0x100000000       # hard DRAM ceiling
 
     @staticmethod
     def _col_split(N, n, align=UE_VECTOR_SIZE):
@@ -2134,19 +2150,47 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 self.dma_write(DMA_DEVICE_H2C, base, bytes(buf), n_bytes)
 
     def _assert_arenas_clear_primary(self, n):
-        """The arenas sit ABOVE the primary's programs in one flat address space; the
-        program allocator is an unchecked bump allocator, so nothing but this assert
-        stands between a large primary program and the workers' code."""
-        top = self.VIS_WORKER_ARENA_BASE + max(0, n - 1) * self.VIS_WORKER_ARENA_BYTES
-        assert top <= self.VIS_WORKER_ARENA_TOP, (
+        """The arenas share ONE flat address space with the model's own regions.
+
+        EVERYTHING HERE IS COMPARED IN ABSOLUTE SPACE. The previous version compared the
+        primary's program cursor (offset space, ~0x56000000) against the arena base
+        (absolute, 0xC0000000) and therefore passed no matter where the arenas landed --
+        which is how workers 1-3 ended up inside the weights and the activation region.
+        The program allocator is an unchecked bump allocator, so these asserts are the
+        only thing standing between a large primary program and the workers' code.
+        """
+        DRAM_START = user_dma_core.DRAM_START_ADDR
+
+        def absolute(a):
+            return a if a >= DRAM_START else DRAM_START + a
+
+        lo = self.VIS_WORKER_ARENA_BASE
+        hi = lo + max(0, n - 1) * self.VIS_WORKER_ARENA_BYTES
+        assert lo >= DRAM_START, (
+            f"worker arena base 0x{lo:X} is below DRAM_START 0x{DRAM_START:X}; these "
+            f"constants are ABSOLUTE, not config-style offsets")
+        assert hi <= self.VIS_WORKER_ARENA_TOP, (
             f"{n - 1} worker arena(s) of {self.VIS_WORKER_ARENA_BYTES >> 20} MB from "
-            f"0x{self.VIS_WORKER_ARENA_BASE:X} end at 0x{top:X}, past the "
-            f"0x{self.VIS_WORKER_ARENA_TOP:X} ceiling")
-        cur = self.get_program_dram_addr()
-        assert cur < self.VIS_WORKER_ARENA_BASE, (
+            f"0x{lo:X} end at 0x{hi:X}, past the 0x{self.VIS_WORKER_ARENA_TOP:X} ceiling")
+
+        # No overlap with the model's OWN regions. This is the check that was missing.
+        p0 = absolute(self._params_dram_base)
+        p_end = p0 + self.get_params_dram_usage()
+        t0, g0 = absolute(self._tensor_dram_base), absolute(self._program_dram_base)
+        for name, r_lo, r_hi in (("params (weights)", p0, max(p_end, t0)),
+                                 ("tensor (activations + KV cache)", t0, g0)):
+            assert not (lo < r_hi and hi > r_lo), (
+                f"worker arenas 0x{lo:X}..0x{hi:X} overlap {name} "
+                f"0x{r_lo:X}..0x{r_hi:X}. Workers would write their programs and "
+                f"per-engine buffers over live model memory, and the model's own writes "
+                f"would corrupt worker instruction streams -- which hangs on a "
+                f"FLAG_CHECK rather than failing. Move VIS_WORKER_ARENA_BASE.")
+
+        cur = absolute(self.get_program_dram_addr())
+        assert cur < lo, (
             f"the primary's program allocator has reached 0x{cur:X}, at/above the worker "
-            f"arena base 0x{self.VIS_WORKER_ARENA_BASE:X} -- primary programs and worker "
-            f"programs would overwrite each other. Raise VIS_WORKER_ARENA_BASE.")
+            f"arena base 0x{lo:X} -- primary programs and worker programs would overwrite "
+            f"each other. Raise VIS_WORKER_ARENA_BASE.")
 
     def _worker_engine_pool(self, n=None):
         """The run's ONE set of worker UnifiedEngines, indices 1..peak-1.
