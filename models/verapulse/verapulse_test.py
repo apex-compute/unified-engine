@@ -2348,7 +2348,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
           vis_zeros   layer_norm_core_dram WRITES it. Sharing it across engines is
                       silent corruption, and it needs refresh_per_engine before EVERY
                       execution (see run_vision), not just the first.
-          flash q/k/v/out, attn_scratch  per-head marshalling + unified_attention.
+          flash q/k/v/out, attn_scratch  per-head marshalling + unified_attention,
+                      which are SHARDED on the query axis -- every engine stages its own
+                      Q rows and its own FULL K/V copy, so these must not be shared.
                       attn_scratch keeps its FULL size: the core derives its sub-offsets
                       from the compile-time S/D, which do not shrink with a row shard.
         """
@@ -2471,7 +2473,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         RH = row_offset * H * bpe            # [S,H] pitch: hidden-width buffers
         RI = row_offset * I * bpe            # [S,I] pitch: the MLP intermediate
         RP = row_offset * (CH * P * P) * bpe  # [S, C*P*P] pitch: the staged pixels
-        for name, off in (("RH", RH), ("RI", RI), ("RP", RP)):
+        RB = row_offset * S * bpe            # [S,S] pitch: the attention bias rows
+        for name, off in (("RH", RH), ("RI", RI), ("RP", RP), ("RB", RB)):
             assert off % 32 == 0, (
                 f"engine {e} {name}={off} B is not 32 B AXI-beat aligned")
 
@@ -2574,36 +2577,63 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # carries + h*D*bpe -- omitting that per-head offset is the finite-but-
             # scrambled bug class (pi05 denoise #3), not a NaN.
             #
-            # PRIMARY ONLY, at full S rows: attention is not row-independent (every query
-            # row reads every key row), and the flash staging buffers are single fixed
-            # addresses. Sharding it means head-splitting, which is a later phase -- the
-            # per-engine flash_q/k/v/out and attn_scratch copies are already registered
-            # for it (_vis_register_per_engine).
-            if primary:
-                elems, col_stride, row_jump = S * D, D * bpe, H * bpe
-                for h in range(NH):
-                    col = h * col_stride
-                    for src, dst in ((self.VIS_Q_DRAM + col, self.VIS_FLASH_Q_DRAM),
-                                     (self.VIS_K_DRAM + col, self.VIS_FLASH_K_DRAM),
-                                     (self.VIS_V_DRAM + col, self.VIS_FLASH_V_DRAM)):
-                        self.accelerator_memory_to_sram(
-                            src, 0x00000, elems, stride_bytes_per_chunk=col_stride,
-                            stride_jump_bytes=row_jump)
-                        self.sram_to_accelerator_memory(0x00000, dst, elems)
-                    self.unified_attention_core(
-                        batch=S, aligned_seq_len=S, head_dim=D,
-                        Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM,
-                        K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
-                        V_DRAM_ADDR=self.VIS_FLASH_V_DRAM,
-                        BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM,
-                        OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
-                        SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
-                        IDENTITY_DRAM_ADDR=self.identity_addr,
-                        gpr_batch_reg=s_reg, gpr_aligned_seq_len_reg=s_reg)
-                    self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
-                    self.sram_to_accelerator_memory(
-                        0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
+            # SHARDED ON THE QUERY AXIS. Splitting the QUERY rows partitions the OUTPUT
+            # rows, and each output row's softmax is complete within itself -- so no
+            # online-softmax merge is needed and there is no mid-attention join. That is
+            # the whole reason this axis was chosen over head-splitting: NH=12 does not
+            # divide 8, while S=1024 = 16 blocks of 64 splits exactly 2 blocks per
+            # engine. (Head-splitting stays available at 4 or 6 engines; this is the
+            # pattern hardware-proven by matmat_mul_norm_attn_chain_n_engine_test.)
+            #
+            # K AND V STAY FULL ON EVERY ENGINE -- they carry `col` but NEVER `+ RH`.
+            # Every query row reads every key row, so a K/V shard would be the sequence-
+            # parallel case that DOES need a merge. Only Q and OUT carry the row offset.
+            #
+            # The flash staging buffers and attn_scratch are PER-ENGINE
+            # (_vis_register_per_engine); sharing them across engines is silent
+            # corruption. attn_scratch keeps its FULL size because the core derives its
+            # sub-offsets from the compile-time S/D, which do not shrink with a row shard.
+            elems_q, elems_kv = rows * D, S * D
+            col_stride, row_jump = D * bpe, H * bpe
+
+            def flash_buf(name, fallback):
+                return (sched.per_engine_addr(name, e) if ne > 1 else fallback)
+
+            F_Q = flash_buf("flash_q", self.VIS_FLASH_Q_DRAM)
+            F_K = flash_buf("flash_k", self.VIS_FLASH_K_DRAM)
+            F_V = flash_buf("flash_v", self.VIS_FLASH_V_DRAM)
+            F_O = flash_buf("flash_out", self.VIS_FLASH_OUT_DRAM)
+            F_S = flash_buf("attn_scratch", self.VIS_ATTN_SCRATCH_DRAM)
+            for h in range(NH):
+                col = h * col_stride
+                # Q: this engine's rows only.
+                ue.accelerator_memory_to_sram(
+                    self.VIS_Q_DRAM + col + RH, 0x00000, elems_q,
+                    stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+                ue.sram_to_accelerator_memory(0x00000, F_Q, elems_q)
+                # K/V: ALL S rows, on every engine. No RH here -- that is the bug that
+                # would turn this into sequence-parallel attention without the merge.
+                for src, dst in ((self.VIS_K_DRAM + col, F_K),
+                                 (self.VIS_V_DRAM + col, F_V)):
+                    ue.accelerator_memory_to_sram(
+                        src, 0x00000, elems_kv,
                         stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+                    ue.sram_to_accelerator_memory(0x00000, dst, elems_kv)
+                # batch = THIS ENGINE'S ROWS, aligned_seq_len = FULL S. Two different
+                # registers: handing one register to both is what made the primary
+                # attend over 128 of 1024 rows.
+                ue.unified_attention_core(
+                    batch=rows, aligned_seq_len=S, head_dim=D,
+                    Q_DRAM_ADDR=F_Q, K_DRAM_ADDR=F_K, V_DRAM_ADDR=F_V,
+                    BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM + RB,
+                    OUTPUT_DRAM_ADDR=F_O,
+                    SCRATCH_DRAM_ADDR=F_S,
+                    IDENTITY_DRAM_ADDR=self.identity_addr,
+                    gpr_batch_reg=m_reg, gpr_aligned_seq_len_reg=s_reg)
+                ue.accelerator_memory_to_sram(F_O, 0x00000, elems_q)
+                ue.sram_to_accelerator_memory(
+                    0x00000, self.VIS_ATTN_RESULT_DRAM + col + RH, elems_q,
+                    stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
             bar()
 
             shard_mm(H, H, self.VIS_ATTN_RESULT_DRAM, H * bpe, la["o_weight"],
