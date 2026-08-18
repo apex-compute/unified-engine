@@ -115,17 +115,25 @@ model_test_help:
 	@echo "                       results -> model_auto_test_results.txt"
 	@echo "  run_from_bin       : skip 'make clean'; reuse existing compiled bins"
 	@echo ""
-	@echo "Models (run one or more by name; default = all):"
+	@echo "Models (run one or more by name; default = non-opt-in suite):"
 	@echo "  $(_MT_MODELS)"
+	@echo "  opt-in: yolov5s, yolov5s_run_from_bin (require a conv-capable FPGA image)"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make model_test                              # all models, concise"
+	@echo "  make model_test                              # default suite, concise"
 	@echo "  make model_test gemma3                       # just one model"
 	@echo "  make model_test gemma3 llama3.2_1b verbose   # two models + live log"
 	@echo "  make model_test qwen3_4b nohup               # one model, in background"
 	@echo "  make model_test gemma3 run_from_bin          # reuse cached bin, no rebuild"
+	@echo "  make yolov5s_bin                             # build one precompiled params/program artifact"
+	@echo "  make model_test yolov5s_run_from_bin run_from_bin  # run that artifact"
 
-_MT_NEW_MODELS := mobilesam locateanything_3b parakeet mobilenetv2_224 mobilenetv2_ssd_640 swin
+# Export the verified v7.0 checkpoint as one precompiled params/program artifact.
+# The compiler validates and reuses an existing artifact unless FORCE=1 is set.
+yolov5s_bin:
+	python3 models/yolov5/yolov5_compile.py $(if $(filter 1,$(FORCE)),--force,)
+
+_MT_NEW_MODELS := mobilesam locateanything_3b parakeet mobilenetv2_224 mobilenetv2_ssd swin yolov5s
 model_test_new:
 	@for m in $(_MT_NEW_MODELS); do \
 		echo "--- Randomizing DRAM before $$m ---"; \
@@ -134,4 +142,4 @@ model_test_new:
 		python model_auto_test.py --only $$m; \
 	done
 
-.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test model_test_new model_test_help verbose nohup run_from_bin $(_MT_MODELS) $(_MT_NEW_MODELS)
+.PHONY: all clean load_drivers run rescan program program_flash program_with_artifact model_test model_test_new model_test_help yolov5s_bin verbose nohup run_from_bin $(_MT_MODELS) $(_MT_NEW_MODELS)

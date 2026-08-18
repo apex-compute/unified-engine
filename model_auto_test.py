@@ -24,9 +24,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ---------------------------------------------------------------------------
 # DRAM Prewriting Tests
 # ---------------------------------------------------------------------------
-# When enabled, the harness DMA-writes test data across the FULL 4 GiB
-# DRAM right before launching each model, so the model (loaded from its bin) starts
-# on poisoned DRAM. A PASS then proves model setup writes every byte it reads.
+# When enabled, the harness DMA-writes test data across the complete model DRAM
+# arena [DRAM_START_ADDR, 4 GiB) right before launching each model. A PASS then
+# proves model setup writes every byte it reads.
 # Toggle off with RANDOMIZE_DRAM=0 in the env to run on clean DRAM.
 RANDOMIZE_DRAM   = os.environ.get("RANDOMIZE_DRAM", "1") != "0"
 RANDOM_DRAM_SEED = int(os.environ.get("RANDOM_DRAM_SEED", "0"))
@@ -35,13 +35,13 @@ DMA_DEV          = os.environ.get("DMA_DEV", "xdma0")
 
 def randomize_dram(seed: int = 0, dev: str = "xdma0",
                    chunk_bytes: int = 64 * 1024 * 1024,
-                   total_bytes: int = 0x100000000) -> bool:
-    """DMA-write random bf16 values across the full 4 GiB DRAM, then release the
-    device, so the model launched next starts on poisoned DRAM.
+                   start_address: int | None = None,
+                   total_bytes: int | None = None) -> bool:
+    """DMA-write random bf16 values across the complete model DRAM arena.
 
-    Covers the ENTIRE 4 GB DMA-mapped DRAM (0x00000000..0xFFFFFFFF): weight / ISA /
-    scratch regions all start as garbage, so a model that still decodes correctly
-    proves its run-from-bin path (re)writes every byte it reads.
+    The XDMA aperture below ``DRAM_START_ADDR`` is not model memory on every
+    board profile. Weight, scratch, tensor, and ISA arenas all live at or above
+    that base, so poisoning through 0xFFFFFFFF covers every model-visible byte.
 
     Uses random bf16 values in [-8, 8] (same method as randomize_dram.py), NOT an
     all-0xFF fill — 0xFF bytes decode to bf16 NaN, which corrupts any DRAM region
@@ -52,10 +52,14 @@ def randomize_dram(seed: int = 0, dev: str = "xdma0",
     run the model because that would not exercise the required poisoned-DRAM state.
     """
     try:
-        if chunk_bytes <= 0 or total_bytes <= 0:
-            raise ValueError("chunk_bytes and total_bytes must be positive")
         import torch
         import user_dma_core
+        start_address = (user_dma_core.DRAM_START_ADDR
+                         if start_address is None else int(start_address))
+        total_bytes = ((1 << 32) - start_address
+                       if total_bytes is None else int(total_bytes))
+        if chunk_bytes <= 0 or total_bytes <= 0 or not 0 <= start_address < 1 << 32:
+            raise ValueError("invalid model DRAM poison range")
         user_dma_core.set_dma_device(dev)
         ue = user_dma_core.UnifiedEngine()           # bare engine: opens device, self-tests
         gen = torch.Generator().manual_seed(seed)
@@ -66,14 +70,16 @@ def randomize_dram(seed: int = 0, dev: str = "xdma0",
             n = min(chunk_bytes, total_bytes - offset)
             take = n // bpe
             data = torch.empty(take, dtype=torch.bfloat16).uniform_(-8.0, 8.0, generator=gen)
-            wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, offset, data, take * bpe)
+            address = start_address + offset
+            wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, address, data, take * bpe)
             if wrote != take * bpe:
                 raise RuntimeError(
-                    f"dma_write wrote {wrote} of {take * bpe} bytes at offset {offset:#x}"
+                    f"dma_write wrote {wrote} of {take * bpe} bytes at address {address:#x}"
                 )
             offset += take * bpe
-        print(f"[randomize_dram] wrote {total_bytes / 1024**3:.2f} GiB of random bf16 poison data to "
-              f"DRAM [0x00000000..{total_bytes - 1:#010x}]", flush=True)
+        print(f"[randomize_dram] wrote {total_bytes / 1024**3:.2f} GiB of random bf16 "
+              f"poison data to DRAM [{start_address:#010x}.."
+              f"{start_address + total_bytes - 1:#010x}]", flush=True)
         del ue                                       # release (dma ops already open/close per call)
         return True
     except Exception as e:
@@ -354,6 +360,52 @@ def _check_pi05(text):
         return False, f"action chunk has nan={nan} inf={inf}"
     return True, f"finite action chunk (min={lo}, max={hi})"
 
+
+def _check_yolov5(text):
+    """Validate YOLOv5's structured result for the vette.jpg fixture."""
+    n = _test_result_field(text, "n_detections")
+    labels = _test_result_field(text, "decoded_text")
+    if not isinstance(n, int) or isinstance(n, bool):
+        return False, "missing integer n_detections in TEST_RESULT"
+    if not isinstance(labels, str):
+        return False, "missing decoded_text in TEST_RESULT"
+    if n <= 0:
+        return False, "no detections above threshold"
+    found = bool(re.search(r"\bcar\b", labels, re.IGNORECASE))
+    return found, (
+        f"{n} detection(s), including car: {labels}"
+        if found
+        else f"{n} detection(s), but expected car for vette.jpg: {labels}"
+    )
+
+def _check_yolov5_single_bin(text):
+    """Validate detection plus the direct single-artifact runtime contract."""
+    passed, reason = _check_yolov5(text)
+    if not passed:
+        return passed, reason
+    backend = _test_result_field(text, "backend")
+    precompiled = _test_result_field(text, "precompiled")
+    artifact_version = _test_result_field(text, "artifact_version")
+    geometry_abi = _test_result_field(text, "geometry_abi")
+    artifact = _test_result_field(text, "artifact")
+    if backend != "hardware":
+        return False, f"single-bin test used unexpected backend {backend!r}"
+    if precompiled is not True:
+        return False, "single-bin runtime did not report precompiled=true"
+    if artifact_version != 3:
+        return False, (
+            f"single-bin runtime reported artifact version "
+            f"{artifact_version!r}, expected 3"
+        )
+    if geometry_abi != "conv-config-inst-v1":
+        return False, f"single-bin runtime used unexpected geometry ABI {geometry_abi!r}"
+    if not isinstance(artifact, str) or not artifact.endswith("yolov5s-andromeda.bin"):
+        return False, "missing yolov5s-andromeda.bin artifact in TEST_RESULT"
+    return True, (
+        f"{reason}; precompiled v{artifact_version} "
+        f"{geometry_abi} artifact={os.path.basename(artifact)}"
+    )
+
 # Shared algebra prompt: a single-answer math question whose correct result is
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
 MATH_PROMPT = "If x + 3 = 5, what is x?"
@@ -402,6 +454,26 @@ TESTS = [
     {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},
     {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
     {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
+    {
+        "name": "yolov5s",
+        "script": "models/yolov5/yolov5_test.py",
+        "pass_check": _check_yolov5,
+        "extra_args": ["--image", "test_samples/vette.jpg"],
+        "mode": "detection",
+        "image": "test_samples/vette.jpg",
+        # No compatible update image is bundled; explicit --only still runs it.
+        "opt_in": True,
+    },
+    {
+        "name": "yolov5s_run_from_bin",
+        "script": "models/yolov5/yolov5_run_from_bin.py",
+        "pass_check": _check_yolov5_single_bin,
+        "extra_args": ["--image", "test_samples/vette.jpg"],
+        "mode": "detection/precompiled single artifact",
+        "image": "test_samples/vette.jpg",
+        # Requires both a prebuilt artifact and an unbundled conv-capable image.
+        "opt_in": True,
+    },
 
     # Encoder models take no --prompt and emit non-LM output (ASR transcription /
     # segmentation).
@@ -521,13 +593,13 @@ def run_test(test: dict, verbose: bool = False,
             result = _parse_output(test, "", 1, clear_elapsed)
             result["pass_reason"] = "DRAM zero-fill failed; model was not run"
             return result
-    # Normal models start from full 4 GiB of 0xFF poison so setup must rewrite
-    # every byte it reads.
+    # Normal models start from poisoned model DRAM so setup must rewrite every
+    # byte it reads.
     elif RANDOMIZE_DRAM:
         model_seed = (
             RANDOM_DRAM_SEED + zlib.crc32(test["name"].encode("utf-8"))
         ) & 0xFFFFFFFF
-        print(f"[randomize_dram] poisoning full 4 GiB DRAM "
+        print(f"[randomize_dram] poisoning model DRAM arena "
               f"(seed={model_seed}) before {test['name']} ...", flush=True)
         poison_start = time.perf_counter()
         poisoned = randomize_dram(seed=model_seed, dev=DMA_DEV)
@@ -754,7 +826,9 @@ def main():
             ap.error(f"unknown test name(s): {', '.join(unknown)}")
         tests = [test for test in TESTS if test["name"] in args.only]
     else:
-        tests = list(TESTS)
+        # Models whose required FPGA image is not part of this repository stay
+        # explicitly runnable with --only, but do not break the default suite.
+        tests = [test for test in TESTS if not test.get("opt_in")]
 
     # --first: hoist without reordering the registry. Validated against the SAME
     # known_names set as --only so a typo fails fast, before the device is touched.
