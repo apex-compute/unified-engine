@@ -177,12 +177,12 @@ for execute-only deploys from precompiled bins.
 | MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
 | Swin | [`models/swin`](models/swin) | Image classification |
 
-YOLOv5s uses the native CONV2D/MAXPOOL modes from Andromeda's
-`pcie_conv_maxpool` line. The bundled `update_cf133b89.bin` predates those
-modes; see the model README for compatible build hashes before running it.
-No compatible update image is shipped in this repository. YOLOv5 is therefore
-opt-in rather than part of the default suite; only run it after programming a
-verified convolution-capable FPGA image.
+YOLOv5s uses the native CONV2D/MAXPOOL modes and ordered queue-CONFIG geometry
+from Andromeda's `pcie_conv_maxpool` line. The bundled `update_cf133b89.bin`
+predates those modes; see the model README for compatible build hashes before
+running it. No compatible update image is shipped in this repository. YOLOv5
+is therefore opt-in rather than part of the default suite; only run it after
+programming a verified queue-CONFIG-capable FPGA image.
 
 YOLOv5 also supports a single checkpoint-free model artifact:
 
@@ -200,9 +200,11 @@ live geometry-CSR writes. It is still not one hardware launch: graph handoff nee
 multiple host dispatches, while concatenation and detection postprocessing remain
 host-side. See the model README for the direct CLI and precise artifact contract.
 
-The direct v3 artifact is host-validated and FPGA-validated on queued-CONFIG build
-`d93eea82`; its strict poisoned-DRAM RK test detects the expected car fixture.
-Older native-convolution images remain usable only with the live-CSR path.
+The direct v3 artifact is host-validated and FPGA-validated on queued-CONFIG
+builds `d93eea82` and `9ef15fc1`; its strict poisoned-DRAM RK test detects the
+expected car fixture. The checkpoint runner uses the same geometry ABI and is
+FPGA-validated on `9ef15fc1`. Older native-convolution images are intentionally
+rejected because they do not implement the queued geometry ABI.
 
 Run the whole suite (or a subset) with the automated tester:
 

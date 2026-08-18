@@ -85,12 +85,16 @@ UE_NATIVE_CONV_HW_VERSIONS = frozenset({
     0xDCACD7AA,
     0xF1BCF368,
     0xD93EEA82,
+    0x9EF15FC1,
+    0x663DE8D5,
 })
 # Builds verified to implement ordered ISA CONFIG subtype 0 for the four
 # CONV2D/MAXPOOL geometry words.  Keep this narrower than the native-conv set:
 # sending opcode 0xC to an older native-conv image must fail closed.
 UE_QUEUE_CONFIG_HW_VERSIONS = frozenset({
     0xD93EEA82,
+    0x9EF15FC1,
+    0x663DE8D5,
 })
 # Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)
 UE_ARGMAX_INDEX = UE_ARGMAX1_INDEX

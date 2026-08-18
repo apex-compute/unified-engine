@@ -59,16 +59,39 @@ def _format_detection(detection) -> str:
             f"[{x1:6.1f}, {y1:6.1f}, {x2:6.1f}, {y2:6.1f}]")
 
 
+def _create_hardware_backend(*, clock: float, known_hw_versions: set[int],
+                             allow_unknown_hardware: bool,
+                             timeout_s: float) -> AndromedaBackend:
+    """Create the checkpoint runner's ordered-CONFIG hardware backend."""
+    ue = user_dma_core.UnifiedEngine(
+        clock_period_ns=clock,
+        allow_unknown_conv_hardware=allow_unknown_hardware,
+        conv_geometry_mode=user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG,
+        allow_unknown_queue_config_hardware=allow_unknown_hardware)
+    ue.software_reset()
+    return AndromedaBackend(
+        ue,
+        known_hw_versions=known_hw_versions,
+        allow_unknown_hardware=allow_unknown_hardware,
+        timeout_s=timeout_s)
+
+
 def main() -> None:
     with (SCRIPT_DIR / "yolov5_config.json").open("r", encoding="utf-8") as f:
         config = json.load(f)
     defaults = config["postprocessing"]
-    configured_hw_versions = set(_parse_hw_versions(
+    configured_native_hw_versions = set(_parse_hw_versions(
         config["hardware"]["compatible_fpga_hashes"]))
-    if configured_hw_versions != set(user_dma_core.UE_NATIVE_CONV_HW_VERSIONS):
+    if configured_native_hw_versions != set(user_dma_core.UE_NATIVE_CONV_HW_VERSIONS):
         raise RuntimeError(
             "yolov5_config.json compatible_fpga_hashes is out of sync with "
             "user_dma_core.UE_NATIVE_CONV_HW_VERSIONS")
+    configured_queue_hw_versions = set(_parse_hw_versions(
+        config["hardware"]["queued_config_fpga_hashes"]))
+    if configured_queue_hw_versions != set(user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS):
+        raise RuntimeError(
+            "yolov5_config.json queued_config_fpga_hashes is out of sync with "
+            "user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS")
 
     parser = argparse.ArgumentParser(
         description="YOLOv5s v7.0 inference on Andromeda CONV2D/MAXPOOL")
@@ -94,7 +117,7 @@ def main() -> None:
     parser.add_argument("--cycle", type=float, default=None)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--allow-unknown-hardware", action="store_true",
-                        help="Bypass the CONV2D-capable FPGA hash allow-list")
+                        help="Bypass the native-CONV and queue-CONFIG FPGA hash allow-lists")
     parser.add_argument("--progress", action="store_true")
     args = parser.parse_args()
     if args.cpu:
@@ -123,13 +146,9 @@ def main() -> None:
         user_dma_core.CLOCK_CYCLE_TIME_NS = clock
         user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
         print(f"FPGA profile: {args.device}, {clock:.4f} ns, AXI={axi_width} bits")
-        ue = user_dma_core.UnifiedEngine(
-            clock_period_ns=clock,
-            allow_unknown_conv_hardware=args.allow_unknown_hardware)
-        ue.software_reset()
-        backend = AndromedaBackend(
-            ue,
-            known_hw_versions=configured_hw_versions,
+        backend = _create_hardware_backend(
+            clock=clock,
+            known_hw_versions=configured_queue_hw_versions,
             allow_unknown_hardware=args.allow_unknown_hardware,
             timeout_s=args.timeout)
     else:
@@ -187,6 +206,11 @@ def main() -> None:
         "backend": args.backend,
         "elapsed_s": round(elapsed, 6),
     }
+    if isinstance(backend, AndromedaBackend):
+        result.update({
+            "geometry_abi": "conv-config-inst-v1",
+            "hardware_version": f"0x{backend.hw_version:08x}",
+        })
     print("TEST_RESULT:" + json.dumps(result, separators=(",", ":")))
 
 

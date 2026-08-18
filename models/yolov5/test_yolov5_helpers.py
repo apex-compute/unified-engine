@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -17,6 +18,7 @@ for path in (SCRIPT_DIR, REPO_ROOT):
         sys.path.insert(0, str(path))
 
 import user_dma_core
+import yolov5_test
 from yolov5_precompiled import (
     compile_precompiled_hardware,
     PrecompiledAndromedaBackend,
@@ -87,6 +89,35 @@ class QuantizationTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_checkpoint_runner_selects_queue_config_geometry(self):
+        fake_engine = mock.Mock()
+        fake_backend = object()
+        known_versions = {0xD93EEA82}
+        with mock.patch.object(
+                yolov5_test.user_dma_core, "UnifiedEngine",
+                return_value=fake_engine) as engine_constructor, \
+                mock.patch.object(
+                    yolov5_test, "AndromedaBackend",
+                    return_value=fake_backend) as backend_constructor:
+            backend = yolov5_test._create_hardware_backend(
+                clock=3.0,
+                known_hw_versions=known_versions,
+                allow_unknown_hardware=False,
+                timeout_s=30.0)
+
+        self.assertIs(backend, fake_backend)
+        engine_constructor.assert_called_once_with(
+            clock_period_ns=3.0,
+            allow_unknown_conv_hardware=False,
+            conv_geometry_mode=user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG,
+            allow_unknown_queue_config_hardware=False)
+        fake_engine.software_reset.assert_called_once_with()
+        backend_constructor.assert_called_once_with(
+            fake_engine,
+            known_hw_versions=known_versions,
+            allow_unknown_hardware=False,
+            timeout_s=30.0)
+
     def test_oc_chunks_have_one_geometry(self):
         _, _, chunk, _ = user_dma_core.plan_conv2d_layer_tiles(
             c_in=512, oc_count=512, in_h=20, in_w=20,
@@ -141,6 +172,10 @@ class PlannerTests(unittest.TestCase):
             engine.require_conv_geometry_hardware()
 
         engine.hw_version = 0xD93EEA82
+        engine.require_conv_geometry_hardware()
+        engine.hw_version = 0x9EF15FC1
+        engine.require_conv_geometry_hardware()
+        engine.hw_version = 0x663DE8D5
         engine.require_conv_geometry_hardware()
         engine.is_capture_on = True
         engine.capture_buffer = []

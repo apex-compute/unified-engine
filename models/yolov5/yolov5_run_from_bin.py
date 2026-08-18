@@ -74,7 +74,9 @@ def main() -> None:
     parser.add_argument("--device", default="kintex7")
     parser.add_argument("--cycle", type=float, default=None)
     parser.add_argument("--timeout", type=float, default=300.0)
-    parser.add_argument("--allow-unknown-hardware", action="store_true")
+    parser.add_argument(
+        "--allow-unknown-hardware", action="store_true",
+        help="Bypass the native-CONV and queue-CONFIG FPGA hash allow-lists")
     parser.add_argument("--progress", action="store_true")
     args = parser.parse_args()
     if args.cpu:
@@ -178,6 +180,8 @@ def main() -> None:
         "artifact": str(args.bin.resolve()),
         "elapsed_s": round(elapsed, 6),
     }
+    if isinstance(backend, PrecompiledAndromedaBackend):
+        result["hardware_version"] = f"0x{backend.hw_version:08x}"
     print("TEST_RESULT:" + json.dumps(result, separators=(",", ":")))
 
 

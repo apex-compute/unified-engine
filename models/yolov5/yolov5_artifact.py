@@ -355,7 +355,9 @@ def validate_single_bin(payload: dict) -> None:
         "output_suffix": "_detections_hw.jpg",
     }
     if runtime != expected_runtime:
-        raise RuntimeError("YOLO artifact runtime ABI/defaults are not canonical")
+        raise RuntimeError(
+            "YOLO artifact runtime ABI/defaults are not canonical; rebuild it "
+            "with `make yolov5s_bin FORCE=1` after updating the driver")
 
     model = payload.get("model")
     operations = payload.get("operations")

@@ -362,7 +362,7 @@ def _check_pi05(text):
 
 
 def _check_yolov5(text):
-    """Validate YOLOv5's structured result for the vette.jpg fixture."""
+    """Validate detection and queued geometry for checkpoint-backed YOLOv5."""
     n = _test_result_field(text, "n_detections")
     labels = _test_result_field(text, "decoded_text")
     if not isinstance(n, int) or isinstance(n, bool):
@@ -371,9 +371,20 @@ def _check_yolov5(text):
         return False, "missing decoded_text in TEST_RESULT"
     if n <= 0:
         return False, "no detections above threshold"
+    backend = _test_result_field(text, "backend")
+    geometry_abi = _test_result_field(text, "geometry_abi")
+    hardware_version = _test_result_field(text, "hardware_version")
+    if backend != "hardware":
+        return False, f"checkpoint test used unexpected backend {backend!r}"
+    if geometry_abi != "conv-config-inst-v1":
+        return False, f"checkpoint test used unexpected geometry ABI {geometry_abi!r}"
+    if not isinstance(hardware_version, str) or not re.fullmatch(
+            r"0x[0-9a-fA-F]{8}", hardware_version):
+        return False, "checkpoint test did not report an FPGA build hash"
     found = bool(re.search(r"\bcar\b", labels, re.IGNORECASE))
     return found, (
-        f"{n} detection(s), including car: {labels}"
+        f"{n} detection(s), including car: {labels}; "
+        f"{geometry_abi} on {hardware_version}"
         if found
         else f"{n} detection(s), but expected car for vette.jpg: {labels}"
     )

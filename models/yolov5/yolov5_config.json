@@ -46,12 +46,16 @@
       "08528a43",
       "dcacd7aa",
       "f1bcf368",
-      "d93eea82"
+      "d93eea82",
+      "9ef15fc1",
+      "663de8d5"
     ],
     "queued_config_fpga_hashes": [
-      "d93eea82"
+      "d93eea82",
+      "9ef15fc1",
+      "663de8d5"
     ],
     "incompatible_shipped_fpga_hash": "cf133b89",
-    "compatibility_note": "Checkpoint-backed YOLO supports the post-convolution builds in compatible_fpga_hashes. Direct artifact v3 additionally requires queued CONFIG opcode 0xC and therefore accepts only queued_config_fpga_hashes. The repository-shipped update_cf133b89.bin is incompatible."
+    "compatibility_note": "Both checkpoint-backed YOLO and direct artifact v3 require ordered queued CONFIG opcode 0xC and accept only queued_config_fpga_hashes. compatible_fpga_hashes documents the broader native-CONV driver compatibility set; those older live-CSR-only builds are not accepted by either YOLO hardware runner. The repository-shipped update_cf133b89.bin is incompatible."
   }
 }

@@ -13,26 +13,22 @@ YOLOv5 requires a convolution-enabled FPGA image. The repository-shipped
 `update_cf133b89.bin` image is **not compatible** because it does not implement
 the required convolution/max-pool modes and registers.
 
-Known post-convolution FPGA build hashes for the checkpoint-backed live-CSR path
-are:
-
-```text
-1b4d15cf  5de75aa6  ba650e20  08528a43  dcacd7aa  f1bcf368
-```
-
-These are Git-derived FPGA build IDs whose histories contain the CONV2D and
-MAXPOOL RTL (including the clean-rebased equivalents). Direct artifact v3 also
-requires the ordered queue-CONFIG ABI and currently accepts verified build
-`d93eea82`. No compatible update image is shipped in this repository. Do not
-start hardware inference until the running FPGA reports an appropriate verified
-build. The stale `0x52a71442` comment in the imported driver predates the
-convolution RTL and is not compatible.
+Both hardware entry points use ordered queue-CONFIG geometry and currently
+accept verified builds `d93eea82` and `9ef15fc1`, plus Python-test-only
+descendant `663de8d5` whose FPGA RTL is identical to `9ef15fc1`. Older
+native-CONV builds support only live geometry CSRs and are not accepted by
+either YOLO runner. No compatible update image is shipped in this repository.
+Do not start hardware inference until the running FPGA reports an appropriate
+verified build. The stale `0x52a71442` comment in the imported driver predates
+the convolution RTL and is not compatible.
 
 The artifact-v3 compiler, schema/digest checks, no-capture replay guards,
-and quantized CPU direct run have been validated on the host. The canonical
-`vette.jpg` CPU run detects `car` at confidence `0.356716`. Hardware replay was
-validated on RK build `d93eea82`; the strict poisoned-DRAM run detects `car` at
-confidence `0.355042`.
+checkpoint queue-mode selection, and quantized CPU direct run have been
+validated on the host. The canonical `vette.jpg` CPU run detects `car` at
+confidence `0.356716`. Direct artifact hardware replay was validated on RK
+builds `d93eea82` and `9ef15fc1`; the strict poisoned-DRAM run detects `car` at
+confidence `0.355042`. The checkpoint-backed queue path was also validated on
+RK build `9ef15fc1` with the same detection and confidence.
 
 ## Model and weights
 
@@ -69,7 +65,7 @@ Run from the repository root. The default hardware backend needs DMA device
 access; the two CPU backends do not:
 
 ```bash
-# Detect objects in test_samples/vette.jpg.
+# Detect objects in test_samples/vette.jpg using ordered queue CONFIG geometry.
 python3 models/yolov5/yolov5_test.py
 
 # Use another image or thresholds.
@@ -104,6 +100,9 @@ python3 models/yolov5/yolov5_run_from_bin.py
 # Check the same artifact and graph on the quantized CPU backend, without FPGA.
 python3 models/yolov5/yolov5_run_from_bin.py --cpu
 ```
+
+Artifact metadata contains the verified FPGA build allow-list. After that list
+changes, rebuild a cached artifact with `make yolov5s_bin FORCE=1`.
 
 `yolov5s-andromeda.bin` is the only model data file required by the direct
 runner. Artifact format version 3 contains the validated fixed-640 graph,
