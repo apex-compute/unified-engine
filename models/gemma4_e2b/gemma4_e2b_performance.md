@@ -29,24 +29,25 @@ python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image --multi-core 
 
 ## Performance comparison
 
-| Metric | Legacy | Kintex | Kintex GQA | Kintex 2-core | rk (outdated) | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
+| Metric | Legacy | Kintex | Kintex GQA | Kintex 2-core | rk | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Vision FPGA execution | 55.54 s | 53.78 s | 53.78 s | 27.78 s | 32.56 s | **28.99 s** | **15.4 s** | **7.98 s** | **4.77 s** |
-| Vision end-to-end path | not reported | 54.32 s | 54.35 s | 28.57 s | 33.03 s | **35.98 s** | **19.6 s** | **10.93 s** | **7.92 s** |
-| Vision throughput | not reported | 21.37 GFLOPS | 21.37 GFLOPS | 41.37 GFLOPS | 35.00 GFLOPS | **39.64 GFLOPS** | **74.4 GFLOPS** | **143.99 GFLOPS** | **240.88 GFLOPS** |
+| Peak throughput | 25.39 GFLOPS | 25.39 GFLOPS | 25.39 GFLOPS | 50.77 GFLOPS | 42.67 GFLOPS | 46.93 GFLOPS | 93.87 GFLOPS | 187.73 GFLOPS | 375.47 GFLOPS |
+| Vision FPGA execution | 55.54 s | 53.78 s | 53.78 s | 27.78 s | 32.05 s | **28.99 s** | **15.4 s** | **7.98 s** | **4.77 s** |
+| Vision end-to-end path | not reported | 54.32 s | 54.43 s | 28.54 s | 33.05 s | **35.98 s** | **19.6 s** | **10.93 s** | **7.92 s** |
+| Vision throughput | not reported | 21.37 GFLOPS | 21.37 GFLOPS | 41.41 GFLOPS | 35.85 GFLOPS | **39.64 GFLOPS** | **74.4 GFLOPS** | **143.99 GFLOPS** | **240.88 GFLOPS** |
 | Vision soft tokens | 256 | 256 | 256 | 256 | 256 | 256 | 256 | 256 | 256 |
 | LM prefill sequence executed | 512-token template | 272 actual tokens | 272 actual tokens | 272 actual tokens | 273 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens |
-| LM prefill FPGA latency | 113.571 s | 51.52 s | 43.95 s | 23.46 s | 32.544 s | **28.23 s** | **17.3 s** | **6.88 s** | **3.96 s** |
-| LM prefill throughput | 23.20 GFLOPS | 23.94 GFLOPS | 24.08 GFLOPS | 45.12 GFLOPS | 37.89 GFLOPS | **43.68 GFLOPS** | **71.22 GFLOPS** | **153.92 GFLOPS** | **267.16 GFLOPS** |
-| Decode average throughput | 2.68 tok/s | 3.74 tok/s | 3.79 tok/s | 3.76 tok/s | 6.00 tok/s | **5.54 tok/s** | **5.49 tok/s** | **5.55 tok/s** | **5.56 tok/s** |
-| Decode peak first-token throughput | 2.86 tok/s | 3.99 tok/s | 4.00 tok/s | 4.00 tok/s | 6.23 tok/s | **5.92 tok/s** | **5.88 tok/s** | **5.91 tok/s** | **5.87 tok/s** |
-| Decode average hardware throughput | 13.42 GFLOPS | 18.78 GFLOPS | 18.97 GFLOPS | 18.88 GFLOPS | 30.45 GFLOPS | **34.22 GFLOPS** | **33.97 GFLOPS** | **34.41 GFLOPS** | **34.41 GFLOPS** |
-| Vision program section | 3.58 MiB | 3.22 MiB | 3.22 MiB | 2.39 MiB | / | 3.22 MiB | 2.39 MiB | 1.90 MiB | 1.75 MiB |
-| Prefill program section | 5.71 MiB | 3.08 MiB | 5.85 MiB | 4.77 MiB | / | 3.08 MiB | 3.46 MiB | 4.06 MiB | 3.72 MiB |
+| LM prefill FPGA latency | 113.571 s | 51.52 s | 43.95 s | 23.46 s | 28.02 s | **28.23 s** | **17.3 s** | **6.88 s** | **3.96 s** |
+| LM prefill throughput | 23.20 GFLOPS | 23.94 GFLOPS | 24.08 GFLOPS | 45.13 GFLOPS | 37.78 GFLOPS | **43.68 GFLOPS** | **71.22 GFLOPS** | **153.92 GFLOPS** | **267.16 GFLOPS** |
+| Decode average throughput | 2.68 tok/s | 3.74 tok/s | 3.75 tok/s | 3.76 tok/s | 5.69 tok/s | **5.54 tok/s** | **5.49 tok/s** | **5.55 tok/s** | **5.56 tok/s** |
+| Decode peak first-token throughput | 2.86 tok/s | 3.99 tok/s | 4.00 tok/s | 4.00 tok/s | 6.04 tok/s | **5.92 tok/s** | **5.88 tok/s** | **5.91 tok/s** | **5.87 tok/s** |
+| Decode average hardware throughput | 13.42 GFLOPS | 18.78 GFLOPS | 18.97 GFLOPS | 22.95 GFLOPS | 36.47 GFLOPS | **34.22 GFLOPS** | **33.97 GFLOPS** | **34.41 GFLOPS** | **34.41 GFLOPS** |
+| Vision program section | 3.58 MiB | 3.22 MiB | 3.22 MiB | 2.39 MiB | 3.4 MiB | 3.22 MiB | 2.39 MiB | 1.90 MiB | 1.75 MiB |
+| Prefill program section | 5.71 MiB | 3.08 MiB | 5.85 MiB | 4.77 MiB | 5.9 MiB | 3.08 MiB | 3.46 MiB | 4.06 MiB | 3.72 MiB |
 | Decode program section | | 1.42 MiB | 1.42 MiB | 1.42 MiB | | 1.42 MiB | 1.46 MiB | 1.42 MiB | 1.42 MiB |
-| Combined program image | 10.37 MiB | 7.73 MiB | 10.49 MiB | 13.73 MiB | / | 7.73 MiB | 10.81 MiB | 19.20 MiB | 30.40 MiB |
+| Combined program image | 10.37 MiB | 7.73 MiB | 10.49 MiB | 13.73 MiB | 10.8 MiB | 7.73 MiB | 10.81 MiB | 19.20 MiB | 30.40 MiB |
 | Weight image (`params.bin`) | 6.91 GiB | same | same | same | / | same | same | same | same |
-| Correctness |  | coherent, total 724 | coherent, total 656 | coherent, total 709 | not recorded | coherent, total 724 | coherent, total 709 | coherent, total 699 | coherent, total 699 |
+| Correctness |  | coherent, total 724 | coherent, total 656 | coherent, total 699 | coherent, total 656 | coherent, total 656 | coherent, total 699 | coherent, total 699 | coherent, total 699 |
 
 ## Refactor optimizations
 

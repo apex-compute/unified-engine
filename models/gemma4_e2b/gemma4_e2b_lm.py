@@ -409,9 +409,10 @@ class Gemma4LMMixin:
         persistent region below _scratch_dram_base is untouched either way).
         ==================================================================
         """
-        seq_len = self.MAX_CONTEXT_SIZE
-        q_seq_len = seq_len * self.group_size
-        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        # KV state follows the full decode context. Token-major workspaces only
+        # need the largest prefill request; decode reuses them for one token.
+        activation_seq_len = max(self.max_prefill_seq_len, 1)
+        activation_q_seq_len = activation_seq_len * self.group_size
         # Unified attention scratch/bias buffers are largest during prefill,
         # but decode can still require MAX_CONTEXT_SIZE KV rows. Size the
         # shared attention buffers for the larger aligned dimension.
@@ -458,7 +459,7 @@ class Gemma4LMMixin:
         # by the vision stage (which now resets only to self._scratch_dram_base).
         # These must stay intact across vision -> prefill -> decode: KV cache,
         # constants, attention bias, and per-layer injection inputs.
-        pli_elements = self.MAX_CONTEXT_SIZE * self.LAYER_SIZE * self.per_layer_input_dim
+        pli_elements = activation_seq_len * self.LAYER_SIZE * self.per_layer_input_dim
         # KV cache (reused throughout prefill + decode).
         self.LAYER0_V_DRAM = self.allocate_tensor_dram(self._kv_cache_bytes)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self._kv_cache_bytes)
@@ -466,8 +467,8 @@ class Gemma4LMMixin:
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_pad)
         # Constant zero tensor + identity matrix (read by many ops).
-        zero_add = torch.zeros(seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
-        self.ZERO_DRAM_ADDR = self.allocate_tensor_dram(seq_len * self.head_dim * self.bytes_per_element)
+        zero_add = torch.zeros(activation_seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
+        self.ZERO_DRAM_ADDR = self.allocate_tensor_dram(activation_seq_len * self.head_dim * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
         self.IDENTITY_DRAM_ADDR = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
@@ -497,18 +498,23 @@ class Gemma4LMMixin:
         # (seq_len*group_size rows) and decode (MAX_CONTEXT_SIZE KV rows).
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        zero_pad = torch.zeros(attention_aligned_seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_pad)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_pad)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_pad)
+        self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(activation_seq_len * self.head_dim * self.bytes_per_element)
+        attention_zero_pad = torch.zeros(
+            attention_aligned_seq_len * self.head_dim * self.bytes_per_element,
+            dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, attention_zero_pad)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, attention_zero_pad)
+        self.dma_to_accelerator_memory(
+            self.LAYER0_FLASH_V_DRAM,
+            torch.zeros(activation_seq_len * self.head_dim * self.bytes_per_element,
+                        dtype=torch.bfloat16))
         # Layer intermediate tensors:
-        self.LAYER0_INPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
-        self.LAYER0_PRE_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
-        self.LAYER0_Q_DRAM = self.allocate_tensor_dram(seq_len * self.q_size)
-        self.LAYER0_K_DRAM = self.allocate_tensor_dram(seq_len * self.k_size)
-        self.LAYER0_K_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.k_size)
-        self.LAYER0_Q_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.q_size)
+        self.LAYER0_INPUT_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
+        self.LAYER0_PRE_NORM_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
+        self.LAYER0_Q_DRAM = self.allocate_tensor_dram(activation_q_seq_len * self.head_dim * self.bytes_per_element)
+        self.LAYER0_K_DRAM = self.allocate_tensor_dram(activation_seq_len * self.k_size)
+        self.LAYER0_K_NORM_DRAM = self.allocate_tensor_dram(activation_seq_len * self.k_size)
+        self.LAYER0_Q_NORM_DRAM = self.allocate_tensor_dram(activation_q_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_OUTPUT_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
         # unified_attention_core scratch layout:
         #   V.T [HD, S] + scores [S, S] + scaled_q [batch, HD].
@@ -516,23 +522,23 @@ class Gemma4LMMixin:
         self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(
             (attention_aligned_seq_len * attention_aligned_seq_len
              + 2 * self.head_dim * attention_aligned_seq_len) * self.bytes_per_element)
-        self.LAYER0_ATTN_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
-        self.LAYER0_POST_ATTN_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
-        self.LAYER0_POST_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
-        self.LAYER0_PRE_MLP_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
+        self.LAYER0_ATTN_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
+        self.LAYER0_POST_ATTN_NORM_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
+        self.LAYER0_POST_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
+        self.LAYER0_PRE_MLP_NORM_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
         mlp_max = max(self.mlp_elements, self.mlp_elements_wide)
-        self.LAYER0_MLP_GATE_DRAM = self.allocate_tensor_dram(seq_len * mlp_max * 2)
-        self.LAYER0_MLP_UP_DRAM = self.allocate_tensor_dram(seq_len * mlp_max * 2)
-        self.LAYER0_MLP_MULT_DRAM = self.allocate_tensor_dram(seq_len * mlp_max * 2)
-        self.LAYER0_MLP_DOWN_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
-        self.LAYER0_POST_MLP_NORM_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
-        self.LAYER0_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
+        self.LAYER0_MLP_GATE_DRAM = self.allocate_tensor_dram(activation_seq_len * mlp_max * 2)
+        self.LAYER0_MLP_UP_DRAM = self.allocate_tensor_dram(activation_seq_len * mlp_max * 2)
+        self.LAYER0_MLP_MULT_DRAM = self.allocate_tensor_dram(activation_seq_len * mlp_max * 2)
+        self.LAYER0_MLP_DOWN_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
+        self.LAYER0_POST_MLP_NORM_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
+        self.LAYER0_OUTPUT_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
         self.OUTPUT_NORM_DRAM = self.allocate_tensor_dram(1 * self.vector_length * self.bytes_per_element)
         self.LOGITS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * self.bytes_per_element)
         # Per-layer injection intermediates (scratch).
         self.PER_LAYER_MODEL_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(pli_elements * self.bytes_per_element)
-        self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.per_layer_input_dim * self.bytes_per_element)
-        self.LAYER0_PER_LAYER_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * self.bytes_per_element)
+        self.LAYER0_PER_LAYER_GATE_OUTPUT_DRAM = self.allocate_tensor_dram(activation_seq_len * self.per_layer_input_dim * self.bytes_per_element)
+        self.LAYER0_PER_LAYER_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * self.bytes_per_element)
 
         if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
             raise RuntimeError(
@@ -1225,7 +1231,10 @@ class Gemma4LMMixin:
         _flash_zero = torch.zeros(flash_qkv_elems, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, _flash_zero)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, _flash_zero)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, _flash_zero)
+        self.dma_to_accelerator_memory(
+            self.LAYER0_FLASH_V_DRAM,
+            torch.zeros(self.max_prefill_seq_len * self.head_dim,
+                        dtype=torch.bfloat16))
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR,
                                        torch.eye(_UE_VS, dtype=torch.bfloat16))
         print(f"[Prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")

@@ -74,6 +74,17 @@ builtins.print = quiet_print
 DEFAULT_IMAGE = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samples", "yosemite.jpg"))
 DEFAULT_AUDIO = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samples", "apex.wav"))
 
+# Static context-capacity switch. Change this single constant to 1024, 2048,
+# 3072, or 4096 when building a program image; tensor allocation and decoder
+# bounds follow it consistently. The JSON value is checked against this choice.
+MAX_CONTEXT_SIZE = 4096
+
+# Context is a static capacity setting in gemma4_e2b_config.json. Keep the
+# supported range explicit because tensor sizing and address arithmetic assume
+# 64-token alignment and the fixed 32-bit DRAM layouts below.
+MIN_CONTEXT_SIZE = 1024
+MAX_CONTEXT_SIZE = 4096
+
 
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
@@ -828,7 +839,17 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.mlp_elements_wide = fi.get("mlp_elements_wide", fi["mlp_elements"])
         self.q_size = self.head_dim * self.group_size * self.bytes_per_element
         self.k_size = self.head_dim * self.bytes_per_element
-        self.MAX_CONTEXT_SIZE = model["max_context_size"]
+        self.MAX_CONTEXT_SIZE = MAX_CONTEXT_SIZE
+        # Keep fallback config lookups (for example sliding_window) consistent
+        # when the source macro is changed without editing the JSON file.
+        model["max_context_size"] = MAX_CONTEXT_SIZE
+        if (self.MAX_CONTEXT_SIZE < MIN_CONTEXT_SIZE
+                or self.MAX_CONTEXT_SIZE > MAX_CONTEXT_SIZE
+                or self.MAX_CONTEXT_SIZE % 64):
+            raise ValueError(
+                f"max_context_size must be a 64-aligned value in "
+                f"[{MIN_CONTEXT_SIZE}, {MAX_CONTEXT_SIZE}], got "
+                f"{self.MAX_CONTEXT_SIZE}")
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
         self._isa_reg_counter = 1
@@ -866,6 +887,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # of max_context_size. Decode may still need MAX_CONTEXT_SIZE KV rows, so
         # tensor_init sizes shared attention buffers for the larger aligned shape.
         self.max_prefill_seq_len = model.get("max_prefill_seq_len", model["max_context_size"])
+        if self.max_prefill_seq_len > self.MAX_CONTEXT_SIZE:
+            raise ValueError(
+                f"max_prefill_seq_len ({self.max_prefill_seq_len}) cannot exceed "
+                f"max_context_size ({self.MAX_CONTEXT_SIZE})")
         # KV sharing map: built from HF model during weight_init
         self._kv_shared_map = {}  # layer_idx -> reference_layer_idx (populated in weight_init)
         self._gamma_bin_offset = self._cfg["special"]["rms_norm"]["gamma_offset"]

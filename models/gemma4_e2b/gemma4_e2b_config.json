@@ -20,7 +20,7 @@
     "per_layer_input_dim": 256
   },
   "model": {
-    "max_context_size": 1024,
+    "max_context_size": 4096,
     "prefill_max_seq_len": 512,
     "max_prefill_seq_len": 512,
     "sliding_window": 512,
@@ -324,11 +324,11 @@
     },
     "ROPE_LOCAL": {
       "offset": "0x9026BD00",
-      "size": 1048576
+      "size": 4194304
     },
     "ROPE_GLOBAL": {
-      "offset": "0x9036BD00",
-      "size": 1048576
+      "offset": "0x9426BD00",
+      "size": 2097152
     }
   },
   "special": {
@@ -337,7 +337,7 @@
       "token_embd_size": "0x30000000"
     },
     "rope": {
-      "num_positions": 1024,
+      "num_positions": 4096,
       "theta": 1000000.0,
       "local_base": 10000.0,
       "partial_rotary_factor_global": 0.25
