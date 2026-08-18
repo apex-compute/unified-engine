@@ -188,6 +188,9 @@ from nn_lib import (  # noqa: E402
     smart_bf16_permute_core, store_weight, eltwise_add_core_dram,
     eltwise_mul_core_dram, silu_core_dram, store_identity_matrix,
 )
+from multi_engine_shard import (  # noqa: E402
+    MultiEngineScheduler, capture_digest,
+)
 
 
 # ======================================================================================
@@ -1257,6 +1260,169 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     # Cost of unrolling: ~3.1 MB -> ~31 MB of program, against a 2.85 GB arena. Cheap.
     DENOISE_ROLLED = False
 
+    # Hash the captured denoise instruction stream and print it. THE ne == 1 IDENTITY
+    # CHECK: the multi-engine plumbing must leave the single-engine program
+    # indistinguishable from the hand-written one, so run --denoise-digest --engines 1
+    # before and after any sharding change and compare the two hex strings. Off by
+    # default only because hashing a 32 MB program costs a few seconds.
+    DENOISE_DIGEST = False
+
+    # ==================================================================================
+    # STUB -- owned by the vision agent, delete on merge.
+    # ==================================================================================
+    # The multi-engine scaffolding below (NUM_ENGINES / STAGE_MAX_ENGINES /
+    # DENOISE_NUM_ENGINES / _num_engines / _vp_barrier / _worker_engine_pool /
+    # _make_stage_scheduler / configure_engines) is being landed by the VISION agent on
+    # this same class. It is duplicated here ONLY so the denoise sharding in this
+    # worktree is statically checkable in isolation. DELETE THIS BLOCK AT MERGE TIME and
+    # keep the vision agent's version -- do not merge two copies.
+    NUM_ENGINES = 1
+    STAGE_MAX_ENGINES = {"VIS": 8, "PREFIX": 8, "DENOISE": 8}
+    # WORKER ARENAS. DRAM is ONE FLAT SHARED SPACE and the primary already claims
+    # params 0x00000000.., tensor 0x48000000.. and programs 0x56000000..; the
+    # MultiEngineScheduler DEFAULT worker base (DRAM_START_ADDR + 0x10000000 =
+    # 0x90000000, stride 0x10000000) would land seven workers straight across the
+    # primary's program arena. Park them at the TOP of the map instead, and assert the
+    # primary's program allocator has not grown into them (it is an unchecked bump
+    # allocator; nothing else stands between a large program and the workers' code).
+    WORKER_ARENA_BASE = 0xE0000000
+    WORKER_ARENA_BYTES = 0x02000000     # 32 MB per worker -> 7 workers = 224 MB
+    WORKER_ARENA_TOP = 0x100000000
+    WORKER_TENSOR_OFFSET = 0x00800000   # 8 MB in:  per-engine column lanes
+    WORKER_PROGRAM_OFFSET = 0x01000000  # 16 MB in: the worker's own program arena
+    VIS_NUM_ENGINES = None
+    PREFIX_NUM_ENGINES = None
+    DENOISE_NUM_ENGINES = None
+
+    @staticmethod
+    def _col_split(N, n, align=UE_VECTOR_SIZE):
+        """HOST-SIDE mirror of MultiEngineScheduler.split_cols: whole `align`-element
+        blocks, deliberately UNEVEN (the trailing engines get one block fewer) rather
+        than ever unaligned. The weight slicing in _weight_init_expert and the region
+        body in _ae_gated_mlp_sharded MUST agree on this partition; the body asserts it
+        against the scheduler, because disagreeing gives finite garbage, not a crash."""
+        if n == 1:
+            return [(0, N)]
+        assert N % align == 0, f"_col_split: N={N} is not a multiple of {align}"
+        blocks = N // align
+        assert blocks >= n, (
+            f"_col_split: N={N} is only {blocks} block(s) of {align}, too few for "
+            f"{n} engine(s)")
+        base, rem = divmod(blocks, n)
+        counts = [align * (base + (1 if i < rem else 0)) for i in range(n)]
+        return [(sum(counts[:i]), counts[i]) for i in range(n)]
+
+    def _num_engines(self, stage):
+        """Engine count for one stage: the per-stage override if set, else the global
+        --engines value, clamped to that stage's structural ceiling."""
+        per_stage = {"VIS": self.VIS_NUM_ENGINES,
+                     "PREFIX": self.PREFIX_NUM_ENGINES,
+                     "DENOISE": self.DENOISE_NUM_ENGINES}
+        assert stage in per_stage, f"unknown stage {stage!r}"
+        n = per_stage[stage]
+        n = int(self.NUM_ENGINES if n is None else n)
+        assert n >= 1, f"{stage}: num_engines must be >= 1, got {n}"
+        return min(n, self.STAGE_MAX_ENGINES[stage])
+
+    def _vp_barrier(self, ue, engine_idx, ne):
+        """All-engine rendezvous. Emits NOTHING at ne == 1 (byte-identity)."""
+        if ne == 1:
+            return
+        ue.generate_instruction_flag_set()
+        for j in range(ne):
+            if j != engine_idx:
+                ue.generate_instruction_flag_check(target_engine_idx=j)
+        for _ in range(32):
+            ue.generate_instruction_nop()
+        ue.generate_instruction_flag_clear()
+
+    def _worker_engine_pool(self, n):
+        """ONE shared pool of n-1 worker engines for the WHOLE run, cached.
+
+        Not an optimization. A second scheduler built over FRESH worker objects restarts
+        their DRAM allocators at 0 and writes stage 2's worker programs on top of stage
+        1's, so stage 1's cached addresses then launch stage 2's code -- instant desync
+        at a FLAG_CHECK that has no timeout (multi_engine_shard.MultiEngineScheduler
+        documents this at length). The bootstrap scheduler below is what actually builds
+        the engines, because its constructor is also what snapshots/restores the 16 KB at
+        the HARDCODED DRAM_START_ADDR (0x80000000) that every UnifiedEngine ctor's DRAM
+        self-test destroys regardless of params_dram_base. On this model's layout that
+        window sits inside the PROGRAM arena (0x56000000..), not the weights -- but it is
+        still live memory once a program has been written there, which is why the pool is
+        built at the top of weight_init, before anything is staged.
+        """
+        pool = self.__dict__.get("_vp_worker_pool")
+        if pool is None:
+            if n <= 1:
+                self.__dict__["_vp_worker_pool"] = []
+                return []
+            top = self.WORKER_ARENA_BASE + (n - 1) * self.WORKER_ARENA_BYTES
+            assert top <= self.WORKER_ARENA_TOP, (
+                f"{n - 1} worker arena(s) of {self.WORKER_ARENA_BYTES >> 20} MB from "
+                f"0x{self.WORKER_ARENA_BASE:X} end at 0x{top:X}, past the "
+                f"0x{self.WORKER_ARENA_TOP:X} ceiling")
+            cur = self.get_program_dram_addr()
+            assert cur < self.WORKER_ARENA_BASE, (
+                f"the primary's program allocator has reached 0x{cur:X}, at/above the "
+                f"worker arena base 0x{self.WORKER_ARENA_BASE:X} -- primary programs and "
+                f"worker programs would overwrite each other. Raise WORKER_ARENA_BASE.")
+            boot = MultiEngineScheduler(
+                self, num_engines=n, allow_more_than_two_engines=True,
+                worker_dram_base=self.WORKER_ARENA_BASE,
+                worker_dram_stride=self.WORKER_ARENA_BYTES,
+                worker_tensor_offset=self.WORKER_TENSOR_OFFSET,
+                worker_program_offset=self.WORKER_PROGRAM_OFFSET)
+            pool = list(boot.workers)
+            self.__dict__["_vp_worker_pool"] = pool
+            _original_print(f"    [engines] worker pool: {len(pool)} shared engine(s) "
+                            f"@0x{self.WORKER_ARENA_BASE:X} +"
+                            f"{self.WORKER_ARENA_BYTES >> 20} MB each")
+        assert len(pool) >= n - 1, (
+            f"shared worker pool holds {len(pool)} engine(s); a later stage asked for "
+            f"{n - 1}. Build the pool at the LARGEST stage engine count first.")
+        return pool[: n - 1]
+
+    def _make_stage_scheduler(self, stage, ne):
+        """Cached per-stage MultiEngineScheduler over the ONE shared worker pool."""
+        cache = self.__dict__.setdefault("_vp_scheds", {})
+        if stage in cache:
+            sched = cache[stage]
+            assert sched.num_engines == ne, (
+                f"{stage} scheduler was built for {sched.num_engines} engine(s), "
+                f"now asked for {ne}")
+            return sched
+        sched = MultiEngineScheduler(
+            self, num_engines=ne, allow_more_than_two_engines=True,
+            workers=self._worker_engine_pool(ne), split_mode="blocks",
+            worker_dram_base=self.WORKER_ARENA_BASE,
+            worker_dram_stride=self.WORKER_ARENA_BYTES,
+            worker_tensor_offset=self.WORKER_TENSOR_OFFSET,
+            worker_program_offset=self.WORKER_PROGRAM_OFFSET)
+        cache[stage] = sched
+        return sched
+
+    def _assert_worker_programs_fit(self, sched, label=""):
+        """Worker programs live in the workers' OWN program arenas, carved out of the
+        same flat 4 GB space. A sharded denoise is a 10x STATIC unroll per worker, so
+        budget it explicitly rather than discovering the overflow as a wrong answer."""
+        WORKER_PROG_ARENA = self.WORKER_ARENA_BYTES - self.WORKER_PROGRAM_OFFSET
+        cur = self.get_program_dram_addr()
+        assert cur < self.WORKER_ARENA_BASE, (
+            f"{label}the primary's program allocator has reached 0x{cur:X}, at/above the "
+            f"worker arena base 0x{self.WORKER_ARENA_BASE:X}. The primary's programs and "
+            f"the workers' code would overwrite each other.")
+        total = 0
+        for i, w in enumerate(sched.workers):
+            used = w.get_program_dram_addr() - w._program_dram_base
+            total += used
+            assert 0 <= used < WORKER_PROG_ARENA, (
+                f"{label}worker {i + 1} program arena overflow: {used / 1e6:.1f} MB of "
+                f"{WORKER_PROG_ARENA / 1e6:.1f} MB. Shrink the unroll, or widen "
+                f"worker_program_offset / worker_dram_stride.")
+        return total
+
+    # ================================ END STUB ========================================
+
     OPS = _cfg["ops"]
     VEC = 64                                              # 64-ALU floor / 128B row
 
@@ -1375,6 +1541,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         dma_read only round-trips bits losslessly for bf16/int32, so any other dtype
         corrupts more than it repairs."""
         assert_bf16_only(self._cfg)     # 16-bit multipliers: no quantized path exists
+        # STUB (vision agent owns this line too). EVERY worker engine is constructed
+        # HERE, before the first store_weight: an UnifiedEngine ctor's DRAM self-test
+        # dma_writes 16 KB to a hardcoded 0x80000000 regardless of params_dram_base.
+        # MultiEngineScheduler snapshots/restores that window, but building the pool
+        # up front is the actual fix. No-op at NUM_ENGINES == 1 -- no engine is built.
+        self._worker_engine_pool(max(self._num_engines(st)
+                                     for st in ("VIS", "PREFIX", "DENOISE")))
         self._dummy_weights = bool(dummy)
         if dummy:
             sd = fake_state_dict(self._cfg, seed=seed)
@@ -1556,6 +1729,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # the invariant that the padded residual stream is zero past column 480.
             return store_weight(self, self._pad_to(sd[name] * self.E_GAMMA_FOLD, HP, 0))
 
+        # How many engines the DENOISE stage will run on. Resolved HERE, at weight-init,
+        # because the K-sliced down-projection blobs below are cut for exactly this
+        # count; compile_denoise_loop asserts the two agree (a silent disagreement is
+        # finite garbage). This is why --engines / --dns_8 must be applied to the model
+        # object BEFORE weight_init(), and why the sliced blobs are not built lazily.
+        ne_dn = self._num_engines("DENOISE")
+
         self.ae_layer_addrs = []
         for i in range(E["num_layers"]):
             la = {}
@@ -1600,7 +1780,26 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # residual stream at exactly zero after every attention/MLP write-back. The
             # gamma fold above is only exact while that holds (_expert_pad_lane_check).
             la["o_weight"] = store_weight(self, npad(sd[f"ae.{i}.o_proj.weight"], HP))
-            la["down_weight"] = store_weight(self, npad(sd[f"ae.{i}.down_proj.weight"], HP))
+            # THE DOWN PROJECTION IS THE ONE WEIGHT THE SHARDED DENOISE CANNOT REACH BY
+            # ADDRESS ARITHMETIC. _ae_gated_mlp_sharded splits it on K (the intermediate
+            # axis, 1280) because that is the axis the gate/up column lanes already
+            # partition -- and B is stored N x K ROW-MAJOR, so B[:, k0:k0+Kc] is STRIDED,
+            # one gap per output row. Shifting B_DRAM_ADDR cannot express it. The cut is
+            # therefore made ONCE, on the host, here, at weight-init time -- exactly what
+            # multi_engine_shard.KShardContext refuses to hide from the caller.
+            dw = npad(sd[f"ae.{i}.down_proj.weight"], HP)          # [HP, I] = N x K
+            if ne_dn > 1:
+                la["down_weight_k"] = [
+                    store_weight(self, dw[:, k0:k0 + kc].contiguous())
+                    for k0, kc in self._col_split(I, ne_dn)]
+                # The unsliced blob is DEAD once the stage is sharded, and it is not
+                # cheap: 512*1280*2 B x 32 layers = 42 MB, against ~64 MB of params
+                # headroom under tensor_dram_base. The slices tile it exactly, so
+                # storing only them is byte-neutral. None (not absent) so any accidental
+                # use in a sharded run is a TypeError at emit time, not a wrong address.
+                la["down_weight"] = None
+            else:
+                la["down_weight"] = store_weight(self, dw)
             la["ln1_gamma"] = gamma(f"ae.{i}.input_layernorm.weight")
             la["ln2_gamma"] = gamma(f"ae.{i}.post_attention_layernorm.weight")
             self.ae_layer_addrs.append(la)
@@ -3077,6 +3276,101 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             C_DRAM_ADDR=bias, bias_mode="broadcast_N",
             gpr_M_reg=self._ae_regs["m"] if m_reg is None else m_reg, **kw)
 
+    def _ae_gated_mlp_sharded(self, sched, M, la):
+        """The expert layer's gated MLP, N-sharded (output columns) across the engines.
+
+        WHY THIS AND NOT q/k/v/o. M is SUFFIX_LEN_PAD = 64 EVERYWHERE in this stage --
+        ONE 64-row block -- so the M-split that shards vision and prefix is not merely
+        inefficient here, it is INEXPRESSIBLE. That leaves the N axis. But an N-shard is
+        only free when its consumer stays in the lane, because matmat_mul_core writes
+        back with stride N*bpe for the N IT WAS GIVEN: calling it with N=cols produces a
+        DENSE per-engine [64, cols] block, never a strided column slice of a full buffer.
+        So:
+
+          gate / up  (N=1280)  -> per-engine [64, cols], consumed ELEMENTWISE by the
+                                  SiLU-multiply, which never leaves the lane. Free.
+          mult       (in lane) -> the [64, cols] product IS the contiguous K-slice
+                                  [col_offset, col_offset+cols) of the [64, 1280]
+                                  intermediate, which is exactly what the down
+                                  projection's K-split needs. No gather.
+          down       (K=1280)  -> K-SPLIT: every engine computes a FULL [64, 512]
+                                  PARTIAL SUM over its slice, and reduce_add combines
+                                  them into the existing AE_MLP_DOWN_DRAM, leaving every
+                                  downstream statement (the gated residual, the next
+                                  layer's norm) untouched.
+
+        q_proj / k_proj / v_proj / o_proj / action_out are deliberately NOT sharded here.
+        k/v are N=320 = 5 blocks of 64 and split_cols ASSERTS above 5 engines. q (N=960)
+        and o (N=512) have the blocks, but their consumers are the flash-Q head gather
+        and the full-width residual add, both of which read ONE contiguous [64, N]
+        buffer -- an N-shard would leave eight disjoint dense blocks and require a
+        cross-engine GATHER through exactly the strided SRAM<->DRAM marshalling that is
+        out of scope for this phase. A K-split is not available to them either: their A
+        operand is a full [64, K] buffer, and A[:, k0:k0+Kc] is strided (matmat_mul_core
+        derives A's row stride from the K it is given), unlike the down projection whose
+        A is already a per-engine dense lane. So they stay primary-only, correctly.
+
+        NOT BIT-IDENTICAL TO ne=1, AND THAT IS EXPECTED: reduce_add is a bf16 add chain
+        on the primary, and bf16 addition is not associative. Denoise has the headroom
+        (floor 36.0 dB against a ~40.1 dB bf16 ceiling); do not chase the delta.
+        """
+        HP, I = self.E_HIDDEN_PAD, self.E_INTER
+        ne = sched.num_engines
+        k_split = self._col_split(I, ne)
+
+        def _body(ctx):
+            i = ctx.engine_idx
+            # The host cut la["down_weight_k"] with _col_split at weight-init time. If
+            # the scheduler ever partitions differently the result is finite garbage,
+            # not a crash -- so assert the two agree, here, every layer.
+            assert (ctx.col_offset, ctx.cols) == k_split[i], (
+                f"mlp shard mismatch on engine {i}: scheduler gives "
+                f"{(ctx.col_offset, ctx.cols)}, the down blobs were cut for {k_split[i]}")
+            raw, mreg, Nc = ctx.unsafe_ue, self._ae_m_regs[i], ctx.cols
+            # gate (fused SiLU) and up: N-split. A -- the normed residual -- is read in
+            # FULL by every engine; it is the same [64, 512] activation. Only B moves,
+            # and B is [N, K] row-major so this engine's output columns are a CONTIGUOUS
+            # ROW BLOCK of it. ops.expert_quant is bf16, so there is no scale blob and
+            # no bias: three of the four per-column offsets collapse to nothing.
+            self._ae_matmul(raw, M, HP, Nc, self.AE_PRE_NORM_DRAM,
+                            ctx.b_addr(la["gate_weight"], HP),
+                            ctx.col_out("ae_mlp_gate"), m_reg=mreg, silu_enable=True)
+            self._ae_matmul(raw, M, HP, Nc, self.AE_PRE_NORM_DRAM,
+                            ctx.b_addr(la["up_weight"], HP),
+                            ctx.col_out("ae_mlp_up"), m_reg=mreg)
+            # silu(gate) * up -- purely per-element, so a column shard of the inputs is a
+            # column shard of the output and no engine needs a peer's columns. raw (not
+            # ctx.ue) because nn_lib's wrapper drives the SRAM staging itself rather than
+            # going through the single allowlisted eltwise_core_dram entry point; the op
+            # is exactly the row/column-independent kind the allowlist exists to admit.
+            eltwise_mul_core_dram(raw, size=ctx.elems(M),
+                                  A_DRAM_ADDR=ctx.col_out("ae_mlp_gate"),
+                                  B_DRAM_ADDR=ctx.col_out("ae_mlp_up"),
+                                  OUTPUT_DRAM_ADDR=ctx.col_out("ae_mlp_mult"))
+            # down: K-SPLIT. This engine's [64, Nc] lane IS the contiguous K-slice, so no
+            # gather -- only the host-pre-sliced weight (see _weight_init_expert).
+            self._ae_matmul(raw, M, Nc, HP, ctx.col_out("ae_mlp_mult"),
+                            la["down_weight_k"][i],
+                            sched.per_engine_addr("ae_mlp_down_partial", i), m_reg=mreg)
+
+        # join=False TWICE. col_sharded_region's exit barrier is redundant because
+        # reduce_add opens with its own rendezvous and the partials are meaningless until
+        # it runs; reduce_add's exit barrier is redundant because the only thing a worker
+        # can do afterwards is block on the NEXT region's opening rendezvous. Over 32
+        # layers x 10 Euler steps that is 320 barriers saved instead of 960.
+        sched.col_sharded_region(I, _body, join=False)
+        # partial[0] IS AE_MLP_DOWN_DRAM (register_per_engine keeps the primary on its
+        # existing model address), so the add chain accumulates IN PLACE: dram_a ==
+        # dram_out on every add. That is the aliasing _ae_dram_copy warns about for the
+        # Euler retire -- and it is deliberate here, because it is what reduce_add
+        # documents ("partial_addrs[0] may alias out_addr") and what pi05 has run for 180
+        # layer-executions per inference. If a sharded denoise ever comes back finite but
+        # scrambled with correct-looking gate/up lanes, THIS is the first thing to break
+        # by pointing the primary partial at a fresh buffer.
+        sched.reduce_add([sched.per_engine_addr("ae_mlp_down_partial", i)
+                          for i in range(ne)],
+                         self.AE_MLP_DOWN_DRAM, M, HP, join=False)
+
     def _ae_strided_copy(self, ue, src, src_jump, dst, dst_jump, rows, width):
         """Static [rows, width] strided gather -> contiguous SRAM -> strided scatter.
         Lifted verbatim from smolvlm2::compile_prefill.
@@ -3236,7 +3530,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                         bias=self.time_mlp_out_bias)
         return self.AE_IO_A_DRAM
 
-    def _emit_expert_layer(self, ue, layer_idx, step):
+    def _emit_expert_layer(self, ue, layer_idx, step, sched=None):
         """Same body shape as one compile_prefix layer at M=SUFFIX_LEN_PAD=64 on the
         512-padded stream, reusing lm_matmul/strided_copy/duplicate_gqa_rows against
         self.ae_layer_addrs.
@@ -3506,15 +3800,22 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # MLP needs the composed form (pi05 measured -6 dB there specifically).
         if self.EXPERT_BISECT and layer_idx == (self.EXPERT_LAYERS or self.E_LAYERS) - 1:
             self._probe_copy(self.AE_PRE_NORM_DRAM, self.AE_P_NORM2_DRAM, M * HP)
-        self._ae_matmul(ue, M, HP, I, self.AE_PRE_NORM_DRAM, la["gate_weight"],
-                        self.AE_MLP_GATE_DRAM, silu_enable=True)
-        self._ae_matmul(ue, M, HP, I, self.AE_PRE_NORM_DRAM, la["up_weight"],
-                        self.AE_MLP_UP_DRAM)
-        eltwise_mul_core_dram(ue, size=M * I, A_DRAM_ADDR=self.AE_MLP_GATE_DRAM,
-                              B_DRAM_ADDR=self.AE_MLP_UP_DRAM,
-                              OUTPUT_DRAM_ADDR=self.AE_MLP_MULT_DRAM)
-        self._ae_matmul(ue, M, I, HP, self.AE_MLP_MULT_DRAM, la["down_weight"],
-                        self.AE_MLP_DOWN_DRAM)
+        if sched is not None and sched.num_engines > 1:
+            # AE_PRE_NORM_DRAM was just written by the primary and is read in FULL by
+            # every engine; the region's OPENING rendezvous is that RAW fence. The
+            # region also lands its result in AE_MLP_DOWN_DRAM, so the residual add
+            # below is unchanged.
+            self._ae_gated_mlp_sharded(sched, M, la)
+        else:
+            self._ae_matmul(ue, M, HP, I, self.AE_PRE_NORM_DRAM, la["gate_weight"],
+                            self.AE_MLP_GATE_DRAM, silu_enable=True)
+            self._ae_matmul(ue, M, HP, I, self.AE_PRE_NORM_DRAM, la["up_weight"],
+                            self.AE_MLP_UP_DRAM)
+            eltwise_mul_core_dram(ue, size=M * I, A_DRAM_ADDR=self.AE_MLP_GATE_DRAM,
+                                  B_DRAM_ADDR=self.AE_MLP_UP_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.AE_MLP_MULT_DRAM)
+            self._ae_matmul(ue, M, I, HP, self.AE_MLP_MULT_DRAM, la["down_weight"],
+                            self.AE_MLP_DOWN_DRAM)
         ue.eltwise_core_dram(M=M, N=HP, dram_a=self.AE_RESIDUAL_DRAM,
                              dram_b=self.AE_MLP_DOWN_DRAM, dram_out=h_out,
                              mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=regs["m"])
@@ -3535,6 +3836,47 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
         self._ae_tensor_init()
         self._precompute_time_embeddings()
+
+        # ---- N-axis (output-column) sharding of the gated MLP ---------------------
+        # See _ae_gated_mlp_sharded for WHY only the MLP: M is 64 here (one row block,
+        # no M-split exists) and the attention projections' consumers need one
+        # contiguous full-width buffer, which an N-shard cannot produce without a
+        # cross-engine gather through the strided marshalling this phase does not touch.
+        ne = self._num_engines("DENOISE")
+        sched = None
+        if ne > 1:
+            assert not self.DENOISE_ROLLED, (
+                "DENOISE_ROLLED + sharding is not supported: _ae_duplicate_gqa_rows "
+                "already opens two nested hardware loops, so rolling makes it depth 3, "
+                "which hangs. Keep the static 10x unroll.")
+            assert not self.EXPERT_BISECT and self.EXPERT_LAYERS is None, (
+                f"--bisect-expert is primary-only (the probe copies and any halt are "
+                f"emitted on engine 0 alone, so the workers would spin forever at the "
+                f"next rendezvous). Use --engines 1 to bisect.")
+            for li, la in enumerate(self.ae_layer_addrs):
+                blobs = la.get("down_weight_k")
+                assert blobs is not None and len(blobs) == ne, (
+                    f"denoise is sharded over {ne} engine(s) but expert layer {li} "
+                    f"carries {0 if blobs is None else len(blobs)} K-sliced down blob(s)."
+                    f" _weight_init_expert cuts them for _num_engines('DENOISE') as it "
+                    f"resolved at WEIGHT-INIT time -- apply --engines/--dns_8 to the "
+                    f"model object BEFORE weight_init().")
+            sched = self._make_stage_scheduler("DENOISE", ne)
+            # Per-engine [64, cols] lanes for gate / up / mult. matmat_mul_core's
+            # writeback stride is N*bpe for the N it was GIVEN, so N=cols writes a DENSE
+            # [64, cols] block: each engine owns its own buffer and nothing is strided.
+            for nm in ("ae_mlp_gate", "ae_mlp_up", "ae_mlp_mult"):
+                sched.alloc_col_output(nm, M, self.E_INTER)
+            # The K-split partials are FULL [64, 512] per engine -- a reduction does not
+            # partition its output. The primary accumulates IN PLACE into the existing
+            # AE_MLP_DOWN_DRAM, so every downstream statement is untouched.
+            sched.register_per_engine(
+                "ae_mlp_down_partial", self.AE_MLP_DOWN_DRAM, M * HP * 2,
+                init_tensor=torch.zeros(M * HP, dtype=torch.bfloat16))
+            print(f"    [denoise] gated MLP sharded over {ne} engine(s): "
+                  f"gate/up N={self.E_INTER} -> {[c for _, c in self._col_split(self.E_INTER, ne)]}"
+                  f", down K-split + reduce_add. q/k/v/o/action_out stay on the primary.")
+        self._denoise_sched = sched
 
         # THE TIMESTEP POINTER IS A **WORD** ADDRESS. accelerator_memory_to_sram's
         # general_reg_src path lowers to PBI_MODE_REG on PBI_FIELD.DRAM_ADDR, and that
@@ -3568,6 +3910,32 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             regs["time"], ue_35bit_addr_shifter(self.AE_TIME_TABLE_DRAM))
         self._ae_regs = regs
 
+        # ONE REGISTER SET PER ENGINE. begin_program() resets each WORKER's isa/inst-ptr
+        # counters too, so the primary's GPR indices are meaningless on a worker: a body
+        # replayed with the primary's index would drive whatever that worker happens to
+        # hold there. Opened here, once, OUTSIDE every region -- and only "m" is actually
+        # consumed by the sharded region, but the full set is primed so a later phase
+        # (attention, RoPE) does not have to re-open the capture to add one.
+        # begin_program() must come AFTER the primary's start_capture (it asserts the
+        # primary is already capturing) and after the primary's own counter reset.
+        self._ae_m_regs = [regs["m"]]
+        if sched is not None:
+            sched.begin_program()
+            for w in sched.workers:
+                wr = {"m": w.alloc_isa_reg(), "qb": w.alloc_isa_reg(),
+                      "cw": w.alloc_isa_reg(), "silu": w.alloc_isa_reg(),
+                      "time": w.alloc_isa_reg()}
+                w.generate_instruction_add_set(wr["m"], M)
+                w.generate_instruction_add_set(wr["qb"], self.AE_FLASH_ROWS)
+                w.generate_instruction_add_set(wr["cw"], self.AE_COMBINED_LEN)
+                w.generate_instruction_add_set(wr["silu"], (M * HP) // UE_VECTOR_SIZE)
+                # THE TIMESTEP POINTER IS A **WORD** ADDRESS (byte >> 3), not a byte
+                # address -- the PBI DRAM_ADDR descriptor field is 35-bit word-addressed.
+                # Seeded identically on every engine so the sets stay symmetric.
+                w.generate_instruction_add_set(
+                    wr["time"], ue_35bit_addr_shifter(self.AE_TIME_TABLE_DRAM))
+                self._ae_m_regs.append(wr["m"])
+
         # ONE BODY, TEN EXECUTIONS. A Python for-loop here would be a 10x multiplier on
         # top of 32 layers x 5 flash calls; the schedule being known at compile time does
         # not make unrolling free. The only per-step input is the timestep row, and it is
@@ -3586,7 +3954,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             if self.EXPERT_BISECT:
                 self._probe_copy(self.AE_IO_A_DRAM, self.AE_P_EMBED_DRAM, M * HP)
             for layer_idx in range(n_ae):
-                self._emit_expert_layer(ue, layer_idx, None)
+                self._emit_expert_layer(ue, layer_idx, None, sched=sched)
             # 32 layers of ping-pong end in A for an even layer count; derive it rather
             # than assume it, so a tiny/partial expert still reads the right buffer.
             final_h = (self.AE_IO_A_DRAM if n_ae % 2 == 0
@@ -3633,6 +4001,18 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             for _step in range(self.N_STEPS):
                 _emit_one_euler_step(step=_step)
 
+        # Close the WORKER captures first: finalize() halts each worker, writes its
+        # program to its own arena and advances its allocator. The primary's capture is
+        # the model's own and stays the model's job (below). The addresses are KEPT --
+        # MultiEngineScheduler overwrites its internal copy on every finalize(), so a
+        # bare start_workers() after a later stage would relaunch the wrong program.
+        if sched is not None:
+            self._denoise_worker_prog_addrs = sched.finalize()
+            wbytes = self._assert_worker_programs_fit(sched, label="denoise: ")
+            print(f"    [denoise] {len(sched.workers)} worker program(s), "
+                  f"{wbytes / 1e6:.2f} MB total "
+                  f"({wbytes / max(1, len(sched.workers)) / 1e6:.2f} MB each)")
+
         ue.generate_instruction_halt()
         ue.stop_capture()
 
@@ -3641,6 +4021,14 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             raw.extend(inst.get_bytes())
         ue.dma_write(DMA_DEVICE_H2C, prog_addr, raw, len(raw))
         ue.allocate_program_dram(len(raw))
+        if self.DENOISE_DIGEST:
+            # BEFORE clear_capture_buffer -- capture_digest reads ue.capture_buffer.
+            self._denoise_capture_digest = capture_digest(ue)
+            _original_print(f"    [denoise] ne={ne} PRIMARY capture digest "
+                            f"{self._denoise_capture_digest}")
+            for wi, w in enumerate(sched.workers if sched is not None else []):
+                _original_print(f"    [denoise] worker {wi + 1} digest "
+                                f"{capture_digest(w)}")
         ue.clear_capture_buffer()
         self._denoise_program_addr = prog_addr
         n_self = sum(1 for i in range(self.E_LAYERS) if self._ae_is_self_attn(i))
@@ -3905,9 +4293,28 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         prefix stage), the timestep pointer is re-seeded inside the captured program so
         every run restarts at t=1.0, and fresh noise is DMA'd to AE_XT_DRAM by the
         caller before this is called."""
+        sched = getattr(self, "_denoise_sched", None)
         with PHASES.track("exec denoise", "exec"), silenced():
+            if sched is not None:
+                # Once per process: a flag left SET by a program that died mid-run would
+                # make the first CHECK of this run pass spuriously. Guarded by
+                # is_queue_busy inside, so it is a no-op on a clean device.
+                if not self.__dict__.get("_denoise_flags_precleared"):
+                    sched.preclear_flags()
+                    self.__dict__["_denoise_flags_precleared"] = True
+                # Workers BEFORE the primary, on EVERY execution: each run ends with the
+                # workers halted, and they must already be parked on the first
+                # rendezvous when the primary reaches it.
+                sched.start_workers(self._denoise_worker_prog_addrs)
             self.start_execute_from_dram(self._denoise_program_addr)
             self._wait_with_heartbeat("denoise", timeout=timeout)
+            if sched is not None:
+                # The primary retires its halt the moment the last rendezvous clears; a
+                # worker may still be draining its (write-free) margin NOPs. Wait for it,
+                # or the NEXT inference's start_workers hits an engine still flagged busy
+                # and the run desyncs on a FLAG_CHECK that has no timeout.
+                for w in sched.workers:
+                    w.wait_queue(60.0)
         _original_print(f"  [denoise] executed in {PHASES.rows[-1][2]:.2f}s")
 
     def run_denoise(self, noise=None, timeout=300.0):
@@ -5139,6 +5546,30 @@ class VeraPulse_Run(VeraPulse_UnifiedEngine):
 # data
 # ======================================================================================
 
+def configure_engines(ue, spec, vis=None, prefix=None, dns=None):
+    """STUB -- owned by the vision agent, delete on merge.
+
+    Applies --engines / the per-stage isolation flags to the model object. MUST be
+    called BEFORE weight_init(): the DENOISE stage's K-sliced down-projection blobs are
+    cut at weight-init time for exactly this engine count, and every UnifiedEngine
+    constructor DMA-writes 16 KB of noise to a hardcoded 0x80000000 -- this model's
+    first stored weight -- so no worker may be built after the weights land either.
+    """
+    if isinstance(spec, str):
+        spec = 8 if spec == "max" else int(spec)
+    ue.NUM_ENGINES = int(spec)
+    if vis is not None:
+        ue.VIS_NUM_ENGINES = int(vis)
+    if prefix is not None:
+        ue.PREFIX_NUM_ENGINES = int(prefix)
+    if dns is not None:
+        ue.DENOISE_NUM_ENGINES = int(dns)
+    n = {s_: ue._num_engines(s_) for s_ in ("VIS", "PREFIX", "DENOISE")}
+    if max(n.values()) > 1:
+        print(f"  [engines] VIS={n['VIS']} PREFIX={n['PREFIX']} DENOISE={n['DENOISE']}")
+    return n
+
+
 def load_sample_observation():
     """[2,512,512,3] uint8 images ('image' + 'image2' upstream) + state[32] + prompt.
 
@@ -5568,6 +5999,18 @@ def main():
                          "compile-free. --no-precompile restores the old lazy behaviour "
                          "where each stage captures inside its first run_* call.")
     ap.add_argument("--engines", type=int, default=1)
+    ap.add_argument("--denoise-digest", action="store_true",
+                    help="SHA-256 the compiled denoise instruction stream and print it. "
+                         "Run it at --engines 1 before and after a sharding change: the "
+                         "two digests MUST match, which is the no-hardware proof that "
+                         "the single-engine program is byte-identical.")
+    ap.add_argument("--dns_8", action="store_true",
+                    help="stage isolation: run the DENOISE action expert's gated MLP on "
+                         "8 engines regardless of --engines. M is 64 (one row block) so "
+                         "the split is on OUTPUT COLUMNS: gate/up N=1280 -> per-engine "
+                         "[64,cols] lanes, the SiLU-multiply stays in lane, and down is "
+                         "a K-split + reduce_add. q/k/v/o/action_out, the attention and "
+                         "every strided copy stay on the primary.")
     ap.add_argument("--quant", default="bf16", choices=["bf16", "q4_64"])
     ap.add_argument("--gate-upstream", action=argparse.BooleanOptionalAction, default=True,
                     help="DEFAULT ON. Score the device against the checkpoint's OWN "
@@ -5996,6 +6439,18 @@ def main():
     print(f"verapulse HW | stage={args.stage} | weights={args.weights} | snr={args.snr}"
           + ("" if VERBOSE else "   (-v for full gate detail)"))
     ue = VeraPulse_UnifiedEngine()
+    # BEFORE weight_init: it sets the engine counts, and _weight_init_expert cuts the
+    # K-sliced down-projection blobs for _num_engines("DENOISE") as resolved right here.
+    configure_engines(ue, args.engines, dns=8 if args.dns_8 else None)
+    ue.DENOISE_DIGEST = args.denoise_digest
+    if args.dump_bins and max(ue._num_engines(s_)
+                              for s_ in ("VIS", "PREFIX", "DENOISE")) > 1:
+        # A bin carries ONE program stream and one params blob. A sharded run also has
+        # per-worker programs in per-worker arenas and per-engine scratch, none of which
+        # the bin schema describes -- loading it back would launch the primary alone
+        # against a rendezvous no worker ever answers, and hang on a FLAG_CHECK that has
+        # no timeout. Refuse rather than emit a bin that cannot be replayed.
+        raise SystemExit("--dump-bins is single-engine only; re-run with --engines 1")
     # weight_init LAST among engine constructions: every UnifiedEngine ctor DMA-writes
     # 16KB of noise to a hardcoded 0x80000000, which is this model's first stored weight.
     # SiLU variant must be set BEFORE compile_prefix runs (it is read at emit time).
