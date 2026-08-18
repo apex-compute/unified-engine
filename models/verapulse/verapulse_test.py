@@ -121,10 +121,18 @@ def silenced():
 @dataclass
 class Phases:
     rows: list = field(default_factory=list)      # (label, kind, seconds)
+    t_first: float = None                         # first track() entry, for true wall
+
+    # "stage" rows are ENVELOPES: they contain that stage's own compile/exec/gate rows.
+    # Summing them into a total counts the nested time twice, so they are excluded from
+    # the per-kind totals and printed separately as context.
+    ENVELOPE_KINDS = ("stage",)
 
     @contextlib.contextmanager
     def track(self, label, kind):
         t0 = time.perf_counter()
+        if self.t_first is None:
+            self.t_first = t0
         try:
             yield
         finally:
@@ -134,16 +142,39 @@ class Phases:
         if not self.rows:
             return
         w = max(len(r[0]) for r in self.rows)
-        _original_print(f"\n=== {title.upper()} ===")
         tot = {}
         for label, kind, s in self.rows:
-            tot[kind] = tot.get(kind, 0.0) + s
-            _original_print(f"  {kind:<8} {label:<{w}}  {s:8.2f}s")
-        _original_print("  " + "-" * (w + 21))
-        for kind, s in sorted(tot.items(), key=lambda kv: -kv[1]):
-            _original_print(f"  {kind:<8} {'TOTAL':<{w}}  {s:8.2f}s")
-        grand = sum(tot.values())
-        _original_print(f"  {'':<8} {'WALL':<{w}}  {grand:8.2f}s")
+            if kind not in self.ENVELOPE_KINDS:
+                tot[kind] = tot.get(kind, 0.0) + s
+        wall = time.perf_counter() - self.t_first
+
+        # THE HEADLINE IS `exec`, AND ONLY `exec`. That is the per-inference cost on the
+        # accelerator -- the number that moves with sharding and DRAM traffic, and the
+        # only one a deployed episode pays. Compile is pre-prepared: built once at
+        # startup by precompile_all and amortized over every inference after it, so
+        # folding it into a hardware total misreports the device as slower than it is.
+        # Gate and host rows are CPU work (torch oracle, readbacks) and are not the
+        # accelerator either. They are reported, separately, below the line.
+        _original_print(f"\n=== {title.upper()} ===")
+        for label, kind, s in self.rows:
+            if kind == "exec":
+                _original_print(f"  {label:<{w}}  {s:8.2f}s")
+        _original_print("  " + "-" * (w + 12))
+        _original_print(f"  {'HARDWARE EXEC':<{w}}  {tot.get('exec', 0.0):8.2f}s")
+
+        other = [(k, v) for k, v in sorted(tot.items(), key=lambda kv: -kv[1])
+                 if k != "exec"]
+        if other or wall:
+            _original_print(f"\n  not hardware execution:")
+            for kind, s in other:
+                note = {"compile": "  (one-time, pre-prepared)",
+                        "gate": "  (cpu oracle)",
+                        "host": "  (cpu)"}.get(kind, "")
+                _original_print(f"    {kind:<{w - 2}}  {s:8.2f}s{note}")
+            resid = wall - sum(tot.values())
+            _original_print(f"    {'untracked':<{w - 2}}  {resid:8.2f}s"
+                            f"  (patchify, dma staging, readbacks)")
+            _original_print(f"    {'script wall':<{w - 2}}  {wall:8.2f}s")
 
 
 PHASES = Phases()
@@ -457,6 +488,24 @@ SNR_FLOOR = {
 COS_FLOOR = 0.999          # structural check: catches scrambling that SNR alone may not
 
 
+# Gate output is terse by default: one line per comparison, prose only on --verbose.
+# The explanations are still worth keeping -- they are what makes a FAIL actionable --
+# but they do not need to be re-read on every green run.
+VERBOSE = False
+
+
+def vnote(*lines):
+    """Print explanatory prose only under --verbose. Indented two extra spaces so it
+    reads as commentary attached to the line above it, not as another result."""
+    if VERBOSE:
+        for ln in lines:
+            print(f"    {ln}")
+
+
+def section(title):
+    print(f"\n  -- {title}")
+
+
 def report(name, hw, ref, valid_rows=None, threshold=40.0, expect_pass=True):
     """The ONE comparison format used by every section: SNR, cos-sim, and both RMS values.
 
@@ -476,9 +525,11 @@ def report(name, hw, ref, valid_rows=None, threshold=40.0, expect_pass=True):
     tag = ("PASS" if passed else "FAIL") if expect_pass else \
           ("gate OK" if not passed else "GATE BROKEN")
     gain = (rh / rr) if rr else float("nan")
-    flag = "  <- GAIN" if (rr and abs(gain - 1.0) > 0.02) else ""
-    print(f"  [{tag:^11s}] {name:28s} snr={s:8.2f}dB cos={c:.6f} "
-          f"rms={rh:.4f}/{rr:.4f}{flag}")
+    flag = f"  GAIN {gain:.3f}x" if (rr and abs(gain - 1.0) > 0.02) else ""
+    mark = {"PASS": "ok  ", "FAIL": "FAIL", "gate OK": "ok  ",
+            "GATE BROKEN": "FAIL"}[tag]
+    print(f"    {mark} {name:26s} {s:7.2f}dB  cos {c:.6f}"
+          + (f"  rms {rh:.4f}/{rr:.4f}" if VERBOSE else "") + flag)
     return passed if expect_pass else (not passed)
 
 
@@ -1735,6 +1786,16 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         it is claimed before any ping-pong buffer can be tempted to reuse it.
         The per-layer LM / expert / head buffers are a TODO for the prefix + expert
         stages; nothing in the vision path touches them."""
+        # IDEMPOTENT, like _lm_tensor_init/_ae_tensor_init. Several call sites invoke
+        # tensor_init defensively (main, then again inside the --gate-upstream / bisect
+        # branches). Re-running it used to be merely wasteful because compilation was
+        # lazy and therefore always came AFTER the last allocation. With precompile_all
+        # the programs are emitted first, so a second allocation would re-point every
+        # VIS_* buffer at a fresh base while the compiled stream still reads the old
+        # one -- silent stale-memory reads, not a crash.
+        if getattr(self, "_tensor_init_done", False):
+            return
+        self._tensor_init_done = True
         print(f"  tensor DRAM starts at 0x{self.get_tensor_dram_addr():X}")
         self.assert_vision_dims()
         self.tensor_init_vision()
@@ -2385,9 +2446,15 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         PM, H, I = self.PREFILL_MAX_SEQ_LEN, self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE
         D, G = self.HEAD_DIM, self.GROUP_SIZE
         KV = self.NUM_KV_HEADS * D
-        QB, bpe = self.LM_QB, 2
+        bpe = 2
 
+        # _lm_tensor_init BEFORE reading LM_QB: it is what defines LM_QB (and the flash
+        # staging addresses). The lazy path got away with the reverse order only because
+        # _execute_prefix called _lm_tensor_init ahead of _compile_once; precompile_all
+        # compiles with no execution in front of it, so compile_prefix must be
+        # self-sufficient.
         self._lm_tensor_init()
+        QB = self.LM_QB
         ue.start_capture()
         prog_addr = ue.get_program_dram_addr()
         m_reg = ue.alloc_isa_reg(); ue.generate_instruction_add_set(m_reg, PM)
@@ -3656,9 +3723,10 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
         # compile-once: the program is structure-bound (PBI on M), identical for every
         # slot, and recompiling per slot would also re-allocate program DRAM per slot.
-        prog = getattr(self, "_vis_program_addr", None)
-        if prog is None:
-            prog = self.compile_encoder()
+        # Goes through the SAME _prog_cache as prefix/denoise so precompile_all() can
+        # seed it up front and this call becomes a pure dict hit (no capture, no
+        # program-DRAM allocation) on every later inference.
+        prog = self._compile_once("vision", self.compile_encoder, label="vision")
 
         # layer_norm_core_dram WRITES its zeros scratch, so the previous slot's execution
         # dirtied it. Restore before every run or slot 1 layer-norms against garbage
@@ -3679,7 +3747,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 patches.reshape(-1).to(torch.bfloat16).contiguous())
             self.dma_to_accelerator_memory(self.vis_zeros_addr, zeros_t)
 
-            self.program_execute(prog, timeout=300.0)
+            with PHASES.track(f"exec vision[slot{i}]", "exec"):
+                self.program_execute(prog, timeout=300.0)
 
             post_ln.append(self._read_bf16(self.VIS_POST_LN_DRAM, (S, H),
                                            label=f"vis_post_ln[{i}]"))
@@ -3812,6 +3881,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         meta = self.__dict__.setdefault("_prog_meta", {})
         if key in cache:
             return cache[key]
+        if getattr(self, "_compile_frozen", False):
+            raise RuntimeError(
+                f"_compile_once({key!r}) would COMPILE inside the execution flow, but "
+                f"precompile_all() froze the program set to {sorted(cache)}. Compilation "
+                f"here means a capture + a program-DRAM allocation per inference -- the "
+                f"exact leak that killed pi05 at 3 inferences. Add {key!r} to "
+                f"precompile_all(stages=...) instead of compiling lazily.")
         _original_print(f"  [{label}] compiling ONCE...", end="\r", flush=True)
         before = self.get_program_dram_addr()
         with PHASES.track(f"compile {label}", "compile"), silenced():
@@ -3905,11 +3981,12 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         ones whose gate is still a stub are named explicitly as UNGATED so nobody reads a
         silent pass as a verified one.
 
-        Stage timing goes through PHASES. Note the "stage" rows are wall-clock ENVELOPES
-        that CONTAIN that stage's own "compile"/"exec" rows -- read the per-kind TOTAL
-        lines (compile vs exec is the split that matters: compile is paid once and shrinks
-        by cutting shape diversity, exec is paid every inference and shrinks by sharding),
-        not the WALL line, which counts the nested time twice.
+        Stage timing goes through PHASES. The "stage" rows are wall-clock ENVELOPES that
+        CONTAIN that stage's own compile/exec/gate rows, so they are excluded from the
+        per-kind TOTALs. Read compile vs exec: compile is paid once and shrinks by
+        cutting shape diversity, exec is paid every inference and shrinks by sharding.
+        WALL is measured, not summed, and the untracked-host line is the difference --
+        patchify, DMA staging and readbacks, which no row currently covers.
 
         Stashes for callers/probes:
             self._last_inference["actions_padded"] [50, 32]  full chunk, padded DoF
@@ -4945,8 +5022,78 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     # 8. bins
     # ==================================================================================
 
-    def precompile_all(self):
-        raise NotImplementedError
+    # The three compilable sections, IN THE ORDER THEY MUST BE COMPILED. This order is
+    # not cosmetic: alloc_isa_reg / alloc_inst_ptr are per-PROCESS counters that
+    # start_capture() does NOT reset, so each stage's registers and PBI pointer rows land
+    # on physical indices that depend on what compiled BEFORE it (see the long comment in
+    # compile_denoise_loop -- pi05's symptom for getting this wrong was 100% NaN, not a
+    # crash). vision -> prefix -> denoise is exactly the lazy order that the gated runs
+    # validated, so precompiling in this order reproduces byte-identical programs.
+    COMPILE_STAGES = ("vision", "prefix", "denoise")
+
+    def precompile_all(self, stages=COMPILE_STAGES, freeze=True):
+        """COMPILE EVERYTHING UP FRONT, then execute stage by stage.
+
+        The engine already had compile-once/execute-many per stage (_compile_once), but
+        compilation was still *interleaved* into the first inference: run_vision compiled
+        the encoder, run_prefix compiled the prefix, run_denoise compiled the denoise
+        loop. That made inference #0 structurally different from every later one --
+        minutes of capture time in the middle of what is supposed to be a robot control
+        loop, and a program-DRAM allocation happening after live data was already staged.
+
+        This method moves all three captures into an explicit build phase, so the
+        execution flow is pure execute. With freeze=True, _compile_once then REFUSES to
+        compile anything new, which turns "a stage compiled at inference time" from a
+        silent 3-minute stall into a loud error.
+
+        PRECONDITIONS: weight_init() and tensor_init() must have run. Compilation reads
+        weight ADDRESSES (and, for the encoder, the vision tensor addresses tensor_init
+        claims), and every stage's compile also runs its own idempotent tensor-init
+        (_lm_tensor_init / _ae_tensor_init), so all DRAM regions are claimed here rather
+        than racing with staged activations later.
+
+        NOTHING DATA-DEPENDENT IS BAKED IN. The prefix attention bias, the expert's two
+        biases and its RoPE base all depend on the observation's valid prefix length, but
+        they are DRAM *data* read by address from an address-static program -- run_prefix
+        (build_attn_bias) and run_denoise (_ae_refresh_runtime_constants) restage them
+        per inference with no recompile. That is why the whole program set can be built
+        before a single observation exists.
+
+        Returns {stage: program_dram_addr}.
+        """
+        unknown = [s for s in stages if s not in self.COMPILE_STAGES]
+        if unknown:
+            raise ValueError(f"unknown compile stage(s) {unknown}; "
+                             f"known: {list(self.COMPILE_STAGES)}")
+        if not hasattr(self, "vis_post_ln_weight"):
+            raise RuntimeError(
+                "precompile_all() before weight_init(): compilation emits weight DRAM "
+                "addresses, so the weights must be resident first")
+
+        fns = {"vision": (self.compile_encoder, "vision"),
+               "prefix": (self.compile_prefix, "prefix"),
+               "denoise": (self.compile_denoise_loop, "denoise")}
+        # Iterate COMPILE_STAGES, not the caller's tuple: order is load-bearing (above),
+        # so a caller passing ("denoise", "vision") still gets the validated order.
+        want = [s for s in self.COMPILE_STAGES if s in stages]
+        _original_print(f"  [precompile] building {len(want)} program(s): "
+                        f"{', '.join(want)} (compile phase -- no execution)")
+        t0 = time.perf_counter()
+        out = {}
+        for s in want:
+            fn, label = fns[s]
+            out[s] = self._compile_once(s, fn, label=label)
+        meta = self.__dict__.get("_prog_meta", {})
+        total = sum(meta[s][1] for s in want if s in meta)
+        _original_print(f"  [precompile] {len(want)} program(s), {total / 1e6:.2f} MB, "
+                        f"{time.perf_counter() - t0:.1f}s. Program DRAM now at "
+                        f"0x{self.get_program_dram_addr():X}; execution is compile-free "
+                        f"from here.")
+        if freeze:
+            # Only freeze on a FULL build. Freezing a partial set (e.g. --stop-after
+            # vision) would turn a later legitimate stage compile into a hard error.
+            self._compile_frozen = (len(want) == len(self.COMPILE_STAGES))
+        return out
 
     def dump_bins(self, bin_dir):
         """params.bin + programs.bin + programs.json. Carry a signature (num image slots,
@@ -5154,7 +5301,7 @@ def _upstream_load(quiet=False, hw_gelu=False):
     if hw_gelu:
         _patch_upstream_quick_gelu(up)
     if not quiet:
-        print(f"  upstream oracle loaded "
+        vnote(f"upstream oracle loaded "
               f"({sum(p.numel() for p in up.parameters())/1e6:.1f}M"
               f"{', vision GELU -> quick_gelu' if hw_gelu else ''})")
     return up
@@ -5200,13 +5347,12 @@ def _upstream_prefix_gate(ue, images, token_ids, text_mask, hidden, kv):
                                 use_cache=True, fill_kv_cache=True)
     up_hidden = outs[0][0]                      # [S, 960]
     valid = int(pad[0].sum())
-    print("\n  == DEVICE vs UPSTREAM: prefix ==")
-    print(f"  upstream prefix rows={up_hidden.shape[0]} valid={valid}; "
+    section("prefix")
+    vnote(f"upstream rows={up_hidden.shape[0]} valid={valid}; "
           f"device valid_len={ue._prefix_valid_len}")
     if up_hidden.shape[0] != ue._prefix_valid_len:
-        print(f"  !! ROW COUNT DISAGREES -- upstream keeps the {ids.numel()-int(m.sum())} "
-              f"padded text slots as real rows, the device packs them out. Compare only "
-              f"the valid rows.")
+        vnote(f"row count differs: upstream keeps {ids.numel()-int(m.sum())} padded text "
+              f"slots as real rows, the device packs them out -- valid rows only.")
     n = min(valid, int(ue._prefix_valid_len))
     hw = torch.as_tensor(hidden).float()[:n]
     report("prefix hidden", hw, up_hidden[:n], threshold=20.0)
@@ -5218,8 +5364,9 @@ def _upstream_prefix_gate(ue, images, token_ids, text_mask, hidden, kv):
         kh, vh = torch.as_tensor(kv[li][0])[:, :n], torch.as_tensor(kv[li][1])[:, :n]
         ck, cv = cos_sim(kh, ku), cos_sim(vh, vu)
         worst = min(worst, ck, cv)
-        print(f"    L{li:<2} K cos={ck:.6f}  V cos={cv:.6f}")
-    print(f"  worst KV cos across sampled layers: {worst:.6f}")
+        vnote(f"L{li:<2} K cos={ck:.6f}  V cos={cv:.6f}")
+    print(f"    {'ok  ' if worst >= COS_FLOOR else 'FAIL'} prefix KV (worst of 4)"
+          f"          cos {worst:.6f}")
     return worst
 
 
@@ -5253,17 +5400,15 @@ def _upstream_denoise_gate(ue, images, token_ids, text_mask, state, noise, hw_ac
     hw = torch.as_tensor(hw_actions).float()
     n = min(hw.shape[0], up_act.shape[0])
     d = min(hw.shape[1], up_act.shape[1])
-    print("\n  == DEVICE vs UPSTREAM: denoise (same noise, deterministic) ==")
+    section("denoise (same noise, deterministic)")
     # NOT a row mismatch: both sides are `chunk_size` rows. The column counts differ
     # because the model's action space is max_action_dim=32 of which only action_dim=7
     # are real DoF -- the other 25 are the multi-embodiment zero padding, which upstream
     # itself slices off before computing loss. The device already returns the 7.
-    print(f"  device {tuple(hw.shape)}  upstream {tuple(up_act.shape)} "
-          f"-> comparing {n} rows x {d} real DoF "
-          f"(upstream cols {d}..{up_act.shape[1]-1} are action-dim padding)")
+    vnote(f"device {tuple(hw.shape)} vs upstream {tuple(up_act.shape)} -> {n} rows x "
+          f"{d} real DoF (upstream cols {d}..{up_act.shape[1]-1} are action-dim padding)")
     report("actions vs upstream", hw[:n, :d], up_act[:n, :d], threshold=30.0)
     c = cos_sim(hw[:n, :d], up_act[:n, :d])
-    print(f"  actions cos {c:.6f}")
 
     # THE DEVICE-MIRROR CHECK. "Expected to be bad" is not the same as "bad in the way we
     # predicted": a low upstream score is consistent BOTH with the three known model
@@ -5285,18 +5430,17 @@ def _upstream_denoise_gate(ue, images, token_ids, text_mask, state, noise, hw_ac
                                     noise=torch.as_tensor(noise).float().clone())
             mrt = torch.as_tensor(mr).float()[:n, :d]
             report("actions vs device-mirror", hw[:n, :d], mrt, threshold=25.0)
-            print("  ^ HIGH = the accelerator faithfully executes the wrong model, so "
-                  "landing faults 4/5/6 in the emitter is sufficient.\n"
-                  "    LOW  = a SECOND device-side fault on top; the emitter work alone "
-                  "will not close it.")
+            vnote("device-mirror HIGH = the accelerator faithfully executes the wrong "
+                  "model, so landing faults 4/5/6 in the emitter is sufficient; LOW = a "
+                  "SECOND device-side fault on top, which the emitter work alone will "
+                  "not close. It is the ceiling: no model fix pushes above it.")
         except Exception as _e:
             import traceback
             print(f"  (device-mirror check failed: {_e!r})")
             traceback.print_exc()
-    print("  NOTE: expert faults 4,5,6,7,8 are ALL LANDED. This line is the SHARP gate "
-          "(quick_gelu on both sides, so the activation substitution cancels) -- it "
-          "grades arithmetic, not fidelity. The device-mirror line below is the ceiling: "
-          "no model fix can push this above it.")
+    vnote("expert faults 4,5,6,7,8 are ALL LANDED. This is the SHARP gate (quick_gelu "
+          "on both sides, so the activation substitution cancels) -- it grades "
+          "arithmetic, not fidelity.")
     return c
 
 
@@ -5323,7 +5467,7 @@ def _upstream_vision_gate(ue, images, tokens):
     reason this function exists.
     """
     hw = torch.as_tensor(tokens).float()
-    print("\n  == DEVICE vs UPSTREAM: vision + connector ==")
+    section("vision + connector")
     out = {}
     for hw_gelu in (False, True):
         try:
@@ -5346,15 +5490,14 @@ def _upstream_vision_gate(ue, images, tokens):
         tag = "vs quick_gelu (SHARP)" if hw_gelu else "vs exact  (fidelity)"
         report(f"vision {tag}", hw, up_con, threshold=(30.0 if hw_gelu else 11.0))
         out[hw_gelu] = cos_sim(hw, up_con)
-    print(f"  fidelity: cos {out[False]:.6f} -- distance from the model AS PUBLISHED; "
-          f"floor set by quick_gelu, not by the accelerator")
-    print(f"  sharp   : cos {out[True]:.6f} -- GELU cancels, so this one grades the "
-          f"ARITHMETIC. Expect ~40 dB.")
+    vnote(f"fidelity cos {out[False]:.6f} -- distance from the model AS PUBLISHED; "
+          f"floor set by quick_gelu, not by the accelerator.",
+          f"sharp    cos {out[True]:.6f} -- GELU cancels, so this grades the ARITHMETIC "
+          f"(expect ~40 dB).")
     ok = out[True] >= 0.999 and out[False] >= 0.955
-    print(f"  vision vs upstream: {'PASS' if ok else 'FAIL'}")
-    if out[True] < 0.999:
-        print("  the SHARP gate is what failed -- that is a real execution fault, not "
-              "the activation tax. Bisect vision against upstream.")
+    if not ok and out[True] < 0.999:
+        print("    the SHARP gate failed -- a real execution fault, not the activation "
+              "tax. Bisect vision against upstream.")
     return ok
 
 
@@ -5418,6 +5561,12 @@ def main():
                          "which selects real weights for the HOST reference stages; if "
                          "both are given, --weights governs the device and --real governs "
                          "the reference, and they never apply to the same stage.")
+    ap.add_argument("--precompile", action=argparse.BooleanOptionalAction, default=True,
+                    help="DEFAULT ON. Build every program the run will need (encoder, "
+                         "prefix, denoise -- minus anything --stop-after excludes) in one "
+                         "compile phase BEFORE the first execution, then run the stages "
+                         "compile-free. --no-precompile restores the old lazy behaviour "
+                         "where each stage captures inside its first run_* call.")
     ap.add_argument("--engines", type=int, default=1)
     ap.add_argument("--quant", default="bf16", choices=["bf16", "q4_64"])
     ap.add_argument("--gate-upstream", action=argparse.BooleanOptionalAction, default=True,
@@ -5429,6 +5578,10 @@ def main():
                          "--no-gate-upstream falls back to the reference gate.")
     ap.add_argument("--snr", action=argparse.BooleanOptionalAction, default=True,
                     help="per-stage >=40 dB gate; --no-snr to disable")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="restore the full gate commentary: per-comparison RMS, the "
+                         "known-fault notes, per-layer KV cos, oracle-load lines. Off "
+                         "by default -- a green run needs one line per check.")
     ap.add_argument("--dump-bins", action="store_true")
     ap.add_argument("--from-bin", action="store_true")
     ap.add_argument("--download-only", action="store_true",
@@ -5449,6 +5602,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--prompt", default=_CFG["defaults"]["prompt"])
     args = ap.parse_args()
+    global VERBOSE
+    VERBOSE = args.verbose
 
     # Resolve the sentinel. Default = "all" (the full FPGA path). The one exception is
     # --tiny with no explicit --stage: --tiny means "2 layers per stack, 64 patches",
@@ -5838,7 +5993,8 @@ def main():
         f"expected [{slots},{IMG},{IMG},{CH}] HWC images, got {tuple(images.shape)}")
 
     # --- hardware ----------------------------------------------------------------
-    print(f"verapulse HW | stage={args.stage} | weights={args.weights} | snr={args.snr}")
+    print(f"verapulse HW | stage={args.stage} | weights={args.weights} | snr={args.snr}"
+          + ("" if VERBOSE else "   (-v for full gate detail)"))
     ue = VeraPulse_UnifiedEngine()
     # weight_init LAST among engine constructions: every UnifiedEngine ctor DMA-writes
     # 16KB of noise to a hardcoded 0x80000000, which is this model's first stored weight.
@@ -5859,6 +6015,21 @@ def main():
     ue.PREFIX_FUSED_SILU = args.fused_silu
     ue.weight_init(dummy=(args.weights == "dummy"), seed=args.seed)
     ue.tensor_init()
+
+    # --- compile phase: every program built BEFORE anything executes ---------------
+    # Only the stages this invocation can actually reach are built: --stop-after vision
+    # must not pay for the 32-layer prefix and the denoise loop it will never run, and
+    # --stage vision/connector is vision-only by definition. When the full set is built,
+    # precompile_all freezes _compile_once so a stray lazy compile inside the execution
+    # flow raises instead of silently stalling and allocating program DRAM.
+    if args.precompile:
+        if args.stage in ("vision", "connector") or args.stop_after in ("vision", "connector"):
+            _stages = ("vision",)
+        elif args.stop_after == "prefix":
+            _stages = ("vision", "prefix")
+        else:
+            _stages = ue.COMPILE_STAGES
+        ue.precompile_all(stages=_stages)
 
     # ================= END-TO-END: vision -> prefix -> denoise ======================
     if args.stage == "all":
@@ -5924,29 +6095,33 @@ def main():
             # vision -> prefix, then score BOTH against the checkpoint's own forward.
             ue.tensor_init()
             toks = ue.run_vision(images)
-            ok_v = _upstream_vision_gate(ue, images, toks)
+            with PHASES.track("gate vision (cpu oracle)", "gate"):
+                ok_v = _upstream_vision_gate(ue, images, toks)
             tm = text_mask if text_mask is not None else torch.ones(
                 token_ids.numel(), dtype=torch.bool)
             hidden = ue.run_prefix(toks, token_ids, state, text_mask=tm)
             PM, D, NKV = ue.PREFILL_MAX_SEQ_LEN, ue.HEAD_DIM, ue.NUM_KV_HEADS
-            kv = [(torch.stack([ue._read_bf16(ue.LAYER0_K_DRAM + li * ue.KV_LAYER_STRIDE
-                                              + h * ue.KV_HEAD_STRIDE, (PM, D),
-                                              label=f"gk{li}{h}") for h in range(NKV)]),
-                   torch.stack([ue._read_bf16(ue.LAYER0_V_DRAM + li * ue.KV_LAYER_STRIDE
-                                              + h * ue.KV_HEAD_STRIDE, (PM, D),
-                                              label=f"gv{li}{h}") for h in range(NKV)]))
-                  for li in range(ue.NUM_LAYERS)]
-            worst = _upstream_prefix_gate(ue, images, token_ids, tm, hidden, kv)
+            with PHASES.track("readback prefix KV", "host"):
+                kv = [(torch.stack([ue._read_bf16(ue.LAYER0_K_DRAM + li * ue.KV_LAYER_STRIDE
+                                                  + h * ue.KV_HEAD_STRIDE, (PM, D),
+                                                  label=f"gk{li}{h}") for h in range(NKV)]),
+                       torch.stack([ue._read_bf16(ue.LAYER0_V_DRAM + li * ue.KV_LAYER_STRIDE
+                                                  + h * ue.KV_HEAD_STRIDE, (PM, D),
+                                                  label=f"gv{li}{h}") for h in range(NKV)]))
+                      for li in range(ue.NUM_LAYERS)]
+            with PHASES.track("gate prefix (cpu oracle)", "gate"):
+                worst = _upstream_prefix_gate(ue, images, token_ids, tm, hidden, kv)
             acts = ue.run_denoise(noise=noise)
-            c_act = _upstream_denoise_gate(ue, images, token_ids, tm, state, noise, acts,
-                                           device_kv=kv)
+            with PHASES.track("gate denoise (cpu oracle)", "gate"):
+                c_act = _upstream_denoise_gate(ue, images, token_ids, tm, state, noise,
+                                               acts, device_kv=kv)
 
             # Same action table the non-gated path prints, so this is a strict superset
             # of the old default behaviour and nothing was lost by turning the gate on.
             a = torch.as_tensor(acts).float()
             n_exec, adim = HEADC["n_action_steps"], HEADC["action_dim"]
-            print(f"\n  MODEL OUTPUT -- first {n_exec} of {HEADC['chunk_size']} actions, "
-                  f"{adim} dof (normalized):")
+            print(f"\n  actions [{n_exec} of {HEADC['chunk_size']} x {adim} dof, "
+                  f"normalized]")
             for i in range(min(n_exec, a.shape[0])):
                 print(f"  {i:>4}  " + "".join(f"{float(v):9.4f}" for v in a[i, :adim]))
             PHASES.summary("hardware timing")
@@ -5957,11 +6132,11 @@ def main():
             # emitter (causal suffix mask, (320,320) cross reprojection, prefix-K/V
             # concat) -- reporting those loudly is useful, failing the run over them
             # every time until they land is not.
-            print(f"\n  gate summary: vision {'ok' if ok_v else 'FAULT'} | "
-                  f"prefix worst-KV cos {worst:.4f} | actions cos {c_act:.4f}")
+            print(f"\n  gates: vision {'ok' if ok_v else 'FAULT'} | "
+                  f"prefix KV cos {worst:.4f} | actions cos {c_act:.4f}")
             if c_act < 0.99:
-                print("  actions are limited by the 3 known expert faults (4/5/6), which "
-                      "are fixed in VeraPulseRef but NOT in the emitter.")
+                vnote("actions are limited by the 3 known expert faults (4/5/6), fixed "
+                      "in VeraPulseRef but NOT in the emitter.")
             sys.exit(0 if ok_v else 1)
 
         executed = ue.run_inference(images, token_ids, state, noise=noise,

@@ -29,8 +29,9 @@ Run:
 THREE CONSTRAINTS THIS FILE IS BUILT AROUND, all learned the expensive way:
 
 1. COMPILE ONCE, EXECUTE MANY. The engine is constructed and weight_init/tensor_init are
-   run EXACTLY ONCE for the whole eval; the three device programs are compiled on the
-   first inference (via the engine's own _compile_once) and only re-EXECUTED afterwards.
+   run EXACTLY ONCE for the whole eval; the three device programs are all compiled up
+   front by precompile_all() during backend construction, and every inference -- the
+   first included -- only re-EXECUTES them.
    Recompiling advances the program-DRAM allocator every inference and marches it at the
    4 GB ceiling: pi05 died after 3 inferences that way and survived 252 once fixed. Any
    change here that re-enters weight_init or constructs a second engine per episode
@@ -261,19 +262,26 @@ class _FpgaBackend:
         self.ue.weight_init(dummy=(weights == "dummy"), seed=seed)
         self.ue.tensor_init()
         print(f"[eval] engine ready in {time.perf_counter() - t0:.1f}s", flush=True)
-        # NOTE: no precompile_all() here. It is still NotImplementedError on this model,
-        # so the three programs compile lazily inside the FIRST inference (each through
-        # the engine's _compile_once) and every later inference is execute-only. That
-        # makes inference #0 of the run structurally slower than the rest -- expected,
-        # and NOT a per-episode cost. Wire precompile_all in here once it exists so run 0
-        # stops being different from the others.
+        # COMPILE PHASE, once, before any observation exists. All three programs
+        # (encoder, prefix, denoise) are built here, so inference #0 is not structurally
+        # different from inference #251: every rollout step is pure execute. The programs
+        # are address-static and the per-observation quantities (attention biases, expert
+        # RoPE base) are DRAM data restaged by run_prefix/run_denoise, so nothing about
+        # this episode is baked into the bytes. precompile_all also freezes the program
+        # set: if any stage tried to compile mid-episode it now raises instead of
+        # stalling the control loop and marching the program-DRAM pointer.
+        print("[eval] precompiling encoder + prefix + denoise (one-time)...", flush=True)
+        t1 = time.perf_counter()
+        self.ue.precompile_all()
+        print(f"[eval] programs ready in {time.perf_counter() - t1:.1f}s -- "
+              f"inferences are execute-only", flush=True)
         self._first = True
 
     def infer(self, images, ids, mask, state32, noise=None):
         ue = self.ue
         if self._first:
-            print("[eval] first inference: the encoder/prefix/denoise programs compile "
-                  "here (once). Later inferences are execute-only.", flush=True)
+            print("[eval] first inference: execute-only (all programs were compiled "
+                  "up front by precompile_all).", flush=True)
         if self.use_run_inference:
             # Single entry point, but it cannot carry the text mask (run_inference does
             # not take one and is off-limits to edit), so the prefix falls back to
