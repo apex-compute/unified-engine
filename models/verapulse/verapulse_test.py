@@ -3978,6 +3978,70 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             C_DRAM_ADDR=bias, bias_mode="broadcast_N",
             gpr_M_reg=self._ae_regs["m"] if m_reg is None else m_reg, **kw)
 
+    def _ae_scatter_lane(self, ue, src, dst_base, col_offset, cols, full_n, rows):
+        """Scatter one engine's DENSE [rows, cols] matmul lane into its own column band
+        of a shared full-width [rows, full_n] buffer.
+
+        THE WHOLE REASON THIS EXISTS. matmat_mul_core writes back with stride N*bpe for
+        the N IT WAS GIVEN, so calling it with N=cols yields a dense [rows, cols] block,
+        NOT a strided column slice of the full tensor. The consumers of q_proj (the
+        flash-Q head gather) and o_proj (the residual add) both want ONE contiguous
+        [rows, full_n] buffer, so the lane has to be re-scattered. The bands are disjoint
+        and 64-element (128 B) aligned, so no two engines ever touch the same bytes and
+        the region's rendezvous is the only fence needed -- no lock, no extra barrier.
+
+        Emitted in 64-COLUMN CHUNKS, exactly as _compile_prefix_sharded's scatter_lane:
+        _ae_strided_copy stages through SRAM 0x00000 and a 64-wide [64, 64] staging is
+        8 KB, comfortably clear of the flash window at 0x10000.
+
+        THE DEST BASE CARRIES ITS PER-COLUMN OFFSET. Dropping the +(col_offset+c0) does
+        not fault and does not NaN -- every engine would overwrite columns [0:cols] and
+        the result would be finite, plausible and wrong (pi05 denoise bug #3, and trap #8
+        on the attention un-stack right above). Both computed addresses are asserted onto
+        a 32 B AXI beat here so a mis-scaled offset cannot slip through silently."""
+        bpe = 2
+        assert cols % UE_VECTOR_SIZE == 0 and full_n % UE_VECTOR_SIZE == 0
+        assert col_offset % UE_VECTOR_SIZE == 0
+        assert rows * UE_VECTOR_SIZE * bpe * 2 <= 0x10000, "SRAM staging window shrank"
+        for c0 in range(0, cols, UE_VECTOR_SIZE):
+            src_a = src + c0 * bpe
+            dst_a = dst_base + (col_offset + c0) * bpe
+            assert src_a % mes.AXI_BEAT_BYTES == 0, \
+                f"scatter src 0x{src_a:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
+            assert dst_a % mes.AXI_BEAT_BYTES == 0, \
+                f"scatter dst 0x{dst_a:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
+            self._ae_strided_copy(ue, src_a, cols * bpe, dst_a, full_n * bpe,
+                                  rows, UE_VECTOR_SIZE)
+
+    def _ae_proj_sharded(self, sched, M, K, N, A, W, out_dram, name, join=True):
+        """One expert projection, N-split across the engines and re-gathered.
+
+        Lifted straight from _compile_prefix_sharded's q/o handling. Each engine runs
+        matmat with N=ctx.cols against the CONTIGUOUS ROW BLOCK of B that its output
+        columns need (B is [N, K] row-major, so a column shard of the output is a row
+        block of the weight -- ctx.b_addr), lands a dense [M, cols] lane, and scatters
+        that lane into its own column band of the shared full-width `out_dram`.
+
+        A is read in FULL by every engine: it is the same [M, K] activation, and a
+        K-split is NOT available (A[:, k0:k0+Kc] is strided and matmat_mul_core derives
+        A's row stride from the K it is given; user_dma_core.py:5155 has no A-stride
+        parameter). That is the same reason the prefix chose N-split for its o_proj.
+
+        ops.expert_quant is bf16 and attention_bias/mlp_bias are false, so there is no
+        scale blob and no broadcast_N bias: of the four per-column offsets that could
+        exist, only B += col_offset*K*bpe remains.
+
+        NO REDUCTION, so unlike the MLP's down-projection K-split this introduces no
+        bf16 add chain and no re-association: every output element is computed by
+        exactly one engine with the same accumulation order the primary used at ne=1."""
+        def _body(ctx):
+            raw = ctx.unsafe_ue
+            self._ae_matmul(raw, M, K, ctx.cols, A, ctx.b_addr(W, K),
+                            ctx.col_out(name), m_reg=self._ae_m_regs[ctx.engine_idx])
+            self._ae_scatter_lane(raw, ctx.col_out(name), out_dram,
+                                  ctx.col_offset, ctx.cols, N, M)
+        sched.col_sharded_region(N, _body, join=join)
+
     def _ae_gated_mlp_sharded(self, sched, M, la):
         """The expert layer's gated MLP, N-sharded (output columns) across the engines.
 
@@ -4001,16 +4065,22 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                   downstream statement (the gated residual, the next
                                   layer's norm) untouched.
 
-        q_proj / k_proj / v_proj / o_proj / action_out are deliberately NOT sharded here.
-        k/v are N=320 = 5 blocks of 64 and split_cols ASSERTS above 5 engines. q (N=960)
-        and o (N=512) have the blocks, but their consumers are the flash-Q head gather
-        and the full-width residual add, both of which read ONE contiguous [64, N]
-        buffer -- an N-shard would leave eight disjoint dense blocks and require a
-        cross-engine GATHER through exactly the strided SRAM<->DRAM marshalling that is
-        out of scope for this phase. A K-split is not available to them either: their A
-        operand is a full [64, K] buffer, and A[:, k0:k0+Kc] is strided (matmat_mul_core
-        derives A's row stride from the K it is given), unlike the down projection whose
-        A is already a per-engine dense lane. So they stay primary-only, correctly.
+        q_proj AND o_proj ARE NOW SHARDED TOO -- see _ae_proj_sharded. They used to be
+        excluded here on the grounds that their consumers (the flash-Q head gather and
+        the full-width residual add) each read ONE contiguous [64, N] buffer, so an
+        N-shard would leave eight disjoint dense blocks needing a cross-engine gather.
+        That gather turned out to be cheap and already proven: _compile_prefix_sharded
+        does exactly it for the prefix's q and o with _ae_strided_copy, one 64-column
+        chunk at a time, into disjoint 128 B-aligned column bands. o splits perfectly
+        (N=512 = 8 blocks of 64, one per engine); q is N=960 = 15 blocks, uneven at 8.
+        Neither introduces a reduction, so both stay numerically identical to ne=1.
+
+        k_proj / v_proj / action_out are STILL primary-only, and for reasons that did
+        not change: k/v are N=320 = 5 blocks of 64 and split_cols ASSERTS above 5
+        engines; action_out is N=64, a single block. A K-split is not available to any
+        of these either -- their A operand is a full [64, K] buffer and A[:, k0:k0+Kc]
+        is strided (matmat_mul_core derives A's row stride from the K it is given),
+        unlike the down projection whose A is already a per-engine dense lane.
 
         NOT BIT-IDENTICAL TO ne=1, AND THAT IS EXPECTED: reduce_add is a bf16 add chain
         on the primary, and bf16 addition is not associative. Denoise has the headroom
@@ -4335,7 +4405,18 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # geometry is not the same thing as skipping the projection.
         if self.EXPERT_BISECT and layer_idx == (self.EXPERT_LAYERS or self.E_LAYERS) - 1:
             self._probe_copy(self.AE_PRE_NORM_DRAM, self.AE_P_NORM1_DRAM, M * HP)
-        self._ae_matmul(ue, M, HP, Q, self.AE_PRE_NORM_DRAM, la["q_weight"], self.AE_Q_DRAM)
+        if sched is not None and sched.num_engines > 1:
+            # N-SPLIT + SCATTER. AE_PRE_NORM_DRAM was just written by the primary and is
+            # read in FULL by every engine; the region's OPENING rendezvous is that RAW
+            # fence. join=False: the only consumer of the full-width AE_Q_DRAM is the
+            # per-group q-head gather below, and the attention region already opens with
+            # its own barrier -- that is the fence. Two back-to-back rendezvous would
+            # cost 320 extra round trips over 32 layers x 10 Euler steps for nothing.
+            self._ae_proj_sharded(sched, M, HP, Q, self.AE_PRE_NORM_DRAM,
+                                  la["q_weight"], self.AE_Q_DRAM, "ae_q", join=False)
+        else:
+            self._ae_matmul(ue, M, HP, Q, self.AE_PRE_NORM_DRAM, la["q_weight"],
+                            self.AE_Q_DRAM)
 
         if is_self:
             self._ae_matmul(ue, M, HP, KV, self.AE_PRE_NORM_DRAM, la["k_weight"],
@@ -4529,15 +4610,23 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                       self.AE_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe,
                                       Q * bpe, M, D)
 
-        # BARRIER OUT: o_proj below is primary-only and reads AE_ATTN_RESULT at FULL
-        # width, which the groups wrote into disjoint 64-column bands.
-        if sched is not None and sched.num_engines > 1:
-            sched.barrier()
         # ---- o_proj + residual ------------------------------------------------------
         # o_weight is [512,960]: the N-pad puts zeros in out-rows 480..511, which is what
         # re-zeroes the residual stream's pad lanes after every attention write.
-        self._ae_matmul(ue, M, Q, HP, self.AE_ATTN_RESULT_DRAM, la["o_weight"],
-                        self.AE_O_PROJ_DRAM)
+        if sched is not None and sched.num_engines > 1:
+            # THE REGION'S OPENING RENDEZVOUS *IS* THE BARRIER OUT of the attention
+            # shard: every engine reads AE_ATTN_RESULT at FULL width here, and the kv
+            # groups wrote it into disjoint 64-column bands on whichever engine owned
+            # them. N=HP=512 is EXACTLY 8 blocks of 64, so at ne=8 every engine gets one
+            # block and none idles.
+            # join=True, unlike q: the very next statement is the primary's residual add
+            # reading the full-width AE_O_PROJ_DRAM, so the scatter must be fenced before
+            # it. There is no later region to borrow a barrier from.
+            self._ae_proj_sharded(sched, M, Q, HP, self.AE_ATTN_RESULT_DRAM,
+                                  la["o_weight"], self.AE_O_PROJ_DRAM, "ae_o", join=True)
+        else:
+            self._ae_matmul(ue, M, Q, HP, self.AE_ATTN_RESULT_DRAM, la["o_weight"],
+                            self.AE_O_PROJ_DRAM)
         ue.eltwise_core_dram(M=M, N=HP, dram_a=h_in, dram_b=self.AE_O_PROJ_DRAM,
                              dram_out=self.AE_RESIDUAL_DRAM, mode=UE_MODE.ELTWISE_ADD,
                              gpr_M_reg=regs["m"])
@@ -4591,11 +4680,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self._ae_tensor_init()
         self._precompute_time_embeddings()
 
-        # ---- N-axis (output-column) sharding of the gated MLP ---------------------
-        # See _ae_gated_mlp_sharded for WHY only the MLP: M is 64 here (one row block,
-        # no M-split exists) and the attention projections' consumers need one
-        # contiguous full-width buffer, which an N-shard cannot produce without a
-        # cross-engine gather through the strided marshalling this phase does not touch.
+        # ---- N-axis (output-column) sharding ---------------------------------------
+        # M is SUFFIX_LEN_PAD = 64 here -- ONE 64-row block -- so the M-split that shards
+        # vision is inexpressible and N is the only axis. Sharded now: the gated MLP
+        # (gate/up N-split, down K-split + reduce_add), the kv-group attention loop, and
+        # q_proj / o_proj (N-split + scatter, see _ae_proj_sharded). Still primary-only:
+        # k/v_proj (N=320 = 5 blocks, split_cols asserts above 5) and action_out (N=64,
+        # one block).
         ne = self._num_engines("DENOISE")
         sched = None
         if ne > 1:
@@ -4621,6 +4712,14 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             # [64, cols] block: each engine owns its own buffer and nothing is strided.
             for nm in ("ae_mlp_gate", "ae_mlp_up", "ae_mlp_mult"):
                 sched.alloc_col_output(nm, M, self.E_INTER)
+            # PROJECTION LANES. q (N=960, 15 blocks -> 2,2,2,2,2,2,2,1 at ne=8) and
+            # o (N=512, EXACTLY 8 blocks of 64). Same dense-writeback argument as the MLP
+            # lanes above; the difference is that these two are SCATTERED back into the
+            # shared full-width AE_Q_DRAM / AE_O_PROJ_DRAM afterwards, because their
+            # consumers (the flash-Q head gather, the residual add) read one contiguous
+            # buffer. Tiny: <=128 cols x 64 rows x 2 B = 16 KB (q) + 8 KB (o) per engine.
+            sched.alloc_col_output("ae_q", M, self.E_Q_OUT)
+            sched.alloc_col_output("ae_o", M, HP)
             # The K-split partials are FULL [64, 512] per engine -- a reduction does not
             # partition its output. The primary accumulates IN PLACE into the existing
             # AE_MLP_DOWN_DRAM, so every downstream statement is untouched.
@@ -4648,7 +4747,12 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             n_grp = min(ne, self.NUM_KV_HEADS)
             print(f"    [denoise] gated MLP sharded over {ne} engine(s): "
                   f"gate/up N={self.E_INTER} -> {[c for _, c in self._col_split(self.E_INTER, ne)]}"
-                  f", down K-split + reduce_add. q/k/v/o/action_out stay on the primary.")
+                  f", down K-split + reduce_add.")
+            print(f"    [denoise] q_proj N={self.E_Q_OUT} -> "
+                  f"{[c for _, c in self._col_split(self.E_Q_OUT, ne)]}, "
+                  f"o_proj N={HP} -> {[c for _, c in self._col_split(HP, ne)]}"
+                  f" (N-split + scatter, no reduction). "
+                  f"k/v (N={self.E_KV_OUT}) and action_out stay on the primary.")
             print(f"    [denoise] attention sharded over {n_grp} engine(s): "
                   f"{self.NUM_KV_HEADS} kv groups, 1 per engine"
                   + (f" ({ne - n_grp} idle in this region -- {self.NUM_KV_HEADS} groups "
