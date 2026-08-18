@@ -2373,6 +2373,23 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         m_reg = ue.alloc_isa_reg()
         ue.generate_instruction_add_set(m_reg, rows)
 
+        # FULL-S REGISTER, SEPARATE FROM THE SHARD COUNT. m_reg carries THIS ENGINE's row
+        # count and is right for the sharded matmuls -- but every primary-only op below
+        # runs at FULL S rows, and its static M= argument is OVERRIDDEN by the runtime
+        # GPR. Handing those m_reg made the primary layer-norm and attend over `rows`
+        # instead of S (128 of 1024 at ne=8): finite output, plausible magnitudes, ~23 dB
+        # of arithmetic gone, and a fake speedup because attention is quadratic in the
+        # sequence it actually runs.
+        #
+        # At ne == 1 this ALIASES m_reg rather than allocating: rows == S there, so the
+        # value is identical, and allocating a second register would shift every
+        # subsequent register index and break byte-identity of the single-engine program.
+        if ne == 1:
+            s_reg = m_reg
+        else:
+            s_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(s_reg, S)
+
         def bar():
             self._vp_barrier(ue, e, ne)
 
@@ -2435,7 +2452,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 self.layer_norm_core_dram(
                     M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
                     GAMMA_DRAM_ADDR=la["ln1_weight"], BETA_DRAM_ADDR=la["ln1_bias"],
-                    gpr_M_reg=m_reg, ZEROS_DRAM_ADDR=self.vis_zeros_addr,
+                    gpr_M_reg=s_reg, ZEROS_DRAM_ADDR=self.vis_zeros_addr,
                     INV_N_DRAM_ADDR=self.vis_inv_n_addr)
 
                 if self.VIS_BISECT and i == 0:
@@ -2477,7 +2494,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                         OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
                         SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
                         IDENTITY_DRAM_ADDR=self.identity_addr,
-                        gpr_batch_reg=m_reg, gpr_aligned_seq_len_reg=m_reg)
+                        gpr_batch_reg=s_reg, gpr_aligned_seq_len_reg=s_reg)
                     self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
                     self.sram_to_accelerator_memory(
                         0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
@@ -2496,7 +2513,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                     M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
                     OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
                     GAMMA_DRAM_ADDR=la["ln2_weight"], BETA_DRAM_ADDR=la["ln2_bias"],
-                    gpr_M_reg=m_reg, ZEROS_DRAM_ADDR=self.vis_zeros_addr,
+                    gpr_M_reg=s_reg, ZEROS_DRAM_ADDR=self.vis_zeros_addr,
                     INV_N_DRAM_ADDR=self.vis_inv_n_addr)
 
                 if self.VIS_BISECT and i == 0:
@@ -2525,7 +2542,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             self.layer_norm_core_dram(
                 M=S, N=H, A_DRAM_ADDR=final, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
                 GAMMA_DRAM_ADDR=self.vis_post_ln_weight,
-                BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=m_reg,
+                BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=s_reg,
                 ZEROS_DRAM_ADDR=self.vis_zeros_addr, INV_N_DRAM_ADDR=self.vis_inv_n_addr)
 
             # M=64 for the whole connector: nothing to shard, and its permute is a
