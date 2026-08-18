@@ -1013,10 +1013,29 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     def _store_program_section(self, name: str, dram_base: int, section_bytes: bytes,
                                extra_meta: dict, profile: bool = False) -> None:
         """Merge one section into the combined programs bin, preserving every
-        other section. Rewrites the file so offsets stay contiguous; sections are
-        ordered by dram_base (vision 0xa0 before LM 0xc0)."""
+        other section written by THIS run. Rewrites the file so offsets stay
+        contiguous; sections are ordered by dram_base (vision 0xa0 before LM 0xc0).
+
+        Fresh-compile hygiene: on a fresh run (``bin_reuse`` False) the FIRST
+        section stored to a given image path in this process starts from an EMPTY
+        image, so sections a previous run left behind are dropped — e.g. the
+        vision_worker*/prefill_worker* sections from an earlier multi-core run
+        when the current run is single-core. Without this, a fresh single-core
+        image only overwrites its own vision/lm sections and the stale worker
+        sections keep inflating the file (and the reported programs.bin size).
+        Later stores in the same run merge normally, so this run's vision + LM
+        (+ its own workers) all land. With ``--bin-reuse`` nothing is dropped:
+        cached sections are preserved and only the recompiled one is replaced.
+        """
         bin_path, meta_path = self._program_image_paths(profile)
-        sections, data = self._read_program_sections(profile)
+        started = getattr(self, "_programs_bin_started", None)
+        if started is None:
+            started = self._programs_bin_started = set()
+        if (not getattr(self, "bin_reuse", False)) and (bin_path not in started):
+            sections, data = {}, b""          # fresh run: first store starts clean
+        else:
+            sections, data = self._read_program_sections(profile)
+        started.add(bin_path)
         blobs = {k: data[s["file_offset"]: s["file_offset"] + s["size"]] for k, s in sections.items()}
         metas = {k: {kk: vv for kk, vv in s.items() if kk not in ("file_offset", "size")}
                  for k, s in sections.items()}
