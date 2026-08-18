@@ -1289,6 +1289,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     # default only because hashing a 32 MB program costs a few seconds.
     DENOISE_DIGEST = False
 
+    # Per-execution FPGA timeout. 300 s is right for a real run; drop it (--exec-timeout
+    # 30) when debugging a multi-engine hang so the engine-state dump fires in seconds
+    # instead of five minutes.
+    EXEC_TIMEOUT = 300.0
+
     # Per-stage overrides; None -> NUM_ENGINES. Set via configure_engines().
     VIS_NUM_ENGINES = None
     PREFIX_NUM_ENGINES = None
@@ -4753,7 +4758,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 sched.start_workers(self._vis_worker_prog_addrs)
 
             with PHASES.track(f"exec vision[slot{i}]", "exec"):
-                self.program_execute(prog, timeout=300.0)
+                self.program_execute(prog, timeout=self.EXEC_TIMEOUT)
 
             if multi:
                 # The primary retires its halt as soon as the last rendezvous clears; a
@@ -4777,7 +4782,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
               f"absmax={tokens.abs().max():.4f}")
         return tokens
 
-    def _execute_prefix(self, timeout=300.0):
+    def _execute_prefix(self, timeout=None):
         """EXECUTE the compiled prefix program. Mirrors _execute_denoise: the program is
         address-static, so re-execution just re-reads LM_INPUT_DRAM and PREFIX_BIAS_DRAM
         (both refreshed by run_prefix) and re-writes the KV cache in place."""
@@ -4803,7 +4808,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                     w.wait_queue(60.0)
         _original_print(f"  [prefix] executed in {PHASES.rows[-1][2]:.2f}s")
 
-    def run_prefix(self, vision_tokens, token_ids, state, text_mask=None, timeout=300.0):
+    def run_prefix(self, vision_tokens, token_ids, state, text_mask=None, timeout=None):
         """Run the 32-layer prefix over the assembled observation. Returns the final
         hidden [PM, 960]; the host needs nothing else back except probes.
 
@@ -4850,7 +4855,36 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
               f"absmax={hidden[:valid_len].abs().max():.4f} (KV cache written)")
         return hidden
 
-    def _wait_with_heartbeat(self, label, timeout=180.0, heartbeat_every=1.0):
+    def _dump_engine_state(self, label, sched=None):
+        """Print every engine's busy/flag state. Called when a stage times out.
+
+        A multi-engine hang is always a FLAG_CHECK spin (it has no timeout), and the
+        question is only WHICH engine failed to arrive. An engine that is idle while the
+        primary is busy never reached its rendezvous -- it either halted early (its
+        program has FEWER barriers than the primary's) or it was never launched. An
+        engine that is busy alongside the primary is waiting on someone else.
+        """
+        sched = sched or next(iter(self.__dict__.get("_sched_by_stage", {}).values()), None)
+        engines = list(sched.engines) if sched is not None else [self]
+        _original_print(f"  [{label}] ENGINE STATE AT TIMEOUT "
+                        f"({len(engines)} engine(s)):")
+        for i, ue in enumerate(engines):
+            try:
+                busy = ue.is_queue_busy()
+                ctrl = ue.read_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR)
+                _original_print(f"    engine {i}{' (primary)' if i == 0 else ''}: "
+                                f"busy={busy}  queue_ctrl=0x{ctrl:08X}")
+            except Exception as e:                      # a wedged engine may not answer
+                _original_print(f"    engine {i}: unreadable ({e!r})")
+        for stage, sc in self.__dict__.get("_sched_by_stage", {}).items():
+            saved = {"VIS": "_vis_worker_prog_addrs", "PREFIX": "_prefix_worker_progs",
+                     "DENOISE": "_denoise_worker_prog_addrs"}.get(stage)
+            addrs = self.__dict__.get(saved) if saved else None
+            _original_print(f"    {stage}: {len(sc.workers)} worker(s), saved "
+                            f"{saved}=" + (", ".join(f"0x{a:X}" for a in addrs)
+                                           if addrs else "None"))
+
+    def _wait_with_heartbeat(self, label, timeout=None, heartbeat_every=1.0):
         """wait_queue wrapper with a liveness heartbeat and a REAL timeout check.
 
         Ported from pi05_libero_test.py. Two reasons it exists, both learned the hard way
@@ -4870,6 +4904,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
         Prints via _original_print so the heartbeat survives silenced()."""
         import threading
+        timeout = self.EXEC_TIMEOUT if timeout is None else timeout
         t0 = time.perf_counter()
         stop = threading.Event()
 
@@ -4887,6 +4922,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             th.join(timeout=1.0)
         if self.is_queue_busy():
             _original_print()
+            # A multi-engine hang is a FLAG_CHECK spin. Dump who arrived and who did not
+            # BEFORE raising, or the traceback says only "it hung" and the next run has
+            # to reproduce it to learn anything.
+            try:
+                self._dump_engine_state(label)
+            except Exception as _e:
+                _original_print(f"  [{label}] engine dump failed: {_e!r}")
             raise RuntimeError(
                 f"[{label}] FPGA queue STILL BUSY after {timeout:.0f}s -- a real hang, "
                 f"not a silent success. wait_queue() does not raise on its own; this "
@@ -4927,7 +4969,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                         f"@0x{addr:X}" + " " * 16)
         return addr
 
-    def _execute_denoise(self, timeout=300.0):
+    def _execute_denoise(self, timeout=None):
         """EXECUTE the compiled denoise program. Re-execution is deterministic: the
         prefix K/V it cross-attends into sits at fixed LAYER0_K/V_DRAM (refreshed by the
         prefix stage), the timestep pointer is re-seeded inside the captured program so
@@ -4955,7 +4997,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                     w.wait_queue(60.0)
         _original_print(f"  [denoise] executed in {PHASES.rows[-1][2]:.2f}s")
 
-    def run_denoise(self, noise=None, timeout=300.0):
+    def run_denoise(self, noise=None, timeout=None):
         """Run the 10-step Euler loop on hardware. Returns actions [chunk, action_dim]
         (normalized -- the caller denormalizes with norm_stats).
 
@@ -6690,6 +6732,11 @@ def main():
                          "redundant at 5 blocks). Shorthand for --prefix-engines 8.")
     ap.add_argument("--prefix-engines", type=int, default=None,
                     help="engines for the PREFIX stage only")
+    ap.add_argument("--exec-timeout", type=float, default=None,
+                    help="per-execution FPGA timeout in seconds (default 300). Use a "
+                         "small value when debugging a multi-engine hang: the timeout "
+                         "path dumps every engine's busy/flag state, which a Ctrl-C "
+                         "does not.")
     ap.add_argument("--denoise-digest", action="store_true",
                     help="SHA-256 the compiled denoise instruction stream and print it. "
                          "Run it at --engines 1 before and after a sharding change: the "
@@ -7138,6 +7185,8 @@ def main():
                       prefix=8 if args.pref_8 else args.prefix_engines,
                       denoise=8 if getattr(args, "dns_8", False) else None)
     ue.DENOISE_DIGEST = args.denoise_digest
+    if args.exec_timeout:
+        ue.EXEC_TIMEOUT = float(args.exec_timeout)
     if args.dump_bins and max(ue._num_engines(s_)
                               for s_ in ("VIS", "PREFIX", "DENOISE")) > 1:
         # A bin carries ONE program stream and one params blob. A sharded run also has
