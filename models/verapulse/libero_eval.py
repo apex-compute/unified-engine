@@ -245,7 +245,7 @@ class _FpgaBackend:
     in the module docstring)."""
 
     def __init__(self, weights="real", seed=0, use_run_inference=False, snr=False,
-                 strict_gates=False, fused_silu=True):
+                 strict_gates=False, fused_silu=True, engines=1, vis_engines=None):
         import verapulse_test as M
         self.M = M
         self.use_run_inference = use_run_inference
@@ -258,6 +258,12 @@ class _FpgaBackend:
         # of noise to 0x80000000 == this model's params base, so a second one built later
         # would destroy the weights loaded below.
         self.ue = M.VeraPulse_UnifiedEngine()
+        # Engine counts BEFORE weight_init: weight_init's first act is to build the
+        # worker pool from them, and no UnifiedEngine may be constructed after the
+        # weights are in DRAM (its ctor DMA-writes 16 KB of noise at a hardcoded
+        # address). These are class attributes, so without this call every episode would
+        # silently run single-engine no matter what the CLI said.
+        M.configure_engines(self.ue, engines, vis=vis_engines, tag="eval")
         self.ue.PREFIX_FUSED_SILU = fused_silu
         self.ue.weight_init(dummy=(weights == "dummy"), seed=seed)
         self.ue.tensor_init()
@@ -664,6 +670,13 @@ def main():
                          "inference. Each gate runs the 2.23 GB torch oracle on CPU -- "
                          "minutes per step. For debugging one inference, not for a rollout.")
     ap.add_argument("--strict-gates", action="store_true")
+    ap.add_argument("--engines", default="1", metavar="N|max",
+                    help="--backend fpga only: shard every stage across N engines (or "
+                         "'max' for each stage's own ceiling). 1 = the historical "
+                         "single-engine programs, byte-for-byte.")
+    ap.add_argument("--vis-8", dest="vis_8", action="store_true",
+                    help="--backend fpga only: pin the vision encoder to 8 engines "
+                         "regardless of --engines.")
     ap.add_argument("--no-fused-silu", dest="fused_silu", action="store_false",
                     help="prefix MLP: composed silu instead of the fused LALU path")
     ap.add_argument("--image-norm", default="pm1", choices=["pm1", "unit"],
@@ -775,7 +788,9 @@ def main():
             backend = _FpgaBackend(weights=args.weights, seed=args.seed,
                                    use_run_inference=args.use_run_inference,
                                    snr=args.snr, strict_gates=args.strict_gates,
-                                   fused_silu=args.fused_silu)
+                                   fused_silu=args.fused_silu,
+                                   engines=args.engines,
+                                   vis_engines=8 if args.vis_8 else None)
     print("[eval] backend ready.", flush=True)
 
     total_ep = sum(1 for _ in episodes)

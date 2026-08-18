@@ -179,6 +179,7 @@ class Phases:
 
 PHASES = Phases()
 
+import user_dma_core  # noqa: E402  (module handle: DRAM_START_ADDR / UE_0_BASE_ADDR)
 from user_dma_core import (  # noqa: E402  (off-limits to edit)
     DMA_DEVICE_C2H, DMA_DEVICE_H2C, UE_MODE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS, UnifiedEngine,
@@ -1257,6 +1258,47 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     # Cost of unrolling: ~3.1 MB -> ~31 MB of program, against a 2.85 GB arena. Cheap.
     DENOISE_ROLLED = False
 
+    # ==================================================================================
+    # MULTI-ENGINE SHARDING KNOBS  (shared scaffolding -- vision/prefix/denoise)
+    # ==================================================================================
+    # NUM_ENGINES is the run-wide default; each stage may override it. A stage at 1 is
+    # BYTE-IDENTICAL to the historical single-engine program: _vp_barrier returns before
+    # emitting anything, split_rows returns [(0, M)], and no worker engine is built.
+    NUM_ENGINES = 1
+
+    # Per-stage ceilings, and WHY each one:
+    #   VIS      8 -- S=1024 patches = 16 blocks of 64, so a PURE ROW split is even at
+    #                 8 (128 rows each). No K-lane grid is needed here (pi05 needed one
+    #                 only because its VIS_S=256 is 4 blocks and capped rows at 4).
+    #   PREFIX   8 -- PM=192 = 3 blocks of 64: a row split caps at 3. Left at 8 because
+    #                 the PREFIX owner may shard some other axis; _num_engines only
+    #                 reports the request, the stage decides what it can honour.
+    #   DENOISE  8 -- suffix is 64 rows = ONE block, so denoise cannot row-split at all;
+    #                 its owner shards columns/heads.
+    STAGE_MAX_ENGINES = {"VIS": 8, "PREFIX": 8, "DENOISE": 8}
+
+    # Per-stage overrides; None -> NUM_ENGINES. Set via configure_engines().
+    VIS_NUM_ENGINES = None
+    PREFIX_NUM_ENGINES = None
+    DENOISE_NUM_ENGINES = None
+
+    # ---- worker DRAM arenas ----------------------------------------------------------
+    # WHERE THE ARENAS LIVE, AND WHY NOT IN THE TENSOR REGION (pi05 carves them out of
+    # the model's tensor allocator; that is impossible here). This model's tensor region
+    # is 0x48000000..0x56000000 = 224 MB and tensor_init already asserts against it, with
+    # ~70 MB of peak activations inside it. Seven worker arenas of any usable size do not
+    # fit. The PROGRAM region, by contrast, is 0x56000000..0x100000000 = 2.85 GB and the
+    # three primary programs together are tens of MB. So the arenas are carved off the
+    # TOP of the program region instead: base 0xC0000000, 128 MB apart, 7 of them ending
+    # at 0xF8000000 -- below the 4 GB boundary (dma_write at/above it fails with
+    # [Errno 512]) and above every primary program. _assert_worker_programs_fit checks
+    # the far end; _assert_arenas_clear_primary checks the near end.
+    VIS_WORKER_ARENA_BASE    = 0xC0000000
+    VIS_WORKER_ARENA_BYTES   = 0x08000000        # 128 MB per worker
+    VIS_WORKER_TENSOR_OFFSET = 0x00400000        #   4 MB params window
+    VIS_WORKER_PROGRAM_OFFSET = 0x00800000       #   8 MB before the program space
+    VIS_WORKER_ARENA_TOP     = 0xF8000000        # hard ceiling for base + n*stride
+
     OPS = _cfg["ops"]
     VEC = 64                                              # 64-ALU floor / 128B row
 
@@ -1375,6 +1417,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         dma_read only round-trips bits losslessly for bf16/int32, so any other dtype
         corrupts more than it repairs."""
         assert_bf16_only(self._cfg)     # 16-bit multipliers: no quantized path exists
+        # EVERY worker engine is constructed HERE, before the first store_weight, for
+        # the reason the docstring's ORDERING HAZARD paragraph gives. This is the actual
+        # fix; _vp_dram_selftest_guard is only belt and braces. It is a no-op at
+        # NUM_ENGINES == 1 (no engine is built at all).
+        self._worker_engine_pool()
         self._dummy_weights = bool(dummy)
         if dummy:
             sd = fake_state_dict(self._cfg, seed=seed)
@@ -1940,6 +1987,223 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self._prefix_valid_len = valid
         return self.PREFIX_BIAS_DRAM
 
+    # ==================================================================================
+    # multi-engine scaffolding: engine counts, barrier, worker pool, schedulers
+    # ==================================================================================
+
+    def _num_engines(self, stage="VIS"):
+        """Resolve one stage's engine count. A per-stage override wins over NUM_ENGINES,
+        and the stage ceiling is enforced here so no caller can request more than the
+        stage's shape supports."""
+        override = getattr(self, f"{stage}_NUM_ENGINES", None)
+        n = int(override if override is not None else self.NUM_ENGINES)
+        cap = self.STAGE_MAX_ENGINES.get(stage, n)
+        assert n >= 1, f"{stage}_NUM_ENGINES={n} must be >= 1"
+        return min(n, cap)
+
+    def _peak_engines(self):
+        """The largest count any stage asks for. The worker pool is sized from THIS, once
+        for the whole run: a stage raising its count after the pool exists is not
+        supported (the pool's allocators are what keep each stage's worker programs from
+        landing on top of the previous stage's)."""
+        return max([int(self.NUM_ENGINES)]
+                   + [self._num_engines(s) for s in ("VIS", "PREFIX", "DENOISE")])
+
+    def _vp_barrier(self, ue, engine_idx, ne, margin_nops=32):
+        """Emit ONE engine's slice of a symmetric all-engine rendezvous.
+
+        SET / CHECK(every peer) / margin NOPs / CLEAR -- the shape proven to RE-ARM by
+        user_hw_test.flag_rendezvous_repeat_test. It is emitted per STREAM, not through
+        MultiEngineScheduler.barrier(), because a stage body is emitted one complete
+        engine stream at a time (each engine's program is independent; only the
+        per-stream order matters).
+
+        AT ne == 1 THIS EMITS NOTHING AT ALL. That is the contract that makes the
+        single-engine program byte-identical to the historical one; do not "simplify" it
+        into an unconditional emit guarded downstream."""
+        if ne == 1:
+            return
+        ue.generate_instruction_flag_set()
+        for j in range(ne):
+            if j != engine_idx:
+                ue.generate_instruction_flag_check(target_engine_idx=j)
+        for _ in range(margin_nops):
+            ue.generate_instruction_nop()
+        ue.generate_instruction_flag_clear()
+
+    @contextlib.contextmanager
+    def _vp_dram_selftest_guard(self, ne):
+        """Protect the 16 KB at DRAM_START_ADDR from UnifiedEngine.__init__.
+
+        Constructing ANY UnifiedEngine runs init_unified_engine(), whose DRAM read/write
+        self-test dma_writes 8192 uint16 to the HARDCODED DRAM_START_ADDR (0x80000000).
+        It ignores params_dram_base entirely, so every engine ever built stomps the same
+        window. user_dma_core.py is off-limits, so: snapshot, build, restore.
+
+        Belt and braces only -- the pool is built BEFORE weight_init (see weight_init),
+        which is the actual fix. The read is allowed to fail: this model's allocators are
+        raw file offsets starting at 0, so 0x80000000 can be an address nothing has ever
+        written, and reading one returns EIO rather than zeros. A failed snapshot means
+        there was nothing there to preserve."""
+        n_bytes = 8192 * 2
+        if ne <= 1:
+            yield                      # no engine is constructed: nothing to guard
+            return
+        base = user_dma_core.DRAM_START_ADDR
+        buf = bytearray(n_bytes)
+        ok = True
+        try:
+            if self.dma_read(DMA_DEVICE_C2H, base, buf, n_bytes) != n_bytes:
+                ok = False
+        except OSError:
+            ok = False
+        try:
+            yield
+        finally:
+            if ok:
+                # Write the raw bytearray back DIRECTLY -- never via
+                # torch.frombuffer(bytes(buf)), which aliases a read-only temporary and
+                # has smashed the CPython heap into a much later segfault.
+                self.dma_write(DMA_DEVICE_H2C, base, bytes(buf), n_bytes)
+
+    def _assert_arenas_clear_primary(self, n):
+        """The arenas sit ABOVE the primary's programs in one flat address space; the
+        program allocator is an unchecked bump allocator, so nothing but this assert
+        stands between a large primary program and the workers' code."""
+        top = self.VIS_WORKER_ARENA_BASE + max(0, n - 1) * self.VIS_WORKER_ARENA_BYTES
+        assert top <= self.VIS_WORKER_ARENA_TOP, (
+            f"{n - 1} worker arena(s) of {self.VIS_WORKER_ARENA_BYTES >> 20} MB from "
+            f"0x{self.VIS_WORKER_ARENA_BASE:X} end at 0x{top:X}, past the "
+            f"0x{self.VIS_WORKER_ARENA_TOP:X} ceiling")
+        cur = self.get_program_dram_addr()
+        assert cur < self.VIS_WORKER_ARENA_BASE, (
+            f"the primary's program allocator has reached 0x{cur:X}, at/above the worker "
+            f"arena base 0x{self.VIS_WORKER_ARENA_BASE:X} -- primary programs and worker "
+            f"programs would overwrite each other. Raise VIS_WORKER_ARENA_BASE.")
+
+    def _worker_engine_pool(self, n=None):
+        """The run's ONE set of worker UnifiedEngines, indices 1..peak-1.
+
+        Built once, for the PEAK stage count, and handed to EVERY stage scheduler. The
+        DRAM allocators live inside these objects, so sharing them is what keeps each
+        stage's worker programs landing AFTER the previous stage's rather than on top of
+        it (two schedulers over FRESH engines restart the allocator at offset 0, stage 1
+        then launches stage 2's code, the barrier desyncs, and the engines spin forever
+        on a FLAG_CHECK that has no timeout).
+
+        CALL THIS BEFORE weight_init -- see _vp_dram_selftest_guard."""
+        from user_dma_core import UnifiedEngine
+
+        n = self._peak_engines() if n is None else int(n)
+        pool = getattr(self, "_worker_pool", None)
+        if pool is not None:
+            assert len(pool) >= n - 1, (
+                f"worker pool holds {len(pool)} engine(s) but {n - 1} are needed; the "
+                f"pool is sized from the peak stage count at first use, so a stage "
+                f"raising its count afterwards is not supported.")
+            return pool
+        peak = max(n, self._peak_engines())
+        if peak <= 1:
+            self._worker_pool = []
+            return self._worker_pool
+        self._assert_arenas_clear_primary(peak)
+        pool = []
+        with self._vp_dram_selftest_guard(peak):
+            for i in range(1, peak):
+                base = self.VIS_WORKER_ARENA_BASE + (i - 1) * self.VIS_WORKER_ARENA_BYTES
+                pool.append(UnifiedEngine(
+                    BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * 0x00010000,
+                    params_dram_base=base,
+                    tensor_dram_base=base + self.VIS_WORKER_TENSOR_OFFSET,
+                    program_dram_base=base + self.VIS_WORKER_PROGRAM_OFFSET,
+                ))
+        self._worker_pool = pool
+        _original_print(f"    [engines] worker pool: {len(pool)} shared engine(s) "
+                        f"@0x{self.VIS_WORKER_ARENA_BASE:X} +"
+                        f"{self.VIS_WORKER_ARENA_BYTES >> 20}MB each "
+                        f"(one allocator each, reused by every stage)")
+        return pool
+
+    def _make_stage_scheduler(self, stage, ne=None):
+        """Cached MultiEngineScheduler for one stage, over the SHARED worker pool.
+
+        A scheduler is built at ne == 1 too, and that is required rather than incidental:
+        compile_encoder calls sched.split_rows(S) unconditionally and the emitter is
+        written so a 1-engine split is (0, S) -- the historical single-engine stream. A
+        1-engine scheduler owns no workers and emits no barriers, so it costs nothing."""
+        from multi_engine_shard import MultiEngineScheduler
+
+        ne = self._num_engines(stage) if ne is None else int(ne)
+        cache = self.__dict__.setdefault("_sched_by_stage", {})
+        key = (stage, ne)
+        if key in cache:
+            return cache[key]
+        sched = MultiEngineScheduler(
+            self, num_engines=ne,
+            worker_dram_base=self.VIS_WORKER_ARENA_BASE,
+            worker_dram_stride=self.VIS_WORKER_ARENA_BYTES,
+            worker_tensor_offset=self.VIS_WORKER_TENSOR_OFFSET,
+            worker_program_offset=self.VIS_WORKER_PROGRAM_OFFSET,
+            # "blocks": split by whole 64-row blocks so every shard stays 64-aligned
+            # whatever M is. For the vision stage (S=1024 = 16 blocks) blocks and even
+            # agree exactly at 1/2/4/8 engines; for the prefix (PM=192 = 3 blocks) only
+            # "blocks" is workable at all.
+            split_mode="blocks",
+            # This board has more than the 2 engines multi_engine_shard's default guard
+            # assumes. That guard is stale -- 8 engines are production-proven -- and the
+            # opt-in is explicit at the CLI (--engines/--vis_8 both name a count).
+            allow_more_than_two_engines=True,
+            workers=self._worker_engine_pool(ne))
+        cache[key] = sched
+        return sched
+
+    def _assert_worker_programs_fit(self):
+        """Every sharded stage's worker programs share ONE allocator per worker engine.
+        Overflowing an arena marches that allocator into the NEXT worker's arena --
+        silent corruption, not a hang. Call after every finalize()."""
+        limit = self.VIS_WORKER_ARENA_BYTES - self.VIS_WORKER_PROGRAM_OFFSET
+        for sched in self.__dict__.get("_sched_by_stage", {}).values():
+            for i, w in enumerate(sched.workers):
+                base = (self.VIS_WORKER_ARENA_BASE + i * self.VIS_WORKER_ARENA_BYTES
+                        + self.VIS_WORKER_PROGRAM_OFFSET)
+                used = w.get_program_dram_addr() - base
+                assert 0 <= used <= limit, (
+                    f"worker {i + 1} program arena overflow: {used} B used of {limit} B "
+                    f"(VIS_WORKER_ARENA_BYTES=0x{self.VIS_WORKER_ARENA_BYTES:X}). "
+                    f"Grow the arena or shard fewer stages.")
+
+    def _vis_register_per_engine(self, sched):
+        """Duplicate every vision buffer a kernel WRITES as scratch.
+
+        Registration is once per scheduler (guarded below). Even where the op that
+        dirties a buffer currently runs primary-only, the copies are registered here so
+        the buffer is never silently shared the moment that op is sharded:
+          vis_zeros   layer_norm_core_dram WRITES it. Sharing it across engines is
+                      silent corruption, and it needs refresh_per_engine before EVERY
+                      execution (see run_vision), not just the first.
+          flash q/k/v/out, attn_scratch  per-head marshalling + unified_attention.
+                      attn_scratch keeps its FULL size: the core derives its sub-offsets
+                      from the compile-time S/D, which do not shrink with a row shard.
+        """
+        if getattr(self, "_vis_per_engine_done", None) is sched:
+            return sched
+        V = self._cfg["vision"]
+        S, H, D, bpe = V["num_patches"], V["hidden_size"], V["head_dim"], 2
+        sched.register_per_engine("vis_zeros", self.vis_zeros_addr, H * bpe,
+                                  init_tensor=torch.zeros(H, dtype=torch.bfloat16))
+        zeros_d = torch.zeros(S * D, dtype=torch.bfloat16)
+        for name, addr in (("flash_q", self.VIS_FLASH_Q_DRAM),
+                           ("flash_k", self.VIS_FLASH_K_DRAM),
+                           ("flash_v", self.VIS_FLASH_V_DRAM),
+                           ("flash_out", self.VIS_FLASH_OUT_DRAM)):
+            sched.register_per_engine(name, addr, S * D * bpe, init_tensor=zeros_d)
+        scratch_n = (D + S) * S + S * D
+        sched.register_per_engine(
+            "attn_scratch", self.VIS_ATTN_SCRATCH_DRAM, scratch_n * bpe,
+            init_tensor=torch.zeros(scratch_n, dtype=torch.bfloat16))
+        self._vis_per_engine_done = sched
+        return sched
+
     def compile_encoder(self):
         """One SigLIP pass over [1024,768] + the connector, compiled ONCE and executed
         once per camera slot (the program is the expensive artifact). Returns its DRAM
@@ -1950,31 +2214,115 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         fc2(+bias) -> residual. Then post_ln -> pixel shuffle -> connector projection.
 
         All matmuls are bf16 B-operand (no is_B_quantized/data_type/SCALE_DRAM_ADDR) and
-        PBI (gpr_M_reg=vis_S_reg), so the captured program is structure-bound, not
-        M-bound. Flash stays static -- PBI flash address injection corrupts on the second
-        execution, and this program runs twice, once per slot.
+        PBI (gpr_M_reg), so the captured program is structure-bound, not M-bound. Flash
+        stays static -- PBI flash address injection corrupts on the second execution, and
+        this program runs twice, once per slot.
 
         Both slots are always encoded; no zero-slot skipping.
 
-        NEXT STEP (not done here): pi05's _emit_encoder_body(ue, engine_idx, sched,
-        row_offset, rows, kgrp, nk) shards this over engines by row and by a K-axis grid.
-        This is the single-engine form; shard it once it passes >=40 dB."""
+        SHARDING (--engines N / --vis_8). PURE ROW SPLIT over the M axis: S=1024 patches
+        is 16 blocks of 64, so 2/4/8 engines all divide evenly (512/256/128 rows each)
+        and no K-lane grid is needed -- pi05 needed one only because its VIS_S=256 caps a
+        row split at 4 engines. THE PROJECTION MATMULS ARE THE ONLY SHARDED OPS in this
+        phase: patch-embed, q/k/v, o_proj, fc1, fc2. Everything else -- the layer norms,
+        the per-head flash marshalling and attention, the eltwise residuals, the pos
+        embed add, post_ln and the whole connector -- still runs on the PRIMARY ONLY, at
+        full S rows, exactly as it did single-engine. Redundant execution on every engine
+        was the alternative and is rejected: those ops write SHARED addresses
+        (VIS_LN_OUT_DRAM, the flash staging buffers), so N engines writing them
+        concurrently is a race, not a duplicate.
+
+        The two are stitched together by _vp_barrier: a rendezvous CLOSES each sharded
+        region (so the primary sees every worker's rows before it reads them) and OPENS
+        the next one (so no worker reads a primary-written buffer early). At ne == 1
+        every barrier and every row offset is zero and the emitted stream is
+        byte-identical to the historical single-engine program.
+        """
+        V = self._cfg["vision"]
+        S = V["num_patches"]
+
+        ne = self._num_engines("VIS")
+        sched = self._make_stage_scheduler("VIS", ne)
+        self._vis_sched = sched
+        self._vis_register_per_engine(sched)
+        splits = sched.split_rows(S)
+        if ne > 1:
+            print(f"    [vis] row shard: {ne} engines x {[c for _, c in splits]} rows "
+                  f"of {S} (projection matmuls only; norms/attention/eltwise stay on the "
+                  f"primary)")
+
+        self.start_capture()
+        sched.begin_program()
+        for e, ue in enumerate(sched.engines):
+            row_offset, rows = splits[e]
+            self._emit_encoder_body(ue, e, sched, row_offset, rows, ne)
+
+        self.generate_instruction_halt()
+        # KEEP the returned addresses: another stage compiling on ANOTHER scheduler over
+        # the same worker pool overwrites that scheduler's _worker_prog_addrs, so a bare
+        # start_workers() in run_vision could relaunch the wrong program.
+        self._vis_worker_prog_addrs = sched.finalize()   # halts + flushes every worker
+        self._assert_worker_programs_fit()
+        self.stop_capture()
+
+        raw = bytearray()
+        for inst in self.capture_buffer:
+            raw.extend(inst.get_bytes())
+        addr = self.get_program_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, addr, raw, len(raw))
+        self.allocate_program_dram(len(raw))
+        self.clear_capture_buffer()
+        self._vis_program_addr = addr
+        print(f"    vision encoder + connector: {len(raw)} bytes @0x{addr:X}")
+        if ne > 1:
+            print(f"    vision workers: {sched.worker_program_bytes()} bytes total "
+                  f"across {len(sched.workers)} engine(s)")
+        return addr
+
+    def _emit_encoder_body(self, ue, e, sched, row_offset, rows, ne):
+        """Emit ONE engine's complete encoder stream.
+
+        `ue` is engine `e`; at e == 0 it IS `self`, the primary. `row_offset`/`rows` are
+        this engine's slice of the S patch rows -- (0, S) when ne == 1.
+
+        ROW OFFSETS ARE COMPILE-TIME, one per pitch: a [S,H] buffer advances
+        row_offset*H*bpe per shard and a [S,I] buffer row_offset*I*bpe. Getting one wrong
+        on a scatter is the finite-but-scrambled failure class (pi05 denoise), never a
+        NaN, so both are asserted against the 64-row / 32-byte-beat contract here rather
+        than trusted at the call sites.
+        """
         V, C = self._cfg["vision"], self._cfg["connector"]
         S, H, I = V["num_patches"], V["hidden_size"], V["intermediate_size"]
         D, NH = V["head_dim"], V["num_heads"]
-        P, CH, NPS = V["patch_size"], V["num_channels"], V["num_patches_per_side"]
+        P, CH = V["patch_size"], V["num_channels"]
         bpe = 2
+        primary = (e == 0)
 
-        self.start_capture()
-        vis_S_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(vis_S_reg, S)
+        assert rows % 64 == 0, (
+            f"engine {e} got {rows} rows, not a whole number of 64-row blocks -- every "
+            f"kernel here assumes 64-aligned row blocks")
+        RH = row_offset * H * bpe            # [S,H] pitch: hidden-width buffers
+        RI = row_offset * I * bpe            # [S,I] pitch: the MLP intermediate
+        RP = row_offset * (CH * P * P) * bpe  # [S, C*P*P] pitch: the staged pixels
+        for name, off in (("RH", RH), ("RI", RI), ("RP", RP)):
+            assert off % 32 == 0, (
+                f"engine {e} {name}={off} B is not 32 B AXI-beat aligned")
 
-        def vis_matmul(M, K, N, A, la, proj, OUT, bias=None, **kw):
-            # bf16 B operand: no is_B_quantized / data_type / SCALE_DRAM_ADDR.
-            self.matmat_mul_core(
-                M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f"{proj}_weight"],
-                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                gpr_M_reg=vis_S_reg, **kw)
+        m_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(m_reg, rows)
+
+        def bar():
+            self._vp_barrier(ue, e, ne)
+
+        def shard_mm(K, N, A, a_pitch, B, OUT, o_pitch, bias=None, **kw):
+            """One row-sharded matmul: M = this engine's row count, A and OUT advanced by
+            this engine's row offset at their OWN pitches, B/bias untouched (a row shard
+            leaves the weight and the broadcast_N bias whole)."""
+            ue.matmat_mul_core(
+                M=rows, K=K, N=N,
+                A_DRAM_ADDR=A + row_offset * a_pitch, B_DRAM_ADDR=B,
+                OUTPUT_DRAM_ADDR=OUT + row_offset * o_pitch,
+                C_DRAM_ADDR=bias, bias_mode="broadcast_N", gpr_M_reg=m_reg, **kw)
 
         # PATCHIFY IS DONE ON THE HOST -- see run_vision. It used to be a device
         # smart_bf16_permute_core(dims=[CH,NPS,P,NPS,P], perm=[1,3,0,2,4]), which is
@@ -1998,115 +2346,131 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # The host does it instead, exactly as pi05 does. Same DMA volume either way
         # (1.5 MB per slot), and _host_patchify is verified bit-exact against
         # conv2d unfold.
-        self.matmat_mul_core(
-            M=S, K=CH * P * P, N=H, A_DRAM_ADDR=self.VIS_PIXEL_IN_DRAM,
-            B_DRAM_ADDR=self.patch_weight_addr, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-            C_DRAM_ADDR=self.patch_bias_addr, bias_mode="broadcast_N",
-            gpr_M_reg=vis_S_reg)
-        if self.VIS_BISECT:
-            self._probe_copy(self.VIS_LN_OUT_DRAM, self.VIS_P_PATCH_DRAM, S * H)
-        eltwise_add_core_dram(
-            self, size=S * H, A_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-            B_DRAM_ADDR=self.pos_embed_addr, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM)
+        bar()
+        shard_mm(CH * P * P, H, self.VIS_PIXEL_IN_DRAM, CH * P * P * bpe,
+                 self.patch_weight_addr, self.VIS_LN_OUT_DRAM, H * bpe,
+                 bias=self.patch_bias_addr)
+        bar()
+        if primary:
+            if self.VIS_BISECT:
+                self._probe_copy(self.VIS_LN_OUT_DRAM, self.VIS_P_PATCH_DRAM, S * H)
+            # vis_pos_embed is SHARED_ROWS -- one full [S,H] table. This add stays on the
+            # primary at full S rows, so it needs no row offset; sharding it later means
+            # adding + RH to A, B *and* OUT together, not to some of them.
+            eltwise_add_core_dram(
+                self, size=S * H, A_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
+                B_DRAM_ADDR=self.pos_embed_addr, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM)
 
         n_vis = len(self.vis_layer_addrs) if self.VIS_LAYERS is None else int(self.VIS_LAYERS)
         assert 1 <= n_vis <= len(self.vis_layer_addrs), f"VIS_LAYERS={self.VIS_LAYERS}"
-        if n_vis != len(self.vis_layer_addrs):
+        if primary and n_vis != len(self.vis_layer_addrs):
             print(f"    [bisect] compiling only {n_vis}/{len(self.vis_layer_addrs)} ViT layers")
         for i, la in enumerate(self.vis_layer_addrs[:n_vis]):
             h_in = self.VIS_IO_A_DRAM if i % 2 == 0 else self.VIS_IO_B_DRAM
             h_out = self.VIS_IO_B_DRAM if i % 2 == 0 else self.VIS_IO_A_DRAM
 
-            self.layer_norm_core_dram(
-                M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["ln1_weight"], BETA_DRAM_ADDR=la["ln1_bias"],
-                gpr_M_reg=vis_S_reg, ZEROS_DRAM_ADDR=self.vis_zeros_addr,
-                INV_N_DRAM_ADDR=self.vis_inv_n_addr)
+            if primary:
+                self.layer_norm_core_dram(
+                    M=S, N=H, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
+                    GAMMA_DRAM_ADDR=la["ln1_weight"], BETA_DRAM_ADDR=la["ln1_bias"],
+                    gpr_M_reg=m_reg, ZEROS_DRAM_ADDR=self.vis_zeros_addr,
+                    INV_N_DRAM_ADDR=self.vis_inv_n_addr)
 
-            if self.VIS_BISECT and i == 0:
-                self._probe_copy(self.VIS_LN_OUT_DRAM, self.VIS_P_LN1_DRAM, S * H)
+                if self.VIS_BISECT and i == 0:
+                    self._probe_copy(self.VIS_LN_OUT_DRAM, self.VIS_P_LN1_DRAM, S * H)
+            bar()
             for proj, dst in (("q", self.VIS_Q_DRAM), ("k", self.VIS_K_DRAM),
                               ("v", self.VIS_V_DRAM)):
-                vis_matmul(S, H, H, self.VIS_LN_OUT_DRAM, la, proj, dst,
-                           bias=la[f"{proj}_bias"])
+                shard_mm(H, H, self.VIS_LN_OUT_DRAM, H * bpe, la[f"{proj}_weight"],
+                         dst, H * bpe, bias=la[f"{proj}_bias"])
+            bar()
 
             # MHA, one head at a time: gather this head's [S,64] column block into the
             # fixed flash operands, run static flash, scatter back. The scatter DEST
             # carries + h*D*bpe -- omitting that per-head offset is the finite-but-
             # scrambled bug class (pi05 denoise #3), not a NaN.
-            elems, col_stride, row_jump = S * D, D * bpe, H * bpe
-            for h in range(NH):
-                col = h * col_stride
-                for src, dst in ((self.VIS_Q_DRAM + col, self.VIS_FLASH_Q_DRAM),
-                                 (self.VIS_K_DRAM + col, self.VIS_FLASH_K_DRAM),
-                                 (self.VIS_V_DRAM + col, self.VIS_FLASH_V_DRAM)):
-                    self.accelerator_memory_to_sram(
-                        src, 0x00000, elems, stride_bytes_per_chunk=col_stride,
-                        stride_jump_bytes=row_jump)
-                    self.sram_to_accelerator_memory(0x00000, dst, elems)
-                self.unified_attention_core(
-                    batch=S, aligned_seq_len=S, head_dim=D,
-                    Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.VIS_FLASH_V_DRAM,
-                    BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM,
-                    OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
-                    SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.identity_addr,
-                    gpr_batch_reg=vis_S_reg, gpr_aligned_seq_len_reg=vis_S_reg)
-                self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
-                self.sram_to_accelerator_memory(
-                    0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
-                    stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+            #
+            # PRIMARY ONLY, at full S rows: attention is not row-independent (every query
+            # row reads every key row), and the flash staging buffers are single fixed
+            # addresses. Sharding it means head-splitting, which is a later phase -- the
+            # per-engine flash_q/k/v/out and attn_scratch copies are already registered
+            # for it (_vis_register_per_engine).
+            if primary:
+                elems, col_stride, row_jump = S * D, D * bpe, H * bpe
+                for h in range(NH):
+                    col = h * col_stride
+                    for src, dst in ((self.VIS_Q_DRAM + col, self.VIS_FLASH_Q_DRAM),
+                                     (self.VIS_K_DRAM + col, self.VIS_FLASH_K_DRAM),
+                                     (self.VIS_V_DRAM + col, self.VIS_FLASH_V_DRAM)):
+                        self.accelerator_memory_to_sram(
+                            src, 0x00000, elems, stride_bytes_per_chunk=col_stride,
+                            stride_jump_bytes=row_jump)
+                        self.sram_to_accelerator_memory(0x00000, dst, elems)
+                    self.unified_attention_core(
+                        batch=S, aligned_seq_len=S, head_dim=D,
+                        Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM,
+                        K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
+                        V_DRAM_ADDR=self.VIS_FLASH_V_DRAM,
+                        BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM,
+                        OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
+                        SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.identity_addr,
+                        gpr_batch_reg=m_reg, gpr_aligned_seq_len_reg=m_reg)
+                    self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
+                    self.sram_to_accelerator_memory(
+                        0x00000, self.VIS_ATTN_RESULT_DRAM + col, elems,
+                        stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
+            bar()
 
-            vis_matmul(S, H, H, self.VIS_ATTN_RESULT_DRAM, la, "o",
-                       self.VIS_O_PROJ_DRAM, bias=la["o_bias"])
-            eltwise_add_core_dram(
-                self, size=S * H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
-                OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
-            self.layer_norm_core_dram(
-                M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
-                OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la["ln2_weight"], BETA_DRAM_ADDR=la["ln2_bias"],
-                gpr_M_reg=vis_S_reg, ZEROS_DRAM_ADDR=self.vis_zeros_addr,
-                INV_N_DRAM_ADDR=self.vis_inv_n_addr)
+            shard_mm(H, H, self.VIS_ATTN_RESULT_DRAM, H * bpe, la["o_weight"],
+                     self.VIS_O_PROJ_DRAM, H * bpe, bias=la["o_bias"])
+            bar()
 
-            if self.VIS_BISECT and i == 0:
-                self._probe_copy(self.VIS_LN_OUT_DRAM, self.VIS_P_LN2_DRAM, S * H)
+            if primary:
+                eltwise_add_core_dram(
+                    self, size=S * H, A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
+                    OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
+                self.layer_norm_core_dram(
+                    M=S, N=H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
+                    OUTPUT_DRAM_ADDR=self.VIS_LN_OUT_DRAM,
+                    GAMMA_DRAM_ADDR=la["ln2_weight"], BETA_DRAM_ADDR=la["ln2_bias"],
+                    gpr_M_reg=m_reg, ZEROS_DRAM_ADDR=self.vis_zeros_addr,
+                    INV_N_DRAM_ADDR=self.vis_inv_n_addr)
+
+                if self.VIS_BISECT and i == 0:
+                    self._probe_copy(self.VIS_LN_OUT_DRAM, self.VIS_P_LN2_DRAM, S * H)
+            bar()
             # The fused GELU is x*sigmoid(1.702x); the model specifies gelu_pytorch_tanh.
             # Score the oracle with --hw-gelu or this stage falsely reads ~28 dB low.
-            vis_matmul(S, H, I, self.VIS_LN_OUT_DRAM, la, "fc1",
-                       self.VIS_MLP_INTER_DRAM, bias=la["fc1_bias"], gelu_enable=True)
-            vis_matmul(S, I, H, self.VIS_MLP_INTER_DRAM, la, "fc2",
-                       self.VIS_MLP_OUT_DRAM, bias=la["fc2_bias"])
-            eltwise_add_core_dram(
-                self, size=S * H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
-                B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM, OUTPUT_DRAM_ADDR=h_out)
+            #
+            # fc1 and fc2 are ONE region: an engine's rows of the intermediate feed only
+            # its own rows of fc2, so no rendezvous is needed between them.
+            shard_mm(H, I, self.VIS_LN_OUT_DRAM, H * bpe, la["fc1_weight"],
+                     self.VIS_MLP_INTER_DRAM, I * bpe, bias=la["fc1_bias"],
+                     gelu_enable=True)
+            shard_mm(I, H, self.VIS_MLP_INTER_DRAM, I * bpe, la["fc2_weight"],
+                     self.VIS_MLP_OUT_DRAM, H * bpe, bias=la["fc2_bias"])
+            bar()
 
-        final = (self.VIS_IO_A_DRAM if n_vis % 2 == 0
-                 else self.VIS_IO_B_DRAM)
-        self.layer_norm_core_dram(
-            M=S, N=H, A_DRAM_ADDR=final, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
-            GAMMA_DRAM_ADDR=self.vis_post_ln_weight,
-            BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=vis_S_reg,
-            ZEROS_DRAM_ADDR=self.vis_zeros_addr, INV_N_DRAM_ADDR=self.vis_inv_n_addr)
+            if primary:
+                eltwise_add_core_dram(
+                    self, size=S * H, A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
+                    B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM, OUTPUT_DRAM_ADDR=h_out)
 
-        self.compile_connector()
+        if primary:
+            final = (self.VIS_IO_A_DRAM if n_vis % 2 == 0
+                     else self.VIS_IO_B_DRAM)
+            self.layer_norm_core_dram(
+                M=S, N=H, A_DRAM_ADDR=final, OUTPUT_DRAM_ADDR=self.VIS_POST_LN_DRAM,
+                GAMMA_DRAM_ADDR=self.vis_post_ln_weight,
+                BETA_DRAM_ADDR=self.vis_post_ln_bias, gpr_M_reg=m_reg,
+                ZEROS_DRAM_ADDR=self.vis_zeros_addr, INV_N_DRAM_ADDR=self.vis_inv_n_addr)
 
-        self.generate_instruction_halt()
-        self.release_isa_reg()
-        self.stop_capture()
+            # M=64 for the whole connector: nothing to shard, and its permute is a
+            # host-index-table DMA gather that has no per-engine form at all.
+            self.compile_connector()
 
-        raw = bytearray()
-        for inst in self.capture_buffer:
-            raw.extend(inst.get_bytes())
-        addr = self.get_program_dram_addr()
-        self.dma_write(DMA_DEVICE_H2C, addr, raw, len(raw))
-        self.allocate_program_dram(len(raw))
-        self.clear_capture_buffer()
-        self._vis_program_addr = addr
-        print(f"    vision encoder + connector: {len(raw)} bytes @0x{addr:X}")
-        return addr
+        ue.release_isa_reg()
 
     def compile_connector(self):
         """[1024,768] -> pixel shuffle x4 -> [64,12288] -> proj -> [64,960].
@@ -3733,6 +4097,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # (pi05's per-slot refresh, same root cause).
         zeros_t = torch.zeros(H, dtype=torch.bfloat16)
 
+        sched = getattr(self, "_vis_sched", None)
+        multi = sched is not None and sched.num_engines > 1
+
         post_ln, conn = [], []
         for i in range(slots):
             # HOST PATCHIFY: [512,512,3] HWC -> [3,512,512] planar -> [1024, 768] with
@@ -3745,10 +4112,34 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             self.dma_to_accelerator_memory(
                 self.VIS_PIXEL_IN_DRAM,
                 patches.reshape(-1).to(torch.bfloat16).contiguous())
-            self.dma_to_accelerator_memory(self.vis_zeros_addr, zeros_t)
+            if multi:
+                # EVERY engine's private copy, not just the primary's: each one runs its
+                # own layer_norm_core_dram... today only the primary does, but the copies
+                # exist and a stale worker copy would be invisible until the norms are
+                # sharded. refresh_per_engine writes the primary's copy too.
+                sched.refresh_per_engine("vis_zeros", zeros_t)
+            else:
+                self.dma_to_accelerator_memory(self.vis_zeros_addr, zeros_t)
+
+            if multi:
+                # Workers HALT at the end of every run, and vision runs ONCE PER CAMERA
+                # SLOT from the same program address -- so they are relaunched on EVERY
+                # execution. preclear_flags is the opposite: exactly once per process,
+                # before the first launch, or a stale SET from a previous run makes the
+                # first rendezvous fall straight through.
+                if not getattr(self, "_vp_flags_precleared", False):
+                    sched.preclear_flags()
+                    self._vp_flags_precleared = True
+                sched.start_workers(self._vis_worker_prog_addrs)
 
             with PHASES.track(f"exec vision[slot{i}]", "exec"):
                 self.program_execute(prog, timeout=300.0)
+
+            if multi:
+                # The primary retires its halt as soon as the last rendezvous clears; a
+                # worker may still be draining its (write-free) margin NOPs.
+                for w in sched.workers:
+                    w.wait_queue(60.0)
 
             post_ln.append(self._read_bf16(self.VIS_POST_LN_DRAM, (S, H),
                                            label=f"vis_post_ln[{i}]"))
@@ -5501,6 +5892,62 @@ def _upstream_vision_gate(ue, images, tokens):
     return ok
 
 
+def configure_engines(ue, spec=1, *, vis=None, prefix=None, denoise=None, tag="main"):
+    """Set the engine-count knobs. Returns True if anything is sharded.
+
+    A MODULE-LEVEL FUNCTION, not a method, and shared by verapulse_test.main() and
+    libero_eval.py. libero_eval constructs VeraPulse_UnifiedEngine() directly and never
+    calls main(), so before this existed every closed-loop LIBERO episode would silently
+    run single-engine no matter what the caller thought -- the knobs are class attributes
+    that only main()'s argument parsing ever wrote (pi05 shipped exactly that bug).
+
+    `ue` is the engine INSTANCE (or the class). Setting on an instance shadows the class
+    attribute, which is what a per-process eval wants; passing the class sets the
+    process-wide default.
+
+    `spec` is an int 1..8 or the literal "max"; it is normalized ONCE here so no
+    downstream comparison has to know which it got. `vis`/`prefix`/`denoise` pin one
+    stage independently and compose with `spec` and with each other.
+
+    MUST BE CALLED BEFORE weight_init(): weight_init builds the worker pool from these
+    numbers, and no UnifiedEngine may be constructed after the weights are in DRAM.
+    """
+    cls = VeraPulse_UnifiedEngine
+    caps = cls.STAGE_MAX_ENGINES
+    is_max = isinstance(spec, str) and spec.lower() == "max"
+    n = max(caps.values()) if is_max else int(spec)
+    assert 1 <= n <= max(caps.values()), (
+        f"--engines {spec!r}: expected 1..{max(caps.values())} or 'max'")
+
+    ue.NUM_ENGINES = n
+    if is_max:
+        # Each stage's OWN ceiling, read from STAGE_MAX_ENGINES rather than assumed:
+        # a stage whose ceiling drops below the peak makes "max" and a flat N diverge,
+        # which is the whole reason this reads the dict.
+        for stage, cap in caps.items():
+            setattr(ue, f"{stage}_NUM_ENGINES", cap)
+        print(f"[{tag}] --engines max: per-stage ceilings -- "
+              + ", ".join(f"{k.lower()}={v}" for k, v in caps.items()))
+    elif n > 1:
+        print(f"[{tag}] NUM_ENGINES={n}: every stage's sharded regions run across "
+              f"{n} engines (bins cannot be dumped in this mode)")
+
+    for stage, want in (("VIS", vis), ("PREFIX", prefix), ("DENOISE", denoise)):
+        if want is None:
+            continue
+        want = int(want)
+        assert 1 <= want <= caps[stage], (
+            f"{stage} override {want} exceeds its ceiling {caps[stage]}")
+        setattr(ue, f"{stage}_NUM_ENGINES", want)
+        print(f"[{tag}] {stage.lower()} pinned to {want} engine(s)")
+
+    multi = max([n] + [int(getattr(ue, f"{st}_NUM_ENGINES", None) or n)
+                       for st in caps]) > 1
+    if multi:
+        print(f"[{tag}] multi-engine: bins cannot be dumped in this mode")
+    return multi
+
+
 def main():
     ap = argparse.ArgumentParser()
     # This file is a HARDWARE bring-up entry point, so the device path is the default and
@@ -5567,7 +6014,18 @@ def main():
                          "compile phase BEFORE the first execution, then run the stages "
                          "compile-free. --no-precompile restores the old lazy behaviour "
                          "where each stage captures inside its first run_* call.")
-    ap.add_argument("--engines", type=int, default=1)
+    # --engines takes an int 1..8 or the literal "max" (every stage at its own
+    # STAGE_MAX_ENGINES ceiling). It was previously parsed and then read by NOTHING;
+    # configure_engines below is what makes it do anything.
+    ap.add_argument("--engines", default="1", metavar="N|max",
+                    help="shard every stage across N engines (or 'max' for each stage's "
+                         "own ceiling). 1 = the historical single-engine program, "
+                         "byte-for-byte.")
+    ap.add_argument("--vis_8", action="store_true",
+                    help="stage isolation: vision encoder on 8 engines regardless of "
+                         "--engines (S=1024 = 16 blocks of 64 -> an even 128-row split). "
+                         "The projection matmuls are sharded; norms, attention and the "
+                         "eltwise adds still run on the primary.")
     ap.add_argument("--quant", default="bf16", choices=["bf16", "q4_64"])
     ap.add_argument("--gate-upstream", action=argparse.BooleanOptionalAction, default=True,
                     help="DEFAULT ON. Score the device against the checkpoint's OWN "
@@ -5996,6 +6454,10 @@ def main():
     print(f"verapulse HW | stage={args.stage} | weights={args.weights} | snr={args.snr}"
           + ("" if VERBOSE else "   (-v for full gate detail)"))
     ue = VeraPulse_UnifiedEngine()
+    # BEFORE weight_init: this sets the engine counts, and weight_init's first act is to
+    # build the worker pool from them. Every UnifiedEngine ctor DMA-writes 16 KB of noise
+    # to a hardcoded 0x80000000, so no engine may be constructed after the weights land.
+    configure_engines(ue, args.engines, vis=8 if args.vis_8 else None)
     # weight_init LAST among engine constructions: every UnifiedEngine ctor DMA-writes
     # 16KB of noise to a hardcoded 0x80000000, which is this model's first stored weight.
     # SiLU variant must be set BEFORE compile_prefix runs (it is read at emit time).
