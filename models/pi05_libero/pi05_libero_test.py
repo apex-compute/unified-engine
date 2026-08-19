@@ -745,16 +745,33 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # (each writes its own naturally-separate buffer), multiply each half
             # independently, then down-project each half (K=FF_HALF, safely under the
             # URAM cap) and sum the two partial results -- no strided DMA anywhere.
+            #
+            # LANE-GENERIC (see PREFIX_MLP_LANES): the same slicing, `lanes` ways
+            # instead of hard-coded 2, so a column lane can be handed to each engine.
+            # gate/up slice along N (whole output rows of the (N,K) matrix), so the
+            # q4_64 blocking -- which runs along K -- is untouched. down slices along
+            # K, and each lane is re-quantized over its OWN K-slice; that is exactly
+            # what the lo/hi code already did, and FF_LANE % 64 == 0 (enforced in
+            # _prefix_mlp_lanes) guarantees no scale block is ever cut in half.
+            #
+            # STORE ORDER IS LOAD-BEARING: all gates, then all ups, then all downs.
+            # At lanes == 2 that reproduces the historical
+            # gate_lo/gate_hi/up_lo/up_hi/down_lo/down_hi sequence address-for-address,
+            # so the single-engine params layout is unchanged.
             gate_2d = gate_up_all[l, 0].transpose(0, 1)   # (16384,2048) = (N,K)
             up_2d = gate_up_all[l, 1].transpose(0, 1)
             down_2d = down_all[l].transpose(0, 1)         # (2048,16384) = (N,K)
-            FF_HALF = gate_2d.shape[0] // 2
-            la["gate_lo_scale"], la["gate_lo_data"] = self._quant_store(gate_2d[:FF_HALF].contiguous())
-            la["gate_hi_scale"], la["gate_hi_data"] = self._quant_store(gate_2d[FF_HALF:].contiguous())
-            la["up_lo_scale"], la["up_lo_data"] = self._quant_store(up_2d[:FF_HALF].contiguous())
-            la["up_hi_scale"], la["up_hi_data"] = self._quant_store(up_2d[FF_HALF:].contiguous())
-            la["down_lo_scale"], la["down_lo_data"] = self._quant_store(down_2d[:, :FF_HALF].contiguous())
-            la["down_hi_scale"], la["down_hi_data"] = self._quant_store(down_2d[:, FF_HALF:].contiguous())
+            lanes, _ = self._prefix_mlp_lanes()
+            FF_LANE = gate_2d.shape[0] // lanes
+            for i in range(lanes):
+                sl = slice(i * FF_LANE, (i + 1) * FF_LANE)
+                la[f"gate_l{i}_scale"], la[f"gate_l{i}_data"] = self._quant_store(gate_2d[sl].contiguous())
+            for i in range(lanes):
+                sl = slice(i * FF_LANE, (i + 1) * FF_LANE)
+                la[f"up_l{i}_scale"], la[f"up_l{i}_data"] = self._quant_store(up_2d[sl].contiguous())
+            for i in range(lanes):
+                sl = slice(i * FF_LANE, (i + 1) * FF_LANE)
+                la[f"down_l{i}_scale"], la[f"down_l{i}_data"] = self._quant_store(down_2d[:, sl].contiguous())
 
             self.lm_layer_addrs.append(la)
         print(f"_weight_init_lm_prefix: {self.NUM_LAYERS} layers loaded")
@@ -797,15 +814,23 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # Gated MLP, FF_HALF-split (see _weight_init_lm_prefix's down_proj comment for
         # why: avoids a strided-DMA K-split extraction that was the confirmed hang
         # trigger). Each half is independently computed/multiplied/down-projected.
-        FF_HALF = I // 2
-        self.LAYER0_MLP_GATE_LO_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
-        self.LAYER0_MLP_GATE_HI_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
-        self.LAYER0_MLP_UP_LO_DRAM   = self.allocate_tensor_dram(S * FF_HALF * bpe)
-        self.LAYER0_MLP_UP_HI_DRAM   = self.allocate_tensor_dram(S * FF_HALF * bpe)
-        self.LAYER0_MLP_MULT_LO_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
-        self.LAYER0_MLP_MULT_HI_DRAM = self.allocate_tensor_dram(S * FF_HALF * bpe)
-        self.LAYER0_MLP_DOWN_LO_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
-        self.LAYER0_MLP_DOWN_HI_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        # LANE-GENERIC (see PREFIX_MLP_LANES). Same order as before -- all gates,
+        # all ups, all mults, then the per-lane down partials -- so lanes == 2
+        # reproduces the historical GATE_LO/GATE_HI/UP_LO/... addresses exactly.
+        # Total gate/up/mult bytes are INVARIANT in the lane count (lanes *
+        # S*(I/lanes) == S*I); only the partials grow, by (lanes-2) * S*H*bpe.
+        lanes, mlp_col_split = self._prefix_mlp_lanes()
+        FF_LANE = I // lanes
+        self.PREFIX_MLP_LANES_RESOLVED = lanes
+        self.LAYER0_MLP_GATE_DRAM = [self.allocate_tensor_dram(S * FF_LANE * bpe) for _ in range(lanes)]
+        self.LAYER0_MLP_UP_DRAM   = [self.allocate_tensor_dram(S * FF_LANE * bpe) for _ in range(lanes)]
+        self.LAYER0_MLP_MULT_DRAM = [self.allocate_tensor_dram(S * FF_LANE * bpe) for _ in range(lanes)]
+        self.LAYER0_MLP_PARTIAL_DRAM = [self.allocate_tensor_dram(S * H * bpe) for _ in range(lanes)]
+        # Ping-pong accumulators for the lanes-1 partial adds. eltwise with OUT
+        # aliasing either input is a CONFIRMED HANG (see compile_prefix), so the
+        # reduce alternates between these two and lands its LAST add directly in
+        # LAYER0_MLP_DOWN_DRAM -- no in-place step anywhere in the chain.
+        self.LAYER0_MLP_ACC_DRAM = [self.allocate_tensor_dram(S * H * bpe) for _ in range(2)]
         self.LAYER0_MLP_DOWN_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.FINAL_NORM_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.LOGITS_DRAM     = self.allocate_tensor_dram(self.VOCAB_SIZE * bpe)
@@ -1455,6 +1480,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                   f"{[w.get_capture_instruction_size_bytes() for w in sched.workers]} bytes")
             self._assert_worker_programs_fit(sched)
 
+        _lanes, _csplit = self._prefix_mlp_lanes(ne)
+        if _csplit:
+            print(f"    [prefix] MLP COLUMN-LANE split: {_lanes} lanes of "
+                  f"{self.INTERMEDIATE_SIZE // _lanes} cols, one per engine, each at "
+                  f"full S={S} -> perfectly balanced (vs the {[c for _, c in splits]} "
+                  f"row split); {_lanes - 1} partial adds + 2 rendezvous/layer")
+        else:
+            print(f"    [prefix] MLP column lanes: {_lanes} (walked per-engine over "
+                  f"own rows; no column split)")
         print(f"compile_prefix: {self.NUM_LAYERS} layers compiled, seq_len={S}, "
               f"valid_len={valid_len}, engines={ne}")
 
@@ -1541,7 +1575,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
               RH = row_offset*H*2      INPUT, LAYER_OUT, PRE_NORM, Q, ATTN_RESULT,
                                        O_PROJ, ATTN_RESIDUAL, MLP_DOWN*
               RK = row_offset*KV*2     K_PROJ, V_PROJ            (KV = 256 -> 512B)
-              RF = row_offset*FF_HALF*2  MLP_{GATE,UP,MULT}_{LO,HI} (-> 16KB)
+              RF = row_offset*FF_LANE*2  MLP_{GATE,UP,MULT}[lane] (-> 16KB)
           PER_ENGINE               ``prefix_attn_scratch``, a LIST indexed by
                                    engine_idx: the head-sharded attention core
                                    WRITES its scratch, so one shared buffer would
@@ -1556,7 +1590,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         H, I, D = self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE, self.HEAD_DIM
         NH, KV = self.NUM_HEADS, self.NUM_KV_HEADS * self.HEAD_DIM
-        FF_HALF = I // 2
+        lanes, mlp_col_split = self._prefix_mlp_lanes(ne)
+        FF_LANE = I // lanes
         bpe = 2
         is_primary = engine_idx == 0
 
@@ -1564,7 +1599,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # literal -- never a runtime GPR (the ue_selector _addr_tmp clobber class).
         RH = row_offset * H * bpe
         RK = row_offset * KV * bpe
-        RF = row_offset * FF_HALF * bpe
+        # Lane-buffer row offset. Used only on the NON-column-split path, where every
+        # engine walks all lanes over its own row shard; when mlp_col_split is on the
+        # lanes run at full S and the offset is 0 (computed inline as LF).
+        RF = row_offset * FF_LANE * bpe
         assert rows % 64 == 0, f"shard row count {rows} must be 64-aligned"
 
         self._debug_counter = 0
@@ -1752,37 +1790,70 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 if layer_idx == 0 and self._prefix_snap:
                     self._dram_copy(S * H * bpe, self.LAYER0_PRE_NORM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["ln2"])
 
-                # 9. gated-GELU MLP + residual, FF_HALF-split (parakeet_test.py pattern,
-                # adapted for the gated variant -- see _weight_init_lm_prefix's comment
-                # for why: matmat_mul_core_pbi can't do K=16384 in one call, and the
-                # strided-DMA extraction alternative (_dram_split_copy) was the
-                # confirmed hang trigger). Each half computed/multiplied/down-projected
-                # independently so down_proj's K-input is naturally contiguous from the
-                # moment it's written -- no slicing step exists to hang on.
-                # [SHARDED] -- the FF_HALF-wide buffers use the RF pitch.
-                self._matmul(M=rows, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="gate_lo", la=la,
-                             OUT=self.LAYER0_MLP_GATE_LO_DRAM + RF, gelu_enable=True, gpr_M_reg=prefix_R_reg, ue=ue)
-                self._matmul(M=rows, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="up_lo", la=la,
-                             OUT=self.LAYER0_MLP_UP_LO_DRAM + RF, gpr_M_reg=prefix_R_reg, ue=ue)
-                eltwise_mul_core_dram(ue, rows * FF_HALF, self.LAYER0_MLP_GATE_LO_DRAM + RF, self.LAYER0_MLP_UP_LO_DRAM + RF, self.LAYER0_MLP_MULT_LO_DRAM + RF)
-                self._matmul(M=rows, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_LO_DRAM + RF, proj="down_lo", la=la,
-                             OUT=self.LAYER0_MLP_DOWN_LO_OUT_DRAM + RH, gpr_M_reg=prefix_R_reg, ue=ue)
-                self._debug_op(f"layer{layer_idx}_mlp_lo", self.LAYER0_MLP_DOWN_LO_OUT_DRAM, S * H, shape=(S, H), ue=ue)
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_LO_OUT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_lo"])
+                # 9. gated-GELU MLP + residual, COLUMN-LANE split (parakeet_test.py
+                # pattern, adapted for the gated variant -- see _weight_init_lm_prefix
+                # for why the split must exist at all: matmat_mul_core_pbi can't do
+                # K=16384 in one call, and the strided-DMA extraction alternative
+                # (_dram_split_copy) was the confirmed hang trigger). Each lane is
+                # computed/multiplied/down-projected independently so down_proj's
+                # K-input is naturally contiguous from the moment it's written.
+                #
+                # TWO MODES (see PREFIX_MLP_LANES):
+                #   mlp_col_split False  every engine walks ALL lanes over its OWN row
+                #                        shard. lanes == 2 here is byte-identical to
+                #                        the historical FF_HALF code.
+                #   mlp_col_split True   engine e computes ONLY lane e, at FULL S. The
+                #                        row imbalance disappears because every engine
+                #                        does exactly S x FF_LANE of work.
+                if mlp_col_split:
+                    # RENDEZVOUS #C: the lanes read ALL S rows of LAYER0_PRE_NORM_DRAM,
+                    # which was just written ROW-SHARDED by every engine (RAW).
+                    self._vis_barrier(ue, engine_idx, ne)
+                    lane_ids, lane_M, lane_row, lane_Mreg = [engine_idx], S, 0, prefix_S_reg
+                else:
+                    lane_ids, lane_M, lane_row, lane_Mreg = range(lanes), rows, RH, prefix_R_reg
 
-                self._matmul(M=rows, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="gate_hi", la=la,
-                             OUT=self.LAYER0_MLP_GATE_HI_DRAM + RF, gelu_enable=True, gpr_M_reg=prefix_R_reg, ue=ue)
-                self._matmul(M=rows, K=H, N=FF_HALF, A=self.LAYER0_PRE_NORM_DRAM + RH, proj="up_hi", la=la,
-                             OUT=self.LAYER0_MLP_UP_HI_DRAM + RF, gpr_M_reg=prefix_R_reg, ue=ue)
-                eltwise_mul_core_dram(ue, rows * FF_HALF, self.LAYER0_MLP_GATE_HI_DRAM + RF, self.LAYER0_MLP_UP_HI_DRAM + RF, self.LAYER0_MLP_MULT_HI_DRAM + RF)
-                self._matmul(M=rows, K=FF_HALF, N=H, A=self.LAYER0_MLP_MULT_HI_DRAM + RF, proj="down_hi", la=la,
-                             OUT=self.LAYER0_MLP_DOWN_HI_OUT_DRAM + RH, gpr_M_reg=prefix_R_reg, ue=ue)
-                self._debug_op(f"layer{layer_idx}_mlp_hi", self.LAYER0_MLP_DOWN_HI_OUT_DRAM, S * H, shape=(S, H), ue=ue)
-                if layer_idx == 0 and self._prefix_snap:
-                    self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_HI_OUT_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_hi"])
+                for i in lane_ids:
+                    LF = 0 if mlp_col_split else row_offset * FF_LANE * bpe
+                    self._matmul(M=lane_M, K=H, N=FF_LANE, A=self.LAYER0_PRE_NORM_DRAM + lane_row,
+                                 proj=f"gate_l{i}", la=la,
+                                 OUT=self.LAYER0_MLP_GATE_DRAM[i] + LF, gelu_enable=True,
+                                 gpr_M_reg=lane_Mreg, ue=ue)
+                    self._matmul(M=lane_M, K=H, N=FF_LANE, A=self.LAYER0_PRE_NORM_DRAM + lane_row,
+                                 proj=f"up_l{i}", la=la,
+                                 OUT=self.LAYER0_MLP_UP_DRAM[i] + LF, gpr_M_reg=lane_Mreg, ue=ue)
+                    eltwise_mul_core_dram(ue, lane_M * FF_LANE,
+                                          self.LAYER0_MLP_GATE_DRAM[i] + LF,
+                                          self.LAYER0_MLP_UP_DRAM[i] + LF,
+                                          self.LAYER0_MLP_MULT_DRAM[i] + LF)
+                    self._matmul(M=lane_M, K=FF_LANE, N=H, A=self.LAYER0_MLP_MULT_DRAM[i] + LF,
+                                 proj=f"down_l{i}", la=la,
+                                 OUT=self.LAYER0_MLP_PARTIAL_DRAM[i] + lane_row,
+                                 gpr_M_reg=lane_Mreg, ue=ue)
+                    self._debug_op(f"layer{layer_idx}_mlp_l{i}", self.LAYER0_MLP_PARTIAL_DRAM[i],
+                                   S * H, shape=(S, H), ue=ue)
+                    if layer_idx == 0 and self._prefix_snap and i < 2:
+                        self._dram_copy(S * H * bpe, self.LAYER0_MLP_PARTIAL_DRAM[i],
+                                        self.PREFIX_L0_SNAPSHOT_DRAM["mlp_lo" if i == 0 else "mlp_hi"])
 
-                eltwise_add_core_dram(ue, rows * H, self.LAYER0_MLP_DOWN_LO_OUT_DRAM + RH, self.LAYER0_MLP_DOWN_HI_OUT_DRAM + RH, self.LAYER0_MLP_DOWN_DRAM + RH)
+                if mlp_col_split:
+                    # RENDEZVOUS #D: the reduce below reads EVERY lane's partial, each
+                    # written by a different engine (RAW). It is also the WAR fence for
+                    # LAYER0_PRE_NORM_DRAM -- without it an engine could race into
+                    # layer i+1's ln2 and overwrite rows a peer is still reading here.
+                    self._vis_barrier(ue, engine_idx, ne)
+
+                # Reduce the lane partials over THIS engine's row shard. Ping-pong
+                # accumulators, last add straight into LAYER0_MLP_DOWN_DRAM: OUT never
+                # aliases either input (in-place eltwise is a confirmed hang).
+                acc = self.LAYER0_MLP_PARTIAL_DRAM[0] + RH
+                for i in range(1, lanes):
+                    last = (i == lanes - 1)
+                    dst = (self.LAYER0_MLP_DOWN_DRAM if last
+                           else self.LAYER0_MLP_ACC_DRAM[i % 2]) + RH
+                    eltwise_add_core_dram(ue, rows * H, acc,
+                                          self.LAYER0_MLP_PARTIAL_DRAM[i] + RH, dst)
+                    acc = dst
                 self._debug_op(f"layer{layer_idx}_mlp_down", self.LAYER0_MLP_DOWN_DRAM, S * H, shape=(S, H), ue=ue)
                 if layer_idx == 0 and self._prefix_snap:
                     self._dram_copy(S * H * bpe, self.LAYER0_MLP_DOWN_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["mlp_down"])
@@ -1889,6 +1960,68 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # two permutes and attention stay on the primary), so it follows --engines.
     # Set to an int to pin the stage independently of the encoder.
     PREFIX_NUM_ENGINES = None
+
+    # ---- PREFIX MLP COLUMN LANES -------------------------------------------
+    # The gated MLP has ALWAYS been column-split: gate/up are N-split and down is
+    # K-split into FF_HALF=8192 halves whose partials are summed. That was done for
+    # a HARDWARE reason, not for parallelism -- matmat_mul_core_pbi asserts
+    # K*16 <= URAM_NEAR_FULL_ELEMENTS (262080), so down_proj's K=16384 cannot run as
+    # one matmul, and the strided-DMA alternative was a confirmed hang trigger. See
+    # _weight_init_lm_prefix.
+    #
+    # Widening 2 lanes -> `ne` lanes turns that existing split into the fix for the
+    # ROW-BLOCK IMBALANCE. S=832 is 13 blocks of 64 and 13 is prime, so no row split
+    # over 8 engines balances: the busiest engine carries 2 blocks where the ideal is
+    # 1.625, i.e. ~81% efficiency (measured: t = 0.70 + 5.70*max_blocks +
+    # 0.30*heads_per_engine, so 2.1s of the 12.4s stage is pure idle). I=16384 is 256
+    # blocks of 64 and divides 8 ways EXACTLY, so a column lane per engine is
+    # PERFECTLY balanced -- every engine does S x (I/ne), identical work.
+    #
+    # The MLP is 91.4% of the row-sharded FLOPs (167.5 of 183.25 GFLOP/layer), so
+    # moving just it off the row axis recovers nearly all of the imbalance. The
+    # projections and both RMSNorms stay row-split (their 2-block critical path is
+    # only ~1.0s) -- splitting them too would need a transpose the hardware has no
+    # A-stride for.
+    #
+    # Cost: two extra rendezvous per layer (#C after ln2, #D after the lanes) and
+    # ne-1 serialized partial adds instead of 1.
+    PREFIX_MLP_LANES = None      # None -> _prefix_mlp_lanes() derives it
+
+    def _prefix_mlp_lanes(self, resolved_ne=None):
+        """Return (lanes, col_split) for the prefix gated MLP.
+
+        THE LANE COUNT IS DERIVED FROM THE CONFIGURED ENGINE COUNT ONLY, never from
+        the per-compile resolved one. weight_init, tensor_init and _emit_prefix_body
+        all call this, and they run at different times: _prefix_num_engines can fall
+        back to 1 at COMPILE time (a seq_len that won't 64-block-split), long after
+        the weights were sliced and the buffers allocated. If the lane count moved
+        with that fallback, emission would index `gate_l0` -- a 2048-wide slice --
+        as if it were 8192 wide. Silent wrong math, not an error.
+
+        ``col_split`` is the only thing the fallback is allowed to change:
+
+          False  every engine walks ALL lanes over its own row shard. The ne == 1
+                 path, and the fallback path. At lanes == 2 the emitted stream is
+                 byte-identical to the historical FF_HALF code.
+          True   engine e computes ONLY lane e, at FULL S -- the balanced path.
+                 Requires lanes == resolved_ne exactly.
+        """
+        raw = self._num_engines("PREFIX")
+        override = self.PREFIX_MLP_LANES
+        lanes = (raw if override is None else int(override)) if raw > 1 else 2
+        if override is not None:
+            lanes = int(override)
+        I = self.INTERMEDIATE_SIZE
+        # Every lane must be a whole number of 64-element blocks: that is the matmul
+        # N/K granularity AND the q4_64 block size. q4_64 blocks run along K, so a
+        # lane boundary off a 64-multiple would cut a down_proj scale block in half.
+        # The down_proj K per lane must also clear the URAM cap that forced this
+        # split to exist at all (matmat_mul_core_pbi: K*16 <= URAM_NEAR_FULL_ELEMENTS).
+        if (lanes < 2 or I % lanes != 0 or (I // lanes) % 64 != 0
+                or (I // lanes) * 16 > URAM_NEAR_FULL_ELEMENTS):
+            lanes = 2
+        col_split = (resolved_ne is not None and resolved_ne > 1 and lanes == resolved_ne)
+        return lanes, col_split
 
     def _num_engines(self, stage="VIS"):
         override = getattr(self, f"{stage}_NUM_ENGINES", None)
