@@ -5688,17 +5688,23 @@ def gemma3_inference_test() -> None:
     from gemma3_test import Gemma3_UnifiedEngine
     import user_dma_core
 
+    # Golden refreshed 2026-08-19 for the proper-GQA prefill (per-head loop over
+    # the compact K/V; the old duplicate-KV + plain-tril path under-weighted the
+    # diagonal token for non-last query heads — now fixed to match the HF GQA
+    # reference). IF4's greedy decode shifted to this coherent completion; the
+    # legacy/streaming/matmatmul labels all share this golden (all use the same
+    # corrected prefill attention).
     expected_text = (
-        "Let's solve the equation x + 3 = 5\n\n"
-        "To find the value of 'x', we need to isolate it.  "
-        "Subtract 3 from both sides of the equation:\n\n"
-        "x + 3 - 3 = 5 - 3\n\n"
+        "If you add 3 to both sides of the equation, you get:\n\n"
+        "x + 3 + 3 = 5 + 3\n\n"
         "This simplifies to:\n\n"
-        "x = 2\n\n"
+        "x + 6 = 8\n\n"
+        "Now, subtract 6 from both sides:\n\n"
+        "x = 8 - 6\n\n"
         "Therefore, x = 2\n\n"
         "So the answer is **2**"
     )
-    expected_tokens = 80
+    expected_tokens = 76
     token_tol = 0
 
     # Peak (1st-token) decode throughput floors were measured on bittware
