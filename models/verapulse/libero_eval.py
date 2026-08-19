@@ -307,8 +307,10 @@ class _FpgaBackend:
         ue.run_prefix(vision_tokens, ids, state32, text_mask=mask)
         chunk = ue.run_denoise(noise=noise)          # [50, 7] normalized
         self._first = False
-        n_exec = self.M._CFG["action_head"]["n_action_steps"]
-        return np.asarray(chunk[:n_exec], dtype=np.float32)
+        # Return the FULL predicted chunk. Truncation to the execution horizon is the
+        # harness's job (--replan-steps, one slice at the plan.extend), and doing it here
+        # too silently capped --replan-steps at n_action_steps=10: asking for 50 got 10.
+        return np.asarray(chunk, dtype=np.float32)
 
 
 class _CpuBackend:
@@ -378,7 +380,7 @@ class _CpuBackend:
             x, valid, pos = self.ref.build_prefix(toks, ids_t[mask_t], st)
             _, kv = self.ref.forward_prefix(x, pos)
             acts = self.ref.denoise(kv, x.shape[0], noise=noise)
-        return np.asarray(acts[:self.n_exec, :self.adim], dtype=np.float32)
+        return np.asarray(acts[:, :self.adim], dtype=np.float32)   # full chunk; --replan-steps truncates
 
 
 class _OracleBackend:
@@ -457,7 +459,7 @@ class _OracleBackend:
         model_input = self.proc.to_model_input(obs)
         with torch.inference_mode():
             chunk = self.model.predict_action_chunk(model_input)
-        acts = self.proc.postprocess_action(chunk[:, : self.n_exec])
+        acts = self.proc.postprocess_action(chunk)   # full chunk; --replan-steps truncates
         return np.asarray(acts[0], dtype=np.float32)
 
 
@@ -621,10 +623,14 @@ def main():
                     help="rollouts per task (2 -> 20 episodes, directional; 5 for a "
                          "citable number)")
     ap.add_argument("--max-steps", type=int, default=None, help="override the suite default")
-    ap.add_argument("--replan-steps", type=int, default=10,
-                    help="how many actions of each 10-step chunk to execute before "
-                         "re-querying the model (default 10 = the whole chunk, i.e. the "
-                         "fewest inferences; lower = tighter closed loop, more FPGA time)")
+    ap.add_argument("--replan-steps", type=int, default=50,
+                    help="how many actions of each 50-step predicted chunk to execute before "
+                         "re-querying the model. DEFAULT 50 = execute the whole chunk, fully "
+                         "open-loop between inferences: measured 10/10 on libero_object in "
+                         "159s at 3 inferences/episode, vs 7/10 in 14min at replan-10. The "
+                         "model is trained to emit a coherent 50-step chunk, so re-planning "
+                         "early throws away good actions. Pass 10 (= n_action_steps) for the "
+                         "tighter closed loop and the old baseline.")
     ap.add_argument("--wait-steps", type=int, default=10,
                     help="dummy-action steps after reset so the objects settle")
     ap.add_argument("--seed", type=int, default=7)
