@@ -38,6 +38,7 @@ and decoded **pure-greedy** (deterministic, matches `user_hw_test.py`).
 | Prefill tokens (seq_len) | 44 | 44 |
 | Prefill FPGA time (HW latency) | 3,664.0 ms | 3,629.4 ms |
 | Prefill throughput | - GFLOPS | 23.71 GFLOPS |
+| — utilization (% peak) | - | 93.4% |
 | Prefill end-to-end (CPU) | 3.66 s | 3.63 s |
 | Decoded tokens | 62 generated (total 106) | 62 generated (total 106) |
 | Decode 1st-token speed (peak) | 8.47 tok/s | 8.47 tok/s |
@@ -45,6 +46,7 @@ and decoded **pure-greedy** (deterministic, matches `user_hw_test.py`).
 | Decode 1st-token HW latency | 118.1 ms/tok | 118.1 ms/tok |
 | Decode average HW latency | 120.6 ms/tok | 120.6 ms/tok |
 | Decode average throughput | 21.65 GFLOPS | 21.65 GFLOPS |
+| — utilization (% peak) | 85.3% | 85.3% |
 | Correctness | coherent (solves x = 2) | coherent (solves x = 2, identical text) |
 
 > **proper-gqa** (IF4, xdma1/kintex7, HW `0x4a6cf588`, pure-greedy, 44-token
@@ -84,11 +86,13 @@ Same proper-GQA + real-seq_len FLOP change applied to `llama3.2_1b_IF8.py`
 | Prefill tokens (seq_len) | 44 | 44 |
 | Prefill FPGA time (HW latency) | 7,037.2 ms | 7,002.7 ms |
 | Prefill throughput | - GFLOPS | 12.29 GFLOPS |
+| — utilization (% peak) | - | 48.4% |
 | Decoded tokens | 68 generated (total 112) | 68 generated (total 112) |
 | Decode average speed | 4.57 tok/s | 4.57 tok/s |
 | Decode 1st-token HW latency | 215.3 ms/tok | 215.3 ms/tok |
 | Decode average HW latency | 217.9 ms/tok | 217.9 ms/tok |
 | Decode average throughput | 11.98 GFLOPS | 11.98 GFLOPS |
+| — utilization (% peak) | 47.2% | 47.2% |
 | Correctness | coherent (solves x = 2) | coherent (solves x = 2, identical text) |
 
 > **Same verdict as IF4, and same not-worth-it at 44 tokens.** Prefill latency

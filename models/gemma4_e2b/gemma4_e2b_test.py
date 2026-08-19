@@ -1327,6 +1327,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             return f"{n / (1024 * 1024):.2f} MB" if n is not None else "n/a"
         def _kb(n):
             return f"{n / 1024:.1f} KB" if n is not None else "n/a"
+        def _util(gflops):
+            """Reported throughput as a percent of this run's peak GFLOPS."""
+            return f"{100.0 * gflops / peak_gflops:.1f}%" if peak_gflops else "n/a"
 
         is_image = bool(getattr(args, "image", None))
         is_audio = bool(getattr(args, "audio", None))
@@ -1382,6 +1385,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 lines.append(f"- **Vision FPGA run time (HW latency):** n/a (host vision)")
             if vis_gflops is not None:
                 lines.append(f"- **Vision reported FLOPS:** {vis_gflops:.2f} GFLOPS")
+                lines.append(f"- **Vision utilization (% peak):** {_util(vis_gflops)}")
             else:
                 lines.append(f"- **Vision reported FLOPS:** n/a (host vision)")
             _vis_e2e = getattr(self, "_vis_e2e_s", None)
@@ -1403,6 +1407,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                          f"({pf_lat_us:.0f} us)")
         if pf_gflops is not None:
             lines.append(f"- **Prefill reported FLOPS:** {pf_gflops:.2f} GFLOPS")
+            lines.append(f"- **Prefill utilization (% peak):** {_util(pf_gflops)}")
         if pf_e2e is not None:
             lines.append(f"- **Prefill end-to-end (CPU timer):** {pf_e2e:.2f} s")
         lines.append("")
@@ -1424,6 +1429,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             lines.append(f"- **Average speed:** {avg_toks:.2f} tok/s")
         if avg_gflops is not None:
             lines.append(f"- **Average FLOPS:** {avg_gflops:.2f} GFLOPS")
+            lines.append(f"- **Decode utilization (% peak):** {_util(avg_gflops)}")
         lines.append("")
 
         # --- Text ------------------------------------------------------------

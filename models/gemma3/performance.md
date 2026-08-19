@@ -27,11 +27,13 @@ compiled the program image **from scratch** (default; `--bin-reuse` off).
 | Prefill tokens (seq_len) | 19 | 19 |
 | Prefill FPGA time (HW latency) | 1118.80 ms | 1128.10 ms |
 | Prefill throughput | ~ GFLOPS | 23.65 GFLOPS |
+| — utilization (% peak) | ~ | 93.1% |
 | Prefill end-to-end (CPU) | 1.12 s | 1.13 s |
 | Decoded tokens | 80 generated (total 99) | 76 generated (total 95) |
 | Decode 1st-token speed (peak) | 10.60 tok/s | 10.60 tok/s |
 | Decode average speed | 10.29 tok/s | 10.32 tok/s |
 | Decode average throughput | 21.50 GFLOPS | 21.52 GFLOPS |
+| — utilization (% peak) | 84.7% | 84.8% |
 | Decode 1st-token HW latency | 94.4 ms/tok | 94.4 ms/tok |
 | Decode average HW latency | 95.6 ms/tok | 95.5 ms/tok |
 | Correctness | coherent (solves x = 2) | coherent (solves x = 2) |
@@ -49,11 +51,13 @@ compiled the program image **from scratch** (default; `--bin-reuse` off).
 | Prefill tokens (seq_len) | 19 | 19 |
 | Prefill FPGA time (HW latency) | 2163.20 ms | 2172.52 ms |
 | Prefill throughput | ~ GFLOPS | 12.28 GFLOPS |
+| — utilization (% peak) | ~ | 48.4% |
 | Prefill end-to-end (CPU) | 2.17 s | 2.18 s |
 | Decoded tokens | 74 generated (total 93) | 74 generated (total 93) |
 | Decode 1st-token speed (peak) | 5.78 tok/s | 5.78 tok/s |
 | Decode average speed | 5.69 tok/s | 5.69 tok/s |
 | Decode average throughput | 11.80 GFLOPS | 11.80 GFLOPS |
+| — utilization (% peak) | 46.5% | 46.5% |
 | Decode 1st-token HW latency | 173.1 ms/tok | 173.1 ms/tok |
 | Decode average HW latency | 174.3 ms/tok | 174.3 ms/tok |
 | Correctness | coherent (solves x = 2) | coherent (solves x = 2) |

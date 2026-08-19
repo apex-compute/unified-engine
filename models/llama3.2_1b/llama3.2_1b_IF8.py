@@ -1776,6 +1776,9 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
             return f"{n / (1024 * 1024):.2f} MB" if n else "n/a"
         def _kb(v):
             return f"{v:.1f} KB" if v is not None else "n/a"
+        def _util(gflops):
+            """Reported throughput as a percent of this run's peak GFLOPS."""
+            return f"{100.0 * gflops / peak_gflops:.1f}%" if peak_gflops else "n/a"
 
         pf_tokens = run_result.get("prefill_tokens")
         pf_hw_ms = run_result.get("prefill_hw_ms")
@@ -1826,6 +1829,7 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
             L.append(f"- **Prefill FPGA run time (HW latency):** {pf_hw_ms:.2f} ms")
         if pf_gflops is not None:
             L.append(f"- **Prefill reported FLOPS:** {pf_gflops:.2f} GFLOPS")
+            L.append(f"- **Prefill utilization (% peak):** {_util(pf_gflops)}")
         if pf_cpu_ms is not None:
             L.append(f"- **Prefill end-to-end (CPU timer):** {pf_cpu_ms / 1e3:.2f} s")
         L.append("")
@@ -1839,6 +1843,7 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
             L.append(f"- **Average speed:** {avg_toks:.2f} tok/s")
         if dec_gflops is not None:
             L.append(f"- **Average FLOPS:** {dec_gflops:.2f} GFLOPS")
+            L.append(f"- **Decode utilization (% peak):** {_util(dec_gflops)}")
         if dec_first_ms is not None:
             L.append(f"- **Decode 1st-token HW latency:** {dec_first_ms:.1f} ms/tok")
         if dec_avg_ms is not None:
