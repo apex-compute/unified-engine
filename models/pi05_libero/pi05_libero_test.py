@@ -1355,10 +1355,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.LAYER0_Q_ROPE_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(S * KV * bpe)
         # rotate_half scratch for the matmul RoPE (_rope_matmul). Sized for the
-        # widest consumer (all NH heads of Q, head-major); the single-head MQA K
-        # rope reuses its first S*D elements, and the two never overlap in time.
+        # widest consumer (all NH heads of Q, head-major).
+        #
+        # K GETS ITS OWN BUFFER, it does NOT reuse Q's first S*D elements any more.
+        # That aliasing was safe only while Q-rope and K-rope ran back-to-back on
+        # the primary. Under PREFIX_ROPE_SHARD they run CONCURRENTLY on different
+        # engines over different row ranges: at ne=8 engine 0 owns Q rows [0,832)
+        # while engine 1 owns K rows [104,208) -- overlapping writes to the same
+        # scratch, i.e. finite-but-scrambled Q, the exact failure class in
+        # project_pi05_denoise_strided_copy_bugs. 0.4 MB to make it impossible.
         if self.USE_MATMUL_ROPE:
             self.PREFIX_ROPE_ROT_DRAM = self.allocate_tensor_dram(S * H * bpe)
+            self.PREFIX_ROPE_ROT_K_DRAM = self.allocate_tensor_dram(S * D * bpe)
         # Per-layer snapshots (LAYER0_LAYER_OUT_DRAM itself is reused/overwritten
         # every layer) so a post-run readback can CPU-vs-HW SNR-check every
         # layer's output at once -- same pattern as VIS_LAYER_SNAPSHOT_DRAM.
@@ -1474,10 +1482,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 "PREFIX_SNAPSHOTS is not supported with a row-sharded prefix "
                 f"(engines={ne}): the layer0 op snapshots run before rendezvous #1 "
                 "and would capture partial data. Re-run with --engines 1.")
-            splits = sched.split_rows(S, mode="blocks")
+            # NOT sched.split_rows: this scheduler is SHARED with the vision stage
+            # and its row_align is 64. _col_split takes the alignment explicitly, so
+            # the 8-row granularity stays scoped to the prefix. (Setting row_align on
+            # the shared scheduler is exactly what broke this stage once already.)
+            splits = self._col_split(S, ne, align=self.PREFIX_ROW_ALIGN)
             engines = sched.engines
+            _mx = max(c for _, c in splits)
             print(f"    [prefix] row-sharded over {ne} engine(s): "
-                  f"{[c for _, c in splits]} of {S} rows (64-row blocks)")
+                  f"{[c for _, c in splits]} of {S} rows "
+                  f"({self.PREFIX_ROW_ALIGN}-row blocks, max shard {_mx} = "
+                  f"{100.0 * S / (ne * _mx):.0f}% efficient)")
             print(f"    [prefix] attention head-sharded: "
                   f"{[c for _, c in self._prefix_head_split(ne)]} of {NH} heads")
         else:
@@ -1619,7 +1634,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # engine walks all lanes over its own row shard; when mlp_col_split is on the
         # lanes run at full S and the offset is 0 (computed inline as LF).
         RF = row_offset * FF_LANE * bpe
-        assert rows % 64 == 0, f"shard row count {rows} must be 64-aligned"
+        assert rows % self.PREFIX_ROW_ALIGN == 0, (
+            f"shard row count {rows} must be {self.PREFIX_ROW_ALIGN}-aligned")
 
         self._debug_counter = 0
         if is_primary:
@@ -1638,6 +1654,28 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # every other op in the layer and needs its own register.
         prefix_NHS_reg = ue.alloc_isa_reg()
         ue.generate_instruction_add_set(prefix_NHS_reg, self.NUM_HEADS * S)
+
+        # ---- RoPE / KV-staging shard (PREFIX_ROPE_SHARD) ----------------------
+        # A SECOND, INDEPENDENT row split from the projections' `rows`: RoPE runs
+        # over the head-major (NH*S, D) Q batch, so its row space is NH*S, not S.
+        # Only the matmul-RoPE path is sharded; the legacy per-row cores stay whole
+        # on the primary (they are DMA-latency bound and being retired anyway).
+        rope_shard = bool(self.PREFIX_ROPE_SHARD and ne > 1 and self.USE_MATMUL_ROPE)
+        if rope_shard:
+            q_off, q_rows = self._col_split(NH * S, ne, align=self.PREFIX_ROW_ALIGN)[engine_idx]
+            k_off, k_rows = self._col_split(S, ne, align=self.PREFIX_ROW_ALIGN)[engine_idx]
+            prefix_QR_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(prefix_QR_reg, q_rows)
+            prefix_KR_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(prefix_KR_reg, k_rows)
+            if is_primary:
+                print(f"    [prefix] rope/kv-staging sharded over {ne} engine(s): "
+                      f"Q {q_rows} of {NH * S} head-major rows, K {k_rows} of {S} "
+                      f"(+1 barrier/layer for the primary-only Q permute)")
+        else:
+            # Byte-identical to the historical stream: whole range, existing regs.
+            q_off, q_rows, prefix_QR_reg = 0, NH * S, prefix_NHS_reg
+            k_off, k_rows, prefix_KR_reg = 0, S, prefix_S_reg
 
         # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds the
         # sqrt(N) RSQRT scale implicitly -- the dynamic core reads it from a runtime
@@ -1714,24 +1752,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     # PRE-rotation Q, and is snapshotted under the "q_rope" key as
                     # such (the golden compare knows -- see compare_prefix_golden).
                     if self.USE_MATMUL_ROPE:
+                        # The permute alone stays here (strided destination under a
+                        # row split -- see PREFIX_ROPE_SHARD). Both RoPEs moved out
+                        # of this primary-only block, below rendezvous #1a.
                         smart_bf16_permute_core(ue, (S, NH, D), [1, 0, 2],
                                                  self.LAYER0_Q_DRAM, self.LAYER0_Q_ROPE_DRAM)
-                        self._rope_matmul(M=NH * S,
-                                          src_dram=self.LAYER0_Q_ROPE_DRAM,
-                                          out_dram=self.LAYER0_Q_PERM_DRAM,
-                                          cos_tiled=self.PREFIX_ROPE_COS_TILED,
-                                          sin_tiled=self.PREFIX_ROPE_SIN_TILED,
-                                          rot_dram=self.PREFIX_ROPE_ROT_DRAM,
-                                          gpr_M_reg=prefix_NHS_reg, ue=ue)
-                        # K is a single MQA head, already (S, D) head-major -- so it is
-                        # the FIRST head-tile of the same tiled table, at offset 0.
-                        self._rope_matmul(M=S,
-                                          src_dram=self.LAYER0_K_PROJ_DRAM,
-                                          out_dram=self.LAYER0_K_ROPE_DRAM,
-                                          cos_tiled=self.PREFIX_ROPE_COS_TILED,
-                                          sin_tiled=self.PREFIX_ROPE_SIN_TILED,
-                                          rot_dram=self.PREFIX_ROPE_ROT_DRAM,
-                                          gpr_M_reg=prefix_S_reg, ue=ue)
                     else:
                         # LEGACY per-row cores, rotate-then-permute. Q is (S, NH*D)
                         # interleaved here -> gqa variant (one rope row broadcast over
@@ -1751,34 +1776,86 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                             cos_dram_addr=self.PREFIX_ROPE_ADDR,
                             sin_dram_addr=self.PREFIX_ROPE_ADDR + self.ROPE_SIN_OFFSET,
                             gpr_M_reg=prefix_S_reg)
-                    self._debug_op(f"layer{layer_idx}_q_rope", self.LAYER0_Q_ROPE_DRAM, S * H, shape=(S, H), ue=ue)
-                    self._debug_op(f"layer{layer_idx}_k_rope", self.LAYER0_K_ROPE_DRAM, S * KV, shape=(S, KV), ue=ue)
-                    if layer_idx == 0 and self._prefix_snap:
-                        self._dram_copy(S * H * bpe, self.LAYER0_Q_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_rope"])
-                        self._dram_copy(S * KV * bpe, self.LAYER0_K_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_rope"])
-
                     if not self.USE_MATMUL_ROPE:
                         # 3. permute Q (seq, heads, head_dim) -> (heads, seq, head_dim);
                         # K/V already (seq, head_dim) since num_kv_heads == 1.
                         smart_bf16_permute_core(ue, (S, NH, D), [1, 0, 2],
                                                  self.LAYER0_Q_ROPE_DRAM, self.LAYER0_Q_PERM_DRAM)
-                    self._debug_op(f"layer{layer_idx}_q_permute", self.LAYER0_Q_PERM_DRAM, S * H, shape=(S, H), ue=ue)
-                    if layer_idx == 0 and self._prefix_snap:
-                        self._dram_copy(S * H * bpe, self.LAYER0_Q_PERM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_permute"])
 
-                    # 4. stage this layer's K/V into the persistent KV cache for downstream
-                    # reuse. Full S on the primary, so the cache layout is byte-identical to
-                    # the single-engine build and prefix_k/v_cache_addr + PREFIX_SEQ_LEN are
-                    # unchanged for the action-expert suffix stack. The V copy reads
-                    # LAYER0_V_PROJ_DRAM, which is written SHARDED -- it MUST stay after
+                # ---- RENDEZVOUS #1a: the sharded RoPE below reads
+                # LAYER0_Q_ROPE_DRAM in full, written by the primary's Q permute
+                # just above (RAW). Only needed when the RoPE is sharded -- without
+                # PREFIX_ROPE_SHARD the permute and the RoPE are the same engine,
+                # back-to-back, and this barrier is not emitted at all.
+                if rope_shard:
+                    self._vis_barrier(ue, engine_idx, ne)
+
+                # ---- RoPE + KV staging  [SHARDED over PREFIX_ROPE_SHARD] --------
+                # Every address is pre-offset to THIS engine's row range; _rope_matmul
+                # is documented row-independent over M. Engines write DISJOINT rows of
+                # Q_PERM / K_ROPE / the KV cache, so no barrier is needed between the
+                # two RoPEs or before the copies -- rendezvous #A below fences them all.
+                if self.USE_MATMUL_ROPE and (rope_shard or is_primary):
+                    _qb = q_off * D * bpe
+                    self._rope_matmul(M=q_rows,
+                                      src_dram=self.LAYER0_Q_ROPE_DRAM + _qb,
+                                      out_dram=self.LAYER0_Q_PERM_DRAM + _qb,
+                                      cos_tiled=self.PREFIX_ROPE_COS_TILED + _qb,
+                                      sin_tiled=self.PREFIX_ROPE_SIN_TILED + _qb,
+                                      rot_dram=self.PREFIX_ROPE_ROT_DRAM + _qb,
+                                      gpr_M_reg=prefix_QR_reg, ue=ue)
+                    # K is a single MQA head, already (S, D) head-major -- so it is the
+                    # FIRST head-tile of the same tiled table; this engine's slice of
+                    # that tile starts at k_off. Its rotate-half scratch is the
+                    # DEDICATED K buffer, never Q's (see PREFIX_ROPE_ROT_K_DRAM).
+                    _kb = k_off * D * bpe
+                    self._rope_matmul(M=k_rows,
+                                      src_dram=self.LAYER0_K_PROJ_DRAM + _kb,
+                                      out_dram=self.LAYER0_K_ROPE_DRAM + _kb,
+                                      cos_tiled=self.PREFIX_ROPE_COS_TILED + _kb,
+                                      sin_tiled=self.PREFIX_ROPE_SIN_TILED + _kb,
+                                      rot_dram=self.PREFIX_ROPE_ROT_K_DRAM + _kb,
+                                      gpr_M_reg=prefix_KR_reg, ue=ue)
+
+                if rope_shard or is_primary:
+                    # 4. stage this layer's K/V into the persistent KV cache. Each engine
+                    # copies ONLY its own K row range, to the SAME absolute addresses the
+                    # single-engine build used, so the cache layout stays byte-identical
+                    # and prefix_k/v_cache_addr + PREFIX_SEQ_LEN are unchanged for the
+                    # action-expert suffix stack. The V copy reads LAYER0_V_PROJ_DRAM,
+                    # written SHARDED by the projections -- it MUST stay after
                     # rendezvous #1. Do not hoist it.
                     k_cache_addr = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
                     v_cache_addr = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
                     # NOTE: the cached K is the ROTATED k (openpi applies rope before
                     # the kv cache write); V is never rotated.
-                    self._dram_copy(S * KV * bpe, self.LAYER0_K_ROPE_DRAM, k_cache_addr, ue=ue)
-                    self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, v_cache_addr, ue=ue)
-                    self._debug_op(f"layer{layer_idx}_kv_cache", k_cache_addr, S * KV, shape=(S, KV), ue=ue)
+                    _kbytes = k_rows * KV * bpe
+                    _koff = k_off * KV * bpe
+                    self._dram_copy(_kbytes, self.LAYER0_K_ROPE_DRAM + _koff,
+                                    k_cache_addr + _koff, ue=ue)
+                    self._dram_copy(_kbytes, self.LAYER0_V_PROJ_DRAM + _koff,
+                                    v_cache_addr + _koff, ue=ue)
+
+                if is_primary:
+                    # Debug/snapshot readbacks. These read FULL buffers, so under
+                    # rope_shard they run before the peers' rows land -- same caveat
+                    # every other sharded op in this file carries, and _prefix_snap is
+                    # already asserted off for a sharded prefix.
+                    self._debug_op(f"layer{layer_idx}_q_rope", self.LAYER0_Q_ROPE_DRAM, S * H, shape=(S, H), ue=ue)
+                    self._debug_op(f"layer{layer_idx}_k_rope", self.LAYER0_K_ROPE_DRAM, S * KV, shape=(S, KV), ue=ue)
+                    self._debug_op(f"layer{layer_idx}_kv_cache",
+                                   self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE,
+                                   S * KV, shape=(S, KV), ue=ue)
+                    # q_permute MUST be read here, not up in the primary block: with
+                    # the matmul RoPE it is the RoPE -- not the permute -- that writes
+                    # LAYER0_Q_PERM_DRAM, and the RoPE now runs below. Reading it
+                    # earlier would snapshot PRE-rotation Q and break the single-engine
+                    # golden compare (compare_prefix_golden).
+                    self._debug_op(f"layer{layer_idx}_q_permute", self.LAYER0_Q_PERM_DRAM, S * H, shape=(S, H), ue=ue)
+                    if layer_idx == 0 and self._prefix_snap:
+                        self._dram_copy(S * H * bpe, self.LAYER0_Q_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_rope"])
+                        self._dram_copy(S * KV * bpe, self.LAYER0_K_ROPE_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_rope"])
+                        self._dram_copy(S * H * bpe, self.LAYER0_Q_PERM_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["q_permute"])
 
                 # ---- RENDEZVOUS #A: the head-sharded attention below reads
                 # LAYER0_Q_PERM_DRAM / LAYER0_K_ROPE_DRAM in full, both written by
@@ -1980,11 +2057,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # <STAGE>_NUM_ENGINES (e.g. VIS_NUM_ENGINES) to a non-None value.
     NUM_ENGINES = 1
 
-    # What `--engines max` resolves to. These are CEILINGS SET BY THE ARCHITECTURE,
-    # not preferences, and each is a different limit:
-    #   VIS      8 -- 2D: 4 row groups x 2 K lanes (_vis_grid). Rows alone still cap
-    #                 at 4 (S=VIS_S=256 is exactly 4 blocks of 64), so the 5th-8th
-    #                 engines split the MLP's K instead: fc1 N-split -> GELU in lane
+    # What `--engines max` resolves to. Each is a different limit:
+    #   VIS      8 -- 2D: 4 row groups x 2 K lanes (_vis_grid) BY DEFAULT. The "rows
+    #                 cap at 4" this works around is a CONVENTION (the 64-row block),
+    #                 NOT an architectural ceiling -- see VIS_M_SHARD / --vis_m_shard,
+    #                 which row-shards all 8 at 32 rows and MEASURES FASTER. Under the
+    #                 2D grid the 5th-8th engines split the MLP's K instead: fc1 N-split -> GELU in lane
     #                 -> fc2 K-split -> 2-way reduce. The attention block stays
     #                 row-parallel and redundant across lanes, because its A operands
     #                 are shared row-major buffers and matmat_mul_core has no
@@ -1996,7 +2074,65 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     #                 the binding dim is o proj N=1024 = 16 blocks, comfortably >8.
     STAGE_MAX_ENGINES = {"VIS": 8, "PREFIX": 8, "DENOISE": 8}
 
+    # Prefix row-split granularity. 8, not 64, for the SAME reason vision drops to
+    # 32 (see VIS_M_SHARD): nothing in _emit_prefix_body consumes a row count as
+    # anything but a runtime M -- rms_norm/matmul take M=rows, eltwise takes
+    # rows*H, and attention is HEAD-sharded, not row-sharded, with RoPE and both
+    # permutes on the primary at full S. There is not a single strided DMA in the
+    # body, so even the AXI-beat rule that constrains vision does not apply here;
+    # 8 is a conservative floor, not a measured one.
+    #
+    # WHY IT MATTERS MORE THAN VISION: cost tracks the LARGEST shard (the roofline
+    # is 0.70 + 5.70*max_blocks + 0.30*heads/engine), and the 64-block rule made
+    # every real prefix length lopsided -- S=576 ran 1x128 + 7x64 (56% efficient)
+    # and S=320 could not be split 8 ways AT ALL and silently fell back to a single
+    # engine. At 8-row blocks all three real lengths divide EVENLY across 8:
+    #   832 -> 8x104   576 -> 8x72   320 -> 8x40
+    PREFIX_ROW_ALIGN = 8
+
+    # Shard the prefix's per-layer SINGLE-ENGINE region (RoPE on Q and K + the
+    # KV-cache staging copies) instead of running it on the primary at full S.
+    #
+    # WHY: balancing the projection row split bought ~0.2s of a 10.3s prefix, which
+    # says the row-sharded projections/MLP are only ~10% of the stage. The rest is
+    # this primary-only region (RoPE over the head-major (NH*S, D) Q batch = 6656
+    # rows at S=832, plus two S*KV cache copies), the head-sharded attention, and
+    # the barriers. RoPE is the largest COMPUTE item left on one engine.
+    #
+    # LEGAL BECAUSE: _rope_matmul is documented row-independent over M ("pass an
+    # `ue` and pre-offset addresses to give an engine its own row range") and every
+    # one of its operands -- src, out, cos_tiled, sin_tiled, rot -- is row-indexed.
+    # The KV copies are contiguous byte ranges. The two PERMUTES stay on the
+    # primary: (S,NH,D)->(NH,S,D) has a strided destination under a row split and
+    # smart_bf16_permute_core has no source/destination stride to express it.
+    #
+    # COSTS ONE EXTRA BARRIER per layer (#1a): the Q permute is a primary-only
+    # producer that the sharded RoPE consumes.
+    PREFIX_ROPE_SHARD = True
+
     VIS_NUM_ENGINES = None       # per-stage override; None -> NUM_ENGINES
+    # Pure M (row) sharding for the vision encoder instead of the 2D rows x K grid
+    # (_vis_grid). S=256 over 8 engines is 32 rows each -- SUB-64, and legal:
+    # matmat_mul_core tiles M with `for output_row in range(m_take)` (the ALU array
+    # is fed along K/N, and only N_chunk is 64-constrained), layer_norm/eltwise take
+    # a runtime row count, unified_attention_core_dynamic constrains only
+    # `aligned_seq_len % 64` and `batch <= aligned_seq_len` (NOT batch), and every
+    # per-engine byte offset is row_offset*X*2 = 64X at 32 rows, so the strided-DMA
+    # AXI-beat assert still holds. The 64 was a convention, not a hardware limit.
+    #
+    # WHY IT MIGHT WIN: under the 2D grid the attention block (q/k/v/out + flash,
+    # ~39% of the stage) is only 4-way parallel with the second K lane recomputing
+    # it redundantly, so 8 engines buy ~5.75x ideal. Pure M makes all of it 8-way.
+    # WHY IT MIGHT LOSE: the B load sits inside the M-chunk loop, so every engine
+    # streams the FULL weight matrix regardless of row count -- 32-row shards halve
+    # the arithmetic intensity per weight byte, where a K-split halves B instead.
+    # Same compute per engine either way (256/8*K*N == 64*(K/2)*N); the whole trade
+    # is attention redundancy vs weight bandwidth. MEASURE IT, don't derive it.
+    VIS_M_SHARD = True
+
+    @property
+    def VIS_ROW_ALIGN(self):
+        return 32 if self.VIS_M_SHARD else 64
     # The prefix LM is row-sharded too (projections / RMSNorms / MLP; RoPE, the
     # two permutes and attention stay on the primary), so it follows --engines.
     # Set to an int to pin the stage independently of the encoder.
@@ -2421,6 +2557,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # guard assumes; the opt-in is explicit at the CLI (--engines/--vis_4/
             # --pref_8/--dns_8 all name a count).
             allow_more_than_two_engines=True,
+            # row_align stays 64 HERE even under VIS_M_SHARD: this scheduler is
+            # SHARED with the prefix (the _sched_by_ne cache below; compile_prefix
+            # reuses it), and a 32 set for vision leaked straight into the prefix's
+            # split -> 832/8 = 96-row shards and an assert in _emit_prefix_body.
+            # The vision 32-row split is computed locally in compile_encoder.
             workers=self._worker_engine_pool(num_engines))
         cache[num_engines] = sched
         return sched
@@ -2534,19 +2675,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """Resolve the PREFIX engine count, falling back to 1 when S cannot be
         block-split.
 
-        THE SPLIT IS BY 64-ROW BLOCKS, NOT EVENLY. Real prefix lengths are
-        320/576/832 (= 256*kept_slots + 64); halving them gives 160/288/416,
-        NONE of which is 64-aligned, and every matmul/RMSNorm here assumes
-        64-aligned row blocks. Block-splitting gives 832 -> 448/384,
-        576 -> 320/256, 320 -> 192/128: uneven (hence a few % off the ideal
-        2.0x) but always aligned. Relaxing the alignment instead
-        (allow_unaligned_rows) is NOT an option -- see multi_engine_shard."""
+        THE SPLIT IS BY PREFIX_ROW_ALIGN-ROW BLOCKS. That used to be 64, which made
+        every real prefix length (320/576/832 = 256*kept_slots + 64) lopsided:
+        576 went 1x128 + 7x64 (56% efficient) and 320 was only 5 blocks, FEWER THAN
+        8 ENGINES, so this function silently returned 1 and the whole stage ran
+        single-engine. At 8-row blocks all three divide evenly across 8 engines
+        (832 -> 8x104, 576 -> 8x72, 320 -> 8x40) and the fallback stops firing.
+
+        The 64 was never a hardware requirement here -- see PREFIX_ROW_ALIGN."""
         ne = self._num_engines("PREFIX")
         if ne <= 1:
             return 1
-        if S % 64 != 0 or S // 64 < ne:
-            print(f"    [prefix] seq_len={S} cannot be 64-block-split across {ne} engine(s) "
-                  f"(blocks={S // 64}); FALLING BACK TO SINGLE-ENGINE PREFIX")
+        a = self.PREFIX_ROW_ALIGN
+        if S % a != 0 or S // a < ne:
+            print(f"    [prefix] seq_len={S} cannot be {a}-block-split across {ne} engine(s) "
+                  f"(blocks={S // a}); FALLING BACK TO SINGLE-ENGINE PREFIX")
             return 1
         return ne
 
@@ -2665,7 +2808,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # _col_split is the same whole-64-block rule split_rows uses in "blocks"
         # mode; used directly here because the row split is over nr GROUPS, not
         # over all ne engines.
-        splits = self._col_split(S, nr) if nk > 1 else sched.split_rows(S)
+        if self.VIS_M_SHARD:
+            # NOT sched.split_rows: the scheduler is shared with the prefix and its
+            # row_align is 64. _col_split takes the alignment explicitly, so the
+            # 32-row granularity stays scoped to this stage.
+            splits = self._col_split(S, nr, align=self.VIS_ROW_ALIGN)
+        else:
+            splits = self._col_split(S, nr) if nk > 1 else sched.split_rows(S)
         if nk > 1:
             print(f"    [vis] 2D shard: {nr} row group(s) x {nk} K lane(s) = {ne} engines "
                   f"(rows {[c for _, c in splits]}; MLP K-split, rest row-parallel)")
@@ -2768,7 +2917,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         RI = row_offset * IP * bpe                   # [S, IP] MLP intermediate
         RK = row_offset * self.VIS_PATCH_K * bpe     # [S, PK] patchified pixels
         RO = row_offset * HO * bpe                   # [S, HO] head output
-        assert rows % 64 == 0, f"shard row count {rows} must be 64-aligned"
+        assert rows % self.VIS_ROW_ALIGN == 0, (
+            f"shard row count {rows} must be {self.VIS_ROW_ALIGN}-aligned")
 
         zeros_addr = sched.per_engine_addr("vis_zeros", engine_idx)
         # 2D-only lane buffers (see the MLP block). Resolved here so the nk == 1
@@ -3038,7 +3188,42 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                              # matmul core is a 64xN systolic array this is higher --
                              # set to the real MAC/cycle to get an accurate %-of-peak.
     AE_ACTION_HORIZON = 10
-    AE_ACTION_HORIZON_PADDED = 64  # padded for 64-alignment (flash / matmul row tiling)
+    AE_ACTION_HORIZON_PADDED = 64  # padded for 64-alignment (see AE_M_PROBE)
+
+    # TRIM THE PADDED ACTION ROWS. The stage stores 64 rows per suffix tensor but
+    # only AE_ACTION_HORIZON=10 are real action tokens; rows 10..63 are 1e-6 filler.
+    # Measured: 483.5 GFLOP issued to do 74.7 GFLOP of real work (6.47x ~= 64/10).
+    #
+    # Legal because M is free (matmat_mul_core tiles M one row at a time; only
+    # N_chunk is 64-constrained) -- the "64-alignment" in AE_ACTION_HORIZON_PADDED's
+    # comment was a convention for the matmul, and a REQUIREMENT only for attention.
+    #
+    # WHAT IS TRIMMED: every PBI op whose operands are (rows, width) row-major and
+    # row-independent -- AdaRMSNorm, q/k/v projections, o projection, the gated MLP,
+    # the K RoPE. Those compute rows 0..9 and leave 10..63 stale.
+    #
+    # WHAT IS **NOT** TRIMMED, and why this is still numerically exact:
+    #   * THE BUFFER LAYOUT IS UNCHANGED. Head stride stays
+    #     AE_ACTION_HORIZON_PADDED. Trimming the stride instead is what makes the
+    #     batched Q RoPE read across head boundaries (M=NH*10 over a stride-64
+    #     buffer rotates head 0 rows 0..63 + head 1 rows 0..15 and leaves heads 2..7
+    #     UNROTATED -- output that still looks plausible by eye. Do not "simplify"
+    #     this back.)
+    #   * The Q RoPE is emitted PER HEAD at M=10 rather than as one NH*S batch.
+    #   * Attention keeps batch=AE_UATTN_BATCH and aligned_seq_len=Tkv. Tkv =
+    #     PREFIX_SEQ_LEN + 64 MUST stay 64-aligned (unified_attention_core_dynamic
+    #     asserts aligned_seq_len % 64) -- a real hardware constraint, not a
+    #     convention. It recomputes the dead query rows; the o projection reads only
+    #     rows 0..9 of its output, so they are discarded.
+    #   * The stale suffix K/V rows P+10..P+63 are already -inf masked
+    #     (_build_ae_suffix_bias: bias[:, P + AE_ACTION_HORIZON:] = NEG_INF), so they
+    #     contribute to no real row's softmax. This is why the padding was always
+    #     dead work.
+    #
+    # Shrinking attention's batch from NH*64 to NH*10 is the remaining win and needs
+    # the compact layout (Q/attn-out stride, the tiled RoPE tables, and the
+    # (batch, Tkv) bias all move together). NOT done here.
+    AE_TRIM_PAD_ROWS = os.environ.get("PI05_AE_TRIM", "1") not in ("0", "", "false", "False")
     AE_NUM_DENOISE_STEPS = 10
     AE_LOOP_TRIP_OVERRIDE = None  # debug knob, see compile_denoise_loop's loop_start call
     DENOISE_STEP0_PROBE = False  # if True, snapshot step-0 intermediates for reference diff
@@ -3057,9 +3242,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     def _vis_grid(self, ne, s=None):
         """(row_groups, k_groups) for `ne` vision engines -- the 2D vision shard.
 
-        The vision encoder's M is only S//64 = 4 blocks of 64 rows, so a pure
-        M-split caps at 4 engines. The PROJECTIONS, however, are 94.9% of the
-        stage and every one of them has a fat K:
+        The vision encoder's M is S//64 = 4 blocks of 64 rows, so a pure M-split
+        caps at 4 engines AT THIS GRANULARITY. 64 is a convention, not a hardware
+        limit -- VIS_M_SHARD drops it to 32 and row-shards all 8, which measures
+        faster because it also parallelizes the attention block 8-way instead of
+        leaving it 4-way with a redundant K lane (see the flag). The 2D grid below
+        remains the default until its numerics are compared.
+
+        The PROJECTIONS are 94.9% of the stage and every one of them has a fat K:
 
             q/k/v  K=H=1152   (18 blocks)     out  K=NH*DP=2048 (32 blocks)
             fc1    K=H=1152   (18 blocks)     fc2  K=IP=4352    (68 blocks)
@@ -3076,7 +3266,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         Row groups are the largest divisor of `ne` that still fits in S//64, so
         ne=4 -> (4,1) is byte-identical to today and ne=8 -> (4,2).
         """
-        max_rows = (s or self.VIS_S) // 64
+        S = s or self.VIS_S
+        if self.VIS_M_SHARD:
+            # Pure row split at 32-row granularity (see VIS_M_SHARD).
+            assert ne <= S // self.VIS_ROW_ALIGN, (
+                f"VIS_M_SHARD: {ne} engines needs {ne} row groups but S={S} is only "
+                f"{S // self.VIS_ROW_ALIGN} block(s) of {self.VIS_ROW_ALIGN}")
+            return ne, 1
+        max_rows = S // 64
         nr = max(d for d in range(1, max_rows + 1) if ne % d == 0)
         return nr, ne // nr
 
@@ -3642,7 +3839,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     #
     # Coverage is now ~97% of the stage instead of ~80%.
 
-    def _ae_q_proj_sharded(self, sched, M, la, gpr_M_regs):
+    def _ae_q_proj_sharded(self, sched, M, la, gpr_M_regs, stride_rows=None):
         """HEAD-PARALLEL q projection + RoPE. Joins: the primary's attention reads
         every head's Q.
 
@@ -3657,6 +3854,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         H, D, NH = self.AE_HIDDEN, self.HEAD_DIM, self.AE_HEADS
         bpe = 2
+        # M is the ROW COUNT; SR is the head STRIDE in AE_Q_DRAM. They were the same
+        # value until AE_TRIM_PAD_ROWS made us compute 10 of 64 rows, and conflating
+        # them silently compacts the layout out from under the attention op (which
+        # still reads stride SR) and under the batched RoPE below. Keep them apart.
+        SR = stride_rows if stride_rows is not None else M
+        assert M <= SR, f"row count {M} exceeds head stride {SR}"
         heads = self._ae_head_split(sched.num_engines)
 
         def _body(ctx):
@@ -3669,12 +3872,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             raw, mreg = ctx.unsafe_ue, gpr_M_regs[i]
             for h in range(h0, h0 + nh):
                 self._ae_matmul(M, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
-                                 self.AE_Q_DRAM + h * M * D * bpe, gpr_M_reg=mreg, ue=raw)
+                                 self.AE_Q_DRAM + h * SR * D * bpe, gpr_M_reg=mreg, ue=raw)
                 if not self.USE_MATMUL_ROPE:
                     raw.rope_hf_core_dram(
                         M=M, N=D,
-                        input_dram_addr=self.AE_Q_DRAM + h * M * D * bpe,
-                        output_dram_addr=self.AE_Q_ROPE_DRAM + h * M * D * bpe,
+                        input_dram_addr=self.AE_Q_DRAM + h * SR * D * bpe,
+                        output_dram_addr=self.AE_Q_ROPE_DRAM + h * SR * D * bpe,
                         cos_dram_addr=self.AE_ROPE_ADDR,
                         sin_dram_addr=self.AE_ROPE_ADDR + self.ROPE_SIN_OFFSET,
                         gpr_M_reg=mreg)
@@ -3685,8 +3888,22 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # below uses. The tiled cos/sin tables are head-major over exactly
             # this layout, so engine i just offsets them by h0*M rows too, and
             # every engine writes a disjoint slice of the shared ROT scratch.
+            # CONTIGUOUS ONLY WHEN M == SR. Trimmed (M < SR) the heads are no longer
+            # back-to-back, so one nh*M batch would run off the end of head h0 into
+            # h0+1's padding rows -- the failure that leaves later heads UNROTATED
+            # while the actions still look plausible. Emit per head instead.
+            if self.USE_MATMUL_ROPE and M != SR:
+                for h in range(h0, h0 + nh):
+                    _b = h * SR * D * bpe
+                    self._rope_matmul(M=M,
+                                      src_dram=self.AE_Q_DRAM + _b,
+                                      out_dram=self.AE_Q_ROPE_DRAM + _b,
+                                      cos_tiled=self.AE_ROPE_COS_TILED + _b,
+                                      sin_tiled=self.AE_ROPE_SIN_TILED + _b,
+                                      rot_dram=self.AE_ROPE_ROT_DRAM + _b,
+                                      gpr_M_reg=self._ae_rope_M_regs[i], ue=raw)
             row0 = h0 * M
-            if self.USE_MATMUL_ROPE:
+            if self.USE_MATMUL_ROPE and M == SR:
                 self._rope_matmul(M=nh * M,
                                   src_dram=self.AE_Q_DRAM + row0 * D * bpe,
                                   out_dram=self.AE_Q_ROPE_DRAM + row0 * D * bpe,
@@ -4086,7 +4303,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         compiled ONCE by the caller after every call site has been emitted."""
         la = self.ae_layer_addrs[layer_idx]
         H, D = self.AE_HIDDEN, self.HEAD_DIM
-        S = self.AE_ACTION_HORIZON_PADDED
+        S = self.AE_ACTION_HORIZON_PADDED          # PHYSICAL row stride of every buffer
+        S_M = self.AE_ACTION_HORIZON if self.AE_TRIM_PAD_ROWS else S   # rows we compute
         Tkv, P = self.AE_TKV, self.AE_PREFIX_SEQ_LEN
         k_combined = self.ae_k_combined[layer_idx]
         v_combined = self.ae_v_combined[layer_idx]
@@ -4147,7 +4365,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # is deliberately excluded.
         _proj_sharded = self._ae_attn_shardable(sched)
         if _proj_sharded:
-            self._ae_q_proj_sharded(sched, S, la, gpr_M_regs)
+            self._ae_q_proj_sharded(sched, S_M, la, gpr_M_regs, stride_rows=S)
         for h in range(self.AE_HEADS if not _proj_sharded else 0):
             self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
                              self.AE_Q_DRAM + h * S * D * 2, gpr_M_reg=gpr_M_reg)
@@ -4159,7 +4377,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     cos_dram_addr=self.AE_ROPE_ADDR,
                     sin_dram_addr=self.AE_ROPE_ADDR + self.ROPE_SIN_OFFSET,
                     gpr_M_reg=gpr_M_reg)
-        if not _proj_sharded and self.USE_MATMUL_ROPE:
+        if not _proj_sharded and self.USE_MATMUL_ROPE and S_M == S:
             # All AE_HEADS at once: head h's queries are the contiguous (S, D)
             # block at h*S*D, so the whole buffer is one (AE_HEADS*S, D) batch and
             # the tiled cos/sin tables are laid out over exactly that. One RoPE
@@ -4171,6 +4389,23 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                               sin_tiled=self.AE_ROPE_SIN_TILED,
                               rot_dram=self.AE_ROPE_ROT_DRAM,
                               gpr_M_reg=self._ae_rope_M_regs[0])
+        elif not _proj_sharded and self.USE_MATMUL_ROPE:
+            # TRIMMED: heads are NOT contiguous any more (S_M rows used of an S-row
+            # stride), so the single NH*S_M batch above would rotate head 0's padding
+            # instead of heads 1..NH-1 and leave them UNROTATED. Same row count
+            # (NH*S_M), one call per head, correct offsets. The tiled cos/sin tables
+            # are head-major over the S-row stride, so they take the same h*S*D
+            # offset as Q; the ROT scratch is sized AE_HEADS*S*D so the slices stay
+            # disjoint.
+            for h in range(self.AE_HEADS):
+                _b = h * S * D * 2
+                self._rope_matmul(M=S_M,
+                                  src_dram=self.AE_Q_DRAM + _b,
+                                  out_dram=self.AE_Q_ROPE_DRAM + _b,
+                                  cos_tiled=self.AE_ROPE_COS_TILED + _b,
+                                  sin_tiled=self.AE_ROPE_SIN_TILED + _b,
+                                  rot_dram=self.AE_ROPE_ROT_DRAM + _b,
+                                  gpr_M_reg=self._ae_rope_M_regs[0])
         self._debug_op(f"{_pfx}_q_proj", self.AE_Q_DRAM, S * D, shape=(S, D))
         self._debug_op(f"{_pfx}_q_rope", self.AE_Q_ROPE_DRAM, S * D, shape=(S, D))
         if getattr(self, "DENOISE_STEP0_PROBE", False) and step == 0 and layer_idx == 0:
@@ -4375,15 +4610,24 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # a skip_prefix run never calls it)
         self._rope_init()
 
+        # Real suffix row count (see AE_TRIM_PAD_ROWS). S stays the PHYSICAL row
+        # stride of every buffer; S_M is how many rows we actually compute.
+        S_M = self.AE_ACTION_HORIZON if self.AE_TRIM_PAD_ROWS else S
+        if S_M != S:
+            _original_print(
+                f"  [denoise] trimming padded action rows: computing {S_M} of {S} "
+                f"rows per suffix op (layout unchanged; attention still runs "
+                f"batch={self.AE_UATTN_BATCH} over the 64-aligned Tkv)")
+
         ae_S_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(ae_S_reg, S)
+        self.generate_instruction_add_set(ae_S_reg, S_M)
         # One M=S GPR PER ENGINE: gpr_M_reg indices are per-engine ISA registers and
         # a worker's allocator was just reset by begin_program(), so the primary's
         # index is meaningless on a worker. Primed here, once, outside every region.
         ae_S_regs = [ae_S_reg]
         for w in (sched.workers if sched is not None else []):
             r = w.alloc_isa_reg()
-            w.generate_instruction_add_set(r, S)
+            w.generate_instruction_add_set(r, S_M)
             ae_S_regs.append(r)
 
         # M = nh*S for the matmul RoPE, which covers an engine's WHOLE head range
@@ -4395,7 +4639,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self._ae_rope_M_regs = []
         for eng in ([self] + list(sched.workers if sched is not None else [])):
             r = eng.alloc_isa_reg()
-            eng.generate_instruction_add_set(r, nh_per * S)
+            # nh_per*S only when the whole head range is one contiguous batch,
+            # i.e. when nothing is trimmed. Trimmed, the Q RoPE goes per head at
+            # S_M rows (head stride is still S), so this register holds S_M.
+            eng.generate_instruction_add_set(r, nh_per * S if S_M == S else S_M)
             self._ae_rope_M_regs.append(r)
 
         # Norm ABI (post pcie_only sync): rms_norm_core_dram no longer folds sqrt(N)
@@ -6767,7 +7014,7 @@ def _load_sample_prompt_tokens():
     return np.array(sp.encode(full_prompt, add_bos=True), dtype=np.int64)
 
 
-def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, tag="main"):
+def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, vis_m_shard=None, tag="main"):
     """Set the engine-count class attributes. Returns True if this is multi-engine.
 
     SHARED by pi05_libero_test.main() and libero_eval.py. It lives here as a
@@ -6813,6 +7060,16 @@ def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, tag="ma
     # with each other: `--vis_4 --pref_8` runs vision on 4 and the prefix on 8
     # while denoise stays on --engines. Sharding a stage is not free in DRAM --
     # see _vis_worker_arena_base, which sizes ONE arena set from the PEAK count.
+    # Set BEFORE any VIS_NUM_ENGINES resolution below: _vis_grid, the scheduler's
+    # row_align and weight_init's K-slicing all read VIS_M_SHARD.
+    # None = leave the class default (M-shard ON). --no-vis_m_shard restores the
+    # historical 2D rows x K grid for an A/B.
+    if vis_m_shard is not None:
+        Pi05Libero_UnifiedEngine.VIS_M_SHARD = bool(vis_m_shard)
+    if not Pi05Libero_UnifiedEngine.VIS_M_SHARD:
+        print(f"[{tag}] --no-vis_m_shard: vision back on the 2D rows x K grid "
+              "(4 row groups x 2 K lanes at 8 engines); attention runs 4-way with a "
+              "redundant K lane. Slower in measurement -- this is the A/B baseline.")
     if vis_4:
         Pi05Libero_UnifiedEngine.VIS_NUM_ENGINES = 4
         print(f"[{tag}] --vis_4: vision encoder row-sharded across 4 engines "
@@ -6927,6 +7184,20 @@ def main():
                           "--vis_4 --pref_8 --dns_8. Those three still exist for isolating one "
                           "stage at a time (e.g. --vis_4 alone gives a single-engine prefix "
                           "baseline) and take precedence over this flag.")
+    ap.add_argument("--vis_m_shard", action=argparse.BooleanOptionalAction, default=None,
+                     help="Shard the VISION encoder by ROWS ONLY (32 rows/engine at 8), "
+                          "instead of the default 2D 4-row-groups x 2-K-lanes grid. The "
+                          "64-row floor the 2D grid works around is a CONVENTION, not a "
+                          "hardware limit: matmat_mul_core tiles M one row at a time (only "
+                          "N_chunk is 64-constrained), layer_norm/eltwise take a runtime row "
+                          "count, and unified_attention_core_dynamic constrains "
+                          "aligned_seq_len %% 64 but NOT batch. Upside: q/k/v/out + flash "
+                          "(~39%% of the stage) run 8-way instead of 4-way with the second K "
+                          "lane recomputing them (~5.75x -> 8x ideal). Downside: the B load "
+                          "sits inside the M-chunk loop, so each engine streams the FULL "
+                          "weight matrix for half as many rows -- a K-split halves B instead. "
+                          "DEFAULT ON -- it measured faster on hardware. Pass "
+                          "--no-vis_m_shard for the 2D-grid baseline.")
     ap.add_argument("--pref_8", action="store_true",
                      help="Row-shard the PREFIX LM across 8 engines (PREFIX_NUM_ENGINES=8), "
                           "independently of --engines. The prefix is ~73%% of total FLOPs, so "
@@ -7013,6 +7284,7 @@ def main():
         "stopping points on the same ladder (encoder -> prefix -> full). Pick one.")
 
     _multi = configure_engines(args.engines, vis_4=args.vis_4, pref_8=args.pref_8,
+                               vis_m_shard=args.vis_m_shard,
                                dns_8=args.dns_8, tag="main")
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
@@ -7060,6 +7332,7 @@ def main():
     # here, or it is quietly ignored whenever a bin set happens to be present.
     _bin_ok = not (args.debug or args.sanity_check or args.probe_step0
                    or _multi or args.vis_4 or args.pref_8 or args.dns_8
+                   or args.vis_m_shard is not None
                    or args.encoderend or args.prefixend)
     bins_exist = _bin_ok and os.path.exists(os.path.join(BIN_DIR, "params.bin")) \
                           and os.path.exists(os.path.join(BIN_DIR, "programs.bin")) \
