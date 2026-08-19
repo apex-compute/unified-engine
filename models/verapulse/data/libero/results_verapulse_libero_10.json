@@ -1,0 +1,121 @@
+{
+  "model": "verapulse/pulsevla-libero-0.5b",
+  "policy_validated": false,
+  "warning": "action expert ~17 dB below its bf16 floor, executed actions at cos 0.97 vs the CPU oracle -- this success rate does NOT characterize the model or the accelerator",
+  "backend": "fpga",
+  "weights": "real",
+  "task_suite": "libero_10",
+  "seed": 7,
+  "task_start": 0,
+  "tasks": 10,
+  "trials": 1,
+  "max_steps": 520,
+  "replan_steps": 10,
+  "image_norm": "pm1",
+  "entry": "vision+prefix+denoise",
+  "successes": 3,
+  "episodes_total": 10,
+  "success_rate": 0.3,
+  "episodes": [
+    {
+      "task_id": 0,
+      "trial": 0,
+      "language": "put both the alphabet soup and the tomato sauce in the basket",
+      "steps": 530,
+      "inferences": 52,
+      "seconds": 241.9,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 1,
+      "trial": 0,
+      "language": "put both the cream cheese box and the butter in the basket",
+      "steps": 420,
+      "inferences": 42,
+      "seconds": 194.8,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 2,
+      "trial": 0,
+      "language": "turn on the stove and put the moka pot on it",
+      "steps": 530,
+      "inferences": 52,
+      "seconds": 239.9,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 3,
+      "trial": 0,
+      "language": "put the black bowl in the bottom drawer of the cabinet and close it",
+      "steps": 259,
+      "inferences": 25,
+      "seconds": 115.7,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 4,
+      "trial": 0,
+      "language": "put the white mug on the left plate and put the yellow and white mug on the right plate",
+      "steps": 530,
+      "inferences": 52,
+      "seconds": 240.8,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 5,
+      "trial": 0,
+      "language": "pick up the book and place it in the back compartment of the caddy",
+      "steps": 530,
+      "inferences": 52,
+      "seconds": 240.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 6,
+      "trial": 0,
+      "language": "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+      "steps": 530,
+      "inferences": 52,
+      "seconds": 240.6,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 7,
+      "trial": 0,
+      "language": "put both the alphabet soup and the cream cheese box in the basket",
+      "steps": 321,
+      "inferences": 32,
+      "seconds": 148.0,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 8,
+      "trial": 0,
+      "language": "put both moka pots on the stove",
+      "steps": 530,
+      "inferences": 52,
+      "seconds": 240.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 9,
+      "trial": 0,
+      "language": "put the yellow and white mug in the microwave and close it",
+      "steps": 530,
+      "inferences": 52,
+      "seconds": 240.2,
+      "success": false,
+      "errored": false
+    }
+  ]
+}
