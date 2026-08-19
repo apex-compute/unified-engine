@@ -17,6 +17,13 @@ Architecture differences vs Gemma3:
   - LM head weight is tied to the embedding weight.
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
+DRAM map (device DRAM is mapped AT 0x80000000; nothing usable below it — see
+__init__ for the authoritative layout + boundary guards):
+  params : 0x80000000 .. 0xB0000000   weights
+  tensor : 0xB0000000 .. 0xFE000000   activations / KV
+  worker : 0xFE000000 .. 0xFF600000   --multi-core prefill worker programs only
+  program: 0xFF600000 .. 0x100000000  master instruction image + preamble
+
 Weights:
   - Default: llama3.2_1b_bin/params.bin (generated from HF model if missing).
   - --local-weights: use llama3.2_1b_bin/full_model_weights.bin instead.
@@ -348,19 +355,36 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
                  decoder_matmatmul: bool | None = None, stream_prefill: bool | None = None,
                  matmatmul: bool | None = None, prefill_kernel: str | None = None,
-                 decode_kernel: str | None = None):
+                 decode_kernel: str | None = None, multi_core: int = 1):
         # IF4 layout inside the 2 GB window 0x80000000..0xFFFFFFFF.
+        # DRAM is mapped AT 0x80000000 (user_dma_core.DRAM_START_ADDR); there is
+        # NO usable DRAM below it, so every region — including the multi-core
+        # worker ISA band — must be carved out of THIS window. (The scheduler's
+        # default worker arena is DRAM_START + 0x10000000 = 0x90000000, which
+        # lands ~256 MiB deep inside the weights below; --multi-core therefore
+        # passes an explicit base — see _ensure_prefill_scheduler.)
         # At max_context_size=1024 the loaded params use ~642 MiB and tensors/KV
-        # use ~212 MiB. Keep simple aligned boundaries and reserve the final
-        # 10 MiB exclusively for the captured instruction image + preamble.
+        # use ~212 MiB. Keep simple aligned boundaries; reserve the final 10 MiB
+        # for the master instruction image + preamble, and a 22 MiB band just
+        # below it for the multi-core prefill worker programs.
         #   params : 0x80000000 .. 0xB0000000  (768 MiB)
-        #   tensor : 0xB0000000 .. 0xFF600000  (1270 MiB)
+        #   tensor : 0xB0000000 .. 0xFE000000  (1248 MiB)
+        #   worker : 0xFE000000 .. 0xFF600000  (22 MiB, --multi-core only)
         #   program: 0xFF600000 .. 0x100000000 (10 MiB)
         super().__init__(
             params_dram_base=0x80000000,
             tensor_dram_base=0xB0000000,
             program_dram_base=0xFF600000,
         )
+        # Multi-core prefill worker ISA band (consumed in _ensure_prefill_scheduler).
+        # Workers hold ONLY their prefill program here; every data buffer they
+        # touch is addressed absolutely into the shared llama tensors, so no
+        # separate worker params/tensor arena is needed. Each worker gets a
+        # WORKER_ISA_STRIDE-sized slice and the band ends exactly at the master
+        # program base, so the tensor region above and the program region below
+        # both bound it. 3 MiB/worker × ≤7 workers (22 MiB) stays under 0xFF600000.
+        self.WORKER_ISA_BASE   = 0xFE000000
+        self.WORKER_ISA_STRIDE = 0x00300000   # 3 MiB / worker
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         # Unified kernel selection. The boolean inputs are legacy constructor
         # aliases retained for callers outside this script.
@@ -400,6 +424,14 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             )
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
+        # Multi-core prefill: engine 0 is this (primary); engines 1..N-1 are worker
+        # UnifiedEngines built lazily by the scheduler. N>2 is unverified on this
+        # device (the scheduler asserts unless opted in). See _ensure_prefill_scheduler.
+        if not 1 <= multi_core <= 8:
+            raise ValueError(f"multi_core must be between 1 and 8, got {multi_core}")
+        self.multi_core = multi_core
+        self._prefill_scheduler = None
+        self._prefill_worker_addrs = []
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
@@ -457,11 +489,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 f"tensor_start=0x{self._tensor_dram_base:X}"
             )
         self.tensor_init()
-        if self.get_tensor_dram_addr() > self._program_dram_base:
+        # Tensor now ends at the worker ISA band, not the master program region:
+        # the 22 MiB worker band (0xFE000000..program_base) sits between them.
+        if self.get_tensor_dram_addr() > self.WORKER_ISA_BASE:
             raise MemoryError(
-                f"Tensor DRAM overlaps program DRAM: "
+                f"Tensor DRAM overlaps the multi-core worker ISA band: "
                 f"tensor_end=0x{self.get_tensor_dram_addr():X}, "
-                f"program_start=0x{self._program_dram_base:X}"
+                f"worker_isa_base=0x{self.WORKER_ISA_BASE:X}"
             )
 
     def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
@@ -633,7 +667,47 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
-    def _compile_prefill_program(self, template_seq_len: int, layer_size: int, profile: bool = False) -> dict:
+    def _ensure_prefill_scheduler(self):
+        """Lazily build (once) the MultiEngineScheduler for prefill row-sharding.
+        Returns None for single-core.
+
+        Worker programs are placed in the dedicated WORKER_ISA band carved out of
+        llama's own address window (0xFE000000..program_base). The scheduler's
+        DEFAULT worker arena (DRAM_START + 0x10000000 = 0x90000000) must NOT be
+        used: DRAM is mapped at 0x80000000, so that default lands inside the
+        weights and silently corrupts them. worker_tensor_offset/
+        worker_program_offset=0 make the passed base the worker's program base
+        directly (workers never use their params/tensor allocators — all data is
+        addressed absolutely into the shared llama tensors)."""
+        if self.multi_core <= 1:
+            return None
+        if self._prefill_scheduler is None:
+            from multi_engine_shard import MultiEngineScheduler
+            # Boundary protection: the whole worker band (one WORKER_ISA_STRIDE
+            # slice per worker) must fit under the master program region.
+            band_end = self.WORKER_ISA_BASE + (self.multi_core - 1) * self.WORKER_ISA_STRIDE
+            if band_end > self._program_dram_base:
+                raise MemoryError(
+                    f"Worker ISA band overflows the program region for "
+                    f"multi_core={self.multi_core}: band_end=0x{band_end:X} > "
+                    f"program_base=0x{self._program_dram_base:X} "
+                    f"(base=0x{self.WORKER_ISA_BASE:X}, stride=0x{self.WORKER_ISA_STRIDE:X})"
+                )
+            # allow_unaligned_rows: the row-local MLP kernels (rms/eltwise/matmul)
+            # loop per token, so a non-64-aligned M shard is safe here and lets a
+            # short prompt (e.g. 44 tokens → 22/22) still split across 2 engines.
+            self._prefill_scheduler = MultiEngineScheduler(
+                self, num_engines=self.multi_core,
+                worker_dram_base=self.WORKER_ISA_BASE,
+                worker_dram_stride=self.WORKER_ISA_STRIDE,
+                worker_tensor_offset=0,
+                worker_program_offset=0,
+                allow_unaligned_rows=True,
+                allow_more_than_two_engines=self.multi_core > 2)
+        return self._prefill_scheduler
+
+    def _compile_prefill_program(self, template_seq_len: int, layer_size: int, profile: bool = False,
+                                 prefill_scheduler=None) -> dict:
         """Compile prefill into the active capture session.
 
         ``template_seq_len`` is used only for FLOPs accounting and static M= args;
@@ -705,6 +779,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 kwargs.pop("is_B_quantized", None)
                 return self.quantized_matmat_core(M=M, K=K, N=N, **kwargs)
             return self.matmat_mul_core(M=M, K=K, N=N, **kwargs)
+
+        def _shard_projection_core(ue, M: int, K: int, N: int, **kwargs) -> int:
+            """Emit one row-shard projection onto engine ``ue`` using the same
+            (streaming, compact) kernel as single-core so the master program still
+            fits the 10 MiB region. The row count comes from gpr_M_reg (the caller
+            primes it) — the streaming kernel needs a GPR-driven M, not a baked one."""
+            if self.prefill_kernel == "streaming":
+                kwargs.pop("is_B_quantized", None)
+                return ue.quantized_matmat_core(M=M, K=K, N=N, **kwargs)
+            return ue.matmat_mul_core(M=M, K=K, N=N, **kwargs)
 
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
@@ -916,48 +1000,92 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             if profile:
                 _checkpoint(f"L{layer_idx}_o_proj_residual")
 
-            # LLaMA: post_attention_layernorm IS the pre-FFN norm
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
-                              gpr_M_reg=self.gpr_seq_len)
-            if profile:
-                _checkpoint(f"L{layer_idx}_pre_ffn_norm")
-            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True,
-                gpr_M_reg=self.gpr_seq_len)
-            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4,
-                gpr_M_reg=self.gpr_seq_len)
-            # gate × up — per-row PBI loop (gpr_seq_len trips); one row of mlp_elements per iter.
-            self.eltwise_core_dram(
-                M=seq_len, N=self.mlp_elements,
-                dram_a=self.LAYER0_MLP_GATE_DRAM,
-                dram_b=self.LAYER0_MLP_UP_DRAM,
-                dram_out=self.LAYER0_MLP_MULT_DRAM,
-                mode=UE_MODE.ELTWISE_MUL,
-                gpr_M_reg=self.gpr_seq_len,
-            )
-            if profile:
-                _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
-            total_flops += prefill_projection_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4,
-                gpr_M_reg=self.gpr_seq_len)
+            # ---- MLP block: post-attn norm + gate/up + silu·mul + down + residual.
+            # Every op here is row-local (each token independent), so with
+            # --multi-core it row-shards cleanly across engines: engine e handles
+            # rows [row_offset, row_offset+rows) of every buffer, reading the shared
+            # (read-only) weights by absolute address. The scheduler emits an entry
+            # + exit barrier around the region. Single-core path is unchanged.
+            vlb = self.vector_length * self.bytes_per_element
+            mlpb = self.mlp_elements * self.bytes_per_element
+            if prefill_scheduler is None:
+                # LLaMA: post_attention_layernorm IS the pre-FFN norm
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
+                                  gpr_M_reg=self.gpr_seq_len)
+                if profile:
+                    _checkpoint(f"L{layer_idx}_pre_ffn_norm")
+                total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True,
+                    gpr_M_reg=self.gpr_seq_len)
+                total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4,
+                    gpr_M_reg=self.gpr_seq_len)
+                # gate × up — per-row PBI loop (gpr_seq_len trips); one row of mlp_elements per iter.
+                self.eltwise_core_dram(
+                    M=seq_len, N=self.mlp_elements,
+                    dram_a=self.LAYER0_MLP_GATE_DRAM,
+                    dram_b=self.LAYER0_MLP_UP_DRAM,
+                    dram_out=self.LAYER0_MLP_MULT_DRAM,
+                    mode=UE_MODE.ELTWISE_MUL,
+                    gpr_M_reg=self.gpr_seq_len,
+                )
+                if profile:
+                    _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
+                total_flops += prefill_projection_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4,
+                    gpr_M_reg=self.gpr_seq_len)
 
-            # LLaMA: no post-FFN norm; add residual directly to down_proj output.
-            # Per-row PBI loop (gpr_seq_len trips) — layer_output = POST_ATTN_RESIDUAL + MLP_DOWN.
-            self.eltwise_core_dram(
-                M=seq_len, N=self.vector_length,
-                dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                dram_b=self.LAYER0_MLP_DOWN_DRAM,
-                dram_out=self.LAYER0_OUTPUT_DRAM,
-                mode=UE_MODE.ELTWISE_ADD,
-                gpr_M_reg=self.gpr_seq_len,
-            )
-            if profile:
-                _checkpoint(f"L{layer_idx}_mlp_down_residual")
+                # LLaMA: no post-FFN norm; add residual directly to down_proj output.
+                # Per-row PBI loop (gpr_seq_len trips) — layer_output = POST_ATTN_RESIDUAL + MLP_DOWN.
+                self.eltwise_core_dram(
+                    M=seq_len, N=self.vector_length,
+                    dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                    dram_b=self.LAYER0_MLP_DOWN_DRAM,
+                    dram_out=self.LAYER0_OUTPUT_DRAM,
+                    mode=UE_MODE.ELTWISE_ADD,
+                    gpr_M_reg=self.gpr_seq_len,
+                )
+                if profile:
+                    _checkpoint(f"L{layer_idx}_mlp_down_residual")
+            else:
+                _mlp_flops = [0]
+                def _emit_mlp_shard(ctx, layer_off=layer_off):
+                    # Per-engine row count via a GPR. gpr_q_seq_len (reg 6) is unused
+                    # in prefill after the proper-GQA rewrite, so repurpose it as the
+                    # shard row-count register on every engine (the master's dynamic
+                    # ISA pool is full; the workers set their own). Primed once per
+                    # shard, then reused by every op in the block.
+                    ue = ctx.unsafe_ue
+                    m = self.gpr_q_seq_len
+                    ue.generate_instruction_add_set(m, ctx.rows)
+                    ue.rms_norm_core_dram(M=ctx.rows, N=self.vector_length,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, vlb),
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_PRE_MLP_NORM_DRAM, vlb),
+                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off, gpr_M_reg=m)
+                    _mlp_flops[0] += _shard_projection_core(ue, M=ctx.rows, K=self.vector_length, N=self.mlp_elements,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_PRE_MLP_NORM_DRAM, vlb), B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_MLP_GATE_DRAM, mlpb),
+                        is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True, gpr_M_reg=m)
+                    _mlp_flops[0] += _shard_projection_core(ue, M=ctx.rows, K=self.vector_length, N=self.mlp_elements,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_PRE_MLP_NORM_DRAM, vlb), B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_MLP_UP_DRAM, mlpb),
+                        is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4, gpr_M_reg=m)
+                    ue.eltwise_core_dram(M=ctx.rows, N=self.mlp_elements,
+                        dram_a=ctx.rows_addr(self.LAYER0_MLP_GATE_DRAM, mlpb), dram_b=ctx.rows_addr(self.LAYER0_MLP_UP_DRAM, mlpb),
+                        dram_out=ctx.rows_addr(self.LAYER0_MLP_MULT_DRAM, mlpb), mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m)
+                    _mlp_flops[0] += _shard_projection_core(ue, M=ctx.rows, K=self.mlp_elements, N=self.vector_length,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_MLP_MULT_DRAM, mlpb), B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_MLP_DOWN_DRAM, vlb),
+                        is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4, gpr_M_reg=m)
+                    ue.eltwise_core_dram(M=ctx.rows, N=self.vector_length,
+                        dram_a=ctx.rows_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, vlb), dram_b=ctx.rows_addr(self.LAYER0_MLP_DOWN_DRAM, vlb),
+                        dram_out=ctx.rows_addr(self.LAYER0_OUTPUT_DRAM, vlb), mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m)
+                prefill_scheduler.sharded_region(seq_len, _emit_mlp_shard)
+                total_flops += _mlp_flops[0]
         self.generate_instruction_halt()
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
@@ -1285,7 +1413,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         )
         print(f"Decode kernel: {self.decode_kernel} — {decode_description}")
         print(f"Prefill kernel: {self.prefill_kernel} — {prefill_description}")
-        if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
+        # Multi-core prefill writes the worker programs to the workers' DRAM as a
+        # side effect of compiling (scheduler.finalize), and run_llama needs the
+        # returned worker addresses. A cache hit would skip that, so always
+        # (re)compile when sharding is active.
+        prefill_scheduler = self._ensure_prefill_scheduler()
+        if prefill_scheduler is None and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             try:
                 with open(instruction_meta_path, "r") as meta_file:
                     cached_meta = json.load(meta_file)
@@ -1314,10 +1447,37 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.clear_inst_id()
         self.start_capture()
 
-        print(f"Compiling prefill (template_seq_len={template_seq_len}; profile={profile})...")
+        # Multi-core: open the worker capture sessions before the prefill body so
+        # the sharded MLP regions + barriers emit into every engine; close them
+        # (writing each worker program to its DRAM) right after prefill — the
+        # decoder is single-engine (master only).
+        if prefill_scheduler is not None:
+            prefill_scheduler.begin_program()
+
+        print(f"Compiling prefill (template_seq_len={template_seq_len}; profile={profile}; multi_core={self.multi_core})...")
         t0 = time.perf_counter()
-        prefill_prog = self._compile_prefill_program(template_seq_len=template_seq_len, layer_size=layer_size, profile=profile)
+        prefill_prog = self._compile_prefill_program(template_seq_len=template_seq_len, layer_size=layer_size, profile=profile,
+                                                     prefill_scheduler=prefill_scheduler)
         print(f"  prefill compiled: {prefill_prog['size_bytes']} bytes, {time.perf_counter() - t0:.1f}s")
+        if prefill_scheduler is not None:
+            self._prefill_worker_addrs = prefill_scheduler.finalize()
+            # Boundary protection: each worker program must stay inside its own
+            # WORKER_ISA_STRIDE slice (and thus below the next worker / the master
+            # program region). finalize() has already DMA-written them, so a
+            # violation means the write clobbered a neighbour — fail loudly.
+            for engine_idx, (worker, worker_addr) in enumerate(
+                    zip(prefill_scheduler.workers, self._prefill_worker_addrs), start=1):
+                worker_end = worker_addr + worker.get_capture_instruction_size_bytes()
+                slice_limit = self.WORKER_ISA_BASE + engine_idx * self.WORKER_ISA_STRIDE
+                if worker_end > slice_limit:
+                    raise MemoryError(
+                        f"prefill worker{engine_idx} ISA overflow: "
+                        f"end=0x{worker_end:X} > slice_limit=0x{slice_limit:X} "
+                        f"(base=0x{worker_addr:X}, stride=0x{self.WORKER_ISA_STRIDE:X}); "
+                        f"increase WORKER_ISA_STRIDE"
+                    )
+            print(f"  prefill workers: {len(self._prefill_worker_addrs)} program(s), "
+                  f"{prefill_scheduler.worker_program_bytes()} bytes total")
 
         print("Compiling decoder...")
         t0 = time.perf_counter()
@@ -1523,8 +1683,19 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         print(f"\n--- Starting prefill (seq_len={prefill_seq_len}) ---")
         print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
+        # Multi-core: launch the worker programs (they spin-wait at the first
+        # barrier) BEFORE the master program, and join them after it halts. The
+        # worker programs were written to their DRAM at compile time
+        # (scheduler.finalize) and self._prefill_worker_addrs was saved.
+        prefill_scheduler = getattr(self, "_prefill_scheduler", None) if self.multi_core > 1 else None
         timer = time.perf_counter()
+        if prefill_scheduler is not None:
+            prefill_scheduler.preclear_flags()
+            prefill_scheduler.start_workers(self._prefill_worker_addrs)
         hw_lat_prefill_us, prefill_gflops = self.program_execute(preamble_addr, flops=flops_prefill)
+        if prefill_scheduler is not None:
+            for w in prefill_scheduler.workers:
+                w.wait_queue(300.0)
         latency_prefill = time.perf_counter() - timer
         print(f"Prefill done in {latency_prefill:.2f}s\n")
 
@@ -1983,6 +2154,8 @@ def llama_run_summary_filename(args, prefix: str = "llama3.2_1b_test") -> str:
     ``llama3.2_1b_test_xdma1_kintex7.md`` or ``..._xdma0_alveo_puregreedy.md``.
     dev/device are always present; other knobs are appended only when non-default."""
     tokens = [args.dev, args.device]
+    if getattr(args, "multi_core", 1) and args.multi_core > 1:
+        tokens.append(f"multi-core-{args.multi_core}")
     if getattr(args, "pure_greedy", False):
         tokens.append("puregreedy")
     if getattr(args, "prefill_kernel", None) == "matmatmul":
@@ -2026,6 +2199,10 @@ def main():
                         help='Compile a profile binary with per-step HALT checkpoints and print one '
                              'per-step HW-latency table (summed over all layers) for prefill and for '
                              'the first decoded token.')
+    parser.add_argument('--multi-core', nargs='?', type=int, const=2, default=1,
+                        help='Row-shard the prefill MLP block across N engines (default 2 when the '
+                             'flag is given with no value). 1 = single-engine. >2 is unverified on '
+                             'this device.')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
     # fully deterministic. --pure-greedy disables it entirely.
@@ -2093,6 +2270,7 @@ def main():
         weights_bin=weights_bin_rel,
         prefill_kernel=prefill_kernel,
         decode_kernel=decode_kernel,
+        multi_core=args.multi_core,
     )
     cfg = _load_config(script_dir)
 
