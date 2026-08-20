@@ -7,93 +7,131 @@ running on the FPGA and paired against a GPU reference on identical episodes.
 GPU reference (step 96) on the identical episode, with 30.2 dB action-chunk agreement,
 gripper cosine 1.000 and 100% sign agreement.
 
+### Layout
+
+| path | what |
+|---|---|
+| `pi05_test.py` | the engine model — compile + single inference. The entry point. |
+| `pi05_libero_config.json` | model manifest (geometry, DRAM map, `paths.*`) |
+| `pi05_sample_meta.json` | the sample observation's raw 8-D robot state (+ its task id) |
+| `utility/libero_eval.py` | closed-loop LIBERO rollouts (`--backend fpga\|torch`) + `--diff-actions` |
+| `utility/pi05_torch_ref.py` | CPU/GPU reference implementation (the numeric oracle) |
+| `utility/pi05_jax_oracle.py` | JAX/openpi oracle, for checking the reference itself |
+| `utility/pi05_weight_export.py` | checkpoint → `pi05_libero_bin/weights_export/` (prep phase) |
+| `utility/pi05_ckpt_noopenpi.py` | orbax checkpoint reader, so the export works without openpi |
+| `utility/compare_bf16_if4.py` | bf16-vs-IF4 quantization sweep on the reference |
+| `setup_env.sh` | one-command conda env + LIBERO + OSMesa bring-up |
+| `document/` | the writeup (`main.tex`) and the episode videos it cites |
+
+The sample observation is two PNGs in the repo-root `test_samples/`
+(`pi05_libero_base.png`, `pi05_libero_wrist.png`) plus `pi05_sample_meta.json` here.
+That JSON is the **non-image half of one LIBERO observation**: `state_example`, the 8
+raw proprioception numbers the sim reported on the frame those PNGs were captured on
+(EEF position ×3, EEF orientation as axis-angle ×3, gripper finger qpos ×2), and
+`task_index`, which task it came from. pi0.5 has no separate state input — the loader
+normalizes these against the checkpoint's `norm_stats` q01/q99, discretizes them to
+ints 0–255 and splices them into the prompt **text**, so without this file there is no
+prompt to run. Together the three files are one complete observation, so
+`pi05_test.py` runs a single inference with **no LIBERO, robosuite, or MuJoCo installed**.
+Only `utility/libero_eval.py` needs the simulator.
+
 ---
 
-## 1. Setup
+## 1. One-time setup
 
-Two env files, pick one:
+### Which env file?
 
-| file | installs | env name |
+Two files, different jobs — there is no third:
+
+| file | what it is | use it when |
 |---|---|---|
-| `models/pi05_libero/pi05_env.yml` | conda, **GPU** torch (cu128) | `libero` |
-| `models/pi05_libero/requirements.txt` | pip, **CPU** torch (the FPGA runs the model) | `pi05_libero` |
+| `pi05_libero_env.yml` | the **spec**: what to install and why. Loose where loose is safe, pinned only where a pin is load-bearing, heavily commented. | always, via `setup_env.sh`. Edit **this** file to change a dependency. |
+| `pi05_libero_env.lock.yml` | the **lock**: every direct and transitive version as it resolved on a machine where the env works. | reproducing the env byte-for-byte on another box, or bisecting "it worked last week". Never hand-edit; regenerate. |
+
+Both build the same env name (`pi05_libero`) and both install the full stack —
+engine + weight export + LIBERO simulator.
+
+**`pi05_test.py` alone needs far less than either.** It imports only
+`numpy<2`, `torch`, `pillow`, `sentencepiece` and this repo's own modules, so the
+repo-root `requirements.txt` already covers a single inference. The extra weight in
+the env files is for two things you may not need:
+
+- **the one-time weight export** — `jax` + `jaxlib` + `flax` + `orbax-checkpoint`,
+  used once on first run and never imported again;
+- **`utility/libero_eval.py`** — robosuite/MuJoCo/LIBERO/OSMesa, the whole simulator.
+
+If you only want an action chunk out of the sample observation, `pip install -r
+requirements.txt` plus the four jax packages is enough.
+
+### One command
 
 ```bash
-conda env create -f models/pi05_libero/pi05_env.yml        # creates env `libero`
-conda activate libero
-
-# libero is NOT on PyPI -- still an editable install by path:
-pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
+bash models/pi05_libero/setup_env.sh
 ```
 
-`openpi_client` (the obs preprocessing helpers `libero_eval.py` imports) comes from
-PyPI's real `openpi-client` package — no local checkout needed.
+That creates the `pi05_libero` conda env from `pi05_libero_env.yml`, installs the one
+library conda cannot supply, seeds LIBERO's interactive first-run prompt, and verifies
+the whole thing renders. It is idempotent — safe to re-run, and it updates an existing
+env rather than recreating it. **No sudo required.**
 
-**`openpi` proper is NOT on PyPI.** The name resolves, but only to a 0.0.0 placeholder
-stub ("Reserved package name for future use by Physical Intelligence") with no code in
-it — a bare `openpi` requirement installs nothing and then fails confusingly at
-`import openpi`. It must come from git:
+Then, in every shell you run from:
 
 ```bash
-pip install "openpi @ git+https://github.com/Physical-Intelligence/openpi"
+conda activate pi05_libero
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib
 ```
 
-Only the **weight export** prep step needs it (§1.1); the FPGA + sim runtime never
-imports it. (`openpi-client` on PyPI *is* real, but it is only the websocket policy
-client — it has neither `shared.download.maybe_download` nor
-`models.model.restore_params`.)
+A successful setup prints:
 
-Checkpoint assets are expected at `~/.cache/openpi/`:
-- `openpi-assets/checkpoints/pi05_libero/assets/physical-intelligence/libero/norm_stats.json`
-- `big_vision/paligemma_tokenizer.model`
-
-### 1.1 Weights: `pi05_libero_bin/weights_export/` (prep phase, one-time)
-
-`pi05_libero_bin/weights_export/` (51 tensors, ~13 GB of `.npy` + a `manifest.json`) is what
-every backend
-loads. It is **regenerable**, not an un-reproducible blob —
-`models/pi05_libero/pi05_libero_export_weights.py` rebuilds it from the upstream openpi JAX
-checkpoint (`gs://openpi-assets/checkpoints/pi05_libero`, declared in
-`pi05_libero_config.json` under `paths.openpi_checkpoint`).
-
-```bash
-# needs openpi (jax/orbax) -- run it in a prep env, not the runtime env:
-/home/rohit/miniconda3/envs/pi05/bin/python models/pi05_libero/pi05_libero_export_weights.py \
-    --out pi05_libero_bin/weights_export_new
+```
+  libero      OK  /path/to/LIBERO/libero/libero/__init__.py
+  benchmark   OK  libero_object has 10 tasks
+  osmesa      OK  rendered (256, 256, 3), sim steps
+  task 0      "pick up the alphabet soup and place it in the basket"
+SETUP COMPLETE
 ```
 
-| flag | does |
-|---|---|
-| `--out DIR` | export destination (default `pi05_libero_bin/weights_export_new`) |
-| `--verify` | read-only: restore the checkpoint and diff it tensor-by-tensor against `--reference` (default `pi05_libero_bin/weights_export`) |
-| `--list` | print checkpoint leaf names + shapes, exit, write nothing |
-| `--only NAME ...` | restrict export/verify to a subset (subset export skips `manifest.json`) |
+Re-run just the checks any time with `setup_env.sh --verify-only`.
 
-Verified: `--verify` reproduces the existing export with **all 51 tensors bit-identical**.
-The script **refuses `--out pi05_libero_bin/weights_export`** — the validated reference is not overwritable;
-export to a new dir and compare. Weights are stored in the checkpoint's own JAX `(in, out)`
-layout; the consumer transposes at load.
+### What it is doing, and why you can't skip it
 
-Two things to expect: `restore_params` pulls all ~13 GB into RAM before saving, and openpi
-drags in jax/jaxlib/orbax (plus `jax-cuda12-plugin`'s own `nvidia-*` wheels, which can
-collide with torch's cu128 set) — which is exactly why the FPGA + sim runtime env does not
-have it and does not need it.
+One conda env holds everything: the FPGA model **and** the LIBERO simulator run in the
+same process — no socket, no server/client. CPU-only; no CUDA device required. The pins
+in the yaml are load-bearing (`numpy<2` is what lets robosuite and `user_dma_core`
+coexist in one interpreter). Three things are sharper than they look:
 
-### Two pins are load-bearing — do not "upgrade" either
+**LIBERO cannot be pip-installed normally.** `pip install git+…LIBERO` reports success
+and installs a ~5.5 KB *metadata-only* wheel — LIBERO is a PEP 420 namespace package
+with no `libero/__init__.py`, so its `setup.py`'s `find_packages()` returns nothing.
+Plain `pip install -e` is *also* broken: PEP 660 generates a finder with
+`MAPPING = {}`. The yaml therefore pins `-e … --config-settings editable_mode=compat`,
+which falls back to the legacy `.pth` mechanism and puts the project root on
+`sys.path`. **Never trust pip's success message here** — `import libero.libero` is the
+only real check, which is why the script does exactly that.
 
-| pin | why |
-|---|---|
-| `numpy<2` (1.26.4) | robosuite/gym 0.25 break on numpy 2.x. This is what lets the **simulator and `user_dma_core` live in ONE process** — no socket, no server/client. |
-| `torch==2.8.0+cu128` | the RTX 5070 is Blackwell (sm_120). Stock PyPI torch installs **CPU-only** and silently gives you `cuda=False`. |
+**OSMesa is not on conda-forge.** `mesalib` ships GL/GLX/EGL and the llvmpipe software
+rasterizer but no `libOSMesa` (verified absent in both 25.2.8 and 26.1.6), and there is
+no standalone `osmesa` package. EGL is not a substitute: MuJoCo's own `Renderer` can go
+surfaceless, but robosuite uses `EGLGLContext`, which needs the `PLATFORM_DEVICE`
+extension and therefore `/dev/dri` — denied unless you are in the `render`/`video`
+groups, and `LIBGL_ALWAYS_SOFTWARE` will not save you. The script pulls Ubuntu's
+`libosmesa6` via `apt-get download` (a plain download, not an install), extracts it, and
+drops `libOSMesa.so.8` into `$CONDA_PREFIX/lib`. No missing transitive deps.
 
-### Verify the install
+> **If you have a usable render node** (`ls -l /dev/dri` shows `renderD128` and you are
+> in the `render` group), skip OSMesa and use `MUJOCO_GL=egl` — it is faster. Add
+> yourself with `sudo usermod -aG render,video $USER` and re-login.
 
-```bash
-MUJOCO_GL=egl python models/pi05_libero/libero_eval.py --backend torch --tasks 1 --trials 3
-# expect: 3/3 SUCCESS in ~36s, mp4s written to data/libero/videos/
-```
+**torch ≥ 2.6 breaks LIBERO's init states.** `benchmark.get_task_init_states()` loads
+pickled numpy via `torch.load`, which now defaults to `weights_only=True` and refuses
+them. `libero_eval.py` installs a scoped shim; standalone scripts need their own
+(`torch.load = functools.partial(torch.load, weights_only=False)`).
 
-`MUJOCO_GL=egl` is required — it renders headless. Without it MuJoCo wants a display.
+### Weights
+
+First run of `pi05_test.py` downloads the checkpoint and exports it — a one-time
+cost of several minutes, cached into `models/pi05_libero/pi05_libero_bin/`.
 
 ---
 
@@ -215,59 +253,271 @@ robot, where the world does not wait.)
 
 ## 4. Running it
 
-### GPU reference (the oracle) — ~10s/episode
+### Single inference (fast)
+
+One observation in, one `(10, 7)` action chunk out. No simulator. This is the loop you
+want while iterating.
 
 ```bash
-MUJOCO_GL=egl python models/pi05_libero/libero_eval.py \
-    --backend torch --device cuda --quant if4 --tasks 1 --trials 3
+python models/pi05_libero/pi05_test.py --engines max
 ```
 
-### FPGA — ~195s/inference
+`--engines max` applies each stage's own ceiling from `STAGE_MAX_ENGINES`, which is
+**8/8/8 today** — vision reached 8 once it became 2D (4 row groups × 2 K lanes); it
+capped at 4 while row-sharded only, since `S=256`/slot is just 4 blocks of 64. So `max`
+and a flat `--engines 8` currently agree, but that is not guaranteed: any stage whose
+ceiling drops below 8 makes them diverge, which is why `max` reads the dict. Prefer it.
+
+Roughly 37 s of execution plus ~13 s of one-time compile. Single-engine
+(`--engines 1`) is ~5× slower but is the control you need when a result looks wrong.
+
+### Closed-loop episodes (the real thing)
 
 ```bash
-screen -dmS pi05_fpga bash -c 'cd /home/rohit/unified-engine && \
-  MUJOCO_GL=egl python models/pi05_libero/libero_eval.py \
-    --backend fpga --tasks 1 --trials 1 --dump-actions 2>&1 \
-    | tee models/pi05_libero/libero_fpga_full.log'
-screen -r pi05_fpga     # attach; Ctrl-A D to detach
+screen -dmS pi05_obj bash -c 'cd /home/rohit/unified-engine && \
+  MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+  LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
+  python models/pi05_libero/utility/libero_eval.py \
+    --backend fpga --task-suite libero_object --tasks 1 --trials 1 \
+    --engines max --dump-actions 2>&1 \
+    | tee models/pi05_libero/libero_fpga_object_t0.log'
+
+screen -r pi05_obj      # attach; Ctrl-A D to detach
 ```
 
-Always run the FPGA under `screen` — a several-hour run must survive the session.
+**Always run under `screen`.** A multi-episode run is hours and must survive the
+session dropping.
 
-### The paired diff — the real verification
+#### Picking a task
 
-Both backends share the sim, seeding, init states, preprocessing, replan cadence, and
-denoise noise, so **inference #0 sees a bit-identical observation in both.** Any
-difference there is the backend and nothing else.
+`--task-start N --tasks 1` runs exactly one task. Every suite has 10 (ids 0–9).
+
+**`libero_spatial`** (220 steps) — same bowl every time, only the *spatial phrase*
+changes, so it isolates language grounding. **Task 0 is the one the 30.2 dB baseline
+was measured on** (`done` at step 91), which makes it the best regression check.
+
+```
+0  pick up the black bowl between the plate and the ramekin and place it on the plate
+1  pick up the black bowl next to the ramekin and place it on the plate
+2  pick up the black bowl from table center and place it on the plate
+3  pick up the black bowl on the cookie box and place it on the plate
+4  pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+5  pick up the black bowl on the ramekin and place it on the plate
+6  pick up the black bowl next to the cookie box and place it on the plate
+7  pick up the black bowl on the stove and place it on the plate
+8  pick up the black bowl next to the plate and place it on the plate
+9  pick up the black bowl on the wooden cabinet and place it on the plate
+```
+
+**`libero_object`** (280 steps) — same scene and motion, only the *target object*
+changes, so it isolates object recognition. Most gripper-diagnostic: every task is a
+grasp-and-place into a basket.
+
+```
+0  pick up the alphabet soup and place it in the basket
+1  pick up the cream cheese and place it in the basket
+2  pick up the salad dressing and place it in the basket
+3  pick up the bbq sauce and place it in the basket
+4  pick up the ketchup and place it in the basket
+5  pick up the tomato sauce and place it in the basket
+6  pick up the butter and place it in the basket
+7  pick up the milk and place it in the basket
+8  pick up the chocolate pudding and place it in the basket
+9  pick up the orange juice and place it in the basket
+```
+
+**`libero_goal`** (300 steps) — same objects, different *goal*. The only suite with
+non-grasp verbs (push, turn on, open), so it exercises behaviours the other three
+never touch.
+
+```
+0  open the middle drawer of the cabinet
+1  put the bowl on the stove
+2  put the wine bottle on top of the cabinet
+3  open the top drawer and put the bowl inside
+4  put the bowl on top of the cabinet
+5  push the plate to the front of the stove
+6  put the cream cheese in the bowl
+7  turn on the stove
+8  put the bowl on the plate
+9  put the wine bottle on the rack
+```
+
+**`libero_10`** (520 steps) — long-horizon, two objects or two stages per task. Budget
+~32 min per episode at max engines; use these last.
+
+```
+0  put both the alphabet soup and the tomato sauce in the basket
+1  put both the cream cheese box and the butter in the basket
+2  turn on the stove and put the moka pot on it
+3  put the black bowl in the bottom drawer of the cabinet and close it
+4  put the white mug on the left plate and put the yellow and white mug on the right plate
+5  pick up the book and place it in the back compartment of the caddy
+6  put the white mug on the plate and put the chocolate pudding to the right of the plate
+7  put both the alphabet soup and the cream cheese box in the basket
+8  put both moka pots on the stove
+9  put the yellow and white mug in the microwave and close it
+```
+
+#### Suggested runs
 
 ```bash
-python models/pi05_libero/libero_eval.py --diff-actions \
-    data/libero/actions_torch_libero_spatial.npz \
-    data/libero/actions_fpga_libero_spatial.npz
+# regression check -- the task the 30.2 dB / step-91 baseline came from
+--task-suite libero_spatial --task-start 0 --tasks 1 --trials 1
+
+# gripper stress -- grasp and place into a basket
+--task-suite libero_object --task-start 4 --tasks 1 --trials 1
+
+# non-grasp behaviour -- no pick-and-place at all
+--task-suite libero_goal --task-start 7 --tasks 1 --trials 1
+
+# whole suite, one trial each (~10 episodes)
+--task-suite libero_object --trials 1
 ```
 
-Reports per-dimension SNR, cosine, and gripper sign agreement.
+There is no free-text prompt in the loop: the sim needs a BDDL scene with matching
+objects, so the prompt comes from the benchmark. For arbitrary text use the
+single-inference path (§2) and edit `defaults.prompt` in `pi05_libero_config.json` —
+you get an action chunk against the sample images, but no robot and no video.
 
-**READ THE COSINE COLUMN, NOT THE SNR.** A dim the robot isn't using (no wrist rotation
-during a straight reach) has a near-zero signal, so its SNR is a ratio of two tiny numbers
-— meaningless, and it reads as an alarming low dB while the direction is perfect. Same
-trap as the masked-rows-poison-SNR bug.
+#### Outputs
 
-### Cost model
+| what | where |
+|---|---|
+| video (one per episode) | `models/pi05_libero/data/libero/videos/{backend}_{suite}_t{task}_e{trial}_{success\|failure\|error}.mp4` |
+| results JSON (checkpointed every episode) | `models/pi05_libero/data/libero/results_{backend}_{suite}.json` |
+| action dumps (`--dump-actions`) | `models/pi05_libero/data/libero/actions_{backend}_{suite}.npz` |
+
+Videos carry a **prompt overlay in the top-left**: `[fpga/if4-hw] pick up the alphabet
+soup and place it in the basket`, yellow on a translucent black bar, 2× upscaled for
+legibility. The overlay is applied to copies at write time and never to the frames fed
+to the model.
+
+#### Cost
+
+One inference produces 10 actions. The loop consumes them one `env.step()` at a time
+and only re-queries when the queue empties, so **inferences = steps ÷ `--replan-steps`**.
+An episode ends early the moment `done` fires, or runs the full step budget.
+
+At `--engines max`, measured: **37.0 s** for the first inference's execution plus
+**11.9 s** of one-time compile, then **36.9 s** each thereafter.
 
 | | inferences | wall-clock |
 |---|---|---|
-| 1 episode, success (exits early) | ~9 | **~31 min** |
-| 1 episode, failure (full 220 steps) | 22 | **~72 min** |
-| 10 tasks × 1 trial | ~142 | **~8 h** |
-| 10 tasks × 5 trials (citable) | ~710 | **~38 h** |
+| best case, `done` around step ~90 | ~9 | **~6 min** |
+| full budget, `libero_spatial` (220) | 22 | ~14 min |
+| full budget, `libero_object` (280) | 28 | **~17 min** |
+| full budget, `libero_10` (520) | 52 | ~32 min |
+| 10 tasks × 1 trial, `libero_object` | ≤280 | ≤3 h |
+| 10 tasks × 5 trials (citable ±13%) | ≤1400 | ≤14 h |
 
-Successes are *cheaper* than failures — `done` fires and the loop breaks. Engine build
-(~4 min) happens **once** per process; never re-launch per episode.
+Add ~2 min of engine build (`weight_init` unpacks ~1.6 GB of params) once per process,
+never per episode. At `--engines 1`, multiply the inference numbers by ~5.
+
+**Measured reference run** — `libero_object` task 0, `--engines max`: SUCCESS at step
+280, 28 inferences, **~18 min** wall clock for the episode. The FPGA was ~97% of that;
+all 280 sim steps plus both camera renders through OSMesa came to ~35 s total, so the
+software renderer is effectively free.
+
+Note a success is only cheaper than a failure if `done` fires early — that run
+succeeded on the *last* step and cost the same as a failure would have.
+
+> **The sim has no wall clock.** MuJoCo advances exactly one tick per `env.step()` and
+> then waits. A 37 s/inference engine produces a *bit-identical trajectory* to a 5 ms
+> one — latency costs wall-clock and nothing else, so correctness proven on slow
+> silicon fully transfers. (This stops being true on a real robot.)
+
+#### Comparing two runs — the real verification
+
+Both backends share the sim, seeding, init states, preprocessing, replan cadence and
+denoise noise, so **inference #0 sees a bit-identical observation in both**. Any
+difference there is the backend and nothing else.
+
+```bash
+python models/pi05_libero/utility/libero_eval.py --diff-actions \
+    models/pi05_libero/data/libero/actions_torch_libero_object.npz \
+    models/pi05_libero/data/libero/actions_fpga_libero_object.npz
+```
+
+**Read the cosine column, not the SNR.** A dimension the robot is barely using has a
+near-zero signal, so its SNR is a ratio of two tiny numbers — meaningless, and it reads
+as an alarming low dB while the direction is perfect.
 
 ---
 
-## 5. Gotchas that cost real time
+## 5. Correctness checks
+
+Ordered cheapest-first. Each isolates one stage.
+
+```bash
+# vision encoder vs CPU IF4 reference (~7s) -- per-slot SNR
+python models/pi05_libero/pi05_test.py --engines max --verify-vision
+
+# full (10,7) action chunk vs pi05_torch_ref on CPU, matched quant/noise/inputs
+# also prints prefix K/V SNR per layer. Slow: the reference runs on CPU.
+python models/pi05_libero/pi05_test.py --engines max --verify-denoise
+
+# on-device timestep-embedding MLP vs exact host oracle
+python models/pi05_libero/pi05_test.py --engines max --check-cond-table
+
+# localize the first diverging op in the action expert (~75s with --debug)
+python models/pi05_libero/pi05_test.py --debug --probe-step0
+```
+
+**Masked slots poison pooled SNR.** LIBERO supplies 2 real cameras; the 3rd slot is an
+all-zero placeholder that is `-inf`-masked out of attention. Its HW rows are *not* an
+encode — `run_vision` overwrites them with a finite `1e-6` placeholder — while any CPU
+oracle encodes that image for real. The two are structurally incomparable and score
+~0 dB by construction. `--verify-vision` reports them separately and excludes them from
+the overall; the prefix K/V check does **not** yet, so its pooled number is pessimistic
+by roughly the masked fraction (256 of 832 rows).
+
+### Known-good baseline
+
+| metric | good | notes |
+|---|---|---|
+| action-chunk agreement, FPGA vs GPU reference | **30.2 dB** | LIBERO-Spatial task 0 |
+| gripper cosine / sign agreement | 1.000 / 100% | |
+| episode completion | `done` @ step 91 (ref: 96) | identical episode |
+
+If `--verify-denoise` reports substantially below 30 dB overall, something has
+regressed — compare against these numbers rather than eyeballing the chunk.
+
+---
+
+## 6. Flag reference
+
+### Engine sharding (both entry points)
+
+| flag | effect |
+|---|---|
+| `--engines max` | each stage's own ceiling from `STAGE_MAX_ENGINES` (8/8/8 today). **The recommended way to run fully sharded.** |
+| `--engines N` | flat N (1–8) for every stage. `N=1` is the single-engine control. |
+| `--vis_4` / `--pref_8` / `--dns_8` | force one stage, composes with and overrides `--engines` |
+
+Defaults differ deliberately: `pi05_test.py` defaults to **1** (so the
+single-engine path stays the byte-identical baseline), `libero_eval.py` defaults to
+**`max`** (nobody wants a 5× slower episode by accident).
+
+Multi-engine runs cannot dump `.bin` program blobs — the bins hold only engine 0's
+programs. Use `--engines 1` if you need bins.
+
+### `libero_eval.py`
+
+| flag | default | notes |
+|---|---|---|
+| `--backend` | `torch` | use `fpga` for hardware |
+| `--task-suite` | `libero_spatial` | see the table above |
+| `--tasks` / `--task-start` | all / 0 | cap and offset the task range |
+| `--trials` | 2 | rollouts per task; 5 for a citable ±13% |
+| `--replan-steps` | 10 | actions consumed per chunk before re-querying |
+| `--dump-actions` | off | record every inference's exact (input, output) |
+| `--no-video` | off | skip mp4 writing |
+| `--quant` | `bf16` | `--backend torch` only; use `if4` to match the FPGA |
+
+---
+
+## 7. Gotchas that cost real time
 
 **Fixed noise is the default, and it's a deviation.** Both backends pin the denoise seed
 to `RandomState(0)`, making the policy a deterministic function of the observation. That is
@@ -298,3 +548,27 @@ verdict of a finished run.
 **Only 1 of every 10 rendered frames reaches the model.** With `--replan-steps 10` the whole
 chunk executes open-loop; the other 9 obs are discarded (they still go into the video).
 `--replan-steps 5` doubles the feedback rate — and doubles FPGA cost.
+
+---
+
+## 8. Troubleshooting
+
+| symptom | cause | fix |
+|---|---|---|
+| `ModuleNotFoundError: No module named 'libero'` after a successful `pip install` | `find_packages()` found nothing; the wheel is metadata-only | §1 — `editable_mode=compat`, not a plain install |
+| `pip install -e` succeeds, import still fails | PEP 660 finder has `MAPPING = {}` | §1 — same fix |
+| `AttributeError: 'NoneType' object has no attribute 'glGetError'` | `PYOPENGL_PLATFORM=osmesa` but no `libOSMesa` on the loader path | §1 — run `setup_env.sh`, set `LD_LIBRARY_PATH` |
+| `libEGL warning: failed to open /dev/dri/card0: Permission denied` | not in the `render`/`video` groups | use OSMesa (§1), or `sudo usermod -aG render,video $USER` + re-login |
+| `Cannot initialize a EGL device display … PLATFORM_DEVICE extension` | robosuite needs EGL device platform; surfaceless is not enough | same as above |
+| `_pickle.UnpicklingError: Weights only load failed` | torch ≥2.6 flipped `weights_only` to True; LIBERO's init states are pickled numpy | already shimmed in `libero_eval.py`; add `torch.load = functools.partial(torch.load, weights_only=False)` for standalone scripts |
+| `[Warning]: datasets path … does not exist!` | LIBERO's demo HDF5 datasets absent | **harmless** — evaluation needs only bddl files and init states |
+| `Exception ignored in: <function GLContext.__del__>` at exit | interpreter-shutdown ordering | **harmless** — cosmetic, appears after results are written |
+| vision asserts above its ceiling | row-sharding needs 64-row blocks; `S=256`/slot is 4 | use `--engines max` — it reads `STAGE_MAX_ENGINES` instead of assuming |
+| overall SNR far below per-slot SNR | masked placeholder slot folded into the pool | see §4 — read per-slot numbers |
+| `skipping bin dump: multi-engine run` | expected on any sharded run | `--engines 1` if you actually need bins |
+
+### Splitting a long GPU run
+
+MuJoCo's EGL renderer segfaults after ~6 `OffScreenRenderEnv` creations when CUDA is
+also active, so run the **torch/GPU** eval in chunks of ≤5 tasks using `--task-start`.
+The FPGA backend does no CUDA compute and is unaffected.

@@ -513,7 +513,7 @@ def run_pi05(images: torch.Tensor, prompt_tokens: torch.Tensor, state: torch.Ten
     embed_table = W["PaliGemma.llm.embedder.input_embedding"]  # (257152, 2048)
     # openpi scales token embeddings by sqrt(width) in Embedder.encode
     # (gemma.py:149-150). Image tokens are NOT scaled. Omitting this made text
-    # enter the prefix 45.25x too small -- and because pi05_libero_test.py had the
+    # enter the prefix 45.25x too small -- and because pi05_test.py had the
     # same omission, this reference AGREED with the hardware and hid the bug.
     text_tokens = embed_table[prompt_tokens] * math.sqrt(embed_table.shape[-1])
 
@@ -596,9 +596,18 @@ def main():
     compute_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "if4": torch.bfloat16}[args.quant]
     W = Weights(device=args.device, dtype=compute_dtype, quant=args.quant)
 
-    sample_dir = Path.home() / "apex-compute-ML" / "simple-llm" / "src" / "models" / "pi0_5" / "sample_data"
-    img = np.load(sample_dir / f"sample_{args.sample}_image.npy").astype(np.float32) / 127.5 - 1.0
-    wrist = np.load(sample_dir / f"sample_{args.sample}_wrist_image.npy").astype(np.float32) / 127.5 - 1.0
+    # In-repo sample frames: repo-root test_samples/ (PNGs are pixel-identical to
+    # the original dataset .npy arrays), so this runs without any LIBERO deps.
+    from PIL import Image
+    sample_dir = Path(__file__).resolve().parents[3] / "test_samples"
+    meta_path = Path(__file__).resolve().parents[1] / "pi05_sample_meta.json"
+
+    def _load_png(name):
+        return np.asarray(Image.open(sample_dir / name).convert("RGB"),
+                          dtype=np.float32) / 127.5 - 1.0
+
+    img = _load_png("pi05_libero_base.png")
+    wrist = _load_png("pi05_libero_wrist.png")
     img_t = torch.from_numpy(img).to(args.device, compute_dtype)
     wrist_t = torch.from_numpy(wrist).to(args.device, compute_dtype)
     pad_t = torch.zeros_like(img_t)
@@ -608,7 +617,7 @@ def main():
     images = F.interpolate(images, size=(224, 224), mode="bilinear", align_corners=False)
     images = images.permute(0, 2, 3, 1).to(compute_dtype)
 
-    meta = json.loads((sample_dir / "meta.json").read_text())
+    meta = json.loads(meta_path.read_text())
     state = torch.tensor([meta["state_example"]], device=args.device, dtype=torch.float32)
 
     # REAL SentencePiece tokenization (was a random-token placeholder, which fed the

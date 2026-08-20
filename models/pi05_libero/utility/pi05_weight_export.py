@@ -5,7 +5,7 @@ This is the SAME lazy weights_export/ materialization the FPGA test.py uses
 manifest.json), but with NO unified-engine / hardware dependency, so the pure-torch
 reference (pi05_torch_ref.py) can reuse it on a GPU-only box.
 
-Kept intentionally in lockstep with pi05_libero_test.py's export logic: same config,
+Kept intentionally in lockstep with pi05_test.py's export logic: same config,
 same _canonical_name, same manifest format ({name: {shape,dtype,file}}), so the export
 this module writes is byte-identical to the one test.py would write. If you change the
 export format in one place, change it in the other.
@@ -17,11 +17,13 @@ from pathlib import Path
 
 import numpy as np
 
+# This file lives in <model>/utility/; the config and <model>_bin/ live one level up.
+_MODEL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 def _load_config(path=None):
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "pi05_libero_config.json")
+        path = os.path.join(_MODEL_DIR, "pi05_libero_config.json")
     with open(path) as f:
         return json.load(f)
 
@@ -32,11 +34,11 @@ _BIN_SUBDIR = _CFG["paths"].get("bin_dir", "pi05_libero_bin")
 
 def weights_export_dir(script_dir=None):
     if script_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = _MODEL_DIR
     return os.path.join(script_dir, _BIN_SUBDIR, "weights_export")
 
 
-# Kept in lockstep with pi05_libero_test.py -- see the docstrings there.
+# Kept in lockstep with pi05_test.py -- see the docstrings there.
 _OPENPI_DATA_HOME = "OPENPI_DATA_HOME"
 _LEGACY_CKPT_CACHE = "~/.cache/openpi"
 
@@ -48,7 +50,7 @@ def _ckpt_cache_root(script_dir=None):
     if env:
         return env
     if script_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = _MODEL_DIR
     return os.path.join(script_dir, _BIN_SUBDIR)
 
 
@@ -102,9 +104,9 @@ The fallback is the normal path and needs only jax + orbax-checkpoint + flax:
     pip install "orbax-checkpoint" "flax" "jax"
 
 Installing openpi proper also works but is far heavier and NOT required:
-    cd models/pi05_libero && pip install -r pi_requirements.txt
+    pip install "openpi @ git+https://github.com/Physical-Intelligence/openpi"
 (openpi is NOT on PyPI under that name -- the PyPI `openpi` is an empty 0.0.0
-placeholder -- so that file pulls the real one from git.)
+placeholder -- so it has to come from git.)
 
 Then re-run: the export runs once (~13 GB, from the pi05 checkpoint cached under
 <model>_bin/) and every later run detects it and skips the step.
@@ -129,7 +131,7 @@ def _import_openpi():
         return maybe_download, restore_params
     except ImportError as openpi_err:
         import sys
-        here = os.path.dirname(os.path.abspath(__file__))
+        here = os.path.dirname(os.path.abspath(__file__))   # utility/
         if here not in sys.path:
             sys.path.insert(0, here)
         try:

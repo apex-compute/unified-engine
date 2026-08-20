@@ -398,8 +398,8 @@ TESTS = [
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
 
     # Robot policy (VLA): no --prompt, no text output -- emits a (10,7) action chunk from
-    # its in-repo LIBERO sample frames. Uses its own sample_data/, not test_samples/.
-    {"name": "pi05_libero", "script": "models/pi05_libero/pi05_libero_test.py", "pass_check": _check_pi05_libero},
+    # its in-repo LIBERO sample frames in test_samples/ (pi05_libero_base/wrist.png).
+    {"name": "pi05_libero", "script": "models/pi05_libero/pi05_test.py", "pass_check": _check_pi05_libero},
 ]
 
 

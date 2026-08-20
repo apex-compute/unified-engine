@@ -22,12 +22,12 @@ the exporter uses actually needs openpi's model code:
 
 Everything downstream -- _flatten_params, _canonical_name, the .npy writes,
 manifest.json, the completeness check -- stays the original code in
-pi05_weight_export.py / pi05_libero_test.py, so the export produced through this
+pi05_weight_export.py / pi05_test.py, so the export produced through this
 path is byte-identical to the one openpi would have produced.
 
 Both exporters call _import_openpi(), which tries the real openpi first and falls
 back to this module, so the auto-download-on-first-run flow is unchanged: just run
-`python pi05_libero_test.py`.
+`python pi05_test.py`.
 
 Requires: numpy, jax, orbax-checkpoint, flax (already in the engine env).
 Does NOT require: openpi, lerobot, jax[cuda12], wandb, uv.

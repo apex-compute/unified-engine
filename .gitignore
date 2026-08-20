@@ -15,3 +15,6 @@ __pycache__/
 # LIBERO eval output: libero_eval.py writes rollout videos, per-episode results
 # JSON and action dumps here -- regenerate by re-running the eval.
 models/pi05_libero/data/
+
+# LIBERO benchmark clone (vendored by setup_env.sh, has its own .git)
+models/*/src/

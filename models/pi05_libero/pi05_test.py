@@ -15,7 +15,12 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
+_UTILITY_DIR = os.path.join(_MODEL_DIR, "utility")
+# repo root (nn_lib, user_dma_core) and this model's utility/ helpers
+# (pi05_torch_ref, pi05_weight_export, pi05_ckpt_noopenpi, ...).
+sys.path.insert(0, os.path.dirname(os.path.dirname(_MODEL_DIR)))
+sys.path.insert(0, _UTILITY_DIR)
 
 import numpy as np
 
@@ -171,9 +176,9 @@ missing or broken:
     pip install "orbax-checkpoint" "flax" "jax"
 
 Installing openpi proper also works, but is far heavier and NOT required:
-    cd models/pi05_libero && pip install -r pi_requirements.txt
+    pip install "openpi @ git+https://github.com/Physical-Intelligence/openpi"
 (openpi is not on PyPI under that name -- the PyPI `openpi` is an empty 0.0.0
-placeholder -- so that file pulls the real one from git.)
+placeholder -- so it has to come from git.)
 
 Either way, re-run this script: the export runs once (~13 GB, from the pi05
 checkpoint cached under <model>_bin/) and every later run detects the export
@@ -191,8 +196,8 @@ def _import_openpi():
     The checkpoint source is needed exactly once (the weight export) and never for
     inference, which runs from params.bin on the FPGA. Two ways to get it:
 
-      1. openpi proper, if it happens to be installed (pi_requirements.txt pulls it
-         from git; PyPI's `openpi` is an empty 0.0.0 placeholder stub).
+      1. openpi proper, if it happens to be installed (only from git; PyPI's
+         `openpi` is an empty 0.0.0 placeholder stub).
       2. pi05_ckpt_noopenpi -- the default path. Both symbols the export needs turn
          out to need none of openpi's model code: maybe_download is an anonymous
          HTTPS pull of a PUBLIC GCS bucket into the same bin-dir cache path, and
@@ -205,9 +210,8 @@ def _import_openpi():
         return maybe_download, restore_params
     except ImportError as openpi_err:
         # sys.path[0] is the script dir when run directly, but not when imported.
-        _here = os.path.dirname(os.path.abspath(__file__))
-        if _here not in sys.path:
-            sys.path.insert(0, _here)
+        if _UTILITY_DIR not in sys.path:
+            sys.path.insert(0, _UTILITY_DIR)
         try:
             from pi05_ckpt_noopenpi import import_openpi_fallback
         except ImportError as err:
@@ -6938,7 +6942,7 @@ def _load_sample_images():
     """
     from PIL import Image
     import torch.nn.functional as _F
-    sample_dir = Path(__file__).parent / "sample_data"
+    sample_dir = Path(_MODEL_DIR).parent.parent / "test_samples"
 
     def _load_png(name):
         return np.asarray(Image.open(sample_dir / name).convert("RGB"),
@@ -6949,8 +6953,8 @@ def _load_sample_images():
         t = _F.interpolate(t, size=(224, 224), mode="bilinear", align_corners=False)
         return t.squeeze(0).permute(1, 2, 0).numpy()
 
-    img = _load_png("sample_0_image.png")
-    wrist = _load_png("sample_0_wrist_image.png")
+    img = _load_png("pi05_libero_base.png")
+    wrist = _load_png("pi05_libero_wrist.png")
     pad = np.zeros_like(img)
     return [_resize(img), _resize(wrist), _resize(pad)]
 
@@ -6985,8 +6989,7 @@ def _load_sample_state():
     NameError'd after every full run and has never actually produced a number.
     One loader, both callers.
     """
-    sample_dir = Path(__file__).parent / "sample_data"
-    meta = json.loads((sample_dir / "meta.json").read_text())
+    meta = json.loads((Path(_MODEL_DIR) / "pi05_sample_meta.json").read_text())
     return np.array(meta["state_example"], dtype=np.float32)
 
 
@@ -7017,7 +7020,7 @@ def _load_sample_prompt_tokens():
 def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, vis_m_shard=None, tag="main"):
     """Set the engine-count class attributes. Returns True if this is multi-engine.
 
-    SHARED by pi05_libero_test.main() and libero_eval.py. It lives here as a
+    SHARED by pi05_test.main() and libero_eval.py. It lives here as a
     function rather than inline in main() because libero_eval constructs
     Pi05Libero_UnifiedEngine() directly and never calls main() -- so before this
     existed, every closed-loop LIBERO episode silently ran SINGLE-ENGINE no matter

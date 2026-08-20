@@ -2,7 +2,7 @@
 
 This is level L0: the real openpi implementation running the real
 gs://openpi-assets/checkpoints/pi05_libero checkpoint in JAX. It shares NO code
-with either pi05_libero_test.py (FPGA) or pi05_torch_ref.py (CPU), which is the
+with either pi05_test.py (FPGA) or pi05_torch_ref.py (CPU), which is the
 whole point -- those two are a hand-written reimplementation and the hardware
 port OF that reimplementation, so they agree with each other even when both are
 wrong. That is exactly how the missing sqrt(2048) text-embedding scale survived
@@ -24,11 +24,13 @@ import sys
 
 import numpy as np
 
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).parent          # <model>/utility/
+_MODEL_DIR = _HERE.parent                      # <model>/
 sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_MODEL_DIR))            # pi05_test
 
 # The checkpoint that pi05_libero_bin/weights_export/*.npy was exported FROM.
-CKPT = _HERE / "pi05_libero_bin" / "openpi-assets" / "checkpoints" / "pi05_libero"
+CKPT = _MODEL_DIR / "pi05_libero_bin" / "openpi-assets" / "checkpoints" / "pi05_libero"
 
 
 def main():
@@ -45,7 +47,7 @@ def main():
 
     # Import the FPGA test module ONLY for its input helpers -- never its model.
     # It pulls in torch/user_dma_core but touches no hardware at import time.
-    import pi05_libero_test as M
+    import pi05_test as M
 
     images_hwc = M._load_sample_images()          # 3 x (224,224,3) float32 in [-1,1]
     prompt_tokens = M._load_sample_prompt_tokens()  # int64 token ids, BOS included

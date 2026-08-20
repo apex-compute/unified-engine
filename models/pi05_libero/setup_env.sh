@@ -82,7 +82,7 @@ fi
 say "verifying"
 export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa LD_LIBRARY_PATH="$PREFIX/lib"
 
-python - <<'PY' || die "verification failed -- see models/pi05_libero/RUNNING.md section 7"
+python - <<'PY' || die "verification failed -- see models/pi05_libero/README.md section 8"
 import functools, os, sys
 
 # torch >= 2.6 flipped torch.load's weights_only default to True, which refuses
@@ -125,11 +125,11 @@ Every run needs these three exports:
 
 Next:
     # single inference on the FPGA (~50s, downloads+exports weights on first run)
-    python models/pi05_libero/pi05_libero_test.py --engines max
+    python models/pi05_libero/pi05_test.py --engines max
 
     # closed-loop episode with video
-    python models/pi05_libero/libero_eval.py --backend fpga \\
+    python models/pi05_libero/utility/libero_eval.py --backend fpga \\
         --task-suite libero_object --tasks 1 --trials 1 --engines max
 
-See models/pi05_libero/RUNNING.md for the full command reference.
+See models/pi05_libero/README.md for the full command reference.
 EOF

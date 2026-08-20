@@ -19,13 +19,13 @@ Setup once:
 
 Run:
     # golden reference on GPU -- start here
-    MUJOCO_GL=egl python models/pi05_libero/libero_eval.py \
+    MUJOCO_GL=egl python models/pi05_libero/utility/libero_eval.py \
         --backend torch --tasks 1 --trials 1 --max-steps 60          # smoke test
-    MUJOCO_GL=egl python models/pi05_libero/libero_eval.py \
+    MUJOCO_GL=egl python models/pi05_libero/utility/libero_eval.py \
         --backend torch --trials 5                                   # 10x5 = 50 episodes
 
     # same 50 episodes on hardware, then diff the two result JSONs
-    MUJOCO_GL=egl python models/pi05_libero/libero_eval.py \
+    MUJOCO_GL=egl python models/pi05_libero/utility/libero_eval.py \
         --backend fpga --trials 5
 
 Each run writes per-episode success bits to --results-out (JSON). Diff two of
@@ -55,7 +55,8 @@ _HERE = pathlib.Path(__file__).parent
 _OPENPI = pathlib.Path.home() / "apex-compute-ML" / "simple-llm" / "src" / "models" / "pi0_5" / "openpi_src"
 sys.path.insert(0, str(_OPENPI / "packages" / "openpi-client" / "src"))   # image_tools
 sys.path.insert(0, str(_OPENPI / "third_party" / "libero"))              # libero package
-sys.path.insert(0, str(_HERE))                                           # engine module
+sys.path.insert(0, str(_HERE))                                           # utility helpers
+sys.path.insert(0, str(_HERE.parent))                                    # engine module
 
 # pi0.5 checkpoint assets (norm_stats + tokenizer).
 #
@@ -79,7 +80,7 @@ _SUITE_MAX_STEPS = {
 
 
 # ---------------------------------------------------------------------------
-# pi0.5 input construction (mirrors pi05_libero_test.main() exactly)
+# pi0.5 input construction (mirrors pi05_test.main() exactly)
 # ---------------------------------------------------------------------------
 class _Pi05Pre:
     """Raw LIBERO obs -> (images, prompt_tokens) for the engine; un-normalizes
@@ -87,7 +88,7 @@ class _Pi05Pre:
 
     def __init__(self):
         import sentencepiece
-        import pi05_libero_test as M
+        import pi05_test as M
         self.norm = M._load_norm_stats()
         self.sp = sentencepiece.SentencePieceProcessor(model_file=M.ensure_tokenizer())
         self.s_q01 = np.array(self.norm["state"]["q01"], dtype=np.float32)
@@ -131,7 +132,7 @@ def _quat2axisangle(quat):
 # The flow-matching denoise loop starts from noise. Both backends must start from
 # the SAME noise or their chunks differ for reasons that have nothing to do with
 # hardware fidelity. The FPGA seeds itself with numpy RandomState(0) (see
-# pi05_libero_test.run_inference), so that is the shared source of truth here --
+# pi05_test.run_inference), so that is the shared source of truth here --
 # NOT torch.manual_seed(0), which draws a completely different sequence.
 AE_ACTION_HORIZON, AE_ACTION_DIM_PADDED = 10, 32
 
@@ -193,10 +194,10 @@ class _FpgaBackend:
     """The UnifiedEngine on real hardware."""
 
     def __init__(self, engines="max", vis_4=False, pref_8=False, dns_8=False):
-        import pi05_libero_test as M
+        import pi05_test as M
         # MUST run before Pi05Libero_UnifiedEngine() -- the engine counts are class
         # attributes read during construction/compile, and this module never calls
-        # pi05_libero_test.main(), which is the only other place that sets them.
+        # pi05_test.main(), which is the only other place that sets them.
         # Without this every closed-loop episode ran single-engine regardless of
         # what the caller asked for, at ~195s/inference instead of ~37s.
         M.configure_engines(engines, vis_4=vis_4, pref_8=pref_8, dns_8=dns_8,
@@ -207,7 +208,7 @@ class _FpgaBackend:
         self.ue.weight_init()
         self.ue.tensor_init(M._CFG["defaults"].get("max_seq", 512))
         # Compile encoder + prefix + denoise BEFORE the first observation executes.
-        # pi05_libero_test.main() does this via --precompile (default True), but this
+        # pi05_test.main() does this via --precompile (default True), but this
         # module never calls main(), so without it inference #0 of an episode compiled
         # INLINE -- interleaved compile/execute/compile/execute/compile/execute -- while
         # #1..N were execute-only. That made run 0 structurally different from every
@@ -350,7 +351,7 @@ def main():
                          "the FPGA (default 10 = use the whole chunk, ~half the inferences of 5)")
     ap.add_argument("--wait-steps", type=int, default=10)
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--video-out", default=str(_HERE / "data" / "libero" / "videos"))
+    ap.add_argument("--video-out", default=str(_HERE.parent / "data" / "libero" / "videos"))
     def _engines_arg(value):
         """--engines N | max.  'max' == each stage's own ceiling, not a flat 8."""
         if str(value).strip().lower() == "max":
@@ -366,7 +367,7 @@ def main():
                 f"got {n}")
         return n
 
-    # DEFAULT "max", unlike pi05_libero_test.py's default of 1. A closed-loop
+    # DEFAULT "max", unlike pi05_test.py's default of 1. A closed-loop
     # episode is 9-22 inferences; at single-engine ~195s each that is 30-70 min,
     # versus ~37s each fully sharded. Nobody wants the slow one by accident, and
     # before these flags existed this script had NO way to ask for anything else.

@@ -4,7 +4,7 @@ between the two action outputs (and per-layer prefix K/V). This is the
 'quantization floor' -- the best the FPGA (which is IF4) could ever match a
 bf16/full-precision model. Runs entirely on GPU, no FPGA. Fast (weights cached).
 
-    python models/pi05_libero/compare_bf16_if4.py [--device cuda] [--sample 0]
+    python models/pi05_libero/utility/compare_bf16_if4.py [--device cuda] [--sample 0]
 """
 import argparse
 from pathlib import Path
@@ -16,16 +16,25 @@ import pi05_torch_ref as _ref
 
 
 def build_inputs(device, compute_dtype, sample):
-    sample_dir = Path.home() / "apex-compute-ML" / "simple-llm" / "src" / "models" / "pi0_5" / "sample_data"
-    img = np.load(sample_dir / f"sample_{sample}_image.npy").astype(np.float32) / 127.5 - 1.0
-    wrist = np.load(sample_dir / f"sample_{sample}_wrist_image.npy").astype(np.float32) / 127.5 - 1.0
+    # In-repo sample frames: repo-root test_samples/ (PNGs are pixel-identical to
+    # the original dataset .npy arrays), so this runs without any LIBERO deps.
+    from PIL import Image
+    sample_dir = Path(__file__).resolve().parents[3] / "test_samples"
+    meta_path = Path(__file__).resolve().parents[1] / "pi05_sample_meta.json"
+
+    def _load_png(name):
+        return np.asarray(Image.open(sample_dir / name).convert("RGB"),
+                          dtype=np.float32) / 127.5 - 1.0
+
+    img = _load_png("pi05_libero_base.png")
+    wrist = _load_png("pi05_libero_wrist.png")
     img_t = torch.from_numpy(img).to(device, compute_dtype)
     wrist_t = torch.from_numpy(wrist).to(device, compute_dtype)
     pad_t = torch.zeros_like(img_t)
     images = torch.stack([img_t, wrist_t, pad_t], dim=0).permute(0, 3, 1, 2).float()
     images = F.interpolate(images, size=(224, 224), mode="bilinear", align_corners=False)
     images = images.permute(0, 2, 3, 1).to(compute_dtype)
-    meta = json.loads((sample_dir / "meta.json").read_text())
+    meta = json.loads(meta_path.read_text())
     state = torch.tensor([meta["state_example"]], device=device, dtype=torch.float32)
     # SAME prompt tokens for both runs (fixed seed) so the only variable is quant.
     g = torch.Generator(device=device).manual_seed(1234)
