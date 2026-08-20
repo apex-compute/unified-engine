@@ -49,18 +49,21 @@
       "d93eea82",
       "9ef15fc1",
       "663de8d5",
-      "77e8adf3"
+      "77e8adf3",
+      "3e92cddf"
     ],
     "queued_config_fpga_hashes": [
       "d93eea82",
       "9ef15fc1",
       "663de8d5",
-      "77e8adf3"
+      "77e8adf3",
+      "3e92cddf"
     ],
     "gather_if8_fpga_hashes": [
-      "77e8adf3"
+      "77e8adf3",
+      "3e92cddf"
     ],
     "incompatible_shipped_fpga_hash": "cf133b89",
-    "compatibility_note": "Optimized checkpoint-backed YOLO and direct artifact v4 require ordered queued CONFIG opcode 0xC plus the corrected 512-bit gather-IF8 scale rewind, and accept only gather_if8_fpga_hashes. queued_config_fpga_hashes and compatible_fpga_hashes document broader legacy driver capabilities. The repository-shipped update_cf133b89.bin is incompatible."
+    "compatibility_note": "Optimized checkpoint-backed YOLO and direct artifact v4 require ordered queued CONFIG opcode 0xC plus the corrected gather-IF8 scale rewind. Build 3e92cddf additionally provides the timing-clean four-channel banked gather used for the utilization results. The optimized path accepts only gather_if8_fpga_hashes; queued_config_fpga_hashes and compatible_fpga_hashes document broader legacy driver capabilities. The repository-shipped update_cf133b89.bin is incompatible."
   }
 }

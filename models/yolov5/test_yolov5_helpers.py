@@ -21,6 +21,7 @@ for path in (SCRIPT_DIR, REPO_ROOT):
 
 import user_dma_core
 import model_auto_test
+import yolov5_run_from_bin
 import yolov5_test
 from yolov5_artifact import (
     _pack_codes,
@@ -38,11 +39,35 @@ from yolov5_common import (
     box_iou_one_to_many,
     decode_yolov5,
     fold_conv_bn,
+    gather_if8_is_profitable,
     get_yolov5_variant,
     non_max_suppression,
     quantize_conv_for_andromeda,
     quantize_conv_if4,
 )
+
+
+def _pack_tiled_result_reference(
+        canonical: torch.Tensor, tiles, oc_chunk: int) -> torch.Tensor:
+    """Serialize exact tile results in compiler/runtime DRAM order."""
+    oc_count, _out_h, _out_w = canonical.shape
+    assert oc_count % oc_chunk == 0
+    chunks = []
+    for oc0 in range(0, oc_count, oc_chunk):
+        slots = []
+        for oy0, ox0, th, tw, *_rest in tiles:
+            values = canonical[
+                oc0:oc0 + oc_chunk, oy0:oy0 + th, ox0:ox0 + tw] \
+                .permute(1, 2, 0).reshape(-1)
+            padded = torch.zeros(
+                ((values.numel() + user_dma_core.UE_VECTOR_SIZE - 1)
+                 // user_dma_core.UE_VECTOR_SIZE)
+                * user_dma_core.UE_VECTOR_SIZE,
+                dtype=canonical.dtype)
+            padded[:values.numel()] = values
+            slots.append(padded)
+        chunks.append(torch.cat(slots))
+    return torch.cat(chunks)
 
 
 class VariantTests(unittest.TestCase):
@@ -59,7 +84,7 @@ class VariantTests(unittest.TestCase):
         artifact = get_canonical_artifact("n")
         self.assertEqual(artifact.format, "andromeda.yolov5n.single-bin")
         self.assertEqual(artifact.params_bytes, 18_219_952)
-        self.assertEqual(artifact.program_bytes, 42_240)
+        self.assertEqual(artifact.program_bytes, 93_504)
         self.assertEqual(artifact_variant({"format": artifact.format}), "n")
 
     def test_variant_configs_match_pinned_profiles(self):
@@ -142,69 +167,48 @@ class QuantizationTests(unittest.TestCase):
         _, _, _, tiles = user_dma_core.plan_conv2d_layer_tiles(
             c_in=65, oc_count=64, in_h=7, in_w=9,
             kernel_h=3, kernel_w=3, stride_s=2, pad=1)
-        win_h, win_w = tiles[0][6:8]
-        ct = 2
         x_padded = torch.nn.functional.pad(x, (1, 1, 1, 1))
-        expected = torch.empty(len(tiles) * win_h * win_w * ct, 64,
-                               dtype=torch.bfloat16)
-        lines = win_h * win_w * ct
-        for index, tile in enumerate(tiles):
+        expected = []
+        for tile in tiles:
             y0, x0 = tile[4:6]
+            win_h, win_w = tile[6:8]
             window = x_padded[:, y0:y0 + win_h, x0:x0 + win_w]
-            expected[index * lines:(index + 1) * lines] = \
-                user_dma_core.conv2d_pack_activation_map(window, 0)
+            expected.append(
+                user_dma_core.conv2d_pack_activation_map(window, 0))
+        expected = torch.cat(expected)
         actual = user_dma_core.conv2d_pack_activation_tiles(
             x, tiles, pad=1)
         self.assertTrue(torch.equal(actual, expected))
 
-    def test_vectorized_tile_unpack_matches_reference_with_overlap(self):
+    def test_vectorized_tile_unpack_matches_exact_reference(self):
         out_h, out_w, oc_chunk, tiles = \
             user_dma_core.plan_conv2d_layer_tiles(
                 c_in=64, oc_count=64, in_h=7, in_w=9,
                 kernel_h=3, kernel_w=3, stride_s=1, pad=1)
-        th, tw = tiles[0][2:4]
-        result_lines = (th * tw * oc_chunk + 63) // 64
         canonical = torch.arange(
             64 * out_h * out_w, dtype=torch.int64).remainder(1024) \
             .to(torch.bfloat16).view(64, out_h, out_w)
-        big = torch.zeros(
-            len(tiles), result_lines * 64, dtype=torch.bfloat16)
-        expected = torch.zeros_like(canonical)
-        for index, tile in enumerate(tiles):
-            oy0, ox0 = tile[:2]
-            block = canonical[:, oy0:oy0 + th, ox0:ox0 + tw]
-            big[index, :th * tw * oc_chunk] = \
-                block.permute(1, 2, 0).reshape(-1)
-            expected[:, oy0:oy0 + th, ox0:ox0 + tw] = \
-                user_dma_core.conv2d_unpack_result(
-                    big[index], th, tw, oc_chunk)
+        big = _pack_tiled_result_reference(canonical, tiles, oc_chunk)
         actual = user_dma_core.conv2d_unpack_tiled_result(
             big, tiles, out_h, out_w, 64, oc_chunk)
-        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.equal(actual, canonical))
 
     def test_vectorized_tile_unpack_preserves_multiple_oc_chunks(self):
         out_h, out_w, oc_chunk, tiles = \
             user_dma_core.plan_conv2d_layer_tiles(
-                c_in=512, oc_count=128, in_h=3, in_w=3,
-                kernel_h=3, kernel_w=3, stride_s=1, pad=1)
-        self.assertEqual(oc_chunk, 64)
-        th, tw = tiles[0][2:4]
-        result_lines = (th * tw * oc_chunk + 63) // 64
+                c_in=3, oc_count=255, in_h=7, in_w=6,
+                kernel_h=1, kernel_w=1, stride_s=1, pad=0)
+        self.assertEqual(oc_chunk, 255)
+        self.assertEqual(
+            [(group[2], group[3]) for group in
+             user_dma_core.conv2d_tile_geometry_groups(tiles)],
+            [(6, 5), (6, 1), (1, 5), (1, 1)])
         canonical = torch.arange(
-            128 * out_h * out_w, dtype=torch.int64).remainder(2048) \
-            .to(torch.bfloat16).view(128, out_h, out_w)
-        big = torch.zeros(
-            2, len(tiles), result_lines * 64, dtype=torch.bfloat16)
-        for chunk_index, oc0 in enumerate(range(0, 128, oc_chunk)):
-            for tile_index, tile in enumerate(tiles):
-                oy0, ox0 = tile[:2]
-                block = canonical[
-                    oc0:oc0 + oc_chunk,
-                    oy0:oy0 + th, ox0:ox0 + tw]
-                big[chunk_index, tile_index, :th * tw * oc_chunk] = \
-                    block.permute(1, 2, 0).reshape(-1)
+            510 * out_h * out_w, dtype=torch.int64).remainder(2048) \
+            .to(torch.bfloat16).view(510, out_h, out_w)
+        big = _pack_tiled_result_reference(canonical, tiles, oc_chunk)
         actual = user_dma_core.conv2d_unpack_tiled_result(
-            big, tiles, out_h, out_w, 128, oc_chunk)
+            big, tiles, out_h, out_w, 510, oc_chunk)
         self.assertTrue(torch.equal(actual, canonical))
 
     def test_vectorized_tile_unpack_handles_padded_detect_tiles(self):
@@ -214,25 +218,15 @@ class QuantizationTests(unittest.TestCase):
                 kernel_h=1, kernel_w=1, stride_s=1, pad=0)
         self.assertEqual(oc_chunk, 255)
         self.assertGreater(len(tiles), 1)
-        th, tw = tiles[0][2:4]
-        values_per_tile = th * tw * oc_chunk
-        result_lines = (values_per_tile + 63) // 64
-        self.assertNotEqual(values_per_tile, result_lines * 64)
+        self.assertTrue(any(
+            tile[2] * tile[3] * oc_chunk % 64 for tile in tiles))
         canonical = torch.arange(
             255 * out_h * out_w, dtype=torch.int64).remainder(1024) \
             .to(torch.bfloat16).view(255, out_h, out_w)
-        big = torch.zeros(
-            len(tiles), result_lines * 64, dtype=torch.bfloat16)
-        expected = torch.zeros_like(canonical)
-        for tile_index, tile in enumerate(tiles):
-            oy0, ox0 = tile[:2]
-            block = canonical[:, oy0:oy0 + th, ox0:ox0 + tw]
-            big[tile_index, :values_per_tile] = \
-                block.permute(1, 2, 0).reshape(-1)
-            expected[:, oy0:oy0 + th, ox0:ox0 + tw] = block
+        big = _pack_tiled_result_reference(canonical, tiles, oc_chunk)
         actual = user_dma_core.conv2d_unpack_tiled_result(
             big, tiles, out_h, out_w, 255, oc_chunk)
-        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.equal(actual, canonical))
 
     def test_conv_if4_uses_native_block_layout(self):
         torch.manual_seed(7)
@@ -289,6 +283,21 @@ class QuantizationTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_hardware_runner_caps_host_threads_without_raising_small_values(self):
+        with mock.patch.object(
+                yolov5_run_from_bin.torch, "get_num_threads", return_value=24), \
+             mock.patch.object(
+                 yolov5_run_from_bin.torch, "set_num_threads") as set_threads:
+            yolov5_run_from_bin._cap_hardware_host_threads()
+            set_threads.assert_called_once_with(4)
+
+        with mock.patch.object(
+                yolov5_run_from_bin.torch, "get_num_threads", return_value=2), \
+             mock.patch.object(
+                 yolov5_run_from_bin.torch, "set_num_threads") as set_threads:
+            yolov5_run_from_bin._cap_hardware_host_threads()
+            set_threads.assert_not_called()
+
     def test_dma_tensor_buffer_path_is_byte_exact(self):
         engine = object.__new__(user_dma_core.UnifiedEngine)
         raw = torch.arange(32, dtype=torch.uint8)
@@ -390,6 +399,50 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(chunk, 128)
         self.assertEqual(512 % chunk, 0)
 
+    def test_exact_tiles_form_ordered_four_group_partition(self):
+        out_h, out_w, oc_chunk, tiles = \
+            user_dma_core.plan_conv2d_layer_tiles(
+                c_in=65, oc_count=64, in_h=7, in_w=9,
+                kernel_h=3, kernel_w=3, stride_s=2, pad=1)
+        self.assertEqual((out_h, out_w, oc_chunk), (4, 5, 64))
+        groups = user_dma_core.conv2d_tile_geometry_groups(tiles)
+        self.assertEqual(groups, [
+            (0, 2, 3, 2, 7, 5),
+            (2, 3, 3, 1, 7, 3),
+            (3, 5, 1, 2, 3, 5),
+            (5, 6, 1, 1, 3, 3),
+        ])
+        occupancy = torch.zeros(out_h, out_w, dtype=torch.int32)
+        for oy0, ox0, th, tw, y0, x0, win_h, win_w in tiles:
+            occupancy[oy0:oy0 + th, ox0:ox0 + tw] += 1
+            self.assertLessEqual(y0 + win_h, 7 + 2)
+            self.assertLessEqual(x0 + win_w, 9 + 2)
+        self.assertTrue(torch.equal(occupancy, torch.ones_like(occupancy)))
+        self.assertEqual(
+            sum(tile[2] * tile[3] for tile in tiles), out_h * out_w)
+
+        layout, activation_bytes, chunk_output_bytes = \
+            user_dma_core.conv2d_tiled_dram_layout(
+                tiles, ct=2, oc_chunk=oc_chunk)
+        self.assertEqual(activation_bytes, 33_280)
+        self.assertEqual(chunk_output_bytes, 2_560)
+        self.assertEqual(
+            [(item[6], item[8]) for item in layout],
+            [(0, 0), (17_920, 1_536),
+             (23_296, 1_920), (30_976, 2_432)])
+        self.assertTrue(all(
+            value % 128 == 0
+            for item in layout for value in (item[6], item[7], item[8], item[9])))
+
+    def test_repeated_noncontiguous_geometry_is_rejected(self):
+        tiles = [
+            (0, 0, 2, 2, 0, 0, 4, 4),
+            (0, 2, 2, 1, 0, 2, 4, 3),
+            (2, 0, 2, 2, 2, 0, 4, 4),
+        ]
+        with self.assertRaisesRegex(AssertionError, "not one contiguous group"):
+            user_dma_core.conv2d_tile_geometry_groups(tiles)
+
     def test_detect_head_keeps_255_channels_together(self):
         for channels in (64, 128):
             with self.subTest(channels=channels):
@@ -485,20 +538,35 @@ class PlannerTests(unittest.TestCase):
         engine._allow_unknown_gather_if8_hardware = True
         engine.require_gather_if8_hardware()
 
+    def test_gather_if8_policy_requires_schedule_and_byte_savings(self):
+        self.assertTrue(gather_if8_is_profitable(
+            channels=3, out_channels=32, kernel_h=6, kernel_w=6))
+        self.assertTrue(gather_if8_is_profitable(
+            channels=16, out_channels=32, kernel_h=3, kernel_w=3))
+        for out_channels in (32, 64):
+            with self.subTest(out_channels=out_channels):
+                self.assertFalse(gather_if8_is_profitable(
+                    channels=32, out_channels=out_channels,
+                    kernel_h=3, kernel_w=3))
+        self.assertFalse(gather_if8_is_profitable(
+            channels=50, out_channels=64, kernel_h=3, kernel_w=3))
+
     def test_gather_geometry_rejects_inconsistent_or_oversized_chunks(self):
         engine = user_dma_core.UnifiedEngine.__new__(user_dma_core.UnifiedEngine)
         engine.is_capture_on = False
         engine.write_reg32 = lambda _address, _value: None
-        base = dict(
-            out_w=1, out_h=1, ct=1, kernel_w=1, kernel_h=1,
+        common = dict(
+            out_w=1, out_h=1, ct=1, kernel_w=3, kernel_h=3,
             oc_count=2, row_stride=1, col_stride=1,
-            pix_col_step=1, pix_row_step=1, gather=True, c_in=3)
+            pix_col_step=1, pix_row_step=1, gather=True)
+        engine.write_conv2d_geometry_registers(
+            **common, c_in=8, blocks_per_pixel=4, chunks=2)
         with self.assertRaisesRegex(ValueError, "four RTL"):
             engine.write_conv2d_geometry_registers(
-                **base, blocks_per_pixel=10, chunks=5)
+                **common, c_in=33, blocks_per_pixel=10, chunks=5)
         with self.assertRaisesRegex(ValueError, "!= oc_count"):
             engine.write_conv2d_geometry_registers(
-                **base, blocks_per_pixel=3, chunks=2)
+                **common, c_in=8, blocks_per_pixel=3, chunks=2)
 
 
 class PrecompiledBinTests(unittest.TestCase):
@@ -509,10 +577,10 @@ class PrecompiledBinTests(unittest.TestCase):
         codes_shape = [8, 3, 6, 6]
         code_count = 8 * 3 * 6 * 6
         return {
-            "model": {"input_shape": [3, 8, 8]},
+            "model": {"input_shape": [3, 32, 40]},
             "operations": [{
                 "op": "conv", "name": "conv", "inputs": ["input"],
-                "output": "conv", "output_shape": [8, 4, 4],
+                "output": "conv", "output_shape": [8, 16, 20],
                 "stride": 2, "pad": 2, "dilation": 1,
                 "activate": True,
             }],
@@ -538,7 +606,33 @@ class PrecompiledBinTests(unittest.TestCase):
         self.assertGreater(hardware["params_image"].numel(), 0)
         self.assertGreater(hardware["program_image"].numel(), 0)
         self.assertEqual(hardware["geometry_abi"], "conv-config-inst-v1")
-        self.assertGreater(hardware["entries"][0]["queue_config_count"], 0)
+        self.assertEqual(
+            hardware["abi"], "andromeda-yolov5-precompiled-v4")
+        self.assertEqual(hardware["entries"][0]["queue_config_count"], 4)
+        entry = hardware["entries"][0]
+        configs = _scan_queue_configs(
+            hardware["program_image"], entry["program_offset"],
+            entry["program_size"])
+        expected_configs = []
+        _out_h, _out_w, _oc_chunk, tiles = \
+            user_dma_core.plan_conv2d_layer_tiles(
+                c_in=3, oc_count=8, in_h=32, in_w=40,
+                kernel_h=6, kernel_w=6, stride_s=2, pad=2,
+                gather=True, bias_enabled=True)
+        for _start, _stop, th, tw, _win_h, win_w in \
+                user_dma_core.conv2d_tile_geometry_groups(tiles):
+            expected_configs.append(user_dma_core.pack_conv2d_geometry_words(
+                out_w=tw, out_h=th, ct=1,
+                kernel_w=6, kernel_h=6, oc_count=8,
+                row_stride=win_w, col_stride=1,
+                pix_col_step=2, pix_row_step=2 * win_w,
+                gather=True, c_in=3, blocks_per_pixel=16, chunks=2))
+        self.assertEqual(configs, expected_configs)
+
+        rebuilt = compile_precompiled_hardware(self._one_conv_payload())
+        self.assertEqual(rebuilt["params_sha256"], hardware["params_sha256"])
+        self.assertEqual(rebuilt["program_sha256"], hardware["program_sha256"])
+        self.assertEqual(rebuilt["entries"], hardware["entries"])
 
         class FakeRuntimeEngine:
             def __init__(self):
@@ -622,9 +716,9 @@ class PrecompiledBinTests(unittest.TestCase):
                 user_dma_core.UnifiedEngine, "run_conv2d_layer",
                 side_effect=forbidden):
             result = backend.conv_prepared(
-                "conv", torch.zeros(3, 8, 8, dtype=torch.bfloat16), None,
+                "conv", torch.zeros(3, 32, 40, dtype=torch.bfloat16), None,
                 stride=2, pad=2, dilation=1, activate=True)
-        self.assertEqual(tuple(result.shape), (8, 4, 4))
+        self.assertEqual(tuple(result.shape), (8, 16, 20))
         # Initial immutable params/program uploads plus one dynamic activation.
         self.assertEqual(len(engine.writes), 3)
         self.assertEqual(len(engine.starts), 1)
@@ -642,6 +736,13 @@ class PrecompiledBinTests(unittest.TestCase):
             user_dma_core.UE_CONV_GEOM_ADDR, user_dma_core.UE_CONV_CTRL_ADDR,
             user_dma_core.UE_CONV_STRIDE_ADDR, user_dma_core.UE_CONV_PIXSTEP_ADDR)
             for address, _value in engine.registers))
+
+        incompatible = copy.deepcopy(payload)
+        incompatible["hardware"]["abi"] = "andromeda-yolov5-precompiled-v3"
+        stale_engine = FakeRuntimeEngine()
+        with self.assertRaisesRegex(RuntimeError, "incompatible fixed-address ABI"):
+            PrecompiledAndromedaBackend(stale_engine, incompatible)
+        self.assertEqual(stale_engine.writes, [])
 
         old_engine = FakeRuntimeEngine()
         old_engine.hw_version = 0xDCACD7AA

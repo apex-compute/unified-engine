@@ -15,11 +15,12 @@ remain host-side.
 ## Hardware compatibility
 
 Hardware inference requires native CONV2D/MAXPOOL, ordered queue-CONFIG
-geometry, and the corrected 512-bit gather-IF8 scale rewind from Andromeda
+geometry, and the corrected gather-IF8 scale rewind introduced by Andromeda
 commit `77e8adf3`. Older queue-CONFIG builds `d93eea82`, `9ef15fc1`, and
 `663de8d5`, as well as the bundled `update_cf133b89.bin`, are rejected before
-optimized model execution. Direct-bin inference and the Andromeda hardware
-suite are validated on RK build `77e8adf3`.
+optimized model execution. The four-channel banked gather, direct-bin
+inference, and complete Andromeda hardware suite are validated on timing-clean
+RK build `3e92cddf`.
 
 ## Checkpoint and quantization
 
@@ -35,7 +36,8 @@ before consuming tensors. The checkpoint is cached at
 
 Conv+BN is folded before weights are quantized. Normal channel-layout
 convolutions use signed-scale IF4 blocks; `model.0`, `model.1`, and
-`model.2.m.0.cv2` use gather-layout IF8 over flattened spatial/channel blocks.
+`model.2.m.0.cv2` use gather-layout IF8 over flattened spatial/channel blocks,
+with MixMSE choosing INT8 for nearly all selected gather blocks.
 The repository fixture is `test_samples/people.jpg`: at 256 x 256, the
 quantized CPU path detects seven `person` instances at the normal `0.25`
 confidence threshold, with top confidence `0.690374`.
@@ -80,12 +82,14 @@ not one accelerator launch.
 
 ## 256 x 256 performance
 
-On corrected RK build `77e8adf3`, one smoke run followed by five measured
-direct-bin runs gave a median FPGA-only time of `36.031 ms` (`12,010,352`
-cycles) and a median execution-wall time of `80.887 ms`. The one-time immutable
-model upload was `18,262,192` bytes in exactly two writes, with a `6.846 ms`
-median. The validated run detects seven `person` instances, led by confidence
-`0.685195`.
+On timing-clean RK build `3e92cddf`, one warm-up followed by five measured
+direct-bin runs gave a median FPGA-only time of `30.366 ms` (`10,121,984`
+cycles) and a median execution-wall time of `91.086 ms`. The one-time immutable
+model upload was `18,313,456` bytes in exactly two writes, with a `6.812 ms`
+median. Every measured run detected seven `person` instances, led by confidence
+`0.685195`. FPGA cycles are 15.72% below the prior one-channel
+gather/overlap-edge schedule; end-to-end useful-MAC occupancy rises from 46.5%
+to 55.2%.
 
 FPGA-only time is the corrected sum of queue-start-to-HALT accelerator latency
 counters. Execution-wall time additionally includes host tensor packing,

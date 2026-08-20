@@ -34,6 +34,7 @@ from yolov5_common import (
     _class_names,
     _pair,
     execute_yolov5,
+    gather_if8_is_profitable,
     get_yolov5_variant,
     quantize_conv_for_andromeda,
     sha256_file,
@@ -67,11 +68,11 @@ CANONICAL_ARTIFACTS = {
         params_sha256=(
             "9b75c0f41b7fc4ae725b47355a6c5fee8f0f8254893d4225da1b5ad0f2ae29b2"),
         program_sha256=(
-            "0d0fa560ec518f42e8b3ee6227dc5fe131f34b9e00851bbbad2e4d1b2752876d"),
+            "32561feb335f1030f94f536a12cb50852e2ab44d90c998eb2c1ae7fb1a10e08e"),
         dispatch_sha256=(
-            "d07cb0b91e8face456a6480044e2350f5e48f1afdf54403b9b368880a3540f3c"),
+            "f81641aecb8e7c785be53c16601572a8a8bc747e911ac06bb6c754a06abd0cf9"),
         params_bytes=16_862_520,
-        program_bytes=45_696,
+        program_bytes=77_952,
     ),
     "n": CanonicalArtifact(
         variant="n",
@@ -83,11 +84,11 @@ CANONICAL_ARTIFACTS = {
         params_sha256=(
             "5901879827c9e9e10525d6879ce9f852941af9be2a4fd7c4d01deaa1101ca931"),
         program_sha256=(
-            "25ffc42fc50fa7c648d0057da9ee4e8802611134499cb60b86d55ecd1743ac7e"),
+            "e69b09076c9c6628960a1096142cea3493e3cd2b7c10c656f2075c87b4fc86a7"),
         dispatch_sha256=(
-            "ccc136e1bf940cce4e68fe68bea481e0fc8d718a958cfb1a21d4d3a3c25b3b40"),
+            "00b0af7c3b61ccd25c0a9726840664362ddfb700226ed3f2baa8887f01fb808b"),
         params_bytes=18_219_952,
-        program_bytes=42_240,
+        program_bytes=93_504,
     ),
 }
 
@@ -534,8 +535,9 @@ def validate_single_bin(payload: dict) -> None:
             patch_taps = kh * kw * channels
             gather_blocks = (patch_taps + 63) // 64
             channel_blocks = kh * kw * ct
-            expected_gather = (channels <= 255 and patch_taps <= 256
-                               and gather_blocks < channel_blocks)
+            expected_gather = gather_if8_is_profitable(
+                channels=channels, out_channels=oc,
+                kernel_h=kh, kernel_w=kw)
             expected_precision = "if8" if expected_gather else "if4"
             expected_layout = "gather" if expected_gather else "channels"
             if precision != expected_precision or layout != expected_layout:

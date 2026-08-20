@@ -18,11 +18,11 @@ YOLOv5 requires a convolution-enabled FPGA image. The repository-shipped
 the required convolution/max-pool modes and registers.
 
 Both hardware entry points use ordered queue-CONFIG geometry. The optimized
-mixed-precision path additionally requires the corrected 512-bit gather-IF8
-scale rewind from Andromeda commit `77e8adf3`; older queue-CONFIG builds
-`d93eea82`, `9ef15fc1`, and `663de8d5` are rejected for this artifact. No
-compatible update image is shipped in this repository. Direct-bin inference
-and the Andromeda hardware suite are validated on RK build `77e8adf3`.
+mixed-precision path additionally requires the corrected gather-IF8 scale
+rewind introduced by Andromeda commit `77e8adf3`; older queue-CONFIG builds
+`d93eea82`, `9ef15fc1`, and `663de8d5` are rejected for this artifact. The
+four-channel banked gather and performance results are validated on timing-clean
+RK build `3e92cddf`. No compatible update image is shipped in this repository.
 
 Artifact-v4 schema/digest checks, no-capture replay guards, checkpoint
 queue-mode selection, and quantized CPU direct execution are host-validated.
@@ -53,10 +53,11 @@ Every Conv+BatchNorm pair is folded, then quantized in the hardware's native
 64-value block layout. Normal channel-layout convolutions use IF4; MixMSE
 chooses INT4 or FP4 independently per `(output channel, kernel row, kernel
 column, 64-channel tile)` block. The small-channel `model.0` stem instead uses
-gather-layout IF8 over flattened `[kernel row, kernel column, channel]` blocks.
-For both widths, the sign of each BF16 scale selects the integer or floating
-codebook in hardware. A single scale for the whole layer is not accurate enough
-for the pretrained detector.
+gather-layout IF8 over flattened `[kernel row, kernel column, channel]` blocks;
+MixMSE selects INT8 for nearly all of those blocks. For both widths, the sign
+of each BF16 scale selects the integer or floating codebook in hardware. A
+single scale for the whole layer is not accurate enough for the pretrained
+detector.
 
 The default confidence and IoU thresholds are `0.25` and `0.45`. The model uses
 the 80 COCO classes and a letterboxed 256 x 256 RGB input.
@@ -95,8 +96,8 @@ make yolov5s_bin
 python3 models/yolov5/yolov5_compile.py \
   --output models/yolov5/yolov5_bin/yolov5s-andromeda.bin
 
-# Hardware inference from that artifact. Artifact v4 requires an image built
-# from corrected gather-IF8 commit 77e8adf3.
+# Hardware inference from that artifact. The measured four-channel path uses
+# timing-clean gather build 3e92cddf.
 python3 models/yolov5/yolov5_run_from_bin.py
 
 # Check the same artifact and graph on the quantized CPU backend, without FPGA.
@@ -164,14 +165,18 @@ testing an already-built artifact so the pre-test clean does not remove it.
 
 ## 256 x 256 performance
 
-The gather primitive now retains the normal folded-bias and fused-SiLU
-epilogue, so the 6x6 RGB stem can use gather-IF8 instead of repeatedly padding
-three channels into channel-mode blocks. On corrected RK build `77e8adf3`, one
-smoke run followed by five measured direct-bin runs gave a median FPGA-only time
-of `88.182 ms` (`29,394,144` cycles) and a median execution-wall time of
-`150.113 ms`. The one-time immutable model upload was `16,908,216` bytes in
-exactly two writes, with a `6.454 ms` median. The validated run detects `car` at
-confidence `0.510560`.
+The gather primitive retains the normal folded-bias and fused-SiLU epilogue,
+so the 6x6 RGB stem uses predominantly INT8 gather blocks instead of repeatedly
+padding three channels into channel-mode IF4 blocks. Build `3e92cddf` advances
+four activation channels per walker cycle through a four-bank LUTRAM patch
+store, while ordered exact-tail CONFIG groups remove duplicated edge outputs.
+One warm-up followed by five measured direct-bin runs gave a median FPGA-only
+time of `84.376 ms` (`28,125,456` cycles) and a median execution-wall time of
+`167.320 ms`. The one-time immutable model upload was `16,940,472` bytes in
+exactly two writes, with a `6.400 ms` median. Every measured run detected `car`
+at confidence `0.510560`. FPGA cycles are 4.32% below the prior one-channel
+gather/overlap-edge schedule; end-to-end useful-MAC occupancy rises from 69.9%
+to 73.0%.
 
 FPGA-only time is the corrected sum of queue-start-to-HALT accelerator latency
 counters. Execution-wall time additionally includes host tensor packing,

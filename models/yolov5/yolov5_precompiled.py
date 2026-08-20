@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import user_dma_core
 
 
-PRECOMPILED_ABI = "andromeda-yolov5-precompiled-v3"
+PRECOMPILED_ABI = "andromeda-yolov5-precompiled-v4"
 GEOMETRY_ABI = "conv-config-inst-v1"
 
 # Keep the image-dependent staging arena separate from the compact immutable
@@ -673,29 +673,23 @@ class PrecompiledAndromedaBackend:
             pad=pad, pad_h=pad, dilation=dilation, gather=gather,
             bias_enabled=weight["bias"].numel() != 0)
         ct = (C + user_dma_core.UE_VECTOR_SIZE - 1) // user_dma_core.UE_VECTOR_SIZE
-        th, tw = tiles[0][2], tiles[0][3]
-        win_h, win_w = tiles[0][6], tiles[0][7]
-        win_lines = win_h * win_w * ct
-        act_bytes = win_lines * 128
-        n_tiles = len(tiles)
         n_chunks = OC // oc_chunk
-        result_lines = (th * tw * oc_chunk + user_dma_core.UE_VECTOR_SIZE - 1) // user_dma_core.UE_VECTOR_SIZE
-        out_bytes = result_lines * 128
+        _groups, activation_bytes, chunk_output_bytes = \
+            user_dma_core.conv2d_tiled_dram_layout(tiles, ct, oc_chunk)
 
         staged = user_dma_core.conv2d_pack_activation_tiles(
             x, tiles, pad=pad)
-        if staged.numel() * staged.element_size() != n_tiles * act_bytes:
+        if staged.numel() * staged.element_size() != activation_bytes:
             raise RuntimeError(f"{name}: staged activation size differs from bin")
         act_address = self._require_allocation(
-            entry, "params_allocations", 0, n_tiles * act_bytes)
+            entry, "params_allocations", 0, activation_bytes)
         self._write_dynamic(act_address, staged)
         out_address = self._require_allocation(
-            entry, "tensor_allocations", 0, n_chunks * n_tiles * out_bytes)
+            entry, "tensor_allocations", 0, n_chunks * chunk_output_bytes)
         self._dispatch(entry)
 
         big = self._read_bf16(
-            out_address,
-            n_chunks * n_tiles * result_lines * user_dma_core.UE_VECTOR_SIZE)
+            out_address, n_chunks * chunk_output_bytes // 2)
         return user_dma_core.conv2d_unpack_tiled_result(
             big, tiles, out_h, out_w, OC, oc_chunk)
 

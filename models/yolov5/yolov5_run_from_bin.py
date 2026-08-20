@@ -58,6 +58,14 @@ def _format_detection(detection) -> str:
             f"[{x1:6.1f}, {y1:6.1f}, {x2:6.1f}, {y2:6.1f}]")
 
 
+def _cap_hardware_host_threads() -> None:
+    """Bound intra-op parallelism before direct hardware tensor work."""
+    current = torch.get_num_threads()
+    target = min(current, 4)
+    if target != current:
+        torch.set_num_threads(target)
+
+
 def main(argv=None, *, pinned_variant: str = "s",
          config_path: Path | None = None) -> None:
     model_name = get_yolov5_variant(pinned_variant).model_name
@@ -85,6 +93,14 @@ def main(argv=None, *, pinned_variant: str = "s",
     args = parser.parse_args(argv)
     if args.cpu:
         args.backend = "cpu-quantized"
+    if args.backend == "hardware":
+        # The direct path performs many medium-sized activation pack/unpack
+        # operations between resident FPGA programs. Large host thread pools
+        # make those indexing/reshape kernels dramatically slower through
+        # launch and synchronization overhead (24 threads can add seconds).
+        # Apply the cap before any eager tensor work and preserve smaller user
+        # settings.
+        _cap_hardware_host_threads()
 
     profile, config, resource_dir = load_yolov5_config(
         args.variant, config_path)

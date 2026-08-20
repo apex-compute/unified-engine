@@ -460,19 +460,40 @@ def quantize_conv_gather_if8(
     )
 
 
-def _gather_is_profitable(conv: torch.nn.Conv2d) -> bool:
-    """Whether gather reduces 64-lane blocks for this convolution."""
-    kh, kw = _pair(conv.kernel_size, "kernel_size")
-    channels = int(conv.in_channels)
+def gather_if8_is_profitable(*, channels: int, out_channels: int,
+                             kernel_h: int, kernel_w: int) -> bool:
+    """Choose gather-IF8 only when it improves both scheduling and RK traffic.
+
+    The vector gather produces four channels per spatial tap, so its producer
+    cost is ``Kh*Kw*ceil(C/4)`` (groups cannot cross a tap boundary). IF8 uses
+    twice the X-stream bytes per 64-value block as channels-IF4; requiring
+    ``2*gather_blocks < channel_blocks`` avoids trading higher DDR traffic for
+    fewer logical blocks on C32/K3 layers.
+    """
+    kh, kw = int(kernel_h), int(kernel_w)
+    channels = int(channels)
+    out_channels = int(out_channels)
     patch_taps = kh * kw * channels
-    if channels > 255 or patch_taps > 256:
+    if channels <= 0 or out_channels <= 0 or channels > 255 or patch_taps > 256:
         return False
     gather_blocks = (patch_taps + user_dma_core.UE_VECTOR_SIZE - 1) // \
         user_dma_core.UE_VECTOR_SIZE
     channel_blocks = kh * kw * (
         (channels + user_dma_core.UE_VECTOR_SIZE - 1)
         // user_dma_core.UE_VECTOR_SIZE)
-    return gather_blocks < channel_blocks
+    producer_cycles = kh * kw * ((channels + 3) // 4)
+    gather_cycles = max(producer_cycles, out_channels * gather_blocks)
+    channel_cycles = out_channels * channel_blocks
+    return (gather_cycles < channel_cycles
+            and 2 * gather_blocks < channel_blocks)
+
+
+def _gather_is_profitable(conv: torch.nn.Conv2d) -> bool:
+    """Whether gather-IF8 is the accuracy-safe, traffic-positive layout."""
+    kh, kw = _pair(conv.kernel_size, "kernel_size")
+    return gather_if8_is_profitable(
+        channels=int(conv.in_channels), out_channels=int(conv.out_channels),
+        kernel_h=kh, kernel_w=kw)
 
 
 def quantize_conv_for_andromeda(

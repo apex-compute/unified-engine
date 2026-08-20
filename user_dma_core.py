@@ -88,6 +88,7 @@ UE_NATIVE_CONV_HW_VERSIONS = frozenset({
     0x9EF15FC1,
     0x663DE8D5,
     0x77E8ADF3,
+    0x3E92CDDF,
 })
 # Builds verified to implement ordered ISA CONFIG subtype 0 for the four
 # CONV2D/MAXPOOL geometry words.  Keep this narrower than the native-conv set:
@@ -97,6 +98,7 @@ UE_QUEUE_CONFIG_HW_VERSIONS = frozenset({
     0x9EF15FC1,
     0x663DE8D5,
     0x77E8ADF3,
+    0x3E92CDDF,
 })
 # Builds whose gather datapath has been verified for consecutive 512-bit IF8
 # blocks.  Earlier queue-CONFIG images rewind the scale BRAM one cycle late in
@@ -104,6 +106,7 @@ UE_QUEUE_CONFIG_HW_VERSIONS = frozenset({
 # gather-IF8 artifacts must use this stricter capability set.
 UE_GATHER_IF8_HW_VERSIONS = frozenset({
     0x77E8ADF3,
+    0x3E92CDDF,
 })
 # Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)
 UE_ARGMAX_INDEX = UE_ARGMAX1_INDEX
@@ -554,6 +557,15 @@ def validate_conv2d_geometry_words(
     if gather:
         if not 1 <= chunks <= 4:
             raise ValueError(f"gather chunks={chunks} exceeds the four RTL patch buffers")
+        expected_chunks = (
+            kernel_h * kernel_w * geom_hi + UE_VECTOR_SIZE - 1
+        ) // UE_VECTOR_SIZE
+        if chunks != expected_chunks:
+            raise ValueError(
+                f"gather chunks={chunks} != ceil(Kh*Kw*C/64)={expected_chunks}")
+        if count % chunks:
+            raise ValueError(
+                f"gather blocks_per_pixel={count} is not divisible by chunks={chunks}")
     elif geom & (1 << 31) or chunks:
         raise ValueError("channels mode requires CT<=127 and a zero chunks field")
     return geom, ctrl, stride, pixstep
@@ -580,6 +592,12 @@ def pack_conv2d_geometry_words(*, out_w: int, out_h: int, ct: int,
             raise ValueError(f"gather c_in={c_in} exceeds the 8-bit field")
         if chunks is None or not 1 <= chunks <= 4:
             raise ValueError(f"gather chunks={chunks} exceeds the four RTL patch buffers")
+        expected_chunks = (
+            kernel_h * kernel_w * c_in + UE_VECTOR_SIZE - 1
+        ) // UE_VECTOR_SIZE
+        if chunks != expected_chunks:
+            raise ValueError(
+                f"gather chunks={chunks} != ceil(Kh*Kw*C/64)={expected_chunks}")
         if blocks_per_pixel is None or not 0 < blocks_per_pixel <= 0xFFFF:
             raise ValueError(f"blocks_per_pixel={blocks_per_pixel} exceeds the 16-bit field")
         expected_ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
@@ -8744,11 +8762,15 @@ class UnifiedEngine:
         results = out_h * out_w * oc_count
         bytes_per_blk = 64 if data_type == TYPE.IF8 else 32
         assert results <= 0xFFFF, f"output_size={results} exceeds the 16-bit descriptor field"
+        if bias_enable:
+            assert results <= BIAS_BRAM_ELEMENTS, (
+                f"bias stream has {results} results > bias BRAM {BIAS_BRAM_ELEMENTS}")
 
         if gather:
             assert c_in is not None and 0 < c_in <= 0xFF, f"gather requires 0 < c_in <= 255, got {c_in}"
             patch_taps = kernel_h * kernel_w * c_in
-            assert patch_taps <= 256, f"gather Kh*Kw*C={patch_taps} exceeds 256 (MAX_CHUNKS=4)"
+            assert patch_taps <= 256, \
+                f"gather Kh*Kw*C={patch_taps} exceeds 256 (MAX_CHUNKS=4)"
             chunks = (patch_taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
             bpp = oc_count * chunks                       # blocks_per_pixel
             blocks = out_h * out_w * bpp                  # whole weight stream
@@ -8980,9 +9002,10 @@ class UnifiedEngine:
     # URAM bank (padded map below the writeback base), the 16-bit output_size
     # and the 12-bit uram_row_size. Real model layers (224x224 stems, 64x64
     # latents, T=3000 audio) exceed those, so these host-orchestrated drivers
-    # tile the output (and oc), run one captured program per tile — geometry
-    # registers are per-launch — and assemble the result on the host. Slow
-    # path (PCIe roundtrip per tile) but bit-exact and shape-complete.
+    # tile the output (and oc), run one resident program whose ordered CONFIG
+    # blocks select each exact tile geometry, and assemble the result after one
+    # bulk readback.  This remains bit-exact and shape-complete without a PCIe
+    # roundtrip per tile.
     # -------------------------------------------------------------------------
 
     def _capture_conv2d_tile_loop(self, *, n_tiles: int,
@@ -9011,9 +9034,8 @@ class UnifiedEngine:
           abs-jump i-cache anchor,
           loop_start(n_tiles):
             PBI memcpy DRAM->URAM_A   (pointer advances act_bytes/iteration)
-            CONV2D                    (constant descriptor; UE_CONV_* geometry
-                                       registers are written live ONCE for
-                                       the whole program)
+            CONFIG + CONV2D           (constant descriptor for this group;
+                                       ordered queued geometry precedes it)
             PBI writeback URAM->DRAM  (pointer advances out_bytes/iteration)
           loop_end.
 
@@ -9090,7 +9112,7 @@ class UnifiedEngine:
                          wb_uram_addr: int = 0x300,
                          gather: Optional[bool] = None,
                          timeout_s: float = 300.0) -> torch.Tensor:
-        """Full-tensor Conv2d layer as ONE resident PBI program per tile shape.
+        """Full-tensor Conv2d layer as one resident multi-geometry program.
 
         x: (C, H, W) tensor (cast to bf16); w_codes: (OC, C, kh, kw) integer
         hardware codes. ``scale_mag`` is the positive, uniform IF4-INT scale.
@@ -9102,15 +9124,14 @@ class UnifiedEngine:
         for asymmetric padding pre-pad x and pass pad=0.
         Conv1d layers: x = (C, 1, T), kernel (OC, C, 1, k), pad_h=0.
 
-        Execution model (single big stream): every tile window is staged
-        contiguously in DRAM with ONE bulk DMA, then one captured program
-        runs a _capture_conv2d_tile_loop PBI loop over all tiles — with one
-        sequential loop block per oc chunk in the SAME program — and the
-        whole result region is read back with one bulk DMA. The planner's
-        overlap-clamped uniform grid guarantees ONE tile shape, so a layer
-        is ALWAYS exactly one capture + one program + one execute (a
-        512x512 stem is ~12 program instructions looping ~44k times); the
-        per-launch UE_CONV_* geometry registers hold that one shape.
+        Execution model (single big stream): every exact tile window is staged
+        contiguously in DRAM with ONE bulk DMA, then one captured program runs
+        one :meth:`_capture_conv2d_tile_loop` per ordered
+        interior/right/bottom/corner geometry group and OC chunk.  CONFIG
+        instructions switch geometry inside that SAME resident program.  The
+        whole result region is read back with one bulk DMA, so a layer remains
+        exactly one capture + one program + one execute without recomputing
+        overlap-clamped edge pixels.
         """
         self.require_conv_geometry_hardware()
         assert data_type in (TYPE.IF4, TYPE.IF8), \
@@ -9127,14 +9148,17 @@ class UnifiedEngine:
         # Gather mode (small-C, UE_CONV_CTRL[31]): computes the whole im2col
         # patch as a plain dot -> ~9x utilization on C_in=3/4 stems. The gather
         # result rejoins the standard dot epilogue, so per-result bias and the
-        # fused LALU remain available. Requires Kh*Kw*C <= 256 and C <= 255.
-        # Auto-engage
-        # when it packs fewer X blocks per output channel than channels mode;
-        # `gather=True/False` forces it.
+        # fused LALU remain available. The four-channel walker supports up to
+        # four 64-tap chunks. Auto-engage only when the slower of patch
+        # production and dot consumption beats channels mode;
+        # ``gather=True/False`` forces it.
         patch_taps = kernel_h * kernel_w * C
         chunks = (patch_taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         can_gather = C <= 255 and patch_taps <= 256
-        beneficial = chunks < taps
+        gather_producer_cycles = kernel_h * kernel_w * ((C + 3) // 4)
+        gather_cycles_per_pixel = max(gather_producer_cycles, OC * chunks)
+        channel_cycles_per_pixel = OC * taps
+        beneficial = gather_cycles_per_pixel < channel_cycles_per_pixel
         use_gather = (can_gather and beneficial) if gather is None else bool(gather)
         if use_gather and not can_gather:
             raise ValueError(
@@ -9174,32 +9198,26 @@ class UnifiedEngine:
             wb_uram_addr=wb_uram_addr)
         n_chunks = -(-OC // oc_chunk)
         assert OC % oc_chunk == 0, (
-            "planner must choose a divisor of OC so every descriptor in the "
-            "resident program sees one geometry")
+            "planner must choose a divisor of OC so every descriptor and "
+            "result chunk uses the same oc_count")
 
-        # The planner's overlap-clamped grid is UNIFORM: exactly one tile
-        # shape, always — so a layer is one geometry and one program.
-        th, tw = tiles[0][2], tiles[0][3]
-        assert all(t[2] == th and t[3] == tw for t in tiles), "planner must emit a uniform grid"
-        win_h, win_w = tiles[0][6], tiles[0][7]
-        win_lines = win_h * win_w * ct
-        act_bytes = win_lines * 128
-        n_tiles = len(tiles)
-        # Slot stride sized for a FULL oc chunk; a smaller final chunk
-        # writes fewer lines into its slots (tail bytes stay unread).
-        result_lines = (th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-        out_bytes = result_lines * 128
+        groups, activation_bytes, chunk_output_bytes = \
+            conv2d_tiled_dram_layout(tiles, ct, oc_chunk)
+        if (len(groups) > 1
+                and self.conv_geometry_mode != CONV_GEOMETRY_QUEUE_CONFIG):
+            raise RuntimeError(
+                "exact convolution edge tiles require queue-config-v1 geometry")
 
-        # Stage every tile's window contiguously; ONE bulk DMA.
+        # Stage every exact tile window in geometry-group order; ONE bulk DMA.
         staged = conv2d_pack_activation_tiles(
             x, tiles, pad=pad, pad_h=pad_h)
-        assert staged.numel() * staged.element_size() == n_tiles * act_bytes
-        ACT_BASE = self.allocate_params_dram(n_tiles * act_bytes)
+        assert staged.numel() * staged.element_size() == activation_bytes
+        ACT_BASE = self.allocate_params_dram(activation_bytes)
         self.dma_write(DMA_DEVICE_H2C, ACT_BASE, staged, staged.numel() * 2)
-        OUT_BASE = self.allocate_tensor_dram(n_chunks * n_tiles * out_bytes)
+        OUT_BASE = self.allocate_tensor_dram(n_chunks * chunk_output_bytes)
 
-        # ONE capture wrapping the whole layer: a PBI tile loop per oc chunk
-        # as sequential blocks of the SAME program.
+        # ONE capture wrapping the whole layer: each OC chunk contains ordered
+        # interior/right/bottom/corner CONFIG + PBI loop blocks.
         self.start_capture()
         for ci, oc0 in enumerate(range(0, OC, oc_chunk)):
             n_oc = oc_chunk
@@ -9209,43 +9227,63 @@ class UnifiedEngine:
             # INT4/FP4 independently for every 64-value block.
             chunk_scale = _conv2d_chunk_scale(
                 block_scales, scale_mag, oc0=oc0, n_oc=n_oc)
+            # Weight, channel-scale, and bias streams repeat the same
+            # per-output-pixel pattern.  Pack the largest geometry once: every
+            # tail geometry consumes an exact prefix from the same address.
+            # Gather scales are already one geometry-independent pixel pattern.
+            stream_group = max(groups, key=lambda group: group[2] * group[3])
+            stream_th, stream_tw = stream_group[2], stream_group[3]
             if use_gather:
-                w_stream = conv2d_pack_weight_stream_gather(wc, th, tw, data_type)
+                w_stream = conv2d_pack_weight_stream_gather(
+                    wc, stream_th, stream_tw, data_type)
                 scale_stream = conv2d_pack_scale_stream_gather(
                     chunk_scale, n_oc, chunks)
-                scale_count = n_oc * chunks
             else:
-                w_stream = conv2d_pack_weight_stream(wc, th, tw, data_type)
+                w_stream = conv2d_pack_weight_stream(
+                    wc, stream_th, stream_tw, data_type)
                 scale_stream = conv2d_pack_scale_stream(
-                    chunk_scale, n_oc, taps, th, tw)
-                scale_count = th * tw * n_oc * taps
+                    chunk_scale, n_oc, taps, stream_th, stream_tw)
             WEIGHTS_DRAM_ADDR = self.allocate_params_dram(w_stream.numel())
-            self.dma_write(DMA_DEVICE_H2C, WEIGHTS_DRAM_ADDR, w_stream, w_stream.numel())
-            SCALE_DRAM_ADDR = self.allocate_params_dram(scale_stream.numel() * 2)
-            self.dma_write(DMA_DEVICE_H2C, SCALE_DRAM_ADDR, scale_stream,
-                           scale_stream.numel() * 2)
+            self.dma_write(
+                DMA_DEVICE_H2C, WEIGHTS_DRAM_ADDR,
+                w_stream, w_stream.numel())
+            SCALE_DRAM_ADDR = self.allocate_params_dram(
+                scale_stream.numel() * 2)
+            self.dma_write(
+                DMA_DEVICE_H2C, SCALE_DRAM_ADDR,
+                scale_stream, scale_stream.numel() * 2)
             BIAS_DRAM_ADDR = None
             if bias is not None:
-                bias_stream = conv2d_pack_bias_stream(bias[oc0:oc0 + n_oc], th, tw)
-                BIAS_DRAM_ADDR = self.allocate_params_dram(bias_stream.numel() * 2)
-                self.dma_write(DMA_DEVICE_H2C, BIAS_DRAM_ADDR, bias_stream,
-                               bias_stream.numel() * 2)
-            self._capture_conv2d_tile_loop(
-                n_tiles=n_tiles,
-                act_base=ACT_BASE, act_bytes=act_bytes,
-                weights_dram_addr=WEIGHTS_DRAM_ADDR,
-                out_base=OUT_BASE + ci * n_tiles * out_bytes,
-                out_bytes=out_bytes,
-                kernel_w=kernel_w, kernel_h=kernel_h, ct=ct,
-                oc_count=n_oc, out_w=tw, out_h=th,
-                w_pad=win_w, stride_s=stride_s, dilation=dilation,
-                data_type=data_type,
-                scale_dram_addr=SCALE_DRAM_ADDR,
-                scale_count=scale_count,
-                bias_dram_addr=BIAS_DRAM_ADDR, results=th * tw * n_oc,
-                lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
-                gather=use_gather, c_in=C,
-                wb_uram_addr=wb_uram_addr)
+                bias_stream = conv2d_pack_bias_stream(
+                    bias[oc0:oc0 + n_oc], stream_th, stream_tw)
+                BIAS_DRAM_ADDR = self.allocate_params_dram(
+                    bias_stream.numel() * 2)
+                self.dma_write(
+                    DMA_DEVICE_H2C, BIAS_DRAM_ADDR,
+                    bias_stream, bias_stream.numel() * 2)
+            for (start, stop, th, tw, _win_h, win_w,
+                 act_offset, act_bytes, out_offset, out_bytes,
+                 _result_lines) in groups:
+                if use_gather:
+                    scale_count = n_oc * chunks
+                else:
+                    scale_count = th * tw * n_oc * taps
+                self._capture_conv2d_tile_loop(
+                    n_tiles=stop - start,
+                    act_base=ACT_BASE + act_offset, act_bytes=act_bytes,
+                    weights_dram_addr=WEIGHTS_DRAM_ADDR,
+                    out_base=(OUT_BASE + ci * chunk_output_bytes + out_offset),
+                    out_bytes=out_bytes,
+                    kernel_w=kernel_w, kernel_h=kernel_h, ct=ct,
+                    oc_count=n_oc, out_w=tw, out_h=th,
+                    w_pad=win_w, stride_s=stride_s, dilation=dilation,
+                    data_type=data_type,
+                    scale_dram_addr=SCALE_DRAM_ADDR,
+                    scale_count=scale_count,
+                    bias_dram_addr=BIAS_DRAM_ADDR, results=th * tw * n_oc,
+                    lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
+                    gather=use_gather, c_in=C,
+                    wb_uram_addr=wb_uram_addr)
         self.stop_capture()
         self.generate_instruction_halt()
         program_dram_addr = self.get_program_dram_addr()
@@ -9260,10 +9298,9 @@ class UnifiedEngine:
         self.last_conv_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
-        # ONE bulk readback for the whole layer; scatter (overlap-clamped
-        # tiles rewrite identical values, so scatter order is irrelevant).
+        # ONE bulk readback for the whole layer; scatter exact grouped tiles.
         big = self.dma_from_accelerator_memory(
-            OUT_BASE, (n_chunks * n_tiles * result_lines * UE_VECTOR_SIZE,))
+            OUT_BASE, (n_chunks * chunk_output_bytes // 2,))
         return conv2d_unpack_tiled_result(
             big, tiles, out_h, out_w, OC, oc_chunk)
 
@@ -12369,16 +12406,86 @@ def conv2d_pack_activation_map(x: torch.Tensor, pad: int, pad_value: float = 0.0
     return m.reshape(h_pad * w_pad * ct, UE_VECTOR_SIZE).contiguous()
 
 
+def conv2d_tile_geometry_groups(tiles):
+    """Return contiguous exact-tile geometry groups.
+
+    Each result tuple is ``(start, stop, th, tw, win_h, win_w)`` and indexes
+    the original ``tiles`` sequence.  The planner deliberately orders its
+    interior, right, bottom, and corner partitions this way so activation and
+    result buffers can stay single contiguous DMA regions while a resident
+    program switches geometry with ordered CONFIG instructions.  Rejecting a
+    geometry that reappears later prevents the compiler and direct-bin runtime
+    from silently disagreeing about offsets.
+    """
+    assert tiles, "at least one convolution tile is required"
+    groups = []
+    seen = set()
+    start = 0
+    first = tiles[0]
+    assert len(first) >= 8, f"invalid convolution tile {first!r}"
+    key = tuple(int(first[index]) for index in (2, 3, 6, 7))
+    assert all(value > 0 for value in key), f"invalid tile geometry {key!r}"
+    seen.add(key)
+    for index, tile in enumerate(tiles[1:], 1):
+        assert len(tile) >= 8, f"invalid convolution tile {tile!r}"
+        next_key = tuple(int(tile[field]) for field in (2, 3, 6, 7))
+        assert all(value > 0 for value in next_key), \
+            f"invalid tile geometry {next_key!r}"
+        if next_key == key:
+            continue
+        assert next_key not in seen, \
+            f"tile geometry {next_key!r} is not one contiguous group"
+        groups.append((start, index, *key))
+        start, key = index, next_key
+        seen.add(key)
+    groups.append((start, len(tiles), *key))
+    assert len(groups) <= 4, \
+        f"exact convolution tiling needs at most four geometries, got {len(groups)}"
+    return groups
+
+
+def conv2d_tiled_dram_layout(tiles, ct: int, oc_chunk: int):
+    """Describe the shared compiler/runtime staging layout for exact tiles.
+
+    Returns ``(groups, activation_bytes, output_bytes_per_oc_chunk)``.  Each
+    group extends :func:`conv2d_tile_geometry_groups` with
+    ``(act_offset, act_bytes_per_tile, out_offset, out_bytes_per_tile,
+    result_lines_per_tile)``.  All sizes and offsets are whole 1024-bit lines,
+    hence also satisfy the allocator's 64-byte address alignment.
+    """
+    assert ct > 0 and oc_chunk > 0
+    layout = []
+    act_offset = 0
+    out_offset = 0
+    for start, stop, th, tw, win_h, win_w in \
+            conv2d_tile_geometry_groups(tiles):
+        count = stop - start
+        act_bytes = win_h * win_w * ct * 128
+        result_lines = \
+            (th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        out_bytes = result_lines * 128
+        layout.append((
+            start, stop, th, tw, win_h, win_w,
+            act_offset, act_bytes, out_offset, out_bytes, result_lines))
+        act_offset += count * act_bytes
+        out_offset += count * out_bytes
+    assert act_offset > 0 and out_offset > 0
+    assert act_offset % 128 == 0 and out_offset % 128 == 0
+    return layout, act_offset, out_offset
+
+
 def conv2d_pack_activation_tiles(x: torch.Tensor, tiles, pad: int,
                                  pad_h: Optional[int] = None,
                                  pad_value: float = 0.0) -> torch.Tensor:
-    """Pack every uniform planner tile without a Python loop per window.
+    """Pack exact planner tiles with at most one gather per geometry group.
 
-    ``tiles`` uses :func:`plan_conv2d_layer_tiles` tuples. Advanced indexing
-    gathers every padded spatial window in one operation, then the result is
-    laid out as ``[tile][pixel][ct][lane]``. This is byte-identical to calling
-    :func:`conv2d_pack_activation_map` once per tile, including overlap-clamped
-    edge tiles and channel-tail padding.
+    ``tiles`` uses :func:`plan_conv2d_layer_tiles` tuples, ordered in contiguous
+    interior/right/bottom/corner geometry groups.  Advanced indexing gathers
+    all windows in one group at once and the groups are concatenated as
+    ``[group][tile][pixel][ct][lane]``.  This is byte-identical to calling
+    :func:`conv2d_pack_activation_map` once per exact tile, including channel
+    tail padding, while avoiding a Python loop over the (potentially thousands
+    of) tiles.
     """
     assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
     assert tiles, "at least one activation tile is required"
@@ -12386,29 +12493,33 @@ def conv2d_pack_activation_tiles(x: torch.Tensor, tiles, pad: int,
     if pad_h is None:
         pad_h = pad
     assert pad >= 0 and pad_h >= 0, "padding must be non-negative"
-    win_h, win_w = int(tiles[0][6]), int(tiles[0][7])
-    assert all(int(tile[6]) == win_h and int(tile[7]) == win_w
-               for tile in tiles), "activation tiles must have one window shape"
-
     x_padded = torch.nn.functional.pad(
         x.to(torch.bfloat16), (pad, pad, pad_h, pad_h), value=float(pad_value))
     device = x_padded.device
-    y0 = torch.tensor([int(tile[4]) for tile in tiles],
-                      dtype=torch.long, device=device)
-    x0 = torch.tensor([int(tile[5]) for tile in tiles],
-                      dtype=torch.long, device=device)
-    yi = y0[:, None, None] + torch.arange(win_h, device=device)[None, :, None]
-    xi = x0[:, None, None] + torch.arange(win_w, device=device)[None, None, :]
-    windows = x_padded[:, yi, xi].permute(1, 2, 3, 0)
-
     ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-    if C == ct * UE_VECTOR_SIZE:
-        return windows.reshape(-1, UE_VECTOR_SIZE).contiguous()
-    staged = torch.full(
-        (len(tiles), win_h, win_w, ct * UE_VECTOR_SIZE),
-        float(pad_value), dtype=torch.bfloat16, device=device)
-    staged[..., :C] = windows
-    return staged.reshape(-1, UE_VECTOR_SIZE)
+    packed_groups = []
+    for start, stop, _th, _tw, win_h, win_w in \
+            conv2d_tile_geometry_groups(tiles):
+        group = tiles[start:stop]
+        y0 = torch.tensor([int(tile[4]) for tile in group],
+                          dtype=torch.long, device=device)
+        x0 = torch.tensor([int(tile[5]) for tile in group],
+                          dtype=torch.long, device=device)
+        yi = y0[:, None, None] + \
+            torch.arange(win_h, device=device)[None, :, None]
+        xi = x0[:, None, None] + \
+            torch.arange(win_w, device=device)[None, None, :]
+        windows = x_padded[:, yi, xi].permute(1, 2, 3, 0)
+        if C == ct * UE_VECTOR_SIZE:
+            packed = windows.reshape(-1, UE_VECTOR_SIZE).contiguous()
+        else:
+            staged = torch.full(
+                (stop - start, win_h, win_w, ct * UE_VECTOR_SIZE),
+                float(pad_value), dtype=torch.bfloat16, device=device)
+            staged[..., :C] = windows
+            packed = staged.reshape(-1, UE_VECTOR_SIZE)
+        packed_groups.append(packed)
+    return torch.cat(packed_groups, dim=0).contiguous()
 
 
 def conv2d_pack_weight_stream(w_codes: torch.Tensor, out_h: int, out_w: int,
@@ -12552,42 +12663,67 @@ def conv2d_unpack_result(flat: torch.Tensor, out_h: int, out_w: int, oc_count: i
 def conv2d_unpack_tiled_result(flat: torch.Tensor, tiles, out_h: int,
                                out_w: int, oc_count: int,
                                oc_chunk: int) -> torch.Tensor:
-    """Scatter all uniform conv tile/chunk results without per-tile copies.
+    """Scatter exact grouped conv tile/chunk results without per-tile copies.
 
-    ``flat`` is the bulk readback for ``[oc_chunk][tile][result_line][lane]``.
-    The planner may overlap-clamp its final row or column; duplicated output
-    pixels are bit-identical, so a vectorized indexed scatter can select either
-    copy while preserving the dense result exactly.
+    ``flat`` is the bulk readback for
+    ``[oc_chunk][geometry_group][tile][result_line][lane]``.  Each geometry
+    group has its own padded result-line stride.  There are at most four such
+    groups, so parsing each group still avoids a Python loop over tiles while
+    preserving the exact, non-overlapping output partition.
     """
     assert tiles, "at least one result tile is required"
     assert oc_count > 0 and oc_chunk > 0 and oc_count % oc_chunk == 0
-    th, tw = int(tiles[0][2]), int(tiles[0][3])
-    assert all(int(tile[2]) == th and int(tile[3]) == tw for tile in tiles), \
-        "result tiles must have one output shape"
     n_chunks = oc_count // oc_chunk
-    result_lines = (th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-    expected = n_chunks * len(tiles) * result_lines * UE_VECTOR_SIZE
+    groups = conv2d_tile_geometry_groups(tiles)
+    chunk_values = sum(
+        (stop - start)
+        * ((th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE)
+        * UE_VECTOR_SIZE
+        for start, stop, th, tw, _win_h, _win_w in groups)
+    expected = n_chunks * chunk_values
     assert flat.numel() == expected, \
         f"tiled result has {flat.numel()} values, expected {expected}"
 
-    big = flat.reshape(n_chunks, len(tiles), result_lines * UE_VECTOR_SIZE)
-    values = big[..., :th * tw * oc_chunk] \
-        .view(n_chunks, len(tiles), th, tw, oc_chunk) \
-        .permute(0, 4, 1, 2, 3)
-    device = flat.device
-    oy0 = torch.tensor([int(tile[0]) for tile in tiles],
-                       dtype=torch.long, device=device)
-    ox0 = torch.tensor([int(tile[1]) for tile in tiles],
-                       dtype=torch.long, device=device)
-    yi = oy0[:, None, None] + torch.arange(th, device=device)[None, :, None]
-    xi = ox0[:, None, None] + torch.arange(tw, device=device)[None, None, :]
+    big = flat.reshape(n_chunks, chunk_values)
     out = torch.empty(
-        n_chunks, oc_chunk, out_h, out_w, dtype=flat.dtype, device=device)
-    # The planner's only duplicate destinations are overlap-clamped edge
-    # pixels. Every duplicate is computed from the same activation values and
-    # weights and is therefore bit-identical; which identical copy wins is
-    # immaterial. This avoids thousands of small host scatter copies.
-    out[:, :, yi, xi] = values
+        n_chunks, oc_chunk, out_h, out_w,
+        dtype=flat.dtype, device=flat.device)
+    offset = 0
+    for start, stop, th, tw, _win_h, _win_w in groups:
+        count = stop - start
+        result_lines = \
+            (th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        group_values = count * result_lines * UE_VECTOR_SIZE
+        values = big[:, offset:offset + group_values] \
+            .view(n_chunks, count, result_lines * UE_VECTOR_SIZE) \
+            [..., :th * tw * oc_chunk] \
+            .view(n_chunks, count, th, tw, oc_chunk)
+        group = tiles[start:stop]
+        # Exact planner groups are Cartesian row-major grids. Reassemble each
+        # one with a bulk reshape/permute/copy instead of an advanced indexed
+        # scatter. The latter launches a large PyTorch parallel-index kernel
+        # for every group and can dominate direct-bin wall time even though the
+        # FPGA work is unchanged.
+        ys = list(dict.fromkeys(int(tile[0]) for tile in group))
+        xs = list(dict.fromkeys(int(tile[1]) for tile in group))
+        expected_positions = [(y, x) for y in ys for x in xs]
+        actual_positions = [(int(tile[0]), int(tile[1])) for tile in group]
+        assert actual_positions == expected_positions, \
+            "convolution tile group must be a row-major Cartesian grid"
+        assert all(ys[index] == ys[0] + index * th
+                   for index in range(len(ys))), \
+            "convolution tile rows must be adjacent"
+        assert all(xs[index] == xs[0] + index * tw
+                   for index in range(len(xs))), \
+            "convolution tile columns must be adjacent"
+        dense = values \
+            .view(n_chunks, len(ys), len(xs), th, tw, oc_chunk) \
+            .permute(0, 5, 1, 3, 2, 4) \
+            .reshape(n_chunks, oc_chunk, len(ys) * th, len(xs) * tw)
+        out[:, :, ys[0]:ys[0] + len(ys) * th,
+            xs[0]:xs[0] + len(xs) * tw] = dense
+        offset += group_values
+    assert offset == chunk_values
     return out.reshape(oc_count, out_h, out_w)
 
 
@@ -12633,13 +12769,13 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
     writeback base, writeback inside the 4096-line bank, output_size within 16
     bits, and taps/stride products within their geometry fields. oc is chunked
     first, then the output tile grows greedily toward a square (a full-width
-    strip when out_h == 1, i.e. Conv1d). The grid is UNIFORM: (th, tw) is
-    identical for every tile — edge tiles are overlap-clamped, not shrunk — so
-    one geometry covers the whole layer. Because every OC block in one resident
-    program must share its geometry, ``oc_chunk`` is a divisor of ``oc_count``;
-    a prime OC above the per-launch cap can therefore fall back to chunk 1.
-    Callers with such shapes may pad OC or compile a separate tail-geometry
-    program when throughput matters.
+    strip when out_h == 1, i.e. Conv1d).  The grid is an exact, non-overlapping
+    partition ordered as contiguous interior/right/bottom/corner geometry
+    groups.  A queue-config resident program can therefore switch geometry at
+    most four times without recomputing overlap-clamped edge pixels.  Every OC
+    block still uses one ``oc_chunk`` value, so it is a divisor of
+    ``oc_count``; a prime OC above the per-launch cap can therefore fall back
+    to chunk 1.  Callers with such shapes may pad OC when throughput matters.
     """
     assert c_in > 0 and oc_count > 0, "channel counts must be positive"
     assert in_h > 0 and in_w > 0, "input dimensions must be positive"
@@ -12686,10 +12822,9 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
                 and wb_uram_addr + result_lines <= 4096
                 and results <= 0xFFFF)
 
-    # Geometry registers are live per launch, not descriptor fields. Every OC
-    # block captured into the one resident program therefore needs the same
-    # ``oc_count``. Pick the largest fitting divisor instead of leaving a short
-    # tail block with a different geometry (e.g. 512 -> 113+...+60).
+    # Keep one ``oc_count`` and result-slot layout across every OC block in the
+    # resident program. Pick the largest fitting divisor instead of leaving a
+    # short tail block (e.g. 512 -> 113+...+60).
     scale_blocks_per_oc = gather_chunks if gather else taps
     oc_cap = min(
         oc_count, max(1, SCALE_BRAM_ELEMENTS // scale_blocks_per_oc))
@@ -12712,25 +12847,34 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
             tile_w += 1
             grew = True
 
-    # UNIFORM grid via overlap-clamping: every tile is exactly
-    # (tile_h, tile_w); when the output does not divide evenly, the LAST
-    # tile's start is clamped so it overlaps its neighbour instead of
-    # shrinking. Overlapped outputs are recomputed with identical inputs and
-    # weights, so the duplicate results are bit-identical. One tile shape ->
-    # one geometry -> the whole layer is a single resident program.
-    def _starts(dim: int, t: int):
-        s = list(range(0, max(dim - t, 0) + 1, t))
-        if s[-1] != dim - t:
-            s.append(dim - t)
-        return s
-
+    # Exact grid, grouped rather than row-major so each shape is one contiguous
+    # DRAM segment and one CONFIG + PBI loop in the resident program.  There is
+    # always at least one full-size tile on each axis because tile_h/out_h and
+    # tile_w/out_w start at one and never grow past the output dimensions.
+    full_h, rem_h = divmod(out_h, tile_h)
+    full_w, rem_w = divmod(out_w, tile_w)
+    full_ys = [index * tile_h for index in range(full_h)]
+    full_xs = [index * tile_w for index in range(full_w)]
     tiles = []
-    win_h = (tile_h - 1) * stride_s + eff_kh
-    win_w = (tile_w - 1) * stride_s + eff_kw
-    for oy0 in _starts(out_h, tile_h):
-        for ox0 in _starts(out_w, tile_w):
-            tiles.append((oy0, ox0, tile_h, tile_w,
-                          oy0 * stride_s, ox0 * stride_s, win_h, win_w))
+    def _append_group(ys, xs, th: int, tw: int) -> None:
+        win_h = (th - 1) * stride_s + eff_kh
+        win_w = (tw - 1) * stride_s + eff_kw
+        for oy0 in ys:
+            for ox0 in xs:
+                tiles.append((oy0, ox0, th, tw,
+                              oy0 * stride_s, ox0 * stride_s,
+                              win_h, win_w))
+
+    _append_group(full_ys, full_xs, tile_h, tile_w)       # interior
+    if rem_w:
+        _append_group(full_ys, [full_w * tile_w], tile_h, rem_w)  # right
+    if rem_h:
+        _append_group([full_h * tile_h], full_xs, rem_h, tile_w)  # bottom
+    if rem_h and rem_w:
+        _append_group(
+            [full_h * tile_h], [full_w * tile_w], rem_h, rem_w)   # corner
+    assert sum(int(tile[2]) * int(tile[3]) for tile in tiles) == out_h * out_w
+    conv2d_tile_geometry_groups(tiles)  # Validate contiguous grouping now.
     return out_h, out_w, oc_chunk, tiles
 
 
