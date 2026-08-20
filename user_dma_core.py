@@ -584,8 +584,10 @@ class UnifiedEngine:
         self._dram_addresses: dict[str, int] = {}
 
         self._inst_id = 0
-        # During capture: LIFO stack of (counter_reg, body_start_inst_id) per nested loop_start/loop_end.
-        self._capture_loop_stack: list[tuple[int, int]] = []
+        # During capture: LIFO stack of
+        # (counter_reg, body_start_inst_id, relative, program_dram_addr)
+        # per nested loop_start/loop_end.
+        self._capture_loop_stack: list[tuple[int, int, bool, int]] = []
         self._clock_period_ns = clock_period_ns if clock_period_ns is not None else CLOCK_CYCLE_TIME_NS
 
         self._base_addr = BASE_ADDR
@@ -815,7 +817,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        # assert hw_version == 0x3d04c689, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x3d04c689. Please update FPGA with commit update_3d04c689.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0x3d04c689, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x3d04c689. Please update FPGA with commit update_3d04c689.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -8938,15 +8940,21 @@ class UnifiedEngine:
             rst_reg_idx=rst_reg_idx,
         )
 
-    def loop_start(self, loop_cnt: int = 0, gpr_loop_cnt: int = None) -> int:
+    def loop_start(self, loop_cnt: int = 0, gpr_loop_cnt: int = None, relative: bool = True) -> int:
         """
-        Open a counted backward-branch loop during instruction capture (stack-nested).
+        Open a counted loop during instruction capture (stack-nested).
 
-        Pushes a new frame: allocates a counter register, emits ``ADD_SET`` with ``loop_cnt``, and
-        records ``body_start_inst_cnt`` = :attr:`_inst_id` after that instruction (the transaction id
-        of the next captured instruction, i.e. the loop-body head). Nested loops call
-        ``loop_start`` again before the matching ``loop_end``; each frame has its own register and
-        start index.
+        Pushes a new frame: allocates a counter register, emits ``ADD_SET`` (or ``ADD_IMM`` from
+        ``gpr_loop_cnt``), then records the loop-body head. Nested loops call ``loop_start`` again
+        before the matching ``loop_end``; each frame has its own register, start index, and jump
+        style.
+
+        ``relative=True`` (default) closes with a backward ``RELA_JNZ`` (i-cache window, 512-instruction
+        limit from the last unconditional abs-jump anchor). ``relative=False`` closes with an
+        absolute ``JNZ`` that refetches the i-cache from DRAM, so the body may be arbitrarily far
+        from the jump. Absolute mode pads to a 512-bit (64 B) DRAM boundary after the header so the
+        body head is a legal abs-jump target; the program must later be written at the
+        :meth:`get_program_dram_addr` value observed during this call.
 
         Args:
             loop_cnt: Initial iteration count **when** ``gpr_loop_cnt`` is omitted (same semantics as
@@ -8957,6 +8965,8 @@ class UnifiedEngine:
                 Emits ``ADD_IMM`` into the allocated counter register as ``dst = src + 0`` so the
                 counter starts from whatever value that GPR held at execution time (typically set with
                 :meth:`generate_instruction_add_set` earlier in the same program).
+            relative: ``True`` → relative backward ``RELA_JNZ`` at :meth:`loop_end`; ``False`` →
+                absolute ``JNZ`` to the body head.
 
         Returns:
             The allocated loop counter register index.
@@ -8967,6 +8977,7 @@ class UnifiedEngine:
         """
         if not self.is_capture_on or self.capture_buffer is None:
             raise RuntimeError("loop_start() requires an active capture (call start_capture() first).")
+        program_dram_addr = self.get_program_dram_addr()
         reg = self.alloc_isa_reg()
         if gpr_loop_cnt is not None:
             if gpr_loop_cnt == 0:
@@ -8974,20 +8985,26 @@ class UnifiedEngine:
             self.generate_instruction_add_imm(src_reg_idx=gpr_loop_cnt, immediate_value=0, dst_reg_idx=reg)
         else:
             self.generate_instruction_add_set(dst_reg_idx=reg, immediate_value=loop_cnt)
+        if not relative:
+            align = 2 * INSTRUCTION_SIZE_BYTES
+            while (program_dram_addr + self.capture_count * INSTRUCTION_SIZE_BYTES) % align != 0:
+                self.generate_instruction_nop()
         body_start_inst_cnt = self.capture_count
-        self._capture_loop_stack.append((reg, body_start_inst_cnt))
+        self._capture_loop_stack.append((reg, body_start_inst_cnt, relative, program_dram_addr))
         return reg
 
     def loop_end(self) -> int:
         """
         Close the innermost loop opened with :meth:`loop_start` (LIFO).
 
-        Pops one stack frame, computes ``backward_instruction_words`` = current ``_inst_id`` -
-        ``body_start_inst_cnt`` + 2, then emits :meth:`generate_instruction_add_dec` and
-        :meth:`generate_instruction_jump_rela_jnz`, and releases the counter register.
+        Pops one stack frame, emits :meth:`generate_instruction_add_dec`, then either
+        :meth:`generate_instruction_jump_rela_jnz` (relative frame) or
+        :meth:`generate_instruction_jump_abs_jnz` to the body-head DRAM word address (absolute
+        frame). Releases the counter register.
 
         Returns:
-            The ``backward_instruction_words`` value passed to the jump.
+            Instruction-word span of the looped region including ``ADD_DEC`` and the jump
+            (same value relative mode uses as the backward offset).
 
         Raises:
             RuntimeError: If capture is not active or the loop stack is empty.
@@ -8996,10 +9013,14 @@ class UnifiedEngine:
             raise RuntimeError("loop_end() requires an active capture (call start_capture() first).")
         if not self._capture_loop_stack:
             raise RuntimeError("loop_end() without a matching loop_start().")
-        reg, body_start_inst_cnt = self._capture_loop_stack.pop()
+        reg, body_start_inst_cnt, relative, program_dram_addr = self._capture_loop_stack.pop()
         loop_body_size = self.capture_count - body_start_inst_cnt + 2
         self.generate_instruction_add_dec(reg_idx=reg)
-        self.generate_instruction_jump_rela_jnz(loop_body_size, reg)
+        if relative:
+            self.generate_instruction_jump_rela_jnz(loop_body_size, reg)
+        else:
+            body_byte_addr = program_dram_addr + body_start_inst_cnt * INSTRUCTION_SIZE_BYTES
+            self.generate_instruction_jump_abs_jnz(ue_35bit_addr_shifter(body_byte_addr), reg)
         self.release_isa_reg()
         return loop_body_size
 
