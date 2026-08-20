@@ -2,55 +2,45 @@
 
 ## Test setup
 
-Measurements were collected on `p620` with the Kintex-7 bitstream
-`0x52a71442`, XDMA device `xdma0`, and a 5.042213410674164 ns clock period.
-Both implementations used `test_samples/yosemite.jpg`, the prompt
+All implementations used `test_samples/yosemite.jpg`, the prompt
 `Describe this image in detail.`, the same `params.bin`, IF4 projection
 weights, 35 LM layers, 16 vision layers, and 256 image soft tokens.
-
-> **2026-08-20 refresh.** Every column except `rk` was re-measured from clean
-> builds (Kintex, Kintex 2-core, Alveo, and Alveo 2/4/8-core). Kintex used
-> `--dev xdma1` with accepted HW version `0x3d04c689`; Alveo used
-> `--device alveo`. Each run was preceded by `make clean`
-> (`clean_program_bins.sh`) so every program image was recompiled from scratch.
-> This refresh also carries the corrected **Vision end-to-end path** metric:
-> it now covers only the vision *run time* (FPGA execute + the LM-facing
-> soft-token readback), excluding one-time weight init / host compile and the
-> numeric-harness debug readbacks — hence it sits just above Vision FPGA
-> execution. The `rk` column predates this fix and is left as previously
-> measured.
 
 Commands:
 
 ```bash
-python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --image
-python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --image --profile
-python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --image --multi-core
-python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --image --multi-core --profile
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image --multi-core
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image --multi-core 4
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image --multi-core 8
+python models/gemma4_e2b/gemma4_e2b_test.py --device rk_256 --dev xdma0 --image
+python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image
+python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core
+python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 4
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 8
 ```
 
 ## Performance comparison
+> `--device alveo` with HW version `0x5affec20`
+> `--dev xdma1` (kintex7) with HW version `0x3d04c689`
+> `--device rk_256` with HW version `0x3d04c689`
 
 | Metric | Kintex | Kintex 2-core | rk | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Peak throughput | 25.39 GFLOPS | 50.77 GFLOPS | 42.67 GFLOPS | 46.93 GFLOPS | 93.87 GFLOPS | 187.73 GFLOPS | 375.47 GFLOPS |
-| Vision FPGA execution | 53.78 s | 27.74 s | 32.05 s | **29.21 s** | **15.54 s** | **8.08 s** | **4.94 s** |
-| Vision end-to-end path | 53.81 s | 27.81 s | 32.62 s | **29.26 s** | **15.60 s** | **8.15 s** | **5.05 s** |
-| Vision throughput | 21.37 GFLOPS | 41.42 GFLOPS | 35.85 GFLOPS | **39.35 GFLOPS** | **73.96 GFLOPS** | **142.20 GFLOPS** | **232.38 GFLOPS** |
-| — utilization (% peak) | 84.2% | 81.6% | 84.0% | **83.8%** | **78.8%** | **75.7%** | **61.9%** |
+| Vision FPGA execution | 53.78 s | 27.74 s | 32.05 s | **29.12 s** | **15.36 s** | **8.09 s** | **4.96 s** |
+| Vision end-to-end path | 53.81 s | 27.81 s | 32.62 s | **29.16 s** | **15.42 s** | **8.16 s** | **5.06 s** |
+| Vision throughput | 21.37 GFLOPS | 41.42 GFLOPS | 35.85 GFLOPS | **39.46 GFLOPS** | **74.79 GFLOPS** | **142.05 GFLOPS** | **231.68 GFLOPS** |
+| — utilization (% peak) | 84.2% | 81.6% | 84.0% | **84.1%** | **79.7%** | **75.7%** | **61.7%** |
 | Vision soft tokens | 256 | 256 | 256 | 256 | 256 | 256 | 256 |
 | LM prefill sequence executed | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens |
-| LM prefill FPGA latency | 43.95 s | 23.46 s | 28.02 s | **26.29 s** | **12.93 s** | **6.94 s** | **4.02 s** |
-| LM prefill throughput | 24.08 GFLOPS | 45.12 GFLOPS | 37.78 GFLOPS | **40.26 GFLOPS** | **81.89 GFLOPS** | **152.56 GFLOPS** | **263.61 GFLOPS** |
-| — utilization (% peak) | 94.9% | 88.9% | 88.5% | **85.8%** | **87.2%** | **81.3%** | **70.2%** |
-| Decode average throughput | 3.78 tok/s | 3.76 tok/s | 5.85 tok/s | **6.32 tok/s** | **5.78 tok/s** | **6.53 tok/s** | **6.53 tok/s** |
-| Decode peak first-token throughput | 3.99 tok/s | 4.00 tok/s | 6.21 tok/s | **6.65 tok/s** | **6.53 tok/s** | **7.08 tok/s** | **6.90 tok/s** |
-| Decode average hardware throughput | 23.06 GFLOPS | 22.95 GFLOPS | 36.47 GFLOPS | **39.01 GFLOPS** | **35.71 GFLOPS** | **40.56 GFLOPS** | **40.56 GFLOPS** |
-| — utilization (% peak) | 90.8% | 45.2% | 85.5% | **83.1%** | **38.0%** | **21.6%** | **10.8%** |
+| LM prefill FPGA latency | 43.95 s | 23.46 s | 28.02 s | **24.92 s** | **12.87 s** | **6.94 s** | **4.02 s** |
+| LM prefill throughput | 24.08 GFLOPS | 45.12 GFLOPS | 37.78 GFLOPS | **42.49 GFLOPS** | **82.24 GFLOPS** | **152.56 GFLOPS** | **263.54 GFLOPS** |
+| — utilization (% peak) | 94.9% | 88.9% | 88.5% | **90.5%** | **87.6%** | **81.3%** | **70.2%** |
+| Decode average throughput | 3.78 tok/s | 3.76 tok/s | 5.85 tok/s | **6.52 tok/s** | **6.55 tok/s** | **6.56 tok/s** | **6.59 tok/s** |
+| Decode peak first-token throughput | 3.99 tok/s | 4.00 tok/s | 6.21 tok/s | **6.90 tok/s** | **6.90 tok/s** | **6.88 tok/s** | **6.86 tok/s** |
+| Decode average hardware throughput | 23.06 GFLOPS | 22.95 GFLOPS | 36.47 GFLOPS | **40.77 GFLOPS** | **40.57 GFLOPS** | **40.57 GFLOPS** | **40.57 GFLOPS** |
+| — utilization (% peak) | 90.8% | 45.2% | 85.5% | **86.9%** | **43.2%** | **21.6%** | **10.8%** |
 | Vision program section | 3.22 MiB | 2.39 MiB | 3.22 MiB | 3.22 MiB | 2.39 MiB | 1.90 MiB | 1.75 MiB |
 | Prefill program section | 5.85 MiB | 4.77 MiB | 5.85 MiB | 5.85 MiB | 4.77 MiB | 4.06 MiB | 3.72 MiB |
 | Decode program section | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB |
