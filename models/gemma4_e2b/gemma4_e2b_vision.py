@@ -1108,7 +1108,13 @@ class Gemma4VisionMixin:
 
         self.compile_vision_encoder_bin(num_patches, profile=profile)
         _mark("patch+encoder compile (host emit)")
+        # Vision run time = FPGA execute + the runtime data handoff the LM needs
+        # (the pooled image soft-tokens read back for run_prefill's merge). One-time
+        # setup (weight init / scratch alloc / host compile) is assumed done and
+        # excluded; the numeric-harness readbacks below (encoder_out + checkpoints)
+        # are debug-only and also excluded.
         self._vis_fpga_t0 = time.perf_counter()
+        _run_t0 = self._vis_fpga_t0
         enc_result = self.execute_vision_encoder_bin(num_patches, profile=profile)
         _mark("patch+encoder execute (FPGA)")
 
@@ -1119,6 +1125,8 @@ class Gemma4VisionMixin:
         N_SOFT = self.VIS_POOL_N_SOFT
         image_features = self.dma_from_accelerator_memory(
             self.VIS_EMBED_OUT, (N_SOFT, self.VIS_TEXT_H)).float().cpu()
+        # Run time ends here: FPGA execute + the LM-facing soft-token readback.
+        self._vis_e2e_s = time.perf_counter() - _run_t0
         encoder_out = self.dma_from_accelerator_memory(
             final_buf, (num_patches, self.VIS_H)).cpu()
         _mark("pooler tail readback (DMA)")
@@ -1154,9 +1162,12 @@ class Gemma4VisionMixin:
             print("-" * 54)
             print(f"{'TOTAL':<38}{_tot:>9.2f}{100.0:>6.1f}%")
         print(f"[Vision] FPGA encoder done: {image_features.shape[0]} soft tokens "
-              f"in {fpga_total_s:.2f}s total.", flush=True)
-        # Stash for the run-summary writer (write_run_summary).
+              f"in {self._vis_e2e_s:.2f}s run time "
+              f"(host total incl. setup/compile/debug readback {fpga_total_s:.2f}s).",
+              flush=True)
+        # Stash for the run-summary writer (write_run_summary). _vis_e2e_s is the
+        # vision run time (FPGA execute + LM-facing soft-token readback), set above
+        # right after the image_features readback — NOT the full host wall-clock.
         self._vis_num_soft_tokens = int(image_features.shape[0])
-        self._vis_e2e_s = fpga_total_s
         self._vis_device = "FPGA"
         return image_features, token_ids, mm_types
