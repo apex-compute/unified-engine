@@ -1956,6 +1956,7 @@ class Gemma4LMMixin:
         # Stash decode metrics for the run-summary writer (write_run_summary).
         self._decode_peak_toks = _peak
         self._decode_avg_toks = _avg
+        self._decode_e2e_s = _elapsed
         self._decode_generated_n = _decoded_n
         self._decode_total_flop_rate = total_flop_rate
         self._decode_hw_latency_us = total_latency
