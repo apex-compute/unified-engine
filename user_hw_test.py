@@ -5023,31 +5023,32 @@ def isa_rela_loop_test() -> None:
 
 def isa_abs_loop_test() -> None:
     """
-    Port of ``andromeda.c`` ``isa_abs_loop_test(loop_cnt)``: same raw ADD register-file sequence,
-    then absolute ``JNZ`` to instruction index 1 (byte offset ``1 * INSTRUCTION_SIZE_BYTES``), then
-    ``HALT``. Asserts the instruction/PC counter from ``UE_INSTRUCTION_CTL_ADDR`` matches
-    ``loop_cnt * 8 + 2`` (same pass condition as the C test).
+    Same ADD register-file body as ``andromeda.c`` ``isa_abs_loop_test(loop_cnt)``, assembled with
+    :meth:`UnifiedEngine.loop_start` / :meth:`UnifiedEngine.loop_end` and ``relative=False`` so the
+    loop-back is absolute ``JNZ`` (i-cache refetch from DRAM). PC check matches
+    :func:`isa_rela_loop_test`: ``loop_cnt * loop_body_size`` plus the once-executed prefix/halt,
+    minus the trailing alignment NOP after HALT (never decoded).
 
-    Uses ``loop_cnt = 6`` like ``main`` → ``isa_abs_loop_test(6)``.
+    Uses ``loop_cnt = 6`` like ``main`` → ``isa_abs_loop_test(6)``. Dummy ALU ops use GPRs
+    allocated after the loop counter so they cannot clobber the trip count (the C test
+    hard-coded the counter as r4 for the same reason).
     """
     loop_cnt = 6
-    loop_reg = 4
 
     ue = UnifiedEngine()
 
-    program_dram_addr = ue.get_program_dram_addr()
-    jump_target_word_addr = ue_35bit_addr_shifter(program_dram_addr + INSTRUCTION_SIZE_BYTES)
-
     ue.start_capture()
-    ue.generate_instruction_add_set(loop_reg, loop_cnt)
-    ue.generate_instruction_add_set(3, 7)
-    ue.generate_instruction_add_inc(3)
-    ue.generate_instruction_add_set(1, 1)
-    ue.generate_instruction_add_set(2, 2)
-    ue.generate_instruction_add_reg(3, 2, 1)
-    ue.generate_instruction_add_imm(3, 5)
-    ue.generate_instruction_add_dec(loop_reg)
-    ue.generate_instruction_jump_abs_jnz(jump_target_word_addr, loop_reg)
+    loop_reg = ue.loop_start(loop_cnt, relative=False)
+    r_acc = ue.alloc_isa_reg()
+    r_a = ue.alloc_isa_reg()
+    r_b = ue.alloc_isa_reg()
+    ue.generate_instruction_add_set(r_acc, 7)
+    ue.generate_instruction_add_inc(r_acc)
+    ue.generate_instruction_add_set(r_a, 1)
+    ue.generate_instruction_add_set(r_b, 2)
+    ue.generate_instruction_add_reg(r_acc, r_b, r_a)
+    ue.generate_instruction_add_imm(r_acc, 5)
+    loop_body_size = ue.loop_end()
     ue.generate_instruction_halt()
     ue.stop_capture()
 
@@ -5059,15 +5060,17 @@ def isa_abs_loop_test() -> None:
     ue.wait_queue(30.0)
 
     _, pc_reg = ue.report_timing_and_instruction_count()
-    expected_pc = loop_cnt * 8 + 2 + 1
+    inst_index_after_halt = ue._inst_id
+    expected_pc = loop_cnt * loop_body_size + (inst_index_after_halt - loop_body_size) - 1
     assert pc_reg == expected_pc, (
         f"instruction/PC counter mismatch: got {pc_reg}, expected {expected_pc} "
-        f"(isa_abs_loop_test, loop_cnt={loop_cnt})"
+        f"(isa_abs_loop_test, loop_cnt={loop_cnt}, loop_body_size={loop_body_size}, "
+        f"_inst_id_after_halt={inst_index_after_halt})"
     )
 
     print(
         f"isa_abs_loop_test: PASS (loop_cnt={loop_cnt}, pc_reg={pc_reg}, "
-        f"jump_target_word=0x{jump_target_word_addr:x}, program_dram=0x{program_dram_addr:x})"
+        f"loop_reg={loop_reg}, loop_body_size={loop_body_size}, program_dram=0x{program_dram_addr:x})"
     )
 
     record_test("isa_abs_loop",
