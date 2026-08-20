@@ -153,6 +153,19 @@ class QuantizationTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_latency_counter_units_are_hidden_by_engine_wrapper(self):
+        engine = object.__new__(user_dma_core.UnifiedEngine)
+        engine.read_reg32 = mock.Mock(return_value=7)
+        engine._clock_period_ns = 3.0
+
+        self.assertEqual(
+            engine.read_latency_cycles(),
+            7 * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV)
+        self.assertAlmostEqual(engine.report_latency_in_us(), 0.336)
+        self.assertEqual(
+            engine.read_reg32.call_args_list,
+            [mock.call(user_dma_core.UE_LATENCY_COUNT_ADDR)] * 2)
+
     def test_checkpoint_runner_selects_queue_config_geometry(self):
         fake_engine = mock.Mock()
         fake_backend = object()
@@ -366,8 +379,14 @@ class PrecompiledBinTests(unittest.TestCase):
                         and self.interrupt_status):
                     return self.interrupt_status.pop(0)
                 if address == user_dma_core.UE_LATENCY_COUNT_ADDR:
-                    return 7
+                    raise AssertionError(
+                        "model backend bypassed the latency wrapper")
                 return 0
+
+            def read_latency_cycles(self):
+                self.latency_wrapper_calls = getattr(
+                    self, "latency_wrapper_calls", 0) + 1
+                return 7 * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV
 
             def dma_read(self, _device, _address, value, size):
                 value.zero_()
@@ -390,10 +409,10 @@ class PrecompiledBinTests(unittest.TestCase):
             backend.static_dram_load_bytes,
             hardware["params_image"].numel()
             + hardware["program_image"].numel())
-        self.assertEqual(backend.latency_counter_ticks["conv"], 7)
         self.assertEqual(
             backend.cycles["conv"],
             7 * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV)
+        self.assertEqual(engine.latency_wrapper_calls, 1)
         self.assertEqual(engine.registers, [(user_dma_core.UE_INT_REG, 1)])
         self.assertFalse(any(address in (
             user_dma_core.UE_CONV_GEOM_ADDR, user_dma_core.UE_CONV_CTRL_ADDR,

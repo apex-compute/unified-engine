@@ -9236,7 +9236,7 @@ class UnifiedEngine:
         # Stash the whole-layer program size and HW execute latency so callers
         # / tests can report them (the capture buffer is cleared just below).
         self.last_conv_inst_bytes = inst_bytes
-        self.last_conv_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_conv_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
         # ONE bulk readback for the whole layer; scatter (overlap-clamped
@@ -9360,7 +9360,7 @@ class UnifiedEngine:
         self.wait_queue(timeout_s)
         # Stash whole-layer program size + HW execute latency for tests/callers.
         self.last_maxpool_inst_bytes = inst_bytes
-        self.last_maxpool_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_maxpool_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
         big = self.dma_from_accelerator_memory(
@@ -9463,7 +9463,7 @@ class UnifiedEngine:
         self.start_execute_from_dram(program_dram_addr)
         self.wait_queue(timeout_s)
         self.last_maxpool_inst_bytes = inst_bytes
-        self.last_maxpool_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_maxpool_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
         flat = self.dma_from_accelerator_memory(OUT, (out_h * out_w * UE_VECTOR_SIZE,))
@@ -9661,7 +9661,7 @@ class UnifiedEngine:
         self.allocate_program_dram(stats_inst_bytes)
         self.start_execute_from_dram(prog)
         self.wait_queue(timeout_s)
-        stats_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        stats_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
         # ---- host: finish the slot sums, fold group stats into per-channel (A, B) ----
@@ -9718,7 +9718,7 @@ class UnifiedEngine:
         self.allocate_program_dram(apply_inst_bytes)
         self.start_execute_from_dram(prog)
         self.wait_queue(timeout_s)
-        self.last_groupnorm_cycles = stats_cycles + self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_groupnorm_cycles = stats_cycles + self.read_latency_cycles()
         self.last_groupnorm_inst_bytes = stats_inst_bytes + apply_inst_bytes
         self.clear_capture_buffer()
 
@@ -9833,7 +9833,7 @@ class UnifiedEngine:
         self.start_execute_from_dram(program_dram_addr)
         self.wait_queue(timeout_s)
         self.last_upsample_inst_bytes = inst_bytes
-        self.last_upsample_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_upsample_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
         flat = self.dma_from_accelerator_memory(
@@ -9979,7 +9979,7 @@ class UnifiedEngine:
         self.start_execute_from_dram(prog)
         self.wait_queue(timeout_s)
         self.last_eltwise_inst_bytes = inst_bytes
-        self.last_eltwise_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_eltwise_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
         flat = self.dma_from_accelerator_memory(OUT, (total_lines * UE_VECTOR_SIZE,))
@@ -10076,7 +10076,7 @@ class UnifiedEngine:
         self.start_execute_from_dram(prog)
         self.wait_queue(timeout_s)
         self.last_relu_inst_bytes = inst_bytes
-        self.last_relu_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_relu_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
         flat = self.dma_from_accelerator_memory(
@@ -10241,7 +10241,7 @@ class UnifiedEngine:
         self.start_execute_from_dram(prog)
         self.wait_queue(timeout_s)
         self.last_silu_inst_bytes = inst_bytes
-        self.last_silu_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_silu_cycles = self.read_latency_cycles()
         self.last_silu_passes = 2 * (len(coeffs) - 1) + 9
         self.clear_capture_buffer()
 
@@ -10366,7 +10366,7 @@ class UnifiedEngine:
         self.start_execute_from_dram(program_dram_addr)
         self.wait_queue(timeout_s)
         self.last_attention_inst_bytes = inst_bytes
-        self.last_attention_cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR)
+        self.last_attention_cycles = self.read_latency_cycles()
         self.clear_capture_buffer()
 
         attn = self.dma_from_accelerator_memory(OUT, (seq, C))
@@ -11811,11 +11811,19 @@ class UnifiedEngine:
         self._inst_id = 0
         print("Software reset complete.")
 
+    def read_latency_counter_ticks(self) -> int:
+        """Read the raw, prescaled hardware latency-counter value."""
+        return int(self.read_reg32(UE_LATENCY_COUNT_ADDR))
+
+    def read_latency_cycles(self) -> int:
+        """Read the last program latency in FPGA ``aclk`` cycles."""
+        return self.read_latency_counter_ticks() * UE_PIPELINE_COUNTER_CLK_DIV
+
     def report_timing_and_instruction_count(self):
         """
         Report timing and instruction count
         """
-        latency = self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV
+        latency = self.read_latency_cycles()
         instruction_count = self.read_reg32(UE_INSTRUCTION_CTL_ADDR)
         print(f"Latency: {latency * self._clock_period_ns / 1e3:.3f} us, Instruction count: {instruction_count}")
         print(f"Latency in cycles: {latency}")
@@ -11825,13 +11833,13 @@ class UnifiedEngine:
         """
         Report latency
         """
-        return self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV * self._clock_period_ns / 1e3
+        return self.read_latency_cycles() * self._clock_period_ns / 1e3
 
     def report_flop_rate_gflops(self, num_flops: int):
         """
         Report flop rate and gflops ratio of peak throughput
         """
-        cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV
+        cycles = self.read_latency_cycles()
         gflops_ratio = num_flops / 1.28 / cycles
         return num_flops / (cycles * self._clock_period_ns), gflops_ratio
 

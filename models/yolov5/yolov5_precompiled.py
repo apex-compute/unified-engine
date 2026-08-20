@@ -536,11 +536,10 @@ class PrecompiledAndromedaBackend:
         self.timeout_s = float(timeout_s)
         if not math.isfinite(self.timeout_s) or self.timeout_s <= 0:
             raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s!r}")
-        # ``cycles`` is expressed in FPGA aclk cycles.  UE_LATENCY_COUNT is a
-        # prescaled counter (one tick per UE_PIPELINE_COUNTER_CLK_DIV clocks),
-        # so _dispatch expands each readout before accumulating it.
+        # ``cycles`` is expressed in FPGA aclk cycles. UnifiedEngine owns the
+        # latency-counter prescaler conversion; model backends never interpret
+        # raw register units.
         self.cycles: dict[str, int] = collections.defaultdict(int)
-        self.latency_counter_ticks: dict[str, int] = collections.defaultdict(int)
         self.instruction_bytes: dict[str, int] = collections.defaultdict(int)
         self.static_dram_load_bytes = 0
         self.static_dram_load_seconds = 0.0
@@ -627,11 +626,7 @@ class PrecompiledAndromedaBackend:
         self.ue.start_execute_from_dram(program_address)
         self._wait_strict()
         self.instruction_bytes[entry["op"]] += entry["program_size"]
-        counter_ticks = int(
-            self.ue.read_reg32(user_dma_core.UE_LATENCY_COUNT_ADDR))
-        self.latency_counter_ticks[entry["op"]] += counter_ticks
-        self.cycles[entry["op"]] += (
-            counter_ticks * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV)
+        self.cycles[entry["op"]] += self.ue.read_latency_cycles()
 
     def conv_prepared(self, name: str, x: torch.Tensor, _prepared, *,
                       stride: int, pad: int, dilation: int,
