@@ -5437,62 +5437,61 @@ def isa_mult_div_shift_test() -> None:
     ue.reset_inst_ptr_counter()
     ue.reset_isa_reg_counter()
 
-def software_reset_test():
+# Per-core AXI-Lite register base spacing. Core i's register block lives at
+# UE_0_BASE_ADDR + i * ENGINE_BASE_STRIDE — the same stride MultiEngineScheduler
+# uses to build worker engines (multi_engine_shard.py engine_base_stride), which
+# is what the multi-core llama3.2_1b prefill runs on.
+ENGINE_BASE_STRIDE = 0x00010000
+
+
+def software_reset_test(cores: int = 1):
+    """Software-reset AXI cores 0..cores-1 and verify each recovers cleanly.
+
+    software_reset() is PER-CORE: it writes SW_RESET_CMD to UE_QUEUE_CTRL_ADDR
+    translated through the engine's OWN _base_addr, so a plain UnifiedEngine()
+    (base = UE_0_BASE_ADDR) resets ONLY core 0 — it does not touch cores 1..N.
+
+    A hung multi-core prefill (e.g. llama3.2_1b --multi-core) leaves every worker
+    core spin-waiting on a FLAG_CHECK too (no timeout). Pass ``cores=N`` to clear
+    every engine that run used: core i lives at UE_0_BASE_ADDR + i*ENGINE_BASE_STRIDE.
+
+    For each core: issue software_reset() to break any stale FLAG_CHECK spin-wait
+    / drain the queue, then run a bare HALT and confirm the core reports idle.
     """
-    Verifies that software reset breaks a deterministic deadlock caused
-    by flag registers, and that the engine recovers cleanly afterwards.
+    if not 1 <= cores <= 8:
+        raise ValueError(f"cores must be 1..8, got {cores}")
+    import user_dma_core
 
-    Phase 1 — flag deadlock (expect engine stuck):
-      Program engine 0 to FLAG_CHECK on engine 1 whose flag is never set.
-      This causes an infinite spin-wait (deadlock).  Confirm the engine
-      is stuck, then issue software_reset() to break it.
+    for core in range(cores):
+        base = user_dma_core.UE_0_BASE_ADDR + core * ENGINE_BASE_STRIDE
+        print(f"--- software_reset: core {core} (base 0x{base:08x}) ---")
+        ue = UnifiedEngine(BASE_ADDR=base)
 
-    Phase 2 — simple halt instruction (expect PASS):
-    """
-    # ---- Phase 1: cause a flag deadlock, then reset ----
-    ue = UnifiedEngine()
+        # Break any stale FLAG_CHECK spin-wait and drain this core's queue.
+        ue.software_reset()
 
-    # ue.start_capture()
-    # ue.generate_instruction_flag_check(target_engine_idx=1)
-    # ue.generate_instruction_halt()
-    # ue.stop_capture()
-    # program_dram_addr = ue.get_program_dram_addr()
-    # print(f"program_dram_addr: {program_dram_addr:08x}")
-    # print(f"capture_instruction_size_bytes: {ue.get_capture_instruction_size_bytes()}")
-    # ue.write_captured_instructions_to_dram(program_dram_addr)
-    # ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-    # ue.start_execute_from_dram(program_dram_addr)
+        # Recovery check: a bare HALT must complete, not report busy.
+        ue.start_capture()
+        ue.generate_instruction_halt()
+        ue.stop_capture()
+        program_dram_addr = ue.get_program_dram_addr()
+        print(f"program_dram_addr: {program_dram_addr:08x}")
+        print(f"capture_instruction_size_bytes: {ue.get_capture_instruction_size_bytes()}")
+        ue.write_captured_instructions_to_dram(program_dram_addr)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
 
-    # ue.clear_capture_buffer()
-    # ue.reset_tensor_dram_addr()
+        ue.start_execute_from_dram(program_dram_addr)
+        ue.wait_queue(3.0)  # 3 seconds timeout
 
-    # ue.wait_queue(1.0) # 3 seconds timeout
+        assert not ue.is_queue_busy(), \
+            f"core {core} should have completed HALT but still reports busy"
 
-    # assert ue.is_queue_busy(), \
-    #     "Engine should be stuck in FLAG_CHECK spin-wait but reports idle"
-    # print("Engine is deadlocked on FLAG_CHECK(engine 1) — issuing software reset...")
-    ue.software_reset()
+        print(f"core {core} software reset + recovery PASSED")
+        ue.clear_capture_buffer()
+        ue.reset_tensor_dram_addr()
 
-    # ---- Phase 2: run flag set/clear after reset, expect completion ----
-    ue.start_capture()
-    ue.generate_instruction_halt()
-    ue.stop_capture()
-    program_dram_addr = ue.get_program_dram_addr()
-    print(f"program_dram_addr: {program_dram_addr:08x}")
-    print(f"capture_instruction_size_bytes: {ue.get_capture_instruction_size_bytes()}")
-    ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-
-    ue.start_execute_from_dram(program_dram_addr)
-    ue.wait_queue(3.0) # 3 seconds timeout
-
-    assert not ue.is_queue_busy(), \
-        "Engine should have completed HALT but still reports busy"
-
-    print("Software reset test PASSED")
+    print(f"Software reset test PASSED ({cores} core(s))")
     record_test("software_reset", "n/a")
-    ue.clear_capture_buffer()
-    ue.reset_tensor_dram_addr()
 
 
 def test_ue_int_reg_read():
@@ -5688,17 +5687,23 @@ def gemma3_inference_test() -> None:
     from gemma3_test import Gemma3_UnifiedEngine
     import user_dma_core
 
+    # Golden refreshed 2026-08-19 for the proper-GQA prefill (per-head loop over
+    # the compact K/V; the old duplicate-KV + plain-tril path under-weighted the
+    # diagonal token for non-last query heads — now fixed to match the HF GQA
+    # reference). IF4's greedy decode shifted to this coherent completion; the
+    # legacy/streaming/matmatmul labels all share this golden (all use the same
+    # corrected prefill attention).
     expected_text = (
-        "Let's solve the equation x + 3 = 5\n\n"
-        "To find the value of 'x', we need to isolate it.  "
-        "Subtract 3 from both sides of the equation:\n\n"
-        "x + 3 - 3 = 5 - 3\n\n"
+        "If you add 3 to both sides of the equation, you get:\n\n"
+        "x + 3 + 3 = 5 + 3\n\n"
         "This simplifies to:\n\n"
-        "x = 2\n\n"
+        "x + 6 = 8\n\n"
+        "Now, subtract 6 from both sides:\n\n"
+        "x = 8 - 6\n\n"
         "Therefore, x = 2\n\n"
         "So the answer is **2**"
     )
-    expected_tokens = 80
+    expected_tokens = 76
     token_tol = 0
 
     # Peak (1st-token) decode throughput floors were measured on bittware
@@ -6080,6 +6085,12 @@ if __name__ == "__main__":
         action='store_true',
         help='Run the large nested-loop sweeps at the end of the suite (slow).',
     )
+    parser.add_argument(
+        '--multi-core', type=int, default=1,
+        help='Number of AXI cores (1..8) to software-reset in software_reset_test. '
+             'Use N to clear all engines a hung multi-core run left spin-waiting '
+             '(e.g. llama3.2_1b --multi-core 2 -> --multi-core 2). Default: 1.',
+    )
     args = parser.parse_args()
 
     import user_dma_core
@@ -6145,7 +6156,7 @@ if __name__ == "__main__":
 
     atexit.register(_atexit_write_test_summary)
 
-    software_reset_test()
+    software_reset_test(cores=args.multi_core)
     dram_read_write_speed_test()
     isa_rela_loop_test()
     isa_abs_loop_test()

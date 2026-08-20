@@ -17,6 +17,13 @@ Architecture differences vs Gemma3:
   - LM head weight is tied to the embedding weight.
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
+DRAM map (device DRAM is mapped AT 0x80000000; nothing usable below it — see
+__init__ for the authoritative layout + boundary guards):
+  params : 0x80000000 .. 0xB0000000   weights
+  tensor : 0xB0000000 .. 0xFE000000   activations / KV
+  worker : 0xFE000000 .. 0xFF600000   --multi-core prefill worker programs only
+  program: 0xFF600000 .. 0x100000000  master instruction image + preamble
+
 Weights:
   - Default: llama3.2_1b_bin/params.bin (generated from HF model if missing).
   - --local-weights: use llama3.2_1b_bin/full_model_weights.bin instead.
@@ -348,19 +355,36 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
                  decoder_matmatmul: bool | None = None, stream_prefill: bool | None = None,
                  matmatmul: bool | None = None, prefill_kernel: str | None = None,
-                 decode_kernel: str | None = None):
+                 decode_kernel: str | None = None, multi_core: int = 1):
         # IF4 layout inside the 2 GB window 0x80000000..0xFFFFFFFF.
+        # DRAM is mapped AT 0x80000000 (user_dma_core.DRAM_START_ADDR); there is
+        # NO usable DRAM below it, so every region — including the multi-core
+        # worker ISA band — must be carved out of THIS window. (The scheduler's
+        # default worker arena is DRAM_START + 0x10000000 = 0x90000000, which
+        # lands ~256 MiB deep inside the weights below; --multi-core therefore
+        # passes an explicit base — see _ensure_prefill_scheduler.)
         # At max_context_size=1024 the loaded params use ~642 MiB and tensors/KV
-        # use ~212 MiB. Keep simple aligned boundaries and reserve the final
-        # 10 MiB exclusively for the captured instruction image + preamble.
+        # use ~212 MiB. Keep simple aligned boundaries; reserve the final 10 MiB
+        # for the master instruction image + preamble, and a 22 MiB band just
+        # below it for the multi-core prefill worker programs.
         #   params : 0x80000000 .. 0xB0000000  (768 MiB)
-        #   tensor : 0xB0000000 .. 0xFF600000  (1270 MiB)
+        #   tensor : 0xB0000000 .. 0xFE000000  (1248 MiB)
+        #   worker : 0xFE000000 .. 0xFF600000  (22 MiB, --multi-core only)
         #   program: 0xFF600000 .. 0x100000000 (10 MiB)
         super().__init__(
             params_dram_base=0x80000000,
             tensor_dram_base=0xB0000000,
             program_dram_base=0xFF600000,
         )
+        # Multi-core prefill worker ISA band (consumed in _ensure_prefill_scheduler).
+        # Workers hold ONLY their prefill program here; every data buffer they
+        # touch is addressed absolutely into the shared llama tensors, so no
+        # separate worker params/tensor arena is needed. Each worker gets a
+        # WORKER_ISA_STRIDE-sized slice and the band ends exactly at the master
+        # program base, so the tensor region above and the program region below
+        # both bound it. 3 MiB/worker × ≤7 workers (22 MiB) stays under 0xFF600000.
+        self.WORKER_ISA_BASE   = 0xFE000000
+        self.WORKER_ISA_STRIDE = 0x00300000   # 3 MiB / worker
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         # Unified kernel selection. The boolean inputs are legacy constructor
         # aliases retained for callers outside this script.
@@ -400,6 +424,14 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             )
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
+        # Multi-core prefill: engine 0 is this (primary); engines 1..N-1 are worker
+        # UnifiedEngines built lazily by the scheduler. N>2 is unverified on this
+        # device (the scheduler asserts unless opted in). See _ensure_prefill_scheduler.
+        if not 1 <= multi_core <= 8:
+            raise ValueError(f"multi_core must be between 1 and 8, got {multi_core}")
+        self.multi_core = multi_core
+        self._prefill_scheduler = None
+        self._prefill_worker_addrs = []
         self._cfg = _load_config(self.script_dir)
         self.weight_defs = self._cfg["_weight_defs"]
 
@@ -457,11 +489,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 f"tensor_start=0x{self._tensor_dram_base:X}"
             )
         self.tensor_init()
-        if self.get_tensor_dram_addr() > self._program_dram_base:
+        # Tensor now ends at the worker ISA band, not the master program region:
+        # the 22 MiB worker band (0xFE000000..program_base) sits between them.
+        if self.get_tensor_dram_addr() > self.WORKER_ISA_BASE:
             raise MemoryError(
-                f"Tensor DRAM overlaps program DRAM: "
+                f"Tensor DRAM overlaps the multi-core worker ISA band: "
                 f"tensor_end=0x{self.get_tensor_dram_addr():X}, "
-                f"program_start=0x{self._program_dram_base:X}"
+                f"worker_isa_base=0x{self.WORKER_ISA_BASE:X}"
             )
 
     def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
@@ -633,7 +667,47 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
-    def _compile_prefill_program(self, template_seq_len: int, layer_size: int, profile: bool = False) -> dict:
+    def _ensure_prefill_scheduler(self):
+        """Lazily build (once) the MultiEngineScheduler for prefill row-sharding.
+        Returns None for single-core.
+
+        Worker programs are placed in the dedicated WORKER_ISA band carved out of
+        llama's own address window (0xFE000000..program_base). The scheduler's
+        DEFAULT worker arena (DRAM_START + 0x10000000 = 0x90000000) must NOT be
+        used: DRAM is mapped at 0x80000000, so that default lands inside the
+        weights and silently corrupts them. worker_tensor_offset/
+        worker_program_offset=0 make the passed base the worker's program base
+        directly (workers never use their params/tensor allocators — all data is
+        addressed absolutely into the shared llama tensors)."""
+        if self.multi_core <= 1:
+            return None
+        if self._prefill_scheduler is None:
+            from multi_engine_shard import MultiEngineScheduler
+            # Boundary protection: the whole worker band (one WORKER_ISA_STRIDE
+            # slice per worker) must fit under the master program region.
+            band_end = self.WORKER_ISA_BASE + (self.multi_core - 1) * self.WORKER_ISA_STRIDE
+            if band_end > self._program_dram_base:
+                raise MemoryError(
+                    f"Worker ISA band overflows the program region for "
+                    f"multi_core={self.multi_core}: band_end=0x{band_end:X} > "
+                    f"program_base=0x{self._program_dram_base:X} "
+                    f"(base=0x{self.WORKER_ISA_BASE:X}, stride=0x{self.WORKER_ISA_STRIDE:X})"
+                )
+            # allow_unaligned_rows: the row-local MLP kernels (rms/eltwise/matmul)
+            # loop per token, so a non-64-aligned M shard is safe here and lets a
+            # short prompt (e.g. 44 tokens → 22/22) still split across 2 engines.
+            self._prefill_scheduler = MultiEngineScheduler(
+                self, num_engines=self.multi_core,
+                worker_dram_base=self.WORKER_ISA_BASE,
+                worker_dram_stride=self.WORKER_ISA_STRIDE,
+                worker_tensor_offset=0,
+                worker_program_offset=0,
+                allow_unaligned_rows=True,
+                allow_more_than_two_engines=self.multi_core > 2)
+        return self._prefill_scheduler
+
+    def _compile_prefill_program(self, template_seq_len: int, layer_size: int, profile: bool = False,
+                                 prefill_scheduler=None) -> dict:
         """Compile prefill into the active capture session.
 
         ``template_seq_len`` is used only for FLOPs accounting and static M= args;
@@ -675,6 +749,25 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         half_ahd    = ahd // 2              # 32
         rope_row    = hd * 2 * bpe          # bytes per rope table row
 
+        # ---- Proper-GQA prefill attention: seq_len-agnostic static dims ----
+        # `seq_len` here is the REAL prompt length, used ONLY for FLOP accounting
+        # (the caller passes len(prefill_seq)-1). The emitted attention instructions
+        # and the core's baked scratch offsets must instead reserve the MAX runtime
+        # length so one cached bin serves any prompt <= PREFILL_CONTEXT_SIZE. So the
+        # unified_attention_core static batch/aligned are pinned to PREFILL_CONTEXT
+        # (never the prompt), while the real per-token counts come from the GPRs.
+        pc_seq_len     = self.PREFILL_CONTEXT_SIZE
+        attn_aligned_static = ((pc_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        real_aligned   = ((seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+
+        def _attn_flops(batch: int, aligned: int, head_dim: int) -> int:
+            """Attention FLOPs (matching unified_attention_core's accounting) for one
+            per-head SDPA at the REAL prompt dims: QKᵀ + softmax + PV. Computed
+            model-side because the core is called with the PREFILL_CONTEXT-max static
+            dims (for scratch), so its own returned count would reflect the max, not
+            the real prompt."""
+            return 2 * batch * head_dim * aligned + 5 * batch * aligned + 2 * batch * aligned * head_dim
+
         # The host uploads prompt embeddings to OUTPUT_DRAM. Each layer consumes
         # that recurrent buffer and writes its final residual back to the same
         # buffer, eliminating the old OUTPUT->INPUT inter-layer copy.
@@ -686,6 +779,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 kwargs.pop("is_B_quantized", None)
                 return self.quantized_matmat_core(M=M, K=K, N=N, **kwargs)
             return self.matmat_mul_core(M=M, K=K, N=N, **kwargs)
+
+        def _shard_projection_core(ue, M: int, K: int, N: int, **kwargs) -> int:
+            """Emit one row-shard projection onto engine ``ue`` using the same
+            (streaming, compact) kernel as single-core so the master program still
+            fits the 10 MiB region. The row count comes from gpr_M_reg (the caller
+            primes it) — the streaming kernel needs a GPR-driven M, not a baked one."""
+            if self.prefill_kernel == "streaming":
+                kwargs.pop("is_B_quantized", None)
+                return ue.quantized_matmat_core(M=M, K=K, N=N, **kwargs)
+            return ue.matmat_mul_core(M=M, K=K, N=N, **kwargs)
 
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
@@ -764,7 +867,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 gpr_M_reg=self.gpr_seq_len,
             )
 
-            # Phase 3: Per-KV-head scatter → KV cache + flash buffers → flash_attention
+            # Phase 3: Proper GQA — outer loop over the 8 KV heads, inner loop over
+            # the 4 query heads in each group. Each query head runs ONE compact SDPA
+            # over the un-duplicated per-KV-head K/V (read straight from the KV cache),
+            # so there is no group_size replication of K/V and the score matrix is
+            # [S, align64(S)] per head instead of [4S, 4S] per KV head — group_size×
+            # less attention MAC + KV DMA than the old duplicate-and-batch scheme.
             for kv_h in range(nkvh):
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
                                 + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
@@ -773,20 +881,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                                 + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
                                 + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
 
-                # Scatter K_h_roped (64-dim) from [lo|hi] K_DRAM → KV cache + FLASH_K
-                # lo half and hi half are non-contiguous in K_DRAM → two PBI loops.
-                k_flash_lo_specs = (
-                    [(k_cache_base,               ahd * bpe)]
-                    + [(self.LAYER0_FLASH_K_DRAM + g * ahd * bpe,               qpkv * ahd * bpe) for g in range(qpkv)]
-                )
-                k_flash_hi_specs = (
-                    [(k_cache_base + half_ahd * bpe, ahd * bpe)]
-                    + [(self.LAYER0_FLASH_K_DRAM + g * ahd * bpe + half_ahd * bpe, qpkv * ahd * bpe) for g in range(qpkv)]
-                )
+                # Scatter K_h_roped (64-dim) from [lo|hi] K_DRAM → KV cache ONLY (the
+                # compact cache row is [lo|hi] = 64 contiguous). No FLASH_K duplication.
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_K_DRAM + kv_h * half_ahd * bpe,
                     read_stride_bytes=hd * bpe,
-                    write_specs=k_flash_lo_specs,
+                    write_specs=[(k_cache_base, ahd * bpe)],
                     sram_byte_addr=0x10000,
                     element_count=half_ahd,
                     gpr_seq_len=self.gpr_seq_len,
@@ -795,33 +895,30 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_K_DRAM + (hd // 2 + kv_h * half_ahd) * bpe,
                     read_stride_bytes=hd * bpe,
-                    write_specs=k_flash_hi_specs,
+                    write_specs=[(k_cache_base + half_ahd * bpe, ahd * bpe)],
                     sram_byte_addr=0x10080,
                     element_count=half_ahd,
                     gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
 
-                # Scatter V_h (64-dim, standard layout) from V_PROJ_TEMP → KV cache + FLASH_V
-                # V_PROJ_TEMP layout: [seq_len, nkvh, ahd] → stride = nkvh*ahd*bpe per token.
+                # Scatter V_h (64-dim, standard layout) from V_PROJ_TEMP → KV cache ONLY.
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe,
                     read_stride_bytes=nkvh * ahd * bpe,
-                    write_specs=(
-                        [(v_cache_base, ahd * bpe)]
-                        + [(self.LAYER0_FLASH_V_DRAM + g * ahd * bpe, qpkv * ahd * bpe) for g in range(qpkv)]
-                    ),
+                    write_specs=[(v_cache_base, ahd * bpe)],
                     sram_byte_addr=0x20000,
                     element_count=ahd,
                     gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
 
-                # Scatter Q_h_q (64-dim) from [lo|hi] Q_DRAM → FLASH_Q
-                # Q group g_for_kv = kv_h//2; sub-heads 0..qpkv-1 within that group.
                 g_for_kv = kv_h // 2
                 local_kv = kv_h % 2
                 for q in range(qpkv):
+                    # Scatter this ONE query head (64-dim) from [lo|hi] Q_DRAM into a
+                    # contiguous FLASH_Q [S, 64] (lo at 0, hi at half_ahd) — the layout
+                    # unified_attention_core expects for Q=[batch, head_dim].
                     sub_idx = local_kv * qpkv + q
                     q_lo_base = (self.LAYER0_Q_DRAM
                                  + g_for_kv * hd * bpe
@@ -829,12 +926,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     q_hi_base = (self.LAYER0_Q_DRAM
                                  + g_for_kv * hd * bpe
                                  + (hd // 2 + sub_idx * half_ahd) * bpe)
-                    flash_q_lo = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
-                    flash_q_hi = flash_q_lo + half_ahd * bpe
                     self._emit_pbi_scatter_per_token(
                         read_base=q_lo_base,
                         read_stride_bytes=total_q_dim * bpe,
-                        write_specs=[(flash_q_lo, qpkv * ahd * bpe)],
+                        write_specs=[(self.LAYER0_FLASH_Q_DRAM, ahd * bpe)],
                         sram_byte_addr=0x30000,
                         element_count=half_ahd,
                         gpr_seq_len=self.gpr_seq_len,
@@ -843,53 +938,47 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self._emit_pbi_scatter_per_token(
                         read_base=q_hi_base,
                         read_stride_bytes=total_q_dim * bpe,
-                        write_specs=[(flash_q_hi, qpkv * ahd * bpe)],
+                        write_specs=[(self.LAYER0_FLASH_Q_DRAM + half_ahd * bpe, ahd * bpe)],
                         sram_byte_addr=0x30080,
                         element_count=half_ahd,
                         gpr_seq_len=self.gpr_seq_len,
                         template_seq_len=seq_len,
                     )
 
-                # Scaled dot-product attention for this KV head's qpkv query heads,
-                # called inline per KV head (unified_attention_core replaces the old
-                # shared flash_attention_core subroutine + JUMP_ABS call-site pattern).
-                attn_result = self.unified_attention_core(
-                    batch=q_seq_len,
-                    aligned_seq_len=aligned_seq_len,
-                    head_dim=ahd,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    gpr_batch_reg=self.gpr_q_seq_len,
-                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
-                    q_pre_scaled=True,
-                )
-                total_flops += attn_result or 0
+                    # Compact per-head SDPA: Q=[S,64] (FLASH_Q), K/V=[S,64] straight
+                    # from the cache, plain causal bias [S, align64(S)]. Static
+                    # batch/aligned pinned to PREFILL_CONTEXT (scratch/instructions
+                    # seq_len-agnostic); real per-token counts come from the GPRs.
+                    self.unified_attention_core(
+                        batch=pc_seq_len,
+                        aligned_seq_len=attn_aligned_static,
+                        head_dim=ahd,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        K_DRAM_ADDR=k_cache_base,
+                        V_DRAM_ADDR=v_cache_base,
+                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                        gpr_batch_reg=self.gpr_seq_len,
+                        gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                        q_pre_scaled=True,
+                    )
+                    # FLOP counted at the REAL prompt dims (model-side, see _attn_flops).
+                    total_flops += _attn_flops(seq_len, real_aligned, ahd)
 
-                # Assemble output into LAYER0_FLASH_OUTPUT_DRAM
-                # Standard GQA layout per token: [kv0_q0(64), kv0_q1..q3, kv1_q0..q3, ...]
-                out_h_base = kv_h * qpkv * ahd * bpe
-                t_reg = self.alloc_isa_reg()
-                src_off_reg = self.alloc_isa_reg()
-                dst_off_reg = self.alloc_isa_reg()
-                self.generate_instruction_add_set(t_reg, 0)
-                self.loop_start(loop_cnt=seq_len, gpr_loop_cnt=self.gpr_seq_len)
-                self.generate_instruction_reg_mul_imm(src_off_reg, t_reg, ue_35bit_addr_shifter(qpkv * ahd * bpe))
-                self.generate_instruction_reg_mul_imm(dst_off_reg, t_reg, ue_35bit_addr_shifter(total_q_dim * bpe))
-                for g in range(qpkv):
-                    self.generate_instruction_add_imm(src_off_reg, ue_35bit_addr_shifter(self.LAYER0_FLASH_OUT_HEAD_DRAM + g * ahd * bpe), self.TMP_REG)
-                    self.accelerator_memory_to_sram(0, 0x40000, ahd, general_reg_src=self.TMP_REG)
-                    self.generate_instruction_add_imm(dst_off_reg, ue_35bit_addr_shifter(self.LAYER0_FLASH_OUTPUT_DRAM + out_h_base + g * ahd * bpe), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x40000, 0, ahd, general_reg_src=self.TMP_REG)
-                self.generate_instruction_add_inc(t_reg)
-                self.loop_end()
-                self.release_isa_reg()  # dst_off_reg
-                self.release_isa_reg()  # src_off_reg
-                self.release_isa_reg()  # t_reg
+                    # Assemble this head's [S, 64] output into FLASH_OUTPUT at its
+                    # standard-GQA slot: token row = [kv0_q0..q3, kv1_q0..q3, ...].
+                    head_pos = (kv_h * qpkv + q) * ahd * bpe
+                    self._emit_pbi_scatter_per_token(
+                        read_base=self.LAYER0_FLASH_OUT_HEAD_DRAM,
+                        read_stride_bytes=ahd * bpe,
+                        write_specs=[(self.LAYER0_FLASH_OUTPUT_DRAM + head_pos, total_q_dim * bpe)],
+                        sram_byte_addr=0x40000,
+                        element_count=ahd,
+                        gpr_seq_len=self.gpr_seq_len,
+                        template_seq_len=seq_len,
+                    )
             if profile:
                 _checkpoint(f"L{layer_idx}_attention")
 
@@ -911,48 +1000,92 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             if profile:
                 _checkpoint(f"L{layer_idx}_o_proj_residual")
 
-            # LLaMA: post_attention_layernorm IS the pre-FFN norm
-            total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                              OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
-                              gpr_M_reg=self.gpr_seq_len)
-            if profile:
-                _checkpoint(f"L{layer_idx}_pre_ffn_norm")
-            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True,
-                gpr_M_reg=self.gpr_seq_len)
-            total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4,
-                gpr_M_reg=self.gpr_seq_len)
-            # gate × up — per-row PBI loop (gpr_seq_len trips); one row of mlp_elements per iter.
-            self.eltwise_core_dram(
-                M=seq_len, N=self.mlp_elements,
-                dram_a=self.LAYER0_MLP_GATE_DRAM,
-                dram_b=self.LAYER0_MLP_UP_DRAM,
-                dram_out=self.LAYER0_MLP_MULT_DRAM,
-                mode=UE_MODE.ELTWISE_MUL,
-                gpr_M_reg=self.gpr_seq_len,
-            )
-            if profile:
-                _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
-            total_flops += prefill_projection_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4,
-                gpr_M_reg=self.gpr_seq_len)
+            # ---- MLP block: post-attn norm + gate/up + silu·mul + down + residual.
+            # Every op here is row-local (each token independent), so with
+            # --multi-core it row-shards cleanly across engines: engine e handles
+            # rows [row_offset, row_offset+rows) of every buffer, reading the shared
+            # (read-only) weights by absolute address. The scheduler emits an entry
+            # + exit barrier around the region. Single-core path is unchanged.
+            vlb = self.vector_length * self.bytes_per_element
+            mlpb = self.mlp_elements * self.bytes_per_element
+            if prefill_scheduler is None:
+                # LLaMA: post_attention_layernorm IS the pre-FFN norm
+                total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                                  OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
+                                  gpr_M_reg=self.gpr_seq_len)
+                if profile:
+                    _checkpoint(f"L{layer_idx}_pre_ffn_norm")
+                total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True,
+                    gpr_M_reg=self.gpr_seq_len)
+                total_flops += prefill_projection_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4,
+                    gpr_M_reg=self.gpr_seq_len)
+                # gate × up — per-row PBI loop (gpr_seq_len trips); one row of mlp_elements per iter.
+                self.eltwise_core_dram(
+                    M=seq_len, N=self.mlp_elements,
+                    dram_a=self.LAYER0_MLP_GATE_DRAM,
+                    dram_b=self.LAYER0_MLP_UP_DRAM,
+                    dram_out=self.LAYER0_MLP_MULT_DRAM,
+                    mode=UE_MODE.ELTWISE_MUL,
+                    gpr_M_reg=self.gpr_seq_len,
+                )
+                if profile:
+                    _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
+                total_flops += prefill_projection_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4,
+                    gpr_M_reg=self.gpr_seq_len)
 
-            # LLaMA: no post-FFN norm; add residual directly to down_proj output.
-            # Per-row PBI loop (gpr_seq_len trips) — layer_output = POST_ATTN_RESIDUAL + MLP_DOWN.
-            self.eltwise_core_dram(
-                M=seq_len, N=self.vector_length,
-                dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                dram_b=self.LAYER0_MLP_DOWN_DRAM,
-                dram_out=self.LAYER0_OUTPUT_DRAM,
-                mode=UE_MODE.ELTWISE_ADD,
-                gpr_M_reg=self.gpr_seq_len,
-            )
-            if profile:
-                _checkpoint(f"L{layer_idx}_mlp_down_residual")
+                # LLaMA: no post-FFN norm; add residual directly to down_proj output.
+                # Per-row PBI loop (gpr_seq_len trips) — layer_output = POST_ATTN_RESIDUAL + MLP_DOWN.
+                self.eltwise_core_dram(
+                    M=seq_len, N=self.vector_length,
+                    dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                    dram_b=self.LAYER0_MLP_DOWN_DRAM,
+                    dram_out=self.LAYER0_OUTPUT_DRAM,
+                    mode=UE_MODE.ELTWISE_ADD,
+                    gpr_M_reg=self.gpr_seq_len,
+                )
+                if profile:
+                    _checkpoint(f"L{layer_idx}_mlp_down_residual")
+            else:
+                _mlp_flops = [0]
+                def _emit_mlp_shard(ctx, layer_off=layer_off):
+                    # Per-engine row count via a GPR. gpr_q_seq_len (reg 6) is unused
+                    # in prefill after the proper-GQA rewrite, so repurpose it as the
+                    # shard row-count register on every engine (the master's dynamic
+                    # ISA pool is full; the workers set their own). Primed once per
+                    # shard, then reused by every op in the block.
+                    ue = ctx.unsafe_ue
+                    m = self.gpr_q_seq_len
+                    ue.generate_instruction_add_set(m, ctx.rows)
+                    ue.rms_norm_core_dram(M=ctx.rows, N=self.vector_length,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, vlb),
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_PRE_MLP_NORM_DRAM, vlb),
+                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off, gpr_M_reg=m)
+                    _mlp_flops[0] += _shard_projection_core(ue, M=ctx.rows, K=self.vector_length, N=self.mlp_elements,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_PRE_MLP_NORM_DRAM, vlb), B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_MLP_GATE_DRAM, mlpb),
+                        is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True, gpr_M_reg=m)
+                    _mlp_flops[0] += _shard_projection_core(ue, M=ctx.rows, K=self.vector_length, N=self.mlp_elements,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_PRE_MLP_NORM_DRAM, vlb), B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_MLP_UP_DRAM, mlpb),
+                        is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4, gpr_M_reg=m)
+                    ue.eltwise_core_dram(M=ctx.rows, N=self.mlp_elements,
+                        dram_a=ctx.rows_addr(self.LAYER0_MLP_GATE_DRAM, mlpb), dram_b=ctx.rows_addr(self.LAYER0_MLP_UP_DRAM, mlpb),
+                        dram_out=ctx.rows_addr(self.LAYER0_MLP_MULT_DRAM, mlpb), mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m)
+                    _mlp_flops[0] += _shard_projection_core(ue, M=ctx.rows, K=self.mlp_elements, N=self.vector_length,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_MLP_MULT_DRAM, mlpb), B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_MLP_DOWN_DRAM, vlb),
+                        is_B_quantized=True, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4, gpr_M_reg=m)
+                    ue.eltwise_core_dram(M=ctx.rows, N=self.vector_length,
+                        dram_a=ctx.rows_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, vlb), dram_b=ctx.rows_addr(self.LAYER0_MLP_DOWN_DRAM, vlb),
+                        dram_out=ctx.rows_addr(self.LAYER0_OUTPUT_DRAM, vlb), mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m)
+                prefill_scheduler.sharded_region(seq_len, _emit_mlp_shard)
+                total_flops += _mlp_flops[0]
         self.generate_instruction_halt()
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
@@ -1229,10 +1362,15 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             digest.update(os.path.abspath(source_path).encode())
             with open(source_path, "rb") as source_file:
                 digest.update(source_file.read())
+        # The prompt length does NOT change the instruction bytes (the bin is
+        # seq_len-agnostic), but it does change the FLOP meta (FLOPs are accounted at
+        # the real prompt length), so fold it in to refresh a cached meta per length.
+        _pf = self.prefill_seq or tuple(self._cfg["default_prefill_tokens"])
         digest.update(
             f"layers={layer_size};decode_kernel={self.decode_kernel};"
             f"prefill_kernel={self.prefill_kernel};"
-            f"penalty={getattr(self, 'fpga_penalty', False)}".encode())
+            f"penalty={getattr(self, 'fpga_penalty', False)};"
+            f"prefill_len={len(_pf) - 1}".encode())
         return digest.hexdigest()
 
     def compile_llama(self, layer_size: int | None = None, profile: bool = False) -> None:
@@ -1275,7 +1413,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         )
         print(f"Decode kernel: {self.decode_kernel} — {decode_description}")
         print(f"Prefill kernel: {self.prefill_kernel} — {prefill_description}")
-        if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
+        # Multi-core prefill writes the worker programs to the workers' DRAM as a
+        # side effect of compiling (scheduler.finalize), and run_llama needs the
+        # returned worker addresses. A cache hit would skip that, so always
+        # (re)compile when sharding is active.
+        prefill_scheduler = self._ensure_prefill_scheduler()
+        if prefill_scheduler is None and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             try:
                 with open(instruction_meta_path, "r") as meta_file:
                     cached_meta = json.load(meta_file)
@@ -1289,19 +1432,52 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 return
             print(f"Rebuilding stale instruction image at {instruction_bin_path}")
 
-        # Compile the prefill template at PREFILL_CONTEXT_SIZE (the max prompt length).
-        # All loop counts are GPR-driven (gpr_seq_len), so the single cached program
-        # handles any actual prompt length <= PREFILL_CONTEXT_SIZE; template_seq_len is
-        # used only for FLOPs accounting and the flash bucket count.
-        template_seq_len = self.PREFILL_CONTEXT_SIZE
+        # FLOP accounting uses the REAL prompt length (len(prefill_seq)-1): the static
+        # M= args and the model-side attention FLOP are then exact for this prompt
+        # (in particular the quadratic attention term, which a fixed-template +
+        # linear rescale would mis-count). The emitted instructions stay fully
+        # seq_len-agnostic — every runtime loop count is GPR-driven and the attention
+        # core's scratch is pinned to PREFILL_CONTEXT_SIZE (see _compile_prefill_program),
+        # so the same bin still serves any prompt <= PREFILL_CONTEXT_SIZE. The prompt
+        # length is folded into the compile fingerprint so a different-length prompt
+        # refreshes the FLOP meta even though the bin bytes are identical.
+        _prefill_seq = self.prefill_seq or tuple(self._cfg["default_prefill_tokens"])
+        template_seq_len = len(_prefill_seq) - 1
 
         self.clear_inst_id()
         self.start_capture()
 
-        print(f"Compiling prefill (template_seq_len={template_seq_len}; profile={profile})...")
+        # Multi-core: open the worker capture sessions before the prefill body so
+        # the sharded MLP regions + barriers emit into every engine; close them
+        # (writing each worker program to its DRAM) right after prefill — the
+        # decoder is single-engine (master only).
+        if prefill_scheduler is not None:
+            prefill_scheduler.begin_program()
+
+        print(f"Compiling prefill (template_seq_len={template_seq_len}; profile={profile}; multi_core={self.multi_core})...")
         t0 = time.perf_counter()
-        prefill_prog = self._compile_prefill_program(template_seq_len=template_seq_len, layer_size=layer_size, profile=profile)
+        prefill_prog = self._compile_prefill_program(template_seq_len=template_seq_len, layer_size=layer_size, profile=profile,
+                                                     prefill_scheduler=prefill_scheduler)
         print(f"  prefill compiled: {prefill_prog['size_bytes']} bytes, {time.perf_counter() - t0:.1f}s")
+        if prefill_scheduler is not None:
+            self._prefill_worker_addrs = prefill_scheduler.finalize()
+            # Boundary protection: each worker program must stay inside its own
+            # WORKER_ISA_STRIDE slice (and thus below the next worker / the master
+            # program region). finalize() has already DMA-written them, so a
+            # violation means the write clobbered a neighbour — fail loudly.
+            for engine_idx, (worker, worker_addr) in enumerate(
+                    zip(prefill_scheduler.workers, self._prefill_worker_addrs), start=1):
+                worker_end = worker_addr + worker.get_capture_instruction_size_bytes()
+                slice_limit = self.WORKER_ISA_BASE + engine_idx * self.WORKER_ISA_STRIDE
+                if worker_end > slice_limit:
+                    raise MemoryError(
+                        f"prefill worker{engine_idx} ISA overflow: "
+                        f"end=0x{worker_end:X} > slice_limit=0x{slice_limit:X} "
+                        f"(base=0x{worker_addr:X}, stride=0x{self.WORKER_ISA_STRIDE:X}); "
+                        f"increase WORKER_ISA_STRIDE"
+                    )
+            print(f"  prefill workers: {len(self._prefill_worker_addrs)} program(s), "
+                  f"{prefill_scheduler.worker_program_bytes()} bytes total")
 
         print("Compiling decoder...")
         t0 = time.perf_counter()
@@ -1441,7 +1617,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.seq_len = prefill_seq_len
 
         q_seq_len = prefill_seq_len * self.group_size
-        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        # Proper GQA: each query head attends the COMPACT (S-long) per-KV-head K/V,
+        # so the dynamic aligned KV length / flash bucket are align64(S), not
+        # align64(S*group). gpr_q_seq_len is still primed (harmless) for symmetry.
+        aligned_seq_len = ((prefill_seq_len + 63) // 64) * 64
         bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
         flops_prefill = flops_prefill_template * prefill_seq_len // max(template_seq_len, 1)
 
@@ -1492,18 +1671,31 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
         self.dma_to_accelerator_memory(self.LAYER0_OUTPUT_DRAM, embedding_tensor)
+        # Proper-GQA per-head plain causal bias over the compact K/V: query token r
+        # attends key token c <= r, shared by every query head; cols >= S are -inf.
         bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
         rows = torch.arange(aligned_seq_len).unsqueeze(1)
         cols = torch.arange(aligned_seq_len).unsqueeze(0)
-        valid_mask = (cols // self.group_size) <= (rows // self.group_size)
+        valid_mask = cols <= rows
         bias_one_group.masked_fill_(valid_mask, 0.0)
-        bias_one_group[:, q_seq_len:] = float("-inf")
+        bias_one_group[:, prefill_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
 
         print(f"\n--- Starting prefill (seq_len={prefill_seq_len}) ---")
         print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
+        # Multi-core: launch the worker programs (they spin-wait at the first
+        # barrier) BEFORE the master program, and join them after it halts. The
+        # worker programs were written to their DRAM at compile time
+        # (scheduler.finalize) and self._prefill_worker_addrs was saved.
+        prefill_scheduler = getattr(self, "_prefill_scheduler", None) if self.multi_core > 1 else None
         timer = time.perf_counter()
-        hw_lat_prefill_us, _ = self.program_execute(preamble_addr, flops=flops_prefill)
+        if prefill_scheduler is not None:
+            prefill_scheduler.preclear_flags()
+            prefill_scheduler.start_workers(self._prefill_worker_addrs)
+        hw_lat_prefill_us, prefill_gflops = self.program_execute(preamble_addr, flops=flops_prefill)
+        if prefill_scheduler is not None:
+            for w in prefill_scheduler.workers:
+                w.wait_queue(300.0)
         latency_prefill = time.perf_counter() - timer
         print(f"Prefill done in {latency_prefill:.2f}s\n")
 
@@ -1663,6 +1855,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "prefill_speed_tok_s": round(prefill_seq_len / latency_prefill, 2),
             "decode_speed_tok_s": round(avg_tokens_per_s, 2),
             "decoder_gflops": round(decoder_gflops, 2),
+            "prefill_gflops": round(prefill_gflops, 2) if prefill_gflops else None,
+            "total_tokens": prefill_seq_len + tokens_decoded,
             "prefill_size_kb": round(meta["prefill_program_size"] / 1024, 1),
             "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
             "prefill_hw_ms": hw_lat_prefill_us / 1e3,
@@ -1671,6 +1865,128 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "decode_avg_hw_ms": hw_decode_avg_ms,
             "decode_avg_cpu_ms": cpu_decode_avg_ms,
         }
+
+    def write_run_summary(self, out_path: str, args, run_result: dict, cores: int = 1,
+                          title: str = "llama3.2_1b_test") -> str:
+        """Write a per-run Markdown performance summary (device info, weight/program
+        sizes, prefill + decode HW latency/throughput, and the prompt/decoded text),
+        built from ``run_result`` (the run_llama dict) plus cheap host-side
+        bookkeeping. No FPGA program is launched here, so calling it after a run is
+        free. Mirrors gemma3_test.write_run_summary. Returns the written path."""
+        clock_ns = getattr(user_dma_core, "CLOCK_CYCLE_TIME_NS", 0.0) or 0.0
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        peak_gflops = freq_mhz * 0.128 * cores   # freq(MHz) * 128 MAC/cyc/1000 * cores
+        try:
+            hw_version = self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF
+            hw_version_str = f"0x{hw_version:08x}"
+        except Exception as e:
+            hw_version_str = f"(read failed: {e})"
+
+        # Weights.
+        weight_bin_rel = self._cfg["paths"]["weights_bin"]
+        weight_bin_path = os.path.join(self.script_dir, weight_bin_rel)
+        weight_bin_size = os.path.getsize(weight_bin_path) if os.path.exists(weight_bin_path) else 0
+        total_weight_dram_mb = self.get_params_dram_usage() / (1024 * 1024)
+
+        prefill_kb = run_result.get("prefill_size_kb")
+        decoder_kb = run_result.get("decoder_size_kb")
+        combined_kb = (prefill_kb or 0) + (decoder_kb or 0)
+
+        def _mb(n):
+            return f"{n / (1024 * 1024):.2f} MB" if n else "n/a"
+        def _kb(v):
+            return f"{v:.1f} KB" if v is not None else "n/a"
+        def _util(gflops):
+            """Reported throughput as a percent of this run's peak GFLOPS."""
+            return f"{100.0 * gflops / peak_gflops:.1f}%" if peak_gflops else "n/a"
+
+        pf_tokens = run_result.get("prefill_tokens")
+        pf_hw_ms = run_result.get("prefill_hw_ms")
+        pf_gflops = run_result.get("prefill_gflops")
+        pf_cpu_ms = run_result.get("prefill_cpu_ms")
+        dec_n = run_result.get("decoded_tokens")
+        total_tok = run_result.get("total_tokens")
+        peak_toks = run_result.get("peak_tokens_per_s")
+        avg_toks = run_result.get("avg_tokens_per_s")
+        dec_gflops = run_result.get("decoder_gflops")
+        dec_first_ms = run_result.get("decode_first_hw_ms")
+        dec_avg_ms = run_result.get("decode_avg_hw_ms")
+
+        try:
+            prompt_text = self.tokenizer.decode(list(self.prefill_seq), skip_special_tokens=False)
+        except Exception:
+            prompt_text = "(decode failed)"
+        decoded_text = run_result.get("decoded_text") or "(none)"
+
+        L = []
+        L.append(f"# {title} run summary")
+        L.append("")
+        L.append(f"- **HW version:** {hw_version_str}")
+        L.append(f"- **--dev:** {args.dev}")
+        L.append(f"- **--device:** {args.device}")
+        L.append(f"- **Clock / frequency:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)")
+        L.append(f"- **Cores:** {cores}")
+        L.append(f"- **Prefill kernel:** {run_result.get('prefill_kernel', 'n/a')}")
+        L.append(f"- **Decode kernel:** {run_result.get('decode_kernel', 'n/a')}")
+        L.append(f"- **Peak throughput:** {peak_gflops:.2f} GFLOPS "
+                 f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))")
+        L.append("")
+        L.append(f"## Weights")
+        L.append("")
+        L.append(f"- **Weight bin:** `{os.path.basename(weight_bin_path)}` — {_mb(weight_bin_size)}")
+        L.append(f"- **Total weight DRAM (quantized, on FPGA):** {total_weight_dram_mb:.1f} MB")
+        L.append("")
+        L.append(f"## Program image")
+        L.append("")
+        L.append(f"- **Prefill program:** {_kb(prefill_kb)}")
+        L.append(f"- **Decoder program:** {_kb(decoder_kb)}")
+        L.append(f"- **Combined program image:** {_kb(combined_kb)}")
+        L.append("")
+        L.append(f"## Prefill")
+        L.append("")
+        L.append(f"- **Prefill tokens (seq_len):** {pf_tokens if pf_tokens is not None else 'n/a'}")
+        if pf_hw_ms is not None:
+            L.append(f"- **Prefill FPGA run time (HW latency):** {pf_hw_ms:.2f} ms")
+        if pf_gflops is not None:
+            L.append(f"- **Prefill reported FLOPS:** {pf_gflops:.2f} GFLOPS")
+            L.append(f"- **Prefill utilization (% peak):** {_util(pf_gflops)}")
+        if pf_cpu_ms is not None:
+            L.append(f"- **Prefill end-to-end (CPU timer):** {pf_cpu_ms / 1e3:.2f} s")
+        L.append("")
+        L.append(f"## Decode")
+        L.append("")
+        L.append(f"- **Decoded tokens:** {dec_n if dec_n is not None else 'n/a'} generated "
+                 f"(sequence total {total_tok if total_tok is not None else 'n/a'})")
+        if peak_toks is not None:
+            L.append(f"- **First-token speed (peak):** {peak_toks:.2f} tok/s")
+        if avg_toks is not None:
+            L.append(f"- **Average speed:** {avg_toks:.2f} tok/s")
+        if dec_gflops is not None:
+            L.append(f"- **Average FLOPS:** {dec_gflops:.2f} GFLOPS")
+            L.append(f"- **Decode utilization (% peak):** {_util(dec_gflops)}")
+        if dec_first_ms is not None:
+            L.append(f"- **Decode 1st-token HW latency:** {dec_first_ms:.1f} ms/tok")
+        if dec_avg_ms is not None:
+            L.append(f"- **Decode average HW latency:** {dec_avg_ms:.1f} ms/tok")
+        L.append("")
+        L.append(f"## Prompt & output")
+        L.append("")
+        L.append(f"### Full prefill prompt")
+        L.append("")
+        L.append("```")
+        L.append(prompt_text)
+        L.append("```")
+        L.append("")
+        L.append(f"### Decoded text")
+        L.append("")
+        L.append("```")
+        L.append(decoded_text)
+        L.append("```")
+        L.append("")
+
+        with open(out_path, "w") as f:
+            f.write("\n".join(L))
+        return out_path
 
     def _profile_execute(self, preamble_addr: int, checkpoints: list,
                          tail_label: str | None = None, timeout: float = 30.0) -> tuple[list, dict]:
@@ -1747,7 +2063,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.seq_len = prefill_seq_len
 
         q_seq_len = prefill_seq_len * self.group_size
-        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        # Proper GQA: compact per-head aligned KV length (align64(S)), see run_llama.
+        aligned_seq_len = ((prefill_seq_len + 63) // 64) * 64
         bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
 
         # On-FPGA penalty needs a zeroed bias buffer so the profiled decode step is pure-greedy.
@@ -1770,12 +2087,14 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
         self.dma_to_accelerator_memory(self.LAYER0_OUTPUT_DRAM, embedding_tensor)
+        # Proper-GQA per-head plain causal bias over the compact K/V: query token r
+        # attends key token c <= r, shared by every query head; cols >= S are -inf.
         bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
         rows = torch.arange(aligned_seq_len).unsqueeze(1)
         cols = torch.arange(aligned_seq_len).unsqueeze(0)
-        valid_mask = (cols // self.group_size) <= (rows // self.group_size)
+        valid_mask = cols <= rows
         bias_one_group.masked_fill_(valid_mask, 0.0)
-        bias_one_group[:, q_seq_len:] = float("-inf")
+        bias_one_group[:, prefill_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
 
         global _SILENT_MODE
@@ -1835,6 +2154,24 @@ def _clock_ns_default_for_device(device: str) -> float:
     return 10.0
 
 
+def llama_run_summary_filename(args, prefix: str = "llama3.2_1b_test") -> str:
+    """Per-run summary .md filename encoding the CLI config, e.g.
+    ``llama3.2_1b_test_xdma1_kintex7.md`` or ``..._xdma0_alveo_puregreedy.md``.
+    dev/device are always present; other knobs are appended only when non-default."""
+    tokens = [args.dev, args.device]
+    if getattr(args, "multi_core", 1) and args.multi_core > 1:
+        tokens.append(f"multi-core-{args.multi_core}")
+    if getattr(args, "pure_greedy", False):
+        tokens.append("puregreedy")
+    if getattr(args, "prefill_kernel", None) == "matmatmul":
+        tokens.append("prefill-matmatmul")
+    if getattr(args, "decode_kernel", None) == "matmatmul":
+        tokens.append("decode-matmatmul")
+    if getattr(args, "cycle", None) is not None:
+        tokens.append(f"cycle_{args.cycle}")
+    return prefix + "_" + "_".join(str(t) for t in tokens) + ".md"
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
@@ -1863,22 +2200,14 @@ def main():
         help='Projection kernel for decode, including the LM head: streaming or matmatmul. '
              'Default: streaming. matmatmul is unsupported on 512-bit AXI devices.',
     )
-    parser.add_argument(
-        '--two-pass-decoder', '--decoder-matmatmul', '--matmatmul',
-        dest='legacy_decoder_matmatmul',
-        action='store_true',
-        help='Compatibility alias for --decode-kernel matmatmul.',
-    )
-    parser.add_argument(
-        '--two-pass-prefill',
-        dest='legacy_prefill_matmatmul',
-        action='store_true',
-        help='Compatibility alias for --prefill-kernel matmatmul.',
-    )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and print one '
                              'per-step HW-latency table (summed over all layers) for prefill and for '
                              'the first decoded token.')
+    parser.add_argument('--multi-core', nargs='?', type=int, const=2, default=1,
+                        help='Row-shard the prefill MLP block across N engines (default 2 when the '
+                             'flag is given with no value). 1 = single-engine. >2 is unverified on '
+                             'this device.')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
     # fully deterministic. --pure-greedy disables it entirely.
@@ -1901,18 +2230,7 @@ def main():
     args = parser.parse_args()
 
     prefill_kernel = args.prefill_kernel or Llama32_1b_UnifiedEngine.DEFAULT_PREFILL_KERNEL
-    if args.legacy_prefill_matmatmul:
-        if args.prefill_kernel not in (None, "matmatmul"):
-            parser.error("--two-pass-prefill conflicts with --prefill-kernel streaming")
-        prefill_kernel = "matmatmul"
     decode_kernel = args.decode_kernel or Llama32_1b_UnifiedEngine.DEFAULT_DECODE_KERNEL
-    if args.legacy_decoder_matmatmul:
-        if args.decode_kernel not in (None, "matmatmul"):
-            parser.error(
-                "--two-pass-decoder/--decoder-matmatmul/--matmatmul conflicts "
-                "with --decode-kernel streaming"
-            )
-        decode_kernel = "matmatmul"
     axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
     if axi_width_bits == 512 and (
         prefill_kernel == "matmatmul" or decode_kernel == "matmatmul"
@@ -1957,6 +2275,7 @@ def main():
         weights_bin=weights_bin_rel,
         prefill_kernel=prefill_kernel,
         decode_kernel=decode_kernel,
+        multi_core=args.multi_core,
     )
     cfg = _load_config(script_dir)
 
@@ -2020,6 +2339,15 @@ def main():
     run_result = ue.run_llama()
     print("Llama-3.2-1B test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
+
+    # Per-run Markdown performance summary, named for the CLI config, written
+    # next to this script (see llama_run_summary_filename / write_run_summary).
+    _summary_path = os.path.join(SCRIPT_DIR, llama_run_summary_filename(args))
+    try:
+        ue.write_run_summary(_summary_path, args, run_result)
+        print(f"Wrote run summary: {_summary_path}")
+    except Exception as _e:
+        print(f"[warn] failed to write run summary: {_e}")
 
 if __name__ == "__main__":
     main()

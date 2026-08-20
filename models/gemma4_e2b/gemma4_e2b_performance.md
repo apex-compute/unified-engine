@@ -8,11 +8,17 @@ Both implementations used `test_samples/yosemite.jpg`, the prompt
 `Describe this image in detail.`, the same `params.bin`, IF4 projection
 weights, 35 LM layers, 16 vision layers, and 256 image soft tokens.
 
-> **2026-08-17 refresh.** The Kintex, Kintex 2-core, and Alveo columns were
-> re-measured from clean builds. Kintex used `--dev xdma1` with accepted HW
-> version `0x3d04c689`; Alveo used `--device alveo` with accepted HW version
-> `0x6bb5d25d`. Each run was preceded by `make clean`
+> **2026-08-20 refresh.** Every column except `rk` was re-measured from clean
+> builds (Kintex, Kintex 2-core, Alveo, and Alveo 2/4/8-core). Kintex used
+> `--dev xdma1` with accepted HW version `0x3d04c689`; Alveo used
+> `--device alveo`. Each run was preceded by `make clean`
 > (`clean_program_bins.sh`) so every program image was recompiled from scratch.
+> This refresh also carries the corrected **Vision end-to-end path** metric:
+> it now covers only the vision *run time* (FPGA execute + the LM-facing
+> soft-token readback), excluding one-time weight init / host compile and the
+> numeric-harness debug readbacks — hence it sits just above Vision FPGA
+> execution. The `rk` column predates this fix and is left as previously
+> measured.
 
 Commands:
 
@@ -29,25 +35,28 @@ python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --image --multi-core 
 
 ## Performance comparison
 
-| Metric | Legacy | Kintex | Kintex GQA | Kintex 2-core | rk | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Peak throughput | 25.39 GFLOPS | 25.39 GFLOPS | 25.39 GFLOPS | 50.77 GFLOPS | 42.67 GFLOPS | 46.93 GFLOPS | 93.87 GFLOPS | 187.73 GFLOPS | 375.47 GFLOPS |
-| Vision FPGA execution | 55.54 s | 53.78 s | 53.78 s | 27.78 s | 32.05 s | **28.99 s** | **15.4 s** | **7.98 s** | **4.77 s** |
-| Vision end-to-end path | not reported | 54.32 s | 54.43 s | 28.54 s | 33.05 s | **35.98 s** | **19.6 s** | **10.93 s** | **7.92 s** |
-| Vision throughput | not reported | 21.37 GFLOPS | 21.37 GFLOPS | 41.41 GFLOPS | 35.85 GFLOPS | **39.64 GFLOPS** | **74.4 GFLOPS** | **143.99 GFLOPS** | **240.88 GFLOPS** |
-| Vision soft tokens | 256 | 256 | 256 | 256 | 256 | 256 | 256 | 256 | 256 |
-| LM prefill sequence executed | 512-token template | 272 actual tokens | 272 actual tokens | 272 actual tokens | 273 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens |
-| LM prefill FPGA latency | 113.571 s | 51.52 s | 43.95 s | 23.46 s | 28.02 s | **28.23 s** | **17.3 s** | **6.88 s** | **3.96 s** |
-| LM prefill throughput | 23.20 GFLOPS | 23.94 GFLOPS | 24.08 GFLOPS | 45.13 GFLOPS | 37.78 GFLOPS | **43.68 GFLOPS** | **71.22 GFLOPS** | **153.92 GFLOPS** | **267.16 GFLOPS** |
-| Decode average throughput | 2.68 tok/s | 3.74 tok/s | 3.75 tok/s | 3.76 tok/s | 5.69 tok/s | **5.54 tok/s** | **5.49 tok/s** | **5.55 tok/s** | **5.56 tok/s** |
-| Decode peak first-token throughput | 2.86 tok/s | 3.99 tok/s | 4.00 tok/s | 4.00 tok/s | 6.04 tok/s | **5.92 tok/s** | **5.88 tok/s** | **5.91 tok/s** | **5.87 tok/s** |
-| Decode average hardware throughput | 13.42 GFLOPS | 18.78 GFLOPS | 18.97 GFLOPS | 22.95 GFLOPS | 36.47 GFLOPS | **34.22 GFLOPS** | **33.97 GFLOPS** | **34.41 GFLOPS** | **34.41 GFLOPS** |
-| Vision program section | 3.58 MiB | 3.22 MiB | 3.22 MiB | 2.39 MiB | 3.4 MiB | 3.22 MiB | 2.39 MiB | 1.90 MiB | 1.75 MiB |
-| Prefill program section | 5.71 MiB | 3.08 MiB | 5.85 MiB | 4.77 MiB | 5.9 MiB | 3.08 MiB | 3.46 MiB | 4.06 MiB | 3.72 MiB |
-| Decode program section | | 1.42 MiB | 1.42 MiB | 1.42 MiB | | 1.42 MiB | 1.46 MiB | 1.42 MiB | 1.42 MiB |
-| Combined program image | 10.37 MiB | 7.73 MiB | 10.49 MiB | 13.73 MiB | 10.8 MiB | 7.73 MiB | 10.81 MiB | 19.20 MiB | 30.40 MiB |
-| Weight image (`params.bin`) | 6.91 GiB | same | same | same | / | same | same | same | same |
-| Correctness |  | coherent, total 724 | coherent, total 656 | coherent, total 699 | coherent, total 656 | coherent, total 656 | coherent, total 699 | coherent, total 699 | coherent, total 699 |
+| Metric | Kintex | Kintex 2-core | rk | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Peak throughput | 25.39 GFLOPS | 50.77 GFLOPS | 42.67 GFLOPS | 46.93 GFLOPS | 93.87 GFLOPS | 187.73 GFLOPS | 375.47 GFLOPS |
+| Vision FPGA execution | 53.78 s | 27.74 s | 32.05 s | **29.21 s** | **15.54 s** | **8.08 s** | **4.94 s** |
+| Vision end-to-end path | 53.81 s | 27.81 s | 32.62 s | **29.26 s** | **15.60 s** | **8.15 s** | **5.05 s** |
+| Vision throughput | 21.37 GFLOPS | 41.42 GFLOPS | 35.85 GFLOPS | **39.35 GFLOPS** | **73.96 GFLOPS** | **142.20 GFLOPS** | **232.38 GFLOPS** |
+| — utilization (% peak) | 84.2% | 81.6% | 84.0% | **83.8%** | **78.8%** | **75.7%** | **61.9%** |
+| Vision soft tokens | 256 | 256 | 256 | 256 | 256 | 256 | 256 |
+| LM prefill sequence executed | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens |
+| LM prefill FPGA latency | 43.95 s | 23.46 s | 28.02 s | **26.29 s** | **12.93 s** | **6.94 s** | **4.02 s** |
+| LM prefill throughput | 24.08 GFLOPS | 45.12 GFLOPS | 37.78 GFLOPS | **40.26 GFLOPS** | **81.89 GFLOPS** | **152.56 GFLOPS** | **263.61 GFLOPS** |
+| — utilization (% peak) | 94.9% | 88.9% | 88.5% | **85.8%** | **87.2%** | **81.3%** | **70.2%** |
+| Decode average throughput | 3.78 tok/s | 3.76 tok/s | 5.85 tok/s | **6.32 tok/s** | **5.78 tok/s** | **6.53 tok/s** | **6.53 tok/s** |
+| Decode peak first-token throughput | 3.99 tok/s | 4.00 tok/s | 6.21 tok/s | **6.65 tok/s** | **6.53 tok/s** | **7.08 tok/s** | **6.90 tok/s** |
+| Decode average hardware throughput | 23.06 GFLOPS | 22.95 GFLOPS | 36.47 GFLOPS | **39.01 GFLOPS** | **35.71 GFLOPS** | **40.56 GFLOPS** | **40.56 GFLOPS** |
+| — utilization (% peak) | 90.8% | 45.2% | 85.5% | **83.1%** | **38.0%** | **21.6%** | **10.8%** |
+| Vision program section | 3.22 MiB | 2.39 MiB | 3.22 MiB | 3.22 MiB | 2.39 MiB | 1.90 MiB | 1.75 MiB |
+| Prefill program section | 5.85 MiB | 4.77 MiB | 5.85 MiB | 5.85 MiB | 4.77 MiB | 4.06 MiB | 3.72 MiB |
+| Decode program section | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB |
+| Combined program image | 10.49 MiB | 13.73 MiB | 10.49 MiB | 10.49 MiB | 13.73 MiB | 19.20 MiB | 30.40 MiB |
+| Weight image (`params.bin`) | 6.91 GiB | same | same | same | same | same | same |
+| Correctness | coherent, total 656 | coherent, total 699 | coherent, total 656 | coherent, total 656 | coherent, total 699 | coherent, total 699 | coherent, total 699 |
 
 ## Refactor optimizations
 

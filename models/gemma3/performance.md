@@ -1,70 +1,63 @@
 # Gemma3 Performance
 
-Hardware: Andromeda FPGA (HW version 0x25e4082c), clock cycle 5.15 ns (194 MHz), device kintex7.
+Baseline numbers captured from the per-run summaries written by
+`gemma3_test.py` / `gemma3_test_IF8.py` (see `write_run_summary`). Both runs
+compiled the program image **from scratch** (default; `--bin-reuse` off).
 
-Architecture: 26 layers, hidden 2048, GQA (4 KV heads × 4 Q/KV = 16 Q heads), head_dim 256, MLP 16384, IF4 quantization.
+- **HW version:** `0x3d04c689`
+- **--dev / --device:** `xdma1` / `kintex7`
+- **Clock / frequency:** 5.0422 ns (198.3 MHz)
+- **Cores:** 1
+- **Prompt:** `x+3=5, what is x?`
+- **Architecture:** 26 layers, hidden 1152, head_dim 256, group_size 4, MLP 6912,
+  global-RoPE layers [5, 11, 17, 23].
+- **Source summaries:** [gemma3_test_xdma1_kintex7.md](gemma3_test_xdma1_kintex7.md) (IF4),
+  [gemma3_test_IF8_xdma1_kintex7.md](gemma3_test_IF8_xdma1_kintex7.md) (IF8).
 
-## Instruction Size
+## Gemma3 IF4
 
-| Stage   | Baseline (kB) | Quantized LM head (kB) | + flash attn reuse (kB) |
-|---------|--------------|----------------------|------------------------|
-| Prefill | 1,655.8      | 1,655.8              | **382.5**              |
-| Decoder | 1,150.4      | 1,077.3              | **326.9**              |
-| Total   | 2,806.2      | 2,733.1              | **709.4**              |
+| Metric | Baseline | proper-gqa |
+|---|---:|---:|
+| Peak throughput | 25.39 GFLOPS | 25.39 GFLOPS |
+| Weight bin (`weights_gemma3_hf.bin`) | 1083.77 MB | 1083.77 MB |
+| Weight DRAM (quantized, on FPGA) | 507.8 MB | 507.8 MB |
+| Prefill program | 53.6 KB | 88.9 KB |
+| Decoder program | 66.6 KB | 66.6 KB |
+| Combined program image | 120.2 KB | 155.6 KB |
+| Prefill tokens (seq_len) | 19 | 19 |
+| Prefill FPGA time (HW latency) | 1118.80 ms | 1128.10 ms |
+| Prefill throughput | ~ GFLOPS | 23.65 GFLOPS |
+| — utilization (% peak) | ~ | 93.1% |
+| Prefill end-to-end (CPU) | 1.12 s | 1.13 s |
+| Decoded tokens | 80 generated (total 99) | 76 generated (total 95) |
+| Decode 1st-token speed (peak) | 10.60 tok/s | 10.60 tok/s |
+| Decode average speed | 10.29 tok/s | 10.32 tok/s |
+| Decode average throughput | 21.50 GFLOPS | 21.52 GFLOPS |
+| — utilization (% peak) | 84.7% | 84.8% |
+| Decode 1st-token HW latency | 94.4 ms/tok | 94.4 ms/tok |
+| Decode average HW latency | 95.6 ms/tok | 95.5 ms/tok |
+| Correctness | coherent (solves x = 2) | coherent (solves x = 2) |
 
-Prefill: 4.3× smaller (26 flash_attention_core copies → 1 shared subroutine + 26 call stubs).
-Decoder: 3.2× smaller (26 decoder_group_attention_core copies → 1 shared subroutine + 26 KV-staging + call stubs).
-Total: 3.8× smaller vs quantized LM head baseline.
+## Gemma3 IF8
 
-## Run Performance
-
-| Metric | Baseline | Quantized LM head | + flash attn reuse |
-|--------|----------|-------------------|-------------------|
-| Prompt tokens (prefill) | 19 | 19 | 19 |
-| Decode tokens generated | 77 | 113 | 77 |
-| **Prefill HW time (ms)** | 1,224.0 | 1,224.0 | 1,224.1 |
-| **Prefill CPU time (ms)** | 1,241.1 | 1,232.6 | 1,236.0 |
-| **Decode 1st token HW (ms/tok)** | 120.2 | 95.3 | 95.8 |
-| **Decode 1st token (tok/s)** | 8.32 | 10.50 | 10.44 |
-| **Decode avg HW time (ms/tok)** | 121.4 | 97.2 | 97.3 |
-| **Decode avg CPU time (ms/tok)** | 128.7 | 105.2 | 104.7 |
-| Decode throughput (inc. host detokenizer) (tok/s) | 7.77 | 9.51 | 9.55 |
-
-## Decoder Step Breakdown (1st token, all 26 layers)
-
-| Step | Baseline (ms) | Quantized LM head (ms) | + flash attn reuse (ms) |
-|------|--------------|----------------------|------------------------|
-| pre_norm | 0.19 | 0.19 | 0.19 |
-| qkv_proj_vcache | 4.27 | 4.27 | 4.27 |
-| qk_norm_rope | 0.53 | 0.53 | 0.52 |
-| attention | 5.55 | 5.55 | 5.55 |
-| o_proj_post_attn_norm_residual | 2.96 | 2.96 | 2.96 |
-| pre_ffn_norm | 0.15 | 0.15 | 0.15 |
-| mlp_gateup_gelu_mul | 36.97 | 36.97 | 36.97 |
-| mlp_down_post_ffn_norm_residual | 18.59 | 18.59 | 18.59 |
-| norm_lm_head | 51.62 | 26.68 | 26.54 |
-| **Total** | **120.84** | **95.90** | **95.75** |
-
----
-
-## Gemma3-IF8 Performance (+ flash attn reuse)
-
-Same subroutine reuse applied to both prefill and decoder.
-
-### Instruction Size
-
-| Stage   | + flash attn reuse (kB) |
-|---------|------------------------|
-| Prefill | 382.5                  |
-| Decoder | 418.3                  |
-| Total   | 800.8                  |
-
-### Run Performance
-
-| Metric | + flash attn reuse |
-|--------|--------------------|
-| Prompt tokens (prefill) | 19 |
-| Decode tokens generated | 76 |
-| **Prefill HW time (ms)** | 1,280.4 |
-| **Decode avg HW time (ms/tok)** | 220.0 |
-| Decode throughput (tok/s) | 4.77 |
+| Metric | Baseline | proper-gqa |
+|---|---:|---:|
+| Peak throughput | 25.39 GFLOPS | 25.39 GFLOPS |
+| Weight bin (`weights_gemma3_hf.bin`) | 1560.49 MB | 1560.49 MB |
+| Weight DRAM (quantized, on FPGA) | 984.5 MB | 984.5 MB |
+| Prefill program | 53.6 KB | 88.9 KB |
+| Decoder program | 66.6 KB | 66.6 KB |
+| Combined program image | 120.2 KB | 155.6 KB |
+| Prefill tokens (seq_len) | 19 | 19 |
+| Prefill FPGA time (HW latency) | 2163.20 ms | 2172.52 ms |
+| Prefill throughput | ~ GFLOPS | 12.28 GFLOPS |
+| — utilization (% peak) | ~ | 48.4% |
+| Prefill end-to-end (CPU) | 2.17 s | 2.18 s |
+| Decoded tokens | 74 generated (total 93) | 74 generated (total 93) |
+| Decode 1st-token speed (peak) | 5.78 tok/s | 5.78 tok/s |
+| Decode average speed | 5.69 tok/s | 5.69 tok/s |
+| Decode average throughput | 11.80 GFLOPS | 11.80 GFLOPS |
+| — utilization (% peak) | 46.5% | 46.5% |
+| Decode 1st-token HW latency | 173.1 ms/tok | 173.1 ms/tok |
+| Decode average HW latency | 174.3 ms/tok | 174.3 ms/tok |
+| Correctness | coherent (solves x = 2) | coherent (solves x = 2) |
