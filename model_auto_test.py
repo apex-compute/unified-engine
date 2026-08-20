@@ -361,8 +361,8 @@ def _check_pi05(text):
     return True, f"finite action chunk (min={lo}, max={hi})"
 
 
-def _check_yolov5(text):
-    """Validate detection and queued geometry for checkpoint-backed YOLOv5."""
+def _check_yolov5_variant(text, *, expected_model, expected_label):
+    """Validate one checkpoint-backed YOLOv5 variant on its fixture."""
     n = _test_result_field(text, "n_detections")
     labels = _test_result_field(text, "decoded_text")
     if not isinstance(n, int) or isinstance(n, bool):
@@ -372,26 +372,46 @@ def _check_yolov5(text):
     if n <= 0:
         return False, "no detections above threshold"
     backend = _test_result_field(text, "backend")
+    model = _test_result_field(text, "model")
     geometry_abi = _test_result_field(text, "geometry_abi")
     hardware_version = _test_result_field(text, "hardware_version")
     if backend != "hardware":
         return False, f"checkpoint test used unexpected backend {backend!r}"
+    if model != expected_model:
+        return False, (
+            f"checkpoint test reported model {model!r}, expected "
+            f"{expected_model!r}"
+        )
     if geometry_abi != "conv-config-inst-v1":
         return False, f"checkpoint test used unexpected geometry ABI {geometry_abi!r}"
     if not isinstance(hardware_version, str) or not re.fullmatch(
             r"0x[0-9a-fA-F]{8}", hardware_version):
         return False, "checkpoint test did not report an FPGA build hash"
-    found = bool(re.search(r"\bcar\b", labels, re.IGNORECASE))
+    found = bool(re.search(
+        rf"\b{re.escape(expected_label)}\b", labels, re.IGNORECASE))
     return found, (
-        f"{n} detection(s), including car: {labels}; "
+        f"{n} detection(s), including {expected_label}: {labels}; "
         f"{geometry_abi} on {hardware_version}"
         if found
-        else f"{n} detection(s), but expected car for vette.jpg: {labels}"
+        else f"{n} detection(s), but expected {expected_label}: {labels}"
     )
 
-def _check_yolov5_single_bin(text):
+
+def _check_yolov5(text):
+    return _check_yolov5_variant(
+        text, expected_model="yolov5s", expected_label="car")
+
+
+def _check_yolov5n(text):
+    return _check_yolov5_variant(
+        text, expected_model="yolov5n", expected_label="person")
+
+
+def _check_yolov5_single_bin_variant(
+        text, *, expected_model, expected_label, expected_artifact):
     """Validate detection plus the direct single-artifact runtime contract."""
-    passed, reason = _check_yolov5(text)
+    passed, reason = _check_yolov5_variant(
+        text, expected_model=expected_model, expected_label=expected_label)
     if not passed:
         return passed, reason
     backend = _test_result_field(text, "backend")
@@ -410,12 +430,30 @@ def _check_yolov5_single_bin(text):
         )
     if geometry_abi != "conv-config-inst-v1":
         return False, f"single-bin runtime used unexpected geometry ABI {geometry_abi!r}"
-    if not isinstance(artifact, str) or not artifact.endswith("yolov5s-andromeda.bin"):
-        return False, "missing yolov5s-andromeda.bin artifact in TEST_RESULT"
+    if (not isinstance(artifact, str)
+            or os.path.basename(artifact) != expected_artifact):
+        return False, f"missing {expected_artifact} artifact in TEST_RESULT"
     return True, (
         f"{reason}; precompiled v{artifact_version} "
         f"{geometry_abi} artifact={os.path.basename(artifact)}"
     )
+
+
+def _check_yolov5_single_bin(text):
+    return _check_yolov5_single_bin_variant(
+        text,
+        expected_model="yolov5s",
+        expected_label="car",
+        expected_artifact="yolov5s-andromeda.bin")
+
+
+def _check_yolov5n_single_bin(text):
+    return _check_yolov5_single_bin_variant(
+        text,
+        expected_model="yolov5n",
+        expected_label="person",
+        expected_artifact="yolov5n-andromeda.bin")
+
 
 # Shared algebra prompt: a single-answer math question whose correct result is
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
@@ -482,6 +520,26 @@ TESTS = [
         "extra_args": ["--image", "test_samples/vette.jpg"],
         "mode": "detection/precompiled single artifact",
         "image": "test_samples/vette.jpg",
+        # Requires both a prebuilt artifact and an unbundled conv-capable image.
+        "opt_in": True,
+    },
+    {
+        "name": "yolov5n",
+        "script": "models/yolov5n/yolov5n_test.py",
+        "pass_check": _check_yolov5n,
+        "extra_args": ["--image", "test_samples/people.jpg"],
+        "mode": "detection",
+        "image": "test_samples/people.jpg",
+        # No compatible update image is bundled; explicit --only still runs it.
+        "opt_in": True,
+    },
+    {
+        "name": "yolov5n_run_from_bin",
+        "script": "models/yolov5n/yolov5n_run_from_bin.py",
+        "pass_check": _check_yolov5n_single_bin,
+        "extra_args": ["--image", "test_samples/people.jpg"],
+        "mode": "detection/precompiled single artifact",
+        "image": "test_samples/people.jpg",
         # Requires both a prebuilt artifact and an unbundled conv-capable image.
         "opt_in": True,
     },

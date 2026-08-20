@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import json
 from pathlib import Path
 import sys
 import types
@@ -18,7 +19,12 @@ for path in (SCRIPT_DIR, REPO_ROOT):
         sys.path.insert(0, str(path))
 
 import user_dma_core
+import model_auto_test
 import yolov5_test
+from yolov5_artifact import (
+    artifact_variant,
+    get_canonical_artifact,
+)
 from yolov5_precompiled import (
     compile_precompiled_hardware,
     PrecompiledAndromedaBackend,
@@ -28,9 +34,67 @@ from yolov5_common import (
     box_iou_one_to_many,
     decode_yolov5,
     fold_conv_bn,
+    get_yolov5_variant,
     non_max_suppression,
     quantize_conv_if4,
 )
+
+
+class VariantTests(unittest.TestCase):
+    def test_nano_profile_and_artifact_are_pinned(self):
+        nano = get_yolov5_variant("yolov5n")
+        self.assertEqual(nano.key, "n")
+        self.assertEqual(nano.model_name, "YOLOv5n")
+        self.assertEqual(nano.parameter_count, 1_872_157)
+        self.assertEqual(nano.detect_input_channels, (64, 128, 256))
+        self.assertEqual(
+            nano.checkpoint_sha256,
+            "4f180cf23ba0717ada0badd6c685026d73d48f184d00fc159c2641284b2ac0a3")
+
+        artifact = get_canonical_artifact("n")
+        self.assertEqual(artifact.format, "andromeda.yolov5n.single-bin")
+        self.assertEqual(artifact.params_bytes, 16_082_992)
+        self.assertEqual(artifact.program_bytes, 43_136)
+        self.assertEqual(artifact_variant({"format": artifact.format}), "n")
+
+    def test_variant_configs_match_pinned_profiles(self):
+        paths = {
+            "s": SCRIPT_DIR / "yolov5_config.json",
+            "n": REPO_ROOT / "models/yolov5n/yolov5n_config.json",
+        }
+        for key, path in paths.items():
+            with self.subTest(variant=key):
+                config = json.loads(path.read_text(encoding="utf-8"))
+                profile = get_yolov5_variant(key)
+                self.assertEqual(config["model"]["name"], profile.model_name)
+                self.assertEqual(
+                    config["source"]["weights_url"], profile.checkpoint_url)
+                self.assertEqual(
+                    config["source"]["weights_sha256"],
+                    profile.checkpoint_sha256)
+
+    def test_unknown_variant_and_artifact_format_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "unsupported YOLOv5 variant"):
+            get_yolov5_variant("x")
+        with self.assertRaisesRegex(RuntimeError, "unsupported YOLO artifact"):
+            artifact_variant({"format": "andromeda.yolov5x.single-bin"})
+
+    def test_model_harness_checks_nano_identity_fixture_and_artifact(self):
+        result = {
+            "model": "yolov5n",
+            "decoded_text": "person, person",
+            "n_detections": 2,
+            "backend": "hardware",
+            "geometry_abi": "conv-config-inst-v1",
+            "hardware_version": "0x9ef15fc1",
+            "precompiled": True,
+            "artifact_version": 3,
+            "artifact": "/tmp/yolov5n-andromeda.bin",
+        }
+        text = "TEST_RESULT:" + json.dumps(result, separators=(",", ":"))
+        self.assertTrue(model_auto_test._check_yolov5n(text)[0])
+        self.assertTrue(model_auto_test._check_yolov5n_single_bin(text)[0])
+        self.assertFalse(model_auto_test._check_yolov5(text)[0])
 
 
 class QuantizationTests(unittest.TestCase):
@@ -132,10 +196,12 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(512 % chunk, 0)
 
     def test_detect_head_keeps_255_channels_together(self):
-        _, _, chunk, _ = user_dma_core.plan_conv2d_layer_tiles(
-            c_in=128, oc_count=255, in_h=80, in_w=80,
-            kernel_h=1, kernel_w=1, stride_s=1, pad=0)
-        self.assertEqual(chunk, 255)
+        for channels in (64, 128):
+            with self.subTest(channels=channels):
+                _, _, chunk, _ = user_dma_core.plan_conv2d_layer_tiles(
+                    c_in=channels, oc_count=255, in_h=80, in_w=80,
+                    kernel_h=1, kernel_w=1, stride_s=1, pad=0)
+                self.assertEqual(chunk, 255)
 
     def test_gather_planner_uses_rewound_scale_bram(self):
         channel_plan = user_dma_core.plan_conv2d_layer_tiles(
@@ -299,6 +365,8 @@ class PrecompiledBinTests(unittest.TestCase):
                 if (address == user_dma_core.UE_INT_REG
                         and self.interrupt_status):
                     return self.interrupt_status.pop(0)
+                if address == user_dma_core.UE_LATENCY_COUNT_ADDR:
+                    return 7
                 return 0
 
             def dma_read(self, _device, _address, value, size):
@@ -317,6 +385,15 @@ class PrecompiledBinTests(unittest.TestCase):
         # Initial immutable params/program uploads plus one dynamic activation.
         self.assertEqual(len(engine.writes), 3)
         self.assertEqual(len(engine.starts), 1)
+        self.assertEqual(backend.static_dram_load_writes, 2)
+        self.assertEqual(
+            backend.static_dram_load_bytes,
+            hardware["params_image"].numel()
+            + hardware["program_image"].numel())
+        self.assertEqual(backend.latency_counter_ticks["conv"], 7)
+        self.assertEqual(
+            backend.cycles["conv"],
+            7 * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV)
         self.assertEqual(engine.registers, [(user_dma_core.UE_INT_REG, 1)])
         self.assertFalse(any(address in (
             user_dma_core.UE_CONV_GEOM_ADDR, user_dma_core.UE_CONV_CTRL_ADDR,

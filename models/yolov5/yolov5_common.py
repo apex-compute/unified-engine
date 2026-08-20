@@ -1,4 +1,4 @@
-"""YOLOv5s graph, weight preparation, and post-processing helpers.
+"""YOLOv5 graph, weight preparation, and post-processing helpers.
 
 The official v7.0 checkpoint contains pickled module objects.  We load it with
 ``weights_only=True`` and a deliberately small set of placeholder classes, so
@@ -12,6 +12,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import hashlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -34,12 +35,89 @@ import quant_lib
 import user_dma_core
 
 
-YOLOV5S_V7_URL = (
-    "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt"
-)
-YOLOV5S_V7_SHA256 = (
-    "8b3b748c1e592ddd8868022e8732fde20025197328490623cc16c6f24d0782ee"
-)
+@dataclass(frozen=True)
+class YOLOv5Variant:
+    key: str
+    model_name: str
+    yaml_file: str
+    checkpoint_url: str
+    checkpoint_sha256: str
+    parameter_count: int
+    detect_input_channels: tuple[int, int, int]
+
+
+YOLOV5_VARIANTS = {
+    "s": YOLOv5Variant(
+        key="s",
+        model_name="YOLOv5s",
+        yaml_file="yolov5s.yaml",
+        checkpoint_url=(
+            "https://github.com/ultralytics/yolov5/releases/download/v7.0/"
+            "yolov5s.pt"),
+        checkpoint_sha256=(
+            "8b3b748c1e592ddd8868022e8732fde20025197328490623cc16c6f24d0782ee"),
+        parameter_count=7_235_389,
+        detect_input_channels=(128, 256, 512),
+    ),
+    "n": YOLOv5Variant(
+        key="n",
+        model_name="YOLOv5n",
+        yaml_file="yolov5n.yaml",
+        checkpoint_url=(
+            "https://github.com/ultralytics/yolov5/releases/download/v7.0/"
+            "yolov5n.pt"),
+        checkpoint_sha256=(
+            "4f180cf23ba0717ada0badd6c685026d73d48f184d00fc159c2641284b2ac0a3"),
+        parameter_count=1_872_157,
+        detect_input_channels=(64, 128, 256),
+    ),
+}
+
+
+def get_yolov5_variant(value: str = "s") -> YOLOv5Variant:
+    """Resolve ``s``/``n`` and their common model-name spellings."""
+    key = str(value).strip().lower()
+    aliases = {
+        "s": "s", "yolov5s": "s",
+        "n": "n", "yolov5n": "n",
+    }
+    try:
+        return YOLOV5_VARIANTS[aliases[key]]
+    except KeyError as exc:
+        choices = ", ".join(sorted(YOLOV5_VARIANTS))
+        raise ValueError(
+            f"unsupported YOLOv5 variant {value!r}; choose one of {choices}") from exc
+
+
+def load_yolov5_config(
+        value: str = "s", config_path: Optional[Path] = None,
+        ) -> tuple[YOLOv5Variant, dict, Path]:
+    """Load a variant's pinned config and return its resource directory."""
+    profile = get_yolov5_variant(value)
+    if config_path is None:
+        models_dir = Path(__file__).resolve().parent.parent
+        model_dirname = "yolov5" if profile.key == "s" else "yolov5n"
+        config_filename = ("yolov5_config.json" if profile.key == "s"
+                           else "yolov5n_config.json")
+        config_path = models_dir / model_dirname / config_filename
+    config_path = Path(config_path).expanduser().resolve()
+    with config_path.open("r", encoding="utf-8") as stream:
+        config = json.load(stream)
+    if config.get("model", {}).get("name") != profile.model_name:
+        raise RuntimeError(
+            f"{config_path} does not describe {profile.model_name}")
+    source = config.get("source", {})
+    if (source.get("weights_url") != profile.checkpoint_url
+            or source.get("weights_sha256") != profile.checkpoint_sha256):
+        raise RuntimeError(
+            f"{config_path} does not pin the verified {profile.model_name} checkpoint")
+    return profile, config, config_path.parent
+
+
+YOLOV5S_V7_URL = YOLOV5_VARIANTS["s"].checkpoint_url
+YOLOV5S_V7_SHA256 = YOLOV5_VARIANTS["s"].checkpoint_sha256
+YOLOV5N_V7_URL = YOLOV5_VARIANTS["n"].checkpoint_url
+YOLOV5N_V7_SHA256 = YOLOV5_VARIANTS["n"].checkpoint_sha256
 
 
 def sha256_file(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
@@ -151,14 +229,17 @@ def _yolov5_pickle_modules():
                 sys.modules[name] = old
 
 
-def load_official_yolov5s(checkpoint_path: Path) -> torch.nn.Module:
-    """Load and structurally validate the official YOLOv5s v7.0 checkpoint."""
+def load_official_yolov5(checkpoint_path: Path, *,
+                         variant: str = "s") -> torch.nn.Module:
+    """Load and structurally validate a pinned official YOLOv5 v7.0 model."""
+    profile = get_yolov5_variant(variant)
     checkpoint_path = checkpoint_path.expanduser().resolve()
     actual = sha256_file(checkpoint_path)
-    if actual != YOLOV5S_V7_SHA256:
+    if actual != profile.checkpoint_sha256:
         raise RuntimeError(
             f"refusing to load unverified checkpoint {checkpoint_path}: "
-            f"got SHA-256 {actual}, expected {YOLOV5S_V7_SHA256}")
+            f"got SHA-256 {actual}, expected {profile.checkpoint_sha256} "
+            f"for {profile.model_name} v7.0")
 
     with _yolov5_pickle_modules() as safe:
         safe_globals = getattr(torch.serialization, "safe_globals", None)
@@ -191,14 +272,38 @@ def load_official_yolov5s(checkpoint_path: Path) -> torch.nn.Module:
     actual_types = tuple(type(m).__name__ for m in modules)
     if actual_types != expected:
         raise RuntimeError(
-            "checkpoint topology is not canonical YOLOv5s v7.0: "
+            f"checkpoint topology is not canonical {profile.model_name} v7.0: "
             f"got {actual_types}")
+    if getattr(model, "yaml_file", None) != profile.yaml_file:
+        raise RuntimeError(
+            f"checkpoint identifies {getattr(model, 'yaml_file', None)!r}, "
+            f"expected {profile.yaml_file!r}")
+    parameter_count = sum(value.numel() for value in model.parameters())
+    if parameter_count != profile.parameter_count:
+        raise RuntimeError(
+            f"unexpected {profile.model_name} parameter count {parameter_count}; "
+            f"expected {profile.parameter_count}")
     strides = tuple(int(v) for v in model.stride.tolist())
     if strides != (8, 16, 32):
         raise RuntimeError(f"unexpected detection strides {strides}")
     if len(model.names) != 80:
         raise RuntimeError(f"expected 80 COCO classes, got {len(model.names)}")
+    detect_channels = tuple(int(conv.in_channels) for conv in modules[-1].m)
+    if detect_channels != profile.detect_input_channels:
+        raise RuntimeError(
+            f"unexpected {profile.model_name} Detect inputs {detect_channels}; "
+            f"expected {profile.detect_input_channels}")
     return model
+
+
+def load_official_yolov5s(checkpoint_path: Path) -> torch.nn.Module:
+    """Compatibility wrapper for the pinned official YOLOv5s checkpoint."""
+    return load_official_yolov5(checkpoint_path, variant="s")
+
+
+def load_official_yolov5n(checkpoint_path: Path) -> torch.nn.Module:
+    """Load the pinned official YOLOv5n v7.0 checkpoint."""
+    return load_official_yolov5(checkpoint_path, variant="n")
 
 
 def _pair(value, name: str) -> tuple[int, int]:
@@ -579,9 +684,9 @@ def _run_sppf(module: torch.nn.Module, x: torch.Tensor,
         backend, f"{name}.cv2")
 
 
-def execute_yolov5s(model: torch.nn.Module, image_chw: torch.Tensor,
-                    backend, *, progress: bool = False) -> list[torch.Tensor]:
-    """Execute canonical YOLOv5s and return its three raw detection maps."""
+def execute_yolov5(model: torch.nn.Module, image_chw: torch.Tensor,
+                   backend, *, progress: bool = False) -> list[torch.Tensor]:
+    """Execute a canonical YOLOv5 graph and return its raw detection maps."""
     if image_chw.dim() != 3 or image_chw.shape[0] != 3:
         raise ValueError(f"expected RGB CHW input, got {tuple(image_chw.shape)}")
     outputs: list[torch.Tensor] = []
@@ -629,6 +734,18 @@ def execute_yolov5s(model: torch.nn.Module, image_chw: torch.Tensor,
             print(f"  [{index:02d}] {name:<12} {kind:<8} -> {tuple(result.shape)}")
 
     raise RuntimeError("YOLOv5 graph ended without a Detect module")
+
+
+def execute_yolov5s(model: torch.nn.Module, image_chw: torch.Tensor,
+                    backend, *, progress: bool = False) -> list[torch.Tensor]:
+    """Compatibility wrapper for callers that previously targeted YOLOv5s."""
+    return execute_yolov5(model, image_chw, backend, progress=progress)
+
+
+def execute_yolov5n(model: torch.nn.Module, image_chw: torch.Tensor,
+                    backend, *, progress: bool = False) -> list[torch.Tensor]:
+    """Compatibility wrapper for explicit YOLOv5n callers."""
+    return execute_yolov5(model, image_chw, backend, progress=progress)
 
 
 @dataclass(frozen=True)

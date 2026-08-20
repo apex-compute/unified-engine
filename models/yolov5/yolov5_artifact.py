@@ -1,4 +1,4 @@
-"""Single-file YOLOv5s compile artifact and checkpoint-free executor.
+"""Single-file YOLOv5 compile artifacts and checkpoint-free executor.
 
 The artifact is a restricted ``torch.save`` container holding only primitive
 Python values and tensors: an explicit flattened graph, native IF4 tensors,
@@ -33,32 +33,87 @@ from yolov5_common import (
     QuantizedConv,
     _class_names,
     _pair,
-    execute_yolov5s,
+    execute_yolov5,
+    get_yolov5_variant,
     quantize_conv_if4,
     sha256_file,
-    YOLOV5S_V7_SHA256,
 )
 
 
-ARTIFACT_FORMAT = "andromeda.yolov5s.single-bin"
 ARTIFACT_VERSION = 3
-CANONICAL_GRAPH_SHA256 = (
-    "0d432730e040130746e1056ec42446ffe7e15e1500872377873afe11c05fefa1"
-)
-CANONICAL_WEIGHTS_SHA256 = (
-    "21cd4dd7316f9e1853f0888286641f5b85ba6996967bd7de99aacbc6e6227202"
-)
-CANONICAL_PARAMS_SHA256 = (
-    "593616e45e54ce39e6a17a3c494b2ce24a87267b101eb5f8f38a75656af4e609"
-)
-CANONICAL_PROGRAM_SHA256 = (
-    "d0318e32bf1426d9a9dcc805c56b02e00af743311a41b8c0c505cfb470d88223"
-)
-CANONICAL_DISPATCH_SHA256 = (
-    "0a21680ff6c46f249eb41b9824b1a15f96d7e72efef617fa40eda4d58b8a5dfe"
-)
-CANONICAL_PARAMS_BYTES = 16_548_664
-CANONICAL_PROGRAM_BYTES = 46_720
+
+
+@dataclass(frozen=True)
+class CanonicalArtifact:
+    variant: str
+    format: str
+    graph_sha256: str
+    weights_sha256: str
+    params_sha256: str
+    program_sha256: str
+    dispatch_sha256: str
+    params_bytes: int
+    program_bytes: int
+
+
+CANONICAL_ARTIFACTS = {
+    "s": CanonicalArtifact(
+        variant="s",
+        format="andromeda.yolov5s.single-bin",
+        graph_sha256=(
+            "0d432730e040130746e1056ec42446ffe7e15e1500872377873afe11c05fefa1"),
+        weights_sha256=(
+            "21cd4dd7316f9e1853f0888286641f5b85ba6996967bd7de99aacbc6e6227202"),
+        params_sha256=(
+            "593616e45e54ce39e6a17a3c494b2ce24a87267b101eb5f8f38a75656af4e609"),
+        program_sha256=(
+            "d0318e32bf1426d9a9dcc805c56b02e00af743311a41b8c0c505cfb470d88223"),
+        dispatch_sha256=(
+            "0a21680ff6c46f249eb41b9824b1a15f96d7e72efef617fa40eda4d58b8a5dfe"),
+        params_bytes=16_548_664,
+        program_bytes=46_720,
+    ),
+    "n": CanonicalArtifact(
+        variant="n",
+        format="andromeda.yolov5n.single-bin",
+        graph_sha256=(
+            "24c81abdd5e68426bd1268e1c0a8324363796073127c11267abcc21056ce40bf"),
+        weights_sha256=(
+            "616aee862c597972776e6bfe1f9e1226cea71bb9d77d81cfef60f5fee0725711"),
+        params_sha256=(
+            "1b9c3a190935ee691d3366f701e1b839a14a89d501a1ab3dcee16a9d2356592c"),
+        program_sha256=(
+            "7d693ad796a0035774e98fb1a4f132a0d2bb169b7a3137d7d2396bf4ee065a5b"),
+        dispatch_sha256=(
+            "b6452d065d23b462f3054568de7116e2df9754f0e587185fc6612606be99f212"),
+        params_bytes=16_082_992,
+        program_bytes=43_136,
+    ),
+}
+
+# Compatibility aliases retained for existing YOLOv5s callers/tests.
+ARTIFACT_FORMAT = CANONICAL_ARTIFACTS["s"].format
+CANONICAL_GRAPH_SHA256 = CANONICAL_ARTIFACTS["s"].graph_sha256
+CANONICAL_WEIGHTS_SHA256 = CANONICAL_ARTIFACTS["s"].weights_sha256
+CANONICAL_PARAMS_SHA256 = CANONICAL_ARTIFACTS["s"].params_sha256
+CANONICAL_PROGRAM_SHA256 = CANONICAL_ARTIFACTS["s"].program_sha256
+CANONICAL_DISPATCH_SHA256 = CANONICAL_ARTIFACTS["s"].dispatch_sha256
+CANONICAL_PARAMS_BYTES = CANONICAL_ARTIFACTS["s"].params_bytes
+CANONICAL_PROGRAM_BYTES = CANONICAL_ARTIFACTS["s"].program_bytes
+
+
+def get_canonical_artifact(variant: str = "s") -> CanonicalArtifact:
+    profile = get_yolov5_variant(variant)
+    return CANONICAL_ARTIFACTS[profile.key]
+
+
+def artifact_variant(payload: dict) -> str:
+    """Return the canonical variant selected by a payload's format."""
+    format_name = payload.get("format") if isinstance(payload, dict) else None
+    for key, spec in CANONICAL_ARTIFACTS.items():
+        if format_name == spec.format:
+            return key
+    raise RuntimeError(f"unsupported YOLO artifact format {format_name!r}")
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -248,20 +303,28 @@ class ArtifactCompileBackend:
 
 
 def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
-                       image_size: int, checkpoint_sha256: str) -> dict:
+                       image_size: int, checkpoint_sha256: str,
+                       variant: str = "s") -> dict:
     """Compile a verified canonical checkpoint into one checkpoint-free bin."""
+    profile = get_yolov5_variant(variant)
+    artifact_spec = get_canonical_artifact(profile.key)
     if image_size != 640:
-        raise ValueError("canonical YOLOv5s single-bin format requires image_size=640")
+        raise ValueError(
+            f"canonical {profile.model_name} single-bin format requires image_size=640")
+    if str(checkpoint_sha256) != profile.checkpoint_sha256:
+        raise ValueError(
+            f"{profile.model_name} compile requested checkpoint SHA-256 "
+            f"{checkpoint_sha256}, expected {profile.checkpoint_sha256}")
     backend = ArtifactCompileBackend()
-    heads = execute_yolov5s(
+    heads = execute_yolov5(
         model, TensorSpec("input", (3, image_size, image_size)), backend)
     detect = model.model[-1]
     payload = {
-        "format": ARTIFACT_FORMAT,
+        "format": artifact_spec.format,
         "artifact_version": ARTIFACT_VERSION,
         "checkpoint_sha256": str(checkpoint_sha256),
         "model": {
-            "name": "YOLOv5s",
+            "name": profile.model_name,
             "upstream_version": "v7.0",
             "input_shape": [3, image_size, image_size],
             "names": _class_names(model),
@@ -287,7 +350,8 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
                 "iou_threshold": 0.45,
                 "max_detections": 300,
             },
-            "output_suffix": "_detections_hw.jpg",
+            "output_suffix": ("_detections_hw.jpg" if profile.key == "s"
+                              else f"_yolov5{profile.key}_detections_hw.jpg"),
         },
     }
     payload["graph_sha256"] = _graph_sha256(payload)
@@ -318,8 +382,9 @@ def validate_single_bin(payload: dict) -> None:
     """Validate the closed artifact schema before any graph execution."""
     if not isinstance(payload, dict):
         raise RuntimeError("YOLO single-bin payload is not a dictionary")
-    if payload.get("format") != ARTIFACT_FORMAT:
-        raise RuntimeError(f"unsupported YOLO artifact format {payload.get('format')!r}")
+    variant = artifact_variant(payload)
+    profile = get_yolov5_variant(variant)
+    artifact_spec = get_canonical_artifact(variant)
     if payload.get("artifact_version") != ARTIFACT_VERSION:
         raise RuntimeError(
             f"unsupported YOLO artifact version {payload.get('artifact_version')!r}")
@@ -331,12 +396,15 @@ def validate_single_bin(payload: dict) -> None:
     if set(payload) != expected_keys:
         raise RuntimeError(
             f"YOLO artifact keys differ from the closed schema: {sorted(payload)}")
-    if payload.get("checkpoint_sha256") != YOLOV5S_V7_SHA256:
-        raise RuntimeError("YOLO artifact checkpoint hash is not the pinned v7.0 release")
+    if payload.get("checkpoint_sha256") != profile.checkpoint_sha256:
+        raise RuntimeError(
+            f"{profile.model_name} artifact checkpoint hash is not the pinned "
+            "v7.0 release")
     if payload.get("graph_sha256") != _graph_sha256(payload):
         raise RuntimeError("YOLO artifact graph digest does not match its contents")
-    if payload["graph_sha256"] != CANONICAL_GRAPH_SHA256:
-        raise RuntimeError("YOLO artifact graph is not canonical YOLOv5s v7.0")
+    if payload["graph_sha256"] != artifact_spec.graph_sha256:
+        raise RuntimeError(
+            f"YOLO artifact graph is not canonical {profile.model_name} v7.0")
 
     runtime = payload.get("runtime")
     expected_runtime = {
@@ -352,12 +420,13 @@ def validate_single_bin(payload: dict) -> None:
             "iou_threshold": 0.45,
             "max_detections": 300,
         },
-        "output_suffix": "_detections_hw.jpg",
+        "output_suffix": ("_detections_hw.jpg" if variant == "s"
+                          else f"_yolov5{variant}_detections_hw.jpg"),
     }
     if runtime != expected_runtime:
         raise RuntimeError(
             "YOLO artifact runtime ABI/defaults are not canonical; rebuild it "
-            "with `make yolov5s_bin FORCE=1` after updating the driver")
+            f"with `make yolov5{variant}_bin FORCE=1` after updating the driver")
 
     model = payload.get("model")
     operations = payload.get("operations")
@@ -372,8 +441,10 @@ def validate_single_bin(payload: dict) -> None:
     if set(model) != {"name", "upstream_version", "input_shape", "names",
                       "strides", "anchors"}:
         raise RuntimeError("YOLO artifact model metadata differs from the closed schema")
-    if model.get("name") != "YOLOv5s" or model.get("upstream_version") != "v7.0":
-        raise RuntimeError("YOLO artifact model identity is not canonical v7.0")
+    if (model.get("name") != profile.model_name
+            or model.get("upstream_version") != "v7.0"):
+        raise RuntimeError(
+            f"YOLO artifact model identity is not canonical {profile.model_name} v7.0")
     if len(model.get("names", ())) != 80:
         raise RuntimeError("YOLO artifact must contain 80 COCO class names")
     strides = model.get("strides")
@@ -393,7 +464,7 @@ def validate_single_bin(payload: dict) -> None:
         raise RuntimeError("YOLO artifact has noncanonical anchors")
     if len(operations) != 85 or len(heads) != 3 or len(weights) != 60:
         raise RuntimeError(
-            "canonical YOLOv5s needs 85 ops/3 heads/60 convs, got "
+            f"canonical {profile.model_name} needs 85 ops/3 heads/60 convs, got "
             f"{len(operations)}/{len(heads)}/{len(weights)}")
 
     produced = {"input"}
@@ -464,7 +535,7 @@ def validate_single_bin(payload: dict) -> None:
         shapes[output] = tuple(shape)
     if set(weights) != conv_names:
         raise RuntimeError("YOLO artifact contains missing or unused convolution weights")
-    if _weights_sha256(weights) != CANONICAL_WEIGHTS_SHA256:
+    if _weights_sha256(weights) != artifact_spec.weights_sha256:
         raise RuntimeError("YOLO artifact logical IF4 tensors are not canonical")
     if any(head not in produced for head in heads):
         raise RuntimeError("YOLO artifact head output is not produced by the graph")
@@ -473,13 +544,13 @@ def validate_single_bin(payload: dict) -> None:
         raise RuntimeError("YOLO artifact detection head shapes are not canonical")
     validate_precompiled_hardware(payload)
     hardware = payload["hardware"]
-    if (hardware["params_image"].numel() != CANONICAL_PARAMS_BYTES
-            or hardware["params_sha256"] != CANONICAL_PARAMS_SHA256):
+    if (hardware["params_image"].numel() != artifact_spec.params_bytes
+            or hardware["params_sha256"] != artifact_spec.params_sha256):
         raise RuntimeError("YOLO artifact prepacked parameter image is not canonical")
-    if (hardware["program_image"].numel() != CANONICAL_PROGRAM_BYTES
-            or hardware["program_sha256"] != CANONICAL_PROGRAM_SHA256):
+    if (hardware["program_image"].numel() != artifact_spec.program_bytes
+            or hardware["program_sha256"] != artifact_spec.program_sha256):
         raise RuntimeError("YOLO artifact precompiled program image is not canonical")
-    if precompiled_manifest_sha256(hardware) != CANONICAL_DISPATCH_SHA256:
+    if precompiled_manifest_sha256(hardware) != artifact_spec.dispatch_sha256:
         raise RuntimeError("YOLO artifact precompiled dispatch manifest is not canonical")
 
 
@@ -515,9 +586,11 @@ def _prepared_convs(payload: dict) -> dict[str, QuantizedConv]:
 
 
 def execute_single_bin(payload: dict, image_chw: torch.Tensor, backend, *,
-                       progress: bool = False) -> list[torch.Tensor]:
+                       progress: bool = False,
+                       validate_payload: bool = True) -> list[torch.Tensor]:
     """Dispatch the embedded primitive graph directly from a loaded artifact."""
-    validate_single_bin(payload)
+    if validate_payload:
+        validate_single_bin(payload)
     expected_input = tuple(payload["model"]["input_shape"])
     if tuple(image_chw.shape) != expected_input:
         raise ValueError(

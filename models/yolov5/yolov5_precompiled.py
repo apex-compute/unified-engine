@@ -536,8 +536,15 @@ class PrecompiledAndromedaBackend:
         self.timeout_s = float(timeout_s)
         if not math.isfinite(self.timeout_s) or self.timeout_s <= 0:
             raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s!r}")
+        # ``cycles`` is expressed in FPGA aclk cycles.  UE_LATENCY_COUNT is a
+        # prescaled counter (one tick per UE_PIPELINE_COUNTER_CLK_DIV clocks),
+        # so _dispatch expands each readout before accumulating it.
         self.cycles: dict[str, int] = collections.defaultdict(int)
+        self.latency_counter_ticks: dict[str, int] = collections.defaultdict(int)
         self.instruction_bytes: dict[str, int] = collections.defaultdict(int)
+        self.static_dram_load_bytes = 0
+        self.static_dram_load_seconds = 0.0
+        self.static_dram_load_writes = 0
         self.hw_version = int(ue.hw_version) & 0xFFFFFFFF
         self._entries = {entry["name"]: entry for entry in self.hardware["entries"]}
         self._operations = {operation["name"]: operation
@@ -550,12 +557,17 @@ class PrecompiledAndromedaBackend:
                 ("program", "program_image", "program_base")):
             image = self.hardware[image_key]
             base = self.hardware[base_key]
+            started = time.perf_counter_ns()
             written = self.ue.dma_write(
                 self.ue.h2c_device, base, image, image.numel())
+            elapsed = (time.perf_counter_ns() - started) / 1e9
             if written != image.numel():
                 raise RuntimeError(
                     f"loading precompiled {label} image wrote {written} of "
                     f"{image.numel()} bytes")
+            self.static_dram_load_bytes += int(written)
+            self.static_dram_load_seconds += elapsed
+            self.static_dram_load_writes += 1
 
     @staticmethod
     def _require_allocation(entry: dict, kind: str, index: int,
@@ -615,8 +627,11 @@ class PrecompiledAndromedaBackend:
         self.ue.start_execute_from_dram(program_address)
         self._wait_strict()
         self.instruction_bytes[entry["op"]] += entry["program_size"]
-        self.cycles[entry["op"]] += int(
+        counter_ticks = int(
             self.ue.read_reg32(user_dma_core.UE_LATENCY_COUNT_ADDR))
+        self.latency_counter_ticks[entry["op"]] += counter_ticks
+        self.cycles[entry["op"]] += (
+            counter_ticks * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV)
 
     def conv_prepared(self, name: str, x: torch.Tensor, _prepared, *,
                       stride: int, pad: int, dilation: int,

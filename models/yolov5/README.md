@@ -7,6 +7,10 @@ Image preparation, concatenation, detection decoding, non-maximum suppression,
 and result drawing run on the host because the current full-tensor primitives
 return a host CHW tensor after each layer.
 
+YOLOv5n has its own commands, configuration, cache, and documentation in
+[`models/yolov5n`](../yolov5n). Its thin entrypoints reuse the graph,
+quantization, artifact, and hardware primitives implemented in this directory.
+
 ## Hardware compatibility
 
 YOLOv5 requires a convolution-enabled FPGA image. The repository-shipped
@@ -132,7 +136,7 @@ The annotated image is written under `yolov5_bin/`. The script also emits one
 machine-readable line for the automated test harness, for example:
 
 ```text
-TEST_RESULT: {"decoded_text":"car","n_detections":1,"precompiled":true,"artifact_version":3,"geometry_abi":"conv-config-inst-v1","detections":[...]}
+TEST_RESULT: {"model":"yolov5s","decoded_text":"car","n_detections":1,"precompiled":true,"artifact_version":3,"geometry_abi":"conv-config-inst-v1","detections":[...]}
 ```
 
 To run either path through the repository harness:

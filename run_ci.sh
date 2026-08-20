@@ -68,7 +68,8 @@ run_yolov5_host_tests() {
     echo "############################################################"
     echo "# $STEP/$STEP_TOTAL  YOLOv5 host regressions — graph helpers + conv planner"
     echo "############################################################"
-    python models/yolov5/test_yolov5_helpers.py
+    python models/yolov5/test_yolov5_helpers.py && \
+    python models/yolov5n/test_yolov5n.py
     if [[ $? -ne 0 ]]; then
         echo "!!! YOLOv5 host regressions failed — stopping before hardware tests."
         exit 1

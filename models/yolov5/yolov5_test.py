@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""YOLOv5s v7.0 inference using Andromeda's native convolution primitives."""
+"""YOLOv5 v7.0 inference using Andromeda's native convolution primitives."""
 
 from __future__ import annotations
 
@@ -25,9 +25,11 @@ from yolov5_common import (
     decode_yolov5,
     draw_detections,
     ensure_checkpoint,
-    execute_yolov5s,
+    execute_yolov5,
+    get_yolov5_variant,
+    load_yolov5_config,
     letterbox_image,
-    load_official_yolov5s,
+    load_official_yolov5,
     non_max_suppression,
     restore_boxes,
 )
@@ -76,41 +78,25 @@ def _create_hardware_backend(*, clock: float, known_hw_versions: set[int],
         timeout_s=timeout_s)
 
 
-def main() -> None:
-    with (SCRIPT_DIR / "yolov5_config.json").open("r", encoding="utf-8") as f:
-        config = json.load(f)
-    defaults = config["postprocessing"]
-    configured_native_hw_versions = set(_parse_hw_versions(
-        config["hardware"]["compatible_fpga_hashes"]))
-    if configured_native_hw_versions != set(user_dma_core.UE_NATIVE_CONV_HW_VERSIONS):
-        raise RuntimeError(
-            "yolov5_config.json compatible_fpga_hashes is out of sync with "
-            "user_dma_core.UE_NATIVE_CONV_HW_VERSIONS")
-    configured_queue_hw_versions = set(_parse_hw_versions(
-        config["hardware"]["queued_config_fpga_hashes"]))
-    if configured_queue_hw_versions != set(user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS):
-        raise RuntimeError(
-            "yolov5_config.json queued_config_fpga_hashes is out of sync with "
-            "user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS")
-
+def main(argv=None, *, pinned_variant: str = "s",
+         config_path: Path | None = None) -> None:
+    model_name = get_yolov5_variant(pinned_variant).model_name
+    default_bin_dir = "yolov5n_bin" if pinned_variant == "n" else "yolov5_bin"
     parser = argparse.ArgumentParser(
-        description="YOLOv5s v7.0 inference on Andromeda CONV2D/MAXPOOL")
-    parser.add_argument("--image", type=Path,
-                        default=(SCRIPT_DIR / config["paths"]["default_image"]).resolve())
+        description=f"{model_name} v7.0 inference on Andromeda")
+    parser.set_defaults(variant=pinned_variant)
+    parser.add_argument("--image", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None,
-                        help="Annotated image path (default: yolov5_bin/<stem>_detections_<backend>.jpg)")
+                        help=("Annotated image path (default: "
+                              f"{default_bin_dir}/<stem>_detections_<backend>.jpg)"))
     parser.add_argument("--backend", choices=("hardware", "cpu", "cpu-quantized"),
                         default="hardware")
     parser.add_argument("--cpu", action="store_true",
                         help="Alias for --backend cpu")
-    parser.add_argument("--image-size", type=int,
-                        default=int(config["model"]["input_size"]))
-    parser.add_argument("--conf-thres", type=float,
-                        default=float(defaults["confidence_threshold"]))
-    parser.add_argument("--iou-thres", type=float,
-                        default=float(defaults["iou_threshold"]))
-    parser.add_argument("--max-det", type=int,
-                        default=int(defaults["max_detections"]))
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--conf-thres", type=float, default=None)
+    parser.add_argument("--iou-thres", type=float, default=None)
+    parser.add_argument("--max-det", type=int, default=None)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dev", default="xdma0")
     parser.add_argument("--device", default="kintex7")
@@ -119,19 +105,46 @@ def main() -> None:
     parser.add_argument("--allow-unknown-hardware", action="store_true",
                         help="Bypass the native-CONV and queue-CONFIG FPGA hash allow-lists")
     parser.add_argument("--progress", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.cpu:
         args.backend = "cpu"
 
+    profile, config, resource_dir = load_yolov5_config(
+        args.variant, config_path)
+    defaults = config["postprocessing"]
+    if args.image is None:
+        args.image = (resource_dir / config["paths"]["default_image"]).resolve()
+    if args.image_size is None:
+        args.image_size = int(config["model"]["input_size"])
+    if args.conf_thres is None:
+        args.conf_thres = float(defaults["confidence_threshold"])
+    if args.iou_thres is None:
+        args.iou_thres = float(defaults["iou_threshold"])
+    if args.max_det is None:
+        args.max_det = int(defaults["max_detections"])
+
+    configured_native_hw_versions = set(_parse_hw_versions(
+        config["hardware"]["compatible_fpga_hashes"]))
+    if configured_native_hw_versions != set(user_dma_core.UE_NATIVE_CONV_HW_VERSIONS):
+        raise RuntimeError(
+            f"{profile.model_name} compatible_fpga_hashes is out of sync with "
+            "user_dma_core.UE_NATIVE_CONV_HW_VERSIONS")
+    configured_queue_hw_versions = set(_parse_hw_versions(
+        config["hardware"]["queued_config_fpga_hashes"]))
+    if configured_queue_hw_versions != set(user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS):
+        raise RuntimeError(
+            f"{profile.model_name} queued_config_fpga_hashes is out of sync with "
+            "user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS")
+
     checkpoint = (args.checkpoint or
-                  SCRIPT_DIR / config["paths"]["weights"])
-    print(f"YOLOv5s v7.0 backend={args.backend} image={args.image}")
+                  resource_dir / config["paths"]["weights"])
+    print(f"{profile.model_name} v7.0 backend={args.backend} image={args.image}")
     print(f"Checkpoint: {checkpoint}")
     checkpoint = ensure_checkpoint(
         checkpoint,
         url=config["source"]["weights_url"],
         sha256=config["source"]["weights_sha256"])
-    model = load_official_yolov5s(checkpoint)
+    model = load_official_yolov5(checkpoint, variant=profile.key)
     original, image_tensor, letterbox = letterbox_image(
         args.image, args.image_size)
 
@@ -156,7 +169,7 @@ def main() -> None:
 
     started = time.perf_counter()
     with torch.inference_mode():
-        raw_heads = execute_yolov5s(
+        raw_heads = execute_yolov5(
             model, image_tensor, backend, progress=args.progress)
         decoded = decode_yolov5(raw_heads, model)
         detections = non_max_suppression(
@@ -175,11 +188,14 @@ def main() -> None:
         print("\n(no detections)")
 
     backend_tag = "hw" if args.backend == "hardware" else args.backend
-    output_suffix = (config["paths"]["output_suffix"]
-                     if args.backend == "hardware"
-                     else f"_detections_{backend_tag}.jpg")
+    if args.backend == "hardware":
+        output_suffix = config["paths"]["output_suffix"]
+    elif profile.key == "s":
+        output_suffix = f"_detections_{backend_tag}.jpg"
+    else:
+        output_suffix = f"_yolov5{profile.key}_detections_{backend_tag}.jpg"
     output = (args.output or
-              SCRIPT_DIR / config["paths"]["bin_dir"] /
+              resource_dir / config["paths"]["bin_dir"] /
               f"{args.image.stem}{output_suffix}")
     draw_detections(original, detections, output)
     print(f"Annotated image: {output}")
@@ -192,6 +208,7 @@ def main() -> None:
 
     labels = [detection.label for detection in detections]
     result = {
+        "model": profile.model_name.lower(),
         "decoded_text": ", ".join(labels),
         "n_detections": len(detections),
         "detections": [

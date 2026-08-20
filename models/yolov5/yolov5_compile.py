@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Compile YOLOv5s into one direct-run params/program/model artifact."""
+"""Compile a YOLOv5 variant into one direct-run params/program artifact."""
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import sys
 
@@ -18,16 +17,18 @@ for path in (SCRIPT_DIR, REPO_ROOT):
 from yolov5_artifact import compile_single_bin, load_single_bin
 from yolov5_common import (
     ensure_checkpoint,
-    load_official_yolov5s,
+    get_yolov5_variant,
+    load_yolov5_config,
+    load_official_yolov5,
     sha256_file,
 )
 
 
-def build_artifact(*, checkpoint: Path | None = None,
-                   output: Path | None = None, force: bool = False) -> Path:
-    with (SCRIPT_DIR / "yolov5_config.json").open("r", encoding="utf-8") as f:
-        config = json.load(f)
-    output = (output or SCRIPT_DIR / config["paths"]["artifact"]).resolve()
+def build_artifact(*, variant: str = "s", checkpoint: Path | None = None,
+                   config_path: Path | None = None, output: Path | None = None,
+                   force: bool = False) -> Path:
+    profile, config, resource_dir = load_yolov5_config(variant, config_path)
+    output = (output or resource_dir / config["paths"]["artifact"]).resolve()
     if output.is_file() and not force:
         payload = load_single_bin(output)
         expected = config["source"]["weights_sha256"]
@@ -40,16 +41,17 @@ def build_artifact(*, checkpoint: Path | None = None,
               f"sha256={sha256_file(output)}")
         return output
 
-    checkpoint = (checkpoint or SCRIPT_DIR / config["paths"]["weights"]).resolve()
+    checkpoint = (checkpoint or resource_dir / config["paths"]["weights"]).resolve()
     checkpoint = ensure_checkpoint(
         checkpoint,
         url=config["source"]["weights_url"],
         sha256=config["source"]["weights_sha256"])
-    model = load_official_yolov5s(checkpoint)
+    model = load_official_yolov5(checkpoint, variant=profile.key)
     report = compile_single_bin(
         model, output,
         image_size=int(config["model"]["input_size"]),
-        checkpoint_sha256=config["source"]["weights_sha256"])
+        checkpoint_sha256=config["source"]["weights_sha256"],
+        variant=profile.key)
     print(f"Single bin written: {report['path']}")
     print(f"  size={report['size'] / 2**20:.2f} MiB sha256={report['sha256']}")
     print(f"  operations={report['operations']} convs={report['convolutions']}")
@@ -58,15 +60,19 @@ def build_artifact(*, checkpoint: Path | None = None,
     return output
 
 
-def main() -> None:
+def main(argv=None, *, pinned_variant: str = "s",
+         config_path: Path | None = None) -> None:
+    model_name = get_yolov5_variant(pinned_variant).model_name
     parser = argparse.ArgumentParser(
-        description="Compile YOLOv5s into one checkpoint-free Andromeda bin")
+        description=f"Compile {model_name} into one Andromeda bin")
+    parser.set_defaults(variant=pinned_variant)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     build_artifact(
-        checkpoint=args.checkpoint, output=args.output, force=args.force)
+        variant=args.variant, config_path=config_path, checkpoint=args.checkpoint,
+        output=args.output, force=args.force)
 
 
 if __name__ == "__main__":

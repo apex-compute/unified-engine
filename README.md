@@ -172,21 +172,28 @@ for execute-only deploys from precompiled bins.
 | GPT-2 | [`models/gpt2`](models/gpt2) | Text LM |
 | LocateAnything 3B | [`models/locateanything_3b`](models/locateanything_3b) | Open-vocabulary localization |
 | MobileNetV2 (224 + SSD-FPNLite 640) | [`models/mobilenetv2`](models/mobilenetv2) | Classification / detection |
+| YOLOv5n | [`models/yolov5n`](models/yolov5n) | Object detection (conv-enabled FPGA image required) |
 | YOLOv5s | [`models/yolov5`](models/yolov5) | Object detection (conv-enabled FPGA image required) |
 | Parakeet | [`models/parakeet`](models/parakeet) | Speech recognition (incl. streaming) |
 | MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
 | Swin | [`models/swin`](models/swin) | Image classification |
 
-YOLOv5s uses the native CONV2D/MAXPOOL modes and ordered queue-CONFIG geometry
-from Andromeda's `pcie_conv_maxpool` line. The bundled `update_cf133b89.bin`
-predates those modes; see the model README for compatible build hashes before
-running it. No compatible update image is shipped in this repository. YOLOv5
-is therefore opt-in rather than part of the default suite; only run it after
-programming a verified queue-CONFIG-capable FPGA image.
+YOLOv5n has dedicated commands, configuration, cache, and documentation under
+`models/yolov5n`; YOLOv5s remains under `models/yolov5`. The variants share the
+low-level YOLOv5 primitive implementation. Both use native CONV2D/MAXPOOL modes
+and ordered queue-CONFIG geometry from Andromeda's `pcie_conv_maxpool` line.
+The bundled `update_cf133b89.bin` predates those modes; see the model READMEs
+for compatible build hashes before running either model. No compatible update
+image is shipped in this repository. YOLOv5 is therefore opt-in rather than
+part of the default suite; only run it after programming a verified
+queue-CONFIG-capable FPGA image.
 
-YOLOv5 also supports a single checkpoint-free model artifact:
+Both variants support a single checkpoint-free model artifact:
 
 ```bash
+make yolov5n_bin
+make model_test yolov5n_run_from_bin run_from_bin
+
 make yolov5s_bin
 make model_test yolov5s_run_from_bin run_from_bin
 ```
@@ -198,13 +205,16 @@ and runtime defaults. The hardware backend uploads the immutable parameter/progr
 images once; inference performs no static-weight repacking, program capture, or
 live geometry-CSR writes. It is still not one hardware launch: graph handoff needs
 multiple host dispatches, while concatenation and detection postprocessing remain
-host-side. See the model README for the direct CLI and precise artifact contract.
+host-side. See each model README for its direct CLI and artifact contract.
 
-The direct v3 artifact is host-validated and FPGA-validated on queued-CONFIG
-builds `d93eea82` and `9ef15fc1`; its strict poisoned-DRAM RK test detects the
-expected car fixture. The checkpoint runner uses the same geometry ABI and is
-FPGA-validated on `9ef15fc1`. Older native-convolution images are intentionally
-rejected because they do not implement the queued geometry ABI.
+The YOLOv5s direct v3 artifact is host-validated and FPGA-validated on
+queued-CONFIG builds `d93eea82` and `9ef15fc1`; its strict poisoned-DRAM RK
+test detects the expected car fixture. The checkpoint runner uses the same
+geometry ABI and is FPGA-validated on `9ef15fc1`. The separated YOLOv5n direct
+artifact is also FPGA-validated on `9ef15fc1`; its poisoned-DRAM harness run
+detects four `person` instances in `people.jpg`.
+Older native-convolution images are intentionally rejected because they do not
+implement the queued geometry ABI.
 
 Run the whole suite (or a subset) with the automated tester:
 
@@ -221,9 +231,10 @@ Notes on the two modes:
   models (slow; needs the HF models available).
 - `run_from_bin` skips the pre-clean; it does not automatically choose a
   different script. Select a registered runtime-only model name explicitly.
-  YOLOv5 uses `yolov5s_run_from_bin`; other models with runtime-only entry
-  points reuse their existing bins. Models without such an entry still run
-  through their `*_test.py` scripts and need their model assets on disk. On a
+  YOLOv5 uses `yolov5n_run_from_bin` or `yolov5s_run_from_bin`; other models
+  with runtime-only entry points reuse their existing bins. Models without such
+  an entry still run through their `*_test.py` scripts and need their model
+  assets on disk. On a
   deploy host, run the desired runtime-only names, for example
   `make model_test gemma4_e2b llama3.2_1b qwen3_4b run_from_bin`.
 
