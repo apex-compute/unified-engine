@@ -26,12 +26,13 @@ import torch.nn.functional as F
 import user_dma_core
 
 
-PRECOMPILED_ABI = "andromeda-yolov5-precompiled-v2"
+PRECOMPILED_ABI = "andromeda-yolov5-precompiled-v3"
 GEOMETRY_ABI = "conv-config-inst-v1"
 
 # Keep the image-dependent staging arena separate from the compact immutable
-# parameter image.  The 640 stem needs ~167 MiB of staging; 256 MiB leaves a
-# useful guard before the static section.  Programs embed all of these values.
+# parameter image. The optimized 256 gather stem is well below this 256 MiB
+# staging arena, leaving a useful guard before the static section. Programs
+# embed all of these values.
 DYNAMIC_PARAMS_BASE = user_dma_core.DRAM_START_ADDR       # 0x80000000
 STATIC_PARAMS_BASE = 0x90000000
 STATIC_PARAMS_LIMIT = user_dma_core.DRAM_ACTIVATION_ADDR  # 0xB0000000
@@ -104,10 +105,22 @@ def _bytes_tensor(value: bytearray) -> torch.Tensor:
     return torch.frombuffer(value, dtype=torch.uint8).clone()
 
 
-def _unpack_codes(packed: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
+def _unpack_codes(packed: torch.Tensor, shape: Sequence[int],
+                  precision: str) -> torch.Tensor:
     count = 1
     for value in shape:
         count *= int(value)
+    if (not isinstance(packed, torch.Tensor) or packed.dtype != torch.uint8
+            or packed.dim() != 1):
+        raise RuntimeError("quantized code payload must be a flat uint8 tensor")
+    if precision == "if8":
+        if packed.numel() != count:
+            raise RuntimeError("IF8 code payload size does not match its shape")
+        return packed.view(tuple(int(value) for value in shape)).contiguous()
+    if precision != "if4":
+        raise RuntimeError(f"unsupported convolution precision {precision!r}")
+    if packed.numel() != (count + 1) // 2:
+        raise RuntimeError("IF4 code payload size does not match its shape")
     raw = torch.empty(packed.numel() * 2, dtype=torch.uint8)
     raw[0::2] = packed & 0x0F
     raw[1::2] = packed >> 4
@@ -171,6 +184,7 @@ class _OfflineEngine(user_dma_core.UnifiedEngine):
         self._clock_period_ns = 10.0
         self._allow_unknown_conv_hardware = True
         self._allow_unknown_queue_config_hardware = True
+        self._allow_unknown_gather_if8_hardware = True
         self.conv_geometry_mode = user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG
         self._base_addr = 0
         self.hw_version = 0
@@ -339,7 +353,11 @@ def compile_precompiled_hardware(payload: dict) -> dict:
                       for shape in input_shapes]
             if kind == "conv":
                 weight = payload["weights"][operation["name"]]
-                codes = _unpack_codes(weight["codes_packed"], weight["codes_shape"])
+                precision = weight["precision"]
+                data_type = user_dma_core.TYPE[precision.upper()]
+                gather = weight["layout"] == "gather"
+                codes = _unpack_codes(
+                    weight["codes_packed"], weight["codes_shape"], precision)
                 bias = weight["bias"]
                 result = engine.run_conv2d_layer(
                     inputs[0], codes,
@@ -348,8 +366,8 @@ def compile_precompiled_hardware(payload: dict) -> dict:
                     block_scales=weight["block_scales"],
                     bias=None if bias.numel() == 0 else bias,
                     silu_enable=operation["activate"],
-                    data_type=user_dma_core.TYPE.IF4,
-                    gather=False)
+                    data_type=data_type,
+                    gather=gather)
             elif kind == "maxpool":
                 result = engine.run_maxpool2d_layer(
                     inputs[0], kernel=operation["kernel"],
@@ -515,10 +533,14 @@ class PrecompiledAndromedaBackend:
         validate_precompiled_hardware(payload)
         ue.require_native_conv_hardware()
         ue.require_queue_conv_config_hardware()
+        if any(weight.get("layout") == "gather"
+               and weight.get("precision") == "if8"
+               for weight in payload.get("weights", {}).values()):
+            ue.require_gather_if8_hardware()
         if getattr(ue, "conv_geometry_mode", None) != \
                 user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG:
             raise RuntimeError(
-                "precompiled YOLO v3 requires queue-config-v1 engine mode")
+                "precompiled YOLO v4 requires queue-config-v1 engine mode")
         expected_bases = {
             "_params_dram_base": DYNAMIC_PARAMS_BASE,
             "_tensor_dram_base": TENSOR_BASE,
@@ -586,7 +608,9 @@ class PrecompiledAndromedaBackend:
                 f"dynamic operand DMA wrote {written} of {size} bytes at {address:#x}")
 
     def _read_bf16(self, address: int, count: int) -> torch.Tensor:
-        value = torch.zeros(int(count), dtype=torch.bfloat16)
+        # A successful XDMA read overwrites every byte and the exact byte count
+        # is checked below, so zero-filling large result buffers is wasted work.
+        value = torch.empty(int(count), dtype=torch.bfloat16)
         size = value.numel() * 2
         read = self.ue.dma_read(self.ue.c2h_device, address, value, size)
         if read != size:
@@ -638,14 +662,16 @@ class PrecompiledAndromedaBackend:
                 or operation["activate"] != bool(activate)):
             raise RuntimeError(f"{name}: invocation differs from its compiled convolution")
         C, H, W = (int(v) for v in x.shape)
-        OC, weight_c, kh, kw = (
-            int(v) for v in self.payload["weights"][name]["codes_shape"])
+        weight = self.payload["weights"][name]
+        OC, weight_c, kh, kw = (int(v) for v in weight["codes_shape"])
         if weight_c != C:
             raise RuntimeError(f"{name}: runtime input channels differ from the bin")
+        gather = weight["layout"] == "gather"
         out_h, out_w, oc_chunk, tiles = user_dma_core.plan_conv2d_layer_tiles(
             c_in=C, oc_count=OC, in_h=H, in_w=W,
             kernel_h=kh, kernel_w=kw, stride_s=stride,
-            pad=pad, pad_h=pad, dilation=dilation, gather=False)
+            pad=pad, pad_h=pad, dilation=dilation, gather=gather,
+            bias_enabled=weight["bias"].numel() != 0)
         ct = (C + user_dma_core.UE_VECTOR_SIZE - 1) // user_dma_core.UE_VECTOR_SIZE
         th, tw = tiles[0][2], tiles[0][3]
         win_h, win_w = tiles[0][6], tiles[0][7]
@@ -656,14 +682,10 @@ class PrecompiledAndromedaBackend:
         result_lines = (th * tw * oc_chunk + user_dma_core.UE_VECTOR_SIZE - 1) // user_dma_core.UE_VECTOR_SIZE
         out_bytes = result_lines * 128
 
-        x_padded = F.pad(x.to(torch.bfloat16), (pad, pad, pad, pad))
-        staged = torch.empty(
-            n_tiles * win_lines, user_dma_core.UE_VECTOR_SIZE,
-            dtype=torch.bfloat16)
-        for index, (_, _, _, _, y0, x0, _, _) in enumerate(tiles):
-            window = x_padded[:, y0:y0 + win_h, x0:x0 + win_w]
-            staged[index * win_lines:(index + 1) * win_lines] = \
-                user_dma_core.conv2d_pack_activation_map(window, 0)
+        staged = user_dma_core.conv2d_pack_activation_tiles(
+            x, tiles, pad=pad)
+        if staged.numel() * staged.element_size() != n_tiles * act_bytes:
+            raise RuntimeError(f"{name}: staged activation size differs from bin")
         act_address = self._require_allocation(
             entry, "params_allocations", 0, n_tiles * act_bytes)
         self._write_dynamic(act_address, staged)
@@ -674,15 +696,8 @@ class PrecompiledAndromedaBackend:
         big = self._read_bf16(
             out_address,
             n_chunks * n_tiles * result_lines * user_dma_core.UE_VECTOR_SIZE)
-        big = big.view(n_chunks, n_tiles,
-                       result_lines * user_dma_core.UE_VECTOR_SIZE)
-        out = torch.zeros(OC, out_h, out_w, dtype=torch.bfloat16)
-        for chunk_index, oc0 in enumerate(range(0, OC, oc_chunk)):
-            for tile_index, (oy0, ox0, _, _, _, _, _, _) in enumerate(tiles):
-                out[oc0:oc0 + oc_chunk, oy0:oy0 + th, ox0:ox0 + tw] = \
-                    user_dma_core.conv2d_unpack_result(
-                        big[chunk_index, tile_index], th, tw, oc_chunk)
-        return out
+        return user_dma_core.conv2d_unpack_tiled_result(
+            big, tiles, out_h, out_w, OC, oc_chunk)
 
     def maxpool(self, name: str, x: torch.Tensor, *, kernel: int,
                 stride: int, pad: int) -> torch.Tensor:

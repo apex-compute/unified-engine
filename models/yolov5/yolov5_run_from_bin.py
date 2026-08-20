@@ -80,7 +80,7 @@ def main(argv=None, *, pinned_variant: str = "s",
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
         "--allow-unknown-hardware", action="store_true",
-        help="Bypass the native-CONV and queue-CONFIG FPGA hash allow-lists")
+        help="Bypass native-CONV, queue-CONFIG, and gather-IF8 FPGA hash gates")
     parser.add_argument("--progress", action="store_true")
     args = parser.parse_args(argv)
     if args.cpu:
@@ -110,8 +110,8 @@ def main(argv=None, *, pinned_variant: str = "s",
     max_detections = (int(defaults["max_detections"])
                       if args.max_det is None else args.max_det)
     configured_hw_versions = set(runtime["compatible_fpga_hashes"])
-    if configured_hw_versions != set(user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS):
-        raise RuntimeError("single-bin queued-CONFIG metadata disagrees with the driver")
+    if configured_hw_versions != set(user_dma_core.UE_GATHER_IF8_HW_VERSIONS):
+        raise RuntimeError("single-bin gather-IF8 metadata disagrees with the driver")
     load_elapsed = time.perf_counter() - load_started
     print(f"{profile.model_name} direct-bin backend={args.backend} image={args.image}")
     print(f"Single bin: {args.bin.resolve()}")
@@ -133,7 +133,8 @@ def main(argv=None, *, pinned_variant: str = "s",
             clock_period_ns=clock,
             allow_unknown_conv_hardware=args.allow_unknown_hardware,
             conv_geometry_mode=user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG,
-            allow_unknown_queue_config_hardware=args.allow_unknown_hardware)
+            allow_unknown_queue_config_hardware=args.allow_unknown_hardware,
+            allow_unknown_gather_if8_hardware=args.allow_unknown_hardware)
         ue.software_reset()
         # The backend uploads the artifact's immutable params/program images
         # once. Per-node execution then moves only image-dependent operands,

@@ -423,10 +423,10 @@ def _check_yolov5_single_bin_variant(
         return False, f"single-bin test used unexpected backend {backend!r}"
     if precompiled is not True:
         return False, "single-bin runtime did not report precompiled=true"
-    if artifact_version != 3:
+    if artifact_version != 4:
         return False, (
             f"single-bin runtime reported artifact version "
-            f"{artifact_version!r}, expected 3"
+            f"{artifact_version!r}, expected 4"
         )
     if geometry_abi != "conv-config-inst-v1":
         return False, f"single-bin runtime used unexpected geometry ABI {geometry_abi!r}"

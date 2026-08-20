@@ -69,7 +69,8 @@ def _create_hardware_backend(*, clock: float, known_hw_versions: set[int],
         clock_period_ns=clock,
         allow_unknown_conv_hardware=allow_unknown_hardware,
         conv_geometry_mode=user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG,
-        allow_unknown_queue_config_hardware=allow_unknown_hardware)
+        allow_unknown_queue_config_hardware=allow_unknown_hardware,
+        allow_unknown_gather_if8_hardware=allow_unknown_hardware)
     ue.software_reset()
     return AndromedaBackend(
         ue,
@@ -103,7 +104,7 @@ def main(argv=None, *, pinned_variant: str = "s",
     parser.add_argument("--cycle", type=float, default=None)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--allow-unknown-hardware", action="store_true",
-                        help="Bypass the native-CONV and queue-CONFIG FPGA hash allow-lists")
+                        help="Bypass native-CONV, queue-CONFIG, and gather-IF8 FPGA hash gates")
     parser.add_argument("--progress", action="store_true")
     args = parser.parse_args(argv)
     if args.cpu:
@@ -135,6 +136,13 @@ def main(argv=None, *, pinned_variant: str = "s",
         raise RuntimeError(
             f"{profile.model_name} queued_config_fpga_hashes is out of sync with "
             "user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS")
+    configured_gather_if8_hw_versions = set(_parse_hw_versions(
+        config["hardware"]["gather_if8_fpga_hashes"]))
+    if configured_gather_if8_hw_versions != set(
+            user_dma_core.UE_GATHER_IF8_HW_VERSIONS):
+        raise RuntimeError(
+            f"{profile.model_name} gather_if8_fpga_hashes is out of sync with "
+            "user_dma_core.UE_GATHER_IF8_HW_VERSIONS")
 
     checkpoint = (args.checkpoint or
                   resource_dir / config["paths"]["weights"])
@@ -161,7 +169,7 @@ def main(argv=None, *, pinned_variant: str = "s",
         print(f"FPGA profile: {args.device}, {clock:.4f} ns, AXI={axi_width} bits")
         backend = _create_hardware_backend(
             clock=clock,
-            known_hw_versions=configured_queue_hw_versions,
+            known_hw_versions=configured_gather_if8_hw_versions,
             allow_unknown_hardware=args.allow_unknown_hardware,
             timeout_s=args.timeout)
     else:

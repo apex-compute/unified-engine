@@ -1,7 +1,7 @@
 """Single-file YOLOv5 compile artifacts and checkpoint-free executor.
 
 The artifact is a restricted ``torch.save`` container holding only primitive
-Python values and tensors: an explicit flattened graph, native IF4 tensors,
+Python values and tensors: an explicit flattened graph, native mixed IF4/IF8 tensors,
 anchors, metadata, a fixed-address prepacked parameter image, and a resident
 instruction image.  The runtime loads it with ``weights_only=True`` and never
 imports/downloads the upstream checkpoint or captures hardware programs.
@@ -35,12 +35,12 @@ from yolov5_common import (
     _pair,
     execute_yolov5,
     get_yolov5_variant,
-    quantize_conv_if4,
+    quantize_conv_for_andromeda,
     sha256_file,
 )
 
 
-ARTIFACT_VERSION = 3
+ARTIFACT_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -61,33 +61,33 @@ CANONICAL_ARTIFACTS = {
         variant="s",
         format="andromeda.yolov5s.single-bin",
         graph_sha256=(
-            "0d432730e040130746e1056ec42446ffe7e15e1500872377873afe11c05fefa1"),
+            "0a3f6dbd9e3950fe5b13e829effeb5827c06321daee9d75f3fd690965939fc22"),
         weights_sha256=(
-            "21cd4dd7316f9e1853f0888286641f5b85ba6996967bd7de99aacbc6e6227202"),
+            "273634fad085fa82ed76b5c5f03d80abebf3c8edcf4c8dbda95697c8c8b7d4d3"),
         params_sha256=(
-            "593616e45e54ce39e6a17a3c494b2ce24a87267b101eb5f8f38a75656af4e609"),
+            "9b75c0f41b7fc4ae725b47355a6c5fee8f0f8254893d4225da1b5ad0f2ae29b2"),
         program_sha256=(
-            "d0318e32bf1426d9a9dcc805c56b02e00af743311a41b8c0c505cfb470d88223"),
+            "0d0fa560ec518f42e8b3ee6227dc5fe131f34b9e00851bbbad2e4d1b2752876d"),
         dispatch_sha256=(
-            "0a21680ff6c46f249eb41b9824b1a15f96d7e72efef617fa40eda4d58b8a5dfe"),
-        params_bytes=16_548_664,
-        program_bytes=46_720,
+            "d07cb0b91e8face456a6480044e2350f5e48f1afdf54403b9b368880a3540f3c"),
+        params_bytes=16_862_520,
+        program_bytes=45_696,
     ),
     "n": CanonicalArtifact(
         variant="n",
         format="andromeda.yolov5n.single-bin",
         graph_sha256=(
-            "24c81abdd5e68426bd1268e1c0a8324363796073127c11267abcc21056ce40bf"),
+            "69dbe201b089756886973e98b9f24e8b58c27baf195f7b31c97f7d9c9c2e4272"),
         weights_sha256=(
-            "616aee862c597972776e6bfe1f9e1226cea71bb9d77d81cfef60f5fee0725711"),
+            "b8ca688e49a44c87b657de6b5c4c9d7b0193718c40ccc8f860733cd89865f666"),
         params_sha256=(
-            "1b9c3a190935ee691d3366f701e1b839a14a89d501a1ab3dcee16a9d2356592c"),
+            "5901879827c9e9e10525d6879ce9f852941af9be2a4fd7c4d01deaa1101ca931"),
         program_sha256=(
-            "7d693ad796a0035774e98fb1a4f132a0d2bb169b7a3137d7d2396bf4ee065a5b"),
+            "25ffc42fc50fa7c648d0057da9ee4e8802611134499cb60b86d55ecd1743ac7e"),
         dispatch_sha256=(
-            "b6452d065d23b462f3054568de7116e2df9754f0e587185fc6612606be99f212"),
-        params_bytes=16_082_992,
-        program_bytes=43_136,
+            "ccc136e1bf940cce4e68fe68bea481e0fc8d718a958cfb1a21d4d3a3c25b3b40"),
+        params_bytes=18_219_952,
+        program_bytes=42_240,
     ),
 }
 
@@ -129,6 +129,8 @@ def _weights_sha256(weights: dict) -> str:
         entry = weights[name]
         descriptor.append({
             "name": name,
+            "precision": entry["precision"],
+            "layout": entry["layout"],
             "codes_shape": entry["codes_shape"],
             "codes_packed_shape": list(entry["codes_packed"].shape),
             "codes_packed_sha256": _tensor_sha256(entry["codes_packed"]),
@@ -142,20 +144,35 @@ def _weights_sha256(weights: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _pack_codes(codes: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
+def _pack_codes(codes: torch.Tensor, precision: str) -> tuple[torch.Tensor, list[int]]:
     raw = codes.detach().cpu().to(torch.uint8).contiguous().view(-1)
-    if int(raw.max()) > 15:
+    if precision == "if8":
+        return raw, list(codes.shape)
+    if precision != "if4":
+        raise ValueError(f"unsupported convolution precision {precision!r}")
+    if raw.numel() and int(raw.max()) > 15:
         raise ValueError("IF4 codes must fit one nibble")
     if raw.numel() & 1:
         raw = torch.cat((raw, torch.zeros(1, dtype=torch.uint8)))
-    packed = (raw[0::2] | (raw[1::2] << 4)).contiguous()
-    return packed, list(codes.shape)
+    return (raw[0::2] | (raw[1::2] << 4)).contiguous(), list(codes.shape)
 
 
-def _unpack_codes(packed: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
+def _unpack_codes(packed: torch.Tensor, shape: Sequence[int],
+                  precision: str) -> torch.Tensor:
     count = 1
     for value in shape:
         count *= int(value)
+    if (not isinstance(packed, torch.Tensor) or packed.dtype != torch.uint8
+            or packed.dim() != 1):
+        raise RuntimeError("quantized code payload must be a flat uint8 tensor")
+    if precision == "if8":
+        if packed.numel() != count:
+            raise RuntimeError("IF8 code payload size does not match its shape")
+        return packed.view(tuple(int(value) for value in shape)).contiguous()
+    if precision != "if4":
+        raise RuntimeError(f"unsupported convolution precision {precision!r}")
+    if packed.numel() != (count + 1) // 2:
+        raise RuntimeError("IF4 code payload size does not match its shape")
     raw = torch.empty(packed.numel() * 2, dtype=torch.uint8)
     raw[0::2] = packed & 0x0F
     raw[1::2] = packed >> 4
@@ -191,7 +208,7 @@ class TensorSpec:
 
 
 class ArtifactCompileBackend:
-    """Flatten canonical YOLO modules into primitive operations and IF4 data."""
+    """Flatten canonical YOLO modules into native primitive operations/data."""
 
     def __init__(self):
         self.operations: list[dict] = []
@@ -220,9 +237,13 @@ class ArtifactCompileBackend:
             raise ValueError(
                 f"{name}: input has {x.shape[0]} channels, expected {conv.in_channels}")
 
-        prepared = quantize_conv_if4(conv, bn)
-        packed_codes, codes_shape = _pack_codes(prepared.codes)
+        prepared = quantize_conv_for_andromeda(conv, bn)
+        precision = prepared.data_type.name.lower()
+        layout = "gather" if prepared.gather else "channels"
+        packed_codes, codes_shape = _pack_codes(prepared.codes, precision)
         self.weights[name] = {
+            "precision": precision,
+            "layout": layout,
             "codes_packed": packed_codes,
             "codes_shape": codes_shape,
             "block_scales": prepared.block_scales.to(torch.bfloat16).contiguous(),
@@ -308,9 +329,9 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
     """Compile a verified canonical checkpoint into one checkpoint-free bin."""
     profile = get_yolov5_variant(variant)
     artifact_spec = get_canonical_artifact(profile.key)
-    if image_size != 640:
+    if image_size != 256:
         raise ValueError(
-            f"canonical {profile.model_name} single-bin format requires image_size=640")
+            f"canonical {profile.model_name} single-bin format requires image_size=256")
     if str(checkpoint_sha256) != profile.checkpoint_sha256:
         raise ValueError(
             f"{profile.model_name} compile requested checkpoint SHA-256 "
@@ -337,9 +358,9 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
         "runtime": {
             "engine_abi": PRECOMPILED_ABI,
             "geometry_abi": GEOMETRY_ABI,
-            "precision": "IF4-MIXED-BLOCK64",
+            "precision": "CHANNEL-IF4/GATHER-IF8-MIXED-BLOCK64",
             "compatible_fpga_hashes": sorted(
-                int(value) for value in user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS),
+                int(value) for value in user_dma_core.UE_GATHER_IF8_HW_VERSIONS),
             "preprocessing": {
                 "letterbox": True,
                 "pad_value": 114,
@@ -410,9 +431,9 @@ def validate_single_bin(payload: dict) -> None:
     expected_runtime = {
         "engine_abi": PRECOMPILED_ABI,
         "geometry_abi": GEOMETRY_ABI,
-        "precision": "IF4-MIXED-BLOCK64",
+        "precision": "CHANNEL-IF4/GATHER-IF8-MIXED-BLOCK64",
         "compatible_fpga_hashes": sorted(
-            int(value) for value in user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS),
+            int(value) for value in user_dma_core.UE_GATHER_IF8_HW_VERSIONS),
         "preprocessing": {
             "letterbox": True, "pad_value": 114, "scale": "0_to_1"},
         "postprocessing": {
@@ -436,7 +457,7 @@ def validate_single_bin(payload: dict) -> None:
         raise RuntimeError("YOLO artifact is missing model/operations metadata")
     if not isinstance(weights, dict) or not isinstance(heads, list):
         raise RuntimeError("YOLO artifact is missing weights/head outputs")
-    if tuple(model.get("input_shape", ())) != (3, 640, 640):
+    if tuple(model.get("input_shape", ())) != (3, 256, 256):
         raise RuntimeError(f"unexpected artifact input shape {model.get('input_shape')}")
     if set(model) != {"name", "upstream_version", "input_shape", "names",
                       "strides", "anchors"}:
@@ -468,7 +489,7 @@ def validate_single_bin(payload: dict) -> None:
             f"{len(operations)}/{len(heads)}/{len(weights)}")
 
     produced = {"input"}
-    shapes = {"input": (3, 640, 640)}
+    shapes = {"input": (3, 256, 256)}
     conv_names = set()
     allowed = {"conv", "maxpool", "upsample2x", "add", "concat"}
     for index, operation in enumerate(operations):
@@ -489,8 +510,12 @@ def validate_single_bin(payload: dict) -> None:
             entry = weights.get(operation.get("name"))
             if not isinstance(entry, dict):
                 raise RuntimeError(f"operation {index} has no convolution weights")
-            if set(entry) != {"codes_packed", "codes_shape", "block_scales", "bias"}:
+            if set(entry) != {
+                    "precision", "layout", "codes_packed", "codes_shape",
+                    "block_scales", "bias"}:
                 raise RuntimeError(f"operation {index} convolution entry has unknown fields")
+            precision = entry.get("precision")
+            layout = entry.get("layout")
             packed = entry.get("codes_packed")
             codes_shape = entry.get("codes_shape")
             scales = entry.get("block_scales")
@@ -498,18 +523,33 @@ def validate_single_bin(payload: dict) -> None:
             if (not isinstance(codes_shape, list) or len(codes_shape) != 4
                     or any(not isinstance(value, int) or value <= 0
                            for value in codes_shape)):
-                raise RuntimeError(f"operation {index} has invalid IF4 code shape")
+                raise RuntimeError(f"operation {index} has invalid code shape")
             code_count = 1
             for value in codes_shape:
                 code_count *= value
-            if (not isinstance(packed, torch.Tensor) or packed.dtype != torch.uint8
-                    or packed.dim() != 1 or packed.numel() != (code_count + 1) // 2):
-                raise RuntimeError(f"operation {index} has invalid IF4 codes")
             oc, channels, kh, kw = codes_shape
             if channels != shapes[inputs[0]][0]:
                 raise RuntimeError(f"operation {index} weight/input channels disagree")
             ct = (channels + 63) // 64
-            expected_scales = (oc, kh * kw * ct)
+            patch_taps = kh * kw * channels
+            gather_blocks = (patch_taps + 63) // 64
+            channel_blocks = kh * kw * ct
+            expected_gather = (channels <= 255 and patch_taps <= 256
+                               and gather_blocks < channel_blocks)
+            expected_precision = "if8" if expected_gather else "if4"
+            expected_layout = "gather" if expected_gather else "channels"
+            if precision != expected_precision or layout != expected_layout:
+                raise RuntimeError(
+                    f"operation {index} uses {layout}/{precision}, expected "
+                    f"{expected_layout}/{expected_precision}")
+            expected_code_bytes = (code_count if precision == "if8"
+                                   else (code_count + 1) // 2)
+            if (not isinstance(packed, torch.Tensor) or packed.dtype != torch.uint8
+                    or packed.dim() != 1
+                    or packed.numel() != expected_code_bytes):
+                raise RuntimeError(f"operation {index} has invalid {precision} codes")
+            expected_scales = (oc, gather_blocks if expected_gather
+                               else channel_blocks)
             if (not isinstance(scales, torch.Tensor)
                     or scales.dtype != torch.bfloat16
                     or tuple(scales.shape) != expected_scales):
@@ -536,11 +576,11 @@ def validate_single_bin(payload: dict) -> None:
     if set(weights) != conv_names:
         raise RuntimeError("YOLO artifact contains missing or unused convolution weights")
     if _weights_sha256(weights) != artifact_spec.weights_sha256:
-        raise RuntimeError("YOLO artifact logical IF4 tensors are not canonical")
+        raise RuntimeError("YOLO artifact logical quantized tensors are not canonical")
     if any(head not in produced for head in heads):
         raise RuntimeError("YOLO artifact head output is not produced by the graph")
     if [shapes[head] for head in heads] != [
-            (255, 80, 80), (255, 40, 40), (255, 20, 20)]:
+            (255, 32, 32), (255, 16, 16), (255, 8, 8)]:
         raise RuntimeError("YOLO artifact detection head shapes are not canonical")
     validate_precompiled_hardware(payload)
     hardware = payload["hardware"]
@@ -577,10 +617,15 @@ def _prepared_convs(payload: dict) -> dict[str, QuantizedConv]:
     result = {}
     for name, entry in payload["weights"].items():
         bias = entry["bias"]
+        data_type = user_dma_core.TYPE[entry["precision"].upper()]
         result[name] = QuantizedConv(
-            codes=_unpack_codes(entry["codes_packed"], entry["codes_shape"]),
+            codes=_unpack_codes(
+                entry["codes_packed"], entry["codes_shape"],
+                entry["precision"]),
             block_scales=entry["block_scales"],
             bias=None if bias.numel() == 0 else bias,
+            data_type=data_type,
+            gather=entry["layout"] == "gather",
         )
     return result
 

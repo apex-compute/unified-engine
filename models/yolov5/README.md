@@ -1,6 +1,6 @@
 # YOLOv5s
 
-This directory contains YOLOv5s v7.0 object detection at a 640 x 640 input
+This directory contains YOLOv5s v7.0 object detection at a 256 x 256 input
 resolution. Convolution, SiLU, SPPF max-pooling, nearest-neighbor upsampling,
 and bottleneck residual additions execute through native engine primitives.
 Image preparation, concatenation, detection decoding, non-maximum suppression,
@@ -17,22 +17,17 @@ YOLOv5 requires a convolution-enabled FPGA image. The repository-shipped
 `update_cf133b89.bin` image is **not compatible** because it does not implement
 the required convolution/max-pool modes and registers.
 
-Both hardware entry points use ordered queue-CONFIG geometry and currently
-accept verified builds `d93eea82` and `9ef15fc1`, plus Python-test-only
-descendant `663de8d5` whose FPGA RTL is identical to `9ef15fc1`. Older
-native-CONV builds support only live geometry CSRs and are not accepted by
-either YOLO runner. No compatible update image is shipped in this repository.
-Do not start hardware inference until the running FPGA reports an appropriate
-verified build. The stale `0x52a71442` comment in the imported driver predates
-the convolution RTL and is not compatible.
+Both hardware entry points use ordered queue-CONFIG geometry. The optimized
+mixed-precision path additionally requires the corrected 512-bit gather-IF8
+scale rewind from Andromeda commit `77e8adf3`; older queue-CONFIG builds
+`d93eea82`, `9ef15fc1`, and `663de8d5` are rejected for this artifact. No
+compatible update image is shipped in this repository. Direct-bin inference
+and the Andromeda hardware suite are validated on RK build `77e8adf3`.
 
-The artifact-v3 compiler, schema/digest checks, no-capture replay guards,
-checkpoint queue-mode selection, and quantized CPU direct run have been
-validated on the host. The canonical `vette.jpg` CPU run detects `car` at
-confidence `0.356716`. Direct artifact hardware replay was validated on RK
-builds `d93eea82` and `9ef15fc1`; the strict poisoned-DRAM run detects `car` at
-confidence `0.355042`. The checkpoint-backed queue path was also validated on
-RK build `9ef15fc1` with the same detection and confidence.
+Artifact-v4 schema/digest checks, no-capture replay guards, checkpoint
+queue-mode selection, and quantized CPU direct execution are host-validated.
+At 256 x 256, the canonical `vette.jpg` quantized CPU run detects `car` at
+about `0.51` confidence (the final low bits can vary with the host BF16 kernel).
 
 ## Model and weights
 
@@ -55,13 +50,16 @@ repository; review the upstream YOLOv5 v7.0 GPL-3.0 terms before redistributing
 it or a derived artifact.
 
 Every Conv+BatchNorm pair is folded, then quantized in the hardware's native
-64-value block layout. IF4 MixMSE chooses INT4 or FP4 independently per
-`(output channel, kernel row, kernel column, 64-channel tile)` block; the sign
-of its BF16 scale selects the codebook in hardware. A single scale for the
-whole layer is not accurate enough for the pretrained detector.
+64-value block layout. Normal channel-layout convolutions use IF4; MixMSE
+chooses INT4 or FP4 independently per `(output channel, kernel row, kernel
+column, 64-channel tile)` block. The small-channel `model.0` stem instead uses
+gather-layout IF8 over flattened `[kernel row, kernel column, channel]` blocks.
+For both widths, the sign of each BF16 scale selects the integer or floating
+codebook in hardware. A single scale for the whole layer is not accurate enough
+for the pretrained detector.
 
 The default confidence and IoU thresholds are `0.25` and `0.45`. The model uses
-the 80 COCO classes and a letterboxed 640 x 640 RGB input.
+the 80 COCO classes and a letterboxed 256 x 256 RGB input.
 
 ## Usage
 
@@ -97,27 +95,27 @@ make yolov5s_bin
 python3 models/yolov5/yolov5_compile.py \
   --output models/yolov5/yolov5_bin/yolov5s-andromeda.bin
 
-# Hardware inference from that artifact. Artifact v3 requires queued-CONFIG
-# build d93eea82 (or a later explicitly verified queue-compatible build).
+# Hardware inference from that artifact. Artifact v4 requires an image built
+# from corrected gather-IF8 commit 77e8adf3.
 python3 models/yolov5/yolov5_run_from_bin.py
 
 # Check the same artifact and graph on the quantized CPU backend, without FPGA.
 python3 models/yolov5/yolov5_run_from_bin.py --cpu
 ```
 
-Artifact metadata contains the verified FPGA build allow-list. After that list
+Artifact metadata contains the required FPGA build allow-list. After that list
 changes, rebuild a cached artifact with `make yolov5s_bin FORCE=1`.
 
 `yolov5s-andromeda.bin` is the only model data file required by the direct
-runner. Artifact format version 3 contains the validated fixed-640 graph,
-nibble-packed IF4 tensors for the CPU fallback, a fixed-address prepacked static
-parameter image, a resident precompiled instruction image with ordered CONFIG
-geometry, per-operation dispatch metadata, section digests, COCO names, anchors,
-strides,
-hardware compatibility metadata, and preprocessing/postprocessing defaults.
-For the canonical build, the static parameter image is `16,548,664` bytes and
-the instruction image is `46,720` bytes containing 72 resident programs and 69
-queue-CONFIG instructions.
+runner. Artifact format version 4 contains the validated fixed-256 graph,
+nibble-packed channel-IF4 and byte-packed gather-IF8 tensors for the CPU
+fallback, a fixed-address prepacked static parameter image, a resident
+precompiled instruction image with ordered CONFIG geometry, per-operation
+dispatch metadata, section digests, COCO names, anchors, strides, hardware
+compatibility metadata, and preprocessing/postprocessing defaults. Rebuild the
+artifact with `make yolov5s_bin FORCE=1` after this resolution/schema change;
+the regenerated image sizes and digests are pinned by the compiler rather than
+carried over from the prior artifact.
 The direct runner does not load or download the official `.pt` checkpoint,
 quantize weights, repack static weights/scales/biases, or capture hardware
 programs.
@@ -136,7 +134,7 @@ The annotated image is written under `yolov5_bin/`. The script also emits one
 machine-readable line for the automated test harness, for example:
 
 ```text
-TEST_RESULT: {"model":"yolov5s","decoded_text":"car","n_detections":1,"precompiled":true,"artifact_version":3,"geometry_abi":"conv-config-inst-v1","detections":[...]}
+TEST_RESULT: {"model":"yolov5s","precompiled":true,"artifact_version":4,"geometry_abi":"conv-config-inst-v1",...}
 ```
 
 To run either path through the repository harness:
@@ -164,12 +162,22 @@ artifacts, and annotated hardware outputs, but deliberately preserves the
 checksum-verified official checkpoint. Use the `run_from_bin` Make modifier when
 testing an already-built artifact so the pre-test clean does not remove it.
 
-The 6x6 stem has folded bias plus fused SiLU, so it cannot use the primitive's
-bias-free gather mode. At 640 x 640 the channels-mode planner stages about
-167 MiB across 17,120 small tiles for that layer. Host-side planning and the
-validated RK replay confirm it fits the configured DRAM arenas. It is the main
-expected throughput bottleneck until gather gains a bias/activation
-epilogue or the driver keeps activations on device across layers.
+## 256 x 256 performance
+
+The gather primitive now retains the normal folded-bias and fused-SiLU
+epilogue, so the 6x6 RGB stem can use gather-IF8 instead of repeatedly padding
+three channels into channel-mode blocks. On corrected RK build `77e8adf3`, one
+smoke run followed by five measured direct-bin runs gave a median FPGA-only time
+of `88.182 ms` (`29,394,144` cycles) and a median execution-wall time of
+`150.113 ms`. The one-time immutable model upload was `16,908,216` bytes in
+exactly two writes, with a `6.454 ms` median. The validated run detects `car` at
+confidence `0.510560`.
+
+FPGA-only time is the corrected sum of queue-start-to-HALT accelerator latency
+counters. Execution-wall time additionally includes host tensor packing,
+dynamic DMA, 72 resident-program dispatches, and host concatenations. Artifact
+loading, preprocessing, decode, NMS, and drawing are outside both timers. The
+model meets the strict sub-100-ms FPGA execution target on one engine.
 
 ## Layout
 

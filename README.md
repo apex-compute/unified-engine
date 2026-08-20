@@ -183,10 +183,10 @@ YOLOv5n has dedicated commands, configuration, cache, and documentation under
 low-level YOLOv5 primitive implementation. Both use native CONV2D/MAXPOOL modes
 and ordered queue-CONFIG geometry from Andromeda's `pcie_conv_maxpool` line.
 The bundled `update_cf133b89.bin` predates those modes; see the model READMEs
-for compatible build hashes before running either model. No compatible update
-image is shipped in this repository. YOLOv5 is therefore opt-in rather than
-part of the default suite; only run it after programming a verified
-queue-CONFIG-capable FPGA image.
+for the required corrected gather-IF8 commit before running either model. No
+compatible update image is shipped in this repository. YOLOv5 is therefore
+opt-in rather than part of the default suite. Both optimized artifacts are
+validated on RK build `77e8adf3`.
 
 Both variants support a single checkpoint-free model artifact:
 
@@ -198,23 +198,34 @@ make yolov5s_bin
 make model_test yolov5s_run_from_bin run_from_bin
 ```
 
-Artifact version 3 is loaded and validated once. It supplies the flattened graph,
-quantized tensors, a fixed-address prepacked parameter image, a resident
-precompiled program image with ordered queue CONFIG geometry, dispatch metadata,
-and runtime defaults. The hardware backend uploads the immutable parameter/program
-images once; inference performs no static-weight repacking, program capture, or
-live geometry-CSR writes. It is still not one hardware launch: graph handoff needs
-multiple host dispatches, while concatenation and detection postprocessing remain
-host-side. See each model README for its direct CLI and artifact contract.
+Artifact version 4 is loaded and validated once. It contains the fixed 256 x
+256 graph, mixed channel-IF4/gather-IF8 tensors, a fixed-address prepacked
+parameter image, a resident precompiled program image with ordered queue CONFIG
+geometry, dispatch metadata, and runtime defaults. The hardware backend uploads
+the immutable parameter/program images once; inference performs no static-weight
+repacking, program capture, or live geometry-CSR writes. It is still not one
+hardware launch: graph handoff needs multiple host dispatches, while
+concatenation and detection postprocessing remain host-side. See each model
+README for its direct CLI and artifact contract.
 
-The YOLOv5s direct v3 artifact is host-validated and FPGA-validated on
-queued-CONFIG builds `d93eea82` and `9ef15fc1`; its strict poisoned-DRAM RK
-test detects the expected car fixture. The checkpoint runner uses the same
-geometry ABI and is FPGA-validated on `9ef15fc1`. The separated YOLOv5n direct
-artifact is also FPGA-validated on `9ef15fc1`; its poisoned-DRAM harness run
-detects four `person` instances in `people.jpg`.
-Older native-convolution images are intentionally rejected because they do not
-implement the queued geometry ABI.
+The optimized artifacts require the corrected 512-bit gather-IF8 scale rewind
+from Andromeda commit `77e8adf3`; older queue-CONFIG builds are intentionally
+rejected for this mixed-precision path. On RK at a 3 ns clock, one smoke run
+followed by five measured direct-bin runs gave these medians:
+
+| Model | Static model upload | Execution wall | FPGA execution only |
+|---|---:|---:|---:|
+| YOLOv5s | 6.454 ms; 16,908,216 B in 2 writes | 150.113 ms | 88.182 ms; 29,394,144 cycles |
+| YOLOv5n | 6.846 ms; 18,262,192 B in 2 writes | 80.887 ms | 36.031 ms; 12,010,352 cycles |
+
+The execution-wall timer covers the image-dependent graph replay, including
+host packing, dynamic DMA, 72 resident-program dispatches, and host
+concatenations. FPGA-only time is the corrected sum of queue-start-to-HALT
+latency counters; it excludes all host work and DMA. Artifact loading,
+preprocessing, decode, NMS, and drawing are outside both execution timers. The
+validated YOLOv5s run detects `car` at confidence `0.510560`; YOLOv5n detects
+seven `person` instances, led by confidence `0.685195`. Both models meet the
+strict sub-100-ms FPGA execution target on one engine.
 
 Run the whole suite (or a subset) with the automated tester:
 

@@ -87,6 +87,7 @@ UE_NATIVE_CONV_HW_VERSIONS = frozenset({
     0xD93EEA82,
     0x9EF15FC1,
     0x663DE8D5,
+    0x77E8ADF3,
 })
 # Builds verified to implement ordered ISA CONFIG subtype 0 for the four
 # CONV2D/MAXPOOL geometry words.  Keep this narrower than the native-conv set:
@@ -95,6 +96,14 @@ UE_QUEUE_CONFIG_HW_VERSIONS = frozenset({
     0xD93EEA82,
     0x9EF15FC1,
     0x663DE8D5,
+    0x77E8ADF3,
+})
+# Builds whose gather datapath has been verified for consecutive 512-bit IF8
+# blocks.  Earlier queue-CONFIG images rewind the scale BRAM one cycle late in
+# this case and can silently select stale scale datatypes, so mixed
+# gather-IF8 artifacts must use this stricter capability set.
+UE_GATHER_IF8_HW_VERSIONS = frozenset({
+    0x77E8ADF3,
 })
 # Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)
 UE_ARGMAX_INDEX = UE_ARGMAX1_INDEX
@@ -713,7 +722,8 @@ class UnifiedEngine:
                  device_name: Optional[str] = None,
                  allow_unknown_conv_hardware: bool = False,
                  conv_geometry_mode: str = CONV_GEOMETRY_LIVE_CSR,
-                 allow_unknown_queue_config_hardware: bool = False):
+                 allow_unknown_queue_config_hardware: bool = False,
+                 allow_unknown_gather_if8_hardware: bool = False):
         self.device = device
         if device_name is not None:
             set_dma_device(device_name)
@@ -769,6 +779,8 @@ class UnifiedEngine:
         self._allow_unknown_conv_hardware = bool(allow_unknown_conv_hardware)
         self._allow_unknown_queue_config_hardware = bool(
             allow_unknown_queue_config_hardware)
+        self._allow_unknown_gather_if8_hardware = bool(
+            allow_unknown_gather_if8_hardware)
 
         self._base_addr = BASE_ADDR
 
@@ -1062,6 +1074,20 @@ class UnifiedEngine:
         if self.conv_geometry_mode == CONV_GEOMETRY_QUEUE_CONFIG:
             self.require_queue_conv_config_hardware()
 
+    def require_gather_if8_hardware(self) -> None:
+        """Reject gather IF8 on builds with the stale scale-rewind timing."""
+        if (self.hw_version in UE_GATHER_IF8_HW_VERSIONS
+                or getattr(self, "_allow_unknown_gather_if8_hardware", False)):
+            return
+        versions = ", ".join(
+            f"0x{version:08x}" for version in sorted(UE_GATHER_IF8_HW_VERSIONS))
+        raise RuntimeError(
+            f"FPGA build 0x{self.hw_version:08x} is not verified for gather IF8 "
+            f"convolution (known builds: {versions}). Older gather RTL rewinds "
+            "the scale address too late on the 512-bit IF8 path. Program a "
+            "verified image, or set allow_unknown_gather_if8_hardware=True "
+            "only after validating the development RTL.")
+
     def write_reg32(self, address: int, value: int):
         """Write 32-bit register using AXI-Lite user interface"""
         self.user_write_reg32(address, value)
@@ -1189,16 +1215,12 @@ class UnifiedEngine:
         try:
             # Convert buffer to bytes
             if isinstance(buffer, torch.Tensor):
-                # Convert tensor to bytes
-                # Handle bfloat16 specially by reinterpreting as uint16 and serializing
-                if buffer.dtype == torch.bfloat16:
-                    buffer_uint16 = buffer.view(torch.uint16).cpu().contiguous()
-                    # Use PyTorch's numpy bridge (no direct numpy dependency/import)
-                    data_bytes = buffer_uint16.numpy().tobytes()[:size]
-                else:
-                    # For other dtypes, serialize contiguous CPU tensor via numpy bridge
-                    tensor_cpu = buffer.cpu().contiguous()
-                    data_bytes = tensor_cpu.numpy().tobytes()[:size]
+                # Present contiguous tensor storage directly to write(2). This
+                # avoids materialising a second, potentially hundreds-of-MiB
+                # Python ``bytes`` object for every activation upload.
+                tensor_bytes = buffer.detach().cpu().contiguous().reshape(-1) \
+                    .view(torch.uint8)
+                data_bytes = memoryview(tensor_bytes.numpy()).cast('B')[:size]
             elif isinstance(buffer, int):
                 # Convert integer to bytes (for register writes)
                 if size == 4:
@@ -1208,7 +1230,7 @@ class UnifiedEngine:
                 else:
                     data_bytes = buffer.to_bytes(size, byteorder='little', signed=False)
             elif isinstance(buffer, (bytes, bytearray)):
-                data_bytes = bytes(buffer[:size])
+                data_bytes = memoryview(buffer)[:size]
             else:
                 # Try to convert to bytes
                 data_bytes = bytes(buffer)[:size]
@@ -1295,36 +1317,31 @@ class UnifiedEngine:
 
                 # Copy data into buffer
                 if isinstance(buffer, torch.Tensor):
-                    # Convert bytes to tensor using struct unpack and view
-                    if buffer.dtype == torch.int32 and size == 4:
-                        # 32-bit register read
-                        # Unpack as signed int32
-                        value = struct.unpack('i', data_bytes[:4])[0]
-                        buffer[0] = value
+                    # DMA is a byte-exact transfer. Copy directly into writable
+                    # contiguous CPU tensor storage rather than expanding every
+                    # uint16 into a Python tuple and constructing another tensor.
+                    # Large YOLO readbacks spend hundreds of milliseconds in
+                    # that tuple conversion despite no numerical conversion
+                    # being required.
+                    if buffer.device.type == 'cpu' and buffer.is_contiguous():
+                        target = memoryview(
+                            buffer.detach().view(torch.uint8).numpy()).cast('B')
+                        take = min(len(data_bytes), len(target), size)
+                        target[:take] = data_bytes[:take]
                     else:
-                        # Regular data read (bf16/uint16)
-                        # Unpack as uint16 (generic type)
-                        num_elements = size // 2
-                        # Use struct.unpack to convert bytes to uint16 values
-                        format_str = f'{num_elements}H'  # 'H' = unsigned short (uint16)
-                        uint16_values = struct.unpack(format_str, data_bytes[:size])
-
-                        # Create tensor from uint16 values
-                        tensor_uint16 = torch.tensor(uint16_values, dtype=torch.uint16, device=buffer.device)
-
-                        # Convert to target dtype using view
-                        if buffer.dtype == torch.bfloat16:
-                            # View uint16 as bfloat16
-                            tensor_data = tensor_uint16.view(torch.bfloat16)
-                        else:
-                            # Use as-is or convert to target dtype
-                            tensor_data = tensor_uint16.to(buffer.dtype)
-
-                        # Copy to buffer
-                        if buffer.numel() >= num_elements:
-                            buffer[:num_elements].copy_(tensor_data[:num_elements])
-                        else:
-                            buffer.copy_(tensor_data[:buffer.numel()])
+                        # ``reshape(-1)`` may allocate for a non-contiguous
+                        # destination, in which case copying into that reshape
+                        # would silently leave ``buffer`` unchanged. Stage the
+                        # raw bytes in a contiguous CPU tensor and copy the
+                        # logical tensor back instead. Initialising from the
+                        # destination also preserves bytes beyond a short read.
+                        staged = buffer.detach().cpu().contiguous()
+                        target = memoryview(
+                            staged.view(torch.uint8).numpy()).cast('B')
+                        take = min(len(data_bytes), len(target), size)
+                        target[:take] = data_bytes[:take]
+                        with torch.no_grad():
+                            buffer.copy_(staged.to(buffer.device))
                 else:
                     # For other buffer types, copy bytes directly
                     if hasattr(buffer, '__setitem__'):
@@ -8691,8 +8708,9 @@ class UnifiedEngine:
         ``chunks = ceil(Kh*Kw*C/64)`` by the bf20 ladder. Pass ``c_in`` (channels,
         <= 255); weights use :func:`conv2d_pack_weight_stream_gather` ([pixel]
         [oc][chunk]) and scales :func:`conv2d_pack_scale_stream_gather` (ONE
-        pixel's oc*chunks blocks — hardware rewinds per pixel). LALU/bias must be
-        BYPASS/off. Requires Kh*Kw*C <= 256 (MAX_CHUNKS=4).
+        pixel's oc*chunks blocks — hardware rewinds per pixel). The scalar
+        result then follows the normal bias-adder/LALU epilogue. Requires
+        Kh*Kw*C <= 256 (MAX_CHUNKS=4).
 
         Args:
             act_sram_start_addr: SRAM byte address of the padded map (URAM_A only)
@@ -8712,6 +8730,8 @@ class UnifiedEngine:
                 pixel-step registers keep the plain stride.
         """
         self.require_conv_geometry_hardware()
+        if gather and data_type == TYPE.IF8:
+            self.require_gather_if8_hardware()
         act_uram_type, act_uram_start_addr = self.sram_address_to_uram_address(act_sram_start_addr)
         assert act_uram_type == URAM_SECTION.URAM_A, \
             "conv activations must live in URAM_A (bank Y); bank Z is reserved for the TQ4 codebook"
@@ -8727,8 +8747,6 @@ class UnifiedEngine:
 
         if gather:
             assert c_in is not None and 0 < c_in <= 0xFF, f"gather requires 0 < c_in <= 255, got {c_in}"
-            assert lalu_mode == LALU_MODE.BYPASS and not bias_enable, \
-                "gather mode is BYPASS-only (no LALU / bias adder) — see doc §9.4"
             patch_taps = kernel_h * kernel_w * c_in
             assert patch_taps <= 256, f"gather Kh*Kw*C={patch_taps} exceeds 256 (MAX_CHUNKS=4)"
             chunks = (patch_taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
@@ -9095,8 +9113,8 @@ class UnifiedEngine:
         per-launch UE_CONV_* geometry registers hold that one shape.
         """
         self.require_conv_geometry_hardware()
-        assert data_type == TYPE.IF4, "layer driver v1 supports IF4 weights"
-        import torch.nn.functional as F
+        assert data_type in (TYPE.IF4, TYPE.IF8), \
+            f"layer driver supports IF4/IF8 weights, got {data_type}"
         C, H, W = x.shape
         OC, wc_c, kernel_h, kernel_w = w_codes.shape
         assert wc_c == C, f"weight C_in {wc_c} != activation C {C}"
@@ -9107,20 +9125,26 @@ class UnifiedEngine:
         lalu_mode, lalu_a, lalu_b = _conv_fused_lalu(relu_enable, silu_enable, gelu_enable)
 
         # Gather mode (small-C, UE_CONV_CTRL[31]): computes the whole im2col
-        # patch as a plain dot -> ~9x utilization on C_in=3/4 stems. Requires
-        # BYPASS (no fused LALU / bias) and Kh*Kw*C <= 256, C <= 255. Auto-engage
-        # when it packs fewer X blocks per pixel than channels mode
-        # (ceil(OC/64)*C < OC*ceil(C/64)); `gather=True/False` forces it.
+        # patch as a plain dot -> ~9x utilization on C_in=3/4 stems. The gather
+        # result rejoins the standard dot epilogue, so per-result bias and the
+        # fused LALU remain available. Requires Kh*Kw*C <= 256 and C <= 255.
+        # Auto-engage
+        # when it packs fewer X blocks per output channel than channels mode;
+        # `gather=True/False` forces it.
         patch_taps = kernel_h * kernel_w * C
         chunks = (patch_taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-        can_gather = (C <= 255 and patch_taps <= 256
-                      and lalu_mode == LALU_MODE.BYPASS and bias is None)
-        beneficial = (-(-OC // UE_VECTOR_SIZE)) * C < OC * ct
+        can_gather = C <= 255 and patch_taps <= 256
+        beneficial = chunks < taps
         use_gather = (can_gather and beneficial) if gather is None else bool(gather)
         if use_gather and not can_gather:
             raise ValueError(
-                f"gather=True unsupported here: need C<=255 (got {C}), Kh*Kw*C<=256 "
-                f"(got {patch_taps}), no bias, no fused LALU")
+                f"gather=True unsupported here: need C<=255 (got {C}) and "
+                f"Kh*Kw*C<=256 (got {patch_taps})")
+        if use_gather and data_type == TYPE.IF8:
+            # Fail before planning, packing, allocation, or any DMA.  The
+            # original gather RTL's scale rewind is one cycle late for
+            # consecutive 512-bit IF8 blocks.
+            self.require_gather_if8_hardware()
 
         scales_per_oc = chunks if use_gather else taps
         if block_scales is not None:
@@ -9146,14 +9170,12 @@ class UnifiedEngine:
             c_in=C, oc_count=OC, in_h=H, in_w=W,
             kernel_h=kernel_h, kernel_w=kernel_w, stride_s=stride_s,
             pad=pad, pad_h=pad_h, dilation=dilation,
-            gather=use_gather, wb_uram_addr=wb_uram_addr)
+            gather=use_gather, bias_enabled=bias is not None,
+            wb_uram_addr=wb_uram_addr)
         n_chunks = -(-OC // oc_chunk)
         assert OC % oc_chunk == 0, (
             "planner must choose a divisor of OC so every descriptor in the "
             "resident program sees one geometry")
-
-        x_padded = F.pad(x.to(torch.bfloat16), (pad, pad, pad_h, pad_h))
-        out = torch.zeros(OC, out_h, out_w, dtype=torch.bfloat16)
 
         # The planner's overlap-clamped grid is UNIFORM: exactly one tile
         # shape, always — so a layer is one geometry and one program.
@@ -9169,10 +9191,9 @@ class UnifiedEngine:
         out_bytes = result_lines * 128
 
         # Stage every tile's window contiguously; ONE bulk DMA.
-        staged = torch.empty(n_tiles * win_lines, UE_VECTOR_SIZE, dtype=torch.bfloat16)
-        for i, (_, _, _, _, y0, x0, _, _) in enumerate(tiles):
-            xs = x_padded[:, y0:y0 + win_h, x0:x0 + win_w]
-            staged[i * win_lines:(i + 1) * win_lines] = conv2d_pack_activation_map(xs, 0)
+        staged = conv2d_pack_activation_tiles(
+            x, tiles, pad=pad, pad_h=pad_h)
+        assert staged.numel() * staged.element_size() == n_tiles * act_bytes
         ACT_BASE = self.allocate_params_dram(n_tiles * act_bytes)
         self.dma_write(DMA_DEVICE_H2C, ACT_BASE, staged, staged.numel() * 2)
         OUT_BASE = self.allocate_tensor_dram(n_chunks * n_tiles * out_bytes)
@@ -9243,13 +9264,8 @@ class UnifiedEngine:
         # tiles rewrite identical values, so scatter order is irrelevant).
         big = self.dma_from_accelerator_memory(
             OUT_BASE, (n_chunks * n_tiles * result_lines * UE_VECTOR_SIZE,))
-        big = big.view(n_chunks, n_tiles, result_lines * UE_VECTOR_SIZE)
-        for ci, oc0 in enumerate(range(0, OC, oc_chunk)):
-            n_oc = min(oc_chunk, OC - oc0)
-            for i, (oy0, ox0, _, _, _, _, _, _) in enumerate(tiles):
-                out[oc0:oc0 + n_oc, oy0:oy0 + th, ox0:ox0 + tw] = \
-                    conv2d_unpack_result(big[ci, i], th, tw, n_oc)
-        return out
+        return conv2d_unpack_tiled_result(
+            big, tiles, out_h, out_w, OC, oc_chunk)
 
     def run_maxpool2d_layer(self, x: torch.Tensor, *, kernel: int, stride_s: int,
                             pad: int, wb_uram_addr: int = 0x300,
@@ -12353,6 +12369,48 @@ def conv2d_pack_activation_map(x: torch.Tensor, pad: int, pad_value: float = 0.0
     return m.reshape(h_pad * w_pad * ct, UE_VECTOR_SIZE).contiguous()
 
 
+def conv2d_pack_activation_tiles(x: torch.Tensor, tiles, pad: int,
+                                 pad_h: Optional[int] = None,
+                                 pad_value: float = 0.0) -> torch.Tensor:
+    """Pack every uniform planner tile without a Python loop per window.
+
+    ``tiles`` uses :func:`plan_conv2d_layer_tiles` tuples. Advanced indexing
+    gathers every padded spatial window in one operation, then the result is
+    laid out as ``[tile][pixel][ct][lane]``. This is byte-identical to calling
+    :func:`conv2d_pack_activation_map` once per tile, including overlap-clamped
+    edge tiles and channel-tail padding.
+    """
+    assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+    assert tiles, "at least one activation tile is required"
+    C, _, _ = x.shape
+    if pad_h is None:
+        pad_h = pad
+    assert pad >= 0 and pad_h >= 0, "padding must be non-negative"
+    win_h, win_w = int(tiles[0][6]), int(tiles[0][7])
+    assert all(int(tile[6]) == win_h and int(tile[7]) == win_w
+               for tile in tiles), "activation tiles must have one window shape"
+
+    x_padded = torch.nn.functional.pad(
+        x.to(torch.bfloat16), (pad, pad, pad_h, pad_h), value=float(pad_value))
+    device = x_padded.device
+    y0 = torch.tensor([int(tile[4]) for tile in tiles],
+                      dtype=torch.long, device=device)
+    x0 = torch.tensor([int(tile[5]) for tile in tiles],
+                      dtype=torch.long, device=device)
+    yi = y0[:, None, None] + torch.arange(win_h, device=device)[None, :, None]
+    xi = x0[:, None, None] + torch.arange(win_w, device=device)[None, None, :]
+    windows = x_padded[:, yi, xi].permute(1, 2, 3, 0)
+
+    ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    if C == ct * UE_VECTOR_SIZE:
+        return windows.reshape(-1, UE_VECTOR_SIZE).contiguous()
+    staged = torch.full(
+        (len(tiles), win_h, win_w, ct * UE_VECTOR_SIZE),
+        float(pad_value), dtype=torch.bfloat16, device=device)
+    staged[..., :C] = windows
+    return staged.reshape(-1, UE_VECTOR_SIZE)
+
+
 def conv2d_pack_weight_stream(w_codes: torch.Tensor, out_h: int, out_w: int,
                               data_type: TYPE) -> torch.Tensor:
     """Pack (OC, C, KH, KW) integer weight codes into the conv X-stream bytes.
@@ -12491,6 +12549,48 @@ def conv2d_unpack_result(flat: torch.Tensor, out_h: int, out_w: int, oc_count: i
     return flat.reshape(-1)[:n].view(out_h, out_w, oc_count).permute(2, 0, 1).contiguous()
 
 
+def conv2d_unpack_tiled_result(flat: torch.Tensor, tiles, out_h: int,
+                               out_w: int, oc_count: int,
+                               oc_chunk: int) -> torch.Tensor:
+    """Scatter all uniform conv tile/chunk results without per-tile copies.
+
+    ``flat`` is the bulk readback for ``[oc_chunk][tile][result_line][lane]``.
+    The planner may overlap-clamp its final row or column; duplicated output
+    pixels are bit-identical, so a vectorized indexed scatter can select either
+    copy while preserving the dense result exactly.
+    """
+    assert tiles, "at least one result tile is required"
+    assert oc_count > 0 and oc_chunk > 0 and oc_count % oc_chunk == 0
+    th, tw = int(tiles[0][2]), int(tiles[0][3])
+    assert all(int(tile[2]) == th and int(tile[3]) == tw for tile in tiles), \
+        "result tiles must have one output shape"
+    n_chunks = oc_count // oc_chunk
+    result_lines = (th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    expected = n_chunks * len(tiles) * result_lines * UE_VECTOR_SIZE
+    assert flat.numel() == expected, \
+        f"tiled result has {flat.numel()} values, expected {expected}"
+
+    big = flat.reshape(n_chunks, len(tiles), result_lines * UE_VECTOR_SIZE)
+    values = big[..., :th * tw * oc_chunk] \
+        .view(n_chunks, len(tiles), th, tw, oc_chunk) \
+        .permute(0, 4, 1, 2, 3)
+    device = flat.device
+    oy0 = torch.tensor([int(tile[0]) for tile in tiles],
+                       dtype=torch.long, device=device)
+    ox0 = torch.tensor([int(tile[1]) for tile in tiles],
+                       dtype=torch.long, device=device)
+    yi = oy0[:, None, None] + torch.arange(th, device=device)[None, :, None]
+    xi = ox0[:, None, None] + torch.arange(tw, device=device)[None, None, :]
+    out = torch.empty(
+        n_chunks, oc_chunk, out_h, out_w, dtype=flat.dtype, device=device)
+    # The planner's only duplicate destinations are overlap-clamped edge
+    # pixels. Every duplicate is computed from the same activation values and
+    # weights and is therefore bit-identical; which identical copy wins is
+    # immaterial. This avoids thousands of small host scatter copies.
+    out[:, :, yi, xi] = values
+    return out.reshape(oc_count, out_h, out_w)
+
+
 def maxpool2d_unpack_result(flat: torch.Tensor, out_h: int, out_w: int,
                             c: int = UE_VECTOR_SIZE) -> torch.Tensor:
     """Reorder the max-pool writeback (one 64-lane line per pooled pixel,
@@ -12517,6 +12617,7 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
                             pad: int, pad_h: Optional[int] = None,
                             dilation: int = 1,
                             gather: bool = False,
+                            bias_enabled: bool = False,
                             act_uram_addr: int = 0x000,
                             wb_uram_addr: int = 0x300):
     """Tile a full conv layer into single-launch chunks.
@@ -12580,6 +12681,7 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
                         pix_col_step, pix_row_step) <= 0xFFF
                 and ((n_oc * gather_chunks <= SCALE_BRAM_ELEMENTS)
                      if gather else (results * taps <= SCALE_BRAM_ELEMENTS))
+                and (not bias_enabled or results <= BIAS_BRAM_ELEMENTS)
                 and win_h * win_w * ct <= wb_uram_addr - act_uram_addr
                 and wb_uram_addr + result_lines <= 4096
                 and results <= 0xFFFF)

@@ -2,7 +2,7 @@
   "model": {
     "name": "YOLOv5n",
     "upstream_version": "v7.0",
-    "input_size": 640,
+    "input_size": 256,
     "num_channels": 3,
     "num_classes": 80,
     "strides": [8, 16, 32],
@@ -11,7 +11,7 @@
       [[30, 61], [62, 45], [59, 119]],
       [[116, 90], [156, 198], [373, 326]]
     ],
-    "precision": "IF4"
+    "precision": "channel IF4 + gather IF8"
   },
   "source": {
     "release_url": "https://github.com/ultralytics/yolov5/releases/tag/v7.0",
@@ -41,12 +41,15 @@
   "hardware": {
     "compatible_fpga_hashes": [
       "1b4d15cf", "5de75aa6", "ba650e20", "08528a43", "dcacd7aa",
-      "f1bcf368", "d93eea82", "9ef15fc1", "663de8d5"
+      "f1bcf368", "d93eea82", "9ef15fc1", "663de8d5", "77e8adf3"
     ],
     "queued_config_fpga_hashes": [
-      "d93eea82", "9ef15fc1", "663de8d5"
+      "d93eea82", "9ef15fc1", "663de8d5", "77e8adf3"
+    ],
+    "gather_if8_fpga_hashes": [
+      "77e8adf3"
     ],
     "incompatible_shipped_fpga_hash": "cf133b89",
-    "compatibility_note": "Both checkpoint-backed YOLO and direct artifact v3 require ordered queued CONFIG opcode 0xC and accept only queued_config_fpga_hashes. compatible_fpga_hashes documents the broader native-CONV driver compatibility set; those older live-CSR-only builds are not accepted by either YOLO hardware runner. The repository-shipped update_cf133b89.bin is incompatible."
+    "compatibility_note": "Optimized checkpoint-backed YOLO and direct artifact v4 require ordered queued CONFIG opcode 0xC plus the corrected 512-bit gather-IF8 scale rewind, and accept only gather_if8_fpga_hashes. queued_config_fpga_hashes and compatible_fpga_hashes document broader legacy driver capabilities. The repository-shipped update_cf133b89.bin is incompatible."
   }
 }

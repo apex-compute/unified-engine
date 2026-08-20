@@ -349,11 +349,13 @@ def _bf16_from_bytes(data: bytes) -> torch.Tensor:
 
 @dataclass
 class QuantizedConv:
-    """One folded convolution in native channels-mode IF4 layout."""
+    """One folded convolution in an Andromeda native quantized layout."""
 
     codes: torch.Tensor
     block_scales: torch.Tensor
     bias: Optional[torch.Tensor]
+    data_type: user_dma_core.TYPE = user_dma_core.TYPE.IF4
+    gather: bool = False
     dequant_weight: Optional[torch.Tensor] = None
 
 
@@ -399,8 +401,89 @@ def quantize_conv_if4(conv: torch.nn.Conv2d,
         codes=codes,
         block_scales=scales,
         bias=None if bias is None else bias.to(torch.bfloat16).contiguous(),
+        data_type=user_dma_core.TYPE.IF4,
+        gather=False,
         dequant_weight=dequant_weight,
     )
+
+
+def quantize_conv_gather_if8(
+        conv: torch.nn.Conv2d,
+        bn: Optional[torch.nn.BatchNorm2d], *,
+        include_dequant: bool = False) -> QuantizedConv:
+    """Fold BN and MixMSE-quantize gather blocks in ``[ky,kx,c]`` order.
+
+    IF8 is intentional for the small-channel gather path: reblocking a whole
+    image patch into only a few 64-value blocks is much more sensitive to IF4
+    error than the normal per-tap channels layout.  The wider codes still cut
+    the padded RGB-stem work by an order of magnitude.
+    """
+    if conv.groups != 1:
+        raise ValueError(f"grouped convolution is unsupported (groups={conv.groups})")
+    weight, bias = fold_conv_bn(conv, bn)
+    oc, channels, kh, kw = weight.shape
+    taps = kh * kw * channels
+    chunks = (taps + user_dma_core.UE_VECTOR_SIZE - 1) // user_dma_core.UE_VECTOR_SIZE
+    if channels > 255 or chunks > 4:
+        raise ValueError(
+            f"gather convolution needs C<=255 and <=4 chunks, got C={channels}, "
+            f"Kh*Kw*C={taps} ({chunks} chunks)")
+
+    flat = weight.permute(0, 2, 3, 1).reshape(oc, taps)
+    padded = torch.zeros(
+        oc, chunks * user_dma_core.UE_VECTOR_SIZE, dtype=torch.float32)
+    padded[:, :taps] = flat
+    data_bytes, scale_bytes = quant_lib.quantize_if8(
+        padded, block_size=user_dma_core.UE_VECTOR_SIZE, int_variant=None)
+    raw = torch.frombuffer(bytearray(data_bytes), dtype=torch.uint8).view(
+        oc, chunks * user_dma_core.UE_VECTOR_SIZE)
+    codes = (raw[:, :taps].view(oc, kh, kw, channels)
+             .permute(0, 3, 1, 2).contiguous())
+    scales = _bf16_from_bytes(scale_bytes).view(oc, chunks).contiguous()
+
+    dequant_weight = None
+    if include_dequant:
+        dequant = quant_lib.dequantize_if8(
+            data_bytes, scale_bytes, oc,
+            chunks * user_dma_core.UE_VECTOR_SIZE,
+            block_size=user_dma_core.UE_VECTOR_SIZE)
+        dequant_weight = (dequant[:, :taps].view(oc, kh, kw, channels)
+                          .permute(0, 3, 1, 2).contiguous())
+
+    return QuantizedConv(
+        codes=codes,
+        block_scales=scales,
+        bias=None if bias is None else bias.to(torch.bfloat16).contiguous(),
+        data_type=user_dma_core.TYPE.IF8,
+        gather=True,
+        dequant_weight=dequant_weight,
+    )
+
+
+def _gather_is_profitable(conv: torch.nn.Conv2d) -> bool:
+    """Whether gather reduces 64-lane blocks for this convolution."""
+    kh, kw = _pair(conv.kernel_size, "kernel_size")
+    channels = int(conv.in_channels)
+    patch_taps = kh * kw * channels
+    if channels > 255 or patch_taps > 256:
+        return False
+    gather_blocks = (patch_taps + user_dma_core.UE_VECTOR_SIZE - 1) // \
+        user_dma_core.UE_VECTOR_SIZE
+    channel_blocks = kh * kw * (
+        (channels + user_dma_core.UE_VECTOR_SIZE - 1)
+        // user_dma_core.UE_VECTOR_SIZE)
+    return gather_blocks < channel_blocks
+
+
+def quantize_conv_for_andromeda(
+        conv: torch.nn.Conv2d,
+        bn: Optional[torch.nn.BatchNorm2d], *,
+        include_dequant: bool = False) -> QuantizedConv:
+    """Choose the fastest accuracy-safe native layout for one YOLO conv."""
+    if _gather_is_profitable(conv):
+        return quantize_conv_gather_if8(
+            conv, bn, include_dequant=include_dequant)
+    return quantize_conv_if4(conv, bn, include_dequant=include_dequant)
 
 
 def dequantize_conv_if4(prepared: QuantizedConv) -> torch.Tensor:
@@ -429,6 +512,33 @@ def dequantize_conv_if4(prepared: QuantizedConv) -> torch.Tensor:
         [:, :channels].contiguous())
 
 
+def dequantize_conv(prepared: QuantizedConv) -> torch.Tensor:
+    """Dequantize either native channels-IF4 or gather-IF8 layout."""
+    if not prepared.gather and prepared.data_type == user_dma_core.TYPE.IF4:
+        return dequantize_conv_if4(prepared)
+    if not prepared.gather or prepared.data_type != user_dma_core.TYPE.IF8:
+        raise ValueError(
+            f"unsupported convolution layout/data type: gather={prepared.gather}, "
+            f"data_type={prepared.data_type}")
+
+    codes = prepared.codes.detach().cpu().to(torch.uint8)
+    oc, channels, kh, kw = codes.shape
+    taps = kh * kw * channels
+    chunks = (taps + user_dma_core.UE_VECTOR_SIZE - 1) // user_dma_core.UE_VECTOR_SIZE
+    flat = codes.permute(0, 2, 3, 1).reshape(oc, taps)
+    padded = torch.zeros(
+        oc, chunks * user_dma_core.UE_VECTOR_SIZE, dtype=torch.uint8)
+    padded[:, :taps] = flat
+    scale_bytes = (prepared.block_scales.detach().cpu().contiguous()
+                   .view(torch.uint8).numpy().tobytes())
+    dequantized = quant_lib.dequantize_if8(
+        padded.numpy().tobytes(), scale_bytes, oc,
+        chunks * user_dma_core.UE_VECTOR_SIZE,
+        block_size=user_dma_core.UE_VECTOR_SIZE)
+    return (dequantized[:, :taps].view(oc, kh, kw, channels)
+            .permute(0, 3, 1, 2).contiguous())
+
+
 def _activation_is_silu(module: torch.nn.Module) -> bool:
     name = type(module).__name__
     if name == "SiLU":
@@ -455,7 +565,8 @@ class TorchBackend:
         if self.quantized:
             prepared = self._quantized.get(id(conv))
             if prepared is None:
-                prepared = quantize_conv_if4(conv, bn, include_dequant=True)
+                prepared = quantize_conv_for_andromeda(
+                    conv, bn, include_dequant=True)
                 self._quantized[id(conv)] = prepared
             return self.conv_prepared(
                 name, x, prepared,
@@ -480,7 +591,7 @@ class TorchBackend:
         if weight is None:
             weight = self._compiled_dequant.get(name)
             if weight is None:
-                weight = dequantize_conv_if4(prepared)
+                weight = dequantize_conv(prepared)
                 self._compiled_dequant[name] = weight
         bias = None if prepared.bias is None else prepared.bias.float()
         y = F.conv2d(
@@ -531,8 +642,9 @@ class AndromedaBackend:
         if hw_version not in known and not allow_unknown_hardware:
             versions = ", ".join(f"0x{v:08x}" for v in sorted(known))
             raise RuntimeError(
-                f"FPGA build 0x{hw_version:08x} is not known to implement native "
-                f"CONV2D/MAXPOOL. Known builds: {versions or '(none)'}. The "
+                f"FPGA build 0x{hw_version:08x} is not known to implement the "
+                f"required optimized CONV2D path. Known builds: "
+                f"{versions or '(none)'}. The "
                 "repository's shipped cf133b89 image predates these opcodes. "
                 "Program a pcie_conv_maxpool build, or pass "
                 "--allow-unknown-hardware only after verifying RTL compatibility.")
@@ -573,7 +685,7 @@ class AndromedaBackend:
                     bn: Optional[torch.nn.BatchNorm2d], *, activate: bool) -> torch.Tensor:
         prepared = self._quantized.get(id(conv))
         if prepared is None:
-            prepared = quantize_conv_if4(conv, bn)
+            prepared = quantize_conv_for_andromeda(conv, bn)
             self._quantized[id(conv)] = prepared
 
         kh, kw = _pair(conv.kernel_size, "kernel_size")
@@ -604,8 +716,8 @@ class AndromedaBackend:
                 block_scales=prepared.block_scales,
                 bias=prepared.bias,
                 silu_enable=activate,
-                data_type=user_dma_core.TYPE.IF4,
-                gather=False,
+                data_type=prepared.data_type,
+                gather=prepared.gather,
                 timeout_s=self.timeout_s),
             cycle_attr="last_conv_cycles",
             instruction_attr="last_conv_inst_bytes")
@@ -757,7 +869,7 @@ class LetterboxInfo:
     pad_top: int
 
 
-def letterbox_image(path: Path, image_size: int = 640) -> tuple[Image.Image, torch.Tensor, LetterboxInfo]:
+def letterbox_image(path: Path, image_size: int = 256) -> tuple[Image.Image, torch.Tensor, LetterboxInfo]:
     """Load RGB, preserve aspect ratio, and pad to a square with value 114."""
     if image_size <= 0 or image_size % 32:
         raise ValueError(f"image_size must be a positive multiple of 32, got {image_size}")
@@ -792,7 +904,7 @@ def _class_names(model: torch.nn.Module) -> list[str]:
 
 
 def decode_yolov5(raw_heads: Sequence[torch.Tensor], model: torch.nn.Module) -> torch.Tensor:
-    """Decode three raw heads into ``(25200, 85)`` xywh/object/class rows."""
+    """Decode three raw heads into dynamic ``(anchors, 85)`` prediction rows."""
     detect = model.model[-1]
     anchors = detect.anchors.detach().cpu().float()
     strides = model.stride.detach().cpu().float()
