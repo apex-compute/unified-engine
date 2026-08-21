@@ -7,6 +7,49 @@ running on the FPGA and paired against a GPU reference on identical episodes.
 GPU reference (step 96) on the identical episode, with 30.2 dB action-chunk agreement,
 gripper cosine 1.000 and 100% sign agreement.
 
+## Quickstart — 5 commands
+
+Everything below is run from the **repo root**. Commands 1-2 are one-time; 3 is the
+single FPGA inference; 4-5 are the closed-loop LIBERO tests.
+
+```bash
+# 1. env: FPGA inference only (no simulator). Skip if the repo env is already active.
+pip install -r models/pi05/pi05_requirements.txt
+
+# 2. env: add the LIBERO simulator (conda env + robosuite/MuJoCo + OSMesa, no sudo).
+#    ONLY needed for commands 4-5. Skip it if you just want command 3.
+bash models/pi05/setup_env.sh && conda activate pi05_libero
+
+# 3. SINGLE INFERENCE on the FPGA -- prints a (10,7) action chunk. ~14.5s.
+#    First run also downloads the checkpoint and exports weights (~13 GB, once).
+python models/pi05/pi05_test.py --engines max
+
+# 4. CLOSED-LOOP episode on the FPGA, under screen (hours -- must survive a dropped
+#    session). Writes a rollout video + per-episode results JSON under models/pi05/data/.
+screen -dmS pi05 bash -c 'MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+  LD_LIBRARY_PATH=$CONDA_PREFIX/lib python models/pi05/utility/libero_eval.py \
+  --backend fpga --task-suite libero_spatial --task-start 0 --tasks 1 --trials 1 \
+  --engines max --dump-actions 2>&1 | tee models/pi05/libero_fpga.log'
+
+# 5. watch it (Ctrl-A D detaches without killing the run)
+screen -r pi05
+```
+
+**Correctness gate.** Command 3 must print finite numbers -- `nan=False inf=False`.
+If it prints NaN, run `--probe-step0`: it diffs every action-expert intermediate
+against a torch reference fed the FPGA's own prefix K/V and prints an SNR per op, so
+the first line that craters names the broken op.
+
+```bash
+python models/pi05/pi05_test.py --engines max --probe-step0
+```
+
+To compare an FPGA episode against the GPU reference on the identical episode, re-run
+command 4 with `--backend torch`, then diff the two action dumps with
+`utility/libero_eval.py --diff-actions` (§4).
+
+---
+
 ### Layout
 
 | path | what |

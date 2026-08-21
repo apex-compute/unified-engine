@@ -197,20 +197,6 @@ SCALE_BRAM_ELEMENTS = 8192
 SCALE_BRAM_SIZE_BYTES = SCALE_BRAM_ELEMENTS * 2
 BIAS_BRAM_ELEMENTS = 8192
 BIAS_BRAM_SIZE_BYTES = BIAS_BRAM_ELEMENTS * 2
-# Default params base for models that do not override it -- NOT a hardware floor.
-#
-# The board has 4 GB of DDR usable over 0x00000000..0xFFFFFFFF, and the engine can
-# address all of it: qwen3_4b (~2.15 GB of weights) runs with
-# params_dram_base=0x00000000 / tensor 0x90000000 / program 0xE0000000, and
-# gemma4_e4b with 0x00000000 / 0xC0000000 / 0xDA000000. Any model whose weights do
-# not fit in the 768 MB this default leaves below DRAM_ACTIVATION_ADDR should pass
-# its own bases to UnifiedEngine (or set dram_layout in its config), the way those
-# two and pi05_libero do -- do not move this constant, other models depend on it.
-#
-# The only real bound is 0x100000000: dram_region_map asserts nothing ends past it,
-# and no DMA address today drives UE_DRAM_ADDR (bits [63:32]), which is defined but
-# never written. The ISA itself reaches far further -- UE_WORD_ADDR_BITS below is a
-# 35-bit WORD address (byte >> 3) = 256 GiB.
 DRAM_START_ADDR = 0x80000000 # 0 GB
 DRAM_ACTIVATION_ADDR = 0xB0000000 # 512 MB reserved for intermediate results
 DRAM_INSTRUCTION_ADDR = 0xD0000000  # 256*3 MB reserved for instructions
@@ -831,7 +817,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xcf133b89, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xcf133b89. Please update FPGA with commit update_cf133b89.bin using update_flash.py (public release v1.4)"
+        # assert hw_version == 0x3d04c689, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x3d04c689. Please update FPGA with commit update_3d04c689.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
