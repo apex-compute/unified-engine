@@ -496,6 +496,8 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
         ue.reset_tensor_dram_addr()
         ue.clear_capture_buffer()
 
+    return speed_mb_per_s
+
 
 def matmat_mul_two_cores_unified_test(
     runtime_list=None,

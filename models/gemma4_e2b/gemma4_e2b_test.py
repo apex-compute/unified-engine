@@ -1324,7 +1324,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         decoder_prog_size = lm_sect.get("decoder_program_size") if lm_sect else None
 
         def _mb(n):
-            return f"{n / (1024 * 1024):.2f} MB" if n is not None else "n/a"
+            return f"{n / (1024 * 1024):.1f} MB" if n is not None else "n/a"
         def _kb(n):
             return f"{n / 1024:.1f} KB" if n is not None else "n/a"
         def _util(gflops):
@@ -1340,10 +1340,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append(f"- **HW version:** {hw_version_str}")
         lines.append(f"- **--dev:** {args.dev}")
         lines.append(f"- **--device:** {args.device}")
-        lines.append(f"- **Clock / frequency:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)")
+        lines.append(f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)")
         lines.append(f"- **Cores (--multi-core):** {cores}")
-        lines.append(f"- **Peak throughput:** {peak_gflops:.2f} GFLOPS "
+        lines.append(f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
                      f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))")
+        dram_read_speed = getattr(self, "_dram_read_speed_mbps", None)
+        if dram_read_speed is not None:
+            lines.append(f"- **DRAM read speed:** {dram_read_speed:.1f} MB/s "
+                         f"({cores}-core aggregate, private regions)")
         lines.append("")
 
         # --- Weights ---------------------------------------------------------
@@ -1379,18 +1383,18 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             lines.append(f"- **Vision kernel:** {vis_kernel}")
             lines.append(f"- **Vision tokens (soft tokens):** {getattr(self, '_vis_num_soft_tokens', 'n/a')}")
             if vis_lat_us is not None:
-                lines.append(f"- **Vision FPGA run time (HW latency):** {vis_lat_us / 1e3:.2f} ms "
-                             f"({vis_lat_us:.0f} us)")
+                lines.append(f"- **Vision FPGA run time (HW latency):** {vis_lat_us / 1e3:.1f} ms "
+                             f"({vis_lat_us:.1f} us)")
             else:
                 lines.append(f"- **Vision FPGA run time (HW latency):** n/a (host vision)")
             if vis_gflops is not None:
-                lines.append(f"- **Vision reported FLOPS:** {vis_gflops:.2f} GFLOPS")
+                lines.append(f"- **Vision reported FLOPS:** {vis_gflops:.1f} GFLOPS")
                 lines.append(f"- **Vision utilization (% peak):** {_util(vis_gflops)}")
             else:
                 lines.append(f"- **Vision reported FLOPS:** n/a (host vision)")
             _vis_e2e = getattr(self, "_vis_e2e_s", None)
             lines.append(f"- **Vision end-to-end (CPU timer):** "
-                         f"{_vis_e2e:.2f} s" if _vis_e2e is not None else
+                         f"{_vis_e2e:.1f} s" if _vis_e2e is not None else
                          "- **Vision end-to-end (CPU timer):** n/a")
             lines.append("")
 
@@ -1403,13 +1407,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append("")
         lines.append(f"- **Prefill seq_len:** {pf_seq if pf_seq is not None else 'n/a'}")
         if pf_lat_us is not None:
-            lines.append(f"- **Prefill FPGA run time (HW latency):** {pf_lat_us / 1e3:.2f} ms "
-                         f"({pf_lat_us:.0f} us)")
+            lines.append(f"- **Prefill FPGA run time (HW latency):** {pf_lat_us / 1e3:.1f} ms "
+                         f"({pf_lat_us:.1f} us)")
         if pf_gflops is not None:
-            lines.append(f"- **Prefill reported FLOPS:** {pf_gflops:.2f} GFLOPS")
+            lines.append(f"- **Prefill reported FLOPS:** {pf_gflops:.1f} GFLOPS")
             lines.append(f"- **Prefill utilization (% peak):** {_util(pf_gflops)}")
         if pf_e2e is not None:
-            lines.append(f"- **Prefill end-to-end (CPU timer):** {pf_e2e:.2f} s")
+            lines.append(f"- **Prefill end-to-end (CPU timer):** {pf_e2e:.1f} s")
         lines.append("")
 
         # --- Decode ----------------------------------------------------------
@@ -1417,6 +1421,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         total_tok = self.seq_len
         peak_toks = getattr(self, "_decode_peak_toks", None)
         avg_toks = getattr(self, "_decode_avg_toks", None)
+        dec_e2e = getattr(self, "_decode_e2e_s", None)
         dec_flop_rate = getattr(self, "_decode_total_flop_rate", None)
         avg_gflops = (dec_flop_rate / gen_n) if (dec_flop_rate is not None and gen_n) else None
         lines.append(f"## Decode")
@@ -1424,12 +1429,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append(f"- **Decoded tokens:** {gen_n if gen_n is not None else 'n/a'} generated "
                      f"(sequence total {total_tok})")
         if peak_toks is not None:
-            lines.append(f"- **First-token speed (peak):** {peak_toks:.2f} tok/s")
-        if avg_toks is not None:
-            lines.append(f"- **Average speed:** {avg_toks:.2f} tok/s")
+            lines.append(f"- **First-token speed (peak):** {peak_toks:.1f} tok/s")
         if avg_gflops is not None:
-            lines.append(f"- **Average FLOPS:** {avg_gflops:.2f} GFLOPS")
+            lines.append(f"- **Average FLOPS:** {avg_gflops:.1f} GFLOPS")
             lines.append(f"- **Decode utilization (% peak):** {_util(avg_gflops)}")
+        if dec_e2e is not None:
+            lines.append(f"- **Decode end-to-end (CPU timer):** {dec_e2e:.1f} s")
+        if avg_toks is not None:
+            lines.append(f"- **Decode average speed (CPU timer):** {avg_toks:.1f} tok/s")
         lines.append("")
 
         # --- Text ------------------------------------------------------------
@@ -1815,7 +1822,19 @@ def main():
     # kernels out of the name.
     _summary_name = run_summary_filename(args)
     engine_kwargs = resolve_engine_config(parser, args)
+
+    # Measure aggregate accelerator-side DRAM reads before model allocation.
+    # The same flag-synchronized benchmark supports one engine and the exact
+    # engine count selected by --multi-core. Keep private-region mode aligned
+    # with the benchmark's default; user_hw_test.py separately exercises its
+    # shared-address stress variant.
+    from user_hw_test import matmat_mul_multi_engine_flag_check_test
+    print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
+    dram_read_speed_mbps = matmat_mul_multi_engine_flag_check_test(
+        M=4096, K=4096, N=4096, num_engines=args.multi_core)
+
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
+    ue._dram_read_speed_mbps = dram_read_speed_mbps
 
     # Prompt first — the prefill program is compiled for its exact length.
     # VLM mode (--image): run the vision encoder on the FPGA now (separate bin

@@ -10,76 +10,56 @@ Commands:
 
 ```bash
 python models/gemma4_e2b/gemma4_e2b_test.py --device rk_256 --dev xdma0 --image
+
 python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --profile
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core 2
 python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 2
 python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 4
 python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 8
+
+python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core --profile
 ```
 
 ## Performance comparison
-> `--device alveo` with HW version `0x5affec20`
-> `--dev xdma1` (kintex7) with HW version `0x3d04c689`
+> `--device alveo` with HW version `0x3d04c689`
+> `--dev xdma1` (kintex7) with HW version `0x6ee171b8`
 > `--device rk_256` with HW version `0x3d04c689`
 
-| Metric | Kintex | Kintex 2-core | rk | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
+| Metric | Kintex | Kintex 2-core | rk_256 | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Peak throughput | 25.39 GFLOPS | 50.77 GFLOPS | 42.67 GFLOPS | 46.93 GFLOPS | 93.87 GFLOPS | 187.73 GFLOPS | 375.47 GFLOPS |
-| Vision FPGA execution | 53.78 s | 27.74 s | 32.05 s | **29.12 s** | **15.36 s** | **8.09 s** | **4.96 s** |
-| Vision end-to-end path | 53.81 s | 27.81 s | 32.62 s | **29.16 s** | **15.42 s** | **8.16 s** | **5.06 s** |
-| Vision throughput | 21.37 GFLOPS | 41.42 GFLOPS | 35.85 GFLOPS | **39.46 GFLOPS** | **74.79 GFLOPS** | **142.05 GFLOPS** | **231.68 GFLOPS** |
-| — utilization (% peak) | 84.2% | 81.6% | 84.0% | **84.1%** | **79.7%** | **75.7%** | **61.7%** |
+| Peak throughput (GFLOPS) | 25.4 | 50.8 | 42.7 | 46.9 | 93.9 | 187.7 | 375.5 |
+| DRAM read speed (MB/s) | 5875.9 | 6884.3 | 9272.2 | **10484.2** | **11271.0** | **15132.2** | **22940.2** |
+| **Vision** |
 | Vision soft tokens | 256 | 256 | 256 | 256 | 256 | 256 | 256 |
-| LM prefill sequence executed | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens | 272 actual tokens |
-| LM prefill FPGA latency | 43.95 s | 23.46 s | 28.02 s | **24.92 s** | **12.87 s** | **6.94 s** | **4.02 s** |
-| LM prefill throughput | 24.08 GFLOPS | 45.12 GFLOPS | 37.78 GFLOPS | **42.49 GFLOPS** | **82.24 GFLOPS** | **152.56 GFLOPS** | **263.54 GFLOPS** |
-| — utilization (% peak) | 94.9% | 88.9% | 88.5% | **90.5%** | **87.6%** | **81.3%** | **70.2%** |
-| Decode average throughput | 3.78 tok/s | 3.76 tok/s | 5.85 tok/s | **6.52 tok/s** | **6.55 tok/s** | **6.56 tok/s** | **6.59 tok/s** |
-| Decode peak first-token throughput | 3.99 tok/s | 4.00 tok/s | 6.21 tok/s | **6.90 tok/s** | **6.90 tok/s** | **6.88 tok/s** | **6.86 tok/s** |
-| Decode average hardware throughput | 23.06 GFLOPS | 22.95 GFLOPS | 36.47 GFLOPS | **40.77 GFLOPS** | **40.57 GFLOPS** | **40.57 GFLOPS** | **40.57 GFLOPS** |
+| Vision throughput (GFLOPS) | 21.4 | 41.4 | 35.9 | **39.5** | **74.3** | **142.0** | **231.9** |
+| — utilization (% peak) | 84.2% | 81.6% | 84.0% | **84.1%** | **79.1%** | **75.7%** | **61.8%** |
+| Vision FPGA execution (s)| 53.8 | 27.7 | 32.1 | **29.1** | **15.5** | **8.1** | **5.0** |
+| Vision end-to-end (CPU)(s) | 53.8 | 27.8 | 32.1 | **29.2** | **15.5** | **8.2** | **5.1** |
+| **LM PREFILL** |
+| LM prefill seq length | 272 | 272 | 272 | 272 | 272 | 272 | 272 |
+| LM prefill throughput (GFLOPS) | 24.1 | 45.1 | 37.8 | **42.5** | **82.2** | **152.6** | **263.6** |
+| — utilization (% peak) | 94.9% | 88.9% | 88.6% | **90.5%** | **87.6%** | **81.3%** | **70.2%** |
+| Prefill FPGA execution (s)| 44.0 | 23.5 | 28.0 | **24.9** | **12.9** | **6.9** | **4.0** |
+| Prefill end-to-end (CPU)(s) | 44.1 | 23.6 | 28.1 | **25.0** | **13.0** | **7.1** | **4.2** |
+| **LM DECODE** |
+| Decode 1-st tok throughput (tok/s)| 3.9 | 3.9 | 6.2 | **6.8** | **6.7** | **6.9** | **6.7** |
+| Decode average throughput (GFLOPS) | 23.1 | 22.9 | 36.5 | **40.8** | **40.6** | **40.6** | **40.6** |
 | — utilization (% peak) | 90.8% | 45.2% | 85.5% | **86.9%** | **43.2%** | **21.6%** | **10.8%** |
-| Vision program section | 3.22 MiB | 2.39 MiB | 3.22 MiB | 3.22 MiB | 2.39 MiB | 1.90 MiB | 1.75 MiB |
-| Prefill program section | 5.85 MiB | 4.77 MiB | 5.85 MiB | 5.85 MiB | 4.77 MiB | 4.06 MiB | 3.72 MiB |
-| Decode program section | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB | 1.42 MiB |
-| Combined program image | 10.49 MiB | 13.73 MiB | 10.49 MiB | 10.49 MiB | 13.73 MiB | 19.20 MiB | 30.40 MiB |
-| Weight image (`params.bin`) | 6.91 GiB | same | same | same | same | same | same |
+| Decode end-to-end (CPU)(s) | 104.5 | 116.1 | 66.6 | **60.2** | **68.0** | **67.8** | **67.3** |
+| Decode average throughput (CPU)(tok/s)| 3.7 | 3.7 | 5.8 | **6.4** | **6.3** | **6.3** | **6.3** |
+| **ARTIFACT** |
+| Vision program section (MiB) | 3.2 | 2.4 | 3.2 | 3.2 | 2.4 | 1.9 | 1.8 |
+| Prefill program section (MiB)| 5.8 | 4.8 | 5.8 | 5.8 | 4.8 | 4.1 | 3.7 |
+| Decode program section (MiB)| 1.4 | 1.4 | 1.4 | 1.4 | 1.4 | 1.4 | 1.4 |
+| Combined program image (MiB)| 10.5 | 13.7 | 10.5 | 10.5 | 13.7 | 19.2 | 30.4 |
+| Weight image (`params.bin`) (GiB) | 6.9 | same | same | same | same | same | same |
 | Correctness | coherent, total 656 | coherent, total 699 | coherent, total 656 | coherent, total 656 | coherent, total 699 | coherent, total 699 | coherent, total 699 |
-
-## Refactor optimizations
-
-- Split the control path into dedicated vision, LM, and audio modules with a
-  small unified-engine orchestrator. Weight initialization, tensor
-  initialization, compile, and run phases now have explicit ownership.
-- Capture patch embedding and all 16 vision layers as one straight-line FPGA
-  program. This removes per-layer host dispatch and shrinks the vision ISA by
-  15.3%.
-- Execute prefill at the actual aligned request length instead of performing
-  all compute over the legacy 512-token template. For this 272-token request,
-  that is the primary source of the 2.18x prefill speedup.
-- Move per-layer input preparation to compact host-backed/memory-mapped data
-  and upload only the rows needed by the active request.
-- Use streaming prefill and decode kernels with dynamic PBI dimensions and
-  inline unified attention call chains.
-- Replace the older vision permutation staging path with direct
-  `bf16_permute_dram_core` operation and keep generated vision constants in
-  stable parameter memory.
-- Store named vision and LM sections in a combined manifest so an unchanged
-  section can be reused independently. The LM section is reduced despite a
-  slightly larger decoder section.
-- Compact the LM KV cache to 15 unique shared slots. The refactor reports 18
-  MiB for K+V and 313 MiB total tensor DRAM use.
-- Memory-map the 4.38 GiB per-layer host embedding table instead of eagerly
-  materializing it. The complete shared weight image remains 6.91 GiB.
-- Add checkpointed profile images for vision, prefill, and decode without
-  changing the normal execution image.
 
 ## Profile backup: vision encoder (kintex7)
 
-Vision multi-core segments tile cleanly (they sum to the single-shot master total),
-so the per-phase `--multi-core 2` numbers are exact.
+Vision multi-core segments tile cleanly (they sum to the single-shot master total)
 
 | Phase | Single-core | --multi-core 2 |
 |---|---:|---:|
