@@ -1176,8 +1176,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 self._prefill_shard_m_regs = None
 
             decoder_count_at_start = self.capture_count
+            decoder_accounting_seq_len = (
+                (len(self.prefill_seq) + 63) // 64) * 64
             _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
-                layer_size=layer_size, profile=profile)
+                layer_size=layer_size, profile=profile,
+                accounting_seq_len=decoder_accounting_seq_len)
             decoder_program_addr = instruction_base_addr + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
             decoder_size_bytes = decoder_program_sizes[0]
 
@@ -1203,6 +1206,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_size_bytes,
             "decoder_total_flops": decoder_total_flops[0],
+            "decoder_non_attention_flops": self._decoder_non_attention_flops,
+            "decoder_accounting_seq_len": decoder_accounting_seq_len,
             "layer_size": layer_size,
             "prefill_kernel": self.prefill_kernel,
             "multi_core": self.multi_core,
@@ -1252,6 +1257,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         base_addr = meta["_dram_base_int"]
         prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
+        if "decoder_non_attention_flops" in meta:
+            self._decoder_non_attention_flops = int(
+                meta["decoder_non_attention_flops"])
         self._preamble_addr = self.get_program_dram_addr()
         print(f"[run] loaded LM section at 0x{base_addr:X} ({meta['prefill_program_size']/1024:.1f} + "
               f"{meta['decoder_program_size']/1024:.1f} KB); dispatch preamble @ 0x{self._preamble_addr:X}")
@@ -1464,11 +1472,122 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             f.write("\n".join(lines))
         return out_path
 
+    def write_profile_summary(self, out_path: str, args) -> str:
+        """Write run metadata followed only by Vision/Prefill/Decode profiles."""
+        clock_ns = self._clock_period_ns
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        cores = self.multi_core
+        peak_gflops = self._profile_peak_gflops()
+        try:
+            hw_version = self.user_read_reg32(
+                user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF
+            hw_version_str = f"0x{hw_version:08x}"
+        except Exception as e:
+            hw_version_str = f"(read failed: {e})"
+
+        weight_bin_path = os.path.join(self.script_dir, self._weights_bin_rel)
+        weight_bin_size = (os.path.getsize(weight_bin_path)
+                           if os.path.exists(weight_bin_path) else 0)
+        total_weight_dram_mb = getattr(
+            self, "_lm_weight_dram_bytes", self.get_params_dram_usage()) / (1024 * 1024)
+        sections, _ = self._read_program_sections(profile=True)
+        prog_bin_path, _ = self._program_image_paths(profile=True)
+        prog_bin_size = (os.path.getsize(prog_bin_path)
+                         if os.path.exists(prog_bin_path) else 0)
+        vision_sect = sections.get("vision")
+        lm_sect = sections.get("lm") or {}
+
+        def _mb(n):
+            return f"{n / (1024 * 1024):.1f} MB" if n is not None else "n/a"
+        def _kb(n):
+            return f"{n / 1024:.1f} KB" if n is not None else "n/a"
+
+        lines = [
+            "# gemma4_e2b_test profile summary",
+            "",
+            f"- **HW version:** {hw_version_str}",
+            f"- **--dev:** {args.dev}",
+            f"- **--device:** {args.device}",
+            f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)",
+            f"- **Cores (--multi-core):** {cores}",
+            f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
+            f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))",
+        ]
+        dram_read_speed = getattr(self, "_dram_read_speed_mbps", None)
+        if dram_read_speed is not None:
+            lines.append(f"- **DRAM read speed:** {dram_read_speed:.1f} MB/s "
+                         f"({cores}-core aggregate, private regions)")
+        lines.extend([
+            "",
+            "## Weights",
+            "",
+            f"- **Weight bin:** `{os.path.basename(weight_bin_path)}` — {_mb(weight_bin_size)}",
+            f"- **Total weight DRAM (quantized, on FPGA):** {total_weight_dram_mb:.1f} MB",
+            "",
+            f"## Program image (`{os.path.basename(prog_bin_path)}`)",
+            "",
+            f"- **Total programs.bin size:** {_mb(prog_bin_size)}",
+        ])
+        if getattr(args, "image", None):
+            lines.append(f"- **Vision section:** "
+                         f"{_mb(vision_sect['size'] if vision_sect else None)}")
+        lines.extend([
+            f"- **Prefill program:** {_kb(lm_sect.get('prefill_program_size'))}",
+            f"- **Decoder program:** {_kb(lm_sect.get('decoder_program_size'))}",
+            "",
+        ])
+
+        def _append_profile_section(title: str, results, level: int = 2) -> None:
+            lines.extend([f"{'#' * level} {title}", ""])
+            if not results:
+                lines.extend(["Profile data unavailable.", ""])
+                return
+            rows = self._aggregate_profile_results(results)
+            lines.extend([
+                "| Phase | Work (GFLOPs) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) | Samples |",
+                "|---|---:|---:|---:|---:|---:|",
+            ])
+            for row in rows:
+                work_gflops = (f"{row['flops'] / 1e9:.2f}"
+                               if row["flops"] is not None else "n/a")
+                gflops = f"{row['gflops']:.1f}" if row["gflops"] is not None else "n/a"
+                util = f"{row['util_pct']:.1f}%" if row["util_pct"] is not None else "n/a"
+                lines.append(f"| {row['phase']} | {work_gflops} | {row['ms']:.1f} | "
+                             f"{gflops} | {util} | {row['n']} |")
+            total_ms = sum(row["ms"] for row in rows)
+            known_flops = [row["flops"] for row in rows if row["flops"] is not None]
+            total_flops = sum(known_flops) if len(known_flops) == len(rows) else None
+            total_rate = (total_flops / (total_ms * 1e6)
+                          if total_flops is not None and total_ms else None)
+            total_util = (100.0 * total_rate / peak_gflops
+                          if total_rate is not None and peak_gflops else None)
+            lines.append(
+                f"| **TOTAL** | **{f'{total_flops / 1e9:.1f}' if total_flops is not None else 'n/a'}** | "
+                f"**{total_ms:.1f}** | **{f'{total_rate:.1f}' if total_rate is not None else 'n/a'}** | "
+                f"**{f'{total_util:.1f}%' if total_util is not None else 'n/a'}** | |")
+            lines.append("")
+
+        _append_profile_section("Vision", getattr(self, "_vision_profile_results", None))
+        _append_profile_section("Prefill", getattr(self, "_prefill_profile_results", None))
+        lines.extend(["## Decode", ""])
+        first_pos = getattr(self, "_decode_first_profile_position", "n/a")
+        _append_profile_section(
+            f"First decode step (position {first_pos})",
+            getattr(self, "_decode_profile_results", None), level=3)
+        target_pos = getattr(self, "_decode_1024_profile_position", 1023)
+        _append_profile_section(
+            f"1024th token (position {target_pos})",
+            getattr(self, "_decode_1024_profile_results", None), level=3)
+
+        with open(out_path, "w") as f:
+            f.write("\n".join(lines))
+        return out_path
+
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
                          checkpoints: list, tail_name: str, timeout: float = 120.0,
                          worker_scheduler=None, worker_addrs=None) -> list:
-        """Run a checkpointed program segment-by-segment, returning [(name, ms)]
-        HW latency per segment. A preamble at self._preamble_addr primes each
+        """Run checkpointed segments, returning ``(name, ms, FLOPs)`` samples.
+        A preamble at self._preamble_addr primes each
         (reg, value) in ``gpr_sets`` then jumps into ``target_addr``; each
         checkpoint HALT stops the FPGA so the per-segment latency counter can be
         read before resuming from the recorded address. The final ``tail_name``
@@ -1493,15 +1612,29 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
         results = []
         if worker_scheduler is not None:
-            worker_scheduler.preclear_flags()
+            # run_prefill() already preclears every engine after loading the
+            # worker programs.  Do not preclear again here: that redundant
+            # core-0 program corrupts the first segmented latency sample.
             worker_scheduler.start_workers(worker_addrs or [])
         self.start_execute_from_dram(self._preamble_addr)
-        for name, resume_hex in checkpoints:
+        for checkpoint in checkpoints:
+            name, resume_hex, *extra = checkpoint
+            phase_flops = int(extra[0]) if extra else None
             self.wait_queue(timeout)
-            results.append((name, self.report_latency_in_us() / 1e3))   # ms
+            measured_ms = self.report_latency_in_us() / 1e3
+            results.append((name, measured_ms,
+                            phase_flops))   # ms, FLOPs
             self.start_execute_from_dram(int(resume_hex, 16))
         self.wait_queue(timeout)   # tail segment: everything up to the terminal HALT
-        results.append((tail_name, self.report_latency_in_us() / 1e3))
+        tail_ms = self.report_latency_in_us() / 1e3
+        if results:
+            # The terminal segment is a coverage boundary, not a useful report
+            # row. Fold prefill's HALT into inject and decode's position
+            # increment/HALT into lm_head.
+            prev_name, prev_ms, prev_flops = results[-1]
+            results[-1] = (prev_name, prev_ms + tail_ms, prev_flops)
+        else:
+            results.append((tail_name, tail_ms, 0))
         for worker in (worker_scheduler.workers if worker_scheduler is not None else []):
             worker.wait_queue(timeout)
         return results
@@ -1511,36 +1644,97 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         """One decode step through the profile-bin's HALT checkpoints. Preamble
         primes gpr_seq_len (=decode_pos) / gpr_aligned_seq_len; the tail segment
         is the add_inc(gpr_seq_len) + terminal HALT."""
-        return self._profile_execute(
+        results = self._profile_execute(
             [(self.gpr_seq_len, self.seq_len - 1),
              (self.gpr_aligned_seq_len, aligned_seq_len)],
             decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout)
+        # The decoder program is captured with MAX_CONTEXT_SIZE as its template
+        # aligned length, so compile-time attention FLOPs describe that maximum.
+        # Replace only attention FLOPs with the exact live-length formula used by
+        # unified_attention_core_dynamic: Q scale + QK (incl. bias/softmax) + PV.
+        adjusted = []
+        import re
+        for name, ms, flops in results:
+            match = re.fullmatch(r"L(\d+)_attention", name)
+            if match:
+                layer_idx = int(match.group(1))
+                head_dim, _, _ = self._get_layer_attention_dims(layer_idx)
+                batch = self.group_size
+                flops = (batch * head_dim
+                         + batch * aligned_seq_len * (4 * head_dim + 6))
+            adjusted.append((name, ms, flops))
+        return adjusted
 
     def _print_phase_breakdown(self, title: str, results: list, per_token: bool) -> None:
-        """Aggregate per-layer checkpoints ("L<idx>_<phase>") into phase totals
-        and print a table. ``per_token`` adds a decode throughput line."""
+        """Print aggregated phase latency, FLOPs, throughput, and utilization."""
+        rows = self._aggregate_profile_results(results)
+        total_ms = sum(row["ms"] for row in rows)
+        all_flops_known = all(row["flops"] is not None for row in rows)
+        total_flops = (sum(row["flops"] for row in rows)
+                       if all_flops_known else None)
+        print(f"\n=== {title} per-phase FPGA profile ===")
+        print(f"{'phase':<16}{'work GFLOPs':>14}{'total ms':>11}{'n':>5}"
+              f"{'GFLOPS':>11}{'% peak':>9}")
+        print("-" * 66)
+        for row in rows:
+            flops_s = (f"{row['flops'] / 1e9:.2f}"
+                       if row["flops"] is not None else "n/a")
+            gflops_s = (f"{row['gflops']:.1f}" if row["gflops"] is not None else "n/a")
+            util_s = (f"{row['util_pct']:.1f}%" if row["util_pct"] is not None else "n/a")
+            print(f"{row['phase']:<16}{flops_s:>14}{row['ms']:>11.1f}{row['n']:>5}"
+                  f"{gflops_s:>11}{util_s:>9}")
+        print("-" * 66)
+        total_gflops = (total_flops / (total_ms * 1e6)
+                        if total_flops is not None and total_ms else None)
+        peak = self._profile_peak_gflops()
+        total_util = (100.0 * total_gflops / peak
+                      if total_gflops is not None and peak else None)
+        total_flops_s = (f"{total_flops / 1e9:.2f}"
+                         if total_flops is not None else "n/a")
+        total_gflops_s = f"{total_gflops:.1f}" if total_gflops is not None else "n/a"
+        total_util_s = f"{total_util:.1f}%" if total_util is not None else "n/a"
+        print(f"{'TOTAL':<16}{total_flops_s:>14}{total_ms:>11.1f}{'':>5}"
+              f"{total_gflops_s:>11}{total_util_s:>9}")
+        if per_token and total_ms:
+            print(f"Decode HW throughput: {1000.0/total_ms:.1f} tok/s ({total_ms:.1f} ms/token)")
+
+    def _profile_peak_gflops(self) -> float:
+        clock_ns = self._clock_period_ns
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        return freq_mhz * 0.128 * self.multi_core
+
+    def _aggregate_profile_results(self, results: list) -> list[dict]:
+        """Aggregate ``L<idx>_<phase>`` samples while preserving phase order."""
         import re
-        from collections import defaultdict
-        phase_ms: dict = defaultdict(float)
-        phase_n: dict = defaultdict(int)
-        for name, ms in results:
+        phases = {}
+        for result in results:
+            name, ms, *extra = result
+            flops = extra[0] if extra else None
             m = re.match(r"L\d+_(.+)", name)
             phase = m.group(1) if m else name
-            phase_ms[phase] += ms
-            phase_n[phase] += 1
-        total_ms = sum(phase_ms.values())
-
-        print(f"\n=== {title} per-phase HW latency ===")
-        print(f"{'phase':<16}{'total ms':>10}{'%':>7}{'n':>5}{'ms/layer':>10}")
-        print("-" * 48)
-        for phase, ms in sorted(phase_ms.items(), key=lambda kv: -kv[1]):
-            n = phase_n[phase]
-            pct = ms / total_ms * 100 if total_ms else 0.0
-            print(f"{phase:<16}{ms:>10.3f}{pct:>6.1f}%{n:>5}{ms/n:>10.4f}")
-        print("-" * 48)
-        print(f"{'TOTAL':<16}{total_ms:>10.3f}{100.0:>6.1f}%")
-        if per_token and total_ms:
-            print(f"Decode HW throughput: {1000.0/total_ms:.2f} tok/s ({total_ms:.1f} ms/token)")
+            row = phases.setdefault(phase, {"phase": phase, "ms": 0.0,
+                                             "flops": 0, "n": 0,
+                                             "flops_known": True})
+            row["ms"] += float(ms)
+            row["n"] += 1
+            if flops is None:
+                row["flops_known"] = False
+            else:
+                row["flops"] += int(flops)
+        peak = self._profile_peak_gflops()
+        rows = []
+        for row in phases.values():
+            if not row.pop("flops_known"):
+                row["flops"] = None
+            row["gflops"] = (row["flops"] / (row["ms"] * 1e6)
+                              if row["flops"] is not None and row["ms"] else None)
+            phase_peak = peak
+            if row["phase"] == "per_layer_prepare" and self.multi_core > 1:
+                phase_peak = peak / self.multi_core
+            row["util_pct"] = (100.0 * row["gflops"] / phase_peak
+                                if row["gflops"] is not None and phase_peak else None)
+            rows.append(row)
+        return rows
 
     def run_gemma4_profile(self) -> None:
         """Load the profile image (programs_profile.bin, built with per-phase
@@ -1566,34 +1760,60 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         prefill_results = self.run_prefill(
             prefill_program_addr, flops=meta["prefill_total_flops"],
             profile_checkpoints=prefill_checkpoints)
+        self._prefill_profile_results = prefill_results
         self._print_phase_breakdown("PREFILL", prefill_results, per_token=False)
 
-        # Host prep for ONE decode step (mirrors run_decoder's per-step work).
+        # Host prep for a decode position (mirrors run_decoder's per-step work).
         token_id = self.prefill_seq[-1]
         self.dma_to_accelerator_memory(
             self.PENALTY_BIAS_DRAM,
             torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
-        self.seq_len += 1
-        aligned_seq_len = ((self.seq_len + 63) // 64) * 64
         emb = self.get_embedding_for_tokens([token_id])
-        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, emb)
         pli_embed = self._lookup_per_layer_embeddings([token_id])
-        self.dma_to_accelerator_memory(
-            self.PER_LAYER_EMBED_DRAM,
-            pli_embed)
-        full_bias = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
-        full_bias[:, :self.seq_len] = 0.0
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, full_bias)
-        if self.seq_len <= self.sliding_window:
-            sliding_bias = full_bias
-        else:
-            sliding_bias = torch.full((self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
-            sliding_bias[:, self.seq_len - self.sliding_window:self.seq_len] = 0.0
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias)
 
-        print(f"\n--- Profiling one decode step (pos {self.seq_len - 1}) ---", flush=True)
-        decode_results = self._decode_profile_execute(decoder_program_addr, aligned_seq_len, decoder_checkpoints)
-        self._print_phase_breakdown("DECODE (1 token)", decode_results, per_token=True)
+        def _prepare_decode_position(context_len: int) -> int:
+            self.seq_len = context_len
+            aligned = ((context_len + 63) // 64) * 64
+            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, emb)
+            self.dma_to_accelerator_memory(self.PER_LAYER_EMBED_DRAM, pli_embed)
+            full_bias = torch.full(
+                (self.group_size, aligned), -1e36, dtype=torch.bfloat16)
+            full_bias[:, :context_len] = 0.0
+            self.dma_to_accelerator_memory(
+                self.LAYER0_FLASH_BIAS_FULL_DRAM, full_bias)
+            if context_len <= self.sliding_window:
+                sliding_bias = full_bias
+            else:
+                sliding_bias = torch.full(
+                    (self.group_size, aligned), -1e36, dtype=torch.bfloat16)
+                sliding_bias[:, context_len - self.sliding_window:context_len] = 0.0
+            self.dma_to_accelerator_memory(
+                self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias)
+            return aligned
+
+        # First decode step immediately following the real prefill.
+        first_context_len = self.seq_len + 1
+        aligned_seq_len = _prepare_decode_position(first_context_len)
+        self._decode_first_profile_position = first_context_len - 1
+        print(f"\n--- Profiling first decode step (pos {first_context_len - 1}) ---",
+              flush=True)
+        decode_results = self._decode_profile_execute(
+            decoder_program_addr, aligned_seq_len, decoder_checkpoints)
+        self._decode_profile_results = decode_results
+        self._print_phase_breakdown("DECODE (first step)", decode_results, per_token=True)
+
+        # Performance-only 1024th-token profile. Intermediate KV rows are left
+        # as initialized/prefill data; values do not affect the execution path.
+        target_context_len = 1024
+        aligned_seq_len = _prepare_decode_position(target_context_len)
+        self._decode_1024_profile_position = target_context_len - 1
+        print(f"\n--- Profiling 1024th token (pos {target_context_len - 1}) ---",
+              flush=True)
+        decode_1024_results = self._decode_profile_execute(
+            decoder_program_addr, aligned_seq_len, decoder_checkpoints)
+        self._decode_1024_profile_results = decode_1024_results
+        self._print_phase_breakdown(
+            "DECODE (1024th token)", decode_1024_results, per_token=True)
 
     @staticmethod
     def _parse_offset(val) -> int:
@@ -1805,7 +2025,8 @@ def run_summary_filename(args) -> str:
         tokens.append("bin-reuse")
     if args.cycle is not None:
         tokens.append(f"cycle_{args.cycle}")
-    return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + ".md"
+    suffix = "_profile" if args.profile else ""
+    return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
 
 
 def main():
@@ -1881,6 +2102,12 @@ def main():
         ue.compile_gemma4(profile=True)
         print(f"Profile compile done in {time.perf_counter() - timer:.2f} seconds")
         ue.run_gemma4_profile()
+        _summary_path = os.path.join(SCRIPT_DIR, _summary_name)
+        try:
+            ue.write_profile_summary(_summary_path, args)
+            print(f"Wrote profile summary: {_summary_path}")
+        except Exception as _e:
+            print(f"[warn] failed to write profile summary: {_e}")
         print("Gemma4 E2B decode profile ends.")
         return
 

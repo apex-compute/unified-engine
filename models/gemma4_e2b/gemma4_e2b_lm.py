@@ -694,12 +694,16 @@ class Gemma4LMMixin:
         self._loud(f"  Emitting dynamic prefill: {layer_size} layers, accounting_seq={seq_len}, attention=unified-inline"
                         + (" (+profile checkpoints)" if profile else ""))
         checkpoints: list[list] = []
+        last_checkpoint_flops = 0
         def _checkpoint(name: str) -> None:
+            nonlocal last_checkpoint_flops
             if not profile:
                 return
             self.generate_instruction_halt()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
-            checkpoints.append([name, f"0x{resume:X}"])
+            phase_flops = int(total_flops - last_checkpoint_flops)
+            checkpoints.append([name, f"0x{resume:X}", phase_flops])
+            last_checkpoint_flops = int(total_flops)
         def _projection_core(**kwargs) -> int:
             """Dynamic quantized projection selected for the whole prefill stage."""
             kwargs.setdefault("gpr_M_reg", self.gpr_seq_len)
@@ -908,7 +912,6 @@ class Gemma4LMMixin:
                 self._emit_strided_copy_pbi(tmp_out, self.LAYER0_FLASH_Q_DRAM, rope_n, rope_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
                 self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM + rope_bytes, self.LAYER0_FLASH_Q_DRAM + rope_bytes, non_rot, head_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
             _checkpoint(f"L{layer_idx}_rope")
-            _checkpoint(f"L{layer_idx}_kv_gather")
 
             # ---- GQA = an outer loop over the group's query heads ----
             # Standard GQA: the group_size query heads all attend the SAME K/V
@@ -935,11 +938,10 @@ class Gemma4LMMixin:
             # V-projection output, so it is not reused here.
             per_head_rows = ((self.max_prefill_seq_len + 63) // 64) * 64
             qhm_head_bytes = per_head_rows * cur_head_dim * self.bytes_per_element
-            # Compile-time runtime dims for multi-core workers (prefill compiles
-            # per prompt, so seq_len is a constant here): batch=seq_len,
-            # aligned=align64(seq_len). Master's single-core path uses the primed
-            # GPRs instead.
-            attn_aligned_ct = ((seq_len + 63) // 64) * 64
+            # The core receives maximum-capacity static dimensions so its
+            # internal scratch partition is safe for any reusable prompt. Live
+            # execution dimensions still come exclusively from the GPRs.
+            attn_aligned_live = ((seq_len + 63) // 64) * 64
             for g in range(self.group_size):
                 self._emit_strided_copy_pbi(
                     self.LAYER0_FLASH_Q_DRAM + g * head_bytes,       # token-major head g
@@ -962,17 +964,12 @@ class Gemma4LMMixin:
 
             def _emit_prefill_head(ue, h, scratch_addr, batch_reg, aligned_reg):
                 head_slot = self.LAYER0_FLASH_K_DRAM + h * qhm_head_bytes
-                # Static batch/aligned = the ACTUAL per-prompt dims (seq_len,
-                # align64(seq_len)), NOT per_head_rows. Prefill compiles per
-                # prompt so these are the true max the runtime GPRs take, which
-                # (a) makes the returned FLOP count accurate — per_head_rows=512
-                # over-counted the 272/320 attention ~3x, nudging reported
-                # prefill throughput above the MAC-array peak — and (b) reserves
-                # exactly the scratch the core uses. The head-major slot stride
-                # (qhm_head_bytes) stays at per_head_rows so buffer layout is
-                # seq-independent.
-                f = ue.unified_attention_core(
-                    batch=seq_len, aligned_seq_len=attn_aligned_ct,
+                # Static core dimensions reserve max-capacity scratch. Ignore
+                # the core's exaggerated return value and account the real live
+                # prompt dimensions outside the core.
+                ue.unified_attention_core(
+                    batch=self.max_prefill_seq_len,
+                    aligned_seq_len=per_head_rows,
                     head_dim=cur_head_dim,
                     Q_DRAM_ADDR=head_slot, K_DRAM_ADDR=k_cache_base,
                     V_DRAM_ADDR=v_cache_base, BIAS_DRAM_ADDR=bias_addr_layer,
@@ -980,7 +977,8 @@ class Gemma4LMMixin:
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     gpr_batch_reg=batch_reg, gpr_aligned_seq_len_reg=aligned_reg,
                     q_scale=1.0)
-                return f if isinstance(f, (int, float)) else 0
+                return self._dynamic_attention_flops(
+                    seq_len, attn_aligned_live, cur_head_dim)
 
             if prefill_scheduler is None:
                 # Single core: loop all group heads on the master, reusing the
@@ -1004,7 +1002,7 @@ class Gemma4LMMixin:
                     b_reg = ctx.ue.alloc_isa_reg()
                     ctx.ue.generate_instruction_add_set(b_reg, seq_len)
                     a_reg = ctx.ue.alloc_isa_reg()
-                    ctx.ue.generate_instruction_add_set(a_reg, attn_aligned_ct)
+                    ctx.ue.generate_instruction_add_set(a_reg, attn_aligned_live)
                     scr = ctx.scratch("prefill_attn_scratch")
                     for h in range(ctx.head_off, ctx.head_off + ctx.heads):
                         _attn_flops[0] += _emit_prefill_head(ctx.ue, h, scr, b_reg, a_reg)
@@ -1365,7 +1363,27 @@ class Gemma4LMMixin:
             _pf_th.join(timeout=1.0)
         return latency, flop_rate_program
 
-    def compile_decoder(self, layer_size: int = 35, profile: bool = False) -> tuple[None, list[int], list[int]]:
+    @staticmethod
+    def _dynamic_attention_flops(batch: int, aligned_seq_len: int,
+                                 head_dim: int) -> int:
+        """Q scale + QK (bias + softmax) + PV at the live runtime shape."""
+        return (batch * head_dim
+                + batch * aligned_seq_len * (4 * head_dim + 6))
+
+    def _decoder_flops_for_aligned_seq_len(self, aligned_seq_len: int) -> int:
+        """Total decoder FLOPs for one token at a live aligned context length."""
+        base = getattr(self, "_decoder_non_attention_flops", None)
+        if base is None:
+            raise RuntimeError("decoder non-attention FLOPs metadata is unavailable")
+        attention = sum(
+            self._dynamic_attention_flops(
+                self.group_size, aligned_seq_len,
+                self._get_layer_attention_dims(layer_idx)[0])
+            for layer_idx in range(self.LAYER_SIZE))
+        return int(base + attention)
+
+    def compile_decoder(self, layer_size: int = 35, profile: bool = False,
+                        accounting_seq_len: int | None = None) -> tuple[None, list[int], list[int]]:
         """Compile a single decoder program with dynamic PBI.
 
         DYNAMIC PBI (see notes_gemma4_e2b.md): one captured
@@ -1380,12 +1398,23 @@ class Gemma4LMMixin:
         single-element lists; caller uses [0] index.
         """
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
+        if accounting_seq_len is None:
+            accounting_seq_len = self.MAX_CONTEXT_SIZE
+        accounting_seq_len = int(accounting_seq_len)
+        if (accounting_seq_len < self.group_size
+                or accounting_seq_len > self.MAX_CONTEXT_SIZE
+                or accounting_seq_len % 64):
+            raise ValueError(
+                "decoder accounting_seq_len must be 64-aligned and within "
+                f"[{self.group_size}, {self.MAX_CONTEXT_SIZE}], got "
+                f"{accounting_seq_len}")
 
         self._set_silent(True)
         self._loud(f"  Emitting dynamic-PBI decoder: 1 segment x {layer_size} layers, attention=unified-inline")
         seg_t0 = time.perf_counter()
         count_at_start = self.capture_count
         total_flops = 0
+        decoder_attention_flops = 0
 
         # Optional per-phase profiling (see run_gemma4_profile / --profile).
         # _checkpoint emits a HALT at a phase boundary and records the resume
@@ -1394,12 +1423,16 @@ class Gemma4LMMixin:
         # placed at UNCONDITIONAL points so every layer contributes one sample
         # per phase (never inside a loop_start/loop_end or a per-layer branch).
         checkpoints: list[list] = []
+        last_checkpoint_flops = 0
         def _checkpoint(name: str) -> None:
+            nonlocal last_checkpoint_flops
             if not profile:
                 return
             self.generate_instruction_halt()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
-            checkpoints.append([name, f"0x{resume:X}"])
+            phase_flops = int(total_flops - last_checkpoint_flops)
+            checkpoints.append([name, f"0x{resume:X}", phase_flops])
+            last_checkpoint_flops = int(total_flops)
         def _projection_core(**kwargs) -> int:
             """Uniform kernel selection for configurable decode IF4 projections."""
             if self.decode_kernel == "matmatmul":
@@ -1460,7 +1493,9 @@ class Gemma4LMMixin:
 
         # Iterate once (no bucket loop)
         for _bi_unused in [0]:
-            seq_len = self.MAX_CONTEXT_SIZE  # template only — for FLOPs
+            # Live-length FLOP accounting only. The core receives global maximum
+            # capacity below so its internal scratch partition remains reusable.
+            seq_len = accounting_seq_len
             for layer_idx in range(layer_size):
                 layer_off = layer_idx * LAYER_WEIGHT_SIZE
                 cur_head_dim, cur_q_size, cur_k_size = self._get_layer_attention_dims(layer_idx)
@@ -1594,8 +1629,6 @@ class Gemma4LMMixin:
                 # Compact per-slot rows already satisfy unified attention's
                 # [aligned_seq_len, head_dim] contract. Read the cache directly;
                 # zero-initialized future rows cover alignment padding.
-                _checkpoint(f"L{layer_idx}_kv_gather")
-
                 # unified_attention_core uses bias_mode="full_matrix"; run_decoder
                 # uploads group_size identical bias rows for this call.
                 bias_addr_layer = (self.LAYER0_FLASH_BIAS_FULL_DRAM
@@ -1611,9 +1644,9 @@ class Gemma4LMMixin:
                 # Multi-core will shard these group rows across engines
                 # (batch=shard_size per engine); this is the single-core (shard=
                 # group_size) case.
-                total_flops += self.unified_attention_core(
+                self.unified_attention_core(
                     batch=self.group_size,
-                    aligned_seq_len=seq_len,
+                    aligned_seq_len=self.MAX_CONTEXT_SIZE,
                     head_dim=cur_head_dim,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
                     K_DRAM_ADDR=kv_k_base,
@@ -1626,6 +1659,10 @@ class Gemma4LMMixin:
                     gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
                     q_scale=1.0,
                 )
+                live_attention_flops = self._dynamic_attention_flops(
+                    self.group_size, seq_len, cur_head_dim)
+                total_flops += live_attention_flops
+                decoder_attention_flops += live_attention_flops
                 _checkpoint(f"L{layer_idx}_attention")
 
                 # O projection: INT4, K=cur_q_size (actual per-layer attention output dim)
@@ -1787,6 +1824,8 @@ class Gemma4LMMixin:
             self._loud(f"    decoder segment ({instr_count} instr) done in {time.perf_counter()-seg_t0:.1f}s")
         program_sizes = [instr_count * 32]
         total_flops_list = [total_flops]
+        self._decoder_non_attention_flops = int(
+            total_flops - decoder_attention_flops)
         self._decoder_checkpoints = checkpoints
         self._set_silent(False)
         return None, program_sizes, total_flops_list
@@ -1895,6 +1934,12 @@ class Gemma4LMMixin:
             self.seq_len += 1
             decode_pos = self.seq_len - 1               # 0-based pos of token now being computed
             aligned_seq_len = ((self.seq_len + 63) // 64) * 64
+            try:
+                live_flops_per_token = self._decoder_flops_for_aligned_seq_len(
+                    aligned_seq_len)
+            except RuntimeError:
+                # Backward compatibility for older program metadata.
+                live_flops_per_token = flops_per_token_scalar
 
             embedding_tensor = self.get_embedding_for_tokens([token_id])
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
@@ -1922,7 +1967,7 @@ class Gemma4LMMixin:
             # advanced by the decoder's trailing add_inc.
             latency, flop_rate_program = self._dispatch_program(
                 [(self.gpr_aligned_seq_len, aligned_seq_len)],
-                prog_addr, timeout=300.0, flops=flops_per_token_scalar)
+                prog_addr, timeout=300.0, flops=live_flops_per_token)
             total_latency += latency
             total_flop_rate += flop_rate_program
             # HW argmax of the streaming LM-head logits.

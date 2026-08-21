@@ -554,12 +554,16 @@ class Gemma4VisionMixin:
               f"{' (+profile checkpoints)' if profile else ''} ...", flush=True)
         t0 = time.perf_counter()
         enc_checkpoints: list[list] = []
+        last_checkpoint_flops = 0
         def _checkpoint(name: str) -> None:
+            nonlocal last_checkpoint_flops
             if not profile:
                 return
             self.generate_instruction_halt()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
-            enc_checkpoints.append([name, f"0x{resume:X}"])
+            phase_flops = int(self._vis_flops - last_checkpoint_flops)
+            enc_checkpoints.append([name, f"0x{resume:X}", phase_flops])
+            last_checkpoint_flops = int(self._vis_flops)
         _prev_silent = self._set_silent(False)
         self.reset_program_dram_addr()
         base_addr = self.get_program_dram_addr()
@@ -907,7 +911,7 @@ class Gemma4VisionMixin:
 
         ``profile``: run the profile-compiled bin **segment-by-segment** through
         its per-phase HALT checkpoints, timing each with the HW latency counter,
-        and return the per-segment [(name, ms)] list instead. The encoder still
+        and return per-segment ``(name, ms, FLOPs)`` samples instead. The encoder still
         computes its full output (segments tile the whole program). No preamble
         is needed — the vision ops prime their own GPRs inline."""
         import threading
@@ -948,14 +952,22 @@ class Gemma4VisionMixin:
             if gate_scheduler is not None:
                 gate_scheduler.start_workers(worker_addrs)
             self.start_execute_from_dram(program_addr)
-            for name, resume_hex in checkpoints:
+            for checkpoint in checkpoints:
+                name, resume_hex, *extra = checkpoint
+                phase_flops = int(extra[0]) if extra else None
                 self.wait_queue(180.0)
-                results.append((name, self.report_latency_in_us() / 1e3))   # ms
+                results.append((name, self.report_latency_in_us() / 1e3,
+                                phase_flops))   # ms, FLOPs
                 self.start_execute_from_dram(int(resume_hex, 16))
             self.wait_queue(180.0)   # tail: final HALT after the last checkpoint
             for worker in gate_scheduler.workers if gate_scheduler is not None else []:
                 worker.wait_queue(180.0)
-            results.append(("tail", self.report_latency_in_us() / 1e3))
+            tail_ms = self.report_latency_in_us() / 1e3
+            if results:
+                # The terminal HALT is only the final coverage boundary; fold
+                # it into pooler_tail instead of reporting a fake phase.
+                prev_name, prev_ms, prev_flops = results[-1]
+                results[-1] = (prev_name, prev_ms + tail_ms, prev_flops)
             return results
 
         _anchor = getattr(self, "_vis_fpga_t0", t0)
@@ -1149,6 +1161,7 @@ class Gemma4VisionMixin:
 
         # Major-step FPGA-latency breakdown of the encoder (profile mode only).
         if profile and isinstance(enc_result, list):
+            self._vision_profile_results = enc_result
             self._print_phase_breakdown("VISION ENCODER", enc_result, per_token=False)
         fpga_total_s = time.perf_counter() - fpga_total_t0
         # Per-stage host wall-clock breakdown of the whole vision path (--profile only).
