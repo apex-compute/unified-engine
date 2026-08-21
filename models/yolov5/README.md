@@ -21,8 +21,11 @@ Both hardware entry points use ordered queue-CONFIG geometry. The optimized
 mixed-precision path additionally requires the corrected gather-IF8 scale
 rewind introduced by Andromeda commit `77e8adf3`; older queue-CONFIG builds
 `d93eea82`, `9ef15fc1`, and `663de8d5` are rejected for this artifact. The
-four-channel banked gather and performance results are validated on timing-clean
-RK build `3e92cddf`. No compatible update image is shipped in this repository.
+four-channel banked gather and direct-bin path are strictly validated on
+timing-clean RK build `9d1a77dc` (WNS `+0.006 ns`, TNS `0`). That build adds
+the read-only `HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG
+direct inference does not write those live CSRs. No compatible update image is
+shipped in this repository.
 
 Artifact-v4 schema/digest checks, no-capture replay guards, checkpoint
 queue-mode selection, and quantized CPU direct execution are host-validated.
@@ -97,7 +100,7 @@ python3 models/yolov5/yolov5_compile.py \
   --output models/yolov5/yolov5_bin/yolov5s-andromeda.bin
 
 # Hardware inference from that artifact. The measured four-channel path uses
-# timing-clean gather build 3e92cddf.
+# timing-clean gather/HW_INFO build 9d1a77dc.
 python3 models/yolov5/yolov5_run_from_bin.py
 
 # Check the same artifact and graph on the quantized CPU backend, without FPGA.
@@ -167,22 +170,24 @@ testing an already-built artifact so the pre-test clean does not remove it.
 
 The gather primitive retains the normal folded-bias and fused-SiLU epilogue,
 so the 6x6 RGB stem uses predominantly INT8 gather blocks instead of repeatedly
-padding three channels into channel-mode IF4 blocks. Build `3e92cddf` advances
+padding three channels into channel-mode IF4 blocks. Build `9d1a77dc` advances
 four activation channels per walker cycle through a four-bank LUTRAM patch
 store, while ordered exact-tail CONFIG groups remove duplicated edge outputs.
-One warm-up followed by five measured direct-bin runs gave a median FPGA-only
-time of `84.376 ms` (`28,125,456` cycles) and a median execution-wall time of
-`167.320 ms`. The one-time immutable model upload was `16,940,472` bytes in
-exactly two writes, with a `6.400 ms` median. Every measured run detected `car`
-at confidence `0.510560`. FPGA cycles are 4.32% below the prior one-channel
-gather/overlap-edge schedule; end-to-end useful-MAC occupancy rises from 69.9%
-to 73.0%.
+A strict direct-bin run, with no unknown-hardware override, reported an
+FPGA-only time of `84.334 ms` (`28,111,200` cycles) and an execution-wall time
+of `159.257 ms`. The one-time immutable model upload was `16,940,472` bytes in
+exactly two writes and took `6.736 ms`. The run detected `car` at confidence
+`0.510560`.
 
 FPGA-only time is the corrected sum of queue-start-to-HALT accelerator latency
 counters. Execution-wall time additionally includes host tensor packing,
-dynamic DMA, 72 resident-program dispatches, and host concatenations. Artifact
-loading, preprocessing, decode, NMS, and drawing are outside both timers. The
-model meets the strict sub-100-ms FPGA execution target on one engine.
+dynamic DMA, 72 resident-program dispatches, and host concatenations. The
+two static uploads are the only model-state writes: runtime does not load a
+checkpoint, quantize or repack static parameters, or capture programs. Hardware
+initialization still performs its DRAM self-test, and graph replay still uses
+image-dependent DMA. Artifact loading, preprocessing, decode, NMS, and drawing
+are outside both execution timers. The model meets the strict sub-100-ms FPGA
+execution target on one engine.
 
 ## Layout
 

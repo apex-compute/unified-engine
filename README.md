@@ -186,7 +186,9 @@ The bundled `update_cf133b89.bin` predates those modes; see the model READMEs
 for the required corrected gather-IF8 commit before running either model. No
 compatible update image is shipped in this repository. YOLOv5 is therefore
 opt-in rather than part of the default suite. Both optimized artifacts are
-validated on timing-clean RK build `3e92cddf`.
+strictly validated on timing-clean RK build `9d1a77dc` (WNS `+0.006 ns`, TNS
+`0`). That build adds the read-only `HW_INFO` register and remaps the live
+geometry CSRs; the direct-bin queue-CONFIG path does not write those live CSRs.
 
 Both variants support a single checkpoint-free model artifact:
 
@@ -209,31 +211,29 @@ concatenation and detection postprocessing remain host-side. See each model
 README for its direct CLI and artifact contract.
 
 The mixed-precision artifacts require the corrected gather-IF8 scale rewind
-introduced by Andromeda commit `77e8adf3`. The utilization results below use
-commit `3e92cddf`, which advances four low-channel activation taps per gather
-walker cycle and stores patches in timing-clean banked LUTRAM. Exact edge-tile
-CONFIG groups also avoid recomputing overlap-clamped outputs. On RK at a 3 ns
-clock, one warm-up followed by five measured direct-bin runs gave these
-medians:
+introduced by Andromeda commit `77e8adf3`. Build `9d1a77dc` advances four
+low-channel activation taps per gather walker cycle and stores patches in
+timing-clean banked LUTRAM. Exact edge-tile CONFIG groups also avoid
+recomputing overlap-clamped outputs. Strict direct-bin runs on RK at a 3 ns
+clock, with no unknown-hardware override, reported:
 
 | Model | Static model upload | Execution wall | FPGA execution only |
 |---|---:|---:|---:|
-| YOLOv5s | 6.400 ms; 16,940,472 B in 2 writes | 167.320 ms | 84.376 ms; 28,125,456 cycles |
-| YOLOv5n | 6.812 ms; 18,313,456 B in 2 writes | 91.086 ms | 30.366 ms; 10,121,984 cycles |
-
-Relative to the `77e8adf3` one-channel-gather/overlap-edge schedule, FPGA
-cycles fell by 4.32% for YOLOv5s and 15.72% for YOLOv5n. Measured useful-MAC
-occupancy (`model MACs / (total FPGA cycles * 64 lanes)`) rose from 69.9% to
-73.0% and from 46.5% to 55.2%, respectively.
+| YOLOv5s | 6.736 ms; 16,940,472 B in 2 writes | 159.257 ms | 84.334 ms; 28,111,200 cycles |
+| YOLOv5n | 7.043 ms; 18,313,456 B in 2 writes | 93.357 ms | 30.357 ms; 10,119,104 cycles |
 
 The execution-wall timer covers the image-dependent graph replay, including
 host packing, dynamic DMA, 72 resident-program dispatches, and host
 concatenations. FPGA-only time is the corrected sum of queue-start-to-HALT
-latency counters; it excludes all host work and DMA. Artifact loading,
-preprocessing, decode, NMS, and drawing are outside both execution timers. The
-validated YOLOv5s run detects `car` at confidence `0.510560`; YOLOv5n detects
-seven `person` instances, led by confidence `0.685195`. Both models meet the
-strict sub-100-ms FPGA execution target on one engine.
+latency counters; it excludes all host work and DMA. The two static uploads are
+the only model-state writes: there is no checkpoint load, quantization, static
+parameter repacking, or program capture at runtime. Hardware initialization
+still performs its DRAM self-test, and graph replay still performs
+image-dependent DMA. Artifact loading, preprocessing, decode, NMS, and drawing
+are outside both execution timers. The validated YOLOv5s run detects `car` at
+confidence `0.510560`; YOLOv5n detects seven `person` instances, led by
+confidence `0.685195`. Both models meet the strict sub-100-ms FPGA execution
+target on one engine.
 
 Run the whole suite (or a subset) with the automated tester:
 
