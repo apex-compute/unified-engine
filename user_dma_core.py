@@ -66,6 +66,7 @@ UE_ARGMAX2_INDEX = 0x00000090
 UE_ARGMAX3_INDEX = 0x00000094
 UE_ARGMAX4_INDEX = 0x00000098
 UE_INT_REG = 0x0000009C  # bits [1:0] interrupt cause; write clears latch (axi_lite_*_module.sv)
+UE_HW_INFO_ADDR = 0x000000A0  # read-only encoded queue/AXI/DRAM/core/clock capabilities
 # CONV2D / MAXPOOL geometry side registers (axi_reg_map_pkg.sv, matches andromeda.c).
 # Write-only legacy staging registers.  Newer queue-CONFIG RTL can shadow all
 # four values in instruction order; programs without CONFIG retain this CSR
@@ -113,7 +114,7 @@ UE_GATHER_IF8_HW_VERSIONS = frozenset({
 })
 # Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)
 UE_ARGMAX_INDEX = UE_ARGMAX1_INDEX
-UE_LAST_REG_ADDR = UE_INT_REG  # last AXI-Lite offset for init scan (UE_CONV_* are write-only)
+UE_LAST_REG_ADDR = UE_HW_INFO_ADDR  # last readable init-scan register (UE_CONV_* are write-only)
 
 # queue_state_module.sv int_cause / andromeda.c INT_CAUSE_*
 INT_CAUSE_NONE = 0

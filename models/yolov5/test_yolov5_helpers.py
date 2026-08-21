@@ -487,6 +487,11 @@ class PlannerTests(unittest.TestCase):
         engine.require_native_conv_hardware()
 
     def test_queued_geometry_is_ordered_and_hash_gated(self):
+        self.assertEqual(user_dma_core.UE_HW_INFO_ADDR, 0x000000A0)
+        self.assertEqual(
+            user_dma_core.UE_LAST_REG_ADDR,
+            user_dma_core.UE_HW_INFO_ADDR,
+        )
         self.assertEqual(
             (
                 user_dma_core.UE_CONV_GEOM_ADDR,
