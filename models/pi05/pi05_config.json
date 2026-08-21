@@ -94,20 +94,20 @@
   "paths": {
     "hf_model_repo": null,
     "openpi_checkpoint": "gs://openpi-assets/checkpoints/pi05_libero",
-    "openpi_checkpoint_dir": "pi05_libero_bin/openpi-assets/checkpoints/pi05_libero",
+    "openpi_checkpoint_dir": "pi05_bin/openpi-assets/checkpoints/pi05_libero",
     "paligemma_tokenizer": "gs://big_vision/paligemma_tokenizer.model",
-    "tokenizer_file": "pi05_libero_bin/big_vision/paligemma_tokenizer.model",
-    "weights_export_dir": "models/pi05_libero/pi05_libero_bin/weights_export",
-    "weights_manifest": "models/pi05_libero/pi05_libero_bin/weights_export/manifest.json",
+    "tokenizer_file": "pi05_bin/big_vision/paligemma_tokenizer.model",
+    "weights_export_dir": "models/pi05/pi05_bin/weights_export",
+    "weights_manifest": "models/pi05/pi05_bin/weights_export/manifest.json",
     "_bin_paths_note": "bin_dir/params_bin/instruction_bin/instruction_meta are relative to the SCRIPT dir (qwen3 convention, resolved at runtime). The weights_export_dir/weights_manifest keys above are repo-root-relative and documentation-only.",
-    "bin_dir": "pi05_libero_bin",
-    "params_bin": "pi05_libero_bin/params.bin",
-    "instruction_bin": "pi05_libero_bin/programs.bin",
-    "instruction_meta": "pi05_libero_bin/programs.json"
+    "bin_dir": "pi05_bin",
+    "params_bin": "pi05_bin/params.bin",
+    "instruction_bin": "pi05_bin/programs.bin",
+    "instruction_meta": "pi05_bin/programs.json"
   },
   "defaults": {
     "prompt": "pick up the object",
-    "image": "models/pi05_libero/sample_data_placeholder",
+    "image": "models/pi05/sample_data_placeholder",
     "dev": "xdma0",
     "cycle_ns": 5.63,
     "max_seq": 1024

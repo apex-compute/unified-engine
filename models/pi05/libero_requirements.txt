@@ -1,0 +1,72 @@
+# LIBERO simulator requirements -- LAYERED ON TOP of pi05_requirements.txt.
+#
+#   pip install -r models/pi05/libero_requirements.txt
+#
+# Needed only by utility/libero_eval.py (closed-loop episodes + rollout videos).
+# pi05_test.py never imports anything in this file.
+#
+# NOT SUFFICIENT ON ITS OWN. Headless rendering needs system GL libraries that no
+# requirements.txt can install:
+#
+#   * libOSMesa -- conda-forge's mesalib ships GL/GLX/EGL and llvmpipe but NOT
+#     libOSMesa (verified absent in 25.2.8 and 26.1.6), and there is no standalone
+#     `osmesa` package. EGL is not a substitute: robosuite's EGLGLContext needs the
+#     PLATFORM_DEVICE extension and therefore /dev/dri, which is denied unless you
+#     are in the render/video groups.
+#   * mesalib / libglu themselves.
+#
+# `bash models/pi05/setup_env.sh` installs all of that (no sudo needed) and
+# seeds LIBERO's interactive first-run prompt. Then every run needs:
+#
+#   export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
+#   export LD_LIBRARY_PATH=$CONDA_PREFIX/lib
+
+-r pi05_requirements.txt
+
+# ---- LIBERO simulator (robosuite/mujoco) + runtime deps ----
+robosuite==1.4.1
+mujoco==3.2.3
+bddl==1.0.1
+gym==0.25.2
+opencv-python
+imageio
+imageio-ffmpeg
+tyro
+numba
+scipy
+easydict
+future
+matplotlib
+einops
+cloudpickle
+PyOpenGL
+
+# libero_eval.py: `from openpi_client import image_tools`. This is a DIFFERENT,
+# real package (the websocket policy client) -- not `openpi` itself, which nothing
+# here imports.
+openpi-client
+
+# ---- LIBERO itself (scenes/BDDL/benchmark API) ----
+# MUST be `-e` WITH `editable_mode=compat`. Both halves are load-bearing:
+#
+#   plain `libero @ git+...`  -> pip reports success and installs a ~5.5 KB
+#     METADATA-ONLY wheel. LIBERO has no libero/__init__.py (it is a PEP 420
+#     namespace package), so its setup.py's find_packages() returns []. The
+#     failure surfaces much later as `ModuleNotFoundError: No module named
+#     'libero'`.
+#
+#   plain `-e` (PEP 660)      -> ALSO broken, same root cause: the generated
+#     __editable___libero_finder.py has `MAPPING = {}`, so it resolves nothing.
+#
+#   `editable_mode=compat`    -> falls back to the legacy .pth mechanism, which
+#     puts the PROJECT ROOT on sys.path, and the namespace package then resolves.
+#
+# Verify with `python -c "import libero.libero"` -- never trust pip's message here.
+# setup.py has install_requires=[], so this pulls NO transitive deps and cannot
+# fight the pins above. (Its requirements.txt asks for numpy==1.22.4 /
+# robosuite==1.4.0 / transformers==4.21.1, but setup.py ignores that file -- and
+# so do we, the same way openpi does.)
+#
+# Clones to ./src/libero relative to your CWD, so run pip from the repo root.
+# ~405 MB of scene assets, plain files, no git-lfs.
+-e git+https://github.com/Lifelong-Robot-Learning/LIBERO.git#egg=libero --config-settings editable_mode=compat

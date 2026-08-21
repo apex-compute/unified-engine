@@ -14,18 +14,18 @@ two noisy success percentages with overlapping confidence intervals.
 
 Setup once:
     conda create -n pi05_libero python=3.11 -y && conda activate pi05_libero
-    pip install -r models/pi05_libero/requirements.txt
+    pip install -r models/pi05/requirements.txt
     pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
 
 Run:
     # golden reference on GPU -- start here
-    MUJOCO_GL=egl python models/pi05_libero/utility/libero_eval.py \
+    MUJOCO_GL=egl python models/pi05/utility/libero_eval.py \
         --backend torch --tasks 1 --trials 1 --max-steps 60          # smoke test
-    MUJOCO_GL=egl python models/pi05_libero/utility/libero_eval.py \
+    MUJOCO_GL=egl python models/pi05/utility/libero_eval.py \
         --backend torch --trials 5                                   # 10x5 = 50 episodes
 
     # same 50 episodes on hardware, then diff the two result JSONs
-    MUJOCO_GL=egl python models/pi05_libero/utility/libero_eval.py \
+    MUJOCO_GL=egl python models/pi05/utility/libero_eval.py \
         --backend fpga --trials 5
 
 Each run writes per-episode success bits to --results-out (JSON). Diff two of

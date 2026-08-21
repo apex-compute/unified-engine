@@ -342,7 +342,7 @@ def _check_mbv2_ssd(text):
         else "no detections above threshold"
     )
 
-def _check_pi05_libero(text):
+def _check_pi05(text):
     # pi05_libero is a robot policy: no text output, no labels. It emits a (10,7) action
     # chunk plus a summary line "nan=False inf=False min=-0.1234 max=0.5678".
     # Pass signal: the run reached the denoise output and the chunk is finite.
@@ -399,7 +399,7 @@ TESTS = [
 
     # Robot policy (VLA): no --prompt, no text output -- emits a (10,7) action chunk from
     # its in-repo LIBERO sample frames in test_samples/ (pi05_libero_base/wrist.png).
-    {"name": "pi05_libero", "script": "models/pi05_libero/pi05_test.py", "pass_check": _check_pi05_libero},
+    {"name": "pi05", "script": "models/pi05/pi05_test.py", "pass_check": _check_pi05},
 ]
 
 

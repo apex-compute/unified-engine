@@ -1,0 +1,60 @@
+# pi05_libero -- FPGA inference requirements (NO simulator).
+#
+#   pip install -r models/pi05/pi05_requirements.txt
+#   python models/pi05/pi05_test.py --engines max
+#
+# This is everything pi05_test.py touches. It has no LIBERO / robosuite /
+# mujoco / openpi dependency at all -- those live in libero_requirements.txt and
+# are needed only by utility/libero_eval.py (closed-loop episodes).
+#
+# WHY THESE PINS -- all load-bearing, do not "upgrade" them casually:
+#
+#  numpy<2      robosuite/gym 0.25 break on numpy 2.x, and this is what lets the
+#               simulator and user_dma_core coexist in ONE interpreter when
+#               libero_requirements.txt is layered on top. It also constrains the
+#               jax stack below, which is why those are pinned to openpi's own
+#               versions.
+#
+#  torch CPU    The model runs on the FPGA, not a GPU, so CPU torch is the right
+#               build. The pure-torch reference (utility/pi05_torch_ref.py,
+#               --verify-denoise) still works, just slowly. If you DO have a CUDA
+#               box, swap the index-url to the matching cuXXX and keep torch at
+#               2.7.1 so nothing else in here has to move.
+#               NOTE torch >= 2.6 defaults torch.load(weights_only=True), which
+#               REJECTS LIBERO's pickled-numpy init-state files; libero_eval.py
+#               installs its own shim for that.
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# ---- unified-engine base (mirrors ../../requirements.txt, CPU wheels) ----
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+soundfile
+numpy<2
+transformers>=4.40,<5
+huggingface-hub>=0.20.0
+pillow>=12.1.1
+sentencepiece
+
+# ---- one-time weight export (openpi-free path) --------------------------
+# Needed on the FIRST run only: utility/pi05_ckpt_noopenpi.py pulls the pi05
+# checkpoint from a PUBLIC GCS bucket anonymously and restores it with orbax,
+# producing <model>_bin/weights_export/*.npy (~13 GB). Every later run detects
+# the export and skips the step -- inference itself runs from params.bin on the
+# FPGA and imports none of this.
+#
+# `openpi` proper is NOT required and is deliberately absent: it would drag in
+# jax[cuda12] + lerobot + wandb. It is also not installable from PyPI (the PyPI
+# `openpi` is an empty 0.0.0 placeholder) -- only from git.
+#
+# This exact set is what upstream openpi pins, so it is known-good together AND
+# known-good with numpy<2. CPU jax is correct here: the export just reads arrays
+# off disk. ml-dtypes and tensorstore are openpi's own resolution overrides --
+# orbax is picky about both, so they are pinned rather than left to the resolver.
+jax==0.5.3
+jaxlib==0.5.3
+flax==0.10.2
+orbax-checkpoint==0.11.13
+ml-dtypes==0.4.1
+tensorstore==0.1.74

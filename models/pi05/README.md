@@ -12,12 +12,14 @@ gripper cosine 1.000 and 100% sign agreement.
 | path | what |
 |---|---|
 | `pi05_test.py` | the engine model — compile + single inference. The entry point. |
-| `pi05_libero_config.json` | model manifest (geometry, DRAM map, `paths.*`) |
+| `pi05_config.json` | model manifest (geometry, DRAM map, `paths.*`) |
 | `pi05_sample_meta.json` | the sample observation's raw 8-D robot state (+ its task id) |
+| `pi05_requirements.txt` | FPGA-inference deps (no simulator) |
+| `libero_requirements.txt` | the above **plus** the LIBERO simulator stack |
 | `utility/libero_eval.py` | closed-loop LIBERO rollouts (`--backend fpga\|torch`) + `--diff-actions` |
 | `utility/pi05_torch_ref.py` | CPU/GPU reference implementation (the numeric oracle) |
 | `utility/pi05_jax_oracle.py` | JAX/openpi oracle, for checking the reference itself |
-| `utility/pi05_weight_export.py` | checkpoint → `pi05_libero_bin/weights_export/` (prep phase) |
+| `utility/pi05_weight_export.py` | checkpoint → `pi05_bin/weights_export/` (prep phase) |
 | `utility/pi05_ckpt_noopenpi.py` | orbax checkpoint reader, so the export works without openpi |
 | `utility/compare_bf16_if4.py` | bf16-vs-IF4 quantization sweep on the reference |
 | `setup_env.sh` | one-command conda env + LIBERO + OSMesa bring-up |
@@ -39,22 +41,23 @@ Only `utility/libero_eval.py` needs the simulator.
 
 ## 1. One-time setup
 
-### Which env file?
+### Which requirements file?
 
-Two files, different jobs — there is no third:
+Two files, layered — there is no third:
 
 | file | what it is | use it when |
 |---|---|---|
-| `pi05_libero_env.yml` | the **spec**: what to install and why. Loose where loose is safe, pinned only where a pin is load-bearing, heavily commented. | always, via `setup_env.sh`. Edit **this** file to change a dependency. |
-| `pi05_libero_env.lock.yml` | the **lock**: every direct and transitive version as it resolved on a machine where the env works. | reproducing the env byte-for-byte on another box, or bisecting "it worked last week". Never hand-edit; regenerate. |
+| `pi05_requirements.txt` | FPGA inference only: engine base + the one-time weight export (`jax`/`orbax`/`flax`). No simulator. | running `pi05_test.py`. This is all it needs. |
+| `libero_requirements.txt` | `-r pi05_requirements.txt` plus robosuite/mujoco/LIBERO and friends. | running `utility/libero_eval.py` (closed-loop episodes). Installed by `setup_env.sh`. |
 
-Both build the same env name (`pi05_libero`) and both install the full stack —
-engine + weight export + LIBERO simulator.
+`libero_requirements.txt` is **not sufficient on its own** — headless rendering needs
+system GL libraries (`libOSMesa`, `mesalib`, `libglu`) that no requirements file can
+install. That is what `setup_env.sh` is for.
 
-**`pi05_test.py` alone needs far less than either.** It imports only
-`numpy<2`, `torch`, `pillow`, `sentencepiece` and this repo's own modules, so the
-repo-root `requirements.txt` already covers a single inference. The extra weight in
-the env files is for two things you may not need:
+**`pi05_test.py` alone needs far less.** It imports only `numpy<2`, `torch`,
+`pillow`, `sentencepiece` and this repo's own modules, so `pi05_requirements.txt` (or
+even the repo-root `requirements.txt`) already covers a single inference. The extra
+weight in `libero_requirements.txt` is for two things you may not need:
 
 - **the one-time weight export** — `jax` + `jaxlib` + `flax` + `orbax-checkpoint`,
   used once on first run and never imported again;
@@ -66,11 +69,11 @@ requirements.txt` plus the four jax packages is enough.
 ### One command
 
 ```bash
-bash models/pi05_libero/setup_env.sh
+bash models/pi05/setup_env.sh
 ```
 
-That creates the `pi05_libero` conda env from `pi05_libero_env.yml`, installs the one
-library conda cannot supply, seeds LIBERO's interactive first-run prompt, and verifies
+That creates the `pi05_libero` conda env (python 3.11 + mesalib + libglu), pip-installs
+`libero_requirements.txt`, installs the one library neither can supply (`libOSMesa`), seeds LIBERO's interactive first-run prompt, and verifies
 the whole thing renders. It is idempotent — safe to re-run, and it updates an existing
 env rather than recreating it. **No sudo required.**
 
@@ -131,7 +134,7 @@ them. `libero_eval.py` installs a scoped shim; standalone scripts need their own
 ### Weights
 
 First run of `pi05_test.py` downloads the checkpoint and exports it — a one-time
-cost of several minutes, cached into `models/pi05_libero/pi05_libero_bin/`.
+cost of several minutes, cached into `models/pi05/pi05_bin/`.
 
 ---
 
@@ -259,7 +262,7 @@ One observation in, one `(10, 7)` action chunk out. No simulator. This is the lo
 want while iterating.
 
 ```bash
-python models/pi05_libero/pi05_test.py --engines max
+python models/pi05/pi05_test.py --engines max
 ```
 
 `--engines max` applies each stage's own ceiling from `STAGE_MAX_ENGINES`, which is
@@ -277,10 +280,10 @@ Roughly 37 s of execution plus ~13 s of one-time compile. Single-engine
 screen -dmS pi05_obj bash -c 'cd /home/rohit/unified-engine && \
   MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
-  python models/pi05_libero/utility/libero_eval.py \
+  python models/pi05/utility/libero_eval.py \
     --backend fpga --task-suite libero_object --tasks 1 --trials 1 \
     --engines max --dump-actions 2>&1 \
-    | tee models/pi05_libero/libero_fpga_object_t0.log'
+    | tee models/pi05/libero_fpga_object_t0.log'
 
 screen -r pi05_obj      # attach; Ctrl-A D to detach
 ```
@@ -377,16 +380,16 @@ never touch.
 
 There is no free-text prompt in the loop: the sim needs a BDDL scene with matching
 objects, so the prompt comes from the benchmark. For arbitrary text use the
-single-inference path (§2) and edit `defaults.prompt` in `pi05_libero_config.json` —
+single-inference path (§2) and edit `defaults.prompt` in `pi05_config.json` —
 you get an action chunk against the sample images, but no robot and no video.
 
 #### Outputs
 
 | what | where |
 |---|---|
-| video (one per episode) | `models/pi05_libero/data/libero/videos/{backend}_{suite}_t{task}_e{trial}_{success\|failure\|error}.mp4` |
-| results JSON (checkpointed every episode) | `models/pi05_libero/data/libero/results_{backend}_{suite}.json` |
-| action dumps (`--dump-actions`) | `models/pi05_libero/data/libero/actions_{backend}_{suite}.npz` |
+| video (one per episode) | `models/pi05/data/libero/videos/{backend}_{suite}_t{task}_e{trial}_{success\|failure\|error}.mp4` |
+| results JSON (checkpointed every episode) | `models/pi05/data/libero/results_{backend}_{suite}.json` |
+| action dumps (`--dump-actions`) | `models/pi05/data/libero/actions_{backend}_{suite}.npz` |
 
 Videos carry a **prompt overlay in the top-left**: `[fpga/if4-hw] pick up the alphabet
 soup and place it in the basket`, yellow on a translucent black bar, 2× upscaled for
@@ -434,9 +437,9 @@ denoise noise, so **inference #0 sees a bit-identical observation in both**. Any
 difference there is the backend and nothing else.
 
 ```bash
-python models/pi05_libero/utility/libero_eval.py --diff-actions \
-    models/pi05_libero/data/libero/actions_torch_libero_object.npz \
-    models/pi05_libero/data/libero/actions_fpga_libero_object.npz
+python models/pi05/utility/libero_eval.py --diff-actions \
+    models/pi05/data/libero/actions_torch_libero_object.npz \
+    models/pi05/data/libero/actions_fpga_libero_object.npz
 ```
 
 **Read the cosine column, not the SNR.** A dimension the robot is barely using has a
@@ -451,17 +454,17 @@ Ordered cheapest-first. Each isolates one stage.
 
 ```bash
 # vision encoder vs CPU IF4 reference (~7s) -- per-slot SNR
-python models/pi05_libero/pi05_test.py --engines max --verify-vision
+python models/pi05/pi05_test.py --engines max --verify-vision
 
 # full (10,7) action chunk vs pi05_torch_ref on CPU, matched quant/noise/inputs
 # also prints prefix K/V SNR per layer. Slow: the reference runs on CPU.
-python models/pi05_libero/pi05_test.py --engines max --verify-denoise
+python models/pi05/pi05_test.py --engines max --verify-denoise
 
 # on-device timestep-embedding MLP vs exact host oracle
-python models/pi05_libero/pi05_test.py --engines max --check-cond-table
+python models/pi05/pi05_test.py --engines max --check-cond-table
 
 # localize the first diverging op in the action expert (~75s with --debug)
-python models/pi05_libero/pi05_test.py --debug --probe-step0
+python models/pi05/pi05_test.py --debug --probe-step0
 ```
 
 **Masked slots poison pooled SNR.** LIBERO supplies 2 real cameras; the 3rd slot is an

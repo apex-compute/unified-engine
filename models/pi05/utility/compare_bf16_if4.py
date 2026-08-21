@@ -4,7 +4,7 @@ between the two action outputs (and per-layer prefix K/V). This is the
 'quantization floor' -- the best the FPGA (which is IF4) could ever match a
 bf16/full-precision model. Runs entirely on GPU, no FPGA. Fast (weights cached).
 
-    python models/pi05_libero/utility/compare_bf16_if4.py [--device cuda] [--sample 0]
+    python models/pi05/utility/compare_bf16_if4.py [--device cuda] [--sample 0]
 """
 import argparse
 from pathlib import Path

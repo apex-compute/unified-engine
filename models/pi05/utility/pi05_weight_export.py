@@ -23,13 +23,13 @@ _MODEL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _load_config(path=None):
     if path is None:
-        path = os.path.join(_MODEL_DIR, "pi05_libero_config.json")
+        path = os.path.join(_MODEL_DIR, "pi05_config.json")
     with open(path) as f:
         return json.load(f)
 
 
 _CFG = _load_config()
-_BIN_SUBDIR = _CFG["paths"].get("bin_dir", "pi05_libero_bin")
+_BIN_SUBDIR = _CFG["paths"].get("bin_dir", "pi05_bin")
 
 
 def weights_export_dir(script_dir=None):
@@ -227,7 +227,7 @@ def ensure_weights_export(script_dir=None):
         "\n              one-time weight download + export step."
         f"\n              target : {os.path.abspath(wdir)}"
         "\n              size   : ~13 GB on disk (plus the openpi checkpoint cached"
-        "\n                       under pi05_libero_bin/)"
+        "\n                       under pi05_bin/)"
         "\n              This happens ONCE; later runs detect it and skip it."
         "\n" + "=" * 78 + "\n")
 

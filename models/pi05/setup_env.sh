@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # One-command setup for pi0.5 + LIBERO on the UnifiedEngine.
 #
-#   bash models/pi05_libero/setup_env.sh                # everything
-#   bash models/pi05_libero/setup_env.sh --osmesa-only  # just the OSMesa step
-#   bash models/pi05_libero/setup_env.sh --verify-only  # just re-run the checks
+#   bash models/pi05/setup_env.sh                # everything
+#   bash models/pi05/setup_env.sh --osmesa-only  # just the OSMesa step
+#   bash models/pi05/setup_env.sh --verify-only  # just re-run the checks
 #
 # Creates the `pi05_libero` conda env, installs the one library conda cannot
 # (libOSMesa), seeds LIBERO's interactive first-run prompt, and verifies the
@@ -14,7 +14,7 @@ set -euo pipefail
 
 ENV_NAME=pi05_libero
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-YML="$REPO_ROOT/models/pi05_libero/pi05_libero_env.yml"
+REQ="$REPO_ROOT/models/pi05/libero_requirements.txt"
 
 MODE=all
 [[ "${1:-}" == "--osmesa-only" ]] && MODE=osmesa
@@ -29,20 +29,27 @@ CONDA_BASE="$(conda info --base)"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
 # ---------------------------------------------------------------- 1. conda env
+# conda supplies ONLY what pip cannot: the interpreter and the GL userspace
+# (mesalib/libglu -- note neither ships libOSMesa, see step 2). Everything else
+# comes from libero_requirements.txt, which layers on pi05_requirements.txt.
 if [[ $MODE == all ]]; then
   if conda env list | grep -qE "^${ENV_NAME}\s"; then
-    say "conda env '$ENV_NAME' exists -- updating from $YML"
-    ( cd "$REPO_ROOT" && conda env update -n "$ENV_NAME" -f "$YML" --prune )
+    say "conda env '$ENV_NAME' exists -- reusing"
   else
-    say "creating conda env '$ENV_NAME' from $YML"
-    # cd to repo root: the LIBERO editable install clones to ./src/libero
-    ( cd "$REPO_ROOT" && conda env create -f "$YML" )
+    say "creating conda env '$ENV_NAME' (python 3.11 + mesalib + libglu)"
+    conda create -y -n "$ENV_NAME" -c conda-forge python=3.11 pip mesalib libglu
   fi
 fi
 
 conda activate "$ENV_NAME"
 PREFIX="${CONDA_PREFIX:?conda activate failed}"
 say "env ready: $PREFIX"
+
+# cd to repo root: the LIBERO editable install clones to ./src/libero
+if [[ $MODE == all ]]; then
+  say "pip install -r $REQ"
+  ( cd "$REPO_ROOT" && pip install -r "$REQ" )
+fi
 
 # ------------------------------------------------------------------ 2. OSMesa
 # The ONE dependency conda cannot supply. conda-forge's mesalib ships GL/GLX/EGL
@@ -82,7 +89,7 @@ fi
 say "verifying"
 export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa LD_LIBRARY_PATH="$PREFIX/lib"
 
-python - <<'PY' || die "verification failed -- see models/pi05_libero/README.md section 8"
+python - <<'PY' || die "verification failed -- see models/pi05/README.md section 8"
 import functools, os, sys
 
 # torch >= 2.6 flipped torch.load's weights_only default to True, which refuses
@@ -125,11 +132,11 @@ Every run needs these three exports:
 
 Next:
     # single inference on the FPGA (~50s, downloads+exports weights on first run)
-    python models/pi05_libero/pi05_test.py --engines max
+    python models/pi05/pi05_test.py --engines max
 
     # closed-loop episode with video
-    python models/pi05_libero/utility/libero_eval.py --backend fpga \\
+    python models/pi05/utility/libero_eval.py --backend fpga \\
         --task-suite libero_object --tasks 1 --trials 1 --engines max
 
-See models/pi05_libero/README.md for the full command reference.
+See models/pi05/README.md for the full command reference.
 EOF

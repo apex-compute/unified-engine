@@ -333,27 +333,28 @@ GFLOP counts therefore differ across columns.
 \begin{table}[H]
 \centering\small
 \caption{\alveo{} (\iffour{}) --- eight \ue{}~v1 instances on one AMD Alveo card,
-832-token prefix. GFLOP/s is on the hardware-issued (padded) FLOPs. Times are pure
-back-to-back execution; programs are compiled once up front and that one-time cost
-is excluded.}
+832-token prefix. GFLOP/s is the work the hardware actually issues over the
+measured time, i.e.\ counted on the padded dimensions the engine runs rather than
+the model's nominal shape. Times are pure back-to-back execution; programs are
+compiled once up front and that one-time cost is excluded.}
 \label{tab:timing-fpga}
 \begin{tabular}{@{}lcc@{}}
 \toprule
 \textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
 \midrule
-Vision encoder          & 3.2  & 210.9 \\
-Prefix (Gemma-2B)       & 10.1 & 230.9 \\
-Action expert (denoise) & 1.2  & 382.8 \\
+Vision encoder          & 3.2  & 266.3 \\
+Prefix (Gemma-2B)       & 10.1 & 335.7 \\
+Action expert (denoise) & 1.2  & 121.4 \\
 \midrule
-\textbf{End-to-end}     & 14.5 & 239.1 \\
+\textbf{End-to-end}     & 14.5 & \textbf{303.3} \\
 \textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.0690} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-On the \alveo{} the expert's rate reads high only because it is scored on padded
-FLOPs. Against the true model shape it is still the least efficient of the three,
-for the same reason it is on the Jetson.
+The expert is the least efficient of the three here for the same reason it is on
+the Jetson: ten short sequential steps against a long K/V cache, where arithmetic
+throughput does not help.
 
 \begin{table}[H]
 \centering\small

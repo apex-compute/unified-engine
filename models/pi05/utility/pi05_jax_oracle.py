@@ -29,8 +29,8 @@ _MODEL_DIR = _HERE.parent                      # <model>/
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_MODEL_DIR))            # pi05_test
 
-# The checkpoint that pi05_libero_bin/weights_export/*.npy was exported FROM.
-CKPT = _MODEL_DIR / "pi05_libero_bin" / "openpi-assets" / "checkpoints" / "pi05_libero"
+# The checkpoint that pi05_bin/weights_export/*.npy was exported FROM.
+CKPT = _MODEL_DIR / "pi05_bin" / "openpi-assets" / "checkpoints" / "pi05_libero"
 
 
 def main():

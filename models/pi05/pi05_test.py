@@ -54,7 +54,7 @@ from quant_lib import (
 
 def _load_config(path=None):
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi05_libero_config.json")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi05_config.json")
     with open(path) as f:
         return json.load(f)
 
@@ -66,7 +66,7 @@ IS_VLM = True
 
 # Bin subdir name (script-dir-relative, qwen3 convention). Everything generated --
 # params/programs bins AND the weights_export/ tree -- lives under it.
-_BIN_SUBDIR = _CFG["paths"].get("bin_dir", "pi05_libero_bin")
+_BIN_SUBDIR = _CFG["paths"].get("bin_dir", "pi05_bin")
 
 
 def _weights_export_dir(script_dir=None):
@@ -318,7 +318,7 @@ def ensure_weights_export(script_dir=None):
         "\n"
         f"\n              target : {os.path.abspath(wdir)}"
         "\n              size   : ~13 GB on disk (plus the openpi checkpoint cached"
-        "\n                       under pi05_libero_bin/)"
+        "\n                       under pi05_bin/)"
         "\n              time   : expect this to take a while (download-bound)."
         "\n"
         "\n              This happens ONCE. Subsequent runs detect the export and skip it."
@@ -352,7 +352,7 @@ BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
 # programs.json's `derived` block at dump time and restored verbatim by Pi05Libero_Run.
 #
 # Persisted rather than recomputed from config on purpose: these are what the compiled
-# programs were actually BUILT against. Recomputing from pi05_libero_config.json would
+# programs were actually BUILT against. Recomputing from pi05_config.json would
 # silently diverge from the baked programs if the config were ever edited after a dump
 # (garbage output, not an error), and VIS_HEAD_OUT is not config-derived at all -- it
 # comes from the exported head-kernel's real shape.
@@ -3191,6 +3191,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     MACS_PER_CYCLE = 64      # ASSUMPTION: 64-ALU vector unit = 64 MACs/cycle. If the
                              # matmul core is a 64xN systolic array this is higher --
                              # set to the real MAC/cycle to get an accurate %-of-peak.
+    # Measured whole-device ceiling, all engines, IF4. Overrides the MACS_PER_CYCLE
+    # estimate above for %-of-peak, which is the ONLY self-check on the issued-FLOP
+    # model: any stage printing >100% means the FLOP accounting drifted from what the
+    # emitters issue, NOT that the silicon beat its own ceiling. That check is what
+    # caught the denoise stage reporting 401 GFLOP/s (see _denoise_flops).
+    # Set to None to fall back to the MACS_PER_CYCLE x engine-count estimate.
+    DEVICE_PEAK_GFLOPS = 375.0
     AE_ACTION_HORIZON = 10
     AE_ACTION_HORIZON_PADDED = 64  # padded for 64-alignment (see AE_M_PROBE)
 
@@ -3508,6 +3515,25 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.AE_KV_LAYER_STRIDE = Tkv * D * bpe
         self.ae_k_combined = [self.allocate_tensor_dram(self.AE_KV_LAYER_STRIDE) for _ in range(self.AE_LAYERS)]
         self.ae_v_combined = [self.allocate_tensor_dram(self.AE_KV_LAYER_STRIDE) for _ in range(self.AE_LAYERS)]
+        # MUST be zeroed, exactly like AE_Q_DRAM/AE_Q_ROPE_DRAM below -- this was a
+        # live NaN bug, not defensive coding.
+        #
+        # AE_TRIM_PAD_ROWS computes S_M = AE_ACTION_HORIZON (10) of the S = 64
+        # physical suffix rows, so the per-step K/V projection writes suffix rows
+        # [P:P+10] and NEVER touches [P+10:P+64]. Those rows are pure allocation
+        # garbage, and a bf16 word of 0xFFFF is NaN. The suffix bias masks those
+        # columns with NEG_INF = -1e9, which suppresses a large FINITE score but
+        # cannot suppress a NaN one: q.k is NaN, NaN + -1e9 is NaN, exp(NaN) is NaN,
+        # and the softmax denominator takes every head down with it. Symptom is all
+        # 8 heads of L0 rawattn going NaN while Q/K/RoPE upstream still score 46 dB.
+        #
+        # Zero ONCE here rather than per step: the trimmed program never writes these
+        # rows, so they stay zero for all 10 Euler steps and every later inference.
+        # Re-running the projections at the padded 64 (PI05_AE_TRIM=0) also fixes it,
+        # but pays 54 dead rows on every row-independent op in 18 layers x 10 steps.
+        _zero_kv = torch.zeros(Tkv, D, dtype=torch.bfloat16).contiguous()
+        for _addr in (*self.ae_k_combined, *self.ae_v_combined):
+            self.dma_write(DMA_DEVICE_H2C, _addr, _zero_kv, self.AE_KV_LAYER_STRIDE)
 
         # Q buffer: (heads, Tkv, D) -- only rows [0:S] per head are real suffix
         # queries; rows [S:Tkv] are padding so prefill_flash_attention_core (which
@@ -5923,11 +5949,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         if seconds <= 0:
             return
         eff, hw = flops if isinstance(flops, (tuple, list)) else (flops, flops)
-        peak = self.MACS_PER_CYCLE * 2 / (self.CYCLE_NS * 1e-9) / 1e9  # GFLOP/s
+        peak = self.DEVICE_PEAK_GFLOPS or (
+            self.MACS_PER_CYCLE * 2 / (self.CYCLE_NS * 1e-9) / 1e9 * self.NUM_ENGINES)
+        rate = hw / seconds / 1e9
+        pct = 100 * rate / peak
         print(f"  ⚡ {label:<18} {seconds:6.1f}s")
         print(f"       effective : {eff/1e9:8.1f} GFLOP  {eff/seconds/1e9:7.1f} GFLOP/s")
-        print(f"       hw-issued : {hw/1e9:8.1f} GFLOP  {hw/seconds/1e9:7.1f} GFLOP/s  "
-              f"[{100*(hw/seconds/1e9)/peak:4.0f}% peak]")
+        print(f"       hw-issued : {hw/1e9:8.1f} GFLOP  {rate:7.1f} GFLOP/s  "
+              f"[{pct:4.0f}% peak]" + ("  <-- ABOVE PEAK: the issued-FLOP model is "
+                                       "wrong, not the hardware" if pct > 100 else ""))
 
     def _n_vision_slots_encoded(self):
         """Image slots the encoder actually RAN: all of them unless zero slots are
@@ -5965,18 +5995,42 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         return f, f
 
     def _denoise_flops(self):
-        """(effective, hw_issued). effective uses the real action horizon (10) and
-        action_dim (32); hw_issued uses the padded 64/64 the FPGA tiles."""
+        """(effective, hw_issued) for the whole denoise loop.
+
+        effective  = real action horizon (10) and action_dim (32).
+        hw_issued  = what the stage ACTUALLY runs, which is NOT uniformly padded:
+                     AE_TRIM_PAD_ROWS (default on) runs every row-independent op
+                     -- AdaRMSNorm, q/k/v, o, the gated MLP, action_in/out -- at
+                     the real 10 rows, while ATTENTION stays at the padded 64
+                     because unified_attention_core_dynamic asserts
+                     aligned_seq_len % 64. So the two row counts differ and cannot
+                     come from a single _xformer_flops call.
+
+        Reporting one padded M for everything is what produced an "issued" rate
+        ABOVE the device ceiling (483.5 GFLOP -> 401 GFLOP/s on a ~375 GFLOP/s
+        part). That figure was the PRE-trim measurement quoted in
+        AE_TRIM_PAD_ROWS's comment -- the trim landed, this accounting did not
+        follow. Anything over peak here means these row counts drifted from what
+        the emitters actually issue.
+        """
         P = self.PREFIX_SEQ_LEN
-        H = self.AE_HIDDEN
-        def one(S, W, Mkv):
-            layer = self._xformer_flops(
-                M=S, Mkv=Mkv, hidden=H, inter=self.AE_INTERMEDIATE, layers=self.AE_LAYERS,
-                nq=self.AE_HEADS, nkv=self.AE_KV_HEADS, hd=self.HEAD_DIM, gated=True)
-            io = 2 * (2 * S * W * H) + 2 * (2 * S * H * W)  # action_in + action_out proj
-            return (layer + io) * self.AE_NUM_DENOISE_STEPS
-        eff = one(self.AE_ACTION_HORIZON, self.AE_ACTION_DIM_REAL, P + self.AE_ACTION_HORIZON)
-        hw = one(self.AE_ACTION_HORIZON_PADDED, self.AE_XT_WIDTH, P + self.AE_ACTION_HORIZON_PADDED)
+        H, I, L = self.AE_HIDDEN, self.AE_INTERMEDIATE, self.AE_LAYERS
+        qd, kvd = self.AE_HEADS * self.HEAD_DIM, self.AE_KV_HEADS * self.HEAD_DIM
+
+        def one(Mp, Ma, W, Mkv):
+            """Mp = rows the row-independent ops run; Ma = rows attention runs."""
+            per = 2 * Mp * H * qd                # Q proj
+            per += 2 * (2 * Mp * H * kvd)        # K, V proj
+            per += 2 * Mp * qd * H               # O proj
+            per += 2 * 3 * Mp * H * I            # gated MLP
+            per += 2 * (2 * Ma * Mkv * qd)       # QK^T + scores @ V
+            io = 2 * (2 * Mp * W * H) + 2 * (2 * Mp * H * W)   # action_in + action_out
+            return (per * L + io) * self.AE_NUM_DENOISE_STEPS
+
+        real, pad = self.AE_ACTION_HORIZON, self.AE_ACTION_HORIZON_PADDED
+        eff = one(real, real, self.AE_ACTION_DIM_REAL, P + real)
+        # Attention always runs the padded batch; the rest only when the trim is off.
+        hw = one(real if self.AE_TRIM_PAD_ROWS else pad, pad, self.AE_XT_WIDTH, P + pad)
         return eff, hw
 
     def precompile_all(self):
@@ -6707,7 +6761,7 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
                              ("tensor_dram_base", self._tensor_dram_base),
                              ("params_dram_base", self._params_dram_base)):
             self._sig_check(_name, hex(_live), self.sig[_name],
-                            "pi05_libero_config.json's dram_layout changed since the bins "
+                            "pi05_config.json's dram_layout changed since the bins "
                             "were compiled -- regenerate the bins")
 
         # PREFIX_SEQ_LEN is normally set by compile_prefix, which never runs here.
@@ -7145,7 +7199,7 @@ def main():
     ap.add_argument("--encdump", default=None,
                      help="--encoderend: PREFIX for the per-slot .npy dumps; each slot is "
                           "written to <prefix>_slot<i>_<checkpoint>.npy (default prefix: "
-                          "models/pi05_libero/enc_only_ne<N>).")
+                          "models/pi05/enc_only_ne<N>).")
     ap.add_argument("--prefixend", action="store_true",
                      help="Run the pipeline through the END OF THE PREFIX stage and stop: "
                           "vision encoder, then the Gemma-2B prefix pass that builds the "
@@ -7155,7 +7209,7 @@ def main():
                           "counts and the prefix's 64-row block split.")
     ap.add_argument("--prefixdump", default=None,
                      help="--prefixend: path for the prefix K/V .npy dump (default: "
-                          "models/pi05_libero/prefix_end_ne<N>_kv.npy).")
+                          "models/pi05/prefix_end_ne<N>_kv.npy).")
     def _engines_arg(value):
         """--engines N | max.  'max' == each stage's own ceiling, not a flat 8."""
         if str(value).strip().lower() == "max":

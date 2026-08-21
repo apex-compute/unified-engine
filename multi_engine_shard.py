@@ -35,7 +35,7 @@ SHARED_FULL  one buffer every engine reads in full (weights, K/V, pos tables,
              identity, zero-bias): pass the address through unchanged.
 PER_ENGINE   scratch that is WRITTEN as scratch and therefore must be
              duplicated (pi05's ``vis_zeros_addr``, which layer_norm_core_dram
-             writes into -- see models/pi05_libero/pi05_test.py:2265).
+             writes into -- see models/pi05/pi05_test.py:2265).
              Register it with :meth:`register_per_engine`; the primary keeps
              its existing address, workers get scheduler-allocated copies.
 
