@@ -13,21 +13,17 @@ Everything below is run from the **repo root**. Commands 1-2 are one-time; 3 is 
 single FPGA inference; 4-5 are the closed-loop LIBERO tests.
 
 ```bash
-# 1. env: FPGA inference only (no simulator). Skip if the repo env is already active.
+
+conda create -n pi05 python=3.12 -y
+
 pip install -r models/pi05/pi05_requirements.txt
 
-# 2. env: add the LIBERO simulator (conda env + robosuite/MuJoCo + OSMesa, no sudo).
-#    ONLY needed for commands 4-5. Skip it if you just want command 3.
-bash models/pi05/setup_env.sh && conda activate pi05_libero
+bash models/pi05/setup_env.sh
 
-# 3. SINGLE INFERENCE on the FPGA -- prints a (10,7) action chunk. ~14.5s.
-#    First run also downloads the checkpoint and exports weights (~13 GB, once).
 python models/pi05/pi05_test.py --engines max
 
-# 4. CLOSED-LOOP episode on the FPGA, under screen (hours -- must survive a dropped
-#    session). Writes a rollout video + per-episode results JSON under models/pi05/data/.
 screen -dmS pi05 bash -c 'MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
-  LD_LIBRARY_PATH=$CONDA_PREFIX/lib python models/pi05/utility/libero_eval.py \
+  LD_LIBRARY_PATH=${CONDA_PREFIX:-$VIRTUAL_ENV}/lib python models/pi05/utility/libero_eval.py \
   --backend fpga --task-suite libero_spatial --task-start 0 --tasks 1 --trials 1 \
   --engines max --dump-actions 2>&1 | tee models/pi05/libero_fpga.log'
 
@@ -67,7 +63,7 @@ command 4 with `--backend torch`, then diff the two action dumps with
 | `utility/pi05_weight_export.py` | checkpoint → `pi05_bin/weights_export/` (prep phase) |
 | `utility/pi05_ckpt_noopenpi.py` | orbax checkpoint reader, so the export works without openpi |
 | `utility/compare_bf16_if4.py` | bf16-vs-IF4 quantization sweep on the reference |
-| `setup_env.sh` | one-command conda env + LIBERO + OSMesa bring-up |
+| `setup_env.sh` | one-command LIBERO + OSMesa bring-up **into the active env** |
 | `document/` | the writeup (`main.tex`) and the episode videos it cites |
 
 The sample observation is two PNGs in the repo-root `test_samples/`
@@ -239,7 +235,7 @@ chunk executes open-loop; the other 9 obs are discarded (they still go into the 
 |---|---|---|
 | `ModuleNotFoundError: No module named 'libero'` after a successful `pip install` | `find_packages()` found nothing; the wheel is metadata-only | `libero_requirements.txt` uses `editable_mode=compat`, not a plain install |
 | `pip install -e` succeeds, import still fails | PEP 660 finder has `MAPPING = {}` | same fix — `editable_mode=compat` |
-| `AttributeError: 'NoneType' object has no attribute 'glGetError'` | `PYOPENGL_PLATFORM=osmesa` but no `libOSMesa` on the loader path | run `setup_env.sh`, set `LD_LIBRARY_PATH=$CONDA_PREFIX/lib` |
+| `AttributeError: 'NoneType' object has no attribute 'glGetError'` | `PYOPENGL_PLATFORM=osmesa` but no `libOSMesa` on the loader path | run `setup_env.sh`, set `LD_LIBRARY_PATH=<env prefix>/lib` |
 | `libEGL warning: failed to open /dev/dri/card0: Permission denied` | not in the `render`/`video` groups | use OSMesa (`setup_env.sh`), or `sudo usermod -aG render,video $USER` + re-login |
 | `Cannot initialize a EGL device display … PLATFORM_DEVICE extension` | robosuite needs EGL device platform; surfaceless is not enough | same as above |
 | `_pickle.UnpicklingError: Weights only load failed` | torch ≥2.6 flipped `weights_only` to True; LIBERO's init states are pickled numpy | already shimmed in `libero_eval.py`; add `torch.load = functools.partial(torch.load, weights_only=False)` for standalone scripts |

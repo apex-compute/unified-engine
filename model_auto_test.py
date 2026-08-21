@@ -343,7 +343,7 @@ def _check_mbv2_ssd(text):
     )
 
 def _check_pi05(text):
-    # pi05_libero is a robot policy: no text output, no labels. It emits a (10,7) action
+    # pi05 is a robot policy (VLA): no text output, no labels. It emits a (10,7) action
     # chunk plus a summary line "nan=False inf=False min=-0.1234 max=0.5678".
     # Pass signal: the run reached the denoise output and the chunk is finite.
     m = re.search(r"nan=(True|False)\s+inf=(True|False)\s+min=(-?[\d.]+)\s+max=(-?[\d.]+)", text)
@@ -398,7 +398,12 @@ TESTS = [
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
 
     # Robot policy (VLA): no --prompt, no text output -- emits a (10,7) action chunk from
-    # its in-repo LIBERO sample frames in test_samples/ (pi05_libero_base/wrist.png).
+    # its in-repo LIBERO sample frames in test_samples/ (pi05_libero_base/wrist.png --
+    # named for the upstream checkpoint, not the model dir). Runs at the default
+    # --engines 1, which is the bin-eligible path: pass 1 compiles + dumps bins, pass 2
+    # loads them. The harness poisons DRAM before every pass, which is exactly the
+    # condition that exposed the action-expert suffix K/V NaN -- so a regression in
+    # tensor_init_action_expert's zero-fill fails here rather than silently.
     {"name": "pi05", "script": "models/pi05/pi05_test.py", "pass_check": _check_pi05},
 ]
 

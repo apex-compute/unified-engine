@@ -5,14 +5,15 @@
 #   bash models/pi05/setup_env.sh --osmesa-only  # just the OSMesa step
 #   bash models/pi05/setup_env.sh --verify-only  # just re-run the checks
 #
-# Creates the `pi05_libero` conda env, installs the one library conda cannot
-# (libOSMesa), seeds LIBERO's interactive first-run prompt, and verifies the
-# result. Idempotent: safe to re-run.
+# INSTALLS INTO THE PYTHON ENV YOU ARE ALREADY IN -- it does NOT create one.
+# Activate the env you want first (conda, venv, whatever), then run this. It pip-
+# installs libero_requirements.txt, drops in the one library pip cannot supply
+# (libOSMesa), seeds LIBERO's interactive first-run prompt, and verifies the result.
+# Idempotent: safe to re-run.
 #
 # Needs NO sudo. `apt-get download` is a plain file download, not an install.
 set -euo pipefail
 
-ENV_NAME=pi05_libero
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REQ="$REPO_ROOT/models/pi05/libero_requirements.txt"
 
@@ -23,50 +24,46 @@ MODE=all
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\n\033[31mFAILED: %s\033[0m\n' "$*" >&2; exit 1; }
 
-command -v conda >/dev/null || die "conda not on PATH"
-CONDA_BASE="$(conda info --base)"
-# shellcheck disable=SC1091
-source "$CONDA_BASE/etc/profile.d/conda.sh"
+# ------------------------------------------------------- 1. use the active env
+# PREFIX is where libOSMesa gets installed and what LD_LIBRARY_PATH must point at
+# later, so we need a real, writable env root -- not the system python.
+PREFIX="${CONDA_PREFIX:-${VIRTUAL_ENV:-}}"
+[[ -n "$PREFIX" ]] || die "no active Python env detected (\$CONDA_PREFIX / \$VIRTUAL_ENV are unset).
+   Activate the env you want pi05 installed into, then re-run:
+       conda activate <your-env>     # or:  source <venv>/bin/activate
+   This script deliberately does NOT create an env for you."
+[[ -w "$PREFIX" ]] || die "active env is not writable: $PREFIX"
 
-# ---------------------------------------------------------------- 1. conda env
-# conda supplies ONLY what pip cannot: the interpreter and the GL userspace
-# (mesalib/libglu -- note neither ships libOSMesa, see step 2). Everything else
-# comes from libero_requirements.txt, which layers on pi05_requirements.txt.
+say "using active env: $PREFIX  ($(python -V 2>&1))"
+
 if [[ $MODE == all ]]; then
-  if conda env list | grep -qE "^${ENV_NAME}\s"; then
-    say "conda env '$ENV_NAME' exists -- reusing"
-  else
-    say "creating conda env '$ENV_NAME' (python 3.11 + mesalib + libglu)"
-    conda create -y -n "$ENV_NAME" -c conda-forge python=3.11 pip mesalib libglu
-  fi
-fi
-
-conda activate "$ENV_NAME"
-PREFIX="${CONDA_PREFIX:?conda activate failed}"
-say "env ready: $PREFIX"
-
-# cd to repo root: the LIBERO editable install clones to ./src/libero
-if [[ $MODE == all ]]; then
+  # cd to repo root: the LIBERO editable install clones to ./src/libero
   say "pip install -r $REQ"
   ( cd "$REPO_ROOT" && pip install -r "$REQ" )
 fi
 
 # ------------------------------------------------------------------ 2. OSMesa
-# The ONE dependency conda cannot supply. conda-forge's mesalib ships GL/GLX/EGL
-# and llvmpipe but NOT libOSMesa (verified absent in 25.2.8 and 26.1.6), and
-# there is no standalone `osmesa` package. EGL is not a substitute: robosuite's
+# The ONE dependency no Python package manager supplies. conda-forge's mesalib
+# ships GL/GLX/EGL and llvmpipe but NOT libOSMesa (verified absent in 25.2.8 and
+# 26.1.6), there is no standalone `osmesa` package, and pip has nothing at all.
+# So it is fetched from the Debian archive and unpacked into the active env's
+# lib/ -- no sudo, nothing touched outside $PREFIX. EGL is not a substitute: robosuite's
 # EGLGLContext needs the PLATFORM_DEVICE extension and therefore /dev/dri, which
 # is denied unless you are in the render/video groups.
 if [[ $MODE == all || $MODE == osmesa ]]; then
   if [[ -f "$PREFIX/lib/libOSMesa.so.8" ]]; then
     say "libOSMesa already present -- skipping"
   else
-    say "installing libOSMesa into \$CONDA_PREFIX/lib (no sudo)"
+    say "installing libOSMesa into $PREFIX/lib (no sudo)"
     TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
     ( cd "$TMP" && apt-get download libosmesa6 ) \
       || die "apt-get download libosmesa6 failed. If you are not on Debian/Ubuntu,
    install libOSMesa by hand into $PREFIX/lib, or use MUJOCO_GL=egl if you have a
-   usable /dev/dri render node and are in the 'render' group."
+   usable /dev/dri render node and are in the 'render' group.
+   NOTE: this script no longer creates a conda env, so it no longer pulls conda-forge's
+   mesalib/libglu either. If verification fails on a missing libGL/libGLU rather than
+   libOSMesa, install those into the active env yourself (conda-forge mesalib libglu)
+   or via your distro."
     dpkg -x "$TMP"/libosmesa6_*.deb "$TMP/root"
     cp "$TMP/root/usr/lib/x86_64-linux-gnu/libOSMesa.so.8.0.0" "$PREFIX/lib/"
     ln -sf libOSMesa.so.8.0.0 "$PREFIX/lib/libOSMesa.so.8"
@@ -89,7 +86,7 @@ fi
 say "verifying"
 export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa LD_LIBRARY_PATH="$PREFIX/lib"
 
-python - <<'PY' || die "verification failed -- see models/pi05/README.md section 8"
+python - <<'PY' || die "verification failed -- see models/pi05/README.md section 5 (Troubleshooting)"
 import functools, os, sys
 
 # torch >= 2.6 flipped torch.load's weights_only default to True, which refuses
@@ -124,11 +121,10 @@ cat <<EOF
 
 $(printf '\033[32m%s\033[0m' "SETUP COMPLETE")
 
-Every run needs these three exports:
+With your env active, every LIBERO run needs these two exports:
 
-    conda activate $ENV_NAME
     export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
-    export LD_LIBRARY_PATH=\$CONDA_PREFIX/lib
+    export LD_LIBRARY_PATH=$PREFIX/lib
 
 Next:
     # single inference on the FPGA (~50s, downloads+exports weights on first run)

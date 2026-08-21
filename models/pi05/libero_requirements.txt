@@ -15,11 +15,12 @@
 #     are in the render/video groups.
 #   * mesalib / libglu themselves.
 #
-# `bash models/pi05/setup_env.sh` installs all of that (no sudo needed) and
-# seeds LIBERO's interactive first-run prompt. Then every run needs:
+# `bash models/pi05/setup_env.sh` installs all of that (no sudo needed) and seeds
+# LIBERO's interactive first-run prompt. It installs into whatever Python env is
+# ACTIVE -- it does not create one, so activate your env first. Then every run needs:
 #
 #   export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
-#   export LD_LIBRARY_PATH=$CONDA_PREFIX/lib
+#   export LD_LIBRARY_PATH=<env prefix>/lib
 
 -r pi05_requirements.txt
 

@@ -16,15 +16,14 @@ bash models/pi05/setup_env.sh
 
 That creates the `pi05_libero` conda env (python 3.11 + mesalib + libglu), pip-installs
 `libero_requirements.txt`, installs the one library neither can supply (`libOSMesa`), seeds LIBERO's interactive first-run prompt, and verifies
-the whole thing renders. It is idempotent — safe to re-run, and it updates an existing
-env rather than recreating it. **No sudo required.**
+the whole thing renders. It is idempotent — safe to re-run. **No sudo required.**
 
-Then, in every shell you run from:
+It installs into the Python env that is **already active** and creates none, so activate
+your env before running it. Then, in every shell you run from:
 
 ```bash
-conda activate pi05_libero
 export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib
+export LD_LIBRARY_PATH=${CONDA_PREFIX:-$VIRTUAL_ENV}/lib
 ```
 
 A successful setup prints:
@@ -41,28 +40,30 @@ Re-run just the checks any time with `setup_env.sh --verify-only`.
 
 ### What it is doing, and why you can't skip it
 
-One conda env holds everything: the FPGA model **and** the LIBERO simulator run in the
-same process — no socket, no server/client. CPU-only; no CUDA device required. The pins
-in the yaml are load-bearing (`numpy<2` is what lets robosuite and `user_dma_core`
-coexist in one interpreter). Three things are sharper than they look:
+One env holds everything: the FPGA model **and** the LIBERO simulator run in the same
+process — no socket, no server/client. CPU-only; no CUDA device required. The pins in
+`pi05_requirements.txt` / `libero_requirements.txt` are load-bearing (`numpy<2` is what
+lets robosuite and `user_dma_core` coexist in one interpreter). Three things are sharper
+than they look:
 
 **LIBERO cannot be pip-installed normally.** `pip install git+…LIBERO` reports success
 and installs a ~5.5 KB *metadata-only* wheel — LIBERO is a PEP 420 namespace package
 with no `libero/__init__.py`, so its `setup.py`'s `find_packages()` returns nothing.
 Plain `pip install -e` is *also* broken: PEP 660 generates a finder with
-`MAPPING = {}`. The yaml therefore pins `-e … --config-settings editable_mode=compat`,
+`MAPPING = {}`. `libero_requirements.txt` therefore pins
+`-e … --config-settings editable_mode=compat`,
 which falls back to the legacy `.pth` mechanism and puts the project root on
 `sys.path`. **Never trust pip's success message here** — `import libero.libero` is the
 only real check, which is why the script does exactly that.
 
-**OSMesa is not on conda-forge.** `mesalib` ships GL/GLX/EGL and the llvmpipe software
+**OSMesa ships with no Python package manager.** `mesalib` ships GL/GLX/EGL and the llvmpipe software
 rasterizer but no `libOSMesa` (verified absent in both 25.2.8 and 26.1.6), and there is
 no standalone `osmesa` package. EGL is not a substitute: MuJoCo's own `Renderer` can go
 surfaceless, but robosuite uses `EGLGLContext`, which needs the `PLATFORM_DEVICE`
 extension and therefore `/dev/dri` — denied unless you are in the `render`/`video`
 groups, and `LIBGL_ALWAYS_SOFTWARE` will not save you. The script pulls Ubuntu's
 `libosmesa6` via `apt-get download` (a plain download, not an install), extracts it, and
-drops `libOSMesa.so.8` into `$CONDA_PREFIX/lib`. No missing transitive deps.
+drops `libOSMesa.so.8` into the active env's `lib/`. No missing transitive deps.
 
 > **If you have a usable render node** (`ls -l /dev/dri` shows `renderD128` and you are
 > in the `render` group), skip OSMesa and use `MUJOCO_GL=egl` — it is faster. Add
@@ -217,7 +218,7 @@ Roughly 37 s of execution plus ~13 s of one-time compile. Single-engine
 ```bash
 screen -dmS pi05_obj bash -c 'cd /home/rohit/unified-engine && \
   MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
-  LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
+  LD_LIBRARY_PATH=${CONDA_PREFIX:-$VIRTUAL_ENV}/lib \
   python models/pi05/utility/libero_eval.py \
     --backend fpga --task-suite libero_object --tasks 1 --trials 1 \
     --engines max --dump-actions 2>&1 \

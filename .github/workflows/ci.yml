@@ -2,7 +2,14 @@ name: Model HW CI
 
 # Runs the local CI suite (run_ci.sh): generic hardware op tests, then the two
 # Gemma4 E2B image cases by default. A manual full-run checkbox runs every
-# registered model instead.
+# registered model instead -- that registry is model_auto_test.py's TESTS list and
+# includes pi05 (robot policy / VLA). The nightly (night-run.yml) dispatches this
+# workflow with full_run: 'true', so pi05 is covered every night.
+#
+# pi05 note: its first run on a clean runner downloads the upstream checkpoint and
+# exports ~13 GB into models/pi05/pi05_bin/weights_export/. That needs the jax /
+# orbax / flax pins from models/pi05/pi05_requirements.txt to be present in the
+# runner's env. The checkout step preserves models/, so this is a one-time cost.
 # Models compile from scratch and run from their cached bins, with DRAM randomized
 # (poisoned) before every single pass. Stops on first failure.
 # Requires the FPGA device, so this must run on a self-hosted runner with the

@@ -13,9 +13,10 @@ comparable EPISODE BY EPISODE. That pairing is the point: it turns
 two noisy success percentages with overlapping confidence intervals.
 
 Setup once:
-    conda create -n pi05_libero python=3.11 -y && conda activate pi05_libero
-    pip install -r models/pi05/requirements.txt
-    pip install -e ~/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero
+    # Activate your Python env first -- setup_env.sh installs INTO it and creates none.
+    # It pip-installs libero_requirements.txt (which layers on pi05_requirements.txt)
+    # and drops in libOSMesa, which no Python package manager ships.
+    bash models/pi05/setup_env.sh
 
 Run:
     # golden reference on GPU -- start here
