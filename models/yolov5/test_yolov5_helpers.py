@@ -487,6 +487,15 @@ class PlannerTests(unittest.TestCase):
         engine.require_native_conv_hardware()
 
     def test_queued_geometry_is_ordered_and_hash_gated(self):
+        self.assertEqual(
+            (
+                user_dma_core.UE_CONV_GEOM_ADDR,
+                user_dma_core.UE_CONV_CTRL_ADDR,
+                user_dma_core.UE_CONV_STRIDE_ADDR,
+                user_dma_core.UE_CONV_PIXSTEP_ADDR,
+            ),
+            (0x0000006C, 0x000000A4, 0x000000A8, 0x000000AC),
+        )
         engine = user_dma_core.UnifiedEngine.__new__(user_dma_core.UnifiedEngine)
         engine.hw_version = 0xDCACD7AA
         engine._allow_unknown_conv_hardware = False

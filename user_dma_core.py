@@ -71,9 +71,9 @@ UE_INT_REG = 0x0000009C  # bits [1:0] interrupt cause; write clears latch (axi_l
 # four values in instruction order; programs without CONFIG retain this CSR
 # fallback.
 UE_CONV_GEOM_ADDR = 0x0000006C     # [11:0] out_w, [23:12] out_h, [30:24] CT
-UE_CONV_CTRL_ADDR = 0x000000A0     # [3:0] kernel_w, [7:4] kernel_h, [23:8] oc_count
-UE_CONV_STRIDE_ADDR = 0x000000A4   # [11:0] row_stride, [23:12] col_stride
-UE_CONV_PIXSTEP_ADDR = 0x000000A8  # [11:0] pix_col_step, [23:12] pix_row_step
+UE_CONV_CTRL_ADDR = 0x000000A4     # [3:0] kernel_w, [7:4] kernel_h, [23:8] oc_count
+UE_CONV_STRIDE_ADDR = 0x000000A8   # [11:0] row_stride, [23:12] col_stride
+UE_CONV_PIXSTEP_ADDR = 0x000000AC  # [11:0] pix_col_step, [23:12] pix_row_step
 # Git-derived FPGA version-register values whose RTL includes the native
 # CONV2D/MAXPOOL modes and geometry CSRs.  Development builds can be admitted
 # explicitly per UnifiedEngine instance after their RTL has been verified.
