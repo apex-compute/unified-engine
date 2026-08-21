@@ -6289,6 +6289,9 @@ class UnifiedEngine:
         assert len(m_shards) == num_engines and sum(m_shards) == M and all(m >= 1 for m in m_shards), \
             f"m_shards must be {num_engines} positive counts summing to M={M}, got {m_shards}"
 
+        assert all(m % UE_VECTOR_SIZE == 0 for m in m_shards), \
+            f"each M shard must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got {m_shards}"
+
         total_flops = 0
         program_addrs = []
         row_offset = 0
@@ -8700,7 +8703,7 @@ class UnifiedEngine:
             return
         if inst_type == INSTRUCTION_FLAG:
             flag_mode = isa_mode
-            target_engine = src_reg_idx & 0x7
+            target_engine = src_reg_idx & 0xF
             flag_mode_names = {
                 FLAG_MODE_SET: "SET",
                 FLAG_MODE_CLEAR: "CLEAR",
@@ -9245,10 +9248,10 @@ class UnifiedEngine:
         Spin-wait until target engine's flag is 1 before proceeding.
 
         Args:
-            target_engine_idx: Engine index (0-7) whose flag to wait on
+            target_engine_idx: Engine index (0-15) whose flag to wait on
         """
-        if target_engine_idx < 0 or target_engine_idx > 7:
-            print(f"ERROR: target_engine_idx must be 0-7, got {target_engine_idx}")
+        if target_engine_idx < 0 or target_engine_idx > 15:
+            print(f"ERROR: target_engine_idx must be 0-15, got {target_engine_idx}")
             return
         self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK,
                                src_reg_idx=target_engine_idx)

@@ -989,7 +989,7 @@ class Gemma4LMMixin:
                     total_flops += _emit_prefill_head(
                         self, g, self.LAYER0_FLASH_SCRATCH_DRAM,
                         self.gpr_seq_len, self.gpr_aligned_seq_len)
-            else:
+            elif prefill_scheduler.num_engines <= self.group_size:
                 # Multi core: shard the group heads across engines; each engine
                 # LOOPS its own heads (batch=seq per head — prefill can't stack
                 # heads into one batch, that would break batch<=aligned and the
@@ -1014,6 +1014,19 @@ class Gemma4LMMixin:
                     self.group_size, per_head_rows, cur_head_dim,
                     _emit_prefill_attn_shard, gqa_ratio=1)
                 total_flops += _attn_flops[0]
+            else:
+                # Gemma4 E2B has eight LM query/KV groups. With 9-12 engines
+                # there are fewer heads than engines, so head sharding cannot
+                # give every engine non-empty work. Keep all workers in the
+                # program's barrier sequence and execute attention on the
+                # primary; projection and post-attention regions still use all
+                # selected engines.
+                prefill_scheduler.barrier()
+                for g in range(self.group_size):
+                    total_flops += _emit_prefill_head(
+                        self, g, self.LAYER0_FLASH_SCRATCH_DRAM,
+                        self.gpr_seq_len, self.gpr_aligned_seq_len)
+                prefill_scheduler.barrier()
             # Permute the head-major attention output back to token-major for O-proj.
             for g in range(self.group_size):
                 self._emit_strided_copy_pbi(

@@ -442,7 +442,9 @@ class Gemma4VisionMixin:
         # post-attention/MLP intermediates, the QKV/MLP clip workspaces, the
         # unused VIS_ATTN_P buffer plus explicit pad, and embed-pool outputs.
         # Carve fixed-size, non-overlapping blocks and use only as many as the
-        # selected engine count needs (maximum seven workers).
+        # selected engine count needs. If the dead-region aliases do not cover
+        # every worker, use the remaining space in the 1-GiB tensor arena for
+        # dedicated scratch; the tensor-vs-weight guard below remains final.
         alias_regions = [
             (self.VIS_POST_ATTN_NORM,
              self.VIS_POST_FFN_NORM + S * H * bpe,
@@ -464,10 +466,12 @@ class Gemma4VisionMixin:
                 alias_candidates.append((addr, region_name))
                 addr = self._align_up(addr + attn_scratch_bytes, 64)
         workers_needed = self.multi_core - 1
-        if len(alias_candidates) < workers_needed:
-            raise MemoryError(
-                f"Gemma4 needs {workers_needed} worker attention scratch buffers "
-                f"but only {len(alias_candidates)} safe alias region(s) fit")
+        dedicated_needed = max(0, workers_needed - len(alias_candidates))
+        for _ in range(dedicated_needed):
+            alias_candidates.append((
+                self.allocate_tensor_dram(attn_scratch_bytes),
+                "dedicated_tensor_arena",
+            ))
         chosen_aliases = alias_candidates[:workers_needed]
         self.VIS_FLASH_SCRATCH_PER_ENGINE.extend(
             addr for addr, _ in chosen_aliases)
