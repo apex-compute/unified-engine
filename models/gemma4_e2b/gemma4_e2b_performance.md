@@ -1,5 +1,23 @@
 # Gemma4 E2B performance
 
+## Alveo U55C scaling
+
+Measured on Alveo U55C (`xdma0`, HW version `0x68f0c76c`) at 300 MHz using
+the current single-core and 2/4/8/10/12-core image-run summaries.
+
+| Metric | 1 core | 2 cores | 4 cores | 8 cores | 10 cores | 12 cores |
+|---|---:|---:|---:|---:|---:|---:|
+| Peak throughput (GFLOPS) | 38.4 | 76.8 | 153.6 | 307.2 | 384.0 | 460.8 |
+| DRAM read speed (MB/s) | 8,288.7 | 8,953.0 | 14,414.1 | 25,483.9 | 31,793.0 | 38,250.6 |
+| Vision throughput (GFLOPS) | 32.3 | 60.8 | 115.0 | 187.6 | 199.2 | 248.7 |
+| Vision utilization (% peak) | 84.0% | 79.2% | 74.9% | 61.1% | 51.9% | 54.0% |
+| Vision FPGA execution (s) | 35.6 | 18.9 | 10.0 | 6.1 | 5.8 | 4.6 |
+| Prefill throughput (GFLOPS) | 33.6 | 67.8 | 125.1 | 217.7 | 203.7 | 218.8 |
+| Prefill utilization (% peak) | 87.6% | 88.3% | 81.5% | 70.9% | 53.1% | 47.5% |
+| Prefill FPGA execution (s) | 31.5 | 15.6 | 8.5 | 4.9 | 5.2 | 4.8 |
+| Decode first-token speed (tok/s) | 5.6 | 5.8 | 5.8 | 5.8 | 5.5 | 5.5 |
+| Decode average speed (tok/s, CPU timer) | 5.3 | 5.5 | 5.5 | 5.4 | 5.2 | 5.2 |
+
 ## Test setup
 
 All implementations used `test_samples/yosemite.jpg`, the prompt

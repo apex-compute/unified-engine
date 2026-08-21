@@ -792,8 +792,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 "GEMMA4_PENALTY=1 is temporarily unsupported: the dynamic streaming "
                 "quantized_matmat_core must gain broadcast-bias support before the "
                 "on-FPGA penalty can be re-enabled.")
-        if not 1 <= multi_core <= 8:
-            raise ValueError(f"multi_core must be between 1 and 8, got {multi_core}")
+        if not 1 <= multi_core <= 12:
+            raise ValueError(f"multi_core must be between 1 and 12, got {multi_core}")
         if multi_core > 1 and vision_kernel != "matmatmul":
             raise ValueError("multi-engine vision projection sharding requires --vision-kernel matmatmul")
         if multi_core > 1:
@@ -825,11 +825,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # MULTI-CORE (full 4 GB, base 0x0):
         #   PARAMS  weights   : 0x00000000 – 0x80000000  (2 GiB;  LM ~1540 MB)
         #   TENSOR  acts/scr  : 0x80000000 – 0xC0000000  (1 GiB;  LM + vision,
-        #                        incl. up-to-8-engine vision scratch + top wts)
+        #                        incl. up-to-12-engine vision scratch + top wts)
         #   ISA vision core0  : 0xC0000000 – 0xC8000000  (128 MiB, master)
         #   ISA vision core1  : 0xC8000000 – 0xE0000000  (384 MiB, 2-core worker)
         #   ISA LM            : 0xE0000000 – 0xF0000000  (256 MiB)
-        #   ISA >2-core workrs: 0xF0000000 – 0x100000000 (256 MiB, 32 MiB/worker)
+        #   ISA >2-core workrs: 0xF0000000 – 0x100000000 (256 MiB, 16 MiB/worker)
         # Vision and LM programs remain resident at disjoint addresses.
         self.DRAM_END = 0x100000000
         if self.multi_core == 1:
@@ -847,7 +847,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.VISION_WORKER_ISA_BASE      = 0xC8000000
             self.LM_ISA_BASE                 = 0xE0000000
             self.MULTICORE_WORKER_ISA_BASE   = 0xF0000000    # >2-core worker arena
-            self.MULTICORE_WORKER_ISA_STRIDE = 0x02000000    # 32 MiB / worker
+            # Eleven 16-MiB slots support 12 engines and occupy 176 MiB of the
+            # 256-MiB worker arena. Current worker images are below 2 MiB; the
+            # per-section overflow checks below enforce the slot boundary.
+            self.MULTICORE_WORKER_ISA_STRIDE = 0x01000000    # 16 MiB / worker
         # Top of the vision tensor arena (vision weights are top-placed against
         # it; scratch stays below). In the multi-core layout every worker ISA
         # lives in the dedicated ISA region, so the tensor arena simply runs up
@@ -1902,7 +1905,7 @@ def add_engine_args(parser) -> None:
                              "(default: streaming).")
     parser.add_argument("--multi-core", nargs="?", const=2, default=1, type=int,
                         help="Enable multi-engine vision and LM prefill. Bare --multi-core "
-                             "selects 2 engines; --multi-core 8 selects 8 (Alveo only). "
+                             "selects 2 engines; up to 12 engines are supported on Alveo. "
                              "Multicore prefill always uses matmatmul.")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
@@ -1927,8 +1930,8 @@ def resolve_engine_config(parser, args) -> dict:
     this runs. Every loaded ``gemma4_e2b_*`` module binds ``DMA_DEVICE_*`` by
     value at import, so all of them are refreshed after ``set_dma_device()``.
     """
-    if args.multi_core not in range(1, 9):
-        parser.error("--multi-core must be between 1 and 8")
+    if args.multi_core not in range(1, 13):
+        parser.error("--multi-core must be between 1 and 12")
     if args.multi_core > 2 and args.device != "alveo" and args.device != "alveo_u55c":
         parser.error("--multi-core values above 2 are currently supported only on Alveo and Alveo U55C")
     if args.multi_core > 1:
