@@ -24,7 +24,11 @@ jobs:
         with:
           script: |
             const workflowId = 'ci.yml';
-            const branch = 'main';
+            // Dispatch ci.yml on the ref THIS workflow was launched from, so picking a
+            // branch in the Actions UI actually runs that branch's ci.yml + registry.
+            // On a `schedule` event context.ref is the default branch, so the nightly
+            // still targets main exactly as before.
+            const branch = (context.ref || 'refs/heads/main').replace('refs/heads/', '');
             const common = {
               owner: context.repo.owner,
               repo: context.repo.repo,
