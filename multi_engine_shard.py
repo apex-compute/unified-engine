@@ -798,12 +798,9 @@ class MultiEngineScheduler:
         its size cannot re-open the hole silently.
         """
         import torch
-        # MUST be bfloat16, not uint8. ``dma_read`` only round-trips bits
-        # losslessly for bf16 (and int32 registers): every other dtype goes
-        # through ``tensor_uint16.to(buffer.dtype)``, which is a NUMERIC CAST,
-        # not a reinterpretation (user_dma_core.py:1100). A uint8 buffer
-        # silently keeps the low byte of each 16-bit word and half the length,
-        # so "restoring" it corrupts the region worse than the self-test did.
+        # Keep the buffer in bfloat16 so its element count mirrors the self-
+        # test's 16-bit words. ``dma_read`` is byte-exact for every contiguous
+        # tensor dtype; no numerical conversion occurs here.
         buf = torch.zeros(DRAM_SELFTEST_GUARD_BYTES // 2, dtype=torch.bfloat16)
         self.primary.dma_read(self.primary.c2h_device,
                               user_dma_core.DRAM_START_ADDR, buf,

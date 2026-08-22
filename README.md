@@ -152,9 +152,10 @@ Options:
 
 ## Supported Models
 
-Gemma3 above is just the quick-start example. Every model below runs on the
-engine today; each folder has its own README/config, and most LLMs ship a
-`*_run_from_bin.py` for execute-only deploys from precompiled bins.
+Gemma3 above is just the quick-start example. Each model below has an engine
+integration and its own README/config; required FPGA images are called out
+where they differ from the bundled build. Most LLMs ship a `*_run_from_bin.py`
+for execute-only deploys from precompiled bins.
 
 | Model | Folder | Type |
 |---|---|---|
@@ -171,9 +172,79 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | GPT-2 | [`models/gpt2`](models/gpt2) | Text LM |
 | LocateAnything 3B | [`models/locateanything_3b`](models/locateanything_3b) | Open-vocabulary localization |
 | MobileNetV2 (224 + SSD-FPNLite 640) | [`models/mobilenetv2`](models/mobilenetv2) | Classification / detection |
+| YOLOv5n | [`models/yolov5n`](models/yolov5n) | Object detection (conv-enabled FPGA image required) |
+| YOLOv5s | [`models/yolov5`](models/yolov5) | Object detection (conv-enabled FPGA image required) |
 | Parakeet | [`models/parakeet`](models/parakeet) | Speech recognition (incl. streaming) |
 | MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
 | Swin | [`models/swin`](models/swin) | Image classification |
+
+YOLOv5n has dedicated commands, configuration, cache, and documentation under
+`models/yolov5n`; YOLOv5s remains under `models/yolov5`. The variants share the
+low-level YOLOv5 primitive implementation. Both use native CONV2D/MAXPOOL modes
+and ordered queue-CONFIG geometry from Andromeda's `pcie_conv_maxpool` line.
+The bundled `update_cf133b89.bin` predates those modes; see the model READMEs
+for the required corrected gather-IF8 commit before running either model. No
+compatible update image is shipped in this repository. YOLOv5 is therefore
+opt-in rather than part of the default suite. Both optimized artifacts are
+strictly validated on timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`,
+TNS `0`). That build includes the read-only `HW_INFO` register and remapped live
+geometry CSRs; it is the only build accepted by the optimized path. The
+direct-bin queue-CONFIG path does not write those live CSRs.
+
+Both variants support a single checkpoint-free model artifact:
+
+```bash
+make yolov5n_bin
+make model_test yolov5n_run_from_bin run_from_bin
+
+make yolov5s_bin
+make model_test yolov5s_run_from_bin run_from_bin
+
+# Select any exact profile embedded in the same bin (WIDTHxHEIGHT).
+python3 models/yolov5/yolov5_run_from_bin.py --resolution 640x480
+python3 models/yolov5n/yolov5n_run_from_bin.py --list-resolutions
+```
+
+Artifact version 5 is loaded and validated once. One bin embeds precompiled
+profiles for `256x256`, `320x320`, `416x416`, `512x512`, `640x480`, and
+`640x640` inputs. It stores mixed channel-IF4/gather-IF8 tensors, one shared
+fixed-address parameter image, and a resident program/dispatch table for each
+resolution. The hardware backend uploads the shared parameter image and only
+the selected program image; inference performs no static-weight
+repacking, program capture, or live geometry-CSR writes. It is still not one
+hardware launch: graph handoff needs multiple host dispatches, while
+concatenation and detection postprocessing remain host-side. See each model
+README for its direct CLI and artifact contract.
+
+The mixed-precision artifacts require the corrected gather-IF8 scale rewind
+introduced by Andromeda commit `77e8adf3`. Build `746d0a49` advances four
+low-channel activation taps per gather walker cycle and stores patches in
+timing-clean banked LUTRAM. Exact edge-tile CONFIG groups also avoid
+recomputing overlap-clamped outputs. Strict direct-bin runs on RK-256 at the
+`HW_INFO`-reported 333.25 MHz clock (3.000750188 ns), with no unknown-hardware
+override, reported:
+
+| Resolution | YOLOv5s FPGA only | YOLOv5n FPGA only |
+|---|---:|---:|
+| 256x256 | 84.366 ms | 30.374 ms |
+| 320x320 | 131.292 ms | 47.114 ms |
+| 416x416 | 222.054 ms | 79.300 ms |
+| 512x512 | 335.197 ms | 119.017 ms |
+| 640x480 | 392.433 ms | 139.268 ms |
+| 640x640 | 523.172 ms | 185.314 ms |
+
+The execution-wall timer covers the image-dependent graph replay, including
+host packing, dynamic DMA, 72 resident-program dispatches, and host
+concatenations. FPGA-only time is the corrected sum of queue-start-to-HALT
+latency counters; it excludes all host work and DMA. The two static uploads are
+the only model-state writes: there is no checkpoint load, quantization, static
+parameter repacking, or program capture at runtime. Hardware initialization
+still performs its DRAM self-test, and graph replay still performs
+image-dependent DMA. Artifact loading, preprocessing, decode, NMS, and drawing
+are outside both execution timers. The validated YOLOv5s run detects `car` at
+confidence `0.510560`; YOLOv5n detects seven `person` instances, led by
+confidence `0.685195`. At 256x256 both models meet the strict sub-100-ms FPGA
+execution target on one engine.
 
 Run the whole suite (or a subset) with the automated tester:
 
@@ -188,12 +259,13 @@ Notes on the two modes:
 - Without the `run_from_bin` word, `model_test` runs `make clean` first,
   which deletes cached model bins and rebuilds everything from the HF
   models (slow; needs the HF models available).
-- `run_from_bin` skips the pre-clean so models with a
-  `*_run_from_bin.py` runtime (the LLM/VLM rows above) reuse their bins.
-  gemma3, gpt2 and the vision/speech models have no runtime-only entry
-  yet and still run through their `*_test.py` scripts, which need their
-  model assets on disk. On a deploy host that only has pregenerated
-  bins, run the runtime-only subset by name, e.g.
+- `run_from_bin` skips the pre-clean; it does not automatically choose a
+  different script. Select a registered runtime-only model name explicitly.
+  YOLOv5 uses `yolov5n_run_from_bin` or `yolov5s_run_from_bin`; other models
+  with runtime-only entry points reuse their existing bins. Models without such
+  an entry still run through their `*_test.py` scripts and need their model
+  assets on disk. On a
+  deploy host, run the desired runtime-only names, for example
   `make model_test gemma4_e2b llama3.2_1b qwen3_4b run_from_bin`.
 
 ---
