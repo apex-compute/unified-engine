@@ -90,24 +90,13 @@ jobs:
 
           # pi05 intentionally uses Transformers 4.x, while Gemma4 requires the
           # Gemma4 model/processor support introduced in Transformers 5.5. Keep
-          # both contracts intact by installing Gemma4 into its own cached venv.
-          # The venv lives under the ignored model-bin cache, which checkout and
-          # clean_program_bins.sh preserve between self-hosted runner jobs.
-          GEMMA4_VENV="$GITHUB_WORKSPACE/models/gemma4_e2b/gemma4_e2b_bin/.ci-venv"
-          GEMMA4_MARKER="$GEMMA4_VENV/.ue-environment-key"
+          # both contracts intact by installing Gemma4 into its own per-job venv.
+          # Never execute an interpreter persisted in the workspace: pull-request
+          # jobs share this runner, while git clean deliberately preserves model
+          # caches. The global pip download cache still makes this setup cheap.
+          GEMMA4_VENV="$RUNNER_TEMP/ue-gemma4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           GEMMA4_REQUIREMENTS="$GITHUB_WORKSPACE/models/gemma4_requirements.txt"
-          GEMMA4_ENVIRONMENT_KEY="$(python -c \
-            'import sys; print(f"{sys.executable}:{sys.version.split()[0]}")'):$(sha256sum "$GEMMA4_REQUIREMENTS" | awk '{print $1}')"
-          CACHED_GEMMA4_KEY=""
-          if [[ -f "$GEMMA4_MARKER" ]]; then
-            CACHED_GEMMA4_KEY=$(<"$GEMMA4_MARKER")
-          fi
-          mkdir -p "$(dirname "$GEMMA4_VENV")"
-          if [[ ! -x "$GEMMA4_VENV/bin/python" || "$CACHED_GEMMA4_KEY" != "$GEMMA4_ENVIRONMENT_KEY" ]]; then
-            # --clear makes a stale cache recoverable if the runner Python or the
-            # pinned requirements change, without touching model weights beside it.
-            python -m venv --clear "$GEMMA4_VENV"
-          fi
+          python -m venv --clear "$GEMMA4_VENV"
 
           # Reuse the runner's large shared packages (most importantly torch)
           # without inheriting its Transformers 4.x import. An explicit .pth is
@@ -166,7 +155,6 @@ jobs:
                   raise SystemExit("Gemma4 <|video|> token is not marked special")
               print(f"Gemma4 tokenizer ready: {tokenizer_dir}")
           PY
-          printf '%s\n' "$GEMMA4_ENVIRONMENT_KEY" > "$GEMMA4_MARKER"
           echo "GEMMA4_PYTHON=$GEMMA4_VENV/bin/python" >> "$GITHUB_ENV"
 
           python -m unittest -v test_model_auto_test_interpreter.py
