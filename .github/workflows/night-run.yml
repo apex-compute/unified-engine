@@ -51,6 +51,9 @@ jobs:
               inputs: {
                 full_run: 'true',
                 clean_bins: 'false',
+                // pi05 runs first, and the model round runs before the HW op
+                // tests, so the nightly reports a pi05 verdict in ~2 min.
+                pi05_first: 'true',
               },
             });
 

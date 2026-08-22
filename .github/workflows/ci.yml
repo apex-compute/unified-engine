@@ -28,6 +28,11 @@ on:
         required: false
         type: boolean
         default: false
+      pi05_first:
+        description: "Run the model round BEFORE user_hw_test.py, with pi05 hoisted to the front (fast pi05 verdict)"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
   pull_request:
@@ -79,6 +84,10 @@ jobs:
           ARGS=()
           if [[ "${{ inputs.clean_bins }}" == "true" ]]; then
             ARGS+=(--clean-bins)
+          fi
+          # Must precede --only: run_ci.sh parses its flags positionally.
+          if [[ "${{ inputs.pi05_first }}" == "true" ]]; then
+            ARGS+=(--pi05-first)
           fi
           if [[ "${{ inputs.full_run }}" != "true" ]]; then
             # Keep both cases in one model_auto_test.py invocation. The first
