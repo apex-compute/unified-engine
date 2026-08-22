@@ -5,7 +5,11 @@ torchvision>=0.23.0
 torchaudio>=2.4
 soundfile
 numpy<2
-transformers>=4.40.0
+# >=5.5.0: models/gemma4_e2b pulls google/gemma-4-E2B-it, whose config declares
+# model_type "gemma4". That key only exists in transformers' CONFIG_MAPPING from the
+# 5.x line; on 4.x AutoConfig raises `KeyError: 'gemma4'`. 5.5.0 is the version
+# verified to register gemma4/gemma4_text/gemma4_vision/gemma4_audio.
+transformers>=5.5.0
 huggingface-hub>=0.20.0
 pillow>=12.1.1
 sentencepiece

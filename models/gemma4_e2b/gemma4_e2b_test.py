@@ -117,6 +117,42 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
                 tensors,
             ))
 
+    def _check_transformers_supports(config_path: str, hf_repo: str) -> None:
+        """Fail fast, and legibly, when the installed transformers cannot load this
+        checkpoint's architecture.
+
+        AutoConfig's own failure for an unknown architecture is a KeyError on
+        CONFIG_MAPPING re-raised as a ValueError, buried under two stack traces and
+        reported only AFTER the multi-GB snapshot_download has run. This turns it
+        into one line naming the model_type, the installed version, and the fix.
+
+        Real case: models/pi05's requirements pinned `transformers<5`, which silently
+        downgraded a shared env to 4.x. google/gemma-4-E2B-it declares model_type
+        "gemma4", which only exists in 5.x, so CI died with `KeyError: 'gemma4'` in a
+        model nobody had touched. Read-only and cheap -- it just parses config.json.
+        """
+        try:
+            with open(config_path) as fh:
+                model_type = json.load(fh).get("model_type")
+        except (OSError, ValueError):
+            return                      # let from_pretrained produce the real error
+        if not model_type:
+            return
+        try:
+            import transformers
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+        except ImportError:
+            return
+        if model_type in CONFIG_MAPPING_NAMES:
+            return
+        raise RuntimeError(
+            f"transformers {transformers.__version__} cannot load {hf_repo}: its "
+            f"config declares model_type {model_type!r}, which is not in this "
+            f"version's CONFIG_MAPPING.\n"
+            f"    Fix: pip install -U 'transformers>=5.5.0'  (see requirements.txt)\n"
+            f"    Do NOT cap transformers below 5 -- gemma4 support only exists in 5.x."
+        )
+
     def _ensure_hf_model(script_dir: str, cfg: dict):
         """Ensure HF model is downloaded and loaded. Returns (model, model_dir). Single place for download + load."""
         model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
@@ -136,6 +172,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
             _original_print(f"Downloading HF model {hf_repo} to {os.path.abspath(model_dir)} ...")
             snapshot_download(repo_id=hf_repo, local_dir=model_dir)
             _original_print("Download complete.")
+        _check_transformers_supports(config_path, hf_repo)
         model = AutoModelForImageTextToText.from_pretrained(
             model_dir, dtype=torch.bfloat16, device_map=None, trust_remote_code=True
         )

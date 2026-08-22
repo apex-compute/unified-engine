@@ -32,7 +32,12 @@ torchvision==0.22.1
 torchaudio==2.7.1
 soundfile
 numpy<2
-transformers>=4.40,<5
+# NO UPPER CAP. pi05 imports transformers NOWHERE -- this line only exists to mirror
+# the repo base. It previously read `transformers>=4.40,<5` (inherited from the old
+# conda yaml), and installing this file into a shared env DOWNGRADED transformers to
+# 4.x, which has no `gemma4` in CONFIG_MAPPING -- breaking models/gemma4_e2b with
+# `KeyError: 'gemma4'`. Never cap a dependency this model does not even import.
+transformers>=5.5.0
 huggingface-hub>=0.20.0
 pillow>=12.1.1
 sentencepiece
