@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import torch
+from PIL import Image
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -26,8 +27,12 @@ import yolov5_test
 from yolov5_artifact import (
     _pack_codes,
     _unpack_codes,
+    SUPPORTED_INPUT_RESOLUTIONS,
+    available_input_resolutions,
     artifact_variant,
     get_canonical_artifact,
+    parse_input_resolution,
+    select_single_bin_profile,
 )
 from yolov5_precompiled import (
     _scan_queue_configs,
@@ -41,6 +46,7 @@ from yolov5_common import (
     fold_conv_bn,
     gather_if8_is_profitable,
     get_yolov5_variant,
+    letterbox_image,
     non_max_suppression,
     quantize_conv_for_andromeda,
     quantize_conv_if4,
@@ -104,6 +110,9 @@ class VariantTests(unittest.TestCase):
                     profile.checkpoint_sha256)
                 self.assertEqual(config["model"]["input_size"], 256)
                 self.assertEqual(
+                    tuple(config["model"]["input_resolutions"]),
+                    SUPPORTED_INPUT_RESOLUTIONS)
+                self.assertEqual(
                     config["model"]["precision"],
                     "channel IF4 + gather IF8")
                 self.assertEqual(
@@ -126,13 +135,64 @@ class VariantTests(unittest.TestCase):
             "geometry_abi": "conv-config-inst-v1",
             "hardware_version": "0x77e8adf3",
             "precompiled": True,
-            "artifact_version": 4,
+            "artifact_version": 5,
+            "input_resolution": "256x256",
+            "input_shape": [3, 256, 256],
             "artifact": "/tmp/yolov5n-andromeda.bin",
         }
         text = "TEST_RESULT:" + json.dumps(result, separators=(",", ":"))
         self.assertTrue(model_auto_test._check_yolov5n(text)[0])
         self.assertTrue(model_auto_test._check_yolov5n_single_bin(text)[0])
         self.assertFalse(model_auto_test._check_yolov5(text)[0])
+
+
+class MultiResolutionTests(unittest.TestCase):
+    def test_resolution_parser_and_profile_selection_fail_closed(self):
+        self.assertEqual(parse_input_resolution("640x480"), (480, 640))
+        self.assertEqual(parse_input_resolution(256), (256, 256))
+        for invalid in ("640", "abcx480", "640x481", (640,), True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    parse_input_resolution(invalid)
+
+        payload = {
+            "model": {"input_shape": [3, 256, 256]},
+            "operations": ["default-operations"],
+            "head_outputs": ["default-heads"],
+            "hardware": {"profile": "default"},
+            "graph_sha256": "default-graph",
+            "profiles": {
+                "640x480": {
+                    "input_shape": [3, 480, 640],
+                    "operations": ["rectangular-operations"],
+                    "head_outputs": ["rectangular-heads"],
+                    "hardware": {"profile": "rectangular"},
+                    "graph_sha256": "rectangular-graph",
+                },
+            },
+            "bundle_sha256": "bundle",
+        }
+        self.assertEqual(
+            available_input_resolutions(payload), ("256x256", "640x480"))
+        key, selected = select_single_bin_profile(payload, "640x480")
+        self.assertEqual(key, "640x480")
+        self.assertEqual(selected["model"]["input_shape"], [3, 480, 640])
+        self.assertEqual(selected["hardware"]["profile"], "rectangular")
+        self.assertNotIn("profiles", selected)
+        with self.assertRaisesRegex(ValueError, "not embedded.*available"):
+            select_single_bin_profile(payload, "320x320")
+
+    def test_rectangular_letterbox_uses_width_by_height_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "wide.png"
+            Image.new("RGB", (800, 400), (255, 0, 0)).save(source)
+            original, tensor, info = letterbox_image(source, (480, 640))
+        self.assertEqual(original.size, (800, 400))
+        self.assertEqual(tuple(tensor.shape), (3, 480, 640))
+        self.assertAlmostEqual(info.ratio, 0.8)
+        self.assertEqual((info.pad_left, info.pad_top), (0, 80))
+        self.assertAlmostEqual(float(tensor[0, 240, 320]), 1.0)
+        self.assertAlmostEqual(float(tensor[0, 0, 0]), 114 / 255.0, places=6)
 
 
 class QuantizationTests(unittest.TestCase):
@@ -283,6 +343,15 @@ class QuantizationTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_direct_runner_decodes_hw_info_clock_transparently(self):
+        self.assertAlmostEqual(
+            yolov5_run_from_bin._clock_ns_from_hw_info(0x80214D40),
+            1000.0 / 333.25)
+        for invalid in (0, 0xDEADBEEF, 0x00014D40, 0x80014D40):
+            with self.subTest(invalid=hex(invalid)):
+                self.assertIsNone(
+                    yolov5_run_from_bin._clock_ns_from_hw_info(invalid))
+
     def test_hardware_runner_caps_host_threads_without_raising_small_values(self):
         with mock.patch.object(
                 yolov5_run_from_bin.torch, "get_num_threads", return_value=24), \
@@ -849,6 +918,17 @@ class PostprocessTests(unittest.TestCase):
         ]
         decoded = decode_yolov5(raw, model)
         self.assertEqual(tuple(decoded.shape), (4032, 85))
+        self.assertTrue(torch.isfinite(decoded).all())
+
+    def test_decode_rectangular_640x480_heads(self):
+        model = self._dummy_model()
+        raw = [
+            torch.zeros(255, 60, 80),
+            torch.zeros(255, 30, 40),
+            torch.zeros(255, 15, 20),
+        ]
+        decoded = decode_yolov5(raw, model)
+        self.assertEqual(tuple(decoded.shape), (18_900, 85))
         self.assertTrue(torch.isfinite(decoded).all())
 
     def test_nms_is_class_aware(self):

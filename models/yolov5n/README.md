@@ -7,7 +7,8 @@ shared with
 [`models/yolov5`](../yolov5) so YOLOv5n and YOLOv5s cannot drift at the engine
 boundary.
 
-The model uses a letterboxed 256 x 256 RGB input and the 80 COCO classes.
+The model embeds letterboxed 256x256, 320x320, 416x416, 512x512, 640x480,
+and 640x640 RGB profiles and uses the 80 COCO classes.
 Convolution, SiLU, SPPF pooling, upsampling, and residual additions run through
 native engine primitives. Concatenation, detection decoding, NMS, and drawing
 remain host-side.
@@ -20,7 +21,7 @@ commit `77e8adf3`. Older queue-CONFIG builds `d93eea82`, `9ef15fc1`, and
 `663de8d5`, as well as the bundled `update_cf133b89.bin`, are rejected before
 optimized model execution. The four-channel banked gather, direct-bin
 inference, and complete Andromeda hardware suite are strictly validated on
-timing-clean RK build `9d1a77dc` (WNS `+0.006 ns`, TNS `0`). That build adds
+timing-clean RK-256 build `83c27ced` (WNS `+0.002 ns`, TNS `0`). That build includes
 the read-only `HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG
 direct inference does not write those live CSRs.
 
@@ -64,6 +65,11 @@ python3 models/yolov5n/yolov5n_test.py --backend cpu-quantized
 make yolov5n_bin
 python3 models/yolov5n/yolov5n_run_from_bin.py
 
+# Select another exact precompiled profile from the same artifact.
+python3 models/yolov5n/yolov5n_run_from_bin.py --resolution 640x480
+python3 models/yolov5n/yolov5n_run_from_bin.py --resolution 640x640
+python3 models/yolov5n/yolov5n_run_from_bin.py --list-resolutions
+
 # Validate the same artifact without an FPGA.
 python3 models/yolov5n/yolov5n_run_from_bin.py --cpu
 ```
@@ -71,10 +77,11 @@ python3 models/yolov5n/yolov5n_run_from_bin.py --cpu
 The dedicated commands are pinned to YOLOv5n and intentionally do not expose a
 `--variant` option. Use the sibling `models/yolov5` commands for YOLOv5s.
 
-The canonical v4 artifact is
-`yolov5n_bin/yolov5n-andromeda.bin`. It contains the graph and quantized CPU
-fallback tensors, a fixed-address parameter image, and resident programs with
-ordered queue-CONFIG instructions. Rebuild it with `make yolov5n_bin FORCE=1`
+The canonical v5 artifact is
+`yolov5n_bin/yolov5n-andromeda.bin`. It contains six fixed-shape graphs,
+quantized CPU fallback tensors, one shared fixed-address parameter image, and a
+resident program with ordered queue-CONFIG instructions for each profile. The
+runtime uploads only the selected program. Rebuild it with `make yolov5n_bin FORCE=1`
 after this resolution/schema change; the regenerated image sizes and digests
 are pinned by the compiler rather than carried over from the prior artifact.
 Runtime loads this single file without downloading a checkpoint, repacking
@@ -84,14 +91,19 @@ not one accelerator launch.
 
 ## 256 x 256 performance
 
-On timing-clean RK build `9d1a77dc`, a strict direct-bin run with no
-unknown-hardware override reported an FPGA-only time of `30.357 ms`
-(`10,119,104` cycles) and an execution-wall time of `93.357 ms`. The one-time
+On timing-clean RK-256 build `83c27ced`, a strict direct-bin run with no
+unknown-hardware override reported an FPGA-only time of `30.366 ms`
+(`10,119,312` cycles) and an execution-wall time of `85.746 ms`. The one-time
 immutable model upload was `18,313,456` bytes in exactly two writes and took
-`7.043 ms`. The run detected seven `person` instances, led by confidence
+`7.111 ms`. The run detected seven `person` instances, led by confidence
 `0.685195`.
 
-FPGA-only time is the corrected sum of queue-start-to-HALT accelerator latency
+Every embedded profile completed strictly from the same bin and detected
+`person`. FPGA-only times were `47.103`, `79.274`, `119.004`, `139.247`, and
+`185.306 ms` for 320x320, 416x416, 512x512, 640x480, and 640x640 respectively.
+
+FPGA-only time uses the `HW_INFO`-reported 333.25 MHz clock and is the corrected
+sum of queue-start-to-HALT accelerator latency
 counters. Execution-wall time additionally includes host tensor packing,
 dynamic DMA, 72 resident-program dispatches, and host concatenations. The
 two static uploads are the only model-state writes: runtime does not load a

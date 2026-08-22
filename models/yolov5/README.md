@@ -1,7 +1,8 @@
 # YOLOv5s
 
-This directory contains YOLOv5s v7.0 object detection at a 256 x 256 input
-resolution. Convolution, SiLU, SPPF max-pooling, nearest-neighbor upsampling,
+This directory contains YOLOv5s v7.0 object detection with precompiled
+256x256, 320x320, 416x416, 512x512, 640x480, and 640x640 input profiles.
+Convolution, SiLU, SPPF max-pooling, nearest-neighbor upsampling,
 and bottleneck residual additions execute through native engine primitives.
 Image preparation, concatenation, detection decoding, non-maximum suppression,
 and result drawing run on the host because the current full-tensor primitives
@@ -22,12 +23,12 @@ mixed-precision path additionally requires the corrected gather-IF8 scale
 rewind introduced by Andromeda commit `77e8adf3`; older queue-CONFIG builds
 `d93eea82`, `9ef15fc1`, and `663de8d5` are rejected for this artifact. The
 four-channel banked gather and direct-bin path are strictly validated on
-timing-clean RK build `9d1a77dc` (WNS `+0.006 ns`, TNS `0`). That build adds
+timing-clean RK-256 build `83c27ced` (WNS `+0.002 ns`, TNS `0`). That build includes
 the read-only `HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG
 direct inference does not write those live CSRs. No compatible update image is
 shipped in this repository.
 
-Artifact-v4 schema/digest checks, no-capture replay guards, checkpoint
+Artifact-v5 schema/profile/digest checks, no-capture replay guards, checkpoint
 queue-mode selection, and quantized CPU direct execution are host-validated.
 At 256 x 256, the canonical `vette.jpg` quantized CPU run detects `car` at
 about `0.51` confidence (the final low bits can vary with the host BF16 kernel).
@@ -63,7 +64,7 @@ single scale for the whole layer is not accurate enough for the pretrained
 detector.
 
 The default confidence and IoU thresholds are `0.25` and `0.45`. The model uses
-the 80 COCO classes and a letterboxed 256 x 256 RGB input.
+the 80 COCO classes and letterboxes into the selected embedded RGB profile.
 
 ## Usage
 
@@ -99,9 +100,13 @@ make yolov5s_bin
 python3 models/yolov5/yolov5_compile.py \
   --output models/yolov5/yolov5_bin/yolov5s-andromeda.bin
 
-# Hardware inference from that artifact. The measured four-channel path uses
-# timing-clean gather/HW_INFO build 9d1a77dc.
+# Hardware inference from that artifact. The default profile is 256x256.
 python3 models/yolov5/yolov5_run_from_bin.py
+
+# The same bin directly selects a precompiled rectangular or square profile.
+python3 models/yolov5/yolov5_run_from_bin.py --resolution 640x480
+python3 models/yolov5/yolov5_run_from_bin.py --resolution 640x640
+python3 models/yolov5/yolov5_run_from_bin.py --list-resolutions
 
 # Check the same artifact and graph on the quantized CPU backend, without FPGA.
 python3 models/yolov5/yolov5_run_from_bin.py --cpu
@@ -111,11 +116,12 @@ Artifact metadata contains the required FPGA build allow-list. After that list
 changes, rebuild a cached artifact with `make yolov5s_bin FORCE=1`.
 
 `yolov5s-andromeda.bin` is the only model data file required by the direct
-runner. Artifact format version 4 contains the validated fixed-256 graph,
+runner. Artifact format version 5 contains six validated fixed-shape graphs,
 nibble-packed channel-IF4 and byte-packed gather-IF8 tensors for the CPU
-fallback, a fixed-address prepacked static parameter image, a resident
-precompiled instruction image with ordered CONFIG geometry, per-operation
-dispatch metadata, section digests, COCO names, anchors, strides, hardware
+fallback, one shared fixed-address prepacked static parameter image, and one
+resident instruction image with ordered CONFIG geometry per profile. Only the
+selected program is uploaded. It also carries per-operation dispatch metadata,
+section digests, COCO names, anchors, strides, hardware
 compatibility metadata, and preprocessing/postprocessing defaults. Rebuild the
 artifact with `make yolov5s_bin FORCE=1` after this resolution/schema change;
 the regenerated image sizes and digests are pinned by the compiler rather than
@@ -138,7 +144,7 @@ The annotated image is written under `yolov5_bin/`. The script also emits one
 machine-readable line for the automated test harness, for example:
 
 ```text
-TEST_RESULT: {"model":"yolov5s","precompiled":true,"artifact_version":4,"geometry_abi":"conv-config-inst-v1",...}
+TEST_RESULT: {"model":"yolov5s","precompiled":true,"artifact_version":5,"input_resolution":"640x480","input_shape":[3,480,640],...}
 ```
 
 To run either path through the repository harness:
@@ -170,16 +176,21 @@ testing an already-built artifact so the pre-test clean does not remove it.
 
 The gather primitive retains the normal folded-bias and fused-SiLU epilogue,
 so the 6x6 RGB stem uses predominantly INT8 gather blocks instead of repeatedly
-padding three channels into channel-mode IF4 blocks. Build `9d1a77dc` advances
+padding three channels into channel-mode IF4 blocks. Build `83c27ced` advances
 four activation channels per walker cycle through a four-bank LUTRAM patch
 store, while ordered exact-tail CONFIG groups remove duplicated edge outputs.
 A strict direct-bin run, with no unknown-hardware override, reported an
-FPGA-only time of `84.334 ms` (`28,111,200` cycles) and an execution-wall time
-of `159.257 ms`. The one-time immutable model upload was `16,940,472` bytes in
-exactly two writes and took `6.736 ms`. The run detected `car` at confidence
+FPGA-only time of `84.342 ms` (`28,106,912` cycles) and an execution-wall time
+of `161.972 ms`. The one-time immutable model upload was `16,940,472` bytes in
+exactly two writes and took `6.359 ms`. The run detected `car` at confidence
 `0.510560`.
 
-FPGA-only time is the corrected sum of queue-start-to-HALT accelerator latency
+The same strict artifact and FPGA build detected `car` at every embedded
+profile. FPGA-only times were `131.265`, `222.030`, `335.200`, `392.472`, and
+`523.181 ms` for 320x320, 416x416, 512x512, 640x480, and 640x640 respectively.
+
+FPGA-only time uses the `HW_INFO`-reported 333.25 MHz clock and is the corrected
+sum of queue-start-to-HALT accelerator latency
 counters. Execution-wall time additionally includes host tensor packing,
 dynamic DMA, 72 resident-program dispatches, and host concatenations. The
 two static uploads are the only model-state writes: runtime does not load a

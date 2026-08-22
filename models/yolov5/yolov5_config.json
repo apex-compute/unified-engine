@@ -3,6 +3,10 @@
     "name": "YOLOv5s",
     "upstream_version": "v7.0",
     "input_size": 256,
+    "input_resolutions": [
+      "256x256", "320x320", "416x416", "512x512",
+      "640x480", "640x640"
+    ],
     "num_channels": 3,
     "num_classes": 80,
     "strides": [8, 16, 32],
@@ -51,7 +55,8 @@
       "663de8d5",
       "77e8adf3",
       "3e92cddf",
-      "9d1a77dc"
+      "9d1a77dc",
+      "83c27ced"
     ],
     "queued_config_fpga_hashes": [
       "d93eea82",
@@ -59,14 +64,16 @@
       "663de8d5",
       "77e8adf3",
       "3e92cddf",
-      "9d1a77dc"
+      "9d1a77dc",
+      "83c27ced"
     ],
     "gather_if8_fpga_hashes": [
       "77e8adf3",
       "3e92cddf",
-      "9d1a77dc"
+      "9d1a77dc",
+      "83c27ced"
     ],
     "incompatible_shipped_fpga_hash": "cf133b89",
-    "compatibility_note": "Optimized checkpoint-backed YOLO and direct artifact v4 require ordered queued CONFIG opcode 0xC plus the corrected gather-IF8 scale rewind. Builds 3e92cddf and 9d1a77dc provide the timing-clean four-channel banked gather; 9d1a77dc also reserves HW_INFO at 0x00A0 and relocates the live CONV control registers. The optimized path accepts only gather_if8_fpga_hashes; queued_config_fpga_hashes and compatible_fpga_hashes document broader legacy driver capabilities. The repository-shipped update_cf133b89.bin is incompatible."
+    "compatibility_note": "Optimized checkpoint-backed YOLO and direct artifact v5 require ordered queued CONFIG opcode 0xC plus the corrected gather-IF8 scale rewind. Builds 3e92cddf, 9d1a77dc, and 83c27ced provide the timing-clean four-channel banked gather; 9d1a77dc and rebased build 83c27ced also reserve HW_INFO at 0x00A0 and relocate the live CONV control registers. The optimized path accepts only gather_if8_fpga_hashes; queued_config_fpga_hashes and compatible_fpga_hashes document broader legacy driver capabilities. The repository-shipped update_cf133b89.bin is incompatible."
   }
 }

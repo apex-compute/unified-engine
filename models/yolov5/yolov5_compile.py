@@ -50,6 +50,7 @@ def build_artifact(*, variant: str = "s", checkpoint: Path | None = None,
     report = compile_single_bin(
         model, output,
         image_size=int(config["model"]["input_size"]),
+        input_resolutions=tuple(config["model"]["input_resolutions"]),
         checkpoint_sha256=config["source"]["weights_sha256"],
         variant=profile.key)
     print(f"Single bin written: {report['path']}")
@@ -57,6 +58,9 @@ def build_artifact(*, variant: str = "s", checkpoint: Path | None = None,
     print(f"  operations={report['operations']} convs={report['convolutions']}")
     print(f"  prepacked_params={report['static_params_bytes'] / 2**20:.2f} MiB "
           f"precompiled_programs={report['program_bytes']} bytes")
+    print("  profiles=" + ", ".join(
+        f"{key}:{size}B" for key, size in
+        report["profile_program_bytes"].items()))
     return output
 
 

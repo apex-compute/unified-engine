@@ -2,14 +2,16 @@
 
 The artifact is a restricted ``torch.save`` container holding only primitive
 Python values and tensors: an explicit flattened graph, native mixed IF4/IF8 tensors,
-anchors, metadata, a fixed-address prepacked parameter image, and a resident
-instruction image.  The runtime loads it with ``weights_only=True`` and never
+anchors, metadata, a shared fixed-address prepacked parameter image, and
+resident instruction images for a closed family of input profiles. The runtime
+loads it with ``weights_only=True`` and never
 imports/downloads the upstream checkpoint or captures hardware programs.
 """
 
 from __future__ import annotations
 
 import collections
+import copy
 import hashlib
 import json
 import os
@@ -41,7 +43,20 @@ from yolov5_common import (
 )
 
 
-ARTIFACT_VERSION = 4
+ARTIFACT_VERSION = 5
+
+# Public resolution strings use the conventional WIDTHxHEIGHT spelling while
+# tensor shapes remain CHW. Every profile is compiled offline into the bin;
+# unsupported sizes fail closed instead of capturing a program at runtime.
+SUPPORTED_INPUT_RESOLUTIONS = (
+    "256x256",
+    "320x320",
+    "416x416",
+    "512x512",
+    "640x480",
+    "640x640",
+)
+DEFAULT_INPUT_RESOLUTION = SUPPORTED_INPUT_RESOLUTIONS[0]
 
 
 @dataclass(frozen=True)
@@ -53,6 +68,7 @@ class CanonicalArtifact:
     params_sha256: str
     program_sha256: str
     dispatch_sha256: str
+    bundle_sha256: str
     params_bytes: int
     program_bytes: int
 
@@ -71,6 +87,8 @@ CANONICAL_ARTIFACTS = {
             "32561feb335f1030f94f536a12cb50852e2ab44d90c998eb2c1ae7fb1a10e08e"),
         dispatch_sha256=(
             "f81641aecb8e7c785be53c16601572a8a8bc747e911ac06bb6c754a06abd0cf9"),
+        bundle_sha256=(
+            "47474a0c006fa0576a9286109f97b0c28577fd7b6dbce59850413ae7c54881fd"),
         params_bytes=16_862_520,
         program_bytes=77_952,
     ),
@@ -87,6 +105,8 @@ CANONICAL_ARTIFACTS = {
             "e69b09076c9c6628960a1096142cea3493e3cd2b7c10c656f2075c87b4fc86a7"),
         dispatch_sha256=(
             "00b0af7c3b61ccd25c0a9726840664362ddfb700226ed3f2baa8887f01fb808b"),
+        bundle_sha256=(
+            "d90c1e2c4ac36ec7c3f8b9ee1649c35977767bf8d490ad8abed672849faf98b8"),
         params_bytes=18_219_952,
         program_bytes=93_504,
     ),
@@ -115,6 +135,87 @@ def artifact_variant(payload: dict) -> str:
         if format_name == spec.format:
             return key
     raise RuntimeError(f"unsupported YOLO artifact format {format_name!r}")
+
+
+def parse_input_resolution(value: str | int | Sequence[int]) -> tuple[int, int]:
+    """Return ``(height, width)`` for a WIDTHxHEIGHT public resolution."""
+    if isinstance(value, bool):
+        raise ValueError(f"invalid input resolution {value!r}")
+    if isinstance(value, int):
+        height = width = int(value)
+    elif isinstance(value, str):
+        parts = value.lower().replace(" ", "").split("x")
+        if len(parts) != 2:
+            raise ValueError(
+                f"resolution must use WIDTHxHEIGHT, got {value!r}")
+        try:
+            width, height = (int(part) for part in parts)
+        except ValueError as exc:
+            raise ValueError(
+                f"resolution must use integer WIDTHxHEIGHT, got {value!r}") from exc
+    else:
+        values = tuple(int(item) for item in value)
+        if len(values) != 2:
+            raise ValueError(f"resolution must contain height and width, got {value!r}")
+        height, width = values
+    if height <= 0 or width <= 0 or height % 32 or width % 32:
+        raise ValueError(
+            f"input resolution must use positive multiples of 32, got "
+            f"{width}x{height}")
+    return height, width
+
+
+def input_resolution_key(height: int, width: int) -> str:
+    """Return the canonical public WIDTHxHEIGHT profile key."""
+    height, width = parse_input_resolution((height, width))
+    return f"{width}x{height}"
+
+
+def available_input_resolutions(payload: dict) -> tuple[str, ...]:
+    """List the default and additional profiles embedded in one artifact."""
+    model = payload.get("model", {}) if isinstance(payload, dict) else {}
+    default_shape = tuple(model.get("input_shape", ()))
+    if len(default_shape) != 3:
+        return ()
+    default = input_resolution_key(default_shape[1], default_shape[2])
+    profiles = payload.get("profiles", {})
+    if not isinstance(profiles, dict):
+        return ()
+    return (default, *tuple(profiles))
+
+
+def select_single_bin_profile(payload: dict, resolution=None) -> tuple[str, dict]:
+    """Materialize the selected fixed-shape graph/program view.
+
+    The returned dictionary shares logical tensors and the common parameter
+    image with the outer artifact. Only its operation shapes and resident
+    program table are resolution-specific.
+    """
+    default_shape = tuple(int(value) for value in payload["model"]["input_shape"])
+    if resolution is None:
+        height, width = default_shape[1:]
+    else:
+        height, width = parse_input_resolution(resolution)
+    key = input_resolution_key(height, width)
+    available = available_input_resolutions(payload)
+    if key not in available:
+        raise ValueError(
+            f"resolution {key} is not embedded in this bin; available: "
+            f"{', '.join(available)}")
+    if key == available[0]:
+        return key, payload
+
+    profile = payload["profiles"][key]
+    selected = dict(payload)
+    selected["model"] = dict(payload["model"])
+    selected["model"]["input_shape"] = list(profile["input_shape"])
+    selected["graph_sha256"] = profile["graph_sha256"]
+    selected["operations"] = profile["operations"]
+    selected["head_outputs"] = profile["head_outputs"]
+    selected["hardware"] = profile["hardware"]
+    selected.pop("profiles", None)
+    selected.pop("bundle_sha256", None)
+    return key, selected
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -197,6 +298,88 @@ def _graph_sha256(payload: dict) -> str:
         _graph_descriptor(payload), sort_keys=True,
         separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _profile_digest_descriptor(key: str, payload: dict) -> dict:
+    hardware = payload["hardware"]
+    return {
+        "resolution": key,
+        "input_shape": payload["model"]["input_shape"],
+        "graph_sha256": payload["graph_sha256"],
+        "params_bytes": int(hardware["params_image"].numel()),
+        "params_sha256": hardware["params_sha256"],
+        "program_bytes": int(hardware["program_image"].numel()),
+        "program_sha256": hardware["program_sha256"],
+        "dispatch_sha256": precompiled_manifest_sha256(hardware),
+    }
+
+
+def _bundle_sha256(payload: dict) -> str:
+    """Bind every embedded shape, resident program, and dispatch manifest."""
+    profiles = []
+    for key in available_input_resolutions(payload):
+        _selected_key, selected = select_single_bin_profile(payload, key)
+        profiles.append(_profile_digest_descriptor(key, selected))
+    descriptor = {
+        "weights_sha256": _weights_sha256(payload["weights"]),
+        "profiles": profiles,
+    }
+    encoded = json.dumps(
+        descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _specialize_operations(operations: Sequence[dict], weights: dict,
+                           input_shape: Sequence[int]) -> list[dict]:
+    """Recompute graph tensor shapes without changing its operation topology."""
+    specialized = copy.deepcopy(list(operations))
+    shapes = {"input": tuple(int(value) for value in input_shape)}
+    for operation in specialized:
+        inputs = [shapes[key] for key in operation["inputs"]]
+        kind = operation["op"]
+        if kind == "conv":
+            oc, _channels, kh, kw = (
+                int(value) for value in weights[operation["name"]]["codes_shape"])
+            effective_h = operation["dilation"] * (kh - 1) + 1
+            effective_w = operation["dilation"] * (kw - 1) + 1
+            output = (
+                oc,
+                (inputs[0][1] + 2 * operation["pad"] - effective_h)
+                // operation["stride"] + 1,
+                (inputs[0][2] + 2 * operation["pad"] - effective_w)
+                // operation["stride"] + 1,
+            )
+        elif kind == "maxpool":
+            channels, height, width = inputs[0]
+            output = (
+                channels,
+                (height + 2 * operation["pad"] - operation["kernel"])
+                // operation["stride"] + 1,
+                (width + 2 * operation["pad"] - operation["kernel"])
+                // operation["stride"] + 1,
+            )
+        elif kind == "upsample2x":
+            channels, height, width = inputs[0]
+            output = (channels, 2 * height, 2 * width)
+        elif kind == "add":
+            if inputs[0] != inputs[1]:
+                raise ValueError(
+                    f"{operation['name']}: residual shapes differ: "
+                    f"{inputs[0]} vs {inputs[1]}")
+            output = inputs[0]
+        elif kind == "concat":
+            if any(value[1:] != inputs[0][1:] for value in inputs[1:]):
+                raise ValueError(
+                    f"{operation['name']}: concat spatial shapes do not match")
+            output = (sum(value[0] for value in inputs), *inputs[0][1:])
+        else:
+            raise ValueError(f"unsupported graph operation {kind!r}")
+        if any(value <= 0 for value in output):
+            raise ValueError(
+                f"{operation['name']}: resolution produced invalid shape {output}")
+        operation["output_shape"] = list(output)
+        shapes[operation["output"]] = output
+    return specialized
 
 
 @dataclass(frozen=True)
@@ -325,14 +508,18 @@ class ArtifactCompileBackend:
 
 
 def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
-                       image_size: int, checkpoint_sha256: str,
+                       image_size: int = 256,
+                       input_resolutions: Sequence[str] | None = None,
+                       checkpoint_sha256: str,
                        variant: str = "s") -> dict:
-    """Compile a verified canonical checkpoint into one checkpoint-free bin."""
+    """Compile canonical weights and several fixed shapes into one bin."""
     profile = get_yolov5_variant(variant)
     artifact_spec = get_canonical_artifact(profile.key)
-    if image_size != 256:
+    resolutions = tuple(input_resolutions or SUPPORTED_INPUT_RESOLUTIONS)
+    if image_size != 256 or resolutions != SUPPORTED_INPUT_RESOLUTIONS:
         raise ValueError(
-            f"canonical {profile.model_name} single-bin format requires image_size=256")
+            f"canonical {profile.model_name} single-bin format requires default "
+            f"image_size=256 and profiles {SUPPORTED_INPUT_RESOLUTIONS}")
     if str(checkpoint_sha256) != profile.checkpoint_sha256:
         raise ValueError(
             f"{profile.model_name} compile requested checkpoint SHA-256 "
@@ -375,9 +562,42 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
             "output_suffix": ("_detections_hw.jpg" if profile.key == "s"
                               else f"_yolov5{profile.key}_detections_hw.jpg"),
         },
+        "profiles": {},
     }
     payload["graph_sha256"] = _graph_sha256(payload)
     payload["hardware"] = compile_precompiled_hardware(payload)
+    shared_params = payload["hardware"]["params_image"]
+    shared_params_sha256 = payload["hardware"]["params_sha256"]
+    shared_params_bytes = shared_params.numel()
+    for resolution in resolutions[1:]:
+        height, width = parse_input_resolution(resolution)
+        input_shape = [3, height, width]
+        operations = _specialize_operations(
+            payload["operations"], payload["weights"], input_shape)
+        selected = {
+            "model": dict(payload["model"], input_shape=input_shape),
+            "operations": operations,
+            "head_outputs": list(payload["head_outputs"]),
+            "weights": payload["weights"],
+        }
+        selected["graph_sha256"] = _graph_sha256(selected)
+        hardware = compile_precompiled_hardware(selected)
+        if (hardware["params_sha256"] != shared_params_sha256
+                or hardware["params_image"].numel() != shared_params_bytes
+                or not torch.equal(hardware["params_image"], shared_params)):
+            raise RuntimeError(
+                f"{resolution}: static parameter image differs across profiles")
+        # Reference one tensor object so torch.save stores the immutable image
+        # once even though every selected hardware view remains self-contained.
+        hardware["params_image"] = shared_params
+        payload["profiles"][resolution] = {
+            "input_shape": input_shape,
+            "graph_sha256": selected["graph_sha256"],
+            "operations": operations,
+            "head_outputs": list(payload["head_outputs"]),
+            "hardware": hardware,
+        }
+    payload["bundle_sha256"] = _bundle_sha256(payload)
     validate_single_bin(payload)
 
     output_path = output_path.expanduser().resolve()
@@ -397,6 +617,11 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
         "convolutions": len(backend.weights),
         "static_params_bytes": payload["hardware"]["params_image"].numel(),
         "program_bytes": payload["hardware"]["program_image"].numel(),
+        "profile_program_bytes": {
+            key: selected["hardware"]["program_image"].numel()
+            for key, selected in ((
+                DEFAULT_INPUT_RESOLUTION, payload), *payload["profiles"].items())
+        },
     }
 
 
@@ -413,7 +638,7 @@ def validate_single_bin(payload: dict) -> None:
     expected_keys = {
         "format", "artifact_version", "checkpoint_sha256", "graph_sha256",
         "model", "operations", "head_outputs", "weights", "runtime",
-        "hardware",
+        "hardware", "profiles", "bundle_sha256",
     }
     if set(payload) != expected_keys:
         raise RuntimeError(
@@ -595,6 +820,61 @@ def validate_single_bin(payload: dict) -> None:
     if precompiled_manifest_sha256(hardware) != artifact_spec.dispatch_sha256:
         raise RuntimeError("YOLO artifact precompiled dispatch manifest is not canonical")
 
+    profiles = payload.get("profiles")
+    expected_profile_keys = set(SUPPORTED_INPUT_RESOLUTIONS[1:])
+    if not isinstance(profiles, dict) or set(profiles) != expected_profile_keys:
+        raise RuntimeError(
+            "YOLO artifact embedded-resolution set is not canonical: "
+            f"expected {list(SUPPORTED_INPUT_RESOLUTIONS)}, got "
+            f"{list(available_input_resolutions(payload))}")
+    shared_params = hardware["params_image"]
+    profile_keys = {
+        "input_shape", "graph_sha256", "operations", "head_outputs", "hardware"}
+    for key in SUPPORTED_INPUT_RESOLUTIONS[1:]:
+        embedded = profiles[key]
+        if not isinstance(embedded, dict) or set(embedded) != profile_keys:
+            raise RuntimeError(f"YOLO profile {key} has unknown/missing fields")
+        height, width = parse_input_resolution(key)
+        input_shape = [3, height, width]
+        if embedded["input_shape"] != input_shape:
+            raise RuntimeError(f"YOLO profile {key} has the wrong input shape")
+        expected_operations = _specialize_operations(
+            operations, weights, input_shape)
+        if embedded["operations"] != expected_operations:
+            raise RuntimeError(
+                f"YOLO profile {key} graph differs from the canonical topology")
+        if embedded["head_outputs"] != heads:
+            raise RuntimeError(f"YOLO profile {key} has noncanonical head outputs")
+        _selected_key, selected = select_single_bin_profile(payload, key)
+        if (embedded["graph_sha256"] != _graph_sha256(selected)
+                or selected["graph_sha256"] != embedded["graph_sha256"]):
+            raise RuntimeError(f"YOLO profile {key} graph digest does not match")
+        selected_shapes = {
+            operation["output"]: tuple(operation["output_shape"])
+            for operation in embedded["operations"]}
+        expected_heads = [
+            (255, height // 8, width // 8),
+            (255, height // 16, width // 16),
+            (255, height // 32, width // 32),
+        ]
+        if [selected_shapes[name] for name in heads] != expected_heads:
+            raise RuntimeError(f"YOLO profile {key} detection heads are invalid")
+        validate_precompiled_hardware(selected)
+        selected_hardware = embedded["hardware"]
+        if (selected_hardware["params_sha256"] != artifact_spec.params_sha256
+                or selected_hardware["params_image"].numel()
+                != artifact_spec.params_bytes
+                or not torch.equal(selected_hardware["params_image"], shared_params)):
+            raise RuntimeError(
+                f"YOLO profile {key} does not share the canonical parameter image")
+
+    computed_bundle = _bundle_sha256(payload)
+    if payload.get("bundle_sha256") != computed_bundle:
+        raise RuntimeError("YOLO artifact profile-bundle digest does not match")
+    if computed_bundle != artifact_spec.bundle_sha256:
+        raise RuntimeError(
+            f"YOLO artifact profile bundle is not canonical {profile.model_name} v7.0")
+
 
 def load_single_bin(path: Path) -> dict:
     """Load one artifact with PyTorch's restricted tensor-only loader."""
@@ -636,7 +916,13 @@ def execute_single_bin(payload: dict, image_chw: torch.Tensor, backend, *,
                        progress: bool = False,
                        validate_payload: bool = True) -> list[torch.Tensor]:
     """Dispatch the embedded primitive graph directly from a loaded artifact."""
-    if validate_payload:
+    if "profiles" in payload:
+        if validate_payload:
+            validate_single_bin(payload)
+        _key, payload = select_single_bin_profile(
+            payload, tuple(int(value) for value in image_chw.shape[1:]))
+        validate_payload = False
+    elif validate_payload:
         validate_single_bin(payload)
     expected_input = tuple(payload["model"]["input_shape"])
     if tuple(image_chw.shape) != expected_input:

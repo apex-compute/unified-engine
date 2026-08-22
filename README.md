@@ -186,8 +186,8 @@ The bundled `update_cf133b89.bin` predates those modes; see the model READMEs
 for the required corrected gather-IF8 commit before running either model. No
 compatible update image is shipped in this repository. YOLOv5 is therefore
 opt-in rather than part of the default suite. Both optimized artifacts are
-strictly validated on timing-clean RK build `9d1a77dc` (WNS `+0.006 ns`, TNS
-`0`). That build adds the read-only `HW_INFO` register and remaps the live
+strictly validated on timing-clean RK-256 build `83c27ced` (WNS `+0.002 ns`,
+TNS `0`). That build includes the read-only `HW_INFO` register and remapped live
 geometry CSRs; the direct-bin queue-CONFIG path does not write those live CSRs.
 
 Both variants support a single checkpoint-free model artifact:
@@ -198,29 +198,39 @@ make model_test yolov5n_run_from_bin run_from_bin
 
 make yolov5s_bin
 make model_test yolov5s_run_from_bin run_from_bin
+
+# Select any exact profile embedded in the same bin (WIDTHxHEIGHT).
+python3 models/yolov5/yolov5_run_from_bin.py --resolution 640x480
+python3 models/yolov5n/yolov5n_run_from_bin.py --list-resolutions
 ```
 
-Artifact version 4 is loaded and validated once. It contains the fixed 256 x
-256 graph, mixed channel-IF4/gather-IF8 tensors, a fixed-address prepacked
-parameter image, a resident precompiled program image with ordered queue CONFIG
-geometry, dispatch metadata, and runtime defaults. The hardware backend uploads
-the immutable parameter/program images once; inference performs no static-weight
+Artifact version 5 is loaded and validated once. One bin embeds precompiled
+profiles for `256x256`, `320x320`, `416x416`, `512x512`, `640x480`, and
+`640x640` inputs. It stores mixed channel-IF4/gather-IF8 tensors, one shared
+fixed-address parameter image, and a resident program/dispatch table for each
+resolution. The hardware backend uploads the shared parameter image and only
+the selected program image; inference performs no static-weight
 repacking, program capture, or live geometry-CSR writes. It is still not one
 hardware launch: graph handoff needs multiple host dispatches, while
 concatenation and detection postprocessing remain host-side. See each model
 README for its direct CLI and artifact contract.
 
 The mixed-precision artifacts require the corrected gather-IF8 scale rewind
-introduced by Andromeda commit `77e8adf3`. Build `9d1a77dc` advances four
+introduced by Andromeda commit `77e8adf3`. Build `83c27ced` advances four
 low-channel activation taps per gather walker cycle and stores patches in
 timing-clean banked LUTRAM. Exact edge-tile CONFIG groups also avoid
-recomputing overlap-clamped outputs. Strict direct-bin runs on RK at a 3 ns
-clock, with no unknown-hardware override, reported:
+recomputing overlap-clamped outputs. Strict direct-bin runs on RK-256 at the
+`HW_INFO`-reported 333.25 MHz clock (3.000750188 ns), with no unknown-hardware
+override, reported:
 
-| Model | Static model upload | Execution wall | FPGA execution only |
-|---|---:|---:|---:|
-| YOLOv5s | 6.736 ms; 16,940,472 B in 2 writes | 159.257 ms | 84.334 ms; 28,111,200 cycles |
-| YOLOv5n | 7.043 ms; 18,313,456 B in 2 writes | 93.357 ms | 30.357 ms; 10,119,104 cycles |
+| Resolution | YOLOv5s FPGA only | YOLOv5n FPGA only |
+|---|---:|---:|
+| 256x256 | 84.342 ms | 30.366 ms |
+| 320x320 | 131.265 ms | 47.103 ms |
+| 416x416 | 222.030 ms | 79.274 ms |
+| 512x512 | 335.200 ms | 119.004 ms |
+| 640x480 | 392.472 ms | 139.247 ms |
+| 640x640 | 523.181 ms | 185.306 ms |
 
 The execution-wall timer covers the image-dependent graph replay, including
 host packing, dynamic DMA, 72 resident-program dispatches, and host
@@ -232,8 +242,8 @@ still performs its DRAM self-test, and graph replay still performs
 image-dependent DMA. Artifact loading, preprocessing, decode, NMS, and drawing
 are outside both execution timers. The validated YOLOv5s run detects `car` at
 confidence `0.510560`; YOLOv5n detects seven `person` instances, led by
-confidence `0.685195`. Both models meet the strict sub-100-ms FPGA execution
-target on one engine.
+confidence `0.685195`. At 256x256 both models meet the strict sub-100-ms FPGA
+execution target on one engine.
 
 Run the whole suite (or a subset) with the automated tester:
 

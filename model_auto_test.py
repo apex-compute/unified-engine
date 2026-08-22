@@ -419,17 +419,23 @@ def _check_yolov5_single_bin_variant(
     artifact_version = _test_result_field(text, "artifact_version")
     geometry_abi = _test_result_field(text, "geometry_abi")
     artifact = _test_result_field(text, "artifact")
+    input_resolution = _test_result_field(text, "input_resolution")
+    input_shape = _test_result_field(text, "input_shape")
     if backend != "hardware":
         return False, f"single-bin test used unexpected backend {backend!r}"
     if precompiled is not True:
         return False, "single-bin runtime did not report precompiled=true"
-    if artifact_version != 4:
+    if artifact_version != 5:
         return False, (
             f"single-bin runtime reported artifact version "
-            f"{artifact_version!r}, expected 4"
+            f"{artifact_version!r}, expected 5"
         )
     if geometry_abi != "conv-config-inst-v1":
         return False, f"single-bin runtime used unexpected geometry ABI {geometry_abi!r}"
+    if input_resolution != "256x256" or input_shape != [3, 256, 256]:
+        return False, (
+            f"single-bin default profile was {input_resolution!r}/{input_shape!r}, "
+            "expected 256x256/[3, 256, 256]")
     if (not isinstance(artifact, str)
             or os.path.basename(artifact) != expected_artifact):
         return False, f"missing {expected_artifact} artifact in TEST_RESULT"

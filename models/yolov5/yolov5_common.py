@@ -890,27 +890,40 @@ class LetterboxInfo:
     pad_top: int
 
 
-def letterbox_image(path: Path, image_size: int = 256) -> tuple[Image.Image, torch.Tensor, LetterboxInfo]:
-    """Load RGB, preserve aspect ratio, and pad to a square with value 114."""
-    if image_size <= 0 or image_size % 32:
-        raise ValueError(f"image_size must be a positive multiple of 32, got {image_size}")
+def letterbox_image(
+        path: Path, image_size: int | Sequence[int] = 256,
+        ) -> tuple[Image.Image, torch.Tensor, LetterboxInfo]:
+    """Load RGB, preserve aspect ratio, and pad to target ``(height, width)``."""
+    if isinstance(image_size, int):
+        target_height = target_width = int(image_size)
+    else:
+        values = tuple(int(value) for value in image_size)
+        if len(values) != 2:
+            raise ValueError(
+                f"image_size must be an integer or (height, width), got {image_size!r}")
+        target_height, target_width = values
+    if (target_height <= 0 or target_width <= 0
+            or target_height % 32 or target_width % 32):
+        raise ValueError(
+            "image_size dimensions must be positive multiples of 32, got "
+            f"{target_width}x{target_height}")
     with Image.open(path) as opened:
         original = ImageOps.exif_transpose(opened).convert("RGB")
     width, height = original.size
-    ratio = min(image_size / height, image_size / width)
+    ratio = min(target_height / height, target_width / width)
     resized_width = max(1, round(width * ratio))
     resized_height = max(1, round(height * ratio))
     resized = original.resize(
         (resized_width, resized_height), Image.Resampling.BILINEAR)
-    pad_x = image_size - resized_width
-    pad_y = image_size - resized_height
+    pad_x = target_width - resized_width
+    pad_y = target_height - resized_height
     left = round(pad_x / 2 - 0.1)
     top = round(pad_y / 2 - 0.1)
-    canvas = Image.new("RGB", (image_size, image_size), (114, 114, 114))
+    canvas = Image.new("RGB", (target_width, target_height), (114, 114, 114))
     canvas.paste(resized, (left, top))
 
     pixels = torch.frombuffer(bytearray(canvas.tobytes()), dtype=torch.uint8)
-    tensor = (pixels.view(image_size, image_size, 3)
+    tensor = (pixels.view(target_height, target_width, 3)
               .permute(2, 0, 1).contiguous().float() / 255.0)
     return original, tensor, LetterboxInfo(
         original_height=height, original_width=width,
