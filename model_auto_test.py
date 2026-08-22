@@ -359,6 +359,19 @@ def _check_pi05(text):
 MATH_PROMPT = "If x + 3 = 5, what is x?"
 
 TESTS = [
+    # >>> TEMPORARILY FIRST <<< the harness stops on the first failure, so putting pi05
+    # at the head means a full/night run reports on it in ~2 min instead of after the
+    # other 18 models. Move it back to the bottom (with the vision/encoder models) once
+    # it is verified green.
+    # Robot policy (VLA): no --prompt, no text output -- emits a (10,7) action chunk from
+    # its in-repo LIBERO sample frames in test_samples/ (pi05_libero_base/wrist.png --
+    # named for the upstream checkpoint, not the model dir). Runs at the default
+    # --engines 1, which is the bin-eligible path: pass 1 compiles + dumps bins, pass 2
+    # loads them. The harness poisons DRAM before every pass, which is exactly the
+    # condition that exposed the action-expert suffix K/V NaN -- so a regression in
+    # tensor_init_action_expert's zero-fill fails here rather than silently.
+    {"name": "pi05", "script": "models/pi05/pi05_test.py", "pass_check": _check_pi05},
+
     # The deprecated gemma3_test_IF8.py is deliberately excluded: IF8 is
     # currently not working.
     {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
@@ -397,14 +410,6 @@ TESTS = [
     {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
 
-    # Robot policy (VLA): no --prompt, no text output -- emits a (10,7) action chunk from
-    # its in-repo LIBERO sample frames in test_samples/ (pi05_libero_base/wrist.png --
-    # named for the upstream checkpoint, not the model dir). Runs at the default
-    # --engines 1, which is the bin-eligible path: pass 1 compiles + dumps bins, pass 2
-    # loads them. The harness poisons DRAM before every pass, which is exactly the
-    # condition that exposed the action-expert suffix K/V NaN -- so a regression in
-    # tensor_init_action_expert's zero-fill fails here rather than silently.
-    {"name": "pi05", "script": "models/pi05/pi05_test.py", "pass_check": _check_pi05},
 ]
 
 
