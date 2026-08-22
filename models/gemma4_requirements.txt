@@ -1,0 +1,5 @@
+# Gemma4 support first shipped in Transformers 5.5. Keep this environment
+# separate from pi05, whose tested dependency set deliberately requires
+# Transformers < 5. Pin the exact known-good patch release so the self-hosted
+# hardware runner does not silently change behavior when a new release lands.
+transformers==5.5.4

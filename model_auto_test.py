@@ -125,7 +125,9 @@ def zero_dram(dev: str = "xdma0",
 # ---------------------------------------------------------------------------
 # Test registry
 # Each entry: script (relative to SCRIPT_DIR), optional prompt override,
-# and a pass_check callable: (decoded_text: str) -> (passed: bool, reason: str)
+# and a pass_check callable: (decoded_text: str) -> (passed: bool, reason: str).
+# ``python_env`` optionally names an environment variable whose value is the
+# interpreter for that model subprocess (otherwise sys.executable is used).
 # ---------------------------------------------------------------------------
 def _test_result_field(text, key):
     """Pull `key` out of a `TEST_RESULT: {json}` line in the model's stdout, or None.
@@ -484,9 +486,13 @@ TESTS = [
     # Gemma4 E2B FPGA vision: the normal entry uses the default yosemite.jpg;
     # the run-from-bin entry uses vette.jpg and a custom prompt. Bin reuse is
     # implemented by gemma4_e2b_test.py itself.
-    {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
-    {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "prompt": "Give a detailed description of the picture", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg"},
-    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
+    # Gemma4 needs Transformers 5.5+, while pi05 deliberately pins Transformers
+    # below 5. CI supplies GEMMA4_PYTHON from a small isolated venv so the two
+    # dependency contracts never mutate each other's interpreter. Local users
+    # already running in a Gemma-compatible environment may omit the override.
+    {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "python_env": "GEMMA4_PYTHON"},
+    {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "prompt": "Give a detailed description of the picture", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "python_env": "GEMMA4_PYTHON"},
+    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "python_env": "GEMMA4_PYTHON"},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
@@ -599,6 +605,23 @@ def _script_supports_flag(script_path: str, flag: str) -> bool:
     return f"'{flag}'" in src or f'"{flag}"' in src
 
 
+def _python_executable_for_test(test: dict) -> str:
+    """Return the interpreter selected for a model subprocess.
+
+    Most models inherit this harness's interpreter. A model may name an
+    environment variable in ``python_env`` to opt into an isolated interpreter;
+    an unset or empty override intentionally falls back to ``sys.executable`` so
+    developers who already activated a compatible environment keep the normal
+    local workflow.
+    """
+    env_name = test.get("python_env")
+    if env_name:
+        override = os.environ.get(env_name)
+        if override:
+            return override
+    return sys.executable
+
+
 def run_test(test: dict, verbose: bool = False,
              dev: str = None, device: str = None) -> dict:
     """Run one model test as a subprocess.
@@ -612,9 +635,10 @@ def run_test(test: dict, verbose: bool = False,
     """
     rel_script = test["script"]
     script = os.path.join(SCRIPT_DIR, rel_script)
+    python_executable = _python_executable_for_test(test)
     # -u: force the child's stdout unbuffered so verbose mode streams live
     # instead of arriving in big blocks (its stdout is a pipe, not a TTY).
-    cmd = [sys.executable, "-u", script]
+    cmd = [python_executable, "-u", script]
     if test.get("prompt"):
         cmd += ["--prompt", test["prompt"]]
     cmd += test.get("extra_args", [])
@@ -630,7 +654,7 @@ def run_test(test: dict, verbose: bool = False,
     print(f"\n{'='*60}")
     print(f"Running test : {test['name']}")
     print(f"Script       : {rel_script}")
-    display_cmd = [os.path.basename(sys.executable), "-u", rel_script] + cmd[3:]
+    display_cmd = [os.path.basename(python_executable), "-u", rel_script] + cmd[3:]
     print(f"Command      : {shlex.join(display_cmd)}")
     if test.get("mode"):
         print(f"Mode         : {test['mode']}")

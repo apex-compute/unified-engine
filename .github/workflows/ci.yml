@@ -80,6 +80,97 @@ jobs:
           git clean -ffdx -e models
           ./clean_program_bins.sh
 
+      - name: Prepare isolated Gemma4 environment
+        run: |
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          if [[ "${{ inputs.full_run }}" != "true" && "$BRANCH" == "model/pi05_libero" ]]; then
+            echo "[ci] branch $BRANCH runs pi05 only; Gemma4 environment not needed"
+            exit 0
+          fi
+
+          # pi05 intentionally uses Transformers 4.x, while Gemma4 requires the
+          # Gemma4 model/processor support introduced in Transformers 5.5. Keep
+          # both contracts intact by installing Gemma4 into its own cached venv.
+          # The venv lives under the ignored model-bin cache, which checkout and
+          # clean_program_bins.sh preserve between self-hosted runner jobs.
+          GEMMA4_VENV="$GITHUB_WORKSPACE/models/gemma4_e2b/gemma4_e2b_bin/.ci-venv"
+          GEMMA4_MARKER="$GEMMA4_VENV/.ue-environment-key"
+          GEMMA4_REQUIREMENTS="$GITHUB_WORKSPACE/models/gemma4_requirements.txt"
+          GEMMA4_ENVIRONMENT_KEY="$(python -c \
+            'import sys; print(f"{sys.executable}:{sys.version.split()[0]}")'):$(sha256sum "$GEMMA4_REQUIREMENTS" | awk '{print $1}')"
+          CACHED_GEMMA4_KEY=""
+          if [[ -f "$GEMMA4_MARKER" ]]; then
+            CACHED_GEMMA4_KEY=$(<"$GEMMA4_MARKER")
+          fi
+          mkdir -p "$(dirname "$GEMMA4_VENV")"
+          if [[ ! -x "$GEMMA4_VENV/bin/python" || "$CACHED_GEMMA4_KEY" != "$GEMMA4_ENVIRONMENT_KEY" ]]; then
+            # --clear makes a stale cache recoverable if the runner Python or the
+            # pinned requirements change, without touching model weights beside it.
+            python -m venv --clear "$GEMMA4_VENV"
+          fi
+
+          # Reuse the runner's large shared packages (most importantly torch)
+          # without inheriting its Transformers 4.x import. An explicit .pth is
+          # reliable whether the runner's base interpreter comes from conda or
+          # another venv; --system-site-packages is not reliable for nested venvs.
+          GEMMA4_SITE=$("$GEMMA4_VENV/bin/python" -c \
+            'import site; print(site.getsitepackages()[0])')
+          python - <<'PY' > "$GEMMA4_SITE/ue-runner-site-packages.pth"
+          import site
+          print(*site.getsitepackages(), sep="\n")
+          PY
+          "$GEMMA4_VENV/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --requirement "$GEMMA4_REQUIREMENTS"
+
+          # Fail before reserving the FPGA if the cached environment is stale or
+          # incomplete. torch is intentionally inherited from the base runner;
+          # only the conflicting Hugging Face stack is isolated in this venv.
+          "$GEMMA4_VENV/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+
+          import torch
+          import transformers
+          from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+
+          expected = "5.5.4"
+          if transformers.__version__ != expected:
+              raise SystemExit(
+                  f"Gemma4 CI requires transformers {expected}, "
+                  f"found {transformers.__version__}"
+              )
+          print(
+              f"Gemma4 environment ready: transformers={transformers.__version__}, "
+              f"torch={torch.__version__}"
+          )
+
+          # Reproduce the formerly failing constructor against the cached
+          # deploy tokenizer when it is available. A brand-new runner may not
+          # have downloaded it yet, in which case the model build supplies it.
+          model_dir = Path(os.environ["GITHUB_WORKSPACE"]) / "models/gemma4_e2b/gemma4_e2b_bin"
+          tokenizer_dirs = [model_dir / "tokenizer", model_dir / "gemma-4-E2B-it"]
+          tokenizer_dir = next(
+              (path for path in tokenizer_dirs if (path / "tokenizer.json").is_file()),
+              None,
+          )
+          if tokenizer_dir is None:
+              print("Gemma4 tokenizer preflight deferred: no cached tokenizer yet")
+          else:
+              tokenizer = AutoTokenizer.from_pretrained(
+                  tokenizer_dir, trust_remote_code=True, local_files_only=True
+              )
+              if tokenizer.image_token != "<|image|>" or tokenizer.audio_token != "<|audio|>":
+                  raise SystemExit("Gemma4 tokenizer named-token contract is invalid")
+              if "<|video|>" not in tokenizer.all_special_tokens:
+                  raise SystemExit("Gemma4 <|video|> token is not marked special")
+              print(f"Gemma4 tokenizer ready: {tokenizer_dir}")
+          PY
+          printf '%s\n' "$GEMMA4_ENVIRONMENT_KEY" > "$GEMMA4_MARKER"
+          echo "GEMMA4_PYTHON=$GEMMA4_VENV/bin/python" >> "$GITHUB_ENV"
+
+          python -m unittest -v test_model_auto_test_interpreter.py
+
       - name: Run CI suite
         id: ci
         run: |
