@@ -51,9 +51,13 @@ jobs:
               inputs: {
                 full_run: 'true',
                 clean_bins: 'false',
-                // pi05 runs first, and the model round runs before the HW op
-                // tests, so the nightly reports a pi05 verdict in ~2 min.
-                pi05_first: 'true',
+                // TODO(after model/pi05_libero merges): add `pi05_first: 'true'` to run
+                // the model round before the HW op tests with pi05 hoisted to the front,
+                // for a ~2-minute pi05 verdict. It CANNOT be sent yet: this dispatch
+                // targets ref 'main' (below), and GitHub validates workflow_dispatch
+                // inputs against the workflow file ON THAT REF -- main's ci.yml has no
+                // pi05_first input, so sending it 422s with "Unexpected inputs provided".
+                // main's TESTS registry also has no pi05 entry for --first to hoist.
               },
             });
 
