@@ -34,7 +34,9 @@ on:
         type: boolean
         default: false
   push:
-    branches: [main]
+    # model/pi05_libero is here so the pi05 bring-up branch gets HW CI on every
+    # push; the model subset it runs is branch-dependent (see "Run CI suite").
+    branches: [main, model/pi05_libero]
   pull_request:
     branches: [main]
 
@@ -89,11 +91,21 @@ jobs:
           if [[ "${{ inputs.pi05_first }}" == "true" ]]; then
             ARGS+=(--pi05-first)
           fi
-          if [[ "${{ inputs.full_run }}" != "true" ]]; then
-            # Default (PR / push) subset. pi05 is listed first and is also first in
-            # model_auto_test.py's TESTS registry -- --only filters but preserves
-            # registry order, so pi05 runs before the Gemma4 cases and, since the
-            # harness stops on the first failure, gives a verdict in ~2 min.
+          # Which branch is this? head_ref is set on pull_request, ref_name on push
+          # and workflow_dispatch.
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+
+          if [[ "${{ inputs.full_run }}" == "true" ]]; then
+            : # no --only: the whole model_auto_test.py registry, pi05 first
+          elif [[ "$BRANCH" == "model/pi05_libero" ]]; then
+            # pi05 bring-up branch: run ONLY pi05. The Gemma4 cases add ~15 min of
+            # shared-board time and cannot regress from pi05-only changes.
+            echo "[ci] branch $BRANCH -> pi05 only"
+            ARGS+=(--only pi05)
+          else
+            # Default subset elsewhere. --only filters but preserves registry order,
+            # and pi05 is first in TESTS, so it runs before the Gemma4 cases; the
+            # harness stops on the first failure, so a verdict lands in ~2 min.
             # The two Gemma4 cases stay in ONE model_auto_test.py invocation: the
             # first run creates/loads programs.bin; no clean or bin removal occurs
             # before the run-from-bin Vette case.
