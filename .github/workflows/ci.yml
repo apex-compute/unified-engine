@@ -90,10 +90,14 @@ jobs:
             ARGS+=(--pi05-first)
           fi
           if [[ "${{ inputs.full_run }}" != "true" ]]; then
-            # Keep both cases in one model_auto_test.py invocation. The first
-            # run creates/loads programs.bin; no clean or bin removal occurs
+            # Default (PR / push) subset. pi05 is listed first and is also first in
+            # model_auto_test.py's TESTS registry -- --only filters but preserves
+            # registry order, so pi05 runs before the Gemma4 cases and, since the
+            # harness stops on the first failure, gives a verdict in ~2 min.
+            # The two Gemma4 cases stay in ONE model_auto_test.py invocation: the
+            # first run creates/loads programs.bin; no clean or bin removal occurs
             # before the run-from-bin Vette case.
-            ARGS+=(--only gemma4_e2b gemma4_e2b_run_from_bin)
+            ARGS+=(--only pi05 gemma4_e2b gemma4_e2b_run_from_bin)
           fi
           ./run_ci.sh "${ARGS[@]}"
 
