@@ -104,6 +104,16 @@ del models/parakeet/parakeet_bin/params.json
 del models/parakeet/parakeet_bin/programs*.bin
 del models/parakeet/parakeet_bin/programs*.json
 
+# --- pi05: keep params.* ; drop programs ------------------------------------
+# params.bin is a DRAM snapshot derived from the 13 GB weights_export/ tree (pi05
+# cannot regenerate weights from HF), so wiping it would force the whole export
+# again. programs.bin/json are cheap to recompile and MUST go: the sig guard in
+# Pi05Libero_Run only checks structural offsets (seq_len, denoise_steps, DRAM
+# bases), so a code change that alters program CONTENT without moving an offset
+# would otherwise be silently replayed from a stale bin.
+del models/pi05/pi05_bin/programs.bin
+del models/pi05/pi05_bin/programs.json
+
 # --- qwen2.5_vl_3b: keep params.* ; drop programs ---------------------------
 del models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.bin
 del models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.json

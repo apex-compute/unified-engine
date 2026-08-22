@@ -342,11 +342,35 @@ def _check_mbv2_ssd(text):
         else "no detections above threshold"
     )
 
+def _check_pi05(text):
+    # pi05 is a robot policy (VLA): no text output, no labels. It emits a (10,7) action
+    # chunk plus a summary line "nan=False inf=False min=-0.1234 max=0.5678".
+    # Pass signal: the run reached the denoise output and the chunk is finite.
+    m = re.search(r"nan=(True|False)\s+inf=(True|False)\s+min=(-?[\d.]+)\s+max=(-?[\d.]+)", text)
+    if not m:
+        return False, "no action-chunk summary line found (run did not reach the denoise output)"
+    nan, inf, lo, hi = m.group(1) == "True", m.group(2) == "True", float(m.group(3)), float(m.group(4))
+    if nan or inf:
+        return False, f"action chunk has nan={nan} inf={inf}"
+    return True, f"finite action chunk (min={lo}, max={hi})"
+
 # Shared algebra prompt: a single-answer math question whose correct result is
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
 MATH_PROMPT = "If x + 3 = 5, what is x?"
 
 TESTS = [
+    # >>> pi05 RUNS FIRST <<< the harness stops on the first failure, so hoisting pi05
+    # to the head gives a full/night run its pi05 verdict in ~2 min instead of after the
+    # other 18 models. Move it back down to the vision/encoder group once it is green.
+    # Robot policy (VLA): no --prompt, no text output -- emits a (10,7) action chunk from
+    # its in-repo LIBERO sample frames in test_samples/ (pi05_libero_base/wrist.png --
+    # named for the upstream checkpoint, not the model dir). Runs at the default
+    # --engines 1, which is the bin-eligible path: pass 1 compiles + dumps bins, pass 2
+    # loads them. The harness poisons DRAM before every pass, which is exactly the
+    # condition that exposed the action-expert suffix K/V NaN -- so a regression in
+    # tensor_init_action_expert's zero-fill fails here rather than silently.
+    {"name": "pi05", "script": "models/pi05/pi05_test.py", "pass_check": _check_pi05},
+
     # The deprecated gemma3_test_IF8.py is deliberately excluded: IF8 is
     # currently not working.
     {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
@@ -384,6 +408,7 @@ TESTS = [
     {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet},
     {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
+
 ]
 
 
@@ -690,6 +715,11 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="+", metavar="NAME", help="Run only these named tests")
+    ap.add_argument("--first", nargs="+", metavar="NAME", default=None,
+                    help="Hoist these named tests to the FRONT of the run order, keeping "
+                         "the rest in registry order. The harness stops on the first "
+                         "failure, so this is how CI gets an early verdict on one model "
+                         "without permanently reordering TESTS.")
     ap.add_argument("--verbose", action="store_true",
                     help="Stream each model's live stdout as it runs (full run log)")
     ap.add_argument("--list-names", action="store_true",
@@ -724,7 +754,18 @@ def main():
             ap.error(f"unknown test name(s): {', '.join(unknown)}")
         tests = [test for test in TESTS if test["name"] in args.only]
     else:
-        tests = TESTS
+        tests = list(TESTS)
+
+    # --first: hoist without reordering the registry. Validated against the SAME
+    # known_names set as --only so a typo fails fast, before the device is touched.
+    if args.first:
+        unknown = sorted(set(args.first) - known_names)
+        if unknown:
+            ap.error(f"unknown --first test name(s): {', '.join(unknown)}")
+        hoisted = [t for name in args.first for t in tests if t["name"] == name]
+        tests = hoisted + [t for t in tests if t not in hoisted]
+        if hoisted:
+            print(f"[order] hoisted to front: {' '.join(t['name'] for t in hoisted)}")
 
     # Initialize the FPGA once before running any model (software reset).
     reset_device(DMA_DEV)

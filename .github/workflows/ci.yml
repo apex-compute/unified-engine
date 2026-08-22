@@ -2,7 +2,14 @@ name: Model HW CI
 
 # Runs the local CI suite (run_ci.sh): generic hardware op tests, then the two
 # Gemma4 E2B image cases by default. A manual full-run checkbox runs every
-# registered model instead.
+# registered model instead -- that registry is model_auto_test.py's TESTS list and
+# includes pi05 (robot policy / VLA). The nightly (night-run.yml) dispatches this
+# workflow with full_run: 'true', so pi05 is covered every night.
+#
+# pi05 note: its first run on a clean runner downloads the upstream checkpoint and
+# exports ~13 GB into models/pi05/pi05_bin/weights_export/. That needs the jax /
+# orbax / flax pins from models/pi05/pi05_requirements.txt to be present in the
+# runner's env. The checkout step preserves models/, so this is a one-time cost.
 # Models compile from scratch and run from their cached bins, with DRAM randomized
 # (poisoned) before every single pass. Stops on first failure.
 # Requires the FPGA device, so this must run on a self-hosted runner with the
@@ -21,8 +28,15 @@ on:
         required: false
         type: boolean
         default: false
+      pi05_first:
+        description: "Run the model round BEFORE user_hw_test.py, with pi05 hoisted to the front (fast pi05 verdict)"
+        required: false
+        type: boolean
+        default: false
   push:
-    branches: [main]
+    # model/pi05_libero is here so the pi05 bring-up branch gets HW CI on every
+    # push; the model subset it runs is branch-dependent (see "Run CI suite").
+    branches: [main, model/pi05_libero]
   pull_request:
     branches: [main]
 
@@ -73,11 +87,29 @@ jobs:
           if [[ "${{ inputs.clean_bins }}" == "true" ]]; then
             ARGS+=(--clean-bins)
           fi
-          if [[ "${{ inputs.full_run }}" != "true" ]]; then
-            # Keep both cases in one model_auto_test.py invocation. The first
-            # run creates/loads programs.bin; no clean or bin removal occurs
+          # Must precede --only: run_ci.sh parses its flags positionally.
+          if [[ "${{ inputs.pi05_first }}" == "true" ]]; then
+            ARGS+=(--pi05-first)
+          fi
+          # Which branch is this? head_ref is set on pull_request, ref_name on push
+          # and workflow_dispatch.
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+
+          if [[ "${{ inputs.full_run }}" == "true" ]]; then
+            : # no --only: the whole model_auto_test.py registry, pi05 first
+          elif [[ "$BRANCH" == "model/pi05_libero" ]]; then
+            # pi05 bring-up branch: run ONLY pi05. The Gemma4 cases add ~15 min of
+            # shared-board time and cannot regress from pi05-only changes.
+            echo "[ci] branch $BRANCH -> pi05 only"
+            ARGS+=(--only pi05)
+          else
+            # Default subset elsewhere. --only filters but preserves registry order,
+            # and pi05 is first in TESTS, so it runs before the Gemma4 cases; the
+            # harness stops on the first failure, so a verdict lands in ~2 min.
+            # The two Gemma4 cases stay in ONE model_auto_test.py invocation: the
+            # first run creates/loads programs.bin; no clean or bin removal occurs
             # before the run-from-bin Vette case.
-            ARGS+=(--only gemma4_e2b gemma4_e2b_run_from_bin)
+            ARGS+=(--only pi05 gemma4_e2b gemma4_e2b_run_from_bin)
           fi
           ./run_ci.sh "${ARGS[@]}"
 
