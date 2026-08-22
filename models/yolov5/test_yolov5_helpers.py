@@ -115,10 +115,24 @@ class VariantTests(unittest.TestCase):
                 self.assertEqual(
                     config["model"]["precision"],
                     "channel IF4 + gather IF8")
+                expected_hashes = {0x746D0A49}
                 self.assertEqual(
-                    {int(value, 16) for value in
-                     config["hardware"]["gather_if8_fpga_hashes"]},
-                    set(user_dma_core.UE_GATHER_IF8_HW_VERSIONS))
+                    set(user_dma_core.UE_NATIVE_CONV_HW_VERSIONS),
+                    expected_hashes)
+                self.assertEqual(
+                    set(user_dma_core.UE_QUEUE_CONFIG_HW_VERSIONS),
+                    expected_hashes)
+                self.assertEqual(
+                    set(user_dma_core.UE_GATHER_IF8_HW_VERSIONS),
+                    expected_hashes)
+                for field in (
+                        "compatible_fpga_hashes",
+                        "queued_config_fpga_hashes",
+                        "gather_if8_fpga_hashes"):
+                    self.assertEqual(
+                        {int(value, 16) for value in
+                         config["hardware"][field]},
+                        expected_hashes)
 
     def test_unknown_variant_and_artifact_format_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "unsupported YOLOv5 variant"):
@@ -133,7 +147,7 @@ class VariantTests(unittest.TestCase):
             "n_detections": 2,
             "backend": "hardware",
             "geometry_abi": "conv-config-inst-v1",
-            "hardware_version": "0x77e8adf3",
+            "hardware_version": "0x746d0a49",
             "precompiled": True,
             "artifact_version": 5,
             "input_resolution": "256x256",
@@ -428,7 +442,7 @@ class PlannerTests(unittest.TestCase):
     def test_checkpoint_runner_selects_queue_config_geometry(self):
         fake_engine = mock.Mock()
         fake_backend = object()
-        known_versions = {0xD93EEA82}
+        known_versions = {0x746D0A49}
         with mock.patch.object(
                 yolov5_test.user_dma_core, "UnifiedEngine",
                 return_value=fake_engine) as engine_constructor, \
@@ -572,17 +586,14 @@ class PlannerTests(unittest.TestCase):
         )
         engine = user_dma_core.UnifiedEngine.__new__(user_dma_core.UnifiedEngine)
         engine.hw_version = 0xDCACD7AA
-        engine._allow_unknown_conv_hardware = False
+        engine._allow_unknown_conv_hardware = True
         engine._allow_unknown_queue_config_hardware = False
         engine.conv_geometry_mode = user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG
         with self.assertRaisesRegex(RuntimeError, "live-csr-v1"):
             engine.require_conv_geometry_hardware()
 
-        engine.hw_version = 0xD93EEA82
-        engine.require_conv_geometry_hardware()
-        engine.hw_version = 0x9EF15FC1
-        engine.require_conv_geometry_hardware()
-        engine.hw_version = 0x663DE8D5
+        engine._allow_unknown_conv_hardware = False
+        engine.hw_version = 0x746D0A49
         engine.require_conv_geometry_hardware()
         engine.is_capture_on = True
         engine.capture_buffer = []
@@ -615,7 +626,7 @@ class PlannerTests(unittest.TestCase):
         engine._allow_unknown_gather_if8_hardware = False
         with self.assertRaisesRegex(RuntimeError, "scale address too late"):
             engine.require_gather_if8_hardware()
-        engine.hw_version = 0x77E8ADF3
+        engine.hw_version = 0x746D0A49
         engine.require_gather_if8_hardware()
         engine.hw_version = 0x9EF15FC1
         engine._allow_unknown_gather_if8_hardware = True
@@ -721,7 +732,7 @@ class PrecompiledBinTests(unittest.TestCase):
             def __init__(self):
                 self.h2c_device = "fake-h2c"
                 self.c2h_device = "fake-c2h"
-                self.hw_version = 0x77E8ADF3
+                self.hw_version = 0x746D0A49
                 self.conv_geometry_mode = user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG
                 self._allow_unknown_conv_hardware = False
                 self._allow_unknown_queue_config_hardware = False
@@ -829,12 +840,14 @@ class PrecompiledBinTests(unittest.TestCase):
 
         old_engine = FakeRuntimeEngine()
         old_engine.hw_version = 0xDCACD7AA
-        with self.assertRaisesRegex(RuntimeError, "live-csr-v1"):
+        with self.assertRaisesRegex(RuntimeError, "not verified for native"):
             PrecompiledAndromedaBackend(old_engine, payload)
         self.assertEqual(old_engine.writes, [])
 
         stale_gather_engine = FakeRuntimeEngine()
         stale_gather_engine.hw_version = 0x9EF15FC1
+        stale_gather_engine._allow_unknown_conv_hardware = True
+        stale_gather_engine._allow_unknown_queue_config_hardware = True
         with self.assertRaisesRegex(RuntimeError, "scale address too late"):
             PrecompiledAndromedaBackend(stale_gather_engine, payload)
         self.assertEqual(stale_gather_engine.writes, [])

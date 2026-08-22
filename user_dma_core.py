@@ -75,47 +75,21 @@ UE_CONV_GEOM_ADDR = 0x0000006C     # [11:0] out_w, [23:12] out_h, [30:24] CT
 UE_CONV_CTRL_ADDR = 0x000000A4     # [3:0] kernel_w, [7:4] kernel_h, [23:8] oc_count
 UE_CONV_STRIDE_ADDR = 0x000000A8   # [11:0] row_stride, [23:12] col_stride
 UE_CONV_PIXSTEP_ADDR = 0x000000AC  # [11:0] pix_col_step, [23:12] pix_row_step
-# Git-derived FPGA version-register values whose RTL includes the native
-# CONV2D/MAXPOOL modes and geometry CSRs.  Development builds can be admitted
-# explicitly per UnifiedEngine instance after their RTL has been verified.
+# Latest timing-clean FPGA version whose RTL has been verified for native
+# CONV2D/MAXPOOL, ordered queue CONFIG, and gather IF8.  Keep these capability
+# sets fail-closed and synchronized with both YOLO configuration files.
 UE_NATIVE_CONV_HW_VERSIONS = frozenset({
-    0x1B4D15CF,
-    0x5DE75AA6,
-    0xBA650E20,
-    0x08528A43,
-    0xDCACD7AA,
-    0xF1BCF368,
-    0xD93EEA82,
-    0x9EF15FC1,
-    0x663DE8D5,
-    0x77E8ADF3,
-    0x3E92CDDF,
-    0x9D1A77DC,
-    0x83C27CED,
     0x746D0A49,
 })
-# Builds verified to implement ordered ISA CONFIG subtype 0 for the four
-# CONV2D/MAXPOOL geometry words.  Keep this narrower than the native-conv set:
-# sending opcode 0xC to an older native-conv image must fail closed.
+# Build verified to implement ordered ISA CONFIG subtype 0 for the four
+# CONV2D/MAXPOOL geometry words.
 UE_QUEUE_CONFIG_HW_VERSIONS = frozenset({
-    0xD93EEA82,
-    0x9EF15FC1,
-    0x663DE8D5,
-    0x77E8ADF3,
-    0x3E92CDDF,
-    0x9D1A77DC,
-    0x83C27CED,
     0x746D0A49,
 })
-# Builds whose gather datapath has been verified for consecutive 512-bit IF8
-# blocks.  Earlier queue-CONFIG images rewind the scale BRAM one cycle late in
-# this case and can silently select stale scale datatypes, so mixed
-# gather-IF8 artifacts must use this stricter capability set.
+# Build whose gather datapath has been verified for consecutive 512-bit IF8
+# blocks.  Older images remain rejected even when they implemented an earlier
+# queue-CONFIG ABI.
 UE_GATHER_IF8_HW_VERSIONS = frozenset({
-    0x77E8ADF3,
-    0x3E92CDDF,
-    0x9D1A77DC,
-    0x83C27CED,
     0x746D0A49,
 })
 # Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)

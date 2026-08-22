@@ -21,9 +21,10 @@ commit `77e8adf3`. Older queue-CONFIG builds `d93eea82`, `9ef15fc1`, and
 `663de8d5`, as well as the bundled `update_cf133b89.bin`, are rejected before
 optimized model execution. The four-channel banked gather, direct-bin
 inference, and complete Andromeda hardware suite are strictly validated on
-timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`, TNS `0`). That build includes
-the read-only `HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG
-direct inference does not write those live CSRs.
+timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`, TNS `0`), which is the
+only build accepted by this optimized path. It includes the read-only `HW_INFO`
+register and remaps the live geometry CSRs. Queue-CONFIG direct inference does
+not write those live CSRs.
 
 ## Checkpoint and quantization
 

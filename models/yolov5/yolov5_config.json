@@ -44,39 +44,15 @@
   },
   "hardware": {
     "compatible_fpga_hashes": [
-      "1b4d15cf",
-      "5de75aa6",
-      "ba650e20",
-      "08528a43",
-      "dcacd7aa",
-      "f1bcf368",
-      "d93eea82",
-      "9ef15fc1",
-      "663de8d5",
-      "77e8adf3",
-      "3e92cddf",
-      "9d1a77dc",
-      "83c27ced",
       "746d0a49"
     ],
     "queued_config_fpga_hashes": [
-      "d93eea82",
-      "9ef15fc1",
-      "663de8d5",
-      "77e8adf3",
-      "3e92cddf",
-      "9d1a77dc",
-      "83c27ced",
       "746d0a49"
     ],
     "gather_if8_fpga_hashes": [
-      "77e8adf3",
-      "3e92cddf",
-      "9d1a77dc",
-      "83c27ced",
       "746d0a49"
     ],
     "incompatible_shipped_fpga_hash": "cf133b89",
-    "compatibility_note": "Optimized checkpoint-backed YOLO and direct artifact v5 require ordered queued CONFIG opcode 0xC plus the corrected gather-IF8 scale rewind. Builds 3e92cddf, 9d1a77dc, 83c27ced, and verified rebased build 746d0a49 provide the timing-clean four-channel banked gather; 9d1a77dc, 83c27ced, and 746d0a49 also reserve HW_INFO at 0x00A0 and relocate the live CONV control registers. The optimized path accepts only gather_if8_fpga_hashes; queued_config_fpga_hashes and compatible_fpga_hashes document broader legacy driver capabilities. The repository-shipped update_cf133b89.bin is incompatible."
+    "compatibility_note": "Optimized checkpoint-backed YOLO and direct artifact v5 accept only the latest verified timing-clean RK-256 build 746d0a49. It provides native CONV2D/MAXPOOL, ordered queued CONFIG opcode 0xC, corrected four-channel banked gather-IF8, HW_INFO at 0x00A0, and relocated live CONV control registers. Older builds and the repository-shipped update_cf133b89.bin fail closed."
   }
 }

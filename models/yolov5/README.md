@@ -23,10 +23,11 @@ mixed-precision path additionally requires the corrected gather-IF8 scale
 rewind introduced by Andromeda commit `77e8adf3`; older queue-CONFIG builds
 `d93eea82`, `9ef15fc1`, and `663de8d5` are rejected for this artifact. The
 four-channel banked gather and direct-bin path are strictly validated on
-timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`, TNS `0`). That build includes
-the read-only `HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG
-direct inference does not write those live CSRs. No compatible update image is
-shipped in this repository.
+timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`, TNS `0`), which is the
+only build accepted by this optimized path. It includes the read-only `HW_INFO`
+register and remaps the live geometry CSRs. Queue-CONFIG direct inference does
+not write those live CSRs. No compatible update image is shipped in this
+repository.
 
 Artifact-v5 schema/profile/digest checks, no-capture replay guards, checkpoint
 queue-mode selection, and quantized CPU direct execution are host-validated.

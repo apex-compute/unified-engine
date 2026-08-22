@@ -188,7 +188,8 @@ compatible update image is shipped in this repository. YOLOv5 is therefore
 opt-in rather than part of the default suite. Both optimized artifacts are
 strictly validated on timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`,
 TNS `0`). That build includes the read-only `HW_INFO` register and remapped live
-geometry CSRs; the direct-bin queue-CONFIG path does not write those live CSRs.
+geometry CSRs; it is the only build accepted by the optimized path. The
+direct-bin queue-CONFIG path does not write those live CSRs.
 
 Both variants support a single checkpoint-free model artifact:
 
