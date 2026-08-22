@@ -23,7 +23,7 @@ mixed-precision path additionally requires the corrected gather-IF8 scale
 rewind introduced by Andromeda commit `77e8adf3`; older queue-CONFIG builds
 `d93eea82`, `9ef15fc1`, and `663de8d5` are rejected for this artifact. The
 four-channel banked gather and direct-bin path are strictly validated on
-timing-clean RK-256 build `83c27ced` (WNS `+0.002 ns`, TNS `0`). That build includes
+timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`, TNS `0`). That build includes
 the read-only `HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG
 direct inference does not write those live CSRs. No compatible update image is
 shipped in this repository.
@@ -176,18 +176,18 @@ testing an already-built artifact so the pre-test clean does not remove it.
 
 The gather primitive retains the normal folded-bias and fused-SiLU epilogue,
 so the 6x6 RGB stem uses predominantly INT8 gather blocks instead of repeatedly
-padding three channels into channel-mode IF4 blocks. Build `83c27ced` advances
+padding three channels into channel-mode IF4 blocks. Build `746d0a49` advances
 four activation channels per walker cycle through a four-bank LUTRAM patch
 store, while ordered exact-tail CONFIG groups remove duplicated edge outputs.
 A strict direct-bin run, with no unknown-hardware override, reported an
-FPGA-only time of `84.342 ms` (`28,106,912` cycles) and an execution-wall time
-of `161.972 ms`. The one-time immutable model upload was `16,940,472` bytes in
-exactly two writes and took `6.359 ms`. The run detected `car` at confidence
+FPGA-only time of `84.366 ms` (`28,115,024` cycles) and an execution-wall time
+of `168.156 ms`. The one-time immutable model upload was `16,940,472` bytes in
+exactly two writes and took `6.846 ms`. The run detected `car` at confidence
 `0.510560`.
 
 The same strict artifact and FPGA build detected `car` at every embedded
-profile. FPGA-only times were `131.265`, `222.030`, `335.200`, `392.472`, and
-`523.181 ms` for 320x320, 416x416, 512x512, 640x480, and 640x640 respectively.
+profile. FPGA-only times were `131.292`, `222.054`, `335.197`, `392.433`, and
+`523.172 ms` for 320x320, 416x416, 512x512, 640x480, and 640x640 respectively.
 
 FPGA-only time uses the `HW_INFO`-reported 333.25 MHz clock and is the corrected
 sum of queue-start-to-HALT accelerator latency

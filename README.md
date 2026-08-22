@@ -186,7 +186,7 @@ The bundled `update_cf133b89.bin` predates those modes; see the model READMEs
 for the required corrected gather-IF8 commit before running either model. No
 compatible update image is shipped in this repository. YOLOv5 is therefore
 opt-in rather than part of the default suite. Both optimized artifacts are
-strictly validated on timing-clean RK-256 build `83c27ced` (WNS `+0.002 ns`,
+strictly validated on timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`,
 TNS `0`). That build includes the read-only `HW_INFO` register and remapped live
 geometry CSRs; the direct-bin queue-CONFIG path does not write those live CSRs.
 
@@ -216,7 +216,7 @@ concatenation and detection postprocessing remain host-side. See each model
 README for its direct CLI and artifact contract.
 
 The mixed-precision artifacts require the corrected gather-IF8 scale rewind
-introduced by Andromeda commit `77e8adf3`. Build `83c27ced` advances four
+introduced by Andromeda commit `77e8adf3`. Build `746d0a49` advances four
 low-channel activation taps per gather walker cycle and stores patches in
 timing-clean banked LUTRAM. Exact edge-tile CONFIG groups also avoid
 recomputing overlap-clamped outputs. Strict direct-bin runs on RK-256 at the
@@ -225,12 +225,12 @@ override, reported:
 
 | Resolution | YOLOv5s FPGA only | YOLOv5n FPGA only |
 |---|---:|---:|
-| 256x256 | 84.342 ms | 30.366 ms |
-| 320x320 | 131.265 ms | 47.103 ms |
-| 416x416 | 222.030 ms | 79.274 ms |
-| 512x512 | 335.200 ms | 119.004 ms |
-| 640x480 | 392.472 ms | 139.247 ms |
-| 640x640 | 523.181 ms | 185.306 ms |
+| 256x256 | 84.366 ms | 30.374 ms |
+| 320x320 | 131.292 ms | 47.114 ms |
+| 416x416 | 222.054 ms | 79.300 ms |
+| 512x512 | 335.197 ms | 119.017 ms |
+| 640x480 | 392.433 ms | 139.268 ms |
+| 640x640 | 523.172 ms | 185.314 ms |
 
 The execution-wall timer covers the image-dependent graph replay, including
 host packing, dynamic DMA, 72 resident-program dispatches, and host

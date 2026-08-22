@@ -21,7 +21,7 @@ commit `77e8adf3`. Older queue-CONFIG builds `d93eea82`, `9ef15fc1`, and
 `663de8d5`, as well as the bundled `update_cf133b89.bin`, are rejected before
 optimized model execution. The four-channel banked gather, direct-bin
 inference, and complete Andromeda hardware suite are strictly validated on
-timing-clean RK-256 build `83c27ced` (WNS `+0.002 ns`, TNS `0`). That build includes
+timing-clean RK-256 build `746d0a49` (WNS `+0.014 ns`, TNS `0`). That build includes
 the read-only `HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG
 direct inference does not write those live CSRs.
 
@@ -91,16 +91,16 @@ not one accelerator launch.
 
 ## 256 x 256 performance
 
-On timing-clean RK-256 build `83c27ced`, a strict direct-bin run with no
-unknown-hardware override reported an FPGA-only time of `30.366 ms`
-(`10,119,312` cycles) and an execution-wall time of `85.746 ms`. The one-time
+On timing-clean RK-256 build `746d0a49`, a strict direct-bin run with no
+unknown-hardware override reported an FPGA-only time of `30.374 ms`
+(`10,122,272` cycles) and an execution-wall time of `95.900 ms`. The one-time
 immutable model upload was `18,313,456` bytes in exactly two writes and took
-`7.111 ms`. The run detected seven `person` instances, led by confidence
+`6.277 ms`. The run detected seven `person` instances, led by confidence
 `0.685195`.
 
 Every embedded profile completed strictly from the same bin and detected
-`person`. FPGA-only times were `47.103`, `79.274`, `119.004`, `139.247`, and
-`185.306 ms` for 320x320, 416x416, 512x512, 640x480, and 640x640 respectively.
+`person`. FPGA-only times were `47.114`, `79.300`, `119.017`, `139.268`, and
+`185.314 ms` for 320x320, 416x416, 512x512, 640x480, and 640x640 respectively.
 
 FPGA-only time uses the `HW_INFO`-reported 333.25 MHz clock and is the corrected
 sum of queue-start-to-HALT accelerator latency

@@ -92,6 +92,7 @@ UE_NATIVE_CONV_HW_VERSIONS = frozenset({
     0x3E92CDDF,
     0x9D1A77DC,
     0x83C27CED,
+    0x746D0A49,
 })
 # Builds verified to implement ordered ISA CONFIG subtype 0 for the four
 # CONV2D/MAXPOOL geometry words.  Keep this narrower than the native-conv set:
@@ -104,6 +105,7 @@ UE_QUEUE_CONFIG_HW_VERSIONS = frozenset({
     0x3E92CDDF,
     0x9D1A77DC,
     0x83C27CED,
+    0x746D0A49,
 })
 # Builds whose gather datapath has been verified for consecutive 512-bit IF8
 # blocks.  Earlier queue-CONFIG images rewind the scale BRAM one cycle late in
@@ -114,6 +116,7 @@ UE_GATHER_IF8_HW_VERSIONS = frozenset({
     0x3E92CDDF,
     0x9D1A77DC,
     0x83C27CED,
+    0x746D0A49,
 })
 # Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)
 UE_ARGMAX_INDEX = UE_ARGMAX1_INDEX
