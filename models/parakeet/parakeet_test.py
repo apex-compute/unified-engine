@@ -1758,7 +1758,7 @@ def main():
     _original_print(f"Parakeet-TDT-0.6B on {user_dma_core.DMA_DEVICE_H2C} ({audio_dur:.1f}s audio)")
 
     # --- Init engine ---
-    engine = Parakeet_UnifiedEngine(clock_period_ns=clock)
+    engine = Parakeet_UnifiedEngine()
 
     # --- Mel spectrogram: power spec on CPU, matmul+log on accelerator, norm on CPU ---
     Parakeet_UnifiedEngine.ensure_model_files()
