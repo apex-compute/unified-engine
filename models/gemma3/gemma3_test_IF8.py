@@ -35,13 +35,13 @@ Weights:
 Usage:
   python gemma3_test_IF8.py
   python gemma3_test_IF8.py --prompt "your prompt"
-  python gemma3_test_IF8.py --dev xdma0 [--device kintex7] [--cycle 5.0422]
+  python gemma3_test_IF8.py --dev xdma0 [--device kintex7]
   python gemma3_test_IF8.py --dev xdma0 --device bittware
   python gemma3_test_IF8.py --local-weights
   python gemma3_test_IF8.py --dual-engine
 
-``--device`` matches ``user_hw_test.py`` (FPGA profile: ``UE_AXI_DATA_WIDTH_BITS`` and default clock).
-``--dev`` is the XDMA device name (e.g. ``xdma0``). For Bittware use ``--device bittware``; override clock with ``--cycle`` if needed.
+``--device`` matches the FPGA/DMA profile; AXI width and clock come from HW_INFO.
+``--dev`` is the XDMA device name (e.g. ``xdma0``). For Bittware use ``--device bittware``.
 
 Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, gemma3_bin/, and gemma3_if8_bin/ live in the same folder.
   user_dma_core.py is two folders up (models/../..); that grandparent is added to sys.path.
@@ -323,8 +323,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # (~990 MB: 26 layers ~687 MB + LM_HEAD ~297 MB + ROPE + OUTPUT_NORM) fits in a
         # single contiguous Params region. The 768 MB Params default in user_dma_core.py
         # is sized for IF4; IF8 doubles every quantized tensor and overflows it. Total
-        # physical DRAM is 4 GB, so recompute the boundary integers from the (already
-        # IF8-rewritten) config sizes. Mirrors Gemma4 E2B's pattern.
+        # recompute the boundary integers from the (already IF8-rewritten) config
+        # sizes. Available physical DRAM is reported separately by HW_INFO.
         _script_dir = script_dir or SCRIPT_DIR
         _cfg_tmp = self.load_config(script_dir=_script_dir)
         _fi = _cfg_tmp["file_info"]
@@ -2902,8 +2902,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         built from ``run_result`` (the run_gemma3_decode dict) plus cheap host-side
         bookkeeping. No FPGA program is launched here. Mirrors
         gemma4_e2b_test.write_run_summary. Returns the written path."""
-        clock_ns = self._clock_period_ns
-        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        hw_info = user_dma_core.configured_hardware_info()
+        clock_ns = 1000.0 / hw_info.frequency_mhz
+        freq_mhz = hw_info.frequency_mhz
         peak_gflops = freq_mhz * 0.128 * cores   # freq(MHz) * 128 MAC/cyc/1000 * cores
         try:
             hw_version = self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF
@@ -2949,6 +2950,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         L.append(f"# {title} run summary")
         L.append("")
         L.append(f"- **HW version:** {hw_version_str}")
+        L.append(f"- **Hardware info register:** {user_dma_core.hardware_info_summary()}")
         L.append(f"- **--dev:** {args.dev}")
         L.append(f"- **--device:** {args.device}")
         L.append(f"- **Clock / frequency:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)")
@@ -3027,24 +3029,11 @@ def gemma3_run_summary_filename(args, prefix: str = "gemma3_test_IF8") -> str:
         tokens.append("two-pass-prefill")
     if getattr(args, "matmatmul", False):
         tokens.append("two-pass-decoder")
-    if getattr(args, "cycle", None) is not None:
-        tokens.append(f"cycle_{args.cycle}")
     return prefix + "_" + "_".join(str(t) for t in tokens) + ".md"
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-def _clock_ns_default_for_device(device: str) -> float:
-    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 1000 / (1066 / 5.375)
-    if device in ("rk", "rk_256", "puzhi"):       return 3.0
-    if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 1000 / 366.666666
-    if device == "alveo_u55c":                     return 3.3333333
-    if device == "efinix":                         return 4.0
-    return 10.0
-
-
 def gemma3_decoder_quantized_matmat_compare_test(
     data_type: TYPE = TYPE.IF4,
     int_variant: bool = True,
@@ -3269,13 +3258,7 @@ def main():
         '--device',
         type=str,
         default='kintex7',
-        help='FPGA board / bitstream profile (same as user_hw_test.py): affects UE_AXI_DATA_WIDTH_BITS and default --cycle.',
-    )
-    parser.add_argument(
-        '--cycle',
-        type=float,
-        default=None,
-        help='Clock cycle time in nanoseconds. Default: from --device (kintex7=5.0422ns, bittware=3.3333ns, rk/rk_256/puzhi=3.0ns, alveo=2.7272727ns).',
+        help='FPGA board / DMA profile; AXI width and clock are read from HW_INFO.',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
@@ -3300,17 +3283,14 @@ def main():
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
 
+    user_dma_core.configure_clock_from_hardware()
+    print(f"FPGA profile: device={args.device}")
+    print(user_dma_core.hardware_info_summary())
+
     _boot = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
     _boot.software_reset()
     _boot.clear_dram()
 
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
     print(f"Using DMA device: {args.dev}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
