@@ -3362,7 +3362,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_ACTION_DIM_PADDED = 32
     AE_XT_WIDTH = 64  # physical width of x_t/v_t buffers (action_dim 32 padded to 64-align)
     # --- roofline / FLOP-util reporting -------------------------------------
-    CYCLE_NS = 5.63          # HW clock period (config defaults.cycle_ns) -> ~177.6 MHz
+    # Alveo U55C (HW 0x68f0c76c) runs at 300 MHz -> 3.3333333 ns. The old 5.63
+    # (~177.6 MHz) was the config default for a different board; see
+    # gemma4_e2b_test.py::_clock_ns_default_for_device, which maps alveo_u55c to
+    # 3.3333333 and rk/rk_256 (HW 0x3d04c689, the previous device) to 3.0.
+    # This is REPORTING ONLY -- CLOCK_CYCLE_TIME_NS drives no timeout or spin count,
+    # and barrier_margin_nops is an instruction count, so it scales with the clock.
+    CYCLE_NS = 3.3333333     # HW clock period, Alveo U55C @ 300 MHz
     MACS_PER_CYCLE = 64      # ASSUMPTION: 64-ALU vector unit = 64 MACs/cycle. If the
                              # matmul core is a 64xN systolic array this is higher --
                              # set to the real MAC/cycle to get an accurate %-of-peak.
@@ -3372,7 +3378,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # emitters issue, NOT that the silicon beat its own ceiling. That check is what
     # caught the denoise stage reporting 401 GFLOP/s (see _denoise_flops).
     # Set to None to fall back to the MACS_PER_CYCLE x engine-count estimate.
-    DEVICE_PEAK_GFLOPS = 375.0
+    #
+    # None on purpose now. The 375.0 was a whole-device measurement on the PREVIOUS
+    # board and does not scale with engine count, so at 12 engines it reported a
+    # ceiling ~23% too low and inflated every %-of-peak. The repo's own per-core
+    # formula is freq_MHz * 0.128 GFLOPS/core (gemma4_e2b_test.py:1348), which the
+    # MACS_PER_CYCLE fallback below reproduces exactly: 64 MACs * 2 flops / 3.3333 ns
+    # = 38.4 GFLOPS/engine at 300 MHz, i.e. 307.2 at 8 engines and 460.8 at 12 --
+    # matching PR #152's measured table for this device. Re-pin this to a real
+    # measured number if you take one, but pin it PER DEVICE, not as a bare constant.
+    DEVICE_PEAK_GFLOPS = None
     AE_ACTION_HORIZON = 10
     AE_ACTION_HORIZON_PADDED = 64  # padded for 64-alignment (see AE_M_PROBE)
 
