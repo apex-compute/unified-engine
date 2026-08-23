@@ -1586,8 +1586,6 @@ def main():
                         help="FPGA board profile. Default: bittware")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=5.62,
-                        help='Clock cycle time in nanoseconds (default: 5.62ns ≈ peak 22.8 GFLOPS)')
     # Decode is deterministic, on-FPGA only: token selection is always the HW argmax of
     # (logits + penalty bias). No host sampling (temperature/top-k/top-p/multinomial) — the
     # repetition penalty is folded into the LM-head matmul bias (notes_repetition_penalty_fpga_bias.md).
@@ -1622,9 +1620,7 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    clock = 4.0 if args.device == "efinix" and args.cycle == 5.62 else args.cycle
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    user_dma_core.configure_clock_from_hardware()
     print(f"Using DMA device: {'pcie_dma0' if args.device == 'efinix' else args.dev}")
     print(f"  H2C: {DMA_DEVICE_H2C}")
     print(f"  C2H: {DMA_DEVICE_C2H}")
