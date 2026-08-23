@@ -7330,6 +7330,10 @@ def main():
     print(f"[main] DMA dev={args.dev} (H2C={user_dma_core.DMA_DEVICE_H2C}, "
           f"C2H={user_dma_core.DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}), "
           f"UE_0_BASE_ADDR={user_dma_core.UE_0_BASE_ADDR:#010x}")
+    # HW_INFO register drives clock/AXI-width/cores/DRAM; must run after
+    # set_dma_device() and before any UnifiedEngine is constructed.
+    user_dma_core.configure_clock_from_hardware()
+    print(user_dma_core.hardware_info_summary())
 
     Pi05Libero_UnifiedEngine.AE_COND_TABLE_ON_DEVICE = bool(args.cond_table_on_device)
     Pi05Libero_UnifiedEngine.AE_COND_TABLE_CHECK = bool(args.check_cond_table)

@@ -1273,23 +1273,12 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-def _clock_ns_default_for_device(device: str) -> float:
-    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 1000 / (1066 / 5.375)
-    if device in ("rk", "puzhi"):                 return 3.0
-    if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 4.0
-    if device == "efinix":                         return 4.0
-    return 10.0
-
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-3B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_3b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
-    parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly (no logit readback), fully
@@ -1329,14 +1318,10 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    user_dma_core.configure_clock_from_hardware()
     effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"FPGA profile: device={args.device}")
+    print(user_dma_core.hardware_info_summary())
 
     ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)

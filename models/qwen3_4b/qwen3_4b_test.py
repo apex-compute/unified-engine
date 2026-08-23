@@ -1530,8 +1530,6 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use qwen3_4b_bin/full_model_weights.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=5.62,
-                        help='Clock cycle time in nanoseconds (default: 5.62ns ≈ peak 22.8 GFLOPS)')
     parser.add_argument('--device', type=str, default='kintex7',
                         help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     # Decode is deterministic, on-FPGA only: token selection is always the HW argmax of
@@ -1568,9 +1566,7 @@ def main():
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    clock = 4.0 if args.device == "efinix" and args.cycle == 5.62 else args.cycle
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    user_dma_core.configure_clock_from_hardware()
 
     ue = Qwen3_4b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
     cfg = _load_config(script_dir)

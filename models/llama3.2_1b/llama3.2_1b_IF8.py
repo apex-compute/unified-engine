@@ -33,7 +33,7 @@ Weights:
 Usage:
   python llama3.2_1b_IF8.py
   python llama3.2_1b_IF8.py --prompt "your prompt"
-  python llama3.2_1b_IF8.py --dev xdma0 [--cycle 5.042]
+  python llama3.2_1b_IF8.py --dev xdma0
   python llama3.2_1b_IF8.py --local-weights
 """
 
@@ -401,7 +401,8 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
                  decoder_matmatmul: bool | None = None, stream_prefill: bool | None = None,
                  matmatmul: bool | None = None, prefill_kernel: str | None = None,
                  decode_kernel: str | None = None):
-        # IF8 layout inside the 2 GB window 0x80000000..0xFFFFFFFF.
+        # IF8 uses this low 2 GiB sub-window, independent of the total DRAM size
+        # reported by HW_INFO: 0x80000000..0xFFFFFFFF.
         # At max_context_size=1024 the loaded IF8 params use ~1.20 GiB and
         # tensors/KV use ~212 MiB. Reserve the final 10 MiB for instructions.
         #   params : 0x80000000 .. 0xD0000000  (1.25 GiB)
@@ -1753,8 +1754,9 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
         built from ``run_result`` (the run_llama dict) plus cheap host-side
         bookkeeping. No FPGA program is launched here, so calling it after a run is
         free. Mirrors gemma3_test.write_run_summary. Returns the written path."""
-        clock_ns = getattr(user_dma_core, "CLOCK_CYCLE_TIME_NS", 0.0) or 0.0
-        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        hw_info = user_dma_core.configured_hardware_info()
+        clock_ns = 1000.0 / hw_info.frequency_mhz
+        freq_mhz = hw_info.frequency_mhz
         peak_gflops = freq_mhz * 0.128 * cores   # freq(MHz) * 128 MAC/cyc/1000 * cores
         try:
             hw_version = self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF
@@ -1802,6 +1804,7 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
         L.append(f"# {title} run summary")
         L.append("")
         L.append(f"- **HW version:** {hw_version_str}")
+        L.append(f"- **Hardware info register:** {user_dma_core.hardware_info_summary()}")
         L.append(f"- **--dev:** {args.dev}")
         L.append(f"- **--device:** {args.device}")
         L.append(f"- **Clock / frequency:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)")
@@ -2024,16 +2027,6 @@ class Llama32_1b_IF8_UnifiedEngine(UnifiedEngine):
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-def _clock_ns_default_for_device(device: str) -> float:
-    """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
-    if device == "kintex7":                       return 1000 / (1066 / 5.375)
-    if device in ("rk", "puzhi"):                 return 3.0
-    if device in ("bittware", "bittware_256"):     return 3.3333
-    if device == "alveo":                          return 4.0
-    if device == "efinix":                         return 4.0
-    return 10.0
-
-
 def llama_run_summary_filename(args, prefix: str = "llama3.2_1b_IF8_test") -> str:
     """Per-run summary .md filename encoding the CLI config, e.g.
     ``llama3.2_1b_IF8_test_xdma1_kintex7_puregreedy.md``. dev/device are always
@@ -2045,8 +2038,6 @@ def llama_run_summary_filename(args, prefix: str = "llama3.2_1b_IF8_test") -> st
         tokens.append("prefill-matmatmul")
     if getattr(args, "decode_kernel", None) == "matmatmul":
         tokens.append("decode-matmatmul")
-    if getattr(args, "cycle", None) is not None:
-        tokens.append(f"cycle_{args.cycle}")
     return prefix + "_" + "_".join(str(t) for t in tokens) + ".md"
 
 
@@ -2062,7 +2053,6 @@ def main():
     )
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_if8_bin/full_model_weights.bin")  # legacy dev path; not in standard bin set
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
-    parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument(
         '--prefill-kernel',
@@ -2103,9 +2093,19 @@ def main():
                              'special tokens). Default 256.')
     args = parser.parse_args()
 
+    set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
+    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
+    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
+    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
+    user_dma_core.configure_clock_from_hardware()
+    print(f"FPGA profile: device={args.device}")
+    print(user_dma_core.hardware_info_summary())
+
     prefill_kernel = args.prefill_kernel or Llama32_1b_IF8_UnifiedEngine.DEFAULT_PREFILL_KERNEL
     decode_kernel = args.decode_kernel or Llama32_1b_IF8_UnifiedEngine.DEFAULT_DECODE_KERNEL
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    axi_width_bits = user_dma_core.UE_AXI_DATA_WIDTH_BITS
+    assert axi_width_bits is not None
     if axi_width_bits == 512 and (
         prefill_kernel == "matmatmul" or decode_kernel == "matmatmul"
     ):
@@ -2127,19 +2127,6 @@ def main():
         weights_bin_full = os.path.join(script_dir, weights_bin_rel)
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
-
-    set_dma_device("efinix" if args.device == "efinix" else args.dev)
-    global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
-    DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
-    DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
 
     ue = UnifiedEngine()
     ue.software_reset()
