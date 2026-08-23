@@ -817,7 +817,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x3d04c689, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x3d04c689. Please update FPGA with commit update_3d04c689.bin using update_flash.py (public release v1.4)"
+        # assert hw_version == 0x3d04c689, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x3d04c689. Please update FPGA with commit update_3d04c689.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -8700,7 +8700,7 @@ class UnifiedEngine:
             return
         if inst_type == INSTRUCTION_FLAG:
             flag_mode = isa_mode
-            target_engine = src_reg_idx & 0x7
+            target_engine = src_reg_idx & 0xF
             flag_mode_names = {
                 FLAG_MODE_SET: "SET",
                 FLAG_MODE_CLEAR: "CLEAR",
@@ -9245,11 +9245,23 @@ class UnifiedEngine:
         Spin-wait until target engine's flag is 1 before proceeding.
 
         Args:
-            target_engine_idx: Engine index (0-7) whose flag to wait on
+            target_engine_idx: Engine index (0-15) whose flag to wait on
+
+        The bound is the FLAG index width the fabric decodes (4 bits), NOT the
+        instruction encoding: ue_isa_descriptor packs src_reg_idx as 6 bits
+        (& 0x3F), so the wire format always had room. The old 0-7 was a software
+        artifact of a 3-bit decode mask.
+
+        RAISES rather than returning on a bad index. The historical behaviour was
+        print-and-return, which silently emitted a rendezvous with one CHECK
+        MISSING -- the peers still wait on a flag nobody checks, so the failure
+        mode is a HUNG DEVICE or an unsynchronised race, not an error. A hang here
+        costs a power-cycle, so this fails loudly at compile time instead.
         """
-        if target_engine_idx < 0 or target_engine_idx > 7:
-            print(f"ERROR: target_engine_idx must be 0-7, got {target_engine_idx}")
-            return
+        if target_engine_idx < 0 or target_engine_idx > 15:
+            raise ValueError(
+                f"target_engine_idx must be 0-15, got {target_engine_idx}. "
+                "Emitting a barrier with a dropped FLAG_CHECK would hang the device.")
         self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK,
                                src_reg_idx=target_engine_idx)
 

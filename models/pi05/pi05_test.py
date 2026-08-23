@@ -1626,6 +1626,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         H, I, D = self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE, self.HEAD_DIM
         NH, KV = self.NUM_HEADS, self.NUM_KV_HEADS * self.HEAD_DIM
         lanes, mlp_col_split = self._prefix_mlp_lanes(ne)
+        # The gate/up/down blobs were SLICED host-side at weight-init using this same
+        # lane count (PREFIX_MLP_LANES_RESOLVED). If anything moved PREFIX_NUM_ENGINES
+        # or PREFIX_MLP_LANES between then and now -- a reconfigure, a run_from_bin
+        # with different flags -- we would index an 8192-wide gate_l0 blob as if it
+        # were 2048 wide. Silent wrong math, not an error. Same guard the action
+        # expert's mlp_down_k slices carry.
+        _resolved = getattr(self, "PREFIX_MLP_LANES_RESOLVED", None)
+        assert _resolved is None or lanes == _resolved, (
+            f"prefix MLP lane count changed after weight-init: blobs were sliced for "
+            f"{_resolved} lane(s), emission wants {lanes}. The host slice and the "
+            f"runtime shard must agree exactly.")
         FF_LANE = I // lanes
         bpe = 2
         is_primary = engine_idx == 0
@@ -2062,21 +2073,69 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     NUM_ENGINES = 1
 
     # What `--engines max` resolves to. Each is a different limit:
-    #   VIS      8 -- 2D: 4 row groups x 2 K lanes (_vis_grid) BY DEFAULT. The "rows
+    #   VIS     12 -- 2D: 6 row groups x 2 K lanes (_vis_grid) BY DEFAULT. The "rows
     #                 cap at 4" this works around is a CONVENTION (the 64-row block),
     #                 NOT an architectural ceiling -- see VIS_M_SHARD / --vis_m_shard,
-    #                 which row-shards all 8 at 32 rows and MEASURES FASTER. Under the
-    #                 2D grid the 5th-8th engines split the MLP's K instead: fc1 N-split -> GELU in lane
-    #                 -> fc2 K-split -> 2-way reduce. The attention block stays
-    #                 row-parallel and redundant across lanes, because its A operands
-    #                 are shared row-major buffers and matmat_mul_core has no
+    #                 which row-shards at 32 rows and MEASURES FASTER. Note S=256/slot
+    #                 is only 8 blocks of 32, so a pure row split at THAT granularity
+    #                 saturates at 8 -- which is why VIS_ROW_ALIGN is now DERIVED from
+    #                 the engine count (_vis_row_align) and drops to 4 at ne=12: 64
+    #                 blocks -> 4x24 + 8x20 rows, 89% balanced, and attention stays
+    #                 row-parallel so it shards 12-wide too. M alignment is free
+    #                 because an M-split hands each engine [rows, FULL_N]; the 64 that
+    #                 is real applies to N/K, not M.
+    #                 The 2D grid (VIS_M_SHARD=False) remains available: its second
+    #                 lane's engines split the MLP's K instead: fc1 N-split -> GELU in
+    #                 lane -> fc2 K-split -> 2-way reduce. There the attention block
+    #                 stays row-parallel and redundant across lanes, because its A
+    #                 operands are shared row-major buffers and matmat_mul_core has no
     #                 A-stride, so a K-split of those is not expressible.
-    #   PREFIX   8 -- device cap. S=832 is 13 blocks and 13 is prime, so 8 is uneven
-    #                 (5x128 + 3x64) at ~81% efficiency. Shorter prefixes degrade:
-    #                 S=576 is 56%, S=320 falls back to 1 engine (_prefix_num_engines).
-    #   DENOISE  8 -- device cap. M=64 is ONE row block so this is a COLUMN (N) split;
-    #                 the binding dim is o proj N=1024 = 16 blocks, comfortably >8.
-    STAGE_MAX_ENGINES = {"VIS": 8, "PREFIX": 8, "DENOISE": 8}
+    #   PREFIX  12 -- raised cap. PREFIX_ROW_ALIGN=8 makes every real length split 12
+    #                 ways with no fallback (832/8=104, 576/8=72, 320/8=40 blocks,
+    #                 all >= 12); _col_split takes the remainder, so balance is 100%
+    #                 at S=576, 96% at 832, 83% at 320. Attention alone caps at 8
+    #                 (NUM_HEADS), leaving 4 engines head-less -- see
+    #                 _prefix_head_split.
+    #   DENOISE 12 -- raised cap. M=64 is ONE row block so this is a COLUMN (N) split;
+    #                 the binding dim is o proj N=1024 = 16 blocks, comfortably >12
+    #                 (2,2,2,2 + 1x8 at 64-col align = 67% balanced; the align stays
+    #                 64 because a 32-wide bf16 shard is 64 B, half an SRAM row).
+    #                 The gated MLP is the bulk and splits 88.9% balanced. Attention
+    #                 is HEAD-split and CAPS at 8 (AE_HEADS); engines 8-11 own zero
+    #                 heads and idle between barriers -- see _ae_head_split.
+    STAGE_MAX_ENGINES = {"VIS": 12, "PREFIX": 12, "DENOISE": 12}
+
+    # Why this is NOT just max(STAGE_MAX_ENGINES.values()): the caps above describe
+    # what the PARTITIONING MATH supports. This constant describes what the HARDWARE
+    # can ADDRESS -- the FLAG rendezvous index width. They are allowed to differ; this
+    # one is the one a real run must obey.
+    #
+    # 12 (not 16) because that is what has actually been RUN on this device. The FLAG
+    # index decodes 4 bits, so 16 is the architectural ceiling, but engines 12-15 have
+    # never been exercised. Do not raise this past what has been observed to work.
+    ENGINE_INDEX_LIMIT = 12
+
+    # RESOLVED -- what used to block a 12-engine run, and how:
+    #   (a) The ISA flag-check bound was a SOFTWARE artifact of a 3-bit decode mask,
+    #       not an encoding limit: ue_isa_descriptor has always packed src_reg_idx as
+    #       6 bits (& 0x3F). generate_instruction_flag_check now accepts 0-15 and
+    #       RAISES on out-of-range instead of print-and-return, because the old soft
+    #       fail emitted a rendezvous with one CHECK missing -- a hung device, not an
+    #       error. The MMIO stride is unchanged (UE_0_BASE_ADDR + i * 0x10000); engines
+    #       8-11 land at 0x02080000..0x020B0000 in the same BAR.
+    #   (b) _ae_head_split no longer asserts NH % ne == 0; it CAPS at NH=8, so engines
+    #       8-11 own zero heads. They still emit every barrier slice.
+    #   (c) _prefix_head_split has only 8 heads to give out, so 4 of 12 engines own
+    #       ZERO heads and sit idle through prefix attention (they still emit every
+    #       rendezvous, so this costs time, not correctness). Everything else in the
+    #       prefix -- projections, MLP, RoPE/KV staging -- stays 12-wide.
+    #   (d) VIS_M_SHARD is fine at 12: VIS_ROW_ALIGN is DERIVED from the engine
+    #       count (_vis_row_align) and drops 32 -> 4 at ne=12, giving 256/4 = 64
+    #       blocks -> 4x24 + 8x20 rows, 89% balanced. RESOLVED.
+    #   (e) PREFIX_ROW_ALIGN = 8 splits every real prefix length 12 ways without
+    #       falling back: _prefix_num_engines only falls back when S // 8 < ne, and
+    #       832/8 = 104, 576/8 = 72, 320/8 = 40 are all >= 12. _col_split absorbs
+    #       the remainder (S=576 100%, S=832 96%, S=320 83% balanced). RESOLVED.
 
     # Prefix row-split granularity. 8, not 64, for the SAME reason vision drops to
     # 32 (see VIS_M_SHARD): nothing in _emit_prefix_body consumes a row count as
@@ -2132,11 +2191,85 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # the arithmetic intensity per weight byte, where a K-split halves B instead.
     # Same compute per engine either way (256/8*K*N == 64*(K/2)*N); the whole trade
     # is attention redundancy vs weight bandwidth. MEASURE IT, don't derive it.
+    #
+    # THE ROW ALIGN IS A CONVENTION, NOT A HARDWARE REQUIREMENT. The real 64-rule
+    # is a LAYOUT rule on N and K: a 128-byte SRAM row holds 64 bf16 elements, and
+    # q4_64 quantisation blocks run along K. It says nothing about M. Under a pure
+    # M-split every engine gets a [rows, FULL_N] shard -- the columns are never
+    # cut, and K is never cut -- so N/K 64-alignment is preserved BY CONSTRUCTION
+    # no matter how few rows a shard has. The only M-side constraint left is the
+    # strided-DMA AXI beat, and row_offset*X*2 stays a comfortable multiple of it
+    # even at 4 rows. Precedent in this same file: PREFIX_ROW_ALIGN was dropped
+    # from 64 to 8 for exactly this reason, with a measured win.
+    #
+    # SO THE ALIGN IS DERIVED FROM THE ENGINE COUNT (_vis_row_align), not fixed:
+    # 32 is kept whenever 256/32 = 8 blocks still feeds every engine (ne <= 8, i.e.
+    # everything that runs today, byte-identical), and we only descend when it
+    # cannot. At ne=12:
+    #   align 32 -> 8 blocks  -> fewer blocks than engines, ILLEGAL
+    #   align 16 -> 16 blocks -> 4x2 + 8x1 blocks, max 2 vs ideal 1.33 = 67%
+    #               (still effectively 8 engines' worth of work -- no gain)
+    #   align  4 -> 64 blocks -> 4x6 + 8x5 blocks = 4x24 + 8x20 ROWS,
+    #               max 6 vs ideal 5.33 = 89% BALANCED  <-- chosen
+    # (align 8 ties align 4 on that ratio but spreads 24 vs 16 rows instead of
+    # 24 vs 20, and cost tracks the LARGEST shard.)
     VIS_M_SHARD = True
+
+    # Row-split granularity candidates for VIS_M_SHARD, coarsest first. The
+    # starting point is 32 (M-shard) / 64 (2D grid); _vis_row_align only DESCENDS
+    # below the start when the start cannot feed every engine (S // align < ne),
+    # so every engine count that runs today keeps its exact shape.
+    VIS_ROW_ALIGN_CANDIDATES = (64, 32, 16, 8, 4)
+    # Hard floor. 4 rows is 4*H*2 bytes per shard offset, still far above the AXI
+    # beat the strided vision DMAs need; going finer buys nothing (the imbalance
+    # is already <=1.125 at 64 blocks) and multiplies per-engine program size.
+    VIS_ROW_ALIGN_FLOOR = 4
 
     @property
     def VIS_ROW_ALIGN(self):
-        return 32 if self.VIS_M_SHARD else 64
+        return self._vis_row_align()
+
+    def _vis_row_align(self, ne=None):
+        """Row-block granularity for the vision M-split, DERIVED from engine count.
+
+        Start at 32 under VIS_M_SHARD (64 under the 2D grid) -- today's value. If
+        that many blocks can feed `ne` engines, return it unchanged: this is what
+        pins ne=1..8 at 32 and keeps every currently-running shape byte-identical.
+
+        Only when S // start < ne (e.g. 12 engines vs 256/32 = 8 blocks) do we walk
+        VIS_ROW_ALIGN_CANDIDATES down to VIS_ROW_ALIGN_FLOOR and pick the align that
+        minimises the imbalance ratio max_shard_blocks / (blocks / ne). Ties are
+        broken by the smallest ROW spread between the fattest and thinnest shard
+        (cost tracks the largest shard, so a tighter spread is strictly better),
+        then by the largest align. At S=256, ne=12 that selects align 4: 64 blocks
+        -> 4x24 + 8x20 rows, max/ideal = 1.125 (89% balanced), where align 8 ties on
+        ratio but spreads 24 vs 16 and align 16 is only 67%.
+        """
+        start = 32 if self.VIS_M_SHARD else 64
+        if not self.VIS_M_SHARD:
+            return start
+        if ne is None:
+            ne = self._num_engines("VIS")
+        S = self.VIS_S
+        if S // start >= ne:
+            return start
+        best = None
+        for align in self.VIS_ROW_ALIGN_CANDIDATES:
+            if align > start or align < self.VIS_ROW_ALIGN_FLOOR:
+                continue
+            if S % align:
+                continue
+            blocks = S // align
+            if blocks < ne:
+                continue
+            base, rem = divmod(blocks, ne)
+            parts = [base + (1 if i < rem else 0) for i in range(ne)]
+            key = (max(parts) / (blocks / ne),
+                   (max(parts) - min(parts)) * align,
+                   -align)
+            if best is None or key < best[0]:
+                best = (key, align)
+        return best[1] if best is not None else start
     # The prefix LM is row-sharded too (projections / RMSNorms / MLP; RoPE, the
     # two permutes and attention stay on the primary), so it follows --engines.
     # Set to an int to pin the stage independently of the encoder.
@@ -2282,11 +2415,22 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # Free at 64 MB arenas -- program space only drops 62 -> 60 MB.
     VIS_WORKER_PROGRAM_OFFSET_MANY = 0x00400000   #  4 MB
 
-    # Tensor DRAM allocated AFTER the arenas, by tensor_init_action_expert
-    # (measured 44.97 MB). Reserved up front because the arenas are allocated at
-    # encoder-compile time, long before the action expert asks -- see
+    # Tensor DRAM allocated AFTER the arenas. Reserved up front because the arenas
+    # are allocated at encoder-compile time, long before these allocators ask -- see
     # _resolve_worker_arena_profile.
-    VIS_WORKER_AE_TENSOR_RESERVE = 0x03000000     # 48 MB
+    #
+    # Covers three things, and TWO OF THEM SCALE WITH THE ENGINE COUNT:
+    #   tensor_init_action_expert   ~45 MB   fixed
+    #   prefix_attn_scratch         ~2.2 MB * ne   (compile_prefix, one per engine)
+    #   AE_UATTN_SCRATCH_SHARDED    ~2.0 MB * ne   (compile_denoise_loop, per engine)
+    # so the real demand is ~45 + 4.2*ne MB: ~79 MB at ne=8, ~95 MB at ne=12. The
+    # historical 48 MB was measured at 8 engines against the AE term ALONE and was
+    # already optimistic; at 12 it under-reserves by enough to trip dram_region_map's
+    # overlap assert on first compile. 112 MB covers ne=12 with margin and costs
+    # nothing real -- the tensor region is 1.5 GB (0x80000000..0xE0000000) and the
+    # arenas are sized from whatever is left, so over-reserving here only trims
+    # arena headroom that is not needed (11 workers need ~28 MB each, cap is 64).
+    VIS_WORKER_AE_TENSOR_RESERVE = 0x07000000     # 112 MB
     # Floor for the computed arena: 2 MB offset + 16 MB program space. A worker's
     # encoder+prefix program measured 15.11 MB (5.48 + 9.64), so anything under
     # this cannot hold both stages and would only fail later, deeper in.
@@ -2451,6 +2595,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         peak = max([int(num_engines)]
                    + [self._num_engines(s) for s in ("VIS", "PREFIX", "DENOISE")])
+        assert peak <= self.ENGINE_INDEX_LIMIT, (
+            f"peak engine count {peak} exceeds ENGINE_INDEX_LIMIT "
+            f"{self.ENGINE_INDEX_LIMIT}, the highest engine index exercised on this "
+            f"device. See the full explanation on the same assert in "
+            f"_worker_engine_pool.")
         if peak <= 1:
             return None
         workers = peak - 1
@@ -2509,6 +2658,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 f"needed; the pool is sized from the peak stage count at first use, "
                 f"so a stage raising its count afterwards is not supported.")
             return pool
+        assert peak <= self.ENGINE_INDEX_LIMIT, (
+            f"requested peak engine count {peak} exceeds ENGINE_INDEX_LIMIT "
+            f"{self.ENGINE_INDEX_LIMIT}, the highest engine index that has actually "
+            f"been exercised on this device. The FLAG rendezvous index decodes 4 bits, "
+            f"so 16 is the architectural ceiling and generate_instruction_flag_check "
+            f"accepts 0-15 -- but engines 12-15 have never been run, and the MMIO "
+            f"window above UE_0_BASE_ADDR + {self.ENGINE_INDEX_LIMIT}*0x10000 is "
+            f"unverified. Constructing a UnifiedEngine there writes control registers "
+            f"into a possibly-unmapped window. Raise this constant only alongside a "
+            f"run that demonstrates the higher count.")
         if peak <= 1:
             return []
 
@@ -2652,7 +2811,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             _nr = num_engines // _nk
             _rows_max = max(c for _, c in self._col_split(S, _nr))
             _IP = self.VIS_I_PAD                       # padded 4352, NOT VIS_I=4304
-            _lane_n = _rows_max * (_IP // _nk)         # fc1 out: [rows, IP/nk] dense
+            # Size from the WIDEST _col_split lane, not IP//nk. _col_split hands out
+            # whole 64-blocks with a remainder, so the lanes are only equal when nk
+            # divides the block count: at nk=3 (ne=12) IP=4352 is 68 blocks ->
+            # 1472/1472/1408, and IP//nk = 1450 would let lanes 0 and 1 write 2816 B
+            # past the end of this buffer into vis_mlp_partial. Finite, plausible,
+            # wrong -- no NaN, no assert. Unreachable at nk in (1,2); reachable at 12.
+            _lane_cols = max(c for _, c in self._col_split(_IP, _nk))
+            _lane_n = _rows_max * _lane_cols           # fc1 out: [rows, IP/nk] dense
             _part_n = _rows_max * H                    # fc2 out: FULL [rows, H] partial
             sched.register_per_engine("vis_mlp_lane", self.VIS_MLP_INTER_DRAM, _lane_n * bpe,
                                       init_tensor=torch.zeros(_lane_n, dtype=torch.bfloat16))
@@ -2721,10 +2887,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         NH = self.NUM_HEADS
         if ne <= 1:
             return [(0, NH)]
-        assert ne <= NH, (
-            f"_prefix_head_split: {ne} engines for only {NH} attention head(s). "
-            f"Row sharding scales past NH but head sharding cannot; give the "
-            f"surplus engines a different axis or lower --engines.")
+        if ne >= NH:
+            # HEAD SHARDING CAPS AT NH. Past one head per engine there is nothing
+            # left to split (split_heads asserts H >= n), so engines NH..ne-1 own
+            # ZERO heads: they emit no attention work, but they still emit EVERY
+            # rendezvous, because the _vis_barrier calls in _emit_prefix_body are
+            # unconditional on the head count. Skipping one on a zero-head engine
+            # would deadlock every peer waiting on its flag.
+            # Only ATTENTION is capped here. The row split and the RoPE/KV-staging
+            # split (PREFIX_ROPE_SHARD, over NH*S and S ROWS) stay ne-wide.
+            # Not routed through split_heads: one head each IS its "qheads" answer
+            # at n == NH, and asking for an NH-engine scheduler would carve a
+            # second worker arena over the live one (see _make_stage_scheduler).
+            return [(i, 1) if i < NH else (NH, 0) for i in range(ne)]
         # split_heads is a pure function of (H, gqa_ratio, num_engines) -- no
         # emission, no allocator touch -- so calling it on the stage scheduler
         # here (and again inside the body) is free and side-effect-free.
@@ -3279,10 +3454,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         S = s or self.VIS_S
         if self.VIS_M_SHARD:
-            # Pure row split at 32-row granularity (see VIS_M_SHARD).
-            assert ne <= S // self.VIS_ROW_ALIGN, (
-                f"VIS_M_SHARD: {ne} engines needs {ne} row groups but S={S} is only "
-                f"{S // self.VIS_ROW_ALIGN} block(s) of {self.VIS_ROW_ALIGN}")
+            # Pure row split at the DERIVED granularity (see VIS_M_SHARD and
+            # _vis_row_align): 32 rows whenever that still feeds every engine,
+            # finer (down to VIS_ROW_ALIGN_FLOOR) only when it cannot.
+            align = self._vis_row_align(ne)
+            assert ne <= S // align, (
+                f"VIS_M_SHARD: {ne} engines needs {ne} row groups but S={S} splits "
+                f"into only {S // align} block(s) at the {align}-row granularity "
+                f"chosen by _vis_row_align (candidates "
+                f"{self.VIS_ROW_ALIGN_CANDIDATES}, floor {self.VIS_ROW_ALIGN_FLOOR}). "
+                f"The align is a convention, not a hardware limit -- lower "
+                f"VIS_ROW_ALIGN_FLOOR, or run this stage with fewer engines")
             return ne, 1
         max_rows = S // 64
         nr = max(d for d in range(1, max_rows + 1) if ne % d == 0)
@@ -3475,7 +3657,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # blocks coincide exactly with a subset of the full weight's blocks
                 # and re-quantizing the slice reproduces those scales bit-for-bit.
                 la["mlp_down_k"] = []
-                for k0, kc in self._col_split(self.AE_INTERMEDIATE, _ne_denoise):
+                self._ae_mlp_down_k_split = self._col_split(self.AE_INTERMEDIATE, _ne_denoise)
+                for k0, kc in self._ae_mlp_down_k_split:
                     sl = dn_w[:, k0:k0 + kc].contiguous()
                     sdata, _ = _mlc_quantize_q4_64(sl)
                     la["mlp_down_k"].append(store_quantized_weight(self, sdata.tobytes()))
@@ -3808,27 +3991,48 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     def _ae_attn_shardable(self, sched):
         """True iff the head-parallel attention block can run on this engine count.
 
-        The block partitions AE_HEADS=8 whole heads, so it needs ne | 8 (1/2/4/8).
-        Other counts (3, 5, 6, 7) keep the SERIAL attention path and shard only the
-        gated MLP -- degrade rather than assert, so --engines 6 still works exactly
-        as it did before this block existed.
+        The block partitions AE_HEADS=8 whole heads, so it needs ne | 8 (1/2/4/8),
+        or ne > 8 -- above the head count the split is CAPPED at one head per engine
+        and the surplus engines own none (see _ae_head_split). Other counts
+        (3, 5, 6, 7) keep the SERIAL attention path and shard only the gated MLP --
+        degrade rather than assert, so --engines 6 still works exactly as it did
+        before this block existed.
         """
-        return (sched is not None and sched.num_engines > 1
-                and self.AE_HEADS % sched.num_engines == 0)
+        if sched is None or sched.num_engines <= 1:
+            return False
+        ne = sched.num_engines
+        return ne > self.AE_HEADS or self.AE_HEADS % ne == 0
 
     def _ae_head_split(self, ne):
-        """Per-engine [first_head, head_count] over AE_HEADS. Requires ne | AE_HEADS.
+        """Per-engine [first_head, head_count] over AE_HEADS.
+
+        Legal for ne | AE_HEADS (an even split) or ne > AE_HEADS (the capped split
+        below); other counts are refused by the assert and take the serial path via
+        _ae_attn_shardable.
 
         The attention block is parallel over HEADS, not rows or columns of one
-        matmul: q/o weights are already stored per head (la["q_data"][h]), every
-        head's attention is independent (MQA -- they share one K/V), and there are
-        exactly AE_HEADS=8 of them, which is the device engine count. So the natural
-        unit here is the head, and the split must land on head boundaries.
+        matmul: q/o weights are already stored per head (la["q_data"][h]) and every
+        head's attention is independent (MQA -- they share one K/V). So the natural
+        unit here is the head, and the split must land on head boundaries. AE_HEADS=8
+        used to equal the device engine count; above 8 engines it no longer does,
+        which is what the cap exists for.
         """
         NH = self.AE_HEADS
+        if ne > NH:
+            # CAPPED: one head each for engines 0..NH-1, ZERO heads for the rest.
+            # A head cannot be split (q/o weights are stored per head and the
+            # attention call is per head range), and M=64 with 10 real action rows
+            # is far too thin to split the query axis instead, so the surplus
+            # engines simply do no attention work. They STILL take part in every
+            # rendezvous: the barriers here are emitted by MultiEngineScheduler
+            # over ALL engines (barrier() / col_sharded_region iterate
+            # self.engines), so a zero-head engine emits its full barrier slice
+            # and merely has nothing between the barriers.
+            return [(e, 1) if e < NH else (NH, 0) for e in range(ne)]
         assert NH % ne == 0, (
             f"denoise attention is HEAD-parallel: engines={ne} must divide "
-            f"AE_HEADS={NH} (use 1, 2, 4 or 8) so each engine owns whole heads")
+            f"AE_HEADS={NH} (use 1, 2, 4 or 8) or exceed it (9+ takes the capped "
+            f"path above) so each engine owns whole heads")
         per = NH // ne
         return [(e * per, per) for e in range(ne)]
 
@@ -3895,10 +4099,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _body(ctx):
             i = ctx.engine_idx
             h0, nh = heads[i]
-            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
-                f"head shard mismatch on engine {i}: scheduler gives "
-                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
-                f"{(h0 * D, nh * D)}")
+            if nh == 0:
+                return   # capped head split (ne > AE_HEADS): no attention work on
+                         # this engine. Its barrier slice is emitted by the
+                         # scheduler regardless, so the rendezvous stays symmetric.
+            # The scheduler's own column split only coincides with the head
+            # boundaries while ne divides AE_HEADS; above that the region's N is
+            # just a vehicle for the rendezvous and every address below is formed
+            # from the head index directly.
+            if self.AE_HEADS % sched.num_engines == 0:
+                assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                    f"head shard mismatch on engine {i}: scheduler gives "
+                    f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                    f"{(h0 * D, nh * D)}")
             raw, mreg = ctx.unsafe_ue, gpr_M_regs[i]
             for h in range(h0, h0 + nh):
                 self._ae_matmul(M, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
@@ -3986,10 +4199,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _body(ctx):
             i = ctx.engine_idx
             h0, nh = heads[i]
-            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
-                f"head shard mismatch on engine {i}: scheduler gives "
-                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
-                f"{(h0 * D, nh * D)}")
+            if nh == 0:
+                return   # capped head split (ne > AE_HEADS): no attention work on
+                         # this engine. Its barrier slice is emitted by the
+                         # scheduler regardless, so the rendezvous stays symmetric.
+            # The scheduler's own column split only coincides with the head
+            # boundaries while ne divides AE_HEADS; above that the region's N is
+            # just a vehicle for the rendezvous and every address below is formed
+            # from the head index directly.
+            if self.AE_HEADS % sched.num_engines == 0:
+                assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                    f"head shard mismatch on engine {i}: scheduler gives "
+                    f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                    f"{(h0 * D, nh * D)}")
             row0 = h0 * S
             ctx.unsafe_ue.unified_attention_core_dynamic(
                 batch=nh * S, aligned_seq_len=Tkv, head_dim=D,
@@ -4029,10 +4251,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _body(ctx):
             i = ctx.engine_idx
             h0, nh = heads[i]
-            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
-                f"head shard mismatch on engine {i}: scheduler gives "
-                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
-                f"{(h0 * D, nh * D)}")
+            if nh == 0:
+                return   # capped head split (ne > AE_HEADS): no attention work on
+                         # this engine. Its barrier slice is emitted by the
+                         # scheduler regardless, so the rendezvous stays symmetric.
+            # The scheduler's own column split only coincides with the head
+            # boundaries while ne divides AE_HEADS; above that the region's N is
+            # just a vehicle for the rendezvous and every address below is formed
+            # from the head index directly.
+            if self.AE_HEADS % sched.num_engines == 0:
+                assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                    f"head shard mismatch on engine {i}: scheduler gives "
+                    f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                    f"{(h0 * D, nh * D)}")
             raw, mreg = ctx.unsafe_ue, gpr_M_regs[i]
             part = sched.per_engine_addr(partial_name, i)
             # Same C_DRAM_ADDR chain as the serial path, over a subset of heads.
@@ -4591,6 +4822,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     "the denoise stage is sharded but weight_init_action_expert did not "
                     "store the K-sliced mlp-down blobs -- DENOISE_NUM_ENGINES must be "
                     "resolvable to the same value at weight-init time as it is here.")
+            # The blobs were CUT at weight-init time against the engine count as it
+            # was resolvable THEN. If that split disagrees with the one this compile
+            # will shard by, every engine multiplies the wrong K-slice: finite,
+            # plausible, wrong -- never a crash. Compare the actual boundaries.
+            assert getattr(self, "_ae_mlp_down_k_split", None) == self._col_split(
+                    self.AE_INTERMEDIATE, ne), (
+                f"mlp_down K-slice mismatch: weight-init cut the blobs for "
+                f"{getattr(self, '_ae_mlp_down_k_split', None)} but this compile shards "
+                f"by {self._col_split(self.AE_INTERMEDIATE, ne)}")
             # Per-engine [S, I/ne] lanes for gate / up / gelu-mult. matmat_mul_core's
             # writeback stride is N*bpe for the N IT WAS GIVEN, so calling it with
             # N=cols writes a DENSE [S, cols] block -- each engine owns its own
@@ -4620,7 +4860,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # Plain allocate_tensor_dram (not register_per_engine): these are
                 # pure scratch that no engine reads across a barrier and that never
                 # needs a primary-address alias or an init tensor.
-                _nh = self.AE_HEADS // ne
+                # Sized from the LARGEST per-engine head count, not AE_HEADS//ne:
+                # above 8 engines that division is 0 while engines 0..7 still own
+                # one head each. Engines with no heads get a buffer they never
+                # touch (harmless waste); an engine that DOES write one and has no
+                # buffer would be silent DRAM corruption.
+                _nh = max(nh for _, nh in self._ae_head_split(ne))
                 _D, _Tkv = self.HEAD_DIM, self.AE_TKV
                 _ushard = _D * _Tkv + _Tkv * _Tkv + _nh * S * _D
                 self.AE_UATTN_SCRATCH_SHARDED = [
@@ -4632,7 +4877,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             else:
                 print(f"    [denoise] engines={ne} does not divide AE_HEADS="
                       f"{self.AE_HEADS}; attention stays SERIAL, only the gated MLP is "
-                      f"sharded (~60% coverage). Use 2, 4 or 8 for the full ~97%.")
+                      f"sharded (~60% coverage). Use 2, 4 or 8 -- or more than "
+                      f"{self.AE_HEADS}, which takes the capped head split -- for the "
+                      f"full ~97%.")
             self.dram_region_map(f"denoise sharded x{ne}")
             sched.begin_program()
 
@@ -4665,7 +4912,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # ae_S_regs, so it needs its own per-engine register (same reasoning: a
         # worker's register indices are its own).
         ne_ae = sched.num_engines if sched is not None else 1
-        nh_per = (self.AE_HEADS // ne_ae) if self._ae_attn_shardable(sched) else self.AE_HEADS
+        nh_per = (max(nh for _, nh in self._ae_head_split(ne_ae))
+                  if self._ae_attn_shardable(sched) else self.AE_HEADS)
         self._ae_rope_M_regs = []
         for eng in ([self] + list(sched.workers if sched is not None else [])):
             r = eng.alloc_isa_reg()
@@ -7081,7 +7329,7 @@ def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, vis_m_s
     what the caller thought, because the knobs are class attributes that only
     main()'s argument parsing ever wrote.
 
-    `engines` is an int 1-8 or the literal "max"; normalize ONCE here so no
+    `engines` is an int 1-12 or the literal "max"; normalize ONCE here so no
     downstream comparison has to know which it got.
     """
     eng_max = (engines == "max")
@@ -7218,27 +7466,31 @@ def main():
             n = int(value)
         except ValueError:
             raise argparse.ArgumentTypeError(
-                f"--engines takes an integer 1-8 or 'max', got {value!r}")
-        if not 1 <= n <= 8:
+                f"--engines takes an integer 1-12 or 'max', got {value!r}")
+        if not 1 <= n <= 12:
             raise argparse.ArgumentTypeError(
-                f"--engines must be 1-8 (the ISA's flag-check addresses engines 0-7), "
-                f"got {n}")
+                f"--engines must be 1-12 (12 is the highest engine count exercised on "
+                f"this device; see ENGINE_INDEX_LIMIT), got {n}")
         return n
 
     ap.add_argument("--engines", type=_engines_arg, default=1, metavar="N|max",
                      help="Number of accelerator engines to row-shard across. DEFAULT 1 = "
                           "the single-engine path, byte-identical to before; only an "
                           "explicit --engines N>1 enables sharding. Applies to the vision "
-                          "encoder (M=256 -> N blocks of 256/N rows) AND the prefix LM "
-                          "(S rows -> N uneven-but-64-aligned block groups); the denoise "
-                          "stage will adopt the same knob. 8 is the device max (the ISA's "
-                          "flag-check addresses engine 0-7).\n"
+                          "encoder (M=256 rows, split at a granularity DERIVED from the "
+                          "engine count -- 32 rows at ne<=8, 4 at ne=12) AND the prefix LM "
+                          "(S rows -> N 8-row block groups); the denoise stage is column/"
+                          "head-split instead (M=64 is one row block). 12 is the max, and "
+                          "is the highest count actually exercised on this device.\n"
+                          "NOTE above 8 engines: both attention blocks are HEAD-split and "
+                          "there are only 8 heads (NUM_HEADS / AE_HEADS), so engines 8-11 "
+                          "own zero heads and idle through attention. They still emit every "
+                          "rendezvous slice, so this costs time, not correctness. "
+                          "Everything else -- projections, MLP, RoPE/KV staging -- is "
+                          "12-wide.\n"
                           "--engines max applies EACH STAGE'S OWN CEILING rather than one "
-                          "number: vision 4, prefix 8, denoise 8 (STAGE_MAX_ENGINES). A flat "
-                          "--engines 8 is NOT the same thing and is wrong for vision, which "
-                          "asserts above 4 -- S=256/slot is only 4 blocks of 64. This is the "
-                          "recommended way to run fully sharded; it is exactly equivalent to "
-                          "--vis_4 --pref_8 --dns_8. Those three still exist for isolating one "
+                          "number: vision 12, prefix 12, denoise 12 (STAGE_MAX_ENGINES). "
+                          "The three per-stage flags still exist for isolating one "
                           "stage at a time (e.g. --vis_4 alone gives a single-engine prefix "
                           "baseline) and take precedence over this flag.")
     ap.add_argument("--vis_m_shard", action=argparse.BooleanOptionalAction, default=None,
