@@ -6382,6 +6382,9 @@ class UnifiedEngine:
         assert all(m % UE_VECTOR_SIZE == 0 for m in m_shards), \
             f"each M shard must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got {m_shards}"
 
+        assert all(m % UE_VECTOR_SIZE == 0 for m in m_shards), \
+            f"each M shard must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got {m_shards}"
+
         total_flops = 0
         program_addrs = []
         row_offset = 0
