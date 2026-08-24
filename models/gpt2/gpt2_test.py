@@ -1199,8 +1199,6 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use gpt2_bin/full_model_weights.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--cycle', type=float, default=1/0.17,
-                        help='Clock cycle time in nanoseconds (default: ~5.88ns)')
     parser.add_argument('--temperature', type=float, default=0.9,
                         help='Sampling temperature. 0 = greedy argmax (default: 0.9)')
     parser.add_argument('--top-k', type=int, default=50,
@@ -1224,7 +1222,7 @@ def main():
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
     set_dma_device(args.dev)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+    user_dma_core.configure_clock_from_hardware()
     print(f"Using DMA device: {args.dev}, CLOCK_CYCLE_TIME_NS={user_dma_core.CLOCK_CYCLE_TIME_NS}")
 
     ue = GPT2_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)

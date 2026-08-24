@@ -28,6 +28,13 @@ from typing import Callable, Optional, Tuple
 from enum import IntEnum
 import torch
 import math
+from andromeda_hw_info import (
+    HardwareInfo,
+    MAX_FREQUENCY_MHZ_Q8,
+    UE_HW_INFO_ADDR,
+    decode_hardware_info,
+    format_hardware_info,
+)
 
 # Register address definitions (matches andromeda.c)
 # User device base address (AXI-Lite BAR mapping)
@@ -66,28 +73,64 @@ UE_ARGMAX2_INDEX = 0x00000090
 UE_ARGMAX3_INDEX = 0x00000094
 UE_ARGMAX4_INDEX = 0x00000098
 UE_INT_REG = 0x0000009C  # bits [1:0] interrupt cause; write clears latch (axi_lite_*_module.sv)
+# UE_HW_INFO_ADDR is imported from andromeda_hw_info.py.
 # Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)
 UE_ARGMAX_INDEX = UE_ARGMAX1_INDEX
-UE_LAST_REG_ADDR = UE_INT_REG  # last AXI-Lite offset for init scan
+UE_LAST_REG_ADDR = UE_HW_INFO_ADDR  # last AXI-Lite offset for init scan
 
 # queue_state_module.sv int_cause / andromeda.c INT_CAUSE_*
 INT_CAUSE_NONE = 0
 INT_CAUSE_SWI = 1
 INT_CAUSE_HALT = 2
 
-# CLOCK_CYCLE_TIME_NS will be set based on target argument (default: 3 ns)
-CLOCK_CYCLE_TIME_NS = 3
+# Populated only by configure_clock_from_hardware(); there are no software defaults.
+CLOCK_CYCLE_TIME_NS: Optional[float] = None
+CORE_CLOCK_FREQ_HZ: Optional[float] = None
+HW_INFO_RAW: Optional[int] = None
+QUEUE_MODE_ENABLED: Optional[bool] = None
+ANDROMEDA_CORE_COUNT: Optional[int] = None
+AVAILABLE_DRAM_SIZE_GB: Optional[int] = None
 # HW prescales PIPELINE_COUNTER (0x30): one count = 16 aclk cycles
 # (pipeline_counter_module.sv CLK_DIV). Multiply readouts by this to get cycles.
 UE_PIPELINE_COUNTER_CLK_DIV = 16
-UE_PEAK_GFLOPS = 333.3 * 0.128
+UE_PEAK_GFLOPS: Optional[float] = None
 UE_TRACE_SIZE = 8192
-UE_AXI_DATA_WIDTH_BITS = int(os.environ.get("UE_AXI_DATA_WIDTH_BITS", "256"))
+UE_AXI_DATA_WIDTH_BITS: Optional[int] = None
+
+
+def _clock_period_ns_from_frequency_hz(frequency_hz: float) -> float:
+    """Validate a hardware clock register value and convert Hz to ns."""
+    max_frequency_hz = MAX_FREQUENCY_MHZ_Q8 / 256.0 * 1_000_000.0
+    if not 0.0 < frequency_hz <= max_frequency_hz:
+        raise RuntimeError(
+            f"Invalid Andromeda core clock value {frequency_hz} Hz; program a bitstream "
+            f"that implements HW_INFO register 0x{UE_HW_INFO_ADDR:04x}."
+        )
+    return 1_000_000_000.0 / frequency_hz
+
+
+def _apply_hardware_info(info: HardwareInfo) -> float:
+    """Update timing, topology, and AXI globals from decoded hardware info."""
+    global CLOCK_CYCLE_TIME_NS, UE_PEAK_GFLOPS, CORE_CLOCK_FREQ_HZ
+    global HW_INFO_RAW, QUEUE_MODE_ENABLED, ANDROMEDA_CORE_COUNT, AVAILABLE_DRAM_SIZE_GB, UE_AXI_DATA_WIDTH_BITS
+    clock_period_ns = _clock_period_ns_from_frequency_hz(info.frequency_hz)
+    CLOCK_CYCLE_TIME_NS = clock_period_ns
+    UE_PEAK_GFLOPS = 0.128 / clock_period_ns
+    CORE_CLOCK_FREQ_HZ = info.frequency_hz
+    HW_INFO_RAW = info.raw
+    QUEUE_MODE_ENABLED = info.queue_mode
+    ANDROMEDA_CORE_COUNT = info.core_count
+    AVAILABLE_DRAM_SIZE_GB = info.dram_size_gb
+    UE_AXI_DATA_WIDTH_BITS = info.axi_data_width_bits
+    for module in list(sys.modules.values()):
+        namespace = getattr(module, "__dict__", None) if module is not None else None
+        if namespace is not None and "UE_AXI_DATA_WIDTH_BITS" in namespace:
+            namespace["UE_AXI_DATA_WIDTH_BITS"] = info.axi_data_width_bits
+    return clock_period_ns
 
 # ---------------------------------------------------------------------------
-# AXI beat width: the ONE number that differs between the two board profiles
-# (256-bit: rk_256/puzhi/alinx/alveo/kintex7; 512-bit: rk/bittware — see the
-# device-profile selection in user_hw_test.py's __main__).
+# AXI beat width is populated exclusively from the HW_INFO register. There is
+# deliberately no board-name mapping, environment override, or software default.
 # The DMA engine requires DRAM-side transfer addresses/lengths to land on
 # beat boundaries, so every alignment/padding rule elsewhere in this file and
 # in user_hw_test.py is a direct consequence of this one doubled granularity:
@@ -111,14 +154,23 @@ def ue_axi_beat_bf16_elems_for(width_bits: int) -> int:
     return max(1, width_bits // 16)
 
 
+def _require_axi_data_width_bits() -> int:
+    if UE_AXI_DATA_WIDTH_BITS is None:
+        raise RuntimeError(
+            "HW_INFO has not been read; call configure_clock_from_hardware() "
+            "after set_dma_device() before using AXI-dependent APIs"
+        )
+    return UE_AXI_DATA_WIDTH_BITS
+
+
 def ue_axi_beat_bytes() -> int:
     """AXI beat size in bytes for the live ``UE_AXI_DATA_WIDTH_BITS``."""
-    return ue_axi_beat_bytes_for(UE_AXI_DATA_WIDTH_BITS)
+    return ue_axi_beat_bytes_for(_require_axi_data_width_bits())
 
 
 def ue_axi_beat_bf16_elems() -> int:
     """AXI beat size in bf16 elements for the live ``UE_AXI_DATA_WIDTH_BITS``."""
-    return ue_axi_beat_bf16_elems_for(UE_AXI_DATA_WIDTH_BITS)
+    return ue_axi_beat_bf16_elems_for(_require_axi_data_width_bits())
 
 
 def ue_round_up_to_axi_beat_bytes(nbytes: int) -> int:
@@ -187,6 +239,41 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
                     setattr(_mod, _name, _new)
                 except Exception:
                     pass
+
+
+def read_hardware_info() -> HardwareInfo:
+    """Read and decode the Andromeda hardware-info register."""
+    fd = os.open(DMA_DEVICE_USER, os.O_RDONLY)
+    try:
+        offset = UE_0_BASE_ADDR + UE_HW_INFO_ADDR - AXI_LITE_TRANSLATION_OFFSET
+        raw = os.pread(fd, 4, offset)
+    finally:
+        os.close(fd)
+    if len(raw) != 4:
+        raise OSError(f"Short read from {DMA_DEVICE_USER} HW_INFO register: expected 4 bytes, got {len(raw)}")
+    return decode_hardware_info(struct.unpack("<I", raw)[0])
+
+
+def configured_hardware_info() -> HardwareInfo:
+    """Return the last register-derived HW_INFO, failing if no read succeeded."""
+    if HW_INFO_RAW is None:
+        raise RuntimeError("HW_INFO register has not been read successfully")
+    return decode_hardware_info(HW_INFO_RAW)
+
+
+def hardware_info_summary() -> str:
+    """Format the last successfully read HW_INFO value for logs and summaries."""
+    return format_hardware_info(configured_hardware_info())
+
+
+def read_core_clock_frequency_hz() -> float:
+    """Compatibility helper returning the clock decoded from HW_INFO."""
+    return read_hardware_info().frequency_hz
+
+
+def configure_clock_from_hardware() -> float:
+    """Read HW_INFO and configure timing, topology, and AXI calculations."""
+    return _apply_hardware_info(read_hardware_info())
 
 # Constants
 UE_VECTOR_SIZE = 64
@@ -588,6 +675,10 @@ class UnifiedEngine:
         # (counter_reg, body_start_inst_id, relative, program_dram_addr)
         # per nested loop_start/loop_end.
         self._capture_loop_stack: list[tuple[int, int, bool, int]] = []
+        # Preserve the existing API override while using HW_INFO as the default
+        # source when the caller does not provide a period explicitly.
+        if clock_period_ns is None and CLOCK_CYCLE_TIME_NS is None:
+            configure_clock_from_hardware()
         self._clock_period_ns = clock_period_ns if clock_period_ns is not None else CLOCK_CYCLE_TIME_NS
 
         self._base_addr = BASE_ADDR
@@ -817,7 +908,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x3d04c689, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x3d04c689. Please update FPGA with commit update_3d04c689.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0x316e13b5, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x316e13b5. Please update FPGA with commit update_316e13b5.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -6288,6 +6379,8 @@ class UnifiedEngine:
             m_shards = [m_base + (1 if i < m_rem else 0) for i in range(num_engines)]
         assert len(m_shards) == num_engines and sum(m_shards) == M and all(m >= 1 for m in m_shards), \
             f"m_shards must be {num_engines} positive counts summing to M={M}, got {m_shards}"
+        assert all(m % UE_VECTOR_SIZE == 0 for m in m_shards), \
+            f"each M shard must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got {m_shards}"
 
         assert all(m % UE_VECTOR_SIZE == 0 for m in m_shards), \
             f"each M shard must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got {m_shards}"
@@ -8403,11 +8496,19 @@ class UnifiedEngine:
         print(f"Capture stopped. Total instructions captured: {self.capture_count}, size: {self.capture_count * 32} bytes")
 
     def clear_dram(self, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
-        dram_total_bytes = 0xffffffff - DRAM_START_ADDR + 1
+        if AVAILABLE_DRAM_SIZE_GB is None:
+            raise RuntimeError("HW_INFO register has not been read successfully")
+        # DMA instructions currently carry a 32-bit address. Clear the portion
+        # of register-reported DRAM that is reachable from DRAM_START_ADDR.
+        addressable_bytes = 0x1_0000_0000 - DRAM_START_ADDR
+        dram_total_bytes = min(AVAILABLE_DRAM_SIZE_GB * 1024**3, addressable_bytes)
+        dram_end_addr = DRAM_START_ADDR + dram_total_bytes - 1
         fill = b'\xff' * chunk_size_bytes
         offset = 0
         bar_width = 40
-        print(f"Clearing DRAM [{hex(DRAM_START_ADDR)}..0xffffffff] ({dram_total_bytes / 1024**3:.2f} GB)")
+        print(f"Clearing addressable DRAM [{hex(DRAM_START_ADDR)}..{hex(dram_end_addr)}] "
+              f"({dram_total_bytes / 1024**3:.2f} GiB; "
+              f"HW_INFO reports {AVAILABLE_DRAM_SIZE_GB} GiB total)")
         while offset < dram_total_bytes:
             write_size = min(chunk_size_bytes, dram_total_bytes - offset)
             self.dma_write(DMA_DEVICE_H2C, DRAM_START_ADDR + offset, fill[:write_size], write_size)

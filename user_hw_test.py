@@ -36,7 +36,6 @@ from user_dma_core import (
     TYPE,
     UE_MODE,
     UE_INT_REG,
-    UE_AXI_DATA_WIDTH_BITS,
     UE_MODE,
     URAM_FULL_ELEMENTS,
     URAM_NEAR_FULL_ELEMENTS,
@@ -63,6 +62,7 @@ from user_dma_core import (
 # concise per-test summary line can be written to user_hw_test_summary.md.
 # ---------------------------------------------------------------------------
 TEST_RESULTS = []
+_TEST_NAME_SUFFIX = ""
 
 # Incremented by _run_rng_matched_pair; stamped into each record_test call so
 # the summary can pair legacy/dynamic results without name/dims matching.
@@ -99,7 +99,7 @@ def _rng_aligned_randn_2d(rows: int, active_cols: int, max_cols: int, *, dtype=t
 def record_test(name: str, dims: str = "", snr_db=None, gflops=None, mb_per_s=None, inst_bytes=None,
                 merge_metric_cols: bool = False) -> None:
     TEST_RESULTS.append({
-        "name": name,
+        "name": f"{name}{_TEST_NAME_SUFFIX}",
         "dims": dims,
         "snr_db": snr_db,
         "gflops": gflops,
@@ -146,6 +146,7 @@ def _fmt_metric(value, fmt: str) -> str:
 def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
     """Write a markdown table of all recorded results; dynamic rows show diffs vs their paired legacy."""
     import math as _math
+    import user_dma_core as _user_dma_core
 
     def _snr_delta(legacy_value, dynamic_value) -> str:
         if legacy_value is None or dynamic_value is None:
@@ -275,17 +276,25 @@ def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
     rng_summary_lines.append(f"end: {_RNG_STATE_END or (_rng_state_fingerprint() if _RNG_SEED is not None else 'n/a')}")
     rng_summary = "\n".join(rng_summary_lines) + "\n"
     status = "\n**Status: ALL TESTS PASSED**\n" if _ALL_TESTS_PASSED_BEFORE_SUMMARY else "\n**Status: INCOMPLETE (failed or aborted)**\n"
+    try:
+        hw_info_line = _user_dma_core.hardware_info_summary()
+    except RuntimeError as error:
+        # Never synthesize values when a run aborts before the register read.
+        hw_info_line = f"unavailable: {error}"
+    hw_summary = f"\n**Hardware Info (hardware register only):**\n{hw_info_line}\n"
 
     with open(path, "w") as f:
         f.write(text)
         f.write(dyn_summary)
         f.write(status)
         f.write(rng_summary)
+        f.write(hw_summary)
     print("=== TEST SUMMARY START ===")
     print(text, end="")
     print(dyn_summary, end="")
     print(status, end="")
     print(rng_summary, end="")
+    print(hw_summary, end="")
     print("=== TEST SUMMARY END ===")
 
 
@@ -498,7 +507,6 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
 
     return speed_mb_per_s
 
-
 def matmat_mul_two_cores_unified_test(
     runtime_list=None,
     softmax_enable: bool = False,
@@ -656,15 +664,14 @@ def matmat_mul_multi_cores_unified_test(
 
     def _run_case(M, K, N, dynamic):
         engine_base_stride = 0x00010000
-        tensor_region_stride = 0x04000000
         program_region_stride = 0x01000000
-        assert num_engines * tensor_region_stride <= DRAM_INSTRUCTION_ADDR - DRAM_ACTIVATION_ADDR, \
-            "per-engine tensor regions overflow the activation window"
 
         ues = []
         for i in range(num_engines):
             ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride)
-            ue._tensor_dram_addr = DRAM_ACTIVATION_ADDR + i * tensor_region_stride
+            # This test shares one A/B/output tensor allocation across all engines.
+            # Each engine receives row-offset addresses inside matmat_mul_multi_cores().
+            ue._tensor_dram_addr = DRAM_ACTIVATION_ADDR
             ue._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + i * program_region_stride
             ues.append(ue)
 
@@ -736,6 +743,34 @@ def matmat_mul_multi_cores_unified_test(
             ref = torch.log(torch.clamp(ref, min=1e-3))
         if softmax_enable:
             ref = torch.softmax(ref, dim=-1).to(torch.bfloat16)
+
+        ref_nan = torch.isnan(ref).sum().item()
+        out_nan = torch.isnan(output).sum().item()
+        ref_inf = torch.isinf(ref).sum().item()
+        out_inf = torch.isinf(output).sum().item()
+        out_nonzero = (output != 0).sum().item()
+        out_total = output.numel()
+        print(
+            f"{num_engines}-cores matmul output stats: "
+            f"ref_nan={ref_nan}, out_nan={out_nan}, ref_inf={ref_inf}, out_inf={out_inf}, "
+            f"out_nonzero={out_nonzero}/{out_total}"
+        )
+        row_base = 0
+        for i, m_engine in enumerate(m_shards):
+            row_end = row_base + m_engine
+            ref_shard = ref[row_base:row_end, :]
+            out_shard = output[row_base:row_end, :]
+            shard_nan = torch.isnan(out_shard).sum().item()
+            shard_inf = torch.isinf(out_shard).sum().item()
+            shard_nonzero = (out_shard != 0).sum().item()
+            shard_total = out_shard.numel()
+            shard_snr = calculate_snr(ref_shard, out_shard)
+            print(
+                f"{num_engines}-cores shard engine{i}: rows={row_base}:{row_end}, "
+                f"snr={shard_snr:.2f} dB, nan={shard_nan}, inf={shard_inf}, "
+                f"nonzero={shard_nonzero}/{shard_total}"
+            )
+            row_base = row_end
 
         snr_combined = calculate_snr(ref, output)
         print(f"{num_engines}-cores matmul SNR combined: {snr_combined:.2f} dB")
@@ -4271,6 +4306,567 @@ def dram_read_write_speed_test():
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
+def _pack_if4_payload(codes_2d: torch.Tensor) -> torch.Tensor:
+    """Pack a [N, K] tensor of 4-bit codes into IF4 byte payload."""
+    flat_codes = codes_2d.reshape(-1).to(torch.uint8)
+    payload = torch.zeros(flat_codes.numel() // 2, dtype=torch.uint8)
+    for i in range(0, flat_codes.numel(), 2):
+        lo = int(flat_codes[i].item()) & 0xF
+        hi = int(flat_codes[i + 1].item()) & 0xF
+        payload[i // 2] = ((hi & 0xF) << 4) | lo
+    return payload
+
+def _run_if4_dot_product(
+    ue: UnifiedEngine,
+    A: torch.Tensor,
+    codes_2d: torch.Tensor,
+    scales_bf16: torch.Tensor,
+    *,
+    bias_bf16: torch.Tensor = None,
+) -> torch.Tensor:
+    """Execute IF4 dot-product and return output vector."""
+    K = int(A.numel())
+    N = int(codes_2d.shape[0])
+    blocks_per_row = K // UE_VECTOR_SIZE
+    assert K % UE_VECTOR_SIZE == 0, f"K={K} must be multiple of {UE_VECTOR_SIZE}"
+    assert N % UE_VECTOR_SIZE == 0, f"N={N} must be multiple of {UE_VECTOR_SIZE}"
+    assert codes_2d.shape == (N, K), f"codes_2d shape={codes_2d.shape} must be ({N}, {K})"
+    assert int(scales_bf16.numel()) == N * blocks_per_row, "scale block count mismatch"
+
+    payload = _pack_if4_payload(codes_2d)
+    B_DRAM_ADDR = ue.get_params_dram_addr()
+    ue.dma_write(DMA_DEVICE_H2C, B_DRAM_ADDR, payload, payload.numel())
+    SCALE_DRAM_ADDR = B_DRAM_ADDR + payload.numel()
+    ue.dma_write(
+        DMA_DEVICE_H2C,
+        SCALE_DRAM_ADDR,
+        scales_bf16.view(torch.uint16),
+        scales_bf16.numel() * 2,
+    )
+    ue.allocate_params_dram(payload.numel() + scales_bf16.numel() * 2)
+
+    A_DRAM_ADDR = ue.allocate_tensor_dram(K * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
+    BIAS_DRAM_ADDR = None
+    if bias_bf16 is not None:
+        assert int(bias_bf16.numel()) == N, f"bias size={bias_bf16.numel()} must be N={N}"
+        BIAS_DRAM_ADDR = ue.allocate_tensor_dram(N * 2)
+        ue.dma_to_accelerator_memory(BIAS_DRAM_ADDR, bias_bf16.contiguous())
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=A_DRAM_ADDR,
+        sram_address=0x00000,
+        element_size=K,
+    )
+    ue.accelerator_memory_to_scale_sram(
+        accelerator_dram_address=SCALE_DRAM_ADDR,
+        element_size=N * blocks_per_row,
+    )
+    if bias_bf16 is not None:
+        ue.accelerator_memory_to_bias_sram(
+            accelerator_dram_address=BIAS_DRAM_ADDR,
+            element_size=N,
+        )
+    ue.start_queue_for_dot_product_operation(
+        max_clear_en=1,
+        fmax_context_addr=0,
+        vector_sram_start_addr=0x00000,
+        output_sram_wb_addr=0x80000,
+        K=K,
+        N=N,
+        dma_start_addr=B_DRAM_ADDR,
+        data_type=TYPE.IF4,
+        bias_enable=(bias_bf16 is not None),
+        lalu_mode=LALU_MODE.BYPASS,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x80000,
+        accelerator_dram_address=OUTPUT_DRAM_ADDR,
+        element_size=N,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.dma_to_accelerator_memory(A_DRAM_ADDR, A.contiguous())
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (N,))
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    return output
+
+def dram_to_uram_test():
+    """Basic DRAM->URAM->DRAM memcpy parity check."""
+    ue = UnifiedEngine()
+    elements = UE_VECTOR_SIZE * 16
+    INPUT_DRAM_ADDR = ue.allocate_tensor_dram(elements * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(elements * 2)
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=INPUT_DRAM_ADDR,
+        sram_address=0x00000,
+        element_size=elements,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000,
+        accelerator_dram_address=OUTPUT_DRAM_ADDR,
+        element_size=elements,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    x = torch.randn(elements, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (elements,))
+    snr_db_ref = calculate_snr(x, output)
+    print(f"Reference SNR Analysis for DRAM->URAM Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 40 or snr_db_ref == float("inf"), (
+        f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    )
+
+    record_test("dram_to_uram", f"elements={elements}", snr_db=snr_db_ref)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def uram_to_dram_test():
+    """Basic URAM(B)-source writeback parity check."""
+    ue = UnifiedEngine()
+    elements = UE_VECTOR_SIZE * 8
+    INPUT_DRAM_ADDR = ue.allocate_tensor_dram(elements * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(elements * 2)
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=INPUT_DRAM_ADDR,
+        sram_address=0x80000,  # URAM_B window
+        element_size=elements,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x80000,
+        accelerator_dram_address=OUTPUT_DRAM_ADDR,
+        element_size=elements,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    x = torch.randn(elements, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (elements,))
+    snr_db_ref = calculate_snr(x, output)
+    print(f"Reference SNR Analysis for URAM->DRAM Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 40 or snr_db_ref == float("inf"), (
+        f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    )
+
+    record_test("uram_to_dram", f"elements={elements}", snr_db=snr_db_ref)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def dram_stride_en_test():
+    """Stride-read test: sparse DRAM -> contiguous URAM/DRAM."""
+    ue = UnifiedEngine()
+    chunk_elems = ue_axi_beat_bf16_elems()
+    chunk_bytes = chunk_elems * 2
+    num_chunks = 16
+    stride_jump_bytes = chunk_bytes * 2
+    stride_jump_elems = stride_jump_bytes // 2
+    input_elements = (num_chunks - 1) * stride_jump_elems + chunk_elems
+    output_elements = num_chunks * chunk_elems
+
+    INPUT_DRAM_ADDR = ue.allocate_tensor_dram(input_elements * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(output_elements * 2)
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=INPUT_DRAM_ADDR,
+        sram_address=0x00000,
+        element_size=output_elements,
+        stride_bytes_per_chunk=chunk_bytes,
+        stride_jump_bytes=stride_jump_bytes,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000,
+        accelerator_dram_address=OUTPUT_DRAM_ADDR,
+        element_size=output_elements,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    x = (torch.arange(input_elements, dtype=torch.float32) % 97).to(torch.bfloat16)
+    ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (output_elements,))
+    expected = torch.cat(
+        [x[i * stride_jump_elems: i * stride_jump_elems + chunk_elems] for i in range(num_chunks)],
+        dim=0,
+    )
+    snr_db_ref = calculate_snr(expected, output)
+    print(f"Reference SNR Analysis for DRAM stride-read Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 40 or snr_db_ref == float("inf"), (
+        f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    )
+
+    record_test(
+        "dram_stride_en",
+        f"chunks={num_chunks}, chunk_bytes={chunk_bytes}, jump_bytes={stride_jump_bytes}",
+        snr_db=snr_db_ref,
+    )
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def dram_stride_wb_test():
+    """Stride-writeback test: contiguous URAM -> sparse DRAM."""
+    ue = UnifiedEngine()
+    chunk_elems = ue_axi_beat_bf16_elems()
+    chunk_bytes = chunk_elems * 2
+    # Mirror Vitis/common/src/andromeda.c:test_dram_stride_wb().
+    # The writeback emits 16 bf16 values per chunk, takes source rows in 64-element
+    # steps, and writes chunks to DRAM with 256-byte spacing.
+    num_chunks = 5
+    stride_jump_bytes = 256
+    stride_jump_elems = stride_jump_bytes // 2
+    src_stride_elems = UE_VECTOR_SIZE
+    input_elements = (num_chunks - 1) * src_stride_elems + chunk_elems
+    output_elements = (num_chunks - 1) * stride_jump_elems + chunk_elems
+    writeback_elements = num_chunks * chunk_elems
+
+    INPUT_DRAM_ADDR = ue.allocate_tensor_dram(input_elements * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(output_elements * 2)
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=INPUT_DRAM_ADDR,
+        sram_address=0x00000,
+        element_size=input_elements,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000,
+        accelerator_dram_address=OUTPUT_DRAM_ADDR,
+        element_size=writeback_elements,
+        stride_bytes_per_chunk=chunk_bytes,
+        stride_jump_bytes=stride_jump_bytes,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    x = (torch.arange(input_elements, dtype=torch.float32) % 113).to(torch.bfloat16)
+    y0 = torch.zeros(output_elements, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+    ue.dma_to_accelerator_memory(OUTPUT_DRAM_ADDR, y0)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (output_elements,))
+    expected = torch.zeros_like(output)
+    for i in range(num_chunks):
+        dst = i * stride_jump_elems
+        src = i * src_stride_elems
+        expected[dst:dst + chunk_elems] = x[src:src + chunk_elems]
+
+    snr_db_ref = calculate_snr(expected, output)
+    print(f"Reference SNR Analysis for DRAM stride-writeback Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 40 or snr_db_ref == float("inf"), (
+        f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    )
+
+    record_test(
+        "dram_stride_wb",
+        f"chunks={num_chunks}, chunk_bytes={chunk_bytes}, jump_bytes={stride_jump_bytes}",
+        snr_db=snr_db_ref,
+    )
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def argmax_test():
+    """Argmax register sanity check via fmax pipeline."""
+    ue = UnifiedEngine()
+    length = 256
+    INPUT_DRAM_ADDR = ue.allocate_tensor_dram(length * 2)
+    IDENTITY_DRAM_ADDR = ue.allocate_tensor_dram(length * length * 2)
+    ZERO_DRAM_ADDR = ue.allocate_tensor_dram(length * 2)
+    FMAX_DRAM_ADDR = ue.allocate_tensor_dram(UE_VECTOR_SIZE * 2)
+
+    vector_sram_addr = 0x00000
+    identity_sram_addr = 0x80000
+    zero_sram_addr = vector_sram_addr + length * 2
+    fmax_sram_addr = zero_sram_addr + UE_VECTOR_SIZE * 2
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(ZERO_DRAM_ADDR, zero_sram_addr, UE_VECTOR_SIZE)
+    ue.accelerator_memory_to_sram(INPUT_DRAM_ADDR, vector_sram_addr, length)
+    ue.accelerator_memory_to_sram(IDENTITY_DRAM_ADDR, identity_sram_addr, length * length)
+    clear_en = 1
+    for i in range(UE_FMAX_CONTEXT_SIZE):
+        ue.start_queue_for_bf16_matvec_operation(
+            max_clear_en=clear_en,
+            fmax_context_addr=i,
+            vector_sram_start_addr=vector_sram_addr,
+            matrix_sram_start_addr=identity_sram_addr,
+            output_sram_wb_addr=vector_sram_addr,
+            K=length,
+            N=length,
+        )
+        clear_en = 0
+    ue.fmax_core(
+        vector_sram_start_addr=zero_sram_addr,
+        output_sram_wb_addr=fmax_sram_addr,
+        N=UE_VECTOR_SIZE,
+        fmax_context_addr=0,
+    )
+    ue.sram_to_accelerator_memory(fmax_sram_addr, FMAX_DRAM_ADDR, UE_VECTOR_SIZE)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    x = torch.full((length,), -10.0, dtype=torch.bfloat16)
+    expected_idx = 37
+    x[expected_idx] = 10.0
+    identity = torch.eye(length, dtype=torch.bfloat16)
+    zero = torch.zeros(UE_VECTOR_SIZE, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, x)
+    ue.dma_to_accelerator_memory(IDENTITY_DRAM_ADDR, identity)
+    ue.dma_to_accelerator_memory(ZERO_DRAM_ADDR, zero)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    argmax_1 = int(ue.get_arg_max_index(rank=1))
+    fmax_out = -ue.dma_from_accelerator_memory(FMAX_DRAM_ADDR, (UE_VECTOR_SIZE,))
+    fmax_ref = torch.max(x)
+    assert argmax_1 == expected_idx, f"Argmax mismatch: expected {expected_idx}, got {argmax_1}"
+    assert fmax_out[0] == fmax_ref, f"FMAX mismatch: expected {fmax_ref}, got {fmax_out[0]}"
+
+    print(f"Argmax test PASS: rank1={argmax_1}, fmax={float(fmax_out[0])}")
+    record_test("argmax", f"N={length}, expected_idx={expected_idx}")
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def element_wise_add_loop_test(loop_count: int = 128):
+    """Repeated eltwise-add stress check (host-emitted loop body).
+
+    Integer 0+1 accumulation stays exact in bf16/bf19 through 128 adds.
+    """
+    assert 1 <= loop_count <= 128, f"loop_count={loop_count} must be in 1..128"
+    ue = UnifiedEngine()
+    elements = UE_VECTOR_SIZE * 8
+    A_DRAM_ADDR = ue.allocate_tensor_dram(elements * 2)
+    B_DRAM_ADDR = ue.allocate_tensor_dram(elements * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(elements * 2)
+
+    sram_a = 0x00000
+    sram_b = 0x80000
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(A_DRAM_ADDR, sram_a, elements)
+    ue.accelerator_memory_to_sram(B_DRAM_ADDR, sram_b, elements)
+
+    for _ in range(loop_count):
+        ue.eltwise_add_core(
+            vector_A_sram_start_addr=sram_a,
+            vector_B_sram_start_addr=sram_b,
+            vector_C_sram_wb_addr=sram_a,
+            element_size=elements,
+        )
+
+    ue.sram_to_accelerator_memory(
+        sram_address=sram_a,
+        accelerator_dram_address=OUTPUT_DRAM_ADDR,
+        element_size=elements,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    a = torch.zeros(elements, dtype=torch.bfloat16)
+    b = torch.ones(elements, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+    ue.dma_to_accelerator_memory(B_DRAM_ADDR, b)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(30.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (elements,))
+    ref = torch.full((elements,), float(loop_count), dtype=torch.bfloat16)
+    snr_db_ref = calculate_snr(ref, output)
+    print(f"Reference SNR Analysis for Eltwise Add Loop Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 40 or snr_db_ref == float("inf"), (
+        f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    )
+
+    record_test(
+        "element_wise_add_loop",
+        f"elements={elements}, loop_count={loop_count}",
+        snr_db=snr_db_ref,
+    )
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+def interrupt_swi_and_halt_test():
+    """SWI/HALT interrupt-cause parity check."""
+    ue = UnifiedEngine()
+    ue.write_reg32(UE_INT_REG, 1)
+    assert (ue.read_reg32(UE_INT_REG) & 3) == INT_CAUSE_NONE, "UE_INT_REG clear failed"
+
+    ue.start_capture()
+    ue.generate_instruction_swi()
+    ue.generate_instruction_add_set(REGFILE_R1_LOOP, 10000)
+    ue.generate_instruction_add_dec(REGFILE_R1_LOOP)
+    ue.generate_instruction_jump_rela_jnz(2, REGFILE_R1_LOOP)
+    ue.generate_instruction_halt()
+    ue.stop_capture()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.start_execute_from_dram(program_dram_addr)
+
+    saw_swi = False
+    deadline = time.time() + 3.0
+    while ue.is_queue_busy():
+        cause = ue.read_reg32(UE_INT_REG) & 3
+        saw_swi = saw_swi or (cause == INT_CAUSE_SWI)
+        assert time.time() < deadline, "interrupt_swi_and_halt_test: queue wait timeout"
+
+    assert saw_swi, "SWI cause not observed while queue busy"
+    final_cause = ue.read_reg32(UE_INT_REG) & 3
+    assert final_cause == INT_CAUSE_HALT, f"Expected HALT cause, got {final_cause}"
+    ue.write_reg32(UE_INT_REG, 1)
+    assert (ue.read_reg32(UE_INT_REG) & 3) == INT_CAUSE_NONE, "UE_INT_REG did not clear after HALT"
+    record_test("interrupt_swi_and_halt", "n/a")
+    ue.clear_capture_buffer()
+    ue.reset_inst_ptr_counter()
+
+def last_adder_test():
+    """Deterministic IF4 diagonal dot-product check."""
+    ue = UnifiedEngine()
+    K = 64
+    N = 64
+    A = torch.ones(K, dtype=torch.bfloat16)
+    diag_codes = (torch.arange(N, dtype=torch.int64) % 16).to(torch.uint8)
+    codes_2d = torch.diag(diag_codes).to(torch.uint8)
+    scales = torch.full((N * (K // UE_VECTOR_SIZE),), -1.0, dtype=torch.bfloat16)
+
+    output = _run_if4_dot_product(ue, A, codes_2d, scales)
+    int4_table = torch.tensor([c - 16 if c >= 8 else c for c in range(16)], dtype=torch.float32)
+    expected = int4_table[diag_codes.to(torch.long)].to(torch.bfloat16)
+    snr_db_ref = calculate_snr(expected, output)
+    print(f"Reference SNR Analysis for Last Adder Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 40 or snr_db_ref == float("inf"), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    record_test("last_adder", f"K={K}, N={N}", snr_db=snr_db_ref)
+
+def matrix_vector_multiply_test():
+    """Medium-shape IF4 matrix-vector parity test."""
+    ue = UnifiedEngine()
+    K = 64
+    N = 128
+    A = torch.ones(K, dtype=torch.bfloat16)
+    base_row = (torch.arange(K, dtype=torch.int64) % 16).to(torch.uint8)
+    codes_2d = torch.stack([base_row.roll(shifts=i % 16) for i in range(N)], dim=0)
+    scales = torch.full((N * (K // UE_VECTOR_SIZE),), -1.0, dtype=torch.bfloat16)
+
+    output = _run_if4_dot_product(ue, A, codes_2d, scales)
+    int4_table = torch.tensor([c - 16 if c >= 8 else c for c in range(16)], dtype=torch.float32)
+    deq = int4_table[codes_2d.to(torch.long)].to(torch.bfloat16)
+    expected = (A @ deq.T).to(torch.bfloat16)
+    snr_db_ref = calculate_snr(expected, output)
+    print(f"Reference SNR Analysis for Matrix-Vector Multiply Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 35 or snr_db_ref == float("inf"), f"SNR {snr_db_ref:.2f} dB must be at least 35 dB"
+    record_test("matrix_vector_multiply", f"K={K}, N={N}", snr_db=snr_db_ref)
+
+def large_matrix_vector_multiply_test():
+    """Large-shape IF4 matrix-vector parity stress."""
+    ue = UnifiedEngine()
+    K = 256
+    N = 256
+    A = torch.ones(K, dtype=torch.bfloat16)
+    base_row = (torch.arange(K, dtype=torch.int64) % 16).to(torch.uint8)
+    codes_2d = torch.stack([base_row.roll(shifts=i % 16) for i in range(N)], dim=0)
+    scales = torch.full((N * (K // UE_VECTOR_SIZE),), -1.0, dtype=torch.bfloat16)
+
+    output = _run_if4_dot_product(ue, A, codes_2d, scales)
+    int4_table = torch.tensor([c - 16 if c >= 8 else c for c in range(16)], dtype=torch.float32)
+    deq = int4_table[codes_2d.to(torch.long)].to(torch.bfloat16)
+    expected = (A @ deq.T).to(torch.bfloat16)
+    snr_db_ref = calculate_snr(expected, output)
+    print(f"Reference SNR Analysis for Large Matrix-Vector Multiply Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 30 or snr_db_ref == float("inf"), f"SNR {snr_db_ref:.2f} dB must be at least 30 dB"
+    record_test("large_matrix_vector_multiply", f"K={K}, N={N}", snr_db=snr_db_ref)
+
+def dram_to_scales_bram_test():
+    """Scale-BRAM load parity: doubling scale doubles IF4 output."""
+    ue = UnifiedEngine()
+    K = 64
+    N = 64
+    A = torch.ones(K, dtype=torch.bfloat16)
+    codes_2d = torch.ones((N, K), dtype=torch.uint8)
+
+    scales_1x = torch.full((N * (K // UE_VECTOR_SIZE),), -1.0, dtype=torch.bfloat16)
+    scales_2x = torch.full((N * (K // UE_VECTOR_SIZE),), -2.0, dtype=torch.bfloat16)
+    out_1x = _run_if4_dot_product(ue, A, codes_2d, scales_1x)
+    out_2x = _run_if4_dot_product(ue, A, codes_2d, scales_2x)
+    snr_db_ref = calculate_snr((out_1x.float() * 2.0).to(torch.bfloat16), out_2x)
+    print(f"Reference SNR Analysis for DRAM->Scales BRAM Test: {snr_db_ref:.2f} dB")
+    assert snr_db_ref >= 40 or snr_db_ref == float("inf"), f"SNR {snr_db_ref:.2f} dB must be at least 40 dB"
+    record_test("dram_to_scales_bram", f"K={K}, N={N}", snr_db=snr_db_ref)
+
+def dram_to_bias_bram_test():
+    """Bias-BRAM load parity: IF4 output equals injected bias when matrix payload is zero."""
+    ue = UnifiedEngine()
+    K = 64
+    N = 64
+    A = torch.ones(K, dtype=torch.bfloat16)
+    codes_2d = torch.zeros((N, K), dtype=torch.uint8)
+    scales = torch.full((N * (K // UE_VECTOR_SIZE),), -1.0, dtype=torch.bfloat16)
+    bias = torch.linspace(-2.0, 2.0, steps=N, dtype=torch.float32).to(torch.bfloat16)
+
+    out_no_bias = _run_if4_dot_product(ue, A, codes_2d, scales, bias_bf16=None)
+    out_with_bias = _run_if4_dot_product(ue, A, codes_2d, scales, bias_bf16=bias)
+    snr_zero = calculate_snr(torch.zeros_like(out_no_bias), out_no_bias)
+    snr_bias = calculate_snr(bias, out_with_bias)
+    print(f"Reference SNR (no-bias path): {snr_zero:.2f} dB")
+    print(f"Reference SNR (bias path): {snr_bias:.2f} dB")
+    assert snr_zero >= 35 or snr_zero == float("inf"), f"No-bias SNR {snr_zero:.2f} dB must be at least 35 dB"
+    assert snr_bias >= 35 or snr_bias == float("inf"), f"Bias SNR {snr_bias:.2f} dB must be at least 35 dB"
+    record_test("dram_to_bias_bram", f"K={K}, N={N}", snr_db=snr_bias)
+
 def padding_zero_test():
     """
     Padding zero test.
@@ -5496,7 +6092,7 @@ def software_reset_test(cores: int = 1):
         ue.reset_tensor_dram_addr()
 
     print(f"Software reset test PASSED ({cores} core(s))")
-    record_test("software_reset", "n/a")
+    record_test("software_reset_test" if _TEST_NAME_SUFFIX else "software_reset", "n/a")
 
 
 def test_ue_int_reg_read():
@@ -5989,7 +6585,9 @@ def _llama32_1b_inference_test(module_filename: str, class_name: str, label_pref
         ("streaming", {}, False),
         ("matmatmul", {"prefill_kernel": "matmatmul"}, True),
     )
-    axi_width_bits = getattr(user_dma_core, "UE_AXI_DATA_WIDTH_BITS", 256)
+    axi_width_bits = user_dma_core.UE_AXI_DATA_WIDTH_BITS
+    if axi_width_bits is None:
+        raise RuntimeError("HW_INFO must be read before selecting an AXI-dependent inference kernel")
     for label, kwargs, needs_256b in runs:
         if needs_256b and axi_width_bits != 256:
             print(
@@ -6082,7 +6680,7 @@ if __name__ == "__main__":
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--device', type=str, default='kintex7',
-                        help='FPGA profile (for example: rk, rk_256, kintex7, alveo, alveo_u55c, bittware).')
+                        help='Board profile used only for Efinix device-node selection and optional systolic tests; hardware properties come from HW_INFO.')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
                         help='AXI-Lite register base address (default: device-specific).')
     parser.add_argument(
@@ -6096,7 +6694,21 @@ if __name__ == "__main__":
              'Use N to clear all engines a hung multi-core run left spin-waiting '
              '(e.g. llama3.2_1b --multi-core 2 -> --multi-core 2). Default: 1.',
     )
+    parser.add_argument(
+        '--single-core-only', action='store_true',
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        '--summary-path', default='user_hw_test_summary.md',
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        '--test-name-suffix', default='',
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+
+    _TEST_NAME_SUFFIX = args.test_name_suffix
 
     import user_dma_core
     set_dma_device("efinix" if args.device == "efinix" else args.dev, base_addr=args.base_addr)
@@ -6106,11 +6718,11 @@ if __name__ == "__main__":
           f" USER={user_dma_core.DMA_DEVICE_USER}),"
           f" base=0x{user_dma_core.UE_0_BASE_ADDR:08x}")
 
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    globals()["UE_AXI_DATA_WIDTH_BITS"] = axi_width_bits
-    print(f"UE_AXI_DATA_WIDTH_BITS={axi_width_bits} (device={args.device})")
+    # HW_INFO is the sole source for clock, queue mode, AXI width, DRAM size,
+    # and engine count. Read it before constructing any UnifiedEngine object.
+    user_dma_core.configure_clock_from_hardware()
+    engine_count = user_dma_core.ANDROMEDA_CORE_COUNT
+    assert engine_count is not None
 
     # Fix RNG seed so SNR numbers are reproducible across runs and easy to
     # compare across HDL changes (e.g. exp/LALU tweaks).
@@ -6123,38 +6735,10 @@ if __name__ == "__main__":
     _seed_probe = torch.randn(4, dtype=torch.bfloat16)
     _RNG_STATE_START = _rng_state_fingerprint()
 
-    # kintex7 operates at 1066 / 5.375 MHz = 198.33 MHz = 5.0422 ns
-    # kintex7_systolic operates at 149.614035 MHz = 6683 ps.
-    # alveo operates at 366.666 MHz = 2.7272727 ns
-    # alveo_u55c operates at 300 MHz = 3.3333333 ns
-    # kintex ultrascale+ operates at 333 Mhz = 3.0 ns
-    # bittware board operates at 300 Mhz = 3.3333 ns
-    clock = None
-    if args.device == "kintex7":
-        clock = 1000 / (1066 / 5.375)
-    elif args.device == "kintex7_systolic":
-        clock = 1000 / 149.61403
-    elif args.device in ("rk", "rk_256", "puzhi"):
-        clock = 3
-    elif args.device in ("bittware", "bittware_256"):
-        clock = 3.3333
-    elif args.device == "alveo":
-        clock = 1000 / 366.666666
-    elif args.device == "alveo_u55c":
-        clock = 3.3333333
-    elif args.device == "efinix":
-        clock = 4.0
-    else:
-        clock = 10
-
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
-    print(f"Clock period={user_dma_core.CLOCK_CYCLE_TIME_NS:.6f} ns")
-
     # Emit the summary on crash via atexit; on a clean run we unregister it and
     # exit via os._exit(0) at the end so C-extension teardown cannot turn a
     # successful run into process status 1 (observed on the PCIe CI runner).
-    _USER_HW_TEST_SUMMARY = "user_hw_test_summary.md"
+    _USER_HW_TEST_SUMMARY = args.summary_path
 
     def _atexit_write_test_summary():
         write_test_summary(_USER_HW_TEST_SUMMARY)
@@ -6446,7 +7030,7 @@ if __name__ == "__main__":
     # --- Multi-core / multi-engine tests (kintex7, kintex7_systolic, and alveo) ---
     # Keep device-specific optional coverage last so it cannot advance RNG
     # before common tests. That makes SNR results comparable across devices.
-    if args.device in ('kintex7', 'kintex7_systolic', 'alveo', 'alveo_u55c'):
+    if not args.single_core_only and args.device in ('kintex7', 'kintex7_systolic', 'alveo', 'alveo_u55c'):
         two_core_shapes = [(1920, 768, 2048)]
         matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
         matmat_mul_two_cores_unified_test(runtime_list=two_core_shapes)
@@ -6473,21 +7057,19 @@ if __name__ == "__main__":
                 input_scale=scale,
                 snr_threshold_db=snr_floor,
             )
-    if args.device in ('alveo', 'alveo_u55c'):
+    if args.device == 'alveo':
         # Each engine reads its own DRAM buffer, then all engines hammer the
         # same DRAM buffer (concurrent reads to a single memory location).
-        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=8)
-        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=8,
+        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count)
+        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count,
                                                 shared_read=True)
         matmat_mul_multi_cores_unified_test(num_engines=8)
-
-    activation_core_test()
-    
-    gemma3_inference_test()
-    gemma3_if8_inference_test()
-
-    llama32_1b_inference_test()
-    llama32_1b_if8_inference_test()
+    elif args.device == 'alveo_u55c':
+        # U55C hardware instantiates 12 Andromeda engines.
+        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=12)
+        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=12,
+                                                shared_read=True)
+        matmat_mul_multi_cores_unified_test(runtime_list=[(4608, 4096, 4096)], num_engines=12)
 
     # --- Systolic core tests (kintex7_systolic only) ---
     # Run last, after all andromeda-core coverage, so a systolic-specific
@@ -6516,6 +7098,27 @@ if __name__ == "__main__":
         systolic_matmul_test(M=8, K=128, N=1024)
         systolic_matmul_test(M=16, K=1024, N=64)
         systolic_matmul_test(M=256, K=64, N=256)
+        
+    activation_core_test()
+    dram_to_uram_test()
+    uram_to_dram_test()
+    dram_stride_en_test()
+    dram_stride_wb_test()
+    argmax_test()
+    element_wise_add_loop_test()
+    interrupt_swi_and_halt_test()
+    last_adder_test()
+    matrix_vector_multiply_test()
+    large_matrix_vector_multiply_test()
+    dram_to_scales_bram_test()
+    dram_to_bias_bram_test()
+    #Adding new tests here
+    
+    gemma3_inference_test()
+    gemma3_if8_inference_test()
+
+    llama32_1b_inference_test()
+    llama32_1b_if8_inference_test()
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
     # Clean run: write the summary directly and hard-exit 0 so the atexit hook

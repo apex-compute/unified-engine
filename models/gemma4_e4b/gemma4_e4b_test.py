@@ -9297,8 +9297,6 @@ defaults (sample files in repo-root test_samples/):
                         help='DMA device name for non-Efinix profiles (e.g., xdma0, xdma1). Efinix uses /dev/pcie_dma0_* from its profile.')
     parser.add_argument('--device', type=str, default='kintex7',
                         help='FPGA board / bitstream profile. Use efinix for the Efinix profile.')
-    parser.add_argument('--cycle', type=float, default=None,
-                        help='Clock cycle time in nanoseconds. Default: from --device.')
     args = parser.parse_args()
 
     if args.fpga_encoder:
@@ -9309,8 +9307,7 @@ defaults (sample files in repo-root test_samples/):
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
+    user_dma_core.configure_clock_from_hardware()
     effective_dma = "pcie_dma0" if args.device == "efinix" else args.dev
     print(f"Using DMA device: {effective_dma}")
     print(f"  H2C: {DMA_DEVICE_H2C}")

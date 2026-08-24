@@ -1867,25 +1867,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return weight_bin_generate(**kwargs)
 
 
-def _clock_ns_default_for_device(device: str) -> float:
-    """Return the board-profile clock period, matching user_hw_test/Llama."""
-    if device == "kintex7":
-        return 1000 / (1066 / 5.375)
-    if device == "kintex7_systolic":
-        return 1000 / 149.61403
-    if device in ("rk", "rk_256", "puzhi"):
-        return 3.0
-    if device in ("bittware", "bittware_256"):
-        return 3.3333
-    if device == "alveo":
-        return 1000 / 366.666666
-    if device == "alveo_u55c":
-        return 3.3333333
-    if device == "efinix":
-        return 4.0
-    return 10.0
-
-
 # --- Shared engine CLI/config -------------------------------------------------
 # add_engine_args + resolve_engine_config are the SINGLE source of truth for the
 # kernel/device knobs, their validation, and the device->AXI->clock wiring.
@@ -1913,8 +1894,6 @@ def add_engine_args(parser) -> None:
                         help="FPGA board profile (kintex7, kintex7_systolic, rk, "
                              "rk_256, puzhi, bittware, bittware_256, alveo, "
                              "alveo_u55c, efinix).")
-    parser.add_argument("--cycle", type=float, default=None,
-                        help="Clock cycle time in nanoseconds. Overrides --device default.")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
                              "exists instead of recompiling. Default: OFF (fresh compile "
@@ -1969,14 +1948,10 @@ def resolve_engine_config(parser, args) -> dict:
                 if hasattr(_mod, _attr):
                     setattr(_mod, _attr, getattr(user_dma_core, _attr))
 
-    os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
-    user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
-    user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    user_dma_core.configure_clock_from_hardware()
 
-    print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, "
-          f"UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")
+    print(f"FPGA profile: device={args.device}")
+    print(user_dma_core.hardware_info_summary())
     print(f"Using DMA device: {dma_name}")
     print(f"  H2C: {user_dma_core.DMA_DEVICE_H2C}")
     print(f"  C2H: {user_dma_core.DMA_DEVICE_C2H}")
@@ -2063,8 +2038,6 @@ def run_summary_filename(args) -> str:
         tokens.append(f"decode-kernel_{args.decode_kernel}")
     if args.bin_reuse:
         tokens.append("bin-reuse")
-    if args.cycle is not None:
-        tokens.append(f"cycle_{args.cycle}")
     suffix = "_profile" if args.profile else ""
     return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
 
