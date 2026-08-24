@@ -4306,6 +4306,109 @@ def dram_read_write_speed_test():
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
 
+
+def dram_read_write_speed_test_8GB():
+    """
+    Briefly exercise BOTH 4 GB halves of the 8 GB HBM: read/write capability,
+    per-half speed, and that the two halves are physically distinct (not an
+    aliased/wrapped view of one 4 GB region). Only a small region of each half
+    is touched.
+
+    Addressing notes:
+      * Host DMA (dma_write/dma_read) takes a raw byte address via 64-bit lseek.
+      * Accelerator DMA shifts the byte address >>3 into a 32-bit word field,
+        which reaches 32 GB, so upper-half byte addresses need no special
+        handling -- pass the plain byte address.
+      * The upper half is addressed as the low base with bit 32 set
+        (low_base + 0x1_0000_0000), i.e. its exact "bit-32 twin".
+    """
+    UPPER_OFFSET = 0x1_0000_0000  # bit 32: low_base -> upper-half twin
+    ue = UnifiedEngine()
+
+    low_base = DRAM_ACTIVATION_ADDR                 # 0x0_B000_0000
+    high_base = low_base + UPPER_OFFSET             # 0x1_B000_0000 (bit-32 twin)
+
+    # --- Uniqueness: prove the two halves are distinct physical memory. ---
+    # Self-round-trip alone can't prove this: if bit 32 were dropped, an "upper"
+    # access lands in the low half and still round-trips. So write DISTINCT
+    # patterns to a low address and its bit-32 twin, then read BOTH back. If they
+    # alias, the high write corrupts the low readback.
+    n_probe = 8192
+    a = torch.randint(0x0000, 0xFFFF, (n_probe,), dtype=torch.uint16)
+    b = (a ^ 0xFFFF).to(torch.uint16)  # guaranteed different from a
+    ue.dma_write(DMA_DEVICE_H2C, low_base, a, n_probe * 2)
+    ue.dma_write(DMA_DEVICE_H2C, high_base, b, n_probe * 2)
+    la = torch.zeros((n_probe,), dtype=torch.uint16)
+    hb = torch.zeros((n_probe,), dtype=torch.uint16)
+    ue.dma_read(DMA_DEVICE_C2H, low_base, la, n_probe * 2)
+    ue.dma_read(DMA_DEVICE_C2H, high_base, hb, n_probe * 2)
+    distinct = torch.equal(la, a) and torch.equal(hb, b)
+    print(f"[8GB] uniqueness: low 0x{low_base:x} vs bit-32 twin 0x{high_base:x} -> "
+          f"{'DISTINCT (two physical 4 GB halves)' if distinct else 'ALIASED (bit 32 dropped!)'}")
+    record_test("dram_8gb_uniqueness",
+                f"low=0x{low_base:x} twin=0x{high_base:x} -> "
+                f"{'DISTINCT' if distinct else 'ALIASED'}")
+    assert distinct, (
+        f"upper 4 GB aliases onto low 4 GB: writing 0x{high_base:x} corrupted 0x{low_base:x} "
+        "-> bit 32 is being dropped; the two halves are the same physical memory")
+
+    # --- Per-half read + writeback speed (accelerator DMA path). ---
+    def _speed_once(base_addr, label):
+        a_addr = base_addr
+        out_addr = base_addr + URAM_NEAR_FULL_ELEMENTS * 2
+        x = torch.randn(URAM_NEAR_FULL_ELEMENTS, dtype=torch.bfloat16)
+
+        # Read: DRAM -> URAM
+        ue.start_capture()
+        ue.accelerator_memory_to_sram(accelerator_dram_address=a_addr,
+                                      sram_address=0x00000,
+                                      element_size=URAM_NEAR_FULL_ELEMENTS)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        program_dram_addr = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(program_dram_addr)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.dma_to_accelerator_memory(a_addr, x)
+        ue.start_execute_from_dram(program_dram_addr)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+        read_mbps = URAM_NEAR_FULL_ELEMENTS * 2 / ue.report_latency_in_us()
+        print(f"[{label}] Read Speed: {read_mbps:.2f} MB/s")
+        record_test(f"dram_read_speed_{label}",
+                    f"elements={URAM_NEAR_FULL_ELEMENTS} addr=0x{a_addr:x}",
+                    mb_per_s=read_mbps)
+        ue.clear_capture_buffer()
+
+        # Writeback: URAM -> DRAM
+        ue.start_capture()
+        ue.sram_to_accelerator_memory(sram_address=0x00000,
+                                      accelerator_dram_address=out_addr,
+                                      element_size=URAM_NEAR_FULL_ELEMENTS)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        program_dram_addr = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(program_dram_addr)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(program_dram_addr)
+        ue.wait_queue(10.0)
+        ue.report_timing_and_instruction_count()
+        write_mbps = URAM_NEAR_FULL_ELEMENTS * 2 / ue.report_latency_in_us()
+        print(f"[{label}] Write Speed: {write_mbps:.2f} MB/s")
+
+        output = ue.dma_from_accelerator_memory(out_addr, (URAM_NEAR_FULL_ELEMENTS,))
+        snr_db = calculate_snr(x, output)
+        print(f"[{label}] SNR: {snr_db:.2f} dB")
+        assert snr_db >= 40 or snr_db == float('inf'), f"[{label}] SNR {snr_db:.2f} dB must be at least 40 dB"
+        record_test(f"dram_write_speed_{label}",
+                    f"elements={URAM_NEAR_FULL_ELEMENTS} addr=0x{out_addr:x}",
+                    snr_db=snr_db, mb_per_s=write_mbps)
+        ue.clear_capture_buffer()
+
+    _speed_once(low_base, "low4gb")
+    _speed_once(high_base, "upper4gb")
+    ue.reset_tensor_dram_addr()
+
+
 def _pack_if4_payload(codes_2d: torch.Tensor) -> torch.Tensor:
     """Pack a [N, K] tensor of 4-bit codes into IF4 byte payload."""
     flat_codes = codes_2d.reshape(-1).to(torch.uint8)
@@ -6059,8 +6162,8 @@ def software_reset_test(cores: int = 1):
     For each core: issue software_reset() to break any stale FLAG_CHECK spin-wait
     / drain the queue, then run a bare HALT and confirm the core reports idle.
     """
-    if not 1 <= cores <= 8:
-        raise ValueError(f"cores must be 1..8, got {cores}")
+    if not 1 <= cores <= 12:
+        raise ValueError(f"cores must be 1..12, got {cores}")
     import user_dma_core
 
     for core in range(cores):
@@ -6690,7 +6793,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--multi-core', type=int, default=1,
-        help='Number of AXI cores (1..8) to software-reset in software_reset_test. '
+        help='Number of AXI cores (1..12) to software-reset in software_reset_test. '
              'Use N to clear all engines a hung multi-core run left spin-waiting '
              '(e.g. llama3.2_1b --multi-core 2 -> --multi-core 2). Default: 1.',
     )
@@ -7112,8 +7215,12 @@ if __name__ == "__main__":
     large_matrix_vector_multiply_test()
     dram_to_scales_bram_test()
     dram_to_bias_bram_test()
+    # 8 GB dual-half DRAM test only applies to the U55C (8 GB HBM, 33-bit space).
+    if args.device == "alveo_u55c":
+        dram_read_write_speed_test_8GB()
+
     #Adding new tests here
-    
+
     gemma3_inference_test()
     gemma3_if8_inference_test()
 
