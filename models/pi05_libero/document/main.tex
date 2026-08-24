@@ -147,8 +147,8 @@ vision MLP pads $4304{\to}4352$. This padding is real issued work, $\sim$30\%
 over the effective FLOPs (Table~\ref{tab:budget}).
 
 \textbf{Prefix masking.} When an image slot is unused it can be dropped from
-the prefill, compressing $832{\to}576$ (bit-identical, $\sim$24\% faster
-end-to-end). Rotary positions use
+the prefill, compressing $832{\to}576$ (bit-identical, $\sim$31\% less
+prefill work). Rotary positions use
 cumulative-sum-of-mask indices, not \texttt{arange}, so dropping a slot does
 not shift phase. The non-causal/causal mixed attention mask is supplied as a
 static bias tensor in DRAM. The measured runs in Sec.~\ref{sec:throughput}
@@ -178,8 +178,9 @@ same inputs/noise, diffed per stage; Table~\ref{tab:quant},
 $\mathrm{SNR}{=}20\log_{10}(\lVert b\rVert/\lVert a{-}b\rVert)$, masked rows
 excluded, sample~0)---the theoretical quantization floor, isolated from any
 hardware effect. Vision is nearly untouched (25.4\,dB); the prefix caches degrade
-with depth, V worse than K ($10.7$ vs.\ $16.0$\,dB mean); and denoise carries the
-largest loss as per-step error accumulates through Eq.~\eqref{eq:euler}---$x_t$
+with depth, V worse than K ($10.7$ vs.\ $16.0$\,dB mean); and while each
+denoise step's velocity holds up on its own ($23.5$\,dB), the Euler loop
+compounds that per-step error through Eq.~\eqref{eq:euler}---$x_t$
 walks $45\!\to\!16.3$\,dB (Table~\ref{tab:quant-detail}), concentrating in
 low-magnitude action dims (dim\,1, $1.5$\,dB) while task-critical dims hold
 (dim\,0 $24.9$, gripper $40.7$\,dB). SNR is a diagnostic; the acceptance gate is
@@ -402,7 +403,7 @@ $208$\,MHz to 8 engines at $1.6$\,GHz multiplies compute by $61.5\times$
 if its arithmetic intensity clears the ASIC ridge point of
 $1638.4/100\approx16$\,FLOP/byte. Traffic here is dominated by streaming the
 \iffour{} weights ($4.25$\,bits/weight, Sec.~\ref{sec:port}): the prefix
-reads $\sim$1.1\,GB once
+reads $\sim$1.06\,GB once
 for its 3399.8\,GFLOP ($\sim$3200\,FLOP/byte), the vision tower $\sim$0.65\,GB
 over three slots ($\sim$1300\,FLOP/byte), and the worst case --- the action
 expert, whose $\sim$0.16\,GB are re-streamed on \emph{every} denoise step
