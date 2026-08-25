@@ -908,7 +908,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x316e13b5, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x316e13b5. Please update FPGA with commit update_316e13b5.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0xe7ac2caf, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xe7ac2caf. Please update FPGA with commit update_e7ac2caf.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -6379,9 +6379,6 @@ class UnifiedEngine:
             m_shards = [m_base + (1 if i < m_rem else 0) for i in range(num_engines)]
         assert len(m_shards) == num_engines and sum(m_shards) == M and all(m >= 1 for m in m_shards), \
             f"m_shards must be {num_engines} positive counts summing to M={M}, got {m_shards}"
-        assert all(m % UE_VECTOR_SIZE == 0 for m in m_shards), \
-            f"each M shard must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got {m_shards}"
-
         assert all(m % UE_VECTOR_SIZE == 0 for m in m_shards), \
             f"each M shard must be a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}, got {m_shards}"
 
