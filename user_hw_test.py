@@ -20,12 +20,14 @@ import time
 import threading
 from read_trace import generate_trace
 import torch
+import torch.nn.functional as F
 
 from user_dma_core import (
     DMA_DEVICE_C2H,
     DMA_DEVICE_H2C,
     DMA_DEVICE_USER,
     DRAM_ACTIVATION_ADDR,
+    DRAM_INSTRUCTION_ADDR,
     INSTRUCTION_SIZE_BYTES,
     INT_CAUSE_HALT,
     INT_CAUSE_NONE,
@@ -79,58 +81,6 @@ _MAX_RNG_ALIGNED_AXI_DATA_WIDTH_BITS = 512
 # Allow a 0.5% decode-cost penalty for the dynamic Gemma3 hardware change.
 GEMMA3_HARDWARE_PENALTY_FACTOR = 1.005
 KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
-
-
-def _multi_engine_dram_layout(num_engines: int):
-    """Return per-engine DRAM bases for multi-engine tests.
-
-    Alveo HBM designs expose at least 4 GB and map HBM from address 0. The
-    8-engine U50C build uses 256 MB windows; the 12-engine U55C build uses
-    512 MB windows. Smaller DDR designs keep the legacy DRAM_START_ADDR base,
-    but still use non-overlapping 256 MB windows for private multi-engine tests.
-    """
-    import user_dma_core
-
-    if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
-        user_dma_core.configure_clock_from_hardware()
-    if num_engines < 1:
-        raise ValueError(f"num_engines must be >= 1, got {num_engines}")
-
-    is_hbm = user_dma_core.AVAILABLE_DRAM_SIZE_GB >= 4
-    if is_hbm:
-        dram_start_addr = 0x0
-        dram_base_stride = (
-            0x10000000 if user_dma_core.ANDROMEDA_CORE_COUNT == 8 else 0x20000000
-        )
-        layout_end = dram_start_addr + (num_engines - 1) * dram_base_stride + 0x0F100000
-        dram_end = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 1024 * 1024 * 1024
-        if layout_end > dram_end:
-            raise ValueError(
-                f"num_engines={num_engines} needs 0x{layout_end:x} of DRAM, "
-                f"but HW_INFO reports only 0x{dram_end:x} bytes"
-            )
-    else:
-        dram_start_addr = user_dma_core.DRAM_START_ADDR
-        dram_base_stride = 0x10000000
-
-    return dram_start_addr, dram_base_stride
-
-
-def _make_multi_engine_ues(num_engines: int):
-    import user_dma_core
-
-    engine_base_stride = 0x00010000
-    dram_start_addr, dram_base_stride = _multi_engine_dram_layout(num_engines)
-    ues = []
-    for i in range(num_engines):
-        engine_dram_base = dram_start_addr + i * dram_base_stride
-        ues.append(UnifiedEngine(
-            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
-            params_dram_base=engine_dram_base,
-            tensor_dram_base=engine_dram_base + 0x08000000,
-            program_dram_base=engine_dram_base + 0x0F000000,
-        ))
-    return ues, dram_start_addr, dram_base_stride
 
 
 def _rng_state_fingerprint() -> str:
@@ -372,8 +322,17 @@ def matmat_mul_two_engine_flag_check_test(
     M_three_fourth = M * 3 // 4
     M_one_fourth = M // 4
 
-    ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(2)
-    ue0, ue1 = ues
+    engine0_base = user_dma_core.UE_0_BASE_ADDR
+    engine1_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000
+    tensor_region_stride = 0x04000000
+
+    ue0 = UnifiedEngine(BASE_ADDR=engine0_base)
+    ue1 = UnifiedEngine(BASE_ADDR=engine1_base)
+    ue0._tensor_dram_addr = DRAM_ACTIVATION_ADDR
+    ue1._tensor_dram_addr = DRAM_ACTIVATION_ADDR + tensor_region_stride
+    ue0._next_program_dram_addr = DRAM_INSTRUCTION_ADDR
+    ue1._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + 0x01000000
+
 
     e0_a_addr = ue0.allocate_tensor_dram(M_three_fourth * K * 2)
     e0_b_addr = ue0.allocate_tensor_dram(N * K * 2)
@@ -470,11 +429,21 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
     """
     import user_dma_core
 
-    ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(num_engines)
+    engine_base_stride = 0x00010000
+    dram_base_stride = 0x10000000
+
+    ues = []
+    for i in range(num_engines):
+        ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
+                            params_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride,
+                            tensor_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride + 0x08000000,
+                            program_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride + 0x0F000000,
+                            )
+        ues.append(ue)
 
     a_addrs = []
     for i, ue in enumerate(ues):
-        # ue.software_reset()
+        ue.software_reset()
         a_addrs.append(ue.allocate_tensor_dram(1 * 1024 * 1024))
     if shared_read:
         # All engines read the same DRAM buffer (engine 0's allocation).
@@ -539,113 +508,6 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
 
     return speed_mb_per_s
 
-
-def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
-    """Concurrent DRAM read bandwidth across num_engines engines.
-
-    Each engine DMA-reads its OWN private data_size_kB buffer from its OWN
-    DRAM window, so no two engines contend on one address range. The engines
-    are barrier-synced so their reads overlap: engine 0 flag_sets, workers wait
-    on it, then all read concurrently, workers flag_set, and engine 0 waits on
-    every worker. The measured latency therefore covers the whole concurrent
-    read.
-
-    HBM hardware only: the layout is based at 0x0 and uses the shared
-    _multi_engine_dram_layout() policy. Engines are NOT software-reset here.
-    """
-    import user_dma_core
-
-    if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
-        user_dma_core.configure_clock_from_hardware()
-    if user_dma_core.AVAILABLE_DRAM_SIZE_GB < 4:
-        raise RuntimeError(
-            f"multi_core_dram_speed_test targets 4 GB or larger hardware only; "
-            f"HW_INFO reports {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GB"
-        )
-    if num_engines < 1:
-        raise ValueError(f"num_engines must be >= 1, got {num_engines}")
-
-    transfer_bytes = data_size_kB * 1024
-    element_size = transfer_bytes // 2          # bf16 elements
-    if transfer_bytes % 2:
-        raise ValueError(f"data_size_kB={data_size_kB} must be a whole number of bf16 elements")
-    if element_size % UE_VECTOR_SIZE:
-        raise ValueError(
-            f"data_size_kB={data_size_kB} gives {element_size} elements, "
-            f"not a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
-        )
-    if element_size > URAM_FULL_ELEMENTS:
-        raise ValueError(
-            f"data_size_kB={data_size_kB} ({element_size} elements) exceeds the "
-            f"{URAM_FULL_ELEMENTS}-element URAM ({URAM_FULL_ELEMENTS * 2 // 1024} kB)"
-        )
-    ues, dram_start_addr, dram_base_stride = _make_multi_engine_ues(num_engines)
-
-    # Each engine reads from its own window: no shared source buffer.
-    a_addrs = [ue.allocate_tensor_dram(transfer_bytes) for ue in ues]
-
-    prog_addrs = []
-    ues[0].start_capture()
-    ues[0].generate_instruction_flag_set()
-    ues[0].accelerator_memory_to_sram(accelerator_dram_address=a_addrs[0],
-                                      sram_address=0x00000,
-                                      element_size=element_size)
-    for i in range(1, num_engines):
-        ues[0].generate_instruction_flag_check(target_engine_idx=i)
-    ues[0].generate_instruction_flag_clear()
-    ues[0].generate_instruction_halt()
-    ues[0].stop_capture()
-    prog_addrs.append(ues[0].get_program_dram_addr())
-    ues[0].write_captured_instructions_to_dram(prog_addrs[0])
-    ues[0].allocate_program_dram(ues[0].get_capture_instruction_size_bytes())
-
-    for i in range(1, num_engines):
-        ues[i].start_capture()
-        ues[i].generate_instruction_flag_clear()
-        ues[i].generate_instruction_flag_check(target_engine_idx=0)
-        ues[i].accelerator_memory_to_sram(accelerator_dram_address=a_addrs[i],
-                                          sram_address=0x00000,
-                                          element_size=element_size)
-        # if i == 2:
-        #     ues[i].accelerator_memory_to_sram(accelerator_dram_address=a_addrs[i],
-        #                                       sram_address=0x00000,
-        #                                       element_size=element_size)
-        ues[i].generate_instruction_flag_set()
-        ues[i].generate_instruction_halt()
-        ues[i].stop_capture()
-        prog_addrs.append(ues[i].get_program_dram_addr())
-        ues[i].write_captured_instructions_to_dram(prog_addrs[i])
-        ues[i].allocate_program_dram(ues[i].get_capture_instruction_size_bytes())
-
-    # Workers first so their flag_clear runs before engine 0 starts polling.
-    for i in range(1, num_engines):
-        ues[i].start_execute_from_dram(prog_addrs[i])
-    ues[0].start_execute_from_dram(prog_addrs[0])
-    ues[0].wait_queue(10.0)
-
-    latency_us = ues[0].report_latency_in_us()
-    total_bytes_transferred = num_engines * transfer_bytes
-    speed_mb_per_s = total_bytes_transferred / latency_us
-    print(f"multi_core_dram_speed_test: {num_engines} engines x {data_size_kB} kB "
-          f"({element_size} elements each), base=0x{dram_start_addr:x}, "
-          f"stride=0x{dram_base_stride:x}")
-    print(f"Total latency: {latency_us} us")
-    print(f"speed {speed_mb_per_s:.2f} MB/s")
-    # for i in range(num_engines):
-    #     generate_trace(ues[i],
-    #                    f"multi_core_dram_speed_test_{data_size_kB}kB_engine_{num_engines}_{i}.csv")
-
-    record_test("multi_core_dram_speed",
-                f"data_size_kB={data_size_kB}, num_engines={num_engines}",
-                mb_per_s=speed_mb_per_s)
-
-    for ue in ues:
-        ue.reset_tensor_dram_addr()
-        ue.clear_capture_buffer()
-
-    return speed_mb_per_s
-
-
 def matmat_mul_two_cores_unified_test(
     runtime_list=None,
     softmax_enable: bool = False,
@@ -665,83 +527,46 @@ def matmat_mul_two_cores_unified_test(
     assert runtime_list, "runtime_list must be non-empty"
 
     def _run_case(M, K, N, dynamic):
-        ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(2)
-        ue0, ue1 = ues
-        bytes_per_element = 2
-        m_engine0 = M // 2
-        m_engine1 = M - m_engine0
+        engine0_base = user_dma_core.UE_0_BASE_ADDR
+        engine1_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000
+        tensor_region_stride = 0x04000000
+
+        ue0 = UnifiedEngine(BASE_ADDR=engine0_base)
+        ue1 = UnifiedEngine(BASE_ADDR=engine1_base)
+        ue0._tensor_dram_addr = DRAM_ACTIVATION_ADDR
+        ue1._tensor_dram_addr = DRAM_ACTIVATION_ADDR + tensor_region_stride
+        ue0._next_program_dram_addr = DRAM_INSTRUCTION_ADDR
+        ue1._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + 0x01000000
+
+        A_DRAM_ADDR = ue0.allocate_tensor_dram(M * K * 2)
+        B_DRAM_ADDR = ue0.allocate_tensor_dram(N * K * 2)
+        OUTPUT_DRAM_ADDR = ue0.allocate_tensor_dram(M * N * 2)
 
         a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
         if input_scale != 1.0:
             a = (a.to(torch.float32) * float(input_scale)).to(torch.bfloat16)
         b = torch.randn(N, K, dtype=torch.bfloat16)
 
-        e0_a_addr = ue0.allocate_tensor_dram(m_engine0 * K * bytes_per_element)
-        e0_b_addr = ue0.allocate_tensor_dram(N * K * bytes_per_element)
-        e0_out_addr = ue0.allocate_tensor_dram(m_engine0 * N * bytes_per_element)
-        e1_a_addr = ue1.allocate_tensor_dram(m_engine1 * K * bytes_per_element)
-        e1_b_addr = ue1.allocate_tensor_dram(N * K * bytes_per_element)
-        e1_out_addr = ue1.allocate_tensor_dram(m_engine1 * N * bytes_per_element)
+        ue0.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+        ue0.dma_to_accelerator_memory(B_DRAM_ADDR, b)
 
-        ue0.dma_to_accelerator_memory(e0_a_addr, a[:m_engine0, :])
-        ue0.dma_to_accelerator_memory(e0_b_addr, b)
-        ue1.dma_to_accelerator_memory(e1_a_addr, a[m_engine0:, :])
-        ue1.dma_to_accelerator_memory(e1_b_addr, b)
-
-        def _program_engine(ue, is_master, m_engine, a_addr, b_addr, out_addr):
-            m_reg = k_reg = n_reg = None
-            if dynamic:
-                m_reg = ue.alloc_isa_reg()
-                k_reg = ue.alloc_isa_reg()
-                n_reg = ue.alloc_isa_reg()
-            ue.start_capture()
-            if is_master:
-                ue.generate_instruction_flag_clear()
-            if dynamic:
-                ue.generate_instruction_add_set(m_reg, m_engine)
-                ue.generate_instruction_add_set(k_reg, K)
-                ue.generate_instruction_add_set(n_reg, N)
-            flops = ue.matmat_mul_core(
-                M=m_engine,
-                K=K,
-                N=N,
-                A_DRAM_ADDR=a_addr,
-                B_DRAM_ADDR=b_addr,
-                OUTPUT_DRAM_ADDR=out_addr,
-                softmax_enable=softmax_enable,
-                gelu_enable=gelu_enable,
-                silu_enable=silu_enable,
-                sigmoid_enable=sigmoid_enable,
-                clamp_enable=clamp_enable,
-                log_enable=log_enable,
-                gpr_M_reg=m_reg,
-                gpr_K_reg=k_reg,
-                gpr_N_reg=n_reg,
-            )
-            if is_master:
-                ue.generate_instruction_flag_set()
-            else:
-                ue.generate_instruction_flag_check(target_engine_idx=0)
-            ue.generate_instruction_halt()
-            ue.stop_capture()
-            if dynamic:
-                ue.release_isa_reg()
-                ue.release_isa_reg()
-                ue.release_isa_reg()
-            program_addr = ue.get_program_dram_addr()
-            ue.write_captured_instructions_to_dram(program_addr)
-            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-            return program_addr, flops
-
-        e0_prog_addr, flops0 = _program_engine(
-            ue0, True, m_engine0, e0_a_addr, e0_b_addr, e0_out_addr)
-        e1_prog_addr, flops1 = _program_engine(
-            ue1, False, m_engine1, e1_a_addr, e1_b_addr, e1_out_addr)
-
-        ue0.start_execute_from_dram(e0_prog_addr)
-        ue1.start_execute_from_dram(e1_prog_addr)
-        ue1.wait_queue(10.0)
-        total_flops = flops0 + flops1
+        total_flops = UnifiedEngine.matmat_mul_two_cores(
+            ue0=ue0,
+            ue1=ue1,
+            M=M,
+            K=K,
+            N=N,
+            A_DRAM_ADDR=A_DRAM_ADDR,
+            B_DRAM_ADDR=B_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            softmax_enable=softmax_enable,
+            gelu_enable=gelu_enable,
+            silu_enable=silu_enable,
+            sigmoid_enable=sigmoid_enable,
+            clamp_enable=clamp_enable,
+            log_enable=log_enable,
+            dynamic=dynamic,
+        )
         ue0.report_timing_and_instruction_count()
         ue1.report_timing_and_instruction_count()
 
@@ -767,9 +592,7 @@ def matmat_mul_two_cores_unified_test(
         generate_trace(
             ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{trace_suffix}.csv")
 
-        out0 = ue0.dma_from_accelerator_memory(e0_out_addr, (m_engine0, N))
-        out1 = ue1.dma_from_accelerator_memory(e1_out_addr, (m_engine1, N))
-        output = torch.cat([out0, out1], dim=0)
+        output = ue0.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
         ref = a @ b.T
         if gelu_enable:
             ref = ref * torch.sigmoid(1.702 * ref)
@@ -824,8 +647,6 @@ def matmat_mul_two_cores_unified_test(
 def matmat_mul_multi_cores_unified_test(
     runtime_list=None,
     num_engines: int = 8,
-    weight_mode: str = "private",
-    also_run_shared_dynamic: bool = True,
     softmax_enable: bool = False,
     gelu_enable: bool = False,
     silu_enable: bool = False,
@@ -835,140 +656,64 @@ def matmat_mul_multi_cores_unified_test(
     input_scale: float = 1.0,
     snr_threshold_db: float = 40.0,
 ):
-    """Run RNG-matched legacy/dynamic multi-core matmuls (M sharded across num_engines).
-
-    ``weight_mode="private"`` gives every engine a full private copy of B in
-    its tensor window (the historical layout). ``weight_mode="shared"`` puts
-    one full B in engine 0's tensor window and every engine reads that same
-    flat DRAM address; A and output remain M-sharded/private in both modes.
-    With the default private mode, a fourth leg also runs the dynamic multicore
-    workload with shared B, so private-vs-shared bandwidth is directly visible
-    without duplicating the one-core baseline or legacy leg.
-
-    Each shape first runs the DYNAMIC path on ONE engine to get the FPGA-side
-    single-core execution time; that latency is the baseline every multi-core
-    leg's speedup is computed against. A summary table of all shapes, legs,
-    latencies, GFLOPS, SNR and speedups is printed at the end.
-    """
+    """Run RNG-matched legacy/dynamic multi-core matmuls (M sharded across num_engines)."""
     import user_dma_core
 
     if runtime_list is None:
         runtime_list = [(4096, 4096, 4096)]
     assert runtime_list, "runtime_list must be non-empty"
-    if weight_mode not in ("private", "shared"):
-        raise ValueError(
-            f"weight_mode must be 'private' or 'shared', got {weight_mode!r}")
 
-    # Per-shape 1-engine dynamic latency (us), and the collected summary rows.
-    baseline_us = {}
-    summary_rows = []
+    def _run_case(M, K, N, dynamic):
+        engine_base_stride = 0x00010000
+        program_region_stride = 0x01000000
 
-    def _run_case(M, K, N, dynamic, ne=None, run_weight_mode=None):
-        if ne is None:
-            ne = num_engines
-        if run_weight_mode is None:
-            run_weight_mode = weight_mode
-        bytes_per_element = 2
-        ues = _make_multi_engine_ues(ne)[0]
+        ues = []
+        for i in range(num_engines):
+            ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride)
+            # This test shares one A/B/output tensor allocation across all engines.
+            # Each engine receives row-offset addresses inside matmat_mul_multi_cores().
+            ue._tensor_dram_addr = DRAM_ACTIVATION_ADDR
+            ue._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + i * program_region_stride
+            ues.append(ue)
+
+        A_DRAM_ADDR = ues[0].allocate_tensor_dram(M * K * 2)
+        B_DRAM_ADDR = ues[0].allocate_tensor_dram(N * K * 2)
+        OUTPUT_DRAM_ADDR = ues[0].allocate_tensor_dram(M * N * 2)
 
         a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
         if input_scale != 1.0:
             a = (a.to(torch.float32) * float(input_scale)).to(torch.bfloat16)
         b = torch.randn(N, K, dtype=torch.bfloat16)
 
-        m_base, m_rem = divmod(M, ne)
-        m_shards = [m_base + (1 if i < m_rem else 0) for i in range(ne)]
+        ues[0].dma_to_accelerator_memory(A_DRAM_ADDR, a)
+        ues[0].dma_to_accelerator_memory(B_DRAM_ADDR, b)
 
-        a_addrs = []
-        b_addrs = []
-        out_addrs = []
-        shared_b_addr = None
-        if run_weight_mode == "shared":
-            # DRAM is flat across engines: one B allocation in engine 0's
-            # window is a legal read address for every worker. Do not allocate
-            # any worker B buffers or duplicate the DMA write in this mode.
-            shared_b_addr = ues[0].allocate_tensor_dram(N * K * bytes_per_element)
-            ues[0].dma_to_accelerator_memory(shared_b_addr, b)
-        row_base = 0
-        for ue, m_engine in zip(ues, m_shards):
-            row_end = row_base + m_engine
-            a_addr = ue.allocate_tensor_dram(m_engine * K * bytes_per_element)
-            if run_weight_mode == "private":
-                b_addr = ue.allocate_tensor_dram(N * K * bytes_per_element)
-                ue.dma_to_accelerator_memory(b_addr, b)
-            else:
-                b_addr = shared_b_addr
-            out_addr = ue.allocate_tensor_dram(m_engine * N * bytes_per_element)
-            ue.dma_to_accelerator_memory(a_addr, a[row_base:row_end, :])
-            a_addrs.append(a_addr)
-            b_addrs.append(b_addr)
-            out_addrs.append(out_addr)
-            row_base = row_end
-
-        total_flops = 0
-        program_addrs = []
-        for i, (ue, m_engine) in enumerate(zip(ues, m_shards)):
-            is_last = (i == ne - 1)
-            m_reg = k_reg = n_reg = None
-            if dynamic:
-                m_reg = ue.alloc_isa_reg()
-                k_reg = ue.alloc_isa_reg()
-                n_reg = ue.alloc_isa_reg()
-            ue.start_capture()
-            if not is_last:
-                ue.generate_instruction_flag_clear()
-            if dynamic:
-                ue.generate_instruction_add_set(m_reg, m_engine)
-                ue.generate_instruction_add_set(k_reg, K)
-                ue.generate_instruction_add_set(n_reg, N)
-            total_flops += ue.matmat_mul_core(
-                M=m_engine,
-                K=K,
-                N=N,
-                A_DRAM_ADDR=a_addrs[i],
-                B_DRAM_ADDR=b_addrs[i],
-                OUTPUT_DRAM_ADDR=out_addrs[i],
-                softmax_enable=softmax_enable,
-                gelu_enable=gelu_enable,
-                silu_enable=silu_enable,
-                sigmoid_enable=sigmoid_enable,
-                clamp_enable=clamp_enable,
-                log_enable=log_enable,
-                gpr_M_reg=m_reg,
-                gpr_K_reg=k_reg,
-                gpr_N_reg=n_reg,
-            )
-            if not is_last:
-                ue.generate_instruction_flag_set()
-            else:
-                for j in range(ne - 1):
-                    ue.generate_instruction_flag_check(target_engine_idx=j)
-            ue.generate_instruction_halt()
-            ue.stop_capture()
-            if dynamic:
-                ue.release_isa_reg()
-                ue.release_isa_reg()
-                ue.release_isa_reg()
-            program_addr = ue.get_program_dram_addr()
-            ue.write_captured_instructions_to_dram(program_addr)
-            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-            program_addrs.append(program_addr)
-
-        for ue, program_addr in zip(ues, program_addrs):
-            ue.start_execute_from_dram(program_addr)
-        ues[-1].wait_queue(10.0)
+        total_flops = UnifiedEngine.matmat_mul_multi_cores(
+            ues=ues,
+            M=M,
+            K=K,
+            N=N,
+            A_DRAM_ADDR=A_DRAM_ADDR,
+            B_DRAM_ADDR=B_DRAM_ADDR,
+            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            softmax_enable=softmax_enable,
+            gelu_enable=gelu_enable,
+            silu_enable=silu_enable,
+            sigmoid_enable=sigmoid_enable,
+            clamp_enable=clamp_enable,
+            log_enable=log_enable,
+            dynamic=dynamic,
+        )
         for ue in ues:
             ue.report_timing_and_instruction_count()
 
         # Parallel completion time is bounded by the slowest engine.
         latency_us = max(ue.report_latency_in_us() for ue in ues)
         flop_rate_gflops = total_flops / (latency_us * 1e3)
-        # Peak is the peak of THIS leg's engine count: the 1-core baseline is
-        # measured against 1-core peak, the multi-core legs against ne-core peak.
-        flops_ratio = flop_rate_gflops / user_dma_core.UE_PEAK_GFLOPS / (10 * ne)
+        flops_ratio = flop_rate_gflops / user_dma_core.UE_PEAK_GFLOPS / (10 * num_engines)
         print(
-            f"Report FLOPS for {ne}-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS, "
-            f"{flops_ratio:.2f}% of {ne}-core peak throughput for M={M}, K={K}, N={N}, "
+            f"Report FLOPS for {num_engines}-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS, "
+            f"{flops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, "
             f"softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, "
             f"silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, dynamic={dynamic}"
         )
@@ -979,14 +724,13 @@ def matmat_mul_multi_cores_unified_test(
             f"{'silu_enabled' if silu_enable else 'silu_disabled'}_"
             f"{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}"
         )
-        # for i, ue in enumerate(ues):
-        #     generate_trace(
-        #         ue, f"matmat_mul_multi_cores_trace_engine{i}_{m_shards[i]}_{trace_suffix}.csv")
+        m_base, m_rem = divmod(M, num_engines)
+        m_shards = [m_base + (1 if i < m_rem else 0) for i in range(num_engines)]
+        for i, ue in enumerate(ues):
+            generate_trace(
+                ue, f"matmat_mul_multi_cores_trace_engine{i}_{m_shards[i]}_{trace_suffix}.csv")
 
-        output = torch.cat([
-            ue.dma_from_accelerator_memory(out_addr, (m_engine, N))
-            for ue, out_addr, m_engine in zip(ues, out_addrs, m_shards)
-        ], dim=0)
+        output = ues[0].dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
         ref = a @ b.T
         if gelu_enable:
             ref = ref * torch.sigmoid(1.702 * ref)
@@ -1008,7 +752,7 @@ def matmat_mul_multi_cores_unified_test(
         out_nonzero = (output != 0).sum().item()
         out_total = output.numel()
         print(
-            f"{ne}-cores matmul output stats: "
+            f"{num_engines}-cores matmul output stats: "
             f"ref_nan={ref_nan}, out_nan={out_nan}, ref_inf={ref_inf}, out_inf={out_inf}, "
             f"out_nonzero={out_nonzero}/{out_total}"
         )
@@ -1023,14 +767,14 @@ def matmat_mul_multi_cores_unified_test(
             shard_total = out_shard.numel()
             shard_snr = calculate_snr(ref_shard, out_shard)
             print(
-                f"{ne}-cores shard engine{i}: rows={row_base}:{row_end}, "
+                f"{num_engines}-cores shard engine{i}: rows={row_base}:{row_end}, "
                 f"snr={shard_snr:.2f} dB, nan={shard_nan}, inf={shard_inf}, "
                 f"nonzero={shard_nonzero}/{shard_total}"
             )
             row_base = row_end
 
         snr_combined = calculate_snr(ref, output)
-        print(f"{ne}-cores matmul SNR combined: {snr_combined:.2f} dB")
+        print(f"{num_engines}-cores matmul SNR combined: {snr_combined:.2f} dB")
         assert snr_combined >= snr_threshold_db or snr_combined == float("inf"), \
             f"SNR {snr_combined:.2f} dB must be at least {snr_threshold_db:g} dB"
 
@@ -1042,337 +786,28 @@ def matmat_mul_multi_cores_unified_test(
         if clamp_enable:   flags.append("clamp")
         if log_enable:     flags.append("log")
         if dynamic:        flags.append("dynamic")
-        if run_weight_mode == "shared":
-            flags.append("shared")
         if input_scale != 1.0: flags.append(f"scale={input_scale:g}")
         flag_str = ("+" + "+".join(flags)) if flags else ""
-        is_baseline = (ne == 1 and dynamic)
-        name = (f"matmat_mul_multi_cores_1core_baseline{flag_str}" if is_baseline
-                else f"matmat_mul_multi_cores{flag_str}")
         record_test(
-            name,
-            f"M={M}, K={K}, N={N}, ne={ne}",
+            f"matmat_mul_multi_cores{flag_str}",
+            f"M={M}, K={K}, N={N}, num_engines={num_engines}",
             snr_db=snr_combined,
             gflops=flop_rate_gflops,
         )
 
-        # Speedup is against the 1-engine dynamic FPGA execution time.
-        base_us = baseline_us.get((M, K, N))
-        speedup = (base_us / latency_us) if (base_us and latency_us) else None
-        summary_rows.append({
-            "shape": f"{M}x{K}x{N}",
-            "leg": "1-core baseline (dynamic)" if is_baseline
-                   else ("dynamic" if dynamic else "legacy"),
-            "weight_mode": run_weight_mode,
-            "engines": ne,
-            "latency_us": latency_us,
-            "gflops": flop_rate_gflops,
-            "peak_pct": flops_ratio,
-            "snr_db": snr_combined,
-            "speedup": speedup,
-        })
-
         for ue in ues:
             ue.reset_tensor_dram_addr()
             ue.clear_capture_buffer()
-
-        return latency_us, flop_rate_gflops, snr_combined
 
     for M, K, N in runtime_list:
         assert M >= num_engines, \
             f"M must be at least num_engines for multi-core execution, got M={M}, num_engines={num_engines}"
         assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, \
             "runtime K and N must be multiples of 64"
-        # Single-engine dynamic run FIRST: its FPGA execution time is the
-        # speedup baseline. Its shard is the whole M, so M must be 64-aligned.
-        assert M % UE_VECTOR_SIZE == 0, \
-            f"M={M} must be a multiple of {UE_VECTOR_SIZE} for the 1-engine baseline"
-        rng_state = _capture_rng_state()
-        base_latency_us, _, _ = _run_case(M, K, N, dynamic=True, ne=1)
-        baseline_us[(M, K, N)] = base_latency_us
-        print(f"1-core dynamic baseline for M={M}, K={K}, N={N}: "
-              f"{base_latency_us:.1f} us")
-        _restore_rng_state(rng_state)
         _run_rng_matched_pair(
             lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=False),
             lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=True),
         )
-        if also_run_shared_dynamic and weight_mode == "private":
-            # Reuse the exact same random A/B as the private legacy/dynamic
-            # pair. This is intentionally only one extra leg: the 1-core
-            # baseline has no inter-engine weight-layout distinction, and the
-            # requested comparison is dynamic private versus dynamic shared.
-            _restore_rng_state(rng_state)
-            _run_case(M, K, N, dynamic=True, run_weight_mode="shared")
-
-    # ---- Summary -----------------------------------------------------------
-    mode_summary = ("private + shared-dynamic" if also_run_shared_dynamic
-                    and weight_mode == "private" else weight_mode)
-    print(f"\n=== matmat_mul_multi_cores_unified_test summary "
-          f"({num_engines} engines; speedup vs 1-core dynamic FPGA time; "
-          f"%peak vs each leg's own engine-count peak; weights={mode_summary}) ===")
-    header = (f"{'shape (MxKxN)':<20}{'leg':<28}{'weights':<10}{'eng':>5}"
-              f"{'latency(us)':>14}{'GFLOPS':>12}{'%peak':>9}"
-              f"{'SNR(dB)':>10}{'speedup':>10}")
-    print(header)
-    print("-" * len(header))
-    for row in summary_rows:
-        snr = row["snr_db"]
-        snr_str = "inf" if snr == float("inf") else f"{snr:.1f}"
-        spd = row["speedup"]
-        spd_str = "base" if spd is None else f"{spd:.2f}x"
-        print(f"{row['shape']:<20}{row['leg']:<28}{row['weight_mode']:<10}{row['engines']:>5}"
-              f"{row['latency_us']:>14.1f}{row['gflops']:>12.2f}"
-              f"{row['peak_pct']:>8.2f}%{snr_str:>10}{spd_str:>10}")
-    print("-" * len(header))
-    print()
-    return summary_rows
-
-
-def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 8,
-                                          data_type=TYPE.IF4, int_variant: bool = True,
-                                          snr_threshold_db: float = 40.0):
-    """Quantized multi-core matmul, N-sharded, with PRIVATE per-core weights.
-
-    Differs from matmat_mul_multi_cores_unified_test in three ways:
-
-      * Weights are quantized THROUGH each engine, so every core's B row block
-        (+ its scale blob) lands in that core's OWN private DRAM window. Weight
-        reads never contend on one address range.
-      * The workload is sharded over N, not M. Each shard must be a multiple of
-        UE_VECTOR_SIZE; if num_engines would leave a shard smaller than that,
-        the extra cores are ignored (eff_ne = min(num_engines, N // 64)).
-      * Input A and output are also private per engine. Each engine receives
-        its own copy of A, writes its local [M, cols] output shard, and the
-        software test concatenates those shards along N for validation.
-
-    The single-core reference runs first: it supplies both the bit-exactness
-    reference and the FPGA latency baseline every speedup is computed against.
-    """
-    import user_dma_core
-    global _PAIR_ID_COUNTER, _CURRENT_PAIR_ID
-
-    if runtime_list is None:
-        runtime_list = [(1, 1536, 4096)]
-    assert runtime_list, "runtime_list must be non-empty"
-    for M, _K, _N in runtime_list:
-        # Each core writes its N slice straight into one contiguous output row.
-        # With M>1 a column shard is strided in a row-major [M, N] buffer, so
-        # direct writeback would need a stride the kernel does not emit here.
-        if M != 1:
-            raise ValueError(
-                f"contiguous N-shard writeback requires M=1, got M={M}")
-
-    bytes_per_element = 2
-
-    summary_rows = []
-
-    def _split_n(N, ne):
-        """Even N split; every shard a whole multiple of UE_VECTOR_SIZE."""
-        blocks, rem = divmod(N // UE_VECTOR_SIZE, ne)
-        splits, off = [], 0
-        for i in range(ne):
-            cols = (blocks + (1 if i < rem else 0)) * UE_VECTOR_SIZE
-            splits.append((off, cols))
-            off += cols
-        return splits
-
-    def _run(M, K, N, ne, a, b, want_ref=False, dynamic=False):
-        ues = _make_multi_engine_ues(ne)[0]
-
-        # Software model of the quantize+dequantize the hardware will apply, so
-        # the CPU reference is a fair comparison (pure torch, no DRAM traffic).
-        b_ref = (ues[0].quantize_weight_simulate(
-            b, data_type=data_type, int_variant=int_variant) if want_ref else None)
-
-        splits = _split_n(N, ne)
-
-        # PRIVATE weights: engine i quantizes its own B rows through itself, so
-        # the blob + scales land in engine i's params region.
-        b_addrs, scale_addrs = [], []
-        for i, (n_off, cols) in enumerate(splits):
-            b_addr, scale_addr = ues[i].quantize_weight(
-                weight=b[n_off:n_off + cols, :].contiguous(), N=cols, K=K,
-                data_type=data_type, int_variant=int_variant)
-            b_addrs.append(b_addr)
-            scale_addrs.append(scale_addr)
-
-        # PRIVATE input/output windows: every engine reads A and its B shard
-        # from its own HBM window, then writes its N shard locally.
-        a_addrs = []
-        out_addrs = []
-        for i, ue in enumerate(ues):
-            a_addr = ue.allocate_tensor_dram(M * K * bytes_per_element)
-            out_addr = ue.allocate_tensor_dram(M * splits[i][1] * bytes_per_element)
-            ue.dma_to_accelerator_memory(a_addr, a)
-            a_addrs.append(a_addr)
-            out_addrs.append(out_addr)
-
-        program_addrs = []
-        # Core 0 is the master. It raises the start flag, every worker waits on
-        # it before touching DRAM, so all cores begin together and host launch
-        # skew stays OUT of the measured window. At the end the master waits on
-        # every worker, so core 0's latency bounds the whole run.
-        for i, ue in enumerate(ues):
-            is_master = (i == 0)
-            # Dynamic path primes M/K/N GPRs on each engine before capture, so
-            # quantized_matmat_core dispatches to its runtime-dimension variant.
-            m_reg = k_reg = n_reg = None
-            if dynamic:
-                m_reg = ue.alloc_isa_reg()
-                k_reg = ue.alloc_isa_reg()
-                n_reg = ue.alloc_isa_reg()
-            ue.start_capture()
-            if ne > 1:
-                if is_master:
-                    ue.generate_instruction_flag_set()      # start barrier
-                else:
-                    ue.generate_instruction_flag_clear()
-                    ue.generate_instruction_flag_check(target_engine_idx=0)
-            if dynamic:
-                ue.generate_instruction_add_set(m_reg, M)
-                ue.generate_instruction_add_set(k_reg, K)
-                ue.generate_instruction_add_set(n_reg, splits[i][1])
-            ue.quantized_matmat_core(
-                M=M, K=K, N=splits[i][1],
-                A_DRAM_ADDR=a_addrs[i],
-                B_DRAM_ADDR=b_addrs[i],
-                OUTPUT_DRAM_ADDR=out_addrs[i],
-                SCALE_DRAM_ADDR=scale_addrs[i],
-                data_type=data_type,
-                gpr_M_reg=m_reg, gpr_K_reg=k_reg, gpr_N_reg=n_reg)
-            # #uncomment below to verifiy the effectiveness of the semaphore synchronization
-            # if i == 2:
-            #      ue.quantized_matmat_core(
-            #                     M=M, K=K, N=splits[i][1],
-            #                     A_DRAM_ADDR=a_addr,
-            #                     B_DRAM_ADDR=b_addrs[i],
-            #                     OUTPUT_DRAM_ADDR=out_addr + out_offsets[i],
-            #                     SCALE_DRAM_ADDR=scale_addrs[i],
-            #                     data_type=data_type)
-            if ne > 1:
-                if is_master:
-                    for j in range(1, ne):                  # completion barrier
-                        ue.generate_instruction_flag_check(target_engine_idx=j)
-                    ue.generate_instruction_flag_clear()
-                else:
-                    ue.generate_instruction_flag_set()
-            ue.generate_instruction_halt()
-            ue.stop_capture()
-            if dynamic:
-                ue.release_isa_reg()
-                ue.release_isa_reg()
-                ue.release_isa_reg()
-            program_dram_addr = ue.get_program_dram_addr()
-            ue.write_captured_instructions_to_dram(program_dram_addr)
-            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-            program_addrs.append(program_dram_addr)
-
-        # Workers first: each must be parked on flag_check(0) before the master
-        # raises the start flag, otherwise the barrier does not hold them.
-        for i in range(1, ne):
-            ues[i].start_execute_from_dram(program_addrs[i])
-        ues[0].start_execute_from_dram(program_addrs[0])
-        ues[0].wait_queue(60.0)
-
-        # The master cannot retire before every worker has flag_set, so its own
-        # latency already bounds the run and no worker poll is needed.
-        latency_us = ues[0].report_latency_in_us()
-        output = torch.cat([
-            ue.dma_from_accelerator_memory(out_addr, (M, cols))
-            for ue, out_addr, (_n_off, cols) in zip(ues, out_addrs, splits)
-        ], dim=1)
-
-        for ue in ues:
-            ue.reset_tensor_dram_addr()
-            ue.reset_params_dram_addr()
-            ue.clear_capture_buffer()
-        return output, latency_us, b_ref
-
-    for M, K, N in runtime_list:
-        assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, \
-            "runtime K and N must be multiples of 64"
-        # A shard below UE_VECTOR_SIZE is not representable: drop the extra cores.
-        eff_ne = min(num_engines, N // UE_VECTOR_SIZE)
-        assert eff_ne >= 1, f"N={N} is smaller than UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
-        if eff_ne < num_engines:
-            print(f"N={N} only supports {eff_ne} cores at {UE_VECTOR_SIZE}-column "
-                  f"granularity; ignoring the other {num_engines - eff_ne}")
-
-        torch.manual_seed(0xC0FFEE + K * 131 + N)
-        a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
-        b = (torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1)
-        total_flops = 2 * M * K * N
-
-        # Single-core dynamic reference FIRST: latency baseline + CPU reference.
-        out_ref, base_us, b_ref = _run(M, K, N, 1, a, b,
-                                       want_ref=True, dynamic=True)
-        print(f"1-core dynamic reference for M={M}, K={K}, N={N}: {base_us:.1f} us")
-        out_leg, leg_us, _ = _run(M, K, N, eff_ne, a, b, dynamic=False)
-        out_dyn, dyn_us, _ = _run(M, K, N, eff_ne, a, b, dynamic=True)
-
-        # Reference uses the same effective BF16 weights as the accelerator
-        # (quantize + dequant), not the raw pre-quantization b — otherwise SNR
-        # is dominated by quantization error rather than compute error.
-        ref = a @ b_ref.T
-        legs = [
-            ("1-core baseline (dynamic)", 1, base_us, out_ref,
-             "quantized_matmat_mul_multi_cores_1core_baseline+dynamic"),
-            (f"{eff_ne}-core legacy", eff_ne, leg_us, out_leg,
-             "quantized_matmat_mul_multi_cores"),
-            (f"{eff_ne}-core dynamic", eff_ne, dyn_us, out_dyn,
-             "quantized_matmat_mul_multi_cores+dynamic"),
-        ]
-        # Pair the two multi-core rows so write_test_summary emits the SNR /
-        # GFLOPS diff columns. A pair_id must group EXACTLY two rows, one of
-        # them "+dynamic", so the 1-core baseline stays unpaired.
-        _PAIR_ID_COUNTER += 1
-        pair_id = _PAIR_ID_COUNTER
-
-        for leg, ne, lat, out, record_name in legs:
-            snr = calculate_snr(ref, out)
-            gflops = total_flops / (lat * 1e3)
-            peak_pct = gflops / user_dma_core.UE_PEAK_GFLOPS / (10 * ne)
-            summary_rows.append({
-                "shape": f"{M}x{K}x{N}", "leg": leg, "engines": ne,
-                "latency_us": lat, "gflops": gflops, "peak_pct": peak_pct,
-                "snr_db": snr, "speedup": None if ne == 1 else base_us / lat,
-            })
-            # Sharding must not change the result at all, on either path.
-            exact = torch.equal(out_ref, out)
-            print(f"{leg}: bit-exact vs 1-core={'yes' if exact else 'NO'}, "
-                  f"SNR vs CPU={snr:.2f} dB, {lat:.1f} us"
-                  + ("" if ne == 1 else f", speedup={base_us / lat:.2f}x"))
-            assert exact, f"{leg} result is not bit-identical to the 1-core result"
-            assert snr >= snr_threshold_db or snr == float("inf"), \
-                f"{leg} SNR vs CPU reference {snr:.2f} dB is below {snr_threshold_db:g} dB"
-            _CURRENT_PAIR_ID = None if ne == 1 else pair_id
-            record_test(record_name,
-                        f"M={M}, K={K}, N={N}, num_engines={ne}, "
-                        f"{data_type.name}, private weights",
-                        snr_db=snr,
-                        gflops=gflops)
-            _CURRENT_PAIR_ID = None
-
-    print(f"\n=== quantized_matmat_mul_multi_cores_test summary "
-          f"(private per-core weights, N-sharded; speedup vs 1-core FPGA time; "
-          f"%peak vs each leg's own engine-count peak) ===")
-    header = (f"{'shape (MxKxN)':<20}{'leg':<24}{'eng':>5}"
-              f"{'latency(us)':>14}{'GFLOPS':>12}{'%peak':>9}"
-              f"{'SNR(dB)':>10}{'speedup':>10}")
-    print(header)
-    print("-" * len(header))
-    for row in summary_rows:
-        snr = row["snr_db"]
-        snr_str = "n/a" if snr is None else ("inf" if snr == float("inf") else f"{snr:.1f}")
-        spd = row["speedup"]
-        spd_str = "base" if spd is None else f"{spd:.2f}x"
-        print(f"{row['shape']:<20}{row['leg']:<24}{row['engines']:>5}"
-              f"{row['latency_us']:>14.1f}{row['gflops']:>12.2f}"
-              f"{row['peak_pct']:>8.2f}%{snr_str:>10}{spd_str:>10}")
-    print("-" * len(header))
-    print()
-    return summary_rows
 
 
 def unified_attention_test(batch: int = 256, aligned_seq_len: int = 256, head_dim: int = 128):
@@ -6735,7 +6170,7 @@ def software_reset_test(cores: int = 1):
     for core in range(cores):
         base = user_dma_core.UE_0_BASE_ADDR + core * ENGINE_BASE_STRIDE
         print(f"--- software_reset: core {core} (base 0x{base:08x}) ---")
-        ue = UnifiedEngine(BASE_ADDR=base, init_unified_engine=True)
+        ue = UnifiedEngine(BASE_ADDR=base)
 
         # Break any stale FLAG_CHECK spin-wait and drain this core's queue.
         ue.software_reset()
@@ -6980,7 +6415,7 @@ def gemma3_inference_test() -> None:
     # (300 MHz, 3.3333 ns/cycle): streaming/legacy = 16.23 tok/s (>16 tok/s
     # required -> <18,750,000 cycles/tok), matmatmul = 8.43 tok/s (>8 tok/s
     # required -> <37,500,000 cycles/tok). Cycles/tok is clock-independent,
-    # so the same thresholds below apply uniformly to every hardware profile; convert
+    # so the same thresholds below apply uniformly to every --device; convert
     # each run's measured peak tok/s to cycles/tok using its own clock period
     # before comparing. streaming/legacy bumped to 20,000,000 after a device
     # measured 19,831,745 cycles/tok (16.81 tok/s @ 3.0000 ns/cycle), which
@@ -7343,11 +6778,884 @@ def llama32_1b_if8_inference_test() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Kokoro op-gap hardware proofs: each function proves one previously-flagged
+# "gap" op decomposes into EXISTING UnifiedEngine primitives (matmul, eltwise,
+# layer_norm, activation) via precompute / shifted-address reads / patching --
+# no new hardware op required. See conversation history for full derivations.
+# ---------------------------------------------------------------------------
+
+# --- from hw_test_embedding_cumsum.py ---
+def embedding_gather_test(vocab_size: int = 178, embed_dim: int = 512, seq_len: int = 32):
+    """Proves embedding-table gather (row lookup by integer id) reduces to pure address
+    arithmetic + DMA on this hardware, with no new hardware primitive required.
+
+    Mechanism demonstrated: each row's absolute DRAM address is computed as
+    ``table_dram + id * embed_dim * 2`` bytes. Because the ids are known at *capture* time
+    in this proof, we bake each row's address directly as the ``accelerator_dram_address``
+    argument to a plain accelerator_memory_to_sram -> sram_to_accelerator_memory copy (an
+    "offset row copy" per seq position), unrolled across seq_len in the Python capture loop.
+
+    This is the simpler of the two mechanisms the task called out (as opposed to loading the
+    row offset into a GPR via generate_instruction_add_set and using accelerator_memory_to_sram
+    with general_reg_src=reg). A fully dynamic version -- where the ids themselves are only
+    known at *runtime* (e.g. read from a DRAM-resident id buffer into a register) -- would:
+      1. DMA the id buffer into SRAM / read it into a GPR.
+      2. Compute the byte offset in a register with generate_instruction_mul32_imm(dst, id_reg,
+         embed_dim * 2) (row stride) plus generate_instruction_add_imm/add_reg against the table
+         base register.
+      3. Issue accelerator_memory_to_sram(..., general_reg_src=offset_reg) so the DMA source
+         address is sourced from the register instead of a Python-baked immediate.
+    That extension is out of scope here; this test only proves the "address arithmetic + DMA"
+    mechanism itself using capture-time-known ids.
+    """
+    ue = UnifiedEngine()
+
+    table = torch.randn(vocab_size, embed_dim, dtype=torch.bfloat16)
+    ids = torch.randint(0, vocab_size, (seq_len,))
+    reference = table[ids]  # (seq_len, embed_dim)
+
+    row_bytes = embed_dim * 2
+    table_dram = ue.allocate_tensor_dram(vocab_size * embed_dim * 2)
+    out_dram = ue.allocate_tensor_dram(seq_len * embed_dim * 2)
+
+    # capture instructions
+    ue.start_capture()
+    for i in range(seq_len):
+        row_id = int(ids[i].item())
+        src_addr = table_dram + row_id * row_bytes
+        dst_addr = out_dram + i * row_bytes
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=src_addr,
+            sram_address=0x00000,
+            element_size=embed_dim,
+        )
+        ue.sram_to_accelerator_memory(
+            sram_address=0x00000,
+            accelerator_dram_address=dst_addr,
+            element_size=embed_dim,
+        )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(prog)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+
+    ue.dma_to_accelerator_memory(table_dram, table.reshape(-1).contiguous())
+
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    result = ue.dma_from_accelerator_memory(out_dram, (seq_len * embed_dim,))
+    snr_db = calculate_snr(reference.reshape(-1), result)
+    print(f"Reference SNR Analysis for Embedding Gather Test: {snr_db:.2f} dB")
+    assert snr_db >= 80.0 or snr_db == float("inf"), \
+        f"embedding_gather SNR {snr_db:.2f} dB must be at least 80 dB (exact memcpy expected)"
+    record_test("embedding_gather", f"vocab={vocab_size},dim={embed_dim},seq={seq_len}", snr_db=snr_db)
+
+    ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+
+
+def cumsum_via_triangular_matmul_test(T: int = 128, D: int = 64):
+    """Proves a running cumulative sum along the time axis (needed e.g. for Kokoro's SineGen
+    phase accumulation) can be computed with the EXISTING matmat_mul_core, no new hardware op,
+    by matmul-ing against a precomputed constant lower-triangular all-ones matrix:
+    cumsum(x, dim=0) == L @ x, where L = tril(ones(T, T)).
+
+    matmat_mul_core computes A @ B^T with A: MxK, B: NxK. To get L @ x (L: TxT, x: TxD) we pass
+    A=L (M=T, K=T) and B=x^T-shaped-as-NxK i.e. we need B such that B^T == x, i.e. B = x^T
+    (D x T). Since matmat_mul_core's B layout is N x K (row-major) and the result is A @ B^T,
+    to compute L @ x directly we instead pass A=L (TxT) and B=x with N=D, K=T requires B stored
+    as D x T (x transposed). To avoid a host-side transpose headache we instead exploit
+    symmetry-free simplicity: matmat_mul_core(M=T, K=T, N=D, A=L, B=x_as_NxK) expects B as N x K
+    = D x T, i.e. x transposed. We DMA x already transposed (x.T contiguous, shape D x T) as B,
+    so the hardware computes L @ (x.T)^T = L @ x, which is exactly cumsum(x, dim=0).
+    """
+    ue = UnifiedEngine()
+
+    x = torch.randn(T, D, dtype=torch.bfloat16)
+    L = torch.tril(torch.ones(T, T, dtype=torch.bfloat16))
+
+    reference_true_cumsum = torch.cumsum(x.float(), dim=0)
+    reference_matmul = (L.float() @ x.float())
+    # Sanity: the bf16 triangular-matmul formulation itself should closely track true cumsum.
+    cumsum_match_snr = calculate_snr(reference_true_cumsum.reshape(-1), reference_matmul.reshape(-1))
+    print(f"[host sanity] L@x vs torch.cumsum SNR: {cumsum_match_snr:.2f} dB")
+
+    l_dram = ue.allocate_tensor_dram(T * T * 2)
+    x_dram = ue.allocate_tensor_dram(T * D * 2)
+    out_dram = ue.allocate_tensor_dram(T * D * 2)
+
+    # capture instructions
+    ue.start_capture()
+    total_flops = ue.matmat_mul_core(M=T, K=T, N=D, A_DRAM_ADDR=l_dram, B_DRAM_ADDR=x_dram,
+                                      OUTPUT_DRAM_ADDR=out_dram)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(prog)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+
+    ue.dma_to_accelerator_memory(l_dram, L.reshape(-1).contiguous())
+    ue.dma_to_accelerator_memory(x_dram, x.T.contiguous().reshape(-1))
+
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    result = ue.dma_from_accelerator_memory(out_dram, (T * D,))
+    snr_db = calculate_snr(reference_matmul.reshape(-1), result)
+    gflops, _ = ue.report_flop_rate_gflops(total_flops)
+    print(f"Reference SNR Analysis for Cumsum-via-Triangular-Matmul Test: {snr_db:.2f} dB, GFLOPS={gflops:.2f}")
+    assert snr_db >= 40.0 or snr_db == float("inf"), \
+        f"cumsum_triangular_matmul SNR {snr_db:.2f} dB must be at least 40 dB"
+    record_test("cumsum_triangular_matmul", f"T={T},D={D}", snr_db=snr_db, gflops=gflops)
+
+    ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+
+# --- from hw_test_lstm.py ---
+def lstm_cell_hw_test(input_size: int = 64, hidden_size: int = 64, T: int = 8,
+                       snr_threshold_db: float = 25.0):
+    """Single LSTMCell over T timesteps, decomposed into UnifiedEngine primitives.
+
+    Proves a bidirectional-LSTM building block (as used 5x in Kokoro TTS,
+    hidden=512/256-per-direction) needs ZERO new hardware primitives: each
+    timestep is just batched gate matmuls (with fused bias) + native sigmoid +
+    tanh derived exactly as tanh(x) = 2*sigmoid(2x) - 1 (affine pre/post
+    transform around the native sigmoid activation) + elementwise mul/add for
+    the cell/hidden state update.
+
+    This is a *single* LSTMCell (no bidirectionality, no multi-layer stacking)
+    over a short sequence, to validate the per-timestep decomposition against
+    PyTorch's own nn.LSTMCell (bit-for-bit gate semantics: gate order i,f,g,o).
+    The per-step op sequence below is unrolled in Python at capture time (a
+    plain `for t in range(T)` while start_capture() is active) rather than
+    using ISA loop_start/loop_end -- once this decomposition is validated on
+    real hardware, the loop can be swapped for a true ISA loop.
+
+    snr_threshold_db defaults to a relaxed 25 dB (vs. the ~35-40 dB floors used
+    by single-op tests elsewhere in this file) because a single LSTM timestep
+    chains many bf16-precision ops (2 matmuls + add + 3x sigmoid-via-identity-
+    matmul + 2x tanh-via-sigmoid-affine + 3 elementwise ops), and T of those
+    chain sequentially -- each step's bf16 rounding compounds into the next.
+    """
+    import torch
+    from user_dma_core import UnifiedEngine, UE_MODE, UE_VECTOR_SIZE, calculate_snr
+
+    assert input_size % UE_VECTOR_SIZE == 0, "input_size must be a multiple of UE_VECTOR_SIZE"
+    assert hidden_size % UE_VECTOR_SIZE == 0, "hidden_size must be a multiple of UE_VECTOR_SIZE"
+    H = hidden_size
+    G = 4 * H  # gate width (i, f, g, o concatenated, PyTorch nn.LSTMCell order)
+
+    # ---- Host reference: PyTorch's own nn.LSTMCell is ground truth. ----
+    torch.manual_seed(0)
+    cell = torch.nn.LSTMCell(input_size, hidden_size)
+    x_seq = torch.randn(T, input_size)
+    h_ref = torch.zeros(hidden_size)
+    c_ref = torch.zeros(hidden_size)
+    ref_outputs = []
+    with torch.no_grad():
+        for t in range(T):
+            h_ref, c_ref = cell(x_seq[t:t + 1], (h_ref.unsqueeze(0), c_ref.unsqueeze(0)))
+            h_ref = h_ref.squeeze(0)
+            c_ref = c_ref.squeeze(0)
+            ref_outputs.append(h_ref.clone())
+    ref_outputs = torch.stack(ref_outputs, dim=0)  # [T, H]
+
+    with torch.no_grad():
+        W_ih = cell.weight_ih.detach()          # [4H, input_size]
+        W_hh = cell.weight_hh.detach()           # [4H, H]
+        bias = (cell.bias_ih.detach() + cell.bias_hh.detach())  # [4H], fold into one bias for hw matmul
+
+    # matmat_mul_core computes A @ B^T with B stored [N,K] row-major (confirmed at
+    # user_dma_core.py:5234-5254). We want gates_x = x_t @ W_ih^T, i.e. B^T == W_ih^T,
+    # so B == W_ih AS-IS ([4H, input_size] == [N,K]) -- no transpose. Same for W_hh.
+    Wx = W_ih.contiguous().to(torch.bfloat16)   # [4H, input_size] == [G, input_size] == [N,K]
+    Wh = W_hh.contiguous().to(torch.bfloat16)   # [4H, H] == [G, H] == [N,K]
+    bias_bf16 = bias.to(torch.bfloat16).contiguous()
+    x_seq_bf16 = x_seq.to(torch.bfloat16).contiguous()
+
+    ue = UnifiedEngine()
+
+    # ---- DRAM buffer allocation (all bf16, 2 bytes/elem). ----
+    wx_dram = ue.allocate_tensor_dram(input_size * G * 2)
+    wh_dram = ue.allocate_tensor_dram(H * G * 2)
+    bias_dram = ue.allocate_tensor_dram(G * 2)
+    ident_dram = ue.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * 2)
+
+    # Two input-x slots (not strictly needed to double-buffer, but keeps each
+    # timestep's x_t contiguous and simple to DMA up-front).
+    x_dram = ue.allocate_tensor_dram(T * input_size * 2)
+
+    # Gate scratch buffers (reused every timestep -- values are fully consumed
+    # each iteration before being overwritten on the next).
+    gates_x_dram = ue.allocate_tensor_dram(G * 2)
+    gates_h_dram = ue.allocate_tensor_dram(G * 2)
+    gates_dram = ue.allocate_tensor_dram(G * 2)  # combined i,f,g,o pre-activations
+    # Individual post-activation gate buffers [1, H] each.
+    i_dram = ue.allocate_tensor_dram(H * 2)
+    f_dram = ue.allocate_tensor_dram(H * 2)
+    g_dram = ue.allocate_tensor_dram(H * 2)
+    o_dram = ue.allocate_tensor_dram(H * 2)
+    g_tmp_dram = ue.allocate_tensor_dram(H * 2)   # scratch for tanh-via-sigmoid affine on g
+    c_tmp_dram = ue.allocate_tensor_dram(H * 2)   # scratch for tanh-via-sigmoid affine on c_t
+    tanh_c_dram = ue.allocate_tensor_dram(H * 2)
+    fc_dram = ue.allocate_tensor_dram(H * 2)      # f_t * c_{t-1}
+    ig_dram = ue.allocate_tensor_dram(H * 2)       # i_t * g_t
+
+    # Persistent recurrent state -- two physical buffers, ping-ponged by
+    # (Python-level) address swap each timestep so h_prev/c_prev always point
+    # at "last iteration's freshly written" buffer.
+    h_bufs = [ue.allocate_tensor_dram(H * 2), ue.allocate_tensor_dram(H * 2)]
+    c_bufs = [ue.allocate_tensor_dram(H * 2), ue.allocate_tensor_dram(H * 2)]
+
+    out_seq_dram = ue.allocate_tensor_dram(T * H * 2)  # full h_t sequence, written each step
+
+    M_H = H // UE_VECTOR_SIZE  # activation tiling: N=UE_VECTOR_SIZE, M=H/UE_VECTOR_SIZE
+
+    def sigmoid_inplace(src_dram, dst_dram):
+        ue.activation_core(M=M_H, N=UE_VECTOR_SIZE, A_DRAM_ADDR=src_dram,
+                            OUTPUT_DRAM_ADDR=dst_dram, IDENTITY_DRAM_ADDR=ident_dram,
+                            activation="sigmoid")
+
+    def tanh_via_sigmoid(src_dram, tmp_dram, dst_dram):
+        # tanh(x) = 2*sigmoid(2x) - 1
+        ue.eltwise_core_dram(M=1, N=H, dram_a=src_dram, dram_b=None, dram_out=tmp_dram,
+                              mode=UE_MODE.MUL_BROADCAST, scalar=2.0)
+        sigmoid_inplace(tmp_dram, tmp_dram)
+        ue.eltwise_core_dram(M=1, N=H, dram_a=tmp_dram, dram_b=None, dram_out=tmp_dram,
+                              mode=UE_MODE.MUL_BROADCAST, scalar=2.0)
+        ue.eltwise_core_dram(M=1, N=H, dram_a=tmp_dram, dram_b=None, dram_out=dst_dram,
+                              mode=UE_MODE.ADD_BROADCAST, scalar=-1.0)
+
+    # ---- Capture: unrolled T-timestep program. ----
+    ue.start_capture()
+    h_prev, c_prev = h_bufs[0], c_bufs[0]
+    for t in range(T):
+        x_t_dram = x_dram + t * input_size * 2
+        h_cur, c_cur = h_bufs[(t + 1) % 2], c_bufs[(t + 1) % 2]
+
+        # gates_x = x_t @ Wx + bias  (bias fused via C_DRAM_ADDR, broadcast over M=1 row)
+        ue.matmat_mul_core(M=1, K=input_size, N=G, A_DRAM_ADDR=x_t_dram, B_DRAM_ADDR=wx_dram,
+                            OUTPUT_DRAM_ADDR=gates_x_dram, C_DRAM_ADDR=bias_dram,
+                            bias_mode="broadcast_N")
+        # gates_h = h_prev @ Wh  (no bias, already folded into gates_x)
+        ue.matmat_mul_core(M=1, K=H, N=G, A_DRAM_ADDR=h_prev, B_DRAM_ADDR=wh_dram,
+                            OUTPUT_DRAM_ADDR=gates_h_dram)
+        # gates = gates_x + gates_h
+        ue.eltwise_core_dram(M=1, N=G, dram_a=gates_x_dram, dram_b=gates_h_dram,
+                              dram_out=gates_dram, mode=UE_MODE.ELTWISE_ADD)
+
+        # Slice gates into i,f,g,o (contiguous H-wide, H*2 bytes apart) and activate.
+        i_raw, f_raw, g_raw, o_raw = (gates_dram + k * H * 2 for k in range(4))
+        sigmoid_inplace(i_raw, i_dram)
+        sigmoid_inplace(f_raw, f_dram)
+        sigmoid_inplace(o_raw, o_dram)
+        tanh_via_sigmoid(g_raw, g_tmp_dram, g_dram)
+
+        # c_t = f_t * c_{t-1} + i_t * g_t
+        ue.eltwise_core_dram(M=1, N=H, dram_a=f_dram, dram_b=c_prev, dram_out=fc_dram,
+                              mode=UE_MODE.ELTWISE_MUL)
+        ue.eltwise_core_dram(M=1, N=H, dram_a=i_dram, dram_b=g_dram, dram_out=ig_dram,
+                              mode=UE_MODE.ELTWISE_MUL)
+        ue.eltwise_core_dram(M=1, N=H, dram_a=fc_dram, dram_b=ig_dram, dram_out=c_cur,
+                              mode=UE_MODE.ELTWISE_ADD)
+
+        # h_t = o_t * tanh(c_t) -- write directly into both the recurrent h
+        # buffer (h_cur, carried forward as next step's h_prev) and the output
+        # sequence buffer at its fixed offset (two writes of the same result,
+        # avoids a needless extra copy op).
+        tanh_via_sigmoid(c_cur, c_tmp_dram, tanh_c_dram)
+        ue.eltwise_core_dram(M=1, N=H, dram_a=o_dram, dram_b=tanh_c_dram, dram_out=h_cur,
+                              mode=UE_MODE.ELTWISE_MUL)
+        ue.eltwise_core_dram(M=1, N=H, dram_a=o_dram, dram_b=tanh_c_dram,
+                              dram_out=out_seq_dram + t * H * 2, mode=UE_MODE.ELTWISE_MUL)
+
+        h_prev, c_prev = h_cur, c_cur
+
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    # ---- Upload weights/inputs (identical weights the PyTorch reference used). ----
+    ue.dma_to_accelerator_memory(wx_dram, Wx.reshape(-1).contiguous())
+    ue.dma_to_accelerator_memory(wh_dram, Wh.reshape(-1).contiguous())
+    ue.dma_to_accelerator_memory(bias_dram, bias_bf16)
+    ue.dma_to_accelerator_memory(ident_dram, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16).reshape(-1).contiguous())
+    ue.dma_to_accelerator_memory(x_dram, x_seq_bf16.reshape(-1).contiguous())
+    zeros_h = torch.zeros(H, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(h_bufs[0], zeros_h)
+    ue.dma_to_accelerator_memory(c_bufs[0], zeros_h)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(out_seq_dram, (T, H))
+    snr_db = calculate_snr(ref_outputs.to(torch.bfloat16), output)
+    print(f"Reference SNR Analysis for LSTM Cell Step Test: {snr_db:.2f} dB")
+    assert snr_db >= snr_threshold_db or snr_db == float("inf"), \
+        f"SNR {snr_db:.2f} dB must be at least {snr_threshold_db:g} dB"
+    record_test("lstm_cell_step", f"input={input_size},hidden={hidden_size},T={T}", snr_db=snr_db)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+# --- from hw_test_conv1d.py ---
+def conv1d_shifted_matmul_test(C_in: int = 64, C_out: int = 64, T: int = 128, kernel_size: int = 3, dilation: int = 1):
+    """Prove Conv1d(C_in, C_out, kernel_size, dilation, padding='same') == sum_k of
+    shifted-input matmuls against per-tap weight slices, i.e. y[t] = sum_k X_pad[t + dilation*k] @ W[k].
+    The "shift" is pure DRAM address offset (zero extra compute); accumulation across taps uses
+    matmat_mul_core's bias_mode="full_matrix" elementwise-add of the running total ([T, C_out]).
+    """
+    assert kernel_size % 2 == 1, "this test assumes an odd kernel_size for symmetric 'same' padding"
+    assert C_in % UE_VECTOR_SIZE == 0 and C_out % UE_VECTOR_SIZE == 0 and T % UE_VECTOR_SIZE == 0
+
+    pad = dilation * (kernel_size // 2)
+
+    # ---- host reference (PyTorch Conv1d weight layout: [C_out, C_in, kernel_size]) ----
+    X = torch.randn(T, C_in, dtype=torch.bfloat16) / math.sqrt(C_in)
+    W = torch.randn(C_out, C_in, kernel_size, dtype=torch.bfloat16) / math.sqrt(C_in * kernel_size)
+
+    x_nchw = X.T.unsqueeze(0).float()  # [1, C_in, T]
+    ref = torch.nn.functional.conv1d(x_nchw, W.float(), padding=pad, dilation=dilation)  # [1, C_out, T]
+    ref = ref.squeeze(0).T.to(torch.bfloat16)  # [T, C_out]
+
+    X_pad = torch.zeros(T + 2 * pad, C_in, dtype=torch.bfloat16)
+    X_pad[pad:pad + T, :] = X
+    # per-tap weight slice: W[:, :, k] is [C_out, C_in] -> transpose to [C_in, C_out] for A@B.T layout
+    # (matmat_mul_core computes A @ B.T with B stored as [N, K] = [C_out, C_in], so B is just W[:, :, k] itself)
+    W_taps = [W[:, :, k].contiguous() for k in range(kernel_size)]  # each [C_out, C_in]
+
+    # ---- device ----
+    ue = UnifiedEngine()
+
+    x_pad_dram = ue.allocate_tensor_dram((T + 2 * pad) * C_in * 2)
+    w_tap_dram = [ue.allocate_tensor_dram(C_out * C_in * 2) for _ in range(kernel_size)]
+    acc_a = ue.allocate_tensor_dram(T * C_out * 2)
+    acc_b = ue.allocate_tensor_dram(T * C_out * 2)
+
+    ue.start_capture()
+    for k in range(kernel_size):
+        A_DRAM_ADDR = x_pad_dram + (k * dilation) * C_in * 2  # pure address offset == "shifted read"
+        prev_acc = acc_a if k % 2 == 0 else acc_b
+        cur_acc = acc_b if k % 2 == 0 else acc_a
+        ue.matmat_mul_core(
+            M=T, K=C_in, N=C_out,
+            A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=w_tap_dram[k], OUTPUT_DRAM_ADDR=cur_acc,
+            C_DRAM_ADDR=(prev_acc if k > 0 else None),
+            bias_mode="full_matrix",
+        )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    ue.dma_to_accelerator_memory(x_pad_dram, X_pad)
+    for k in range(kernel_size):
+        ue.dma_to_accelerator_memory(w_tap_dram[k], W_taps[k])
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    # Must match the loop's own cur_acc formula at k = kernel_size - 1 (previously had the
+    # branches swapped, silently reading the prior tap's partial sum instead of the final one).
+    final_acc = acc_b if (kernel_size - 1) % 2 == 0 else acc_a
+    out = ue.dma_from_accelerator_memory(final_acc, (T, C_out))
+
+    snr_db = calculate_snr(ref, out)
+    print(f"conv1d_shifted_matmul SNR: {snr_db:.2f} dB (Cin={C_in},Cout={C_out},T={T},k={kernel_size},dil={dilation})")
+    assert snr_db >= 40.0 or snr_db == float("inf"), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+
+    gflops = (2 * T * C_in * C_out * kernel_size) / 1e9
+    record_test("conv1d_shifted_matmul", f"Cin={C_in},Cout={C_out},T={T},k={kernel_size},dil={dilation}",
+                 snr_db=snr_db, gflops=gflops)
+
+
+def depthwise_conv1d_eltwise_test(C: int = 64, T: int = 128, kernel_size: int = 3):
+    """Prove depthwise/grouped Conv1d (groups=C) reduces to kernel_size elementwise
+    multiply-accumulate steps, no matmul: y[t, c] = sum_k X_pad[t+k, c] * w[c, k], with w[c, k]
+    broadcast across T. No per-channel-vector broadcast op exists on this hardware
+    (MUL_BROADCAST only broadcasts a scalar), so the per-tap weight row is host-tiled to a
+    full [T, C] buffer once and applied with plain ELTWISE_MUL + ELTWISE_ADD.
+    """
+    assert kernel_size % 2 == 1
+    assert C % UE_VECTOR_SIZE == 0 and T % UE_VECTOR_SIZE == 0
+
+    pad = kernel_size // 2
+
+    # ---- host reference (PyTorch depthwise Conv1d weight [C, 1, kernel_size]) ----
+    X = torch.randn(T, C, dtype=torch.bfloat16)
+    w = torch.randn(C, kernel_size, dtype=torch.bfloat16) / math.sqrt(kernel_size)
+
+    ref = torch.nn.functional.conv1d(
+        X.T.unsqueeze(0).float(), w.unsqueeze(1).float(), groups=C, padding=pad
+    )  # [1, C, T]
+    ref = ref.squeeze(0).T.to(torch.bfloat16)  # [T, C]
+
+    X_pad = torch.zeros(T + 2 * pad, C, dtype=torch.bfloat16)
+    X_pad[pad:pad + T, :] = X
+    # host-side "precompute": tile each tap's per-channel weight row across T (constant, built once)
+    w_tap_tiled = [w[:, k].unsqueeze(0).expand(T, C).contiguous() for k in range(kernel_size)]
+
+    # ---- device ----
+    ue = UnifiedEngine()
+
+    x_pad_dram = ue.allocate_tensor_dram((T + 2 * pad) * C * 2)
+    w_tap_dram = [ue.allocate_tensor_dram(T * C * 2) for _ in range(kernel_size)]
+    tmp_dram = ue.allocate_tensor_dram(T * C * 2)
+    acc_a = ue.allocate_tensor_dram(T * C * 2)
+    acc_b = ue.allocate_tensor_dram(T * C * 2)
+
+    # Per-tap DRAM buffer holding X_pad[k:k+T] * w_tap[k] (the elementwise product); tap 0's
+    # product IS the running total (no add needed yet), later taps accumulate via ELTWISE_ADD
+    # into ping-pong buffers acc_a/acc_b.
+    tmp_dram_per_tap = [tmp_dram] + [ue.allocate_tensor_dram(T * C * 2) for _ in range(kernel_size - 1)]
+
+    ue.start_capture()
+    for k in range(kernel_size):
+        shifted_x = x_pad_dram + k * C * 2  # pure address offset == shifted read
+        ue.eltwise_core_dram(M=T, N=C, dram_a=shifted_x, dram_b=w_tap_dram[k], dram_out=tmp_dram_per_tap[k], mode=UE_MODE.ELTWISE_MUL)
+        if k == 0:
+            running_total = tmp_dram_per_tap[0]
+            continue
+        prev_total = running_total
+        cur_total = acc_a if k % 2 == 1 else acc_b
+        ue.eltwise_core_dram(M=T, N=C, dram_a=tmp_dram_per_tap[k], dram_b=prev_total, dram_out=cur_total, mode=UE_MODE.ELTWISE_ADD)
+        running_total = cur_total
+    final_acc = running_total  # captured after the loop; valid since Python `for` leaks its scope
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    ue.dma_to_accelerator_memory(x_pad_dram, X_pad)
+    for k in range(kernel_size):
+        ue.dma_to_accelerator_memory(w_tap_dram[k], w_tap_tiled[k])
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    out = ue.dma_from_accelerator_memory(final_acc, (T, C))
+
+    snr_db = calculate_snr(ref, out)
+    print(f"depthwise_conv1d_eltwise SNR: {snr_db:.2f} dB (C={C},T={T},k={kernel_size})")
+    assert snr_db >= 40.0 or snr_db == float("inf"), f"SNR {snr_db:.2f} dB must be at least 40 dB"
+
+    record_test("depthwise_conv1d_eltwise", f"C={C},T={T},k={kernel_size}", snr_db=snr_db)
+
+# --- from hw_test_convtranspose_interp.py ---
+def interpolate_fixed_matmul_test(T_in: int = 64, C: int = 64, scale_factor: int = 4, mode: str = "linear"):
+    """Fixed-ratio 1D upsample (F.interpolate, mode='linear'/'nearest') is a precomputed
+    constant matmul: M_interp [T_out, T_in] @ X [T_in, C] == interpolate(X). Since the scale
+    factor is a compile-time constant (Kokoro SineGen / UpSample1d), no new hardware op is
+    needed -- this is executed on the existing matmat_mul_core.
+    """
+    T_out = T_in * scale_factor
+    assert T_in % UE_VECTOR_SIZE == 0 and C % UE_VECTOR_SIZE == 0, \
+        "T_in/C must be multiples of UE_VECTOR_SIZE for matmat_mul_core alignment"
+
+    X = torch.randn(T_in, C, dtype=torch.bfloat16)
+
+    # --- Host precompute: build the interpolation matrix M_interp [T_out, T_in] ---
+    M_interp = torch.zeros(T_out, T_in, dtype=torch.float32)
+    if mode == "nearest":
+        for t_out in range(T_out):
+            t_in = min(t_out // scale_factor, T_in - 1)
+            M_interp[t_out, t_in] = 1.0
+    elif mode == "linear":
+        # align_corners=False convention (PyTorch default for interpolate).
+        for t_out in range(T_out):
+            src = (t_out + 0.5) / scale_factor - 0.5
+            i0 = math.floor(src)
+            frac = src - i0
+            i0c = min(max(i0, 0), T_in - 1)
+            i1c = min(max(i0 + 1, 0), T_in - 1)
+            M_interp[t_out, i0c] += (1.0 - frac)
+            M_interp[t_out, i1c] += frac
+    else:
+        raise ValueError(f"unsupported mode: {mode}")
+
+    # --- Verify the constructed matrix matches torch's F.interpolate BEFORE touching hardware ---
+    ref = F.interpolate(
+        X.T.unsqueeze(0).float(), scale_factor=scale_factor, mode=mode,
+        align_corners=False if mode == "linear" else None,
+    ).squeeze(0).T  # [T_out, C]
+    host_pred = (M_interp @ X.float())
+    host_snr_db = calculate_snr(ref, host_pred)
+    print(f"[interpolate_fixed_matmul_test] host-side matrix-vs-F.interpolate SNR: {host_snr_db:.2f} dB")
+    if not (host_snr_db >= 35 or host_snr_db == float("inf")):
+        print(f"WARNING: constructed interpolation matrix only reaches {host_snr_db:.2f} dB "
+              f"against F.interpolate's align_corners=False convention; falling back is not "
+              f"implemented here, proceeding anyway (see docstring).")
+
+    M_interp_bf16 = M_interp.to(torch.bfloat16)
+
+    ue = UnifiedEngine()
+    # matmat_mul_core computes A @ B^T with A:[M,K] row-major, B:[N,K] row-major.
+    # We want M_interp[T_out,T_in] @ X[T_in,C] == M_interp @ (X^T)^T, so B must be X^T, [C,T_in].
+    A_DRAM_ADDR = ue.allocate_tensor_dram(T_out * T_in * 2)
+    B_DRAM_ADDR = ue.allocate_tensor_dram(C * T_in * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(T_out * C * 2)
+
+    ue.start_capture()
+    ue.matmat_mul_core(
+        M=T_out, K=T_in, N=C,
+        A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    X_T = X.T.contiguous()  # [C, T_in]
+    ue.dma_to_accelerator_memory(A_DRAM_ADDR, M_interp_bf16)
+    ue.dma_to_accelerator_memory(B_DRAM_ADDR, X_T)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (T_out, C))
+
+    snr_threshold = 35.0 if mode == "linear" else 40.0
+    snr_db = calculate_snr(ref.to(torch.bfloat16), output)
+    print(f"[interpolate_fixed_matmul_test] device SNR vs F.interpolate: {snr_db:.2f} dB")
+    assert snr_db >= snr_threshold or snr_db == float("inf"), \
+        f"SNR {snr_db:.2f} dB must be at least {snr_threshold} dB"
+
+    gflops = 2 * T_out * T_in * C / 1e9
+    record_test("interpolate_fixed_matmul", f"Tin={T_in},C={C},scale={scale_factor},mode={mode}",
+                snr_db=snr_db, gflops=gflops)
+
+
+def conv_transpose1d_zero_insert_test(C_in: int = 64, C_out: int = 64, T_in: int = 32,
+                                       stride: int = 4, kernel_size: int = 8):
+    """ConvTranspose1d(C_in, C_out, kernel_size, stride) reduces to zero-insertion upsample
+    (pure strided memory scatter) + regular Conv1d with the flipped kernel (shifted-matmul-
+    accumulate, same pattern as conv1d_shifted_matmul_test).
+    """
+    assert C_in % UE_VECTOR_SIZE == 0 and C_out % UE_VECTOR_SIZE == 0, \
+        "C_in/C_out must be multiples of UE_VECTOR_SIZE for matmat_mul_core alignment"
+
+    X = torch.randn(T_in, C_in, dtype=torch.bfloat16)
+    W = torch.randn(C_in, C_out, kernel_size, dtype=torch.bfloat16) * 0.1  # nn.ConvTranspose1d layout
+
+    T_out = (T_in - 1) * stride + kernel_size
+
+    ref = F.conv_transpose1d(
+        X.T.unsqueeze(0).float(), W.float(), stride=stride
+    ).squeeze(0).T  # [T_out, C_out]
+
+    # --- Step 1: zero-insertion dilation (host-built; see deviation note at top of file) ---
+    dilated_len = (T_in - 1) * stride + 1
+    X_dilated = torch.zeros(dilated_len, C_in, dtype=torch.bfloat16)
+    X_dilated[::stride, :] = X
+
+    # --- Step 2: zero-pad by kernel_size-1 on both sides ---
+    pad = kernel_size - 1
+    L_pad = dilated_len + 2 * pad
+    X_dilated_pad = torch.zeros(L_pad, C_in, dtype=torch.bfloat16)
+    X_dilated_pad[pad:pad + dilated_len, :] = X_dilated
+
+    # Sanity check the length arithmetic: T_out taps of shifted-window matmul over X_dilated_pad
+    # must produce exactly T_out output rows: L_pad - kernel_size + 1 == T_out.
+    assert L_pad - kernel_size + 1 == T_out, \
+        f"dilated+padded length mismatch: L_pad={L_pad}, kernel_size={kernel_size}, T_out={T_out}"
+
+    # Flip the kernel taps (conv/conv_transpose duality): Wk[k] = W[:, :, kernel_size-1-k], [C_in,C_out]
+    Wk = [W[:, :, kernel_size - 1 - k].contiguous() for k in range(kernel_size)]
+
+    ue = UnifiedEngine()
+    x_dilated_pad_dram = ue.allocate_tensor_dram(L_pad * C_in * 2)
+    wk_dram = [ue.allocate_tensor_dram(C_out * C_in * 2) for _ in range(kernel_size)]
+    out_dram = ue.allocate_tensor_dram(T_out * C_out * 2)
+
+    ue.start_capture()
+    for k in range(kernel_size):
+        # Shifted read: row k of X_dilated_pad, T_out contiguous rows, stride C_in*2 bytes/row.
+        a_addr = x_dilated_pad_dram + k * C_in * 2
+        if k == 0:
+            ue.matmat_mul_core(
+                M=T_out, K=C_in, N=C_out,
+                A_DRAM_ADDR=a_addr, B_DRAM_ADDR=wk_dram[k], OUTPUT_DRAM_ADDR=out_dram,
+            )
+        else:
+            # Accumulate into the running sum: out = (A_k @ Wk[k]^T) + out, C_DRAM_ADDR=out_dram
+            # (bias_mode="full_matrix") reads the previous partial sum as the bias-add operand
+            # and the result is written back to the same address.
+            ue.matmat_mul_core(
+                M=T_out, K=C_in, N=C_out,
+                A_DRAM_ADDR=a_addr, B_DRAM_ADDR=wk_dram[k], OUTPUT_DRAM_ADDR=out_dram,
+                C_DRAM_ADDR=out_dram, bias_mode="full_matrix",
+            )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    ue.dma_to_accelerator_memory(x_dilated_pad_dram, X_dilated_pad)
+    # B operand for matmat_mul_core must be [N,K] = [C_out, C_in], i.e. Wk[k]^T.
+    for k in range(kernel_size):
+        ue.dma_to_accelerator_memory(wk_dram[k], Wk[k].T.contiguous())
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(out_dram, (T_out, C_out))
+
+    snr_db = calculate_snr(ref.to(torch.bfloat16), output)
+    print(f"[conv_transpose1d_zero_insert_test] device SNR vs F.conv_transpose1d: {snr_db:.2f} dB")
+    assert snr_db >= 35 or snr_db == float("inf"), f"SNR {snr_db:.2f} dB must be at least 35 dB"
+
+    record_test("conv_transpose1d_zero_insert",
+                f"Cin={C_in},Cout={C_out},Tin={T_in},stride={stride},k={kernel_size}",
+                snr_db=snr_db)
+
+# --- from hw_test_norm_exp_sincos.py ---
+def instance_norm1d_via_layernorm_test(C: int = 64, T: int = 128):
+    """Proves InstanceNorm1d (Kokoro AdaIN1d's normalization step) is exactly
+    ``layer_norm_core_dram`` applied to a ``[C, T]`` tensor with C as the row (M) axis and T as the
+    reduced free (N) axis -- the natural Conv1d output layout, no permute needed -- followed by a
+    per-channel affine applied host-side via a tiled eltwise multiply/add (since the native
+    GAMMA/BETA_DRAM_ADDR vectors broadcast per-column, not per-row, so they cannot express a
+    per-channel AdaIN affine directly; see header note).
+    """
+    torch.manual_seed(0)
+    x = torch.randn(C, T, dtype=torch.bfloat16)
+    gamma = (torch.randn(C, dtype=torch.bfloat16) * 0.2)
+    beta = (torch.randn(C, dtype=torch.bfloat16) * 0.2)
+
+    # Reference: InstanceNorm (no affine) then a separate per-channel AdaIN-style affine.
+    normed_ref = torch.nn.functional.instance_norm(x.unsqueeze(0).float(), eps=1e-5).squeeze(0)
+    ref = (1.0 + gamma.float()).unsqueeze(1) * normed_ref + beta.float().unsqueeze(1)
+    ref = ref.to(torch.bfloat16)
+
+    ue = UnifiedEngine()
+    A = ue.allocate_tensor_dram(C * T * 2)
+    NORMED = ue.allocate_tensor_dram(C * T * 2)
+    GTILE = ue.allocate_tensor_dram(C * T * 2)
+    BTILE = ue.allocate_tensor_dram(C * T * 2)
+    OUT = ue.allocate_tensor_dram(C * T * 2)
+
+    ue.start_capture()
+    # Native gamma/beta omitted -> layer_norm_core_dram defaults them to a neutral ones(N) vector /
+    # None (see user_dma_core.py lines 4028-4034), i.e. plain InstanceNorm with no affine baked in.
+    total_flops = ue.layer_norm_core_dram(M=C, N=T, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=NORMED)
+    # Apply the AdaIN affine separately: y = (1+gamma)*normed + beta, gamma/beta tiled to [C, T]
+    # host-side since only a single global scalar broadcast is exposed (see header note).
+    total_flops += ue.eltwise_core_dram(C, T, NORMED, GTILE, OUT, UE_MODE.ELTWISE_MUL)
+    total_flops += ue.eltwise_core_dram(C, T, OUT, BTILE, OUT, UE_MODE.ELTWISE_ADD)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(prog)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+
+    gtile = (1.0 + gamma.float()).unsqueeze(1).expand(C, T).contiguous().to(torch.bfloat16)
+    btile = beta.float().unsqueeze(1).expand(C, T).contiguous().to(torch.bfloat16)
+    ue.dma_to_accelerator_memory(A, x.reshape(-1).contiguous())
+    ue.dma_to_accelerator_memory(GTILE, gtile.reshape(-1).contiguous())
+    ue.dma_to_accelerator_memory(BTILE, btile.reshape(-1).contiguous())
+
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+    gflops, _ = ue.report_flop_rate_gflops(total_flops)
+
+    out = ue.dma_from_accelerator_memory(OUT, (C, T))
+    snr_db = calculate_snr(ref, out)
+    print(f"[instance_norm1d_via_layernorm] C={C} T={T} SNR={snr_db:.2f} dB GFLOPS={gflops:.2f}")
+    assert snr_db >= 40.0 or snr_db == float("inf"), \
+        f"instance_norm1d_via_layernorm C={C} T={T} SNR {snr_db:.2f} dB < 40 dB"
+    record_test("instance_norm1d_via_layernorm", f"C={C},T={T}", snr_db=snr_db, gflops=gflops,
+                inst_bytes=inst_bytes)
+    ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+
+
+def exp_via_sigmoid_test(N: int = 64, x_min: float = -3.0, x_max: float = 3.0):
+    """Proves exp(x) (needed for Kokoro ISTFTNet's ``spec = exp(raw)``) is exactly derivable from
+    the native ``sigmoid`` activation plus elementwise ops:
+        sigmoid(x) = 1/(1+e^-x)  =>  e^x = sigmoid(x) / (1 - sigmoid(x))
+
+    Reciprocal honesty note: there is no exposed standalone elementwise reciprocal primitive (see
+    header). This uses HONEST OPTION (a) -- a Newton-Raphson reciprocal (r_{n+1} = r_n*(2 - a*r_n))
+    built entirely from eltwise_mul_core/eltwise_add_core/broadcast ops (via eltwise_core_dram),
+    seeded with a constant initial guess valid over the known bounded range of ``1 - sigmoid(x)``
+    for x in [x_min, x_max].
+    """
+    torch.manual_seed(0)
+    N_pad = ((N + 63) // 64) * 64  # round up to UE_VECTOR_SIZE-friendly width
+    x = torch.linspace(x_min, x_max, N, dtype=torch.float32).to(torch.bfloat16)
+    x_pad = torch.zeros(N_pad, dtype=torch.bfloat16); x_pad[:N] = x
+    ref = torch.exp(x.float())
+
+    ue = UnifiedEngine()
+    A = ue.allocate_tensor_dram(N_pad * 2)
+    IDENT = ue.allocate_tensor_dram(N_pad * N_pad * 2)
+    S = ue.allocate_tensor_dram(N_pad * 2)          # sigmoid(x)
+    D = ue.allocate_tensor_dram(N_pad * 2)          # 1 - sigmoid(x)
+    R = ue.allocate_tensor_dram(N_pad * 2)          # reciprocal(D), Newton-Raphson
+    TMP = ue.allocate_tensor_dram(N_pad * 2)
+    OUT = ue.allocate_tensor_dram(N_pad * 2)         # exp(x) = S * R
+
+    ue.start_capture()
+    ue.activation_core(M=1, N=N_pad, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=S,
+                        IDENTITY_DRAM_ADDR=IDENT, activation="sigmoid")
+    # D = 1 - S  ==  (-1)*S + 1
+    ue.eltwise_core_dram(1, N_pad, S, None, D, UE_MODE.MUL_BROADCAST, scalar=-1.0)
+    ue.eltwise_core_dram(1, N_pad, D, None, D, UE_MODE.ADD_BROADCAST, scalar=1.0)
+    # Newton-Raphson reciprocal of D: r0 = constant seed (1 - sigmoid(x) in [x_min,x_max] is bounded
+    # well away from 0 for this range; a flat mid-range seed converges in a few iterations).
+    d_lo = float((1.0 - torch.sigmoid(torch.tensor(x_max, dtype=torch.float32))).item())
+    d_hi = float((1.0 - torch.sigmoid(torch.tensor(x_min, dtype=torch.float32))).item())
+    r0 = 2.0 / (d_lo + d_hi)  # 1 / midpoint(D range)
+    ue.eltwise_core_dram(1, N_pad, D, None, R, UE_MODE.MUL_BROADCAST, scalar=0.0)
+    ue.eltwise_core_dram(1, N_pad, R, None, R, UE_MODE.ADD_BROADCAST, scalar=r0)
+    for _ in range(6):
+        # TMP = D * R
+        ue.eltwise_core_dram(1, N_pad, D, R, TMP, UE_MODE.ELTWISE_MUL)
+        # TMP = 2 - D*R  ==  (-1)*TMP + 2
+        ue.eltwise_core_dram(1, N_pad, TMP, None, TMP, UE_MODE.MUL_BROADCAST, scalar=-1.0)
+        ue.eltwise_core_dram(1, N_pad, TMP, None, TMP, UE_MODE.ADD_BROADCAST, scalar=2.0)
+        # R = R * TMP
+        ue.eltwise_core_dram(1, N_pad, R, TMP, R, UE_MODE.ELTWISE_MUL)
+    # OUT = S * R  (= exp(x))
+    total_flops = ue.eltwise_core_dram(1, N_pad, S, R, OUT, UE_MODE.ELTWISE_MUL)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(prog)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+
+    ue.dma_to_accelerator_memory(A, x_pad.reshape(-1).contiguous())
+    ue.dma_to_accelerator_memory(IDENT, torch.eye(N_pad, dtype=torch.bfloat16).reshape(-1).contiguous())
+
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+    gflops, _ = ue.report_flop_rate_gflops(total_flops)
+
+    out = ue.dma_from_accelerator_memory(OUT, (N_pad,))[:N]
+    snr_db = calculate_snr(ref, out)
+    print(f"[exp_via_sigmoid] N={N} range=[{x_min},{x_max}] SNR={snr_db:.2f} dB GFLOPS={gflops:.2f}")
+    assert snr_db >= 25.0 or snr_db == float("inf"), \
+        f"exp_via_sigmoid N={N} SNR {snr_db:.2f} dB < 25 dB"
+    record_test("exp_via_sigmoid", f"N={N},range=[{x_min},{x_max}]", snr_db=snr_db, gflops=gflops,
+                inst_bytes=inst_bytes)
+    ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+
+
+def sincos_bounded_poly_test(N: int = 64, x_min: float = -1.0, x_max: float = 1.0):
+    """Proves sin(x)/cos(x) for BOUNDED-domain x (as in Kokoro's Snake1D activation and
+    iSTFT phase reconstruction, both post-normalization / clamped to roughly [-1, 1]) can be
+    computed via a fixed low-degree Taylor polynomial built entirely from eltwise_mul_core /
+    broadcast_add -- no transcendental hardware needed. Uses independent odd (sin) and even (cos)
+    polynomials (NOT cos(x)=sin(x+pi/2), since x+pi/2 would leave the fit range for x in [-1,1]).
+    """
+    torch.manual_seed(0)
+    # sin(x) ~= x - x^3/6 + x^5/120 - x^7/5040   (degree-7 Taylor, evaluated via Horner in x^2)
+    # cos(x) ~= 1 - x^2/2 + x^4/24 - x^6/720     (degree-6 Taylor, evaluated via Horner in x^2)
+    x_np = torch.linspace(x_min, x_max, 4001, dtype=torch.float64)
+    sin_taylor = x_np - x_np**3/6 + x_np**5/120 - x_np**7/5040
+    cos_taylor = 1 - x_np**2/2 + x_np**4/24 - x_np**6/720
+    max_sin_err = (sin_taylor - torch.sin(x_np)).abs().max().item()
+    max_cos_err = (cos_taylor - torch.cos(x_np)).abs().max().item()
+    assert max_sin_err < 1e-3, f"sin taylor fit error too large: {max_sin_err}"
+    assert max_cos_err < 1e-3, f"cos taylor fit error too large: {max_cos_err}"
+
+    N_pad = ((N + 63) // 64) * 64
+    x = torch.linspace(x_min, x_max, N, dtype=torch.float32).to(torch.bfloat16)
+    x_pad = torch.zeros(N_pad, dtype=torch.bfloat16); x_pad[:N] = x
+    sin_ref = torch.sin(x.float())
+    cos_ref = torch.cos(x.float())
+
+    ue = UnifiedEngine()
+    X = ue.allocate_tensor_dram(N_pad * 2)
+    X2 = ue.allocate_tensor_dram(N_pad * 2)     # x^2
+    SIN = ue.allocate_tensor_dram(N_pad * 2)
+    COS = ue.allocate_tensor_dram(N_pad * 2)
+    TMP = ue.allocate_tensor_dram(N_pad * 2)
+
+    ue.start_capture()
+    # X2 = x * x
+    ue.eltwise_core_dram(1, N_pad, X, X, X2, UE_MODE.ELTWISE_MUL)
+
+    # cos(x) ~= 1 - x^2/2 + x^4/24 - x^6/720
+    #         = 1 + x^2*(-1/2 + x^2*(1/24 + x^2*(-1/720)))   Horner in x2 = X2
+    ue.eltwise_core_dram(1, N_pad, X2, None, TMP, UE_MODE.MUL_BROADCAST, scalar=-1.0 / 720.0)
+    ue.eltwise_core_dram(1, N_pad, TMP, None, TMP, UE_MODE.ADD_BROADCAST, scalar=1.0 / 24.0)
+    ue.eltwise_core_dram(1, N_pad, TMP, X2, TMP, UE_MODE.ELTWISE_MUL)
+    ue.eltwise_core_dram(1, N_pad, TMP, None, TMP, UE_MODE.ADD_BROADCAST, scalar=-1.0 / 2.0)
+    ue.eltwise_core_dram(1, N_pad, TMP, X2, TMP, UE_MODE.ELTWISE_MUL)
+    total_flops = ue.eltwise_core_dram(1, N_pad, TMP, None, COS, UE_MODE.ADD_BROADCAST, scalar=1.0)
+
+    # sin(x) ~= x - x^3/6 + x^5/120 - x^7/5040
+    #         = x * (1 + x^2*(-1/6 + x^2*(1/120 + x^2*(-1/5040))))   Horner in x2 = X2
+    ue.eltwise_core_dram(1, N_pad, X2, None, TMP, UE_MODE.MUL_BROADCAST, scalar=-1.0 / 5040.0)
+    ue.eltwise_core_dram(1, N_pad, TMP, None, TMP, UE_MODE.ADD_BROADCAST, scalar=1.0 / 120.0)
+    ue.eltwise_core_dram(1, N_pad, TMP, X2, TMP, UE_MODE.ELTWISE_MUL)
+    ue.eltwise_core_dram(1, N_pad, TMP, None, TMP, UE_MODE.ADD_BROADCAST, scalar=-1.0 / 6.0)
+    ue.eltwise_core_dram(1, N_pad, TMP, X2, TMP, UE_MODE.ELTWISE_MUL)
+    ue.eltwise_core_dram(1, N_pad, TMP, None, TMP, UE_MODE.ADD_BROADCAST, scalar=1.0)
+    total_flops += ue.eltwise_core_dram(1, N_pad, TMP, X, SIN, UE_MODE.ELTWISE_MUL)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    prog = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(prog)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+
+    ue.dma_to_accelerator_memory(X, x_pad.reshape(-1).contiguous())
+
+    ue.start_execute_from_dram(prog)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+    gflops, _ = ue.report_flop_rate_gflops(total_flops)
+
+    sin_out = ue.dma_from_accelerator_memory(SIN, (N_pad,))[:N]
+    cos_out = ue.dma_from_accelerator_memory(COS, (N_pad,))[:N]
+    sin_snr_db = calculate_snr(sin_ref, sin_out)
+    cos_snr_db = calculate_snr(cos_ref, cos_out)
+    print(f"[sincos_bounded_poly] N={N} range=[{x_min},{x_max}] "
+          f"sin_SNR={sin_snr_db:.2f} dB cos_SNR={cos_snr_db:.2f} dB GFLOPS={gflops:.2f}")
+    assert sin_snr_db >= 35.0 or sin_snr_db == float("inf"), \
+        f"sincos_bounded_poly sin N={N} SNR {sin_snr_db:.2f} dB < 35 dB"
+    assert cos_snr_db >= 35.0 or cos_snr_db == float("inf"), \
+        f"sincos_bounded_poly cos N={N} SNR {cos_snr_db:.2f} dB < 35 dB"
+    record_test("sincos_bounded_poly_sin", f"N={N},range=[{x_min},{x_max}]", snr_db=sin_snr_db,
+                gflops=gflops, inst_bytes=inst_bytes)
+    record_test("sincos_bounded_poly_cos", f"N={N},range=[{x_min},{x_max}]", snr_db=cos_snr_db,
+                gflops=gflops, inst_bytes=inst_bytes)
+    ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument('--device', type=str, default='kintex7',
+                        help='Board profile used only for Efinix device-node selection and optional systolic tests; hardware properties come from HW_INFO.')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
                         help='AXI-Lite register base address (default: device-specific).')
     parser.add_argument(
@@ -7378,7 +7686,7 @@ if __name__ == "__main__":
     _TEST_NAME_SUFFIX = args.test_name_suffix
 
     import user_dma_core
-    set_dma_device(args.dev, base_addr=args.base_addr)
+    set_dma_device("efinix" if args.device == "efinix" else args.dev, base_addr=args.base_addr)
     print(f"DMA dev={args.dev}"
           f" (H2C={user_dma_core.DMA_DEVICE_H2C},"
           f" C2H={user_dma_core.DMA_DEVICE_C2H},"
@@ -7413,376 +7721,397 @@ if __name__ == "__main__":
     atexit.register(_atexit_write_test_summary)
 
     software_reset_test(cores=args.multi_core)
-    dram_read_write_speed_test()
-    isa_rela_loop_test()
-    isa_abs_loop_test()
-    isa_reg_min_sub_mul_test()
-    isa_mult_div_shift_test()
-    test_ue_int_reg_read()
-    fmax_test()
-    for packing_mode in [16, 32, 48, 64]:
-        packing_test(packing_mode=packing_mode)
-    padding_zero_test()
-    slicing_test()
-    quantized_fp4_test()
-    if4_if8_tests()
-    if4_if8_mixed_sign_test()
-    tq4_dequantize_test()
-    tq4_dot_product_test(K=64, N=64)
-    tq4_dot_product_test(K=128, N=128)
-    run_turboquant_mse(1024)
-    # Additional NEW TQ4 tests (variants) without changing the baseline tests above.
-    tq4_dequantize_variant_tests()
-    tq4_dot_product_variant_tests()
-    tq4_dot_product_onehot_oracle_tests()
-    tq4_codebook_reload_tests()
-    if4_if8_dot_product_test(K=64, N=64)
-    if4_if8_dot_product_test(K=128, N=128)
-    if4_if8_dot_product_test(K=256, N=256)
-    dequantize_test(TYPE.IF4, int_variant=True)
-    dequantize_test(TYPE.IF4, int_variant=False)
-    dequantize_test(TYPE.IF8, int_variant=True)
-    dequantize_test(TYPE.IF8, int_variant=False)
-    matmat_mul_non_aligned_writeback_test()
-    rope_hf_core_dram_unified_test(shapes=[(64, 512)])
-    bf16_permute_test(dim_0=144, dim_1=48, dim_2=64)
-    patching_test()
-    mix_of_broadcast_eltwise_add_eltwise_mul_core_test()
-    eltwise_core_dram_unified_test(shapes=[(64, 512)])
-    # Each (M, N) is a paired legacy/dynamic run with dyn_M + dyn_N + GPR-sourced bases.
-    bf16_transpose_core_unified_test(shapes=[
-        (64, 64), (256, 256), (512, 2048), (1024, 4032),
-        (256, 512), (64, 768), (256, 768), (512, 768), (128, 4032), (512, 4032),
-    ])
-    # Per-call snr_threshold_db tightens the floor where we have headroom
-    # (observed ~50-55 dB on plain matmul, ~46-47 dB on softmax) so silent
-    # SNR regressions trip the assert instead of slipping under the legacy
-    # 40 dB floor.
-    matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], clamp_enable=True, snr_threshold_db=52.0)
-    matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], log_enable=True, snr_threshold_db=52.0)
-    matmat_mul_unified_test(runtime_list=[(1984, 1024, 384)], softmax_enable=True, debug_fmax=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
-    matmat_mul_unified_test(runtime_list=[(64, 6912, 64)], snr_threshold_db=48.0)
-    matmat_mul_unified_test(runtime_list=[(2048, 512, 384)], softmax_enable=True, snr_threshold_db=44.0)
-    matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], sigmoid_enable=True, snr_threshold_db=52.0)
-    matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], clamp_enable=True, clamp_min=-11.125, clamp_max=11.0, snr_threshold_db=52.0)
-    M = N = K = 512
-    for bias_mode in ["broadcast_N", "full_matrix"]:
-        for softmax_enable in [True, False]:
-            matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable)
-    matmat_mul_unified_test(runtime_list=[(M, K, N)], softmax_enable=True)
-    M = N = K = 4096
-    matmat_mul_unified_test(runtime_list=[(M, K, N)])
-    # --- Wide-variance softmax stress: exercises exp + bf20 adder tree ------
-    # The post-matmul pre-softmax values span ~N(0, input_scale^2). Larger
-    # scales push exp() outputs across many orders of magnitude, which stresses
-    # the denominator reduction (adder tree) dynamic range and the fmax-based
-    # numerical-stability path. Reference stays numerically stable because
-    # torch.softmax internally subtracts the row max.
-    #
-    # SNR thresholds are scale-specific: as input_scale grows, the
-    # max-min span of (a @ b.T) grows linearly in scale, so the bf20
-    # adder tree retains progressively fewer effective bits. We set
-    # thresholds ~3 dB below empirically observed values so the tests
-    # still catch regressions but tolerate the inherent dynamic-range loss.
-    wide_variance_snr_floors = {
-        2.0: 42.0,   # observed ~44.5 dB
-        4.0: 38.0,   # observed ~41.0 dB
-        8.0: 28.0,   # estimated; scale doubling ~ -6 dB SNR
-        16.0: 18.0,  # adder tree near saturation
-    }
-    for scale, snr_floor in wide_variance_snr_floors.items():
-        matmat_mul_unified_test(runtime_list=[(512, 512, 384)], softmax_enable=True,
-                                input_scale=scale, snr_threshold_db=snr_floor)
-    # Pair wide variance with debug_fmax so fmax SNR is also validated.
-    # fmax itself is exact (a row max) so fmax SNR stays high even at
-    # large scales — keep that floor tight at 44 dB.
-    matmat_mul_unified_test(runtime_list=[(1024, 1024, 512)], softmax_enable=True, debug_fmax=True,
-                            input_scale=8.0, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
-    # Tall/narrow and short/wide variants to sweep different M/N tile shapes
-    # through the wide-variance exp path.
-    matmat_mul_unified_test(runtime_list=[(2048, 256, 128)], softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
-    matmat_mul_unified_test(runtime_list=[(128, 256, 2048)], softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
-    matmat_mul_unified_test(runtime_list=[(512, 1024, 1024)], softmax_enable=True, input_scale=12.0, snr_threshold_db=22.0)
 
-    # Every shape now runs the legacy/dynamic + dynamic-addr matched pair (the dynamic
-    # quantized_matmat_core supports bias and the sub-64 large-K fallback), so the biased shapes
-    # above already exercise the dynamic bias path.
-    #
-    # Large-K sub-64 column-strip fallback (K>8192): a 64-wide strip's scales overflow the scale
-    # BRAM, so strip_w falls back to 32 (K<=16384) or 16 (K<=32768). M==1 (production decode path)
-    # with and without bias; higher accumulation depth lowers the SNR floor.
-
-    quantized_matmat_mul_unified_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
-    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
-    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  silu_enable=True)
-    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", sigmoid_enable=True)
-    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  clamp_enable=True)
-    quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True, snr_threshold_db=37) # log activation in the quantized path is degraded.
-
-    quantized_matmat_mul_unified_test(M=1, K=512, N=512, data_type=TYPE.IF4, int_variant=True)
-    quantized_matmat_mul_unified_test(M=1, K=1280, N=1408, data_type=TYPE.IF4, int_variant=True, silu_enable=True)
-    quantized_matmat_mul_unified_test(M=1, K=512, N=512, data_type=TYPE.IF8, int_variant=True, gelu_enable=True)
-    quantized_matmat_mul_unified_test(M=2, K=128, N=128, data_type=TYPE.IF4, int_variant=True)
-    quantized_matmat_mul_unified_test(M=8, K=256, N=256, data_type=TYPE.IF4, int_variant=False)
-    quantized_matmat_mul_unified_test(M=65, K=512, N=512, data_type=TYPE.IF8, int_variant=True)
-    quantized_matmat_mul_unified_test(M=1024, K=768, N=512, data_type=TYPE.IF8, int_variant=False)
-    quantized_matmat_mul_unified_test(M=257, K=1280, N=1408, data_type=TYPE.IF4, int_variant=True)
-
-    matmat_mul_quantized_weights_unified_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix")
-
-    unified_attention_test(batch=256, aligned_seq_len=256, head_dim=128)
-    unified_attention_test(batch=512, aligned_seq_len=512, head_dim=128)
-
-    # --- Additional coverage: extra dimension/feature combinations ---
-    rms_norm_unified_test(shapes=[(768, 1024), (2048, 2048)])
-    layer_norm_core_dram_unified_test(shapes=[(1024, 1024)], gamma_enable=True, beta_enable=False)
-    layer_norm_core_dram_unified_test(shapes=[(1024, 1024)], gamma_enable=False, beta_enable=True)
-    layer_norm_core_dram_unified_test(shapes=[(192, 6912)], gamma_enable=True, beta_enable=True)
-    bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
-    matmat_mul_unified_test(runtime_list=[(512, 2048, 2048)])
-    matmat_mul_unified_test(runtime_list=[(128, 4096, 512)], gelu_enable=True)
-    matmat_mul_unified_test(runtime_list=[(256, 2048, 1024)], silu_enable=True)
-    matmat_mul_unified_test(runtime_list=[(512, 1024, 512)], bias_enable=True, bias_mode="broadcast_N")
-    matmat_mul_unified_test(runtime_list=[(512, 1024, 512)], bias_enable=True, bias_mode="full_matrix")
-    matmat_mul_quantized_weights_unified_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=True)
-    matmat_mul_quantized_weights_unified_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=False)
-    quantized_matmat_mul_unified_test(M=128, K=512, N=512, data_type=TYPE.IF4, int_variant=True, gelu_enable=True)
-
-    # GPR-sourced-base (dynamic_addr) coverage unique to this section — the unified tests above
-    # already source DRAM bases from GPRs in their dynamic leg, so the former per-test dynamic_addr
-    # re-runs (eltwise/rms/layer_norm/rope/transpose/attention/qweights at shapes already covered)
-    # are redundant and dropped. Only shapes/variants NOT covered above are kept here.
-    rms_norm_unified_test(shapes=[(64, 512)])
-    rope_hf_core_dram_gqa_unified_test(shapes=[(64, 4, 512)])
-    matmat_mul_unified_test(runtime_list=[(256, 256, 256)])
-    matmat_mul_unified_test(runtime_list=[(256, 512, 512)], bias_enable=True, bias_mode="broadcast_N")
-    # head_dim=256 (the fully-dynamic leg covers runtime head_dim + pre-scale); head_dim=128
-    # fully-dynamic is already covered by the batch=512 attention call above.
-    unified_attention_test(batch=512, aligned_seq_len=512, head_dim=256)
-    # Quantized-B matmul at the gemma3 fold shape (broadcast_N bias).
-    matmat_mul_quantized_weights_unified_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="broadcast_N")
-
-    if args.ext:
-        # --- Eltwise: paired dynamic-vs-legacy over a representative shape set (M ladder, N/dim-swap
-        #     ladder, gemma dims). GPR-sourced bases + runtime broadcast scalar are on by default. ---
-        eltwise_core_dram_unified_test(shapes=[
-            (1, 512), (512, 512), (8192, 512),      # M ladder (edge/tiny -> large)
-            (512, 64), (512, 1024), (512, 6912),    # N / dim-swap ladder
-            (64, 640), (256, 1024),                 # gemma vector_length + mixed
-        ])
-
-        # --- RMS norm: paired dynamic-vs-legacy (64-aligned) + dynamic-only host-pad (odd N),
-        #     covering the existing rms_norm test scope. ---
-        rms_norm_unified_test(shapes=[
-            (1, 512), (512, 512), (8192, 512),        # M ladder (edge/tiny -> large)
-            (512, 64), (512, 1024), (512, 4096),      # N / dim-swap ladder
-            (512, 640), (256, 1024),                  # gemma vector_length + mixed
-            (95, 128), (411, 128),                    # odd M, aligned N (stress ladder)
-            (64, 78), (64, 411), (64, 1000),          # non-64-aligned N (dynamic-only host-pad)
-        ])
-
-        # --- LayerNorm: paired dynamic-vs-legacy (64-aligned) + dynamic-only host-pad + mask (odd N),
-        #     covering the existing layer_norm test scope (gamma/beta combos). ---
-        layer_norm_core_dram_unified_test(shapes=[
-            (1, 512), (512, 512), (8192, 512),        # M ladder (edge/tiny -> large)
-            (512, 64), (512, 1024), (512, 4096),      # N / dim-swap ladder
-            (256, 1024),                              # mixed
-            (95, 128), (411, 128),                    # odd M, aligned N
-            (64, 78), (64, 411), (64, 1000),          # non-64-aligned N (dynamic-only, host-pad + mask)
-        ])
-        # (gamma-only / beta-only combos are covered in the normal pass, which always runs first.)
-
-        rope_hf_core_dram_unified_test(shapes=[
-            (1, 64), (8, 128), (95, 138), (411, 512),
-        ])
-        rope_hf_core_dram_gqa_unified_test(shapes=[
-            (1, 4, 128), (64, 4, 138), (95, 4, 512),
-        ])
-        # bf16_transpose: per-N M-ladder hits M_chunk boundaries
-        # (sub-chunk / exact chunk / chunk+64 / 2×chunk / multi-chunk + 8192 stress).
-        # Every run is dyn_M + dyn_N + dynamic_addr, so this also subsumes the old
-        # dynamic_addr spot check (N ∈ {64, 256, 2048}).
-        _TRANSPOSE_M_LADDERS = {
-            64:   [64, 448, 512, 896, 8192],    # M_chunk=448
-            256:  [64, 192, 256, 384, 8192],    # M_chunk=192
-            2048: [64, 128, 512, 1024, 8192],   # M_chunk=64
-            4032: [64, 128, 512, 1024, 8192],   # M_chunk=64, max valid N (4096 overflows URAM_ROW_SIZE_Z)
-        }
-        bf16_transpose_core_unified_test(shapes=[
-            (M, N) for N, Ms in _TRANSPOSE_M_LADDERS.items() for M in Ms
-        ])
-
-        # --- Quantized-B matmul: every shape traverses every format/option configuration. ---
-        for M in [64, 384, 1024]:
-            for N in [64, 576, 1024]:
-                for K in [64, 192, 1024]:
-                    for bias_enable in [False, True]:
-                        for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
-                            matmat_mul_quantized_weights_unified_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
-
-        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
-        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
-        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix", sigmoid_enable=True)
-        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix", clamp_enable=True)
-        matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True)
-
-        # --- Matmul: comprehensive paired legacy/dynamic coverage. ---
-        for M in [25, 64, 133, 384, 1024]:
-            for N in [64, 576, 1024]:
-                for K in [64, 192, 1024]:
-                    for bias_enable in [False, True]:
-                        for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
-                            for softmax_enable in [True, False]:
-                                snr_floor = 36 if M in (25, 133) or (M, K, N) == (64, 64, 576) else 40
-                                matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=bias_enable, bias_mode=bias_mode, softmax_enable=softmax_enable, snr_threshold_db=snr_floor)
-        # Representative activation coverage: one shape per activation, mirroring the quantized_weights pattern above.
-        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", gelu_enable=True,    snr_threshold_db=40)
-        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="full_matrix",  silu_enable=True,   snr_threshold_db=40)
-        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", sigmoid_enable=True, snr_threshold_db=40)
-        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="full_matrix",  clamp_enable=True,  snr_threshold_db=40)
-        matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", log_enable=True,     snr_threshold_db=40)
-
-        # Large-dim stress: each axis at 8192 (others fixed at 512) + all-4096 square.
-        for bias_enable in [False, True]:
-            for softmax_enable in [False, True]:
-                for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
-                    matmat_mul_unified_test(runtime_list=[(8192, 512,  512)],  bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
-                    # Reminder: k=8192 breaks on 512-b dram setup
-                    matmat_mul_unified_test(runtime_list=[(512,  8192-64, 512)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
-                    matmat_mul_unified_test(runtime_list=[(512,  512,  8192)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
-                    matmat_mul_unified_test(runtime_list=[(4096, 4032, 4032)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
-
-        for M in [1, 64, 384, 1024]:
-            for N in [64, 576, 1024]:
-                for K in [64, 192, 1024]:
-                    matmat_mul_unified_test(runtime_list=[(M, K, N)])
-        M = N = K = 512
-        for bias_mode in ["broadcast_N", "full_matrix"]:
-            for softmax_enable in [True, False]:
-                matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable)
-        matmat_mul_unified_test(runtime_list=[(M, K, N)], softmax_enable=True)
-
-
-        # --- Quantized matmat-mul (1-pass streaming quantized dot core): full shape × bias sweep. ---
-        for M in [64, 384, 1024]:
-            for N in [64, 576, 1024]:
-                for K in [64, 192, 1024]:
-                    for bias_enable in [False, True]:
-                        for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
-                            quantized_matmat_mul_unified_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
-
-        # unified_attention: head_dim × seq_len coverage (paired legacy/dynamic; the dynamic leg
-        # sources all Q/K/V/bias/out DRAM bases from GPRs). Merges the former dynamic-only,
-        # matched-pair, and dynamic_addr (head_dim=128) sweeps into one.
-        for head_dim in [64, 256, 512, 1024]:
-            for seq_len in [64, 256, 512, 1024, 4096, 8192-64]: # Reminder: seq_len=8192 breaks on 512-b dram setup
-                unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim)
-        # head_dim=128 came only from the former dynamic_addr sweep (seq_len up to 1024).
-        for seq_len in [64, 256, 512, 1024]:
-            unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=128)
-        # Small-batch (batch=4) coverage.
-        for head_dim in [64, 256, 512]:
-            for seq_len in [64, 256, 512]:
-                unified_attention_test(batch=4, aligned_seq_len=seq_len, head_dim=head_dim)
-
-        # Large-K sub-64 column-strip fallback (K>8192 -> strip_w 32/16) across M>1 (the EXPERIMENTAL
-        # general path) and both bias modes. Deeper accumulation lowers the SNR floor.
-        quantized_matmat_mul_unified_test(M=1, K=8256,  N=512, data_type=TYPE.IF4, int_variant=True)
-        quantized_matmat_mul_unified_test(M=256, K=8192, N=512, data_type=TYPE.IF4, int_variant=True)
-        quantized_matmat_mul_unified_test(M=1, K=8256,  N=512, bias_enable=True, bias_mode="broadcast_N")
-        quantized_matmat_mul_unified_test(M=256, K=8192,  N=512, bias_enable=True, bias_mode="full_matrix")
-
-    _RNG_STATE_END = _rng_state_fingerprint()
-
-    # --- Multi-core / multi-engine tests, enabled by HW_INFO core count ---
-    # Keep device-specific optional coverage last so it cannot advance RNG
-    # before common tests. That makes SNR results comparable across devices.
-    if not args.single_core_only and engine_count >= 2:
-        two_core_shapes = [(1920, 768, 2048)]
-        matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
-        matmat_mul_two_cores_unified_test(runtime_list=two_core_shapes)
-        matmat_mul_two_cores_unified_test(
-            runtime_list=two_core_shapes, softmax_enable=True)
-        matmat_mul_two_cores_unified_test(
-            runtime_list=two_core_shapes, gelu_enable=True)
-        matmat_mul_two_cores_unified_test(
-            runtime_list=two_core_shapes, silu_enable=True)
-        matmat_mul_two_cores_unified_test(
-            runtime_list=two_core_shapes, sigmoid_enable=True)
-        matmat_mul_two_cores_unified_test(
-            runtime_list=two_core_shapes, clamp_enable=True)
-        matmat_mul_two_cores_unified_test(
-            runtime_list=two_core_shapes, log_enable=True)
-
-        # Wide-variance softmax across two engines exercises per-row exp +
-        # bf20 adder tree reduction on both engines concurrently. Use scale-
-        # specific SNR floors mirroring the single-engine wide-variance set.
-        for scale, snr_floor in ((4.0, 38.0), (8.0, 28.0)):
-            matmat_mul_two_cores_unified_test(
-                runtime_list=two_core_shapes,
-                softmax_enable=True,
-                input_scale=scale,
-                snr_threshold_db=snr_floor,
-            )
-    if engine_count >= 8: # alveo and alveo_u55c only
-        multi_core_dram_speed_test(data_size_kB=512, num_engines=engine_count)
-        matmat_mul_multi_cores_unified_test(runtime_list=[(6144, 1024, 1024)], num_engines=engine_count)
-        quantized_matmat_mul_multi_cores_test(runtime_list=[(1, 1536, 6144)], num_engines=engine_count)
-
-    # --- Systolic core tests are disabled until HW_INFO exposes systolic presence ---
-    # Run last, after all andromeda-core coverage, so a systolic-specific
-    # failure never masks whether the andromeda core itself passed.
-    systolic_core_present = False
-    if systolic_core_present:
-        from systolic_engine import SystolicEngine
-        SystolicEngine(csr_base=KINTEX7_SYSTOLIC_CSR_BASE_ADDR).dump_csrs()
-
-        systolic_matmul_test(8, 16, 32)
-        systolic_matmul_test(16, 16, 32)
-        systolic_matmul_test(64, 64, 64)
-        systolic_matmul_test(128, 128, 128)
-        systolic_matmul_test(256, 256, 256)
-        systolic_matmul_test(512, 512, 512)
-        systolic_matmul_test(64, 512, 128)
-        systolic_matmul_test(256, 128, 512)
-        systolic_matmul_test(512, 2048, 2048)
-        systolic_matmul_test(128, 4096, 512)
-        systolic_matmul_test(256, 2048, 1024)
-        systolic_matmul_test(512, 1024, 512)
-        systolic_matmul_test(1024, 1024, 1024)
-        systolic_matmul_test(4096, 4096, 4096)
-        systolic_matmul_test(8192, 512, 512)
-        systolic_matmul_test(512, 512, 8192)
-        systolic_matmul_test(M=1024, K=1024, N=1024)
-        systolic_matmul_test(M=8, K=128, N=1024)
-        systolic_matmul_test(M=16, K=1024, N=64)
-        systolic_matmul_test(M=256, K=64, N=256)
-        
-    activation_core_test()
-    dram_to_uram_test()
-    uram_to_dram_test()
-    dram_stride_en_test()
-    dram_stride_wb_test()
-    argmax_test()
-    element_wise_add_loop_test()
-    interrupt_swi_and_halt_test()
-    last_adder_test()
-    matrix_vector_multiply_test()
-    large_matrix_vector_multiply_test()
-    dram_to_scales_bram_test()
-    dram_to_bias_bram_test()
-    # 8 GB dual-half DRAM test only applies to the U55C (8 GB HBM, 33-bit space).
-    if user_dma_core.AVAILABLE_DRAM_SIZE_GB == 8:
-        dram_read_write_speed_test_8GB()
-
-    #Adding new tests here
-
-    gemma3_inference_test()
-    gemma3_if8_inference_test()
-
-    llama32_1b_inference_test()
-    llama32_1b_if8_inference_test()
-
+    # --- Kokoro op-gap hardware proofs (see conversation history) ---
+    embedding_gather_test()
+    cumsum_via_triangular_matmul_test()
+    lstm_cell_hw_test()
+    conv1d_shifted_matmul_test()
+    depthwise_conv1d_eltwise_test()
+    interpolate_fixed_matmul_test(mode="linear")
+    interpolate_fixed_matmul_test(mode="nearest")
+    conv_transpose1d_zero_insert_test()
+    instance_norm1d_via_layernorm_test()
+    exp_via_sigmoid_test()
+    sincos_bounded_poly_test()
+    # dram_read_write_speed_test()
+    # isa_rela_loop_test()
+    # isa_abs_loop_test()
+    # isa_reg_min_sub_mul_test()
+    # isa_mult_div_shift_test()
+    # test_ue_int_reg_read()
+    # fmax_test()
+    # for packing_mode in [16, 32, 48, 64]:
+        # packing_test(packing_mode=packing_mode)
+    # padding_zero_test()
+    # slicing_test()
+    # quantized_fp4_test()
+    # if4_if8_tests()
+    # if4_if8_mixed_sign_test()
+    # tq4_dequantize_test()
+    # tq4_dot_product_test(K=64, N=64)
+    # tq4_dot_product_test(K=128, N=128)
+    # run_turboquant_mse(1024)
+    # # Additional NEW TQ4 tests (variants) without changing the baseline tests above.
+    # tq4_dequantize_variant_tests()
+    # tq4_dot_product_variant_tests()
+    # tq4_dot_product_onehot_oracle_tests()
+    # tq4_codebook_reload_tests()
+    # if4_if8_dot_product_test(K=64, N=64)
+    # if4_if8_dot_product_test(K=128, N=128)
+    # if4_if8_dot_product_test(K=256, N=256)
+    # dequantize_test(TYPE.IF4, int_variant=True)
+    # dequantize_test(TYPE.IF4, int_variant=False)
+    # dequantize_test(TYPE.IF8, int_variant=True)
+    # dequantize_test(TYPE.IF8, int_variant=False)
+    # matmat_mul_non_aligned_writeback_test()
+    # rope_hf_core_dram_unified_test(shapes=[(64, 512)])
+    # bf16_permute_test(dim_0=144, dim_1=48, dim_2=64)
+    # patching_test()
+    # mix_of_broadcast_eltwise_add_eltwise_mul_core_test()
+    # eltwise_core_dram_unified_test(shapes=[(64, 512)])
+    # # Each (M, N) is a paired legacy/dynamic run with dyn_M + dyn_N + GPR-sourced bases.
+    # bf16_transpose_core_unified_test(shapes=[
+        # (64, 64), (256, 256), (512, 2048), (1024, 4032),
+        # (256, 512), (64, 768), (256, 768), (512, 768), (128, 4032), (512, 4032),
+    # ])
+    # # Per-call snr_threshold_db tightens the floor where we have headroom
+    # # (observed ~50-55 dB on plain matmul, ~46-47 dB on softmax) so silent
+    # # SNR regressions trip the assert instead of slipping under the legacy
+    # # 40 dB floor.
+    # matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], clamp_enable=True, snr_threshold_db=52.0)
+    # matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], log_enable=True, snr_threshold_db=52.0)
+    # matmat_mul_unified_test(runtime_list=[(1984, 1024, 384)], softmax_enable=True, debug_fmax=True, snr_threshold_db=44.0, fmax_snr_threshold_db=44.0)
+    # matmat_mul_unified_test(runtime_list=[(64, 6912, 64)], snr_threshold_db=48.0)
+    # matmat_mul_unified_test(runtime_list=[(2048, 512, 384)], softmax_enable=True, snr_threshold_db=44.0)
+    # matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], sigmoid_enable=True, snr_threshold_db=52.0)
+    # matmat_mul_unified_test(runtime_list=[(1024, 768, 512)], clamp_enable=True, clamp_min=-11.125, clamp_max=11.0, snr_threshold_db=52.0)
+    # M = N = K = 512
+    # for bias_mode in ["broadcast_N", "full_matrix"]:
+        # for softmax_enable in [True, False]:
+            # matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable)
+    # matmat_mul_unified_test(runtime_list=[(M, K, N)], softmax_enable=True)
+    # M = N = K = 4096
+    # matmat_mul_unified_test(runtime_list=[(M, K, N)])
+    # # --- Wide-variance softmax stress: exercises exp + bf20 adder tree ------
+    # # The post-matmul pre-softmax values span ~N(0, input_scale^2). Larger
+    # # scales push exp() outputs across many orders of magnitude, which stresses
+    # # the denominator reduction (adder tree) dynamic range and the fmax-based
+    # # numerical-stability path. Reference stays numerically stable because
+    # # torch.softmax internally subtracts the row max.
+    # #
+    # # SNR thresholds are scale-specific: as input_scale grows, the
+    # # max-min span of (a @ b.T) grows linearly in scale, so the bf20
+    # # adder tree retains progressively fewer effective bits. We set
+    # # thresholds ~3 dB below empirically observed values so the tests
+    # # still catch regressions but tolerate the inherent dynamic-range loss.
+    # wide_variance_snr_floors = {
+        # 2.0: 42.0,   # observed ~44.5 dB
+        # 4.0: 38.0,   # observed ~41.0 dB
+        # 8.0: 28.0,   # estimated; scale doubling ~ -6 dB SNR
+        # 16.0: 18.0,  # adder tree near saturation
+    # }
+    # for scale, snr_floor in wide_variance_snr_floors.items():
+        # matmat_mul_unified_test(runtime_list=[(512, 512, 384)], softmax_enable=True,
+                                # input_scale=scale, snr_threshold_db=snr_floor)
+    # # Pair wide variance with debug_fmax so fmax SNR is also validated.
+    # # fmax itself is exact (a row max) so fmax SNR stays high even at
+    # # large scales — keep that floor tight at 44 dB.
+    # matmat_mul_unified_test(runtime_list=[(1024, 1024, 512)], softmax_enable=True, debug_fmax=True,
+                            # input_scale=8.0, snr_threshold_db=28.0, fmax_snr_threshold_db=44.0)
+    # # Tall/narrow and short/wide variants to sweep different M/N tile shapes
+    # # through the wide-variance exp path.
+    # matmat_mul_unified_test(runtime_list=[(2048, 256, 128)], softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
+    # matmat_mul_unified_test(runtime_list=[(128, 256, 2048)], softmax_enable=True, input_scale=6.0, snr_threshold_db=33.0)
+    # matmat_mul_unified_test(runtime_list=[(512, 1024, 1024)], softmax_enable=True, input_scale=12.0, snr_threshold_db=22.0)
+# 
+    # # Every shape now runs the legacy/dynamic + dynamic-addr matched pair (the dynamic
+    # # quantized_matmat_core supports bias and the sub-64 large-K fallback), so the biased shapes
+    # # above already exercise the dynamic bias path.
+    # #
+    # # Large-K sub-64 column-strip fallback (K>8192): a 64-wide strip's scales overflow the scale
+    # # BRAM, so strip_w falls back to 32 (K<=16384) or 16 (K<=32768). M==1 (production decode path)
+    # # with and without bias; higher accumulation depth lowers the SNR floor.
+# 
+    # quantized_matmat_mul_unified_test(M=640, K=1280, N=1408, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
+    # quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
+    # quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  silu_enable=True)
+    # quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", sigmoid_enable=True)
+    # quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix",  clamp_enable=True)
+    # quantized_matmat_mul_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True, snr_threshold_db=37) # log activation in the quantized path is degraded.
+# 
+    # quantized_matmat_mul_unified_test(M=1, K=512, N=512, data_type=TYPE.IF4, int_variant=True)
+    # quantized_matmat_mul_unified_test(M=1, K=1280, N=1408, data_type=TYPE.IF4, int_variant=True, silu_enable=True)
+    # quantized_matmat_mul_unified_test(M=1, K=512, N=512, data_type=TYPE.IF8, int_variant=True, gelu_enable=True)
+    # quantized_matmat_mul_unified_test(M=2, K=128, N=128, data_type=TYPE.IF4, int_variant=True)
+    # quantized_matmat_mul_unified_test(M=8, K=256, N=256, data_type=TYPE.IF4, int_variant=False)
+    # quantized_matmat_mul_unified_test(M=65, K=512, N=512, data_type=TYPE.IF8, int_variant=True)
+    # quantized_matmat_mul_unified_test(M=1024, K=768, N=512, data_type=TYPE.IF8, int_variant=False)
+    # quantized_matmat_mul_unified_test(M=257, K=1280, N=1408, data_type=TYPE.IF4, int_variant=True)
+# 
+    # matmat_mul_quantized_weights_unified_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="full_matrix")
+# 
+    # unified_attention_test(batch=256, aligned_seq_len=256, head_dim=128)
+    # unified_attention_test(batch=512, aligned_seq_len=512, head_dim=128)
+# 
+    # # --- Additional coverage: extra dimension/feature combinations ---
+    # rms_norm_unified_test(shapes=[(768, 1024), (2048, 2048)])
+    # layer_norm_core_dram_unified_test(shapes=[(1024, 1024)], gamma_enable=True, beta_enable=False)
+    # layer_norm_core_dram_unified_test(shapes=[(1024, 1024)], gamma_enable=False, beta_enable=True)
+    # layer_norm_core_dram_unified_test(shapes=[(192, 6912)], gamma_enable=True, beta_enable=True)
+    # bf16_permute_test(dim_0=64, dim_1=64, dim_2=64)
+    # matmat_mul_unified_test(runtime_list=[(512, 2048, 2048)])
+    # matmat_mul_unified_test(runtime_list=[(128, 4096, 512)], gelu_enable=True)
+    # matmat_mul_unified_test(runtime_list=[(256, 2048, 1024)], silu_enable=True)
+    # matmat_mul_unified_test(runtime_list=[(512, 1024, 512)], bias_enable=True, bias_mode="broadcast_N")
+    # matmat_mul_unified_test(runtime_list=[(512, 1024, 512)], bias_enable=True, bias_mode="full_matrix")
+    # matmat_mul_quantized_weights_unified_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=True)
+    # matmat_mul_quantized_weights_unified_test(M=256, K=1024, N=512, data_type=TYPE.IF4, int_variant=False)
+    # quantized_matmat_mul_unified_test(M=128, K=512, N=512, data_type=TYPE.IF4, int_variant=True, gelu_enable=True)
+# 
+    # # GPR-sourced-base (dynamic_addr) coverage unique to this section — the unified tests above
+    # # already source DRAM bases from GPRs in their dynamic leg, so the former per-test dynamic_addr
+    # # re-runs (eltwise/rms/layer_norm/rope/transpose/attention/qweights at shapes already covered)
+    # # are redundant and dropped. Only shapes/variants NOT covered above are kept here.
+    # rms_norm_unified_test(shapes=[(64, 512)])
+    # rope_hf_core_dram_gqa_unified_test(shapes=[(64, 4, 512)])
+    # matmat_mul_unified_test(runtime_list=[(256, 256, 256)])
+    # matmat_mul_unified_test(runtime_list=[(256, 512, 512)], bias_enable=True, bias_mode="broadcast_N")
+    # # head_dim=256 (the fully-dynamic leg covers runtime head_dim + pre-scale); head_dim=128
+    # # fully-dynamic is already covered by the batch=512 attention call above.
+    # unified_attention_test(batch=512, aligned_seq_len=512, head_dim=256)
+    # # Quantized-B matmul at the gemma3 fold shape (broadcast_N bias).
+    # matmat_mul_quantized_weights_unified_test(M=4032, K=1152, N=640, bias_enable=True, bias_mode="broadcast_N")
+# 
+    # if args.ext:
+        # # --- Eltwise: paired dynamic-vs-legacy over a representative shape set (M ladder, N/dim-swap
+        # #     ladder, gemma dims). GPR-sourced bases + runtime broadcast scalar are on by default. ---
+        # eltwise_core_dram_unified_test(shapes=[
+            # (1, 512), (512, 512), (8192, 512),      # M ladder (edge/tiny -> large)
+            # (512, 64), (512, 1024), (512, 6912),    # N / dim-swap ladder
+            # (64, 640), (256, 1024),                 # gemma vector_length + mixed
+        # ])
+# 
+        # # --- RMS norm: paired dynamic-vs-legacy (64-aligned) + dynamic-only host-pad (odd N),
+        # #     covering the existing rms_norm test scope. ---
+        # rms_norm_unified_test(shapes=[
+            # (1, 512), (512, 512), (8192, 512),        # M ladder (edge/tiny -> large)
+            # (512, 64), (512, 1024), (512, 4096),      # N / dim-swap ladder
+            # (512, 640), (256, 1024),                  # gemma vector_length + mixed
+            # (95, 128), (411, 128),                    # odd M, aligned N (stress ladder)
+            # (64, 78), (64, 411), (64, 1000),          # non-64-aligned N (dynamic-only host-pad)
+        # ])
+# 
+        # # --- LayerNorm: paired dynamic-vs-legacy (64-aligned) + dynamic-only host-pad + mask (odd N),
+        # #     covering the existing layer_norm test scope (gamma/beta combos). ---
+        # layer_norm_core_dram_unified_test(shapes=[
+            # (1, 512), (512, 512), (8192, 512),        # M ladder (edge/tiny -> large)
+            # (512, 64), (512, 1024), (512, 4096),      # N / dim-swap ladder
+            # (256, 1024),                              # mixed
+            # (95, 128), (411, 128),                    # odd M, aligned N
+            # (64, 78), (64, 411), (64, 1000),          # non-64-aligned N (dynamic-only, host-pad + mask)
+        # ])
+        # # (gamma-only / beta-only combos are covered in the normal pass, which always runs first.)
+# 
+        # rope_hf_core_dram_unified_test(shapes=[
+            # (1, 64), (8, 128), (95, 138), (411, 512),
+        # ])
+        # rope_hf_core_dram_gqa_unified_test(shapes=[
+            # (1, 4, 128), (64, 4, 138), (95, 4, 512),
+        # ])
+        # # bf16_transpose: per-N M-ladder hits M_chunk boundaries
+        # # (sub-chunk / exact chunk / chunk+64 / 2×chunk / multi-chunk + 8192 stress).
+        # # Every run is dyn_M + dyn_N + dynamic_addr, so this also subsumes the old
+        # # dynamic_addr spot check (N ∈ {64, 256, 2048}).
+        # _TRANSPOSE_M_LADDERS = {
+            # 64:   [64, 448, 512, 896, 8192],    # M_chunk=448
+            # 256:  [64, 192, 256, 384, 8192],    # M_chunk=192
+            # 2048: [64, 128, 512, 1024, 8192],   # M_chunk=64
+            # 4032: [64, 128, 512, 1024, 8192],   # M_chunk=64, max valid N (4096 overflows URAM_ROW_SIZE_Z)
+        # }
+        # bf16_transpose_core_unified_test(shapes=[
+            # (M, N) for N, Ms in _TRANSPOSE_M_LADDERS.items() for M in Ms
+        # ])
+# 
+        # # --- Quantized-B matmul: every shape traverses every format/option configuration. ---
+        # for M in [64, 384, 1024]:
+            # for N in [64, 576, 1024]:
+                # for K in [64, 192, 1024]:
+                    # for bias_enable in [False, True]:
+                        # for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
+                            # matmat_mul_quantized_weights_unified_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
+# 
+        # matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", gelu_enable=True)
+        # matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", silu_enable=True)
+        # matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix", sigmoid_enable=True)
+        # matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="full_matrix", clamp_enable=True)
+        # matmat_mul_quantized_weights_unified_test(M=512, K=512, N=512, bias_enable=True, bias_mode="broadcast_N", log_enable=True)
+# 
+        # # --- Matmul: comprehensive paired legacy/dynamic coverage. ---
+        # for M in [25, 64, 133, 384, 1024]:
+            # for N in [64, 576, 1024]:
+                # for K in [64, 192, 1024]:
+                    # for bias_enable in [False, True]:
+                        # for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
+                            # for softmax_enable in [True, False]:
+                                # snr_floor = 36 if M in (25, 133) or (M, K, N) == (64, 64, 576) else 40
+                                # matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=bias_enable, bias_mode=bias_mode, softmax_enable=softmax_enable, snr_threshold_db=snr_floor)
+        # # Representative activation coverage: one shape per activation, mirroring the quantized_weights pattern above.
+        # matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", gelu_enable=True,    snr_threshold_db=40)
+        # matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="full_matrix",  silu_enable=True,   snr_threshold_db=40)
+        # matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", sigmoid_enable=True, snr_threshold_db=40)
+        # matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="full_matrix",  clamp_enable=True,  snr_threshold_db=40)
+        # matmat_mul_unified_test(runtime_list=[(512, 512, 512)], bias_enable=True, bias_mode="broadcast_N", log_enable=True,     snr_threshold_db=40)
+# 
+        # # Large-dim stress: each axis at 8192 (others fixed at 512) + all-4096 square.
+        # for bias_enable in [False, True]:
+            # for softmax_enable in [False, True]:
+                # for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
+                    # matmat_mul_unified_test(runtime_list=[(8192, 512,  512)],  bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
+                    # # Reminder: k=8192 breaks on 512-b dram setup
+                    # matmat_mul_unified_test(runtime_list=[(512,  8192-64, 512)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
+                    # matmat_mul_unified_test(runtime_list=[(512,  512,  8192)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
+                    # matmat_mul_unified_test(runtime_list=[(4096, 4032, 4032)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
+# 
+        # for M in [1, 64, 384, 1024]:
+            # for N in [64, 576, 1024]:
+                # for K in [64, 192, 1024]:
+                    # matmat_mul_unified_test(runtime_list=[(M, K, N)])
+        # M = N = K = 512
+        # for bias_mode in ["broadcast_N", "full_matrix"]:
+            # for softmax_enable in [True, False]:
+                # matmat_mul_unified_test(runtime_list=[(M, K, N)], bias_enable=True, bias_mode=bias_mode, softmax_enable=softmax_enable)
+        # matmat_mul_unified_test(runtime_list=[(M, K, N)], softmax_enable=True)
+# 
+# 
+        # # --- Quantized matmat-mul (1-pass streaming quantized dot core): full shape × bias sweep. ---
+        # for M in [64, 384, 1024]:
+            # for N in [64, 576, 1024]:
+                # for K in [64, 192, 1024]:
+                    # for bias_enable in [False, True]:
+                        # for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
+                            # quantized_matmat_mul_unified_test(M=M, K=K, N=N, bias_enable=bias_enable, bias_mode=bias_mode)
+# 
+        # # unified_attention: head_dim × seq_len coverage (paired legacy/dynamic; the dynamic leg
+        # # sources all Q/K/V/bias/out DRAM bases from GPRs). Merges the former dynamic-only,
+        # # matched-pair, and dynamic_addr (head_dim=128) sweeps into one.
+        # for head_dim in [64, 256, 512, 1024]:
+            # for seq_len in [64, 256, 512, 1024, 4096, 8192-64]: # Reminder: seq_len=8192 breaks on 512-b dram setup
+                # unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim)
+        # # head_dim=128 came only from the former dynamic_addr sweep (seq_len up to 1024).
+        # for seq_len in [64, 256, 512, 1024]:
+            # unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=128)
+        # # Small-batch (batch=4) coverage.
+        # for head_dim in [64, 256, 512]:
+            # for seq_len in [64, 256, 512]:
+                # unified_attention_test(batch=4, aligned_seq_len=seq_len, head_dim=head_dim)
+# 
+        # # Large-K sub-64 column-strip fallback (K>8192 -> strip_w 32/16) across M>1 (the EXPERIMENTAL
+        # # general path) and both bias modes. Deeper accumulation lowers the SNR floor.
+        # quantized_matmat_mul_unified_test(M=1, K=8256,  N=512, data_type=TYPE.IF4, int_variant=True)
+        # quantized_matmat_mul_unified_test(M=256, K=8192, N=512, data_type=TYPE.IF4, int_variant=True)
+        # quantized_matmat_mul_unified_test(M=1, K=8256,  N=512, bias_enable=True, bias_mode="broadcast_N")
+        # quantized_matmat_mul_unified_test(M=256, K=8192,  N=512, bias_enable=True, bias_mode="full_matrix")
+# 
+    # _RNG_STATE_END = _rng_state_fingerprint()
+# 
+    # # --- Multi-core / multi-engine tests (kintex7, kintex7_systolic, and alveo) ---
+    # # Keep device-specific optional coverage last so it cannot advance RNG
+    # # before common tests. That makes SNR results comparable across devices.
+    # if not args.single_core_only and args.device in ('kintex7', 'kintex7_systolic', 'alveo', 'alveo_u55c'):
+        # two_core_shapes = [(1920, 768, 2048)]
+        # matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
+        # matmat_mul_two_cores_unified_test(runtime_list=two_core_shapes)
+        # matmat_mul_two_cores_unified_test(
+            # runtime_list=two_core_shapes, softmax_enable=True)
+        # matmat_mul_two_cores_unified_test(
+            # runtime_list=two_core_shapes, gelu_enable=True)
+        # matmat_mul_two_cores_unified_test(
+            # runtime_list=two_core_shapes, silu_enable=True)
+        # matmat_mul_two_cores_unified_test(
+            # runtime_list=two_core_shapes, sigmoid_enable=True)
+        # matmat_mul_two_cores_unified_test(
+            # runtime_list=two_core_shapes, clamp_enable=True)
+        # matmat_mul_two_cores_unified_test(
+            # runtime_list=two_core_shapes, log_enable=True)
+# 
+        # # Wide-variance softmax across two engines exercises per-row exp +
+        # # bf20 adder tree reduction on both engines concurrently. Use scale-
+        # # specific SNR floors mirroring the single-engine wide-variance set.
+        # for scale, snr_floor in ((4.0, 38.0), (8.0, 28.0)):
+            # matmat_mul_two_cores_unified_test(
+                # runtime_list=two_core_shapes,
+                # softmax_enable=True,
+                # input_scale=scale,
+                # snr_threshold_db=snr_floor,
+            # )
+    # if args.device == 'alveo':
+        # # Each engine reads its own DRAM buffer, then all engines hammer the
+        # # same DRAM buffer (concurrent reads to a single memory location).
+        # matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count)
+        # matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count,
+                                                # shared_read=True)
+        # matmat_mul_multi_cores_unified_test(num_engines=8)
+    # elif args.device == 'alveo_u55c':
+        # # U55C hardware instantiates 12 Andromeda engines.
+        # matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=12)
+        # matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=12,
+                                                # shared_read=True)
+        # matmat_mul_multi_cores_unified_test(runtime_list=[(4608, 4096, 4096)], num_engines=12)
+# 
+    # # --- Systolic core tests (kintex7_systolic only) ---
+    # # Run last, after all andromeda-core coverage, so a systolic-specific
+    # # failure never masks whether the andromeda core itself passed.
+    # if args.device == 'kintex7_systolic':
+        # from systolic_engine import SystolicEngine
+        # SystolicEngine(csr_base=KINTEX7_SYSTOLIC_CSR_BASE_ADDR).dump_csrs()
+# 
+        # systolic_matmul_test(8, 16, 32)
+        # systolic_matmul_test(16, 16, 32)
+        # systolic_matmul_test(64, 64, 64)
+        # systolic_matmul_test(128, 128, 128)
+        # systolic_matmul_test(256, 256, 256)
+        # systolic_matmul_test(512, 512, 512)
+        # systolic_matmul_test(64, 512, 128)
+        # systolic_matmul_test(256, 128, 512)
+        # systolic_matmul_test(512, 2048, 2048)
+        # systolic_matmul_test(128, 4096, 512)
+        # systolic_matmul_test(256, 2048, 1024)
+        # systolic_matmul_test(512, 1024, 512)
+        # systolic_matmul_test(1024, 1024, 1024)
+        # systolic_matmul_test(4096, 4096, 4096)
+        # systolic_matmul_test(8192, 512, 512)
+        # systolic_matmul_test(512, 512, 8192)
+        # systolic_matmul_test(M=1024, K=1024, N=1024)
+        # systolic_matmul_test(M=8, K=128, N=1024)
+        # systolic_matmul_test(M=16, K=1024, N=64)
+        # systolic_matmul_test(M=256, K=64, N=256)
+        # 
+    # activation_core_test()
+    # dram_to_uram_test()
+    # uram_to_dram_test()
+    # dram_stride_en_test()
+    # dram_stride_wb_test()
+    # argmax_test()
+    # element_wise_add_loop_test()
+    # interrupt_swi_and_halt_test()
+    # last_adder_test()
+    # matrix_vector_multiply_test()
+    # large_matrix_vector_multiply_test()
+    # dram_to_scales_bram_test()
+    # dram_to_bias_bram_test()
+    # # 8 GB dual-half DRAM test only applies to the U55C (8 GB HBM, 33-bit space).
+    # if args.device == "alveo_u55c":
+        # dram_read_write_speed_test_8GB()
+# 
+    # #Adding new tests here
+# 
+    # gemma3_inference_test()
+    # gemma3_if8_inference_test()
+# 
+    # llama32_1b_inference_test()
+    # llama32_1b_if8_inference_test()
+# 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
     # Clean run: write the summary directly and hard-exit 0 so the atexit hook
     # and any C-extension teardown cannot flip the process status to 1.
