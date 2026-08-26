@@ -1513,11 +1513,169 @@ def sharded_scheduler_head_attn_test(H: int = 8, seq_len: int = 256, head_dim: i
     return snr
 
 
+def sharded_scheduler_reduce_add_parallel_test(M: int = 64, N: int = 1024,
+                                               engine_counts=(2, 4, 8, 12),
+                                               snr_threshold_db: float = 40.0,
+                                               timeout_seconds: float = 30.0):
+    """A/B the SERIAL vs ROW-SPLIT ``reduce_add`` at pi05's denoise shape.
+
+    ``reduce_add`` historically emitted its ``(n-1)`` ELTWISE_ADDs on the PRIMARY
+    with every worker idle. ``parallel=True`` splits them by row block across all
+    n engines. This test measures the win and proves the two are BIT-IDENTICAL.
+
+    Defaults are the action expert's reduction shape: M=AE_ACTION_HORIZON_PADDED
+    =64, N=AE_HIDDEN=1024. Both denoise reduce sites (o_proj, mlp down) produce
+    exactly this, 2 x AE_LAYERS(18) x AE_NUM_DENOISE_STEPS(10) = 360 times per
+    action, so whatever ratio this prints is the ratio that stage inherits.
+
+    The program is ONE reduce_add and then HALT -- deliberately. Repeating it
+    would put reduce_add's closing barrier immediately against the next one's
+    opening barrier with zero worker instructions between them, which is the
+    re-arm race (a worker clears, immediately re-sets, and a peer still walking
+    the previous barrier's CHECKs sees the NEW 1). One reduction per program
+    keeps the measurement out of that window; the margin below covers the rest.
+    """
+    import user_dma_core
+    from multi_engine_shard import MultiEngineScheduler
+
+    bpe = 2
+    rows = []
+
+    for ne in engine_counts:
+        dram = user_dma_core.DRAM_START_ADDR
+        primary = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
+                                params_dram_base=dram,
+                                tensor_dram_base=dram + 0x08000000,
+                                program_dram_base=dram + 0x0F000000)
+        # DEFAULT margin, deliberately. A bigger CLEAR margin does NOT make a
+        # back-to-back barrier pair safer -- it is the window during which our
+        # stale flag is still visible, so widening it makes race-through MORE
+        # likely, not less. The fix is join=False below (one barrier, not two),
+        # not a fatter margin.
+        sched = MultiEngineScheduler(primary, num_engines=ne,
+                                     allow_more_than_two_engines=True)
+
+        parts = [torch.randn(M, N, dtype=torch.bfloat16) for _ in range(ne)]
+        partial_addrs = []
+        for p in parts:
+            pa = primary.allocate_tensor_dram(M * N * bpe, align_bytes=128)
+            primary.dma_to_accelerator_memory(pa, p)
+            partial_addrs.append(pa)
+        out_serial = primary.allocate_tensor_dram(M * N * bpe, align_bytes=128)
+        out_par = primary.allocate_tensor_dram(M * N * bpe, align_bytes=128)
+        for o in (out_serial, out_par):
+            primary.dma_to_accelerator_memory(o, torch.zeros(M, N, dtype=torch.bfloat16))
+        sched.preclear_flags()
+
+        def _leg(out_addr, parallel):
+            for ue in sched.engines:
+                ue.reset_program_dram_addr()
+            primary.start_capture()
+            primary.reset_isa_reg_counter()
+            primary.reset_inst_ptr_counter()
+            sched.begin_program()
+            # join=False: ONE barrier, at the entry. With join=True the closing
+            # barrier lands immediately after the opening one on every WORKER
+            # stream (the adds are primary-only in the serial leg), and a worker
+            # that clears barrier 1 then instantly re-sets for barrier 2 sees the
+            # primary's not-yet-cleared barrier-1 flag, passes barrier 2 on it,
+            # and halts -- leaving the primary waiting on a flag that is gone.
+            # Observed exactly: engine 0 stuck at inst 1033, engine 1 retired
+            # 2055/2056 and idle. The host join below is the real rendezvous.
+            sched.reduce_add(partial_addrs, out_addr, M, N,
+                             join=False, parallel=parallel)
+            worker_addrs = sched.finalize()
+            primary.generate_instruction_halt()
+            primary.stop_capture()
+            prog = primary.get_program_dram_addr()
+            primary.write_captured_instructions_to_dram(prog)
+            inst_bytes = (primary.get_capture_instruction_size_bytes()
+                          + sched.worker_program_bytes())
+            primary.allocate_program_dram(primary.get_capture_instruction_size_bytes())
+
+            t0 = time.perf_counter()
+            sched.start_workers(worker_addrs)
+            primary.start_execute_from_dram(prog)
+            primary.wait_queue(timeout_seconds)
+            for w in sched.workers:
+                w.wait_queue(5.0)
+            wall_us = (time.perf_counter() - t0) * 1e6
+            hw = [ue.report_latency_in_us() for ue in sched.engines]
+            stuck = [i for i, ue in enumerate(sched.engines) if ue.is_queue_busy()]
+            if stuck:
+                for i, ue in enumerate(sched.engines):
+                    print(f"     engine {i}: busy={int(ue.is_queue_busy())} "
+                          f"retired={ue.read_reg32(user_dma_core.UE_INSTRUCTION_CTL_ADDR)}")
+                SW_RESET_CMD = 0x80008000
+                for ue in sched.engines:
+                    ue.write_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR, SW_RESET_CMD)
+                time.sleep(0.5)
+                raise RuntimeError(
+                    f"reduce_add parallel={parallel} ne={ne}: engines {stuck} stuck")
+            primary.clear_capture_buffer()
+            return wall_us, hw, inst_bytes
+
+        wall_s, hw_s, bytes_s = _leg(out_serial, parallel=False)
+        wall_p, hw_p, bytes_p = _leg(out_par, parallel=True)
+
+        got_s = primary.dma_from_accelerator_memory(out_serial, (M, N))
+        got_p = primary.dma_from_accelerator_memory(out_par, (M, N))
+        ref = parts[0].float()
+        for p in parts[1:]:
+            ref = (ref.to(torch.bfloat16).float() + p.float())
+        ref = ref.to(torch.bfloat16)
+
+        snr_s = calculate_snr(ref, got_s)
+        snr_p = calculate_snr(ref, got_p)
+        bitexact = torch.equal(got_s.view(torch.uint16), got_p.view(torch.uint16))
+
+        dev_s, dev_p = max(hw_s), max(hw_p)
+        speedup = dev_s / dev_p if dev_p else float("nan")
+        print(f"\n=== reduce_add A/B: M={M} N={N} ne={ne} ({ne - 1} adds) ===")
+        print(f"  SERIAL   device {dev_s:9.1f} us  wall {wall_s:9.1f} us  SNR {snr_s:.2f} dB")
+        print(f"    per engine: {', '.join(f'{v:.1f}' for v in hw_s)}")
+        print(f"  PARALLEL device {dev_p:9.1f} us  wall {wall_p:9.1f} us  SNR {snr_p:.2f} dB")
+        print(f"    per engine: {', '.join(f'{v:.1f}' for v in hw_p)}")
+        print(f"  SPEEDUP  {speedup:.2f}x   bit-identical: {bitexact}")
+
+        assert snr_s >= snr_threshold_db or snr_s == float("inf"), \
+            f"serial reduce_add SNR {snr_s:.2f} dB below {snr_threshold_db:g} dB"
+        assert snr_p >= snr_threshold_db or snr_p == float("inf"), \
+            f"parallel reduce_add SNR {snr_p:.2f} dB below {snr_threshold_db:g} dB"
+        assert bitexact, (
+            "parallel reduce_add is NOT bit-identical to serial. Row splitting must "
+            "not change the summation order of any output element -- if this fires, "
+            "the row offsets are wrong, not the arithmetic.")
+
+        rows.append((ne, dev_s, dev_p, speedup, bitexact))
+        record_test("sharded_scheduler_reduce_add_parallel",
+                    f"M={M}, N={N}, num_engines={ne}, serial={dev_s:.0f}us, "
+                    f"parallel={dev_p:.0f}us, speedup={speedup:.2f}x, bitexact={bitexact}",
+                    snr_db=snr_p, inst_bytes=bytes_p)
+
+        primary.reset_tensor_dram_addr()
+        primary.clear_capture_buffer()
+
+    print(f"\n=== reduce_add parallel-split summary (M={M}, N={N}) ===")
+    print(f"{'ne':>3} {'serial us':>11} {'parallel us':>13} {'speedup':>9} {'bitexact':>9}")
+    for ne, ds, dp, sp, be in rows:
+        print(f"{ne:>3} {ds:>11.1f} {dp:>13.1f} {sp:>8.2f}x {str(be):>9}")
+    return rows
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-engine hardware tests")
     parser.add_argument('--dev', type=str, default='xdma0')
     parser.add_argument('--device', type=str, default='kintex7')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None)
+    parser.add_argument('--reduce-add', action='store_true',
+                        help='Run ONLY sharded_scheduler_reduce_add_parallel_test: A/B the '
+                             'serial vs row-split reduce_add at the pi05 denoise shape.')
+    parser.add_argument('--reduce-add-engines', type=str, default='2,4,8,12',
+                        help='Comma-separated engine counts for --reduce-add.')
+    parser.add_argument('--reduce-add-shape', type=str, default='64,1024',
+                        help='M,N for --reduce-add. Default 64,1024 = AE_ACTION_HORIZON_'
+                             'PADDED x AE_HIDDEN, the action expert reduction shape.')
     args = parser.parse_args()
 
     set_dma_device("efinix" if args.device == "efinix" else args.dev,
@@ -1528,6 +1686,14 @@ if __name__ == "__main__":
     globals()["UE_AXI_DATA_WIDTH_BITS"] = axi_width_bits
 
     torch.manual_seed(0)
+
+    if args.reduce_add:
+        _ra_M, _ra_N = (int(v) for v in args.reduce_add_shape.split(','))
+        sharded_scheduler_reduce_add_parallel_test(
+            M=_ra_M, N=_ra_N,
+            engine_counts=[int(v) for v in args.reduce_add_engines.split(',')])
+        write_test_summary("multi_engine_hw_test_summary.md")
+        sys.exit(0)
 
     # --- Cross-engine rendezvous: does the flag re-arm across many barriers
     # inside ONE captured stream? (27 = pi05 vision encoder layer count.)
@@ -1563,6 +1729,8 @@ if __name__ == "__main__":
     # Negative control: stub the cross-engine reduction, the same test must FAIL.
     sharded_scheduler_k_split_reduce_test(M=64, K=4096, N=1024, num_engines=2,
                                           stub_reduction=True)
+    # reduce_add's adds split across engines: bit-identity + the speedup.
+    sharded_scheduler_reduce_add_parallel_test(M=64, N=1024, engine_counts=(2, 4))
 
     # --- MultiEngineScheduler, HEAD-axis (attention) sharding ---
     # num_engines=1 first: exact passthrough, so a failure here is the kernel

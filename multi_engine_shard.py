@@ -1980,7 +1980,7 @@ class MultiEngineScheduler:
         self.end_sharded(join=join)
 
     def reduce_add(self, partial_addrs: list[int], out_addr: int, M: int, N: int,
-                   join: bool = True) -> None:
+                   join: bool = True, parallel: bool = True) -> None:
         """Cross-engine SUM of per-engine partial [M, N] results (K-split join).
 
         Deliberately explicit and deliberately named: this is the ONLY place in
@@ -1989,11 +1989,34 @@ class MultiEngineScheduler:
         helper would make a genuinely expensive step invisible.
 
         Emits: barrier -> (n-1) ``eltwise_core_dram`` ELTWISE_ADD of M*N bf16
-        ON THE PRIMARY, workers idle -> barrier (if ``join``). The adds are
-        serialized against everything else; see the cost note in the module
-        docstring. Splitting the add back across engines is not done here
-        because the shapes this exists for have M=64, a single row block that
-        cannot be row-split at all.
+        -> barrier (if ``join``).
+
+        ``parallel=True`` (default) SPLITS THOSE ADDS ACROSS EVERY ENGINE by
+        row block, so each engine reduces ``M/n`` rows of all n partials and
+        the step costs ``(n-1)`` adds of ``M/n x N`` instead of ``(n-1)`` adds
+        of ``M x N`` on one engine while the rest idle. At pi05's denoise shape
+        (M=64, N=1024, n=12, 2 reduce sites x 18 layers x 10 Euler steps) that
+        is 3960 full-size adds on the primary versus 3960 adds at 1/12 the
+        size spread 12 ways -- the same DRAM traffic, ~n times less wall clock.
+
+        THE OLD DOCSTRING SAID THIS COULD NOT BE DONE because "the shapes this
+        exists for have M=64, a single row block that cannot be row-split at
+        all". That is a MATMUL constraint -- kernels assume 64-aligned row
+        blocks. ``eltwise_core_dram`` has no such rule: it is elementwise over
+        a contiguous ``[M, N]`` buffer, so any row range works and a row slice
+        is contiguous (offset ``row * N * bpe``), never strided.
+
+        NUMERICALLY BIT-IDENTICAL to the serial path, which is why this is the
+        default rather than an opt-in. Every output element is still summed
+        ``partial[0] + partial[1] + ... + partial[n-1]`` in that exact order;
+        only WHICH ENGINE evaluates a given row changes. (A tree reduction
+        would be faster still -- log2(n) rounds -- but reassociates, and bf16
+        addition is not associative, so it would move results.)
+
+        Falls back to the serial path when the split is not expressible: fewer
+        rows than engines, or a row pitch that is not AXI-beat aligned. Pass
+        ``parallel=False`` to force the serial path (A/B measurement, or to
+        reproduce a historical numeric stream exactly).
 
         ``partial_addrs[0]`` may alias ``out_addr`` (accumulate in place).
         """
@@ -2011,15 +2034,52 @@ class MultiEngineScheduler:
                 "reduce_add with num_engines=1 is the identity; point the single "
                 "partial at out_addr instead of asking for a copy")
             return
+        # Row pitch must be AXI-beat aligned or a row offset lands mid-beat.
+        row_bytes = N * 2
+        split_ok = (parallel and M >= self.num_engines
+                    and row_bytes % AXI_BEAT_BYTES == 0)
+
         self.barrier()
-        acc = partial_addrs[0]
-        for src in partial_addrs[1:]:
-            self.primary.eltwise_core_dram(
-                M=M, N=N, dram_a=acc, dram_b=src, dram_out=out_addr,
-                mode=user_dma_core.UE_MODE.ELTWISE_ADD,
-            )
-            acc = out_addr
-        if join:
+        if not split_ok:
+            acc = partial_addrs[0]
+            for src in partial_addrs[1:]:
+                self.primary.eltwise_core_dram(
+                    M=M, N=N, dram_a=acc, dram_b=src, dram_out=out_addr,
+                    mode=user_dma_core.UE_MODE.ELTWISE_ADD,
+                )
+                acc = out_addr
+        else:
+            base, rem = divmod(M, self.num_engines)
+            counts = [base + (1 if i < rem else 0) for i in range(self.num_engines)]
+            offsets = [sum(counts[:i]) for i in range(self.num_engines)]
+            for i, ue in enumerate(self.engines):
+                if counts[i] == 0:
+                    continue
+                off = offsets[i] * row_bytes
+                acc = partial_addrs[0] + off
+                for src in partial_addrs[1:]:
+                    ue.eltwise_core_dram(
+                        M=counts[i], N=N, dram_a=acc, dram_b=src + off,
+                        dram_out=out_addr + off,
+                        mode=user_dma_core.UE_MODE.ELTWISE_ADD,
+                    )
+                    acc = out_addr + off
+        # THE PARALLEL PATH MUST JOIN, whatever the caller asked for.
+        # With the serial path the PRIMARY wrote every byte of out_addr, so its own
+        # next instruction could read it back under plain program order and callers
+        # legitimately passed join=False to save a rendezvous. Once the adds are
+        # distributed that is a RAW hazard: 11 of 12 row blocks are written by
+        # WORKERS, and pi05 reads the result immediately afterwards on the primary
+        # with nothing in between (models/pi05/pi05_test.py:4795, the gated residual
+        # right after _ae_o_proj_sharded). No barrier there means the primary reads
+        # rows a peer has not written yet -- finite, plausible, wrong numbers.
+        #
+        # So join is forced here rather than left to the call sites: the caller's
+        # join=False was a statement about the SERIAL emission's guarantees, and
+        # those no longer hold. Cost is one rendezvous per reduce (~2 us at ne=12
+        # against ~110 us saved on the adds), and it is what makes the optimization
+        # safe to enable by default.
+        if join or split_ok:
             self.barrier()
 
     # -------------------------------------------------------- PER_ENGINE ---
